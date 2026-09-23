@@ -168,6 +168,107 @@ def test_calling_that_model_refuses_and_names_the_class_it_stands_for():
         UnbuiltModel(SomeModel)(torch.zeros(1))
 
 
+# --- what stays resident after construction, and which names hold it ---------
+
+# A value that builds or holds one of the ring's buffers, as it reads in the
+# source. `self.forward_vars` is one because the ring is built out of it.
+BUFFER_TERMS = ("CpuGpuBuffer", "torch.empty", "self.forward_vars")
+
+
+def _method_def(node, name):
+    """The `def name` in class definition *node*."""
+    return next(
+        n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == name
+    )
+
+
+def _self_assigned(node):
+    """Every `self.x = ...` in *node*, as (name, the source of its value).
+
+    Pairs, not a mapping keyed by name. A name can be assigned more than once --
+    `forward_vars` is bound to the dict of buffers and later rebound to a slot
+    of the ring it already holds -- and a mapping keeps only the last binding
+    walked, which here is the rebind. The rebind names no buffer, so keying by
+    name dropped `forward_vars` out of the holder set entirely. Keeping the
+    pairs is what lets a name count as a holder when *any* of its bindings is.
+    """
+    return {
+        (t.attr, ast.unparse(n.value))
+        for n in ast.walk(node)
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Attribute)
+        and isinstance(t.value, ast.Name)
+        and t.value.id == "self"
+    }
+
+
+def test_the_docstring_names_every_attribute_that_holds_the_ring():
+    """Construction leaves the base's forward-vars ring resident, and named
+    attributes of the runner hold it -- which the docstring denied until it was
+    corrected, with nothing asserting either way. Both holders are the base's,
+    so a rename, or a third one bound anywhere in the class, stops the sentence
+    being true; this fails then, rather than the prose drifting again.
+
+    The whole `ModelRunner` body is read, not the two methods that build the
+    ring, because a holder bound in `__init__` is just as much a holder and an
+    earlier draft of this test could not see one. Over 94 `self.x = ...` in that
+    class the answer is the same two, which is the fact the docstring states.
+
+    Two nearby bindings are deliberately not in it. `self.forward_vars` is
+    assigned twice: `_advance_forward_vars` rebinds the name to a slot of the
+    ring it already holds, which is a rotation and not a fourth holder. And
+    `self.tokenID_processor.input_ids` is a fourth *name* reaching a ring
+    buffer, one attribute deeper -- true, and outside a claim about attributes
+    on the runner.
+    """
+    assigned = _self_assigned(_classes(ATOM_RUNNER)["ModelRunner"])
+    holders = {n for n, v in assigned if any(t in v for t in BUFFER_TERMS)}
+    assert holders == {"forward_vars", "_fv_ring"}
+    runner = _classes(PACKAGE / "model_runner.py")["CompassModelRunner"]
+    assert all(f"`{name}`" in ast.get_docstring(runner) for name in holders)
+
+
+def test_what_that_ring_costs_is_the_batch_budget_by_the_hidden_size():
+    """The shape of the residue, read off the allocation the docstring names.
+
+    Its dominant term, so a runner that allocates no weights still holds
+    device memory that grows with the batch budget and the model's hidden
+    size. The bytes are a measurement and live in the task record; what is
+    checkable here is which two numbers they are a product of.
+    """
+    allocate = _method_def(
+        _classes(ATOM_RUNNER)["ModelRunner"], "allocate_forward_vars"
+    )
+    built = next(
+        n.value
+        for n in ast.walk(allocate)
+        if isinstance(n, ast.Assign)
+        and any(getattr(t, "attr", None) == "forward_vars" for t in n.targets)
+    )
+    outputs = dict(zip([k.value for k in built.keys], built.values))["outputs"]
+    assert ast.unparse(outputs.func) == "torch.empty"
+    assert ast.unparse(outputs.args[0]) == "self.max_num_batched_tokens"
+    assert ast.unparse(outputs.args[-1]) == "hidden_size"
+
+
+def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
+    """The half of the claim that is this package's own: it adds none.
+
+    `model` registers no parameter and no buffer, and `_token_stream` is the
+    deferral bookkeeping `forward` builds on first use. Anything else appearing
+    here is a tensor this class put on a device, which is the thing it exists
+    not to do. The class docstring is held to the same two, by the mirror of
+    test 1's last two lines: the enumeration in the prose and the bindings in
+    the source fail together rather than drifting apart.
+    """
+    overrides = _classes(PACKAGE / "overrides.py")["NonAllocatingRunner"]
+    bound = {n for n, _ in _self_assigned(overrides)}
+    assert bound == {"model", "_token_stream"}
+    runner = _classes(PACKAGE / "model_runner.py")["CompassModelRunner"]
+    assert all(f"`{name}`" in ast.get_docstring(runner) for name in bound)
+
+
 # --- warmup drives a forward, which is why it is skipped ---------------------
 
 
