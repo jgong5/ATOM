@@ -230,9 +230,9 @@ def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
             if isinstance(s, str)
         }
         assert "plan_pools" not in strings, f"{module} names ATOM's plan_pools"
-        assert "_kv_budget_extra_reserve" not in strings, (
-            f"{module} names ATOM's budget reserve override point"
-        )
+        assert (
+            "_kv_budget_extra_reserve" not in strings
+        ), f"{module} names ATOM's budget reserve override point"
         literals = {
             round(n.value, 12)
             for n in ast.walk(tree)
