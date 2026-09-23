@@ -43,8 +43,7 @@ named.
 read back through `naming.read_back`; a neighbour that does not parse, is not
 listed, or whose digest has moved is refused by name rather than returned.
 
-**What was ART-2's is now here too**, and it is two more things the entry
-states about itself. A published entry carries the **fingerprint of every row
+**The entry also states two things about its own validity.** A published entry carries the **fingerprint of every row
 the invalidation matrix gives its kind** -- three for a `machine_spec`, whose
 capacity, runtime constants and tokenizer terms are invalidated by different
 things -- and the **state of every gate that shaped it**. Both are required at

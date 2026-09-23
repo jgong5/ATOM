@@ -19,9 +19,9 @@ invalidation does not need #165 ruled; where a key field happens to be
 called `width` the topology here is tensor-parallel only, so the two candidate
 readings coincide and no fixture settles the question by example.
 
-**It rules nothing that is the owner's.** T86 -- whether an aiter bump
-invalidates or only warns -- is #168, and until it is ruled the default
-stands: `test_an_aiter_bump_refuses_until_t86_is_ruled` pins the default, and
+**It rules nothing that is the owner's.** Whether an aiter bump invalidates
+or only warns is #168, and until it is ruled the default stands:
+`test_an_aiter_bump_refuses_until_its_meaning_is_ruled` pins the default, and
 it is the test that changes when the ruling lands.
 
 Nothing here touches a driver, a device or a network. The conditions are
@@ -63,10 +63,10 @@ from atom.compass.artifacts import (
 )
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-#: The document the table is read back out of. The section heading below is a
-#: literal this test parses, which is why the identifier survives here and in
-#: `matrix.py` and nowhere else.
-D43 = REPO / "atom" / "compass" / "design" / "07_calibration_toolchain.md"
+#: The design document the invalidation matrix is read back out of.
+MATRIX_DOC = REPO / "atom" / "compass" / "design" / "07_calibration_toolchain.md"
+#: The heading of the section that holds the table, whatever it is numbered.
+MATRIX_HEADING = re.compile(r"^## .*\bInvalidation$", re.MULTILINE)
 #: One cell of the document's table: the mark, and the parenthesis beside it.
 CELL = re.compile(r"^([X-])(?:\s*\*?\((.+)\)\*?)?$")
 
@@ -170,7 +170,7 @@ def publish(
 # --- the matrix is a table, and it is the document's ----------------------
 
 
-def test_the_matrix_is_d43s_table():
+def test_the_matrix_is_the_documents_table():
     """The code's table and the document's are one fact, cell by cell.
 
     The document's table is what a reader checks the code against by eye, so
@@ -179,8 +179,8 @@ def test_the_matrix_is_d43s_table():
     is what it is, silently lost -- `- (shape-parametric)` is the sentence
     that makes one pricing campaign serve many shapes.
     """
-    text = D43.read_text(encoding="utf-8")
-    table = text.split("## D43. Invalidation", 1)[1].split("### The gate", 1)[0]
+    text = MATRIX_DOC.read_text(encoding="utf-8")
+    table = MATRIX_HEADING.split(text, 1)[1].split("### The gate", 1)[0]
     lines = [line for line in table.splitlines() if line.strip().startswith("|")]
     header, _divider, *body = lines
     columns = [part.strip() for part in header.strip().strip("|").split("|")][1:]
@@ -215,7 +215,7 @@ def test_the_matrix_is_not_uniform():
 
 
 @pytest.mark.parametrize("kind", [Kind.SHAPE_POPULATION, Kind.COVERAGE_HULL])
-def test_a_kind_d43_does_not_row_is_refused_by_name(kind):
+def test_a_kind_the_matrix_does_not_row_is_refused_by_name(kind):
     """The key table declares seven artifacts and the matrix rows seven.
 
     The tempting default is "depends on nothing", which loads clean forever,
@@ -248,7 +248,7 @@ def test_every_cell_of_the_matrix_decides_by_itself(row, axis):
     It reads `MATRIX` rather than restating the document by hand, so on its
     own it
     would pass against a wrong table that the code agreed with. The anchor is
-    `test_the_matrix_is_d43s_table`, which ties `MATRIX` to the document; the
+    `test_the_matrix_is_the_documents_table`, which ties `MATRIX` to the document; the
     chain is document -> table -> behaviour, and each link is a test.
     """
     recorded = {row: fingerprint(row, BASE)}
@@ -346,8 +346,8 @@ def test_a_machine_spec_is_three_rows_and_a_device_change_moves_two(tmp_path):
     )
 
 
-def test_an_aiter_bump_refuses_until_t86_is_ruled(tmp_path):
-    """The default, implemented because T86's ruling is the owner's (#168).
+def test_an_aiter_bump_refuses_until_its_meaning_is_ruled(tmp_path):
+    """The default, because what an aiter bump means is the owner's ruling (#168).
 
     The four rows that carry ROCm/AITER/RCCL refuse a bump; `machine_spec`'s
     capacity does not, because the silicon did not move. If the ruling lands
@@ -613,7 +613,7 @@ def test_a_step_names_every_key_that_missed_not_the_first(tmp_path):
 
 
 def test_a_report_never_states_a_count_without_its_decomposition(tmp_path):
-    """Principle 7, in the one line that used to read `incomplete: N/2570`."""
+    """No count without the names behind it, where `incomplete: N/2570` was."""
     store = ArtifactStore(tmp_path)
     published = publish(store, KEY_OF[Row.PRICE_LIST])
     step = Resolution("step 41")
@@ -746,7 +746,7 @@ def test_a_publish_that_states_no_conditions_is_refused(tmp_path):
 
 
 def test_notes_that_are_not_text_are_refused_and_leave_nothing_behind(tmp_path):
-    """Measured by ART-1 and filed as #169: `TypeError`, and litter.
+    """Measured on the artifact store's review, filed as #169: `TypeError`, and litter.
 
     `notes` was never checked, so a non-string reached `json.dumps` and came
     back as a bare `TypeError` -- an unnamed exception where a named refusal

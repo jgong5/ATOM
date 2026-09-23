@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: MIT
-"""D43's invalidation matrix, as a table rather than a chain of conditionals.
+"""The invalidation matrix, as a table rather than a chain of conditionals.
 
 A global fingerprint would force re-measuring everything on a torch bump. Each
 artifact records the fingerprint of **its own dependency row**, so a bump
 invalidates the rows that name it and leaves the rest alone.
 
-The identifier `D43` survives in this module and in the test that reads the
-document, and nowhere else in the package. It is not a citation there:
-`test_the_matrix_is_d43s_table` opens
-`atom/compass/design/07_calibration_toolchain.md` and splits it on the literal
-string `"## D43. Invalidation"` to parse the table back out, so the name is a
-functional dependency of that test. Nothing this module *emits* carries it.
+The table lives in `atom/compass/design/07_calibration_toolchain.md`, in the
+section headed *Invalidation*. `test_the_matrix_is_the_documents_table` opens
+that file by path, finds the section by its heading and parses the table
+back out, so the document is a functional dependency of that test and of
+nothing this module emits.
 
 `MATRIX` below is that table transcribed, and it is deliberately a table: the
 deliverable is that a reader can hold the document beside the code and check
-them cell by cell. `test_the_matrix_is_d43s_table` does the same check
+them cell by cell. `test_the_matrix_is_the_documents_table` does the same check
 mechanically, parsing the document's own rows, marks and parentheses, so the
 two cannot drift.
 
@@ -48,7 +47,7 @@ from .rules import ArtifactRefusal, Rule
 class Axis(enum.Enum):
     """The six things a change to which can invalidate an artifact.
 
-    The value is D43's column header verbatim so a refusal quotes the document;
+    The value is the document's column header verbatim so a refusal quotes it;
     `field` is the stable name the same axis is recorded and asked for under.
     """
 
@@ -69,7 +68,7 @@ class Axis(enum.Enum):
 
 
 class Row(enum.Enum):
-    """D43's seven rows. `machine_spec` is three of them, and that is the point."""
+    """The seven rows. `machine_spec` is three of them, and that is the point."""
 
     OP_GRAPH = "op_graph"
     PRICE_LIST = "price_list"
@@ -90,7 +89,7 @@ class Row(enum.Enum):
 
 @dataclass(frozen=True, slots=True)
 class Cell:
-    """One cell of D43's table: the mark, and the parenthesis beside it.
+    """One cell of the table: the mark, and the parenthesis beside it.
 
     The note is carried rather than dropped because three of the seven rows
     have one and each says something the mark alone does not -- which part of
@@ -106,11 +105,11 @@ class Cell:
         return f"{mark} ({self.note})" if self.note else mark
 
 
-#: D43's `X` and `-`, so the table below transcribes rather than translates.
+#: The document's `X` and `-`, so the table below transcribes rather than translates.
 DEPENDS = Cell(True)
 INDEPENDENT = Cell(False)
 
-#: D43's invalidation matrix, row by row and column by column.
+#: The invalidation matrix, row by row and column by column.
 MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
     Row.OP_GRAPH: {
         Axis.SOFTWARE_STACK: INDEPENDENT,

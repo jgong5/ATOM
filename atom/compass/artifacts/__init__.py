@@ -36,7 +36,7 @@ thing it was measured against has moved.
   states a count and not which of two stages declined.
 
 **Not decided here**: whether an aiter bump invalidates an artifact or only
-warns (T86, filed as #168) -- until it is ruled the default stands and a bump
+warns (filed as #168) -- until it is ruled the default stands and a bump
 refuses; whether a dirty source root may publish (also #168); and what
 an artifact key's scalar `width` means against a four-axis topology (#165).
 The matrix's six columns hold no width, so nothing here binds one.
