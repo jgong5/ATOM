@@ -7,9 +7,15 @@ the fixture and not a precaution: the package claims that no reading comes off
 a card, and a claim of that shape is worth what it costs to falsify.
 It is checked twice over and the two checks fail differently -- the patch would
 catch a call made at run time, and `test_the_package_imports_no_device` catches
-one that could be made at all, by reading the import graph of every module in
-the package. A module that never imports torch cannot call it, however the
-branches fall.
+a device import. It reads every import statement of every module, in every
+branch, and it imports each module in a fresh interpreter, which sees a name
+whose lookup loads the engine (`atom.LLMEngine`, `from atom import *`) and a
+module reached through another. Neither sees a load reached only by code that
+does not run at import (a function body that is not called, or a branch not
+taken), whether it is an import statement or an attribute access, unless the
+statement names a forbidden module itself: `importlib.import_module("torch")`,
+`atom.LLMEngine` or `from atom import LLMEngine` inside a `def`, or a `def`
+that imports a module which imports torch.
 
 The model is the vendored Qwen3.8-27B config, as `test_backend_kv_geometry.py`
 uses it, so the geometry here and the KV geometry there are the same model. The
@@ -27,6 +33,8 @@ import ast
 import copy
 import json
 import pathlib
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -594,6 +602,10 @@ FORBIDDEN_ROOTS = frozenset({"torch", "transformers"})
 FORBIDDEN_PREFIXES = ("atom.model_engine", "atom.model_ops", "atom.models")
 
 
+def _forbidden(mod):
+    return mod.split(".")[0] in FORBIDDEN_ROOTS or mod.startswith(FORBIDDEN_PREFIXES)
+
+
 def _imported_names(tree):
     """Every module name a tree imports, with relative imports resolved.
 
@@ -605,7 +617,9 @@ def _imported_names(tree):
     ignored. `from ... import model_engine` carries `node.module is None`,
     which a truthiness guard skips entirely; here each imported name is
     resolved against the package instead, to `atom.model_engine`, and its row
-    fails when that guard is put back.
+    fails when that guard is put back. The absolute `from atom import
+    model_engine` adds `atom.model_engine` beside `atom`, and its row fails
+    without that.
     """
     names = set()
     for node in ast.walk(tree):
@@ -620,20 +634,39 @@ def _imported_names(tree):
                     names.update(".".join(parts + [alias.name]) for alias in node.names)
             elif node.module:
                 names.add(node.module)
+                names.update(f"{node.module}.{alias.name}" for alias in node.names)
     return names
+
+
+def _device_imports(source):
+    """The forbidden modules imported by running `source` inside the package, in
+    a fresh interpreter (this one imported torch above) started in the root this
+    suite imported `atom` from. The first forbidden import is refused before it
+    loads, so a caught row costs an interpreter start, not an engine."""
+    probe = (
+        "import os, sys\n"
+        "class Refuse:\n"
+        "    def find_spec(name, *_):\n"
+        f"        if name.split('.')[0] in {sorted(FORBIDDEN_ROOTS)} or name.startswith({FORBIDDEN_PREFIXES}):\n"
+        "            os.write(1, b'\\n' + name.encode()), os._exit(0)\n"
+        "sys.meta_path.insert(0, Refuse)\n"
+        f"exec({source!r}, {{'__package__': {PACKAGE_DOTTED!r}}})\n"
+        "print(*sys.modules)"
+    )
+    run = [sys.executable, "-c", probe]
+    loaded = subprocess.check_output(run, cwd=PACKAGE.parents[2], text=True).split()
+    return [name for name in loaded if _forbidden(name)]
 
 
 @pytest.mark.parametrize("module", sorted(p.name for p in PACKAGE.glob("*.py")))
 def test_the_package_imports_no_device(module):
-    # The patched fixture catches a call; this catches the possibility of one,
-    # for branches that never execute. It is one level deep and not a closure:
-    # a memory module importing an `atom.compass.*` module that itself imports
-    # torch passes here, and a full closure needs a real import walk. Nothing
-    # in the package does that today, and this says so rather than implying a
-    # guarantee it does not give.
+    # The patched fixture catches a call; this catches the possibility of one.
+    # The walk reads branches that never execute but only one level deep; the
+    # import reads the whole closure but only what runs at import time.
     for name in sorted(_imported_names(ast.parse((PACKAGE / module).read_text()))):
-        assert name.partition(".")[0] not in FORBIDDEN_ROOTS, f"{module} -> {name}"
-        assert not name.startswith(FORBIDDEN_PREFIXES), f"{module} -> {name}"
+        assert not _forbidden(name), f"{module} -> {name}"
+    dotted = f"{PACKAGE_DOTTED}.{module[:-3]}".removesuffix(".__init__")
+    assert _device_imports(f"import {dotted}") == [], module
 
 
 @pytest.mark.parametrize(
@@ -645,18 +678,34 @@ def test_the_package_imports_no_device(module):
         ("from ...model_engine import model_runner", True),
         ("from ...model_engine.model_runner import ModelRunner", True),
         ("from ... import model_engine", True),
+        ("from atom import model_engine", True),
         ("from . import terms", False),
         ("from atom.compass.spec import MachineSpec", False),
     ],
 )
 def test_the_import_guard_catches_what_it_claims_to(source, caught):
-    # A guard with no positive control is a guard nobody has seen work. The
-    # two `from ...model_engine` rows are the forms a walk that ignores
-    # `node.level` lets through, and `from ... import model_engine` the form a
-    # walk that skips `node.module is None` lets through.
+    # A guard with no positive control is a guard nobody has seen work.
     names = _imported_names(ast.parse(source))
-    hit = any(
-        name.partition(".")[0] in FORBIDDEN_ROOTS or name.startswith(FORBIDDEN_PREFIXES)
-        for name in names
-    )
-    assert hit is caught, names
+    assert any(map(_forbidden, names)) is caught, names
+
+
+@pytest.mark.parametrize(
+    "source,caught",
+    [
+        ("from ... import LLMEngine", True),
+        ("import atom\natom.LLMEngine", True),
+        ("from ... import *", True),
+        ("from atom.compass.runner import overrides", True),
+        ("import sys\nsys.stdout.write('x')\nfrom ... import LLMEngine", True),
+        ("import io, sys\nsys.stdout = io.StringIO()\nfrom ... import LLMEngine", True),
+        ("from . import terms", False),
+    ],
+)
+def test_the_import_run_catches_what_the_walk_does_not(source, caught):
+    # Every row passes the walk. Each True row reaches a device import anyway: a
+    # name, not a module, loads the engine through `atom/__init__.py`'s lazy lookup,
+    # or a module outside the package imports torch. The refusal goes to file
+    # descriptor 1, so the two rows that write to or replace `sys.stdout` do not
+    # hide it.
+    assert not any(map(_forbidden, _imported_names(ast.parse(source))))
+    assert bool(_device_imports(source)) is caught
