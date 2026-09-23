@@ -809,7 +809,15 @@ def test_raise_first_gives_the_spec_or_the_first_refusal():
 
 
 def refused_by_condition():
-    """One subject per condition in the check set, each earning its refusal."""
+    """One subject per condition in the check set, each earning its refusal.
+
+    Each subject comes with the rule and a piece of the text only that
+    condition's refusal writes. A subject that is wrong in one respect is
+    usually wrong in another too -- a document missing an entry is refused for
+    the missing width as well as for the probe that could not fill it -- so a
+    rule alone can be earned by a neighbouring condition while the one named
+    here produces nothing.
+    """
     thin = without(TIER1, "device", "arch")
     no_constant = without(
         TIER1, "device", "runtime_constants", "persistent_forward_buffer_bytes"
@@ -833,24 +841,51 @@ def refused_by_condition():
         )
     return {
         MISSING_ASKED: [
-            (validate(merge(fragments(tier1=thin)).document), Rule.SHAPE),
+            (
+                validate(merge(fragments(tier1=thin)).document),
+                Rule.SHAPE,
+                "`device.arch` is missing",
+            ),
             (
                 validate(merge(fragments(tier1=no_constant)).document),
                 Rule.NO_DEFAULTS,
+                "`device.runtime_constants.persistent_forward_buffer_bytes` is missing",
             ),
         ],
         DERATES_ASKED: [
-            (validate(merge(fragments(tier1=no_derate)).document), Rule.DERATE)
+            (
+                validate(merge(fragments(tier1=no_derate)).document),
+                Rule.DERATE,
+                "`device.memory.derate` is missing, and its block states a spec peak",
+            )
         ],
-        WIDTHS_ASKED: [(validate(merged(), tp_widths=(16,)), Rule.NO_DEFAULTS)],
+        WIDTHS_ASKED: [
+            (
+                validate(merged(), tp_widths=(16,)),
+                Rule.NO_DEFAULTS,
+                "was not measured at tensor-parallel width 16",
+            )
+        ],
         PROBES_ASKED: [
             (
                 validate(merge(fragments(tier1=no_probe)).document, tp_widths=(1,)),
                 Rule.NO_DEFAULTS,
+                (
+                    "no probe here fills `allocator_retained_after_load_bytes` "
+                    "at tensor-parallel width 1"
+                ),
             )
         ],
-        STACK_ASKED: [(moved, Rule.PINNED_STACK)],
-        TRANSFERS_ASKED: [(validate(transferred), Rule.PINNED_STACK)],
+        STACK_ASKED: [
+            (moved, Rule.PINNED_STACK, "this spec's constants were measured against")
+        ],
+        TRANSFERS_ASKED: [
+            (
+                validate(transferred),
+                Rule.PINNED_STACK,
+                "measured against rocm '7.0.2', into a spec pinned to rocm '7.2.4'",
+            )
+        ],
     }
 
 
@@ -867,9 +902,14 @@ def test_the_check_set_names_every_condition_a_spec_can_be_refused_by():
 
 @pytest.mark.parametrize("condition", CONDITIONS)
 def test_each_condition_in_the_check_set_is_earned_by_a_spec(condition):
-    for checked, rule in refused_by_condition()[condition]:
+    for checked, rule, written in refused_by_condition()[condition]:
         assert not checked.ok, condition
-        assert rule in {refusal.rule for refusal in checked.refusals}, condition
+        # The rule and the text on one refusal: the rule alone is shared by
+        # conditions, and the text alone could sit on a refusal of another rule.
+        assert any(
+            refusal.rule is rule and written in refusal.what
+            for refusal in checked.refusals
+        ), (condition, [str(refusal) for refusal in checked.refusals])
 
 
 def test_a_document_reaches_what_the_package_says_a_document_reaches():
@@ -1550,6 +1590,14 @@ def test_readings_no_card_could_produce_are_refused_though_their_difference_is_n
     with pytest.raises(SpecRefusal) as refused:
         non_torch_across_ranks(2, [odd, odd], 7.2e9)
     assert refused.value.rule is Rule.DEVICE_WIDE
+    # These readings are two impossibilities, and the negative reserve would
+    # be refused by the same rule on its own. What is named is the free memory
+    # the card cannot hold, so a check that stopped asking that is seen here
+    # rather than covered by its neighbour.
+    assert "rank 0 reports 400000000000.0 bytes free of 288000000000.0" in (
+        refused.value.what
+    )
+    assert "take them again and find out" in refused.value.remedy
 
 
 def test_a_reading_just_inside_the_limit_is_accepted_and_is_what_the_spec_takes():
@@ -1570,7 +1618,13 @@ def test_a_width_with_no_ranks_is_refused_rather_than_reduced(tp_width):
     with pytest.raises(SpecRefusal) as refused:
         non_torch_across_ranks(tp_width, [], 7.2e9)
     assert refused.value.rule is Rule.RANK_AGREEMENT
-    assert str(tp_width) in refused.value.what
+    # The cross-rank reduction refuses a negative width by the same rule, for
+    # having no reading per rank, and names the width too. The text below is
+    # the width's own refusal, which is asked before any reading is counted.
+    assert (
+        f"tensor-parallel width {tp_width!r} has no ranks to read a card on"
+        in refused.value.what
+    )
 
 
 def test_the_readings_are_reachable_by_name():
@@ -1659,6 +1713,34 @@ def test_a_spec_that_carries_the_hand_measured_entry_is_not_refused_for_it():
     # obtained. A spec that states it is a good spec at width 1.
     checked = validate(merged().document, tp_widths=(1,))
     assert checked.ok
+
+
+def test_the_probe_question_is_asked_of_the_tables_it_says_it_reads(monkeypatch):
+    # The condition registers `PROBE_TABLES` as what it reads, and the walk that
+    # produces its refusals has to be over the same tables. Walking every width
+    # table instead changes nothing today -- the reserve table is filled at
+    # every width, so asking about it never refuses -- which is why the walk is
+    # observed here by what it asks rather than by what it answers.
+    asked = []
+
+    def recording(constant, tp_width):
+        asked.append((constant, tp_width))
+        return probe_for(constant, tp_width)
+
+    monkeypatch.setattr(
+        importlib.import_module("atom.compass.spec.validate"), "probe_for", recording
+    )
+    checked = validate(merged().document, tp_widths=(16,))
+    # Width 16 is missing from every width table, so a walk over any of them
+    # would reach the probe; the width question says so once per table.
+    unmeasured = [
+        refusal
+        for refusal in checked.refusals
+        if "was not measured at tensor-parallel width 16" in refusal.what
+    ]
+    assert len(unmeasured) == len(WIDTH_TABLES) > len(PROBE_TABLES)
+    assert asked, "the probe question asked nothing"
+    assert asked == [(path.rsplit(".", 1)[-1], 16) for path in PROBE_TABLES]
 
 
 @pytest.mark.parametrize("tp_width", [0, -3])
