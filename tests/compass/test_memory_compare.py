@@ -314,6 +314,13 @@ def test_the_tied_head_is_one_embedding_of_0_290_gib_on_the_0_6b():
     assert round(nbytes / (1 << 30), 3) == 0.290
 
 
+def test_the_tied_head_scales_with_a_4_byte_element_size():
+    # A float32 build of the same geometry owes twice the bfloat16 correction.
+    nbytes = tied_lm_head_bytes(qwen_0_6b(), dtype_bytes=4)
+    assert nbytes == 151_936 * 1_024 * 4
+    assert nbytes == 622_329_856
+
+
 def test_an_untied_model_owes_no_correction(qwen):
     assert qwen.tie_word_embeddings is False
     assert tied_lm_head_bytes(qwen, dtype_bytes=2) == 0
