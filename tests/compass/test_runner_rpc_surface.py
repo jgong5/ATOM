@@ -27,6 +27,7 @@ import ast
 import collections
 import pathlib
 import re
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import pytest
@@ -209,9 +210,15 @@ EXTENSION_CLASSES = {
 
 
 class Runner(NonAllocatingRunner):
-    """The overrides over a base that supplies only what they read."""
+    """The overrides over a base that supplies only what they read.
+
+    `config` is empty rather than absent: the base sets it first thing in its
+    own `__init__`, so every override reads it, and a stub without one tests a
+    shape the class is never in.
+    """
 
     def __init__(self):
+        self.config = SimpleNamespace()
         self.capture_sizes = [0]
         self.capture_sizes_np = "untouched"
 
@@ -508,7 +515,10 @@ def test_get_num_blocks_refuses_and_the_keys_its_caller_reads_are_named():
         if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict)
     )
     assert required | optional == returned
-    with pytest.raises(RunnerRefusal, match="memory model"):
+    # The four keys are now forwarded from the base rather than described in a
+    # refusal, so what is left to check on this side is that the one path that
+    # answers nothing still names what would make it answer.
+    with pytest.raises(RunnerRefusal, match="install_device_readings"):
         Runner().get_num_blocks()
 
 

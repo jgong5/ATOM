@@ -33,8 +33,14 @@ and returns a per-term table with no total in it. The aggregate exists only as
 a `SummedCheck`, which cannot be built without the comparison it summarises,
 because the instrument that reads one figure over a decomposition is the one
 the per-term rule was written to reject.
+
+**A block count keeps its readings.** ATOM's own arithmetic turns the five into
+one integer, and an integer cannot say that most of what produced it was a
+coefficient somebody wrote down. `budget.SizedKVPool` is the count carried
+beside the readings it came out of; it computes nothing ATOM computes.
 """
 
+from atom.compass.memory.budget import SUBTRACTED, SizedKVPool
 from atom.compass.memory.compare import (
     DISCHARGES,
     NON_KV_TERM_GATE,
@@ -53,6 +59,7 @@ from atom.compass.memory.compare import (
     tied_lm_head_bytes,
 )
 from atom.compass.memory.graph_pool import (
+    EAGER_SOURCE,
     PREDICTS,
     RESERVES,
     PiecewiseCapture,
@@ -71,9 +78,11 @@ from atom.compass.memory.terms import Basis, Reading, Term
 
 __all__ = [
     "DISCHARGES",
+    "EAGER_SOURCE",
     "NON_KV_TERM_GATE",
     "PREDICTS",
     "RESERVES",
+    "SUBTRACTED",
     "Basis",
     "Comparison",
     "DeviceReadings",
@@ -85,6 +94,7 @@ __all__ = [
     "Reading",
     "Recorded",
     "Shape",
+    "SizedKVPool",
     "SummedCheck",
     "Term",
     "TermComparison",

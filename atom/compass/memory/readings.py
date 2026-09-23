@@ -4,7 +4,7 @@
 """The five readings `get_num_blocks` takes off a card, taken off a spec instead.
 
 The rule is **substitute the readings, never the arithmetic**. ATOM's
-`get_num_blocks` (`model_runner.py:1652-1873`) is five device readings and then
+`get_num_blocks` (`model_runner.py:1686-1900`) is five device readings and then
 some arithmetic over them; this module owns the five, and the budget formula,
 the 2% margin, the `min(budget, free)` clamp and `plan_pools` stay ATOM's. A
 copy of that formula here is exactly the drift the substitution exists to avoid,
@@ -170,7 +170,7 @@ class ModelTerms:
             "positions x rotary_dim elements, because inv_freq holds "
             "rotary_dim/2 of them (model_ops/rotary_embedding.py:58-80), and "
             "they are resident at the model dtype they are cast to, not the "
-            "fp32 they are computed in (:39-49, set at model_runner.py:700)",
+            "fp32 they are computed in (:39-49, set at model_runner.py:714)",
         )
         activations = Term(
             "activations",
@@ -188,7 +188,7 @@ class ModelTerms:
             f"{_LIVE_INTERMEDIATE} x {intermediate} intermediate)",
             "a liveness walk over a traced op graph, plus the per-leaf "
             "invisible-scratch constants, replace this; the per-layer "
-            "coefficient is ATOM's own (model_runner.py:3601), over one live "
+            "coefficient is ATOM's own (model_runner.py:3628), over one live "
             "layer rather than all of them",
         )
         return cls(weights, buffers, activations)
@@ -333,7 +333,7 @@ def device_readings(
             "this configuration does not start on this card. Even "
             "--gpu-memory-utilization 1.0 is insufficient -- the non-KV terms "
             f"alone are {needed:.2f} of total -- so the lever ATOM names on "
-            "its own version of this failure (model_runner.py:1698-1706) will "
+            "its own version of this failure (model_runner.py:1725-1733) will "
             "not reach it; reduce the width, the model or the warmup shape, "
             "or name a larger card. A clamped zero here would be a free "
             "reading nobody could read as a refusal",
