@@ -26,6 +26,7 @@ module's tests read it.
 import ast
 import collections
 import pathlib
+import re
 from typing import NamedTuple
 
 import pytest
@@ -41,6 +42,9 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 ENGINE = REPO / "atom" / "model_engine"
 ATOM_RUNNER = ENGINE / "model_runner.py"
 ASYNC_PROC = (ENGINE / "async_proc.py").read_text()
+PACKAGE = REPO / "atom" / "compass" / "runner"
+PACKAGE_DOC = ast.get_docstring(ast.parse((PACKAGE / "__init__.py").read_text()))
+UNWAITED = {name for name, waits in RPC_SURFACE.items() if not waits}
 BROADCAST = ("call_func", "call_func_with_aggregation")
 # Every class in the tree that answers a dispatched name and is not in
 # `model_runner.py`. The leftover names have to land on one of these; a name
@@ -814,3 +818,72 @@ def test_the_zero_block_form_in_the_tree_answers_two_of_the_four_keys():
     engine = (ENGINE / "engine_core.py").read_text()
     assert 'block_info.get("pool_entries", {})' in engine
     assert 'block_info.get("pool_entries_per_req", {})' in engine
+
+
+# --- the package docstring, read against the table it describes --------------
+
+
+def _bullet_leads(doc):
+    """The backticked name each top-level bullet of *doc* opens with.
+
+    The package docstring carries two bullet lists -- the modules it splits and
+    the dispatched names no caller waits for -- and every entry of both opens
+    with one backticked identifier. Reading the leads rather than searching the
+    whole text is what lets the two lists be checked separately, and it is also
+    what keeps an incidental mention from counting: `forward` is named in the
+    prose of a module bullet and is not an entry of either list.
+    """
+    return set(re.findall(r"^- `([A-Za-z_][A-Za-z0-9_]*)`", doc, flags=re.MULTILINE))
+
+
+def test_the_package_docstring_lists_every_module_beside_it():
+    """The split it describes has to be over the package's own files.
+
+    The docstring said "Two modules" for as long as there were three:
+    `step_output` landed a PR after the sentence was written, and nothing went
+    red, because a count in prose has nothing to disagree with. So the bullets
+    are compared against the directory instead of against a number, and the
+    next module either appears in them or fails here.
+    """
+    modules = {p.stem for p in PACKAGE.glob("*.py")} - {"__init__"}
+    assert "step_output" in modules, "the glob found no package to compare against"
+    assert _bullet_leads(PACKAGE_DOC) - set(RPC_SURFACE) == modules
+
+
+def test_the_package_docstring_partitions_the_surface_the_way_the_table_does():
+    """A hole in this surface is quiet, but it is not one failure.
+
+    `RPC_SURFACE`'s value is whether the caller waits, and the two answers fail
+    differently: a hole in a waited name parks its caller for the life of the
+    process, and a hole in an unwaited one parks nobody and loses the work the
+    name stood for. The docstring claimed the first for all twelve until it was
+    corrected, which named the one failure mode that cannot happen at the other
+    two and sent a reader debugging a leak or a missing KV load to look for a
+    park that does not exist.
+
+    This fails in both directions. Reinstating the unpartitioned sentence
+    leaves the docstring naming neither name; flipping an entry of the table,
+    or adding a thirteenth that no caller waits for, leaves it naming the wrong
+    ones. The two guards either side of the assertion keep it from passing
+    vacuously if the table ever stopped recording two answers at all.
+    """
+    assert UNWAITED, "a table with nothing unwaited would pass the partition trivially"
+    assert UNWAITED != set(RPC_SURFACE), "and so would a table with nothing waited"
+    assert _bullet_leads(PACKAGE_DOC) & set(RPC_SURFACE) == UNWAITED
+
+
+def test_every_site_the_package_docstring_cites_is_one_no_caller_waits_for():
+    """The partition is a claim about call sites, so it carries them.
+
+    Each unwaited bullet names where ATOM broadcasts that name, and `SITES` is
+    recovered from ATOM's own source rather than from this file, so the
+    citations are checked against the tree instead of read as decoration. Set
+    equality covers the way either half drifts: a broadcast that moves, or a
+    second site that appears, is uncited; a site that starts passing
+    `wait_out=True`, or a name that leaves the unwaited half, is cited and
+    should not be.
+    """
+    cited = set(re.findall(r"`([a-z_]+\.py:\d+)`", PACKAGE_DOC))
+    sites = [s for name in UNWAITED for s in SITES[name]]
+    assert [s for s in sites if s.waits] == []
+    assert cited == {f"{s.file}:{s.line}" for s in sites}
