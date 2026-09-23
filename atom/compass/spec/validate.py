@@ -372,7 +372,9 @@ def _transfers(resolved: Mapping[str, Any], merged: Merge):
                 "this one cannot say which stack they were measured against",
                 "merge the fragments it was built from "
                 f"({', '.join(map(repr, listed))}) in its place, since a "
-                "transfer states its source's stack pin there and nowhere else",
+                "transfer states its source's stack pin there and nowhere else; "
+                "any of them that is itself a saved document with no pin is "
+                "refused the same way",
             )
             continue
         if not declared:

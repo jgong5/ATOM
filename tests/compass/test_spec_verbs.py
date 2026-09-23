@@ -336,6 +336,7 @@ def test_two_fragments_pinned_to_different_stacks_are_refused_as_a_stack_conflic
     with pytest.raises(SpecRefusal) as refused:
         merge([fragment("tier1", TIER1), fragment("tier1b", moved)])
     assert refused.value.rule is Rule.PINNED_STACK
+    assert "fragments pinned to different stacks" in refused.value.remedy
 
 
 def test_the_merged_document_reads_as_a_spec_and_echoes_back():
@@ -586,21 +587,32 @@ def test_a_transfer_that_names_no_stack_at_all_is_refused():
 def test_a_saved_transfer_merged_again_names_the_merge_that_dropped_its_pin():
     # The transfer is pinned to this stack; the merge that wrote the saved
     # document kept that pin out, so no author omitted it. The first-hand
-    # transfer with no pin is the control, and its text does not change.
+    # transfer with no pin is the control, and its text does not change. Saved
+    # twice, the provenance lists the pinned transfer and the first saved
+    # document, which is itself a transfer with no pin; the remedy names both.
     carried = copy.deepcopy(TIER2)
     carried["device"]["software_pinned_to"] = dict(STACK)
     transfer = fragment("tier2", carried, method="transferred-from:mi300x-8gpu")
     saved = Fragment.from_mapping(merge([transfer]).document, "t.yaml")
-    again = validate(merge([saved] + fragments()[:2] + [fragment("links", LINKS)]))
-    assert [refusal.rule for refusal in again.refusals] == [Rule.PINNED_STACK]
-    assert "fragments an earlier merge built it from" in again.refusals[0].what
-    assert "merge the fragments it was built from" in again.refusals[0].remedy
+    rest = fragments()[:2] + [fragment("links", LINKS)]
+    (refused,) = validate(merge([saved] + rest)).refusals
+    assert refused.rule is Rule.PINNED_STACK
+    assert "over from 'mi300x-8gpu', and its provenance names the" in refused.what
+    assert "fragments an earlier merge built it from" in refused.what
     bare = fragment("tier2", TIER2, method="transferred-from:mi300x-8gpu")
     first_hand = validate(merge(fragments()[:2] + [bare, fragment("links", LINKS)]))
     assert first_hand.refusals[0].what == (
         "'tier2' (machine 'mi355x-8gpu-2node', transferred-from:mi300x-8gpu, "
         "by a person on 2026-09-18) carried constants over from 'mi300x-8gpu' "
         "without saying which stack they were measured against"
+    )
+    twice = Fragment.from_mapping(merge([saved]).document, "t2.yaml")
+    (refused,) = validate(merge([twice] + rest)).refusals
+    assert refused.remedy == (
+        "merge the fragments it was built from ('tier2', 't.yaml') in its place, "
+        "since a transfer states its source's stack pin there and nowhere else; "
+        "any of them that is itself a saved document with no pin is refused the "
+        "same way"
     )
 
 
@@ -611,24 +623,9 @@ def test_a_transfer_whose_provenance_lists_no_fragments_is_refused_first_hand():
     rest = fragments()[:2] + [fragment("links", LINKS)]
     empty = fragment("tier2", TIER2, method=method, fragments=[])
     bare = fragment("tier2", TIER2, method=method)
-    refused = [str(r) for r in validate(merge(rest + [empty])).refusals]
-    assert refused == [str(r) for r in validate(merge(rest + [bare])).refusals]
-
-
-def test_a_saved_transfer_refusal_names_the_fragments_its_provenance_lists():
-    # Saved twice, the provenance lists the pinned transfer and the first saved
-    # document, which is itself a transfer with no pin; the remedy names both.
-    carried = copy.deepcopy(TIER2)
-    carried["device"]["software_pinned_to"] = dict(STACK)
-    transfer = fragment("tier2", carried, method="transferred-from:mi300x-8gpu")
-    once = Fragment.from_mapping(merge([transfer]).document, "t0.yaml")
-    twice = Fragment.from_mapping(merge([once]).document, "t1.yaml")
-    again = validate(merge([twice] + fragments()[:2] + [fragment("links", LINKS)]))
-    (refused,) = again.refusals
-    assert refused.remedy == (
-        "merge the fragments it was built from ('tier2', 't0.yaml') in its place, "
-        "since a transfer states its source's stack pin there and nowhere else"
-    )
+    (refused,) = validate(merge(rest + [empty])).refusals
+    (control,) = validate(merge(rest + [bare])).refusals
+    assert str(refused) == str(control)
 
 
 def test_a_transfer_from_a_spec_pinned_to_this_stack_validates():
