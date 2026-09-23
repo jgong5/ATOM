@@ -26,10 +26,17 @@ the file from that generation's own sentence: before the register's most recent
 row landed the file stated 86 rows, `T1-T80 and T82-T87` and 80 open, and the
 parsers here return exactly those three figures from it.
 
-Two adjacent documents are out of scope deliberately. `16_execution_plan.md`
-states no count at all -- it was corrected to stop restating one after going
-stale twice in a day -- and nothing here re-requires it; only the two files in
-`STATED_IN` must state their figures. And prose decomposition *is* in scope
+Only the two files in `STATED_IN` must state these figures, and -- the other
+half of the same rule -- no other design document may state them at all.
+`16_execution_plan.md` is the reason: it restated a register count and went
+stale twice in one day, and was then corrected to state none. Nothing here
+re-requires it, but every design document including it is now read for a figure
+it must not carry, so a fourth copy fails on arrival rather than years later.
+What counts as such a figure is narrowed deliberately, in the comments on
+`EXTENT` and `COUNT` below: a guard that refused a measurement table's row count
+would be answered with an exemption, and an exemption list is the next hole.
+
+And prose decomposition *is* in scope
 here, unlike the synchronization inventory's guard which reads a `Count` column
 and so cannot see a decomposition that disagrees with it: the open figure is
 not derivable from the rows alone, because one row is closed without being
@@ -57,6 +64,68 @@ TOTAL = re.compile(r"(\d+) (?:registered TODOs|rows)")
 OPEN = re.compile(r"(?<![T\d.])(\d+) are open")
 STRUCK = re.compile(r"((?:T\d+(?:, | and ))*T\d+) are struck through as done")
 CLOSED = re.compile(r"T(\d+) was opened and closed")
+
+DESIGN_DOCS = sorted(DESIGN.glob("*.md"))
+ELSEWHERE = tuple(path for path in DESIGN_DOCS if path not in STATED_IN)
+
+# An *extent* is a T-number range. It asserts the register holds every id
+# between its endpoints, so it states how far the register runs and goes stale
+# the moment the register grows. A list of ids is not an extent: it names the
+# ids it names and claims nothing between them, which is how a topic document
+# points at its own successors, and `15_parallelism_support.md` does exactly
+# that today. The dash class is every dash these documents write a range with:
+# the front page writes `D0–D94`, `01` writes `D3-D5`, and an author restating
+# the extent with the em dash their prose is full of has stated it just the same.
+EXTENT = re.compile(r"T\d+ ?[-–—‒−] ?T\d+")
+
+# A *count* is a number whose noun can mean nothing but the register. `rows`
+# and `items` alone cannot qualify it, because the design counts rows of
+# measurement tables and items of many other kinds; `TOTAL` above reads `rows`
+# and is safe only because it runs over `STATED_IN`. The cost of that narrowing
+# is stated with the cases it protects, in `LEGITIMATE`.
+#
+# The lookbehind is `OPEN`'s above, widened, and is here for the same reason: an
+# id ends in digits, so without it a list of ids reads as a count -- `T83, T84
+# and T85 are open` refused as `85 are open`. That refuses the list form this
+# rule leaves legal, and prescribes as the remedy the list it just refused.
+# `OPEN` excludes `T` alone because the two files it reads name nothing else;
+# the documents read here name `D92`, `M1`, `TP4`, `W3` and `P0` as well, and
+# `D4 and D6 are open` is the class the `D6 open issue` row below is pinned to
+# protect. So the class is every letter: digits glued to one are an identifier.
+#
+# `N TODOs` and `N are open` reach wider than the register -- they refuse `The
+# adapter still carries 4 TODOs` and `Of the five probes, 3 are open` -- and are
+# kept that way. `TODOs` is the register's own noun and `are open` is how both
+# stating sentences state the open figure, so narrowing either to exclude those
+# would let the register's own phrasing through in a third document. Neither
+# sentence occurs in `design/`; the remedy for a false refusal is to write the
+# sentence another way, never an exemption.
+COUNT = re.compile(
+    r"(?<![A-Za-z\d.])\d+ (?:registered (?:TODOs|items)|open items|TODOs|are open)"
+)
+
+# Quoted from the documents this scan reaches. Each is a number or a run of ids
+# that a looser reading of either pattern would refuse, and each is legitimate:
+# a measurement table's row count, successors named one by one, and a decision
+# id sitting next to the word "open".
+LEGITIMATE = (
+    "| median over 121 rows | 9.51% | **9.03%** | |",
+    "successors T83, T84, T85",
+    (
+        "| T13 | Decide the simulated KV connector's completion semantic "
+        "(MoRI-IO's last-status vs Mooncake's all-ranks) | doc 01 D6 open issue, "
+        "surfaces here |"
+    ),
+)
+
+# Not quoted: no document writes either sentence today. They are pinned because
+# a list of ids is the form this rule leaves legal -- and the form its own
+# refusal prescribes -- and the only thing keeping them legal is `COUNT`'s
+# lookbehind, whose removal would otherwise still read 36 passed.
+LISTED = (
+    "Its successors T83, T84 and T85 are open.",
+    "Of the validation gates, D4 and D6 are open.",
+)
 
 # The register's introduction as it stood one generation back, quoted verbatim.
 PREVIOUS = (
@@ -102,6 +171,20 @@ def ids(span: str) -> set[int]:
 def flattened(path: Path) -> str:
     """One line, so a figure that wraps mid-sentence still reads as one."""
     return " ".join(path.read_text(encoding="utf-8").split())
+
+
+def blocks(path: Path) -> list[tuple[int, str]]:
+    """Each run of non-blank lines, flattened, with the line it opens on.
+
+    Flattened per block rather than per file for the same reason `flattened` is,
+    but a refusal about a document that should carry no figure has to say where
+    the figure is, and a whole-file join has nowhere to point.
+    """
+    text = path.read_text(encoding="utf-8")
+    return [
+        (text[: found.start()].count("\n") + 1, " ".join(found.group().split()))
+        for found in re.finditer(r"[^\n]+(?:\n[^\n]+)*", text)
+    ]
 
 
 @pytest.fixture(scope="module")
@@ -232,3 +315,59 @@ def test_the_rule_reproduces_the_previous_generation():
     done |= {int(number) for number in CLOSED.findall(PREVIOUS)}
     assert int(TOTAL.search(PREVIOUS).group(1)) == len(named) == 86
     assert int(OPEN.search(PREVIOUS).group(1)) == len(named - done) == 80
+
+
+@pytest.mark.parametrize("path", ELSEWHERE, ids=lambda p: p.name)
+def test_no_other_design_document_states_a_register_figure(path):
+    """The extent and the counts are stated in the two files named above and
+    nowhere else. A third site is not caught by checking the sites already
+    known, which is how one document restated a count and went stale twice in
+    one day before anything noticed."""
+    owners = " and ".join(owner.name for owner in STATED_IN)
+    for number, text in blocks(path):
+        for pattern, figure in ((EXTENT, "extent"), (COUNT, "count")):
+            found = pattern.search(text)
+            assert not found, (
+                f"{path.name}:{number} states a register {figure}, "
+                f"{found.group()!r}, in: "
+                f"{text[max(0, found.start() - 70) : found.end() + 70]!r}. "
+                f"Only {owners} may state the register's extent or its counts; "
+                "a third copy goes stale unread. Link to the register, or name "
+                "the ids as a list rather than as a range."
+            )
+
+
+@pytest.mark.parametrize("path", STATED_IN, ids=lambda p: p.name)
+def test_the_two_patterns_still_read_the_documents_that_do_state_it(path):
+    """Neither pattern may rot into matching nothing, which would pass every
+    other document by default."""
+    text = flattened(path)
+    assert EXTENT.search(text), f"{path.name} states no register extent"
+    assert COUNT.search(text), f"{path.name} states no register count"
+
+
+def test_the_scan_reaches_every_design_document_but_those_two():
+    """A renamed directory or a renamed stating file would empty the scan, and
+    a parametrization over nothing passes. A document that leaves the glob
+    without emptying it is the quieter failure: the glob is non-recursive and
+    reads only `.md`, so moving one document into a subdirectory, or renaming
+    it `.txt`, drops its case while the scan still looks healthy."""
+    assert set(STATED_IN) < set(DESIGN_DOCS), f"{DESIGN} does not hold both"
+    assert len(ELSEWHERE) == len(DESIGN_DOCS) - len(STATED_IN) > 1
+    assert set(DESIGN_DOCS) == {path for path in DESIGN.rglob("*") if path.is_file()}, (
+        f"{DESIGN} holds a document this scan does not read"
+    )
+
+
+@pytest.mark.parametrize("phrase", LEGITIMATE + LISTED)
+def test_counting_something_other_than_the_register_is_not_a_figure(phrase):
+    assert not EXTENT.search(phrase) and not COUNT.search(phrase)
+
+
+def test_a_range_is_an_extent_in_every_dash_these_documents_write():
+    """The two stating documents write their range with an en dash, so that one
+    dash and the plain hyphen are the only ones pinned by the documents
+    themselves. The other three are pinned here, because narrowing the class
+    back to `[-–]` refuses nothing that any test asserts."""
+    for dash in "-–—‒−":
+        assert EXTENT.search(f"T1{dash}T87"), f"{dash!r} does not read as a range"
