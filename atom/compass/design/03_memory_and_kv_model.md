@@ -145,7 +145,7 @@ probed per request. Whether that is 0.1 ms or 10 ms is unmeasured. Recorded as *
 plus arithmetic**:
 
 ```
-# in _read_device_memory, which get_num_blocks calls first
+# in _read_device_memory, which get_num_blocks calls before any budget arithmetic
 free, total        = torch.cuda.mem_get_info()
 peak_torch         = max(allocated_bytes.all.peak, .all.current)
 non_torch          = max((total - free) - torch.cuda.memory_reserved(), 0)
