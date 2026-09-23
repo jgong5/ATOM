@@ -602,6 +602,21 @@ def test_every_refusal_site_in_the_package_resolves_to_a_rule():
     assert thrown <= set(_refusal_sites())
 
 
+def test_every_rule_is_named_by_at_least_one_site():
+    # The checks on a rule are written over the sites that name it, so a rule
+    # no site names passes every one of them by having nothing to check. A
+    # member is kept only if some refusal the package builds names it, whether
+    # inline or through the local it picks its rule from.
+    named = {
+        node.attr
+        for rule in _refusal_sites().values()
+        for node in ast.walk(ast.parse(rule, mode="eval"))
+        if isinstance(node, ast.Attribute) and getattr(node.value, "id", None) == "Rule"
+    }
+    assert named
+    assert [member.name for member in Rule if member.name not in named] == []
+
+
 def test_every_site_that_declines_a_document_is_driven_here():
     # A table written by hand that quietly covers six of seven sites passes for
     # a reason nobody stated, so the set is read out of the package's source
