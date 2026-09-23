@@ -58,6 +58,10 @@ def transfer_params(seq: Any, *, tp_size: int, dp_rank: int) -> dict[str, Any]:
     prefilling worker**, dropping it outright only when it has none either
     way. So a rank of the wrong type is not lost loudly; it is replaced by a
     plausible one, with no error anywhere.
+
+    A value that is not a whole number is refused rather than cast, because
+    `int` truncates: a width of 8.5 would go out as 8, naming a deployment
+    that was never launched, and nothing downstream could tell.
     """
     drafts = getattr(seq, "spec_token_ids", None)
     draft_token_ids = (
@@ -71,10 +75,30 @@ def transfer_params(seq: Any, *, tp_size: int, dp_rank: int) -> dict[str, Any]:
         "remote_host": SIMULATED_HOST,
         "remote_port": SIMULATED_PORT,
         "remote_handshake_port": SIMULATED_PORT,
-        "tp_size": int(tp_size),
-        "dp_rank": int(dp_rank),
+        "tp_size": _whole_number("tp_size", tp_size),
+        "dp_rank": _whole_number("dp_rank", dp_rank),
         "transfer_id": seq.id,
         "first_token_id": seq.output_tokens[0] if seq.output_tokens else None,
         "draft_token_ids": draft_token_ids,
         "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
     }
+
+
+def _whole_number(field: str, value: Any) -> int:
+    """*value* as an `int`, or a `ValueError` naming *field* if it is not whole.
+
+    Text is read as a number first, because a width filled from an environment
+    variable or a config file arrives as a string. Anything whose value
+    changes on the way to an `int` is refused.
+    """
+    try:
+        number = float(value) if isinstance(value, str) else value
+        whole = int(number)
+    except (TypeError, ValueError, OverflowError):
+        whole = None
+    if whole is None or whole != number:
+        raise ValueError(
+            f"{field} is {value!r}, which is not a whole number; a parallel "
+            "width or rank is a count, so it is refused rather than rounded"
+        )
+    return whole

@@ -24,6 +24,7 @@ import ipaddress
 import json
 import pathlib
 import socket
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -222,6 +223,28 @@ def test_no_field_of_the_blob_names_a_machine_the_simulation_runs_on():
         assert_could_not_be_dialled(blob[field], field)
 
 
+def test_the_engine_id_is_the_label_the_host_invents_and_nothing_else():
+    """The engine id is held to the host's rule, not only to "no colon".
+
+    A dotted name such as `prod-decode-07.internal` carries no colon and no
+    address, and is not the name of the machine running the test, so every
+    check above passes it on every machine. The rule that makes the host safe
+    is that it is one label, invented here, under a suffix that resolves
+    nowhere; the engine id is held to that same label, so it names nothing a
+    resolver could find either.
+    """
+    blob = simulated_blob()
+    engine_id = blob["remote_engine_id"]
+    assert "." not in engine_id, (
+        f"remote_engine_id {engine_id!r} is a dotted name, which a resolver "
+        "can route; it must be the single invented label"
+    )
+    assert blob["remote_host"] == f"{engine_id}.invalid", (
+        f"remote_engine_id {engine_id!r} is not the label remote_host "
+        f"{blob['remote_host']!r} reserves under .invalid"
+    )
+
+
 def test_the_ranks_the_router_reads_are_numbers(geometry):
     """The router drops `dp_rank` unless it is a number, and says nothing.
 
@@ -249,6 +272,51 @@ def test_the_ranks_the_router_reads_are_numbers(geometry):
     relayed = seq.kv_transfer_params_output
     assert isinstance(relayed["tp_size"], int) and relayed["tp_size"] == 8
     assert isinstance(relayed["dp_rank"], int) and relayed["dp_rank"] == 3
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        pytest.param("tp_size", 8.5, id="tp_size-float"),
+        pytest.param("tp_size", "8.5", id="tp_size-text"),
+        pytest.param("tp_size", "eight", id="tp_size-word"),
+        pytest.param("dp_rank", 2.5, id="dp_rank-float"),
+        pytest.param("dp_rank", "2.5", id="dp_rank-text"),
+    ],
+)
+def test_a_width_that_is_not_a_whole_number_is_refused_by_name(geometry, field, value):
+    """A fractional width is refused, naming the field, rather than truncated.
+
+    Driven through the connector, because the config is where a width can
+    arrive as something other than an int. Casting 8.5 to 8 would emit a blob
+    for a deployment that was never launched, and nothing reading it could
+    tell.
+    """
+    widths = {"tp_size": 8, "dp_rank": 3, field: value}
+    scheduler = connector(
+        model_for(geometry, PEAKS[0]), lambda: ISSUE_AT, role="scheduler", **widths
+    )
+    with pytest.raises(ValueError, match=f"^{field} is .*not a whole number"):
+        scheduler.request_finished(finished_sequence())
+
+
+@pytest.mark.parametrize(
+    "value", [8, "8", 8.0, " 8 "], ids=["int", "text", "float", "padded"]
+)
+def test_a_whole_width_is_taken_whatever_it_is_spelled_as(geometry, value):
+    """The refusal above is of fractions, not of text or of floats."""
+    scheduler = connector(
+        model_for(geometry, PEAKS[0]),
+        lambda: ISSUE_AT,
+        role="scheduler",
+        tp_size=value,
+        dp_rank=value,
+    )
+    seq = finished_sequence()
+    scheduler.request_finished(seq)
+    relayed = seq.kv_transfer_params_output
+    assert type(relayed["tp_size"]) is int and relayed["tp_size"] == 8
+    assert type(relayed["dp_rank"]) is int and relayed["dp_rank"] == 8
 
 
 def test_the_blob_carries_the_request_and_not_a_template():
@@ -432,6 +500,39 @@ def test_a_parked_request_is_not_counted_as_admittable_work(geometry, seq_factor
     assert engine._oldest_waiting_prefill_age_ms() == 0.0
 
 
+#: The ordinary prompt queued behind a parked one, of a length no other count
+#: in the queue can produce.
+QUEUED_PROMPT = list(range(24))
+
+
+def test_the_request_queued_beside_a_parked_one_is_the_one_counted(
+    geometry, seq_factory
+):
+    """The positive control for the test above: the signals do count work.
+
+    Reading zero beside a parked request says the parked one was excluded
+    only if the same signals read non-zero for work that is admittable. So an
+    ordinary request is queued behind the parked one, and each signal must
+    report exactly that request: its token count, not the parked one's added
+    to it and not nothing; a head that can be admitted; and its own age, which
+    is a second, where the parked request's arrival stamp is decades old.
+    """
+    model = model_for(geometry, PEAKS[0])
+    engine = scheduler_with(connector(model, lambda: ISSUE_AT, role="scheduler"))
+    parked = remote_filled(seq_factory)
+    engine.add(parked)
+    engine.schedule()
+    assert parked.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+    queued = seq_factory(QUEUED_PROMPT)
+    queued.arrive_time = time.time() - 1.0
+    engine.add(queued)
+
+    assert engine._waiting_new_token_count() == len(QUEUED_PROMPT)
+    assert engine._can_admit_head_prefill() is True
+    assert 1000.0 <= engine._oldest_waiting_prefill_age_ms() < 60_000.0
+
+
 def test_the_prompt_is_claimed_once_and_the_request_keeps_its_intent(
     geometry, seq_factory
 ):
@@ -465,7 +566,10 @@ def test_the_prompt_is_claimed_once_and_the_request_keeps_its_intent(
     assert scheduler.build_connector_meta().reqs_to_recv == {}, "announced twice"
 
 
-def test_an_ordinary_request_is_neither_claimed_nor_queued(geometry, seq_factory):
+@pytest.mark.parametrize("kv_role", ["kv_consumer", "kv_producer"])
+def test_an_ordinary_request_is_neither_claimed_nor_queued(
+    geometry, seq_factory, kv_role
+):
     """Only a remote fill is taken on; every other allocation is silent.
 
     Both roles, because "silent" is two different things and only one of them
@@ -473,17 +577,18 @@ def test_an_ordinary_request_is_neither_claimed_nor_queued(geometry, seq_factory
     must leave the offer queue empty. On the producer side the refusal below
     stands between every ordinary allocation and a `ValueError`, and no
     announcement check can see that: the raise happens before there is
-    anything to announce.
+    anything to announce. One case per role, so a failure names the role.
     """
-    model = model_for(geometry, PEAKS[0])
-    for kv_role in ("kv_consumer", "kv_producer"):
-        scheduler = connector(
-            model, lambda: ISSUE_AT, role="scheduler", kv_role=kv_role
-        )
-        seq = seq_factory(PROMPT)
-        assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
-        scheduler.update_state_after_alloc(seq)
-        assert scheduler.build_connector_meta().reqs_to_recv == {}
+    scheduler = connector(
+        model_for(geometry, PEAKS[0]),
+        lambda: ISSUE_AT,
+        role="scheduler",
+        kv_role=kv_role,
+    )
+    seq = seq_factory(PROMPT)
+    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler.build_connector_meta().reqs_to_recv == {}
 
 
 def test_the_producing_side_refuses_a_remote_fill(geometry, seq_factory):
