@@ -784,6 +784,19 @@ def test_the_scan_ignores_a_compass_package_the_reply_never_reaches(tmp_path):
     assert _mentions(roots, "trace_dir", tmp_path) == {PRODUCER}
 
 
+def test_the_reply_assertion_scans_the_roots_the_constant_names(monkeypatch):
+    """The tests above hold `REPLY_SURFACE`; this one holds its reader.
+
+    With the surface emptied, the profiler-reply assertion has nowhere to find
+    the producer and must fail. An assertion that scans roots written out at
+    its own call site ignores the constant and passes here, and it is the
+    whole-tree scan that call site used to hold.
+    """
+    monkeypatch.setitem(globals(), "REPLY_SURFACE", ())
+    with pytest.raises(AssertionError):
+        test_the_profiler_replies_are_forwarded_whole_and_never_unpacked()
+
+
 def test_the_two_names_no_caller_waits_for_and_what_replying_costs():
     """A reply nobody reads sits on the queue for whoever asks next.
 
