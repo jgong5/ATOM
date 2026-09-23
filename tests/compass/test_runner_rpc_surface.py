@@ -213,7 +213,7 @@ EXTENSION_CLASSES = {
 class Runner(NonAllocatingRunner):
     """The overrides over a base that supplies only what they read.
 
-    `config` is empty rather than absent: the base sets it first thing in its
+    `config` is present rather than absent: the base sets it first thing in its
     own `__init__`, so every override reads it, and a stub without one tests a
     shape the class is never in.
     """
