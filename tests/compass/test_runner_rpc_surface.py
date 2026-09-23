@@ -152,16 +152,17 @@ def _arity(parent):
 
     `0` means the reply is discarded -- the broadcast is a bare statement and
     nothing can read what came back. `1` means it is used whole: bound to a
-    name, or handed straight back to this function's own caller. Anything above `1` is a tuple unpack, which is the only shape
-    that fixes a length rather than just a type.
+    name, or handed straight back to this function's own caller. Anything
+    above `1` is a tuple unpack, which is the only shape that fixes a length
+    rather than just a type.
 
     `ast.Return` is the case worth naming, because reading only `ast.Assign`
     scores `return self.runner_mgr.call_func(...)` as a discard when the value
     is in fact the function's result -- `engine_core.py:749`, `dummy_execution`.
 
     Any other shape -- a list or starred target, an annotated one, a chained
-    target, an argument to another call -- is scored `None` rather than `1`, which would read an unpack as a
-    use of the whole reply, and
+    target, an argument to another call -- is scored `None` rather than `1`,
+    which would read an unpack as a use of the whole reply, and
     `test_every_reply_is_taken_in_a_shape_the_arity_reads` names its site.
     """
     if isinstance(parent, ast.Expr):
@@ -1022,13 +1023,17 @@ def test_the_unanswered_helper_describes_its_whole_return_and_not_one_half():
     assert word is not None, f"no count word for {len(RPC_SURFACE)} names"
     assert f"all {word}" in doc
     # Called by bare name or through a module, both are a call; any other
-    # mention -- an `import ... as`, a `partial`, a callback -- is a caller this cannot
-    # follow, so it is refused rather than left out of the count.
+    # mention -- an `import ... as`, a `partial`, a callback -- is a caller
+    # this cannot follow, so it is refused rather than left out of the count.
     callers, unread = set(), []
     for f in sorted((REPO / "atom").rglob("*.py")):
         tree = ast.parse(f.read_text())
         called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
         for n in ast.walk(tree):
+            if isinstance(n, ast.alias) and n.name == "unanswered_rpc_names":
+                if n.asname:
+                    unread.append(f"{f.relative_to(REPO)}:{n.lineno}: as {n.asname}")
+                continue
             if "unanswered_rpc_names" not in (
                 getattr(n, "id", 0),
                 getattr(n, "attr", 0),

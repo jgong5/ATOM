@@ -209,9 +209,10 @@ def _self_assigned(node, unreadable=()):
     one inside a tuple or list, of an annotated or augmented `=`, and
     `setattr(self, "x", ...)`. Any other write -- a `for` or `with` target, and
     every other mention of `setattr`, `__setattr__`, `__dict__` or `vars`,
-    however it is reached -- binds something this cannot read. Each of those must be listed in
-    *unreadable* by its source text, or this refuses, so a spelling it cannot
-    read fails here rather than leaving the set smaller than the class.
+    however it is reached -- binds something this cannot read. Each of those
+    must be listed in *unreadable* by its source text, or this refuses, so a
+    spelling it cannot read fails here rather than leaving the set smaller
+    than the class.
     """
     bound, read = set(), set()
     for n in ast.walk(node):
