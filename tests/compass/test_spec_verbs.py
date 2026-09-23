@@ -247,8 +247,10 @@ def test_the_refusal_says_the_fragments_are_authored_for_different_machines():
 
 
 def test_the_same_two_tokenizers_merge_when_the_machine_agrees():
-    # The control for the result above: the same two measurements, the same two
-    # authors and dates, differing only in the machine they name.
+    # The control for
+    # `test_two_hosts_in_one_spec_are_refused_and_both_provenances_are_named`:
+    # the same two measurements, the same two authors and dates, differing only
+    # in the machine they name.
     here = fragment("tokenizer-a", TIER0, machine="node-18", authored_by="ana")
     also_here = fragment(
         "tokenizer-b",
@@ -602,7 +604,7 @@ def test_a_clear_check_says_which_conditions_it_could_not_ask():
 def test_the_transfer_condition_names_itself_as_unaskable_of_a_document():
     # The same spec is refused as a `Merge` and clear as the document it makes,
     # because the source's pin is deliberately in no field of the document. A
-    # spec checked from a file is a document, so the document must say as much.
+    # caller holding only the document cannot ask it, so its check must say so.
     carried = copy.deepcopy(TIER2)
     carried["device"]["software_pinned_to"] = dict(STACK, rocm="7.0.2")
     combination = merge(
@@ -746,8 +748,8 @@ def test_one_mistyped_key_does_not_take_the_rest_of_the_document_with_it():
     # The refusal a mistyped key earns is about that key. A check that stopped
     # there would leave every other field unchecked and every consistency
     # question with nothing resolved to be asked of -- the desk fix hiding the
-    # eight-GPU one again, on the form the verb takes: a hand-authored file no
-    # merge ever saw, since a merge refuses the unknown key before this runs.
+    # eight-GPU one again, on a document edited after its merge and handed to
+    # `validate` directly, since a merge refuses the unknown key before this runs.
     document = merged().document
     memory = document["device"]["memory"]
     memory["capacity_byte"] = memory.pop("capacity_bytes")
@@ -913,12 +915,12 @@ def test_each_condition_in_the_check_set_is_earned_by_a_spec(condition):
 
 
 def test_a_document_reaches_what_the_package_says_a_document_reaches():
-    # A spec checked from a file is a document, so this is the form that gets
-    # weaker: a transfer's source pin is in no field of a document however it
-    # was built. What the package states it reaches is a value, and this holds
-    # a run's own record to that value rather than to a sentence -- so a
-    # condition becoming askable of a document, one ceasing to be, or one added
-    # to the check set moves a test instead of going stale in prose.
+    # A document reaches less than a `Merge` does: a transfer's source pin is
+    # in no field of a document however it was built. What the package states
+    # it reaches is a value, and this holds a run's own record to that value
+    # rather than to a sentence -- so a condition becoming askable of a
+    # document, one ceasing to be, or one added to the check set moves a test
+    # instead of going stale in prose.
     checked = validate(merged().document, tp_widths=(1, 2, 4, 8), observed_stack=STACK)
     assert checked.ok
     unasked = {condition.split(" -- ")[0] for condition in checked.not_asked}
@@ -1411,9 +1413,11 @@ def test_the_probes_counts_refuse_the_pair_that_used_to_merge(tmp_path):
 
 
 def test_the_same_pair_merges_when_the_counts_agree(tmp_path):
-    # The other half of the result: the refusal is about the two readings and
-    # not about the probe having spoken at all. Run on the machine the spec is
-    # authored for, the same probe supplies the same field and the pair merges.
+    # The other half of the test above,
+    # `test_the_probes_counts_refuse_the_pair_that_used_to_merge`: the refusal
+    # is about the two readings and not about the probe having spoken at all.
+    # Run on the machine the spec is authored for, the same probe supplies the
+    # same field and the pair merges.
     here = tokenizer_fragment(
         [ELSEWHERES],
         machine="node-18",

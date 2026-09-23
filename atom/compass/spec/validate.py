@@ -51,13 +51,15 @@ exists to refuse. The sharpest case is the transfer: its source's pin is in no
 field of the merged document, by the decision below, so `validate(document)`
 can never ask that condition however the document was built, and the same spec
 is refused as a `Merge` and clear as a document. That is not a wrong number,
-but it must be visible, because checking a file -- `compass spec
-validate machine.yaml` -- is the form that cannot ask it. `CONDITIONS` is what
-a count of reach is a count of; a condition added to the check set and not to
-it is one no result can report on.
+but it must be visible, because a caller that holds only the document cannot
+ask it. A `validate` verb over a machine file -- `compass spec validate
+machine.yaml` -- is not built yet: no entry point names it, and nothing in this
+package reads a spec file. This module is what it would call. `CONDITIONS` is
+what a count of reach is a count of; a condition added to the check set and not
+to it is one no result can report on.
 
-**The reach of that form is `ASKABLE_OF_A_DOCUMENT`, which is a value and not a
-sentence.** Writing the number down in prose here puts a reader between the
+**The reach of a document is `ASKABLE_OF_A_DOCUMENT`, which is a value and not
+a sentence.** Writing the number down in prose here puts a person between the
 check set and the statement about it: the set changes, nobody rereads the
 paragraph, and the package goes on claiming a reach it no longer has. So the
 statement is the tuple below, a run's own `not_asked` is asserted against it,
@@ -134,8 +136,8 @@ CONDITIONS = (MISSING, DERATES, WIDTHS, PROBES, STACK, TRANSFERS)
 #: transfer: a transfer's source pin is in no field of a document, however the
 #: document was built. This is the package's statement of its own reach, held to
 #: a run's `not_asked` by a test rather than written out in prose that nothing
-#: reads. A caller that takes a filename -- which is the form the verb takes --
-#: states its reach from here, or states one nothing checks.
+#: reads. A caller that passes `validate` only a document states its reach from
+#: here, or states one nothing checks.
 ASKABLE_OF_A_DOCUMENT = tuple(
     condition for condition in CONDITIONS if condition != TRANSFERS
 )
