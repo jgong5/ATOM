@@ -189,7 +189,9 @@ does print `GATE_CPU_RC=` on stdout on every path, so the number survives in the
 *text* of an untruncated pipe — but only an unpiped run puts it in `$?`.
 
 **What those rates are, and are not.** n=21, node 18, container `xiaobizh_n18_cpu`,
-one branch, on a box whose load was not controlled — and all 21 runs were of **one
+on a box whose load was not controlled. 19 of the 21 are pinned: PR #79's review
+(issue comment 5765186351) ran `b58a48cc2` 19 times, for 17 nominal, 1 skip-variant
+and the one hard failure. The other 2 name no commit. All 21 runs were of **one
 method**, `test_the_cost_per_byte_does_not_grow`. Not-nominal combined is ~1 in 7.
 The finding is the third outcome, not the rate. The rates are a **lower bound on
 the class**, not a measurement of it: the class holds **3 methods / 4 collected
