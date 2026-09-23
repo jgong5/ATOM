@@ -27,7 +27,15 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
    superseded extent must not be restated in prose in either file, because that test reads
    any range starting at T1 as a claim about the register as it stands, and refuses any
    other range or list that names two or more ids the register does not yet hold — so an
-   unlanded allocation may be named here only one id at a time
+   unlanded allocation may be named here only one id at a time. **That allowance bounds the
+   shape of one mention, not how many a document carries**: the unit it reads is a *span* —
+   ids joined by a hyphen or an en dash, a comma or "and" — and it is checked per span, not
+   per document, so a page naming one unlanded id in each of ten separate sentences passes
+   and nothing counts them. That is deliberate — what goes stale is the range, which
+   asserts the register holds every id between its endpoints and so turns false as the
+   register grows, while single mentions assert nothing between them and each stays
+   individually checkable against the rows below. Bounding how many a document carries
+   would be a different rule and would need its own reason
 4. **Cross-cutting issues and pending amendments**
 
 ---

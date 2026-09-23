@@ -278,6 +278,38 @@ def test_the_register_still_sanctions_naming_one_unlanded_id():
     )
 
 
+# The allowance above is bounded per *span*, and nothing bounds a document. Ten
+# sentences each naming one unlanded id are ten free mentions and pass, while
+# one sentence naming two refuses -- so the rule shapes a mention rather than
+# rationing ids. `MANY_MENTIONS` is that document. Ten is the figure the
+# register's own sentence names and is not otherwise load-bearing: any number
+# above one shows the same thing. What is load-bearing is that each id sits in a
+# sentence of its own -- joined by `,` or ` and ` the same ten ids read as one
+# span and refuse, which is the case two above.
+#
+# `SPAN` joins with `-` and `–` where `EXTENT` above reads all five dashes these
+# documents write, so a pair written with `—`, `‒` or `−` is two single mentions
+# and passes here too -- appended to the real register, `T99–T100` refuses and
+# `T99—T100` does not. Latent, not intended: widening the join class is
+# behaviour, with its own reason to give.
+MANY_MENTIONS = " ".join(FREE_MENTION.format(f"T{id_} is") for id_ in range(99, 109))
+
+
+def test_many_unlanded_ids_pass_when_each_has_a_span_of_its_own(tmp_path):
+    path = tmp_path / "ten_unlanded_ids.md"
+    path.write_text(MANY_MENTIONS, encoding="utf-8")
+    test_every_stated_extent_names_exactly_the_rows(path, LANDED)
+
+
+def test_the_register_states_that_the_allowance_is_per_span():
+    """What the case above passes is a limit a reader has to be told about, or
+    they meet it by writing the document the case three above refuses."""
+    assert "per span, not per document" in flattened(REGISTER), (
+        f"{REGISTER.name} no longer states that the one-id allowance bounds a "
+        "span and not a document, and the case above still passes ten of them"
+    )
+
+
 @pytest.mark.parametrize("path", STATED_IN, ids=lambda p: p.name)
 def test_every_stated_count_matches_the_rows(path, rows):
     """Total, open, and the prose that decomposes one into the other."""
