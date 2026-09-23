@@ -393,7 +393,7 @@ def validate(
     refusals += _probes(tp_widths, resolved)
     differences: tuple = ()
     if observed_stack is not None:
-        differences = asked_of.check_stack(observed_stack)
+        differences = asked_of.check_stack(observed_stack, carried_only=True)
         if differences and strict:
             refusals.append(
                 SpecRefusal(
