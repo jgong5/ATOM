@@ -59,14 +59,14 @@ BLOCK_SIZE = 64
 MAX_NUM_SEQS = 256
 MAX_MODEL_LEN = 32768
 
-#: The named result. Produced by this file on node 18, container
-#: `xiaobizh_n18`, 2026-09-22, and pinned so that a term moving anywhere
+#: The block counts this file produced on node 18, container
+#: `xiaobizh_n18`, 2026-09-22, pinned so that a term moving anywhere
 #: upstream of it is a failure here rather than a different number nobody
 #: compared. The arithmetic behind them is ATOM's: this file adds none.
 EXPECTED_BLOCKS = {1: 46641, 2: 102152}
 
 #: What one block costs the rank being modelled, pinned beside the count.
-#: Cycle 1 caught the TP2 row priced against a TP1 block: the readings were
+#: A TP2 row was once priced against a TP1 block: the readings were
 #: per-rank and the geometry was not, so a footprint for one rank was divided
 #: by a block belonging to the whole model. Both halves of the reply now state
 #: the width they were built at, and the entry size is the half that would
@@ -81,8 +81,8 @@ def no_device_readings(monkeypatch):
 
     def refuse(*args, **kwargs):
         raise AssertionError(
-            "a device reading was taken; the whole of this task is that the "
-            "budget runs without one"
+            "a device reading was taken; this file sizes the budget from a "
+            "spec and must never read the card that is present"
         )
 
     monkeypatch.setattr(torch.cuda, "mem_get_info", refuse)
@@ -168,7 +168,7 @@ def _runner(spec, qwen, tp_width, *, utilisation=GPU_MEMORY_UTILIZATION, free=No
     return runner
 
 
-# --- the named result --------------------------------------------------------
+# --- the block count ---------------------------------------------------------
 
 
 @pytest.mark.parametrize("tp_width", [1, 2])

@@ -200,9 +200,9 @@ def _sizing(spec, qwen, tp_width, blocks=100_000):
 
 
 def test_the_count_says_how_much_of_the_footprint_was_a_coefficient(spec, qwen, capsys):
-    """The accessor MEM-1 left with no consumer, given one.
+    """`Basis.DECLARED` on each term, read back as bytes by the block count.
 
-    Both figures are derived from the per-term table that task pinned rather
+    Both figures are derived from `test_memory_readings`' per-term table rather
     than restated here, so a term that moves there moves here too instead of
     this becoming a second place the same bytes are written down.
     """
@@ -360,8 +360,8 @@ def test_the_pipeline_minimum_is_inert_on_an_even_split_and_not_otherwise(
     with one it runs ATOM's own code unchanged either way.
 
     Whether it is *inert* is a different question and the answer is not
-    "always". Every stage computes the same readings here, because nothing in
-    the memory model varies with pipeline rank. But each stage sizes its pool
+    "always". Every stage computes the same readings here, because
+    `device_readings` takes no pipeline rank. But each stage sizes its pool
     from the layers it holds -- `_get_total_num_layers` takes a
     `get_pp_indices` slice under pipeline parallelism -- so the entry size
     differs whenever the split is uneven, and the minimum is then what decides
@@ -402,7 +402,7 @@ def test_the_pipeline_minimum_is_inert_on_an_even_split_and_not_otherwise(
     }
 
 
-# --- the closure MEM-1's one-level guard could not give ----------------------
+# --- the whole import closure, which a one-level guard cannot see -----------
 
 
 def _pulls_a_tensor_library(module: str) -> bool:
@@ -426,12 +426,12 @@ def _pulls_a_tensor_library(module: str) -> bool:
 def test_importing_the_memory_package_pulls_no_tensor_library_at_all():
     """The whole import closure, not one level of it.
 
-    MEM-1's guard reads each module's own import statements, so a memory module
-    importing an `atom.compass` module that itself imports torch would pass it.
-    This is the same claim made over whatever actually arrives, and it matters
-    more now than it did then: the runner override imports this package at
-    module scope, and a worker that dies on an import dies before it can say
-    anything a reader would see.
+    `test_memory_readings.py::test_the_package_imports_no_device` reads each
+    module's own import statements, so a memory module importing an
+    `atom.compass` module that itself imports torch would pass it. This is the
+    same claim made over whatever actually arrives, and it matters because the
+    runner override imports this package at module scope, and a worker that
+    dies on an import dies before it can say anything a reader would see.
     """
     assert not _pulls_a_tensor_library("atom.compass.memory")
 

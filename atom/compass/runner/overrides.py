@@ -117,7 +117,7 @@ logger = logging.getLogger(__name__)
 # runner (`config.py:1729-1736`) fires only while `runner_qualname` is still
 # ATOM's default -- which Compass overwrites. `enable_rapidserve=True` with this
 # runner is therefore seven silent parks on names this table deliberately
-# excludes. Recorded on the board and not closed here.
+# excludes, and nothing in this module closes that gap.
 #
 # Also outside the table, and outside anything a broadcast-derived enumeration
 # can see: three of these twelve are called in-process on the runner itself,
@@ -360,8 +360,8 @@ class NonAllocatingRunner:
         neither: this path would hand a decode process a pool it does not own.
         The base's `_kv_budget_extra_reserve` of zero is left alone for the
         same reason it is right -- the card these readings describe is a
-        dedicated one, and a shared-card reservation would model a tenant that
-        the memory model has already declared out of scope.
+        dedicated one, and a shared-card reservation would hold bytes back for a
+        second tenant that those readings do not have.
         """
         if getattr(self.config, "disagg_is_decode", False):
             raise RunnerRefusal(
