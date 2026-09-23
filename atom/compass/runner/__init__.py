@@ -10,9 +10,10 @@ The modules here, split by what each is allowed to import:
   stylistic preference. Importing `atom.model_engine.model_runner` runs aiter's
   architecture probe, which shells out to `rocminfo` and raises in a container
   with no driver, so anything reachable from that import cannot be exercised by
-  a test that runs without one. The one engine name it needs,
-  `ScheduledBatchOutput`, is imported inside `forward`, which only ever runs on
-  a worker that has imported the engine already.
+  a test that runs without one. The engine names it needs are imported where
+  they are used -- `ScheduledBatchOutput` inside `forward`, and
+  `DeviceMemoryReadings` inside `_read_device_memory` -- and both of those only
+  ever run on a worker that has imported the engine already.
 - `step_output` holds what a predicted step reports -- the deferral rules and
   the token ids -- over numpy and nothing else, so it has no engine import to
   defer.

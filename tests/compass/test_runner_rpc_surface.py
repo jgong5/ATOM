@@ -1028,14 +1028,16 @@ def test_the_zero_block_form_in_the_tree_answers_two_of_the_four_keys():
 # --- the package docstring, read against the table it describes --------------
 #
 # What is read here is what the docstring states through tokens the tree can
-# check: bullet leads, the `file.py:NN` citations under each lead, and a module
-# count. The sentences between them are not read. Which half of the table
-# parks its caller, and the scope of `overrides`' engine import, differ from
-# their false forms only in wording, and asserting wording is not a check on
-# what the wording claims.
+# check: bullet leads, the `file.py:NN` citations under each lead, a module
+# count, and the engine names, functions and paths each module's bullet cites.
+# The sentences between them are not read. Which half of the table parks its
+# caller, and whether an engine import sits at module scope, differ from their
+# false forms only in wording, and asserting wording is not a check on what the
+# wording claims.
 
 CITATION = r"`([a-z_]+\.py:\d+)`"
-COUNT_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven")
+# Words from two up: a split needs two, so "the one module here" is no count.
+COUNT_WORDS = ("two", "three", "four", "five", "six", "seven", "eight", "nine")
 
 
 def _bullets(doc):
@@ -1064,13 +1066,9 @@ def _modules():
 
 
 def _stated_module_counts(doc):
-    """Every number *doc* puts in front of "module" or "modules"."""
-    words = re.findall(r"\b(\w+) modules?\b", doc)
-    return [
-        int(w) if w.isdigit() else COUNT_WORDS.index(w.lower())
-        for w in words
-        if w.isdigit() or w.lower() in COUNT_WORDS
-    ]
+    """Every count *doc* puts before "module(s)": a digit, or a word from two up."""
+    words = re.findall(rf"(?i)\b(\d+|{'|'.join(COUNT_WORDS)})\s+modules?\b", doc)
+    return [int(w) if w.isdigit() else COUNT_WORDS.index(w.lower()) + 2 for w in words]
 
 
 def test_the_package_docstring_lists_every_module_beside_it():
@@ -1095,7 +1093,7 @@ def test_a_module_count_the_package_docstring_states_is_the_packages():
     it is the number of modules the package holds, so "Two modules" put back
     above three bullets fails here rather than reading as true.
     """
-    assert _stated_module_counts("Two modules, split by") == [2]
+    assert _stated_module_counts("Two modules; eight\n modules; one module") == [2, 8]
     for stated in _stated_module_counts(PACKAGE_DOC):
         assert stated == len(_modules()), f"the docstring says {stated} modules"
 
@@ -1145,3 +1143,32 @@ def test_every_site_the_package_docstring_cites_is_one_no_caller_waits_for():
     assert {n: set(re.findall(CITATION, bullets.get(n, ""))) for n in UNWAITED} == {
         n: {f"{s.file}:{s.line}" for s in SITES[n]} for n in UNWAITED
     }
+
+
+def _engine_imports(mod):
+    """(name bound, engine module, enclosing function) for each engine import."""
+    tree = ast.parse((PACKAGE / f"{mod}.py").read_text())
+    scope = {
+        c: f.name
+        for f in ast.walk(tree)
+        if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for c in ast.walk(f)
+    }
+    return [
+        (a.asname or a.name, getattr(n, "module", None) or a.name, scope.get(n))
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.Import, ast.ImportFrom))
+        for a in n.names
+        if (getattr(n, "module", None) or a.name).startswith("atom.model_engine")
+    ]
+
+
+@pytest.mark.parametrize("mod", ["overrides", "step_output", "model_runner"])
+def test_a_module_bullet_cites_the_engine_imports_its_module_makes(mod):
+    """A module bullet cites every engine import its module makes, and no other."""
+    cited = set(re.findall(r"`([^`]+)`", _bullets(PACKAGE_DOC)[mod]))
+    imports = _engine_imports(mod)
+    missing = [i for i in imports if not {i[0], i[2] or i[0]} <= cited]
+    assert missing == [], f"the {mod} bullet omits {missing}"
+    named = {c for c in cited if c.startswith("atom.model_engine")}
+    assert named <= {i[1] for i in imports}, f"the {mod} bullet names {named}"
