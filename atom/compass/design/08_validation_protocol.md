@@ -29,14 +29,15 @@ at *collection* time, via `rocminfo` reached on import, so pytest cannot even bu
 list, plus 1 that collects cleanly and then fails at run time on a pinned-host allocation
 (`hipHostMalloc failed: 100`). That numerator is non-plugin, so its denominator must be too —
 quoting 29 against 189 is the defect `16` L4 fixes and it is not repeated here. **At the
-whole-suite denominator the figure is at least 32 of 189**, because `tests/plugin/` is not
+whole-suite denominator the figure is at least 34 of 189**, because `tests/plugin/` is not
 purely a packaging problem: collecting it alone at `236abfd9a`, and again at `fada7424e`, in `xiaobizh_n18_cpu` gives
-`153 tests collected, 7 errors in 1.45s`, rc=2, and those 7 decompose as **3 `rocminfo`**
+`153 tests collected, 7 errors`, rc=2, and those 7 decompose as **3 `rocminfo`**
 (`test_gdn_target_verify_batched_equiv.py`, `test_rtpllm_forward_context_semantics.py`,
 `test_vllm_deepseek_v4_proxy_state_arena_layout.py`), **1 `ModuleNotFoundError: No module
 named 'sglang'`**, and **3 `ImportError: cannot import name 'fused_gdn_gating' from
 'atom.model_ops.attention_gdn' (unknown location)`** — a module left half-initialised by the
-first three, not a fourth cause. 29 + 3 = 32 is a floor: the other 23 plugin files collect
+first three, not a fourth cause. With the 2 tier files the table below names, which reach
+`rocminfo` run alone at `fada7424e` too, 29 + 2 + 3 = 34 is a floor: the other 23 plugin files collect
 here and are never run, so nothing is measured about what they would touch.
 `tests/plugin/`'s 30 files at `fada7424e` are dropped whole because the tier targets ATOM and sglang
 and vllm are in neither image — the measured reason for 27 of them, not for all 30. The
@@ -62,7 +63,7 @@ saying those three need the driver is stale.
 | `test_prefill_scheduler.py`, `test_scheduler_partial_prefill_tail.py` | CPU | chunked prefill boundaries |
 | `test_block_manager.py`, `test_block_pool.py` | CPU | the block accounting D13 relies on running unmodified |
 | `test_prefix_cache_accuracy.py` | **neither** | nothing. It holds **no test function at all** — it is an `argparse` script that drives a live server on `localhost:8000`, and `pytest` reports `no tests ran` for it in both containers. The prefix-cache behaviour doc `03` declares correct-by-construction is not covered by this file. |
-| `test_prefill_prefix_vs_native.py` | **GPU only** | the prefix-cache behaviour doc `03` declares correct-by-construction. It module-skips on the CPU tier ("needs a real GPU") and gives 4 passed in the GPU container, so the prefix-cache row is GPU-tier evidence and nothing else. |
+| `test_prefill_prefix_vs_native.py` | **GPU only** | the prefix-cache behaviour doc `03` declares correct-by-construction. It module-skips on the CPU tier ("needs a real GPU") and gives 4 passed in the GPU container (`xiaobizh_n18`, one card, at `cb684287f`), so the prefix-cache row is GPU-tier evidence and nothing else. |
 | `test_scheduled_batch_marshal.py` | CPU | the IPC payloads the clock protocol annotates around |
 | `test_block_table_marshal.py` | **GPU only** | the block-table half of those same payloads — excluded at collection time, so the CPU tier does not see it |
 | `test_kv_connector_scheduler.py` | **neither** | the connector factory doc `01` D6 registers a simulated connector into — except that it runs nothing in either tier: `1 skipped`, because ATOM #690 split `kv_transfer_engine` into `moriio` and the test's imports were never updated. |

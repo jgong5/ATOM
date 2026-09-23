@@ -123,10 +123,9 @@ joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* sui
   `PYTHONPATH` asserted to resolve `atom` under that root and pytest's own exit status
   captured before any pipe. The 4030 at `105ca4197` is **3956 ATOM tests + 74 `tests/compass/` tests**,
   stated as its parts because a single total cannot show which half moved (principle 7). The
-  3956 is the same gate at the base, `042aad97d`, which has no `tests/compass/`. The
-  file count moves 128 → 130 and the test count 3956 → 4030 because `105ca4197` adds
-  `tests/compass/test_cpu_gate_exclude.py` and `tests/compass/test_gate_gpu_surplus.py`; the
-  P0.2 readings above are the same suite without them. **4005** was the same gate at
+  3956 is P0.1's control, `042aad97d` with P0.1's `scripts/compass/` copied in and, like the
+  P0.2 readings above, no `tests/compass/`; `105ca4197` adds `tests/compass/test_cpu_gate_exclude.py`
+  and `tests/compass/test_gate_gpu_surplus.py`, so the file count moves 128 → 130. **4005** was the same gate at
   `3afcb4880`, with `tests/compass` at 49 tests. The 49 → 74
   growth is two steps: `tests/compass/test_cpu_gate_exclude.py` parametrises one case per
   entry of `gpu_gate_triggers.txt`, and correcting that file's derivation took it from 13
