@@ -28,7 +28,8 @@
   Container git runs as uid 0 and the repo belongs to the host user, 13797, so
   container git works only because `/root/.gitconfig` carries
   `safe.directory = *`. `/root` does not survive `teardown.sh`: after a rebuild,
-  run `git config --global --add safe.directory '*'` before any git command.
+  run `git config --global --add safe.directory '*'` before any git command, then
+  `gh auth setup-git` — the same file holds the credential helper `push` needs.
   Measured 2026-09-23: with that entry removed, container git refuses both the
   main worktree and a linked one with `dubious ownership`. A pull as root leaves
   new files root-owned, which fails host-side edits silently, so the chown
@@ -40,8 +41,8 @@
   chown -R 13797:13797 .      # whole tree, .git included -- the repo's standing state
   ```
 
-  Verify with `stat -c "%u %n" . .git` and `git -C <each worktree> rev-parse HEAD`
-  afterwards. Do not assume it worked.
+  Verify afterwards: `stat -c "%u %n" . .git` prints `13797` on both lines, and
+  `git -C <each worktree> rev-parse HEAD` succeeds. Do not assume it worked.
 - **Four setup rules.** Each failure behind them came from a shared mutable
   non-git source tree that things silently resolved against, not from worktrees.
   1. No shared mutable source root exists. Every tree is a worktree or a
@@ -113,16 +114,16 @@
   remembered approval may belong to an earlier round. Measured: one PR sat
   recorded as approved through six consecutive checks while its last entry was a
   developer record and no reviewer had seen its head.
-- Design and implement solutions while keeping the solution as simple as possible.
-- **When something does not work as expected, stop and discuss. Do not work
+- **When something does not work as expected, stop and diagnose it. Do not work
   around it.** This covers: a design document that contradicts the code; a test
   that fails for a reason the task did not predict; a measurement outside its
-  stated range; an interface that cannot be implemented as specified. Each is an
-  **escalation** (defined below) until its cause is known; if the cause turns out
-  to be fixable without a ruling — a bug in the task's own change — it becomes a
-  finding, is fixed, and is recorded in the PR body. A workaround improvised
-  under build pressure is exactly the class of decision that never gets written
-  down.
+  stated range; an interface that cannot be implemented as specified. Each is
+  investigated first — the workaround is forbidden, the diagnosis is not. If the
+  cause is a bug in the task's own change, it is a finding: fixed, and recorded
+  in the PR body. Only if settling it needs an owner ruling is it an
+  **escalation** (defined below), labelled and discussed with the owner. A
+  workaround improvised under build pressure is exactly the class of decision
+  that never gets written down.
 - Concurrency: 5 tasks in flight, up to 10 agents (5 developer + 5 reviewer). The
   cap is review throughput, not the task DAG.
 - Both developer and reviewer agents must be told to read `atom/compass/design/README.md`'s
@@ -185,9 +186,11 @@
      defect only after reinstating the defect — the pre-fix code via
      `git show`, nothing else changed — re-running, and recording both counts
      plus the failing node id and assertion. A developer reverts their own fix
-     before claiming it; if nothing reddens, they add the pin or state why the
-     fix is unobservable. **An inert pin on a required finding is itself a
-     required finding: the reviewer does not approve over it.** Mutations
+     before claiming it; if nothing reddens, they add the pin. A claim that a
+     fix is unobservable is checked the same way: if the reviewer can make the
+     reinstated defect fail a test, the claim is wrong. **An inert pin on a
+     required finding is itself a required finding: the reviewer does not
+     approve over it.** Mutations
      preserve line count, because a test that asserts a source line number or a
      file's length fails on any edit and would look as if it caught the
      mutation. Measured: #163's cycle-2 reviewer reinstated the defect, recorded
@@ -212,22 +215,26 @@
   for the per-wave GPU superset. **The hold is the label**: a PR whose body
   declares an escalation but carries no label gets the label, and is then held
   by it. The only other holds are rules in this file, such as an approval that
-  does not cover the head, and **an agent that holds a PR names the rule**.
+  does not cover the head, and **an agent that holds a PR names the rule**. An
+  agent that sees a rule violation in an approved PR lands it anyway and files
+  the violation as an issue; it does not post a verdict.
   The owner stated this after ~42 approved, unlabelled PRs sat for a day because
   a handoff note called landing "the owner's call".
   - **A handoff note is a predecessor's judgement, not a rule.** Where a note
     contradicts this file, this file wins.
-  - **Before landing on a moved tip, compare trees.** If
-    `git merge-tree --write-tree <current tip> <reviewed head>` prints
-    `<reviewed head>^{tree}`, the reviewed gate result stands with no re-run.
-    The check only tells you something when the tip has commits the head lacks;
-    if the tip is an ancestor of the head, the trees are equal by construction.
-    Measured: #170's command output and reviewed tree are both `fd1492b35`, but
-    only because the tip was already an ancestor — the trivial case.
-  - **If the trees differ, trial-merge the batch and gate it once.** Any PR gated
-    against an older tip: `git merge-tree --write-tree`, bottom-first per chain,
-    then gate the combined tree before landing — two green PRs can merge red, and
-    package-wide globs are the known mechanism.
+  - **Before landing on a moved tip, compute the tree that will land.** An
+    independent PR: `git merge-tree --write-tree <current tip> <reviewed head>`.
+    A PR stacked on another adds `--merge-base <parent's reviewed head>`: its
+    head still carries the parent's original commits while the tip carries the
+    parent's squash, so the plain form reports conflicts that do not exist. If
+    the result is `<reviewed head>^{tree}`, the gate stands. Otherwise apply the
+    whole batch this way, bottom-first per chain, and gate the combined tree once
+    before landing — two green PRs can merge red, and package-wide globs are the
+    known mechanism. Measured: 19 PRs landed as one batch; every computed tree
+    differed from its reviewed head, the plain form falsely conflicted on all 5
+    stacked children, the combined tree `23b288eee` was gated once (4829 passed,
+    against 4601 on the old tip), and the landed tip `05880556e` carries exactly
+    that tree.
   - **After landing:** fast-forward the main worktree (above); close, with a
     handoff comment, a tracker issue whose tasks have all landed; a follow-up
     filed as "claimable once X lands" is now claimable.
@@ -238,44 +245,33 @@
   of the result, never a diff of diffs. Measured: **13** heads had moved past
   their approvals, one with an unreviewed commit under two other approved PRs.
 - **Recommended, not required: stack a dependent task's PR on its unlanded
-  parent** with `gh stack` rather than waiting for it to land. Independent
-  tasks do not stack. `gh stack` is GitHub's own extension
-  (`github/gh-stack`, v0.1.1 against `gh` 2.45.0). It installs under `/root`,
-  which `teardown.sh` discards; reinstall with
-  `./shell.sh /workspace/gpu_docker/install-gh-stack.sh`, idempotent. Its
-  stack metadata lives in `.git/gh-stack` and is not committed.
-- **Land a stack with `gh stack merge <pr-number> --squash --yes`**, which merges
-  up to and including that PR as one squashed commit carrying its message body,
-  leaves the rest open, and retargets the PR above automatically — no rebase, no
-  force-push, no base patch. The plain endpoints are the wrong tools on a stacked
-  PR: `PUT /pulls/<n>/merge` returns 403 naming the stack merge path, and
-  `PATCH /pulls/<n> -f base=` returns 422. Measured on a two-PR probe stack.
-- **Four `gh stack` gotchas.** `gh stack link` needs `--base <branch>`. Only
-  open, non-draft PRs merge. There is **no `--message` flag**, so a hand-written
-  squash message cannot be supplied at merge time — with one commit the body
-  survives, with many GitHub's default applies; since the squash message records
-  a task's result, that is the one real cost of stacking. `gh stack unstack`
-  **can refuse outright**, even once every member is closed, and
-  `DELETE /stacks/<n>` 404s — **linking is not freely reversible; link a chain
-  when you mean it.**
+  parent** with `gh stack` (`github/gh-stack` v0.1.1, `gh` 2.45.0) rather than
+  waiting for it to land. Independent tasks do not stack. It installs under
+  `/root`, which `teardown.sh` discards; reinstall with
+  `./shell.sh /workspace/gpu_docker/install-gh-stack.sh` (idempotent).
+- **Land a stack with `gh stack merge <pr-number> --squash --yes`**: it squashes
+  up to and including that PR, leaves the rest open and retargets the PR above —
+  no rebase, force-push or base patch. On a stacked PR `PUT /pulls/<n>/merge`
+  returns 403 and `PATCH /pulls/<n> -f base=` returns 422 (measured on a probe).
+- **`gh stack` gotchas.** `link` needs `--base <branch>`. Only open, non-draft
+  PRs merge. There is **no `--message` flag**: with one commit the body survives
+  as the squash message, with many GitHub's default applies — the one real cost
+  of stacking. `unstack` **can refuse outright** and `DELETE /stacks/<n>` 404s,
+  so **link a chain only when you mean it.**
 - **Never force-push a branch under review. A restack after its parent has
   landed is permitted.**
-- **A chain is linked as a whole or not at all.** A half-linked chain is worse
-  than none: `gh stack merge` auto-retargets the members inside the stack and not
-  the ones outside it, so two disciplines apply in one chain and nothing on the
-  PR says which. **When a PR joins a chain, re-link the whole chain in the same
-  step** — `gh stack link --base feature/atomcompass_new <bottom> ... <top>`,
-  naming every member; it updates the existing stack, so it is safe to repeat.
-  **Do not link a chain with `need human` anywhere below it** — linking acts on
-  every member. **Drift check:** for each open PR whose base is another open PR's
-  branch, both sit in one stack (`gh api "repos/<o>/<r>/stacks?pull_request=<n>"`);
-  held chains are counted, not failed. Measured: two chains linked at two PRs
-  each grew to five and four.
-- **Landing the bottom of a hand-managed base chain forces one restack of
-  everything above it** — `git rebase --onto <new> <old> <branch>` plus a REST base
-  patch, per child, per parent move. A plain `git rebase` conflicts where `--onto`
-  does not. **A linked `gh stack` does not pay this**, which is the argument for
-  linking a chain rather than hand-managing it.
+- **A chain is linked as a whole or not at all**: `gh stack merge` retargets
+  members inside the stack and not those outside it. When a PR joins a chain,
+  re-link the whole chain in the same step —
+  `gh stack link --base feature/atomcompass_new <bottom> ... <top>`, safe to
+  repeat. **Do not link a chain with `need human` anywhere below it.** **Drift
+  check:** for each open PR whose base is another open PR's branch, both sit in
+  one stack (`gh api "repos/<o>/<r>/stacks?pull_request=<n>"`); held chains are
+  counted, not failed. Measured: two chains linked at two PRs each grew to five
+  and four.
+- **An unlinked chain pays a restack of everything above on each parent
+  landing** — `git rebase --onto <new> <old> <branch>` (a plain rebase
+  conflicts) plus a REST base patch, per child. A linked `gh stack` does not.
 - Except for the main branch, free updates to `jgong5/ATOM` — branches, PRs and
   issues alike, untouched until the project agrees to upstream the milestone.
   Never touch `ROCm/ATOM`.
