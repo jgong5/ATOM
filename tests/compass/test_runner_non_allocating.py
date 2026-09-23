@@ -18,6 +18,12 @@ The two facts worth naming, because both were surprises:
   allocator, so the check is meaningful on a machine with no CUDA allocator to
   read. A control asserts the counter sees an allocation when there is one;
   without it a broken counter and a clean runner look identical.
+
+The import scan walks the package, so a root that does not resolve yields
+nothing and the parametrisation passes on zero cases. The non-empty case is
+asserted on its own, because the neighbouring test that reads a path under the
+same root is what reddens this file today -- an accident of who its sibling is,
+not a statement about this scan.
 """
 
 import ast
@@ -411,9 +417,32 @@ def test_the_guard_reads_the_imports_that_run_at_import(form, tmp_path, monkeypa
     sys.modules.pop(probe, None)
 
 
+def _runner_modules():
+    # rglob, so a module added under the package is covered the day it lands.
+    return sorted(PACKAGE.rglob("*.py"))
+
+
+def test_the_package_was_found():
+    assert _runner_modules(), f"no modules under {PACKAGE}"
+
+
+def test_the_guard_finds_nothing_when_the_root_moves(monkeypatch, tmp_path):
+    """The control for the guard above, which otherwise only proves it is alive.
+
+    A guard that has never been seen failing is a liveness check: it passes
+    today because the package is where it always was. Pointed at a root that
+    does not resolve it must come back empty -- and the sibling module one level
+    out is there so a derivation that widened past its own root would be caught
+    here instead of quietly keeping the parametrisation non-empty.
+    """
+    (tmp_path / "sibling.py").write_text("")
+    monkeypatch.setitem(globals(), "PACKAGE", tmp_path / "moved")
+    assert not _runner_modules()
+
+
 @pytest.mark.parametrize(
     "path",
-    sorted(PACKAGE.rglob("*.py")),
+    _runner_modules(),
     ids=lambda p: p.name,
 )
 def test_only_the_binding_module_reaches_the_engine(path):
