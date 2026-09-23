@@ -29,14 +29,15 @@ at *collection* time, via `rocminfo` reached on import, so pytest cannot even bu
 list, plus 1 that collects cleanly and then fails at run time on a pinned-host allocation
 (`hipHostMalloc failed: 100`). That numerator is non-plugin, so its denominator must be too —
 quoting 29 against 189 is the defect `16` L4 fixes and it is not repeated here. **At the
-whole-suite denominator the figure is at least 32 of 189**, because `tests/plugin/` is not
+whole-suite denominator the figure is at least 34 of 189**, because `tests/plugin/` is not
 purely a packaging problem: collecting it alone at `236abfd9a`, and again at `fada7424e`, in `xiaobizh_n18_cpu` gives
-`153 tests collected, 7 errors in 1.45s`, rc=2, and those 7 decompose as **3 `rocminfo`**
+`153 tests collected, 7 errors`, rc=2, and those 7 decompose as **3 `rocminfo`**
 (`test_gdn_target_verify_batched_equiv.py`, `test_rtpllm_forward_context_semantics.py`,
 `test_vllm_deepseek_v4_proxy_state_arena_layout.py`), **1 `ModuleNotFoundError: No module
 named 'sglang'`**, and **3 `ImportError: cannot import name 'fused_gdn_gating' from
 'atom.model_ops.attention_gdn' (unknown location)`** — a module left half-initialised by the
-first three, not a fourth cause. 29 + 3 = 32 is a floor: the other 23 plugin files collect
+first three, not a fourth cause. With the 2 tier files the table below names, which reach
+`rocminfo` run alone at `fada7424e` too, 29 + 2 + 3 = 34 is a floor: the other 23 plugin files collect
 here and are never run, so nothing is measured about what they would touch.
 `tests/plugin/`'s 30 files at `fada7424e` are dropped whole because the tier targets ATOM and sglang
 and vllm are in neither image — the measured reason for 27 of them, not for all 30. The

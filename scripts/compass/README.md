@@ -96,8 +96,8 @@ figure is stale by construction between one task and the next, and it has twice
 been taken as a control by a task that then read the intervening tasks' tests as a
 surplus of its own. **A control is measured, not read**: run `gate_cpu.sh` on the
 integration head your branch forked from, in the same container, and state both
-figures beside their commits. The CPU row below does not name the commit it ran
-on, which is the omission that let it pass for current; the same gate on
+figures beside their commits. The CPU row below once named no commit, which is
+the omission that let it pass for current; the same gate on
 `68ef4f329` measured **4380 passed, 149 skipped, 3 xfailed, rc=0** — node 18,
 container `xiaobizh_n18_cpu`, 2026-09-22, 36.2 s of pytest inside 43.0 s of wall.
 
@@ -110,7 +110,7 @@ with a non-zero rc and no ±1.
 
 | Tier | Result | Measured |
 |---|---|---|
-| CPU gate | **4030 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0, **identical in every run on 2026-09-21, the clock 25.4-31.7 s of pytest inside 31.1-37.8 s of wall (`time` real) — a measured spread, not a bound** — decomposing as **3956 ATOM + 74 `tests/compass`** | node 18, container `xiaobizh_n18_cpu`, 2026-09-21, **commit not recorded**, against a `git archive` snapshot with `PYTHONPATH` asserted and pytest's own rc captured before any pipe |
+| CPU gate, at `105ca4197` | **4030 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0 — decomposing as **3956 ATOM + 74 `tests/compass`**; the 3956 is PR #6's control, `042aad97d` with PR #6's `scripts/compass/` copied in, since `042aad97d` has none. Six runs at `d737f15e7` and `7ff80cc4b`, before PR #6's restack, read the same counts and **25.6-30.8 s of pytest inside 31.6-36.9 s of wall (`time` real) — a measured spread, not a bound** (`8c0ee374f`) | `105ca4197`, PR #6's head, landed as `4c16792d9` (same tree) — PR #6's gate table; node 18, container `xiaobizh_n18_cpu`, 2026-09-21, against a `git archive` snapshot with `PYTHONPATH` asserted and pytest's own rc captured before any pipe |
 | CPU gate, same tier, at `186d12829` | **4501 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0 — three runs, identical, 28.8-34.4 s of pytest inside 35-40 s of wall. The **4030** above and the **4380** in the paragraph above are this same gate at earlier trees; all three are history, and this one will be too | `186d12829` — the commit this branch forks from, which is its merge-base with the integration head, **read 2026-09-21T19:21Z**, node 18's own clock — node 18, container `xiaobizh_n18_cpu`, `git archive` snapshot staged by `snapshot.sh`, `PYTHONPATH` asserted, pytest's own rc captured before any pipe |
 | GPU superset (`--ignore=tests/plugin`) | **4779 passed, 5 failed**, 0 errors, 105 skipped, 3 xfailed, **72.6 s**; two runs, byte-identical failing sets | `fe9ea043c`, node 18, container `xiaobizh_n18`, `HIP_VISIBLE_DEVICES=1`, 2026-09-20, torch **2.10.0+rocm7.2.4.git3d3aa833**, `torch.version.hip` **7.2.53211**, ROCm release **7.2.4**, AITER **v0.1.21.dev0-49-gf4e7c7509** (`git describe`) |
 | `ruff check .` | 1003 errors, 640 fixable — the gate is *no new* error, not zero | `83daf636d` |
@@ -122,11 +122,12 @@ it is this directory.** `tests/compass/test_cpu_gate_exclude.py` parametrises
 one case each, so regenerating that file changes the pass count by exactly the
 change in the number of entries. The readings in circulation are the same gate
 under different exclusion lists and a different `tests/compass`, not discrepancies:
-**3925** at 32 exclusions; **3956** is the ATOM-only half; **3988** with
-`tests/compass` at 32; **4005** with it at 49; **4022** with it at 66 — 49 plus the 17
-extra trigger paths the corrected derivation below produces — and **4030** with it at 74,
-the 8 cases `test_gate_gpu_surplus.py` adds. The
-exclusion list went 32 → 29 because `test_dp_metadata.py`, `test_dp_sync_layout.py`
+**3925** at `83daf636d`, 32 exclusions and no `tests/compass`; **3956** is the
+ATOM-only half, at `042aad97d` above, and 3925 + 31; **4005** at `3afcb4880`, with
+`tests/compass` at 49; **4022** at `71d2a1ac2`, with it at 66 — 49 plus the 17 extra
+trigger paths the corrected derivation below produces — and **4030** at `105ca4197`,
+with it at 74, the 8 cases `test_gate_gpu_surplus.py` adds. The exclusion list went
+32 → 29, adding those 31, because `test_dp_metadata.py`, `test_dp_sync_layout.py`
 and `test_forward_mode.py` were re-measured **CPU-green**.
 
 **The five GPU failures are four ULP comparisons and one bitwise check** — not
