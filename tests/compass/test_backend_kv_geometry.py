@@ -193,10 +193,23 @@ def test_expert_parallelism_alone_builds_no_all_to_all():
 
 
 def test_a_width_the_kv_heads_cannot_shard_is_refused(qwen):
-    with pytest.raises(ValueError, match="do not divide"):
+    """Which of the two indivisible cases is refused is the whole content.
+
+    `kv_heads_per_rank` refuses on either side of `total_kv_heads >= tp_size`,
+    and the two sentences differ only in which width is said not to divide the
+    other. Reading that comparison the other way up routes this very call to
+    the replicated branch, so `do not divide` alone held both ways. What
+    separates them is the order of the two operands and the clause about
+    replication, and both are asserted here.
+    """
+    heads = qwen.num_key_value_heads
+    with pytest.raises(
+        ValueError, match=rf"{heads} KV heads do not divide across 3 ranks"
+    ) as refused:
         KvGeometry.from_hf_config(
             qwen, block_size=BLOCK_SIZE, parallelism=Parallelism(tp_size=3)
         )
+    assert "replicated case" not in str(refused.value)
 
 
 def test_an_unrecognised_layer_kind_is_refused_rather_than_paged(qwen):
