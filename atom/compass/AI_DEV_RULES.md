@@ -94,14 +94,16 @@
   eight principles first.
 - **A developer agent owns development and PR updates; the main agent orchestrates
   and does not write the change itself.** After each push a reviewer agent
-  reviews, the developer amends, and that repeats until the verdict is APPROVE.
+  reviews, the developer pushes fixes, and that repeats until the verdict is APPROVE.
 - **Escalations and `need human`.** An escalation is anything that needs an owner
   ruling before work can continue; anything the developer can fix without one is
   a finding, and the owner is never asked about findings. An agent applies
   `need human` the moment it escalates — a halt declared in prose stops nothing;
   when the ruling lives on another issue, label each PR it holds and name that
   issue. The label stops all agent action on that issue or PR (no commit, review,
-  amend or merge, even after a passed review); only the owner removes it.
+  amend or merge, even after a passed review), with one exception: `gh stack
+  link` by PR number, which lands and pushes nothing, though it retargets the
+  linked PRs' bases (then and when a PR below lands). Only the owner removes it.
   **Without it, automation is on by default**: agents act with no opt-in.
 - **The review loop has its own stop.** If the same finding survives two cycles,
   or the loop passes three cycles, it halts, goes to the owner and applies
@@ -172,17 +174,22 @@
   stack. Reinstall after a container rebuild with
   `./shell.sh /workspace/gpu_docker/install-gh-stack.sh`.
   - Link a chain whole or not at all, and only when you mean it (`unstack` can
-    refuse): `gh stack link --base feature/atomcompass_new <bottom> ... <top>`,
-    re-run whenever a PR joins, never with `need human` below. `merge` retargets
-    only linked members. Drift check: every open PR based on another open PR's
-    branch sits in one stack (`gh api "repos/<o>/<r>/stacks?pull_request=<n>"`).
+    refuse): `gh stack link --base feature/atomcompass_new <bottom-pr#> ... <top-pr#>`,
+    re-run whenever a PR joins, held members included (linking lands nothing).
+    `merge` retargets only linked members. A fork (two or more open PRs based on
+    one open PR's branch) links at most one arm. Drift check: every open PR based
+    on another open PR's branch sits in one stack, fork arms excepted
+    (`gh api "repos/<o>/<r>/stacks?pull_request=<n>"`).
   - Land with `gh stack merge <pr-number> --squash --yes`: it squashes up to that
-    PR and retargets the one above. Only open, non-draft PRs merge. There is no
-    `--message`: a multi-commit PR gets GitHub's default squash message.
+    PR and retargets the one above. Only open, non-draft PRs merge; it checks no
+    labels, so apply the landing rule first. There is no `--message`: a
+    multi-commit PR gets GitHub's default squash message.
   - An unlinked chain needs, per child on each parent landing,
     `git rebase --onto <new> <old> <branch>` plus a REST base patch.
-- **Never force-push a branch under review. A restack after its parent has
-  landed is permitted.**
+- **Never force-push a branch under review.** Answer review findings with new
+  commits, never an amend: the branch lands squashed anyway, and an amend removes
+  the reviewed commit a delta review needs and strands any child stacked on it.
+  A restack after the parent has landed is permitted.
 - Except for the main branch, free updates to `jgong5/ATOM` — branches, PRs and
   issues alike, untouched until the project agrees to upstream the milestone.
   Never touch `ROCm/ATOM`.
