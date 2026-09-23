@@ -147,9 +147,16 @@ WIDTH_TABLES = tuple(field.path for field in SCHEMA if field.kind is Kind.WIDTH_
 #: about -- and a question registered as reading a field it cannot speak for
 #: reports a run that could not ask it and a run that asked and found nothing
 #: as the same record. Derived from `FILLED_BY`, so a probe given the width
-#: that has none empties this with no second list to remember.
+#: that has none empties this with no second list to remember. A table no
+#: probe is named for at all contributes nothing here rather than failing the
+#: derivation: this runs while the module is being imported, so a subscript
+#: would answer a table nobody has entered yet by denying every caller of the
+#: package, including the ones with no interest in probes, and the reader would
+#: be told which import failed rather than which term is missing. The naming is
+#: left to `probe_for`, which refuses such a term by name, and the two lists
+#: are held against each other by a test.
 PROBE_TABLES = tuple(
-    path for path in WIDTH_TABLES if None in FILLED_BY[path.rsplit(".", 1)[-1]]
+    path for path in WIDTH_TABLES if None in FILLED_BY.get(path.rsplit(".", 1)[-1], ())
 )
 STACK_PINS = tuple(f"{PINNED_BLOCK}.{component}" for component in PINNED)
 
