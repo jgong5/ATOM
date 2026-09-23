@@ -53,10 +53,18 @@ set -uo pipefail
 # FATAL paths printed it not at all, and the failure verdicts went to stderr
 # while the success verdict went to stdout -- so `gate_gpu.sh 2>/dev/null | grep
 # GATE_GPU_RC` was silent on failure and indistinguishable from "never ran".
+#
+# The verdict line carries its reason, for the reasons given above finish() in
+# gate_cpu.sh: it is the only line every pipe keeps.
 finish() {
-    printf 'GATE_GPU_RC=%s\n' "$1"
+    if [ "$1" -eq 0 ]; then
+        printf 'GATE_GPU_RC=0 PASSED\n'
+    else
+        printf 'GATE_GPU_RC=%s NOT PASSED -- %s\n' "$1" "$2"
+    fi
     exit "$1"
 }
+printf 'verdict: the last line of stdout; if this run is piped, $? is the pipe'"'"'s\n'
 
 # The baseline is a pair AND the tree and toolchain it was measured on. A bare
 # pair cannot distinguish a regression from drift: after a torch bump, 4728/7
@@ -104,13 +112,13 @@ KNOWN_FILE=$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_known_failures.txt
 known_ids() { grep -vE '^[[:space:]]*(#|$)' "$KNOWN_FILE"; }
 [ -r "$KNOWN_FILE" ] || {
     printf 'FATAL: %s is missing; the baseline names no failures.\n' "$KNOWN_FILE" >&2
-    finish 93
+    finish 93 "the known-failures list is missing; nothing was run"
 }
 KNOWN_N=$(known_ids | grep -c .)
 [ "$KNOWN_N" -eq "$BASE_FAILED" ] || {
     printf 'FATAL: BASE_FAILED=%s but %s names %s node-id(s).\n' \
         "$BASE_FAILED" "$KNOWN_FILE" "$KNOWN_N" >&2
-    finish 93
+    finish 93 "BASE_FAILED disagrees with the known-failures list; nothing was run"
 }
 
 # pytest's -r is store-last-wins, so a caller's -rE silently replaces the -rfE
@@ -131,21 +139,21 @@ for arg in "$@"; do
         printf '  built from the FAILED and ERROR report lines, and -r is\n' >&2
         printf '  store-last-wins, so your flag would silently empty the observed\n' >&2
         printf '  failure set and the by-name check would compare nothing.\n' >&2
-        finish 95
+        finish 95 "refused a -r argument; nothing was run"
         ;;
     esac
 done
 
-ROOT=$(compass_tree_root) || finish $?
-cd "$ROOT" || finish 90
+ROOT=$(compass_tree_root) || finish $? "the tree to measure could not be resolved; nothing was run"
+cd "$ROOT" || finish 90 "cannot cd into the tree; nothing was run"
 compass_env "$ROOT"
 export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
 
 PRE=$(dirname -- "${BASH_SOURCE[0]}")/preflight.sh
 printf '===== pre-flight (before) =====\n'
-"$PRE" || { printf 'ABORT: pre-flight failed before the run.\n' >&2; finish 91; }
+"$PRE" || { printf 'ABORT: pre-flight failed before the run.\n' >&2; finish 91 "pre-flight failed before the run; nothing was run"; }
 
-compass_require_tree "$ROOT" || finish $?
+compass_require_tree "$ROOT" || finish $? "atom does not import from this tree; nothing was run"
 compass_describe "$ROOT"
 
 TORCH=$(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo UNKNOWN)
@@ -179,7 +187,7 @@ fi
 # on the integration branch that is 4779 + 0 - 49 = 4730, which is what a tree
 # without this phase's tests measures. See compass_compass_pass_count in _lib.sh
 # for why that is a count and not a refusal.
-COMPASS_N=$(compass_compass_pass_count "$ROOT") || finish $?
+COMPASS_N=$(compass_compass_pass_count "$ROOT") || finish $? "the tests/compass pass count has no source; the suite was not run"
 [ -d "$ROOT/tests/compass" ] ||
     printf 'tests/compass: absent on this tree, so it contributes no tests.\n'
 EXPECT_PASSED=$((BASE_PASSED + COMPASS_N - BASE_COMPASS_TESTS))
@@ -207,7 +215,7 @@ if [ -z "$SUMMARY" ] || { [ "$PASSED" -eq 0 ] && [ "$FAILED" -eq 0 ] && [ "$ERRO
     printf 'NO MEASUREMENT -- no usable pytest summary line found.\n' >&2
     tail -20 "$OUT" >&2
     rm -f "$OUT"
-    finish 1
+    finish 1 "no usable pytest summary line; the run is not a measurement"
 fi
 
 # pytest's own verdict, which the delta rule cannot replace: 0 = all passed,
@@ -220,19 +228,27 @@ case "$PYRC" in
     printf 'pytest rc=%s -- not "all passed" and not "tests failed", so the run\n' "$PYRC" >&2
     printf '  did not complete and the counts above are not a measurement.\n' >&2
     rm -f "$OUT"
-    finish 1
+    finish 1 "pytest rc=$PYRC; the run did not complete"
     ;;
 esac
 
+# Each finding goes to stderr in full. The first one's one-line form, and how
+# many more there were, travel on the verdict line. The checks run with the
+# node-id comparisons ahead of the counts they explain, so a new failure is
+# named there by its node-id rather than as a changed count.
+# A finding passed without a one-line form is named by its own first line, so
+# a call that omits it still ends on a verdict rather than on `set -u`.
 VERDICT=0
-fail() { printf '%s\n' "$1" >&2; VERDICT=1; }
+WHY=
+fail() { printf '%s\n' "$1" >&2; VERDICT=$((VERDICT + 1)); [ -n "$WHY" ] || WHY=${2:-${1%%$'\n'*}}; }
 
 # Errors are not failures and were never parsed: a run reading "4800 passed, 5
 # failed, 12 errors" produced GATE_GPU_RC=0 without one word about the twelve.
 [ "$ERRORS" -eq 0 ] ||
     fail "$(printf '%s collection/teardown error(s). The baseline has none, and an
   error is not a failure -- the tests behind it did not run at all, so the
-  pass count below is over a smaller suite than the baseline'"'"'s.' "$ERRORS")"
+  pass count below is over a smaller suite than the baseline'"'"'s.' "$ERRORS")" \
+    "$ERRORS collection/teardown error(s)"
 
 # The names, not only the counts: one baseline failure fixed and one new one
 # introduced reads as 5/5.
@@ -262,7 +278,8 @@ NEW_IDS=$(comm -23 "$OBS_IDS" "$KNOWN_IDS")
 GONE_IDS=$(comm -13 "$OBS_IDS" "$KNOWN_IDS")
 if [ -n "$NEW_IDS" ]; then
     fail "$(printf 'failure(s) the baseline does not name:\n%s' \
-        "$(printf '%s\n' "$NEW_IDS" | sed 's/^/  /')")"
+        "$(printf '%s\n' "$NEW_IDS" | sed 's/^/  /')")" \
+        "$(printf '%s\n' "$NEW_IDS" | grep -c .) failure(s) the baseline does not name, first ${NEW_IDS%%$'\n'*}"
 fi
 # Not good news by default, and the gate cannot tell the three causes apart:
 # the failure was fixed; the test stopped running; or the observed set could not
@@ -272,7 +289,8 @@ if [ -n "$GONE_IDS" ]; then
     fail "$(printf 'baseline failure(s) not observed failing:\n%s\n  Confirm which of the three this is -- fixed, no longer collected, or an
   observed set that could not be read -- then drop them from %s.
   That edit is reviewed; it is not something this gate may assume.' \
-        "$(printf '%s\n' "$GONE_IDS" | sed 's/^/  /')" "$(basename "$KNOWN_FILE")")"
+        "$(printf '%s\n' "$GONE_IDS" | sed 's/^/  /')" "$(basename "$KNOWN_FILE")")" \
+        "$(printf '%s\n' "$GONE_IDS" | grep -c .) baseline failure(s) not observed failing, first ${GONE_IDS%%$'\n'*}"
 fi
 # grep -c always prints a number, so an emptiness test here would be dead.
 if [ "$ERR_N" -gt 0 ]; then
@@ -302,14 +320,16 @@ rm -f "$OBS_IDS" "$ERR_IDS" "$KNOWN_IDS"
   them here.' \
         "$PASSED" "$EXPECT_PASSED" "$BASE_PASSED" "$BASE_COMMIT" \
         "$COMPASS_N" "$BASE_COMPASS_TESTS" "$((COMPASS_N - BASE_COMPASS_TESTS))" \
-        "$EXPECT_PASSED" "$PASSED" "$((PASSED - EXPECT_PASSED))")"
+        "$EXPECT_PASSED" "$PASSED" "$((PASSED - EXPECT_PASSED))")" \
+    "$PASSED passed, expected $EXPECT_PASSED"
 
 rm -f "$OUT"
 
 printf '\n===== pre-flight (after) =====\n'
 "$PRE" || printf 'WARNING: pre-flight failed AFTER the run -- the node changed under it,\n         and the numbers above may not be attributable.\n' >&2
 
-[ "$VERDICT" -eq 0 ] || finish 1
+[ "$VERDICT" -le 1 ] || WHY="${WHY%.}; $((VERDICT - 1)) more finding(s) on stderr"
+[ "$VERDICT" -eq 0 ] || finish 1 "$WHY"
 
 # An attestation names a tree. On a tree with no commit, gate_cpu.sh refuses
 # COMPASS_GPU_GATE_DONE=UNKNOWN -- so say that here rather than print an
