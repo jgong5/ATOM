@@ -355,9 +355,10 @@ KV gate, a spec that cannot be recovered from the artifact makes an error unattr
   depend on the ROCm/RCCL/AITER build more than on the die — the +5980 MiB at width > 1 is
   collective buffer sizing, and the 926 MiB at TP1 is HIP context plus libraries. Adopted
   as a working assumption rather than left open, and made *enforceable* by
-  `software_pinned_to` (doc `05` D25 rule 3), which refuses silently reusing a spec across
-  a stack change. Still untested across dies; recorded as **T50** and cheap to settle with
-  one startup on a second card type.
+  `software_pinned_to` (doc `05` D25 rule 3): reusing a spec across a stack change warns by
+  default (`check_stack`) and refuses under `validate(strict=True)`, and moving constants
+  across stacks, by a transfer or a merge, always refuses. Still untested across dies;
+  recorded as **T50** and cheap to settle with one startup on a second card type.
 - Three topologies of one model is interpolation, not a law. The prior work said so
   explicitly and could not get a third model because the box was offline.
 - **The graph-pool width scaling rests on one point above W=1.** Context, since the line

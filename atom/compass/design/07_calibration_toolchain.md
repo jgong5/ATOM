@@ -686,8 +686,9 @@ Two consequences worth noting:
   what lets one campaign serve many shapes.
 - The device runtime constants depend on the **library build** as much as the silicon,
   which is why doc 05's schema carries `software_pinned_to` and why a mismatch warns
-  loudly. The +5980 MiB appearing the moment width exceeds one is collective buffer sizing;
-  the 926 MiB at TP1 is HIP context plus libraries.
+  loudly by default, refusing under `validate(strict=True)` or when a transfer or merge
+  moves constants across stacks. The +5980 MiB appearing the moment width exceeds one is
+  collective buffer sizing; the 926 MiB at TP1 is HIP context plus libraries.
 
 ### The gate must be verifiable from the artifact, not from the flag
 
