@@ -25,8 +25,8 @@ aiter's, aiter lives in the container's writable layer outside `/workspace`,
 and two versions are in circulation on this project right now. A stanza naming
 only ATOM's tree describes half of what ran, so a `Provenance` cannot be built
 without both. **What a difference then means is not decided here**: whether an
-aiter bump invalidates an artifact or only warns is the owner's ruling, and
-this module records the version so a ruling has something to act on.
+aiter bump invalidates an artifact or only warns is left open (#168), and
+this module records the version so either answer has something to act on.
 
 `git describe --tags --always --dirty` is the call the GPU gate makes to
 version aiter, and the gate finds aiter's checkout with this module's

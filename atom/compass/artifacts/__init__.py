@@ -15,8 +15,7 @@ thing it was measured against has moved.
 * **Provenance names every executed source root** (`provenance`). ATOM's by the
   tree `git archive` would ship, aiter's by `git describe --tags --always
   --dirty`, the call the GPU gate makes on aiter's checkout. **Only the recording
-  half**: the version is recorded, and what a bump *means* is the owner's
-  ruling, which is not taken.
+  half**: the version is recorded, and what a bump *means* is left open.
 * **A handed-off entry is immutable** (`store`). **The physical form is a
   directory convention** -- no index, no manifest -- and publishing is a rename
   onto a name that must not exist, so an overwrite is impossible rather than
@@ -36,7 +35,7 @@ thing it was measured against has moved.
   states a count and not which of two stages declined.
 
 **Not decided here**: whether an aiter bump invalidates an artifact or only
-warns (filed as #168) -- until it is ruled the default stands and a bump
+warns (filed as #168) -- while that is open the default stands and a bump
 refuses; whether a dirty source root may publish (also #168); and what
 an artifact key's scalar `width` means against a four-axis topology (#165).
 The matrix's six columns hold no width, so nothing here binds one.

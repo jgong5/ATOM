@@ -13,9 +13,9 @@ overwrite comes from the filesystem for free: an entry is built elsewhere and
 moved into place, and a published entry is never empty -- it always carries
 `entry.json` -- so `rename(2)` cannot replace one.
 
-Stated that way on purpose, because the obvious stronger claim is false and was
-in this PR until it was measured: on ext4, `os.rename` **succeeds** onto an
-existing *empty* directory and fails with ENOTEMPTY only onto a non-empty one.
+Stated that way on purpose, because the obvious stronger claim is false, as
+measured: on ext4, `os.rename` **succeeds** onto an existing *empty* directory
+and fails with ENOTEMPTY only onto a non-empty one.
 The exclusivity is a consequence of what a published entry contains, not of the
 rename primitive refusing an existing name -- so an entry form with no members
 would inherit a silent overwrite, and an empty directory sitting in the way is
