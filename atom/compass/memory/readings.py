@@ -39,8 +39,8 @@ tested -- and buffers need a recording, because the formula that matched the
 tree, which needs the engine, which this tier does not import; and there is no
 recording of a card nobody has run. So `ModelTerms` takes those two terms rather
 than deriving them, with no default -- the same shape as the spec's "a runtime
-constant has no default" rule, and for the same reason. `declared_for_m1` fills
-all three with declared formulas for M1 and labels every one of them. For the
+constant has no default" rule, and for the same reason. `declared` fills
+all three with declared formulas and labels every one of them. For the
 activation term a declared formula is the only answer while no op graph
 exists; this module gives the other two the same treatment, visibly.
 """
@@ -108,7 +108,7 @@ class ModelTerms:
     activations: Term
 
     @classmethod
-    def declared_for_m1(
+    def declared(
         cls,
         config,
         *,
@@ -119,7 +119,7 @@ class ModelTerms:
     ) -> ModelTerms:
         """All three from geometry and declared coefficients, each labelled.
 
-        For M1, with fake models, a declared formula suffices and must say so.
+        With fake models, a declared formula suffices and must say so.
         Every term below is `Basis.DECLARED` and every one names its
         successor, because none of the three is its eventual source: weights
         are owed a meta build, buffers a recording, and
@@ -128,7 +128,7 @@ class ModelTerms:
         with no law behind it. The measured spread that makes it load-bearing
         is 0.1 KB/token on the 0.6B against 39.6 KB/token on the 27B, the
         difference between -35.0% and +3.4% held out. A formula does not
-        stand in for that past M1.
+        stand in for that on a real model.
         """
         if tp_size < 1:
             raise ValueError(f"tensor-parallel width is at least 1: {tp_size}")

@@ -450,7 +450,7 @@ def live_readings(spec, qwen, tp_width=1):
     return device_readings(
         spec,
         tp_width=tp_width,
-        model=ModelTerms.declared_for_m1(
+        model=ModelTerms.declared(
             qwen,
             parameter_count=PARAMETERS,
             tp_size=tp_width,
@@ -1035,18 +1035,14 @@ def test_the_footprint_is_peak_torch_and_non_torch_and_nothing_else(spec, qwen):
 #: lets the guard below read the file it is written in if it is ever widened.
 #: `P\d+\.\d+` is in the banned list by name; the two-to-four letter form with
 #: a dash is every task label, not just the one this cut happened to leave.
+#: A milestone label is `M1` in prose and `_m1` as an identifier suffix; a bare
+#: letter-and-digit is not matched, because it would take `TP1`, `w1` and
+#: every dtype width in this package with it. No group captures, so a failure
+#: prints the forms it found.
 _TAGS = re.compile(
-    r"\b[DTW]\d+(\.\d+)?\b|\bP\d+\.\d+\b|\b[A-Z]{2,4}-\d+\b"
+    r"\b[DTW]\d+(?:\.\d+)?\b|\bP\d+\.\d+\b|\b[A-Z]{2,4}-\d+\b|\bM\d+\b|\w*_m\d+\b"
     r"|principles? \d+|Gate \d+|`\d{2}`|#\d+"
 )
-
-#: What this pattern deliberately does not catch, and why, because an absence
-#: nobody explained is the same defect one level up. `M1` is a milestone that
-#: the public `ModelTerms.declared_for_m1` is named after: it says when a
-#: declared term stops being allowed, which is what the code does, and it
-#: points at no document. Matching a bare letter-and-digit would also take
-#: `TP1`, `w1` and every dtype width in this package with it.
-KEPT = ("M1", "declared_for_m1")
 
 #: The package as the suite imported it, never a walk up from this file: if
 #: `atom` resolves from another root, a path-derived location would scan one
@@ -1070,7 +1066,7 @@ def test_no_module_in_the_package_carries_a_design_reference(module):
     `test_memory_readings.py`, and for the same reason.
     """
     found = _TAGS.findall((PACKAGE / module).read_text())
-    assert not found, f"{module} carries {len(found)} design references"
+    assert not found, f"{module} carries design references: {found}"
 
 
 def test_the_guard_catches_the_forms_that_were_actually_removed():
@@ -1090,6 +1086,8 @@ def test_the_guard_catches_the_forms_that_were_actually_removed():
         "an open owner ruling (**#87**)",
         "proving it is MEM-2's",
         "`16` row W2.2",
+        "For M1, with fake models, a declared formula suffices",
+        "def declared_for_m1(",
     ]
     # Two forms this package never carried, driven anyway because a guard is
     # worth what it catches rather than what it happened to meet. `P0.4` is
@@ -1105,19 +1103,7 @@ def test_the_guard_catches_the_forms_that_were_actually_removed():
     assert not _TAGS.search(replacement)
 
 
-def test_the_kept_forms_are_kept_on_purpose_and_stay_readable():
-    """An absence with a stated reason is a decision; without one it is a gap.
-
-    `M1` is the one letter-and-digit form this package keeps. It names the
-    milestone at which a declared term stops being allowed -- which is what
-    the code does, not a pointer into a document -- and the public
-    `ModelTerms.declared_for_m1` is named after it, so removing it would
-    rename an API to satisfy a pattern.
-    """
-    assert all(not _TAGS.search(kept) for kept in KEPT)
-    sources = "".join((PACKAGE / p.name).read_text() for p in PACKAGE.glob("*.py"))
-    assert "declared_for_m1" in sources
-    # And the widened pattern does not sweep up the widths and dtypes that
-    # share its shape, which is why it is not a bare letter-and-digit.
+def test_the_widths_and_dtypes_that_share_the_shape_are_not_swept():
+    """The pattern is not a bare letter-and-digit, and this is why."""
     for benign in ("TP1", "w1_base_bytes", "fp8", "int8", "bf16"):
         assert not _TAGS.search(benign), benign
