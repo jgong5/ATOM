@@ -16,8 +16,10 @@ driver.
 What this tier holds is the half that decides whether the binding is right
 rather than whether it runs: that ATOM's budget method reaches the device
 through one call and through no other, that the four figures are handed back
-under the names they were taken by, that no line of that arithmetic is written
-down anywhere in this package, and that the count carries what sized it.
+under the names they were taken by, that the parts of that arithmetic with a
+name or a literal to find are not written down in this package, that the
+refusals it carries read fields ATOM declares, and that the count carries what
+sized it.
 
 The spec document and the model config are imported from `test_memory_readings`
 rather than copied. The numbers here are the numbers there; a second MI355X
@@ -168,13 +170,38 @@ def test_the_four_figures_are_handed_back_under_the_names_they_were_taken_by():
     }
 
 
-def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
-    """The claim the route rests on, checked over the package rather than said.
+def _safety_margin_coefficients():
+    """The float literals in ATOM's own `safety_margin = ...` line."""
+    method = _method(_classes(ATOM_RUNNER)["ModelRunner"], "get_num_blocks")
+    return {
+        n.value
+        for node in ast.walk(method)
+        if isinstance(node, ast.Assign)
+        and [ast.unparse(t) for t in node.targets] == ["safety_margin"]
+        for n in ast.walk(node.value)
+        if isinstance(n, ast.Constant) and isinstance(n.value, float)
+    }
 
-    Read as imports and attribute names rather than as text: both words appear
-    in docstrings all over this package, so a grep would pass for as long as
-    somebody kept writing about the formula while copying it.
+
+def test_the_margin_walker_finds_the_margin_where_there_is_one():
+    """The control: a walker that found nothing would clear every module."""
+    assert _safety_margin_coefficients() == {0.02}
+
+
+def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
+    """Three proxies for the claim, checked over the package rather than said.
+
+    What is checked: no module imports `plan_pools`, none reads an attribute
+    named `gpu_memory_utilization`, and none writes the coefficient of ATOM's
+    safety margin -- read off ATOM's own line, so it follows ATOM -- or its
+    complement as a literal. What is not: the `min(budget, free)` clamp, which
+    has no name to find, and a margin spelled some other way (`2 / 100`).
+
+    Read as imports, attribute names and literals rather than as text: the
+    words appear in docstrings all over this package, so a grep would pass for
+    as long as somebody kept writing about the formula while copying it.
     """
+    margins = {round(c, 12) for m in _safety_margin_coefficients() for c in (m, 1 - m)}
     for module in sorted(COMPASS.rglob("*.py")):
         tree = ast.parse(module.read_text())
         imported = {
@@ -186,6 +213,12 @@ def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
         assert "plan_pools" not in imported, module
         reads = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
         assert "gpu_memory_utilization" not in reads, module
+        literals = {
+            round(n.value, 12)
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and type(n.value) is float
+        }
+        assert not literals & margins, module
 
 
 # --- the count carries what it was sized from --------------------------------
@@ -298,6 +331,49 @@ def test_that_refusal_comes_before_the_readings_are_even_looked_for():
     stub.compass_readings = "not readings, and not reached"
     with pytest.raises(RunnerRefusal, match="owns no device memory"):
         NonAllocatingRunner.get_num_blocks(stub)
+
+
+def _fields_the_refusals_read():
+    """Every name the overrides read through `_config_field`, off the source."""
+    tree = ast.parse((COMPASS / "runner" / "overrides.py").read_text())
+    return sorted(
+        node.args[1].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "_config_field"
+    )
+
+
+def test_the_refusals_read_exactly_these_config_fields():
+    """The control: the collector below is not pinning an empty list."""
+    assert _fields_the_refusals_read() == ["disagg_is_decode", "enforce_eager"]
+
+
+@pytest.mark.parametrize("name", _fields_the_refusals_read())
+def test_each_config_field_a_refusal_reads_is_one_atom_declares(name):
+    """Every stub in this file supplies these fields itself, so none of them
+    would notice ATOM renaming one. This reads ATOM's config class instead."""
+    from atom.config import Config
+
+    assert name in {f.name for f in dataclasses.fields(Config)}
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        NonAllocatingRunner.get_num_blocks,
+        NonAllocatingRunner._estimate_cudagraph_overhead,
+    ],
+)
+def test_a_config_without_the_field_a_refusal_reads_is_itself_refused(
+    spec, qwen, method
+):
+    """A running engine on a renamed field refuses naming it, rather than
+    reading the field as unset and sizing a pool the refusal was for."""
+    runner = SimpleNamespace(config=SimpleNamespace())
+    install_device_readings(runner, readings_at(spec, qwen, 1))
+    with pytest.raises(RunnerRefusal, match="ATOM's config has no field"):
+        method(runner)
 
 
 def test_installing_something_that_is_not_the_readings_is_refused(spec, qwen):

@@ -203,6 +203,23 @@ def _installed_readings(runner: Any) -> DeviceReadings:
     return readings
 
 
+def _config_field(runner: Any, name: str) -> Any:
+    """The config field a refusal decides on, or a refusal naming it.
+
+    No default is taken. With one, a field ATOM renamed or removed would read
+    as that default, and the refusal keyed on it would stop firing with nothing
+    to show for it; without one, the rename is itself refused by name.
+    """
+    try:
+        return getattr(runner.config, name)
+    except AttributeError:
+        raise RunnerRefusal(
+            f"ATOM's config has no field {name!r}, and this runner reads it "
+            "to decide whether to refuse; answering as if it were unset would "
+            "let that refusal stop firing without saying so."
+        ) from None
+
+
 class UnbuiltModel(torch.nn.Module):
     """Stands in for the module tree a non-allocating runner never builds.
 
@@ -308,7 +325,7 @@ class NonAllocatingRunner:
         """
         reading = _installed_readings(self).cudagraph_overhead
         built_eager = any(term.source == EAGER_SOURCE for term in reading.terms)
-        configured_eager = bool(getattr(self.config, "enforce_eager", False))
+        configured_eager = bool(_config_field(self, "enforce_eager"))
         if built_eager != configured_eager:
             raise RunnerRefusal(
                 "the installed graph-pool reading was built for a deployment "
@@ -363,7 +380,7 @@ class NonAllocatingRunner:
         dedicated one, and a shared-card reservation would hold bytes back for a
         second tenant that those readings do not have.
         """
-        if getattr(self.config, "disagg_is_decode", False):
+        if _config_field(self, "disagg_is_decode"):
             raise RunnerRefusal(
                 "this runner does not model the decode process of intra-GPU "
                 "prefill/decode disaggregation: that process owns no device "
