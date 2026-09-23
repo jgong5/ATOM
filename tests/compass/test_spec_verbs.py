@@ -624,10 +624,11 @@ def test_a_saved_transfer_refusal_names_the_fragments_its_provenance_lists():
     once = Fragment.from_mapping(merge([transfer]).document, "t0.yaml")
     twice = Fragment.from_mapping(merge([once]).document, "t1.yaml")
     again = validate(merge([twice] + fragments()[:2] + [fragment("links", LINKS)]))
-    assert [refusal.remedy for refusal in again.refusals] == [
+    (refused,) = again.refusals
+    assert refused.remedy == (
         "merge the fragments it was built from ('tier2', 't0.yaml') in its place, "
         "since a transfer states its source's stack pin there and nowhere else"
-    ]
+    )
 
 
 def test_a_transfer_from_a_spec_pinned_to_this_stack_validates():
