@@ -14,7 +14,7 @@ thing it was measured against has moved.
   too -- so a width-2 read cannot answer from a width-1 neighbour.
 * **Provenance names every executed source root** (`provenance`). ATOM's by the
   tree `git archive` would ship, aiter's by `git describe --tags --always
-  --dirty`, the call `gate_gpu.sh:153-159` already makes. **Only the recording
+  --dirty`, the call the GPU gate makes on aiter's checkout. **Only the recording
   half**: the version is recorded, and what a bump *means* is the owner's
   ruling, which is not taken.
 * **A handed-off entry is immutable** (`store`). **The physical form is a
