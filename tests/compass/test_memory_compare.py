@@ -643,24 +643,32 @@ def test_two_shapes_and_no_side_naming_a_shaped_term_refuses_outright():
 @pytest.mark.parametrize(
     "at_shape", [AT_SHAPE, frozenset()], ids=["per-term", "outright"]
 )
-def test_a_decode_side_refuses_a_prefill_side_at_the_same_token_count(at_shape):
+@pytest.mark.parametrize(
+    "mine, theirs",
+    [("prefill", "decode"), ("decode", "Decode")],
+    ids=["prefill-decode", "two-spellings"],
+)
+def test_a_decode_side_refuses_a_prefill_side_at_the_same_token_count(
+    at_shape, mine, theirs
+):
     # The token counts agree, so only the phase separates the two sides. Both
     # places that read shape agreement are driven: the per-term refusal when a
     # shaped term is named, and the outright one when neither side names one.
+    # Phases compare exactly, so two spellings of one phase refuse as well.
     predicted = Predicted(
-        label="a prefill prediction",
-        shape=HISTORICAL_SHAPE,
+        label="a prediction",
+        shape=Shape(tokens=HISTORICAL_SHAPE.tokens, phase=mine),
         terms=HISTORICAL_PREDICTED.terms,
         at_shape=at_shape,
     )
     decode = Recorded(
         run="a decode step at the prediction's token count",
-        shape=Shape(tokens=HISTORICAL_SHAPE.tokens, phase="decode"),
+        shape=Shape(tokens=HISTORICAL_SHAPE.tokens, phase=theirs),
         high_water_reset=True,
         terms=HISTORICAL_RECORDED.terms,
         at_shape=at_shape,
     )
-    both = "predicted at 4096 tokens, prefill, recorded at 4096 tokens, decode"
+    both = f"predicted at 4096 tokens, {mine}, recorded at 4096 tokens, {theirs}"
     if not at_shape:
         with pytest.raises(MemoryRefusal) as refusal:
             compare(predicted, decode)
