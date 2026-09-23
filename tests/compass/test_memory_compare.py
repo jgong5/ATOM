@@ -7,9 +7,10 @@ The per-term rule comes from an incident. A summed non-KV memory check read
 **-0.084 GB** of a resident term nobody had noticed existed. **The largest
 single error was 25% of its own term.**
 
-`HISTORICAL` below is that breakdown, and the named result of this task is the
-two instruments run on it side by side -- the per-term comparator naming three
-failures, and the summed check reading +13.8% and passing.
+`HISTORICAL` below is that breakdown, and
+`test_two_instruments_on_one_breakdown` runs the two instruments on it side by
+side -- the per-term comparator naming three failures, and the summed check
+reading +13.8% and passing.
 
 **How the fixture's totals were reconstructed, since the incident was reported
 as deltas and ratios rather than totals.** Three deltas are given (+0.280, -0.015,
@@ -154,11 +155,11 @@ HISTORICAL_PREDICTED = Predicted(
 )
 
 
-def test_the_named_result_two_instruments_on_one_breakdown(capsys):
+def test_two_instruments_on_one_breakdown(capsys):
     """Three named term errors, beside a sum that reads +13.8% and passes.
 
     The per-term table and the summed check are printed here rather than only
-    asserted, because the argument this task makes is that the two disagree on
+    asserted, because the argument this file makes is that the two disagree on
     one breakdown and the disagreement is the finding.
     """
     comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
@@ -369,8 +370,8 @@ def test_a_model_config_class_supplies_the_field_and_its_default_is_untied():
     default is untied -- the direction that leaves the meta build over by an
     embedding. So on a config class the correction cannot tell a checkpoint
     that said untied from a class that defaulted to it, and it returns zero for
-    both. That is a limit of this cut, asserted here so it is a known limit
-    rather than a claim nobody checked.
+    both. That is a limit of the correction, asserted here so it is a known
+    limit rather than a claim nobody checked.
     """
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
@@ -1034,7 +1035,7 @@ def test_the_footprint_is_peak_torch_and_non_torch_and_nothing_else(spec, qwen):
 #: Built from parts so that this pattern does not match its own source, which
 #: lets the guard below read the file it is written in if it is ever widened.
 #: `P\d+\.\d+` is in the banned list by name; the two-to-four letter form with
-#: a dash is every task label, not just the one this cut happened to leave.
+#: a dash is every task label, not only the one this package once carried.
 #: A milestone label is `M1` in prose and `_m1` as an identifier suffix; a bare
 #: letter-and-digit is not matched, because it would take `TP1`, `w1` and
 #: every dtype width in this package with it. No group captures, so a failure
@@ -1072,10 +1073,10 @@ def test_no_module_in_the_package_carries_a_design_reference(module):
 def test_the_guard_catches_the_forms_that_were_actually_removed():
     """A guard nobody drove is a guard nobody knows the reach of.
 
-    Each string below was in this package before this cut swept it, and each
-    is a form the rule names. Driving them is how the guard is shown to hold
-    in the direction that matters -- it would be worth nothing if it only ever
-    saw text that was already clean.
+    Each string below was once in this package and has since been removed,
+    and each is a form the rule names. Driving them is how the guard is shown
+    to hold in the direction that matters -- it would be worth nothing if it
+    only ever saw text that was already clean.
     """
     removed = [
         "03 D16 records buffers rather than computing them",
@@ -1093,7 +1094,7 @@ def test_the_guard_catches_the_forms_that_were_actually_removed():
     # worth what it catches rather than what it happened to meet. `P0.4` is
     # named verbatim in the rule's own list; `ART-2` is the exact sibling of
     # the `MEM-2` above, and a pattern that caught one and not the other would
-    # be a pattern fitted to this cut.
+    # be a pattern fitted to the one label it happened to meet.
     never_here = ["the P0.4 gates", "ART-2 swept the other package"]
     for text in removed + never_here:
         assert _TAGS.search(text), text

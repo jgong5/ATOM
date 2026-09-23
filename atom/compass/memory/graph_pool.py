@@ -133,9 +133,9 @@ def reserves(
 
     **Two of ATOM's own adjustments inside those branches are not mirrored
     here, and they pull in opposite directions.** Neither fires with no
-    drafter and one data-parallel rank, and both are named because the cut that
-    wires this into `get_num_blocks` under a block-count gate would otherwise
-    read "nothing else" as fidelity:
+    drafter and one data-parallel rank, and both are named because a caller
+    that feeds this into `get_num_blocks` and checks the block count would
+    otherwise read "nothing else" as fidelity:
 
     - A DSpark confidence-schedule drafter rescales the whole-graph branch by
       the captured bucket count, `activation_bytes * 0.2 * n_buckets`

@@ -25,8 +25,10 @@ neighbour held 152 GB while this rank had reserved 2.9 GB. Taking `non_torch`
 from a spec removes that contamination by construction. And with `free` derived
 as the box that is left, the `min(budget, free)` clamp cannot bind -- the prior
 design needed a `free_was_binding()` guard to refuse records where it had, and
-this one does not. Making it inert is this module's job; proving it against
-ATOM's own arithmetic belongs to the cut that wires these readings in.
+this one does not. Making it inert is this module's job; ATOM's own budget
+arithmetic runs over these readings in `atom.compass.runner.overrides`, and
+`test_the_min_budget_free_clamp_does_not_bind_on_either_side_of_free` in
+`tests/compass/test_kv_budget_engine.py` checks that the clamp does not bind.
 
 The declared scope boundary that follows, stated so it is not discovered as a
 gap: Compass models a **dedicated** device. It will not predict the OOM a shared
