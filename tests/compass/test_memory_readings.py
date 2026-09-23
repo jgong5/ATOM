@@ -3,8 +3,8 @@
 
 Every test here runs with `torch.cuda.mem_get_info` and
 `torch.cuda.memory_stats` replaced by functions that raise. That is the point of
-the fixture and not a precaution: the claim this task makes is that no reading
-comes off a card, and a claim of that shape is worth what it costs to falsify.
+the fixture and not a precaution: the package claims that no reading comes off
+a card, and a claim of that shape is worth what it costs to falsify.
 It is checked twice over and the two checks fail differently -- the patch would
 catch a call made at run time, and `test_the_package_imports_no_device` catches
 one that could be made at all, by reading the import graph of every module in
@@ -14,13 +14,13 @@ branches fall.
 The model is the vendored Qwen3.8-27B config, as `test_backend_kv_geometry.py`
 uses it, so the geometry here and the KV geometry there are the same model. The
 spec is a complete MI355X document written out below rather than imported from
-the spec tests, because the named result is meant to be readable beside its
-inputs.
+the spec tests, because the per-term table below is meant to be readable beside
+its inputs.
 
-Two things are asserted as byte counts rather than as properties, because the
-named result of this task is a per-term table and a table nobody checked is a
-claim. The terms that come off the spec are asserted at their exact values, and
-so is the clean-box identity that produces `free`.
+Two things are asserted as byte counts rather than as properties, because what
+this file pins is a per-term table and a table nobody checked is a claim. The
+terms that come off the spec are asserted at their exact values, and so is the
+clean-box identity that produces `free`.
 """
 
 import ast
@@ -151,7 +151,7 @@ def no_device_readings(monkeypatch):
 
     def refuse(*args, **kwargs):
         raise AssertionError(
-            "a device reading was taken; the whole of this task is that none is"
+            "a device reading was taken; this package promises that none is"
         )
 
     monkeypatch.setattr(torch.cuda, "mem_get_info", refuse)
@@ -238,13 +238,13 @@ def readings_at(spec, qwen, tp_width):
     )
 
 
-# --- the named result --------------------------------------------------------
+# --- the per-term table ------------------------------------------------------
 
-#: Every term of every reading at TP1 and TP2, as bytes. This is the named
-#: result of the task, and it is written down so that a change to any one term
-#: is a change to this table rather than to a total that could absorb it. All
-#: five readings are here: `cudagraph_overhead` was constrained only by a ratio
-#: band in cycle 1, which a 7% move in LIVE_TENSORS_PER_LAYER passed through.
+#: Every term of every reading at TP1 and TP2, as bytes. It is written down so
+#: that a change to any one term is a change to this table rather than to a
+#: total that could absorb it. All five readings are here, `cudagraph_overhead`
+#: included: a ratio band on it lets a 7% move in LIVE_TENSORS_PER_LAYER
+#: through.
 EXPECTED = {
     1: {
         "total": {"capacity": 288_000_000_000},
@@ -326,8 +326,8 @@ def test_the_declared_terms_are_exactly_weights_buffers_and_activations(spec, qw
 
 @pytest.mark.parametrize("tp_width", [1, 2])
 def test_the_min_budget_free_clamp_cannot_bind(spec, qwen, tp_width):
-    # Making it inert is this task's job; proving it against ATOM's own
-    # arithmetic belongs to the cut that wires them in. What is checked here
+    # Making it inert is this package's job; ATOM's own arithmetic runs over
+    # these readings in `atom.compass.runner.overrides`. What is checked here
     # is the only thing checkable without the engine: with `free` a clean box,
     # the budget branch is below it at every utilisation the engine accepts.
     readings = readings_at(spec, qwen, tp_width)
@@ -600,8 +600,8 @@ def _imported_names(tree):
     import model_runner` carries `node.module == 'model_engine'` and
     `node.level == 3`, which matches neither a forbidden root nor a forbidden
     prefix; and `from . import sibling` carries `node.module is None`, which a
-    truthiness guard skips entirely. Both were live escapes until a reviewer
-    walked them.
+    truthiness guard skips entirely. Both are rows in the positive control,
+    `test_the_import_guard_catches_what_it_claims_to`.
     """
     names = set()
     for node in ast.walk(tree):
@@ -642,9 +642,9 @@ def test_the_package_imports_no_device(module):
     ],
 )
 def test_the_import_guard_catches_what_it_claims_to(source, caught):
-    # A guard with no positive control is a guard nobody has seen work. Every
-    # row here was run against a scratch copy of this package by the cycle-1
-    # reviewer; the two relative forms passed before this test existed.
+    # A guard with no positive control is a guard nobody has seen work. The
+    # two `from ...model_engine` rows are the forms a walk that ignores
+    # `node.level` lets through.
     names = _imported_names(ast.parse(source))
     hit = any(
         name.partition(".")[0] in FORBIDDEN_ROOTS or name.startswith(FORBIDDEN_PREFIXES)
