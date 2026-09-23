@@ -109,7 +109,13 @@ and chunked prefill. The prior one-point rule is a weaker version of the same th
 
 **Option A.** `torch.export` is recorded as an unverified alternative in D18.1.
 
-### The three disciplines, all mandatory, all silent when omitted
+### The four disciplines, all mandatory, all silent when omitted
+
+Three of them keep the *tracing* symbolic and are listed here; the fourth is about
+what the **engine around the trace** does to a symbol, needs the FakeTensor material
+below to state, and is therefore a section of its own -- "A fourth discipline: the
+engine's host arithmetic asks a symbol for a number". A reader who stops at the end of
+this numbered list has three of four.
 
 1. **`torch._C._EnablePythonDispatcher()` is not optional.** Without it, `torch.matmul` on
    ndim>2 is a C++ CompositeImplicitAutograd decomposition that calls non-symbolic
@@ -175,6 +181,100 @@ Three FakeTensor traps, each of which silently produces a wrong artifact:
 2. **Weights need `from_tensor(w, static_shapes=True)`** or they are symbolized too.
 3. The torch 2.10 signature is
    `symbolic_context=StatelessSymbolicContext(dynamic_sizes=[...])`, not `dynamic_dims=`.
+
+### A fourth discipline: the engine's host arithmetic asks a symbol for a number
+
+The three disciplines above keep the *tracing* symbolic. They are not enough on a real
+engine, and the reason is one line of torch: **`SymInt.__index__` and `SymInt.__int__`
+are `guard_int`.** Every host-side use of a step's width — filling a staging buffer's
+numpy view, slicing a Python list, checking a staged array's length — asks for a number,
+gets the symbol's trace-time hint, and *records the ask as `Eq(s, hint)`*. The graph is
+constant from there, with no error and no warning.
+
+Measured on ATOM's decode path for the published 27B: **16 ATOM lines** convert the step's
+width to a number during one traced forward — 20 conversions in all — and they are host
+fills and slices, nothing else:
+
+| where | lines | conversions |
+|---|---|---|
+| `aiter_attention.py in prepare_decode` | 1106, 1115, 1121, 1122, 1123, 1131, 1132 | 10 |
+| `model_runner.py in prepare_inputs` | 2441, 2452, 2454 | 4 |
+| `model_runner.py in prepare_input_ids` | 510, 513 | 2 |
+| `model_runner.py in prepare_sample` | 2537 | 1 |
+| `backends.py in _mrope_cpu_view` | 398, 400 | 2 |
+| `gdn_attn.py in _attach_gdn_decode_metadata` | 1237 | 1 |
+
+A seventeenth sits in `forward_context`'s own `assert_shape_contract`, whose `_rows`
+helper takes `int(t.shape[0])`, and an eighteenth solves the width by *comparison* rather
+than conversion: `ScheduledBatch.__init__` checks the staged token array's length against
+the count. **Repairing them one at a time does not converge** — the two sites this
+property was originally recorded at were repaired and `_rows` appeared behind them.
+
+**The conversion is not the defect; the recording is.** A host fill genuinely needs a
+number, and the number it needs is the hint, which is the count the engine computed. So a
+symbolic capture keeps the conversion and replaces the guard with its own log — every
+conversion, with the line it happened on — and asserts that log, as a multiset of
+`(line, conversions)`, against a declared set. That last clause is the whole of the
+discipline's value and it is the part that is easy to leave out: a log nothing compares
+records a conversion at a seventeenth line and says nothing, so the instrument reads as
+evidence while behaving as decoration. The capture referenced below declares the set as
+`EXPECTED_HOST_RESOLUTIONS` and asserts it at both group widths and both step widths.
+**`__bool__` stays untouched**, so a branch on a width still installs its guard and a step
+whose shape decides which path the engine takes still records that it did.
+
+Two consequences worth stating, because both were expected the other way round:
+
+- **`copy_to_gpu` needs no change, and neither does `CpuGpuBuffer`.** The specialisation
+  recorded there was a *buffer capacity* — `max_model_len // block_size` — being solved
+  against the CPU side's constant, and it only existed because that capture symbolised
+  every dimension of the staged device tensor. Capacities are engine configuration and are
+  not a function of the step. With only the step's width symbolic, the two slices carry
+  the same symbol and the copy dispatches with it on both sides.
+- **One production line changes**, `_rows`'s `int(t.shape[0])` → `t.shape[0]`.
+  `torch.Size.__getitem__` already returns a Python `int` for a tensor with a real size,
+  so it is the identity in a served step; it matters only where the size is symbolic, and
+  there converting one side of an equality to a number forces the other to become it.
+
+**What the symbol has to be attached to is the batch, not the buffers.** Handing each
+staged buffer a bound of its own re-derives widths the engine did not run at. The width
+is set on the `ScheduledBatch` and the engine derives the rest — `ForwardMode.decide`
+settles both units off it, `prepare_inputs` writes the `cu_seqlens_q` boundary at
+`running_bs + 1`, `prepare_decode` uses it as every staged bound. A decode step is one
+query row per sequence, so its token count and its sequence count are **one** symbol; two
+would have to be equated later, which is the specialisation again by a longer route.
+
+**It does not survive the batch's own constructor, and that is the eighteenth site.**
+`ScheduledBatch.__init__` compares the staged token array's length against the count it
+was handed, which solves the width by comparison rather than by conversion — the
+`__bool__` boundary this discipline deliberately leaves alive. So the capture builds the
+batch at the concrete width and rebinds the four count fields afterwards. The symbol
+enters the engine's *staging*; it does not enter the engine's batch constructor, and a
+reader who takes "the symbol enters at the `ScheduledBatch`" literally will look for it
+in the wrong place.
+
+**The evidence that the symbol is free, rather than a hint in disguise.** The engine
+computes its host values from the hint, so a graph built this way would still be a graph
+about one width if any dimension had taken the hint instead of the symbol — and nothing in
+a census would say so. The step is therefore traced at **two** widths, at **each** group
+width the result is claimed at, and the inventories compared operator for operator and
+shape for shape with the symbol's name set aside. They are identical, which also says that
+every dimension that stayed a number is the same number at both widths and so is not a
+width in disguise. The digest that carries this covers operator names and tensor shapes
+only — not scalar arguments, dtypes or strides — so a value-level difference is found by
+comparing the distinct-operator sets instead, which is how the one difference between the
+concrete and symbolic passes (`lift_fresh` becoming `scalar_tensor`) was found.
+
+**One artifact is width-dependent, and the comparison should say so rather than omit it.**
+The guard set is not the same at two hints: at every hint but 2 a lower bound
+`<axis> + 1 > <hint>` appears as well, measured at hints 3, 8 and 16 at TP1
+and at hint 8 at TP2, and seen independently at 5, 7 and 64. At a hint of 2 it is
+elided, because a size symbol's default range is
+`[2, ∞)` and the inequality is vacuous. It is a `__bool__` comparison on a live symbol, so
+it is the positive evidence that the boundary is intact — but it means the applicability
+statement carries a *lower* bound at any hint but 2, and a two-width table that lists
+five rows as identical has to name the sixth that is not.
+
+Pinned by `tests/compass/test_capture_real_model.py`.
 
 ### The gating cost turned out to be small
 
@@ -1017,7 +1117,7 @@ Deferred to future work by decision on 2026-09-18.
 | # | Decision | Date |
 |---|---|---|
 | D17 | Two tiers behind one `CostBackend`; tier (a) discovers the structure set tier (b) traces | 2026-09-18 |
-| D18 | Capture with `TorchDispatchMode` + `FakeTensorMode(ShapeEnv)` + `_EnablePythonDispatcher()`, on FakeTensor rather than bare meta | 2026-09-18 |
+| D18 | Capture with `TorchDispatchMode` + `FakeTensorMode(ShapeEnv)` + `_EnablePythonDispatcher()`, on FakeTensor rather than bare meta; **four** disciplines, not three — the fourth is that the engine's host arithmetic asks a symbol for a number, so the capture keeps the conversion, logs it with the line it happened on, and asserts that log against a declared set | 2026-09-18, fourth discipline 2026-09-22 |
 | D18.1 | `torch.export` recorded as an unverified alternative; rejected now on decomposition fidelity and on capturing a model call rather than an engine step | 2026-09-18 |
 | D19 | Hierarchical, symbolic, stream-annotated IR: `Seq` / `Repeat` / `Par`. No branches in the IR — applicability is a discrete key plus an evaluated guard domain | 2026-09-18 |
 | D20 | Opaque leaves are priced, not decomposed. Each carries a declared parameter extractor. FlyDSL and MORI need no IR node. | 2026-09-18 |
