@@ -34,6 +34,8 @@ class Rule(enum.Enum):
     """The rules a spec is read against, as a refusal names them."""
 
     SEPARATION = "the spec describes the machine, not the deployment"
+    ONE_MACHINE = "one spec describes one host"
+    RANK_AGREEMENT = "ranks of one group measure one machine"
     NO_DEFAULTS = "a runtime constant has no default"
     DERATE = "a spec-peak number carries a derate"
     PINNED_STACK = "the constants are pinned to a software stack"

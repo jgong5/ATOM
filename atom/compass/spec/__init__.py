@@ -21,12 +21,25 @@ tokenizer is refused rather than guessed.
 
 Nothing here imports a tensor library, a device runtime or the engine, so a spec
 can be authored, read and checked anywhere Python runs. The document is a plain
-mapping: turning a file into one, combining two of them, and reporting on one
-belong to the tools built over this.
+mapping, and turning a file into one belongs to the tools built over this, which
+can declare the parser they need.
+
+Three verbs work over that mapping. `merge` combines the fragments separate
+probes produce and refuses the ones that were not taken on the same host, which
+is the hazard the schema cannot see: two tokenizers measured on two machines
+contradict nothing in their shape. `validate` reports everything a document is
+missing or inconsistent about, rather than completing it. `explain` takes a
+predicted quantity back to the spec fields under it, which is what makes echoing
+the whole spec into every artifact worth anything. `across_ranks` reduces the
+one reading that is taken per rank, keeping the smallest and reporting how far
+the ranks disagreed.
 """
 
+from .explain import QUANTITIES, Basis, Contribution, explain
 from .fields import DECLARED, SCHEMA, SCHEMA_VERSION, Field, Kind
 from .machine import MachineSpec
+from .merge import Fragment, Merge, merge
+from .ranks import SPREAD_LIMIT, RankSpread, across_ranks
 from .rules import (
     DEPLOYMENT_OWNED,
     FingerprintMismatch,
@@ -35,21 +48,34 @@ from .rules import (
     StackMismatch,
 )
 from .tokenizers import Backend, TokenizerEntry, TokenizerKey, TokenizerTable
+from .validate import Validation, validate
 
 __all__ = [
     "DECLARED",
     "DEPLOYMENT_OWNED",
+    "QUANTITIES",
     "SCHEMA",
     "SCHEMA_VERSION",
+    "SPREAD_LIMIT",
     "Backend",
+    "Basis",
+    "Contribution",
     "Field",
     "FingerprintMismatch",
+    "Fragment",
     "Kind",
     "MachineSpec",
+    "Merge",
+    "RankSpread",
     "Rule",
     "SpecRefusal",
     "StackMismatch",
     "TokenizerEntry",
     "TokenizerKey",
     "TokenizerTable",
+    "Validation",
+    "across_ranks",
+    "explain",
+    "merge",
+    "validate",
 ]
