@@ -244,9 +244,9 @@ Recorded as **T47**.
 - Simulation wall-clock cost is higher than Option A's. The >=5x target is stated as
   negotiable with a bottom line of "faster than real runs". Under saturation the prior
   design was 0.30x. This must be measured early, not assumed.
-- `torch.cuda.set_device` (`model_runner.py:958`) and `torch.cuda.mem_get_info`
-  (`model_runner.py:1659`) are the two hard GPU dependencies a simulated runner must not
-  inherit.
+- `torch.cuda.set_device` (`model_runner.py:972`, in `_setup_device_and_distributed`) and
+  `torch.cuda.mem_get_info` (`model_runner.py:1676`, in `_read_device_memory`) are the two
+  hard GPU dependencies a simulated runner must not inherit.
 
 ---
 
@@ -1077,7 +1077,7 @@ The ABC is small and has **no `send_kv` / `recv_kv` verb** to fake
 Every connector's completion reaches the scheduler through **one** method:
 
 ```
-ModelRunner.async_proc_aggregation      model_runner.py:3351-3372
+ModelRunner.async_proc_aggregation      model_runner.py:3378-3399
   -> EngineCore._poll_kv_transfer_progress   engine_core.py:485-489
      -> Scheduler._update_from_kv_xfer_finished   scheduler.py:2989-3053
 ```
@@ -1416,7 +1416,7 @@ re-derive.
 - `Config.runner_qualname` — `atom/config.py:1595`; consumed `engine_core.py:129`,
   `async_proc.py:166-169`
 - `ModelRunner.forward(batch: ScheduledBatch) -> ScheduledBatchOutput` —
-  `model_runner.py:3233-3320`
+  `model_runner.py:3262-3350`
 - the RPC boundary — `engine_core.py:386-388`
 - `ScheduledBatch` fields — `scheduler.py:579-820`; notably `detailed_sqsq` /
   `detailed_sqsk` / `detailed_sk` at `:790-792`, which are sum(N_Q^2), sum(N_Q * N_KV),
@@ -1428,10 +1428,10 @@ re-derive.
 - `--load_dummy {empty,zero,xavier}` — `config.py:1556`, `arg_utils.py:260`,
   `loader.py:179-227,309-310`, `loading_core.py:266-291`
 - meta-device model construction — `RapidServeModelRunner._init_weight_params_on_meta`,
-  `model_runner.py:4188-4211`
+  `model_runner.py:4216-4239`
 - a working non-allocating runner template — `RapidServeModelRunner` overrides at
-  `model_runner.py:4218,4232,4239,4245,4261,4269`
-- `ModelRunner.dummy_execution()` — `model_runner.py:1177-1217`, shows how to hand-build
+  `model_runner.py:4245,4259,4266,4272,4288,4296`
+- `ModelRunner.dummy_execution()` — `model_runner.py:1191-1231`, shows how to hand-build
   a `ScheduledBatch`
 - `ScheduledBatch.is_dummy_run` — `scheduler.py:589,781`
 - simulated TP (`--fake-eplb`) — `atom/distributed/simulated_tp.py`; explicit precedent
@@ -1442,7 +1442,8 @@ re-derive.
   `tools/parse_trace.py`
 
 **Memory sizing (needed because it decides which configurations exist)**
-- `ModelRunner.get_num_blocks()` — `model_runner.py:1652-1873`. Five device readings plus
+- `ModelRunner.get_num_blocks()` — `model_runner.py:1686-1899`, with its four `torch.cuda`
+  reads in `_read_device_memory` (`model_runner.py:1666-1684`). Five device readings plus
   arithmetic: `mem_get_info`, `allocated_bytes.all.peak`,
   `(total - free) - memory_reserved()`, `_estimate_cudagraph_overhead()`, a 2% safety
   margin, then `min(budget - ..., free)` and `plan_pools`. Consumed
