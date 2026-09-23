@@ -242,7 +242,9 @@ def test_the_refusal_says_the_fragments_are_authored_for_different_machines():
             [fragment("a", TIER0, machine="node-18"), fragment("b", machine="node-22")]
         )
     message = str(refused.value)
-    assert "are authored for different machines" in message
+    assert refused.value.what.endswith(
+        "are authored for different machines, 'node-18' and 'node-22'"
+    )
     assert "measured on" not in message
 
 
@@ -326,6 +328,15 @@ def test_one_width_measured_twice_differently_is_refused():
         merged(tier2=disagrees)
     assert refused.value.rule is Rule.ONE_MACHINE
     assert "driver_and_collective_reserve_bytes[1]" in str(refused.value)
+
+
+def test_two_fragments_pinned_to_different_stacks_are_refused_as_a_stack_conflict():
+    moved = copy.deepcopy(TIER1)
+    moved["device"]["software_pinned_to"]["rocm"] = "7.3.0"
+    with pytest.raises(SpecRefusal) as refused:
+        merge([fragment("tier1", TIER1), fragment("tier1b", moved)])
+    assert refused.value.rule is Rule.PINNED_STACK
+    assert "fragments pinned to different stacks" in refused.value.remedy
 
 
 def test_the_merged_document_reads_as_a_spec_and_echoes_back():
@@ -414,7 +425,9 @@ def test_one_id_over_two_files_is_refused_with_both_fingerprints():
     with pytest.raises(SpecRefusal) as refused:
         merge([fragment("first", TIER0), fragment("second", revised)])
     assert refused.value.rule is Rule.TOKENIZER_IDENTITY
-    assert "a" * 64 in str(refused.value) and "b" * 64 in str(refused.value)
+    what = refused.value.what
+    assert what.startswith(f"'qwen3-151k-bpe' is 'sha256:{'a' * 64}' in 'first' (")
+    assert f") and 'sha256:{'b' * 64}' in 'second' (" in what
 
 
 def test_one_tokenizer_measured_on_both_backends_is_not_a_conflict():
@@ -552,8 +565,10 @@ def test_a_transfer_keeps_the_source_stack_out_of_this_machines_pin():
     checked = validate(combination)
     assert not checked.ok
     assert checked.refusals[0].rule is Rule.PINNED_STACK
-    assert "mi300x-8gpu" in checked.refusals[0].what
-    assert "7.0.2" in checked.refusals[0].what
+    assert checked.refusals[0].what.endswith(
+        "carried constants over from 'mi300x-8gpu', measured against rocm "
+        "'7.0.2', into a spec pinned to rocm '7.2.4'"
+    )
 
 
 def test_a_transfer_that_names_no_stack_at_all_is_refused():
@@ -572,15 +587,18 @@ def test_a_transfer_that_names_no_stack_at_all_is_refused():
 def test_a_saved_transfer_merged_again_names_the_merge_that_dropped_its_pin():
     # The transfer is pinned to this stack; the merge that wrote the saved
     # document kept that pin out, so no author omitted it. The first-hand
-    # transfer with no pin is the control, and its text does not change.
+    # transfer with no pin is the control, and its text does not change. Saved
+    # twice, the provenance lists the pinned transfer and the first saved
+    # document, which is itself a transfer with no pin; the remedy names both.
     carried = copy.deepcopy(TIER2)
     carried["device"]["software_pinned_to"] = dict(STACK)
     transfer = fragment("tier2", carried, method="transferred-from:mi300x-8gpu")
     saved = Fragment.from_mapping(merge([transfer]).document, "t.yaml")
-    again = validate(merge([saved] + fragments()[:2] + [fragment("links", LINKS)]))
-    assert [refusal.rule for refusal in again.refusals] == [Rule.PINNED_STACK]
-    assert "fragments an earlier merge built it from" in again.refusals[0].what
-    assert "merge the fragments it was built from" in again.refusals[0].remedy
+    rest = fragments()[:2] + [fragment("links", LINKS)]
+    (refused,) = validate(merge([saved] + rest)).refusals
+    assert refused.rule is Rule.PINNED_STACK
+    assert "over from 'mi300x-8gpu', and its provenance names the" in refused.what
+    assert "fragments an earlier merge built it from" in refused.what
     bare = fragment("tier2", TIER2, method="transferred-from:mi300x-8gpu")
     first_hand = validate(merge(fragments()[:2] + [bare, fragment("links", LINKS)]))
     assert first_hand.refusals[0].what == (
@@ -588,6 +606,26 @@ def test_a_saved_transfer_merged_again_names_the_merge_that_dropped_its_pin():
         "by a person on 2026-09-18) carried constants over from 'mi300x-8gpu' "
         "without saying which stack they were measured against"
     )
+    twice = Fragment.from_mapping(merge([saved]).document, "t2.yaml")
+    (refused,) = validate(merge([twice] + rest)).refusals
+    assert refused.remedy == (
+        "merge the fragments it was built from ('tier2', 't.yaml') in its place, "
+        "since a transfer states its source's stack pin there and nowhere else; "
+        "any of them that is itself a saved document with no pin is refused the "
+        "same way"
+    )
+
+
+def test_a_transfer_whose_provenance_lists_no_fragments_is_refused_first_hand():
+    # `merge` never writes an empty list, so one names no earlier merge; whoever
+    # wrote this transfer left its pin out, as in the first-hand case.
+    method = "transferred-from:mi300x-8gpu"
+    rest = fragments()[:2] + [fragment("links", LINKS)]
+    empty = fragment("tier2", TIER2, method=method, fragments=[])
+    bare = fragment("tier2", TIER2, method=method)
+    (refused,) = validate(merge(rest + [empty])).refusals
+    (control,) = validate(merge(rest + [bare])).refusals
+    assert str(refused) == str(control)
 
 
 def test_a_transfer_from_a_spec_pinned_to_this_stack_validates():
@@ -1125,7 +1163,9 @@ def test_a_term_the_schema_does_not_know_is_asked_for_again_by_path():
     with pytest.raises(SpecRefusal) as refused:
         explain(resolved(), "device.clock_ceiling")
     assert refused.value.rule is Rule.ADDRESSING
-    assert "is not a field, a block of fields or a quantity" in refused.value.what
+    assert refused.value.what.startswith(
+        "`device.clock_ceiling` is not a field, a block of fields or a quantity"
+    )
     assert "ask again by the whole dotted path" in refused.value.remedy
     assert "kv_blocks" in refused.value.remedy
     assert "declared by this schema" not in str(refused.value)

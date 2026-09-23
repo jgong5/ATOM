@@ -361,7 +361,8 @@ def _transfers(resolved: Mapping[str, Any], merged: Merge):
             for component in PINNED
             if f"{PINNED_BLOCK}.{component}" in fragment.values
         }
-        if not declared and "provenance.fragments" in fragment.values:
+        listed = fragment.values.get("provenance.fragments")
+        if not declared and listed:
             yield SpecRefusal(
                 Rule.PINNED_STACK,
                 f"{fragment.stanza()} carried constants over from "
@@ -369,8 +370,11 @@ def _transfers(resolved: Mapping[str, Any], merged: Merge):
                 "fragments an earlier merge built it from; a merge keeps a "
                 "transfer's source stack pin out of the document it writes, so "
                 "this one cannot say which stack they were measured against",
-                "merge the fragments it was built from in its place, since a "
-                "transfer states its source's stack pin there and nowhere else",
+                "merge the fragments it was built from "
+                f"({', '.join(map(repr, listed))}) in its place, since a "
+                "transfer states its source's stack pin there and nowhere else; "
+                "any of them that is itself a saved document with no pin is "
+                "refused the same way",
             )
             continue
         if not declared:
