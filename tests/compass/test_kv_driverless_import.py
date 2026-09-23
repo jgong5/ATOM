@@ -125,14 +125,48 @@ def test_the_child_sees_a_package_reached_through_another(tmp_path):
     assert _third_party(seen["added"]) == {"probe_outer", "probe_inner"}
 
 
+def _kv_modules():
+    # rglob, so a module added under the package is covered the day it lands.
+    return sorted(PACKAGE.rglob("*.py"))
+
+
+def _module_name(path):
+    """The dotted name *path* is imported under, subpackages included."""
+    return ".".join(path.relative_to(REPO).with_suffix("").parts).removesuffix(
+        ".__init__"
+    )
+
+
+def test_the_package_was_found():
+    assert _kv_modules(), f"no modules under {PACKAGE}"
+
+
+def test_the_guard_finds_nothing_when_the_root_moves(monkeypatch, tmp_path):
+    """The control for the guard above, which otherwise only proves it is alive.
+
+    Pointed at a root that does not resolve, the listing must come back empty.
+    The sibling module one level out catches a derivation that widened past its
+    own root and so kept the parametrisation non-empty.
+    """
+    (tmp_path / "sibling.py").write_text("")
+    monkeypatch.setitem(globals(), "PACKAGE", tmp_path / "moved")
+    assert not _kv_modules()
+
+
+def test_a_module_in_a_subpackage_keeps_its_subpackage():
+    sub = PACKAGE / "sub"
+    assert _module_name(sub / "x.py") == "atom.compass.kv.sub.x"
+    assert _module_name(sub / "__init__.py") == "atom.compass.kv.sub"
+    assert _module_name(PACKAGE / "__init__.py") == "atom.compass.kv"
+
+
 @pytest.mark.parametrize(
     "path",
-    sorted(PACKAGE.rglob("*.py")),
-    ids=lambda p: p.name,
+    _kv_modules(),
+    ids=lambda p: str(p.relative_to(PACKAGE)),
 )
 def test_importing_it_loads_no_device_runtime(path):
-    module = f"atom.compass.kv.{path.stem}".removesuffix(".__init__")
-    seen = _import_in_a_fresh_interpreter(module)
+    seen = _import_in_a_fresh_interpreter(_module_name(path))
     assert Path(seen["file"]).is_relative_to(REPO)
     assert BOUNDARY <= set(seen["added"])
     assert _third_party(seen["added"]) == ALLOWED
@@ -144,6 +178,7 @@ def test_a_price_is_computed_without_one():
         "atom.compass.kv",
         then="module.TransferModel(1e-6, 1e9, 1000).release_at(1.0, 3)",
     )
+    assert Path(seen["file"]).is_relative_to(REPO)
     assert seen["result"] == pytest.approx(1.0 + 1e-6 + 3e-6)
     assert BOUNDARY <= set(seen["added"])
     assert _third_party(seen["added"]) == ALLOWED
