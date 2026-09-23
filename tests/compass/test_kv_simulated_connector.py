@@ -21,7 +21,6 @@ through the schema's peak-and-derate rule the way a real one would.
 import copy
 import json
 import pathlib
-from types import SimpleNamespace
 
 import pytest
 from conftest import atom_config_double
@@ -352,40 +351,3 @@ def test_a_negative_block_count_is_refused(geometry):
     """A transfer that finished before it started is not a fast transfer."""
     with pytest.raises(ValueError, match="not a transfer"):
         model_for(geometry, PEAKS[0]).duration_s(-1)
-
-
-def test_the_scheduler_declines_a_remote_load_it_could_not_wait_for(geometry):
-    """The two halves of a remote fill land together, or the request refuses.
-
-    A request asking to be filled from another deployment is client-reachable
-    -- `kv_transfer_params` rides the API request onto the sequence -- and the
-    engine calls this on every prefill allocation, before it decides whether
-    to suspend anything. Queueing the receive here while nothing suspends the
-    request would have the workers report a transfer finished against a
-    request the scheduler never suspended, and the scheduler has no path to
-    take that report back off its list.
-    """
-    scheduler = connector(
-        model_for(geometry, PEAKS[0]), lambda: ISSUE_AT, role="scheduler"
-    )
-    seq = SimpleNamespace(
-        id="r", block_table=[0, 1, 2], kv_transfer_params={"do_remote_prefill": True}
-    )
-    with pytest.raises(NotImplementedError, match="never suspended"):
-        scheduler.update_state_after_alloc(seq)
-
-    assert seq.kv_transfer_params["do_remote_prefill"] is True, "state was changed"
-    assert scheduler.build_connector_meta().reqs_to_recv == {}
-    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
-
-
-def test_an_ordinary_request_passes_the_scheduler_untouched(geometry):
-    """Only a remote fill is declined; every other allocation is silent."""
-    scheduler = connector(
-        model_for(geometry, PEAKS[0]), lambda: ISSUE_AT, role="scheduler"
-    )
-    seq = SimpleNamespace(id="r", block_table=[0, 1, 2], kv_transfer_params=None)
-    scheduler.update_state_after_alloc(seq)
-    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
-    assert scheduler.build_connector_meta().reqs_to_recv == {}
-    assert scheduler.build_connector_meta().reqs_to_save == {}

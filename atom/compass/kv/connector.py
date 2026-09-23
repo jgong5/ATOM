@@ -40,25 +40,29 @@ by its deadline against the clock and by nothing else, so two transfers issued
 in either order at one instant release together, and the sets carry no
 sequence for anything downstream to read.
 
-**Filling a request from another deployment is declined, not half-done.** That
-path is two halves that only work together -- the request is suspended to wait
-for a remote load, and the receive is queued for the workers to carry -- and
-neither the suspension nor the transfer parameters the router relays between
-deployments is written yet. A queued receive whose request was never suspended
-is reported finished to a scheduler that has nothing waiting on it, so the
-scheduler side declines the queue by name instead.
+**Filling a request from another deployment is two halves, and they land
+together.** The scheduler side claims the whole prompt as already held
+elsewhere, which is what suspends the request, and offers the receive that
+the workers then carry and report. The offer becomes an announcement only for
+a request the engine did suspend, so a report always has a suspension to
+resolve and never names a request nothing was waiting on. A producer that
+finishes a request hands back the parameters the router relays to the
+deployment that will decode it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
+from atom.compass.kv.handoff import transfer_params
 from atom.compass.kv.transfer import TransferModel
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata, ReqId, ReqMeta
+from atom.model_engine.sequence import SequenceStatus
 
 #: Where the harness binds the clock this connector reads.
 CLOCK_KEY = "compass_clock"
@@ -180,50 +184,145 @@ class SimulatedKVConnector(KVConnectorBase):
 
 
 class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
-    """Scheduler side: it holds no clock, and it takes on no remote load.
+    """Scheduler side: it suspends a remote fill, announces it, and hands off.
 
-    Timing belongs to the workers, which are where a transfer is announced and
-    where it is reported finished.
+    It holds no clock. Timing belongs to the workers, which are where a
+    transfer is announced and where it is reported finished; what is decided
+    here is only which requests have one and what the other deployment is
+    told.
 
-    What this half would otherwise own is the pair that fills a request from
-    another deployment: claiming the prompt as already held elsewhere, which
-    suspends the request, and queueing the receive that the workers then
-    carry. Doing the second without the first is worse than doing neither.
-    The scheduler suspends nothing, so it holds nothing waiting; the workers
-    would still mature the transfer and report it finished, and the report
-    would name a request the scheduler has no path to resume. So the queue
-    declines by name while the suspension is missing.
+    **The prompt is claimed once per request, and the request keeps its own
+    intent.** The engine asks on every admission attempt, and a second claim
+    on a request it has already suspended would suspend it again. Both real
+    backends stop that by clearing the request's `do_remote_prefill` as they
+    queue; the pull backend additionally sets a mark on the request and reads
+    it back. This connector takes the mark and not the clearing, because the
+    flag is what the request said about itself and the clearing happens at a
+    point where nothing in that step has read it yet. The cost of declining it
+    is named rather than claimed away: under the composite backend this call
+    fans out to every sub-connector, so a second consumer beside this one
+    would still see the flag and queue its own receive. That is a
+    configuration this design does not contemplate -- a simulated deployment
+    has no second consumer to pair with -- but it is the thing the clearing
+    buys, and it is given up here.
+
+    **The cost of the mark, which is the pull backend's.** A request matched
+    on a step where it cannot be admitted -- the pool is full, or the batch is
+    -- has spent its claim, and is prefilled locally on a later step rather
+    than suspended. That is reproduced rather than improved on, because the
+    engine's reads of the suspended state were written against it.
+
+    **A transfer is announced only for a request the engine actually
+    suspended.** What `update_state_after_alloc` takes is an offer, not an
+    announcement; the announcement is made in `build_connector_meta`, which
+    the engine calls once its whole admission pass is over. By then every
+    suspension decision in that step is final and can be read off the
+    request's own status, and an offer whose request was not suspended is
+    dropped.
+
+    That is deliberately not the same moment as clearing the flag, and cannot
+    collapse into it. Clearing acts **on the request**, before the suspension
+    has been decided, and destroys what the request said about itself on the
+    way past. This acts **on this connector's own queue**, after the
+    suspension has happened, and leaves the request exactly as it arrived.
+
+    The case it exists for is the one the mark above creates: a request whose
+    claim was spent on an earlier step reaches the allocation with its flag
+    still set and is not suspended. Both real backends queue a receive for it
+    anyway -- the guard on both is the flag alone -- and the workers then
+    report a transfer finished against a request the scheduler never
+    suspended, whose id lands on a list with no reachable pop, after which the
+    engine rebuilds its waiting queue on every step for the rest of the run.
+    Nothing is announced for it here. The divergence has a cost and it is one
+    term wide: a deployment that really did issue that read spends the
+    bandwidth, and this does not charge for it, so a run containing such a
+    request under-reports by that request's block table -- once, because the
+    offer is dropped rather than carried.
+
+    **How much of the block table moves is not decided here, and the reason
+    is the blob.** A consumer that already holds a prefix could take only the
+    blocks past it, but the two deployments' block tables only correspond if
+    they were launched with the same block size, and the field set this
+    connector emits -- the pull backend's -- carries no block size for the
+    consumer to compare against. The push backend, whose blob does carry one,
+    transfers the whole table whenever that comparison cannot be made. So does
+    this connector, and so does the pull backend in every case: the count of
+    already-held blocks is named nowhere in its package. The consequence is
+    worth stating in the direction it errs -- a consumer whose prefix cache
+    holds part of the prompt is still charged for the whole of it, so a
+    simulated run of that request reads slower than a deployment that could
+    skip -- but no deployment on this field set can skip, so there is nothing
+    here to compute that would not be an invention.
     """
 
     def __init__(self, config) -> None:
-        self.is_producer = _is_producer(_kv_config(config))
+        kv_config = _kv_config(config)
+        self.is_producer = _is_producer(kv_config)
+        self._tp_size = config.tensor_parallel_size
+        self._dp_rank = config.parallel_config.data_parallel_rank
+        self._offered: dict[ReqId, tuple[Any, list[int]]] = {}
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
-        """No remote match is claimed here, so no request is suspended."""
+        """Claim a remote-filled prompt whole, once, so the engine suspends it.
+
+        The whole prompt is the claim because the producer computed all of it:
+        there is no partial remote fill. The second element is what the engine
+        reads to suspend the request, and it is the point of the method.
+        """
+        params = seq.kv_transfer_params or {}
+        if params.get("do_remote_prefill") and not hasattr(seq, "kv_async_tagged"):
+            seq.kv_async_tagged = True
+            return len(seq.prompt_token_ids), True
         return 0, False
 
     def update_state_after_alloc(self, seq) -> None:
-        """Take on a remote load only if one could be waited for -- it cannot."""
+        """Offer the receive that a suspension would wait for.
+
+        The engine calls this immediately after it allocates the request's
+        blocks and immediately before it decides whether to suspend it, so the
+        block table read here is the one a transfer would fill -- and whether
+        there is going to be a transfer at all is not known yet. Nothing is
+        announced from here, and the request is not touched.
+        """
         params = seq.kv_transfer_params or {}
         if not params.get("do_remote_prefill"):
             return
-        raise NotImplementedError(
-            f"request {seq.id!r} asks to be filled from another deployment. "
-            "This connector declines rather than starting one: it does not "
-            "suspend a request to wait for a remote load, so a receive queued "
-            "here would be reported finished against a request the scheduler "
-            "never suspended, and the report has no path out of it. The two "
-            "halves land together or not at all"
-        )
+        if self.is_producer:
+            raise ValueError(
+                f"request {seq.id!r} asks to be filled from another deployment "
+                "while this connector was built as the producer side. Only the "
+                "decoding side takes a remote fill on; a producer queueing one "
+                "would wait for a transfer it is itself supposed to serve"
+            )
+        self._offered[seq.id] = (seq, list(seq.block_table))
 
     def build_connector_meta(self) -> ConnectorMetadata:
-        """Nothing is queued, because no remote load was taken on."""
-        return ConnectorMetadata()
+        """Announce the offers the engine suspended, and drop the rest.
+
+        Called once the admission pass is over, so the status read here is
+        the engine's settled answer. Cleared on the way out either way,
+        because the workers own each announced transfer from here -- a queue
+        that survived its own announcement is how one request gets two.
+        """
+        meta = ConnectorMetadata()
+        for req_id, (seq, block_ids) in self._offered.items():
+            if seq.status is not SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            meta.add_new_req_to_recv(
+                request_id=req_id,
+                local_block_ids=block_ids,
+                kv_transfer_params=seq.kv_transfer_params or {},
+            )
+        self._offered.clear()
+        return meta
 
     def request_finished(self, seq) -> None:
-        """Nothing is attached to a finished request yet.
+        """Attach the parameters the router relays to the next deployment.
 
-        The producer's answer here is the parameter blob the HTTP router
-        relays to the other deployment, which is not written yet; a partial
-        one would be relayed and believed, so none is written.
+        Attached on both sides, as both real backends do: the router reads it
+        from the prefilling leg only, and a decode response carrying one costs
+        nothing and keeps this to one path.
         """
+        seq.kv_transfer_params_output = transfer_params(
+            seq, tp_size=self._tp_size, dp_rank=self._dp_rank
+        )
