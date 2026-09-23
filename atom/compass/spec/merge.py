@@ -2,7 +2,7 @@
 """Fragments combined into one spec, and the check that is the point of it.
 
 A probe measures part of a machine and emits a **fragment**: a partial document
-plus the stanza that says which machine it was taken on, by whom, when and how.
+plus the stanza that says which machine it is for, by whom, when and how.
 Combining fragments is arithmetic over dotted paths and would need very little
 said about it. The conflict check is why this module exists.
 
@@ -99,7 +99,7 @@ STATED = (
 
 @dataclass(frozen=True, slots=True)
 class Fragment:
-    """What one probe measured, and the stanza saying where it was measured."""
+    """What one probe measured, and the stanza saying which machine it is for."""
 
     source: str
     values: Mapping[str, Any]
@@ -126,15 +126,15 @@ class Fragment:
                 raise SpecRefusal(
                     Rule.ONE_MACHINE,
                     f"fragment {source!r} does not state `{path}`",
-                    "a fragment names the machine it was measured on and how, "
-                    "because nothing in the numbers themselves says which host "
-                    "produced them",
+                    "a fragment names the machine it is authored for and how "
+                    "its numbers were obtained, because nothing in the numbers "
+                    "themselves says which host produced them",
                 )
         return cls(source, values)
 
     @property
     def machine(self) -> str:
-        """The machine this fragment claims to have been measured on."""
+        """The machine this fragment is authored for, which is the `name` it states."""
         return self.values["name"]
 
     @property
@@ -150,7 +150,7 @@ class Fragment:
         return None
 
     def stanza(self) -> str:
-        """Who measured what, where and when, as a refusal names it."""
+        """Who measured what, for which machine and when, as a refusal names it."""
         return (
             f"{self.source!r} (machine {self.machine!r}, {self.method}, "
             f"by {self.values['provenance.authored_by']} "
@@ -180,7 +180,7 @@ def _one_machine(fragments: tuple[Fragment, ...]) -> None:
         first, second = list(claimed.values())[:2]
         raise SpecRefusal(
             Rule.ONE_MACHINE,
-            f"{first.stanza()} and {second.stanza()} were measured on "
+            f"{first.stanza()} and {second.stanza()} are authored for "
             f"different machines, {first.machine!r} and {second.machine!r}",
             "one spec describes one host; numbers from two hosts in one "
             "document describe neither, and nothing in their shape would ever "

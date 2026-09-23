@@ -106,10 +106,16 @@ class Validation:
         return self.spec
 
     def __str__(self) -> str:
-        """The verdict, every reason for it, and every question left unasked."""
+        """The verdict, every reason for it, every stack difference it found,
+        and every question left unasked."""
         return "\n".join(
             [f"{'ok' if self.ok else 'refused'}: {len(self.refusals)} refusal(s)"]
             + [f"  {refusal}" for refusal in self.refusals]
+            + [
+                f"  stack moved: the constants were measured against "
+                f"{component} {pinned!r} (now {seen!r})"
+                for component, pinned, seen in self.stack_differences
+            ]
             + [f"  not asked: {condition}" for condition in self.not_asked]
         )
 

@@ -25,7 +25,7 @@ mapping, and turning a file into one belongs to the tools built over this, which
 can declare the parser they need.
 
 Three verbs work over that mapping. `merge` combines the fragments separate
-probes produce and refuses the ones that were not taken on the same host, which
+probes produce and refuses the ones that name different machines, which
 is the hazard the schema cannot see: two tokenizers measured on two machines
 contradict nothing in their shape. `validate` reports everything a document is
 missing or inconsistent about, rather than completing it. `explain` takes a
