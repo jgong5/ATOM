@@ -54,15 +54,8 @@ set -uo pipefail
 # while the success verdict went to stdout -- so `gate_gpu.sh 2>/dev/null | grep
 # GATE_GPU_RC` was silent on failure and indistinguishable from "never ran".
 #
-# The verdict line also carries its reason, because it is the only line every
-# pipe keeps. `gate_gpu.sh | tail -6` hands the caller tail's exit status, not
-# this script's, and no script can change that. Every reason below goes to
-# stderr, and the after-run pre-flight readout is printed to stdout just before
-# the verdict, so `2>/dev/null | tail -6` used to keep that readout and a bare
-# number. Stated on the verdict line, the reason survives any pipe that keeps
-# the verdict at all. Refusing to run when stdout is a pipe is not an option:
-# under `docker exec` stdout is a FIFO too, as it is under any harness that
-# captures output.
+# The verdict line carries its reason, for the reasons given above finish() in
+# gate_cpu.sh: it is the only line every pipe keeps.
 finish() {
     if [ "$1" -eq 0 ]; then
         printf 'GATE_GPU_RC=0 PASSED\n'
@@ -243,9 +236,11 @@ esac
 # many more there were, travel on the verdict line. The checks run with the
 # node-id comparisons ahead of the counts they explain, so a new failure is
 # named there by its node-id rather than as a changed count.
+# A finding passed without a one-line form is named by its own first line, so
+# a call that omits it still ends on a verdict rather than on `set -u`.
 VERDICT=0
 WHY=
-fail() { printf '%s\n' "$1" >&2; VERDICT=$((VERDICT + 1)); [ -n "$WHY" ] || WHY=$2; }
+fail() { printf '%s\n' "$1" >&2; VERDICT=$((VERDICT + 1)); [ -n "$WHY" ] || WHY=${2:-${1%%$'\n'*}}; }
 
 # Errors are not failures and were never parsed: a run reading "4800 passed, 5
 # failed, 12 errors" produced GATE_GPU_RC=0 without one word about the twelve.
@@ -274,12 +269,10 @@ ERR_N=$(grep -c . "$ERR_IDS")
     fail "$(printf 'the summary says %s failed but %s FAILED line(s) were printed.
   The by-name comparison has no set to compare, so it is not evidence either
   way. (pytest -r is store-last-wins: a caller flag, a truncated log or a
-  plugin can all empty it.)' "$FAILED" "$OBS_N")" \
-    "the summary says $FAILED failed but $OBS_N FAILED line(s) were printed"
+  plugin can all empty it.)' "$FAILED" "$OBS_N")"
 [ "$ERR_N" -eq "$ERRORS" ] ||
     fail "$(printf 'the summary says %s error(s) but %s ERROR line(s) were printed.' \
-        "$ERRORS" "$ERR_N")" \
-    "the summary says $ERRORS error(s) but $ERR_N ERROR line(s) were printed"
+        "$ERRORS" "$ERR_N")"
 
 NEW_IDS=$(comm -23 "$OBS_IDS" "$KNOWN_IDS")
 GONE_IDS=$(comm -13 "$OBS_IDS" "$KNOWN_IDS")
@@ -307,8 +300,7 @@ fi
 rm -f "$OBS_IDS" "$ERR_IDS" "$KNOWN_IDS"
 
 [ "$FAILED" -eq "$BASE_FAILED" ] ||
-    fail "$(printf '%s failed, baseline %s.' "$FAILED" "$BASE_FAILED")" \
-    "$FAILED failed, baseline $BASE_FAILED"
+    fail "$(printf '%s failed, baseline %s.' "$FAILED" "$BASE_FAILED")"
 
 # EQUALITY, not a floor. A floor is loosened by exactly the new tests every task
 # adds, so a task that adds 30 tests and silently skips a 20-test file still

@@ -29,6 +29,7 @@ BASE = dict(re.findall(r"^(BASE_\w+)=(\S+)$", (REPO / GATE).read_text(), re.MULT
 KNOWN = [
     f"tests/test_suite.py::test_known[{i}]" for i in range(int(BASE["BASE_FAILED"]))
 ]
+EXPECT = int(BASE["BASE_PASSED"]) - int(BASE["BASE_COMPASS_TESTS"])
 
 pytestmark = pytest.mark.skipif(BASH is None, reason="needs bash")
 
@@ -52,17 +53,19 @@ CASES = {
     "passed": (
         0,
         "",
-        {
-            "tests/test_suite.py": _suite(
-                int(BASE["BASE_PASSED"]) - int(BASE["BASE_COMPASS_TESTS"])
-            )
-        },
+        {"tests/test_suite.py": _suite(EXPECT)},
         "",
     ),
     "new-failure": (
         1,
         "first tests/test_suite.py::test_new; 2 more",
         {"tests/test_suite.py": _suite(1, "\n\ndef test_new():\n    assert False\n")},
+        "",
+    ),
+    "pass-count": (
+        1,
+        f"-- {EXPECT + 1} passed, expected {EXPECT}",
+        {"tests/test_suite.py": _suite(EXPECT + 1)},
         "",
     ),
     "no-summary": (1, "no usable pytest summary", {"tests/test_suite.py": ""}, ""),
@@ -117,6 +120,8 @@ def _tree(root, case):
         "scripts/compass/preflight.sh": _preflight(0),
         "scripts/compass/gpu_gate_known_failures.txt": "\n".join(KNOWN) + "\n",
         "atom/__init__.py": "",
+        # The probes only read torch's version; a real import costs 1.6 s a run.
+        "torch/__init__.py": "__version__ = 1\nclass version:\n    hip = 1\n",
         "tests/test_suite.py": _suite(1),
         **CASES[case][2],
     }
@@ -161,6 +166,8 @@ def test_the_verdict_key_is_printed_exactly_once_and_last(tmp_path, case):
     assert [line for line in lines if "GATE_GPU_RC=" in line] == lines[-1:], lines
     head, why = _expected(case)
     assert lines[-1].startswith(head) and why in lines[-1], lines[-1]
+    # A reason cut at its first line can end on a colon that promises the rest.
+    assert not lines[-1].endswith(":"), lines[-1]
     if CASES[case][0] == 0:
         assert lines[-1] == head, lines[-1]
 
