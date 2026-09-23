@@ -734,5 +734,9 @@ def test_the_package_imports_only_the_standard_library_it_names(module):
 
 
 def test_everything_the_package_exports_is_reachable_by_name():
+    # An empty list would let the loop pass having checked nothing, with no
+    # count moving. The package exists to re-export its modules' names and this
+    # file imports them from it, so exporting none is never a legitimate state.
+    assert ir.__all__, "atom.compass.ir declares no exports"
     for name in ir.__all__:
         assert getattr(ir, name, None) is not None, name
