@@ -565,6 +565,7 @@ def test_a_transfer_keeps_the_source_stack_out_of_this_machines_pin():
     checked = validate(combination)
     assert not checked.ok
     assert checked.refusals[0].rule is Rule.PINNED_STACK
+    assert checked.refusals[0].what.startswith("'tier2' (machine ")
     assert checked.refusals[0].what.endswith(
         "carried constants over from 'mi300x-8gpu', measured against rocm "
         "'7.0.2', into a spec pinned to rocm '7.2.4'"
@@ -597,6 +598,7 @@ def test_a_saved_transfer_merged_again_names_the_merge_that_dropped_its_pin():
     rest = fragments()[:2] + [fragment("links", LINKS)]
     (refused,) = validate(merge([saved] + rest)).refusals
     assert refused.rule is Rule.PINNED_STACK
+    assert refused.what.startswith("'t.yaml' (machine ")
     assert "over from 'mi300x-8gpu', and its provenance names the" in refused.what
     assert "fragments an earlier merge built it from" in refused.what
     bare = fragment("tier2", TIER2, method="transferred-from:mi300x-8gpu")
@@ -1987,6 +1989,10 @@ def test_the_probe_question_reads_only_the_tables_a_probe_can_fall_short_on():
     }
 
 
+#: The one width table a probe falls short on, the retained bytes at width 1.
+THE_HOLE = "device.runtime_constants.allocator_retained_after_load_bytes"
+
+
 def reimported_validate(name):
     """`validate` imported again, the way a session imports it the first time.
 
@@ -2002,6 +2008,7 @@ def reimported_validate(name):
     )
     module = importlib.util.module_from_spec(loaded)
     loaded.loader.exec_module(module)
+    assert importlib.import_module("atom.compass.spec.validate") is not module
     return module
 
 
@@ -2019,8 +2026,9 @@ def test_a_width_table_no_probe_is_named_for_is_refused_and_not_an_import_error(
     monkeypatch.setattr(schema_module, "SCHEMA", schema_module.SCHEMA + (added,))
     under_test = reimported_validate("validate_with_a_table_no_probe_is_named_for")
     assert added.path in under_test.WIDTH_TABLES
-    # A table with no entry has no hole to report, so it is not a probe table.
-    assert added.path not in under_test.PROBE_TABLES
+    # A table with no entry has no hole to report, so it is not a probe table,
+    # and the table that has one still is.
+    assert under_test.PROBE_TABLES == (THE_HOLE,)
     # The term is named where a caller asks about it, by the refusal this
     # package exists to give.
     with pytest.raises(SpecRefusal) as refused:
@@ -2045,7 +2053,8 @@ def test_a_probe_given_the_width_that_has_none_empties_the_probe_tables(monkeypa
         (probes_module.SINGLE_CARD, probes_module.MULTI_RANK),
     )
     under_test = reimported_validate("validate_with_every_width_filled")
-    assert under_test.PROBE_TABLES == ()
+    # Emptied by the probe, and not empty before it.
+    assert (PROBE_TABLES, under_test.PROBE_TABLES) == ((THE_HOLE,), ())
     checked = under_test.validate(merged().document, tp_widths=(16,))
     assert not checked.ok
     assert not any(
