@@ -245,7 +245,7 @@ def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
         ), f"{module} names ATOM's budget reserve override point"
         assert "gpu_memory_utilization" not in {
             s for n, s in named if n not in keys
-        }, f"{module} names ATOM's gpu_memory_utilization outside a dict key"
+        }, f"{module} names ATOM's gpu_memory_utilization outside a string dict key"
         literals = {
             round(n.value, 12)
             for n in ast.walk(tree)
