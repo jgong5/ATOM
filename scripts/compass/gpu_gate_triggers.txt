@@ -20,7 +20,7 @@
 # tests/test_mla_index_cache.py:99-100 imports ModelRunner indented inside a
 # test function rather than at module level. Crediting either would delete a
 # real trigger -- topK.py and atom/model_engine/model_runner.py respectively.
-# The COLLECTS-A-TEST half removes no path from this tree: 30 triggers with it,
+# The COLLECTS-A-TEST half removed no path at 236abfd9a: 30 triggers with it,
 # 30 without, difference empty. It is kept as a forward guard. The full
 # derivation, with that 2x2, is in the script's header comment.
 #

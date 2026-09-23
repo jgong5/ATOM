@@ -38,7 +38,7 @@
 # from the baseline's -- including an AITER version that reads UNKNOWN, which the
 # toolchain comparison below explicitly calls a mismatch -- warns on stderr and
 # can still end
-# GATE_GPU_RC=0. All five known failures are AITER-kernel numerics, so on an
+# GATE_GPU_RC=0. All the known failures are AITER-kernel numerics, so on an
 # AITER bump the delta compares two different things and exits 0 anyway. Making
 # it a refusal is a behaviour change with its own cost -- a `git describe` that
 # cannot read aiter's checkout would then block every run on a node where the
@@ -86,7 +86,7 @@ BASE_TORCH=2.10.0+rocm7.2.4.git3d3aa833
 # runtime version, not the ROCm release. ROCm release was 7.2.4.
 BASE_ROCM=7.2.53211
 # AITER has no __version__; this is `git describe --tags --always` in the source
-# checkout aiter imports from. All five known failures are AITER-kernel numerics
+# checkout aiter imports from. All the known failures are AITER-kernel numerics
 # comparisons, so AITER is the likeliest single cause of a change that moves
 # them -- a bump used to pass the drift check in silence because only torch and
 # HIP were compared.

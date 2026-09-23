@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# Per-task test gate: the 130 of 189 test files that run without a GPU driver,
-# ~30 s. Green is the bar: this subset really is green.
+# Per-task test gate: the test files that run without a GPU driver, ~30 s.
+# Green is the bar: this subset really is green.
 #
 # Excluded, and why neither is a judgement call:
-#   tests/plugin/          30 files, needs sglang + vllm -- in neither image
-#   cpu_gate_exclude.txt   29 files that reach the driver: 28 at *collection*
-#                          time via rocminfo, plus 1 that collects and then
-#                          fails on a driver call. That file names which is
-#                          which, and only the first group is generated.
+#   tests/plugin/          needs sglang + vllm -- in neither image
+#   cpu_gate_exclude.txt   files that reach the driver, most at *collection*
+#                          time via rocminfo, the rest on a driver call after
+#                          collecting. That file names which is which and
+#                          which is generated; README.md's row counts both.
 #
 # What this tier cannot see is not left to memory. gpu_gate_triggers.txt lists
 # the source paths whose only coverage is in the excluded set; a diff touching

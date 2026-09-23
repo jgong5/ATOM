@@ -15,10 +15,10 @@
 # to be inferred from this sentence.
 #
 #   1. Imports are read at ANY indentation, not just column 0. The previous
-#      version anchored on `^`, and 190 `import atom.*` lines in non-plugin test
-#      files are indented -- function-local and guarded imports are the dominant
-#      idiom here. It was reading roughly a third of the import lines it claimed
-#      to read.
+#      version anchored on `^`, and at fada7424e 190 `import atom.*` lines in
+#      non-plugin test files were indented -- function-local and guarded imports
+#      were the dominant idiom. It was reading roughly a third of the import lines
+#      it claimed to read.
 #
 #   2. A test whose file is not collected covers nothing, so coverage is
 #      credited only from a CPU-tier file that `pytest --collect-only` shows
@@ -261,7 +261,7 @@ TMP=$OUT.tmp
 # tests/test_mla_index_cache.py:99-100 imports ModelRunner indented inside a
 # test function rather than at module level. Crediting either would delete a
 # real trigger -- topK.py and atom/model_engine/model_runner.py respectively.
-# The COLLECTS-A-TEST half removes no path from this tree: 30 triggers with it,
+# The COLLECTS-A-TEST half removed no path at 236abfd9a: 30 triggers with it,
 # 30 without, difference empty. It is kept as a forward guard. The full
 # derivation, with that 2x2, is in the script's header comment.
 #

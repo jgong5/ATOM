@@ -21,6 +21,7 @@ what it does with pytest's exit status and summary line, not what pytest finds.
 """
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -30,6 +31,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 LIB = REPO / "scripts" / "compass" / "_lib.sh"
 GATE_GPU = REPO / "scripts" / "compass" / "gate_gpu.sh"
+README = REPO / "scripts" / "compass" / "README.md"
 
 BASH = shutil.which("bash")
 
@@ -145,9 +147,48 @@ def test_gate_gpu_derives_the_surplus_through_the_helper():
     assert "--collect-only" not in text
 
 
+def _base():
+    return dict(re.findall(r"^(BASE_\w+)=(\S+)$", GATE_GPU.read_text(), re.MULTILINE))
+
+
 def test_gate_gpu_states_the_expectation_for_a_tree_without_compass_tests():
-    """4779 + 0 - 49 = 4730, the figure a tree without this phase's tests
-    measures. Stated in the gate so the verdict on such a tree is readable
-    without re-deriving it."""
-    text = GATE_GPU.read_text()
-    assert "4730" in text
+    """BASE_PASSED + 0 - BASE_COMPASS_TESTS, the figure a tree without this
+    phase's tests measures. Stated in the gate so the verdict on such a tree is
+    readable without re-deriving it -- and derived here from the gate's own
+    constants, so a rebaseline that leaves the stated figure behind reddens."""
+    base = _base()
+    passed, compass = int(base["BASE_PASSED"]), int(base["BASE_COMPASS_TESTS"])
+    stated = f"{passed} + 0 - {compass} = {passed - compass}"
+    assert stated in GATE_GPU.read_text(), (
+        f"{GATE_GPU.name} no longer states `{stated}`, which its BASE_PASSED and "
+        "BASE_COMPASS_TESTS make it. Update the comment above the surplus."
+    )
+
+
+@pytest.mark.parametrize(
+    "stated, constant",
+    [
+        (r"\*\*(\d+) passed / \d+ failed\*\*", "BASE_PASSED"),
+        (r"\*\*\d+ passed / (\d+) failed\*\*", "BASE_FAILED"),
+        (r"failed\*\* at `([0-9a-f]+)`", "BASE_COMMIT"),
+    ],
+    ids=["passed", "failed", "commit"],
+)
+def test_the_readme_states_the_baseline_the_gate_holds(stated, constant):
+    # README.md restates the baseline gate_gpu.sh judges against. A rebaseline
+    # edits the gate's constants and nothing else, so without this join the README
+    # keeps describing the previous baseline in silence. Same shape as the
+    # README's cpu_gate_exclude.txt counts in test_cpu_gate_exclude.py.
+    row = [
+        ln
+        for ln in README.read_text().splitlines()
+        if ln.startswith(f"| `{GATE_GPU.name}` |")
+    ]
+    assert len(row) == 1, f"{README.name} has {len(row)} rows for {GATE_GPU.name}"
+    found = re.search(stated, row[0])
+    assert found, f"{README.name}'s {GATE_GPU.name} row no longer states /{stated}/"
+    value = _base()[constant]
+    assert found[1] == value, (
+        f"{README.name} states {found[0]} but {GATE_GPU.name} has {constant}={value}. "
+        "Update the README row to match the gate."
+    )

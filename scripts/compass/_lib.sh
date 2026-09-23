@@ -28,7 +28,7 @@ compass_enclosing_tree() {
 # compass-d78f3bbd3.tar stamped `commit: d78f3bbd3...`, exit 0, no warning. The
 # stamp was truthful about the tree it archived and silent about the tree the
 # caller was standing in -- a wrong answer carrying the full confidence of a
-# right one. All five callers of this function have the same exposure; for the
+# right one. Every caller of this function has the same exposure; for the
 # gates the consequence is worse than for snapshot.sh, since the result of a
 # pytest run would be attributed to a commit it did not come from.
 #
