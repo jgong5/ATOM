@@ -102,7 +102,8 @@
   when the ruling lives on another issue, label each PR it holds and name that
   issue. The label stops all agent action on that issue or PR (no commit, review,
   amend or merge, even after a passed review), with one exception: `gh stack
-  link` by PR number, which lands and pushes nothing. Only the owner removes it.
+  link` by PR number, which lands and pushes nothing, though it retargets the
+  linked PRs' bases (then and when a PR below lands). Only the owner removes it.
   **Without it, automation is on by default**: agents act with no opt-in.
 - **The review loop has its own stop.** If the same finding survives two cycles,
   or the loop passes three cycles, it halts, goes to the owner and applies
@@ -175,8 +176,8 @@
   - Link a chain whole or not at all, and only when you mean it (`unstack` can
     refuse): `gh stack link --base feature/atomcompass_new <bottom-pr#> ... <top-pr#>`,
     re-run whenever a PR joins, held members included (linking lands nothing).
-    `merge` retargets only linked members. A fork (two open PRs on one base) links
-    at most one arm; the other arms stay unlinked. Drift check: every open PR based
+    `merge` retargets only linked members. A fork (two or more open PRs based on
+    one open PR's branch) links at most one arm. Drift check: every open PR based
     on another open PR's branch sits in one stack, fork arms excepted
     (`gh api "repos/<o>/<r>/stacks?pull_request=<n>"`).
   - Land with `gh stack merge <pr-number> --squash --yes`: it squashes up to that
