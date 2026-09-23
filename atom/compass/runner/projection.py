@@ -13,15 +13,15 @@ the engine at all.
 Two things the type cannot check, both of which belong to whoever builds the
 projection rather than to whoever prices it.
 
-**The row count.** A one-row `BatchView` is a legal batch, and a one-row batch
-is `tokens x history` exactly -- the collapsed form that summing per request
-exists to keep out. `RequestShape(512, 2048)` sums to 1048576 where the two
-256-token rows it collapses sum to 524288, and nothing in the type ties its row
-count to the number of requests a scheduler scheduled. So the rows here are one
-per entry of `ScheduledBatch.num_scheduled_tokens`, and a `seqs` mapping whose
-keys are not the batch's own `req_ids`, in the batch's own order, is refused.
-That refusal is the load-bearing line in this file rather than housekeeping:
-`zip` is how both structures are read everywhere else in the tree, including by
+**The row count.** `BatchView` states, and measures, that a one-row batch is
+`tokens x history` exactly -- the collapsed form that summing per request
+exists to keep out -- and that nothing in the type ties its row count to the
+number of requests a scheduler scheduled. It names this module as what closes
+that. So the rows here are one per entry of
+`ScheduledBatch.num_scheduled_tokens`, and a `seqs` mapping whose keys are not
+the batch's own `req_ids`, in the batch's own order, is refused. That refusal
+is the load-bearing line in this file rather than housekeeping: `zip` is how
+both structures are read everywhere else in the tree, including by
 `Scheduler.compute_detailed_aggregates`, and `zip` over a mapping one request
 short drops the last row in silence -- which is a shorter batch that prices
 without complaining, and at two requests is exactly the collapse.
@@ -35,7 +35,11 @@ takes a width from a caller. `ForwardMode.decide` is the rule ATOM dispatches a
 real step by, and its answer is taken whole: `running_bs` where it says a graph
 replays, `None` where it says one does not. A prefill step, an eager runner and
 a batch wider than the widest captured size therefore all come back `None` from
-that one call rather than from three conditions restated here.
+that one call rather than from three conditions restated here. `decide` finds
+the width by binary search and so has a precondition -- an ascending ladder --
+which is checked here rather than assumed, because an unsorted ladder answers a
+width that is not the smallest captured one holding the batch, and too wide is
+the direction the type cannot refuse.
 
 **Why each row's history is read twice.** `ScheduledBatch.context_lens` is the
 `N_KV` ATOM computed when it built the batch -- a prefill chunk's cached tokens
@@ -43,13 +47,16 @@ plus the chunk, a decode's whole sequence -- and is what this builds rows from.
 The sequence is read for its type and for a second derivation of that same
 `N_KV`, from `Sequence.num_tokens` and `Sequence.num_cached_tokens`, which is
 the one `Scheduler.compute_detailed_aggregates` takes. They must agree. A
-disagreement means the sequences handed in are no longer the ones the batch was
-built from -- they have advanced, or they are a later step's -- and the two
-readings then differ by a whole chunk of history. `advance_on_schedule` makes
-that a configuration rather than a hypothesis: it is on whenever
-`pipeline_parallel_size > 1` (`scheduler.py:994`), and it advances each
-sequence's offsets after the batch has snapshotted them (`:1730`). The
-projection refuses there instead of picking one of the two readings.
+disagreement has two causes and this module cannot tell them apart by looking
+at the numbers, so the refusal names both. Either the sequences handed in are
+not the ones the batch was built from -- a stale or a later step's mapping --
+or they are exactly those sequences and the scheduler advanced them on
+purpose: `advance_on_schedule` is on whenever `pipeline_parallel_size > 1`
+(`scheduler.py:994`), and `_advance_prefill_on_schedule` (`:1730`) adds each
+chunk to its sequence's offsets after the batch has snapshotted them. Under
+that configuration the two readings differ by a whole chunk of history on
+every prefill row, and the projection refuses there instead of picking one of
+the two readings.
 """
 
 from __future__ import annotations
@@ -71,6 +78,12 @@ def request_rows(batch: Any, seqs: dict[int, Any]) -> tuple[RequestShape, ...]:
     requiring the two to be equal states both halves of the projection's
     guarantee -- the row count, and that row *i* describes the request row *i*
     of every parallel array on the batch describes.
+
+    Both integers are cast out of `np.int32` before a row is built. The sums
+    over these rows multiply two of them together, and the scheduler's own
+    aggregate casts for the same reason and says so: past roughly 46341 tokens
+    a 32-bit product wraps, which is not an error anywhere downstream but a
+    smaller -- or negative -- price.
     """
     if list(seqs.keys()) != list(batch.req_ids):
         raise RunnerRefusal(
@@ -91,10 +104,13 @@ def request_rows(batch: Any, seqs: dict[int, Any]) -> tuple[RequestShape, ...]:
         if settled != context:
             raise RunnerRefusal(
                 f"request {batch.req_ids[index]} reads {context} context tokens "
-                f"off the batch and {settled} off its sequence; the sequences "
-                "handed in are not the ones this batch was built from, and the "
-                "two readings differ by history this step either did or did not "
-                "compute"
+                f"off the batch and {settled} off its sequence; the two readings "
+                "differ by history this step either did or did not compute. "
+                "Either these are not the sequences this batch was built from, "
+                "or they are and `advance_on_schedule` moved them on purpose "
+                "after the batch snapshotted its offsets -- which it does on "
+                "every pipeline-parallel run, and this cannot tell the two "
+                "apart from the numbers"
             )
         rows.append(RequestShape(query, context, decode))
     if len(rows) != batch.total_seqs_num:
@@ -126,12 +142,21 @@ def capture_rung(batch: Any, runner: Any) -> int | None:
             f"`decide` settles it from a collective over all {dp_size} ranks, "
             "and this projection has no group to run one on"
         )
+    ladder = np.asarray(runner.capture_sizes_np, dtype=np.int32)
+    if bool(np.any(ladder[1:] < ladder[:-1])):
+        raise RunnerRefusal(
+            f"the capture ladder {ladder.tolist()} is not ascending, which is "
+            "the precondition of the binary search `decide` resolves the rung "
+            "with; out of order it answers a width that is not the narrowest "
+            "captured one holding this batch, and a rung too wide is the one "
+            "direction the rows cannot contradict"
+        )
     mode = ForwardMode.decide(
         batch=batch,
         dp_size=1,
         dp_group=None,
         enforce_eager=bool(runner.enforce_eager),
-        capture_sizes=np.asarray(runner.capture_sizes_np, dtype=np.int32),
+        capture_sizes=ladder,
         captured_tokens=None,
         is_block_drafter=False,
         tbo_on=False,
@@ -142,8 +167,23 @@ def capture_rung(batch: Any, runner: Any) -> int | None:
 
 
 def _data_parallel_size(runner: Any) -> int:
+    """How many ranks `decide` would settle a rung across, or a refusal.
+
+    Absent is refused rather than read as one. A runner shaped differently
+    from the engine's own would otherwise be priced as a single rank on a
+    default nothing checked, three lines above a refusal written for exactly
+    that subject.
+    """
     parallel = getattr(getattr(runner, "config", None), "parallel_config", None)
-    return int(getattr(parallel, "data_parallel_size", 1) or 1)
+    size = getattr(parallel, "data_parallel_size", None)
+    if size is None:
+        raise RunnerRefusal(
+            "this runner states no `config.parallel_config.data_parallel_size`, "
+            "and a rung is one rank's answer or a group's depending on it; "
+            "reading an absent width as 1 is the guess this would have to make "
+            "to carry on"
+        )
+    return int(size)
 
 
 def project(batch: Any, seqs: dict[int, Any], runner: Any) -> BatchView:

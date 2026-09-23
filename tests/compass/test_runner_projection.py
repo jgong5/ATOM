@@ -10,9 +10,11 @@ both are asserted here.
 The batches are ATOM's own. A real `Scheduler` runs with chunked prefill
 against a real block manager, and the run is driven long enough that its steps
 include two-request prefill chunks, middle chunks with history behind them, and
-decode. Nothing is hand-built except the runner stand-in, which exists only to
-carry a capture ladder and an eager flag, and the three-field sequence snapshot
-described below.
+decode. The same run is driven a second time under `pipeline_parallel_size=2`,
+which is the one configuration in which the scheduler's sequences and its batch
+disagree. Nothing is hand-built except the runner stand-in, which exists only
+to carry a capture ladder and an eager flag, and the three-field sequence
+snapshot described below.
 
 Two things deliberately not re-derived here, because a re-derivation that
 agrees with itself proves nothing: the per-request attention sums are compared
@@ -69,7 +71,8 @@ class Step(NamedTuple):
     batch: object
     seqs: dict  # the three fields, frozen when the batch was built
     live: dict  # the same sequences, still moving
-    rows: tuple
+    rows: tuple  # empty when the projection refused this step
+    refusal: object  # the refusal's message, or None
 
 
 def runner(ladder=LADDER, enforce_eager=False, dp_size=1):
@@ -105,16 +108,10 @@ def _batch_like(req_ids, scheduled, context):
     )
 
 
-def _drive(steps=STEPS, chunk=CHUNK):
-    """Run ATOM's scheduler and keep every step it produced.
-
-    Two prompts of different lengths, a token budget two chunks wide and a
-    per-request chunk cap: both prompts share the first steps, the long one is
-    then issued a chunk at a time on its own, and once it is through, every
-    later step is a decode of both.
-    """
+def _scheduler(chunk=CHUNK, **overrides):
+    """ATOM's own scheduler, chunked prefill against a real block manager."""
     Sequence.counter = count()
-    scheduler = Scheduler(
+    return Scheduler(
         MockConfig(
             kv_cache_block_size=16,
             num_kvcache_blocks=1024,
@@ -123,8 +120,23 @@ def _drive(steps=STEPS, chunk=CHUNK):
             max_num_batched_tokens=2 * chunk,
             long_prefill_token_threshold=chunk,
             max_model_len=4096,
+            **overrides,
         )
     )
+
+
+def _drive(steps=STEPS, chunk=CHUNK, **overrides):
+    """Run ATOM's scheduler and keep every step it produced.
+
+    Two prompts of different lengths, a token budget two chunks wide and a
+    per-request chunk cap: both prompts share the first steps, the long one is
+    then issued a chunk at a time on its own, and once it is through, every
+    later step is a decode of both.
+
+    A refused step is kept rather than raised, because whether the projection
+    refuses is itself the measurement under `pipeline_parallel_size=2`.
+    """
+    scheduler = _scheduler(chunk=chunk, **overrides)
     params = SamplingParams(max_tokens=200)
     for length in (PROMPT_LONG, PROMPT_SHORT):
         scheduler.add(Sequence(list(range(1, length + 1)), 16, sampling_params=params))
@@ -135,7 +147,11 @@ def _drive(steps=STEPS, chunk=CHUNK):
             break
         Scheduler.compute_detailed_aggregates(PUBLISHING, batch, seqs)
         frozen = _frozen(seqs)
-        trace.append(Step(batch, frozen, dict(seqs), request_rows(batch, frozen)))
+        try:
+            rows, refusal = request_rows(batch, frozen), None
+        except RunnerRefusal as refused:
+            rows, refusal = (), str(refused)
+        trace.append(Step(batch, frozen, dict(seqs), rows, refusal))
         scheduler.postprocess(
             list(seqs.values()),
             ScheduledBatchOutput(
@@ -155,6 +171,11 @@ def trace():
     return _drive()
 
 
+@pytest.fixture
+def pipeline_trace():
+    return _drive(pipeline_parallel_size=2)
+
+
 def _multi(trace):
     """The first step the scheduler put two requests in."""
     for step in trace:
@@ -165,7 +186,7 @@ def _multi(trace):
 
 def _decode(trace):
     for step in trace:
-        if all(row.decode for row in step.rows):
+        if step.rows and all(row.decode for row in step.rows):
             return step
     raise AssertionError("the run produced no decode step")
 
@@ -194,6 +215,13 @@ class TestTheRun:
 
     def test_no_step_was_empty(self, trace):
         assert all(step.rows for step in trace)
+
+    def test_no_step_of_this_run_was_refused(self, trace):
+        """The control for every count below that is stated as a refusal: at
+        `pipeline_parallel_size=1` the projection declines nothing, so a
+        refusal counted elsewhere is that configuration's and not the
+        harness's."""
+        assert [step.refusal for step in trace] == [None] * STEPS
 
 
 class TestTheRowCount:
@@ -268,6 +296,13 @@ class TestTheAttentionSums:
     an `N_KV` that survives that guard agrees with the scheduler's by
     construction; a query count on a decode row does not go through the guard,
     and neither does a dropped or duplicated row.
+
+    What it cannot catch is the `decode` flag. None of the three sums reads
+    it -- they are functions of `query_tokens` and `context_tokens` alone --
+    while the flag is what decides which half of the cost form prices a row.
+    That flag is held elsewhere: by the history check, whose two arms
+    `TestBothKindsInOneBatch` drives in a single call, and by `TestTheRung`,
+    where a step with no decode row answers `None`.
     """
 
     def test_the_three_sums_equal_atom_s_own_on_every_step(self, trace):
@@ -322,6 +357,97 @@ class TestTheAttentionSums:
         assert sum_query_square(rows) == 9 * step.batch.detailed_sqsq
 
 
+class TestWidthsAnInt32ProductCannotHold:
+    """The two integers are cast out of `np.int32`, and these rows say so.
+
+    `num_scheduled_tokens` and `context_lens` are `np.int32`, and every shape
+    sum multiplies two of them. `Scheduler.compute_detailed_aggregates` casts
+    to Python `int` for this reason and spends three comment lines on it --
+    "`nq*nq` ... would overflow once a prefill/chunk exceeds ~46341 tokens
+    ... silently corrupting the estimate". A wrapped product raises nothing
+    anywhere downstream; it is a zero, or a negative, price.
+
+    The third assertion is what keeps the first two from being satisfied by a
+    width that never wraps: it states that this row's product is outside the
+    32-bit range in the first place.
+    """
+
+    @pytest.mark.parametrize(
+        "query, context",
+        [(65536, 131072), (46341, 46341)],
+        ids=["a-chunk-whose-square-is-2**32", "the-narrowest-chunk-that-wraps"],
+    )
+    def test_a_row_this_wide_sums_to_the_true_product(self, query, context):
+        batch = _batch_like([5], [query], [context])
+        seqs = {
+            5: SimpleNamespace(
+                type=SequenceType.PREFILL,
+                num_tokens=context,
+                num_cached_tokens=context - query,
+            )
+        }
+        (row,) = request_rows(batch, seqs)
+        assert sum_query_square((row,)) == query * query
+        assert sum_query_context((row,)) == query * context
+        assert min(query * query, query * context) > 2**31 - 1
+
+
+def _mixed_batch():
+    """One prefill chunk with history behind it, and one decoding request."""
+    return _batch_like([11, 12], [CHUNK, 1], [2 * CHUNK, PROMPT_SHORT + 1])
+
+
+def _mixed_seqs():
+    return {
+        11: SimpleNamespace(
+            type=SequenceType.PREFILL,
+            num_tokens=PROMPT_LONG,
+            num_cached_tokens=CHUNK,
+        ),
+        12: SimpleNamespace(
+            type=SequenceType.DECODE,
+            num_tokens=PROMPT_SHORT + 1,
+            num_cached_tokens=0,
+        ),
+    }
+
+
+class TestBothKindsInOneBatch:
+    """The one shape in which both arms of the history check run in one call.
+
+    `schedule()` returns its prefill batch before it can add a decode row
+    (`scheduler.py:1736`), so no batch this scheduler builds holds both kinds
+    and the per-row branch is otherwise only ever exercised across steps. The
+    batch here is the same stand-in the refusal tests use.
+
+    Each sequence's *other* field is set to a number the opposite arm could
+    not produce -- the prefill's `num_tokens` is its whole prompt rather than
+    its chunk's history, and the decoding request's `num_cached_tokens` is 0 --
+    so a row that took the wrong arm disagrees with `context_lens` and refuses
+    instead of quietly agreeing. The second test is that control, stated as a
+    measurement.
+    """
+
+    def test_a_prefill_row_and_a_decode_row_project_side_by_side(self):
+        rows = request_rows(_mixed_batch(), _mixed_seqs())
+        assert [r.decode for r in rows] == [False, True]
+        assert [r.query_tokens for r in rows] == [CHUNK, 1]
+        assert [r.context_tokens for r in rows] == [2 * CHUNK, PROMPT_SHORT + 1]
+        assert rows[0].cached_tokens == CHUNK
+
+    @pytest.mark.parametrize("req_id", [11, 12])
+    def test_a_row_read_under_the_other_kind_s_arm_is_refused(self, req_id):
+        seqs = _mixed_seqs()
+        other = seqs[req_id]
+        other.type = (
+            SequenceType.PREFILL
+            if other.type == SequenceType.DECODE
+            else SequenceType.DECODE
+        )
+        with pytest.raises(RunnerRefusal, match="differ by history"):
+            request_rows(_mixed_batch(), seqs)
+
+
 class TestTheRung:
     """The width comes off the ladder, through the rule ATOM dispatches by."""
 
@@ -370,6 +496,47 @@ class TestTheRung:
         with pytest.raises(RunnerRefusal, match="collective"):
             capture_rung(step.batch, runner(dp_size=2))
 
+    @pytest.mark.parametrize(
+        "ladder, wrong_rung",
+        [([8, 4, 2, 1, 0], 8), ([0, 1, 8, 4, 2], 8)],
+        ids=["descending", "one-pair-out-of-order"],
+    )
+    def test_a_ladder_that_is_not_ascending_is_refused(self, trace, ladder, wrong_rung):
+        """`decide` resolves the rung by binary search, whose precondition is
+        an ascending ladder, and this forwards whatever the runner holds.
+
+        The second assertion is why refusing is the answer rather than a
+        comment: the same widths out of order answer a rung four times the
+        batch's own width, and `BatchView` accepts that -- a rung wider than
+        its rows is the one direction rows cannot contradict, so the padding
+        would be priced on a graph no capture ever recorded."""
+        step = _decode(trace)
+        assert sorted(ladder) == sorted(LADDER)
+        with pytest.raises(RunnerRefusal, match="not ascending"):
+            capture_rung(step.batch, runner(ladder=ladder))
+        unchecked = BatchView(step.rows, capture_rung=wrong_rung)
+        assert unchecked.capture_rung == wrong_rung > len(step.rows)
+
+    @pytest.mark.parametrize(
+        "config",
+        [None, SimpleNamespace(), SimpleNamespace(parallel_config=SimpleNamespace())],
+        ids=["no-config", "no-parallel-config", "no-data-parallel-size"],
+    )
+    def test_a_runner_that_states_no_parallel_size_is_refused(self, trace, config):
+        """The module's only place a default could stand in for an answer.
+
+        Each of the three lookups on the way to `data_parallel_size` is a
+        place a differently shaped runner stops, and reading a stop as 1 rank
+        prices a group's step as one rank's without saying so."""
+        step = _decode(trace)
+        bare = SimpleNamespace(
+            capture_sizes_np=np.asarray(LADDER, dtype=np.int32),
+            enforce_eager=False,
+            config=config,
+        )
+        with pytest.raises(RunnerRefusal, match="states no"):
+            capture_rung(step.batch, bare)
+
 
 class TestTheWholeProjection:
     def test_a_decode_step_projects_its_rows_and_a_captured_width(self, trace):
@@ -397,17 +564,16 @@ class TestSequencesThatHaveMovedOn:
     """The reading off the batch and the reading off the sequence must agree.
 
     They stop agreeing when the sequences handed in are not the ones the batch
-    was built from. That is a configuration rather than a hypothesis: under
-    pipeline parallelism the scheduler advances each sequence's offsets at
-    schedule time, after the batch has snapshotted them, so the sequence then
-    reports a chunk more history than the step computes.
+    was built from -- and, under pipeline parallelism, when they are exactly
+    those sequences. `TestPipelineParallelism` drives the second case; these
+    two are the first.
     """
 
     def test_the_live_sequences_of_an_earlier_step_are_refused(self, trace):
         """Not a hand-built divergence: these are the same objects, nineteen
         steps later, and the run moved them."""
         step = trace[0]
-        with pytest.raises(RunnerRefusal, match="not the ones this batch"):
+        with pytest.raises(RunnerRefusal, match="differ by history"):
             request_rows(step.batch, step.live)
 
     def test_an_advanced_prefill_offset_is_refused(self, trace):
@@ -419,12 +585,92 @@ class TestSequencesThatHaveMovedOn:
             num_tokens=step.seqs[first].num_tokens,
             num_cached_tokens=step.seqs[first].num_cached_tokens + CHUNK,
         )
-        with pytest.raises(RunnerRefusal, match="not the ones this batch"):
+        with pytest.raises(RunnerRefusal, match="differ by history"):
             request_rows(step.batch, advanced)
 
     def test_the_same_sequences_unmoved_are_accepted(self, trace):
         step = trace[0]
         assert request_rows(step.batch, step.seqs) == step.rows
+
+
+class TestPipelineParallelism:
+    """The configuration in which the scheduler's own two records disagree.
+
+    `advance_on_schedule` is on whenever `pipeline_parallel_size > 1`
+    (`scheduler.py:994`), and `_advance_prefill_on_schedule` (`:2271`) adds
+    each chunk to its sequence's `num_cached_tokens` *after* the batch has
+    snapshotted the pre-advance offsets (`:1730`). So the mapping `schedule()`
+    returns is a chunk ahead of the batch built from it -- not a stale mapping
+    and not a caller's mistake, which is why the refusal names the advance as
+    well as the staleness.
+
+    This is the same run as `trace`, one kwarg apart, and the counts below are
+    read against that run: it refuses nothing.
+    """
+
+    def test_the_scheduler_advances_its_sequences_only_under_this_setting(self):
+        """The switch itself, so a refusal counted below cannot be some other
+        difference between the two runs."""
+        assert _scheduler(pipeline_parallel_size=2).advance_on_schedule
+        assert not _scheduler().advance_on_schedule
+
+    def test_every_prefill_step_refuses_and_every_decode_step_projects(
+        self, trace, pipeline_trace
+    ):
+        """The consequence, decomposed rather than summarised.
+
+        `advance_on_schedule` moves `num_cached_tokens`, which is only read on
+        the prefill arm; a decode row's `N_KV` is `seq.num_tokens` on both
+        sides and does not move. So the projection does not merely decline to
+        pick a side under pipeline parallelism -- it produces no prefill row
+        at all, on step 0 of any such run."""
+        refused = [s for s in pipeline_trace if s.refusal is not None]
+        projected = [s for s in pipeline_trace if s.rows]
+        assert len(pipeline_trace) == STEPS
+        assert len(refused) == 8
+        assert len(projected) == 12
+        assert all(s.batch.total_seqs_num_decode == 0 for s in refused)
+        assert all(
+            s.batch.total_seqs_num_decode == len(s.batch.req_ids) for s in projected
+        )
+        assert [s.refusal for s in trace] == [None] * STEPS
+
+    def test_the_refusal_names_the_advance_and_not_only_a_stale_mapping(
+        self, pipeline_trace
+    ):
+        """These *are* the sequences the batch was built from. A message
+        saying otherwise sends whoever hits it in a pipeline-parallel run
+        looking for a plumbing bug that is not there."""
+        first = pipeline_trace[0]
+        assert first.refusal is not None
+        assert "advance_on_schedule" in first.refusal
+        assert "pipeline-parallel" in first.refusal
+
+    def test_each_sequence_is_exactly_one_chunk_ahead_of_its_batch(
+        self, pipeline_trace
+    ):
+        """The size of the divergence is what says it is the advance.
+
+        Any disagreement would refuse; a disagreement of exactly this step's
+        own chunk, on every request, is the advance and nothing else."""
+        step = pipeline_trace[0]
+        assert len(step.batch.req_ids) == 2
+        for index, seq in enumerate(step.seqs.values()):
+            chunk = int(step.batch.num_scheduled_tokens[index])
+            settled = int(seq.num_cached_tokens) + chunk
+            assert settled - int(step.batch.context_lens[index]) == chunk
+
+    def test_atom_s_own_aggregate_is_the_reading_that_moved(self, pipeline_trace):
+        """Which of the two readings is wrong, recorded rather than repaired.
+
+        `compute_detailed_aggregates` reads the live sequence, so under this
+        setting it prices history the forward does not read. The forward reads
+        `context_lens`. Repairing ATOM's annotation is not this file set."""
+        step = pipeline_trace[0]
+        batched = sum(int(n) for n in step.batch.context_lens)
+        scheduled = sum(int(n) for n in step.batch.num_scheduled_tokens)
+        assert (step.batch.detailed_sk, batched, scheduled) == (1024, 512, 512)
+        assert step.batch.detailed_sk - batched == scheduled
 
 
 class TestRowsTheShapesAreNotDefinedOver:
