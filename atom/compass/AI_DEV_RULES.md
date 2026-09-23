@@ -20,8 +20,12 @@
   names it differently, substitute that name. After a container rebuild
   (`/root` does not survive `teardown.sh`), run
   `git config --global --add safe.directory '*'` and `gh auth setup-git` before
-  any git command. A pull as root leaves files
-  root-owned, which fails host-side edits silently, so chown after every pull:
+  any git command. `setup-git` needs `gh` logged in, and the login is
+  `/root/.config/gh/hosts.yml`, which a full teardown also discards; so
+  `gh auth login`, or the token file `gpu_docker/CLAUDE.md` names, may be needed
+  first (unverified: not yet tested after a real teardown). A pull as root
+  leaves files root-owned, which fails host-side edits silently, so chown after
+  every pull:
 
   ```
   cd <main worktree> && git fetch fork --quiet
@@ -152,8 +156,11 @@
   per-wave GPU superset. Landing a stacked PR lands every unlanded PR below it,
   so each of those needs the same: its own APPROVE covering its head, and no
   label. A PR whose body declares an escalation without the label
-  gets the label. Any other hold names the rule in this file behind it; a rule
-  violation seen in an approved PR is filed as an issue, not held. Where a
+  gets the label. **Holds are landing preconditions, and there are three:**
+  `need human` on the PR or below it (every escalation rule in this file holds
+  through this label), an APPROVE covering each head, and the tree check below. A
+  hold names the one that is unmet. **A violation of any other rule seen in an
+  approved PR is landed and filed as an issue, not held.** Where a
   handoff note contradicts this file, this file wins.
   - **Before landing on a moved tip, compute the tree that will land:**
     `git merge-tree --write-tree <current tip> <reviewed head>`, adding
