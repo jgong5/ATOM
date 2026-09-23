@@ -105,7 +105,10 @@ the two are compared, and a transfer out of a differently-pinned spec is refused
 by name. A transfer that declares no stack at all is refused too: the evidence
 that these constants move with the compute stack is the whole reason a transfer
 is allowed to be cheap, and a transfer that does not say what it was measured
-against cannot be checked by anyone, ever.
+against cannot be checked by anyone, ever. A document saved from a merge of
+transfers from one spec reads back as such a transfer, since a merge keeps a
+transfer's pin out of what it writes, so its refusal names that merge rather
+than its author.
 
 A stack mismatch on the running machine is the one finding that is not fatal by
 default. The numbers are still measurements, taken on a stack that has since
@@ -358,6 +361,18 @@ def _transfers(resolved: Mapping[str, Any], merged: Merge):
             for component in PINNED
             if f"{PINNED_BLOCK}.{component}" in fragment.values
         }
+        if not declared and "provenance.fragments" in fragment.values:
+            yield SpecRefusal(
+                Rule.PINNED_STACK,
+                f"{fragment.stanza()} carried constants over from "
+                f"{fragment.transferred_from!r}, and its provenance names the "
+                "fragments an earlier merge built it from; a merge keeps a "
+                "transfer's source stack pin out of the document it writes, so "
+                "this one cannot say which stack they were measured against",
+                "merge the fragments it was built from in its place, since a "
+                "transfer states its source's stack pin there and nowhere else",
+            )
+            continue
         if not declared:
             yield SpecRefusal(
                 Rule.PINNED_STACK,
