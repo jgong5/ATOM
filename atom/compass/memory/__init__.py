@@ -26,8 +26,32 @@ a claim about the code paths, and it is checked as one.
 
 The two graph-pool numbers are kept apart in `graph_pool`, by name and at the
 call site, because they disagree by 4-19x and only one of them reserves.
+
+**A prediction is held to its gate one term at a time.** `compare` takes a
+breakdown a hardware run printed -- as input data; nothing here runs a model --
+and returns a per-term table with no total in it. The aggregate exists only as
+a `SummedCheck`, which cannot be built without the comparison it summarises,
+because the instrument that reads one figure over a decomposition is the one
+the per-term rule was written to reject.
 """
 
+from atom.compass.memory.compare import (
+    DISCHARGES,
+    NON_KV_TERM_GATE,
+    Comparison,
+    GraphPoolComparison,
+    Predicted,
+    Recorded,
+    Shape,
+    SummedCheck,
+    TermComparison,
+    TermRefusal,
+    Verdict,
+    compare,
+    compare_graph_pool,
+    footprint_terms,
+    tied_lm_head_bytes,
+)
 from atom.compass.memory.graph_pool import (
     PREDICTS,
     RESERVES,
@@ -46,18 +70,33 @@ from atom.compass.memory.readings import (
 from atom.compass.memory.terms import Basis, Reading, Term
 
 __all__ = [
+    "DISCHARGES",
+    "NON_KV_TERM_GATE",
     "PREDICTS",
     "RESERVES",
     "Basis",
+    "Comparison",
     "DeviceReadings",
+    "GraphPoolComparison",
     "MemoryRefusal",
     "ModelTerms",
     "PiecewiseCapture",
+    "Predicted",
     "Reading",
+    "Recorded",
+    "Shape",
+    "SummedCheck",
     "Term",
+    "TermComparison",
+    "TermRefusal",
+    "Verdict",
     "capture_token_shapes",
+    "compare",
+    "compare_graph_pool",
     "device_readings",
+    "footprint_terms",
     "piecewise_per_token_bytes",
     "predicts",
     "reserves",
+    "tied_lm_head_bytes",
 ]

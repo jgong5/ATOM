@@ -32,17 +32,17 @@ The declared scope boundary that follows, stated so it is not discovered as a
 gap: Compass models a **dedicated** device. It will not predict the OOM a shared
 box produces and will not reproduce a neighbour-induced admission cliff.
 
-**Two of the five `peak_torch` terms are not obtainable here.** The memory
-model has weights come from a meta build deduped by storage -- exact at every
-width on both models tested -- and buffers *recorded*, because the formula
-that matched the 0.6B was 4x wrong on the 27B. A meta build needs a module
+**Two of the five `peak_torch` terms are not obtainable here.** Weights are
+exact from a meta build deduped by storage -- at every width on both models
+tested -- and buffers need a recording, because the formula that matched the
+0.6B was 4x wrong on the 27B. A meta build needs a module
 tree, which needs the engine, which this tier does not import; and there is no
 recording of a card nobody has run. So `ModelTerms` takes those two terms rather
 than deriving them, with no default -- the same shape as the spec's "a runtime
 constant has no default" rule, and for the same reason. `declared_for_m1` fills
-all three with declared formulas for M1 and labels every one of them, which is
-what is allowed for the activation term while no op graph exists, and what
-this module extends, visibly, to the other two.
+all three with declared formulas for M1 and labels every one of them. For the
+activation term a declared formula is the only answer while no op graph
+exists; this module gives the other two the same treatment, visibly.
 """
 
 from __future__ import annotations
@@ -122,8 +122,8 @@ class ModelTerms:
 
         For M1, with fake models, a declared formula suffices and must say so.
         Every term below is `Basis.DECLARED` and every one names its
-        successor, because none of the three is the source the memory model
-        gives it: weights are owed a meta build, buffers a recording, and
+        successor, because none of the three is its eventual source: weights
+        are owed a meta build, buffers a recording, and
         activations a liveness walk over a traced op graph *plus* the
         per-leaf invisible-scratch constants -- and the second is the one
         with no law behind it. The measured spread that makes it load-bearing
@@ -164,7 +164,7 @@ class ModelTerms:
             Basis.DECLARED,
             f"{positions} positions x int({head_dim} head_dim x {partial} "
             f"partial_rotary_factor{assumed}) x {dtype_bytes} B",
-            "buffers are recorded rather than computed, and this is "
+            "a recording off a card replaces this; this is "
             "not a recording -- it is derived from ATOM's own rotary source "
             "and validated against no card. cos and sin together are "
             "positions x rotary_dim elements, because inv_freq holds "
