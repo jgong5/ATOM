@@ -624,9 +624,10 @@ def test_the_transfer_condition_names_itself_as_unaskable_of_a_document():
 
 
 def test_a_saved_document_merged_again_does_not_claim_to_have_asked_the_transfer():
-    # Issue #331. The first merge is refused and writes `method: mixed`, which
-    # drops the transfer, so a `Merge` of the saved document has no transfer to
-    # ask the condition of. A re-merged all-`probed` document is the control.
+    # Validating the first `Merge` is refused. Its document keeps the transfer's
+    # source pin out and says only `method: mixed`, so a `Merge` of the saved
+    # document has no transfer to ask the condition of. A re-merged all-`probed`
+    # document is the control.
     carried = copy.deepcopy(TIER2)
     carried["device"]["software_pinned_to"] = dict(STACK, rocm="7.0.2")
     transfer = fragment("tier2", carried, method="transferred-from:mi300x-8gpu")
@@ -645,6 +646,12 @@ def test_a_saved_document_merged_again_does_not_claim_to_have_asked_the_transfer
     beside = validate(merge([saved, transfer]), **asked)
     assert [refusal.rule for refusal in beside.refusals] == [Rule.PINNED_STACK]
     assert [c.split(" -- ")[0] for c in beside.asked_in_part] == [TRANSFERS_ASKED]
+    # With some stack pins resolved it was asked in part, and says so once.
+    thin = copy.deepcopy(combination.document)
+    del thin["device"]["software_pinned_to"]["rccl"]
+    thin = Fragment.from_mapping(thin, "machine.yaml")
+    partly = validate(merge([thin, transfer]), **asked)
+    assert sum(c.startswith(TRANSFERS_ASKED) for c in partly.asked_in_part) == 1
     # With no stack pin resolved it was not asked at all, and says so once.
     unpinned = copy.deepcopy(combination.document)
     del unpinned["device"]["software_pinned_to"]
