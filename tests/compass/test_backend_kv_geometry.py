@@ -246,3 +246,14 @@ def test_a_uniform_stack_needs_no_layer_kinds():
     geometry = KvGeometry.from_hf_config(dense, block_size=BLOCK_SIZE)
     assert (geometry.layers, geometry.head_dim, geometry.element_bytes) == (32, 128, 2)
     assert blocks_for(geometry) == KV_BUDGET_BYTES // geometry.bytes_per_block
+
+
+def test_a_config_with_no_dtype_is_refused_rather_than_sized(qwen):
+    """With no dtype and no kv_dtype there is no element size to assume."""
+    nameless = PretrainedConfig.from_dict({**qwen.to_dict(), "dtype": None})
+    with pytest.raises(ValueError, match="states no `dtype` and no kv_dtype"):
+        KvGeometry.from_hf_config(nameless, block_size=BLOCK_SIZE)
+    stated = KvGeometry.from_hf_config(
+        nameless, block_size=BLOCK_SIZE, kv_dtype="float16"
+    )
+    assert stated.element_bytes == 2
