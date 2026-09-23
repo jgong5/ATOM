@@ -623,6 +623,46 @@ def test_the_transfer_condition_names_itself_as_unaskable_of_a_document():
     assert "in no field" in str(as_document)
 
 
+def test_a_saved_document_merged_again_does_not_claim_to_have_asked_the_transfer():
+    # Validating the first `Merge` is refused. Its document keeps the transfer's
+    # source pin out and says only `method: mixed`, so a `Merge` of the saved
+    # document has no transfer to ask the condition of. A re-merged all-`probed`
+    # document is the control.
+    carried = copy.deepcopy(TIER2)
+    carried["device"]["software_pinned_to"] = dict(STACK, rocm="7.0.2")
+    transfer = fragment("tier2", carried, method="transferred-from:mi300x-8gpu")
+    combination = merge(fragments()[:2] + [transfer, fragment("links", LINKS)])
+    asked = {"tp_widths": (1, 2, 4, 8), "observed_stack": STACK}
+    first = validate(combination, **asked)
+    assert [refusal.rule for refusal in first.refusals] == [Rule.PINNED_STACK]
+    bare = validate(combination.document, **asked)
+    assert bare.ok and [c.split(" -- ")[0] for c in bare.not_asked] == [TRANSFERS_ASKED]
+    saved = Fragment.from_mapping(combination.document, "machine.yaml")
+    again = validate(merge([saved]), **asked)
+    assert again.ok and again.asked_in_part == ()
+    assert [c.split(" -- ")[0] for c in again.not_asked] == [TRANSFERS_ASKED]
+    assert "method `mixed` in 'machine.yaml'" in again.not_asked[0]
+    # A transfer stated beside the saved document is asked, and only in part.
+    beside = validate(merge([saved, transfer]), **asked)
+    assert [refusal.rule for refusal in beside.refusals] == [Rule.PINNED_STACK]
+    assert [c.split(" -- ")[0] for c in beside.asked_in_part] == [TRANSFERS_ASKED]
+    # With some stack pins resolved it was asked in part, and says so once.
+    thin = copy.deepcopy(combination.document)
+    del thin["device"]["software_pinned_to"]["rccl"]
+    thin = Fragment.from_mapping(thin, "machine.yaml")
+    partly = validate(merge([thin, transfer]), **asked)
+    assert sum(c.startswith(TRANSFERS_ASKED) for c in partly.asked_in_part) == 1
+    # With no stack pin resolved it was not asked at all, and says so once.
+    unpinned = copy.deepcopy(combination.document)
+    del unpinned["device"]["software_pinned_to"]
+    unpinned = Fragment.from_mapping(unpinned, "machine.yaml")
+    nowhere = validate(merge([unpinned, transfer]), **asked)
+    assert sum(c.startswith(TRANSFERS_ASKED) for c in nowhere.not_asked) == 1
+    assert nowhere.asked_in_part == ()
+    control = Fragment.from_mapping(merged().document, "machine.yaml")
+    assert validate(merge([control]), **asked).not_asked == ()
+
+
 def test_a_desk_fix_refusal_does_not_hide_the_expensive_one():
     # The phase-one refusal here is a derate an author types in at a desk; the
     # width table behind it is present and schema-valid, and the width nobody
