@@ -1047,6 +1047,19 @@ def test_an_optional_field_the_document_left_out_is_refused_as_absent():
     assert str(refused.value) == str(accessed.value)
 
 
+def test_an_empty_tokenizer_table_explains_to_no_rows_rather_than_refusing():
+    # The field is present and holds no entries, so nothing is absent and
+    # nothing was measured. A refusal here would call a spec that was read
+    # assembled, and would disagree with the accessor, which answers `()`.
+    document = copy.deepcopy(merged().document)
+    document["host"]["tokenizers"] = []
+    spec = MachineSpec.from_mapping(document)
+    assert spec.value("host.tokenizers") == ()
+    basis = explain(spec, "host.tokenizers")
+    assert basis.contributions == ()
+    assert str(basis) == f"host.tokenizers, from spec {spec.digest()}"
+
+
 def test_a_block_an_assembled_spec_holds_nothing_under_names_its_first_field():
     # A spec built from parts can lack required fields too, and then the
     # absent field is required, so the remedy is in whatever assembled it.

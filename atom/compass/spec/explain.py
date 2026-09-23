@@ -35,12 +35,14 @@ refused by name, here as everywhere else. Tokenizer rates explain per entry and
 per rate, because a spec holding two tokenizers has two different answers and a
 reader tracing a tokenization cost needs to see which of them was used.
 
-A term that comes back empty is refused one of two ways, because the two want
+A term with nothing to explain is refused one of two ways, because the two want
 different actions. A term the schema does not know is asked for again by a real
-path. A term the schema does know, with nothing under it that this spec holds,
+path. A term the schema does know, with no field under it that this spec holds,
 would come back empty however it was spelled, so it is refused as the absent
 field it is -- the same refusal `MachineSpec.value` gives for that field, and
-for a term naming several fields, for the first of them.
+for a term naming several fields, for the first of them. A field the spec does
+hold is never refused here, even when it holds nothing: a tokenizer table with
+no entries explains to no rows, as `MachineSpec.value` answers it with none.
 """
 
 from collections.abc import Mapping
@@ -198,10 +200,10 @@ def explain(
             "ask again by the whole dotted path of a field or a block of fields, "
             f"or by one of the quantities {sorted(QUANTITIES)}",
         )
+    if not any(path in spec.values for path in paths):
+        refuse_absent_field(paths[0], BY_PATH[paths[0]].required)
     contributions: list[Contribution] = []
     for path in paths:
         if path in spec.values:
             contributions += _rows(spec, path, tp_width, origin)
-    if not contributions:
-        refuse_absent_field(paths[0], BY_PATH[paths[0]].required)
     return Basis(term, spec.digest(), tuple(contributions))
