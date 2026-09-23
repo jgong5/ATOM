@@ -150,7 +150,12 @@ compass_describe "$ROOT"
 
 TORCH=$(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo UNKNOWN)
 ROCM=$(python -c 'import torch; print(torch.version.hip)' 2>/dev/null || echo UNKNOWN)
-AITER_DIR=$(python -c 'import aiter, os; print(os.path.dirname(aiter.__file__))' 2>/dev/null)
+# aiter's checkout is located without importing aiter: its import shells out to
+# rocminfo, which hangs uninterruptibly on a wedged driver -- the box where the
+# version is most worth recording. module_root resolves a top-level name with
+# importlib.util.find_spec, which executes nothing, and its import chain loads
+# neither aiter nor torch.
+AITER_DIR=$(python -c 'from atom.compass.artifacts.provenance import module_root; print(module_root("aiter"))' 2>/dev/null)
 if [ -n "$AITER_DIR" ]; then
     AITER=$(git -C "$AITER_DIR" describe --tags --always --dirty 2>/dev/null || echo UNKNOWN)
 else
