@@ -2,7 +2,7 @@
 """The artifact store: what names an entry, what made it, and what it refuses.
 
 Every test here runs at **width two or more** wherever a width can matter. A
-single rank cannot expose either of D41's naming incidents as they happened: at
+single rank cannot expose either of the two naming incidents as they happened: at
 width one the failing code applied no suffix, so one writer and four writers
 produced the same file and looked alike. The suffix here is unconditional --
 that is this module's departure, and `test_the_bare_name_is_never_produced`
@@ -10,9 +10,9 @@ is what holds it -- but the four-ranks-one-file case still needs four ranks to
 be visible at all, and every test that could pass at width one by accident is
 run at width two as well.
 
-Two things these tests deliberately do **not** do. They never bind D41's
-scalar `width` to a topology: at `-tp 2 -dp 2` the tensor-parallel width and
-the rank count are 2 and 4, D41 does not say which its key field means, and a
+Two things these tests deliberately do **not** do. They never bind an artifact
+key's scalar `width` to a topology: at `-tp 2 -dp 2` the tensor-parallel width
+and the rank count are 2 and 4, nothing says which the key field means, and a
 fixture that picked one would settle by example a question filed as #165. The
 multi-axis round trip is therefore keyed on `op_graph`, which has no width in
 its key at all. And nothing here touches a driver, a device or a network:
@@ -46,8 +46,9 @@ from atom.compass.artifacts import (
 )
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-D41 = REPO / "atom" / "compass" / "design" / "07_calibration_toolchain.md"
-#: One row of D41's six-artifacts table: the name, and the `Keyed by` cell.
+#: The design document the artifact key table is read back out of.
+KEY_TABLE_DOC = REPO / "atom" / "compass" / "design" / "07_calibration_toolchain.md"
+#: One row of the six-artifacts table: the name, and the `Keyed by` cell.
 ROW = re.compile(r"^\| `([a-z_]+)` \| [^|]*\| ([^|]*)\|", re.MULTILINE)
 
 ATOM_ROOT = SourceRoot(
@@ -69,7 +70,7 @@ AITER_ROOT = SourceRoot(
 
 
 def stanza(produced_by: str = "compass calibrate phase-1b") -> Provenance:
-    """A complete stanza: both executed source roots, as T86 requires."""
+    """A complete stanza: both executed source roots, ATOM's and aiter's."""
     return Provenance(produced_by, "2026-09-22T11:00:00+00:00", (ATOM_ROOT, AITER_ROOT))
 
 
@@ -104,16 +105,16 @@ def words(text: str) -> str:
 # --- a key is a tuple, never a path -----------------------------------------
 
 
-def test_the_six_artifacts_are_the_ones_d41_declares():
-    """The kinds *and their key fields* are one fact with D41's table.
+def test_the_six_artifacts_are_the_ones_the_key_table_declares():
+    """The kinds *and their key fields* are one fact with the document's table.
 
     The `Keyed by` column is compared per row, not just the set of names: an
     earlier version of this test compared only the names and one tuple, and
     stayed green with five of `memory_readings`' seven key fields deleted --
-    which is the row whose length is the whole point of `13` D81 separating
-    "part of the key" from "merely recorded".
+    which is the row whose length is the whole point of separating "part of
+    the key" from "merely recorded".
     """
-    text = D41.read_text(encoding="utf-8")
+    text = KEY_TABLE_DOC.read_text(encoding="utf-8")
     table = text.split("### The six artifacts", 1)[1].split("### Four rules", 1)[0]
     rows = dict(ROW.findall(table))
     assert set(rows) == {kind.value for kind in Kind}
@@ -123,15 +124,19 @@ def test_the_six_artifacts_are_the_ones_d41_declares():
         stated = re.search(r"\(([^)]*)\)", cell)
         fields = KEY_FIELDS[kind]
         if stated is None:
-            assert len(fields) == 1, f"D41 keys {kind} by one thing, code has {fields}"
+            assert (
+                len(fields) == 1
+            ), f"the key table keys {kind} by one thing, code has {fields}"
         else:
             named = [part for part in stated.group(1).split(",") if part.strip()]
             assert len(fields) == len(named), (
-                f"D41 keys {kind} by {len(named)} fields and KEY_FIELDS has "
-                f"{len(fields)}: {fields}"
+                f"the key table keys {kind} by {len(named)} fields and "
+                f"KEY_FIELDS has {len(fields)}: {fields}"
             )
         for field in fields:
-            assert words(field) in words(cell), f"D41's {kind} row omits `{field}`"
+            assert words(field) in words(
+                cell
+            ), f"the key table's {kind} row omits `{field}`"
 
 
 def test_a_price_list_asked_for_by_path_is_refused_by_name(tmp_path):
@@ -150,6 +155,7 @@ def test_a_price_list_asked_for_by_path_is_refused_by_name(tmp_path):
             source_root="/measurements/prices.json",
         )
     assert "which is a path" in str(by_value.value)
+    assert "write the value itself there, not the path" in str(by_value.value)
 
     with pytest.raises(ArtifactRefusal) as by_store:
         ArtifactStore(tmp_path).read("/measurements/prices.json")
@@ -210,7 +216,7 @@ def test_a_coordinate_taken_in_another_topology_is_refused():
     assert "dp1.pp1.pcp1.tp2" in str(refused.value)
 
 
-def test_the_topology_counts_ranks_without_spending_d41s_word():
+def test_the_topology_counts_ranks_without_spending_the_word_width():
     """`rank_count`, not `width`: #165 is open and the code stays out of it."""
     assert not hasattr(Topology(), "width")
     assert Topology(dp=2, tp=2).rank_count == 4
@@ -409,10 +415,11 @@ def test_a_missing_entry_names_the_key_that_missed(tmp_path):
 def test_a_hand_edited_entry_is_refused_by_name(tmp_path, damage, expected):
     """A tampered document is declined, not raised as a bare traceback.
 
-    The module's argument for T19 is that the path is a place and never the
-    authority. That is only true if a document this store does not recognise
-    is refused by name; before this, three separate edits raised `KeyError`,
-    `JSONDecodeError` and `ValueError` and none of them named an artifact.
+    The module's argument for the directory convention is that the path is a
+    place and never the authority. That is only true if a document this store
+    does not recognise is refused by name; before this, three separate edits
+    raised `KeyError`, `JSONDecodeError` and `ValueError` and none of them
+    named an artifact.
     """
     store = ArtifactStore(tmp_path)
     topology = Topology(tp=2)
@@ -503,7 +510,7 @@ def test_an_abandoned_staging_directory_does_not_block_a_publish(tmp_path):
     assert abandoned.is_dir()
 
 
-# --- T19: the physical form is a directory convention -----------------------
+# --- the physical form is a directory convention ----------------------------
 
 
 def test_the_store_is_a_directory_convention_with_no_index(tmp_path):
@@ -537,6 +544,7 @@ def test_a_stanza_without_aiter_is_refused():
         Provenance("phase 1b", "2026-09-22T11:00:00+00:00", (ATOM_ROOT,))
     assert refused.value.rule is Rule.PROVENANCE
     assert "names no aiter source root" in str(refused.value)
+    assert "Add a row for each missing root" in str(refused.value)
 
 
 def test_a_stanza_without_an_offset_is_refused():

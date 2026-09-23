@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from .rules import ArtifactRefusal, Rule
 
 #: The parallel axes, in the order ATOM's own rank arithmetic reshapes them
-#: (`all_ranks.reshape(-1, dp, pp, pcp, tp)`, `15` D92).
+#: (`all_ranks.reshape(-1, dp, pp, pcp, tp)`).
 AXES = ("dp", "pp", "pcp", "tp")
 _AXIS = re.compile(r"^([a-z]+)([0-9]+)of([0-9]+)$")
 
@@ -78,12 +78,12 @@ class Topology:
     def rank_count(self) -> int:
         """How many ranks the topology holds, across every axis.
 
-        Deliberately **not** called `width`. D41 keys `price_list`,
-        `region_terms` and `memory_readings` on a scalar `width` and does not
-        say whether that is the tensor-parallel width or the total rank
-        count -- at `-tp 2 -dp 2` the two readings are 2 and 4. Spending the
-        word here would settle by naming a question that is open (#165), in
-        the one module that raised it.
+        Deliberately **not** called `width`. The keys of `price_list`,
+        `region_terms` and `memory_readings` each carry a scalar `width`, and
+        nothing says whether that is the tensor-parallel width or the total
+        rank count -- at `-tp 2 -dp 2` the two readings are 2 and 4. Spending
+        the word here would settle by naming a question that is open (#165),
+        in the one module that raised it.
         """
         total = 1
         for axis in AXES:

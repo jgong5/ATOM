@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""What names an artifact: the six keys of D41, as tuples that cannot be paths.
+"""What names an artifact: the six artifact keys, as tuples that cannot be paths.
 
 The table below is the whole of artifact identity. An entry is addressed by the
 values that decide what it contains and by nothing else -- not by where someone
@@ -39,7 +39,7 @@ from .rules import ArtifactRefusal, Rule
 
 
 class Kind(enum.Enum):
-    """The artifacts D41 declares. There are no others."""
+    """The artifacts this store holds. There are no others."""
 
     MACHINE_SPEC = "machine_spec"
     SHAPE_POPULATION = "shape_population"
@@ -53,7 +53,9 @@ class Kind(enum.Enum):
         return self.value
 
 
-#: What keys each artifact, in the order a key reads. D41's table, verbatim.
+#: What keys each artifact, in the order a key reads. The design's table,
+#: verbatim -- a test parses it back out of the document and compares this
+#: mapping row by row.
 KEY_FIELDS: Mapping[Kind, tuple[str, ...]] = {
     Kind.MACHINE_SPEC: ("device", "software_stack"),
     Kind.SHAPE_POPULATION: ("model", "workload", "engine_config"),
@@ -115,7 +117,7 @@ def _looks_like_a_path(value: object) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class Key:
-    """One artifact's identity: its kind and the values D41 keys it by."""
+    """One artifact's identity: its kind and the values that key it."""
 
     kind: Kind
     fields: tuple[tuple[str, object], ...]
@@ -126,8 +128,8 @@ class Key:
         if not isinstance(kind, Kind):
             raise ArtifactRefusal(
                 Rule.KEY_IS_A_TUPLE,
-                f"{kind!r} is not one of the artifacts D41 declares",
-                "ask for one of " + ", ".join(str(k) for k in Kind),
+                f"{kind!r} is not a Kind member, and only a Kind names an artifact",
+                "pass one of " + ", ".join(f"Kind.{k.name}" for k in Kind),
             )
         declared = KEY_FIELDS[kind]
         unknown = sorted(set(values) - set(declared))
@@ -151,8 +153,10 @@ class Key:
                 raise ArtifactRefusal(
                     Rule.KEY_IS_A_TUPLE,
                     f"`{kind}.{name}` holds {str(value)!r}, which is a path",
-                    _remedy(kind) + "; record the value, never a file that may "
-                    "have changed since (13 D81)",
+                    _remedy(kind) + "; write the value itself there, not the "
+                    "path of a file holding it -- the file can change after the "
+                    "key is written, and the key would then no longer say what "
+                    "the entry holds",
                 )
             simple = isinstance(value, (str, int, float)) and not isinstance(
                 value, bool

@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: MIT
-"""The store: a directory per entry, published once and never again (T19).
+"""The store: a directory per entry, published once and never again.
 
-**T19 -- the store's physical form -- is decided here as a directory
-convention, with no index and no manifest.** A key renders to a path by one
-total function, and the entry restates its key, its topology, its provenance
-and a digest of every member inside `entry.json`. Resolution is then arithmetic
-over the key rather than a lookup, and there is no second record that can
-disagree with the first. D41's eight incidents are each a second statement of
-one fact drifting away from it; an index is one more of those, and it is the
-one a store would have to maintain on every write. Principle 3 -- and principle
-6 for what the filesystem gives free: an entry is built elsewhere and moved
-into place, and a published entry is never empty -- it always carries
+**The store's physical form is a directory convention, with no index and no
+manifest.** A key renders to a path by one total function, and the entry
+restates its key, its topology, its provenance and a digest of every member
+inside `entry.json`. Resolution is then arithmetic over the key rather than a
+lookup, and there is no second record that can disagree with the first. The
+eight incidents this package exists for are each a second statement of one fact
+drifting away from it; an index is one more of those, and it is the one a store
+would have to maintain on every write, so there is none. The refusal to
+overwrite comes from the filesystem for free: an entry is built elsewhere and
+moved into place, and a published entry is never empty -- it always carries
 `entry.json` -- so `rename(2)` cannot replace one.
 
 Stated that way on purpose, because the obvious stronger claim is false and was
@@ -23,7 +23,7 @@ caught by the occupancy check before the rename, not by the rename. Staging is
 per-publisher (`mkdtemp`) rather than a function of the key, so two publishers
 at one key cannot write into each other's half-built entry.
 
-Three refusals the convention buys, each an incident from D41:
+Three refusals the convention buys, each one of those incidents:
 
 **A handed-off entry cannot be quietly replaced.** Publishing to a key that
 already has an entry is refused, and the refusal states the stored digest and
@@ -44,8 +44,8 @@ read back through `naming.read_back`; a neighbour that does not parse, is not
 listed, or whose digest has moved is refused by name rather than returned.
 
 Not here, and deliberately: the invalidation matrix, fingerprint comparison on
-load, and gate state. Those are ART-2's, and what they need is an entry that
-can state its key, its digest and what produced it.
+load, and gate state. What they need from this module is an entry that can
+state its key, its digest and what produced it.
 """
 
 import contextlib
@@ -77,9 +77,10 @@ def _legible(directory: Path):
 
     A hand-edited `entry.json` otherwise surfaces as `JSONDecodeError`,
     `KeyError` or `ValueError` -- three tracebacks that say nothing about
-    which artifact answered, which is the shape of failure D41 is about. The
-    module argues that the path is a place and never the authority; that is
-    only true if a document the store does not recognise is declined by name.
+    which artifact answered, which is the shape of failure this store is
+    about. The module argues that the path is a place and never the
+    authority; that is only true if a document the store does not recognise
+    is declined by name.
     """
     try:
         yield

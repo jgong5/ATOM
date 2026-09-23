@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 """What a refusal from the artifact store says, and the rules it declines under.
 
-D41 opens with eight incidents that share one shape: the number was fine and
-the question of *which artifact answered* was not. Each rule below is one of
-those incidents written as something the store can decline, so the failure
-arrives as a named refusal at the moment it is made rather than as a plausible
-number a week later.
+This package exists for eight incidents that share one shape: the number was
+fine and the question of *which artifact answered* was not. Each rule below is
+one of those incidents written as something the store can decline, so the
+failure arrives as a named refusal at the moment it is made rather than as a
+plausible number a week later.
 
 A refusal carries three parts, as everywhere else in Compass: which rule
 declined, what tripped it, and what would satisfy it. The third part is the

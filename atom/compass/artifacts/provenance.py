@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 """What produced an entry: the executed source roots, and there are two of them.
 
-D41's rule is that the source root is a `git archive` digest and never an
-rsync, because a correct registry digest once sat beside a stale package for
-exactly that reason. The digest taken here is the **tree object** --
+A source root is identified by a `git archive` digest and never by an rsync,
+because a correct registry digest once sat beside a stale package for exactly
+that reason. The digest taken here is the **tree object** --
 `git rev-parse HEAD^{tree}` -- which is the identity of the content
 `git archive` ships, and unlike a commit sha it does not move when a message is
 amended. That equivalence holds for this repo as it stands: there is no
@@ -20,7 +20,7 @@ source, or compare them wrongly. For the same reason the stamp path reports
 tree, but a hand-written stamp is not `snapshot.sh`, and this module cannot see
 the difference.
 
-**aiter is the second root** (T86). The MoE kernels and every collective are
+**aiter is the second root.** The MoE kernels and every collective are
 aiter's, aiter lives in the container's writable layer outside `/workspace`,
 and two versions are in circulation on this project right now. A stanza naming
 only ATOM's tree describes half of what ran, so a `Provenance` cannot be built
@@ -165,7 +165,8 @@ class Provenance:
                 f"this stanza names no {', '.join(missing)} source root",
                 "record every tree that executed: the MoE kernels and every "
                 "collective are aiter's, so a stanza naming only ATOM's tree "
-                "describes half of what ran (T86)",
+                "describes half of what ran. Add a row for each missing root; "
+                "roots_for({'atom': 'atom', 'aiter': 'aiter'}) resolves both",
             )
         if len(set(named)) != len(named):
             _refuse(
@@ -322,8 +323,8 @@ def roots_for(
     """One row per module that can answer, each resolved on its own.
 
     `modules` maps the name a row is recorded under to the module it resolves
-    from, so `{"atom": "atom", "aiter": "aiter"}` is the stanza D41 and T86
-    require, and a module with its own answer adds a row that can disagree
+    from, so `{"atom": "atom", "aiter": "aiter"}` is the stanza every entry
+    requires, and a module with its own answer adds a row that can disagree
     with ATOM's rather than hiding behind it.
     """
     resolved = []
