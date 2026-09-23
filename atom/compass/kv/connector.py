@@ -55,7 +55,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from atom.compass.kv.handoff import transfer_params
+from atom.compass.kv.handoff import transfer_params, whole_number
 from atom.compass.kv.transfer import TransferModel
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
@@ -258,8 +258,11 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
     def __init__(self, config) -> None:
         kv_config = _kv_config(config)
         self.is_producer = _is_producer(kv_config)
-        self._tp_size = config.tensor_parallel_size
-        self._dp_rank = config.parallel_config.data_parallel_rank
+        # Checked here so a malformed width refuses the connector before any
+        # request is served, not at the first request_finished.
+        parallel = config.parallel_config
+        self._tp_size = whole_number("tp_size", config.tensor_parallel_size)
+        self._dp_rank = whole_number("dp_rank", parallel.data_parallel_rank)
         self._offered: dict[ReqId, tuple[Any, list[int]]] = {}
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:

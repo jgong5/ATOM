@@ -52,12 +52,13 @@ def transfer_params(seq: Any, *, tp_size: int, dp_rank: int) -> dict[str, Any]:
     """The blob the router relays for *seq*, as a simulated producer sees it.
 
     `tp_size` and `dp_rank` describe the deployment rather than the request,
-    so they are passed in from the config the connector was built with. Both
-    are cast to `int` because the router takes `dp_rank` only if it is a
-    number, and otherwise **substitutes its own registry value for the
-    prefilling worker**, dropping it outright only when it has none either
-    way. So a rank of the wrong type is not lost loudly; it is replaced by a
-    plausible one, with no error anywhere.
+    so they are passed in from the config the connector was built with, which
+    has already put each through `whole_number`. They go out as given. They
+    must be `int` because the router takes `dp_rank` only if it is a number,
+    and otherwise **substitutes its own registry value for the prefilling
+    worker**, dropping it outright only when it has none either way. So a
+    rank of the wrong type is not lost loudly; it is replaced by a plausible
+    one, with no error anywhere.
     """
     drafts = getattr(seq, "spec_token_ids", None)
     draft_token_ids = (
@@ -71,10 +72,41 @@ def transfer_params(seq: Any, *, tp_size: int, dp_rank: int) -> dict[str, Any]:
         "remote_host": SIMULATED_HOST,
         "remote_port": SIMULATED_PORT,
         "remote_handshake_port": SIMULATED_PORT,
-        "tp_size": int(tp_size),
-        "dp_rank": int(dp_rank),
+        "tp_size": tp_size,
+        "dp_rank": dp_rank,
         "transfer_id": seq.id,
         "first_token_id": seq.output_tokens[0] if seq.output_tokens else None,
         "draft_token_ids": draft_token_ids,
         "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
     }
+
+
+def whole_number(field: str, value: Any) -> int:
+    """*value* as an `int`, or a `ValueError` naming *field* if it is not one.
+
+    An `int` is taken as it is, and so is a float with no fractional part.
+    Text is taken only if `int` reads it as an integer literal, so "8" and
+    " 8 " are 8 and "8.0" and "1e1" are refused. ATOM's own launch path does
+    not deliver a width as text -- its CLI flags and `ATOM_DP_RANK` are parsed
+    with `int`, and its `Config` raises on a string width -- so text arrives
+    only from a caller that builds the config by hand.
+
+    Refused: a fraction, because `int` truncates and 8.5 would go out as 8,
+    naming a deployment that was never launched; a `bool`, which Python
+    counts as an `int` and which would go out as a width of 1 or 0; and
+    anything else `int` does not take exactly. No value that is accepted
+    changes on the way to the `int` returned.
+    """
+    try:
+        if isinstance(value, bool):
+            raise TypeError(f"{value!r} is a bool")
+        number = int(value) if isinstance(value, str) else value
+        whole = int(number)
+    except (TypeError, ValueError, OverflowError):
+        whole = None
+    if whole is None or whole != number:
+        raise ValueError(
+            f"{field} is {value!r}, which is not a whole number; a parallel "
+            "width or rank is a count, so it is refused rather than converted"
+        )
+    return whole
