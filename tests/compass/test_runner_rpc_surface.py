@@ -1026,33 +1026,78 @@ def test_the_zero_block_form_in_the_tree_answers_two_of_the_four_keys():
 
 
 # --- the package docstring, read against the table it describes --------------
+#
+# What is read here is what the docstring states through tokens the tree can
+# check: bullet leads, the `file.py:NN` citations under each lead, and a module
+# count. The sentences between them are not read. Which half of the table
+# parks its caller, and the scope of `overrides`' engine import, differ from
+# their false forms only in wording, and asserting wording is not a check on
+# what the wording claims.
+
+CITATION = r"`([a-z_]+\.py:\d+)`"
+COUNT_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven")
 
 
-def _bullet_leads(doc):
-    """The backticked name each top-level bullet of *doc* opens with.
+def _bullets(doc):
+    """Each top-level bullet of *doc*, keyed by the backticked name it opens with.
 
     The package docstring carries two bullet lists -- the modules it splits and
     the dispatched names no caller waits for -- and every entry of both opens
     with one backticked identifier. Reading the leads rather than searching the
     whole text is what lets the two lists be checked separately, and it is also
     what keeps an incidental mention from counting: `forward` is named in the
-    prose of a module bullet and is not an entry of either list.
+    prose of a module bullet and is not an entry of either list. A bullet's
+    text runs through the lines indented under it, so what it says is read as
+    that entry's and not as the whole docstring's.
     """
-    return set(re.findall(r"^- `([A-Za-z_][A-Za-z0-9_]*)`", doc, flags=re.MULTILINE))
+    pattern = r"^- `([A-Za-z_][A-Za-z0-9_]*)`(.*(?:\n  .*)*)"
+    return dict(re.findall(pattern, doc, flags=re.MULTILINE))
+
+
+def _modules():
+    """The package's own modules: its `.py` files and its subpackage directories."""
+    return {
+        p.stem
+        for p in PACKAGE.iterdir()
+        if p.suffix == ".py" or (p.is_dir() and any(p.rglob("*.py")))
+    } - {"__init__"}
+
+
+def _stated_module_counts(doc):
+    """Every number *doc* puts in front of "module" or "modules"."""
+    words = re.findall(r"\b(\w+) modules?\b", doc)
+    return [
+        int(w) if w.isdigit() else COUNT_WORDS.index(w.lower())
+        for w in words
+        if w.isdigit() or w.lower() in COUNT_WORDS
+    ]
 
 
 def test_the_package_docstring_lists_every_module_beside_it():
-    """The split it describes has to be over the package's own files.
+    """The split it describes has to be over the package's own modules.
 
     The docstring said "Two modules" for as long as there were three:
     `step_output` landed a PR after the sentence was written, and nothing went
     red, because a count in prose has nothing to disagree with. So the bullets
     are compared against the directory instead of against a number, and the
-    next module either appears in them or fails here.
+    next module either appears in them or fails here -- including one that
+    arrives as a subpackage directory rather than as a `.py` file.
     """
-    modules = {p.stem for p in PACKAGE.glob("*.py")} - {"__init__"}
-    assert "step_output" in modules, "the glob found no package to compare against"
-    assert _bullet_leads(PACKAGE_DOC) - set(RPC_SURFACE) == modules
+    modules = _modules()
+    assert "step_output" in modules, "the walk found no package to compare against"
+    assert set(_bullets(PACKAGE_DOC)) - set(RPC_SURFACE) == modules
+
+
+def test_a_module_count_the_package_docstring_states_is_the_packages():
+    """A count in prose, given the directory to disagree with.
+
+    The docstring states no count today, and need not. Where it does state one,
+    it is the number of modules the package holds, so "Two modules" put back
+    above three bullets fails here rather than reading as true.
+    """
+    assert _stated_module_counts("Two modules, split by") == [2]
+    for stated in _stated_module_counts(PACKAGE_DOC):
+        assert stated == len(_modules()), f"the docstring says {stated} modules"
 
 
 def test_the_package_docstring_partitions_the_surface_the_way_the_table_does():
@@ -1074,7 +1119,7 @@ def test_the_package_docstring_partitions_the_surface_the_way_the_table_does():
     """
     assert UNWAITED, "a table with nothing unwaited would pass the partition trivially"
     assert UNWAITED != set(RPC_SURFACE), "and so would a table with nothing waited"
-    assert _bullet_leads(PACKAGE_DOC) & set(RPC_SURFACE) == UNWAITED
+    assert set(_bullets(PACKAGE_DOC)) & set(RPC_SURFACE) == UNWAITED
 
 
 def test_every_site_the_package_docstring_cites_is_one_no_caller_waits_for():
@@ -1087,8 +1132,16 @@ def test_every_site_the_package_docstring_cites_is_one_no_caller_waits_for():
     second site that appears, is uncited; a site that starts passing
     `wait_out=True`, or a name that leaves the unwaited half, is cited and
     should not be.
+
+    The union alone does not say which name a site belongs to: two bullets
+    with their bodies swapped cite the same six sites between them. So each
+    bullet's citations are also held to its own name's sites.
     """
-    cited = set(re.findall(r"`([a-z_]+\.py:\d+)`", PACKAGE_DOC))
+    cited = set(re.findall(CITATION, PACKAGE_DOC))
     sites = [s for name in UNWAITED for s in SITES[name]]
     assert [s for s in sites if s.waits] == []
     assert cited == {f"{s.file}:{s.line}" for s in sites}
+    bullets = _bullets(PACKAGE_DOC)
+    assert {n: set(re.findall(CITATION, bullets.get(n, ""))) for n in UNWAITED} == {
+        n: {f"{s.file}:{s.line}" for s in SITES[n]} for n in UNWAITED
+    }
