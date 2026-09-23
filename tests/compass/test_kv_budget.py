@@ -194,16 +194,16 @@ def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
     `_kv_budget_extra_reserve` -- ATOM's override point for a reserve inside
     the budget -- as any string in its syntax tree (a name, attribute,
     parameter, keyword, import or string constant, so a call through the
-    module, `setattr`, `getattr` and `__dict__` spellings count), none reads
-    an attribute named `gpu_memory_utilization`, and none writes the
-    coefficient of ATOM's safety margin -- read off ATOM's own line, so it
-    follows ATOM -- or its complement as a literal. What is not: the
-    `min(budget, free)` clamp, which has no name to find, a margin spelled some
-    other way (`2 / 100`), a name built at runtime (a concatenation or an
+    module, `setattr`, `getattr` and `__dict__` spellings count), none carries
+    `gpu_memory_utilization` the same way except as a dict-display key, and
+    none writes the coefficient of ATOM's safety margin -- read off ATOM's own
+    line, so it follows ATOM -- or its complement as a literal. What is not:
+    the `min(budget, free)` clamp, which has no name to find, a margin spelled
+    some other way (`2 / 100`), a name built at runtime (a concatenation or an
     f-string) or held inside a longer string (source text handed to `exec`),
-    and `gpu_memory_utilization` read by string (`getattr`): `spec/rules.py`
-    holds that knob's name as a string to word a refusal, so the string
-    itself cannot be refused.
+    and `gpu_memory_utilization` as a dict-display key: `spec/rules.py` holds
+    it as one to word a refusal. A key names the knob without reading it; a
+    read keyed by one takes its name at runtime, which is listed above.
 
     Read as syntax trees rather than as text: the words appear in docstrings
     all over this package, so a grep would pass for as long as somebody kept
@@ -220,19 +220,24 @@ def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
     margins = {round(c, 12) for m in _safety_margin_coefficients() for c in (m, 1 - m)}
     for module in sorted(COMPASS.rglob("*.py")):
         tree = ast.parse(module.read_text())
-        reads = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-        assert "gpu_memory_utilization" not in reads, module
-        strings = {
-            s
+        keys = {
+            id(k) for n in ast.walk(tree) if isinstance(n, ast.Dict) for k in n.keys
+        }
+        named = [
+            (id(n), s)
             for n in ast.walk(tree)
             for _, value in ast.iter_fields(n)
             for s in (value if isinstance(value, list) else [value])
             if isinstance(s, str)
-        }
+        ]
+        strings = {s for _, s in named}
         assert "plan_pools" not in strings, f"{module} names ATOM's plan_pools"
         assert (
             "_kv_budget_extra_reserve" not in strings
         ), f"{module} names ATOM's budget reserve override point"
+        assert "gpu_memory_utilization" not in {
+            s for n, s in named if n not in keys
+        }, f"{module} names ATOM's gpu_memory_utilization outside a dict key"
         literals = {
             round(n.value, 12)
             for n in ast.walk(tree)
@@ -371,9 +376,13 @@ def test_the_refusals_read_exactly_these_config_fields():
     """The control: the collector below is not pinning an empty list.
 
     It collects only reads made through `_config_field`; a refusal reading its
-    field any other way is not seen here (issue #293).
+    field any other way is not seen here.
     """
-    assert _fields_the_refusals_read() == ["disagg_is_decode", "enforce_eager"]
+    assert _fields_the_refusals_read() == [
+        "disagg_is_decode",
+        "enforce_eager",
+        "speculative_config",
+    ]
 
 
 @pytest.mark.parametrize("name", _fields_the_refusals_read())

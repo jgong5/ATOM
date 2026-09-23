@@ -513,7 +513,7 @@ class NonAllocatingRunner:
                 f"{type(batch).__name__} cannot say whether its batch produces "
                 "output; there is nothing here to report from."
             )
-        if getattr(self.config, "speculative_config", None) is not None:
+        if _config_field(self, "speculative_config") is not None:
             # Refused on the config rather than on the batch: the reply this
             # method builds drafts nothing, and a run that drafts nothing is a
             # different run from the one a speculative config describes. The
