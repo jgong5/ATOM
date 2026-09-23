@@ -270,7 +270,7 @@ def test_the_five_readings_are_a_per_term_table(spec, qwen, tp_width, capsys):
 
 @pytest.mark.parametrize("tp_width", [1, 2])
 def test_free_is_a_clean_box_and_not_a_reading(spec, qwen, tp_width):
-    # 03 D14: derived, so `(total - free)` can never carry a neighbour's bytes.
+    # Derived, so `(total - free)` can never carry a neighbour's bytes.
     readings = readings_at(spec, qwen, tp_width)
     assert readings.free.total == (
         readings.total.total - readings.peak_torch.total - readings.non_torch.total
@@ -292,8 +292,8 @@ def test_every_term_names_where_it_came_from(spec, qwen, tp_width):
 
 
 def test_the_declared_terms_are_named_and_are_the_three_the_design_owes(spec, qwen):
-    # 03 D16 owes weights a meta build, buffers a recording, and activations
-    # the liveness walk of 04 D22. Until then they are declared and say so.
+    # The memory model owes weights a meta build, buffers a recording, and
+    # activations a liveness walk. Until then they are declared and say so.
     readings = readings_at(spec, qwen, 1)
     assert set(readings.peak_torch.declared) == {"weights", "buffers", "activations"}
 
@@ -301,9 +301,9 @@ def test_the_declared_terms_are_named_and_are_the_three_the_design_owes(spec, qw
 @pytest.mark.parametrize("tp_width", [1, 2])
 def test_the_min_budget_free_clamp_cannot_bind(spec, qwen, tp_width):
     # Making it inert is this task's job; proving it against ATOM's own
-    # arithmetic is MEM-2's. What is checked here is the only thing that can be
-    # checked without the engine: with `free` a clean box, the budget branch is
-    # below it at every utilisation the engine accepts.
+    # arithmetic belongs to the cut that wires them in. What is checked here
+    # is the only thing checkable without the engine: with `free` a clean box,
+    # the budget branch is below it at every utilisation the engine accepts.
     readings = readings_at(spec, qwen, tp_width)
     total = readings.total.total
     for utilisation in (0.5, 0.7, 0.9, 0.95, 1.0):
@@ -365,8 +365,8 @@ def test_a_configuration_that_does_not_fit_refuses_rather_than_clamping(spec, qw
 
 
 def test_the_predicting_function_cannot_be_spent_as_the_reserving_one(spec, qwen):
-    # 03 D16 keeps them apart; this is where that is enforced rather than
-    # remembered. Only the mirror of ATOM's estimator reserves anything.
+    # The memory model keeps them apart; this is where that is enforced rather
+    # than remembered. Only the mirror of ATOM's estimator reserves anything.
     with pytest.raises(MemoryRefusal) as refusal:
         device_readings(
             spec,
@@ -426,7 +426,7 @@ def test_enforce_eager_reserves_nothing_and_says_why():
 
 
 def test_a_reading_cannot_be_spent_as_a_number():
-    # 03 D16: a summed check read +13.8% while holding a 25% error in one term.
+    # A summed check read +13.8% while holding a 25% error in one term.
     reading = Reading("x", (Term("a", 3, Basis.DERIVED, "somewhere"),))
     assert not hasattr(reading, "__int__")
     assert not hasattr(reading, "__index__")
@@ -460,7 +460,7 @@ def test_the_total_follows_the_terms_rather_than_being_stored():
 
 
 def test_an_absent_partial_rotary_factor_says_so_in_the_table(qwen):
-    # The one field whose absence produced 03 D15's recorded 4x. 1.0 is the
+    # The one field whose absence produced the recorded 4x. 1.0 is the
     # right reading for a full-rotary model, so it is not refused -- but the
     # row must not look the same as a config that states 1.0.
     full = copy.deepcopy(qwen)
@@ -500,7 +500,7 @@ def test_a_config_with_no_dtype_refuses_rather_than_assuming_one(qwen):
 
 
 def test_the_negative_box_refusal_carries_its_decomposition(spec, qwen):
-    # Principle 7 applies to a refusal too: the reader has to see which of the
+    # A refusal carries its decomposition too: the reader has to see which of the
     # six terms does not fit, and three of them are declared coefficients.
     with pytest.raises(MemoryRefusal) as refusal:
         device_readings(
@@ -521,7 +521,7 @@ def test_the_negative_box_refusal_carries_its_decomposition(spec, qwen):
 
 
 def test_a_deployment_flag_is_not_labelled_geometry():
-    # 05 D24 draws the line between the machine and the deployment, and
+    # The line between the machine and the deployment is drawn so that
     # enforce_eager is squarely on the deployment side of it.
     assert reserves(enforce_eager=True).terms[0].basis is Basis.DEPLOYMENT
     assert not hasattr(Basis, "GEOMETRY")
@@ -530,7 +530,7 @@ def test_a_deployment_flag_is_not_labelled_geometry():
 # --- no device, structurally -------------------------------------------------
 
 #: Roots the package may not import at all, and the prefixes of ATOM that reach
-#: a driver. Principle 2: device capability is configured, never read.
+#: a driver. Device capability is configured here, never read off a device.
 FORBIDDEN_ROOTS = frozenset({"torch", "transformers"})
 FORBIDDEN_PREFIXES = ("atom.model_engine", "atom.model_ops", "atom.models")
 

@@ -3,7 +3,7 @@
 
 """Two graph-pool numbers that are not the same number, kept apart on purpose.
 
-`03` D16 keeps two functions here and this module is that decision:
+The memory model keeps two functions here and this module is that decision:
 
 - **`reserves()` mirrors ATOM's own `_estimate_cudagraph_overhead`**
   (`model_runner.py:1546-1641`). It is not the better number and it is not meant
@@ -33,7 +33,7 @@ One thing the width scaling rests on, recorded where the number is used: flat
 above width 1 is well supported as a *shape* -- the allocated delta was
 byte-identical, 79,692,800, across three widths and three ladders -- but that
 the step happens at width 2 rather than the function merely looking flat over
-the widths measured rests on one point above width 1 (`03` D15).
+the widths measured rests on one point above width 1.
 """
 
 from __future__ import annotations
@@ -129,8 +129,8 @@ def reserves(
 
     **Two of ATOM's own adjustments inside those branches are not mirrored
     here, and they pull in opposite directions.** Neither fires at M1 -- no
-    drafter, one data-parallel rank -- and both are named because MEM-2 wires
-    this into `get_num_blocks` under a block-count gate and would otherwise
+    drafter, one data-parallel rank -- and both are named because the cut that
+    wires this into `get_num_blocks` under a block-count gate would otherwise
     read "nothing else" as fidelity:
 
     - A DSpark confidence-schedule drafter rescales the whole-graph branch by
@@ -225,7 +225,7 @@ def predicts(spec, *, tp_width: int, captured_tokens: int) -> Reading:
                     "flat is well supported as a shape -- the allocated delta "
                     "was byte-identical across three widths and three ladders "
                     "-- but that the step is at width 2 rests on one point "
-                    "above width 1 (03 D15)",
+                    "above width 1",
                 ),
             ),
         )

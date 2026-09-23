@@ -3,10 +3,10 @@
 
 """A memory reading and the terms it was composed of, which it cannot shed.
 
-`03` D16 is a rule about arithmetic that has already gone wrong once: a summed
-non-KV memory check read +13.8% while holding three errors, two of which
-cancelled, and the largest of them was 25% of its own term. The conclusion
-recorded there is that every term is validated individually and never as a sum.
+The rule this file carries is about arithmetic that has already gone wrong
+once: a summed non-KV memory check read +13.8% while holding three errors,
+two of which cancelled, and the largest of them was 25% of its own term. The
+conclusion drawn is that every term is validated individually, never as a sum.
 A reading object that can be printed only as a total reproduces that failure by
 design, so this one cannot be:
 
@@ -16,17 +16,19 @@ design, so this one cannot be:
   number by accident; a caller that wants the number asks for `.total` and the
   call site says so.
 - `__str__` is the per-term table. Printing a reading prints its decomposition,
-  which is principle 7 made structural rather than remembered.
+  which is the rule against reporting an aggregate without its decomposition,
+  made structural rather than remembered.
 
 **`Basis` is not `Species`.** `backends/provenance.py` answers *how a cost was
 obtained* -- analytical, measured, fitted, interpolated, extrapolated. This enum
 answers a different question about a different subject: *where this memory
 term's bytes came from* -- a named field of the machine spec, a knob ATOM's
 own config states, arithmetic over other readings, or a coefficient somebody
-wrote down. There is deliberately no `GEOMETRY` member: `05` D24 draws the line
-between the machine and the deployment, and nothing on the model side of it is
-*obtained* yet -- every term read off a model config here is a declared
-formula, and labelling one `GEOMETRY` would say it was not.
+wrote down. There is deliberately no `GEOMETRY` member: the line drawn
+between the machine and the deployment puts a serving knob on the deployment
+side, and nothing on the model side of it is *obtained* yet -- every term
+read off a model config here is a declared formula, and labelling one
+`GEOMETRY` would say it was not.
 
 The two vocabularies are kept apart deliberately. A declared coefficient has no
 word in `Species` and adding one is an open owner ruling (**#87**), so nothing
@@ -87,8 +89,8 @@ class Term:
             )
         if not self.source.strip():
             raise ValueError(
-                f"{self.name} states no source; a number without one is a defect "
-                "(principle 8), and this is the field that carries it"
+                f"{self.name} states no source; a number without one is a "
+                "defect, and this is the field that carries it"
             )
         if self.basis is Basis.DECLARED and not self.note.strip():
             raise ValueError(

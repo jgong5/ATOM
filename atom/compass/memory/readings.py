@@ -3,7 +3,7 @@
 
 """The five readings `get_num_blocks` takes off a card, taken off a spec instead.
 
-`03` D14's rule is **substitute the readings, never the arithmetic**. ATOM's
+The rule is **substitute the readings, never the arithmetic**. ATOM's
 `get_num_blocks` (`model_runner.py:1652-1873`) is five device readings and then
 some arithmetic over them; this module owns the five, and the budget formula,
 the 2% margin, the `min(budget, free)` clamp and `plan_pools` stay ATOM's. A
@@ -25,23 +25,24 @@ neighbour held 152 GB while this rank had reserved 2.9 GB. Taking `non_torch`
 from a spec removes that contamination by construction. And with `free` derived
 as the box that is left, the `min(budget, free)` clamp cannot bind -- the prior
 design needed a `free_was_binding()` guard to refuse records where it had, and
-this one does not. Making it inert is this task's job; proving it is MEM-2's.
+this one does not. Making it inert is this module's job; proving it against
+ATOM's own arithmetic belongs to the cut that wires these readings in.
 
 The declared scope boundary that follows, stated so it is not discovered as a
 gap: Compass models a **dedicated** device. It will not predict the OOM a shared
 box produces and will not reproduce a neighbour-induced admission cliff.
 
-**Two of the five `peak_torch` terms are not obtainable here.** `03` D16 says
-weights come from a meta build deduped by storage -- exact at every width on
-both models tested -- and that buffers are *recorded*, because the formula that
-matched the 0.6B was 4x wrong on the 27B. A meta build needs a module tree,
-which needs the engine, which this tier does not import; and there is no
+**Two of the five `peak_torch` terms are not obtainable here.** The memory
+model has weights come from a meta build deduped by storage -- exact at every
+width on both models tested -- and buffers *recorded*, because the formula
+that matched the 0.6B was 4x wrong on the 27B. A meta build needs a module
+tree, which needs the engine, which this tier does not import; and there is no
 recording of a card nobody has run. So `ModelTerms` takes those two terms rather
 than deriving them, with no default -- the same shape as the spec's "a runtime
 constant has no default" rule, and for the same reason. `declared_for_m1` fills
 all three with declared formulas for M1 and labels every one of them, which is
-what `03` D16's open issue allows for the activation term and what this module
-extends, visibly, to the other two.
+what is allowed for the activation term while no op graph exists, and what
+this module extends, visibly, to the other two.
 """
 
 from __future__ import annotations
@@ -119,15 +120,16 @@ class ModelTerms:
     ) -> ModelTerms:
         """All three from geometry and declared coefficients, each labelled.
 
-        For M1, with fake models, a declared formula suffices and must say so
-        (`03` D16). Every term below is `Basis.DECLARED` and every one names its
-        successor, because none of the three is the source that `03` D16 gives
-        it: weights are owed a meta build, buffers a recording, and activations
-        the liveness walk of `04` D22 *plus* the invisible-scratch constants of
-        `04` T4 -- and the second is the one with no law behind it. The measured
-        spread that makes it load-bearing is 0.1 KB/token on the 0.6B against
-        39.6 KB/token on the 27B, which is the difference between -35.0% and
-        +3.4% held out. A formula does not stand in for that past M1.
+        For M1, with fake models, a declared formula suffices and must say so.
+        Every term below is `Basis.DECLARED` and every one names its
+        successor, because none of the three is the source the memory model
+        gives it: weights are owed a meta build, buffers a recording, and
+        activations a liveness walk over a traced op graph *plus* the
+        per-leaf invisible-scratch constants -- and the second is the one
+        with no law behind it. The measured spread that makes it load-bearing
+        is 0.1 KB/token on the 0.6B against 39.6 KB/token on the 27B, the
+        difference between -35.0% and +3.4% held out. A formula does not
+        stand in for that past M1.
         """
         if tp_size < 1:
             raise ValueError(f"tensor-parallel width is at least 1: {tp_size}")
@@ -141,7 +143,7 @@ class ModelTerms:
         # 1.0 is the right reading for a model with full rotary, so an absent
         # field is not refused here. But a config that states 1.0 and one that
         # states nothing must not render the same row: the second is the
-        # absence that 03 D15's recorded 4x came from, and an assumption that
+        # absence the recorded 4x came from, and an assumption that
         # does not appear in the table is not an assumption a reader can see.
         stated = getattr(text, "partial_rotary_factor", None)
         partial = 1.0 if stated is None else float(stated)
@@ -152,7 +154,7 @@ class ModelTerms:
             parameter_count * dtype_bytes // tp_size,
             Basis.DECLARED,
             f"{parameter_count} stated parameters x {dtype_bytes} B / TP{tp_size}",
-            "a meta build deduped by storage (02 D10.1) replaces this and is "
+            "a meta build deduped by storage replaces this and is "
             "exact at every width; this shards every parameter, where a real "
             "stack replicates its norms",
         )
@@ -162,7 +164,7 @@ class ModelTerms:
             Basis.DECLARED,
             f"{positions} positions x int({head_dim} head_dim x {partial} "
             f"partial_rotary_factor{assumed}) x {dtype_bytes} B",
-            "03 D16 records buffers rather than computing them, and this is "
+            "buffers are recorded rather than computed, and this is "
             "not a recording -- it is derived from ATOM's own rotary source "
             "and validated against no card. cos and sin together are "
             "positions x rotary_dim elements, because inv_freq holds "
@@ -184,9 +186,10 @@ class ModelTerms:
             f"{warmup_tokens} warmup tokens x {dtype_bytes} B x "
             f"({graph_pool.LIVE_TENSORS_PER_LAYER} x {hidden} hidden + "
             f"{_LIVE_INTERMEDIATE} x {intermediate} intermediate)",
-            "the liveness walk of 04 D22 plus the invisible-scratch constants "
-            "of 04 T4 replace this; the per-layer coefficient is ATOM's own "
-            "(model_runner.py:3601), over one live layer rather than all of them",
+            "a liveness walk over a traced op graph, plus the per-leaf "
+            "invisible-scratch constants, replace this; the per-layer "
+            "coefficient is ATOM's own (model_runner.py:3601), over one live "
+            "layer rather than all of them",
         )
         return cls(weights, buffers, activations)
 
@@ -244,7 +247,7 @@ def device_readings(
     reading from `graph_pool.predicts()` is refused here by name. The two
     disagree by 4-19x and only the first is what ATOM subtracts from the budget,
     so which one reserves is settled at this call site by the code rather than
-    by a comment beside it (`03` D16).
+    by a comment beside it.
 
     A width absent from either width table refuses, and the spec's own refusal
     names the field and the width -- `driver_and_collective_reserve_bytes` and
@@ -317,7 +320,7 @@ def device_readings(
     )
     box = total.total - peak_torch.total - non_torch.total
     if box < 0:
-        # Principle 7 applies to a refusal as much as to an answer: the reader
+        # A refusal carries its decomposition as an answer does: the reader
         # has to see which of the six terms is the one that does not fit, and
         # three of them are declared coefficients. Both readings render
         # themselves, so the decomposition costs a newline.
