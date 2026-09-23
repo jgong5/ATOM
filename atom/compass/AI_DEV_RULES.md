@@ -67,7 +67,8 @@
 
   Every brief links its predecessors' issues. **A brief that cannot name its file
   set is not claimable.** **Decompose a complex task into sub-tasks** before it is
-  claimed (roughly: an estimate over ~300 lines, or three or more deliverables).
+  claimed (roughly: an estimate over ~1000 lines including tests, or three or
+  more deliverables).
   Each sub-task is its own issue, with its own brief and its dependencies stated.
 - Task management is GitHub: the PR names its issue, and the issue is closed
   deliberately, with the handoff comment. Agents open, assign, comment on and
