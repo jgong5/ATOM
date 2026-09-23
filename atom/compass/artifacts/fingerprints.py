@@ -267,8 +267,8 @@ def differences(recorded: Fingerprint, current: Fingerprint) -> tuple[Mismatch, 
         raise ArtifactRefusal(
             Rule.NOT_COMPARABLE,
             f"`{recorded.row}` was fingerprinted over "
-            f"{', '.join(str(axis) for axis in recorded.axes) or 'nothing'} and "
-            f"and the matrix now rows it over "
+            f"{', '.join(str(axis) for axis in recorded.axes) or 'nothing'}, but "
+            "the matrix now rows it over "
             f"{', '.join(str(axis) for axis in current.axes) or 'nothing'}",
             "the matrix moved under this entry; re-measure it, because an "
             "entry checked against a column it never recorded is unchecked",
