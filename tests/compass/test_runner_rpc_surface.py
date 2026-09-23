@@ -75,7 +75,20 @@ class Site(NamedTuple):
 
 def _classes(path):
     tree = ast.parse(path.read_text())
+    for n in ast.walk(tree):
+        n.file = path.name
     return {n.name: n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+
+
+UNREAD_CLASS_BODY: list[str] = []
+
+
+def _is_docstring(n):
+    return (
+        isinstance(n, ast.Expr)
+        and isinstance(n.value, ast.Constant)
+        and isinstance(n.value.value, str)
+    )
 
 
 def _methods(node):
@@ -84,8 +97,11 @@ def _methods(node):
     A `def` and an `async def` bind a name the same way an assignment in the
     class body does, and the worker's `getattr` finds all three. A statement in
     the body that could bind a name some other way -- an `if`, a `try`, a
-    loop -- is refused rather than skipped, so a name bound there cannot pass
-    as absent.
+    loop, an expression such as `vars().update(...)` -- is recorded in
+    `UNREAD_CLASS_BODY` rather than skipped, and
+    `test_every_class_body_the_method_sets_are_read_from_is_read` names it.
+    Recorded, not raised: this runs at import, where a raise would stop every
+    module importing this one from collecting.
     """
     names = set()
     for n in node.body:
@@ -94,10 +110,9 @@ def _methods(node):
         elif isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             for target in n.targets if isinstance(n, ast.Assign) else [n.target]:
                 names |= {t.id for t in ast.walk(target) if isinstance(t, ast.Name)}
-        else:
-            assert isinstance(n, (ast.Expr, ast.Pass)), (
-                f"{node.name}:{n.lineno} binds names in a form not read here: "
-                f"{ast.unparse(n).splitlines()[0]}"
+        elif not isinstance(n, ast.Pass) and not _is_docstring(n):
+            UNREAD_CLASS_BODY.append(
+                f"{node.file}:{n.lineno}: {ast.unparse(n).splitlines()[0]}"
             )
     return names
 
@@ -137,8 +152,7 @@ def _arity(parent):
 
     `0` means the reply is discarded -- the broadcast is a bare statement and
     nothing can read what came back. `1` means it is used whole: bound to a
-    name, handed straight back to this function's own caller, or passed on as
-    an argument. Anything above `1` is a tuple unpack, which is the only shape
+    name, or handed straight back to this function's own caller. Anything above `1` is a tuple unpack, which is the only shape
     that fixes a length rather than just a type.
 
     `ast.Return` is the case worth naming, because reading only `ast.Assign`
@@ -146,13 +160,13 @@ def _arity(parent):
     is in fact the function's result -- `engine_core.py:749`, `dummy_execution`.
 
     Any other shape -- a list or starred target, an annotated one, a chained
-    target -- is scored `None` rather than `1`, which would read an unpack as a
+    target, an argument to another call -- is scored `None` rather than `1`, which would read an unpack as a
     use of the whole reply, and
     `test_every_reply_is_taken_in_a_shape_the_arity_reads` names its site.
     """
     if isinstance(parent, ast.Expr):
         return 0
-    if isinstance(parent, (ast.Return, ast.Call)):
+    if isinstance(parent, ast.Return):
         return 1
     target = parent.targets[0] if isinstance(parent, ast.Assign) else None
     if isinstance(target, ast.Name) and len(parent.targets) == 1:
@@ -281,6 +295,11 @@ def test_every_reply_is_taken_in_a_shape_the_arity_reads():
         f"{s.file}:{s.line}" for v in SITES.values() for s in v if s.arity is None
     ]
     assert unscored == [], f"replies taken in a shape not scored: {unscored}"
+
+
+def test_every_class_body_the_method_sets_are_read_from_is_read():
+    """A statement `_methods` could not read may bind a name it would miss."""
+    assert UNREAD_CLASS_BODY == [], f"class bodies not read: {UNREAD_CLASS_BODY}"
 
 
 def test_the_dispatched_names_outside_the_surface_belong_to_other_runners():
@@ -937,6 +956,13 @@ def test_what_the_comment_says_a_hole_at_exit_loses_is_what_exit_does():
         if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
     }
     assert {"destroy_dist_env", "torch.cuda.empty_cache"} <= calls
+    # And nothing leaves `exit` between them: its only ways out are the guard
+    # that opens it and the `return True` that closes it.
+    exits = sorted(
+        ast.unparse(n) for n in ast.walk(body) if isinstance(n, (ast.Return, ast.Raise))
+    )
+    assert exits == ["return", "return True"], f"exit leaves early: {exits}"
+    assert ast.unparse(body.body[-1]) == "return True"
     assert "`ModelRunner.exit` never runs" in comment
     assert "the distributed environment is never destroyed" in comment
     assert "`torch.cuda.empty_cache()` never runs" in comment
@@ -996,7 +1022,7 @@ def test_the_unanswered_helper_describes_its_whole_return_and_not_one_half():
     assert word is not None, f"no count word for {len(RPC_SURFACE)} names"
     assert f"all {word}" in doc
     # Called by bare name or through a module, both are a call; any other
-    # mention -- an alias, a `partial`, a callback -- is a caller this cannot
+    # mention -- an `import ... as`, a `partial`, a callback -- is a caller this cannot
     # follow, so it is refused rather than left out of the count.
     callers, unread = set(), []
     for f in sorted((REPO / "atom").rglob("*.py")):

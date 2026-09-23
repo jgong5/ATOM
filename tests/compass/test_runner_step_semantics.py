@@ -420,13 +420,20 @@ def _decorators(path, class_name, name):
     return [ast.unparse(d) for d in _function(path, class_name, name).decorator_list]
 
 
+# The methods the reply is handed to whole. `postprocess` reads it under
+# `fwd_output`, which the walk below sees; `send_tokens` pickles it and reads
+# nothing. A hand-off to any other method is refused: it would read the reply
+# under a name this walk does not follow.
+HANDED_TO = ("postprocess", "send_tokens")
+
+
 def _reply_attribute_reads():
     """Every attribute ATOM reads off a forward reply, from ATOM's own source.
 
     A read is `fwd_out.x` or `fwd_output.x`. The reply may also be handed on
-    whole -- passed positionally to a method, returned, or tested against
-    `None` -- which reads nothing here. Any other use of it, a `getattr`, an
-    alias, a call of a plain function on it, is refused by file and line: it
+    whole -- passed positionally to one of `HANDED_TO`, returned, or tested
+    against `None`. Any other use of it, a `getattr`, an alias, a hand-off to
+    any other function or method, is refused by file and line: it
     could read an attribute this set would never contain.
     """
     names, unread = set(), []
@@ -445,8 +452,8 @@ def _reply_attribute_reads():
                 isinstance(up, ast.Return)
                 or ast.unparse(up) == f"{node.id} is None"
                 or (
-                    isinstance(up, ast.Call)
-                    and isinstance(up.func, ast.Attribute)
+                    getattr(up, "func", None) is not None
+                    and getattr(up.func, "attr", None) in HANDED_TO
                     and node in up.args
                 )
             )

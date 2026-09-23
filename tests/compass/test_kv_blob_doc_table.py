@@ -74,8 +74,10 @@ def _blob_site(path: Path) -> list[ast.Assign]:
 def _writes_not_read(path: Path) -> list[str]:
     """Every write of the name `_blob_site` does not read, by line and source.
 
-    A `setattr`, an annotated or augmented assignment, the name inside a tuple
-    target, or the name as a string anywhere in the module.
+    An annotated or augmented assignment, the name inside a tuple target, the
+    name as a string anywhere in the module -- and any mention of `setattr`,
+    `__setattr__`, `__dict__` or `vars` at all, since a name built at run time
+    cannot be read and neither connector writes attributes that way.
     """
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -92,6 +94,8 @@ def _writes_not_read(path: Path) -> list[str]:
             and id(n) not in read
         )
         or (isinstance(n, ast.Constant) and n.value == BLOB_ATTR)
+        or getattr(n, "id", getattr(n, "attr", None))
+        in ("setattr", "__setattr__", "__dict__", "vars")
     ]
 
 

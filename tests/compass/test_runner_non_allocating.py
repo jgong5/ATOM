@@ -63,6 +63,8 @@ OVERRIDDEN = {
 
 def _classes(path):
     tree = ast.parse(path.read_text())
+    for n in ast.walk(tree):
+        n.file = path.name
     return {n.name: n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
 
 
@@ -185,6 +187,10 @@ def _method_def(node, name):
     )
 
 
+# Every name through which an attribute can be written without an assignment.
+_WRITERS = ("setattr", "__setattr__", "__dict__", "vars")
+
+
 def _on_self(node):
     return isinstance(node, ast.Attribute) and ast.unparse(node.value) == "self"
 
@@ -201,13 +207,13 @@ def _self_assigned(node, unreadable=()):
 
     Read in every spelling that states the name: a target of `=`, including
     one inside a tuple or list, of an annotated or augmented `=`, and
-    `setattr(self, "x", ...)`. Any other write -- a `for` or `with` target, a
-    `setattr` whose name is computed, anything through `__dict__` or `vars` --
-    binds something this cannot read. Each of those must be listed in
+    `setattr(self, "x", ...)`. Any other write -- a `for` or `with` target, and
+    every other mention of `setattr`, `__setattr__`, `__dict__` or `vars`,
+    however it is reached -- binds something this cannot read. Each of those must be listed in
     *unreadable* by its source text, or this refuses, so a spelling it cannot
     read fails here rather than leaving the set smaller than the class.
     """
-    bound, read, unread = set(), set(), []
+    bound, read = set(), set()
     for n in ast.walk(node):
         if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             for target in n.targets if isinstance(n, ast.Assign) else [n.target]:
@@ -217,24 +223,27 @@ def _self_assigned(node, unreadable=()):
                     read.add(id(t))
         elif (
             isinstance(n, ast.Call)
-            and ast.unparse(n.func) in ("setattr", "object.__setattr__", "vars")
-            and n.args
-            and ast.unparse(n.args[0]) == "self"
+            and ast.unparse(n.func) == "setattr"
+            and [ast.unparse(a) for a in n.args[:1]] == ["self"]
+            and len(n.args) == 3
+            and isinstance(n.args[1], ast.Constant)
+            and isinstance(n.args[1].value, str)
         ):
-            name = n.args[1] if len(n.args) == 3 else None
-            if isinstance(name, ast.Constant) and isinstance(name.value, str):
-                bound.add((name.value, ast.unparse(n.args[2])))
-            else:
-                unread.append((n.lineno, ast.unparse(n)))
-    unread += [
-        (n.lineno, ast.unparse(n))
+            bound.add((n.args[1].value, ast.unparse(n.args[2])))
+            read.add(id(n.func))
+    calls = {id(n.func): n for n in ast.walk(node) if isinstance(n, ast.Call)}
+    unread = [
+        (n.lineno, ast.unparse(calls.get(id(n), n)))
         for n in ast.walk(node)
-        if (_on_self(n) and isinstance(n.ctx, ast.Store) and id(n) not in read)
-        or (isinstance(n, ast.Attribute) and n.attr == "__dict__")
+        if id(n) not in read
+        and (
+            (_on_self(n) and isinstance(n.ctx, ast.Store))
+            or getattr(n, "id", getattr(n, "attr", None)) in _WRITERS
+        )
     ]
     assert sorted(text for _, text in unread) == sorted(unreadable), (
         f"{node.name} binds attributes on self in a form not read here: "
-        + "; ".join(f"line {line}: {text}" for line, text in sorted(unread))
+        + "; ".join(f"{node.file}:{line}: {text}" for line, text in sorted(unread))
         + f" -- listed as expected: {sorted(unreadable)}"
     )
     return bound
