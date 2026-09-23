@@ -53,7 +53,8 @@ both erases and fabricates -- row-parallel `all_reduce` becomes the identity and
 appears nowhere, while one `all_gather` becomes six dispatched ops over a
 half-zeros tensor -- so a TP2 inventory taken through it is not a TP2
 inventory. A sentinel sits over both bindings of it, but its one call site in
-ATOM is inside the method this capture's runner overrides, so today the
+ATOM (held by a scan of ATOM's source, not assumed) is inside the method this
+capture's runner overrides, so today the
 sentinel is a guard over a path the capture does not execute rather than an
 observation that ATOM at TP2 avoids it. What does observe the width is the
 group's own `world_size` and the collectives it issued.
@@ -98,9 +99,11 @@ the only one of the three not reachable from a capture-time substitution.
 
 from __future__ import annotations
 
+import ast
 import collections
 import contextlib
 import hashlib
+import inspect
 import json
 import os
 import pathlib
@@ -275,61 +278,55 @@ CUDA_NAMES_NEVER_READ = frozenset(
     }
 )
 
-# The concrete census's denominator, by family: the shape entries each family's
-# operators carry at each width. The concrete result is that none of these
-# entries is anything but an integer, and that sentence is only as good as the
-# count under it -- a family that stopped being recorded would read as a family
-# with no symbol in it. TP2 adds the collectives and, around them, a few
-# allocations, views, transfers and device reads; no family that decides a
-# step's cost moves.
-CONCRETE_SHAPE_ENTRIES = {
-    1: {
-        "activation": 608,
-        "allocation": 1897,
-        "attention": 704,
-        "bookkeeping": 87,
-        "elementwise": 1592,
-        "embedding": 5,
-        "gemm": 1542,
-        "normalisation": 2150,
-        "sampling": 10,
-        "transfer": 44,
-        "view": 3905,
-    },
-    2: {
-        "activation": 608,
-        "allocation": 1900,
-        "attention": 704,
-        "bookkeeping": 91,
-        "collective": 528,
-        "elementwise": 1592,
-        "embedding": 5,
-        "gemm": 1542,
-        "normalisation": 2150,
-        "sampling": 10,
-        "transfer": 56,
-        "view": 3921,
-    },
+# The families the concrete census is split into at each width. The concrete
+# result is that none of their entries is anything but an integer, and that
+# sentence is only as good as the count under it -- a family that stopped being
+# recorded would read as a family with no symbol in it. So the test holds which
+# families there are and that each carries entries, not how many: the counts
+# move with any change to ATOM's forward that leaves the inventory exactly as
+# concrete, one more view or one more elementwise operator per layer, and the
+# record reports them anyway.
+#
+# The price, chosen rather than missed: a recorder that loses *part* of a
+# family -- the GEMMs' input shapes, say, two thirds of that family's entries --
+# passes, because the family is still present and still counted. A family that
+# goes to zero, or a total that falls under the floor, does not.
+CONCRETE_FAMILIES = {
+    1: frozenset(
+        {
+            "activation",
+            "allocation",
+            "attention",
+            "bookkeeping",
+            "elementwise",
+            "embedding",
+            "gemm",
+            "normalisation",
+            "sampling",
+            "transfer",
+            "view",
+        }
+    ),
 }
+CONCRETE_FAMILIES[2] = CONCRETE_FAMILIES[1] | {"collective"}
 
 # What the census reads on the symbolic probe, keyed by whether site one is
-# simulated closed: the non-integer shape entries by family, and the operators
-# carrying one. 26 entries, and 32 with the repair, which adds one `copy_` and
-# the slices and device read around it.
+# simulated closed: the families carrying a non-integer shape entry, and the
+# operators carrying one. Kinds, not counts.
 #
 # This is the positive half of the concrete result. The concrete census reads
 # zero, and a census that could not tell a symbol from a number would read zero
-# too; these are the same census reading what it is there to find.
-#
-# Exact rather than bounded, because every one of these entries is on a staging
-# path -- `CpuGpuBuffer.copy_to_gpu`, `_copy_mrope_to_gpu` and
-# `_mrope_positions_view` -- and none is on a model layer. They are the same at
-# TP2, where the operator set grows by 141 operators and five kinds, and they
-# are unchanged by adding an operator to every linear-attention layer. They move
-# when staging changes, which is also when the specialisation sites move.
-PROBE_NON_NUMERIC = {
-    False: {"bookkeeping": 17, "view": 9},
-    True: {"bookkeeping": 18, "transfer": 3, "view": 11},
+# too; these are the same census reading what it is there to find. It reads 26
+# entries today, and 32 with the repair, but those are not held: a staging
+# refactor that behaves identically -- `reshape` for `view` on a contiguous
+# buffer in `_copy_mrope_to_gpu` -- moves 26 to 27 while every site and line
+# pin in this file holds. What holds the detector instead is the loops that
+# count it, read against each other. That refactor still fails the probe test,
+# at the operator list: the `reshape` stops being dispatched, so the kinds
+# carrying a symbol change, and a change of kind is what this list is for.
+PROBE_FAMILIES = {
+    False: frozenset({"bookkeeping", "view"}),
+    True: frozenset({"bookkeeping", "transfer", "view"}),
 }
 PROBE_NON_NUMERIC_OPS = {
     False: [
@@ -1000,8 +997,11 @@ def _watch_simulated_tp(tree_root):
     `ModelRunner._setup_device_and_distributed`, and `_build_runner` overrides
     that method, so no capture can reach the call and the list is empty by
     construction. Replacing the sentinel's body with `raise SystemExit` leaves
-    every test here passing. It fires only if ATOM comes to call the function
-    from a path this capture does execute.
+    every capture test passing. It fires only if ATOM comes to call the function
+    from a path this capture does execute. That ATOM has one call site, and
+    that it is the overridden method, is held by a scan of ATOM's source in
+    `test_apply_simulated_tp_is_called_only_where_the_capture_does_not_go`, so
+    a second caller fails there even where the sentinel cannot see it.
     """
     from atom.distributed import simulated_tp
     from atom.model_engine import model_runner
@@ -2101,7 +2101,8 @@ def test_the_width_is_the_group_s_and_nothing_simulated_it():
     measurement half of this test.
 
     `apply_simulated_tp_calls` is the other half, and **it is a forward guard,
-    not an observation about ATOM at TP2 today.** ATOM's one call site is in
+    not an observation about ATOM at TP2 today.** ATOM's one call site -- held
+    by the source scan in the next test -- is in
     `ModelRunner._setup_device_and_distributed`, which `_build_runner`
     overrides, so the list cannot be anything but empty: a sentinel whose body
     is `raise SystemExit` leaves this test passing. It earns its place against
@@ -2116,6 +2117,44 @@ def test_the_width_is_the_group_s_and_nothing_simulated_it():
     for record in (capture(1), capture(2), capture(1, symbolic=True)):
         assert record["tp_group_world_size"] == record["tp"]
         assert record["apply_simulated_tp_calls"] == []
+
+
+def test_apply_simulated_tp_is_called_only_where_the_capture_does_not_go():
+    """The premise under the sentinel, held by reading ATOM rather than stated.
+
+    The sentinel in `_watch_simulated_tp` is a forward guard because ATOM calls
+    `apply_simulated_tp` from exactly one method, and `_build_runner` overrides
+    that method. Nothing checked the first half: a second call site in another
+    overridden method would leave every capture test green and the account
+    false. So every call to the name, anywhere under `atom/`, is listed with the
+    function it sits in, and the list is held.
+
+    Calls are matched by name, as a bare name or as an attribute, which is how
+    both bindings of it are spelled. A call through an alias under another name
+    would not be seen.
+    """
+    tree_root = pathlib.Path(__file__).resolve().parents[2]
+    scanned = 0
+    callers = set()
+    for path in sorted((tree_root / "atom").rglob("*.py")):
+        scanned += 1
+        module = ast.parse(path.read_text(), filename=str(path))
+        for function in ast.walk(module):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call):
+                    continue
+                called = getattr(node.func, "id", getattr(node.func, "attr", None))
+                if called == "apply_simulated_tp":
+                    rel = path.relative_to(tree_root).as_posix()
+                    callers.add((rel, function.name))
+    assert scanned > 100
+    assert callers == {
+        ("atom/model_engine/model_runner.py", "_setup_device_and_distributed")
+    }
+    # And that method is the one the capture's runner replaces.
+    assert "def _setup_device_and_distributed" in inspect.getsource(_build_runner)
 
 
 def test_atom_s_own_buffer_constructor_is_what_runs():
@@ -2260,18 +2299,21 @@ def test_the_inventory_is_concrete_at_both_widths():
     sentence that stops anyone evaluating one anywhere else.
 
     A zero is a fraction, and both halves are held. The denominator is held by
-    family, so "none of the GEMM entries is symbolic" names how many GEMM
-    entries there are; the total's floor stays beside it, so a recorder that
-    stopped recording cannot read as a concrete one. The numerator's zero is
-    held by the test after this one, which shows the same census reading a
-    number other than zero when there is a symbol to read.
+    family: which families there are, that each carries entries, and that they
+    add up to the total, so "none of the GEMM entries is symbolic" is about
+    GEMM entries that were recorded. The total's floor stays beside it, so a
+    recorder that stopped recording cannot read as a concrete one. The counts
+    themselves are not held; `CONCRETE_FAMILIES` says why and what that costs.
+    The numerator's zero is held by the test after this one, which shows the
+    same census reading a number other than zero when there is a symbol to read.
     """
     for tp in (1, 2):
         record = capture(tp)
         assert record["shape_entries"] > 10000
         census = record["family_census"]
         by_family = {family: row["shape_entries"] for family, row in census.items()}
-        assert by_family == CONCRETE_SHAPE_ENTRIES[tp], tp
+        assert set(by_family) == CONCRETE_FAMILIES[tp], tp
+        assert all(entries > 0 for entries in by_family.values()), (by_family, tp)
         assert sum(by_family.values()) == record["shape_entries"], tp
         assert record["non_numeric_shape_entries"] == 0
         assert record["non_numeric_ops"] == []
@@ -2283,17 +2325,18 @@ def test_the_census_counts_the_symbols_the_probe_leaves():
     """The concreteness detector, read where there is something to detect.
 
     The concrete inventory's census is zero, and zero is also what a census
-    returns when it cannot tell a symbol from a number. So the same three
-    readings -- the total, the family split and the operators carrying one --
-    are held on the symbolic probe, which leaves a known handful of symbols
-    free on staging views: 26 entries, and 32 with site one simulated closed.
-    Each reading comes from its own loop over the inventory, and each is
-    asserted, so a loop that stopped discriminating fails here by name rather
-    than agreeing with the concrete zero.
+    returns when it cannot tell a symbol from a number. So the census is read
+    on the symbolic probe, which leaves a handful of symbols free on staging
+    views, and its four loops over the inventory are held against each other:
+    the total (`shape_census`), the family split (`family_census`), the
+    operators carrying one (`non_numeric_ops`) and the call sites where they
+    were dispatched (`symbolic_sites`). Each is counted separately, so a loop
+    that stops discriminating disagrees with the others, or reads zero where
+    the kinds below say there is something, and fails here by name rather than
+    agreeing with the concrete zero.
 
-    The totals are the sum of the family split, not a third literal: the two
-    are counted separately in the record, and holding one against the other is
-    what says the split is the whole of the total.
+    Kinds are held and counts are not: which families and which operators
+    carry a symbol, not how many entries. `PROBE_FAMILIES` says why.
     """
     for repaired in (False, True):
         record = capture(1, symbolic=True, repair_site_one=repaired)
@@ -2303,9 +2346,43 @@ def test_the_census_counts_the_symbols_the_probe_leaves():
             for family, row in census.items()
             if row["non_numeric_shape_entries"]
         }
-        assert by_family == PROBE_NON_NUMERIC[repaired], repaired
-        assert record["non_numeric_shape_entries"] == sum(by_family.values())
+        assert set(by_family) == PROBE_FAMILIES[repaired], repaired
+        total = record["non_numeric_shape_entries"]
+        assert total == sum(by_family.values()) > 0, repaired
         assert record["non_numeric_ops"] == PROBE_NON_NUMERIC_OPS[repaired]
+        # Operator by operator, the family loop and the call-site loop count
+        # the same dispatches.
+        from_families = collections.Counter()
+        for row in census.values():
+            from_families.update(row["ops_carrying_a_symbol"])
+        from_sites = collections.Counter()
+        for entry in record["symbolic_sites"]:
+            from_sites[entry["op"]] += entry["n"]
+        assert from_families == from_sites, repaired
+        assert sorted(from_families) == record["non_numeric_ops"], repaired
+
+
+def test_the_census_counts_an_expression_as_a_symbol():
+    """A dimension is numeric only if it is an integer; an expression is not.
+
+    Which expressions the probe happens to produce is a property of ATOM's
+    staging, not of the census, so the rule is held here on a recorder built
+    by hand, with no capture: a negative integer is a number, and each
+    expression -- `2*s0`, `s0 + 1` -- is one non-numeric entry. A detector
+    narrowed to "starts with s" fails here whatever the probe produces.
+    """
+    recorder = _Recorder(pathlib.Path(__file__).resolve().parents[2], COLLECTIVE_OPS)
+    recorder.ops = [
+        ("aten.view.default", [["2*s0", "4"]], [["s0 + 1"]]),
+        ("aten.add.Tensor", [["-1", "8"]], []),
+    ]
+    assert recorder.shape_census() == (5, 2)
+    assert recorder.non_numeric_ops() == ["aten.view.default"]
+    census = recorder.family_census()
+    assert census["view"]["non_numeric_shape_entries"] == 2
+    assert census["elementwise"]["non_numeric_shape_entries"] == 0
+    assert _Recorder._carries_symbol([["2*s0", "4"]], [])
+    assert not _Recorder._carries_symbol([["-1", "8"]], [])
 
 
 def test_the_first_two_specialisation_sites_are_where_they_were_measured():
