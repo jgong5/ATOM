@@ -92,6 +92,23 @@ EXTENT = re.compile(r"T\d+ ?[-–—‒−] ?T\d+")
 # the documents read here name `D92`, `M1`, `TP4`, `W3` and `P0` as well, and
 # `D4 and D6 are open` is the class the `D6 open issue` row below is pinned to
 # protect. So the class is every letter: digits glued to one are an identifier.
+# It is also `-`, `_` and `/`, because a digit glued to a separator is an
+# identifier's tail just as surely: without them `TP2/4/8 are open` refused as
+# `8 are open` and `tier-0 and tier-1 are open` as `1 are open`, while `T99 and
+# T100 are open` was already legal. Both tokens are live text in six of the 18
+# documents in `design/`, four of which this scan reaches, so neither refusal
+# was invented vocabulary. What all three separators cost is a count with no
+# space after one: `-81 are open`, `_81 are open` and `/81 are open` all pass
+# now. Nothing writes a count that way -- a markdown bullet keeps its space and
+# `blocks` flattens the line break to another, so `- 81 are open` still refuses
+# -- but one of the three forms carries register content rather than a bare
+# count. `T1-87 are open` is a range with its prefix written once, so it
+# restates the register's extent, and after this widening nothing reads it:
+# `EXTENT` wants `T` on both endpoints, and the narrower class had been refusing
+# it only by accident, as `87 are open`. It stays latent because no document
+# writes a prefix-once range -- every extent here writes `T` twice -- and
+# because the same restatement spaced, `The register holds T1-87; 81 are
+# open.`, still refuses.
 #
 # `N TODOs` and `N are open` reach wider than the register -- they refuse `The
 # adapter still carries 4 TODOs` and `Of the five probes, 3 are open` -- and are
@@ -101,7 +118,7 @@ EXTENT = re.compile(r"T\d+ ?[-–—‒−] ?T\d+")
 # sentence occurs in `design/`; the remedy for a false refusal is to write the
 # sentence another way, never an exemption.
 COUNT = re.compile(
-    r"(?<![A-Za-z\d.])\d+ (?:registered (?:TODOs|items)|open items|TODOs|are open)"
+    r"(?<![A-Za-z\d./_-])\d+ (?:registered (?:TODOs|items)|open items|TODOs|are open)"
 )
 
 # Quoted from the documents this scan reaches. Each is a number or a run of ids
@@ -400,6 +417,23 @@ def test_the_scan_reaches_every_design_document_but_those_two():
 @pytest.mark.parametrize("phrase", LEGITIMATE + LISTED)
 def test_counting_something_other_than_the_register_is_not_a_figure(phrase):
     assert not EXTENT.search(phrase) and not COUNT.search(phrase)
+
+
+# Quoted from the documents as tokens, not as sentences: `TP2/4/8` and `tier-0`
+# are live text, and these are the sentences an author reaching for either would
+# write. The first two read as counts until the separators joined `COUNT`'s
+# lookbehind class and are the reason they did; the third was legal already and
+# holds that half of the boundary. Narrowing the class back fails this by name.
+GLUED = (
+    "TP2/4/8 are open",
+    "tier-0 and tier-1 are open",
+    "T99 and T100 are open",
+)
+
+
+@pytest.mark.parametrize("phrase", GLUED)
+def test_a_digit_glued_to_a_separator_is_part_of_an_identifier(phrase):
+    assert not COUNT.search(phrase)
 
 
 def test_a_range_is_an_extent_in_every_dash_these_documents_write():
