@@ -59,7 +59,7 @@ Three sites, in an order rather than a set. A free symbol is solved by whichever
 line reaches it first, so repairing one does not always close what it solved:
 closing the first moves the caller's bound into an ATOM assertion helper in
 another file and a later phase of the step -- `forward_context.py`, reached
-from the `run_model` call at `model_runner.py:3254`, with `prepare_inputs`
+from the `run_model` call at `model_runner.py:3281`, with `prepare_inputs`
 already returned. The plain symbolic pass records the first two; a third pass
 simulates the first closed, from outside ATOM, and records what is behind it.
 All three are pinned, and there is no claim that three is all there are -- only
@@ -185,7 +185,7 @@ ROW_PARALLEL = (
 )
 VOCAB_EMBEDDING = "atom/model_ops/embed_head.py:175 in forward"
 VOCAB_LM_HEAD = "atom/model_ops/embed_head.py:257 in forward"
-SAMPLER = "atom/model_engine/model_runner.py:3138 in postprocess"
+SAMPLER = "atom/model_engine/model_runner.py:3165 in postprocess"
 
 # Where a free symbol stops being free, each as the value it takes and the
 # innermost ATOM frames it takes it through. Three, not two, and in this order:
@@ -411,12 +411,12 @@ EXPECTED_HOST_RESOLUTIONS = {
     "atom/model_ops/attentions/aiter_attention.py:1123 in prepare_decode": 2,
     "atom/model_ops/attentions/aiter_attention.py:1131 in prepare_decode": 1,
     "atom/model_ops/attentions/aiter_attention.py:1132 in prepare_decode": 2,
-    "atom/model_engine/model_runner.py:2441 in prepare_inputs": 1,
-    "atom/model_engine/model_runner.py:2452 in prepare_inputs": 2,
-    "atom/model_engine/model_runner.py:2454 in prepare_inputs": 1,
+    "atom/model_engine/model_runner.py:2468 in prepare_inputs": 1,
+    "atom/model_engine/model_runner.py:2479 in prepare_inputs": 2,
+    "atom/model_engine/model_runner.py:2481 in prepare_inputs": 1,
     "atom/model_engine/model_runner.py:510 in prepare_input_ids": 1,
     "atom/model_engine/model_runner.py:513 in prepare_input_ids": 1,
-    "atom/model_engine/model_runner.py:2537 in prepare_sample": 1,
+    "atom/model_engine/model_runner.py:2564 in prepare_sample": 1,
     "atom/model_ops/attentions/backends.py:398 in _mrope_cpu_view": 1,
     "atom/model_ops/attentions/backends.py:400 in _mrope_cpu_view": 1,
     "atom/model_ops/attentions/gdn_attn.py:1237 in _attach_gdn_decode_metadata": 1,
@@ -2103,7 +2103,7 @@ def test_closing_site_one_moves_the_bound_to_a_third_site():
     survives `:1115` and is solved in another file and a later phase of the
     step, inside ATOM's own shape-contract assertion: `forward_context.py:444
     in assert_shape_contract`, reached from the `run_model` call at
-    `model_runner.py:3254`, with `prepare_inputs` already returned -- not
+    `model_runner.py:3281`, with `prepare_inputs` already returned -- not
     fourteen lines after `aiter_attention.py:1115`.
 
     The second site is untouched by the repair, exactly as recorded.

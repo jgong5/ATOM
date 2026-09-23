@@ -272,16 +272,19 @@ def test_what_that_ring_costs_is_the_batch_budget_by_the_hidden_size():
 def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
     """The half of the claim that is this package's own: it adds none.
 
-    `model` registers no parameter and no buffer, and `_token_stream` is the
-    deferral bookkeeping `forward` builds on first use. Anything else appearing
-    here is a tensor this class put on a device, which is the thing it exists
-    not to do. The class docstring is held to the same two, by the mirror of
-    test 1's last two lines: the enumeration in the prose and the bindings in
-    the source fail together rather than drifting apart.
+    `model` registers no parameter and no buffer, `_token_stream` is the
+    deferral bookkeeping `forward` builds on first use, and `kv_pool_sizing`
+    is a `SizedKVPool` -- a count, a name-to-count table and the readings --
+    built in a package whose whole import closure `test_kv_budget.py` holds
+    free of any tensor library. Anything else appearing here is a tensor this
+    class put on a device, which is the thing it exists not to do. The class
+    docstring is held to the same three, by the mirror of test 1's last two
+    lines: the enumeration in the prose and the bindings in the source fail
+    together rather than drifting apart.
     """
     overrides = _classes(PACKAGE / "overrides.py")["NonAllocatingRunner"]
     bound = {n for n, _ in _self_assigned(overrides)}
-    assert bound == {"model", "_token_stream"}
+    assert bound == {"model", "_token_stream", "kv_pool_sizing"}
     runner = _classes(PACKAGE / "model_runner.py")["CompassModelRunner"]
     assert all(f"`{name}`" in ast.get_docstring(runner) for name in bound)
 

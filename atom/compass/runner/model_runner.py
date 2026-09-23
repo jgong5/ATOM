@@ -36,8 +36,12 @@ class CompassModelRunner(NonAllocatingRunner, ModelRunner):
     process: `forward_vars`, the dict `allocate_forward_vars` builds, and
     `_fv_ring`, the list of per-slot dicts built from it. Both are the base's.
     What this class adds is no tensor at all: `model`, a module registering no
-    parameter and no buffer, and `_token_stream`, the deferral bookkeeping
-    `forward` builds on first use. It also sets `config.num_kvcache_blocks`,
+    parameter and no buffer; `_token_stream`, the deferral bookkeeping
+    `forward` builds on first use; and `kv_pool_sizing`, the block count
+    `get_num_blocks` answered, kept beside the readings it was sized from.
+    Those readings come from `atom.compass.memory`, whose whole import closure
+    reaches no tensor library, and `install_device_readings` puts them on the
+    runner as `compass_readings`. It also sets `config.num_kvcache_blocks`,
     which is a count and not a buffer.
 
     `NonAllocatingRunner` comes first so its methods win over the base's. There
