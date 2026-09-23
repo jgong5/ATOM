@@ -238,16 +238,71 @@ def test_a_root_carrying_both_populations_is_read(tmp_path, capsys):
     """
     assert detector.main(_fixture_tree(tmp_path)) == 0
     out = capsys.readouterr().out
-    assert "SHARP  (>= 2 matching raise sites in ONE function): 1" in out
     assert "production refusals stating no text:  1" in out
     assert "  ! atom/compass/opaque.py:3  no text in any argument (Name)" in out
 
 
-def test_a_wrong_argument_count_is_refused_with_a_usage_line():
+def test_a_broad_flag_is_printed_with_every_site_it_matched(tmp_path, capsys):
+    assert detector.main(_fixture_tree(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "BROAD  (needle matches >= 2 production raise sites): 1" in out
+    assert (
+        "  tests/compass/sample.py:6  'do not divide across' -> "
+        "atom/compass/sample.py:4, atom/compass/sample.py:5\n"
+    ) in out
+
+
+def test_a_sharp_flag_is_printed_with_its_function_and_lines(tmp_path, capsys):
+    assert detector.main(_fixture_tree(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "SHARP  (>= 2 matching raise sites in ONE function): 1" in out
+    assert "  tests/compass/sample.py:6  'do not divide across'\n" in out
+    assert "      atom/compass/sample.py::kv_heads_per_rank at 4, 5\n" in out
+
+
+# A refusal sharing the fixture needle's words, for a package two levels down.
+NESTED_ROWS = """
+def block_rows(rows, ranks):
+    raise ValueError(f"{rows} rows do not divide across {ranks} ranks")
+"""
+
+
+def test_modules_in_nested_packages_are_read(tmp_path, capsys):
+    """Both walks recurse: a raise site and a needle two directories below
+    `atom/compass/` and `tests/compass/` are counted and printed like the rest.
+    A walk that stops at the top directory drops them without a word."""
+    root = _fixture_tree(tmp_path)
+    for part, name, source in (
+        ("atom", "rows.py", NESTED_ROWS),
+        ("tests", "test_rows.py", RENDERED_NEEDLE),
+    ):
+        package = root / part / "compass" / "sub" / "pkg"
+        package.mkdir(parents=True)
+        (package / name).write_text(source)
+    assert detector.main(root) == 0
+    out = capsys.readouterr().out
+    assert (
+        "  tests/compass/sample.py:6  'do not divide across' -> "
+        "atom/compass/sample.py:4, atom/compass/sample.py:5, "
+        "atom/compass/sub/pkg/rows.py:3\n"
+    ) in out
+    assert (
+        "  ! tests/compass/sub/pkg/test_rows.py:7  not a string constant (JoinedStr)\n"
+    ) in out
+
+
+@pytest.mark.parametrize("extra", [False, True], ids=["none", "two"])
+def test_a_wrong_argument_count_is_refused_with_a_usage_line(tmp_path, extra):
     """The root is a hand-typed argument, so omitting it must say what to type
-    rather than raise `IndexError` out of `sys.argv` with no word about why."""
+    rather than raise `IndexError` out of `sys.argv` with no word about why.
+    A second argument is refused too: the tool would read the first and ignore
+    the rest, reporting over a root the caller may not have meant."""
+    argv = [str(_fixture_tree(tmp_path)), "extra"] if extra else []
     done = subprocess.run(
-        [sys.executable, str(TOOL)], capture_output=True, text=True, check=False
+        [sys.executable, str(TOOL), *argv],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert done.returncode == 2
     assert done.stderr.startswith("usage: ")
