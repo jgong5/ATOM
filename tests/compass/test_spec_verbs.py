@@ -213,10 +213,10 @@ def without(body, *path):
 
 
 def test_two_hosts_in_one_spec_are_refused_and_both_provenances_are_named():
-    # The named result. Two tokenizers measured on two machines contradict
-    # nothing in their shape: different identities, different entries, no field
-    # of one overlapping a field of the other. Only the stanzas differ, so only
-    # the stanzas can catch it.
+    # Two tokenizers measured on two machines contradict nothing in their
+    # shape: different identities, different entries, no field of one
+    # overlapping a field of the other. Only the stanzas differ, so only the
+    # stanzas can catch it.
     here = fragment("tokenizer-a", TIER0, machine="node-18", authored_by="ana")
     elsewhere = fragment(
         "tokenizer-b",
@@ -601,8 +601,8 @@ def test_a_clear_check_says_which_conditions_it_could_not_ask():
 
 def test_the_transfer_condition_names_itself_as_unaskable_of_a_document():
     # The same spec is refused as a `Merge` and clear as the document it makes,
-    # because the source's pin is deliberately in no field of the document. The
-    # verb the design writes takes a file, so the document must say as much.
+    # because the source's pin is deliberately in no field of the document. A
+    # spec checked from a file is a document, so the document must say as much.
     carried = copy.deepcopy(TIER2)
     carried["device"]["software_pinned_to"] = dict(STACK, rocm="7.0.2")
     combination = merge(
@@ -913,7 +913,7 @@ def test_each_condition_in_the_check_set_is_earned_by_a_spec(condition):
 
 
 def test_a_document_reaches_what_the_package_says_a_document_reaches():
-    # The verb the design writes takes a file, so this is the form that gets
+    # A spec checked from a file is a document, so this is the form that gets
     # weaker: a transfer's source pin is in no field of a document however it
     # was built. What the package states it reaches is a value, and this holds
     # a run's own record to that value rather than to a sentence -- so a
@@ -1366,9 +1366,9 @@ def test_an_entry_without_the_derate_its_rates_oblige_is_refused_here(tmp_path):
     assert refused.value.rule is Rule.DERATE
 
 
-def test_the_pair_this_closes_merged_cleanly_before_the_counts_were_emitted():
-    # The control the named result is measured against: what the tokenizer
-    # probe emitted before it wrote the processor down -- the rates and the
+def test_the_pair_merged_cleanly_before_the_counts_were_emitted():
+    # The control for the next test: what the tokenizer probe emitted before
+    # it wrote the processor down -- the rates and the
     # stanza, and no field the node's own fragment also states. Nothing in
     # their shape says the two were measured on different processors, so the
     # merge has nothing to compare and combines them into one document.
@@ -1387,8 +1387,8 @@ def test_the_pair_this_closes_merged_cleanly_before_the_counts_were_emitted():
 
 
 def test_the_probes_counts_refuse_the_pair_that_used_to_merge(tmp_path):
-    # The named result. The same two fragments, with the tokenizer one built by
-    # the probe on a host of 8 physical cores instead of written out by hand.
+    # The same two fragments as the control above, with the tokenizer one
+    # built by the probe on a host of 8 physical cores instead of by hand.
     # It now states a field the node's fragment also states, and one machine
     # cannot have both counts, so the merge refuses and prints both.
     laptop = tokenizer_fragment(
@@ -1536,9 +1536,9 @@ def test_the_widest_honest_reading_at_every_width_is_accepted(tp_width):
 
 
 def test_the_spread_this_hardware_shows_is_reported_and_not_folded_away():
-    # The first half of the named result: eight ranks of one group, the widest
-    # honest spread this hardware shows, kept as the smallest reading with the
-    # disagreement reported beside it rather than reduced to one number.
+    # Eight ranks of one group, the widest honest spread this hardware shows,
+    # kept as the smallest reading with the disagreement reported beside it
+    # rather than reduced to one number.
     measured = non_torch_across_ranks(8, ranks_of(8, 10704 * MIB, 640 * MIB), 11.2e9)
     assert measured.minimum == 10704 * MIB
     assert measured.spread == 640 * MIB
@@ -1546,7 +1546,7 @@ def test_the_spread_this_hardware_shows_is_reported_and_not_folded_away():
 
 
 def test_a_card_every_rank_shares_with_one_neighbour_is_refused_by_name():
-    # The second half of the named result. Every rank reads the neighbour that
+    # What the cross-rank check cannot see. Every rank reads the neighbour that
     # killed six engine starts, so they agree to the byte and the cross-rank
     # check is silent; the absolute one names the reading and the ceiling.
     crowded = ranks_of(8, 152.01e9)

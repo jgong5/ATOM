@@ -53,8 +53,8 @@ What the limit asserts is that the machine was quiet enough for any rank to be
 believed at all -- a quietness assertion, not an error bar -- and a tighter one
 would only refuse readings whose minimum was fine. And it is **differential**,
 so it cannot see common-mode contamination: eight ranks each reading 2.5 GB high
-have a spread of zero and carry the 2.5 GB into the spec unremarked. The design
-pairs this check with an absolute one -- refuse a reading that far exceeds what
+have a spread of zero and carry the 2.5 GB into the spec unremarked. So this
+check needs an absolute one beside it -- refuse a reading that far exceeds what
 the collective terms predict for its width -- and the two are only jointly
 sufficient. That one needs a probe to have read `free` and `total` separately,
 so it is not here: it sits beside the readings themselves, where `free` and

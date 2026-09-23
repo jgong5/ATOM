@@ -51,13 +51,13 @@ exists to refuse. The sharpest case is the transfer: its source's pin is in no
 field of the merged document, by the decision below, so `validate(document)`
 can never ask that condition however the document was built, and the same spec
 is refused as a `Merge` and clear as a document. That is not a wrong number,
-but it must be visible, because the verb the design writes -- `compass spec
+but it must be visible, because checking a file -- `compass spec
 validate machine.yaml` -- is the form that cannot ask it. `CONDITIONS` is what
 a count of reach is a count of; a condition added to the check set and not to
 it is one no result can report on.
 
 **The reach of that form is `ASKABLE_OF_A_DOCUMENT`, which is a value and not a
-sentence.** Writing the number down in prose here puts a reviewer between the
+sentence.** Writing the number down in prose here puts a reader between the
 check set and the statement about it: the set changes, nobody rereads the
 paragraph, and the package goes on claiming a reach it no longer has. So the
 statement is the tuple below, a run's own `not_asked` is asserted against it,
