@@ -248,13 +248,13 @@ def test_the_engine_id_is_the_label_the_host_invents_and_nothing_else():
 def test_the_ranks_the_router_reads_are_numbers(geometry):
     """The router drops `dp_rank` unless it is a number, and says nothing.
 
-    Driven through the connector from a config carrying the widths as text,
-    because that is the only place they can arrive as anything but an int:
-    the request does not carry them, and handing `transfer_params` two
-    literal ints asserts nothing the cast is responsible for. A config field
-    filled from an environment variable or a JSON file is a string, and the
-    failure it causes is silent -- the router substitutes its own registry
-    value for the prefilling worker rather than refusing the blob.
+    Driven through the connector from a config carrying the widths as floats
+    with no fractional part, because handing `transfer_params` two literal
+    ints asserts nothing the conversion is responsible for. A whole float is
+    converted to an `int` on the way in; text is refused, which the test
+    below pins. A rank that went out as anything but a number would fail
+    silently -- the router substitutes its own registry value for the
+    prefilling worker rather than refusing the blob.
     """
     blob = simulated_blob(tp_size=8, dp_rank=3)
     assert isinstance(blob["dp_rank"], int) and blob["dp_rank"] == 3
@@ -264,8 +264,8 @@ def test_the_ranks_the_router_reads_are_numbers(geometry):
         model_for(geometry, PEAKS[0]),
         lambda: ISSUE_AT,
         role="scheduler",
-        tp_size="8",
-        dp_rank="3",
+        tp_size=8.0,
+        dp_rank=3.0,
     )
     seq = finished_sequence()
     scheduler.request_finished(seq)
@@ -288,6 +288,9 @@ def test_the_ranks_the_router_reads_are_numbers(geometry):
         pytest.param("tp_size", False, id="tp_size-false"),
         pytest.param("dp_rank", True, id="dp_rank-true"),
         pytest.param("dp_rank", False, id="dp_rank-false"),
+        pytest.param("tp_size", "8", id="tp_size-integer-text"),
+        pytest.param("dp_rank", "3", id="dp_rank-integer-text"),
+        pytest.param("tp_size", " 8 ", id="tp_size-padded-text"),
     ],
 )
 def test_a_width_that_is_not_a_whole_number_is_refused_by_name(geometry, field, value):
@@ -296,9 +299,9 @@ def test_a_width_that_is_not_a_whole_number_is_refused_by_name(geometry, field, 
     Refused when the connector is built, so a malformed config never serves a
     request. Casting 8.5 to 8 would emit a blob for a deployment that was
     never launched, and nothing reading it could tell. A `bool` is an `int` to
-    Python and would go out as a width of 1 or 0. Text that `int` does not
-    read as an integer literal is refused rather than read as a float, which
-    would take "1e1" as 10.
+    Python and would go out as a width of 1 or 0. Text is refused whatever it
+    spells, "8" included: ATOM's launch path parses its widths with `int`, so
+    reading text would be a conversion no launch needs.
     """
     widths = {"tp_size": 8, "dp_rank": 3, field: value}
     with pytest.raises(ValueError, match=f"^{field} is .*not a whole number"):
@@ -307,32 +310,9 @@ def test_a_width_that_is_not_a_whole_number_is_refused_by_name(geometry, field, 
         )
 
 
-def test_a_width_in_text_keeps_its_exact_value(geometry):
-    """Text is read as an integer, never through a float that rounds it.
-
-    2**53 + 1 is the smallest integer a float cannot hold, so read through a
-    float it would go out as 2**53: a value changed on the way to an `int`.
-    """
-    exact = 2**53 + 1
-    scheduler = connector(
-        model_for(geometry, PEAKS[0]),
-        lambda: ISSUE_AT,
-        role="scheduler",
-        tp_size=str(exact),
-        dp_rank=str(exact),
-    )
-    seq = finished_sequence()
-    scheduler.request_finished(seq)
-    relayed = seq.kv_transfer_params_output
-    assert relayed["tp_size"] == exact, f"tp_size went out as {relayed['tp_size']}"
-    assert relayed["dp_rank"] == exact, f"dp_rank went out as {relayed['dp_rank']}"
-
-
-@pytest.mark.parametrize(
-    "value", [8, "8", 8.0, " 8 "], ids=["int", "text", "float", "padded"]
-)
-def test_a_whole_width_is_taken_whatever_it_is_spelled_as(geometry, value):
-    """The refusal above is not of integer text or of a float with no fraction."""
+@pytest.mark.parametrize("value", [8, 8.0], ids=["int", "float"])
+def test_a_whole_width_is_taken_as_an_int_or_a_whole_float(geometry, value):
+    """The refusal above is not of an `int` or of a float with no fraction."""
     scheduler = connector(
         model_for(geometry, PEAKS[0]),
         lambda: ISSUE_AT,
