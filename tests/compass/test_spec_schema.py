@@ -42,6 +42,7 @@ its own sentence and to deny the others', so swapping any two fails these tests.
 import ast
 import copy
 import pathlib
+import sys
 import warnings
 
 import pytest
@@ -54,11 +55,14 @@ from atom.compass.spec import (
     SCHEMA_VERSION,
     Backend,
     FingerprintMismatch,
+    Fragment,
     Kind,
     MachineSpec,
     Rule,
     SpecRefusal,
     StackMismatch,
+    explain,
+    validate,
 )
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -391,12 +395,43 @@ BREAKAGES = {
 }
 
 
-def _site_of(refusal):
-    """The file and line of the `raise` a refusal came from."""
-    frame = refusal.__traceback__
-    while frame.tb_next is not None:
-        frame = frame.tb_next
-    return pathlib.Path(frame.tb_frame.f_code.co_filename).name, frame.tb_lineno
+#: The same rule named by the verbs other than the reader, each driven through
+#: the verb that declines. Not part of the edit-then-read claim below, which is
+#: about what this reader goes on to read; here only so the partition covers
+#: every site the package has rather than the reader's share of them.
+ELSEWHERE = {
+    "a fragment that is not a mapping": lambda: Fragment.from_mapping([1, 2], "p"),
+    "a subject to check that is not a mapping": lambda: validate([1, 2]).raise_first(),
+    "a term the spec carries nothing under": lambda: explain(read(), "no_such_term"),
+}
+
+
+def _site_of(declines):
+    """The file and line of the `SpecRefusal(...)` that `declines()` raises.
+
+    Taken where the refusal is built rather than from its traceback. The walk
+    yields its refusals and the reader over it raises the first, so the
+    traceback of a refusal the walk found names the reader's `raise` and not
+    the site that declined.
+    """
+    built = {}
+    init = SpecRefusal.__init__
+
+    def recording(refusal, *args):
+        caller = sys._getframe(1)
+        built[id(refusal)] = (
+            pathlib.Path(caller.f_code.co_filename).name,
+            caller.f_lineno,
+        )
+        init(refusal, *args)
+
+    SpecRefusal.__init__ = recording
+    try:
+        with pytest.raises(SpecRefusal) as raised:
+            declines()
+    finally:
+        SpecRefusal.__init__ = init
+    return built[id(raised.value)]
 
 
 def _is_refusal(raised):
@@ -405,8 +440,11 @@ def _is_refusal(raised):
     return getattr(callee, "id", None) == "SpecRefusal"
 
 
-def _raise_sites():
-    """Every `raise SpecRefusal` in the package, mapped to the rule it names.
+def _refusal_sites():
+    """Every `SpecRefusal(...)` built in the package, mapped to the rule it names.
+
+    A site is where a refusal is built, whether it is raised there, yielded to
+    a walk's consumer or collected into a result, because all three decline.
 
     One site picks its rule from a local name rather than naming it inline, so
     a name is resolved through the assignments in the function it sits in. The
@@ -432,37 +470,55 @@ def _raise_sites():
                 if isinstance(target, ast.Name)
             }
             for node in ast.walk(scope):
-                if isinstance(node, ast.Raise) and _is_refusal(node.exc):
-                    named = ast.unparse(node.exc.args[0])
+                if _is_refusal(node):
+                    named = ast.unparse(node.args[0])
                     found[source.name, node.lineno] = bound.get(named, named)
     return found
 
 
+def _built_where_thrown():
+    """Every `raise` or `yield` in the package that builds what it throws.
+
+    A `raise` of a refusal already built -- the reader raising the first one
+    its walk yielded, or a result handing back its first -- builds nothing
+    there, so it is not a site.
+    """
+    found = set()
+    for source in sorted(PACKAGE.glob("*.py")):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if isinstance(node, ast.Raise):
+                thrown = node.exc
+            elif isinstance(node, ast.Yield):
+                thrown = node.value
+            else:
+                continue
+            if isinstance(thrown, ast.Call):
+                found.add((source.name, thrown.lineno))
+    return found
+
+
 def _sites_naming(member):
-    return {site for site, rule in _raise_sites().items() if f"Rule.{member}" in rule}
+    return {site for site, rule in _refusal_sites().items() if f"Rule.{member}" in rule}
 
 
-def test_every_raise_site_in_the_package_resolves_to_a_rule():
+def test_every_refusal_site_in_the_package_resolves_to_a_rule():
     # The resolver has to read all of them. One it could not read would leave
     # the two checks below green over a smaller package than the one that
     # exists, which is the shape of defect they are here to catch.
     unread = {
         site: rule
-        for site, rule in _raise_sites().items()
+        for site, rule in _refusal_sites().items()
         if not rule.startswith("Rule.")
     }
     assert unread == {}
     # A site the walk never reaches -- in a scope it does not descend, or
-    # raising through a name that is not `SpecRefusal` -- is absent rather
+    # building through a name that is not `SpecRefusal` -- is absent rather
     # than unread, and absence is invisible to a check that reads only what
-    # the walk found. So the package's own `raise` statements are counted
-    # against what the resolver recognised.
-    written_in_the_package = sum(
-        isinstance(node, ast.Raise)
-        for source in sorted(PACKAGE.glob("*.py"))
-        for node in ast.walk(ast.parse(source.read_text()))
-    )
-    assert len(_raise_sites()) == written_in_the_package
+    # the walk found. So everything the package throws as it builds it is
+    # held against what the resolver recognised.
+    thrown = _built_where_thrown()
+    assert thrown
+    assert thrown <= set(_refusal_sites())
 
 
 def test_every_site_that_declines_a_document_is_driven_here():
@@ -470,14 +526,17 @@ def test_every_site_that_declines_a_document_is_driven_here():
     # a reason nobody stated, so the set is read out of the package's source
     # instead of counted. A site added later is red here until it is placed on
     # one side of the partition or the other.
-    driven = {_site_of(refusal_from(make())) for make in BREAKAGES.values()}
+    driven = {
+        _site_of(lambda make=make: MachineSpec.from_mapping(make()))
+        for make in BREAKAGES.values()
+    } | {_site_of(declines) for declines in ELSEWHERE.values()}
     assert driven == _sites_naming("SHAPE")
 
 
 def test_the_version_is_the_one_site_that_is_not_about_the_document():
-    refusal = refusal_from(document(schema_version=2))
-    assert _sites_naming("VERSION") == {_site_of(refusal)}
-    assert _site_of(refusal) not in _sites_naming("SHAPE")
+    site = _site_of(lambda: MachineSpec.from_mapping(document(schema_version=2)))
+    assert _sites_naming("VERSION") == {site}
+    assert site not in _sites_naming("SHAPE")
 
 
 @pytest.mark.parametrize("breakage", sorted(BREAKAGES))
