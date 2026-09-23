@@ -3,13 +3,11 @@
 - **Quote the context; stop only for critical decisions.**
 - **Always communicate PR status.** The owner does not care about local worktree state.
 - **Answer with the conclusion first.** When the owner asks what a task
-  established, the first line is the **finding**, not the method, the process, or
-  what happens next. A reader who stops after one line should have the answer.
-  Supporting measurement follows; caveats and cost follow that. The shape, from a
-  capture task: *a real model traces at both widths, and its shapes are entirely
-  concrete -- 0 symbolic of 13,107* -- then the evidence for each half. What this
-  replaces is a status report that recites what was done and leaves the owner to
-  infer what it means.
+  established, the first line is the **finding**, not the method or the process;
+  for that question this overrides the next-action lead below. A reader who stops
+  after one line should have the answer; measurement follows, then caveats and
+  cost. The shape: *a real model traces at both widths, and its shapes are
+  entirely concrete -- 0 symbolic of 13,107* -- then the evidence for each half.
 - Output shaping (`/i-have-adhd`): lead with the next action, number multi-step
   tasks, end with one concrete next action, restate state every turn, specific time
   estimates, matter-of-fact error tone, cap lists at 5, no preamble or closing
@@ -18,58 +16,44 @@
 ## Execution rules
 - Don't modify the main worktree. Develop with linked worktrees, one per in-flight
   task, under `compass-worktrees/<task-id>`, beside the repo.
-- **On every landing, the main agent fast-forwards the main worktree** to
-  `feature/atomcompass_new` (the integration branch) promptly. This doesn't
-  contradict the rule above: that rule
-  forbids developing there, not updating it. The pull runs through the container
-  as root and leaves the tree root-owned, which fails host-side edits silently;
-  chowning it to the host user fixes that but then makes container git refuse
-  the same tree with `dubious ownership` until a `safe.directory` entry for that
-  path exists in the container's git config. That entry lives under `/root`,
-  which does not survive a full `teardown.sh`, so expect to re-add it after a
-  container rebuild — script it under `/workspace` rather than doing it by hand
-  each time. This happened on #11's landing and needed a manual repair.
-- **The fast-forward is easy to skip because nothing visibly breaks**, and it was
-  measured **14 commits behind** after a full session of landings. It matters
-  beyond tidiness: the main worktree holds the local `feature/atomcompass_new`,
-  **every linked worktree shares that ref**, and `compass_resolve_ref` tries the
-  bare name first -- so a stale local branch beats `fork/...` for any command that
-  omits `COMPASS_INTEGRATION_REF`. That is the defect the resolver was changed to
-  announce rather than resolve silently.
-- **The chown back is two steps, and the second is not optional.** The container
-  runs as uid 0 and the host user is 13797, so root writes with umask 0022 and the
-  tree stays root-owned without it. But `chown -R` over the main worktree also
-  hits `.git/worktrees/`, **which every linked worktree shares**, and container git
-  then refuses all of them with `dubious ownership`. Measured: it broke four
-  worktrees at once, mid-session, with agents running.
+- **On every landing, the landing agent fast-forwards the main worktree** to
+  `feature/atomcompass_new` (the integration branch). That updates the main
+  worktree; it does not develop there, so the rule above stands. It is easy to
+  skip because nothing visibly breaks, but every linked worktree shares the main
+  worktree's local `feature/atomcompass_new`, and `compass_resolve_ref` tries that
+  bare name first, so a stale local branch wins for any command that omits
+  `COMPASS_INTEGRATION_REF`. Measured: 14 commits behind after one session of
+  landings.
+
+  Container git runs as uid 0 and the repo belongs to the host user, 13797, so
+  container git works only because `/root/.gitconfig` carries
+  `safe.directory = *`. `/root` does not survive `teardown.sh`: after a rebuild,
+  run `git config --global --add safe.directory '*'` before any git command.
+  Measured 2026-09-23: with that entry removed, container git refuses both the
+  main worktree and a linked one with `dubious ownership`. A pull as root leaves
+  new files root-owned, which fails host-side edits silently, so the chown
+  follows every pull:
 
   ```
   cd <main worktree> && git fetch fork --quiet
   git merge --ff-only fork/feature/atomcompass_new
-  chown -R 13797:13797 .      # working tree back to the host user
-  chown -R 0:0 .git           # MUST follow, or every linked worktree breaks
+  chown -R 13797:13797 .      # whole tree, .git included -- the repo's standing state
   ```
 
-  Working tree 13797-owned, `.git` root-owned -- the state the repo was already
-  in, which is why no `safe.directory` entry is needed. Verify with
-  `stat -c "%u %n" . .git` and by running `git -C <each worktree> rev-parse HEAD`
+  Verify with `stat -c "%u %n" . .git` and `git -C <each worktree> rev-parse HEAD`
   afterwards. Do not assume it worked.
-- **Four setup rules, from failures already recorded on this hardware.** None was
-  caused by worktrees; all were caused by a shared mutable non-git source tree
-  that things silently resolved against.
+- **Four setup rules.** Each failure behind them came from a shared mutable
+  non-git source tree that things silently resolved against, not from worktrees.
   1. No shared mutable source root exists. Every tree is a worktree or a
      `git archive` snapshot.
   2. Containers mount the worktree parent, so every task's tree is reachable at a
-     stable path. Mounting only one tree makes `pytest` on worktree code fail
-     with a path error rather than a test failure.
-  3. Every command sets `PYTHONPATH` to its own worktree and verifies it —
+     stable path; mounting one tree makes `pytest` fail with a path error.
+  3. Every command sets `PYTHONPATH` to its own worktree and verifies it with
      `python -c "import atom; print(atom.__file__)"` before trusting a result. A
-     prior run resolved `atom` to a non-git snapshot of a different branch, 72
-     files divergent, and failed silently wherever both trees had the symbol.
-  4. Snapshots use `git archive`, never `rsync` — so a snapshot names a commit and
-     cannot be a mixture of generations. One shared tree held two files from two
-     different generations, producing a `TypeError` that named the callee and
-     read as a code bug.
+     run once resolved `atom` to another branch's snapshot and failed silently.
+  4. Snapshots use `git archive`, never `rsync`, so a snapshot names one commit.
+     An rsync'd tree mixing two generations gave a `TypeError` that read as a
+     code bug.
 - **No design-doc references in code.** No `D18`, `P0.4`, `T5`, `W2.5`, backticked
   doc numbers, "principle N", or numbered labels like "Gate 1". No quoting design
   principles as justification. Say what the code does, its functions, how it works.
@@ -78,11 +62,10 @@
   a citation in the output record.
 - **The design-doc rule is checked at the head, over the PR's whole file set** —
   never over the added lines of a delta, which cannot see a reference that
-  arrived before the range. Classify each hit as prose or emitted. A design
-  document a test opens **by path** is a functional dependency, not a citation,
-  and stays. Measured: one PR carried **41** references through review cycles
-  that each reported clean; a board-wide census found **nine** reaching runtime
-  output, inside `raise` messages and printed table notes.
+  arrived before the range. A design document a test opens **by path** is a
+  functional dependency, not a citation, and stays. Measured: one PR carried
+  **41** through cycles that each reported clean; a board-wide census found nine
+  reaching runtime output.
 - Merge conflicts are the agent's call, not the owner's ("don't bother me on merge
   conflict, it's on you"). Tasks are cut so each touches one module plus its tests,
   which makes most of them disjoint, but they are **not guaranteed disjoint** and no
@@ -117,25 +100,29 @@
   title or with a delivering verb (closes / fixes / resolves / addresses /
   implements). **Do not write "checked" unless the check you ran is the one that
   answers the claim.** Measured: two briefs in one day were written for issues an
-  open PR already delivered — one missed a delivery note in the first comment,
-  one asserted *"checked, not assumed"* with no check run.
+  open PR already delivered.
 - **A finding that outlives its PR needs an issue, not a PR body.** PR bodies are
   squashed away on landing, so a finding recorded only there is lost to the next
-  reader. Two reviews have now re-derived findings that had been written down
-  repeatedly with no issue to point at. If a finding is not fixed in the PR that
-  found it, open an issue and point the PR body at it.
-- **A PR's state is read from the last entry in its comment thread**, never from
-  a carried-forward summary. Developer rounds and review verdicts alternate in one
-  stream and both open with a bold heading, so a remembered approval may belong to
-  an earlier round. One PR sat recorded as approved through six consecutive checks
-  while its last entry was a developer record and no reviewer had seen its head.
+  reader. If a finding is not fixed in the PR that found it, open an issue and
+  point the PR body at it. Measured: two reviews re-derived findings that had been
+  written down repeatedly with no issue to point at.
+- **A PR's state is its last thread entry; its verdict is the last comment that
+  carries one**, and a verdict covers only the head it names. Read both from the
+  thread, never from a carried-forward summary: developer rounds and review
+  verdicts alternate in one stream and both open with a bold heading, so a
+  remembered approval may belong to an earlier round. Measured: one PR sat
+  recorded as approved through six consecutive checks while its last entry was a
+  developer record and no reviewer had seen its head.
 - Design and implement solutions while keeping the solution as simple as possible.
 - **When something does not work as expected, stop and discuss. Do not work
   around it.** This covers: a design document that contradicts the code; a test
   that fails for a reason the task did not predict; a measurement outside its
-  stated range; an interface that cannot be implemented as specified. A
-  workaround improvised under build pressure is exactly the class of decision
-  that never gets written down.
+  stated range; an interface that cannot be implemented as specified. Each is an
+  **escalation** (defined below) until its cause is known; if the cause turns out
+  to be fixable without a ruling — a bug in the task's own change — it becomes a
+  finding, is fixed, and is recorded in the PR body. A workaround improvised
+  under build pressure is exactly the class of decision that never gets written
+  down.
 - Concurrency: 5 tasks in flight, up to 10 agents (5 developer + 5 reviewer). The
   cap is review throughput, not the task DAG.
 - Both developer and reviewer agents must be told to read `atom/compass/design/README.md`'s
@@ -143,8 +130,15 @@
 - **A developer agent owns development and PR updates; the main agent orchestrates
   and does not write the change itself.** After each push a reviewer agent
   reviews, the developer amends, and that repeats until the verdict is APPROVE.
-  The owner is asked only for a critical blocking issue or a scope call — an
-  actionable review finding is not an escalation, and is not labelled.
+  The owner is asked only for an escalation, never for a finding.
+- **An escalation is anything that needs an owner ruling before work can
+  continue; it is labelled `need human` when it is declared. Anything the
+  developer can fix without a ruling is a finding, and is not labelled.** A halt
+  declared in prose does not stop automation; the label does. When the ruling
+  lives on a separate issue, **label each PR it holds anyway** and name the issue
+  on the PR. Measured: four PRs declared effort halts pointing at a ruling on
+  #89, none was labelled, and an agent dispatched work at #91 because it looked
+  unlabelled and approved.
 - **Automation is on by default.** An agent acts on any issue or PR that does
   not carry the `need human` label — no opt-in, no waiting to be told.
 - **`need human` stops all agent action on that issue or PR** — no agent
@@ -152,14 +146,8 @@
   whose review already passed. An agent applies the label the moment it
   escalates, so it can stop itself; only the owner removes it, and removal is
   what restarts the work.
-- **A declared escalation carries the label, or it is not a stop.** A halt
-  declared in prose does not stop automation; the label does. When the ruling
-  lives on a separate issue, **label each PR it holds anyway** and name the
-  issue on the PR. Measured: #81, #85, #91 and #95 all declared effort halts and
-  none was labelled — the ruling sat on #89 — and an agent dispatched work at #91
-  because it looked unlabelled and approved.
 - **The review loop has its own stop.** If the same finding survives two cycles,
-  or the loop passes three cycles, it halts and goes to the owner and applies
+  or the loop passes three cycles, it halts, goes to the owner and applies
   `need human` to the PR: a task that cannot converge is mis-cut, not
   under-worked.
 - Reviewer agents must post their review to the PR; **the verdict goes in the
@@ -184,125 +172,105 @@
      Needing to edit an ATOM test means the change altered ATOM's behaviour and
      must be justified on its own terms, not absorbed.
   2. New CPU-only tests for what the task added, in `tests/compass/`, in ATOM's
-     style.
-     **The tests must exercise something the PR did not itself add.** A new
-     module plus tests for that module, imported by nothing else, is
-     self-confirming: it passes every gate and demonstrates nothing. Where a
-     task is verification rather than implementation, the brief says so and the
-     deliverable is evidence, not a package.
+     style. **The tests must exercise something the PR did not itself add.** A
+     new module plus tests for that module, imported by nothing else, is
+     self-confirming: it passes every gate and demonstrates nothing.
   3. One named result, stated in the issue body before the task is claimed and
-     not chosen afterwards.
-     An umbrella brief whose children carry the work states one anyway, or
-     names the child that carries it. A developer choosing one afterwards is
-     the case this rule forbids, and it has happened.
+     not chosen afterwards. An umbrella brief whose children carry the work
+     states one anyway, or names the child that carries it; a developer choosing
+     one afterwards is the case this rule forbids.
   4. Review by the task's reviewer agent, looping to APPROVE as above.
-     **A pin is inert until someone has seen it fail.** A reviewer credits a
-     test with holding a defect only after reinstating the defect — the pre-fix
-     code via `git show`, nothing else changed — re-running, and recording both
-     counts plus the failing node id and assertion. A developer reverts their
-     own fix before claiming it; if nothing reddens, they add the pin or state
-     why the fix is unobservable. **Mutations preserve line count** — a
-     line-drift guard fires on any edit and reads as coverage. Measured: #163
-     was approved at cycle 2 on a pin that still gave `39 passed` with its
-     defect reinstated; a re-check of ~25 approved PRs found four inert pins
-     and five fixes nothing holds.
+     **A check counts only once someone has seen it fire** — a test, a pin, or
+     any instrument in this file. A reviewer credits a test with holding a
+     defect only after reinstating the defect — the pre-fix code via
+     `git show`, nothing else changed — re-running, and recording both counts
+     plus the failing node id and assertion. A developer reverts their own fix
+     before claiming it; if nothing reddens, they add the pin or state why the
+     fix is unobservable. **An inert pin on a required finding is itself a
+     required finding: the reviewer does not approve over it.** Mutations
+     preserve line count, because a test that asserts a source line number or a
+     file's length fails on any edit and would look as if it caught the
+     mutation. Measured: #163's cycle-2 reviewer reinstated the defect, recorded
+     the pin as inert (`39 passed`), and approved anyway.
 
   Baselines are recorded first (the suite's and ruff's pass/fail state, before the
   first Compass commit) — the lint baseline on this repository is already known
   to be dirty, and a pre-existing failure attributed to Compass costs a day.
 - **Effort is estimated in lines of code, not time.** Wall-clock appears only for
   machine time with a measured basis. **A task that overruns its estimate by more
-  than ~2x is a halt-and-discuss event, not a reason to keep going** — the usual
-  cause is that the task was mis-cut.
+  than ~2x is a halt-and-discuss event, not a reason to keep going** — an
+  escalation, labelled as above; the usual cause is that the task was mis-cut.
 - **PRs land squashed onto `feature/atomcompass_new`, the integration branch**,
   one commit per task. GitHub enforces this structurally
   (`allow_merge_commit=false`, `allow_rebase_merge=false`). Base branch is always
   `feature/atomcompass_new` — never `main`, never `master`, never a branch on
   upstream `ROCm/ATOM`.
 - **Landing is the agents' job; no owner approval is needed or sought.** An agent
-  lands any PR that is approved — the verdict in the last review comment of its
-  thread, covering its current head — with no `need human` on it **or anywhere
-  below it in its stack**. The only other holds are reasons written in this file
-  — a declared escalation such as an effort halt, or a change these rules forbid
-  such as design-doc references in code — and **an agent that holds a PR names
-  the rule**. The owner stated this directly after ~42 approved, unlabelled PRs
-  sat for a day because a handoff note called landing "the owner's call".
+  lands any PR whose verdict is APPROVE covering its current head, with no
+  `need human` on it **or anywhere below it in its stack**. The APPROVE is the
+  reviewer's statement that gates 1-3 hold for that head; landing does not wait
+  for the per-wave GPU superset. **The hold is the label**: a PR whose body
+  declares an escalation but carries no label gets the label, and is then held
+  by it. The only other holds are rules in this file, such as an approval that
+  does not cover the head, and **an agent that holds a PR names the rule**.
+  The owner stated this after ~42 approved, unlabelled PRs sat for a day because
+  a handoff note called landing "the owner's call".
   - **A handoff note is a predecessor's judgement, not a rule.** Where a note
     contradicts this file, this file wins.
   - **Before landing on a moved tip, compare trees.** If
-    `<tip after landing>^{tree}` equals `<reviewed head>^{tree}`, the reviewed
-    gate result stands: #162→#170 landed as tree `fd1492b35`, identical to #170's
-    reviewed head, so its 4601-passed gate covered the tip with no re-run.
+    `git merge-tree --write-tree <current tip> <reviewed head>` prints
+    `<reviewed head>^{tree}`, the reviewed gate result stands with no re-run.
+    The check only tells you something when the tip has commits the head lacks;
+    if the tip is an ancestor of the head, the trees are equal by construction.
+    Measured: #170's command output and reviewed tree are both `fd1492b35`, but
+    only because the tip was already an ancestor — the trivial case.
   - **If the trees differ, trial-merge the batch and gate it once.** Any PR gated
     against an older tip: `git merge-tree --write-tree`, bottom-first per chain,
     then gate the combined tree before landing — two green PRs can merge red, and
     package-wide globs are the known mechanism.
-  - **After landing:** fast-forward the main worktree (above); close a tracker
-    issue whose tasks have all landed; a follow-up filed as "claimable once X
-    lands" is now claimable.
+  - **After landing:** fast-forward the main worktree (above); close, with a
+    handoff comment, a tracker issue whose tasks have all landed; a follow-up
+    filed as "claimable once X lands" is now claimable.
 - **An approval covers a tree, not a PR.** When a head moves past the comment
   that approved it, the new commits get a delta review pinned to
   `<approved sha>..<head>` before the PR lands. A content-preserving restack needs
   a verification, not a full review — by tree hash or a chunk-by-chunk comparison
   of the result, never a diff of diffs. Measured: **13** heads had moved past
-  their approvals, one with an unreviewed commit sitting under two other approved
-  PRs.
+  their approvals, one with an unreviewed commit under two other approved PRs.
 - **Recommended, not required: stack a dependent task's PR on its unlanded
   parent** with `gh stack` rather than waiting for it to land. Independent
   tasks do not stack. `gh stack` is GitHub's own extension
-  (`github/gh-stack`), already installed at v0.1.1 against `gh` 2.45.0. It
-  installs under `/root`, which `teardown.sh` discards, so it does not
-  survive a container rebuild; reinstall with
+  (`github/gh-stack`, v0.1.1 against `gh` 2.45.0). It installs under `/root`,
+  which `teardown.sh` discards; reinstall with
   `./shell.sh /workspace/gpu_docker/install-gh-stack.sh`, idempotent. Its
   stack metadata lives in `.git/gh-stack` and is not committed.
 - **Land a stack with `gh stack merge <pr-number> --squash --yes`**, which merges
-  up to and including that PR and leaves the rest open. Measured on this fork:
-  landing the bottom of a two-PR stack produced **one squashed commit carrying
-  that PR's message body**, left the upper PR open, **retargeted its base to the
-  merged branch automatically**, and left it at `mergeable_state=clean` — no
-  rebase, no force-push, no base patch. The plain endpoints are what fail on a
-  stacked PR: `PUT /pulls/<n>/merge` returns 403 naming the stack merge path, and
-  `PATCH /pulls/<n> -f base=` returns 422. Those are the wrong tools, not a
-  limitation.
-- **Four things about `gh stack` that cost time if rediscovered.** `gh stack link`
-  fails with `unable to determine default branch` unless `--base <branch>` is
-  given. `gh stack unstack <n>` takes no `--yes` and **can refuse outright** --
-  measured with *"Pull request #N cannot be removed from this stack"* both while a
-  member was queued for merge **and** later when every member was closed and its
-  branches deleted. `DELETE /stacks/<n>` 404s. So a stack object can outlive
-  everything it points at, and one orphan from a throwaway probe is stuck on this
-  fork: **linking is not freely reversible -- link a chain when you mean it.** Only
-  open, non-draft PRs merge. And there is **no `--message` flag**, so a
-  hand-written squash message cannot be supplied at merge time — with one commit
-  the body survives, with many GitHub's default applies. Since the squash message
-  is where a task's measured result is recorded, that is the one real cost of
-  stacking.
+  up to and including that PR as one squashed commit carrying its message body,
+  leaves the rest open, and retargets the PR above automatically — no rebase, no
+  force-push, no base patch. The plain endpoints are the wrong tools on a stacked
+  PR: `PUT /pulls/<n>/merge` returns 403 naming the stack merge path, and
+  `PATCH /pulls/<n> -f base=` returns 422. Measured on a two-PR probe stack.
+- **Four `gh stack` gotchas.** `gh stack link` needs `--base <branch>`. Only
+  open, non-draft PRs merge. There is **no `--message` flag**, so a hand-written
+  squash message cannot be supplied at merge time — with one commit the body
+  survives, with many GitHub's default applies; since the squash message records
+  a task's result, that is the one real cost of stacking. `gh stack unstack`
+  **can refuse outright**, even once every member is closed, and
+  `DELETE /stacks/<n>` 404s — **linking is not freely reversible; link a chain
+  when you mean it.**
 - **Never force-push a branch under review. A restack after its parent has
   landed is permitted.**
-- **A chain is linked as a whole or not at all, and the check is an instrument
-  rather than a habit.** Linking a chain when it is quiescent and then letting it
-  grow leaves a **half-linked** chain, which is worse than none: `gh stack merge`
-  auto-retargets the members inside the stack and not the ones outside it, so two
-  disciplines apply to different PRs in one chain and nothing on the PR says which.
-  This happened: two chains were linked at two PRs each and grew to five and four.
-
-  **When a PR joins a chain, re-link the whole chain in the same step** --
-  `gh stack link --base feature/atomcompass_new <bottom> ... <top>` naming every
-  member. It updates an existing stack rather than creating a second one, so it is
-  idempotent and safe to repeat.
-
-  **Do not link a chain with `need human` anywhere below it.** The label stops
-  agent action on that PR, and linking acts on every member.
-
-  **The drift check**, which belongs in the slot check rather than in memory: for
-  each open PR whose base is another open PR's branch, assert both sit in one
-  stack. Build it from `gh pr list --json number,headRefName,baseRefName,labels` and
-  `gh api "repos/<o>/<r>/stacks?pull_request=<n>"`, exit non-zero on drift, and
-  count held chains separately rather than reporting them as failures. A working
-  copy may sit in `agent_scratch/`, which is git-ignored -- rebuild it rather than
-  assume it survived. **Run its positive
-  control before trusting a clean result** -- a check nobody has watched fire
-  proves nothing, which this project has now learned twice.
+- **A chain is linked as a whole or not at all.** A half-linked chain is worse
+  than none: `gh stack merge` auto-retargets the members inside the stack and not
+  the ones outside it, so two disciplines apply in one chain and nothing on the
+  PR says which. **When a PR joins a chain, re-link the whole chain in the same
+  step** — `gh stack link --base feature/atomcompass_new <bottom> ... <top>`,
+  naming every member; it updates the existing stack, so it is safe to repeat.
+  **Do not link a chain with `need human` anywhere below it** — linking acts on
+  every member. **Drift check:** for each open PR whose base is another open PR's
+  branch, both sit in one stack (`gh api "repos/<o>/<r>/stacks?pull_request=<n>"`);
+  held chains are counted, not failed. Measured: two chains linked at two PRs
+  each grew to five and four.
 - **Landing the bottom of a hand-managed base chain forces one restack of
   everything above it** — `git rebase --onto <new> <old> <branch>` plus a REST base
   patch, per child, per parent move. A plain `git rebase` conflicts where `--onto`
