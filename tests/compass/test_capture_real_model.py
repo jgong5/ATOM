@@ -264,6 +264,26 @@ CUDA_NAMES_READ = frozenset(
     }
 )
 
+# Every `torch.cuda` name read by code outside torch, stubbed or not, with who
+# reads it. Measured over a whole capture: the same 12 at both widths and in
+# every pass this file runs. The 8 stubs missing here are read by torch alone.
+CUDA_NAMES_READ_OUTSIDE_TORCH = frozenset(
+    {
+        "CUDAGraph",  # annotations: atom.utils.cuda_graph, tbo, transformers
+        "Event",  # atom.model_engine.model_runner
+        "ExternalStream",  # annotation: RapidServeModelRunner
+        "Stream",  # atom, aiter, flydsl, transformers
+        "__file__",  # inspect.getmodule
+        "current_device",  # aiter, atom.model_ops.attention_mha
+        "current_stream",  # atom.utils.forward_context
+        "device_count",  # atom.model_ops.fla_ops.utils
+        "get_device_properties",  # aiter
+        "is_available",  # aiter.ops.gemm_op_a6w6, atom.utils.forward_context
+        "memory_stats",  # atom.model_engine.model_runner
+        "stream",  # atom.model_engine.model_runner
+    }
+)
+
 # The families the concrete census is split into at each width. The concrete
 # result is that none of their entries is anything but an integer, and that
 # sentence is only as good as the count under it -- a family that stopped being
@@ -569,6 +589,12 @@ def _anonymise(text, axis):
 # the capture driver -- everything below runs in the subprocess
 
 
+_CUDA_READS_OUTSIDE_TORCH = collections.Counter()
+_UNCOUNTED_READERS = frozenset(
+    {"torch", "importlib", "_frozen_importlib", "_frozen_importlib_external"}
+)
+
+
 def _declare_cuda():
     """Stub the `torch.cuda` names ATOM reads, and report what was stubbed.
 
@@ -677,10 +703,25 @@ def _declare_cuda():
     stubbed = frozenset(for_import) | frozenset(for_runner)
     reads = collections.Counter()
 
+    # Separately, every name read outside torch, stubbed or not: an unstubbed
+    # read is a real device reading on a GPU host and a nameless error without
+    # one. The reader is the calling frame's module package. Torch's own and the
+    # import system's reads bind names and are not counted. A reader that cannot
+    # be named is recorded as "<name> (reader unknown)", so it fails by name.
+    outside = _CUDA_READS_OUTSIDE_TORCH
+
     class _ReadCountingModule(type(torch.cuda)):
         def __getattribute__(self, name):
             if name in stubbed:
                 reads[name] += 1
+            try:
+                reader = sys._getframe(1).f_globals["__name__"]
+            except (ValueError, KeyError):
+                reader = None
+            if not isinstance(reader, str):
+                outside[f"{name} (reader unknown)"] += 1
+            elif reader.partition(".")[0] not in _UNCOUNTED_READERS:
+                outside[name] += 1
             return super().__getattribute__(name)
 
     torch.cuda.__class__ = _ReadCountingModule
@@ -1873,6 +1914,7 @@ def _capture(
 
 def main(argv):
     import argparse
+    import atexit
     import tempfile
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1905,6 +1947,10 @@ def main(argv):
             f"and would say it was symbolic. The narrowest traceable width is "
             f"{MIN_STEP_WIDTH}."
         )
+    # At exit, so it is printed even when a new device read ends the capture.
+    atexit.register(
+        lambda: print(READS_MARKER + json.dumps(sorted(_CUDA_READS_OUTSIDE_TORCH)))
+    )
     with tempfile.TemporaryDirectory(prefix="compass-capture-") as tmpdir:
         record = _capture(
             args.tp,
@@ -1923,9 +1969,11 @@ def main(argv):
 
 
 RECORD_MARKER = "CAPTURE-RECORD "
+READS_MARKER = "CAPTURE-CUDA-READS "
 
 
 _RECORDS: dict[tuple, dict] = {}
+_READS: dict[tuple, frozenset] = {}
 
 
 def capture(
@@ -1961,9 +2009,12 @@ def capture(
         cwd=str(tree_root),
     )
     for line in completed.stdout.splitlines():
+        if line.startswith(READS_MARKER):
+            _READS[key] = frozenset(json.loads(line[len(READS_MARKER) :]))
         if line.startswith(RECORD_MARKER):
             _RECORDS[key] = json.loads(line[len(RECORD_MARKER) :])
-            return _RECORDS[key]
+    if key in _RECORDS:
+        return _RECORDS[key]
     pytest.fail(
         f"the capture at TP{tp} (symbolic={symbolic}, "
         f"repair_site_one={repair_site_one}, step_symbol={step_symbol}, "
@@ -1971,6 +2022,24 @@ def capture(
         f"subprocess exited {completed.returncode}.\n"
         f"--- stderr tail ---\n{completed.stderr[-4000:]}"
     )
+
+
+def cuda_reads(
+    tp, symbolic=False, repair_site_one=False, step_symbol=False, width=DECODE_SEQS
+):
+    """Every `torch.cuda` name read outside torch, even by a capture that failed.
+
+    So a new device read is reported by its name, not by the error it raised.
+    """
+    import pytest
+
+    key = (tp, symbolic, repair_site_one, step_symbol, width)
+    try:
+        capture(*key)
+    except pytest.fail.Exception:
+        if key not in _READS:
+            raise
+    return _READS[key]
 
 
 def row_parallel_reduces():
@@ -2172,14 +2241,17 @@ def test_atom_s_own_buffer_constructor_is_what_runs():
 
 
 def test_the_stubbed_device_names_are_the_ones_the_capture_reads():
-    """Which `torch.cuda` stubs a capture reads, counted rather than listed.
+    """Which `torch.cuda` names a capture reads, counted rather than listed.
 
     The stub list is what `_declare_cuda` wrote, so asserting its length would
     assert the function against itself. What is measured is every read of a
     stubbed name over a whole capture, and that says which stubs are doing
     anything: all 17, the same at both widths and in every pass. The stub list
     is held equal to that read set, so a stub nothing reads fails here as
-    surely as a stub that stops being read.
+    surely as a stub that stops being read. Every name read outside torch,
+    stubbed or not, is held equal to its own measured set, so a new device read
+    fails here by its name on any host, including one the capture does not
+    survive.
     """
     for tp in (1, 2):
         for arrangement in (
@@ -2191,6 +2263,8 @@ def test_the_stubbed_device_names_are_the_ones_the_capture_reads():
         ):
             if tp == 2 and arrangement.get("symbolic"):
                 continue
+            reads = cuda_reads(tp, **arrangement)
+            assert reads == CUDA_NAMES_READ_OUTSIDE_TORCH, (tp, arrangement)
             record = capture(tp, **arrangement)
             cuda = record["declared"]["cuda"]
             declared = set(cuda["import"]) | set(cuda["model_runner"])
