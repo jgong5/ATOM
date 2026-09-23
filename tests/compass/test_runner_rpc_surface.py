@@ -70,7 +70,7 @@ class Site(NamedTuple):
     line: int
     waits: bool
     aggregated: bool
-    arity: int  # values unpacked from the reply; 0 when it is discarded
+    arity: int | None  # values unpacked; 0 when discarded, None when unread
 
 
 def _classes(path):
@@ -79,7 +79,27 @@ def _classes(path):
 
 
 def _methods(node):
-    return {n.name for n in node.body if isinstance(n, ast.FunctionDef)}
+    """Every name the body of class *node* binds, and so answers `getattr` with.
+
+    A `def` and an `async def` bind a name the same way an assignment in the
+    class body does, and the worker's `getattr` finds all three. A statement in
+    the body that could bind a name some other way -- an `if`, a `try`, a
+    loop -- is refused rather than skipped, so a name bound there cannot pass
+    as absent.
+    """
+    names = set()
+    for n in node.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(n.name)
+        elif isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for target in n.targets if isinstance(n, ast.Assign) else [n.target]:
+                names |= {t.id for t in ast.walk(target) if isinstance(t, ast.Name)}
+        else:
+            assert isinstance(n, (ast.Expr, ast.Pass)), (
+                f"{node.name}:{n.lineno} binds names in a form not read here: "
+                f"{ast.unparse(n).splitlines()[0]}"
+            )
+    return names
 
 
 def _busy_loop():
@@ -124,13 +144,23 @@ def _arity(parent):
     `ast.Return` is the case worth naming, because reading only `ast.Assign`
     scores `return self.runner_mgr.call_func(...)` as a discard when the value
     is in fact the function's result -- `engine_core.py:749`, `dummy_execution`.
+
+    Any other shape -- a list or starred target, an annotated one, a chained
+    target -- is scored `None` rather than `1`, which would read an unpack as a
+    use of the whole reply, and
+    `test_every_reply_is_taken_in_a_shape_the_arity_reads` names its site.
     """
     if isinstance(parent, ast.Expr):
         return 0
-    if isinstance(parent, ast.Assign):
-        target = parent.targets[0]
-        return len(target.elts) if isinstance(target, ast.Tuple) else 1
-    return 1
+    if isinstance(parent, (ast.Return, ast.Call)):
+        return 1
+    target = parent.targets[0] if isinstance(parent, ast.Assign) else None
+    if isinstance(target, ast.Name) and len(parent.targets) == 1:
+        return 1
+    starred = any(isinstance(e, ast.Starred) for e in getattr(target, "elts", ()))
+    if isinstance(target, ast.Tuple) and len(parent.targets) == 1 and not starred:
+        return len(target.elts)
+    return None
 
 
 def _mentions(roots, needle, base=REPO):
@@ -168,13 +198,13 @@ def _call_sites():
                 isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             ):
                 continue
-            if node.func.attr not in BROADCAST or not node.args:
+            if node.func.attr not in BROADCAST:
                 continue
             where = f"{path.relative_to(REPO)}:{node.lineno}"
             if "compass" in path.parts:
                 from_compass.append(where)
                 continue
-            if not isinstance(node.args[0], ast.Constant):
+            if not node.args or not isinstance(node.args[0], ast.Constant):
                 non_literal.append(where)
                 continue
             aggregated = node.func.attr == "call_func_with_aggregation"
@@ -243,6 +273,14 @@ def test_both_filters_in_the_derivation_drop_nothing():
     """
     assert NON_LITERAL == []
     assert FROM_COMPASS == []
+
+
+def test_every_reply_is_taken_in_a_shape_the_arity_reads():
+    """A site `_arity` could not score would otherwise vanish from every arity set."""
+    unscored = [
+        f"{s.file}:{s.line}" for v in SITES.values() for s in v if s.arity is None
+    ]
+    assert unscored == [], f"replies taken in a shape not scored: {unscored}"
 
 
 def test_the_dispatched_names_outside_the_surface_belong_to_other_runners():
@@ -481,13 +519,18 @@ def test_the_base_capture_reaches_a_device_before_it_reaches_the_model():
 def test_get_num_blocks_refuses_and_the_keys_its_caller_reads_are_named():
     site = SITES["get_num_blocks"][0]
     tree = ast.parse((ENGINE / site.file).read_text())
-    required = {
-        n.slice.value
+    subscripts = [
+        n
         for n in ast.walk(tree)
-        if isinstance(n, ast.Subscript)
-        and getattr(n.value, "id", None) == "block_info"
-        and isinstance(n.slice, ast.Constant)
-    }
+        if isinstance(n, ast.Subscript) and getattr(n.value, "id", None) == "block_info"
+    ]
+    unread = [
+        f"{site.file}:{n.lineno}: {ast.unparse(n)}"
+        for n in subscripts
+        if not isinstance(n.slice, ast.Constant)
+    ]
+    assert not unread, f"a key the caller reads is not written as a literal: {unread}"
+    required = {n.slice.value for n in subscripts}
     optional = {
         n.args[0].value
         for n in ast.walk(tree)
@@ -886,7 +929,13 @@ def test_what_the_comment_says_a_hole_at_exit_loses_is_what_exit_does():
         for n in ast.walk(_classes(ATOM_RUNNER)["ModelRunner"])
         if isinstance(n, ast.FunctionDef) and n.name == "exit"
     )
-    calls = {ast.unparse(n.func) for n in ast.walk(body) if isinstance(n, ast.Call)}
+    # Statements of the body itself: a call inside a lambda, a branch or a
+    # nested def is one `exit` may never make.
+    calls = {
+        ast.unparse(n.value.func)
+        for n in body.body
+        if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+    }
     assert {"destroy_dist_env", "torch.cuda.empty_cache"} <= calls
     assert "`ModelRunner.exit` never runs" in comment
     assert "the distributed environment is never destroyed" in comment
@@ -906,7 +955,11 @@ def test_what_the_comment_says_a_hole_at_exit_loses_is_what_exit_does():
     ]
     assert len(literal_loops) == 1
     kv = literal_loops[0]
-    assert {e.value for e in kv.iter.elts if isinstance(e, ast.Constant)} == {
+    unread = [ast.unparse(e) for e in kv.iter.elts if not isinstance(e, ast.Constant)]
+    assert (
+        not unread
+    ), f"line {kv.lineno} deletes names not written as literals: {unread}"
+    assert {e.value for e in kv.iter.elts} == {
         "kv_cache",
         "kv_scale",
         "index_cache",
@@ -942,16 +995,25 @@ def test_the_unanswered_helper_describes_its_whole_return_and_not_one_half():
     word = {10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen"}.get(len(RPC_SURFACE))
     assert word is not None, f"no count word for {len(RPC_SURFACE)} names"
     assert f"all {word}" in doc
-    callers = [
-        str(f.relative_to(REPO))
-        for f in sorted((REPO / "atom").rglob("*.py"))
-        if any(
-            isinstance(n, ast.Call)
-            and getattr(n.func, "id", None) == "unanswered_rpc_names"
-            for n in ast.walk(ast.parse(f.read_text()))
-        )
-    ]
-    assert callers == ["atom/compass/runner/model_runner.py"]
+    # Called by bare name or through a module, both are a call; any other
+    # mention -- an alias, a `partial`, a callback -- is a caller this cannot
+    # follow, so it is refused rather than left out of the count.
+    callers, unread = set(), []
+    for f in sorted((REPO / "atom").rglob("*.py")):
+        tree = ast.parse(f.read_text())
+        called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        for n in ast.walk(tree):
+            if "unanswered_rpc_names" not in (
+                getattr(n, "id", 0),
+                getattr(n, "attr", 0),
+            ):
+                continue
+            if id(n) in called:
+                callers.add(str(f.relative_to(REPO)))
+            else:
+                unread.append(f"{f.relative_to(REPO)}:{n.lineno}: {ast.unparse(n)}")
+    assert not unread, f"the helper is reached other than by calling it: {unread}"
+    assert callers == {"atom/compass/runner/model_runner.py"}
     tree = ast.parse(COMPOSED)
     bound = next(
         n.targets[0].id

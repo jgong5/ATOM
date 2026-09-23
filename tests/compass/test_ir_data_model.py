@@ -729,6 +729,11 @@ def test_the_package_imports_only_the_standard_library_it_names(module):
             roots += [alias.name.split(".")[0] for alias in node.names]
         elif isinstance(node, ast.ImportFrom) and not node.level:
             roots.append((node.module or "").split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and not module.parents[
+            node.level - 1
+        ].is_relative_to(IR_PACKAGE):
+            # A relative import that climbs out of this package, named as written.
+            roots.append("." * node.level + (node.module or ""))
     strays = sorted({root for root in roots if root not in allowed})
     assert not strays, f"{module.name} imports {strays}; allowed: {sorted(allowed)}"
 

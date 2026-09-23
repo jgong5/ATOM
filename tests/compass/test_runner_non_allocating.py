@@ -35,6 +35,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_runner_rpc_surface import _methods
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from atom.compass.runner import COMPASS_RUNNER_QUALNAME
@@ -63,10 +64,6 @@ OVERRIDDEN = {
 def _classes(path):
     tree = ast.parse(path.read_text())
     return {n.name: n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
-
-
-def _methods(node):
-    return {n.name for n in node.body if isinstance(n, ast.FunctionDef)}
 
 
 def _self_calls(node):
@@ -188,8 +185,12 @@ def _method_def(node, name):
     )
 
 
-def _self_assigned(node):
-    """Every `self.x = ...` in *node*, as (name, the source of its value).
+def _on_self(node):
+    return isinstance(node, ast.Attribute) and ast.unparse(node.value) == "self"
+
+
+def _self_assigned(node, unreadable=()):
+    """Every binding of `self.x` in *node*, as (name, the source of its value).
 
     Pairs, not a mapping keyed by name. A name can be assigned more than once --
     `forward_vars` is bound to the dict of buffers and later rebound to a slot
@@ -197,16 +198,46 @@ def _self_assigned(node):
     walked, which here is the rebind. The rebind names no buffer, so keying by
     name dropped `forward_vars` out of the holder set entirely. Keeping the
     pairs is what lets a name count as a holder when *any* of its bindings is.
+
+    Read in every spelling that states the name: a target of `=`, including
+    one inside a tuple or list, of an annotated or augmented `=`, and
+    `setattr(self, "x", ...)`. Any other write -- a `for` or `with` target, a
+    `setattr` whose name is computed, anything through `__dict__` or `vars` --
+    binds something this cannot read. Each of those must be listed in
+    *unreadable* by its source text, or this refuses, so a spelling it cannot
+    read fails here rather than leaving the set smaller than the class.
     """
-    return {
-        (t.attr, ast.unparse(n.value))
+    bound, read, unread = set(), set(), []
+    for n in ast.walk(node):
+        if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for target in n.targets if isinstance(n, ast.Assign) else [n.target]:
+                for t in ast.walk(target):
+                    if _on_self(t) and isinstance(t.ctx, ast.Store) and n.value:
+                        bound.add((t.attr, ast.unparse(n.value)))
+                    read.add(id(t))
+        elif (
+            isinstance(n, ast.Call)
+            and ast.unparse(n.func) in ("setattr", "object.__setattr__", "vars")
+            and n.args
+            and ast.unparse(n.args[0]) == "self"
+        ):
+            name = n.args[1] if len(n.args) == 3 else None
+            if isinstance(name, ast.Constant) and isinstance(name.value, str):
+                bound.add((name.value, ast.unparse(n.args[2])))
+            else:
+                unread.append((n.lineno, ast.unparse(n)))
+    unread += [
+        (n.lineno, ast.unparse(n))
         for n in ast.walk(node)
-        if isinstance(n, ast.Assign)
-        for t in n.targets
-        if isinstance(t, ast.Attribute)
-        and isinstance(t.value, ast.Name)
-        and t.value.id == "self"
-    }
+        if (_on_self(n) and isinstance(n.ctx, ast.Store) and id(n) not in read)
+        or (isinstance(n, ast.Attribute) and n.attr == "__dict__")
+    ]
+    assert sorted(text for _, text in unread) == sorted(unreadable), (
+        f"{node.name} binds attributes on self in a form not read here: "
+        + "; ".join(f"line {line}: {text}" for line, text in sorted(unread))
+        + f" -- listed as expected: {sorted(unreadable)}"
+    )
+    return bound
 
 
 def test_the_docstring_names_every_attribute_that_holds_the_ring():
@@ -228,7 +259,12 @@ def test_the_docstring_names_every_attribute_that_holds_the_ring():
     buffer, one attribute deeper -- true, and outside a claim about attributes
     on the runner.
     """
-    assigned = _self_assigned(_classes(ATOM_RUNNER)["ModelRunner"])
+    # The three `setattr`s bind whatever the attention builders return --
+    # the KV cache and the per-request state, by names the source never states.
+    assigned = _self_assigned(
+        _classes(ATOM_RUNNER)["ModelRunner"],
+        unreadable=["setattr(self, name, value)"] * 3,
+    )
     holders = {n for n, v in assigned if any(t in v for t in BUFFER_TERMS)}
     assert holders == {"forward_vars", "_fv_ring"}
     runner = _classes(PACKAGE / "model_runner.py")["CompassModelRunner"]
@@ -447,7 +483,17 @@ def test_the_guard_finds_nothing_when_the_root_moves(monkeypatch, tmp_path):
 )
 def test_only_the_binding_module_reaches_the_engine(path):
     """Everything else stays runnable where the engine cannot be imported."""
-    imported = _import_time_imports(path.read_text())
+    # A relative import is resolved against this module's package first, so
+    # one that climbs out of the package is read as the module it names.
+    package = path.relative_to(REPO).parent.parts
+    imported = {
+        (
+            ".".join([*package[: len(package) + 1 - level], name[level:]]).strip(".")
+            if (level := len(name) - len(name.lstrip(".")))
+            else name
+        )
+        for name in _import_time_imports(path.read_text())
+    }
     engine = {m for m in imported if m.split(".")[0] == "atom"} - {
         m for m in imported if m.startswith("atom.compass.runner")
     }

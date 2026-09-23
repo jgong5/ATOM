@@ -460,6 +460,11 @@ def test_the_package_imports_only_the_standard_library_it_names(module):
             roots += [alias.name.split(".")[0] for alias in node.names]
         elif isinstance(node, ast.ImportFrom) and not node.level:
             roots.append((node.module or "").split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and not module.parents[
+            node.level - 1
+        ].is_relative_to(CLOCK_PACKAGE):
+            # A relative import that climbs out of this package, named as written.
+            roots.append("." * node.level + (node.module or ""))
     strays = sorted({root for root in roots if root not in allowed})
     assert not strays, f"{module.name} imports {strays}; allowed: {sorted(allowed)}"
 
@@ -473,16 +478,16 @@ def test_the_package_builds_no_set_at_all(module):
     # see -- and the package has no use for one -- so the rule it enforces is the
     # one it can prove: none is constructed, so none can be iterated.
     tree = ast.parse(module.read_text())
+    # Every mention of either type, called or not: `frozenset.union` or an
+    # alias builds one without the call a narrower match would look for.
+    called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
     offenders = []
     for node in ast.walk(tree):
         if isinstance(node, (ast.Set, ast.SetComp)):
             offenders.append(f"{type(node).__name__} at line {node.lineno}")
-        elif (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id in ("set", "frozenset")
-        ):
-            offenders.append(f"{node.func.id}() at line {node.lineno}")
+        elif isinstance(node, ast.Name) and node.id in ("set", "frozenset"):
+            how = "()" if id(node) in called else " named"
+            offenders.append(f"{node.id}{how} at line {node.lineno}")
     assert not offenders, (
         f"{module.name} builds {offenders}; use a dict with None values as an "
         "ordered set, or sort at the point of iteration"
