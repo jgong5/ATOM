@@ -569,6 +569,27 @@ def test_a_transfer_that_names_no_stack_at_all_is_refused():
     assert "without saying which stack" in checked.refusals[0].what
 
 
+def test_a_saved_transfer_merged_again_names_the_merge_that_dropped_its_pin():
+    # The transfer is pinned to this stack; the merge that wrote the saved
+    # document kept that pin out, so no author omitted it. The first-hand
+    # transfer with no pin is the control, and its text does not change.
+    carried = copy.deepcopy(TIER2)
+    carried["device"]["software_pinned_to"] = dict(STACK)
+    transfer = fragment("tier2", carried, method="transferred-from:mi300x-8gpu")
+    saved = Fragment.from_mapping(merge([transfer]).document, "t.yaml")
+    again = validate(merge([saved] + fragments()[:2] + [fragment("links", LINKS)]))
+    assert [refusal.rule for refusal in again.refusals] == [Rule.PINNED_STACK]
+    assert "fragments an earlier merge built it from" in again.refusals[0].what
+    assert "merge the fragments it was built from" in again.refusals[0].remedy
+    bare = fragment("tier2", TIER2, method="transferred-from:mi300x-8gpu")
+    first_hand = validate(merge(fragments()[:2] + [bare, fragment("links", LINKS)]))
+    assert first_hand.refusals[0].what == (
+        "'tier2' (machine 'mi355x-8gpu-2node', transferred-from:mi300x-8gpu, "
+        "by a person on 2026-09-18) carried constants over from 'mi300x-8gpu' "
+        "without saying which stack they were measured against"
+    )
+
+
 def test_a_transfer_from_a_spec_pinned_to_this_stack_validates():
     carried = dict(copy.deepcopy(TIER2))
     carried["device"]["software_pinned_to"] = dict(STACK)
