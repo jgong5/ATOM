@@ -132,8 +132,8 @@ def reserves(
     inferring it from an engine it is not allowed to import.
 
     **Two of ATOM's own adjustments inside those branches are not mirrored
-    here, and they pull in opposite directions.** Neither fires at M1 -- no
-    drafter, one data-parallel rank -- and both are named because the cut that
+    here, and they pull in opposite directions.** Neither fires with no
+    drafter and one data-parallel rank, and both are named because the cut that
     wires this into `get_num_blocks` under a block-count gate would otherwise
     read "nothing else" as fidelity:
 
