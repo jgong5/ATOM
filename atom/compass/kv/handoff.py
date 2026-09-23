@@ -91,15 +91,15 @@ def whole_number(field: str, value: Any) -> int:
     conversion that no launch needs.
 
     Refused: a fraction, because `int` truncates and 8.5 would go out as 8,
-    naming a deployment that was never launched; a truth value, which would
-    go out as a width of 1 or 0 -- a `bool`, or numpy's boolean, which is not
-    a `bool` subclass and so is known by its `dtype`; and anything else `int`
-    does not take exactly. No value that is accepted changes on the way to
-    the `int` returned, and that check is what refuses integer text:
-    `int("8")` is 8, which is not equal to "8".
+    naming a deployment that was never launched; a boolean, which would go
+    out as a width of 1 or 0 -- a `bool`, or anything whose `dtype` has "bool"
+    in its text, as numpy's and torch's booleans do, neither being a `bool`
+    subclass; and anything else `int` does not take exactly. No value that is
+    accepted changes on the way to the `int` returned, and that check is what
+    refuses integer text: `int("8")` is 8, which is not equal to "8".
     """
     try:
-        if isinstance(value, bool) or getattr(value, "dtype", None) == bool:
+        if isinstance(value, bool) or "bool" in str(getattr(value, "dtype", "")):
             raise TypeError(f"{value!r} is a bool")
         whole = int(value)
     except (TypeError, ValueError, OverflowError):
