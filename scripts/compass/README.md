@@ -189,9 +189,12 @@ does print `GATE_CPU_RC=` on stdout on every path, so the number survives in the
 *text* of an untruncated pipe — but only an unpiped run puts it in `$?`.
 
 **What those rates are, and are not.** n=21, node 18, container `xiaobizh_n18_cpu`,
-on a box whose load was not controlled. 19 of the 21 are pinned: PR #79's review
+on a box whose load was not controlled. The table's counts and n are issue #93's.
+19 of the 21 are pinned: PR #79's review
 (issue comment 5765186351) ran `b58a48cc2` 19 times, for 17 nominal, 1 skip-variant
-and the one hard failure. The other 2 name no commit. All 21 runs were of **one
+and the one hard failure. The other 2, 1 nominal and 1 skip-variant by subtraction
+from the table, name no commit, so half the skip-variant rate rests on #93's count
+alone. Per #93, all 21 runs were of **one
 method**, `test_the_cost_per_byte_does_not_grow`. Not-nominal combined is ~1 in 7.
 The finding is the third outcome, not the rate. The rates are a **lower bound on
 the class**, not a measurement of it: the class holds **3 methods / 4 collected
@@ -207,8 +210,9 @@ observed failing the same way — `qwen: cost per KB grew 1.73x from 32 to 128 K
 comment 5765660762), which hit it on its own gate run. A sequential re-run of that
 same tree passed at **4496**, and 1 + 4495 = 4496 accounts for it exactly. Inherited,
 not measured here — so the failure belongs to the mechanism and not to the one
-method the counts came from. The two skip-variants both occurred under
-`gate_cpu.sh`, and the one hard failure in the counts under direct pytest.
+method the counts came from. Per #93, the only record that says, the two
+skip-variants both occurred under `gate_cpu.sh`, and the one hard failure in the
+counts under direct pytest; comment 5765186351 gives only its mix, 7 gate + 12 direct.
 
 **Run gates sequentially.** The failure was reproduced with two gate loops
 overlapping on node 18. Two gates on one box compete for the CPU the control arm is
