@@ -12,16 +12,22 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — 86 rows, **T1–T80 and T82–T87**, per topic, of which **80 are open**:
+3. **TODO register** — 87 rows, **T1–T87**, per topic, of which **81 are open**:
    T10, T15, T22, T48 and T65 are struck through as done, and T77 was opened and closed by
    P0.1.
    Both figures are the rows of section 3 below, counted as
    `grep -oE '^\| *~*\**T[0-9]+'` over that section and nothing else — prose elsewhere in
    this file names T-numbers that belong to other branches, and counting those tokens is
-   what made two earlier counts disagree. The register is **not contiguous and is not a
-   range**: T-numbers are allocated across parallel task branches and arrive when those
-   branches land. T73–T76 arrived with P0.3 and T83–T87 with P0.6; at the time of writing
-   T81 is still open on P0.4's branch
+   what made two earlier counts disagree. The ids **happen to be contiguous today and are
+   still not a range**: T-numbers are allocated across parallel task branches and arrive
+   when those branches land, so the run closes and reopens — T73–T76 arrived with P0.3,
+   T81 with P0.4 and T83–T87 with P0.6, and the register was discontiguous between the
+   last two. Every figure and range here, and on `README.md`'s front page and index row,
+   is checked against these rows by `tests/compass/test_open_items_register.py`; a
+   superseded extent must not be restated in prose in either file, because that test reads
+   any range starting at T1 as a claim about the register as it stands, and refuses any
+   other range or list that names two or more ids the register does not yet hold — so an
+   unlanded allocation may be named here only one id at a time
 4. **Cross-cutting issues and pending amendments**
 
 ---
