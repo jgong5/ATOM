@@ -1017,11 +1017,52 @@ def test_every_quantity_is_built_out_of_fields_this_schema_really_has():
             assert path in BY_PATH, f"{term} names {path}, which is not a field"
 
 
-def test_a_term_this_spec_carries_nothing_for_is_refused():
+def test_a_term_the_schema_does_not_know_is_asked_for_again_by_path():
+    assert "device.clock_ceiling" not in BY_PATH
     with pytest.raises(SpecRefusal) as refused:
         explain(resolved(), "device.clock_ceiling")
-    assert refused.value.rule is Rule.SHAPE
+    assert refused.value.rule is Rule.ADDRESSING
+    assert "is not a field, a block of fields or a quantity" in refused.value.what
+    assert "ask again by the whole dotted path" in refused.value.remedy
     assert "kv_blocks" in refused.value.remedy
+    assert "declared by this schema" not in str(refused.value)
+
+
+def test_an_optional_field_the_document_left_out_is_refused_as_absent():
+    # The path is right, so a remedy that says to ask again would send the
+    # reader round in a circle. The spec reads without `provenance.notes`
+    # because the schema declares it optional, and `explain` says exactly what
+    # the accessor says about the same field.
+    spec = resolved()
+    assert not BY_PATH["provenance.notes"].required
+    assert "provenance.notes" not in spec.values
+    with pytest.raises(SpecRefusal) as refused:
+        explain(spec, "provenance.notes")
+    with pytest.raises(SpecRefusal) as accessed:
+        spec.value("provenance.notes")
+    assert refused.value.rule is Rule.TOTALITY
+    assert "is declared by this schema as optional" in refused.value.what
+    assert "write it in the document" in refused.value.remedy
+    assert "ask again" not in refused.value.remedy
+    assert str(refused.value) == str(accessed.value)
+
+
+def test_a_block_an_assembled_spec_holds_nothing_under_names_its_first_field():
+    # A spec built from parts can lack required fields too, and then the
+    # absent field is required, so the remedy is in whatever assembled it.
+    whole = resolved()
+    spec = MachineSpec(
+        values={p: v for p, v in whole.values.items() if not p.startswith("host.ipc.")},
+        tokenizers=whole.tokenizers,
+    )
+    with pytest.raises(SpecRefusal) as refused:
+        explain(spec, "host.ipc")
+    assert refused.value.rule is Rule.TOTALITY
+    assert "`host.ipc.zmq_roundtrip_s` is declared by this schema" in (
+        refused.value.what
+    )
+    assert "merge the fragment" in refused.value.remedy
+    assert "optional" not in refused.value.what
 
 
 def test_the_basis_prints_its_spec_and_one_line_per_field():
