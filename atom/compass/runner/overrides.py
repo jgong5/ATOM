@@ -204,12 +204,7 @@ def _installed_readings(runner: Any) -> DeviceReadings:
 
 
 def _config_field(runner: Any, name: str) -> Any:
-    """The config field a refusal decides on, or a refusal naming it.
-
-    No default is taken. With one, a field ATOM renamed or removed would read
-    as that default, and the refusal keyed on it would stop firing with nothing
-    to show for it; without one, the rename is itself refused by name.
-    """
+    """A config field read with no default; a missing one is refused by name."""
     try:
         return getattr(runner.config, name)
     except AttributeError:
