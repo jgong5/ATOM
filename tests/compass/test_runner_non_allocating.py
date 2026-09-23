@@ -307,7 +307,7 @@ def test_skipping_warmup_is_what_lets_construction_finish():
     """`forward` refuses, so a warmup that ran one would raise out of `__init__`."""
     runner = Runner()
     assert runner._maybe_warmup() is None
-    with pytest.raises(RunnerRefusal):
+    with pytest.raises(RunnerRefusal, match="produces output"):
         runner.forward(object())
 
 

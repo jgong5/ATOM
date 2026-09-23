@@ -596,7 +596,7 @@ def test_forward_refuses_and_its_reply_is_one_object_read_for_nine_attributes():
         "num_bonus",
         "dspark_ell",
     }
-    with pytest.raises(RunnerRefusal):
+    with pytest.raises(RunnerRefusal, match="produces output"):
         Runner().forward(object())
 
 
