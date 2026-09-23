@@ -27,7 +27,6 @@ import ast
 import copy
 import json
 import pathlib
-import types
 
 import pytest
 import torch
@@ -527,22 +526,10 @@ def test_the_graph_pool_reservation_follows_the_element_size(resident):
     assert reserved(config, 288.0e9).total == GRAPH_POOL_BY_DTYPE[name]
 
 
-def test_a_config_that_spells_it_torch_dtype_is_read(qwen):
-    # transformers aliases `torch_dtype` to `dtype` on its own configs, so the
-    # older spelling reaches the reader alone only on a config that is not one.
-    older = types.SimpleNamespace(**vars(copy.deepcopy(qwen)))
-    del older.dtype
-    older.torch_dtype = torch.float32
-    terms = ModelTerms.declared_for_m1(
-        older, parameter_count=PARAMETERS, tp_size=1, warmup_tokens=WARMUP_TOKENS
-    )
-    assert terms.weights.nbytes == PARAMETERS * 4
-
-
 def test_a_config_with_no_dtype_refuses_rather_than_assuming_one(qwen):
     nameless = copy.deepcopy(qwen)
     del nameless.dtype
-    with pytest.raises(MemoryRefusal, match="neither `dtype` nor `torch_dtype`"):
+    with pytest.raises(MemoryRefusal, match="states no `dtype`, and every byte"):
         ModelTerms.declared_for_m1(
             nameless,
             parameter_count=PARAMETERS,

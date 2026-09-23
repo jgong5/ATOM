@@ -81,17 +81,16 @@ def _geometry(config, name: str):
 
 
 def _dtype(config):
-    """The dtype a model's tensors are resident at, under either spelling."""
+    """The dtype a model's tensors are resident at."""
     text = getattr(config, "text_config", config)
-    for name in ("dtype", "torch_dtype"):
-        value = getattr(text, name, None)
-        if value is not None:
-            return value
-    raise MemoryRefusal(
-        "this config states neither `dtype` nor `torch_dtype`, and every byte "
-        "of the model-side terms is twice or half what it should be without it",
-        "name the dtype on the config, or pass `dtype_bytes` explicitly",
-    )
+    value = getattr(text, "dtype", None)
+    if value is None:
+        raise MemoryRefusal(
+            "this config states no `dtype`, and every byte of the model-side "
+            "terms is twice or half what it should be without it",
+            "name the dtype on the config, or pass `dtype_bytes` explicitly",
+        )
+    return value
 
 
 @dataclass(frozen=True, slots=True)
