@@ -327,11 +327,8 @@ def test_the_declared_terms_are_exactly_weights_buffers_and_activations(spec, qw
 
 @pytest.mark.parametrize("tp_width", [1, 2])
 def test_the_min_budget_free_clamp_cannot_bind(spec, qwen, tp_width):
-    # Making it inert is this package's job; ATOM's own arithmetic runs over
-    # these readings in `atom.compass.runner.overrides`, and
-    # `test_the_min_budget_free_clamp_does_not_bind_on_either_side_of_free` in
-    # `test_kv_budget_engine.py` checks with the engine that it does not bind.
-    # What is checked here is the only thing checkable without the engine:
+    # `test_kv_budget_engine.py` checks with the engine that the clamp does not
+    # bind. What is checked here is the only thing checkable without the engine:
     # with `free` a clean box, the budget branch is below it at every
     # utilisation the engine accepts.
     readings = readings_at(spec, qwen, tp_width)
@@ -605,10 +602,10 @@ def _imported_names(tree):
     `node.level == 3`, which matches neither a forbidden root nor a forbidden
     prefix; its two rows in the positive control,
     `test_the_import_guard_catches_what_it_claims_to`, fail when the level is
-    ignored. `from . import sibling` carries `node.module is None`, which a
-    truthiness guard skips entirely. Here it resolves to the package alone and
-    the imported names are not added, so no row fails when that guard is put
-    back, and `from ... import model_engine` resolves to `atom` and passes.
+    ignored. `from ... import model_engine` carries `node.module is None`,
+    which a truthiness guard skips entirely; here each imported name is
+    resolved against the package instead, to `atom.model_engine`, and its row
+    fails when that guard is put back.
     """
     names = set()
     for node in ast.walk(tree):
@@ -617,7 +614,10 @@ def _imported_names(tree):
         elif isinstance(node, ast.ImportFrom):
             if node.level:
                 parts = PACKAGE_DOTTED.split(".")[: -node.level + 1 or None]
-                names.add(".".join(parts + ([node.module] if node.module else [])))
+                if node.module:
+                    names.add(".".join(parts + [node.module]))
+                else:
+                    names.update(".".join(parts + [alias.name]) for alias in node.names)
             elif node.module:
                 names.add(node.module)
     return names
@@ -644,6 +644,7 @@ def test_the_package_imports_no_device(module):
         ("from atom.model_engine.model_runner import ModelRunner", True),
         ("from ...model_engine import model_runner", True),
         ("from ...model_engine.model_runner import ModelRunner", True),
+        ("from ... import model_engine", True),
         ("from . import terms", False),
         ("from atom.compass.spec import MachineSpec", False),
     ],
@@ -651,7 +652,8 @@ def test_the_package_imports_no_device(module):
 def test_the_import_guard_catches_what_it_claims_to(source, caught):
     # A guard with no positive control is a guard nobody has seen work. The
     # two `from ...model_engine` rows are the forms a walk that ignores
-    # `node.level` lets through.
+    # `node.level` lets through, and `from ... import model_engine` the form a
+    # walk that skips `node.module is None` lets through.
     names = _imported_names(ast.parse(source))
     hit = any(
         name.partition(".")[0] in FORBIDDEN_ROOTS or name.startswith(FORBIDDEN_PREFIXES)

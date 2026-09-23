@@ -11,7 +11,7 @@ while `region_terms` refuses one -- is also published and loaded through the
 store, because a table that is right in the abstract and unwired in the store
 is machinery with no caller.
 
-Two things this file deliberately does not do, both inherited.
+Two things this file deliberately does not do.
 
 **It binds no `width`.** The matrix's six columns contain no width at all, so
 invalidation does not need #165 settled; where a key field happens to be
@@ -770,9 +770,8 @@ def test_a_publish_that_fails_on_the_way_to_the_rename_leaves_nothing_behind(tmp
 
     Validating `notes` makes the measured `TypeError` unreachable through
     `publish`, so a test driven only through the public surface would leave
-    the widened `except` as a claim nothing bites on -- an inert pin, made by
-    the fix for the thing above it. The staging directory is what is under
-    test, so the test goes to where it is made.
+    the widened `except` as a claim nothing bites on. The staging directory is
+    what is under test, so the test goes to where it is made.
     """
     store = ArtifactStore(tmp_path)
     destination = store.directory_for(KEY_OF[Row.PRICE_LIST])
