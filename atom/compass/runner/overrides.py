@@ -209,9 +209,9 @@ def _config_field(runner: Any, name: str) -> Any:
         return getattr(runner.config, name)
     except AttributeError:
         raise RunnerRefusal(
-            f"ATOM's config has no field {name!r}, and this runner reads it "
-            "to decide whether to refuse; answering as if it were unset would "
-            "let that refusal stop firing without saying so."
+            f"ATOM's config has no field {name!r}; this runner reads it with "
+            "no default, so a config that lacks it is refused by name rather "
+            "than read as if the field were unset."
         ) from None
 
 
