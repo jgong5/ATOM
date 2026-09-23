@@ -287,8 +287,7 @@ def test_modules_in_nested_packages_are_read(tmp_path, capsys):
         "atom/compass/sub/pkg/rows.py:3\n"
     ) in out
     assert (
-        "  ! tests/compass/sub/pkg/test_rows.py:7  "
-        "not a string constant (JoinedStr)\n"
+        "  ! tests/compass/sub/pkg/test_rows.py:7  not a string constant (JoinedStr)\n"
     ) in out
 
 
