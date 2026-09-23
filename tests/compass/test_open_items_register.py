@@ -223,6 +223,44 @@ def test_every_stated_extent_names_exactly_the_rows(path, rows):
             )
 
 
+# The extent rule above lets prose name one id the register does not hold, so an
+# allocation still on a branch can be mentioned before it lands. That threshold
+# is one comparison in the filter above, and nothing asserted it: moving it to
+# `> 2` or `> 3` left every test in this file passing. The two cases below pin
+# it at exactly two by running that test over documents written here -- a single
+# free mention and a pair -- rather than over a second copy of its rule, which
+# would pin the copy and let the rule move. The stated extent below is three ids
+# wide on purpose: at `> 2` a two-id extent is dropped by the same filter, and
+# both cases would then die on the precondition instead of on the hatch.
+FREE_MENTION = "The register runs T1–T3. {} allocated on a branch that has not landed."
+LANDED = [(1, False), (2, False), (3, False)]
+
+
+def test_one_unlanded_id_may_be_named_in_prose(tmp_path):
+    path = tmp_path / "one_unlanded_id.md"
+    path.write_text(FREE_MENTION.format("T99 is"), encoding="utf-8")
+    test_every_stated_extent_names_exactly_the_rows(path, LANDED)
+
+
+def test_two_unlanded_ids_refuse_and_the_refusal_names_them(tmp_path):
+    path = tmp_path / "two_unlanded_ids.md"
+    path.write_text(FREE_MENTION.format("T99 and T100 are"), encoding="utf-8")
+    with pytest.raises(
+        AssertionError,
+        match=r"two_unlanded_ids\.md names \[99, 100\] in 'T99 and T100'",
+    ):
+        test_every_stated_extent_names_exactly_the_rows(path, LANDED)
+
+
+def test_the_register_still_sanctions_naming_one_unlanded_id():
+    """The sentence the two cases above hold in place. Reworded away, the rule
+    would be enforcing a hatch its own document no longer offers."""
+    assert "only one id at a time" in flattened(REGISTER), (
+        f"{REGISTER.name} no longer sanctions naming an unlanded id one at a "
+        "time, and the extent rule above still allows it"
+    )
+
+
 @pytest.mark.parametrize("path", STATED_IN, ids=lambda p: p.name)
 def test_every_stated_count_matches_the_rows(path, rows):
     """Total, open, and the prose that decomposes one into the other."""
