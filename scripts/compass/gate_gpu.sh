@@ -328,7 +328,7 @@ rm -f "$OUT"
 printf '\n===== pre-flight (after) =====\n'
 "$PRE" || printf 'WARNING: pre-flight failed AFTER the run -- the node changed under it,\n         and the numbers above may not be attributable.\n' >&2
 
-[ "$VERDICT" -le 1 ] || WHY="$WHY; $((VERDICT - 1)) more finding(s) on stderr"
+[ "$VERDICT" -le 1 ] || WHY="${WHY%.}; $((VERDICT - 1)) more finding(s) on stderr"
 [ "$VERDICT" -eq 0 ] || finish 1 "$WHY"
 
 # An attestation names a tree. On a tree with no commit, gate_cpu.sh refuses

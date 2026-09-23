@@ -68,6 +68,7 @@ CASES = {
         {"tests/test_suite.py": _suite(EXPECT + 1)},
         "",
     ),
+    "no-fail-lines": (1, "0 FAILED line(s) were printed; 2 more", {}, " --no-summary"),
     "no-summary": (1, "no usable pytest summary", {"tests/test_suite.py": ""}, ""),
     "interrupted": (
         1,
