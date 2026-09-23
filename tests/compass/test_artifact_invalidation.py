@@ -56,6 +56,7 @@ from atom.compass.artifacts import (
     StaleArtifact,
     Topology,
     axes_of,
+    differences,
     fingerprint,
     member_name,
     rows_for,
@@ -783,3 +784,134 @@ def test_a_publish_that_fails_on_the_way_to_the_rename_leaves_nothing_behind(tmp
     assert "TypeError" in str(refused.value)
     assert not destination.exists()
     assert list(destination.parent.iterdir()) == []
+
+
+# --- refusals the package states, each reached by a caller ------------------
+
+
+def test_a_recorded_cell_the_matrix_has_no_column_for_is_refused(tmp_path):
+    """The cell-level companion of the row refusal above.
+
+    Without it the read succeeds and the cell is dropped: the entry answers
+    with a fingerprint narrower than the one it recorded, and the axis that
+    was recorded is never compared again.
+    """
+    store = ArtifactStore(tmp_path)
+    entry = publish(store, KEY_OF[Row.PRICE_LIST])
+    document = json.loads((entry.directory / "entry.json").read_bytes())
+    document["fingerprints"]["price_list"]["cells"]["compiler"] = Reading.stated(
+        "hipcc 6.2"
+    ).as_json()
+    (entry.directory / "entry.json").chmod(0o644)
+    (entry.directory / "entry.json").write_text(json.dumps(document))
+    with pytest.raises(ArtifactRefusal) as refused:
+        store.read(entry.key)
+    assert refused.value.rule is Rule.INVALIDATED
+    assert "records `compiler`, which the invalidation matrix has no column for" in str(
+        refused.value
+    )
+
+
+def test_a_publish_that_omits_the_gates_is_a_type_error(tmp_path):
+    """No default: an entry that states no gates cannot be checked on load."""
+    store = ArtifactStore(tmp_path)
+    with pytest.raises(TypeError):
+        store.publish(
+            KEY_OF[Row.PRICE_LIST],
+            provenance=STANZA,
+            topology=TP2,
+            conditions=BASE,
+            members={member_name("rows", rank, "json"): b"{}" for rank in TP2.ranks()},
+        )
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_publish_handed_something_that_is_not_a_gate_state_is_refused(tmp_path):
+    """A named refusal at publish, not an `AttributeError` from the JSON writer."""
+    store = ArtifactStore(tmp_path)
+    with pytest.raises(ArtifactRefusal) as refused:
+        publish(store, KEY_OF[Row.PRICE_LIST], gates="off")
+    assert refused.value.rule is Rule.GATE_STATE
+    assert "'off' is not a gate state" in str(refused.value)
+
+
+def test_a_miss_where_the_gate_and_the_device_both_moved_is_filed_as_the_gate(
+    tmp_path,
+):
+    """The gate is checked first, so the ledger names the gate as what declined.
+
+    The control shows the device move refuses on its own; without it, a
+    fingerprint that happened not to move would make the order unobservable.
+    """
+    store = ArtifactStore(tmp_path)
+    publish(store, KEY_OF[Row.PRICE_LIST])
+    gate_on = GateState.of(Gate("PRICE_KERNELS", "on", "COMPASS_PRICE_KERNELS"))
+    elsewhere = moved(BASE, Axis.DEVICE)
+
+    device_only = Resolution("step 41")
+    store.answer(KEY_OF[Row.PRICE_LIST], device_only, conditions=elsewhere, gates=GATES)
+    assert [miss.rule for miss in device_only.misses] == [Rule.INVALIDATED]
+
+    both = Resolution("step 41")
+    store.answer(KEY_OF[Row.PRICE_LIST], both, conditions=elsewhere, gates=gate_on)
+    assert [miss.rule for miss in both.misses] == [Rule.GATE_STATE]
+
+
+def test_a_dead_gate_cannot_hide_behind_a_live_twin_of_its_name(tmp_path):
+    """Two recorded rows for one gate name are refused rather than collapsed.
+
+    Collapsed by name, the last row wins: an entry recording the dead
+    `WORLD_SIZE` gate beside the live one would load clean under the live
+    gate, and the dead one would never be compared.
+    """
+    store = ArtifactStore(tmp_path)
+    entry = publish(store, KEY_OF[Row.PRICE_LIST])
+    document = json.loads((entry.directory / "entry.json").read_bytes())
+    document["gates"] = [
+        Gate("PRICE_KERNELS", "off", "WORLD_SIZE").as_json(),
+        PRICE_KERNELS.as_json(),
+    ]
+    (entry.directory / "entry.json").chmod(0o644)
+    (entry.directory / "entry.json").write_text(json.dumps(document))
+    with pytest.raises(ArtifactRefusal) as refused:
+        store.load(KEY_OF[Row.PRICE_LIST], conditions=BASE, gates=GATES)
+    assert refused.value.rule is Rule.GATE_STATE
+    assert "two gates share a name" in str(refused.value)
+
+
+def test_two_rows_over_the_same_axes_are_still_not_compared():
+    """Two rows with identical columns, so only the row check can refuse.
+
+    Compared cell by cell they would report no difference, which is an answer
+    to a question that was never asked.
+    """
+    assert axes_of(Row.REGION_TERMS) == axes_of(Row.MEMORY_READINGS)
+    with pytest.raises(ArtifactRefusal) as refused:
+        differences(
+            fingerprint(Row.REGION_TERMS, BASE),
+            fingerprint(Row.MEMORY_READINGS, BASE),
+        )
+    assert refused.value.rule is Rule.NOT_COMPARABLE
+    assert "a `region_terms` fingerprint was compared with a `memory_readings` one" in (
+        str(refused.value)
+    )
+
+
+def test_a_load_handed_something_that_is_not_a_gate_state_is_refused(tmp_path):
+    """The same refusal at load, where the recorded gates are checked."""
+    store = ArtifactStore(tmp_path)
+    publish(store, KEY_OF[Row.PRICE_LIST])
+    with pytest.raises(ArtifactRefusal) as refused:
+        store.load(KEY_OF[Row.PRICE_LIST], conditions=BASE, gates="off")
+    assert refused.value.rule is Rule.GATE_STATE
+    assert "'off' is not a gate state" in str(refused.value)
+
+
+def test_conditions_that_state_an_axis_the_matrix_has_no_column_for_are_refused():
+    """All six stated plus one more: the extra axis is named, not dropped."""
+    with pytest.raises(ArtifactRefusal) as refused:
+        Conditions.of(
+            **{axis.field: BASE.reading(axis) for axis in Axis}, compiler="hipcc 6.2"
+        )
+    assert refused.value.rule is Rule.INVALIDATED
+    assert "these conditions state an unknown compiler" in str(refused.value)
