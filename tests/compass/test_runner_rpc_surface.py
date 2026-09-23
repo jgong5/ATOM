@@ -219,7 +219,13 @@ class Runner(NonAllocatingRunner):
     """
 
     def __init__(self):
-        self.config = SimpleNamespace(disagg_is_decode=False, speculative_config=None)
+        self.config = SimpleNamespace(
+            disagg_is_decode=False,
+            speculative_config=None,
+            eos_token_id=-1,
+            stop_token_ids=[],
+            pipeline_parallel_size=1,
+        )
         self.capture_sizes = [0]
         self.capture_sizes_np = "untouched"
 

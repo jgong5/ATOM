@@ -389,7 +389,10 @@ def test_the_refusals_read_exactly_these_config_fields():
     assert _fields_the_refusals_read() == [
         "disagg_is_decode",
         "enforce_eager",
+        "eos_token_id",
+        "pipeline_parallel_size",
         "speculative_config",
+        "stop_token_ids",
     ]
 
 

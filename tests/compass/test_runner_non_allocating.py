@@ -99,7 +99,12 @@ class Runner(NonAllocatingRunner):
 
     def __init__(self):
         self.config = SimpleNamespace(
-            num_kvcache_blocks=None, disagg_is_decode=False, speculative_config=None
+            num_kvcache_blocks=None,
+            disagg_is_decode=False,
+            speculative_config=None,
+            eos_token_id=-1,
+            stop_token_ids=[],
+            pipeline_parallel_size=1,
         )
 
 

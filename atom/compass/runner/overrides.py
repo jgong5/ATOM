@@ -536,11 +536,11 @@ class NonAllocatingRunner:
             # control, and `self.config` is what this reads.
             stream = DeferredTokenStream(
                 reported_token_id(
-                    getattr(self.config, "eos_token_id", None),
-                    getattr(self.config, "stop_token_ids", None),
+                    _config_field(self, "eos_token_id"),
+                    _config_field(self, "stop_token_ids"),
                 ),
                 deferred=reports_previous_step(
-                    getattr(self.config, "pipeline_parallel_size", 1)
+                    _config_field(self, "pipeline_parallel_size")
                 ),
             )
             self._token_stream = stream
