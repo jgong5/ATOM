@@ -10,10 +10,7 @@ AI agents are given full autonomy under standing rules at `atom/compass/AI_DEV_R
 ```bash
 pip install -e .                          # editable install
 python -m pytest tests/                   # the full suite; needs a GPU driver
-scripts/compass/gate_cpu.sh               # the CPU tier, run per task: every test file
-                                          # outside tests/plugin/ and cpu_gate_exclude.txt,
-                                          # no driver; must be green. What it excludes and
-                                          # its baselines: scripts/compass/README.md
+scripts/compass/gate_cpu.sh               # CPU tier, per task; no driver as a batch; must be green: scripts/compass/README.md
 black . && ruff check .                   # format + lint (CI enforced)
 ```
 
