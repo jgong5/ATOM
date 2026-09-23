@@ -31,10 +31,14 @@ from atom.compass.artifacts import (
     KEY_FIELDS,
     ArtifactRefusal,
     ArtifactStore,
+    Conditions,
+    Gate,
+    GateState,
     Key,
     Kind,
     Provenance,
     RankCoords,
+    Reading,
     Rule,
     SourceRoot,
     Topology,
@@ -67,6 +71,22 @@ AITER_ROOT = SourceRoot(
     "git describe --tags --always --dirty",
     0,
 )
+
+
+#: What every publish here states about the conditions it was made under and
+#: the gates that shaped it. A publish requires both and this file is about
+#: neither:
+#: what they *do* is exercised in `test_artifact_invalidation.py`, and here
+#: they are the fixture that lets a publish happen at all.
+CONDITIONS = Conditions.of(
+    software_stack="rocm7.2.4 / aiter v0.1.21.dev0-49-gf4e7c7509 / rccl2.22.3",
+    torch="2.10.0+rocm7.2.4",
+    atom_src=Reading.of_source_root(ATOM_ROOT),
+    model="Qwen/Qwen3-32B",
+    device="MI308X-80CU",
+    engine_config="cudagraph=piecewise,level=3",
+)
+GATES = GateState.of(Gate("PRICE_KERNELS", "off", "COMPASS_PRICE_KERNELS"))
 
 
 def stanza(produced_by: str = "compass calibrate phase-1b") -> Provenance:
@@ -251,7 +271,13 @@ def test_an_entry_round_trips_through_the_naming_function(tmp_path, topology, ke
     store = ArtifactStore(tmp_path)
     members = members_for(topology, "steps", "jsonl")
     published = store.publish(
-        key, provenance=stanza(), topology=topology, members=members, notes="first pass"
+        key,
+        provenance=stanza(),
+        conditions=CONDITIONS,
+        gates=GATES,
+        topology=topology,
+        members=members,
+        notes="first pass",
     )
     entry = store.read(key)
     assert entry.digest == published.digest
@@ -274,6 +300,8 @@ def test_a_read_that_drops_the_rank_coordinates_refuses_by_name(tmp_path):
     store.publish(
         key,
         provenance=stanza(),
+        conditions=CONDITIONS,
+        gates=GATES,
         topology=wide,
         members=members_for(wide, "steps", "jsonl"),
     )
@@ -311,6 +339,8 @@ def test_one_rank_writing_for_four_is_refused_at_hand_off(tmp_path):
         store.publish(
             graph_key("qwen3-moe-48L-tp2dp2"),
             provenance=stanza(),
+            conditions=CONDITIONS,
+            gates=GATES,
             topology=topology,
             members={member_name("graph", only, "json"): b"807 operators"},
         )
@@ -330,6 +360,8 @@ def test_a_notes_only_rewrite_of_a_handed_off_entry_is_refused(tmp_path):
     first = store.publish(
         key,
         provenance=stanza(),
+        conditions=CONDITIONS,
+        gates=GATES,
         topology=topology,
         members=members,
         notes="case (b) aggregate",
@@ -339,6 +371,8 @@ def test_a_notes_only_rewrite_of_a_handed_off_entry_is_refused(tmp_path):
         store.publish(
             key,
             provenance=stanza(),
+            conditions=CONDITIONS,
+            gates=GATES,
             topology=topology,
             members=dict(members),
             notes="case (b) aggregate, reuse note corrected",
@@ -361,6 +395,8 @@ def test_the_notes_are_inside_the_digest(tmp_path):
             store.publish(
                 graph_key(f"qwen3-moe-48L-v{index}"),
                 provenance=stanza(),
+                conditions=CONDITIONS,
+                gates=GATES,
                 topology=topology,
                 members=members,
                 notes=note,
@@ -376,6 +412,8 @@ def test_a_member_changed_after_hand_off_is_refused(tmp_path):
     store.publish(
         key,
         provenance=stanza(),
+        conditions=CONDITIONS,
+        gates=GATES,
         topology=topology,
         members=members_for(topology, "prices", "json"),
     )
@@ -398,6 +436,8 @@ def test_an_entry_moved_by_hand_is_found_out(tmp_path):
     store.publish(
         mine,
         provenance=stanza(),
+        conditions=CONDITIONS,
+        gates=GATES,
         topology=topology,
         members=members_for(topology, "prices", "json"),
     )
@@ -440,6 +480,8 @@ def test_a_hand_edited_entry_is_refused_by_name(tmp_path, damage, expected):
     entry = store.publish(
         key,
         provenance=stanza(),
+        conditions=CONDITIONS,
+        gates=GATES,
         topology=topology,
         members=members_for(topology, "prices", "json"),
     )
@@ -459,6 +501,8 @@ def test_a_truncated_entry_is_refused_by_name(tmp_path):
     entry = store.publish(
         key,
         provenance=stanza(),
+        conditions=CONDITIONS,
+        gates=GATES,
         topology=topology,
         members=members_for(topology, "prices", "json"),
     )
@@ -486,6 +530,8 @@ def test_an_empty_directory_in_the_way_is_not_silently_replaced(tmp_path):
         store.publish(
             key,
             provenance=stanza(),
+            conditions=CONDITIONS,
+            gates=GATES,
             topology=topology,
             members=members_for(topology, "prices", "json"),
         )
@@ -513,6 +559,8 @@ def test_an_abandoned_staging_directory_does_not_block_a_publish(tmp_path):
     entry = store.publish(
         key,
         provenance=stanza(),
+        conditions=CONDITIONS,
+        gates=GATES,
         topology=topology,
         members=members_for(topology, "prices", "json"),
     )
@@ -533,6 +581,8 @@ def test_the_store_is_a_directory_convention_with_no_index(tmp_path):
     entry = store.publish(
         key,
         provenance=stanza(),
+        conditions=CONDITIONS,
+        gates=GATES,
         topology=topology,
         members=members_for(topology, "prices", "json"),
     )

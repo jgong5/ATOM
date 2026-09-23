@@ -11,6 +11,13 @@ A refusal carries three parts, as everywhere else in Compass: which rule
 declined, what tripped it, and what would satisfy it. The third part is the
 only one the caller needs, and it is the one an exception message usually
 leaves out.
+
+Three of the rules are about whether an entry is still valid rather than
+about what names it, and the pair worth reading together is `INVALIDATED`
+and `NOT_COMPARABLE`. The first says a comparison
+was made and failed; the second says it could not be made at all, which is
+what a git tree and a git commit in one `revision` field amount to. Collapsing
+the second into the first would report a change nobody observed.
 """
 
 import enum
@@ -25,6 +32,9 @@ class Rule(enum.Enum):
     PROVENANCE = "an entry names every executed source root"
     IMMUTABLE = "a handed-off entry is immutable"
     RESOLUTION = "resolution names its answer"
+    INVALIDATED = "an artifact is valid only under the conditions its row depends on"
+    NOT_COMPARABLE = "two readings of different kinds are not compared"
+    GATE_STATE = "a gate's state is checked in the artifact, not in the flag in force"
 
 
 class ArtifactRefusal(Exception):
