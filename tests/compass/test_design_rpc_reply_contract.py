@@ -18,14 +18,16 @@ the second one parks anybody.
 **This guards the document, not the runner.** What a runner must return, and
 what a raise becomes once it has left the worker, are asserted beside the module
 that owns them. What is asserted here is that the prose still describes ATOM's
-source: the names it enumerates, how many of them are waited on, which ones are
-not, and the site and arity it cites for the unpack.
+source: the names it enumerates and how many there are, how many of them are
+waited on, which ones are not, and the site and arity it cites for the unpack.
 
-That is the whole reach: an assertion that carries no number and no name is
-outside it. Put the rule this paragraph replaced back in place of the sentence
-that corrects it, with every number left alone, and nothing here fails. The
-source facts behind two such assertions are checked below; that the prose still
-makes them is not.
+That is the whole reach: the six values `audit` compares. Every other assertion
+is outside it, including one that sits beside a compared name or number. Flip
+where the unpack runs or whether the wait has a timeout, or cite other lines for
+the dispatch, and nothing here fails; nor does putting the rule this paragraph
+replaced back in place of the sentence that corrects it, with every compared
+value left alone. The source facts behind the first two are checked below; that
+the prose still makes them is not.
 
 Nothing below writes down an answer. The waited/unwaited partition comes from
 `RPC_SURFACE`, the unpack's line and arity are walked out of `engine_core.py`,
@@ -241,7 +243,7 @@ DRIFTS = (
 )
 
 # The checks each drift must raise and no others, so a check deleted from
-# `audit` fails the drift that isolates it, by name.
+# `audit` fails, by name, every drift that raises it.
 TOTAL, CITE = "how many there are", f"the line it cites for the {UNPACKED} unpack"
 WAITED, UNWAITED = "how many are waited on", "which are not waited on"
 FIRES = {
@@ -263,8 +265,10 @@ def test_the_guard_fires_when_one_side_moves_alone(drift):
 
 
 def test_reverted_is_the_pre_fix_paragraph_byte_for_byte():
-    """A paraphrase would still fire the guard; this keeps `REVERTED` the text
-    `git show` prints for that paragraph at the commit named above it."""
+    """A paraphrase would still fire the guard; this keeps `REVERTED` the paragraph
+    at the commit named above it. The digest is sha256 over that paragraph alone:
+    the document split on blank lines, LF endings, no trailing newline, UTF-8. It
+    pins history, so the only legitimate change is a new anchor commit."""
     digest = "36da9cc1ef3f9f1fa8bdf192023dc2e332d6c42dc5dce1ca318a5fb0f8c0a932"
     assert hashlib.sha256(REVERTED.encode("utf-8")).hexdigest() == digest
 
