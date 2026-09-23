@@ -27,6 +27,7 @@ import ast
 import copy
 import json
 import pathlib
+import types
 
 import pytest
 import torch
@@ -167,6 +168,32 @@ def spec():
 def qwen():
     raw = json.loads(CONFIG_JSON.read_text())
     return PretrainedConfig.from_dict(raw["text_config"])
+
+
+#: The terms sized by the model's element size, at TP1, for a 2-byte and a
+#: 4-byte dtype. With bfloat16 alone, a size that collapsed to the literal 2
+#: would read exactly like the right one; float32 is every term doubled.
+MODEL_TERMS_BY_DTYPE = {
+    "bfloat16": {
+        "weights": 54_000_000_000,
+        "buffers": 33_554_432,
+        "activations": 805_306_368,
+    },
+    "float32": {
+        "weights": 108_000_000_000,
+        "buffers": 67_108_864,
+        "activations": 1_610_612_736,
+    },
+}
+GRAPH_POOL_BY_DTYPE = {"bfloat16": 1_877_213_184, "float32": 3_754_426_368}
+
+
+@pytest.fixture(scope="module", params=sorted(MODEL_TERMS_BY_DTYPE))
+def resident(request, qwen):
+    """The same model with its tensors resident at another dtype."""
+    config = copy.deepcopy(qwen)
+    config.dtype = getattr(torch, request.param)
+    return request.param, config
 
 
 def ladder():
@@ -486,6 +513,30 @@ def test_the_model_dtype_sizes_the_model_terms(qwen):
     )
     assert terms.buffers.nbytes == 262_144 * 64 * 2
     assert " x 2 B" in terms.buffers.source
+
+
+def test_the_model_terms_follow_the_element_size(spec, resident):
+    name, config = resident
+    peak = readings_at(spec, config, 1).peak_torch
+    expected = MODEL_TERMS_BY_DTYPE[name]
+    assert {t.name: t.nbytes for t in peak.terms if t.name in expected} == expected
+
+
+def test_the_graph_pool_reservation_follows_the_element_size(resident):
+    name, config = resident
+    assert reserved(config, 288.0e9).total == GRAPH_POOL_BY_DTYPE[name]
+
+
+def test_a_config_that_spells_it_torch_dtype_is_read(qwen):
+    # transformers aliases `torch_dtype` to `dtype` on its own configs, so the
+    # older spelling reaches the reader alone only on a config that is not one.
+    older = types.SimpleNamespace(**vars(copy.deepcopy(qwen)))
+    del older.dtype
+    older.torch_dtype = torch.float32
+    terms = ModelTerms.declared_for_m1(
+        older, parameter_count=PARAMETERS, tp_size=1, warmup_tokens=WARMUP_TOKENS
+    )
+    assert terms.weights.nbytes == PARAMETERS * 4
 
 
 def test_a_config_with_no_dtype_refuses_rather_than_assuming_one(qwen):
