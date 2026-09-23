@@ -98,7 +98,7 @@ class Runner(NonAllocatingRunner):
     """The overrides over a base that supplies only what they read."""
 
     def __init__(self):
-        self.config = SimpleNamespace(num_kvcache_blocks=None)
+        self.config = SimpleNamespace(num_kvcache_blocks=None, disagg_is_decode=False)
 
 
 class SomeModel:
