@@ -11,6 +11,7 @@ an approximation but a different question.
 """
 
 import json
+import logging
 
 import pytest
 
@@ -241,6 +242,21 @@ class TestDecodeRungs:
             for _ in range(4):
                 oracle.estimate(self._shape(4))
         assert caplog.text.count("no decode graph for rung") == 1
+
+    def test_a_lone_rung_warns_too(self, tmp_path, caplog):
+        """One measured rung is the dangerous case, not the exempt one.
+
+        It was exempt: the warning was gated on having more than one rung, so
+        a price list carrying only batch-1 decode graphs answered every other
+        bucket in silence. That is exactly the configuration the cc-traces
+        rungs ran under, and it read -51.7% low over the 49075 decode steps
+        at c4/c8/c16 whose bucket was never captured.
+        """
+        prices, graphs = self._ladder(tmp_path, [1])
+        oracle = PricedGraphCostOracle(prices, graphs, boundary_seconds=0.0)
+        with caplog.at_level("WARNING"):
+            oracle.estimate(self._shape(16))
+        assert "no decode graph for rung 16" in caplog.text
 
     def test_one_graph_behaves_as_before(self, tmp_path):
         prices, graph = _artifacts(tmp_path, [_op("a")], seconds=1e-5)
@@ -543,3 +559,153 @@ class TestPrefillShapes:
         # is the caller saying that is the graph to use.
         assert oracle.estimate(self._shape(8, 0)).seconds == pytest.approx(
             1e-9 * 16384 * 229376)
+
+def _graph_at(tmp_path, name, batch, context):
+    """A graph carrying the capture shape a grid point records."""
+    graph = {"version": 2, "key": None,
+             "provenance": {"shape": {"num_scheduled_tokens": [1] * batch,
+                                      "context_lens": [context] * batch}},
+             "ops": [_op("a")]}
+    (tmp_path / name).write_text(json.dumps(graph))
+
+
+def _one_price(tmp_path):
+    prices = {"prices": {signature_of(_op("a")): {
+        "name": "a", "seconds": 1e-5, "occurrences": 1,
+        "kernels": {"k": 1e-5}}}}
+    (tmp_path / "p.json").write_text(json.dumps(prices))
+    return str(tmp_path / "p.json")
+
+
+def _decode_at(context, batch=1):
+    return StepShape(num_scheduled_tokens=(1,) * batch,
+                     context_lens=(context,) * batch, capture_bucket=batch)
+
+
+def _skewed_graph_at(tmp_path, name, batch, short, long_):
+    """A capture with one long row among short ones."""
+    graph = {"version": 2, "key": None,
+             "provenance": {"shape": {
+                 "num_scheduled_tokens": [1] * batch,
+                 "context_lens": [short] * (batch - 1) + [long_]}},
+             "ops": [_op("a")]}
+    (tmp_path / name).write_text(json.dumps(graph))
+
+
+def _skewed_decode_at(short, long_, batch):
+    lens = (short,) * (batch - 1) + (long_,)
+    return StepShape(num_scheduled_tokens=(1,) * batch,
+                     context_lens=lens, capture_bucket=batch)
+
+
+class TestARungIsAContextLadder:
+    """A grid captured across a run's context range holds one batch size at
+    many contexts. Keyed on batch alone those graphs overwrite each other and
+    the glob's sort order picks the survivor, silently and in the direction
+    that looks like coverage: on a c1 rung one graph taken at context 99024
+    answered every step and ran +27% under 50k of context against -17% past
+    250k.
+    """
+
+    CONTEXTS = (176, 49168, 99024, 191808)
+
+    def _oracle(self, tmp_path, contexts=CONTEXTS, batch=1):
+        for ctx in contexts:
+            _graph_at(tmp_path, f"g_c{ctx}.json", batch, ctx)
+        return PricedGraphCostOracle(_one_price(tmp_path),
+                                     str(tmp_path / "g_*.json"))
+
+    def test_every_graph_at_a_rung_is_kept_in_context_order(self, tmp_path):
+        oracle = self._oracle(tmp_path)
+        assert sorted(oracle.by_rung) == [1]
+        assert ([int(p.context) for p in oracle.by_rung[1]]
+                == list(self.CONTEXTS))
+
+    def test_a_step_takes_the_nearest_measured_context(self, tmp_path):
+        oracle = self._oracle(tmp_path)
+        for ctx, want in ((200, 176), (60000, 49168), (250000, 191808)):
+            assert oracle._for_rung(_decode_at(ctx)).path.endswith(
+                f"g_c{want}.json")
+
+    def test_it_is_not_whichever_file_the_glob_visited_last(self, tmp_path):
+        oracle = self._oracle(tmp_path)
+        assert not oracle._for_rung(_decode_at(200)).path.endswith(
+            "g_c99024.json")
+
+    def test_a_context_nothing_is_within_2x_of_warns_once(self, tmp_path,
+                                                          caplog):
+        oracle = self._oracle(tmp_path, contexts=(99024, 191808))
+        with caplog.at_level(logging.WARNING):
+            oracle._for_rung(_decode_at(176))
+            oracle._for_rung(_decode_at(200))
+        said = [r.getMessage() for r in caplog.records
+                if "no decode graph within 2x of context" in r.getMessage()]
+        assert len(said) == 1
+
+    def test_a_context_inside_the_measured_range_is_not_a_guess(self, tmp_path,
+                                                                caplog):
+        oracle = self._oracle(tmp_path)
+        with caplog.at_level(logging.WARNING):
+            oracle._for_rung(_decode_at(100000))
+        assert not [r for r in caplog.records
+                    if "within 2x of context" in r.getMessage()]
+
+    def test_distinct_rungs_still_key_apart(self, tmp_path):
+        for batch in (1, 2, 4):
+            _graph_at(tmp_path, f"g_b{batch}.json", batch, 99024)
+        oracle = PricedGraphCostOracle(_one_price(tmp_path),
+                                       str(tmp_path / "g_*.json"))
+        assert sorted(oracle.by_rung) == [1, 2, 4]
+        assert oracle._for_rung(_decode_at(99024, batch=2)).path.endswith(
+            "g_b2.json")
+
+    def test_describe_says_the_context_span(self, tmp_path):
+        assert ("decode rung 1 over 4 contexts [176..191808]"
+                in self._oracle(tmp_path).describe())
+
+
+class TestTheLongestRowSetsTheCost:
+    """Decode attention launches a uniform grid over batch x max_seqlen_k and
+    pays for that whole rectangle, so a batch of one long row and fifteen short
+    ones costs what sixteen long rows cost. Over 49075 real decode steps, step
+    seconds regressed on the longest context give R2 0.983/0.997/0.994/0.995 at
+    rungs 2/4/8/16; on the mean of the contexts, 0.885/0.605/0.541/0.000. The
+    mean explains none of rung 16.
+    """
+
+    def _ladder(self, tmp_path, batch=4):
+        for ctx in (50000, 200000):
+            _graph_at(tmp_path, f"g_c{ctx}.json", batch, ctx)
+        return PricedGraphCostOracle(_one_price(tmp_path),
+                                     str(tmp_path / "g_*.json"))
+
+    def test_a_skewed_step_reads_the_graph_nearest_its_longest_row(
+            self, tmp_path):
+        oracle = self._ladder(tmp_path)
+        # mean 56000, nearest 50000; max 200000, nearest 200000.
+        step = _skewed_decode_at(8000, 200000, batch=4)
+        assert sum(step.context_lens) / 4 < 60000
+        assert oracle._for_rung(step).path.endswith("g_c200000.json")
+
+    def test_a_uniform_step_is_unchanged(self, tmp_path):
+        oracle = self._ladder(tmp_path)
+        assert oracle._for_rung(_decode_at(60000, batch=4)).path.endswith(
+            "g_c50000.json")
+
+    def test_a_skewed_graph_is_indexed_at_its_longest_row(self, tmp_path):
+        _skewed_graph_at(tmp_path, "g_skew.json", 4, 8000, 200000)
+        oracle = PricedGraphCostOracle(_one_price(tmp_path),
+                                       str(tmp_path / "g_*.json"))
+        point = oracle.by_rung[4][0]
+        assert point.max_context == 200000
+        assert point.context == 56000
+
+    def test_the_ladder_is_ordered_by_the_longest_row(self, tmp_path):
+        _graph_at(tmp_path, "g_uniform.json", 4, 100000)
+        _skewed_graph_at(tmp_path, "g_skew.json", 4, 8000, 200000)
+        oracle = PricedGraphCostOracle(_one_price(tmp_path),
+                                       str(tmp_path / "g_*.json"))
+        # The skewed graph has the lower mean (56000 against 100000) and the
+        # higher maximum, so the two rules order these two graphs oppositely.
+        assert [int(p.max_context) for p in oracle.by_rung[4]] == [100000,
+                                                                   200000]

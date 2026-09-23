@@ -63,6 +63,14 @@ class _Costed:
     is_prefill: bool
     batch: int
     context: float
+    #: The longest context in the step, which on a decode graph is what the
+    #: attention kernel is actually paid for: it launches a uniform grid over
+    #: batch x max_seqlen_k, so a batch of one long row and fifteen short ones
+    #: costs what sixteen long rows cost. Fitted over 49075 real decode steps,
+    #: step seconds against the max give R2 0.983 to 0.997 per rung, against
+    #: the mean 0.885 down to 0.000. Separate from `context` because the
+    #: prefill path selects on the mean and that has not been measured.
+    max_context: float = 0.0
     #: Tokens the step scheduled. On a decode graph this is the batch; on a
     #: prefill graph it is the chunk, and together with `context` it is what
     #: distinguishes one prefill graph from another.
@@ -291,13 +299,23 @@ class PricedGraphCostOracle:
         import glob as _glob
 
         paths = sorted(_glob.glob(self.graph_path)) or [self.graph_path]
-        self.by_rung: dict[int, _Costed] = {}
+        # A rung holds every graph measured at that batch size, ordered by the
+        # context it was captured at. Several graphs naming one rung is
+        # coverage, not a clash -- a grid taken across a run's context range
+        # is one batch size at many contexts -- but keyed on batch alone they
+        # overwrite each other and the glob's sort order decides which shape
+        # prices the run. Twenty graphs and one graph then look identical to
+        # every caller, and the twenty-way case is the one that looks
+        # measured. Keep them all and let `_for_rung` choose.
+        self.by_rung: dict[int, list[_Costed]] = {}
         for path in paths:
             with open(path, encoding="utf-8") as fh:
                 blob = json.load(fh)
             costed = self._cost(blob, price_list, path)
-            self.by_rung[costed.batch or 0] = costed
-        self.decode = (self.by_rung[max(self.by_rung)] if self.by_rung
+            self.by_rung.setdefault(costed.batch or 0, []).append(costed)
+        for points in self.by_rung.values():
+            points.sort(key=lambda c: c.max_context)
+        self.decode = (self.by_rung[max(self.by_rung)][-1] if self.by_rung
                        else self._cost({"ops": []}, price_list, self.graph_path))
 
         # A prefill step is different operators at different shapes, so a decode
@@ -342,6 +360,7 @@ class PricedGraphCostOracle:
         self._warned = False
         self._warned_rung = False
         self._warned_prefill = False
+        self._warned_decode_context = False
 
         if self.unpriced:
             logger.warning(
@@ -389,33 +408,78 @@ class PricedGraphCostOracle:
             is_prefill=bool(recorded.get("num_prefill_tokens", 0)),
             batch=len(recorded.get("num_scheduled_tokens") or []),
             context=(sum(contexts) / len(contexts)) if contexts else 0.0,
+            max_context=float(max(contexts)) if contexts else 0.0,
             tokens=int(sum(recorded.get("num_scheduled_tokens") or [])),
         )
 
     def _for_rung(self, shape: StepShape) -> "_Costed":
-        """The decode graph for the rung this step replays.
+        """The decode graph for the rung this step replays, at its context.
 
-        Exact match only. The rungs are enumerable and were measured, so there is
-        nothing to interpolate and nothing that would justify it: a neighbouring
-        shape can run a different tuned kernel and cost 2.4x more, and the price
-        list cannot tell in advance which neighbours are safe. Where a rung was
-        not measured this falls back to the largest that was, and says so once --
-        an answer that is wrong by a known mechanism rather than by a silent one.
+        The rung is matched exactly. The rungs are enumerable and were
+        measured, so there is nothing to interpolate and nothing that would
+        justify it: a neighbouring shape can run a different tuned kernel and
+        cost 2.4x more, and the price list cannot tell in advance which
+        neighbours are safe. Where a rung was not measured this falls back to
+        the largest that was, and says so once -- an answer that is wrong by a
+        known mechanism rather than by a silent one.
+
+        Context is then matched the same way, nearest measured and never
+        interpolated. A decode step's attention reads the whole context, so
+        one graph does not stand in for a range: on a c1 cc-traces rung a
+        graph captured at context 99024 answered every one of 39831 steps and
+        ran +27.2% under 50k of context against -16.7% past 250k, monotonic,
+        with each band's MAPE equal to its bias -- a constant offset per band
+        rather than scatter.
         """
-        if len(self.by_rung) <= 1:
-            return self.decode
         rung = shape.capture_bucket or shape.batch_size
-        point = self.by_rung.get(rung)
-        if point is not None:
-            return point
-        if not self._warned_rung:
-            self._warned_rung = True
+        points = self.by_rung.get(rung)
+        if points is None:
+            if not self._warned_rung:
+                self._warned_rung = True
+                logger.warning(
+                    "ATOMCompass WARNING: no decode graph for rung %s (have "
+                    "%s); using rung %s instead. Trace that rung to fix it -- "
+                    "prices are not interpolated across shapes on purpose, "
+                    "and standing one rung in for another is not a small "
+                    "error: batch-1 graphs answering buckets 2 to 16 read "
+                    "-51.7%% low over 49075 cc-traces decode steps.",
+                    rung, sorted(self.by_rung), self.decode.batch)
+            points = self.by_rung.get(self.decode.batch or 0) or [self.decode]
+        return self._at_context(points, shape)
+
+    def _at_context(self, points: list, shape: StepShape) -> "_Costed":
+        """The graph within one rung measured nearest this step's context.
+
+        Relative distance, matching `_for_prefill`: 16 of context against 176
+        is a different regime, while 229376 against 245760 is the same one.
+
+        The context that decides is the *longest* row, not the mean of them.
+        Decode attention launches a uniform grid over batch x max_seqlen_k and
+        pays for that whole rectangle, so a batch of one 229376-token row and
+        fifteen 8192-token ones costs what sixteen long rows cost. Over the
+        49075 real cc-traces decode steps, step seconds regressed on the max
+        give R2 0.983/0.997/0.994/0.995 at rungs 2/4/8/16; on the mean,
+        0.885/0.605/0.541/0.000. Selecting on the mean had rung 8 reading
+        -8.4% and rung 16 -50.1%.
+        """
+        if len(points) == 1:
+            return points[0]
+        ctx = float(max(shape.context_lens)) if shape.context_lens else 0.0
+
+        def offset(point: "_Costed") -> float:
+            return abs(math.log((ctx + 1) / (point.max_context + 1)))
+
+        point = min(points, key=offset)
+        if offset(point) > math.log(2) and not self._warned_decode_context:
+            self._warned_decode_context = True
             logger.warning(
-                "ATOMCompass WARNING: no decode graph for rung %s (have %s); "
-                "using the largest measured one. Trace that rung to fix it -- "
-                "prices are not interpolated across shapes on purpose.",
-                rung, sorted(self.by_rung))
-        return self.decode
+                "ATOMCompass WARNING: no decode graph within 2x of context "
+                "%.0f at rung %d (measured %s); using %s. Capture that "
+                "context to fix it -- prices are not interpolated across "
+                "shapes on purpose.",
+                ctx, point.batch, [int(p.max_context) for p in points],
+                point.path)
+        return point
 
     def _for_prefill(self, shape: StepShape) -> Optional["_Costed"]:
         """The prefill graph closest to the shape this step is prefilling.
@@ -522,6 +586,11 @@ class PricedGraphCostOracle:
                                      for p in self.by_prefill)))
         rungs = (f", {len(self.by_rung)} decode rungs {sorted(self.by_rung)}"
                  if len(self.by_rung) > 1 else "")
+        spread = max(self.by_rung.values(), key=len) if self.by_rung else []
+        if len(spread) > 1:
+            rungs += (f", decode rung {spread[0].batch} over {len(spread)} "
+                      f"contexts [{int(spread[0].max_context)}.."
+                      f"{int(spread[-1].max_context)}]")
         return (f"PricedGraphCostOracle("
                 f"{self.decode.seconds*1e3:.3f}ms decode kernels, {prefill}; "
                 f"+{self.boundary_seconds*1e6:.2f}us/launch replayed, "

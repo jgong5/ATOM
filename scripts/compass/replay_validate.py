@@ -213,10 +213,48 @@ def _engine_flags(args):
     return flags
 
 
+#: `--compass-oracle` resolves a qualname and nothing else -- there is no
+#: short-name registry behind it -- so these live here, for the command line,
+#: rather than in the engine's argument parser.
+ORACLES = {
+    "calibrated": "atom.compass.core.cost.calibrated.CalibratedCostOracle",
+    "priced": "atom.compass.core.cost.priced.PricedGraphCostOracle",
+    "interpolated": "atom.compass.core.cost.interpolated.InterpolatedCostOracle",
+    "constant": "atom.compass.core.cost.constant.ConstantCostOracle",
+}
+
+#: Which constructor keyword each oracle takes the step table through. An
+#: oracle absent from here is handed no table at all: ConstantCostOracle
+#: costs every step at two fixed rates and raises on an unexpected keyword,
+#: and a qualname we have never seen could do either, so it has to say.
+TABLE_KEY = {
+    ORACLES["calibrated"]: "table",
+    ORACLES["interpolated"]: "table",
+    ORACLES["priced"]: "fallback",
+}
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--oracle", default="calibrated",
+                   help=f"what the modelled side costs its steps with: one of "
+                        f"{', '.join(sorted(ORACLES))}, or a qualname. "
+                        f"Default calibrated, which is what every rung so far "
+                        f"was measured under. A qualname, and constant, are "
+                        f"handed no step table unless you name one with "
+                        f"--oracle-option.")
+    p.add_argument("--oracle-option", action="append", default=[],
+                   metavar="K=V",
+                   help="a keyword argument for the oracle's constructor, "
+                        "repeatable. The calibrated oracle is given "
+                        "table=<--table> and the priced one fallback=<--table> "
+                        "unless you pass those yourself. Priced also needs "
+                        "prices=, graph= and prefill_graph=; it holds decode "
+                        "graphs at one batch rung per captured shape, so a "
+                        "rung it has no graph for is answered by another rung "
+                        "and reads low -- the server log says which.")
     p.add_argument("--model", required=True)
     p.add_argument("--trace", required=True,
                    help="JSONL from scripts/compass/cc_traces.py")
@@ -340,12 +378,25 @@ def main(argv=None) -> int:
             _run(replay + ["--port", str(srv.port), "--out", str(real_out),
                            *real_arrivals, *real_only], "real replay")
 
-    print("phase 3/5  replaying it modelled ...", flush=True)
+    # The step table is the default for whichever knob the chosen oracle reads
+    # it through: the calibrated oracle fits it, the priced one falls back to
+    # it for shapes no graph covers. Naming it in only one of those two places
+    # would make `--oracle priced` silently drop the fallback, and a priced
+    # run with no fallback answers an uncovered shape with a floor rather than
+    # with a cost.
+    oracle = ORACLES.get(args.oracle, args.oracle)
+    oracle_options = list(args.oracle_option)
+    default_key = TABLE_KEY.get(oracle)
+    if default_key and not any(o.split("=", 1)[0] == default_key
+                               for o in oracle_options):
+        oracle_options.append(f"{default_key}={table}")
+    print(f"phase 3/5  replaying it modelled, oracle={oracle} "
+          f"{' '.join(oracle_options)} ...", flush=True)
     modelled_flags = _engine_flags(args) + [
         "--compass",
-        "--compass-oracle",
-        "atom.compass.core.cost.calibrated.CalibratedCostOracle",
-        "--compass-oracle-option", f"table={table}",
+        "--compass-oracle", oracle,
+        *[flag for opt in oracle_options
+          for flag in ("--compass-oracle-option", opt)],
         # The predict path already records every step it ran, in the format
         # the measure path records every step it timed -- runner.py
         # `_record_measurement` is called from both. It just never got a path.
