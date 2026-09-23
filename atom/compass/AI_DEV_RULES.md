@@ -182,8 +182,10 @@
     `--message`: a multi-commit PR gets GitHub's default squash message.
   - An unlinked chain needs, per child on each parent landing,
     `git rebase --onto <new> <old> <branch>` plus a REST base patch.
-- **Never force-push a branch under review. A restack after its parent has
-  landed is permitted.**
+- **Never force-push a branch under review.** Answer review findings with new
+  commits, never an amend: the branch lands squashed anyway, and an amend removes
+  the reviewed commit a delta review needs and strands any child stacked on it.
+  A restack after the parent has landed is permitted.
 - Except for the main branch, free updates to `jgong5/ATOM` — branches, PRs and
   issues alike, untouched until the project agrees to upstream the milestone.
   Never touch `ROCm/ATOM`.
