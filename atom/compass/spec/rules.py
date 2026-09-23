@@ -62,6 +62,7 @@ class Rule(enum.Enum):
     SHAPE = "the document has the shape the schema declares"
     TOTALITY = "a spec resolves every field the document was required to state"
     ADDRESSING = "a field is asked for by the path of the field itself"
+    VERSION = "the reader knows the schema version the document was written to"
     MEASURED = "a probe reports what it read, and refuses what it could not"
 
 

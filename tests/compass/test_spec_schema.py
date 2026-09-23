@@ -23,6 +23,14 @@ fields that version added, or the echo missing is the reader's fault and the
 message says it is the author's. And a checked value the document still owns
 can move after the artifact carrying its digest was written.
 
+One section is about which rule a refusal names rather than about its words.
+The rules are indexed by the action they ask for, so a member's sentence has to
+be true of every refusal that carries it. The sites that decline a document are
+driven rather than listed, and the set driven is checked against the package's
+own source; each is then shown to ask either for an edit this reader goes on to
+read, or for a different reader altogether. A document written to a later
+schema is the second kind, and it is the only one.
+
 The last section is about the refusals themselves rather than about what they
 refuse. A refusal is read by a person, so a message that is accurate about what
 could not be done and wrong about why costs that person the time it was meant to
@@ -34,6 +42,7 @@ its own sentence and to deny the others', so swapping any two fails these tests.
 import ast
 import copy
 import pathlib
+import sys
 import warnings
 
 import pytest
@@ -46,11 +55,14 @@ from atom.compass.spec import (
     SCHEMA_VERSION,
     Backend,
     FingerprintMismatch,
+    Fragment,
     Kind,
     MachineSpec,
     Rule,
     SpecRefusal,
     StackMismatch,
+    explain,
+    validate,
 )
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -310,7 +322,7 @@ def test_a_later_document_is_told_this_reader_is_old():
     later["schema_version"] = 2
     later["device"]["power_cap_watts"] = 700
     refusal = refusal_from(later)
-    assert refusal.rule is Rule.SHAPE
+    assert refusal.rule is Rule.VERSION
     assert "schema_version 2" in refusal.what
     assert f"understands version {SCHEMA_VERSION}" in refusal.what
     assert "power_cap_watts" not in refusal.what
@@ -324,6 +336,7 @@ def test_the_version_is_read_before_the_fields_it_governs():
     later = drop(document(), "device", "memory", "capacity_bytes")
     later["schema_version"] = 2
     refusal = refusal_from(later)
+    assert refusal.rule is Rule.VERSION
     assert "schema_version 2" in refusal.what
     assert "capacity_bytes" not in refusal.what
 
@@ -338,9 +351,302 @@ def test_a_document_that_states_no_version_is_told_it_is_missing():
 
 
 def test_a_version_that_is_not_one_is_refused_as_a_shape():
+    # The boundary between the two rules. A version this reader does not know
+    # is about the reader; a version that is not a version is about the
+    # document, and the author has a line to correct.
     refusal = refusal_from(document(schema_version="1"))
     assert refusal.rule is Rule.SHAPE
     assert "a positive whole number" in refusal.what
+
+
+# --- the rule a refusal names is the action it asks for ----------------------
+
+
+def written(path, value):
+    """The reference document with one dotted field set, for a one-edit break."""
+    fresh = document()
+    node = fresh
+    *blocks, leaf = path.split(".")
+    for block in blocks:
+        node = node[block]
+    node[leaf] = value
+    return fresh
+
+
+#: One edit each, and every one of them a document this reader declines as a
+#: shape. Driven rather than listed, because what is claimed about them is the
+#: action they ask for, and only running them shows that.
+BREAKAGES = {
+    "a block holding a scalar": lambda: written("device.memory", 7),
+    "a required field is missing": lambda: drop(
+        document(), "device", "memory", "capacity_bytes"
+    ),
+    "a spec that is not a mapping at all": lambda: [1, 2],
+    "a tokenizer entry field is missing": lambda: drop(
+        document(), "host", "tokenizers", 0, "vocab_size"
+    ),
+    "a tokenizer entry that is not a mapping": lambda: written(
+        "host.tokenizers", ["not an entry"]
+    ),
+    "a value the schema cannot hold": lambda: written(
+        "device.memory.capacity_bytes", "lots"
+    ),
+    "one field written under two spellings": lambda: both_spellings(True),
+}
+
+
+#: The same rule named by the verbs other than the reader, each driven through
+#: the verb that declines. Not part of the edit-then-read claim below, which is
+#: about what this reader goes on to read; here only so the partition covers
+#: every site the package has rather than the reader's share of them.
+ELSEWHERE = {
+    "a fragment that is not a mapping": lambda: Fragment.from_mapping([1, 2], "p"),
+    "a subject to check that is not a mapping": lambda: validate([1, 2]).raise_first(),
+    "a term the spec carries nothing under": lambda: explain(read(), "no_such_term"),
+}
+
+
+def _site_of(declines):
+    """The file and line of the `SpecRefusal(...)` that `declines()` raises.
+
+    Taken where the refusal is built rather than from its traceback. The walk
+    yields its refusals and the reader over it raises the first, so the
+    traceback of a refusal the walk found names the reader's `raise` and not
+    the site that declined.
+    """
+    built = {}
+    init = SpecRefusal.__init__
+
+    def recording(refusal, *args):
+        caller = sys._getframe(1)
+        built[id(refusal)] = (
+            pathlib.Path(caller.f_code.co_filename).name,
+            caller.f_lineno,
+        )
+        init(refusal, *args)
+
+    SpecRefusal.__init__ = recording
+    try:
+        with pytest.raises(SpecRefusal) as raised:
+            declines()
+    finally:
+        SpecRefusal.__init__ = init
+    return built[id(raised.value)]
+
+
+def _is_refusal(raised):
+    """Whether a raised expression constructs a `SpecRefusal`."""
+    callee = raised.func if isinstance(raised, ast.Call) else None
+    return getattr(callee, "id", None) == "SpecRefusal"
+
+
+def _refusal_sites():
+    """Every `SpecRefusal(...)` built in the package, mapped to the rule it names.
+
+    A site is where a refusal is built, whether it is raised there, yielded to
+    a walk's consumer or collected into a result, because all three decline.
+
+    One site picks its rule from a local name rather than naming it inline, so
+    a name is resolved through the assignments in the function it sits in. The
+    binding map is per-name and last-write-wins, so a second binding of the
+    same local in one function misattributes one of the two sites; the check
+    below then reddens for a site that is on the wrong side of the partition
+    rather than for the rule it actually names.
+
+    A site whose rule will not resolve is kept, carrying whatever it named,
+    rather than dropped -- a dropped site would be a hole in the coverage check
+    below, and holes of exactly that kind are why the check exists.
+
+    The module body is a scope too, so a refusal built outside any function is
+    a site. Scopes are read innermost first and the module body last, and a
+    site keeps the rule the first scope holding it resolved.
+    """
+    found = {}
+    for source in sorted(PACKAGE.glob("*.py")):
+        module = ast.parse(source.read_text())
+        functions = [
+            scope
+            for scope in ast.walk(module)
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for scope in [*reversed(functions), module]:
+            bound = {
+                target.id: ast.unparse(node.value)
+                for node in ast.walk(scope)
+                if isinstance(node, ast.Assign)
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            }
+            for node in ast.walk(scope):
+                if _is_refusal(node):
+                    named = ast.unparse(node.args[0])
+                    found.setdefault(
+                        (source.name, node.lineno), bound.get(named, named)
+                    )
+    return found
+
+
+def _mentions_the_walk_cannot_follow():
+    """Every mention of `SpecRefusal` in the package that is not calling it.
+
+    The walk above sees a refusal only where `SpecRefusal(...)` is called by
+    that bare name. Catching the class, testing against it and annotating with
+    it build nothing. Any other mention -- an alias, an `import ... as`, a
+    subclass, a `partial`, a qualified `rules.SpecRefusal` -- is a way to build
+    a refusal the walk never sees, and a refusal built that way and thrown by
+    name is invisible to every check here. A class reached without its name,
+    as `type(refusal)(...)`, is past what reading the source can see.
+    """
+    found = []
+    for source in sorted(PACKAGE.glob("*.py")):
+        lines = source.read_text().splitlines()
+        module = ast.parse("\n".join(lines))
+        harmless = set()
+        for node in ast.walk(module):
+            if _is_refusal(node):
+                harmless.add(id(node.func))
+            if isinstance(node, ast.ExceptHandler):
+                cleared = [node.type]
+            elif isinstance(node, (ast.arg, ast.AnnAssign)):
+                cleared = [node.annotation]
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                cleared = [node.returns]
+            elif (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) in ("isinstance", "issubclass")
+                and len(node.args) == 2
+            ):
+                cleared = [node.args[1]]
+            else:
+                continue
+            for subtree in filter(None, cleared):
+                harmless.update(id(inner) for inner in ast.walk(subtree))
+        for node in ast.walk(module):
+            if isinstance(node, ast.alias):
+                mentioned = node.name == "SpecRefusal" and node.asname is not None
+            elif isinstance(node, (ast.Name, ast.Attribute)):
+                spelled = node.id if isinstance(node, ast.Name) else node.attr
+                mentioned = spelled == "SpecRefusal" and id(node) not in harmless
+            else:
+                continue
+            if mentioned:
+                found.append(
+                    f"{source.name}:{node.lineno}: {lines[node.lineno - 1].strip()}"
+                )
+    return found
+
+
+def _built_where_thrown():
+    """Every `raise` or `yield` in the package that builds what it throws.
+
+    A `raise` of a refusal already built -- the reader raising the first one
+    its walk yielded, or a result handing back its first -- builds nothing
+    there, so it is not a site.
+    """
+    found = set()
+    for source in sorted(PACKAGE.glob("*.py")):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if isinstance(node, ast.Raise):
+                thrown = node.exc
+            elif isinstance(node, ast.Yield):
+                thrown = node.value
+            else:
+                continue
+            if isinstance(thrown, ast.Call):
+                found.add((source.name, thrown.lineno))
+    return found
+
+
+def _sites_naming(member):
+    return {site for site, rule in _refusal_sites().items() if f"Rule.{member}" in rule}
+
+
+def test_every_refusal_site_in_the_package_resolves_to_a_rule():
+    # The resolver has to read all of them. One it could not read would leave
+    # the two checks below green over a smaller package than the one that
+    # exists, which is the shape of defect they are here to catch.
+    unread = {
+        site: rule
+        for site, rule in _refusal_sites().items()
+        if not rule.startswith("Rule.")
+    }
+    assert unread == {}
+    # A site the walk never reaches -- in a scope it does not descend, or
+    # building through a name that is not `SpecRefusal` -- is absent rather
+    # than unread, and absence is invisible to a check that reads only what
+    # the walk found. A refusal built through another name and thrown by name
+    # is absent from both sets below, so the class is never named any other
+    # way; and everything the package throws as it builds it is held against
+    # what the resolver recognised.
+    loose = _mentions_the_walk_cannot_follow()
+    assert loose == [], (
+        "SpecRefusal is reached other than by calling it by name, so a refusal "
+        "built through it is invisible to the site walk. Call SpecRefusal(...) "
+        "there, or teach _is_refusal the new spelling: " + "; ".join(loose)
+    )
+    thrown = _built_where_thrown()
+    assert thrown
+    assert thrown <= set(_refusal_sites())
+
+
+def test_every_site_that_declines_a_document_is_driven_here():
+    # A table written by hand that quietly covers six of seven sites passes for
+    # a reason nobody stated, so the set is read out of the package's source
+    # instead of counted. A site added later is red here until it is placed on
+    # one side of the partition or the other.
+    driven = {
+        _site_of(lambda make=make: MachineSpec.from_mapping(make()))
+        for make in BREAKAGES.values()
+    } | {_site_of(declines) for declines in ELSEWHERE.values()}
+    assert driven == _sites_naming("SHAPE")
+
+
+def test_the_version_is_the_one_site_that_is_not_about_the_document():
+    site = _site_of(lambda: MachineSpec.from_mapping(document(schema_version=2)))
+    assert _sites_naming("VERSION") == {site}
+    assert site not in _sites_naming("SHAPE")
+
+
+@pytest.mark.parametrize("breakage", sorted(BREAKAGES))
+def test_a_shape_refusal_asks_for_an_edit_this_reader_then_reads(breakage):
+    # SHAPE's action, and it is one action: correct the document and read it
+    # again. Each breakage is one edit from the reference document, so the
+    # reference document is the correction, and this reader still reads it.
+    refusal = refusal_from(BREAKAGES[breakage]())
+    assert refusal.rule is Rule.SHAPE, breakage
+    assert MachineSpec.from_mapping(document()).echo() == DOCUMENT
+
+
+def test_the_version_refusal_asks_for_a_newer_reader_and_says_so():
+    # The named result, and what it asserts is the member and the action. A
+    # count of members would pass the next time somebody adds one.
+    refusal = refusal_from(document(schema_version=2))
+    assert refusal.rule is Rule.VERSION
+    assert refusal.rule is not Rule.SHAPE
+    assert "reader" in refusal.rule.value
+    assert "read it with a Compass that knows that version" in refusal.remedy
+    assert Rule.VERSION.value in str(refusal)
+
+
+def test_no_edit_a_shape_refusal_asks_for_reaches_a_later_document():
+    # Why the action differs, measured rather than argued. Every breakage above
+    # earns its own refusal on a document this reader knows the version of; on
+    # a v2 document each earns the version refusal instead, byte for byte the
+    # same one, because nothing past the version was read. So there is no edit
+    # here for the author to make, which is what puts this use outside SHAPE.
+    plain = refusal_from(document(schema_version=2))
+    unreachable = [
+        name for name, make in BREAKAGES.items() if not isinstance(make(), dict)
+    ]
+    assert unreachable == ["a spec that is not a mapping at all"]
+    for name, make in BREAKAGES.items():
+        if name in unreachable:
+            continue
+        later = make()
+        later["schema_version"] = 2
+        refusal = refusal_from(later)
+        assert refusal.rule is Rule.VERSION, name
+        assert str(refusal) == str(plain), name
 
 
 # --- a checked value belongs to the spec, not to the document ----------------

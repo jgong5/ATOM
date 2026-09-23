@@ -152,7 +152,7 @@ def _version(document: Mapping) -> None:
     stated = check(field, document[field.path], field.path)
     if stated != SCHEMA_VERSION:
         raise SpecRefusal(
-            Rule.SHAPE,
+            Rule.VERSION,
             f"this document states schema_version {stated}, and this reader "
             f"understands version {SCHEMA_VERSION}",
             "read it with a Compass that knows that version; what a later "
