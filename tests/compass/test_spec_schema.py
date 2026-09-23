@@ -456,12 +456,20 @@ def _refusal_sites():
     A site whose rule will not resolve is kept, carrying whatever it named,
     rather than dropped -- a dropped site would be a hole in the coverage check
     below, and holes of exactly that kind are why the check exists.
+
+    The module body is a scope too, so a refusal built outside any function is
+    a site. Scopes are read innermost first and the module body last, and a
+    site keeps the rule the first scope holding it resolved.
     """
     found = {}
     for source in sorted(PACKAGE.glob("*.py")):
-        for scope in ast.walk(ast.parse(source.read_text())):
-            if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
+        module = ast.parse(source.read_text())
+        functions = [
+            scope
+            for scope in ast.walk(module)
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for scope in [*reversed(functions), module]:
             bound = {
                 target.id: ast.unparse(node.value)
                 for node in ast.walk(scope)
@@ -472,7 +480,59 @@ def _refusal_sites():
             for node in ast.walk(scope):
                 if _is_refusal(node):
                     named = ast.unparse(node.args[0])
-                    found[source.name, node.lineno] = bound.get(named, named)
+                    found.setdefault(
+                        (source.name, node.lineno), bound.get(named, named)
+                    )
+    return found
+
+
+def _mentions_the_walk_cannot_follow():
+    """Every mention of `SpecRefusal` in the package that is not calling it.
+
+    The walk above sees a refusal only where `SpecRefusal(...)` is called by
+    that bare name. Catching the class, testing against it and annotating with
+    it build nothing. Any other mention -- an alias, an `import ... as`, a
+    subclass, a `partial`, a qualified `rules.SpecRefusal` -- is a way to build
+    a refusal the walk never sees, and a refusal built that way and thrown by
+    name is invisible to every check here. A class reached without its name,
+    as `type(refusal)(...)`, is past what reading the source can see.
+    """
+    found = []
+    for source in sorted(PACKAGE.glob("*.py")):
+        lines = source.read_text().splitlines()
+        module = ast.parse("\n".join(lines))
+        harmless = set()
+        for node in ast.walk(module):
+            if _is_refusal(node):
+                harmless.add(id(node.func))
+            if isinstance(node, ast.ExceptHandler):
+                cleared = [node.type]
+            elif isinstance(node, (ast.arg, ast.AnnAssign)):
+                cleared = [node.annotation]
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                cleared = [node.returns]
+            elif (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) in ("isinstance", "issubclass")
+                and len(node.args) == 2
+            ):
+                cleared = [node.args[1]]
+            else:
+                continue
+            for subtree in filter(None, cleared):
+                harmless.update(id(inner) for inner in ast.walk(subtree))
+        for node in ast.walk(module):
+            if isinstance(node, ast.alias):
+                mentioned = node.name == "SpecRefusal" and node.asname is not None
+            elif isinstance(node, (ast.Name, ast.Attribute)):
+                spelled = node.id if isinstance(node, ast.Name) else node.attr
+                mentioned = spelled == "SpecRefusal" and id(node) not in harmless
+            else:
+                continue
+            if mentioned:
+                found.append(
+                    f"{source.name}:{node.lineno}: {lines[node.lineno - 1].strip()}"
+                )
     return found
 
 
@@ -514,8 +574,16 @@ def test_every_refusal_site_in_the_package_resolves_to_a_rule():
     # A site the walk never reaches -- in a scope it does not descend, or
     # building through a name that is not `SpecRefusal` -- is absent rather
     # than unread, and absence is invisible to a check that reads only what
-    # the walk found. So everything the package throws as it builds it is
-    # held against what the resolver recognised.
+    # the walk found. A refusal built through another name and thrown by name
+    # is absent from both sets below, so the class is never named any other
+    # way; and everything the package throws as it builds it is held against
+    # what the resolver recognised.
+    loose = _mentions_the_walk_cannot_follow()
+    assert loose == [], (
+        "SpecRefusal is reached other than by calling it by name, so a refusal "
+        "built through it is invisible to the site walk. Call SpecRefusal(...) "
+        "there, or teach _is_refusal the new spelling: " + "; ".join(loose)
+    )
     thrown = _built_where_thrown()
     assert thrown
     assert thrown <= set(_refusal_sites())
