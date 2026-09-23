@@ -394,7 +394,6 @@ BREAKAGES = {
     "one field written under two spellings": lambda: both_spellings(True),
 }
 
-
 #: The same rule named by the verbs other than the reader, each driven through
 #: the verb that declines. Not part of the edit-then-read claim below, which is
 #: about what this reader goes on to read; here only so the partition covers
@@ -403,6 +402,21 @@ ELSEWHERE = {
     "a fragment that is not a mapping": lambda: Fragment.from_mapping([1, 2], "p"),
     "a subject to check that is not a mapping": lambda: validate([1, 2]).raise_first(),
 }
+
+
+def _spec_modules():
+    # The one walk over the package: every check below that reads its source
+    # takes its modules from here, so no two of them can disagree about which
+    # modules exist. Recursive, so a module added under a subpackage is read
+    # the day it lands.
+    return sorted(PACKAGE.rglob("*.py"))
+
+
+def _named(path):
+    # A site's file, relative to the package, so `sub/machine.py` is not
+    # `machine.py`. A module loaded from outside the package walked here
+    # refuses rather than being compared under a name that happens to match.
+    return pathlib.Path(path).resolve().relative_to(PACKAGE).as_posix()
 
 
 def _site_of(declines):
@@ -419,7 +433,7 @@ def _site_of(declines):
     def recording(refusal, *args):
         caller = sys._getframe(1)
         built[id(refusal)] = (
-            pathlib.Path(caller.f_code.co_filename).name,
+            _named(caller.f_code.co_filename),
             caller.f_lineno,
         )
         init(refusal, *args)
@@ -461,7 +475,7 @@ def _refusal_sites():
     site keeps the rule the first scope holding it resolved.
     """
     found = {}
-    for source in sorted(PACKAGE.glob("*.py")):
+    for source in _spec_modules():
         module = ast.parse(source.read_text())
         functions = [
             scope
@@ -480,7 +494,7 @@ def _refusal_sites():
                 if _is_refusal(node):
                     named = ast.unparse(node.args[0])
                     found.setdefault(
-                        (source.name, node.lineno), bound.get(named, named)
+                        (_named(source), node.lineno), bound.get(named, named)
                     )
     return found
 
@@ -497,7 +511,7 @@ def _mentions_the_walk_cannot_follow():
     as `type(refusal)(...)`, is past what reading the source can see.
     """
     found = []
-    for source in sorted(PACKAGE.glob("*.py")):
+    for source in _spec_modules():
         lines = source.read_text().splitlines()
         module = ast.parse("\n".join(lines))
         harmless = set()
@@ -530,7 +544,7 @@ def _mentions_the_walk_cannot_follow():
                 continue
             if mentioned:
                 found.append(
-                    f"{source.name}:{node.lineno}: {lines[node.lineno - 1].strip()}"
+                    f"{_named(source)}:{node.lineno}: {lines[node.lineno - 1].strip()}"
                 )
     return found
 
@@ -543,7 +557,7 @@ def _built_where_thrown():
     there, so it is not a site.
     """
     found = set()
-    for source in sorted(PACKAGE.glob("*.py")):
+    for source in _spec_modules():
         for node in ast.walk(ast.parse(source.read_text())):
             if isinstance(node, ast.Raise):
                 thrown = node.exc
@@ -552,7 +566,7 @@ def _built_where_thrown():
             else:
                 continue
             if isinstance(thrown, ast.Call):
-                found.add((source.name, thrown.lineno))
+                found.add((_named(source), thrown.lineno))
     return found
 
 
@@ -1178,16 +1192,11 @@ def test_the_other_accessors_decline_on_a_fragment_rather_than_raise():
 # --- what the package reaches ------------------------------------------------
 
 
-def _spec_modules():
-    # rglob, so a module added under the package is covered the day it lands.
-    return sorted(PACKAGE.rglob("*.py"))
-
-
 def test_the_package_was_found():
     assert _spec_modules(), f"no modules under {PACKAGE}"
 
 
-@pytest.mark.parametrize("module", _spec_modules(), ids=lambda p: p.name)
+@pytest.mark.parametrize("module", _spec_modules(), ids=_named)
 def test_the_package_imports_only_the_standard_library_it_names(module):
     # An allowlist of what the package actually imports. The claim kept is that
     # a spec can be authored and checked on any machine: no device runtime, no
@@ -1214,7 +1223,7 @@ def test_the_package_imports_only_the_standard_library_it_names(module):
         elif isinstance(node, ast.ImportFrom) and not node.level:
             roots.append((node.module or "").split(".")[0])
     strays = sorted({root for root in roots if root not in allowed})
-    assert not strays, f"{module.name} imports {strays}; allowed: {sorted(allowed)}"
+    assert not strays, f"{_named(module)} imports {strays}; allowed: {sorted(allowed)}"
 
 
 def test_everything_the_package_exports_is_reachable_by_name():
