@@ -46,21 +46,14 @@ that tier is genuinely green.
 
 | Tier | What runs | Measured result |
 |---|---|---|
-| **CPU tier** — per task, and green is the bar | `tests/` minus `tests/plugin/` (30 files) minus the 29 driver-dependent files in `scripts/compass/cpu_gate_exclude.txt` = **130 of 189 files**. Driven by `scripts/compass/gate_cpu.sh`; no driver is touched **as a batch**. That is the weaker and correct claim: `test_postprocess_width.py` and `test_v4_checkpoint_slot_copy.py` are among the 130 handed, and each reaches `rocminfo` when run *alone* (`no tests collected, 1 error in 0.78s`, rc=2, each, measured at `236abfd9a` in `xiaobizh_n18_cpu`); inside the gate they module-skip on the mock an earlier file installs. Driver-freedom here is a property of the batch, not of every file in it. | **4030 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0 — identical in every run taken on 2026-09-21, where the clock read **25.4-31.7 s of pytest inside 31.1-37.8 s of wall (`time` real)**, a measured spread rather than a bound: it tracks what else is on the node. Decomposition (principle 7): **3956 ATOM + 74 `tests/compass` = 4030**. Measured 2026-09-21 in container `xiaobizh_n18_cpu` on hjbog-srdc-18, against a `git archive` snapshot with `PYTHONPATH` asserted to resolve `atom` under that root and pytest's own exit status captured before any pipe. |
+| **CPU tier** — per task, and green is the bar | Every test file outside `tests/plugin/` and `scripts/compass/cpu_gate_exclude.txt`. Driven by `scripts/compass/gate_cpu.sh`; no driver is touched **as a batch**. That is the weaker and correct claim: `test_postprocess_width.py` and `test_v4_checkpoint_slot_copy.py` are both in the tier, and each reaches `rocminfo` when run *alone* (`no tests collected, 1 error in 0.78s`, rc=2, each, measured at `236abfd9a` in `xiaobizh_n18_cpu`); inside the gate they module-skip on the mock an earlier file installs. Driver-freedom here is a property of the batch, not of every file in it. | Green, `GATE_CPU_RC=0`. The counts are not restated here, because they move with every test the tier gains or loses: `gate_cpu.sh` prints them under the `commit:` line of the tree it ran, and `scripts/compass/README.md` says what the tier runs. |
 | **GPU superset** — per wave, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`. | **4779 passed / 5 failed**, 0 errors, 105 skipped, 3 xfailed, 72.6 s, at `fe9ea043c` on node 18 in `xiaobizh_n18`, `HIP_VISIBLE_DEVICES=1`, 2026-09-20 — torch **2.10.0+rocm7.2.4.git3d3aa833**, `torch.version.hip` **7.2.53211**, ROCm **7.2.4**, AITER **v0.1.21.dev0-49-gf4e7c7509**; two runs, byte-identical failing sets. The five are pre-existing and unrelated to Compass, and they are **four ULP comparisons plus one bitwise check**, not "five bf16 ULP failures": four `allclose` cases in `tests/test_fused_compress_ragged.py` off by one bf16 ULP (`max\|diff\| = 0.001953125`, exactly 2⁻⁹, against `atol=rtol=1e-3`), plus `tests/test_dcp_merge_ops.py::test_row_view_matches_output_slicing_bitwise`, a `torch.equal` with **no tolerance at all** — a tolerance bump would not move it. All five node-ids are on file verbatim in `scripts/compass/gpu_gate_known_failures.txt` and compared by name, so "5 failed" can now be checked against "the *same* 5 failed". |
 
-**Six different totals for this suite are in circulation and all six are consistent** —
-each is a different exclusion count and a different `tests/compass`, not a discrepancy:
-3925 (32 exclusions, `tests/compass` at 35 tests), 3956 (29 exclusions, **ATOM tests only**,
-no `tests/compass` — the P0.2 reviewer's figure), 3988 (29 exclusions, `tests/compass` at
-32), 4005 (29 exclusions, `tests/compass` at 49), 4022 (29 exclusions, `tests/compass` at
-66), and **4030** (29 exclusions, `tests/compass` at 74). The 49 → 66 step is mechanical:
-`tests/compass/test_cpu_gate_exclude.py` parametrises one case per entry of
-`gpu_gate_triggers.txt`, and correcting that file's derivation took it from 13 entries
-to 30. The 66 → 74 step is `tests/compass/test_gate_gpu_surplus.py`, added here. The exclusion list went 32 → 29
-because `test_dp_metadata.py`, `test_dp_sync_layout.py` and `test_forward_mode.py` were
-re-measured and are CPU-green. Prose saying the list is 32, or that those three need the
-driver, is stale.
+**A total for this tier is a reading of one tree, not a property of the suite.** Each total
+belongs to one exclusion list and one `tests/compass`, both of which change, so two totals
+compare only when each names its commit. `test_dp_metadata.py`, `test_dp_sync_layout.py`
+and `test_forward_mode.py` were once excluded and were re-measured CPU-green (`16`); prose
+saying those three need the driver is stale.
 
 ### The tests that matter to Compass, and which tier each is in
 
