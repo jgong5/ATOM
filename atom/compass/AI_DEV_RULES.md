@@ -12,11 +12,15 @@
   task, under `compass-worktrees/<task-id>`, beside the repo.
 - **On every landing, the landing agent fast-forwards the main worktree** to
   `feature/atomcompass_new` (the integration branch). Every linked worktree shares
-  its local `feature/atomcompass_new`, and `compass_resolve_ref` tries that bare
-  name first, so a stale branch wins for any command that omits
-  `COMPASS_INTEGRATION_REF`. After a container rebuild (`/root` does not survive
-  `teardown.sh`), run `git config --global --add safe.directory '*'` and
-  `gh auth setup-git` before any git command. A pull as root leaves files
+  its local `feature/atomcompass_new`, and the Compass scripts
+  (`scripts/compass/`) diff against that local branch when it exists, before
+  falling back to `fork/feature/atomcompass_new` — so a stale local branch gives
+  a wrong base unless `COMPASS_INTEGRATION_REF` names the ref explicitly. `fork`
+  is the remote for `jgong5/ATOM` (`origin` is `ROCm/ATOM`); in a clone that
+  names it differently, substitute that name. After a container rebuild
+  (`/root` does not survive `teardown.sh`), run
+  `git config --global --add safe.directory '*'` and `gh auth setup-git` before
+  any git command. A pull as root leaves files
   root-owned, which fails host-side edits silently, so chown after every pull:
 
   ```
@@ -62,7 +66,9 @@
   | Handoff | both | a closing comment on the issue | what a successor needs to know that is not in the code |
 
   Every brief links its predecessors' issues. **A brief that cannot name its file
-  set is not claimable.**
+  set is not claimable.** **Decompose a complex task into sub-tasks** before it is
+  claimed (roughly: an estimate over ~300 lines, or three or more deliverables).
+  Each sub-task is its own issue, with its own brief and its dependencies stated.
 - Task management is GitHub: the PR names its issue, and the issue is closed
   deliberately, with the handoff comment. Agents open, assign, comment on and
   close issues, including issues they did not open. A finding not fixed in the PR
@@ -118,7 +124,11 @@
      not chosen afterwards. An umbrella brief whose children carry the work
      states one anyway, or names the child that carries it; a developer choosing
      one afterwards is the case this rule forbids.
-  4. Review by the task's reviewer agent, looping to APPROVE as above. **A check
+  4. Review by the task's reviewer agent, looping to APPROVE as above. The
+     reviewer also runs the
+     [`ponytail-review`](https://github.com/DietrichGebert/ponytail/blob/main/skills/ponytail-review/SKILL.md)
+     skill over the diff to catch over-engineering; its findings are posted like
+     any others. **A check
      counts only once someone has seen it fire.** A reviewer credits a test with
      holding a defect only after reinstating it (the pre-fix code via `git show`,
      line count preserved, nothing else changed) and recording the red: both
@@ -131,12 +141,14 @@
 - **Effort is estimated in lines of code, not time.** Wall-clock appears only for
   machine time with a measured basis. **A task that overruns its estimate by more
   than ~2x is an escalation**, not a reason to keep going.
-- **PRs land squashed onto `feature/atomcompass_new`**, one commit per task --
+- **PRs land squashed onto `feature/atomcompass_new`**, one commit per task —
   never `main` or `master`.
 - **Landing is the agents' job; no owner approval is needed or sought.** An agent
   lands any PR whose APPROVE covers its current head (below) and with no
   `need human` on it or anywhere below it in its stack; it does not wait for the
-  per-wave GPU superset. A PR whose body declares an escalation without the label
+  per-wave GPU superset. Landing a stacked PR lands every unlanded PR below it,
+  so each of those needs the same: its own APPROVE covering its head, and no
+  label. A PR whose body declares an escalation without the label
   gets the label. Any other hold names the rule in this file behind it; a rule
   violation seen in an approved PR is filed as an issue, not held. Where a
   handoff note contradicts this file, this file wins.
