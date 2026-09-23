@@ -191,21 +191,28 @@ def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
     """Four proxies for the claim, checked over the package rather than said.
 
     What is checked: no module imports `plan_pools`, none reads an attribute
-    named `gpu_memory_utilization`, none names `_kv_budget_extra_reserve` --
-    ATOM's override point for a reserve inside the budget -- and none writes
-    the coefficient of ATOM's safety margin -- read off ATOM's own line, so it
+    named `gpu_memory_utilization`, none carries `_kv_budget_extra_reserve` --
+    ATOM's override point for a reserve inside the budget -- as any string in
+    its syntax tree (a name, attribute, parameter, keyword or string constant,
+    so `setattr` and `__dict__` spellings count), and none writes the
+    coefficient of ATOM's safety margin -- read off ATOM's own line, so it
     follows ATOM -- or its complement as a literal. What is not: the
-    `min(budget, free)` clamp, which has no name to find, and a margin spelled
-    some other way (`2 / 100`).
+    `min(budget, free)` clamp, which has no name to find, a margin spelled some
+    other way (`2 / 100`), and a name built at runtime (a concatenation or an
+    f-string).
 
-    Read as imports, attribute names and literals rather than as text: the
-    words appear in docstrings all over this package, so a grep would pass for
-    as long as somebody kept writing about the formula while copying it.
+    Read as syntax trees rather than as text: the words appear in docstrings
+    all over this package, so a grep would pass for as long as somebody kept
+    writing about the formula while copying it. A docstring holds the name
+    inside prose, never as the whole string, so it does not match.
     """
     method = _method(_classes(ATOM_RUNNER)["ModelRunner"], "get_num_blocks")
     assert "_kv_budget_extra_reserve" in {
         n.attr for n in ast.walk(method) if isinstance(n, ast.Attribute)
-    }
+    }, (
+        "ATOM's get_num_blocks no longer reads _kv_budget_extra_reserve; "
+        "the refusal below would pin a dead name"
+    )
     margins = {round(c, 12) for m in _safety_margin_coefficients() for c in (m, 1 - m)}
     for module in sorted(COMPASS.rglob("*.py")):
         tree = ast.parse(module.read_text())
@@ -218,10 +225,14 @@ def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
         assert "plan_pools" not in imported, module
         reads = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
         assert "gpu_memory_utilization" not in reads, module
-        names = reads | {
-            getattr(n, "id", None) or getattr(n, "name", None) for n in ast.walk(tree)
+        strings = {
+            s
+            for n in ast.walk(tree)
+            for _, value in ast.iter_fields(n)
+            for s in (value if isinstance(value, list) else [value])
+            if isinstance(s, str)
         }
-        assert "_kv_budget_extra_reserve" not in names, (
+        assert "_kv_budget_extra_reserve" not in strings, (
             f"{module} names ATOM's budget reserve override point"
         )
         literals = {
