@@ -162,6 +162,19 @@ def test_a_price_list_asked_for_by_path_is_refused_by_name(tmp_path):
     assert "is not a key" in str(by_store.value)
 
 
+def test_a_kind_named_by_string_is_refused_with_the_members_to_pass():
+    with pytest.raises(ArtifactRefusal) as refused:
+        Key.of(
+            "price_list",
+            model="Qwen/Qwen3-32B",
+            width=2,
+            source_root=ATOM_ROOT.revision,
+        )
+    assert refused.value.rule is Rule.KEY_IS_A_TUPLE
+    assert "is not a Kind member" in str(refused.value)
+    assert "Kind.PRICE_LIST" in str(refused.value)
+
+
 def test_a_key_that_states_no_width_is_refused():
     with pytest.raises(ArtifactRefusal) as refused:
         Key.of(Kind.PRICE_LIST, model="Qwen/Qwen3-32B", width=2)

@@ -218,13 +218,13 @@ def module_root(module: str) -> str:
     wedged driver, so only the head is resolved by the import machinery and
     the remaining segments are walked as paths.
 
-    The walk resolves the two forms that `scripts/compass/README.md` names in
-    its trigger-derivation decision 2, "Symbols" -- `X/y/` and `X/y.py` -- and
-    refuses a segment that is neither, for the reason that decision gives:
-    either the name was misread or the module is absent, and both make the
-    stanza wrong by an unknown amount.
+    The walk resolves the two forms that `resolve()` in
+    `scripts/compass/regen_gpu_gate_triggers.sh` accepts for a module
+    reference -- `X/y/` and `X/y.py` -- and refuses a segment that is neither,
+    for the reason that script refuses one: either the name was misread or the
+    module is absent, and both make the stanza wrong by an unknown amount.
 
-    **The precedence here is the opposite of that rule**, deliberately.
+    **The precedence here is the opposite of that function's order**, deliberately.
     It resolves a name read out of source text and takes `X/y.py` first; this
     resolves a name the import system would, and there a package shadows a
     module of the same name. A tree holding both is digested under the
