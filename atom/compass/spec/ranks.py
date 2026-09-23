@@ -57,7 +57,8 @@ have a spread of zero and carry the 2.5 GB into the spec unremarked. The design
 pairs this check with an absolute one -- refuse a reading that far exceeds what
 the collective terms predict for its width -- and the two are only jointly
 sufficient. That one needs a probe to have read `free` and `total` separately,
-so it is not here, and it is recorded as left undone rather than assumed.
+so it is not here: it sits beside the readings themselves, where `free` and
+`total` still exist as two numbers, and only the reduced one arrives here.
 
 The readings themselves are checked the way the schema checks a quantity, so a
 reading that could never be written into a spec is declined here, where the

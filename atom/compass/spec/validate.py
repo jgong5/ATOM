@@ -43,17 +43,18 @@ document is the cheapest fix there is, and it would have hidden the width
 nobody measured behind itself. So the walk yields its refusals and carries on,
 and the document is checked field by field whatever it holds elsewhere.
 
-**The same record makes the opt-in conditions legible.** Three of the five in
-`CONDITIONS` need something from the caller -- `tp_widths=`, `observed_stack=`,
-and a `Merge` rather than a document -- and a clear result that does not say what
-it declined to ask is the shape this package exists to refuse. The sharpest case
-is the transfer: its source's pin is in no field of the merged document, by the
-decision below, so `validate(document)` can never ask that condition however the
-document was built, and the same spec is refused as a `Merge` and clear as a
-document. That is not a wrong number, but it must be visible, because the verb
-the design writes -- `compass spec validate machine.yaml` -- is the form that
-cannot ask it. `CONDITIONS` is what a count of reach is a count of; a condition
-added to the check set and not to it is one no result can report on.
+**The same record makes the opt-in conditions legible.** Four of the six in
+`CONDITIONS` need something from the caller -- two of them `tp_widths=`, one
+`observed_stack=`, and one a `Merge` rather than a document -- and a clear
+result that does not say what it declined to ask is the shape this package
+exists to refuse. The sharpest case is the transfer: its source's pin is in no
+field of the merged document, by the decision below, so `validate(document)`
+can never ask that condition however the document was built, and the same spec
+is refused as a `Merge` and clear as a document. That is not a wrong number,
+but it must be visible, because the verb the design writes -- `compass spec
+validate machine.yaml` -- is the form that cannot ask it. `CONDITIONS` is what
+a count of reach is a count of; a condition added to the check set and not to
+it is one no result can report on.
 
 **The reach of that form is `ASKABLE_OF_A_DOCUMENT`, which is a value and not a
 sentence.** Writing the number down in prose here puts a reviewer between the
@@ -71,7 +72,19 @@ one resolved *was* asked, and can already have earned a refusal; filing it under
 and would subtract it from the count of what the run reached. Both are results
 and neither is the other, so they are two fields of the record.
 
-Two of those questions need something the document does not carry.
+**A width nobody measured is two questions, not one.** The first is whether the
+document carries it, and the remedy that refusal offers is to go and measure it.
+The second is whether anything here would measure it, and for one entry -- the
+allocator's retained bytes on a single card -- the answer is no: the single-card
+probe fills the other width-keyed term, and the multi-rank one starts above
+width one. So for that entry the first remedy cannot be followed with the tools
+this package ships, and a check that stopped at the first question would leave
+an author hunting a probe that does not exist. The second is asked only where
+the entry is absent: a spec that carries the number, measured by hand, is a good
+spec and is not refused for how it was obtained.
+
+Three of those questions need something the document does not carry, and the two
+about widths need the same thing.
 
 **The widths a deployment will use are ATOM's, not the spec's.** The spec
 describes a machine and says nothing about how the engine was launched, so the
@@ -101,6 +114,7 @@ from typing import Any
 from .fields import PINNED, SCHEMA, Kind, check
 from .machine import MachineSpec, _missing, _survey
 from .merge import PINNED_BLOCK, Merge
+from .probes import FILLED_BY, probe_for
 from .rules import Rule, SpecRefusal
 from .tokenizers import TokenizerTable
 
@@ -110,11 +124,12 @@ from .tokenizers import TokenizerTable
 MISSING = "whether every required field is present and every value its declared shape"
 DERATES = "whether a spec-peak number carries the derate it obliges"
 WIDTHS = "whether the widths this deployment will use were measured"
+PROBES = "whether a probe fills the widths this deployment uses and nobody measured"
 STACK = "whether the constants' stack pin is the stack now loaded"
 TRANSFERS = "whether a transferred constant came from a spec pinned to this stack"
 #: The whole check set, in the order a run asks it. What `not_asked` is measured
 #: against: a condition missing from here is one no result can report on.
-CONDITIONS = (MISSING, DERATES, WIDTHS, STACK, TRANSFERS)
+CONDITIONS = (MISSING, DERATES, WIDTHS, PROBES, STACK, TRANSFERS)
 #: What a document-taking run can reach, which is every condition but the
 #: transfer: a transfer's source pin is in no field of a document, however the
 #: document was built. This is the package's statement of its own reach, held to
@@ -126,6 +141,16 @@ ASKABLE_OF_A_DOCUMENT = tuple(
 )
 #: The fields each consistency question reads before it can be asked at all.
 WIDTH_TABLES = tuple(field.path for field in SCHEMA if field.kind is Kind.WIDTH_TABLE)
+#: The width tables the probe question can say anything about, which is not all
+#: of them. It reports a width a document is missing that no probe would fill
+#: either, so a table every probe covers is one it can only ever be silent
+#: about -- and a question registered as reading a field it cannot speak for
+#: reports a run that could not ask it and a run that asked and found nothing
+#: as the same record. Derived from `FILLED_BY`, so a probe given the width
+#: that has none empties this with no second list to remember.
+PROBE_TABLES = tuple(
+    path for path in WIDTH_TABLES if None in FILLED_BY[path.rsplit(".", 1)[-1]]
+)
 STACK_PINS = tuple(f"{PINNED_BLOCK}.{component}" for component in PINNED)
 
 
@@ -216,8 +241,10 @@ def _reach(
         unasked.append(f"{DERATES} -- {why}")
     if not tp_widths:
         unasked.append(f"{WIDTHS} -- no `tp_widths=` was given")
+        unasked.append(f"{PROBES} -- no `tp_widths=` was given")
     else:
         reached(WIDTHS, WIDTH_TABLES)
+        reached(PROBES, PROBE_TABLES)
     if observed_stack is None:
         unasked.append(f"{STACK} -- no `observed_stack=` was given")
     else:
@@ -273,6 +300,26 @@ def _widths(spec: MachineSpec, tp_widths: Sequence[int], resolved: Mapping[str, 
         for width in tp_widths:
             try:
                 spec.runtime_constant(path.rsplit(".", 1)[-1], width)
+            except SpecRefusal as refusal:
+                yield refusal
+
+
+def _probes(tp_widths: Sequence[int], resolved: Mapping[str, Any]):
+    """The widths a document is missing that no probe here would fill either.
+
+    Asked of the tables a probe can fall short on, which is the same set the
+    condition registers as what it reads: walking a table every probe covers
+    would ask a question whose answer is fixed.
+    """
+    for path in PROBE_TABLES:
+        if path not in resolved:
+            continue
+        name = path.rsplit(".", 1)[-1]
+        for width in tp_widths:
+            if width in resolved[path]:
+                continue
+            try:
+                probe_for(name, width)
             except SpecRefusal as refusal:
                 yield refusal
 
@@ -336,6 +383,7 @@ def validate(
     # machine, and `Validation.spec` must not offer it as one.
     asked_of = spec if spec is not None else MachineSpec(resolved, TokenizerTable(()))
     refusals += _widths(asked_of, tp_widths, resolved)
+    refusals += _probes(tp_widths, resolved)
     differences: tuple = ()
     if observed_stack is not None:
         differences = asked_of.check_stack(observed_stack)

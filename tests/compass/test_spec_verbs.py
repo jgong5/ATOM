@@ -12,10 +12,19 @@ these checks are judgements about size: the cross-rank spread accepted is the
 one the hardware really shows, and the spread refused is the one a neighbour
 really produced. Round numbers would make both tests vacuous.
 
-The last section is the probe that needs no device. Its fragments are built by
-the probe itself against a stand-in for the per-processor topology the kernel
-publishes, so the core counts in them are read by the code a real run reads
-them with rather than typed in beside the assertion that checks them.
+The probe that needs no device has a section of its own. Its fragments are
+built by the probe itself against a stand-in for the per-processor topology the
+kernel publishes, so the core counts in them are read by the code a real run
+reads them with rather than typed in beside the assertion that checks them.
+
+The last two sections are the memory a probe that does start an engine reads
+off each card, and the table of which probe supplies which runtime constant.
+The readings are written as the term under test plus the rest of the card, so
+a test says what it is about while the checks over them still see the four
+numbers a rank really reports. The predictions they are judged
+against are the spec's own measured reserves, which is what makes the accepted
+readings and the refused one a judgement about size rather than about round
+numbers.
 """
 
 import copy
@@ -25,6 +34,7 @@ import pytest
 from atom.compass import spec as spec_package
 from atom.compass.spec import (
     QUANTITIES,
+    DeviceMemory,
     Fragment,
     MachineSpec,
     Rule,
@@ -33,19 +43,23 @@ from atom.compass.spec import (
     across_ranks,
     explain,
     merge,
+    non_torch_across_ranks,
+    probe_for,
     tokenizer_fragment,
     validate,
 )
 from atom.compass.spec.fields import BY_PATH, Kind
-from atom.compass.spec.probes import cpu_counts
+from atom.compass.spec.probes import FILLED_BY, cpu_counts
 from atom.compass.spec.tokenizers import ENTRY_FIELDS
 from atom.compass.spec.validate import (
     ASKABLE_OF_A_DOCUMENT,
     CONDITIONS,
+    PROBE_TABLES,
     WIDTH_TABLES,
 )
 from atom.compass.spec.validate import DERATES as DERATES_ASKED
 from atom.compass.spec.validate import MISSING as MISSING_ASKED
+from atom.compass.spec.validate import PROBES as PROBES_ASKED
 from atom.compass.spec.validate import STACK as STACK_ASKED
 from atom.compass.spec.validate import TRANSFERS as TRANSFERS_ASKED
 from atom.compass.spec.validate import WIDTHS as WIDTHS_ASKED
@@ -79,7 +93,13 @@ TIER0 = {
     }
 }
 
-#: Tier 1, one card: the five readings and the single-width graph pool.
+#: Tier 1, one card: the five readings and the single-width graph pool, plus
+#: one entry no tier-1 probe produces. `allocator_retained_after_load_bytes` at
+#: width 1 is the hole `FILLED_BY` records, so on a real machine it is measured
+#: by hand. It is carried here because these fixtures exist to make a complete
+#: document, and `provenance.method` is one claim over a whole fragment:
+#: `probed` on this body is right about every entry but that one, which is a
+#: limit of the fixture rather than a capability of the probe.
 TIER1 = {
     "device": {
         "name": "MI355X",
@@ -558,12 +578,13 @@ def test_a_transfer_from_a_spec_pinned_to_this_stack_validates():
 
 
 def test_a_clear_check_says_which_conditions_it_could_not_ask():
-    # Three of the five conditions are opt-in, and a check that is silent about
+    # Four of the six conditions are opt-in, and a check that is silent about
     # what it declined to ask is a clear with no content behind it.
     bare = validate(merged().document)
     assert bare.ok
     assert [condition.split(" -- ")[0] for condition in bare.not_asked] == [
         WIDTHS_ASKED,
+        PROBES_ASKED,
         STACK_ASKED,
         TRANSFERS_ASKED,
     ]
@@ -759,6 +780,9 @@ def refused_by_condition():
         TIER1, "device", "runtime_constants", "persistent_forward_buffer_bytes"
     )
     no_derate = without(TIER1, "device", "memory", "derate")
+    no_probe = without(
+        TIER1, "device", "runtime_constants", "allocator_retained_after_load_bytes"
+    )
     carried = copy.deepcopy(TIER2)
     carried["device"]["software_pinned_to"] = dict(STACK, rocm="7.0.2")
     transferred = merge(
@@ -784,6 +808,12 @@ def refused_by_condition():
             (validate(merge(fragments(tier1=no_derate)).document), Rule.DERATE)
         ],
         WIDTHS_ASKED: [(validate(merged(), tp_widths=(16,)), Rule.NO_DEFAULTS)],
+        PROBES_ASKED: [
+            (
+                validate(merge(fragments(tier1=no_probe)).document, tp_widths=(1,)),
+                Rule.NO_DEFAULTS,
+            )
+        ],
         STACK_ASKED: [(moved, Rule.PINNED_STACK)],
         TRANSFERS_ASKED: [(validate(transferred), Rule.PINNED_STACK)],
     }
@@ -1262,3 +1292,361 @@ def test_how_the_rates_were_obtained_is_the_callers_claim_and_has_no_default(tmp
 def test_the_probe_is_reachable_by_name():
     assert "tokenizer_fragment" in spec_package.__all__
     assert spec_package.tokenizer_fragment is tokenizer_fragment
+
+
+# --- the readings a probe takes off a card -----------------------------------
+
+#: The card the readings below are taken on, and the two numbers a rank reads
+#: beside the one the spec wants: what the torch allocator holds, and the
+#: budget side of the clamp the engine sizes its cache by.
+CAPACITY = 288.0e9
+RESERVED = 2.94e9
+KV_BUDGET = 92.1e9
+
+#: The reserve the collective terms predict at each measured width, and what a
+#: rank really read there: the honest readings sit just above their prediction,
+#: and the spread is the one this hardware shows with nothing else on it.
+PREDICTED = {1: 970.0e6, 2: 7.2e9, 4: 7.6e9, 8: 11.2e9}
+MEASURED = {
+    1: (926 * MIB, 0),
+    2: (6906 * MIB, 0),
+    4: (7266 * MIB, 192 * MIB),
+    8: (10704 * MIB, 640 * MIB),
+}
+
+
+def reading(non_torch, *, total=CAPACITY, reserved=RESERVED, kv_budget=KV_BUDGET):
+    """One rank's four readings, written as the term under test plus the rest."""
+    return DeviceMemory(
+        free_bytes=total - reserved - non_torch,
+        total_bytes=total,
+        reserved_bytes=reserved,
+        kv_budget_bytes=kv_budget,
+    )
+
+
+def ranks_of(tp_width, non_torch, spread=0):
+    """One engine start: every rank reading the same, and one reading higher."""
+    return [reading(non_torch)] * (tp_width - 1) + [reading(non_torch + spread)]
+
+
+def test_free_and_total_are_kept_apart_and_the_difference_is_derived():
+    # The whole point of the four fields: the reading a spec wants is a
+    # difference, and a probe that stored only the difference could not be
+    # asked either of the questions below.
+    one = reading(10704 * MIB)
+    assert one.total_bytes == CAPACITY and one.reserved_bytes == RESERVED
+    assert one.free_bytes == CAPACITY - RESERVED - 10704 * MIB
+    assert one.non_torch == 10704 * MIB
+    assert not one.free_was_binding
+    assert "free of" in str(one) and "non_torch" in str(one)
+
+
+@pytest.mark.parametrize("tp_width", sorted(PREDICTED))
+def test_the_widest_honest_reading_at_every_width_is_accepted(tp_width):
+    # Measured on a machine with nothing else on it, so a check that refused
+    # any of these would be refusing the hardware for behaving as it behaves.
+    lowest, spread = MEASURED[tp_width]
+    measured = non_torch_across_ranks(
+        tp_width, ranks_of(tp_width, lowest, spread), PREDICTED[tp_width]
+    )
+    assert measured.minimum == lowest
+    assert measured.spread == spread
+
+
+def test_the_spread_this_hardware_shows_is_reported_and_not_folded_away():
+    # The first half of the named result: eight ranks of one group, the widest
+    # honest spread this hardware shows, kept as the smallest reading with the
+    # disagreement reported beside it rather than reduced to one number.
+    measured = non_torch_across_ranks(8, ranks_of(8, 10704 * MIB, 640 * MIB), 11.2e9)
+    assert measured.minimum == 10704 * MIB
+    assert measured.spread == 640 * MIB
+    assert "spread" in str(measured) and "6.0%" in str(measured)
+
+
+def test_a_card_every_rank_shares_with_one_neighbour_is_refused_by_name():
+    # The second half of the named result. Every rank reads the neighbour that
+    # killed six engine starts, so they agree to the byte and the cross-rank
+    # check is silent; the absolute one names the reading and the ceiling.
+    crowded = ranks_of(8, 152.01e9)
+    agreed = across_ranks("non_torch", 8, [rank.non_torch for rank in crowded])
+    assert agreed.spread == 0
+    with pytest.raises(SpecRefusal) as refused:
+        non_torch_across_ranks(8, crowded, 11.2e9)
+    assert refused.value.rule is Rule.DEVICE_WIDE
+    assert "152010000000.0" in refused.value.what
+    assert "22400000000.0" in refused.value.what
+    assert "11200000000.0" in refused.value.what and "2x" in refused.value.what
+
+
+def test_the_limit_is_a_multiple_of_what_the_width_predicts():
+    # It is the prediction for the width that moves, not the reading: the same
+    # number is a quiet card at width 8 and eleven times its prediction at 1.
+    assert non_torch_across_ranks(8, ranks_of(8, 10704 * MIB), 11.2e9).minimum
+    with pytest.raises(SpecRefusal) as refused:
+        non_torch_across_ranks(1, ranks_of(1, 10704 * MIB), 970.0e6)
+    assert refused.value.rule is Rule.DEVICE_WIDE
+
+
+def test_how_crowded_the_card_may_be_is_the_callers_judgement():
+    # 16.0e9 is 2.1 times what width 4 predicts: inside a limit of 2.5 and
+    # outside the default of 2.0, so the judgement is the only thing moving.
+    crowded = ranks_of(4, 16.0e9)
+    assert non_torch_across_ranks(4, crowded, 7.6e9, limit=2.5).minimum == 16.0e9
+    with pytest.raises(SpecRefusal):
+        non_torch_across_ranks(4, crowded, 7.6e9)
+
+
+def test_a_rank_whose_free_memory_was_binding_is_refused_and_named():
+    # A cache sized by the gap a neighbour left is a property of the
+    # neighbour, so the rank that read it is named while it is still in hand.
+    binding = ranks_of(2, 200.0e9)
+    with pytest.raises(SpecRefusal) as refused:
+        non_torch_across_ranks(2, binding, 7.2e9)
+    assert refused.value.rule is Rule.DEVICE_WIDE
+    assert "rank 0" in refused.value.what
+    assert "92100000000.0" in refused.value.what
+
+
+def test_a_reading_the_engine_would_floor_at_zero_is_refused_here():
+    # The engine floors this term at zero. A probe does not: a floor turns an
+    # impossible reading into a plausible one.
+    impossible = reading(-1.0 * MIB, kv_budget=1.0)
+    assert impossible.non_torch < 0
+    with pytest.raises(SpecRefusal) as refused:
+        non_torch_across_ranks(2, [impossible, impossible], 7.2e9)
+    assert refused.value.rule is Rule.SHAPE
+
+
+def test_a_prediction_that_is_not_a_quantity_is_refused():
+    with pytest.raises(SpecRefusal) as refused:
+        non_torch_across_ranks(8, ranks_of(8, 10704 * MIB), 0)
+    assert refused.value.rule is Rule.SHAPE
+    assert "the predicted reserve" in refused.value.what
+
+
+def test_a_rank_that_was_not_read_is_refused_before_anything_is_kept():
+    with pytest.raises(SpecRefusal) as refused:
+        non_torch_across_ranks(8, ranks_of(4, 10704 * MIB), 11.2e9)
+    assert refused.value.rule is Rule.RANK_AGREEMENT
+
+
+@pytest.mark.parametrize(
+    "overrides, named",
+    [
+        ({"total_bytes": 0.0}, "a card of 0.0 bytes"),
+        ({"free_bytes": -1.0}, "-1.0 bytes free"),
+        ({"free_bytes": 400.0e9}, "400000000000.0 bytes free of 288000000000.0"),
+        ({"reserved_bytes": -120.0e9}, "-120000000000.0 bytes reserved"),
+        (
+            {"reserved_bytes": 400.0e9},
+            "400000000000.0 bytes reserved of 288000000000.0",
+        ),
+    ],
+)
+def test_a_rank_whose_readings_cannot_be_one_card_is_refused_and_named(
+    overrides, named
+):
+    # Keeping the four apart is what makes this askable at all: each of these
+    # is a statement about one reading against another, and the difference the
+    # spec wants has already thrown the comparison away.
+    fields = {
+        "free_bytes": CAPACITY - RESERVED - 10704 * MIB,
+        "total_bytes": CAPACITY,
+        "reserved_bytes": RESERVED,
+        "kv_budget_bytes": 1.0,
+    }
+    odd = DeviceMemory(**dict(fields, **overrides))
+    assert odd.impossible == named
+    with pytest.raises(SpecRefusal) as refused:
+        non_torch_across_ranks(2, [odd, odd], 7.2e9)
+    assert refused.value.rule is Rule.DEVICE_WIDE
+    assert "rank 0" in refused.value.what
+    assert named in refused.value.what
+
+
+def test_readings_no_card_could_produce_are_refused_though_their_difference_is_not():
+    # 400e9 free on a 288e9 card with -120e9 reserved leaves a difference of
+    # 8.0e9, which is a quiet width-2 card by every check over the difference
+    # alone. The readings behind it are not a card.
+    odd = DeviceMemory(
+        free_bytes=400.0e9,
+        total_bytes=CAPACITY,
+        reserved_bytes=-120.0e9,
+        kv_budget_bytes=1.0,
+    )
+    assert odd.non_torch == 8.0e9
+    assert not odd.free_was_binding
+    assert non_torch_across_ranks(2, [reading(8.0e9)] * 2, 7.2e9).minimum == 8.0e9
+    with pytest.raises(SpecRefusal) as refused:
+        non_torch_across_ranks(2, [odd, odd], 7.2e9)
+    assert refused.value.rule is Rule.DEVICE_WIDE
+
+
+def test_a_reading_just_inside_the_limit_is_accepted_and_is_what_the_spec_takes():
+    # What the check lets through is the number a spec carries. Just inside the
+    # limit at width 8 is nearly twice the prediction, and the whole of the
+    # excess is memory this engine did not allocate.
+    inside = non_torch_across_ranks(8, ranks_of(8, 22.39e9), 11.2e9)
+    assert inside.minimum == 22.39e9
+    assert inside.minimum - 11.2e9 > 11.1e9
+    with pytest.raises(SpecRefusal):
+        non_torch_across_ranks(8, ranks_of(8, 22.41e9), 11.2e9)
+
+
+@pytest.mark.parametrize("tp_width", [0, -2])
+def test_a_width_with_no_ranks_is_refused_rather_than_reduced(tp_width):
+    # The width reaches this entry point from a caller, not from a document
+    # the schema has already refused a non-positive key in.
+    with pytest.raises(SpecRefusal) as refused:
+        non_torch_across_ranks(tp_width, [], 7.2e9)
+    assert refused.value.rule is Rule.RANK_AGREEMENT
+    assert str(tp_width) in refused.value.what
+
+
+def test_the_readings_are_reachable_by_name():
+    for name in ("DeviceMemory", "non_torch_across_ranks", "ABSOLUTE_LIMIT"):
+        assert name in spec_package.__all__
+        assert getattr(spec_package, name, None) is not None
+
+
+# --- which probe fills which constant, and the entry none fills ---------------
+
+
+def test_the_probe_table_names_every_constant_the_schema_keys_by_width():
+    # The table and the schema are two lists of the same constants. A width
+    # table added to one and not the other is a term with no probe named for
+    # it, or a probe named for a term the schema does not have.
+    assert set(FILLED_BY) == {path.rsplit(".", 1)[-1] for path in WIDTH_TABLES}
+
+
+@pytest.mark.parametrize("tp_width", [1, 2, 4, 8, 16])
+def test_the_reserve_is_filled_at_every_width_by_one_probe_or_the_other(tp_width):
+    filled = probe_for("driver_and_collective_reserve_bytes", tp_width)
+    assert filled == ("device-memory" if tp_width == 1 else "device-runtime-constants")
+
+
+@pytest.mark.parametrize("tp_width", [2, 4, 8, 16])
+def test_the_allocators_retained_bytes_are_filled_above_one_card(tp_width):
+    assert probe_for("allocator_retained_after_load_bytes", tp_width) == (
+        "device-runtime-constants"
+    )
+
+
+def test_the_one_entry_no_probe_fills_is_refused_and_says_what_is_missing():
+    # The hole. The single-card probe is specified to read the device's own
+    # reserve and not this term, and the multi-rank probe is specified for the
+    # widths above one, so this entry is measured by hand or it is not
+    # measured. Naming either probe here would be inventing a capability.
+    with pytest.raises(SpecRefusal) as refused:
+        probe_for("allocator_retained_after_load_bytes", 1)
+    assert refused.value.rule is Rule.NO_DEFAULTS
+    assert "no probe here fills" in refused.value.what
+    assert "allocator_retained_after_load_bytes" in refused.value.what
+    assert "width 1" in refused.value.what
+    assert "by hand" in refused.value.remedy
+    for named in ("device-memory", "device-runtime-constants"):
+        assert named in refused.value.remedy
+
+
+def test_a_term_that_is_not_keyed_by_width_has_no_probe_to_ask_for():
+    with pytest.raises(SpecRefusal) as refused:
+        probe_for("persistent_forward_buffer_bytes", 1)
+    assert refused.value.rule is Rule.NO_DEFAULTS
+    assert "not one of the constants measured per" in refused.value.what
+
+
+def test_a_missing_entry_no_probe_fills_is_two_refusals_and_not_one():
+    # A width nobody measured is always refused; this one is refused twice,
+    # because the remedy the first offers -- go and measure it -- names a probe
+    # that does not exist. The two always arrive together: the probe question
+    # is asked only where the entry is absent, which is when the first fires.
+    thin = without(
+        TIER1, "device", "runtime_constants", "allocator_retained_after_load_bytes"
+    )
+    checked = validate(merge(fragments(tier1=thin)).document, tp_widths=(1,))
+    assert not checked.ok
+    assert [refusal.rule for refusal in checked.refusals] == [
+        Rule.NO_DEFAULTS,
+        Rule.NO_DEFAULTS,
+    ]
+    measured, filled = (refusal.what for refusal in checked.refusals)
+    assert "was not measured at tensor-parallel width 1" in measured
+    assert "no probe here fills" in filled
+
+
+def test_a_width_a_probe_would_fill_is_not_reported_as_a_hole_in_the_probes():
+    # Width 16 is unmeasured and refused, and the remedy is one an author can
+    # follow: the multi-rank probe starts an engine at any width above one.
+    checked = validate(merged().document, tp_widths=(16,))
+    assert not checked.ok
+    assert all(
+        "no probe here fills" not in refusal.what for refusal in checked.refusals
+    )
+
+
+def test_a_spec_that_carries_the_hand_measured_entry_is_not_refused_for_it():
+    # The refusal is about the hole in the tools, not about how the number was
+    # obtained. A spec that states it is a good spec at width 1.
+    checked = validate(merged().document, tp_widths=(1,))
+    assert checked.ok
+
+
+@pytest.mark.parametrize("tp_width", [0, -3])
+def test_a_width_below_one_card_is_refused_rather_than_handed_a_probe(tp_width):
+    # Every width that was not exactly one fell to the multi-rank probe, zero
+    # and the negatives with it. No engine starts on that many cards, so this
+    # is a wrong question and not a term nobody has measured yet.
+    for constant in sorted(FILLED_BY):
+        with pytest.raises(SpecRefusal) as refused:
+            probe_for(constant, tp_width)
+        assert refused.value.rule is Rule.NO_DEFAULTS
+        assert f"width {tp_width} is not a number of cards" in refused.value.what
+
+
+def test_the_check_does_not_agree_a_probe_exists_for_a_width_below_one():
+    # Reachable from the verb, which is where a width arrives from the caller
+    # rather than from a document the schema has already refused it in.
+    checked = validate(merged().document, tp_widths=(0,))
+    assert not checked.ok
+    assert any(
+        "is not a number of cards" in refusal.what for refusal in checked.refusals
+    )
+
+
+def test_the_probe_question_reads_only_the_tables_a_probe_can_fall_short_on():
+    # The reserve table is filled at every width by one probe or the other, so
+    # the question can never say anything about it. Registering it as read
+    # would make a run that could not ask the question and a run that asked it
+    # and found nothing report the same record.
+    assert set(PROBE_TABLES) <= set(WIDTH_TABLES)
+    assert {path.rsplit(".", 1)[-1] for path in PROBE_TABLES} == {
+        name for name, probes in FILLED_BY.items() if None in probes
+    }
+
+
+def test_the_probe_question_says_it_could_not_be_asked_when_its_table_is_gone():
+    # The other width table still resolves, so the width question was asked of
+    # part of what it reads. The probe question was not asked at all, and the
+    # count of what this run reached must not include it.
+    absent = ("device", "runtime_constants", "allocator_retained_after_load_bytes")
+    checked = validate(
+        merge(
+            fragments(tier1=without(TIER1, *absent), tier2=without(TIER2, *absent))
+        ).document,
+        tp_widths=(16,),
+    )
+    (unasked,) = [
+        condition
+        for condition in checked.not_asked
+        if condition.startswith(PROBES_ASKED)
+    ]
+    assert "could not be asked at all" in unasked
+    assert not any(
+        condition.startswith(PROBES_ASKED) for condition in checked.asked_in_part
+    )
+
+
+def test_the_probe_table_is_reachable_by_name():
+    assert "probe_for" in spec_package.__all__
+    assert spec_package.probe_for is probe_for
