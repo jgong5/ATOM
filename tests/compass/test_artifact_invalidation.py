@@ -6,23 +6,22 @@ crosses.** `test_every_cell_of_the_matrix_decides_by_itself` walks all
 forty-two cells: where the matrix says a row depends on an axis, moving that
 axis refuses and the refusal names the cell; where it says the row does not,
 moving the same axis loads clean. A matrix that has been tidied into a uniform rule
-passes neither half, and the pair the brief names -- `price_list` surviving a
-model change while `region_terms` refuses one -- is also published and loaded
-through the store, because a table that is right in the abstract and unwired
-in the store is the machinery-with-no-caller shape this package's own review
-found once already.
+passes neither half, and one pair -- `price_list` surviving a model change
+while `region_terms` refuses one -- is also published and loaded through the
+store, because a table that is right in the abstract and unwired in the store
+is machinery with no caller.
 
 Two things this file deliberately does not do, both inherited.
 
 **It binds no `width`.** The matrix's six columns contain no width at all, so
-invalidation does not need #165 ruled; where a key field happens to be
+invalidation does not need #165 settled; where a key field happens to be
 called `width` the topology here is tensor-parallel only, so the two candidate
 readings coincide and no fixture settles the question by example.
 
-**It rules nothing that is the owner's.** Whether an aiter bump invalidates
-or only warns is #168, and until it is ruled the default stands:
-`test_an_aiter_bump_refuses_until_its_meaning_is_ruled` pins the default, and
-it is the test that changes when the ruling lands.
+**It settles nothing left open.** Whether an aiter bump invalidates or only
+warns is open (#168), and while it is open the default stands:
+`test_an_aiter_bump_refuses_while_its_meaning_is_open` pins the default, and
+it is the test that changes when that is settled.
 
 Nothing here touches a driver, a device or a network. The conditions are
 stated and never probed, which is also why a fixture can express a ROCm bump
@@ -242,10 +241,10 @@ def test_a_kind_the_matrix_does_not_row_is_refused_by_name(kind):
 def test_every_cell_of_the_matrix_decides_by_itself(row, axis):
     """Forty-two cells: a cross refuses and names itself, a zero loads clean.
 
-    This is the named result. It is one test rather than seven because the
-    claim is about the table and not about any row: a rule that refused on
-    every axis would pass every cross and fail every zero, and a rule that
-    refused on none would do the reverse.
+    It is one test rather than seven because the claim is about the table
+    and not about any row: a rule that refused on every axis would pass every
+    cross and fail every zero, and a rule that refused on none would do the
+    reverse.
 
     It reads `MATRIX` rather than restating the document by hand, so on its
     own it
@@ -279,7 +278,7 @@ def test_a_fingerprint_carries_only_the_cells_its_row_depends_on():
 
 
 def test_no_axis_of_the_matrix_is_a_width():
-    """#165 does not block this cut, and this is why.
+    """No axis is a width, so the matrix does not depend on #165.
 
     The columns are the software stack, torch, ATOM's source, the model, the
     device and the engine config. None of them is a width, so no fingerprint
@@ -297,7 +296,7 @@ def test_no_axis_of_the_matrix_is_a_width():
     assert TP2.rank_count == TP2.tp
 
 
-# --- the pair the brief names, through the store ---------------------------
+# --- one row survives what the other refuses, through the store ------------
 
 
 def test_a_price_list_survives_a_model_change_and_region_terms_refuses_one(tmp_path):
@@ -348,13 +347,12 @@ def test_a_machine_spec_is_three_rows_and_a_device_change_moves_two(tmp_path):
     )
 
 
-def test_an_aiter_bump_refuses_until_its_meaning_is_ruled(tmp_path):
-    """The default, because what an aiter bump means is the owner's ruling (#168).
+def test_an_aiter_bump_refuses_while_its_meaning_is_open(tmp_path):
+    """The default, because what an aiter bump means is left open (#168).
 
     The four rows that carry ROCm/AITER/RCCL refuse a bump; `machine_spec`'s
-    capacity does not, because the silicon did not move. If the ruling lands
-    as "warn", this is the test that changes, and one cell of `MATRIX` with
-    it.
+    capacity does not, because the silicon did not move. If it is settled as
+    "warn", this is the test that changes, and one cell of `MATRIX` with it.
     """
     store = ArtifactStore(tmp_path)
     bumped = BASE.with_reading(
@@ -748,7 +746,7 @@ def test_a_publish_that_states_no_conditions_is_refused(tmp_path):
 
 
 def test_notes_that_are_not_text_are_refused_and_leave_nothing_behind(tmp_path):
-    """Measured on the artifact store's review, filed as #169: `TypeError`, and litter.
+    """Measured and filed as #169: `TypeError`, and litter.
 
     `notes` was never checked, so a non-string reached `json.dumps` and came
     back as a bare `TypeError` -- an unnamed exception where a named refusal
@@ -772,10 +770,9 @@ def test_a_publish_that_fails_on_the_way_to_the_rename_leaves_nothing_behind(tmp
 
     Validating `notes` makes the measured `TypeError` unreachable through
     `publish`, so a test driven only through the public surface would leave
-    the widened `except` as a claim nothing bites on -- the inert-pin finding
-    this package's own review made in cycle 2, reproduced by the fix for the
-    thing above it. The staging directory is what is under test, so the test
-    goes to where it is made.
+    the widened `except` as a claim nothing bites on -- an inert pin, made by
+    the fix for the thing above it. The staging directory is what is under
+    test, so the test goes to where it is made.
     """
     store = ArtifactStore(tmp_path)
     destination = store.directory_for(KEY_OF[Row.PRICE_LIST])
