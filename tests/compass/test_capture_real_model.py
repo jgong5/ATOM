@@ -265,7 +265,7 @@ CUDA_NAMES_READ = frozenset(
 )
 
 # Every `torch.cuda` name read by code outside torch, stubbed or not, with who
-# reads it. Measured over a whole capture: the same 12 at both widths and in
+# reads it. Measured over a whole capture: the same 11 at both widths and in
 # every pass this file runs. The 8 stubs missing here are read by torch alone.
 CUDA_NAMES_READ_OUTSIDE_TORCH = frozenset(
     {
@@ -273,7 +273,6 @@ CUDA_NAMES_READ_OUTSIDE_TORCH = frozenset(
         "Event",  # atom.model_engine.model_runner
         "ExternalStream",  # annotation: RapidServeModelRunner
         "Stream",  # atom, aiter, flydsl, transformers
-        "__file__",  # inspect.getmodule
         "current_device",  # aiter, atom.model_ops.attention_mha
         "current_stream",  # atom.utils.forward_context
         "device_count",  # atom.model_ops.fla_ops.utils
@@ -589,7 +588,7 @@ def _anonymise(text, axis):
 # the capture driver -- everything below runs in the subprocess
 
 
-_CUDA_READS_OUTSIDE_TORCH = collections.Counter()
+_CUDA_READS_OUTSIDE_TORCH = set()
 _UNCOUNTED_READERS = frozenset(
     {"torch", "importlib", "_frozen_importlib", "_frozen_importlib_external"}
 )
@@ -708,20 +707,22 @@ def _declare_cuda():
     # one. The reader is the calling frame's module package. Torch's own and the
     # import system's reads bind names and are not counted. A reader that cannot
     # be named is recorded as "<name> (reader unknown)", so it fails by name.
-    outside = _CUDA_READS_OUTSIDE_TORCH
+    # Dunder names are module metadata, never a device reading, and are skipped.
 
     class _ReadCountingModule(type(torch.cuda)):
         def __getattribute__(self, name):
             if name in stubbed:
                 reads[name] += 1
+            if name.startswith("__"):
+                return super().__getattribute__(name)
             try:
                 reader = sys._getframe(1).f_globals["__name__"]
             except (ValueError, KeyError):
                 reader = None
             if not isinstance(reader, str):
-                outside[f"{name} (reader unknown)"] += 1
+                _CUDA_READS_OUTSIDE_TORCH.add(f"{name} (reader unknown)")
             elif reader.partition(".")[0] not in _UNCOUNTED_READERS:
-                outside[name] += 1
+                _CUDA_READS_OUTSIDE_TORCH.add(name)
             return super().__getattribute__(name)
 
     torch.cuda.__class__ = _ReadCountingModule
