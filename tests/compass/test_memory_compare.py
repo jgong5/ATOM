@@ -611,6 +611,39 @@ def test_two_shapes_and_no_side_naming_a_shaped_term_refuses_outright():
     assert "neither names a term it took at one" in str(refusal.value)
 
 
+@pytest.mark.parametrize(
+    "at_shape", [AT_SHAPE, frozenset()], ids=["per-term", "outright"]
+)
+def test_a_decode_side_refuses_a_prefill_side_at_the_same_token_count(at_shape):
+    # The token counts agree, so only the phase separates the two sides. Both
+    # places that read shape agreement are driven: the per-term refusal when a
+    # shaped term is named, and the outright one when neither side names one.
+    predicted = Predicted(
+        label="a prefill prediction",
+        shape=HISTORICAL_SHAPE,
+        terms=HISTORICAL_PREDICTED.terms,
+        at_shape=at_shape,
+    )
+    decode = Recorded(
+        run="a decode step at the prediction's token count",
+        shape=Shape(tokens=HISTORICAL_SHAPE.tokens, phase="decode"),
+        high_water_reset=True,
+        terms=HISTORICAL_RECORDED.terms,
+        at_shape=at_shape,
+    )
+    both = "predicted at 4096 tokens, prefill, recorded at 4096 tokens, decode"
+    if not at_shape:
+        with pytest.raises(MemoryRefusal) as refusal:
+            compare(predicted, decode)
+        assert f"taken at different shapes -- {both} -- " in str(refusal.value)
+        return
+    comparison = compare(predicted, decode)
+    refused = {r.name: r for r in comparison.refused}
+    assert set(refused) == {"activations"}
+    assert f"the two disagree -- {both}" in refused["activations"].what
+    assert {t.name for t in comparison.compared} == {"weights", UNATTRIBUTED}
+
+
 def test_a_side_that_claims_a_shaped_term_it_does_not_carry_is_rejected():
     with pytest.raises(ValueError) as bad:
         Recorded(
