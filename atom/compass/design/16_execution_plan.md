@@ -471,7 +471,8 @@ decision that belongs to the project owner, not to the agent that ran it.
 arrives with the options and their costs already worked out, so the decision is one round
 trip rather than a fresh analysis under time pressure.
 
-The halt rule (`AI_DEV_RULES.md`) is the general case: any surprise stops and is discussed.
+The stop-and-diagnose rule (`AI_DEV_RULES.md`) is the general case: any surprise stops and
+is diagnosed, and becomes an escalation only when it needs an owner ruling.
 
 Reaching any of these five, like the loop's halt above, is an escalation — so it applies
 `need human` too (`AI_DEV_RULES.md`), for the same reason: the stop should be visible on
