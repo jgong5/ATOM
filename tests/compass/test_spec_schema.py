@@ -248,9 +248,9 @@ def test_a_field_stated_twice_is_refused_by_name(dotted_first):
 
 
 def test_both_orders_give_the_same_refusal():
-    # The named result. Order decided which value survived, so nothing in the
-    # message may depend on which spelling the mapping yielded first -- and a
-    # message that named the value it kept would.
+    # Order decided which value survived, so nothing in the message may depend
+    # on which spelling the mapping yielded first -- and a message that named
+    # the value it kept would.
     dotted_first = refusal_from(both_spellings(True))
     nested_first = refusal_from(both_spellings(False))
     assert dotted_first.rule is nested_first.rule
@@ -314,10 +314,10 @@ def test_a_dotted_key_on_its_own_is_a_supported_spelling():
 
 
 def test_a_later_document_is_told_this_reader_is_old():
-    # The named result for the version. A v2 document carries what v2 added;
-    # the schema is closed, so a version checked after the fields lets the
-    # closed schema speak first and tells the author their new field is
-    # illegitimate, in the one case where this reader is what is out of date.
+    # A v2 document carries what v2 added; the schema is closed, so a version
+    # checked after the fields lets the closed schema speak first and tells the
+    # author their new field is illegitimate, in the one case where this reader
+    # is what is out of date.
     later = document()
     later["schema_version"] = 2
     later["device"]["power_cap_watts"] = 700
@@ -659,8 +659,8 @@ def test_a_shape_refusal_asks_for_an_edit_this_reader_then_reads(breakage):
 
 
 def test_the_version_refusal_asks_for_a_newer_reader_and_says_so():
-    # The named result, and what it asserts is the member and the action. A
-    # count of members would pass the next time somebody adds one.
+    # What this asserts is the member and the action. A count of members would
+    # pass the next time somebody adds one.
     refusal = refusal_from(document(schema_version=2))
     assert refusal.rule is Rule.VERSION
     assert refusal.rule is not Rule.SHAPE
@@ -925,8 +925,8 @@ def test_a_missing_stack_pin_is_refused():
 
 
 def test_two_models_sharing_one_tokenizer_resolve_to_one_entry():
-    # The named result. Two architectures, one measured entry: four rates and a
-    # derate stored once. Keyed by model the same spec would hold one copy per
+    # Two architectures, one measured entry: four rates and a derate stored
+    # once. Keyed by model the same spec would hold one copy per
     # architecture -- two here, more in a real family -- with nothing in the
     # document ever comparing them, so they would drift silently.
     machine = read()
@@ -1164,8 +1164,8 @@ def test_a_block_is_refused_as_a_block_and_names_what_it_groups():
 
 
 def test_the_three_refusals_are_not_interchangeable():
-    # The named result. Swap any two messages and this fails; match a substring
-    # they share and it would not.
+    # Swap any two messages and this fails; match a substring they share and it
+    # would not.
     unknown = refused(read(), UNDECLARED)
     absent = refused(without(ABSENT), ABSENT)
     block = refused(read(), BLOCK)
