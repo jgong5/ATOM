@@ -76,6 +76,13 @@
   Design docs may cite each other freely; code may not cite them at all. This
   extends to **runtime data** — a `(BEYOND-D18)` suffix on an emitted stub name was
   a citation in the output record.
+- **The design-doc rule is checked at the head, over the PR's whole file set** —
+  never over the added lines of a delta, which cannot see a reference that
+  arrived before the range. Classify each hit as prose or emitted. A design
+  document a test opens **by path** is a functional dependency, not a citation,
+  and stays. Measured: one PR carried **41** references through review cycles
+  that each reported clean; a board-wide census found **nine** reaching runtime
+  output, inside `raise` messages and printed table notes.
 - Merge conflicts are the agent's call, not the owner's ("don't bother me on merge
   conflict, it's on you"). Tasks are cut so each touches one module plus its tests,
   which makes most of them disjoint, but they are **not guaranteed disjoint** and no
@@ -105,6 +112,13 @@
 - Task management is GitHub: the PR names its issue, and the issue is closed
   deliberately, with the handoff comment. Agents open, assign, comment on and
   close issues, including issues they did not open.
+- **Check delivery before claiming or briefing an issue.** Read its
+  **comments**, not only its body, and check whether any open PR names it in its
+  title or with a delivering verb (closes / fixes / resolves / addresses /
+  implements). **Do not write "checked" unless the check you ran is the one that
+  answers the claim.** Measured: two briefs in one day were written for issues an
+  open PR already delivered — one missed a delivery note in the first comment,
+  one asserted *"checked, not assumed"* with no check run.
 - **A finding that outlives its PR needs an issue, not a PR body.** PR bodies are
   squashed away on landing, so a finding recorded only there is lost to the next
   reader. Two reviews have now re-derived findings that had been written down
@@ -138,6 +152,12 @@
   whose review already passed. An agent applies the label the moment it
   escalates, so it can stop itself; only the owner removes it, and removal is
   what restarts the work.
+- **A declared escalation carries the label, or it is not a stop.** A halt
+  declared in prose does not stop automation; the label does. When the ruling
+  lives on a separate issue, **label each PR it holds anyway** and name the
+  issue on the PR. Measured: #81, #85, #91 and #95 all declared effort halts and
+  none was labelled — the ruling sat on #89 — and an agent dispatched work at #91
+  because it looked unlabelled and approved.
 - **The review loop has its own stop.** If the same finding survives two cycles,
   or the loop passes three cycles, it halts and goes to the owner and applies
   `need human` to the PR: a task that cannot converge is mis-cut, not
@@ -176,6 +196,16 @@
      names the child that carries it. A developer choosing one afterwards is
      the case this rule forbids, and it has happened.
   4. Review by the task's reviewer agent, looping to APPROVE as above.
+     **A pin is inert until someone has seen it fail.** A reviewer credits a
+     test with holding a defect only after reinstating the defect — the pre-fix
+     code via `git show`, nothing else changed — re-running, and recording both
+     counts plus the failing node id and assertion. A developer reverts their
+     own fix before claiming it; if nothing reddens, they add the pin or state
+     why the fix is unobservable. **Mutations preserve line count** — a
+     line-drift guard fires on any edit and reads as coverage. Measured: #163
+     was approved at cycle 2 on a pin that still gave `39 passed` with its
+     defect reinstated; a re-check of ~25 approved PRs found four inert pins
+     and five fixes nothing holds.
 
   Baselines are recorded first (the suite's and ruff's pass/fail state, before the
   first Compass commit) — the lint baseline on this repository is already known
@@ -189,6 +219,34 @@
   (`allow_merge_commit=false`, `allow_rebase_merge=false`). Base branch is always
   `feature/atomcompass_new` — never `main`, never `master`, never a branch on
   upstream `ROCm/ATOM`.
+- **Landing is the agents' job; no owner approval is needed or sought.** An agent
+  lands any PR that is approved — the verdict in the last review comment of its
+  thread, covering its current head — with no `need human` on it **or anywhere
+  below it in its stack**. The only other holds are reasons written in this file
+  — a declared escalation such as an effort halt, or a change these rules forbid
+  such as design-doc references in code — and **an agent that holds a PR names
+  the rule**. The owner stated this directly after ~42 approved, unlabelled PRs
+  sat for a day because a handoff note called landing "the owner's call".
+  - **A handoff note is a predecessor's judgement, not a rule.** Where a note
+    contradicts this file, this file wins.
+  - **Before landing on a moved tip, compare trees.** If
+    `<tip after landing>^{tree}` equals `<reviewed head>^{tree}`, the reviewed
+    gate result stands: #162→#170 landed as tree `fd1492b35`, identical to #170's
+    reviewed head, so its 4601-passed gate covered the tip with no re-run.
+  - **If the trees differ, trial-merge the batch and gate it once.** Any PR gated
+    against an older tip: `git merge-tree --write-tree`, bottom-first per chain,
+    then gate the combined tree before landing — two green PRs can merge red, and
+    package-wide globs are the known mechanism.
+  - **After landing:** fast-forward the main worktree (above); close a tracker
+    issue whose tasks have all landed; a follow-up filed as "claimable once X
+    lands" is now claimable.
+- **An approval covers a tree, not a PR.** When a head moves past the comment
+  that approved it, the new commits get a delta review pinned to
+  `<approved sha>..<head>` before the PR lands. A content-preserving restack needs
+  a verification, not a full review — by tree hash or a chunk-by-chunk comparison
+  of the result, never a diff of diffs. Measured: **13** heads had moved past
+  their approvals, one with an unreviewed commit sitting under two other approved
+  PRs.
 - **Recommended, not required: stack a dependent task's PR on its unlanded
   parent** with `gh stack` rather than waiting for it to land. Independent
   tasks do not stack. `gh stack` is GitHub's own extension
