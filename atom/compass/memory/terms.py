@@ -24,9 +24,9 @@ obtained* -- analytical, measured, fitted, interpolated, extrapolated. This enum
 answers a different question about a different subject: *where this memory
 term's bytes came from* -- a named field of the machine spec, a knob ATOM's
 own config states, arithmetic over other readings, or a coefficient somebody
-wrote down. There is deliberately no `GEOMETRY` member: the line drawn
-between the machine and the deployment puts a serving knob on the deployment
-side, and nothing on the model side of it is *obtained* yet -- every term
+wrote down. There is deliberately no `GEOMETRY` member: a serving knob is a
+property of the deployment rather than of the machine or the model, and
+nothing on the model side is *obtained* yet -- every term
 read off a model config here is a declared formula, and labelling one
 `GEOMETRY` would say it was not.
 

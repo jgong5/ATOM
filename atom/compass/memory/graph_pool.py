@@ -3,7 +3,7 @@
 
 """Two graph-pool numbers that are not the same number, kept apart on purpose.
 
-The memory model keeps two functions here and this module is that decision:
+This module keeps two graph-pool functions apart on purpose:
 
 - **`reserves()` mirrors ATOM's own `_estimate_cudagraph_overhead`**
   (`model_runner.py:1546-1641`). It is not the better number and it is not meant

@@ -1,26 +1,26 @@
 # SPDX-License-Identifier: MIT
 """Two instruments on one breakdown: the per-term gate, and the sum that hid it.
 
-The memory model records an incident rather than a rule and then draws the
-rule from it. A summed non-KV memory check read **+13.8%** and was three
-errors, two of which cancelled: weights over by **+0.280 GB**, activations
-compared at the wrong shape (**-0.015 GB**), and **-0.084 GB** of a resident
-term nobody had noticed existed. **The largest single error was 25% of its own term.**
+The per-term rule comes from an incident. A summed non-KV memory check read
+**+13.8%** and was three errors, two of which cancelled: weights over by
+**+0.280 GB**, activations compared at the wrong shape (**-0.015 GB**), and
+**-0.084 GB** of a resident term nobody had noticed existed. **The largest
+single error was 25% of its own term.**
 
 `HISTORICAL` below is that breakdown, and the named result of this task is the
 two instruments run on it side by side -- the per-term comparator naming three
 failures, and the summed check reading +13.8% and passing.
 
-**How the fixture's totals were reconstructed, since the record carries deltas
-and ratios rather than totals.** Three deltas are given (+0.280, -0.015,
+**How the fixture's totals were reconstructed, since the incident was reported
+as deltas and ratios rather than totals.** Three deltas are given (+0.280, -0.015,
 -0.084 GB), and two ratios: the largest error is 25% of its term, and the sum
 is +13.8%. The largest error by bytes is the weights one, so the recorded
 weights follow exactly: `0.280 / 0.25 = 1.120 GB`. The three deltas sum to
 +0.181 GB, so the recorded terms sum to `0.181 / 0.138`, and the rounding of
 13.8% pins that sum to `(1.30686, 1.31636]` GB -- leaving the recorded
 activations in `(0.10286, 0.11236]` GB. The fixture takes **0.110 GB**, the
-only figure the record does not determine, and the resulting sum is +13.77%,
-which is the +13.8% the record states. Nothing else in the fixture is chosen.
+only figure the incident's numbers do not determine, and the resulting sum is
++13.77%, which is the +13.8% the incident reported. Nothing else in the fixture is chosen.
 
 Every test in this file runs with both device readings patched to raise, for the
 same reason the readings tests do: a comparator that needed a card would be
@@ -113,8 +113,8 @@ HISTORICAL_SHAPE = Shape(tokens=4096, phase="prefill")
 #: The terms taken at that shape. Stated, never inferred from a name.
 AT_SHAPE = frozenset({"activations"})
 
-#: The record does not name the third term. It is named here for the two things
-#: it does say about it: it is resident, and the model that missed it
+#: The incident does not name the third term. It is named here for the two
+#: things known about it: it is resident, and the model that missed it
 #: attributed nothing to it.
 UNATTRIBUTED = "resident (unattributed)"
 
@@ -134,7 +134,7 @@ HISTORICAL_RECORDED = Recorded(
 )
 
 HISTORICAL_PREDICTED = Predicted(
-    label="the memory model of the incident",
+    label="the prediction the incident's summed check passed",
     shape=HISTORICAL_SHAPE,
     terms=(
         Term(
@@ -162,9 +162,9 @@ def test_the_named_result_two_instruments_on_one_breakdown(capsys):
     one breakdown and the disagreement is the finding.
     """
     comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
-    # This project states no band for a sum. Every band it does state -- the
-    # 10% a non-KV term carries, and the 25% the unmeasured-device tier allows
-    # one -- is per term, and taking one of them for a sum is the substitution
+    # No band for a sum exists. Both bands in use -- the 10% a non-KV term
+    # carries, and the 25% allowed one on a device nobody has measured -- are
+    # per term, and taking one of them for a sum is the substitution
     # the incident is made of. 25% is the loosest, so it flatters the sum most.
     summed = comparison.summed(band=0.25)
     with capsys.disabled():
@@ -305,12 +305,12 @@ def qwen_0_6b():
     )
 
 
-def test_the_tied_head_is_one_embedding_and_the_design_records_its_size():
+def test_the_tied_head_is_one_embedding_of_0_290_gib_on_the_0_6b():
     config = qwen_0_6b()
     nbytes = tied_lm_head_bytes(config, dtype_bytes=element_bytes(config.dtype))
     assert nbytes == 151_936 * 1_024 * 2
     assert nbytes == 311_164_928
-    # The record: "worth one embedding, 0.290 GiB on the 0.6B".
+    # The measured gap the tie closed: one embedding, 0.290 GiB on the 0.6B.
     assert round(nbytes / (1 << 30), 3) == 0.290
 
 
@@ -351,9 +351,9 @@ def test_a_model_config_class_supplies_the_field_and_its_default_is_untied():
     assert tied_lm_head_bytes(defaulted, dtype_bytes=2) == 0
 
 
-#: The 0.6B's resident weight total is not in the design record. This fixture
-#: states one so a percentage can be shown; the only figure the test below pins
-#: to the record is the tie itself.
+#: No measured resident weight total for the 0.6B is available. This fixture
+#: states one so a percentage can be shown; the only measured figure the test
+#: below pins is the tie itself.
 RECORDED_0_6B_WEIGHTS = 1_192_000_000
 
 
@@ -450,8 +450,8 @@ def agreeing_recording(prediction, *, drop=("buffers",)):
     non-subtractive readings -- `parameter_bytes`, `weights_torch`,
     `current_torch` -- and none of them is buffers. Buffers are not parameters,
     so they fall inside `weights_torch - parameter_bytes` together with every
-    other resident non-parameter allocation; isolating them needs the recording
-    the memory model asks for, which is a separate instrument.
+    other resident non-parameter allocation; isolating them needs a recording
+    of buffers on their own, which is a separate instrument.
     """
     return Recorded(
         run="fixture: every recorded term set to the predicted byte count",
@@ -470,7 +470,7 @@ def test_a_term_the_run_does_not_record_refuses_and_carries_its_own_reason(
 ):
     """`buffers` refuses by name, and the refusal quotes the reason.
 
-    The rule for this term is *recorded, not formula'd*: the formula that
+    This term has to be recorded rather than computed: the formula that
     matched the 0.6B exactly was 4x wrong on the 27B, was tested on a second
     model, failed and did not ship. The replacement that shipped was itself 4x
     high and now says on the term that it is derived from ATOM's rotary source
@@ -511,9 +511,9 @@ def test_the_two_terms_that_cannot_discharge_their_gate_while_agreeing_exactly(
     `weights` is a declared coefficient over a **round 27e9**, and the note it
     carries names a second reason that a better parameter count would not
     touch: it shards every parameter, where a real stack replicates its norms.
-    `activations` is a declared formula over one live layer, and the memory
-    model's own open issue says a traced graph without the invisible-scratch
-    table does not discharge the 10% gate on it.
+    `activations` is a declared formula over one live layer, and even a traced
+    graph without the invisible-scratch table would not be enough to discharge
+    the 10% gate on it.
     """
     prediction = live_prediction(spec, qwen)
     comparison = compare(prediction, agreeing_recording(prediction))
@@ -849,9 +849,9 @@ def test_both_graph_pool_numbers_are_reported_against_the_recorded_pool(
 ):
     """Neither function is picked, and the one that reserves is labelled.
 
-    The memory model keeps the two apart because they disagree by 4-19x. A
-    that reported one of them would have reconciled what the design says to
-    keep apart, so this one has a row for each and no accessor for *the* error.
+    The two stay apart because they disagree by 4-19x. A comparator that
+    reported one of them would reconcile the two numbers `graph_pool` keeps
+    apart, so this one has a row for each and no accessor for *the* error.
     """
     total_bytes = int(spec.value("device.memory.capacity_bytes"))
     comparison = compare_graph_pool(
@@ -875,7 +875,7 @@ def test_both_graph_pool_numbers_are_reported_against_the_recorded_pool(
     assert f"{comparison.predicts_relative:+.2%}" in rendered
 
 
-def test_the_recorded_band_is_the_four_to_nineteen_times_the_design_records(spec, qwen):
+def test_the_disagreement_is_inside_the_recorded_four_to_nineteen_times(spec, qwen):
     total_bytes = int(spec.value("device.memory.capacity_bytes"))
     captured = sum(ladder())
     ratios = {}
@@ -1029,7 +1029,10 @@ def test_the_guard_catches_the_forms_that_were_actually_removed():
     never_here = ["the P0.4 gates", "ART-2 swept the other package"]
     for text in removed + never_here:
         assert _TAGS.search(text), text
-    assert not _TAGS.search("buffers are recorded rather than computed")
+    # The replacement wording, read out of the package so the two cannot drift.
+    replacement = "a recording off a card replaces this"
+    assert replacement in (PACKAGE / "readings.py").read_text()
+    assert not _TAGS.search(replacement)
 
 
 def test_the_kept_forms_are_kept_on_purpose_and_stay_readable():

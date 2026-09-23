@@ -54,11 +54,11 @@ about a number having been read off the thing it describes.
   eager-mode branch of the graph-pool estimator, which is not a footprint term.
 
 The asymmetry between the second and third rows is deliberate: a declared term
-can **fail** its gate but cannot **pass** it. The memory model is written that
-way for two of the three terms it owes -- weights are exact from a meta build,
-and buffers are recorded rather than computed -- and for the third it is stated
-outright, that a traced graph without the invisible-scratch table does not
-discharge the 10% gate on the activation term.
+can **fail** its gate but cannot **pass** it. Two of the three model terms have
+a successor that makes them exact -- weights from a meta build, buffers from a
+recording off a card -- and the third has none yet: a traced graph without the
+invisible-scratch table is not enough to discharge the 10% gate on the
+activation term.
 
 ## The traps this module refuses rather than papers over
 
@@ -100,7 +100,7 @@ from atom.compass.memory import graph_pool
 from atom.compass.memory.readings import DeviceReadings, MemoryRefusal
 from atom.compass.memory.terms import Basis, Reading, Term
 
-#: The memory model's acceptance gate on a non-KV term, individually.
+#: The acceptance gate on each non-KV term, as a fraction of the recorded term.
 NON_KV_TERM_GATE = 0.10
 
 #: The bases that can discharge a gate. Stated as a set rather than as "not
@@ -411,9 +411,9 @@ class Comparison:
     def summed(self, *, band: float) -> SummedCheck:
         """The instrument the per-term rule rejects, kept so it can be shown wrong.
 
-        `band` has no default because this project states no band for a sum.
-        Every band it does state -- the 10% a non-KV memory term carries, and
-        the 25% the unmeasured-device tier allows one -- is **per term**, and
+        `band` has no default because no band for a sum exists. Both bands in
+        use -- the 10% a non-KV memory term carries, and the 25% allowed one on
+        a device nobody has measured -- are **per term**, and
         choosing one of those two for a sum is the substitution that produced
         the +13.8%. Naming it at the call site is the moment a caller has to
         notice that.
@@ -670,12 +670,12 @@ def compare(
 class GraphPoolComparison:
     """Both graph-pool numbers against the recorded pool, labelled by which reserves.
 
-    The memory model keeps ATOM's estimator and the measured predictor as two
-    because they disagree by 4-19x, and the disagreement is the finding. So
-    this type has no accessor for *the* error: it has one for each, and its
-    table has a row for each, labelled with what that function does. A
-    comparator that reported one of them would have reconciled what the design
-    says to keep apart.
+    ATOM's estimator and the measured predictor stay two numbers because they
+    disagree by 4-19x, and the disagreement is the finding. So this type has
+    no accessor for *the* error: it has one for each, and its table has a row
+    for each, labelled with what that function does. A comparator that
+    reported one of them would reconcile the two numbers `graph_pool` keeps
+    apart.
     """
 
     recorded: Term
@@ -786,8 +786,8 @@ def tied_lm_head_bytes(config, *, dtype_bytes: int) -> int:
     looks.** It fires when the attribute is *absent*, and nothing more. A bare
     `PretrainedConfig` that was never given the field does raise on the
     attribute, so the refusal is real and the test drives it. But a model's own
-    config class supplies the field, and for at least one family the design
-    cites the class default is `False` -- untied, which is the direction that
+    config class supplies the field, and for at least one family, Qwen3, the
+    class default is `False` -- untied, which is the direction that
     costs an embedding. So on a config class this function cannot tell a
     checkpoint that said untied from a class that defaulted to it, and it will
     return zero for both. Telling those apart needs the raw config mapping,

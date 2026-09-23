@@ -291,9 +291,9 @@ def test_every_term_names_where_it_came_from(spec, qwen, tp_width):
                 assert term.note.strip(), f"{name}.{term.name}"
 
 
-def test_the_declared_terms_are_named_and_are_the_three_the_design_owes(spec, qwen):
-    # The memory model owes weights a meta build, buffers a recording, and
-    # activations a liveness walk. Until then they are declared and say so.
+def test_the_declared_terms_are_exactly_weights_buffers_and_activations(spec, qwen):
+    # Each is a declared formula until its source exists: a meta build for
+    # weights, a recording for buffers, a liveness walk for activations.
     readings = readings_at(spec, qwen, 1)
     assert set(readings.peak_torch.declared) == {"weights", "buffers", "activations"}
 
@@ -365,8 +365,8 @@ def test_a_configuration_that_does_not_fit_refuses_rather_than_clamping(spec, qw
 
 
 def test_the_predicting_function_cannot_be_spent_as_the_reserving_one(spec, qwen):
-    # The memory model keeps them apart; this is where that is enforced rather
-    # than remembered. Only the mirror of ATOM's estimator reserves anything.
+    # Only the mirror of ATOM's estimator reserves anything; this is where
+    # that is enforced rather than remembered.
     with pytest.raises(MemoryRefusal) as refusal:
         device_readings(
             spec,
@@ -388,9 +388,10 @@ def test_the_predicting_function_cannot_be_spent_as_the_reserving_one(spec, qwen
 def test_the_two_graph_pool_numbers_disagree_by_the_recorded_factor(
     spec, qwen, tp_width, low, high
 ):
-    # The design records 4-19x. On this ladder and this spec the measured pool
-    # is 4.46x smaller than ATOM's reservation at width 1 and 17.2x at width 2,
-    # which is the band and is why substituting one for the other is refused.
+    # The two disagree by 4-19x across the recorded ladders. On this ladder
+    # and this spec the measured pool is 4.46x smaller than ATOM's reservation
+    # at width 1 and 17.2x at width 2, which is inside that band and is why
+    # substituting one for the other is refused.
     reserving = reserved(qwen, 288.0e9).total
     predicted = predicts(spec, tp_width=tp_width, captured_tokens=sum(ladder())).total
     assert low < reserving / predicted < high
@@ -521,8 +522,8 @@ def test_the_negative_box_refusal_carries_its_decomposition(spec, qwen):
 
 
 def test_a_deployment_flag_is_not_labelled_geometry():
-    # The line between the machine and the deployment is drawn so that
-    # enforce_eager is squarely on the deployment side of it.
+    # enforce_eager is a serving knob, so it belongs to the deployment rather
+    # than to the machine or the model.
     assert reserves(enforce_eager=True).terms[0].basis is Basis.DEPLOYMENT
     assert not hasattr(Basis, "GEOMETRY")
 
