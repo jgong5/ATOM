@@ -538,6 +538,22 @@ def test_a_config_with_no_dtype_refuses_rather_than_assuming_one(qwen):
         )
 
 
+def test_a_config_with_no_hidden_size_refuses_naming_the_field(qwen):
+    shapeless = copy.deepcopy(qwen)
+    del shapeless.hidden_size
+    with pytest.raises(MemoryRefusal) as refusal:
+        ModelTerms.declared_for_m1(
+            shapeless,
+            parameter_count=PARAMETERS,
+            tp_size=1,
+            warmup_tokens=WARMUP_TOKENS,
+        )
+    assert refusal.value.what == (
+        "this config states no `hidden_size`, and the memory model reads it"
+    )
+    assert "through ATOM's own config classes" in refusal.value.remedy
+
+
 def test_the_negative_box_refusal_carries_its_decomposition(spec, qwen):
     # A refusal carries its decomposition too: the reader has to see which of the
     # six terms does not fit, and three of them are declared coefficients.
