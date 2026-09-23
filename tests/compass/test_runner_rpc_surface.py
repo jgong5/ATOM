@@ -781,27 +781,31 @@ def test_the_scan_ignores_a_compass_package_the_reply_never_reaches(tmp_path):
     A module under `atom/compass` that the reply never touches may mention
     `trace_dir` -- in a comment, in a docstring, in a field name of its own --
     without failing a test about the profiler reply. Nor may the scan read a
-    root of its own: every file contains the empty string, and handed no roots
-    it finds nothing.
+    root of its own when handed none: every file contains the empty string,
+    and handed no roots it finds nothing. A root added only when roots are
+    handed in, or only for a non-empty needle, passes every test in this file.
     """
     roots = _fake_repo(tmp_path, {PRODUCER, "atom/compass/spec/reader.py"})
     assert _mentions(roots, "trace_dir", tmp_path) == {PRODUCER}
     assert _mentions((), "") == set()
 
 
-@pytest.mark.parametrize("surface", [(), (ENGINE,)])
+@pytest.mark.parametrize("surface", [(), (ENGINE,), REPLY_SURFACE])
 def test_the_reply_assertion_scans_the_roots_the_constant_names(monkeypatch, surface):
     """The tests above hold `REPLY_SURFACE`; this one holds its reader.
 
     The scan is replaced by a spy that records the roots it is handed, and the
-    profiler-reply assertion runs with the constant set to `surface`: once
-    empty, once the engine alone. The spy must see exactly that surface both
-    times. A root added beside the constant, or roots written out at the call
-    site, fail both runs; a fallback for an empty constant fails the empty one;
-    a root that appears only when the constant is set, or one derived from its
-    roots -- each root's parent, say -- fails the other. A scan that bypasses
-    `_mentions` reaches the spy not at all. What passes is any expression that
-    is the identity at exactly these two surfaces.
+    profiler-reply assertion runs with the constant set to `surface`: empty,
+    the engine alone, and the constant as it stands. The spy must see exactly
+    that surface each time. A root added beside the constant fails all three
+    runs, and the constant's two roots written out at the call site fail the
+    first two; a fallback for an empty constant fails the empty one; a root
+    that appears only when the constant is set, or one derived from every root
+    -- each root's parent, say -- fails the last two; one derived from the
+    Compass root alone -- its parent, all of `atom/compass` -- fails the last.
+    A scan that bypasses `_mentions` reaches the spy not at all. What passes is
+    any expression that is the identity at these three surfaces, the last of
+    which is the one the assertion runs at.
     """
     seen = []
 
