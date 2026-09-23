@@ -548,6 +548,11 @@ def test_an_abandoned_staging_directory_does_not_block_a_publish(tmp_path):
     something to find and `shutil.rmtree` away. An earlier version of this test
     called it `.crashed`, which no version of the code ever touched -- it
     passed with the fix and passed reverted, and proved nothing.
+
+    The directory must come out with its contents as they were, not merely
+    still standing: a publish that empties it and leaves the husk has reached
+    into another publisher's staging just the same, and `is_dir()` alone
+    stays true when that happens.
     """
     store = ArtifactStore(tmp_path)
     topology = Topology(tp=2)
@@ -555,7 +560,8 @@ def test_an_abandoned_staging_directory_does_not_block_a_publish(tmp_path):
     destination = store.directory_for(key)
     abandoned = destination.parent / f".{destination.name}.publishing"
     abandoned.mkdir(parents=True)
-    (abandoned / "prices.dp0of1.pp0of1.pcp0of1.tp0of2.json").write_bytes(b"half")
+    half_built = abandoned / "prices.dp0of1.pp0of1.pcp0of1.tp0of2.json"
+    half_built.write_bytes(b"half")
     entry = store.publish(
         key,
         provenance=stanza(),
@@ -569,6 +575,9 @@ def test_an_abandoned_staging_directory_does_not_block_a_publish(tmp_path):
         *entry.members,
     }
     assert abandoned.is_dir()
+    assert {item.name: item.read_bytes() for item in abandoned.iterdir()} == {
+        half_built.name: b"half"
+    }
 
 
 # --- the physical form is a directory convention ----------------------------
