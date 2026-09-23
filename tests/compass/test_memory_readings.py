@@ -243,8 +243,9 @@ def readings_at(spec, qwen, tp_width):
 #: Every term of every reading at TP1 and TP2, as bytes. It is written down so
 #: that a change to any one term is a change to this table rather than to a
 #: total that could absorb it. All five readings are here, `cudagraph_overhead`
-#: included: a ratio band on it lets a 7% move in LIVE_TENSORS_PER_LAYER
-#: through.
+#: included: the ratio band in
+#: `test_the_two_graph_pool_numbers_disagree_by_the_recorded_factor` lets a 7%
+#: move in LIVE_TENSORS_PER_LAYER through at width 1.
 EXPECTED = {
     1: {
         "total": {"capacity": 288_000_000_000},
@@ -327,9 +328,12 @@ def test_the_declared_terms_are_exactly_weights_buffers_and_activations(spec, qw
 @pytest.mark.parametrize("tp_width", [1, 2])
 def test_the_min_budget_free_clamp_cannot_bind(spec, qwen, tp_width):
     # Making it inert is this package's job; ATOM's own arithmetic runs over
-    # these readings in `atom.compass.runner.overrides`. What is checked here
-    # is the only thing checkable without the engine: with `free` a clean box,
-    # the budget branch is below it at every utilisation the engine accepts.
+    # these readings in `atom.compass.runner.overrides`, and
+    # `test_the_min_budget_free_clamp_does_not_bind_on_either_side_of_free` in
+    # `test_kv_budget_engine.py` checks with the engine that it does not bind.
+    # What is checked here is the only thing checkable without the engine:
+    # with `free` a clean box, the budget branch is below it at every
+    # utilisation the engine accepts.
     readings = readings_at(spec, qwen, tp_width)
     total = readings.total.total
     for utilisation in (0.5, 0.7, 0.9, 0.95, 1.0):
@@ -599,9 +603,12 @@ def _imported_names(tree):
     Resolving the level is what makes this test hold. `from ...model_engine
     import model_runner` carries `node.module == 'model_engine'` and
     `node.level == 3`, which matches neither a forbidden root nor a forbidden
-    prefix; and `from . import sibling` carries `node.module is None`, which a
-    truthiness guard skips entirely. Both are rows in the positive control,
-    `test_the_import_guard_catches_what_it_claims_to`.
+    prefix; its two rows in the positive control,
+    `test_the_import_guard_catches_what_it_claims_to`, fail when the level is
+    ignored. `from . import sibling` carries `node.module is None`, which a
+    truthiness guard skips entirely. Here it resolves to the package alone and
+    the imported names are not added, so no row fails when that guard is put
+    back, and `from ... import model_engine` resolves to `atom` and passes.
     """
     names = set()
     for node in ast.walk(tree):
