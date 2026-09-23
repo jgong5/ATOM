@@ -302,8 +302,8 @@ mv -f "$TMP" "$OUT"
 # file is part of the suite it is measured against: tests/compass/
 # test_cpu_gate_exclude.py parametrises test_every_trigger_path_still_exists
 # over the paths below, one case each. So regenerating moves the CPU tier's
-# pass count by exactly the change in the number of entries -- 13 -> 30 here,
-# +17 passed -- and a count taken before the rewrite describes the previous
+# pass count by exactly the change in the number of entries -- 13 -> 30 at
+# f3f584ea4 -- and a count taken before the rewrite describes the previous
 # list, not this one. That is not a quirk to work around; it is why the number
 # is re-taken rather than reused.
 COLLECT2=$(python -m pytest tests/ "${IGN[@]}" --collect-only -q -p no:cacheprovider 2>&1)
