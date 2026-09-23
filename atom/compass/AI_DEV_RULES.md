@@ -173,9 +173,10 @@
   `./shell.sh /workspace/gpu_docker/install-gh-stack.sh`.
   - Link a chain whole or not at all, and only when you mean it (`unstack` can
     refuse): `gh stack link --base feature/atomcompass_new <bottom> ... <top>`,
-    re-run whenever a PR joins, never with `need human` below. `merge` retargets
-    only linked members. Drift check: every open PR based on another open PR's
-    branch sits in one stack (`gh api "repos/<o>/<r>/stacks?pull_request=<n>"`).
+    re-run whenever a PR joins, held members included (linking lands nothing).
+    `merge` retargets only linked members. Drift check: every open PR based on
+    another open PR's branch sits in one stack
+    (`gh api "repos/<o>/<r>/stacks?pull_request=<n>"`).
   - Land with `gh stack merge <pr-number> --squash --yes`: it squashes up to that
     PR and retargets the one above. Only open, non-draft PRs merge. There is no
     `--message`: a multi-commit PR gets GitHub's default squash message.
