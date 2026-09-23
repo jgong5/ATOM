@@ -35,7 +35,7 @@ are not a cost-model input at any width.
 What is substituted, and what is not
 ------------------------------------
 Substituted, all of it device facts declared by the caller rather than read from
-a runtime: the `torch.cuda` namespace (22 names, 17 of which a capture reads --
+a runtime: the `torch.cuda` namespace (17 names, each one read by a capture --
 the record counts every read, see `_declare_cuda`); `rocminfo`, which aiter
 shells out to at import and which needs `/dev/kfd`; Triton's active device
 target; the collective *transport*, so
@@ -239,14 +239,9 @@ SITE_THREE = (
 BUFFER_INIT = "atom/utils/__init__.py:700"
 BUFFER_COUNT = 19
 
-# The `torch.cuda` names `_declare_cuda` stubs, split by whether a capture reads
-# them. Measured by counting every read of a stubbed name over a whole capture:
-# the same 17 at both widths and in every pass this file runs. The other five
-# are stubbed and never read -- removing all five leaves the TP1 and TP2 graph
-# digests unchanged -- so they are held here as unread rather than counted as
-# needed. One of them is `mem_get_info`, the reading ATOM sizes its KV budget
-# from; this capture sizes the pool itself with `allocate_kv_cache`, so nothing
-# asks.
+# The `torch.cuda` names `_declare_cuda` stubs, which are exactly the names a
+# capture reads. Measured by counting every read of a stubbed name over a whole
+# capture: the same 17 at both widths and in every pass this file runs.
 CUDA_NAMES_READ = frozenset(
     {
         "Event",
@@ -266,15 +261,6 @@ CUDA_NAMES_READ = frozenset(
         "set_rng_state",
         "stream",
         "synchronize",
-    }
-)
-CUDA_NAMES_NEVER_READ = frozenset(
-    {
-        "empty_cache",
-        "max_memory_allocated",
-        "mem_get_info",
-        "memory_reserved",
-        "reset_peak_memory_stats",
     }
 )
 
@@ -594,11 +580,8 @@ def _declare_cuda():
     runs. `FakeTensorMode` needs the opposite answer; `_driverless_mode` says
     why, and how both are told what they need.
 
-    `mem_get_info` is a reading, not an ordering primitive, and it is the one
-    that must not be zero: ATOM sizes the KV budget from it, so a `(0, 0)` here
-    is a budget of exactly zero, precise and fictional. Streams and events are
-    not readings at all -- a capture has one order by construction -- so a null
-    object is the whole of their content.
+    Streams and events are not readings at all -- a capture has one order by
+    construction -- so a null object is the whole of their content.
     """
 
     class _Props:
@@ -674,17 +657,12 @@ def _declare_cuda():
         "default_stream": lambda *a, **k: _Stream(),
         "set_device": lambda *a, **k: None,
         "synchronize": lambda *a, **k: None,
-        "empty_cache": lambda *a, **k: None,
-        "reset_peak_memory_stats": lambda *a, **k: None,
         "memory_stats": lambda *a, **k: {
             "allocated_bytes.all.current": 0,
             "allocated_bytes.all.peak": 0,
             "reserved_bytes.all.current": 0,
         },
-        "mem_get_info": lambda *a, **k: (TOTAL_MEMORY_BYTES, TOTAL_MEMORY_BYTES),
-        "max_memory_allocated": lambda *a, **k: 0,
         "memory_allocated": lambda *a, **k: 0,
-        "memory_reserved": lambda *a, **k: 0,
         "stream": lambda s: contextlib.nullcontext(),
     }
     for group in (for_import, for_runner):
@@ -2199,11 +2177,9 @@ def test_the_stubbed_device_names_are_the_ones_the_capture_reads():
     The stub list is what `_declare_cuda` wrote, so asserting its length would
     assert the function against itself. What is measured is every read of a
     stubbed name over a whole capture, and that says which stubs are doing
-    anything: 17 of the 22, the same at both widths and in every pass. The
-    other five are stubbed and never read. They are held as such, so a path
-    that starts reading one -- `mem_get_info` above all, a fictional reading
-    that would size a real KV budget -- fails here instead of being answered
-    quietly.
+    anything: all 17, the same at both widths and in every pass. The stub list
+    is held equal to that read set, so a stub nothing reads fails here as
+    surely as a stub that stops being read.
     """
     for tp in (1, 2):
         for arrangement in (
@@ -2222,7 +2198,7 @@ def test_the_stubbed_device_names_are_the_ones_the_capture_reads():
                 tp,
                 arrangement,
             )
-            assert declared - CUDA_NAMES_READ == CUDA_NAMES_NEVER_READ
+            assert declared == CUDA_NAMES_READ
 
 
 def test_the_collectives_at_tp2_are_recorded_by_name_and_call_site():
