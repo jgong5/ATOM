@@ -1017,7 +1017,8 @@ def _watch_simulated_tp(tree_root):
     `ModelRunner._setup_device_and_distributed`, and `_build_runner` overrides
     that method, so no capture can reach the call and the list is empty by
     construction. Replacing the sentinel's body with `raise SystemExit` leaves
-    every capture test passing. It fires only if ATOM comes to call the function
+    every test that runs a capture passing, and fails the one that calls both
+    bindings directly. It fires only if ATOM comes to call the function
     from a path this capture does execute. That ATOM has one call site, and
     that it is the overridden method, is held by a scan of ATOM's source in
     `test_apply_simulated_tp_is_called_only_where_the_capture_does_not_go`, so
@@ -2205,6 +2206,42 @@ def test_apply_simulated_tp_is_called_only_where_the_capture_does_not_go():
     assert "def _setup_device_and_distributed" in inspect.getsource(_build_runner)
 
 
+def test_a_call_through_either_binding_reaches_the_sentinel():
+    """A call through either binding of `apply_simulated_tp` lands in the sentinel.
+
+    No capture reaches ATOM's call site, so this calls both names on a `None`
+    config. A binding left out, or a sentinel that calls through, runs the real
+    function, which raises on `None.tensor_parallel_size`.
+    """
+    probe = (
+        "import importlib.util, pathlib, sys, tempfile\n"
+        "spec = importlib.util.spec_from_file_location('capture', sys.argv[1])\n"
+        "capture = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(capture)\n"
+        "capture._declare_cuda()\n"
+        "with tempfile.TemporaryDirectory() as tmpdir:\n"
+        "    capture._declare_arch(tmpdir)\n"
+        "    calls = capture._watch_simulated_tp(pathlib.Path(sys.argv[2]))\n"
+        "    from atom.distributed import simulated_tp\n"
+        "    from atom.model_engine import model_runner\n"
+        "    model_runner.apply_simulated_tp(None)\n"
+        "    simulated_tp.apply_simulated_tp(None)\n"
+        "print('SENTINEL-CALLS', len(calls))\n"
+    )
+    tree_root = pathlib.Path(__file__).resolve().parents[2]
+    completed = subprocess.run(
+        [sys.executable, "-c", probe, str(pathlib.Path(__file__)), str(tree_root)],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(tree_root)},
+        cwd=str(tree_root),
+    )
+    lines = completed.stdout.splitlines()
+    assert "SENTINEL-CALLS 2" in lines, completed.stderr[-4000:]
+
+
 def test_atom_s_own_buffer_constructor_is_what_runs():
     """`CpuGpuBuffer.__init__` executes here, and the record says how.
 
@@ -2591,11 +2628,30 @@ def test_the_capture_refuses_a_width_that_torch_would_specialise():
         env={**os.environ, "PYTHONPATH": str(tree_root)},
         cwd=str(tree_root),
     )
-    assert completed.returncode != 0
+    # 2 is argparse's usage error. Without `main`'s refusal, `_step_axis`
+    # still refuses, but as an uncaught AssertionError, which exits 1.
+    assert completed.returncode == 2
     assert "traces no symbol" in completed.stderr
     # And no record at all: a refusal that still printed one would be worse
-    # than the emission it replaced.
+    # than the emission it replaced. Either refusal satisfies this, so it
+    # fails only with both gone; the next test holds the second on its own.
     assert RECORD_MARKER not in completed.stdout
+
+
+def test_the_step_axis_refuses_a_hint_torch_specialises():
+    """`_step_axis` refuses a hint of 1 itself; `main` never lets one reach it.
+
+    Held by the raise, not the message: with the check disabled the call
+    returns a plain `1`. The narrowest width is the control a symbol passes.
+    """
+    import pytest
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    fake_mode = FakeTensorMode(shape_env=ShapeEnv())
+    assert re.fullmatch(r"s\d+", str(_step_axis(fake_mode, MIN_STEP_WIDTH)))
+    with pytest.raises(AssertionError, match="not a symbol"):
+        _step_axis(fake_mode, 1)
 
 
 def test_the_symbol_reaches_the_work_that_decides_the_cost():
@@ -2641,8 +2697,12 @@ def test_the_symbol_reaches_the_work_that_decides_the_cost():
             "aiter.unified_attention_with_output_base.default",
             "aiter.linear_attention_with_output_base.default",
         }, tp
-        norms = at_width["normalisation"]["ops_carrying_a_symbol"]
-        assert "aiter._fused_qk_rmsnorm_group_quant_kernel.default" in norms, tp
+        assert set(at_width["normalisation"]["ops_carrying_a_symbol"]) == {
+            "aiter._fused_qk_rmsnorm_group_quant_kernel.default",
+            "aten.mean.dim",
+            "aten.pow.Tensor_Scalar",
+            "aten.rsqrt.default",
+        }, tp
     # At TP2 the collectives carry it too, which is the width showing up in
     # the census rather than only in the operator list.
     assert (
