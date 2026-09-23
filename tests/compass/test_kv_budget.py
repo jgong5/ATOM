@@ -365,7 +365,7 @@ def test_that_refusal_comes_before_the_readings_are_even_looked_for():
         NonAllocatingRunner.get_num_blocks(stub)
 
 
-def _fields_the_refusals_read():
+def _fields_read_with_no_default():
     """Every name the overrides read through `_config_field`, off the source."""
     tree = ast.parse((COMPASS / "runner" / "overrides.py").read_text())
     return sorted(
@@ -376,13 +376,13 @@ def _fields_the_refusals_read():
     )
 
 
-def test_the_refusals_read_exactly_these_config_fields():
+def test_exactly_these_config_fields_are_read_with_no_default():
     """The control: the collector below is not pinning an empty list.
 
-    It collects only reads made through `_config_field`; a refusal reading its
-    field any other way is not seen here.
+    It collects only reads made through `_config_field`; a field read any other
+    way is not seen here.
     """
-    assert _fields_the_refusals_read() == [
+    assert _fields_read_with_no_default() == [
         "disagg_is_decode",
         "enforce_eager",
         "eos_token_id",
@@ -392,8 +392,8 @@ def test_the_refusals_read_exactly_these_config_fields():
     ]
 
 
-@pytest.mark.parametrize("name", _fields_the_refusals_read())
-def test_each_config_field_a_refusal_reads_is_one_atom_declares(name):
+@pytest.mark.parametrize("name", _fields_read_with_no_default())
+def test_each_config_field_read_with_no_default_is_one_atom_declares(name):
     """The stubs that reach these reads either supply the fields themselves or
     omit them to be refused, so none of them would notice ATOM renaming one.
     This reads ATOM's config class instead."""
