@@ -763,8 +763,7 @@ def test_the_scan_looks_at_both_sides_of_the_reply():
         "atom/compass/runner/overrides.py",
         "atom/compass/runner/model_runner.py",
     } <= scanned
-    producers = {root: (root / "model_runner.py").is_file() for root in REPLY_SURFACE}
-    assert producers == {ENGINE: True, PACKAGE: True}
+    assert set(REPLY_SURFACE) == {ENGINE, PACKAGE}
 
 
 def test_the_scan_still_catches_the_string_inside_the_runner_package(tmp_path):
@@ -781,22 +780,28 @@ def test_the_scan_ignores_a_compass_package_the_reply_never_reaches(tmp_path):
 
     A module under `atom/compass` that the reply never touches may mention
     `trace_dir` -- in a comment, in a docstring, in a field name of its own --
-    without failing a test about the profiler reply.
+    without failing a test about the profiler reply. Nor may the scan read a
+    root of its own: every file contains the empty string, and handed no roots
+    it finds nothing.
     """
     roots = _fake_repo(tmp_path, {PRODUCER, "atom/compass/spec/reader.py"})
     assert _mentions(roots, "trace_dir", tmp_path) == {PRODUCER}
+    assert _mentions((), "") == set()
 
 
-def test_the_reply_assertion_scans_the_roots_the_constant_names(monkeypatch):
+@pytest.mark.parametrize("surface", [(), (ENGINE,)])
+def test_the_reply_assertion_scans_the_roots_the_constant_names(monkeypatch, surface):
     """The tests above hold `REPLY_SURFACE`; this one holds its reader.
 
-    The surface is emptied and the scan replaced by a spy that records the
-    roots it is handed, so the profiler-reply assertion must scan the constant
-    and nothing else. Roots written out at the call site, a fallback for when
-    the constant is empty, or a root added beside it -- which lets a mention in
-    that package fail a test about this reply -- reach the spy as something
-    other than the empty tuple, and a scan that bypasses `_mentions` reaches it
-    not at all.
+    The scan is replaced by a spy that records the roots it is handed, and the
+    profiler-reply assertion runs with the constant set to `surface`: once
+    empty, once the engine alone. The spy must see exactly that surface both
+    times. A root added beside the constant, or roots written out at the call
+    site, fail both runs; a fallback for an empty constant fails the empty one;
+    a root that appears only when the constant is set, or one derived from its
+    roots -- each root's parent, say -- fails the other. A scan that bypasses
+    `_mentions` reaches the spy not at all. What passes is any expression that
+    is the identity at exactly these two surfaces.
     """
     seen = []
 
@@ -804,10 +809,10 @@ def test_the_reply_assertion_scans_the_roots_the_constant_names(monkeypatch):
         seen.append(roots)
         return {"atom/model_engine/model_runner.py"}
 
-    monkeypatch.setitem(globals(), "REPLY_SURFACE", ())
+    monkeypatch.setitem(globals(), "REPLY_SURFACE", surface)
     monkeypatch.setitem(globals(), "_mentions", spy)
     test_the_profiler_replies_are_forwarded_whole_and_never_unpacked()
-    assert seen == [()]
+    assert seen == [surface]
 
 
 def test_the_two_names_no_caller_waits_for_and_what_replying_costs():
