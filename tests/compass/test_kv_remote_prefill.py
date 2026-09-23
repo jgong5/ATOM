@@ -282,29 +282,57 @@ def test_the_ranks_the_router_reads_are_numbers(geometry):
         pytest.param("tp_size", "eight", id="tp_size-word"),
         pytest.param("dp_rank", 2.5, id="dp_rank-float"),
         pytest.param("dp_rank", "2.5", id="dp_rank-text"),
+        pytest.param("tp_size", "8.0", id="tp_size-decimal-text"),
+        pytest.param("tp_size", "1e1", id="tp_size-exponent-text"),
+        pytest.param("tp_size", True, id="tp_size-true"),
+        pytest.param("tp_size", False, id="tp_size-false"),
+        pytest.param("dp_rank", True, id="dp_rank-true"),
+        pytest.param("dp_rank", False, id="dp_rank-false"),
     ],
 )
 def test_a_width_that_is_not_a_whole_number_is_refused_by_name(geometry, field, value):
-    """A fractional width is refused, naming the field, rather than truncated.
+    """A width that is not exactly an integer refuses the connector by name.
 
-    Driven through the connector, because the config is where a width can
-    arrive as something other than an int. Casting 8.5 to 8 would emit a blob
-    for a deployment that was never launched, and nothing reading it could
-    tell.
+    Refused when the connector is built, so a malformed config never serves a
+    request. Casting 8.5 to 8 would emit a blob for a deployment that was
+    never launched, and nothing reading it could tell. A `bool` is an `int` to
+    Python and would go out as a width of 1 or 0. Text that `int` does not
+    read as an integer literal is refused rather than read as a float, which
+    would take "1e1" as 10.
     """
     widths = {"tp_size": 8, "dp_rank": 3, field: value}
-    scheduler = connector(
-        model_for(geometry, PEAKS[0]), lambda: ISSUE_AT, role="scheduler", **widths
-    )
     with pytest.raises(ValueError, match=f"^{field} is .*not a whole number"):
-        scheduler.request_finished(finished_sequence())
+        connector(
+            model_for(geometry, PEAKS[0]), lambda: ISSUE_AT, role="scheduler", **widths
+        )
+
+
+def test_a_width_in_text_keeps_its_exact_value(geometry):
+    """Text is read as an integer, never through a float that rounds it.
+
+    2**53 + 1 is the smallest integer a float cannot hold, so read through a
+    float it would go out as 2**53: a value changed on the way to an `int`.
+    """
+    exact = 2**53 + 1
+    scheduler = connector(
+        model_for(geometry, PEAKS[0]),
+        lambda: ISSUE_AT,
+        role="scheduler",
+        tp_size=str(exact),
+        dp_rank=str(exact),
+    )
+    seq = finished_sequence()
+    scheduler.request_finished(seq)
+    relayed = seq.kv_transfer_params_output
+    assert relayed["tp_size"] == exact, f"tp_size went out as {relayed['tp_size']}"
+    assert relayed["dp_rank"] == exact, f"dp_rank went out as {relayed['dp_rank']}"
 
 
 @pytest.mark.parametrize(
     "value", [8, "8", 8.0, " 8 "], ids=["int", "text", "float", "padded"]
 )
 def test_a_whole_width_is_taken_whatever_it_is_spelled_as(geometry, value):
-    """The refusal above is of fractions, not of text or of floats."""
+    """The refusal above is not of integer text or of a float with no fraction."""
     scheduler = connector(
         model_for(geometry, PEAKS[0]),
         lambda: ISSUE_AT,
@@ -567,14 +595,16 @@ def test_the_prompt_is_claimed_once_and_the_request_keeps_its_intent(
 
 
 @pytest.mark.parametrize("kv_role", ["kv_consumer", "kv_producer"])
-def test_an_ordinary_request_is_neither_claimed_nor_queued(
+def test_an_ordinary_request_is_neither_claimed_nor_announced(
     geometry, seq_factory, kv_role
 ):
     """Only a remote fill is taken on; every other allocation is silent.
 
     Both roles, because "silent" is two different things and only one of them
     is visible in the metadata. On the consumer side an ordinary allocation
-    must leave the offer queue empty. On the producer side the refusal below
+    is not claimed and no receive is announced for it; whether it was queued
+    as an offer is not observed here, because the announcement drops any
+    offer the engine did not suspend. On the producer side the refusal below
     stands between every ordinary allocation and a `ValueError`, and no
     announcement check can see that: the raise happens before there is
     anything to announce. One case per role, so a failure names the role.
