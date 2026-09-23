@@ -138,9 +138,16 @@ RPC_SURFACE: dict[str, bool] = {
 def unanswered_rpc_names(runner: Any) -> tuple[str, ...]:
     """The dispatched names `getattr` would answer with None for this runner.
 
-    Each one is a caller that parks forever rather than an error anyone sees,
-    so this is checked where the class is composed instead of being discovered
-    by a deployment.
+    Drawn from all twelve, which do not fail the same way, so this return
+    carries no one story about its names. `RPC_SURFACE[name]` records whether
+    any caller reads the reply, and this function's only caller in the package
+    partitions the result on exactly that before reporting it: a waited name
+    parks its caller on an unbounded queue read for the life of the process,
+    while `exit` and `process_kvconnector_output` are read by nobody and a
+    hole in either parks no one.
+
+    Checked where the class is composed instead of being discovered by a
+    deployment, because the worker raises on none of them.
     """
     return tuple(name for name in RPC_SURFACE if getattr(runner, name, None) is None)
 
