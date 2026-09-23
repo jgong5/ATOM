@@ -1395,8 +1395,8 @@ re-derive.
   `model_runner.py:3233-3320`
 - the RPC boundary — `engine_core.py:386-388`
 - `ScheduledBatch` fields — `scheduler.py:579-820`; notably `detailed_sqsq` /
-  `detailed_sqsk` / `detailed_sk` at `:790-792`, which are sum(N_Q^2), sum(N_Q * N_KV),
-  sum(N_KV) per batch, computed by `compute_detailed_aggregates` (`:2788-2842`) and
+  `detailed_sqsk` / `detailed_sk` at `:801-803`, which are sum(N_Q^2), sum(N_Q * N_KV),
+  sum(N_KV) per batch, computed by `compute_detailed_aggregates` (`:2788-2841`) and
   currently gated on `profile_active and ATOM_ENABLE_DETAILED_ANNOTATION`
 - `ScheduledBatchOutput` — `scheduler.py:841-885`; `produces_output()` at `:823-840`
 
