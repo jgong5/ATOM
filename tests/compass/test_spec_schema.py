@@ -402,7 +402,6 @@ BREAKAGES = {
 ELSEWHERE = {
     "a fragment that is not a mapping": lambda: Fragment.from_mapping([1, 2], "p"),
     "a subject to check that is not a mapping": lambda: validate([1, 2]).raise_first(),
-    "a term the spec carries nothing under": lambda: explain(read(), "no_such_term"),
 }
 
 
@@ -599,6 +598,19 @@ def test_every_site_that_declines_a_document_is_driven_here():
         for make in BREAKAGES.values()
     } | {_site_of(declines) for declines in ELSEWHERE.values()}
     assert driven == _sites_naming("SHAPE")
+
+
+def test_explain_declines_an_unknown_term_and_an_absent_one_at_two_sites():
+    # Neither is a document to correct, so neither is a shape. A term the
+    # schema does not know is re-asked by path; a declared field this spec
+    # does not state would come back empty under any spelling, so it is the
+    # absent-field refusal the accessor gives, and not a second copy of it.
+    unknown = _site_of(lambda: explain(read(), "no_such_term"))
+    absent = _site_of(lambda: explain(read(), "provenance.notes"))
+    assert unknown[0] == "explain.py" and unknown in _sites_naming("ADDRESSING")
+    assert absent == _site_of(lambda: read().value("provenance.notes"))
+    assert absent in _sites_naming("TOTALITY")
+    assert not {unknown, absent} & _sites_naming("SHAPE")
 
 
 def test_the_version_is_the_one_site_that_is_not_about_the_document():
