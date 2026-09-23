@@ -247,6 +247,28 @@ def test_a_comparison_has_no_total_and_a_sum_cannot_be_built_without_one():
     assert set(SummedCheck.__dataclass_fields__) == {"comparison", "band"}
 
 
+@pytest.mark.parametrize(
+    "omit, names",
+    [
+        (lambda c, r: SummedCheck(comparison=c), ("SummedCheck.__init__", "'band'")),
+        (lambda c, r: c.summed(), ("Comparison.summed", "'band'")),
+        (
+            lambda c, r: Predicted.from_readings(r, shape=HISTORICAL_SHAPE),
+            ("Predicted.from_readings", "'at_shape'"),
+        ),
+    ],
+    ids=["SummedCheck.band", "Comparison.summed-band", "from_readings-at_shape"],
+)
+def test_a_value_the_caller_must_state_is_refused_when_omitted(omit, names, spec, qwen):
+    # A band for a sum, and which terms move with the shape, are the caller's
+    # to state. Omitting one is a TypeError naming the signature and the field.
+    comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
+    with pytest.raises(TypeError) as omitted:
+        omit(comparison, live_readings(spec, qwen))
+    for name in names:
+        assert name in str(omitted.value)
+
+
 def test_printing_a_sum_prints_the_terms_it_folded():
     summed = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED).summed(band=0.25)
     rendered = str(summed)
