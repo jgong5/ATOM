@@ -538,9 +538,12 @@ def test_a_config_with_no_dtype_refuses_rather_than_assuming_one(qwen):
         )
 
 
-def test_a_config_with_no_hidden_size_refuses_naming_the_field(qwen):
+@pytest.mark.parametrize(
+    "field", ["hidden_size", "intermediate_size", "head_dim", "max_position_embeddings"]
+)
+def test_a_config_missing_a_geometry_field_refuses_naming_that_field(qwen, field):
     shapeless = copy.deepcopy(qwen)
-    del shapeless.hidden_size
+    delattr(shapeless, field)
     with pytest.raises(MemoryRefusal) as refusal:
         ModelTerms.declared_for_m1(
             shapeless,
@@ -549,7 +552,7 @@ def test_a_config_with_no_hidden_size_refuses_naming_the_field(qwen):
             warmup_tokens=WARMUP_TOKENS,
         )
     assert refusal.value.what == (
-        "this config states no `hidden_size`, and the memory model reads it"
+        f"this config states no `{field}`, and the memory model reads it"
     )
     assert "through ATOM's own config classes" in refusal.value.remedy
 
