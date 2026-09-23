@@ -219,7 +219,7 @@ class Runner(NonAllocatingRunner):
     """
 
     def __init__(self):
-        self.config = SimpleNamespace(disagg_is_decode=False)
+        self.config = SimpleNamespace(disagg_is_decode=False, speculative_config=None)
         self.capture_sizes = [0]
         self.capture_sizes_np = "untouched"
 
