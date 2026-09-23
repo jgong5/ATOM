@@ -728,6 +728,20 @@ def test_an_unknown_key_is_refused_where_it_sits():
     assert [refusal.rule for refusal in checked.refusals] == [Rule.SEPARATION]
 
 
+def test_a_field_stated_twice_is_reported_beside_the_rest_rather_than_raised():
+    # The reader refuses a document that states one field under two spellings.
+    # The check walks the same document, so it reports that refusal with the
+    # others and keeps walking: raised out of the walk instead, it would take
+    # every other result of the run with it, the unknown key beside it included.
+    document = dict(merged().document, gpu_memory_utilization=0.9)
+    assert "cores_physical" in document["host"]["cpu"]
+    document["host.cpu.cores_physical"] = 1
+    checked = validate(document)
+    rules = sorted(refusal.rule.name for refusal in checked.refusals)
+    assert rules == ["SEPARATION", "SHAPE"]
+    assert any("stated twice" in refusal.what for refusal in checked.refusals)
+
+
 def test_one_mistyped_key_does_not_take_the_rest_of_the_document_with_it():
     # The refusal a mistyped key earns is about that key. A check that stopped
     # there would leave every other field unchecked and every consistency
