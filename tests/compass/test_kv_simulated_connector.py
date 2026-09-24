@@ -52,11 +52,11 @@ TICK = 1.0e-9
 #: A clock reading that is not zero, so an issue time cannot hide in the sum.
 ISSUE_AT = 12.5
 
-#: The two link speeds of the named result, as spec peaks. The document's own
-#: derate turns each into what a transfer actually reaches.
+#: Two link speeds, as spec peaks. The document's own derate turns each into
+#: what a transfer actually reaches.
 PEAKS = (64.0e9, 400.0e9)
 
-#: The two transfer sizes of the named result, in KV blocks.
+#: Two transfer sizes, in KV blocks.
 BLOCK_COUNTS = (8, 512)
 
 
@@ -123,7 +123,7 @@ def test_the_factory_builds_both_halves_under_the_registered_name():
 def test_a_transfer_is_released_when_the_clock_reaches_its_deadline(
     geometry, blocks, peak
 ):
-    """The named result: four cells of predicted against observed release.
+    """Four cells of predicted against observed release.
 
     The prediction is rebuilt here from the spec's own numbers rather than
     asked of the model, so agreement means the connector charged the latency,

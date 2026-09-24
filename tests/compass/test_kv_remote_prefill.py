@@ -12,8 +12,8 @@ this red; a list copied into a test would not notice either.
 **The suspension is not asserted by calling the connector.** The engine asks
 whether a request is held elsewhere, allocates its blocks, tells the connector
 about the allocation and only then decides to suspend it -- four steps in one
-loop, in that order, and the defect this cut exists to close was a connector
-that behaved correctly at each step and wrongly across them. So the request
+loop, in that order, and the defect these tests exist to catch is a connector
+that behaves correctly at each step and wrongly across them. So the request
 here goes into a real `Scheduler`, and what is asserted is the status the
 engine put it in and the step it came back out on. The clock is the list
 holding one number that the rest of this package's tests use.
@@ -105,7 +105,7 @@ def relayed_fields() -> frozenset:
 
 
 def assert_relays_every_field(blob) -> None:
-    """The check the named result makes, and the one the drop test breaks."""
+    """The check the field-set test makes, and the one the drop test breaks."""
     missing = sorted(relayed_fields() - set(blob))
     assert not missing, f"the relayed blob would not carry {missing}"
     extra = sorted(set(blob) - relayed_fields())
@@ -183,7 +183,7 @@ def assert_could_not_be_dialled(value, field) -> None:
 
 
 def test_the_blob_carries_the_field_set_the_router_relays():
-    """The named result: the emitted set equals the backend's, re-derived."""
+    """The emitted set equals the backend's, re-derived."""
     assert set(simulated_blob()) == relayed_fields()
     assert_relays_every_field(simulated_blob())
 
@@ -367,7 +367,7 @@ def scheduler_with(connector_half, **config):
 def test_a_remote_filled_request_parks_and_leaves_on_its_deadline(
     geometry, seq_factory
 ):
-    """The named result's other half, driven through the engine's own order.
+    """The module's second claim, driven through the engine's own order.
 
     Nothing here calls the connector's scheduler methods. The request is added
     to a real scheduler and stepped; the engine asks, allocates, notifies and
