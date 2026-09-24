@@ -46,9 +46,9 @@ one of those branches, on this hardware.
 These are measurements, not opinions, and they are load-bearing below:
 
 - **The seam needs no ATOM change.** `Config.runner_qualname` (`atom/config.py:1595`),
-  consumed at `engine_core.py:129` and `async_proc.py:166`. Two in-tree precedents:
+  consumed at `engine_core.py:128` and `async_proc.py:166`. Two in-tree precedents:
   `RLHFModelRunner` (`atom/rollout/async_engine.py:26-32`) and `RapidServeModelRunner`
-  (`config.py:1729-1736`).
+  (`Config.__post_init__`, `config.py:1730-1736`).
 - **Rank-0 single-sourcing of the clock is correct for symmetric TP.** TP=2 over 1727
   steps: per-step rank difference median 0.03%, worst 0.82%, rank 1 slower on 51% of
   steps. TP=4 over 2295 steps: rank totals within ±0.02%; charging every step to its
@@ -244,9 +244,9 @@ Recorded as **T47**.
 - Simulation wall-clock cost is higher than Option A's. The >=5x target is stated as
   negotiable with a bottom line of "faster than real runs". Under saturation the prior
   design was 0.30x. This must be measured early, not assumed.
-- `torch.cuda.set_device` (`model_runner.py:958`) and `torch.cuda.mem_get_info`
-  (`model_runner.py:1659`) are the two hard GPU dependencies a simulated runner must not
-  inherit.
+- `torch.cuda.set_device` (in `model_runner.py::ModelRunner._setup_device_and_distributed`) and
+  `torch.cuda.mem_get_info` (in `model_runner.py::ModelRunner._read_device_memory`) are the two
+  hard GPU dependencies a simulated runner must not inherit.
 
 ---
 
@@ -340,7 +340,7 @@ one LP:
 
 | ATOM group | OS processes | LPs | Why |
 |---|---|---|---|
-| TP group | 1 EngineCore + N workers | **1** | Workers are slaved by a blocking RPC (`async_proc.py:439`) and hold no clock. Rank-0 authority validated at 0.06% (D0). |
+| TP group | 1 EngineCore + N workers | **1** | Workers are slaved by a blocking RPC (`async_proc.py:431`) and hold no clock. Rank-0 authority validated at 0.06% (D0). |
 | DP group | N EngineCores | **1** | Already `all_reduce`s every step for lockstep (`engine_core.py:751-781`) and runs `dummy_execution` on idle ranks (`:748-749`). Carry `max(step_seconds)` on the collective that already runs. |
 | Prefill container | — | **1** | |
 | Decode container | — | **1** | |
@@ -472,7 +472,7 @@ protocol itself.
 
 A DP group is **one** LP however many ranks it holds, because it already
 `all_reduce`s every step (`engine_core.py:751-781`). A TP group is **one** LP however
-wide, because its workers are slaved by a blocking RPC (`async_proc.py:439`) and hold no
+wide, because its workers are slaved by a blocking RPC (`async_proc.py:431`) and hold no
 clock. Adding GPUs to either does not create a time domain.
 
 Only three things create an LP:
@@ -750,7 +750,8 @@ merely noisy.
 
 ### Problem
 
-ATOM's serving path contains roughly 55 distinct synchronization points: blocking ZMQ
+ATOM's serving path contains 212 distinct synchronization points — "roughly 55" until
+they were counted, see the contract below: blocking ZMQ
 recvs, bounded pollers, queue gets with timeouts, Gloo and NCCL collectives,
 `multiprocessing` barriers and joins, busy-waits, and literal sleeps. "Intercept every
 blocking call" is the obvious reading of what a virtual clock demands. It is also the
@@ -762,34 +763,126 @@ scheduler.
 A wait matters to virtual time **only if its duration is observable in the simulated
 result.** That yields four categories.
 
-| Cat. | What it is | What you do | Approx. count |
-|---|---|---|---|
-| **A** | Wait whose duration **is** modelled time | **Rewrite.** Do not wait — `advance_to(now + d)` and continue. | ~6 |
-| **B** | Wait for a message another LP will send | **Annotate only.** `declare_blocked()` / `declare_running()` around the existing call. Leave the call itself alone. | ~10 |
-| **C1** | Timeout that is a failure detector | **Disable or raise.** No virtual semantics needed. | ~20 |
-| **C2** | Timeout that is pacing | **Virtual timer.** Declare next event at `now+d`; keep a short real poll so the thread stays responsive. | ~3 |
-| **—** | Wait *inside* one LP; startup; shutdown; OS-level | **Ignore.** Invisible to modelled time. | ~20 |
+**The counts below are measured, not estimated.** The classified list is
+`atom/compass/audit/sync_sites.json`, produced by the scanner beside it and held to the
+tree by `tests/compass/test_sync_inventory.py` — which parses **this table too**, so it
+cannot drift from the rows. The estimates this table carried until 2026-09-21 are kept
+in the last column so the diff stays visible.
 
-#### Category A — the short list
+| Cat. | What it is | What you do | Count | Est. |
+|---|---|---|---|---|
+| A | Wait whose duration **is** modelled time, or a reading the result reports | **Rewrite.** Do not wait — `advance_to(now + d)` and continue. | **23** | ~6 |
+| B | Wait for a message another LP will send | **Annotate only.** `declare_blocked()` / `declare_running()` around the existing call. Leave the call itself alone. | **36** | ~10 |
+| C1 | Timeout that is a failure detector | **Disable or raise.** No virtual semantics needed. | **11** | ~20 |
+| C2 | Timeout that is pacing | **Virtual timer.** Declare next event at `now+d`; keep a short real poll so the thread stays responsive. | **3** | ~3 |
+| ignore | Wait *inside* one LP; startup; shutdown; OS-level | **Ignore.** Invisible to modelled time. | **137** | ~20 |
+| undecided | Reading depends on a decision not yet made | **Decide before building on it.** | **2** | — |
 
-- the forward pass (`engine_core.py:386-388`)
-- KV-transfer completion (D6)
-- the arrival gate (D8)
-- `Scheduler._passed_delay` / `--scheduler-delay-factor` (`scheduler.py:3108-3126`)
+**212 sites, not ~55**, over the serving-path directories named in the scanner's
+`SCANNED_ROOTS` — 194 call sites plus 18 pinned points that are not a call. The
+category totals move less than the grand total does: A, B and C2 are within a factor of
+four of the estimates and C1 is *below* its estimate. Almost all of the growth is in
+`ignore`, and counting each site once, in this order, the 134 ignored *call sites* are:
+the module the runner seam replaces (21), the two real RDMA transfer backends the
+simulated connector replaces (17), the send half of a cross-process message (24),
+startup and shutdown (35), collectives inside the real forward pass (4), text scanners
+whose loops park on nothing (4), and 29 others carrying their own reasons.
+**Deliberately left alone: 137 of 212.**
+
+Two rules settle the boundaries the estimate left implicit, and both are in the
+artifact's own README rather than only here:
+
+- **B against C1/C2 is the bound, not the peer.** An unbounded wait for another process
+  is B; the same wait with a finite bound is C1 or C2 by what the bound is for. This is
+  the rule the B list below already used ("no timeout argument").
+- **B against ignore is the process.** A thread parked on a queue its *own* process
+  fills does not make that process idle — its step loop is running — so declaring it
+  blocked there is wrong rather than merely redundant.
+
+#### Category A — the short list, as measured
+
+Sixteen call sites and seven pinned points:
+
+- the forward pass, at **five** call sites, not one: `engine_core.py:386` (the main
+  step), `:992` and `:1264` (the two halves of RapidServe), `pp_engine_core.py:118` and
+  `:379` (the PP head and a downstream stage)
+- the idle rank's empty batch, `engine_core.py:749` — it consumes a step and is charged
+  like any other
+- KV-transfer completion (D6), at **three** call sites: `engine_core.py:488`,
+  `pp_engine_core.py:252` and `:406`
+- **tokenization**, at the five `run_in_executor` hand-offs `06` D33 names
+  (`api_server.py:890`, `:1004`, `:1126`, `:1258`, `:1480`). D33 charges their service
+  time from the machine spec, which makes them category A by this table's own
+  definition; this list omitted them.
+- **the idle jump, which is a real site in ATOM even though the name this list gave it
+  is not.** `Scheduler._advance_to_next_arrival` does not exist here — but the loops it
+  would have served do, and all three spin rather than wait when there is nothing to
+  run, because `pull_and_process_input_queue` drains with `get_nowait` and nothing else
+  in the turn blocks: `EngineCore.busy_loop` (`engine_core.py:315`),
+  `DPEngineCoreProc.busy_loop` (`:696`), and `PPEngineCoreProc._head_busy_loop`
+  (`pp_engine_core.py:67`). D8's measurement of the prior design — first real step is
+  tick 1, first simulated step is tick **89,336** — is this loop counted. Simulated time
+  has to jump to the next declared event at each of the three.
+- `Scheduler._passed_delay` / `--scheduler-delay-factor` (`scheduler.py:3108`)
 - `Scheduler._oldest_waiting_prefill_age_ms` feeding `PrefillDelayer` (`scheduler.py:1194`)
-- the idle jump (`Scheduler._advance_to_next_arrival`, replaced by `declare_next`)
+- the four stamps the result reports: `llm_engine.py:745`, `:777`, `scheduler.py:2688`
+  and `:3364` — D5 already lists these as business logic, and they are carried in the
+  inventory because a category applies to them
 
+**One entry of the original list is not ATOM code at all.** The arrival gate (D8) is
+something Compass adds: `_arrival_barrier_unmet`, `compass_workload_size` and
+`ARRIVAL_BARRIER_TIMEOUT_S` return nothing on the whole `atom/` tree, so there is no
+site to intercept, only a mechanism to build.
 #### Category B — annotate, do not intercept
 
-The important instance: **`call_func(..., wait_out=True)` (`async_proc.py:439`) is not
-intercepted.** It has no timeout and every forward goes through it. Two lines of status
-annotation are enough, because its duration was already charged by the *sender* when it
-called `advance_to`. The receiver is merely idle in wall time; the CA routes grants
-elsewhere meanwhile.
+The important instance: **`call_func(..., wait_out=True)` is not intercepted.** It has
+no timeout and every forward goes through it. Two lines of status annotation are enough,
+because its duration was already charged by the *sender* when it called `advance_to`.
+The receiver is merely idle in wall time; the CA routes grants elsewhere meanwhile.
+The blocking call is `self.outputs_queue.get()` at **`async_proc.py:431`**; this section
+said `:439`, which is inside the docstring of the *other* RPC entry point, and D1's own
+`:425-434` was right.
 
-Same treatment for `engine_core.py:546` (the CoreManager poller, no timeout argument),
-`engine_core.py:587`, `engine_core_mgr.py:534/544/576/586`, and the RapidServe recvs
-if that path is ever used.
+Same treatment for `engine_core.py:544/546` (the engine's input thread, no timeout
+argument — this section called it "the CoreManager poller", which is the peer, not the
+thread), `engine_core_mgr.py:534/544/576/586`, and the RapidServe recvs, which are now
+listed rather than deferred: `engine_core.py:946` (block assignments) and `:1204`
+(prefill completion).
+
+**Two groups this list never reached**, both invisible until the scanner's roots became
+directories rather than a list of files:
+
+- the four streaming endpoints' own collector reads — `serving_chat.py:289` and `:596`,
+  `serving_completion.py:91` and `:252`. `api_server.py:2147` is the *same call* on the
+  Anthropic endpoint and was listed; these two are the endpoints a replay drives.
+- the nine out-of-band control commands in `engine_utility.py` (`:126`, `:147`, `:174`,
+  `:194`, `:203`, `:213`, `:236`, `:252`, `:264`). Each parks the engine's **step loop**
+  with no bound, and unlike the startup calls they can arrive at any point in a run.
+  They wait for **rank 0 only**: `async_proc.py:310` gives the primary output address to
+  rank 0 and `None` to every other rank, and `:332` builds one `outputs_queue` for it,
+  so no other worker has a thread on that channel. The form that does wait for all of
+  them is `call_func_with_aggregation`, which has a queue per rank.
+
+**On the send side, "it cannot park" is true of most of them and has to be said per
+socket, not once.** Of the 25 sends, the ones built by `make_zmq_socket`
+(`atom/utils/__init__.py:541-543`) carry `SNDHWM=0` and provably cannot park. The rest
+are bare `ctx.socket(...)` and keep ZeroMQ's default thousand-message bound: the three
+`pp_transport.py` sends, the disagg bootstrap sends, and — the two that matter at
+runtime — `engine_core.py:1014` on the **prefill step loop** and `:1229` on the decode
+one, whose sockets are created bare at `:925` and `:1182`. Their protocol is one message
+per sequence and the peer drains it every tick, so a thousand-message backlog is not
+reachable in a run; the rows say that rather than claiming the bound does not exist.
+
+**Two of the sites named here are classified otherwise in the inventory, with reasons:**
+
+- `engine_core.py:587` — the line is `self.output_queue.get()` in the engine's *output*
+  thread, fed by this same process's step loop. It is `ignore`: annotating it would
+  declare the engine blocked while its step loop is running, which is the one direction
+  the annotation must not be wrong in.
+- `engine_core_mgr.py:534/544` — reached only from `CoreManager.__init__`, i.e. startup,
+  which this table's last row says to ignore. It is kept as **B** because the peer is
+  another process and the annotation is harmless; the contradiction between the two rows
+  is recorded rather than resolved by fiat.
 
 #### Why I4 is safe rather than merely careful
 
@@ -800,25 +893,67 @@ the loud side.
 
 ### The case that is not a "wait" problem at all
 
-`_recv_prefill_done` (`engine_core.py:1201`) blocks in a background thread and calls
-`Scheduler.on_prefill_done`, which stamps `seq.first_token_time = time.time()`
-(`scheduler.py:3357`). Intercepting the block fixes nothing. The rule is about who
+`_recv_prefill_done` (`engine_core.py:1204`) blocks in a background thread and calls
+`DecodeScheduler.on_prefill_done`, which stamps `seq.first_token_time = time.time()`
+(`scheduler.py:3364`). Intercepting the block fixes nothing. The rule is about who
 stamps:
 
 > **Background threads enqueue. The main loop stamps, at a granted time.**
 
-ATOM's queueing is already correct here (`_pending_assignments` under
-`scheduler._pending_lock`; the `prefill_done` deque). Only the stamping moves.
+The recv itself is category B and needs only the annotation. **But "ATOM's queueing is
+already correct here" is half right, and the half that is wrong is worth stating.**
+Measured at `7fc7a5ddd`:
+
+- The `prefill_done` deque *is* correct: `schedule()` pops it in the step loop
+  (`scheduler.py:3381-3383`), so promotion order follows message arrival order and
+  nothing else.
+- `on_prefill_done` does **more than enqueue**. In the background thread it also pops
+  `prefill_waiting`, sets `num_cached_tokens`, appends the sampled first token, and
+  stamps `first_token_time` — all before the deque append.
+- It takes **no lock** while doing so, although `_prefill_lock` was created for exactly
+  this (`scheduler.py:3302-3304`: *"Protects prefill_waiting and running: on_prefill_done
+  is called from the _recv_prefill_done background thread"*). The lock's two users are
+  `allocate_waiting` and `schedule`, both on the step-loop thread; the thread the comment
+  names never takes it.
+- The `_pending_assignments` half of the claim is about the **prefill** side
+  (`engine_core.py:952/956/968` under `PrefillScheduler._pending_lock`) and is correct
+  there. The two locks are different objects on different schedulers in different
+  processes, and only the prefill one is used as its comment says.
+
+So "only the stamping moves" understates it by three mutations. Moving the stamp alone
+would leave the sequence's token and cached-token count set at an ungranted moment by a
+thread holding no lock. Not a correctness defect in CPython today — the individual dict
+and deque operations are atomic — but it is not the shape the rule describes, and a task
+that assumes the enqueue is the only thing in that function will be surprised.
 
 ### Open issues
 
-- The counts above are estimates from a synchronization inventory, not from a completed
+- ~~The counts above are estimates from a synchronization inventory, not from a completed
   pass over the code. The first implementation task should be to produce the exact
-  classified list and check it in.
-- `engine_core.py:1156` is a literal `time.sleep(2)` whose purpose is GPU-allocator
-  settling after weight-handle import. It must stay on real time. It is RapidServe-only
-  and Compass loads no real weights, so it is probably moot — but it must be *checked*,
-  not assumed.
+  classified list and check it in.~~ **Done, 2026-09-21.** `atom/compass/audit/`.
+- ~~`engine_core.py:1156` is a literal `time.sleep(2)` ... it must be *checked*, not
+  assumed.~~ **Checked, 2026-09-21, and both halves hold.** It is reached only from
+  `DecodeEngineCore._post_model_load_hook`, and `DecodeEngineCore` is constructed only by
+  `DisaggCoreManager`, which `LLMEngine.__init__` selects only under
+  `config.enable_rapidserve` (`llm_engine.py:140-142`) — so "RapidServe-only" is exact.
+  Its purpose is verified by the code around it: the sleep sits between importing
+  decode's weight IPC handles and acknowledging to prefill, and prefill measures free
+  VRAM for KV sizing only after that ACK. It must stay on the real clock. Nothing in ATOM
+  couples it to whether weights are real, but `Config` keeps a simulated runner from it:
+  `--enable-rapidserve` selects `RapidServeModelRunner` only when `runner_qualname` is
+  still the default (`config.py:1730-1736`), and otherwise `Config` raises `ValueError`
+  unless `runner_qualname` is in `RAPIDSERVE_RUNNERS`. The cost, for a runner that list
+  names, is two real seconds of startup and no modelled time, because it runs before
+  READY and therefore before any arrival.
+- The scanner's boundary is a list of directories, not a graph. It reads every `.py`
+  file under `SCANNED_ROOTS`, so a module added beside a scanned one is caught; but a
+  blocking call under one of the three directories `UNSCANNED_ROOTS` names is invisible
+  to the test, and so is one reached through a call shape the scanner does not know. The
+  offload connectors are the largest of the three exclusions. The earlier version of
+  this scanner listed **files**, which declared its blind spot at a finer grain than it
+  excluded: 24 candidate sites sat inside scanned directories and outside both lists,
+  four of them the same streaming-collector read already classified B on another
+  endpoint.
 
 ---
 
@@ -894,6 +1029,14 @@ shutdown disagree.
 
 ### Open issues
 
+- **All 34 `file:line` cites in this section were re-checked against `7fc7a5ddd`** while
+  the synchronization inventory was built, and every one holds — including the four
+  sites "deleted for free by D6", the two Rust constants, and the three clock reads in
+  `streaming_dispatch.py`. The drifted cites are elsewhere: three distinct ones, one of
+  which appears twice more in D3, for five occurrences in all. The rows this section
+  owns are carried in `atom/compass/audit/sync_sites.json` as pinned lines of text
+  rather than as call sites, so a rename or a move fails the inventory test instead of
+  rotting quietly.
 - Disabling a failure detector removes a safety net from a long unattended run. The
   simulator should log, once at startup, exactly which detectors it disabled, so a
   hung run is diagnosable.
@@ -935,7 +1078,7 @@ The ABC is small and has **no `send_kv` / `recv_kv` verb** to fake
 Every connector's completion reaches the scheduler through **one** method:
 
 ```
-ModelRunner.async_proc_aggregation      model_runner.py:3351-3372
+model_runner.py::ModelRunner.async_proc_aggregation
   -> EngineCore._poll_kv_transfer_progress   engine_core.py:485-489
      -> Scheduler._update_from_kv_xfer_finished   scheduler.py:2989-3053
 ```
@@ -953,15 +1096,39 @@ A `SimulatedKVConnector` registered through the existing factory:
 - `latency` and `bandwidth` are configuration, satisfying the "interconnect is
   configurable" requirement directly.
 - It must still emit the `kv_transfer_params` blob that Atomesh relays, so
-  `AtomAdapter` works unmodified. The real shape is at `moriio_connector.py:970-1001`:
-  `{do_remote_prefill, remote_block_ids, remote_engine_id, remote_host, remote_port,
-  remote_handshake_port, tp_size, dp_rank, transfer_id, first_token_id,
-  draft_token_ids, prefix_cache_hit_tokens}`. The router hard-errors if it is absent
-  (`http_pd_router.rs:1073-1078`).
+  `AtomAdapter` works unmodified. The router hard-errors if it is absent
+  (`http_pd_router.rs:1073-1078`). The two backends emit **different shapes** —
+  thirteen fields and seventeen — so the connector it stands in for decides which;
+  see *The blob, per backend* below.
 - The consumer side must still return `(len(prompt), True)` from
   `get_num_new_matched_tokens` when `do_remote_prefill` is set, i.e. park the request
   (`moriio_connector.py:904-917`), so `Scheduler._park_for_remote_load`
   (`scheduler.py:2207-2212`) and the `WAITING_FOR_REMOTE_KVS` state behave identically.
+
+### The blob, per backend
+
+Each connector assigns `seq.kv_transfer_params_output` exactly once, so there is no
+second site either row below could be describing. Each row's field set is the key
+list of that one dict literal, walked out of the AST at `92f1fdafe`.
+
+| Backend | Assignment | Keys | Field set, in source order |
+|---|---|---|---|
+| `moriio` (pull, the default) | `moriio_connector.py:983-997` | 13 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `transfer_id`, `first_token_id`, `draft_token_ids`, `prefix_cache_hit_tokens` |
+| `mooncake` (push) | `mooncake_connector.py:432-452` | 17 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_swa_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `remote_pp_size`, `hash_block_size`, `transfer_id`, `first_token_id`, `draft_token_ids`, `local_slot_index`, `prefix_cache_hit_tokens` |
+
+The push shape is the pull shape plus four: `remote_swa_block_ids`, `remote_pp_size`,
+`hash_block_size`, `local_slot_index`. They are a second backend's blob, not optional
+fields of one, and a simulated connector standing in for `moriio` emits the thirteen.
+
+One of the four is load-bearing rather than descriptive. The push consumer compares
+the producer's `hash_block_size` against its own and falls back to a full transfer —
+`num_computed_blocks = 0` — whenever it is absent or differs
+(`mooncake_connector.py:388-401`), so a blob carrying only the thirteen can never
+take the incremental path.
+
+`tests/compass/test_kv_blob_doc_table.py` re-derives both sets from the connectors and
+fails naming the field that differs, so this table cannot drift from the source the
+way its twelve-field predecessor did.
 
 ### Pros
 
@@ -1247,10 +1414,10 @@ Facts this design leans on, with their source, so a later reader can re-check ra
 re-derive.
 
 **The seam**
-- `Config.runner_qualname` — `atom/config.py:1595`; consumed `engine_core.py:129`,
+- `Config.runner_qualname` — `atom/config.py:1595`; consumed `engine_core.py:128`,
   `async_proc.py:166-169`
-- `ModelRunner.forward(batch: ScheduledBatch) -> ScheduledBatchOutput` —
-  `model_runner.py:3233-3320`
+- `model_runner.py::ModelRunner.forward`, whose signature is
+  `forward(batch: ScheduledBatch) -> ScheduledBatchOutput`
 - the RPC boundary — `engine_core.py:386-388`
 - `ScheduledBatch` fields — `scheduler.py:579-820`; notably `detailed_sqsq` /
   `detailed_sqsk` / `detailed_sk` at `:790-792`, which are sum(N_Q^2), sum(N_Q * N_KV),
@@ -1261,11 +1428,12 @@ re-derive.
 **Existing simulation-shaped hooks in ATOM**
 - `--load_dummy {empty,zero,xavier}` — `config.py:1556`, `arg_utils.py:260`,
   `loader.py:179-227,309-310`, `loading_core.py:266-291`
-- meta-device model construction — `RapidServeModelRunner._init_weight_params_on_meta`,
-  `model_runner.py:4188-4211`
-- a working non-allocating runner template — `RapidServeModelRunner` overrides at
-  `model_runner.py:4218,4232,4239,4245,4261,4269`
-- `ModelRunner.dummy_execution()` — `model_runner.py:1177-1217`, shows how to hand-build
+- meta-device model construction —
+  `model_runner.py::RapidServeModelRunner._init_weight_params_on_meta`
+- a working non-allocating runner template — `model_runner.py::RapidServeModelRunner`,
+  which overrides `_build_and_load_model`, `_maybe_warmup`, `_kv_budget_extra_reserve`,
+  `get_num_blocks`, `allocate_kv_cache` and `forward`
+- `model_runner.py::ModelRunner.dummy_execution` shows how to hand-build
   a `ScheduledBatch`
 - `ScheduledBatch.is_dummy_run` — `scheduler.py:589,781`
 - simulated TP (`--fake-eplb`) — `atom/distributed/simulated_tp.py`; explicit precedent
@@ -1276,7 +1444,8 @@ re-derive.
   `tools/parse_trace.py`
 
 **Memory sizing (needed because it decides which configurations exist)**
-- `ModelRunner.get_num_blocks()` — `model_runner.py:1652-1873`. Five device readings plus
+- `model_runner.py::ModelRunner.get_num_blocks`, with its four `torch.cuda`
+  reads in `model_runner.py::ModelRunner._read_device_memory`. Five device readings plus
   arithmetic: `mem_get_info`, `allocated_bytes.all.peak`,
   `(total - free) - memory_reserved()`, `_estimate_cudagraph_overhead()`, a 2% safety
   margin, then `min(budget - ..., free)` and `plan_pools`. Consumed
