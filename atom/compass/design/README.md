@@ -2,8 +2,8 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header. **109 decisions — D0–D94
-with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **88 registered
-TODOs — T1–T88 with no gaps, of which 82 are open** (T10, T15, T22, T48 and T65 are struck
+with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **90 registered
+TODOs — T1–T90 with no gaps, of which 84 are open** (T10, T15, T22, T48 and T65 are struck
 through as done, and T77 was opened and closed by P0.1); they, the load-bearing assumptions and the
 cross-cutting issues live in **`12_open_items.md`**. Implementation follows the execution
 plan in `16`.

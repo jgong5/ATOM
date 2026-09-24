@@ -406,10 +406,62 @@ LP i advances to min( T_grant(i), next[i] )
 - With `next[j]`, LP A can be behind LP B (A had the minimum, B ran ahead earlier), and
   an event A generates at `A.now + 0` lands in `[A.now, B.now)` — B's past.
 
-At zero lookahead the rule degenerates to `T_grant(i) = min_j now[j]`, i.e. a single
-global event loop across processes: correct, serialized, no parallelism. **That is
-acceptable here, because the speedup comes from skipping idle, not from running LPs
-concurrently in wall time.**
+At zero lookahead the rule as written above does **not** degenerate to a single global
+event loop, and does not run at all. See the amendment immediately below, which replaces
+this paragraph's original claim.
+
+##### Amendment, 2026-09-21, by CA-2 (#45, PR #59) — the rule stalls as written, and the fix
+
+Two claims above are false as written, and both were found by implementing them. The
+correction is small and the rest of D3 stands: `now[j]` over `next[j]` is right, and the
+reviewer's independent measurements strengthened rather than weakened it.
+
+**1. `T_grant(i) = min over j != i of ( now[j] + L[j->i] )` cannot make a move at zero
+lookahead.** Every LP's clock starts at the same value, so for any *i* the minimum over
+the others equals `now[i]`, the grant target equals the current time, and nobody advances.
+This is not a start-up wrinkle that clears once the run is moving: the condition recurs at
+every step, because `min_j now[j]` is the earliest **clock**, not the earliest **next
+event**, and the clocks are exactly what the rule is refusing to let diverge. Measured: the
+three-LP configuration this document itself calls a global event loop — zero floors, events
+at 5 s, 1 s and 7 s — deadlocks under the literal rule.
+
+**2. It therefore does not degenerate to a single global event loop.** It degenerates to a
+stall. The global-event-loop behaviour is real and is what the implementation does, but it
+needs the correction below to get there.
+
+**The correction.** `now[j]` is kept for every LP that can still produce an event, which is
+the whole of the causality argument and is unchanged. It is replaced only for an LP that is
+*parked* — one that has asked to advance and been refused — because such an LP can produce
+nothing until it is granted. For those, the quantity entering the minimum is the earliest
+time the LP could do anything at all: its own `next[j]`, or the arrival of a message from an
+LP that can still move, whichever is sooner, and never earlier than where its clock already
+stands. Those quantities refer to one another, so they are relaxed together to a fixpoint,
+descending from `next`. Floors are non-negative, so this is a shortest-path computation over
+the lookahead matrix and it settles.
+
+This is not the `next[j]` rule under another name, and the distinction is exactly the one
+the paragraph above draws: `next[j]` is used only for an LP that provably cannot emit.
+Using it for an LP that *can* is the error described above, and it remains an error.
+
+Three properties were measured on the implementation, two of them by the reviewer
+independently:
+
+- **It is safe.** The fixpoint agrees with an unbounded relaxation on adversarial
+  reverse-order chains at 5 to 65 LPs — exactly *n* passes, matching every time — and on
+  200 random topologies with no disagreement. Relaxing from above yields the greatest
+  fixpoint, which excludes circular support, so two parked LPs cannot talk each other into
+  an earlier emission time.
+- **Both halves are load-bearing.** "A parked LP contributes its own `next`" *without* the
+  fixpoint is unsafe: on a three-LP topology it grants `b` to 15.0 s where the full rule
+  gives 5.0 s, and an event from `c` to `b` at 5.0 s then lands 10 s in `b`'s past.
+- **It gives the degenerate shapes this document claims.** One LP is a local clock. Every
+  floor at zero releases exactly one event's worth of time at a time, across processes:
+  correct, serialized, no parallelism.
+
+**What remains true unchanged:** the speedup comes from skipping idle, not from running LPs
+concurrently in wall time — and with the correction it is a real skip, since a parked LP is
+released straight to the next event anywhere in the system rather than creeping forward one
+lookahead at a time.
 
 #### Invariants
 
@@ -444,6 +496,28 @@ PP8, 27B, ~10 ms step, 300 s modelled run: ~30k steps x 8 stages ~= **240k grant
 ~50 us per local IPC round trip, ~12 s of overhead against a 300 s real run — still
 ~25x. For M1-M4 with 2-3 LPs the grant traffic is negligible.
 
+
+**Amendment, 2026-09-21, by CA-2 (#45, PR #59): the 240k figure assumes a driver
+discipline that nothing states.** Grant count is not a property of the topology. Measured
+on the implementation — two LPs, one event at 20 s, identical lookahead matrices:
+
+| How the LPs drive the clock | 1 ms floor | 1 us floor |
+|---|---|---|
+| idle LP parks before the busy one asks | **3 grants**, reaches 20 s | **3 grants**, reaches 20 s |
+| every LP takes up and immediately asks again | 20,002 grants, reaches 20 s | >2,000,000 grants, reaches 2 s |
+
+Three to six orders of magnitude apart on one topology. The 240k estimate is the first
+row's discipline; the second is what an LP written without thinking about it will do,
+because a grant truncated by the bound looks like progress and invites another request.
+
+Two things the numbers say that the intuition does not. **The efficient discipline is
+lookahead-independent** — 3 grants at both floors, because with every LP parked the bound
+is computed from where the next event actually is rather than from a clock that is about to
+stop moving. And **a tighter floor makes the inefficient discipline worse, not better**: it
+truncates more grants, so the crawl is finer. The rule a transport has to implement is
+therefore: *an LP asks again when it has work or has been refused, and an LP with nothing
+to do parks rather than stepping its clock forward one floor at a time.* That decision, not
+PP degree, is what decides whether the grant traffic is affordable.
 **PP is therefore an efficiency concern, not a correctness concern.** It is also
 single-node only (every PP address is ZMQ IPC, `engine_core_mgr.py:327-329`), and ATOM
 *rejects* PP+DP (`:298-300`) and multi-node DP+PP (`:272-279`). Defer it on scope

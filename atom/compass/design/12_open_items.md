@@ -12,19 +12,20 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — 88 rows, **T1–T88 with no gaps**, per topic, of which **82 are open**:
+3. **TODO register** — 90 rows, **T1–T90 with no gaps**, per topic, of which **84 are open**:
    T10, T15, T22, T48 and T65 are struck through as done, and T77 was opened and closed by
    P0.1. **The previous figures, 86 rows and 80 open, were stale rather than differently
    counted**: re-run at `fec23aecb` the rule below gives 87 rows and 5 struck, because T81
-   landed from P0.4 after the line was last written. T88 makes it 88.
+   landed from P0.4 after the line was last written. T88 makes it 88; T89 and T90 make it 90.
    Both figures are the rows of section 3 below, counted as
    `grep -oE '^\| *~*\**T[0-9]+'` over that section and nothing else — prose elsewhere in
    this file names T-numbers that belong to other branches, and counting those tokens is
    what made two earlier counts disagree. The register is **allocated across parallel task
    branches rather than as a range**, and has read as non-contiguous whenever one of those
-   branches was in flight: T73–T76 arrived with P0.3, T83–T87 with P0.6, T81 with P0.4, and
-   T88 arrives here. It happens to be complete at this head; that is an observation about
-   what has landed, not a property to rely on
+   branches was in flight: T73–T76 arrived with P0.3, T83–T87 with P0.6, T81 with P0.4,
+   T88 with #196, and T89–T90 with CA-2, which first numbered them T83–T84 before P0.6's
+   landed under those numbers. It happens to be complete at this head; that is an
+   observation about what has landed, not a property to rely on
 4. **Cross-cutting issues and pending amendments**
 
 ---
@@ -234,6 +235,8 @@ M-f `14`; M-g `01` D3.5.
 | **T50** | Whether runtime memory constants transfer across dies (the working assumption says yes within a software generation) | `03`, `05` |
 | **T53** | Whether tokenizer throughput transfers across CPU classes (the working assumption says yes, adjusted by derate) | `05` |
 | **T88** | **D25 says the resolved spec is echoed *verbatim*, and `echo()` is canonical rather than verbatim.** Opened 2026-09-23 by #196 (issue #192). A dotted key resolves to the nested path — deliberately, because a probe fragment writes them — so one field has two spellings and `echo()` rebuilds only the nested one. Measured on `087f85e9d`: the reference document with `host.cpu` written flat reads, `value("host.cpu.cores_physical")` is 96, and `echo()` equals the **nested** document with `digest(flat) == digest(nested)` — while the document read was the flat one. For a digest that is the right answer, and it is why #196 refuses a document stating both spellings rather than picking one. But "verbatim" and "canonically" differ for a fragment a probe wrote flat, and D15's honesty measure is stated as the echo standing beside the number it produced. Either D25 says *canonically, after resolution*, or `echo()` records the spelling it was given. Nothing reads the echo as text today, so it is cheap to settle before the artifact store (#157, #161) takes a content digest over one. | `05` |
+| T89 | **The virtual-time protocol has no way for a logical process to say it has finished, so a clean end of run is indistinguishable from a deadlock.** Opened 2026-09-21 by CA-2 (#45, PR #59). `01` D3's deadlock invariant is "all LPs blocked and none holding a finite `next` -> abort loudly", and the Clock Authority implements it exactly. But that state is also what a *correct, completed* run looks like — every LP has drained its work and parked with an empty horizon — so an integration reaches it at the end of every clean run and aborts. Asserted as the specified behaviour in `tests/compass/test_clock_grant_rule.py::test_everyone_waiting_with_no_known_event_aborts_loudly` and `::test_one_participant_with_nothing_left_to_do_is_the_same_stall`. The gap is not theoretical: a harness written while measuring the row below hung rather than finishing, because an LP that had drained its own events had no third option — it could neither park (which would abort the run) nor keep asking (which pins every peer at its stale clock), and the run spun with no grant issued and no abort raised. The item is the missing third case: either a retire call on the protocol, so a departed LP leaves the minimum and the rest carry on, or a stated convention that the run is torn down before the last LP parks. It is **not** a choice the clock can make alone, because "the workload is over" is a statement about the traffic source and the engines, not about time. Owner: whoever takes the transports (#46) and the traffic source (#47); CA-2 deliberately did not invent one, since the wrong convention here is more expensive than the abort. The abort must not be softened into a timeout while this is open — that invariant exists because a prior 120 s arrival barrier released on an invalid run and the client reported "0 failed". | `01` |
+| T90 | **`grants_issued()` is arrival-order dependent while the event schedule is not, so a grant count cannot be compared between runs.** Opened 2026-09-21 by CA-2 (#45, PR #59); measured by CA-2's reviewer and not independently reproduced here — the reproduction harness hit T89 above and hung. `01` D3.5 lists "grants issued, per LP" in the run summary and reads it as the protocol's own cost, the number that says whether a PP degree is affordable. Measured across 24 permutations of the order in which LPs ask for time, one topology: **12 distinct totals spanning 1457 to 1484**, while the same 24 runs produced **one** distinct set of 1024 events. That is the `01` D3.4 distinction landing where it should — the sequence of `(LP, virtual time, event)` is reproducible, the wall-clock interleaving is not — but it means a grant count is a property of the run and not of the configuration, and a summary that reports it as one invites a comparison between two runs differing only in which socket was ready first. Compounded by D3's Sizing amendment of the same date: on one topology the count spans three to six orders of magnitude on the driver's discipline alone. The item is for the run summary (#50): record the grant count with the arrival order that produced it and forbid comparing across runs, or replace it with a figure that is a function of the virtual schedule. **Do not** fix it by making grants arrival-independent — the grant *order* already is, by LP identity, and that is the property determinism needs. | `01`, `11` |
 
 ---
 
