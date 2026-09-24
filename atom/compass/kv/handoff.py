@@ -98,11 +98,11 @@ def whole_number(field: str, value: Any) -> int:
     accepted changes on the way to the `int` returned, and that check is what
     refuses integer text: `int("8")` is 8, which is not equal to "8".
 
-    Two limits, neither of which returns a width: a numpy union dtype with a
-    field named "bool", `("i8", [("bool", "i8")])`, is refused even holding a
-    whole number; and a `dtype` whose `__str__` raises anything but
-    `TypeError`, `ValueError` or `OverflowError` escapes with that error, not
-    this named refusal.
+    Limits: "bool" is matched case-sensitively, so a numpy union dtype with a
+    field whose name contains "bool" is refused even holding a whole number.
+    An exception from the value's own methods, such as `dtype`, its `__str__`,
+    `__int__`, `__ne__` or `__repr__`, can escape as raised, not as this
+    refusal, and a `dtype` raising `AttributeError` reads as no dtype.
     """
     try:
         if isinstance(value, bool) or "bool" in str(getattr(value, "dtype", "")):
