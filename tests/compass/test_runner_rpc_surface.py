@@ -1068,7 +1068,6 @@ def test_the_zero_block_form_in_the_tree_answers_two_of_the_four_keys():
 # which is a call and not an import statement.
 
 CITATION = r"`([a-z_]+\.py:\d+)`"
-CITED = frozenset(re.findall(CITATION, PACKAGE_DOC))
 # Words from two up: a split needs two, so "the one module here" is no count.
 COUNT_WORDS = ("two", "three", "four", "five", "six", "seven", "eight", "nine")
 
@@ -1174,7 +1173,7 @@ def test_every_site_the_package_docstring_cites_is_one_no_caller_waits_for():
     """
     sites = [s for name in UNWAITED for s in SITES[name]]
     assert [s for s in sites if s.waits] == []
-    assert CITED == {_cite(s) for s in sites}
+    assert set(re.findall(CITATION, PACKAGE_DOC)) == {_cite(s) for s in sites}
     bullets = _bullets(PACKAGE_DOC)
     assert {n: set(re.findall(CITATION, bullets.get(n, ""))) for n in UNWAITED} == {
         n: {_cite(s) for s in SITES[n]} for n in UNWAITED
@@ -1189,8 +1188,9 @@ def test_a_site_in_a_same_named_file_elsewhere_is_not_a_cited_one():
     """
     site = next(s for n in UNWAITED for s in SITES[n])
     moved = site._replace(file=f"atom/diffusion/{pathlib.Path(site.file).name}")
-    assert _cite(site) in CITED
-    assert _cite(moved) not in CITED
+    cited = set(re.findall(CITATION, PACKAGE_DOC))
+    assert _cite(site) in cited
+    assert _cite(moved) not in cited
 
 
 def _imported(node, alias):
