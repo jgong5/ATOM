@@ -10,8 +10,8 @@
 ## Execution rules
 - Don't modify the main worktree. Develop with linked worktrees, one per in-flight
   task, under `compass-worktrees/<task-id>`, beside the repo.
-- **On every landing, the landing agent fast-forwards the main worktree** to
-  `feature/atomcompass_new` (the integration branch). Every linked worktree shares
+- **On every landing, the landing agent fast-forwards the main worktree's local
+  `feature/atomcompass_new`** (the integration branch). Every linked worktree shares
   its local `feature/atomcompass_new`, and the Compass scripts
   (`scripts/compass/`) diff against that local branch when it exists, before
   falling back to `fork/feature/atomcompass_new` — so a stale local branch gives
@@ -23,12 +23,15 @@
   any git command. `setup-git` needs a `gh` login, `/root/.config/gh/hosts.yml`,
   which a full teardown also discards, so `gh auth login` or the token file
   `gpu_docker/CLAUDE.md` names may be needed first (unverified: untested after a
-  real teardown). A pull as root leaves files root-owned, which fails host-side
-  edits silently, so chown after every pull:
+  real teardown). The main worktree may have another branch checked out, so
+  update the integration branch without checking it out (fast-forward only; if
+  it is the checked-out branch, `git merge --ff-only fork/feature/atomcompass_new`
+  instead). Git as root leaves files root-owned, which fails host-side edits
+  silently, so chown after every update:
 
   ```
-  cd <main worktree> && git fetch fork --quiet
-  git merge --ff-only fork/feature/atomcompass_new
+  cd <main worktree>
+  git fetch fork feature/atomcompass_new:feature/atomcompass_new
   chown -R 13797:13797 .      # whole tree, .git included
   stat -c "%u %n" . .git      # 13797 twice; then git -C <each worktree> rev-parse HEAD
   ```
@@ -147,8 +150,12 @@
 - **Effort is estimated in lines of code, not time.** Wall-clock appears only for
   machine time with a measured basis. **A task that overruns its estimate by more
   than ~2x is an escalation**, not a reason to keep going.
-- **PRs land squashed onto `feature/atomcompass_new`**, one commit per task —
-  never `main` or `master`.
+- **PRs land squashed onto `feature/atomcompass_new`**, one commit per task with a
+  written message — never `main` or `master`. Land through REST with
+  `merge_method=squash`, `commit_title`, `commit_message` (`-F
+  commit_message=@<file>`) and `sha=<approved head>`: `PUT
+  repos/<o>/<r>/pulls/<n>/merge` for an unstacked PR, `PUT .../merge-async` with
+  `merge_action=direct_merge` for a stacked one, bottom-first.
 - **Landing is the agents' job; no owner approval is needed or sought.** An agent
   lands any PR whose APPROVE covers its current head (below) and with no
   `need human` on it or anywhere below it in its stack; it does not wait for the
@@ -174,9 +181,9 @@
     filed as "claimable once X lands" is now claimable.
 - **An approval covers a tree, not a PR.** When a head moves past the comment
   that approved it, the new commits get a delta review pinned to
-  `<approved sha>..<head>` before the PR lands. A content-preserving restack needs
-  a verification, not a full review — by tree hash or a chunk-by-chunk comparison
-  of the result, never a diff of diffs.
+  `<approved sha>..<head>` before the PR lands. A merge commit in that range is
+  reviewed by its conflict resolutions (`git show --remerge-diff <merge>`), not
+  by the changes it brings in, which were reviewed where they landed.
 - **Recommended, not required: stack a dependent task's PR on its unlanded
   parent** with `gh stack` (`github/gh-stack` v0.1.1); independent tasks do not
   stack. Reinstall after a container rebuild with
@@ -184,20 +191,24 @@
   - Link a chain whole or not at all, and only when you mean it (`unstack` can
     refuse): `gh stack link --base feature/atomcompass_new <bottom-pr#> ... <top-pr#>`,
     re-run whenever a PR joins, held members included (linking lands nothing).
-    `merge` retargets only linked members. A fork (two or more open PRs based on
-    one open PR's branch) links at most one arm. Drift check: every open PR based
+    Only linked members are retargeted when a parent lands. A fork (two or more
+    open PRs based on one open PR's branch) links at most one arm. Drift check:
+    every open PR based
     on another open PR's branch sits in one stack, fork arms excepted
     (`gh api "repos/<o>/<r>/stacks?pull_request=<n>"`).
-  - Land with `gh stack merge <pr-number> --squash --yes`: it squashes up to that
-    PR and retargets the one above. Only open, non-draft PRs merge; it checks no
-    labels, so apply the landing rule first. There is no `--message`: a
-    multi-commit PR gets GitHub's default squash message.
-  - An unlinked chain needs, per child on each parent landing,
-    `git rebase --onto <new> <old> <branch>` plus a REST base patch.
-- **Never force-push a branch under review.** Answer review findings with new
-  commits, never an amend: the branch lands squashed anyway, and an amend removes
-  the reviewed commit a delta review needs and strands any child stacked on it.
-  A restack after the parent has landed is permitted.
+  - Land a stack one PR at a time (above), not with `gh stack merge`: it takes no
+    message, so a multi-commit PR lands with GitHub's commit-list message. When a
+    parent lands, GitHub retargets a linked child itself. An unlinked child (a
+    fork arm, or a chain never linked) gets the new integration tip merged into
+    it and its base patched via REST.
+- **PR branches only gain commits: no force-push, no rebase, no amend.** Answer
+  review findings with new commits. Update a branch only when it conflicts or
+  needs code landed since — a moved tip alone needs no update, the tree check
+  covers it — and then by merging the integration branch, or the parent's head,
+  into it. Never run `gh stack rebase`, `sync`, `push` or `submit`: they rebase
+  and force-push. The branch lands squashed, so its merge commits never reach the
+  integration branch, and GitHub's incremental review and the delta review stay
+  intact.
 - Except for the main branch, free updates to `jgong5/ATOM` — branches, PRs and
   issues alike, untouched until the project agrees to upstream the milestone.
   Never touch `ROCm/ATOM`.
