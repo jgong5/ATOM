@@ -194,8 +194,8 @@ id, `test_the_cost_per_byte_does_not_grow`, are issue #93's. 19 of the 21 are pi
 PR #79's review (issue comment 5765186351) ran `b58a48cc2` 19 times, for 17 nominal,
 1 skip-variant and the one hard failure. The other 2, 1 nominal and 1 skip-variant
 by subtraction from the table, name no commit, so half the skip-variant rate rests
-on #93's count alone. #93 attributes the skip-variants to that test, but no run
-named it (PR #99). Not-nominal combined is ~1 in 7.
+on #93's count alone. #93 attributes the skip-variants to that test, but no
+skip-variant run named it (PR #99). Not-nominal combined is ~1 in 7.
 The finding is the third outcome, not the rate. The rates are a **lower bound on
 the class**, not a measurement of it: the class holds **3 methods / 4 collected
 cases** (one is parametrised `buffered-region` and `kimi-incremental`), of which
