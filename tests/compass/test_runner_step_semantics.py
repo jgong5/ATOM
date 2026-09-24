@@ -453,17 +453,48 @@ def _decorators(path, class_name, name):
     return [ast.unparse(d) for d in _function(path, class_name, name).decorator_list]
 
 
+# The methods the reply is handed to whole. `postprocess` reads it under
+# `fwd_output`, which the walk below sees; `send_tokens` pickles it and reads
+# nothing. A hand-off to any other method is refused: it would read the reply
+# under a name this walk does not follow.
+HANDED_TO = ("postprocess", "send_tokens")
+
+
 def _reply_attribute_reads():
-    """Every attribute ATOM reads off a forward reply, from ATOM's own source."""
-    names = set()
+    """Every attribute ATOM reads off a forward reply, from ATOM's own source.
+
+    A read is `fwd_out.x` or `fwd_output.x`. The reply may also be handed on
+    whole -- passed positionally to one of `HANDED_TO`, returned, or tested
+    against `None`. Any other use of it, a `getattr`, an alias, a hand-off to
+    any other function or method, is refused by file and line: it
+    could read an attribute this set would never contain.
+    """
+    names, unread = set(), []
     for path in (REPO / "atom" / "model_engine").glob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text())):
-            if (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id in {"fwd_out", "fwd_output"}
+        tree = ast.parse(path.read_text())
+        parent = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Name)
+                and node.id in {"fwd_out", "fwd_output"}
+                and isinstance(node.ctx, ast.Load)
             ):
-                names.add(node.attr)
+                continue
+            up = parent[node]
+            handed_on = (
+                isinstance(up, ast.Return)
+                or ast.unparse(up) == f"{node.id} is None"
+                or (
+                    getattr(up, "func", None) is not None
+                    and getattr(up.func, "attr", None) in HANDED_TO
+                    and node in up.args
+                )
+            )
+            if isinstance(up, ast.Attribute):
+                names.add(up.attr)
+            elif not handed_on:
+                unread.append(f"{path.name}:{node.lineno}: {ast.unparse(up)}")
+    assert not unread, f"the forward reply is used in a form not read here: {unread}"
     return names
 
 
