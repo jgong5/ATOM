@@ -258,7 +258,7 @@ def test_what_that_ring_costs_is_the_batch_budget_by_the_hidden_size():
 
     Its dominant term, so a runner that allocates no weights still holds
     device memory that grows with the batch budget and the model's hidden
-    size. The bytes are a measurement and live in the task record; what is
+    size. The bytes need a device to measure and are not asserted; what is
     checkable here is which two numbers they are a product of.
     """
     allocate = _method_def(

@@ -443,7 +443,7 @@ def test_the_binding_module_refuses_rather_than_composing_a_hole():
     Executing the device means importing the composed class, which imports
     `ModelRunner`, which runs aiter's architecture probe and needs a driver.
     So this asserts the device is wired up and not that it fires correctly;
-    that it fires correctly is a GPU-tier observation, recorded in the PR.
+    that it fires correctly can only be observed with a driver present.
     What is checked here is the part that can drift silently: that the message
     partitions the missing names on `RPC_SURFACE` instead of telling one story
     about all twelve, since two of them are waited on by nobody.
@@ -782,7 +782,7 @@ def test_the_scan_still_catches_the_string_inside_the_runner_package(tmp_path):
 
 
 def test_the_scan_ignores_a_compass_package_the_reply_never_reaches(tmp_path):
-    """The half the whole-tree read got wrong, and the reason for this change.
+    """The half a read of the whole tree gets wrong.
 
     A module under `atom/compass` that the reply never touches may mention
     `trace_dir` -- in a comment, in a docstring, in a field name of its own --
@@ -865,7 +865,7 @@ def test_the_break_on_exit_is_a_sibling_of_the_per_runner_loop():
     reply -- a runner with no `exit` is skipped by the `getattr`, and the loop
     still breaks.
 
-    The landed assertion in
+    The assertion in
     `test_the_two_names_no_caller_waits_for_and_what_replying_costs` pins the
     same two lines as an exact string. That catches the break moving one level
     in, because its own indentation would change, but says nothing about what
@@ -903,16 +903,17 @@ def test_the_break_on_exit_is_a_sibling_of_the_per_runner_loop():
 def test_the_refusal_comment_says_the_loop_breaks_and_not_that_it_hangs():
     """The prose beside the refusal, held to the structure above.
 
-    This is the half the surface was missing. One commit landed the comment,
-    the package docstring and the string assertion above together, and the
+    This is the half the surface was missing. The comment, the package
+    docstring and the string assertion above were added together, and the
     comment said the opposite of that assertion: that an unanswered `exit`
     means "the loop never breaks". Nothing failed, because nothing read the
     prose. So the words are read here.
 
-    `never breaks` in any spelling is the claim that was wrong. The three
-    phrases required are the three findings of the structure test -- that it
-    breaks, what the `if` is a sibling of, and that it tests a name rather
-    than a reply -- so prose and source now fail together.
+    `never breaks` is the claim that was wrong. It is refused as that
+    lower-case phrase, including where a comment line wraps between the two
+    words. The three phrases required are the three findings of the structure
+    test -- that it breaks, what the `if` is a sibling of, and that it tests a
+    name rather than a reply -- so prose and source now fail together.
     """
     comment = _refusal_comment()
     assert "The loop breaks either way" in comment
@@ -1106,7 +1107,7 @@ def test_the_package_docstring_lists_every_module_beside_it():
     """The split it describes has to be over the package's own modules.
 
     The docstring said "Two modules" for as long as there were three:
-    `step_output` landed a PR after the sentence was written, and nothing went
+    `step_output` was added after the sentence was written, and nothing went
     red, because a count in prose has nothing to disagree with. So the bullets
     are compared against the directory instead of against a number, and the
     next module either appears in them or fails here -- including one that
