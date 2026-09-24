@@ -46,9 +46,9 @@ one of those branches, on this hardware.
 These are measurements, not opinions, and they are load-bearing below:
 
 - **The seam needs no ATOM change.** `Config.runner_qualname` (`atom/config.py:1595`),
-  consumed at `engine_core.py:129` and `async_proc.py:166`. Two in-tree precedents:
+  consumed at `engine_core.py:128` and `async_proc.py:166`. Two in-tree precedents:
   `RLHFModelRunner` (`atom/rollout/async_engine.py:26-32`) and `RapidServeModelRunner`
-  (`config.py:1729-1736`).
+  (`Config.__post_init__`, `config.py:1730-1736`).
 - **Rank-0 single-sourcing of the clock is correct for symmetric TP.** TP=2 over 1727
   steps: per-step rank difference median 0.03%, worst 0.82%, rank 1 slower on 51% of
   steps. TP=4 over 2295 steps: rank totals within ±0.02%; charging every step to its
@@ -941,11 +941,10 @@ that assumes the enqueue is the only thing in that function will be surprised.
   VRAM for KV sizing only after that ACK. It must stay on the real clock. Nothing in ATOM
   couples it to whether weights are real, but `Config` keeps a simulated runner from it:
   `--enable-rapidserve` selects `RapidServeModelRunner` only when `runner_qualname` is
-  still the default (`config.py:1727-1736`), and otherwise `Config` raises `ValueError`
-  unless `runner_qualname` is in `RAPIDSERVE_RUNNERS` (`config.py:1737-1745`), before
-  `LLMEngine.__init__` constructs any engine core. The cost, for a runner that list names,
-  is two real seconds of startup and no modelled time, because
-  it runs before READY and therefore before any arrival.
+  still the default (`config.py:1730-1736`), and otherwise `Config` raises `ValueError`
+  unless `runner_qualname` is in `RAPIDSERVE_RUNNERS`. The cost, for a runner that list
+  names, is two real seconds of startup and no modelled time, because it runs before
+  READY and therefore before any arrival.
 - The scanner's boundary is a list of directories, not a graph. It reads every `.py`
   file under `SCANNED_ROOTS`, so a module added beside a scanned one is caught; but a
   blocking call under one of the three directories `UNSCANNED_ROOTS` names is invisible
@@ -1415,7 +1414,7 @@ Facts this design leans on, with their source, so a later reader can re-check ra
 re-derive.
 
 **The seam**
-- `Config.runner_qualname` — `atom/config.py:1595`; consumed `engine_core.py:129`,
+- `Config.runner_qualname` — `atom/config.py:1595`; consumed `engine_core.py:128`,
   `async_proc.py:166-169`
 - `model_runner.py::ModelRunner.forward`, whose signature is
   `forward(batch: ScheduledBatch) -> ScheduledBatchOutput`
