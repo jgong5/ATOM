@@ -467,10 +467,25 @@ def test_the_guard_finds_nothing_when_the_root_moves(monkeypatch, tmp_path):
     assert not _runner_modules()
 
 
+def test_the_walk_returns_every_module_under_the_root(monkeypatch, tmp_path):
+    """Non-empty says the walk found something; this says it found everything.
+
+    The tree is built here, so the expected set does not move when the package
+    gains a module. A walk that is not recursive misses `sub/b.py`, and one
+    narrowed to a pattern or sliced to a prefix misses `a.py` or more.
+    """
+    for rel in ("__init__.py", "a.py", "sub/b.py"):
+        (tmp_path / rel).parent.mkdir(exist_ok=True)
+        (tmp_path / rel).write_text("")
+    monkeypatch.setitem(globals(), "PACKAGE", tmp_path)
+    modules = {str(p.relative_to(tmp_path)) for p in _runner_modules()}
+    assert modules == {"__init__.py", "a.py", "sub/b.py"}
+
+
 @pytest.mark.parametrize(
     "path",
     _runner_modules(),
-    ids=lambda p: p.name,
+    ids=lambda p: str(p.relative_to(PACKAGE)),
 )
 def test_only_the_binding_module_reaches_the_engine(path):
     """Everything else stays runnable where the engine cannot be imported.
@@ -489,5 +504,17 @@ def test_only_the_binding_module_reaches_the_engine(path):
         if m.startswith(("atom.compass.runner", "atom.compass.memory"))
     }
     assert engine == (
-        {"atom.model_engine.model_runner"} if path.name == "model_runner.py" else set()
+        {"atom.model_engine.model_runner"}
+        if path == PACKAGE / "model_runner.py"
+        else set()
     )
+
+
+def test_every_module_the_walk_returns_is_a_case():
+    """The cases are compared to the walk, not only the walk to its tree.
+
+    A slice or filter where the walk is handed to the parametrisation drops
+    cases while the walk itself still returns every module.
+    """
+    (mark,) = test_only_the_binding_module_reaches_the_engine.pytestmark
+    assert mark.args[1] == _runner_modules()
