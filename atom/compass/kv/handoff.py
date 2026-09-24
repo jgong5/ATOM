@@ -102,7 +102,7 @@ def whole_number(field: str, value: Any) -> int:
     field whose name contains "bool" is refused even holding a whole number.
     An exception from the value's own methods, such as `dtype`, its `__str__`,
     `__int__`, `__ne__` or `__repr__`, can escape as raised, not as this
-    refusal, and a `dtype` raising `AttributeError` reads as no dtype.
+    refusal, and an `AttributeError` from reading `dtype` counts as no dtype.
     """
     try:
         if isinstance(value, bool) or "bool" in str(getattr(value, "dtype", "")):
