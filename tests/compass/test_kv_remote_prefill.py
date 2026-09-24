@@ -24,6 +24,7 @@ import ipaddress
 import json
 import pathlib
 import socket
+import sys
 import time
 from types import SimpleNamespace
 
@@ -39,22 +40,26 @@ from test_kv_simulated_connector import (
     TICK,
     model_for,
 )
+from test_runner_non_allocating import ATOM_RUNNER, PACKAGE, _classes
 from transformers import PretrainedConfig
 
 from atom.compass.backends import KvGeometry
 from atom.compass.kv import CLOCK_KEY, TRANSFER_KEY
+from atom.compass.kv.connector import SimulatedKVConnector
 from atom.compass.kv.handoff import (
     SIMULATED_ENGINE_ID,
     SIMULATED_HOST,
     SIMULATED_PORT,
     transfer_params,
 )
+from atom.compass.runner.overrides import NonAllocatingRunner, RunnerRefusal
 from atom.kv_transfer import disaggregation
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus
+from atom.utils import forward_context
 
 #: The backend whose blob shape the router and the consumer were built around.
 PULL_BACKEND_SOURCE = (
@@ -421,6 +426,80 @@ def step(engine, worker):
     )
     engine._update_from_kv_xfer_finished(aggregated)
     engine.schedule()
+
+
+def test_the_compass_runner_builds_the_worker_that_ends_the_park(
+    geometry, seq_factory, monkeypatch
+):
+    """The same park, with the worker built and started by the runner.
+
+    Importing either runner needs a driver, so `CompassModelRunner`'s class
+    statement is compiled from source over the overrides and an ATOM
+    `ModelRunner` holding only its `process_kvconnector_output`, and the TP
+    group `ModelRunner.__init__` opens is stood in at rank 0.
+    """
+    atom_runner = _classes(ATOM_RUNNER)["ModelRunner"]
+    (method,) = [
+        n
+        for n in atom_runner.body
+        if isinstance(n, ast.FunctionDef) and n.name == "process_kvconnector_output"
+    ]
+    atom_runner.body = [method]
+    namespace = {
+        "torch": torch,
+        "get_kvconnector": forward_context.get_kvconnector,
+        "NonAllocatingRunner": NonAllocatingRunner,
+    }
+    compass_runner = _classes(PACKAGE / "model_runner.py")["CompassModelRunner"]
+    exec(ast.unparse(atom_runner), namespace)  # noqa: S102
+    exec(ast.unparse(compass_runner), namespace)  # noqa: S102
+    group = SimpleNamespace(get_tp_group=lambda: SimpleNamespace(rank_in_group=0))
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", group)
+    monkeypatch.setattr(forward_context, "_global_kvconnector", None)
+
+    model = model_for(geometry, PEAKS[0])
+    now = [ISSUE_AT]
+    runner = object.__new__(namespace["CompassModelRunner"])
+    runner.config = atom_config_double(
+        kv_transfer_config={
+            "kv_connector": "compass",
+            "kv_role": "kv_consumer",
+            CLOCK_KEY: lambda: now[0],
+            TRANSFER_KEY: model,
+        }
+    )
+    assert runner.allocate_kv_cache(100) is True
+    worker = forward_context.get_kvconnector()
+    assert isinstance(worker, SimulatedKVConnector)
+
+    engine = scheduler_with(connector(model, lambda: now[0], role="scheduler"))
+    seq = remote_filled(seq_factory)
+    engine.add(seq)
+    batch, _ = engine.schedule()
+    assert seq.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+    runner.process_kvconnector_output(batch.connector_meta_output)
+    now[0] = model.release_at(ISSUE_AT, len(seq.block_table))
+    step(engine, worker)
+    assert seq.status is SequenceStatus.RUNNING
+
+
+@pytest.mark.parametrize(
+    "kv", [{"kv_connector": "mooncake"}, {"kv_connector": "moriio"}, {}]
+)
+def test_the_compass_runner_refuses_a_real_transfer_backend(kv, monkeypatch):
+    """Refused by name before anything is built; `{}` is the factory's moriio."""
+    calls = []
+    monkeypatch.setattr(
+        forward_context, "set_kv_cache_data", lambda *a, **k: calls.append(a)
+    )
+    runner = object.__new__(NonAllocatingRunner)
+    runner.config = atom_config_double(
+        kv_transfer_config={"kv_role": "kv_consumer", **kv}
+    )
+    name = kv.get("kv_connector", "moriio")
+    with pytest.raises(RunnerRefusal, match=f"kv_connector '{name}' is a real"):
+        runner.allocate_kv_cache(100)
+    assert calls == []
 
 
 def test_nothing_is_announced_for_a_request_the_engine_did_not_suspend(

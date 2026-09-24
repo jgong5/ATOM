@@ -416,7 +416,27 @@ class NonAllocatingRunner:
         The block accounting above this -- the pool, the prefix index, eviction,
         preemption -- is integer arithmetic and runs unmodified against the count
         recorded here. Only the tensors behind the blocks are absent.
+
+        An empty registry still goes through ATOM's `set_kv_cache_data`: it is
+        the one call that builds the worker-side KV connector, without which no
+        transfer the scheduler announces ever starts or finishes.
         """
+        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+        from atom.utils.forward_context import set_kv_cache_data
+
+        kv = getattr(self.config, "kv_transfer_config", None)
+        name = kv and KVConnectorFactory.canonical_name(
+            kv.get("kv_connector", "moriio")
+        )
+        if kv and name != "compass":
+            reason = (
+                f"kv_connector {name!r} is a real transfer backend, and building "
+                "it would open ports or load an RDMA library on this worker; "
+                "this runner simulates only 'compass'."
+            )
+            logger.error("%s", reason)
+            raise RunnerRefusal(reason)
+        set_kv_cache_data({}, self.config, num_blocks=num_kvcache_blocks)
         self.config.num_kvcache_blocks = num_kvcache_blocks
         logger.info(
             "kv cache: %d blocks accounted, 0 bytes allocated.",
