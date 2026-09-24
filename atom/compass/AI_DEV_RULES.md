@@ -35,7 +35,8 @@
   cd <main worktree>
   git fetch fork feature/atomcompass_new:feature/atomcompass_new
   chown -R 13797:13797 . "$(git rev-parse --git-common-dir)"
-  stat -c "%u %n" . .git      # 13797 twice; then git -C <each worktree> rev-parse HEAD
+  find . "$(git rev-parse --git-common-dir)" ! -uid 13797 | head -1   # prints nothing
+  git -C <each worktree> rev-parse HEAD
   ```
 - **Four setup rules.** Each failure behind them came from a shared mutable
   non-git source tree that things silently resolved against, not from worktrees.
@@ -160,9 +161,10 @@
   repos/<o>/<r>/pulls/<n>/merge-async` (stacked or not), `merge_method=squash`,
   `merge_action=direct_merge`, `sha=<approved head>`, a `commit_title` ending in
   ` (#<n>)` (GitHub does not add it) and `-F commit_message=@<file>`. It is
-  asynchronous: poll the status URL its response returns until it reports
-  success — a failure is a finding to diagnose — before the fast-forward below
-  or the next PR up a stack, which lands bottom-first.
+  asynchronous: poll `GET repos/<o>/<r>/pulls/<n>/merge-async/<uuid>`, with the
+  `uuid` from the response's `details`, until `status` is `merged` (`failed` is a
+  finding to diagnose), before the fast-forward below or the next PR up a stack,
+  which lands bottom-first.
 - **Landing is the agents' job; no owner approval is needed or sought.** An agent
   lands any PR whose APPROVE covers its current head (below) and with no
   `need human` on it or anywhere below it in its stack; it does not wait for the
