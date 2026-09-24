@@ -1152,6 +1152,10 @@ def test_the_package_docstring_partitions_the_surface_the_way_the_table_does():
     assert set(_bullets(PACKAGE_DOC)) & set(RPC_SURFACE) == UNWAITED
 
 
+def _cite(s):  # the docstring cites paths under atom/model_engine/
+    return f"{s.file.removeprefix('atom/model_engine/')}:{s.line}"
+
+
 def test_every_site_the_package_docstring_cites_is_one_no_caller_waits_for():
     """The partition is a claim about call sites, so it carries them.
 
@@ -1170,15 +1174,24 @@ def test_every_site_the_package_docstring_cites_is_one_no_caller_waits_for():
     cited = set(re.findall(CITATION, PACKAGE_DOC))
     sites = [s for name in UNWAITED for s in SITES[name]]
     assert [s for s in sites if s.waits] == []
-
-    def cite(s):  # the docstring cites paths under atom/model_engine/
-        return f"{s.file.removeprefix('atom/model_engine/')}:{s.line}"
-
-    assert cited == {cite(s) for s in sites}
+    assert cited == {_cite(s) for s in sites}
     bullets = _bullets(PACKAGE_DOC)
     assert {n: set(re.findall(CITATION, bullets.get(n, ""))) for n in UNWAITED} == {
-        n: {cite(s) for s in SITES[n]} for n in UNWAITED
+        n: {_cite(s) for s in SITES[n]} for n in UNWAITED
     }
+
+
+def test_a_site_in_a_same_named_file_elsewhere_is_not_a_cited_one():
+    """A cited site moved outside `atom/model_engine/` is no longer cited.
+
+    Only that prefix is stripped, so the moved site keeps a `/` that no
+    citation matches. A base name would let it satisfy the citation.
+    """
+    site = next(s for n in UNWAITED for s in SITES[n])
+    moved = site._replace(file=f"atom/diffusion/engine/{pathlib.Path(site.file).name}")
+    cited = set(re.findall(CITATION, PACKAGE_DOC))
+    assert _cite(site) in cited
+    assert _cite(moved) not in cited
 
 
 def _imported(node, alias):
