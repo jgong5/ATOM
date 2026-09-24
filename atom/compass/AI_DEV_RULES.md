@@ -27,8 +27,9 @@
   refspec fetch fast-forwards the integration branch without a checkout. If
   `git worktree list` shows `[feature/atomcompass_new]` in some worktree, git
   refuses that fetch; run `git fetch fork && git merge --ff-only
-  fork/feature/atomcompass_new` in that worktree instead. Git as root leaves files root-owned, which fails host-side edits
-  silently, so chown after every update:
+  fork/feature/atomcompass_new` in that worktree instead. Git as root leaves
+  files root-owned, which fails host-side edits silently, so chown after every
+  update:
 
   ```
   cd <main worktree>
@@ -215,9 +216,9 @@
   `fork/feature/atomcompass_new` (never the local branch, which may be stale), or
   the parent's head, into it. Never run `gh stack rebase`, `sync`, `push` or
   `submit`: they rebase or force-push. A secret or large binary pushed by mistake
-  is the one case that needs a force-push, and it is an escalation. The branch lands squashed, so its merge commits never reach the
-  integration branch, and GitHub's incremental review and the delta review stay
-  intact.
+  is the one case that needs a force-push, and it is an escalation. The branch
+  lands squashed, so its merge commits never reach the integration branch, and
+  GitHub's incremental review and the delta review stay intact.
 - Except for the main branch, free updates to `jgong5/ATOM` — branches, PRs and
   issues alike, untouched until the project agrees to upstream the milestone.
   Never touch `ROCm/ATOM`.
