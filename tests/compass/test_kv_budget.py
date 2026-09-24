@@ -386,6 +386,7 @@ def test_exactly_these_config_fields_are_read_with_no_default():
         "disagg_is_decode",
         "enforce_eager",
         "eos_token_id",
+        "kv_transfer_config",
         "pipeline_parallel_size",
         "speculative_config",
         "stop_token_ids",
