@@ -504,6 +504,18 @@ def test_the_compass_runner_refuses_a_real_transfer_backend(kv, monkeypatch):
     assert calls == []
 
 
+def test_the_compass_runner_accepts_no_transfer_config(monkeypatch):
+    """`{}` is ATOM's default: every run that sets no kv_transfer_config takes this."""
+    calls = []
+    monkeypatch.setattr(
+        forward_context, "set_kv_cache_data", lambda *a, **k: calls.append(a)
+    )
+    runner = object.__new__(NonAllocatingRunner)
+    runner.config = atom_config_double(kv_transfer_config={})
+    assert runner.allocate_kv_cache(100) is True
+    assert len(calls) == 1
+
+
 def test_nothing_is_announced_for_a_request_the_engine_did_not_suspend(
     geometry, seq_factory
 ):
