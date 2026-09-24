@@ -28,10 +28,19 @@ because a check whose limits are unstated gets read as a guarantee:
 * a name bound to the result of a call rather than to a name, since only a
   dotted name on the right of an assignment is followed;
 * scope: a name bound anywhere in the file is treated as bound everywhere in
-  it, so a local alias in one function is resolved in another.
+  it, so a local alias in one function is resolved in another;
+* **a clock handed around as a value rather than assigned to a name.** Only an
+  import and a plain assignment are followed, so a parameter default
+  (`def step(wall_clock=time.monotonic)`), a walrus, a tuple unpacking, a class
+  attribute read back through the class, a dict entry read back by subscript
+  and a `functools.partial` all carry the clock past this pass. They are one
+  class -- the callable is bound somewhere the parser does not follow and
+  called later -- and the parameter default is the form that appears in real
+  code, which is also why a bare attribute load is not treated as a read.
 
 Each of those is a read this pass would miss and a reviewer would not, which is
-the trade the pass is worth making and not a reason to trust it alone.
+the trade the pass is worth making and not a reason to trust it alone. The list
+is what has been tried against it, not an enumeration of what Python allows.
 
 **Pacing a loop is the same mistake and only one form of it is listed.**
 `asyncio.sleep` is flagged for that reason, and `time.sleep`,
@@ -57,9 +66,17 @@ from dataclasses import dataclass
 #: The calls that return real seconds. `asyncio.sleep` is here with the rest
 #: because pacing a loop against the machine's clock is the same mistake as
 #: reading it: the loop turns at a rate the modelled run does not know about.
-#: The `_ns` forms are the same three machine clocks in different units, and a
-#: number divided by a billion after the fact is not distinguishable from one
-#: taken in seconds, so they are listed beside them rather than under them.
+#: The `_ns` forms are the same machine clocks in different units, and a number
+#: divided by a billion after the fact is not distinguishable from one taken in
+#: seconds, so they are listed beside them rather than under them.
+#:
+#: **Every entry is the fully qualified name, because the comparison is exact.**
+#: A tail match would hand the whole list to any receiver whose attribute
+#: happens to be spelled the same -- `self.time.monotonic()`, `row.datetime.now()`,
+#: a `time` imported from somewhere that is not the standard library. The two
+#: `datetime` entries are written out to `datetime.datetime` for the same
+#: reason; `from datetime import datetime` resolves to exactly that, so the
+#: short spelling costs nothing and the long one cannot be reached by accident.
 CLOCK_READS = (
     "time.time",
     "time.time_ns",
@@ -67,7 +84,10 @@ CLOCK_READS = (
     "time.monotonic_ns",
     "time.perf_counter",
     "time.perf_counter_ns",
-    "datetime.now",
+    "time.clock_gettime",
+    "time.clock_gettime_ns",
+    "datetime.datetime.now",
+    "datetime.datetime.utcnow",
     "asyncio.sleep",
 )
 
@@ -122,7 +142,14 @@ class ClockSourceLint:
         return None
 
     def scan_source(self, source: str, path: str) -> tuple[ClockRead, ...]:
-        """Every real-clock read in one module's text, in line order."""
+        """Every real-clock read in one module's text, in line order.
+
+        A call counts when its resolved name is exactly an entry in the list.
+        Matching a tail instead would excuse nothing and accuse plenty: any
+        receiver whose attribute is spelled like a module would collect the
+        whole list, which is the same unanchored comparison the allow-list
+        above had and the same answer.
+        """
         if not self.enabled or self.allowed(path) is not None:
             return ()
         tree = ast.parse(source, filename=path)
@@ -136,7 +163,7 @@ class ClockSourceLint:
             if call is None:
                 continue
             for read in CLOCK_READS:
-                if call == read or call.endswith("." + read):
+                if call == read:
                     found.append(
                         ClockRead(
                             path, node.lineno, call, _scope_at(scopes, node.lineno)
