@@ -27,6 +27,8 @@ import ast
 import collections
 import pathlib
 import re
+from importlib.util import resolve_name
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import pytest
@@ -229,7 +231,7 @@ def _call_sites():
             )
             sites.setdefault(node.args[0].value, []).append(
                 Site(
-                    path.name,
+                    str(path.relative_to(REPO)),
                     node.lineno,
                     waits,
                     aggregated,
@@ -254,9 +256,21 @@ EXTENSION_CLASSES = {
 
 
 class Runner(NonAllocatingRunner):
-    """The overrides over a base that supplies only what they read."""
+    """The overrides over a base that supplies only what they read.
+
+    `config` is present rather than absent: the base sets it first thing in its
+    own `__init__`, so every override reads it, and a stub without one tests a
+    shape the class is never in.
+    """
 
     def __init__(self):
+        self.config = SimpleNamespace(
+            disagg_is_decode=False,
+            speculative_config=None,
+            eos_token_id=-1,
+            stop_token_ids=[],
+            pipeline_parallel_size=1,
+        )
         self.capture_sizes = [0]
         self.capture_sizes_np = "untouched"
 
@@ -487,7 +501,7 @@ def test_the_binding_module_refuses_rather_than_composing_a_hole():
     Executing the device means importing the composed class, which imports
     `ModelRunner`, which runs aiter's architecture probe and needs a driver.
     So this asserts the device is wired up and not that it fires correctly;
-    that it fires correctly is a GPU-tier observation, recorded in the PR.
+    that it fires correctly can only be observed with a driver present.
     What is checked here is the part that can drift silently: that the message
     partitions the missing names on `RPC_SURFACE` instead of telling one story
     about all twelve, since two of them are waited on by nobody.
@@ -538,7 +552,7 @@ def test_the_base_capture_reaches_a_device_before_it_reaches_the_model():
 
 def test_get_num_blocks_refuses_and_the_keys_its_caller_reads_are_named():
     site = SITES["get_num_blocks"][0]
-    tree = ast.parse((ENGINE / site.file).read_text())
+    tree = ast.parse((REPO / site.file).read_text())
     subscripts = [
         n
         for n in ast.walk(tree)
@@ -571,7 +585,10 @@ def test_get_num_blocks_refuses_and_the_keys_its_caller_reads_are_named():
         if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict)
     )
     assert required | optional == returned
-    with pytest.raises(RunnerRefusal, match="memory model"):
+    # The four keys are now forwarded from the base rather than described in a
+    # refusal, so what is left to check on this side is that the one path that
+    # answers nothing still names what would make it answer.
+    with pytest.raises(RunnerRefusal, match="install_device_readings"):
         Runner().get_num_blocks()
 
 
@@ -617,8 +634,8 @@ def test_forward_refuses_and_its_reply_is_one_object_read_for_nine_attributes():
     rename, fails here.
     """
     assert collections.Counter(s.file for s in SITES["forward"]) == {
-        "engine_core.py": 2,
-        "pp_engine_core.py": 2,
+        "atom/model_engine/engine_core.py": 2,
+        "atom/model_engine/pp_engine_core.py": 2,
     }
     assert {s.arity for s in SITES["forward"]} == {0, 1}
     engine = (ENGINE / "engine_core.py").read_text()
@@ -648,7 +665,7 @@ def test_forward_refuses_and_its_reply_is_one_object_read_for_nine_attributes():
         "num_bonus",
         "dspark_ell",
     }
-    with pytest.raises(RunnerRefusal):
+    with pytest.raises(RunnerRefusal, match="produces output"):
         Runner().forward(object())
 
 
@@ -799,9 +816,11 @@ def test_the_scan_looks_at_both_sides_of_the_reply():
 
     Naming files bounds the scan from below only, and every wider scope -- up
     to `atom/` itself, which is the scope this one replaced -- satisfies a
-    lower bound. The second assertion is the upper one: a package the reply
-    never reaches must sit outside every root, so a scan widened back over
-    `atom/compass` fails here instead of passing quietly.
+    lower bound. The second assertion is the upper one, and it is exact: the
+    roots are the engine and the runner package, each holding a
+    `model_runner.py` -- ATOM's, which produces the reply, and the Compass one
+    that stands in for it. A sibling added to the constant, `atom/compass/clock`
+    say, fails here instead of passing quietly.
     """
     scanned = {
         str(path.relative_to(REPO))
@@ -813,8 +832,7 @@ def test_the_scan_looks_at_both_sides_of_the_reply():
         "atom/compass/runner/overrides.py",
         "atom/compass/runner/model_runner.py",
     } <= scanned
-    spec = REPO / "atom" / "compass" / "spec"
-    assert not any(spec.is_relative_to(root) for root in REPLY_SURFACE)
+    assert set(REPLY_SURFACE) == {ENGINE, PACKAGE}
 
 
 def test_the_scan_still_catches_the_string_inside_the_runner_package(tmp_path):
@@ -827,14 +845,47 @@ def test_the_scan_still_catches_the_string_inside_the_runner_package(tmp_path):
 
 
 def test_the_scan_ignores_a_compass_package_the_reply_never_reaches(tmp_path):
-    """The half the whole-tree read got wrong, and the reason for this change.
+    """The half a read of the whole tree gets wrong.
 
     A module under `atom/compass` that the reply never touches may mention
     `trace_dir` -- in a comment, in a docstring, in a field name of its own --
-    without failing a test about the profiler reply.
+    without failing a test about the profiler reply. Nor may the scan read a
+    root of its own when handed none: every file contains the empty string,
+    and handed no roots it finds nothing. A root added only when roots are
+    handed in, or only for a non-empty needle, passes every test in this file.
     """
     roots = _fake_repo(tmp_path, {PRODUCER, "atom/compass/spec/reader.py"})
     assert _mentions(roots, "trace_dir", tmp_path) == {PRODUCER}
+    assert _mentions((), "") == set()
+
+
+@pytest.mark.parametrize("surface", [(), (ENGINE,), REPLY_SURFACE])
+def test_the_reply_assertion_scans_the_roots_the_constant_names(monkeypatch, surface):
+    """The tests above hold `REPLY_SURFACE`; this one holds its reader.
+
+    The scan is replaced by a spy that records the roots it is handed, and the
+    profiler-reply assertion runs with the constant set to `surface`: empty,
+    the engine alone, and the constant as it stands. The spy must see exactly
+    that surface each time. A root added beside the constant fails all three
+    runs, and the constant's two roots written out at the call site fail the
+    first two; a fallback for an empty constant fails the empty one; a root
+    that appears only when the constant is set, or one derived from every root
+    -- each root's parent, say -- fails the last two; one derived from the
+    Compass root alone -- its parent, all of `atom/compass` -- fails the last.
+    A scan that bypasses `_mentions` reaches the spy not at all. What passes is
+    any expression that is the identity at these three surfaces, the last of
+    which is the one the assertion runs at.
+    """
+    seen = []
+
+    def spy(roots, needle):
+        seen.append(roots)
+        return {"atom/model_engine/model_runner.py"}
+
+    monkeypatch.setitem(globals(), "REPLY_SURFACE", surface)
+    monkeypatch.setitem(globals(), "_mentions", spy)
+    test_the_profiler_replies_are_forwarded_whole_and_never_unpacked()
+    assert seen == [surface]
 
 
 def test_the_two_names_no_caller_waits_for_and_what_replying_costs():
@@ -877,7 +928,7 @@ def test_the_break_on_exit_is_a_sibling_of_the_per_runner_loop():
     reply -- a runner with no `exit` is skipped by the `getattr`, and the loop
     still breaks.
 
-    The landed assertion in
+    The assertion in
     `test_the_two_names_no_caller_waits_for_and_what_replying_costs` pins the
     same two lines as an exact string. That catches the break moving one level
     in, because its own indentation would change, but says nothing about what
@@ -915,16 +966,17 @@ def test_the_break_on_exit_is_a_sibling_of_the_per_runner_loop():
 def test_the_refusal_comment_says_the_loop_breaks_and_not_that_it_hangs():
     """The prose beside the refusal, held to the structure above.
 
-    This is the half the surface was missing. One commit landed the comment,
-    the package docstring and the string assertion above together, and the
-    comment said the opposite of that assertion: that an unanswered `exit`
-    means "the loop never breaks". Nothing failed, because nothing read the
-    prose. So the words are read here.
+    This is the half the surface was missing. The comment, the package
+    docstring's sentence about the surface and the string assertion above
+    were added together, and the comment said the opposite of that assertion:
+    that an unanswered `exit` means "the loop never breaks". Nothing failed,
+    because nothing read the prose. So the words are read here.
 
-    `never breaks` in any spelling is the claim that was wrong. The three
-    phrases required are the three findings of the structure test -- that it
-    breaks, what the `if` is a sibling of, and that it tests a name rather
-    than a reply -- so prose and source now fail together.
+    `never breaks` is the claim that was wrong. It is refused as that
+    lower-case phrase, including where a comment line wraps between the two
+    words. The three phrases required are the three findings of the structure
+    test -- that it breaks, what the `if` is a sibling of, and that it tests a
+    name rather than a reply -- so prose and source now fail together.
     """
     comment = _refusal_comment()
     assert "The loop breaks either way" in comment
@@ -936,8 +988,8 @@ def test_the_refusal_comment_says_the_loop_breaks_and_not_that_it_hangs():
 def test_what_the_comment_says_a_hole_at_exit_loses_is_what_exit_does():
     """Each loss the comment names, against `ModelRunner.exit`'s own body.
 
-    The comment is the only place in this package that says what shutdown
-    fails to release, and it says it about ATOM's code rather than about this
+    The comment is what this test holds against `ModelRunner.exit`'s body: it
+    says what shutdown fails to release about ATOM's code rather than this
     package's, so it drifts whenever `exit` is edited. It also states which of
     those losses is empty here -- the five KV deletions are `hasattr`-guarded
     and this runner allocates no KV tensor, so they find nothing. The guard is
@@ -1096,33 +1148,79 @@ def test_the_zero_block_form_in_the_tree_answers_two_of_the_four_keys():
 
 
 # --- the package docstring, read against the table it describes --------------
+#
+# What is read here is what the docstring states through tokens the tree can
+# check: bullet leads, the `file.py:NN` citations under each lead, a module
+# count, and the engine names, functions and paths each module's bullet cites.
+# The sentences between them are not read. Which half of the table parks its
+# caller, and whether an engine import sits at module scope, differ from their
+# false forms only in wording, and asserting wording is not a check on what the
+# wording claims. Which function holds which engine name is not read either: a
+# bullet is held to the union of the names and the functions they are imported
+# in, not to the pairs. Nor is an engine module loaded through `__import__`,
+# which is a call and not an import statement.
+
+CITATION = r"`([a-z_]+\.py:\d+)`"
+# Words from two up: a split needs two, so "the one module here" is no count.
+COUNT_WORDS = ("two", "three", "four", "five", "six", "seven", "eight", "nine")
 
 
-def _bullet_leads(doc):
-    """The backticked name each top-level bullet of *doc* opens with.
+def _bullets(doc):
+    """Each top-level bullet of *doc*, keyed by the backticked name it opens with.
 
     The package docstring carries two bullet lists -- the modules it splits and
     the dispatched names no caller waits for -- and every entry of both opens
     with one backticked identifier. Reading the leads rather than searching the
     whole text is what lets the two lists be checked separately, and it is also
     what keeps an incidental mention from counting: `forward` is named in the
-    prose of a module bullet and is not an entry of either list.
+    prose of a module bullet and is not an entry of either list. A bullet's
+    text runs through the lines indented under it, so what it says is read as
+    that entry's and not as the whole docstring's.
     """
-    return set(re.findall(r"^- `([A-Za-z_][A-Za-z0-9_]*)`", doc, flags=re.MULTILINE))
+    pattern = r"^- `([A-Za-z_][A-Za-z0-9_]*)`(.*(?:\n  .*)*)"
+    return dict(re.findall(pattern, doc, flags=re.MULTILINE))
+
+
+def _modules():
+    """The package's own modules: its `.py` files and its subpackage directories."""
+    return {
+        p.stem
+        for p in PACKAGE.iterdir()
+        if p.suffix == ".py" or (p.is_dir() and any(p.rglob("*.py")))
+    } - {"__init__"}
+
+
+def _stated_module_counts(doc):
+    """Every count *doc* puts before "module(s)": a digit, or a word from two up."""
+    words = re.findall(rf"(?i)\b(\d+|{'|'.join(COUNT_WORDS)})\s+modules?\b", doc)
+    return [int(w) if w.isdigit() else COUNT_WORDS.index(w.lower()) + 2 for w in words]
 
 
 def test_the_package_docstring_lists_every_module_beside_it():
-    """The split it describes has to be over the package's own files.
+    """The split it describes has to be over the package's own modules.
 
     The docstring said "Two modules" for as long as there were three:
-    `step_output` landed a PR after the sentence was written, and nothing went
+    `step_output` was added after the sentence was written, and nothing went
     red, because a count in prose has nothing to disagree with. So the bullets
     are compared against the directory instead of against a number, and the
-    next module either appears in them or fails here.
+    next module either appears in them or fails here -- including one that
+    arrives as a subpackage directory rather than as a `.py` file.
     """
-    modules = {p.stem for p in PACKAGE.glob("*.py")} - {"__init__"}
-    assert "step_output" in modules, "the glob found no package to compare against"
-    assert _bullet_leads(PACKAGE_DOC) - set(RPC_SURFACE) == modules
+    modules = _modules()
+    assert "step_output" in modules, "the walk found no package to compare against"
+    assert set(_bullets(PACKAGE_DOC)) - set(RPC_SURFACE) == modules
+
+
+def test_a_module_count_the_package_docstring_states_is_the_packages():
+    """A count in prose, given the directory to disagree with.
+
+    The docstring states no count today, and need not. Where it does state one,
+    it is the number of modules the package holds, so "Two modules" put back
+    above three bullets fails here rather than reading as true.
+    """
+    assert _stated_module_counts("Two modules; eight\n modules; one module") == [2, 8]
+    for stated in _stated_module_counts(PACKAGE_DOC):
+        assert stated == len(_modules()), f"the docstring says {stated} modules"
 
 
 def test_the_package_docstring_partitions_the_surface_the_way_the_table_does():
@@ -1144,7 +1242,11 @@ def test_the_package_docstring_partitions_the_surface_the_way_the_table_does():
     """
     assert UNWAITED, "a table with nothing unwaited would pass the partition trivially"
     assert UNWAITED != set(RPC_SURFACE), "and so would a table with nothing waited"
-    assert _bullet_leads(PACKAGE_DOC) & set(RPC_SURFACE) == UNWAITED
+    assert set(_bullets(PACKAGE_DOC)) & set(RPC_SURFACE) == UNWAITED
+
+
+def _cite(s):  # the docstring cites paths under atom/model_engine/
+    return f"{s.file.removeprefix('atom/model_engine/')}:{s.line}"
 
 
 def test_every_site_the_package_docstring_cites_is_one_no_caller_waits_for():
@@ -1157,8 +1259,70 @@ def test_every_site_the_package_docstring_cites_is_one_no_caller_waits_for():
     second site that appears, is uncited; a site that starts passing
     `wait_out=True`, or a name that leaves the unwaited half, is cited and
     should not be.
+
+    The union alone does not say which name a site belongs to: two bullets
+    with their bodies swapped cite the same six sites between them. So each
+    bullet's citations are also held to its own name's sites.
     """
-    cited = set(re.findall(r"`([a-z_]+\.py:\d+)`", PACKAGE_DOC))
     sites = [s for name in UNWAITED for s in SITES[name]]
     assert [s for s in sites if s.waits] == []
-    assert cited == {f"{s.file}:{s.line}" for s in sites}
+    assert set(re.findall(CITATION, PACKAGE_DOC)) == {_cite(s) for s in sites}
+    bullets = _bullets(PACKAGE_DOC)
+    assert {n: set(re.findall(CITATION, bullets.get(n, ""))) for n in UNWAITED} == {
+        n: {_cite(s) for s in SITES[n]} for n in UNWAITED
+    }
+
+
+def test_a_site_in_a_same_named_file_elsewhere_is_not_a_cited_one():
+    """A cited site moved outside `atom/model_engine/` is no longer cited.
+
+    Only that prefix is stripped, so the moved site keeps a `/` that no
+    citation matches. A base name, or any `atom/<pkg>/` stripped, would match.
+    """
+    site = next(s for n in UNWAITED for s in SITES[n])
+    moved = site._replace(file=f"atom/diffusion/{pathlib.Path(site.file).name}")
+    cited = set(re.findall(CITATION, PACKAGE_DOC))
+    assert _cite(site) in cited
+    assert _cite(moved) not in cited
+
+
+def _imported(node, alias):
+    """The absolute module an import names, relative spellings resolved.
+
+    The alias is joined on only when the module is not itself in the engine,
+    so `from atom import model_engine` reads as `atom.model_engine`.
+    """
+    if isinstance(node, ast.Import):
+        return alias.name
+    module = resolve_name("." * node.level + (node.module or ""), "atom.compass.runner")
+    engine = module.startswith("atom.model_engine")
+    return module if engine else f"{module}.{alias.name}"
+
+
+def _engine_imports(mod):
+    """(name bound, engine module, enclosing function) for each engine import."""
+    tree = ast.parse((PACKAGE / f"{mod}.py").read_text())
+    scope = {
+        c: f.name
+        for f in ast.walk(tree)
+        if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for c in ast.walk(f)
+    }
+    return [
+        (a.asname or a.name, _imported(n, a), scope.get(n))
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.Import, ast.ImportFrom))
+        for a in n.names
+        if _imported(n, a).startswith("atom.model_engine")
+    ]
+
+
+@pytest.mark.parametrize("mod", ["overrides", "step_output", "model_runner"])
+def test_a_module_bullet_cites_the_engine_imports_its_module_makes(mod):
+    """A module bullet cites every engine import its module makes, and no other."""
+    cited = set(re.findall(r"`([^`]+)`", _bullets(PACKAGE_DOC)[mod]))
+    imports = _engine_imports(mod)
+    missing = [i for i in imports if not {i[0], i[2] or i[0]} <= cited]
+    assert missing == [], f"the {mod} bullet omits {missing}"
+    named = {c for c in cited if c.startswith("atom.model_engine")}
+    assert named <= {i[1] for i in imports}, f"the {mod} bullet names {named}"

@@ -248,9 +248,9 @@ def test_a_field_stated_twice_is_refused_by_name(dotted_first):
 
 
 def test_both_orders_give_the_same_refusal():
-    # The named result. Order decided which value survived, so nothing in the
-    # message may depend on which spelling the mapping yielded first -- and a
-    # message that named the value it kept would.
+    # Order decided which value survived, so nothing in the message may depend
+    # on which spelling the mapping yielded first -- and a message that named
+    # the value it kept would.
     dotted_first = refusal_from(both_spellings(True))
     nested_first = refusal_from(both_spellings(False))
     assert dotted_first.rule is nested_first.rule
@@ -314,10 +314,10 @@ def test_a_dotted_key_on_its_own_is_a_supported_spelling():
 
 
 def test_a_later_document_is_told_this_reader_is_old():
-    # The named result for the version. A v2 document carries what v2 added;
-    # the schema is closed, so a version checked after the fields lets the
-    # closed schema speak first and tells the author their new field is
-    # illegitimate, in the one case where this reader is what is out of date.
+    # A v2 document carries what v2 added; the schema is closed, so a version
+    # checked after the fields lets the closed schema speak first and tells the
+    # author their new field is illegitimate, in the one case where this reader
+    # is what is out of date.
     later = document()
     later["schema_version"] = 2
     later["device"]["power_cap_watts"] = 700
@@ -394,7 +394,6 @@ BREAKAGES = {
     "one field written under two spellings": lambda: both_spellings(True),
 }
 
-
 #: The same rule named by the verbs other than the reader, each driven through
 #: the verb that declines. Not part of the edit-then-read claim below, which is
 #: about what this reader goes on to read; here only so the partition covers
@@ -402,8 +401,22 @@ BREAKAGES = {
 ELSEWHERE = {
     "a fragment that is not a mapping": lambda: Fragment.from_mapping([1, 2], "p"),
     "a subject to check that is not a mapping": lambda: validate([1, 2]).raise_first(),
-    "a term the spec carries nothing under": lambda: explain(read(), "no_such_term"),
 }
+
+
+def _spec_modules():
+    # The one walk over the package: every check below that reads its source
+    # takes its modules from here, so no two of them can disagree about which
+    # modules exist. Recursive, so a module added under a subpackage is read
+    # the day it lands.
+    return sorted(PACKAGE.rglob("*.py"))
+
+
+def _named(path):
+    # A site's file, relative to the package, so `sub/machine.py` is not
+    # `machine.py`. A module loaded from outside the package walked here
+    # refuses rather than being compared under a name that happens to match.
+    return pathlib.Path(path).resolve().relative_to(PACKAGE).as_posix()
 
 
 def _site_of(declines):
@@ -420,7 +433,7 @@ def _site_of(declines):
     def recording(refusal, *args):
         caller = sys._getframe(1)
         built[id(refusal)] = (
-            pathlib.Path(caller.f_code.co_filename).name,
+            _named(caller.f_code.co_filename),
             caller.f_lineno,
         )
         init(refusal, *args)
@@ -462,7 +475,7 @@ def _refusal_sites():
     site keeps the rule the first scope holding it resolved.
     """
     found = {}
-    for source in sorted(PACKAGE.glob("*.py")):
+    for source in _spec_modules():
         module = ast.parse(source.read_text())
         functions = [
             scope
@@ -481,7 +494,7 @@ def _refusal_sites():
                 if _is_refusal(node):
                     named = ast.unparse(node.args[0])
                     found.setdefault(
-                        (source.name, node.lineno), bound.get(named, named)
+                        (_named(source), node.lineno), bound.get(named, named)
                     )
     return found
 
@@ -498,7 +511,7 @@ def _mentions_the_walk_cannot_follow():
     as `type(refusal)(...)`, is past what reading the source can see.
     """
     found = []
-    for source in sorted(PACKAGE.glob("*.py")):
+    for source in _spec_modules():
         lines = source.read_text().splitlines()
         module = ast.parse("\n".join(lines))
         harmless = set()
@@ -531,7 +544,7 @@ def _mentions_the_walk_cannot_follow():
                 continue
             if mentioned:
                 found.append(
-                    f"{source.name}:{node.lineno}: {lines[node.lineno - 1].strip()}"
+                    f"{_named(source)}:{node.lineno}: {lines[node.lineno - 1].strip()}"
                 )
     return found
 
@@ -544,7 +557,7 @@ def _built_where_thrown():
     there, so it is not a site.
     """
     found = set()
-    for source in sorted(PACKAGE.glob("*.py")):
+    for source in _spec_modules():
         for node in ast.walk(ast.parse(source.read_text())):
             if isinstance(node, ast.Raise):
                 thrown = node.exc
@@ -553,7 +566,7 @@ def _built_where_thrown():
             else:
                 continue
             if isinstance(thrown, ast.Call):
-                found.add((source.name, thrown.lineno))
+                found.add((_named(source), thrown.lineno))
     return found
 
 
@@ -589,6 +602,21 @@ def test_every_refusal_site_in_the_package_resolves_to_a_rule():
     assert thrown <= set(_refusal_sites())
 
 
+def test_every_rule_is_named_by_at_least_one_site():
+    # The checks on a rule are written over the sites that name it, so a rule
+    # no site names passes every one of them by having nothing to check. A
+    # member is kept only if some refusal the package builds names it, whether
+    # inline or through the local it picks its rule from.
+    named = {
+        node.attr
+        for rule in _refusal_sites().values()
+        for node in ast.walk(ast.parse(rule, mode="eval"))
+        if isinstance(node, ast.Attribute) and getattr(node.value, "id", None) == "Rule"
+    }
+    assert named
+    assert [member.name for member in Rule if member.name not in named] == []
+
+
 def test_every_site_that_declines_a_document_is_driven_here():
     # A table written by hand that quietly covers six of seven sites passes for
     # a reason nobody stated, so the set is read out of the package's source
@@ -599,6 +627,19 @@ def test_every_site_that_declines_a_document_is_driven_here():
         for make in BREAKAGES.values()
     } | {_site_of(declines) for declines in ELSEWHERE.values()}
     assert driven == _sites_naming("SHAPE")
+
+
+def test_explain_declines_an_unknown_term_and_an_absent_one_at_two_sites():
+    # Neither is a document to correct, so neither is a shape. A term the
+    # schema does not know is re-asked by path; a declared field this spec
+    # does not state would come back empty under any spelling, so it is the
+    # absent-field refusal the accessor gives, and not a second copy of it.
+    unknown = _site_of(lambda: explain(read(), "no_such_term"))
+    absent = _site_of(lambda: explain(read(), "provenance.notes"))
+    assert unknown[0] == "explain.py" and unknown in _sites_naming("ADDRESSING")
+    assert absent == _site_of(lambda: read().value("provenance.notes"))
+    assert absent in _sites_naming("TOTALITY")
+    assert not {unknown, absent} & _sites_naming("SHAPE")
 
 
 def test_the_version_is_the_one_site_that_is_not_about_the_document():
@@ -618,8 +659,8 @@ def test_a_shape_refusal_asks_for_an_edit_this_reader_then_reads(breakage):
 
 
 def test_the_version_refusal_asks_for_a_newer_reader_and_says_so():
-    # The named result, and what it asserts is the member and the action. A
-    # count of members would pass the next time somebody adds one.
+    # What this asserts is the member and the action. A count of members would
+    # pass the next time somebody adds one.
     refusal = refusal_from(document(schema_version=2))
     assert refusal.rule is Rule.VERSION
     assert refusal.rule is not Rule.SHAPE
@@ -717,6 +758,15 @@ ENGINE_SURFACE = _engine_argument_names()
 
 def test_the_engine_argument_surface_was_found():
     assert len(ENGINE_SURFACE) > 20
+
+
+def test_the_deployment_knobs_are_the_nine_the_list_is_pinned_to_hold():
+    # Two tests below are parametrised over this list, so emptying it makes them
+    # collect nothing and skip. The list may legitimately shrink, even to
+    # nothing: the closed schema refuses these keys without it, and it only
+    # adds where ATOM configures each. So the count is pinned rather than
+    # asserted non-empty, and every change to it is an edit made here too.
+    assert len(DEPLOYMENT_OWNED) == 9, sorted(DEPLOYMENT_OWNED)
 
 
 @pytest.mark.parametrize("knob", sorted(DEPLOYMENT_OWNED))
@@ -875,8 +925,8 @@ def test_a_missing_stack_pin_is_refused():
 
 
 def test_two_models_sharing_one_tokenizer_resolve_to_one_entry():
-    # The named result. Two architectures, one measured entry: four rates and a
-    # derate stored once. Keyed by model the same spec would hold one copy per
+    # Two architectures, one measured entry: four rates and a derate stored
+    # once. Keyed by model the same spec would hold one copy per
     # architecture -- two here, more in a real family -- with nothing in the
     # document ever comparing them, so they would drift silently.
     machine = read()
@@ -1114,8 +1164,8 @@ def test_a_block_is_refused_as_a_block_and_names_what_it_groups():
 
 
 def test_the_three_refusals_are_not_interchangeable():
-    # The named result. Swap any two messages and this fails; match a substring
-    # they share and it would not.
+    # Swap any two messages and this fails; match a substring they share and it
+    # would not.
     unknown = refused(read(), UNDECLARED)
     absent = refused(without(ABSENT), ABSENT)
     block = refused(read(), BLOCK)
@@ -1166,16 +1216,11 @@ def test_the_other_accessors_decline_on_a_fragment_rather_than_raise():
 # --- what the package reaches ------------------------------------------------
 
 
-def _spec_modules():
-    # rglob, so a module added under the package is covered the day it lands.
-    return sorted(PACKAGE.rglob("*.py"))
-
-
 def test_the_package_was_found():
     assert _spec_modules(), f"no modules under {PACKAGE}"
 
 
-@pytest.mark.parametrize("module", _spec_modules(), ids=lambda p: p.name)
+@pytest.mark.parametrize("module", _spec_modules(), ids=_named)
 def test_the_package_imports_only_the_standard_library_it_names(module):
     # An allowlist of what the package actually imports. The claim kept is that
     # a spec can be authored and checked on any machine: no device runtime, no
@@ -1202,9 +1247,13 @@ def test_the_package_imports_only_the_standard_library_it_names(module):
         elif isinstance(node, ast.ImportFrom) and not node.level:
             roots.append((node.module or "").split(".")[0])
     strays = sorted({root for root in roots if root not in allowed})
-    assert not strays, f"{module.name} imports {strays}; allowed: {sorted(allowed)}"
+    assert not strays, f"{_named(module)} imports {strays}; allowed: {sorted(allowed)}"
 
 
 def test_everything_the_package_exports_is_reachable_by_name():
+    # An empty list would let the loop pass having checked nothing, with no
+    # count moving. The package exists to re-export its modules' names and this
+    # file imports them from it, so exporting none is never a legitimate state.
+    assert spec_package.__all__, "atom.compass.spec declares no exports"
     for name in spec_package.__all__:
         assert getattr(spec_package, name, None) is not None, name

@@ -14,8 +14,16 @@ and decline to do their work. The rest run afterwards, over the worker's RPC
 channel; `allocate_kv_cache` does the arithmetic and none of the allocation,
 `capture_cudagraph` captures nothing and says so in the shape its caller
 unpacks, `forward` reports what a step produced without running one, and
-`get_num_blocks` refuses by name because its answer is not this module's to
-invent -- a wrong block count would be indistinguishable from a measured one.
+`get_num_blocks` runs ATOM's own budget arithmetic against readings taken off a
+machine spec instead of off a card.
+
+That last one replaces no arithmetic, and the two methods beside it are the
+reason it does not have to. `ModelRunner.get_num_blocks` touches the device in
+exactly two calls -- `_read_device_memory` and `_estimate_cudagraph_overhead`
+-- and both are override points, so replacing them leaves every line of the
+budget formula, the clamp and `plan_pools` to run unchanged. A second copy of
+that formula would drift from it with no test failing; a substituted reading
+cannot.
 
 Order matters when mixing this in: `NonAllocatingRunner` must precede
 `ModelRunner` in the bases so these definitions win. The class deliberately
@@ -79,6 +87,7 @@ from typing import Any
 
 import torch
 
+from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
 from atom.compass.runner.step_output import (
     DeferredTokenStream,
     reported_token_id,
@@ -101,14 +110,14 @@ logger = logging.getLogger(__name__)
 # so, and it is load-bearing. Fourteen dispatched names are absent from this
 # table because `ModelRunner` does not define them -- seven belong to
 # `RapidServeModelRunner`, seven to the rollout extension. The rollout seven are
-# unreachable here. The RapidServe seven are not: `enable_rapidserve` picks
-# `PrefillEngineCore` / `DecodeEngineCore` (`llm_engine.py:140`), those classes
-# broadcast all seven with `wait_out=True`, and that broadcast never consults
-# `runner_qualname`, while the substitution that would install a RapidServe
-# runner (`config.py:1729-1736`) fires only while `runner_qualname` is still
-# ATOM's default -- which Compass overwrites. `enable_rapidserve=True` with this
-# runner is therefore seven silent parks on names this table deliberately
-# excludes. Tracked as issue #98; not closed here.
+# unreachable here. The RapidServe seven are kept out by `Config`, not by this
+# module: `enable_rapidserve` picks `PrefillEngineCore` / `DecodeEngineCore`
+# (`llm_engine.py:140`), those classes broadcast all seven with `wait_out=True`
+# without consulting `runner_qualname`, and the substitution that installs a
+# RapidServe runner (`config.py:1730-1736`) fires only while `runner_qualname`
+# is still ATOM's default -- which Compass overwrites. `Config` therefore raises
+# `ValueError` for `enable_rapidserve=True` with any runner not in
+# `RAPIDSERVE_RUNNERS`, this one included.
 #
 # Also outside the table, and outside anything a broadcast-derived enumeration
 # can see: three of these twelve are called in-process on the runner itself,
@@ -156,6 +165,56 @@ class RunnerRefusal(RuntimeError):
     """Raised where this runner has no answer and will not invent one."""
 
 
+def install_device_readings(runner: Any, readings: DeviceReadings) -> None:
+    """Give a runner the readings its KV budget will be computed from.
+
+    Set on the instance rather than taken in an `__init__`, because the base
+    class runs the whole of its own before a subclass body would get control.
+    It is a function rather than a method so that every method on
+    `NonAllocatingRunner` is a replacement for one of ATOM's, which is a
+    property the tests check rather than a preference.
+
+    Reading a machine spec off a flag or a config field, and building the
+    readings from it, is the configuration surface's job and is not wired yet.
+    Until it is, whoever has the spec installs the readings here, and
+    `get_num_blocks` refuses by name in the meantime rather than sizing a pool
+    from nothing.
+    """
+    if not isinstance(readings, DeviceReadings):
+        raise RunnerRefusal(
+            "the KV budget is sized from the five substituted readings, and "
+            f"{type(readings).__name__} is not them; install what "
+            "`atom.compass.memory.device_readings` returned for this width"
+        )
+    runner.compass_readings = readings
+
+
+def _installed_readings(runner: Any) -> DeviceReadings:
+    """The installed readings, or a refusal that says what would supply them."""
+    readings = getattr(runner, "compass_readings", None)
+    if readings is None:
+        raise RunnerRefusal(
+            "no device readings are installed on this runner, so there is "
+            "nothing for ATOM's KV budget arithmetic to run against; call "
+            "`install_device_readings` with what "
+            "`atom.compass.memory.device_readings` produced from a machine "
+            "spec before the engine asks this worker for a block count."
+        )
+    return readings
+
+
+def _config_field(runner: Any, name: str) -> Any:
+    """A config field read with no default; a missing one is refused by name."""
+    try:
+        return getattr(runner.config, name)
+    except AttributeError:
+        raise RunnerRefusal(
+            f"ATOM's config has no field {name!r}; this runner reads it with "
+            "no default, so a config that lacks it is refused by name rather "
+            "than read as if the field were unset."
+        ) from None
+
+
 class UnbuiltModel(torch.nn.Module):
     """Stands in for the module tree a non-allocating runner never builds.
 
@@ -185,12 +244,28 @@ class NonAllocatingRunner:
         The base class constructs the model with the default device set to this
         rank's GPU and then fills it from disk. Both halves are skipped here, so
         no weight byte reaches the device and no checkpoint is read.
+
+        A speculative config is refused here, because on the last pipeline rank
+        the base goes on to build the drafter on this rank's GPU and load its
+        checkpoint. On any rank, it cannot be modelled: a predicted step's reply has
+        `draft_token_ids` None and zero `num_rejected`/`num_bonus`, which the
+        scheduler accepts as a step that drafted nothing (`scheduler.py:2579`
+        never fills `seq.spec_token_ids`, and `:2521-2522` reads the zeros), so
+        a caller that asked for speculation would get a prediction with it off
+        and no error.
         """
         self.model = UnbuiltModel(model_class)
         # Cleared on the way out, as both of ATOM's own implementations do: the
         # caller set the default device to this rank's GPU before calling, and
         # the code that runs next is written against a cleared default.
         torch.set_default_device(None)
+        if _config_field(self, "speculative_config") is not None:
+            raise RunnerRefusal(
+                "a predicted step drafts no tokens, so reporting one under a "
+                "speculative config would model speculation as off and say "
+                "nothing about it; speculative decoding has no step semantics "
+                "here yet."
+            )
         logger.info(
             "%s not built and no checkpoint read; no weight bytes on the device.",
             self.model.model_class_name,
@@ -207,34 +282,133 @@ class NonAllocatingRunner:
         """
         return
 
-    def get_num_blocks(self) -> dict[str, object]:
-        """Refuse to size the KV pool.
+    def _read_device_memory(self) -> Any:
+        """Answer the four device figures off the machine spec.
 
-        The base sizes it from what a real device reports free after the weights
-        are resident. Neither figure exists here, and the substitute belongs to
-        the memory model rather than to the runner, so answering would mean
-        inventing a block count that the scheduler would then treat as measured.
+        ATOM's own reads this rank's allocator and the driver. These four come
+        from the device model instead, so every line of budget arithmetic below
+        the call runs unchanged against a card this host does not have -- which
+        is the whole of the substitution, and the reason no formula is copied
+        anywhere in this package.
 
-        Whoever supplies that count answers a dict, and `engine_core.py:132-141`
-        fixes its four keys: `num_kvcache_blocks` (`:133`) and `state_runtime`
-        (`:141`) are subscripted, `pool_entries` (`:139`) and
-        `pool_entries_per_req` (`:140`) are taken with a `{}` default. The block
-        count goes on to `BlockManager`, which asserts it is greater than zero
-        (`block_manager.py:78`).
-
-        `state_runtime` is not an opaque value. `:141` hands it to
-        `StateRuntime.from_wire` (`state_runtime.py:159-166`), which raises
-        `TypeError` unless it is a `Mapping` and `ValueError` unless its key set
-        is exactly `{"transfer", "checkpoint_spec"}`. The fourth value is a
-        two-key nested wire dict, and a successor who builds a four-key dict
-        with anything else under that key gets a `ValueError` in the parent on
-        the first RPC of the engine's life.
+        The named tuple is ATOM's, imported at call time so this module stays
+        importable where there is no driver, and built by keyword: four
+        same-typed integers handed over positionally are a reordering nobody
+        would see.
         """
-        raise RunnerRefusal(
-            "a non-allocating runner cannot size the KV pool from a device it "
-            "never allocated on; the block count has to come from a memory model "
-            "this runner has not been given."
+        from atom.model_engine.model_runner import DeviceMemoryReadings
+
+        readings = _installed_readings(self)
+        return DeviceMemoryReadings(
+            free=readings.free.total,
+            total=readings.total.total,
+            peak_torch=readings.peak_torch.total,
+            non_torch=readings.non_torch.total,
         )
+
+    def _estimate_cudagraph_overhead(self) -> int:
+        """The graph-pool bytes the budget holds back, off the machine spec.
+
+        ATOM's own derives this from the gap between the allocator's warmup
+        peak and its steady state, which is two more device reads, so it is the
+        second of the two places `get_num_blocks` touches the device and the
+        second thing replaced here.
+
+        The reading installed for it is the one `memory.graph_pool.reserves()`
+        produces -- the mirror of ATOM's estimator rather than the measured
+        pool, because this is the number that actually reserves and the two
+        disagree; `memory.device_readings` refuses the other one by name at the
+        call site. Two adjustments inside ATOM's estimator are not mirrored and
+        move the block count in opposite directions, and `reserves()`' own
+        docstring names both. Both need a drafter, and this runner never has
+        one: `_build_and_load_model` refuses a speculative config before the
+        base can build a drafter, so construction fails before
+        `get_num_blocks` can run.
+
+        `enforce_eager` is reconciled here rather than trusted. ATOM's own
+        returns zero under that flag (`model_runner.py:1570-1571`) and this
+        returns whatever was installed, so correctness would otherwise rest on
+        whoever built the reading having passed the same flag this runner is
+        configured with. A reading built for a capturing deployment, installed
+        on a runner told not to capture, holds back bytes ATOM would not and
+        moves the block count with nothing to show for it. The eager branch
+        names the config field as the source of its only term, so the reading
+        says which deployment it was built for and a disagreement declines.
+        """
+        reading = _installed_readings(self).cudagraph_overhead
+        built_eager = any(term.source == EAGER_SOURCE for term in reading.terms)
+        configured_eager = bool(_config_field(self, "enforce_eager"))
+        if built_eager != configured_eager:
+            raise RunnerRefusal(
+                "the installed graph-pool reading was built for a deployment "
+                f"with enforce_eager={built_eager} and this runner is "
+                f"configured with enforce_eager={configured_eager}; ATOM "
+                "reserves nothing for a graph it never captures, so one of "
+                "the two would move the block count by the whole of the "
+                "reservation without saying so."
+            )
+        return reading.total
+
+    def get_num_blocks(self) -> dict[str, object]:
+        """Size the KV pool with ATOM's own arithmetic over substituted readings.
+
+        The base method is readings and then arithmetic: the utilisation
+        budget, the 2% safety margin, `_kv_budget_extra_reserve`, the
+        `min(budget, free)` clamp, `plan_pools`, and under pipeline parallelism
+        a minimum across stages. None of that is replaced, and none of it is
+        written down anywhere in this package. The two methods above are, and
+        `super()` does the rest.
+
+        The reply is the base's, forwarded unaltered, and
+        `engine_core.py:132-141` fixes its four keys: `num_kvcache_blocks`
+        (`:133`) and `state_runtime` (`:141`) are subscripted, `pool_entries`
+        (`:139`) and `pool_entries_per_req` (`:140`) are taken with a `{}`
+        default. The block count goes on to `BlockManager`, which asserts it is
+        greater than zero (`block_manager.py:78`); the base asserts the same
+        thing first and prints the whole budget with it. `state_runtime` is not
+        an opaque value: `:141` hands it to `StateRuntime.from_wire`
+        (`state_runtime.py:159-166`), which raises `TypeError` unless it is a
+        `Mapping` and `ValueError` unless its key set is exactly
+        `{"transfer", "checkpoint_spec"}`. Building that dict here instead of
+        forwarding the base's would put all of those failures on the first RPC
+        of the engine's life, so it is not built here.
+
+        What this adds is one record and no arithmetic. The count the scheduler
+        receives is an integer with nothing attached, and most of what produced
+        it is a coefficient somebody wrote down rather than a measurement of
+        the card being modelled; `kv_pool_sizing` keeps the count beside the
+        readings, so which terms those were is recoverable from the runner and
+        not only from a log line somebody kept.
+
+        The decode process of intra-GPU prefill/decode disaggregation is
+        refused rather than sized. ATOM's own runner for that answers a block
+        count of zero there, because decode imports the pool from prefill and
+        owns no device memory (`model_runner.py:4272-4286`), and it holds back
+        four safety margins on the prefill side because two processes share the
+        card (`:4266-4270`). Substituting readings into the base method reaches
+        neither: this path would hand a decode process a pool it does not own.
+        The base's `_kv_budget_extra_reserve` of zero is left alone for the
+        same reason it is right -- the card these readings describe is a
+        dedicated one, and a shared-card reservation would hold bytes back for a
+        second tenant that those readings do not have.
+        """
+        if _config_field(self, "disagg_is_decode"):
+            raise RunnerRefusal(
+                "this runner does not model the decode process of intra-GPU "
+                "prefill/decode disaggregation: that process owns no device "
+                "memory and imports the pool from prefill, so its block count "
+                "is zero rather than a sizing, and the substituted readings "
+                "describe a card with one tenant on it."
+            )
+        readings = _installed_readings(self)
+        reply = super().get_num_blocks()
+        self.kv_pool_sizing = SizedKVPool(
+            num_kvcache_blocks=int(reply["num_kvcache_blocks"]),
+            entries=dict(reply["pool_entries"]),
+            readings=readings,
+        )
+        logger.info("%s", self.kv_pool_sizing.table())
+        return reply
 
     def allocate_kv_cache(self, num_kvcache_blocks: int) -> bool:
         """Record the block count and allocate nothing.
@@ -242,7 +416,24 @@ class NonAllocatingRunner:
         The block accounting above this -- the pool, the prefix index, eviction,
         preemption -- is integer arithmetic and runs unmodified against the count
         recorded here. Only the tensors behind the blocks are absent.
+
+        An empty registry still goes through ATOM's `set_kv_cache_data`: it is
+        the one call that builds the worker-side KV connector, without which no
+        transfer the scheduler announces ever starts or finishes.
         """
+        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+        from atom.utils.forward_context import set_kv_cache_data
+
+        kv = getattr(self.config, "kv_transfer_config", None)
+        if kv:
+            name = KVConnectorFactory.canonical_name(kv.get("kv_connector", "moriio"))
+            if name != "compass":
+                raise RunnerRefusal(
+                    f"kv_connector {name!r} is a real transfer backend; this "
+                    "runner simulates only 'compass', and an unset kv_connector "
+                    "means 'moriio'."
+                )
+        set_kv_cache_data({}, self.config, num_blocks=num_kvcache_blocks)
         self.config.num_kvcache_blocks = num_kvcache_blocks
         logger.info(
             "kv cache: %d blocks accounted, 0 bytes allocated.",
@@ -270,7 +461,7 @@ class NonAllocatingRunner:
         attention metadata builder reads them on every step. The reply
         deliberately disagrees with the attribute it preserves: the base sends
         `self.capture_sizes` -- the same `[0]` -- as the second element
-        (`model_runner.py:4085`), and this sends `[]`. Both are only ever
+        (`model_runner.py:4112`), and this sends `[]`. Both are only ever
         formatted into a log line, and `[]` is the truthful one.
 
         `engine_core.py:148` reaches this method only when `not enforce_eager
@@ -334,16 +525,6 @@ class NonAllocatingRunner:
 
         No duration is reported. The reply has nowhere to put one: the engine
         times the call itself, and the batch output it reads carries tokens.
-
-        A speculative config is refused rather than reported. The reply's
-        `draft_token_ids` is None and its `num_rejected`/`num_bonus` are zero,
-        which is a well-formed description of a step that drafted nothing:
-        `scheduler.py:2579` then never fills `seq.spec_token_ids` and
-        `:2521-2522` reads zeros out of correctly sized arrays. Nothing raises,
-        and a caller that asked for a speculative configuration gets a
-        prediction of that configuration with speculation off. That silence is
-        the failure this module exists to avoid, so the configuration it cannot
-        model is named instead.
         """
         if not hasattr(batch, "produces_output"):
             # Not reachable from the engine, which only ever passes a scheduled
@@ -355,17 +536,6 @@ class NonAllocatingRunner:
                 "a step is reported from what the scheduler scheduled, and "
                 f"{type(batch).__name__} cannot say whether its batch produces "
                 "output; there is nothing here to report from."
-            )
-        if getattr(self.config, "speculative_config", None) is not None:
-            # Refused on the config rather than on the batch: the reply this
-            # method builds drafts nothing, and a run that drafts nothing is a
-            # different run from the one a speculative config describes. The
-            # shapes are right -- it is the semantics that are not modelled.
-            raise RunnerRefusal(
-                "a predicted step drafts no tokens, so reporting one under a "
-                "speculative config would model speculation as off and say "
-                "nothing about it; speculative decoding has no step semantics "
-                "here yet."
             )
         # Imported at call time, not at module scope, so this module stays
         # importable where there is no driver. By the time a step is reported
@@ -379,11 +549,11 @@ class NonAllocatingRunner:
             # control, and `self.config` is what this reads.
             stream = DeferredTokenStream(
                 reported_token_id(
-                    getattr(self.config, "eos_token_id", None),
-                    getattr(self.config, "stop_token_ids", None),
+                    _config_field(self, "eos_token_id"),
+                    _config_field(self, "stop_token_ids"),
                 ),
                 deferred=reports_previous_step(
-                    getattr(self.config, "pipeline_parallel_size", 1)
+                    _config_field(self, "pipeline_parallel_size")
                 ),
             )
             self._token_stream = stream

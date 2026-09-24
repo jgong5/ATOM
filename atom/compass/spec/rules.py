@@ -141,20 +141,39 @@ def refuse_absent_field(path: str, required: bool) -> NoReturn:
     in the document.
     """
     if required:
-        raise SpecRefusal(
-            Rule.TOTALITY,
-            f"`{path}` is declared by this schema, and this spec carries no value "
-            "for it",
-            "a spec read with `MachineSpec.from_mapping` resolves every required "
-            "field, so this one was assembled from parts; merge the fragment "
-            "that measures this field before asking for it",
-        )
+        refuse_absent_fields((path,))
     raise SpecRefusal(
         Rule.TOTALITY,
         f"`{path}` is declared by this schema as optional, and this spec states "
         "no value for it",
         "write it in the document if a reader needs it; a field the document "
         "leaves out is left out here rather than invented",
+    )
+
+
+def refuse_absent_fields(paths: tuple[str, ...]) -> NoReturn:
+    """Decline required fields this spec holds no value for, naming every one.
+
+    The required half of `refuse_absent_field`, which reads one path through
+    here, so a question over several fields and a question over one are
+    declined in the same words. Every missing field is named rather than the
+    first: each is a separate fragment to merge, and a refusal naming one of
+    them sends the reader back once per field.
+    """
+    one = len(paths) == 1
+    named = ", ".join(f"`{path}`" for path in paths)
+    are, them, measures = (
+        ("is", "it", "fragment that measures this field")
+        if one
+        else ("are", "them", "fragments that measure these fields")
+    )
+    raise SpecRefusal(
+        Rule.TOTALITY,
+        f"{named} {are} declared by this schema, and this spec carries no value "
+        f"for {them}",
+        "a spec read with `MachineSpec.from_mapping` resolves every required "
+        f"field, so this one was assembled from parts; merge the {measures} "
+        f"before asking for {them}",
     )
 
 

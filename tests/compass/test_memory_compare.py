@@ -7,9 +7,10 @@ The per-term rule comes from an incident. A summed non-KV memory check read
 **-0.084 GB** of a resident term nobody had noticed existed. **The largest
 single error was 25% of its own term.**
 
-`HISTORICAL` below is that breakdown, and the named result of this task is the
-two instruments run on it side by side -- the per-term comparator naming three
-failures, and the summed check reading +13.8% and passing.
+`HISTORICAL` below is that breakdown, and
+`test_two_instruments_on_one_breakdown` runs the two instruments on it side by
+side -- the per-term comparator naming three failures, and the summed check
+reading +13.8% and passing.
 
 **How the fixture's totals were reconstructed, since the incident was reported
 as deltas and ratios rather than totals.** Three deltas are given (+0.280, -0.015,
@@ -154,11 +155,11 @@ HISTORICAL_PREDICTED = Predicted(
 )
 
 
-def test_the_named_result_two_instruments_on_one_breakdown(capsys):
+def test_two_instruments_on_one_breakdown(capsys):
     """Three named term errors, beside a sum that reads +13.8% and passes.
 
     The per-term table and the summed check are printed here rather than only
-    asserted, because the argument this task makes is that the two disagree on
+    asserted, because the argument this file makes is that the two disagree on
     one breakdown and the disagreement is the finding.
     """
     comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
@@ -247,6 +248,28 @@ def test_a_comparison_has_no_total_and_a_sum_cannot_be_built_without_one():
     assert set(SummedCheck.__dataclass_fields__) == {"comparison", "band"}
 
 
+@pytest.mark.parametrize(
+    "omit, names",
+    [
+        (lambda c, r: SummedCheck(comparison=c), ("SummedCheck.__init__", "'band'")),
+        (lambda c, r: c.summed(), ("Comparison.summed", "'band'")),
+        (
+            lambda c, r: Predicted.from_readings(r, shape=HISTORICAL_SHAPE),
+            ("Predicted.from_readings", "'at_shape'"),
+        ),
+    ],
+    ids=["SummedCheck.band", "Comparison.summed-band", "from_readings-at_shape"],
+)
+def test_a_value_the_caller_must_state_is_refused_when_omitted(omit, names, spec, qwen):
+    # A band for a sum, and which terms move with the shape, are the caller's
+    # to state. Omitting one is a TypeError naming the signature and the field.
+    comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
+    with pytest.raises(TypeError) as omitted:
+        omit(comparison, live_readings(spec, qwen))
+    for name in names:
+        assert name in str(omitted.value)
+
+
 def test_printing_a_sum_prints_the_terms_it_folded():
     summed = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED).summed(band=0.25)
     rendered = str(summed)
@@ -314,6 +337,13 @@ def test_the_tied_head_is_one_embedding_of_0_290_gib_on_the_0_6b():
     assert round(nbytes / (1 << 30), 3) == 0.290
 
 
+def test_the_tied_head_scales_with_a_4_byte_element_size():
+    # A float32 build of the same geometry owes twice the bfloat16 correction.
+    nbytes = tied_lm_head_bytes(qwen_0_6b(), dtype_bytes=4)
+    assert nbytes == 151_936 * 1_024 * 4
+    assert nbytes == 622_329_856
+
+
 def test_an_untied_model_owes_no_correction(qwen):
     assert qwen.tie_word_embeddings is False
     assert tied_lm_head_bytes(qwen, dtype_bytes=2) == 0
@@ -340,8 +370,8 @@ def test_a_model_config_class_supplies_the_field_and_its_default_is_untied():
     default is untied -- the direction that leaves the meta build over by an
     embedding. So on a config class the correction cannot tell a checkpoint
     that said untied from a class that defaulted to it, and it returns zero for
-    both. That is a limit of this cut, asserted here so it is a known limit
-    rather than a claim nobody checked.
+    both. That is a limit of the correction, asserted here so it is a known
+    limit rather than a claim nobody checked.
     """
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
@@ -421,7 +451,7 @@ def live_readings(spec, qwen, tp_width=1):
     return device_readings(
         spec,
         tp_width=tp_width,
-        model=ModelTerms.declared_for_m1(
+        model=ModelTerms.from_declared_config(
             qwen,
             parameter_count=PARAMETERS,
             tp_size=tp_width,
@@ -609,6 +639,47 @@ def test_two_shapes_and_no_side_naming_a_shaped_term_refuses_outright():
     with pytest.raises(MemoryRefusal) as refusal:
         compare(predicted, recorded)
     assert "neither names a term it took at one" in str(refusal.value)
+
+
+@pytest.mark.parametrize(
+    "at_shape", [AT_SHAPE, frozenset()], ids=["per-term", "outright"]
+)
+@pytest.mark.parametrize(
+    "mine, theirs",
+    [("prefill", "decode"), ("decode", "Decode")],
+    ids=["prefill-decode", "two-spellings"],
+)
+def test_a_decode_side_refuses_a_prefill_side_at_the_same_token_count(
+    at_shape, mine, theirs
+):
+    # The token counts agree, so only the phase separates the two sides. Both
+    # places that read shape agreement are driven: the per-term refusal when a
+    # shaped term is named, and the outright one when neither side names one.
+    # Phases compare exactly, so two spellings of one phase refuse as well.
+    predicted = Predicted(
+        label="a prediction",
+        shape=Shape(tokens=HISTORICAL_SHAPE.tokens, phase=mine),
+        terms=HISTORICAL_PREDICTED.terms,
+        at_shape=at_shape,
+    )
+    decode = Recorded(
+        run="a decode step at the prediction's token count",
+        shape=Shape(tokens=HISTORICAL_SHAPE.tokens, phase=theirs),
+        high_water_reset=True,
+        terms=HISTORICAL_RECORDED.terms,
+        at_shape=at_shape,
+    )
+    both = f"predicted at 4096 tokens, {mine}, recorded at 4096 tokens, {theirs}"
+    if not at_shape:
+        with pytest.raises(MemoryRefusal) as refusal:
+            compare(predicted, decode)
+        assert f"taken at different shapes -- {both} -- " in str(refusal.value)
+        return
+    comparison = compare(predicted, decode)
+    refused = {r.name: r for r in comparison.refused}
+    assert set(refused) == {"activations"}
+    assert f"the two disagree -- {both}" in refused["activations"].what
+    assert {t.name for t in comparison.compared} == {"weights", UNATTRIBUTED}
 
 
 def test_a_side_that_claims_a_shaped_term_it_does_not_carry_is_rejected():
@@ -964,19 +1035,15 @@ def test_the_footprint_is_peak_torch_and_non_torch_and_nothing_else(spec, qwen):
 #: Built from parts so that this pattern does not match its own source, which
 #: lets the guard below read the file it is written in if it is ever widened.
 #: `P\d+\.\d+` is in the banned list by name; the two-to-four letter form with
-#: a dash is every task label, not just the one this cut happened to leave.
+#: a dash is every task label, not only the one this package once carried.
+#: A milestone label is `M1` in prose and `_m1` as an identifier suffix; a bare
+#: letter-and-digit is not matched, because it would take `TP1`, `w1` and
+#: every dtype width in this package with it. No group captures, so a failure
+#: prints the forms it found.
 _TAGS = re.compile(
-    r"\b[DTW]\d+(\.\d+)?\b|\bP\d+\.\d+\b|\b[A-Z]{2,4}-\d+\b"
+    r"\b[DTW]\d+(?:\.\d+)?\b|\bP\d+\.\d+\b|\b[A-Z]{2,4}-\d+\b|\bM\d+\b|\w*_m\d+\b"
     r"|principles? \d+|Gate \d+|`\d{2}`|#\d+"
 )
-
-#: What this pattern deliberately does not catch, and why, because an absence
-#: nobody explained is the same defect one level up. `M1` is a milestone that
-#: the public `ModelTerms.declared_for_m1` is named after: it says when a
-#: declared term stops being allowed, which is what the code does, and it
-#: points at no document. Matching a bare letter-and-digit would also take
-#: `TP1`, `w1` and every dtype width in this package with it.
-KEPT = ("M1", "declared_for_m1")
 
 #: The package as the suite imported it, never a walk up from this file: if
 #: `atom` resolves from another root, a path-derived location would scan one
@@ -1000,16 +1067,16 @@ def test_no_module_in_the_package_carries_a_design_reference(module):
     `test_memory_readings.py`, and for the same reason.
     """
     found = _TAGS.findall((PACKAGE / module).read_text())
-    assert not found, f"{module} carries {len(found)} design references"
+    assert not found, f"{module} carries design references: {found}"
 
 
 def test_the_guard_catches_the_forms_that_were_actually_removed():
     """A guard nobody drove is a guard nobody knows the reach of.
 
-    Each string below was in this package before this cut swept it, and each
-    is a form the rule names. Driving them is how the guard is shown to hold
-    in the direction that matters -- it would be worth nothing if it only ever
-    saw text that was already clean.
+    Each string below was once in this package and has since been removed,
+    and each is a form the rule names. Driving them is how the guard is shown
+    to hold in the direction that matters -- it would be worth nothing if it
+    only ever saw text that was already clean.
     """
     removed = [
         "03 D16 records buffers rather than computing them",
@@ -1020,12 +1087,14 @@ def test_the_guard_catches_the_forms_that_were_actually_removed():
         "an open owner ruling (**#87**)",
         "proving it is MEM-2's",
         "`16` row W2.2",
+        "For M1, with fake models, a declared formula suffices",
+        "def declared_for_m1(",
     ]
     # Two forms this package never carried, driven anyway because a guard is
     # worth what it catches rather than what it happened to meet. `P0.4` is
     # named verbatim in the rule's own list; `ART-2` is the exact sibling of
     # the `MEM-2` above, and a pattern that caught one and not the other would
-    # be a pattern fitted to this cut.
+    # be a pattern fitted to the one label it happened to meet.
     never_here = ["the P0.4 gates", "ART-2 swept the other package"]
     for text in removed + never_here:
         assert _TAGS.search(text), text
@@ -1035,19 +1104,25 @@ def test_the_guard_catches_the_forms_that_were_actually_removed():
     assert not _TAGS.search(replacement)
 
 
-def test_the_kept_forms_are_kept_on_purpose_and_stay_readable():
-    """An absence with a stated reason is a decision; without one it is a gap.
+def test_what_the_pattern_matches_beside_its_targets_is_on_record():
+    """The pattern's reach past the forms it targets, both ways, stated here.
 
-    `M1` is the one letter-and-digit form this package keeps. It names the
-    milestone at which a declared term stops being allowed -- which is what
-    the code does, not a pointer into a document -- and the public
-    `ModelTerms.declared_for_m1` is named after it, so removing it would
-    rename an API to satisfy a pattern.
+    It is not a bare letter-and-digit, so widths and dtypes stay clear. It does
+    match some of ATOM's own names, none of which this package carries; a hit
+    fails loudly, and rewording the line is the fix, not an exemption. And it
+    misses forms one step from the removed ones, because a pattern wide enough
+    to take them would take more of ATOM's names with it.
     """
-    assert all(not _TAGS.search(kept) for kept in KEPT)
-    sources = "".join((PACKAGE / p.name).read_text() for p in PACKAGE.glob("*.py"))
-    assert "declared_for_m1" in sources
-    # And the widened pattern does not sweep up the widths and dtypes that
-    # share its shape, which is why it is not a bare letter-and-digit.
     for benign in ("TP1", "w1_base_bytes", "fp8", "int8", "bf16"):
         assert not _TAGS.search(benign), benign
+    for collision in (
+        "MiniMax-M3",
+        "minimax_m3",
+        "M128",
+        "tile_m128",
+        "seq_len_m1",
+        "fp8_m3",
+    ):
+        assert _TAGS.search(collision), collision
+    for escape in ("declared_for_m1_terms", "At m1", "M1a", "declared_for_M1"):
+        assert not _TAGS.search(escape), escape

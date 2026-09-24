@@ -51,9 +51,9 @@ over the model's own tensors. The two words sit on different subjects and one
 would be the wrong answer on the other's.
 
 The two vocabularies are kept apart deliberately. A declared coefficient has no
-word in `Species` and adding one is an open owner ruling, so nothing
+word in `Species`, and whether to add one is left open, so nothing
 here touches that enum; `Basis.DECLARED` carries the distinction on this side of
-the boundary, and it is the one place a ruling would land.
+the boundary, and it is the one place an answer would have to reach.
 
 A declared term must say what replaces it. That is the whole difference between
 a declared number and a guess: `Term` refuses to hold `DECLARED` without a note,

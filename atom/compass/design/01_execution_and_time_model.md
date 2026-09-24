@@ -46,9 +46,9 @@ one of those branches, on this hardware.
 These are measurements, not opinions, and they are load-bearing below:
 
 - **The seam needs no ATOM change.** `Config.runner_qualname` (`atom/config.py:1595`),
-  consumed at `engine_core.py:129` and `async_proc.py:166`. Two in-tree precedents:
+  consumed at `engine_core.py:128` and `async_proc.py:166`. Two in-tree precedents:
   `RLHFModelRunner` (`atom/rollout/async_engine.py:26-32`) and `RapidServeModelRunner`
-  (`config.py:1729-1736`).
+  (`Config.__post_init__`, `config.py:1730-1736`).
 - **Rank-0 single-sourcing of the clock is correct for symmetric TP.** TP=2 over 1727
   steps: per-step rank difference median 0.03%, worst 0.82%, rank 1 slower on 51% of
   steps. TP=4 over 2295 steps: rank totals within ±0.02%; charging every step to its
@@ -244,9 +244,9 @@ Recorded as **T47**.
 - Simulation wall-clock cost is higher than Option A's. The >=5x target is stated as
   negotiable with a bottom line of "faster than real runs". Under saturation the prior
   design was 0.30x. This must be measured early, not assumed.
-- `torch.cuda.set_device` (`model_runner.py:958`) and `torch.cuda.mem_get_info`
-  (`model_runner.py:1659`) are the two hard GPU dependencies a simulated runner must not
-  inherit.
+- `torch.cuda.set_device` (in `model_runner.py::ModelRunner._setup_device_and_distributed`) and
+  `torch.cuda.mem_get_info` (in `model_runner.py::ModelRunner._read_device_memory`) are the two
+  hard GPU dependencies a simulated runner must not inherit.
 
 ---
 
@@ -938,12 +938,13 @@ that assumes the enqueue is the only thing in that function will be surprised.
   `config.enable_rapidserve` (`llm_engine.py:140-142`) — so "RapidServe-only" is exact.
   Its purpose is verified by the code around it: the sleep sits between importing
   decode's weight IPC handles and acknowledging to prefill, and prefill measures free
-  VRAM for KV sizing only after that ACK. It must stay on the real clock. It is not
-  *unconditionally* moot: nothing in ATOM couples it to whether weights are real, and
+  VRAM for KV sizing only after that ACK. It must stay on the real clock. Nothing in ATOM
+  couples it to whether weights are real, but `Config` keeps a simulated runner from it:
   `--enable-rapidserve` selects `RapidServeModelRunner` only when `runner_qualname` is
-  still the default (`config.py:1727-1736`), so a simulated runner plus that flag would
-  reach the sleep. The cost is two real seconds of startup and no modelled time, because
-  it runs before READY and therefore before any arrival.
+  still the default (`config.py:1730-1736`), and otherwise `Config` raises `ValueError`
+  unless `runner_qualname` is in `RAPIDSERVE_RUNNERS`. The cost, for a runner that list
+  names, is two real seconds of startup and no modelled time, because it runs before
+  READY and therefore before any arrival.
 - The scanner's boundary is a list of directories, not a graph. It reads every `.py`
   file under `SCANNED_ROOTS`, so a module added beside a scanned one is caught; but a
   blocking call under one of the three directories `UNSCANNED_ROOTS` names is invisible
@@ -1077,7 +1078,7 @@ The ABC is small and has **no `send_kv` / `recv_kv` verb** to fake
 Every connector's completion reaches the scheduler through **one** method:
 
 ```
-ModelRunner.async_proc_aggregation      model_runner.py:3351-3372
+model_runner.py::ModelRunner.async_proc_aggregation
   -> EngineCore._poll_kv_transfer_progress   engine_core.py:485-489
      -> Scheduler._update_from_kv_xfer_finished   scheduler.py:2989-3053
 ```
@@ -1413,10 +1414,10 @@ Facts this design leans on, with their source, so a later reader can re-check ra
 re-derive.
 
 **The seam**
-- `Config.runner_qualname` — `atom/config.py:1595`; consumed `engine_core.py:129`,
+- `Config.runner_qualname` — `atom/config.py:1595`; consumed `engine_core.py:128`,
   `async_proc.py:166-169`
-- `ModelRunner.forward(batch: ScheduledBatch) -> ScheduledBatchOutput` —
-  `model_runner.py:3233-3320`
+- `model_runner.py::ModelRunner.forward`, whose signature is
+  `forward(batch: ScheduledBatch) -> ScheduledBatchOutput`
 - the RPC boundary — `engine_core.py:386-388`
 - `ScheduledBatch` fields — `scheduler.py:579-820`; notably `detailed_sqsq` /
   `detailed_sqsk` / `detailed_sk` at `:790-792`, which are sum(N_Q^2), sum(N_Q * N_KV),
@@ -1427,11 +1428,12 @@ re-derive.
 **Existing simulation-shaped hooks in ATOM**
 - `--load_dummy {empty,zero,xavier}` — `config.py:1556`, `arg_utils.py:260`,
   `loader.py:179-227,309-310`, `loading_core.py:266-291`
-- meta-device model construction — `RapidServeModelRunner._init_weight_params_on_meta`,
-  `model_runner.py:4188-4211`
-- a working non-allocating runner template — `RapidServeModelRunner` overrides at
-  `model_runner.py:4218,4232,4239,4245,4261,4269`
-- `ModelRunner.dummy_execution()` — `model_runner.py:1177-1217`, shows how to hand-build
+- meta-device model construction —
+  `model_runner.py::RapidServeModelRunner._init_weight_params_on_meta`
+- a working non-allocating runner template — `model_runner.py::RapidServeModelRunner`,
+  which overrides `_build_and_load_model`, `_maybe_warmup`, `_kv_budget_extra_reserve`,
+  `get_num_blocks`, `allocate_kv_cache` and `forward`
+- `model_runner.py::ModelRunner.dummy_execution` shows how to hand-build
   a `ScheduledBatch`
 - `ScheduledBatch.is_dummy_run` — `scheduler.py:589,781`
 - simulated TP (`--fake-eplb`) — `atom/distributed/simulated_tp.py`; explicit precedent
@@ -1442,7 +1444,8 @@ re-derive.
   `tools/parse_trace.py`
 
 **Memory sizing (needed because it decides which configurations exist)**
-- `ModelRunner.get_num_blocks()` — `model_runner.py:1652-1873`. Five device readings plus
+- `model_runner.py::ModelRunner.get_num_blocks`, with its four `torch.cuda`
+  reads in `model_runner.py::ModelRunner._read_device_memory`. Five device readings plus
   arithmetic: `mem_get_info`, `allocated_bytes.all.peak`,
   `(total - free) - memory_reserved()`, `_estimate_cudagraph_overhead()`, a 2% safety
   margin, then `min(budget - ..., free)` and `plan_pools`. Consumed

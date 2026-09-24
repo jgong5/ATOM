@@ -51,13 +51,19 @@ exists to refuse. The sharpest case is the transfer: its source's pin is in no
 field of the merged document, by the decision below, so `validate(document)`
 can never ask that condition however the document was built, and the same spec
 is refused as a `Merge` and clear as a document. That is not a wrong number,
-but it must be visible, because the verb the design writes -- `compass spec
-validate machine.yaml` -- is the form that cannot ask it. `CONDITIONS` is what
-a count of reach is a count of; a condition added to the check set and not to
-it is one no result can report on.
+but it must be visible, because a caller that holds only the document cannot
+ask it. Merging the document again does not recover the pin: a merge whose
+fragments disagree on a method states `mixed`, so a `Merge` holding the saved
+document reports the transfer as not asked too, or as asked only in part when
+another fragment states a transfer and a stack pin resolved. A `validate` verb
+over a machine file -- `compass spec validate machine.yaml` -- is not built
+yet: no entry point names it, and nothing in this package reads a spec file.
+This module is what it would call. `CONDITIONS` is what a count of reach is a
+count of; a condition added to the check set and not to it is one no result
+can report on.
 
-**The reach of that form is `ASKABLE_OF_A_DOCUMENT`, which is a value and not a
-sentence.** Writing the number down in prose here puts a reviewer between the
+**The reach of a document is `ASKABLE_OF_A_DOCUMENT`, which is a value and not
+a sentence.** Writing the number down in prose here puts a person between the
 check set and the statement about it: the set changes, nobody rereads the
 paragraph, and the package goes on claiming a reach it no longer has. So the
 statement is the tuple below, a run's own `not_asked` is asserted against it,
@@ -99,7 +105,10 @@ the two are compared, and a transfer out of a differently-pinned spec is refused
 by name. A transfer that declares no stack at all is refused too: the evidence
 that these constants move with the compute stack is the whole reason a transfer
 is allowed to be cheap, and a transfer that does not say what it was measured
-against cannot be checked by anyone, ever.
+against cannot be checked by anyone, ever. A document saved from a merge of
+transfers from one spec reads back as such a transfer, since a merge keeps a
+transfer's pin out of what it writes, so its refusal names that merge rather
+than its author.
 
 A stack mismatch on the running machine is the one finding that is not fatal by
 default. The numbers are still measurements, taken on a stack that has since
@@ -134,8 +143,8 @@ CONDITIONS = (MISSING, DERATES, WIDTHS, PROBES, STACK, TRANSFERS)
 #: transfer: a transfer's source pin is in no field of a document, however the
 #: document was built. This is the package's statement of its own reach, held to
 #: a run's `not_asked` by a test rather than written out in prose that nothing
-#: reads. A caller that takes a filename -- which is the form the verb takes --
-#: states its reach from here, or states one nothing checks.
+#: reads. A caller that passes `validate` only a document states its reach from
+#: here, or states one nothing checks.
 ASKABLE_OF_A_DOCUMENT = tuple(
     condition for condition in CONDITIONS if condition != TRANSFERS
 )
@@ -262,8 +271,22 @@ def _reach(
             "pin is in no field of one; ask this of the `Merge` while the "
             "fragments are still in hand"
         )
-    elif merged.transfers:
-        reached(TRANSFERS, STACK_PINS)
+    else:
+        if merged.transfers:
+            reached(TRANSFERS, STACK_PINS)
+        # Where a transfer is stated and a pin did not resolve, `reached` has
+        # already reported the condition once.
+        hidden = [repr(f.source) for f in merged.fragments if f.method == "mixed"]
+        if hidden and not any(c.startswith(TRANSFERS) for c in unasked + partial):
+            why = (
+                f"{TRANSFERS} -- method `mixed` in {', '.join(hidden)} does not "
+                "say whether a transfer went into it, and a transfer's source "
+                "pin is in no field of a document"
+            )
+            if merged.transfers:
+                partial.append(f"{why}; it was asked of the transfers stated")
+            else:
+                unasked.append(why)
     return tuple(unasked), tuple(partial)
 
 
@@ -338,6 +361,22 @@ def _transfers(resolved: Mapping[str, Any], merged: Merge):
             for component in PINNED
             if f"{PINNED_BLOCK}.{component}" in fragment.values
         }
+        listed = fragment.values.get("provenance.fragments")
+        if not declared and listed:
+            yield SpecRefusal(
+                Rule.PINNED_STACK,
+                f"{fragment.stanza()} carried constants over from "
+                f"{fragment.transferred_from!r}, and its provenance names the "
+                "fragments an earlier merge built it from; a merge keeps a "
+                "transfer's source stack pin out of the document it writes, so "
+                "this one cannot say which stack they were measured against",
+                "merge the fragments it was built from "
+                f"({', '.join(map(repr, listed))}) in its place, since a "
+                "transfer states its source's stack pin there and nowhere else; "
+                "any of them that is itself a saved document with no pin is "
+                "refused the same way",
+            )
+            continue
         if not declared:
             yield SpecRefusal(
                 Rule.PINNED_STACK,

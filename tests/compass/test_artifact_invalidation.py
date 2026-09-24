@@ -6,23 +6,22 @@ crosses.** `test_every_cell_of_the_matrix_decides_by_itself` walks all
 forty-two cells: where the matrix says a row depends on an axis, moving that
 axis refuses and the refusal names the cell; where it says the row does not,
 moving the same axis loads clean. A matrix that has been tidied into a uniform rule
-passes neither half, and the pair the brief names -- `price_list` surviving a
-model change while `region_terms` refuses one -- is also published and loaded
-through the store, because a table that is right in the abstract and unwired
-in the store is the machinery-with-no-caller shape this package's own review
-found once already.
+passes neither half, and one pair -- `price_list` surviving a model change
+while `region_terms` refuses one -- is also published and loaded through the
+store, because a table that is right in the abstract and unwired in the store
+is machinery with no caller.
 
-Two things this file deliberately does not do, both inherited.
+Two things this file deliberately does not do.
 
 **It binds no `width`.** The matrix's six columns contain no width at all, so
-invalidation does not need #165 ruled; where a key field happens to be
+invalidation does not need #165 settled; where a key field happens to be
 called `width` the topology here is tensor-parallel only, so the two candidate
 readings coincide and no fixture settles the question by example.
 
-**It rules nothing that is the owner's.** Whether an aiter bump invalidates
-or only warns is #168, and until it is ruled the default stands:
-`test_an_aiter_bump_refuses_until_its_meaning_is_ruled` pins the default, and
-it is the test that changes when the ruling lands.
+**It settles nothing left open.** Whether an aiter bump invalidates or only
+warns is open (#168), and while it is open the default stands:
+`test_an_aiter_bump_refuses_while_its_meaning_is_open` pins the default, and
+it is the test that changes when that is settled.
 
 Nothing here touches a driver, a device or a network. The conditions are
 stated and never probed, which is also why a fixture can express a ROCm bump
@@ -42,6 +41,7 @@ from atom.compass.artifacts import (
     Axis,
     Cell,
     Conditions,
+    Fingerprint,
     Gate,
     GateState,
     Key,
@@ -56,6 +56,7 @@ from atom.compass.artifacts import (
     StaleArtifact,
     Topology,
     axes_of,
+    differences,
     fingerprint,
     member_name,
     rows_for,
@@ -240,10 +241,10 @@ def test_a_kind_the_matrix_does_not_row_is_refused_by_name(kind):
 def test_every_cell_of_the_matrix_decides_by_itself(row, axis):
     """Forty-two cells: a cross refuses and names itself, a zero loads clean.
 
-    This is the named result. It is one test rather than seven because the
-    claim is about the table and not about any row: a rule that refused on
-    every axis would pass every cross and fail every zero, and a rule that
-    refused on none would do the reverse.
+    It is one test rather than seven because the claim is about the table
+    and not about any row: a rule that refused on every axis would pass every
+    cross and fail every zero, and a rule that refused on none would do the
+    reverse.
 
     It reads `MATRIX` rather than restating the document by hand, so on its
     own it
@@ -277,7 +278,7 @@ def test_a_fingerprint_carries_only_the_cells_its_row_depends_on():
 
 
 def test_no_axis_of_the_matrix_is_a_width():
-    """#165 does not block this cut, and this is why.
+    """No axis is a width, so the matrix does not depend on #165.
 
     The columns are the software stack, torch, ATOM's source, the model, the
     device and the engine config. None of them is a width, so no fingerprint
@@ -295,7 +296,7 @@ def test_no_axis_of_the_matrix_is_a_width():
     assert TP2.rank_count == TP2.tp
 
 
-# --- the pair the brief names, through the store ---------------------------
+# --- one row survives what the other refuses, through the store ------------
 
 
 def test_a_price_list_survives_a_model_change_and_region_terms_refuses_one(tmp_path):
@@ -346,13 +347,12 @@ def test_a_machine_spec_is_three_rows_and_a_device_change_moves_two(tmp_path):
     )
 
 
-def test_an_aiter_bump_refuses_until_its_meaning_is_ruled(tmp_path):
-    """The default, because what an aiter bump means is the owner's ruling (#168).
+def test_an_aiter_bump_refuses_while_its_meaning_is_open(tmp_path):
+    """The default, because what an aiter bump means is left open (#168).
 
     The four rows that carry ROCm/AITER/RCCL refuse a bump; `machine_spec`'s
-    capacity does not, because the silicon did not move. If the ruling lands
-    as "warn", this is the test that changes, and one cell of `MATRIX` with
-    it.
+    capacity does not, because the silicon did not move. If it is settled as
+    "warn", this is the test that changes, and one cell of `MATRIX` with it.
     """
     store = ArtifactStore(tmp_path)
     bumped = BASE.with_reading(
@@ -746,7 +746,7 @@ def test_a_publish_that_states_no_conditions_is_refused(tmp_path):
 
 
 def test_notes_that_are_not_text_are_refused_and_leave_nothing_behind(tmp_path):
-    """Measured on the artifact store's review, filed as #169: `TypeError`, and litter.
+    """Measured and filed as #169: `TypeError`, and litter.
 
     `notes` was never checked, so a non-string reached `json.dumps` and came
     back as a bare `TypeError` -- an unnamed exception where a named refusal
@@ -770,10 +770,8 @@ def test_a_publish_that_fails_on_the_way_to_the_rename_leaves_nothing_behind(tmp
 
     Validating `notes` makes the measured `TypeError` unreachable through
     `publish`, so a test driven only through the public surface would leave
-    the widened `except` as a claim nothing bites on -- the inert-pin finding
-    this package's own review made in cycle 2, reproduced by the fix for the
-    thing above it. The staging directory is what is under test, so the test
-    goes to where it is made.
+    the widened `except` as a claim nothing bites on. The staging directory is
+    what is under test, so the test goes to where it is made.
     """
     store = ArtifactStore(tmp_path)
     destination = store.directory_for(KEY_OF[Row.PRICE_LIST])
@@ -783,3 +781,145 @@ def test_a_publish_that_fails_on_the_way_to_the_rename_leaves_nothing_behind(tmp
     assert "TypeError" in str(refused.value)
     assert not destination.exists()
     assert list(destination.parent.iterdir()) == []
+
+
+# --- refusals the package states, each reached by a caller ------------------
+
+
+def test_a_recorded_cell_the_matrix_has_no_column_for_is_refused(tmp_path):
+    """The cell-level companion of the row refusal above.
+
+    Without it the read succeeds and the cell is dropped: the entry answers
+    with a fingerprint narrower than the one it recorded, and the axis that
+    was recorded is never compared again.
+    """
+    store = ArtifactStore(tmp_path)
+    entry = publish(store, KEY_OF[Row.PRICE_LIST])
+    document = json.loads((entry.directory / "entry.json").read_bytes())
+    document["fingerprints"]["price_list"]["cells"]["compiler"] = Reading.stated(
+        "hipcc 6.2"
+    ).as_json()
+    (entry.directory / "entry.json").chmod(0o644)
+    (entry.directory / "entry.json").write_text(json.dumps(document))
+    with pytest.raises(ArtifactRefusal) as refused:
+        store.read(entry.key)
+    assert refused.value.rule is Rule.INVALIDATED
+    assert "records `compiler`, which the invalidation matrix has no column for" in str(
+        refused.value
+    )
+
+
+def test_a_publish_that_omits_the_gates_is_a_type_error(tmp_path):
+    """No default: an entry that states no gates cannot be checked on load."""
+    store = ArtifactStore(tmp_path)
+    with pytest.raises(TypeError):
+        store.publish(
+            KEY_OF[Row.PRICE_LIST],
+            provenance=STANZA,
+            topology=TP2,
+            conditions=BASE,
+            members={member_name("rows", rank, "json"): b"{}" for rank in TP2.ranks()},
+        )
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_publish_handed_something_that_is_not_a_gate_state_is_refused(tmp_path):
+    """A named refusal at publish, not an `AttributeError` from the JSON writer."""
+    store = ArtifactStore(tmp_path)
+    with pytest.raises(ArtifactRefusal) as refused:
+        publish(store, KEY_OF[Row.PRICE_LIST], gates="off")
+    assert refused.value.rule is Rule.GATE_STATE
+    assert "'off' is not a gate state" in str(refused.value)
+
+
+def test_a_miss_where_the_gate_and_the_device_both_moved_is_filed_as_the_gate(
+    tmp_path,
+):
+    """The gate is checked first, so the ledger names the gate as what declined.
+
+    The control shows the device move refuses on its own; without it, a
+    fingerprint that happened not to move would make the order unobservable.
+    """
+    store = ArtifactStore(tmp_path)
+    publish(store, KEY_OF[Row.PRICE_LIST])
+    gate_on = GateState.of(Gate("PRICE_KERNELS", "on", "COMPASS_PRICE_KERNELS"))
+    elsewhere = moved(BASE, Axis.DEVICE)
+
+    device_only = Resolution("step 41")
+    store.answer(KEY_OF[Row.PRICE_LIST], device_only, conditions=elsewhere, gates=GATES)
+    assert [miss.rule for miss in device_only.misses] == [Rule.INVALIDATED]
+
+    both = Resolution("step 41")
+    store.answer(KEY_OF[Row.PRICE_LIST], both, conditions=elsewhere, gates=gate_on)
+    assert [miss.rule for miss in both.misses] == [Rule.GATE_STATE]
+
+
+def test_a_dead_gate_cannot_hide_behind_a_live_twin_of_its_name(tmp_path):
+    """Two recorded rows for one gate name are refused rather than collapsed.
+
+    Collapsed by name, the last row wins: an entry recording the dead
+    `WORLD_SIZE` gate beside the live one would load clean under the live
+    gate, and the dead one would never be compared.
+    """
+    store = ArtifactStore(tmp_path)
+    entry = publish(store, KEY_OF[Row.PRICE_LIST])
+    document = json.loads((entry.directory / "entry.json").read_bytes())
+    document["gates"] = [
+        Gate("PRICE_KERNELS", "off", "WORLD_SIZE").as_json(),
+        PRICE_KERNELS.as_json(),
+    ]
+    (entry.directory / "entry.json").chmod(0o644)
+    (entry.directory / "entry.json").write_text(json.dumps(document))
+    with pytest.raises(ArtifactRefusal) as refused:
+        store.load(KEY_OF[Row.PRICE_LIST], conditions=BASE, gates=GATES)
+    assert refused.value.rule is Rule.GATE_STATE
+    assert "two gates share a name" in str(refused.value)
+
+
+def test_two_rows_over_the_same_axes_are_still_not_compared():
+    """Two rows with identical columns, so only the row check can refuse.
+
+    Compared cell by cell they would report no difference, which is an answer
+    to a question that was never asked.
+    """
+    assert axes_of(Row.REGION_TERMS) == axes_of(Row.MEMORY_READINGS)
+    with pytest.raises(ArtifactRefusal) as refused:
+        differences(
+            fingerprint(Row.REGION_TERMS, BASE),
+            fingerprint(Row.MEMORY_READINGS, BASE),
+        )
+    assert refused.value.rule is Rule.NOT_COMPARABLE
+    assert "a `region_terms` fingerprint was compared with a `memory_readings` one" in (
+        str(refused.value)
+    )
+
+
+def test_one_row_over_different_axes_names_both_sides_axes():
+    """A row recorded before the matrix gained a column: both axis lists are named."""
+    now = fingerprint(Row.PRICE_LIST, BASE)
+    with pytest.raises(ArtifactRefusal) as refused:
+        differences(Fingerprint(Row.PRICE_LIST, now.cells[:-1]), now)
+    assert (
+        "`price_list` was fingerprinted over ROCm / AITER / RCCL, torch, ATOM src, "
+        "but the matrix now rows it over ROCm / AITER / RCCL, torch, ATOM src, device"
+    ) in str(refused.value)
+
+
+def test_a_load_handed_something_that_is_not_a_gate_state_is_refused(tmp_path):
+    """The same refusal at load, where the recorded gates are checked."""
+    store = ArtifactStore(tmp_path)
+    publish(store, KEY_OF[Row.PRICE_LIST])
+    with pytest.raises(ArtifactRefusal) as refused:
+        store.load(KEY_OF[Row.PRICE_LIST], conditions=BASE, gates="off")
+    assert refused.value.rule is Rule.GATE_STATE
+    assert "'off' is not a gate state" in str(refused.value)
+
+
+def test_conditions_that_state_an_axis_the_matrix_has_no_column_for_are_refused():
+    """All six stated plus one more: the extra axis is named, not dropped."""
+    with pytest.raises(ArtifactRefusal) as refused:
+        Conditions.of(
+            **{axis.field: BASE.reading(axis) for axis in Axis}, compiler="hipcc 6.2"
+        )
+    assert refused.value.rule is Rule.INVALIDATED
+    assert "these conditions state an unknown compiler" in str(refused.value)

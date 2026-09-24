@@ -85,26 +85,32 @@ def whole_number(field: str, value: Any) -> int:
     """*value* as an `int`, or a `ValueError` naming *field* if it is not one.
 
     An `int` is taken as it is, and so is a float with no fractional part.
-    Text is taken only if `int` reads it as an integer literal, so "8" and
-    " 8 " are 8 and "8.0" and "1e1" are refused. ATOM's own launch path does
-    not deliver a width as text -- its CLI flags and `ATOM_DP_RANK` are parsed
-    with `int`, and its `Config` raises on a string width -- so text arrives
-    only from a caller that builds the config by hand.
+    Text is refused, "8" included. ATOM's own launch path does not deliver a
+    width as text -- its CLI flags and `ATOM_DP_RANK` are parsed with `int`,
+    and its `Config` raises on a string width -- so reading text would be a
+    conversion that no launch needs.
 
     Refused: a fraction, because `int` truncates and 8.5 would go out as 8,
-    naming a deployment that was never launched; a `bool`, which Python
-    counts as an `int` and which would go out as a width of 1 or 0; and
-    anything else `int` does not take exactly. No value that is accepted
-    changes on the way to the `int` returned.
+    naming a deployment that was never launched; a boolean, which would go
+    out as a width of 1 or 0 -- a `bool`, or anything whose `dtype` has "bool"
+    in its text, as numpy's and torch's booleans do, neither being a `bool`
+    subclass; and anything else `int` does not take exactly. No value that is
+    accepted changes on the way to the `int` returned, and that check is what
+    refuses integer text: `int("8")` is 8, which is not equal to "8".
+
+    Limits: a whole number whose dtype text has "bool", such as a 0-d array
+    of a numpy union dtype with a field "is_bool", is refused as not one. An
+    exception from the value, from its dtype, or from an object either of them
+    returns, such as the result of `__ne__`, can escape as raised, not as this
+    refusal, and an `AttributeError` from reading `dtype` counts as no dtype.
     """
     try:
-        if isinstance(value, bool):
+        if isinstance(value, bool) or "bool" in str(getattr(value, "dtype", "")):
             raise TypeError(f"{value!r} is a bool")
-        number = int(value) if isinstance(value, str) else value
-        whole = int(number)
+        whole = int(value)
     except (TypeError, ValueError, OverflowError):
         whole = None
-    if whole is None or whole != number:
+    if whole is None or whole != value:
         raise ValueError(
             f"{field} is {value!r}, which is not a whole number; a parallel "
             "width or rank is a count, so it is refused rather than converted"

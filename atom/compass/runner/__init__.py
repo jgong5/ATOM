@@ -10,9 +10,10 @@ The modules here, split by what each is allowed to import:
   stylistic preference. Importing `atom.model_engine.model_runner` runs aiter's
   architecture probe, which shells out to `rocminfo` and raises in a container
   with no driver, so anything reachable from that import cannot be exercised by
-  a test that runs without one. The one engine name it needs,
-  `ScheduledBatchOutput`, is imported inside `forward`, which only ever runs on
-  a worker that has imported the engine already.
+  a test that runs without one. The engine names it needs are imported where
+  they are used -- `ScheduledBatchOutput` inside `forward`, and
+  `DeviceMemoryReadings` inside `_read_device_memory` -- and both of those only
+  ever run on a worker that has imported the engine already.
 - `step_output` holds what a predicted step reports -- the deferral rules and
   the token ids -- over numpy and nothing else, so it has no engine import to
   defer.
@@ -28,14 +29,14 @@ caller waits, a hole parks that caller for the life of the process. For a name
 the table marks unwaited, a hole parks nobody, and what is lost is the work the
 name stood for:
 
-- `exit` (`engine_core.py:260`) never reaches `ModelRunner.exit`, so the
-  distributed environment is never destroyed and the graphs and five KV tensors
-  it deletes stay held. The worker still leaves its loop -- `busy_loop` breaks
+- `exit` (`engine_core.py:260`) never reaches `ModelRunner.exit`; the comment
+  on the `RPC_SURFACE` check in `model_runner` says what that loses here.
+  The worker still leaves its loop -- `busy_loop` breaks
   on the dispatched name, in a statement beside the per-runner loop rather than
   inside it -- so the symptom is what shutdown failed to release, not a hang.
-- `process_kvconnector_output` never starts the asynchronous KV load its
-  metadata was built for, and nothing is waiting on a load that never began.
-  It is broadcast five times and waited for at none of them:
+- `process_kvconnector_output` never starts the asynchronous KV transfer its
+  metadata was built for (a consumer's load, a producer's send, an offload
+  save). It is broadcast five times and waited for at none of them:
   `engine_core.py:378` and `engine_core.py:500`, `pp_engine_core.py:113`,
   `pp_engine_core.py:232` and `pp_engine_core.py:369`.
 

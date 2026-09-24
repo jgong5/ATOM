@@ -34,6 +34,7 @@ that means collecting each one in a driver-free container, which is
 `regen_cpu_gate_exclude.sh`'s job, not a unit test's.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 EXCLUDE = REPO / "scripts" / "compass" / "cpu_gate_exclude.txt"
 TRIGGERS = REPO / "scripts" / "compass" / "gpu_gate_triggers.txt"
+README = REPO / "scripts" / "compass" / "README.md"
 
 GEN_BEGIN, GEN_END = "# BEGIN GENERATED", "# END GENERATED"
 MAN_BEGIN, MAN_END = "# BEGIN MANUAL", "# END MANUAL"
@@ -185,6 +187,38 @@ def test_the_manual_guard_finds_nothing_when_the_section_empties(monkeypatch, tm
     )
     monkeypatch.setitem(globals(), "EXCLUDE", moved)
     assert not _manual_entries()
+
+
+@pytest.mark.parametrize(
+    "listed, stated, derive",
+    [
+        (EXCLUDE, r"\*\*(\d+)\*\* excluded test files", _entries),
+        (
+            EXCLUDE,
+            r"\*\*(\d+) GENERATED\*\*",
+            lambda: _paths(_section(GEN_BEGIN, GEN_END)),
+        ),
+        (EXCLUDE, r"\*\*(\d+) MANUAL\*\*", _manual_entries),
+        (TRIGGERS, r"\*\*(\d+)\*\* source paths", _trigger_entries),
+    ],
+    ids=["total", "generated", "manual", "triggers"],
+)
+def test_the_readme_states_the_counts_the_list_holds(listed, stated, derive):
+    # README.md restates these lists' counts. The pin above holds the MANUAL one
+    # in its own file only, and regen_gpu_gate_triggers.sh rewrites the trigger
+    # list wholesale without touching the README. Without this join, either
+    # change leaves the README wrong in silence. Same shape as gate_gpu.sh's
+    # BASE_FAILED against gpu_gate_known_failures.txt: the stated number stays,
+    # the list is counted, and a disagreement names both rather than picking one.
+    row = [ln for ln in _lines(README) if ln.startswith(f"| `{listed.name}` |")]
+    assert len(row) == 1, f"{README.name} has {len(row)} rows for {listed.name}"
+    found = re.search(stated, row[0])
+    assert found, f"{README.name}'s {listed.name} row no longer states /{stated}/"
+    entries = derive()
+    assert int(found[1]) == len(entries), (
+        f"{README.name} states {found[0]} but {listed.name} holds {len(entries)}: "
+        f"{entries}. Update the README row to match the list."
+    )
 
 
 @pytest.mark.parametrize("entry", _manual_entries())

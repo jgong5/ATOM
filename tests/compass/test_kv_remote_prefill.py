@@ -12,22 +12,27 @@ this red; a list copied into a test would not notice either.
 **The suspension is not asserted by calling the connector.** The engine asks
 whether a request is held elsewhere, allocates its blocks, tells the connector
 about the allocation and only then decides to suspend it -- four steps in one
-loop, in that order, and the defect this cut exists to close was a connector
-that behaved correctly at each step and wrongly across them. So the request
+loop, in that order, and the defect the suspension tests exist to catch is a connector
+that behaves correctly at each step and wrongly across them. So the request
 here goes into a real `Scheduler`, and what is asserted is the status the
 engine put it in and the step it came back out on. The clock is the list
 holding one number that the rest of this package's tests use.
 """
+
+from __future__ import annotations
 
 import ast
 import ipaddress
 import json
 import pathlib
 import socket
+import sys
 import time
 from types import SimpleNamespace
 
+import numpy
 import pytest
+import torch
 from conftest import MockConfig, atom_config_double
 from test_kv_simulated_connector import (
     BLOCK_SIZE,
@@ -37,22 +42,26 @@ from test_kv_simulated_connector import (
     TICK,
     model_for,
 )
+from test_runner_non_allocating import ATOM_RUNNER, PACKAGE, _classes
 from transformers import PretrainedConfig
 
 from atom.compass.backends import KvGeometry
 from atom.compass.kv import CLOCK_KEY, TRANSFER_KEY
+from atom.compass.kv.connector import SimulatedKVConnector
 from atom.compass.kv.handoff import (
     SIMULATED_ENGINE_ID,
     SIMULATED_HOST,
     SIMULATED_PORT,
     transfer_params,
 )
+from atom.compass.runner.overrides import NonAllocatingRunner, RunnerRefusal
 from atom.kv_transfer import disaggregation
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus
+from atom.utils import forward_context
 
 #: The backend whose blob shape the router and the consumer were built around.
 PULL_BACKEND_SOURCE = (
@@ -103,7 +112,7 @@ def relayed_fields() -> frozenset:
 
 
 def assert_relays_every_field(blob) -> None:
-    """The check the named result makes, and the one the drop test breaks."""
+    """The check the field-set test makes, and the one the drop test breaks."""
     missing = sorted(relayed_fields() - set(blob))
     assert not missing, f"the relayed blob would not carry {missing}"
     extra = sorted(set(blob) - relayed_fields())
@@ -181,7 +190,7 @@ def assert_could_not_be_dialled(value, field) -> None:
 
 
 def test_the_blob_carries_the_field_set_the_router_relays():
-    """The named result: the emitted set equals the backend's, re-derived."""
+    """The emitted set equals the backend's, re-derived."""
     assert set(simulated_blob()) == relayed_fields()
     assert_relays_every_field(simulated_blob())
 
@@ -248,13 +257,13 @@ def test_the_engine_id_is_the_label_the_host_invents_and_nothing_else():
 def test_the_ranks_the_router_reads_are_numbers(geometry):
     """The router drops `dp_rank` unless it is a number, and says nothing.
 
-    Driven through the connector from a config carrying the widths as text,
-    because that is the only place they can arrive as anything but an int:
-    the request does not carry them, and handing `transfer_params` two
-    literal ints asserts nothing the cast is responsible for. A config field
-    filled from an environment variable or a JSON file is a string, and the
-    failure it causes is silent -- the router substitutes its own registry
-    value for the prefilling worker rather than refusing the blob.
+    Driven through the connector from a config carrying the widths as floats
+    with no fractional part, because handing `transfer_params` two literal
+    ints asserts nothing the conversion is responsible for. A whole float is
+    converted to an `int` on the way in; text is refused, which the test
+    below pins. A rank that went out as anything but a number would fail
+    silently -- the router substitutes its own registry value for the
+    prefilling worker rather than refusing the blob.
     """
     blob = simulated_blob(tp_size=8, dp_rank=3)
     assert isinstance(blob["dp_rank"], int) and blob["dp_rank"] == 3
@@ -264,8 +273,8 @@ def test_the_ranks_the_router_reads_are_numbers(geometry):
         model_for(geometry, PEAKS[0]),
         lambda: ISSUE_AT,
         role="scheduler",
-        tp_size="8",
-        dp_rank="3",
+        tp_size=8.0,
+        dp_rank=3.0,
     )
     seq = finished_sequence()
     scheduler.request_finished(seq)
@@ -288,6 +297,12 @@ def test_the_ranks_the_router_reads_are_numbers(geometry):
         pytest.param("tp_size", False, id="tp_size-false"),
         pytest.param("dp_rank", True, id="dp_rank-true"),
         pytest.param("dp_rank", False, id="dp_rank-false"),
+        pytest.param("tp_size", numpy.bool_(True), id="tp_size-numpy-true"),
+        pytest.param("tp_size", numpy.bool_(False), id="tp_size-numpy-false"),
+        pytest.param("tp_size", torch.tensor(True), id="tp_size-torch-true"),
+        pytest.param("tp_size", "8", id="tp_size-integer-text"),
+        pytest.param("dp_rank", "3", id="dp_rank-integer-text"),
+        pytest.param("tp_size", " 8 ", id="tp_size-padded-text"),
     ],
 )
 def test_a_width_that_is_not_a_whole_number_is_refused_by_name(geometry, field, value):
@@ -295,56 +310,16 @@ def test_a_width_that_is_not_a_whole_number_is_refused_by_name(geometry, field, 
 
     Refused when the connector is built, so a malformed config never serves a
     request. Casting 8.5 to 8 would emit a blob for a deployment that was
-    never launched, and nothing reading it could tell. A `bool` is an `int` to
-    Python and would go out as a width of 1 or 0. Text that `int` does not
-    read as an integer literal is refused rather than read as a float, which
-    would take "1e1" as 10.
+    never launched, and nothing reading it could tell. A boolean, Python's,
+    numpy's or torch's, would go out as a width of 1 or 0. Text is refused
+    whatever it spells, "8" included: ATOM's launch path parses its widths
+    with `int`, so reading text would be a conversion no launch needs.
     """
     widths = {"tp_size": 8, "dp_rank": 3, field: value}
     with pytest.raises(ValueError, match=f"^{field} is .*not a whole number"):
         connector(
             model_for(geometry, PEAKS[0]), lambda: ISSUE_AT, role="scheduler", **widths
         )
-
-
-def test_a_width_in_text_keeps_its_exact_value(geometry):
-    """Text is read as an integer, never through a float that rounds it.
-
-    2**53 + 1 is the smallest integer a float cannot hold, so read through a
-    float it would go out as 2**53: a value changed on the way to an `int`.
-    """
-    exact = 2**53 + 1
-    scheduler = connector(
-        model_for(geometry, PEAKS[0]),
-        lambda: ISSUE_AT,
-        role="scheduler",
-        tp_size=str(exact),
-        dp_rank=str(exact),
-    )
-    seq = finished_sequence()
-    scheduler.request_finished(seq)
-    relayed = seq.kv_transfer_params_output
-    assert relayed["tp_size"] == exact, f"tp_size went out as {relayed['tp_size']}"
-    assert relayed["dp_rank"] == exact, f"dp_rank went out as {relayed['dp_rank']}"
-
-
-@pytest.mark.parametrize(
-    "value", [8, "8", 8.0, " 8 "], ids=["int", "text", "float", "padded"]
-)
-def test_a_whole_width_is_taken_whatever_it_is_spelled_as(geometry, value):
-    """The refusal above is not of integer text or of a float with no fraction."""
-    scheduler = connector(
-        model_for(geometry, PEAKS[0]),
-        lambda: ISSUE_AT,
-        role="scheduler",
-        tp_size=value,
-        dp_rank=value,
-    )
-    seq = finished_sequence()
-    scheduler.request_finished(seq)
-    relayed = seq.kv_transfer_params_output
-    assert type(relayed["tp_size"]) is int and relayed["tp_size"] == 8
-    assert type(relayed["dp_rank"]) is int and relayed["dp_rank"] == 8
 
 
 def test_the_blob_carries_the_request_and_not_a_template():
@@ -399,7 +374,7 @@ def scheduler_with(connector_half, **config):
 def test_a_remote_filled_request_parks_and_leaves_on_its_deadline(
     geometry, seq_factory
 ):
-    """The named result's other half, driven through the engine's own order.
+    """The module's second claim, driven through the engine's own order.
 
     Nothing here calls the connector's scheduler methods. The request is added
     to a real scheduler and stepped; the engine asks, allocates, notifies and
@@ -453,6 +428,80 @@ def step(engine, worker):
     )
     engine._update_from_kv_xfer_finished(aggregated)
     engine.schedule()
+
+
+def test_the_compass_runner_builds_the_worker_that_ends_the_park(
+    geometry, seq_factory, monkeypatch
+):
+    """The same park, with the worker built and started by the runner.
+
+    Importing either runner needs a driver, so `CompassModelRunner`'s class
+    statement is compiled from source over the overrides and an ATOM
+    `ModelRunner` holding only its `process_kvconnector_output`, and the TP
+    group `ModelRunner.__init__` opens is stood in at rank 0.
+    """
+    atom_runner = _classes(ATOM_RUNNER)["ModelRunner"]
+    (method,) = [
+        n
+        for n in atom_runner.body
+        if isinstance(n, ast.FunctionDef) and n.name == "process_kvconnector_output"
+    ]
+    atom_runner.body = [method]
+    namespace = {
+        "torch": torch,
+        "get_kvconnector": forward_context.get_kvconnector,
+        "NonAllocatingRunner": NonAllocatingRunner,
+    }
+    compass_runner = _classes(PACKAGE / "model_runner.py")["CompassModelRunner"]
+    exec(ast.unparse(atom_runner), namespace)  # noqa: S102
+    exec(ast.unparse(compass_runner), namespace)  # noqa: S102
+    group = SimpleNamespace(get_tp_group=lambda: SimpleNamespace(rank_in_group=0))
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", group)
+    monkeypatch.setattr(forward_context, "_global_kvconnector", None)
+
+    model = model_for(geometry, PEAKS[0])
+    now = [ISSUE_AT]
+    runner = object.__new__(namespace["CompassModelRunner"])
+    runner.config = atom_config_double(
+        kv_transfer_config={
+            "kv_connector": "compass",
+            "kv_role": "kv_consumer",
+            CLOCK_KEY: lambda: now[0],
+            TRANSFER_KEY: model,
+        }
+    )
+    assert runner.allocate_kv_cache(100) is True
+    worker = forward_context.get_kvconnector()
+    assert isinstance(worker, SimulatedKVConnector)
+
+    engine = scheduler_with(connector(model, lambda: now[0], role="scheduler"))
+    seq = remote_filled(seq_factory)
+    engine.add(seq)
+    batch, _ = engine.schedule()
+    assert seq.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+    runner.process_kvconnector_output(batch.connector_meta_output)
+    now[0] = model.release_at(ISSUE_AT, len(seq.block_table))
+    step(engine, worker)
+    assert seq.status is SequenceStatus.RUNNING
+
+
+@pytest.mark.parametrize(
+    "kv", [{"kv_connector": "mooncake"}, {"kv_connector": "moriio"}, {}]
+)
+def test_the_compass_runner_refuses_a_real_transfer_backend(kv, monkeypatch):
+    """Refused by name before anything is built; `{}` is the factory's moriio."""
+    calls = []
+    monkeypatch.setattr(
+        forward_context, "set_kv_cache_data", lambda *a, **k: calls.append(a)
+    )
+    runner = object.__new__(NonAllocatingRunner)
+    runner.config = atom_config_double(
+        kv_transfer_config={"kv_role": "kv_consumer", **kv}
+    )
+    name = kv.get("kv_connector", "moriio")
+    with pytest.raises(RunnerRefusal, match=f"kv_connector '{name}' is a real"):
+        runner.allocate_kv_cache(100)
+    assert calls == []
 
 
 def test_nothing_is_announced_for_a_request_the_engine_did_not_suspend(

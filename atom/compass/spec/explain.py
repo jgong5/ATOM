@@ -34,6 +34,23 @@ was measured when no width is given; asking at a width nobody measured is
 refused by name, here as everywhere else. Tokenizer rates explain per entry and
 per rate, because a spec holding two tokenizers has two different answers and a
 reader tracing a tokenization cost needs to see which of them was used.
+
+A term with nothing to explain is refused one of two ways, because the two want
+different actions. A term the schema does not know is asked for again by a real
+path. A term the schema does know, with no field under it that this spec holds,
+would come back empty however it was spelled, so it is refused as the absent
+field it is -- the same refusal `MachineSpec.value` gives for that field.
+
+A term naming several fields is refused when any required field under it is
+absent, and the refusal names every one of them. Explaining from the fields
+that are there would present part of a basis as the whole of it. An optional
+field the document left out is not missing, so a block holding one still
+explains from the rest.
+
+A field the spec does hold is never refused here, even when it holds nothing:
+a tokenizer table with no entries explains to no rows, as `MachineSpec.value`
+answers it with none. It is still printed, as the empty value it holds, so a
+reader can tell a field that contributed nothing from one that was left out.
 """
 
 from collections.abc import Mapping
@@ -43,7 +60,7 @@ from typing import Any
 from .fields import BY_PATH, SCHEMA, Kind
 from .machine import MachineSpec
 from .merge import Merge, entry_label
-from .rules import Rule, SpecRefusal
+from .rules import Rule, SpecRefusal, refuse_absent_field, refuse_absent_fields
 from .tokenizers import ENTRY_FIELDS
 
 #: Predicted quantities, and the spec fields each one is built out of.
@@ -105,11 +122,14 @@ class Basis:
     term: str
     digest: str
     contributions: tuple[Contribution, ...]
+    #: Fields the spec holds that contribute no rows, printed so as not to
+    #: read as fields left out.
+    empty: tuple[Contribution, ...] = ()
 
     def __str__(self) -> str:
         return "\n".join(
             [f"{self.term}, from spec {self.digest}"]
-            + [f"  {contribution}" for contribution in self.contributions]
+            + [f"  {row}" for row in self.contributions + self.empty]
         )
 
 
@@ -183,15 +203,27 @@ def explain(
             for field in SCHEMA
             if field.path == term or field.path.startswith(f"{term}.")
         )
+    if not paths:
+        raise SpecRefusal(
+            Rule.ADDRESSING,
+            f"`{term}` is not a field, a block of fields or a quantity this "
+            "schema knows",
+            "ask again by the whole dotted path of a field or a block of fields, "
+            f"or by one of the quantities {sorted(QUANTITIES)}",
+        )
+    absent = [path for path in paths if path not in spec.values]
+    missing = tuple(path for path in absent if BY_PATH[path].required)
+    if missing:
+        refuse_absent_fields(missing)
+    if len(absent) == len(paths):
+        refuse_absent_field(paths[0], False)
     contributions: list[Contribution] = []
+    empty: list[Contribution] = []
     for path in paths:
         if path in spec.values:
-            contributions += _rows(spec, path, tp_width, origin)
-    if not contributions:
-        raise SpecRefusal(
-            Rule.SHAPE,
-            f"this spec carries nothing named {term!r}",
-            "name a field or a block of fields by its dotted path, or one of "
-            f"the quantities {sorted(QUANTITIES)}",
-        )
-    return Basis(term, spec.digest(), tuple(contributions))
+            rows = _rows(spec, path, tp_width, origin)
+            contributions += rows
+            if not rows:
+                held = spec.values[path]
+                empty.append(_row(path, held, None, _supplied(origin, path)))
+    return Basis(term, spec.digest(), tuple(contributions), tuple(empty))

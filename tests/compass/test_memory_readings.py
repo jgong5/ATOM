@@ -3,30 +3,38 @@
 
 Every test here runs with `torch.cuda.mem_get_info` and
 `torch.cuda.memory_stats` replaced by functions that raise. That is the point of
-the fixture and not a precaution: the claim this task makes is that no reading
-comes off a card, and a claim of that shape is worth what it costs to falsify.
+the fixture and not a precaution: the package claims that no reading comes off
+a card, and a claim of that shape is worth what it costs to falsify.
 It is checked twice over and the two checks fail differently -- the patch would
 catch a call made at run time, and `test_the_package_imports_no_device` catches
-one that could be made at all, by reading the import graph of every module in
-the package. A module that never imports torch cannot call it, however the
-branches fall.
+a device import. It reads every import statement of every module, in every
+branch, and it imports each module in a fresh interpreter, which sees a name
+whose lookup loads the engine (`atom.LLMEngine`, `from atom import *`) and a
+module reached through another. Neither sees a load reached only by code that
+does not run at import (a function body that is not called, or a branch not
+taken), whether it is an import statement or an attribute access, unless the
+statement names a forbidden module itself: `importlib.import_module("torch")`,
+`atom.LLMEngine` or `from atom import LLMEngine` inside a `def`, or a `def`
+that imports a module which imports torch.
 
 The model is the vendored Qwen3.8-27B config, as `test_backend_kv_geometry.py`
 uses it, so the geometry here and the KV geometry there are the same model. The
 spec is a complete MI355X document written out below rather than imported from
-the spec tests, because the named result is meant to be readable beside its
-inputs.
+the spec tests, because the per-term table below is meant to be readable beside
+its inputs.
 
-Two things are asserted as byte counts rather than as properties, because the
-named result of this task is a per-term table and a table nobody checked is a
-claim. The terms that come off the spec are asserted at their exact values, and
-so is the clean-box identity that produces `free`.
+Two things are asserted as byte counts rather than as properties, because what
+this file pins is a per-term table and a table nobody checked is a claim. The
+terms that come off the spec are asserted at their exact values, and so is the
+clean-box identity that produces `free`.
 """
 
 import ast
 import copy
 import json
 import pathlib
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -151,7 +159,7 @@ def no_device_readings(monkeypatch):
 
     def refuse(*args, **kwargs):
         raise AssertionError(
-            "a device reading was taken; the whole of this task is that none is"
+            "a device reading was taken; this package promises that none is"
         )
 
     monkeypatch.setattr(torch.cuda, "mem_get_info", refuse)
@@ -167,6 +175,32 @@ def spec():
 def qwen():
     raw = json.loads(CONFIG_JSON.read_text())
     return PretrainedConfig.from_dict(raw["text_config"])
+
+
+#: The terms sized by the model's element size, at TP1, for a 2-byte and a
+#: 4-byte dtype. With bfloat16 alone, a size that collapsed to the literal 2
+#: would read exactly like the right one; float32 is every term doubled.
+MODEL_TERMS_BY_DTYPE = {
+    "bfloat16": {
+        "weights": 54_000_000_000,
+        "buffers": 33_554_432,
+        "activations": 805_306_368,
+    },
+    "float32": {
+        "weights": 108_000_000_000,
+        "buffers": 67_108_864,
+        "activations": 1_610_612_736,
+    },
+}
+GRAPH_POOL_BY_DTYPE = {"bfloat16": 1_877_213_184, "float32": 3_754_426_368}
+
+
+@pytest.fixture(scope="module", params=sorted(MODEL_TERMS_BY_DTYPE))
+def resident(request, qwen):
+    """The same model with its tensors resident at another dtype."""
+    config = copy.deepcopy(qwen)
+    config.dtype = getattr(torch, request.param)
+    return request.param, config
 
 
 def ladder():
@@ -202,7 +236,7 @@ def readings_at(spec, qwen, tp_width):
     return device_readings(
         spec,
         tp_width=tp_width,
-        model=ModelTerms.declared_for_m1(
+        model=ModelTerms.from_declared_config(
             qwen,
             parameter_count=PARAMETERS,
             tp_size=tp_width,
@@ -212,13 +246,14 @@ def readings_at(spec, qwen, tp_width):
     )
 
 
-# --- the named result --------------------------------------------------------
+# --- the per-term table ------------------------------------------------------
 
-#: Every term of every reading at TP1 and TP2, as bytes. This is the named
-#: result of the task, and it is written down so that a change to any one term
-#: is a change to this table rather than to a total that could absorb it. All
-#: five readings are here: `cudagraph_overhead` was constrained only by a ratio
-#: band in cycle 1, which a 7% move in LIVE_TENSORS_PER_LAYER passed through.
+#: Every term of every reading at TP1 and TP2, as bytes. It is written down so
+#: that a change to any one term is a change to this table rather than to a
+#: total that could absorb it. All five readings are here, `cudagraph_overhead`
+#: included: the ratio band in
+#: `test_the_two_graph_pool_numbers_disagree_by_the_recorded_factor` lets a 7%
+#: move in LIVE_TENSORS_PER_LAYER through at width 1.
 EXPECTED = {
     1: {
         "total": {"capacity": 288_000_000_000},
@@ -300,10 +335,10 @@ def test_the_declared_terms_are_exactly_weights_buffers_and_activations(spec, qw
 
 @pytest.mark.parametrize("tp_width", [1, 2])
 def test_the_min_budget_free_clamp_cannot_bind(spec, qwen, tp_width):
-    # Making it inert is this task's job; proving it against ATOM's own
-    # arithmetic belongs to the cut that wires them in. What is checked here
-    # is the only thing checkable without the engine: with `free` a clean box,
-    # the budget branch is below it at every utilisation the engine accepts.
+    # `test_kv_budget_engine.py` checks with the engine that the clamp does not
+    # bind. What is checked here is the only thing checkable without the engine:
+    # with `free` a clean box, the budget branch is below it at every
+    # utilisation the engine accepts.
     readings = readings_at(spec, qwen, tp_width)
     total = readings.total.total
     for utilisation in (0.5, 0.7, 0.9, 0.95, 1.0):
@@ -350,7 +385,7 @@ def test_a_configuration_that_does_not_fit_refuses_rather_than_clamping(spec, qw
         device_readings(
             spec,
             tp_width=1,
-            model=ModelTerms.declared_for_m1(
+            model=ModelTerms.from_declared_config(
                 qwen,
                 parameter_count=400_000_000_000,
                 tp_size=1,
@@ -371,7 +406,7 @@ def test_the_predicting_function_cannot_be_spent_as_the_reserving_one(spec, qwen
         device_readings(
             spec,
             tp_width=1,
-            model=ModelTerms.declared_for_m1(
+            model=ModelTerms.from_declared_config(
                 qwen,
                 parameter_count=PARAMETERS,
                 tp_size=1,
@@ -466,10 +501,10 @@ def test_an_absent_partial_rotary_factor_says_so_in_the_table(qwen):
     # row must not look the same as a config that states 1.0.
     full = copy.deepcopy(qwen)
     del full.partial_rotary_factor
-    stated = ModelTerms.declared_for_m1(
+    stated = ModelTerms.from_declared_config(
         qwen, parameter_count=PARAMETERS, tp_size=1, warmup_tokens=WARMUP_TOKENS
     )
-    assumed = ModelTerms.declared_for_m1(
+    assumed = ModelTerms.from_declared_config(
         full, parameter_count=PARAMETERS, tp_size=1, warmup_tokens=WARMUP_TOKENS
     )
     assert "absent from config, assumed" in assumed.buffers.source
@@ -481,23 +516,54 @@ def test_the_model_dtype_sizes_the_model_terms(qwen):
     # Read off the config, not a module constant: a term sized in fp32 where
     # the tensors are resident in bf16 is twice what the model holds.
     assert str(qwen.dtype).endswith("bfloat16")
-    terms = ModelTerms.declared_for_m1(
+    terms = ModelTerms.from_declared_config(
         qwen, parameter_count=PARAMETERS, tp_size=1, warmup_tokens=WARMUP_TOKENS
     )
     assert terms.buffers.nbytes == 262_144 * 64 * 2
     assert " x 2 B" in terms.buffers.source
 
 
+def test_the_model_terms_follow_the_element_size(spec, resident):
+    name, config = resident
+    peak = readings_at(spec, config, 1).peak_torch
+    expected = MODEL_TERMS_BY_DTYPE[name]
+    assert {t.name: t.nbytes for t in peak.terms if t.name in expected} == expected
+
+
+def test_the_graph_pool_reservation_follows_the_element_size(resident):
+    name, config = resident
+    assert reserved(config, 288.0e9).total == GRAPH_POOL_BY_DTYPE[name]
+
+
 def test_a_config_with_no_dtype_refuses_rather_than_assuming_one(qwen):
     nameless = copy.deepcopy(qwen)
     del nameless.dtype
-    with pytest.raises(MemoryRefusal, match="neither `dtype` nor `torch_dtype`"):
-        ModelTerms.declared_for_m1(
+    with pytest.raises(MemoryRefusal, match="states no `dtype`, and every byte"):
+        ModelTerms.from_declared_config(
             nameless,
             parameter_count=PARAMETERS,
             tp_size=1,
             warmup_tokens=WARMUP_TOKENS,
         )
+
+
+@pytest.mark.parametrize(
+    "field", ["hidden_size", "intermediate_size", "head_dim", "max_position_embeddings"]
+)
+def test_a_config_missing_a_geometry_field_refuses_naming_that_field(qwen, field):
+    shapeless = copy.deepcopy(qwen)
+    delattr(shapeless, field)
+    with pytest.raises(MemoryRefusal) as refusal:
+        ModelTerms.from_declared_config(
+            shapeless,
+            parameter_count=PARAMETERS,
+            tp_size=1,
+            warmup_tokens=WARMUP_TOKENS,
+        )
+    assert refusal.value.what == (
+        f"this config states no `{field}`, and the memory model reads it"
+    )
+    assert "through ATOM's own config classes" in refusal.value.remedy
 
 
 def test_the_negative_box_refusal_carries_its_decomposition(spec, qwen):
@@ -507,7 +573,7 @@ def test_the_negative_box_refusal_carries_its_decomposition(spec, qwen):
         device_readings(
             spec,
             tp_width=1,
-            model=ModelTerms.declared_for_m1(
+            model=ModelTerms.from_declared_config(
                 qwen,
                 parameter_count=400_000_000_000,
                 tp_size=1,
@@ -536,15 +602,24 @@ FORBIDDEN_ROOTS = frozenset({"torch", "transformers"})
 FORBIDDEN_PREFIXES = ("atom.model_engine", "atom.model_ops", "atom.models")
 
 
+def _forbidden(mod):
+    return mod.split(".")[0] in FORBIDDEN_ROOTS or mod.startswith(FORBIDDEN_PREFIXES)
+
+
 def _imported_names(tree):
     """Every module name a tree imports, with relative imports resolved.
 
     Resolving the level is what makes this test hold. `from ...model_engine
     import model_runner` carries `node.module == 'model_engine'` and
     `node.level == 3`, which matches neither a forbidden root nor a forbidden
-    prefix; and `from . import sibling` carries `node.module is None`, which a
-    truthiness guard skips entirely. Both were live escapes until a reviewer
-    walked them.
+    prefix; its two rows in the positive control,
+    `test_the_import_guard_catches_what_it_claims_to`, fail when the level is
+    ignored. `from ... import model_engine` carries `node.module is None`,
+    which a truthiness guard skips entirely; here each imported name is
+    resolved against the package instead, to `atom.model_engine`, and its row
+    fails when that guard is put back. The absolute `from atom import
+    model_engine` adds `atom.model_engine` beside `atom`, and its row fails
+    without that.
     """
     names = set()
     for node in ast.walk(tree):
@@ -553,23 +628,45 @@ def _imported_names(tree):
         elif isinstance(node, ast.ImportFrom):
             if node.level:
                 parts = PACKAGE_DOTTED.split(".")[: -node.level + 1 or None]
-                names.add(".".join(parts + ([node.module] if node.module else [])))
+                if node.module:
+                    names.add(".".join(parts + [node.module]))
+                else:
+                    names.update(".".join(parts + [alias.name]) for alias in node.names)
             elif node.module:
                 names.add(node.module)
+                names.update(f"{node.module}.{alias.name}" for alias in node.names)
     return names
+
+
+def _device_imports(source):
+    """The forbidden modules imported by running `source` inside the package, in
+    a fresh interpreter (this one imported torch above) started in the root this
+    suite imported `atom` from. The first forbidden import is refused before it
+    loads, so a caught row costs an interpreter start, not an engine."""
+    probe = (
+        "import os, sys\n"
+        "class Refuse:\n"
+        "    def find_spec(name, *_):\n"
+        f"        if name.split('.')[0] in {sorted(FORBIDDEN_ROOTS)} or name.startswith({FORBIDDEN_PREFIXES}):\n"
+        "            os.write(1, b'\\n' + name.encode()), os._exit(0)\n"
+        "sys.meta_path.insert(0, Refuse)\n"
+        f"exec({source!r}, {{'__package__': {PACKAGE_DOTTED!r}}})\n"
+        "print(*sys.modules)"
+    )
+    run = [sys.executable, "-c", probe]
+    loaded = subprocess.check_output(run, cwd=PACKAGE.parents[2], text=True).split()
+    return [name for name in loaded if _forbidden(name)]
 
 
 @pytest.mark.parametrize("module", sorted(p.name for p in PACKAGE.glob("*.py")))
 def test_the_package_imports_no_device(module):
-    # The patched fixture catches a call; this catches the possibility of one,
-    # for branches that never execute. It is one level deep and not a closure:
-    # a memory module importing an `atom.compass.*` module that itself imports
-    # torch passes here, and a full closure needs a real import walk. Nothing
-    # in the package does that today, and this says so rather than implying a
-    # guarantee it does not give.
+    # The patched fixture catches a call; this catches the possibility of one.
+    # The walk reads branches that never execute but only one level deep; the
+    # import reads the whole closure but only what runs at import time.
     for name in sorted(_imported_names(ast.parse((PACKAGE / module).read_text()))):
-        assert name.partition(".")[0] not in FORBIDDEN_ROOTS, f"{module} -> {name}"
-        assert not name.startswith(FORBIDDEN_PREFIXES), f"{module} -> {name}"
+        assert not _forbidden(name), f"{module} -> {name}"
+    dotted = f"{PACKAGE_DOTTED}.{module[:-3]}".removesuffix(".__init__")
+    assert _device_imports(f"import {dotted}") == [], module
 
 
 @pytest.mark.parametrize(
@@ -580,17 +677,35 @@ def test_the_package_imports_no_device(module):
         ("from atom.model_engine.model_runner import ModelRunner", True),
         ("from ...model_engine import model_runner", True),
         ("from ...model_engine.model_runner import ModelRunner", True),
+        ("from ... import model_engine", True),
+        ("from atom import model_engine", True),
         ("from . import terms", False),
         ("from atom.compass.spec import MachineSpec", False),
     ],
 )
 def test_the_import_guard_catches_what_it_claims_to(source, caught):
-    # A guard with no positive control is a guard nobody has seen work. Every
-    # row here was run against a scratch copy of this package by the cycle-1
-    # reviewer; the two relative forms passed before this test existed.
+    # A guard with no positive control is a guard nobody has seen work.
     names = _imported_names(ast.parse(source))
-    hit = any(
-        name.partition(".")[0] in FORBIDDEN_ROOTS or name.startswith(FORBIDDEN_PREFIXES)
-        for name in names
-    )
-    assert hit is caught, names
+    assert any(map(_forbidden, names)) is caught, names
+
+
+@pytest.mark.parametrize(
+    "source,caught",
+    [
+        ("from ... import LLMEngine", True),
+        ("import atom\natom.LLMEngine", True),
+        ("from ... import *", True),
+        ("from atom.compass.runner import overrides", True),
+        ("import sys\nsys.stdout.write('x')\nfrom ... import LLMEngine", True),
+        ("import io, sys\nsys.stdout = io.StringIO()\nfrom ... import LLMEngine", True),
+        ("from . import terms", False),
+    ],
+)
+def test_the_import_run_catches_what_the_walk_does_not(source, caught):
+    # Every row passes the walk. Each True row reaches a device import anyway: a
+    # name, not a module, loads the engine through `atom/__init__.py`'s lazy lookup,
+    # or a module outside the package imports torch. The refusal goes to file
+    # descriptor 1, so the two rows that write to or replace `sys.stdout` do not
+    # hide it.
+    assert not any(map(_forbidden, _imported_names(ast.parse(source))))
+    assert bool(_device_imports(source)) is caught

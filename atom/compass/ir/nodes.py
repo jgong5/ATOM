@@ -372,11 +372,14 @@ def _as_attrs(attrs: Any) -> tuple[tuple[str, Any], ...]:
     checked against `AMBIENT_READINGS`, which catches the per-step readings that
     arrive as plain numbers and that no type rule could tell from a width.
 
-    An item that is not a pair at all and an item that is a pair of the wrong
-    length are separate refusals, and each names its own fault: they once shared
-    an opening sentence, and a str was the case that made the difference matter,
-    since a two-character str unpacks into a name and a value and would
-    otherwise be accepted as one.
+    An item that is not a tuple or list and an item of the wrong length are
+    separate refusals, and each names its own fault. The container test comes
+    first, and it is the one that refuses a str: a two-character str has length
+    2 and unpacks into a name and a value, so the length test alone would
+    accept it. No str test of its own is needed, because no type can be both a
+    str or bytes and a tuple or list -- Python refuses that combination of
+    bases as an instance lay-out conflict. An object whose `__class__` answers
+    `tuple` still passes the container test, since `isinstance` believes it.
     """
     if isinstance(attrs, (str, bytes)):
         raise TypeError(f"attributes are name/value pairs, got {attrs!r}")
@@ -384,7 +387,7 @@ def _as_attrs(attrs: Any) -> tuple[tuple[str, Any], ...]:
     pairs: list[tuple[str, Any]] = []
     seen: dict[str, None] = {}
     for item in items:
-        if isinstance(item, (str, bytes)) or not isinstance(item, (tuple, list)):
+        if not isinstance(item, (tuple, list)):
             raise TypeError(
                 f"each attribute is a (name, value) pair, given as a tuple or "
                 f"list; got {item!r}"

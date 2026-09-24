@@ -49,8 +49,8 @@ from atom.models.utils import get_pp_indices
 CONFIG_JSON = pathlib.Path(__file__).with_name("qwen3_5_27b_config.json")
 BLOCK_SIZE = 64
 MAX_NUM_SEQS = 512
-# A budget, not a measurement: the device readings are another task's, and a
-# fixed number is what makes these counts reproducible.
+# A budget, not a measurement: no device is read for it, and a fixed number is
+# what makes these counts reproducible.
 KV_BUDGET_BYTES = 64 << 30
 
 
@@ -198,18 +198,36 @@ def test_a_width_the_kv_heads_cannot_shard_is_refused(qwen):
     `kv_heads_per_rank` refuses on either side of `total_kv_heads >= tp_size`,
     and the two sentences differ only in which width is said not to divide the
     other. Reading that comparison the other way up routes this very call to
-    the replicated branch, so `do not divide` alone held both ways. What
-    separates them is the order of the two operands and the clause about
-    replication, and both are asserted here.
+    the replicated branch, so `do not divide` alone held both ways. The whole
+    sentence is matched, from its first character to its last, so the operand
+    order is asserted and the replicated branch's extra clause cannot be
+    present. The next test reaches that branch and holds its sentence.
     """
     heads = qwen.num_key_value_heads
     with pytest.raises(
-        ValueError, match=rf"{heads} KV heads do not divide across 3 ranks"
-    ) as refused:
+        ValueError, match=rf"^{heads} KV heads do not divide across 3 ranks$"
+    ):
         KvGeometry.from_hf_config(
             qwen, block_size=BLOCK_SIZE, parallelism=Parallelism(tp_size=3)
         )
-    assert "replicated case" not in str(refused.value)
+
+
+def test_more_ranks_than_kv_heads_that_they_do_not_divide_is_refused(qwen):
+    """Six ranks over 4 KV heads: the heads cannot be cut and cannot be copied.
+
+    More ranks than heads is the replicated case, where each rank keeps a copy
+    of one head. That needs the heads to divide the ranks, and 4 does not
+    divide 6, so this is refused too, with the operands the other way round.
+    """
+    heads = qwen.num_key_value_heads
+    with pytest.raises(
+        ValueError,
+        match=rf"^6 ranks do not divide across {heads} KV heads, so the "
+        r"replicated case does not apply either$",
+    ):
+        KvGeometry.from_hf_config(
+            qwen, block_size=BLOCK_SIZE, parallelism=Parallelism(tp_size=6)
+        )
 
 
 def test_an_unrecognised_layer_kind_is_refused_rather_than_paged(qwen):
@@ -246,3 +264,14 @@ def test_a_uniform_stack_needs_no_layer_kinds():
     geometry = KvGeometry.from_hf_config(dense, block_size=BLOCK_SIZE)
     assert (geometry.layers, geometry.head_dim, geometry.element_bytes) == (32, 128, 2)
     assert blocks_for(geometry) == KV_BUDGET_BYTES // geometry.bytes_per_block
+
+
+def test_a_config_with_no_dtype_is_refused_rather_than_sized(qwen):
+    """With no dtype and no kv_dtype there is no element size to assume."""
+    nameless = PretrainedConfig.from_dict({**qwen.to_dict(), "dtype": None})
+    with pytest.raises(ValueError, match="states no `dtype` and no kv_dtype"):
+        KvGeometry.from_hf_config(nameless, block_size=BLOCK_SIZE)
+    stated = KvGeometry.from_hf_config(
+        nameless, block_size=BLOCK_SIZE, kv_dtype="float16"
+    )
+    assert stated.element_bytes == 2

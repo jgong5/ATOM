@@ -198,9 +198,9 @@ fills and slices, nothing else:
 | where | lines | conversions |
 |---|---|---|
 | `aiter_attention.py in prepare_decode` | 1106, 1115, 1121, 1122, 1123, 1131, 1132 | 10 |
-| `model_runner.py in prepare_inputs` | 2441, 2452, 2454 | 4 |
-| `model_runner.py in prepare_input_ids` | 510, 513 | 2 |
-| `model_runner.py in prepare_sample` | 2537 | 1 |
+| `model_runner.py::ModelRunner.prepare_inputs` | 2468, 2479, 2481 | 4 |
+| `model_runner.py::tokenIDProcessor.prepare_input_ids` | 510, 513 | 2 |
+| `model_runner.py::ModelRunner.prepare_sample` | 2564 | 1 |
 | `backends.py in _mrope_cpu_view` | 398, 400 | 2 |
 | `gdn_attn.py in _attach_gdn_decode_metadata` | 1237 | 1 |
 

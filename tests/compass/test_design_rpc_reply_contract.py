@@ -18,8 +18,16 @@ the second one parks anybody.
 **This guards the document, not the runner.** What a runner must return, and
 what a raise becomes once it has left the worker, are asserted beside the module
 that owns them. What is asserted here is that the prose still describes ATOM's
-source: the names it enumerates, how many of them are waited on, which ones are
-not, and the site and arity it cites for the unpack.
+source: the names it enumerates and how many there are, how many of them are
+waited on, which ones are not, and the site and arity it cites for the unpack.
+
+That is the whole reach: the six values `audit` compares. Every other assertion
+is outside it, including one that sits beside a compared name or number. Flip
+where the unpack runs or whether the wait has a timeout, or cite other lines for
+the dispatch, and nothing here fails; nor does putting the rule this paragraph
+replaced back in place of the sentence that corrects it, with every compared
+value left alone. The source facts behind the first two are checked below; that
+the prose still makes them is not.
 
 Nothing below writes down an answer. The waited/unwaited partition comes from
 `RPC_SURFACE`, the unpack's line and arity are walked out of `engine_core.py`,
@@ -36,6 +44,7 @@ aiter's architecture probe, and these tests run with no driver.
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 from pathlib import Path
 
@@ -217,7 +226,9 @@ def _revert(text: str) -> str:
 # One drift at a time, each a document edit, a surface edit, or both. The first
 # is the whole paragraph reverted; then a name losing its waiting caller with
 # the prose not told; then the cited unpack line ceasing to be the unpack line;
-# then a dispatched name dropped from the list the paragraph counts.
+# then a dispatched name dropped from the list the paragraph counts. The last
+# three move one claim alone: the total, the arity, and which names go unwaited
+# with their count unchanged.
 DRIFTS = (
     ("reverted", lambda text, surface: (_revert(text), surface)),
     ("surface", lambda text, surface: (text, dict(surface, dummy_execution=False))),
@@ -226,13 +237,40 @@ DRIFTS = (
         "enumeration",
         lambda text, surface: (text.replace("`flush_pp_send`.", "."), surface),
     ),
+    ("total", lambda t, s: (t.replace("the twelve names", "the eleven names"), s)),
+    ("arity", lambda t, s: (t.replace("three values", "two values"), s)),
+    ("unwaited", lambda t, s: (t, dict(s, exit=True, dummy_execution=False))),
 )
+
+# The checks each drift must raise and no others, so a check deleted from
+# `audit` fails, by name, every drift that raises it.
+TOTAL, CITE = "how many there are", f"the line it cites for the {UNPACKED} unpack"
+WAITED, UNWAITED = "how many are waited on", "which are not waited on"
+FIRES = {
+    "reverted": {TOTAL, WAITED, UNWAITED, CITE},
+    "surface": {WAITED, UNWAITED},
+    "citation": {CITE},
+    "enumeration": {"the names it enumerates"},
+    "total": {TOTAL},
+    "arity": {f"the values {UNPACKED} unpacks into"},
+    "unwaited": {UNWAITED},
+}
 
 
 @pytest.mark.parametrize("drift", DRIFTS, ids=[name for name, _ in DRIFTS])
 def test_the_guard_fires_when_one_side_moves_alone(drift):
     """The firing direction, each drift routed through the same `audit`."""
-    assert audit(*drift[1](DOCUMENT, RPC_SURFACE)), "a lone drift left the guard silent"
+    fired = audit(*drift[1](DOCUMENT, RPC_SURFACE))
+    assert {c.split(": the paragraph says ")[0] for c in fired} == FIRES[drift[0]]
+
+
+def test_reverted_is_the_pre_fix_paragraph_byte_for_byte():
+    """A paraphrase would still fire the guard; this keeps `REVERTED` the paragraph
+    at the commit named above it. The digest is sha256 over that paragraph alone:
+    the document split on blank lines, LF endings, no trailing newline, UTF-8. It
+    pins history, so the only legitimate change is a new anchor commit."""
+    digest = "36da9cc1ef3f9f1fa8bdf192023dc2e332d6c42dc5dce1ca318a5fb0f8c0a932"
+    assert hashlib.sha256(REVERTED.encode("utf-8")).hexdigest() == digest
 
 
 def test_the_guard_is_silent_when_the_paragraph_and_the_surface_move_together():

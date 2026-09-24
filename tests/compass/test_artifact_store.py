@@ -420,6 +420,7 @@ def test_a_member_changed_after_hand_off_is_refused(tmp_path):
     entry = store.read(key)
     name = member_name("prices", topology.ranks()[0], "json")
     assert (entry.directory / name).stat().st_mode & 0o222 == 0
+    assert (entry.directory / "entry.json").stat().st_mode & 0o222 == 0
     (entry.directory / name).chmod(0o644)
     (entry.directory / name).write_bytes(b"re-run in place")
     with pytest.raises(ArtifactRefusal) as refused:

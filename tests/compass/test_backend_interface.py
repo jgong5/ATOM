@@ -116,6 +116,21 @@ def test_the_guard_finds_nothing_when_the_root_moves(monkeypatch, tmp_path):
     assert not _backend_modules()
 
 
+def test_the_walk_returns_every_module_under_the_root(monkeypatch, tmp_path):
+    """Non-empty says the walk found something; this, every module of a tree built here.
+
+    The tree is built here, so the expected set does not move when the package
+    gains a module. A walk that is not recursive misses `sub/b.py`, and any
+    narrowing or slice that drops a module of the built tree fails the same way.
+    """
+    for rel in ("__init__.py", "a.py", "sub/b.py"):
+        (tmp_path / rel).parent.mkdir(exist_ok=True)
+        (tmp_path / rel).write_text("")
+    monkeypatch.setitem(globals(), "PACKAGE", tmp_path)
+    modules = {str(p.relative_to(tmp_path)) for p in _backend_modules()}
+    assert modules == {"__init__.py", "a.py", "sub/b.py"}
+
+
 @pytest.mark.parametrize(
     "path",
     _backend_modules(),
@@ -128,3 +143,13 @@ def test_the_package_imports_nothing_from_the_engine(path):
             assert module.startswith(
                 "atom.compass.backends"
             ), f"{path.name}:{node.lineno} imports {module}"
+
+
+def test_every_module_the_walk_returns_is_a_case():
+    """The cases are compared to the walk, not only the walk to its tree.
+
+    A slice or filter where the walk is handed to the parametrisation drops
+    cases while the walk itself still returns every module.
+    """
+    (mark,) = test_the_package_imports_nothing_from_the_engine.pytestmark
+    assert mark.args[1] == _backend_modules()

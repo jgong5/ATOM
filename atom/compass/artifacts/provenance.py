@@ -25,15 +25,15 @@ aiter's, aiter lives in the container's writable layer outside `/workspace`,
 and two versions are in circulation on this project right now. A stanza naming
 only ATOM's tree describes half of what ran, so a `Provenance` cannot be built
 without both. **What a difference then means is not decided here**: whether an
-aiter bump invalidates an artifact or only warns is the owner's ruling, and
-this module records the version so a ruling has something to act on.
+aiter bump invalidates an artifact or only warns is left open (#168), and
+this module records the version so either answer has something to act on.
 
-`git describe --tags --always --dirty` is `gate_gpu.sh:153-159`'s call,
-adopted. What is not adopted is how that script finds the checkout: it imports
-`aiter` to read `aiter.__file__`, and importing aiter shells out to `rocminfo`,
-which hangs uninterruptibly on a node whose driver is wedged. `module_root`
-executes nothing at all -- see its own note, because `find_spec` alone is not
-enough for a dotted name.
+`git describe --tags --always --dirty` is the call the GPU gate makes to
+version aiter, and the gate finds aiter's checkout with this module's
+`module_root`, so the two agree on which checkout that is. Neither imports
+aiter: importing it shells out to `rocminfo`, which hangs uninterruptibly on a
+node whose driver is wedged. `module_root` executes nothing at all -- see its
+own note, because `find_spec` alone is not enough for a dotted name.
 
 **Every module that can answer is digested, not just the one named.** A
 hard-coded `sys.path` once let a stale regions module answer under a current
@@ -297,7 +297,7 @@ def git_tree_root(name: str, root: str, run=_run) -> SourceRoot:
 
 
 def git_described_root(name: str, root: str, run=_run) -> SourceRoot:
-    """A source root identified the way `gate_gpu.sh:153-159` identifies aiter."""
+    """A source root identified the way the GPU gate identifies aiter's checkout."""
     code, version, error = run(
         ["git", "-C", root, "describe", "--tags", "--always", "--dirty"]
     )

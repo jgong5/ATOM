@@ -4,7 +4,7 @@
 """The five readings `get_num_blocks` takes off a card, taken off a spec instead.
 
 The rule is **substitute the readings, never the arithmetic**. ATOM's
-`get_num_blocks` (`model_runner.py:1652-1873`) is five device readings and then
+`get_num_blocks` (`model_runner.py:1686-1900`) is five device readings and then
 some arithmetic over them; this module owns the five, and the budget formula,
 the 2% margin, the `min(budget, free)` clamp and `plan_pools` stay ATOM's. A
 copy of that formula here is exactly the drift the substitution exists to avoid,
@@ -25,8 +25,10 @@ neighbour held 152 GB while this rank had reserved 2.9 GB. Taking `non_torch`
 from a spec removes that contamination by construction. And with `free` derived
 as the box that is left, the `min(budget, free)` clamp cannot bind -- the prior
 design needed a `free_was_binding()` guard to refuse records where it had, and
-this one does not. Making it inert is this module's job; proving it against
-ATOM's own arithmetic belongs to the cut that wires these readings in.
+this one does not. Making it inert is this module's job; ATOM's own budget
+arithmetic runs over these readings in `atom.compass.runner.overrides`, and
+`test_the_min_budget_free_clamp_does_not_bind_on_either_side_of_free` in
+`tests/compass/test_kv_budget_engine.py` checks that the clamp does not bind.
 
 The declared scope boundary that follows, stated so it is not discovered as a
 gap: Compass models a **dedicated** device. It will not predict the OOM a shared
@@ -39,8 +41,8 @@ tested -- and buffers need a recording, because the formula that matched the
 tree, which needs the engine, which this tier does not import; and there is no
 recording of a card nobody has run. So `ModelTerms` takes those two terms rather
 than deriving them, with no default -- the same shape as the spec's "a runtime
-constant has no default" rule, and for the same reason. `declared_for_m1` fills
-all three with declared formulas for M1 and labels every one of them. For the
+constant has no default" rule, and for the same reason. `from_declared_config`
+fills all three with declared formulas and labels every one of them. For the
 activation term a declared formula is the only answer while no op graph
 exists; this module gives the other two the same treatment, visibly.
 """
@@ -81,17 +83,16 @@ def _geometry(config, name: str):
 
 
 def _dtype(config):
-    """The dtype a model's tensors are resident at, under either spelling."""
+    """The dtype a model's tensors are resident at."""
     text = getattr(config, "text_config", config)
-    for name in ("dtype", "torch_dtype"):
-        value = getattr(text, name, None)
-        if value is not None:
-            return value
-    raise MemoryRefusal(
-        "this config states neither `dtype` nor `torch_dtype`, and every byte "
-        "of the model-side terms is twice or half what it should be without it",
-        "name the dtype on the config, or pass `dtype_bytes` explicitly",
-    )
+    value = getattr(text, "dtype", None)
+    if value is None:
+        raise MemoryRefusal(
+            "this config states no `dtype`, and every byte of the model-side "
+            "terms is twice or half what it should be without it",
+            "name the dtype on the config, or pass `dtype_bytes` explicitly",
+        )
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +110,7 @@ class ModelTerms:
     activations: Term
 
     @classmethod
-    def declared_for_m1(
+    def from_declared_config(
         cls,
         config,
         *,
@@ -120,7 +121,7 @@ class ModelTerms:
     ) -> ModelTerms:
         """All three from geometry and declared coefficients, each labelled.
 
-        For M1, with fake models, a declared formula suffices and must say so.
+        With fake models, a declared formula suffices and must say so.
         Every term below is `Basis.DECLARED` and every one names its
         successor, because none of the three is its eventual source: weights
         are owed a meta build, buffers a recording, and
@@ -129,7 +130,7 @@ class ModelTerms:
         with no law behind it. The measured spread that makes it load-bearing
         is 0.1 KB/token on the 0.6B against 39.6 KB/token on the 27B, the
         difference between -35.0% and +3.4% held out. A formula does not
-        stand in for that past M1.
+        stand in for that on a real model.
         """
         if tp_size < 1:
             raise ValueError(f"tensor-parallel width is at least 1: {tp_size}")
@@ -170,7 +171,7 @@ class ModelTerms:
             "positions x rotary_dim elements, because inv_freq holds "
             "rotary_dim/2 of them (model_ops/rotary_embedding.py:58-80), and "
             "they are resident at the model dtype they are cast to, not the "
-            "fp32 they are computed in (:39-49, set at model_runner.py:700)",
+            "fp32 they are computed in (:39-49, set at model_runner.py:714)",
         )
         activations = Term(
             "activations",
@@ -188,7 +189,7 @@ class ModelTerms:
             f"{_LIVE_INTERMEDIATE} x {intermediate} intermediate)",
             "a liveness walk over a traced op graph, plus the per-leaf "
             "invisible-scratch constants, replace this; the per-layer "
-            "coefficient is ATOM's own (model_runner.py:3601), over one live "
+            "coefficient is ATOM's own (model_runner.py:3628), over one live "
             "layer rather than all of them",
         )
         return cls(weights, buffers, activations)
@@ -333,7 +334,7 @@ def device_readings(
             "this configuration does not start on this card. Even "
             "--gpu-memory-utilization 1.0 is insufficient -- the non-KV terms "
             f"alone are {needed:.2f} of total -- so the lever ATOM names on "
-            "its own version of this failure (model_runner.py:1698-1706) will "
+            "its own version of this failure (model_runner.py:1725-1733) will "
             "not reach it; reduce the width, the model or the warmup shape, "
             "or name a larger card. A clamped zero here would be a free "
             "reading nobody could read as a refusal",
