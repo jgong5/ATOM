@@ -40,7 +40,8 @@ from __future__ import annotations
 import json
 import logging
 import math
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from atom.compass.core.cost.base import StepCost, StepShape
@@ -75,6 +76,10 @@ class _Costed:
     #: prefill graph it is the chunk, and together with `context` it is what
     #: distinguishes one prefill graph from another.
     tokens: int = 0
+    #: Per priced operator: (name, dimensions, seconds). Kept so a graph can be
+    #: re-priced for a nearby shape without re-reading it, which is the only
+    #: thing `op_fit` needs and is not worth a second pass over the blob.
+    entries: tuple = ()
 
 
 
@@ -172,6 +177,122 @@ HOST_SYNC = frozenset({
     "aten::equal", "aten::allclose",
 })
 
+
+#: Smallest chunk whose cost is token-proportional enough to scale. Below it a
+#: prefill chunk is latency-bound -- the device is not doing work in proportion
+#: to the tokens, it is paying to be asked -- and a power law cannot express a
+#: floor, so it predicts a doubling where the truth is a rounding error.
+#:
+#: Measured from the price list itself, as the exponent each pair of shapes
+#: differing only in their token dimension implies. On `aiter::gemm_a16w16`,
+#: where the small shapes are dense enough to say:
+#:
+#:     smaller side of the pair   pairs   implied exponent
+#:                        1-64      42              0.008
+#:                      64-256       5              0.882
+#:                   1024-4096       5              0.947
+#:                       >4096      38              0.986
+#:
+#: Flat below 64 and proportional above it. Attention has one pair below 4096
+#: and cannot second the number, so this is the gemm's boundary applied to
+#: every operator, and it is a floor on where the fit is *allowed* to speak
+#: rather than a claim about where every kernel turns over. Chunks below it
+#: keep the unscaled behaviour: on the four rungs measured they are 712 steps
+#: worth 7.3% of prefill seconds.
+MIN_FITTED_TOKENS = 64
+
+
+def _dims_of(shapes, contexts) -> tuple:
+    """The dimensions an operator's cost could be a function of.
+
+    Every input dimension, flattened, plus the longest context when the
+    operator was recorded attending to one -- an attention call reading 40
+    tokens of history and one reading 4000 have identical input shapes and are
+    not the same work, and the context is where that difference is written.
+
+    Deliberately generic rather than a table of dimensions per operator: such a
+    table has to be maintained against the model, and the fit discards any
+    dimension that does not vary anyway. A vector holding a non-positive
+    dimension is refused rather than logged, because the fit is in log space.
+    """
+    dims = [int(d) for shape in shapes for d in shape]
+    if contexts:
+        dims.append(int(max(contexts)))
+    return tuple(dims) if dims and all(d > 0 for d in dims) else ()
+
+
+def _dims_of_signature(sig: str) -> tuple:
+    """`_dims_of` for a price-list key, which carries the same facts as text."""
+    parts = sig.split("|")
+    if len(parts) < 2:
+        return ()
+    shapes = [[int(d) for d in group.split(",") if d.strip().isdigit()]
+              for group in parts[1].split(";")]
+    found = re.search(r"context_lens=\[([0-9, ]*)\]", sig)
+    contexts = ([int(v) for v in found.group(1).split(",") if v.strip()]
+                if found else [])
+    return _dims_of(shapes, contexts)
+
+
+def _fit_operators(price_list: dict) -> dict:
+    """Per operator, a power law in its own dimensions.
+
+    ``log seconds = a + sum(b_i * log d_i)``, least squares over every distinct
+    shape the operator was priced at. One point per distinct dimension vector,
+    not per key: the attention key embeds a slot map, so a single shape appears
+    under hundreds of keys and counting them all would weight a shape by how
+    often the step trace happened to hit it.
+
+    The intercept is fitted and then never used. What this is for is the
+    *ratio* between two nearby shapes of one operator, and the intercept
+    cancels there -- which is the whole reason it is usable at all. Fitted
+    globally the law is poor (30% median error on attention, 53% on the gemm,
+    leave-one-out); used to carry a measured price from one shape to a
+    neighbour it is 8.8% and 13.4% at a 1.22-1.5x move, against 30.8% for
+    taking the neighbour's price whole. The surface is not smooth -- the
+    library re-tunes per shape -- but it is smooth enough *locally*, and that
+    is the only place this is asked.
+
+    Returns ``{name: (mask, coefficients)}``, the mask naming the dimensions
+    that actually vary. Operators with fewer shapes than the fit has degrees of
+    freedom are absent, and absent means unscaled.
+    """
+    try:
+        import numpy as np
+    except ImportError:  # pragma: no cover - numpy is a hard dep of torch
+        logger.warning("ATOMCompass WARNING: op_fit needs numpy; not scaling.")
+        return {}
+    import collections
+    import statistics
+
+    by_op: dict = collections.defaultdict(dict)
+    for sig, entry in price_list.items():
+        seconds = entry.get("seconds") or 0.0
+        dims = _dims_of_signature(sig) if seconds > 0 else ()
+        if dims:
+            by_op[sig.split("|")[0]].setdefault(dims, []).append(seconds)
+
+    fits = {}
+    for name, shapes in by_op.items():
+        widths = collections.Counter(len(d) for d in shapes)
+        modal = widths.most_common(1)[0][0]
+        points = [(d, statistics.median(v))
+                  for d, v in shapes.items() if len(d) == modal]
+        if len(points) < 6:
+            continue
+        matrix = np.log(np.array([p[0] for p in points], dtype=float))
+        observed = np.log(np.array([p[1] for p in points], dtype=float))
+        mask = matrix.std(0) > 1e-9
+        varying = int(mask.sum())
+        if not varying or len(points) < varying + 3:
+            continue
+        design = np.hstack([np.ones((len(observed), 1)), matrix[:, mask]])
+        coef, *_ = np.linalg.lstsq(design, observed, rcond=None)
+        fits[name] = (tuple(bool(m) for m in mask),
+                      tuple(float(c) for c in coef[1:]))
+    return fits
+
+
 DEFAULT_COMPILED_SECONDS_PER_LAUNCH = 9.71e-6
 
 #: How long the host takes per kernel launch on a compiled, not-replayed step.
@@ -207,6 +328,7 @@ class PricedGraphCostOracle:
                  DEFAULT_HOST_SECONDS_PER_LAUNCH,
                  calibration: str = "",
                  floor_seconds: float = 1e-6, fallback: str = "",
+                 op_fit: int = 0,
                  rank_coords: Optional[dict] = None) -> None:
         """
         Args:
@@ -256,6 +378,12 @@ class PricedGraphCostOracle:
                 a decode cost, which is not an approximation but a different
                 question. Optional, and its absence is a warning rather than an
                 error so that a decode-only run needs nothing extra.
+            op_fit: Price a prefill chunk no graph was captured at by
+                moving the nearest graph's operators to it, rather than
+                returning that graph's total whole. Off by default: it is a
+                fit, and what it replaces is a measurement of a different
+                shape, so which is the lesser error is a property of how far
+                apart they are. See `_scaled`.
             rank_coords: This rank's coordinates. Each rank prices its own
                 graph under parallelism.
         """
@@ -288,6 +416,8 @@ class PricedGraphCostOracle:
         with open(self.prices_path, encoding="utf-8") as fh:
             price_list = json.load(fh)["prices"]
 
+        self.op_fit = int(op_fit or 0)
+        self._fits = _fit_operators(price_list) if self.op_fit else {}
         self.unpriced = 0
         # A glob may name one decode graph or one per capture rung. Decode shapes
         # are not arbitrary: they are the rungs of the CUDA-graph ladder, known
@@ -380,6 +510,7 @@ class PricedGraphCostOracle:
         # dispatch on the first and pays it on the second.
         kernel_seconds: list = []
         breakdown: dict[str, float] = {}
+        entries: list = []
         for op in graph_blob["ops"]:
             if op.get("name", "") in HOST_SYNC:
                 continue
@@ -395,6 +526,11 @@ class PricedGraphCostOracle:
             # benchmark saw the operator launch, not from the operator count.
             launches += max(1, len(entry.get("kernels") or {}))
             breakdown[op["name"]] = breakdown.get(op["name"], 0.0) + entry["seconds"]
+            ambient = dict(tuple(x) for x in (op.get("context") or ()))
+            entries.append((op["name"],
+                            _dims_of(op.get("input_shapes") or [],
+                                     ambient.get("context_lens") or []),
+                            entry["seconds"]))
 
         recorded = (graph_blob.get("provenance") or {}).get("shape") or {}
         contexts = recorded.get("context_lens") or []
@@ -410,6 +546,7 @@ class PricedGraphCostOracle:
             context=(sum(contexts) / len(contexts)) if contexts else 0.0,
             max_context=float(max(contexts)) if contexts else 0.0,
             tokens=int(sum(recorded.get("num_scheduled_tokens") or [])),
+            entries=tuple(entries),
         )
 
     def _for_rung(self, shape: StepShape) -> "_Costed":
@@ -517,7 +654,64 @@ class PricedGraphCostOracle:
                 "Capture that shape to fix it -- prices are not interpolated "
                 "across shapes on purpose.",
                 tokens, ctx, point.path, point.tokens, point.context)
+        if self._fits and tokens and point.tokens and tokens != point.tokens:
+            return self._scaled(point, int(tokens))
         return point
+
+    def _scaled(self, point: "_Costed", tokens: int) -> "_Costed":
+        """`point` re-priced operator by operator for a chunk of `tokens`.
+
+        Every dimension equal to the graph's own token count moves to the new
+        one, and that operator's fitted power law says what the move costs.
+        Every other dimension, every operator without a fit, and the launch
+        count are left alone -- the operator sequence does not change with the
+        chunk, only its dimensions do.
+
+        The substitution rule is measured, not assumed. Aligning two prefill
+        graphs of one category operator by operator, 3165 dimensions are
+        constant, 1592 equal the token count and move with it, and the 123 that
+        follow some other law (`3*tokens-1`, a buffer slice) all sit on
+        `aten::` operators that carry, between them, none of the cost.
+
+        Refused at or past a factor of two, where the nearest graph is far
+        enough away that the fit is extrapolating as badly as the substitution
+        is, and refused below `MIN_FITTED_TOKENS`, where it is not a power law
+        at all.
+
+        The endpoint is excluded rather than included because it was measured
+        to be the wrong side of the line. Over the four rungs, 43 steps sit at
+        a ratio of exactly two -- 32 against a 16-token graph, 352 against 176,
+        1440 against 720 -- and admitting them moved their median error from
+        14.7% to 32.6%. Every other band improved.
+        """
+        if point.tokens <= 0 or not 0.5 < tokens / point.tokens < 2.0:
+            return point
+        if min(point.tokens, tokens) < MIN_FITTED_TOKENS:
+            return point
+        moved = math.log(tokens / point.tokens)
+        seconds = 0.0
+        kernel_seconds: list = []
+        breakdown: dict[str, float] = {}
+        for name, dims, priced in point.entries:
+            fit = self._fits.get(name)
+            scale = 1.0
+            if fit and len(fit[0]) == len(dims) and point.tokens in dims:
+                mask, coefficients = fit
+                exponent = 0.0
+                index = 0
+                for position, dim in enumerate(dims):
+                    if not mask[position]:
+                        continue
+                    if dim == point.tokens:
+                        exponent += coefficients[index] * moved
+                    index += 1
+                scale = math.exp(exponent)
+            seconds += priced * scale
+            kernel_seconds.append(priced * scale)
+            breakdown[name] = breakdown.get(name, 0.0) + priced * scale
+        return replace(point, seconds=seconds, tokens=tokens,
+                       kernel_seconds=tuple(kernel_seconds),
+                       breakdown=breakdown)
 
     def estimate(self, shape: StepShape) -> StepCost:
         point = self._for_prefill(shape) if shape.is_prefill else self._for_rung(shape)

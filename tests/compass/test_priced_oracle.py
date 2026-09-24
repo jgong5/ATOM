@@ -16,7 +16,7 @@ import logging
 import pytest
 
 from atom.compass.core.cost.base import StepShape
-from atom.compass.core.cost.priced import PricedGraphCostOracle
+from atom.compass.core.cost.priced import MIN_FITTED_TOKENS, PricedGraphCostOracle
 from atom.compass.runtime.microbench import signature_of
 
 
@@ -709,3 +709,77 @@ class TestTheLongestRowSetsTheCost:
         # higher maximum, so the two rules order these two graphs oppositely.
         assert [int(p.max_context) for p in oracle.by_rung[4]] == [100000,
                                                                    200000]
+
+
+class TestFittedChunks:
+    """Pricing a chunk size nobody measured, operator by operator.
+
+    The nearest graph answers for a chunk it is not a graph of, and at a 1.2x
+    move that is a 44% error on a quadratic operator. `op_fit` keeps the
+    nearest graph's operator *sequence* -- which is invariant across a 724x
+    span of chunk sizes -- and moves each operator's dimensions, charging the
+    move at that operator's own fitted power law. These pin that it happens
+    where it should and, more importantly, that it stays out where the law
+    does not hold: below the latency-bound floor and at or past a factor of two.
+    """
+
+    #: Chunk sizes with a measured graph. Straddles `MIN_FITTED_TOKENS` so the
+    #: floor has something on both sides of it to choose between.
+    LADDER = (32, 64, 80, 96, 128, 160, 192, 256, 320)
+    CONTEXT = 1000
+
+    def _oracle(self, tmp_path, op_fit):
+        """One graph per ladder rung, one operator, priced as `tokens` squared.
+
+        An exact law, so a fit that works recovers the unmeasured chunk's true
+        price rather than merely getting nearer to it.
+        """
+        prices = {"prices": {}}
+        for tokens in self.LADDER:
+            op = dict(_op("g"), input_shapes=[[tokens, 512]])
+            graph = {"version": 2, "key": None, "ops": [op],
+                     "provenance": {"shape": {
+                         "num_scheduled_tokens": [tokens],
+                         "context_lens": [self.CONTEXT],
+                         "num_prefill_tokens": tokens}}}
+            (tmp_path / f"g.prefill.t{tokens}.json").write_text(json.dumps(graph))
+            prices["prices"][signature_of(op)] = {
+                "name": "g", "seconds": 1e-9 * tokens ** 2,
+                "occurrences": 1, "kernels": {"k": 1.0}}
+        decode = _op("d")
+        (tmp_path / "g.json").write_text(json.dumps(
+            {"version": 2, "key": None, "provenance": {}, "ops": [decode]}))
+        prices["prices"][signature_of(decode)] = {
+            "name": "d", "seconds": 1e-5, "occurrences": 1, "kernels": {"k": 1e-5}}
+        (tmp_path / "p.json").write_text(json.dumps(prices))
+        return PricedGraphCostOracle(
+            str(tmp_path / "p.json"), str(tmp_path / "g.json"),
+            prefill_graph=str(tmp_path / "g.prefill.*.json"),
+            boundary_seconds=0.0, eager_seconds_per_op=0.0, op_fit=op_fit)
+
+    def _at(self, oracle, tokens):
+        return oracle.estimate(StepShape(
+            num_scheduled_tokens=(tokens,), context_lens=(self.CONTEXT,),
+            num_prefill_tokens=tokens)).seconds
+
+    def test_an_unmeasured_chunk_is_priced_by_the_fit(self, tmp_path):
+        # 384 tokens, nearest measured graph 320: a 1.2x move.
+        assert self._at(self._oracle(tmp_path, 0), 384) == pytest.approx(
+            1e-9 * 320 ** 2)
+        assert self._at(self._oracle(tmp_path, 1), 384) == pytest.approx(
+            1e-9 * 384 ** 2, rel=1e-3)
+
+    def test_below_the_floor_the_fit_stays_out(self, tmp_path):
+        # 48 tokens sits under MIN_FITTED_TOKENS, where a chunk is
+        # latency-bound and the measured exponent is 0.008 rather than ~1.
+        assert MIN_FITTED_TOKENS == 64
+        assert self._at(self._oracle(tmp_path, 1), 48) == pytest.approx(
+            1e-9 * 64 ** 2)
+
+    def test_at_a_factor_of_two_the_fit_stays_out(self, tmp_path):
+        # 960 tokens against a 320-token graph is 3x, and the operator sequence
+        # is no longer evidence for anything. 640 is exactly 2x, which is the
+        # endpoint -- excluded, because admitting it made those steps worse.
+        oracle = self._oracle(tmp_path, 1)
+        assert self._at(oracle, 960) == pytest.approx(1e-9 * 320 ** 2)
+        assert self._at(oracle, 640) == pytest.approx(1e-9 * 320 ** 2)
