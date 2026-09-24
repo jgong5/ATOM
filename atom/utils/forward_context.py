@@ -420,8 +420,14 @@ class ForwardMode:
             return
 
         def _rows(name):
+            # `t.shape[0]` is already an `int` for any tensor with a real size,
+            # so this returns exactly what an `int()` around it returned. It is
+            # written without one so that a tensor whose size is symbolic keeps
+            # its symbol here: the equalities below then compare two symbolic
+            # widths and hold or fail as algebra, where converting one side to a
+            # number first forces the other to become that number.
             t = getattr(attn_metadata, name, None)
-            return None if t is None else int(t.shape[0])
+            return None if t is None else t.shape[0]
 
         # `input_ids` is the argument, this rank's own rows -- the cudagraph
         # branch re-slices the buffer to `running_tokens` itself.

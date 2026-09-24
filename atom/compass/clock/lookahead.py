@@ -18,8 +18,7 @@ order; what it gives up is overlap, because neither side can then run ahead of
 the other's current time, and the whole run collapses towards a single global
 event loop. So the floor buys speed, and the amount of speed it buys is the
 whole of what it decides. It never buys safety, and code that treats a small
-floor as a hazard has the relationship backwards. `LookaheadMatrix.serializing`
-exists to report the zero links, not to reject them.
+floor as a hazard has the relationship backwards.
 
 **An undeclared pair is not a zero, and it is not skippable either.** A caller
 takes a minimum over one participant's whole row, quantified over every
@@ -41,34 +40,25 @@ from .registry import LpRegistry
 
 
 class LinkClass(enum.Enum):
-    """The three kinds of link between logical processes, and the scale of each.
-
-    `scale_seconds` is the order of magnitude the link has been observed or
-    modelled at. It is documentation and a sanity reference -- a declared floor
-    is never derived from it -- and it is what says which link is the tight one.
-    """
+    """The three kinds of link between logical processes."""
 
     #: Traffic source to engine: the modelled admission delay. The only one of
     #: the three with an end-to-end measurement behind it, and the measurement
     #: is path-specific; see `TRAFFIC_TO_ENGINE_FLOOR_SECONDS`.
-    TRAFFIC_TO_ENGINE = ("traffic_to_engine", 1.0e-2)
+    TRAFFIC_TO_ENGINE = "traffic_to_engine"
 
     #: Prefill role to decode role: a router relay plus a simulated transfer of
     #: the cached keys and values. Modelled at millisecond scale, which is
     #: comfortable -- it is the cheap link to stretch across a node.
-    PREFILL_TO_DECODE = ("prefill_to_decode", 1.0e-3)
+    PREFILL_TO_DECODE = "prefill_to_decode"
 
     #: Pipeline stage to pipeline stage: a modelled send and receive of the
     #: intermediate tensors. Microsecond scale, and the only tight one: stages
     #: belong close together for exactly this reason.
-    PIPELINE_STAGE_TO_STAGE = ("pipeline_stage_to_stage", 1.0e-6)
-
-    def __init__(self, label: str, scale_seconds: float) -> None:
-        self.label = label
-        self.scale_seconds = scale_seconds
+    PIPELINE_STAGE_TO_STAGE = "pipeline_stage_to_stage"
 
     def __str__(self) -> str:
-        return self.label
+        return self.value
 
 
 #: Measured admission delay from the traffic source to the engine, per path, in
@@ -177,7 +167,7 @@ class LookaheadMatrix:
         not less. Zero would at least have been the conservative mistake.
         """
         self._registry.require(target)
-        missing = self._missing_into(target)
+        missing = [source for source, into in self.undeclared() if into == target]
         if missing:
             raise KeyError(
                 f"{len(missing)} registered peer(s) have no declared floor into "
@@ -191,13 +181,6 @@ class LookaheadMatrix:
             self._links[(source, target)]
             for source in self._registry.ids()
             if source != target
-        )
-
-    def _missing_into(self, target: LpId) -> tuple[LpId, ...]:
-        return tuple(
-            source
-            for source in self._registry.ids()
-            if source != target and (source, target) not in self._links
         )
 
     def require_complete(self) -> None:
@@ -218,10 +201,6 @@ class LookaheadMatrix:
                 "lockstep."
             )
 
-    def links(self) -> tuple[InterLpLink, ...]:
-        """Every declared link, ordered by source then target."""
-        return tuple(self._links[key] for key in sorted(self._links))
-
     def undeclared(self) -> tuple[tuple[LpId, LpId], ...]:
         """Ordered pairs of registered identities with no floor yet, in order.
 
@@ -235,28 +214,3 @@ class LookaheadMatrix:
             for target in ids
             if source != target and (source, target) not in self._links
         )
-
-    def serializing(self) -> tuple[InterLpLink, ...]:
-        """The links declared at a zero floor -- correct, and slow.
-
-        Reported so a run that turns out to be serial can say which pair made it
-        so. Not an error, and not a warning about correctness.
-        """
-        return tuple(link for link in self.links() if link.floor_seconds == 0.0)
-
-    def tightest(self) -> InterLpLink | None:
-        """The declared link with the smallest floor: what bounds how far anything runs ahead.
-
-        Reporting, not protocol: it walks the links that exist, so on an
-        incomplete matrix it answers about the part that was declared. Check
-        `require_complete` before quoting it as the bound on a run.
-        """
-        links = self.links()
-        if not links:
-            return None
-        return min(
-            links, key=lambda link: (link.floor_seconds, link.source, link.target)
-        )
-
-    def __len__(self) -> int:
-        return len(self._links)

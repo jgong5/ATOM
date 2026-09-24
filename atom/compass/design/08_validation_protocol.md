@@ -22,22 +22,24 @@ property than everything else here.**
 
 **Revised 2026-09-20; the original claim was measured false.** This decision used to read
 *"187 test files under `tests/`, and ATOM's own `CLAUDE.md` states they need **no GPU** —
-AITER and `torch.cuda` are mocked"*. Neither half survived measurement. There are **189**
-test files under `tests/`, and **29 of the 159 outside `tests/plugin/` reach the driver**: 28
+AITER and `torch.cuda` are mocked"*. Neither half survived measurement. At `fada7424e` there are **189**
+test files under `tests/`, and the **29 of the 159 outside `tests/plugin/`** that
+`scripts/compass/cpu_gate_exclude.txt` lists **reach the driver**, each run alone: 28
 at *collection* time, via `rocminfo` reached on import, so pytest cannot even build the node
 list, plus 1 that collects cleanly and then fails at run time on a pinned-host allocation
 (`hipHostMalloc failed: 100`). That numerator is non-plugin, so its denominator must be too —
 quoting 29 against 189 is the defect `16` L4 fixes and it is not repeated here. **At the
-whole-suite denominator the figure is at least 32 of 189**, because `tests/plugin/` is not
-purely a packaging problem: collecting it alone at `236abfd9a` in `xiaobizh_n18_cpu` gives
-`153 tests collected, 7 errors in 1.45s`, rc=2, and those 7 decompose as **3 `rocminfo`**
+whole-suite denominator the figure is at least 34 of 189**, because `tests/plugin/` is not
+purely a packaging problem: collecting it alone at `236abfd9a`, and again at `fada7424e`, in `xiaobizh_n18_cpu` gives
+`153 tests collected, 7 errors`, rc=2, and those 7 decompose as **3 `rocminfo`**
 (`test_gdn_target_verify_batched_equiv.py`, `test_rtpllm_forward_context_semantics.py`,
 `test_vllm_deepseek_v4_proxy_state_arena_layout.py`), **1 `ModuleNotFoundError: No module
 named 'sglang'`**, and **3 `ImportError: cannot import name 'fused_gdn_gating' from
 'atom.model_ops.attention_gdn' (unknown location)`** — a module left half-initialised by the
-first three, not a fourth cause. 29 + 3 = 32 is a floor: the other 23 plugin files collect
+first three, not a fourth cause. With the 2 tier files the table below names, which reach
+`rocminfo` run alone at `fada7424e` too, 29 + 2 + 3 = 34 is a floor: the other 23 plugin files collect
 here and are never run, so nothing is measured about what they would touch.
-`tests/plugin/`'s 30 files are dropped whole because the tier targets ATOM and sglang
+`tests/plugin/`'s 30 files at `fada7424e` are dropped whole because the tier targets ATOM and sglang
 and vllm are in neither image — the measured reason for 27 of them, not for all 30. The
 suite as a whole is **not** GPU-free and never was. What is GPU-free is a *tier* of it, and
 that tier is genuinely green.
@@ -46,21 +48,12 @@ that tier is genuinely green.
 
 | Tier | What runs | Measured result |
 |---|---|---|
-| **CPU tier** — per task, and green is the bar | `tests/` minus `tests/plugin/` (30 files) minus the 29 driver-dependent files in `scripts/compass/cpu_gate_exclude.txt` = **130 of 189 files**. Driven by `scripts/compass/gate_cpu.sh`; no driver is touched **as a batch**. That is the weaker and correct claim: `test_postprocess_width.py` and `test_v4_checkpoint_slot_copy.py` are among the 130 handed, and each reaches `rocminfo` when run *alone* (`no tests collected, 1 error in 0.78s`, rc=2, each, measured at `236abfd9a` in `xiaobizh_n18_cpu`); inside the gate they module-skip on the mock an earlier file installs. Driver-freedom here is a property of the batch, not of every file in it. | **4030 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0 — identical in every run taken on 2026-09-21, where the clock read **25.4-31.7 s of pytest inside 31.1-37.8 s of wall (`time` real)**, a measured spread rather than a bound: it tracks what else is on the node. Decomposition (principle 7): **3956 ATOM + 74 `tests/compass` = 4030**. Measured 2026-09-21 in container `xiaobizh_n18_cpu` on hjbog-srdc-18, against a `git archive` snapshot with `PYTHONPATH` asserted to resolve `atom` under that root and pytest's own exit status captured before any pipe. |
+| **CPU tier** — per task, and green is the bar | Every test file outside `tests/plugin/` and `scripts/compass/cpu_gate_exclude.txt`. Driven by `scripts/compass/gate_cpu.sh`; no driver is touched **as a batch**. That is the weaker and correct claim: `test_postprocess_width.py` and `test_v4_checkpoint_slot_copy.py` are both in the tier, and each reaches `rocminfo` when run *alone* (`no tests collected, 1 error`, rc=2, each, measured at `236abfd9a` in `xiaobizh_n18_cpu`); inside the gate they module-skip on the mock an earlier file installs. Driver-freedom here is a property of the batch, not of every file in it. | Green, `GATE_CPU_RC=0`, read at `bdd244c57` in `xiaobizh_n18_cpu`. The counts are not restated here, because they move with every test the tier gains or loses: `gate_cpu.sh` prints them under the `commit:` line of the tree it ran, and `scripts/compass/README.md` says what the tier runs. |
 | **GPU superset** — per wave, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`. | **4779 passed / 5 failed**, 0 errors, 105 skipped, 3 xfailed, 72.6 s, at `fe9ea043c` on node 18 in `xiaobizh_n18`, `HIP_VISIBLE_DEVICES=1`, 2026-09-20 — torch **2.10.0+rocm7.2.4.git3d3aa833**, `torch.version.hip` **7.2.53211**, ROCm **7.2.4**, AITER **v0.1.21.dev0-49-gf4e7c7509**; two runs, byte-identical failing sets. The five are pre-existing and unrelated to Compass, and they are **four ULP comparisons plus one bitwise check**, not "five bf16 ULP failures": four `allclose` cases in `tests/test_fused_compress_ragged.py` off by one bf16 ULP (`max\|diff\| = 0.001953125`, exactly 2⁻⁹, against `atol=rtol=1e-3`), plus `tests/test_dcp_merge_ops.py::test_row_view_matches_output_slicing_bitwise`, a `torch.equal` with **no tolerance at all** — a tolerance bump would not move it. All five node-ids are on file verbatim in `scripts/compass/gpu_gate_known_failures.txt` and compared by name, so "5 failed" can now be checked against "the *same* 5 failed". |
 
-**Six different totals for this suite are in circulation and all six are consistent** —
-each is a different exclusion count and a different `tests/compass`, not a discrepancy:
-3925 (32 exclusions, `tests/compass` at 35 tests), 3956 (29 exclusions, **ATOM tests only**,
-no `tests/compass` — the P0.2 reviewer's figure), 3988 (29 exclusions, `tests/compass` at
-32), 4005 (29 exclusions, `tests/compass` at 49), 4022 (29 exclusions, `tests/compass` at
-66), and **4030** (29 exclusions, `tests/compass` at 74). The 49 → 66 step is mechanical:
-`tests/compass/test_cpu_gate_exclude.py` parametrises one case per entry of
-`gpu_gate_triggers.txt`, and correcting that file's derivation took it from 13 entries
-to 30. The 66 → 74 step is `tests/compass/test_gate_gpu_surplus.py`, added here. The exclusion list went 32 → 29
-because `test_dp_metadata.py`, `test_dp_sync_layout.py` and `test_forward_mode.py` were
-re-measured and are CPU-green. Prose saying the list is 32, or that those three need the
-driver, is stale.
+`test_dp_metadata.py`, `test_dp_sync_layout.py`
+and `test_forward_mode.py` were once excluded and were re-measured CPU-green (`16`); prose
+saying those three need the driver is stale.
 
 ### The tests that matter to Compass, and which tier each is in
 
@@ -70,7 +63,7 @@ driver, is stale.
 | `test_prefill_scheduler.py`, `test_scheduler_partial_prefill_tail.py` | CPU | chunked prefill boundaries |
 | `test_block_manager.py`, `test_block_pool.py` | CPU | the block accounting D13 relies on running unmodified |
 | `test_prefix_cache_accuracy.py` | **neither** | nothing. It holds **no test function at all** — it is an `argparse` script that drives a live server on `localhost:8000`, and `pytest` reports `no tests ran` for it in both containers. The prefix-cache behaviour doc `03` declares correct-by-construction is not covered by this file. |
-| `test_prefill_prefix_vs_native.py` | **GPU only** | the prefix-cache behaviour doc `03` declares correct-by-construction. It module-skips on the CPU tier ("needs a real GPU") and gives 4 passed in the GPU container, so the prefix-cache row is GPU-tier evidence and nothing else. |
+| `test_prefill_prefix_vs_native.py` | **GPU only** | the prefix-cache behaviour doc `03` declares correct-by-construction. It module-skips on the CPU tier ("needs a real GPU") and gives 4 passed in the GPU container (`xiaobizh_n18`, one card, at `cb684287f`), so the prefix-cache row is GPU-tier evidence and nothing else. |
 | `test_scheduled_batch_marshal.py` | CPU | the IPC payloads the clock protocol annotates around |
 | `test_block_table_marshal.py` | **GPU only** | the block-table half of those same payloads — excluded at collection time, so the CPU tier does not see it |
 | `test_kv_connector_scheduler.py` | **neither** | the connector factory doc `01` D6 registers a simulated connector into — except that it runs nothing in either tier: `1 skipped`, because ATOM #690 split `kv_transfer_engine` into `moriio` and the test's imports were never updated. |

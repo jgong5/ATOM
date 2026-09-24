@@ -12,6 +12,13 @@ sees every participant.
 
 Nothing here imports a device runtime, reads a clock, or opens a socket, which
 is what makes it testable on any machine.
+
+That claim is enforced, not asserted: every `.py` file under this package, at
+any depth, is held to a three-module standard-library allowlist and to building
+no `set`. Tooling that has to read the tree, parse source, or talk to anything
+therefore does not belong here even when it is about time -- put it beside the
+package, not inside it. The build-time audit of ATOM's blocking calls sits in
+`atom/compass/audit/` for exactly this reason.
 """
 
 from .authority import (

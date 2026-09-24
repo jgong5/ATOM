@@ -45,8 +45,27 @@ DIRTY=$(git -C "$ROOT" status --porcelain | wc -l)
     exit 91
 }
 
-BASE=$(git -C "$ROOT" merge-base HEAD "$INTEGRATION") || {
-    printf 'REFUSED: no merge-base with %s. Set COMPASS_INTEGRATION_REF.\n' "$INTEGRATION" >&2
+# Two different failures used to share one message. `no merge-base with <ref>`
+# reads as a claim about the history, and was printed just as often when the ref
+# had not resolved at all and nothing had been compared -- sending the reader to
+# inspect a tree that was fine. Each step now names itself.
+# On success REF is the ref that resolved; on failure it carries git's own
+# message, which is what the refusal quotes.
+REF=$(compass_resolve_ref "$ROOT" "$INTEGRATION") || {
+    printf 'REFUSED: ref resolution failed -- %s names nothing here, with or without\n' "$INTEGRATION" >&2
+    printf '  a remote prefix, so no history has been compared. git said:\n    %s\n' "$REF" >&2
+    printf '  Set COMPASS_INTEGRATION_REF to a ref this tree resolves.\n' >&2
+    exit 92
+}
+[ "$REF" = "$INTEGRATION" ] ||
+    printf 'ref:    %s is not a ref here; resolved it as %s\n' "$INTEGRATION" "$REF"
+# A resolved local branch left behind the remote of the same name is named on
+# the same line, in the same place. It stays the base; it stops being silent.
+compass_ref_drift "$ROOT" "$REF"
+
+BASE=$(git -C "$ROOT" merge-base HEAD "$REF") || {
+    printf 'REFUSED: merge-base failed -- %s resolved, but shares no commit with HEAD.\n' "$REF" >&2
+    printf '  The ref is fine; these two histories are unrelated.\n' >&2
     exit 92
 }
 
@@ -62,7 +81,7 @@ tar -rf "$TAR" -C "$STAGE" ATOM/.compass-commit ATOM/.compass-changed
 
 printf 'wrote %s\n' "$TAR"
 printf '  commit:  %s\n' "$SHA"
-printf '  base:    %s (%s)\n' "${BASE:0:9}" "$INTEGRATION"
+printf '  base:    %s (%s)\n' "${BASE:0:9}" "$REF"
 printf '  changed: %s file(s)\n' "$(grep -c . "$STAGE/ATOM/.compass-changed")"
 printf '\nExtract with:\n'
 printf '  mkdir -p <dir> && tar -x -C <dir> -f %s\n' "$(basename "$TAR")"
