@@ -97,6 +97,12 @@ def whole_number(field: str, value: Any) -> int:
     subclass; and anything else `int` does not take exactly. No value that is
     accepted changes on the way to the `int` returned, and that check is what
     refuses integer text: `int("8")` is 8, which is not equal to "8".
+
+    Two limits, neither of which returns a width: a numpy union dtype with a
+    field named "bool", `("i8", [("bool", "i8")])`, is refused even holding a
+    whole number; and a `dtype` whose `__str__` raises anything but
+    `TypeError`, `ValueError` or `OverflowError` escapes with that error, not
+    this named refusal.
     """
     try:
         if isinstance(value, bool) or "bool" in str(getattr(value, "dtype", "")):
