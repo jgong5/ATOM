@@ -34,9 +34,9 @@ name stood for:
   The worker still leaves its loop -- `busy_loop` breaks
   on the dispatched name, in a statement beside the per-runner loop rather than
   inside it -- so the symptom is what shutdown failed to release, not a hang.
-- `process_kvconnector_output` never starts the asynchronous KV load its
-  metadata was built for, and nothing is waiting on a load that never began.
-  It is broadcast five times and waited for at none of them:
+- `process_kvconnector_output` never starts the asynchronous KV transfer its
+  metadata was built for (a consumer's load, a producer's send, an offload
+  save). It is broadcast five times and waited for at none of them:
   `engine_core.py:378` and `engine_core.py:500`, `pp_engine_core.py:113`,
   `pp_engine_core.py:232` and `pp_engine_core.py:369`.
 
