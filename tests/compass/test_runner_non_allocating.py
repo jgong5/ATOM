@@ -468,11 +468,11 @@ def test_the_guard_finds_nothing_when_the_root_moves(monkeypatch, tmp_path):
 
 
 def test_the_walk_returns_every_module_under_the_root(monkeypatch, tmp_path):
-    """Non-empty says the walk found something; this says it found everything.
+    """Non-empty says the walk found something; this, every module of a tree built here.
 
     The tree is built here, so the expected set does not move when the package
-    gains a module. A walk that is not recursive misses `sub/b.py`, and one
-    narrowed to a pattern or sliced to a prefix misses `a.py` or more.
+    gains a module. A walk that is not recursive misses `sub/b.py`, and any
+    narrowing or slice that drops a module of the built tree fails the same way.
     """
     for rel in ("__init__.py", "a.py", "sub/b.py"):
         (tmp_path / rel).parent.mkdir(exist_ok=True)
