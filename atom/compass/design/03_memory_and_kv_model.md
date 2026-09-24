@@ -136,22 +136,19 @@ probed per request. Whether that is 0.1 ms or 10 ms is unmeasured. Recorded as *
     copies it into each step's context, and is called from
     `model_runner.py::ModelRunner.prepare_inputs`, from graph capture and from
     `Drafter.warmup_draft_graphs`; `UBatchWrapper._make_ubatch_context` copies that
-    again per micro-batch. Attention
-    forwards read the copy: `PagedAttentionImpl.rope_cache` and
-    `SparseMHAPagedAttentionImpl.rope_cache` (`attention_mha.py`),
-    `MLAAttention.forward_impl` (`attention_mla.py`), `GatedDeltaNet.forward`
-    (`attention_gdn.py`) and `KimiKDAAttention._forward_impl` (`models/kimi_k3.py`). And
-    the drafter reads it outside any model forward, in `DSparkProposer._resolve_dtype_q`
-    (`spec_decode/dspark_proposer.py`).
+    again per micro-batch. Attention forwards read the copy:
+    `PagedAttentionImpl.rope_cache` and `SparseMHAPagedAttentionImpl.rope_cache`
+    (`attention_mha.py`), `MLAAttention.forward_impl` (`attention_mla.py`),
+    `GatedDeltaNet.forward` (`attention_gdn.py`) and `KimiKDAAttention._forward_impl`
+    (`models/kimi_k3.py`). And the drafter reads it outside any model forward, in
+    `DSparkProposer._resolve_dtype_q` (`spec_decode/dspark_proposer.py`).
   - `atom/plugin` reads it only in plugin mode, where vLLM, SGLang or RTP-LLM runs ATOM's
     model code. The mode defaults to `"atom"`, which is not a plugin mode
     (`plugin/prepare.py`).
-  - The Compass runner reaches none of these. Its `forward` replaces ATOM's and calls
-    neither `prepare_inputs` nor the model, and its `capture_cudagraph` replaces ATOM's
-    and captures nothing. Its `_build_and_load_model` sets the model to an
-    `UnbuiltModel`, whose `forward` refuses, and refuses a speculative config before
-    `ModelRunner.__init__` calls `build_drafter`, so no drafter exists. If Compass ever
-    accepts a speculative config, the drafter's two reads become live.
+  - The Compass runner reaches none of these: its `forward` and `capture_cudagraph`
+    replace ATOM's and run none of `prepare_inputs`, the model, the drafter or a
+    capture. Its `_build_and_load_model` also sets the model to an `UnbuiltModel`,
+    whose `forward` refuses, and refuses a speculative config.
 - `BlockManager.hash_block_size = block_size * dcp_world_size`
   (`block_manager.py:93`) — decode context parallelism changes the hash granularity.
   Out of scope now; noted so it is not discovered later.
