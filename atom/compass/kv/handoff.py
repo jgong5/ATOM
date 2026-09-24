@@ -94,15 +94,16 @@ def whole_number(field: str, value: Any) -> int:
     naming a deployment that was never launched; a boolean, which would go
     out as a width of 1 or 0 -- a `bool`, or anything whose `dtype` has "bool"
     in its text, as numpy's and torch's booleans do, neither being a `bool`
-    subclass, and as an array of a numpy union dtype with a field "is_bool"
-    does; and anything else `int` does not take exactly. No value that is
+    subclass; and anything else `int` does not take exactly. No value that is
     accepted changes on the way to the `int` returned, and that check is what
     refuses integer text: `int("8")` is 8, which is not equal to "8".
 
-    Limits: an exception from the value, from its dtype, or from an object
-    either of them returns, such as the result of `__ne__`, can escape as
-    raised, not as this refusal, and an `AttributeError` from reading `dtype`
-    counts as no dtype.
+    Limits: the dtype text test also refuses a whole number whose dtype text
+    has "bool", such as an array of a numpy union dtype with a field "is_bool",
+    and the message then says it is not a whole number. An exception from the
+    value, from its dtype, or from an object either of them returns, such as
+    the result of `__ne__`, can escape as raised, not as this refusal, and an
+    `AttributeError` from reading `dtype` counts as no dtype.
     """
     try:
         if isinstance(value, bool) or "bool" in str(getattr(value, "dtype", "")):
