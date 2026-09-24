@@ -378,7 +378,8 @@ def _as_attrs(attrs: Any) -> tuple[tuple[str, Any], ...]:
     2 and unpacks into a name and a value, so the length test alone would
     accept it. No str test of its own is needed, because no type can be both a
     str or bytes and a tuple or list -- Python refuses that combination of
-    bases as an instance lay-out conflict.
+    bases as an instance lay-out conflict. An object whose `__class__` answers
+    `tuple` still passes the container test, since `isinstance` believes it.
     """
     if isinstance(attrs, (str, bytes)):
         raise TypeError(f"attributes are name/value pairs, got {attrs!r}")

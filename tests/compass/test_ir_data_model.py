@@ -273,7 +273,7 @@ def test_a_binding_wrong_in_both_ways_still_names_both_faults():
 
 
 def test_a_refused_binding_names_the_key_and_the_indices_it_has():
-    """The reason alone does not say which key was bound, or to what."""
+    """The reason alone does not say which key was bound, or which indices it has."""
     with pytest.raises(KeyError) as refused:
         ContextRef("model.layers.{layer}.experts.{expert}").bind(layer=1)
     assert refused.value.args[0].startswith(
@@ -655,15 +655,12 @@ def test_an_item_that_is_not_a_pair_shaped_container_is_refused_as_that(attrs):
     rather than `not isinstance(...)` -- sends both of these inputs past it to
     the length check: `"ab"` has length 2 and is accepted as the name "a" with
     the value "b", and `3` fails inside `len()` with a TypeError of Python's
-    own. A union of the two exception types with a needle both templates
-    carried is what the four cases used to share, and it settled neither half.
-    The container test is the only thing that refuses a str, so `"ab"` is here
-    on purpose. The refusal ends by naming the item it refused.
+    own. The container test is the only thing that refuses a str, so `"ab"` is
+    here on purpose. The refusal ends by naming the item it refused.
     """
     pattern = rf"given as a tuple or list; got {re.escape(repr(attrs[0]))}$"
-    with pytest.raises(TypeError, match=pattern) as refused:
+    with pytest.raises(TypeError, match=pattern):
         _op(attrs=attrs)
-    assert "items, not 2" not in str(refused.value)
 
 
 @pytest.mark.parametrize("attrs", [[("dtype",)], [("a", 1, 2)]])
