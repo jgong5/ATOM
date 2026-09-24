@@ -145,7 +145,7 @@ def test_membership_and_size():
     # An unhashable probe is a mistake in the call, so it raises rather than
     # answering False.
     with pytest.raises(TypeError):
-        [] in registry
+        _ = [] in registry
 
 
 # --- the lookahead matrix ----------------------------------------------------
