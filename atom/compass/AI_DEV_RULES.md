@@ -28,13 +28,13 @@
   `git worktree list` shows `[feature/atomcompass_new]` in some worktree, git
   refuses that fetch; run `git fetch fork && git merge --ff-only
   fork/feature/atomcompass_new` in that worktree instead. Git as root leaves
-  files root-owned, which fails host-side edits silently, so chown after every
-  update:
+  files root-owned, which fails host-side edits silently, so chown whichever
+  worktree git ran in, and the shared `.git`, after every update:
 
   ```
   cd <main worktree>
   git fetch fork feature/atomcompass_new:feature/atomcompass_new
-  chown -R 13797:13797 .      # whole tree, .git included
+  chown -R 13797:13797 . "$(git rev-parse --git-common-dir)"
   stat -c "%u %n" . .git      # 13797 twice; then git -C <each worktree> rev-parse HEAD
   ```
 - **Four setup rules.** Each failure behind them came from a shared mutable
@@ -105,8 +105,7 @@
   reviews, the developer pushes fixes, and that repeats until the verdict is APPROVE.
   The developer works under the
   [`ponytail`](https://github.com/DietrichGebert/ponytail/blob/main/skills/ponytail/SKILL.md)
-  skill at level `full` (`/ponytail full`), the counterpart of the reviewer's
-  `ponytail-review` in gate 4.
+  skill at level `full` (`/ponytail full`).
 - **Escalations and `need human`.** An escalation is anything that needs an owner
   ruling before work can continue; anything the developer can fix without one is
   a finding, and the owner is never asked about findings. An agent applies
@@ -161,8 +160,9 @@
   repos/<o>/<r>/pulls/<n>/merge-async` (stacked or not), `merge_method=squash`,
   `merge_action=direct_merge`, `sha=<approved head>`, a `commit_title` ending in
   ` (#<n>)` (GitHub does not add it) and `-F commit_message=@<file>`. It is
-  asynchronous: wait until `pulls/<n>` shows `merged: true` before the
-  fast-forward below or the next PR up a stack, which lands bottom-first.
+  asynchronous: poll the status URL its response returns until it reports
+  success — a failure is a finding to diagnose — before the fast-forward below
+  or the next PR up a stack, which lands bottom-first.
 - **Landing is the agents' job; no owner approval is needed or sought.** An agent
   lands any PR whose APPROVE covers its current head (below) and with no
   `need human` on it or anywhere below it in its stack; it does not wait for the
@@ -188,10 +188,10 @@
     filed as "claimable once X lands" is now claimable.
 - **An approval covers a tree, not a PR.** When a head moves past the comment
   that approved it, the new commits get a delta review pinned to
-  `<approved sha>..<head>` before the PR lands. A merge commit in that range is
-  reviewed by its conflict resolutions (`git show --remerge-diff <merge>`), and
-  the rest with `git log -p --first-parent <approved sha>..<head>`; what a merge
-  brings in is reviewed in its own PR, landed or still under review.
+  `<approved sha>..<head>` before the PR lands, read with `git log -p
+  --first-parent --diff-merges=remerge <approved sha>..<head>`: each commit's
+  own diff, and only the conflict resolutions of each merge. What a merge brings
+  in is reviewed in its own PR, landed or still under review.
 - **Recommended, not required: stack a dependent task's PR on its unlanded
   parent** with `gh stack` (`github/gh-stack` v0.1.1); independent tasks do not
   stack. Reinstall after a container rebuild with
@@ -211,11 +211,11 @@
     tip merged into it, so its diff shows only its own changes.
 - **PR branches only gain commits: no force-push, no rebase, no amend.** Answer
   review findings with new commits. Update a branch only when it conflicts, needs
-  code landed since, or its unlinked parent landed (above) — a moved tip alone
-  needs no update, the tree check covers it — and then by merging freshly fetched
-  `fork/feature/atomcompass_new` (never the local branch, which may be stale), or
-  the parent's head, into it. Never run `gh stack rebase`, `sync`, `push` or
-  `submit`: they rebase or force-push. A secret or large binary pushed by mistake
+  code landed since, or it is an unlinked child whose parent landed (above) — a
+  moved tip alone needs no update, the tree check covers it — and then by merging
+  freshly fetched `fork/feature/atomcompass_new`, or the parent's head, into it.
+  Never run `gh stack rebase`, `sync`, `push` or `submit`: they rebase or
+  force-push. A secret or large binary pushed by mistake
   is the one case that needs a force-push, and it is an escalation. The branch
   lands squashed, so its merge commits never reach the integration branch, and
   GitHub's incremental review and the delta review stay intact.
