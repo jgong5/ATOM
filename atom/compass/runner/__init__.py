@@ -29,9 +29,9 @@ caller waits, a hole parks that caller for the life of the process. For a name
 the table marks unwaited, a hole parks nobody, and what is lost is the work the
 name stood for:
 
-- `exit` (`engine_core.py:260`) never reaches `ModelRunner.exit`, so the
-  distributed environment is never destroyed and the graphs and five KV tensors
-  it deletes stay held. The worker still leaves its loop -- `busy_loop` breaks
+- `exit` (`engine_core.py:260`) never reaches `ModelRunner.exit`; the comment
+  on the `RPC_SURFACE` check in `model_runner` says what that loses here.
+  The worker still leaves its loop -- `busy_loop` breaks
   on the dispatched name, in a statement beside the per-runner loop rather than
   inside it -- so the symptom is what shutdown failed to release, not a hang.
 - `process_kvconnector_output` never starts the asynchronous KV load its
