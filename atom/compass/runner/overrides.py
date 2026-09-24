@@ -209,9 +209,9 @@ def _config_field(runner: Any, name: str) -> Any:
         return getattr(runner.config, name)
     except AttributeError:
         raise RunnerRefusal(
-            f"ATOM's config has no field {name!r}, and this runner reads it "
-            "to decide whether to refuse; answering as if it were unset would "
-            "let that refusal stop firing without saying so."
+            f"ATOM's config has no field {name!r}; this runner reads it with "
+            "no default, so a config that lacks it is refused by name rather "
+            "than read as if the field were unset."
         ) from None
 
 
@@ -536,11 +536,11 @@ class NonAllocatingRunner:
             # control, and `self.config` is what this reads.
             stream = DeferredTokenStream(
                 reported_token_id(
-                    getattr(self.config, "eos_token_id", None),
-                    getattr(self.config, "stop_token_ids", None),
+                    _config_field(self, "eos_token_id"),
+                    _config_field(self, "stop_token_ids"),
                 ),
                 deferred=reports_previous_step(
-                    getattr(self.config, "pipeline_parallel_size", 1)
+                    _config_field(self, "pipeline_parallel_size")
                 ),
             )
             self._token_stream = stream

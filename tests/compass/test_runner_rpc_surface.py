@@ -213,13 +213,19 @@ EXTENSION_CLASSES = {
 class Runner(NonAllocatingRunner):
     """The overrides over a base that supplies only what they read.
 
-    `config` is empty rather than absent: the base sets it first thing in its
+    `config` is present rather than absent: the base sets it first thing in its
     own `__init__`, so every override reads it, and a stub without one tests a
     shape the class is never in.
     """
 
     def __init__(self):
-        self.config = SimpleNamespace(disagg_is_decode=False, speculative_config=None)
+        self.config = SimpleNamespace(
+            disagg_is_decode=False,
+            speculative_config=None,
+            eos_token_id=-1,
+            stop_token_ids=[],
+            pipeline_parallel_size=1,
+        )
         self.capture_sizes = [0]
         self.capture_sizes_np = "untouched"
 
@@ -596,7 +602,7 @@ def test_forward_refuses_and_its_reply_is_one_object_read_for_nine_attributes():
         "num_bonus",
         "dspark_ell",
     }
-    with pytest.raises(RunnerRefusal):
+    with pytest.raises(RunnerRefusal, match="produces output"):
         Runner().forward(object())
 
 

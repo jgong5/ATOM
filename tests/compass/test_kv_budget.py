@@ -195,19 +195,15 @@ def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
     the budget -- as any string in its syntax tree (a name, attribute,
     parameter, keyword, import or string constant, so a call through the
     module, `setattr`, `getattr` and `__dict__` spellings count), none carries
-    `gpu_memory_utilization` the same way except as a string-constant key of
-    a dict display, and none writes the coefficient of ATOM's safety margin --
-    read off ATOM's own line, so it follows ATOM -- or its complement as a
-    literal. An attribute in key position is not exempt, so
-    `{cfg.gpu_memory_utilization: 0}` is refused. What is not: the
-    `min(budget, free)` clamp, which has no name to find, a margin spelled
-    some other way (`2 / 100`), a name built at runtime (a concatenation or an
-    f-string) or held inside a longer string (source text handed to `exec`),
-    and `gpu_memory_utilization` as a string-constant dict-display key, which
-    `spec/rules.py` holds to word a refusal. What such a dict is then used for
-    is not seen: a read keyed by it (`getattr(cfg, k)`, `vars(cfg)[k]`,
-    including a key imported from another module) or a write through it
-    (`cfg.__dict__.update({...})`, `replace(cfg, **{...})`).
+    `gpu_memory_utilization` the same way except `spec/rules.py`, as the
+    string-constant key of a dict display it holds to word a refusal, and
+    none writes the coefficient of ATOM's safety margin -- read off ATOM's
+    own line, so it follows ATOM -- or its complement as a literal. What is
+    not: the `min(budget, free)` clamp, which has no name to find, a margin
+    spelled some other way (`2 / 100`), a name built at runtime (a
+    concatenation or an f-string) or held inside a longer string (source text
+    handed to `exec`), what `spec/rules.py` does with such a key, and a key
+    read out of its dict by another module (`sorted(DEPLOYMENT_OWNED)[3]`).
 
     Read as syntax trees rather than as text: the words appear in docstrings
     all over this package, so a grep would pass for as long as somebody kept
@@ -229,7 +225,7 @@ def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
             for n in ast.walk(tree)
             if isinstance(n, ast.Dict)
             for k in n.keys
-            if isinstance(k, ast.Constant)
+            if isinstance(k, ast.Constant) and module == COMPASS / "spec" / "rules.py"
         }
         named = [
             (id(n), s)
@@ -245,7 +241,7 @@ def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
         ), f"{module} names ATOM's budget reserve override point"
         assert "gpu_memory_utilization" not in {
             s for n, s in named if n not in keys
-        }, f"{module} names ATOM's gpu_memory_utilization outside a string dict key"
+        }, f"{module} names gpu_memory_utilization outside rules.py's string dict keys"
         literals = {
             round(n.value, 12)
             for n in ast.walk(tree)
@@ -369,7 +365,7 @@ def test_that_refusal_comes_before_the_readings_are_even_looked_for():
         NonAllocatingRunner.get_num_blocks(stub)
 
 
-def _fields_the_refusals_read():
+def _fields_read_with_no_default():
     """Every name the overrides read through `_config_field`, off the source."""
     tree = ast.parse((COMPASS / "runner" / "overrides.py").read_text())
     return sorted(
@@ -380,24 +376,27 @@ def _fields_the_refusals_read():
     )
 
 
-def test_the_refusals_read_exactly_these_config_fields():
+def test_exactly_these_config_fields_are_read_with_no_default():
     """The control: the collector below is not pinning an empty list.
 
-    It collects only reads made through `_config_field`; a refusal reading its
-    field any other way is not seen here.
+    It collects only reads made through `_config_field`; a field read any other
+    way is not seen here.
     """
-    assert _fields_the_refusals_read() == [
+    assert _fields_read_with_no_default() == [
         "disagg_is_decode",
         "enforce_eager",
+        "eos_token_id",
+        "pipeline_parallel_size",
         "speculative_config",
+        "stop_token_ids",
     ]
 
 
-@pytest.mark.parametrize("name", _fields_the_refusals_read())
-def test_each_config_field_a_refusal_reads_is_one_atom_declares(name):
-    """The stubs that reach these reads supply the fields themselves, so none
-    of them would notice ATOM renaming one. This reads ATOM's config class
-    instead."""
+@pytest.mark.parametrize("name", _fields_read_with_no_default())
+def test_each_config_field_read_with_no_default_is_one_atom_declares(name):
+    """The stubs that reach these reads either supply the fields themselves or
+    omit them to be refused, so none of them would notice ATOM renaming one.
+    This reads ATOM's config class instead."""
     from atom.config import Config
 
     assert name in {f.name for f in dataclasses.fields(Config)}

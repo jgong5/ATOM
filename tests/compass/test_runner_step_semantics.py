@@ -96,6 +96,7 @@ def _drive(stream=None, ignore_eos=True, stop_token_ids=(), **overrides):
         max_num_batched_tokens=spec["budget"],
         enable_chunked_prefill=True,
         stop_token_ids=list(stop_token_ids),
+        pipeline_parallel_size=1,
     )
     scheduler = Scheduler(config)
     runner = _Runner(config, stream)
@@ -371,12 +372,14 @@ def test_forward_keeps_inference_mode_and_drops_the_expert_load_monitor():
 
 def test_reporting_a_step_from_something_that_is_not_a_batch_refuses():
     with pytest.raises(RunnerRefusal, match="produces output"):
-        _Runner(MockConfig()).forward(object())
+        _Runner(MockConfig(pipeline_parallel_size=1)).forward(object())
 
 
 def test_a_speculative_config_is_refused_rather_than_reported_with_no_drafts(run):
     """The zeros would be well-formed, which is the whole problem with them."""
-    speculative = _Runner(MockConfig(speculative_config=object()))
+    speculative = _Runner(
+        MockConfig(speculative_config=object(), pipeline_parallel_size=1)
+    )
     with pytest.raises(RunnerRefusal, match="speculative"):
         speculative.forward(run.batches[-1])
     # What the refusal is instead of: a reply nothing rejects, describing a run
@@ -452,7 +455,7 @@ def test_the_reply_answers_every_attribute_atom_reads_off_one(run):
     }
     # Answered by building ATOM's own object rather than one shaped like it, so
     # a field this runner never sets still carries the default ATOM gives it.
-    runner = _Runner(MockConfig())
+    runner = _Runner(MockConfig(pipeline_parallel_size=1))
     runner.forward(run.batches[-2])
     reply = runner.forward(run.batches[-1])
     assert isinstance(reply, ScheduledBatchOutput)
