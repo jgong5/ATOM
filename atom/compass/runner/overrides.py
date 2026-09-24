@@ -244,12 +244,28 @@ class NonAllocatingRunner:
         The base class constructs the model with the default device set to this
         rank's GPU and then fills it from disk. Both halves are skipped here, so
         no weight byte reaches the device and no checkpoint is read.
+
+        A speculative config is refused here, because right after this returns
+        the base builds the drafter on this rank's GPU and loads its checkpoint.
+        It cannot be modelled either: a predicted step's reply has
+        `draft_token_ids` None and zero `num_rejected`/`num_bonus`, which the
+        scheduler accepts as a step that drafted nothing (`scheduler.py:2579`
+        never fills `seq.spec_token_ids`, and `:2521-2522` reads the zeros), so
+        a caller that asked for speculation would get a prediction with it off
+        and no error.
         """
         self.model = UnbuiltModel(model_class)
         # Cleared on the way out, as both of ATOM's own implementations do: the
         # caller set the default device to this rank's GPU before calling, and
         # the code that runs next is written against a cleared default.
         torch.set_default_device(None)
+        if _config_field(self, "speculative_config") is not None:
+            raise RunnerRefusal(
+                "a predicted step drafts no tokens, so reporting one under a "
+                "speculative config would model speculation as off and say "
+                "nothing about it; speculative decoding has no step semantics "
+                "here yet."
+            )
         logger.info(
             "%s not built and no checkpoint read; no weight bytes on the device.",
             self.model.model_class_name,
@@ -304,9 +320,10 @@ class NonAllocatingRunner:
         disagree; `memory.device_readings` refuses the other one by name at the
         call site. Two adjustments inside ATOM's estimator are not mirrored and
         move the block count in opposite directions, and `reserves()`' own
-        docstring names both: neither is reachable without a drafter or a
-        second data-parallel rank, and this runner refuses a speculative config
-        in `forward` before either could be.
+        docstring names both. Both need a drafter, and this runner never has
+        one: `_build_and_load_model` refuses a speculative config before the
+        base can build a drafter, so construction fails before
+        `get_num_blocks` can run.
 
         `enforce_eager` is reconciled here rather than trusted. ATOM's own
         returns zero under that flag (`model_runner.py:1570-1571`) and this
@@ -491,16 +508,6 @@ class NonAllocatingRunner:
 
         No duration is reported. The reply has nowhere to put one: the engine
         times the call itself, and the batch output it reads carries tokens.
-
-        A speculative config is refused rather than reported. The reply's
-        `draft_token_ids` is None and its `num_rejected`/`num_bonus` are zero,
-        which is a well-formed description of a step that drafted nothing:
-        `scheduler.py:2579` then never fills `seq.spec_token_ids` and
-        `:2521-2522` reads zeros out of correctly sized arrays. Nothing raises,
-        and a caller that asked for a speculative configuration gets a
-        prediction of that configuration with speculation off. That silence is
-        the failure this module exists to avoid, so the configuration it cannot
-        model is named instead.
         """
         if not hasattr(batch, "produces_output"):
             # Not reachable from the engine, which only ever passes a scheduled
@@ -512,17 +519,6 @@ class NonAllocatingRunner:
                 "a step is reported from what the scheduler scheduled, and "
                 f"{type(batch).__name__} cannot say whether its batch produces "
                 "output; there is nothing here to report from."
-            )
-        if _config_field(self, "speculative_config") is not None:
-            # Refused on the config rather than on the batch: the reply this
-            # method builds drafts nothing, and a run that drafts nothing is a
-            # different run from the one a speculative config describes. The
-            # shapes are right -- it is the semantics that are not modelled.
-            raise RunnerRefusal(
-                "a predicted step drafts no tokens, so reporting one under a "
-                "speculative config would model speculation as off and say "
-                "nothing about it; speculative decoding has no step semantics "
-                "here yet."
             )
         # Imported at call time, not at module scope, so this module stays
         # importable where there is no driver. By the time a step is reported

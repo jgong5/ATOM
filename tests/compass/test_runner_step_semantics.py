@@ -26,6 +26,7 @@ import itertools
 import pathlib
 import pickle
 import queue
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -375,13 +376,41 @@ def test_reporting_a_step_from_something_that_is_not_a_batch_refuses():
         _Runner(MockConfig(pipeline_parallel_size=1)).forward(object())
 
 
-def test_a_speculative_config_is_refused_rather_than_reported_with_no_drafts(run):
-    """The zeros would be well-formed, which is the whole problem with them."""
-    speculative = _Runner(
-        MockConfig(speculative_config=object(), pipeline_parallel_size=1)
-    )
-    with pytest.raises(RunnerRefusal, match="speculative"):
-        speculative.forward(run.batches[-1])
+@pytest.mark.parametrize("method", ["eagle3", "mtp"])
+def test_a_speculative_config_is_refused_before_the_drafter_is_built(run, method):
+    """Refused while the model is being built, so the base never builds a drafter.
+
+    Constructing `CompassModelRunner` needs a driver, because importing ATOM's
+    runner runs aiter's architecture probe. So `_Base` stands in for
+    `ModelRunner.__init__` and records what runs after the model is built. The
+    order it copies is read from ATOM's source: `_build_and_load_model` is a
+    plain statement of `__init__`'s body, under no `if` or `try`, and it comes
+    before the statement that calls `build_drafter`.
+    """
+    init = _function(ATOM_RUNNER, "ModelRunner", "__init__")
+    calls = [
+        {ast.unparse(n.func) for n in ast.walk(stmt) if isinstance(n, ast.Call)}
+        for stmt in init.body
+    ]
+    built = next(i for i, c in enumerate(calls) if "self._build_and_load_model" in c)
+    drafter = next(i for i, c in enumerate(calls) if "build_drafter" in c)
+    assert isinstance(init.body[built], ast.Expr) and built < drafter
+
+    ran = []
+
+    class _Base:
+        def __init__(self, config):
+            self.config = config
+            self._build_and_load_model(object)
+            ran.append("build_drafter")
+
+    class _Composed(NonAllocatingRunner, _Base):
+        pass
+
+    speculative = SimpleNamespace(method=method)
+    with pytest.raises(RunnerRefusal, match="drafts no tokens"):
+        _Composed(MockConfig(speculative_config=speculative))
+    assert ran == []
     # What the refusal is instead of: a reply nothing rejects, describing a run
     # in which nothing was drafted.
     reply = DeferredTokenStream(0)._reply(run.batches[-1], deferred=True)
