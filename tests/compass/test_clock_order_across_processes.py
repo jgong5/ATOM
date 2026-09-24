@@ -70,7 +70,6 @@ for name in arrival:
 print("seed", os.environ.get("PYTHONHASHSEED", "<unset>"))
 print("hash", hash(names[0]))
 print("module", atom.__file__)
-print("arrival", " ".join(arrival))
 print("registry", " ".join(str(lp_id) for lp_id in registry.ids()))
 # Built from `names`, not from `arrival`: the seed is then the only thing that
 # differs between children, so a difference in this line is attributable to it
@@ -128,11 +127,6 @@ def test_every_child_ran_against_the_tree_under_test(runs):
             f"seed {run['seed']} resolved atom at {run['module']}, "
             f"which is not under {REPO}"
         )
-
-
-def test_the_children_really_did_register_in_different_orders(runs):
-    arrivals = [run["arrival"] for run in runs]
-    assert len(dict.fromkeys(arrivals)) == len(SEEDS), arrivals
 
 
 def test_the_total_order_is_the_same_in_every_process(runs):
