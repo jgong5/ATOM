@@ -65,6 +65,5 @@ def test_the_rpcs_named_are_the_waits_only_the_rapidserve_cores_make():
         and s.file == "engine_core.py"
         and any(c.lineno <= s.line <= c.end_lineno for c in cores)
     }
-    rpcs = set(config_module.RAPIDSERVE_RPCS)
     rapid_only = (set(surface.SITES) & surface.RAPID) - surface.BASE
-    assert rpcs == waited - surface.BASE == rapid_only
+    assert set(config_module.RAPIDSERVE_RPCS) == waited - surface.BASE == rapid_only
