@@ -925,8 +925,8 @@ def test_the_refusal_comment_says_the_loop_breaks_and_not_that_it_hangs():
 def test_what_the_comment_says_a_hole_at_exit_loses_is_what_exit_does():
     """Each loss the comment names, against `ModelRunner.exit`'s own body.
 
-    The comment is the only place in this package that says what shutdown
-    fails to release, and it says it about ATOM's code rather than about this
+    The comment is what this test holds against `ModelRunner.exit`'s body: it
+    says what shutdown fails to release about ATOM's code rather than this
     package's, so it drifts whenever `exit` is edited. It also states which of
     those losses is empty here -- the five KV deletions are `hasattr`-guarded
     and this runner allocates no KV tensor, so they find nothing. The guard is
