@@ -105,6 +105,7 @@ class Runner(NonAllocatingRunner):
             eos_token_id=-1,
             stop_token_ids=[],
             pipeline_parallel_size=1,
+            kv_transfer_config={},
         )
 
 
