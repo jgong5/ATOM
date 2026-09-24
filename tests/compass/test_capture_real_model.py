@@ -2210,7 +2210,7 @@ def test_a_call_through_either_binding_reaches_the_sentinel():
     No capture reaches ATOM's call site, so this calls both names on a `None`
     config. A binding left out, or a sentinel that calls through, runs the real
     function, which raises on `None.tensor_parallel_size`. The child also
-    refuses an `atom` from outside the root this process imported it from.
+    refuses any `atom` package but the one this process imported.
     """
     probe = (
         "import importlib.util, pathlib, sys, tempfile\n"
@@ -2226,15 +2226,15 @@ def test_a_call_through_either_binding_reaches_the_sentinel():
         "    model_runner.apply_simulated_tp(None)\n"
         "    simulated_tp.apply_simulated_tp(None)\n"
         "from atom import __file__ as atom_file\n"
-        "assert pathlib.Path(atom_file).is_relative_to(sys.argv[3]), atom_file\n"
+        "assert pathlib.Path(atom_file).resolve() == pathlib.Path(sys.argv[3]), atom_file\n"
         "print('SENTINEL-CALLS', len(calls))\n"
     )
     tree_root = pathlib.Path(__file__).resolve().parents[2]
     import atom
 
-    atom_root = pathlib.Path(atom.__file__).resolve().parents[1]
+    atom_init = pathlib.Path(atom.__file__).resolve()
     completed = subprocess.run(
-        [sys.executable, "-c", probe, __file__, str(tree_root), str(atom_root)],
+        [sys.executable, "-c", probe, __file__, str(tree_root), str(atom_init)],
         capture_output=True,
         text=True,
         timeout=1800,
@@ -2767,9 +2767,8 @@ def test_the_three_sites_are_where_they_were_and_carry_the_symbol_instead():
     symbol, so both slices carry it and the copy dispatches with it; the line
     appears as the call site of operators whose shapes are not numbers.
 
-    **Site three**, `assert_shape_contract`'s `_rows`. This is the one closed in
-    ATOM's own code, and it is the only one that could not be closed from
-    outside ATOM: `int(t.shape[0])` converts a dimension the assertion
+    **Site three**, `assert_shape_contract`'s `_rows`, the only one that could not
+    be closed from outside ATOM: `int(t.shape[0])` converts a dimension the assertion
     then compares against a symbolic width. It no longer converts, so it
     appears nowhere.
 
