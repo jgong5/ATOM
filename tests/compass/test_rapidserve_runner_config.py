@@ -6,6 +6,7 @@
 from types import SimpleNamespace
 
 import pytest
+import test_runner_rpc_surface as surface
 from transformers import PretrainedConfig
 
 import atom.config as config_module
@@ -48,3 +49,21 @@ def test_a_rapidserve_runner_is_accepted(monkeypatch, qualname):
     named = {} if qualname is None else {"runner_qualname": qualname}
     config = _config(monkeypatch, enable_rapidserve=True, **named)
     assert config.runner_qualname == (qualname or RAPID)
+
+
+def test_the_rpcs_named_are_the_waits_only_the_rapidserve_cores_make():
+    """`RAPIDSERVE_RPCS` is the waited names `PrefillEngineCore` and
+    `DecodeEngineCore` broadcast that `ModelRunner` lacks, and also the
+    broadcast names `RapidServeModelRunner` defines and `ModelRunner` lacks."""
+    classes = surface._classes(surface.ENGINE / "engine_core.py")
+    cores = [classes["PrefillEngineCore"], classes["DecodeEngineCore"]]
+    waited = {
+        name
+        for name, sites in surface.SITES.items()
+        for s in sites
+        if s.waits
+        and s.file == "engine_core.py"
+        and any(c.lineno <= s.line <= c.end_lineno for c in cores)
+    }
+    rapid_only = (set(surface.SITES) & surface.RAPID) - surface.BASE
+    assert set(config_module.RAPIDSERVE_RPCS) == waited - surface.BASE == rapid_only
