@@ -116,12 +116,12 @@
   amend or merge, even after a passed review), with two exceptions. One is `gh
   stack link` by PR number, which lands and pushes nothing, though it retargets
   the linked PRs' bases (then and when a PR below lands). **The other is a base
-  update: an agent may merge as the branch-update rule (below) calls for, first
-  patching the PR's base via REST if it is an unlinked child whose parent landed,
-  changing nothing else.** The merge keeps every change from both sides; where it
-  cannot, the agent commits nothing and names the conflict hunk in a PR comment.
-  A PR comment lists each resolved file, and the label allows one delta review of
-  the resolutions (`--diff-merges=remerge`). Only the owner removes the label.
+  update: an agent may merge as the branch-update rule (below) calls for,
+  patching the PR's base via REST just before the push if it is an unlinked child
+  whose parent landed, changing nothing else.** The merge keeps every change from
+  both sides; where it cannot, the agent commits nothing and names the conflict
+  hunk in a PR comment. A PR comment lists each resolved file, and the label
+  allows one delta review of the resolutions. Only the owner removes the label.
   **Without it, automation is on by default**: agents act with no opt-in.
 - **The review loop has its own stop.** If the same finding survives two cycles,
   or the loop passes three cycles, it halts, goes to the owner and applies
