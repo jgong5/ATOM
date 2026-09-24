@@ -541,7 +541,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it holds |
 |---|---|---|
-| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T87; cross-cutting issues; pending amendments. |
+| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; the TODO register; cross-cutting issues; pending amendments. |
 
 ### Part VII — How it gets built
 
