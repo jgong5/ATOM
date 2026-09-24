@@ -194,9 +194,8 @@ id, `test_the_cost_per_byte_does_not_grow`, are issue #93's. 19 of the 21 are pi
 PR #79's review (issue comment 5765186351) ran `b58a48cc2` 19 times, for 17 nominal,
 1 skip-variant and the one hard failure. The other 2, 1 nominal and 1 skip-variant
 by subtraction from the table, name no commit, so half the skip-variant rate rests
-on #93's count alone. No record names the skip-variants' method: #93 never says
-all 21 ran that test, and 5765186351 names it only for the failure. Not-nominal
-combined is ~1 in 7.
+on #93's count alone. #93 attributes the skip-variants to that test, but no run
+named it (PR #99). Not-nominal combined is ~1 in 7.
 The finding is the third outcome, not the rate. The rates are a **lower bound on
 the class**, not a measurement of it: the class holds **3 methods / 4 collected
 cases** (one is parametrised `buffered-region` and `kimi-incremental`), of which
@@ -216,8 +215,8 @@ and the one hard failure in the counts under direct pytest; comment 5765186351
 gives only its mix, 7 gate + 12 direct.
 
 **Run gates sequentially.** Per #93, the hard failure was reproduced when two gate
-loops on node 18 overlapped; it names neither that run's harness nor whether it is
-the one in the counts. Two gates on one box compete for the CPU the control arm is
+loops on node 18 overlapped; #93 names neither that run's harness nor whether it
+is the one in the counts. Two gates on one box compete for the CPU the control arm is
 measuring, which is the condition this test is least able to survive — check for a
 running `gate_cpu.sh` before starting one.
 
