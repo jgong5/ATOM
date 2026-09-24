@@ -2209,7 +2209,8 @@ def test_a_call_through_either_binding_reaches_the_sentinel():
 
     No capture reaches ATOM's call site, so this calls both names on a `None`
     config. A binding left out, or a sentinel that calls through, runs the real
-    function, which raises on `None.tensor_parallel_size`.
+    function, which raises on `None.tensor_parallel_size`. The child also
+    refuses an `atom` from outside the root this process imported it from.
     """
     probe = (
         "import importlib.util, pathlib, sys, tempfile\n"
@@ -2224,11 +2225,16 @@ def test_a_call_through_either_binding_reaches_the_sentinel():
         "    from atom.model_engine import model_runner\n"
         "    model_runner.apply_simulated_tp(None)\n"
         "    simulated_tp.apply_simulated_tp(None)\n"
+        "from atom import __file__ as atom_file\n"
+        "assert pathlib.Path(atom_file).is_relative_to(sys.argv[3]), atom_file\n"
         "print('SENTINEL-CALLS', len(calls))\n"
     )
     tree_root = pathlib.Path(__file__).resolve().parents[2]
+    import atom
+
+    atom_root = pathlib.Path(atom.__file__).resolve().parents[1]
     completed = subprocess.run(
-        [sys.executable, "-c", probe, str(pathlib.Path(__file__)), str(tree_root)],
+        [sys.executable, "-c", probe, __file__, str(tree_root), str(atom_root)],
         capture_output=True,
         text=True,
         timeout=1800,
@@ -2625,8 +2631,9 @@ def test_the_capture_refuses_a_width_that_torch_would_specialise():
         env={**os.environ, "PYTHONPATH": str(tree_root)},
         cwd=str(tree_root),
     )
-    # 2 is argparse's usage error. Without `main`'s refusal, `_step_axis`
-    # still refuses, but as an uncaught AssertionError, which exits 1.
+    # Without `main`'s refusal, `_step_axis` still refuses, but as an uncaught
+    # AssertionError: a traceback, and exit 1. 2 is argparse's usage error.
+    assert "Traceback" not in completed.stderr
     assert completed.returncode == 2
     assert "traces no symbol" in completed.stderr
     # And no record at all: a refusal that still printed one would be worse
