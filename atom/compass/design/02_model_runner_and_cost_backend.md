@@ -36,9 +36,9 @@ enough that it does not become a maintenance burden against upstream ATOM.
 
 `Config.runner_qualname` (`atom/config.py:1595`) is consumed at `engine_core.py:125-130`
 and `async_proc.py:166-169`. It already has two in-tree users —
-`atom/rollout/async_engine.py:26-32` injects `RLHFModelRunner`, and `config.py:1729-1736`
-swaps in `RapidServeModelRunner` automatically. **The injection itself requires no ATOM
-change.**
+`atom/rollout/async_engine.py:26-32` injects `RLHFModelRunner`, and `Config.__post_init__`
+(`config.py:1730-1736`) swaps in `RapidServeModelRunner` automatically. **The injection
+itself requires no ATOM change.**
 
 `model_runner.py::RapidServeModelRunner` is a working template for a
 non-allocating runner already in the tree. It overrides exactly the memory-owning

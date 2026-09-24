@@ -117,8 +117,7 @@ logger = logging.getLogger(__name__)
 # RapidServe runner (`config.py:1730-1736`) fires only while `runner_qualname`
 # is still ATOM's default -- which Compass overwrites. `Config` therefore raises
 # `ValueError` for `enable_rapidserve=True` with any runner not in
-# `RAPIDSERVE_RUNNERS` (`config.py:1737-1745`), this one included, and
-# `LLMEngine` builds that `Config` (`llm_engine.py:43`) before either class.
+# `RAPIDSERVE_RUNNERS`, this one included.
 #
 # Also outside the table, and outside anything a broadcast-derived enumeration
 # can see: three of these twelve are called in-process on the runner itself,
