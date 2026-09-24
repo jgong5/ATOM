@@ -12,7 +12,7 @@ this red; a list copied into a test would not notice either.
 **The suspension is not asserted by calling the connector.** The engine asks
 whether a request is held elsewhere, allocates its blocks, tells the connector
 about the allocation and only then decides to suspend it -- four steps in one
-loop, in that order, and the defect these tests exist to catch is a connector
+loop, in that order, and the defect the suspension tests exist to catch is a connector
 that behaves correctly at each step and wrongly across them. So the request
 here goes into a real `Scheduler`, and what is asserted is the status the
 engine put it in and the step it came back out on. The clock is the list
