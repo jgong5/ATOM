@@ -518,6 +518,41 @@ truncates more grants, so the crawl is finer. The rule a transport has to implem
 therefore: *an LP asks again when it has work or has been refused, and an LP with nothing
 to do parks rather than stepping its clock forward one floor at a time.* That decision, not
 PP degree, is what decides whether the grant traffic is affordable.
+**Amendment, 2026-09-22, by CA-7 (#50) — at a microsecond floor the discipline is not
+available, and the grant traffic is then 8750x this sizing.** The amendment above ends with
+a rule a transport can follow: park rather than stepping forward one floor at a time. That
+rule is available only to an LP with nothing to do. Measured on the implementation, and the
+argument is short enough to check by hand: **at any strictly positive floor a parked LP's
+bound is `min_j earliest(j) + L >= now + L > now`**, so `_resolve`'s zero-span refusal — the
+thing that leaves an LP parked — is unreachable while any peer is executing. The all-parked
+state that produces the cheap jump to a distant event cannot be entered from an arrangement
+in which everybody has work. **So the crawl is a property of the grant rule, not of a
+careless driver**, and a pipeline is exactly the arrangement in which everybody has work.
+
+Measured grant rates, full mesh at floor *f*, every participant holding work it cannot yet
+reach:
+
+| stages | 1 µs floor | law |
+|---|---|---|
+| 2 | 1.0e6 grants per simulated second | `(n-1)/f` |
+| 8 | 7.0e6 | |
+| 33 | 3.2e7 | |
+| 65 | 6.4e7 | |
+
+Against **800 per simulated second** — the ~240k grants for a 300 s run this section sizes
+PP8 at — that is **8750x**. At the ~50 µs per grant round trip the open issue below
+estimates, 7.0e6 grants per simulated second is **~350 wall-seconds of clock traffic per
+simulated second**, against an acceptance target of running at least five times faster than
+real. The timeline log's volume, recorded as T70, is a consequence of this number; **the
+number itself is about the protocol**. Two ways out exist on paper and neither is this
+document's to choose: raise the stage-to-stage floor to whatever the modelled send and
+receive actually costs and accept the fidelity that buys, or give the PP sub-graph the
+distributed safe-window computation option B describes, which is what the open issue below
+already says to re-evaluate when M7 arrives. What is settled is that PP at a microsecond
+floor is not affordable under a central authority at one grant per round trip, and that
+this is a correctness-of-the-*result* concern by way of the speed target rather than only
+an efficiency one.
+
 **PP is therefore an efficiency concern, not a correctness concern.** It is also
 single-node only (every PP address is ZMQ IPC, `engine_core_mgr.py:327-329`), and ATOM
 *rejects* PP+DP (`:298-300`) and multi-node DP+PP (`:272-279`). Defer it on scope
@@ -815,11 +850,103 @@ merely noisy.
 2. **The summary is part of the run artifact, not a log line.** `13` D81's rule applies:
    recorded by value, so a result can be audited without the machine that produced it.
 
+### Amendment, 2026-09-22, by CA-7 (#50) — three things implementation changed
+
+**1. The summary is in two halves, because one of its fields is not reproducible.** D3.4's
+rule is that the sequence of `(LP, virtual time, event)` may not vary between runs while
+wall-clock interleaving may. "Grants issued, per LP" is on the wrong side of that line:
+measured across all 24 request orders of one four-LP configuration with unequal floors and
+unequal horizons, **one** schedule comes out and **six** distinct grant totals, 55 to 60
+(T90 records CA-2's reviewer measuring 12 totals over 1457-1484 on a larger one). A summary
+that reports both alike invites a comparison between two runs that differ only in which
+socket was ready first. So the record is `schedule_record()` — every LP's final clock, the
+simulated span, the refusal tally, the straggler count, the clock-lint status — and
+`cost_record()`, whose first field is `varies_with: [arrival order, driver discipline,
+host]` and which carries the grants, the wall seconds, the speed ratio, the lazy-trace cost
+and the watchdog count. Only the first is byte-diffable. The grant count is kept, because
+it is the only reading of the protocol's own cost, and per D3's sizing amendment it is
+meaningless without the discipline that produced it: the discipline is a **required**
+argument of the summary, and where the timeline is on, the share of grants a peer's bound
+cut short is recorded beside it as the measured fingerprint of which discipline the run
+actually used.
+
+**2. The dump cannot say what an LP "declared itself blocked on", because the protocol
+carries no such declaration.** The grant rule records that an LP asked for time and was
+refused, never a reason in the LP's own words. What the dump can say, and does, is which
+peer at which time is holding it, derived from the row the bound was a minimum over and
+marked at the binding term — and it says that the column is derived rather than presenting
+it as a declaration. Naming what an LP is waiting *for*, as opposed to what is holding it,
+needs a field on the request that does not exist today; it is the transports' call
+(`#46`), not the clock's.
+
+**3. The dump classifies the stall, because two different situations reach it.** T89: a run
+whose work is finished and a run waiting on a message that will never be sent are the same
+state. The dump therefore reports `event-unreachable` — every LP parked with a finite
+horizon somewhere — or `no-future-event`, where it states in the record that the two are
+indistinguishable and gives the one reading the state supports (whether every LP was
+granted time, or some LP never was), labelled as a reading of the same evidence and not a
+second source.
+
+`event-unreachable` says it is **not** a finished run, and that is provable only under a
+premise the clock does not enforce, so the record now names the premise. `request_advance`
+accepts any finite horizon at or after the caller's clock and never checks that it is an
+*event* rather than a *deadline*. An LP built over one of D4's bounded pollers, declaring
+its poll timeout as its horizon, reaches this state on a run that has genuinely finished,
+and the headline would then be wrong about it. **Declare events, never timeouts** — that is
+a requirement on every `request_advance` caller and it was nowhere before this.
+
+**Three smaller things the record needed, all of them the same mistake in different
+places — a number that reads as a statement it cannot support.** The summary reads the
+timeline off the clock rather than taking a copy from its caller, because otherwise an
+empty record count means "the log was off" *or* "whoever built the summary forgot to pass
+it", on a clock that logged every grant. An advance whose bound and whose own horizon fall
+on the same instant is classed `tie` and not `bound`, because the `bound` count is the only
+measured check on a declared driver discipline and on a symmetric arrangement — a ring of
+PP stages is one — **34% of the advances land on both at once**. And a run that spent no
+measurable wall time has **no** speed result rather than an unlimited one: an infinity is
+not a value a strict reader of the artifact can carry, and `meets_speed_target: true` on a
+run nobody timed is a guess in the field `08`'s gate reads.
+
+**Measured:** what the log costs when off is bounded, not merely asserted. Node 18, **60
+alternating rounds** of control → branch-off → branch-on, one process per trial, 40,000
+paired grants each, so drift falls on all three arms alike.
+
+| arm | median | mean | sd | max |
+|---|---|---|---|---|
+| control `4c538fdb1`, no hook anywhere in the tree | 7.158 | 7.170 | 0.160 | 8.118 |
+| branch, log off — the default | 7.213 | 7.221 | 0.144 | 7.777 |
+| branch, log on | 9.264 | 9.285 | 0.134 | 9.623 |
+
+µs per grant. **Paired within round (off − control): mean +0.051 µs, median +0.064 µs, off
+slower in 38 of 60 rounds.** A sign test does not clear that at 60 rounds, so the honest
+statement is a bound rather than a zero: the hook costs **at most about 0.06 µs a grant,
+under 1%**. An independent 60-round repetition of the same experiment on the previous head
+gave mean +0.0022 µs and 28 of 60 — indistinguishable from zero — so the two together put
+it between nothing and 0.06 µs. A null control, the same tree run in both slots for 40
+rounds, gives mean −0.014 µs and 19 of 40, so the ordering inside a round does not produce
+the difference.
+
+For scale: the log **on** costs **+2.05 µs, 1.284x**, and a version that builds one tuple of
+horizons before the guard — which is the cheapest way to get this wrong, and passes a test
+that only checks the guard's shape — costs **+0.674 µs, slower in 30 of 30 paired rounds**.
+So the default is around thirty times below the cost it exists to avoid and ten times below
+the cheapest known mistake. Stating it as overlapping ranges of best-of-five minima, as the
+first version of this measurement did, discards the distribution and gives nothing to test
+a null against; the paired difference is the same claim with one.
+
 ### Open issue
 
-- The timeline log's volume at PP degree > 1 is unestimated. Grants scale with PP stages
-  and with the microsecond lookahead between them, so the log could be very large exactly
-  where it is most wanted. Recorded as **T70**.
+- ~~The timeline log's volume at PP degree > 1 is unestimated.~~ **Estimated, 2026-09-22 by
+  CA-7 — see T70**, and the grant rates behind it are in the Sizing amendment above, where
+  they say something larger. At `(n-1)/f` grants per simulated second and a mean **104-108
+  byte** record — measured with realistic participant names, a clock at 150 s and the exact
+  rendering the log needs at a microsecond floor — a 300 s run writes **31 GB at PP2,
+  224 GB at PP8, 1.0 TB at 33 and 2.1 TB at 65**. The affordable discipline is the other
+  extreme and is lookahead-independent: every LP but one idle gives **3 grants and 187
+  bytes** for a 20 s stretch at both a 1 ms and a 1 µs floor. So at PP degree > 1 the log is
+  a windowed artifact or it is nothing, and what the window is keyed on is what remains
+  open. The run summary is unaffected: it is read once at the end and its size does not
+  depend on the grant count.
 ## D4. The interception contract: which waits must be touched
 
 ### Problem
