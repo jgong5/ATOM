@@ -20,10 +20,12 @@ holding one number that the rest of this package's tests use.
 """
 
 import ast
+import inspect
 import ipaddress
 import json
 import pathlib
 import socket
+import sys
 import time
 from types import SimpleNamespace
 
@@ -43,23 +45,29 @@ from transformers import PretrainedConfig
 
 from atom.compass.backends import KvGeometry
 from atom.compass.kv import CLOCK_KEY, TRANSFER_KEY
+from atom.compass.kv.connector import SimulatedKVConnector
 from atom.compass.kv.handoff import (
     SIMULATED_ENGINE_ID,
     SIMULATED_HOST,
     SIMULATED_PORT,
     transfer_params,
 )
+from atom.compass.runner.overrides import NonAllocatingRunner
 from atom.kv_transfer import disaggregation
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus
+from atom.utils import forward_context
 
 #: The backend whose blob shape the router and the consumer were built around.
 PULL_BACKEND_SOURCE = (
     pathlib.Path(disaggregation.__file__).parent / "moriio" / "moriio_connector.py"
 )
+
+#: The runner whose `process_kvconnector_output` the Compass runner inherits.
+ATOM_RUNNER = pathlib.Path(inspect.getfile(Scheduler)).with_name("model_runner.py")
 
 #: The first sampled token the producer hands back; the consumer resumes on it.
 FIRST_TOKEN_ID = 7
@@ -421,6 +429,57 @@ def step(engine, worker):
     )
     engine._update_from_kv_xfer_finished(aggregated)
     engine.schedule()
+
+
+def test_the_compass_runner_builds_the_worker_that_ends_the_park(
+    geometry, seq_factory, monkeypatch
+):
+    """The same park, with the worker built and started by the runner.
+
+    Importing ATOM's runner needs a driver, so its `process_kvconnector_output`
+    is compiled from source onto the Compass overrides, and the TP group
+    `ModelRunner.__init__` opens is stood in at rank 0.
+    """
+    source = ast.parse(ATOM_RUNNER.read_text())
+    (method,) = [
+        n
+        for c in source.body
+        if isinstance(c, ast.ClassDef) and c.name == "ModelRunner"
+        for n in c.body
+        if isinstance(n, ast.FunctionDef) and n.name == "process_kvconnector_output"
+    ]
+    namespace = {"torch": torch, "get_kvconnector": forward_context.get_kvconnector}
+    exec(ast.unparse(method), namespace)  # noqa: S102
+    group = SimpleNamespace(get_tp_group=lambda: SimpleNamespace(rank_in_group=0))
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", group)
+    monkeypatch.setattr(forward_context, "_global_kvconnector", None)
+
+    model = model_for(geometry, PEAKS[0])
+    now = [ISSUE_AT]
+    runner = object.__new__(
+        type("Runner", (NonAllocatingRunner,), {method.name: namespace[method.name]})
+    )
+    runner.config = atom_config_double(
+        kv_transfer_config={
+            "kv_connector": "compass",
+            "kv_role": "kv_consumer",
+            CLOCK_KEY: lambda: now[0],
+            TRANSFER_KEY: model,
+        }
+    )
+    assert runner.allocate_kv_cache(100) is True
+    worker = forward_context.get_kvconnector()
+    assert isinstance(worker, SimulatedKVConnector)
+
+    engine = scheduler_with(connector(model, lambda: now[0], role="scheduler"))
+    seq = remote_filled(seq_factory)
+    engine.add(seq)
+    batch, _ = engine.schedule()
+    assert seq.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+    runner.process_kvconnector_output(batch.connector_meta_output)
+    now[0] = model.release_at(ISSUE_AT, len(seq.block_table))
+    step(engine, worker)
+    assert seq.status is SequenceStatus.RUNNING
 
 
 def test_nothing_is_announced_for_a_request_the_engine_did_not_suspend(
