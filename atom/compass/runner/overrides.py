@@ -425,17 +425,14 @@ class NonAllocatingRunner:
         from atom.utils.forward_context import set_kv_cache_data
 
         kv = getattr(self.config, "kv_transfer_config", None)
-        name = kv and KVConnectorFactory.canonical_name(
-            kv.get("kv_connector", "moriio")
-        )
-        if kv and name != "compass":
-            reason = (
-                f"kv_connector {name!r} is a real transfer backend, and building "
-                "it would open ports or load an RDMA library on this worker; "
-                "this runner simulates only 'compass'."
-            )
-            logger.error("%s", reason)
-            raise RunnerRefusal(reason)
+        if kv:
+            name = KVConnectorFactory.canonical_name(kv.get("kv_connector", "moriio"))
+            if name != "compass":
+                raise RunnerRefusal(
+                    f"kv_connector {name!r} is a real transfer backend; this "
+                    "runner simulates only 'compass', and an unset kv_connector "
+                    "means 'moriio'."
+                )
         set_kv_cache_data({}, self.config, num_blocks=num_kvcache_blocks)
         self.config.num_kvcache_blocks = num_kvcache_blocks
         logger.info(

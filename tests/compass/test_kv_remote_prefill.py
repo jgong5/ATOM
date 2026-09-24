@@ -19,6 +19,8 @@ engine put it in and the step it came back out on. The clock is the list
 holding one number that the rest of this package's tests use.
 """
 
+from __future__ import annotations
+
 import ast
 import ipaddress
 import json
