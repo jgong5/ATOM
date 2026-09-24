@@ -174,7 +174,9 @@ that reads like a neutral measurement would undercut that; `derate` reads like w
 3. **`software_pinned_to` is checked, not decorative.** The plausible reading of the
    evidence is that these constants track the ROCm/RCCL/AITER build more than the die —
    the +5980 MiB at width > 1 is collective buffer sizing, the 926 MiB at TP1 is HIP
-   context plus libraries. A stack mismatch warns loudly.
+   context plus libraries. A stack mismatch warns loudly by default and refuses under
+   `validate(strict=True)`; constants moved across stacks, by a transfer or a merge,
+   always refuse.
 4. **The whole resolved spec is echoed into every run artifact.** The KV gate is **≤5%**;
    a number whose spec cannot be recovered from the artifact is unattributable.
 

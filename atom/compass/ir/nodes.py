@@ -264,14 +264,26 @@ class ContextRef:
         return tuple(dict.fromkeys(self._fields()))
 
     def bind(self, **values: int) -> "ContextRef":
-        """This key with its indices substituted, for one instance of a repeat."""
+        """This key with its indices substituted, for one instance of a repeat.
+
+        A binding can be wrong in two ways -- an index left without a value, and
+        a value naming no index -- and each is refused in its own clause, which
+        appears only when that fault did. One clause naming both stated the
+        other fault too whichever had happened, so the refusal could not say
+        which, and neither could a caller reading it.
+        """
         names = self.index_names
         missing = [name for name in names if name not in values]
         unknown = [name for name in values if name not in names]
-        if missing or unknown:
+        faults = []
+        if missing:
+            faults.append(f"no value was given for {missing}")
+        if unknown:
+            faults.append(f"{unknown} is not an index of it")
+        if faults:
             raise KeyError(
                 f"cannot bind {self.key!r}: it is written in terms of "
-                f"{list(names)}; missing {missing}, not used {unknown}"
+                f"{list(names)}; " + " and ".join(faults)
             )
         return ContextRef(self.key.format(**values))
 
@@ -359,6 +371,15 @@ def _as_attrs(attrs: Any) -> tuple[tuple[str, Any], ...]:
     docstring says why that distinction is the whole of the guarantee. Names are
     checked against `AMBIENT_READINGS`, which catches the per-step readings that
     arrive as plain numbers and that no type rule could tell from a width.
+
+    An item that is not a tuple or list and an item of the wrong length are
+    separate refusals, and each names its own fault. The container test comes
+    first, and it is the one that refuses a str: a two-character str has length
+    2 and unpacks into a name and a value, so the length test alone would
+    accept it. No str test of its own is needed, because no type can be both a
+    str or bytes and a tuple or list -- Python refuses that combination of
+    bases as an instance lay-out conflict. An object whose `__class__` answers
+    `tuple` still passes the container test, since `isinstance` believes it.
     """
     if isinstance(attrs, (str, bytes)):
         raise TypeError(f"attributes are name/value pairs, got {attrs!r}")
@@ -366,12 +387,15 @@ def _as_attrs(attrs: Any) -> tuple[tuple[str, Any], ...]:
     pairs: list[tuple[str, Any]] = []
     seen: dict[str, None] = {}
     for item in items:
-        if isinstance(item, (str, bytes)) or not isinstance(item, (tuple, list)):
-            raise TypeError(f"each attribute is a (name, value) pair, got {item!r}")
+        if not isinstance(item, (tuple, list)):
+            raise TypeError(
+                f"each attribute is a (name, value) pair, given as a tuple or "
+                f"list; got {item!r}"
+            )
         if len(item) != 2:
             raise ValueError(
-                f"each attribute is a (name, value) pair, got {len(item)} "
-                f"items: {item!r}"
+                f"each attribute is a (name, value) pair; {item!r} has "
+                f"{len(item)} items, not 2"
             )
         key, value = item
         if not isinstance(key, str):

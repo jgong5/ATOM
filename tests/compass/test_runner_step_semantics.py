@@ -45,6 +45,7 @@ from atom.sampling_params import SamplingParams
 REPO = pathlib.Path(__file__).resolve().parents[2]
 ATOM_RUNNER = REPO / "atom" / "model_engine" / "model_runner.py"
 OVERRIDES = REPO / "atom" / "compass" / "runner" / "overrides.py"
+COMPASS_RUNNER = REPO / "atom" / "compass" / "runner" / "model_runner.py"
 SCHEDULER = (REPO / "atom" / "model_engine" / "scheduler.py").read_text()
 
 # One request's prompt is three full token budgets plus a remainder, so each
@@ -96,6 +97,7 @@ def _drive(stream=None, ignore_eos=True, stop_token_ids=(), **overrides):
         max_num_batched_tokens=spec["budget"],
         enable_chunked_prefill=True,
         stop_token_ids=list(stop_token_ids),
+        pipeline_parallel_size=1,
     )
     scheduler = Scheduler(config)
     runner = _Runner(config, stream)
@@ -371,14 +373,45 @@ def test_forward_keeps_inference_mode_and_drops_the_expert_load_monitor():
 
 def test_reporting_a_step_from_something_that_is_not_a_batch_refuses():
     with pytest.raises(RunnerRefusal, match="produces output"):
-        _Runner(MockConfig()).forward(object())
+        _Runner(MockConfig(pipeline_parallel_size=1)).forward(object())
 
 
-def test_a_speculative_config_is_refused_rather_than_reported_with_no_drafts(run):
-    """The zeros would be well-formed, which is the whole problem with them."""
-    speculative = _Runner(MockConfig(speculative_config=object()))
-    with pytest.raises(RunnerRefusal, match="speculative"):
-        speculative.forward(run.batches[-1])
+def test_a_speculative_config_is_refused_before_the_drafter_is_built(run):
+    """Refused while the model is being built, so the base never builds a drafter.
+
+    Constructing `CompassModelRunner` needs a driver, because importing ATOM's
+    runner runs aiter's architecture probe. So `_Base` stands in for
+    `ModelRunner.__init__` and records what runs after the model is built. The
+    order it copies is read from ATOM's source: `_build_and_load_model` is a
+    plain statement of `__init__`'s body, under no `if` or `try`, and it comes
+    before the statement that calls `build_drafter`. The composition it copies
+    is read from `CompassModelRunner`'s: its bases are `NonAllocatingRunner` then
+    `ModelRunner`, and its body binds neither `__init__` nor `_build_and_load_model`.
+    """
+    init = _function(ATOM_RUNNER, "ModelRunner", "__init__")
+    body = [ast.unparse(s) for s in init.body]
+    built = [s.startswith("self._build_and_load_model(") for s in body].index(True)
+    assert built < ["build_drafter(" in s for s in body].index(True)
+    runner = _class(COMPASS_RUNNER, "CompassModelRunner")
+    bases = [ast.unparse(b) for b in runner.bases]
+    assert bases == ["NonAllocatingRunner", "ModelRunner"]
+    bound = {getattr(n, "name", getattr(n, "id", None)) for n in ast.walk(runner)}
+    assert not bound & {"__init__", "_build_and_load_model"}
+
+    ran = []
+
+    class _Base:
+        def __init__(self, config):
+            self.config = config
+            self._build_and_load_model(object)
+            ran.append("build_drafter")
+
+    class _Composed(NonAllocatingRunner, _Base):
+        pass
+
+    with pytest.raises(RunnerRefusal, match="drafts no tokens"):
+        _Composed(MockConfig(speculative_config=object()))
+    assert ran == []
     # What the refusal is instead of: a reply nothing rejects, describing a run
     # in which nothing was drafted.
     reply = DeferredTokenStream(0)._reply(run.batches[-1], deferred=True)
@@ -404,16 +437,16 @@ def test_forward_never_answers_none_and_so_never_parks_its_caller(run):
     assert forward.body[-1] is returns[0]
 
 
-def _function(path, class_name, name):
+def _class(path, name):
     tree = ast.parse(path.read_text())
-    cls = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.ClassDef) and n.name == class_name
-    )
     return next(
-        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name
+        n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == name
     )
+
+
+def _function(path, class_name, name):
+    body = _class(path, class_name).body
+    return next(n for n in body if isinstance(n, ast.FunctionDef) and n.name == name)
 
 
 def _decorators(path, class_name, name):
@@ -452,7 +485,7 @@ def test_the_reply_answers_every_attribute_atom_reads_off_one(run):
     }
     # Answered by building ATOM's own object rather than one shaped like it, so
     # a field this runner never sets still carries the default ATOM gives it.
-    runner = _Runner(MockConfig())
+    runner = _Runner(MockConfig(pipeline_parallel_size=1))
     runner.forward(run.batches[-2])
     reply = runner.forward(run.batches[-1])
     assert isinstance(reply, ScheduledBatchOutput)

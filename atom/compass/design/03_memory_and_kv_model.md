@@ -38,7 +38,7 @@ with exactly one point of GPU contact.
 | Prefix-cache hash (`compute_hash`, xxhash xxh64 chained with the parent) | `block_manager.py:233-245` | **No** |
 | Prefix-cache scan and claim (`can_allocate`, `allocate`) | `block_manager.py:469-561`, `:563-597` | **No** |
 | Prefix publish, deferred until the forward computed the KV (`hash_blocks`) | `block_manager.py:696-771` | **No** |
-| **`allocate_kv_cache`** — creating the actual tensors | **`model_runner.py:1874-2078`** | **Yes** |
+| **`allocate_kv_cache`** — creating the actual tensors | **`model_runner.py::ModelRunner.allocate_kv_cache`** | **Yes** |
 
 `BlockManager.__init__` asserts `num_blocks > 0` (`block_manager.py:77`) and nothing else
 about the device.
@@ -49,8 +49,9 @@ about the device.
 
 Two changes only:
 
-1. `allocate_kv_cache` becomes a no-op in the simulated runner (`RapidServeModelRunner`
-   already does exactly this at `model_runner.py:4261-4267`), so no tensor is created.
+1. `allocate_kv_cache` creates no tensor in the simulated runner. It passes an empty
+   registry to ATOM's `set_kv_cache_data`, which builds the worker-side KV connector when
+   a `compass` `kv_transfer_config` is set (#428).
 2. `get_num_blocks` returns a block count produced from a device model rather than from
    device readings. See D14.
 
@@ -126,10 +127,28 @@ probed per request. Whether that is 0.1 ms or 10 ms is unmeasured. Recorded as *
 
 ### Open issues
 
-- `allocate_kv_cache` also registers tensors globally via `set_kv_cache_data`
-  (`model_runner.py:2029-2034`) and cross-validates expected against actual bytes
-  (`:2036-2062`). The no-op must keep whatever downstream code reads from that registry
-  satisfied, or supply a descriptor-shaped stand-in.
+- **Resolved by #428.** `model_runner.py::ModelRunner.allocate_kv_cache` also registers
+  tensors globally via `set_kv_cache_data`. The Compass override makes the same call with
+  an empty registry, so the registry is `{}` (`forward_context.py:987`), and no stand-in
+  is needed, because nothing reads it under the Compass runner:
+  - No module under `atom/compass` or `scripts/compass` reads it.
+  - Outside `atom/plugin`, ATOM reads it in three kinds of place. `set_forward_context`
+    copies it into each step's context, and is called from
+    `model_runner.py::ModelRunner.prepare_inputs`, from graph capture and from
+    `Drafter.warmup_draft_graphs`; `UBatchWrapper._make_ubatch_context` copies that
+    again per micro-batch. Attention forwards read the copy:
+    `PagedAttentionImpl.rope_cache` and `SparseMHAPagedAttentionImpl.rope_cache`
+    (`attention_mha.py`), `MLAAttention.forward_impl` (`attention_mla.py`),
+    `GatedDeltaNet.forward` (`attention_gdn.py`) and `KimiKDAAttention._forward_impl`
+    (`models/kimi_k3.py`). And the drafter reads it outside any model forward, in
+    `DSparkProposer._resolve_dtype_q` (`spec_decode/dspark_proposer.py`).
+  - `atom/plugin` reads it only in plugin mode, where vLLM, SGLang or RTP-LLM runs ATOM's
+    model code. The mode defaults to `"atom"`, which is not a plugin mode
+    (`plugin/prepare.py`).
+  - The Compass runner reaches none of these: its `forward` and `capture_cudagraph`
+    replace ATOM's and run none of `prepare_inputs`, the model, the drafter or a
+    capture. Its `_build_and_load_model` also sets the model to an `UnbuiltModel`,
+    whose `forward` refuses, and refuses a speculative config.
 - `BlockManager.hash_block_size = block_size * dcp_world_size`
   (`block_manager.py:93`) — decode context parallelism changes the hash granularity.
   Out of scope now; noted so it is not discovered later.
@@ -140,24 +159,28 @@ probed per request. Whether that is 0.1 ms or 10 ms is unmeasured. Recorded as *
 
 ### Problem
 
-`ModelRunner.get_num_blocks()` (`model_runner.py:1652-1873`) is **five device readings
+`model_runner.py::ModelRunner.get_num_blocks` is **five device readings
 plus arithmetic**:
 
 ```
-free, total        = torch.cuda.mem_get_info()                              # :1659
-peak_torch         = max(allocated_bytes.all.peak, .all.current)            # :1660-1663
-non_torch          = max((total - free) - torch.cuda.memory_reserved(), 0)  # :1666
-cudagraph_overhead = self._estimate_cudagraph_overhead()                    # :1668
-safety_margin      = int(total * 0.02)                                      # :1669
-budget             = int(total * config.gpu_memory_utilization)             # :1671
+# in _read_device_memory, which get_num_blocks calls before any budget arithmetic
+free, total        = torch.cuda.mem_get_info()
+peak_torch         = max(allocated_bytes.all.peak, .all.current)
+non_torch          = max((total - free) - torch.cuda.memory_reserved(), 0)
+# in get_num_blocks
+cudagraph_overhead = self._estimate_cudagraph_overhead()
+safety_margin      = int(total * 0.02)
+budget             = int(total * config.gpu_memory_utilization)
 available_for_kv   = min(budget - (peak_torch + non_torch + cudagraph_overhead
                                    + safety_margin)
-                         - self._kv_budget_extra_reserve(total), free)      # :1672-1679
+                         - self._kv_budget_extra_reserve(total), free)
 plan                = plan_pools(self._sub_pool_specs(), available_for_kv,
-                                 config.max_num_seqs)                       # :1697
-num_kvcache_blocks  = plan.paged_entries                                    # :1735
-# under PP: all_reduce MIN across stages                                    # :1737-1744
+                                 config.max_num_seqs)
+num_kvcache_blocks  = plan.paged_entries
+# under PP: all_reduce MIN across stages
 ```
+
+`_read_device_memory` is `model_runner.py::ModelRunner._read_device_memory`.
 
 Consumed at `engine_core.py:132-145`, which sets `config.num_kvcache_blocks` before the
 `Scheduler` and `BlockManager` are constructed at `:170`.
@@ -218,11 +241,69 @@ Compass therefore models a **dedicated** device. It will not predict the OOM tha
 shared box produces, and it will not reproduce a neighbour-induced admission cliff. That
 is the right thing to model and it is stated here so it is not discovered as a gap.
 
+### The pipeline minimum is not inert
+
+An earlier note here said that under PP the `all_reduce(MIN)` across stages
+(in `model_runner.py::ModelRunner.get_num_blocks`) is inert, *because every stage computes
+the same number*, and that it *still needs a live process group or a stub*. Both halves are
+wrong — and the engine's own comment on that reduce has said so all along:
+*"PP stages compute different block counts; block ids must be valid on every stage's KV
+tensor, so reduce to the global minimum."* The code said what this document denied.
+
+**The stages do not compute the same number.** The five readings *are* identical across
+stages — nothing in the memory model varies with pipeline rank. The layer count is not:
+`model_runner.py::ModelRunner._get_total_num_layers` takes a `get_pp_indices` slice, so
+each stage sizes its pool from the layers it actually holds. Re-derived from ATOM's own
+partitioner at `feature/atomcompass_new` `92f1fdafe`, over the 64-layer hybrid vendored at
+`tests/compass/qwen3_5_27b_config.json` — one full-attention layer in four, so 16 of the 64
+hold paged KV — at block size 64, `max_num_seqs` 256, and a KV budget fixed at
+200,000,000,000 bytes. **That budget is a chosen figure, not a sizing anyone runs at**: the
+absolute counts below are illustrative, and only their movement *between* stages is
+derived.
+
+| PP | layers held per stage | paged layers per stage | distinct block counts |
+|---|---|---|---|
+| 2 | 32, 32 | 8, 8 | 1 |
+| 3 | 21, 22, 21 | 5, 5, 6 | 2 — 152,587 / 152,587 / 127,156 |
+| 4 | 16, 16, 16, 16 | 4, 4, 4, 4 | 1 |
+| 5 | 13, 13, 13, 13, 12 | 3, 3, 3, 4, 3 | 2 |
+| 6 | 10, 11, 11, 11, 11, 10 | 2, 3, 3, 2, 3, 3 | 2 |
+| 7 | 9, 9, 9, 9, 9, 10, 9 | 2, 2, 2, 3, 2, 2, 3 | 2 |
+| 8 | 8, 8, 8, 8, 8, 8, 8, 8 | 2, 2, 2, 2, 2, 2, 2, 2 | 1 |
+
+5/5/6 is **two** distinct counts, not three — the two five-layer stages share one.
+
+**What the counts turn on is the *paged* layer count, not the layer count.** A block costs
+`paged_layers × block_size × bytes_per_token_per_layer`, so two stages agree exactly when
+they hold the same number of paged layers — and an even division of *layers* does not give
+one. The counterexample is inside the table: at pp = 6 stages 1 and 3 each hold 11 layers,
+yet hold **3** and **2** paged ones, and their block counts differ. Layer division and
+paged-layer division coincide at pp = 2, 4 and 8 here only because this model's
+full-attention layers fall one in four; on a stack whose paged layers are spaced otherwise
+they need not. Over the widths above the reduction binds at pp = 3, 5, 6 and 7.
+
+**The block count a PP deployment gets is the minimum over stages**, set by whichever stage
+holds the most paged layers — which is not in general the last one: at pp = 5 it is stage
+3 of 5, and at pp = 6 it is four stages of the six.
+
+**Neither a live process group nor a stub is needed.** The reduce is already guarded by
+`torch.distributed.is_initialized()` (in `model_runner.py::ModelRunner.get_num_blocks`): with no group it does not
+run, and with one it runs ATOM's own code unchanged. Building a stub for it is building
+something nothing asks for.
+
+`tests/compass/test_pipeline_minimum.py` re-derives the table and the widths sentence above
+from `get_pp_indices` rather than restating them, and reads the guard by parsing the runner
+rather than importing it.
+
 ### Open issues
 
-- Under PP, `get_num_blocks` does an `all_reduce(MIN)` across stages
-  (`model_runner.py:1737-1744`). With a device model every stage computes the same number,
-  so the reduction is inert — but it still needs a live process group or a stub.
+- Under PP the guard means the stages agree on a count only when a process group is live.
+  **Without one they do not converge at all**: each keeps its own `plan.paged_entries`, so
+  a simulated pp = 3 run leaves stage 0 holding 152,587 blocks where the deployment it
+  models runs 127,156 on every stage — and the comment cited above says why that is not
+  harmless, since block ids must be valid on every stage's KV tensor. Whether a simulated
+  PP run has a live group is `01` D1's question about topology and is left there; the
+  divergence without one is not a question, and is recorded here.
 - `gpu_memory_utilization` here is a fraction of **total**, with the non-KV footprint
   subtracted afterwards — the vLLM convention, **not** TRT-LLM's. Comparing the resulting
   block count against a number produced under the other convention is wrong.
@@ -297,9 +378,10 @@ KV gate, a spec that cannot be recovered from the artifact makes an error unattr
   depend on the ROCm/RCCL/AITER build more than on the die — the +5980 MiB at width > 1 is
   collective buffer sizing, and the 926 MiB at TP1 is HIP context plus libraries. Adopted
   as a working assumption rather than left open, and made *enforceable* by
-  `software_pinned_to` (doc `05` D25 rule 3), which refuses silently reusing a spec across
-  a stack change. Still untested across dies; recorded as **T50** and cheap to settle with
-  one startup on a second card type.
+  `software_pinned_to` (doc `05` D25 rule 3): reusing a spec across a stack change warns by
+  default (`check_stack`) and refuses under `validate(strict=True)`, and moving constants
+  across stacks, by a transfer or a merge, always refuses. Still untested across dies;
+  recorded as **T50** and cheap to settle with one startup on a second card type.
 - Three topologies of one model is interpolation, not a law. The prior work said so
   explicitly and could not get a third model because the box was offline.
 - **The graph-pool width scaling rests on one point above W=1.** Context, since the line

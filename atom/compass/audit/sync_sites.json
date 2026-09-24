@@ -2026,7 +2026,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner._advance_forward_vars::self._fv_slot_events[self._fv_idx].synchronize()::device_sync#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 1404,
+   "line": 1418,
    "symbol": "ModelRunner._advance_forward_vars",
    "call": "self._fv_slot_events[self._fv_idx].synchronize",
    "expr": "self._fv_slot_events[self._fv_idx].synchronize()",
@@ -2038,7 +2038,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner._gate_staging_reuse::self._stage_h2d_done.synchronize()::device_sync#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 1439,
+   "line": 1453,
    "symbol": "ModelRunner._gate_staging_reuse",
    "call": "self._stage_h2d_done.synchronize",
    "expr": "self._stage_h2d_done.synchronize()",
@@ -2050,7 +2050,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner.get_num_blocks::torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)::collective#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 1742,
+   "line": 1769,
    "symbol": "ModelRunner.get_num_blocks",
    "call": "torch.distributed.all_reduce",
    "expr": "torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)",
@@ -2062,7 +2062,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner.allocate_kv_cache::torch.distributed.barrier()::barrier#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 2077,
+   "line": 2104,
    "symbol": "ModelRunner.allocate_kv_cache",
    "call": "torch.distributed.barrier",
    "expr": "torch.distributed.barrier()",
@@ -2074,7 +2074,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner.postprocess::get_tp_group().broadcast(sampled_tokens, src=0)::collective#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 3138,
+   "line": 3165,
    "symbol": "ModelRunner.postprocess",
    "call": "get_tp_group().broadcast",
    "expr": "get_tp_group().broadcast(sampled_tokens, src=0)",
@@ -2086,7 +2086,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner.postprocess::log_probs.gather( -1, sampled_tokens.to(torch.long).unsqueeze(-1) )::collective#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 3146,
+   "line": 3173,
    "symbol": "ModelRunner.postprocess",
    "call": "log_probs.gather",
    "expr": "log_probs.gather( -1, sampled_tokens.to(torch.long).unsqueeze(-1) )",
@@ -2098,7 +2098,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner.postprocess::get_tp_group().broadcast(sampled_logprobs, src=0)::collective#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 3150,
+   "line": 3177,
    "symbol": "ModelRunner.postprocess",
    "call": "get_tp_group().broadcast",
    "expr": "get_tp_group().broadcast(sampled_logprobs, src=0)",
@@ -2110,7 +2110,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner.postprocess::torch.gather( sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1) )::collective#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 3170,
+   "line": 3197,
    "symbol": "ModelRunner.postprocess",
    "call": "torch.gather",
    "expr": "torch.gather( sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1) )",
@@ -2122,7 +2122,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner.postprocess::torch.gather( sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1) )::collective#1",
    "file": "atom/model_engine/model_runner.py",
-   "line": 3199,
+   "line": 3226,
    "symbol": "ModelRunner.postprocess",
    "call": "torch.gather",
    "expr": "torch.gather( sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1) )",
@@ -2134,7 +2134,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner._piecewise_skip_capture::dist.all_reduce( free_t, op=dist.ReduceOp.MIN, group=get_dp_group().cpu_group )::collective#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 3655,
+   "line": 3682,
    "symbol": "ModelRunner._piecewise_skip_capture",
    "call": "dist.all_reduce",
    "expr": "dist.all_reduce( free_t, op=dist.ReduceOp.MIN, group=get_dp_group().cpu_group )",
@@ -2146,7 +2146,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner.capture_cudagraph::torch.cuda.synchronize()::device_sync#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 3968,
+   "line": 3995,
    "symbol": "ModelRunner.capture_cudagraph",
    "call": "torch.cuda.synchronize",
    "expr": "torch.cuda.synchronize()",
@@ -2158,7 +2158,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner.capture_cudagraph::torch.cuda.synchronize()::device_sync#1",
    "file": "atom/model_engine/model_runner.py",
-   "line": 4012,
+   "line": 4039,
    "symbol": "ModelRunner.capture_cudagraph",
    "call": "torch.cuda.synchronize",
    "expr": "torch.cuda.synchronize()",
@@ -2170,7 +2170,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner._maybe_calibrate_dspark_sps::torch.cuda.synchronize()::device_sync#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 4135,
+   "line": 4162,
    "symbol": "ModelRunner._maybe_calibrate_dspark_sps",
    "call": "torch.cuda.synchronize",
    "expr": "torch.cuda.synchronize()",
@@ -2182,7 +2182,7 @@
   {
    "id": "atom/model_engine/model_runner.py::ModelRunner._maybe_calibrate_dspark_sps::end.synchronize()::device_sync#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 4143,
+   "line": 4170,
    "symbol": "ModelRunner._maybe_calibrate_dspark_sps",
    "call": "end.synchronize",
    "expr": "end.synchronize()",
@@ -2194,7 +2194,7 @@
   {
    "id": "atom/model_engine/model_runner.py::RapidServeModelRunner._disagg_collect_rank_files::time.sleep(0.05)::sleep#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 4354,
+   "line": 4381,
    "symbol": "RapidServeModelRunner._disagg_collect_rank_files",
    "call": "time.sleep",
    "expr": "time.sleep(0.05)",
@@ -2206,7 +2206,7 @@
   {
    "id": "atom/model_engine/model_runner.py::RapidServeModelRunner.prefill_forward::stream.synchronize()::device_sync#0",
    "file": "atom/model_engine/model_runner.py",
-   "line": 4681,
+   "line": 4708,
    "symbol": "RapidServeModelRunner.prefill_forward",
    "call": "stream.synchronize",
    "expr": "stream.synchronize()",

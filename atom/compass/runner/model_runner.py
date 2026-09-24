@@ -23,11 +23,26 @@ class CompassModelRunner(NonAllocatingRunner, ModelRunner):
     step itself, by overriding the six methods that own them; see `overrides`,
     which holds the bodies and says why each one does what it does.
 
-    Construction is not free of device memory. What remains is the base's
-    forward-vars ring from `allocate_forward_vars`, whose dominant term is a
-    `max_num_batched_tokens` by `hidden_size` output buffer. It is sized by the
-    batch budget and the model's hidden size, not by the model's weights, and
-    no named tensor on the runner holds any of it.
+    Construction is not free of device memory. Almost all of what stays
+    resident is the base's forward-vars ring from `allocate_forward_vars`,
+    whose dominant term is a `max_num_batched_tokens` by `hidden_size` output
+    buffer; the rest is a stream, the ring's events, the attention metadata
+    builder and the expert-load-balancing runtime. So the residue is O(batch
+    budget x hidden size) rather than O(weights), and that dominant term is
+    allocated once however deep the pipeline is: a ring slot clones the
+    staging buffers and shares the one output buffer.
+
+    Two named attributes on the runner hold that ring for the life of the
+    process: `forward_vars`, the dict `allocate_forward_vars` builds, and
+    `_fv_ring`, the list of per-slot dicts built from it. Both are the base's.
+    What this class adds is no tensor at all: `model`, a module registering no
+    parameter and no buffer; `_token_stream`, the deferral bookkeeping
+    `forward` builds on first use; and `kv_pool_sizing`, the block count
+    `get_num_blocks` answered, kept beside the readings it was sized from.
+    Those readings come from `atom.compass.memory`, whose whole import closure
+    reaches no tensor library, and `install_device_readings` puts them on the
+    runner as `compass_readings`. It also sets `config.num_kvcache_blocks`,
+    which is a count and not a buffer.
 
     `NonAllocatingRunner` comes first so its methods win over the base's. There
     is deliberately no `__init__`: the base runs all of its own before a
@@ -49,9 +64,16 @@ if _UNANSWERED:
     # partitions them instead of asserting one story for all twelve. A waited
     # name parks its caller on an unbounded queue read for the life of the
     # process. An unwaited one parks nobody: `busy_loop` skips it and carries
-    # on -- which for `exit` means the loop never breaks, and for
-    # `process_kvconnector_output` means a KV load is silently never started.
-    # Both are real failures; neither is a park.
+    # on -- which for `exit` means `ModelRunner.exit` never runs: the
+    # distributed environment is never destroyed, `self.model` is never
+    # dropped, and `torch.cuda.empty_cache()` never runs. Its five KV-tensor
+    # deletions are `hasattr`-guarded and find nothing here, because this
+    # runner allocated none. Its `hasattr`-guarded drafter deletion finds
+    # nothing either: `_build_and_load_model` refuses a speculative config
+    # before the base can build a drafter. The loop breaks either way, since
+    # the break is a sibling of the per-runner loop and tests the dispatched
+    # name rather than any reply. Skipping `process_kvconnector_output` means a
+    # KV transfer is silently never started. Both are real failures; neither is a park.
     #
     # Two things about this raise itself. No CPU test tier can execute it:
     # importing this module imports `ModelRunner`, which runs aiter's

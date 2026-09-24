@@ -9,15 +9,8 @@ AI agents are given full autonomy under standing rules at `atom/compass/AI_DEV_R
 
 ```bash
 pip install -e .                          # editable install
-python -m pytest tests/                   # needs a GPU: AITER and torch.cuda are mocked, but
-                                          # 29 of the 159 files outside tests/plugin/ reach
-                                          # the driver, and 3 of the 30 inside it do too, so
-                                          # at least 32 of 189 -- not 29 of 189
-scripts/compass/gate_cpu.sh               # driver-free AS A BATCH: 130 files, 4030 passed,
-                                          # 0 failed, 31-38 s, green. Two of the 130 reach
-                                          # rocminfo run alone; in the gate they module-skip.
-                                          # Measured 2026-09-21 in xiaobizh_n18_cpu; an
-                                          # earlier 128-file/3956 reading is superseded
+python -m pytest tests/                   # the full suite; needs a GPU driver
+scripts/compass/gate_cpu.sh               # CPU tier, per task; no driver as a batch; must be green: scripts/compass/README.md
 black . && ruff check .                   # format + lint (CI enforced)
 ```
 

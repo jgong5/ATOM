@@ -13,6 +13,11 @@ the day it is added. It reads nothing outside it, which is the limit worth
 stating: the property is a property of a *package*, not something a type
 inherits by being passed across the seam. Whoever defines the projection type
 somewhere else owns the same assertion over the package that defines it.
+
+Walking a root that does not resolve yields nothing, and a parametrisation of
+nothing is a pass. So the non-empty case is asserted on its own: without it a
+renamed or moved package collects zero cases and this file reports green, which
+is the one outcome a test whose job is to pin something must not have.
 """
 
 import ast
@@ -91,9 +96,47 @@ def _imported_modules(path):
             yield node, "." * node.level + (node.module or "")
 
 
+def _backend_modules():
+    # rglob, so a module added under the package is covered the day it lands.
+    return sorted(PACKAGE.rglob("*.py"))
+
+
+def test_the_package_was_found():
+    assert _backend_modules(), f"no modules under {PACKAGE}"
+
+
+def test_the_guard_finds_nothing_when_the_root_moves(monkeypatch, tmp_path):
+    """The control for the guard above, which otherwise only proves it is alive.
+
+    A guard that has never been seen failing is a liveness check: it passes
+    today because the package is where it always was. Pointed at a root that
+    does not resolve it must come back empty -- and the sibling module one level
+    out is there so a derivation that widened past its own root would be caught
+    here instead of quietly keeping the parametrisation non-empty.
+    """
+    (tmp_path / "sibling.py").write_text("")
+    monkeypatch.setitem(globals(), "PACKAGE", tmp_path / "moved")
+    assert not _backend_modules()
+
+
+def test_the_walk_returns_every_module_under_the_root(monkeypatch, tmp_path):
+    """Non-empty says the walk found something; this, every module of a tree built here.
+
+    The tree is built here, so the expected set does not move when the package
+    gains a module. A walk that is not recursive misses `sub/b.py`, and any
+    narrowing or slice that drops a module of the built tree fails the same way.
+    """
+    for rel in ("__init__.py", "a.py", "sub/b.py"):
+        (tmp_path / rel).parent.mkdir(exist_ok=True)
+        (tmp_path / rel).write_text("")
+    monkeypatch.setitem(globals(), "PACKAGE", tmp_path)
+    modules = {str(p.relative_to(tmp_path)) for p in _backend_modules()}
+    assert modules == {"__init__.py", "a.py", "sub/b.py"}
+
+
 @pytest.mark.parametrize(
     "path",
-    sorted(PACKAGE.rglob("*.py")),
+    _backend_modules(),
     ids=lambda p: str(p.relative_to(PACKAGE)),
 )
 def test_the_package_imports_nothing_from_the_engine(path):
@@ -119,3 +162,13 @@ def test_the_projection_type_is_where_the_scan_can_reach_it(projection):
     defined_in = pathlib.Path(inspect.getfile(projection)).resolve()
     assert defined_in.parent == PACKAGE
     assert defined_in in set(PACKAGE.rglob("*.py"))
+
+
+def test_every_module_the_walk_returns_is_a_case():
+    """The cases are compared to the walk, not only the walk to its tree.
+
+    A slice or filter where the walk is handed to the parametrisation drops
+    cases while the walk itself still returns every module.
+    """
+    (mark,) = test_the_package_imports_nothing_from_the_engine.pytestmark
+    assert mark.args[1] == _backend_modules()
