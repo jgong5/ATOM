@@ -49,8 +49,8 @@ from atom.models.utils import get_pp_indices
 CONFIG_JSON = pathlib.Path(__file__).with_name("qwen3_5_27b_config.json")
 BLOCK_SIZE = 64
 MAX_NUM_SEQS = 512
-# A budget, not a measurement: the device readings are another task's, and a
-# fixed number is what makes these counts reproducible.
+# A budget, not a measurement: no device is read for it, and a fixed number is
+# what makes these counts reproducible.
 KV_BUDGET_BYTES = 64 << 30
 
 

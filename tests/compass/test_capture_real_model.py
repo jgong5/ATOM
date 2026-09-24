@@ -146,9 +146,8 @@ MIN_STEP_WIDTH = 2
 # blocks is the 16,384 that dimension takes.
 BLOCK_SIZE = 16
 
-# The KV pool the step indexes into. A block count, not a measurement: the
-# device readings are another task's, and a fixed number is what makes this
-# reproducible.
+# The KV pool the step indexes into. A block count, not a measurement: no
+# device is read for it, and a fixed number is what makes this reproducible.
 KV_BLOCKS = 64
 
 # What counts as a collective in the inventory. ATOM issues them two ways: as
@@ -1070,9 +1069,8 @@ class _HintSlicedView(numpy.ndarray):
     view with the row count it was handed -- `var["slot_mapping"].np[:running_
     tokens]` -- and numpy takes `__index__` of whatever it is given, which
     solves the symbol. A staging buffer that reads the bound's hint instead
-    leaves it free. That is the shape of one of the two repair routes the
-    design record carries for this, applied from outside ATOM rather than by
-    editing it.
+    leaves it free. That is the shape of one repair to this site, applied from
+    outside ATOM rather than by editing it.
 
     It exists to measure what happens *next*, because the answer is not what
     the two-site account assumed: the bound is not closed by repairing the
@@ -2248,9 +2246,9 @@ def test_atom_s_own_buffer_constructor_is_what_runs():
     The pin on the second specialisation site is worth only as much as the
     code it lets run. An earlier version of this file replaced `__init__`
     wholesale, and a `raise` as its first statement then changed nothing
-    anywhere in this file -- so the repair route the design record names for
-    site two, a symbolic `CpuGpuBuffer`, could have landed and this test would
-    still have reported the site unrepaired. It is ATOM's body that runs now,
+    anywhere in this file -- so a repair to site two, a symbolic
+    `CpuGpuBuffer`, could have gone in and this test would still have reported
+    the site unrepaired. It is ATOM's body that runs now,
     with three primitives staged around it, and these counts are what says so.
 
     The counts are also the pin on the body itself, which no specialisation
@@ -2481,9 +2479,8 @@ def test_the_first_two_specialisation_sites_are_where_they_were_measured():
     take `__index__` of it, and the buffer's own dimension is solved in
     `copy_to_gpu` because that is the first copy whose slice does not cover
     it. Both are pinned by value and by the frames they happened through, so a
-    repair to either one fails here -- which is the point, because the repair
-    is the next task and this is how it will be known to have worked. What
-    lies behind the first of them is the test below.
+    repair to either one fails here. What lies behind the first of them is the
+    test below.
     """
     record = capture(1, symbolic=True)
     injected = record["injected_bounds"]
@@ -2520,9 +2517,9 @@ def test_closing_site_one_moves_the_bound_to_a_third_site():
 
     **What the third site turned out to be.** It was recorded one frame deeper,
     at `_rows`'s `int(t.shape[0])`, which converted a dimension before the
-    assertion compared it. `_rows` no longer converts -- that is this task's one
-    production line -- and the assertion is still reached, because this probe
-    hands the caller a bound that is a *different symbol* from the one the
+    assertion compared it. `_rows` no longer converts -- it returns
+    `t.shape[0]` as it is -- and the assertion is still reached, because this
+    probe hands the caller a bound that is a *different symbol* from the one the
     staged buffer carries, and ATOM's contract is that the two are one number.
     Equating them is the contract working. It is not what made the capture
     concrete, and it does not fire when the whole step is one symbol.
@@ -2679,9 +2676,9 @@ def test_the_symbol_reaches_the_work_that_decides_the_cost():
     is that a future ATOM routing a projection through `addmm` fails here
     instead of quietly understating the three families that decide the cost.
     """
-    # Both widths. TP2 is the one the result is named for -- a width that is
-    # real rather than simulated is where a capture has most to lose -- and TP1
-    # is what says the width added nothing.
+    # Both widths. TP2 is a width that is real rather than simulated, which is
+    # where a capture has most to lose, and TP1 is what says the width added
+    # nothing.
     for tp in (1, 2):
         at_width = capture(tp, step_symbol=True)["family_census"]
         # An operator nobody has classified would otherwise land in whichever
@@ -2763,9 +2760,9 @@ def test_the_three_sites_are_where_they_were_and_carry_the_symbol_instead():
     symbol, so both slices carry it and the copy dispatches with it; the line
     appears as the call site of operators whose shapes are not numbers.
 
-    **Site three**, `assert_shape_contract`'s `_rows`. This is the one the
-    production change is for, and it is the only one that could not be closed
-    from outside ATOM: `int(t.shape[0])` converts a dimension the assertion
+    **Site three**, `assert_shape_contract`'s `_rows`. This is the one closed in
+    ATOM's own code, and it is the only one that could not be closed from
+    outside ATOM: `int(t.shape[0])` converts a dimension the assertion
     then compares against a symbolic width. It no longer converts, so it
     appears nowhere.
 
@@ -2817,9 +2814,9 @@ def test_the_three_sites_are_where_they_were_and_carry_the_symbol_instead():
         "prim.device.default": STAGED_COPIES,
     }
 
-    # Site three converts nothing now. It is the one line under `atom/` this
-    # task changed, and it is the only site of the three that is not reachable
-    # from a capture-time substitution.
+    # Site three converts nothing now. It is ATOM's own `_rows`, which returns
+    # `t.shape[0]` unconverted, and it is the only site of the three that is not
+    # reachable from a capture-time substitution.
     assert not [
         event
         for event in record["host_resolutions"]
@@ -2859,9 +2856,9 @@ def test_the_symbol_is_free_across_the_step_width():
     wide is an engine constant and not a width that leaked. At TP1 no 2 appears
     at all.
 
-    **At TP2 as well as TP1.** TP2 is the width the result is named for and the
-    one where a capture has most to lose, so the comparison that carries the
-    result is run there too rather than inferred from TP1.
+    **At TP2 as well as TP1.** TP2 is the width where a capture has most to
+    lose, so the comparison that carries the result is run there too rather
+    than inferred from TP1.
 
     **What the digest covers, and the one artifact that differs.** The digest
     is over operator names and tensor shapes: not scalar arguments, not dtypes,
