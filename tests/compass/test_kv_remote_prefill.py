@@ -516,6 +516,19 @@ def test_the_compass_runner_accepts_no_transfer_config(monkeypatch):
     assert len(calls) == 1
 
 
+def test_the_compass_runner_refuses_a_config_that_lacks_the_field(monkeypatch):
+    """A config with no `kv_transfer_config` is refused, not read as unset."""
+    calls = []
+    monkeypatch.setattr(
+        forward_context, "set_kv_cache_data", lambda *a, **k: calls.append(a)
+    )
+    runner = object.__new__(NonAllocatingRunner)
+    runner.config = SimpleNamespace(kv_transfer_config_renamed={})
+    with pytest.raises(RunnerRefusal, match="no field 'kv_transfer_config'"):
+        runner.allocate_kv_cache(100)
+    assert calls == []
+
+
 def test_nothing_is_announced_for_a_request_the_engine_did_not_suspend(
     geometry, seq_factory
 ):
