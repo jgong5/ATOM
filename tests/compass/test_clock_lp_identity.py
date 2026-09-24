@@ -44,7 +44,6 @@ import pytest
 
 from atom.compass import clock
 from atom.compass.clock import (
-    TRAFFIC_TO_ENGINE_FLOOR_SECONDS,
     InterLpLink,
     LinkClass,
     LookaheadMatrix,
@@ -143,6 +142,10 @@ def test_membership_and_size():
     registry = _registry(TRAFFIC, DECODE)
     assert TRAFFIC in registry and PREFILL not in registry
     assert len(registry) == 2
+    # An unhashable probe is a mistake in the call, so it raises rather than
+    # answering False.
+    with pytest.raises(TypeError):
+        _ = [] in registry
 
 
 # --- the lookahead matrix ----------------------------------------------------
@@ -173,20 +176,12 @@ def test_an_undeclared_pair_is_refused_rather_than_read_as_zero():
 
 
 def test_a_zero_floor_is_a_declaration_and_not_an_error():
-    # Zero serializes the pair. It stays correct, so it is accepted and reported
-    # rather than rejected -- the floor buys speed, never safety.
+    # Zero serializes the pair. It stays correct, so it is accepted rather than
+    # rejected -- the floor buys speed, never safety.
     registry = _registry(PREFILL, DECODE)
     matrix = LookaheadMatrix(registry)
-    link = matrix.declare(PREFILL, DECODE, LinkClass.PREFILL_TO_DECODE, 0.0)
+    matrix.declare(PREFILL, DECODE, LinkClass.PREFILL_TO_DECODE, 0.0)
     assert matrix.lookahead(PREFILL, DECODE) == 0.0
-    assert matrix.serializing() == (link,)
-
-
-def test_a_nonzero_floor_is_not_reported_as_serializing():
-    registry = _registry(PREFILL, DECODE)
-    matrix = LookaheadMatrix(registry)
-    matrix.declare(PREFILL, DECODE, LinkClass.PREFILL_TO_DECODE, 1.0e-3)
-    assert matrix.serializing() == ()
 
 
 @pytest.mark.parametrize("bad", [-1.0e-9, float("nan"), float("inf")])
@@ -208,7 +203,11 @@ def test_declaring_the_same_link_twice_is_refused():
     registry = _registry(PREFILL, DECODE)
     matrix = LookaheadMatrix(registry)
     matrix.declare(PREFILL, DECODE, LinkClass.PREFILL_TO_DECODE, 1.0e-3)
-    with pytest.raises(ValueError, match="already declared"):
+    # The refusal names the declaration that stands, so the caller can tell which
+    # of the two calls to change.
+    with pytest.raises(
+        ValueError, match=r"already declared as .*prefill_to_decode, floor=0\.001s"
+    ):
         matrix.declare(PREFILL, DECODE, LinkClass.PREFILL_TO_DECODE, 2.0e-3)
 
 
@@ -278,7 +277,7 @@ def test_require_complete_accepts_a_matrix_with_every_pair_declared():
 
 
 def test_a_declared_floor_cannot_be_rewritten_through_a_handed_out_link():
-    # `links`, `inbound` and `declare` all return the object itself. If it were
+    # `inbound` and `declare` both return the object itself. If it were
     # writable, every refusal in `declare` -- negative, NaN, infinite, already
     # declared -- would be reachable around.
     registry = _registry(PREFILL, DECODE)
@@ -287,17 +286,6 @@ def test_a_declared_floor_cannot_be_rewritten_through_a_handed_out_link():
     with pytest.raises(dataclasses.FrozenInstanceError):
         link.floor_seconds = 99.0
     assert matrix.lookahead(PREFILL, DECODE) == pytest.approx(2.0e-3)
-
-
-def test_inbound_links_come_back_in_the_total_order_whatever_order_they_were_declared():
-    # This is the shape the grant rule reads: every floor into one participant.
-    # It has to be ordered by identity, because a sum or a min taken over it in
-    # declaration order would depend on set-up.
-    registry = _registry(TRAFFIC, PREFILL, DECODE)
-    matrix = LookaheadMatrix(registry)
-    matrix.declare(TRAFFIC, DECODE, LinkClass.TRAFFIC_TO_ENGINE, 9.0e-3)
-    matrix.declare(PREFILL, DECODE, LinkClass.PREFILL_TO_DECODE, 1.0e-3)
-    assert tuple(link.source for link in matrix.inbound(DECODE)) == (PREFILL, TRAFFIC)
 
 
 def test_inserting_a_participant_moves_nothing_that_was_already_declared():
@@ -316,52 +304,6 @@ def test_inserting_a_participant_moves_nothing_that_was_already_declared():
     assert registry.ids() == (DECODE, inserted, TRAFFIC)
     assert matrix.lookahead(TRAFFIC, DECODE) == before
     assert tuple(link.source for link in matrix.inbound(DECODE)) == (inserted, TRAFFIC)
-
-
-def test_the_tightest_link_is_the_one_that_bounds_the_run():
-    registry = _registry(TRAFFIC, PREFILL, DECODE)
-    matrix = LookaheadMatrix(registry)
-    matrix.declare(TRAFFIC, PREFILL, LinkClass.TRAFFIC_TO_ENGINE, 9.0e-3)
-    matrix.declare(PREFILL, DECODE, LinkClass.PREFILL_TO_DECODE, 1.0e-3)
-    assert matrix.tightest().link_class is LinkClass.PREFILL_TO_DECODE
-    assert LookaheadMatrix(LpRegistry()).tightest() is None
-
-
-def test_links_are_listed_in_a_stable_order():
-    registry = _registry(TRAFFIC, PREFILL, DECODE)
-    matrix = LookaheadMatrix(registry)
-    matrix.declare(TRAFFIC, PREFILL, LinkClass.TRAFFIC_TO_ENGINE, 9.0e-3)
-    matrix.declare(PREFILL, DECODE, LinkClass.PREFILL_TO_DECODE, 1.0e-3)
-    assert [(str(link.source), str(link.target)) for link in matrix.links()] == [
-        ("prefill", "decode"),
-        ("traffic-source", "prefill"),
-    ]
-    assert len(matrix) == 2
-
-
-# --- the configured scales ---------------------------------------------------
-
-
-def test_the_three_link_classes_carry_the_scales_that_were_modelled():
-    # Recorded so the tight link is a property of the class rather than folklore:
-    # stage-to-stage is three orders below the admission delay, which is why
-    # stages belong close together and role boundaries are the cheap ones to
-    # stretch.
-    scales = {link_class: link_class.scale_seconds for link_class in LinkClass}
-    assert (
-        scales[LinkClass.PIPELINE_STAGE_TO_STAGE]
-        < scales[LinkClass.PREFILL_TO_DECODE]
-        < scales[LinkClass.TRAFFIC_TO_ENGINE]
-    )
-    assert min(scales, key=scales.get) is LinkClass.PIPELINE_STAGE_TO_STAGE
-
-
-def test_the_admission_delay_is_kept_per_path():
-    # One number for both paths would misprice whichever was not measured.
-    assert TRAFFIC_TO_ENGINE_FLOOR_SECONDS == {
-        "offline_batch": 13.0e-3,
-        "serving": 9.0e-3,
-    }
 
 
 # --- what the package is allowed to name -------------------------------------

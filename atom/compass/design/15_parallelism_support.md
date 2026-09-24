@@ -220,11 +220,84 @@ when `pp_group.world_size > 1`.
 **Compass calls it; it never re-derives a split.** Same rule as `14` D86 for draft KV
 layers, and for the same reason: two spellings of one count drift.
 
-Weights and KV both shard by layer range, so per-stage memory is `layers_in_stage /
-total_layers` of the sharded terms — but the Class-C `runtime_constants` do **not** scale
-that way, since HIP context and collective buffers are per-process. **Memory readings must
-be keyed by PP degree as well as TP width**, and that is a new dimension on `05` D25's
-table rather than a derivation.
+**Weights shard by layer range. KV does not.** What separates them is homogeneity, not
+per-layer-ness: KV is per-layer too. *Every* layer carries weights, so a stage's share of
+the sharded weight terms is `layers_in_stage / total_layers`; only the layers that cache
+the whole history carry paged KV, and inside a span of a hybrid stack that count is not
+proportional to the span's length. A stage's share of the KV term is
+`paged_layers_in_stage / total_paged_layers`, and on a hybrid the two fractions differ.
+
+The weights ratio is itself exact only where the layer kinds are equally sized, and on this
+hybrid they are merely close. The two kinds are different modules — `Qwen3NextAttention`
+against `Qwen3_5GatedDeltaNet` — and at TP1, counted from the vendored config over their
+projection shapes with norms and biases omitted (under 0.01% of a layer), a
+`full_attention` layer is **372,244,480** parameters against **383,262,720** for a
+`linear_attention` one, **+2.96%**. That moves a stage's true weight share off the layer
+ratio by at most **0.242%**, at pp = 7; 0.197% at pp = 6 and 0.104% at pp = 3. Two orders
+of magnitude inside the ≤10% target a non-KV memory term carries, so the layer range stays
+the weights key here — but it stays one because the two kinds happen to be nearly the same
+size, not because weights are per-layer, and on a hybrid whose kinds differ more it would
+not. How close that ratio has to be is a weights-term question rather than this decision's.
+
+**The paged count is read, not computed.** It comes from the same two sources as the split
+itself — `get_pp_indices` for the span, and the model's own `layer_types` for which layers
+inside it are paged (`atom/compass/backends/geometry.py`'s `paged_layers`, which refuses a
+kind it does not recognise rather than counting it as ordinary attention). An earlier form
+of this paragraph gave the KV share as the layer ratio. That is exactly the re-derivation
+the rule above forbids: it recomputed from the layer count something ATOM already holds,
+and the two spellings disagree on every hybrid.
+
+**A second spelling of this count already exists in the engine, and it is not the one to
+read.** `GDNStateMixin._init_gdn_state` (`atom/model_ops/attentions/gdn_attn.py`) sets
+`num_full_attn` by dividing `num_hidden_layers` by `full_attention_interval`, and the
+attention sizing in the same file consumes it. That count is **global**, so it cannot
+answer what a stage holds at all. It agrees at 16 on this config and not by luck:
+`Qwen3_5TextConfig.__init__` (`atom/model_config/qwen3_5.py`) fills `layer_types` *from*
+that interval when a config omits it, so anything built through ATOM's own config class is
+consistent by construction. A config carrying an explicit non-periodic `layer_types` would
+separate the two, and `layer_types` is the one that stays right.
+
+Derived at `feature/atomcompass_new` `92f1fdafe` from `get_pp_indices`, with
+`VLLM_PP_LAYER_PARTITION` cleared — left set it overrides the partitioner and a layout out
+of the environment reads as ATOM's — on the 64-layer hybrid vendored at
+`tests/compass/qwen3_5_27b_config.json`: one `full_attention` layer in four, so 16 of the
+64 are paged. The layers that do not divide evenly are added walking back from the
+*second-to-last* partition, so the **last stage never takes one** and the rest fill in from
+the right; at pp = 5 that reaches stage 0, the first. *The middle stages* is true of 3, 6
+and 7 here and false of 5, which is why no row below is the split a reader would write
+out:
+
+| PP | `get_pp_indices` spans | layers held | paged layers | stages where `held/64` = `paged/16` |
+|---|---|---|---|---|
+| 2 | 0-32, 32-64 | 32, 32 | 8, 8 | all |
+| 3 | 0-21, 21-43, 43-64 | 21, 22, 21 | 5, 5, 6 | none |
+| 4 | 0-16, 16-32, 32-48, 48-64 | 16, 16, 16, 16 | 4, 4, 4, 4 | all |
+| 5 | 0-13, 13-26, 26-39, 39-52, 52-64 | 13, 13, 13, 13, 12 | 3, 3, 3, 4, 3 | stage 4 |
+| 6 | 0-10, 10-21, 21-32, 32-43, 43-54, 54-64 | 10, 11, 11, 11, 11, 10 | 2, 3, 3, 2, 3, 3 | none |
+| 7 | 0-9, 9-18, 18-27, 27-36, 36-45, 45-55, 55-64 | 9, 9, 9, 9, 9, 10, 9 | 2, 2, 2, 3, 2, 2, 3 | none |
+| 8 | 0-8, 8-16, 16-24, 24-32, 32-40, 40-48, 48-56, 56-64 | 8, 8, 8, 8, 8, 8, 8, 8 | 2, 2, 2, 2, 2, 2, 2, 2 | all |
+
+**The pp = 6 row falsifies the layer ratio in one line: stages 1 and 3 each hold 11 layers
+and carry 3 and 2 paged ones.** `layers_in_stage / total_layers` is 11/64 for both, and
+their shares of the KV are 3/16 and 2/16. The ratio understates stage 1 by 8.3% and
+overstates stage 3 by 37.5% — against the **≤ 5%** target the KV term carries, the
+tightest in the project, where every other memory term is gated at 10%. The sign of the
+error changes between two stages of one deployment, so no single correction factor absorbs
+it. At pp = 3 the stage holding the *most* layers holds the *fewest* paged ones of the
+three: 22 layers carry 5 where 21 carry 6.
+
+**Uniform stacks are unaffected.** Where every layer is paged the two fractions are equal
+by construction and the layer ratio is correct — that is the case anyone checks first, and
+it is why this stood. The widths above where they agree at every stage, 2, 4 and 8, are
+the ones where the paged period of this model, 4, divides every span.
+
+The Class-C `runtime_constants` scale by neither key, since HIP context and collective
+buffers are per-process; that half of the sentence this replaces was already right.
+**Memory readings must be keyed by PP degree as well as TP width**, and that is a new
+dimension on `05` D25's table rather than a derivation.
+
+The per-stage *block count* these paged counts produce, and the `all_reduce(MIN)` that
+picks one of them for the whole deployment, are `03` D14's question and not this one's.
 
 ### What is not established
 
@@ -240,26 +313,167 @@ work.
 
 ## D92. EP — invisible communication and an exclusive-occupancy kernel
 
-### Q1: no LPs added, with one caveat
+### The EP group, per supported configuration
 
-EP shards experts within a group that **inherits the TP group** — *"ep_size/ep_rank below
-inherit tp_size/tp_rank"* (`moe.py:265`). So EP lives inside a group that is already one
-LP, and adds none.
+**Measured 2026-09-21 by P0.6, answering T65.** ATOM at `7fc7a5ddd`; aiter at
+`23f83724f` (`v0.1.20-103-g23f83724f`) in container `jgong5_vllm`, re-checked against
+`f4e7c7509` (`v0.1.21.dev0-49-gf4e7c7509`) in node 18's `xiaobizh_n18` and
+`xiaobizh_n18_cpu`, where every aiter line quoted below is byte-identical at the same
+numbers. Two aiter versions are in circulation on this project and they agree here; that
+they agree is a reading, not a guarantee, and no artifact key currently records which one
+answered — **T86**.
 
-**The caveat, and it is a real one:** if a deployment configures EP to span the DP
-dimension as well, its all-to-all becomes a second cross-DP synchronisation with a
-different membership from `sync_dp_metadata`'s. `get_max_tokens_across_dispatchers`
-(`moe.py:495`) hints at a cross-dispatcher reduction whose group is not established here.
-**Recorded as T65**: establish EP's group membership per supported configuration before
-assuming the collapse holds.
+**ATOM does not construct the EP group — aiter does.** No ATOM file assigns `_EP`, and
+every use site imports `get_ep_group` from `aiter.dist.parallel_state` (`moe.py:599`,
+`fused_moe/mori_v2_prepare_finalize.py:153,636`, `fused_moe/flydsl_mega_experts.py:186`,
+`eplb.py:1768`, `models/glm4_moe.py:96`, `models/qwen3_next.py:171`,
+`model_runner.py::ModelRunner._force_aiter_unreg_capture_for_piecewise`). Both of ATOM's distributed-init paths —
+`init_pp_aware_dist_env` (`distributed/pp_comm.py:46`) when `pp_size > 1`, aiter's
+`init_dist_env` (`aiter/ops/communication.py:22`) otherwise, chosen by the
+`pipeline_parallel_size > 1` branch of
+`model_runner.py::ModelRunner._setup_device_and_distributed` — end in
+aiter's `initialize_model_parallel`, which builds the
+group at `aiter/dist/parallel_state.py:1926-1945` out of
+
+```python
+group_ranks = (
+    all_ranks.transpose(1, 2)
+    .reshape(-1, data_parallel_size
+                 * prefill_context_model_parallel_size
+                 * tensor_model_parallel_size)
+    .unbind(0)
+)
+```
+
+over `all_ranks = torch.arange(world_size).reshape(-1, dp, pp, pcp, tp)`
+(`parallel_state.py:1833-1839`). The `transpose(1, 2)` swaps DP and PP, so **the EP group
+is every rank of one PP stage — it spans DP, PCP and TP, its size is `dp × pcp × tp`, and
+there is one group per PP stage.** aiter says so itself:
+*"all2all lives in ep group, which is merged from dp and tp group"*
+(`dist/device_communicators/base_device_communicator.py:42`).
+
+Membership, from re-executing those expressions verbatim at each configuration ATOM
+ships or documents:
+
+| Configuration | world | dp/pp/pcp/tp | EP groups | size |
+|---|---|---|---|---|
+| `-tp 8` (`recipes/Qwen3-235b.md:24`) | 8 | 1/1/1/8 | `[0…7]` | 8 |
+| `-tp 2 --enable-dp-attention` (`recipes/GPT-OSS.md:34`) | 2 | 2/1/1/1 | `[0,1]` | 2 |
+| `-tp 8 --enable-dp-attention` (`recipes/TBO.md:63`, `recipes/GLM-5.md:205`, `recipes/DeepSeek-V4.md:126`) | 8 | 8/1/1/1 | `[0…7]` | 8 |
+| `-tp 4 -dp 2` (`docs/distributed_guide.md:20`) | 8 | 2/1/1/4 | `[0…7]` | 8 |
+| `-tp 2 -pp 2` | 4 | 1/2/1/2 | `[0,1]`, `[2,3]` | 2 |
+| `-tp 4 -pcp 2` | 8 | 1/1/2/4 | `[0…7]` | 8 |
+| `-tp 2 -pp 2 -dp 2` — **refused** at `engine_core_mgr.py:297-300` | 8 | 2/2/1/2 | `[0,1,4,5]`, `[2,3,6,7]` | 4 |
+
+Under DP-attention `CoreManager` rewrites `dp := dp × tp, tp := 1` before any of this
+(`engine_core_mgr.py:281-295`), which is why those rows carry `tp 1`. The torch world is
+`dp × pcp × tp` either way: `init_dist_env` passes `world_size = pp × tp × pcp` with `pp`
+pinned to 1 (`aiter/ops/communication.py:33-40`) and `init_distributed_environment`
+multiplies DP back in (`parallel_state.py:1726-1729`); the PP branch computes the same
+index itself in `model_runner.py::ModelRunner._setup_device_and_distributed`.
+
+**Ranks are contiguous whenever `pp == 1`**, which is every reachable EP configuration.
+The strided last row is the only non-contiguous case, and ATOM refuses it
+(*"Pipeline parallel combined with data parallel is not supported yet."*).
+
+**Membership is not topology-aware.** It is index arithmetic on
+`torch.arange(world_size)`; nothing reads the interconnect. *Kernel selection* is:
+`All2AllManagerBase` sets
+`self.internode = not all(in_the_same_node_as(cpu_group, source_rank=0))`
+(`base_device_communicator.py:55`), MoRI picks `IntraNode` against `InterNodeV1` from it,
+and ATOM deliberately shares that one probe rather than re-deriving it from a width
+(`moe.py:692-698`).
+
+**Two configurations where ATOM does not own the answer at all.** Under the vLLM plugin
+ATOM adopts vLLM's group wholesale — `aiter_ps._EP = getattr(vllm_ps, "_EP", None)`
+(`plugin/vllm/tp_group_reuse.py:150-152`) — so membership is vLLM's decision there, and a
+vLLM configuration with no `_EP` installs `None` and fails at the first `get_ep_group()`
+(`parallel_state.py:1586`). And EP width is never requested directly: ATOM has no
+`--ep-size` flag (`model_engine/arg_utils.py:271-275` offers only the boolean
+`--enable-expert-parallel`), and the SGLang and rtp-llm frontends, which do carry an
+`ep_size`, have it reduced to that boolean (`plugin/config.py:612,690`) — so `ep_size=2`
+under `-tp 8` is accepted and silently means 8.
+
+### `moe_parallel_config.ep_size` is a second number, and it is not the group size
+
+`FusedMoEParallelConfig.make` computes its own: `ep_size = tp_size; ep_rank = tp_rank`
+(`moe.py:299-300`), where `tp_size` has been flattened across DP **only if**
+`enable_dp_attention or moe_ep_flatten_tp_across_dp` (`moe.py:240-242`, `252-256`) and
+folded with PCP only under `ATOM_PCP_MOE_MERGE` (`moe.py:272-280`). The two numbers agree
+in every configuration ATOM ships a recipe for, and disagree in one it documents:
+
+| Configuration | group size (aiter) | `moe_parallel_config.ep_size` | agree |
+|---|---|---|---|
+| `-tp N`, DP 1 | `N` | `N` | yes |
+| `-tp N --enable-dp-attention` | `N` | `N` | yes |
+| vLLM plugin `--enable-expert-parallel` (`plugin/config.py:361`) | `dp × tp` | `dp × tp` | yes |
+| **`-tp 4 -dp 2 --enable-expert-parallel`, no DP-attention** | **8** | **4** | **no** |
+| `-pcp P` without `ATOM_PCP_MOE_MERGE` | `P × tp` | `tp` | **no** |
+
+MoRI v1 is handed `num_ep_ranks` from the group and `num_local_experts` from the config
+number (`moe.py:654,664`); MoRI v2 derives both from the group
+(`mori_v2_prepare_finalize.py:640,666`). The two paths therefore disagree exactly where
+the two numbers do. **Compass must carry both and assert they agree**, because ATOM
+asserts nothing here — recorded as **T83**, which also covers `local_ep_size`
+(`moe.py:313-314`, MoRI's `gpu_per_node`) omitting PCP while the group includes it.
+
+### EP without DP runs no all-to-all at all
+
+`use_all2all_kernels` requires `dp_size > 1` (`moe.py:201-211`) and is the sole gate on
+building `MoriPrepareAndFinalize` (`moe.py:736-742`); without it `self.fused_experts`
+stays `None` (`moe.py:756-759`) and the layer falls through to a plain
+`fused_moe(…, expert_mask=…)` (`moe.py:907-915`). So under
+`-tp 8 --enable-expert-parallel` — `recipes/Qwen3-235b.md:24`, the flagship EP recipe —
+the MoE is masked local-expert compute plus the ordinary TP all-reduce
+(`moe.py:4370-4374`), and moves **zero all-to-all bytes**. That is the mechanism behind
+`04`'s *"at `ep_size == tp_size` EP is close to a no-op"*, and it is stronger than close.
+
+**A cost model must refuse to price a MoRI all-to-all at `dp_size == 1` rather than price
+zero bytes** — a confident, precise, fictional number is the archetypal failure `README`
+names. The gate to mirror is `moe.py:201-211` in full, including `dp_logical_ratio == 1`
+and `_has_module("mori")`. One exception: `--moe-backend mega` installs `MegaFusedExperts`
+unconditionally (`moe.py:1738-1753`) and reads the group directly for its rank and world
+(`flydsl_mega_experts.py:186-193`), so it does run peer-to-peer at `dp_size == 1`;
+`config.py:1677-1681` refuses `mega` without EP.
+
+### Q1: no LPs added — the conclusion holds, the reason under it did not
+
+**The conclusion stands, and D93's formula is unchanged.** The EP group is exactly the set
+of ranks of one PP stage, and PP is the only LP-adding dimension (D88, D93). The one case
+where EP's membership could cut across an LP boundary is `pp > 1` together with `dp > 1`,
+and `engine_core_mgr.py:297-300` refuses it.
+
+**The reason previously given here was wrong, and is recorded rather than quietly
+dropped**, because a future reader who lifts that refusal will need to know which half
+survived. It read that EP *"inherits the TP group"*, citing `moe.py:265`; that line is a
+comment inside the PCP-merge block explaining that the *integers* `ep_size`/`ep_rank`
+inherit `tp_size`/`tp_rank`, and says nothing about the communicator. The caveat below it
+was stated conditionally — *"if a deployment configures EP to span the DP dimension"* —
+and EP spans DP in every configuration where DP exists. The second cross-DP
+synchronisation that caveat predicted **does** appear: MoRI dispatch/combine, over a
+membership different from `sync_dp_metadata`'s. ATOM confirms the two groups are distinct
+objects in code — `eplb.py:1784-1793` compares the DP group's global ranks against the EP
+group's to decide `_dp_is_migration_group`, a comparison with no purpose if they were the
+same group.
+
+`get_max_tokens_across_dispatchers` (`moe.py:495`) was cited here as hinting at a
+cross-dispatcher reduction. It is `def …(input): return input.item()` — no collective —
+and a tree-wide `grep -rn` returns the definition and this document. It has no callers.
+
+**D92's decision-log row below is left unamended**: its parentheticals *"inherits the TP
+group"* and *"remainder included"* are the two claims this section corrects, and rewriting
+a decision is the project owner's call. Registered as a pending amendment in
+[`12_open_items.md`](12_open_items.md) §5.
 
 ### Q2: no scheduling coupling
 
 Expert assignment is a function of the routing computed inside the layer, not of a
-scheduler decision. The flat-ring assignment is closed form —
-`expert_ids = (p % ep_size) * L + (p // ep_size) % L` where `L = E // ep_size` and
-`p = t * topk + j` (`moe.py:139-174`) — so it is Class-A derivable from geometry if a cost
-model ever needs it.
+scheduler decision — and **real routing is data-dependent, so it is not derivable from
+geometry**. The closed-form flat ring
+`expert_ids = (p % ep_size) × L + (p // ep_size) % L` is `init_balance_router_logits`
+(`moe.py:137-152`), the **synthetic** router built only under `--fake-eplb`
+(`moe.py:2974-2989`: *"if atom_config.fake_eplb else None"*). Class A under `--fake-eplb`,
+and nothing outside it.
 
 ### Q3: cost — the hard part, and it is already characterised
 
@@ -275,14 +489,26 @@ And the property no generic cost model would capture:
 
 That is `04` D19's `exclusive` join policy, and it is a **measured fact rather than a
 modelling choice** — an EP all-to-all cannot overlap with anything, so the IR must not
-place it in a `Par`.
+place it in a `Par`. The cap is two numbers and not one —
+`min(128, CU)` blocks at 16 warps for prefill against `min(64, CU)` at 4 for decode
+(`fused_moe/mori_prepare_finalize.py:257-261`), which on the 80-CU MI308X is 80 and 64 —
+recorded as **T87**, since `07`'s price-list table states it as a single cell.
 
-### Q4: memory — experts shard, and the remainder is dropped
+### Q4: memory — experts shard contiguously, and an indivisible count is refused
 
-`L = E // ep_size` experts per rank, *"a remainder is left unused"* (`moe.py:151`). So
-expert weight bytes per rank are `L × bytes_per_expert`, exact from geometry (Class A),
-and a configuration whose expert count does not divide by `ep_size` wastes the remainder —
-which a memory model must reproduce rather than round.
+`determine_expert_map` (`fused_moe/expert_layout.py:111-152`) gives rank `r` the
+contiguous run `[r×L, (r+1)×L)` with `L = E // ep_size`, and gives any remainder to the
+**last** rank (`expert_layout.py:147-152`) — it is not left unused. Expert weight bytes per
+rank are `L × bytes_per_expert`, exact from geometry (Class A).
+
+**There is no remainder for a memory model to reproduce**, because a configuration whose
+expert count does not divide by `ep_size` is refused outright:
+`assert self.global_num_experts % self.ep_size == 0` whenever `use_ep`
+(`moe.py:2758-2763`). MoRI derives a token's destination as
+`expert_id // num_experts_per_rank` (`distributed/simulated_tp.py:105-107`,
+`moe.py:203-206`) and cannot represent an uneven last rank, so ATOM refuses rather than
+pads. The *"a remainder is left unused"* comment this section used to quote is
+`moe.py:151`, inside the `--fake-eplb` synthetic router, not the real path.
 
 ---
 
@@ -320,11 +546,15 @@ The split, because "parallelism support" is otherwise read as one late lump:
 | **TP** | LP collapse; width as an artifact key | priced collectives per width; T21 |
 | **DP** | both collectives run for real; `max`-over-ranks step duration; dummy-batch pricing for idle ranks | the collectives' own cost |
 | **PP** | **one LP per stage**; transfer as a size from the spec; layer split via `get_pp_indices`; memory keyed by PP degree | bubble fidelity; microbatching if it exists (T64) |
-| **EP** | group membership established (T65); `exclusive` occupancy honoured in the IR | MORI all-to-all priced via declared nodes |
+| **EP** | group membership established — it is `dp × pcp × tp` within one PP stage, built in aiter (D92); `exclusive` occupancy honoured in the IR | MORI all-to-all priced via declared nodes |
 
 **The M1 test that matters** is not "does it produce plausible numbers" — the fake model
 guarantees it will. It is: **does a fake-model run at each of TP2 / DP2 / PP2 / EP2 reach
-the same scheduling decisions as the real engine at the same configuration?** That is
+the same scheduling decisions as the real engine at the same configuration?** *Which*
+EP2 is now an open question rather than a detail: `-tp 2 --enable-expert-parallel` at
+DP 1 runs no all-to-all at all (D92), so that leg would pass while exercising nothing,
+and the only non-degenerate EP2 is `-tp 2 --enable-dp-attention --enable-expert-parallel`.
+**T84.** That aside, the test is
 checkable without a cost model, it exercises exactly the couplings this topic is about,
 and ATOM's own `test_dp_load_balance.py`, `test_dp_metadata.py`, `test_dp_sync_layout.py`
 and `test_forward_mode.py` already cover the pieces on the CPU-only path (`08` D43.1).
@@ -335,8 +565,14 @@ and `test_forward_mode.py` already cover the pieces on the CPU-only path (`08` D
 
 - **T64 — does ATOM microbatch PP?** Unestablished, and it changes both the LP event rate
   and the bubble model. Settle before any PP work.
-- **T65 — EP group membership** per supported configuration. If EP ever spans DP, the
-  collapse in D92 Q1 does not hold and a second cross-DP barrier appears.
+- **T65 — EP group membership** per supported configuration. **Answered 2026-09-21 by
+  P0.6**, in D92: the group is `dp × pcp × tp` within one PP stage, built in aiter rather
+  than in ATOM. EP does span DP wherever DP exists, and the second cross-DP barrier does
+  appear — but the LP collapse survives anyway, because the group is exactly one PP
+  stage's ranks and PP>1 with DP>1 is refused. Three successors are open: **T83** (the
+  group size and `moe_parallel_config.ep_size` disagree in two configurations, one of
+  them documented), **T84** (which EP2 D94's M1 test means) and **T85** (multi-node EP
+  rank-to-node mapping, unverified).
 - **PP degree is a new key on the memory readings table** (`05` D25), and nothing has
   measured whether the Class-C constants move with it. One startup per PP degree settles
   it; recorded as **T66**.
@@ -356,7 +592,7 @@ and `test_forward_mode.py` already cover the pieces on the CPU-only path (`08` D
 | D88 | One frame of four questions per strategy — LPs and lookahead, scheduling coupling, cost, memory. **Only PP adds logical processes**; TP, DP and EP each sit behind an existing barrier. | 2026-09-19 |
 | D89 | TP is the settled instance and supplies the per-width discipline: width is a key, not a parameter. | 2026-09-19 |
 | D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP. Step duration is `max` over ranks, computed not rank-0-sourced, and idle ranks cost a dummy batch. | 2026-09-19 |
-| D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived. Memory readings gain a PP-degree key. | 2026-09-19 |
+| D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. | 2026-09-19 |
 | D92 | EP adds no LPs (inherits the TP group) but its all-to-all is invisible and must be a declared node, and its `exclusive` occupancy forbids placing it in a `Par`. Expert sharding is Class A, remainder included. | 2026-09-19 |
 | D93 | LP count = PD roles × PP stages (+2), independent of GPU count. The clock protocol's cost tracks PP degree, not width. | 2026-09-19 |
 | D94 | Parallelism splits across milestones: LP structure, couplings and memory shape at **M1**; cost accuracy at **M7**. M1's test is scheduling-decision agreement at TP2/DP2/PP2/EP2, which needs no cost model. | 2026-09-19 |
@@ -371,7 +607,10 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | # | Item | Why deferred |
 |---|---|---|
 | T64 | Establish whether ATOM microbatches PP — changes the LP event rate and the bubble model | a grep finds nothing; needs reading `pp_transport.py` and one PP2 run |
-| T65 | Establish EP's group membership per supported configuration; if EP spans DP, D92's collapse does not hold | needs a deployed EP configuration to inspect |
+| ~~T65~~ | ~~Establish EP's group membership per supported configuration; if EP spans DP, D92's collapse does not hold~~ — **answered 2026-09-21 by P0.6**, in D92 above; successors T83, T84, T85 | — |
+| T83 | The EP group's size and `moe_parallel_config.ep_size` disagree at `-tp N -dp M --enable-expert-parallel` without DP-attention (group `N×M`, config `N`) and at `-pcp P` without `ATOM_PCP_MOE_MERGE`; `local_ep_size` also omits PCP while the group includes it | one 8-GPU startup logging `all2all_manager.world_size` against `moe.num_local_experts`; or an owner statement that the combination is unsupported |
+| T84 | Decide which EP2 D94's M1 scheduling-agreement test means — `-tp 2 --enable-expert-parallel` at DP 1 runs no all-to-all, so that leg exercises nothing | an owner decision, then one line in D94 |
+| T85 | Multi-node EP rank-to-node mapping is assumed, not verified: MoRI infers node identity as `ep_rank // gpu_per_node`, which needs consecutive EP ranks to be physically consecutive GPUs | a 2-node DP+EP run logging `all2all_manager.internode` and each rank's EP group; M7-era |
 | T66 | Measure whether the Class-C runtime constants move with PP degree | one engine startup per PP degree |
 | T67 | Measure the step-duration spread across DP ranks, and what padding to `unified_bs` costs | needs a DP2 run with per-rank step timing |
 | T78 | `qwen3_5.py:427` and `glm4_moe.py:426` declare `"intermediate_tensors": 0`, so neither model can run PP at compilation level >= 2 | upstream ATOM fix; `15` D94's PP2 test is fake-model and CPU-only, so this is not on M1's path |
