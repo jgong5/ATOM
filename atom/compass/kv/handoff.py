@@ -98,10 +98,11 @@ def whole_number(field: str, value: Any) -> int:
     accepted changes on the way to the `int` returned, and that check is what
     refuses integer text: `int("8")` is 8, which is not equal to "8".
 
-    Limits: "bool" is matched case-sensitively, so a numpy union dtype with a
-    field whose name contains "bool" is refused even holding a whole number.
-    An exception from the value's own methods, such as `dtype`, its `__str__`,
-    `__int__`, `__ne__` or `__repr__`, can escape as raised, not as this
+    Limits: the dtype text test also refuses a whole number whose dtype text
+    has "bool", such as a 0-d array of a numpy union dtype with a field
+    "is_bool", and the message then says it is not a whole number. An
+    exception from the value, from its dtype, or from an object either of them
+    returns, such as the result of `__ne__`, can escape as raised, not as this
     refusal, and an `AttributeError` from reading `dtype` counts as no dtype.
     """
     try:
