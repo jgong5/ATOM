@@ -566,13 +566,10 @@ def test_a_transfer_keeps_the_source_stack_out_of_this_machines_pin():
     checked = validate(combination)
     assert not checked.ok
     assert checked.refusals[0].rule is Rule.PINNED_STACK
-    assert checked.refusals[0].what.startswith(
+    assert checked.refusals[0].what == (
         "'tier2' (machine 'mi355x-8gpu-2node', transferred-from:mi300x-8gpu, "
-        "by a person on 2026-09-18) carried "
-    )
-    assert checked.refusals[0].what.endswith(
-        "carried constants over from 'mi300x-8gpu', measured against rocm "
-        "'7.0.2', into a spec pinned to rocm '7.2.4'"
+        "by a person on 2026-09-18) carried constants over from 'mi300x-8gpu', "
+        "measured against rocm '7.0.2', into a spec pinned to rocm '7.2.4'"
     )
 
 
@@ -604,10 +601,9 @@ def test_a_saved_transfer_merged_again_names_the_merge_that_dropped_its_pin():
     assert refused.rule is Rule.PINNED_STACK
     assert refused.what.startswith(
         "'t.yaml' (machine 'mi355x-8gpu-2node', transferred-from:mi300x-8gpu, "
-        "by a person on 2026-09-18) carried constants over from "
+        "by a person on 2026-09-18) carried constants over from 'mi300x-8gpu', "
+        "and its provenance names the fragments an earlier merge built it from"
     )
-    assert "over from 'mi300x-8gpu', and its provenance names the" in refused.what
-    assert "fragments an earlier merge built it from" in refused.what
     bare = fragment("tier2", TIER2, method="transferred-from:mi300x-8gpu")
     first_hand = validate(merge(fragments()[:2] + [bare, fragment("links", LINKS)]))
     assert first_hand.refusals[0].what == (
@@ -2015,8 +2011,7 @@ def reimported_validate(name):
     )
     module = importlib.util.module_from_spec(loaded)
     loaded.loader.exec_module(module)
-    assert loaded.name not in sys.modules
-    assert importlib.import_module("atom.compass.spec.validate") is not module
+    assert module not in sys.modules.values()
     return module
 
 
