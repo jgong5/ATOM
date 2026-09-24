@@ -1501,6 +1501,25 @@ def qrep_unsupported_reason(
     return None
 
 
+# The RPCs that `enable_rapidserve`'s engine cores (PrefillEngineCore and
+# DecodeEngineCore) call on the runner and wait on. Only RapidServeModelRunner
+# defines them; a runner that lacks one leaves its caller blocked forever.
+RAPIDSERVE_RPCS = (
+    "export_model_weight_ipc_handles",
+    "import_model_weight_ipc_handles",
+    "create_prefill_stream_pool",
+    "export_kv_cache_ipc_handle",
+    "import_kv_cache_ipc_handle",
+    "create_decode_stream_pool",
+    "prefill_forward",
+)
+# Runners accepted under `enable_rapidserve`, by qualname. Compared as strings
+# because importing a runner module initialises the GPU runtime and loads
+# AITER, and on a host with no driver the import raises. A subclass of
+# RapidServeModelRunner is accepted once its qualname is added here.
+RAPIDSERVE_RUNNERS = frozenset({"atom.model_engine.model_runner.RapidServeModelRunner"})
+
+
 @dataclass
 class Config:
     model: str
@@ -1733,6 +1752,15 @@ class Config:
         ):
             self.runner_qualname = (
                 "atom.model_engine.model_runner.RapidServeModelRunner"
+            )
+        if self.enable_rapidserve and self.runner_qualname not in RAPIDSERVE_RUNNERS:
+            raise ValueError(
+                f"enable_rapidserve=True with runner_qualname="
+                f"{self.runner_qualname!r}: the RapidServe engine cores call "
+                f"{', '.join(RAPIDSERVE_RPCS)} on the runner and wait for each "
+                "reply, and only RapidServeModelRunner defines them. Leave "
+                "runner_qualname at its default, or name a RapidServeModelRunner "
+                "subclass listed in atom.config.RAPIDSERVE_RUNNERS."
             )
 
         assert 1 <= self.tensor_parallel_size <= 8
