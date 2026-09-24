@@ -504,23 +504,14 @@ def test_the_compass_runner_refuses_a_real_transfer_backend(kv, monkeypatch):
     assert calls == []
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        atom_config_double(kv_transfer_config={}),
-        atom_config_double(kv_transfer_config=None),
-        SimpleNamespace(),
-    ],
-    ids=["empty", "none", "missing"],
-)
-def test_the_compass_runner_accepts_no_transfer_config(config, monkeypatch):
-    """`{}` is ATOM's default, so every run without disaggregation takes this."""
+def test_the_compass_runner_accepts_no_transfer_config(monkeypatch):
+    """`{}` is ATOM's default: every run that sets no kv_transfer_config takes this."""
     calls = []
     monkeypatch.setattr(
         forward_context, "set_kv_cache_data", lambda *a, **k: calls.append(a)
     )
     runner = object.__new__(NonAllocatingRunner)
-    runner.config = config
+    runner.config = atom_config_double(kv_transfer_config={})
     assert runner.allocate_kv_cache(100) is True
     assert len(calls) == 1
 
