@@ -110,14 +110,15 @@ logger = logging.getLogger(__name__)
 # so, and it is load-bearing. Fourteen dispatched names are absent from this
 # table because `ModelRunner` does not define them -- seven belong to
 # `RapidServeModelRunner`, seven to the rollout extension. The rollout seven are
-# unreachable here. The RapidServe seven are not: `enable_rapidserve` picks
-# `PrefillEngineCore` / `DecodeEngineCore` (`llm_engine.py:140`), those classes
-# broadcast all seven with `wait_out=True`, and that broadcast never consults
-# `runner_qualname`, while the substitution that would install a RapidServe
-# runner (`config.py:1729-1736`) fires only while `runner_qualname` is still
-# ATOM's default -- which Compass overwrites. `enable_rapidserve=True` with this
-# runner is therefore seven silent parks on names this table deliberately
-# excludes, and nothing in this module closes that gap.
+# unreachable here. The RapidServe seven are kept out by `Config`, not by this
+# module: `enable_rapidserve` picks `PrefillEngineCore` / `DecodeEngineCore`
+# (`llm_engine.py:140`), those classes broadcast all seven with `wait_out=True`
+# without consulting `runner_qualname`, and the substitution that installs a
+# RapidServe runner (`config.py:1730-1736`) fires only while `runner_qualname`
+# is still ATOM's default -- which Compass overwrites. `Config` therefore raises
+# `ValueError` for `enable_rapidserve=True` with any runner not in
+# `RAPIDSERVE_RUNNERS` (`config.py:1737-1745`), this one included, and
+# `LLMEngine` builds that `Config` (`llm_engine.py:43`) before either class.
 #
 # Also outside the table, and outside anything a broadcast-derived enumeration
 # can see: three of these twelve are called in-process on the runner itself,

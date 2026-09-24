@@ -938,11 +938,13 @@ that assumes the enqueue is the only thing in that function will be surprised.
   `config.enable_rapidserve` (`llm_engine.py:140-142`) — so "RapidServe-only" is exact.
   Its purpose is verified by the code around it: the sleep sits between importing
   decode's weight IPC handles and acknowledging to prefill, and prefill measures free
-  VRAM for KV sizing only after that ACK. It must stay on the real clock. It is not
-  *unconditionally* moot: nothing in ATOM couples it to whether weights are real, and
+  VRAM for KV sizing only after that ACK. It must stay on the real clock. Nothing in ATOM
+  couples it to whether weights are real, but `Config` keeps a simulated runner from it:
   `--enable-rapidserve` selects `RapidServeModelRunner` only when `runner_qualname` is
-  still the default (`config.py:1727-1736`), so a simulated runner plus that flag would
-  reach the sleep. The cost is two real seconds of startup and no modelled time, because
+  still the default (`config.py:1727-1736`), and otherwise `Config` raises `ValueError`
+  unless `runner_qualname` is in `RAPIDSERVE_RUNNERS` (`config.py:1737-1745`), before
+  `LLMEngine.__init__` constructs any engine core. The cost, for a runner that list names,
+  is two real seconds of startup and no modelled time, because
   it runs before READY and therefore before any arrival.
 - The scanner's boundary is a list of directories, not a graph. It reads every `.py`
   file under `SCANNED_ROOTS`, so a module added beside a scanned one is caught; but a
