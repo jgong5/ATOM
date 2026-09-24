@@ -14,9 +14,13 @@
 # idle model), and `non_torch` is a device-wide reading, so a neighbour's
 # allocation is indistinguishable from ours.
 #
-# This is not only for GPU tasks. On a wedged node ATOM's *import* hangs, because
-# aiter's arch discovery shells out to rocminfo -- so a "CPU-only, no hardware"
-# task hangs too, and looks like a bug in the task.
+# This is not only for GPU tasks. aiter's arch discovery shells out to rocminfo
+# when aiter is imported, and so does importing any ATOM module that imports
+# aiter at load time (atom.model_engine.model_runner, atom.model_ops.linear) -- so on
+# a wedged node a "CPU-only, no hardware" task that reaches the model layer hangs
+# too, and looks like a bug in the task. MEASURED 2026-09-23 on node 18: a bare
+# `import atom`, atom.config, atom.compass, atom.model_engine.llm_engine and
+# atom.entrypoints.openai_server run no rocminfo.
 set -uo pipefail
 RC=0
 

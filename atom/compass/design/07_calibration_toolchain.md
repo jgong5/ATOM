@@ -311,8 +311,8 @@ forward context only the runner establishes, and building it by hand means reimp
 
 The constraints point at the *runner*, not the server — a single-process `ModelRunner` **is**
 the worker, so Phase 1b's placement requirement is satisfied. ATOM already shows how to
-drive one without a scheduler: `dummy_execution` (`model_runner.py:1177-1217`) and
-`warmup_model` (`:1219-1284`) both fabricate `ScheduledBatch`es by hand.
+drive one without a scheduler: `model_runner.py::ModelRunner.dummy_execution` and
+`model_runner.py::ModelRunner.warmup_model` both fabricate `ScheduledBatch`es by hand.
 
 ```
   Phase 0 (device-free)            standalone bench (GPU, one process)
@@ -686,8 +686,9 @@ Two consequences worth noting:
   what lets one campaign serve many shapes.
 - The device runtime constants depend on the **library build** as much as the silicon,
   which is why doc 05's schema carries `software_pinned_to` and why a mismatch warns
-  loudly. The +5980 MiB appearing the moment width exceeds one is collective buffer sizing;
-  the 926 MiB at TP1 is HIP context plus libraries.
+  loudly by default, refusing under `validate(strict=True)` or when a transfer or merge
+  moves constants across stacks. The +5980 MiB appearing the moment width exceeds one is
+  collective buffer sizing; the 926 MiB at TP1 is HIP context plus libraries.
 
 ### The gate must be verifiable from the artifact, not from the flag
 

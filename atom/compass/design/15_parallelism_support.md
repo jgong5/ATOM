@@ -220,11 +220,84 @@ when `pp_group.world_size > 1`.
 **Compass calls it; it never re-derives a split.** Same rule as `14` D86 for draft KV
 layers, and for the same reason: two spellings of one count drift.
 
-Weights and KV both shard by layer range, so per-stage memory is `layers_in_stage /
-total_layers` of the sharded terms — but the Class-C `runtime_constants` do **not** scale
-that way, since HIP context and collective buffers are per-process. **Memory readings must
-be keyed by PP degree as well as TP width**, and that is a new dimension on `05` D25's
-table rather than a derivation.
+**Weights shard by layer range. KV does not.** What separates them is homogeneity, not
+per-layer-ness: KV is per-layer too. *Every* layer carries weights, so a stage's share of
+the sharded weight terms is `layers_in_stage / total_layers`; only the layers that cache
+the whole history carry paged KV, and inside a span of a hybrid stack that count is not
+proportional to the span's length. A stage's share of the KV term is
+`paged_layers_in_stage / total_paged_layers`, and on a hybrid the two fractions differ.
+
+The weights ratio is itself exact only where the layer kinds are equally sized, and on this
+hybrid they are merely close. The two kinds are different modules — `Qwen3NextAttention`
+against `Qwen3_5GatedDeltaNet` — and at TP1, counted from the vendored config over their
+projection shapes with norms and biases omitted (under 0.01% of a layer), a
+`full_attention` layer is **372,244,480** parameters against **383,262,720** for a
+`linear_attention` one, **+2.96%**. That moves a stage's true weight share off the layer
+ratio by at most **0.242%**, at pp = 7; 0.197% at pp = 6 and 0.104% at pp = 3. Two orders
+of magnitude inside the ≤10% target a non-KV memory term carries, so the layer range stays
+the weights key here — but it stays one because the two kinds happen to be nearly the same
+size, not because weights are per-layer, and on a hybrid whose kinds differ more it would
+not. How close that ratio has to be is a weights-term question rather than this decision's.
+
+**The paged count is read, not computed.** It comes from the same two sources as the split
+itself — `get_pp_indices` for the span, and the model's own `layer_types` for which layers
+inside it are paged (`atom/compass/backends/geometry.py`'s `paged_layers`, which refuses a
+kind it does not recognise rather than counting it as ordinary attention). An earlier form
+of this paragraph gave the KV share as the layer ratio. That is exactly the re-derivation
+the rule above forbids: it recomputed from the layer count something ATOM already holds,
+and the two spellings disagree on every hybrid.
+
+**A second spelling of this count already exists in the engine, and it is not the one to
+read.** `GDNStateMixin._init_gdn_state` (`atom/model_ops/attentions/gdn_attn.py`) sets
+`num_full_attn` by dividing `num_hidden_layers` by `full_attention_interval`, and the
+attention sizing in the same file consumes it. That count is **global**, so it cannot
+answer what a stage holds at all. It agrees at 16 on this config and not by luck:
+`Qwen3_5TextConfig.__init__` (`atom/model_config/qwen3_5.py`) fills `layer_types` *from*
+that interval when a config omits it, so anything built through ATOM's own config class is
+consistent by construction. A config carrying an explicit non-periodic `layer_types` would
+separate the two, and `layer_types` is the one that stays right.
+
+Derived at `feature/atomcompass_new` `92f1fdafe` from `get_pp_indices`, with
+`VLLM_PP_LAYER_PARTITION` cleared — left set it overrides the partitioner and a layout out
+of the environment reads as ATOM's — on the 64-layer hybrid vendored at
+`tests/compass/qwen3_5_27b_config.json`: one `full_attention` layer in four, so 16 of the
+64 are paged. The layers that do not divide evenly are added walking back from the
+*second-to-last* partition, so the **last stage never takes one** and the rest fill in from
+the right; at pp = 5 that reaches stage 0, the first. *The middle stages* is true of 3, 6
+and 7 here and false of 5, which is why no row below is the split a reader would write
+out:
+
+| PP | `get_pp_indices` spans | layers held | paged layers | stages where `held/64` = `paged/16` |
+|---|---|---|---|---|
+| 2 | 0-32, 32-64 | 32, 32 | 8, 8 | all |
+| 3 | 0-21, 21-43, 43-64 | 21, 22, 21 | 5, 5, 6 | none |
+| 4 | 0-16, 16-32, 32-48, 48-64 | 16, 16, 16, 16 | 4, 4, 4, 4 | all |
+| 5 | 0-13, 13-26, 26-39, 39-52, 52-64 | 13, 13, 13, 13, 12 | 3, 3, 3, 4, 3 | stage 4 |
+| 6 | 0-10, 10-21, 21-32, 32-43, 43-54, 54-64 | 10, 11, 11, 11, 11, 10 | 2, 3, 3, 2, 3, 3 | none |
+| 7 | 0-9, 9-18, 18-27, 27-36, 36-45, 45-55, 55-64 | 9, 9, 9, 9, 9, 10, 9 | 2, 2, 2, 3, 2, 2, 3 | none |
+| 8 | 0-8, 8-16, 16-24, 24-32, 32-40, 40-48, 48-56, 56-64 | 8, 8, 8, 8, 8, 8, 8, 8 | 2, 2, 2, 2, 2, 2, 2, 2 | all |
+
+**The pp = 6 row falsifies the layer ratio in one line: stages 1 and 3 each hold 11 layers
+and carry 3 and 2 paged ones.** `layers_in_stage / total_layers` is 11/64 for both, and
+their shares of the KV are 3/16 and 2/16. The ratio understates stage 1 by 8.3% and
+overstates stage 3 by 37.5% — against the **≤ 5%** target the KV term carries, the
+tightest in the project, where every other memory term is gated at 10%. The sign of the
+error changes between two stages of one deployment, so no single correction factor absorbs
+it. At pp = 3 the stage holding the *most* layers holds the *fewest* paged ones of the
+three: 22 layers carry 5 where 21 carry 6.
+
+**Uniform stacks are unaffected.** Where every layer is paged the two fractions are equal
+by construction and the layer ratio is correct — that is the case anyone checks first, and
+it is why this stood. The widths above where they agree at every stage, 2, 4 and 8, are
+the ones where the paged period of this model, 4, divides every span.
+
+The Class-C `runtime_constants` scale by neither key, since HIP context and collective
+buffers are per-process; that half of the sentence this replaces was already right.
+**Memory readings must be keyed by PP degree as well as TP width**, and that is a new
+dimension on `05` D25's table rather than a derivation.
+
+The per-stage *block count* these paged counts produce, and the `all_reduce(MIN)` that
+picks one of them for the whole deployment, are `03` D14's question and not this one's.
 
 ### What is not established
 
@@ -254,10 +327,12 @@ answered — **T86**.
 every use site imports `get_ep_group` from `aiter.dist.parallel_state` (`moe.py:599`,
 `fused_moe/mori_v2_prepare_finalize.py:153,636`, `fused_moe/flydsl_mega_experts.py:186`,
 `eplb.py:1768`, `models/glm4_moe.py:96`, `models/qwen3_next.py:171`,
-`model_runner.py:3553`). Both of ATOM's distributed-init paths —
+`model_runner.py::ModelRunner._force_aiter_unreg_capture_for_piecewise`). Both of ATOM's distributed-init paths —
 `init_pp_aware_dist_env` (`distributed/pp_comm.py:46`) when `pp_size > 1`, aiter's
-`init_dist_env` (`aiter/ops/communication.py:22`) otherwise, chosen at
-`model_runner.py:932` — end in aiter's `initialize_model_parallel`, which builds the
+`init_dist_env` (`aiter/ops/communication.py:22`) otherwise, chosen by the
+`pipeline_parallel_size > 1` branch of
+`model_runner.py::ModelRunner._setup_device_and_distributed` — end in
+aiter's `initialize_model_parallel`, which builds the
 group at `aiter/dist/parallel_state.py:1926-1945` out of
 
 ```python
@@ -295,7 +370,7 @@ Under DP-attention `CoreManager` rewrites `dp := dp × tp, tp := 1` before any o
 `dp × pcp × tp` either way: `init_dist_env` passes `world_size = pp × tp × pcp` with `pp`
 pinned to 1 (`aiter/ops/communication.py:33-40`) and `init_distributed_environment`
 multiplies DP back in (`parallel_state.py:1726-1729`); the PP branch computes the same
-index itself at `model_runner.py:979`.
+index itself in `model_runner.py::ModelRunner._setup_device_and_distributed`.
 
 **Ranks are contiguous whenever `pp == 1`**, which is every reachable EP configuration.
 The strided last row is the only non-contiguous case, and ATOM refuses it
@@ -517,7 +592,7 @@ and `test_forward_mode.py` already cover the pieces on the CPU-only path (`08` D
 | D88 | One frame of four questions per strategy — LPs and lookahead, scheduling coupling, cost, memory. **Only PP adds logical processes**; TP, DP and EP each sit behind an existing barrier. | 2026-09-19 |
 | D89 | TP is the settled instance and supplies the per-width discipline: width is a key, not a parameter. | 2026-09-19 |
 | D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP. Step duration is `max` over ranks, computed not rank-0-sourced, and idle ranks cost a dummy batch. | 2026-09-19 |
-| D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived. Memory readings gain a PP-degree key. | 2026-09-19 |
+| D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. | 2026-09-19 |
 | D92 | EP adds no LPs (inherits the TP group) but its all-to-all is invisible and must be a declared node, and its `exclusive` occupancy forbids placing it in a `Par`. Expert sharding is Class A, remainder included. | 2026-09-19 |
 | D93 | LP count = PD roles × PP stages (+2), independent of GPU count. The clock protocol's cost tracks PP degree, not width. | 2026-09-19 |
 | D94 | Parallelism splits across milestones: LP structure, couplings and memory shape at **M1**; cost accuracy at **M7**. M1's test is scheduling-decision agreement at TP2/DP2/PP2/EP2, which needs no cost model. | 2026-09-19 |

@@ -109,7 +109,13 @@ and chunked prefill. The prior one-point rule is a weaker version of the same th
 
 **Option A.** `torch.export` is recorded as an unverified alternative in D18.1.
 
-### The three disciplines, all mandatory, all silent when omitted
+### The four disciplines, all mandatory, all silent when omitted
+
+Three of them keep the *tracing* symbolic and are listed here; the fourth is about
+what the **engine around the trace** does to a symbol, needs the FakeTensor material
+below to state, and is therefore a section of its own -- "A fourth discipline: the
+engine's host arithmetic asks a symbol for a number". A reader who stops at the end of
+this numbered list has three of four.
 
 1. **`torch._C._EnablePythonDispatcher()` is not optional.** Without it, `torch.matmul` on
    ndim>2 is a C++ CompositeImplicitAutograd decomposition that calls non-symbolic
@@ -176,6 +182,100 @@ Three FakeTensor traps, each of which silently produces a wrong artifact:
 3. The torch 2.10 signature is
    `symbolic_context=StatelessSymbolicContext(dynamic_sizes=[...])`, not `dynamic_dims=`.
 
+### A fourth discipline: the engine's host arithmetic asks a symbol for a number
+
+The three disciplines above keep the *tracing* symbolic. They are not enough on a real
+engine, and the reason is one line of torch: **`SymInt.__index__` and `SymInt.__int__`
+are `guard_int`.** Every host-side use of a step's width — filling a staging buffer's
+numpy view, slicing a Python list, checking a staged array's length — asks for a number,
+gets the symbol's trace-time hint, and *records the ask as `Eq(s, hint)`*. The graph is
+constant from there, with no error and no warning.
+
+Measured on ATOM's decode path for the published 27B: **16 ATOM lines** convert the step's
+width to a number during one traced forward — 20 conversions in all — and they are host
+fills and slices, nothing else:
+
+| where | lines | conversions |
+|---|---|---|
+| `aiter_attention.py in prepare_decode` | 1106, 1115, 1121, 1122, 1123, 1131, 1132 | 10 |
+| `model_runner.py::ModelRunner.prepare_inputs` | 2468, 2479, 2481 | 4 |
+| `model_runner.py::tokenIDProcessor.prepare_input_ids` | 510, 513 | 2 |
+| `model_runner.py::ModelRunner.prepare_sample` | 2564 | 1 |
+| `backends.py in _mrope_cpu_view` | 398, 400 | 2 |
+| `gdn_attn.py in _attach_gdn_decode_metadata` | 1237 | 1 |
+
+A seventeenth sits in `forward_context`'s own `assert_shape_contract`, whose `_rows`
+helper takes `int(t.shape[0])`, and an eighteenth solves the width by *comparison* rather
+than conversion: `ScheduledBatch.__init__` checks the staged token array's length against
+the count. **Repairing them one at a time does not converge** — the two sites this
+property was originally recorded at were repaired and `_rows` appeared behind them.
+
+**The conversion is not the defect; the recording is.** A host fill genuinely needs a
+number, and the number it needs is the hint, which is the count the engine computed. So a
+symbolic capture keeps the conversion and replaces the guard with its own log — every
+conversion, with the line it happened on — and asserts that log, as a multiset of
+`(line, conversions)`, against a declared set. That last clause is the whole of the
+discipline's value and it is the part that is easy to leave out: a log nothing compares
+records a conversion at a seventeenth line and says nothing, so the instrument reads as
+evidence while behaving as decoration. The capture referenced below declares the set as
+`EXPECTED_HOST_RESOLUTIONS` and asserts it at both group widths and both step widths.
+**`__bool__` stays untouched**, so a branch on a width still installs its guard and a step
+whose shape decides which path the engine takes still records that it did.
+
+Two consequences worth stating, because both were expected the other way round:
+
+- **`copy_to_gpu` needs no change, and neither does `CpuGpuBuffer`.** The specialisation
+  recorded there was a *buffer capacity* — `max_model_len // block_size` — being solved
+  against the CPU side's constant, and it only existed because that capture symbolised
+  every dimension of the staged device tensor. Capacities are engine configuration and are
+  not a function of the step. With only the step's width symbolic, the two slices carry
+  the same symbol and the copy dispatches with it on both sides.
+- **One production line changes**, `_rows`'s `int(t.shape[0])` → `t.shape[0]`.
+  `torch.Size.__getitem__` already returns a Python `int` for a tensor with a real size,
+  so it is the identity in a served step; it matters only where the size is symbolic, and
+  there converting one side of an equality to a number forces the other to become it.
+
+**What the symbol has to be attached to is the batch, not the buffers.** Handing each
+staged buffer a bound of its own re-derives widths the engine did not run at. The width
+is set on the `ScheduledBatch` and the engine derives the rest — `ForwardMode.decide`
+settles both units off it, `prepare_inputs` writes the `cu_seqlens_q` boundary at
+`running_bs + 1`, `prepare_decode` uses it as every staged bound. A decode step is one
+query row per sequence, so its token count and its sequence count are **one** symbol; two
+would have to be equated later, which is the specialisation again by a longer route.
+
+**It does not survive the batch's own constructor, and that is the eighteenth site.**
+`ScheduledBatch.__init__` compares the staged token array's length against the count it
+was handed, which solves the width by comparison rather than by conversion — the
+`__bool__` boundary this discipline deliberately leaves alive. So the capture builds the
+batch at the concrete width and rebinds the four count fields afterwards. The symbol
+enters the engine's *staging*; it does not enter the engine's batch constructor, and a
+reader who takes "the symbol enters at the `ScheduledBatch`" literally will look for it
+in the wrong place.
+
+**The evidence that the symbol is free, rather than a hint in disguise.** The engine
+computes its host values from the hint, so a graph built this way would still be a graph
+about one width if any dimension had taken the hint instead of the symbol — and nothing in
+a census would say so. The step is therefore traced at **two** widths, at **each** group
+width the result is claimed at, and the inventories compared operator for operator and
+shape for shape with the symbol's name set aside. They are identical, which also says that
+every dimension that stayed a number is the same number at both widths and so is not a
+width in disguise. The digest that carries this covers operator names and tensor shapes
+only — not scalar arguments, dtypes or strides — so a value-level difference is found by
+comparing the distinct-operator sets instead, which is how the one difference between the
+concrete and symbolic passes (`lift_fresh` becoming `scalar_tensor`) was found.
+
+**One artifact is width-dependent, and the comparison should say so rather than omit it.**
+The guard set is not the same at two hints: at every hint but 2 a lower bound
+`<axis> + 1 > <hint>` appears as well, measured at hints 3, 8 and 16 at TP1
+and at hint 8 at TP2, and seen independently at 5, 7 and 64. At a hint of 2 it is
+elided, because a size symbol's default range is
+`[2, ∞)` and the inequality is vacuous. It is a `__bool__` comparison on a live symbol, so
+it is the positive evidence that the boundary is intact — but it means the applicability
+statement carries a *lower* bound at any hint but 2, and a two-width table that lists
+five rows as identical has to name the sixth that is not.
+
+Pinned by `tests/compass/test_capture_real_model.py`.
+
 ### The gating cost turned out to be small
 
 An operator with no fake/meta impl is a **hard stop**, not a degradation:
@@ -192,11 +292,114 @@ That composes with D20: **the trace stops at the opaque leaf**, which is where 6
 the step time lives and exactly where a parameterized price is wanted anyway. The ~231
 fake-less aiter ops sit *inside* those leaves and are never reached.
 
+### Collectives at TP>1 — measured, and the group is not what the trace needs
+
+> **Provenance — measured under a capture that has since been withdrawn.** Every count in
+> this section was taken with the fake-tensor capture module that PR #10 added under
+> `atom/compass/capture/`, driven by scripts that were never committed and writing JSON
+> records that no longer exist. That module and its tests have been withdrawn from the
+> tree, so **none of the numbers below was reproducible here**. They are kept because they
+> are the specification a replacement capture is written from, not because they can be
+> re-run; anything that builds on them re-takes them first.
+>
+> **Partly re-taken since, by `tests/compass/test_capture_real_model.py`.** That test
+> traces the 27B at both widths through a group of the honest width, and agrees with the
+> 27B row on what it is a claim about rather than on its totals: at TP2 it records
+> `aiter.all_reduce_` **129** — 128 row-parallel at `communication_op.py:58` plus the
+> vocab-parallel one at `embed_head.py:175`, the 128 predicted from the config's layer
+> types and not read off the inventory — one all-gather at `embed_head.py:257`, and one
+> broadcast, plus two `_c10d_functional.wait_tensor` entries that belong to the
+> substitution below rather than to ATOM. The raw Triton traffic agrees exactly:
+> **33 launches across 3 kernels**. The operator totals do
+> **not** match and are not expected to: they are 2,521 at TP1 and 2,662 at TP2 against
+> 2,471 and 2,611 here, on a decode step of two sequences at a block size and a batch
+> budget this file never recorded, which is the reason a total is not the assertion.
+>
+> **The TP2 inventory is conditional on two declared substitutions, and every number in
+> the paragraph above inherits them.** `ATOM_USE_CUSTOM_ALL_GATHER=0` selects the
+> non-custom vocab-parallel gather: it is a **non-default** ATOM path, and a default TP2
+> deployment takes the `ca_comm` custom gather, which is not what was traced — with the
+> default the forward dies on `ca_comm` after roughly 2,500 operators, so this is the
+> difference between a run that refuses part-way and one that completes. Second, the four
+> call sites reaching `c10d`'s legacy in-place collectives are routed to their functional
+> forms, which is where every `_c10d_functional.*` entry, including both `wait_tensor`s,
+> comes from; only the 129 `aiter.all_reduce_` are ATOM's own dispatch.
+>
+> **The gather's shapes — both arrangements, each read off the live call.** ATOM hands
+> `all_gather_into_tensor` an output buffer of `(world_size,) + input_size`, measured as
+> `[2, 2, 124160]`; the functional substitute concatenates the `[2, 124160]` input along
+> dim 0 into `[4, 124160]`, and the shim reshapes that into ATOM's buffer. `[4, 124160]`
+> is therefore the **substitute's** arrangement and not the 27B's. An earlier revision of
+> this paragraph gave it as the 27B's output shape, and gave it from the width rather
+> than from any record: the dispatched operator carries only its input, so nothing
+> recorded a destination shape at all until the test began recording both.
+
+The open issue *"whether ATOM's real model classes trace cleanly under this mode at
+TP>1"* is **answered yes**, on two models at both widths, with the collectives in the
+inventory rather than substituted away.
+
+> **These are DIAGNOSTIC inventories.** Every run below was taken with raw
+> `@triton.jit` launches recorded and **not executed** -- 33 launches across 3 kernels on
+> the 27B decode -- so anything downstream of a skipped kernel read uninitialised fake
+> memory, and each record carries `diagnostic_inventory: true`. The operator and
+> collective counts are an enumeration of what a step reaches. They are **not** a cost
+> model input at any width.
+
+| model | TP1 | TP2 | collectives recorded at TP2 |
+|---|---|---|---|
+| Qwen3.8-27B (hybrid; vision tower, linear attention) | 2,471 ops / 33 distinct | 2,611 / 38 | `aiter.all_reduce_` **129**, functional all-gather 1, broadcast 1 |
+| Qwen3-0.6B (dense MHA) | 389 / 17 | 457 / 23 | `aiter.all_reduce_` **57**, functional all-gather 1, broadcast 1 |
+
+Both widths complete a full decode step. The 27B's TP1 inventory is identical
+operator-for-operator to the TP1 record taken through `apply_simulated_tp`, so the TP2
+difference is attributable to width rather than to a different capture. The 0.6B's 57 is
+28 layers x 2 row-parallel linears plus 1 vocab-parallel reduce, which its parameter
+geometry predicts independently. A third model with a different collective pattern,
+Qwen3-30B-A3B, was attempted and is not reachable on this stack: `AutoConfig` rejects the
+checkpoint before any capture code runs.
+
+**Why no process-group substitution is required.** The collective ATOM issues at TP>1
+goes through a **registered custom operator with a registered fake implementation** —
+aiter's `all_reduce_`. Under `FakeTensorMode` the fake answers and the body that needs a
+device communicator is unreachable, so the operator is recorded with its real shapes
+having allocated and communicated nothing. It does not need the group to exist at all:
+called with a group name that does not, it still returns the input's shape.
+
+**The exception, which is not the group either.** Four call sites reach
+`torch.distributed`'s legacy entry points instead — the non-custom `all_gather`,
+`gather`, `broadcast`, and the `barrier` in `allocate_kv_cache`. On this stack those
+`c10d::*` operators carry a backend kernel and **neither a `Meta` nor a
+`CompositeExplicitAutograd` one**, so `FakeTensorMode` raises
+`UnsupportedOperatorException` rather than producing a meta operation. The functional
+forms do carry a kernel it can run, and give the same shapes — a `[2, 124160]` input
+gathers to `[4, 124160]` as one recorded collective. This is the same fact as the
+`c10d.broadcast_` gap, measured to be general rather than particular to `broadcast`.
+
+A width-N group inside one process is available from torch's own `fake` backend and needs
+no peer. What one process cannot build is the **transport**: the device communicator opens
+a collective rendezvous that waits for absent ranks, as does the message-queue
+broadcaster, so both have to be declined when the group is built.
+
+Declining the device communicator is **not free**, and the earlier claim that nothing
+reaches it once the group exists is wrong. ATOM's default `ATOM_USE_CUSTOM_ALL_GATHER`
+takes `embed_head.py:257`'s vocab-parallel gather down the custom path, which asserts on
+`device_communicator.ca_comm` and fails with `'NoneType' object has no attribute
+'ca_comm'` after 2,588 operators. The runs above therefore set
+**`ATOM_USE_CUSTOM_ALL_GATHER=0`**, selecting the non-custom gather; that is a declared
+configuration of the capture and belongs in the record beside the device readings. It is
+the whole difference between the run that fails at 2,588 and the one that completes at
+2,611.
+
+The test that enumerated both operator sets by name — so that a future torch growing a
+meta kernel for one of the legacy forms would fail there rather than leave unexplained
+code behind — was withdrawn along with the capture module it exercised. Nothing on this
+tree holds either set in place today.
+
 ### Open issues
 
-- Whether any op on the forward path **outside** an opaque leaf lacks a fake impl. Expected
-  to be small; unmeasured.
-- Whether ATOM's real model classes trace cleanly under this mode at TP>1.
+- Whether any op on the forward path **outside** an opaque leaf lacks a fake impl. One
+  class of them is now measured -- the legacy `c10d::*` collectives above. The rest is
+  expected to be small; unmeasured.
 
 ---
 
@@ -268,8 +471,17 @@ Node    := Op(name, kind, in_shapes: [SymExpr], out_shapes: [SymExpr],
 
 ### `Repeat` — the efficiency property
 
-An LLM forward is a prologue, N layer bodies, and an epilogue. `Repeat` prices the body
-once and multiplies. For Qwen3.8-27B that is 64 layers collapsing to roughly two bodies —
+An LLM forward is a prologue, N layer bodies, and an epilogue. `Repeat` prices the body's
+operators once and **reuses those prices** for every instance — the same prices, in the
+same order, added the same way. What is reused is the body's sequence of per-operator
+prices, re-emitted in order once per instance, and not a body total; it does not multiply
+a body price by the count. Float addition is not associative, so multiplying re-associates,
+and it reproduces the recorded price in **none of the three shapes measured**: eight
+identical layers, 3.2e-05 s multiplied against 3.200000000000001e-05 s recorded; a
+four-block pattern repeated twenty times, 0.00036 against 0.0003600000000000009; six
+instances of 0.1 s, 0.6000000000000001 against 0.6. Reuse reproduces all three exactly.
+
+For Qwen3.8-27B that is 64 layers collapsing to roughly two bodies —
 **48 `linear_attention` and 16 `full_attention`**, `full_attention_interval: 4` — plus
 embedding and the head.
 
@@ -286,8 +498,13 @@ unsound**, see below); 4.3 ms once the key carried the bound allocation.
 > shape-only cache answers the first number, with a complete-coverage claim, for a step
 > that is neither.
 
-**`Repeat` must be validated, not assumed.** Derive flat, group, and assert the grouped
-form reproduces the flat cost. Layer 0 often differs structurally; per-layer quantization
+**`Repeat` must be validated, not assumed.** Derive flat, group, and compare the two forms
+**term by term, in order** — not total against total. A step cost is reported as a
+breakdown, one row per term, so individual prices are read downstream and not only their
+sum; two forms agreeing on the sum while disagreeing on a term disagree in what gets
+reported. Measured: one instance priced one bit above the others left the two forms
+bit-identical in total, so the elementwise comparison refuses that grouping and a
+total-only one accepts it. Layer 0 often differs structurally; per-layer quantization
 scales differ without differing in cost; a hybrid's layer types interleave rather than
 block.
 
@@ -442,8 +659,8 @@ Three rules make this well-formed rather than merely expressible:
    changes period) prices per instance rather than being assumed uniform. Without this,
    nesting is a lie: `Repeat(20, P)` claims 20 identical `P`s.
 3. **Grouping is an optimisation and must be provably free.** `Repeat` is only emitted
-   where the flattened price and the grouped price agree exactly; otherwise the node
-   stays a `Seq`. This is already **T6**, and the nested form makes it load-bearing
+   where the flattened and grouped forms price identically, term by term; otherwise the
+   node stays a `Seq`. This is already **T6**, and the nested form makes it load-bearing
    rather than a nicety — a wrong nesting is a systematic error multiplied by the repeat
    count.
 
@@ -900,7 +1117,7 @@ Deferred to future work by decision on 2026-09-18.
 | # | Decision | Date |
 |---|---|---|
 | D17 | Two tiers behind one `CostBackend`; tier (a) discovers the structure set tier (b) traces | 2026-09-18 |
-| D18 | Capture with `TorchDispatchMode` + `FakeTensorMode(ShapeEnv)` + `_EnablePythonDispatcher()`, on FakeTensor rather than bare meta | 2026-09-18 |
+| D18 | Capture with `TorchDispatchMode` + `FakeTensorMode(ShapeEnv)` + `_EnablePythonDispatcher()`, on FakeTensor rather than bare meta; **four** disciplines, not three — the fourth is that the engine's host arithmetic asks a symbol for a number, so the capture keeps the conversion, logs it with the line it happened on, and asserts that log against a declared set | 2026-09-18, fourth discipline 2026-09-22 |
 | D18.1 | `torch.export` recorded as an unverified alternative; rejected now on decomposition fidelity and on capturing a model call rather than an engine step | 2026-09-18 |
 | D19 | Hierarchical, symbolic, stream-annotated IR: `Seq` / `Repeat` / `Par`. No branches in the IR — applicability is a discrete key plus an evaluated guard domain | 2026-09-18 |
 | D20 | Opaque leaves are priced, not decomposed. Each carries a declared parameter extractor. FlyDSL and MORI need no IR node. | 2026-09-18 |
@@ -922,7 +1139,7 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T3 | Build the per-leaf parameter-extractor table (~20 entries) | the main hand-written asset; needs the leaf list frozen first |
 | T4 | Establish scratch constants per leaf for the 27B | unobservable device-free; needs a source or one measurement |
 | T5 | Verify ATOM's model classes trace cleanly under FakeTensorMode at TP>1 | needs a non-wedged node |
-| T6 | Validate that `Repeat` grouping reproduces the flat cost | needs a first trace |
+| T6 | Validate that `Repeat` grouping reproduces the flat prices term by term | needs a first trace |
 | T7 | Validate `Par` reconstruction from stream ids | not exercised until M5 (Kimi-K3) |
 | T8 | Decide whether tier (a) is fitted independently or derived from tier (b) | tier (b) does not exist yet |
 | T9 | Declare a row-ordering treatment for decode attention | 1.77x effect, invisible to every current feature |

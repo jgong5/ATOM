@@ -2,8 +2,8 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header. **109 decisions — D0–D94
-with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **86 registered
-TODOs — T1–T80 and T82–T87, of which 80 are open** (T10, T15, T22, T48 and T65 are struck
+with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **88 registered
+TODOs — T1–T88 with no gaps, of which 82 are open** (T10, T15, T22, T48 and T65 are struck
 through as done, and T77 was opened and closed by P0.1); they, the load-bearing assumptions and the
 cross-cutting issues live in **`12_open_items.md`**. Implementation follows the execution
 plan in `16`.
@@ -42,7 +42,7 @@ Where a decision looks odd, it is usually principle 1 or 2 being applied literal
 |---|---|---|
 | **1** | **Reuse ATOM's API server and scheduling modules.** Replace only the model layer and the modules it depends on (KV cache management, communication). Modify or refactor the reused parts where discrete time requires it — but do not reimplement them. | `01` D1 keeps ATOM's whole multi-process topology rather than collapsing it. `03` D13 refuses to simulate the KV pool. `07` Phase 0 forbids re-deriving admission to get shapes. |
 | **2** | **Simulated execution touches no GPU.** No compute, no device allocation. Compute capability, memory size, bandwidth and interconnect are **configured**, never read from a device runtime. | `05` exists at all. `03` D14 substitutes the five device readings. `04` D18 captures under `FakeTensorMode`. |
-| **3** | **Prioritise simplicity.** Add only what is necessary, and nothing more. | `02` D11: the runner has no modes. `01` D4: ~20 of ~55 synchronization sites are deliberately left alone. |
+| **3** | **Prioritise simplicity.** Add only what is necessary, and nothing more. | `02` D11: the runner has no modes. `01` D4: 137 of 212 synchronization sites are deliberately left alone, measured. |
 | **4** | **Prefer clean abstractions and refactoring over ad-hoc changes.** | `02`'s `CostBackend` boundary, which forbids ATOM imports. `05` D24 pushes thread-pool width into ATOM's config rather than Compass's. |
 | **5** | **Start small; cut work into stages that are individually verifiable.** | M1's fake model exists to validate the clock, the KV path and the harness *before* any real cost model. |
 | **6** | **Refuse rather than fall back.** A declined answer with a named reason is a result. A guessed one is a defect. | Everywhere. The archetypal failure is in *Conventions* below. |
@@ -66,9 +66,9 @@ ATOM's real code owns still never touch a device.
 |---|---|---|
 | **Forward pass** | **SIMULATED** | No kernels run. `CompassModelRunner.forward` evaluates a cost model and returns a predicted duration plus a correctly-shaped `ScheduledBatchOutput`. `02` D10 |
 | **Model weights** | **STUBBED** | Constructed on meta/fake tensors for geometry; no checkpoint bytes are read and nothing is resident on a device. `02`, and see `12_open_items.md` M-c |
-| **KV cache *tensors*** | **STUBBED** | `allocate_kv_cache` is a no-op. No device bytes are allocated. `03` D13 |
+| **KV cache *tensors*** | **STUBBED** | `allocate_kv_cache` allocates no bytes. It passes an empty registry to ATOM's `set_kv_cache_data`, which sets the registry to `{}` and builds the worker-side KV connector for a `compass` `kv_transfer_config`. `03` D13 |
 | **KV block accounting** | **REUSED, unmodified** | `BlockManager`, `BlockPool`, the prefix index, `plan_pools`, ref counting, eviction, preemption. It is pure arithmetic over integers, so running the real thing is *more* faithful than simulating it, and free. `03` D13 |
-| **KV *transfer* (PD disagg)** | **SIMULATED** | No RDMA, no real bytes on a fabric. A simulated connector registered in ATOM's existing factory charges `latency + bytes/bandwidth` from the machine spec. `01` D6 |
+| **KV *transfer* (PD disagg)** | **SIMULATED** | No RDMA, no real bytes on a fabric. A simulated connector registered in ATOM's existing factory charges `latency + bytes/bandwidth` from the machine spec. `allocate_kv_cache` refuses, by name, any `kv_connector` other than `compass`, including a non-empty `kv_transfer_config` with no `kv_connector` key, which reads as `moriio`. A `kv_transfer_config` of `{}` (ATOM's default) or `None` builds no connector and refuses nothing; a config that lacks the field is refused by name. `01` D6 |
 | **Prefix caching** | **REUSED, unmodified** | The hit *is* ATOM's hit, at ATOM's 64-token block granularity. Its effect on prefill cost is a cost-model term, not an inference. `03` |
 | **Scheduler / admission / chunking** | **REUSED, unmodified** | The whole point. Same decisions as a real run. `01`, `03` |
 | **API server, tokenizer** | **REUSED, real** | Real HTTP, real uvicorn, real tokenizer — run for its *effect*, with a modelled duration charged for its *time*. `06` D33 |
@@ -526,7 +526,7 @@ The documents use these precisely; a reader will bounce off without them.
 | Doc | Title | What it settles |
 |---|---|---|
 | [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced additive field each direction, audited for minimality. Timeline piggybacked on `kv_transfer_params` so Atomesh needs no change. Tokenizer cost is a queue, not a constant. |
-| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two tiers: a driver-free CPU tier over 130 of 189 files, green at **4030 passed / 0 failed** (3956 ATOM + 74 `tests/compass`; node 18 CPU container), and a GPU superset judged as a **delta** against **4779 / 5** (`fe9ea043c`, torch 2.10.0+rocm7.2.4, ROCm 7.2.4, AITER v0.1.21.dev0-49-gf4e7c7509, all five failing node-ids on file). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible only if stable *and* sensitive. |
+| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two tiers: a CPU tier over every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free **as a batch** and held to green, and a GPU superset judged as a **delta** against **4779 / 5** (`fe9ea043c`, torch 2.10.0+rocm7.2.4, ROCm 7.2.4, AITER v0.1.21.dev0-49-gf4e7c7509, all five failing node-ids on file). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible only if stable *and* sensitive. |
 | [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. Both metrics clock reads stay real. |
 
 ### Part V — Cross-cutting
@@ -541,7 +541,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it holds |
 |---|---|---|
-| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T80 and T82–T87; cross-cutting issues; pending amendments. |
+| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T87; cross-cutting issues; pending amendments. |
 
 ### Part VII — How it gets built
 
@@ -590,5 +590,5 @@ The documents use these precisely; a reader will bounce off without them.
 | D45 | The real-vs-real spread is the tolerance; a metric must be stable **and** sensitive |
 | D3.2 | Three always-on causality detectors; a straggler fails the run rather than warning |
 | D3.3 | The Clock Authority ships two deployment forms from one implementation: co-hosted by default, standalone for multi-container runs |
-| D43.1 | ATOM's suite is a merge gate on every Compass change, unmodified, in two tiers: a driver-free CPU tier (130 of 189 files, green at 4030 passed) per change, a GPU superset judged as a delta per wave against 4779 / 5, by an equality on a per-tree expectation rather than "no worse than". The CPU tier **exits 98** rather than reporting "GPU not required" when it cannot tell |
+| D43.1 | ATOM's suite is a merge gate on every Compass change, unmodified, in two tiers: a CPU tier (every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free as a batch, held to green) per change, a GPU superset judged as a delta per wave against 4779 / 5 at `fe9ea043c`, by an equality on a per-tree expectation rather than "no worse than". The CPU tier **exits 98** rather than reporting "GPU not required" when it cannot tell |
 | D67.1 | Tier 0 is graded on **configuration ranking** first; its latency goals are diagnostics for that, not the result |

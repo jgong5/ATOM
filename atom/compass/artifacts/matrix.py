@@ -1,0 +1,210 @@
+# SPDX-License-Identifier: MIT
+"""The invalidation matrix, as a table rather than a chain of conditionals.
+
+A global fingerprint would force re-measuring everything on a torch bump. Each
+artifact records the fingerprint of **its own dependency row**, so a bump
+invalidates the rows that name it and leaves the rest alone.
+
+The table lives in `atom/compass/design/07_calibration_toolchain.md`, in the
+section headed *Invalidation*. `test_the_matrix_is_the_documents_table` opens
+that file by path, finds the section by its heading and parses the table
+back out, so the document is a functional dependency of that test and of
+nothing this module emits.
+
+`MATRIX` below is that table transcribed, and it is deliberately a table: the
+deliverable is that a reader can hold the document beside the code and check
+them cell by cell. `test_the_matrix_is_the_documents_table` does the same check
+mechanically, parsing the document's own rows, marks and parentheses, so the
+two cannot drift.
+
+**A uniform matrix has lost its point**, and two cells are the ones a tidying
+hand would take away:
+
+* `price_list` does **not** depend on the model. Its leaves are
+  shape-parametric, and that is exactly what lets one campaign serve many
+  shapes. A row that also depended on the model would make every new model a
+  new pricing campaign.
+* `machine_spec`'s tokenizer terms do **not** depend on the device -- they are
+  host CPU work -- and its capacity does not depend on the software stack. So
+  `machine_spec` is three rows here rather than one, and a device change
+  invalidates two of them while a tokenizer change invalidates the third.
+
+**Two of the seven artifacts this store holds have no row at all.**
+`shape_population` and `coverage_hull` appear in the artifact key table and
+nowhere in this one, and the two "sevens" are not the same seven (#174). Guessing a row for them is the failure
+this package exists to prevent -- an artifact answering under conditions
+nobody checked -- so `rows_for` refuses and names what is missing.
+"""
+
+import enum
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+from .keys import Kind
+from .rules import ArtifactRefusal, Rule
+
+
+class Axis(enum.Enum):
+    """The six things a change to which can invalidate an artifact.
+
+    The value is the document's column header verbatim so a refusal quotes it;
+    `field` is the stable name the same axis is recorded and asked for under.
+    """
+
+    SOFTWARE_STACK = "ROCm / AITER / RCCL"
+    TORCH = "torch"
+    ATOM_SRC = "ATOM src"
+    MODEL = "model"
+    DEVICE = "device"
+    ENGINE_CONFIG = "engine cfg"
+
+    @property
+    def field(self) -> str:
+        """The axis as it is written in JSON and passed to `Conditions.of`."""
+        return self.name.lower()
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class Row(enum.Enum):
+    """The seven rows. `machine_spec` is three of them, and that is the point."""
+
+    OP_GRAPH = "op_graph"
+    PRICE_LIST = "price_list"
+    REGION_TERMS = "region_terms"
+    MEMORY_READINGS = "memory_readings"
+    MACHINE_SPEC_CAPACITY = "machine_spec: capacity"
+    MACHINE_SPEC_RUNTIME_CONSTANTS = "machine_spec: runtime constants"
+    MACHINE_SPEC_TOKENIZER_TERMS = "machine_spec: tokenizer terms"
+
+    @property
+    def field(self) -> str:
+        """The row as it is written in JSON."""
+        return self.name.lower()
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class Cell:
+    """One cell of the table: the mark, and the parenthesis beside it.
+
+    The note is carried rather than dropped because three of the seven rows
+    have one and each says something the mark alone does not -- which part of
+    the engine config an `op_graph` turns on, why a `price_list` is free of
+    the model, and which reading of "model" a tokenizer term follows.
+    """
+
+    depends: bool
+    note: str = ""
+
+    def __str__(self) -> str:
+        mark = "X" if self.depends else "-"
+        return f"{mark} ({self.note})" if self.note else mark
+
+
+#: The document's `X` and `-`, so the table below transcribes rather than translates.
+DEPENDS = Cell(True)
+INDEPENDENT = Cell(False)
+
+#: The invalidation matrix, row by row and column by column.
+MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
+    Row.OP_GRAPH: {
+        Axis.SOFTWARE_STACK: INDEPENDENT,
+        Axis.TORCH: DEPENDS,
+        Axis.ATOM_SRC: DEPENDS,
+        Axis.MODEL: DEPENDS,
+        Axis.DEVICE: INDEPENDENT,
+        Axis.ENGINE_CONFIG: Cell(True, "level, cudagraph mode"),
+    },
+    Row.PRICE_LIST: {
+        Axis.SOFTWARE_STACK: DEPENDS,
+        Axis.TORCH: DEPENDS,
+        Axis.ATOM_SRC: DEPENDS,
+        Axis.MODEL: Cell(False, "shape-parametric"),
+        Axis.DEVICE: DEPENDS,
+        Axis.ENGINE_CONFIG: INDEPENDENT,
+    },
+    Row.REGION_TERMS: {
+        Axis.SOFTWARE_STACK: DEPENDS,
+        Axis.TORCH: DEPENDS,
+        Axis.ATOM_SRC: DEPENDS,
+        Axis.MODEL: DEPENDS,
+        Axis.DEVICE: DEPENDS,
+        Axis.ENGINE_CONFIG: DEPENDS,
+    },
+    Row.MEMORY_READINGS: {
+        Axis.SOFTWARE_STACK: DEPENDS,
+        Axis.TORCH: DEPENDS,
+        Axis.ATOM_SRC: DEPENDS,
+        Axis.MODEL: DEPENDS,
+        Axis.DEVICE: DEPENDS,
+        Axis.ENGINE_CONFIG: DEPENDS,
+    },
+    Row.MACHINE_SPEC_CAPACITY: {
+        Axis.SOFTWARE_STACK: INDEPENDENT,
+        Axis.TORCH: INDEPENDENT,
+        Axis.ATOM_SRC: INDEPENDENT,
+        Axis.MODEL: INDEPENDENT,
+        Axis.DEVICE: DEPENDS,
+        Axis.ENGINE_CONFIG: INDEPENDENT,
+    },
+    Row.MACHINE_SPEC_RUNTIME_CONSTANTS: {
+        Axis.SOFTWARE_STACK: DEPENDS,
+        Axis.TORCH: INDEPENDENT,
+        Axis.ATOM_SRC: INDEPENDENT,
+        Axis.MODEL: INDEPENDENT,
+        Axis.DEVICE: DEPENDS,
+        Axis.ENGINE_CONFIG: INDEPENDENT,
+    },
+    Row.MACHINE_SPEC_TOKENIZER_TERMS: {
+        Axis.SOFTWARE_STACK: INDEPENDENT,
+        Axis.TORCH: INDEPENDENT,
+        Axis.ATOM_SRC: INDEPENDENT,
+        Axis.MODEL: Cell(True, "tokenizer"),
+        Axis.DEVICE: Cell(False, "host CPU"),
+        Axis.ENGINE_CONFIG: INDEPENDENT,
+    },
+}
+
+#: Which rows decide a kind's validity. `machine_spec` is three; two kinds are
+#: none, and that is a gap in the matrix rather than a default taken here.
+ROWS_OF: Mapping[Kind, tuple[Row, ...]] = {
+    Kind.OP_GRAPH: (Row.OP_GRAPH,),
+    Kind.PRICE_LIST: (Row.PRICE_LIST,),
+    Kind.REGION_TERMS: (Row.REGION_TERMS,),
+    Kind.MEMORY_READINGS: (Row.MEMORY_READINGS,),
+    Kind.MACHINE_SPEC: (
+        Row.MACHINE_SPEC_CAPACITY,
+        Row.MACHINE_SPEC_RUNTIME_CONSTANTS,
+        Row.MACHINE_SPEC_TOKENIZER_TERMS,
+    ),
+}
+
+
+def rows_for(kind: Kind) -> tuple[Row, ...]:
+    """The rows of the matrix a kind is checked against, or a refusal.
+
+    `machine_spec` answers with three, because a device change invalidates its
+    capacity and its runtime constants while leaving its tokenizer terms
+    standing, and one row could not say that.
+    """
+    rows = ROWS_OF.get(kind, ())
+    if not rows:
+        raise ArtifactRefusal(
+            Rule.INVALIDATED,
+            f"the invalidation matrix states no dependency row for {kind}",
+            "the artifact key table declares seven artifacts and the matrix "
+            f"rows seven, and they are not the same seven: {kind} is in the "
+            "first and not the second. Add a row to the matrix, or say there "
+            "why the kind needs none (#174); a row guessed here would answer "
+            "under conditions nobody checked",
+        )
+    return rows
+
+
+def axes_of(row: Row) -> tuple[Axis, ...]:
+    """The axes a row depends on, in the matrix's column order."""
+    return tuple(axis for axis in Axis if MATRIX[row][axis].depends)
