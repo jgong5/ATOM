@@ -186,7 +186,7 @@ def _call_sites():
             )
             sites.setdefault(node.args[0].value, []).append(
                 Site(
-                    path.name,
+                    str(path.relative_to(REPO)),
                     node.lineno,
                     waits,
                     aggregated,
@@ -494,7 +494,7 @@ def test_the_base_capture_reaches_a_device_before_it_reaches_the_model():
 
 def test_get_num_blocks_refuses_and_the_keys_its_caller_reads_are_named():
     site = SITES["get_num_blocks"][0]
-    tree = ast.parse((ENGINE / site.file).read_text())
+    tree = ast.parse((REPO / site.file).read_text())
     required = {
         n.slice.value
         for n in ast.walk(tree)
@@ -571,8 +571,8 @@ def test_forward_refuses_and_its_reply_is_one_object_read_for_nine_attributes():
     rename, fails here.
     """
     assert collections.Counter(s.file for s in SITES["forward"]) == {
-        "engine_core.py": 2,
-        "pp_engine_core.py": 2,
+        "atom/model_engine/engine_core.py": 2,
+        "atom/model_engine/pp_engine_core.py": 2,
     }
     assert {s.arity for s in SITES["forward"]} == {0, 1}
     engine = (ENGINE / "engine_core.py").read_text()
@@ -1170,10 +1170,14 @@ def test_every_site_the_package_docstring_cites_is_one_no_caller_waits_for():
     cited = set(re.findall(CITATION, PACKAGE_DOC))
     sites = [s for name in UNWAITED for s in SITES[name]]
     assert [s for s in sites if s.waits] == []
-    assert cited == {f"{s.file}:{s.line}" for s in sites}
+
+    def cite(s):  # the docstring cites paths under atom/model_engine/
+        return f"{s.file.removeprefix('atom/model_engine/')}:{s.line}"
+
+    assert cited == {cite(s) for s in sites}
     bullets = _bullets(PACKAGE_DOC)
     assert {n: set(re.findall(CITATION, bullets.get(n, ""))) for n in UNWAITED} == {
-        n: {f"{s.file}:{s.line}" for s in SITES[n]} for n in UNWAITED
+        n: {cite(s) for s in SITES[n]} for n in UNWAITED
     }
 
 

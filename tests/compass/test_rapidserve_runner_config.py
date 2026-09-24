@@ -62,7 +62,7 @@ def test_the_rpcs_named_are_the_waits_only_the_rapidserve_cores_make():
         for name, sites in surface.SITES.items()
         for s in sites
         if s.waits
-        and s.file == "engine_core.py"
+        and s.file == "atom/model_engine/engine_core.py"
         and any(c.lineno <= s.line <= c.end_lineno for c in cores)
     }
     rapid_only = (set(surface.SITES) & surface.RAPID) - surface.BASE
