@@ -904,10 +904,10 @@ def test_the_refusal_comment_says_the_loop_breaks_and_not_that_it_hangs():
     """The prose beside the refusal, held to the structure above.
 
     This is the half the surface was missing. The comment, the package
-    docstring and the string assertion above were added together, and the
-    comment said the opposite of that assertion: that an unanswered `exit`
-    means "the loop never breaks". Nothing failed, because nothing read the
-    prose. So the words are read here.
+    docstring's sentence about the surface and the string assertion above
+    were added together, and the comment said the opposite of that assertion:
+    that an unanswered `exit` means "the loop never breaks". Nothing failed,
+    because nothing read the prose. So the words are read here.
 
     `never breaks` is the claim that was wrong. It is refused as that
     lower-case phrase, including where a comment line wraps between the two
