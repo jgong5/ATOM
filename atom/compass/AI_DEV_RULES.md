@@ -101,6 +101,10 @@
 - **A developer agent owns development and PR updates; the main agent orchestrates
   and does not write the change itself.** After each push a reviewer agent
   reviews, the developer pushes fixes, and that repeats until the verdict is APPROVE.
+  The developer works under the
+  [`ponytail`](https://github.com/DietrichGebert/ponytail/blob/main/skills/ponytail/SKILL.md)
+  skill at level `full` (`/ponytail full`), the counterpart of the reviewer's
+  `ponytail-review` in gate 4.
 - **Escalations and `need human`.** An escalation is anything that needs an owner
   ruling before work can continue; anything the developer can fix without one is
   a finding, and the owner is never asked about findings. An agent applies
