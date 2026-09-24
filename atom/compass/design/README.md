@@ -66,9 +66,9 @@ ATOM's real code owns still never touch a device.
 |---|---|---|
 | **Forward pass** | **SIMULATED** | No kernels run. `CompassModelRunner.forward` evaluates a cost model and returns a predicted duration plus a correctly-shaped `ScheduledBatchOutput`. `02` D10 |
 | **Model weights** | **STUBBED** | Constructed on meta/fake tensors for geometry; no checkpoint bytes are read and nothing is resident on a device. `02`, and see `12_open_items.md` M-c |
-| **KV cache *tensors*** | **STUBBED** | `allocate_kv_cache` is a no-op. No device bytes are allocated. `03` D13 |
+| **KV cache *tensors*** | **STUBBED** | `allocate_kv_cache` allocates no bytes. It passes an empty registry to ATOM's `set_kv_cache_data`, which sets the registry to `{}` and builds the worker-side KV connector for a `compass` `kv_transfer_config`. `03` D13 |
 | **KV block accounting** | **REUSED, unmodified** | `BlockManager`, `BlockPool`, the prefix index, `plan_pools`, ref counting, eviction, preemption. It is pure arithmetic over integers, so running the real thing is *more* faithful than simulating it, and free. `03` D13 |
-| **KV *transfer* (PD disagg)** | **SIMULATED** | No RDMA, no real bytes on a fabric. A simulated connector registered in ATOM's existing factory charges `latency + bytes/bandwidth` from the machine spec. `01` D6 |
+| **KV *transfer* (PD disagg)** | **SIMULATED** | No RDMA, no real bytes on a fabric. A simulated connector registered in ATOM's existing factory charges `latency + bytes/bandwidth` from the machine spec. `allocate_kv_cache` refuses, by name, any `kv_connector` other than `compass`, including an absent key. `01` D6 |
 | **Prefix caching** | **REUSED, unmodified** | The hit *is* ATOM's hit, at ATOM's 64-token block granularity. Its effect on prefill cost is a cost-model term, not an inference. `03` |
 | **Scheduler / admission / chunking** | **REUSED, unmodified** | The whole point. Same decisions as a real run. `01`, `03` |
 | **API server, tokenizer** | **REUSED, real** | Real HTTP, real uvicorn, real tokenizer — run for its *effect*, with a modelled duration charged for its *time*. `06` D33 |
