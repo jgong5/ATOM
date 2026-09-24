@@ -245,9 +245,9 @@ class NonAllocatingRunner:
         rank's GPU and then fills it from disk. Both halves are skipped here, so
         no weight byte reaches the device and no checkpoint is read.
 
-        A speculative config is refused here, because right after this returns
-        the base builds the drafter on this rank's GPU and loads its checkpoint.
-        It cannot be modelled either: a predicted step's reply has
+        A speculative config is refused here, because on the last pipeline rank
+        the base goes on to build the drafter on this rank's GPU and load its
+        checkpoint. On any rank, it cannot be modelled: a predicted step's reply has
         `draft_token_ids` None and zero `num_rejected`/`num_bonus`, which the
         scheduler accepts as a step that drafted nothing (`scheduler.py:2579`
         never fills `seq.spec_token_ids`, and `:2521-2522` reads the zeros), so
