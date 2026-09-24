@@ -23,10 +23,11 @@
   any git command. `setup-git` needs a `gh` login, `/root/.config/gh/hosts.yml`,
   which a full teardown also discards, so `gh auth login` or the token file
   `gpu_docker/CLAUDE.md` names may be needed first (unverified: untested after a
-  real teardown). The main worktree may have another branch checked out, so
-  update the integration branch without checking it out (fast-forward only; if
-  it is the checked-out branch, `git merge --ff-only fork/feature/atomcompass_new`
-  instead). Git as root leaves files root-owned, which fails host-side edits
+  real teardown). The main worktree may have another branch checked out, so a
+  refspec fetch fast-forwards the integration branch without a checkout. If
+  `git worktree list` shows `[feature/atomcompass_new]` in some worktree, git
+  refuses that fetch; run `git fetch fork && git merge --ff-only
+  fork/feature/atomcompass_new` in that worktree instead. Git as root leaves files root-owned, which fails host-side edits
   silently, so chown after every update:
 
   ```
@@ -155,11 +156,12 @@
   machine time with a measured basis. **A task that overruns its estimate by more
   than ~2x is an escalation**, not a reason to keep going.
 - **PRs land squashed onto `feature/atomcompass_new`**, one commit per task with a
-  written message — never `main` or `master`. Land through REST with
-  `merge_method=squash`, `commit_title`, `commit_message` (`-F
-  commit_message=@<file>`) and `sha=<approved head>`: `PUT
-  repos/<o>/<r>/pulls/<n>/merge` for an unstacked PR, `PUT .../merge-async` with
-  `merge_action=direct_merge` for a stacked one, bottom-first.
+  written message — never `main` or `master`. Land with `PUT
+  repos/<o>/<r>/pulls/<n>/merge-async` (stacked or not), `merge_method=squash`,
+  `merge_action=direct_merge`, `sha=<approved head>`, a `commit_title` ending in
+  ` (#<n>)` (GitHub does not add it) and `-F commit_message=@<file>`. It is
+  asynchronous: wait until `pulls/<n>` shows `merged: true` before the
+  fast-forward below or the next PR up a stack, which lands bottom-first.
 - **Landing is the agents' job; no owner approval is needed or sought.** An agent
   lands any PR whose APPROVE covers its current head (below) and with no
   `need human` on it or anywhere below it in its stack; it does not wait for the
@@ -186,8 +188,9 @@
 - **An approval covers a tree, not a PR.** When a head moves past the comment
   that approved it, the new commits get a delta review pinned to
   `<approved sha>..<head>` before the PR lands. A merge commit in that range is
-  reviewed by its conflict resolutions (`git show --remerge-diff <merge>`), not
-  by the changes it brings in, which were reviewed where they landed.
+  reviewed by its conflict resolutions (`git show --remerge-diff <merge>`), and
+  the rest with `git log -p --first-parent <approved sha>..<head>`; what a merge
+  brings in is reviewed in its own PR, landed or still under review.
 - **Recommended, not required: stack a dependent task's PR on its unlanded
   parent** with `gh stack` (`github/gh-stack` v0.1.1); independent tasks do not
   stack. Reinstall after a container rebuild with
@@ -197,20 +200,22 @@
     re-run whenever a PR joins, held members included (linking lands nothing).
     Only linked members are retargeted when a parent lands. A fork (two or more
     open PRs based on one open PR's branch) links at most one arm. Drift check:
-    every open PR based
-    on another open PR's branch sits in one stack, fork arms excepted
+    every open PR based on another open PR's branch sits in one stack, fork arms
+    excepted
     (`gh api "repos/<o>/<r>/stacks?pull_request=<n>"`).
-  - Land a stack one PR at a time (above), not with `gh stack merge`: it takes no
-    message, so a multi-commit PR lands with GitHub's commit-list message. When a
-    parent lands, GitHub retargets a linked child itself. An unlinked child (a
-    fork arm, or a chain never linked) gets the new integration tip merged into
-    it and its base patched via REST.
+  - Land a stack one PR at a time (above), never with `gh stack merge`: it takes
+    no message, and it force-pushes the child after landing. When a parent lands,
+    GitHub retargets a linked child itself. An unlinked child (a fork arm, or a
+    chain never linked) gets its base patched via REST and the new integration
+    tip merged into it, so its diff shows only its own changes.
 - **PR branches only gain commits: no force-push, no rebase, no amend.** Answer
-  review findings with new commits. Update a branch only when it conflicts or
-  needs code landed since — a moved tip alone needs no update, the tree check
-  covers it — and then by merging the integration branch, or the parent's head,
-  into it. Never run `gh stack rebase`, `sync`, `push` or `submit`: they rebase
-  and force-push. The branch lands squashed, so its merge commits never reach the
+  review findings with new commits. Update a branch only when it conflicts, needs
+  code landed since, or its unlinked parent landed (above) — a moved tip alone
+  needs no update, the tree check covers it — and then by merging freshly fetched
+  `fork/feature/atomcompass_new` (never the local branch, which may be stale), or
+  the parent's head, into it. Never run `gh stack rebase`, `sync`, `push` or
+  `submit`: they rebase or force-push. A secret or large binary pushed by mistake
+  is the one case that needs a force-push, and it is an escalation. The branch lands squashed, so its merge commits never reach the
   integration branch, and GitHub's incremental review and the delta review stay
   intact.
 - Except for the main branch, free updates to `jgong5/ATOM` — branches, PRs and
