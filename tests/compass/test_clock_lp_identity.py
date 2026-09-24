@@ -142,6 +142,10 @@ def test_membership_and_size():
     registry = _registry(TRAFFIC, DECODE)
     assert TRAFFIC in registry and PREFILL not in registry
     assert len(registry) == 2
+    # An unhashable probe is a mistake in the call, so it raises rather than
+    # answering False.
+    with pytest.raises(TypeError):
+        _ = [] in registry
 
 
 # --- the lookahead matrix ----------------------------------------------------
@@ -199,7 +203,11 @@ def test_declaring_the_same_link_twice_is_refused():
     registry = _registry(PREFILL, DECODE)
     matrix = LookaheadMatrix(registry)
     matrix.declare(PREFILL, DECODE, LinkClass.PREFILL_TO_DECODE, 1.0e-3)
-    with pytest.raises(ValueError, match="already declared"):
+    # The refusal names the declaration that stands, so the caller can tell which
+    # of the two calls to change.
+    with pytest.raises(
+        ValueError, match=r"already declared as .*prefill_to_decode, floor=0\.001s"
+    ):
         matrix.declare(PREFILL, DECODE, LinkClass.PREFILL_TO_DECODE, 2.0e-3)
 
 

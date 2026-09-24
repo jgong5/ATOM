@@ -13,15 +13,12 @@ every child, and prints the order it iterates in. That is the control, and it is
 the reason the result reads as a demonstration rather than an assertion: the
 same names, in the same children, come out in a different order per seed through
 a `set` and in one order through the registry. The seed is the only thing that
-differs between those `set` lines -- they are built from the unrotated list on
-purpose, because insertion order moves set order a little by itself and a
-control varying two things at once attributes nothing. The `set` here is
-deliberate and belongs to the control; the package under test builds none, which
-its own source check covers.
+differs between those `set` lines. The `set` here is deliberate and belongs to
+the control; the package under test builds none, which its own source check
+covers.
 
-Arrival order is varied separately -- each child registers the names rotated by
-a different amount -- so an implementation that simply preserved insertion order
-fails this too.
+`NAMES` is not in sorted order, so an implementation that simply preserved
+insertion order fails this too.
 """
 
 import os
@@ -59,32 +56,26 @@ import os, sys
 import atom
 from atom.compass.clock import LpId, LpRegistry
 
-names = sys.argv[2].split(",")
-rotate = int(sys.argv[1])
-arrival = names[rotate:] + names[:rotate]
+names = sys.argv[1].split(",")
 
 registry = LpRegistry()
-for name in arrival:
+for name in names:
     registry.register(LpId(name))
 
 print("seed", os.environ.get("PYTHONHASHSEED", "<unset>"))
 print("hash", hash(names[0]))
 print("module", atom.__file__)
 print("registry", " ".join(str(lp_id) for lp_id in registry.ids()))
-# Built from `names`, not from `arrival`: the seed is then the only thing that
-# differs between children, so a difference in this line is attributable to it
-# and to nothing else. Insertion order does move set order a little on its own,
-# which is exactly the confound worth not having in the control.
 print("set", " ".join(set(names)))
 """
 
 
-def _child(seed, rotate):
+def _child(seed):
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = seed
     env["PYTHONPATH"] = str(REPO)
     done = subprocess.run(
-        [sys.executable, "-c", CHILD, str(rotate), ",".join(NAMES)],
+        [sys.executable, "-c", CHILD, ",".join(NAMES)],
         env=env,
         capture_output=True,
         text=True,
@@ -98,10 +89,9 @@ def _child(seed, rotate):
 
 @pytest.fixture(scope="module")
 def runs():
-    # One child per seed, each registering in a different rotation. Spawned once
-    # for the module: the import is the expensive part and it is the same import
-    # for every assertion below.
-    return [_child(seed, rotate) for rotate, seed in enumerate(SEEDS)]
+    # One child per seed. Spawned once for the module: the import is the
+    # expensive part and it is the same import for every assertion below.
+    return [_child(seed) for seed in SEEDS]
 
 
 def test_the_children_really_did_get_different_hash_seeds(runs):
