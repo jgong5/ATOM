@@ -113,9 +113,17 @@
   `need human` the moment it escalates — a halt declared in prose stops nothing;
   when the ruling lives on another issue, label each PR it holds and name that
   issue. The label stops all agent action on that issue or PR (no commit, review,
-  amend or merge, even after a passed review), with one exception: `gh stack
-  link` by PR number, which lands and pushes nothing, though it retargets the
-  linked PRs' bases (then and when a PR below lands). Only the owner removes it.
+  amend or merge, even after a passed review), with two exceptions. One is `gh
+  stack link` by PR number, which lands and pushes nothing, though it retargets
+  the linked PRs' bases (then and when a PR below lands). **The other is a base
+  update: when the branch-update rule (below) calls for one, an agent may merge
+  freshly fetched `fork/feature/atomcompass_new`, or the parent's head, into a
+  held branch, changing nothing else.** It resolves conflicts only, toward the
+  integration side unless the PR's own diff changes those lines. It lands
+  nothing, reviews nothing and leaves the label. A PR comment lists each
+  resolved file, and the label allows one review of the merge: a delta review of
+  its resolutions (`--diff-merges=remerge`) before the owner lifts the label. Only
+  the owner removes the label.
   **Without it, automation is on by default**: agents act with no opt-in.
 - **The review loop has its own stop.** If the same finding survives two cycles,
   or the loop passes three cycles, it halts, goes to the owner and applies
@@ -216,6 +224,7 @@
   code landed since, or it is an unlinked child whose parent landed (above) — a
   moved tip alone needs no update, the tree check covers it — and then by merging
   freshly fetched `fork/feature/atomcompass_new`, or the parent's head, into it.
+  A held branch is updated this way too, as the `need human` base update (above).
   Never run `gh stack rebase`, `sync`, `push` or `submit`: they rebase or
   force-push. A secret or large binary pushed by mistake
   is the one case that needs a force-push, and it is an escalation. The branch
