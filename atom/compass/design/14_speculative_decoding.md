@@ -251,7 +251,7 @@ decode can no longer be priced by a form that assumes one token per row.
 > non-speculative decode be the `N_Q = 1` case.**
 
 The features are already on the batch: `detailed_sqsq`, `detailed_sqsk` and `detailed_sk`
-(`scheduler.py:790-792`) are `Σ N_Q²`, `Σ N_Q·N_KV` and `Σ N_KV`, computed by
+(`scheduler.py:801-803`) are `Σ N_Q²`, `Σ N_Q·N_KV` and `Σ N_KV`, computed by
 `compute_detailed_aggregates`.
 
 ### What *is* new

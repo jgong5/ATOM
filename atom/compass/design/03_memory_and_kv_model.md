@@ -99,7 +99,7 @@ a + b·tokens + c·Σ_req N_Q²  + d·Σ_req (N_Q · N_KV_cached)
 `d` is the cache-hit term. A 90k hit and a 10k hit on the same `N_Q` differ in `d ·
 N_Q · ΔN_KV`, linearly, which is the right shape: the query block is fixed, the KV it
 scans is not. ATOM already computes these sums itself — `detailed_sqsq`, `detailed_sqsk`
-and `detailed_sk` at `scheduler.py:790-792` are exactly `Σ N_Q²`, `Σ N_Q·N_KV` and
+and `detailed_sk` at `scheduler.py:801-803` are exactly `Σ N_Q²`, `Σ N_Q·N_KV` and
 `Σ N_KV`, so the features are read from the batch rather than recomputed.
 
 **3. The calibration must have *seen* high-hit steps, or the hull refuses.** This is
