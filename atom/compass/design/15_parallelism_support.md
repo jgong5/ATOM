@@ -130,12 +130,11 @@ Consequences:
 2. **The DP group stays one LP** (`01` D3), and the shape collective is a *second* barrier
    confirming it: with a blocking all-gather at the head of every forward, DP ranks cannot
    drift by more than one step.
-3. **It is a category-A or category-B wait** in `01` D4's taxonomy, and which one depends
-   on where the LP boundary falls. Since the DP group is one LP, the collective is
-   **internal to an LP**: it is not a cross-LP wait the CA sees. It is not ignored either
-   (revised 2026-09-28, #443): it is part of the step's cost (`01` D4, K1: an event
-   cost), both as a priced collective (Q3 below) and as a barrier in the step's critical
-   path (below).
+3. **Both collectives are internal to the LP, and neither is ignored** (revised
+   2026-09-28, #443). Neither is a cross-LP wait the CA sees. The lockstep `all_reduce`
+   (`engine_core.py:770`) is an event cost (`01` D4, K1): the ranks exchange their batch
+   descriptions on it and it is where the step's length is decided, as its per-layer
+   critical path (below). Every collective's own cost is priced (Q3 below).
 
 ### Q1, Q3, Q4
 
@@ -164,8 +163,8 @@ Two things follow:
   case where the only cross-rank sync is per step; with per-layer barriers it
   underestimates. Rank 0 at 3 attention + 1 MoE per layer and rank 1 at 1 + 3 give a
   `max` of 4 per layer but a critical path of max(3,1) + max(1,3) = 6: over 60 layers,
-  240 against 360. The ranks exchange their batch descriptions on a collective the step
-  already runs and compute the same path; only one talks to the CA. The cost model
+  240 against 360. The ranks exchange their batch descriptions on the lockstep
+  `all_reduce` and each computes the same path; only one talks to the CA. The cost model
   therefore owes per-rank, per-layer durations. Per-rank LPs, still granted per step,
   are only for ranks that decouple at step level (no per-step collective) and interact
   only with lookahead > 0; a finer, operator-level grant is not used.
