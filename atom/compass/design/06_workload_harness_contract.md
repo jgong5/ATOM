@@ -408,8 +408,9 @@ Four properties that shape the model:
 2. **Cost is O(sliding window), not O(total output).**
 3. It runs on the **engine output threads, batched per engine step** — the module
    docstring: *"buffers a whole engine step, detokenizes it, and schedules a single
-   callback per event loop."* One thread, all streams: a serialization point at high
-   concurrency.
+   callback per event loop."* One thread per DP rank (`EngineCoreOutputThread-DP<rank>`,
+   `engine_core_mgr.py:694-698`), all of that rank's streams: a serialization point at
+   high concurrency.
 4. The window only advances when the decode does not end in `�`. Hence D31's ASCII
    constraint.
 
@@ -425,11 +426,29 @@ rule as the forward pass.
 
 | Stage | Where | Concurrency | Service time |
 |---|---|---|---|
-| encode | default `ThreadPoolExecutor` | width from ATOM config | `encode_fixed_s + tokens / encode_tokens_per_s` |
-| decode | engine output thread, per stream per step | **1** | `2 x (decode_fixed_s + window / decode_tokens_per_s)` |
+| encode | default `ThreadPoolExecutor` | pool width from ATOM config, **minus the pass-through jobs resident when the run starts** | `encode_fixed_s + tokens / encode_tokens_per_s` |
+| decode | engine output thread, per stream per step | **1**, one station per output thread | `2 x (decode_fixed_s + window / decode_tokens_per_s)` |
 
 Terms come from `host.tokenizers[]` in the machine spec (doc 05 D25), populated by the
 `compass spec probe tokenizer` Tier-0 probe.
+
+**Both stages are resource stations** (revised 2026-09-28, #443; PDES term: a multi-server
+FIFO queue). The simulated run installs its own default executor on the event loop. Each
+pool job is classified by a registry: `do_preprocess` is a **service** job; the
+`outputs_queue.get` that `engine_core_mgr.py:723` hands to the pool is a **pass-through**
+job, completed by a channel event at no cost, and it holds one thread for the life of the
+server, which is why the encode width subtracts it. **Anything unregistered is refused by
+name** and counted in the run summary's refusals, so a job ATOM later adds to the pool is
+reported rather than silently charged zero; multimodal preprocessing (`api_server.py:1660`)
+is refused today. A service job runs for real to get its result, takes a server in
+submission order, and its result reaches the coroutine at its completion time. On the
+decode side, each batch an output thread handles is one job on that thread's width-1
+station, starting at the later of its arrival and the previous job's completion; the
+callbacks it posts to the event loop (`streaming_dispatch.py:274`, `api_server.py:869`)
+run at its completion time. **Inside a job the clock reads the job's start time plus the
+service time accumulated so far**, charged by the wrapped `tokenizer.encode` / `decode`.
+So `seq.arrive_time = time.time()` after tokenization (`llm_engine.py:745`) reads the
+tokenization completion time, as in a real run.
 
 **This is a queue, not a constant.** At the corpus p50 and a plausible 2 M tokens/s,
 encode is ~44 ms — roughly **3x take2's entire admission constant** (13.7 ms) — and it
@@ -724,17 +743,43 @@ sites below, which do not go through `LoopScheduler` either (T74).
 3. **Metrics are stamped in the transport**, so our transport controls them.
    `ttft_metric.py:49-56` is `content_responses[0].perf_ns - request.start_perf_ns`;
    `request_latency_metric.py:38-49` is `content_responses[-1].perf_ns - start_perf_ns`;
-   ITL is `(request_latency - ttft) / (osl - 1)`. A transport that sets `start_perf_ns`,
-   each SSE chunk's `perf_ns` and `end_perf_ns` from the response's `sim_*` fields makes
+   ITL is `(request_latency - ttft) / (osl - 1)`. A transport that sets `start_perf_ns`
+   from the simulated arrival time it sends, and each SSE chunk's `perf_ns` and
+   `end_perf_ns` from that chunk's simulated time, makes
    the **entire existing metric and export stack correct by construction** — TTFT, ITL,
    ICL, latency, throughput, percentiles, goodput, the JSON/CSV exporters, the swim-lane
    plot and `submission_valid`. Roughly 15,000 lines of metrics code for free.
+
+   **The carriers** (revised 2026-09-28, #443; `01` D8). The arrival time goes in the
+   **`compass` entry of the W3C `tracestate` header**, appended after any existing entries
+   (for example `tracestate: compass=a:12.345;s:17`), not in a body field: atomesh
+   re-serializes a chat request through a typed struct with no catch-all, so an unknown
+   top-level field is dropped, while `tracestate` is on the header allow-list it forwards
+   (`atom/mesh/src/routers/comm/header_utils.rs:59`)
+   to both prefill and decode. Each streamed event's simulated time arrives on an **SSE
+   comment line** the server puts before that event (for example
+   `: compass a=12.345 s=18`); clients ignore comment lines, and aiperf's own parser
+   already keeps them on the message as `comment` packets
+   (`common/models/record_models.py:775-777`), so the transport reads them without a
+   parser change.
+
+   **The `/metrics` scrape runs on simulated time too** (`11` D72). aiperf's
+   `ServerMetricsDataCollector` (`server_metrics/data_collector.py:86`) scrapes on
+   `_collect_metrics_loop` (`common/mixins/base_metrics_collector_mixin.py:457`), paced
+   by `asyncio.sleep` (`common/mixins/task_manager_mixin.py:96`): a real-clock timer the
+   rebind above does not reach. The adapter paces it on the clock client, every
+   `scrape_interval` of simulated time, and stamps each sample with the simulated time
+   of its scrape. It is a real `GET /metrics` over the harness's existing HTTP path, so it
+   adds no channel. Because the scrape is periodic, no LP ever runs out of events: the
+   run ends with the workload, when the adapter has every response and the last scrape
+   and calls `end_workload` (`01` D3).
 
 ### Contents and size
 
 | Component | Lines | Status |
 |---|---|---|
-| Transport plugin — real HTTP, re-stamp anchors from `sim_*` | 150-250 | stands |
+| Transport plugin — real HTTP, `tracestate` arrival out, anchors re-stamped from SSE comment lines | 150-250 | stands |
+| `/metrics` scrape paced on the clock client, `end_workload` at the end | **not costed** | new scope, added by the PDES revision (#443) |
 | `ClockPacedLoopScheduler` — the `LoopScheduler` subclass, covering the nine pacing calls | 80-150 | **open** — costed against the option-A wrapper, which constraint 1 rules out |
 | Clock client library | 100-150 | stands |
 | Plugin manifest, bootstrap, config glue | ~100 | stands — T73's dotted entry-point value costs nothing; the ~20-line deferred rebind hook sits inside this row's ~100 |
@@ -852,8 +897,8 @@ requires genuine fan-out in every root is not constructible without reusing sess
 | D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes on that path. | 2026-09-18 |
 | D31 | Filler token is non-EOS, decodes to complete standalone ASCII, and is derived from the request id. | 2026-09-18 |
 | D32 | The decode->prefill cache chain is already broken by the harness for real servers too; guard only against false hits. `theoretical_prefix_cache_hit` is the oracle. | 2026-09-18 |
-| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. | 2026-09-18 |
-| D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. | 2026-09-18 |
+| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. Revised: both are resource stations; encode width excludes resident pass-through jobs, pool jobs are classified by a registry and unregistered ones refused, and a clock read inside a job is its start plus accumulated service time. | 2026-09-18, revised 2026-09-28 |
+| D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. Revised: arrival rides the `compass` entry of `tracestate`, output times ride SSE comment lines, and the `/metrics` scrape is paced on simulated time. | 2026-09-18, revised 2026-09-28 |
 | D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists; the rebind itself is deferred by a `sys.meta_path` hook, because the bootstrap runs while `aiperf.plugin.plugins` is still importing and cannot import `aiperf`; an inline attempt does not raise to the operator, it de-registers the whole plugin and logs one `WARNING` (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
 | D35 | Declare what the harness reproduces and what it cannot; cancellation is not available from this corpus. | 2026-09-18 |
 
