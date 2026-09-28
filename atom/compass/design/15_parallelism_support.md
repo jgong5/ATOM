@@ -180,7 +180,7 @@ Two things follow:
 
 Each PP stage is its own `EngineCore` (`01` D1: `dp_size × pp_size` engine cores), and
 stages communicate by point-to-point transfer rather than by a barrier — so `01` D3's
-collapse rule does **not** absorb them. PP degree `P` multiplies the LP count by `P`.
+collapse rule does **not** absorb them. PP degree `P` turns each engine LP into `P` LPs.
 
 The lookahead between adjacent stages is the p2p latency, which is **microseconds**. That
 is the expensive case for a conservative protocol: small lookahead means frequent grants.
@@ -542,16 +542,17 @@ pads. The *"a remainder is left unused"* comment this section used to quote is
 Strategies compose, and the LP count is what the clock protocol pays for:
 
 ```
-  LPs  =  (number of PD roles)                     1 for aggregated, 2 for disaggregated
-          x (dp_size)          <- collapses to 1 per group; a DP GROUP is one LP
-          x (pp_size)          <- DOES NOT collapse: one LP per stage
-          x 1                  <- tp_size and ep_size collapse into their group
-        + 1                    the harness
-        + 1                    the API server
+  LPs  =  1                                   the traffic source (the harness)
+        + (number of deployments)             1 aggregated, 2 for 1P1D (one per PD role)
+          x ( 1                               its frontend: the API server's event loop
+            + pp_size )                       its engine: one LP per PP stage; a DP group,
+                                              and tp_size and ep_size, collapse into it
 ```
 
-So a TP8/EP8 single-node aggregated deployment is **~3 LPs**, the same as TP1 — and a
-PP4 deployment is four times that. **The protocol's cost tracks PP degree and PD roles,
+So a TP8/EP8 single-node aggregated deployment is **3 LPs** (traffic, frontend, engine),
+the same as TP1; 1P1D is **5** (traffic, frontend-P, engine-P, frontend-D, engine-D); and
+a PP4 aggregated deployment is **6** (`01` D3, D3.1). **The protocol's cost tracks PP
+degree and PD roles,
 not GPU count**, which is the property that makes `01`'s single-CA decision hold as the
 milestones widen.
 
@@ -619,7 +620,7 @@ and `test_forward_mode.py` already cover the pieces on the CPU-only path (`08` D
 | D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP. Step duration is `max` over ranks, computed not rank-0-sourced, and idle ranks cost a dummy batch. Revised: the step is a compound event priced by the per-layer critical path over ranks (`max` is its step-sync-only special case). | 2026-09-19, revised 2026-09-28 |
 | D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. Revised: the send wait inside forward and the idle `flush_pp_send` are event costs, the runner answering the remaining transfer time. | 2026-09-19, revised 2026-09-28 |
 | D92 | EP adds no LPs (inherits the TP group) but its all-to-all is invisible and must be a declared node, and its `exclusive` occupancy forbids placing it in a `Par`. Expert sharding is Class A, remainder included. | 2026-09-19 |
-| D93 | LP count = PD roles × PP stages (+2), independent of GPU count. The clock protocol's cost tracks PP degree, not width. | 2026-09-19 |
+| D93 | LP count = 1 traffic LP + per deployment (1 frontend LP + one engine LP per PP stage): 3 aggregated, 5 for 1P1D, independent of GPU count. The clock protocol's cost tracks PP degree and PD roles, not width. | 2026-09-19, revised 2026-09-28 |
 | D94 | Parallelism splits across milestones: LP structure, couplings and memory shape at **M1**; cost accuracy at **M7**. M1's test is scheduling-decision agreement at TP2/DP2/PP2/EP2, which needs no cost model. | 2026-09-19 |
 
 ---
