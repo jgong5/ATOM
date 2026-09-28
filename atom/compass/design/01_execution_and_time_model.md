@@ -136,8 +136,8 @@ in-process queues with modelled latency.
 **B. Keep ATOM's multi-process topology; give it coordinated virtual time.**
 
 - *Pros:* minimal intrusion. The simulated deployment *is* the real deployment. Every
-  ATOM change is additive (a clock module, clock-read substitutions, status
-  annotations, config flags).
+  ATOM change is additive (a clock module, clock-read substitutions, channel
+  wrappers, config flags).
 - *Cons:* requires a time-coordination protocol between processes, and causality
   violations are silent.
 
@@ -153,9 +153,28 @@ is removed. The changes are:
 
 1. an injectable clock module,
 2. clock-read substitution at business-logic sites,
-3. status annotation around cross-process blocking waits,
-4. configuration to disable failure detectors,
+3. wrappers on the cross-LP channels ATOM already has: the channel sockets, the pollers
+   that wait on them, and the engine's output queue, which becomes a `RelayQueue` that
+   stamps each item when the step loop puts it. Threads no longer declare themselves
+   blocked or running; an LP is idle when its clock owner sits at an idle point with
+   nothing left to release (D3),
+4. the failure-detector treatment of D5,
 5. a simulated KV connector and a simulated model runner.
+
+**One substitution that is not a topology change.** A simulated run starts the API server
+on a stdlib-asyncio `CompassEventLoop` instead of uvloop, through the `loop=` setting
+uvicorn already takes (`api_server.py:2625-2646` picks `"uvloop"` or `"auto"` there;
+uvicorn also accepts a `"module:Class"` loop factory). Processes, threads and the service
+topology are unchanged; only the event loop's implementation differs. The reason is
+mechanical: the API server's event loop is an LP clock owner (D3), and virtual time can
+only be hooked into a loop written in Python. The stdlib loop decides timer expiry and its
+`select` timeout from `self.time()` and blocks in `self._selector.select(timeout)`, so
+overriding `time()` puts every timer on LP time and the selector becomes the idle point.
+uvloop hands timers to libuv in real milliseconds and blocks inside C (`uv_run`), where
+neither hook reaches. Keeping uvloop would take process-wide syscall interception
+(`LD_PRELOAD` over `clock_gettime` and `epoll_wait`), which is not an additive change at
+an existing site. No fidelity is lost: the frontend's service times come from the model,
+not from the wall clock.
 
 Rationale: the design principle is explicit that ATOM's api server and scheduling
 modules are reused and only the model layer and its dependencies are replaced. Option A
@@ -173,16 +192,17 @@ error into the acceptance evidence. So three always-on detectors, sized to be ch
 enough that none of them is a mode anyone can forget to enable.
 
 **What class of error these detect — and it matters which.** All three catch
-**implementation defects, not holes in the PDES algorithm.** The grant rule
-`T_grant(i) = min over j≠i of (now[j] + L[j→i])` is conservative by construction: given
-correct inputs it *cannot* produce a violation, which is the standard Chandy–Misra–Bryant
-guarantee and is not in question here. What the detectors watch for is the inputs being
-wrong — a lookahead constant declared too large, a call site nobody annotated, a clock
-read nobody substituted. Those are bugs in *our* code and configuration.
+**implementation defects, not holes in the PDES algorithm.** The grant rule (D3: grant
+strictly below `LBTS(i) = min over j≠i of (N[j] + D(j→i))`, with in-transit messages
+counted) is conservative by construction: given correct inputs it *cannot* produce a
+violation, which is the standard Chandy–Misra–Bryant guarantee and is not in question
+here. What the detectors watch for is the inputs being wrong — a lookahead constant
+declared too large, a channel nobody wrapped, a clock read nobody substituted. Those are
+bugs in *our* code and configuration.
 
 This distinction is worth stating plainly because the two cases warrant opposite
-responses. If a detector fires, the fix is local: correct the constant, add the
-annotation, substitute the clock read. **If one fired and none of those explained it, the
+responses. If a detector fires, the fix is local: correct the constant, wrap the
+channel, substitute the clock read. **If one fired and none of those explained it, the
 mechanism itself would be in question** — and that would be a much larger problem than a
 detector, because it would mean the conservative rule is not conservative on this
 topology. Nothing observed so far suggests that, and the grant rule is standard rather
@@ -194,43 +214,55 @@ wrong, and each maps to one detector.
 
 | Failure | What it looks like | Detector |
 |---|---|---|
-| **Declared lookahead is larger than reality** — an LP claims it cannot affect another for 50 µs and then does it in 10 | Receiver has already advanced past the send time. Silent; the message lands "in the past" | **(1) Straggler check** |
-| **A wait is not annotated** — an LP blocks for real while the CA believes it is running | Either a deadlock (loud) or, if a timeout rescues it, an LP that consumed no virtual time while real time passed. Silent | **(2) Annotation-coverage audit** |
+| **Declared lookahead is larger than reality** — an LP claims it cannot affect another for 50 µs and then does it in 10 | Receiver has already released messages past the arrival time. Silent; the message lands "in the past" | **(1) Straggler check** |
+| **A wait the CA cannot see** — an unwrapped channel, or a real collective spanning two LPs; an LP blocks for real while the CA believes it is running | A run that stops making progress. Nothing times out, so nothing is released wrongly, but nothing names the site either | **(2) Coverage audit** |
 | **A clock read was missed** — business logic still calls `time.monotonic()` | Two timestamps on one timeline disagree; durations mix scales. Silent | **(3) Clock-source audit** |
 
 **(1) Straggler check — receive side, always on, one comparison.** Every cross-LP
-message already passes through a small number of send/recv wrappers (the ZMQ hops of
-D4 category B). Each carries the sender's virtual send time `t_s`. On receipt the LP
-asserts `t_s >= now_self`. A violation means this LP has already simulated past the
-moment the message was sent, i.e. the local-causality constraint is broken. The check
-costs one float comparison per message and is the direct test of the property the whole
-protocol exists to provide. On failure: record `(sender, receiver, t_s, now_self,
-declared lookahead)` and **fail the run** — not a warning, because a straggler
-invalidates every number downstream of it.
+message passes through the channel wrappers (decision item 3). Each frame carries its
+channel, its sequence number and its arrival time `a = t_send + L(ch)`, stamped when the
+clock owner produced it. On receipt, for a message not yet released, the wrapper asserts
+`a >= ` the receiver's last drain time — the LP time up to which it has already released
+messages to ATOM. A violation means the receiver has already delivered past the moment
+this message arrives, i.e. the local-causality constraint is broken. (Comparing the
+*send* time with the receiver's *current* clock, as this check first did, is wrong:
+with lookahead `L > 0` a receiver is legitimately granted up to `t_send + L` before the
+message reaches it, so that form fails correct runs.) The check costs one float
+comparison per message and is the direct test of the property the whole protocol exists
+to provide. On failure: record `(channel, seq, a, drain time, declared lookahead)` and
+**fail the run** — not a warning, because a straggler invalidates every number
+downstream of it.
 
-This is also what makes a wrong lookahead *findable*: the report names the pair, so
-raising `L[j→i]` to the observed violation plus margin is a mechanical fix.
+This is also what makes a wrong lookahead *findable*: the report names the channel, so
+correcting its `L(ch)` is a mechanical fix.
 
-**(2) Annotation-coverage audit — a watchdog on "running" LPs.** A background thread
-per LP samples its own state. If an LP has been `declare_running()` for more than a
-wall-clock threshold (~200 ms is far above any real simulated step and far below any
-real blocking wait) *without* its virtual clock advancing, it is blocked on something
-nobody annotated. Log the LP, the stack, and continue — this one is a warning rather
-than a failure, because it costs correctness only when it also produces a straggler,
-and detector (1) catches that. Its value is that it names the missing annotation
-**during development**, when D4's ~55-site audit is still being worked through, rather
-than leaving a category-B site to be discovered by a wrong result.
+**(2) Coverage audit — a stall diagnostic, never an abort.** A wait the CA cannot see is
+one no wrapper covers. In a valid run every such wait ends; one that does not can only
+be a fault (a bug or a dead process). So nothing waits on a timer: the CA and every LP
+wait for as long as it takes, which consumes no virtual time, cannot change the result,
+needs no threshold tuned, and cannot kill a valid but slow run. After `DIAG_S` = 30 wall
+seconds without progress, one diagnostic is printed and the wait continues: the CA
+prints its LP table when it has received no request for that long; an LP prints the
+channel, the sequence number and every thread's stack when a message it released has
+not been handled for that long. `DIAG_S` is a reporting threshold, not a model
+parameter. Its value is that it names the uncovered wait **during development** rather
+than leaving it to be discovered as a hang with no name. A stall the CA *can* see —
+every LP waiting at the CA — is not a fault and is not this detector's business: D3's
+deadlock recovery handles it exactly. The preventive half runs at startup: a process
+group whose ranks map to more than one LP raises (D3).
 
 **(3) Clock-source audit — static, run in CI.** D4's categorisation rests on a
 by-hand audit of clock-read sites. A grep-level lint over the simulated-path modules
 that flags `time.time`, `time.monotonic`, `time.perf_counter`, `datetime.now` and
 `asyncio.sleep` outside an allow-list keeps that audit from rotting as ATOM's main
-branch moves. The allow-list is the set doc `11` D72 establishes as deliberately real
-(metrics push cadence, transport). Anything new lands as a CI failure on the day it is
-added, not at validation time.
+branch moves. The allow-list is the set left on real time deliberately: transport, and
+the bounds the CA cannot reach, which D5 sends to configuration. Metrics are not on it:
+`11` D72 runs all three metric clocks on virtual time, so `metrics.py:408` is a
+substituted clock read like any other. Anything new lands as a CI failure on the day it
+is added, not at validation time.
 
-**What this costs.** One comparison per cross-LP message, one sampling thread per LP,
-one CI lint. None of it is on the per-step path. **What it buys:** the statement "no
+**What this costs.** One comparison per cross-LP message, one wall-clock check in waits
+that already block, one CI lint. None of it is on the per-step path. **What it buys:** the statement "no
 causality violation occurred" becomes a reported result of every run rather than an
 assumption, which is what doc `08` needs in order to treat a simulated number as
 evidence at all.
@@ -341,22 +373,60 @@ one LP:
 | ATOM group | OS processes | LPs | Why |
 |---|---|---|---|
 | TP group | 1 EngineCore + N workers | **1** | Workers are slaved by a blocking RPC (`async_proc.py:431`) and hold no clock. Rank-0 authority validated at 0.06% (D0). |
-| DP group | N EngineCores | **1** | Already `all_reduce`s every step for lockstep (`engine_core.py:751-781`) and runs `dummy_execution` on idle ranks (`:748-749`). Carry `max(step_seconds)` on the collective that already runs. |
-| Prefill container | — | **1** | |
-| Decode container | — | **1** | |
+| DP group | N EngineCores | **1** | Already `all_reduce`s every step for lockstep (`engine_core.py:751-781`) and runs `dummy_execution` on idle ranks (`:748-749`). A step is one compound event priced by its per-layer critical path (below). |
+| API server | 1 process: uvicorn, `CoreManager` and its threads | **1** (frontend) | Its asyncio event loop is a clock owner of its own: it tokenizes and streams while the engine runs a forward, so it overlaps the step loop in simulated time and cannot be folded into it. Offline, the owner is the loop that calls `get_output`. |
+| PD container (prefill or decode) | one full ATOM deployment | **2** | its frontend LP and its engine LP |
 | Traffic source | — | **1** | |
+| Atomesh router, 1P1D | 1 Rust process | **0** | Part of the channels that cross it: with one P and one D it has no choice to make, so it contributes only a fixed per-request forward cost, declared in those channels' lookahead (D7). With several P or D its policy reads time-varying state and it becomes an LP; that case is deferred. |
 | PP stages | N EngineCores | **N** | The only group the collapse does not cover. |
 
 LP counts for the milestones:
 
 | Milestone | LPs |
 |---|---|
-| M1-M3 (single deployment, TP1/2/4) | **2** — traffic, engine |
-| M4 (two containers, PD disagg) | **3** — traffic, prefill, decode |
-| M5-M6 (Kimi-K3, TP8) | **3** |
-| M7 (PP) | +1 per stage |
+| M1-M3 (single deployment, TP1/2/4) | **3** — traffic, frontend, engine |
+| M4 (atomesh 1P1D, two containers) | **5** — traffic, frontend-P, engine-P, frontend-D, engine-D |
+| M5 (Kimi-K3, TP8, one deployment) | **3** |
+| M6 (Kimi-K3, TP8, PD disagg) | **5** |
+| M7 (PP) | the engine LP becomes one LP per stage |
 
-So a TP4 x DP2 deployment is **one** LP, not eight.
+So a TP4 x DP2 deployment is **one** engine LP, not eight.
+
+**The partition principle.** Where LP boundaries fall is a modelling choice: a finer
+partition is not more correct, it only adds grants and wrapped channels, and the speedup
+here comes from skipping idle time, not from parallelism. So: as few LPs as satisfy three
+constraints.
+
+1. **Zero-lookahead couplings stay inside one LP.** A per-step barrier or collective, a
+   synchronous RPC, or a read of the other side's live state lets one side's action at `t`
+   change the other at `t`; no positive lookahead exists. Split across LPs, the protocol
+   is still correct (deadlock recovery, below) but fully serial: attention-DP + EP with
+   one LP per rank would cost ~960 grants per step (60 layers x 2 collectives x 8 ranks),
+   ~48 ms of wall time at ~50 us each against a ~30 ms simulated step. Worse, the real
+   collectives would bypass the CA, where it cannot see them, and making them visible
+   would mean rewriting them as CA rendezvous, which D1 forbids.
+2. **One clock owner per LP** — a step loop, a PP stage loop, or an asyncio event loop.
+   Only the owner calls TAR/NER (below); every other thread is transport (receives into a
+   queue, or relays sends the owner registered) or a handler running on a message the
+   owner released. Activities that overlap in simulated time and each have a duration
+   are either events on the owner's timer list or separate LPs.
+3. **LPs interact only through timestamped channels.** A cross-process shared-memory or
+   collective interaction is out of model if it touches only replaced code or hardware
+   scheduling; otherwise it is a channel with lookahead > 0, or its two sides are one LP.
+   A startup assertion enforces the collective case: creating a process group whose ranks
+   map to more than one LP raises.
+
+**A DP group is one LP, and its step is a compound event** priced by the critical path of
+the per-layer synchronization graph: nodes are `(rank, layer, operator)` costed on that
+rank's own batch; edges are program order within a rank plus a cross-rank barrier at each
+collective (e.g. the MoE all-to-all). The ranks exchange batch descriptors (or per-layer
+cost vectors) on the collective that already runs, all compute the same path, and one
+rank talks to the CA. No operator-level TAR/NER. `max(step_seconds)` is right only when
+the step is the only synchronization; with per-layer barriers it underestimates. Rank 0
+at attention 3 / MoE 1 per layer and rank 1 at 1 / 3 give `max` 4 but a critical path of
+`max(3,1) + max(1,3)` = 6: 240 against 360 over 60 layers. Per-rank LPs are right only
+if the ranks decouple at step level (no per-step collective) and interact only with
+lookahead > 0.
 
 ### Options for the protocol
 
@@ -387,62 +457,170 @@ computes its own safe window from a distributed LBTS reduction plus a lookahead 
 
 #### State
 
-Per LP: `now[i]`, `next[i]` (earliest future event this LP knows of, or `+inf`),
-`status[i] in {running, granted, blocked-on-message}`. Plus a static lookahead matrix
-`L[j->i]`.
+The CA plays the part of an HLA RTI, and an LP's clock owner uses HLA's three time
+services:
+
+| LP call | PDES term | Meaning |
+|---|---|---|
+| `advance_to(T)` | TAR (time advance request) | the owner prices an event of duration `d` (a forward) and asks for `T = now + d`; the grant is exactly `T` |
+| `next_event(t)` | NER (next event request) | the owner is idle; `t` is its next local event, or `+inf`; the grant is `min(t, earliest undelivered arrival)` |
+| grant reply | TAG (time advance grant) | carries `G` and the `(channel, seq)` set it releases |
+
+**Guarantee: a grant to `T` means every message with timestamp `<= T` has been delivered
+to that LP.**
+
+Per LP *i*: `now[i]`; a state in `{running, TAR, NER}`; and the target it asked for (`T`
+or `t`). Per channel: every registered message as `seq -> arrival`, and which of them a
+grant has already released. Static: the channel table (lookahead sources, below), from
+which the CA computes once, by Floyd–Warshall, `D(j->i)` — the least total lookahead
+over any channel path from *j* to *i*.
 
 #### Grant rule
 
 ```
-T_grant(i) = min over all j != i of ( now[j] + L[j->i] )
-LP i advances to min( T_grant(i), next[i] )
+N[j] = now[j]                                        j running
+     = T_j                                           j waiting in TAR(T_j)
+     = min(t_j, earliest undelivered arrival into j) j waiting in NER(t_j)
+
+LBTS(i) = min over j != i of ( N[j] + D(j->i) )
+a waiting LP i is granted G = N[i]  only if  G < LBTS(i)      -- strictly
 ```
 
-**It is `now[j]`, not `next[j]`.** This matters and the naive version looks correct:
+Waiting LPs are tried in `(N, LP id)` order; a grant changes state, so the check restarts.
+PDES term: Ayani's distance-between-objects LBTS (Fujimoto, ch. 3). Each part matters:
 
-- With `now[j]`, no LP is ever granted past the globally-earliest LP's current time, so
-  no event that LP generates can land in anyone's past. Correct at **any** lookahead,
-  including zero.
-- With `next[j]`, LP A can be behind LP B (A had the minimum, B ran ahead earlier), and
-  an event A generates at `A.now + 0` lands in `[A.now, B.now)` — B's past.
+- **A running LP contributes `now[j]`, not its next event.** It can produce a message at
+  any moment from `now[j]` on. With `next[j]`, LP A can be behind LP B (A had the minimum,
+  B ran ahead earlier), and an event A generates at `A.now + 0` lands in `[A.now, B.now)`
+  — B's past.
+- **An LP waiting in TAR contributes its target.** Its owner is inside the CA call and
+  produces nothing (I1, below); messages released to it meanwhile are handled by receiver
+  and handler threads, which send nothing across LPs (I4). With `now[j]` instead, two LPs
+  in TAR whose targets cross would wait on each other for ever under the strict rule.
+- **Distance, not direct neighbours.** Frontend running at 9.0 feeds prefill (idle,
+  `t = inf`) with `L = 0.1`; prefill feeds decode with `L = 0.5`. Treating the idle
+  prefill as `inf` is unsafe — frontend's 9.0 request reaches decode through prefill at
+  9.6 — and using prefill's stale `now` stalls decode for nothing. By distance,
+  `LBTS(decode) = min(inf + 0.5, 9.0 + 0.6) = 9.6`: correct.
+- **Strict.** A message not yet reported to the CA has arrival `>= ` its sender's
+  `now + L`, so a strict grant never reaches it.
 
-At zero lookahead the rule degenerates to `T_grant(i) = min_j now[j]`, i.e. a single
-global event loop across processes: correct, serialized, no parallelism. **That is
-acceptable here, because the speedup comes from skipping idle, not from running LPs
-concurrently in wall time.**
+**Messages in transit are counted, not assumed away.** `min(now + L)` alone only
+guarantees that no *future* message is earlier. ATOM's sends are asynchronous (ZMQ PUSH,
+then a receiver thread), so when the CA sees a sender's clock move, an earlier message may
+still be in flight — the case Fujimoto notes the classic rule does not cover. The fix is
+the standard counting one (Fujimoto, Mattern):
+
+1. **Registered when produced, reported with the advance.** Only the clock owner registers
+   a send, at the moment it produces the message, with `arrival = now + L(ch)`. The
+   engine's output thread relays through a `RelayQueue` whose `put` registers on the step
+   loop, so a late physical send changes nothing; an item the output thread never sends
+   raises `UnsentRelayItem` rather than being covered by a null message. The send log
+   rides in the same request as the owner's next TAR/NER, so the CA knows every message
+   an LP produced before it moves that LP's clock.
+2. **The grant carries the expected `(channel, seq)` set**: every registered message into
+   *i* with `arrival <= G` not yet released. The receiver waits locally until each has
+   physically arrived; nothing is acknowledged back to the CA.
+3. **TSO delivery in `_step_through`.** The receive wrappers hold arrived frames back from
+   ATOM. Before returning from the CA call, the owner walks the released set in
+   `(arrival, channel, seq)` order: it sets `now = arrival`, releases one message, and
+   for a thread-received channel waits until the receiving thread is back at its wait
+   point before releasing the next. A handler thread (`_recv_prefill_done`) therefore runs
+   with the LP clock at the message's timestamp, with nothing else in the LP moving.
+   Inline channels are taken by the owner at its own receive point.
+
+Counting is exact: release and completion are per `(channel, seq)`, so a channel need not
+be FIFO and arrivals on one channel need not be monotone — concurrent HTTP requests do
+reorder through the router. The sequence number also asserts no duplicate.
+
+Not chosen: CMB null messages (a standing stream on every idle channel, and the time
+promise would have to travel on ATOM's own sockets); RTI message forwarding (ATOM's ZMQ
+traffic would route through the CA, against D1); per-message acknowledgement (Samadi:
+one extra message per message and a round trip before each grant).
+
+At zero lookahead the strict rule grants nothing once every LP waits, and deadlock
+recovery (below) grants one LP at a time: a single global event loop across processes —
+correct, serialized, no parallelism. That is why zero-lookahead couplings stay inside one
+LP (partition principle, above).
 
 #### Invariants
 
-- **Safety (asserted, always on):** an event LP *i* schedules on LP *j* must satisfy
-  `ts >= now[i] + L[i->j]`. A backdated event **aborts the run with a full LP state
-  dump**. It must not be a warning and must not be behind a flag.
-- **Deadlock:** all LPs blocked and none holding a finite `next` -> abort loudly with the
-  LP table. Never a quiet timeout. (The prior arrival barrier's 120 s timeout released
-  on a run that was invalid, the client printed "0 failed", and a day's conclusions came
-  off it.)
-- **Determinism:** ties at equal timestamps broken by LP id. Without this the
-  126-vs-189-decode-steps nondeterminism returns.
+- **Safety (asserted, always on):** every message registered into LP *j* must have
+  `arrival >= now[j]` at the CA; equality is that instant's next round (below). A
+  backdated message **aborts the run with a full LP state dump**. It must not be a
+  warning and must not be behind a flag.
+- **Deadlock: detected and recovered, never aborted.** When every LP waits at the CA and
+  the strict rule grants none — possible only with a zero-lookahead channel — the CA
+  grants the LP with the least `(N, LP id)`: no other LP's `N` is smaller, so nothing
+  earlier can reach it. PDES term: Chandy–Misra deadlock detection and recovery. A
+  message that then arrives at the receiver's current instant counts toward that
+  instant's next round, not as a violation: the CA asserts `>=`, and the LP sets
+  `now = max(now, arrival)`. A stall the CA cannot see can only be a fault; it waits and
+  prints one diagnostic after `DIAG_S` (D1's detector (2)). Never a quiet timeout that
+  releases. (The prior arrival barrier's 120 s timeout released on a run that was
+  invalid, the client printed "0 failed", and a day's conclusions came off it.)
+- **A run ends with its workload.** The traffic LP calls `end_workload` once it has sent
+  every request, received every response and taken its last metrics scrape; the CA then
+  grants every LP to `+inf`. "Every `N` is `+inf`" also ends a run but cannot be relied
+  on: periodic timers (metrics push, the scrape) keep `N` finite for ever.
+- **Determinism:** ties at equal timestamps broken by `(time, LP id, channel, seq)`.
+  Without this the 126-vs-189-decode-steps nondeterminism returns.
+
+The grant rule relies on four invariants inside each LP:
+
+- **I1** An LP's clock moves only inside its clock owner's CA call (TAR/NER).
+- **I2** In a CA call the owner holds no lock another thread of its LP needs; otherwise a
+  handler thread deadlocks. Checked: the six serving-path locks are each held only in a
+  short `with` block, none around a CA call site; an AST test asserts no TAR/NER call
+  sits lexically inside a `with ...lock` block.
+- **I3** One sending thread per channel (a ZMQ socket is not thread-safe either).
+- **I4** Receiver and handler threads produce no cross-LP message; only the clock owner
+  does, directly or by registering on a `RelayQueue`. Checked: the engine input thread,
+  the frontend output thread, `_recv_prefill_done` and `_recv_block_assignments` send
+  nothing inside the simulation window, and the simulated KV connector sends only from
+  scheduler-side hooks on the step loop (D6).
 
 #### Lookahead sources
 
 Every one is physical and configurable, which is also a project requirement
-(interconnect must be configurable and not read from a device):
+(interconnect must be configurable and not read from a device). Lookahead is declared
+**per channel**, not per LP pair: one pair of LPs can have several sockets between them,
+and one LP can span several processes. A channel is one real communication path from a
+sending endpoint to a receiving endpoint, named `src->dst:kind#inst`. Only channels the
+real deployment already has: the simulation adds none, and stamps ride in existing
+headers or fields. A component the simulation replaces reproduces the real component's
+channel — same endpoints, message and trigger. The table is the channel list: wrapping an
+undeclared channel name raises.
 
-| Link | Lookahead |
-|---|---|
-| traffic -> engine | modelled admission delay. Prior work measured 13.7 ms end-to-end, worth ~4 points of TTFT. Path-specific: 13 ms offline batch, 9 ms serving. |
-| prefill -> decode | Atomesh relay + simulated KV transfer. Millisecond scale. Comfortable. |
-| PP stage -> stage | modelled NCCL send/recv of intermediate tensors. Microsecond scale. The only tight one. |
+Receive mode: **thread** — a transport or handler thread receives, and the owner releases
+each message in `_step_through` and waits for it to be handled; **inline** — the owner
+receives it itself, at its own receive point.
 
-**Declaring a lookahead floor on every inter-LP link is a design commitment, not a
-constant to tune later.** Zero lookahead is correct under the grant rule above but
-serializes everything.
+| Channel | Sender | Receiver (mode) | Lookahead |
+|---|---|---|---|
+| `traffic->frontend:http` | Compass traffic source | event loop (inline) | modelled admission delay. Prior work measured 13.7 ms end-to-end, worth ~4 points of TTFT. Path-specific: 13 ms offline batch, 9 ms serving. M4 adds the router hop. |
+| `frontend->traffic:stream` | event loop, writing the SSE stream | traffic source (inline) | declared return delay |
+| `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py:826` | engine input thread, `poller.poll()` at `engine_core.py:544` (thread) | declared IPC delay |
+| `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py:838` | same (thread) | declared IPC delay |
+| `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py:579`) | frontend output thread, `poller.poll()` at `engine_core_mgr.py:576` (thread) | declared IPC delay |
+| `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | the router's per-request forward cost (D7) |
+| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py:2196`); Mooncake's write request, sent from the engine process rather than the worker | prefill step loop, drained in `process_completions` (`scheduler.py:3002-3004`) (inline) | declared request latency (D6) |
+| PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py:105/141/147` | the stage loop's own poll and receive (inline) | modelled NCCL send/recv of intermediate tensors. Microsecond scale. The only tight one. |
+
+In M4 the three frontend-engine channels exist once per deployment (`frontend-P`/`engine-P`
+and `frontend-D`/`engine-D`), and the two traffic channels connect to frontend-P
+(requests) and frontend-D (stream), both through the router. Mooncake's write-done
+message is not a channel: both ends compute its time (D6).
+
+**Declaring a lookahead floor on every channel is a design commitment, not a constant to
+tune later.** Zero lookahead is correct under the grant rule above but serializes
+everything.
 
 ### Sizing
 
 PP8, 27B, ~10 ms step, 300 s modelled run: ~30k steps x 8 stages ~= **240k grants**. At
 ~50 us per local IPC round trip, ~12 s of overhead against a 300 s real run — still
-~25x. For M1-M4 with 2-3 LPs the grant traffic is negligible.
+~25x. For M1-M4 with 3-5 LPs the grant traffic is negligible.
 
 **PP is therefore an efficiency concern, not a correctness concern.** It is also
 single-node only (every PP address is ZMQ IPC, `engine_core_mgr.py:327-329`), and ATOM
@@ -475,33 +653,43 @@ A DP group is **one** LP however many ranks it holds, because it already
 wide, because its workers are slaved by a blocking RPC (`async_proc.py:431`) and hold no
 clock. Adding GPUs to either does not create a time domain.
 
-Only three things create an LP:
+Every ATOM deployment is two LPs, one per clock owner: its API server's event loop (the
+frontend LP) and its engine's step loop (the engine LP), plus one traffic LP per run
+(D3). Beyond that, only three things create an LP:
 
-1. a **PD role boundary** — prefill fleet vs decode fleet
-2. a **PP stage**
+1. a **PD role boundary** — prefill fleet vs decode fleet, each its own deployment
+2. a **PP stage**, which replaces the engine LP with one LP per stage
 3. an **independent replica** behind the router. `.github/scripts/atomesh/pd_server_atom.sh`
    deploys *xP* prefill servers and *yD* decode servers, each an independent deployment
-   with its own `Scheduler`, none synchronizing with the others.
+   with its own `Scheduler`, none synchronizing with the others. With more than one
+   replica per role the router itself is an LP (deferred; in 1P1D it is transport).
 
 | Deployment | GPUs | LPs |
 |---|---|---|
-| M1-M3: TP4, one server | 4 | **2** |
-| M4: TP4 prefill + TP4 decode, two containers | 8 | **3** |
-| M5-M6: Kimi-K3 TP8, PD disagg | 16 | **3** |
-| M7: Kimi-K3 TP8 + PP4 | 32 | **6** |
-| 8 prefill + 8 decode replicas, each TP8 | 128 | **17** |
-| ... the same with PP4 | 512 | **65** |
+| M1-M3: TP4, one server | 4 | **3** |
+| M4: TP4 prefill + TP4 decode, two containers | 8 | **5** |
+| M5: Kimi-K3 TP8, one server | 8 | **3** |
+| M6: Kimi-K3 TP8, PD disagg | 16 | **5** |
+| M7: Kimi-K3 TP8 + PP4, one server | 32 | **6** |
+| 8 prefill + 8 decode replicas, each TP8 | 128 | **34** |
+| ... the same with PP4 | 512 | **82** |
+
+The last two rows are traffic + router + 16 deployments of 2 LPs (34), or of a frontend
+and 4 stages (82).
 
 ### Sizing against a measured workload
 
 The prior 27B cc-traces run executed 106 prefill + 4,346 decode steps over 267 s of
-modelled time — about **4,450 events per LP**.
+modelled time — about **4,450 events per LP**. A frontend LP is counted at the same rate:
+it takes one delivery per engine output step plus its requests' HTTP events, so it is
+about as busy as its engine. That is an assumption, not a measurement.
 
 | LPs | Grants per run | CA cost at 50 us (local IPC) | at 500 us (cross-node TCP) |
 |---|---|---|---|
 | 3 | 13k | 0.7 s | 7 s |
-| 17 | 76k | 4 s | 38 s |
-| 65 | 289k | 14 s | 145 s |
+| 5 | 22k | 1.1 s | 11 s |
+| 34 | 151k | 7.6 s | 76 s |
+| 82 | 365k | 18 s | 182 s |
 
 Against the **cost model on the same steps**: previously measured at **4.3 ms per step**
 with the bound allocation carried in the cache key (2.3 ms with a shape-only key, but
@@ -514,8 +702,10 @@ simulator's own pricing dominates by two orders of magnitude. Optimising the tim
 protocol before the cost model would be optimising the wrong thing.
 
 Throughput headroom: a Python ZMQ ROUTER sustains roughly 50-200k msg/s; the largest case
-above is ~10k/s. The CA's own work per grant is a `min` over at most 65 entries, and RTTs
-pipeline across LPs.
+above is ~19k/s (365k grants over the ~19 s the pricing takes). The CA's own work per
+state change is an LBTS for each waiting LP, each a `min` over the other LPs: O(LPs²),
+nothing at the milestones' 3-6 LPs but ~6.7k terms at 82, so measure it before the
+replica scale. RTTs pipeline across LPs.
 
 ### Options
 
@@ -640,13 +830,13 @@ runs.
 
 | Source | Deterministic? | What makes it so |
 |---|---|---|
-| **Grant order at the CA** when two LPs are eligible at the same virtual time | **not by default** — real arrival order decides | **Tie-break by LP identity, never by arrival order.** The CA holds a total order over LP ids and grants in it. This is the single most important rule here, and it costs one comparison. |
+| **Grant order at the CA** when two LPs are eligible at the same virtual time | **not by default** — real arrival order decides | **Tie-break by LP identity, never by arrival order.** The CA holds a total order over LP ids and grants in it; messages released at one instant go in `(channel, seq)` order. This is the single most important rule here, and it costs one comparison. |
 | **Cost model output** | yes, if the backend is pure | no iteration over a `dict` or `set` whose order depends on insertion or on object identity; a fixed summation order over IR nodes, since float addition is not associative |
 | **Speculative acceptance draw** | already handled | `14` D83: one host draw seeded from the step counter, not `world_size` draws that must agree |
 | **`dict` iteration** over request or block ids | **yes** | insertion-ordered since Python 3.7, and insertion order is the schedule's order, which is itself deterministic |
 | **`set` iteration** | **NO — and this is the trap** | see below |
-| **Thread scheduling inside an LP** | irrelevant | by D4, waits inside one LP are invisible to modelled time |
-| **Deliberately-real clock reads** (metrics push cadence, transport) | irrelevant | `11` D72 — they affect when a scrape lands, not what it says |
+| **Thread scheduling inside an LP** | irrelevant **only under D3's delivery rules** | without in-transit counting and TSO delivery (D3 grant rule), a race inside the LP decides which drain sees a message and at what logical time a handler thread runs; with them, a handler runs only on a released message, at its timestamp, while the owner waits |
+| **Deliberately-real clock reads** (transport; bounds the CA cannot reach) | irrelevant | they never enter the virtual schedule. Metrics are not in this row: `11` D72 runs all three metric clocks on virtual time, so a scrape is an ordinary event in the schedule |
 
 ### `set` is the trap, and it is worse than "unordered"
 
@@ -675,7 +865,8 @@ rule in the same check rather than a convention anyone has to remember.
 
 ### The rule, and the test
 
-**Rule:** the CA's grant order is a total order over LP identity; the cost backend is a
+**Rule:** the CA's grant order is a total order over LP identity, and ties at one instant
+fall to `(time, LP id, channel, seq)`; the cost backend is a
 pure function of its `batch_view`; and no simulated-path code iterates a `set` or any
 container whose order depends on object identity.
 
@@ -716,11 +907,15 @@ only place where the ordering is authoritative. It is what makes a causality rep
 actionable: when the straggler check (D3.2) fails, the log already contains both LPs'
 histories up to the violation.
 
-**2. The deadlock dump.** When no LP can be granted, the CA dumps, for every LP: its
-current virtual time, its declared state (`running` / `blocked`), what it declared itself
-blocked on, and the lookahead row that produced its grant bound. A deadlock is the *loud*
-failure D4 deliberately engineered for — this is what makes it diagnosable rather than
-merely noisy.
+**2. The stall diagnostic.** A stall the CA can see — every LP waiting at the CA, none
+grantable under the strict rule — is not a failure: it takes D3's recovery branch and
+appears in the timeline as an ordinary grant. A stall the CA cannot see can only be a
+fault. The run keeps waiting, and after `DIAG_S` = 30 wall seconds without progress the
+CA prints once, for every LP: its virtual time, its state (`running` / `TAR` / `NER`)
+and target, the registered messages not yet delivered to it, and the `N[j] + D(j->i)`
+term that bounds its grant. An LP stuck delivering a message prints its channel, its
+sequence number and every thread's stack. Neither aborts. This is what makes a hang
+diagnosable rather than merely silent.
 
 **3. The run summary**, written once at the end and carried in the run artifact:
 
@@ -729,7 +924,7 @@ merely noisy.
 | grants issued, per LP | the protocol's own cost; the number that says whether PP degree is affordable |
 | wall seconds vs simulated seconds | the speed result (`08`), and the only place the ≥5x target is measured |
 | lazy traces: count and wall seconds | `02` — they consume real time inside a simulated run and must not silently degrade the speed result |
-| causality detector state | straggler count (must be 0), watchdog warnings, clock-lint status |
+| causality detector state | straggler count (must be 0), stall diagnostics printed, clock-lint status |
 | refusals: count, fraction of steps, **fraction of predicted seconds**, distinct reasons | `08` D50.1's admissibility gate reads this |
 
 ### Two rules
