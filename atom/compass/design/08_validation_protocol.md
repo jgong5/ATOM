@@ -64,7 +64,7 @@ saying those three need the driver is stale.
 | `test_block_manager.py`, `test_block_pool.py` | CPU | the block accounting D13 relies on running unmodified |
 | `test_prefix_cache_accuracy.py` | **neither** | nothing. It holds **no test function at all** — it is an `argparse` script that drives a live server on `localhost:8000`, and `pytest` reports `no tests ran` for it in both containers. The prefix-cache behaviour doc `03` declares correct-by-construction is not covered by this file. |
 | `test_prefill_prefix_vs_native.py` | **GPU only** | the prefix-cache behaviour doc `03` declares correct-by-construction. It module-skips on the CPU tier ("needs a real GPU") and gives 4 passed in the GPU container (`xiaobizh_n18`, one card, at `cb684287f`), so the prefix-cache row is GPU-tier evidence and nothing else. |
-| `test_scheduled_batch_marshal.py` | CPU | the IPC payloads the clock protocol annotates around |
+| `test_scheduled_batch_marshal.py` | CPU | the IPC payloads the channel wrappers timestamp (`01` D4, K4/K5) |
 | `test_block_table_marshal.py` | **GPU only** | the block-table half of those same payloads — excluded at collection time, so the CPU tier does not see it |
 | `test_kv_connector_scheduler.py` | **neither** | the connector factory doc `01` D6 registers a simulated connector into — except that it runs nothing in either tier: `1 skipped`, because ATOM #690 split `kv_transfer_engine` into `moriio` and the test's imports were never updated. |
 | `test_disagg_modes.py`, `test_disagg_types.py` | CPU | the PD paths of M4/M6 |
@@ -84,8 +84,9 @@ as coverage Compass keeps, and are not. Raised with ATOM's owners as **T80** in 
 
 **What it proves, and it is exactly the claim Compass's central design choice rests on:**
 that the scheduler, block manager and admission logic still behave identically after
-Compass's changes. Every one of doc `01` D4's edits — clock-read substitution, blocked/
-running annotation, disabled failure detectors — lands in code these tests cover. A
+Compass's changes. Every one of doc `01` D4's edits — clock reads on the LP clock (K2), idle points as
+`next_event` (K3), timestamped sends and counted receives (K4, K5), timers on the LP clock
+(K7) — lands in code these tests cover. A
 simulated run "makes the same scheduling decisions as a real one" is not a hope if the CPU
 tier passes unchanged and the GPU superset's delta is zero; it is the definition of what the
 suite checks.
