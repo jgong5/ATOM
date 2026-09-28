@@ -221,14 +221,20 @@ wrong, and each maps to one detector.
 **(1) Straggler check — receive side, always on, one comparison.** Every cross-LP
 message passes through the channel wrappers (decision item 3). Each frame carries its
 channel, its sequence number and its arrival time `a = t_send + L(ch)`, stamped when the
-clock owner produced it. On receipt, for a message not yet released, the wrapper asserts
-`a >= ` the receiver's last drain time — the LP time up to which it has already released
-messages to ATOM. A violation means the receiver has already delivered past the moment
-this message arrives, i.e. the local-causality constraint is broken. (Comparing the
+clock owner produced it. A straggler is a buffered message that no grant has released
+(its `(channel, seq)` is in no grant's released set) and whose `a` is below the
+receiver's last drain time — the LP time up to which it has already released messages
+to ATOM. The wrapper checks this on receipt and again at each drain, over every message
+still buffered: a frame read before the receiver passed `a`, and never released because
+its send was never registered, would otherwise wait in the buffer for ever with no
+straggler and no diagnostic. A message a grant *did* release may arrive with `a` below
+the grant time; that is normal TSO delivery (D3) and does not fire the check. A
+violation means the receiver has already delivered past the moment this message
+arrives, i.e. the local-causality constraint is broken. (Comparing the
 *send* time with the receiver's *current* clock, as this check first did, is wrong:
 with lookahead `L > 0` a receiver is legitimately granted up to `t_send + L` before the
 message reaches it, so that form fails correct runs.) The check costs one float
-comparison per message and is the direct test of the property the whole protocol exists
+comparison per buffered message per check and is the direct test of the property the whole protocol exists
 to provide. On failure: record `(channel, seq, a, drain time, declared lookahead)` and
 **fail the run** — not a warning, because a straggler invalidates every number
 downstream of it.
@@ -1551,7 +1557,10 @@ Ordered by how much they could cost.
 
 1. **Silent failure is the dominant risk mode.** Every failure in D3-D5 produces a
    plausible latency table rather than an exception. The mitigations — always-on
-   assertions, loud deadlock abort, the AST test — are the design, not decoration. This
+   assertions, a stall the CA can see resolved by Chandy–Misra deadlock detection and
+   recovery, one the CA cannot see named by a `DIAG_S` diagnostic while the run keeps
+   waiting (never an abort), a run that ends only with `end_workload` (D3), the AST
+   test — are the design, not decoration. This
    project's history contains at least four instances of a plausible artifact from a
    broken run being read as a result for a day or more.
 2. **Simulation speed is unmeasured under this architecture.** The prior design was
