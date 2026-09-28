@@ -132,9 +132,10 @@ Consequences:
    drift by more than one step.
 3. **It is a category-A or category-B wait** in `01` D4's taxonomy, and which one depends
    on where the LP boundary falls. Since the DP group is one LP, the collective is
-   **internal to an LP** — so by `01` D4's own rule it is **ignored**: its duration is not
-   observable in the simulated result as a cross-LP wait. What *is* charged is its cost,
-   as a priced collective (Q3 below).
+   **internal to an LP**: it is not a cross-LP wait the CA sees. It is not ignored either
+   (revised 2026-09-28, #443): it is part of the step's cost (`01` D4, K1: an event
+   cost), both as a priced collective (Q3 below) and as a barrier in the step's critical
+   path (below).
 
 ### Q1, Q3, Q4
 
@@ -154,9 +155,20 @@ rounding correction here — it is the definition of the step, and it is what th
 
 Two things follow:
 
-- **The LP's step duration is `max` over DP ranks, and it must be computed, not
-  approximated by rank 0.** Rank-0 single-sourcing is a TP result and does not transfer to
-  DP.
+- **The LP's step is a compound event priced by the per-layer critical path over DP
+  ranks, and it must be computed, not approximated by rank 0** (revised 2026-09-28,
+  #443). Rank-0 single-sourcing is a TP result and does not transfer to DP. The graph's
+  nodes are (rank, layer, operator), each timed from that rank's own batch; its edges are
+  the order within a rank plus a cross-rank barrier at every collective, such as the MoE
+  all-to-all under attention-DP + EP. `max` over whole-rank step times is the special
+  case where the only cross-rank sync is per step; with per-layer barriers it
+  underestimates. Rank 0 at 3 attention + 1 MoE per layer and rank 1 at 1 + 3 give a
+  `max` of 4 per layer but a critical path of max(3,1) + max(1,3) = 6: over 60 layers,
+  240 against 360. The ranks exchange their batch descriptions on a collective the step
+  already runs and compute the same path; only one talks to the CA. The cost model
+  therefore owes per-rank, per-layer durations. Per-rank LPs, still granted per step,
+  are only for ranks that decouple at step level (no per-step collective) and interact
+  only with lookahead > 0; a finer, operator-level grant is not used.
 - **Idle DP ranks still cost a step.** `EngineCore._execute_dummy_batch` runs
   `dummy_execution` on ranks with nothing to do (`engine_core.py:748-749`), so a rank with
   no work is not free and must be priced as the dummy shape rather than as zero.
@@ -199,7 +211,21 @@ ATOM's PP transport (`atom/distributed/pp_comm.py`):
 | `commit_pp_send_work` (`:159-162`) | blocks until in-flight `isend`s complete |
 | `pp_send_allgather_group` (`:28-38`) | TP group for PP send-allgather, `None` if disabled or tp=1 |
 
-`flush_pp_send` is already in the RPC surface a replacement runner must answer (`02` D10).
+**The send is asynchronous, so its transfer time surfaces in two waits** (revised
+2026-09-28, #443). The runner records the completion time of a stage's last send,
+`pending_send_done` = the end of the forward that issued it + its transfer time (below).
+
+- Before issuing a send, ATOM waits for the previous one (`commit_pp_send_work`, called
+  from `model_runner.py::ModelRunner.run_model`). The simulated forward's predicted
+  duration reproduces that wait: `max(compute done, pending_send_done) - start`.
+- An idle stage loop calls `flush_pp_send` — the head stage when it launched nothing this
+  round (`pp_engine_core.py:125`), a downstream stage when it received nothing (`:362`).
+  The call blocks until the pending send completes and so delays the loop's next round:
+  a real wait, not one to ignore (`01` D4, K1: an event cost). The simulated runner
+  answers `max(0, pending_send_done - now)` (`02` D10) and the call site advances the
+  stage's clock by it. The shutdown calls (`:81`, `:395`) are outside the simulated
+  window, and `commit_pp_send_work`'s own `wait()` is inside the replaced runner and
+  never runs.
 
 **The payload is `hidden_states` + `residual` — real tensors that a simulated run never
 materialises.** So PP transfer is treated exactly like KV transfer (`01` D6): a **size
@@ -544,7 +570,7 @@ The split, because "parallelism support" is otherwise read as one late lump:
 | | **M1 — plumbing, with fake models** | **M7 — accuracy, with real ones** |
 |---|---|---|
 | **TP** | LP collapse; width as an artifact key | priced collectives per width; T21 |
-| **DP** | both collectives run for real; `max`-over-ranks step duration; dummy-batch pricing for idle ranks | the collectives' own cost |
+| **DP** | both collectives run for real; step priced by the per-layer critical path over ranks; dummy-batch pricing for idle ranks | the collectives' own cost |
 | **PP** | **one LP per stage**; transfer as a size from the spec; layer split via `get_pp_indices`; memory keyed by PP degree | bubble fidelity; microbatching if it exists (T64) |
 | **EP** | group membership established — it is `dp × pcp × tp` within one PP stage, built in aiter (D92); `exclusive` occupancy honoured in the IR | MORI all-to-all priced via declared nodes |
 
@@ -576,7 +602,7 @@ and `test_forward_mode.py` already cover the pieces on the CPU-only path (`08` D
 - **PP degree is a new key on the memory readings table** (`05` D25), and nothing has
   measured whether the Class-C constants move with it. One startup per PP degree settles
   it; recorded as **T66**.
-- **The DP `max`-over-ranks rule is unmeasured.** `01`'s 0.06% figure is a TP result. What
+- **The DP critical-path rule is unmeasured.** `01`'s 0.06% figure is a TP result. What
   the spread across DP ranks actually is — and therefore how much the padding to
   `unified_bs` costs — has not been measured. **T67**.
 - Nothing here covers **PCP / DCP** (`pcp_size`, `dcp_world_size`), which appear in the
@@ -591,8 +617,8 @@ and `test_forward_mode.py` already cover the pieces on the CPU-only path (`08` D
 |---|---|---|
 | D88 | One frame of four questions per strategy — LPs and lookahead, scheduling coupling, cost, memory. **Only PP adds logical processes**; TP, DP and EP each sit behind an existing barrier. | 2026-09-19 |
 | D89 | TP is the settled instance and supplies the per-width discipline: width is a key, not a parameter. | 2026-09-19 |
-| D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP. Step duration is `max` over ranks, computed not rank-0-sourced, and idle ranks cost a dummy batch. | 2026-09-19 |
-| D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. | 2026-09-19 |
+| D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP. Step duration is `max` over ranks, computed not rank-0-sourced, and idle ranks cost a dummy batch. Revised: the step is a compound event priced by the per-layer critical path over ranks (`max` is its step-sync-only special case). | 2026-09-19, revised 2026-09-28 |
+| D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. Revised: the send wait inside forward and the idle `flush_pp_send` are event costs, the runner answering the remaining transfer time. | 2026-09-19, revised 2026-09-28 |
 | D92 | EP adds no LPs (inherits the TP group) but its all-to-all is invisible and must be a declared node, and its `exclusive` occupancy forbids placing it in a `Par`. Expert sharding is Class A, remainder included. | 2026-09-19 |
 | D93 | LP count = PD roles × PP stages (+2), independent of GPU count. The clock protocol's cost tracks PP degree, not width. | 2026-09-19 |
 | D94 | Parallelism splits across milestones: LP structure, couplings and memory shape at **M1**; cost accuracy at **M7**. M1's test is scheduling-decision agreement at TP2/DP2/PP2/EP2, which needs no cost model. | 2026-09-19 |
