@@ -75,7 +75,7 @@ ATOM's real code owns still never touch a device.
 | **Device memory readings** | **SUBSTITUTED** | Five readings come from the machine spec instead of the runtime, so an MI308X host can model an MI355X. The budget *arithmetic* around them is ATOM's. `03` D14, `05` |
 | **Wall-clock time** | **SUBSTITUTED** | Every clock read and timer the Clock Authority can reach runs on virtual time, failure detectors and metrics cadence included. Only the Atomesh router's compiled bounds and health check, and OS-level process-death detection, stay real. `01` D5, `11` D72 |
 | **Collectives / comms** | **SIMULATED** (cost only) | Priced from measurements or the spec; no collective actually runs on a device. `07` D40 |
-| **Atomesh router** | **REUSED, untouched** | Zero changes. The simulated timeline rides `kv_transfer_params`, which the router already relays verbatim. `06` D30 |
+| **Atomesh router** | **REUSED, untouched** | Zero changes. The simulated timeline rides carriers the router already relays: the `compass` entry of the `tracestate` header on requests, a field in `kv_transfer_params` on the prefill-to-decode forward, and SSE comment lines on streamed output. `01` D7, `06` D30 |
 | **Serving *decisions*** | **NOT MODELLED** | Compass predicts the time decisions consume, not the decisions themselves — because it reuses the code that makes them. *(A simple serving simulation is planned as a future part of Compass; explicitly out of scope for this work.)* |
 
 **The rule underneath the table:** anything that is *arithmetic* is reused; anything that is
