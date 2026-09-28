@@ -1073,6 +1073,10 @@ The ABC is small and has **no `send_kv` / `recv_kv` verb** to fake
 - scheduler: `get_num_new_matched_tokens` (`:83`), `build_connector_meta` (`:92`),
   `update_state_after_alloc` (`:97`), `request_finished` (`:102`)
 
+A fifth scheduler-side hook is not on the ABC: `process_completions`, which the scheduler
+calls on each completion report when the connector defines it (`scheduler.py:3002-3004`).
+The offload and `multi` connectors define it; Mooncake and MoRI-IO do not.
+
 ### The seam
 
 Every connector's completion reaches the scheduler through **one** method:
@@ -1087,23 +1091,58 @@ That single funnel covers any backend, which is why a simulated connector is che
 
 ### Design
 
-A `SimulatedKVConnector` registered through the existing factory:
+A `SimulatedKVConnector` is registered through the existing factory. It reproduces
+**Mooncake**, the backend ATOM's PD CI deploys
+(`.github/scripts/atomesh/pd_server_atom.sh:560`, `:612`), and
+implements **scheduler-side hooks only**: sends and receives both run on the engine's
+step loop, and no worker takes part.
 
-- `get_finished()` releases a request when the **virtual** clock passes
-  `issue_time + latency + bytes / bandwidth`.
-- `bytes` is exactly computable from block count x per-block bytes — no measurement
-  needed.
-- `latency` and `bandwidth` are configuration, satisfying the "interconnect is
-  configurable" requirement directly.
+- `T = latency + bytes / bandwidth`. `bytes` is exactly computable from block count x
+  per-block bytes — no measurement needed. `latency` and `bandwidth` are
+  configuration, satisfying the "interconnect is configurable" requirement directly.
+- **Decode** posts the write request in `update_state_after_alloc`
+  (`scheduler.py:2196`): channel `engine-D->engine-P:kv_write_req`, sent at `t`,
+  arriving at `a = t + request latency`. It computes its own ready time
+  `a + T + notify latency` and, once the clock reaches it, reports the request in
+  `finished_recving` from `process_completions`. A local event of engine-D.
+- **Prefill** records the data-ready time `r` in `request_finished`
+  (`scheduler.py:2708`, `:2768`) and takes the write request in `process_completions`,
+  which the step loop receives inline. At `max(a, r) + T` it reports
+  `finished_sending`, and the scheduler frees the blocks it parked in
+  `deferred_free_blocks` (`:2772-2774`, freed at `:3038-3046`). A local event of
+  engine-P. Scheduler code is unchanged.
+- **Write-done is not a message.** Real Mooncake sends `MSG_WRITE_DONE` when the write
+  ends (`mooncake_connector.py:1313`). Both ends compute that time instead, for two
+  reasons: the router forwards strictly in sequence (D2), so the decode request, and
+  with it the write request, exists only after prefill has returned, i.e. `r <= a`,
+  which prefill asserts and refuses otherwise; and `T` depends only on this request's
+  bytes and the configuration, not on other writes in flight. No channel is added; one
+  message whose time both ends already know is not simulated.
+- **Why this is the real channel.** A simulated component keeps the real one's
+  channel: endpoints, message and trigger. The write request is Mooncake's
+  `MSG_WRITE_REQUEST`, decode to prefill, triggered by decode's block allocation. The
+  real one leaves a decode worker (`mooncake_connector.py:1048`) for a prefill worker's
+  listener thread (`:1139`); the simulated one leaves and reaches the engine process of
+  the same two LPs, so the LP-level channel is the same and no worker ever sends or
+  receives across LPs. A prefill-side local timer would not do: when decode posts
+  depends on its own admission, which prefill cannot know, and assuming "at once"
+  frees prefill's blocks early exactly when decode is congested.
+- **Ceiling.** Pricing bandwidth contention between concurrent writes would make `T`
+  depend on prefill's other writes, which decode cannot see. That model needs the
+  write-done message back, plus protocol support for a thread that handles a write
+  request sending a message; in this protocol only an LP's clock owner registers a
+  send (D3).
 - It must still emit the `kv_transfer_params` blob that Atomesh relays, so
   `AtomAdapter` works unmodified. The router hard-errors if it is absent
-  (`http_pd_router.rs:1073-1078`). The two backends emit **different shapes** —
-  thirteen fields and seventeen — so the connector it stands in for decides which;
-  see *The blob, per backend* below.
+  (`http_pd_router.rs:1067-1078`). The two backends emit **different shapes** —
+  thirteen fields and seventeen — and Mooncake's is the seventeen; see *The blob, per
+  backend* below.
 - The consumer side must still return `(len(prompt), True)` from
   `get_num_new_matched_tokens` when `do_remote_prefill` is set, i.e. park the request
-  (`moriio_connector.py:904-917`), so `Scheduler._park_for_remote_load`
+  (`mooncake_connector.py:320-328`), so `Scheduler._park_for_remote_load`
   (`scheduler.py:2207-2212`) and the `WAITING_FOR_REMOTE_KVS` state behave identically.
+  It also clears the flag in `update_state_after_alloc`, as Mooncake does (`:383`), so
+  every call that posts a write request is followed by that park.
 
 ### The blob, per backend
 
@@ -1118,7 +1157,8 @@ list of that one dict literal, walked out of the AST at `92f1fdafe`.
 
 The push shape is the pull shape plus four: `remote_swa_block_ids`, `remote_pp_size`,
 `hash_block_size`, `local_slot_index`. They are a second backend's blob, not optional
-fields of one, and a simulated connector standing in for `moriio` emits the thirteen.
+fields of one, and the simulated connector, standing in for `mooncake`, emits the
+seventeen.
 
 One of the four is load-bearing rather than descriptive. The push consumer compares
 the producer's `hash_block_size` against its own and falls back to a full transfer —
@@ -1135,6 +1175,8 @@ way its twelve-field predecessor did.
 - Removes RDMA, drivers and the handshake entirely.
 - Makes interconnect a first-class configured parameter, which a real RDMA run could not.
 - Deletes three busy-waits and two long blocking timeouts (D5).
+- Every cross-LP send and receive stays on the engine's step loop, so no LP state has
+  to be shared with a worker process.
 - The parked-duration gauge `_num_parked_remote_kv` (`scheduler.py:2216`, logged at
   `:1648-1656`) is already almost the instrumentation needed to validate it.
 
@@ -1143,13 +1185,11 @@ way its twelve-field predecessor did.
 - The transfer model is now **unvalidated** — a real RDMA baseline is needed at least
   once to fit `latency` and `bandwidth`, or the numbers are declared rather than
   measured. This is a calibration task, not a simulator task, but it must be named.
-- MoRI-IO's `_pop_done_transfers` (`moriio_connector.py:818-837`) polls only
-  `status_list[-1].Succeeded()` — the *last* status in the list. If the simulated
-  connector is ever compared against the real one, this is a semantic difference to
-  watch.
 - Mooncake requires **all** `(pp_rank, tp_rank)` pairs to report before a request
-  completes (`mooncake_connector.py:1763-1832`); MoRI-IO does not. The simulated
-  connector must pick one and declare it.
+  completes (`mooncake_connector.py:1761-1832`). The simulated write is one event per
+  request, priced on the whole block table, so ranks with unequal shares are not
+  modelled. Under PP, Mooncake adds a decode-to-prefill `MSG_RELEASE` channel
+  (`:1759`) that this section does not cover.
 
 ---
 
@@ -1168,6 +1208,27 @@ The ATOM relay is strictly sequential and blocking (D2). Atomesh therefore contr
 exactly two things to a request: a **routing decision**, and **two HTTP round trips of
 overhead**. It never overlaps prefill and decode.
 
+M4 is **1P1D**: one prefill and one decode instance, the only layout ATOM's single-node
+PD launch supports (`.github/scripts/atomesh/pd_server_atom.sh:271`). The routing
+decision then has nothing to choose between, so no load count, random draw or clock
+read reaches its result, and the router is **one segment of a channel**, not an LP. Each
+of the three channels through it has a real LP at both ends:
+
+| Channel | Registered by |
+|---|---|
+| `traffic->frontend-P:http` | traffic, when it posts |
+| `frontend-P->frontend-D:relay` (prefill's JSON out, the decode request in) | frontend-P, when it writes prefill's JSON |
+| `frontend-D->traffic:stream` | frontend-D, per streamed event |
+
+The router's per-request overhead is part of these channels' lookahead. The wall time
+it really takes only lengthens a message's time in flight, which the `(channel, seq)`
+counting covers (D3, D8). FIFO is not required: concurrent requests through the router's
+tokio tasks can arrive out of order, and messages are released by `(channel, seq)`.
+
+This holds only while the router sees one worker per role. A `--dp-aware` launch, which
+CI uses with DP attention (`pd_server_atom.sh:649-655`), registers every DP rank as a
+separate worker, and the policy then chooses among them; that is the xPyD case below.
+
 So its only time-dependent behaviours are **failure detectors**, which by the D5 rule
 get disabled — not virtualized.
 
@@ -1182,9 +1243,29 @@ get disabled — not virtualized.
 3. **Model the relay overhead as a declared per-request delay**, exactly as the prior
    work modelled admission (13.7 ms measured; worth ~4 points of TTFT; applied as a
    delay on the request, *not* as time the engine consumes — advancing a global clock
-   per admission double-counts concurrent arrivals).
+   per admission double-counts concurrent arrivals). The delay is the lookahead of the
+   three channels above.
 4. Atomesh's routing **decision** is business logic and is reused unchanged. Only its
    latency is modelled.
+5. **Timestamps ride carriers the router already forwards**, so the router is not
+   changed. Verified against `http_pd_router.rs` and `openai-protocol 1.0.0`, the crate
+   it pins:
+
+   | Channel | What the router does | Carrier |
+   |---|---|---|
+   | `traffic->frontend-P:http` | Parses the body into a typed request and re-serializes it. `CompletionRequest` keeps unknown fields (`#[serde(flatten)]`, `completion.rs:146`); `ChatCompletionRequest` has no such field (`chat.rs:151`), so **an unknown top-level chat field is dropped**. Request headers are forwarded by allow-list, `tracestate` included (`header_utils.rs:51-63`), to decode as well. | The `compass` entry of the W3C `tracestate` header, e.g. `tracestate: compass=a:12.345;s:17`, appended after any existing entry so real tracing is unaffected. The same for chat and completion. |
+   | `frontend-P->frontend-D:relay` | Takes `kv_transfer_params` from prefill's JSON, lets the ATOM adapter insert fields, and writes it into the decode body (`http_pd_router.rs:1067-1114`). | A field inside `kv_transfer_params`. frontend-D also receives the original `tracestate`, so a request carrying `kv_transfer_params` takes its stamp from there (relay channel), any other from `tracestate` (traffic channel). |
+   | `frontend-D->traffic:stream` | Passes the ATOM stream through byte for byte: `create_streaming_response` (`http_pd_router.rs:1587`) rewrites only with `return_logprob` and prefill logprobs, and the ATOM path has neither. | An SSE comment line before each event, e.g. `: compass a=12.345 s=18`. SSE clients ignore lines starting with a colon. |
+
+   A single deployment (M1-M3, no router) uses the same carriers.
+
+**xPyD is deferred.** With several instances per role, or `--dp-aware`, the policies
+this router ships read state that changes over time — `power_of_two` and `cache_aware`
+compare `load()`, which moves as requests start and finish; `random` draws from an
+unseeded generator; `dp_sticky` reads `Instant::now()` (`atom/mesh/src/policies/`). A
+component whose time-varying state decides its output is an LP, so the router would have
+to become one, instrumented in its own process with the policy code untouched. That
+design is not done here; M4 stays 1P1D.
 
 ### An unused hook worth knowing about
 
@@ -1239,8 +1320,8 @@ take2 solved it with an **arrival barrier**: the engine runs nothing until
 ### Design
 
 With a CA, the traffic source is simply **an LP that publishes one thing: "no arrival
-before time T."** The engine LP can never be granted past `T + L[traffic->engine]`, so
-it cannot miss an arrival.
+before time T."** No LP it feeds can be granted past `T` plus its lookahead distance
+from traffic (D3), so none can miss an arrival.
 
 This is the same mechanism every other LP uses. Consequences:
 
@@ -1257,14 +1338,19 @@ A POST travels uvicorn -> `LLMEngine.preprocess` -> ZMQ -> EngineCore input thre
 `scheduler.waiting`. The traffic LP must not publish a bound past an arrival that has not
 landed in `waiting`.
 
-- **Closed / pre-declared workload** (the cc-traces case): post everything up front, then
-  publish bounds. Trivially correct. take2 already has both halves —
-  `CompletionRequest.compass_arrival` as an offset into the run
-  (`protocol.py`, `llm_engine._stamp_arrival`) and `Scheduler._declared_arrival_pending`
-  putting a not-yet-arrived sequence back on the waiting queue rather than routing it
-  through `_unschedulable_reason`, which would finish it.
-- **Open-ended:** publish the bound only after an enqueue acknowledgement. One extra hop,
-  well-defined, build it when needed.
+This is not special to arrivals: it is the general **transient message**, sent but not
+yet received, and the send/receive counting of D3 already covers it (PDES term:
+Fujimoto/Mattern message counting under an HLA time-advance grant). The traffic LP
+registers each POST as a `(channel, seq)` with its arrival time, reported with its next
+advance request; a grant past that time carries the `(channel, seq)` set it releases,
+and the receiver does not return from the grant until each has arrived. The frontend's
+send to the engine is counted the same way, and a frame is held at the receive wrapper
+until its grant, so ATOM never sees a request before its arrival time. There is no
+enqueue acknowledgement, and **closed and open-ended workloads are handled alike**.
+
+The arrival time rides the `compass` entry of the `tracestate` request header (D7). take2
+put it in a body field, `CompletionRequest.compass_arrival`, which the router drops from a
+chat request because the typed chat request keeps no unknown top-level field.
 
 ### What the corpus cannot supply
 
