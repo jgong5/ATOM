@@ -229,7 +229,7 @@ M-f `14`; M-g `01` D3.5.
 
 | # | Item | Topic |
 |---|---|---|
-| **T47** | A lookahead that is wrong but never exercised by the workload is not detected by the straggler check | `01` |
+| **T47** | A wrong lookahead is a calibration error no causality detector sees; only validation against real runs (`08`) or a declared-vs-measured channel-delay check catches it | `01` |
 | **T49** | The prefix-index *lookup* cost is charged to nobody — ~1,387 blocks hashed and probed per request at the cc-traces p50, magnitude unmeasured | `03` |
 | **T50** | Whether runtime memory constants transfer across dies (the working assumption says yes within a software generation) | `03`, `05` |
 | **T53** | Whether tokenizer throughput transfers across CPU classes (the working assumption says yes, adjusted by derate) | `05` |

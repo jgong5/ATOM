@@ -196,12 +196,12 @@ enough that none of them is a mode anyone can forget to enable.
 strictly below `LBTS(i) = min over j≠i of (N[j] + D(j→i))`, with in-transit messages
 counted) is conservative by construction: given correct inputs it *cannot* produce a
 violation, which is the standard Chandy–Misra–Bryant guarantee and is not in question
-here. What the detectors watch for is the inputs being wrong — a lookahead constant
-declared too large, a channel nobody wrapped, a clock read nobody substituted. Those are
+here. What the detectors watch for is the inputs being wrong — a send nobody
+registered, a channel nobody wrapped, a clock read nobody substituted. Those are
 bugs in *our* code and configuration.
 
 This distinction is worth stating plainly because the two cases warrant opposite
-responses. If a detector fires, the fix is local: correct the constant, wrap the
+responses. If a detector fires, the fix is local: register the send, wrap the
 channel, substitute the clock read. **If one fired and none of those explained it, the
 mechanism itself would be in question** — and that would be a much larger problem than a
 detector, because it would mean the conservative rule is not conservative on this
@@ -209,12 +209,13 @@ topology. Nothing observed so far suggests that, and the grant rule is standard 
 than invented here. But the detectors are also the only thing that would *tell us*, which
 is a second reason to have them.
 
-**Where violations actually come from.** There are exactly three ways the inputs go
-wrong, and each maps to one detector.
+**Where violations actually come from.** Each way the inputs go wrong maps to a detector.
 
 | Failure | What it looks like | Detector |
 |---|---|---|
-| **Declared lookahead is larger than reality** — an LP claims it cannot affect another for 50 µs and then does it in 10 | Receiver has already released messages past the arrival time. Silent; the message lands "in the past" | **(1) Straggler check** |
+| **A send the CA never saw** — an unregistered channel, or a send from a non-owner thread that slipped the thread-identity assertion; no grant counts it | Receiver has already released messages past the arrival time. Silent; the message lands "in the past" | **(1) Straggler check** |
+| **A duplicate sequence number** on one channel. Out of order is fine (release is per `(channel, seq)`); a missing one shows as a wait that (2) names | Two frames claim one registered send | **Seq assertion** (D3): fails the run |
+| **A cross-LP send off the clock owner** — a `RelayQueue.put` from another thread, or a second thread sending on one channel (I3, I4) | The send would bypass registration | **Thread-identity assertion**: raises at once |
 | **A wait the CA cannot see** — an unwrapped channel, or a real collective spanning two LPs; an LP blocks for real while the CA believes it is running | A run that stops making progress. Nothing times out, so nothing is released wrongly, but nothing names the site either | **(2) Coverage audit** |
 | **A clock read was missed** — business logic still calls `time.monotonic()` | Two timestamps on one timeline disagree; durations mix scales. Silent | **(3) Clock-source audit** |
 
@@ -239,8 +240,11 @@ to provide. On failure: record `(channel, seq, a, drain time, declared lookahead
 **fail the run** — not a warning, because a straggler invalidates every number
 downstream of it.
 
-This is also what makes a wrong lookahead *findable*: the report names the channel, so
-correcting its `L(ch)` is a mechanical fix.
+A lookahead declared larger than reality cannot fire this check: every arrival is stamped
+`t_send + L(ch)` by the sender, and a strict grant never passes an unreported message (its
+arrival is at least its sender's `now + L`), so the model just delivers later than reality.
+That is a calibration error, invisible to any causality check; validation against real
+runs (`08`) or a declared-vs-measured channel-delay check catches it.
 
 **(2) Coverage audit — a stall diagnostic, never an abort.** A wait the CA cannot see is
 one no wrapper covers. In a valid run every such wait ends; one that does not can only
@@ -273,9 +277,8 @@ causality violation occurred" becomes a reported result of every run rather than
 assumption, which is what doc `08` needs in order to treat a simulated number as
 evidence at all.
 
-**What it does not cover.** A lookahead that is wrong but *never exercised* by the
-workload is not detected — the run is correct, and a different workload may not be.
-Recorded as **T47**.
+**What it does not cover.** A wrong lookahead: no detector sees it (above). Recorded as
+**T47**.
 
 ### Open issues
 
