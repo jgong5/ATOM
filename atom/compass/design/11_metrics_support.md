@@ -334,7 +334,7 @@ exporter**.
 | any metric with a **wall-clock denominator** presented as a simulated rate | there are none today; this is a rule about future additions |
 | any **histogram observation of an un-virtualized duration** | D73 — the failure looks authoritative because it came from Prometheus |
 | GPU utilisation, power, temperature, and the `server_metrics/` Prometheus scraper | there is no GPU |
-| metric emission that **advances the virtual clock** | emission is simulator overhead, not modelled work. Under `01` D4 virtual time advances only for durations the cost model produced, so this is satisfied by construction — but it must be **asserted**, because a hook that accidentally sat inside a Category-A path would be invisible |
+| metric emission that **advances the virtual clock** | emission is simulator overhead, not modelled work. Under `01` D4 virtual time advances only for durations the cost model produced, so this is satisfied by construction — but it must be **asserted**, because a hook that accidentally sat inside a K1 (event cost, `advance_to`) path would be invisible |
 
 The standing reminder behind the last row: the instrument changes what it measures. Measure
 mode cost ~**11 ms of TTFT on the 27B (4%)**, and a variant that synchronised around each
