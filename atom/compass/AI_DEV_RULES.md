@@ -51,7 +51,9 @@
      An rsync'd tree mixing two generations gave a `TypeError` that read as a
      code bug.
 - **Code and docs are English only** — identifiers, comments, strings and
-  documents — whatever language the conversation with the owner uses.
+  documents — whatever language the conversation with the owner uses. Test
+  inputs may be any language, and a verbatim quote of a non-English source stays
+  as quoted.
 - **No design-doc references in code or runtime output.** No `D18`, `P0.4`, `T5`,
   `W2.5`, backticked doc numbers, "principle N", or labels like "Gate 1"; no
   quoting principles as justification. Say what the code does. Design docs may
