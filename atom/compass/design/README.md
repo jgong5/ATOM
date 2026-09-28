@@ -127,9 +127,9 @@ Four views. **A** shows where Compass sits inside ATOM; **A2** is Compass alone,
            :  :                           |                               :
            :  :   +-----------------------v-----------------------+       :
            :..:   |  Clock Authority                              |       :
-   grants,    :   |  grants virtual time to every logical process |       :
-   blocked/   :   |  co-hosted by default; standalone for M4/M6   |       :
-   running    :   +-----------------------------------------------+       :
+   TAR/NER    :   |  grants virtual time to every logical process |       :
+   requests,  :   |  co-hosted by default; standalone for M4/M6   |       :
+   TAG grants :   +-----------------------------------------------+       :
               :                                                           :
               :   +-----------------------------------------------+       :
               :   |  simulated KV connector                       |       :
@@ -181,9 +181,10 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                                             docs 02, 01 D6, 11      |
   +=====================================================================+
   |  L1  TIME             Clock Authority: grant rule, lookahead matrix |
-  |                       LP registry . blocked/running protocol        |
-  |                       causality detectors (straggler, watchdog,     |
-  |                       CI clock lint)                                |
+  |                       LP registry . TAR/NER/TAG protocol            |
+  |                       causality detectors (straggler check at       |
+  |                       arrival and drain, one DIAG_S stall           |
+  |                       diagnostic, CI clock lint)                    |
   |                       LP topology per strategy: TP/DP/EP collapse,  |
   |                       PP adds one LP per stage                      |
   |                                                docs 01, 15          |
@@ -588,7 +589,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D36 | Three tiers: analytic, coarse empirical, op-level empirical. Compass models a device it has been measured on |
 | D37 | `compass plan` — the tool tells the user what to measure |
 | D45 | The real-vs-real spread is the tolerance; a metric must be stable **and** sensitive |
-| D3.2 | Three always-on causality detectors; a straggler fails the run rather than warning |
+| D3.2 | Three always-on causality detectors: a straggler, checked on arrival and at each drain, fails the run rather than warning; a stall the Clock Authority cannot see waits for ever and prints one `DIAG_S` diagnostic, never aborting; a CI clock-source lint |
 | D3.3 | The Clock Authority ships two deployment forms from one implementation: co-hosted by default, standalone for multi-container runs |
 | D43.1 | ATOM's suite is a merge gate on every Compass change, unmodified, in two tiers: a CPU tier (every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free as a batch, held to green) per change, a GPU superset judged as a delta per wave against 4779 / 5 at `fe9ea043c`, by an equality on a per-tree expectation rather than "no worse than". The CPU tier **exits 98** rather than reporting "GPU not required" when it cannot tell |
 | D67.1 | Tier 0 is graded on **configuration ranking** first; its latency goals are diagnostics for that, not the result |
