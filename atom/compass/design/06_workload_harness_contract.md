@@ -4,8 +4,9 @@
 interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
 written against it yet; implementation follows the execution plan in `16`.
 
-**Depends on:** `01_execution_and_time_model.md` (the Clock Authority and the Category-A/B
-wait contract), `05_machine_spec_and_probes.md` (the host terms the tokenizer model needs).
+**Depends on:** `01_execution_and_time_model.md` (the Clock Authority, its channels and
+the K1-K9 mechanisms), `05_machine_spec_and_probes.md` (the host terms the tokenizer
+model needs).
 
 **Scope.** How traffic reaches a simulated ATOM: the contract any harness must satisfy,
 the wire protocol, the per-harness adapter, and the serving-side costs the harness makes
@@ -35,41 +36,43 @@ downstream.
 Three parts:
 
 ```
-   +--------------+   1. clock: now() / advance_to(T) / blocked() / running()
+   +--------------+   1. clock: now() / advance_to(T) / next_event(t) / end_workload()
    |   harness    |<----------------------------------+
    | (any vendor) |                                   |
    +------+-------+                            +------+------+
-          |  2. wire:  compass.arrival_s  -->  |    Clock    |
-          |            <-- compass.{arrival_s,|  Authority  |
-          |                 first_token_s,    +------+------+
-          |                 finish_s}                |
+          |  2. wire: tracestate compass=..--> |    Clock    |
+          |            <-- SSE ": compass a=.."|  Authority  |
+          |                before each event   +------+------+
+          |                                           |
           v                                           |
    +--------------+                                   |
    | ATOM api_srv |-----------------------------------+
    +--------------+
 ```
 
-**Part 1 - clock client.** `now()`, `advance_to(T)`, `declare_blocked()`,
-`declare_running()`. This is doc 01 D4's Category-A (rewrite: do not wait, advance) and
-Category-B (annotate: leave the blocking call alone) contract, already specified. A thin
-library per language.
+**Part 1 - clock client.** `now()`, `advance_to(T)` (TAR; `01` D4, K1), `next_event(t)`
+(NER, K3) and `end_workload()`. Each request the harness sends is logged on the channel
+`traffic->frontend:http` (K4) and each streamed response counted where it is read on
+`frontend->traffic:stream` (K5); nothing is annotated (`01` D3, D4; revised 2026-09-28,
+#443). A thin library per language.
 
-**Part 2 - wire protocol.** Additive optional fields on the existing OpenAI-compatible
-endpoint, ignored by a real server. See D28.
+**Part 2 - wire protocol.** Stamps on the existing OpenAI-compatible endpoint, in carriers
+a real server ignores and the router forwards. See D28.
 
 **Part 3 - a per-harness adapter**, living outside both ATOM and the harness repo. It
 redirects pacing to the clock client and stamps the harness's latency anchors from the
-response fields.
+stream.
 
 ### What a second harness must implement
 
-Exactly three things: replace its inter-request sleep with a clock call; attach one field
-to an outgoing request; take its latency numbers from response fields rather than its own
-stopwatch. A harness that cannot do the third is still usable for throughput-only studies.
+Exactly three things: replace its inter-request sleep with a clock call; attach one
+`tracestate` entry to an outgoing request; take its latency numbers from the stream's
+stamps rather than its own stopwatch. A harness that cannot do the third is still usable
+for throughput-only studies.
 
 ### Warmup is not a protocol feature
 
-**Warmup requests are ordinary requests sent early.** They carry `compass.arrival_s` like
+**Warmup requests are ordinary requests sent early.** They carry the arrival stamp like
 any other, go through the same endpoint, and the contract gains nothing from special-casing
 them — nothing about a warmup *request* differs from a normal one.
 
@@ -130,8 +133,16 @@ dedicated one.
 
 | Direction | Field | Meaning |
 |---|---|---|
-| request -> | `compass.arrival_s` | when this request counts as arriving, on the run's simulated timeline |
-| <- response | `compass.{arrival_s, first_token_s, finish_s}` | the engine's own readings |
+| request -> | the `compass` entry of the `tracestate` header, `compass=a:<arrival_s>;s:<seq>` | when this request counts as arriving, on the run's simulated timeline, and its sequence number on the channel |
+| <- response | an SSE comment line before each streamed event, `: compass a=<t> s=<seq>` | that event's simulated time: the first is `first_token_s`, the last `finish_s` |
+
+**Revised 2026-09-28 (#443): a header entry and SSE comment lines, not body fields.**
+Atomesh re-serializes a chat request through a typed struct that keeps no unknown
+top-level field (`01` D7), so a body field is dropped on the PD path, while `tracestate`
+is forwarded to prefill and to decode. A comment line is ignored by every SSE client and
+passes the router byte for byte. The audit below was written for body fields: the need
+for each value stands, the carrier changed, and `arrival_s` (out) has no carrier yet
+(Open issues).
 
 #### Minimality audit: why four values, and why not three or five
 
@@ -178,7 +189,8 @@ sides emit, and putting it on the wire would grow every response by the output l
 If a later result needs per-token simulated stamps, it comes from the step table join,
 not from the endpoint.
 
-take2 built the request half: `CompletionRequest.compass_arrival` as an offset into the
+take2 built the request half in a body field, which the revised carrier above replaces
+with `tracestate`: `CompletionRequest.compass_arrival` as an offset into the
 run, `llm_engine._stamp_arrival` turning it into `epoch + offset` and warning plus falling
 back to `now()` on a real clock, and `Scheduler._declared_arrival_pending` putting a
 not-yet-arrived sequence back on the waiting queue — deliberately **not** via
@@ -200,6 +212,10 @@ Keep `GET /compass/requests` as a bulk diagnostic, not the primary path.
 
 - Whether upstream ATOM will accept simulation fields in the public request schema, or
   whether they must be namespaced or gated.
+- `arrival_s` (out), the clamp detector, has no carrier under the revised wire. Under
+  `01` D8 as revised a request is held at the receive wrapper until its arrival is
+  granted, so the engine should no longer clamp; if that holds the value is redundant,
+  otherwise it needs a carrier.
 
 ---
 
@@ -219,9 +235,11 @@ Reasons, in order of weight:
 3. A real run and a simulated run then differ in exactly one thing: what the forward pass
    costs.
 
-The round trip is a doc 01 **Category-B** blocking wait: annotate `declare_blocked()` /
-`declare_running()` around the existing call, leave the call itself alone. Real wall time
-passes; virtual time does not advance; the Clock Authority routes grants elsewhere.
+The round trip is two channels (`01` D3; revised 2026-09-28, #443): the request is a send
+on `traffic->frontend:http` (K4), logged on the harness's clock owner, and the stream a
+receive on `frontend->traffic:stream` (K5), counted where the harness reads it. Nothing is
+annotated and the call itself is left alone. Real wall time passes in transit; the send
+and receive counts, not the wall clock, decide what a grant may pass.
 
 Rejected: aiperf's own `FakeTransport` (bypasses HTTP entirely) and an in-process ASGI
 call. Both are faster and both break reason 1.
@@ -243,7 +261,7 @@ The ATOM relay is strictly sequential (`http_pd_router.rs:969-1192`), unlike the
 path (`tokio::join!` on both, `:1463`) and the vLLM path (detached `spawn`, `:732`):
 
 ```
-client --compass.arrival_s--> router --inject_prefill_fields--> PREFILL
+client --tracestate compass-> router --inject_prefill_fields--> PREFILL
                                   (sets kv_transfer_params, stream=false,
                                    max_tokens=1; other fields pass through)
                         router <-- prefill response
@@ -261,8 +279,12 @@ itself is produced by `MoRIIOConnectorScheduler.request_finished`
 
 ### Decision
 
-**Prefill writes `arrival_s` and `first_token_s` into `kv_transfer_params`. Decode reads
-them, adds `finish_s`, and emits the merged timeline in its response.**
+**Three carriers, each one the router already passes unchanged** (revised 2026-09-28,
+#443; `01` D7): the `compass` entry of `tracestate` on the request, which the router
+forwards to prefill and to decode; a field inside `kv_transfer_params` on the
+prefill-to-decode forward, stamped when prefill writes its JSON; and SSE comment lines on
+decode's stream. A decode request that carries `kv_transfer_params` takes its time from
+that field, any other request from `tracestate`.
 
 Consequences:
 
@@ -274,10 +296,10 @@ Consequences:
 ### Open issues
 
 - The simulated KV connector (doc 01 D6) must produce a `kv_transfer_params` blob of the
-  same shape as MoRI-IO's, or the router refuses.
+  same shape as the real connector's (Mooncake's, `01` D6), or the router refuses.
 - Mooncake requires **all** `(pp_rank, tp_rank)` pairs to report before a request
   completes; MoRI-IO does not. The simulated connector must pick one semantic and declare
-  it.
+  it. **Picked** (2026-09-28, #443): Mooncake, which ATOM's PD CI deploys (`01` D6).
 
 ---
 
@@ -387,7 +409,8 @@ p50 input is 88,768 tokens and p90 is 204,288, this is not a rounding error.
 `InputOutputProcessor.preprocess`, reached from the API server via
 `await loop.run_in_executor(None, do_preprocess)` at `api_server.py:890`, `:1004`, `:1126`,
 `:1258`, `:1480`. That is Python's **implicit default executor**, width
-`min(32, cpu_count + 4)` — see doc 05 D24, which makes it an ATOM config option.
+`min(32, cpu_count + 4)`. Doc 05 D24 proposes an ATOM option for it
+(`--preprocess-pool-width`); it is not added yet.
 
 **Decode** — `IncrementalStreamDetokenizer.update` at
 `atom/entrypoints/openai/streaming_dispatch.py:40-69`:
@@ -426,7 +449,7 @@ rule as the forward pass.
 
 | Stage | Where | Concurrency | Service time |
 |---|---|---|---|
-| encode | default `ThreadPoolExecutor` | pool width from ATOM config, **minus the pass-through jobs resident when the run starts** | `encode_fixed_s + tokens / encode_tokens_per_s` |
+| encode | default `ThreadPoolExecutor` | the executor's actual width, **minus the pass-through jobs resident when the run starts** | `encode_fixed_s + tokens / encode_tokens_per_s` |
 | decode | engine output thread, per stream per step | **1**, one station per output thread | `2 x (decode_fixed_s + window / decode_tokens_per_s)` |
 
 Terms come from `host.tokenizers[]` in the machine spec (doc 05 D25), populated by the
@@ -892,9 +915,9 @@ requires genuine fan-out in every root is not constructible without reusing sess
 | # | Decision | Date |
 |---|---|---|
 | D27 | A three-part contract (clock client, wire fields, per-harness adapter), not a bespoke client. Harnesses live outside ATOM; more than one is supported. | 2026-09-18 |
-| D28 | Additive optional fields on the real endpoint, both directions. Response-carried timings replace take2's bulk drain. | 2026-09-18 |
-| D29 | Real HTTP to ATOM's real uvicorn server, both PD topologies. Round trip is a Category-B blocking wait. | 2026-09-18 |
-| D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes on that path. | 2026-09-18 |
+| D28 | Additive optional fields on the real endpoint, both directions. Response-carried timings replace take2's bulk drain. Revised: the request carrier is the `compass` entry of `tracestate`, the response's SSE comment lines. | 2026-09-18, revised 2026-09-28 |
+| D29 | Real HTTP to ATOM's real uvicorn server, both PD topologies. Round trip is a Category-B blocking wait. Revised: two counted channels, a K4 send and a K5 receive; nothing is annotated. | 2026-09-18, revised 2026-09-28 |
+| D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes on that path. Revised: three carriers, `tracestate` on the request, a `kv_transfer_params` field on the forward and SSE comment lines on the stream; still zero Atomesh changes. | 2026-09-18, revised 2026-09-28 |
 | D31 | Filler token is non-EOS, decodes to complete standalone ASCII, and is derived from the request id. | 2026-09-18 |
 | D32 | The decode->prefill cache chain is already broken by the harness for real servers too; guard only against false hits. `theoretical_prefix_cache_hit` is the oracle. | 2026-09-18 |
 | D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. Revised: both are resource stations; encode width excludes resident pass-through jobs, pool jobs are classified by a registry and unregistered ones refused, and a clock read inside a job is its start plus accumulated service time. | 2026-09-18, revised 2026-09-28 |
