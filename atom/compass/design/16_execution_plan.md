@@ -281,7 +281,7 @@ Phase 0's environment. All CPU-only.
 | ID | Task | Module | Effort | Implements / consumes |
 |---|---|---|---|---|
 | **W1.1** | CA core as the HLA RTI (`01` D3): TAR/NER/TAG, a grant strictly below the lookahead-distance LBTS with in-transit messages counted, lookahead matrix addressed by LP identity, LP registry, **both transports** (in-process and socket) from one implementation | `clock/` | 600–900 | implements the clock client API |
-| **W1.2** | Synthetic-LP harness modelling ATOM's **verified** topology — the ZMQ/shm/Gloo links of `01` D1 and the K1–K9 mechanisms of D4 — plus adversarial scenarios: wrong lookahead, a wait the CA cannot see, induced straggler | `tests/compass/clock/` | 400–600 | consumes W1.1 |
+| **W1.2** | Synthetic-LP harness modelling ATOM's **verified** topology — the ZMQ/shm/Gloo links of `01` D1 and the K1–K9 mechanisms of D4 — plus adversarial scenarios: a send missing from the sender's send log (induced straggler), a duplicate seq on one channel, a wait the CA cannot see | `tests/compass/clock/` | 400–600 | consumes W1.1 |
 | **W1.3** | Causality detectors (`01` D3.2): straggler check on arrival and at each drain (fails the run), `DIAG_S` stall diagnostic (keeps waiting, never aborts), CI clock-source lint | `detect/` | 250–400 | consumes W1.1 |
 | **W1.4** | `CompassModelRunner` skeleton: the `--runner-qualname` subclass, the full RPC surface, and the three forward semantics of `02` D10 (deferred output, the meaningful-step unit, `produces_output`) | `runner/` | 400–600 | implements the runner seam |
 | **W1.5** | `CostBackend` interface, `StepCost` with its breakdown, the provenance vocabulary and the resolver ladder | `backends/` | 200–300 | implements the backend API |
