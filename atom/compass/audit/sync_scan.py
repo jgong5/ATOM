@@ -505,15 +505,6 @@ def load_inventory(path: str | os.PathLike | None = None) -> dict:
     return json.loads(Path(path or INVENTORY_PATH).read_text(encoding="utf-8"))
 
 
-def category_counts(inventory: dict | None = None) -> dict[str, int]:
-    """How many classified sites sit in each category."""
-    inv = inventory if inventory is not None else load_inventory()
-    counts: dict[str, int] = {}
-    for row in inv["sites"] + inv["anchors"]:
-        counts[row["category"]] = counts.get(row["category"], 0) + 1
-    return counts
-
-
 def repo_root_from_here() -> Path:
     """The checkout this module was imported from."""
     return Path(__file__).resolve().parents[3]

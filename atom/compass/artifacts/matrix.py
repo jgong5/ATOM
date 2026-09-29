@@ -5,17 +5,8 @@ A global fingerprint would force re-measuring everything on a torch bump. Each
 artifact records the fingerprint of **its own dependency row**, so a bump
 invalidates the rows that name it and leaves the rest alone.
 
-The table lives in `atom/compass/design/07_calibration_toolchain.md`, in the
-section headed *Invalidation*. `test_the_matrix_is_the_documents_table` opens
-that file by path, finds the section by its heading and parses the table
-back out, so the document is a functional dependency of that test and of
-nothing this module emits.
-
-`MATRIX` below is that table transcribed, and it is deliberately a table: the
-deliverable is that a reader can hold the document beside the code and check
-them cell by cell. `test_the_matrix_is_the_documents_table` does the same check
-mechanically, parsing the document's own rows, marks and parentheses, so the
-two cannot drift.
+`MATRIX` below holds the dependency rows, and it is deliberately a table: the
+deliverable is that a reader can check it cell by cell.
 
 **A uniform matrix has lost its point**, and two cells are the ones a tidying
 hand would take away:
@@ -29,11 +20,11 @@ hand would take away:
   `machine_spec` is three rows here rather than one, and a device change
   invalidates two of them while a tokenizer change invalidates the third.
 
-**Two of the seven artifacts this store holds have no row at all.**
-`shape_population` and `coverage_hull` appear in the artifact key table and
-nowhere in this one, and the two "sevens" are not the same seven (#174). Guessing a row for them is the failure
-this package exists to prevent -- an artifact answering under conditions
-nobody checked -- so `rows_for` refuses and names what is missing.
+**Two artifacts this store holds have no row at all.** `shape_population` and
+`coverage_hull` appear in the artifact key table and nowhere in this one.
+Guessing a row for them is the failure this package exists to prevent -- an
+artifact answering under conditions nobody checked -- so `rows_for` refuses and
+names what is missing.
 """
 
 import enum
