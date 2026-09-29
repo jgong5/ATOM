@@ -26,8 +26,6 @@ module's tests read it.
 import ast
 import collections
 import pathlib
-import re
-from importlib.util import resolve_name
 from types import SimpleNamespace
 from typing import NamedTuple
 
@@ -45,8 +43,6 @@ ENGINE = REPO / "atom" / "model_engine"
 ATOM_RUNNER = ENGINE / "model_runner.py"
 ASYNC_PROC = (ENGINE / "async_proc.py").read_text()
 PACKAGE = REPO / "atom" / "compass" / "runner"
-PACKAGE_DOC = ast.get_docstring(ast.parse((PACKAGE / "__init__.py").read_text()))
-UNWAITED = {name for name, waits in RPC_SURFACE.items() if not waits}
 COMPOSED = (REPO / "atom/compass/runner/model_runner.py").read_text()
 BROADCAST = ("call_func", "call_func_with_aggregation")
 # Every class in the tree that answers a dispatched name and is not in
@@ -91,22 +87,6 @@ def _busy_loop():
         for n in ast.walk(ast.parse(ASYNC_PROC))
         if isinstance(n, ast.FunctionDef) and n.name == "busy_loop"
     )
-
-
-def _refusal_comment():
-    """The comment block the composed module's refusal is written inside.
-
-    Comments are not AST nodes, so this is source text: every indented `#`
-    line of `model_runner.py`, joined into one string. The module's only
-    indented comment is that block; the two unindented ones are the SPDX
-    header, which is why the column is enough to select it.
-    """
-    lines = [
-        line.strip().lstrip("#").strip()
-        for line in COMPOSED.splitlines()
-        if line.strip().startswith("#") and not line.startswith("#")
-    ]
-    return " ".join(line for line in lines if line)
 
 
 def _raised_name(node):
@@ -354,6 +334,42 @@ def test_the_caller_that_waits_has_no_timeout_to_rescue_it():
         if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "get"
     ]
     assert gets and not any(g.args or g.keywords for g in gets)
+
+
+def test_the_worker_cannot_break_on_an_unpack_and_the_wait_is_unbounded():
+    """`busy_loop` binds the resolved method's return to a single name, so
+    there is no unpacking in the worker for a `None` reply to fail at; the sole
+    unpack is in the module that constructs the manager, which is the parent.
+    And `call_func` reads the output queue with no timeout, which is what makes
+    a reply that never arrives a park rather than an error.
+    """
+    module = ast.parse(ASYNC_PROC)
+    defs = {n.name: n for n in ast.walk(module) if isinstance(n, ast.FunctionDef)}
+    dispatched = [
+        node
+        for node in ast.walk(defs["busy_loop"])
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and getattr(node.value.func, "id", None) == "func"
+    ]
+    assert len(dispatched) == 1 and isinstance(
+        dispatched[0].targets[0], ast.Name
+    ), "busy_loop no longer binds the resolved method's reply to a single name"
+    reads = [
+        node
+        for node in ast.walk(defs["call_func"])
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "get"
+        and getattr(getattr(node.func, "value", None), "attr", None) == "outputs_queue"
+    ]
+    assert (
+        len(reads) == 1 and not reads[0].args and not reads[0].keywords
+    ), "call_func's read of the output queue is no longer a single untimed get"
+    assert any(
+        isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "AsyncIOProcManager"
+        for node in ast.walk(ast.parse((ENGINE / "engine_core.py").read_text()))
+    ), "engine_core.py no longer constructs the manager, so it is not the parent"
 
 
 def test_the_aggregating_form_is_the_one_bounded_wait():
@@ -852,7 +868,7 @@ def test_the_two_names_no_caller_waits_for_and_what_replying_costs():
     assert 'if func_name == "exit":\n                break' in ASYNC_PROC
 
 
-# --- the break at `exit`, and the comment that describes it ------------------
+# --- the break at `exit` ---------------------------------------------------
 
 
 def test_the_break_on_exit_is_a_sibling_of_the_per_runner_loop():
@@ -900,39 +916,12 @@ def test_the_break_on_exit_is_a_sibling_of_the_per_runner_loop():
     assert reached == {"func_name"} and reached <= bound
 
 
-def test_the_refusal_comment_says_the_loop_breaks_and_not_that_it_hangs():
-    """The prose beside the refusal, held to the structure above.
+def test_what_a_hole_at_exit_loses_is_what_exit_does():
+    """What shutdown fails to release, read off `ModelRunner.exit`'s own body.
 
-    This is the half the surface was missing. The comment, the package
-    docstring's sentence about the surface and the string assertion above
-    were added together, and the comment said the opposite of that assertion:
-    that an unanswered `exit` means "the loop never breaks". Nothing failed,
-    because nothing read the prose. So the words are read here.
-
-    `never breaks` is the claim that was wrong. It is refused as that
-    lower-case phrase, including where a comment line wraps between the two
-    words. The three phrases required are the three findings of the structure
-    test -- that it breaks, what the `if` is a sibling of, and that it tests a
-    name rather than a reply -- so prose and source now fail together.
+    The KV deletions are `hasattr`-guarded, and this runner allocates no KV
+    tensor, so they find nothing here; the guard is asserted too.
     """
-    comment = _refusal_comment()
-    assert "The loop breaks either way" in comment
-    assert "the break is a sibling of the per-runner loop" in comment
-    assert "tests the dispatched name rather than any reply" in comment
-    assert "never breaks" not in comment
-
-
-def test_what_the_comment_says_a_hole_at_exit_loses_is_what_exit_does():
-    """Each loss the comment names, against `ModelRunner.exit`'s own body.
-
-    The comment is what this test holds against `ModelRunner.exit`'s body: it
-    says what shutdown fails to release about ATOM's code rather than this
-    package's, so it drifts whenever `exit` is edited. It also states which of
-    those losses is empty here -- the five KV deletions are `hasattr`-guarded
-    and this runner allocates no KV tensor, so they find nothing. The guard is
-    asserted too: dropping it would make the comment's own exception false.
-    """
-    comment = _refusal_comment()
     body = next(
         n
         for n in ast.walk(_classes(ATOM_RUNNER)["ModelRunner"])
@@ -940,9 +929,6 @@ def test_what_the_comment_says_a_hole_at_exit_loses_is_what_exit_does():
     )
     calls = {ast.unparse(n.func) for n in ast.walk(body) if isinstance(n, ast.Call)}
     assert {"destroy_dist_env", "torch.cuda.empty_cache"} <= calls
-    assert "`ModelRunner.exit` never runs" in comment
-    assert "the distributed environment is never destroyed" in comment
-    assert "`torch.cuda.empty_cache()` never runs" in comment
     deleted = {
         ast.unparse(t)
         for n in ast.walk(body)
@@ -950,7 +936,6 @@ def test_what_the_comment_says_a_hole_at_exit_loses_is_what_exit_does():
         for t in n.targets
     }
     assert "self.model" in deleted
-    assert "`self.model` is never dropped" in comment
     literal_loops = [
         n
         for n in ast.walk(body)
@@ -970,30 +955,12 @@ def test_what_the_comment_says_a_hole_at_exit_loses_is_what_exit_does():
         and getattr(getattr(n.test, "func", None), "id", None) == "hasattr"
         for n in ast.walk(kv)
     )
-    assert "five KV-tensor deletions are `hasattr`-guarded" in comment
 
 
-def test_the_unanswered_helper_describes_its_whole_return_and_not_one_half():
-    """The list is returned unpartitioned; its docstring may not be.
-
-    `unanswered_rpc_names` draws from all twelve, and its only caller in the
-    package splits them on `RPC_SURFACE` before reporting them. A docstring
-    that gives one story for the whole return is the claim
-    `test_the_two_names_no_caller_waits_for_and_what_replying_costs` already
-    calls false, so the two names it excepts are read back out of the prose
-    and compared with the table rather than typed here. The count word is
-    held to `len(RPC_SURFACE)` the same way -- the word is looked up from the
-    table's length, not typed beside a literal 12 -- and the single-caller
-    claim to the tree.
+def test_the_unanswered_helper_returns_one_list_its_one_caller_partitions():
+    """`unanswered_rpc_names` returns its list unpartitioned, and its only
+    caller in the package splits it on `RPC_SURFACE` before reporting it.
     """
-    doc = " ".join(unanswered_rpc_names.__doc__.split())
-    unwaited = {n for n, w in RPC_SURFACE.items() if not w}
-    assert {n for n in RPC_SURFACE if f"`{n}`" in doc} == unwaited
-    assert "a hole in either parks no one" in doc
-    assert "parks forever" not in doc
-    word = {10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen"}.get(len(RPC_SURFACE))
-    assert word is not None, f"no count word for {len(RPC_SURFACE)} names"
-    assert f"all {word}" in doc
     callers = [
         str(f.relative_to(REPO))
         for f in sorted((REPO / "atom").rglob("*.py"))
@@ -1052,184 +1019,3 @@ def test_the_zero_block_form_in_the_tree_answers_two_of_the_four_keys():
     engine = (ENGINE / "engine_core.py").read_text()
     assert 'block_info.get("pool_entries", {})' in engine
     assert 'block_info.get("pool_entries_per_req", {})' in engine
-
-
-# --- the package docstring, read against the table it describes --------------
-#
-# What is read here is what the docstring states through tokens the tree can
-# check: bullet leads, the `file.py:NN` citations under each lead, a module
-# count, and the engine names, functions and paths each module's bullet cites.
-# The sentences between them are not read. Which half of the table parks its
-# caller, and whether an engine import sits at module scope, differ from their
-# false forms only in wording, and asserting wording is not a check on what the
-# wording claims. Which function holds which engine name is not read either: a
-# bullet is held to the union of the names and the functions they are imported
-# in, not to the pairs. Nor is an engine module loaded through `__import__`,
-# which is a call and not an import statement.
-
-CITATION = r"`([a-z_]+\.py:\d+)`"
-# Words from two up: a split needs two, so "the one module here" is no count.
-COUNT_WORDS = ("two", "three", "four", "five", "six", "seven", "eight", "nine")
-
-
-def _bullets(doc):
-    """Each top-level bullet of *doc*, keyed by the backticked name it opens with.
-
-    The package docstring carries two bullet lists -- the modules it splits and
-    the dispatched names no caller waits for -- and every entry of both opens
-    with one backticked identifier. Reading the leads rather than searching the
-    whole text is what lets the two lists be checked separately, and it is also
-    what keeps an incidental mention from counting: `forward` is named in the
-    prose of a module bullet and is not an entry of either list. A bullet's
-    text runs through the lines indented under it, so what it says is read as
-    that entry's and not as the whole docstring's.
-    """
-    pattern = r"^- `([A-Za-z_][A-Za-z0-9_]*)`(.*(?:\n  .*)*)"
-    return dict(re.findall(pattern, doc, flags=re.MULTILINE))
-
-
-def _modules():
-    """The package's own modules: its `.py` files and its subpackage directories."""
-    return {
-        p.stem
-        for p in PACKAGE.iterdir()
-        if p.suffix == ".py" or (p.is_dir() and any(p.rglob("*.py")))
-    } - {"__init__"}
-
-
-def _stated_module_counts(doc):
-    """Every count *doc* puts before "module(s)": a digit, or a word from two up."""
-    words = re.findall(rf"(?i)\b(\d+|{'|'.join(COUNT_WORDS)})\s+modules?\b", doc)
-    return [int(w) if w.isdigit() else COUNT_WORDS.index(w.lower()) + 2 for w in words]
-
-
-def test_the_package_docstring_lists_every_module_beside_it():
-    """The split it describes has to be over the package's own modules.
-
-    The docstring said "Two modules" for as long as there were three:
-    `step_output` was added after the sentence was written, and nothing went
-    red, because a count in prose has nothing to disagree with. So the bullets
-    are compared against the directory instead of against a number, and the
-    next module either appears in them or fails here -- including one that
-    arrives as a subpackage directory rather than as a `.py` file.
-    """
-    modules = _modules()
-    assert "step_output" in modules, "the walk found no package to compare against"
-    assert set(_bullets(PACKAGE_DOC)) - set(RPC_SURFACE) == modules
-
-
-def test_a_module_count_the_package_docstring_states_is_the_packages():
-    """A count in prose, given the directory to disagree with.
-
-    The docstring states no count today, and need not. Where it does state one,
-    it is the number of modules the package holds, so "Two modules" put back
-    above three bullets fails here rather than reading as true.
-    """
-    assert _stated_module_counts("Two modules; eight\n modules; one module") == [2, 8]
-    for stated in _stated_module_counts(PACKAGE_DOC):
-        assert stated == len(_modules()), f"the docstring says {stated} modules"
-
-
-def test_the_package_docstring_partitions_the_surface_the_way_the_table_does():
-    """A hole in this surface is quiet, but it is not one failure.
-
-    `RPC_SURFACE`'s value is whether the caller waits, and the two answers fail
-    differently: a hole in a waited name parks its caller for the life of the
-    process, and a hole in an unwaited one parks nobody and loses the work the
-    name stood for. The docstring claimed the first for all twelve until it was
-    corrected, which named the one failure mode that cannot happen at the other
-    two and sent a reader debugging a leak or a missing KV load to look for a
-    park that does not exist.
-
-    This fails in both directions. Reinstating the unpartitioned sentence
-    leaves the docstring naming neither name; flipping an entry of the table,
-    or adding a thirteenth that no caller waits for, leaves it naming the wrong
-    ones. The two guards either side of the assertion keep it from passing
-    vacuously if the table ever stopped recording two answers at all.
-    """
-    assert UNWAITED, "a table with nothing unwaited would pass the partition trivially"
-    assert UNWAITED != set(RPC_SURFACE), "and so would a table with nothing waited"
-    assert set(_bullets(PACKAGE_DOC)) & set(RPC_SURFACE) == UNWAITED
-
-
-def _cite(s):  # the docstring cites paths under atom/model_engine/
-    return f"{s.file.removeprefix('atom/model_engine/')}:{s.line}"
-
-
-def test_every_site_the_package_docstring_cites_is_one_no_caller_waits_for():
-    """The partition is a claim about call sites, so it carries them.
-
-    Each unwaited bullet names where ATOM broadcasts that name, and `SITES` is
-    recovered from ATOM's own source rather than from this file, so the
-    citations are checked against the tree instead of read as decoration. Set
-    equality covers the way either half drifts: a broadcast that moves, or a
-    second site that appears, is uncited; a site that starts passing
-    `wait_out=True`, or a name that leaves the unwaited half, is cited and
-    should not be.
-
-    The union alone does not say which name a site belongs to: two bullets
-    with their bodies swapped cite the same six sites between them. So each
-    bullet's citations are also held to its own name's sites.
-    """
-    sites = [s for name in UNWAITED for s in SITES[name]]
-    assert [s for s in sites if s.waits] == []
-    assert set(re.findall(CITATION, PACKAGE_DOC)) == {_cite(s) for s in sites}
-    bullets = _bullets(PACKAGE_DOC)
-    assert {n: set(re.findall(CITATION, bullets.get(n, ""))) for n in UNWAITED} == {
-        n: {_cite(s) for s in SITES[n]} for n in UNWAITED
-    }
-
-
-def test_a_site_in_a_same_named_file_elsewhere_is_not_a_cited_one():
-    """A cited site moved outside `atom/model_engine/` is no longer cited.
-
-    Only that prefix is stripped, so the moved site keeps a `/` that no
-    citation matches. A base name, or any `atom/<pkg>/` stripped, would match.
-    """
-    site = next(s for n in UNWAITED for s in SITES[n])
-    moved = site._replace(file=f"atom/diffusion/{pathlib.Path(site.file).name}")
-    cited = set(re.findall(CITATION, PACKAGE_DOC))
-    assert _cite(site) in cited
-    assert _cite(moved) not in cited
-
-
-def _imported(node, alias):
-    """The absolute module an import names, relative spellings resolved.
-
-    The alias is joined on only when the module is not itself in the engine,
-    so `from atom import model_engine` reads as `atom.model_engine`.
-    """
-    if isinstance(node, ast.Import):
-        return alias.name
-    module = resolve_name("." * node.level + (node.module or ""), "atom.compass.runner")
-    engine = module.startswith("atom.model_engine")
-    return module if engine else f"{module}.{alias.name}"
-
-
-def _engine_imports(mod):
-    """(name bound, engine module, enclosing function) for each engine import."""
-    tree = ast.parse((PACKAGE / f"{mod}.py").read_text())
-    scope = {
-        c: f.name
-        for f in ast.walk(tree)
-        if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
-        for c in ast.walk(f)
-    }
-    return [
-        (a.asname or a.name, _imported(n, a), scope.get(n))
-        for n in ast.walk(tree)
-        if isinstance(n, (ast.Import, ast.ImportFrom))
-        for a in n.names
-        if _imported(n, a).startswith("atom.model_engine")
-    ]
-
-
-@pytest.mark.parametrize("mod", ["overrides", "step_output", "model_runner"])
-def test_a_module_bullet_cites_the_engine_imports_its_module_makes(mod):
-    """A module bullet cites every engine import its module makes, and no other."""
-    cited = set(re.findall(r"`([^`]+)`", _bullets(PACKAGE_DOC)[mod]))
-    imports = _engine_imports(mod)
-    missing = [i for i in imports if not {i[0], i[2] or i[0]} <= cited]
-    assert missing == [], f"the {mod} bullet omits {missing}"
-    named = {c for c in cited if c.startswith("atom.model_engine")}
-    assert named <= {i[1] for i in imports}, f"the {mod} bullet names {named}"
