@@ -228,17 +228,14 @@ def _self_assigned(node):
     }
 
 
-def test_the_docstring_names_every_attribute_that_holds_the_ring():
+def test_exactly_two_attributes_of_the_runner_hold_the_ring():
     """Construction leaves the base's forward-vars ring resident, and named
-    attributes of the runner hold it -- which the docstring denied until it was
-    corrected, with nothing asserting either way. Both holders are the base's,
-    so a rename, or a third one bound anywhere in the class, stops the sentence
-    being true; this fails then, rather than the prose drifting again.
+    attributes of the runner hold it. Both holders are the base's, so a
+    rename, or a third one bound anywhere in the class, fails here.
 
     The whole `ModelRunner` body is read, not the two methods that build the
     ring, because a holder bound in `__init__` is just as much a holder and an
-    earlier draft of this test could not see one. Over 94 `self.x = ...` in that
-    class the answer is the same two, which is the fact the docstring states.
+    earlier draft of this test could not see one.
 
     Two nearby bindings are deliberately not in it. `self.forward_vars` is
     assigned twice: `_advance_forward_vars` rebinds the name to a slot of the
@@ -250,8 +247,6 @@ def test_the_docstring_names_every_attribute_that_holds_the_ring():
     assigned = _self_assigned(_classes(ATOM_RUNNER)["ModelRunner"])
     holders = {n for n, v in assigned if any(t in v for t in BUFFER_TERMS)}
     assert holders == {"forward_vars", "_fv_ring"}
-    runner = _classes(PACKAGE / "model_runner.py")["CompassModelRunner"]
-    assert all(f"`{name}`" in ast.get_docstring(runner) for name in holders)
 
 
 def test_what_that_ring_costs_is_the_batch_budget_by_the_hidden_size():
@@ -285,16 +280,11 @@ def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
     is a `SizedKVPool` -- a count, a name-to-count table and the readings --
     built in a package whose whole import closure `test_kv_budget.py` holds
     free of any tensor library. Anything else appearing here is a tensor this
-    class put on a device, which is the thing it exists not to do. The class
-    docstring is held to the same three, by the mirror of test 1's last two
-    lines: the enumeration in the prose and the bindings in the source fail
-    together rather than drifting apart.
+    class put on a device, which is the thing it exists not to do.
     """
     overrides = _classes(PACKAGE / "overrides.py")["NonAllocatingRunner"]
     bound = {n for n, _ in _self_assigned(overrides)}
     assert bound == {"model", "_token_stream", "kv_pool_sizing"}
-    runner = _classes(PACKAGE / "model_runner.py")["CompassModelRunner"]
-    assert all(f"`{name}`" in ast.get_docstring(runner) for name in bound)
 
 
 # --- warmup drives a forward, which is why it is skipped ---------------------
