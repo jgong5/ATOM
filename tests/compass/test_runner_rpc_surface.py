@@ -1041,16 +1041,29 @@ def test_the_unanswered_helper_returns_one_list_its_one_caller_partitions():
     """`unanswered_rpc_names` returns its list unpartitioned, and its only
     caller in the package splits it on `RPC_SURFACE` before reporting it.
     """
-    callers = [
-        str(f.relative_to(REPO))
-        for f in sorted((REPO / "atom").rglob("*.py"))
-        if any(
-            isinstance(n, ast.Call)
-            and getattr(n.func, "id", None) == "unanswered_rpc_names"
-            for n in ast.walk(ast.parse(f.read_text()))
-        )
-    ]
-    assert callers == ["atom/compass/runner/model_runner.py"]
+    # Called by bare name or through a module, both are a call; any other
+    # mention -- an `import ... as`, a `partial`, a callback -- is a caller
+    # this cannot follow, so it is refused rather than left out of the count.
+    callers, unread = set(), []
+    for f in sorted((REPO / "atom").rglob("*.py")):
+        tree = ast.parse(f.read_text())
+        called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.alias) and n.name == "unanswered_rpc_names":
+                if n.asname:
+                    unread.append(f"{f.relative_to(REPO)}:{n.lineno}: as {n.asname}")
+                continue
+            if "unanswered_rpc_names" not in (
+                getattr(n, "id", 0),
+                getattr(n, "attr", 0),
+            ):
+                continue
+            if id(n) in called:
+                callers.add(str(f.relative_to(REPO)))
+            else:
+                unread.append(f"{f.relative_to(REPO)}:{n.lineno}: {ast.unparse(n)}")
+    assert not unread, f"the helper is reached other than by calling it: {unread}"
+    assert callers == {"atom/compass/runner/model_runner.py"}
     tree = ast.parse(COMPOSED)
     bound = next(
         n.targets[0].id
