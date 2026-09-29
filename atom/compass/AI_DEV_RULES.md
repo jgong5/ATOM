@@ -59,8 +59,23 @@
   `W2.5`, backticked doc numbers, "principle N", or labels like "Gate 1"; no
   quoting principles as justification. Say what the code does. Design docs may
   cite each other. Check at the head over the PR's whole file set, never over a
-  delta's added lines. A design document a test opens by path is a dependency,
-  not a citation.
+  delta's added lines.
+- **Prose is not a test subject.** No test opens a design document, a README or a
+  docstring to assert what it says; tests assert behaviour. A doc that is wrong is
+  fixed in the doc by whoever finds it, not guarded. Reviewers do not file findings
+  that a prose claim is unheld or unpinned, and no test's subject is another test
+  or guard. Where a fact must stay in step with code, the code holds it and the doc
+  says where to find it.
+- **Write nothing that goes stale on its own.** In docs, code, briefs, issues and
+  PR text:
+  - Cite code by path and symbol (`atom/model_engine/scheduler.py`,
+    `Scheduler.schedule`), never by line number. An inline review comment is the
+    exception: GitHub pins its line to a commit.
+  - Do not state how many items a list, table, register or set holds (decisions,
+    TODOs, open items, sync sites, findings). The list is its own count. A
+    measured result, such as a test run's pass count, goes in the PR or issue
+    record with the commit it was measured at, never in a doc.
+  - Do not restate a fact another document owns; link to it.
 - Merge conflicts are the agent's call, not the owner's. Tasks are cut to one
   module plus its tests but are not guaranteed disjoint. **Frequent conflicts mean
   the decomposition is wrong**: re-cut the tasks, don't add a scheduler.
@@ -102,6 +117,13 @@
   task did not predict; a measurement outside its stated range; an interface that
   cannot be implemented as specified. The outcome is a finding or an escalation
   (below).
+- **When a design document and the code disagree, the kind of claim decides which
+  side changes.** A description of existing code (ATOM, aiter, atomesh or any
+  upstream tool) is corrected to match the code, and every decision that rested on
+  it is re-checked. A design decision is the spec: Compass code that departs from
+  it is a defect and is fixed to match. If building a decision shows it is wrong
+  or cannot be built, that is an escalation and the design changes first. Code
+  never departs from a decision silently.
 - Concurrency: 5 tasks in flight, up to 10 agents (5 developer + 5 reviewer). The
   cap is review throughput, not the task DAG.
 - Both developer and reviewer agents must be told to read `atom/compass/design/README.md`'s
@@ -155,7 +177,8 @@
      [`ponytail-review`](https://github.com/DietrichGebert/ponytail/blob/main/skills/ponytail-review/SKILL.md)
      skill over the diff to catch over-engineering; its findings are posted like
      any others. **A check
-     counts only once someone has seen it fire.** A reviewer credits a test with
+     counts only once someone has seen it fire.** This applies to behaviour
+     tests; prose is not a test subject (above). A reviewer credits a test with
      holding a defect only after reinstating it (the pre-fix code via `git show`,
      line count preserved, nothing else changed) and recording the red: both
      counts, the failing node id and assertion. A developer reverts their own
