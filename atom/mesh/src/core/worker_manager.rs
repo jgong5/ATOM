@@ -2,7 +2,14 @@
 //!
 //! Provides worker lifecycle operations and fan-out request utilities.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use futures::{
     future,
@@ -21,7 +28,17 @@ use crate::{
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_WORKER_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// Timeout for the `/flush_cache` and `/get_load` requests below; set from
+/// `--worker-request-timeout-secs` when the router config is built.
+pub static WORKER_REQUEST_TIMEOUT_SECS: AtomicU64 =
+    AtomicU64::new(DEFAULT_WORKER_REQUEST_TIMEOUT_SECS);
+
+fn request_timeout() -> Duration {
+    Duration::from_secs(WORKER_REQUEST_TIMEOUT_SECS.load(Ordering::Relaxed))
+}
+
 const MAX_CONCURRENT: usize = 32;
 
 /// Result of a fan-out request to a single worker
@@ -47,7 +64,7 @@ async fn fan_out(
             let method = method.clone();
 
             async move {
-                let mut req = client.request(method, &full_url).timeout(REQUEST_TIMEOUT);
+                let mut req = client.request(method, &full_url).timeout(request_timeout());
                 if let Some(key) = api_key {
                     req = req.bearer_auth(key);
                 }
@@ -194,7 +211,7 @@ impl WorkerManager {
         api_key: Option<&str>,
     ) -> isize {
         let load_url = format!("{}/get_load", url);
-        let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
+        let mut req = client.get(&load_url).timeout(request_timeout());
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
@@ -337,6 +354,62 @@ impl Drop for LoadMonitor {
             if let Some(handle) = handle_guard.take() {
                 handle.abort();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use clap::Parser;
+
+    use super::*;
+    use crate::{cliargs::CliArgs, core::BasicWorkerBuilder};
+
+    #[tokio::test]
+    async fn worker_request_timeout_option_outlasts_a_40s_worker() {
+        let slow = Duration::from_secs(40);
+        let app = axum::Router::new()
+            .route(
+                "/get_load",
+                axum::routing::get(move || async move {
+                    tokio::time::sleep(slow).await;
+                    axum::Json(serde_json::json!([{ "num_tokens": 7 }]))
+                }),
+            )
+            .route(
+                "/flush_cache",
+                axum::routing::post(move || tokio::time::sleep(slow)),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let registry = WorkerRegistry::new();
+        registry.register(Arc::new(BasicWorkerBuilder::new(&url).build()));
+        let client = reqwest::Client::new();
+
+        for (flags, answered) in [
+            (&[][..], false),
+            (&["--worker-request-timeout-secs", "60"][..], true),
+        ] {
+            let args = CliArgs::parse_from(["atomesh"].iter().chain(flags));
+            args.to_router_config(vec![]).unwrap();
+            let start = Instant::now();
+            let (loads, flush) = tokio::join!(
+                WorkerManager::get_all_worker_loads(&registry, &client),
+                WorkerManager::flush_cache_all(&registry, &client),
+            );
+            let elapsed = start.elapsed();
+            eprintln!(
+                "flags={flags:?} load={} flushed={} elapsed={elapsed:?}",
+                loads.loads[0].load,
+                flush.successful.len()
+            );
+            assert_eq!(loads.loads[0].load, if answered { 7 } else { -1 });
+            assert_eq!(flush.successful.len(), answered as usize);
+            assert_eq!(elapsed >= slow, answered);
         }
     }
 }
