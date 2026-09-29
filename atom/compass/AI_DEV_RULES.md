@@ -73,8 +73,9 @@
   PR text:
   - Cite code by path and symbol (`atom/model_engine/scheduler.py`,
     `Scheduler.schedule`), never by line number. An inline review comment is the
-    exception: GitHub pins its line to a commit. So is data a tool generates from
-    the source, such as `atom/compass/audit/sync_sites.json`.
+    exception: GitHub pins its line to a commit. So is a checked-in data file
+    whose recorded lines a test re-checks against the tree, such as
+    `atom/compass/audit/sync_sites.json` (`tests/compass/test_sync_inventory.py`).
   - Do not state how many items a list, table, register or set holds (decisions,
     TODOs, open items, sync sites, findings). A measured count, such as a test
     run's pass count, goes in the PR or issue record with the commit it was
@@ -144,9 +145,9 @@
   `need human` the moment it escalates — a halt declared in prose stops nothing;
   when the ruling lives on another issue, label each PR it holds and name that
   issue. The label stops all agent action on that issue or PR (no commit, review,
-  amend or merge, even after a passed review), with two exceptions. One is `gh
+  amend or merge, even after a passed review), with these exceptions. One is `gh
   stack link` by PR number, which lands and pushes nothing, though it retargets
-  the linked PRs' bases (then and when a PR below lands). **The other is a base
+  the linked PRs' bases (then and when a PR below lands). **Another is a base
   update: an agent may merge as the branch-update rule (below) calls for,
   patching the PR's base via REST just before the push if it is an unlinked child
   whose parent landed, changing nothing else.** The merge keeps every change from
@@ -164,8 +165,8 @@
   `gh api repos/<owner>/<repo>/pulls/<n>/comments` with `body`, `commit_id`,
   `path` and `line`; only findings with no line go in the standalone comment.
 - **These gates land a task, all required:**
-  1. ATOM's test suite passes unmodified, in two tiers: the GPU-free tier per
-     task, the GPU superset per wave as a delta. Needing to edit an ATOM test
+  1. ATOM's test suite passes unmodified: the GPU-free tier per
+     task, and the GPU superset per wave as a delta. Needing to edit an ATOM test
      means the change altered ATOM's behaviour and must be justified on its own
      terms, not absorbed.
   2. New CPU-only tests for what the task added, in `tests/compass/`, in ATOM's
