@@ -219,7 +219,7 @@ is a second reason to have them.
 | **A wait the CA cannot see** — an unwrapped channel, or a real collective spanning two LPs; an LP blocks for real while the CA believes it is running | A run that stops making progress. Nothing times out, so nothing is released wrongly, but nothing names the site either | **(2) Coverage audit** |
 | **A clock read was missed** — business logic still calls `time.monotonic()` | Two timestamps on one timeline disagree; durations mix scales. Silent | **(3) Clock-source audit** |
 
-**(1) Straggler check — receive side, always on, one comparison.** Every cross-LP
+**(1) Straggler check — receive side, always on.** Every cross-LP
 message passes through the channel wrappers (decision item 3). Each frame carries its
 channel, its sequence number and its arrival time `a = t_send + L(ch)`, stamped when the
 clock owner produced it. A straggler is a buffered message that no grant has released
@@ -231,12 +231,10 @@ its send was never registered, would otherwise wait in the buffer for ever with 
 straggler and no diagnostic. A message a grant *did* release may arrive with `a` below
 the grant time; that is normal TSO delivery (D3) and does not fire the check. A
 violation means the receiver has already delivered past the moment this message
-arrives, i.e. the local-causality constraint is broken. (Comparing the
-*send* time with the receiver's *current* clock, as this check first did, is wrong:
-with lookahead `L > 0` a receiver is legitimately granted up to `t_send + L` before the
-message reaches it, so that form fails correct runs.) The check costs one float
-comparison per buffered message per check and is the direct test of the property the whole protocol exists
-to provide. On failure: record `(channel, seq, a, drain time, declared lookahead)` and
+arrives, i.e. the local-causality constraint is broken. (It compares the arrival time,
+not the send time against the receiver's current clock, which fails correct runs when
+`L > 0`.) It is the direct test of the property the whole protocol exists to provide.
+On failure: record `(channel, seq, a, drain time, declared lookahead)` and
 **fail the run** — not a warning, because a straggler invalidates every number
 downstream of it.
 
@@ -251,10 +249,8 @@ one no wrapper covers. In a valid run every such wait ends; one that does not ca
 be a fault (a bug or a dead process). So nothing waits on a timer: the CA and every LP
 wait for as long as it takes, which consumes no virtual time, cannot change the result,
 needs no threshold tuned, and cannot kill a valid but slow run. After `DIAG_S` = 30 wall
-seconds without progress, one diagnostic is printed and the wait continues: the CA
-prints its LP table when it has received no request for that long; an LP prints the
-channel, the sequence number and every thread's stack when a message it released has
-not been handled for that long. `DIAG_S` is a reporting threshold, not a model
+seconds without progress, one diagnostic is printed (D3.5) and the wait continues.
+`DIAG_S` is a reporting threshold, not a model
 parameter. Its value is that it names the uncovered wait **during development** rather
 than leaving it to be discovered as a hang with no name. A stall the CA *can* see —
 every LP waiting at the CA — is not a fault and is not this detector's business: D3's
@@ -271,8 +267,9 @@ the bounds the CA cannot reach, which D5 sends to configuration. Metrics are not
 substituted clock read like any other. Anything new lands as a CI failure on the day it
 is added, not at validation time.
 
-**What this costs.** One comparison per cross-LP message, one wall-clock check in waits
-that already block, one CI lint. None of it is on the per-step path. **What it buys:** the statement "no
+**What this costs.** One float comparison per buffered message at receipt and at each
+drain, which is on the per-step path and bounded by the buffer depth; one wall-clock
+check in waits that already block; one CI lint. **What it buys:** the statement "no
 causality violation occurred" becomes a reported result of every run rather than an
 assumption, which is what doc `08` needs in order to treat a simulated number as
 evidence at all.
@@ -437,6 +434,13 @@ at attention 3 / MoE 1 per layer and rank 1 at 1 / 3 give `max` 4 but a critical
 if the ranks decouple at step level (no per-step collective) and interact only with
 lookahead > 0.
 
+**Open: the DP ranks that do not talk to the CA.** Each DP rank is its own `EngineCore`
+process with its own `#dpN` channels and its own input and output threads, but only one
+rank makes TAR/NER calls. How a rank that makes none registers its sends and has its
+received frames released, and so how I1 holds for it, is not decided (`12` T91). The
+channel tables and the registration and release rules below are written for one DP rank
+(`#dp0`); until T91 is settled a simulated run with DP > 1 is refused by name.
+
 ### Options for the protocol
 
 **A. Central Clock Authority.** One small process owns global virtual time; LPs request
@@ -476,7 +480,9 @@ services:
 | grant reply | TAG (time advance grant) | carries `G` and the `(channel, seq)` set it releases |
 
 **Guarantee: a grant to `T` means every message with timestamp `<= T` has been delivered
-to that LP.**
+to that LP.** The one exception is a deadlock-recovery grant (Invariants, below): it
+guarantees delivery below `T`, and a message at exactly `T` arrives in that instant's next
+round.
 
 Per LP *i*: `now[i]`; a state in `{running, TAR, NER}`; and the target it asked for (`T`
 or `t`). Per channel: every registered message as `seq -> arrival`, and which of them a
@@ -506,12 +512,16 @@ PDES term: Ayani's distance-between-objects LBTS (Fujimoto, ch. 3). Each part ma
   produces nothing (I1, below); messages released to it meanwhile are handled by receiver
   and handler threads, which send nothing across LPs (I4). With `now[j]` instead, two LPs
   in TAR whose targets cross would wait on each other for ever under the strict rule.
-- **Distance, not direct neighbours.** Frontend running at 9.0 feeds prefill (idle,
-  `t = inf`) with `L = 0.1`; prefill feeds decode with `L = 0.5`. Treating the idle
-  prefill as `inf` is unsafe — frontend's 9.0 request reaches decode through prefill at
-  9.6 — and using prefill's stale `now` stalls decode for nothing. By distance,
-  `LBTS(decode) = min(inf + 0.5, 9.0 + 0.6) = 9.6`: correct.
-- **Strict.** A message not yet reported to the CA has arrival `>= ` its sender's
+- **Distance, not direct neighbours.** In M4, with illustrative lookaheads
+  `L(traffic->frontend-P:http) = 0.1` and `L(frontend-P->frontend-D:relay) = 0.5`:
+  traffic is running at 9.0, and frontend-P, engine-P and engine-D are idle with `t = inf`
+  and nothing undelivered, so each has `N = inf`; frontend-D waits. Its direct
+  neighbours are frontend-P and engine-D, both `inf`, but treating the idle frontend-P as
+  `inf` is unsafe — traffic's 9.0 request reaches frontend-D through frontend-P at 9.6 —
+  and using frontend-P's stale `now` stalls frontend-D for nothing. By distance,
+  `D(traffic->frontend-D) = 0.1 + 0.5`, so
+  `LBTS(frontend-D) = min(9.0 + 0.6, inf, inf, inf) = 9.6`: correct.
+- **Strict.** A message not yet reported to the CA has arrival `>=` its sender's
   `now + L`, so a strict grant never reaches it.
 
 **Messages in transit are counted, not assumed away.** `min(now + L)` alone only
@@ -523,8 +533,10 @@ the standard counting one (Fujimoto, Mattern):
 1. **Registered when produced, reported with the advance.** Only the clock owner registers
    a send, at the moment it produces the message, with `arrival = now + L(ch)`. The
    engine's output thread relays through a `RelayQueue` whose `put` registers on the step
-   loop, so a late physical send changes nothing; an item the output thread never sends
-   raises `UnsentRelayItem` rather than being covered by a null message. The send log
+   loop, so a late physical send changes nothing. Inside the simulation window (below) the
+   output thread sends every item it takes (its one skip, an all-`EXIT_ENGINE` list at
+   `engine_core.py:618-625`, occurs only at shutdown), so an item it never sends raises
+   `UnsentRelayItem` rather than being covered by a null message. The send log
    rides in the same request as the owner's next TAR/NER, so the CA knows every message
    an LP produced before it moves that LP's clock.
 2. **The grant carries the expected `(channel, seq)` set**: every registered message into
@@ -534,9 +546,18 @@ the standard counting one (Fujimoto, Mattern):
    ATOM. Before returning from the CA call, the owner walks the released set in
    `(arrival, channel, seq)` order: it sets `now = arrival`, releases one message, and
    for a thread-received channel waits until the receiving thread is back at its wait
-   point before releasing the next. A handler thread (`_recv_prefill_done`) therefore runs
-   with the LP clock at the message's timestamp, with nothing else in the LP moving.
+   point before releasing the next. A handler thread (RapidServe's `_recv_prefill_done`)
+   therefore runs with the LP clock at the message's timestamp, with nothing else in the
+   LP moving.
    Inline channels are taken by the owner at its own receive point.
+
+**The simulation window.** Each LP's window opens once its process is ready to serve (an
+engine after it queues READY, `engine_core.py:225`) and closes when that process begins
+to shut down; for the frontend that includes `_shutdown_engine_core_rank`
+(`engine_core_mgr.py:1343`). Inside it every cross-LP frame is stamped, registered and
+counted, and the thread-identity assertion (I3, I4) applies. Frames outside it — READY,
+SHUTDOWN and the rest of startup and teardown — carry no stamp, are not counted, and are
+handed to ATOM at once.
 
 Counting is exact: release and completion are per `(channel, seq)`, so a channel need not
 be FIFO and arrivals on one channel need not be monotone — concurrent HTTP requests do
@@ -559,7 +580,8 @@ LP (partition principle, above).
   backdated message **aborts the run with a full LP state dump**. It must not be a
   warning and must not be behind a flag.
 - **Deadlock: detected and recovered, never aborted.** When every LP waits at the CA and
-  the strict rule grants none — possible only with a zero-lookahead channel — the CA
+  the strict rule grants none — possible only with a zero-lookahead channel, once the end
+  rule (below), which the CA checks first, has not ended the run — the CA
   grants the LP with the least `(N, LP id)`: no other LP's `N` is smaller, so nothing
   earlier can reach it. PDES term: Chandy–Misra deadlock detection and recovery. A
   message that then arrives at the receiver's current instant counts toward that
@@ -577,11 +599,19 @@ LP (partition principle, above).
 
 The grant rule relies on four invariants inside each LP:
 
-- **I1** An LP's clock moves only inside its clock owner's CA call (TAR/NER).
+- **I1** An LP's clock moves only inside its clock owner's CA call (TAR/NER). For a DP
+  rank that makes no CA call this is open (T91, above).
 - **I2** In a CA call the owner holds no lock another thread of its LP needs; otherwise a
-  handler thread deadlocks. Checked: the six serving-path locks are each held only in a
-  short `with` block, none around a CA call site; an AST test asserts no TAR/NER call
-  sits lexically inside a `with ...lock` block.
+  handler thread deadlocks. Checked at `f87413a7a` by searching `atom/model_engine`,
+  `atom/entrypoints/openai`, `atom/distributed` and `atom/utils` for
+  `threading.Lock/RLock/Condition/Semaphore`: six serving-path locks,
+  `PrefillScheduler._pending_lock` (`scheduler.py:3166`) and
+  `DecodeScheduler._prefill_lock` (`:3304`), both RapidServe;
+  `CoreManager._lb_lock` (`engine_core_mgr.py:254`) and `_control_send_lock` (`:261`);
+  the metrics exporter's `_lock` (`entrypoints/openai/metrics.py:398`); and the KV-event
+  publisher's `_lock` (`distributed/kv_events.py:177`). Each is held only in a short
+  `with` block, none around a CA call site; an AST test asserts no TAR/NER call sits
+  lexically inside a `with ...lock` block.
 - **I3** One sending thread per channel (a ZMQ socket is not thread-safe either).
 - **I4** Receiver and handler threads produce no cross-LP message; only the clock owner
   does, directly or by registering on a `RelayQueue`. Checked: the engine input thread,
@@ -610,16 +640,30 @@ receives it itself, at its own receive point.
 | `traffic->frontend:http` | Compass traffic source | event loop (inline) | modelled admission delay. Prior work measured 13.7 ms end-to-end, worth ~4 points of TTFT. Path-specific: 13 ms offline batch, 9 ms serving. M4 adds the router hop. |
 | `frontend->traffic:stream` | event loop, writing the SSE stream | traffic source (inline) | declared return delay |
 | `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py:826` | engine input thread, `poller.poll()` at `engine_core.py:544` (thread) | declared IPC delay |
-| `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py:838` | same (thread) | declared IPC delay |
+| `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py:838`. Its second writer, the frontend output thread sending SHUTDOWN (`:592 -> :1364`), runs only outside the window | same (thread) | declared IPC delay |
 | `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py:579`) | frontend output thread, `poller.poll()` at `engine_core_mgr.py:576` (thread) | declared IPC delay |
 | `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | the router's per-request forward cost (D7) |
 | `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py:2196`); Mooncake's write request, sent from the engine process rather than the worker | prefill step loop, drained in `process_completions` (`scheduler.py:3002-3004`) (inline) | declared request latency (D6) |
 | PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py:105/141/147` | the stage loop's own poll and receive (inline) | modelled NCCL send/recv of intermediate tensors. Microsecond scale. The only tight one. |
+| `engine-P->engine-D:prefill_done` (RapidServe only, outside M1-M7) | prefill step loop, direct send at `engine_core.py:1014` | decode handler thread `_recv_prefill_done`, `sock.recv()` at `:1204` (thread) | declared IPC delay |
+| `engine-D->engine-P:block_assignment` (RapidServe only, outside M1-M7) | decode step loop, direct send at `engine_core.py:1229` | prefill handler thread `_recv_block_assignments`, `sock.recv()` at `:946` (thread) | declared IPC delay |
 
-In M4 the three frontend-engine channels exist once per deployment (`frontend-P`/`engine-P`
-and `frontend-D`/`engine-D`), and the two traffic channels connect to frontend-P
-(requests) and frontend-D (stream), both through the router. Mooncake's write-done
-message is not a channel: both ends compute its time (D6).
+The last two rows exist only under `--enable-rapidserve` (D2), whose prefill and decode
+`EngineCore`s are two engine LPs of one deployment; they are the only channels received
+by a handler thread. No M1-M4 channel is.
+
+The M4 channel list at DP1, ten channels:
+
+- `traffic->frontend-P:http` and `frontend-D->traffic:stream`, both through the router;
+- `frontend-P->frontend-D:relay`;
+- `frontend-P->engine-P:request#dp0`, `frontend-P->engine-P:control#dp0`,
+  `engine-P->frontend-P:output#dp0`;
+- `frontend-D->engine-D:request#dp0`, `frontend-D->engine-D:control#dp0`,
+  `engine-D->frontend-D:output#dp0`;
+- `engine-D->engine-P:kv_write_req`.
+
+Mooncake's write-done message is not a channel: both ends compute its time (D6). With PP
+(M7), Mooncake also has a decode-to-prefill `MSG_RELEASE` channel (D6).
 
 **Declaring a lookahead floor on every channel is a design commitment, not a constant to
 tune later.** Zero lookahead is correct under the grant rule above but serializes
@@ -724,8 +768,8 @@ the API-server process for the single-node case, or as a standalone process addr
 interface is identical in both.
 
 - *Pros:* zero deployment cost single-node; one address to configure multi-node; one
-  choke point that knows global state, which is where the safety assertion, the deadlock
-  dump, and a "who is holding up the simulation" query naturally live. A node-CA can
+  choke point that knows global state, which is where the safety assertion, the stall
+  diagnostic, and a "who is holding up the simulation" query naturally live. A node-CA can
   later slot between an LP and a root CA without either side changing, because a node-CA
   runs the same algorithm as the root — the CA is recursive.
 - *Cons:* a single point of failure. Acceptable: its failure is a hang, which is loud,
@@ -749,7 +793,7 @@ interface is identical in both.
   peer's message would need a separate time-service thread sharing mutable `now`/`next`
   with its main thread under a lock — a concurrency hazard placed exactly where silent
   failure is most expensive. It also gives up the single choke point for the safety
-  assertion and the deadlock dump.
+  assertion and the stall diagnostic.
 
 **D. Single CA with no hierarchy provision.** Least code now; if a hierarchy is ever
 needed the LP-facing interface changes, which touches every LP.
@@ -764,8 +808,8 @@ Requirements that follow, and they are cheap only if honoured from the start:
    endpoint, nothing more.
 2. The CA's own interface to *its* peers must be the same as its interface to LPs, so a
    node-CA is a CA whose "LPs" are other CAs.
-3. The lookahead matrix must be addressable by LP identity, not by index, so inserting a
-   level does not renumber anything.
+3. The channel table must be addressable by LP and channel name, not by index, so
+   inserting a level does not renumber anything.
 4. Partition guidance for a future hierarchy is already implied by the topology, and
    matches what SimAI's auto-partitioner does (it cuts p2p links whose delay is at or
    above the median): **PP stages have microsecond lookahead and must stay under one
@@ -784,7 +828,8 @@ Settled: **two deployment forms of one implementation, not two implementations.*
 This is cheap precisely because requirement 1 above already forbids the LP-facing
 interface from naming the CA's location. The two forms differ only in which transport
 the endpoint resolves to. The in-process form is *not* a shortcut that skips the
-protocol — the same grant rule, the same lookahead matrix, the same straggler stamps —
+protocol — the same grant rule, the same channel table, the same `(channel, seq, arrival)`
+stamps —
 so a bug found in one form is a bug in the other, and the cheap single-container runs
 are a real test of the expensive multi-container path.
 
@@ -795,9 +840,10 @@ right host and making one of them the clock owner would give the two roles asymm
 failure behaviour that the real deployment does not have.
 
 **What must be true for this to stay one implementation:** the co-hosted form must not
-acquire an in-process fast path that bypasses the message stamps detector (1) above
-depends on. If grant traffic ever stops carrying virtual send times in-process, the
-single-container runs stop testing the property they are supposed to be testing.
+acquire an in-process fast path that bypasses what detector (1) above reads: the
+`(channel, seq, arrival)` stamp on each frame and the `(channel, seq)` set each grant
+releases. If either stops travelling in-process, the single-container runs stop testing
+the property they are supposed to be testing.
 
 ### Open issues
 
@@ -805,7 +851,7 @@ single-container runs stop testing the property they are supposed to be testing.
   estimate and should be measured before it is quoted. Note this matters only for the
   standalone form; co-hosted grants are function calls.
 - The CA is the only component that knows every LP's virtual time. It should therefore
-  own the global timeline log and the deadlock dump. That makes it an observability
+  own the global timeline log and the stall diagnostic. That makes it an observability
   component as well as a coordination one, which is a benefit but also means its output
   format is part of the acceptance evidence and should be designed, not improvised.
 
@@ -845,7 +891,7 @@ runs.
 | **`dict` iteration** over request or block ids | **yes** | insertion-ordered since Python 3.7, and insertion order is the schedule's order, which is itself deterministic |
 | **`set` iteration** | **NO — and this is the trap** | see below |
 | **Thread scheduling inside an LP** | irrelevant **only under D3's delivery rules** | without in-transit counting and TSO delivery (D3 grant rule), a race inside the LP decides which drain sees a message and at what logical time a handler thread runs; with them, a handler runs only on a released message, at its timestamp, while the owner waits |
-| **Deliberately-real clock reads** (transport; bounds the CA cannot reach) | irrelevant | they never enter the virtual schedule. Metrics are not in this row: `11` D72 runs all three metric clocks on virtual time, so a scrape is an ordinary event in the schedule |
+| **Deliberately-real clock reads** (transport; bounds the CA cannot reach) | irrelevant | they never enter the virtual schedule. Metrics are not in this row (D1 detector (3)) |
 
 ### `set` is the trap, and it is worse than "unordered"
 
@@ -894,7 +940,7 @@ twice. Determinism is a precondition for comparison, not evidence of fidelity.
 ### Problem
 
 D3.1 records that the CA is the only component that knows every LP's virtual time, and
-that it should therefore own the global timeline log and the deadlock dump — and that
+that it should therefore own the global timeline log and the stall diagnostic — and that
 *"its output format is part of the acceptance evidence and should be designed, not
 improvised."* This is that design. It is deliberately small.
 
@@ -917,13 +963,17 @@ actionable: when the straggler check (D3.2) fails, the log already contains both
 histories up to the violation.
 
 **2. The stall diagnostic.** A stall the CA can see — every LP waiting at the CA, none
-grantable under the strict rule — is not a failure: it takes D3's recovery branch and
-appears in the timeline as an ordinary grant. A stall the CA cannot see can only be a
+grantable under the strict rule — is not a failure: it takes D3's recovery branch, and
+the timeline marks that grant as a recovery grant, the one kind whose TAG guarantee is
+weaker (D3). A stall the CA cannot see can only be a
 fault. The run keeps waiting, and after `DIAG_S` = 30 wall seconds without progress the
 CA prints once, for every LP: its virtual time, its state (`running` / `TAR` / `NER`)
 and target, the registered messages not yet delivered to it, and the `N[j] + D(j->i)`
-term that bounds its grant. An LP stuck delivering a message prints its channel, its
-sequence number and every thread's stack. Neither aborts. This is what makes a hang
+term that bounds its grant. An LP stuck delivering a message it released prints its
+channel, its sequence number and every thread's stack. An LP that has waited at the CA
+for `DIAG_S` also prints the buffered frames no grant has released, which is where a
+frame whose send was never registered sits when no later drain runs the straggler check.
+None of these aborts. This is what makes a hang
 diagnosable rather than merely silent.
 
 **3. The run summary**, written once at the end and carried in the run artifact:
@@ -1560,10 +1610,8 @@ Ordered by how much they could cost.
 
 1. **Silent failure is the dominant risk mode.** Every failure in D3-D5 produces a
    plausible latency table rather than an exception. The mitigations — always-on
-   assertions, a stall the CA can see resolved by Chandy–Misra deadlock detection and
-   recovery, one the CA cannot see named by a `DIAG_S` diagnostic while the run keeps
-   waiting (never an abort), a run that ends only with `end_workload` (D3), the AST
-   test — are the design, not decoration. This
+   assertions, the D3 stall rules (recovery, or one `DIAG_S` diagnostic, never an
+   abort), the AST test — are the design, not decoration. This
    project's history contains at least four instances of a plausible artifact from a
    broken run being read as a result for a day or more.
 2. **Simulation speed is unmeasured under this architecture.** The prior design was
