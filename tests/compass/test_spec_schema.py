@@ -809,6 +809,16 @@ def test_the_closed_schema_refuses_a_key_no_rule_names():
     assert "some_future_engine_knob" in refusal.value.what
 
 
+def test_the_reader_raises_the_first_refusal_the_walk_meets():
+    # Two unknown keys in one block, one before its fields and one after, so a
+    # reader that raised any later refusal names the other key.
+    edited = document()
+    edited["device"] = {"first_knob": 1, **edited["device"], "last_knob": 2}
+    with pytest.raises(SpecRefusal) as refusal:
+        MachineSpec.from_mapping(edited)
+    assert "`device.first_knob`" in refusal.value.what
+
+
 # --- no defaults for the runtime constants -----------------------------------
 
 
@@ -1211,6 +1221,15 @@ def test_the_other_accessors_decline_on_a_fragment_rather_than_raise():
     with pytest.raises(SpecRefusal) as block:
         read().runtime_constant("cudagraph_pool")
     assert block.value.rule is Rule.ADDRESSING
+
+
+def test_a_width_table_a_fragment_lacks_is_declined_rather_than_raised():
+    # A width-keyed constant is read past the point where a single-valued one
+    # returns, so it is declined at its own read.
+    name = "driver_and_collective_reserve_bytes"
+    with pytest.raises(SpecRefusal) as refusal:
+        without(f"device.runtime_constants.{name}").runtime_constant(name, 2)
+    assert refusal.value.rule is Rule.TOTALITY
 
 
 # --- what the package reaches ------------------------------------------------
