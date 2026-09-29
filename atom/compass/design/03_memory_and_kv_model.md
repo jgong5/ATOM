@@ -49,9 +49,9 @@ about the device.
 
 Two changes only:
 
-1. `allocate_kv_cache` becomes a no-op in the simulated runner (`RapidServeModelRunner`
-   already does exactly this in `model_runner.py::RapidServeModelRunner.allocate_kv_cache`),
-   so no tensor is created.
+1. `allocate_kv_cache` creates no tensor in the simulated runner. It passes an empty
+   registry to ATOM's `set_kv_cache_data`, which builds the worker-side KV connector when
+   a `compass` `kv_transfer_config` is set (#428).
 2. `get_num_blocks` returns a block count produced from a device model rather than from
    device readings. See D14.
 
@@ -127,10 +127,28 @@ probed per request. Whether that is 0.1 ms or 10 ms is unmeasured. Recorded as *
 
 ### Open issues
 
-- `model_runner.py::ModelRunner.allocate_kv_cache` also registers tensors globally via
-  `set_kv_cache_data` and cross-validates expected against actual bytes. The no-op must
-  keep whatever downstream code reads from that registry satisfied, or supply a
-  descriptor-shaped stand-in.
+- **Resolved by #428.** `model_runner.py::ModelRunner.allocate_kv_cache` also registers
+  tensors globally via `set_kv_cache_data`. The Compass override makes the same call with
+  an empty registry, so the registry is `{}` (`forward_context.py:987`), and no stand-in
+  is needed, because nothing reads it under the Compass runner:
+  - No module under `atom/compass` or `scripts/compass` reads it.
+  - Outside `atom/plugin`, ATOM reads it in three kinds of place. `set_forward_context`
+    copies it into each step's context, and is called from
+    `model_runner.py::ModelRunner.prepare_inputs`, from graph capture and from
+    `Drafter.warmup_draft_graphs`; `UBatchWrapper._make_ubatch_context` copies that
+    again per micro-batch. Attention forwards read the copy:
+    `PagedAttentionImpl.rope_cache` and `SparseMHAPagedAttentionImpl.rope_cache`
+    (`attention_mha.py`), `MLAAttention.forward_impl` (`attention_mla.py`),
+    `GatedDeltaNet.forward` (`attention_gdn.py`) and `KimiKDAAttention._forward_impl`
+    (`models/kimi_k3.py`). And the drafter reads it outside any model forward, in
+    `DSparkProposer._resolve_dtype_q` (`spec_decode/dspark_proposer.py`).
+  - `atom/plugin` reads it only in plugin mode, where vLLM, SGLang or RTP-LLM runs ATOM's
+    model code. The mode defaults to `"atom"`, which is not a plugin mode
+    (`plugin/prepare.py`).
+  - The Compass runner reaches none of these: its `forward` and `capture_cudagraph`
+    replace ATOM's and run none of `prepare_inputs`, the model, the drafter or a
+    capture. Its `_build_and_load_model` also sets the model to an `UnbuiltModel`,
+    whose `forward` refuses, and refuses a speculative config.
 - `BlockManager.hash_block_size = block_size * dcp_world_size`
   (`block_manager.py:93`) — decode context parallelism changes the hash granularity.
   Out of scope now; noted so it is not discovered later.

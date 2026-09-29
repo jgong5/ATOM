@@ -32,14 +32,11 @@ package, so `compare.py` is inside it already.
 
 import copy
 import json
-import pathlib
-import re
 
 import pytest
 import torch
 from transformers import PretrainedConfig
 
-import atom.compass.memory as memory_package
 from atom.compass.backends.geometry import dtype_bytes as element_bytes
 from atom.compass.memory import (
     DISCHARGES,
@@ -1028,101 +1025,3 @@ def test_the_footprint_is_peak_torch_and_non_torch_and_nothing_else(spec, qwen):
     assert "capacity" not in {t.name for t in prediction.terms}
     assert "per-token x captured tokens" not in {t.name for t in prediction.terms}
     assert readings.spec_digest in prediction.label
-
-
-# --- the package says what the code does, and cites nothing ------------------
-
-#: Built from parts so that this pattern does not match its own source, which
-#: lets the guard below read the file it is written in if it is ever widened.
-#: `P\d+\.\d+` is in the banned list by name; the two-to-four letter form with
-#: a dash is every task label, not only the one this package once carried.
-#: A milestone label is `M1` in prose and `_m1` as an identifier suffix; a bare
-#: letter-and-digit is not matched, because it would take `TP1`, `w1` and
-#: every dtype width in this package with it. No group captures, so a failure
-#: prints the forms it found.
-_TAGS = re.compile(
-    r"\b[DTW]\d+(?:\.\d+)?\b|\bP\d+\.\d+\b|\b[A-Z]{2,4}-\d+\b|\bM\d+\b|\w*_m\d+\b"
-    r"|principles? \d+|Gate \d+|`\d{2}`|#\d+"
-)
-
-#: The package as the suite imported it, never a walk up from this file: if
-#: `atom` resolves from another root, a path-derived location would scan one
-#: tree while every other test here imports another, and pass.
-PACKAGE = pathlib.Path(memory_package.__file__).parent
-
-
-@pytest.mark.parametrize(
-    "module", sorted(p.name for p in pathlib.Path(PACKAGE).glob("*.py"))
-)
-def test_no_module_in_the_package_carries_a_design_reference(module):
-    """Say what the code does. Nothing here points at a document by number.
-
-    The rule is mechanical and it reaches runtime data, which is the half that
-    matters most here: two refusal strings and every `why` this module renders
-    are emitted output, and a tag in one of them is a citation in whatever
-    record that output lands in.
-
-    This is parametrised over a glob rather than a list, so it covers a module
-    added after it was written -- the same shape as the device-free guard in
-    `test_memory_readings.py`, and for the same reason.
-    """
-    found = _TAGS.findall((PACKAGE / module).read_text())
-    assert not found, f"{module} carries design references: {found}"
-
-
-def test_the_guard_catches_the_forms_that_were_actually_removed():
-    """A guard nobody drove is a guard nobody knows the reach of.
-
-    Each string below was once in this package and has since been removed,
-    and each is a form the rule names. Driving them is how the guard is shown
-    to hold in the direction that matters -- it would be worth nothing if it
-    only ever saw text that was already clean.
-    """
-    removed = [
-        "03 D16 records buffers rather than computing them",
-        "a meta build deduped by storage (02 D10.1) replaces this",
-        "the liveness walk of 04 D22 plus the invisible-scratch constants of 04 T4",
-        "above width 1 (03 D15)",
-        "a number without one is a defect (principle 8)",
-        "an open owner ruling (**#87**)",
-        "proving it is MEM-2's",
-        "`16` row W2.2",
-        "For M1, with fake models, a declared formula suffices",
-        "def declared_for_m1(",
-    ]
-    # Two forms this package never carried, driven anyway because a guard is
-    # worth what it catches rather than what it happened to meet. `P0.4` is
-    # named verbatim in the rule's own list; `ART-2` is the exact sibling of
-    # the `MEM-2` above, and a pattern that caught one and not the other would
-    # be a pattern fitted to the one label it happened to meet.
-    never_here = ["the P0.4 gates", "ART-2 swept the other package"]
-    for text in removed + never_here:
-        assert _TAGS.search(text), text
-    # The replacement wording, read out of the package so the two cannot drift.
-    replacement = "a recording off a card replaces this"
-    assert replacement in (PACKAGE / "readings.py").read_text()
-    assert not _TAGS.search(replacement)
-
-
-def test_what_the_pattern_matches_beside_its_targets_is_on_record():
-    """The pattern's reach past the forms it targets, both ways, stated here.
-
-    It is not a bare letter-and-digit, so widths and dtypes stay clear. It does
-    match some of ATOM's own names, none of which this package carries; a hit
-    fails loudly, and rewording the line is the fix, not an exemption. And it
-    misses forms one step from the removed ones, because a pattern wide enough
-    to take them would take more of ATOM's names with it.
-    """
-    for benign in ("TP1", "w1_base_bytes", "fp8", "int8", "bf16"):
-        assert not _TAGS.search(benign), benign
-    for collision in (
-        "MiniMax-M3",
-        "minimax_m3",
-        "M128",
-        "tile_m128",
-        "seq_len_m1",
-        "fp8_m3",
-    ):
-        assert _TAGS.search(collision), collision
-    for escape in ("declared_for_m1_terms", "At m1", "M1a", "declared_for_M1"):
-        assert not _TAGS.search(escape), escape

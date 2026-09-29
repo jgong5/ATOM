@@ -424,7 +424,7 @@ class NonAllocatingRunner:
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
         from atom.utils.forward_context import set_kv_cache_data
 
-        kv = getattr(self.config, "kv_transfer_config", None)
+        kv = _config_field(self, "kv_transfer_config")
         if kv:
             name = KVConnectorFactory.canonical_name(kv.get("kv_connector", "moriio"))
             if name != "compass":
