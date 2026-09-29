@@ -140,7 +140,8 @@ def _arity(parent):
 
     `ast.Return` is the case worth naming, because reading only `ast.Assign`
     scores `return self.runner_mgr.call_func(...)` as a discard when the value
-    is in fact the function's result -- `engine_core.py:749`, `dummy_execution`.
+    is in fact the function's result -- `DPEngineCoreProc._execute_dummy_batch`,
+    `dummy_execution`.
 
     Any other shape -- a list or starred target, an annotated one, a chained
     target, an argument to another call -- is scored `None` rather than `1`,
@@ -644,8 +645,8 @@ def test_forward_refuses_and_its_reply_is_one_object_read_for_nine_attributes():
     """What a successor owes: one value, never unpacked, read by attribute.
 
     Four sites broadcast it, two per file. Three use the reply and the fourth
-    discards it -- `pp_engine_core.py:118`, the head's launch, whose tokens
-    come back over the transport instead. The nine attribute names are
+    discards it -- `PPEngineCoreProc._pp_head_step`, the head's launch, whose
+    tokens come back over the transport instead. The nine attribute names are
     recovered from the consumers rather than listed, so a tenth read, or a
     rename, fails here.
     """
@@ -688,12 +689,12 @@ def test_forward_refuses_and_its_reply_is_one_object_read_for_nine_attributes():
 def test_the_pp_reply_is_read_in_the_head_and_not_at_the_last_stages_call():
     """The correction that a substring check cannot make.
 
-    `pp_engine_core.py:379` is inside `_downstream_busy_loop` -- the **last**
-    stage. Nothing there reads the reply: the two nearby `.req_ids` reads are
-    on `batch`, and `fwd_out` is handed whole to `send_tokens`. The `.req_ids`
-    read is one ZMQ hop later, in the head, at `:144-147`, on what
-    `recv_tokens()` returned at `:139`. So the reply must survive a pickle
-    round trip, which reading only the call site would never say.
+    The `forward` call in `PPEngineCoreProc._downstream_busy_loop` is in the
+    **last** stage. Nothing there reads the reply: the two nearby `.req_ids`
+    reads are on `batch`, and `fwd_out` is handed whole to `send_tokens`. The
+    `.req_ids` read is one ZMQ hop later, in the head's `_pp_head_step`, on
+    what `recv_tokens()` returned. So the reply must survive a pickle round
+    trip, which reading only the call site would never say.
     """
     tree = ast.parse((ENGINE / "pp_engine_core.py").read_text())
     enclosing = {}
@@ -741,9 +742,10 @@ def test_dummy_execution_is_this_runners_forward_and_refuses_with_it():
         for n in ast.walk(body)
     )
     assert body.body[-1].value.value is True
-    # Its one site returns the reply to its own caller (`engine_core.py:749`),
-    # which is a read and not a discard. Scoring it 0 is the modelling error
-    # `_arity` exists to avoid, and this is the site that catches it.
+    # Its one site returns the reply to its own caller
+    # (`DPEngineCoreProc._execute_dummy_batch`), which is a read and not a
+    # discard. Scoring it 0 is the modelling error `_arity` exists to avoid,
+    # and this is the site that catches it.
     assert [s.arity for s in SITES["dummy_execution"]] == [1]
 
 
@@ -772,8 +774,8 @@ def test_the_profiler_replies_are_forwarded_whole_and_never_unpacked():
     `ModelRunner.stop_profiler` documents a `{trace_dir, elapsed}` dict, and it
     is tempting to read that as the shape the call site requires. It is not.
     `engine_utility.py` logs the reply whole and puts it in a response
-    envelope; `llm_engine.py:300`'s `.get("result", {})` is on that envelope,
-    not on the reply; and `trace_dir` appears nowhere on either side of the
+    envelope; `LLMEngine.stop_profile`'s `.get("result", {})` is on that
+    envelope, not on the reply; and `trace_dir` appears nowhere on either side of the
     reply except the three lines of `model_runner.py` that produce it. What
     the callers impose is non-None and picklable. The keys are a convention a
     successor inherits, and stating them as a requirement would be stating a
@@ -1092,11 +1094,12 @@ def test_the_zero_block_form_in_the_tree_answers_two_of_the_four_keys():
     shortfall is invisible at zero blocks and not invisible above them, so the
     count is asserted here rather than left to be noticed.
 
-    The default is not neutral either. `block_manager.py:116-121` turns a
-    missing `pool_entries` into `num_state_slots = 0`, which is a decision
-    input at `:162` and in the permanent-unschedulable predicate at
-    `scheduler.py:1364-1376` -- so on a per-request-state model the missing key
-    reads as "no slots ever existed" rather than raising.
+    The default is not neutral either. `BlockManager.__init__` turns a
+    missing `pool_entries` into `num_state_slots = 0`, which decides there
+    whether state checkpoints are enabled, and is read again by the
+    permanent-unschedulable predicate in `Scheduler._warn_if_unschedulable`
+    -- so on a per-request-state model the missing key reads as "no slots
+    ever existed" rather than raising.
     """
     short = next(
         n

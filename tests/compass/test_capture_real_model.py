@@ -65,7 +65,7 @@ Three sites, in an order rather than a set. A free symbol is solved by whichever
 line reaches it first, so repairing one does not always close what it solved:
 closing the first moves the caller's bound into an ATOM assertion helper in
 another file and a later phase of the step -- `forward_context.py`, reached
-from the `run_model` call at `model_runner.py:3281`, with `prepare_inputs`
+from the `run_model` call in `ModelRunner.forward`, with `prepare_inputs`
 already returned. The plain symbolic pass records the first two; a third pass
 simulates the first closed, from outside ATOM, and records what is behind it.
 All three are pinned, and there is no claim that three is all there are -- only
@@ -211,7 +211,7 @@ SITE_TWO = (
         "atom/utils/__init__.py:725 in copy_to_gpu",
     ),
 )
-# `assert_shape_contract`, reached with the bound still free once `:1115` no
+# `assert_shape_contract`, reached with the bound still free once site one no
 # longer takes `__index__` of it. It was recorded one frame deeper, in the
 # `_rows` helper, where `int(t.shape[0])` converted a dimension before the
 # assertion compared it; `_rows` no longer converts, so what is left is the
@@ -2481,7 +2481,7 @@ def test_the_first_two_specialisation_sites_are_where_they_were_measured():
     """The two places a free symbol stops being free first.
 
     Not two independent sites. They are the first two in an order: the bound
-    the caller passes is solved at `:1115` because that is the first line to
+    the caller passes is solved at site one because that is the first line to
     take `__index__` of it, and the buffer's own dimension is solved in
     `copy_to_gpu` because that is the first copy whose slice does not cover
     it. Both are pinned by value and by the frames they happened through, so a
@@ -2513,11 +2513,11 @@ def test_closing_site_one_moves_the_bound_to_a_third_site():
     the other half, and it is the reason the sites are an order rather than a
     set: with the numpy view reading the bound's hint instead of solving it --
     the simulated site-one repair, applied from outside ATOM -- the bound
-    survives `:1115` and is solved in another file and a later phase of the
-    step, inside ATOM's own shape-contract assertion: `forward_context.py:444
-    in assert_shape_contract`, reached from the `run_model` call at
-    `model_runner.py:3281`, with `prepare_inputs` already returned -- not
-    fourteen lines after `aiter_attention.py:1115`.
+    survives site one and is solved in another file and a later phase of the
+    step, inside ATOM's own shape-contract assertion: `assert_shape_contract`
+    in `atom/utils/forward_context.py`, reached from the `run_model` call in
+    `ModelRunner.forward`, with `prepare_inputs` already returned -- not
+    further down `prepare_decode`.
 
     The second site is untouched by the repair, exactly as recorded.
 
