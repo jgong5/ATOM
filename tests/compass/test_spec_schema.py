@@ -811,12 +811,13 @@ def test_the_closed_schema_refuses_a_key_no_rule_names():
 
 def test_the_reader_raises_the_first_refusal_the_walk_meets():
     # Two unknown keys in one block, one before its fields and one after, so a
-    # reader that raised any later refusal names the other key.
+    # reader that raised any later refusal names the other key. The first key
+    # sorts last, so a walk in sorted order names the other key as well.
     edited = document()
-    edited["device"] = {"first_knob": 1, **edited["device"], "last_knob": 2}
+    edited["device"] = {"zeta_knob": 1, **edited["device"], "alpha_knob": 2}
     with pytest.raises(SpecRefusal) as refusal:
         MachineSpec.from_mapping(edited)
-    assert "`device.first_knob`" in refusal.value.what
+    assert "`device.zeta_knob`" in refusal.value.what
 
 
 # --- no defaults for the runtime constants -----------------------------------
