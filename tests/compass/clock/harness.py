@@ -11,12 +11,12 @@ requests as it receives replies.
 
 The driver holds the check the authority cannot make about itself: no grant
 may move an LP past a message registered for it that it was not handed, and no
-LP is handed a message that arrives after its grant.
+LP is handed a message that arrives after its grant, or at or before the grant
+it had last.
 """
 
 import collections
 import math
-import time
 from dataclasses import dataclass
 
 from atom.compass.clock import END, ClockAuthority
@@ -60,7 +60,6 @@ class RunReport:
     channels: dict  # channel -> messages sent on it
     timers: int
     modelled_seconds: float
-    wall_seconds: float
     unfinished: tuple[str, ...]
     stopped_by: str
 
@@ -72,7 +71,7 @@ class RunReport:
 class SyntheticRun:
     """One deployment, one workload, one request order, driven to the end."""
 
-    def __init__(self, deployment, workload, order=None, grant_cap=None):
+    def __init__(self, deployment, workload, order=None, grant_cap=100_000):
         self.deployment = deployment
         self.table = DEPLOYMENTS[deployment]()
         self.clock = _Counted(self.table)
@@ -81,6 +80,7 @@ class SyntheticRun:
         self.rank = {lp: order.index(str(lp)) for lp in self.lps}
         self.grant_cap = grant_cap
         self.in_flight = {lp: {} for lp in self.lps}  # (channel, seq) -> (a, payload)
+        self.granted = dict.fromkeys(self.lps, -math.inf)  # each LP's last grant
         self.requests = {lp: collections.Counter() for lp in self.lps}
         self.reply_log = {lp: [] for lp in self.lps}
         self.channels = collections.Counter()
@@ -88,7 +88,6 @@ class SyntheticRun:
         self.messages = self.handled = self.handled_before_grant = 0
 
     def run(self):
-        started = time.perf_counter()
         ready = {lp: person.run(0.0) for lp, person in self.lps.items()}
         stopped_by = None
         try:
@@ -114,7 +113,7 @@ class SyntheticRun:
                     ready[i] = self.lps[i].on_grant(g, messages)
         except GrantsExhausted:
             stopped_by = f"the grant cap of {self.grant_cap} was reached"
-        return self._report(time.perf_counter() - started, stopped_by)
+        return self._report(stopped_by)
 
     def _post(self, lp):
         """Take the LP's sends since its last request as its send log."""
@@ -131,19 +130,21 @@ class SyntheticRun:
 
     def _check_cap(self):
         grants = sum(map(len, self.reply_log.values()))
-        if self.grant_cap is not None and grants >= self.grant_cap:
+        if grants >= self.grant_cap:
             raise GrantsExhausted
 
     def _hand_over(self, lp, g, released):
         """The released messages, in `(arrival, channel, seq)` order."""
+        last, self.granted[lp] = self.granted[lp], g
         messages = []
         for channel, pairs in released.items():
             for seq, a in pairs:
                 arrival, payload = self.in_flight[lp].pop((channel, seq))
-                if a != arrival or a > g:
+                if a != arrival or not last < a <= g:
                     raise SteppedOverEvent(
                         f"{lp} was handed {channel} seq {seq} arriving at {a} "
-                        f"(sent for {arrival}) on a grant to {g}"
+                        f"(sent for {arrival}) on a grant to {g}, its previous "
+                        f"grant {last}"
                     )
                 messages.append((a, channel, seq, payload))
         messages.sort(key=lambda m: m[:3])
@@ -165,7 +166,7 @@ class SyntheticRun:
                 + "\n".join(map(repr, self.clock.lp_table()))
             )
 
-    def _report(self, wall_seconds, stopped_by):
+    def _report(self, stopped_by):
         finite = [g for log in self.reply_log.values() for g, _ in log if g < math.inf]
         return RunReport(
             deployment=self.deployment,
@@ -181,7 +182,6 @@ class SyntheticRun:
             channels=dict(self.channels),
             timers=sum(p.timers for p in self.lps.values()),
             modelled_seconds=max(finite, default=0.0),
-            wall_seconds=wall_seconds,
             unfinished=tuple(str(lp) for lp, p in self.lps.items() if not p.finished),
             stopped_by=stopped_by or "the driver ran out of requests",
         )

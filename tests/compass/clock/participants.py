@@ -3,7 +3,7 @@
 
 An LP holds its own clock and nothing else. The driver hands it a grant `G` and
 the messages the grant released. It handles them one at a time in
-`(arrival, channel, seq)` order with its clock at each arrival, then runs at `G`
+`(arrival, channel, seq)` order, each at its arrival, then runs at `G`
 and returns its next request: `TAR(t)` while a step is being charged, `NER(t)`
 while idle until its next local event (infinite when it has none), or `END`.
 
@@ -21,16 +21,20 @@ from atom.compass.clock import END, NER, TAR, LpId
 
 # Declared, not measured: the tokenizer station of each frontend, and the
 # simulated KV transfer between the two engines of a prefill-decode deployment.
+# Every time here and in the workload is a binary fraction, so sums are exact
+# and a grant can tie its bound.
 TOKENIZER_WIDTH = 2
-ENCODE_FIXED_S = 1.0e-4
-ENCODE_TOKENS_PER_S = 2.0e6
-KV_LATENCY_S = 1.0e-4
-KV_BYTES_PER_TOKEN = 70_000
-KV_BANDWIDTH_BYTES_PER_S = 50.0e9
-KV_NOTIFY_S = 1.0e-4
-#: The idle KV drain pace, the value of `KV_IDLE_DRAIN_INTERVAL_S` in
-#: `atom/model_engine/engine_core.py`.
-KV_IDLE_DRAIN_S = 1.0e-3
+ENCODE_FIXED_S = 2.0**-10
+ENCODE_TOKENS_PER_S = 2.0**20
+KV_LATENCY_S = 2.0**-10
+KV_BYTES_PER_TOKEN = 2**16
+KV_BANDWIDTH_BYTES_PER_S = 2.0**36
+KV_NOTIFY_S = 2.0**-10
+#: The idle KV drain pace and the metrics push interval, the values of
+#: `KV_IDLE_DRAIN_INTERVAL_S` (1 ms, here 2**-10 s) and `METRICS_PUSH_INTERVAL_S`
+#: in `atom/model_engine/engine_core.py`.
+KV_IDLE_DRAIN_S = 2.0**-10
+METRICS_PUSH_S = 5.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -53,25 +57,20 @@ class Workload:
 
 
 #: A measured prior run: 106 prefill and 4,346 decode steps, the last response at
-#: about 267 s of modelled time. The prompt lengths and the scrape interval are
-#: declared, not taken from that run.
+#: about 267 s of modelled time. Its step times (0.30 s, 0.054 s) and arrival
+#: interval (5.0861 s) are rounded onto the binary grid, which moves the last
+#: response later. The prompt lengths and the scrape interval are declared, not
+#: taken from that run.
 DESIGN_WORKLOAD = Workload(
     requests=106,
     prefill_steps=1,
     decode_steps=41,
-    prefill_step_seconds=0.30,
-    decode_step_seconds=0.054,
-    arrival_interval_seconds=5.0861,
-    prompt_tokens=(1000, 3000),
-    scrape_interval_seconds=15.0,
+    prefill_step_seconds=0.25,
+    decode_step_seconds=0.0625,
+    arrival_interval_seconds=5.0,
+    prompt_tokens=(1024, 3072),
+    scrape_interval_seconds=16.0,
 )
-
-
-def scaled(workload: Workload, requests: int, decode_steps: int = 0) -> Workload:
-    """The same trace shape, shorter."""
-    return dataclasses.replace(
-        workload, requests=requests, decode_steps=decode_steps or workload.decode_steps
-    )
 
 
 def transfer_seconds(tokens: int) -> float:
@@ -98,7 +97,7 @@ class _Lp:
         self.table = table
         self.clock = 0.0
         self.outbox = []  # (channel, seq, arrival, payload) since the last request
-        self.timers = 0  # local timer firings: scrapes and idle drain ticks
+        self.timers = 0  # local timer firings: scrapes, pushes, idle drain ticks
         self._seq = collections.Counter()
 
     def send(self, channel, payload):
@@ -110,7 +109,6 @@ class _Lp:
     def on_grant(self, g, messages):
         """Step through the released messages at their arrivals, then run at `g`."""
         for arrival, channel, _seq, payload in messages:
-            self.clock = arrival
             self.handle(channel, arrival, payload)
         self.clock = g
         return self.run(g)
@@ -204,7 +202,7 @@ class Frontend(_Lp):
             heapq.heappush(self.tokenized, (done, request, tokens))
         elif kind == "scrape":
             self.answers.append((self.stream, payload))
-        else:
+        elif kind == "output":  # a metrics push is cached, and sends nothing
             _, request, tokens, finished = payload
             if self.relay is None:
                 self.answers.append((self.stream, ("chunk", request, finished)))
@@ -228,6 +226,9 @@ class Frontend(_Lp):
 class Engine(_Lp):
     """One engine LP: every step is a TAR, and an idle engine waits in NER.
 
+    As ATOM's busy loop does, it pushes a metrics snapshot on its output channel
+    at 0 and then every `METRICS_PUSH_S`, so it never waits on `NER(+inf)`.
+
     A step serves one request, round robin, and puts its output. On a prefill
     engine a finished request keeps its blocks until the decode side's write
     request has arrived and the write is done at `max(a, r) + T`. On a decode
@@ -250,6 +251,7 @@ class Engine(_Lp):
         self.write_arrivals = {}  # request -> a
         self.parked = {}  # request -> (ready, tokens)
         self.drain_due = None
+        self.next_push = 0.0
 
     def handle(self, channel, arrival, payload):
         if payload[0] == "write":
@@ -261,6 +263,10 @@ class Engine(_Lp):
         boundary = self.step is not None
         if boundary:
             self._finish_step(now)
+        if now >= self.next_push:
+            self.timers += 1
+            self.next_push = now + METRICS_PUSH_S
+            self.send(self.output, ("metrics",))
         tick = self.drain_due is not None and now >= self.drain_due
         if boundary or tick:
             self.timers += tick
@@ -273,8 +279,8 @@ class Engine(_Lp):
         if self.deferred or self.parked:
             if self.drain_due is None:
                 self.drain_due = now + KV_IDLE_DRAIN_S
-            return NER, self.drain_due
-        return NER, math.inf
+            return NER, min(self.drain_due, self.next_push)
+        return NER, self.next_push
 
     def _finish_step(self, now):
         request, tokens, left = self.step

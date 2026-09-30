@@ -13,8 +13,9 @@ What each group defends:
 * **The request order decides nothing**: on the full-length trace each LP's
   replies are the same under four orders of submission, which do interleave
   differently.
-* **The checks fire**: a message held back is a step-over, and a message never
-  sent leaves its receiver unfinished while the scrape keeps the run going.
+* **The checks fire**: a message held back, or handed one grant late, is a
+  step-over, and a message never sent leaves its receiver unfinished while the
+  engine's metrics push keeps the run going.
 """
 
 import dataclasses
@@ -24,9 +25,9 @@ import pytest
 
 from .deployments import DEPLOYMENTS
 from .harness import SteppedOverEvent, SyntheticRun
-from .participants import DESIGN_WORKLOAD, Station, scaled
+from .participants import DESIGN_WORKLOAD, ENCODE_TOKENS_PER_S
 
-BRIEF = scaled(DESIGN_WORKLOAD, requests=8, decode_steps=3)
+BRIEF = dataclasses.replace(DESIGN_WORKLOAD, requests=8, decode_steps=3)
 
 LPS = {
     "single-deployment": ("engine", "frontend", "traffic"),
@@ -96,6 +97,18 @@ def test_every_mechanism_is_driven(report):
     assert report.timers > 0
 
 
+def test_a_pair_from_one_arrival_is_tokenized_side_by_side(report):
+    first, second = sorted(
+        a
+        for log in report.reply_log.values()
+        for _, m in log
+        for c, _, a in m
+        if ":request#" in c
+    )[:2]
+    short, long = BRIEF.prompt_tokens
+    assert second - first == (long - short) / ENCODE_TOKENS_PER_S
+
+
 @pytest.mark.parametrize("name", sorted(DEPLOYMENTS))
 def test_each_lps_replies_do_not_depend_on_the_request_order(name):
     reports = [
@@ -106,15 +119,9 @@ def test_each_lps_replies_do_not_depend_on_the_request_order(name):
         assert r.stopped_by == "END from traffic"
         assert r.steps == steps(DESIGN_WORKLOAD)
         assert r.recovered == 0
+        assert r.handled == r.messages
         assert {lp: sum(k.values()) for lp, k in r.requests.items()} == r.replies
         assert r.reply_log == reports[0].reply_log
-
-
-def test_a_pair_tokenized_together_completes_apart_only_through_its_lengths():
-    wide = Station(2)
-    assert (wide.admit(0.0, 1.0), wide.admit(0.0, 2.0)) == (1.0, 2.0)
-    wide = Station(2)
-    assert (wide.admit(0.0, 1.0), wide.admit(0.0, 1.0)) == (1.0, 1.0)
 
 
 class TestTheChecksFire:
@@ -124,15 +131,18 @@ class TestTheChecksFire:
         with pytest.raises(SteppedOverEvent, match="never handed"):
             run.run()
 
-    @pytest.mark.parametrize(
-        "scrape_s, stopped_by",
-        [
-            (BRIEF.scrape_interval_seconds, "the grant cap of 2000 was reached"),
-            (math.inf, "every N infinite"),
-        ],
-    )
-    def test_a_message_never_sent_leaves_traffic_unfinished(self, scrape_s, stopped_by):
-        """Only the scrape keeps a run with no END from ending on its own."""
+    @pytest.mark.parametrize("name", sorted(DEPLOYMENTS))
+    def test_a_message_handed_one_grant_late_is_a_step_over(self, name):
+        """Granting at `N` equal to its bound hands a tied send over a grant late."""
+        run = SyntheticRun(name, DESIGN_WORKLOAD, orders(name)[1])
+        lbts = run.clock._lbts
+        run.clock._lbts = lambda i: math.nextafter(lbts(i), math.inf)
+        with pytest.raises(SteppedOverEvent, match="previous grant"):
+            run.run()
+
+    @pytest.mark.parametrize("scrape_s", [BRIEF.scrape_interval_seconds, math.inf])
+    def test_a_message_never_sent_leaves_traffic_unfinished(self, scrape_s):
+        """With no scrape, the engine's metrics push still keeps the run going."""
         workload = dataclasses.replace(BRIEF, scrape_interval_seconds=scrape_s)
         run = SyntheticRun("single-deployment", workload, grant_cap=2000)
         frontend = next(lp for lp in run.lps.values() if str(lp.name) == "frontend")
@@ -141,5 +151,5 @@ class TestTheChecksFire:
             None if channel == "frontend->traffic:stream" else send(channel, payload)
         )
         report = run.run()
-        assert report.stopped_by == stopped_by
+        assert report.stopped_by == "the grant cap of 2000 was reached"
         assert report.unfinished == ("traffic",)

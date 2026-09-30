@@ -14,11 +14,12 @@ from atom.compass.clock import prefill_decode_table, single_engine_table
 
 from .participants import Engine, Frontend, Traffic
 
-# Declared, not measured: the lookaheads the tables leave to the caller.
-IPC_S = 1.0e-4
-STREAM_S = 2.0e-3
-ROUTER_S = 1.0e-3
-KV_WRITE_REQ_S = 1.0e-4
+# Declared, not measured: the lookaheads the tables leave to the caller, on the
+# binary grid the participants' times use.
+IPC_S = 2.0**-10
+STREAM_S = 2.0**-9
+ROUTER_S = 2.0**-10
+KV_WRITE_REQ_S = 2.0**-10
 
 DEPLOYMENTS = {
     "single-deployment": functools.partial(
