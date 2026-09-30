@@ -1,9 +1,9 @@
 # ATOM Compass — Design
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
-against it yet.** Every document carries a matching header. **109 decisions — D0–D94
+against it yet.** Every document carries a matching header. **110 decisions — D0–D95
 with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **88 registered
-TODOs — T1–T88 with no gaps, of which 82 are open** (T10, T15, T22, T48 and T65 are struck
+TODOs — T1–T88 with no gaps, of which 80 are open** (T10, T15, T22, T48, T65, T71 and T84 are struck
 through as done, and T77 was opened and closed by P0.1); they, the load-bearing assumptions and the
 cross-cutting issues live in **`12_open_items.md`**. Implementation follows the execution
 plan in `16`.
@@ -316,7 +316,7 @@ fitted, interpolated, extrapolated or analytical — and a step reports the mixt
 |---|---|
 | Throughput prediction | error ≤ 10% |
 | Time per output token (TPOT) | error ≤ 10% |
-| Time to first token (TTFT) | error ≤ 10% |
+| Time to first token (TTFT) | error ≤ 15% (`16` D95) |
 | Each non-KV memory term | error ≤ 10% |
 | KV capacity / block count | **error ≤ 5%** |
 | Generalization | predict beyond the configurations used for calibration |
@@ -331,14 +331,9 @@ Final proof is **paired simulated and real execution of cc-traces proper**.
 
 | # | Milestone |
 |---|---|
-| **M1** | Fake models covering prefill, decode, KV need and TP/DP/PP/EP; the discrete-event foundation; the test harness; PD aggregation and disaggregation driven by the cc-traces harness |
-| **M2** | Qwen3.8-27B on MI308X-class hardware, PD aggregation, **TP1** |
-| **M3** | Qwen3.8-27B, same hardware, **TP2 and TP4** |
-| **M3.5** | **Speculative decoding / MTP** mechanism on Qwen3.8-27B: structures, shapes, draft KV, declared acceptance (`14`) |
-| **M4** | Qwen3.8-27B, same hardware and TP configs, **PD disaggregation across two nodes** |
-| **M5** | Kimi-K3, same hardware, **TP8**, PD aggregation |
-| **M6** | Kimi-K3, **TP8, PD disaggregation** |
-| **M7** | Kimi-K3 with **DP, PP and EP** |
+| **M1** | **GPU-free as deployed, for DeepSeek-V4-Pro's P/D deployment** (`16` D95): the discrete-event foundation; fake models covering prefill, decode, KV need and TP/DP/EP; the test harness; 1P+1D through atomesh and Mooncake with DP-attention + EP8 inside each node; the same scheduling decisions as the real engine |
+| **M2 — v1** | **DeepSeek-V4-Pro 1P+1D on MI355X within the targets above**, graded by the separable results of `08` D44 and the configuration-ranking gate; **the MI455 roofline projection**, held to the soundness checks of `16` D95 |
+| ~~M3–M7~~ | Retired by `16` D95, which maps each one to where its scope went. PP, EP beyond one node, and further models come after v1 |
 
 Sequencing, dependencies and parallelisable work are in the execution plan (`16`). `00_initial_prompt.md` is the original seed and is
 **not** a design document — see *Development history*.
@@ -569,6 +564,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D78 – D81 | `13` The Configuration Surface |
 | D82 – D87 | `14` Speculative Decoding and MTP |
 | D88 – D94 | `15` Parallelism Support (TP, DP, PP, EP) |
+| D95 | `16` The Execution Plan |
 
 ### Headline decisions
 
