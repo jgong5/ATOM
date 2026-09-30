@@ -3,10 +3,12 @@
 
 What lives here: who the participants are (`LpId`), the order they are served
 in (`LpRegistry`), the channels between them with the lookahead each declares
-and the path distances that follow (`ChannelTable`), and the Clock Authority
+and the path distances that follow (`ChannelTable`), the Clock Authority
 that grants each one time from those distances and the messages it has
-registered (`ClockAuthority`). The transport that carries a request to the
-authority, and the runtime inside each participant, sit elsewhere.
+registered (`ClockAuthority`), and what a run says about itself: its timeline,
+the LP table as text, and the run summary (`observability`). The transport
+that carries a request to the authority, and the runtime inside each
+participant, sit elsewhere.
 
 Nothing here imports a device runtime, reads a clock, or opens a socket, which
 is what makes it testable on any machine.
@@ -35,20 +37,36 @@ from .channels import (
     single_engine_table,
 )
 from .identity import LpId
+from .observability import (
+    SPEED_TARGET_RATIO,
+    DetectorState,
+    RefusalTally,
+    RunSummary,
+    TimelineLog,
+    TimelineRecord,
+    lp_table_dump,
+)
 from .registry import LpRegistry
 
 __all__ = [
     "END",
     "NER",
+    "SPEED_TARGET_RATIO",
     "TAR",
     "BackdatedEvent",
     "Channel",
     "ChannelTable",
     "ClockAbort",
     "ClockAuthority",
+    "DetectorState",
     "LpId",
     "LpRegistry",
     "LpRow",
+    "RefusalTally",
+    "RunSummary",
+    "TimelineLog",
+    "TimelineRecord",
+    "lp_table_dump",
     "prefill_decode_table",
     "single_engine_table",
 ]
