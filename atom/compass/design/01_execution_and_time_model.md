@@ -772,11 +772,11 @@ LP is transport. Nine mechanisms cover the 212 sites, and **none is left undecid
 | K2 | Clock read | returns the LP's logical time | 6 | the arrive / leave / first-token stamps (first-token ×2), `_passed_delay`, the waiting-prefill age |
 | K3 | Idle point | NER: `next_event(t)` | 6 | the three step loops' spin, the PP bounded polls ×2, offline `get_output` |
 | K4 | Channel send | timestamped send, logged on the clock owner | 11 | PD direct sends ×2, PP sends ×3, output sends through the relay queue ×6 |
-| K5 | Channel receive | counted at the wait point, then TSO delivery | 12 | the engine input thread, the frontend output thread, the PD handler threads, the PP receives and zero-bound drains, the PP idle `flush_pp_send` ×2 |
+| K5 | Channel receive | counted at the wait point, then TSO delivery | 13 | the engine input thread, the frontend output thread, the PD handler threads, the PP receives and zero-bound drains, the PP `flush_pp_send` ×3 |
 | K6 | Wait inside one LP | LP aggregation: never reported to the CA | 35 | TP worker RPC and barriers, frontend coroutines awaiting their own process's data, control commands' calls to workers, the DP group's reduction |
 | K7 | Virtual timer | the timer runs on the LP clock | 8 | idle KV drain, metrics push ×2 and refresh, Anthropic ping, keep-alive, the silence warning, the control-command reply timeout |
 | K8 | Real bound | the CA cannot reach it, or it stays real on purpose: configuration | 5 | the Rust router ×4, process-death detection |
-| K9 | Outside the model | outside the simulated window, inside replaced code, or cannot park | 113 | startup and shutdown, the replaced runner and RDMA backends, collectives inside the real forward, text scanners |
+| K9 | Outside the model | outside the simulated window, inside replaced code, or cannot park | 112 | startup and shutdown, the replaced runner and RDMA backends, collectives inside the real forward, text scanners |
 
 **The counts are measured, not estimated.** The rows are
 `atom/compass/audit/sync_sites.json`, produced by the scanner beside it and held to the
@@ -792,12 +792,12 @@ natural mechanism (A→K1, B→K5, C1→K8, C2→K7, ignore→K9).
 | B | | | 1 | | 8 | 25 | | | 2 | 36 |
 | C1 | | | | | | 3 | 4 | 4 | | 11 |
 | C2 | | | 2 | | | | 1 | | | 3 |
-| ignore | 1 | | | 11 | 4 | 7 | 3 | 1 | 110 | 137 |
+| ignore | 1 | | | 11 | 5 | 7 | 3 | 1 | 109 | 137 |
 | undecided | 1 | | | | | | | | 1 | 2 |
 
 **212 sites** over the serving-path directories named in the scanner's `SCANNED_ROOTS` —
-194 call sites plus 18 pinned points that are not a call. The K9 share is the part a
-simulated run deliberately leaves alone: **113 of 212**.
+194 call sites plus 18 pinned points that are not a call. The K9 row is the part a
+simulated run deliberately leaves alone.
 
 Five rules settle the boundaries #53's categories left in the wrong place:
 
@@ -921,8 +921,9 @@ thread declares anything:
   `stage(k+1)->stage(k):pp_ack#dp0` inline before the call; an eager (small) send has a
   local completion and no ack, and the loop advances to it by K1's rule. The forward's
   own wait for the previous send is the same receive, made at the forward call site after
-  its compute TAR. The real `isend` and `wait()` inside the replaced runner are K9
-  (`15` D91 Q3).
+  its compute TAR. The shutdown call in `_downstream_busy_loop` is the same call as the
+  idle one and shares its answer; it runs outside the simulated window, so sharing changes
+  nothing. The real `isend` and `wait()` inside the replaced runner are K9 (`15` D91 Q3).
 - **K9**, `engine_core_mgr.py:534/544`, reached only from `CoreManager.__init__`: waiting
   for READY is outside the simulated window. #53 kept these as B with the contradiction
   recorded; the LP rule resolves it.
