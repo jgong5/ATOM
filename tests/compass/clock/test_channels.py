@@ -3,10 +3,9 @@
 
 A grant bounds each waiting process by ``min over j of (N[j] + D(j->i))``, so a
 distance that is too large hands out time a message may still need. The
-distances are checked here three ways: against values worked out by hand for
-the two shipped tables, against a brute-force enumeration of every simple
-channel path, and on the worked example of an idle process in the middle of a
-chain.
+distances are checked against values worked out by hand for the shipped
+tables, against a brute-force enumeration of every simple channel path, and on
+the worked example of an idle process in the middle of a chain.
 """
 
 import math
@@ -40,10 +39,8 @@ def _pd():
     )
 
 
-def _single(**kw):
-    return single_engine_table(
-        admission_path="serving", ipc_s=IPC, stream_s=STREAM, **kw
-    )
+def _single():
+    return single_engine_table(admission_path="serving", ipc_s=IPC, stream_s=STREAM)
 
 
 def _table(*lps):
@@ -70,54 +67,58 @@ def _enumerated(table, source, target):
 
 # --- the shipped tables ------------------------------------------------------
 
+ADMISSION = [("serving", 9.0e-3), ("offline_batch", 13.0e-3)]
 
-def test_the_single_engine_table_declares_cleanly():
-    table = _single()
-    assert [str(lp) for lp in table.registry.ids()] == ["engine", "frontend", "traffic"]
-    modes = {
-        c.name: c.receive for lp in table.registry for c in table.channels_from(lp)
-    }
-    assert modes == {
-        "traffic->frontend:http": "inline",
-        "frontend->traffic:stream": "inline",
-        "frontend->engine:request#dp0": "thread",
-        "frontend->engine:control#dp0": "thread",
-        "engine->frontend:output#dp0": "thread",
+
+def _whole(table):
+    return {
+        c.name: (c.source, c.target, c.lookahead_s, c.receive)
+        for lp in table.registry
+        for c in table.channels_from(lp)
     }
 
 
-def test_every_data_parallel_rank_has_its_own_three_channels():
-    table = _single(dp=2)
-    names = [c.name for c in table.channels_into(LpId("engine"))]
-    assert names == [
+@pytest.mark.parametrize("path, delay", ADMISSION)
+def test_the_single_engine_table_is_exactly_its_channel_list(path, delay):
+    table = single_engine_table(admission_path=path, ipc_s=IPC, stream_s=STREAM)
+    F, E = LpId("frontend"), LpId("engine")
+    assert table.registry.ids() == (E, F, T)
+    assert _whole(table) == {
+        "traffic->frontend:http": (T, F, delay, "inline"),
+        "frontend->traffic:stream": (F, T, STREAM, "inline"),
+        "frontend->engine:request#dp0": (F, E, IPC, "thread"),
+        "frontend->engine:control#dp0": (F, E, IPC, "thread"),
+        "engine->frontend:output#dp0": (E, F, IPC, "thread"),
+    }
+    assert [c.name for c in table.channels_into(E)] == [
         "frontend->engine:control#dp0",
-        "frontend->engine:control#dp1",
         "frontend->engine:request#dp0",
-        "frontend->engine:request#dp1",
     ]
-    assert table.recv_mode("engine->frontend:output#dp1") == "thread"
 
 
-def test_the_prefill_decode_table_declares_cleanly():
-    table = _pd()
+@pytest.mark.parametrize("path, delay", ADMISSION)
+def test_the_prefill_decode_table_is_exactly_its_channel_list(path, delay):
+    table = prefill_decode_table(
+        admission_path=path,
+        ipc_s=IPC,
+        stream_s=STREAM,
+        router_s=ROUTER,
+        kv_write_req_s=KV,
+    )
     assert table.registry.ids() == (ED, EP, FD, FP, T)
-    modes = {
-        c.name: c.receive for lp in table.registry for c in table.channels_from(lp)
-    }
-    assert len(modes) == 10
-    assert modes["frontend-P->frontend-D:relay"] == "inline"
-    assert modes["engine-D->engine-P:kv_write_req"] == "inline"
-    assert modes["engine-D->frontend-D:output#dp0"] == "thread"
-
-
-def test_the_measured_admission_delay_is_the_request_lookahead():
-    for path, seconds in (("serving", 9.0e-3), ("offline_batch", 13.0e-3)):
-        table = single_engine_table(admission_path=path, ipc_s=IPC, stream_s=STREAM)
-        assert table.lookahead("traffic->frontend:http") == seconds
     # Behind the router the request, the stream and the relay each carry its cost.
-    assert _pd().lookahead("traffic->frontend-P:http") == 9.0e-3 + ROUTER
-    assert _pd().lookahead("frontend-D->traffic:stream") == STREAM + ROUTER
-    assert _pd().lookahead("frontend-P->frontend-D:relay") == ROUTER
+    assert _whole(table) == {
+        "traffic->frontend-P:http": (T, FP, delay + ROUTER, "inline"),
+        "frontend-D->traffic:stream": (FD, T, STREAM + ROUTER, "inline"),
+        "frontend-P->frontend-D:relay": (FP, FD, ROUTER, "inline"),
+        "engine-D->engine-P:kv_write_req": (ED, EP, KV, "inline"),
+        "frontend-P->engine-P:request#dp0": (FP, EP, IPC, "thread"),
+        "frontend-P->engine-P:control#dp0": (FP, EP, IPC, "thread"),
+        "engine-P->frontend-P:output#dp0": (EP, FP, IPC, "thread"),
+        "frontend-D->engine-D:request#dp0": (FD, ED, IPC, "thread"),
+        "frontend-D->engine-D:control#dp0": (FD, ED, IPC, "thread"),
+        "engine-D->frontend-D:output#dp0": (ED, FD, IPC, "thread"),
+    }
 
 
 # --- distance ----------------------------------------------------------------
@@ -148,7 +149,7 @@ def test_the_single_engine_distances_match_the_hand_computed_paths():
 
 
 @pytest.mark.parametrize(
-    "table", [_pd(), _single(dp=2)], ids=["prefill-decode", "single-engine"]
+    "table", [_pd(), _single()], ids=["prefill-decode", "single-engine"]
 )
 def test_distance_agrees_with_every_enumerated_path(table):
     ids = table.registry.ids()
@@ -271,8 +272,3 @@ def test_every_query_refuses_an_unregistered_process():
             query(b)
     with pytest.raises(KeyError, match="b is not registered; registered: a"):
         table.distance(a, b)
-
-
-def test_a_deployment_with_no_data_parallel_rank_is_refused():
-    with pytest.raises(ValueError, match="dp must be at least 1"):
-        _single(dp=0)

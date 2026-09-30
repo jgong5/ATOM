@@ -9,7 +9,7 @@ transport or handler thread receives and the clock owner releases each message
 and waits for it to be handled, ``inline`` when the owner receives it itself.
 
 Lookahead is per channel, not per pair of processes: a frontend and an engine
-are joined by three channels, and two processes with no channel between them
+are joined by several channels, and two processes with no channel between them
 have no lookahead at all -- declaring one would describe a path that does not
 exist. What a grant needs is the distance ``D(j->i)``: the least summed
 lookahead over every channel path from *j* to *i*, infinite when there is none.
@@ -149,25 +149,19 @@ def _table(lps: tuple[str, ...], rows: list) -> ChannelTable:
     return table
 
 
-def _frontend_engine(frontend: str, engine: str, dp: int, ipc_s: float) -> list:
-    """Request and control in, output back, once per data-parallel rank."""
-    if dp < 1:
-        raise ValueError(f"dp must be at least 1, got {dp!r}")
+def _frontend_engine(frontend: str, engine: str, ipc_s: float) -> list:
+    """Request and control in, output back, for data-parallel rank 0 only."""
     return [
-        row
-        for n in range(dp)
-        for row in (
-            (frontend, engine, f"request#dp{n}", ipc_s, "thread"),
-            (frontend, engine, f"control#dp{n}", ipc_s, "thread"),
-            (engine, frontend, f"output#dp{n}", ipc_s, "thread"),
-        )
+        (frontend, engine, "request#dp0", ipc_s, "thread"),
+        (frontend, engine, "control#dp0", ipc_s, "thread"),
+        (engine, frontend, "output#dp0", ipc_s, "thread"),
     ]
 
 
 def single_engine_table(
-    *, admission_path: str, ipc_s: float, stream_s: float, dp: int = 1
+    *, admission_path: str, ipc_s: float, stream_s: float
 ) -> ChannelTable:
-    """Traffic, one frontend, one engine; a data-parallel group is one engine.
+    """Traffic, one frontend, one engine, and the channels of data-parallel rank 0.
 
     The request channel's lookahead is the measured admission delay of
     `admission_path` (``serving`` or ``offline_batch``). The other lookaheads
@@ -185,7 +179,7 @@ def single_engine_table(
             ),
             ("frontend", "traffic", "stream", stream_s, "inline"),
         ]
-        + _frontend_engine("frontend", "engine", dp, ipc_s),
+        + _frontend_engine("frontend", "engine", ipc_s),
     )
 
 
@@ -219,6 +213,6 @@ def prefill_decode_table(
             ("frontend-P", "frontend-D", "relay", router_s, "inline"),
             ("engine-D", "engine-P", "kv_write_req", kv_write_req_s, "inline"),
         ]
-        + _frontend_engine("frontend-P", "engine-P", 1, ipc_s)
-        + _frontend_engine("frontend-D", "engine-D", 1, ipc_s),
+        + _frontend_engine("frontend-P", "engine-P", ipc_s)
+        + _frontend_engine("frontend-D", "engine-D", ipc_s),
     )
