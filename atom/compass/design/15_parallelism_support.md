@@ -132,9 +132,9 @@ Consequences:
    drift by more than one step.
 3. **Both collectives are internal to the LP, and neither is ignored** (revised
    2026-09-28, #443). Neither is a cross-LP wait the CA sees. The lockstep `all_reduce`
-   (`engine_core.py:770`) is an event cost (`01` D4, K1): the ranks exchange their batch
-   descriptions on it and it is where the step's length is decided, as its per-layer
-   critical path (below). Every collective's own cost is priced (Q3 below).
+   (`DPEngineCoreProc._sync_dp_state` in `atom/model_engine/engine_core.py`) is an event
+   cost (`01` D4, K1): the ranks exchange their batch descriptions on it and it is where
+   the step's length is decided, as its per-layer critical path (below). Every collective's own cost is priced (Q3 below).
 
 ### Q1, Q3, Q4
 
@@ -233,7 +233,7 @@ protocol for the message's size, the standard MPI-level PDES treatment (SimGrid 
 adjacent stages, each on a path the real system has: the stage-to-stage send itself, and
 the completion that the receiving transport (RCCL or gloo) returns to the sender. PP runs
 only with one DP rank (`CoreManager.__init__` rejects PP with DP), so `#dp0` is the only
-instance. The three `pp_transport.py` channels (`meta`, `tokens`, `kv_status`) are listed
+instance. The `pp_transport.py` channels (`meta`, `tokens`, `kv_status`) are listed
 with the others in `01` D3.
 
 | Channel | Sent | Stamped | Received |
@@ -253,14 +253,18 @@ lookahead is
 
 with `T_min` the smallest rendezvous duration on any carrier (the one at its threshold).
 The two channels' lookaheads sum to `T_min`: the ack makes the stage-to-stage cycle no
-tighter than the rendezvous itself. `L_data` is declared as the smallest carrier latency
-`L`. It moves no modelled time, because the receiver's clock goes on to `done` (or, for an
-eager send, to `t_send + L + o + bytes × G`), and both are at least `t_send + L`; it only
-decides how the cycle's lookahead is split. If `T_min <= L_data`, the calibration says a
-rendezvous completes before its request could reach the receiver, which no rendezvous
-does, so the channel table refuses the declaration and names both values (README principle
-6). A zero `L_ack` is refused with it: it is a zero-lookahead coupling, which `01` D4 puts
-inside one LP.
+tighter than the rendezvous itself. `L_data` is declared as the smallest carrier
+`latency_s` (`L`). It moves no modelled time, because the receiver's clock goes on to the
+end of the receive (below), which is at least `t_send + L_data`; it only decides how the
+cycle's lookahead is split. The channel table refuses, by name, either channel with a
+non-positive lookahead (README principle 6): a zero-lookahead coupling belongs inside one
+LP (`01` D4).
+
+- `L_ack <= 0`, i.e. `T_min <= L_data`: the calibration says a rendezvous completes
+  before its request could reach the receiver, which no rendezvous does. The refusal
+  names both values.
+- A carrier's `latency_s <= 0`: `L_data` is then not positive and `pp_data` has no
+  lookahead. The refusal names the carrier and its value.
 
 **Eager sends take no ack.** An eager completion `t_send + o + bytes × G` can lie before
 the receiver's clock (a receiver that posts late), so an ack stamped with it would break
@@ -283,9 +287,9 @@ payload of send `n`:
 So the forward still costs `max(compute done, previous send done) - start`, but a
 rendezvous send's completion now comes from the receiver. At a downstream stage's forward
 call site, before the runner is called and with `t_recv_posted` the loop's clock there,
-the loop receives `(pp_data, n)` inline (its clock reaching `now_r`). For a rendezvous
-send it registers `(pp_ack, n)` stamped `done` (K4) and advances to `done`; for an eager
-one it advances to the data's arrival. Then the forward computes as usual.
+the loop receives `(pp_data, n)` inline (its clock reaching `now_r`). If any part of the
+send is rendezvous it registers `(pp_ack, n)` stamped `done` (K4). Either way it then
+advances to the end of the receive (below), and the forward computes as usual.
 
 **The idle flushes are channel receives (`01` D4, K5).** At both idle call sites the loop
 first settles the pending send: an inline receive of its `pp_ack` if it was rendezvous, an
@@ -319,28 +323,45 @@ out of several parts, and each part's carrier is ATOM's:
 - `_async_send_object` puts the size tensor and the pickled metadata list on the PP CPU
   group: the gloo carrier, bytes = the pickled length.
 - `hidden_states`, `residual` and, when a PP boundary splits a DSA IndexShare group,
-  `sparse_kv_indices` are device tensors on `pp.device_group`: the RCCL carrier, bytes =
-  tokens × hidden × dtype size, or the shard when `pp_send_allgather_group` is on. A small
-  decode batch can fall under the threshold, so the regime is decided per send, not per
-  site.
+  `sparse_kv_indices` are device tensors on `pp.device_group`: the RCCL carrier. Bytes are
+  tokens × hidden × dtype size for `hidden_states` and `residual`, and tokens ×
+  `_pp_index_topk` int32 indices for `sparse_kv_indices` (`ModelRunner.run_model`). With
+  `pp_send_allgather_group` on, a tensor whose element count divides by the TP width is
+  sent as its shard, a TP-width fraction of those bytes. A small decode batch can fall
+  under the threshold, so the regime is decided per send, not per site.
 - a CPU tensor in the list goes on the PP CPU group, the gloo carrier.
+- an empty tensor is skipped on both sides and is no part.
 
-The send completes with its last part. It takes an ack when any part is rendezvous, and
-the receiver's `done` covers every part: `(pp_data, n)` carries each part's carrier and
-bytes.
+**How the parts combine.** The sender posts every part at `t_send`. The receiver,
+`GroupCoordinator.recv_tensor_dict`, takes them in order: the size and the metadata through
+`recv_object` (blocking gloo receives of the size, then the object), then each tensor in list order, and it posts a
+part's receive only when the previous part is done. With `r_1 = t_recv_posted` and parts
+`i` in that order:
+
+- an eager part arrives at `a_i = max(r_i, t_send + L + o + bytes × G)`, and its sender
+  side is done at `t_send + o + bytes × G`;
+- a rendezvous part ends on both sides at `a_i = max(t_send, r_i) + T`;
+- the next receive is posted at `r_(i+1) = a_i + g_i`, where `g_i` is the TP-wide
+  all-gather that the receiving stage runs right after receiving a sharded tensor (an
+  ordinary priced collective on the receiver's time), else 0.
+
+The receive ends at the last part's `a_i + g_i`. The send takes an ack when any part is
+rendezvous, and `done` is the latest sender-side completion over its parts; `(pp_data, n)`
+carries each part's carrier and bytes, so the receiver computes both. The lookahead
+derivation still holds: every `r_i >= t_recv_posted`, so `done` is at least
+`max(t_send, t_recv_posted) + T_min`, the only bound it uses.
 
 **The payload is `hidden_states` + `residual` — real tensors that a simulated run never
 materialises.** So its size is computed from geometry, as for KV transfer (`01` D6). The
 single intra-node latency and bandwidth of the machine spec do not tell carrier from
-protocol, so each carrier (`rccl`, `gloo`) gets five fields under
+protocol, so each carrier (`rccl`, `gloo`) gets these fields under
 `interconnect.intra_node.pp.<carrier>`: `eager_threshold_bytes`, `latency_s` (`L`),
 `overhead_s` (`o`), `per_byte_s` (`G`) and `rendezvous_fixed_s`, the size-independent part
 of `T = rendezvous_fixed_s + bytes × G`. So `T_min` is `T` at the threshold. PP is
 single-node (every PP address is ZMQ IPC), hence the intra-node section. The fields are
 optional in the schema and required by a PP run. None has a value until a two-GPU
 measurement on RCCL and gloo supplies it (README principle 8); until then a PP run is
-refused by name. The `pp_send_allgather_group` path adds a TP-wide all-gather
-before the send when enabled, which is an ordinary priced collective.
+refused by name.
 
 ### Q4: memory — layers split, and the split is ATOM's
 
@@ -725,7 +746,7 @@ and `test_forward_mode.py` already cover the pieces on the CPU-only path (`08` D
 | D88 | One frame of four questions per strategy — LPs and lookahead, scheduling coupling, cost, memory. **Only PP adds logical processes**; TP, DP and EP each sit behind an existing barrier. | 2026-09-19 |
 | D89 | TP is the settled instance and supplies the per-width discipline: width is a key, not a parameter. | 2026-09-19 |
 | D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP. Step duration is `max` over ranks, computed not rank-0-sourced, and idle ranks cost a dummy batch. Revised: the step is a compound event priced by the per-layer critical path over ranks (`max` is its step-sync-only special case). | 2026-09-19, revised 2026-09-28 |
-| D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. Revised: the send wait inside forward and the idle `flush_pp_send` are event costs. Revised again: a send completes on the sender's clock when eager and at `max(t_send, t_recv_posted) + T` when rendezvous, a per-carrier size threshold deciding which; the receiver returns a rendezvous completion on `stage(k+1)->stage(k):pp_ack#dp0`, lookahead `T_min - L_data`, and both waits receive it (K5). | 2026-09-19, revised 2026-09-28 and 2026-09-30 |
+| D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. Revised: a send completes on the sender's clock when eager and at `max(t_send, t_recv_posted) + T` when rendezvous, a per-carrier size threshold deciding which; the receiver returns a rendezvous completion on `stage(k+1)->stage(k):pp_ack#dp0`, lookahead `T_min - L_data`, and both waits receive it (K5). | 2026-09-19, revised 2026-09-28 and 2026-09-30 |
 | D92 | EP adds no LPs (inherits the TP group) but its all-to-all is invisible and must be a declared node, and its `exclusive` occupancy forbids placing it in a `Par`. Expert sharding is Class A, remainder included. | 2026-09-19 |
 | D93 | LP count = 1 traffic LP + per deployment (1 frontend LP + one engine LP per PP stage): 3 aggregated, 5 for 1P1D, independent of GPU count. The clock protocol's cost tracks PP degree and PD roles, not width. | 2026-09-19, revised 2026-09-28 |
 | D94 | Parallelism splits across milestones: LP structure, couplings and memory shape at **M1**; cost accuracy at **M7**. M1's test is scheduling-decision agreement at TP2/DP2/PP2/EP2, which needs no cost model. | 2026-09-19 |
