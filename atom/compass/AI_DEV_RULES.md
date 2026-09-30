@@ -6,6 +6,10 @@
   a task established, with the finding — number multi-step tasks, end with one
   concrete next action, matter-of-fact error tone, cap lists at 5, no preamble or
   closing pleasantries.
+- **GitHub text follows the [`gh-prose`](../../.claude/skills/gh-prose/SKILL.md)
+  skill.** Lint every issue body, PR body, comment and review record with its
+  `scripts/lint_gh_prose.py` before posting, and fix every hit. The skill decides
+  how a required section is written, never whether it is written.
 
 ## Execution rules
 - Don't modify the main worktree. Develop with linked worktrees, one per in-flight
