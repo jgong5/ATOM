@@ -7,11 +7,11 @@ pool means executing `ModelRunner.get_num_blocks`, which means importing
 raises where there is no GPU. That import is not stubbed around. The tree
 already carries an aiter stub for this exact problem (`tests/aiter_stub.py`),
 and it covers three module names -- measured 2026-09-22 in `xiaobizh_n18_cpu`,
-`model_runner.py:20` imports a fourth, `aiter.dist.parallel_state`, and the
-import fails there. Widening that stub is the thing `tests/conftest.py`'s own
-header records as having silently stopped four test modules from running, so
-the binding lives in `test_kv_budget_engine.py` and runs where there is a
-driver.
+`atom/model_engine/model_runner.py` imports a fourth at module scope,
+`aiter.dist.parallel_state`, and the import fails there. Widening that stub is
+the thing `tests/conftest.py`'s own header records as having silently stopped
+four test modules from running, so the binding lives in
+`test_kv_budget_engine.py` and runs where there is a driver.
 
 What this tier holds is the half that decides whether the binding is right
 rather than whether it runs: that ATOM's budget method reaches the device
