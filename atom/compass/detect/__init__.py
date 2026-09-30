@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
-"""Static checks over the simulated path's source, run in CI.
+"""Checks over the simulated path, run in CI.
 
-Each module here parses source files and returns an exit code beside a report;
-none of them runs inside a simulated run. Import the module you need; this
-package re-exports nothing.
+The static checks parse source files; `determinism` compares the step tables
+of two runs. Each returns an exit code beside a report, and none of them runs
+inside a simulated run. Import the module you need; this package re-exports
+nothing.
 """
