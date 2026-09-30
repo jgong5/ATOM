@@ -302,7 +302,10 @@ workers of adjacent stages: the group and the endpoints ATOM's `_async_send_obje
 the metadata on, and aiter's `GroupCoordinator.recv_tensor_dict` reads with
 `recv_object`. The stage loop stamps, registers and releases every frame; the worker only
 moves bytes, through two simulated-runner methods the loop calls (send one frame, receive
-one frame), an engine-to-worker RPC inside the LP like every other (K6). Chosen because it
+one frame), an engine-to-worker RPC inside the LP like every other (K6). The send only
+posts the `isend` and never waits for it, or the loop would wait on the receiving stage
+where the CA cannot see it; the receive runs only after a grant released the frame, which
+is then registered and in flight, so it waits a bounded time. Chosen because it
 is the real path between the real endpoints, adds no socket, process or address, exists in
 every PP run, runs on the CPU (README principle 2) and is ordered per pair. Not chosen: a
 socket between adjacent stage loops, which ATOM does not have (`PPStageTransport` joins
