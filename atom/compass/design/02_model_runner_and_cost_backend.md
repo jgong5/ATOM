@@ -65,19 +65,22 @@ the twelve names above have a caller that waits for the reply, and `exit` and
 `process_kvconnector_output` do not. `atom/compass/runner/overrides.py` carries the
 third case — a method that raises — and the table of which names wait.
 
-**Three names are not answered by ATOM's own, and seven more must be defined to be
-refused** (revised 2026-09-28, #443):
+**`flush_pp_send` keeps ATOM's own answer, the profiler pair is refused, and the rollout
+methods must be defined to be refused** (revised 2026-09-28 and 2026-09-30, #443):
 
-- `flush_pp_send` answers with the **remaining transfer time** of the stage's last send,
-  `max(0, pending_send_done - now)` in simulated seconds, where `pending_send_done` is
-  the completion time the runner recorded when `forward` priced that send (`15` D91 Q3).
-  It is `0.0` when nothing is in flight, never None. ATOM's own returns `True` after
-  waiting on the `isend` (`model_runner.py::ModelRunner.flush_pp_send`). The idle-time
-  calls — `pp_engine_core.py:125`, the head stage having launched nothing this round,
-  and `:362`, a downstream stage having received nothing — are real waits that delay
-  the loop's next round, so the call site advances the stage's clock by the reply
-  (`01` D4, K1: an event cost). The shutdown calls at `:81` and `:395` fall outside the
-  simulated window.
+- `flush_pp_send` is **answered by ATOM's own, at once**: `ModelRunner.flush_pp_send`
+  returns `True` after waiting on any pending `isend`, and a simulated runner posts none.
+  The wait the call stands for is not the runner's to answer, because a large
+  stage-to-stage send completes by rendezvous at a time only the receiving stage's LP
+  knows. The stage loop settles it before the call: at the idle call sites in
+  `PPEngineCoreProc._pp_head_step` (the head launched nothing this round) and
+  `_downstream_busy_loop` (a downstream stage received nothing), it receives the pending
+  send's `stage(k+1)->stage(k):pp_ack#dp0` frame inline when the send was rendezvous, or
+  advances to the send's local completion when it was eager (`01` D4, K5; `15` D91 Q3).
+  The shutdown calls, in the `finally` blocks of `_head_busy_loop` and
+  `_downstream_busy_loop`, fall outside the simulated window. The runner gains two methods
+  that the stage loop calls to move one `pp_data` or `pp_ack` frame over the PP CPU group
+  (`15` D91 Q3, carrier); only the stage loop's hooks call them, never ATOM.
 - `start_profiler` and `stop_profiler` are **refused**. Both are reachable while serving
   (`/start_profile` and `/stop_profile`, `api_server.py:2426` and `:2437`). A real
   profiler slows every step after it, so a zero-cost answer is a silent simplification,
@@ -549,7 +552,7 @@ scheduler at shapes no real model has.
 
 | # | Decision | Date |
 |---|---|---|
-| D10 | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass; no ATOM change for the injection. Revised: `flush_pp_send` answers the remaining transfer time; the two profiler and seven rollout worker methods are refused by name and counted | 2026-09-18, revised 2026-09-28 |
+| D10 | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass; no ATOM change for the injection. Revised: `flush_pp_send` keeps ATOM's own answer and the stage loop receives the pending send's `pp_ack` before calling it; the two profiler and seven rollout worker methods are refused by name and counted | 2026-09-18, revised 2026-09-28 and 2026-09-30 |
 | D10.1 | A model comes into existence three ways, none reading weights: HF-config geometry where only geometry is needed; a `torch.device("meta")` context where a module tree is needed without tracing (no transient, no GPU, covers buffers - ATOM already has this shape at `models/utils.py:457-496`, unused); and `FakeTensorMode` for tracing, the only one with symbolic shapes and the right device branch. `--load_dummy` is reused in all three. `_init_weight_params_on_meta` is not a bug but is superseded by the meta context. The T5 fallback is the meta context plus concrete traces. | 2026-09-20 |
 | D11 | No modes on the runner. Every run simulates; the algorithm comes from a pluggable cost backend. `measure` and `trace` are orthogonal flags. | 2026-09-18 |
 | D12 | M1 fake model = KV/weight geometry from the HF config + a shape-analytic cost stub including the quadratic query term; constant mode retained for bring-up | 2026-09-18 |
