@@ -82,9 +82,15 @@ def _seconds(value, what: str, finite: bool) -> float:
 
 
 class ClockAuthority:
-    """Every LP's clock and state, and the rule that grants them time."""
+    """Every LP's clock and state, and the rule that grants them time.
 
-    def __init__(self, channels: ChannelTable) -> None:
+    `timeline`, when given, receives one ``record(lp, from, to, kind,
+    recovered)`` call per reply, in issue order. `grants` counts each LP's
+    finite grants by name. `final_clocks` is every LP's clock just before the run
+    finished, and ``None`` until it has.
+    """
+
+    def __init__(self, channels: ChannelTable, timeline=None) -> None:
         self._channels = channels
         self._ids = channels.registry.ids()
         self._now = dict.fromkeys(self._ids, 0.0)
@@ -99,7 +105,9 @@ class ClockAuthority:
             name: {} for names in self._into.values() for name in names
         }
         self._next_seq = dict.fromkeys(self._undelivered, 0)
-        self._done = False
+        self.timeline = timeline
+        self.grants = {i.name: 0 for i in self._ids}
+        self.final_clocks = None
 
     def on_request(self, lp: LpId, kind: str, t: float, log) -> list:
         """Register `lp`'s send log, record its request, and grant what is due.
@@ -110,7 +118,7 @@ class ClockAuthority:
         reply is held. Once the run is finished, every LP has had its ``+inf``
         reply, and a request changes nothing and returns none.
         """
-        if self._done:
+        if self.final_clocks is not None:
             return []
         self._channels.registry.require(lp)
         if self._state[lp] != RUNNING:
@@ -224,20 +232,25 @@ class ClockAuthority:
 
     def _recover(self, i: LpId, g: float) -> tuple:
         # The one grant whose guarantee is weaker: a message may still land at g.
-        return self._grant(i, g)
+        return self._grant(i, g, recovered=True)
 
-    def _grant(self, i: LpId, g: float) -> tuple:
+    def _grant(self, i: LpId, g: float, recovered: bool = False) -> tuple:
         released = {}
         for name in self._into[i]:
             pending = self._undelivered[name]
             released[name] = [(seq, a) for seq, a in pending.items() if a <= g]
             for seq, _ in released[name]:
                 del pending[seq]
+        if self.timeline is not None:
+            self.timeline.record(i, self._now[i], g, self._state[i], recovered)
+        self.grants[i.name] += 1
         self._now[i], self._state[i], self._target[i] = g, RUNNING, None
         return (i, g, released)
 
     def _finish(self) -> list:
-        self._done = True
+        self.final_clocks = tuple(self._now.items())
         for i in self._ids:
+            if self.timeline is not None:
+                self.timeline.record(i, self._now[i], math.inf, END, False)
             self._now[i], self._state[i], self._target[i] = math.inf, RUNNING, None
         return [(i, math.inf, {name: [] for name in self._into[i]}) for i in self._ids]
