@@ -166,14 +166,13 @@ class LPRuntime:
         )
 
     def inline_pending(self) -> bool:
-        """Is there a released message not yet taken?
-
-        Only an inline one can be: `_step_through` returns only once every
-        thread-received message it released is handled, and the owner is the
-        only caller.
-        """
+        """Is there a released inline message not yet taken?"""
         with self.lock:
-            return any(self.released[ch] - self.handled[ch] for ch in self.released)
+            return any(
+                self.released[ch] - self.handled[ch]
+                for ch in self.released
+                if self.table.recv_mode(ch) == "inline"
+            )
 
     # ---- receive side ----
 

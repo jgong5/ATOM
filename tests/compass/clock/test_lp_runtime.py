@@ -101,28 +101,30 @@ def _receiver(rt, ch, n, seen, hold=lambda: None):
 def test_a_handler_runs_at_its_arrival_and_the_owner_waits_for_it():
     rt, call = _runtime(ENGINE, (10.2, {REQ: [(0, 10.1)]}))
     rt.check_arrival(REQ, 10.1, 0)
-    seen, now_while_handling = [], []
+    seen, now_while_handling, inline_while_handling = [], [], []
 
     def hold():
         time.sleep(0.2)
         now_while_handling.append(rt.now)
+        inline_while_handling.append(rt.inline_pending())
 
     handler = _receiver(rt, REQ, 1, seen, hold)
     call(rt.advance_to, 10.2)
     assert seen == [(REQ, 0, 10.1)]
     assert now_while_handling == [10.1]
+    assert inline_while_handling == [False]
     assert rt.now == 10.2
     handler.join(5)
     assert not handler.is_alive()
 
 
 def test_release_is_in_arrival_channel_seq_order_not_seq_order():
-    grant = {REQ: [(1, 10.05), (0, 10.15)], CTL: [(0, 10.05)]}
+    grant = {REQ: [(0, 10.05)], CTL: [(0, 10.01), (1, 10.05)]}
     rt, call = _runtime(ENGINE, (10.2, grant))
     seen = []
-    threads = [_receiver(rt, REQ, 2, seen), _receiver(rt, CTL, 1, seen)]
+    threads = [_receiver(rt, REQ, 1, seen), _receiver(rt, CTL, 2, seen)]
     call(rt.advance_to, 10.2)
-    assert seen == [(CTL, 0, 10.05), (REQ, 1, 10.05), (REQ, 0, 10.15)]
+    assert seen == [(CTL, 0, 10.01), (CTL, 1, 10.05), (REQ, 0, 10.05)]
     for t in threads:
         t.join(5)
 
@@ -159,12 +161,16 @@ def test_end_workload_sends_its_log():
     assert rt.conn.sent == [("END", float("inf"), [(OUT, 0, IPC)])]
 
 
-def test_a_send_or_advance_off_the_owner_thread_is_refused():
+def test_a_send_or_clock_call_off_the_owner_thread_is_refused():
     rt, _ = _runtime(ENGINE)
-    with pytest.raises(RuntimeError, match="only the clock owner"):
-        rt.stamp_send(OUT)
-    with pytest.raises(RuntimeError, match="only the clock owner"):
-        rt.advance_to(1.0)
+    for fn, args in [
+        (rt.stamp_send, (OUT,)),
+        (rt.advance_to, (1.0,)),
+        (rt.next_event, (1.0,)),
+        (rt.end_workload, ()),
+    ]:
+        with pytest.raises(RuntimeError, match=f"^{fn.__name__} from thread"):
+            fn(*args)
     assert rt.send_log == [] and rt.conn.sent == []
 
 
@@ -185,6 +191,14 @@ def test_a_frame_read_after_its_arrival_was_passed_is_a_straggler():
         Straggler, match=r"seq 1 arrives at 10.1 but engine has released up to 10.2"
     ):
         rt.check_arrival(REQ, 10.1, 1)
+
+
+def test_a_released_frame_read_after_its_arrival_is_not_a_straggler():
+    rt, call = _runtime(FRONTEND, (10.2, {HTTP: [(0, 10.1)]}), (10.3, {}))
+    call(rt.advance_to, 10.2)
+    rt.check_arrival(HTTP, 10.1, 0)
+    call(rt.advance_to, 10.3)
+    assert rt.now == 10.3
 
 
 def test_a_buffered_frame_no_grant_released_is_a_straggler_at_the_drain():
