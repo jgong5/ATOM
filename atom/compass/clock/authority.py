@@ -86,7 +86,7 @@ class ClockAuthority:
 
     `timeline`, when given, receives one ``record(lp, from, to, kind,
     recovered)`` call per reply, in issue order. `grants` counts each LP's
-    finite grants. `final_clocks` is every LP's clock just before the run
+    finite grants by name. `final_clocks` is every LP's clock just before the run
     finished, and ``None`` until it has.
     """
 
@@ -106,7 +106,7 @@ class ClockAuthority:
         }
         self._next_seq = dict.fromkeys(self._undelivered, 0)
         self.timeline = timeline
-        self.grants = dict.fromkeys(self._ids, 0)
+        self.grants = {i.name: 0 for i in self._ids}
         self.final_clocks = None
 
     def on_request(self, lp: LpId, kind: str, t: float, log) -> list:
@@ -243,7 +243,7 @@ class ClockAuthority:
                 del pending[seq]
         if self.timeline is not None:
             self.timeline.record(i, self._now[i], g, self._state[i], recovered)
-        self.grants[i] += 1
+        self.grants[i.name] += 1
         self._now[i], self._state[i], self._target[i] = g, RUNNING, None
         return (i, g, released)
 

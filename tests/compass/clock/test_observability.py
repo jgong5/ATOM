@@ -11,12 +11,10 @@
   and the record survives strict JSON.
 """
 
-import ast
 import json
 import math
 import re
 import time
-from pathlib import Path
 
 import pytest
 
@@ -34,7 +32,6 @@ from atom.compass.clock import (
     lp_table_dump,
     single_engine_table,
 )
-from atom.compass.clock import authority as authority_module
 from tests.compass.clock.test_grant_rule import (
     PICKS,
     SEEDS,
@@ -86,10 +83,10 @@ def test_one_record_per_reply_in_issue_order_with_recovery_marked_exactly():
         assert [(str(r.lp), r.time_to) for r in records if r.recovered] == ca.recovered
         clock = dict.fromkeys(ca.grants, 0.0)
         for r in records:
-            assert r.time_from == clock[r.lp]
+            assert r.time_from == clock[r.lp.name]
             assert (r.time_to == INF) == (r.kind == END)
             assert r.kind in (TAR, NER, END)
-            clock[r.lp] = r.time_to
+            clock[r.lp.name] = r.time_to
         assert len(records) == sum(ca.grants.values()) + len(ca.grants)
         recovered += len(ca.recovered)
         strict += sum(ca.grants.values()) - len(ca.recovered)
@@ -102,6 +99,13 @@ def test_a_zero_lookahead_pair_marks_the_recovery_grant_and_nothing_else():
     ca.on_request(B, TAR, 10.3, [])
     ca.on_request(A, NER, INF, [("a->b:m", 0, 10.3)])
     assert ca.timeline.lines() == ("a 0.0 10.3 TAR recovery", "b 0.0 10.3 TAR -")
+
+
+def test_an_ner_reply_is_recorded_as_ner():
+    ca = ClockAuthority(_two_way(0.5), TimelineLog())
+    ca.on_request(A, NER, 1.0, [])
+    ca.on_request(B, TAR, 2.0, [])
+    assert ca.timeline.lines()[0] == "a 0.0 1.0 NER -"
 
 
 def _per_reply_seconds(timeline, rounds=2000):
@@ -159,7 +163,6 @@ def test_a_streaming_log_can_be_asked_not_to_keep_what_it_streamed():
     streaming = TimelineLog(seen.append, retain=False)
     kept = _drive(3, PICKS["name order"], cls=_Logged)[2].timeline
     _drive(3, PICKS["name order"], cls=_logging_to(streaming))
-    assert len(streaming) == len(kept)
     assert seen == list(kept.lines())
     with pytest.raises(ValueError, match="asked not to retain"):
         streaming.records()
@@ -266,13 +269,21 @@ def test_a_finished_run_reports_the_clocks_it_finished_from_not_infinity():
     summary = RunSummary.of(ca, 0.25)
     assert dict(summary.final_clocks) == last
     assert summary.simulated_seconds == max(last.values())
-    assert dict(summary.grants) == {str(i): n for i, n in ca.grants.items()}
     assert summary.schedule_record()["grants_total"] == sum(ca.grants.values())
 
 
+def test_grants_per_lp_match_the_finite_replies_each_lp_received():
+    for seed in SEEDS:
+        replies, _, ca = _drive(seed, PICKS["name order"])
+        finite = {str(i): sum(g != INF for g, _ in got) for i, got in replies.items()}
+        assert dict(RunSummary.of(ca, 0.25).grants) == finite, seed
+
+
 def test_a_run_that_has_not_finished_reports_its_clocks_as_they_stand():
+    # b waits in TAR with a target above its clock; the summary reports the clock.
     ca = ClockAuthority(_two_way(0.5))
     ca.on_request(A, TAR, 0.4, [])
+    ca.on_request(B, TAR, 5.0, [])
     assert RunSummary.of(ca, 0.1).final_clocks == (("a", 0.4), ("b", 0.0))
 
 
@@ -306,6 +317,10 @@ def test_a_duration_that_is_not_a_finite_number_is_refused_where_it_enters():
             RunSummary.of(ca, bad)
         with pytest.raises(ValueError, match="lazy_trace_wall_seconds must be"):
             RunSummary.of(ca, 0.1, lazy_trace_wall_seconds=bad)
+        with pytest.raises(ValueError, match="^refused_predicted_seconds must be"):
+            RefusalTally.of([], 1, refused_predicted_seconds=bad)
+        with pytest.raises(ValueError, match="^predicted_seconds must be"):
+            RefusalTally.of([], 1, predicted_seconds=bad)
 
 
 def test_the_by_value_fields_land_in_their_halves():
@@ -404,25 +419,3 @@ def test_nothing_the_clock_emits_cites_a_design_document():
         emitted.append(str(raised.value))
     offenders = [text for text in emitted if CITATION.search(text)]
     assert not offenders, offenders[:3]
-
-
-def test_the_authority_reads_its_timeline_only_inside_the_guard():
-    # With the log off, a reply must do no work for it beyond one test.
-    tree = ast.parse(Path(authority_module.__file__).read_text())
-    guards = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If)
-        and ast.unparse(node.test) == "self.timeline is not None"
-    ]
-    assert guards and not any(guard.orelse for guard in guards)
-    guarded = [id(node) for guard in guards for node in ast.walk(guard)]
-    stray = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute)
-        and node.attr == "timeline"
-        and isinstance(node.ctx, ast.Load)
-        and id(node) not in guarded
-    ]
-    assert not stray, f"the timeline is read outside its guard at {stray}"

@@ -41,7 +41,7 @@ def _seconds(value: float | None) -> str:
     return "inf" if value == math.inf else f"{value!r}s"
 
 
-def _wall_seconds(value: float, what: str) -> float:
+def _finite_seconds(value: float, what: str) -> float:
     seconds = float(value)
     if not math.isfinite(seconds) or seconds < 0.0:
         raise ValueError(
@@ -75,7 +75,7 @@ class TimelineLog:
     """Every reply, in issue order; append-only.
 
     Kept in memory, handed line by line to `sink` if one is given, or both.
-    `retain=False` keeps only the count, so a run streaming to a sink does not
+    `retain=False` keeps no record, so a run streaming to a sink does not
     also hold every record; `records()` then refuses.
     """
 
@@ -89,32 +89,26 @@ class TimelineLog:
             )
         self._records = [] if retain else None
         self._sink = sink
-        self._written = 0
 
     def record(
         self, lp: LpId, time_from: float, time_to: float, kind: str, recovered: bool
     ):
         entry = TimelineRecord(lp, time_from, time_to, kind, recovered)
-        self._written += 1
         if self._records is not None:
             self._records.append(entry)
         if self._sink is not None:
             self._sink(str(entry))
-        return entry
 
     def records(self) -> tuple[TimelineRecord, ...]:
         if self._records is None:
             raise ValueError(
-                f"this log was asked not to retain its records; {self._written} "
-                "were written and handed to its sink"
+                "this log was asked not to retain its records; they were handed "
+                "to its sink"
             )
         return tuple(self._records)
 
     def lines(self) -> tuple[str, ...]:
         return tuple(str(entry) for entry in self.records())
-
-    def __len__(self) -> int:
-        return self._written
 
 
 # --- the dump ----------------------------------------------------------------
@@ -172,8 +166,8 @@ class RefusalTally:
             counted[reason] = counted.get(reason, 0) + 1
         return cls(
             steps,
-            refused_predicted_seconds,
-            predicted_seconds,
+            _finite_seconds(refused_predicted_seconds, "refused_predicted_seconds"),
+            _finite_seconds(predicted_seconds, "predicted_seconds"),
             tuple(sorted(counted.items())),
         )
 
@@ -240,10 +234,10 @@ class RunSummary:
             clocks = tuple((row.lp, row.now) for row in authority.lp_table())
         return cls(
             tuple((str(lp), now) for lp, now in clocks),
-            tuple((str(lp), count) for lp, count in authority.grants.items()),
-            _wall_seconds(wall_seconds, "wall_seconds"),
+            tuple(authority.grants.items()),
+            _finite_seconds(wall_seconds, "wall_seconds"),
             lazy_traces,
-            _wall_seconds(lazy_trace_wall_seconds, "lazy_trace_wall_seconds"),
+            _finite_seconds(lazy_trace_wall_seconds, "lazy_trace_wall_seconds"),
             diagnostics,
             detectors if detectors is not None else DetectorState(),
             refusals if refusals is not None else RefusalTally(),
