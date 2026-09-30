@@ -72,7 +72,7 @@ ADMISSION = [("serving", 9.0e-3), ("offline_batch", 13.0e-3)]
 
 def _whole(table):
     return {
-        c.name: (c.source, c.target, c.lookahead_s, c.receive)
+        c.name: (c.source, c.target, table.lookahead(c.name), table.recv_mode(c.name))
         for lp in table.registry
         for c in table.channels_from(lp)
     }
@@ -93,6 +93,11 @@ def test_the_single_engine_table_is_exactly_its_channel_list(path, delay):
     assert [c.name for c in table.channels_into(E)] == [
         "frontend->engine:control#dp0",
         "frontend->engine:request#dp0",
+    ]
+    assert [c.name for c in table.channels_from(F)] == [
+        "frontend->engine:control#dp0",
+        "frontend->engine:request#dp0",
+        "frontend->traffic:stream",
     ]
 
 
