@@ -329,11 +329,14 @@ bytes.
 **The payload is `hidden_states` + `residual` — real tensors that a simulated run never
 materialises.** So its size is computed from geometry, as for KV transfer (`01` D6). The
 single intra-node latency and bandwidth of the machine spec do not tell carrier from
-protocol, so each carrier (`rccl`, `gloo`) gets `eager_threshold_bytes`, `latency_s` (`L`),
-`overhead_s` (`o`), `per_byte_s` (`G`) and its rendezvous duration `T(bytes)` in the same terms, in the spec's intra-node
-interconnect section (PP is single-node: every PP address is ZMQ IPC). None has a value
-until a two-GPU measurement on RCCL and gloo supplies it (README principle 8); until then
-a PP run is refused by name. The `pp_send_allgather_group` path adds a TP-wide all-gather
+protocol, so each carrier (`rccl`, `gloo`) gets five fields under
+`interconnect.intra_node.pp.<carrier>`: `eager_threshold_bytes`, `latency_s` (`L`),
+`overhead_s` (`o`), `per_byte_s` (`G`) and `rendezvous_fixed_s`, the size-independent part
+of `T = rendezvous_fixed_s + bytes × G`. So `T_min` is `T` at the threshold. PP is
+single-node (every PP address is ZMQ IPC), hence the intra-node section. The fields are
+optional in the schema and required by a PP run. None has a value until a two-GPU
+measurement on RCCL and gloo supplies it (README principle 8); until then a PP run is
+refused by name. The `pp_send_allgather_group` path adds a TP-wide all-gather
 before the send when enabled, which is an ordinary priced collective.
 
 ### Q4: memory — layers split, and the split is ATOM's
