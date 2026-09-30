@@ -48,10 +48,8 @@ reviewable, and adding to it is a decision somebody writes down rather than a
 silence.
 """
 
-import argparse
 import ast
 import os
-import sys
 from dataclasses import dataclass
 
 #: The calls that return real seconds. An asyncio timer is not one: it runs on
@@ -130,7 +128,7 @@ class ClockSourceLint:
             return ()
         tree = ast.parse(source, filename=path)
         origins = _origins(tree)
-        scopes = _scopes(tree)
+        spans = scopes(tree)
         found = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -138,17 +136,9 @@ class ClockSourceLint:
             call = _resolve(_dotted(node.func), origins)
             if call in CLOCK_READS:
                 found.append(
-                    ClockRead(path, node.lineno, call, _scope_at(scopes, node.lineno))
+                    ClockRead(path, node.lineno, call, scope_at(spans, node.lineno))
                 )
         return tuple(sorted(found, key=lambda read: (read.path, read.line, read.call)))
-
-    def scan_modules(self, paths) -> tuple[ClockRead, ...]:
-        """Every read in the modules named, in the order they were named."""
-        found = []
-        for path in paths:
-            with open(path, encoding="utf-8") as handle:
-                found.extend(self.scan_source(handle.read(), path))
-        return tuple(found)
 
     @staticmethod
     def modules(root: str) -> tuple[str, ...]:
@@ -193,9 +183,18 @@ class ClockSourceLint:
         return "\n".join(lines)
 
     def check(self, root: str) -> tuple[int, str]:
-        """Scan `root` and return an exit code beside the report. Non-zero fails CI."""
+        """Scan `root` and return an exit code beside the report. Non-zero fails CI.
+
+        A root holding no module is refused: a scan of nothing has checked
+        nothing, and a mistyped path would otherwise read as clean.
+        """
         modules = self.modules(root)
-        reads = self.scan_modules(modules)
+        if not modules:
+            return 1, f"clock-source lint: no module under {root}, nothing checked"
+        reads = []
+        for path in modules:
+            with open(path, encoding="utf-8") as handle:
+                reads.extend(self.scan_source(handle.read(), path))
         allow_listed = sum(1 for path in modules if self.allowed(path) is not None)
         return (1 if reads else 0), self.report(reads, len(modules), allow_listed)
 
@@ -255,26 +254,26 @@ def _resolve(call: str | None, origins: dict[str, str]) -> str | None:
     """
     if call is None:
         return None
-    expanded: dict[str, None] = {}
+    expanded = set()
     while True:
         origin = origins.get(call)
         if origin is not None:
             if call in expanded:
                 return call
-            expanded[call] = None
+            expanded.add(call)
         else:
             head, _, rest = call.partition(".")
             head_origin = origins.get(head)
             if head_origin is None or head in expanded:
                 return call
-            expanded[head] = None
+            expanded.add(head)
             origin = f"{head_origin}.{rest}" if rest else head_origin
         if origin == call:
             return call
         call = origin
 
 
-def _scopes(tree) -> tuple[tuple[int, int, str], ...]:
+def scopes(tree) -> tuple[tuple[int, int, str], ...]:
     """Every def and class as (first line, last line, name), outermost first."""
     return tuple(
         (node.lineno, node.end_lineno or node.lineno, node.name)
@@ -283,27 +282,10 @@ def _scopes(tree) -> tuple[tuple[int, int, str], ...]:
     )
 
 
-def _scope_at(scopes, line: int) -> str:
-    """The innermost def or class containing `line`, or module level."""
-    inner = [scope for scope in scopes if scope[0] <= line <= scope[1]]
+def scope_at(spans, line: int) -> str:
+    """The innermost def or class containing `line`, or module level.
+
+    `spans` is what `scopes` returns for the module holding `line`.
+    """
+    inner = [span for span in spans if span[0] <= line <= span[1]]
     return max(inner)[2] if inner else "<module>"
-
-
-def main(argv=None) -> int:
-    """Run the check over the paths given, print the report, return the exit code."""
-    parser = argparse.ArgumentParser(
-        description="Find real-clock reads on the simulated path."
-    )
-    parser.add_argument("roots", nargs="+", help="files or directories to check")
-    arguments = parser.parse_args(argv)
-    lint = ClockSourceLint()
-    worst = 0
-    for root in arguments.roots:
-        code, report = lint.check(root)
-        print(report)
-        worst = max(worst, code)
-    return worst
-
-
-if __name__ == "__main__":
-    sys.exit(main())
