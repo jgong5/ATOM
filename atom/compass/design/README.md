@@ -1,8 +1,8 @@
 # ATOM Compass — Design
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
-against it yet.** Every document carries a matching header. **109 decisions — D0–D94
-with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **88 registered
+against it yet.** Every document carries a matching header. **Decisions D0–D94,
+with no gaps, and their sub-decisions** are indexed at the end of this file; **88 registered
 TODOs — T1–T88 with no gaps, of which 82 are open** (T10, T15, T22, T48 and T65 are struck
 through as done, and T77 was opened and closed by P0.1); they, the load-bearing assumptions and the
 cross-cutting issues live in **`12_open_items.md`**. Implementation follows the execution
@@ -42,7 +42,7 @@ Where a decision looks odd, it is usually principle 1 or 2 being applied literal
 |---|---|---|
 | **1** | **Reuse ATOM's API server and scheduling modules.** Replace only the model layer and the modules it depends on (KV cache management, communication). Modify or refactor the reused parts where discrete time requires it — but do not reimplement them. | `01` D1 keeps ATOM's whole multi-process topology rather than collapsing it. `03` D13 refuses to simulate the KV pool. `07` Phase 0 forbids re-deriving admission to get shapes. |
 | **2** | **Simulated execution touches no GPU.** No compute, no device allocation. Compute capability, memory size, bandwidth and interconnect are **configured**, never read from a device runtime. | `05` exists at all. `03` D14 substitutes the five device readings. `04` D18 captures under `FakeTensorMode`. |
-| **3** | **Prioritise simplicity.** Add only what is necessary, and nothing more. | `02` D11: the runner has no modes. `01` D4: 137 of 212 synchronization sites are deliberately left alone, measured. |
+| **3** | **Prioritise simplicity.** Add only what is necessary, and nothing more. | `02` D11: the runner has no modes. `01` D4: the K9 synchronization sites are deliberately left outside the model, measured. |
 | **4** | **Prefer clean abstractions and refactoring over ad-hoc changes.** | `02`'s `CostBackend` boundary, which forbids ATOM imports. `05` D24 pushes thread-pool width into ATOM's config rather than Compass's. |
 | **5** | **Start small; cut work into stages that are individually verifiable.** | M1's fake model exists to validate the clock, the KV path and the harness *before* any real cost model. |
 | **6** | **Refuse rather than fall back.** A declined answer with a named reason is a result. A guessed one is a defect. | Everywhere. The archetypal failure is in *Conventions* below. |
@@ -73,9 +73,9 @@ ATOM's real code owns still never touch a device.
 | **Scheduler / admission / chunking** | **REUSED, unmodified** | The whole point. Same decisions as a real run. `01`, `03` |
 | **API server, tokenizer** | **REUSED, real** | Real HTTP, real uvicorn, real tokenizer — run for its *effect*, with a modelled duration charged for its *time*. `06` D33 |
 | **Device memory readings** | **SUBSTITUTED** | Five readings come from the machine spec instead of the runtime, so an MI308X host can model an MI355X. The budget *arithmetic* around them is ATOM's. `03` D14, `05` |
-| **Wall-clock time** | **SUBSTITUTED** | Business-logic clock reads come from the Clock Authority. Failure detectors and metrics-push cadence deliberately stay real. `01` D5, `11` D72 |
+| **Wall-clock time** | **SUBSTITUTED** | Every clock read and timer the Clock Authority can reach runs on virtual time, failure detectors and metrics cadence included. Only the Atomesh router's bounds and health check, set by its flags, and OS-level process-death detection stay real. `01` D5, `11` D72 |
 | **Collectives / comms** | **SIMULATED** (cost only) | Priced from measurements or the spec; no collective actually runs on a device. `07` D40 |
-| **Atomesh router** | **REUSED, untouched** | Zero changes. The simulated timeline rides `kv_transfer_params`, which the router already relays verbatim. `06` D30 |
+| **Atomesh router** | **REUSED, configured** | No Compass change beyond the `--worker-request-timeout-secs` option (#478); a simulated launch sets it large and switches the health check and circuit breaker off. The simulated timeline rides carriers the router already relays: the `compass` entry of the `tracestate` header on requests, a field in `kv_transfer_params` on the prefill-to-decode forward, and SSE comment lines on streamed output. `01` D7, `06` D30 |
 | **Serving *decisions*** | **NOT MODELLED** | Compass predicts the time decisions consume, not the decisions themselves — because it reuses the code that makes them. *(A simple serving simulation is planned as a future part of Compass; explicitly out of scope for this work.)* |
 
 **The rule underneath the table:** anything that is *arithmetic* is reused; anything that is
@@ -127,9 +127,9 @@ Four views. **A** shows where Compass sits inside ATOM; **A2** is Compass alone,
            :  :                           |                               :
            :  :   +-----------------------v-----------------------+       :
            :..:   |  Clock Authority                              |       :
-   grants,    :   |  grants virtual time to every logical process |       :
-   blocked/   :   |  co-hosted by default; standalone for M4/M6   |       :
-   running    :   +-----------------------------------------------+       :
+   TAR/NER    :   |  grants virtual time to every logical process |       :
+   requests,  :   |  co-hosted by default; standalone for M4/M6   |       :
+   TAG grants :   +-----------------------------------------------+       :
               :                                                           :
               :   +-----------------------------------------------+       :
               :   |  simulated KV connector                       |       :
@@ -181,9 +181,10 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                                             docs 02, 01 D6, 11      |
   +=====================================================================+
   |  L1  TIME             Clock Authority: grant rule, lookahead matrix |
-  |                       LP registry . blocked/running protocol        |
-  |                       causality detectors (straggler, watchdog,     |
-  |                       CI clock lint)                                |
+  |                       LP registry . TAR/NER/TAG protocol            |
+  |                       causality detectors (straggler check at       |
+  |                       receipt and drain, one DIAG_S stall           |
+  |                       diagnostic, CI clock lint)                    |
   |                       LP topology per strategy: TP/DP/EP collapse,  |
   |                       PP adds one LP per stage                      |
   |                                                docs 01, 15          |
@@ -205,7 +206,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L1 | Clock Authority, grant rule, LP collapse | [`01_execution_and_time_model.md`](01_execution_and_time_model.md) | D3, D3.1 |
 | L1 | Causality detectors | [`01`](01_execution_and_time_model.md) | D3.2 |
 | L1 | CA deployment (co-hosted / standalone) | [`01`](01_execution_and_time_model.md) | D3.3 |
-| L1 | Wait interception contract (4 categories) | [`01`](01_execution_and_time_model.md) | D4, D5 |
+| L1 | Wait interception contract (K1–K9 mechanisms) | [`01`](01_execution_and_time_model.md) | D4, D5 |
 | L1 | Arrival gate | [`01`](01_execution_and_time_model.md) | D8 |
 | L2 | `CompassModelRunner`, the seam | [`02_model_runner_and_cost_backend.md`](02_model_runner_and_cost_backend.md) | D10, D11 |
 | L2 | M1 fake model | [`02`](02_model_runner_and_cost_backend.md) | D12 |
@@ -502,7 +503,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it settles |
 |---|---|---|
-| [`01`](01_execution_and_time_model.md) | Execution and Time Model | Keep ATOM's multi-process topology. A central **Clock Authority** grants virtual time; logical processes collapse onto ATOM's existing hardware barriers. Which waits are rewritten, annotated, disabled or ignored. Three always-on causality detectors. KV transfer simulated; Atomesh untouched; arrivals via a next-arrival bound. |
+| [`01`](01_execution_and_time_model.md) | Execution and Time Model | Keep ATOM's multi-process topology. A central **Clock Authority** acts as the HLA RTI (TAR, NER, TAG); an LP is a process group with one clock owner, and zero-lookahead couplings share one LP. Every synchronization site maps to one PDES mechanism, K1–K9. A straggler fails the run; a stall the Clock Authority cannot see prints one diagnostic and never aborts. KV transfer is simulated, reproducing Mooncake through scheduler-side hooks; the Atomesh router is a configured segment of a channel; arrivals are messages in transit. |
 | [`02`](02_model_runner_and_cost_backend.md) | Model Runner Seam and Cost Backend | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass — **no ATOM change for the injection**. The runner has no modes; the algorithm comes from a pluggable backend. Trace is device-free and may be lazy; measure needs a device and never is. The milestone-1 fake model. |
 
 ### Part II — What is modelled
@@ -555,7 +556,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Decisions | Document |
 |---|---|
-| D0 – D9 (+ D3.1–D3.5) | `01` Execution and Time Model |
+| D0 – D9 (+ D3.1–D3.5, D5.1) | `01` Execution and Time Model |
 | D10 – D12 (+ D10.1) | `02` Model Runner Seam and Cost Backend |
 | D13 – D16 | `03` Memory Model and the KV Pool |
 | D17 – D23 (+ D18.1) | `04` Model Capture and the Cost IR |
@@ -575,8 +576,8 @@ The documents use these precisely; a reader will bounce off without them.
 | # | Decision |
 |---|---|
 | D1 | Keep ATOM's multi-process and multi-thread topology; every change is additive |
-| D3 | A central **Clock Authority**; grant rule `min_j(now[j] + L[j→i])`; logical processes collapse onto existing hardware barriers |
-| D4 | Four-category wait contract: ~6 rewritten, ~10 annotated, ~20 disabled, ~20 ignored |
+| D3 | A central **Clock Authority** acting as the HLA RTI; a grant stays strictly below the lookahead-distance LBTS and waits for messages in transit; zero-lookahead couplings collapse into one LP |
+| D4 | Every synchronization site maps to one of the PDES mechanisms K1–K9; the boundary is the LP, not the process |
 | D10 | Attach at `ModelRunner.forward` via `--runner-qualname`; no ATOM change for the injection |
 | D13 | Do not simulate the KV pool; run ATOM's real one |
 | D14 | Substitute the five device readings, never the arithmetic |
@@ -588,7 +589,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D36 | Three tiers: analytic, coarse empirical, op-level empirical. Compass models a device it has been measured on |
 | D37 | `compass plan` — the tool tells the user what to measure |
 | D45 | The real-vs-real spread is the tolerance; a metric must be stable **and** sensitive |
-| D3.2 | Three always-on causality detectors; a straggler fails the run rather than warning |
+| D3.2 | Always-on causality detectors: a straggler, checked on receipt and at each drain, fails the run rather than warning; a stall the Clock Authority cannot see waits for ever and prints one `DIAG_S` diagnostic, never aborting; a CI clock-source lint |
 | D3.3 | The Clock Authority ships two deployment forms from one implementation: co-hosted by default, standalone for multi-container runs |
 | D43.1 | ATOM's suite is a merge gate on every Compass change, unmodified, in two tiers: a CPU tier (every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free as a batch, held to green) per change, a GPU superset judged as a delta per wave against 4779 / 5 at `fe9ea043c`, by an equality on a per-tree expectation rather than "no worse than". The CPU tier **exits 98** rather than reporting "GPU not required" when it cannot tell |
 | D67.1 | Tier 0 is graded on **configuration ranking** first; its latency goals are diagnostics for that, not the result |
