@@ -32,6 +32,7 @@ pub const DEFAULT_WORKER_REQUEST_TIMEOUT_SECS: u64 = 5;
 
 /// Timeout for the `/flush_cache` and `/get_load` requests below; set from
 /// `--worker-request-timeout-secs` when the router config is built.
+/// Process-wide: the last router config built in a process wins.
 pub static WORKER_REQUEST_TIMEOUT_SECS: AtomicU64 =
     AtomicU64::new(DEFAULT_WORKER_REQUEST_TIMEOUT_SECS);
 
@@ -411,5 +412,18 @@ mod tests {
             assert_eq!(flush.successful.len(), answered as usize);
             assert_eq!(elapsed >= slow, answered);
         }
+    }
+
+    #[test]
+    fn worker_request_timeout_defaults_to_5s_and_refuses_zero() {
+        let parse = |flags: &[&str]| CliArgs::try_parse_from(["atomesh"].iter().chain(flags));
+        assert_eq!(parse(&[]).unwrap().worker_request_timeout_secs, 5);
+        assert_eq!(
+            parse(&["--worker-request-timeout-secs", "1"])
+                .unwrap()
+                .worker_request_timeout_secs,
+            1
+        );
+        assert!(parse(&["--worker-request-timeout-secs", "0"]).is_err());
     }
 }

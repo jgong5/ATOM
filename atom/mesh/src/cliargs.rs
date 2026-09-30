@@ -330,7 +330,7 @@ pub struct CliArgs {
     pub request_timeout_secs: u64,
 
     /// Timeout in seconds for the router's own /get_load and /flush_cache requests to workers
-    #[arg(long, default_value_t = DEFAULT_WORKER_REQUEST_TIMEOUT_SECS, help_heading = "Request Handling")]
+    #[arg(long, default_value_t = DEFAULT_WORKER_REQUEST_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Request Handling")]
     pub worker_request_timeout_secs: u64,
 
     /// Grace period in seconds to wait for in-flight requests during shutdown
