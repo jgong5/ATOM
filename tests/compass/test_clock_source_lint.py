@@ -139,8 +139,9 @@ class TestTheClockSourceLint:
         )
 
     def test_a_root_holding_no_module_is_refused(self, tmp_path):
-        """A mistyped root would otherwise report clean over nothing."""
-        root = str(tmp_path / "no_such_dir")
+        """A docs directory or a mistyped root would otherwise report clean."""
+        (tmp_path / "README.md").write_text("# docs\n")
+        root = str(tmp_path)
         assert ClockSourceLint().check(root) == (
             1,
             f"clock-source lint: no module under {root}, nothing checked",
