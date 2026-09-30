@@ -17,9 +17,9 @@ mistake is invisible at the moment it is made.
 
 **Membership is not iteration.** `x in s`, `len(s)`, `s.add(...)` and
 `s.discard(...)` read nothing in order and are not reported. `sorted(s)` is not
-reported either: it is the fix. Nor is a comprehension handed straight to
-`sorted`, as `sorted(x for x in s if x > 0)`: that is the same fix with a
-filter, and the sort throws away the order the members came out in.
+reported either: it is the fix. A comprehension handed to `sorted`, as
+`sorted(f(x) for x in s)`, is reported: its element and filter run in the
+set's order before the sort sees anything. Sort the set first instead.
 
 **A report has to survive the fix it prescribes.** A name rebound to something
 this pass cannot see as a set stops being one, so applying the remedy in place
@@ -186,11 +186,8 @@ class SetIterationLint:
         tree = ast.parse(source, filename=path)
         known = _set_valued_names(tree)
         enclosing = scopes(tree)
-        sorted_away = _sorted_away(tree)
         found = {}
         for node, scope in _scoped(tree):
-            if node in sorted_away:
-                continue
             for expression, form in _reads(node):
                 if not _is_set(expression, known, scope):
                     continue
@@ -264,20 +261,6 @@ def _scoped(node, scope=()):
             inner = scope
         yield child, inner
         yield from _scoped(child, inner)
-
-
-def _sorted_away(tree) -> set:
-    """The generators of every comprehension that is `sorted`'s first argument."""
-    return {
-        generator
-        for call in ast.walk(tree)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Name)
-        and call.func.id == "sorted"
-        and call.args
-        and isinstance(call.args[0], (ast.GeneratorExp, ast.ListComp))
-        for generator in call.args[0].generators
-    }
 
 
 def _reads(node):

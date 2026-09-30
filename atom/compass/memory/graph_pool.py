@@ -92,7 +92,7 @@ def capture_token_shapes(
     schedulable and is not captured, so it is dropped here too.
     """
     shapes = {bs * q for bs in capture_sizes for q in q_buckets}
-    return tuple(sorted(s for s in shapes if s <= max_num_batched_tokens))
+    return tuple(s for s in sorted(shapes) if s <= max_num_batched_tokens)
 
 
 @dataclass(frozen=True, slots=True)

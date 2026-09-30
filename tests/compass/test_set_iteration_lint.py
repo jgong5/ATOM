@@ -12,7 +12,7 @@ not recognised or because the read is not. They are asserted **absent** from
 the report, in the same place as the ones that are present. Absent is what was
 measured; complete is not claimed.
 
-Two false positives are pinned here as well, and they matter more than a miss.
+False positives are pinned here as well, and they matter more than a miss.
 A name rebound to something that is not a set stops being one, so a reader who
 applies the remedy stops being told to apply it; and a name is a set only inside
 the scope that bound it, so a short name in one function does not fail the gate
@@ -30,7 +30,7 @@ from atom.compass.detect.set_iteration import SetIterationLint
 SIMULATED_PATH = os.path.dirname(atom.compass.__file__)
 
 #: A step loop that reads its participants out of a set every way the pass
-#: claims to see, and seven more it does not. Everything here runs; nothing
+#: claims to see, and some it does not. Everything here runs; nothing
 #: here raises.
 SIMULATED_PATH_READING_SETS = '''# SPDX-License-Identifier: MIT
 """A step loop that decides what to charge by reading a set."""
@@ -264,12 +264,7 @@ FORMS_THAT_FIRE = {
     "augmented": "def f(n, t):\n    s = set(n)\n    s |= t\n    for x in s:\n        yield x\n",
     "typing-Set": "from typing import Set\n\n\ndef f(r: Set[str]):\n    return [x for x in r]\n",
     "string-annotation": 'def f(r: "set[str]"):\n    return [x for x in r]\n',
-    "comprehension-inside-a-sorted-element": (
-        "def f(s: set[str], t):\n    return sorted(tuple(x for x in s) for _ in t)\n"
-    ),
-    "method-named-sorted": (
-        "def f(s: set[str], rows):\n    return rows.sorted(x for x in s)\n"
-    ),
+    "sorted-generator": "def f(s: set[str], ids):\n    return sorted(ids.take(x) for x in s)\n",
     "attribute": (
         "class C:\n"
         "    def __init__(self, n):\n"
@@ -281,15 +276,13 @@ FORMS_THAT_FIRE = {
     ),
 }
 
-#: Every shape the pass claims *not* to report. Half of these read a set and
-#: do not read its order; the rest read something that is not a set and share
+#: Every shape the pass claims *not* to report. Some of these read a set and
+#: do not read its order; the others read something that is not a set and share
 #: a name or a method with one. A false positive is worse than a miss, because
 #: the check's whole value is that a red gate means something.
 FORMS_THAT_STAY_QUIET = {
     "sorted": "def f(s: set[str]):\n    return sorted(s)\n",
     "sorted-key": "def f(s: set[str], c):\n    return sorted(s, key=c)\n",
-    "sorted-generator": "def f(s: set[int]):\n    return sorted(x for x in s if x > 0)\n",
-    "sorted-list-comprehension": "def f(s: set[int]):\n    return sorted([-x for x in s])\n",
     "membership": "def f(s, x):\n    return x in set(s)\n",
     "len": "def f(s):\n    return len(set(s))\n",
     "add": "def f(s: set[str], x):\n    s.add(x)\n",
@@ -398,10 +391,7 @@ class TestTheSetIterationLint:
         assert os.path.join(SIMULATED_PATH, "memory", "graph_pool.py") in scanned
         code, report = lint.check(SIMULATED_PATH)
         assert code == 0
-        assert report == (
-            f"set-iteration lint: clean over {len(lint.modules(SIMULATED_PATH))} "
-            "module(s)"
-        )
+        assert report == f"set-iteration lint: clean over {len(scanned)} module(s)"
 
     def test_it_fires_on_an_injected_read_and_names_every_one(self, reading_sets):
         module, (code, report) = reading_sets
