@@ -768,11 +768,11 @@ LP is transport. Nine mechanisms cover the 212 sites, and **none is left undecid
 
 | Class | Mechanism | PDES rule | Sites | Representative sites |
 |---|---|---|---|---|
-| K1 | Event cost | TAR: `advance_to(now + d)`, `d` from the cost model or a resource station | 18 | forward ×5, the idle DP rank's dummy batch, KV-transfer completion ×3, tokenization ×5, the DP lockstep `all_reduce`, the PP idle `flush_pp_send` ×2, multimodal preprocessing (refused today) |
+| K1 | Event cost | TAR: `advance_to(now + d)`, `d` from the cost model or a resource station | 16 | forward ×5, the idle DP rank's dummy batch, KV-transfer completion ×3, tokenization ×5, the DP lockstep `all_reduce`, multimodal preprocessing (refused today) |
 | K2 | Clock read | returns the LP's logical time | 6 | the arrive / leave / first-token stamps (first-token ×2), `_passed_delay`, the waiting-prefill age |
 | K3 | Idle point | NER: `next_event(t)` | 6 | the three step loops' spin, the PP bounded polls ×2, offline `get_output` |
 | K4 | Channel send | timestamped send, logged on the clock owner | 11 | PD direct sends ×2, PP sends ×3, output sends through the relay queue ×6 |
-| K5 | Channel receive | counted at the wait point, then TSO delivery | 10 | the engine input thread, the frontend output thread, the PD handler threads, the PP receives and zero-bound drains |
+| K5 | Channel receive | counted at the wait point, then TSO delivery | 12 | the engine input thread, the frontend output thread, the PD handler threads, the PP receives and zero-bound drains, the PP idle `flush_pp_send` ×2 |
 | K6 | Wait inside one LP | LP aggregation: never reported to the CA | 35 | TP worker RPC and barriers, frontend coroutines awaiting their own process's data, control commands' calls to workers, the DP group's reduction |
 | K7 | Virtual timer | the timer runs on the LP clock | 8 | idle KV drain, metrics push ×2 and refresh, Anthropic ping, keep-alive, the silence warning, the control-command reply timeout |
 | K8 | Real bound | the CA cannot reach it, or it stays real on purpose: configuration | 5 | the Rust router ×4, process-death detection |
@@ -792,7 +792,7 @@ natural mechanism (A→K1, B→K5, C1→K8, C2→K7, ignore→K9).
 | B | | | 1 | | 8 | 25 | | | 2 | 36 |
 | C1 | | | | | | 3 | 4 | 4 | | 11 |
 | C2 | | | 2 | | | | 1 | | | 3 |
-| ignore | 3 | | | 11 | 2 | 7 | 3 | 1 | 110 | 137 |
+| ignore | 1 | | | 11 | 4 | 7 | 3 | 1 | 110 | 137 |
 | undecided | 1 | | | | | | | | 1 | 2 |
 
 **212 sites** over the serving-path directories named in the scanner's `SCANNED_ROOTS` —
@@ -807,8 +807,8 @@ Five rules settle the boundaries #53's categories left in the wrong place:
   workers — `call_func(..., wait_out=True)`, which parks in `self.outputs_queue.get()` at
   `async_proc.py:431` and carries every forward — is K6 although its peer is another
   process; the forward's duration is charged by the clock owner's TAR. #53 drew this
-  line at the process and put 25 such waits in B. Only 8 receives cross an LP; with the
-  two PP zero-bound drains they are K5's 10.
+  line at the process and put 25 such waits in B. K5 holds only the receives that cross an
+  LP: those, the PP zero-bound drains, and the PP idle flushes.
 - **Zero-lookahead couplings go inside one LP.** A coupling has zero lookahead when LP
   *j*'s action at time *t* can change LP *i*'s behaviour at the same *t*: a barrier or
   collective (each participant leaves at the latest arrival), a synchronous RPC (the
@@ -872,9 +872,6 @@ Five rules settle the boundaries #53's categories left in the wrong place:
   sixth hand-off, multimodal preprocessing (`api_server.py:1660`), is K1 too, and is
   refused today because no service time is modelled for it.
 - **K1**, the DP lockstep `all_reduce` (`engine_core.py:770`), per the third rule above
-- **K1**, the PP idle flush, `pp_engine_core.py:125` and `:362`: `flush_pp_send` waits
-  for the previous inter-stage send and delays the stage loop's next turn. The simulated
-  runner returns the remaining transfer time and the call site advances by it (`15` Q3).
 - **K3**, **the idle jump, which is a real site in ATOM even though the name this list
   once gave it is not.** `Scheduler._advance_to_next_arrival` does not exist here — but
   the loops it would have served do, and all three spin rather than wait when there is
@@ -918,6 +915,14 @@ thread declares anything:
   and a handler thread's socket is wrapped. Then **TSO delivery**: a received message is
   held at the wait point until the clock owner's `advance_to` walks past its arrival
   time, and released one at a time in arrival order.
+- **K5**, the PP idle flush, `flush_pp_send` in `PPEngineCoreProc._pp_head_step` and
+  `_downstream_busy_loop`: it waits for the stage's previous send, whose completion a
+  rendezvous (large) send learns from the next stage. The stage loop receives that send's
+  `stage(k+1)->stage(k):pp_ack#dp0` inline before the call; an eager (small) send has a
+  local completion and no ack, and the loop advances to it by K1's rule. The forward's
+  own wait for the previous send is the same receive, made at the forward call site after
+  its compute TAR. The real `isend` and `wait()` inside the replaced runner are K9
+  (`15` D91 Q3).
 - **K9**, `engine_core_mgr.py:534/544`, reached only from `CoreManager.__init__`: waiting
   for READY is outside the simulated window. #53 kept these as B with the contradiction
   recorded; the LP rule resolves it.
