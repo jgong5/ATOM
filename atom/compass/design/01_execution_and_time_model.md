@@ -783,8 +783,8 @@ LP is transport. Nine mechanisms cover the 212 sites, and **none is left undecid
 tree by `tests/compass/test_sync_inventory.py`. Each row still carries the category of the
 first classification (#53), and the test parses **the table below** — the only one here
 with a `Count` column — against those rows. Until each row also carries its mechanism,
-this crosswalk is where the change shows: **75 rows** sit outside their old category's
-natural mechanism (A→K1, B→K5, C1→K8, C2→K7, ignore→K9).
+this crosswalk is where the change shows: every cell off its old category's natural
+mechanism (A→K1, B→K5, C1→K8, C2→K7, ignore→K9) counts rows that moved.
 
 | #53 category | K1 | K2 | K3 | K4 | K5 | K6 | K7 | K8 | K9 | Count |
 |---|---|---|---|---|---|---|---|---|---|---|
