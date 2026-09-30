@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 """The clock-source lint: clean over `atom/compass`, and fired by a seeded read."""
 
-import importlib.util
 import os
 
 import pytest
@@ -9,8 +8,7 @@ import pytest
 import atom.compass
 from atom.compass.detect.clock_source import DEFAULT_ALLOW_LIST, ClockSourceLint
 
-#: A cost backend that charges the time its own arithmetic took. It imports,
-#: runs, and returns a number of the right size.
+#: A cost backend that charges the time its own arithmetic took.
 SIMULATED_PATH_WITH_A_REAL_READ = '''# SPDX-License-Identifier: MIT
 """A cost backend that charges a decode step, and its own arithmetic with it."""
 
@@ -36,20 +34,63 @@ SECOND_READ_LINE = (
     _SOURCE_LINES.index("    return total + (time.monotonic() - started)") + 1
 )
 
-#: Spellings of a real-clock read that the pass has to find. The three
-#: `datetime` forms all resolve to one name, which is why the list entry is
-#: written out in full rather than as the tail a caller happens to type.
+#: Spellings of a real-clock read that the pass has to find, each beside the
+#: report line it must produce. The three `datetime` forms all resolve to one
+#: name, which is why the list entry is written out in full rather than as the
+#: tail a caller happens to type.
 CLOCK_READS_THAT_FIRE = {
-    "import": "import time\n\n\ndef f():\n    return time.monotonic()\n",
-    "from-import": "from time import monotonic\n\n\ndef f():\n    return monotonic()\n",
-    "assigned-alias": "import time\n\nnow = time.monotonic\n\n\ndef f():\n    return now()\n",
-    "nanoseconds": "import time\n\n\ndef f():\n    return time.perf_counter_ns()\n",
-    "clock-gettime": "import time\n\n\ndef f():\n    return time.clock_gettime(0)\n",
-    "clock-gettime-ns": "import time\n\n\ndef f():\n    return time.clock_gettime_ns(0)\n",
-    "datetime-module": "import datetime\n\n\ndef f():\n    return datetime.datetime.now()\n",
-    "datetime-class": "from datetime import datetime\n\n\ndef f():\n    return datetime.now()\n",
-    "datetime-alias": "import datetime as dt\n\n\ndef f():\n    return dt.datetime.now()\n",
-    "utcnow": "from datetime import datetime\n\n\ndef f():\n    return datetime.utcnow()\n",
+    "import": (
+        "import time\n\n\ndef f():\n    return time.monotonic()\n",
+        "engine.py:5  time.monotonic  in f",
+    ),
+    "from-import": (
+        "from time import monotonic\n\n\ndef f():\n    return monotonic()\n",
+        "engine.py:5  time.monotonic  in f",
+    ),
+    "import-renamed": (
+        "from time import monotonic as clock\n\n\ndef f():\n    return clock()\n",
+        "engine.py:5  time.monotonic  in f",
+    ),
+    "assigned-alias": (
+        "import time\n\nnow = time.monotonic\n\n\ndef f():\n    return now()\n",
+        "engine.py:7  time.monotonic  in f",
+    ),
+    "alias-of-alias": (
+        "import time as t\n\nnow = t.monotonic\n\n\ndef f():\n    return now()\n",
+        "engine.py:7  time.monotonic  in f",
+    ),
+    "nanoseconds": (
+        "import time\n\n\ndef f():\n    return time.perf_counter_ns()\n",
+        "engine.py:5  time.perf_counter_ns  in f",
+    ),
+    "clock-gettime": (
+        "import time\n\n\ndef f():\n    return time.clock_gettime(0)\n",
+        "engine.py:5  time.clock_gettime  in f",
+    ),
+    "clock-gettime-ns": (
+        "import time\n\n\ndef f():\n    return time.clock_gettime_ns(0)\n",
+        "engine.py:5  time.clock_gettime_ns  in f",
+    ),
+    "datetime-module": (
+        "import datetime\n\n\ndef f():\n    return datetime.datetime.now()\n",
+        "engine.py:5  datetime.datetime.now  in f",
+    ),
+    "datetime-class": (
+        "from datetime import datetime\n\n\ndef f():\n    return datetime.now()\n",
+        "engine.py:5  datetime.datetime.now  in f",
+    ),
+    "datetime-alias": (
+        "import datetime as dt\n\n\ndef f():\n    return dt.datetime.now()\n",
+        "engine.py:5  datetime.datetime.now  in f",
+    ),
+    "utcnow": (
+        "from datetime import datetime\n\n\ndef f():\n    return datetime.utcnow()\n",
+        "engine.py:5  datetime.datetime.utcnow  in f",
+    ),
+    "innermost-scope": (
+        "import time\n\n\nclass A:\n    def g(self):\n        return time.time()\n",
+        "engine.py:6  time.time  in g",
+    ),
 }
 
 #: Calls whose name ends in a listed one and which are not it. Each is a
@@ -59,17 +100,6 @@ CLOCK_READS_THAT_ARE_NOT = {
     "row-attribute": "def f(row):\n    return row.datetime.now()\n",
     "imported-namespace": "import mock\n\n\ndef f():\n    return mock.time.time()\n",
     "another-package": "from mypkg import time\n\n\ndef f():\n    return time.monotonic()\n",
-}
-
-#: A real clock bound somewhere the parser does not follow and called later.
-#: Every one of these reads a machine clock and none is reported.
-CLOCKS_HANDED_AROUND = {
-    "parameter-default": "import time\n\n\ndef f(wall_clock=time.monotonic):\n    return wall_clock()\n",
-    "walrus": "import time\n\n\ndef f():\n    if c := time.monotonic:\n        return c()\n",
-    "tuple-unpacking": "import time\n\n\ndef f():\n    a, b = time.monotonic, 1\n    return a()\n",
-    "class-attribute": "import time\n\n\nclass C:\n    clock = time.monotonic\n\n\ndef f():\n    return C.clock()\n",
-    "subscript": 'import time\n\nCLOCKS = {"m": time.monotonic}\n\n\ndef f():\n    return CLOCKS["m"]()\n',
-    "partial": "import functools\nimport time\n\n\ndef f():\n    return functools.partial(time.monotonic)()\n",
 }
 
 
@@ -87,9 +117,11 @@ class TestTheClockSourceLint:
         )
 
     def test_the_lint_fires_on_a_seeded_read_and_names_every_one(self, tmp_path):
-        module = tmp_path / "step.py"
+        """The seeded module sits one directory down, so the walk has to recurse."""
+        (tmp_path / "backends").mkdir()
+        module = tmp_path / "backends" / "step.py"
         module.write_text(SIMULATED_PATH_WITH_A_REAL_READ, encoding="utf-8")
-        code, report = ClockSourceLint().check(str(module))
+        code, report = ClockSourceLint().check(str(tmp_path))
         assert code == 1
         assert report == "\n".join(
             [
@@ -106,49 +138,13 @@ class TestTheClockSourceLint:
             ]
         )
 
-    def test_without_the_lint_the_module_imports_and_returns_a_believable_number(
-        self, tmp_path
-    ):
-        """The uncaught half. Machine seconds in a modelled record, and it reads fine.
-
-        The corrupted step is strictly longer than the modelled one, because real
-        time went into it; and it is indistinguishable from the modelled one at
-        any precision a latency table prints.
-        """
-        module = tmp_path / "step.py"
-        module.write_text(SIMULATED_PATH_WITH_A_REAL_READ, encoding="utf-8")
-        spec = importlib.util.spec_from_file_location("seeded_step", module)
-        seeded = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(seeded)
-        charged = seeded.step_seconds(1)
-        assert charged > seeded.DECODE_STEP_SECONDS
-        assert charged == pytest.approx(seeded.DECODE_STEP_SECONDS, abs=1.0e-3)
-
-    def test_a_read_the_import_renamed_is_still_found(self):
-        """`from time import monotonic` is the form a text search walks past."""
-        source = "from time import monotonic as clock\n\n\ndef age(since):\n    return clock() - since\n"
-        reads = ClockSourceLint().scan_source(source, "engine.py")
-        assert [str(read) for read in reads] == ["engine.py:5  time.monotonic  in age"]
-
-    def test_a_read_an_assignment_renamed_is_still_found(self):
-        """The form a text search *would* have found, so the parse has to as well."""
-        source = (
-            "import time\n\nnow = time.monotonic\n\n\ndef age(since):\n"
-            "    return now() - since\n"
+    def test_a_root_holding_no_module_is_refused(self, tmp_path):
+        """A mistyped root would otherwise report clean over nothing."""
+        root = str(tmp_path / "no_such_dir")
+        assert ClockSourceLint().check(root) == (
+            1,
+            f"clock-source lint: no module under {root}, nothing checked",
         )
-        reads = ClockSourceLint().scan_source(source, "engine.py")
-        assert [str(read) for read in reads] == ["engine.py:7  time.monotonic  in age"]
-
-    def test_the_same_clock_in_nanoseconds_is_the_same_read(self):
-        """One divide separates these from the seconds they are listed beside."""
-        source = (
-            "import time\n\n\ndef age(since):\n"
-            "    return time.perf_counter_ns() / 1e9 - since\n"
-        )
-        reads = ClockSourceLint().scan_source(source, "engine.py")
-        assert [str(read) for read in reads] == [
-            "engine.py:5  time.perf_counter_ns  in age"
-        ]
 
     def test_an_asyncio_timer_is_not_a_read(self):
         """A simulated run's event loop keeps virtual time, so its timers do too."""
@@ -156,10 +152,14 @@ class TestTheClockSourceLint:
         assert ClockSourceLint().scan_source(source, "engine.py") == ()
 
     def test_the_clean_line_counts_what_this_scan_skipped(self, tmp_path):
-        """A tree holding none of the listed files is a tree with no exemptions."""
-        (tmp_path / "step.py").write_text("x = 1\n", encoding="utf-8")
+        """A tree holding none of the listed files is a tree with no exemptions.
+
+        The root is the module itself, which is a scan of one file.
+        """
+        module = tmp_path / "step.py"
+        module.write_text("x = 1\n", encoding="utf-8")
         lint = ClockSourceLint(allow_list={"detect/sampler.py": "the sampler"})
-        code, report = lint.check(str(tmp_path))
+        code, report = lint.check(str(module))
         assert code == 0
         assert report == (
             "clock-source lint: clean over 1 module(s), 0 file(s) allow-listed"
@@ -200,10 +200,13 @@ class TestWhatCountsAsAClockRead:
     """Which call is the machine's clock, and which one merely reads like it."""
 
     @pytest.mark.parametrize(
-        "source", CLOCK_READS_THAT_FIRE.values(), ids=CLOCK_READS_THAT_FIRE.keys()
+        "source, expected",
+        CLOCK_READS_THAT_FIRE.values(),
+        ids=CLOCK_READS_THAT_FIRE.keys(),
     )
-    def test_every_spelling_of_a_real_read_is_found(self, source):
-        assert ClockSourceLint().scan_source(source, "engine.py") != ()
+    def test_every_spelling_of_a_real_read_is_found(self, source, expected):
+        reads = ClockSourceLint().scan_source(source, "engine.py")
+        assert [str(read) for read in reads] == [expected]
 
     @pytest.mark.parametrize(
         "source", CLOCK_READS_THAT_ARE_NOT.values(), ids=CLOCK_READS_THAT_ARE_NOT.keys()
@@ -211,25 +214,3 @@ class TestWhatCountsAsAClockRead:
     def test_a_name_merely_ending_in_a_listed_one_is_not_a_read(self, source):
         """A false positive here is a red gate on code that is doing nothing wrong."""
         assert ClockSourceLint().scan_source(source, "engine.py") == ()
-
-    @pytest.mark.parametrize(
-        "source", CLOCKS_HANDED_AROUND.values(), ids=CLOCKS_HANDED_AROUND.keys()
-    )
-    def test_a_clock_bound_where_the_parser_does_not_follow_is_not_reported(
-        self, source
-    ):
-        """Each of these reads a machine clock at run time; none is reported."""
-        assert ClockSourceLint().scan_source(source, "engine.py") == ()
-
-    def test_the_three_datetime_spellings_resolve_to_one_name(self):
-        """Which is why the list entry is the full name and not the tail."""
-        reported = {
-            read.call
-            for source in (
-                "import datetime\n\n\ndef f():\n    return datetime.datetime.now()\n",
-                "from datetime import datetime\n\n\ndef f():\n    return datetime.now()\n",
-                "import datetime as dt\n\n\ndef f():\n    return dt.datetime.now()\n",
-            )
-            for read in ClockSourceLint().scan_source(source, "engine.py")
-        }
-        assert reported == {"datetime.datetime.now"}

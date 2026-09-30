@@ -83,7 +83,7 @@ from dataclasses import dataclass
 # The enclosing-scope question and the walk over a tree are the same ones the
 # clock-source pass answers, and the answers are taken from it rather than
 # written twice.
-from .clock_source import ClockSourceLint, _scope_at, _scopes
+from .clock_source import ClockSourceLint, scope_at, scopes
 
 #: Builders that produce a set from anything.
 SET_BUILDERS = ("set", "frozenset")
@@ -185,7 +185,7 @@ class SetIterationLint:
             return ()
         tree = ast.parse(source, filename=path)
         known = _set_valued_names(tree)
-        scopes = _scopes(tree)
+        enclosing = scopes(tree)
         sorted_away = _sorted_away(tree)
         found = {}
         for node, scope in _scoped(tree):
@@ -199,7 +199,7 @@ class SetIterationLint:
                     expression.lineno,
                     form,
                     ast.unparse(expression),
-                    _scope_at(scopes, expression.lineno),
+                    scope_at(enclosing, expression.lineno),
                 )
                 found[read] = None
         return tuple(
