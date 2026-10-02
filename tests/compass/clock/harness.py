@@ -12,7 +12,8 @@ The driver holds the check the authority cannot make about itself: no grant
 may move an LP past a message registered for it that it was not handed, and no
 LP is handed a message that arrives after its grant, or at or before the grant
 it had last. It makes the same check on the `+inf` reply, so a run finishes
-with nothing in flight.
+with nothing in flight, and then closes the LP, where the traffic LP checks
+every request it sent was answered.
 """
 
 import collections
@@ -71,10 +72,12 @@ class RunReport:
 class SyntheticRun:
     """One deployment, one workload, one request order, driven to the end."""
 
-    def __init__(self, deployment, workload, order=None, grant_cap=100_000):
+    def __init__(
+        self, deployment, workload, order=None, grant_cap=100_000, bound_s=math.inf
+    ):
         self.deployment = deployment
         self.table = DEPLOYMENTS[deployment]()
-        self.clock = _Counted(self.table)
+        self.clock = _Counted(self.table, bound_s=bound_s)
         self.lps = build(self.table, workload)
         order = tuple(order or map(str, self.table.registry.ids()))
         self.rank = {lp: order.index(str(lp)) for lp in self.lps}
@@ -107,6 +110,7 @@ class SyntheticRun:
                     self._refuse_step_over(i, g)
                     if g == math.inf:
                         stopped_by = "the finish"
+                        self.lps[i].close()
                         continue
                     ready[i] = self.lps[i].on_grant(g, messages)
         except GrantsExhausted:

@@ -16,8 +16,11 @@ What each group defends:
   replies are the same under four orders of submission, which do interleave
   differently.
 * **The checks fire**: a message held back, or handed one grant late, is a
-  step-over, and a message never sent leaves its receiver unfinished at the
-  finish rather than the engine's metrics push keeping the run going.
+  step-over; a final response never sent lets the run finish, and the traffic
+  LP's end-of-run check names that request; an engine push left essential
+  stops the run at the simulated-time bound.
+* **The run ends with a scrape**: one scrape follows the last response even
+  with no periodic scrape, and its answer is delivered before the finish.
 """
 
 import dataclasses
@@ -25,9 +28,17 @@ import math
 
 import pytest
 
+from atom.compass.clock import ClockAbort
+
 from .deployments import DEPLOYMENTS
 from .harness import SteppedOverEvent, SyntheticRun
-from .participants import DESIGN_WORKLOAD, ENCODE_TOKENS_PER_S, Engine, Traffic
+from .participants import (
+    DESIGN_WORKLOAD,
+    ENCODE_TOKENS_PER_S,
+    Engine,
+    Traffic,
+    UnansweredRequests,
+)
 
 BRIEF = dataclasses.replace(DESIGN_WORKLOAD, requests=8, decode_steps=3)
 
@@ -150,15 +161,41 @@ class TestTheChecksFire:
             run.run()
 
     @pytest.mark.parametrize("scrape_s", [BRIEF.scrape_interval_seconds, math.inf])
-    def test_a_message_never_sent_leaves_traffic_unfinished(self, scrape_s):
+    def test_a_dropped_response_is_named_by_the_end_of_run_check(self, scrape_s):
         """The engine's metrics push does not keep the run going."""
         workload = dataclasses.replace(BRIEF, scrape_interval_seconds=scrape_s)
         run = SyntheticRun("single-deployment", workload, grant_cap=2000)
         frontend = next(lp for lp in run.lps.values() if str(lp.name) == "frontend")
         send = frontend.send
         frontend.send = lambda channel, payload: (
-            None if channel == "frontend->traffic:stream" else send(channel, payload)
+            None if payload == ("chunk", 3, True) else send(channel, payload)
         )
-        report = run.run()
-        assert report.stopped_by == "the finish"
-        assert report.unfinished == ("traffic",)
+        with pytest.raises(UnansweredRequests, match=r"requests \[3\] sent but"):
+            run.run()
+        assert run.clock.final_clocks is not None
+
+    @pytest.mark.parametrize("name", sorted(DEPLOYMENTS))
+    def test_an_essential_engine_push_stops_at_the_bound(self, name):
+        def essential(run):
+            def push_joins_t(now):
+                kind, t, t_daemon = run(now)
+                return kind, min(t, t_daemon), math.inf
+
+            return push_joins_t
+
+        assert SyntheticRun(name, BRIEF, bound_s=64.0).run().unfinished == ()
+        run = SyntheticRun(name, BRIEF, bound_s=64.0)
+        for lp in run.lps.values():
+            if isinstance(lp, Engine):
+                lp.run = essential(lp.run)
+        with pytest.raises(ClockAbort, match="passes the simulated-time bound 64.0"):
+            run.run()
+
+
+def test_one_scrape_follows_the_last_response():
+    """With no periodic scrape, the closing scrape still runs and is answered."""
+    workload = dataclasses.replace(BRIEF, scrape_interval_seconds=math.inf)
+    report = SyntheticRun("single-deployment", workload).run()
+    assert report.stopped_by == "the finish"
+    assert report.channels["traffic->frontend:http"] == BRIEF.requests + 1
+    assert report.handled == report.messages

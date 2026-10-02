@@ -115,23 +115,34 @@ class _Lp:
         self.clock = g
         return self.run(g)
 
+    def close(self):
+        """The `+inf` grant: the run is over, and no timer runs at it."""
+
+
+class UnansweredRequests(AssertionError):
+    """The run finished with requests that never had their final response."""
+
 
 class Traffic(_Lp):
     """The traffic source, and the metrics observer that scrapes on its clock.
 
     With `scrape_on` naming its request channel, a scrape is a `GET /metrics`
     answered on the stream. With `None`, the router answers the scrape itself,
-    so no LP sees it. Its arrivals are essential and its scrape is a daemon
-    deadline.
+    so no LP sees it. Its arrivals and its one scrape after the last response
+    are essential; its periodic scrape is a daemon deadline.
+
+    The clock cannot tell a lost message from a finished run, so on its `+inf`
+    grant it raises unless every request it sent has its final response.
     """
 
     def __init__(self, table, workload, http, scrape_on):
         super().__init__("traffic", table)
         self.http = http
         self.scrape_on = scrape_on
-        self.expected = workload.requests
         self.interval = workload.scrape_interval_seconds
         self.next_scrape = self.interval
+        self.closing_scrape = None  # when the scrape after the last response ran
+        self.open = {}  # request -> sent at, until its final response
         self.arrivals = collections.deque()
         group = len(workload.prompt_tokens)
         for request in range(workload.requests):
@@ -143,28 +154,41 @@ class Traffic(_Lp):
                     workload.prompt_tokens[index],
                 )
             )
-        self.responses = self.scrapes = 0
+        self.scrapes = 0
 
     def handle(self, channel, arrival, payload):
         if payload[0] == "chunk" and payload[2]:  # ("chunk", request, finished)
-            self.responses += 1
+            del self.open[payload[1]]
 
     def run(self, now):
         while self.arrivals and self.arrivals[0][0] <= now:
             _, request, tokens = self.arrivals.popleft()
+            self.open[request] = now
             self.send(self.http, ("request", request, tokens))
-        if now >= self.next_scrape:
-            self.timers += 1
+        due = now >= self.next_scrape
+        closing = self.finished and self.closing_scrape is None
+        if due or closing:
+            self.timers += due
             self.scrapes += 1
-            self.next_scrape += self.interval
+            if due:
+                self.next_scrape += self.interval
+            if closing:
+                self.closing_scrape = now
             if self.scrape_on is not None:
                 self.send(self.scrape_on, ("scrape", self.scrapes))
         next_arrival = self.arrivals[0][0] if self.arrivals else math.inf
         return NER, next_arrival, self.next_scrape
 
+    def close(self):
+        if self.open:
+            raise UnansweredRequests(
+                f"the run finished with requests {sorted(self.open)} sent but "
+                "never given their final response"
+            )
+
     @property
     def finished(self):
-        return not self.arrivals and self.responses == self.expected
+        return not (self.arrivals or self.open)
 
 
 class Frontend(_Lp):

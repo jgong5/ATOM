@@ -42,6 +42,10 @@ round. When every LP waits and none is grantable, nothing is undelivered and
 no essential target is pending: the run is finished, every LP is granted
 ``+inf``, and the daemon deadlines still held never fire.
 
+A finite grant past the simulated-time bound aborts the run with the LP table.
+A housekeeping timer nobody declared daemon keeps raising ``H`` and would
+otherwise keep the run alive forever.
+
 Nothing here reads a clock, opens a socket or starts a thread. The caller
 carries requests in and replies out.
 """
@@ -97,11 +101,15 @@ class ClockAuthority:
     `timeline`, when given, receives one ``record(lp, from, to, kind,
     recovered)`` call per reply, in issue order. `grants` counts each LP's
     finite grants by name. `final_clocks` is every LP's clock just before the run
-    finished, and ``None`` until it has.
+    finished, and ``None`` until it has. `bound_s` is the simulated-time bound,
+    ``+inf`` for none.
     """
 
-    def __init__(self, channels: ChannelTable, timeline=None) -> None:
+    def __init__(
+        self, channels: ChannelTable, timeline=None, bound_s: float = math.inf
+    ) -> None:
         self._channels = channels
+        self._bound = _seconds(bound_s, "the simulated-time bound", finite=False)
         self._ids = channels.registry.ids()
         self._now = dict.fromkeys(self._ids, 0.0)
         self._state = dict.fromkeys(self._ids, RUNNING)
@@ -261,6 +269,13 @@ class ClockAuthority:
         return self._grant(i, g, recovered=True)
 
     def _grant(self, i: LpId, g: float, recovered: bool = False) -> tuple:
+        if g > self._bound:
+            raise ClockAbort(
+                f"a grant to {g} for {i} passes the simulated-time bound "
+                f"{self._bound}; something essential, such as a housekeeping "
+                "timer not declared daemon, keeps the run alive",
+                self.lp_table(),
+            )
         released = {}
         for name in self._into[i]:
             pending = self._undelivered[name]
