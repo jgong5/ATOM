@@ -503,6 +503,28 @@ and only **144** offer a multi-request episode containing a descendant. A 256-cl
 requiring genuine fan-out in every root is not constructible without reusing sessions.
 Whatever is done there must be declared, not discovered.
 
+### The DP cells
+
+Owner's DP ruling, 2026-10-01
+([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)). DP
+acceptance uses two DP-attention configurations of DeepSeek-V4-Pro on MI355X that ATOM's
+nightly benchmarks already run, and no other model:
+
+| Cell | Where ATOM defines it |
+|---|---|
+| DPA+TBO | the `DPA TBO` variant of `DeepSeek-V4-Pro` in `.github/benchmark/models.json`: aggregated, TP 8, `--enable-dp-attention --enable-tbo` |
+| DPA+MTP1 | the `ds-v4-1p1d-dpa-tp8-mtp1` case in `.github/benchmark/models_atomesh.yaml`: 1P1D, TP 8 per side, `--method mtp --num-speculative-tokens 1 --enable-dp-attention`, and the prefill side also passes `--enable-tbo` |
+
+Each cell is judged by cc-traces e2e and by the per-step error spread (D47), never by a
+total. TBO under DP (#531) and tier b pricing for V4-Pro are prerequisites, so neither
+cell is acceptance evidence before both exist. The DPA+MTP1 case is 1P1D, so it also
+needs the M4 deployment form.
+
+The mechanism tests run device-free on a CPU fake-model DP2: both ranks report the same
+step seconds, equal to the larger of the two; an idle rank's dummy batch is priced and
+enters the `max`; the batch view refuses a DP run that states no `num_tokens_across_dp`
+(#470); and the CA refuses members whose call counts differ (#528).
+
 ### Repeats
 
 The simulator is **deterministic by construction** under doc 01 D3 (Clock Authority, ties
@@ -584,7 +606,7 @@ claims there are not.
 | D48 | Memory per term, never as a sum. The gate is whether the top-1 configuration choice survives, not the byte error. | 2026-09-18 |
 | D49 | Seven hygiene refusals, each with a prior incident behind it. | 2026-09-18 |
 | D50.1 | A refusal marks and continues: priced by the next answerable rung, tagged `refused(reason)`, never zero and never skipped. Refused fraction of **seconds** is a reported result; **>5% refused seconds is not acceptance evidence**. | 2026-09-19 |
-| D50 | Everything registered and hashed before evaluation; the case set never shrinks. One simulated run plus a reproducibility assertion; N≥3 spaced real runs. | 2026-09-18 |
+| D50 | Everything registered and hashed before evaluation; the case set never shrinks. One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The DP cells are DeepSeek-V4-Pro DPA+TBO and DPA+MTP1 on MI355X, judged by cc-traces e2e and the per-step error spread; DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01 |
 | D51 | Measure a saturated cell early. Account cold costs once; report the simulator's own per-step CPU cost alongside the ratio. | 2026-09-18 |
 | D52 | Eight fail-closed invalidation conditions. Scheduling claims require slack; throughput claims at saturation are fine. | 2026-09-18 |
 
