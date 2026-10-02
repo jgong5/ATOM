@@ -19,11 +19,16 @@ and again only if a channel is declared afterwards.
 
 import math
 from dataclasses import dataclass
+from enum import StrEnum
 
 from .identity import LpId
 from .registry import LpRegistry
 
-RECEIVE_MODES = ("thread", "inline")
+
+class ReceiveMode(StrEnum):
+    THREAD = "thread"
+    INLINE = "inline"
+
 
 #: Measured admission delay from the traffic source into the serving stack, per
 #: path, in seconds. Earlier work measured 13.7 ms end-to-end -- worth around
@@ -43,7 +48,7 @@ class Channel:
     source: LpId
     target: LpId
     lookahead_s: float
-    receive: str
+    receive: ReceiveMode
 
 
 class ChannelTable:
@@ -77,11 +82,12 @@ class ChannelTable:
                 f"the lookahead of {name!r} must be a finite number of seconds and "
                 f"not negative, got {lookahead_s!r}"
             )
-        if receive not in RECEIVE_MODES:
+        if receive not in tuple(ReceiveMode):
             raise ValueError(
-                f"the receive mode of {name!r} must be one of {RECEIVE_MODES}, got {receive!r}"
+                f"the receive mode of {name!r} must be one of "
+                f"{', '.join(ReceiveMode)}, got {receive!r}"
             )
-        channel = Channel(name, source, target, lookahead, receive)
+        channel = Channel(name, source, target, lookahead, ReceiveMode(receive))
         self._channels[name] = channel
         self._distances = None
         return channel
@@ -107,7 +113,7 @@ class ChannelTable:
     def lookahead(self, name: str) -> float:
         return self.channel(name).lookahead_s
 
-    def recv_mode(self, name: str) -> str:
+    def recv_mode(self, name: str) -> ReceiveMode:
         return self.channel(name).receive
 
     def distance(self, source: LpId, target: LpId) -> float:

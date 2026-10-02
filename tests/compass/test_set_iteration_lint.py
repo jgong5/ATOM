@@ -24,6 +24,7 @@ import os
 import pytest
 
 import atom.compass
+import atom.utils.clock
 from atom.compass.detect.set_iteration import SetIterationLint
 
 #: The tree the rule applies to.
@@ -392,6 +393,13 @@ class TestTheSetIterationLint:
         code, report = lint.check(SIMULATED_PATH)
         assert code == 0
         assert report == f"set-iteration lint: clean over {len(scanned)} module(s)"
+
+    def test_the_lp_runtime_is_clean_today(self):
+        """The LP runtime sits outside `atom/compass` and is on the simulated path."""
+        assert SetIterationLint().check(atom.utils.clock.__file__) == (
+            0,
+            "set-iteration lint: clean over 1 module(s)",
+        )
 
     def test_it_fires_on_an_injected_read_and_names_every_one(self, reading_sets):
         module, (code, report) = reading_sets
