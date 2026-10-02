@@ -169,15 +169,15 @@ def capture_rung(batch: Any, runner: Any) -> int | None:
 def _data_parallel_size(runner: Any) -> int:
     """How many ranks `decide` would settle a rung across, or a refusal.
 
-    Absent, zero or `False` is refused rather than read as one. A runner
-    shaped differently from the engine's own would otherwise be priced as a
-    single rank on a default nothing checked, three lines above a refusal
-    written for exactly that subject; zero would pass the `> 1` test below as
-    the single-rank case.
+    Absent, zero, negative or `False` is refused rather than read as one,
+    the set ATOM's `ParallelConfig` refuses too. A runner shaped differently
+    from the engine's own would otherwise be priced as a single rank on a
+    default nothing checked; zero or a negative width would pass the `> 1`
+    test in `capture_rung` as the single-rank case.
     """
     parallel = getattr(getattr(runner, "config", None), "parallel_config", None)
     size = getattr(parallel, "data_parallel_size", None)
-    if not size:
+    if size is None or size < 1:
         raise RunnerRefusal(
             "this runner states no width in "
             f"`config.parallel_config.data_parallel_size` (it reads {size!r}), "

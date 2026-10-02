@@ -525,6 +525,7 @@ class TestTheRung:
             SimpleNamespace(parallel_config=SimpleNamespace()),
             SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=0)),
             SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=False)),
+            SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=-1)),
         ],
         ids=[
             "no-config",
@@ -532,6 +533,7 @@ class TestTheRung:
             "no-data-parallel-size",
             "zero",
             "false",
+            "negative",
         ],
     )
     def test_a_runner_that_states_no_parallel_size_is_refused(self, trace, config):
@@ -539,9 +541,9 @@ class TestTheRung:
 
         Each of the three lookups on the way to `data_parallel_size` is a
         place a differently shaped runner stops, and reading a stop as 1 rank
-        prices a group's step as one rank's without saying so. Zero and
-        `False` are not widths either, and `int()` of either passes the
-        `> 1` check as the single-rank case."""
+        prices a group's step as one rank's without saying so. Zero,
+        `False` and a negative are not widths either, and each passes the
+        `> 1` check in `capture_rung` as the single-rank case."""
         step = _decode(trace)
         bare = SimpleNamespace(
             capture_sizes_np=np.asarray(LADDER, dtype=np.int32),
