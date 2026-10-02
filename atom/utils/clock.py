@@ -11,9 +11,9 @@ message an LP produced before it moves that LP's clock.
 
 A grant to ``+inf`` closes the simulation window (`end_run`) before the process
 begins to shut down: the run is finished, and the owner's loop must exit rather
-than run its timers at ``+inf``. A clock call after it raises, `stamp_send` keeps
-returning ``+inf`` arrivals for shutdown sends, and `close` raises if the owner
-leaves before it.
+than run its timers at ``+inf``. A clock call after it raises; the wrappers send
+shutdown frames unstamped (arrival ``None``), so only a direct `stamp_send` call
+returns a ``+inf`` arrival; and `close` raises if the owner leaves before it.
 
 A grant names the messages it releases as ``{channel: [(seq, arrival)]}``.
 `_step_through` releases them one at a time in ``(arrival, channel, seq)``
