@@ -6,7 +6,6 @@ import os
 import pytest
 
 import atom
-import atom.model_engine.scheduler
 from atom.compass.detect.clock_source import (
     SERVING_ALLOW_LIST,
     SERVING_ROOTS,
@@ -53,11 +52,16 @@ class TestTheServingPathGate:
         code, report = ClockSourceLint().check(os.path.join(REPO, root))
         assert code == 0, report
 
-    def test_a_seeded_read_in_the_scheduler_fails(self, tmp_path):
-        with open(atom.model_engine.scheduler.__file__, encoding="utf-8") as handle:
+    @pytest.mark.parametrize(
+        "module",
+        ["atom/model_engine/scheduler.py", "atom/model_engine/model_runner.py"],
+    )
+    def test_a_seeded_read_fails(self, module, tmp_path):
+        """`model_runner.py` keeps `time.time` reads in other defs; a new def is not one of them."""
+        with open(os.path.join(REPO, module), encoding="utf-8") as handle:
             source = handle.read()
         seeded = source + "\n\ndef _seeded():\n    return time.time()\n"
-        target = tmp_path / "atom" / "model_engine" / "scheduler.py"
+        target = tmp_path / module
         target.parent.mkdir(parents=True)
         target.write_text(seeded, encoding="utf-8")
         code, report = ClockSourceLint().check(str(tmp_path))
