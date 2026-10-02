@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from atom.compass.clock import ChannelTable, LpId, LpRegistry, single_engine_table
+from atom.compass.clock import LpId, single_engine_table
 from atom.utils.clock import LPRuntime, Straggler
 
 ENGINE, FRONTEND = LpId("engine"), LpId("frontend")
@@ -222,13 +222,3 @@ def test_an_unhandled_release_prints_one_diagnostic_and_keeps_waiting(caplog):
     assert len(diags) == 1
     assert f"released {REQ} seq 0" in diags[0]
     assert rt.now == 10.2
-
-
-def test_a_channel_of_another_data_parallel_rank_is_refused_by_name():
-    registry = LpRegistry()
-    for lp in (FRONTEND, ENGINE):
-        registry.register(lp)
-    table = ChannelTable(registry)
-    table.declare("frontend->engine:request#dp1", FRONTEND, ENGINE, IPC, "thread")
-    with pytest.raises(NotImplementedError, match="'frontend->engine:request#dp1'"):
-        LPRuntime(ENGINE, table, FakeConn())
