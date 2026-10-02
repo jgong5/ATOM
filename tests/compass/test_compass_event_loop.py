@@ -101,13 +101,14 @@ def _until(cond) -> None:
         time.sleep(0.001)
 
 
-def _traffic(run, stamps: queue.Queue, before_ner) -> threading.Thread:
-    """The traffic LP: stamps one request at 0, then `before_ner()`, then idles."""
+def _traffic(run, stamps: queue.Queue, before_ner, n=1) -> threading.Thread:
+    """The traffic LP: stamps `n` requests at 0, then `before_ner()`, then idles."""
 
     def body():
         rt = LPRuntime(TRAFFIC, TABLE, clock_transport.connect(TRAFFIC, run.endpoint))
         rt.start_run()
-        stamps.put(rt.stamp_send(HTTP))
+        for _ in range(n):
+            stamps.put(rt.stamp_send(HTTP))
         before_ner()
         rt.next_event(INF)
         rt.close()
@@ -275,6 +276,40 @@ def test_a_request_read_before_its_release_is_held_until_it(run):
         traffic.join(10)
     loop.close()
     assert handled == [arrival]
+    assert run.conn.grants == [arrival, INF] and run.conn.unread == []
+
+
+def test_requests_with_one_arrival_are_handed_over_in_seq_order(run):
+    stamps, handled = queue.Queue(), []
+    traffic = _traffic(run, stamps, before_ner=lambda: None, n=2)
+    (arrival, _), (again, _) = stamps.get(timeout=10), stamps.get(timeout=10)
+    assert arrival == again
+
+    async def app(scope, receive, send):
+        handled.append(_stamp(scope)[1])
+
+    def read(seq):
+        scope = {
+            "type": "http",
+            "headers": [(b"x-test-stamp", b"%r %d" % (arrival, seq))],
+        }
+        return HttpChannel(app, _stamp)(scope, None, None)
+
+    async def go():
+        await asyncio.sleep(arrival)  # both are released, neither is read yet
+        first = asyncio.ensure_future(read(1))
+        for _ in range(3):  # the loop selects with seq 0 still unread
+            await asyncio.sleep(0)
+        await asyncio.gather(first, read(0))
+
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        traffic.join(10)
+    loop.close()
+    assert handled == [0, 1]
     assert run.conn.grants == [arrival, INF] and run.conn.unread == []
 
 

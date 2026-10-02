@@ -206,7 +206,6 @@ DAEMON_TIMERS = frozenset(
         "Server.main_loop",
         "H11Protocol.timeout_keep_alive_handler",
         "HttpToolsProtocol.timeout_keep_alive_handler",
-        "ZttpProtocol.timeout_keep_alive_handler",
     }
 )
 
@@ -234,7 +233,8 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
                 "LPRuntime with atom.utils.clock.install first"
             )
         self.daemon = weakref.WeakSet()  # the daemon timers scheduled
-        self.held: dict[tuple[str, int], asyncio.Future] = {}  # waiting for release
+        # Requests read, not handed over: (channel, seq) -> (arrival, wake-up).
+        self.held: dict[tuple[str, int], tuple[float, asyncio.Future]] = {}
         super().__init__(CompassSelector(self))
         self.executor = SimExecutor(self)
         self.set_default_executor(self.executor)
@@ -252,6 +252,22 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         super().close()
         self.rt.close()
 
+    def hand_over(self) -> bool:
+        """Once every released request has been read, wake the released ones in
+        ``(arrival, seq)`` order; returns whether any was woken."""
+        rt = self.rt
+        with rt.lock:
+            if any(not rt.released[ch] <= rt.arrived[ch] for ch, _ in self.held):
+                return False
+            out = sorted(
+                (a, seq, ch)
+                for (ch, seq), (a, _) in self.held.items()
+                if rt.is_released(ch, seq)
+            )
+        for _, seq, ch in out:
+            self.held.pop((ch, seq))[1].set_result(None)
+        return bool(out)
+
 
 class CompassSelector(selectors.DefaultSelector):
     """The loop's one blocking point: a socket wait, or a next-event request."""
@@ -266,7 +282,7 @@ class CompassSelector(selectors.DefaultSelector):
             return super().select(timeout)
         if loop.executor.station is None:
             loop.executor.start_run()
-        if timeout == 0:
+        if loop.hand_over() or timeout == 0:
             return super().select(0)
         if rt.inline_pending() or loop.executor.station.unresolved():
             return super().select(POLL_S)
@@ -283,10 +299,6 @@ class CompassSelector(selectors.DefaultSelector):
                 h.cancel()
             loop.stop()
             return []
-        with rt.lock:
-            released = [k for k in loop.held if rt.is_released(*k)]
-        for k in released:
-            loop.held.pop(k).set_result(None)
         return super().select(0)
 
 
@@ -295,8 +307,9 @@ class HttpChannel:
 
     `stamp(scope)` is a request's ``(arrival, seq)`` read from its carrier, or
     ``None`` for one sent outside the run, which passes straight through. A
-    stamped request waits for its release and counts as handled when it is
-    handed on.
+    stamped request waits until it is released and every released request has
+    been read; released requests are handed on in ``(arrival, seq)`` order and
+    count as handled then.
     """
 
     def __init__(self, app, stamp) -> None:
@@ -314,11 +327,9 @@ class HttpChannel:
             )
             arrival, seq = got
             rt.check_arrival(ch, arrival, seq)
-            with rt.lock:
-                released = rt.is_released(ch, seq)
-            if not released:
-                loop.held[ch, seq] = loop.create_future()
-                await loop.held[ch, seq]
+            wake = loop.create_future()
+            loop.held[ch, seq] = (arrival, wake)
+            await wake
             with rt.lock:
                 rt.count_done_locked(ch, seq)
         await self.app(scope, receive, send)
