@@ -3,8 +3,9 @@
 
 A message is a tuple, one of four shapes:
 
-* ``("BIND", lp)`` -- the first frame on a connection; every later request on
-  that connection is `lp`'s;
+* ``("BIND", lp)`` or ``("BIND", lp, member)`` -- the first frame on a
+  connection; every later request on that connection is `lp`'s, made by
+  `member` when `lp` is declared with members;
 * ``(kind, t, log, t_daemon)`` with `kind` ``TAR`` or ``NER`` -- a request,
   where `log` is ``[(channel, seq, arrival)]``, the requester's sends since its
   previous request, and `t_daemon` an NER's daemon deadline, ``+inf`` for none;
@@ -152,8 +153,26 @@ def _refused_in(body) -> tuple:
     )
 
 
+def _member(name) -> str:
+    if not isinstance(name, str):
+        raise TypeError(f"a member is named by a str, got {name!r}")
+    return name
+
+
+def _bind_out(_, lp, member=None) -> dict:
+    body = {"kind": BIND, "lp": lp.name}
+    if member is not None:
+        body["member"] = _member(member)
+    return body
+
+
+def _bind_in(body) -> tuple:
+    bind = (BIND, LpId(body["lp"]))
+    return (*bind, _member(body["member"])) if "member" in body else bind
+
+
 _ENCODE = {
-    BIND: lambda _, lp: {"kind": BIND, "lp": lp.name},
+    BIND: _bind_out,
     GRANT: lambda _, g, released: {
         "kind": GRANT,
         "G": _out(g),
@@ -166,7 +185,7 @@ _ENCODE = {
 }
 
 _DECODE = {
-    BIND: lambda body: (BIND, LpId(body["lp"])),
+    BIND: _bind_in,
     GRANT: lambda body: (
         GRANT,
         _in(body["G"]),

@@ -91,10 +91,10 @@ class _StreamServer:
                 while (frame := _receive(stream)) is not None:
                     try:
                         if slot is None:
-                            lp, slot = self._server.bind(frame)
+                            address, slot = self._server.bind(frame)
                             reply = frame
                         else:
-                            self._server.submit(lp, frame)
+                            self._server.submit(address, frame)
                             reply = slot.get()
                     except (KeyError, ValueError) as refused:
                         reply = encode(_refusal(refused))
@@ -114,11 +114,11 @@ class _Remote:
     def bind(self, frame: bytes) -> tuple:
         _send(self._stream, frame)
         try:
-            _, lp = _reply(self.get())
+            _reply(self.get())
         except Exception:
             self.close()
             raise
-        return lp, self
+        return None, self
 
     def submit(self, _lp, frame: bytes) -> None:
         _send(self._stream, frame)
@@ -145,9 +145,10 @@ def serve(authority, endpoint: str) -> _StreamServer:
     return _StreamServer(authority, *_address(endpoint))
 
 
-def connect(lp, endpoint: str) -> _StreamConnection:
-    """`lp`'s connection to the authority served at ``tcp://host:port``."""
-    return _StreamConnection(_Remote(*_address(endpoint)), lp)
+def connect(lp, endpoint: str, member: str | None = None) -> _StreamConnection:
+    """`lp`'s connection, or its `member`'s, to the authority served at
+    ``tcp://host:port``."""
+    return _StreamConnection(_Remote(*_address(endpoint)), lp, member)
 
 
 def _address(endpoint: str) -> tuple[str, int]:
