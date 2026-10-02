@@ -554,7 +554,10 @@ class NonAllocatingRunner:
         # Imported at call time, not at module scope, so this module stays
         # importable where there is no driver. By the time a step is reported
         # the worker has imported the engine anyway.
+        from atom.compass.parity import record_step
         from atom.model_engine.scheduler import ScheduledBatchOutput
+
+        record_step(self, batch)
 
         stream = getattr(self, "_token_stream", None)
         if stream is None:
