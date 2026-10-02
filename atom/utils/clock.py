@@ -36,6 +36,25 @@ logger = logging.getLogger("atom")
 #: printed. The wait itself goes on: it costs no simulated time.
 DIAG_S = 30.0
 
+#: The runtime of the LP this process belongs to, or None on a real run.
+_installed: "LPRuntime | None" = None
+
+
+def install(runtime: "LPRuntime | None") -> None:
+    """Make every `now` in this process read `runtime`; None restores the real clock."""
+    global _installed
+    _installed = runtime
+
+
+def now(real) -> float:
+    """The LP clock while a runtime is installed; otherwise `real()`.
+
+    A serving-path read passes the machine clock it read before, so a real run
+    reads exactly what it did, and a simulated one never calls it.
+    """
+    runtime = _installed
+    return real() if runtime is None else runtime.read_clock()
+
 
 class Straggler(Exception):
     """An unreleased message whose arrival this LP has already released past."""

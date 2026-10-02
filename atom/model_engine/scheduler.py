@@ -41,7 +41,7 @@ from atom.model_engine.state_runtime import (
     StateMaintenanceOps,
     StateRuntime,
 )
-from atom.utils import envs
+from atom.utils import clock, envs
 
 logger = logging.getLogger("atom")
 
@@ -1191,7 +1191,7 @@ class Scheduler:
                 oldest_arrive = seq.arrive_time
         if oldest_arrive is None:
             return 0.0
-        return max(0.0, (time.time() - oldest_arrive) * 1000.0)
+        return max(0.0, (clock.now(time.time) - oldest_arrive) * 1000.0)
 
     def publish_kv_events(self) -> None:
         """Drain BlockManager's event log and publish as one EventBatch. Called
@@ -1471,7 +1471,7 @@ class Scheduler:
         # ---- Phase 2: new requests from waiting ----
         while (
             delayer_allows
-            and (self.delay_factor <= 0 or self._passed_delay(time.time()))
+            and (self.delay_factor <= 0 or self._passed_delay(clock.now(time.time)))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens
@@ -2685,7 +2685,7 @@ class Scheduler:
             # speculative tokens and cap/stop overflow have been removed. A
             # terminal response with no completion tokens must keep TTFT zero.
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
-                seq.first_token_time = time.time()
+                seq.first_token_time = clock.now(time.time)
 
             # Hash generated blocks. Deferred output: all tokens forwarded;
             # undeferred: last token not yet forwarded, so exclude it.
@@ -3361,7 +3361,7 @@ class DecodeScheduler(Scheduler):
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
-            seq.first_token_time = time.time()
+            seq.first_token_time = clock.now(time.time)
             self.prefill_done.append(seq)
 
     def schedule(self):

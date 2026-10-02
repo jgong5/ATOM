@@ -118,6 +118,8 @@ way, so the ordinal never carries meaning of its own.
 Every reading of the wall clock, as opposed to every wait. The rows under
 `anchors` carry the readings that gate scheduling or that the result reports —
 the delay gate, the queue-age guard, and the arrival, first-token and finish
-stamps — because a mechanism already applies to them. The rest of this path's
-clock reads are logging and metrics, and separating those from business logic
-across the whole tree is its own pass.
+stamps — because a mechanism already applies to them. Every clock read on this
+path is classified by the clock-source lint instead
+(`atom/compass/detect/clock_source.py`): a read either goes through
+`atom.utils.clock.now` and returns the LP's time, or stays real under a
+`SERVING_ALLOW_LIST` entry naming its site, class and reason.
