@@ -45,7 +45,7 @@ influence how they land rather than retrofit them. See D73.
 
 ---
 
-## D72. Counters and gauges are valid by construction; their clocks stay real
+## D72. Counters and gauges are valid by construction; their clocks are virtual
 
 ### Why they are valid
 
@@ -54,47 +54,63 @@ influence how they land rather than retrofit them. See D73.
 run unmodified under simulation** (`03` D13). Nothing there is a timing read, and there are
 no rate denominators to correct.
 
-### The two clock reads, and why both stay on the real clock
+### The three clocks, and why all three are virtual
 
 ```python
-# engine_core.py:317-320   <- inside EngineCore.busy_loop, the process that OWNS the clock
+# engine_core.py:317-320   <- EngineCore.busy_loop, the engine LP's clock owner (DP loop: :698-701)
 now = time.monotonic()
 if now >= next_metrics_push:
     next_metrics_push = now + METRICS_PUSH_INTERVAL_S      # 5.0, engine_core.py:50
     self.utility_handler.push_metrics()
 
+# api_server.py:1522       <- _metrics_refresh_loop, in the API-server process
+await asyncio.sleep(_METRICS_REFRESH_INTERVAL_SECONDS)     # 5.0, api_server.py:339
+
 # metrics.py:408           <- in the API-server process
 self._last_refresh = time.time()    # "when was this snapshot taken", returned by read()
 ```
 
-**Decision: both stay real, and both go on the allowlist of `01` D9's AST test.**
+**Decision: all three run on virtual time, and none goes on `01` D9's allowlist.**
 
-*"Leave them alone"* is not sufficient, because both sit inside processes whose clocks are
-virtualized:
+- **The push gate is a virtual timer.** Its clock read returns LP time, and
+  `next_metrics_push` is a local next event folded into the engine's idle-point (NER) time.
+  The push stays an ordinary message on the engine's output channel.
+- **The refresh loop is a virtual timer with no code change.** Under simulation the API
+  server's asyncio loop runs on virtual time, so this `sleep` is one.
+- **`_last_refresh` is a clock-read substitution** (`01` D9 item 2) and returns LP time:
+  *when, in virtual time, the snapshot was taken*. It is exported as
+  `atom:metrics_last_refresh_timestamp_seconds` (`metrics.py:41`), and the observer below
+  compares it against a virtual scrape time, so a staleness check reads true.
 
-- `engine_core.py:317` is in the **clock owner's hot loop**. Redirect `time.monotonic()`
-  wholesale there and the metrics gate goes virtual whether or not that was intended.
-- `metrics.py:408` is in the API-server process, which installs a virtual clock for arrival
-  stamping. Redirect `time.time()` broadly and `_last_refresh` silently reports a snapshot
-  *"taken"* at virtual t=180 s while wall time is t=4 s — a scraper's staleness check then
-  reads nonsense.
+**Revised 2026-09-28.** This decision used to keep all three on the real clock, allowlisted,
+and to correct `01` D5's virtual push cadence; `01` D5 now stands. Neither reason held: a
+push every 5 virtual seconds at a 100× speed ratio is one small message per 50 ms of wall
+time, which changes how fast the simulator runs but not what it predicts, since every
+result is cost-model virtual time; and a snapshot goes stale on the wall clock only for
+someone watching the simulator on the wall clock, while the observer watches on simulated
+time.
 
-The allowlist is the mechanism; these are two of its entries; the AST test is what stops a
-later refactor from quietly virtualizing them.
+### The observer: Prometheus's scrape, on simulated time
 
-### This corrects `01` D5
+A real deployment's Prometheus `GET`s `/metrics` every `scrape_interval`, and the
+simulation does the same. A periodic timer in the traffic LP (Compass code) fires every
+`scrape_interval` of simulated time, taken from the real deployment's configuration. It adds
+no LP, because the traffic LP's clock owner is already Compass's own event-driven code, and
+no channel, because `/metrics` is a real HTTP endpoint: the request rides
+`traffic->frontend:http` and the response `frontend->traffic:stream`. The frontend serves
+it at its arrival time from the exporter's current snapshot, which lags engine state by at
+most the push interval plus the IPC lookahead — the same lag, from the same source, as on a
+real system. Samples carry virtual timestamps. Idle stretches are not skipped: each firing
+is an event the Clock Authority grants, at the cost of a few extra grants per interval.
 
-That document lists `METRICS_PUSH_INTERVAL_S` among the things that *"become a virtual
-timer, not disabled — metrics should be on the virtual timeline"*. **That is wrong.** A
-virtual cadence is harmful in both directions:
+### A periodic observer does not keep a run alive
 
-| virtual clock | 5 virtual s becomes | consequence |
-|---|---|---|
-| 100× fast (idle-skipping) | ~50 ms wall | **100× more pushes** over the ZMQ output socket and through `output_queue.get()` — real load, perturbing the measurement (D77 of the previous draft, now D75) |
-| 0.3× (saturated) | ~16.7 s wall | metrics stale past the API server's own 5 s refresh, which re-reads the same values |
-
-A wall cadence avoids both. The simulated *timeline* comes from D74's sampling, not from the
-push cadence.
+The push, the refresh and the scrape are all periodic timers, so every LP's next-event time
+stays finite and "every LP's next event is ∞" never holds. The run ends with its workload
+instead (`01` D3): once the traffic LP has sent every request, received every response and
+completed its last scrape, it calls `end_workload()`, whose `END` request makes the Clock
+Authority grant every LP to ∞. This is the usual discrete-event treatment of periodic
+statistics events.
 
 ---
 
@@ -223,11 +239,16 @@ not an approximation of it**.
                   one per step = every breakpoint
 ```
 
+This series coexists with D72's observer scrape, and the two serve different purposes: the
+per-step series is the simulated timeline's ground truth, for analysis; the scrape series is
+what an operator's Prometheus would see, comparable with a real run's scrape at the same
+`scrape_interval`.
+
 ### And it is cheap
 
 The prior 27B cc-traces run was **106 prefill + 4,346 decode = ~4,450 steps over 267 s of
 virtual time**. At ~40 series that is ~178k data points for a whole run — trivial to buffer
-and to write. The transport still drains on the wall-clock cadence of D72, so the ZMQ
+and to write. The transport still drains on the push timer of D72, so the ZMQ
 message **count** is unchanged; only the payload gets wider.
 
 ```
@@ -237,14 +258,14 @@ message **count** is unchanged; only the payload gets wider.
   |     snapshot = collect_metrics()    <- cheap   |
   |     buffer.append((virtual_ts, snapshot))      |
   |                                                |
-  |  wall timer, every 5 REAL seconds  (D72)       |
+  |  virtual timer, every 5 VIRTUAL s  (D72)       |
   |     push_metrics(buffer.drain())    <- costly  |
   +----------------------+-------------------------+
                          | same ZMQ, same message COUNT, bigger payload
                          v
    +---------------------------------------------+
    | API server                                  |
-   |   /metrics -> current values, wall scrape   |  <- liveness, unchanged
+   |   /metrics -> current values, D72 scrape    |  <- the scrape series
    |   run end  -> OpenMetrics text w/ virtual ts|  <- the simulated timeline
    +---------------------+-----------------------+
                          v
@@ -313,7 +334,7 @@ exporter**.
 | any metric with a **wall-clock denominator** presented as a simulated rate | there are none today; this is a rule about future additions |
 | any **histogram observation of an un-virtualized duration** | D73 — the failure looks authoritative because it came from Prometheus |
 | GPU utilisation, power, temperature, and the `server_metrics/` Prometheus scraper | there is no GPU |
-| metric emission that **advances the virtual clock** | emission is simulator overhead, not modelled work. Under `01` D4 virtual time advances only for durations the cost model produced, so this is satisfied by construction — but it must be **asserted**, because a hook that accidentally sat inside a Category-A path would be invisible |
+| metric emission that **advances the virtual clock** | emission is simulator overhead, not modelled work. Under `01` D4 virtual time advances only for durations the cost model produced, so this is satisfied by construction — but it must be **asserted**, because a hook that accidentally sat inside a K1 (event cost, `advance_to`) path would be invisible |
 
 The standing reminder behind the last row: the instrument changes what it measures. Measure
 mode cost ~**11 ms of TTFT on the 27B (4%)**, and a variant that synchronised around each
@@ -359,7 +380,7 @@ attach to where the number came from, not to how it is exposed.
 | **E — event tally** | a count incremented on an occurrence: requests finished, preemptions, tokens, histogram `_bucket` and `_count` | **valid by construction.** Monotone; sample per step. |
 | **D — duration** | a clock delta: TTFT, TPOT, step time, queue wait, histogram `_sum` over durations | **must be a simulated duration.** Audit the observation argument (D73). |
 | **R — rate** | a count divided by elapsed time | **do not export.** Export the underlying counter and let PromQL `rate()` compute it over virtual timestamps. If a rate must be exported, its denominator is virtual elapsed. |
-| **T — timestamp** | a wall-clock instant exported as a value: `process_start_time_seconds`, `_created`, `_last_refresh`, exemplar timestamps | **must declare its clock.** Usually real, because it describes the *process*; virtual if it describes the *run*. Never left implicit. |
+| **T — timestamp** | a wall-clock instant exported as a value: `process_start_time_seconds`, `_created`, `_last_refresh`, exemplar timestamps | **must declare its clock.** Usually real, because it describes the *process*; virtual if it describes the *run*, as `_last_refresh` does (D72). Never left implicit. |
 | **X — external** | measured outside the engine: GPU telemetry, host stats, the `server_metrics/` scraper | **invalid under simulation.** Refuse. |
 
 ATOM's current twenty metrics are all **S** or **E**, which is why D72's "valid by
@@ -440,9 +461,9 @@ infrastructure and add nothing" should mean in practice.
 | # | Decision | Date |
 |---|---|---|
 | D71 | Scope is ATOM's Prometheus engine metrics only. Harness metrics belong to `06`; simulator observability is run-artifact fields, not a metrics subsystem. | 2026-09-19 |
-| D72 | Counters and gauges are valid by construction. **Both metrics clock reads stay on the real clock** and go on `01` D9's allowlist. This corrects `01` D5, which made the push cadence virtual. | 2026-09-19 |
+| D72 | Counters and gauges are valid by construction. **All three metrics clocks are virtual:** the engine push gate and the API-server refresh loop are virtual timers, and `_last_refresh` is a clock-read substitution; none is allowlisted. A sim-time-aware observer in the traffic LP scrapes `/metrics` every `scrape_interval` of simulated time over the existing HTTP channels. The run ends with its workload (`end_workload`), so the periodic timers cannot keep it alive. | 2026-09-19; revised 2026-09-28 |
 | D73 | Histograms observe durations, so the clock audit extends from clock *reads* to observation *arguments*. Ask for classic histograms and for instrumentation that is handed a duration rather than computing one inline. | 2026-09-19 |
-| D74 | **Sample once per engine step** — virtual time is discrete-event, so state changes only at step boundaries and the per-step series is the ground truth. Transport on the wall clock; write OpenMetrics with virtual timestamps; backfill into TSDB. Treat the real run identically, for overlay. | 2026-09-19 |
+| D74 | **Sample once per engine step** — virtual time is discrete-event, so state changes only at step boundaries and the per-step series is the ground truth. Transport on D72's push timer; coexists with D72's scrape series; write OpenMetrics with virtual timestamps; backfill into TSDB. Treat the real run identically, for overlay. | 2026-09-19; revised 2026-09-28 |
 | D75 | Four classes of invalid metric, refused rather than reported. Emission never advances the virtual clock, and that is asserted. | 2026-09-19 |
 | D76 | The gauges supply `08`'s counting invariants for free; a histogram's `_count` is one too, and `_sum/_count` is a mean comparable at the noise floor. | 2026-09-19 |
 | D77 | Classify every metric by the **provenance of its value** (state, event tally, duration, rate, timestamp, external), not by its Prometheus type. Declare the class at construction; an unclassified metric refuses to export under simulation. The backfill writer uses the OpenMetrics serializer and the `timestamp=` argument that `add_metric` already provides. | 2026-09-19 |

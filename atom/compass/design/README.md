@@ -528,7 +528,7 @@ The documents use these precisely; a reader will bounce off without them.
 |---|---|---|
 | [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced additive field each direction, audited for minimality. Timeline piggybacked on `kv_transfer_params` so Atomesh needs no change. Tokenizer cost is a queue, not a constant. |
 | [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two tiers: a CPU tier over every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free **as a batch** and held to green, and a GPU superset judged as a **delta** against **4779 / 5** (`fe9ea043c`, torch 2.10.0+rocm7.2.4, ROCm 7.2.4, AITER v0.1.21.dev0-49-gf4e7c7509, all five failing node-ids on file). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible only if stable *and* sensitive. |
-| [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. Both metrics clock reads stay real. |
+| [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. All three metrics clocks are virtual, and an observer scrapes `/metrics` on simulated time. |
 
 ### Part V — Cross-cutting
 
