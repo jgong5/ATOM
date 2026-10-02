@@ -380,7 +380,7 @@ one LP:
 | ATOM group | OS processes | LPs | Why |
 |---|---|---|---|
 | TP group | 1 EngineCore + N workers | **1** | Workers are slaved by a blocking RPC (`async_proc.py:431`) and hold no clock. Rank-0 authority validated at 0.06% (D0). |
-| DP group | N EngineCores | **1** | Already `all_reduce`s every step for lockstep (`engine_core.py:751-781`) and runs `dummy_execution` on idle ranks (`:748-749`). A step is one compound event priced by its per-layer critical path (below). |
+| DP group | N EngineCores | **1** | Already `all_reduce`s every step for lockstep (`DPEngineCoreProc._sync_dp_state`) and runs `dummy_execution` on idle ranks (`DPEngineCoreProc._execute_dummy_batch`). A step costs the `max` over ranks of each rank's own cost (below). |
 | API server | 1 process: uvicorn, `CoreManager` and its threads | **1** (frontend) | Its asyncio event loop is a clock owner of its own: it tokenizes and streams while the engine runs a forward, so it overlaps the step loop in simulated time and cannot be folded into it. Offline, the owner is the loop that calls `get_output`. |
 | PD container (prefill or decode) | one full ATOM deployment | **2** | its frontend LP and its engine LP |
 | Traffic source | — | **1** | |
@@ -423,17 +423,12 @@ constraints.
    A startup assertion enforces the collective case: creating a process group whose ranks
    map to more than one LP raises.
 
-**A DP group is one LP, and its step is a compound event** priced by the critical path of
-the per-layer synchronization graph: nodes are `(rank, layer, operator)` costed on that
-rank's own batch; edges are program order within a rank plus a cross-rank barrier at each
-collective (e.g. the MoE all-to-all). The ranks exchange batch descriptors (or per-layer
-cost vectors) on the collective that already runs, all compute the same path, and every
-rank calls the CA as a member of the LP (below). No operator-level TAR/NER. `max(step_seconds)` is right only when
-the step is the only synchronization; with per-layer barriers it underestimates. Rank 0
-at attention 3 / MoE 1 per layer and rank 1 at 1 / 3 give `max` 4 but a critical path of
-`max(3,1) + max(1,3)` = 6: 240 against 360 over 60 layers. Per-rank LPs are right only
-if the ranks decouple at step level (no per-step collective) and interact only with
-lookahead > 0.
+**A DP group is one LP, and its step costs the `max` over ranks** of each rank's own cost
+(owner ruling 2026-10-01, `15` D90). Every rank prices its own batch, and the predicted
+forward exchanges the step seconds by one `all_reduce(MAX)` on the DP group after
+pricing; `15` D90 owns the `T_dp` and uniform-routing argument. Every rank then calls
+the CA as a member of the LP (below). No operator-level TAR/NER. Per-rank LPs are right only if the ranks decouple at step level (no per-step
+collective) and interact only with lookahead > 0.
 
 **A DP group's LP has one member process per rank, and the CA joins them** (owner
 ruling 2026-10-01, `12` T91, #528). Each DP rank is its own `EngineCore` process with its
@@ -443,7 +438,7 @@ frames. The CA completes the LP's request only when every member has called:
 
 1. Every member makes the same number of CA calls per loop iteration; a per-member call
    counter refuses a mismatch by name.
-2. One request kind per round: TAR with equal `T` on every member, or NER with `t` the
+2. One request kind per round: TAR with equal `T` on every member, or NER with `t`
    and `t_daemon` each the minimum over members. Unequal `T` or mixed kinds are refused.
 3. Every member's send log is merged before any grant is computed, so the LP's promised
    time never rises on a partial request.
@@ -1048,7 +1043,7 @@ undecided**.
 | K3 | Idle point | NER: `next_event(t, t_daemon)` | the step loops' spin, the PP bounded polls, offline `get_output` |
 | K4 | Channel send | timestamped send, logged on the clock owner | PD direct sends, PP sends, output sends through the relay queue |
 | K5 | Channel receive | counted at the wait point, then TSO delivery | the engine input thread, the frontend output thread, the PD handler threads, the PP receives and zero-bound drains, the PP `flush_pp_send` |
-| K6 | Wait inside one LP | LP aggregation: never reported to the CA | TP worker RPC and barriers, frontend coroutines awaiting their own process's data, control commands' calls to workers, the DP group's reduction |
+| K6 | Wait inside one LP | LP aggregation: never reported to the CA | TP worker RPC and barriers, frontend coroutines awaiting their own process's data, control commands' calls to workers, the DP group's reductions (the `PrefillDelayer` all_reduce, and the step-seconds `all_reduce(MAX)` in the predicted forward) |
 | K7 | Virtual timer | the timer runs on the LP clock | idle KV drain, metrics push and refresh, Anthropic ping, keep-alive, the silence warning, the control-command reply timeout |
 | K8 | Real bound | the CA cannot reach it, or it stays real on purpose: configuration | the Rust router's bounds and health check, process-death detection |
 | K9 | Outside the model | outside the simulation window, inside replaced code, or cannot park | startup and shutdown, the replaced runner and RDMA backends, collectives inside the real forward, text scanners |
@@ -1076,14 +1071,15 @@ The rules that settle the boundaries #53's categories left in the wrong place:
   sizes both). So the TP workers and every rank of a lockstep DP group sit in the engine
   LP, and a startup assertion refuses a process group whose ranks map to more than one
   LP.
-- **A DP step is one TAR, priced by its per-layer critical path** (D3). The ranks exchange
-  their batch descriptions on the lockstep `all_reduce` they already run
-  (`DPEngineCoreProc._sync_dp_state`, `atom/model_engine/engine_core.py`), each computes
-  the same path, and every rank calls the CA as a member of the LP (D3) — which is why
-  that `all_reduce` is K1 rather than ignored: it is where the DP LP's step length is decided. **Second-order
-  bound:** a fast rank's output is stamped at the end of the whole step, late by at most
-  the difference between the ranks' tail times; the step is split with in-step TAR only
-  if that is measured to affect TPOT.
+- **A DP step is one TAR, costing the `max` over ranks** (D3, `15` D90). Each rank prices
+  its own batch, the ranks exchange the step seconds by one `all_reduce(MAX)` inside the
+  predicted forward, and every rank calls the CA as a member of the LP (D3). The exchange
+  is K6 and carries no cost (`15` D90). The lockstep `all_reduce`
+  (`DPEngineCoreProc._sync_dp_state`, `atom/model_engine/engine_core.py`) keeps its payload; it is K1 rather than ignored because it has a cost of its own, not
+  because the step is decided there. **Second-order bound:** a fast rank's output is
+  stamped at the end of the whole step, late by at most the difference between its own
+  cost and the `max`; the step is split with in-step TAR only if that is measured to
+  affect TPOT.
 - **A bound in Python is a virtual timer; only what the CA cannot reach is a real
   bound.** #53 split bounded waits by purpose, failure detector (C1) against pacing (C2).
   Both run on the LP clock now (K7, D5). K8 is the Rust router's bounds and health check,
@@ -1122,8 +1118,8 @@ The rules that settle the boundaries #53's categories left in the wrong place:
   frontend LP whose completion times come from D33's service model. The multimodal
   preprocessing hand-off in `chat_completions` is K1 too, and is refused today because no
   service time is modelled for it.
-- **K1**, the DP lockstep `all_reduce` (`DPEngineCoreProc._sync_dp_state`), per the DP
-  rule above
+- **K1**, the DP lockstep `all_reduce` (`DPEngineCoreProc._sync_dp_state`), for its own
+  cost, per the DP rule above
 - **K3**, **the idle jump, which is a real site in ATOM even though the name this list
   once gave it is not.** `Scheduler._advance_to_next_arrival` does not exist here — but
   the loops it would have served do, and each spins rather than waits when there is
@@ -1803,7 +1799,7 @@ Ordered by how much they could cost.
 | D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for M4/M6 multi-container runs | 2026-09-19 |
 | D3.4 | Wall-clock interleaving may vary between runs; the `(LP, virtual time, event)` sequence may not. Thread scheduling inside an LP is irrelevant only under in-transit counting and TSO delivery; ties break by **(time, LP id, channel, sequence number), never arrival order**; the cost backend is a pure function of its batch view; **no `set` iteration on the simulated path** - string ids are hashed under `PYTHONHASHSEED` randomisation, so a set of request ids iterates differently in every process. Test is a byte-diff of two step tables, CPU-only, in CI. | 2026-09-20; revised 2026-09-28 |
 | D3.5 | The CA owns three outputs: an opt-in timeline log, a stall diagnostic (a stall the CA can see is resolved by deadlock detection and recovery; one it cannot see gets a diagnostic, never an abort), and an always-written run summary carrying grants, speed ratio, lazy-trace cost, detector state and the refusal fractions `08` D50.1 gates on. | 2026-09-20; revised 2026-09-28 |
-| D4 | Every synchronization site maps to one of the PDES mechanisms K1-K9, none undecided; the boundary is the LP, not the process; a DP step is one compound event priced by its per-layer critical path; handler threads stay and TSO delivery runs them at their message's timestamp | 2026-09-18; revised 2026-09-28 |
+| D4 | Every synchronization site maps to one of the PDES mechanisms K1-K9, none undecided; the boundary is the LP, not the process; a DP step is one TAR costing the `max` over ranks, exchanged inside the forward by a K6 wait with no cost, and the lockstep `all_reduce` is K1 for its own cost; handler threads stay and TSO delivery runs them at their message's timestamp | 2026-09-18; revised 2026-09-28 and 2026-10-01 |
 | D5 | Every timer and clock read the CA can reach runs on the LP clock; only what it cannot reach is configured or left real; metric cadence is virtual time (revising `11` D72); the profiler and RL control commands are refused by the simulated runner and counted | 2026-09-18; revised 2026-09-28 |
 | D5.1 | The simulated run uses stdlib asyncio, not uvloop: only a Python event loop can host virtual time | 2026-09-28 |
 | D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only | 2026-09-18; revised 2026-09-28 |
