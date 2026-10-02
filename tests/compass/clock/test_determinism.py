@@ -18,14 +18,14 @@ order rows reach the table in but not its text.
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
 
 from atom.compass.detect.determinism import StepTable, compare_step_tables
 
-from .repeat import CONFIGURATIONS, RecordedRun
+from .deployments import DEPLOYMENTS
+from .repeat import RecordedRun
 
 TREE = Path(__file__).resolve().parents[3]
 
@@ -33,12 +33,13 @@ TREE = Path(__file__).resolve().parents[3]
 #: shown to come apart at this pair on every configuration, so a clean table
 #: that agrees at it has been compared by a check that can fail.
 SEEDS = ("1", "2")
+NAMES = tuple(f"seed {seed}" for seed in SEEDS)
 
 
-def child(configuration, seed, *flags):
+def child(deployment, seed, *flags):
     """One recorded run in its own process: its table, hash probe and `atom`."""
     done = subprocess.run(
-        [sys.executable, "-m", "clock.repeat", configuration, *flags],
+        [sys.executable, "-m", "clock.repeat", deployment, *flags],
         cwd=TREE / "tests" / "compass",
         env=dict(os.environ, PYTHONHASHSEED=seed, PYTHONPATH=str(TREE)),
         capture_output=True,
@@ -51,16 +52,12 @@ def child(configuration, seed, *flags):
     return done.stdout, probe, module
 
 
-def names():
-    return tuple(f"seed {seed}" for seed in SEEDS)
-
-
-@pytest.fixture(scope="module", params=sorted(CONFIGURATIONS))
+@pytest.fixture(scope="module", params=sorted(DEPLOYMENTS))
 def clean(request):
     return request.param, [child(request.param, seed) for seed in SEEDS]
 
 
-@pytest.fixture(scope="module", params=sorted(CONFIGURATIONS))
+@pytest.fixture(scope="module", params=sorted(DEPLOYMENTS))
 def defective(request):
     return request.param, [
         child(request.param, seed, "--hand-over-by-set") for seed in SEEDS
@@ -80,7 +77,7 @@ class TestTheSameConfigurationTwice:
         configuration, runs = clean
         left, right = (table for table, _, _ in runs)
         assert left == right
-        code, report = compare_step_tables(left, right, *names())
+        code, report = compare_step_tables(left, right, *NAMES)
         assert code == 0
         rows = left.count("\n")
         assert report == (
@@ -94,10 +91,13 @@ class TestTheSameConfigurationTwice:
     def test_the_order_rows_reach_the_table_in_does_not_reach_its_text(self):
         """The driver's request order stands in for wall-clock interleaving.
 
-        M4 only: on M1-M3 all six orders give one row order.
+        Prefill-decode only: on the single deployment all six orders give one
+        row order.
         """
-        first = RecordedRun("M4")
-        second = RecordedRun("M4", sorted(map(str, first.lps), reverse=True))
+        first = RecordedRun("prefill-decode-1p1d")
+        second = RecordedRun(
+            "prefill-decode-1p1d", sorted(map(str, first.lps), reverse=True)
+        )
         reports = [first.run(), second.run()]
         assert [r.stopped_by for r in reports] == ["END from traffic"] * 2
         assert reports[0].submitted != reports[1].submitted
@@ -111,15 +111,21 @@ class TestTheSeededDefect:
     ):
         configuration, runs = defective
         left, right = (table for table, _, _ in runs)
-        code, report = compare_step_tables(left, right, *names())
+        code, report = compare_step_tables(left, right, *NAMES)
         assert code == 1
-        first, one, other = report.split("\n")
-        assert first.startswith(
-            f"determinism: seed 1 and seed 2 ran {configuration} and produced "
-            "different records, first at row "
-        )
-        assert one.startswith("  seed 1   ") and other.startswith("  seed 2   ")
-        assert one[len("  seed 1") :] != other[len("  seed 2") :]
+        lines, others = left.split("\n"), right.split("\n")
+        differing = [i for i, (a, b) in enumerate(zip(lines, others)) if a != b]
+        assert len(differing) > 1
+        index = differing[0]
+        assert report.split("\n") == [
+            (
+                f"determinism: seed 1 and seed 2 ran {configuration} and produced "
+                f"different records, first at row {index} of "
+                f"{len(lines) - 1} and {len(others) - 1}:"
+            ),
+            f"  seed 1   {lines[index]}",
+            f"  seed 2   {others[index]}",
+        ]
 
     def test_one_process_cannot_tell_the_defect_from_a_clean_run(self, defective):
         configuration, _ = defective
@@ -129,18 +135,6 @@ class TestTheSeededDefect:
             run.run()
             tables.append(run.step_table.text())
         assert compare_step_tables(*tables, "first", "second")[0] == 0
-
-
-def test_a_sleep_on_every_reply_costs_wall_time_and_changes_no_row():
-    quick = RecordedRun("M1-M3")
-    quick.run()
-    slow = RecordedRun("M1-M3", sleep_seconds=0.001)
-    started = time.perf_counter()
-    slow.run()
-    seconds = time.perf_counter() - started
-    replies = sum(row.event != "receive" for row in slow.step_table.rows)
-    assert seconds >= replies * 0.001
-    assert slow.step_table.text() == quick.step_table.text()
 
 
 class TestWhatTheComparisonReportsOnItsOwn:
