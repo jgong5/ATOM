@@ -31,6 +31,34 @@ plus one term per collective the deployment's widths make possible. A step
 carrying both kinds of work is priced as both and pays both intercepts, because
 a step that did both launched both.
 
+A tensor-parallel all-reduce runs once per layer this worker holds, so its
+count is the depth of the worker's span and not the number of layers in it that
+hold a cache of every past token. The two are the same number only on a stack
+whose layers are all paged, and they diverge with the architecture rather than
+by a factor somebody could fold into the coefficient: a layer keeping a bounded
+recurrent state costs a KV block nothing and still takes part in the
+all-reduce, so a stack that is one paged layer in four charges four times what
+the paged count would. That depth is handed in -- the KV geometry cannot supply
+it, since what it counts is the paged subset -- and a deployment with a
+collective to price and no depth stated is refused rather than charged on the
+count that happens to be at hand.
+
+**That argument is the all-reduce's and it does not reach the other collective
+this charges.** An expert all-to-all runs on the layers that hold experts,
+which is a third count: not the paged subset, not the depth of the span, and
+not something anything here can supply, since no expert arrangement is read
+anywhere in this package. It is charged on the stack depth regardless, because
+that is the count in hand -- so on a stack whose experts sit on a period, or
+one mixing dense layers among expert ones, it is wrong in exactly the way the
+paged count was wrong for the all-reduce. Two consequences are stated rather
+than left to be noticed. The term for any collective other than the all-reduce
+says, where its charge is read, that the depth is standing in for a count of
+expert-bearing layers; and moving the all-reduce onto the stack depth moved the
+all-to-all by the same four times on the hybrid here, which is a side effect of
+sharing the count in hand and not a result about experts. Settling it needs an
+expert geometry and a term that reads one, which belongs to a backend that
+means its numbers rather than to this one.
+
 Two things the form does not know, stated because a reader of a number will
 otherwise assume it does. It has one quadratic coefficient for the whole batch
 and no notion of a layer kind, so a stack whose layers do not all grow with
@@ -114,6 +142,33 @@ CANDIDATE = "a collective these widths admit, not one observed to run"
 # show a rung is too narrow and can never show it is too wide, so that count
 # rests on the caller in a way the coefficient's own note does not cover.
 UNCHECKED_RUNG = "padding from a supplied rung width; nothing here bounds it above"
+
+# Added to a collective's own provenance, because the count it multiplies is
+# the one a reader is most likely to assume wrong. Two layer counts describe
+# one worker and a record that states seconds states neither, so the term says
+# which of them it was charged on where the charge is read.
+PER_STACK_LAYER = "one charge per layer of the worker's stack, not per paged layer"
+
+# Added to the provenance of every collective except the one whose count is
+# argued for below. The depth is the count in hand rather than the count that
+# collective runs on, and a term charged on a stand-in says so where the charge
+# is read; a reader who divides the charge back out otherwise recovers a number
+# and no indication that nothing here chose it. It names no collective and no
+# kind of layer, because it is attached by not being in the argued set: a
+# sentence about the layers one of them runs on would be a claim about every
+# later name that joins it unargued, made by the default rather than by
+# anybody.
+DEPTH_STANDS_IN = (
+    "the stack depth standing in for this collective's own count, which "
+    "nothing here argues it equals"
+)
+
+# The collectives whose charge on the worker's stack depth has an argument
+# behind it: an all-reduce runs on every layer the worker runs, and that is the
+# depth. Membership is stated rather than inferred so that a collective added
+# to the named set later is labelled a stand-in until somebody argues its
+# count, instead of inheriting an argument made for a different collective.
+_COUNT_ARGUED = frozenset({"tp-all-reduce"})
 
 
 def _refuse_shadowing(owner: type, cls: type) -> None:
@@ -375,8 +430,32 @@ class ShapeStubBackend(CostBackend):
     What it returns is a candidate set: nothing it omits can run, and what it
     names can still be ruled out by conditions the widths do not express, so
     each such term carries that qualification in its own provenance rather
-    than being charged as a certainty. Pricing one needs the layer count, so a
-    deployment with any candidate must also hand in the geometry.
+    than being charged as a certainty.
+
+    Pricing one needs a layer count, and there are two of them. `stack_layers`
+    is the one the charge is made on: every layer this worker runs, whatever
+    each layer keeps. `geometry` is the KV a block is sized from, whose own
+    `layers` counts only the layers holding a cache of every past token -- the
+    same number on a uniform stack and a quarter of it on a stack that is one
+    paged layer in four. Both are held, neither is derived from the other, and
+    a deployment with a candidate collective and no stack depth is refused: a
+    count taken from the geometry there would be wrong in kind on every hybrid
+    and right by coincidence on everything else.
+
+    **A geometry is not required to price a collective, and that is a
+    loosening of what this constructor used to refuse.** Nothing that computes
+    seconds reads it -- a collective costs the tokens times the stack depth
+    times a declared coefficient, and every other term reads the batch -- so
+    declining for want of a paged count would refuse a price this would then
+    make identically, which is a refusal with nothing behind it. It stays on
+    the constructor because it is the pool declaration a price is paired with
+    where there is one, and `describe()` writes it. What its absence costs is
+    two things, stated here rather than left to be discovered. The check that
+    catches the two counts crossed -- a span shallower than the paged subset
+    inside it -- compares two stated counts, so with one stated there is
+    nothing to cross and it does not run. And `describe()` has one count to
+    write, so it says the paged one was not stated rather than printing a lone
+    number that reads like the whole description of a worker.
     """
 
     def __init__(
@@ -384,16 +463,55 @@ class ShapeStubBackend(CostBackend):
         coefficients: Coefficients | None = None,
         parallelism: Parallelism | None = None,
         geometry: KvGeometry | None = None,
+        stack_layers: int | None = None,
     ) -> None:
         self.coefficients = Coefficients() if coefficients is None else coefficients
         self.parallelism = Parallelism() if parallelism is None else parallelism
         self.geometry = geometry
+        # A whole number of layers, or nothing. `int()` on the argument would
+        # take 64.7 for a precise 64 and "64" for a count that was never
+        # stated as one, which is the guess the refusals below exist to
+        # decline, made in the constructor that makes them. The wording and
+        # the `TypeError` are the ones this package already uses for a dialled
+        # count. A `bool` is an `int` to Python and is taken as the one-layer
+        # span it equals; refusing that here alone would be a second
+        # convention for one question, which is worse than the case it would
+        # catch. It is stored as that span and not as `True`: the check has
+        # already declined everything that is not an `int`, so converting
+        # after it narrows nothing else, and `describe()` writes this value as
+        # the count the charge was made on, which `True` is not.
+        if stack_layers is not None and not isinstance(stack_layers, int):
+            raise TypeError(
+                f"stack_layers must be a whole number of at least 1, not "
+                f"{stack_layers!r}"
+            )
+        self.stack_layers = None if stack_layers is None else int(stack_layers)
         named = self.parallelism.collectives()
-        if named and geometry is None:
+        if named and self.stack_layers is None:
             raise ValueError(
-                f"{', '.join(named)} to price and no geometry to price it from; a "
-                "collective runs once per layer, so hand in the KV geometry that "
-                "says how many layers this worker holds"
+                f"{', '.join(named)} to price and no stack depth to price it from; "
+                "a collective runs once per layer this worker runs, and a KV "
+                "geometry counts only the layers that hold a cache of every past "
+                "token, so state how many layers deep the span is"
+            )
+        if self.stack_layers is not None and self.stack_layers < 1:
+            raise ValueError(
+                "a worker runs at least one layer, got "
+                f"stack_layers={self.stack_layers}"
+            )
+        # Two counts are what this compares, and a geometry is optional above,
+        # so a deployment that states one count is priced with this check not
+        # run. That is the cost of the geometry being optional and it is named
+        # in the class docstring beside the reason.
+        if (
+            self.stack_layers is not None
+            and geometry is not None
+            and self.stack_layers < geometry.layers
+        ):
+            raise ValueError(
+                f"a {self.stack_layers}-layer span holding {geometry.layers} paged "
+                "layers is not a span: the layers that hold a cache are a subset "
+                "of the layers there are, so the two counts have been crossed"
             )
 
     @property
@@ -471,17 +589,28 @@ class ShapeStubBackend(CostBackend):
                 ),
             ]
         terms = [self._term(*row) for row in counted]
-        layers = 0 if self.geometry is None else self.geometry.layers
-        moved = sum_tokens(batch_view.requests) * layers
-        for collective in self.parallelism.collectives():
-            terms.append(
-                self._term(
-                    f"collective.{collective}",
-                    moved,
-                    c.collective_token_layer,
-                    CANDIDATE,
+        collectives = self.parallelism.collectives()
+        if collectives:
+            # The constructor refuses a candidate collective with no depth
+            # stated, so there is a count here and it is the stack's.
+            moved = sum_tokens(batch_view.requests) * self.stack_layers
+            for collective in collectives:
+                # One count for all of them, and an argument for it behind
+                # only one. The rest say in their own provenance that the
+                # depth is standing in, because the seconds do not and a
+                # reader who recovers the count from them recovers no sign
+                # that nothing here chose it.
+                qualifier = f"{CANDIDATE}; {PER_STACK_LAYER}"
+                if collective not in _COUNT_ARGUED:
+                    qualifier = f"{qualifier}; {DEPTH_STANDS_IN}"
+                terms.append(
+                    self._term(
+                        f"collective.{collective}",
+                        moved,
+                        c.collective_token_layer,
+                        qualifier,
+                    )
                 )
-            )
         return StepCost(terms)
 
     def describe(self) -> str:
@@ -492,7 +621,22 @@ class ShapeStubBackend(CostBackend):
             f" pp{self.parallelism.pp_size}"
             f" dp{self.parallelism.dp_size}"
         )
-        named = ", ".join(self.parallelism.collectives()) or "no collectives"
+        named = ", ".join(self.parallelism.collectives())
+        if named:
+            # The depth belongs in the line because the seconds do not carry
+            # it: a collective charged on the paged layers of a hybrid and one
+            # charged on its stack read alike once they are in a total. With
+            # no geometry held there is one count to write, and a lone number
+            # here would read as the worker's whole description, so the line
+            # says which count is missing instead of quietly emitting one.
+            paged = (
+                ", paged count not stated"
+                if self.geometry is None
+                else f", {self.geometry.layers} paged"
+            )
+            named += f" on {self.stack_layers} layers{paged}"
+        else:
+            named = "no collectives"
         return (
             f"step-level stand-in, {pricing} coefficients, {widths}, {named}"
             f" -- {DECLARED}"
