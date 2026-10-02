@@ -61,6 +61,12 @@ evidence about another until it is shown to transfer.
 
 ## D90. DP — the step shape is decided by a collective, and that is the design problem
 
+> **Replaced in part by the owner's DP ruling of 2026-10-01**
+> ([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)): the step is
+> the `max` over ranks of each rank's own cost, exchanged by one `all_reduce(MAX)` inside
+> the forward, and every DP rank holds its own LP runtime, joined by the CA. Where this
+> section differs, the ruling holds; #532 rewrites it.
+
 ### Q2 first, because it is the one with teeth
 
 DP is the only strategy that couples **scheduling decisions** across ranks. Under DP, the
@@ -133,8 +139,7 @@ Consequences:
 3. **Both collectives are internal to the LP, and neither is ignored** (revised
    2026-09-28, #443). Neither is a cross-LP wait the CA sees. The lockstep `all_reduce`
    (`DPEngineCoreProc._sync_dp_state` in `atom/model_engine/engine_core.py`) is an event
-   cost (`01` D4, K1): the ranks exchange their batch descriptions on it and it is where
-   the step's length is decided, as its per-layer critical path (below). Every collective's own cost is priced (Q3 below).
+   cost (`01` D4, K1). Every collective's own cost is priced (Q3 below).
 
 ### Q1, Q3, Q4
 
@@ -163,9 +168,7 @@ Two things follow:
   case where the only cross-rank sync is per step; with per-layer barriers it
   underestimates. Rank 0 at 3 attention + 1 MoE per layer and rank 1 at 1 + 3 give a
   `max` of 4 per layer but a critical path of max(3,1) + max(1,3) = 6: over 60 layers,
-  240 against 360. The ranks exchange their batch descriptions on the lockstep
-  `all_reduce` and each computes the same path; only one talks to the CA. The cost model
-  therefore owes per-rank, per-layer durations. Per-rank LPs, still granted per step,
+  240 against 360. The cost model therefore owes per-rank, per-layer durations. Per-rank LPs, still granted per step,
   are only for ranks that decouple at step level (no per-step collective) and interact
   only with lookahead > 0; a finer, operator-level grant is not used.
 - **Idle DP ranks still cost a step.** `EngineCore._execute_dummy_batch` runs
@@ -225,9 +228,10 @@ protocol for the message's size, the standard MPI-level PDES treatment (SimGrid 
   overhead `o`, per-byte time `G`, bytes from geometry (below).
 - **Eager** (bytes up to the carrier's `eager_threshold_bytes`): the send completes on the
   sender's clock at `t_send + o + bytes × G`. The receiver plays no part.
-- **Rendezvous** (larger): the send completes at `done = max(t_send, t_recv_posted) + T`,
-  `T` the rendezvous duration for its size and `t_recv_posted` the time the next stage
-  posts its receive, which only the next stage's LP knows.
+- **Rendezvous** (larger): a part completes at `max(t_send, r_i) + T`, `T` the rendezvous
+  duration for its size and `r_i` the time the next stage posts that part's receive, which
+  only the next stage's LP knows; the first part's is `t_recv_posted`. The send's `done` is
+  the latest completion over its parts (How the parts combine, below).
 
 **A cross-LP dependency arrives as a message** (conservative PDES). Two channels join
 adjacent stages, each on a path the real system has: the stage-to-stage send itself, and
@@ -296,8 +300,9 @@ first settles the pending send: an inline receive of its `pp_ack` if it was rend
 advance to its local completion if it was eager, nothing if no send is pending. ATOM's own
 `flush_pp_send` call then runs, and the simulated runner answers it at once (`02` D10). The
 shutdown call in `_downstream_busy_loop` is the same call as the idle one and shares its
-answer; it runs outside the simulated window, so sharing changes nothing. The head's
-shutdown call in `_head_busy_loop` is outside the window too. `commit_pp_send_work`'s own
+answer; it runs after the `+inf` grant that ends the run, where the loop makes no clock
+call (#533), so it settles nothing and sharing changes nothing. The head's shutdown call
+in `_head_busy_loop` runs there too. `commit_pp_send_work`'s own
 `wait()` is inside the replaced runner and never runs.
 
 **Carrier.** A simulated runner sends no tensors, so both channels ride gloo
@@ -745,8 +750,8 @@ and `test_forward_mode.py` already cover the pieces on the CPU-only path (`08` D
 |---|---|---|
 | D88 | One frame of four questions per strategy — LPs and lookahead, scheduling coupling, cost, memory. **Only PP adds logical processes**; TP, DP and EP each sit behind an existing barrier. | 2026-09-19 |
 | D89 | TP is the settled instance and supplies the per-width discipline: width is a key, not a parameter. | 2026-09-19 |
-| D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP. Step duration is `max` over ranks, computed not rank-0-sourced, and idle ranks cost a dummy batch. Revised: the step is a compound event priced by the per-layer critical path over ranks (`max` is its step-sync-only special case). | 2026-09-19, revised 2026-09-28 |
-| D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. Revised: a send completes on the sender's clock when eager and at `max(t_send, t_recv_posted) + T` when rendezvous, a per-carrier size threshold deciding which; the receiver returns a rendezvous completion on `stage(k+1)->stage(k):pp_ack#dp0`, lookahead `T_min - L_data`, and both waits receive it (K5). | 2026-09-19, revised 2026-09-28 and 2026-09-30 |
+| D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP. Step duration is `max` over ranks, computed not rank-0-sourced, and idle ranks cost a dummy batch. Revised: the step is a compound event priced by the per-layer critical path over ranks (`max` is its step-sync-only special case). Replaced in part by the owner's DP ruling ([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)); #532 rewrites this row. | 2026-09-19, revised 2026-09-28; ruling 2026-10-01 |
+| D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. Revised: a send part completes on the sender's clock when eager and at `max(t_send, r_i) + T` when rendezvous, `r_i` the time its receive is posted, a per-carrier size threshold deciding which, and a send's `done` is the latest over its parts; the receiver returns a rendezvous completion on `stage(k+1)->stage(k):pp_ack#dp0`, lookahead `T_min - L_data`, and both waits receive it (K5). Confirmed by the owner on 2026-10-02: the send reaches the next stage on `stage(k)->stage(k+1):pp_data#dp0`, and the TP-rank-0 workers carry both channels' frames over the PP CPU group. | 2026-09-19, revised 2026-09-28 and 2026-09-30, confirmed 2026-10-02 |
 | D92 | EP adds no LPs (inherits the TP group) but its all-to-all is invisible and must be a declared node, and its `exclusive` occupancy forbids placing it in a `Par`. Expert sharding is Class A, remainder included. | 2026-09-19 |
 | D93 | LP count = 1 traffic LP + per deployment (1 frontend LP + one engine LP per PP stage): 3 aggregated, 5 for 1P1D, independent of GPU count. The clock protocol's cost tracks PP degree and PD roles, not width. | 2026-09-19, revised 2026-09-28 |
 | D94 | Parallelism splits across milestones: LP structure, couplings and memory shape at **M1**; cost accuracy at **M7**. M1's test is scheduling-decision agreement at TP2/DP2/PP2/EP2, which needs no cost model. | 2026-09-19 |
