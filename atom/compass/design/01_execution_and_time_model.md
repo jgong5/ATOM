@@ -567,12 +567,12 @@ the standard counting one (Fujimoto, Mattern):
    Inline channels are taken by the owner at its own receive point.
 
 **The simulation window.** Each LP's window opens once its process is ready to serve (an
-engine after it queues READY, `engine_core.py:225`) and closes when that process begins
-to shut down; for the frontend that includes `_shutdown_engine_core_rank`
-(`engine_core_mgr.py:1343`). Inside it every cross-LP frame is stamped, registered and
-counted, and the thread-identity assertion (I3, I4) applies. Frames outside it — READY,
-SHUTDOWN and the rest of startup and teardown — carry no stamp, are not counted, and are
-handed to ATOM at once.
+engine after it queues READY, `engine_core.py:225`) and closes at that LP's `+inf` grant,
+before its process begins to shut down (`LPRuntime.next_event` calls `end_run` on that
+grant). Inside it every cross-LP frame is stamped, registered and counted, and the
+thread-identity assertion (I3, I4) applies. Frames outside it — READY, SHUTDOWN and the
+rest of startup and teardown — are not counted and are handed to ATOM at once; a send
+stamped after the `+inf` grant carries arrival `+inf`, which no grant releases.
 
 Counting is exact: release and completion are per `(channel, seq)`, so a channel need not
 be FIFO and arrivals on one channel need not be monotone — concurrent HTTP requests do
