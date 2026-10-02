@@ -116,6 +116,12 @@ def stateless_init_torch_distributed_process_group(
     if LP_OF_RANK is not None:
         # A collective across logical processes is a wait the clock authority
         # cannot see, so refuse before any rank blocks in the rendezvous.
+        missing = [r for r in range(world_size) if r not in LP_OF_RANK]
+        if missing:
+            raise RuntimeError(
+                f"a process group of {world_size} ranks has ranks with no logical "
+                f"process: {', '.join(map(str, missing))}"
+            )
         lps = sorted({LP_OF_RANK[r] for r in range(world_size)})
         if len(lps) > 1:
             raise RuntimeError(

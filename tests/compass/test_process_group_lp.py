@@ -42,6 +42,19 @@ def test_a_group_over_two_lps_is_refused_naming_both(monkeypatch):
     )
 
 
+def test_a_rank_missing_from_the_map_is_refused_by_name(monkeypatch):
+    monkeypatch.setattr(dist_utils, "LP_OF_RANK", {0: LpId("engine")})
+
+    with pytest.raises(RuntimeError) as refused:
+        dist_utils.stateless_init_torch_distributed_process_group(
+            "127.0.0.1", get_open_port(), 0, 3, backend="gloo"
+        )
+
+    assert str(refused.value) == (
+        "a process group of 3 ranks has ranks with no logical process: 1, 2"
+    )
+
+
 def test_the_dp2_group_of_one_engine_lp_is_built(monkeypatch):
     monkeypatch.setattr(
         dist_utils, "LP_OF_RANK", {0: LpId("engine"), 1: LpId("engine")}
