@@ -1051,7 +1051,7 @@ undecided**.
 | K6 | Wait inside one LP | LP aggregation: never reported to the CA | TP worker RPC and barriers, frontend coroutines awaiting their own process's data, control commands' calls to workers, the DP group's reduction |
 | K7 | Virtual timer | the timer runs on the LP clock | idle KV drain, metrics push and refresh, Anthropic ping, keep-alive, the silence warning, the control-command reply timeout |
 | K8 | Real bound | the CA cannot reach it, or it stays real on purpose: configuration | the Rust router's bounds and health check, process-death detection |
-| K9 | Outside the model | outside the simulation window, inside replaced code, or cannot park | startup and shutdown, the replaced runner and RDMA backends, collectives inside the real forward, text scanners |
+| K9 | Outside the model | outside the simulation window, inside replaced code, cannot park, or a timing only a log line reads | startup and shutdown, the replaced runner and RDMA backends, collectives inside the real forward, text scanners, the step-loop timings that only feed a log line |
 
 Each site's mechanism is the `mechanism` field #476 adds to its row in
 `atom/compass/audit/sync_sites.json`, produced by the scanner beside it. A row's

@@ -20,15 +20,20 @@ in another.
 """
 
 import os
+from collections import Counter
 
 import pytest
 
 import atom.compass
 import atom.utils.clock
-from atom.compass.detect.set_iteration import SetIterationLint
+from atom.compass.detect.clock_source import CORE_ROOTS
+from atom.compass.detect.set_iteration import CORE_SET_ALLOW_LIST, SetIterationLint
 
 #: The tree the rule applies to.
 SIMULATED_PATH = os.path.dirname(atom.compass.__file__)
+
+REPO = os.path.dirname(os.path.dirname(atom.__file__))
+CORE = [os.path.join(REPO, root) for root in CORE_ROOTS]
 
 #: A step loop that reads its participants out of a set every way the pass
 #: claims to see, and some it does not. Everything here runs; nothing
@@ -261,6 +266,7 @@ FORMS_THAT_FIRE = {
     "copy": "def f(s: set[str]):\n    t = s.copy()\n    for x in t:\n        yield x\n",
     "dict-view-operator": "def f(d, s: set[str]):\n    for x in d.keys() & s:\n        yield x\n",
     "ifexp": "def f(p, n, m):\n    for x in set(n) if p else set(m):\n        yield x\n",
+    "or-empty": "def f(s: set[str]):\n    for x in s or ():\n        yield x\n",
     "walrus": "def f(n):\n    if s := set(n):\n        for x in s:\n            yield x\n",
     "augmented": "def f(n, t):\n    s = set(n)\n    s |= t\n    for x in s:\n        yield x\n",
     "typing-Set": "from typing import Set\n\n\ndef f(r: Set[str]):\n    return [x for x in r]\n",
@@ -616,3 +622,55 @@ class TestTheSetIterationLint:
             "set-iteration lint: disabled, so this tree makes no claim about "
             "its set order"
         )
+
+
+class TestTheCoreGate:
+    """The same check over ATOM's core, with the reads whose order cannot matter kept by site."""
+
+    def test_the_core_roots_are_clean(self):
+        code, report = SetIterationLint().check(*CORE)
+        assert code == 0, report
+
+    def test_every_entry_holds_exactly_the_reads_it_counts(self):
+        """A stale entry, or a count that drifted, is a decision nobody re-made."""
+        lint = SetIterationLint()
+        modules = [path for root in CORE for path in lint.modules(root)]
+        held = Counter(lint.site(read) for read in lint.scan_modules(modules))
+        held.pop(None, None)
+        assert held == {site: count for site, (_, count) in CORE_SET_ALLOW_LIST.items()}
+        assert all(why.strip() for why, _ in CORE_SET_ALLOW_LIST.values())
+
+    def test_a_seeded_read_in_the_scheduler_fails(self, tmp_path):
+        module = "atom/model_engine/scheduler.py"
+        with open(os.path.join(REPO, module), encoding="utf-8") as handle:
+            source = (
+                handle.read() + "\n\ndef _seeded(ids):\n    return list(set(ids))\n"
+            )
+        target = tmp_path / module
+        target.parent.mkdir(parents=True)
+        target.write_text(source, encoding="utf-8")
+        code, report = SetIterationLint().check(str(tmp_path))
+        assert code == 1
+        assert report.splitlines()[:2] == [
+            "set-iteration lint: 1 ordered read(s) of a set:",
+            f"  {target}:{len(source.splitlines())}  list() over set(ids)  in _seeded",
+        ]
+
+    def test_a_field_annotated_in_another_module_is_a_set_when_scanned_with_it(self):
+        """`KVConnectorOutput` annotates its fields in `types.py`; the scheduler reads them."""
+        scheduler = os.path.join(REPO, "atom/model_engine/scheduler.py")
+        types = os.path.join(REPO, "atom/kv_transfer/disaggregation/types.py")
+        lint = SetIterationLint(sites={})
+
+        def receives(paths):
+            return sorted(
+                read.expression
+                for read in lint.scan_modules(paths)
+                if read.scope == "_update_from_kv_xfer_finished"
+            )
+
+        assert receives([scheduler]) == []
+        assert receives([types, scheduler]) == [
+            "kv_connector_output.failed_recving or ()",
+            "kv_connector_output.finished_recving or ()",
+        ]
