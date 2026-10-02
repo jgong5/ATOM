@@ -50,6 +50,11 @@ def _rt(lp, *replies, table=None):
     return rt, call
 
 
+def _requests(rt):
+    """Each clock request's kind, time and send log; later fields are not checked."""
+    return [m[:3] for m in rt.conn.sent]
+
+
 def _relayed(rt, raw, ch, *stamps):
     """A sending wrapper whose stamps are scripted, as a relay would hand them over."""
     ws = WrappedSocket(rt, raw, ch)
@@ -116,7 +121,7 @@ def test_the_relay_sends_every_put_stamped_at_its_put(ctx):
     assert [f[3].bytes for f in rx.buf] == [b"ready", b"a", b"b", b"c"]
     stamps = {(OUT, 0): IPC, (OUT, 1): 0.5 + IPC, (OUT, 2): 0.7 + IPC}
     assert rx_rt.unreleased == stamps
-    assert rt.conn.sent == [
+    assert _requests(rt) == [
         ("TAR", 0.5, [(OUT, 0, IPC)]),
         ("TAR", 0.7, [(OUT, 1, 0.5 + IPC)]),
     ]
@@ -209,9 +214,9 @@ def test_inline_receive_idles_until_the_frame_is_released(ctx):
     assert call(rx.poll, 0) is False
     assert rt.conn.sent == []
     assert call(rx.poll, 100) is False
-    assert rt.conn.sent == [("NER", 0.1, [])]
+    assert _requests(rt) == [("NER", 0.1, [])]
     assert call(rx.recv) == b"p0"
-    assert rt.conn.sent[1:] == [("NER", math.inf, [])] * 2
+    assert _requests(rt)[1:] == [("NER", math.inf, [])] * 2
     assert call(rx.recv) == b"p1"
     assert len(rt.conn.sent) == 3
     assert rt.handled[KV] == {0, 1} and rt.now == 0.6
