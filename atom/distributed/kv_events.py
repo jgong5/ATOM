@@ -16,6 +16,8 @@ from typing import Any, Final
 
 import msgspec
 
+from atom.utils import clock
+
 logger = logging.getLogger("atom")
 
 # Where a block lives.
@@ -187,7 +189,7 @@ class ZmqEventPublisher(EventPublisher):
         if not evt_list:
             return
         batch = EventBatch(
-            ts=time.time(),
+            ts=clock.now(time.time),
             events=evt_list,
             data_parallel_rank=self._dp_rank,
         )

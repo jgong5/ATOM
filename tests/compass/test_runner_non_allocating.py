@@ -50,6 +50,18 @@ PACKAGE = REPO / "atom" / "compass" / "runner"
 ENGINE = REPO / "atom" / "model_engine"
 ATOM_RUNNER = ENGINE / "model_runner.py"
 
+# The `atom` modules outside this package and `atom.compass.memory` that a
+# module of this package imports at module scope, keyed by its path in the
+# package; every other module, none.
+ENGINE_READS = {
+    "model_runner.py": {"atom.model_engine.model_runner"},
+    "projection.py": {
+        "atom.compass.backends.shape",
+        "atom.model_engine.sequence",
+        "atom.utils.forward_context",
+    },
+}
+
 # The methods that own memory or run a step, and so are the ones replaced.
 OVERRIDDEN = {
     "_build_and_load_model",
@@ -533,6 +545,12 @@ def test_only_the_binding_module_reaches_the_engine(path):
     level of its import statements -- reaches no tensor library and no engine.
     The exemption is exactly the two packages whose closure something asserts;
     widening it to `atom.compass` would exempt packages nothing has checked.
+
+    Two modules read named engine modules, listed in `ENGINE_READS` by the
+    exact set. `model_runner` binds ATOM's runner. `projection` reads a
+    scheduled batch, a sequence's kind and the dispatch rule; none of the
+    three reaches `atom.model_engine.model_runner`, and
+    `test_every_other_module_imports_here` runs the import to measure it.
     """
     # A relative import is resolved against this module's package first, so
     # one that climbs out of the package is read as the module it names.
@@ -550,11 +568,7 @@ def test_only_the_binding_module_reaches_the_engine(path):
         for m in imported
         if m.startswith(("atom.compass.runner", "atom.compass.memory"))
     }
-    assert engine == (
-        {"atom.model_engine.model_runner"}
-        if path == PACKAGE / "model_runner.py"
-        else set()
-    )
+    assert engine == ENGINE_READS.get(str(path.relative_to(PACKAGE)), set())
 
 
 def test_every_module_the_walk_returns_is_a_case():
@@ -565,3 +579,22 @@ def test_every_module_the_walk_returns_is_a_case():
     """
     (mark,) = test_only_the_binding_module_reaches_the_engine.pytestmark
     assert mark.args[1] == _runner_modules()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [p for p in _runner_modules() if p != PACKAGE / "model_runner.py"],
+    ids=lambda p: str(p.relative_to(PACKAGE)),
+)
+def test_every_other_module_imports_here(path):
+    """The measurement the scan above can only approximate.
+
+    A source scan cannot see a driver reached through an import of an import,
+    and the scan's own predicate is blind to a module-scope `try:`/`except
+    ImportError:` in a module it does not read. Running the import is blind to
+    neither. On the tier that has no driver this is the whole property; on a
+    machine that has one it degrades to a syntax and resolution check, which is
+    why the scan above is kept as well.
+    """
+    module = ".".join(path.relative_to(REPO).with_suffix("").parts)
+    assert importlib.import_module(module.removesuffix(".__init__")) is not None

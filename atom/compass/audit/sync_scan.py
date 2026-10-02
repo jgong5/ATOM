@@ -5,8 +5,9 @@
 
 The simulator substitutes predicted durations for real work, so any call that
 parks a thread on the real clock has to be accounted for: some become an
-advance of simulated time, some are only annotated, some are timeouts that
-must be raised, and some are invisible to simulated time and are left alone.
+advance of simulated time, some carry a message from one logical process to
+another, some are timeouts that move onto the simulated clock, and some are
+invisible to simulated time and are left alone.
 Deciding that per call site is a reading job; keeping the *list* honest as
 ATOM changes is not, and that is what this module does.
 
@@ -258,7 +259,7 @@ SHAPES: tuple[Shape, ...] = (
     ),
     Shape(
         "p2p",
-        frozenset({"send", "isend", "irecv", "batch_isend_irecv"}),
+        frozenset({"send", "send_multipart", "isend", "irecv", "batch_isend_irecv"}),
         "hands a message to a peer; parks when the transport's buffer is full",
     ),
     Shape(
