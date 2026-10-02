@@ -233,11 +233,19 @@ def test_a_refusal_raises_at_its_requester_and_the_loop_serves_on(
 
 def test_a_backdated_event_arrives_with_the_lp_table(served):
     ca = ClockAuthority(_table())
-    a = connect(A, served(ca).endpoint)
+    endpoint = served(ca).endpoint
+    a, b = connect(A, endpoint), connect(B, endpoint)
+    _result(_later(b.send, (NER, INF, [])))
+    assert _ask(a, (TAR, 2.0, [(AB, 0, 3.0)])) == (2.0, {})
     with pytest.raises(BackdatedEvent) as refused:
-        _ask(a, (TAR, 1.0, [(AB, 0, 0.1)]))
-    assert refused.value.reason.startswith(f"{AB} seq 0 arrives at 0.1")
-    assert refused.value.table == ca.lp_table()
+        _ask(a, (TAR, 3.0, [(AB, 1, 2.1)]))
+    assert refused.value.reason.startswith(f"{AB} seq 1 arrives at 2.1")
+    table = refused.value.table
+    assert table == ca.lp_table()
+    # b is waiting, so its state, target and undelivered all cross the wire.
+    assert [(r.state, r.target, r.undelivered) for r in table if r.lp == B] == [
+        (NER, INF, ((AB, 0, 3.0),))
+    ]
 
 
 def test_an_end_whose_log_is_behind_its_receiver_is_refused(served):
@@ -320,8 +328,10 @@ def test_an_endpoint_that_reaches_nothing_is_refused_rather_than_guessed(endpoin
 
 def _messages():
     ca = ClockAuthority(_table())
+    ca.on_request(B, NER, INF, [])
+    ca.on_request(A, TAR, 2.0, [(AB, 0, 3.0)])
     with pytest.raises(BackdatedEvent) as refused:
-        ca.on_request(A, TAR, 1.0, [(AB, 0, 0.1)])
+        ca.on_request(A, TAR, 3.0, [(AB, 1, 2.1)])
     return [
         ("BIND", A),
         (TAR, 1.0, [(AB, 0, 1.5)]),
@@ -354,7 +364,7 @@ def test_a_frame_is_json_a_stranger_can_read():
 
 
 def test_a_duration_that_is_not_one_is_refused_where_it_would_be_written():
-    with pytest.raises(MalformedMessage, match="unbounded, got nan"):
+    with pytest.raises(MalformedMessage, match="not JSON compliant: nan"):
         encode((TAR, math.nan, []))
 
 
@@ -368,6 +378,7 @@ def test_a_duration_that_is_not_one_is_refused_where_it_would_be_written():
         "a string",
         b'{"kind":"NER","log":[],"t":Infinity}',
         b'{"kind":"TAR","log":[[["x"],0,1.0]],"t":1.0}',
+        b'{"kind":"TAR","log":[["x",0.0,1.0]],"t":1.0}',
         b'{"kind":"REFUSED","error":"SystemExit","reason":"","table":null}',
     ],
 )

@@ -75,10 +75,6 @@ def decode(frame: bytes) -> tuple:
 
 def _out(seconds) -> float | str:
     value = float(seconds)
-    if math.isnan(value):
-        raise ValueError(
-            "a simulated time must be a number of seconds or unbounded, got nan"
-        )
     return UNBOUNDED.get(value, value)
 
 
