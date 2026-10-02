@@ -81,11 +81,13 @@ class _Eager(DeferredTokenStream):
 
 
 def _drive(stream=None, ignore_eos=True, stop_token_ids=(), **overrides):
-    """ATOM's engine step, run to completion, in `engine_core.py:382-412`'s order.
+    """ATOM's engine step, run to completion, in the engine's own order.
+
+    The order is `EngineCore._process_engine_step_inner`'s.
 
     `ignore_eos` is a parameter because it decides whether the scheduler's own
     end-of-text and stop-token checks run at all: both are gated on
-    `not seq.ignore_eos` (`scheduler.py:2630` and `:2633`), so a run that
+    `not seq.ignore_eos` (`Scheduler.postprocess`), so a run that
     leaves it True says nothing about the id this runner reports.
     """
     spec = {**STREAK, **overrides}
@@ -136,12 +138,12 @@ def _drive(stream=None, ignore_eos=True, stop_token_ids=(), **overrides):
                 if batch.is_final_chunk[i]:
                     final_chunk_at.setdefault(req_id, step)
         # Between `schedule()` and `forward` in the engine's own order
-        # (`engine_core.py:385`). It attaches the batch's attention aggregates
-        # in place and returns early unless profiling is active, so it moves
-        # nothing measured here -- it is called so that a successor extending
-        # this driver to a cost model inherits the loop and not a summary of
-        # it, since those aggregates are the batch-level attention terms such a
-        # model would read.
+        # (`EngineCore._process_engine_step_inner`). It attaches the batch's
+        # attention aggregates in place and returns early unless profiling is
+        # active, so it moves nothing measured here -- it is called so that a
+        # successor extending this driver to a cost model inherits the loop and
+        # not a summary of it, since those aggregates are the batch-level
+        # attention terms such a model would read.
         scheduler.compute_detailed_aggregates(batch, seqs)
         reply = runner.forward(batch)
         replies.append(reply)
@@ -314,7 +316,7 @@ def test_reporting_a_stop_id_lets_the_run_decide_the_length_it_predicts(run):
     """Driven with the scheduler's stop checks live, which the other runs are not.
 
     Every request in the default run sets `ignore_eos=True`, and both checks
-    are gated on `not seq.ignore_eos` (`scheduler.py:2630` and `:2633`). So
+    are gated on `not seq.ignore_eos` (`Scheduler.postprocess`). So
     that run would read exactly the same if every step reported the
     end-of-text id, and it is no evidence about the id this module picks. Here
     the checks run, against both ids they test for: reporting either one ends
@@ -423,8 +425,8 @@ def test_a_speculative_config_is_refused_before_the_drafter_is_built(run):
 def test_forward_never_answers_none_and_so_never_parks_its_caller(run):
     """A present method that answers None parks the caller exactly like an absent one.
 
-    `async_proc.py:243` is `if out is not None:` with both of the loop's
-    `put_nowait` calls inside it -- pinned as structure in
+    `AsyncIOProc.busy_loop` has both of its `put_nowait` calls inside
+    `if out is not None:` -- pinned as structure in
     `test_runner_rpc_surface.py`. This is the other side of that: the first
     method on this surface with a body that returns, and the property that its
     body has no way out that answers None.
@@ -453,17 +455,48 @@ def _decorators(path, class_name, name):
     return [ast.unparse(d) for d in _function(path, class_name, name).decorator_list]
 
 
+# The methods the reply is handed to whole. `postprocess` reads it under
+# `fwd_output`, which the walk below sees; `send_tokens` pickles it and reads
+# nothing. A hand-off to any other method is refused: it would read the reply
+# under a name this walk does not follow.
+HANDED_TO = ("postprocess", "send_tokens")
+
+
 def _reply_attribute_reads():
-    """Every attribute ATOM reads off a forward reply, from ATOM's own source."""
-    names = set()
+    """Every attribute ATOM reads off a forward reply, from ATOM's own source.
+
+    A read is `fwd_out.x` or `fwd_output.x`. The reply may also be handed on
+    whole -- passed positionally to one of `HANDED_TO`, returned, or tested
+    against `None`. Any other use of it, a `getattr`, an alias, a hand-off to
+    any other function or method, is refused by file and line: it
+    could read an attribute this set would never contain.
+    """
+    names, unread = set(), []
     for path in (REPO / "atom" / "model_engine").glob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text())):
-            if (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id in {"fwd_out", "fwd_output"}
+        tree = ast.parse(path.read_text())
+        parent = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Name)
+                and node.id in {"fwd_out", "fwd_output"}
+                and isinstance(node.ctx, ast.Load)
             ):
-                names.add(node.attr)
+                continue
+            up = parent[node]
+            handed_on = (
+                isinstance(up, ast.Return)
+                or ast.unparse(up) == f"{node.id} is None"
+                or (
+                    getattr(up, "func", None) is not None
+                    and getattr(up.func, "attr", None) in HANDED_TO
+                    and node in up.args
+                )
+            )
+            if isinstance(up, ast.Attribute):
+                names.add(up.attr)
+            elif not handed_on:
+                unread.append(f"{path.name}:{node.lineno}: {ast.unparse(up)}")
+    assert not unread, f"the forward reply is used in a form not read here: {unread}"
     return names
 
 

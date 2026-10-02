@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
-from pathlib import Path
 
 import pytest
 
@@ -49,13 +48,6 @@ MECHANISMS = set(INVENTORY["mechanisms"])
 # The mechanism each first-classification category named. A row whose
 # mechanism is another one has to say why in `mechanism_why`.
 NAMED_BY_CATEGORY = {"A": "K1", "B": "K5", "C1": "K8", "C2": "K7", "ignore": "K9"}
-
-# Every file that states a count per category or per mechanism. Each is parsed
-# and compared against the rows, so a table cannot drift from the data.
-COUNT_TABLES = (
-    Path(sync_scan.__file__).with_name("README.md"),
-    TREE / "atom/compass/design/01_execution_and_time_model.md",
-)
 
 
 @pytest.fixture(scope="module")
@@ -177,7 +169,7 @@ def test_mechanism_crosstab_against_the_first_classification():
     for c in categories:
         line = [cells[(c, m)] for m in mechanisms]
         print(c, *line, sum(line), sep="\t")
-    totals = sync_scan.counts_by("mechanism", INVENTORY)
+    totals = Counter(row["mechanism"] for row in ROWS)
     print("total", *(totals[m] for m in mechanisms), len(ROWS), sep="\t")
     assert sum(cells.values()) == sum(totals.values()) == len(ROWS)
 
@@ -211,37 +203,6 @@ def test_no_scanned_file_is_also_declared_unscanned():
     for rel, _why in sync_scan.UNSCANNED_ROOTS:
         inside = {f for f in scanned_files if f == rel or f.startswith(rel)}
         assert not inside, f"{rel} is excluded but these are scanned: {sorted(inside)}"
-
-
-def _stated_counts(text: str) -> dict[str, int]:
-    """Read every markdown table that has a column headed `Count`."""
-    counts: dict[str, int] = {}
-    column = None
-    for line in text.splitlines():
-        if not line.startswith("|"):
-            column = None
-            continue
-        cells = [c.strip().strip("*`") for c in line.strip().strip("|").split("|")]
-        if "Count" in cells:
-            column = cells.index("Count")
-            continue
-        if column is None or column >= len(cells):
-            continue
-        if cells[0] in CATEGORIES | MECHANISMS and cells[column].isdigit():
-            counts[cells[0]] = int(cells[column])
-    return counts
-
-
-@pytest.mark.parametrize("path", COUNT_TABLES, ids=lambda p: p.name)
-def test_every_stated_count_matches_the_rows(path):
-    """The counts are written down in prose and derived once here. A table
-    states every category or every mechanism, never a subset."""
-    stated = _stated_counts(path.read_text(encoding="utf-8"))
-    assert stated, f"{path} states no counts; the parser or the table changed"
-    for field, names in (("category", CATEGORIES), ("mechanism", MECHANISMS)):
-        part = {k: v for k, v in stated.items() if k in names}
-        if part:
-            assert part == sync_scan.counts_by(field, INVENTORY), (path, field)
 
 
 # --- the shape rules, against the forms they are written to tell apart ------

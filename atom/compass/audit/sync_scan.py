@@ -506,17 +506,6 @@ def load_inventory(path: str | os.PathLike | None = None) -> dict:
     return json.loads(Path(path or INVENTORY_PATH).read_text(encoding="utf-8"))
 
 
-def counts_by(field: str, inventory: dict | None = None) -> dict[str, int]:
-    """How many classified rows carry each value of ``field``; a row without
-    the field is not counted."""
-    inv = inventory if inventory is not None else load_inventory()
-    counts: dict[str, int] = {}
-    for row in inv["sites"] + inv["anchors"]:
-        if field in row:
-            counts[row[field]] = counts.get(row[field], 0) + 1
-    return counts
-
-
 def repo_root_from_here() -> Path:
     """The checkout this module was imported from."""
     return Path(__file__).resolve().parents[3]
