@@ -36,6 +36,16 @@ logger = logging.getLogger("atom")
 #: printed. The wait itself goes on: it costs no simulated time.
 DIAG_S = 30.0
 
+#: The station job this thread is serving, as ``job.cur = (station, k)``; the
+#: executor running the job sets it and clears it.
+job = threading.local()
+
+
+def current_job_time() -> float | None:
+    """The clock inside this thread's station job, or ``None`` outside one."""
+    cur = getattr(job, "cur", None)
+    return None if cur is None else cur[0].time_in_job(cur[1])
+
 
 class Straggler(Exception):
     """An unreleased message whose arrival this LP has already released past."""
@@ -77,7 +87,9 @@ class LPRuntime:
     # ---- clock owner ----
 
     def read_clock(self) -> float:
-        return self.now
+        """The LP clock, or on a thread serving a station job, the time in that job."""
+        t = current_job_time()
+        return self.now if t is None else t
 
     def stamp_send(self, ch: str) -> tuple[float, int]:
         """Register one message on `ch` as produced now; returns its ``(arrival, seq)``."""
