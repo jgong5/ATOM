@@ -380,6 +380,31 @@ def test_a_grant_that_cannot_be_framed_ends_the_run_for_every_parked_connection(
     assert no_table == table_breaks
 
 
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+def test_no_finish_grant_goes_out_when_the_last_cannot_be_framed(
+    served, monkeypatch, endpoint
+):
+    ca = ClockAuthority(_table())
+    endpoint = served(ca, endpoint).endpoint
+    a, b = connect(A, endpoint), connect(B, endpoint)
+    rule = ca.on_request
+    released = []
+
+    def last_nan(*args):
+        grants = rule(*args)
+        released.append(len(grants))
+        return grants[:-1] + [(i, math.nan, r) for i, _, r in grants[-1:]]
+
+    monkeypatch.setattr(ca, "on_request", last_nan)
+    _result(_later(b.send, (NER, INF, [], INF)))
+    parked = _later(b.recv)
+    _result(_later(a.send, (NER, INF, [], INF)))
+    for box in (_later(a.recv), parked):
+        with pytest.raises(ClockAbort, match=r"raised MalformedMessage\(.*nan"):
+            _result(box)
+    assert released == [0, 2]
+
+
 def test_a_log_behind_its_receiver_is_refused(served):
     endpoint = served(ClockAuthority(_table())).endpoint
     a, b = connect(A, endpoint), connect(B, endpoint)
