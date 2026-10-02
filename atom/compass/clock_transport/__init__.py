@@ -31,8 +31,8 @@ def connect(lp, endpoint: str = DEFAULT_ENDPOINT):
 
 
 def _carrier(endpoint: str):
-    scheme = endpoint.partition(":")[0]
-    if scheme not in _CARRIERS:
+    scheme, separator, _ = endpoint.partition(":")
+    if not separator or scheme not in _CARRIERS:
         raise ValueError(
             f"{endpoint!r} is not inproc:<name> or tcp://<host>:<port>; "
             "no carrier is guessed"

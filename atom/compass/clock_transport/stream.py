@@ -12,7 +12,9 @@ whose reply is held stops no other connection.
 ``connect(lp, "tcp://host:port")`` returns the in-process carrier's connection
 with a socket in place of the loop: the same ``send``, ``recv`` and ``close``,
 and the same frames, each preceded by its length as four big-endian bytes. A
-connection that ends inside a frame is a `MalformedMessage`.
+connection that ends inside a frame is a `MalformedMessage`. A frame the loop
+will not queue, such as a reply kind sent as a request, is refused at ``recv``
+here and at ``send`` in-process, with the same reason, and reaches no authority.
 """
 
 import contextlib

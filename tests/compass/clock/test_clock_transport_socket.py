@@ -52,7 +52,7 @@ FIVE_LP = {**THREE_LP, "router_s": 0.003, "kv_write_req_s": 0.004}
 #: One request through prefill and decode, on the five-LP table: the prefill
 #: engine computes and answers, the relay hands the request to decode, decode
 #: asks prefill for the KV and streams the output. Every LP ends in NER(+inf).
-M4_SCRIPTS = {
+PREFILL_DECODE_SCRIPTS = {
     "traffic": [("send", "traffic->frontend-P:http"), (NER, INF), (NER, INF)],
     "frontend-P": [
         (NER, INF),
@@ -86,7 +86,7 @@ M4_SCRIPTS = {
 
 RUNS = {
     "three-lp": (single_engine_table, THREE_LP, SCRIPTS),
-    "five-lp": (prefill_decode_table, FIVE_LP, M4_SCRIPTS),
+    "five-lp": (prefill_decode_table, FIVE_LP, PREFILL_DECODE_SCRIPTS),
 }
 
 CHILD = """
@@ -124,9 +124,14 @@ def served():
         server.close()
 
 
+def _connect(lp, endpoint):
+    """`connect`, bounded by `_result`'s wait."""
+    return _result(_later(connect, lp, endpoint))
+
+
 def _replies(endpoint, table, scripts):
     """Run `scripts` against `endpoint`: each LP's request count and reply frames."""
-    conns = {name: connect(LpId(name), endpoint) for name in scripts}
+    conns = {name: _connect(LpId(name), endpoint) for name in scripts}
     taps = {}
     for name, conn in conns.items():
         conn._slot = taps[name] = _Tap(conn._slot)
@@ -157,7 +162,8 @@ def test_a_scripted_run_gives_each_lp_the_same_reply_bytes_over_both_carriers(
 
 def test_a_standalone_clock_runs_in_a_process_of_its_own():
     table = prefill_decode_table(**FIVE_LP)
-    # The child serves until its stdin closes, which leaving this block does.
+    # The child serves until its stdin closes; it is killed so that a child
+    # stalled before it serves cannot hold up leaving this block.
     with subprocess.Popen(
         [sys.executable, "-c", CHILD.format(kwargs=FIVE_LP, endpoint=LOCAL)],
         env=dict(os.environ, PYTHONPATH=str(REPO)),
@@ -165,12 +171,15 @@ def test_a_standalone_clock_runs_in_a_process_of_its_own():
         stdout=subprocess.PIPE,
         text=True,
     ) as child:
-        endpoint = child.stdout.readline().strip()
-        assert endpoint.startswith("tcp://127.0.0.1:")
-        standalone = _replies(endpoint, table, M4_SCRIPTS)
+        try:
+            endpoint = _result(_later(child.stdout.readline)).strip()
+            assert endpoint.startswith("tcp://127.0.0.1:")
+            standalone = _replies(endpoint, table, PREFILL_DECODE_SCRIPTS)
+        finally:
+            child.kill()
     inproc = serve(ClockAuthority(table), "inproc:standalone-control")
     try:
-        assert standalone == _replies(inproc.endpoint, table, M4_SCRIPTS)
+        assert standalone == _replies(inproc.endpoint, table, PREFILL_DECODE_SCRIPTS)
     finally:
         inproc.close()
 
@@ -184,7 +193,7 @@ def test_a_held_reply_over_tcp_delays_no_other_lps_reply(served):
     table.declare("a->c:m", a, c, 1.0, "inline")
     table.declare("c->a:m", c, a, 1.0, "inline")
     endpoint = served(ClockAuthority(table), LOCAL)
-    conns = {lp: connect(lp, endpoint) for lp in (a, b, c)}
+    conns = {lp: _connect(lp, endpoint) for lp in (a, b, c)}
     _result(_later(conns[b].send, (NER, INF, [])))
     held = _later(conns[b].recv)
 
@@ -215,10 +224,10 @@ def test_a_standalone_clock_says_which_port_it_ended_up_on(served):
 def test_a_name_the_clock_does_not_hold_is_refused_over_tcp(served):
     endpoint = served(ClockAuthority(prefill_decode_table(**FIVE_LP)), LOCAL)
     with pytest.raises(KeyError, match="not a participant"):
-        connect(LpId("pp-stage-7"), endpoint)
-    traffic = connect(LpId("traffic"), endpoint)
+        _connect(LpId("pp-stage-7"), endpoint)
+    traffic = _connect(LpId("traffic"), endpoint)
     with pytest.raises(KeyError, match="already bound"):
-        connect(LpId("traffic"), endpoint)
+        _connect(LpId("traffic"), endpoint)
     traffic.close()
 
 
@@ -250,19 +259,19 @@ def _fake_clock(answer: bytes):
 )
 def test_a_clock_that_hangs_up_mid_frame_is_a_malformed_message(answer, match):
     with pytest.raises(MalformedMessage, match=match):
-        _result(_later(connect, LpId("a"), _fake_clock(answer)))
+        _connect(LpId("a"), _fake_clock(answer))
 
 
 def test_a_refusal_crosses_tcp_as_itself_and_the_connection_serves_on(served):
     ca = ClockAuthority(_table())
-    a = connect(A, served(ca, LOCAL))
+    a = _connect(A, served(ca, LOCAL))
     with pytest.raises(BackdatedEvent, match="before a's clock 0.0") as refused:
         _ask(a, (TAR, 1.0, [(AB, 0, 0.1)]))
     assert refused.value.table == ca.lp_table()
     # A frame the loop refuses to queue is answered in place of a reply.
     a.send(("GRANT", 1.0, {}))
     with pytest.raises(ValueError, match="sends only TAR, NER"):
-        a.recv()
+        _result(_later(a.recv))
     assert _ask(a, (TAR, 1.0, [])) == (1.0, {})
     a.close()
     with pytest.raises(ValueError, match="closed file"):
@@ -272,4 +281,4 @@ def test_a_refusal_crosses_tcp_as_itself_and_the_connection_serves_on(served):
 @pytest.mark.parametrize("endpoint", ["tcp://127.0.0.1", "tcp://:9", "tcp:9"])
 def test_a_tcp_endpoint_without_host_and_port_is_refused(endpoint):
     with pytest.raises(ValueError, match="is not tcp://<host>:<port>"):
-        connect(LpId("a"), endpoint)
+        _connect(LpId("a"), endpoint)

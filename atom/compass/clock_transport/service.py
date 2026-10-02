@@ -143,7 +143,6 @@ class _Connection:
 
 def serve(authority, endpoint: str = DEFAULT_ENDPOINT) -> _Server:
     """Serve `authority` at `endpoint`. `close()` on the result stops it."""
-    _require_carried(endpoint)
     if endpoint in _SERVED:
         raise ValueError(
             f"{endpoint} is already served in this process; two authorities at "
@@ -155,7 +154,6 @@ def serve(authority, endpoint: str = DEFAULT_ENDPOINT) -> _Server:
 
 def connect(lp: LpId, endpoint: str = DEFAULT_ENDPOINT) -> _Connection:
     """`lp`'s connection to the authority served at `endpoint`."""
-    _require_carried(endpoint)
     server = _SERVED.get(endpoint)
     if server is None:
         raise KeyError(
@@ -163,9 +161,3 @@ def connect(lp: LpId, endpoint: str = DEFAULT_ENDPOINT) -> _Connection:
             + (", ".join(sorted(_SERVED)) or "<none>")
         )
     return _Connection(server, lp)
-
-
-def _require_carried(endpoint: str) -> None:
-    scheme, separator, _ = endpoint.partition(":")
-    if not separator or scheme != IN_PROCESS_SCHEME:
-        raise ValueError(f"{endpoint!r} is not {IN_PROCESS_SCHEME}:<name>")
