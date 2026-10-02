@@ -62,7 +62,7 @@ K8, C2 K7, `ignore` K9 — and wherever a row's mechanism is a different one,
 
 The `send_multipart` calls the scanner found once it knew that shape carry no
 category: the front end's request and control sends (K4), and the sends in the
-KV event publisher and the two transfer backends (K9). The rows per mechanism,
+KV event publisher and the transfer backends (K9). The rows per mechanism,
 crossed with the first classification's categories, are printed by
 `pytest tests/compass/test_sync_inventory.py -s -k crosstab`.
 
