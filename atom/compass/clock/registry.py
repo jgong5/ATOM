@@ -52,7 +52,7 @@ class LpRegistry:
 
         Used wherever an unregistered identity would otherwise be accepted and
         turn into a missing row later, far from the call that introduced it. It
-        is the entry point the matrix funnels every identity through, so it
+        is the entry point the channel table funnels every identity through, so it
         type-checks for the same reason `register` does -- and because a bare
         `str` that reached the check below would be reported as not registered
         alongside the identically-spelled name that is.

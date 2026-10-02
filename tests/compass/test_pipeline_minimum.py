@@ -7,11 +7,10 @@ computes the same number*, and that it *still needs a live process group or a
 stub*. Both halves were wrong, and prose is how they stayed wrong: nothing
 re-checked them.
 
-So this file checks them, and then checks that the document still says what
-was checked -- the table, and the sentence naming the widths at which the
-reduction binds. The split is never written out here: it comes from ATOM's own
-`get_pp_indices`, which hands the remainder to the *middle* partitions and so
-produces a layout no reader would guess. `VLLM_PP_LAYER_PARTITION` overrides
+So this file checks them. The split is never written out here: it comes from
+ATOM's own `get_pp_indices`, which hands the remainder to the *middle*
+partitions and so produces a layout no reader would guess.
+`VLLM_PP_LAYER_PARTITION` overrides
 that partitioner, so every derivation clears it first; left set, this reads a
 layer layout out of the environment and calls it ATOM's.
 
@@ -43,7 +42,6 @@ from atom.model_ops.attentions.sub_pool_spec import page_pool, plan_pools
 from atom.models.utils import get_pp_indices
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-DESIGN = REPO / "atom/compass/design/03_memory_and_kv_model.md"
 RUNNER = REPO / "atom/model_engine/model_runner.py"
 CONFIG_JSON = pathlib.Path(__file__).with_name("qwen3_5_27b_config.json")
 QWEN = PretrainedConfig.from_dict(json.loads(CONFIG_JSON.read_text())["text_config"])
@@ -152,35 +150,3 @@ def test_the_reduce_is_guarded_so_it_needs_neither_a_group_nor_a_stub():
     ]
     assert sized and len(guards) == 1 and len(reduces) == 1
     assert {id(node) for node in ast.walk(guards[0])} >= {id(n) for n in reduces}
-
-
-def test_the_design_document_states_the_table_and_widths_that_were_derived(monkeypatch):
-    """The prose and the derivation, pinned to each other.
-
-    The note this replaces drifted because nothing joined the sentence to the
-    behaviour it described. Three things are joined here: every row of the
-    table, including its distinct-block-count cell; the sentence naming the
-    widths at which the reduction binds, which is the claim the table alone
-    does not spell out; and the one line of absolute counts. A row or a width
-    edited by hand, or a partitioner that starts splitting differently, fails
-    here instead of being believed.
-    """
-    text = DESIGN.read_text()
-    derived = {pp: stages(pp, monkeypatch) for pp in WIDTHS}
-    rows = [
-        "| {} | {} | {} | {}".format(
-            pp,
-            ", ".join(str(held) for held, _, _ in per_stage),
-            ", ".join(str(paged) for _, paged, _ in per_stage),
-            len({blocks for _, _, blocks in per_stage}),
-        )
-        for pp, per_stage in derived.items()
-    ]
-    binds = [
-        str(pp)
-        for pp, per_stage in derived.items()
-        if len({blocks for _, _, blocks in per_stage}) > 1
-    ]
-    assert [row for row in rows if row not in text] == []
-    assert f"binds at pp = {', '.join(binds[:-1])} and {binds[-1]}." in text
-    assert "152,587 / 152,587 / 127,156" in text

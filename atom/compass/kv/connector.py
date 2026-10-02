@@ -175,12 +175,12 @@ class SimulatedKVConnector(KVConnectorBase):
 
     @staticmethod
     def _matured(pending: dict[ReqId, _InFlight], now: float) -> set:
-        done = {
+        done = [
             req_id for req_id, flight in pending.items() if flight.release_at_s <= now
-        }
+        ]
         for req_id in done:
             del pending[req_id]
-        return done
+        return set(done)
 
 
 class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
