@@ -6,6 +6,10 @@
   a task established, with the finding — number multi-step tasks, end with one
   concrete next action, matter-of-fact error tone, cap lists at 5, no preamble or
   closing pleasantries.
+- **GitHub text follows the [`gh-prose`](../../.claude/skills/gh-prose/SKILL.md)
+  skill.** Lint every issue body, PR body, comment and review record with its
+  `scripts/lint_gh_prose.py` before posting, and fix every hit. The skill decides
+  how a required section is written, never whether it is written.
 
 ## Execution rules
 - Don't modify the main worktree. Develop with linked worktrees, one per in-flight
@@ -38,7 +42,7 @@
   find . "$(git rev-parse --git-common-dir)" ! -uid 13797 | head -1   # prints nothing
   git -C <each worktree> rev-parse HEAD
   ```
-- **Four setup rules.** Each failure behind them came from a shared mutable
+- **Setup rules.** Each failure behind them came from a shared mutable
   non-git source tree that things silently resolved against, not from worktrees.
   1. No shared mutable source root exists. Every tree is a worktree or a
      `git archive` snapshot.
@@ -50,12 +54,37 @@
   4. Snapshots use `git archive`, never `rsync`, so a snapshot names one commit.
      An rsync'd tree mixing two generations gave a `TypeError` that read as a
      code bug.
+- **Everything published to GitHub is English only** — code, docs, PR and issue
+  text, comments, commit messages — whatever language the conversation with the
+  owner uses. Inputs (test data, probe strings, example prompts) may be any
+  language; a verbatim quote of a non-English source and pre-existing upstream
+  ATOM text stay as they are.
 - **No design-doc references in code or runtime output.** No `D18`, `P0.4`, `T5`,
   `W2.5`, backticked doc numbers, "principle N", or labels like "Gate 1"; no
   quoting principles as justification. Say what the code does. Design docs may
   cite each other. Check at the head over the PR's whole file set, never over a
-  delta's added lines. A design document a test opens by path is a dependency,
-  not a citation.
+  delta's added lines.
+- **Prose is not a test subject.** No test opens a design document, a README or a
+  docstring to assert what it says; tests assert behaviour. A wrong description in
+  a doc is fixed in the doc by whoever finds it, not guarded; a wrong design
+  decision is escalated (below). Reviewers do not file findings that a prose claim
+  is unheld or unpinned, and no test's subject is another test or a check on prose.
+  Gate and audit scripts are code: a test of their exit status or verdict is a
+  behaviour test. Where a fact must stay in step with code, the code or a
+  checked-in data file holds it and the doc says where to find it. An existing
+  test that reads prose and goes red on a doc fix is deleted, not satisfied.
+- **Write nothing that goes stale on its own.** In docs, code, briefs, issues and
+  PR text:
+  - Cite code by path and symbol (`atom/model_engine/scheduler.py`,
+    `Scheduler.schedule`), never by line number. An inline review comment is the
+    exception: GitHub pins its line to a commit. So is a checked-in data file
+    whose recorded lines a test re-checks against the tree, such as
+    `atom/compass/audit/sync_sites.json` (`tests/compass/test_sync_inventory.py`).
+  - Do not state how many items a list, table, register or set holds (decisions,
+    TODOs, open items, sync sites, findings). A measured count, such as a test
+    run's pass count, goes in the PR or issue record with the commit it was
+    measured at, not in a doc.
+  - Do not restate a fact another document owns; link to it.
 - Merge conflicts are the agent's call, not the owner's. Tasks are cut to one
   module plus its tests but are not guaranteed disjoint. **Frequent conflicts mean
   the decomposition is wrong**: re-cut the tasks, don't add a scheduler.
@@ -64,7 +93,7 @@
 - **Tasks are a pool, not a track assignment.** Work is a DAG of GitHub issues; a
   task becomes claimable when its dependencies land, and any free agent assigns
   itself the issue — there is no permanent per-track ownership. A task carries
-  four sections, the first written before it is claimable and the rest written as
+  these sections, the first written before it is claimable and the rest written as
   it runs:
 
   | Section | Written by | Lives in | Contains |
@@ -97,10 +126,17 @@
   task did not predict; a measurement outside its stated range; an interface that
   cannot be implemented as specified. The outcome is a finding or an escalation
   (below).
+- **When a design document and the code disagree, the kind of claim decides which
+  side changes.** A description of code Compass reuses and does not own (ATOM,
+  aiter, atomesh or any upstream tool) is corrected to match the code, and every
+  decision that rested on it is re-checked. A design decision is the spec: Compass
+  code that departs from it is a defect and is fixed to match. If building a
+  decision shows it is wrong or cannot be built, that is an escalation and the
+  design changes first.
 - Concurrency: 5 tasks in flight, up to 10 agents (5 developer + 5 reviewer). The
   cap is review throughput, not the task DAG.
 - Both developer and reviewer agents must be told to read `atom/compass/design/README.md`'s
-  eight principles first.
+  design principles first.
 - **A developer agent owns development and PR updates; the main agent orchestrates
   and does not write the change itself.** After each push a reviewer agent
   reviews, the developer pushes fixes, and that repeats until the verdict is APPROVE.
@@ -113,14 +149,14 @@
   `need human` the moment it escalates — a halt declared in prose stops nothing;
   when the ruling lives on another issue, label each PR it holds and name that
   issue. The label stops all agent action on that issue or PR (no commit, review,
-  amend or merge, even after a passed review), with two exceptions. One is `gh
+  amend or merge, even after a passed review), with these exceptions. One is `gh
   stack link` by PR number, which lands and pushes nothing, though it retargets
-  the linked PRs' bases (then and when a PR below lands). **The other is a base
+  the linked PRs' bases (then and when a PR below lands). **Another is a base
   update: an agent may merge as the branch-update rule (below) calls for,
   patching the PR's base via REST just before the push if it is an unlinked child
   whose parent landed, changing nothing else.** The merge keeps every change from
-  both sides; where it cannot, the agent commits nothing and names the conflict
-  hunk in a PR comment. A PR comment lists each resolved file, and the label
+  both sides; where it cannot, the agent commits nothing and names the conflicting
+  file and symbol in a PR comment. A PR comment lists each resolved file, and the label
   allows one delta review of the resolutions. Only the owner removes the label.
   **Without it, automation is on by default**: agents act with no opt-in.
 - **The review loop has its own stop.** If the same finding survives two cycles,
@@ -132,9 +168,9 @@
   that points at lines is an inline comment via
   `gh api repos/<owner>/<repo>/pulls/<n>/comments` with `body`, `commit_id`,
   `path` and `line`; only findings with no line go in the standalone comment.
-- **Four gates land a task, all required:**
-  1. ATOM's test suite passes unmodified, in two tiers: the GPU-free tier per
-     task, the GPU superset per wave as a delta. Needing to edit an ATOM test
+- **These gates land a task, all required:**
+  1. ATOM's test suite passes unmodified: the GPU-free tier per
+     task, and the GPU superset per wave as a delta. Needing to edit an ATOM test
      means the change altered ATOM's behaviour and must be justified on its own
      terms, not absorbed.
   2. New CPU-only tests for what the task added, in `tests/compass/`, in ATOM's
@@ -150,7 +186,8 @@
      [`ponytail-review`](https://github.com/DietrichGebert/ponytail/blob/main/skills/ponytail-review/SKILL.md)
      skill over the diff to catch over-engineering; its findings are posted like
      any others. **A check
-     counts only once someone has seen it fire.** A reviewer credits a test with
+     counts only once someone has seen it fire.** This applies to behaviour
+     tests. A reviewer credits a test with
      holding a defect only after reinstating it (the pre-fix code via `git show`,
      line count preserved, nothing else changed) and recording the red: both
      counts, the failing node id and assertion. A developer reverts their own
@@ -177,7 +214,7 @@
   per-wave GPU superset. Landing a stacked PR lands every unlanded PR below it,
   so each of those needs the same: its own APPROVE covering its head, and no
   label. A PR whose body declares an escalation without the label
-  gets the label. **Holds are landing preconditions, and there are three:**
+  gets the label. **Holds are landing preconditions:**
   `need human` on the PR or below it (a label on an issue a PR delivers counts as
   on that PR; every escalation rule in this file holds through this label), an
   APPROVE covering each head (the reviewer checks gates 1-3 as they apply per task

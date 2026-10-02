@@ -2483,19 +2483,19 @@
    "anchor": "pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS",
    "category": "C1",
    "peer": "deployment",
-   "why": "the router's thirty-second bound on one worker request, compiled in; it fires whenever simulated time runs slower than real"
-  },
-  {
-   "file": "atom/mesh/src/core/worker_manager.rs",
-   "line": 24,
-   "anchor": "const REQUEST_TIMEOUT",
-   "category": "C1",
-   "peer": "deployment",
-   "why": "the router's five-second bound on a fan-out request, compiled in; it fires whenever simulated time runs slower than real"
+   "why": "the default timeout of the client the router uses only for HTTP health checks; each check sets its own timeout from --health-check-timeout-secs, which replaces this one, so it bounds no request"
   },
   {
    "file": "atom/mesh/src/cliargs.rs",
-   "line": 423,
+   "line": 334,
+   "anchor": "pub worker_request_timeout_secs",
+   "category": "C1",
+   "peer": "deployment",
+   "why": "the router's five-second default bound on its /get_load and /flush_cache requests to workers; raise it from the command line when simulated time runs slower than real"
+  },
+  {
+   "file": "atom/mesh/src/cliargs.rs",
+   "line": 430,
    "anchor": "pub disable_health_check",
    "category": "C1",
    "peer": "deployment",
@@ -2503,7 +2503,7 @@
   },
   {
    "file": "atom/mesh/src/cliargs.rs",
-   "line": 398,
+   "line": 405,
    "anchor": "pub disable_circuit_breaker",
    "category": "C1",
    "peer": "deployment",

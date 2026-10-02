@@ -29,16 +29,17 @@ caller waits, a hole parks that caller for the life of the process. For a name
 the table marks unwaited, a hole parks nobody, and what is lost is the work the
 name stood for:
 
-- `exit` (`engine_core.py:260`) never reaches `ModelRunner.exit`; the comment
+- `exit` (`EngineCore.exit`) never reaches `ModelRunner.exit`; the comment
   on the `RPC_SURFACE` check in `model_runner` says what that loses here.
   The worker still leaves its loop -- `busy_loop` breaks
   on the dispatched name, in a statement beside the per-runner loop rather than
   inside it -- so the symptom is what shutdown failed to release, not a hang.
 - `process_kvconnector_output` never starts the asynchronous KV transfer its
   metadata was built for (a consumer's load, a producer's send, an offload
-  save). It is broadcast five times and waited for at none of them:
-  `engine_core.py:378` and `engine_core.py:500`, `pp_engine_core.py:113`,
-  `pp_engine_core.py:232` and `pp_engine_core.py:369`.
+  save). It is broadcast from `EngineCore._process_engine_step_inner`,
+  `EngineCore._dispatch_idle_offload_work`, `PPEngineCoreProc._pp_head_step`,
+  `PPEngineCoreProc._dispatch_connector_only_batch` and
+  `PPEngineCoreProc._downstream_busy_loop`, and waited for at none of them.
 
 `overrides` states the reply contract both of these follow from, including why
 a method that is present and answers None is the same event to a caller as one

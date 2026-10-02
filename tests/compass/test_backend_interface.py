@@ -21,14 +21,17 @@ is the one outcome a test whose job is to pin something must not have.
 """
 
 import ast
+import inspect
 import pathlib
 
 import pytest
 
 from atom.compass.backends import (
+    BatchView,
     CostBackend,
     CostTerm,
     Provenance,
+    RequestShape,
     Species,
     StepCost,
     Tier,
@@ -140,9 +143,25 @@ def test_the_package_imports_nothing_from_the_engine(path):
     """Only its own modules, so it runs anywhere Python does."""
     for node, module in _imported_modules(path):
         if module.startswith(".") or module.split(".")[0] == "atom":
-            assert module.startswith(
-                "atom.compass.backends"
-            ), f"{path.name}:{node.lineno} imports {module}"
+            assert module.startswith("atom.compass.backends"), (
+                f"{path.name}:{node.lineno} imports {module}"
+            )
+
+
+@pytest.mark.parametrize("projection", [BatchView, RequestShape])
+def test_the_projection_type_is_where_the_scan_can_reach_it(projection):
+    """The engine-free property covers files, so the projection has to be one.
+
+    The scan above walks this package and reads nothing outside it. A
+    projection defined next to the engine would satisfy the seam's signature
+    and be asserted by nobody, and would be buildable only where the engine
+    imports -- which is the machine this whole arrangement exists to avoid
+    needing. Moving either type out of the package fails here rather than
+    quietly thinning what the scan means.
+    """
+    defined_in = pathlib.Path(inspect.getfile(projection)).resolve()
+    assert defined_in.parent == PACKAGE
+    assert defined_in in set(PACKAGE.rglob("*.py"))
 
 
 def test_every_module_the_walk_returns_is_a_case():

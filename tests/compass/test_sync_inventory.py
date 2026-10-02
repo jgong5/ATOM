@@ -30,7 +30,6 @@ No driver, and no import of ATOM's serving modules: the scanner parses them.
 from __future__ import annotations
 
 import ast
-from pathlib import Path
 
 import pytest
 
@@ -39,13 +38,6 @@ from atom.compass.audit import sync_scan
 TREE = sync_scan.repo_root_from_here()
 INVENTORY = sync_scan.load_inventory()
 CATEGORIES = set(INVENTORY["categories"])
-
-# Every file that states the count per category. Each is parsed and compared
-# against the rows, so a table cannot drift from the data it describes.
-COUNT_TABLES = (
-    Path(sync_scan.__file__).with_name("README.md"),
-    TREE / "atom/compass/design/01_execution_and_time_model.md",
-)
 
 
 @pytest.fixture(scope="module")
@@ -127,33 +119,6 @@ def test_no_scanned_file_is_also_declared_unscanned():
     for rel, _why in sync_scan.UNSCANNED_ROOTS:
         inside = {f for f in scanned_files if f == rel or f.startswith(rel)}
         assert not inside, f"{rel} is excluded but these are scanned: {sorted(inside)}"
-
-
-def _stated_counts(text: str) -> dict[str, int]:
-    """Read every markdown table that has a column headed `Count`."""
-    counts: dict[str, int] = {}
-    column = None
-    for line in text.splitlines():
-        if not line.startswith("|"):
-            column = None
-            continue
-        cells = [c.strip().strip("*`") for c in line.strip().strip("|").split("|")]
-        if "Count" in cells:
-            column = cells.index("Count")
-            continue
-        if column is None or column >= len(cells):
-            continue
-        if cells[0] in CATEGORIES and cells[column].isdigit():
-            counts[cells[0]] = int(cells[column])
-    return counts
-
-
-@pytest.mark.parametrize("path", COUNT_TABLES, ids=lambda p: p.name)
-def test_every_stated_count_matches_the_rows(path):
-    """The count per category is written down twice and derived once here."""
-    stated = _stated_counts(path.read_text(encoding="utf-8"))
-    assert stated, f"{path} states no counts; the parser or the table changed"
-    assert stated == sync_scan.category_counts(INVENTORY), path
 
 
 # --- the shape rules, against the forms they are written to tell apart ------

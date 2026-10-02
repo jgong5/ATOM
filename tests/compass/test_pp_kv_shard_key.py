@@ -10,8 +10,7 @@ length -- so neither the numerator nor the denominator is a layer count.
 
 Nothing re-checked that sentence, which is how it survived: it is true of a
 uniform stack, where every layer is paged, and that is the case anyone checks
-first. So this file checks it on both, and then checks that the document still
-states what was checked.
+first. So this file checks it on both.
 
 Neither the split nor the paged count is written out here. The span comes from
 ATOM's own `get_pp_indices`, which adds the layers that do not divide evenly
@@ -36,8 +35,6 @@ from transformers import PretrainedConfig
 from atom.compass.backends import KvGeometry, Parallelism
 from atom.models.utils import get_pp_indices
 
-REPO = pathlib.Path(__file__).resolve().parents[2]
-DESIGN = REPO / "atom/compass/design/15_parallelism_support.md"
 CONFIG_JSON = pathlib.Path(__file__).with_name("qwen3_5_27b_config.json")
 HYBRID_DICT = json.loads(CONFIG_JSON.read_text())["text_config"]
 HYBRID = PretrainedConfig.from_dict(HYBRID_DICT)
@@ -170,56 +167,13 @@ def test_a_uniform_stack_is_the_case_the_layer_ratio_gets_right(monkeypatch):
         assert agreeing(rows, total, total) == list(range(pp))
 
 
-def test_the_document_states_the_split_that_was_derived(monkeypatch):
-    """The prose and the derivation, pinned to each other.
-
-    The sentence this replaces drifted because nothing joined it to the
-    partitioner it described. Every row of the table is rebuilt here from
-    `get_pp_indices` and the model's layer types -- spans, layers held, paged
-    layers, and the cell naming the stages where the two fractions agree --
-    so a row edited by hand, or a partitioner that starts splitting
-    differently, fails here instead of being believed.
-
-    The three sentences asserted beside the table are the ones that bound the
-    correction: what the fractions are taken over, that `runtime_constants`
-    scale by neither, and that a uniform stack is unaffected. Each is a claim
-    a reader would otherwise have to take on trust, and the last two are the
-    places an over-reaching edit would show up.
-
-    The last assertion is about the *other* spelling of this count. The engine
-    also derives a full-attention layer count by dividing the stack by
-    `full_attention_interval`, which is global and so cannot answer what a
-    stage holds; the document says the two agree on this config and not by
-    luck, because ATOM's own config class fills `layer_types` from that same
-    interval. That agreement is derived here rather than asserted, so a
-    config whose kinds stop matching its interval fails instead of being
-    described.
+def test_the_interval_count_agrees_with_the_layer_kinds(monkeypatch):
+    """The engine also derives a full-attention layer count by dividing the
+    stack by `full_attention_interval`, which is global and so cannot answer
+    what a stage holds. On this config the two agree and not by luck, because
+    ATOM's own config class fills `layer_types` from that same interval; a
+    config whose kinds stop matching its interval fails here.
     """
-    text = DESIGN.read_text()
     total = int(HYBRID.num_hidden_layers)
-    per_width = {pp: stages(HYBRID, pp, monkeypatch) for pp in WIDTHS}
-    total_paged = sum(paged for _, _, paged in per_width[2])
-    rows = []
-    for pp, stage_rows in per_width.items():
-        ranks = agreeing(stage_rows, total, total_paged)
-        cell = (
-            "all"
-            if len(ranks) == pp
-            else "none"
-            if not ranks
-            else "stage " + ", ".join(str(rank) for rank in ranks)
-        )
-        rows.append(
-            "| {} | {} | {} | {} | {} |".format(
-                pp,
-                ", ".join(f"{start}-{end}" for (start, end), _, _ in stage_rows),
-                ", ".join(str(held) for _, held, _ in stage_rows),
-                ", ".join(str(paged) for _, _, paged in stage_rows),
-                cell,
-            )
-        )
-    assert [row for row in rows if row not in text] == []
-    assert f"`held/{total}` = `paged/{total_paged}`" in text
-    assert "The Class-C `runtime_constants` scale by neither key" in text
-    assert "**Uniform stacks are unaffected.**" in text
+    total_paged = sum(paged for _, _, paged in stages(HYBRID, 2, monkeypatch))
     assert total // int(HYBRID.full_attention_interval) == total_paged
