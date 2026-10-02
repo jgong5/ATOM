@@ -476,7 +476,7 @@ async def _client_stream(
                 return
         delivered = True
         _log_sse(chunk, request_id)
-        rt = clock._installed
+        rt = clock.installed()
         if rt is not None and rt.in_run:
             chunk = stamp_events(chunk, rt)
         yield chunk

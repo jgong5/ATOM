@@ -54,16 +54,18 @@ def stamp_events(text: str, rt) -> str:
     """`text` with a stamped comment line before each SSE event in it.
 
     Each event is one send on the runtime's stream channel to the traffic LP.
-    Every frame the endpoints write ends in a blank line, so splitting on one
-    finds every event, and nothing after the last.
+    A write must end its last frame in a blank line: text after it is refused,
+    since the next write's comment would land inside that frame.
     """
     ch = f"{rt.me}->traffic:stream"
     *events, tail = text.split("\n\n")
+    if tail:
+        raise ValueError(f"unterminated SSE frame {tail!r}: no blank line after it")
     out = []
     for event in events:
         arrival, seq = rt.stamp_send(ch)
         out.append(f": compass a={arrival!r} s={seq}\n{event}\n\n")
-    return "".join(out) + tail
+    return "".join(out)
 
 
 def sse_stamp(line: str) -> tuple[float, int] | None:

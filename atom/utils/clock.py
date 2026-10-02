@@ -61,6 +61,11 @@ def install(runtime: "LPRuntime | None") -> None:
     _installed = runtime
 
 
+def installed() -> "LPRuntime | None":
+    """The runtime installed in this process, or None on a real run."""
+    return _installed
+
+
 def now(real) -> float:
     """The LP clock while a runtime is installed; otherwise `real()`.
 

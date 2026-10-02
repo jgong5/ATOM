@@ -68,6 +68,9 @@ class TestTracestate:
         assert header == VENDORS + ",compass=a:1.5;s:3"
         assert tracestate_stamp(header) == (1.5, 3)
 
+    def test_a_space_after_the_comma_is_allowed(self):
+        assert tracestate_stamp("rojo=1, compass=a:1.5;s:3") == (1.5, 3)
+
     @pytest.mark.parametrize("header", [None, "", VENDORS, "compassion=a:1;s:2"])
     def test_no_compass_entry_reads_as_none(self, header):
         assert tracestate_stamp(header) is None
@@ -127,6 +130,14 @@ class TestTheStreamWriter:
     def test_outside_the_run_the_stream_is_unchanged(self, installed):
         rt = installed(_runtime(1.0, in_run=False))
         assert _client_text(_replay(FRAMES)) == FRAMES
+        assert rt.send_log == []
+
+    def test_an_unterminated_frame_is_refused_by_name(self, installed):
+        rt = installed(_runtime(1.0))
+        with pytest.raises(
+            ValueError, match=r"^unterminated SSE frame 'data: \{\"x\":'"
+        ):
+            _client_text(_replay(['data: {"x":', "1}\n\n"]))
         assert rt.send_log == []
 
     def test_a_chat_stream_carries_one_stamp_per_event(self, installed):
