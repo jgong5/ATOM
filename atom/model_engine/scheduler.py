@@ -3015,14 +3015,14 @@ class Scheduler:
             )
             self.failed_recving_kv_req_ids.append(req_id)
 
-        for req_id in kv_connector_output.finished_loading or ():
+        for req_id in sorted(kv_connector_output.finished_loading or (), key=str):
             assert is_offload, "Only offload connector should update loading KV status"
             logger.debug("Finished offload KV load for request %s", req_id)
             if self._finish_aborted_load_cleanup(req_id):
                 continue
             self.finished_recving_kv_req_ids.append(req_id)
 
-        for req_id in kv_connector_output.failed_loading or ():
+        for req_id in sorted(kv_connector_output.failed_loading or (), key=str):
             assert (
                 is_offload
             ), "Only offload connector should update failed KV load status"
@@ -3034,8 +3034,8 @@ class Scheduler:
                 continue
             self.failed_recving_kv_req_ids.append(req_id)
 
-        finished_saving = kv_connector_output.finished_saving or ()
-        for req_id in kv_connector_output.finished_sending or ():
+        finished_saving = sorted(kv_connector_output.finished_saving or (), key=str)
+        for req_id in sorted(kv_connector_output.finished_sending or (), key=str):
             assert (
                 self.kv_connector.is_producer
             ), "Only producer should free blocks after sending KV"
