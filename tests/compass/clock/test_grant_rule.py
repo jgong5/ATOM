@@ -12,8 +12,11 @@ What the groups below defend:
 * **Every registration check is a raise carrying the LP table**, never an
   `assert`, which `python -O` deletes.
 * **Recovery and the end of a run are grants, not aborts.**
-* **Generated runs**: no reply grants past an unreleased message, and each LP's
-  replies do not depend on the order in which running LPs submit.
+* **Daemon deadlines** are held until essential time reaches them, delay no
+  essential grant, and never fire once the run has finished.
+* **Generated runs**, with daemon deadlines: no reply grants past an unreleased
+  message, and each LP's replies do not depend on the order in which running
+  LPs submit.
 """
 
 import ast
@@ -23,7 +26,6 @@ from pathlib import Path
 import pytest
 
 from atom.compass.clock import (
-    END,
     NER,
     TAR,
     BackdatedEvent,
@@ -59,10 +61,15 @@ class _Recorded(ClockAuthority):
     def __init__(self, channels):
         super().__init__(channels)
         self.recovered = []
+        self.daemon_grants = 0
 
     def _recover(self, i, g):
         self.recovered.append((str(i), g))
         return super()._recover(i, g)
+
+    def _grant(self, i, g, recovered=False):
+        self.daemon_grants += self._state[i] == NER and g == self._daemon[i]
+        return super()._grant(i, g, recovered)
 
 
 class _NowForWaitingTar(_Recorded):
@@ -251,15 +258,41 @@ def test_one_participant_advances_straight_to_its_own_next_event():
     assert ca.on_request(only, NER, INF, []) == [(only, INF, {})]
 
 
-# --- end of run ---------------------------------------------------------------
+# --- daemon deadlines and the finish ------------------------------------------
 
 
-def test_end_grants_every_lp_infinity_once_and_then_changes_nothing():
+def test_a_daemon_deadline_is_held_until_essential_time_reaches_it():
+    ca = ClockAuthority(_two_way(0.5))
+    assert ca.on_request(A, NER, INF, [], t_daemon=1.0) == []
+    # Held: nothing essential has reached 1.0, and b's grant is not delayed.
+    assert _grants(ca.on_request(B, TAR, 0.75, [])) == [("b", 0.75)]
+    assert _grants(ca.on_request(B, TAR, 2.0, [])) == [("a", 1.0)]
+    assert _grants(ca.on_request(A, NER, INF, [], t_daemon=3.0)) == [("b", 2.0)]
+    # Every LP waits and a's next deadline is past every essential time.
+    assert _grants(ca.on_request(B, NER, INF, [])) == [("a", INF), ("b", INF)]
+
+
+def test_a_daemon_deadline_equal_to_the_horizon_fires():
+    ca = ClockAuthority(_two_way(0.5))
+    assert ca.on_request(A, NER, INF, [], t_daemon=1.0) == []
+    assert _grants(ca.on_request(B, TAR, 1.0, [])) == [("a", 1.0), ("b", 1.0)]
+
+
+def test_a_daemon_deadline_is_only_an_ner_and_never_behind_the_clock():
+    ca = _one_way_at(0.5)
+    with pytest.raises(ValueError, match="only NER has one"):
+        ca.on_request(A, TAR, 1.0, [], t_daemon=2.0)
+    with pytest.raises(BackdatedEvent, match="daemon deadline 0.25 behind its own"):
+        ca.on_request(B, NER, INF, [], t_daemon=0.25)
+
+
+def test_the_finish_grants_every_lp_infinity_once_and_then_changes_nothing():
     table = single_engine_table(admission_path="serving", ipc_s=1.0e-4, stream_s=2.0e-3)
     ca = ClockAuthority(table)
     engine, frontend, traffic = table.registry.ids()
+    assert ca.on_request(engine, NER, INF, [], t_daemon=5.0) == []
     assert ca.on_request(frontend, NER, INF, []) == []
-    replies = ca.on_request(traffic, END, INF, [])
+    replies = ca.on_request(traffic, NER, INF, [], t_daemon=16.0)
     assert replies == [
         (
             engine,
@@ -407,7 +440,9 @@ def _generated_table(seed):
 def _request(table, lp, own, seed):
     """A legal LP's next request, a function of its own history only."""
     if own["k"] >= STEPS:
-        return NER, INF, []
+        # Some LPs keep a periodic housekeeping timer that sends nothing.
+        period = (INF, 0.75, 1.5)[(seed + ord(lp.name[0])) % 3]
+        return NER, INF, [], own["g"] + period
     x = _lcg(
         _lcg(seed * 7919 + own["k"] * 104729 + own["received"] * 31 + ord(lp.name[0]))
     )
@@ -422,7 +457,7 @@ def _request(table, lp, own, seed):
     d = (0.0, 0.5, 1.0)[(x >> 8) % 3]
     return ((TAR, own["g"] + d), (NER, own["g"] + d), (NER, INF), (TAR, own["g"] + d))[
         (x >> 4) % 4
-    ] + (log,)
+    ] + (log, INF)
 
 
 PICKS = {
@@ -457,13 +492,13 @@ def _drive(seed, pick, cls=_Recorded, shuffle=0):
         x = _lcg(x)
         lp = pick(sorted(running), x)
         running.remove(lp)
-        kind, t, log = _request(table, lp, own[lp], seed)
+        kind, t, log, t_daemon = _request(table, lp, own[lp], seed)
         for name, seq, arrival in log:
             dst = table.channel(name).target
             if arrival < own[dst]["g"]:
                 violations.append(("into the past", name, seq, arrival, own[dst]["g"]))
             sent[dst].append((name, seq, arrival))
-        for i, g, released in ca.on_request(lp, kind, t, log):
+        for i, g, released in ca.on_request(lp, kind, t, log, t_daemon):
             got = [
                 (name, seq, a) for name, pairs in released.items() for seq, a in pairs
             ]
@@ -487,7 +522,7 @@ SEEDS = range(60)
 
 
 def test_no_reply_grants_past_an_unreleased_arrival():
-    recovered = strict = 0
+    recovered = strict = fired = held = 0
     for seed in SEEDS:
         for name, pick in PICKS.items():
             replies, violations, ca = _drive(seed, pick)
@@ -495,8 +530,12 @@ def test_no_reply_grants_past_an_unreleased_arrival():
             assert all(r[-1][0] == INF for r in replies.values())
             recovered += len(ca.recovered)
             strict += sum(len(r) - 1 for r in replies.values()) - len(ca.recovered)
-    # Both branches are exercised, so neither half of the property is vacuous.
+            fired += ca.daemon_grants
+            held += sum(d < INF for d in ca._daemon.values())
+    # Both branches are exercised, so neither half of the property is vacuous;
+    # so are daemon deadlines that fire and ones still held at the finish.
     assert recovered > 0 and strict > 0
+    assert fired > 0 and held > 0
 
 
 def test_the_generated_runs_catch_a_rule_that_reads_only_neighbours():

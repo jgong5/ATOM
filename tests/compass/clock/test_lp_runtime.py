@@ -24,6 +24,7 @@ CTL = "frontend->engine:control#dp0"
 HTTP = "traffic->frontend:http"
 OUT = "engine->frontend:output#dp0"
 IPC = 0.001
+INF = float("inf")
 
 
 def _table():
@@ -147,18 +148,28 @@ def test_sends_are_stamped_now_plus_lookahead_and_ride_the_next_request():
     assert call(rt.stamp_send, OUT) == (0.5 + IPC, 1)
     assert call(rt.next_event, 0.7) == 0.7
     assert rt.conn.sent == [
-        ("TAR", 0.5, [(OUT, 0, IPC)]),
-        ("NER", 0.7, [(OUT, 1, 0.5 + IPC)]),
+        ("TAR", 0.5, [(OUT, 0, IPC)], INF),
+        ("NER", 0.7, [(OUT, 1, 0.5 + IPC)], INF),
     ]
     with pytest.raises(ValueError, match="cannot advance to 0.1, it is at 0.7"):
         call(rt.advance_to, 0.1)
 
 
-def test_end_workload_sends_its_log():
-    rt, call = _runtime(ENGINE, (float("inf"), {}))
+def test_the_inf_grant_closes_the_clock_and_leaves_sends_stamped_inf():
+    rt, call = _runtime(ENGINE, (INF, {}))
+    rt.start_run()
+    with pytest.raises(RuntimeError, match=r"left its loop at 0.0, before the \+inf"):
+        rt.close()
     call(rt.stamp_send, OUT)
-    call(rt.end_workload)
-    assert rt.conn.sent == [("END", float("inf"), [(OUT, 0, IPC)])]
+    assert call(rt.next_event, INF, 5.0) == INF
+    assert not rt.in_run
+    assert rt.conn.sent == [("NER", INF, [(OUT, 0, IPC)], 5.0)]
+    for fn, args in [(rt.advance_to, (1.0,)), (rt.next_event, (INF,))]:
+        with pytest.raises(RuntimeError, match=rf"^{fn.__name__} from engine after"):
+            call(fn, *args)
+    assert call(rt.stamp_send, OUT) == (INF, 1)
+    rt.close()
+    assert len(rt.conn.sent) == 1
 
 
 def test_a_send_or_clock_call_off_the_owner_thread_is_refused():
@@ -167,7 +178,6 @@ def test_a_send_or_clock_call_off_the_owner_thread_is_refused():
         (rt.stamp_send, (OUT,)),
         (rt.advance_to, (1.0,)),
         (rt.next_event, (1.0,)),
-        (rt.end_workload, ()),
     ]:
         with pytest.raises(RuntimeError, match=f"^{fn.__name__} from thread"):
             fn(*args)

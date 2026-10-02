@@ -5,9 +5,15 @@ One `LPRuntime` per logical process (LP), in the process of its clock owner: the
 engine step loop or the frontend event loop. The owner is the only thread that
 moves the LP clock and the only one that produces a cross-LP message. It asks the
 clock authority for time over an injected connection, ``conn.send((kind, t,
-log))`` then ``conn.recv() -> (G, released)``, and every request carries the
-sends registered since the previous one, so the authority knows each message an
-LP produced before it moves that LP's clock.
+log, t_daemon))`` then ``conn.recv() -> (G, released)``, and every request
+carries the sends registered since the previous one, so the authority knows each
+message an LP produced before it moves that LP's clock.
+
+A grant to ``+inf`` closes the simulation window (`end_run`) before the process
+begins to shut down: the run is finished, and the owner's loop must exit rather
+than run its timers at ``+inf``. A clock call after it raises, `stamp_send` keeps
+returning ``+inf`` arrivals for shutdown sends, and `close` raises if the owner
+leaves before it.
 
 A grant names the messages it releases as ``{channel: [(seq, arrival)]}``.
 `_step_through` releases them one at a time in ``(arrival, channel, seq)``
@@ -110,21 +116,32 @@ class LPRuntime:
 
     def advance_to(self, T: float) -> None:
         """Price an event: block until granted `T`, releasing what arrives up to it."""
-        self._require_owner("advance_to")
+        self._require_open("advance_to")
         if T < self.now:
             raise ValueError(f"{self.me} cannot advance to {T}, it is at {self.now}")
         self._step_through(*self._ca_call("TAR", T))
 
-    def next_event(self, t: float) -> float:
-        """Idle until `t` or the earliest arrival, whichever the grant is; returns it."""
-        self._require_owner("next_event")
-        G, released = self._ca_call("NER", t)
+    def next_event(self, t: float, t_daemon: float = float("inf")) -> float:
+        """Idle until `t`, the daemon deadline `t_daemon` or the earliest arrival,
+        whichever the grant is; returns it.
+
+        A daemon deadline is a housekeeping timer that does not keep the run
+        alive: it fires only once essential work reaches it.
+        """
+        self._require_open("next_event")
+        G, released = self._ca_call("NER", t, t_daemon)
         self._step_through(G, released)
+        if G == float("inf"):
+            self.end_run()
         return G
 
-    def end_workload(self) -> None:
-        self._require_owner("end_workload")
-        self._ca_call("END", float("inf"))
+    def close(self) -> None:
+        """The owner leaves its loop; refused before the ``+inf`` grant."""
+        if self.now != float("inf"):
+            raise RuntimeError(
+                f"{self.me} left its loop at {self.now}, before the +inf grant "
+                "finished the run"
+            )
 
     def _require_owner(self, what: str) -> None:
         if threading.current_thread() is not self.owner:
@@ -133,10 +150,15 @@ class LPRuntime:
                 f"owner {self.owner.name!r} of {self.me} moves its clock or sends"
             )
 
-    def _ca_call(self, kind: str, t: float):
+    def _require_open(self, what: str) -> None:
+        self._require_owner(what)
+        if self.now == float("inf"):
+            raise RuntimeError(f"{what} from {self.me} after the +inf grant")
+
+    def _ca_call(self, kind: str, t: float, t_daemon: float = float("inf")):
         with self.lock:
             log, self.send_log = self.send_log, []
-        self.conn.send((kind, t, log))
+        self.conn.send((kind, t, log, t_daemon))
         return self.conn.recv()
 
     def _step_through(self, G: float, released: dict) -> None:

@@ -85,7 +85,8 @@ class TestTheSameConfigurationTwice:
             f"{rows} row(s) of {configuration}"
         )
         lps = len(RecordedRun(configuration).lps)
-        assert left.count(" END ") == lps
+        # The finish: one +inf reply per LP.
+        assert left.count(" inf NER ") == lps
         assert " TAR " in left and " NER " in left and " receive " in left
 
     def test_the_order_rows_reach_the_table_in_does_not_reach_its_text(self):
@@ -99,7 +100,7 @@ class TestTheSameConfigurationTwice:
             "prefill-decode-1p1d", sorted(map(str, first.lps), reverse=True)
         )
         reports = [first.run(), second.run()]
-        assert [r.stopped_by for r in reports] == ["END from traffic"] * 2
+        assert [r.stopped_by for r in reports] == ["the finish"] * 2
         assert reports[0].submitted != reports[1].submitted
         assert first.step_table.rows != second.step_table.rows
         assert first.step_table.text() == second.step_table.text()
