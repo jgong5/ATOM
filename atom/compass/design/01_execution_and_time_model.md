@@ -188,10 +188,10 @@ be small **because ATOM's own structure supplies most of the synchronization alr
 Option A's safety is structural — one thread cannot race itself. Option B has to *earn*
 the same property, and a violation under option B produces a plausible number rather
 than a crash. Accepting option B without a detector would mean accepting that class of
-error into the acceptance evidence. So three always-on detectors, sized to be cheap
-enough that none of them is a mode anyone can forget to enable.
+error into the acceptance evidence. So the detectors below are always on, sized to be
+cheap enough that none of them is a mode anyone can forget to enable.
 
-**What class of error these detect — and it matters which.** All three catch
+**What class of error these detect — and it matters which.** They all catch
 **implementation defects, not holes in the PDES algorithm.** The grant rule (D3: grant
 strictly below `LBTS(i) = min over j≠i of (N[j] + D(j→i))`, with in-transit messages
 counted) is conservative by construction: given correct inputs it *cannot* produce a
@@ -254,8 +254,9 @@ seconds without progress, one diagnostic is printed (D3.5) and the wait continue
 parameter. Its value is that it names the uncovered wait **during development** rather
 than leaving it to be discovered as a hang with no name. A stall the CA *can* see —
 every LP waiting at the CA — is not a fault and is not this detector's business: D3's
-deadlock recovery handles it exactly. The preventive half runs at startup: a process
-group whose ranks map to more than one LP raises (D3).
+finish ends the run if it applies, and D3's deadlock recovery handles it otherwise. The
+preventive half runs at startup: a process group whose ranks map to more than one LP
+raises (D3).
 
 **(3) Clock-source audit — static, run in CI.** D4's categorisation rests on a
 by-hand audit of clock-read sites. A grep-level lint over the simulated-path modules
@@ -490,7 +491,7 @@ services:
 | LP call | PDES term | Meaning |
 |---|---|---|
 | `advance_to(T)` | TAR (time advance request) | the owner prices an event of duration `d` (a forward) and asks for `T = now + d`; the grant is exactly `T` |
-| `next_event(t)` | NER (next event request) | the owner is idle; `t` is its next local event, or `+inf`; the grant is `min(t, earliest undelivered arrival)` |
+| `next_event(t, t_daemon)` | NER (next event request) | the owner is idle; `t` is its next essential event and `t_daemon` its next daemon deadline, each or `+inf`; the grant is `min(t, t_daemon, earliest undelivered arrival)`, a daemon deadline held until it is at most the essential horizon `H` (Invariants, below) |
 | grant reply | TAG (time advance grant) | carries `G` and the `(channel, seq)` set it releases |
 
 **Guarantee: a grant to `T` means every message with timestamp `<= T` has been delivered
@@ -498,18 +499,18 @@ to that LP.** The one exception is a deadlock-recovery grant (Invariants, below)
 guarantees delivery below `T`, and a message at exactly `T` arrives in that instant's next
 round.
 
-Per LP *i*: `now[i]`; a state in `{running, TAR, NER}`; and the target it asked for (`T`
-or `t`). Per channel: every registered message as `seq -> arrival`, and which of them a
-grant has already released. Static: the channel table (lookahead sources, below), from
+Per LP *i*: `now[i]`; a state in `{running, TAR, NER}`; and the target it asked for (`T`,
+or `t` and `t_daemon`). Per channel: every registered message as `seq -> arrival`, and
+which of them a grant has already released. Static: the channel table (lookahead sources, below), from
 which the CA computes once, by Floyd–Warshall, `D(j->i)` — the least total lookahead
 over any channel path from *j* to *i*.
 
 #### Grant rule
 
 ```
-N[j] = now[j]                                        j running
-     = T_j                                           j waiting in TAR(T_j)
-     = min(t_j, earliest undelivered arrival into j) j waiting in NER(t_j)
+N[j] = now[j]                                                   j running
+     = T_j                                                      j waiting in TAR(T_j)
+     = min(t_j, t_daemon_j, earliest undelivered arrival into j) j waiting in NER(t_j, t_daemon_j)
 
 LBTS(i) = min over j != i of ( N[j] + D(j->i) )
 a waiting LP i is granted G = N[i]  only if  G < LBTS(i)      -- strictly
@@ -668,7 +669,7 @@ receives it itself, at its own receive point.
 | `engine-P->engine-D:prefill_done` (RapidServe only, outside M1-M7) | prefill step loop, direct send at `engine_core.py:1014` | decode handler thread `_recv_prefill_done`, `sock.recv()` at `:1204` (thread) | declared IPC delay |
 | `engine-D->engine-P:block_assignment` (RapidServe only, outside M1-M7) | decode step loop, direct send at `engine_core.py:1229` | prefill handler thread `_recv_block_assignments`, `sock.recv()` at `:946` (thread) | declared IPC delay |
 
-The last two rows exist only under `--enable-rapidserve` (D2), whose prefill and decode
+The RapidServe rows exist only under `--enable-rapidserve` (D2), whose prefill and decode
 `EngineCore`s are two engine LPs of one deployment; they are the only channels received
 by a handler thread. No M1-M4 channel is.
 
@@ -727,8 +728,8 @@ wide, because its workers are slaved by a blocking RPC (`async_proc.py:431`) and
 clock. Adding GPUs to either does not create a time domain.
 
 Every ATOM deployment is two LPs: its API server's event loop (the frontend LP) and its
-engine's step loop, one per DP rank (the engine LP), plus one traffic LP per run (D3).
-Beyond that, only these create an LP:
+engine's step loops, one per DP rank, together the engine LP; plus one traffic LP per
+run (D3). Beyond that, only these create an LP:
 
 1. a **PD role boundary** — prefill fleet vs decode fleet, each its own deployment
 2. a **PP stage**, which replaces the engine LP with one LP per stage
@@ -747,7 +748,7 @@ Beyond that, only these create an LP:
 | 8 prefill + 8 decode replicas, each TP8 | 128 | **34** |
 | ... the same with PP4 | 512 | **82** |
 
-The last two rows are traffic + router + 16 deployments of 2 LPs (34), or of a frontend
+The replica rows are traffic + router + 16 deployments of 2 LPs (34), or of a frontend
 and 4 stages (82).
 
 ### Sizing against a measured workload
@@ -983,9 +984,9 @@ actionable: when the straggler check (D3.2) fails, the log already contains both
 histories up to the violation.
 
 **2. The stall diagnostic.** A stall the CA can see — every LP waiting at the CA, none
-grantable under the strict rule — is not a failure: it takes D3's recovery branch, and
-the timeline marks that grant as a recovery grant, the one kind whose TAG guarantee is
-weaker (D3). A stall the CA cannot see can only be a
+grantable under the strict rule — is not a failure: unless D3's finish applies, it
+takes D3's recovery branch, and the timeline marks that grant as a recovery grant, the
+one kind whose TAG guarantee is weaker (D3). A stall the CA cannot see can only be a
 fault. The run keeps waiting, and after `DIAG_S` = 30 wall seconds without progress the
 CA prints once, for every LP: its virtual time, its state (`running` / `TAR` / `NER`)
 and target, the registered messages not yet delivered to it, and the `N[j] + D(j->i)`
@@ -1044,7 +1045,7 @@ undecided**.
 |---|---|---|---|
 | K1 | Event cost | TAR: `advance_to(now + d)`, `d` from the cost model or a resource station | the forward, the idle DP rank's dummy batch, KV-transfer completion, tokenization, the DP lockstep `all_reduce`, multimodal preprocessing (refused today) |
 | K2 | Clock read | returns the LP's logical time | the arrive / leave / first-token stamps, `_passed_delay`, the waiting-prefill age |
-| K3 | Idle point | NER: `next_event(t)` | the step loops' spin, the PP bounded polls, offline `get_output` |
+| K3 | Idle point | NER: `next_event(t, t_daemon)` | the step loops' spin, the PP bounded polls, offline `get_output` |
 | K4 | Channel send | timestamped send, logged on the clock owner | PD direct sends, PP sends, output sends through the relay queue |
 | K5 | Channel receive | counted at the wait point, then TSO delivery | the engine input thread, the frontend output thread, the PD handler threads, the PP receives and zero-bound drains, the PP `flush_pp_send` |
 | K6 | Wait inside one LP | LP aggregation: never reported to the CA | TP worker RPC and barriers, frontend coroutines awaiting their own process's data, control commands' calls to workers, the DP group's reduction |
