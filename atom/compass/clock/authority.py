@@ -272,8 +272,9 @@ class ClockAuthority:
         if g > self._bound:
             raise ClockAbort(
                 f"a grant to {g} for {i} passes the simulated-time bound "
-                f"{self._bound}; something essential, such as a housekeeping "
-                "timer not declared daemon, keeps the run alive",
+                f"{self._bound}; either the bound is shorter than the workload, "
+                "or something essential, such as a housekeeping timer not "
+                "declared daemon, keeps the run alive",
                 self.lp_table(),
             )
         released = {}

@@ -141,8 +141,8 @@ class Traffic(_Lp):
         self.scrape_on = scrape_on
         self.interval = workload.scrape_interval_seconds
         self.next_scrape = self.interval
-        self.closing_scrape = None  # when the scrape after the last response ran
-        self.open = {}  # request -> sent at, until its final response
+        self.closed = False  # the scrape after the last response has run
+        self.open = set()  # requests sent and not yet given their final response
         self.arrivals = collections.deque()
         group = len(workload.prompt_tokens)
         for request in range(workload.requests):
@@ -158,22 +158,21 @@ class Traffic(_Lp):
 
     def handle(self, channel, arrival, payload):
         if payload[0] == "chunk" and payload[2]:  # ("chunk", request, finished)
-            del self.open[payload[1]]
+            self.open.remove(payload[1])
 
     def run(self, now):
         while self.arrivals and self.arrivals[0][0] <= now:
             _, request, tokens = self.arrivals.popleft()
-            self.open[request] = now
+            self.open.add(request)
             self.send(self.http, ("request", request, tokens))
         due = now >= self.next_scrape
-        closing = self.finished and self.closing_scrape is None
+        closing = self.finished and not self.closed
         if due or closing:
             self.timers += due
             self.scrapes += 1
             if due:
                 self.next_scrape += self.interval
-            if closing:
-                self.closing_scrape = now
+            self.closed |= closing
             if self.scrape_on is not None:
                 self.send(self.scrape_on, ("scrape", self.scrapes))
         next_arrival = self.arrivals[0][0] if self.arrivals else math.inf
