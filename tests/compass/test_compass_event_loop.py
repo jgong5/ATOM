@@ -65,14 +65,15 @@ def run(monkeypatch):
     rt.start_run()
     clock.install(rt)
     # Every loop the test builds, uvicorn's included, is stopped after 20 wall
-    # seconds, so a loop that never stops fails the test instead of hanging it.
-    loops, init = [], CompassEventLoop.__init__
+    # seconds, and the test fails: a loop that never stops cannot hang it.
+    loops, fired, init = [], [], CompassEventLoop.__init__
 
     def tracked(self):
         init(self)
         loops.append(self)
 
     def stop_all():
+        fired.append(True)
         for loop in loops:
             if not loop.is_closed():
                 loop.call_soon_threadsafe(loop.stop)
@@ -86,6 +87,7 @@ def run(monkeypatch):
         guard.cancel()
         clock.install(None)
         server.close()
+    assert not fired, "a loop ran 20 wall seconds without stopping"
 
 
 def _idle_traffic(run) -> None:
