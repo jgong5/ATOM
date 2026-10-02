@@ -23,6 +23,7 @@ from atom.compass.spec.tokenizers import Backend, table
 from atom.entrypoints.openai.api_server import _prepare_multimodal_inputs
 from atom.model_engine import llm_engine
 from atom.sampling_params import SamplingParams
+from atom.utils import clock
 from atom.utils.clock import LPRuntime
 from atom.utils.compass_loop import Refused, SimExecutor, Station, wrap_encode
 
@@ -131,7 +132,7 @@ def test_start_of_waits_for_earlier_jobs_with_one_diagnostic(caplog):
     assert len([r for r in caplog.records if "still waiting" in r.message]) == 1
 
 
-def test_five_jobs_at_width_two_predicted_beside_observed(loop, monkeypatch):
+def test_five_jobs_at_width_two_predicted_beside_observed(loop):
     tokens = [100, 50, 150, 25, 200]
     rate = ENCODE_TOKENS_PER_S * DERATE
     service = [ENCODE_FIXED_S + n / rate for n in tokens]
@@ -145,7 +146,6 @@ def test_five_jobs_at_width_two_predicted_beside_observed(loop, monkeypatch):
         hf_config=SimpleNamespace(model_type="llama"), speculative_config=None
     )
     proc = llm_engine.InputOutputProcessor(config, SimpleNamespace(encode=encode), 16)
-    monkeypatch.setattr(llm_engine, "time", SimpleNamespace(time=loop.rt.read_clock))
     _, release = _executor(loop, width=2)
 
     async def request(n):
@@ -160,8 +160,10 @@ def test_five_jobs_at_width_two_predicted_beside_observed(loop, monkeypatch):
         return await asyncio.gather(*map(request, tokens))
 
     try:
+        clock.install(loop.rt)
         rows = loop.run_until_complete(run())
     finally:
+        clock.install(None)
         release()
     print("\n  k  tokens  service    predicted s, c        observed s, c")
     for k, (n, d, p, o) in enumerate(zip(tokens, service, predicted, rows)):
