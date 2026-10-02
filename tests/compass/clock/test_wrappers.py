@@ -11,6 +11,7 @@ hanging it.
 import math
 import re
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -236,3 +237,54 @@ def test_settle_waits_for_a_released_frame_still_in_flight(ctx):
     tx.send(b"p0")
     settling.join(5)
     assert not settling.is_alive() and rt.arrived[KV] == {0}
+
+
+def test_inline_receive_takes_a_frame_released_while_still_in_flight(ctx):
+    """Released by the receive's own grant, or by an earlier `advance_to`, then sent."""
+    table = _pd_table()
+    push, pull = _pair(ctx, "kv", zmq.PUSH, zmq.PULL)
+    stamps = (0.5, 0), (0.55, 1), (0.7, 2)
+    tx = _relayed(_rt(LpId("engine-D"), table=table)[0], push, KV, *stamps)
+    grants = [(a, {KV: [(seq, a)]}) for a, seq in stamps]
+    rt, call = _rt(LpId("engine-P"), *grants, table=table)
+    rx = WrappedSocket(rt, pull, KV)
+
+    def send_later(payload):
+        threading.Timer(0.2, lambda: tx.send(payload)).start()
+
+    send_later(b"p0")
+    assert call(rx.recv) == b"p0"
+    send_later(b"p1")
+    assert call(rx.poll, 100) is True
+    assert call(rx.recv) == b"p1"
+    call(rt.advance_to, 0.7)
+    send_later(b"p2")
+    assert call(rx.recv) == b"p2"
+    assert _requests(rt) == [("NER", math.inf, []), ("NER", 0.6, []), ("TAR", 0.7, [])]
+
+
+def test_outside_the_run_an_inline_receive_waits_on_the_socket(ctx):
+    """Before the run and after the +inf grant, as ATOM's loops poll until shutdown."""
+    table = _pd_table()
+    push, pull = _pair(ctx, "kv", zmq.PUSH, zmq.PULL)
+    tx_rt, _ = _rt(LpId("engine-D"), table=table)
+    tx_rt.end_run()
+    tx = WrappedSocket(tx_rt, push, KV)
+    rt, call = _rt(LpId("engine-P"), (math.inf, {}), table=table)
+    rt.end_run()
+    rx = WrappedSocket(rt, pull, KV)
+
+    def outside_the_run(asked):
+        start = time.monotonic()
+        assert call(rx.poll, 100) is False
+        assert _requests(rt) == asked
+        assert time.monotonic() - start >= 0.05
+        threading.Timer(0.2, lambda: tx.send(b"x")).start()
+        assert call(rx.recv) == b"x"
+        assert _requests(rt) == asked
+
+    outside_the_run([])
+    rt.start_run()
+    call(rt.next_event, math.inf)
+    rt.end_run()  # the window closes at the +inf grant
+    outside_the_run([("NER", math.inf, [])])

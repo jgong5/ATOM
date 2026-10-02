@@ -313,10 +313,8 @@ class WrappedSocket:
             self.raw.poll()
 
     def _recv_inline(self, copy: bool):
-        self.settle()
-        while not self.ready():
-            self.rt.next_event(math.inf)
-            self.settle()
+        while not self.poll():
+            pass
         ch, arrival, seq, payload = self._take(copy)
         if arrival is not None:
             with self.rt.lock:
@@ -324,11 +322,18 @@ class WrappedSocket:
         return payload
 
     def poll(self, timeout_ms: int | None = None) -> bool:
-        """A bounded poll is an idle point until ``now + timeout``; zero never idles."""
+        """A bounded poll is an idle point until ``now + timeout``; zero never idles.
+
+        Outside the run there is no clock to ask: it waits on the socket itself.
+        """
         self.settle()
         if not self.ready() and timeout_ms != 0:
-            t = math.inf if timeout_ms is None else self.rt.now + timeout_ms / 1000.0
-            self.rt.next_event(t)
+            if not self.rt.in_run:
+                self.raw.poll(timeout_ms)
+            elif timeout_ms is None:
+                self.rt.next_event(math.inf)
+            else:
+                self.rt.next_event(self.rt.now + timeout_ms / 1000.0)
             self.settle()
         return self.ready()
 
