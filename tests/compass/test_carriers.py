@@ -137,7 +137,7 @@ class TestTheStreamWriter:
         with pytest.raises(
             ValueError, match=r"^unterminated SSE frame 'data: \{\"x\":'"
         ):
-            _client_text(_replay(['data: {"x":', "1}\n\n"]))
+            _client_text(_replay(['data: a\n\ndata: {"x":', "1}\n\n"]))
         assert rt.send_log == []
 
     def test_a_chat_stream_carries_one_stamp_per_event(self, installed):
