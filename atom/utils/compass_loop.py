@@ -74,7 +74,7 @@ class Station:
         with self.cv:
             if not self.cv.wait_for(lambda: self.final >= k, self.diag_s):
                 logger.warning(
-                    "station job %d waits for job %d, which has not finished after "
+                    "station job %d waits for job %d, which is not placed yet after "
                     "%s wall seconds; still waiting",
                     k,
                     self.final,
@@ -111,9 +111,9 @@ def classify(fn) -> str:
 class SimExecutor(ThreadPoolExecutor):
     """The loop's default executor; its jobs run in simulated time from `start_run`."""
 
-    def __init__(self, loop, max_workers: int | None = None, diag_s: float = DIAG_S):
+    def __init__(self, loop, max_workers: int | None = None):
         super().__init__(max_workers)
-        self.loop, self.diag_s = loop, diag_s
+        self.loop = loop
         self.station: Station | None = None
         self.passthrough = 0  # wait jobs in flight
         self.refusals: list[str] = []  # run-summary reasons, ``executor:<name>``
@@ -121,7 +121,7 @@ class SimExecutor(ThreadPoolExecutor):
 
     def start_run(self) -> None:
         """Freeze the width: the pool's, less the wait jobs resident now."""
-        self.station = Station(self._max_workers - self.passthrough, self.diag_s)
+        self.station = Station(self._max_workers - self.passthrough)
 
     def submit(self, fn, /, *args, **kwargs) -> Future:
         kind = "wait" if self.station is None else classify(fn)
@@ -178,16 +178,5 @@ def wrap_encode(encode, entry):
         ids = encode(*args, **kwargs)
         _charge(entry.encode_fixed_s + len(ids) / rate)
         return ids
-
-    return charged
-
-
-def wrap_decode(decode, entry):
-    """`decode`, charging the current job ``fixed + window / derated rate``."""
-    rate = entry.decode_tokens_per_s * entry.derate
-
-    def charged(ids, *args, **kwargs):
-        _charge(entry.decode_fixed_s + len(ids) / rate)
-        return decode(ids, *args, **kwargs)
 
     return charged

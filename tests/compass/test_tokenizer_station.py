@@ -194,6 +194,51 @@ def test_a_job_finishing_before_an_earlier_one_gets_its_own_completion(loop):
         release()
 
 
+def test_a_wait_job_submitted_during_the_run_passes_through(loop):
+    # ATOM's output handler resubmits `outputs_queue.get` after every output.
+    ex, release = _executor(loop, width=1)
+    outputs = queue.Queue()
+    outputs.put("output")
+    try:
+        got = loop.run_until_complete(loop.run_in_executor(None, outputs.get))
+    finally:
+        release()
+    assert got == "output"
+    assert ex.refusals == [] and ex.station.jobs == []
+
+
+def test_a_job_cancelled_before_it_starts_is_skipped_and_the_next_one_places(loop):
+    encode = wrap_encode(lambda text: list(range(int(text))), _entry())
+    ex, release = _executor(loop, width=1)
+    go = threading.Event()
+
+    def request(n):
+        def do_preprocess():
+            go.wait(10)
+            return encode(str(n))
+
+        return loop.run_in_executor(None, do_preprocess)
+
+    async def run():
+        first, cancelled, last = map(request, (100, 50, 25))
+        cancelled.cancel()  # queued behind `first` on the only free thread
+        await asyncio.sleep(0)
+        go.set()
+        await first
+        await last
+        return loop.time()
+
+    # A job that is never placed leaves the station unresolved, and the clock stops.
+    stop = threading.Timer(10, loop.call_soon_threadsafe, (loop.stop,))
+    stop.start()
+    try:
+        assert loop.run_until_complete(run()) == pytest.approx(0.201 + 0.051)
+    finally:
+        stop.cancel()
+        release()
+    assert not ex.station.unresolved()
+
+
 def _unregistered():
     return None
 
