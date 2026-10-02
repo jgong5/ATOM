@@ -6,6 +6,7 @@ import os
 import pytest
 
 import atom.compass
+import atom.utils.clock
 from atom.compass.detect.clock_source import DEFAULT_ALLOW_LIST, ClockSourceLint
 
 #: A cost backend that charges the time its own arithmetic took.
@@ -114,6 +115,13 @@ class TestTheClockSourceLint:
         assert report == (
             f"clock-source lint: clean over {len(lint.modules(SIMULATED_PATH))} "
             f"module(s), {len(DEFAULT_ALLOW_LIST)} file(s) allow-listed"
+        )
+
+    def test_the_lp_runtime_is_clean_today(self):
+        """The LP runtime sits outside `atom/compass` and is on the simulated path."""
+        assert ClockSourceLint().check(atom.utils.clock.__file__) == (
+            0,
+            "clock-source lint: clean over 1 module(s), 0 file(s) allow-listed",
         )
 
     def test_the_lint_fires_on_a_seeded_read_and_names_every_one(self, tmp_path):

@@ -146,9 +146,9 @@ def test_the_package_imports_nothing_from_the_engine(path):
     """Only its own modules, so it runs anywhere Python does."""
     for node, module in _imported_modules(path):
         if module.startswith(".") or module.split(".")[0] == "atom":
-            assert module.startswith("atom.compass.backends"), (
-                f"{path.name}:{node.lineno} imports {module}"
-            )
+            assert module.startswith(
+                "atom.compass.backends"
+            ), f"{path.name}:{node.lineno} imports {module}"
 
 
 @pytest.mark.parametrize(
