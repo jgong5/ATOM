@@ -444,7 +444,7 @@ frames. The CA completes the LP's request only when every member has called:
 1. Every member makes the same number of CA calls per loop iteration; a per-member call
    counter refuses a mismatch by name.
 2. One request kind per round: TAR with equal `T` on every member, or NER with `t` the
-   minimum over members. Unequal `T` or mixed kinds are refused.
+   and `t_daemon` each the minimum over members. Unequal `T` or mixed kinds are refused.
 3. Every member's send log is merged before any grant is computed, so the LP's promised
    time never rises on a partial request.
 4. One common grant `G`; each member is released only the messages on its own channels.
@@ -491,7 +491,7 @@ services:
 | LP call | PDES term | Meaning |
 |---|---|---|
 | `advance_to(T)` | TAR (time advance request) | the owner prices an event of duration `d` (a forward) and asks for `T = now + d`; the grant is exactly `T` |
-| `next_event(t, t_daemon)` | NER (next event request) | the owner is idle; `t` is its next essential event and `t_daemon` its next daemon deadline, each or `+inf`; the grant is `min(t, t_daemon, earliest undelivered arrival)`, a daemon deadline held until it is at most the essential horizon `H` (Invariants, below) |
+| `next_event(t, t_daemon)` | NER (next event request) | the owner is idle; `t` is its next essential event and `t_daemon` its next daemon deadline, each or `+inf`; the grant is `min(t, t_daemon, earliest undelivered arrival)`, a daemon deadline held until it is at most the essential horizon `H` (Invariants, below); a one-argument `next_event(t)` means `t_daemon = +inf` |
 | grant reply | TAG (time advance grant) | carries `G` and the `(channel, seq)` set it releases |
 
 **Guarantee: a grant to `T` means every message with timestamp `<= T` has been delivered
@@ -508,9 +508,9 @@ over any channel path from *j* to *i*.
 #### Grant rule
 
 ```
-N[j] = now[j]                                                   j running
-     = T_j                                                      j waiting in TAR(T_j)
-     = min(t_j, t_daemon_j, earliest undelivered arrival into j) j waiting in NER(t_j, t_daemon_j)
+N[j] = now[j]                                                     j running
+     = T_j                                                        j waiting in TAR(T_j)
+     = min(t_j, t_daemon_j, earliest undelivered arrival into j)  j waiting in NER(t_j, t_daemon_j)
 
 LBTS(i) = min over j != i of ( N[j] + D(j->i) )
 a waiting LP i is granted G = N[i]  only if  G < LBTS(i)      -- strictly
@@ -1131,7 +1131,8 @@ The rules that settle the boundaries #53's categories left in the wrong place:
   nothing else in the turn blocks: `EngineCore.busy_loop`, `DPEngineCoreProc.busy_loop`
   and `PPEngineCoreProc._head_busy_loop`. D8's measurement of the prior design — first
   real step is tick 1, first simulated step is tick **89,336** — is this loop counted.
-  Each becomes `next_event(t)`, `t` the LP's earliest local event. The PP bounded polls
+  Each becomes `next_event(t, t_daemon)`, `t` the LP's earliest essential local event and
+  `t_daemon` its next daemon deadline (the metrics push). The PP bounded polls
   (`PPStageTransport.recv_tokens` and `recv_metadata`) are `next_event(now + bound)`, and
   the offline driver's `CoreManager.get_output` (`atom/model_engine/engine_core_mgr.py`)
   is `next_event(inf)`.
@@ -1310,13 +1311,14 @@ applied in that file's `main`), and the stream silence warning (`SILENCE_LOG_SEC
 Each fires only if the simulated system is really that slow, which is when a real one
 would fire it too.
 
-The pacing timers are local next events. Each joins the `t` the clock owner hands to
-`next_event(t)` (D4, K3):
+The pacing timers are local next events the clock owner hands to
+`next_event(t, t_daemon)` (D4, K3):
 
 - `KV_IDLE_DRAIN_INTERVAL_S = 0.001` (`atom/model_engine/engine_core.py`), gated in
-  `EngineCore._advance_idle_kv_transfer`.
-- `METRICS_PUSH_INTERVAL_S`, the engine's metrics push (`EngineCore.busy_loop` and
-  `DPEngineCoreProc.busy_loop`), and the API server's refresh loop
+  `EngineCore._advance_idle_kv_transfer`, is essential and joins `t`.
+- Daemon deadlines (#533), which join `t_daemon`: `METRICS_PUSH_INTERVAL_S`, the
+  engine's metrics push (`EngineCore.busy_loop` and `DPEngineCoreProc.busy_loop`), and
+  the API server's refresh loop
   (`_metrics_refresh_loop` in `api_server.py`). **Metric cadence is virtual time again**,
   which revises `11` D72's decision to keep it on the real clock: an observer in the
   traffic LP scrapes `/metrics` every `scrape_interval` of simulated time. `11` D72
@@ -1679,7 +1681,7 @@ Every item is additive at an existing site; no process and no thread is removed 
    real run is untouched. The same at the other forward sites and the idle rank's
    dummy batch (K1).
 4. **`Scheduler._advance_to_next_arrival`**, which does not exist, is not added: the step
-   loops' spin and the offline `get_output` become `next_event(t)` (K3), and the CA
+   loops' spin and the offline `get_output` become `next_event` calls (K3), and the CA
    performs the jump. Items 3 and 4 together: **~100**
 5. **Socket wrappers** at the channel creation points, one line each. The message
    header is (channel, arrival time, sequence number); on a ROUTER socket it goes after
