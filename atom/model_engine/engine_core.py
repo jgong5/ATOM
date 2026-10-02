@@ -26,6 +26,7 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.utils import (
+    clock,
     engine_process_name,
     envs,
     init_exit_handler,
@@ -314,7 +315,7 @@ class EngineCore:
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
-                now = time.monotonic()
+                now = clock.now(time.monotonic)
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
@@ -451,7 +452,7 @@ class EngineCore:
     def _advance_idle_kv_transfer(self) -> None:
         # No forward batch will run this tick, but offload load/save work may
         # still need to be dispatched or reported back to the scheduler.
-        now = time.monotonic()
+        now = clock.now(time.monotonic)
         if now < self._next_idle_kv_drain:
             return
         self._next_idle_kv_drain = now + KV_IDLE_DRAIN_INTERVAL_S
@@ -695,7 +696,7 @@ class DPEngineCoreProc(EngineCore):
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
-                now = time.monotonic()
+                now = clock.now(time.monotonic)
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()

@@ -5,9 +5,9 @@ A message is a tuple, one of four shapes:
 
 * ``("BIND", lp)`` -- the first frame on a connection; every later request on
   that connection is `lp`'s;
-* ``(kind, t, log)`` with `kind` one of ``TAR``, ``NER``, ``END`` -- a request,
+* ``(kind, t, log, t_daemon)`` with `kind` ``TAR`` or ``NER`` -- a request,
   where `log` is ``[(channel, seq, arrival)]``, the requester's sends since its
-  previous request;
+  previous request, and `t_daemon` an NER's daemon deadline, ``+inf`` for none;
 * ``("GRANT", G, released)`` -- the reply, `released` being
   ``{channel: [(seq, arrival)]}``;
 * ``("REFUSED", error, reason, table)`` -- the request was refused; `error` names
@@ -25,7 +25,6 @@ import json
 import math
 
 from atom.compass.clock import (
-    END,
     NER,
     TAR,
     BackdatedEvent,
@@ -35,7 +34,7 @@ from atom.compass.clock import (
 )
 
 BIND, GRANT, REFUSED = "BIND", "GRANT", "REFUSED"
-REQUESTS = (TAR, NER, END)
+REQUESTS = (TAR, NER)
 UNBOUNDED = {math.inf: "+inf", -math.inf: "-inf"}
 BOUNDS = {name: value for value, name in UNBOUNDED.items()}
 #: What a refusal can raise at the requester, most specific first.
@@ -119,8 +118,13 @@ def _row_in(fields: list) -> LpRow:
     )
 
 
-def _request_out(kind, t, log) -> dict:
-    return {"kind": kind, "t": _out(t), "log": [[c, s, _out(a)] for c, s, a in log]}
+def _request_out(kind, t, log, t_daemon) -> dict:
+    return {
+        "kind": kind,
+        "t": _out(t),
+        "log": [[c, s, _out(a)] for c, s, a in log],
+        "t_daemon": _out(t_daemon),
+    }
 
 
 def _error(name: str) -> str:
@@ -178,6 +182,7 @@ _DECODE = {
             body["kind"],
             _in(body["t"]),
             [_entry(*e) for e in body["log"]],
+            _in(body["t_daemon"]),
         ),
     ),
 }

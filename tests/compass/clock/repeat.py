@@ -69,7 +69,7 @@ def main(argv=None) -> int:
     report = run.run()
     sys.stdout.write(run.step_table.text())
     sys.stderr.write(f"hash-probe {hash(SEED_PROBE)}\natom {atom.__file__}\n")
-    return 0 if report.stopped_by == "END from traffic" else 1
+    return 0 if report.stopped_by == "the finish" else 1
 
 
 if __name__ == "__main__":

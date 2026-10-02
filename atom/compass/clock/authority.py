@@ -2,14 +2,14 @@
 """The Clock Authority: which waiting process may move its clock, to when, and
 with which messages.
 
-A logical process (LP) asks for time with one of three requests:
+A logical process (LP) asks for time with one of two requests:
 
 * ``TAR`` -- advance to ``t``: its owner has priced an event, and the grant is
   exactly ``t``;
-* ``NER`` -- idle until ``t``, which may be ``+inf``: the grant is ``t`` or the
-  earliest message registered for it, whichever comes first;
-* ``END`` -- the workload is over: every LP is granted ``+inf`` and the run
-  finishes.
+* ``NER`` -- idle until ``t``, which may be ``+inf``: the grant is ``t``, its
+  daemon deadline, or the earliest message registered for it, whichever comes
+  first. A daemon deadline is a housekeeping timer (a metrics push, a scrape)
+  that fires as usual but does not keep the run alive.
 
 Each request carries the requester's send log since its previous request, as
 ``(channel, seq, arrival)``. The log is registered before the requester's state
@@ -17,20 +17,30 @@ changes, so every message an LP produced is known before its clock moves.
 
 ``N[j]`` is the earliest time LP *j* could still produce a message: its clock
 while it runs, its target while it waits in TAR (its owner is inside this call
-and sends nothing), and the lesser of its target and its earliest unreleased
-message while it waits in NER. A waiting LP *i* is granted exactly ``N[i]``, and
-only when ``N[i] < min over j != i of (N[j] + D(j->i))``. ``D`` is the channel
-table's least summed lookahead over every channel path, so an idle LP between
-two others does not hide the first from the third. The comparison is strict: a
+and sends nothing), and the least of its target, its daemon deadline and its
+earliest unreleased message while it waits in NER. A waiting LP *i* is granted
+exactly ``N[i]``, and only when ``N[i] < min over j != i of (N[j] + D(j->i))``.
+``D`` is the channel table's least summed lookahead over every channel path, so
+an idle LP between two others does not hide the first from the third. The comparison is strict: a
 message not yet reported arrives no earlier than its sender's ``N`` plus that
 distance, so a strict grant never reaches it. Waiting LPs are tried in
 ``(N, name)`` order and the scan restarts after every grant.
 
+The essential horizon ``H`` is the largest TAR target, finite NER target or
+registered arrival seen so far; it only grows. A waiting LP is grantable only
+while ``N <= H``, so one whose ``N`` is its daemon deadline is held until some
+essential time or arrival reaches that deadline. A held deadline delays no
+essential grant: its ``N`` exceeds ``H``, and every essential ``N`` is at most
+``H``. Because ``H`` is a function of the schedule, not of which running LP
+reports first, a daemon deadline fires under every request order or none.
+
 When every LP waits and the strict rule grants none, which only a
-zero-lookahead cycle allows, the LP with the least ``(N, name)`` is granted:
-nothing is earlier, so nothing earlier can reach it. A message that then lands
-at its receiver's current instant belongs to that instant's next round. When
-every ``N`` is infinite the run is finished, as with ``END``.
+zero-lookahead cycle allows, the grantable LP with the least ``(N, name)`` is
+granted: nothing is earlier, so nothing earlier can reach it. A message that
+then lands at its receiver's current instant belongs to that instant's next
+round. When every LP waits and none is grantable, nothing is undelivered and
+no essential target is pending: the run is finished, every LP is granted
+``+inf``, and the daemon deadlines still held never fire.
 
 Nothing here reads a clock, opens a socket or starts a thread. The caller
 carries requests in and replies out.
@@ -42,7 +52,7 @@ from dataclasses import dataclass
 from .channels import ChannelTable
 from .identity import LpId
 
-TAR, NER, END = "TAR", "NER", "END"
+TAR, NER = "TAR", "NER"
 RUNNING = "running"
 
 
@@ -96,6 +106,8 @@ class ClockAuthority:
         self._now = dict.fromkeys(self._ids, 0.0)
         self._state = dict.fromkeys(self._ids, RUNNING)
         self._target = dict.fromkeys(self._ids)
+        self._daemon = dict.fromkeys(self._ids, math.inf)
+        self._horizon = -math.inf  # H: the latest essential time seen
         self._into = {
             i: tuple(c.name for c in channels.channels_into(i)) for i in self._ids
         }
@@ -109,14 +121,17 @@ class ClockAuthority:
         self.grants = {i.name: 0 for i in self._ids}
         self.final_clocks = None
 
-    def on_request(self, lp: LpId, kind: str, t: float, log) -> list:
+    def on_request(
+        self, lp: LpId, kind: str, t: float, log, t_daemon: float = math.inf
+    ) -> list:
         """Register `lp`'s send log, record its request, and grant what is due.
 
-        Returns the replies made due, as ``(lp, G, released)`` in the order
-        issued, where ``released`` maps each channel into that LP to its newly
-        released ``(seq, arrival)`` pairs. The requester is absent when its
-        reply is held. Once the run is finished, every LP has had its ``+inf``
-        reply, and a request changes nothing and returns none.
+        `t_daemon` is an NER's daemon deadline, ``+inf`` for none. Returns the
+        replies made due, as ``(lp, G, released)`` in the order issued, where
+        ``released`` maps each channel into that LP to its newly released
+        ``(seq, arrival)`` pairs. The requester is absent when its reply is
+        held. Once the run is finished, every LP has had its ``+inf`` reply,
+        and a request changes nothing and returns none.
         """
         if self.final_clocks is not None:
             return []
@@ -127,21 +142,28 @@ class ClockAuthority:
                 "running LP can produce a request",
                 self.lp_table(),
             )
-        if kind not in (TAR, NER, END):
-            raise ValueError(f"{kind!r} is not one of {TAR}, {NER}, {END}")
-        if kind != END:
-            t = _seconds(t, f"the {kind} target of {lp}", finite=kind == TAR)
-            if t < self._now[lp]:
+        if kind not in (TAR, NER):
+            raise ValueError(f"{kind!r} is not one of {TAR}, {NER}")
+        t = _seconds(t, f"the {kind} target of {lp}", finite=kind == TAR)
+        daemon = _seconds(t_daemon, f"the daemon deadline of {lp}", finite=False)
+        if kind == TAR and daemon != math.inf:
+            raise ValueError(
+                f"{lp} sent TAR with daemon deadline {daemon}; only NER has one"
+            )
+        for asked, value in (
+            (f"{kind}({t})", t),
+            (f"daemon deadline {daemon}", daemon),
+        ):
+            if value < self._now[lp]:
                 raise BackdatedEvent(
-                    f"{lp} asked for {kind}({t}) behind its own clock at "
-                    f"{self._now[lp]}",
+                    f"{lp} asked for {asked} behind its own clock at {self._now[lp]}",
                     self.lp_table(),
                 )
         for name, seq, arrival in log:
             self._register(lp, name, seq, arrival)
-        if kind == END:
-            return self._finish()
-        self._state[lp], self._target[lp] = kind, t
+        if t < math.inf:
+            self._horizon = max(self._horizon, t)
+        self._state[lp], self._target[lp], self._daemon[lp] = kind, t, daemon
         return self._grant_due()
 
     def lp_table(self) -> tuple[LpRow, ...]:
@@ -188,6 +210,7 @@ class ClockAuthority:
             )
         else:
             self._undelivered[name][seq] = a
+            self._horizon = max(self._horizon, a)
             self._next_seq[name] = seq + 1
             return
         raise BackdatedEvent(refusal, self.lp_table())
@@ -204,7 +227,9 @@ class ClockAuthority:
             return self._now[j]
         if self._state[j] == TAR:
             return self._target[j]
-        return min([self._target[j]] + [a for _, _, a in self._pending(j)])
+        return min(
+            [self._target[j], self._daemon[j]] + [a for _, _, a in self._pending(j)]
+        )
 
     def _row(self, i: LpId) -> tuple[tuple[LpId, float], ...]:
         return tuple(
@@ -220,15 +245,16 @@ class ClockAuthority:
             waiting = sorted(
                 (self._n(i), i) for i in self._ids if self._state[i] != RUNNING
             )
-            due = next(((i, n) for n, i in waiting if n < self._lbts(i)), None)
+            grantable = [(n, i) for n, i in waiting if n <= self._horizon]
+            due = next(((i, n) for n, i in grantable if n < self._lbts(i)), None)
             if due is not None:
                 replies.append(self._grant(*due))
             elif len(waiting) < len(self._ids):
                 return replies
-            elif waiting[0][0] == math.inf:
+            elif not grantable:
                 return replies + self._finish()
             else:
-                replies.append(self._recover(waiting[0][1], waiting[0][0]))
+                replies.append(self._recover(grantable[0][1], grantable[0][0]))
 
     def _recover(self, i: LpId, g: float) -> tuple:
         # The one grant whose guarantee is weaker: a message may still land at g.
@@ -251,6 +277,6 @@ class ClockAuthority:
         self.final_clocks = tuple(self._now.items())
         for i in self._ids:
             if self.timeline is not None:
-                self.timeline.record(i, self._now[i], math.inf, END, False)
+                self.timeline.record(i, self._now[i], math.inf, self._state[i], False)
             self._now[i], self._state[i], self._target[i] = math.inf, RUNNING, None
         return [(i, math.inf, {name: [] for name in self._into[i]}) for i in self._ids]
