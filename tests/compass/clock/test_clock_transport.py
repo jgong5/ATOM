@@ -331,6 +331,23 @@ def test_a_backdated_event_arrives_with_the_lp_table(served):
     ]
 
 
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+def test_a_backdated_event_ends_the_run_for_the_lp_parked_on_its_channel(
+    served, endpoint
+):
+    ca = ClockAuthority(_table())
+    endpoint = served(ca, endpoint).endpoint
+    a, b = connect(A, endpoint), connect(B, endpoint)
+    _result(_later(b.send, (NER, INF, [], INF)))
+    parked = _later(b.recv)
+    with pytest.raises(BackdatedEvent, match="before a's clock 0.0") as sent:
+        _ask(a, (TAR, 1.0, [(AB, 0, 0.1)], INF))
+    with pytest.raises(BackdatedEvent) as parked_on:
+        _result(parked)
+    assert parked_on.value.reason == sent.value.reason
+    assert sent.value.table == parked_on.value.table == ca.lp_table()
+
+
 def test_a_log_behind_its_receiver_is_refused(served):
     endpoint = served(ClockAuthority(_table())).endpoint
     a, b = connect(A, endpoint), connect(B, endpoint)
