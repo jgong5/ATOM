@@ -19,6 +19,7 @@ from atom.compass.clock import (
     prefill_decode_table,
     single_engine_table,
 )
+from atom.compass.clock.channels import ReceiveMode
 
 T, FP, EP, FD, ED = (
     LpId(n) for n in ("traffic", "frontend-P", "engine-P", "frontend-D", "engine-D")
@@ -265,8 +266,17 @@ def test_a_channel_to_itself_and_an_unknown_receive_mode_are_refused():
     table = _table(a, b)
     with pytest.raises(ValueError, match="joins a to itself"):
         table.declare("a->a:x", a, a, 1.0, "inline")
-    with pytest.raises(ValueError, match="receive mode of 'a->b:x' must be one of"):
+    with pytest.raises(
+        ValueError,
+        match="receive mode of 'a->b:x' must be one of thread, inline, got 'poll'",
+    ):
         table.declare("a->b:x", a, b, 1.0, "poll")
+
+
+def test_a_receive_mode_given_as_a_string_is_stored_as_its_member():
+    a, b = LpId("a"), LpId("b")
+    channel = _table(a, b).declare("a->b:x", a, b, 1.0, "inline")
+    assert channel.receive is ReceiveMode.INLINE
 
 
 def test_every_query_refuses_an_unregistered_process():

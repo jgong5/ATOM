@@ -28,6 +28,7 @@ import logging
 import threading
 
 from atom.compass.clock import ChannelTable, LpId
+from atom.compass.clock.channels import ReceiveMode
 
 logger = logging.getLogger("atom")
 
@@ -128,7 +129,7 @@ class LPRuntime:
                 self.unreleased.pop((ch, seq), None)
                 for w in self.wakes.values():
                     w.set()
-                if self.table.recv_mode(ch) == "inline":
+                if self.table.recv_mode(ch) is ReceiveMode.INLINE:
                     continue
                 reported = False
                 while seq not in self.handled[ch]:
@@ -160,7 +161,7 @@ class LPRuntime:
             return any(
                 self.released[ch] - self.handled[ch]
                 for ch in self.released
-                if self.table.recv_mode(ch) == "inline"
+                if self.table.recv_mode(ch) is ReceiveMode.INLINE
             )
 
     # ---- receive side ----
