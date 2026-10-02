@@ -8,6 +8,8 @@ import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from atom.utils import clock
+
 from .protocol import (
     STREAM_DONE_MESSAGE,
     TEXT_COMPLETION_OBJECT,
@@ -43,7 +45,7 @@ def create_completion_chunk(
     chunk = {
         "id": request_id,
         "object": TEXT_COMPLETION_OBJECT,
-        "created": int(time.time()),
+        "created": int(clock.now(time.time)),
         "model": model,
         "choices": [
             {
@@ -114,7 +116,7 @@ async def stream_completion_response(
                 usage_chunk = {
                     "id": request_id,
                     "object": TEXT_COMPLETION_OBJECT,
-                    "created": int(time.time()),
+                    "created": int(clock.now(time.time)),
                     "model": model,
                     "choices": [],
                     "usage": {
@@ -150,7 +152,7 @@ def build_completion_response(
     """Build a non-streaming text completion response (single choice)."""
     response = CompletionResponse(
         id=request_id,
-        created=int(time.time()),
+        created=int(clock.now(time.time)),
         model=model,
         choices=[
             {
@@ -197,7 +199,7 @@ def build_completion_response_multi(
     completion_tokens = sum(out["num_tokens_output"] for out in final_outputs)
     return CompletionResponse(
         id=request_id,
-        created=int(time.time()),
+        created=int(clock.now(time.time)),
         model=model,
         choices=choices,
         usage={
@@ -283,7 +285,7 @@ async def stream_completion_response_fanout(
         usage_chunk = {
             "id": request_id,
             "object": TEXT_COMPLETION_OBJECT,
-            "created": int(time.time()),
+            "created": int(clock.now(time.time)),
             "model": model,
             "choices": [],
             "usage": usage,

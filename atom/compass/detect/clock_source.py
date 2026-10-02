@@ -43,14 +43,16 @@ the trade the pass is worth making and not a reason to trust it alone. The list
 is what has been tried against it, not an enumeration of what Python allows.
 
 **The allow-list is part of the check, not an escape from it.** A read that is
-meant to stay real gets an entry naming its file and the reason, so the list is
-reviewable, and adding to it is a decision somebody writes down rather than a
-silence.
+meant to stay real gets an entry naming its file, or its site and class, and the
+reason, so the list is reviewable, and adding to it is a decision somebody
+writes down rather than a silence.
 """
 
 import ast
 import os
 from dataclasses import dataclass
+
+from atom.compass.audit.sync_scan import SCANNED_ROOTS
 
 #: The calls that return real seconds. An asyncio timer is not one: it runs on
 #: the event loop's clock, which a simulated run replaces. The `_ns` forms are
@@ -84,6 +86,101 @@ CLOCK_READS = (
 #: does not collect the exemption.
 DEFAULT_ALLOW_LIST: dict[str, str] = {}
 
+#: ATOM's serving path: the roots the synchronization inventory scans, and the
+#: utilities they call. Paths are relative to the repository root.
+SERVING_ROOTS = tuple(root for root, _ in SCANNED_ROOTS) + ("atom/utils/",)
+
+_REPLACED_RUNNER = "the real model runner, which a simulated run replaces"
+_LOG_ONLY = "times real work for a log line; nothing in the simulated record reads it"
+
+#: Real-clock reads on the serving path that stay real, by site: (file, the
+#: innermost def holding the read, the call) -> (class, reason). K8 stays real
+#: on purpose, out of the clock authority's reach; K9 is outside the model --
+#: outside the simulated window, or in code a simulated run replaces. Every
+#: other read on the serving path takes the LP clock through
+#: `atom.utils.clock.now`.
+SERVING_ALLOW_LIST: dict[tuple[str, str, str], tuple[str, str]] = {
+    (
+        "atom/model_engine/engine_core.py",
+        "_drain_kv_work_at_exit",
+        "time.monotonic",
+    ): ("K9", "bounds the KV drain at shutdown, after the last step is charged"),
+    ("atom/model_engine/engine_core.py", "_process_engine_step", "time.perf_counter"): (
+        "K9",
+        _LOG_ONLY,
+    ),
+    ("atom/model_engine/engine_core_mgr.py", "close", "time.monotonic"): (
+        "K9",
+        "the engine processes' shutdown grace period, after the simulated window",
+    ),
+    (
+        "atom/model_engine/engine_utility.py",
+        "_execute_utility_command",
+        "time.monotonic",
+    ): ("K9", _LOG_ONLY),
+    (
+        "atom/model_engine/model_runner.py",
+        "_build_and_load_model",
+        "time.perf_counter",
+    ): (
+        "K9",
+        _REPLACED_RUNNER,
+    ),
+    ("atom/model_engine/model_runner.py", "_on_trace_ready", "time.time"): (
+        "K9",
+        _REPLACED_RUNNER,
+    ),
+    ("atom/model_engine/model_runner.py", "_on_trace_ready", "time.monotonic"): (
+        "K9",
+        _REPLACED_RUNNER,
+    ),
+    ("atom/model_engine/model_runner.py", "stop_profiler", "time.monotonic"): (
+        "K9",
+        _REPLACED_RUNNER,
+    ),
+    ("atom/model_engine/model_runner.py", "warmup_model", "time.time"): (
+        "K9",
+        _REPLACED_RUNNER,
+    ),
+    ("atom/model_engine/model_runner.py", "capture_cudagraph", "time.time"): (
+        "K9",
+        _REPLACED_RUNNER,
+    ),
+    (
+        "atom/model_engine/model_runner.py",
+        "_disagg_collect_rank_files",
+        "time.monotonic",
+    ): ("K9", _REPLACED_RUNNER),
+    (
+        "atom/kv_transfer/disaggregation/moriio/moriio_connector.py",
+        "_execute_handshake",
+        "time.perf_counter",
+    ): ("K9", "a transfer backend the simulator replaces with a priced one"),
+    ("atom/utils/__init__.py", "shutdown_all_processes", "time.monotonic"): (
+        "K9",
+        "the process shutdown grace period, after the simulated window",
+    ),
+    ("atom/utils/backends.py", "compile", "time.time"): (
+        "K9",
+        "torch.compile at startup, before the simulated window",
+    ),
+    ("atom/utils/backends.py", "__call__", "time.time"): (
+        "K9",
+        "torch.compile at startup, before the simulated window",
+    ),
+    ("atom/utils/decorators.py", "start_monitoring_torch_compile", "time.time"): (
+        "K9",
+        "torch.compile at startup, before the simulated window",
+    ),
+    ("atom/utils/gc_utils.py", "_log", "time.perf_counter"): ("K9", _LOG_ONLY),
+}
+
+
+def _names(path: str, entry: str) -> bool:
+    """Does `entry` name `path`? Whole path segments only, from any root."""
+    posix = path.replace(os.sep, "/")
+    return posix == entry or posix.endswith("/" + entry)
+
 
 @dataclass(frozen=True)
 class ClockRead:
@@ -101,8 +198,9 @@ class ClockRead:
 class ClockSourceLint:
     """Parses the simulated path and reports every real-clock read it finds."""
 
-    def __init__(self, allow_list=DEFAULT_ALLOW_LIST) -> None:
+    def __init__(self, allow_list=DEFAULT_ALLOW_LIST, sites=SERVING_ALLOW_LIST) -> None:
         self.allow_list = dict(allow_list)
+        self.sites = dict(sites)
 
     def allowed(self, path: str) -> str | None:
         """The recorded reason this file may read a real clock, if it may.
@@ -111,10 +209,16 @@ class ClockSourceLint:
         hand the exemption to any directory whose name happens to end in the
         first segment of an entry, which is a file nobody reviewed.
         """
-        posix = path.replace(os.sep, "/")
         for entry in sorted(self.allow_list):
-            if posix == entry or posix.endswith("/" + entry):
+            if _names(path, entry):
                 return self.allow_list[entry]
+        return None
+
+    def site(self, read: ClockRead) -> tuple[str, str] | None:
+        """The class and reason recorded for this read's site, if it stays real."""
+        for (path, scope, call), why in self.sites.items():
+            if (scope, call) == (read.scope, read.call) and _names(read.path, path):
+                return why
         return None
 
     def scan_source(self, source: str, path: str) -> tuple[ClockRead, ...]:
@@ -157,18 +261,20 @@ class ClockSourceLint:
             )
         return tuple(found)
 
-    def report(self, reads, scanned: int, allow_listed: int = 0) -> str:
+    def report(self, reads, scanned: int, allow_listed: int = 0, kept: int = 0) -> str:
         """What the check prints. Clean is a line; dirty is the list and the fix.
 
         `allow_listed` is how many of the files in this scan were passed over,
-        not how long the list is. The line reads as a statement about the scan,
-        so it has to be one: a tree containing none of the listed files is a
-        tree where nothing was exempted.
+        and `kept` how many reads a site entry kept real, not how long either
+        list is. The line reads as a statement about the scan, so it has to be
+        one: a tree containing none of the listed files is a tree where nothing
+        was exempted.
         """
         if not reads:
+            by_site = f", {kept} read(s) kept real by site" if kept else ""
             return (
                 f"clock-source lint: clean over {scanned} module(s), "
-                f"{allow_listed} file(s) allow-listed"
+                f"{allow_listed} file(s) allow-listed{by_site}"
             )
         lines = [
             f"clock-source lint: {len(reads)} real-clock read(s) on the simulated path:"
@@ -196,7 +302,11 @@ class ClockSourceLint:
             with open(path, encoding="utf-8") as handle:
                 reads.extend(self.scan_source(handle.read(), path))
         allow_listed = sum(1 for path in modules if self.allowed(path) is not None)
-        return (1 if reads else 0), self.report(reads, len(modules), allow_listed)
+        unlisted = [read for read in reads if self.site(read) is None]
+        kept = len(reads) - len(unlisted)
+        return (1 if unlisted else 0), self.report(
+            unlisted, len(modules), allow_listed, kept
+        )
 
 
 def _dotted(node) -> str | None:
