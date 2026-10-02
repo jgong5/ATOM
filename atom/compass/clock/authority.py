@@ -140,10 +140,10 @@ class ClockAuthority:
             channels.registry.require(lp)
             if not owned:
                 raise ValueError(f"{lp} is declared with an empty member list")
-            touching = set(self._into[lp]) | {
-                c.name for c in channels.channels_from(lp)
-            }
-            listed = {name for names in owned.values() for name in names}
+            touching = dict.fromkeys(
+                [*self._into[lp], *(c.name for c in channels.channels_from(lp))]
+            )
+            listed = dict.fromkeys(name for names in owned.values() for name in names)
             self._owner[lp] = {}
             for name in sorted(touching | listed):
                 owners = sorted(m for m, names in owned.items() if name in names)
