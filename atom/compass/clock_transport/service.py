@@ -112,6 +112,16 @@ def _refusal(refused: Exception) -> tuple:
     return REFUSED, error, " ".join(map(str, refused.args)), None
 
 
+def _reply(frame: bytes) -> tuple:
+    """The message `frame` carries; a refusal raises as its own type."""
+    kind, *rest = decode(frame)
+    if kind == REFUSED:
+        error, reason, table = rest
+        cls = REFUSALS[error]
+        raise cls(reason, table) if issubclass(cls, ClockAbort) else cls(reason)
+    return kind, *rest
+
+
 class _Connection:
     """One LP's connection: ``send((kind, t, log))``, ``recv() -> (G, released)``, ``close()``."""
 
@@ -124,12 +134,7 @@ class _Connection:
 
     def recv(self) -> tuple:
         """Block until this LP's reply exists; a refusal raises."""
-        kind, *rest = decode(self._slot.get())
-        if kind == REFUSED:
-            error, reason, table = rest
-            cls = REFUSALS[error]
-            raise cls(reason, table) if issubclass(cls, ClockAbort) else cls(reason)
-        g, released = rest
+        _, g, released = _reply(self._slot.get())
         return g, released
 
     def close(self) -> None:
@@ -163,6 +168,4 @@ def connect(lp: LpId, endpoint: str = DEFAULT_ENDPOINT) -> _Connection:
 def _require_carried(endpoint: str) -> None:
     scheme, separator, _ = endpoint.partition(":")
     if not separator or scheme != IN_PROCESS_SCHEME:
-        raise ValueError(
-            f"{endpoint!r} is not {IN_PROCESS_SCHEME}:<name>, the one carrier here"
-        )
+        raise ValueError(f"{endpoint!r} is not {IN_PROCESS_SCHEME}:<name>")

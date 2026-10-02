@@ -315,7 +315,7 @@ def test_two_clocks_at_one_endpoint_are_refused():
     serve(ClockAuthority(_table()), "inproc:twice").close()
 
 
-@pytest.mark.parametrize("endpoint", ["clock", "tcp://127.0.0.1:9"])
+@pytest.mark.parametrize("endpoint", ["clock", "udp://127.0.0.1:9"])
 def test_an_endpoint_that_reaches_nothing_is_refused_rather_than_guessed(endpoint):
     with pytest.raises(ValueError, match="is not inproc:<name>"):
         connect(A, endpoint)
