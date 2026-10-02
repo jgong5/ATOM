@@ -19,7 +19,6 @@ import time
 import pytest
 
 from atom.compass.clock import (
-    END,
     NER,
     SPEED_TARGET_RATIO,
     TAR,
@@ -54,8 +53,8 @@ class _Logged(_Recorded):
         self.timeline = TimelineLog()
         self.issued = []
 
-    def on_request(self, lp, kind, t, log):
-        replies = super().on_request(lp, kind, t, log)
+    def on_request(self, lp, kind, t, log, t_daemon=INF):
+        replies = super().on_request(lp, kind, t, log, t_daemon)
         self.issued += [(i, g) for i, g, _ in replies]
         return replies
 
@@ -84,8 +83,7 @@ def test_one_record_per_reply_in_issue_order_with_recovery_marked_exactly():
         clock = dict.fromkeys(ca.grants, 0.0)
         for r in records:
             assert r.time_from == clock[r.lp.name]
-            assert (r.time_to == INF) == (r.kind == END)
-            assert r.kind in (TAR, NER, END)
+            assert r.kind in (TAR, NER)
             clock[r.lp.name] = r.time_to
         assert len(records) == sum(ca.grants.values()) + len(ca.grants)
         recovered += len(ca.recovered)
@@ -173,19 +171,19 @@ def test_a_log_that_would_write_nothing_anywhere_is_refused():
         TimelineLog(retain=False)
 
 
-def test_end_records_one_end_reply_per_lp_from_the_clock_it_finished_at():
+def test_the_finish_records_one_reply_per_lp_from_the_clock_it_finished_at():
     table = single_engine_table(admission_path="serving", ipc_s=1.0e-4, stream_s=2.0e-3)
     engine, frontend, traffic = table.registry.ids()
     ca = ClockAuthority(table, TimelineLog())
     ca.on_request(engine, NER, INF, [])
     ca.on_request(frontend, NER, INF, [])
     assert _grants(ca.on_request(traffic, TAR, 2.0, [])) == [("traffic", 2.0)]
-    ca.on_request(traffic, END, INF, [])
+    ca.on_request(traffic, NER, INF, [])
     assert ca.timeline.lines() == (
         "traffic 0.0 2.0 TAR -",
-        "engine 0.0 inf END -",
-        "frontend 0.0 inf END -",
-        "traffic 2.0 inf END -",
+        "engine 0.0 inf NER -",
+        "frontend 0.0 inf NER -",
+        "traffic 2.0 inf NER -",
     )
     assert ca.final_clocks == ((engine, 0.0), (frontend, 0.0), (traffic, 2.0))
     # Every reply of the finish is +inf, and the table says so.

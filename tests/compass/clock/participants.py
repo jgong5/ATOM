@@ -4,8 +4,10 @@
 An LP holds its own clock and nothing else. The driver hands it a grant `G` and
 the messages the grant released. It handles them one at a time in
 `(arrival, channel, seq)` order, each at its arrival, then runs at `G`
-and returns its next request: `TAR(t)` while a step is being charged, `NER(t)`
-while idle until its next local event (infinite when it has none), or `END`.
+and returns its next request as `(kind, t, t_daemon)`: `TAR(t)` while a step
+is being charged, or `NER(t, t_daemon)` while idle until its next essential
+local event `t` (infinite when it has none) or its next housekeeping timer
+`t_daemon`, which does not keep the run alive.
 
 Only the run at `G` sends, and every send is stamped `G` plus the channel's
 lookahead. A handler never sends: in ATOM a receiving thread hands the message
@@ -17,7 +19,7 @@ import dataclasses
 import heapq
 import math
 
-from atom.compass.clock import END, NER, TAR, LpId
+from atom.compass.clock import NER, TAR, LpId
 
 # Declared, not measured: the tokenizer station of each frontend, and the
 # simulated KV transfer between the two engines of a prefill-decode deployment.
@@ -119,8 +121,8 @@ class Traffic(_Lp):
 
     With `scrape_on` naming its request channel, a scrape is a `GET /metrics`
     answered on the stream. With `None`, the router answers the scrape itself,
-    so no LP sees it. After the last response it waits for one more scrape to
-    complete and then ends the run.
+    so no LP sees it. Its arrivals are essential and its scrape is a daemon
+    deadline.
     """
 
     def __init__(self, table, workload, http, scrape_on):
@@ -141,13 +143,10 @@ class Traffic(_Lp):
                     workload.prompt_tokens[index],
                 )
             )
-        self.responses = self.scrapes = self.answered = 0
-        self.last_scrape = None
+        self.responses = self.scrapes = 0
 
     def handle(self, channel, arrival, payload):
-        if payload[0] == "scrape":
-            self.answered = payload[1]
-        elif payload[2]:  # ("chunk", request, finished)
+        if payload[0] == "chunk" and payload[2]:  # ("chunk", request, finished)
             self.responses += 1
 
     def run(self, now):
@@ -158,21 +157,14 @@ class Traffic(_Lp):
             self.timers += 1
             self.scrapes += 1
             self.next_scrape += self.interval
-            if self.last_scrape is None and self.responses == self.expected:
-                self.last_scrape = self.scrapes
-            if self.scrape_on is None:
-                self.answered = self.scrapes
-            else:
+            if self.scrape_on is not None:
                 self.send(self.scrape_on, ("scrape", self.scrapes))
-        if self.finished:
-            return END, math.inf
-        if self.arrivals:
-            return NER, min(self.next_scrape, self.arrivals[0][0])
-        return NER, self.next_scrape
+        next_arrival = self.arrivals[0][0] if self.arrivals else math.inf
+        return NER, next_arrival, self.next_scrape
 
     @property
     def finished(self):
-        return self.last_scrape is not None and self.answered >= self.last_scrape
+        return not self.arrivals and self.responses == self.expected
 
 
 class Frontend(_Lp):
@@ -216,7 +208,7 @@ class Frontend(_Lp):
         for channel, payload in self.answers:
             self.send(channel, payload)
         self.answers.clear()
-        return NER, self.tokenized[0][0] if self.tokenized else math.inf
+        return NER, self.tokenized[0][0] if self.tokenized else math.inf, math.inf
 
     @property
     def finished(self):
@@ -227,7 +219,7 @@ class Engine(_Lp):
     """One engine LP: every step is a TAR, and an idle engine waits in NER.
 
     As ATOM's busy loop does, it pushes a metrics snapshot on its output channel
-    at 0 and then every `METRICS_PUSH_S`, so it never waits on `NER(+inf)`.
+    at 0 and then every `METRICS_PUSH_S`, a daemon deadline.
 
     A step serves one request, round robin, and puts its output. On a prefill
     engine a finished request keeps its blocks until the decode side's write
@@ -275,12 +267,10 @@ class Engine(_Lp):
         self._admit(now)
         if self.work:
             self.step = self.work.popleft()
-            return TAR, now + self.step[2][0]
-        if self.deferred or self.parked:
-            if self.drain_due is None:
-                self.drain_due = now + KV_IDLE_DRAIN_S
-            return NER, min(self.drain_due, self.next_push)
-        return NER, self.next_push
+            return TAR, now + self.step[2][0], math.inf
+        if (self.deferred or self.parked) and self.drain_due is None:
+            self.drain_due = now + KV_IDLE_DRAIN_S
+        return NER, self.drain_due or math.inf, self.next_push
 
     def _finish_step(self, now):
         request, tokens, left = self.step

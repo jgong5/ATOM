@@ -41,6 +41,7 @@ from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
+from atom.utils import clock
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
     freeze_gc_heap,
@@ -378,7 +379,7 @@ def _log_request_event(event_type: str, request_id: str, data: Any) -> None:
     if _request_logger is None:
         return
     entry = {
-        "timestamp": time.time(),
+        "timestamp": clock.now(time.time),
         "request_id": request_id,
         "type": event_type,
         "data": data,
@@ -769,7 +770,7 @@ def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
         "token_ids": request_output.output_tokens,
         "finished": request_output.finished,
         "finish_reason": request_output.finish_reason,
-        "finished_at": time.time(),
+        "finished_at": clock.now(time.time),
         "started_at": started_at,
         "num_cached_tokens": getattr(request_output, "num_cached_tokens", 0),
     }
@@ -842,7 +843,7 @@ async def generate_async(
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
-    started_at = time.time()
+    started_at = clock.now(time.time)
     first_token_at: float | None = None
     last_token_at: float | None = None
     # An array, not a list: this grows for the whole life of the request,
@@ -865,7 +866,7 @@ async def generate_async(
         _ct = getattr(request_output, "num_cached_tokens", 0)
         if _ct:
             num_cached_tokens_seen = _ct
-        now = time.time()
+        now = clock.now(time.time)
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
             {
@@ -902,8 +903,8 @@ async def generate_async(
             token_ids = item.get("token_ids") or []
             if token_ids:
                 if first_token_at is None:
-                    first_token_at = item.get("ts", time.time())
-                last_token_at = item.get("ts", time.time())
+                    first_token_at = item.get("ts", clock.now(time.time))
+                last_token_at = item.get("ts", clock.now(time.time))
                 all_token_ids.extend(token_ids)
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
@@ -931,7 +932,7 @@ async def generate_async(
         seq.num_prompt_tokens if seq is not None else len(tokenizer.encode(prompt))
     )
     num_tokens_output = len(all_token_ids)
-    finished_at = time.time()
+    finished_at = clock.now(time.time)
     latency = finished_at - started_at
     ttft = (first_token_at - started_at) if first_token_at is not None else 0.0
     tpot = (
@@ -971,7 +972,7 @@ async def generate_async_multimodal(
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
-    started_at = time.time()
+    started_at = clock.now(time.time)
     first_token_at: float | None = None
     last_token_at: float | None = None
     all_token_ids = new_token_ids()
@@ -979,7 +980,7 @@ async def generate_async_multimodal(
     seq = None
 
     def completion_callback(request_output: RequestOutput):
-        now = time.time()
+        now = clock.now(time.time)
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
             {
@@ -1016,8 +1017,8 @@ async def generate_async_multimodal(
             token_ids_out = item.get("token_ids") or []
             if token_ids_out:
                 if first_token_at is None:
-                    first_token_at = item.get("ts", time.time())
-                last_token_at = item.get("ts", time.time())
+                    first_token_at = item.get("ts", clock.now(time.time))
+                last_token_at = item.get("ts", clock.now(time.time))
                 all_token_ids.extend(token_ids_out)
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
@@ -1035,7 +1036,7 @@ async def generate_async_multimodal(
 
     text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
     num_tokens_output = len(all_token_ids)
-    finished_at = time.time()
+    finished_at = clock.now(time.time)
     ttft = (first_token_at - started_at) if first_token_at is not None else 0.0
     tpot = (
         (last_token_at - first_token_at) / (num_tokens_output - 1)
@@ -1083,7 +1084,7 @@ async def generate_async_fanout(
     shared_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
-    started_at = time.time()
+    started_at = clock.now(time.time)
     per_tokens = [new_token_ids() for _ in range(n)]
     per_first_token_at: list[float | None] = [None] * n
     per_last_token_at: list[float | None] = [None] * n
@@ -1092,7 +1093,7 @@ async def generate_async_fanout(
 
     def make_callback(idx: int):
         def _cb(request_output: RequestOutput) -> None:
-            now = time.time()
+            now = clock.now(time.time)
             loop.call_soon_threadsafe(
                 shared_queue.put_nowait,
                 (
@@ -1142,8 +1143,8 @@ async def generate_async_fanout(
             tokens = item.get("token_ids") or []
             if tokens:
                 if per_first_token_at[idx] is None:
-                    per_first_token_at[idx] = item.get("ts", time.time())
-                per_last_token_at[idx] = item.get("ts", time.time())
+                    per_first_token_at[idx] = item.get("ts", clock.now(time.time))
+                per_last_token_at[idx] = item.get("ts", clock.now(time.time))
                 per_tokens[idx].extend(tokens)
             if item.get("finished", False):
                 per_finish_reason[idx] = item.get("finish_reason")
@@ -1159,7 +1160,7 @@ async def generate_async_fanout(
                     pass
             engine.io_processor.requests.pop(_seq.id, None)
 
-    finished_at = time.time()
+    finished_at = clock.now(time.time)
     outputs: list[dict[str, Any]] = []
     for i in range(n):
         num_tokens_output = len(per_tokens[i])
@@ -1225,7 +1226,7 @@ async def setup_streaming_request(
     stream_collector = StreamOutputCollector(request_id)
     stream_loop = asyncio.get_running_loop()
     _stream_loops[request_id] = stream_loop
-    _request_start_times[request_id] = time.time()
+    _request_start_times[request_id] = clock.now(time.time)
 
     # The detokenizer lives in this closure, so it is freed when the engine
     # drops the callback on the stream's last chunk -- no registry, no cleanup.
@@ -1435,7 +1436,7 @@ async def setup_streaming_request_fanout(
     shared_collector = StreamOutputCollector(request_id)
     stream_loop = asyncio.get_running_loop()
     _stream_loops[request_id] = stream_loop
-    _request_start_times[request_id] = time.time()
+    _request_start_times[request_id] = clock.now(time.time)
 
     assert _stream_batch_dispatcher is not None
 
@@ -2172,7 +2173,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
                             if field == "reasoning_content":
                                 if drop_reasoning:
-                                    now = time.monotonic()
+                                    now = clock.now(time.monotonic)
                                     if now - last_ping >= (
                                         _ANTHROPIC_PING_INTERVAL_SECONDS
                                     ):

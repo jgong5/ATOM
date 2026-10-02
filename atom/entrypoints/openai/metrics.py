@@ -12,6 +12,8 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
+from atom.utils import clock
+
 from .streaming_dispatch import longest_silence_seconds
 
 
@@ -405,7 +407,7 @@ class AtomMetricsExporter:
     def update(self, snapshot: dict[str, Any]) -> None:
         with self._lock:
             self._snapshot = copy.deepcopy(snapshot)
-            self._last_refresh = time.time()
+            self._last_refresh = clock.now(time.time)
 
     def record_refresh_error(self) -> None:
         with self._lock:

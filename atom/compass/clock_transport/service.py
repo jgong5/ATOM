@@ -4,10 +4,10 @@
 `serve` starts one thread that takes ``(lp, request)`` off a single queue, in
 arrival order, and passes it to `ClockAuthority.on_request`. Each reply that
 call returns goes to its LP's own reply slot, whether or not that LP is waiting
-on it. A grant only ever goes to an LP waiting in TAR or NER, but the finish at
-the end of a run answers LPs that are still running too, and each of them reads
-its ``+inf`` on its next request. A requester whose reply is held gets nothing
-until a later request makes it due, and nothing times it out.
+on it. A grant only ever goes to an LP waiting in TAR or NER; the finish at the
+end of a run comes when every LP waits, and answers each one's request with
+``+inf``. A requester whose reply is held gets nothing until a later request
+makes it due, and nothing times it out.
 
 A refused request, a `ClockAbort` such as `BackdatedEvent` or a `KeyError` or
 `ValueError` from the authority, is answered with a refusal frame. The
@@ -93,11 +93,13 @@ class _Server:
 
     def _loop(self) -> None:
         while (item := self._requests.get()) is not None:
-            lp, (kind, t, log) = item
+            lp, (kind, t, log, t_daemon) = item
             try:
                 replies = [
                     (i, (GRANT, g, released))
-                    for i, g, released in self._authority.on_request(lp, kind, t, log)
+                    for i, g, released in self._authority.on_request(
+                        lp, kind, t, log, t_daemon
+                    )
                 ]
             except (ClockAbort, KeyError, ValueError) as refused:
                 replies = [(lp, _refusal(refused))]
@@ -112,8 +114,19 @@ def _refusal(refused: Exception) -> tuple:
     return REFUSED, error, " ".join(map(str, refused.args)), None
 
 
+def _reply(frame: bytes) -> tuple:
+    """The message `frame` carries; a refusal raises as its own type."""
+    kind, *rest = decode(frame)
+    if kind == REFUSED:
+        error, reason, table = rest
+        cls = REFUSALS[error]
+        raise cls(reason, table) if issubclass(cls, ClockAbort) else cls(reason)
+    return kind, *rest
+
+
 class _Connection:
-    """One LP's connection: ``send((kind, t, log))``, ``recv() -> (G, released)``, ``close()``."""
+    """One LP's connection: ``send((kind, t, log, t_daemon))``, ``recv() -> (G, released)``,
+    ``close()``."""
 
     def __init__(self, server: _Server, lp: LpId) -> None:
         self._server = server
@@ -124,12 +137,7 @@ class _Connection:
 
     def recv(self) -> tuple:
         """Block until this LP's reply exists; a refusal raises."""
-        kind, *rest = decode(self._slot.get())
-        if kind == REFUSED:
-            error, reason, table = rest
-            cls = REFUSALS[error]
-            raise cls(reason, table) if issubclass(cls, ClockAbort) else cls(reason)
-        g, released = rest
+        _, g, released = _reply(self._slot.get())
         return g, released
 
     def close(self) -> None:
@@ -138,7 +146,6 @@ class _Connection:
 
 def serve(authority, endpoint: str = DEFAULT_ENDPOINT) -> _Server:
     """Serve `authority` at `endpoint`. `close()` on the result stops it."""
-    _require_carried(endpoint)
     if endpoint in _SERVED:
         raise ValueError(
             f"{endpoint} is already served in this process; two authorities at "
@@ -150,7 +157,6 @@ def serve(authority, endpoint: str = DEFAULT_ENDPOINT) -> _Server:
 
 def connect(lp: LpId, endpoint: str = DEFAULT_ENDPOINT) -> _Connection:
     """`lp`'s connection to the authority served at `endpoint`."""
-    _require_carried(endpoint)
     server = _SERVED.get(endpoint)
     if server is None:
         raise KeyError(
@@ -158,11 +164,3 @@ def connect(lp: LpId, endpoint: str = DEFAULT_ENDPOINT) -> _Connection:
             + (", ".join(sorted(_SERVED)) or "<none>")
         )
     return _Connection(server, lp)
-
-
-def _require_carried(endpoint: str) -> None:
-    scheme, separator, _ = endpoint.partition(":")
-    if not separator or scheme != IN_PROCESS_SCHEME:
-        raise ValueError(
-            f"{endpoint!r} is not {IN_PROCESS_SCHEME}:<name>, the one carrier here"
-        )

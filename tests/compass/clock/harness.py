@@ -4,22 +4,22 @@
 No transport and no threads: the driver calls `ClockAuthority.on_request`
 directly. Every LP starts running at 0. While several LPs are running, which
 one's request reaches the authority next is the driver's `order`, a priority
-over LP names. A reply goes to its LP, which returns its next request; a
-running LP that receives the `+inf` reply at the end of the run still submits
-the request it was holding, as it would on a wire, so each LP issues as many
-requests as it receives replies.
+over LP names. A reply goes to its LP, which returns its next request, until
+the finish replies `+inf` to every LP, each then waiting, so each LP issues as
+many requests as it receives replies.
 
 The driver holds the check the authority cannot make about itself: no grant
 may move an LP past a message registered for it that it was not handed, and no
 LP is handed a message that arrives after its grant, or at or before the grant
-it had last.
+it had last. It makes the same check on the `+inf` reply, so a run finishes
+with nothing in flight.
 """
 
 import collections
 import math
 from dataclasses import dataclass
 
-from atom.compass.clock import END, ClockAuthority
+from atom.compass.clock import ClockAuthority
 
 from .deployments import DEPLOYMENTS, build
 from .participants import Engine
@@ -93,23 +93,21 @@ class SyntheticRun:
         try:
             while ready:
                 lp = min(ready, key=self.rank.__getitem__)
-                kind, t = ready.pop(lp)
+                kind, t, t_daemon = ready.pop(lp)
                 self.requests[lp][kind] += 1
                 self.submitted.append(str(lp))
-                if kind == END and stopped_by is None:
-                    stopped_by = f"END from {lp}"
                 for i, g, released in self.clock.on_request(
-                    lp, kind, t, self._post(lp)
+                    lp, kind, t, self._post(lp), t_daemon
                 ):
                     self._check_cap()
                     messages = self._hand_over(i, g, released)
                     self.reply_log[i].append(
                         (g, tuple((c, s, a) for a, c, s, _ in messages))
                     )
-                    if g == math.inf:
-                        stopped_by = stopped_by or "every N infinite"
-                        continue
                     self._refuse_step_over(i, g)
+                    if g == math.inf:
+                        stopped_by = "the finish"
+                        continue
                     ready[i] = self.lps[i].on_grant(g, messages)
         except GrantsExhausted:
             stopped_by = f"the grant cap of {self.grant_cap} was reached"
