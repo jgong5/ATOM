@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""ATOM's own runner, recording each step: what `--runner-qualname` names on a real run.
+"""ATOM's own runner, recording each step: what `Config.runner_qualname` names on a real run.
 
 Kept apart from the package because importing `ModelRunner` needs a driver.
 """

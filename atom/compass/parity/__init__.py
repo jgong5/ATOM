@@ -12,11 +12,20 @@ of each DP rank writes `dp<rank>.jsonl` there, replacing any earlier file.
 Unset, nothing is recorded. The simulated runner records from
 `NonAllocatingRunner.forward`; a real one records through `StepRecording`,
 composed into `atom.compass.parity.runner.RecordingModelRunner`, which
-`--runner-qualname` names.
+`Config.runner_qualname` names.
 
-A request is named by its key, a digest of the tokens it was first scheduled
-with, because request ids are numbered per run. Two requests of one run with the
-same key could not be told apart in either record, so the second is refused.
+A request is named by its key, because request ids are numbered per run: a
+digest of the first `KEY_TOKENS` tokens it was first scheduled with. That prefix
+does not move with the first chunk. `Scheduler._chunked_prefill_size` floors a
+chunk the budget cuts short to a multiple of `max(block_size, 64)`, so a first
+chunk holds the whole prompt or at least 64 tokens; only a budget under 64
+tokens cuts it shorter, and then every run with that budget cuts it alike. Two
+things it does not cover: a prefix-cache hit starts the first chunk where the
+hit ends, so a request that hits in one run and misses in the other is keyed on
+different tokens and does not join; and on a model with per-request state,
+`Scheduler._finalize_prefill_chunk` may cut a first chunk at a checkpoint
+position. Two requests of one run with the same key could not be told apart in
+either record, so the second is refused.
 """
 
 import hashlib
@@ -28,11 +37,12 @@ from itertools import zip_longest
 import numpy as np
 
 ENV = "ATOM_COMPASS_PARITY_RECORD"
+KEY_TOKENS = 64
 
 
 def request_key(tokens) -> str:
-    """The digest a request is named by across runs."""
-    data = np.asarray(tokens, dtype=np.int32).tobytes()
+    """The digest a request is named by across runs, of its first `KEY_TOKENS`."""
+    data = np.asarray(tokens[:KEY_TOKENS], dtype=np.int32).tobytes()
     return hashlib.blake2b(data, digest_size=8).hexdigest()
 
 
@@ -64,9 +74,11 @@ class StepRecord:
                     if key in self.owners:
                         raise ValueError(
                             f"requests {self.owners[key]} and {req_id} were first "
-                            f"scheduled with the same tokens (key {key}), so no "
-                            "record can tell them apart; give each request a "
-                            "distinct prompt."
+                            f"scheduled with the same leading {KEY_TOKENS} tokens "
+                            f"(key {key}), so no record can tell them apart; give "
+                            "each request a first window of its own, for example "
+                            f"prompts that differ within their first {KEY_TOKENS} "
+                            "tokens."
                         )
                     self.keys[req_id], self.owners[key] = key, req_id
                 rows.append([self.keys[req_id], num, int(batch.context_lens[i])])

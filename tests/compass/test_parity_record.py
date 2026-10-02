@@ -28,13 +28,13 @@ def _prompt(i):
     return list(range(5 + 1000 * i, 5 + 1000 * i + PROMPT))
 
 
-def _config(dp_rank=0, pipeline_parallel_size=1):
+def _config(dp_rank=0, pipeline_parallel_size=1, budget=BUDGET):
     return MockConfig(
         max_num_seqs=8,
         num_kvcache_blocks=4096,
         kv_cache_block_size=BLOCK,
         max_model_len=2048,
-        max_num_batched_tokens=BUDGET,
+        max_num_batched_tokens=budget,
         pipeline_parallel_size=pipeline_parallel_size,
         parallel_config=SimpleNamespace(data_parallel_rank=dp_rank),
     )
@@ -47,12 +47,12 @@ class _Runner(NonAllocatingRunner):
         self.config, self.rank = config, rank
 
 
-def _drive(directory, monkeypatch, ranks, prompt=_prompt):
+def _drive(directory, monkeypatch, ranks, prompt=_prompt, budget=BUDGET):
     """Run each DP rank's requests to completion; return its batches and sequences."""
     monkeypatch.setenv(ENV, str(directory))
     built = {}
     for dp_rank, requests in ranks.items():
-        config = _config(dp_rank)
+        config = _config(dp_rank, budget=budget)
         scheduler, runner = Scheduler(config), _Runner(config)
         sequences = [
             Sequence(
@@ -156,9 +156,22 @@ def test_two_records_of_one_sequence_compare_equal(tmp_path, monkeypatch):
     assert sorted(ranks["real"].values()) == [0, 0, 1, 1]
 
 
-def test_a_request_moved_to_the_other_rank_names_its_first_step(tmp_path, monkeypatch):
-    real = _drive(tmp_path / "real", monkeypatch, {0: [0, 1], 1: [2, 3]})
-    _drive(tmp_path / "simulated", monkeypatch, {0: [0], 1: [1, 2, 3]})
+@pytest.mark.parametrize(
+    "budget, length",
+    # At a 128-token budget requests 1, 2 and 3 open with a different first
+    # chunk in each run, 64 tokens in one and 128 in the other.
+    [(BUDGET, PROMPT), (128, 150)],
+)
+def test_a_request_moved_to_the_other_rank_names_its_first_step(
+    tmp_path, monkeypatch, budget, length
+):
+    def prompt(i):
+        return _prompt(i)[:length]
+
+    real = _drive(
+        tmp_path / "real", monkeypatch, {0: [0, 1], 1: [2, 3]}, prompt, budget
+    )
+    _drive(tmp_path / "simulated", monkeypatch, {0: [0], 1: [1, 2, 3]}, prompt, budget)
     report = compare(tmp_path / "real", tmp_path / "simulated")
     real_record = read(tmp_path / "real")
     first = report["first_divergence"]
@@ -170,6 +183,7 @@ def test_a_request_moved_to_the_other_rank_names_its_first_step(tmp_path, monkey
     assert first[0]["real"] == real_record[0][moved]
     assert first[1]["step"] == 0
     ranks = report["request_dp_rank"]
+    assert ranks["real"].keys() == ranks["simulated"].keys()
     assert [
         (ranks["real"][key], ranks["simulated"][key])
         for key in ranks["real"]
@@ -195,9 +209,30 @@ def test_a_shifted_chunk_boundary_names_its_first_step(tmp_path, monkeypatch):
     assert first["simulated"]["batch"][0][1:] == [60, 60]
 
 
+def test_a_record_that_stops_early_or_has_no_rank_parts_where_it_ends(
+    tmp_path, monkeypatch
+):
+    _drive(tmp_path / "real", monkeypatch, {0: [0, 1], 1: [2, 3]})
+    shutil.copytree(tmp_path / "real", tmp_path / "simulated")
+    real = read(tmp_path / "real")
+    (tmp_path / "simulated" / "dp0.jsonl").unlink()
+    cut = tmp_path / "simulated" / "dp1.jsonl"
+    cut.write_text("".join(cut.read_text().splitlines(keepends=True)[:2]))
+    first = compare(tmp_path / "real", tmp_path / "simulated")["first_divergence"]
+    assert first == {
+        0: {"step": 0, "real": real[0][0], "simulated": None},
+        1: {"step": 2, "real": real[1][2], "simulated": None},
+    }
+
+
 def test_two_requests_with_one_first_window_are_refused(tmp_path, monkeypatch):
-    with pytest.raises(ValueError, match="first scheduled with the same tokens"):
-        _drive(tmp_path, monkeypatch, {0: [0, 1]}, prompt=lambda i: _prompt(0))
+    # Distinct 100-token prompts, both scheduled whole, that share 64 leading
+    # tokens, as two requests behind one long system prompt would.
+    def prompt(i):
+        return _prompt(0)[:64] + _prompt(i)[64:100]
+
+    with pytest.raises(ValueError, match="with the same leading 64 tokens"):
+        _drive(tmp_path, monkeypatch, {0: [0, 1]}, prompt, budget=256)
 
 
 def test_one_key_on_two_ranks_is_refused(tmp_path, monkeypatch):
