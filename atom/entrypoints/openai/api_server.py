@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from PIL import Image
 
 from atom import SamplingParams
+from atom.compass.carriers import stamp_events
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.multimodal import build_multimodal_inputs
@@ -459,6 +460,9 @@ async def _client_stream(
     `_logged_stream`, and the Anthropic endpoint never used it. A watchdog
     with an endpoint-shaped hole in it is worse than none, because the zero it
     reports looks like an answer.
+
+    In a simulated run each event leaves with a comment line carrying its
+    stream stamp, written after the frame is logged.
     """
     it = gen.__aiter__()
     delivered = False
@@ -472,6 +476,9 @@ async def _client_stream(
                 return
         delivered = True
         _log_sse(chunk, request_id)
+        rt = clock._installed
+        if rt is not None and rt.in_run:
+            chunk = stamp_events(chunk, rt)
         yield chunk
 
 
