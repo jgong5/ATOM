@@ -34,6 +34,8 @@ from atom.compass.clock_transport import (
     service,
 )
 
+from .test_member_join import ENGINE, FRONTEND, RANKS, _joined
+
 A, B = LpId("a"), LpId("b")
 AB = "a->b:m"
 INF = math.inf
@@ -57,9 +59,9 @@ class _Recorded(ClockAuthority):
         super().__init__(channels)
         self.requests = []
 
-    def on_request(self, lp, kind, t, log, t_daemon=INF):
+    def on_request(self, lp, kind, t, log, t_daemon=INF, member=None):
         self.requests.append((lp, (kind, t, log, t_daemon)))
-        return super().on_request(lp, kind, t, log, t_daemon)
+        return super().on_request(lp, kind, t, log, t_daemon, member)
 
 
 @pytest.fixture
@@ -221,6 +223,36 @@ def test_every_request_reaches_the_rule_as_the_frame_it_was_sent_as(
     assert [m[0] for m in frames].count("BIND") == 3
 
 
+# --- members -------------------------------------------------------------------
+
+REQ0, REQ1 = (f"frontend->engine:request#{rank}" for rank in RANKS)
+
+
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+def test_each_member_binds_its_own_connection_and_reads_its_own_releases(
+    served, endpoint
+):
+    endpoint = served(_joined(), endpoint).endpoint
+    frontend = connect(FRONTEND, endpoint)
+    dp0, dp1 = (connect(ENGINE, endpoint, rank) for rank in RANKS)
+    with pytest.raises(KeyError, match="engine member dp0 is already bound"):
+        connect(ENGINE, endpoint, "dp0")
+    with pytest.raises(KeyError, match="called by member 'dp2'"):
+        _ask(connect(ENGINE, endpoint, "dp2"), (NER, INF, [], INF))
+    _result(_later(frontend.send, (NER, INF, [(REQ1, 0, 1.0)], INF)))
+    rounds = []
+    for _ in range(2):
+        _result(_later(dp0.send, (NER, 3.0, [], INF)))
+        first = _later(dp0.recv)
+        _result(_later(dp1.send, (NER, 2.0, [], INF)))
+        rounds.append((_result(first), _result(_later(dp1.recv))))
+    # One common grant per round, each member reading only its own channel.
+    assert rounds == [
+        ((1.0, {REQ0: []}), (1.0, {REQ1: [(0, 1.0)]})),
+        ((2.0, {REQ0: []}), (2.0, {REQ1: []})),
+    ]
+
+
 # --- refusals -----------------------------------------------------------------
 
 
@@ -346,6 +378,7 @@ def _messages():
         ca.on_request(A, TAR, 3.0, [(AB, 1, 2.1)])
     return [
         ("BIND", A),
+        ("BIND", ENGINE, "dp0"),
         (TAR, 1.0, [(AB, 0, 1.5)], INF),
         (NER, INF, [], 2.0),
         ("GRANT", INF, {AB: [(0, 0.5), (1, 0.75)]}),
@@ -393,6 +426,7 @@ def test_a_duration_that_is_not_one_is_refused_where_it_would_be_written():
         b'{"kind":"TAR","log":[[["x"],0,1.0]],"t":1.0,"t_daemon":"+inf"}',
         b'{"kind":"TAR","log":[["x",0.0,1.0]],"t":1.0,"t_daemon":"+inf"}',
         b'{"kind":"NER","log":[],"t":"+inf"}',
+        b'{"kind":"BIND","lp":"engine","member":0}',
         b'{"kind":"REFUSED","error":"SystemExit","reason":"","table":null}',
     ],
 )
