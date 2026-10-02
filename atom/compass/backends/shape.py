@@ -52,12 +52,12 @@ that is the count in hand -- so on a stack whose experts sit on a period, or
 one mixing dense layers among expert ones, it is wrong in exactly the way the
 paged count was wrong for the all-reduce. Two consequences are stated rather
 than left to be noticed. The term for any collective other than the all-reduce
-says, where its charge is read, that the depth is standing in for a count of
-expert-bearing layers; and moving the all-reduce onto the stack depth moved the
-all-to-all by the same four times on the hybrid here, which is a side effect of
-sharing the count in hand and not a result about experts. Settling it needs an
-expert geometry and a term that reads one, which belongs to a backend that
-means its numbers rather than to this one.
+says, where its charge is read, that the depth stands in for this collective's
+own count, which nothing here argues it equals; and moving the all-reduce onto
+the stack depth moved the all-to-all by the same four times on the hybrid
+here, which is a side effect of sharing the count in hand and not a result
+about experts. Settling it needs an expert geometry and a term that reads one,
+which belongs to a backend that means its numbers rather than to this one.
 
 Two things the form does not know, stated because a reader of a number will
 otherwise assume it does. It has one quadratic coefficient for the whole batch
