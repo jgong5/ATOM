@@ -43,8 +43,8 @@ from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
 from atom.utils import clock
-from atom.utils.compass_loop import HttpChannel
 from atom.utils.arg_parser import FlexibleArgumentParser
+from atom.utils.compass_loop import HttpChannel
 from atom.utils.gc_utils import (
     freeze_gc_heap,
     maybe_attach_gc_debug_callback,
