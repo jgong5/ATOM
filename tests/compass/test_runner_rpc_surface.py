@@ -26,6 +26,7 @@ module's tests read it.
 import ast
 import collections
 import pathlib
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import pytest
@@ -41,6 +42,8 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 ENGINE = REPO / "atom" / "model_engine"
 ATOM_RUNNER = ENGINE / "model_runner.py"
 ASYNC_PROC = (ENGINE / "async_proc.py").read_text()
+PACKAGE = REPO / "atom" / "compass" / "runner"
+COMPOSED = (REPO / "atom/compass/runner/model_runner.py").read_text()
 BROADCAST = ("call_func", "call_func_with_aggregation")
 # Every class in the tree that answers a dispatched name and is not in
 # `model_runner.py`. The leftover names have to land on one of these; a name
@@ -50,6 +53,12 @@ ROLLOUT = (
     "atom/rollout/weight_updater.py",
     "atom/rollout/memory_manager.py",
 )
+# The two trees the profiler reply crosses: `model_engine`, which builds the
+# dict and forwards it, and the Compass package that replaces the producer.
+# The `trace_dir` claim below is about these and nothing else -- reading the
+# whole `atom/` tree would let any package's passing mention of the string
+# fail a test about this one reply.
+REPLY_SURFACE = (ENGINE, REPO / "atom" / "compass" / "runner")
 
 
 class Site(NamedTuple):
@@ -59,16 +68,60 @@ class Site(NamedTuple):
     line: int
     waits: bool
     aggregated: bool
-    arity: int  # values unpacked from the reply; 0 when it is discarded
+    arity: int | None  # values unpacked; 0 when discarded, None when unread
 
 
 def _classes(path):
     tree = ast.parse(path.read_text())
+    for n in ast.walk(tree):
+        n.file = path.name
     return {n.name: n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
 
 
+UNREAD_CLASS_BODY: list[str] = []
+
+
+def _is_docstring(n):
+    return (
+        isinstance(n, ast.Expr)
+        and isinstance(n.value, ast.Constant)
+        and isinstance(n.value.value, str)
+    )
+
+
 def _methods(node):
-    return {n.name for n in node.body if isinstance(n, ast.FunctionDef)}
+    """Every name the body of class *node* binds, and so answers `getattr` with.
+
+    A `def` and an `async def` bind a name the same way an assignment in the
+    class body does, and the worker's `getattr` finds all three. A statement in
+    the body that could bind a name some other way -- an `if`, a `try`, a
+    loop, an expression such as `vars().update(...)` -- is recorded in
+    `UNREAD_CLASS_BODY` rather than skipped, and
+    `test_every_class_body_the_method_sets_are_read_from_is_read` names it.
+    Recorded, not raised: this runs at import, where a raise would stop every
+    module importing this one from collecting.
+    """
+    names = set()
+    for n in node.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(n.name)
+        elif isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for target in n.targets if isinstance(n, ast.Assign) else [n.target]:
+                names |= {t.id for t in ast.walk(target) if isinstance(t, ast.Name)}
+        elif not isinstance(n, ast.Pass) and not _is_docstring(n):
+            UNREAD_CLASS_BODY.append(
+                f"{node.file}:{n.lineno}: {ast.unparse(n).splitlines()[0]}"
+            )
+    return names
+
+
+def _busy_loop():
+    """`AsyncIOProc.busy_loop`, parsed."""
+    return next(
+        n
+        for n in ast.walk(ast.parse(ASYNC_PROC))
+        if isinstance(n, ast.FunctionDef) and n.name == "busy_loop"
+    )
 
 
 def _raised_name(node):
@@ -81,20 +134,41 @@ def _arity(parent):
 
     `0` means the reply is discarded -- the broadcast is a bare statement and
     nothing can read what came back. `1` means it is used whole: bound to a
-    name, handed straight back to this function's own caller, or passed on as
-    an argument. Anything above `1` is a tuple unpack, which is the only shape
-    that fixes a length rather than just a type.
+    name, or handed straight back to this function's own caller. Anything
+    above `1` is a tuple unpack, which is the only shape that fixes a length
+    rather than just a type.
 
     `ast.Return` is the case worth naming, because reading only `ast.Assign`
     scores `return self.runner_mgr.call_func(...)` as a discard when the value
-    is in fact the function's result -- `engine_core.py:749`, `dummy_execution`.
+    is in fact the function's result -- `DPEngineCoreProc._execute_dummy_batch`,
+    `dummy_execution`.
+
+    Any other shape -- a list or starred target, an annotated one, a chained
+    target, an argument to another call -- is scored `None` rather than `1`,
+    which would read an unpack as a use of the whole reply, and
+    `test_every_reply_is_taken_in_a_shape_the_arity_reads` names its site.
     """
     if isinstance(parent, ast.Expr):
         return 0
-    if isinstance(parent, ast.Assign):
-        target = parent.targets[0]
-        return len(target.elts) if isinstance(target, ast.Tuple) else 1
-    return 1
+    if isinstance(parent, ast.Return):
+        return 1
+    target = parent.targets[0] if isinstance(parent, ast.Assign) else None
+    if isinstance(target, ast.Name) and len(parent.targets) == 1:
+        return 1
+    starred = any(isinstance(e, ast.Starred) for e in getattr(target, "elts", ()))
+    if isinstance(target, ast.Tuple) and len(parent.targets) == 1 and not starred:
+        return len(target.elts)
+    return None
+
+
+def _mentions(roots, needle, base=REPO):
+    """Files under `roots` containing `needle`, as paths relative to `base`."""
+    return {
+        str(path.relative_to(base))
+        for root in roots
+        for path in root.rglob("*.py")
+        if needle in path.read_text()
+    }
 
 
 def _call_sites():
@@ -122,13 +196,13 @@ def _call_sites():
                 isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             ):
                 continue
-            if node.func.attr not in BROADCAST or not node.args:
+            if node.func.attr not in BROADCAST:
                 continue
             where = f"{path.relative_to(REPO)}:{node.lineno}"
             if "compass" in path.parts:
                 from_compass.append(where)
                 continue
-            if not isinstance(node.args[0], ast.Constant):
+            if not node.args or not isinstance(node.args[0], ast.Constant):
                 non_literal.append(where)
                 continue
             aggregated = node.func.attr == "call_func_with_aggregation"
@@ -138,7 +212,7 @@ def _call_sites():
             )
             sites.setdefault(node.args[0].value, []).append(
                 Site(
-                    path.name,
+                    str(path.relative_to(REPO)),
                     node.lineno,
                     waits,
                     aggregated,
@@ -163,9 +237,21 @@ EXTENSION_CLASSES = {
 
 
 class Runner(NonAllocatingRunner):
-    """The overrides over a base that supplies only what they read."""
+    """The overrides over a base that supplies only what they read.
+
+    `config` is present rather than absent: the base sets it first thing in its
+    own `__init__`, so every override reads it, and a stub without one tests a
+    shape the class is never in.
+    """
 
     def __init__(self):
+        self.config = SimpleNamespace(
+            disagg_is_decode=False,
+            speculative_config=None,
+            eos_token_id=-1,
+            stop_token_ids=[],
+            pipeline_parallel_size=1,
+        )
         self.capture_sizes = [0]
         self.capture_sizes_np = "untouched"
 
@@ -197,6 +283,19 @@ def test_both_filters_in_the_derivation_drop_nothing():
     """
     assert NON_LITERAL == []
     assert FROM_COMPASS == []
+
+
+def test_every_reply_is_taken_in_a_shape_the_arity_reads():
+    """A site `_arity` could not score would otherwise vanish from every arity set."""
+    unscored = [
+        f"{s.file}:{s.line}" for v in SITES.values() for s in v if s.arity is None
+    ]
+    assert unscored == [], f"replies taken in a shape not scored: {unscored}"
+
+
+def test_every_class_body_the_method_sets_are_read_from_is_read():
+    """A statement `_methods` could not read may bind a name it would miss."""
+    assert UNREAD_CLASS_BODY == [], f"class bodies not read: {UNREAD_CLASS_BODY}"
 
 
 def test_the_dispatched_names_outside_the_surface_belong_to_other_runners():
@@ -233,11 +332,7 @@ def test_each_name_waits_exactly_as_its_own_call_sites_say(name):
 
 def test_a_name_the_runner_lacks_is_skipped_and_not_raised():
     """`getattr(..., None)` plus `continue`: the worker never notices."""
-    busy = next(
-        n
-        for n in ast.walk(ast.parse(ASYNC_PROC))
-        if isinstance(n, ast.FunctionDef) and n.name == "busy_loop"
-    )
+    busy = _busy_loop()
     getattrs = [
         n
         for n in ast.walk(busy)
@@ -261,11 +356,7 @@ def test_a_reply_is_forwarded_only_when_it_is_not_none():
     caller on that path and this file's whole account of the surface would be
     wrong for it.
     """
-    busy = next(
-        n
-        for n in ast.walk(ast.parse(ASYNC_PROC))
-        if isinstance(n, ast.FunctionDef) and n.name == "busy_loop"
-    )
+    busy = _busy_loop()
     guards = [
         n
         for n in ast.walk(busy)
@@ -302,6 +393,42 @@ def test_the_caller_that_waits_has_no_timeout_to_rescue_it():
         if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "get"
     ]
     assert gets and not any(g.args or g.keywords for g in gets)
+
+
+def test_the_worker_cannot_break_on_an_unpack_and_the_wait_is_unbounded():
+    """`busy_loop` binds the resolved method's return to a single name, so
+    there is no unpacking in the worker for a `None` reply to fail at; the sole
+    unpack is in the module that constructs the manager, which is the parent.
+    And `call_func` reads the output queue with no timeout, which is what makes
+    a reply that never arrives a park rather than an error.
+    """
+    module = ast.parse(ASYNC_PROC)
+    defs = {n.name: n for n in ast.walk(module) if isinstance(n, ast.FunctionDef)}
+    dispatched = [
+        node
+        for node in ast.walk(defs["busy_loop"])
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and getattr(node.value.func, "id", None) == "func"
+    ]
+    assert len(dispatched) == 1 and isinstance(
+        dispatched[0].targets[0], ast.Name
+    ), "busy_loop no longer binds the resolved method's reply to a single name"
+    reads = [
+        node
+        for node in ast.walk(defs["call_func"])
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "get"
+        and getattr(getattr(node.func, "value", None), "attr", None) == "outputs_queue"
+    ]
+    assert (
+        len(reads) == 1 and not reads[0].args and not reads[0].keywords
+    ), "call_func's read of the output queue is no longer a single untimed get"
+    assert any(
+        isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "AsyncIOProcManager"
+        for node in ast.walk(ast.parse((ENGINE / "engine_core.py").read_text()))
+    ), "engine_core.py no longer constructs the manager, so it is not the parent"
 
 
 def test_the_aggregating_form_is_the_one_bounded_wait():
@@ -350,11 +477,7 @@ def test_a_refusal_reaches_the_caller_instead_of_stranding_it():
     assert "_self.exit()" in ASYNC_PROC
 
     # The worker's own dispatch catches nothing, which is what kills it.
-    busy = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "busy_loop"
-    )
+    busy = _busy_loop()
     assert not [n for n in ast.walk(busy) if isinstance(n, ast.Try)]
 
     # SystemExit is queued before the manager finalizes its parent.
@@ -395,16 +518,15 @@ def test_the_binding_module_refuses_rather_than_composing_a_hole():
     Executing the device means importing the composed class, which imports
     `ModelRunner`, which runs aiter's architecture probe and needs a driver.
     So this asserts the device is wired up and not that it fires correctly;
-    that it fires correctly is a GPU-tier observation, recorded in the PR.
+    that it fires correctly can only be observed with a driver present.
     What is checked here is the part that can drift silently: that the message
     partitions the missing names on `RPC_SURFACE` instead of telling one story
     about all twelve, since two of them are waited on by nobody.
     """
-    src = (REPO / "atom/compass/runner/model_runner.py").read_text()
-    assert "unanswered_rpc_names(CompassModelRunner)" in src
-    assert "raise RunnerRefusal(" in src
-    assert "RPC_SURFACE[name]" in src
-    assert "not RPC_SURFACE[name]" in src
+    assert "unanswered_rpc_names(CompassModelRunner)" in COMPOSED
+    assert "raise RunnerRefusal(" in COMPOSED
+    assert "RPC_SURFACE[name]" in COMPOSED
+    assert "not RPC_SURFACE[name]" in COMPOSED
 
 
 # --- capture_cudagraph: the three values, taken from the unpack ---------------
@@ -447,14 +569,19 @@ def test_the_base_capture_reaches_a_device_before_it_reaches_the_model():
 
 def test_get_num_blocks_refuses_and_the_keys_its_caller_reads_are_named():
     site = SITES["get_num_blocks"][0]
-    tree = ast.parse((ENGINE / site.file).read_text())
-    required = {
-        n.slice.value
+    tree = ast.parse((REPO / site.file).read_text())
+    subscripts = [
+        n
         for n in ast.walk(tree)
-        if isinstance(n, ast.Subscript)
-        and getattr(n.value, "id", None) == "block_info"
-        and isinstance(n.slice, ast.Constant)
-    }
+        if isinstance(n, ast.Subscript) and getattr(n.value, "id", None) == "block_info"
+    ]
+    unread = [
+        f"{site.file}:{n.lineno}: {ast.unparse(n)}"
+        for n in subscripts
+        if not isinstance(n.slice, ast.Constant)
+    ]
+    assert not unread, f"a key the caller reads is not written as a literal: {unread}"
+    required = {n.slice.value for n in subscripts}
     optional = {
         n.args[0].value
         for n in ast.walk(tree)
@@ -475,7 +602,10 @@ def test_get_num_blocks_refuses_and_the_keys_its_caller_reads_are_named():
         if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict)
     )
     assert required | optional == returned
-    with pytest.raises(RunnerRefusal, match="memory model"):
+    # The four keys are now forwarded from the base rather than described in a
+    # refusal, so what is left to check on this side is that the one path that
+    # answers nothing still names what would make it answer.
+    with pytest.raises(RunnerRefusal, match="install_device_readings"):
         Runner().get_num_blocks()
 
 
@@ -515,14 +645,14 @@ def test_forward_refuses_and_its_reply_is_one_object_read_for_nine_attributes():
     """What a successor owes: one value, never unpacked, read by attribute.
 
     Four sites broadcast it, two per file. Three use the reply and the fourth
-    discards it -- `pp_engine_core.py:118`, the head's launch, whose tokens
-    come back over the transport instead. The nine attribute names are
+    discards it -- `PPEngineCoreProc._pp_head_step`, the head's launch, whose
+    tokens come back over the transport instead. The nine attribute names are
     recovered from the consumers rather than listed, so a tenth read, or a
     rename, fails here.
     """
     assert collections.Counter(s.file for s in SITES["forward"]) == {
-        "engine_core.py": 2,
-        "pp_engine_core.py": 2,
+        "atom/model_engine/engine_core.py": 2,
+        "atom/model_engine/pp_engine_core.py": 2,
     }
     assert {s.arity for s in SITES["forward"]} == {0, 1}
     engine = (ENGINE / "engine_core.py").read_text()
@@ -552,19 +682,19 @@ def test_forward_refuses_and_its_reply_is_one_object_read_for_nine_attributes():
         "num_bonus",
         "dspark_ell",
     }
-    with pytest.raises(RunnerRefusal):
+    with pytest.raises(RunnerRefusal, match="produces output"):
         Runner().forward(object())
 
 
 def test_the_pp_reply_is_read_in_the_head_and_not_at_the_last_stages_call():
     """The correction that a substring check cannot make.
 
-    `pp_engine_core.py:379` is inside `_downstream_busy_loop` -- the **last**
-    stage. Nothing there reads the reply: the two nearby `.req_ids` reads are
-    on `batch`, and `fwd_out` is handed whole to `send_tokens`. The `.req_ids`
-    read is one ZMQ hop later, in the head, at `:144-147`, on what
-    `recv_tokens()` returned at `:139`. So the reply must survive a pickle
-    round trip, which reading only the call site would never say.
+    The `forward` call in `PPEngineCoreProc._downstream_busy_loop` is in the
+    **last** stage. Nothing there reads the reply: the two nearby `.req_ids`
+    reads are on `batch`, and `fwd_out` is handed whole to `send_tokens`. The
+    `.req_ids` read is one ZMQ hop later, in the head's `_pp_head_step`, on
+    what `recv_tokens()` returned. So the reply must survive a pickle round
+    trip, which reading only the call site would never say.
     """
     tree = ast.parse((ENGINE / "pp_engine_core.py").read_text())
     enclosing = {}
@@ -612,9 +742,10 @@ def test_dummy_execution_is_this_runners_forward_and_refuses_with_it():
         for n in ast.walk(body)
     )
     assert body.body[-1].value.value is True
-    # Its one site returns the reply to its own caller (`engine_core.py:749`),
-    # which is a read and not a discard. Scoring it 0 is the modelling error
-    # `_arity` exists to avoid, and this is the site that catches it.
+    # Its one site returns the reply to its own caller
+    # (`DPEngineCoreProc._execute_dummy_batch`), which is a read and not a
+    # discard. Scoring it 0 is the modelling error `_arity` exists to avoid,
+    # and this is the site that catches it.
     assert [s.arity for s in SITES["dummy_execution"]] == [1]
 
 
@@ -643,23 +774,136 @@ def test_the_profiler_replies_are_forwarded_whole_and_never_unpacked():
     `ModelRunner.stop_profiler` documents a `{trace_dir, elapsed}` dict, and it
     is tempting to read that as the shape the call site requires. It is not.
     `engine_utility.py` logs the reply whole and puts it in a response
-    envelope; `llm_engine.py:300`'s `.get("result", {})` is on that envelope,
-    not on the reply; and `trace_dir` appears nowhere in the tree except the
-    three lines of `model_runner.py` that produce it. What the callers impose
-    is non-None and picklable. The keys are a convention a successor inherits,
-    and stating them as a requirement would be stating a tighter contract than
-    anything checks -- which is a documentation defect even when it errs safe.
+    envelope; `LLMEngine.stop_profile`'s `.get("result", {})` is on that
+    envelope, not on the reply; and `trace_dir` appears nowhere on either side of the
+    reply except the three lines of `model_runner.py` that produce it. What
+    the callers impose is non-None and picklable. The keys are a convention a
+    successor inherits, and stating them as a requirement would be stating a
+    tighter contract than anything checks -- which is a documentation defect
+    even when it errs safe.
+
+    The scan reads the engine and the Compass runner package -- the code this
+    reply crosses -- and not every package that will ever sit under
+    `atom/compass`. The three tests below hold it to both halves of that: it
+    still catches a mention inside the runner package, and it stays quiet
+    about one outside it.
     """
     assert {s.arity for s in SITES["start_profiler"]} == {1}
     assert {s.arity for s in SITES["stop_profiler"]} == {1}
-    producers = {
-        str(p.relative_to(REPO))
-        for p in (REPO / "atom").rglob("*.py")
-        if "trace_dir" in p.read_text()
+    assert _mentions(REPLY_SURFACE, "trace_dir") == {
+        "atom/model_engine/model_runner.py"
     }
-    assert producers == {"atom/model_engine/model_runner.py"}
     utility = (ENGINE / "engine_utility.py").read_text()
     assert '("UTILITY_RESPONSE", {"cmd": "stop_profile", "result": result})' in utility
+
+
+# --- the scan itself, which has to catch something and not everything --------
+
+
+FAKE_TREE = (
+    "atom/model_engine/model_runner.py",
+    "atom/compass/runner/overrides.py",
+    "atom/compass/spec/reader.py",
+)
+PRODUCER = FAKE_TREE[0]
+
+
+def _fake_repo(tmp_path, mentioning):
+    """A three-file stand-in repo, with `trace_dir` written into `mentioning`.
+
+    One call builds either direction of the pin. The roots handed back are
+    `REPLY_SURFACE` re-rooted under `tmp_path` rather than two paths written
+    out again here: a scan widened to `atom/` would be widened here too, and
+    the direction it is widened past -- the package beside the runner -- is the
+    third file. Roots typed out a second time would pin `_mentions` and leave
+    the scope free, which is what these two tests exist to stop.
+    """
+    for rel in FAKE_TREE:
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# trace_dir\n" if rel in mentioning else "pass\n")
+    return tuple(tmp_path / root.relative_to(REPO) for root in REPLY_SURFACE)
+
+
+def test_the_scan_looks_at_both_sides_of_the_reply():
+    """A scan narrowed until it reaches nothing would pass forever.
+
+    The producer and the two Compass runner modules are named here, so a root
+    that moves or a package that is renamed fails rather than quietly
+    shrinking the set the assertion above is computed over.
+
+    Naming files bounds the scan from below only, and every wider scope -- up
+    to `atom/` itself, which is the scope this one replaced -- satisfies a
+    lower bound. The second assertion is the upper one, and it is exact: the
+    roots are the engine and the runner package, each holding a
+    `model_runner.py` -- ATOM's, which produces the reply, and the Compass one
+    that stands in for it. A sibling added to the constant, `atom/compass/clock`
+    say, fails here instead of passing quietly.
+    """
+    scanned = {
+        str(path.relative_to(REPO))
+        for root in REPLY_SURFACE
+        for path in root.rglob("*.py")
+    }
+    assert {
+        "atom/model_engine/model_runner.py",
+        "atom/compass/runner/overrides.py",
+        "atom/compass/runner/model_runner.py",
+    } <= scanned
+    assert set(REPLY_SURFACE) == {ENGINE, PACKAGE}
+
+
+def test_the_scan_still_catches_the_string_inside_the_runner_package(tmp_path):
+    """Where the contract does reach, the assertion is the old assertion."""
+    roots = _fake_repo(tmp_path, {PRODUCER, "atom/compass/runner/overrides.py"})
+    assert _mentions(roots, "trace_dir", tmp_path) == {
+        PRODUCER,
+        "atom/compass/runner/overrides.py",
+    }
+
+
+def test_the_scan_ignores_a_compass_package_the_reply_never_reaches(tmp_path):
+    """The half a read of the whole tree gets wrong.
+
+    A module under `atom/compass` that the reply never touches may mention
+    `trace_dir` -- in a comment, in a docstring, in a field name of its own --
+    without failing a test about the profiler reply. Nor may the scan read a
+    root of its own when handed none: every file contains the empty string,
+    and handed no roots it finds nothing. A root added only when roots are
+    handed in, or only for a non-empty needle, passes every test in this file.
+    """
+    roots = _fake_repo(tmp_path, {PRODUCER, "atom/compass/spec/reader.py"})
+    assert _mentions(roots, "trace_dir", tmp_path) == {PRODUCER}
+    assert _mentions((), "") == set()
+
+
+@pytest.mark.parametrize("surface", [(), (ENGINE,), REPLY_SURFACE])
+def test_the_reply_assertion_scans_the_roots_the_constant_names(monkeypatch, surface):
+    """The tests above hold `REPLY_SURFACE`; this one holds its reader.
+
+    The scan is replaced by a spy that records the roots it is handed, and the
+    profiler-reply assertion runs with the constant set to `surface`: empty,
+    the engine alone, and the constant as it stands. The spy must see exactly
+    that surface each time. A root added beside the constant fails all three
+    runs, and the constant's two roots written out at the call site fail the
+    first two; a fallback for an empty constant fails the empty one; a root
+    that appears only when the constant is set, or one derived from every root
+    -- each root's parent, say -- fails the last two; one derived from the
+    Compass root alone -- its parent, all of `atom/compass` -- fails the last.
+    A scan that bypasses `_mentions` reaches the spy not at all. What passes is
+    any expression that is the identity at these three surfaces, the last of
+    which is the one the assertion runs at.
+    """
+    seen = []
+
+    def spy(roots, needle):
+        seen.append(roots)
+        return {"atom/model_engine/model_runner.py"}
+
+    monkeypatch.setitem(globals(), "REPLY_SURFACE", surface)
+    monkeypatch.setitem(globals(), "_mentions", spy)
+    test_the_profiler_replies_are_forwarded_whole_and_never_unpacked()
+    assert seen == [surface]
 
 
 def test_the_two_names_no_caller_waits_for_and_what_replying_costs():
@@ -689,6 +933,157 @@ def test_the_two_names_no_caller_waits_for_and_what_replying_costs():
     assert 'if func_name == "exit":\n                break' in ASYNC_PROC
 
 
+# --- the break at `exit` ---------------------------------------------------
+
+
+def test_the_break_on_exit_is_a_sibling_of_the_per_runner_loop():
+    """Where the break sits is the whole of why a hole at `exit` is not a hang.
+
+    Read off the structure rather than off the source text, because the
+    indentation *is* the claim: the `if` is a statement of the `while` body
+    beside `for runner in self.runners`, not a statement inside it. So it
+    fires on the name dequeued at the top of the iteration and consults no
+    reply -- a runner with no `exit` is skipped by the `getattr`, and the loop
+    still breaks.
+
+    The assertion in
+    `test_the_two_names_no_caller_waits_for_and_what_replying_costs` pins the
+    same two lines as an exact string. That catches the break moving one level
+    in, because its own indentation would change, but says nothing about what
+    the `if` is a sibling of or about what its test reaches. Both are here.
+    """
+    busy = _busy_loop()
+    loop = next(n for n in busy.body if isinstance(n, ast.While))
+    dispatch = next(n for n in loop.body if isinstance(n, ast.For))
+    guards = [
+        n
+        for n in loop.body
+        if isinstance(n, ast.If)
+        and isinstance(n.test, ast.Compare)
+        and getattr(n.test.left, "id", None) == "func_name"
+        and getattr(n.test.comparators[0], "value", None) == "exit"
+    ]
+    assert len(guards) == 1
+    guard = guards[0]
+    assert [type(n) for n in guard.body] == [ast.Break]
+    assert guard not in list(ast.walk(dispatch))
+    assert guard.col_offset == dispatch.col_offset
+    assert {n.col_offset for n in dispatch.body} == {dispatch.col_offset + 4}
+    dequeued = next(
+        n
+        for n in loop.body
+        if isinstance(n, ast.Assign)
+        and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "attr", None) == "get_func"
+    )
+    bound = {n.id for n in ast.walk(dequeued.targets[0]) if isinstance(n, ast.Name)}
+    reached = {n.id for n in ast.walk(guard.test) if isinstance(n, ast.Name)}
+    assert reached == {"func_name"} and reached <= bound
+
+
+def test_what_a_hole_at_exit_loses_is_what_exit_does():
+    """What shutdown fails to release, read off `ModelRunner.exit`'s own body.
+
+    The KV deletions are `hasattr`-guarded, and this runner allocates no KV
+    tensor, so they find nothing here; the guard is asserted too.
+    """
+    body = next(
+        n
+        for n in ast.walk(_classes(ATOM_RUNNER)["ModelRunner"])
+        if isinstance(n, ast.FunctionDef) and n.name == "exit"
+    )
+    # Statements of the body itself: a call inside a lambda, a branch or a
+    # nested def is one `exit` may never make.
+    calls = {
+        ast.unparse(n.value.func)
+        for n in body.body
+        if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+    }
+    assert {"destroy_dist_env", "torch.cuda.empty_cache"} <= calls
+    # And nothing leaves `exit` between them: its only ways out are the guard
+    # that opens it and the `return True` that closes it.
+    exits = sorted(
+        ast.unparse(n) for n in ast.walk(body) if isinstance(n, (ast.Return, ast.Raise))
+    )
+    assert exits == ["return", "return True"], f"exit leaves early: {exits}"
+    assert ast.unparse(body.body[-1]) == "return True"
+    deleted = {
+        ast.unparse(t)
+        for n in ast.walk(body)
+        if isinstance(n, ast.Delete)
+        for t in n.targets
+    }
+    assert "self.model" in deleted
+    literal_loops = [
+        n
+        for n in ast.walk(body)
+        if isinstance(n, ast.For) and isinstance(n.iter, (ast.Tuple, ast.List))
+    ]
+    assert len(literal_loops) == 1
+    kv = literal_loops[0]
+    unread = [ast.unparse(e) for e in kv.iter.elts if not isinstance(e, ast.Constant)]
+    assert (
+        not unread
+    ), f"line {kv.lineno} deletes names not written as literals: {unread}"
+    assert {e.value for e in kv.iter.elts} == {
+        "kv_cache",
+        "kv_scale",
+        "index_cache",
+        "mamba_k_cache",
+        "mamba_v_cache",
+    }
+    assert any(
+        isinstance(n, ast.If)
+        and getattr(getattr(n.test, "func", None), "id", None) == "hasattr"
+        for n in ast.walk(kv)
+    )
+
+
+def test_the_unanswered_helper_returns_one_list_its_one_caller_partitions():
+    """`unanswered_rpc_names` returns its list unpartitioned, and its only
+    caller in the package splits it on `RPC_SURFACE` before reporting it.
+    """
+    # Called by bare name or through a module, both are a call; any other
+    # mention -- an `import ... as`, a `partial`, a callback -- is a caller
+    # this cannot follow, so it is refused rather than left out of the count.
+    callers, unread = set(), []
+    for f in sorted((REPO / "atom").rglob("*.py")):
+        tree = ast.parse(f.read_text())
+        called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.alias) and n.name == "unanswered_rpc_names":
+                if n.asname:
+                    unread.append(f"{f.relative_to(REPO)}:{n.lineno}: as {n.asname}")
+                continue
+            if "unanswered_rpc_names" not in (
+                getattr(n, "id", 0),
+                getattr(n, "attr", 0),
+            ):
+                continue
+            if id(n) in called:
+                callers.add(str(f.relative_to(REPO)))
+            else:
+                unread.append(f"{f.relative_to(REPO)}:{n.lineno}: {ast.unparse(n)}")
+    assert not unread, f"the helper is reached other than by calling it: {unread}"
+    assert callers == {"atom/compass/runner/model_runner.py"}
+    tree = ast.parse(COMPOSED)
+    bound = next(
+        n.targets[0].id
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "id", None) == "unanswered_rpc_names"
+    )
+    splits = sorted(
+        ast.unparse(c.ifs[0])
+        for c in ast.walk(tree)
+        if isinstance(c, ast.comprehension)
+        and getattr(c.iter, "id", None) == bound
+        and c.ifs
+    )
+    assert splits == ["RPC_SURFACE[name]", "not RPC_SURFACE[name]"]
+
+
 def test_the_zero_block_form_in_the_tree_answers_two_of_the_four_keys():
     """A trap for whoever ends the `get_num_blocks` refusal above.
 
@@ -699,11 +1094,12 @@ def test_the_zero_block_form_in_the_tree_answers_two_of_the_four_keys():
     shortfall is invisible at zero blocks and not invisible above them, so the
     count is asserted here rather than left to be noticed.
 
-    The default is not neutral either. `block_manager.py:116-121` turns a
-    missing `pool_entries` into `num_state_slots = 0`, which is a decision
-    input at `:162` and in the permanent-unschedulable predicate at
-    `scheduler.py:1364-1376` -- so on a per-request-state model the missing key
-    reads as "no slots ever existed" rather than raising.
+    The default is not neutral either. `BlockManager.__init__` turns a
+    missing `pool_entries` into `num_state_slots = 0`, which decides there
+    whether state checkpoints are enabled, and is read again by the
+    permanent-unschedulable predicate in `Scheduler._warn_if_unschedulable`
+    -- so on a per-request-state model the missing key reads as "no slots
+    ever existed" rather than raising.
     """
     short = next(
         n

@@ -11,15 +11,15 @@ on, because until 2026-09-20 it was not — see "Which tree a script acts on" be
 
 | Script | Where | What |
 |---|---|---|
-| `gate_cpu.sh` | CPU container | The CPU test tier, run per task. 130 of 189 test files, no driver, ~31 s. **Must be green.** Also exits 98 when the diff is in the blind spot below and the GPU tier has not run on *this* tree. Refuses a caller-supplied `-r`. |
-| `gate_gpu.sh` | GPU container | The GPU test tier, run per wave — and per task for a blind-spot diff. Superset (`--ignore=tests/plugin`), judged as a **delta** against **4779 passed / 5 failed** at `fe9ea043c`, with torch, HIP, ROCm and AITER recorded and compared. The five failing node-ids are on file in `gpu_gate_known_failures.txt` and compared **by name**. Calls `preflight.sh` itself, before and after. |
-| `preflight.sh` | GPU container | `rocminfo` reachability, compute use and VRAM use (checks 1–3), plus a D-state census (check 0), and a list of bookable devices. Run **before and after**. The census states its own scope: in a container it can only see this PID namespace, and says so rather than reporting a clear node. Also worth running for a CPU-only task: on a wedged node ATOM's *import* hangs, because aiter shells out to `rocminfo`. |
+| `gate_cpu.sh` | CPU container | The CPU test tier, run per task: every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, no driver **as a batch**: run alone, a tier file can still reach `rocminfo` (`tests/test_postprocess_width.py` does, through `atom.model_engine.model_runner`'s `from aiter import …`; measured on node 18 at `bdd244c57`). **Must be green.** Also exits 98 when the diff is in the blind spot below and the GPU tier has not run on *this* tree. Refuses a caller-supplied `-r`. |
+| `gate_gpu.sh` | GPU container | The GPU test tier, run per wave — and per task for a blind-spot diff. Superset (`--ignore=tests/plugin`), judged as a **delta** against **4779 passed / 5 failed** at `fe9ea043c`, with torch, HIP, ROCm and AITER recorded and compared. The failing node-ids are on file in `gpu_gate_known_failures.txt` and compared **by name**. Calls `preflight.sh` itself, before and after. |
+| `preflight.sh` | GPU container | `rocminfo` reachability, compute use and VRAM use (checks 1–3), plus a D-state census (check 0), and a list of bookable devices. Run **before and after**. The census states its own scope: in a container it can only see this PID namespace, and says so rather than reporting a clear node. Also worth running for a CPU-only task that imports ATOM's model layer: `import aiter` runs `rocminfo`, and so does any module that imports aiter at load time (`atom.model_engine.model_runner`, `atom.model_ops.linear`), so on a wedged node that import hangs. A bare `import atom` and `atom.compass` run no `rocminfo` and load no torch; `atom.config`, `atom.model_engine.llm_engine` and `atom.entrypoints.openai_server` load torch but run no `rocminfo`. Measured on node 18, 2026-09-23. |
 | `regen_cpu_gate_exclude.sh` | CPU container | Regenerate the **GENERATED** section of the exclusion list by iterating `--collect-only` to a fixed point (three passes at `83daf636d`: 37 errors, 1, clean). Preserves the MANUAL section verbatim. |
 | `regen_gpu_gate_triggers.sh` | CPU container | Re-derive `gpu_gate_triggers.txt` from the exclusion list and the tree. Run after **any** change to `cpu_gate_exclude.txt` — the two files are derived from the same tree and are wrong separately. Writes the whole file, **header counts included**; nothing in it is maintained by hand. |
 | `snapshot.sh` | either | Build the `git archive` tarball a gate runs against (never `rsync`). Stamps `.compass-commit` (so output names its tree, and a `COMPASS_GPU_GATE_DONE` attestation can be checked) and `.compass-changed` (so the blind-spot question is answerable without `.git`). Refuses a dirty tree. |
 | `cpu_gate_exclude.txt` | — | **29** excluded test files in two marked sections: **28 GENERATED** (`# BEGIN GENERATED`, driver-dependent at *collection* time; never hand-edit — `regen_cpu_gate_exclude.sh` rewrites it wholesale) + **1 MANUAL** (`# BEGIN MANUAL`, collects cleanly then fails on a driver call, so the regenerator cannot see it). The MANUAL section **is** hand-edited; every entry must carry its observed failure above it. |
 | `gpu_gate_triggers.txt` | — | **30** source paths that no *running* CPU-tier test names. Generated, not hand-written; matched by `gate_cpu.sh`. A trailing `/` matches a subtree. |
-| `gpu_gate_known_failures.txt` | — | The five known-failing GPU node-ids at `fe9ea043c`, verbatim. Its line count and `BASE_FAILED` are two statements of one fact; `gate_gpu.sh` refuses to run if they disagree. |
+| `gpu_gate_known_failures.txt` | — | The known-failing GPU node-ids at `gate_gpu.sh`'s `BASE_COMMIT`, verbatim. Its line count and `BASE_FAILED` are two statements of one fact; `gate_gpu.sh` refuses to run if they disagree. |
 | `_lib.sh` | — | Tree resolution, `PYTHONPATH`, the `import atom` assertion, commit stamp, and the `tests/compass` pass count the GPU gate derives its allowed surplus from. |
 
 ## Gate a tree with its own `scripts/compass/` — four `test_snapshot_ref.py` failures mean you overlaid
@@ -96,8 +96,8 @@ figure is stale by construction between one task and the next, and it has twice
 been taken as a control by a task that then read the intervening tasks' tests as a
 surplus of its own. **A control is measured, not read**: run `gate_cpu.sh` on the
 integration head your branch forked from, in the same container, and state both
-figures beside their commits. The CPU row below does not name the commit it ran
-on, which is the omission that let it pass for current; the same gate on
+figures beside their commits. The CPU row below once named no commit, which is
+the omission that let it pass for current; the same gate on
 `68ef4f329` measured **4380 passed, 149 skipped, 3 xfailed, rc=0** — node 18,
 container `xiaobizh_n18_cpu`, 2026-09-22, 36.2 s of pytest inside 43.0 s of wall.
 
@@ -110,8 +110,8 @@ with a non-zero rc and no ±1.
 
 | Tier | Result | Measured |
 |---|---|---|
-| CPU gate (130 files) | **4030 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0, **identical in every run on 2026-09-21, the clock 25.4-31.7 s of pytest inside 31.1-37.8 s of wall (`time` real) — a measured spread, not a bound** — decomposing as **3956 ATOM + 74 `tests/compass`** | node 18, container `xiaobizh_n18_cpu`, 2026-09-21, **commit not recorded**, against a `git archive` snapshot with `PYTHONPATH` asserted and pytest's own rc captured before any pipe |
-| CPU gate (130 files), same tier, current | **4501 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0 — three runs, identical, 28.8-34.4 s of pytest inside 35-40 s of wall. The **4030** above and the **4380** in the paragraph above are this same gate at earlier trees; all three are history, and this one will be too | `186d12829` — the commit this branch forks from, which is its merge-base with the integration head, **read 2026-09-21T19:21Z**, node 18's own clock — node 18, container `xiaobizh_n18_cpu`, `git archive` snapshot staged by `snapshot.sh`, `PYTHONPATH` asserted, pytest's own rc captured before any pipe |
+| CPU gate, at `105ca4197` | **4030 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0 — decomposing as **3956 ATOM + 74 `tests/compass`**; the 3956 is PR #6's control, `042aad97d` with PR #6's `scripts/compass/` copied in, since `042aad97d` has none. Six runs at `d737f15e7` and `7ff80cc4b`, before PR #6's restack, read the same counts and **25.6-30.8 s of pytest inside 31.6-36.9 s of wall (`time` real) — a measured spread, not a bound** (`8c0ee374f`) | `105ca4197`, PR #6's head, landed as `4c16792d9` (same tree) — PR #6's gate table; node 18, container `xiaobizh_n18_cpu`, 2026-09-21, against a `git archive` snapshot with `PYTHONPATH` asserted and pytest's own rc captured before any pipe |
+| CPU gate, same tier, at `186d12829` | **4501 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0 — three runs, identical, 28.8-34.4 s of pytest inside 35-40 s of wall. The **4030** above and the **4380** in the paragraph above are this same gate at earlier trees; all three are history, and this one will be too | `186d12829` — the commit this branch forks from, which is its merge-base with the integration head, **read 2026-09-21T19:21Z**, node 18's own clock — node 18, container `xiaobizh_n18_cpu`, `git archive` snapshot staged by `snapshot.sh`, `PYTHONPATH` asserted, pytest's own rc captured before any pipe |
 | GPU superset (`--ignore=tests/plugin`) | **4779 passed, 5 failed**, 0 errors, 105 skipped, 3 xfailed, **72.6 s**; two runs, byte-identical failing sets | `fe9ea043c`, node 18, container `xiaobizh_n18`, `HIP_VISIBLE_DEVICES=1`, 2026-09-20, torch **2.10.0+rocm7.2.4.git3d3aa833**, `torch.version.hip` **7.2.53211**, ROCm release **7.2.4**, AITER **v0.1.21.dev0-49-gf4e7c7509** (`git describe`) |
 | `ruff check .` | 1003 errors, 640 fixable — the gate is *no new* error, not zero | `83daf636d` |
 | `black --check .` | clean, 660 files | `83daf636d` |
@@ -122,11 +122,12 @@ it is this directory.** `tests/compass/test_cpu_gate_exclude.py` parametrises
 one case each, so regenerating that file changes the pass count by exactly the
 change in the number of entries. The readings in circulation are the same gate
 under different exclusion lists and a different `tests/compass`, not discrepancies:
-**3925** at 32 exclusions; **3956** is the ATOM-only half; **3988** with
-`tests/compass` at 32; **4005** with it at 49; **4022** with it at 66 — 49 plus the 17
-extra trigger paths the corrected derivation below produces — and **4030** with it at 74,
-the 8 cases `test_gate_gpu_surplus.py` adds. The
-exclusion list went 32 → 29 because `test_dp_metadata.py`, `test_dp_sync_layout.py`
+**3925** at `83daf636d`, 32 exclusions and no `tests/compass`; **3956** is the
+ATOM-only half, at `042aad97d` above, and 3925 + 31; **4005** at `3afcb4880`, with
+`tests/compass` at 49; **4022** at `71d2a1ac2`, with it at 66 — 49 plus the 17 extra
+trigger paths the corrected derivation below produces — and **4030** at `105ca4197`,
+with it at 74, the 8 cases `test_gate_gpu_surplus.py` adds. The exclusion list went
+32 → 29, adding those 31, because `test_dp_metadata.py`, `test_dp_sync_layout.py`
 and `test_forward_mode.py` were re-measured **CPU-green**.
 
 **The five GPU failures are four ULP comparisons and one bitwise check** — not
@@ -188,8 +189,13 @@ does print `GATE_CPU_RC=` on stdout on every path, so the number survives in the
 *text* of an untruncated pipe — but only an unpiped run puts it in `$?`.
 
 **What those rates are, and are not.** n=21, node 18, container `xiaobizh_n18_cpu`,
-one branch, on a box whose load was not controlled — and all 21 runs were of **one
-method**, `test_the_cost_per_byte_does_not_grow`. Not-nominal combined is ~1 in 7.
+on a box whose load was not controlled. Those conditions, the table and its one test
+id, `test_the_cost_per_byte_does_not_grow`, are issue #93's. 19 of the 21 are pinned:
+PR #79's review (issue comment 5765186351) ran `b58a48cc2` 19 times, for 17 nominal,
+1 skip-variant and the one hard failure. The other 2, 1 nominal and 1 skip-variant
+by subtraction from the table, name no commit, so half the skip-variant rate rests
+on #93's count alone. #93 attributes the skip-variants to that test, but no
+skip-variant run named it (PR #99). Not-nominal combined is ~1 in 7.
 The finding is the third outcome, not the rate. The rates are a **lower bound on
 the class**, not a measurement of it: the class holds **3 methods / 4 collected
 cases** (one is parametrised `buffered-region` and `kimi-incremental`), of which
@@ -204,11 +210,13 @@ observed failing the same way — `qwen: cost per KB grew 1.73x from 32 to 128 K
 comment 5765660762), which hit it on its own gate run. A sequential re-run of that
 same tree passed at **4496**, and 1 + 4495 = 4496 accounts for it exactly. Inherited,
 not measured here — so the failure belongs to the mechanism and not to the one
-method the counts came from. The two skip-variants both occurred under
-`gate_cpu.sh`, and the one hard failure in the counts under direct pytest.
+method #93 names. Per #93, the two skip-variants both occurred under `gate_cpu.sh`,
+and the one hard failure in the counts under direct pytest; comment 5765186351
+gives only its mix, 7 gate + 12 direct.
 
-**Run gates sequentially.** The failure was reproduced with two gate loops
-overlapping on node 18. Two gates on one box compete for the CPU the control arm is
+**Run gates sequentially.** Per #93, the hard failure was reproduced when two gate
+loops on node 18 overlapped; #93 names neither that run's harness nor whether it
+is the one in the counts. Two gates on one box compete for the CPU the control arm is
 measuring, which is the condition this test is least able to survive — check for a
 running `gate_cpu.sh` before starting one.
 
@@ -245,22 +253,22 @@ still allowed — there nothing contradicts the caller, and it is how
 
 ## The CPU tier's blind spot — a file, and a gate
 
-`gpu_gate_triggers.txt` is the blind spot stated as paths a script can match:
-**30 source paths**, generated by `regen_gpu_gate_triggers.sh`. The rule it applies:
+`gpu_gate_triggers.txt` is the blind spot stated as paths a script can match,
+generated by `regen_gpu_gate_triggers.sh`. The rule it applies:
 
 > an `atom` module named by an excluded test is a blind spot **unless a CPU-tier
 > test that actually runs names it too**.
 
 Four decisions make that sentence operational. Three were forced by a defect or a
-counter-example this tree measured; the fourth, collection, currently changes no
-path and is kept as a forward guard:
+measured counter-example; the fourth, collection, changed no path at `236abfd9a`
+and is kept as a forward guard:
 
-1. **Indentation.** The parser anchored on `^`, and **190** of this tree's
-   `import atom.*` lines in non-plugin test files are indented — function-local and
+1. **Indentation.** The parser anchored on `^`, and at `fada7424e` **190** of the
+   `import atom.*` lines in non-plugin test files were indented — function-local and
    guarded imports are the dominant idiom here. It was reading about a third of the
    lines it claimed to read. The excluded side now reads any indentation.
 2. **Symbols.** `from atom.model_ops import eplb` parsed to the bare package
-   `atom.model_ops`, which resolved to the whole 106-file subtree and swallowed
+   `atom.model_ops`, which resolved to the whole subtree and swallowed
    every sibling entry. `from X import y` is now read as `X.y`, resolved to
    `X/y.py`, else `X/y/`, else `X.py`, else `X/__init__.py`. An `atom.*` reference
    that resolves to none of those is a **refusal**, not a warning: either the parser
@@ -280,12 +288,12 @@ path and is kept as a forward guard:
    `xiaobizh_n18_cpu`.
 4. **Collection.** A file that collects nothing covers nothing, so coverage is
    credited only from a CPU-tier file `--collect-only` shows collecting at least one
-   test. On **this** tree that probe removes no path: **30 triggers with it, 30
-   without, difference empty** (measured at `236abfd9a` in `xiaobizh_n18_cpu`; it
-   withholds 15 coverage paths, of which the only candidate,
-   `atom/model_ops/v4_kernels/state_writes.py`, is absorbed either way by the
+   test. At `236abfd9a` that probe removed no path: **30 triggers with it, 30
+   without, difference empty** (measured in `xiaobizh_n18_cpu`; it
+   withheld 15 coverage paths, of which the only candidate,
+   `atom/model_ops/v4_kernels/state_writes.py`, was absorbed either way by the
    candidate subtree entry `atom/model_ops/v4_kernels/`). It is a forward guard for
-   trees this one does not represent, not the thing that keeps `model_runner.py`, and
+   trees that one does not represent, not the thing that keeps `model_runner.py`, and
    it costs a full `pytest --collect-only` over the CPU tier plus a refusal path
    (exit 97).
 
@@ -385,18 +393,18 @@ shape of a measurement. The refusal names the omission instead.
 
 `gate_gpu.sh` judges an **equality**, not a floor: `BASE_PASSED` plus whatever
 `tests/compass/` contributes on the tree in front of it, minus what it contributed
-at the baseline (`BASE_COMPASS_TESTS=49`). A floor would be loosened by exactly the
+at the baseline (`BASE_COMPASS_TESTS`). A floor would be loosened by exactly the
 tests each task adds, so a task adding 30 tests while silently losing a 20-test file
 would still clear it.
 
 | this tree's `tests/compass/` | expected passes |
 |---|---|
-| absent | `4779 + 0 - 49` = **4730** — the figure a tree without this phase's tests measures |
-| present, N passing | `4779 + N - 49` |
+| absent | `BASE_PASSED + 0 - BASE_COMPASS_TESTS` — the figure a tree without this phase's tests measures, worked out beside the call in `gate_gpu.sh` |
+| present, N passing | `BASE_PASSED + N - BASE_COMPASS_TESTS` |
 | present, unreadable | **93** — a surplus with no source is not a measurement |
 
-The absent case is the common one: every tree except a Compass task's own has no
-such directory, the integration branch included. Deriving the surplus with
+The absent case is a tree without this phase's tests, as the integration branch
+was until `4c16792d9` added the directory. Deriving the surplus with
 `pytest tests/compass --collect-only` made that case exit 4 (`file or directory not
 found`), left the count empty and refused with `GATE_GPU_RC=93` before running a
 test — reproduced on `4da2f3a2d` and on PR #9's branch, so it was a property of the

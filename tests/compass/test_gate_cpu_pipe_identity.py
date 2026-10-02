@@ -45,7 +45,7 @@ def _rendered():
     for line in GATE.read_text().splitlines():
         if line == 'if [ "$RC" -ne 0 ]; then':
             inside = True
-        elif inside and line.strip() == 'finish "$RC"':
+        elif inside and line.strip().startswith('finish "$RC"'):
             break
         elif inside and line.strip().startswith("printf "):
             body.append(line)

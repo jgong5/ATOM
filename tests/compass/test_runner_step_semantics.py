@@ -45,6 +45,7 @@ from atom.sampling_params import SamplingParams
 REPO = pathlib.Path(__file__).resolve().parents[2]
 ATOM_RUNNER = REPO / "atom" / "model_engine" / "model_runner.py"
 OVERRIDES = REPO / "atom" / "compass" / "runner" / "overrides.py"
+COMPASS_RUNNER = REPO / "atom" / "compass" / "runner" / "model_runner.py"
 SCHEDULER = (REPO / "atom" / "model_engine" / "scheduler.py").read_text()
 
 # One request's prompt is three full token budgets plus a remainder, so each
@@ -80,11 +81,13 @@ class _Eager(DeferredTokenStream):
 
 
 def _drive(stream=None, ignore_eos=True, stop_token_ids=(), **overrides):
-    """ATOM's engine step, run to completion, in `engine_core.py:382-412`'s order.
+    """ATOM's engine step, run to completion, in the engine's own order.
+
+    The order is `EngineCore._process_engine_step_inner`'s.
 
     `ignore_eos` is a parameter because it decides whether the scheduler's own
     end-of-text and stop-token checks run at all: both are gated on
-    `not seq.ignore_eos` (`scheduler.py:2630` and `:2633`), so a run that
+    `not seq.ignore_eos` (`Scheduler.postprocess`), so a run that
     leaves it True says nothing about the id this runner reports.
     """
     spec = {**STREAK, **overrides}
@@ -96,6 +99,7 @@ def _drive(stream=None, ignore_eos=True, stop_token_ids=(), **overrides):
         max_num_batched_tokens=spec["budget"],
         enable_chunked_prefill=True,
         stop_token_ids=list(stop_token_ids),
+        pipeline_parallel_size=1,
     )
     scheduler = Scheduler(config)
     runner = _Runner(config, stream)
@@ -134,12 +138,12 @@ def _drive(stream=None, ignore_eos=True, stop_token_ids=(), **overrides):
                 if batch.is_final_chunk[i]:
                     final_chunk_at.setdefault(req_id, step)
         # Between `schedule()` and `forward` in the engine's own order
-        # (`engine_core.py:385`). It attaches the batch's attention aggregates
-        # in place and returns early unless profiling is active, so it moves
-        # nothing measured here -- it is called so that a successor extending
-        # this driver to a cost model inherits the loop and not a summary of
-        # it, since those aggregates are the batch-level attention terms such a
-        # model would read.
+        # (`EngineCore._process_engine_step_inner`). It attaches the batch's
+        # attention aggregates in place and returns early unless profiling is
+        # active, so it moves nothing measured here -- it is called so that a
+        # successor extending this driver to a cost model inherits the loop and
+        # not a summary of it, since those aggregates are the batch-level
+        # attention terms such a model would read.
         scheduler.compute_detailed_aggregates(batch, seqs)
         reply = runner.forward(batch)
         replies.append(reply)
@@ -312,7 +316,7 @@ def test_reporting_a_stop_id_lets_the_run_decide_the_length_it_predicts(run):
     """Driven with the scheduler's stop checks live, which the other runs are not.
 
     Every request in the default run sets `ignore_eos=True`, and both checks
-    are gated on `not seq.ignore_eos` (`scheduler.py:2630` and `:2633`). So
+    are gated on `not seq.ignore_eos` (`Scheduler.postprocess`). So
     that run would read exactly the same if every step reported the
     end-of-text id, and it is no evidence about the id this module picks. Here
     the checks run, against both ids they test for: reporting either one ends
@@ -371,14 +375,45 @@ def test_forward_keeps_inference_mode_and_drops_the_expert_load_monitor():
 
 def test_reporting_a_step_from_something_that_is_not_a_batch_refuses():
     with pytest.raises(RunnerRefusal, match="produces output"):
-        _Runner(MockConfig()).forward(object())
+        _Runner(MockConfig(pipeline_parallel_size=1)).forward(object())
 
 
-def test_a_speculative_config_is_refused_rather_than_reported_with_no_drafts(run):
-    """The zeros would be well-formed, which is the whole problem with them."""
-    speculative = _Runner(MockConfig(speculative_config=object()))
-    with pytest.raises(RunnerRefusal, match="speculative"):
-        speculative.forward(run.batches[-1])
+def test_a_speculative_config_is_refused_before_the_drafter_is_built(run):
+    """Refused while the model is being built, so the base never builds a drafter.
+
+    Constructing `CompassModelRunner` needs a driver, because importing ATOM's
+    runner runs aiter's architecture probe. So `_Base` stands in for
+    `ModelRunner.__init__` and records what runs after the model is built. The
+    order it copies is read from ATOM's source: `_build_and_load_model` is a
+    plain statement of `__init__`'s body, under no `if` or `try`, and it comes
+    before the statement that calls `build_drafter`. The composition it copies
+    is read from `CompassModelRunner`'s: its bases are `NonAllocatingRunner` then
+    `ModelRunner`, and its body binds neither `__init__` nor `_build_and_load_model`.
+    """
+    init = _function(ATOM_RUNNER, "ModelRunner", "__init__")
+    body = [ast.unparse(s) for s in init.body]
+    built = [s.startswith("self._build_and_load_model(") for s in body].index(True)
+    assert built < ["build_drafter(" in s for s in body].index(True)
+    runner = _class(COMPASS_RUNNER, "CompassModelRunner")
+    bases = [ast.unparse(b) for b in runner.bases]
+    assert bases == ["NonAllocatingRunner", "ModelRunner"]
+    bound = {getattr(n, "name", getattr(n, "id", None)) for n in ast.walk(runner)}
+    assert not bound & {"__init__", "_build_and_load_model"}
+
+    ran = []
+
+    class _Base:
+        def __init__(self, config):
+            self.config = config
+            self._build_and_load_model(object)
+            ran.append("build_drafter")
+
+    class _Composed(NonAllocatingRunner, _Base):
+        pass
+
+    with pytest.raises(RunnerRefusal, match="drafts no tokens"):
+        _Composed(MockConfig(speculative_config=object()))
+    assert ran == []
     # What the refusal is instead of: a reply nothing rejects, describing a run
     # in which nothing was drafted.
     reply = DeferredTokenStream(0)._reply(run.batches[-1], deferred=True)
@@ -390,8 +425,8 @@ def test_a_speculative_config_is_refused_rather_than_reported_with_no_drafts(run
 def test_forward_never_answers_none_and_so_never_parks_its_caller(run):
     """A present method that answers None parks the caller exactly like an absent one.
 
-    `async_proc.py:243` is `if out is not None:` with both of the loop's
-    `put_nowait` calls inside it -- pinned as structure in
+    `AsyncIOProc.busy_loop` has both of its `put_nowait` calls inside
+    `if out is not None:` -- pinned as structure in
     `test_runner_rpc_surface.py`. This is the other side of that: the first
     method on this surface with a body that returns, and the property that its
     body has no way out that answers None.
@@ -404,33 +439,64 @@ def test_forward_never_answers_none_and_so_never_parks_its_caller(run):
     assert forward.body[-1] is returns[0]
 
 
-def _function(path, class_name, name):
+def _class(path, name):
     tree = ast.parse(path.read_text())
-    cls = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.ClassDef) and n.name == class_name
-    )
     return next(
-        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name
+        n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == name
     )
+
+
+def _function(path, class_name, name):
+    body = _class(path, class_name).body
+    return next(n for n in body if isinstance(n, ast.FunctionDef) and n.name == name)
 
 
 def _decorators(path, class_name, name):
     return [ast.unparse(d) for d in _function(path, class_name, name).decorator_list]
 
 
+# The methods the reply is handed to whole. `postprocess` reads it under
+# `fwd_output`, which the walk below sees; `send_tokens` pickles it and reads
+# nothing. A hand-off to any other method is refused: it would read the reply
+# under a name this walk does not follow.
+HANDED_TO = ("postprocess", "send_tokens")
+
+
 def _reply_attribute_reads():
-    """Every attribute ATOM reads off a forward reply, from ATOM's own source."""
-    names = set()
+    """Every attribute ATOM reads off a forward reply, from ATOM's own source.
+
+    A read is `fwd_out.x` or `fwd_output.x`. The reply may also be handed on
+    whole -- passed positionally to one of `HANDED_TO`, returned, or tested
+    against `None`. Any other use of it, a `getattr`, an alias, a hand-off to
+    any other function or method, is refused by file and line: it
+    could read an attribute this set would never contain.
+    """
+    names, unread = set(), []
     for path in (REPO / "atom" / "model_engine").glob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text())):
-            if (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id in {"fwd_out", "fwd_output"}
+        tree = ast.parse(path.read_text())
+        parent = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Name)
+                and node.id in {"fwd_out", "fwd_output"}
+                and isinstance(node.ctx, ast.Load)
             ):
-                names.add(node.attr)
+                continue
+            up = parent[node]
+            handed_on = (
+                isinstance(up, ast.Return)
+                or ast.unparse(up) == f"{node.id} is None"
+                or (
+                    getattr(up, "func", None) is not None
+                    and getattr(up.func, "attr", None) in HANDED_TO
+                    and node in up.args
+                )
+            )
+            if isinstance(up, ast.Attribute):
+                names.add(up.attr)
+            elif not handed_on:
+                unread.append(f"{path.name}:{node.lineno}: {ast.unparse(up)}")
+    assert not unread, f"the forward reply is used in a form not read here: {unread}"
     return names
 
 
@@ -452,7 +518,7 @@ def test_the_reply_answers_every_attribute_atom_reads_off_one(run):
     }
     # Answered by building ATOM's own object rather than one shaped like it, so
     # a field this runner never sets still carries the default ATOM gives it.
-    runner = _Runner(MockConfig())
+    runner = _Runner(MockConfig(pipeline_parallel_size=1))
     runner.forward(run.batches[-2])
     reply = runner.forward(run.batches[-1])
     assert isinstance(reply, ScheduledBatchOutput)

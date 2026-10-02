@@ -210,3 +210,17 @@ try:
     import atom.kv_transfer.offload  # noqa: F401,E402
 except Exception as _e:  # pragma: no cover - offload optional (needs lmcache)
     logger.debug("lmcache_offload backend not registered: %s", _e)
+
+
+# Compass's simulated connector: it moves no bytes, pricing each transfer from
+# a machine spec and releasing it on a clock handed in through
+# kv_transfer_config. Named by module string like the backends above, so it
+# costs no import until it is selected, and it stages for P/D like the other
+# disaggregation backends because the deployment it stands in for does.
+KVConnectorFactory.register(
+    "compass",
+    worker_module="atom.compass.kv.connector",
+    worker_class="SimulatedKVConnector",
+    scheduler_module="atom.compass.kv.connector",
+    scheduler_class="SimulatedKVConnectorScheduler",
+)

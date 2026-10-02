@@ -29,7 +29,6 @@ class LpRegistry:
 
     def __init__(self) -> None:
         self._members: dict[LpId, None] = {}
-        self._ordered: tuple[LpId, ...] | None = None
 
     def register(self, lp_id: LpId) -> LpId:
         """Add one logical process. Refuses a duplicate rather than ignoring it.
@@ -42,21 +41,18 @@ class LpRegistry:
         if lp_id in self._members:
             raise ValueError(f"{lp_id} is already registered")
         self._members[lp_id] = None
-        self._ordered = None
         return lp_id
 
     def ids(self) -> tuple[LpId, ...]:
-        """Every registered identity, in the total order, cheapest to call repeatedly."""
-        if self._ordered is None:
-            self._ordered = tuple(sorted(self._members))
-        return self._ordered
+        """Every registered identity, in the total order."""
+        return tuple(sorted(self._members))
 
     def require(self, lp_id: LpId) -> LpId:
         """Return `lp_id`, or refuse with the names that are registered.
 
         Used wherever an unregistered identity would otherwise be accepted and
         turn into a missing row later, far from the call that introduced it. It
-        is the entry point the matrix funnels every identity through, so it
+        is the entry point the channel table funnels every identity through, so it
         type-checks for the same reason `register` does -- and because a bare
         `str` that reached the check below would be reported as not registered
         alongside the identically-spelled name that is.
@@ -76,6 +72,3 @@ class LpRegistry:
 
     def __len__(self) -> int:
         return len(self._members)
-
-    def __repr__(self) -> str:
-        return f"LpRegistry({', '.join(str(lp_id) for lp_id in self.ids())})"

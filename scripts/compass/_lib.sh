@@ -28,7 +28,7 @@ compass_enclosing_tree() {
 # compass-d78f3bbd3.tar stamped `commit: d78f3bbd3...`, exit 0, no warning. The
 # stamp was truthful about the tree it archived and silent about the tree the
 # caller was standing in -- a wrong answer carrying the full confidence of a
-# right one. All five callers of this function have the same exposure; for the
+# right one. Every caller of this function has the same exposure; for the
 # gates the consequence is worse than for snapshot.sh, since the result of a
 # pytest run would be attributed to a commit it did not come from.
 #
@@ -256,8 +256,8 @@ compass_describe() {
 # to its baseline, so a tree that carries Compass tests is judged by an equality
 # rather than by "no worse than".
 #
-# An ABSENT tests/compass/ is a count of zero, not a refusal. Every tree except a
-# Compass task's own has no such directory -- the integration branch included --
+# An ABSENT tests/compass/ is a count of zero, not a refusal. A tree without this
+# phase's tests -- as the integration branch was until 4c16792d9 -- has none,
 # and a gate that produces no verdict there cannot be used to show that a branch
 # is gate-neutral. REPRODUCED 2026-09-21 on 4da2f3a2d and on the branch of PR #9:
 # `pytest tests/compass --collect-only` exits 4 with `file or directory not
@@ -269,9 +269,9 @@ compass_describe() {
 # pass count, and the two diverge the moment tests/compass/ holds a skip or an
 # xfail -- which would read as a missing pass and fail a legitimately green tree.
 # Counting passes costs one extra pytest invocation over a CPU-only directory
-# (~1 s beside the superset's 72 s) and removes the condition entirely instead of
-# documenting it. What it assumes instead is narrower: that these tests give the
-# same result alone as inside the superset run.
+# and removes the condition entirely instead of documenting it. What it assumes
+# instead is narrower: that these tests give the same result alone as inside the
+# superset run.
 #
 # Anything else -- a failure, an error, an unparsable summary -- is a refusal.
 # The surplus would have no source, and a delta judged against a surplus that

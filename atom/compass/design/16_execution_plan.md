@@ -114,33 +114,31 @@ joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* sui
 - **Per task — the CPU tier, re-measured by P0.1 and superseding the counts above.**
   `tests/` minus `tests/plugin/` (30 files) minus the 29 driver-dependent files in
   `scripts/compass/cpu_gate_exclude.txt`, driven by `scripts/compass/gate_cpu.sh`:
-  **130 of this tree's 189 test files, 4030 passed, 0 failed, 149 skipped, 3 xfailed,
-  rc=0** — identical in every run taken on 2026-09-21 in `xiaobizh_n18_cpu` on
-  hjbog-srdc-18, where the clock read **25.4-31.7 s of pytest inside 31.1-37.8 s of
-  wall (`time` real)**, which is a measured spread rather than a bound: it tracks
+  **130 of the 189 test files at `105ca4197`, 4030 passed, 0 failed, 149 skipped, 3 xfailed,
+  rc=0** in `xiaobizh_n18_cpu` on hjbog-srdc-18. `105ca4197` is P0.1's head and landed as
+  `4c16792d9`, the same tree. Six runs at two of that branch's commits before its restack, `d737f15e7` and
+  `7ff80cc4b`, gave the same counts, and the clock read **25.6-30.8 s of pytest inside
+  31.6-36.9 s of wall (`time` real)**, which is a measured spread rather than a bound: it tracks
   what else is on the node. Run against a `git archive` snapshot of the tree, with
   `PYTHONPATH` asserted to resolve `atom` under that root and pytest's own exit status
-  captured before any pipe. The 4030 is **3956 ATOM tests + 74 `tests/compass/` tests**,
+  captured before any pipe. The 4030 at `105ca4197` is **3956 ATOM tests + 74 `tests/compass/` tests**,
   stated as its parts because a single total cannot show which half moved (principle 7). The
-  file count moves 128 → 130 and the test count 3956 → 4030 because this tree adds
-  `tests/compass/test_cpu_gate_exclude.py` and `tests/compass/test_gate_gpu_surplus.py`; the
-  P0.2 readings above are the same suite without them. The other totals in circulation are
-  the same suite under a different exclusion list or a different `tests/compass`, not
-  discrepancies: **3925** was 32 exclusions with
-  `tests/compass` at 35 tests, **3956** is the ATOM-only half at 29 exclusions, and **4005**
-  was this gate at `3afcb4880` with `tests/compass` at 49, and **4022** was it at 66. The
-  49 → 66 step is mechanical: `tests/compass/test_cpu_gate_exclude.py` parametrises one case
-  per entry of `gpu_gate_triggers.txt`, and correcting that file's derivation took it from 13
-  entries to 30. The 66 → 74 step is `tests/compass/test_gate_gpu_surplus.py`, added here.
-- **Green is the bar, but green is not "exercised".** Of the 130 files handed, **22 collect
+  3956 is P0.1's control, `042aad97d` with P0.1's `scripts/compass/` copied in and, like the
+  P0.2 readings above, no `tests/compass/`; `105ca4197` adds `tests/compass/test_cpu_gate_exclude.py`
+  and `tests/compass/test_gate_gpu_surplus.py`, so the file count moves 128 → 130. **4005** was the same gate at
+  `3afcb4880`, with `tests/compass` at 49 tests. The 49 → 74
+  growth is two steps: `tests/compass/test_cpu_gate_exclude.py` parametrises one case per
+  entry of `gpu_gate_triggers.txt`, and correcting that file's derivation took it from 13
+  entries to 30 (+17); `tests/compass/test_gate_gpu_surplus.py`, added here, is the other 8.
+- **Green is the bar, but green is not "exercised".** Of the 130 files handed at `105ca4197`, **22 collect
   no test at all**: 16 declare a device dependency, 3 need PyAV, 2 are dead since ATOM #690
   split `kv_transfer_engine` into `moriio` (`test_kv_connector_scheduler.py`,
   `test_transfer_engine.py`), and `test_prefix_cache_accuracy.py` has **no test function at
-  all** — it is an `argparse` script that drives a live server on `localhost:8000`. The 149
-  skips are 68 distinct reasons: 66 skipped tests name a device, 83 do not. That
-  decomposition was measured per file by P0.2 against an earlier tree, where the same 22 sat
-  inside a 128-file gate; the gate's own counts above supersede that file count, and the
-  split of the 22 stands because nothing since has changed which files hold runnable tests.
+  all** — it is an `argparse` script that drives a live server on `localhost:8000`. That
+  decomposition was measured per file by P0.2 at `b963c9411`, where the same 22 sat inside a
+  128-file gate whose 149 skips were 68 distinct reasons: 66 skipped tests name a device, 83
+  do not. Both carry to `105ca4197`: its `tests/` and code differ from `b963c9411`'s only by
+  the two `tests/compass/` files above, which collect tests and skip none.
 - **Per wave — the GPU superset, re-measured by P0.1.** `tests/ --ignore=tests/plugin` in the
   GPU container, driven by `scripts/compass/gate_gpu.sh`, judged as a **delta**, never as
   "green". The baseline is **4779 passed / 5 failed**, 0 errors, 105 skipped, 3 xfailed,
@@ -193,7 +191,7 @@ areas — EPLB, DP metadata, cudagraph bounds, block tables — which nothing re
 named two files (`test_dp_metadata`, `test_dp_sync_layout`) the CPU tier does in fact cover.
 It is now `scripts/compass/gpu_gate_triggers.txt`, **30 paths** in the tree committed here,
 generated by `regen_gpu_gate_triggers.sh` and never hand-edited — the counts in its own
-header included (189 test files, 130 CPU tier, 108 of them collecting, 47 candidates, 99
+header included (at `fada7424e`: 189 test files, 130 CPU tier, 108 of them collecting, 47 candidates, 99
 covered). The rule it applies: an `atom` module named by an excluded test is a blind spot
 **unless a CPU-tier test that actually runs names it too**. A module both tiers import is
 covered when the CPU gate runs, so triggering on it would make the gate cry wolf. A trailing
@@ -473,7 +471,8 @@ decision that belongs to the project owner, not to the agent that ran it.
 arrives with the options and their costs already worked out, so the decision is one round
 trip rather than a fresh analysis under time pressure.
 
-The halt rule (`AI_DEV_RULES.md`) is the general case: any surprise stops and is discussed.
+The stop-and-diagnose rule (`AI_DEV_RULES.md`) is the general case: any surprise stops and
+is diagnosed, and becomes an escalation only when it needs an owner ruling.
 
 Reaching any of these five, like the loop's halt above, is an escalation — so it applies
 `need human` too (`AI_DEV_RULES.md`), for the same reason: the stop should be visible on

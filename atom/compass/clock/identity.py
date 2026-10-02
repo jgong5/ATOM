@@ -41,7 +41,7 @@ class LpId:
             )
         if not self.name:
             raise ValueError("a logical process name must not be empty")
-        if self.name != self.name.strip() or any(c.isspace() for c in self.name):
+        if any(c.isspace() for c in self.name):
             raise ValueError(
                 f"a logical process name must not contain whitespace, got {self.name!r}; "
                 "names are written verbatim into the timeline record, one field per column"

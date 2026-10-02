@@ -280,7 +280,12 @@ class KvGeometry:
             text.hidden_size // text.num_attention_heads
         )
         if kv_dtype is None:
-            kv_dtype = getattr(text, "dtype", None) or text.torch_dtype
+            kv_dtype = getattr(text, "dtype", None)
+        if kv_dtype is None:
+            raise ValueError(
+                "this config states no `dtype` and no kv_dtype was given, so a "
+                "KV element has no size; name one of the two"
+            )
         return cls(
             layers=layers,
             kv_heads=kv_heads_per_rank(

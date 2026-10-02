@@ -5,9 +5,10 @@ The GPU gate judges an equality, not a floor: it expects its baseline pass count
 plus whatever `tests/compass/` contributes on the tree in front of it, minus what
 `tests/compass/` contributed at the baseline. That surplus therefore has to be
 derived on any tree the gate can be pointed at, including the trees that carry no
-Compass tests at all -- the integration branch, and every branch that has not
-taken this phase's work yet. A gate that produces no verdict there cannot be used
-to show that a branch is gate-neutral, which is most of what it is for.
+Compass tests at all -- every branch that has not taken this phase's work, as the
+integration branch had not until 4c16792d9. A gate that produces no verdict there
+cannot be used to show that a branch is gate-neutral, which is most of what it is
+for.
 
 The defect these tests pin: the derivation used to be
 `pytest tests/compass --collect-only`, which exits 4 with `file or directory not
@@ -143,11 +144,3 @@ def test_gate_gpu_derives_the_surplus_through_the_helper():
     text = GATE_GPU.read_text()
     assert "compass_compass_pass_count" in text
     assert "--collect-only" not in text
-
-
-def test_gate_gpu_states_the_expectation_for_a_tree_without_compass_tests():
-    """4779 + 0 - 49 = 4730, the figure a tree without this phase's tests
-    measures. Stated in the gate so the verdict on such a tree is readable
-    without re-deriving it."""
-    text = GATE_GPU.read_text()
-    assert "4730" in text

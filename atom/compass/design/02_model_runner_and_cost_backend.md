@@ -26,8 +26,8 @@ enough that it does not become a maintenance burden against upstream ATOM.
 
 | Cut | Where | Replaces | Verdict |
 |---|---|---|---|
-| `ModelRunner.run_model()` | `model_runner.py:2840-3060` | `model(input_ids, positions)` + `compute_logits` | **Rejected.** Returns `(logits, hidden_states)` as real tensors that `postprocess` indexes, samples and gathers logprobs from. Faking it still requires a `[bs, vocab]` device allocation. |
-| `ModelRunner.forward()` | `model_runner.py:3233-3320` | the whole forward, sampling included | **Chosen.** Its contract is `ScheduledBatch` in, `ScheduledBatchOutput` out — both pure numpy/list/int, already pickled across the worker boundary. |
+| `ModelRunner.run_model()` | `model_runner.py::ModelRunner.run_model` | `model(input_ids, positions)` + `compute_logits` | **Rejected.** Returns `(logits, hidden_states)` as real tensors that `postprocess` indexes, samples and gathers logprobs from. Faking it still requires a `[bs, vocab]` device allocation. |
+| `ModelRunner.forward()` | `model_runner.py::ModelRunner.forward` | the whole forward, sampling included | **Chosen.** Its contract is `ScheduledBatch` in, `ScheduledBatchOutput` out — both pure numpy/list/int, already pickled across the worker boundary. |
 | whole-runner replacement via `Config.runner_qualname` | `config.py:1595` | weights, KV tensors, CUDA graphs, sampling | **Chosen as the delivery mechanism** for the above. |
 
 ### Decision
@@ -36,16 +36,15 @@ enough that it does not become a maintenance burden against upstream ATOM.
 
 `Config.runner_qualname` (`atom/config.py:1595`) is consumed at `engine_core.py:125-130`
 and `async_proc.py:166-169`. It already has two in-tree users —
-`atom/rollout/async_engine.py:26-32` injects `RLHFModelRunner`, and `config.py:1729-1736`
-swaps in `RapidServeModelRunner` automatically. **The injection itself requires no ATOM
-change.**
+`atom/rollout/async_engine.py:26-32` injects `RLHFModelRunner`, and `Config.__post_init__`
+(`config.py:1730-1736`) swaps in `RapidServeModelRunner` automatically. **The injection
+itself requires no ATOM change.**
 
-`RapidServeModelRunner` (`model_runner.py:4168-4298`) is a working template for a
+`model_runner.py::RapidServeModelRunner` is a working template for a
 non-allocating runner already in the tree. It overrides exactly the memory-owning
-methods: `_build_and_load_model` (`:4218`), `_maybe_warmup` (`:4232`),
-`_kv_budget_extra_reserve` (`:4239`), `get_num_blocks` (`:4245`),
-`allocate_kv_cache` (`:4261`), `forward` (`:4269`) — and constructs parameters on meta
-through `_init_weight_params_on_meta` (`:4188-4211`).
+methods: `_build_and_load_model`, `_maybe_warmup`, `_kv_budget_extra_reserve`,
+`get_num_blocks`, `allocate_kv_cache` and `forward` — and constructs parameters on meta
+through `model_runner.py::RapidServeModelRunner._init_weight_params_on_meta`.
 
 ### The RPC surface that must be honoured
 
@@ -55,9 +54,16 @@ runner must answer all of: `get_num_blocks`, `allocate_kv_cache`, `capture_cudag
 `async_proc_aggregation`, `start_profiler`, `stop_profiler`, `flush_pp_send`.
 
 **Return contracts are load-bearing across a process boundary.** `engine_core` calls
-`capture_cudagraph` with `wait_out=True` and unpacks three values; a stub that returned
-`None` killed the worker on an unpacking error while the parent waited forever. **Across
-a process boundary a breached contract becomes a hang, not a traceback.**
+`capture_cudagraph` with `wait_out=True` and unpacks three values — in the parent, at
+`engine_core.py:149`, not in the worker. The two ways that contract breaks do not fail
+alike. A reply of the wrong **shape** arrives and raises where it is unpacked,
+in-process and with a traceback. A reply that never **arrives** queues nothing: a name
+the runner does not define is skipped by `busy_loop`, a method that answers `None` is
+called and its result declined, and `call_func`'s `outputs_queue.get()` takes no
+timeout either way. That silence parks somebody only where somebody is waiting: ten of
+the twelve names above have a caller that waits for the reply, and `exit` and
+`process_kvconnector_output` do not. `atom/compass/runner/overrides.py` carries the
+third case — a method that raises — and the table of which names wait.
 
 ### Three semantics `forward()` must reproduce
 
@@ -75,7 +81,8 @@ a process boundary a breached contract becomes a hang, not a traceback.**
    step for step (mean 8.99 s vs a real 9.00 s).
 3. **`produces_output()`** (`scheduler.py:823-840`): a pure-middle-chunk prefill batch
    must return an **empty** `token_ids` list with the same `req_ids`, mirroring
-   `model_runner.py:3298-3305`.
+   the early `return ScheduledBatchOutput(...)` in
+   `model_runner.py::ModelRunner.forward`.
 
 Speculative decoding adds `num_rejected` / `num_bonus` sized `batch.total_seqs_num` and
 `draft_token_ids` shaped `[bs, mtp_k]`. ATOM's existing `synthetic_acceptance_rates` path
@@ -110,9 +117,9 @@ missing is a statement of which combination Compass uses, and when.
 | Piece | Where | What it does |
 |---|---|---|
 | `--load_dummy {empty,zero,xavier}` | `config.py:1556`, `arg_utils.py:69,260`, `loader.py:126,234,289-307` | skips the checkpoint read; `empty` leaves params uninitialised, the others fill them with finite values in place |
-| `_init_weight_params_on_meta` | `model_runner.py:4188-4211` | wraps `Module.register_parameter` so every `nn.Parameter` is replaced by a meta tensor as it is registered |
+| `_init_weight_params_on_meta` | `model_runner.py::RapidServeModelRunner._init_weight_params_on_meta` | wraps `Module.register_parameter` so every `nn.Parameter` is replaced by a meta tensor as it is registered |
 | `no_init_weights` | `models/utils.py:457-496` | uses `torch.device("meta")` as a **context manager**, so construction itself lands on meta - no transient, no GPU, and it covers buffers. **Currently unused in ATOM.** |
-| `RapidServeModelRunner._build_and_load_model` | `model_runner.py:4218` | the override point where a runner declines to load |
+| `RapidServeModelRunner._build_and_load_model` | `model_runner.py::RapidServeModelRunner._build_and_load_model` | the override point where a runner declines to load |
 
 #### Why `_init_weight_params_on_meta` allocates on the real device, despite its name
 
@@ -138,7 +145,7 @@ CUDA IPC and recomputes RoPE caches locally.
 **So it is not a bug.** It is a deliberate trade — a one-parameter transient bought in
 exchange for real buffers and unchanged init branches — and for its use case the trade is
 clearly right. It avoids what the call site calls *"the transient 2x-weights peak that
-OOMs at TP=4"* (`model_runner.py:4222-4226`), which is the thing that mattered there.
+OOMs at TP=4"* (in `model_runner.py::RapidServeModelRunner._build_and_load_model`), which is the thing that mattered there.
 
 Worth noting for anyone reading that code: the call site says construction *"allocates
 zero GPU bytes"* while the helper says one parameter is transiently real. Both are true of

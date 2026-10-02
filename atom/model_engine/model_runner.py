@@ -627,6 +627,20 @@ class tokenIDProcessor:
         return ret
 
 
+class DeviceMemoryReadings(NamedTuple):
+    """What `get_num_blocks` knows about the device before any arithmetic.
+
+    Four figures with the same units and the same type, so a tuple of them is
+    easy to unpack in the wrong order; naming them makes that a typo the reader
+    can see.
+    """
+
+    free: int
+    total: int
+    peak_torch: int
+    non_torch: int
+
+
 class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
@@ -1649,13 +1663,16 @@ class ModelRunner:
         """
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
-    def get_num_blocks(self) -> dict[str, object]:
-        torch.set_default_device(self.device)
-        config = self.config
-        hf_config = config.hf_config
-        if not hasattr(hf_config, "head_dim") or hf_config.head_dim is None:
-            hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+    def _read_device_memory(self) -> DeviceMemoryReadings:
+        """The four device figures the KV budget is computed from.
 
+        Override point, and the only place `get_num_blocks` touches the device
+        allocator: everything below this call in that method is arithmetic over
+        these four numbers, `_estimate_cudagraph_overhead` and
+        `_kv_budget_extra_reserve`, which are override points already. A runner
+        that sizes a pool for a card it is not running on replaces this and
+        leaves the budget formula where it is.
+        """
         free, total = torch.cuda.mem_get_info()
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
@@ -1664,6 +1681,16 @@ class ModelRunner:
         # RCCL/NCCL buffers etc. held outside the allocator: device-used minus
         # torch-reserved. Ignoring it over-allocates KV and OOMs at runtime.
         non_torch = max((total - free) - torch.cuda.memory_reserved(), 0)
+        return DeviceMemoryReadings(free, total, peak_torch, non_torch)
+
+    def get_num_blocks(self) -> dict[str, object]:
+        torch.set_default_device(self.device)
+        config = self.config
+        hf_config = config.hf_config
+        if not hasattr(hf_config, "head_dim") or hf_config.head_dim is None:
+            hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+
+        free, total, peak_torch, non_torch = self._read_device_memory()
 
         cudagraph_overhead = self._estimate_cudagraph_overhead()
         safety_margin = int(total * 0.02)

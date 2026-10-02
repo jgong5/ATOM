@@ -61,6 +61,12 @@ evidence about another until it is shown to transfer.
 
 ## D90. DP — the step shape is decided by a collective, and that is the design problem
 
+> **Replaced in part by the owner's DP ruling of 2026-10-01**
+> ([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)): the step is
+> the `max` over ranks of each rank's own cost, exchanged by one `all_reduce(MAX)` inside
+> the forward, and every DP rank holds its own LP runtime, joined by the CA. Where this
+> section differs, the ruling holds; #532 rewrites it.
+
 ### Q2 first, because it is the one with teeth
 
 DP is the only strategy that couples **scheduling decisions** across ranks. Under DP, the
@@ -130,11 +136,10 @@ Consequences:
 2. **The DP group stays one LP** (`01` D3), and the shape collective is a *second* barrier
    confirming it: with a blocking all-gather at the head of every forward, DP ranks cannot
    drift by more than one step.
-3. **It is a category-A or category-B wait** in `01` D4's taxonomy, and which one depends
-   on where the LP boundary falls. Since the DP group is one LP, the collective is
-   **internal to an LP** — so by `01` D4's own rule it is **ignored**: its duration is not
-   observable in the simulated result as a cross-LP wait. What *is* charged is its cost,
-   as a priced collective (Q3 below).
+3. **Both collectives are internal to the LP, and neither is ignored** (revised
+   2026-09-28, #443). Neither is a cross-LP wait the CA sees. The lockstep `all_reduce`
+   (`DPEngineCoreProc._sync_dp_state` in `atom/model_engine/engine_core.py`) is an event
+   cost (`01` D4, K1). Every collective's own cost is priced (Q3 below).
 
 ### Q1, Q3, Q4
 
@@ -169,7 +174,7 @@ Two things follow:
 
 Each PP stage is its own `EngineCore` (`01` D1: `dp_size × pp_size` engine cores), and
 stages communicate by point-to-point transfer rather than by a barrier — so `01` D3's
-collapse rule does **not** absorb them. PP degree `P` multiplies the LP count by `P`.
+collapse rule does **not** absorb them. PP degree `P` turns each engine LP into `P` LPs.
 
 The lookahead between adjacent stages is the p2p latency, which is **microseconds**. That
 is the expensive case for a conservative protocol: small lookahead means frequent grants.
@@ -190,25 +195,170 @@ without adding a decision coupling — the opposite trade to DP.
 
 ### Q3: cost — the transfer is a size, not a tensor
 
-ATOM's PP transport (`atom/distributed/pp_comm.py`):
+ATOM's PP send (`atom/distributed/pp_comm.py`):
 
 | Call | Nature |
 |---|---|
-| `send_intermediate_tensors` (`:96-101`) | **blocking** send of `hidden_states` / `residual` to the next stage |
-| `async_send_intermediate_tensors` (`:127-157`) | non-blocking `isend`, metadata then buffers |
-| `commit_pp_send_work` (`:159-162`) | blocks until in-flight `isend`s complete |
-| `pp_send_allgather_group` (`:28-38`) | TP group for PP send-allgather, `None` if disabled or tp=1 |
+| `async_send_intermediate_tensors` | non-blocking `isend`s: the metadata list through `_async_send_object`, then each tensor |
+| `_async_send_object` | two gloo `isend`s on the PP CPU group: a one-element size tensor, then the pickled object |
+| `commit_pp_send_work` | blocks until the in-flight `isend`s complete |
+| `pp_send_allgather_group` | TP group for PP send-allgather, `None` if disabled or tp=1 |
 
-`flush_pp_send` is already in the RPC surface a replacement runner must answer (`02` D10).
+`send_intermediate_tensors`, the blocking variant, has no caller under `atom/`.
+
+**The send is asynchronous, and when it completes can depend on the receiver** (revised
+2026-09-30, owner ruling, #443). The stage waits for its last send in two places: before
+it issues the next one (`commit_pp_send_work`, called from `ModelRunner.run_model`), and
+when its loop is idle (`flush_pp_send`, called from `PPEngineCoreProc._pp_head_step` when
+the head launched nothing this round and from `_downstream_busy_loop` when a downstream
+stage received nothing). Which clock bounds that completion is decided by the transport's
+protocol for the message's size, the standard MPI-level PDES treatment (SimGrid SMPI's
+`smpi/send-is-detached-thresh`, SST/macro, CODES):
+
+- **Duration** comes from a LogGP-style cost model per carrier: latency `L`, per-message
+  overhead `o`, per-byte time `G`, bytes from geometry (below).
+- **Eager** (bytes up to the carrier's `eager_threshold_bytes`): the send completes on the
+  sender's clock at `t_send + o + bytes × G`. The receiver plays no part.
+- **Rendezvous** (larger): a part completes at `max(t_send, r_i) + T`, `T` the rendezvous
+  duration for its size and `r_i` the time the next stage posts that part's receive, which
+  only the next stage's LP knows; the first part's is `t_recv_posted`. The send's `done` is
+  the latest completion over its parts (How the parts combine, below).
+
+**A cross-LP dependency arrives as a message** (conservative PDES). Two channels join
+adjacent stages, each on a path the real system has: the stage-to-stage send itself, and
+the completion that the receiving transport (RCCL or gloo) returns to the sender. PP runs
+only with one DP rank (`CoreManager.__init__` rejects PP with DP), so `#dp0` is the only
+instance. The `pp_transport.py` channels (`meta`, `tokens`, `kv_status`) are listed
+with the others in `01` D3.
+
+| Channel | Sent | Stamped | Received |
+|---|---|---|---|
+| `stage(k)->stage(k+1):pp_data#dp0` | at stage k's send point | `t_send + L_data` | before stage k+1's forward computes |
+| `stage(k+1)->stage(k):pp_ack#dp0` | by stage k+1, rendezvous sends only | `done` | at stage k's pre-send wait and idle flush |
+
+**Lookahead of `pp_ack`.** The receiver can compute `done` only once it holds the data
+message and has posted its receive, at `now_r = max(t_recv_posted, t_send + L_data)`, and
+the ack is valid only if `done >= now_r + L_ack` for every send. If
+`t_recv_posted >= t_send + L_data`, then `done - now_r = T`. Otherwise
+`now_r = t_send + L_data` and `done - now_r = max(0, t_recv_posted - t_send) + T - L_data`,
+smallest when the receive was posted no later than the send. So the largest valid
+lookahead is
+
+    L_ack = T_min - L_data
+
+with `T_min` the smallest rendezvous duration on any carrier (the one at its threshold).
+The two channels' lookaheads sum to `T_min`: the ack makes the stage-to-stage cycle no
+tighter than the rendezvous itself. `L_data` is declared as the smallest carrier
+`latency_s` (`L`). It moves no modelled time, because the receiver's clock goes on to the
+end of the receive (below), which is at least `t_send + L_data`; it only decides how the
+cycle's lookahead is split. The channel table refuses, by name, either channel with a
+non-positive lookahead (README principle 6): a zero-lookahead coupling belongs inside one
+LP (`01` D4).
+
+- `L_ack <= 0`, i.e. `T_min <= L_data`: the calibration says a rendezvous completes
+  before its request could reach the receiver, which no rendezvous does. The refusal
+  names both values.
+- A carrier's `latency_s <= 0`: `L_data` is then not positive and `pp_data` has no
+  lookahead. The refusal names the carrier and its value.
+
+**Eager sends take no ack.** An eager completion `t_send + o + bytes × G` can lie before
+the receiver's clock (a receiver that posts late), so an ack stamped with it would break
+any positive lookahead. The sender computes it itself, and both waits advance to it (K1's
+rule).
+
+**The step loop keeps the forward's compute overlap.** On the device, the previous send
+runs while the next forward computes; the forward then waits for it and sends. At a
+non-last stage's forward call site, after the runner answers the compute time `c` and the
+payload of send `n`:
+
+1. `advance_to(t0 + c)`, TAR to the end of compute. The previous send's `pp_ack`, if
+   stamped at or before `t0 + c`, is released during this TAR, which is the common case.
+2. If that send was rendezvous and its ack is not yet released, the loop receives it
+   inline: NER until the grant releases `(pp_ack, n-1)`, its clock reaching `done`. If it
+   was eager, `advance_to` its local completion when that is later than now.
+3. The loop issues send `n` at `t_send = max(t0 + c, done)` and registers `(pp_data, n)`
+   (K4), noting whether it is eager (a local completion) or rendezvous (an ack to receive).
+
+So the forward still costs `max(compute done, previous send done) - start`, but a
+rendezvous send's completion now comes from the receiver. At a downstream stage's forward
+call site, before the runner is called and with `t_recv_posted` the loop's clock there,
+the loop receives `(pp_data, n)` inline (its clock reaching `now_r`). If any part of the
+send is rendezvous it registers `(pp_ack, n)` stamped `done` (K4). Either way it then
+advances to the end of the receive (below), and the forward computes as usual.
+
+**The idle flushes are channel receives (`01` D4, K5).** At both idle call sites the loop
+first settles the pending send: an inline receive of its `pp_ack` if it was rendezvous, an
+advance to its local completion if it was eager, nothing if no send is pending. ATOM's own
+`flush_pp_send` call then runs, and the simulated runner answers it at once (`02` D10). The
+shutdown call in `_downstream_busy_loop` is the same call as the idle one and shares its
+answer; it runs after the `+inf` grant that closes the simulation window, where
+`advance_to` and `next_event` raise (#533), so it settles nothing and sharing changes
+nothing. The head's shutdown call
+in `_head_busy_loop` runs there too. `commit_pp_send_work`'s own
+`wait()` is inside the replaced runner and never runs.
+
+**Carrier.** A simulated runner sends no tensors, so both channels ride gloo
+point-to-point on the PP CPU group (`get_pp_group().cpu_group`) between the TP-rank-0
+workers of adjacent stages: the group and the endpoints ATOM's `_async_send_object` sends
+the metadata on, and aiter's `GroupCoordinator.recv_tensor_dict` reads with
+`recv_object`. The stage loop stamps, registers and releases every frame; the worker only
+moves bytes, through two simulated-runner methods the loop calls (send one frame, receive
+one frame), an engine-to-worker RPC inside the LP like every other (K6). The send only
+posts the `isend` and never waits for it, or the loop would wait on the receiving stage
+where the CA cannot see it; the receive runs only after a grant released the frame, which
+is then registered and in flight, so it waits a bounded time. Chosen because it
+is the real path between the real endpoints, adds no socket, process or address, exists in
+every PP run, runs on the CPU (README principle 2) and is ordered per pair. Not chosen: a
+socket between adjacent stage loops, which ATOM does not have (`PPStageTransport` joins
+the head to each stage and each stage to the head), so it would add a channel; and the
+`meta` frame, which the head sends before its own forward and so cannot carry stage k's
+send time.
+
+**Which sends are which regime.** `async_send_intermediate_tensors` makes one stage send
+out of several parts, and each part's carrier is ATOM's:
+
+- `_async_send_object` puts the size tensor and the pickled metadata list on the PP CPU
+  group: the gloo carrier, bytes = the pickled length.
+- `hidden_states`, `residual` and, when a PP boundary splits a DSA IndexShare group,
+  `sparse_kv_indices` are device tensors on `pp.device_group`: the RCCL carrier. Bytes are
+  tokens × hidden × dtype size for `hidden_states` and `residual`, and tokens ×
+  `_pp_index_topk` int32 indices for `sparse_kv_indices` (`ModelRunner.run_model`). With
+  `pp_send_allgather_group` on, a tensor whose element count divides by the TP width is
+  sent as its shard, a TP-width fraction of those bytes. A small decode batch can fall
+  under the threshold, so the regime is decided per send, not per site.
+- a CPU tensor in the list goes on the PP CPU group, the gloo carrier.
+- an empty tensor is skipped on both sides and is no part.
+
+**How the parts combine.** The sender posts every part at `t_send`. The receiver,
+`GroupCoordinator.recv_tensor_dict`, takes them in order: the size and the metadata through
+`recv_object` (blocking gloo receives of the size, then the object), then each tensor in list order, and it posts a
+part's receive only when the previous part is done. With `r_1 = t_recv_posted` and parts
+`i` in that order:
+
+- an eager part arrives at `a_i = max(r_i, t_send + L + o + bytes × G)`, and its sender
+  side is done at `t_send + o + bytes × G`;
+- a rendezvous part ends on both sides at `a_i = max(t_send, r_i) + T`;
+- the next receive is posted at `r_(i+1) = a_i + g_i`, where `g_i` is the TP-wide
+  all-gather that the receiving stage runs right after receiving a sharded tensor (an
+  ordinary priced collective on the receiver's time), else 0.
+
+The receive ends at the last part's `a_i + g_i`. The send takes an ack when any part is
+rendezvous, and `done` is the latest sender-side completion over its parts; `(pp_data, n)`
+carries each part's carrier and bytes, so the receiver computes both. The lookahead
+derivation still holds: every `r_i >= t_recv_posted`, so `done` is at least
+`max(t_send, t_recv_posted) + T_min`, the only bound it uses.
 
 **The payload is `hidden_states` + `residual` — real tensors that a simulated run never
-materialises.** So PP transfer is treated exactly like KV transfer (`01` D6): a **size
-computed from geometry** (`tokens × hidden × dtype`, plus residual) divided by the
-interconnect bandwidth from the machine spec, plus its latency. Priced from the spec, not
-measured, which is what keeps interconnect configurable.
-
-The metadata `isend`s are latency-only. The `pp_send_allgather_group` path adds a TP-wide
-all-gather before the send when enabled, which is an ordinary priced collective.
+materialises.** So its size is computed from geometry, as for KV transfer (`01` D6). The
+single intra-node latency and bandwidth of the machine spec do not tell carrier from
+protocol, so each carrier (`rccl`, `gloo`) gets these fields under
+`interconnect.intra_node.pp.<carrier>`: `eager_threshold_bytes`, `latency_s` (`L`),
+`overhead_s` (`o`), `per_byte_s` (`G`) and `rendezvous_fixed_s`, the size-independent part
+of `T = rendezvous_fixed_s + bytes × G`. So `T_min` is `T` at the threshold. PP is
+single-node (every PP address is ZMQ IPC), hence the intra-node section. The fields are
+optional in the schema and required by a PP run. None has a value until a two-GPU
+measurement on RCCL and gloo supplies it (README principle 8); until then a PP run is
+refused by name.
 
 ### Q4: memory — layers split, and the split is ATOM's
 
@@ -220,11 +370,84 @@ when `pp_group.world_size > 1`.
 **Compass calls it; it never re-derives a split.** Same rule as `14` D86 for draft KV
 layers, and for the same reason: two spellings of one count drift.
 
-Weights and KV both shard by layer range, so per-stage memory is `layers_in_stage /
-total_layers` of the sharded terms — but the Class-C `runtime_constants` do **not** scale
-that way, since HIP context and collective buffers are per-process. **Memory readings must
-be keyed by PP degree as well as TP width**, and that is a new dimension on `05` D25's
-table rather than a derivation.
+**Weights shard by layer range. KV does not.** What separates them is homogeneity, not
+per-layer-ness: KV is per-layer too. *Every* layer carries weights, so a stage's share of
+the sharded weight terms is `layers_in_stage / total_layers`; only the layers that cache
+the whole history carry paged KV, and inside a span of a hybrid stack that count is not
+proportional to the span's length. A stage's share of the KV term is
+`paged_layers_in_stage / total_paged_layers`, and on a hybrid the two fractions differ.
+
+The weights ratio is itself exact only where the layer kinds are equally sized, and on this
+hybrid they are merely close. The two kinds are different modules — `Qwen3NextAttention`
+against `Qwen3_5GatedDeltaNet` — and at TP1, counted from the vendored config over their
+projection shapes with norms and biases omitted (under 0.01% of a layer), a
+`full_attention` layer is **372,244,480** parameters against **383,262,720** for a
+`linear_attention` one, **+2.96%**. That moves a stage's true weight share off the layer
+ratio by at most **0.242%**, at pp = 7; 0.197% at pp = 6 and 0.104% at pp = 3. Two orders
+of magnitude inside the ≤10% target a non-KV memory term carries, so the layer range stays
+the weights key here — but it stays one because the two kinds happen to be nearly the same
+size, not because weights are per-layer, and on a hybrid whose kinds differ more it would
+not. How close that ratio has to be is a weights-term question rather than this decision's.
+
+**The paged count is read, not computed.** It comes from the same two sources as the split
+itself — `get_pp_indices` for the span, and the model's own `layer_types` for which layers
+inside it are paged (`atom/compass/backends/geometry.py`'s `paged_layers`, which refuses a
+kind it does not recognise rather than counting it as ordinary attention). An earlier form
+of this paragraph gave the KV share as the layer ratio. That is exactly the re-derivation
+the rule above forbids: it recomputed from the layer count something ATOM already holds,
+and the two spellings disagree on every hybrid.
+
+**A second spelling of this count already exists in the engine, and it is not the one to
+read.** `GDNStateMixin._init_gdn_state` (`atom/model_ops/attentions/gdn_attn.py`) sets
+`num_full_attn` by dividing `num_hidden_layers` by `full_attention_interval`, and the
+attention sizing in the same file consumes it. That count is **global**, so it cannot
+answer what a stage holds at all. It agrees at 16 on this config and not by luck:
+`Qwen3_5TextConfig.__init__` (`atom/model_config/qwen3_5.py`) fills `layer_types` *from*
+that interval when a config omits it, so anything built through ATOM's own config class is
+consistent by construction. A config carrying an explicit non-periodic `layer_types` would
+separate the two, and `layer_types` is the one that stays right.
+
+Derived at `feature/atomcompass_new` `92f1fdafe` from `get_pp_indices`, with
+`VLLM_PP_LAYER_PARTITION` cleared — left set it overrides the partitioner and a layout out
+of the environment reads as ATOM's — on the 64-layer hybrid vendored at
+`tests/compass/qwen3_5_27b_config.json`: one `full_attention` layer in four, so 16 of the
+64 are paged. The layers that do not divide evenly are added walking back from the
+*second-to-last* partition, so the **last stage never takes one** and the rest fill in from
+the right; at pp = 5 that reaches stage 0, the first. *The middle stages* is true of 3, 6
+and 7 here and false of 5, which is why no row below is the split a reader would write
+out:
+
+| PP | `get_pp_indices` spans | layers held | paged layers | stages where `held/64` = `paged/16` |
+|---|---|---|---|---|
+| 2 | 0-32, 32-64 | 32, 32 | 8, 8 | all |
+| 3 | 0-21, 21-43, 43-64 | 21, 22, 21 | 5, 5, 6 | none |
+| 4 | 0-16, 16-32, 32-48, 48-64 | 16, 16, 16, 16 | 4, 4, 4, 4 | all |
+| 5 | 0-13, 13-26, 26-39, 39-52, 52-64 | 13, 13, 13, 13, 12 | 3, 3, 3, 4, 3 | stage 4 |
+| 6 | 0-10, 10-21, 21-32, 32-43, 43-54, 54-64 | 10, 11, 11, 11, 11, 10 | 2, 3, 3, 2, 3, 3 | none |
+| 7 | 0-9, 9-18, 18-27, 27-36, 36-45, 45-55, 55-64 | 9, 9, 9, 9, 9, 10, 9 | 2, 2, 2, 3, 2, 2, 3 | none |
+| 8 | 0-8, 8-16, 16-24, 24-32, 32-40, 40-48, 48-56, 56-64 | 8, 8, 8, 8, 8, 8, 8, 8 | 2, 2, 2, 2, 2, 2, 2, 2 | all |
+
+**The pp = 6 row falsifies the layer ratio in one line: stages 1 and 3 each hold 11 layers
+and carry 3 and 2 paged ones.** `layers_in_stage / total_layers` is 11/64 for both, and
+their shares of the KV are 3/16 and 2/16. The ratio understates stage 1 by 8.3% and
+overstates stage 3 by 37.5% — against the **≤ 5%** target the KV term carries, the
+tightest in the project, where every other memory term is gated at 10%. The sign of the
+error changes between two stages of one deployment, so no single correction factor absorbs
+it. At pp = 3 the stage holding the *most* layers holds the *fewest* paged ones of the
+three: 22 layers carry 5 where 21 carry 6.
+
+**Uniform stacks are unaffected.** Where every layer is paged the two fractions are equal
+by construction and the layer ratio is correct — that is the case anyone checks first, and
+it is why this stood. The widths above where they agree at every stage, 2, 4 and 8, are
+the ones where the paged period of this model, 4, divides every span.
+
+The Class-C `runtime_constants` scale by neither key, since HIP context and collective
+buffers are per-process; that half of the sentence this replaces was already right.
+**Memory readings must be keyed by PP degree as well as TP width**, and that is a new
+dimension on `05` D25's table rather than a derivation.
+
+The per-stage *block count* these paged counts produce, and the `all_reduce(MIN)` that
+picks one of them for the whole deployment, are `03` D14's question and not this one's.
 
 ### What is not established
 
@@ -254,10 +477,12 @@ answered — **T86**.
 every use site imports `get_ep_group` from `aiter.dist.parallel_state` (`moe.py:599`,
 `fused_moe/mori_v2_prepare_finalize.py:153,636`, `fused_moe/flydsl_mega_experts.py:186`,
 `eplb.py:1768`, `models/glm4_moe.py:96`, `models/qwen3_next.py:171`,
-`model_runner.py:3553`). Both of ATOM's distributed-init paths —
+`model_runner.py::ModelRunner._force_aiter_unreg_capture_for_piecewise`). Both of ATOM's distributed-init paths —
 `init_pp_aware_dist_env` (`distributed/pp_comm.py:46`) when `pp_size > 1`, aiter's
-`init_dist_env` (`aiter/ops/communication.py:22`) otherwise, chosen at
-`model_runner.py:932` — end in aiter's `initialize_model_parallel`, which builds the
+`init_dist_env` (`aiter/ops/communication.py:22`) otherwise, chosen by the
+`pipeline_parallel_size > 1` branch of
+`model_runner.py::ModelRunner._setup_device_and_distributed` — end in
+aiter's `initialize_model_parallel`, which builds the
 group at `aiter/dist/parallel_state.py:1926-1945` out of
 
 ```python
@@ -295,7 +520,7 @@ Under DP-attention `CoreManager` rewrites `dp := dp × tp, tp := 1` before any o
 `dp × pcp × tp` either way: `init_dist_env` passes `world_size = pp × tp × pcp` with `pp`
 pinned to 1 (`aiter/ops/communication.py:33-40`) and `init_distributed_environment`
 multiplies DP back in (`parallel_state.py:1726-1729`); the PP branch computes the same
-index itself at `model_runner.py:979`.
+index itself in `model_runner.py::ModelRunner._setup_device_and_distributed`.
 
 **Ranks are contiguous whenever `pp == 1`**, which is every reachable EP configuration.
 The strided last row is the only non-contiguous case, and ATOM refuses it
@@ -442,16 +667,17 @@ pads. The *"a remainder is left unused"* comment this section used to quote is
 Strategies compose, and the LP count is what the clock protocol pays for:
 
 ```
-  LPs  =  (number of PD roles)                     1 for aggregated, 2 for disaggregated
-          x (dp_size)          <- collapses to 1 per group; a DP GROUP is one LP
-          x (pp_size)          <- DOES NOT collapse: one LP per stage
-          x 1                  <- tp_size and ep_size collapse into their group
-        + 1                    the harness
-        + 1                    the API server
+  LPs  =  1                                   the traffic source (the harness)
+        + (number of deployments)             1 aggregated, 2 for 1P1D (one per PD role)
+          x ( 1                               its frontend: the API server's event loop
+            + pp_size )                       its engine: one LP per PP stage; a DP group,
+                                              and tp_size and ep_size, collapse into it
 ```
 
-So a TP8/EP8 single-node aggregated deployment is **~3 LPs**, the same as TP1 — and a
-PP4 deployment is four times that. **The protocol's cost tracks PP degree and PD roles,
+So a TP8/EP8 single-node aggregated deployment is **3 LPs** (traffic, frontend, engine),
+the same as TP1; 1P1D is **5** (traffic, frontend-P, engine-P, frontend-D, engine-D); and
+a PP4 aggregated deployment is **6** (`01` D3, D3.1). **The protocol's cost tracks PP
+degree and PD roles,
 not GPU count**, which is the property that makes `01`'s single-CA decision hold as the
 milestones widen.
 
@@ -516,10 +742,10 @@ and `test_forward_mode.py` already cover the pieces on the CPU-only path (`08` D
 |---|---|---|
 | D88 | One frame of four questions per strategy — LPs and lookahead, scheduling coupling, cost, memory. **Only PP adds logical processes**; TP, DP and EP each sit behind an existing barrier. | 2026-09-19 |
 | D89 | TP is the settled instance and supplies the per-width discipline: width is a key, not a parameter. | 2026-09-19 |
-| D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP. Step duration is `max` over ranks, computed not rank-0-sourced, and idle ranks cost a dummy batch. | 2026-09-19 |
-| D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived. Memory readings gain a PP-degree key. | 2026-09-19 |
+| D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP. Step duration is `max` over ranks, computed not rank-0-sourced, and idle ranks cost a dummy batch. Replaced in part by the owner's DP ruling ([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)); #532 rewrites this row. | 2026-09-19, revised 2026-09-28; ruling 2026-10-01 |
+| D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. Revised: a send part completes on the sender's clock when eager and at `max(t_send, r_i) + T` when rendezvous, `r_i` the time its receive is posted, a per-carrier size threshold deciding which, and a send's `done` is the latest over its parts; the receiver returns a rendezvous completion on `stage(k+1)->stage(k):pp_ack#dp0`, lookahead `T_min - L_data`, and both waits receive it (K5). Confirmed by the owner on 2026-10-02: the send reaches the next stage on `stage(k)->stage(k+1):pp_data#dp0`, and the TP-rank-0 workers carry both channels' frames over the PP CPU group. | 2026-09-19, revised 2026-09-28 and 2026-09-30, confirmed 2026-10-02 |
 | D92 | EP adds no LPs (inherits the TP group) but its all-to-all is invisible and must be a declared node, and its `exclusive` occupancy forbids placing it in a `Par`. Expert sharding is Class A, remainder included. | 2026-09-19 |
-| D93 | LP count = PD roles × PP stages (+2), independent of GPU count. The clock protocol's cost tracks PP degree, not width. | 2026-09-19 |
+| D93 | LP count = 1 traffic LP + per deployment (1 frontend LP + one engine LP per PP stage): 3 aggregated, 5 for 1P1D, independent of GPU count. The clock protocol's cost tracks PP degree and PD roles, not width. | 2026-09-19, revised 2026-09-28 |
 | D94 | Parallelism splits across milestones: LP structure, couplings and memory shape at **M1**; cost accuracy at **M7**. M1's test is scheduling-decision agreement at TP2/DP2/PP2/EP2, which needs no cost model. | 2026-09-19 |
 
 ---
