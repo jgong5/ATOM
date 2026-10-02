@@ -11,6 +11,7 @@ fails the test instead of hanging it.
 import json
 import math
 import queue
+import re
 import threading
 
 import pytest
@@ -20,6 +21,7 @@ from atom.compass.clock import (
     TAR,
     BackdatedEvent,
     ChannelTable,
+    ClockAbort,
     ClockAuthority,
     LpId,
     LpRegistry,
@@ -259,11 +261,10 @@ def test_each_member_binds_its_own_connection_and_reads_its_own_releases(
 @pytest.mark.parametrize(
     "request_, error, match",
     [
-        ((TAR, 1.0, [(AB, 0, 0.1)], INF), BackdatedEvent, "before a's clock 0.0"),
         ((TAR, INF, [], INF), ValueError, "must be a finite number"),
         ((TAR, 1.0, [("a->x:m", 0, 1.0)], INF), KeyError, "not a declared channel"),
     ],
-    ids=["backdated", "value", "key"],
+    ids=["value", "key"],
 )
 def test_a_refusal_raises_at_its_requester_and_the_loop_serves_on(
     served, request_, error, match
@@ -273,6 +274,44 @@ def test_a_refusal_raises_at_its_requester_and_the_loop_serves_on(
         _ask(a, request_)
     assert type(refused.value) is error
     assert _ask(a, (TAR, 1.0, [], INF)) == (1.0, {})
+
+
+def _breaks_at_dp1(self, lp, member, kind, t):
+    if member == "dp1":
+        raise RuntimeError("the join broke")
+
+
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+@pytest.mark.parametrize(
+    "broken, reason",
+    [
+        (False, r"engine: dp[01] asked (TAR|NER) while dp[01] asked (TAR|NER)\n"),
+        (True, re.escape("the clock authority raised RuntimeError('the join broke')")),
+    ],
+    ids=["abort", "unexpected"],
+)
+def test_a_rule_that_raises_ends_the_run_for_every_bound_connection(
+    served, monkeypatch, endpoint, broken, reason
+):
+    if broken:
+        monkeypatch.setattr(ClockAuthority, "_refuse_unjoinable", _breaks_at_dp1)
+    endpoint = served(_joined(), endpoint).endpoint
+    frontend = connect(FRONTEND, endpoint)
+    dp0, dp1 = (connect(ENGINE, endpoint, rank) for rank in RANKS)
+    waiting = []
+    # dp1's TAR does not join dp0's NER; over TCP the two may reach the rule
+    # in either order, so either one is the requester.
+    for conn, kind in [(frontend, NER), (dp0, NER), (dp1, TAR)]:
+        _result(_later(conn.send, (kind, 1.0 if kind == TAR else INF, [], INF)))
+        waiting.append(_later(conn.recv))
+    refusals = []
+    for box in waiting:
+        with pytest.raises(ClockAbort, match=reason) as refused:
+            _result(box)
+        refusals.append(refused.value.reason)
+    assert len(set(refusals)) == 1
+    with pytest.raises(ClockAbort, match=reason):
+        _ask(frontend, (NER, INF, [], INF))
 
 
 def test_a_backdated_event_arrives_with_the_lp_table(served):
