@@ -21,6 +21,7 @@ from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
+    clock,
     envs,
     get_open_zmq_inproc_path,
     get_open_zmq_ipc_path,
@@ -439,19 +440,23 @@ class CoreManager:
                 else:
                     bind_addresses = [info["addresses"] for info in processes_info]
 
-                for addresses in bind_addresses:
+                for dp, addresses in enumerate(bind_addresses):
                     input_socket = make_zmq_socket(
                         self.ctx, addresses["input_address"], zmq.ROUTER, bind=True
                     )
                     identity, _ = input_socket.recv_multipart()
-                    self.input_sockets.append(input_socket)
+                    self.input_sockets.append(
+                        clock.wrap(input_socket, f"request#dp{dp}")
+                    )
                     self.engine_core_identities.append(identity)
 
                     control_socket = make_zmq_socket(
                         self.ctx, addresses["control_address"], zmq.ROUTER, bind=True
                     )
                     control_identity, _ = control_socket.recv_multipart()
-                    self.control_sockets.append(control_socket)
+                    self.control_sockets.append(
+                        clock.wrap(control_socket, f"control#dp{dp}")
+                    )
                     self.control_identities.append(control_identity)
 
                     # PULL always binds; the engine's PUSH always connects.
@@ -464,7 +469,9 @@ class CoreManager:
                         zmq.PULL,
                         bind=True,
                     )
-                    self.output_sockets.append(output_socket)
+                    self.output_sockets.append(
+                        clock.wrap(output_socket, f"output#dp{dp}")
+                    )
                     self.shutdown_paths.append(get_open_zmq_inproc_path())
 
                 self._wait_for_all_ready_signals()
@@ -522,7 +529,7 @@ class CoreManager:
 
     def _wait_for_all_ready_signals(self):
         """Wait for READY signals from all DP ranks in parallel (no timeout)."""
-        poller = zmq.Poller()
+        poller = clock.poller()
         for dp_rank, output_socket in enumerate(self.output_sockets):
             poller.register(output_socket, zmq.POLLIN)
 
@@ -564,11 +571,11 @@ class CoreManager:
         self, dp_rank: int, output_socket: zmq.Socket, shutdown_path: str
     ) -> Thread:
         def process_outputs_socket():
-            assert isinstance(output_socket, zmq.Socket)
+            assert isinstance(output_socket, (zmq.Socket, clock.WrappedSocket))
             shutdown_socket = self.ctx.socket(zmq.PAIR)
             try:
                 shutdown_socket.bind(shutdown_path)
-                poller = zmq.Poller()
+                poller = clock.poller()
                 poller.register(shutdown_socket, zmq.POLLIN)
                 poller.register(output_socket, zmq.POLLIN)
                 logger.debug(f"{self.label} (DP {dp_rank}): output thread started")
@@ -1591,14 +1598,14 @@ class DisaggCoreManager(CoreManager):
             self.engine_core_processes.append(proc)
             in_sock = make_zmq_socket(self.ctx, in_addr, zmq.ROUTER, bind=True)
             identity, _ = in_sock.recv_multipart()
-            self.input_sockets.append(in_sock)
+            self.input_sockets.append(clock.wrap(in_sock, "request#dp0"))
             self.engine_core_identities.append(identity)
             ctrl_sock = make_zmq_socket(self.ctx, ctrl_addr, zmq.ROUTER, bind=True)
             ctrl_identity, _ = ctrl_sock.recv_multipart()
-            self.control_sockets.append(ctrl_sock)
+            self.control_sockets.append(clock.wrap(ctrl_sock, "control#dp0"))
             self.control_identities.append(ctrl_identity)
             out_sock = make_zmq_socket(self.ctx, out_addr, zmq.PULL)
-            self.output_sockets.append(out_sock)
+            self.output_sockets.append(clock.wrap(out_sock, "output#dp0"))
             self.shutdown_paths.append(get_open_zmq_inproc_path())
             logger.info(f"{self.label}: {name} process started and connected")
 

@@ -290,6 +290,13 @@ class WrappedSocket:
         self.relay: RelayQueue | None = None
         self.buf: list[tuple] = []  # (ch, arrival, seq, payload frame) read, not taken
 
+    def close(self, linger=None) -> None:
+        self.raw.close(linger)
+
+    @property
+    def closed(self) -> bool:
+        return self.raw.closed
+
     def send(self, data, **kw) -> None:
         self.send_multipart([data], **kw)
 
@@ -452,3 +459,51 @@ class RelayQueue:
             raise RuntimeError(f"{self.wsock.ch}: one relay item sent twice")
         stamp, self.pending = self.pending, None
         return stamp
+
+
+# ---- the channel sites: each returns ATOM's own object on a real run ----
+
+
+def _channel_of(rt: LPRuntime, kind: str) -> str:
+    """The one channel of `rt`'s LP whose name ends ``:kind``."""
+    names = [
+        c.name
+        for c in rt.table.channels_from(rt.me) + rt.table.channels_into(rt.me)
+        if c.name.endswith(":" + kind)
+    ]
+    if len(names) != 1:
+        raise KeyError(
+            f"{rt.me} has {len(names)} channels of kind {kind!r} ({names}); a "
+            "channel socket names exactly one"
+        )
+    return names[0]
+
+
+def wrap(raw: zmq.Socket, kind: str):
+    """`raw` as this LP's channel of `kind`, or `raw` itself on a real run."""
+    rt = _installed
+    return raw if rt is None else WrappedSocket(rt, raw, _channel_of(rt, kind))
+
+
+def poller():
+    rt = _installed
+    return zmq.Poller() if rt is None else WrappedPoller(rt)
+
+
+def relay_queue(kind: str):
+    """The engine's output queue: a `RelayQueue` on the channel of `kind`, else a `queue.Queue`.
+
+    Its socket is opened later, on the output thread; `relay_socket` attaches it.
+    """
+    rt = _installed
+    if rt is None:
+        return queue.Queue()
+    return RelayQueue(rt, WrappedSocket(rt, None, _channel_of(rt, kind)))
+
+
+def relay_socket(q, raw: zmq.Socket):
+    """The socket `q`'s items go out on: its relay's wrapper over `raw`, else `raw`."""
+    if not isinstance(q, RelayQueue):
+        return raw
+    q.wsock.raw = raw
+    return q.wsock

@@ -70,7 +70,8 @@ class EngineCore:
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
-        self.output_queue = queue.Queue[list[Sequence]]()
+        self.dp_tag = f"#dp{config.parallel_config.data_parallel_rank}"
+        self.output_queue = clock.relay_queue("output" + self.dp_tag)
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
@@ -530,14 +531,18 @@ class EngineCore:
             control_socket = stack.enter_context(
                 make_zmq_socket(ctx, control_address, zmq.DEALER, bind=False)
             )
-            poller = zmq.Poller()
+            poller = clock.poller()
             # Send initial message on each socket - this is required
             # before the front-end ROUTER sockets can send messages
             # back to us.
             input_socket.send(b"")
             control_socket.send(b"")
-            poller.register(input_socket, zmq.POLLIN)
-            poller.register(control_socket, zmq.POLLIN)
+            poller.register(
+                clock.wrap(input_socket, "request" + self.dp_tag), zmq.POLLIN
+            )
+            poller.register(
+                clock.wrap(control_socket, "control" + self.dp_tag), zmq.POLLIN
+            )
             logger.debug(f"{self.label}: input and control sockets connected")
             alive = True
 
@@ -580,8 +585,11 @@ class EngineCore:
     def process_output_sockets(self, output_address: str):
         """Output socket IO thread."""
         with ExitStack() as stack, zmq.Context() as ctx:
-            socket = stack.enter_context(
-                make_zmq_socket(ctx, output_address, zmq.PUSH, linger=4000)
+            socket = clock.relay_socket(
+                self.output_queue,
+                stack.enter_context(
+                    make_zmq_socket(ctx, output_address, zmq.PUSH, linger=4000)
+                ),
             )
             logger.debug(f"{self.label}: output socket connected")
 
@@ -925,11 +933,13 @@ class PrefillEngineCore(EngineCore):
         # preventing messages from being dropped before decode connects.
         self._p2d_sock = self._disagg_ctx.socket(zmq.PUSH)
         self._p2d_sock.connect(self._disagg_p2d_addr)
+        self._p2d_sock = clock.wrap(self._p2d_sock, "prefill_done")
 
         # --- Start thread to receive BlockAssignment from decode ---
         # Prefill binds so decode's PUSH connect finds a ready socket.
         self._assignment_sock = self._disagg_ctx.socket(zmq.PULL)
         self._assignment_sock.bind(self._disagg_d2p_addr)
+        self._assignment_sock = clock.wrap(self._assignment_sock, "block_assignment")
         self._assignment_thread = threading.Thread(
             target=self._recv_block_assignments,
             daemon=True,
@@ -1182,10 +1192,12 @@ class DecodeEngineCore(EngineCore):
         # Decode PUSH connects to prefill's bound PULL (d2p channel).
         self._d2p_sock = self._disagg_ctx.socket(zmq.PUSH)
         self._d2p_sock.connect(self._disagg_d2p_addr)
+        self._d2p_sock = clock.wrap(self._d2p_sock, "block_assignment")
 
         # Decode PULL binds so prefill's connecting PUSH finds a ready socket (p2d channel).
         self._p2d_recv_sock = self._disagg_ctx.socket(zmq.PULL)
         self._p2d_recv_sock.bind(self._disagg_p2d_addr)
+        self._p2d_recv_sock = clock.wrap(self._p2d_recv_sock, "prefill_done")
 
         # Start thread to receive PrefillDone from prefill.
         self._prefill_done_thread = threading.Thread(

@@ -26,6 +26,8 @@ from typing import Any
 
 import zmq
 
+from atom.utils import clock
+
 logger = logging.getLogger("atom")
 
 
@@ -77,25 +79,30 @@ class PPStageTransport:
             for s in range(1, pp_size):
                 sock = self._ctx.socket(zmq.PUSH)
                 sock.connect(meta_addrs[s])
-                self._meta_send.append(sock)
+                self._meta_send.append(clock.wrap(sock, "meta"))
             # Receive sampled tokens back from the last stage.
             self._token_recv = self._ctx.socket(zmq.PULL)
             self._token_recv.bind(token_addr)
+            self._token_recv = clock.wrap(self._token_recv, "tokens")
             # Receive KV offload status from all downstream stages.
             if kv_status_addr:
                 self._kv_status_recv = self._ctx.socket(zmq.PULL)
                 self._kv_status_recv.bind(kv_status_addr)
+                self._kv_status_recv = clock.wrap(self._kv_status_recv, "kv_status")
         else:
             # Receive the scheduled batch from the head.
             self._meta_recv = self._ctx.socket(zmq.PULL)
             self._meta_recv.bind(meta_addrs[pp_rank])
+            self._meta_recv = clock.wrap(self._meta_recv, "meta")
             if self.is_last:
                 self._token_send = self._ctx.socket(zmq.PUSH)
                 self._token_send.connect(token_addr)
+                self._token_send = clock.wrap(self._token_send, "tokens")
             # Send KV offload status back to the head.
             if kv_status_addr:
                 self._kv_status_send = self._ctx.socket(zmq.PUSH)
                 self._kv_status_send.connect(kv_status_addr)
+                self._kv_status_send = clock.wrap(self._kv_status_send, "kv_status")
 
     # ---- head side ----------------------------------------------------------
     def send_metadata(self, batch: Any) -> None:
