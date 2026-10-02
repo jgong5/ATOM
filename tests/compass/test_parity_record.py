@@ -6,6 +6,7 @@ engine's order -- schedule, forward, postprocess -- one scheduler per DP rank,
 with every prompt distinct.
 """
 
+import hashlib
 import json
 import queue
 import shutil
@@ -15,7 +16,7 @@ import numpy as np
 import pytest
 from conftest import MockConfig
 
-from atom.compass.parity import ENV, StepRecording, compare, read, request_key
+from atom.compass.parity import ENV, StepRecording, compare, read
 from atom.compass.runner.overrides import NonAllocatingRunner
 from atom.model_engine.scheduler import ScheduledBatch, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
@@ -26,6 +27,11 @@ PROMPT, BUDGET, BLOCK = 200, 64, 16
 
 def _prompt(i):
     return list(range(5 + 1000 * i, 5 + 1000 * i + PROMPT))
+
+
+def _key(tokens):
+    data = np.asarray(tokens, dtype=np.int32).tobytes()
+    return hashlib.blake2b(data, digest_size=8).hexdigest()
 
 
 def _config(dp_rank=0, pipeline_parallel_size=1, budget=BUDGET):
@@ -100,13 +106,9 @@ def test_the_record_is_the_batches_the_scheduler_built(
     for step, batch in enumerate(batches):
         rows = []
         for i, req_id in enumerate(batch.req_ids):
-            start = batch.num_cached_tokens[i]
-            window = sequences[req_id].token_ids[
-                start : start + batch.num_scheduled_tokens[i]
-            ]
             if req_id not in keys:
                 opened_at.append(i)
-            key = keys.setdefault(req_id, request_key(window))
+            key = keys.setdefault(req_id, _key(sequences[req_id].prompt_token_ids))
             rows.append(
                 [key, int(batch.num_scheduled_tokens[i]), int(batch.context_lens[i])]
             )
@@ -195,7 +197,7 @@ def test_a_shifted_chunk_boundary_names_its_first_step(tmp_path, monkeypatch):
     _drive(tmp_path / "real", monkeypatch, {0: [0, 1], 1: [2, 3]})
     shutil.copytree(tmp_path / "real", tmp_path / "simulated")
     path = tmp_path / "simulated" / "dp0.jsonl"
-    steps = read(tmp_path / "simulated")[0]
+    steps = [json.loads(line) for line in path.read_text().splitlines()]
     # Request 0's first two chunks, 64 and 64, become 60 and 68.
     assert [s["batch"][0][1:] for s in steps[:2]] == [[64, 64], [64, 128]]
     steps[0]["batch"][0][1:] = [60, 60]
@@ -217,22 +219,45 @@ def test_a_record_that_stops_early_or_has_no_rank_parts_where_it_ends(
     real = read(tmp_path / "real")
     (tmp_path / "simulated" / "dp0.jsonl").unlink()
     cut = tmp_path / "simulated" / "dp1.jsonl"
-    cut.write_text("".join(cut.read_text().splitlines(keepends=True)[:2]))
+    lines = cut.read_text().splitlines(keepends=True)
+    # Cut after the line naming rank 1's last request, so every row is keyed.
+    end = max(n for n, line in enumerate(lines) if json.loads(line)["named"]) + 1
+    assert end < len(lines)
+    cut.write_text("".join(lines[:end]))
     first = compare(tmp_path / "real", tmp_path / "simulated")["first_divergence"]
     assert first == {
         0: {"step": 0, "real": real[0][0], "simulated": None},
-        1: {"step": 2, "real": real[1][2], "simulated": None},
+        1: {"step": end, "real": real[1][end], "simulated": None},
     }
 
 
-def test_two_requests_with_one_first_window_are_refused(tmp_path, monkeypatch):
-    # Distinct 100-token prompts, both scheduled whole, that share 64 leading
-    # tokens, as two requests behind one long system prompt would.
+def test_requests_behind_one_system_prompt_keep_their_keys_at_every_budget(
+    tmp_path, monkeypatch
+):
+    # A 192-token system prompt, then a distinct 36-token tail; the first
+    # chunks differ with the budget.
     def prompt(i):
-        return _prompt(0)[:64] + _prompt(i)[64:100]
+        return _prompt(9)[:192] + _prompt(i)[:36]
 
-    with pytest.raises(ValueError, match="with the same leading 64 tokens"):
-        _drive(tmp_path, monkeypatch, {0: [0, 1]}, prompt, budget=256)
+    keys = []
+    for budget in (64, 128, 512):
+        _drive(tmp_path / str(budget), monkeypatch, {0: [0, 1, 2, 3]}, prompt, budget)
+        steps = read(tmp_path / str(budget))[0]
+        keys.append({row[0] for step in steps for row in step["batch"]})
+    assert keys[0] == keys[1] == keys[2] == {_key(prompt(i)) for i in range(4)}
+
+
+def test_two_requests_with_one_prompt_are_refused(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="with the same prompt"):
+        _drive(tmp_path, monkeypatch, {0: [0, 1]}, lambda i: _prompt(0))
+
+
+def test_a_window_that_does_not_continue_the_last_is_refused(tmp_path, monkeypatch):
+    batches = _drive(tmp_path / "source", monkeypatch, {0: [0]})[0][0]
+    runner = _Runner(_config())
+    runner.forward(batches[0])
+    with pytest.raises(ValueError, match="starts at token 0, not at 64"):
+        runner.forward(batches[0])
 
 
 def test_one_key_on_two_ranks_is_refused(tmp_path, monkeypatch):

@@ -15,17 +15,13 @@ composed into `atom.compass.parity.runner.RecordingModelRunner`, which
 `Config.runner_qualname` names.
 
 A request is named by its key, because request ids are numbered per run: a
-digest of the first `KEY_TOKENS` tokens it was first scheduled with. That prefix
-does not move with the first chunk. `Scheduler._chunked_prefill_size` floors a
-chunk the budget cuts short to a multiple of `max(block_size, 64)`, so a first
-chunk holds the whole prompt or at least 64 tokens; only a budget under 64
-tokens cuts it shorter, and then every run with that budget cuts it alike. Two
-things it does not cover: a prefix-cache hit starts the first chunk where the
-hit ends, so a request that hits in one run and misses in the other is keyed on
-different tokens and does not join; and on a model with per-request state,
-`Scheduler._finalize_prefill_chunk` may cut a first chunk at a checkpoint
-position. Two requests of one run with the same key could not be told apart in
-either record, so the second is refused.
+digest of its whole prompt as its prefill windows carry it, taken when its final
+chunk is scheduled, so it does not move with chunking. A line records request
+ids and names each request whose final chunk it holds; `read` puts the keys in.
+Prefix caching is not covered: the worker never sees a cached prefix, so parity
+runs need caching off or the same cache hits in both runs. Two requests of one
+run with one prompt could not be told apart in either record, so the second is
+refused.
 """
 
 import hashlib
@@ -37,13 +33,6 @@ from itertools import zip_longest
 import numpy as np
 
 ENV = "ATOM_COMPASS_PARITY_RECORD"
-KEY_TOKENS = 64
-
-
-def request_key(tokens) -> str:
-    """The digest a request is named by across runs, of its first `KEY_TOKENS`."""
-    data = np.asarray(tokens[:KEY_TOKENS], dtype=np.int32).tobytes()
-    return hashlib.blake2b(data, digest_size=8).hexdigest()
 
 
 class StepRecord:
@@ -57,37 +46,55 @@ class StepRecord:
         self.step = 0
         self.keys: dict[int, str] = {}  # request id -> key
         self.owners: dict[str, int] = {}  # key -> request id
+        self.prompts: dict[int, tuple] = {}  # request id -> (digest, next position)
 
     def add(self, batch) -> None:
-        """Append `batch` as (key, scheduled tokens, context length) per request.
+        """Append `batch` as (request id, scheduled tokens, context length) per request.
 
-        A dummy batch is fabricated for DP synchronisation and names no
-        request, so it is recorded with an empty batch.
+        Each prefill window is added to its request's digest; the line holding
+        a request's final chunk names it under `named`. A dummy batch is
+        fabricated for DP synchronisation and names no request, so it is
+        recorded with an empty batch.
         """
-        rows = []
+        rows, named = [], []
         if not batch.is_dummy_run:
             ends = np.cumsum(batch.num_scheduled_tokens)
             for i, req_id in enumerate(batch.req_ids):
                 num = int(batch.num_scheduled_tokens[i])
-                if req_id not in self.keys:
-                    key = request_key(batch.scheduled_tokens[ends[i] - num : ends[i]])
-                    if key in self.owners:
-                        raise ValueError(
-                            f"requests {self.owners[key]} and {req_id} were first "
-                            f"scheduled with the same leading {KEY_TOKENS} tokens "
-                            f"(key {key}), so no record can tell them apart; give "
-                            "each request a first window of its own, for example "
-                            f"prompts that differ within their first {KEY_TOKENS} "
-                            "tokens."
-                        )
-                    self.keys[req_id], self.owners[key] = key, req_id
-                rows.append([self.keys[req_id], num, int(batch.context_lens[i])])
+                rows.append([req_id, num, int(batch.context_lens[i])])
+                if batch.is_final_chunk is None or req_id in self.keys:
+                    continue
+                start = int(batch.num_cached_tokens[i])
+                digest, end = self.prompts.pop(
+                    req_id, (hashlib.blake2b(digest_size=8), start)
+                )
+                if start != end:
+                    raise ValueError(
+                        f"request {req_id}'s prefill window starts at token "
+                        f"{start}, not at {end} where its last one ended, so its "
+                        "prompt cannot be digested whole."
+                    )
+                window = batch.scheduled_tokens[ends[i] - num : ends[i]]
+                digest.update(np.asarray(window, dtype=np.int32).tobytes())
+                if not batch.is_final_chunk[i]:
+                    self.prompts[req_id] = (digest, start + num)
+                    continue
+                key = digest.hexdigest()
+                if key in self.owners:
+                    raise ValueError(
+                        f"requests {self.owners[key]} and {req_id} were scheduled "
+                        f"with the same prompt (key {key}), so no record can tell "
+                        "them apart; give each request a prompt of its own."
+                    )
+                self.keys[req_id], self.owners[key] = key, req_id
+                named.append([req_id, key])
         line = {
             "step": self.step,
             "dp_rank": self.dp_rank,
             "is_dummy_run": bool(batch.is_dummy_run),
             "produces_output": bool(batch.produces_output()),
             "batch": rows,
+            "named": named,
         }
         with self.path.open("a") as f:
             f.write(json.dumps(line) + "\n")
@@ -134,11 +141,21 @@ class StepRecording:
 
 
 def read(directory) -> dict[int, list[dict]]:
-    """A record directory as {DP rank: steps}."""
-    return {
-        int(path.stem[2:]): [json.loads(line) for line in path.read_text().splitlines()]
-        for path in sorted(pathlib.Path(directory).glob("dp*.jsonl"))
-    }
+    """A record directory as {DP rank: steps}, each named request under its key.
+
+    A request the record never named keeps its request id, so a record that
+    ends inside a request's prefill parts from a full one at that request's
+    first step.
+    """
+    record = {}
+    for path in sorted(pathlib.Path(directory).glob("dp*.jsonl")):
+        steps = [json.loads(line) for line in path.read_text().splitlines()]
+        keys = dict(pair for step in steps for pair in step.pop("named"))
+        for step in steps:
+            for row in step["batch"]:
+                row[0] = keys.get(row[0], row[0])
+        record[int(path.stem[2:])] = steps
+    return record
 
 
 def _request_ranks(name: str, record: dict[int, list[dict]]) -> dict[str, int]:
