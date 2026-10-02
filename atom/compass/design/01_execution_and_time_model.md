@@ -1043,7 +1043,7 @@ undecided**.
 | K3 | Idle point | NER: `next_event(t, t_daemon)` | the step loops' spin, the PP bounded polls, offline `get_output` |
 | K4 | Channel send | timestamped send, logged on the clock owner | PD direct sends, PP sends, output sends through the relay queue |
 | K5 | Channel receive | counted at the wait point, then TSO delivery | the engine input thread, the frontend output thread, the PD handler threads, the PP receives and zero-bound drains, the PP `flush_pp_send` |
-| K6 | Wait inside one LP | LP aggregation: never reported to the CA | TP worker RPC and barriers, frontend coroutines awaiting their own process's data, control commands' calls to workers, the DP group's step-seconds `all_reduce(MAX)` in the predicted forward |
+| K6 | Wait inside one LP | LP aggregation: never reported to the CA | TP worker RPC and barriers, frontend coroutines awaiting their own process's data, control commands' calls to workers, the DP group's reductions (the `PrefillDelayer` all_reduce, and the step-seconds `all_reduce(MAX)` in the predicted forward) |
 | K7 | Virtual timer | the timer runs on the LP clock | idle KV drain, metrics push and refresh, Anthropic ping, keep-alive, the silence warning, the control-command reply timeout |
 | K8 | Real bound | the CA cannot reach it, or it stays real on purpose: configuration | the Rust router's bounds and health check, process-death detection |
 | K9 | Outside the model | outside the simulation window, inside replaced code, or cannot park | startup and shutdown, the replaced runner and RDMA backends, collectives inside the real forward, text scanners |
@@ -1074,10 +1074,8 @@ The rules that settle the boundaries #53's categories left in the wrong place:
 - **A DP step is one TAR, costing the `max` over ranks** (D3, `15` D90). Each rank prices
   its own batch, the ranks exchange the step seconds by one `all_reduce(MAX)` inside the
   predicted forward, and every rank calls the CA as a member of the LP (D3). The exchange
-  is K6 and carries no cost: it stands in for the MoE all-to-all, which the MoE segment
-  already prices. The lockstep
-  `all_reduce` (`DPEngineCoreProc._sync_dp_state`, `atom/model_engine/engine_core.py`)
-  keeps its payload; it is K1 rather than ignored because it has a cost of its own, not
+  is K6 and carries no cost (`15` D90). The lockstep `all_reduce`
+  (`DPEngineCoreProc._sync_dp_state`, `atom/model_engine/engine_core.py`) keeps its payload; it is K1 rather than ignored because it has a cost of its own, not
   because the step is decided there. **Second-order bound:** a fast rank's output is
   stamped at the end of the whole step, late by at most the difference between its own
   cost and the `max`; the step is split with in-step TAR only if that is measured to
