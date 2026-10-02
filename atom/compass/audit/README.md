@@ -46,7 +46,7 @@ group is one LP, so the engine's RPC to its own workers is K6 although its peer
 is another process, and so is a frontend coroutine waiting for data its own
 output thread delivers. Only a wait whose sender is in another LP is K5. **A
 bound in Python is a virtual timer**; only what the clock authority cannot reach
-— the router's compiled-in bounds and switches, and OS-level process-death
+— the router's bounds and switches, and OS-level process-death
 detection — is a real bound. **Sends are counted**, because a send is one end
 of the count of messages in transit, even on a socket that cannot park.
 
@@ -58,29 +58,12 @@ since carry no category. Each category named one mechanism — A K1, B K5, C1
 K8, C2 K7, `ignore` K9 — and wherever a row's mechanism is a different one,
 `mechanism_why` says why; the test requires it there.
 
-## The counts
+## Rows added since the first classification
 
-Measured at the commit this file was written against, from the rows below:
-**220 rows — 202 call sites plus 18 pinned points that are not a call.** None
-is undecided.
-
-| Mechanism | Count | Where the weight is |
-|---|---|---|
-| K1 | 18 | five forward passes, the idle data-parallel rank's empty batch, three transfer-completion polls, five tokenizer hand-offs and multimodal preprocessing (refused today), the data-parallel lockstep reduction, and the two idle pipeline flushes |
-| K2 | 6 | the arrival, finish and two first-token stamps, the scheduler's delay gate, and the waiting-prefill age |
-| K3 | 6 | the three step loops' spin, the two pipeline-stage bounded polls, and the offline driver's output read |
-| K4 | 13 | the front end's request and control sends, six rows of the engine's output thread stamped where the step loop puts each item, the three pipeline-stage sends, and the two sends of the intra-device split |
-| K5 | 10 | the engine's input thread, the front end's output thread, the two handler threads of the intra-device split, and the pipeline-stage receives and zero-bound drains |
-| K6 | 35 | the worker RPC, output and barrier inside a tensor-parallel group and its three real-time bounds, the nine control commands' calls to the workers, the frontend coroutines and pool thread awaiting their own process's data, two tasks of one request racing, and the data-parallel group's per-step reduction |
-| K7 | 8 | the idle transfer drain, the two metrics pushes and the metrics refresh, the keep-alive frame, the keep-alive connection bound, the silence warning, and the control-command reply timeout |
-| K8 | 5 | the router's four compiled-in bounds and switches, and process-death detection |
-| K9 | 119 | startup and shutdown, the runner module the simulated one replaces, the real RDMA transfer backends, collectives inside the real forward pass, sends and in-process hand-offs that never hold up a clock owner, and text scanners whose loops park on nothing |
-
-Eight of the rows are the `send_multipart` calls the scanner found once it
-knew that shape: the front end's request and control sends (K4), and six
-sends in the KV event publisher and the two transfer backends (K9). The rest
-are the first classification's 212 rows. The crosstab of all 220 against the
-first classification's categories is printed by
+The `send_multipart` calls the scanner found once it knew that shape carry no
+category: the front end's request and control sends (K4), and the sends in the
+KV event publisher and the two transfer backends (K9). The rows per mechanism,
+crossed with the first classification's categories, are printed by
 `pytest tests/compass/test_sync_inventory.py -s -k crosstab`.
 
 ## What the scanner does, and where it can be wrong

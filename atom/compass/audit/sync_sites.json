@@ -2746,8 +2746,8 @@
    "category": "ignore",
    "peer": "process",
    "why": "flushes a pending stage send when the head launched nothing this tick",
-   "mechanism": "K1",
-   "mechanism_why": "an idle flush_pp_send really waits for the previous inter-stage send to finish; the simulated runner returns the remaining transfer time, max(0, last send completion - now), and the call site advances by it"
+   "mechanism": "K5",
+   "mechanism_why": "the flush waits for the stage's previous send; a rendezvous send's completion arrives from the next stage on pp_ack, received inline before the call, and an eager send's completion is local"
   },
   {
    "id": "atom/model_engine/pp_engine_core.py::PPEngineCoreProc._pp_head_step::while self._in_flight::spin_loop#0",
@@ -2788,8 +2788,8 @@
    "category": "ignore",
    "peer": "process",
    "why": "flushes a pending stage send: once when no batch arrived this tick, once on shutdown. Neither waits for anything the run reports",
-   "mechanism": "K1",
-   "mechanism_why": "an idle flush_pp_send really waits for the previous inter-stage send to finish; the simulated runner returns the remaining transfer time, max(0, last send completion - now), and the call site advances by it"
+   "mechanism": "K5",
+   "mechanism_why": "the flush waits for the stage's previous send; a rendezvous send's completion arrives from the next stage on pp_ack, received inline before the call, and an eager send's completion is local"
   },
   {
    "id": "atom/model_engine/pp_engine_core.py::PPEngineCoreProc._downstream_busy_loop::self.runner_mgr.call_func(\"forward\", batch, wait_out=True)::worker_rpc#0",
@@ -2816,8 +2816,8 @@
    "category": "ignore",
    "peer": "process",
    "why": "flushes a pending stage send: once when no batch arrived this tick, once on shutdown. Neither waits for anything the run reports",
-   "mechanism": "K9",
-   "mechanism_why": ""
+   "mechanism": "K5",
+   "mechanism_why": "the flush waits for the stage's previous send; a rendezvous send's completion arrives from the next stage on pp_ack, received inline before the call, and an eager send's completion is local"
   },
   {
    "id": "atom/model_engine/pp_engine_core.py::PPEngineCoreProc._poll_and_send_kv_status::self.runner_mgr.call_func_with_aggregation(\"async_proc_aggregation\")::worker_rpc#0",
