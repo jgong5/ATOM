@@ -211,7 +211,7 @@ def test_the_package_imports_only_the_standard_library_it_names(module):
     # the name of the next thing that breaks it. It lists only what the package
     # actually imports: an allowlist naming something unused is a permission
     # granted for no reason, and it weakens the statement.
-    allowed = {"dataclasses", "math"}
+    allowed = {"dataclasses", "enum", "math"}
     tree = ast.parse(module.read_text())
     roots = []
     for node in ast.walk(tree):

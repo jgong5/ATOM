@@ -28,16 +28,13 @@ for membership, never iterated.
 The receive side (socket and poller wrappers) calls `check_arrival` for every
 stamped frame it reads, holds a frame back until `is_released`, and brackets
 handing one to ATOM with `handed_over` and `back_at_wait_point`.
-
-Only data-parallel rank 0 is supported: a rank that makes no clock-authority
-call has no way yet to register its sends or have its frames released, so a
-channel of any other rank is refused.
 """
 
 import logging
 import threading
 
 from atom.compass.clock import ChannelTable, LpId
+from atom.compass.clock.channels import ReceiveMode
 
 logger = logging.getLogger("atom")
 
@@ -60,13 +57,6 @@ class LPRuntime:
         owner: threading.Thread | None = None,
         diag_s: float = DIAG_S,
     ) -> None:
-        for c in table.channels_into(me) + table.channels_from(me):
-            if "#dp" in c.name and not c.name.endswith("#dp0"):
-                raise NotImplementedError(
-                    f"{c.name!r}: data-parallel size > 1 is refused; how a rank other "
-                    "than the one calling the clock authority registers its sends and "
-                    "has its frames released is undecided"
-                )
         self.me, self.table, self.conn, self.diag_s = me, table, conn, diag_s
         self.owner = owner or threading.current_thread()
         self.lock = threading.Lock()
@@ -161,7 +151,7 @@ class LPRuntime:
                 self.unreleased.pop((ch, seq), None)
                 for w in self.wakes.values():
                     w.set()
-                if self.table.recv_mode(ch) == "inline":
+                if self.table.recv_mode(ch) is ReceiveMode.INLINE:
                     continue
                 reported = False
                 while seq not in self.handled[ch]:
@@ -193,7 +183,7 @@ class LPRuntime:
             return any(
                 self.released[ch] - self.handled[ch]
                 for ch in self.released
-                if self.table.recv_mode(ch) == "inline"
+                if self.table.recv_mode(ch) is ReceiveMode.INLINE
             )
 
     # ---- receive side ----
