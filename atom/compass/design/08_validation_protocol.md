@@ -507,8 +507,8 @@ Whatever is done there must be declared, not discovered.
 
 Owner's DP ruling, 2026-10-01
 ([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)). DP
-acceptance uses two DP-attention configurations of DeepSeek-V4-Pro on MI355X that ATOM's
-nightly benchmarks already run, and no other model:
+acceptance uses the DP-attention configurations of DeepSeek-V4-Pro on MI355X below, which
+ATOM's nightly benchmarks already run, and no other model:
 
 | Cell | Where ATOM defines it |
 |---|---|
@@ -517,8 +517,9 @@ nightly benchmarks already run, and no other model:
 
 Each cell is judged by cc-traces e2e and by the per-step error spread (D47), never by a
 total. TBO under DP (#531) and tier b pricing for V4-Pro are prerequisites, so neither
-cell is acceptance evidence before both exist. The DPA+MTP1 case is 1P1D, so it also
-needs the M4 deployment form.
+cell is acceptance evidence before both exist. The DPA+MTP1 cell exists only as this
+atomesh 1P1D case, so it needs the M4 deployment form and waits for P/D, which is parked
+([#443](https://github.com/jgong5/ATOM/issues/443#issuecomment-5955155129)).
 
 The mechanism tests run device-free on a CPU fake-model DP2: both ranks report the same
 step seconds, equal to the larger of the two; an idle rank's dummy batch is priced and
