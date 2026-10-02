@@ -12,19 +12,10 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — 88 rows, **T1–T88 with no gaps**, per topic, of which **82 are open**:
-   T10, T15, T22, T48 and T65 are struck through as done, and T77 was opened and closed by
-   P0.1. **The previous figures, 86 rows and 80 open, were stale rather than differently
-   counted**: re-run at `fec23aecb` the rule below gives 87 rows and 5 struck, because T81
-   landed from P0.4 after the line was last written. T88 makes it 88.
-   Both figures are the rows of section 3 below, counted as
-   `grep -oE '^\| *~*\**T[0-9]+'` over that section and nothing else — prose elsewhere in
-   this file names T-numbers that belong to other branches, and counting those tokens is
-   what made two earlier counts disagree. The register is **allocated across parallel task
-   branches rather than as a range**, and has read as non-contiguous whenever one of those
-   branches was in flight: T73–T76 arrived with P0.3, T83–T87 with P0.6, T81 with P0.4, and
-   T88 arrives here. It happens to be complete at this head; that is an observation about
-   what has landed, not a property to rely on
+3. **TODO register** — per topic. T10, T15, T22, T48, T65 and T91 are struck through as
+   done, and T77 was opened and closed by P0.1. The register is the rows of section 3
+   below and nothing else: prose elsewhere in this file names T-numbers that belong to
+   other branches. It is allocated across parallel task branches, so not contiguous
 4. **Cross-cutting issues and pending amendments**
 
 ---
@@ -73,7 +64,7 @@ silently carried as gaps.
 | ~~M-d~~ | ~~TP / DP / PP / EP specifics~~ | M1 names all four, and DP couples *scheduling decisions* across ranks through a per-forward collective that rewrites the batch - so the LP structure is an M1 deliverable, not an M7 one. | **DONE** - topic `15_parallelism_support.md`, D88-D94, with an explicit M1/M7 split. |
 | ~~M-e~~ | ~~Determinism and reproducibility~~ | Doc `08` **T26** asks for bit-reproducibility as a test, but nothing designs for it. Under a distributed CA, grant ordering is a function of real-time message arrival unless something pins it. Two runs of one configuration disagreeing would undermine every paired comparison. | **DONE** - `01` D3.4: the `(LP, virtual time, event)` sequence is what must reproduce; CA grants tie-break by LP identity. |
 | ~~M-f~~ | ~~Speculative decoding / MTP~~ | Acceptance is a *behaviour* Compass cannot compute - the first quantity in the design that is neither derivable nor measurable. | **IN SCOPE** by decision 2026-09-19; topic `14_speculative_decoding.md`, D82-D87. Placed as **M3.5** (mechanism on Qwen3.8-27B), real claim at M5/M6. |
-| ~~M-g~~ | ~~Simulated-run observability~~ | Doc `01` D3.1's open issue says the CA should own the global timeline log and the deadlock dump, and that "its output format is part of the acceptance evidence and should be designed, not improvised". Doc `11` covers Prometheus metrics, which is a different thing. Still improvised. | **DONE** - `01` D3.5: timeline log, deadlock dump, and an always-written run summary. |
+| ~~M-g~~ | ~~Simulated-run observability~~ | Doc `01` D3.1's open issue says the CA should own the global timeline log and the stall diagnostic, and that "its output format is part of the acceptance evidence and should be designed, not improvised". Doc `11` covers Prometheus metrics, which is a different thing. Still improvised. | **DONE** - `01` D3.5: timeline log, stall diagnostic, and an always-written run summary. |
 
 **All seven are now closed.** M-a `13`; M-b `08` D50.1; M-c `02` D10.1; M-d `15`; M-e `01` D3.4;
 M-f `14`; M-g `01` D3.5.
@@ -229,7 +220,8 @@ M-f `14`; M-g `01` D3.5.
 
 | # | Item | Topic |
 |---|---|---|
-| **T47** | A lookahead that is wrong but never exercised by the workload is not detected by the straggler check | `01` |
+| **T47** | A wrong lookahead is a calibration error no causality detector sees; only validation against real runs (`08`) or a declared-vs-measured channel-delay check catches it | `01` |
+| ~~**T91**~~ | ~~How the DP ranks that make no CA call register sends and get frames released~~ — ruled 2026-10-01, option (b) ([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)); stated in `01` D3 | `01` |
 | **T49** | The prefix-index *lookup* cost is charged to nobody — ~1,387 blocks hashed and probed per request at the cc-traces p50, magnitude unmeasured | `03` |
 | **T50** | Whether runtime memory constants transfer across dies (the working assumption says yes within a software generation) | `03`, `05` |
 | **T53** | Whether tokenizer throughput transfers across CPU classes (the working assumption says yes, adjusted by derate) | `05` |
@@ -242,8 +234,9 @@ M-f `14`; M-g `01` D3.5.
 Beyond the per-topic TODOs.
 
 1. **Silent failure is the dominant risk mode.** The always-on causality detectors
-   (`01` D3.2), loud deadlock aborts, and the AST clock-site test are the design, not
-   decoration.
+   (`01` D3.2), the `01` D3 stall rules (Chandy–Misra recovery for a stall the CA can
+   see, one `DIAG_S` diagnostic for one it cannot, never an abort), and the AST
+   clock-site test are the design, not decoration.
 2. **Simulation speed is unmeasured under this architecture.** The prior design ran
    **0.30×** under saturation — slower than the system it simulates. Measure a saturated
    cell early, not at the end.
