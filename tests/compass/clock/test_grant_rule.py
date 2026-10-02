@@ -272,6 +272,12 @@ def test_a_daemon_deadline_is_held_until_essential_time_reaches_it():
     assert _grants(ca.on_request(B, NER, INF, [])) == [("a", INF), ("b", INF)]
 
 
+def test_a_daemon_deadline_equal_to_the_horizon_fires():
+    ca = ClockAuthority(_two_way(0.5))
+    assert ca.on_request(A, NER, INF, [], t_daemon=1.0) == []
+    assert _grants(ca.on_request(B, TAR, 1.0, [])) == [("a", 1.0), ("b", 1.0)]
+
+
 def test_a_daemon_deadline_is_only_an_ner_and_never_behind_the_clock():
     ca = _one_way_at(0.5)
     with pytest.raises(ValueError, match="only NER has one"):
