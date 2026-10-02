@@ -208,7 +208,7 @@ class ClockAuthority:
             joined[member] = (kind, t, daemon)
             self._calls[lp][member] += 1
             if len(joined) < len(members):
-                return self._address(self._grant_due())
+                return []
             t = min(asked for _, asked, _ in joined.values())
             daemon = min(deadline for _, _, deadline in joined.values())
             joined.clear()
