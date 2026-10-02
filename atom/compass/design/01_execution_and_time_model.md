@@ -423,6 +423,38 @@ concurrently in wall time.**
 - **Determinism:** ties at equal timestamps broken by LP id. Without this the
   126-vs-189-decode-steps nondeterminism returns.
 
+#### Daemon deadlines and the finish
+
+A housekeeping timer (the metrics push and refresh, a server tick, keep-alive, a periodic
+scrape) never stops. An LP that counts one as its next event keeps its `N` finite for
+ever, so a run that waits for every `N` to be infinite never ends. Such a timer is a
+**daemon deadline**: the clock owner passes it to `next_event(t, t_daemon)` beside its
+essential next event `t`, and it fires as usual but does not keep the run alive.
+Essential is the default; daemon is declared. There is no end-of-workload request.
+
+- **Essential horizon `H`:** the largest TAR target, finite NER target or registered
+  arrival seen so far. It only grows.
+- **Grants:** `N` and the strict rule are unchanged and include daemon deadlines, so
+  safety is untouched. A waiting LP whose `N` is its daemon deadline is granted only once
+  that deadline is at most `H`; until then it is held. A held deadline delays no
+  essential grant: whatever waits behind it has a target or arrival at least that
+  deadline, already in `H`. Deadlock recovery picks among grantable LPs only.
+- **Finish:** every LP waits, nothing is undelivered, no essential target is pending, and
+  every daemon deadline exceeds `H`. Every LP is granted `+inf`, and those deadlines never
+  fire. With no daemon deadlines, this is the state in which every `N` is infinite.
+- **Why `H`, not "no essential work right now":** that test depends on which running LP
+  reports first, so a daemon tick near the end would fire under one request order and not
+  another. Under `H`, a daemon deadline fires exactly when some essential time or arrival
+  reaches it.
+- **`+inf` closes the simulation window.** `advance_to` and `next_event` after it raise;
+  `stamp_send` keeps returning `+inf` arrivals for shutdown sends; `LPRuntime.close`
+  raises if the owner leaves before it. The owner's loop exits rather than run its timers
+  at `+inf`.
+- **What keeps a run alive by mistake:** an undeclared housekeeping timer, and a daemon
+  whose period is at most the lookahead of a message it causes, which raises `H` past its
+  own next tick. Periods are seconds and lookaheads milliseconds; a simulated-time bound
+  on the run catches both.
+
 #### Lookahead sources
 
 Every one is physical and configurable, which is also a project requirement
@@ -1519,7 +1551,7 @@ Ordered by how much they could cost.
 | D0 | Fresh design; prior branches referenced at the design level only, not as a code-port plan | 2026-09-17 |
 | D1 | Keep ATOM's multi-process / multi-thread topology; additive changes only | 2026-09-17 |
 | D2 | "Two nodes" means true PD disaggregation, realised as two containers on one physical node | 2026-09-17 |
-| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner, and zero-lookahead couplings collapse into one LP; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters) | 2026-09-18; revised 2026-09-28 |
+| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner, and zero-lookahead couplings collapse into one LP; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); housekeeping timers are daemon deadlines, and a run finishes when no essential work is left | 2026-09-18; revised 2026-09-28, 2026-10-02 |
 | D3.1 | Single CA with a hierarchy-ready interface; LP count scales with replicas and PP stages, not with GPUs | 2026-09-18 |
 | D3.2 | Always-on causality detectors: a straggler check against the receiver's last drain (fails the run); a stall the CA cannot see prints one diagnostic after 30 wall seconds and keeps waiting, never aborting; clock-source CI lint | 2026-09-19; revised 2026-09-28 |
 | D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for M4/M6 multi-container runs | 2026-09-19 |

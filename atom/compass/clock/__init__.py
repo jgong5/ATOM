@@ -22,7 +22,6 @@ package, not inside it. The build-time audit of ATOM's blocking calls sits in
 """
 
 from .authority import (
-    END,
     NER,
     TAR,
     BackdatedEvent,
@@ -49,7 +48,6 @@ from .observability import (
 from .registry import LpRegistry
 
 __all__ = [
-    "END",
     "NER",
     "SPEED_TARGET_RATIO",
     "TAR",

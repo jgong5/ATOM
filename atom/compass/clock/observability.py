@@ -4,8 +4,8 @@ a run summary.
 
 **The timeline.** One record per reply the Clock Authority issues, in issue
 order: which LP, from which clock to which, the kind of request it answers
-(``TAR``, ``NER``, or ``END`` for the replies that finish the run), and whether
-the recovery branch issued it. It is off unless a run hands the authority a
+(``TAR`` or ``NER``; a reply to ``+inf`` finishes the run), and whether the
+recovery branch issued it. It is off unless a run hands the authority a
 `TimelineLog`; with none, a reply costs one ``is not None`` test.
 
 **The dump.** `lp_table_dump` renders `ClockAuthority.lp_table()` as text: each
@@ -45,8 +45,7 @@ def _finite_seconds(value: float, what: str) -> float:
     seconds = float(value)
     if not math.isfinite(seconds) or seconds < 0.0:
         raise ValueError(
-            f"{what} must be a finite number of seconds and not negative, "
-            f"got {value!r}"
+            f"{what} must be a finite number of seconds and not negative, got {value!r}"
         )
     return seconds
 
