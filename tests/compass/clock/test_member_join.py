@@ -10,7 +10,9 @@ groups below defend:
 * **The combination.** NER takes the least target and the least daemon
   deadline over the members, and each member is released only its own
   channels.
-* **The refusals**, each naming the LP and both members.
+* **The refusals**, each naming the LP and both members, and the ownership the
+  caller declares: every channel into or out of the LP has exactly one owning
+  member, and a member sends only on its own.
 * **One member is no member.** It is granted exactly as an LP with none.
 * **The deadlock the join exists for.** With one LP per rank, a rank woken by a
   message waits in the lockstep all-reduce for a rank that waits in NER with no
@@ -52,8 +54,14 @@ def _dp_table(engines):
     return table
 
 
-def _joined():
-    return ClockAuthority(_dp_table(("engine", "engine")), members={ENGINE: RANKS})
+def _own(rank):
+    """The channels rank `rank` owns on the joined engine."""
+    return (f"frontend->engine:request#{rank}", f"engine->frontend:output#{rank}")
+
+
+def _joined(members=None):
+    members = members or {rank: _own(rank) for rank in RANKS}
+    return ClockAuthority(_dp_table(("engine", "engine")), members={ENGINE: members})
 
 
 def _grants(replies):
@@ -102,7 +110,7 @@ def test_ner_joins_to_the_least_target_and_deadline_and_releases_each_its_own():
             "dp1 asked TAR(2.0) while dp0 asked TAR(1.0)",
         ),
         (("dp0", TAR, 1.0), ("dp1", NER, 1.0), "dp1 asked NER while dp0 asked TAR"),
-        (("dp1", TAR, 1.0), ("dp1", TAR, 1.0), "dp1 made call 2 while dp0 has made 0"),
+        (("dp1", TAR, 1.0), ("dp1", TAR, 1.0), "dp1 called again before dp0 called"),
     ],
     ids=["unequal-target", "mixed-kinds", "call-count"],
 )
@@ -126,9 +134,59 @@ def test_a_call_from_no_member_of_the_lp_is_refused(lp, member):
         _joined().on_request(lp, NER, INF, [], member=member)
 
 
-def test_a_channel_into_the_lp_that_no_member_owns_is_refused():
-    with pytest.raises(ValueError, match="request#dp1 goes into engine, and none"):
-        ClockAuthority(_dp_table(("engine", "engine")), members={ENGINE: ("dp0",)})
+def test_members_are_named_by_the_caller_not_by_their_channels():
+    ca = _joined({"rank0": _own("dp0"), "rank1": _own("dp1")})
+    req0, req1 = "frontend->engine:request#dp0", "frontend->engine:request#dp1"
+    ca.on_request(FRONTEND, NER, INF, [(req1, 0, 1.0)])
+    assert ca.on_request(ENGINE, NER, INF, [], member="rank0") == []
+    assert ca.on_request(ENGINE, NER, INF, [], member="rank1") == [
+        ((ENGINE, "rank0"), 1.0, {req0: []}),
+        ((ENGINE, "rank1"), 1.0, {req1: [(0, 1.0)]}),
+    ]
+
+
+def test_a_send_on_a_channel_another_member_owns_is_refused_naming_its_owner():
+    out0 = "engine->frontend:output#dp0"
+    refusal = f"engine: dp1 logged a send on {out0}, which dp0 owns"
+    with pytest.raises(ClockAbort, match="^" + re.escape(refusal)):
+        _joined().on_request(ENGINE, NER, INF, [(out0, 0, 1.0)], member="dp1")
+
+
+@pytest.mark.parametrize(
+    "members, refusal",
+    [
+        (
+            {"dp0": _own("dp0"), "dp1": _own("dp1")[:1]},
+            (
+                "engine->frontend:output#dp1 goes into or out of engine, and none of "
+                "its members dp0, dp1 owns it"
+            ),
+        ),
+        (
+            {"dp0": _own("dp0") + _own("dp1")[:1], "dp1": _own("dp1")},
+            (
+                "frontend->engine:request#dp1 goes into or out of engine, and its "
+                "members dp0 and dp1 each own it"
+            ),
+        ),
+        (
+            {"dp0": _own("dp0") + ("engine->frontend:output#dp2",), "dp1": _own("dp1")},
+            (
+                "dp0 of engine owns engine->frontend:output#dp2, which neither goes "
+                "into nor comes out of engine"
+            ),
+        ),
+    ],
+    ids=["unowned", "doubly-owned", "not-the-lps"],
+)
+def test_a_channel_not_owned_by_exactly_one_member_is_refused(members, refusal):
+    with pytest.raises(ValueError, match="^" + re.escape(refusal) + "$"):
+        _joined(members)
+
+
+def test_an_empty_member_list_is_refused():
+    with pytest.raises(ValueError, match="^engine is declared with an empty member"):
+        ClockAuthority(_dp_table(("engine", "engine")), members={ENGINE: {}})
 
 
 def test_a_one_member_lp_is_granted_exactly_as_an_lp_with_none():
@@ -157,7 +215,8 @@ def test_a_one_member_lp_is_granted_exactly_as_an_lp_with_none():
 
     plain = run(None, None)
     assert [g for _, g, _ in plain] == [1.0, 3.0, 4.0, INF, INF, INF]
-    assert run({ENGINE: ("dp0",)}, "dp0") == plain
+    every = (req, "frontend->engine:control#dp0", out)
+    assert run({ENGINE: {"dp0": every}}, "dp0") == plain
 
 
 # --- the deadlock the join exists for ----------------------------------------

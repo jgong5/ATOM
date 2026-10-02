@@ -43,8 +43,9 @@ no essential target is pending: the run is finished, every LP is granted
 ``+inf``, and the daemon deadlines still held never fire.
 
 An LP may be declared with members: processes that each hold a runtime for it,
-as the ranks of a data-parallel group do. A member names itself in each call
-and owns the channels into the LP whose names end ``#<member>``. The members'
+as the ranks of a data-parallel group do. A member names itself in each call,
+and each channel into or out of the LP is owned by exactly one member, as the
+caller declares; a member may log sends only on channels it owns. The members'
 calls are joined into one request per round: each member makes the same number
 of calls, all ask one kind, every TAR asks the same target, and the joined
 NER's target and daemon deadline are each the least over the members. A call
@@ -107,8 +108,9 @@ class ClockAuthority:
     `timeline`, when given, receives one ``record(lp, from, to, kind,
     recovered)`` call per reply, in issue order. `grants` counts each LP's
     finite grants by name. `final_clocks` is every LP's clock just before the run
-    finished, and ``None`` until it has. `members` maps an LP to the names of
-    its members; an LP not in it is its own single caller.
+    finished, and ``None`` until it has. `members` maps an LP to
+    ``{member: names of the channels into or out of it that the member owns}``;
+    an LP not in it is its own single caller.
     """
 
     def __init__(self, channels: ChannelTable, timeline=None, members=None) -> None:
@@ -132,19 +134,35 @@ class ClockAuthority:
         self.grants = {i.name: 0 for i in self._ids}
         self.final_clocks = None
         self._members = {}  # LP -> its member names, sorted
-        self._calls = {}  # LP -> member -> calls made
+        self._owner = {}  # LP -> channel into or out of it -> the member owning it
         self._round = {}  # LP -> member -> (kind, t, daemon) of the round being joined
-        for lp, names in (members or {}).items():
+        for lp, owned in (members or {}).items():
             channels.registry.require(lp)
-            names = tuple(sorted(names))
-            for name in self._into[lp]:
-                if name.rpartition("#")[2] not in names:
+            if not owned:
+                raise ValueError(f"{lp} is declared with an empty member list")
+            touching = set(self._into[lp]) | {
+                c.name for c in channels.channels_from(lp)
+            }
+            listed = {name for names in owned.values() for name in names}
+            self._owner[lp] = {}
+            for name in sorted(touching | listed):
+                owners = sorted(m for m, names in owned.items() if name in names)
+                if name not in touching:
                     raise ValueError(
-                        f"{name} goes into {lp}, and none of its members "
-                        f"{', '.join(names)} owns it"
+                        f"{' and '.join(owners)} of {lp} owns {name}, which "
+                        f"neither goes into nor comes out of {lp}"
                     )
-            self._members[lp] = names
-            self._calls[lp] = dict.fromkeys(names, 0)
+                if len(owners) != 1:
+                    raise ValueError(
+                        f"{name} goes into or out of {lp}, and "
+                        + (
+                            f"its members {' and '.join(owners)} each own it"
+                            if owners
+                            else f"none of its members {', '.join(sorted(owned))} owns it"
+                        )
+                    )
+                self._owner[lp][name] = owners[0]
+            self._members[lp] = tuple(sorted(owned))
             self._round[lp] = {}
 
     def on_request(
@@ -202,11 +220,10 @@ class ClockAuthority:
         if members:
             self._refuse_unjoinable(lp, member, kind, t)
         for name, seq, arrival in log:
-            self._register(lp, name, seq, arrival)
+            self._register(lp, name, seq, arrival, member)
         if members:
             joined = self._round[lp]
             joined[member] = (kind, t, daemon)
-            self._calls[lp][member] += 1
             if len(joined) < len(members):
                 return []
             t = min(asked for _, asked, _ in joined.values())
@@ -218,13 +235,13 @@ class ClockAuthority:
         return self._address(self._grant_due())
 
     def _refuse_unjoinable(self, lp: LpId, member: str, kind: str, t: float) -> None:
-        calls, joined = self._calls[lp], self._round[lp]
-        behind = min(calls, key=calls.__getitem__)
+        joined = self._round[lp]
         reason = None
-        if calls[member] > calls[behind]:
+        if member in joined:
+            behind = ", ".join(m for m in self._members[lp] if m not in joined)
             reason = (
-                f"{lp}: {member} made call {calls[member] + 1} while {behind} has "
-                f"made {calls[behind]}; every member calls once per round"
+                f"{lp}: {member} called again before {behind} called; every "
+                "member calls once per round"
             )
         elif joined:
             other, (other_kind, other_t, _) = next(iter(joined.items()))
@@ -246,7 +263,7 @@ class ClockAuthority:
                 else (
                     (i, m),
                     g,
-                    {c: r for c, r in released.items() if c.rpartition("#")[2] == m},
+                    {c: r for c, r in released.items() if self._owner[i][c] == m},
                 )
             )
             for i, g, released in replies
@@ -273,13 +290,20 @@ class ClockAuthority:
             )
         return tuple(rows)
 
-    def _register(self, lp: LpId, name: str, seq: int, arrival: float) -> None:
+    def _register(
+        self, lp: LpId, name: str, seq: int, arrival: float, member: str | None
+    ) -> None:
         channel = self._channels.channel(name)
         a = _seconds(arrival, f"the arrival of {name} seq {seq}", finite=True)
         expected = self._next_seq[name]
         floor = self._now[lp] + channel.lookahead_s
         if channel.source != lp:
             refusal = f"{lp} logged a send on {name}, whose sender is {channel.source}"
+        elif member is not None and self._owner[lp][name] != member:
+            refusal = (
+                f"{lp}: {member} logged a send on {name}, which "
+                f"{self._owner[lp][name]} owns"
+            )
         elif seq != expected:
             refusal = (
                 f"{lp} logged seq {seq} on {name}, which expects seq {expected} "
