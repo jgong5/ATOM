@@ -157,10 +157,12 @@ def test_sends_are_stamped_now_plus_lookahead_and_ride_the_next_request():
 
 def test_the_inf_grant_closes_the_clock_and_leaves_sends_stamped_inf():
     rt, call = _runtime(ENGINE, (INF, {}))
+    rt.start_run()
     with pytest.raises(RuntimeError, match=r"left its loop at 0.0, before the \+inf"):
         rt.close()
     call(rt.stamp_send, OUT)
     assert call(rt.next_event, INF, 5.0) == INF
+    assert not rt.in_run
     assert rt.conn.sent == [("NER", INF, [(OUT, 0, IPC)], 5.0)]
     for fn, args in [(rt.advance_to, (1.0,)), (rt.next_event, (INF,))]:
         with pytest.raises(RuntimeError, match=rf"^{fn.__name__} from engine after"):

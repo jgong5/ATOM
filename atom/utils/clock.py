@@ -9,10 +9,11 @@ log, t_daemon))`` then ``conn.recv() -> (G, released)``, and every request
 carries the sends registered since the previous one, so the authority knows each
 message an LP produced before it moves that LP's clock.
 
-A grant to ``+inf`` closes the simulation window: the run is finished, and the
-owner's loop must exit rather than run its timers at ``+inf``. A clock call after
-it raises, `stamp_send` keeps returning ``+inf`` arrivals for shutdown sends, and
-`close` raises if the owner leaves before it.
+A grant to ``+inf`` closes the simulation window (`end_run`) before the process
+begins to shut down: the run is finished, and the owner's loop must exit rather
+than run its timers at ``+inf``. A clock call after it raises, `stamp_send` keeps
+returning ``+inf`` arrivals for shutdown sends, and `close` raises if the owner
+leaves before it.
 
 A grant names the messages it releases as ``{channel: [(seq, arrival)]}``.
 `_step_through` releases them one at a time in ``(arrival, channel, seq)``
@@ -121,6 +122,8 @@ class LPRuntime:
         self._require_open("next_event")
         G, released = self._ca_call("NER", t, t_daemon)
         self._step_through(G, released)
+        if G == float("inf"):
+            self.end_run()
         return G
 
     def close(self) -> None:
