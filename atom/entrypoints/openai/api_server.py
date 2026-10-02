@@ -2455,25 +2455,6 @@ async def stop_profile():
 # ============================================================================
 
 
-def _loop_impl() -> str:
-    """uvicorn's ``loop``: on a simulated run, the loop that runs on the LP clock."""
-    if clock._installed is not None:
-        return "atom.utils.compass_loop:CompassEventLoop"
-    # uvloop replaces the stdlib asyncio selector loop with a libuv-backed one,
-    # which is markedly faster at the SSE socket I/O (sock.send / selector
-    # register-unregister) that saturates the event loop under high streaming
-    # concurrency. Fall back to the default loop if uvloop is unavailable.
-    try:
-        import uvloop  # noqa: F401
-
-        return "uvloop"
-    except ImportError:
-        logger.warning(
-            "uvloop not installed; falling back to the default asyncio loop."
-        )
-        return "auto"
-
-
 def main():
     """Main entry point for the server."""
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
@@ -2654,6 +2635,25 @@ def main():
         access_log=not args.disable_uvicorn_access_log,
         timeout_keep_alive=args.timeout_keep_alive,
     )
+
+
+def _loop_impl() -> str:
+    """uvicorn's ``loop``: on a simulated run, the loop that runs on the LP clock."""
+    if clock._installed is not None:
+        return "atom.utils.compass_loop:CompassEventLoop"
+    # uvloop replaces the stdlib asyncio selector loop with a libuv-backed one,
+    # which is markedly faster at the SSE socket I/O (sock.send / selector
+    # register-unregister) that saturates the event loop under high streaming
+    # concurrency. Fall back to the default loop if uvloop is unavailable.
+    try:
+        import uvloop  # noqa: F401
+
+        return "uvloop"
+    except ImportError:
+        logger.warning(
+            "uvloop not installed; falling back to the default asyncio loop."
+        )
+        return "auto"
 
 
 if __name__ == "__main__":

@@ -56,7 +56,7 @@ class _Watched:
 
 
 @pytest.fixture
-def run():
+def run(monkeypatch):
     endpoint = f"inproc:test-compass-loop-{uuid.uuid4().hex}"
     server = clock_transport.serve(ClockAuthority(TABLE), endpoint)
     clock_transport.connect(ENGINE, endpoint).send((NER, INF, [], INF))
@@ -64,9 +64,26 @@ def run():
     conn.rt = rt = LPRuntime(FRONTEND, TABLE, conn)
     rt.start_run()
     clock.install(rt)
+    # Every loop the test builds, uvicorn's included, is stopped after 20 wall
+    # seconds, so a loop that never stops fails the test instead of hanging it.
+    loops, init = [], CompassEventLoop.__init__
+
+    def tracked(self):
+        init(self)
+        loops.append(self)
+
+    def stop_all():
+        for loop in loops:
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(loop.stop)
+
+    monkeypatch.setattr(CompassEventLoop, "__init__", tracked)
+    guard = threading.Timer(20, stop_all)
+    guard.start()
     try:
         yield SimpleNamespace(rt=rt, conn=conn, endpoint=endpoint)
     finally:
+        guard.cancel()
         clock.install(None)
         server.close()
 
@@ -93,7 +110,7 @@ def _traffic(run, stamps: queue.Queue, before_ner) -> threading.Thread:
         rt.next_event(INF)
         rt.close()
 
-    thread = threading.Thread(target=body, name="traffic")
+    thread = threading.Thread(target=body, name="traffic", daemon=True)
     thread.start()
     return thread
 
@@ -125,10 +142,13 @@ def test_the_metrics_refresh_is_a_daemon_and_the_finish_stops_the_loop(
     run, monkeypatch
 ):
     _idle_traffic(run)
-    refreshed = []
+    refreshed, late = [], []
 
     async def refresh():
-        refreshed.append(asyncio.get_running_loop().time())
+        loop = asyncio.get_running_loop()
+        refreshed.append(loop.time())
+        # A plain callback, a daemon because the refresh loop schedules it.
+        loop.call_later(4, lambda: late.append(loop.time()))
 
     monkeypatch.setattr(api_server, "_refresh_metrics_once", refresh)
 
@@ -140,14 +160,16 @@ def test_the_metrics_refresh_is_a_daemon_and_the_finish_stops_the_loop(
     # asyncio.run, as uvicorn calls it: a stop ends the main task early.
     with pytest.raises(RuntimeError, match="Event loop stopped before Future"):
         asyncio.run(serve(), loop_factory=CompassEventLoop)
-    assert refreshed == [5.0, 10.0]
+    # The timers due at 14 and 15 never run, not even at +inf.
+    assert refreshed == [5.0, 10.0] and late == [9.0]
     assert run.conn.sent == [
         (NER, 12.0, [], 5.0),
+        (NER, 12.0, [], 9.0),
         (NER, 12.0, [], 10.0),
-        (NER, 12.0, [], 15.0),
-        (NER, INF, [], 15.0),
+        (NER, 12.0, [], 14.0),
+        (NER, INF, [], 14.0),
     ]
-    assert run.conn.grants == [5.0, 10.0, 12.0, INF]
+    assert run.conn.grants == [5.0, 9.0, 10.0, 12.0, INF]
 
 
 def test_no_time_is_asked_while_a_station_job_is_open(run):
@@ -158,7 +180,7 @@ def test_no_time_is_asked_while_a_station_job_is_open(run):
         later = asyncio.ensure_future(asyncio.sleep(1))  # a timer to jump to
 
         def do_preprocess():
-            return None
+            time.sleep(0.2)  # open across the loop's next select
 
         await loop.run_in_executor(None, do_preprocess)
         done = loop.time()
@@ -206,18 +228,13 @@ def test_a_request_released_before_it_is_read_is_handed_over_at_its_arrival(run)
 
     def client():
         _until(lambda: server.started and released())
-        listener = server.servers[0]
-        guard = threading.Timer(
-            30, listener.get_loop().call_soon_threadsafe, (listener.get_loop().stop,)
-        )
-        guard.start()
-        port = listener.sockets[0].getsockname()[1]
+        port = server.servers[0].sockets[0].getsockname()[1]
         got["conn"] = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
         got["conn"].request("GET", "/", headers={"x-test-stamp": f"{arrival!r} {seq}"})
+        # The connection stays open, so its keep-alive timer stays set.
         got["body"] = got["conn"].getresponse().read()
-        guard.cancel()  # the connection stays open: its keep-alive timer is set
 
-    thread = threading.Thread(target=client, name="client")
+    thread = threading.Thread(target=client, name="client", daemon=True)
     thread.start()
     try:
         with pytest.raises(RuntimeError, match="Event loop stopped before Future"):
@@ -249,13 +266,10 @@ def test_a_request_read_before_its_release_is_held_until_it(run):
         "headers": [(b"x-test-stamp", f"{arrival!r} {seq}".encode())],
     }
     loop = CompassEventLoop()
-    guard = threading.Timer(10, loop.call_soon_threadsafe, (loop.stop,))
-    guard.start()
     try:
         loop.run_until_complete(HttpChannel(app, _stamp)(scope, None, None))
         loop.run_forever()
     finally:
-        guard.cancel()
         traffic.join(10)
     loop.close()
     assert handled == [arrival]
