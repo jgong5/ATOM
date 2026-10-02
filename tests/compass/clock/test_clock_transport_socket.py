@@ -194,13 +194,13 @@ def test_a_held_reply_over_tcp_delays_no_other_lps_reply(served):
     table.declare("c->a:m", c, a, 1.0, "inline")
     endpoint = served(ClockAuthority(table), LOCAL)
     conns = {lp: _connect(lp, endpoint) for lp in (a, b, c)}
-    _result(_later(conns[b].send, (NER, INF, [])))
+    _result(_later(conns[b].send, (NER, INF, [], INF)))
     held = _later(conns[b].recv)
 
     def steps(conn):
         replies = []
         for k in range(1, 51):
-            conn.send((TAR, k * 0.5, []))
+            conn.send((TAR, k * 0.5, [], INF))
             replies.append(conn.recv())
         return replies
 
@@ -209,7 +209,7 @@ def test_a_held_reply_over_tcp_delays_no_other_lps_reply(served):
     assert len(replies) == 100
     assert held.empty()
     for lp in (a, c):
-        conns[lp].send((NER, INF, []))
+        conns[lp].send((NER, INF, [], INF))
     assert _result(held) == (INF, {})
     for conn in conns.values():
         conn.close()
@@ -266,16 +266,16 @@ def test_a_refusal_crosses_tcp_as_itself_and_the_connection_serves_on(served):
     ca = ClockAuthority(_table())
     a = _connect(A, served(ca, LOCAL))
     with pytest.raises(BackdatedEvent, match="before a's clock 0.0") as refused:
-        _ask(a, (TAR, 1.0, [(AB, 0, 0.1)]))
+        _ask(a, (TAR, 1.0, [(AB, 0, 0.1)], INF))
     assert refused.value.table == ca.lp_table()
     # A frame the loop refuses to queue is answered in place of a reply.
     a.send(("GRANT", 1.0, {}))
     with pytest.raises(ValueError, match="sends only TAR, NER"):
         _result(_later(a.recv))
-    assert _ask(a, (TAR, 1.0, [])) == (1.0, {})
+    assert _ask(a, (TAR, 1.0, [], INF)) == (1.0, {})
     a.close()
     with pytest.raises(ValueError, match="closed file"):
-        a.send((TAR, 2.0, []))
+        a.send((TAR, 2.0, [], INF))
 
 
 @pytest.mark.parametrize("endpoint", ["tcp://127.0.0.1", "tcp://:9", "tcp:9"])
