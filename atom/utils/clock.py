@@ -19,13 +19,22 @@ there is nothing to wait for. Messages are counted by ``(channel, seq)``, so a
 channel need not be FIFO. The ``(channel, seq)`` sets here are only ever tested
 for membership, never iterated.
 
-The receive side (socket and poller wrappers) calls `check_arrival` for every
-stamped frame it reads, holds a frame back until `is_released`, and brackets
-handing one to ATOM with `handed_over` and `back_at_wait_point`.
+The receive side (`WrappedSocket`, `WrappedPoller`) calls `check_arrival` for
+every stamped frame it reads, holds a frame back until `is_released`, and
+brackets handing one to ATOM with `handed_over` and `back_at_wait_point`. The
+send side stamps each frame with `stamp_send`, directly or through the
+`RelayQueue` that stands in for the engine's output queue.
 """
 
+import contextlib
 import logging
+import math
+import os
+import pickle
+import queue
 import threading
+
+import zmq
 
 from atom.compass.clock import ChannelTable, LpId
 from atom.compass.clock.channels import ReceiveMode
@@ -39,6 +48,24 @@ DIAG_S = 30.0
 
 class Straggler(Exception):
     """An unreleased message whose arrival this LP has already released past."""
+
+
+class _Wakeup(threading.Event):
+    """An event `zmq.zmq_poll` can also wait on, through `fd`, beside the sockets."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        # ponytail: one eventfd per receiving thread, never closed; threads are few
+        self.fd = os.eventfd(0, os.EFD_NONBLOCK)
+
+    def set(self) -> None:
+        super().set()
+        os.eventfd_write(self.fd, 1)
+
+    def clear(self) -> None:
+        super().clear()
+        with contextlib.suppress(BlockingIOError):
+            os.eventfd_read(self.fd)
 
 
 class LPRuntime:
@@ -66,7 +93,7 @@ class LPRuntime:
         # Frames read but not released, (channel, seq) -> arrival: checked at each drain.
         self.unreleased: dict[tuple[str, int], float] = {}
         self.taken_by: dict[threading.Thread, tuple[str, int]] = {}
-        self.wakes: dict[threading.Thread, threading.Event] = {}
+        self.wakes: dict[threading.Thread, _Wakeup] = {}
 
     def start_run(self) -> None:
         self.in_run = True
@@ -177,10 +204,13 @@ class LPRuntime:
                 if arrival < self.now:
                     self._straggler(arrival, ch, seq)
 
-    def my_wakeup(self) -> threading.Event:
+    def my_wakeup(self) -> _Wakeup:
         """This thread's event, set whenever a message is released."""
         with self.lock:
-            return self.wakes.setdefault(threading.current_thread(), threading.Event())
+            me = threading.current_thread()
+            if me not in self.wakes:
+                self.wakes[me] = _Wakeup()
+            return self.wakes[me]
 
     def is_released(self, ch: str, seq: int) -> bool:
         """Caller holds `lock`."""
@@ -200,3 +230,179 @@ class LPRuntime:
         """Caller holds `lock`."""
         self.handled[ch].add(seq)
         self.cv.notify_all()
+
+
+class UnsentRelayItem(Exception):
+    """The output thread took a stamped item off a `RelayQueue` and never sent it."""
+
+
+class WrappedSocket:
+    """One end of a channel's zmq socket, with the ``(channel, arrival, seq)`` header.
+
+    The header is its own frame: first, or after the identity frame on a ROUTER.
+    Frames read are held back until the runtime releases them, then handed over
+    in ``(arrival, seq)`` order; frames sent outside the run pass straight through.
+    """
+
+    def __init__(self, rt: LPRuntime, raw: zmq.Socket, ch: str) -> None:
+        self.rt, self.raw, self.ch = rt, raw, ch
+        self.relay: RelayQueue | None = None
+        self.buf: list[tuple] = []  # (ch, arrival, seq, payload frame) read, not taken
+
+    def send(self, data, **kw) -> None:
+        self.send_multipart([data], **kw)
+
+    def send_multipart(self, frames: list, **kw) -> None:
+        if not self.rt.in_run:
+            stamp = (None, None)
+        elif self.relay is not None:
+            stamp = self.relay.take_stamp()
+        else:
+            stamp = self.rt.stamp_send(self.ch)
+        hdr = pickle.dumps((self.ch, *stamp))  # arrival None: outside the run
+        at = 1 if self.raw.type == zmq.ROUTER else 0
+        self.raw.send_multipart([*frames[:at], hdr, *frames[at:]], **kw)
+
+    def pull(self) -> None:
+        """Read every frame already here, without blocking; check and buffer each."""
+        while True:
+            try:
+                hdr, payload = self.raw.recv_multipart(zmq.NOBLOCK, copy=False)
+            except zmq.Again:
+                return
+            ch, arrival, seq = pickle.loads(hdr.bytes)
+            if arrival is not None:
+                self.rt.check_arrival(ch, arrival, seq)
+            self.buf.append((ch, arrival, seq, payload))
+            self.buf.sort(key=lambda f: (-math.inf, 0) if f[1] is None else f[1:3])
+
+    def _first_ready(self) -> int | None:
+        with self.rt.lock:
+            for k, (ch, arrival, seq, _) in enumerate(self.buf):
+                if arrival is None or self.rt.is_released(ch, seq):
+                    return k
+        return None
+
+    def ready(self) -> bool:
+        return self._first_ready() is not None
+
+    def _take(self, copy: bool):
+        ch, arrival, seq, payload = self.buf.pop(self._first_ready())
+        return ch, arrival, seq, payload.bytes if copy else payload
+
+    def recv(self, copy: bool = True):
+        """A receiving thread's wait point, or the clock owner's on an inline channel."""
+        if self.rt.table.recv_mode(self.ch) is ReceiveMode.INLINE:
+            return self._recv_inline(copy)
+        if not self.ready():  # nothing to take: the poller is the wait point
+            WrappedPoller(self.rt, [self]).poll()
+        ch, arrival, seq, payload = self._take(copy)
+        if arrival is not None:
+            self.rt.handed_over(ch, seq)
+        return payload
+
+    # ---- inline receive: the clock owner takes released frames itself ----
+
+    def settle(self) -> None:
+        """Block until every frame released on this channel has physically arrived."""
+        while True:
+            self.pull()
+            with self.rt.lock:
+                if self.rt.released[self.ch] <= self.rt.arrived[self.ch]:
+                    return
+            self.raw.poll()
+
+    def _recv_inline(self, copy: bool):
+        self.settle()
+        while not self.ready():
+            self.rt.next_event(math.inf)
+            self.settle()
+        ch, arrival, seq, payload = self._take(copy)
+        if arrival is not None:
+            with self.rt.lock:
+                self.rt.count_done_locked(ch, seq)
+        return payload
+
+    def poll(self, timeout_ms: int | None = None) -> bool:
+        """A bounded poll is an idle point until ``now + timeout``; zero never idles."""
+        self.settle()
+        if not self.ready() and timeout_ms != 0:
+            t = math.inf if timeout_ms is None else self.rt.now + timeout_ms / 1000.0
+            self.rt.next_event(t)
+            self.settle()
+        return self.ready()
+
+
+class WrappedPoller:
+    """`zmq.Poller` for a receiving thread: the wait point where a frame counts as done.
+
+    Channel sockets count as readable only with a released frame; any other socket
+    registered (a shutdown signal) is polled as it is.
+    """
+
+    def __init__(self, rt: LPRuntime, socks=()) -> None:
+        self.rt, self.socks = rt, list(socks)
+
+    def register(self, sock, flags: int = zmq.POLLIN) -> None:
+        self.socks.append(sock)
+
+    def poll(self) -> list[tuple]:
+        self.rt.back_at_wait_point()
+        wake = self.rt.my_wakeup()
+        wrapped = [s for s in self.socks if isinstance(s, WrappedSocket)]
+        waits = [(getattr(s, "raw", s), zmq.POLLIN) for s in self.socks]
+        while True:
+            wake.clear()
+            for s in wrapped:
+                s.pull()
+            ready = [
+                s
+                for s in self.socks
+                if (s.ready() if isinstance(s, WrappedSocket) else s.poll(0))
+            ]
+            if ready:
+                return [(s, zmq.POLLIN) for s in ready]
+            zmq.zmq_poll([*waits, (wake.fd, zmq.POLLIN)])
+
+
+class RelayQueue:
+    """The engine's output queue: `put` stamps the send, and the send carries the stamp.
+
+    Only the clock owner puts in the run, and one consumer thread gets. The
+    stamp travels with its item, FIFO, so the header is the step's time, not the
+    moment the output thread woke. Every item taken in the run must be sent.
+    """
+
+    def __init__(self, rt: LPRuntime, wsock: WrappedSocket) -> None:
+        self.rt, self.wsock, self.q = rt, wsock, queue.Queue()
+        self.pending: tuple | None = None  # stamp of the item taken, not yet sent
+        self.consumer: threading.Thread | None = None
+        wsock.relay = self
+
+    def put(self, item) -> None:
+        stamp = self.rt.stamp_send(self.wsock.ch) if self.rt.in_run else (None, None)
+        self.q.put((stamp, item))
+
+    put_nowait = put
+
+    def get(self):
+        me = threading.current_thread()
+        if self.consumer not in (None, me):
+            raise RuntimeError(
+                f"{self.wsock.ch}: get from thread {me.name!r}; the relay's one "
+                f"consumer is {self.consumer.name!r}"
+            )
+        self.consumer = me
+        if self.pending is not None and self.pending[0] is not None:
+            raise UnsentRelayItem(
+                f"{self.wsock.ch}: the item stamped (arrival {self.pending[0]}, seq "
+                f"{self.pending[1]}) was taken and never sent"
+            )
+        self.pending, item = self.q.get()
+        return item
+
+    def take_stamp(self) -> tuple:
+        if self.pending is None:
+            raise RuntimeError(f"{self.wsock.ch}: one relay item sent twice")
+        stamp, self.pending = self.pending, None
+        return stamp
