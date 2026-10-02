@@ -13,6 +13,7 @@ import logging
 import queue
 import selectors
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -168,6 +169,29 @@ def test_five_jobs_at_width_two_predicted_beside_observed(loop, monkeypatch):
     assert [row[:2] for row in rows] == [pytest.approx(p) for p in predicted]
     # The arrival stamp is read inside the job, after the encode is charged.
     assert [row[2] for row in rows] == pytest.approx([p[1] for p in predicted])
+
+
+def test_a_job_finishing_before_an_earlier_one_gets_its_own_completion(loop):
+    encode = wrap_encode(lambda text: list(range(int(text))), _entry())
+    ex, release = _executor(loop, width=2)
+
+    async def request(n):
+        def do_preprocess():
+            jobs = ex.station.jobs  # job 0 ends after job 1 is marked done
+            while n == 100 and not (len(jobs) > 1 and jobs[1][2]):
+                time.sleep(0.001)
+            return encode(str(n))
+
+        await loop.run_in_executor(None, do_preprocess)
+        return loop.time()
+
+    async def run():
+        return await asyncio.wait_for(asyncio.gather(*map(request, (100, 50))), 10)
+
+    try:
+        assert loop.run_until_complete(run()) == pytest.approx([0.201, 0.101])
+    finally:
+        release()
 
 
 def _unregistered():
