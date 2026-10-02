@@ -12,19 +12,14 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — 89 rows, **T1–T88 and T91**, per topic, of which **83 are open**:
-   T10, T15, T22, T48 and T65 are struck through as done, and T77 was opened and closed by
-   P0.1. **The previous figures, 86 rows and 80 open, were stale rather than differently
-   counted**: re-run at `fec23aecb` the rule below gives 87 rows and 5 struck, because T81
-   landed from P0.4 after the line was last written. T88 makes it 88.
-   Both figures are the rows of section 3 below, counted as
-   `grep -oE '^\| *~*\**T[0-9]+'` over that section and nothing else — prose elsewhere in
-   this file names T-numbers that belong to other branches, and counting those tokens is
-   what made two earlier counts disagree. The register is **allocated across parallel task
-   branches rather than as a range**, and has read as non-contiguous whenever one of those
-   branches was in flight: T73–T76 arrived with P0.3, T83–T87 with P0.6, T81 with P0.4, and
-   T88 arrives here. T89–T90 are allocated on the CA-2 branch (PR #59) and T91 arrives
-   with `01` D3's DP ranks, so the register is not contiguous at this head
+3. **TODO register** — per topic. T10, T15, T22, T48, T65 and T91 are struck through as
+   done, and T77 was opened and closed by P0.1. The register is the rows of section 3
+   below and nothing else: prose elsewhere in this file names T-numbers that belong to
+   other branches. It is **allocated across parallel task branches rather than as a
+   range**, and has read as non-contiguous whenever one of those branches was in flight:
+   T73–T76 arrived with P0.3, T83–T87 with P0.6, T81 with P0.4, and T88 arrives here.
+   T89–T90 are allocated on the CA-2 branch (PR #59) and T91 arrived with `01` D3's DP
+   ranks, so the register is not contiguous at this head
 4. **Cross-cutting issues and pending amendments**
 
 ---
@@ -230,7 +225,7 @@ M-f `14`; M-g `01` D3.5.
 | # | Item | Topic |
 |---|---|---|
 | **T47** | A wrong lookahead is a calibration error no causality detector sees; only validation against real runs (`08`) or a declared-vs-measured channel-delay check catches it | `01` |
-| **T91** | **How the DP ranks that make no CA call register sends and get frames released.** Opened 2026-09-29 by the round-1 review of PR #446. `01` D3 makes a DP group one LP whose step is a compound event, and has one rank call TAR/NER. Every rank is its own `EngineCore` process with its own `request#dpN`, `control#dpN` and `output#dpN` channels and its own input and output threads, but only the clock owner registers a send (its send log rides its TAR/NER) and TSO release runs inside the owner's CA call, so a rank that makes no CA call registers nothing, has nothing released, and I1 does not hold for it. Candidates: (a) each rank's send log and arrived set travel to the CA-facing rank on the per-step lockstep exchange, and its released set comes back on the next one; (b) every rank calls the CA as a member of the one LP, the CA granting the LP only once all members have asked for the same `T`; (c) simulated runs are restricted to DP1 and DP > 1 leaves their scope. Until decided, `01` D3's channel tables cover one DP rank and a simulated run with DP > 1 is refused by name | `01` |
+| ~~**T91**~~ | ~~How the DP ranks that make no CA call register sends and get frames released~~ — **ruled 2026-10-01 by the owner, option (b)** ([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)): every DP rank holds its own LP runtime as a member of the one engine LP, and the CA grants the LP only after every member has called, checked by a call counter (#528). Stated in `01` D3 | `01` |
 | **T49** | The prefix-index *lookup* cost is charged to nobody — ~1,387 blocks hashed and probed per request at the cc-traces p50, magnitude unmeasured | `03` |
 | **T50** | Whether runtime memory constants transfer across dies (the working assumption says yes within a software generation) | `03`, `05` |
 | **T53** | Whether tokenizer throughput transfers across CPU classes (the working assumption says yes, adjusted by derate) | `05` |

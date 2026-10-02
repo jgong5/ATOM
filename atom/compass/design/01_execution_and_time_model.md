@@ -263,7 +263,7 @@ that flags `time.time`, `time.monotonic`, `time.perf_counter`, `datetime.now` an
 `asyncio.sleep` outside an allow-list keeps that audit from rotting as ATOM's main
 branch moves. The allow-list is the set left on real time deliberately: transport, and
 the bounds the CA cannot reach, which D5 sends to configuration. Metrics are not on it:
-`11` D72 runs all three metric clocks on virtual time, so `metrics.py:408` is a
+`11` D72 runs every metric clock on virtual time, so `metrics.py:408` is a
 substituted clock read like any other. Anything new lands as a CI failure on the day it
 is added, not at validation time.
 
@@ -400,7 +400,7 @@ So a TP4 x DP2 deployment is **one** engine LP, not eight.
 
 **The partition principle.** Where LP boundaries fall is a modelling choice: a finer
 partition is not more correct, it only adds grants and wrapped channels, and the speedup
-here comes from skipping idle time, not from parallelism. So: as few LPs as satisfy three
+here comes from skipping idle time, not from parallelism. So: as few LPs as satisfy these
 constraints.
 
 1. **Zero-lookahead couplings stay inside one LP.** A per-step barrier or collective, a
@@ -411,8 +411,8 @@ constraints.
    ~48 ms of wall time at ~50 us each against a ~30 ms simulated step. Worse, the real
    collectives would bypass the CA, where it cannot see them, and making them visible
    would mean rewriting them as CA rendezvous, which D1 forbids.
-2. **One clock owner per LP** — a step loop, a PP stage loop, or an asyncio event loop.
-   Only the owner calls TAR/NER (below); every other thread is transport (receives into a
+2. **One clock owner per LP process** — a step loop, a PP stage loop, or an asyncio event
+   loop; a DP group's LP has one per rank (below). Only the owner calls TAR/NER (below); every other thread is transport (receives into a
    queue, or relays sends the owner registered) or a handler running on a message the
    owner released. Activities that overlap in simulated time and each have a duration
    are either events on the owner's timer list or separate LPs.
@@ -426,20 +426,34 @@ constraints.
 the per-layer synchronization graph: nodes are `(rank, layer, operator)` costed on that
 rank's own batch; edges are program order within a rank plus a cross-rank barrier at each
 collective (e.g. the MoE all-to-all). The ranks exchange batch descriptors (or per-layer
-cost vectors) on the collective that already runs, all compute the same path, and one
-rank talks to the CA. No operator-level TAR/NER. `max(step_seconds)` is right only when
+cost vectors) on the collective that already runs, all compute the same path, and every
+rank calls the CA as a member of the LP (below). No operator-level TAR/NER. `max(step_seconds)` is right only when
 the step is the only synchronization; with per-layer barriers it underestimates. Rank 0
 at attention 3 / MoE 1 per layer and rank 1 at 1 / 3 give `max` 4 but a critical path of
 `max(3,1) + max(1,3)` = 6: 240 against 360 over 60 layers. Per-rank LPs are right only
 if the ranks decouple at step level (no per-step collective) and interact only with
 lookahead > 0.
 
-**Open: the DP ranks that do not talk to the CA.** Each DP rank is its own `EngineCore`
-process with its own `#dpN` channels and its own input and output threads, but only one
-rank makes TAR/NER calls. How a rank that makes none registers its sends and has its
-received frames released, and so how I1 holds for it, is not decided (`12` T91). The
-channel tables and the registration and release rules below are written for one DP rank
-(`#dp0`); until T91 is settled a simulated run with DP > 1 is refused by name.
+**A DP group's LP has one member process per rank, and the CA joins them** (owner
+ruling 2026-10-01, `12` T91, #528). Each DP rank is its own `EngineCore` process with its
+own `#dpN` channels and input and output threads, and holds its own LP runtime: its step
+loop is that member's clock owner, registers that rank's sends and releases its received
+frames. The CA completes the LP's request only when every member has called:
+
+1. Every member makes the same number of CA calls per loop iteration; a per-member call
+   counter refuses a mismatch by name.
+2. One request kind per round: TAR with equal `T` on every member, or NER with `t` the
+   minimum over members. Unequal `T` or mixed kinds are refused.
+3. Every member's send log is merged before any grant is computed, so the LP's promised
+   time never rises on a partial request.
+4. One common grant `G`; each member is released only the messages on its own channels.
+5. A member never advances time alone; a lone call only ships its send log.
+
+One LP per rank is rejected: under NER a rank woken by a message blocks in the lockstep
+`all_reduce` on a rank that waits at the CA with no message. Precedents: dist-gem5, where
+each process holds its own connection to the synchronising switch that joins them; and
+Pham and Bagrodia (WSC 1998), where a parallel federate's time is the minimum over its
+members.
 
 ### Options for the protocol
 
@@ -470,7 +484,7 @@ computes its own safe window from a distributed LBTS reduction plus a lookahead 
 
 #### State
 
-The CA plays the part of an HLA RTI, and an LP's clock owner uses HLA's three time
+The CA plays the part of an HLA RTI, and an LP's clock owner uses HLA's time
 services:
 
 | LP call | PDES term | Meaning |
@@ -580,8 +594,8 @@ LP (partition principle, above).
   backdated message **aborts the run with a full LP state dump**. It must not be a
   warning and must not be behind a flag.
 - **Deadlock: detected and recovered, never aborted.** When every LP waits at the CA and
-  the strict rule grants none — possible only with a zero-lookahead channel, once the end
-  rule (below), which the CA checks first, has not ended the run — the CA
+  the strict rule grants none — possible only with a zero-lookahead channel, once the
+  finish (below), which the CA checks first, does not apply — the CA
   grants the LP with the least `(N, LP id)`: no other LP's `N` is smaller, so nothing
   earlier can reach it. PDES term: Chandy–Misra deadlock detection and recovery. A
   message that then arrives at the receiver's current instant counts toward that
@@ -590,21 +604,27 @@ LP (partition principle, above).
   prints one diagnostic after `DIAG_S` (D1's detector (2)). Never a quiet timeout that
   releases. (The prior arrival barrier's 120 s timeout released on a run that was
   invalid, the client printed "0 failed", and a day's conclusions came off it.)
-- **A run ends with its workload.** The traffic LP calls `end_workload` once it has sent
-  every request, received every response and taken its last metrics scrape; the CA then
-  grants every LP to `+inf`. "Every `N` is `+inf`" also ends a run but cannot be relied
-  on: periodic timers (metrics push, the scrape) keep `N` finite for ever.
+- **A run finishes when no essential work is left** (#533). Housekeeping timers (the
+  metrics push and refresh, uvicorn's server tick, keep-alive, the periodic scrape) are
+  daemon deadlines: they fire as usual but do not keep the run alive. The CA keeps an
+  essential horizon `H`, the largest TAR target, finite essential NER target or
+  registered arrival seen so far, and grants a daemon deadline only once it is at most
+  `H`. When every LP waits, nothing is undelivered, no essential target is pending and
+  every daemon deadline exceeds `H`, the CA grants every LP `+inf`. The clock cannot tell
+  a lost message from a finished run, so on its `+inf` grant the traffic LP raises unless
+  every request it sent has its final response, naming those that do not (#534).
 - **Determinism:** ties at equal timestamps broken by `(time, LP id, channel, seq)`.
   Without this the 126-vs-189-decode-steps nondeterminism returns.
 
-The grant rule relies on four invariants inside each LP:
+The grant rule relies on these invariants inside each LP:
 
-- **I1** An LP's clock moves only inside its clock owner's CA call (TAR/NER). For a DP
-  rank that makes no CA call this is open (T91, above).
+- **I1** An LP's clock moves only inside its clock owner's CA call (TAR/NER). In a DP
+  group's LP each member's clock moves only inside its own owner's call, to the common
+  grant (above).
 - **I2** In a CA call the owner holds no lock another thread of its LP needs; otherwise a
   handler thread deadlocks. Checked at `f87413a7a` by searching `atom/model_engine`,
   `atom/entrypoints/openai`, `atom/distributed` and `atom/utils` for
-  `threading.Lock/RLock/Condition/Semaphore`: six serving-path locks,
+  `threading.Lock/RLock/Condition/Semaphore`, the serving-path locks are
   `PrefillScheduler._pending_lock` (`scheduler.py:3166`) and
   `DecodeScheduler._prefill_lock` (`:3304`), both RapidServe;
   `CoreManager._lb_lock` (`engine_core_mgr.py:254`) and `_control_send_lock` (`:261`);
@@ -652,7 +672,7 @@ The last two rows exist only under `--enable-rapidserve` (D2), whose prefill and
 `EngineCore`s are two engine LPs of one deployment; they are the only channels received
 by a handler thread. No M1-M4 channel is.
 
-The M4 channel list at DP1, ten channels:
+The M4 channel list at DP1:
 
 - `traffic->frontend-P:http` and `frontend-D->traffic:stream`, both through the router;
 - `frontend-P->frontend-D:relay`;
@@ -706,9 +726,9 @@ A DP group is **one** LP however many ranks it holds, because it already
 wide, because its workers are slaved by a blocking RPC (`async_proc.py:431`) and hold no
 clock. Adding GPUs to either does not create a time domain.
 
-Every ATOM deployment is two LPs, one per clock owner: its API server's event loop (the
-frontend LP) and its engine's step loop (the engine LP), plus one traffic LP per run
-(D3). Beyond that, only three things create an LP:
+Every ATOM deployment is two LPs: its API server's event loop (the frontend LP) and its
+engine's step loop, one per DP rank (the engine LP), plus one traffic LP per run (D3).
+Beyond that, only these create an LP:
 
 1. a **PD role boundary** — prefill fleet vs decode fleet, each its own deployment
 2. a **PP stage**, which replaces the engine LP with one LP per stage
@@ -1015,9 +1035,9 @@ scheduler.
 
 Each site is answered by **the PDES mechanism a simulated run applies there**, not by the
 shape of the wait. What decides it is which LP owns the waiting thread and what the wait
-means for that LP's clock. Each LP has one clock owner — its step loop or its asyncio
-event loop — and only the clock owner moves the LP's clock (D3); every other thread in the
-LP is transport. Every site maps to one of the mechanisms K1–K9, and **none is left
+means for that LP's clock. Each LP process has one clock owner — its step loop or its
+asyncio event loop; a DP group's LP has one per rank — and only a clock owner moves the
+LP's clock (D3); every other thread in the LP is transport. Every site maps to one of the mechanisms K1–K9, and **none is left
 undecided**.
 
 | Class | Mechanism | PDES rule | Representative sites |
@@ -1058,8 +1078,8 @@ The rules that settle the boundaries #53's categories left in the wrong place:
 - **A DP step is one TAR, priced by its per-layer critical path** (D3). The ranks exchange
   their batch descriptions on the lockstep `all_reduce` they already run
   (`DPEngineCoreProc._sync_dp_state`, `atom/model_engine/engine_core.py`), each computes
-  the same path, and one rank talks to the CA — which is why that `all_reduce` is K1
-  rather than ignored: it is where the DP LP's step length is decided. **Second-order
+  the same path, and every rank calls the CA as a member of the LP (D3) — which is why
+  that `all_reduce` is K1 rather than ignored: it is where the DP LP's step length is decided. **Second-order
   bound:** a fast rank's output is stamped at the end of the whole step, late by at most
   the difference between the ranks' tail times; the step is split with in-step TAR only
   if that is measured to affect TPOT.
@@ -1681,8 +1701,8 @@ Every item is additive at an existing site; no process and no thread is removed 
 12. **Control-command refusal** in the simulated runner's worker methods that the refused
     commands reach (D5). **~40**
 13. **The metrics observer and the end of a run**: a periodic `/metrics` scrape in the
-    traffic LP, the engine's push gate on a virtual timer (D5, `11` D72), and the CA's
-    end-of-workload request (D3). **~60**
+    traffic LP, the engine's push gate on a virtual timer (D5, `11` D72), and the traffic
+    LP's end-of-run check (D3, #534). **~60**
 14. **A simulated `ModelRunner`** injected via `--runner-qualname` (no ATOM change needed
     for the injection itself).
 
@@ -1774,7 +1794,7 @@ Ordered by how much they could cost.
 | D0 | Fresh design; prior branches referenced at the design level only, not as a code-port plan | 2026-09-17 |
 | D1 | Keep ATOM's multi-process / multi-thread topology; additive changes only | 2026-09-17 |
 | D2 | "Two nodes" means true PD disaggregation, realised as two containers on one physical node | 2026-09-17 |
-| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner, and zero-lookahead couplings collapse into one LP; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters) | 2026-09-18; revised 2026-09-28 |
+| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP only after every rank has called; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a run finishes when no essential work is left | 2026-09-18; revised 2026-09-28 and 2026-10-02 |
 | D3.1 | Single CA with a hierarchy-ready interface; LP count scales with replicas and PP stages, not with GPUs | 2026-09-18 |
 | D3.2 | Always-on causality detectors: a straggler check against the receiver's last drain (fails the run); a stall the CA cannot see prints one diagnostic after 30 wall seconds and keeps waiting, never aborting; clock-source CI lint | 2026-09-19; revised 2026-09-28 |
 | D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for M4/M6 multi-container runs | 2026-09-19 |
