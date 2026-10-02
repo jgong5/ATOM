@@ -36,13 +36,14 @@ if TYPE_CHECKING:
     from PIL import Image
 
 from atom import SamplingParams
-from atom.compass.carriers import stamp_events
+from atom.compass.carriers import stamp_events, tracestate_stamp
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
 from atom.utils import clock
+from atom.utils.compass_loop import HttpChannel
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
     freeze_gc_heap,
@@ -2635,7 +2636,7 @@ def main():
         f"Starting server on {args.host}:{args.server_port} (loop={loop_impl})..."
     )
     uvicorn.run(
-        app,
+        _served_app(),
         host=args.host,
         port=args.server_port,
         loop=loop_impl,
@@ -2644,9 +2645,23 @@ def main():
     )
 
 
+def _served_app():
+    """The ASGI app ``main`` serves: on a simulated run, behind `HttpChannel`."""
+    if clock.installed() is None:
+        return app
+    return HttpChannel(app, _tracestate_stamp)
+
+
+def _tracestate_stamp(scope) -> tuple[float, int] | None:
+    """A request's ``(arrival, seq)`` from all its ``tracestate`` header lines."""
+    return tracestate_stamp(
+        ",".join(v.decode("latin-1") for k, v in scope["headers"] if k == b"tracestate")
+    )
+
+
 def _loop_impl() -> str:
     """uvicorn's ``loop``: on a simulated run, the loop that runs on the LP clock."""
-    if clock._installed is not None:
+    if clock.installed() is not None:
         return "atom.utils.compass_loop:CompassEventLoop"
     # uvloop replaces the stdlib asyncio selector loop with a libuv-backed one,
     # which is markedly faster at the SSE socket I/O (sock.send / selector

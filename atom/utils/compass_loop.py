@@ -226,7 +226,7 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
     """The frontend's event loop on its LP clock; uvicorn's ``loop`` in a simulated run."""
 
     def __init__(self) -> None:
-        self.rt = clock._installed
+        self.rt = clock.installed()
         if self.rt is None:
             raise RuntimeError(
                 "CompassEventLoop runs on an LP clock; install the frontend's "

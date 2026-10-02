@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 import uvicorn
 
-from atom.compass import clock_transport
+from atom.compass import carriers, clock_transport
 from atom.compass.clock import NER, ClockAuthority, LpId, single_engine_table
 from atom.entrypoints.openai import api_server
 from atom.utils import clock
@@ -313,10 +313,38 @@ def test_requests_with_one_arrival_are_handed_over_in_seq_order(run):
     assert run.conn.grants == [arrival, INF] and run.conn.unread == []
 
 
+@pytest.mark.parametrize("order", [1, -1], ids=["entry-last", "entry-first"])
+def test_a_stamp_split_over_two_tracestate_lines_holds_the_served_app(
+    run, monkeypatch, order
+):
+    stamps, handled = queue.Queue(), []
+    traffic = _traffic(
+        run, stamps, before_ner=lambda: _until(lambda: run.rt.arrived[HTTP])
+    )
+    arrival, seq = stamps.get(timeout=10)
+
+    async def app(scope, receive, send):
+        handled.append(asyncio.get_running_loop().time())
+
+    monkeypatch.setattr(api_server, "app", app)
+    lines = [b"vendor=x", carriers.tracestate_with(None, arrival, seq).encode()]
+    scope = {"type": "http", "headers": [(b"tracestate", v) for v in lines[::order]]}
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(api_server._served_app()(scope, None, None))
+        assert handled == [arrival]
+        loop.run_forever()
+    finally:
+        traffic.join(10)
+    loop.close()
+    assert run.conn.grants == [arrival, INF] and run.conn.unread == []
+
+
 def test_compass_off_keeps_uvloop_and_on_names_a_loop_uvicorn_builds(run):
     clock.install(None)
     off = "uvloop" if importlib.util.find_spec("uvloop") else "auto"
     assert api_server._loop_impl() == off
+    assert api_server._served_app() is api_server.app
     clock.install(run.rt)
     config = uvicorn.Config(lambda *_: None, loop=api_server._loop_impl())
     assert config.get_loop_factory() is CompassEventLoop
