@@ -93,7 +93,7 @@ Two constructions are load-bearing and both were originally wrong.
 Collapsing the batch to `tokens × history` and multiplying was a rank deficiency. ATOM
 already computes the correct form: `ScheduledBatch.detailed_sqsq / detailed_sqsk /
 detailed_sk` are **Σ N_Q², Σ N_Q·N_KV, Σ N_KV**, produced by `compute_detailed_aggregates`
-(`scheduler.py:2788-2842`).
+(`scheduler.py:2788-2841`).
 
 **2. The padding term is the *rung's* rectangle, not the batch's.** `rung·max(ctx) − Σctx`,
 **not** `len(ctx)·max(ctx) − Σctx`. Error tracked the ratio between them exactly:

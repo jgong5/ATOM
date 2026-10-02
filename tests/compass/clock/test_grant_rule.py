@@ -182,7 +182,7 @@ def test_an_idle_lp_gets_no_reply_until_a_message_is_registered_for_it():
     assert ca.on_request(A, NER, INF, []) == []
     assert _grants(ca.on_request(B, TAR, 1.0, [])) == [("b", 1.0)]
     assert ca.on_request(B, TAR, 2.0, []) == [(B, 2.0, {})]
-    (row, _) = ca.lp_table()
+    row, _ = ca.lp_table()
     assert (row.state, row.n) == (NER, INF)
     replies = ca.on_request(B, TAR, 5.0, [("b->a:m", 0, 2.5)])
     assert replies == [(A, 2.5, {"b->a:m": [(0, 2.5)]}), (B, 5.0, {})]
