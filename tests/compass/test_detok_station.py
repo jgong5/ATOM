@@ -200,3 +200,15 @@ def test_a_loop_thread_decode_outside_the_run_asks_for_no_time(monkeypatch):
     monkeypatch.setattr(clock, "_installed", frontend)
     decode = wrap_decode(_Tokenizer().decode, _entry())
     assert decode([1, 2]) == "xx" and frontend.now == 0.0
+
+
+def test_a_decode_on_another_thread_with_no_job_open_is_refused(monkeypatch):
+    # In the run, a thread other than the clock owner with no job open asks the
+    # authority for nothing: the charge goes through `advance_to`, which refuses it.
+    frontend = LPRuntime(LpId("frontend"), TABLE, None, owner=threading.Thread())
+    monkeypatch.setattr(clock, "_installed", frontend)
+    frontend.start_run()
+    decode = wrap_decode(_Tokenizer().decode, _entry())
+    with pytest.raises(RuntimeError, match="only the clock owner"):
+        decode([1, 2])
+    assert frontend.now == 0.0

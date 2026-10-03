@@ -1117,7 +1117,10 @@ The rules that settle the boundaries #53's categories left in the wrong place:
   (`atom/entrypoints/openai/api_server.py`): a multi-server resource station in the
   frontend LP whose completion times come from D33's service model. The multimodal
   preprocessing hand-off in `chat_completions` is K1 too, and is refused today because no
-  service time is modelled for it.
+  service time is modelled for it. A tokenizer call on the event loop thread itself, such
+  as the final `decode` of a non-streaming completion, is no station job: the loop is the
+  LP's clock owner, so the call is a TAR on the loop, `advance_to(now + d)` with `d` from
+  the same service model, and nothing else on the loop runs until it ends.
 - **K1**, the DP lockstep `all_reduce` (`DPEngineCoreProc._sync_dp_state`), for its own
   cost, per the DP rule above
 - **K3**, **the idle jump, which is a real site in ATOM even though the name this list
