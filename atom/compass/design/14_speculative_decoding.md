@@ -357,7 +357,7 @@ Adding it as **M3.5** rather than extending M3 keeps the milestone's own accepta
   every artifact key today. It must be captured in the run fingerprint or two runs with
   different acceptance semantics will compare as one. Recorded as **T59**.
 - **The DSpark hang of `04` T52 was observed in this subsystem** (`dspark_scheduler.py::schedule_prefix_lengths_tensor`,
-  which now builds the value that hung with `torch.full_like`).
+  while the function was written; the landed function builds that value with `torch.full_like`, which avoids the call that hung).
   Root-causing it is already a gating task; it is now also on this topic's critical path.
 - **Whether a draft forward's cost transfers across `K`** is untested. A serial MTP reusing
   one layer `mtp_k` times should be linear in `K`; a real draft stack need not be. One
