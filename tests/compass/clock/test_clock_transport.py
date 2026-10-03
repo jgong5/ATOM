@@ -11,6 +11,7 @@ fails the test instead of hanging it.
 import json
 import math
 import queue
+import re
 import threading
 
 import pytest
@@ -20,6 +21,7 @@ from atom.compass.clock import (
     TAR,
     BackdatedEvent,
     ChannelTable,
+    ClockAbort,
     ClockAuthority,
     LpId,
     LpRegistry,
@@ -33,6 +35,8 @@ from atom.compass.clock_transport import (
     serve,
     service,
 )
+
+from .test_member_join import ENGINE, FRONTEND, RANKS, _joined
 
 A, B = LpId("a"), LpId("b")
 AB = "a->b:m"
@@ -57,9 +61,9 @@ class _Recorded(ClockAuthority):
         super().__init__(channels)
         self.requests = []
 
-    def on_request(self, lp, kind, t, log, t_daemon=INF):
+    def on_request(self, lp, kind, t, log, t_daemon=INF, member=None):
         self.requests.append((lp, (kind, t, log, t_daemon)))
-        return super().on_request(lp, kind, t, log, t_daemon)
+        return super().on_request(lp, kind, t, log, t_daemon, member)
 
 
 @pytest.fixture
@@ -221,17 +225,46 @@ def test_every_request_reaches_the_rule_as_the_frame_it_was_sent_as(
     assert [m[0] for m in frames].count("BIND") == 3
 
 
+# --- members -------------------------------------------------------------------
+
+REQ0, REQ1 = (f"frontend->engine:request#{rank}" for rank in RANKS)
+
+
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+def test_each_member_binds_its_own_connection_and_reads_its_own_releases(
+    served, endpoint
+):
+    endpoint = served(_joined(), endpoint).endpoint
+    frontend = connect(FRONTEND, endpoint)
+    dp0, dp1 = (connect(ENGINE, endpoint, rank) for rank in RANKS)
+    with pytest.raises(KeyError, match="engine member dp0 is already bound"):
+        connect(ENGINE, endpoint, "dp0")
+    with pytest.raises(KeyError, match="called by member 'dp2'"):
+        _ask(connect(ENGINE, endpoint, "dp2"), (NER, INF, [], INF))
+    _result(_later(frontend.send, (NER, INF, [(REQ1, 0, 1.0)], INF)))
+    rounds = []
+    for _ in range(2):
+        _result(_later(dp0.send, (NER, 3.0, [], INF)))
+        first = _later(dp0.recv)
+        _result(_later(dp1.send, (NER, 2.0, [], INF)))
+        rounds.append((_result(first), _result(_later(dp1.recv))))
+    # One common grant per round, each member reading only its own channel.
+    assert rounds == [
+        ((1.0, {REQ0: []}), (1.0, {REQ1: [(0, 1.0)]})),
+        ((2.0, {REQ0: []}), (2.0, {REQ1: []})),
+    ]
+
+
 # --- refusals -----------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "request_, error, match",
     [
-        ((TAR, 1.0, [(AB, 0, 0.1)], INF), BackdatedEvent, "before a's clock 0.0"),
         ((TAR, INF, [], INF), ValueError, "must be a finite number"),
         ((TAR, 1.0, [("a->x:m", 0, 1.0)], INF), KeyError, "not a declared channel"),
     ],
-    ids=["backdated", "value", "key"],
+    ids=["value", "key"],
 )
 def test_a_refusal_raises_at_its_requester_and_the_loop_serves_on(
     served, request_, error, match
@@ -241,6 +274,44 @@ def test_a_refusal_raises_at_its_requester_and_the_loop_serves_on(
         _ask(a, request_)
     assert type(refused.value) is error
     assert _ask(a, (TAR, 1.0, [], INF)) == (1.0, {})
+
+
+def _breaks_at_dp1(self, lp, member, kind, t):
+    if member == "dp1":
+        raise RuntimeError("the join broke")
+
+
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+@pytest.mark.parametrize(
+    "broken, reason",
+    [
+        (False, r"engine: dp[01] asked (TAR|NER) while dp[01] asked (TAR|NER)\n"),
+        (True, re.escape("the clock authority raised RuntimeError('the join broke')")),
+    ],
+    ids=["abort", "unexpected"],
+)
+def test_a_rule_that_raises_ends_the_run_for_every_bound_connection(
+    served, monkeypatch, endpoint, broken, reason
+):
+    if broken:
+        monkeypatch.setattr(ClockAuthority, "_refuse_unjoinable", _breaks_at_dp1)
+    endpoint = served(_joined(), endpoint).endpoint
+    frontend = connect(FRONTEND, endpoint)
+    dp0, dp1 = (connect(ENGINE, endpoint, rank) for rank in RANKS)
+    waiting = []
+    # dp1's TAR does not join dp0's NER; over TCP the two may reach the rule
+    # in either order, so either one is the requester.
+    for conn, kind in [(frontend, NER), (dp0, NER), (dp1, TAR)]:
+        _result(_later(conn.send, (kind, 1.0 if kind == TAR else INF, [], INF)))
+        waiting.append(_later(conn.recv))
+    refusals = []
+    for box in waiting:
+        with pytest.raises(ClockAbort, match=reason) as refused:
+            _result(box)
+        refusals.append(refused.value.reason)
+    assert len(set(refusals)) == 1
+    with pytest.raises(ClockAbort, match=reason):
+        _ask(frontend, (NER, INF, [], INF))
 
 
 def test_a_backdated_event_arrives_with_the_lp_table(served):
@@ -258,6 +329,80 @@ def test_a_backdated_event_arrives_with_the_lp_table(served):
     assert [(r.state, r.target, r.undelivered) for r in table if r.lp == B] == [
         (NER, INF, ((AB, 0, 3.0),))
     ]
+
+
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+def test_a_backdated_event_ends_the_run_for_the_lp_parked_on_its_channel(
+    served, endpoint
+):
+    ca = ClockAuthority(_table())
+    endpoint = served(ca, endpoint).endpoint
+    a, b = connect(A, endpoint), connect(B, endpoint)
+    _result(_later(b.send, (NER, INF, [], INF)))
+    parked = _later(b.recv)
+    with pytest.raises(BackdatedEvent, match="before a's clock 0.0") as sent:
+        _ask(a, (TAR, 1.0, [(AB, 0, 0.1)], INF))
+    with pytest.raises(BackdatedEvent) as parked_on:
+        _result(parked)
+    assert parked_on.value.reason == sent.value.reason
+    assert sent.value.table == parked_on.value.table == ca.lp_table()
+
+
+def _table_breaks():
+    raise RuntimeError("the table broke")
+
+
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+@pytest.mark.parametrize("table_breaks", [False, True], ids=["table", "no-table"])
+def test_a_grant_that_cannot_be_framed_ends_the_run_for_every_parked_connection(
+    served, monkeypatch, endpoint, table_breaks
+):
+    ca = ClockAuthority(_table())
+    endpoint = served(ca, endpoint).endpoint
+    a, b = connect(A, endpoint), connect(B, endpoint)
+    _result(_later(b.send, (NER, INF, [], INF)))
+    parked = _later(b.recv)
+    rule = ca.on_request
+    monkeypatch.setattr(
+        ca, "on_request", lambda *args: [(i, math.nan, r) for i, _, r in rule(*args)]
+    )
+    if table_breaks:
+        monkeypatch.setattr(ca, "lp_table", _table_breaks)
+    _result(_later(a.send, (TAR, 1.0, [], INF)))
+    refusals = []
+    for box in (_later(a.recv), parked):
+        with pytest.raises(ClockAbort, match=r"raised MalformedMessage\(.*nan") as e:
+            _result(box)
+        refusals.append((e.value.reason, e.value.table))
+    table = () if table_breaks else ClockAuthority.lp_table(ca)
+    assert len(set(refusals)) == 1 and refusals[0][1] == table
+    no_table = refusals[0][0].endswith("no LP table: RuntimeError('the table broke')")
+    assert no_table == table_breaks
+
+
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+def test_no_finish_grant_goes_out_when_the_last_cannot_be_framed(
+    served, monkeypatch, endpoint
+):
+    ca = ClockAuthority(_table())
+    endpoint = served(ca, endpoint).endpoint
+    a, b = connect(A, endpoint), connect(B, endpoint)
+    rule = ca.on_request
+    released = []
+
+    def last_nan(*args):
+        grants = rule(*args)
+        released.append(len(grants))
+        return grants[:-1] + [(i, math.nan, r) for i, _, r in grants[-1:]]
+
+    monkeypatch.setattr(ca, "on_request", last_nan)
+    _result(_later(b.send, (NER, INF, [], INF)))
+    parked = _later(b.recv)
+    _result(_later(a.send, (NER, INF, [], INF)))
+    for box in (_later(a.recv), parked):
+        with pytest.raises(ClockAbort, match=r"raised MalformedMessage\(.*nan"):
+            _result(box)
+    assert released == [0, 2]
 
 
 def test_a_log_behind_its_receiver_is_refused(served):
@@ -327,7 +472,7 @@ def test_two_clocks_at_one_endpoint_are_refused():
     serve(ClockAuthority(_table()), "inproc:twice").close()
 
 
-@pytest.mark.parametrize("endpoint", ["clock", "tcp://127.0.0.1:9"])
+@pytest.mark.parametrize("endpoint", ["clock", "inproc", "udp://127.0.0.1:9"])
 def test_an_endpoint_that_reaches_nothing_is_refused_rather_than_guessed(endpoint):
     with pytest.raises(ValueError, match="is not inproc:<name>"):
         connect(A, endpoint)
@@ -346,6 +491,7 @@ def _messages():
         ca.on_request(A, TAR, 3.0, [(AB, 1, 2.1)])
     return [
         ("BIND", A),
+        ("BIND", ENGINE, "dp0"),
         (TAR, 1.0, [(AB, 0, 1.5)], INF),
         (NER, INF, [], 2.0),
         ("GRANT", INF, {AB: [(0, 0.5), (1, 0.75)]}),
@@ -393,6 +539,7 @@ def test_a_duration_that_is_not_one_is_refused_where_it_would_be_written():
         b'{"kind":"TAR","log":[[["x"],0,1.0]],"t":1.0,"t_daemon":"+inf"}',
         b'{"kind":"TAR","log":[["x",0.0,1.0]],"t":1.0,"t_daemon":"+inf"}',
         b'{"kind":"NER","log":[],"t":"+inf"}',
+        b'{"kind":"BIND","lp":"engine","member":0}',
         b'{"kind":"REFUSED","error":"SystemExit","reason":"","table":null}',
     ],
 )

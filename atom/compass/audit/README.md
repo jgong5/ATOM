@@ -122,4 +122,4 @@ stamps — because a mechanism already applies to them. Every clock read on this
 path is classified by the clock-source lint instead
 (`atom/compass/detect/clock_source.py`): a read either goes through
 `atom.utils.clock.now` and returns the LP's time, or stays real under a
-`SERVING_ALLOW_LIST` entry naming its site, class and reason.
+`CORE_ALLOW_LIST` entry naming its site, class and reason.
