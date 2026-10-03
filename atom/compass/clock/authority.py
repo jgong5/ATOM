@@ -42,6 +42,17 @@ round. When every LP waits and none is grantable, nothing is undelivered and
 no essential target is pending: the run is finished, every LP is granted
 ``+inf``, and the daemon deadlines still held never fire.
 
+An LP may be declared with members: processes that each hold a runtime for it,
+as the ranks of a data-parallel group do. A member names itself in each call,
+and each channel into or out of the LP is owned by exactly one member, as the
+caller declares; a member may log sends only on channels it owns. The members'
+calls are joined into one request per round: each member makes the same number
+of calls, all ask one kind, every TAR asks the same target, and the joined
+NER's target and daemon deadline are each the least over the members. A call
+before the round is complete registers its send log and nothing else: the LP
+stays running, so its ``N`` stays at its clock. Every member gets the common
+grant, carrying the releases on its own channels only.
+
 Nothing here reads a clock, opens a socket or starts a thread. The caller
 carries requests in and replies out.
 """
@@ -97,10 +108,12 @@ class ClockAuthority:
     `timeline`, when given, receives one ``record(lp, from, to, kind,
     recovered)`` call per reply, in issue order. `grants` counts each LP's
     finite grants by name. `final_clocks` is every LP's clock just before the run
-    finished, and ``None`` until it has.
+    finished, and ``None`` until it has. `members` maps an LP to
+    ``{member: names of the channels into or out of it that the member owns}``;
+    an LP not in it is its own single caller.
     """
 
-    def __init__(self, channels: ChannelTable, timeline=None) -> None:
+    def __init__(self, channels: ChannelTable, timeline=None, members=None) -> None:
         self._channels = channels
         self._ids = channels.registry.ids()
         self._now = dict.fromkeys(self._ids, 0.0)
@@ -120,22 +133,67 @@ class ClockAuthority:
         self.timeline = timeline
         self.grants = {i.name: 0 for i in self._ids}
         self.final_clocks = None
+        self._members = {}  # LP -> its member names, sorted
+        self._owner = {}  # LP -> channel into or out of it -> the member owning it
+        self._round = {}  # LP -> member -> (kind, t, daemon) of the round being joined
+        for lp, owned in (members or {}).items():
+            channels.registry.require(lp)
+            if not owned:
+                raise ValueError(f"{lp} is declared with an empty member list")
+            touching = dict.fromkeys(
+                [*self._into[lp], *(c.name for c in channels.channels_from(lp))]
+            )
+            listed = dict.fromkeys(name for names in owned.values() for name in names)
+            self._owner[lp] = {}
+            for name in sorted(touching | listed):
+                owners = sorted(m for m, names in owned.items() if name in names)
+                if name not in touching:
+                    raise ValueError(
+                        f"{' and '.join(owners)} of {lp} owns {name}, which "
+                        f"neither goes into nor comes out of {lp}"
+                    )
+                if len(owners) != 1:
+                    raise ValueError(
+                        f"{name} goes into or out of {lp}, and "
+                        + (
+                            f"its members {' and '.join(owners)} each own it"
+                            if owners
+                            else f"none of its members {', '.join(sorted(owned))} owns it"
+                        )
+                    )
+                self._owner[lp][name] = owners[0]
+            self._members[lp] = tuple(sorted(owned))
+            self._round[lp] = {}
 
     def on_request(
-        self, lp: LpId, kind: str, t: float, log, t_daemon: float = math.inf
+        self,
+        lp: LpId,
+        kind: str,
+        t: float,
+        log,
+        t_daemon: float = math.inf,
+        member: str | None = None,
     ) -> list:
         """Register `lp`'s send log, record its request, and grant what is due.
 
-        `t_daemon` is an NER's daemon deadline, ``+inf`` for none. Returns the
-        replies made due, as ``(lp, G, released)`` in the order issued, where
-        ``released`` maps each channel into that LP to its newly released
-        ``(seq, arrival)`` pairs. The requester is absent when its reply is
-        held. Once the run is finished, every LP has had its ``+inf`` reply,
-        and a request changes nothing and returns none.
+        `t_daemon` is an NER's daemon deadline, ``+inf`` for none. `member`
+        names the caller when `lp` has members, and is ``None`` otherwise.
+        Returns the replies made due, as ``(lp, G, released)`` in the order
+        issued, where ``released`` maps each channel into that LP to its newly
+        released ``(seq, arrival)`` pairs; a member's reply is addressed
+        ``(lp, member)`` and carries its own channels only. The requester is
+        absent when its reply is held. Once the run is finished, every LP has
+        had its ``+inf`` reply, and a request changes nothing and returns none.
         """
         if self.final_clocks is not None:
             return []
         self._channels.registry.require(lp)
+        members = self._members.get(lp, ())
+        if member not in (members or (None,)):
+            raise KeyError(
+                f"{lp} was called by member {member!r}; its members: "
+                + (", ".join(members) or "none")
+            )
         if self._state[lp] != RUNNING:
             raise BackdatedEvent(
                 f"{lp} sent {kind} while waiting in {self._state[lp]}; only a "
@@ -159,12 +217,58 @@ class ClockAuthority:
                     f"{lp} asked for {asked} behind its own clock at {self._now[lp]}",
                     self.lp_table(),
                 )
+        if members:
+            self._refuse_unjoinable(lp, member, kind, t)
         for name, seq, arrival in log:
-            self._register(lp, name, seq, arrival)
+            self._register(lp, name, seq, arrival, member)
+        if members:
+            joined = self._round[lp]
+            joined[member] = (kind, t, daemon)
+            if len(joined) < len(members):
+                return []
+            t = min(asked for _, asked, _ in joined.values())
+            daemon = min(deadline for _, _, deadline in joined.values())
+            joined.clear()
         if t < math.inf:
             self._horizon = max(self._horizon, t)
         self._state[lp], self._target[lp], self._daemon[lp] = kind, t, daemon
-        return self._grant_due()
+        return self._address(self._grant_due())
+
+    def _refuse_unjoinable(self, lp: LpId, member: str, kind: str, t: float) -> None:
+        joined = self._round[lp]
+        reason = None
+        if member in joined:
+            behind = ", ".join(m for m in self._members[lp] if m not in joined)
+            reason = (
+                f"{lp}: {member} called again before {behind} called; every "
+                "member calls once per round"
+            )
+        elif joined:
+            other, (other_kind, other_t, _) = next(iter(joined.items()))
+            if other_kind != kind:
+                reason = f"{lp}: {member} asked {kind} while {other} asked {other_kind}"
+            elif kind == TAR and other_t != t:
+                reason = (
+                    f"{lp}: {member} asked TAR({t}) while {other} asked TAR({other_t})"
+                )
+        if reason is not None:
+            raise ClockAbort(reason, self.lp_table())
+
+    def _address(self, replies: list) -> list:
+        """One reply per member for an LP with members, each with its own channels."""
+        return [
+            (
+                (i, g, released)
+                if m is None
+                else (
+                    (i, m),
+                    g,
+                    {c: r for c, r in released.items() if self._owner[i][c] == m},
+                )
+            )
+            for i, g, released in replies
+            for m in self._members.get(i, (None,))
+        ]
 
     def lp_table(self) -> tuple[LpRow, ...]:
         """Every LP's row, in name order."""
@@ -186,13 +290,20 @@ class ClockAuthority:
             )
         return tuple(rows)
 
-    def _register(self, lp: LpId, name: str, seq: int, arrival: float) -> None:
+    def _register(
+        self, lp: LpId, name: str, seq: int, arrival: float, member: str | None
+    ) -> None:
         channel = self._channels.channel(name)
         a = _seconds(arrival, f"the arrival of {name} seq {seq}", finite=True)
         expected = self._next_seq[name]
         floor = self._now[lp] + channel.lookahead_s
         if channel.source != lp:
             refusal = f"{lp} logged a send on {name}, whose sender is {channel.source}"
+        elif member is not None and self._owner[lp][name] != member:
+            refusal = (
+                f"{lp}: {member} logged a send on {name}, which "
+                f"{self._owner[lp][name]} owns"
+            )
         elif seq != expected:
             refusal = (
                 f"{lp} logged seq {seq} on {name}, which expects seq {expected} "

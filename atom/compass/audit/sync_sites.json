@@ -407,7 +407,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::_send_stream_chunk_direct::_stream_batch_dispatcher.enqueue( loop=loop, collector=stream_collector, state=state, chunk=_build_stream_chunk(request_output, request_id), )::task_wait#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 791,
+   "line": 798,
    "symbol": "_send_stream_chunk_direct",
    "call": "_stream_batch_dispatcher.enqueue",
    "expr": "_stream_batch_dispatcher.enqueue( loop=loop, collector=stream_collector, state=state, chunk=_build_stream_chunk(request_output, request_id), )",
@@ -421,7 +421,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::_send_stream_chunk_tagged::_stream_batch_dispatcher.enqueue( loop=loop, collector=stream_collector, state=state, chunk=_build_stream_chunk(request_output, request_id), tag=sibling_index, ::task_wait#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 824,
+   "line": 831,
    "symbol": "_send_stream_chunk_tagged",
    "call": "_stream_batch_dispatcher.enqueue",
    "expr": "_stream_batch_dispatcher.enqueue( loop=loop, collector=stream_collector, state=state, chunk=_build_stream_chunk(request_output, request_id), tag=sibling_index, ",
@@ -435,7 +435,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::generate_async::loop.run_in_executor(None, do_preprocess)::executor_handoff#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 891,
+   "line": 898,
    "symbol": "generate_async",
    "call": "loop.run_in_executor",
    "expr": "loop.run_in_executor(None, do_preprocess)",
@@ -449,7 +449,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::generate_async::token_queue.get()::queue_get#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 902,
+   "line": 909,
    "symbol": "generate_async",
    "call": "token_queue.get",
    "expr": "token_queue.get()",
@@ -463,7 +463,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::generate_async_multimodal::loop.run_in_executor(None, do_preprocess)::executor_handoff#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 1005,
+   "line": 1012,
    "symbol": "generate_async_multimodal",
    "call": "loop.run_in_executor",
    "expr": "loop.run_in_executor(None, do_preprocess)",
@@ -477,7 +477,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::generate_async_multimodal::token_queue.get()::queue_get#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 1016,
+   "line": 1023,
    "symbol": "generate_async_multimodal",
    "call": "token_queue.get",
    "expr": "token_queue.get()",
@@ -491,7 +491,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::generate_async_fanout::loop.run_in_executor(None, do_preprocess)::executor_handoff#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 1127,
+   "line": 1134,
    "symbol": "generate_async_fanout",
    "call": "loop.run_in_executor",
    "expr": "loop.run_in_executor(None, do_preprocess)",
@@ -505,7 +505,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::generate_async_fanout::shared_queue.get()::queue_get#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 1140,
+   "line": 1147,
    "symbol": "generate_async_fanout",
    "call": "shared_queue.get",
    "expr": "shared_queue.get()",
@@ -519,7 +519,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::setup_streaming_request::executor_loop.run_in_executor(None, do_preprocess)::executor_handoff#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 1259,
+   "line": 1266,
    "symbol": "setup_streaming_request",
    "call": "executor_loop.run_in_executor",
    "expr": "executor_loop.run_in_executor(None, do_preprocess)",
@@ -533,7 +533,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::_race_disconnect::asyncio.wait( [handler_task, disconnect_task], return_when=asyncio.FIRST_COMPLETED, )::event_wait#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 1366,
+   "line": 1373,
    "symbol": "_race_disconnect",
    "call": "asyncio.wait",
    "expr": "asyncio.wait( [handler_task, disconnect_task], return_when=asyncio.FIRST_COMPLETED, )",
@@ -547,7 +547,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::_race_disconnect::handler_task.result()::event_wait#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 1389,
+   "line": 1396,
    "symbol": "_race_disconnect",
    "call": "handler_task.result",
    "expr": "handler_task.result()",
@@ -561,7 +561,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::setup_streaming_request_fanout::executor_loop.run_in_executor(None, do_preprocess)::executor_handoff#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 1481,
+   "line": 1488,
    "symbol": "setup_streaming_request_fanout",
    "call": "executor_loop.run_in_executor",
    "expr": "executor_loop.run_in_executor(None, do_preprocess)",
@@ -575,7 +575,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::_metrics_refresh_loop::asyncio.sleep(_METRICS_REFRESH_INTERVAL_SECONDS)::sleep#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 1523,
+   "line": 1530,
    "symbol": "_metrics_refresh_loop",
    "call": "asyncio.sleep",
    "expr": "asyncio.sleep(_METRICS_REFRESH_INTERVAL_SECONDS)",
@@ -589,7 +589,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::chat_completions::loop.run_in_executor( None, _prepare_multimodal_inputs, messages, merged_kwargs, request.tools, )::executor_handoff#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 1661,
+   "line": 1668,
    "symbol": "chat_completions",
    "call": "loop.run_in_executor",
    "expr": "loop.run_in_executor( None, _prepare_multimodal_inputs, messages, merged_kwargs, request.tools, )",
@@ -603,7 +603,7 @@
   {
    "id": "atom/entrypoints/openai/api_server.py::anthropic_messages.generate_anthropic_stream::stream_collector.get()::queue_get#0",
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 2148,
+   "line": 2155,
    "symbol": "anthropic_messages.generate_anthropic_stream",
    "call": "stream_collector.get",
    "expr": "stream_collector.get()",
@@ -2979,7 +2979,7 @@
   },
   {
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 337,
+   "line": 338,
    "anchor": "_ANTHROPIC_PING_INTERVAL_SECONDS = 5.0",
    "category": "C1",
    "peer": "none",
@@ -2999,7 +2999,7 @@
   },
   {
    "file": "atom/entrypoints/openai/api_server.py",
-   "line": 2481,
+   "line": 2488,
    "anchor": "\"--timeout-keep-alive\",",
    "category": "C1",
    "peer": "none",

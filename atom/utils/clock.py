@@ -11,9 +11,9 @@ message an LP produced before it moves that LP's clock.
 
 A grant to ``+inf`` closes the simulation window (`end_run`) before the process
 begins to shut down: the run is finished, and the owner's loop must exit rather
-than run its timers at ``+inf``. A clock call after it raises, `stamp_send` keeps
-returning ``+inf`` arrivals for shutdown sends, and `close` raises if the owner
-leaves before it.
+than run its timers at ``+inf``. A clock call after it raises; the wrappers send
+shutdown frames unstamped (arrival ``None``), so only a direct `stamp_send` call
+returns a ``+inf`` arrival; and `close` raises if the owner leaves before it.
 
 A grant names the messages it releases as ``{channel: [(seq, arrival)]}``.
 `_step_through` releases them one at a time in ``(arrival, channel, seq)``
@@ -61,6 +61,11 @@ def install(runtime: "LPRuntime | None") -> None:
     _installed = runtime
 
 
+def installed() -> "LPRuntime | None":
+    """The runtime installed in this process, or None on a real run."""
+    return _installed
+
+
 def now(real) -> float:
     """The LP clock while a runtime is installed; otherwise `real()`.
 
@@ -69,6 +74,17 @@ def now(real) -> float:
     """
     runtime = _installed
     return real() if runtime is None else runtime.read_clock()
+
+
+#: The station job this thread is serving, as ``job.cur = (station, k)``; the
+#: executor running the job sets it and clears it.
+job = threading.local()
+
+
+def current_job_time() -> float | None:
+    """The clock inside this thread's station job, or ``None`` outside one."""
+    cur = getattr(job, "cur", None)
+    return None if cur is None else cur[0].time_in_job(cur[1])
 
 
 class Straggler(Exception):
@@ -129,7 +145,9 @@ class LPRuntime:
     # ---- clock owner ----
 
     def read_clock(self) -> float:
-        return self.now
+        """The LP clock, or on a thread serving a station job, the time in that job."""
+        t = current_job_time()
+        return self.now if t is None else t
 
     def stamp_send(self, ch: str) -> tuple[float, int]:
         """Register one message on `ch` as produced now; returns its ``(arrival, seq)``."""

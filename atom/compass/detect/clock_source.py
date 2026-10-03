@@ -50,9 +50,8 @@ writes down rather than a silence.
 
 import ast
 import os
+from collections import Counter
 from dataclasses import dataclass
-
-from atom.compass.audit.sync_scan import SCANNED_ROOTS
 
 #: The calls that return real seconds. An asyncio timer is not one: it runs on
 #: the event loop's clock, which a simulated run replaces. The `_ns` forms are
@@ -86,93 +85,98 @@ CLOCK_READS = (
 #: does not collect the exemption.
 DEFAULT_ALLOW_LIST: dict[str, str] = {}
 
-#: ATOM's serving path: the roots the synchronization inventory scans, and the
-#: utilities they call. Paths are relative to the repository root.
-SERVING_ROOTS = tuple(root for root, _ in SCANNED_ROOTS) + ("atom/utils/",)
+#: Packages under `atom/` a simulated run never executes, or that keep their
+#: own gate: `compass` its own, `mesh` is Rust, `benchmarks` and `examples` are
+#: scripts, and `diffusion` and `plugin` are never run by a simulation.
+NOT_CORE = ("compass", "mesh", "benchmarks", "examples", "diffusion", "plugin")
+
+_ATOM = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+#: ATOM's core: every module and package under `atom/` outside `NOT_CORE`, read
+#: off the tree so a new package is gated the day it lands. Paths are relative
+#: to the repository root; the clock-source and set-iteration gates both scan
+#: these.
+CORE_ROOTS = tuple(
+    f"atom/{name}"
+    for name in sorted(os.listdir(_ATOM))
+    if name not in NOT_CORE + ("__pycache__",)
+    and (name.endswith(".py") or os.path.isdir(os.path.join(_ATOM, name)))
+)
 
 _REPLACED_RUNNER = "the real model runner, which a simulated run replaces"
+_REPLACED_TRANSFER = "a transfer backend the simulator replaces with a priced one"
 _LOG_ONLY = "times real work for a log line; nothing in the simulated record reads it"
+_COMPILE = "torch.compile at startup, before the simulated window"
+_LOAD = "loads or warms up the model at startup, before the simulated window"
 
-#: Real-clock reads on the serving path that stay real, by site: (file, the
-#: innermost def holding the read, the call) -> (class, reason). K8 stays real
-#: on purpose, out of the clock authority's reach; K9 is outside the model --
-#: outside the simulated window, or in code a simulated run replaces. Every
-#: other read on the serving path takes the LP clock through
-#: `atom.utils.clock.now`.
-SERVING_ALLOW_LIST: dict[tuple[str, str, str], tuple[str, str]] = {
-    (
-        "atom/model_engine/engine_core.py",
-        "_drain_kv_work_at_exit",
-        "time.monotonic",
-    ): ("K9", "bounds the KV drain at shutdown, after the last step is charged"),
-    ("atom/model_engine/engine_core.py", "_process_engine_step", "time.perf_counter"): (
-        "K9",
-        _LOG_ONLY,
-    ),
-    ("atom/model_engine/engine_core_mgr.py", "close", "time.monotonic"): (
-        "K9",
-        "the engine processes' shutdown grace period, after the simulated window",
-    ),
-    (
-        "atom/model_engine/engine_utility.py",
-        "_execute_utility_command",
-        "time.monotonic",
-    ): ("K9", _LOG_ONLY),
-    (
-        "atom/model_engine/model_runner.py",
-        "_build_and_load_model",
-        "time.perf_counter",
-    ): (
-        "K9",
-        _REPLACED_RUNNER,
-    ),
-    ("atom/model_engine/model_runner.py", "_on_trace_ready", "time.time"): (
-        "K9",
-        _REPLACED_RUNNER,
-    ),
-    ("atom/model_engine/model_runner.py", "_on_trace_ready", "time.monotonic"): (
-        "K9",
-        _REPLACED_RUNNER,
-    ),
-    ("atom/model_engine/model_runner.py", "stop_profiler", "time.monotonic"): (
-        "K9",
-        _REPLACED_RUNNER,
-    ),
-    ("atom/model_engine/model_runner.py", "warmup_model", "time.time"): (
-        "K9",
-        _REPLACED_RUNNER,
-    ),
-    ("atom/model_engine/model_runner.py", "capture_cudagraph", "time.time"): (
-        "K9",
-        _REPLACED_RUNNER,
-    ),
-    (
-        "atom/model_engine/model_runner.py",
-        "_disagg_collect_rank_files",
-        "time.monotonic",
-    ): ("K9", _REPLACED_RUNNER),
-    (
-        "atom/kv_transfer/disaggregation/moriio/moriio_connector.py",
-        "_execute_handshake",
-        "time.perf_counter",
-    ): ("K9", "a transfer backend the simulator replaces with a priced one"),
-    ("atom/utils/__init__.py", "shutdown_all_processes", "time.monotonic"): (
-        "K9",
-        "the process shutdown grace period, after the simulated window",
-    ),
-    ("atom/utils/backends.py", "compile", "time.time"): (
-        "K9",
-        "torch.compile at startup, before the simulated window",
-    ),
-    ("atom/utils/backends.py", "__call__", "time.time"): (
-        "K9",
-        "torch.compile at startup, before the simulated window",
-    ),
-    ("atom/utils/decorators.py", "start_monitoring_torch_compile", "time.time"): (
-        "K9",
-        "torch.compile at startup, before the simulated window",
-    ),
-    ("atom/utils/gc_utils.py", "_log", "time.perf_counter"): ("K9", _LOG_ONLY),
+#: Real-clock reads in ATOM's core that stay real, by site: (file, the innermost
+#: def holding the read, the call) -> (class, reason, how many such reads the
+#: def holds). A def holding a different number fails, so a new read beside a
+#: kept one is not excused by it. K8 stays real on purpose, out of the clock
+#: authority's reach; K9 is outside the model -- outside the simulated window,
+#: in code a simulated run replaces, or a timing only a log line reads. Every
+#: other read takes the LP clock through `atom.utils.clock.now`.
+# fmt: off
+_KEPT_REAL = (
+    ("atom/model_engine/engine_core.py", "_drain_kv_work_at_exit", "time.monotonic",
+     "K9", "bounds the KV drain at shutdown, after the last step is charged", 2),
+    ("atom/model_engine/engine_core.py", "_process_engine_step", "time.perf_counter",
+     "K9", _LOG_ONLY, 4),
+    ("atom/model_engine/engine_core_mgr.py", "close", "time.monotonic",
+     "K9", "the engine processes' shutdown grace period, after the simulated window", 2),
+    ("atom/model_engine/engine_utility.py", "_execute_utility_command", "time.monotonic",
+     "K9", _LOG_ONLY, 2),
+    ("atom/model_engine/model_runner.py", "_build_and_load_model", "time.perf_counter",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/model_engine/model_runner.py", "_on_trace_ready", "time.time",
+     "K9", _REPLACED_RUNNER, 1),
+    ("atom/model_engine/model_runner.py", "_on_trace_ready", "time.monotonic",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/model_engine/model_runner.py", "stop_profiler", "time.monotonic",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/model_engine/model_runner.py", "warmup_model", "time.time",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/model_engine/model_runner.py", "capture_cudagraph", "time.time",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/model_engine/model_runner.py", "_disagg_collect_rank_files", "time.monotonic",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/kv_transfer/disaggregation/moriio/moriio_connector.py", "_execute_handshake",
+     "time.perf_counter", "K9", _REPLACED_TRANSFER, 3),
+    ("atom/kv_transfer/offload/dense/connector.py", "_do_load_req", "time.perf_counter",
+     "K9", _REPLACED_TRANSFER, 4),
+    ("atom/kv_transfer/offload/dense/connector.py", "_do_save_req", "time.perf_counter",
+     "K9", _REPLACED_TRANSFER, 4),
+    ("atom/kv_transfer/offload/hybrid/dsv4/connector.py", "_load_page", "time.perf_counter",
+     "K9", _REPLACED_TRANSFER, 4),
+    ("atom/kv_transfer/offload/hybrid/dsv4/connector.py", "_do_save_req", "time.perf_counter",
+     "K9", _REPLACED_TRANSFER, 4),
+    ("atom/model_loader/expert_staging.py", "_ensure_staging", "time.perf_counter",
+     "K9", _LOAD, 2),
+    ("atom/model_loader/loader.py", "load_model", "time.perf_counter", "K9", _LOAD, 2),
+    ("atom/model_loader/loader.py", "_save_online_quant_info", "time.time_ns",
+     "K9", "names a file the loader writes at startup, before the simulated window", 1),
+    ("atom/model_loader/loading_core.py", "load_weights_into_model", "time.perf_counter",
+     "K9", _LOAD, 8),
+    ("atom/model_loader/weight_iterator.py", "_run", "time.perf_counter", "K9", _LOAD, 2),
+    ("atom/model_loader/weight_utils.py", "download_weights_from_hf", "time.perf_counter",
+     "K9", _LOAD, 2),
+    ("atom/spec_decode/drafter.py", "warmup_draft_graphs", "time.time", "K9", _LOAD, 2),
+    ("atom/model_ops/eplb.py", "_execute_runtime_rebalance", "time.perf_counter",
+     "K9", "moves expert weights inside the real forward, which a simulated run replaces", 4),
+    ("atom/rollout/weight_sync.py", "load_weights_via_ipc", "time.time",
+     "K9", "pushes real weights to the GPU, which a simulated run never holds", 2),
+    ("atom/utils/__init__.py", "shutdown_all_processes", "time.monotonic",
+     "K9", "the process shutdown grace period, after the simulated window", 2),
+    ("atom/utils/backends.py", "compile", "time.time", "K9", _COMPILE, 3),
+    ("atom/utils/backends.py", "__call__", "time.time", "K9", _COMPILE, 1),
+    ("atom/utils/decorators.py", "start_monitoring_torch_compile", "time.time",
+     "K9", _COMPILE, 1),
+    ("atom/utils/gc_utils.py", "_log", "time.perf_counter", "K9", _LOG_ONLY, 2),
+)
+# fmt: on
+CORE_ALLOW_LIST: dict[tuple[str, str, str], tuple[str, str, int]] = {
+    (path, scope, call): (kind, why, count)
+    for path, scope, call, kind, why, count in _KEPT_REAL
 }
 
 
@@ -198,7 +202,7 @@ class ClockRead:
 class ClockSourceLint:
     """Parses the simulated path and reports every real-clock read it finds."""
 
-    def __init__(self, allow_list=DEFAULT_ALLOW_LIST, sites=SERVING_ALLOW_LIST) -> None:
+    def __init__(self, allow_list=DEFAULT_ALLOW_LIST, sites=CORE_ALLOW_LIST) -> None:
         self.allow_list = dict(allow_list)
         self.sites = dict(sites)
 
@@ -214,11 +218,11 @@ class ClockSourceLint:
                 return self.allow_list[entry]
         return None
 
-    def site(self, read: ClockRead) -> tuple[str, str] | None:
-        """The class and reason recorded for this read's site, if it stays real."""
-        for (path, scope, call), why in self.sites.items():
+    def site(self, read: ClockRead) -> tuple[str, str, str] | None:
+        """The entry naming this read's site, if one does."""
+        for path, scope, call in self.sites:
             if (scope, call) == (read.scope, read.call) and _names(read.path, path):
-                return why
+                return path, scope, call
         return None
 
     def scan_source(self, source: str, path: str) -> tuple[ClockRead, ...]:
@@ -302,11 +306,27 @@ class ClockSourceLint:
             with open(path, encoding="utf-8") as handle:
                 reads.extend(self.scan_source(handle.read(), path))
         allow_listed = sum(1 for path in modules if self.allowed(path) is not None)
-        unlisted = [read for read in reads if self.site(read) is None]
+        unlisted = unkept(reads, self.sites, self.site)
         kept = len(reads) - len(unlisted)
         return (1 if unlisted else 0), self.report(
             unlisted, len(modules), allow_listed, kept
         )
+
+
+def unkept(reads, sites, site) -> list:
+    """The reads no entry keeps.
+
+    `site(read)` names a read's entry, and the entry's last field is how many
+    reads it keeps. A site holding any other number keeps none, so a new read
+    beside a kept one is reported together with them.
+    """
+    keys = [site(read) for read in reads]
+    held = Counter(keys)
+    return [
+        read
+        for read, key in zip(reads, keys)
+        if key is None or held[key] != sites[key][-1]
+    ]
 
 
 def _dotted(node) -> str | None:
