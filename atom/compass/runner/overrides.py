@@ -551,10 +551,16 @@ class NonAllocatingRunner:
                 f"{type(batch).__name__} cannot say whether its batch produces "
                 "output; there is nothing here to report from."
             )
-        # Imported at call time, not at module scope, so this module stays
-        # importable where there is no driver. By the time a step is reported
-        # the worker has imported the engine anyway.
+        # Imported at call time, not at module scope: the scheduler so this
+        # module stays importable where there is no driver (by the time a step
+        # is reported the worker has imported the engine anyway), and the
+        # parity package because, at module scope, this module may import no
+        # `atom` package besides `atom.compass.runner` and `atom.compass.memory`
+        # (`test_only_the_binding_module_reaches_the_engine`).
+        from atom.compass.parity import record_step
         from atom.model_engine.scheduler import ScheduledBatchOutput
+
+        record_step(self, batch)
 
         stream = getattr(self, "_token_stream", None)
         if stream is None:
