@@ -9,7 +9,6 @@ import time
 from contextlib import ExitStack
 
 import torch
-import zmq
 
 from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
@@ -33,6 +32,7 @@ from atom.utils import (
     make_zmq_socket,
     set_process_title,
 )
+from atom.utils import zmq_shim as zmq
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -70,7 +70,7 @@ class EngineCore:
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
-        self.output_queue = queue.Queue[list[Sequence]]()
+        self.output_queue = clock.relay_queue(config.parallel_config.data_parallel_rank)
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
@@ -90,6 +90,13 @@ class EngineCore:
         assert self.control_address, (
             "parallel_config.control_address is unset -- an EngineCore must be "
             "launched through CoreManager, which allocates the control channel"
+        )
+        clock.name_endpoints(
+            config.parallel_config.data_parallel_rank,
+            input_address=input_address,
+            control_address=self.control_address,
+            output_address=output_address,
+            config=config,
         )
         self.output_thread = threading.Thread(
             target=self.process_output_sockets, args=(self.output_address,), daemon=True

@@ -13,19 +13,18 @@ import weakref
 from dataclasses import dataclass
 from threading import Lock, Thread
 
-import zmq
-import zmq.asyncio
-
 from atom.config import Config
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
+    clock,
     envs,
     get_open_zmq_inproc_path,
     get_open_zmq_ipc_path,
     make_zmq_socket,
 )
+from atom.utils import zmq_shim as zmq
 
 logger = logging.getLogger("atom")
 
@@ -439,7 +438,8 @@ class CoreManager:
                 else:
                     bind_addresses = [info["addresses"] for info in processes_info]
 
-                for addresses in bind_addresses:
+                for dp, addresses in enumerate(bind_addresses):
+                    clock.name_endpoints(dp, **addresses)
                     input_socket = make_zmq_socket(
                         self.ctx, addresses["input_address"], zmq.ROUTER, bind=True
                     )
@@ -1589,6 +1589,12 @@ class DisaggCoreManager(CoreManager):
         def _connect_proc(proc, in_addr, out_addr, ctrl_addr, name):
             proc.start()
             self.engine_core_processes.append(proc)
+            clock.name_endpoints(
+                0,
+                input_address=in_addr,
+                control_address=ctrl_addr,
+                output_address=out_addr,
+            )
             in_sock = make_zmq_socket(self.ctx, in_addr, zmq.ROUTER, bind=True)
             identity, _ = in_sock.recv_multipart()
             self.input_sockets.append(in_sock)

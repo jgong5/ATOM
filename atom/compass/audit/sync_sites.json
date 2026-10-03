@@ -1340,7 +1340,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.__init__::self.runner_mgr.call_func(\"get_num_blocks\", wait_out=True)::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 133,
+   "line": 140,
    "symbol": "EngineCore.__init__",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func(\"get_num_blocks\", wait_out=True)",
@@ -1354,7 +1354,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.__init__::self.runner_mgr.call_func( \"allocate_kv_cache\", num_blocks, wait_out=True )::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 143,
+   "line": 150,
    "symbol": "EngineCore.__init__",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func( \"allocate_kv_cache\", num_blocks, wait_out=True )",
@@ -1368,7 +1368,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.__init__::self.runner_mgr.call_func( \"capture_cudagraph\", wait_out=True )::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 150,
+   "line": 157,
    "symbol": "EngineCore.__init__",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func( \"capture_cudagraph\", wait_out=True )",
@@ -1382,7 +1382,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore._freeze_after_startup::self.runner_mgr.call_func(\"freeze_gc_heap\", wait_out=True)::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 205,
+   "line": 212,
    "symbol": "EngineCore._freeze_after_startup",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func(\"freeze_gc_heap\", wait_out=True)",
@@ -1396,7 +1396,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.exit::proc.join(timeout=5)::join#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 270,
+   "line": 277,
    "symbol": "EngineCore.exit",
    "call": "proc.join",
    "expr": "proc.join(timeout=5)",
@@ -1410,7 +1410,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore._send_engine_dead::self.output_thread.join(timeout=0.5)::join#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 277,
+   "line": 284,
    "symbol": "EngineCore._send_engine_dead",
    "call": "self.output_thread.join",
    "expr": "self.output_thread.join(timeout=0.5)",
@@ -1424,7 +1424,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore._is_idle_rl_weights_offloaded::time.sleep(0.01)::sleep#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 308,
+   "line": 315,
    "symbol": "EngineCore._is_idle_rl_weights_offloaded",
    "call": "time.sleep",
    "expr": "time.sleep(0.01)",
@@ -1438,7 +1438,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.busy_loop::while True::spin_loop#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 316,
+   "line": 323,
    "symbol": "EngineCore.busy_loop",
    "call": "while True",
    "expr": "while True",
@@ -1452,7 +1452,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore._process_engine_step_inner::self.runner_mgr.call_func( \"forward\", scheduled_batch, wait_out=True )::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 387,
+   "line": 394,
    "symbol": "EngineCore._process_engine_step_inner",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func( \"forward\", scheduled_batch, wait_out=True )",
@@ -1466,7 +1466,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore._drain_kv_work_at_exit::time.sleep(KV_IDLE_DRAIN_INTERVAL_S)::sleep#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 482,
+   "line": 489,
    "symbol": "EngineCore._drain_kv_work_at_exit",
    "call": "time.sleep",
    "expr": "time.sleep(KV_IDLE_DRAIN_INTERVAL_S)",
@@ -1480,7 +1480,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore._poll_kv_transfer_progress::self.runner_mgr.call_func_with_aggregation(\"async_proc_aggregation\")::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 489,
+   "line": 496,
    "symbol": "EngineCore._poll_kv_transfer_progress",
    "call": "self.runner_mgr.call_func_with_aggregation",
    "expr": "self.runner_mgr.call_func_with_aggregation(\"async_proc_aggregation\")",
@@ -1494,7 +1494,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.process_input_sockets::input_socket.send(b\"\")::p2p#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 537,
+   "line": 544,
    "symbol": "EngineCore.process_input_sockets",
    "call": "input_socket.send",
    "expr": "input_socket.send(b\"\")",
@@ -1508,7 +1508,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.process_input_sockets::control_socket.send(b\"\")::p2p#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 538,
+   "line": 545,
    "symbol": "EngineCore.process_input_sockets",
    "call": "control_socket.send",
    "expr": "control_socket.send(b\"\")",
@@ -1522,7 +1522,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.process_input_sockets::poller.poll()::poll#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 545,
+   "line": 552,
    "symbol": "EngineCore.process_input_sockets",
    "call": "poller.poll",
    "expr": "poller.poll()",
@@ -1536,7 +1536,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.process_input_sockets::sock.recv(copy=False)::socket_recv#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 547,
+   "line": 554,
    "symbol": "EngineCore.process_input_sockets",
    "call": "sock.recv",
    "expr": "sock.recv(copy=False)",
@@ -1550,7 +1550,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::self.output_queue.get()::queue_get#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 589,
+   "line": 596,
    "symbol": "EngineCore.process_output_sockets",
    "call": "self.output_queue.get",
    "expr": "self.output_queue.get()",
@@ -1564,7 +1564,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::socket.send(obj)::p2p#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 594,
+   "line": 601,
    "symbol": "EngineCore.process_output_sockets",
    "call": "socket.send",
    "expr": "socket.send(obj)",
@@ -1578,7 +1578,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::socket.send(obj)::p2p#1",
    "file": "atom/model_engine/engine_core.py",
-   "line": 600,
+   "line": 607,
    "symbol": "EngineCore.process_output_sockets",
    "call": "socket.send",
    "expr": "socket.send(obj)",
@@ -1592,7 +1592,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::socket.send(obj)::p2p#2",
    "file": "atom/model_engine/engine_core.py",
-   "line": 606,
+   "line": 613,
    "symbol": "EngineCore.process_output_sockets",
    "call": "socket.send",
    "expr": "socket.send(obj)",
@@ -1606,7 +1606,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::socket.send(serialized_obj)::p2p#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 615,
+   "line": 622,
    "symbol": "EngineCore.process_output_sockets",
    "call": "socket.send",
    "expr": "socket.send(serialized_obj)",
@@ -1620,7 +1620,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::socket.send(obj)::p2p#3",
    "file": "atom/model_engine/engine_core.py",
-   "line": 626,
+   "line": 633,
    "symbol": "EngineCore.process_output_sockets",
    "call": "socket.send",
    "expr": "socket.send(obj)",
@@ -1634,7 +1634,7 @@
   {
    "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::socket.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))::p2p#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 629,
+   "line": 636,
    "symbol": "EngineCore.process_output_sockets",
    "call": "socket.send",
    "expr": "socket.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))",
@@ -1648,7 +1648,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DPEngineCoreProc.busy_loop::time.sleep(0.01)::sleep#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 722,
+   "line": 729,
    "symbol": "DPEngineCoreProc.busy_loop",
    "call": "time.sleep",
    "expr": "time.sleep(0.01)",
@@ -1662,7 +1662,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DPEngineCoreProc._execute_dummy_batch::self.runner_mgr.call_func(\"dummy_execution\", wait_out=True)::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 750,
+   "line": 757,
    "symbol": "DPEngineCoreProc._execute_dummy_batch",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func(\"dummy_execution\", wait_out=True)",
@@ -1676,7 +1676,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DPEngineCoreProc._sync_dp_state::torch.distributed.all_reduce( state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group )::collective#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 771,
+   "line": 778,
    "symbol": "DPEngineCoreProc._sync_dp_state",
    "call": "torch.distributed.all_reduce",
    "expr": "torch.distributed.all_reduce( state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group )",
@@ -1690,7 +1690,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DPEngineCoreProc._sync_shutdown_state::torch.distributed.all_reduce( tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group )::collective#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 788,
+   "line": 795,
    "symbol": "DPEngineCoreProc._sync_shutdown_state",
    "call": "torch.distributed.all_reduce",
    "expr": "torch.distributed.all_reduce( tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group )",
@@ -1704,7 +1704,7 @@
   {
    "id": "atom/model_engine/engine_core.py::PrefillEngineCore._post_model_load_hook::self.runner_mgr.call_func( \"export_model_weight_ipc_handles\", wait_out=True )::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 873,
+   "line": 880,
    "symbol": "PrefillEngineCore._post_model_load_hook",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func( \"export_model_weight_ipc_handles\", wait_out=True )",
@@ -1718,7 +1718,7 @@
   {
    "id": "atom/model_engine/engine_core.py::PrefillEngineCore._post_model_load_hook::w_sock.send(weight_payload)::p2p#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 882,
+   "line": 889,
    "symbol": "PrefillEngineCore._post_model_load_hook",
    "call": "w_sock.send",
    "expr": "w_sock.send(weight_payload)",
@@ -1732,7 +1732,7 @@
   {
    "id": "atom/model_engine/engine_core.py::PrefillEngineCore._post_model_load_hook::ack_sock.recv()::socket_recv#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 886,
+   "line": 893,
    "symbol": "PrefillEngineCore._post_model_load_hook",
    "call": "ack_sock.recv",
    "expr": "ack_sock.recv()",
@@ -1746,7 +1746,7 @@
   {
    "id": "atom/model_engine/engine_core.py::PrefillEngineCore._send_ready_signal::self.runner_mgr.call_func( \"export_kv_cache_ipc_handle\", wait_out=True )::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 892,
+   "line": 899,
    "symbol": "PrefillEngineCore._send_ready_signal",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func( \"export_kv_cache_ipc_handle\", wait_out=True )",
@@ -1760,7 +1760,7 @@
   {
    "id": "atom/model_engine/engine_core.py::PrefillEngineCore._send_ready_signal::self._bootstrap_push_sock.send(kvcache_bundle)::p2p#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 907,
+   "line": 914,
    "symbol": "PrefillEngineCore._send_ready_signal",
    "call": "self._bootstrap_push_sock.send",
    "expr": "self._bootstrap_push_sock.send(kvcache_bundle)",
@@ -1774,7 +1774,7 @@
   {
    "id": "atom/model_engine/engine_core.py::PrefillEngineCore._init_disagg::self.runner_mgr.call_func(\"create_prefill_stream_pool\", wait_out=True)::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 920,
+   "line": 927,
    "symbol": "PrefillEngineCore._init_disagg",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func(\"create_prefill_stream_pool\", wait_out=True)",
@@ -1788,7 +1788,7 @@
   {
    "id": "atom/model_engine/engine_core.py::PrefillEngineCore._recv_block_assignments::sock.recv()::socket_recv#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 947,
+   "line": 954,
    "symbol": "PrefillEngineCore._recv_block_assignments",
    "call": "sock.recv",
    "expr": "sock.recv()",
@@ -1802,7 +1802,7 @@
   {
    "id": "atom/model_engine/engine_core.py::PrefillEngineCore._process_engine_step::self.runner_mgr.call_func( \"prefill_forward\", scheduled_batch, wait_out=True )::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 993,
+   "line": 1000,
    "symbol": "PrefillEngineCore._process_engine_step",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func( \"prefill_forward\", scheduled_batch, wait_out=True )",
@@ -1816,7 +1816,7 @@
   {
    "id": "atom/model_engine/engine_core.py::PrefillEngineCore._process_engine_step::self._p2d_sock.send(pickle.dumps((DisaggMsgType.PREFILL_DONE, done)))::p2p#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 1015,
+   "line": 1022,
    "symbol": "PrefillEngineCore._process_engine_step",
    "call": "self._p2d_sock.send",
    "expr": "self._p2d_sock.send(pickle.dumps((DisaggMsgType.PREFILL_DONE, done)))",
@@ -1830,7 +1830,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DecodeEngineCore.__init__::sock.recv()::socket_recv#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 1090,
+   "line": 1097,
    "symbol": "DecodeEngineCore.__init__",
    "call": "sock.recv",
    "expr": "sock.recv()",
@@ -1844,7 +1844,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DecodeEngineCore.__init__::self.runner_mgr.call_func( \"import_kv_cache_ipc_handle\", bundle[\"kvcache_args\"], num_kvcache_blocks, wait_out=True, )::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 1098,
+   "line": 1105,
    "symbol": "DecodeEngineCore.__init__",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func( \"import_kv_cache_ipc_handle\", bundle[\"kvcache_args\"], num_kvcache_blocks, wait_out=True, )",
@@ -1858,7 +1858,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DecodeEngineCore.__init__::self.runner_mgr.call_func( \"capture_cudagraph\", wait_out=True )::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 1110,
+   "line": 1117,
    "symbol": "DecodeEngineCore.__init__",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func( \"capture_cudagraph\", wait_out=True )",
@@ -1872,7 +1872,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DecodeEngineCore._post_model_load_hook::w_sock.recv()::socket_recv#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 1145,
+   "line": 1152,
    "symbol": "DecodeEngineCore._post_model_load_hook",
    "call": "w_sock.recv",
    "expr": "w_sock.recv()",
@@ -1886,7 +1886,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DecodeEngineCore._post_model_load_hook::self.runner_mgr.call_func( \"import_model_weight_ipc_handles\", weight_handles, wait_out=True )::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 1150,
+   "line": 1157,
    "symbol": "DecodeEngineCore._post_model_load_hook",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func( \"import_model_weight_ipc_handles\", weight_handles, wait_out=True )",
@@ -1900,7 +1900,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DecodeEngineCore._post_model_load_hook::time.sleep(2)::sleep#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 1157,
+   "line": 1164,
    "symbol": "DecodeEngineCore._post_model_load_hook",
    "call": "time.sleep",
    "expr": "time.sleep(2)",
@@ -1914,7 +1914,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DecodeEngineCore._post_model_load_hook::ack_sock.send(b\"ok\")::p2p#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 1163,
+   "line": 1170,
    "symbol": "DecodeEngineCore._post_model_load_hook",
    "call": "ack_sock.send",
    "expr": "ack_sock.send(b\"ok\")",
@@ -1928,7 +1928,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DecodeEngineCore._init_disagg::self.runner_mgr.call_func(\"create_decode_stream_pool\", wait_out=True)::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 1180,
+   "line": 1187,
    "symbol": "DecodeEngineCore._init_disagg",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func(\"create_decode_stream_pool\", wait_out=True)",
@@ -1942,7 +1942,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DecodeEngineCore._recv_prefill_done::sock.recv()::socket_recv#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 1205,
+   "line": 1212,
    "symbol": "DecodeEngineCore._recv_prefill_done",
    "call": "sock.recv",
    "expr": "sock.recv()",
@@ -1956,7 +1956,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DecodeEngineCore._send_block_assignment::self._d2p_sock.send(pickle.dumps((DisaggMsgType.BLOCK_ASSIGNMENT, assignment)))::p2p#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 1230,
+   "line": 1237,
    "symbol": "DecodeEngineCore._send_block_assignment",
    "call": "self._d2p_sock.send",
    "expr": "self._d2p_sock.send(pickle.dumps((DisaggMsgType.BLOCK_ASSIGNMENT, assignment)))",
@@ -1970,7 +1970,7 @@
   {
    "id": "atom/model_engine/engine_core.py::DecodeEngineCore._process_engine_step::self.runner_mgr.call_func(\"forward\", scheduled_batch, wait_out=True)::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "line": 1265,
+   "line": 1272,
    "symbol": "DecodeEngineCore._process_engine_step",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func(\"forward\", scheduled_batch, wait_out=True)",
@@ -1984,7 +1984,7 @@
   {
    "id": "atom/model_engine/engine_core_mgr.py::CoreManager.__init__::proc.join()::join#0",
    "file": "atom/model_engine/engine_core_mgr.py",
-   "line": 427,
+   "line": 426,
    "symbol": "CoreManager.__init__",
    "call": "proc.join",
    "expr": "proc.join()",
@@ -2234,7 +2234,7 @@
   {
    "id": "atom/model_engine/engine_core_mgr.py::DisaggCoreManager.__init__._connect_proc::in_sock.recv_multipart()::socket_recv#0",
    "file": "atom/model_engine/engine_core_mgr.py",
-   "line": 1593,
+   "line": 1599,
    "symbol": "DisaggCoreManager.__init__._connect_proc",
    "call": "in_sock.recv_multipart",
    "expr": "in_sock.recv_multipart()",
@@ -2248,7 +2248,7 @@
   {
    "id": "atom/model_engine/engine_core_mgr.py::DisaggCoreManager.__init__._connect_proc::ctrl_sock.recv_multipart()::socket_recv#0",
    "file": "atom/model_engine/engine_core_mgr.py",
-   "line": 1597,
+   "line": 1603,
    "symbol": "DisaggCoreManager.__init__._connect_proc",
    "call": "ctrl_sock.recv_multipart",
    "expr": "ctrl_sock.recv_multipart()",
@@ -2262,7 +2262,7 @@
   {
    "id": "atom/model_engine/engine_core_mgr.py::DisaggCoreManager._wait_for_single_ready::sock.recv(copy=False)::socket_recv#0",
    "file": "atom/model_engine/engine_core_mgr.py",
-   "line": 1652,
+   "line": 1658,
    "symbol": "DisaggCoreManager._wait_for_single_ready",
    "call": "sock.recv",
    "expr": "sock.recv(copy=False)",
@@ -2939,7 +2939,7 @@
   },
   {
    "file": "atom/model_engine/engine_core.py",
-   "line": 456,
+   "line": 463,
    "anchor": "if now < self._next_idle_kv_drain:",
    "category": "C2",
    "peer": "none",
@@ -2949,7 +2949,7 @@
   },
   {
    "file": "atom/model_engine/engine_core.py",
-   "line": 320,
+   "line": 327,
    "anchor": "next_metrics_push = now + METRICS_PUSH_INTERVAL_S",
    "category": "ignore",
    "peer": "none",
@@ -2959,7 +2959,7 @@
   },
   {
    "file": "atom/model_engine/engine_core.py",
-   "line": 701,
+   "line": 708,
    "anchor": "next_metrics_push = now + METRICS_PUSH_INTERVAL_S",
    "category": "ignore",
    "peer": "none",
@@ -2969,7 +2969,7 @@
   },
   {
    "file": "atom/model_engine/engine_core.py",
-   "line": 471,
+   "line": 478,
    "anchor": "deadline = time.monotonic() + KV_SHUTDOWN_DRAIN_TIMEOUT_S",
    "category": "ignore",
    "peer": "none",
@@ -3049,7 +3049,7 @@
   },
   {
    "file": "atom/model_engine/engine_core.py",
-   "line": 697,
+   "line": 704,
    "anchor": "while True:",
    "category": "A",
    "peer": "none",

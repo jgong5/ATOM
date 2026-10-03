@@ -135,6 +135,8 @@ class LPRuntime:
         self.unreleased: dict[tuple[str, int], float] = {}
         self.taken_by: dict[threading.Thread, tuple[str, int]] = {}
         self.wakes: dict[threading.Thread, _Wakeup] = {}
+        self.endpoints: dict[str, str] = {}  # address -> channel kind it carries
+        self.relays: dict[str, RelayQueue] = {}  # channel -> the engine's output relay
 
     def start_run(self) -> None:
         self.in_run = True
@@ -322,6 +324,16 @@ class WrappedSocket:
         at = 1 if self.raw.type == zmq.ROUTER else 0
         self.raw.send_multipart([*frames[:at], hdr, *frames[at:]], **kw)
 
+    def recv_multipart(self, *args, **kw) -> list:
+        """A frame sent outside the run, ATOM's connect handshake: the frames, header removed."""
+        frames = self.raw.recv_multipart(*args, **kw)
+        ch, arrival, seq = pickle.loads(
+            frames.pop(1 if self.raw.type == zmq.ROUTER else 0)
+        )
+        if arrival is not None:
+            raise RuntimeError(f"{ch} seq {seq} read by recv_multipart, past the clock")
+        return frames
+
     def pull(self) -> None:
         """Read every frame already here, without blocking; check and buffer each."""
         while True:
@@ -470,3 +482,67 @@ class RelayQueue:
             raise RuntimeError(f"{self.wsock.ch}: one relay item sent twice")
         stamp, self.pending = self.pending, None
         return stamp
+
+
+# ---- channel endpoints: named by ATOM's wiring, read by `atom.utils.zmq_shim` ----
+
+
+def channel_of(rt: LPRuntime, kind: str) -> str:
+    """The one channel of `rt`'s LP whose name ends ``:kind``."""
+    names = [
+        c.name
+        for c in rt.table.channels_from(rt.me) + rt.table.channels_into(rt.me)
+        if c.name.endswith(":" + kind)
+    ]
+    if len(names) != 1:
+        raise KeyError(
+            f"{rt.me} has {len(names)} channels of kind {kind!r} ({names}); a "
+            "channel socket names exactly one"
+        )
+    return names[0]
+
+
+def name_endpoints(
+    dp: int, input_address: str, control_address: str, output_address: str, config=None
+) -> None:
+    """Record the channel kind each address carries; a real run records nothing.
+
+    A socket this LP binds or connects to a recorded address becomes that
+    channel's `WrappedSocket`; the channel is looked up then, so an address no
+    socket of this LP opens is never resolved. An engine passes its `config`,
+    which holds its pipeline-stage and prefill/decode addresses.
+    """
+    rt = _installed
+    if rt is None:
+        return
+    tag = f"#dp{dp}"
+    kinds = {
+        input_address: "request" + tag,
+        control_address: "control" + tag,
+        output_address: "output" + tag,
+    }
+    if config is not None:
+        pc = config.parallel_config
+        kinds |= dict.fromkeys(pc.pp_meta_addrs, "meta")
+        kinds |= {
+            pc.pp_token_addr: "tokens",
+            pc.pp_kv_status_addr: "kv_status",
+            config.disagg_p2d_addr: "prefill_done",
+            config.disagg_d2p_addr: "block_assignment",
+        }
+    kinds.pop("", None)  # an address the deployment does not use
+    rt.endpoints |= kinds
+
+
+def relay_queue(dp: int):
+    """The engine's output queue: a `RelayQueue` on its output channel, else a `queue.Queue`.
+
+    Its socket is opened later, on the output thread, and takes the relay's
+    placeholder when it connects to the output address.
+    """
+    rt = _installed
+    if rt is None:
+        return queue.Queue()
+    ch = channel_of(rt, f"output#dp{dp}")
+    rt.relays[ch] = RelayQueue(rt, WrappedSocket(rt, None, ch))
+    return rt.relays[ch]
