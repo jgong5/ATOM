@@ -1589,7 +1589,12 @@ class DisaggCoreManager(CoreManager):
         def _connect_proc(proc, in_addr, out_addr, ctrl_addr, name):
             proc.start()
             self.engine_core_processes.append(proc)
-            clock.name_endpoints(0, in_addr, ctrl_addr, out_addr)
+            clock.name_endpoints(
+                0,
+                input_address=in_addr,
+                control_address=ctrl_addr,
+                output_address=out_addr,
+            )
             in_sock = make_zmq_socket(self.ctx, in_addr, zmq.ROUTER, bind=True)
             identity, _ = in_sock.recv_multipart()
             self.input_sockets.append(in_sock)

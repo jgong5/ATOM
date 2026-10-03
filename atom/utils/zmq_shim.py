@@ -38,11 +38,20 @@ def __getattr__(name: str):
 class _Socket:
     """A socket of a Compass run: pyzmq's own until it names a channel address."""
 
+    # The wrapper's own fields; every other attribute is read from and set on `raw`.
+    _OWN = ("raw", "rt", "ch", "relay", "buf", "__class__")
+
     def __init__(self, raw: _zmq.Socket) -> None:
         self.raw = raw
 
     def __getattr__(self, name: str):
         return getattr(self.raw, name)
+
+    def __setattr__(self, name: str, value) -> None:
+        if name in self._OWN:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self.raw, name, value)
 
     def __enter__(self):
         return self

@@ -93,10 +93,10 @@ class EngineCore:
         )
         clock.name_endpoints(
             config.parallel_config.data_parallel_rank,
-            input_address,
-            self.control_address,
-            output_address,
-            config,
+            input_address=input_address,
+            control_address=self.control_address,
+            output_address=output_address,
+            config=config,
         )
         self.output_thread = threading.Thread(
             target=self.process_output_sockets, args=(self.output_address,), daemon=True

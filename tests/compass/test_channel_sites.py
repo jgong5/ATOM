@@ -60,6 +60,23 @@ SITES = {
     "CoreManager._create_output_thread.process_outputs_socket": (("output",), MGR),
 }
 
+#: Function -> the expression each `clock.name_endpoints` keyword must carry there;
+#: ``None`` is a ``**`` mapping keyed by the parameter names.
+ADDRESSES = {
+    "EngineCore.__init__": {
+        "input_address": "input_address",
+        "control_address": "self.control_address",
+        "output_address": "output_address",
+        "config": "config",
+    },
+    "CoreManager.__init__": {None: "addresses"},
+    "DisaggCoreManager.__init__._connect_proc": {
+        "input_address": "in_addr",
+        "control_address": "ctrl_addr",
+        "output_address": "out_addr",
+    },
+}
+
 
 def _config(meta=(), token="", kv="", p2d="", d2p=""):
     pc = SimpleNamespace(pp_meta_addrs=list(meta), pp_token_addr=token)
@@ -126,11 +143,18 @@ def test_every_channel_row_maps_to_an_address_its_wiring_names(monkeypatch):
         print(r["mechanism"], r["id"], "->", *SITES.get(r["symbol"], ("?",))[0])
     assert rows and acks
     assert sorted({r["symbol"] for r in rows}) == sorted(SITES), "unmapped or stale"
+    passed = {
+        fn: {k.arg: ast.unparse(k.value) for k in c.keywords}
+        for fn, calls in naming.calls.items()
+        for c in calls
+        if c.func.attr == "name_endpoints"
+    }
+    assert passed == ADDRESSES
 
     def covers(call, kind):
         if call.func.attr == "relay_queue":
             return kind == "relay"
-        return kind in (full if len(call.args) == 5 else base)
+        return kind in (full if any(k.arg == "config" for k in call.keywords) else base)
 
     unnamed = [
         (symbol, kind, fn)
@@ -208,6 +232,20 @@ def test_the_shim_is_pyzmq_until_a_runtime_is_installed(monkeypatch):
     ctx.destroy(linger=0)  # before asserting: a later `instance()` must not inherit it
     assert made[:3] == (False, True, zmq_shim._Socket)
     assert type(made[3]) is WrappedPoller
+
+
+def test_an_option_set_by_attribute_on_a_shim_socket_reaches_pyzmq(
+    monkeypatch, shim_ctx
+):
+    rt = LPRuntime(LpId("engine"), _engine_table(), None)
+    monkeypatch.setattr(clock, "_installed", rt)
+    clock.name_endpoints(0, "", "", "inproc://named")
+    plain, named = shim_ctx.socket(zmq.PULL), shim_ctx.socket(zmq.PUSH)
+    named.connect("inproc://named")
+    for sock in (plain, named):
+        sock.rcvtimeo = 123
+    assert type(named) is zmq_shim._ChannelSocket
+    assert [s.raw.getsockopt(zmq.RCVTIMEO) for s in (plain, named)] == [123, 123]
 
 
 def test_an_engine_names_its_own_and_its_configured_addresses(monkeypatch):
