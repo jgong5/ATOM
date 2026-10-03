@@ -265,14 +265,14 @@ def test_a_clock_that_hangs_up_mid_frame_is_a_malformed_message(answer, match):
 def test_a_refusal_crosses_tcp_as_itself_and_the_connection_serves_on(served):
     ca = ClockAuthority(_table())
     a = _connect(A, served(ca, LOCAL))
-    with pytest.raises(BackdatedEvent, match="before a's clock 0.0") as refused:
-        _ask(a, (TAR, 1.0, [(AB, 0, 0.1)], INF))
-    assert refused.value.table == ca.lp_table()
     # A frame the loop refuses to queue is answered in place of a reply.
     a.send(("GRANT", 1.0, {}))
     with pytest.raises(ValueError, match="sends only TAR, NER"):
         _result(_later(a.recv))
     assert _ask(a, (TAR, 1.0, [], INF)) == (1.0, {})
+    with pytest.raises(BackdatedEvent, match="before a's clock 1.0") as refused:
+        _ask(a, (TAR, 2.0, [(AB, 0, 1.1)], INF))
+    assert refused.value.table == ca.lp_table()
     a.close()
     with pytest.raises(ValueError, match="closed file"):
         a.send((TAR, 2.0, [], INF))

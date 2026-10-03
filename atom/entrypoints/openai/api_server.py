@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from PIL import Image
 
 from atom import SamplingParams
+from atom.compass.carriers import stamp_events, tracestate_stamp
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.multimodal import build_multimodal_inputs
@@ -459,6 +460,9 @@ async def _client_stream(
     `_logged_stream`, and the Anthropic endpoint never used it. A watchdog
     with an endpoint-shaped hole in it is worse than none, because the zero it
     reports looks like an answer.
+
+    In a simulated run each event leaves with a comment line carrying its
+    stream stamp, written after the frame is logged.
     """
     it = gen.__aiter__()
     delivered = False
@@ -472,6 +476,9 @@ async def _client_stream(
                 return
         delivered = True
         _log_sse(chunk, request_id)
+        rt = clock.installed()
+        if rt is not None and rt.in_run:
+            chunk = stamp_events(chunk, rt)
         yield chunk
 
 
@@ -2623,6 +2630,40 @@ def main():
 
     signal.signal(signal.SIGINT, _sigint_handler)
 
+    loop_impl = _loop_impl()
+    logger.info(
+        f"Starting server on {args.host}:{args.server_port} (loop={loop_impl})..."
+    )
+    uvicorn.run(
+        _served_app(),
+        host=args.host,
+        port=args.server_port,
+        loop=loop_impl,
+        access_log=not args.disable_uvicorn_access_log,
+        timeout_keep_alive=args.timeout_keep_alive,
+    )
+
+
+def _served_app():
+    """The ASGI app ``main`` serves: on a simulated run, behind `HttpChannel`."""
+    if clock.installed() is None:
+        return app
+    from atom.utils.compass_loop import HttpChannel
+
+    return HttpChannel(app, _tracestate_stamp)
+
+
+def _tracestate_stamp(scope) -> tuple[float, int] | None:
+    """A request's ``(arrival, seq)`` from all its ``tracestate`` header lines."""
+    return tracestate_stamp(
+        ",".join(v.decode("latin-1") for k, v in scope["headers"] if k == b"tracestate")
+    )
+
+
+def _loop_impl() -> str:
+    """uvicorn's ``loop``: on a simulated run, the loop that runs on the LP clock."""
+    if clock.installed() is not None:
+        return "atom.utils.compass_loop:CompassEventLoop"
     # uvloop replaces the stdlib asyncio selector loop with a libuv-backed one,
     # which is markedly faster at the SSE socket I/O (sock.send / selector
     # register-unregister) that saturates the event loop under high streaming
@@ -2630,24 +2671,12 @@ def main():
     try:
         import uvloop  # noqa: F401
 
-        loop_impl = "uvloop"
+        return "uvloop"
     except ImportError:
-        loop_impl = "auto"
         logger.warning(
             "uvloop not installed; falling back to the default asyncio loop."
         )
-
-    logger.info(
-        f"Starting server on {args.host}:{args.server_port} (loop={loop_impl})..."
-    )
-    uvicorn.run(
-        app,
-        host=args.host,
-        port=args.server_port,
-        loop=loop_impl,
-        access_log=not args.disable_uvicorn_access_log,
-        timeout_keep_alive=args.timeout_keep_alive,
-    )
+        return "auto"
 
 
 if __name__ == "__main__":

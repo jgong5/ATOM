@@ -61,18 +61,17 @@ evidence about another until it is shown to transfer.
 
 ## D90. DP — the step shape is decided by a collective, and that is the design problem
 
-> **Replaced in part by the owner's DP ruling of 2026-10-01**
-> ([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)): the step is
-> the `max` over ranks of each rank's own cost, exchanged by one `all_reduce(MAX)` inside
-> the forward, and every DP rank holds its own LP runtime, joined by the CA. Where this
-> section differs, the ruling holds; #532 rewrites it.
+**Revised 2026-10-01 by the owner's DP ruling**
+([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)): the step's
+cost is the `max` over ranks, below. It replaces the per-layer critical-path pricing `01`
+D3 adopted on 2026-09-28.
 
 ### Q2 first, because it is the one with teeth
 
 DP is the only strategy that couples **scheduling decisions** across ranks. Under DP, the
 shape a rank runs is not a function of what that rank scheduled.
 
-`ForwardMode.decide` (`forward_context.py:227-300`) runs a DP collective *before* the
+`ForwardMode.decide` (`atom/utils/forward_context.py`) runs a DP collective *before* the
 step's shape is settled, and settles the shape **from the result**:
 
 ```
@@ -110,8 +109,8 @@ load-bearing one for this topic:
 
 | | Where | What it carries | Cadence |
 |---|---|---|---|
-| **liveness / lockstep** | `EngineCore._sync_dp_state` (`engine_core.py:751-781`) | Gloo CPU `all_reduce(MAX)` over three booleans: `has_unfinished`, `shutdown`, `offloaded` | engine-core loop |
-| **step shape** | `sync_dp_metadata` (`tbo/ubatching.py:199-224`), called from `ForwardMode.decide` | one packed `all_gather` of `n_fields` int32 per rank: DP token padding, the prefill fan-out, the cross-DP TBO gate, and the DSpark graph-shape MAX | **every forward** |
+| **liveness / lockstep** | `DPEngineCoreProc._sync_dp_state` (`atom/model_engine/engine_core.py`) | Gloo CPU `all_reduce(MAX)` over three booleans: `has_unfinished`, `shutdown`, `offloaded` | engine-core loop |
+| **step shape** | `sync_dp_metadata` (`atom/utils/tbo/ubatching.py`), called from `ForwardMode.decide` | one packed `all_gather` of `n_fields` int32 per rank: DP token padding, the prefill fan-out, the cross-DP TBO gate, and the DSpark graph-shape MAX | **every forward** |
 
 The second is cheap by construction — *"one all_gather of n_fields int32 values per rank
 suffices"*, down from up to three `all_reduce`s, and with TBO off only the first three
@@ -139,32 +138,62 @@ Consequences:
 3. **Both collectives are internal to the LP, and neither is ignored** (revised
    2026-09-28, #443). Neither is a cross-LP wait the CA sees. The lockstep `all_reduce`
    (`DPEngineCoreProc._sync_dp_state` in `atom/model_engine/engine_core.py`) is an event
-   cost (`01` D4, K1). Every collective's own cost is priced (Q3 below).
+   cost (`01` D4, K1). Both have their own cost priced (Q3 below). The
+   step-seconds exchange (below) is Compass's own and carries no cost (`01` D4, K6).
 
 ### Q1, Q3, Q4
 
 | | |
 |---|---|
-| **Q1 LPs** | **None added.** One LP per DP group, barriered twice per step. |
-| **Q3 cost** | Two collectives per step, both tiny and both on the **CPU/Gloo** path for the liveness one. Priced like any other collective (`07` D40), per width. The all-gather payload is `n_fields × dp_size` int32 — bandwidth-irrelevant, latency-dominated, which is the regime `10` D66 already models. |
+| **Q1 LPs** | **None added.** One LP per DP group, barriered at each of ATOM's DP collectives and at Compass's step-seconds exchange, every step. Each rank is a member process of that LP with its own LP runtime, and the CA joins the members (`01` D3). |
+| **Q3 cost** | ATOM's DP collectives (the table above) are tiny, and the liveness one runs on the **CPU/Gloo** path. Each is priced like any other collective (`07` D40), per width. The step-seconds exchange is not priced: it stands in for the MoE all-to-all, which the MoE segment already prices. The all-gather payload is `n_fields × dp_size` int32 — bandwidth-irrelevant, latency-dominated, which is the regime `10` D66 already models. |
 | **Q4 memory** | Weights and KV **replicate** per DP rank; nothing shards. So the memory model is per-replica and the width key is DP-independent — DP is the one strategy that does *not* add a `runtime_constants` dimension. |
 
-### The rule that bites harder under DP than under TP
+### The step costs the `max` over ranks
 
 `01` charges a step to its **slowest rank**, and measured that this costs 0.06% at TP=4
 because TP ranks are near-identical. **DP ranks are not.** Different DP ranks hold
 different requests and therefore genuinely different batches, so "slowest rank" is not a
 rounding correction here — it is the definition of the step, and it is what the
-`unified_bs` padding exists to express.
+`unified_bs` padding exists to express. Rank-0 single-sourcing is a TP result and does not
+transfer to DP.
 
-Two things follow:
-
-- **The LP's step duration is `max` over DP ranks, and it must be computed, not
-  approximated by rank 0.** Rank-0 single-sourcing is a TP result and does not transfer to
-  DP.
-- **Idle DP ranks still cost a step.** `EngineCore._execute_dummy_batch` runs
-  `dummy_execution` on ranks with nothing to do (`engine_core.py:748-749`), so a rank with
-  no work is not free and must be priced as the dummy shape rather than as zero.
+- **Combine.** The DP group's step costs the `max` over ranks of each rank's own step cost.
+  Every rank prices its own batch with its own runner and backend.
+- **Exchange.** After pricing, the predicted forward (`atom/compass/runner/overrides.py`,
+  #470) runs one `all_reduce(MAX)` of the step seconds on the DP group `sync_dp_metadata`
+  uses, before the forward's `advance_to`. It stands in for the cross-rank collectives a
+  real forward makes (the MoE all-to-all), which a predicted forward does not run. It
+  carries no cost of its own, because the MoE segment already prices that all-to-all; it
+  is a wait inside one LP (`01` D4, K6). With one rank it is skipped. The lockstep `all_reduce` in `DPEngineCoreProc._sync_dp_state`
+  keeps its payload, the three booleans above; the step's cost is not exchanged on it.
+- **Two token counts.** `T_own` is the rank's own scheduled token count. `T_dp =
+  max_tokens_across_dp` is the group's: `ForwardMode.decide` reads it from
+  `sync_dp_metadata` into `forward_mode.sync.num_tokens_across_dp`, the value
+  `ModelRunner.get_dp_padding` pads to. The batch view carries both, and refuses a DP run
+  that states no `num_tokens_across_dp`. The local segment (attention, dense layers, the
+  shared expert) is priced from the rank's own batch; the MoE segment (dispatch, experts,
+  combine) reads only `T_dp`, in every tier (`09` D54 for tier a, #530 for tier 0 and
+  tier b).
+- **Why `max` is the critical path here.** Under DP-attention and EP a layer's
+  barrier-delimited segments are the local segment and the MoE segment. Priced from `T_dp`
+  under uniform routing, the MoE segment costs the same on every rank, and when one
+  segment is rank-invariant the sum of per-segment maxima equals the max of per-rank sums.
+  Rank 0 at attention 3 per layer and rank 1 at 1, both at MoE `c`, give
+  `max(3 + c, 1 + c) = max(3, 1) + c`. A gap between the two, such as 240 against 360 over
+  60 layers for attention 3 / MoE 1 against 1 / 3, needs MoE cost to differ across ranks,
+  which only non-uniform routing produces.
+- **Non-uniform routing is a declared limit.** Real routing is data-dependent (D92 Q2).
+  Where it loads ranks unevenly the MoE segment differs across ranks and `max`
+  underestimates the step. Compass prices uniform routing as a declared treatment
+  (`09` D61) and does not model the difference.
+- **Idle ranks.** `DPEngineCoreProc._execute_dummy_batch` calls
+  `ModelRunner.dummy_execution`, which runs the same `forward` on a dummy batch. So an idle
+  rank's dummy batch is priced and enters the `max`; a rank with no work is never free and
+  never zero.
+- **Second-order effect.** Every rank stamps its outputs at the end of the group's step, so
+  a fast rank's output is late by at most the difference between its own cost and the
+  `max`. The step is split with in-step TAR only if that is measured to affect TPOT.
 
 ---
 
@@ -742,7 +771,7 @@ and `test_forward_mode.py` already cover the pieces on the CPU-only path (`08` D
 |---|---|---|
 | D88 | One frame of four questions per strategy — LPs and lookahead, scheduling coupling, cost, memory. **Only PP adds logical processes**; TP, DP and EP each sit behind an existing barrier. | 2026-09-19 |
 | D89 | TP is the settled instance and supplies the per-width discipline: width is a key, not a parameter. | 2026-09-19 |
-| D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP. Step duration is `max` over ranks, computed not rank-0-sourced, and idle ranks cost a dummy batch. Replaced in part by the owner's DP ruling ([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)); #532 rewrites this row. | 2026-09-19, revised 2026-09-28; ruling 2026-10-01 |
+| D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP, with one member process per rank. The step costs the `max` over ranks of each rank's own cost, computed not rank-0-sourced, and exchanged by one `all_reduce(MAX)` inside the predicted forward, a K6 wait that carries no cost; the lockstep `all_reduce` keeps its payload. The MoE segment reads `T_dp = max_tokens_across_dp` and is priced under uniform routing, which makes `max` the per-layer critical path; non-uniform routing is a declared limit. Idle ranks are priced through `dummy_execution`'s own `forward`. | 2026-09-19, revised 2026-09-28 and 2026-10-01 (owner's DP ruling, [#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)) |
 | D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. Revised: a send part completes on the sender's clock when eager and at `max(t_send, r_i) + T` when rendezvous, `r_i` the time its receive is posted, a per-carrier size threshold deciding which, and a send's `done` is the latest over its parts; the receiver returns a rendezvous completion on `stage(k+1)->stage(k):pp_ack#dp0`, lookahead `T_min - L_data`, and both waits receive it (K5). Confirmed by the owner on 2026-10-02: the send reaches the next stage on `stage(k)->stage(k+1):pp_data#dp0`, and the TP-rank-0 workers carry both channels' frames over the PP CPU group. | 2026-09-19, revised 2026-09-28 and 2026-09-30, confirmed 2026-10-02 |
 | D92 | EP adds no LPs (inherits the TP group) but its all-to-all is invisible and must be a declared node, and its `exclusive` occupancy forbids placing it in a `Par`. Expert sharding is Class A, remainder included. | 2026-09-19 |
 | D93 | LP count = 1 traffic LP + per deployment (1 frontend LP + one engine LP per PP stage): 3 aggregated, 5 for 1P1D, independent of GPU count. The clock protocol's cost tracks PP degree and PD roles, not width. | 2026-09-19, revised 2026-09-28 |
