@@ -427,6 +427,12 @@ rule as the forward pass.
 |---|---|---|---|
 | encode | default `ThreadPoolExecutor` | width from ATOM config | `encode_fixed_s + tokens / encode_tokens_per_s` |
 | decode | engine output thread, per stream per step | **1** | `2 x (decode_fixed_s + window / decode_tokens_per_s)` |
+| encode or decode on the loop thread | the API server's event loop: the final `decode` of a non-streaming completion in `generate_async`, `generate_async_multimodal` and `generate_async_fanout`, and the `encode` and `decode` calls in `anthropic_messages` | **1**, the loop itself | the same terms per call, over the tokens it encodes or decodes |
+
+A loop-thread call is not a station job. The event loop is the frontend LP's clock owner,
+so the call prices itself as an event cost (`01` K1): it advances the LP clock by its
+service time, and nothing else on the loop runs until it ends. Outside the simulation
+window it is charged nothing.
 
 Terms come from `host.tokenizers[]` in the machine spec (doc 05 D25), populated by the
 `compass spec probe tokenizer` Tier-0 probe.

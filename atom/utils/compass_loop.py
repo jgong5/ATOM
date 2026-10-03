@@ -21,6 +21,8 @@ A frontend output thread has a width-1 detokenization station of its own:
 handling one released frame is one job, from `LPRuntime.handed_over` to its
 next `LPRuntime.back_at_wait_point`, charged by the `wrap_decode` calls it
 makes. Callbacks it posts with ``call_soon_threadsafe`` run at its completion.
+A `wrap_encode` or `wrap_decode` call on the event loop thread, such as the
+final decode of a non-streaming completion, advances the LP clock instead.
 
 `CompassEventLoop` is the frontend's event loop in a simulated run: its
 ``time()`` is the installed `LPRuntime`'s clock, so every timer is on LP time,
@@ -186,9 +188,16 @@ class SimExecutor(ThreadPoolExecutor):
 
 
 def _charge(d: float) -> None:
+    """Charge `d` to this thread's station job; with none open, in the run, the
+    caller is the clock owner and advances the LP clock by `d` (`advance_to`
+    refuses any other thread)."""
     cur = getattr(job, "cur", None)
     if cur is not None:
         cur[0].charge(cur[1], d)
+        return
+    rt = clock.installed()
+    if rt is not None and rt.in_run:
+        rt.advance_to(rt.now + d)
 
 
 def wrap_encode(encode, entry):
