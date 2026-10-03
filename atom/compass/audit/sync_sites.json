@@ -584,7 +584,7 @@
    "peer": "none",
    "why": "the metrics scrape cadence is deliberately left on the real clock",
    "mechanism": "K7",
-   "mechanism_why": "the metrics refresh cadence runs on virtual time once the frontend's event loop does, with no change at the call"
+   "mechanism_why": "the metrics refresh cadence is a daemon timer on simulated time once the frontend's event loop runs on the LP clock, with no change at the call"
   },
   {
    "id": "atom/entrypoints/openai/api_server.py::chat_completions::loop.run_in_executor( None, _prepare_multimodal_inputs, messages, merged_kwargs, request.tools, )::executor_handoff#0",
@@ -2955,7 +2955,7 @@
    "peer": "none",
    "why": "the metrics push cadence is deliberately left on the real clock; the reported timeline comes from sampling, not from this",
    "mechanism": "K7",
-   "mechanism_why": "the metrics push cadence becomes a virtual timer, folded into the loop's idle point"
+   "mechanism_why": "the metrics push cadence becomes a daemon timer on simulated time, folded into the loop's idle point"
   },
   {
    "file": "atom/model_engine/engine_core.py",
@@ -2965,7 +2965,7 @@
    "peer": "none",
    "why": "the same cadence in the data-parallel loop, deliberately left on the real clock",
    "mechanism": "K7",
-   "mechanism_why": "the metrics push cadence becomes a virtual timer, folded into the loop's idle point"
+   "mechanism_why": "the metrics push cadence becomes a daemon timer on simulated time, folded into the loop's idle point"
   },
   {
    "file": "atom/model_engine/engine_core.py",

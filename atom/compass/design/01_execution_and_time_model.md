@@ -1316,9 +1316,13 @@ The pacing timers are local next events the clock owner hands to
   engine's metrics push (`EngineCore.busy_loop` and `DPEngineCoreProc.busy_loop`), and
   the API server's refresh loop
   (`_metrics_refresh_loop` in `api_server.py`). **Metric cadence is virtual time again**,
-  which revises `11` D72's decision to keep it on the real clock: an observer in the
-  traffic LP scrapes `/metrics` every `scrape_interval` of simulated time. `11` D72
-  carries the observer and the reasons.
+  as revised `11` D72 also decides (its first version kept it on the real clock): an
+  observer in the traffic LP scrapes `/metrics` every `scrape_interval` of simulated
+  time. `11` D72 carries the observer and the reasons.
+- uvicorn's server tick, a 0.1 s `asyncio.sleep` in `Server.main_loop`, and its
+  keep-alive timeout are daemon deadlines too. They are uvicorn's code, not ATOM's, so the
+  sync inventory (`atom/compass/audit/sync_sites.json`) has no row for them; the frontend
+  declares them with the refresh loop in `DAEMON_TIMERS` (`atom/utils/compass_loop.py`).
 
 ### Must read the LP clock — these three change scheduling (K2)
 
@@ -1478,9 +1482,9 @@ the producer's `hash_block_size` against its own and falls back to a full transf
 (`mooncake_connector.py::MooncakeConnectorScheduler.update_state_after_alloc`), so a blob carrying only the thirteen can never
 take the incremental path.
 
-`tests/compass/test_kv_blob_doc_table.py` re-derives both sets from the connectors and
-fails naming the field that differs, so this table cannot drift from the source the
-way its twelve-field predecessor did.
+`tests/compass/test_kv_blob_site.py` holds the one-site claim above. Nothing re-checks
+the field sets: they describe the connectors' code as read at `92f1fdafe`, and where the
+two differ the code is right.
 
 ### Pros
 
@@ -1548,9 +1552,12 @@ router-side latency injection is ever wanted, this is where it goes.
 
 ### Open issues
 
-- The two hardcoded Rust timeouts (`worker.rs::DEFAULT_WORKER_HTTP_TIMEOUT_SECS`, `worker_manager.rs::DEFAULT_WORKER_REQUEST_TIMEOUT_SECS`) require
-  touching the Rust crate, which means `ATOM_MESH_BUILD=1` and a Rust toolchain in the
-  loop. Confirm the container has one.
+- `worker.rs::DEFAULT_WORKER_HTTP_TIMEOUT_SECS` is the one Atomesh timeout still compiled
+  in; changing it means touching the Rust crate, with `ATOM_MESH_BUILD=1` and a Rust
+  toolchain in the loop. D5 finds a simulated launch never reaches it, so this stays open
+  only if that launch ever keeps the health check on.
+  `worker_manager.rs::DEFAULT_WORKER_REQUEST_TIMEOUT_SECS` is only the default of
+  `--worker-request-timeout-secs` (#478), which D5 sets large.
 - Mesh-only mode has not been exercised by this project. Confirm it serves the ATOM
   relay path correctly against two ATOM servers before depending on it.
 
