@@ -19,7 +19,6 @@ from aiter_stub import stubbed_aiter
 
 from atom.compass import clock_transport
 from atom.compass.clock import NER, ClockAuthority, LpId, single_engine_table
-from atom.compass.spec.tokenizers import Backend, table
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.streaming_dispatch import StreamBatchDispatcher
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
@@ -27,6 +26,7 @@ from atom.model_engine.request import RequestOutput
 from atom.utils import clock, get_open_zmq_ipc_path, make_zmq_socket, zmq_shim
 from atom.utils.clock import LPRuntime, WrappedSocket
 from atom.utils.compass_loop import CompassEventLoop, wrap_decode
+from tests.compass.test_tokenizer_station import _entry
 
 with stubbed_aiter():
     from atom.model_engine.engine_core_mgr import CoreManager
@@ -34,28 +34,11 @@ with stubbed_aiter():
 IPC = 0.001
 TABLE = single_engine_table(admission_path="serving", ipc_s=IPC, stream_s=0.002)
 OUT = "engine->frontend:output#dp0"
-DECODE_FIXED_S, DECODE_TOKENS_PER_S, DERATE = 0.001, 1000.0, 0.5
 
 
 class _Tokenizer:
     def decode(self, ids, skip_special_tokens=False):
         return "x" * len(ids)
-
-
-def _entry():
-    raw = {
-        "id": "test-bpe",
-        "backend": "fast",
-        "vocab_size": 1000,
-        "fingerprint": "sha256:0",
-        "applies_to": ["LlamaForCausalLM"],
-        "encode_fixed_s": 0.001,
-        "encode_tokens_per_s": 1000.0,
-        "decode_fixed_s": DECODE_FIXED_S,
-        "decode_tokens_per_s": DECODE_TOKENS_PER_S,
-        "derate": DERATE,
-    }
-    return table([raw]).resolve("LlamaForCausalLM", Backend.FAST)
 
 
 def _run(monkeypatch, callback, token_counts) -> None:
@@ -111,8 +94,8 @@ def _run(monkeypatch, callback, token_counts) -> None:
 
 
 def test_three_messages_on_one_thread_predicted_beside_observed(monkeypatch):
-    tokenizer = _Tokenizer()
-    tokenizer.decode = wrap_decode(tokenizer.decode, _entry())
+    tokenizer, entry = _Tokenizer(), _entry()
+    tokenizer.decode = wrap_decode(tokenizer.decode, entry)
     dispatcher = StreamBatchDispatcher(tokenizer)
     monkeypatch.setattr(api_server, "_stream_batch_dispatcher", dispatcher)
     state, observed = dispatcher.new_state(), []
@@ -130,11 +113,11 @@ def test_three_messages_on_one_thread_predicted_beside_observed(monkeypatch):
     # Predicted by hand: one stream; each update decodes the window before it
     # and the window with it, ``fixed + tokens / (rate x derate)`` per call.
     # The three arrive together at IPC and run back to back.
-    rate = DECODE_TOKENS_PER_S * DERATE
+    rate = entry.decode_tokens_per_s * entry.derate
     windows = [(0, 100), (100, 150), (50, 75)]
     start, predicted = IPC, []
     for prefix, full in windows:
-        end = start + 2 * DECODE_FIXED_S + (prefix + full) / rate
+        end = start + 2 * entry.decode_fixed_s + (prefix + full) / rate
         predicted.append((start, end))
         start = end
     # (job start, completion): (0.001, 0.203), (0.203, 0.705), (0.705, 0.957)
