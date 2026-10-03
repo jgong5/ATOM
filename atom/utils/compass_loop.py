@@ -23,9 +23,9 @@ and its selector is the frontend's idle point. Idle with nothing to read, it
 asks for time with `next_event`: its earliest essential timer as ``t``, its
 earliest daemon timer (`DAEMON_TIMERS`) as ``t_daemon``. While a released
 request is unread or a station job is open it only waits on its sockets, and
-a request still unread after the runtime's ``diag_s`` wall seconds ends the
-run with its channel and seq. On the ``+inf`` grant it cancels its timers and
-stops. `HttpChannel` is the inline receive of HTTP requests.
+a request still unread after ``diag_s`` wall seconds with no socket event ends
+the run with its channel and seq. On the ``+inf`` grant it cancels its timers
+and stops. `HttpChannel` is the inline receive of HTTP requests.
 """
 
 import asyncio
@@ -35,7 +35,6 @@ import math
 import selectors
 import sys
 import threading
-import time
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
@@ -237,7 +236,6 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         self.daemon = weakref.WeakSet()  # the daemon timers scheduled
         # Requests read, not handed over: (channel, seq) -> (arrival, wake-up).
         self.held: dict[tuple[str, int], tuple[float, asyncio.Future]] = {}
-        self.unread = (None, 0.0)  # the oldest unread request, wall time first seen
         super().__init__(CompassSelector(self))
         self.executor = SimExecutor(self)
         self.set_default_executor(self.executor)
@@ -272,27 +270,18 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
             self.held.pop((ch, seq))[1].set_result(None)
         return bool(out)
 
-    def refuse_unread(self) -> None:
-        """Raise once one released request has stayed unread ``diag_s`` wall
-        seconds: uvicorn reads a request pipelined on a connection only after
-        the response before it ends, and that one waits for it."""
+    def unread(self) -> tuple[int, str] | None:
+        """The released request with the lowest seq not yet read, as
+        ``(seq, channel)``, or ``None``."""
         rt = self.rt
         with rt.lock:
-            oldest = min(
+            return min(
                 (
                     (seq, ch)
                     for ch, got in rt.released.items()
                     for seq in got - rt.arrived[ch]
                 ),
                 default=None,
-            )
-        if oldest != self.unread[0]:
-            self.unread = (oldest, time.monotonic())
-        elif oldest is not None and time.monotonic() - self.unread[1] > rt.diag_s:
-            raise RuntimeError(
-                f"{rt.me}: released {oldest[1]} seq {oldest[0]} is still unread after "
-                f"{rt.diag_s} wall seconds; a request pipelined behind an unfinished "
-                "one on the same connection is not read until that response ends"
             )
 
 
@@ -312,8 +301,17 @@ class CompassSelector(selectors.DefaultSelector):
         if loop.hand_over() or timeout == 0:
             return super().select(0)
         if rt.inline_pending() or loop.executor.station.unresolved():
-            loop.refuse_unread()
-            return super().select(POLL_S)
+            unread = loop.unread()
+            events = super().select(POLL_S if unread is None else rt.diag_s)
+            if events or unread is None:
+                return events
+            # uvicorn reads a request pipelined on a connection only after the
+            # response before it ends, and hand_over holds that one for it.
+            raise RuntimeError(
+                f"{rt.me}: released {unread[1]} seq {unread[0]} is still unread after "
+                f"{rt.diag_s} wall seconds; a request pipelined behind an unfinished "
+                "one on the same connection is not read until that response ends"
+            )
         t = t_daemon = math.inf
         for h in loop._scheduled:
             if h.cancelled():
