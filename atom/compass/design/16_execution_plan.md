@@ -60,7 +60,7 @@ five-slot cap.
 | **P0.4** | **T5** — trace the 27B under `FakeTensorMode` at TP1 **and TP2**; diff the captured structures | spike → `capture/` | ~200 LOC | clean node |
 | **P0.5** | **T64** — does ATOM microbatch PP? | reading + 1 run | ~0 | clean node |
 | **P0.6** | **T65** — EP group membership per supported configuration | reading | ~0 | — |
-| **P0.7** | **T52** — root-cause the dispatch-mode 8-rank hang. **Only if P0.4 hits it.** | spike | — | quiet node |
+| **P0.7** | **T52** — root-cause the `DeviceContext` `__torch_function__` guard 8-rank hang. **Only if P0.4 hits it.** | spike | — | quiet node |
 
 **Why these seven.** Each can invalidate work that would otherwise be built on top of it.
 P0.3 swung an estimate by ~2,000 lines for one hour's work; it has since run and the swing

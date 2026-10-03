@@ -1064,10 +1064,12 @@ Deferred to future work by decision on 2026-09-18.
   (`atom/model_loader/online_quant_streaming.py::_CopyCounter`) overrides
   `ignore_compile_internals()` because *"TorchDispatchMode keeps its compile-internal
   state in process-global booleans"*.
-- One in-tree hazard for mode-based instrumentation: `atom/spec_decode/dspark_scheduler.py::schedule_prefix_lengths_tensor`
-  — `torch.tensor(N, device=...)` under an active `DeviceContext` `__torch_function__`
-  guard **hangs all 8 ranks on ROCm**. Mode-based instrumentation has already caused one
-  production hang in this codebase.
+- One in-tree hazard for mode-based instrumentation, recorded in a code comment in
+  `atom/spec_decode/dspark_scheduler.py::schedule_prefix_lengths_tensor`: `torch.tensor(N, device=...)`
+  under an active `DeviceContext` `__torch_function__` guard **hung all 8 ranks on ROCm**.
+  The comment records a hang observed while the function was written; no landed version
+  makes that call, as the function builds the value with `torch.full_like` on a device
+  tensor. The mechanism is unexplained.
 
   **How much this gates T5.** A `FakeTensorMode` trace should be **GPU-free and
   collective-free**, so a hang whose mechanism is a desynchronised collective should not
@@ -1079,10 +1081,10 @@ Deferred to future work by decision on 2026-09-18.
      dispatcher-visible ops (which have `register_fake` impls — every ATOM opaque op
      does) or invisible ones reached through declared nodes, which the tracer records
      rather than calls. Nothing should reach RCCL.
-  2. **The specific hazard is not the same mode.** `dspark_scheduler.py::schedule_prefix_lengths_tensor` hangs under
+  2. **The specific hazard is not the same mode.** `dspark_scheduler.py::schedule_prefix_lengths_tensor` hung under
      an active `DeviceContext` **`__torch_function__`** guard doing
-     `torch.tensor(N, device=...)` — a *real* run with a real device, not a fake-tensor
-     trace.
+     `torch.tensor(N, device=...)` — a
+     *real* run with a real device, not a fake-tensor trace.
 
   So the honest status is: **the hang gates `--measure` runs and any mode-based
   instrumentation of a real execution. It probably does not gate Phase 1a.** "Probably"
@@ -1090,7 +1092,7 @@ Deferred to future work by decision on 2026-09-18.
   the cheap way to convert them into evidence is T5 itself, which will either trace
   cleanly at TP>1 or produce the hang and settle the question.
 
-  **It gets root-caused rather than worked around**, for a reason independent of T5: mode-based instrumentation has caused one production hang in this codebase, and
+  **It gets root-caused rather than worked around**, for a reason independent of T5: a `__torch_function__` mode (the `DeviceContext` guard) hung all 8 ranks while that function was written, and
   `--measure` is a designed path. A workaround that avoids the one known call site leaves
   the mechanism unexplained and the next call site undiscovered.
 

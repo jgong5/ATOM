@@ -71,7 +71,7 @@ split into two halves that are handled differently:
 | Half | What it is | Treatment |
 |---|---|---|
 | **cost** | the kernel's duration | **Traced and priced like any other operator** — the sampler is dispatcher-visible and goes through `07` Phase 1b with everything else. Nothing special. |
-| **value** | `num_bonus_tokens` per sequence, written by `tl.store(num_bonus_tokens_ptr + req_idx, …)` (`rejection_sampler.py::rejection_greedy_sample_kernel`) | **Cannot be traced.** Compass needs the number itself — the scheduler updates `num_computed_tokens` from it, decides `max_tokens` completion from it, and sizes the next step from it. Without the value the simulation cannot advance. |
+| **value** | `num_bonus_tokens` per sequence, written by `tl.store(num_bonus_tokens_ptr + req_idx, …)` (`rejection_sampler.py::rejection_synthetic_sample_kernel`) | **Cannot be traced.** Compass needs the number itself — the scheduler updates `num_computed_tokens` from it, decides `max_tokens` completion from it, and sizes the next step from it. Without the value the simulation cannot advance. |
 
 So there is exactly one thing Compass must reimplement, and it is small:
 
@@ -356,7 +356,8 @@ Adding it as **M3.5** rather than extending M3 keeps the milestone's own accepta
   (`rejection_sampler.py`). It is an environment variable, so it is invisible to
   every artifact key today. It must be captured in the run fingerprint or two runs with
   different acceptance semantics will compare as one. Recorded as **T59**.
-- **The DSpark hang of `04` T52 lives in this subsystem** (`dspark_scheduler.py::schedule_prefix_lengths_tensor`).
+- **The DSpark hang of `04` T52 was observed in this subsystem** (`dspark_scheduler.py::schedule_prefix_lengths_tensor`,
+  while the function was written; the landed function builds that value with `torch.full_like`, which avoids the call that hung).
   Root-causing it is already a gating task; it is now also on this topic's critical path.
 - **Whether a draft forward's cost transfers across `K`** is untested. A serial MTP reusing
   one layer `mtp_k` times should be linear in `K`; a real draft stack need not be. One
