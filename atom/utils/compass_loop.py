@@ -27,9 +27,10 @@ makes. Callbacks it posts with ``call_soon_threadsafe`` run at its completion.
 and its selector is the frontend's idle point. Idle with nothing to read, it
 asks for time with `next_event`: its earliest essential timer as ``t``, its
 earliest daemon timer (`DAEMON_TIMERS`) as ``t_daemon``. While a released
-request is unread or a station job is open it only waits on its sockets. On
-the ``+inf`` grant it cancels its timers and stops. `HttpChannel` is the inline
-receive of HTTP requests.
+request is unread or a station job is open it only waits on its sockets, and
+a request still unread after ``diag_s`` wall seconds with no socket event ends
+the run with its channel and seq. On the ``+inf`` grant it cancels its timers
+and stops. `HttpChannel` is the inline receive of HTTP requests.
 """
 
 import asyncio
@@ -303,7 +304,8 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
 
     def close(self) -> None:
         super().close()
-        self.rt.close()
+        if sys.exception() is None:  # else that error ended the run: let it name why
+            self.rt.close()
 
     def hand_over(self) -> bool:
         """Once every released request has been read, wake the released ones in
@@ -320,6 +322,20 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         for _, seq, ch in out:
             self.held.pop((ch, seq))[1].set_result(None)
         return bool(out)
+
+    def unread(self) -> tuple[int, str] | None:
+        """The released request with the lowest seq not yet read, as
+        ``(seq, channel)``, or ``None``."""
+        rt = self.rt
+        with rt.lock:
+            return min(
+                (
+                    (seq, ch)
+                    for ch, got in rt.released.items()
+                    for seq in got - rt.arrived[ch]
+                ),
+                default=None,
+            )
 
 
 class CompassSelector(selectors.DefaultSelector):
@@ -338,7 +354,17 @@ class CompassSelector(selectors.DefaultSelector):
         if loop.hand_over() or timeout == 0:
             return super().select(0)
         if rt.inline_pending() or loop.executor.station.unresolved():
-            return super().select(POLL_S)
+            unread = loop.unread()
+            events = super().select(POLL_S if unread is None else rt.diag_s)
+            if events or unread is None:
+                return events
+            # uvicorn reads a request pipelined on a connection only after the
+            # response before it ends, and hand_over holds that one for it.
+            raise RuntimeError(
+                f"{rt.me}: released {unread[1]} seq {unread[0]} is still unread after "
+                f"{rt.diag_s} wall seconds; a request pipelined behind an unfinished "
+                "one on the same connection is not read until that response ends"
+            )
         t = t_daemon = math.inf
         for h in loop._scheduled:
             if h.cancelled():

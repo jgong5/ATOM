@@ -12,6 +12,7 @@ import http.client
 import importlib.util
 import math
 import queue
+import socket
 import threading
 import time
 import uuid
@@ -127,6 +128,20 @@ def _stamp(scope):
     return None
 
 
+def _server(app) -> uvicorn.Server:
+    """uvicorn on `CompassEventLoop`, serving `app` behind `HttpChannel`."""
+    return uvicorn.Server(
+        uvicorn.Config(
+            HttpChannel(app, _stamp),
+            host="127.0.0.1",
+            port=0,
+            loop="atom.utils.compass_loop:CompassEventLoop",
+            lifespan="off",
+            log_level="warning",
+        )
+    )
+
+
 def test_a_60_second_sleep_ends_at_lp_60_with_no_wall_wait(run):
     _idle_traffic(run)
     loop = CompassEventLoop()
@@ -212,16 +227,7 @@ def test_a_request_released_before_it_is_read_is_handed_over_at_its_arrival(run)
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b"ok"})
 
-    server = uvicorn.Server(
-        uvicorn.Config(
-            HttpChannel(app, _stamp),
-            host="127.0.0.1",
-            port=0,
-            loop="atom.utils.compass_loop:CompassEventLoop",
-            lifespan="off",
-            log_level="warning",
-        )
-    )
+    server = _server(app)
     traffic = _traffic(run, stamps, before_ner=lambda: None)
     arrival, seq = stamps.get(timeout=10)
 
@@ -252,6 +258,37 @@ def test_a_request_released_before_it_is_read_is_handed_over_at_its_arrival(run)
     # The server tick and the keep-alive timeout never move the clock.
     assert max(g for g in run.conn.grants if g < INF) == arrival
     assert run.conn.grants[-1] == INF
+
+
+def test_a_request_pipelined_behind_an_unfinished_one_is_refused_by_name(run):
+    run.rt.diag_s = 0.5
+    stamps, got = queue.Queue(), []
+
+    async def app(scope, receive, send):
+        await asyncio.sleep(1)
+
+    server = _server(app)
+    _traffic(run, stamps, before_ner=lambda: None, n=2)
+    (arrival, _), (_, seq) = stamps.get(timeout=10), stamps.get(timeout=10)
+
+    def client():
+        _until(lambda: server.started and run.rt.released[HTTP])
+        port = server.servers[0].sockets[0].getsockname()[1]
+        got.append(socket.create_connection(("127.0.0.1", port), timeout=10))
+        req = b"GET / HTTP/1.1\r\nhost: x\r\nx-test-stamp: %r %d\r\n\r\n"
+        got[0].sendall(req % (arrival, 0) + req % (arrival, 1))
+
+    threading.Thread(target=client, name="client", daemon=True).start()
+    wall = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match=f"released {HTTP} seq {seq} is still"):
+            server.run()
+    finally:
+        wall = time.monotonic() - wall
+        for sock in got:
+            sock.close()
+    print(f"\n  pipelined pair refused after {wall:.2f} wall seconds")
+    assert run.rt.diag_s < wall < 10
 
 
 def test_a_request_read_before_its_release_is_held_until_it(run):
