@@ -18,6 +18,7 @@ from conftest import MockConfig
 
 from atom.compass.parity import ENV, StepRecording, compare, read
 from atom.compass.runner.overrides import NonAllocatingRunner
+from atom.model_engine.prefill_delayer import PrefillDelayer
 from atom.model_engine.scheduler import ScheduledBatch, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.sampling_params import SamplingParams
@@ -34,10 +35,10 @@ def _key(tokens):
     return hashlib.blake2b(data, digest_size=8).hexdigest()
 
 
-def _config(dp_rank=0, pipeline_parallel_size=1, budget=BUDGET):
+def _config(dp_rank=0, pipeline_parallel_size=1, budget=BUDGET, blocks=4096):
     return MockConfig(
         max_num_seqs=8,
-        num_kvcache_blocks=4096,
+        num_kvcache_blocks=blocks,
         kv_cache_block_size=BLOCK,
         max_model_len=2048,
         max_num_batched_tokens=budget,
@@ -53,13 +54,26 @@ class _Runner(NonAllocatingRunner):
         self.config, self.rank = config, rank
 
 
-def _drive(directory, monkeypatch, ranks, prompt=_prompt, budget=BUDGET):
-    """Run each DP rank's requests to completion; return its batches and sequences."""
+def _drive(
+    directory,
+    monkeypatch,
+    ranks,
+    prompt=_prompt,
+    budget=BUDGET,
+    blocks=4096,
+    delayer=False,
+):
+    """Run each DP rank's requests to completion; return its batches and sequences.
+
+    `delayer` installs ATOM's `PrefillDelayer` at its defaults, as its DP engine does.
+    """
     monkeypatch.setenv(ENV, str(directory))
     built = {}
     for dp_rank, requests in ranks.items():
-        config = _config(dp_rank, budget=budget)
+        config = _config(dp_rank, budget=budget, blocks=blocks)
         scheduler, runner = Scheduler(config), _Runner(config)
+        if delayer:
+            scheduler.set_prefill_delayer(PrefillDelayer(1, None, budget))
         sequences = [
             Sequence(
                 prompt(i),
@@ -79,6 +93,8 @@ def _drive(directory, monkeypatch, ranks, prompt=_prompt, budget=BUDGET):
             batch, seqs = scheduled
             batches.append(batch)
             reply = runner.forward(batch)
+            if delayer and batch.total_seqs_num_prefill:
+                scheduler.prefill_delayer.notify_prefill_executed()
             scheduler.postprocess(
                 list(seqs.values()),
                 reply,
@@ -256,8 +272,42 @@ def test_a_window_that_does_not_continue_the_last_is_refused(tmp_path, monkeypat
     batches = _drive(tmp_path / "source", monkeypatch, {0: [0]})[0][0]
     runner = _Runner(_config())
     runner.forward(batches[0])
-    with pytest.raises(ValueError, match="starts at token 0, not at 64"):
-        runner.forward(batches[0])
+    with pytest.raises(ValueError, match="starts at token 128, not at 64"):
+        runner.forward(batches[2])
+
+
+@pytest.mark.parametrize(
+    "blocks, starts",
+    # Four 16-token requests decode beside request 4's 200-token prompt, and
+    # the pool is too small for all of them, so request 4 is preempted.
+    [
+        # Mid-prefill, held by the delayer: it restarts at token 0.
+        (19, [0, 64, 128, 0, 64, 128, 192]),
+        # After its final chunk: it re-prefills, already named.
+        (17, [0, 64, 128, 192, 0, 64, 128, 192]),
+    ],
+)
+def test_a_preempted_request_keeps_its_whole_prompt_key(
+    tmp_path, monkeypatch, blocks, starts
+):
+    def prompt(i):
+        return _prompt(i)[: 16 if i < 4 else PROMPT]
+
+    built = _drive(
+        tmp_path, monkeypatch, {0: range(5)}, prompt, blocks=blocks, delayer=True
+    )
+    batches, sequences, _ = built[0]
+    last = list(sequences)[-1]
+    assert [
+        int(b.num_cached_tokens[i])
+        for b in batches
+        for i, req_id in enumerate(b.req_ids)
+        if req_id == last and b.num_scheduled_tokens[i] > 1
+    ] == starts
+    steps = read(tmp_path)[0]
+    assert {row[0] for step in steps for row in step["batch"]} == {
+        _key(prompt(i)) for i in range(5)
+    }
 
 
 def test_one_key_on_two_ranks_is_refused(tmp_path, monkeypatch):

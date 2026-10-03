@@ -65,6 +65,8 @@ class StepRecord:
                 if batch.is_final_chunk is None or req_id in self.keys:
                     continue
                 start = int(batch.num_cached_tokens[i])
+                if start == 0:  # a preempted prefill restarts its prompt
+                    self.prompts.pop(req_id, None)
                 digest, end = self.prompts.pop(
                     req_id, (hashlib.blake2b(digest_size=8), start)
                 )
