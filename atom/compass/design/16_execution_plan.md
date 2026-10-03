@@ -26,7 +26,7 @@ Tasks are cut so each touches one module plus its tests.
 ```
 atom/compass/
   clock/      CA core, grant rule, lookahead matrix, LP registry, both transports
-  detect/     straggler check, watchdog, CI clock-source lint
+  detect/     straggler check, stall diagnostic, CI clock-source lint
   runner/     CompassModelRunner - the seam, RPC surface, forward semantics
   backends/   CostBackend interface, StepCost, provenance; tier 0 / a / b
   memory/     device-reading substitution, per-term model
@@ -42,7 +42,7 @@ tests/compass/          mirrors the above
 ```
 
 Edits to ATOM outside `atom/compass/` are deliberately few and are enumerated per task —
-clock-read substitutions, blocked/running annotations, the config flags of `13` D80, and
+clock-read substitutions, the channel wrappers and idle points of `01` D4, the config flags of `13` D80, and
 the two ATOM-owned additions (`--preprocess-pool-width`, `--spec-decode-acceptance-rates`).
 
 ---
@@ -280,9 +280,9 @@ Phase 0's environment. All CPU-only.
 
 | ID | Task | Module | Effort | Implements / consumes |
 |---|---|---|---|---|
-| **W1.1** | CA core: grant rule `min_j(now[j] + L[j→i])`, lookahead matrix addressed by LP identity, LP registry, **both transports** (in-process and socket) from one implementation | `clock/` | 600–900 | implements the clock client API |
-| **W1.2** | Synthetic-LP harness modelling ATOM's **verified** topology — the ZMQ/shm/Gloo links of `01` D1 and the four wait categories of D4 — plus adversarial scenarios: wrong lookahead, missing annotation, induced straggler | `tests/compass/clock/` | 400–600 | consumes W1.1 |
-| **W1.3** | Causality detectors: receive-side straggler check (fails the run), annotation watchdog (warns), CI clock-source lint | `detect/` | 250–400 | consumes W1.1 |
+| **W1.1** | CA core as the HLA RTI (`01` D3): TAR/NER/TAG, a grant strictly below the lookahead-distance LBTS with in-transit messages counted, lookahead matrix addressed by LP identity, LP registry, **both transports** (in-process and socket) from one implementation | `clock/` | 600–900 | implements the clock client API |
+| **W1.2** | Synthetic-LP harness modelling ATOM's **verified** topology — the ZMQ/shm/Gloo links of `01` D1 and the K1–K9 mechanisms of D4 — plus adversarial scenarios: a send missing from the sender's send log (induced straggler), a duplicate seq on one channel, a wait the CA cannot see | `tests/compass/clock/` | 400–600 | consumes W1.1 |
+| **W1.3** | Causality detectors (`01` D3.2): straggler check on arrival and at each drain (fails the run), `DIAG_S` stall diagnostic (keeps waiting, never aborts), CI clock-source lint | `detect/` | 250–400 | consumes W1.1 |
 | **W1.4** | `CompassModelRunner` skeleton: the `--runner-qualname` subclass, the full RPC surface, and the three forward semantics of `02` D10 (deferred output, the meaningful-step unit, `produces_output`) | `runner/` | 400–600 | implements the runner seam |
 | **W1.5** | `CostBackend` interface, `StepCost` with its breakdown, the provenance vocabulary and the resolver ladder | `backends/` | 200–300 | implements the backend API |
 | **W1.6** | M1 fake model: HF-config geometry plus the shape-analytic cost stub of `02` D12, including the quadratic query term | `backends/` | 300–450 | consumes W1.5 |
@@ -350,13 +350,13 @@ Depends on Wave 1. The first three are the vertical slice.
 
 | ID | Task | Effort | Notes |
 |---|---|---|---|
-| **W3.1** | LP structure for DP: both collectives run for real; `max`-over-ranks step duration; dummy-batch pricing for idle ranks (`15` D90) | 300–500 | |
+| **W3.1** | LP structure for DP: the DP group is one LP and its step one compound event (one TAR), priced by the per-layer critical path across ranks, no operator-level TAR/NER (`01` D4); both collectives run for real; dummy-batch pricing for idle ranks (`15` D90) | 300–500 | |
 | **W3.2** | LP structure for PP: one LP per stage; transfer as a size from the spec; layer split via `get_pp_indices` | 400–600 | shaped by **P0.5** |
 | **W3.3** | EP: `exclusive` occupancy honoured in the IR; group membership per P0.6 | 200–350 | shaped by **P0.6** |
 | **W3.4** | Standalone CA exercised against the synthetic-LP harness at multi-container topology | 200–300 | consumes W1.2 |
 | **W3.5** | PD aggregation and disaggregation, two containers on one node | 400–600 | |
 | **W3.6** | cc-traces harness driving a simulated run end to end | 300–500 | consumes W1.9 |
-| **W3.7** | CA observability: timeline log, deadlock dump, run summary (`01` D3.5) | 300–450 | |
+| **W3.7** | CA observability: timeline log, stall diagnostic, run summary (`01` D3.5) | 300–450 | |
 
 **M1's exit criterion**, per `15` D94, needs no cost model: **does a fake-model run at
 TP2 / DP2 / PP2 / EP2 reach the same scheduling decisions as the real engine at the same
