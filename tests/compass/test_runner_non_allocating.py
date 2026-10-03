@@ -72,6 +72,7 @@ OVERRIDDEN = {
     "allocate_kv_cache",
     "capture_cudagraph",
     "forward",
+    "dummy_execution",
 }
 
 
@@ -138,7 +139,7 @@ def test_every_replaced_method_exists_on_the_class_being_replaced():
     assert OVERRIDDEN <= _methods(_classes(ATOM_RUNNER)["ModelRunner"])
 
 
-def test_the_difference_from_the_in_tree_non_allocating_runner_is_five_methods():
+def test_the_difference_from_the_in_tree_non_allocating_runner():
     """`RapidServeModelRunner` is the working non-allocating runner in the tree.
 
     It overrides two things this one does not. `__init__`: it has to bind a
@@ -149,7 +150,7 @@ def test_the_difference_from_the_in_tree_non_allocating_runner_is_five_methods()
     anything back from -- the base's zero is the right answer here, not an
     override that was forgotten.
 
-    This one overrides three things it does not. `capture_cudagraph`:
+    This one overrides things it does not. `capture_cudagraph`:
     RapidServe allocates no weights of its own but imports real ones over CUDA
     IPC, so it has a model to trace and keeps ATOM's capture. This runner has
     none, and ATOM's capture zeroes device buffers and opens a graph pool
@@ -157,6 +158,7 @@ def test_the_difference_from_the_in_tree_non_allocating_runner_is_five_methods()
     `_estimate_cudagraph_overhead`: the two calls through which
     `get_num_blocks` reaches the device, which RapidServe leaves alone because
     it runs on the card it is sizing and this runner does not.
+    `dummy_execution`: it answers with the priced forward reply, not `True`.
 
     Its `_init_weight_params_on_meta` is not in the difference because it is not
     an override -- it is a helper the base does not have.
@@ -168,6 +170,7 @@ def test_the_difference_from_the_in_tree_non_allocating_runner_is_five_methods()
         "capture_cudagraph",
         "_read_device_memory",
         "_estimate_cudagraph_overhead",
+        "dummy_execution",
     }
 
 
@@ -334,7 +337,8 @@ def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
     """The half of the claim that is this package's own: it adds none.
 
     `model` registers no parameter and no buffer, `_token_stream` is the
-    deferral bookkeeping `forward` builds on first use, and `kv_pool_sizing`
+    deferral bookkeeping `forward` builds on first use, `_step_reply` is the
+    reply `forward` last built, and `kv_pool_sizing`
     is a `SizedKVPool` -- a count, a name-to-count table and the readings --
     built in a package whose whole import closure `test_kv_budget.py` holds
     free of any tensor library. Anything else appearing here is a tensor this
@@ -342,7 +346,7 @@ def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
     """
     overrides = _classes(PACKAGE / "overrides.py")["NonAllocatingRunner"]
     bound = {n for n, _ in _self_assigned(overrides)}
-    assert bound == {"model", "_token_stream", "kv_pool_sizing"}
+    assert bound == {"model", "_token_stream", "kv_pool_sizing", "_step_reply"}
 
 
 # --- warmup drives a forward, which is why it is skipped ---------------------
