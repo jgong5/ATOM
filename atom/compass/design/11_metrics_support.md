@@ -31,14 +31,14 @@ Verified on `feature/atomcompass_new`:
 | metric families | **10 `GaugeMetricFamily`, 10 `CounterMetricFamily`** |
 | histograms / summaries | **none today** |
 | `.observe()` call sites | **none** (the `buckets=` hits in the tree are CUDA-graph query buckets, unrelated) |
-| API style | collector-style `prometheus_client.core.*MetricFamily` (`metrics.py:11-13`) |
+| API style | collector-style `prometheus_client.core.*MetricFamily` (`metrics.py::_AtomMetricsCollector.collect`) |
 | rate metrics (anything ÷ time) | **none.** The three that look like rates are not: `queued_prefill_tokens_per_rank` is per *rank*, `mtp_acceptance_rate` is a ratio of counts, `mtp_average_tokens_per_forward` is per *forward* |
 
-The pipeline: `EngineUtilityHandler.collect_metrics()` (`engine_utility.py:336-392`) →
-`push_metrics()` (`:322`) on the EngineCore busy loop → DP aggregation in
-`LLMEngine.get_metrics_statistics()` (`llm_engine.py:438-562`) → `_metrics_refresh_loop`
-(`api_server.py:1504-1526`) → `_AtomMetricsCollector` / `AtomMetricsExporter`
-(`atom/entrypoints/openai/metrics.py`) → `/metrics` (`api_server.py:2336-2344`).
+The pipeline: `EngineUtilityHandler.collect_metrics()` (`engine_utility.py`) →
+`push_metrics()` on the EngineCore busy loop → DP aggregation in
+`LLMEngine.get_metrics_statistics()` (`llm_engine.py`) → `_metrics_refresh_loop`
+(`api_server.py`) → `_AtomMetricsCollector` / `AtomMetricsExporter`
+(`atom/entrypoints/openai/metrics.py`) → `/metrics` (`api_server.py::metrics`).
 
 **Histograms are being added.** They are not present yet, which means this is the moment to
 influence how they land rather than retrofit them. See D73.
@@ -120,7 +120,7 @@ value derives from a clock delta is a site that must be on the virtual clock.
 
 ### The placement hazard
 
-The obvious place to feed a TTFT histogram is `api_server.py:936-943`, where ttft and tpot
+The obvious place to feed a TTFT histogram is `api_server.py::generate_async`, where ttft and tpot
 are already computed — from `time.time()` deltas in the API-server process. Under
 simulation those stamp **wall** time for an event that happened at a **simulated** instant.
 
@@ -401,7 +401,7 @@ Prometheus.
 
 | Hazard | Detail |
 |---|---|
-| **Summaries cannot be aggregated across DP ranks** | client-computed quantiles do not average. `LLMEngine.get_metrics_statistics()` (`llm_engine.py:438-562`) merges per-rank snapshots; summing histogram `_bucket` is valid, averaging summary quantiles is not. This is a general Prometheus truth that would bite ATOM whether or not Compass existed. |
+| **Summaries cannot be aggregated across DP ranks** | client-computed quantiles do not average. `LLMEngine.get_metrics_statistics()` (`llm_engine.py`) merges per-rank snapshots; summing histogram `_bucket` is valid, averaging summary quantiles is not. This is a general Prometheus truth that would bite ATOM whether or not Compass existed. |
 | **`_created` series** | opt-in — `CounterMetricFamily.add_metric(..., created=...)`. ATOM does not pass it today. If it starts, `created` is class **T** and must not be a wall-clock value inside a virtual-timeline block. |
 | **Exemplars** | `add_metric(..., exemplar=...)` exists and an `Exemplar` carries a timestamp. If trace linking is ever added, that timestamp is class **T**. |
 | **Counter resets** | PromQL `rate()`/`increase()` detect decreases as resets. Normal handling; no special treatment needed under backfill, provided timestamps are monotone in virtual time. |
@@ -417,7 +417,7 @@ openmetrics CONTENT_TYPE : application/openmetrics-text; version=1.0.0  <- what 
 ```
 
 `prometheus_client.openmetrics.exposition.generate_latest` exists. So D74's run-end writer
-uses **that**, not the `generate_latest` ATOM imports at `metrics.py:11`. The `/metrics`
+uses **that**, not the `generate_latest` ATOM imports in `metrics.py`. The `/metrics`
 endpoint keeps the text format it has.
 
 ### And the timestamp injection point already exists
@@ -465,4 +465,4 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T43 | Verify the backfill end to end — produce one block, load it, see the series in Grafana | the documented gotchas are silent ones (epoch-dated blocks, retention) |
 | T44 | Sanity-check histogram bucket ranges against simulated latencies | a quantile pinned to `+Inf` is worth catching once rather than discovering |
 | T45 | Tag ATOM's existing twenty metrics with their D77 class | ~20 tags; mechanical, but it is the gate for everything after |
-| T46 | Decide the DP-aggregation rule per class, and refuse summaries there | `llm_engine.py:438-562` merges per-rank snapshots; quantiles do not average |
+| T46 | Decide the DP-aggregation rule per class, and refuse summaries there | `llm_engine.py::LLMEngine.get_metrics_statistics` merges per-rank snapshots; quantiles do not average |
