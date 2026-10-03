@@ -17,6 +17,11 @@ A service job's result reaches its coroutine at ``c_k``, through ``call_at``.
 A thread serving a station job reads the clock as the job's start plus the
 service charged so far (`atom.utils.clock.current_job_time`).
 
+A frontend output thread has a width-1 detokenization station of its own:
+handling one released frame is one job, from `LPRuntime.handed_over` to its
+next `LPRuntime.back_at_wait_point`, charged by the `wrap_decode` calls it
+makes. Callbacks it posts with ``call_soon_threadsafe`` run at its completion.
+
 `CompassEventLoop` is the frontend's event loop in a simulated run: its
 ``time()`` is the installed `LPRuntime`'s clock, so every timer is on LP time,
 and its selector is the frontend's idle point. Idle with nothing to read, it
@@ -28,6 +33,7 @@ receive of HTTP requests.
 """
 
 import asyncio
+import collections
 import heapq
 import logging
 import math
@@ -197,6 +203,17 @@ def wrap_encode(encode, entry):
     return charged
 
 
+def wrap_decode(decode, entry):
+    """`decode`, charging the current job ``fixed + tokens / derated rate``."""
+    rate = entry.decode_tokens_per_s * entry.derate
+
+    def charged(ids, *args, **kwargs):
+        _charge(entry.decode_fixed_s + len(ids) / rate)
+        return decode(ids, *args, **kwargs)
+
+    return charged
+
+
 #: Timers that do not keep the run alive, by the qualified name of their
 #: callback or of a coroutine on the stack that scheduled them: the API
 #: server's metrics refresh, uvicorn's server tick and its keep-alive timeout.
@@ -235,12 +252,48 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         self.daemon = weakref.WeakSet()  # the daemon timers scheduled
         # Requests read, not handed over: (channel, seq) -> (arrival, wake-up).
         self.held: dict[tuple[str, int], tuple[float, asyncio.Future]] = {}
+        # Per output thread: its width-1 station, its open job, and the callbacks
+        # that job posted.
+        self.detok = threading.local()
         super().__init__(CompassSelector(self))
         self.executor = SimExecutor(self)
         self.set_default_executor(self.executor)
+        self.rt.loop = self
 
     def time(self) -> float:
         return self.rt.read_clock()
+
+    def job_begin(self, arrival: float) -> None:
+        """A thread took a released frame: handling it is one job on its station."""
+        d = self.detok
+        if not hasattr(d, "station"):
+            d.station, d.due = Station(1), collections.deque()
+        d.k, d.posted = d.station.enqueue(arrival), []
+        job.cur = (d.station, d.k)
+
+    def job_end(self) -> None:
+        """The thread is back at its wait point: its job's callbacks run at completion."""
+        d = self.detok
+        posted = getattr(d, "posted", None)
+        if posted is None:
+            return
+        job.cur = d.posted = None
+        d.station.finish(d.k)
+        d.due.append(posted)
+        c = d.station.completion(d.k)
+        super().call_soon_threadsafe(self.call_at, c, self._post, d.due)
+
+    def _post(self, due) -> None:
+        # Timers that share a deadline fire in any order; each takes the oldest
+        # job's callbacks, so a thread's jobs post theirs in completion order.
+        for callback, args in due.popleft():
+            self.call_soon(callback, *args)
+
+    def call_soon_threadsafe(self, callback, *args, context=None):
+        posted = getattr(self.detok, "posted", None)
+        if posted is None:
+            return super().call_soon_threadsafe(callback, *args, context=context)
+        posted.append((callback, args))
 
     def call_at(self, when, callback, *args, context=None):
         handle = super().call_at(when, callback, *args, context=context)
