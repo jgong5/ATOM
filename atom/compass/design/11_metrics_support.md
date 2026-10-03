@@ -247,7 +247,7 @@ and to write. The transport still drains on D72's push cadence, so the ZMQ messa
                          v
    +---------------------------------------------+
    | API server                                  |
-   |   /metrics -> current values, wall scrape   |  <- liveness, unchanged
+   |   /metrics -> values, simulated-time scrape |  <- the traffic LP's daemon scrape (D72)
    |   run end  -> OpenMetrics text w/ virtual ts|  <- the simulated timeline
    +---------------------+-----------------------+
                          v
@@ -362,7 +362,7 @@ attach to where the number came from, not to how it is exposed.
 | **E — event tally** | a count incremented on an occurrence: requests finished, preemptions, tokens, histogram `_bucket` and `_count` | **valid by construction.** Monotone; sample per step. |
 | **D — duration** | a clock delta: TTFT, TPOT, step time, queue wait, histogram `_sum` over durations | **must be a simulated duration.** Audit the observation argument (D73). |
 | **R — rate** | a count divided by elapsed time | **do not export.** Export the underlying counter and let PromQL `rate()` compute it over virtual timestamps. If a rate must be exported, its denominator is virtual elapsed. |
-| **T — timestamp** | a wall-clock instant exported as a value: `process_start_time_seconds`, `_created`, `_last_refresh`, exemplar timestamps | **must declare its clock.** Usually real, because it describes the *process*; virtual if it describes the *run*. Never left implicit. |
+| **T — timestamp** | an instant exported as a value: `process_start_time_seconds`, `_created`, exemplar timestamps; `_last_refresh`, which stamps simulated time (D72) | **must declare its clock.** Usually real, because it describes the *process*; virtual if it describes the *run*. Never left implicit. |
 | **X — external** | measured outside the engine: GPU telemetry, host stats, the `server_metrics/` scraper | **invalid under simulation.** Refuse. |
 
 ATOM's current twenty metrics are all **S** or **E**, which is why D72's "valid by

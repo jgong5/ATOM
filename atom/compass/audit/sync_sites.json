@@ -21,7 +21,7 @@
   "K8": "real bound: the clock authority cannot reach it, or it stays real on purpose; it is configured rather than simulated",
   "K9": "outside the model: outside the simulated window, inside code the simulator replaces, or cannot park"
  },
- "history": "category and why are the first classification, kept as written except the metrics cadences, which an owner ruling moved from ignore to C2; rows added since carry none. mechanism and mechanism_why are what a simulated run does at the site: mechanism_why is empty only where the mechanism is the one the row's category named (A K1, B K5, C1 K8, C2 K7, ignore K9) and why already says it.",
+ "history": "category and why are the first classification, kept as written; rows added since carry none. mechanism and mechanism_why are what a simulated run does at the site: mechanism_why is empty only where the mechanism is the one the row's category named (A K1, B K5, C1 K8, C2 K7, ignore K9) and why already says it.",
  "scanned_roots": [
   {
    "path": "atom/model_engine/",
@@ -580,11 +580,11 @@
    "call": "asyncio.sleep",
    "expr": "asyncio.sleep(_METRICS_REFRESH_INTERVAL_SECONDS)",
    "shape": "sleep",
-   "category": "C2",
+   "category": "ignore",
    "peer": "none",
-   "why": "the metrics refresh cadence, a daemon timer on simulated time once the frontend's event loop runs on the LP clock, with no change at the call",
+   "why": "the metrics scrape cadence is deliberately left on the real clock",
    "mechanism": "K7",
-   "mechanism_why": ""
+   "mechanism_why": "the metrics refresh cadence is a daemon timer on simulated time once the frontend's event loop runs on the LP clock, with no change at the call"
   },
   {
    "id": "atom/entrypoints/openai/api_server.py::chat_completions::loop.run_in_executor( None, _prepare_multimodal_inputs, messages, merged_kwargs, request.tools, )::executor_handoff#0",
@@ -2951,21 +2951,21 @@
    "file": "atom/model_engine/engine_core.py",
    "line": 320,
    "anchor": "next_metrics_push = now + METRICS_PUSH_INTERVAL_S",
-   "category": "C2",
+   "category": "ignore",
    "peer": "none",
-   "why": "the metrics push cadence, a daemon timer on simulated time folded into the loop's idle point; the reported timeline comes from sampling, not from this",
+   "why": "the metrics push cadence is deliberately left on the real clock; the reported timeline comes from sampling, not from this",
    "mechanism": "K7",
-   "mechanism_why": ""
+   "mechanism_why": "the metrics push cadence becomes a daemon timer on simulated time, folded into the loop's idle point"
   },
   {
    "file": "atom/model_engine/engine_core.py",
    "line": 701,
    "anchor": "next_metrics_push = now + METRICS_PUSH_INTERVAL_S",
-   "category": "C2",
+   "category": "ignore",
    "peer": "none",
-   "why": "the same cadence in the data-parallel loop, a daemon timer on simulated time folded into the loop's idle point",
+   "why": "the same cadence in the data-parallel loop, deliberately left on the real clock",
    "mechanism": "K7",
-   "mechanism_why": ""
+   "mechanism_why": "the metrics push cadence becomes a daemon timer on simulated time, folded into the loop's idle point"
   },
   {
    "file": "atom/model_engine/engine_core.py",

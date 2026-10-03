@@ -53,10 +53,9 @@ of the count of messages in transit, even on a socket that cannot park.
 Every row also keeps the `category` and `why` of the first classification,
 which sorted waits into A (simulated time decides it), B (an unbounded wait for
 another process), C1 (a bound that declares something broken), C2 (a bound that
-sets a cadence), `ignore` and `undecided`. They are history, except the
-metrics push and refresh cadences, which an owner ruling moved from `ignore` to
-C2; rows added since carry no category. Each category named one mechanism —
-A K1, B K5, C1 K8, C2 K7, `ignore` K9 — and wherever a row's mechanism is a different one,
+sets a cadence), `ignore` and `undecided`. They are history, and rows added
+since carry no category. Each category named one mechanism — A K1, B K5, C1
+K8, C2 K7, `ignore` K9 — and wherever a row's mechanism is a different one,
 `mechanism_why` says why; the test requires it there.
 
 ## Rows added since the first classification
