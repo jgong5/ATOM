@@ -1092,7 +1092,7 @@ Deferred to future work by decision on 2026-09-18.
   the cheap way to convert them into evidence is T5 itself, which will either trace
   cleanly at TP>1 or produce the hang and settle the question.
 
-  **It gets root-caused rather than worked around**, for a reason independent of T5: mode-based instrumentation hung all 8 ranks while that function was written, and
+  **It gets root-caused rather than worked around**, for a reason independent of T5: a `__torch_function__` mode (the `DeviceContext` guard) hung all 8 ranks while that function was written, and
   `--measure` is a designed path. A workaround that avoids the one known call site leaves
   the mechanism unexplained and the next call site undiscovered.
 
