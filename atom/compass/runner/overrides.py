@@ -139,8 +139,8 @@ RPC_SURFACE: dict[str, bool] = {
     "allocate_kv_cache": True,  # EngineCore.__init__ asserts the reply
     "capture_cudagraph": True,  # EngineCore.__init__ unpacks three values
     "forward": True,  # Scheduler.postprocess reads its attributes
-    # Answered by ATOM's own, which needs neither weights nor a device for them.
     "dummy_execution": True,  # DPEngineCoreProc._execute_dummy_batch returns it
+    # Answered by ATOM's own, which needs neither weights nor a device for them.
     "exit": False,  # EngineCore.exit, the last call of the process's life
     "freeze_gc_heap": True,  # EngineCore._freeze_after_startup catches a raise, not a None
     "process_kvconnector_output": False,  # EngineCore does not wait
@@ -537,8 +537,10 @@ class NonAllocatingRunner:
         `RapidServeModelRunner`, the other runner in this tree that declines
         to own its memory, carries the same one of the two.
 
-        No duration is reported. The reply has nowhere to put one: the engine
-        times the call itself, and the batch output it reads carries tokens.
+        The duration rides on the reply as `predicted_s`, which the engine's
+        step loop advances its clock by (`atom.utils.clock.step_done`). It is
+        set only when a cost backend is installed as `compass_backend`; without
+        one the reply has no `predicted_s`, and the clock refuses it in a run.
         """
         if not hasattr(batch, "produces_output"):
             # Not reachable from the engine, which only ever passes a scheduled
@@ -577,4 +579,40 @@ class NonAllocatingRunner:
                 ),
             )
             self._token_stream = stream
-        return ScheduledBatchOutput(**stream.step(batch))
+        reply = ScheduledBatchOutput(**stream.step(batch))
+        backend = getattr(self, "compass_backend", None)
+        if backend is not None:
+            reply.predicted_s = _group_step_seconds(self, batch, backend)
+        self._step_reply = reply
+        return reply
+
+    def dummy_execution(self) -> Any:
+        """ATOM's dummy batch, answered with its forward's reply, not `True`.
+
+        `DPEngineCoreProc._execute_dummy_batch` hands the reply to the step
+        loop, which advances the clock by its `predicted_s`, so an idle rank's
+        dummy batch is priced and enters the group's max like any other step.
+        """
+        super().dummy_execution()
+        return self._step_reply
+
+
+def _group_step_seconds(runner: Any, batch: Any, backend: Any) -> float:
+    """This rank's step priced from its own batch, then the max over its DP group.
+
+    The `all_reduce(MAX)` stands in for the cross-rank collectives a real
+    forward makes, which a predicted one does not run, so every rank leaves the
+    step at the group's seconds. With one rank there is no group to exchange
+    with.
+    """
+    from atom.compass.runner.projection import batch_view, dp_group, forward_mode
+
+    mode = forward_mode(batch, runner)
+    seconds = backend.estimate(batch_view(batch, mode, runner)).seconds
+    if mode.sync is None:
+        return seconds
+    group_max = torch.tensor([seconds], dtype=torch.float64)
+    torch.distributed.all_reduce(
+        group_max, op=torch.distributed.ReduceOp.MAX, group=dp_group()
+    )
+    return group_max.item()

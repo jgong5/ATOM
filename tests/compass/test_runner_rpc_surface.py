@@ -731,7 +731,7 @@ def test_the_pp_reply_is_read_in_the_head_and_not_at_the_last_stages_call():
 
 
 def test_dummy_execution_is_this_runners_forward_and_refuses_with_it():
-    """Which is why it is not replaced: it answers as soon as `forward` does."""
+    """ATOM's builds the dummy batch and answers `True`; the override keeps the batch."""
     body = next(
         n
         for n in ast.walk(_classes(ATOM_RUNNER)["ModelRunner"])

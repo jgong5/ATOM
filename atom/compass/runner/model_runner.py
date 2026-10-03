@@ -37,7 +37,8 @@ class CompassModelRunner(NonAllocatingRunner, ModelRunner):
     `_fv_ring`, the list of per-slot dicts built from it. Both are the base's.
     What this class adds is no tensor at all: `model`, a module registering no
     parameter and no buffer; `_token_stream`, the deferral bookkeeping
-    `forward` builds on first use; and `kv_pool_sizing`, the block count
+    `forward` builds on first use; `_step_reply`, the reply `forward` last
+    built, which `dummy_execution` answers with; and `kv_pool_sizing`, the block count
     `get_num_blocks` answered, kept beside the readings it was sized from.
     Those readings come from `atom.compass.memory`, whose whole import closure
     reaches no tensor library, and `install_device_readings` puts them on the

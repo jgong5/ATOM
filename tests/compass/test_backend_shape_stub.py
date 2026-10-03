@@ -155,10 +155,15 @@ class TestPerRequestSums:
         """Every sum is a function of the rows, so none can be supplied and
         none can disagree with the rows it came from.
 
-        `capture_rung` is the one batch-level scalar and is one deliberately:
-        a rung is a property of the replayed graph, not of any row.
+        `capture_rung` and `max_tokens_across_dp` are batch-level scalars
+        deliberately: a rung is a property of the replayed graph and the token
+        count of the data-parallel group, not of any row.
         """
-        assert [f.name for f in fields(BatchView)] == ["requests", "capture_rung"]
+        assert [f.name for f in fields(BatchView)] == [
+            "requests",
+            "capture_rung",
+            "max_tokens_across_dp",
+        ]
         assert [f.name for f in fields(RequestShape)] == [
             "query_tokens",
             "context_tokens",
