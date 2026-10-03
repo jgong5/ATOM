@@ -23,6 +23,7 @@ from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.streaming_dispatch import StreamBatchDispatcher
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.request import RequestOutput
+from atom.sampling_params import SamplingParams
 from atom.utils import clock, get_open_zmq_ipc_path, make_zmq_socket, zmq_shim
 from atom.utils.clock import LPRuntime, WrappedSocket
 from atom.utils.compass_loop import CompassEventLoop, wrap_decode
@@ -133,3 +134,81 @@ def test_callbacks_of_jobs_completing_together_run_in_job_order(monkeypatch):
     seen = []
     _run(monkeypatch, callback, [1, 2, 3, 4, 5])
     assert seen == [1, 2, 3, 4, 5]
+
+
+def test_a_non_streaming_completion_is_delivered_after_its_loop_thread_decode(
+    monkeypatch,
+):
+    # ATOM's `generate_async` on the frontend loop: preprocess on the executor,
+    # 100 tokens in one finished output, then its final decode on the loop thread.
+    entry = _entry()
+    tokenizer = _Tokenizer()
+    tokenizer.decode = wrap_decode(tokenizer.decode, entry)
+    endpoint = f"inproc:test-loop-decode-{uuid.uuid4().hex}"
+    server = clock_transport.serve(ClockAuthority(TABLE), endpoint)
+    for lp in ("traffic", "engine"):
+        clock_transport.connect(LpId(lp), endpoint).send((NER, math.inf, [], math.inf))
+    frontend = LPRuntime(
+        LpId("frontend"), TABLE, clock_transport.connect(LpId("frontend"), endpoint)
+    )
+    monkeypatch.setattr(clock, "_installed", frontend)
+    loop = CompassEventLoop()
+    seq = SimpleNamespace(id=7, num_prompt_tokens=1, max_tokens=100)
+
+    def preprocess(prompt, params, stream_callback, **kw):
+        seq.callback = stream_callback
+        return seq
+
+    def add_request(seqs):
+        seq.callback(RequestOutput(7, list(range(100)), True, "length"))
+
+    monkeypatch.setattr(api_server, "tokenizer", tokenizer)
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        SimpleNamespace(
+            io_processor=SimpleNamespace(preprocess=preprocess, requests={}),
+            core_mgr=SimpleNamespace(add_request=add_request),
+        ),
+    )
+    delivered = []
+
+    async def request():
+        async for response in api_server.generate_async("p", SamplingParams(), "r"):
+            delivered.append((response["latency"], loop.time()))
+
+    frontend.start_run()
+    task = loop.create_task(request())
+    guard = threading.Timer(20, loop.call_soon_threadsafe, (loop.stop,))
+    guard.start()
+    try:
+        loop.run_forever()
+    finally:
+        guard.cancel()
+        loop.close()
+        server.close()
+    task.result()
+    # Predicted by hand: everything before the decode takes no simulated time,
+    # and the decode of 100 tokens costs ``fixed + 100 / (rate x derate)``.
+    predicted = entry.decode_fixed_s + 100 / (entry.decode_tokens_per_s * entry.derate)
+    assert predicted == pytest.approx(0.201)
+    assert delivered == [pytest.approx((predicted, predicted))]
+
+
+def test_a_loop_thread_decode_outside_the_run_asks_for_no_time(monkeypatch):
+    frontend = LPRuntime(LpId("frontend"), TABLE, None)  # no connection to ask on
+    monkeypatch.setattr(clock, "_installed", frontend)
+    decode = wrap_decode(_Tokenizer().decode, _entry())
+    assert decode([1, 2]) == "xx" and frontend.now == 0.0
+
+
+def test_a_decode_on_another_thread_with_no_job_open_is_refused(monkeypatch):
+    # In the run, a thread other than the clock owner with no job open asks the
+    # authority for nothing: the charge goes through `advance_to`, which refuses it.
+    frontend = LPRuntime(LpId("frontend"), TABLE, None, owner=threading.Thread())
+    monkeypatch.setattr(clock, "_installed", frontend)
+    frontend.start_run()
+    decode = wrap_decode(_Tokenizer().decode, _entry())
+    with pytest.raises(RuntimeError, match="only the clock owner"):
+        decode([1, 2])
+    assert frontend.now == 0.0
