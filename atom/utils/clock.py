@@ -137,6 +137,8 @@ class LPRuntime:
         self.wakes: dict[threading.Thread, _Wakeup] = {}
         self.endpoints: dict[str, str] = {}  # address -> channel kind it carries
         self.relays: dict[str, RelayQueue] = {}  # channel -> the engine's output relay
+        self.calls = 0  # clock calls made, TAR and NER
+        self.turn_calls = 0  # `calls` when the step loop last began a turn
 
     def start_run(self) -> None:
         self.in_run = True
@@ -205,6 +207,7 @@ class LPRuntime:
     def _ca_call(self, kind: str, t: float, t_daemon: float = float("inf")):
         with self.lock:
             log, self.send_log = self.send_log, []
+        self.calls += 1
         self.conn.send((kind, t, log, t_daemon))
         return self.conn.recv()
 
@@ -546,3 +549,63 @@ def relay_queue(dp: int):
     ch = channel_of(rt, f"output#dp{dp}")
     rt.relays[ch] = RelayQueue(rt, WrappedSocket(rt, None, ch))
     return rt.relays[ch]
+
+
+# ---- the engine step loop: hooks ATOM calls, each a no-op on a real run ----
+
+#: Worker calls that run one step; their reply carries its predicted seconds.
+STEP_CALLS = frozenset({"forward", "prefill_forward", "dummy_execution"})
+
+
+def step_done(name: str, reply):
+    """The step's reply is back: advance the clock by its ``predicted_s``.
+
+    A step reply in the run without predicted seconds is refused rather than
+    charged nothing.
+    """
+    rt = _installed
+    if rt is None or name not in STEP_CALLS:
+        return reply
+    seconds = getattr(reply, "predicted_s", None)
+    if seconds is None:
+        raise RuntimeError(
+            f"{rt.me}: the {name} reply carries no predicted_s, so its step has no cost"
+        )
+    rt.advance_to(rt.now + seconds)
+    return reply
+
+
+def turn(engine, t_daemon: float = math.inf) -> bool:
+    """The top of a step-loop turn; True once the run is finished and the loop exits.
+
+    A turn that made no clock call ran nothing, so this one first idles with
+    `next_event`: for one idle KV drain interval while KV work is pending, else
+    until an arrival. `t_daemon` is the loop's housekeeping deadline.
+    """
+    rt = _installed
+    if rt is None:
+        return False
+    if rt.in_run and rt.calls == rt.turn_calls:
+        from atom.model_engine.engine_core import KV_IDLE_DRAIN_INTERVAL_S as drain
+
+        t = rt.now + drain if engine.has_pending_kv_work() else math.inf
+        rt.next_event(t, t_daemon)
+    rt.turn_calls = rt.calls
+    return rt.now == math.inf
+
+
+def wait_output(q: queue.Queue) -> None:
+    """The offline driver's idle point: ask for time until `q` holds an output."""
+    rt = _installed
+    if rt is None:
+        return
+    while rt.in_run and q.empty():
+        rt.next_event(math.inf)
+    if rt.now == math.inf and q.empty():
+        raise RuntimeError(f"{rt.me}: the run finished with no output left to get")
+
+
+def close() -> None:
+    """The step loop's process leaves; refused before the ``+inf`` grant."""
+    if _installed is not None:
+        _installed.close()

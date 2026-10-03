@@ -1376,6 +1376,7 @@ class CoreManager:
                 )
 
     def get_output(self) -> list[Sequence]:
+        clock.wait_output(self.outputs_queue)
         seqs = self.outputs_queue.get()
         if isinstance(seqs, BaseException):
             raise seqs

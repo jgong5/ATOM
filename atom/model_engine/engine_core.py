@@ -277,6 +277,7 @@ class EngineCore:
                 proc.join(timeout=5)
         self._send_engine_dead()
         logger.debug(f"{self.label}: model runner exit")
+        clock.close()
 
     def _send_engine_dead(self):
         logger.debug(f"{self.label}: send SHUTDOWN request")
@@ -321,6 +322,8 @@ class EngineCore:
         next_metrics_push = 0.0
         try:
             while True:
+                if clock.turn(self, next_metrics_push):
+                    break
                 self.utility_handler.process_queue(self.utility_queue, self)
                 now = clock.now(time.monotonic)
                 if now >= next_metrics_push:
@@ -702,6 +705,8 @@ class DPEngineCoreProc(EngineCore):
         next_metrics_push = 0.0
         try:
             while True:
+                if clock.turn(self, next_metrics_push):
+                    break
                 self.utility_handler.process_queue(self.utility_queue, self)
                 now = clock.now(time.monotonic)
                 if now >= next_metrics_push:
