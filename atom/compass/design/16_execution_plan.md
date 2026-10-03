@@ -207,14 +207,14 @@ what keeps the headline example, and one currently changes no path:
   `import atom.*` lines are indented — inside a function, a `try`, or a
   `skipif(not torch.cuda.is_available())` guard. An earlier draft anchored the match at
   column 0 on both sides and silently dropped `atom/model_ops/topK.py`, whose only
-  excluded-side reference is `test_moe_dp_token_capacity.py:39`, indented under exactly such
+  excluded-side reference is `test_moe_dp_token_capacity.py::test_dpa_capacity_fits_gathered_topk_metadata`, indented under exactly such
   a guard.
 - *Coverage is credited only for a module-level import.* An indented import in a CPU-tier
   file is not proof that the CPU tier executes it, and crediting it would let a never-taken
   branch suppress a trigger. **This is the part that keeps
   `atom/model_engine/model_runner.py`** — the module Compass's runner seam replaces.
   `tests/test_mla_index_cache.py` imports `ModelRunner` at
-  `tests/test_mla_index_cache.py:99`, indented four spaces inside a test function, so that
+  `tests/test_mla_index_cache.py::test_model_runner_local_total_layers_adds_mtp_only_on_drafter_stage`, indented four spaces inside a test function, so that
   import is never credited whatever the file collects. Measured at `236abfd9a` in
   `xiaobizh_n18_cpu`: crediting coverage at any indentation drops the set 30 → 29, losing
   `topK.py`; doing that *and* crediting non-collecting files drops it 30 → 27, losing

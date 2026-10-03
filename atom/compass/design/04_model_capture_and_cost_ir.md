@@ -150,7 +150,7 @@ memory-format propagation, and an op cache.
 
 Symbolic shapes are the decisive reason — `ShapeEnv` attaches to `FakeTensorMode`, and
 bare meta puts you back on the unsound route D. The device tag is the practical reason:
-ATOM registers its ops at `dispatch_key="CUDA"` (`atom/utils/custom_register.py:40`) and
+ATOM registers its ops at `dispatch_key="CUDA"` (`atom/utils/custom_register.py::direct_register_custom_op`) and
 the model and runner branch on device throughout; under meta that code takes paths nobody
 runs. The prior work felt this directly — *"meta accepts kernels real devices reject"*
 (AITER's fused qk-rmsnorm takes fp16/bf16 only, yet meta traced happily at fp32, so model
@@ -305,9 +305,9 @@ fake-less aiter ops sit *inside* those leaves and are never reached.
 > **Partly re-taken since, by `tests/compass/test_capture_real_model.py`.** That test
 > traces the 27B at both widths through a group of the honest width, and agrees with the
 > 27B row on what it is a claim about rather than on its totals: at TP2 it records
-> `aiter.all_reduce_` **129** — 128 row-parallel at `communication_op.py:58` plus the
-> vocab-parallel one at `embed_head.py:175`, the 128 predicted from the config's layer
-> types and not read off the inventory — one all-gather at `embed_head.py:257`, and one
+> `aiter.all_reduce_` **129** — 128 row-parallel at `communication_op.py::tensor_model_parallel_all_reduce` plus the
+> vocab-parallel one at `embed_head.py::VocabParallelEmbedding.forward`, the 128 predicted from the config's layer
+> types and not read off the inventory — one all-gather at `embed_head.py::ParallelLMHead.forward`, and one
 > broadcast, plus two `_c10d_functional.wait_tensor` entries that belong to the
 > substitution below rather than to ATOM. The raw Triton traffic agrees exactly:
 > **33 launches across 3 kernels**. The operator totals do
@@ -382,7 +382,7 @@ broadcaster, so both have to be declined when the group is built.
 
 Declining the device communicator is **not free**, and the earlier claim that nothing
 reaches it once the group exists is wrong. ATOM's default `ATOM_USE_CUSTOM_ALL_GATHER`
-takes `embed_head.py:257`'s vocab-parallel gather down the custom path, which asserts on
+takes `embed_head.py::ParallelLMHead.forward`'s vocab-parallel gather down the custom path, which asserts on
 `device_communicator.ca_comm` and fails with `'NoneType' object has no attribute
 'ca_comm'` after 2,588 operators. The runs above therefore set
 **`ATOM_USE_CUSTOM_ALL_GATHER=0`**, selecting the non-custom gather; that is a declared
@@ -702,14 +702,14 @@ is the one that matters — a dense-then-MoE schedule with shared experts is exa
 
 An operator the tracer records as **one node whose internal kernels are invisible**,
 because ATOM deliberately registers a whole subsystem as a single dispatcher op. The
-intent is stated at `atom/model_ops/module_dispatch_ops.py:5-19`: hide dynamic-shape
+intent is stated in the `atom/model_ops/module_dispatch_ops.py` module docstring: hide dynamic-shape
 internals from Dynamo while leaving CUDA-graph capture transparent. The same property
 makes them opaque to any trace.
 
 There are ~19 ATOM-registered ones. The ones that matter: `moe_forward`
-(`atom/model_ops/moe.py:2642`), `unified_attention_with_output_base`
-(`atom/model_ops/base_attention.py:347`), `linear_attention_with_output_base`
-(`:389`), `gemm_a16w16` (aiter), and the `v4_*` family.
+(`atom/model_ops/moe.py`), `unified_attention_with_output_base`
+(`atom/model_ops/base_attention.py`), `linear_attention_with_output_base`
+(`atom/model_ops/base_attention.py`), `gemm_a16w16` (aiter), and the `v4_*` family.
 
 ### Why this is good news
 
@@ -999,7 +999,7 @@ model.
 Device-free means the model cannot be compiled: inductor must codegen and autotune for the
 target architecture. So tier (b) traces the **eager** operator stream, while production
 runs at `--level 3` PIECEWISE with `use_inductor = True` and `--cudagraph-mode FULL`
-(`atom/model_engine/arg_utils.py:246`, `:251`).
+(`atom/model_engine/arg_utils.py::EngineArgs.add_cli_args`).
 
 ### Why this is more sound than it sounds
 
@@ -1061,10 +1061,10 @@ Deferred to future work by decision on 2026-09-18.
   through the dispatcher at all — they are reached via
   `torch._inductor.runtime.triton_heuristics.CachingAutotuner.run`, not
   `JITFunction.run`. A prior in-tree precedent
-  (`atom/model_loader/online_quant_streaming.py:25-46`) overrides
+  (`atom/model_loader/online_quant_streaming.py::_CopyCounter`) overrides
   `ignore_compile_internals()` because *"TorchDispatchMode keeps its compile-internal
   state in process-global booleans"*.
-- One in-tree hazard for mode-based instrumentation: `atom/spec_decode/dspark_scheduler.py:264`
+- One in-tree hazard for mode-based instrumentation: `atom/spec_decode/dspark_scheduler.py::schedule_prefix_lengths_tensor`
   — `torch.tensor(N, device=...)` under an active `DeviceContext` `__torch_function__`
   guard **hangs all 8 ranks on ROCm**. Mode-based instrumentation has already caused one
   production hang in this codebase.
@@ -1079,7 +1079,7 @@ Deferred to future work by decision on 2026-09-18.
      dispatcher-visible ops (which have `register_fake` impls — every ATOM opaque op
      does) or invisible ones reached through declared nodes, which the tracer records
      rather than calls. Nothing should reach RCCL.
-  2. **The specific hazard is not the same mode.** `dspark_scheduler.py:264` hangs under
+  2. **The specific hazard is not the same mode.** `dspark_scheduler.py::schedule_prefix_lengths_tensor` hangs under
      an active `DeviceContext` **`__torch_function__`** guard doing
      `torch.tensor(N, device=...)` — a *real* run with a real device, not a fake-tensor
      trace.

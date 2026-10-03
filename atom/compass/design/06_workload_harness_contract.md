@@ -239,8 +239,8 @@ are `tokio::time` / `std::time::Instant`, and we want to touch it as little as p
 
 ### The mechanism that already exists
 
-The ATOM relay is strictly sequential (`http_pd_router.rs:969-1192`), unlike the SGLang
-path (`tokio::join!` on both, `:1463`) and the vLLM path (detached `spawn`, `:732`):
+The ATOM relay is strictly sequential (`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`), unlike the SGLang
+path (`tokio::join!` on both, `http_pd_router.rs::PDRouter::execute_dual_dispatch_internal`) and the vLLM path (detached `spawn`, `http_pd_router.rs::PDRouter::dispatch_vllm_mooncake_internal`):
 
 ```
 client --compass.arrival_s--> router --inject_prefill_fields--> PREFILL
@@ -253,11 +253,11 @@ client --compass.arrival_s--> router --inject_prefill_fields--> PREFILL
 client <--------------  router <-- decode response (streamed)
 ```
 
-`AtomAdapter::enrich_decode_kv` (`placement/backend/atom.rs:37-59`) only *adds* fields
+`AtomAdapter::enrich_decode_kv` (`placement/backend/atom.rs`) only *adds* fields
 (`remote_dp_size`, `remote_tp_size`, renames `dp_rank` -> `remote_dp_rank`). The blob
 itself is produced by `MoRIIOConnectorScheduler.request_finished`
-(`moriio_connector.py:970-1001`) and the router hard-errors if it is absent
-(`http_pd_router.rs:1073-1078`).
+(`moriio_connector.py`) and the router hard-errors if it is absent
+(`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`).
 
 ### Decision
 
@@ -342,7 +342,7 @@ the same property. That is what makes the comparison valid.
 
 If every request decodes the same filler id, two requests sharing a prompt prefix produce
 identically-chained decode blocks (`BlockManager.compute_hash` is xxhash chained with the
-parent hash, `block_manager.py:233-245`), and the second would **hit** the first. A real
+parent hash, `block_manager.py`), and the second would **hit** the first. A real
 run would not. That inflates cache hits — and since `num_cached_tokens` feeds chunked
 prefill sizing and admission, **it changes the schedule**, which is the thing this project
 is most sensitive to.
@@ -383,14 +383,14 @@ p50 input is 88,768 tokens and p90 is 204,288, this is not a rounding error.
 
 ### Where it happens
 
-**Encode** — `self.tokenizer.encode(prompt_or_tokens)` at `llm_engine.py:690`, inside
+**Encode** — `self.tokenizer.encode(prompt_or_tokens)` at `llm_engine.py::InputOutputProcessor.preprocess_fanout`, inside
 `InputOutputProcessor.preprocess`, reached from the API server via
-`await loop.run_in_executor(None, do_preprocess)` at `api_server.py:890`, `:1004`, `:1126`,
-`:1258`, `:1480`. That is Python's **implicit default executor**, width
+`await loop.run_in_executor(None, do_preprocess)` at `api_server.py::generate_async`, `generate_async_multimodal`, `generate_async_fanout`,
+`setup_streaming_request`, `setup_streaming_request_fanout`. That is Python's **implicit default executor**, width
 `min(32, cpu_count + 4)` — see doc 05 D24, which makes it an ATOM config option.
 
 **Decode** — `IncrementalStreamDetokenizer.update` at
-`atom/entrypoints/openai/streaming_dispatch.py:40-69`:
+`atom/entrypoints/openai/streaming_dispatch.py`:
 
 ```python
 self.tokens.extend(token_ids)
@@ -414,7 +414,7 @@ Four properties that shape the model:
    constraint.
 
 Note also the terminal `self.tokenizer.decode(req.completion_token_ids)` at
-`llm_engine.py:776` — but ATOM defect #6 records that `InputOutputProcessor.postprocess` is
+`llm_engine.py::InputOutputProcessor.postprocess` — but ATOM defect #6 records that `InputOutputProcessor.postprocess` is
 **never called from `api_server.py`**, so that path does not run under serving. It matters
 only for the offline `generate()` path.
 

@@ -392,7 +392,7 @@ refused by name.
 ### Q4: memory — layers split, and the split is ATOM's
 
 `get_pp_indices(num_hidden_layers, pp_rank, pp_size)` (`atom/models/utils.py`, used at
-`kv_transfer/offload/config.py:332,439` and in the Mooncake connector) owns the layer
+`kv_transfer/offload/config.py::scale_cpu_size_for_pp`, `kv_transfer/offload/config.py::build_lmcache_metadata` and in the Mooncake connector) owns the layer
 range per stage. `ModelRunner._get_total_num_layers` already consults `get_pp_indices`
 when `pp_group.world_size > 1`.
 
@@ -503,11 +503,11 @@ they agree is a reading, not a guarantee, and no artifact key currently records 
 answered — **T86**.
 
 **ATOM does not construct the EP group — aiter does.** No ATOM file assigns `_EP`, and
-every use site imports `get_ep_group` from `aiter.dist.parallel_state` (`moe.py:599`,
-`fused_moe/mori_v2_prepare_finalize.py:153,636`, `fused_moe/flydsl_mega_experts.py:186`,
-`eplb.py:1768`, `models/glm4_moe.py:96`, `models/qwen3_next.py:171`,
+every use site imports `get_ep_group` from `aiter.dist.parallel_state` (`moe.py::FusedMoEMethodBase._maybe_make_prepare_finalize`,
+`fused_moe/mori_v2_prepare_finalize.py::_init_cco_comm`, `fused_moe/mori_v2_prepare_finalize.py::make_mori_v2_prepare_finalize`, `fused_moe/flydsl_mega_experts.py::run_mega_moe`,
+`eplb.py::EPLBManager._maybe_initialize_runtime`, `models/glm4_moe.py::Glm4MoE.__init__`, `models/qwen3_next.py::Qwen3NextSparseMoeBlock.__init__`,
 `model_runner.py::ModelRunner._force_aiter_unreg_capture_for_piecewise`). Both of ATOM's distributed-init paths —
-`init_pp_aware_dist_env` (`distributed/pp_comm.py:46`) when `pp_size > 1`, aiter's
+`init_pp_aware_dist_env` (`distributed/pp_comm.py`) when `pp_size > 1`, aiter's
 `init_dist_env` (`aiter/ops/communication.py:22`) otherwise, chosen by the
 `pipeline_parallel_size > 1` branch of
 `model_runner.py::ModelRunner._setup_device_and_distributed` — end in
@@ -542,10 +542,10 @@ ships or documents:
 | `-tp 4 -dp 2` (`docs/distributed_guide.md:20`) | 8 | 2/1/1/4 | `[0…7]` | 8 |
 | `-tp 2 -pp 2` | 4 | 1/2/1/2 | `[0,1]`, `[2,3]` | 2 |
 | `-tp 4 -pcp 2` | 8 | 1/1/2/4 | `[0…7]` | 8 |
-| `-tp 2 -pp 2 -dp 2` — **refused** at `engine_core_mgr.py:297-300` | 8 | 2/2/1/2 | `[0,1,4,5]`, `[2,3,6,7]` | 4 |
+| `-tp 2 -pp 2 -dp 2` — **refused** at `engine_core_mgr.py::CoreManager.__init__` | 8 | 2/2/1/2 | `[0,1,4,5]`, `[2,3,6,7]` | 4 |
 
 Under DP-attention `CoreManager` rewrites `dp := dp × tp, tp := 1` before any of this
-(`engine_core_mgr.py:281-295`), which is why those rows carry `tp 1`. The torch world is
+(`engine_core_mgr.py::CoreManager.__init__`), which is why those rows carry `tp 1`. The torch world is
 `dp × pcp × tp` either way: `init_dist_env` passes `world_size = pp × tp × pcp` with `pp`
 pinned to 1 (`aiter/ops/communication.py:33-40`) and `init_distributed_environment`
 multiplies DP back in (`parallel_state.py:1726-1729`); the PP branch computes the same
@@ -561,81 +561,81 @@ The strided last row is the only non-contiguous case, and ATOM refuses it
 `self.internode = not all(in_the_same_node_as(cpu_group, source_rank=0))`
 (`base_device_communicator.py:55`), MoRI picks `IntraNode` against `InterNodeV1` from it,
 and ATOM deliberately shares that one probe rather than re-deriving it from a width
-(`moe.py:692-698`).
+(`moe.py::FusedMoEMethodBase._maybe_make_prepare_finalize`).
 
 **Two configurations where ATOM does not own the answer at all.** Under the vLLM plugin
 ATOM adopts vLLM's group wholesale — `aiter_ps._EP = getattr(vllm_ps, "_EP", None)`
-(`plugin/vllm/tp_group_reuse.py:150-152`) — so membership is vLLM's decision there, and a
+(`plugin/vllm/tp_group_reuse.py::init_aiter_dist_from_vllm`) — so membership is vLLM's decision there, and a
 vLLM configuration with no `_EP` installs `None` and fails at the first `get_ep_group()`
 (`parallel_state.py:1586`). And EP width is never requested directly: ATOM has no
-`--ep-size` flag (`model_engine/arg_utils.py:271-275` offers only the boolean
+`--ep-size` flag (`model_engine/arg_utils.py::EngineArgs.add_cli_args` offers only the boolean
 `--enable-expert-parallel`), and the SGLang and rtp-llm frontends, which do carry an
-`ep_size`, have it reduced to that boolean (`plugin/config.py:612,690`) — so `ep_size=2`
+`ep_size`, have it reduced to that boolean (`plugin/config.py::_generate_atom_config_from_sglang_config`, `plugin/config.py::_generate_atom_config_from_rtpllm_config`) — so `ep_size=2`
 under `-tp 8` is accepted and silently means 8.
 
 ### `moe_parallel_config.ep_size` is a second number, and it is not the group size
 
 `FusedMoEParallelConfig.make` computes its own: `ep_size = tp_size; ep_rank = tp_rank`
-(`moe.py:299-300`), where `tp_size` has been flattened across DP **only if**
-`enable_dp_attention or moe_ep_flatten_tp_across_dp` (`moe.py:240-242`, `252-256`) and
-folded with PCP only under `ATOM_PCP_MOE_MERGE` (`moe.py:272-280`). The two numbers agree
+(`moe.py`), where `tp_size` has been flattened across DP **only if**
+`enable_dp_attention or moe_ep_flatten_tp_across_dp` (`moe.py`) and
+folded with PCP only under `ATOM_PCP_MOE_MERGE` (`moe.py`). The two numbers agree
 in every configuration ATOM ships a recipe for, and disagree in one it documents:
 
 | Configuration | group size (aiter) | `moe_parallel_config.ep_size` | agree |
 |---|---|---|---|
 | `-tp N`, DP 1 | `N` | `N` | yes |
 | `-tp N --enable-dp-attention` | `N` | `N` | yes |
-| vLLM plugin `--enable-expert-parallel` (`plugin/config.py:361`) | `dp × tp` | `dp × tp` | yes |
+| vLLM plugin `--enable-expert-parallel` (`plugin/config.py::_generate_atom_config_from_vllm_config`) | `dp × tp` | `dp × tp` | yes |
 | **`-tp 4 -dp 2 --enable-expert-parallel`, no DP-attention** | **8** | **4** | **no** |
 | `-pcp P` without `ATOM_PCP_MOE_MERGE` | `P × tp` | `tp` | **no** |
 
 MoRI v1 is handed `num_ep_ranks` from the group and `num_local_experts` from the config
-number (`moe.py:654,664`); MoRI v2 derives both from the group
-(`mori_v2_prepare_finalize.py:640,666`). The two paths therefore disagree exactly where
+number (`moe.py::FusedMoEMethodBase._maybe_make_prepare_finalize`); MoRI v2 derives both from the group
+(`mori_v2_prepare_finalize.py::make_mori_v2_prepare_finalize`). The two paths therefore disagree exactly where
 the two numbers do. **Compass must carry both and assert they agree**, because ATOM
 asserts nothing here — recorded as **T83**, which also covers `local_ep_size`
-(`moe.py:313-314`, MoRI's `gpu_per_node`) omitting PCP while the group includes it.
+(`moe.py::FusedMoEParallelConfig.make`, MoRI's `gpu_per_node`) omitting PCP while the group includes it.
 
 ### EP without DP runs no all-to-all at all
 
-`use_all2all_kernels` requires `dp_size > 1` (`moe.py:201-211`) and is the sole gate on
-building `MoriPrepareAndFinalize` (`moe.py:736-742`); without it `self.fused_experts`
-stays `None` (`moe.py:756-759`) and the layer falls through to a plain
-`fused_moe(…, expert_mask=…)` (`moe.py:907-915`). So under
+`use_all2all_kernels` requires `dp_size > 1` (`moe.py`) and is the sole gate on
+building `MoriPrepareAndFinalize` (`moe.py::FusedMoEMethodBase.maybe_make_prepare_finalize`); without it `self.fused_experts`
+stays `None` (`moe.py::FusedMoEMethodBase.init_prepare_finalize`) and the layer falls through to a plain
+`fused_moe(…, expert_mask=…)` (`moe.py::UnquantizedFusedMoEMethod.apply`). So under
 `-tp 8 --enable-expert-parallel` — `recipes/Qwen3-235b.md:24`, the flagship EP recipe —
 the MoE is masked local-expert compute plus the ordinary TP all-reduce
-(`moe.py:4370-4374`), and moves **zero all-to-all bytes**. That is the mechanism behind
+(`moe.py::FusedMoE.forward_impl_graph`), and moves **zero all-to-all bytes**. That is the mechanism behind
 `04`'s *"at `ep_size == tp_size` EP is close to a no-op"*, and it is stronger than close.
 
 **A cost model must refuse to price a MoRI all-to-all at `dp_size == 1` rather than price
 zero bytes** — a confident, precise, fictional number is the archetypal failure `README`
-names. The gate to mirror is `moe.py:201-211` in full, including `dp_logical_ratio == 1`
+names. The gate to mirror is `moe.py::FusedMoEParallelConfig.use_all2all_kernels` in full, including `dp_logical_ratio == 1`
 and `_has_module("mori")`. One exception: `--moe-backend mega` installs `MegaFusedExperts`
-unconditionally (`moe.py:1738-1753`) and reads the group directly for its rank and world
-(`flydsl_mega_experts.py:186-193`), so it does run peer-to-peer at `dp_size == 1`;
-`config.py:1677-1681` refuses `mega` without EP.
+unconditionally (`moe.py::MegaMxfp4MoEMethod.init_prepare_finalize`) and reads the group directly for its rank and world
+(`flydsl_mega_experts.py::run_mega_moe`), so it does run peer-to-peer at `dp_size == 1`;
+`config.py::Config.__post_init__` refuses `mega` without EP.
 
 ### Q1: no LPs added — the conclusion holds, the reason under it did not
 
 **The conclusion stands, and D93's formula is unchanged.** The EP group is exactly the set
 of ranks of one PP stage, and PP is the only LP-adding dimension (D88, D93). The one case
 where EP's membership could cut across an LP boundary is `pp > 1` together with `dp > 1`,
-and `engine_core_mgr.py:297-300` refuses it.
+and `engine_core_mgr.py::CoreManager.__init__` refuses it.
 
 **The reason previously given here was wrong, and is recorded rather than quietly
 dropped**, because a future reader who lifts that refusal will need to know which half
-survived. It read that EP *"inherits the TP group"*, citing `moe.py:265`; that line is a
+survived. It read that EP *"inherits the TP group"*, citing `moe.py::FusedMoEParallelConfig.make`; the cited line is a
 comment inside the PCP-merge block explaining that the *integers* `ep_size`/`ep_rank`
 inherit `tp_size`/`tp_rank`, and says nothing about the communicator. The caveat below it
 was stated conditionally — *"if a deployment configures EP to span the DP dimension"* —
 and EP spans DP in every configuration where DP exists. The second cross-DP
 synchronisation that caveat predicted **does** appear: MoRI dispatch/combine, over a
 membership different from `sync_dp_metadata`'s. ATOM confirms the two groups are distinct
-objects in code — `eplb.py:1784-1793` compares the DP group's global ranks against the EP
+objects in code — `eplb.py::EPLBManager._maybe_initialize_runtime` compares the DP group's global ranks against the EP
 group's to decide `_dp_is_migration_group`, a comparison with no purpose if they were the
 same group.
 
-`get_max_tokens_across_dispatchers` (`moe.py:495`) was cited here as hinting at a
+`get_max_tokens_across_dispatchers` (`moe.py`) was cited here as hinting at a
 cross-dispatcher reduction. It is `def …(input): return input.item()` — no collective —
 and a tree-wide `grep -rn` returns the definition and this document. It has no callers.
 
@@ -650,8 +650,8 @@ Expert assignment is a function of the routing computed inside the layer, not of
 scheduler decision — and **real routing is data-dependent, so it is not derivable from
 geometry**. The closed-form flat ring
 `expert_ids = (p % ep_size) × L + (p // ep_size) % L` is `init_balance_router_logits`
-(`moe.py:137-152`), the **synthetic** router built only under `--fake-eplb`
-(`moe.py:2974-2989`: *"if atom_config.fake_eplb else None"*). Class A under `--fake-eplb`,
+(`moe.py`), the **synthetic** router built only under `--fake-eplb`
+(`moe.py::FusedMoE.__init__`: *"if atom_config.fake_eplb else None"*). Class A under `--fake-eplb`,
 and nothing outside it.
 
 ### Q3: cost — the hard part, and it is already characterised
@@ -670,24 +670,24 @@ That is `04` D19's `exclusive` join policy, and it is a **measured fact rather t
 modelling choice** — an EP all-to-all cannot overlap with anything, so the IR must not
 place it in a `Par`. The cap is two numbers and not one —
 `min(128, CU)` blocks at 16 warps for prefill against `min(64, CU)` at 4 for decode
-(`fused_moe/mori_prepare_finalize.py:257-261`), which on the 80-CU MI308X is 80 and 64 —
+(`fused_moe/mori_prepare_finalize.py::MoriPrepareAndFinalize._get_dispatch_config`), which on the 80-CU MI308X is 80 and 64 —
 recorded as **T87**, since `07`'s price-list table states it as a single cell.
 
 ### Q4: memory — experts shard contiguously, and an indivisible count is refused
 
-`determine_expert_map` (`fused_moe/expert_layout.py:111-152`) gives rank `r` the
+`determine_expert_map` (`fused_moe/expert_layout.py`) gives rank `r` the
 contiguous run `[r×L, (r+1)×L)` with `L = E // ep_size`, and gives any remainder to the
-**last** rank (`expert_layout.py:147-152`) — it is not left unused. Expert weight bytes per
+**last** rank (`expert_layout.py::determine_expert_map`) — it is not left unused. Expert weight bytes per
 rank are `L × bytes_per_expert`, exact from geometry (Class A).
 
 **There is no remainder for a memory model to reproduce**, because a configuration whose
 expert count does not divide by `ep_size` is refused outright:
 `assert self.global_num_experts % self.ep_size == 0` whenever `use_ep`
-(`moe.py:2758-2763`). MoRI derives a token's destination as
-`expert_id // num_experts_per_rank` (`distributed/simulated_tp.py:105-107`,
-`moe.py:203-206`) and cannot represent an uneven last rank, so ATOM refuses rather than
+(`moe.py::FusedMoE.__init__`). MoRI derives a token's destination as
+`expert_id // num_experts_per_rank` (`distributed/simulated_tp.py::_reject_unsupported`,
+`moe.py::FusedMoEParallelConfig.use_all2all_kernels`) and cannot represent an uneven last rank, so ATOM refuses rather than
 pads. The *"a remainder is left unused"* comment this section used to quote is
-`moe.py:151`, inside the `--fake-eplb` synthetic router, not the real path.
+in `moe.py::init_balance_router_logits`, inside the `--fake-eplb` synthetic router, not the real path.
 
 ---
 
@@ -793,6 +793,6 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T85 | Multi-node EP rank-to-node mapping is assumed, not verified: MoRI infers node identity as `ep_rank // gpu_per_node`, which needs consecutive EP ranks to be physically consecutive GPUs | a 2-node DP+EP run logging `all2all_manager.internode` and each rank's EP group; M7-era |
 | T66 | Measure whether the Class-C runtime constants move with PP degree | one engine startup per PP degree |
 | T67 | Measure the step-duration spread across DP ranks, and what padding to `unified_bs` costs | needs a DP2 run with per-rank step timing |
-| T78 | `qwen3_5.py:427` and `glm4_moe.py:426` declare `"intermediate_tensors": 0`, so neither model can run PP at compilation level >= 2 | upstream ATOM fix; `15` D94's PP2 test is fake-model and CPU-only, so this is not on M1's path |
-| T79 | `gdn_attn.py:1329-1331` mixes a PP-local layer count with a global one; KV sizing sign-flips at PP2 | upstream ATOM fix; blocks real-model PP measurement, not M1 |
-| T82 | D91 Q2's "no scheduling coupling" is contradicted by `scheduler.py:1761-1763`, which skips `_pp_inflight_token_block` seqs inside the decode admission loop | the amendment to D91 and its LP consequence is its own task; this PR registers the contradiction rather than rewriting the decision |
+| T78 | `qwen3_5.py::Qwen3_5Model` and `glm4_moe.py::Glm4MoeModel` declare `"intermediate_tensors": 0`, so neither model can run PP at compilation level >= 2 | upstream ATOM fix; `15` D94's PP2 test is fake-model and CPU-only, so this is not on M1's path |
+| T79 | `gdn_attn.py::GDNAttentionMetadataBuilder.sub_pool_specs` mixes a PP-local layer count with a global one; KV sizing sign-flips at PP2 | upstream ATOM fix; blocks real-model PP measurement, not M1 |
+| T82 | D91 Q2's "no scheduling coupling" is contradicted by `scheduler.py::Scheduler.schedule`, which skips `_pp_inflight_token_block` seqs inside the decode admission loop | the amendment to D91 and its LP consequence is its own task; this PR registers the contradiction rather than rewriting the decision |
