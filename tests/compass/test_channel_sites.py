@@ -40,7 +40,8 @@ ENGINE = ("EngineCore.__init__",)
 MGR = ("CoreManager.__init__", "DisaggCoreManager.__init__._connect_proc")
 
 #: Row symbol -> (the kind of each channel its call carries, the functions that
-#: record the addresses of those channels).
+#: record the addresses of those channels). ``relay`` is the output queue the
+#: function makes with `clock.relay_queue`.
 SITES = {
     "PPStageTransport.send_metadata": (("meta",), ENGINE),
     "PPStageTransport.recv_metadata": (("meta",), ENGINE),
@@ -49,7 +50,7 @@ SITES = {
     "PPStageTransport.send_kv_status": (("kv_status",), ENGINE),
     "PPStageTransport.recv_kv_status": (("kv_status",), ENGINE),
     "EngineCore.process_input_sockets": (("request", "control"), ENGINE),
-    "EngineCore.process_output_sockets": (("output",), ENGINE),
+    "EngineCore.process_output_sockets": (("output", "relay"), ENGINE),
     "PrefillEngineCore._process_engine_step": (("prefill_done",), ENGINE),
     "DecodeEngineCore._recv_prefill_done": (("prefill_done",), ENGINE),
     "DecodeEngineCore._send_block_assignment": (("block_assignment",), ENGINE),
@@ -67,7 +68,7 @@ def _config(meta=(), token="", kv="", p2d="", d2p=""):
 
 
 class _Naming(ast.NodeVisitor):
-    """Function qualname -> its `clock.name_endpoints` calls."""
+    """Function qualname -> its `clock.name_endpoints` and `clock.relay_queue` calls."""
 
     def __init__(self):
         self.scope, self.calls = [], {}
@@ -81,7 +82,7 @@ class _Naming(ast.NodeVisitor):
 
     def visit_Call(self, node):
         f = node.func
-        if isinstance(f, ast.Attribute) and f.attr == "name_endpoints":
+        if isinstance(f, ast.Attribute) and f.attr in ("name_endpoints", "relay_queue"):
             self.calls.setdefault(".".join(self.scope), []).append(node)
         self.generic_visit(node)
 
@@ -125,15 +126,18 @@ def test_every_channel_row_maps_to_an_address_its_wiring_names(monkeypatch):
         print(r["mechanism"], r["id"], "->", *SITES.get(r["symbol"], ("?",))[0])
     assert rows and acks
     assert sorted({r["symbol"] for r in rows}) == sorted(SITES), "unmapped or stale"
+
+    def covers(call, kind):
+        if call.func.attr == "relay_queue":
+            return kind == "relay"
+        return kind in (full if len(call.args) == 5 else base)
+
     unnamed = [
         (symbol, kind, fn)
         for symbol, (kinds, fns) in SITES.items()
         for fn in fns
         for kind in kinds
-        if not any(
-            kind in (full if len(c.args) == 5 else base)
-            for c in naming.calls.get(fn, ())
-        )
+        if not any(covers(c, kind) for c in naming.calls.get(fn, ()))
     ]
     assert not unnamed
     assert [f for f, tree in trees.items() if not _imports_the_shim(tree)] == []
@@ -195,17 +199,40 @@ def test_the_shim_is_pyzmq_until_a_runtime_is_installed(monkeypatch):
     ctx = zmq_shim.Context.instance()
     sock = ctx.socket(zmq.PULL)
     sock.bind("inproc://unnamed")
-    assert ctx is not real and isinstance(sock, zmq_shim.Socket)
-    assert not isinstance(sock, WrappedSocket)
-    assert type(zmq_shim.Poller()) is WrappedPoller
-    ctx.destroy(linger=0)
+    made = (
+        ctx is real,
+        isinstance(sock, zmq_shim.Socket),
+        type(sock),
+        zmq_shim.Poller(),
+    )
+    ctx.destroy(linger=0)  # before asserting: a later `instance()` must not inherit it
+    assert made[:3] == (False, True, zmq_shim._Socket)
+    assert type(made[3]) is WrappedPoller
 
 
-def test_pp_stages_talk_through_their_wrapped_sockets(monkeypatch, shim_ctx):
+def test_an_engine_names_its_own_and_its_configured_addresses(monkeypatch):
+    rt = LPRuntime(LpId("engine"), _engine_table(), None)
+    monkeypatch.setattr(clock, "_installed", rt)
+    clock.name_endpoints(1, "in", "ctl", "out", _config(["", "m1"], "t", "k", "p", "d"))
+    assert rt.endpoints == {
+        "in": "request#dp1",
+        "ctl": "control#dp1",
+        "out": "output#dp1",
+        "m1": "meta",
+        "t": "tokens",
+        "k": "kv_status",
+        "p": "prefill_done",
+        "d": "block_assignment",
+    }
+
+
+def test_pp_stages_talk_through_their_wrapped_sockets(monkeypatch):
+    zmq.Context.instance()  # pyzmq's own process-wide context exists already
     table = _pp_table(2)
-    last, head = (_stage(monkeypatch, table, rank, 2, shim_ctx) for rank in (1, 0))
+    last = _stage(monkeypatch, table, 1, 2, None)  # takes `zmq.Context.instance()`
+    head = _stage(monkeypatch, table, 0, 2, last._ctx)
     head.send_metadata("batch")
-    assert last.recv_metadata() == "batch"
+    assert last.recv_metadata(timeout_ms=5000) == "batch"
     last.send_tokens("out")
     assert head.recv_tokens(timeout_ms=5000) == "out"
     last.send_kv_status("kv")
@@ -242,7 +269,9 @@ def test_the_engine_input_thread_takes_a_request_sent_by_the_frontend(
     clock.name_endpoints(0, *addrs, "")
     engine = EngineCore.__new__(EngineCore)
     engine.label, engine.input_queue = "engine", queue.Queue()
-    thread = threading.Thread(target=engine.process_input_sockets, args=addrs)
+    thread = threading.Thread(
+        target=engine.process_input_sockets, args=addrs, daemon=True
+    )
     thread.start()
     assert mgr.input_sockets[0].raw.poll(5000) and mgr.control_sockets[0].raw.poll(5000)
     mgr.engine_core_identities = [mgr.input_sockets[0].recv_multipart()[0]]
@@ -283,7 +312,9 @@ def test_the_engine_output_thread_sends_each_item_with_its_put_stamp(monkeypatch
     clock.name_endpoints(0, "", "", address)
     engine = EngineCore.__new__(EngineCore)
     engine.label, engine.output_queue = "engine", clock.relay_queue(0)
-    thread = threading.Thread(target=engine.process_output_sockets, args=(address,))
+    thread = threading.Thread(
+        target=engine.process_output_sockets, args=(address,), daemon=True
+    )
     thread.start()
     frames = []
     rt.start_run()
