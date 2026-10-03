@@ -29,6 +29,7 @@ from aiter.dist.shm_broadcast import MessageQueue
 
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.utils import (
+    clock,
     get_mp_context,
     get_open_zmq_ipc_path,
     init_exit_handler,
@@ -431,7 +432,7 @@ class AsyncIOProcManager:
             ret = self.outputs_queue.get()
             if isinstance(ret, SystemExit):
                 raise ret
-            return ret
+            return clock.step_done(func_name, ret)
 
     def call_func_with_aggregation(self, func_name: str, *args, timeout: float = 10.0):
         """RPC call with KV output aggregation across all workers.
