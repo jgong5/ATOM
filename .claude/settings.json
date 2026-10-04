@@ -1,4 +1,15 @@
 {
+  "extraKnownMarketplaces": {
+    "jgong5": {
+      "source": {
+        "source": "github",
+        "repo": "jgong5/skills"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "agent-team@jgong5": true
+  },
   "hooks": {
     "PostToolUse": [
       {
