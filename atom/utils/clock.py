@@ -563,9 +563,10 @@ def relay_queue(dp: int):
 
 
 def charge(reply):
-    """A worker reply that carries ``predicted_s`` advances the clock by it.
+    """A reply whose ``ScheduledBatchOutput.predicted_s`` is set advances the clock by it.
 
-    The reply is what says the call cost time, not the call's name.
+    The reply is what says the call cost time, not the call's name. A real
+    forward leaves the field None, and no other reply has it.
     """
     rt = _installed
     if rt is not None and getattr(reply, "predicted_s", None) is not None:

@@ -18,6 +18,7 @@ import pytest
 from aiter_stub import stubbed_aiter
 
 from atom.compass.clock import LpId, single_engine_table
+from atom.model_engine.scheduler import ScheduledBatchOutput
 from atom.model_engine.sequence import SequenceStatus
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
@@ -221,7 +222,7 @@ def test_a_reply_advances_the_clock_only_by_the_seconds_it_carries(installed):
     workers = Workers(SimpleNamespace())
     call(lambda: workers.call_func("forward", wait_out=True))
     assert ca.calls == []
-    workers.reply = SimpleNamespace(predicted_s=0.5)
+    workers.reply = ScheduledBatchOutput([], [], None, None, None, predicted_s=0.5)
     call(lambda: workers.call_func("dummy_execution", wait_out=True))
     assert ca.calls == [("TAR", 0.0, 0.5, 0.5)]
 
