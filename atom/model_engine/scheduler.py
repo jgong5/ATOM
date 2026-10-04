@@ -847,6 +847,8 @@ class ScheduledBatchOutput:
         num_rejected: Per-request count of rejected speculative tokens.
         num_bonus: Per-request count of bonus accepted tokens.
         is_deferred_out: Whether output was deferred from a previous step.
+        predicted_s: The step's duration in seconds, as a runner that predicts
+            the step rather than running it prices it; None from a real forward.
     """
 
     def __init__(
@@ -860,6 +862,7 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        predicted_s: float | None = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -874,6 +877,7 @@ class ScheduledBatchOutput:
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
+        self.predicted_s = predicted_s
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
 
