@@ -9,11 +9,18 @@ new_tests_dir: tests/compass
 worktree_root: /workspace/llm_infer_deploy_study/perf_modeling/compass-worktrees
 import_check: python3 -c "import atom; print(atom.__file__)"
 ---
-Git, `gh`, `python3`, the gates and the `agent-team` scripts run in the GPU
-container through `gpu_docker/shell.sh`, never on the host;
+Git, `gh`, `python3`, `gate_wave` and the `agent-team` scripts run in the
+GPU container through `gpu_docker/shell.sh`, never on the host;
 `gpu_docker/CLAUDE.md` gives the host-to-container path mapping.
 `worktree_root` is a container path. Scratch and working logs go in
 `agent_scratch/`, beside the repository.
+
+**`gate_task` runs in the CPU container**, node 18's `xiaobizh_n18_cpu`, on a
+`scripts/compass/snapshot.sh` tarball of the head copied in with `docker cp`
+(`scripts/compass/README.md`), and is judged against the same run on the
+base. Not in the GPU container: kernel tests in the CPU tier run on the
+device there and fail at the base too. New tests in `new_tests_dir` are
+CPU-only: they pass in that container with no driver.
 
 **Ownership.** Git in the container runs as root and leaves files root-owned,
 which makes later host-side edits fail silently. After every git command that
