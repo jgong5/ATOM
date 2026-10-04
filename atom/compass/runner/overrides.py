@@ -89,6 +89,7 @@ from typing import Any
 
 import torch
 
+from atom.compass.backends.base import CostBackend
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
 from atom.compass.runner.step_output import (
     DeferredTokenStream,
@@ -208,6 +209,36 @@ def _installed_readings(runner: Any) -> DeviceReadings:
             "spec before the engine asks this worker for a block count."
         )
     return readings
+
+
+def install_cost_backend(runner: Any, backend: CostBackend) -> None:
+    """Give a runner the cost backend its steps are priced by.
+
+    Set on the instance the way `install_device_readings` sets the readings,
+    and for the same reason. Choosing a backend from a flag or a config field
+    is the configuration surface's job and is not wired yet.
+    """
+    if not isinstance(backend, CostBackend):
+        raise RunnerRefusal(
+            "a step is priced by a `CostBackend`, and "
+            f"{type(backend).__name__} is not one"
+        )
+    runner.compass_backend = backend
+
+
+def _installed_backend(runner: Any) -> CostBackend:
+    """The installed backend, or a refusal that says what would supply it.
+
+    A step with no backend would take no time, which reads as a valid run.
+    """
+    backend = getattr(runner, "compass_backend", None)
+    if backend is None:
+        raise RunnerRefusal(
+            "no cost backend is installed on this runner, so there is nothing "
+            "to price a step with; call `install_cost_backend` before the "
+            "engine's first step."
+        )
+    return backend
 
 
 def _config_field(runner: Any, name: str) -> Any:
