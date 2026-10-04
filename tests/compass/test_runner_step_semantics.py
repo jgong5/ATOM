@@ -32,7 +32,13 @@ import pytest
 from conftest import MockConfig
 from test_runner_rpc_surface import SITES
 
-from atom.compass.runner.overrides import NonAllocatingRunner, RunnerRefusal
+from atom.compass.backends.shape import ShapeStubBackend
+from atom.compass.runner import overrides
+from atom.compass.runner.overrides import (
+    NonAllocatingRunner,
+    RunnerRefusal,
+    install_cost_backend,
+)
 from atom.compass.runner.step_output import (
     DeferredTokenStream,
     reported_token_id,
@@ -59,8 +65,17 @@ class _Runner(NonAllocatingRunner):
 
     def __init__(self, config, stream=None):
         self.config = config
+        install_cost_backend(self, ShapeStubBackend())
         if stream is not None:
             self._token_stream = stream
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _unpriced():
+    """Reporting is under test here, not the price: `test_dp_step_max.py` prices."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(overrides, "_group_step_seconds", lambda *_: 0.0)
+        yield
 
 
 class _PerStep(DeferredTokenStream):
