@@ -322,14 +322,16 @@ class EngineCore:
         next_metrics_push = 0.0
         try:
             while True:
-                if clock.turn(self, next_metrics_push):
-                    break
                 self.utility_handler.process_queue(self.utility_queue, self)
                 now = clock.now(time.monotonic)
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
-                shutdown = shutdown or self.pull_and_process_input_queue()
+                shutdown = (
+                    clock.idle(self._idle_deadline, next_metrics_push)
+                    or shutdown
+                    or self.pull_and_process_input_queue()
+                )
                 if shutdown:
                     break
                 if self._is_idle_rl_weights_offloaded():
@@ -468,6 +470,13 @@ class EngineCore:
         self._next_idle_kv_drain = now + KV_IDLE_DRAIN_INTERVAL_S
         self._dispatch_idle_offload_work()
         self._poll_kv_transfer_progress()
+
+    def _idle_deadline(self) -> float:
+        """When an idle loop next acts on its own: it polls pending KV work every
+        idle drain interval, and otherwise waits for input."""
+        if not self.has_pending_kv_work():
+            return float("inf")
+        return clock.now(time.monotonic) + KV_IDLE_DRAIN_INTERVAL_S
 
     def _drain_kv_work_at_exit(self) -> None:
         """Give in-flight KV transfers a bounded window to report back.
@@ -705,14 +714,16 @@ class DPEngineCoreProc(EngineCore):
         next_metrics_push = 0.0
         try:
             while True:
-                if clock.turn(self, next_metrics_push):
-                    break
                 self.utility_handler.process_queue(self.utility_queue, self)
                 now = clock.now(time.monotonic)
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
-                shutdown = shutdown or self.pull_and_process_input_queue()
+                shutdown = (
+                    clock.idle(self._idle_deadline, next_metrics_push)
+                    or shutdown
+                    or self.pull_and_process_input_queue()
+                )
                 local_unfinished = (
                     not self.scheduler.is_finished()
                     and not self._is_rl_weights_offloaded

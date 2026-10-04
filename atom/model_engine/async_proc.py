@@ -432,7 +432,7 @@ class AsyncIOProcManager:
             ret = self.outputs_queue.get()
             if isinstance(ret, SystemExit):
                 raise ret
-            return clock.step_done(func_name, ret)
+            return clock.charge(ret)
 
     def call_func_with_aggregation(self, func_name: str, *args, timeout: float = 10.0):
         """RPC call with KV output aggregation across all workers.

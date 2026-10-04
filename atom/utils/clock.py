@@ -138,7 +138,7 @@ class LPRuntime:
         self.endpoints: dict[str, str] = {}  # address -> channel kind it carries
         self.relays: dict[str, RelayQueue] = {}  # channel -> the engine's output relay
         self.calls = 0  # clock calls made, TAR and NER
-        self.turn_calls = 0  # `calls` when the step loop last began a turn
+        self.idle_calls = 0  # `calls` when the step loop last passed its idle point
         # The frontend's event loop, once built: a frame a thread takes is a job on it.
         self.loop = None
 
@@ -561,44 +561,32 @@ def relay_queue(dp: int):
 
 # ---- the engine step loop: hooks ATOM calls, each a no-op on a real run ----
 
-#: Worker calls that run one step; their reply carries its predicted seconds.
-STEP_CALLS = frozenset({"forward", "prefill_forward", "dummy_execution"})
 
+def charge(reply):
+    """A worker reply that carries ``predicted_s`` advances the clock by it.
 
-def step_done(name: str, reply):
-    """The step's reply is back: advance the clock by its ``predicted_s``.
-
-    A step reply in the run without predicted seconds is refused rather than
-    charged nothing.
+    The reply is what says the call cost time, not the call's name.
     """
     rt = _installed
-    if rt is None or name not in STEP_CALLS:
-        return reply
-    seconds = getattr(reply, "predicted_s", None)
-    if seconds is None:
-        raise RuntimeError(
-            f"{rt.me}: the {name} reply carries no predicted_s, so its step has no cost"
-        )
-    rt.advance_to(rt.now + seconds)
+    if rt is not None and getattr(reply, "predicted_s", None) is not None:
+        rt.advance_to(rt.now + reply.predicted_s)
     return reply
 
 
-def turn(engine, t_daemon: float = math.inf) -> bool:
-    """The top of a step-loop turn; True once the run is finished and the loop exits.
+def idle(deadline, t_daemon: float = math.inf) -> bool:
+    """An idle point of a loop that never blocks; True once the run is finished.
 
-    A turn that made no clock call ran nothing, so this one first idles with
-    `next_event`: for one idle KV drain interval while KV work is pending, else
-    until an arrival. `t_daemon` is the loop's housekeeping deadline.
+    A pass through the loop that made no clock call ran nothing, so this one
+    first waits for the LP's next event: an arrival, or ``deadline()``, the time
+    the loop next acts on its own. `t_daemon` is a deadline that does not keep
+    the run alive. The loop takes True as its shutdown.
     """
     rt = _installed
     if rt is None:
         return False
-    if rt.in_run and rt.calls == rt.turn_calls:
-        from atom.model_engine.engine_core import KV_IDLE_DRAIN_INTERVAL_S as drain
-
-        t = rt.now + drain if engine.has_pending_kv_work() else math.inf
-        rt.next_event(t, t_daemon)
-    rt.turn_calls = rt.calls
+    if rt.in_run and rt.calls == rt.idle_calls:
+        rt.next_event(deadline(), t_daemon)
+    rt.idle_calls = rt.calls
     return rt.now == math.inf
 
 

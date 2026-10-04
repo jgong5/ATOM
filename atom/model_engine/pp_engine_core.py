@@ -66,10 +66,12 @@ class PPEngineCoreProc(EngineCore):
         shutdown = False
         try:
             while True:
-                if clock.turn(self):
-                    break
                 self.utility_handler.process_queue(self.utility_queue, self)
-                shutdown = shutdown or self.pull_and_process_input_queue()
+                shutdown = (
+                    clock.idle(self._idle_deadline)
+                    or shutdown
+                    or self.pull_and_process_input_queue()
+                )
                 if shutdown:
                     break
                 if self._is_idle_rl_weights_offloaded():

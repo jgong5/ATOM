@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""The engine step loops on an LP clock: TAR after each step, NER at each idle point.
+"""The engine step loops on an LP clock: TAR by what a reply charges, NER when idle.
 
 ATOM's own loops (`EngineCore.busy_loop`, `DPEngineCoreProc.busy_loop`,
 `PPEngineCoreProc._head_busy_loop`) and its worker RPC
@@ -214,22 +214,29 @@ def test_an_idle_loop_asks_for_time_once_per_idle_period(name, installed):
     assert all(t == pytest.approx(now + STEP_S) for now, t in tars)
 
 
-def test_a_step_reply_without_predicted_seconds_is_refused(installed):
-    with pytest.raises(RuntimeError, match="forward reply carries no predicted_s"):
-        _run(EngineCore.busy_loop, SimpleNamespace(), arrivals=ARRIVALS[:1])
+def test_a_reply_advances_the_clock_only_by_the_seconds_it_carries(installed):
+    ca = Authority([], None)
+    call = _install(ca)
+    workers = Workers(SimpleNamespace())
+    call(lambda: workers.call_func("forward", wait_out=True))
+    assert ca.calls == []
+    workers.reply = SimpleNamespace(predicted_s=0.5)
+    call(lambda: workers.call_func("any_call", wait_out=True))
+    assert ca.calls == [("TAR", 0.0, 0.5, 0.5)]
 
 
-def test_with_pending_kv_work_a_turn_idles_one_drain_interval(installed):
+def test_with_pending_kv_work_an_idle_point_waits_one_drain_interval(installed):
     ca = Authority([], None)
     call = _install(ca, start=False)
-    engine = SimpleNamespace(has_pending_kv_work=lambda: True)
-    assert call(clock.turn, engine, 5.0) is False
+    engine = Engine(None)
+    engine.has_pending_kv_work = lambda: True
+    assert call(clock.idle, engine._idle_deadline, 5.0) is False
     assert ca.calls == []  # before the run there is no clock to ask
     ca.rt.start_run()
-    call(clock.turn, engine, 5.0)
-    assert ca.calls == [
-        ("NER", 0.0, KV_IDLE_DRAIN_INTERVAL_S, KV_IDLE_DRAIN_INTERVAL_S)
-    ]
+    for _ in range(2):  # an idle point that follows an idle point waits again
+        call(clock.idle, engine._idle_deadline, 5.0)
+    D = KV_IDLE_DRAIN_INTERVAL_S
+    assert ca.calls == [("NER", 0.0, D, D), ("NER", D, 2 * D, 2 * D)]
 
 
 def test_with_no_runtime_the_hooks_read_nothing():
@@ -238,18 +245,18 @@ def test_with_no_runtime_the_hooks_read_nothing():
             raise AssertionError(f"read {name}")
 
     reply = Untouchable()
-    assert clock.turn(Untouchable(), 0.0) is False
-    assert clock.step_done("forward", reply) is reply
+    assert clock.idle(Untouchable(), 0.0) is False
+    assert clock.charge(reply) is reply
     clock.wait_output(Untouchable())
     clock.close()
 
 
 def test_get_output_idles_until_an_output_and_refuses_at_the_finish(installed):
     mgr = SimpleNamespace(outputs_queue=queue.Queue())
-    ca = Authority([2.0], lambda a: mgr.outputs_queue.put(["done"]))
+    ca = Authority([1.0, 2.0], lambda a: a == 2.0 and mgr.outputs_queue.put(["done"]))
     call = _install(ca, "frontend")
     assert call(CoreManager.get_output, mgr) == ["done"]
-    assert [(k, G) for k, _, _, G in ca.calls] == [("NER", 2.0)]
+    assert [(k, G) for k, _, _, G in ca.calls] == [("NER", 1.0), ("NER", 2.0)]
     with pytest.raises(RuntimeError, match="no output left"):
         call(CoreManager.get_output, mgr)
 
