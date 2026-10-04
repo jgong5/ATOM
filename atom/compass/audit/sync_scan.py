@@ -334,7 +334,6 @@ class Site:
         return {
             "id": self.id,
             "file": self.file,
-            "line": self.line,
             "symbol": self.symbol,
             "call": self.call,
             "expr": self.expr,
@@ -342,15 +341,27 @@ class Site:
         }
 
 
-class _CallVisitor(ast.NodeVisitor):
+class _ScopedVisitor(ast.NodeVisitor):
+    """Tracks the enclosing qualified name a site or an anchor carries.
+
+    ``spans`` maps each such name to the line spans of the definitions it
+    names; ``<module>`` spans the whole file.
+    """
+
     def __init__(self, rel_path: str, source: str) -> None:
         self.rel_path = rel_path
         self.source = source
         self._scope: list[str] = []
         self.sites: list[Site] = []
+        self.spans = {"<module>": [(1, len(source.splitlines()))]}
+
+    @property
+    def symbol(self) -> str:
+        return ".".join(self._scope) or "<module>"
 
     def _push(self, node):
         self._scope.append(node.name)
+        self.spans.setdefault(self.symbol, []).append((node.lineno, node.end_lineno))
         self.generic_visit(node)
         self._scope.pop()
 
@@ -358,6 +369,8 @@ class _CallVisitor(ast.NodeVisitor):
     visit_AsyncFunctionDef = _push
     visit_ClassDef = _push
 
+
+class _CallVisitor(_ScopedVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
         if isinstance(func, ast.Attribute):
@@ -378,7 +391,7 @@ class _CallVisitor(ast.NodeVisitor):
                     Site(
                         file=self.rel_path,
                         line=node.lineno,
-                        symbol=".".join(self._scope) or "<module>",
+                        symbol=self.symbol,
                         call=text,
                         expr=whole,
                         shape=shape.name,
@@ -388,23 +401,8 @@ class _CallVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-class _SpinVisitor(ast.NodeVisitor):
+class _SpinVisitor(_ScopedVisitor):
     """Find ``while`` loops that go around without calling anything that parks."""
-
-    def __init__(self, rel_path: str, source: str) -> None:
-        self.rel_path = rel_path
-        self.source = source
-        self._scope: list[str] = []
-        self.sites: list[Site] = []
-
-    def _push(self, node):
-        self._scope.append(node.name)
-        self.generic_visit(node)
-        self._scope.pop()
-
-    visit_FunctionDef = _push
-    visit_AsyncFunctionDef = _push
-    visit_ClassDef = _push
 
     def visit_While(self, node: ast.While) -> None:
         if self._is_spin(node):
@@ -414,7 +412,7 @@ class _SpinVisitor(ast.NodeVisitor):
                 Site(
                     file=self.rel_path,
                     line=node.lineno,
-                    symbol=".".join(self._scope) or "<module>",
+                    symbol=self.symbol,
                     call=whole,
                     expr=whole,
                     shape="spin_loop",
@@ -449,8 +447,7 @@ def _number(sites: list[Site]) -> list[Site]:
     symbol plus the whole call expression plus its position among *textually
     identical* siblings. Siblings that share an ordinal are the same call
     written the same way in one function, so the inventory has to give them the
-    same answer, and a test asserts it does. The line is still recorded, and
-    checked separately, so the list stays quotable.
+    same answer, and a test asserts it does. The line only orders the sites.
     """
     seen: dict[tuple[str, str, str], int] = {}
     for site in sites:

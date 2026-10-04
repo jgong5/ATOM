@@ -427,6 +427,12 @@ rule as the forward pass.
 |---|---|---|---|
 | encode | default `ThreadPoolExecutor` | width from ATOM config | `encode_fixed_s + tokens / encode_tokens_per_s` |
 | decode | engine output thread, per stream per step | **1** | `2 x (decode_fixed_s + window / decode_tokens_per_s)` |
+| encode or decode on the loop thread | the API server's event loop: the final `decode` of a non-streaming completion in `generate_async`, `generate_async_multimodal` and `generate_async_fanout`, and the `encode` and `decode` calls in `anthropic_messages` | **1**, the loop itself | the same terms per call, over the tokens it encodes or decodes |
+
+A loop-thread call is not a station job. The event loop is the frontend LP's clock owner,
+so the call prices itself as an event cost (`01` K1): it advances the LP clock by its
+service time, and nothing else on the loop runs until it ends. Outside the simulation
+window it is charged nothing.
 
 Terms come from `host.tokenizers[]` in the machine spec (doc 05 D25), populated by the
 `compass spec probe tokenizer` Tier-0 probe.
@@ -852,7 +858,7 @@ requires genuine fan-out in every root is not constructible without reusing sess
 | D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes on that path. | 2026-09-18 |
 | D31 | Filler token is non-EOS, decodes to complete standalone ASCII, and is derived from the request id. | 2026-09-18 |
 | D32 | The decode->prefill cache chain is already broken by the harness for real servers too; guard only against false hits. `theoretical_prefix_cache_hit` is the oracle. | 2026-09-18 |
-| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. | 2026-09-18 |
+| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. A tokenizer call on the event loop thread (the final `decode` of a non-streaming completion, the calls in `anthropic_messages`) is no station job: it advances the frontend LP clock by its service time on the loop. | 2026-09-18; revised 2026-10-03 |
 | D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. | 2026-09-18 |
 | D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists; the rebind itself is deferred by a `sys.meta_path` hook, because the bootstrap runs while `aiperf.plugin.plugins` is still importing and cannot import `aiperf`; an inline attempt does not raise to the operator, it de-registers the whole plugin and logs one `WARNING` (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
 | D35 | Declare what the harness reproduces and what it cannot; cancellation is not available from this corpus. | 2026-09-18 |

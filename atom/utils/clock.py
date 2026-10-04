@@ -139,6 +139,8 @@ class LPRuntime:
         self.relays: dict[str, RelayQueue] = {}  # channel -> the engine's output relay
         self.calls = 0  # clock calls made, TAR and NER
         self.turn_calls = 0  # `calls` when the step loop last began a turn
+        # The frontend's event loop, once built: a frame a thread takes is a job on it.
+        self.loop = None
 
     def start_run(self) -> None:
         self.in_run = True
@@ -283,8 +285,14 @@ class LPRuntime:
     def handed_over(self, ch: str, seq: int) -> None:
         with self.lock:
             self.taken_by[threading.current_thread()] = (ch, seq)
+            # The owner waits at this frame's arrival until it is handled.
+            arrival = self.now
+        if self.loop is not None:
+            self.loop.job_begin(arrival)
 
     def back_at_wait_point(self) -> None:
+        if self.loop is not None:
+            self.loop.job_end()
         with self.lock:
             taken = self.taken_by.pop(threading.current_thread(), None)
             if taken is not None:
