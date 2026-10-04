@@ -54,5 +54,6 @@ with `./shell.sh /workspace/gpu_docker/install-gh-stack.sh`.
 
 **`gh` version.** `pr_state.py` asks `gh pr view` for
 `closingIssuesReferences`, which the image's apt `gh` (2.45.0) rejects as an
-unknown field, so every PR fails. Put a current release from `cli/cli` ahead
-of it on `PATH` (2.102.0 works).
+unknown field, so every PR fails. After a rebuild, run
+`./shell.sh /workspace/gpu_docker/install-gh.sh`: it installs a current
+release into `/usr/local/bin`, ahead of the apt copy on `PATH`.
