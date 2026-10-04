@@ -73,7 +73,7 @@ class Authority:
 
 
 class Workers:
-    """`AsyncIOProcManager` without processes: every call is answered with `reply`."""
+    """`AsyncIOProcManager` without processes: a step answers `reply`, others ``None``."""
 
     call_func = AsyncIOProcManager.call_func
     label = "workers"
@@ -84,8 +84,9 @@ class Workers:
         self.reply = reply
 
     def enqueue(self, msg):
-        self.steps += msg[0] in ("forward", "dummy_execution")
-        self.outputs_queue.put(self.reply)
+        step = msg[0] in ("forward", "dummy_execution")
+        self.steps += step
+        self.outputs_queue.put(self.reply if step else None)
 
 
 class Scheduler:
@@ -221,7 +222,7 @@ def test_a_reply_advances_the_clock_only_by_the_seconds_it_carries(installed):
     call(lambda: workers.call_func("forward", wait_out=True))
     assert ca.calls == []
     workers.reply = SimpleNamespace(predicted_s=0.5)
-    call(lambda: workers.call_func("any_call", wait_out=True))
+    call(lambda: workers.call_func("dummy_execution", wait_out=True))
     assert ca.calls == [("TAR", 0.0, 0.5, 0.5)]
 
 
