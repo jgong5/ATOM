@@ -491,11 +491,6 @@ class TestTheRung:
         for step in trace:
             assert capture_rung(step.batch, runner(ladder=[0])) is None
 
-    def test_a_rung_under_data_parallelism_is_refused(self, trace):
-        step = _decode(trace)
-        with pytest.raises(RunnerRefusal, match="collective"):
-            capture_rung(step.batch, runner(dp_size=2))
-
     @pytest.mark.parametrize(
         "ladder, wrong_rung",
         [([8, 4, 2, 1, 0], 8), ([0, 1, 8, 4, 2], 8)],

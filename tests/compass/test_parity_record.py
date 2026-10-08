@@ -16,8 +16,10 @@ import numpy as np
 import pytest
 from conftest import MockConfig
 
+from atom.compass.backends.shape import ShapeStubBackend
 from atom.compass.parity import ENV, StepRecording, compare, read
-from atom.compass.runner.overrides import NonAllocatingRunner
+from atom.compass.runner import overrides
+from atom.compass.runner.overrides import NonAllocatingRunner, install_cost_backend
 from atom.model_engine.prefill_delayer import PrefillDelayer
 from atom.model_engine.scheduler import ScheduledBatch, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
@@ -52,6 +54,15 @@ class _Runner(NonAllocatingRunner):
 
     def __init__(self, config, rank=0):
         self.config, self.rank = config, rank
+        install_cost_backend(self, ShapeStubBackend())
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _unpriced():
+    """Reporting is under test here, not the price: `test_dp_step_max.py` prices."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(overrides, "_group_step_seconds", lambda *_: 0.0)
+        yield
 
 
 def _drive(
