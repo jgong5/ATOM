@@ -27,8 +27,7 @@ own `gh` login. Ownership is the assignee:
   other open issue and PR belongs to someone else; `status` may report
   them, nothing else touches them. One exception: in a stack that holds
   another owner's PR, linking, unstacking and base PATCHes may name it,
-  since they land and push nothing. Your PRs above theirs wait for theirs
-  to land.
+  since they land and push nothing.
 - **Assignee on creation.** Every issue and PR gets an assignee when it is
   created: an issue its creator's login, a PR the assignee of the issue it
   delivers (its creator's login when it delivers none). With `gh issue
@@ -38,8 +37,8 @@ own `gh` login. Ownership is the assignee:
   repos/<repo>/pulls` takes no assignee, so follow it with `POST
   repos/<repo>/issues/<pr>/assignees`. An issue or PR with no assignee is
   in no run's scope: `status` lists it, and an owner assigns it.
-- **Reassignment** moves an issue and its open PRs together, so a PR is
-  never in two runs' scope. It takes effect at the next pass: the old
+- **Reassignment** replaces the assignee, never adds one, and moves an
+  issue and its open PRs together, so nothing is in two runs' scope. It takes effect at the next pass: the old
   owner's run stops touching them, the new owner's run takes them over
   (recreating the worktree from the PR branch). A push rejected during the overlap is
   fetched and merged, never forced.
@@ -75,8 +74,10 @@ own `gh` login. Ownership is the assignee:
 - **The local integration branch.** The Compass scripts diff against the
   local `feature/atomcompass_new` when it exists, before
   `fork/feature/atomcompass_new`, so a stale local branch gives them a wrong
-  base unless `COMPASS_INTEGRATION_REF` names the ref. The fast-forward
-  after every landing keeps it current.
+  base unless `COMPASS_INTEGRATION_REF` names the ref. Other owners land
+  without touching your clone, so fetch and fast-forward the local branch,
+  or set `COMPASS_INTEGRATION_REF=fork/feature/atomcompass_new`, before
+  staging any gate.
 
 ## Project rules
 
