@@ -591,6 +591,18 @@ def idle(deadline, t_daemon: float = math.inf) -> bool:
     return rt.now == math.inf
 
 
+def finish() -> None:
+    """Offline teardown: wait for the run to finish before the engines are stopped.
+
+    An engine leaves its loop on the ``+inf`` grant, so a shutdown sent at a
+    finite time would take it out before the finish. Outside a run, or once it
+    has finished, this asks nothing.
+    """
+    rt = _installed
+    while rt is not None and rt.in_run:
+        rt.next_event(math.inf)
+
+
 def wait_output(q: queue.Queue) -> None:
     """The offline driver's idle point: ask for time until `q` holds an output."""
     rt = _installed
