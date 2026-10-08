@@ -32,6 +32,7 @@ with stubbed_aiter():
         EngineCore,
     )
     from atom.model_engine.engine_core_mgr import CoreManager
+    from atom.model_engine.llm_engine import LLMEngine
     from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
 INF = float("inf")
@@ -250,6 +251,7 @@ def test_with_no_runtime_the_hooks_read_nothing():
     assert clock.idle(Untouchable(), 0.0) is False
     assert clock.charge(reply) is reply
     clock.wait_output(Untouchable())
+    clock.finish()
     clock.close()
 
 
@@ -261,6 +263,20 @@ def test_get_output_idles_until_an_output_and_refuses_at_the_finish(installed):
     assert [(k, G) for k, _, _, G in ca.calls] == [("NER", 1.0), ("NER", 2.0)]
     with pytest.raises(RuntimeError, match="no output left"):
         call(CoreManager.get_output, mgr)
+
+
+def test_the_frontend_stops_the_engines_only_after_the_finish(installed):
+    ca = Authority([1.0], lambda a: None)
+    call = _install(ca, "frontend")
+    in_run_when_stopped = []
+    engine = SimpleNamespace(
+        core_mgr=SimpleNamespace(close=lambda: in_run_when_stopped.append(ca.rt.in_run))
+    )
+    call(LLMEngine.close, engine)
+    assert [(k, G) for k, _, _, G in ca.calls] == [("NER", 1.0), ("NER", INF)]
+    assert in_run_when_stopped == [False]  # the engines stop after the finish
+    call(LLMEngine.close, engine)  # after the finish there is nothing to ask
+    assert len(ca.calls) == 2
 
 
 @pytest.mark.parametrize("loop_raises", [False, True])

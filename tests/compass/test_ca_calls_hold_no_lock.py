@@ -4,8 +4,8 @@
 A clock owner parked in `advance_to` or `next_event` waits for its own LP's
 receiving threads to hand over what the grant released. If it holds a lock one
 of them needs, the LP deadlocks. So a call to `advance_to`, `next_event`, or the
-step-loop hooks ATOM calls (`clock.idle`, `clock.charge`,
-`clock.wait_output`) must not sit inside a `with` whose context expression is a
+step-loop hooks ATOM calls (`clock.idle`, `clock.charge`, `clock.wait_output`,
+`clock.finish`) must not sit inside a `with` whose context expression is a
 name bound, in the same file, to a `threading` Lock, RLock, Condition,
 Semaphore or BoundedSemaphore.
 
@@ -26,7 +26,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 CA_CALLS = {"advance_to", "next_event"}
-HOOKS = {"idle", "charge", "wait_output"}
+HOOKS = {"idle", "charge", "wait_output", "finish"}
 LOCKS = {"Lock", "RLock", "Condition", "Semaphore", "BoundedSemaphore"}
 
 
