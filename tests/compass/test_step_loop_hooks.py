@@ -268,10 +268,13 @@ def test_get_output_idles_until_an_output_and_refuses_at_the_finish(installed):
 def test_the_frontend_stops_the_engines_only_after_the_finish(installed):
     ca = Authority([1.0], lambda a: None)
     call = _install(ca, "frontend")
-    engine = SimpleNamespace()  # no core manager: close only waits
+    in_run_when_stopped = []
+    engine = SimpleNamespace(
+        core_mgr=SimpleNamespace(close=lambda: in_run_when_stopped.append(ca.rt.in_run))
+    )
     call(LLMEngine.close, engine)
     assert [(k, G) for k, _, _, G in ca.calls] == [("NER", 1.0), ("NER", INF)]
-    assert not ca.rt.in_run
+    assert in_run_when_stopped == [False]  # the engines stop after the finish
     call(LLMEngine.close, engine)  # after the finish there is nothing to ask
     assert len(ca.calls) == 2
 
