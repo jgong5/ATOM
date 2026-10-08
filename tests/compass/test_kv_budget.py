@@ -369,10 +369,12 @@ def _fields_read_with_no_default():
     """Every name the overrides read through `_config_field`, off the source."""
     tree = ast.parse((COMPASS / "runner" / "overrides.py").read_text())
     return sorted(
-        node.args[1].value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and getattr(node.func, "id", None) == "_config_field"
+        {
+            node.args[1].value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "_config_field"
+        }
     )
 
 
