@@ -197,6 +197,13 @@ def test_a_runner_with_no_backend_refuses_the_step():
         runner(None).forward(prefill(8))
 
 
+def test_a_pipeline_stage_refuses_to_price_the_whole_model():
+    stage = runner(ShapeStubBackend())
+    stage.config.pipeline_parallel_size = 2
+    with pytest.raises(RunnerRefusal, match="one stage of a pipeline"):
+        stage.forward(prefill(8))
+
+
 def test_a_dp_rank_whose_mode_states_no_group_count_is_refused():
     batch = prefill(8)
     single_rank_mode = projection.forward_mode(batch, runner(None))
