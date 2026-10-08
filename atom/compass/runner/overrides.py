@@ -625,9 +625,18 @@ def _group_step_seconds(runner: Any, batch: Any, backend: CostBackend) -> float:
     forward makes, which a predicted one does not run, so every rank leaves the
     step at the group's seconds. With one rank there is no group to exchange
     with.
+
+    A pipeline stage is refused: it runs only its own layers, and a backend
+    prices the whole step, so every stage would charge the whole model.
     """
     from atom.compass.runner.projection import batch_view, dp_group, forward_mode
 
+    if int(_config_field(runner, "pipeline_parallel_size") or 1) > 1:
+        raise RunnerRefusal(
+            "this runner is one stage of a pipeline and runs only its own "
+            "layers, but a cost backend prices a whole step; charging each "
+            "stage the whole model would count it once per stage"
+        )
     mode = forward_mode(batch, runner)
     seconds = backend.estimate(batch_view(batch, mode, runner)).seconds
     if mode.sync is None:
