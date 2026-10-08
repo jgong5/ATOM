@@ -22,18 +22,27 @@ working logs go in `agent_scratch/`, beside the repository.
 Several owners drive agents on this repository at once, each through their
 own `gh` login. Ownership is the assignee:
 
-- **Scope.** A `run` acts only on issues assigned to its own `gh` login and on
-  the PRs that deliver them, with their stacks: claim, review, develop and
-  land all stay inside that set. Every other open issue and PR belongs to
-  someone else; `status` may report them, nothing else touches them.
-- **Assignee on creation.** `gh issue create` always passes
-  `--assignee @me`. `gh pr create` passes the assignee of the issue it
-  delivers.
+- **Scope.** A `run` acts only on issues assigned to its own `gh` login,
+  the PRs that deliver them, and PRs assigned to its login: claim, review,
+  develop and land all stay inside that set. Every other open issue and PR
+  belongs to someone else; `status` may report them, nothing else touches
+  them. In a stack that holds another owner's PR, act only on your own PRs;
+  yours above theirs waits for theirs to land.
+- **Assignee on creation.** Every issue and PR gets an assignee when it is
+  created: an issue its creator's login, a PR the assignee of the issue it
+  delivers (its creator's login when it delivers none). With `gh issue
+  create`, pass `--assignee @me`. Over REST, `@me` is not accepted: read
+  the login with `gh api user --jq .login` and pass `-f
+  "assignees[]=<login>"` to `POST repos/<repo>/issues`; `POST
+  repos/<repo>/pulls` takes no assignee, so follow it with `POST
+  repos/<repo>/issues/<pr>/assignees`. An issue or PR with no assignee is
+  in no run's scope: `status` lists it, and an owner assigns it.
 - **Reassignment** takes effect at the next pass: the old owner's run stops
   touching the issue, the new owner's run takes it over (recreating the
   worktree from the PR branch). A push rejected during the overlap is
   fetched and merged, never forced.
-- **`need human`** is removed by the issue's assignee, except an escalation
+- **`need human`** is removed by the assignee of the issue or PR that
+  carries it, except an escalation
   about a design decision (a D-numbered decision, a design document, a new
   hook point in ATOM): only @jgong5 removes that one.
 
@@ -72,14 +81,15 @@ own `gh` login. Ownership is the assignee:
 - **Few ATOM hook points.** Hook Compass into ATOM at the fewest points (a
   factory, a constructor, or a bootstrap patch applied only when Compass is
   on), never with per-use-site wrappers in ATOM's engine or frontend files.
-  Compass-off behaviour stays byte-identical. A PR touching ATOM engine code
-  compares the hook options in its body before building.
-- **Inline reviews.** Owners may review with inline comments
-  (`pulls/<n>/comments`, `pulls/<n>/reviews`), which `pr_state.py` and the
-  issue-comments endpoint do not show. Read both endpoints before acting on
-  a PR, and treat an owner's inline comment as a required finding. A search
-  over a PR that found nothing counts only if it covered both. On REST,
-  merge state is `.merged` / `.merged_at`, not `.mergedAt`.
+  Compass-off behaviour stays byte-identical. A task touching ATOM engine
+  code compares the hook options under Decided in its Dev record before
+  building.
+- **Inline comments.** `pr_state.py` and the issue-comments endpoint do not
+  show inline comments (`pulls/<n>/comments`), and owners review with them.
+  Read both endpoints before acting on a PR, and answer every inline
+  comment in the next round, whoever posted it. A search over a PR that
+  found nothing counts only if it covered both. On REST, merge state is
+  `.merged` / `.merged_at`, not `.mergedAt`.
 - **`gh` and the fork's parent.** Commands that look up the fork's parent
   (`pr create`, `issue create`, `pr ready`, `stack`) can fail with a ROCm
   SAML error. Never follow the authorization link it prints: use REST on
@@ -95,12 +105,11 @@ own `gh` login. Ownership is the assignee:
   GPU-trigger path changed lower in the stack makes `gate_cpu.sh` exit 98
   for every PR above it; only the PR that changes that path needs
   `gate_gpu.sh`.
-- **Timing noise.** `tests/entrypoints/test_stream_marker_properties.py`
-  holds wall-clock timing classes that can fail a correct tree under load.
-  A failure there is noise until a re-run reproduces it; never edit or
-  exclude the file to get a gate green.
-- **Bound every gate.** Run gates under `timeout`. A gate that failed prints
-  `GATE_CPU_RC=`; one that hung prints a pytest summary and nothing after
-  it. Never pipe a gate or a lint into `tail`: capture each exit status
-  separately. The MANUAL entries in `cpu_gate_exclude.txt` are
-  load-bearing: each one hangs the tier.
+- **Timing noise.** `scripts/compass/README.md` ("A red CPU gate that may
+  not be your diff") covers one timing class in
+  `tests/entrypoints/test_stream_marker_properties.py`;
+  `TestNoSizeAtWhichACallStopsBeingOne` in the same file behaves the same
+  way and is read the same way.
+- **Bound every gate.** Run gates under `timeout`. `gate_cpu.sh` prints
+  `GATE_CPU_RC=` on every exit, pass or fail; a run that shows a pytest
+  summary and no such line hung.
