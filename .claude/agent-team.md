@@ -88,18 +88,20 @@ own `gh` login. Ownership is the assignee:
   code compares the hook options under Decided in its Dev record before
   building.
 - **Production reachability.** Code a PR adds or changes outside `tests/`
-  must run from a production entry point under some production
-  configuration. Code only tests reach, including code a test installs by
-  monkeypatch or assignment (as `wrap_encode` / `wrap_decode` in
+  must run from an entry point under some production configuration. For
+  `atom/` the entry points are ATOM's serving and offline engine startup,
+  Compass on or off; for `scripts/` and `tools/`, the invocation a README,
+  this file or CI documents. Code only tests reach, including code a test
+  installs by monkeypatch or assignment (as `wrap_encode` / `wrap_decode` in
   `atom/utils/compass_loop.py` were), is a violation. One exception: a
-  building-block PR may carry code its own head does not reach if it sits
-  in a `gh stack` under an approved PR that wires that code into a
-  production path, and the two land together by landing the wiring PR.
-  Plan tasks to fit: a brief that leaves code unreached names the task that
-  wires it. A reviewer traces each added or changed non-test symbol at the
-  head to a caller outside `tests/` and on up to a production entry point;
-  a violation is a required finding and blocks APPROVE until the PR wires
-  or deletes the code.
+  building-block PR may carry code its own head does not reach if it is
+  stacked under a PR that wires that code into an entry point's path. Its
+  reviewer approves it only once the wiring PR is approved, and the wiring
+  PR lands right after it, once a delta review covers its rebased head.
+  A reviewer traces each added or changed non-test symbol at the head to a
+  caller outside `tests/` and on up to an entry point; a violation is a
+  required finding and blocks APPROVE until the PR wires or deletes the
+  code.
 - **Inline comments.** `pr_state.py` and the issue-comments endpoint do not
   show inline comments (`pulls/<n>/comments`), and owners review with them.
   Read both endpoints before acting on a PR, and answer every inline
