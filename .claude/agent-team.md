@@ -22,12 +22,13 @@ working logs go in `agent_scratch/`, beside the repository.
 Several owners drive agents on this repository at once, each through their
 own `gh` login. Ownership is the assignee:
 
-- **Scope.** A `run` acts only on issues assigned to its own `gh` login,
-  the PRs that deliver them, and PRs assigned to its login: claim, review,
-  develop and land all stay inside that set. Every other open issue and PR
-  belongs to someone else; `status` may report them, nothing else touches
-  them. In a stack that holds another owner's PR, act only on your own PRs;
-  yours above theirs waits for theirs to land.
+- **Scope.** A `run` acts only on issues and PRs assigned to its own `gh`
+  login: claim, review, develop and land all stay inside that set. Every
+  other open issue and PR belongs to someone else; `status` may report
+  them, nothing else touches them. One exception: in a stack that holds
+  another owner's PR, linking, unstacking and base PATCHes may name it,
+  since they land and push nothing. Your PRs above theirs wait for theirs
+  to land.
 - **Assignee on creation.** Every issue and PR gets an assignee when it is
   created: an issue its creator's login, a PR the assignee of the issue it
   delivers (its creator's login when it delivers none). With `gh issue
@@ -37,9 +38,10 @@ own `gh` login. Ownership is the assignee:
   repos/<repo>/pulls` takes no assignee, so follow it with `POST
   repos/<repo>/issues/<pr>/assignees`. An issue or PR with no assignee is
   in no run's scope: `status` lists it, and an owner assigns it.
-- **Reassignment** takes effect at the next pass: the old owner's run stops
-  touching the issue, the new owner's run takes it over (recreating the
-  worktree from the PR branch). A push rejected during the overlap is
+- **Reassignment** moves an issue and its open PRs together, so a PR is
+  never in two runs' scope. It takes effect at the next pass: the old
+  owner's run stops touching them, the new owner's run takes them over
+  (recreating the worktree from the PR branch). A push rejected during the overlap is
   fetched and merged, never forced.
 - **`need human`** is removed by the assignee of the issue or PR that
   carries it, except an escalation
@@ -108,8 +110,8 @@ own `gh` login. Ownership is the assignee:
 - **Timing noise.** `scripts/compass/README.md` ("A red CPU gate that may
   not be your diff") covers one timing class in
   `tests/entrypoints/test_stream_marker_properties.py`;
-  `TestNoSizeAtWhichACallStopsBeingOne` in the same file behaves the same
-  way and is read the same way.
+  `TestNoSizeAtWhichACallStopsBeingOne::test_a_long_call_costs_what_it_is_and_not_its_square`
+  in the same file also times wall clock and is read the same way.
 - **Bound every gate.** Run gates under `timeout`. `gate_cpu.sh` prints
   `GATE_CPU_RC=` on every exit, pass or fail; a run that shows a pytest
   summary and no such line hung.
