@@ -11,8 +11,11 @@ Semaphore or BoundedSemaphore.
 
 What this cannot read it refuses by name rather than passing over: an
 `.acquire()` in a function that makes a clock call, a `with` item in such a
-function that resolves to no binding in the file, and a clock call reached
-through an alias. A call made through any other helper function is out of
+function that is not read as a lock, and a clock call reached through an
+alias. A `with` item is read as a lock only when it constructs one, or names
+something the file binds to a lock constructor somewhere, with
+`from threading import Lock as L` resolved. A name bound to nothing, or only to
+a parameter, a factory call or a conditional, cannot be classified. A call made through any other helper function is out of
 scope: the invariant is stated lexically.
 """
 
@@ -42,25 +45,27 @@ def _key(node) -> str | None:
     return getattr(node, "id", None) or getattr(node, "attr", None)
 
 
-def _is_lock(node) -> bool:
-    return isinstance(node, ast.Call) and _key(node.func) in LOCKS
-
-
 def check(path: str, source: str) -> tuple[list[str], list[str], list[str]]:
     """The clock call sites in `source`, the ones inside a lock, and the refusals."""
     tree = ast.parse(source)
+    locks = set(LOCKS)
     bound: dict[str, list] = {}
     for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "threading":
+            locks |= {a.asname for a in node.names if a.name in LOCKS and a.asname}
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 bound.setdefault(_key(target), []).append(node.value)
 
+    def constructs_lock(expr) -> bool:
+        return isinstance(expr, ast.Call) and _key(expr.func) in locks
+
     def is_lock(expr) -> bool | None:
-        """True or False when `expr` is read as a lock or not; None when it cannot be."""
+        """True when `expr` is read as a lock; None when it cannot be classified."""
         if isinstance(expr, ast.Call):
-            return True if _is_lock(expr) else None
-        values = bound.get(_key(expr))
-        return None if not values else any(_is_lock(v) for v in values)
+            return True if constructs_lock(expr) else None
+        values = bound.get(_key(expr), [])
+        return True if any(constructs_lock(v) for v in values) else None
 
     sites, inside, refused = [], [], []
     called = set()
@@ -165,6 +170,45 @@ def test_a_with_item_bound_to_nothing_is_refused():
     assert refused == [
         f"atom/utils/clock.py:{line}: cannot classify with item self.rt.gate"
     ]
+
+
+SEEDED = """
+from threading import Lock as Held
+
+
+class Owner:
+    def __init__(self, lock, make):
+        self.held = Held()
+        self.passed = lock
+        self.made = make()
+        self.either = Held() if lock else None
+
+    def step(self):
+        with self.{name}:
+            clock.idle(self)
+"""
+
+
+def _with_line(name):
+    return 1 + SEEDED.format(name=name).splitlines().index(f"        with self.{name}:")
+
+
+@pytest.mark.parametrize("name", ["passed", "made", "either"])
+def test_a_with_item_bound_to_no_lock_constructor_is_refused(name):
+    _, inside, refused = check("seeded.py", SEEDED.format(name=name))
+    assert inside == []
+    assert refused == [
+        f"seeded.py:{_with_line(name)}: cannot classify with item self.{name}"
+    ]
+
+
+def test_a_lock_imported_under_another_name_is_read_as_a_lock():
+    line = _with_line("held")
+    _, inside, refused = check("seeded.py", SEEDED.format(name="held"))
+    assert inside == [
+        f"seeded.py:{line + 1}: clock.idle inside with self.held (line {line})"
+    ]
+    assert refused == []
 
 
 def test_a_clock_call_through_an_alias_is_refused():

@@ -277,7 +277,6 @@ class EngineCore:
                 proc.join(timeout=5)
         self._send_engine_dead()
         logger.debug(f"{self.label}: model runner exit")
-        clock.close()
 
     def _send_engine_dead(self):
         logger.debug(f"{self.label}: send SHUTDOWN request")
@@ -299,6 +298,7 @@ class EngineCore:
             else:
                 engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
+            clock.close()
         except Exception as e:
             logger.error(f"run_engine: exception: {e}", exc_info=True)
             raise e

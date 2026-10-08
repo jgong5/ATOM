@@ -263,14 +263,27 @@ def test_get_output_idles_until_an_output_and_refuses_at_the_finish(installed):
         call(CoreManager.get_output, mgr)
 
 
-def test_the_engine_exit_refuses_to_leave_before_the_finish(installed):
-    engine = SimpleNamespace(
-        still_running=True,
-        label="engine",
-        runner_mgr=SimpleNamespace(procs=[], call_func=lambda name: None),
-        _send_engine_dead=lambda: None,
-    )
+@pytest.mark.parametrize("loop_raises", [False, True])
+def test_an_engine_leaving_before_the_finish_is_refused_unless_it_raised(
+    monkeypatch, installed, loop_raises
+):
+    """A loop that returns at 3.0 is refused; a loop that raised keeps its own error."""
+
+    def busy_loop(self):
+        if loop_raises:
+            raise ValueError("the loop's own error")
+
+    monkeypatch.setattr(EngineCore, "_setup_engine_process", lambda name: None)
+    monkeypatch.setattr(EngineCore, "__init__", lambda self, *args: None)
+    monkeypatch.setattr(EngineCore, "busy_loop", busy_loop)
+    monkeypatch.setattr(EngineCore, "exit", lambda self: None)
     clock.install(LPRuntime(LpId("engine"), TABLE, conn=None))
     clock.installed().now = 3.0
-    with pytest.raises(RuntimeError, match="left its loop at 3.0"):
-        EngineCore.exit(engine)
+    config = SimpleNamespace(
+        pipeline_parallel_size=1, parallel_config=SimpleNamespace(data_parallel_size=1)
+    )
+    error, match = (
+        (ValueError, "own error") if loop_raises else (RuntimeError, "left its loop")
+    )
+    with pytest.raises(error, match=match):
+        EngineCore.run_engine(config, "in", "out")
