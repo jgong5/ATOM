@@ -57,15 +57,15 @@ Q1–Q6 已收敛，最新的功能验收要求取代此前的冻结数值迁移
 | 约束 | 实现事实 | 设计影响 |
 | --- | --- | --- |
 | 后端契约 | `backends/base.py`：`tier`、`estimate(batch_view)`、`describe()` | 实现一个普通 CostBackend 即可 |
-| 输入 | `RequestShape(query_tokens, context_tokens, decode)`，加 batch 的 `capture_rung` | 保留请求顺序和逐请求形状 |
+| 输入 | `RequestShape(query_tokens, context_tokens, decode)`，加 batch 的 `capture_rung` 与 `max_tokens_across_dp` | 保留请求顺序和逐请求形状；DP 组的最大 token 数供 MoE 段计价，单 rank 时为 None |
 | 成本组织 | `StepCost` 总量只能由有限、非负、名称唯一的 terms 相加得到 | 完整 forward 用一个 term；负残差不能成为独立计费项 |
 | 依赖边界 | backend 包的测试禁止导入其他 `atom.*` 包 | EngineCore、配置、ArtifactStore 的装配代码放在 backend 包外 |
-| Runner | `NonAllocatingRunner.forward()` 只有调度记录和占位输出 | 新 backend 不会自动参与 serving |
+| Runner | `NonAllocatingRunner.forward()` 用 `install_cost_backend()` 装上的后端为本 rank 批次计价，无后端则按名拒绝该 step | 后端已在 serving 路径上；从 flag 或配置字段选择后端仍属配置面，尚未接 |
 | 投影 | `project(batch, seqs, runner)` 需要 scheduler 的 seqs | worker 仅收到 batch，不能直接调用现有完整投影 |
 | graph 元数据 | Compass 的 capture 替换保留原生 eager fallback `[0]` | 不能把它当成目标 GPU 的真实 capture ladder |
-| 输出协议 | `ScheduledBatchOutput` 没有 duration；输出可能滞后一轮产出输出的 step | 不把 RPC 返回改成 `(output, cost)`，不改变 token 延迟状态机 |
-| 平台限制 | 当前 projection 拒绝 DP>1；PP prefill 有历史校验限制；Runner 拒绝 speculation | 新成本模型不能顺带宣称这些场景已支持 |
-| 时间装配 | 没有完整的 runtime 安装、engine step 计费与 idle NER 调用链 | 时间接线必须包含初始化和空闲推进，不能只加一次 `advance_to()` |
+| 输出协议 | `ScheduledBatchOutput.predicted_s` 携带本 step 秒数，真实 forward 留 `None`；输出仍可能滞后一轮产出输出的 step | 成本随 reply 回传而非改成 `(output, cost)`，token 延迟状态机不变 |
+| 平台限制 | projection 跑真实 `sync_dp_metadata`，DP>1 的计价已支持；PP stage 计价明确拒绝；Runner 拒绝 speculation | 新成本模型不能顺带宣称未支持场景已覆盖；MTP 另见 §5 |
+| 时间装配 | 每步 TAR 经 `clock.charge(reply)`、空闲点 NER 经 `clock.idle()` 已接入三个 step loop；生产入口的 `LPRuntime` 安装仍缺 | 时间接线的推进部分已具备，仍需初始化链路与 §9.3 的故障收尾 |
 
 关键代码：[契约](../../../atom/compass/backends/base.py)、[成本](../../../atom/compass/backends/cost.py)、[投影](../../../atom/compass/runner/projection.py)、[Runner](../../../atom/compass/runner/overrides.py)、[EngineCore](../../../atom/model_engine/engine_core.py)、[输出状态机](../../../atom/compass/runner/step_output.py)。
 
@@ -466,7 +466,7 @@ A1 的成员有两类入组理由：进入特征计算（前五项），以及�
 
 现有 `wait_out=True` 只接收 primary output，并不收齐八个 rank 的 forward 计时；forward 也不在全 rank barrier RPC 列表中。TP 组耗时必须来自已汇总的 profile，不能用这次 rank0 RPC 的真实返回时间替代。
 
-最小接点优先考虑 EngineCore：它在 `schedule()` 返回后同时持有 `scheduled_batch` 和 `seqs`，随后阻塞等待现有 `forward` RPC，最后调用 scheduler postprocess。这里可复用 `request_rows()`，避免把整个 Sequence 或新增复杂投影协议传给 worker。
+计价接点已经落在 runner 上：`install_cost_backend()` 把后端装到 `NonAllocatingRunner`，`forward()` 为本 rank 批次定价，成本经 `ScheduledBatchOutput.predicted_s` 随 reply 回到 engine，再由 `clock.charge(reply)` 推进逻辑时钟。EngineCore 不另行构造 `BatchView`，也不显式调用 `advance_to`；它仍持有 `scheduled_batch` 与 `seqs`，这一位置留给 §9.4 的两个 CPU 区段。
 
 ```mermaid
 flowchart LR
@@ -498,8 +498,8 @@ schedule()
 ### 9.2 不可省略的接线工作
 
 - 在 EngineCore 构造 queue/socket 前安装所需 `LPRuntime`、LP 身份及通道配置；晚装可能已错过包装器创建。
-- busy step 使用 owner thread 的 `advance_to(start + duration)`。backend 自身不调用时钟，也不真实 sleep。
-- idle step 接上 NER，处理下一请求、KV 完成和结束事件；只加 busy TAR 会留下唤醒和终止缺口。
+- ~~busy step 推进逻辑时间~~：已由 `clock.charge(reply)` 接入，判据是 reply 是否带 `predicted_s`。backend 自身不调用时钟，也不真实 sleep。
+- ~~idle step 接上 NER~~：已由 `clock.idle(deadline, t_daemon)` 接入 `EngineCore`、`DPEngineCoreProc` 与 PP head 三个 step loop；`EngineCore._idle_deadline` 在有 KV 活时给出一个 drain interval 的前瞻，否则 `+inf`，而 `+inf` 的 grant 读作关机。
 - 明确时间消费者在 engine，避免 worker 和 engine 对同一 forward 重复推进；多 member 的 TAR 需要相同目标，CA 不自动替各 member 求最大值。
 - 在 EngineCore 一侧持有目标执行声明；有目标 graph ladder 时核对其合法性并复用 `ForwardMode.decide` 的 DP1 规则。保持占位 worker 的真实 `[0]` 不变；不能把不存在的真实 capture 写进 worker 状态。未提供历史 ladder 不阻塞不依赖 rung 的配方，未知状态和近似需随运行记录保留。
 - 目标 ladder 必须符合目标 `max_num_seqs`、token budget、query width 和 graph 模式；已知 eager／replay 冲突不能直接套用另一模式的数字。目标声明与历史测量的匹配尚未验证时按 §8.4 记录。内存读数的 graph reservation 也来自同一目标输入。
@@ -514,7 +514,7 @@ schedule()
 
 | 时间来源／事件 | 已有机制 | 当前接入状态 |
 | --- | --- | --- |
-| 批次 forward 完成 | 后端可提供 `StepCost`，owner 可申请 `advance_to(start + duration)` | 普通 EngineCore 尚无估价与消费接点，属于本次首版待实现内容 |
+| 批次 forward 完成 | runner 用已安装后端定价，经 `predicted_s` 回传，`clock.charge(reply)` 推进 | 已接入；仍缺生产入口的 `LPRuntime` 安装 |
 | 请求、控制消息与输出消息到达 | send stamp 记录到达时刻，接收方通过 grant 释放消息；空闲等待可以推进到该时刻 | channel／socket 包装已存在；完整 runtime 启动链尚未装配 |
 | tokenization／detokenization 完成 | `wrap_encode`／`wrap_decode` 按固定成本与 token 速率计价；owner 直接推进，station job 则先累计成本、再安排完成定时器 | 包装器和 station 已存在，生产 tokenizer 尚未绑定这些包装器；不是宿主耗时自动测量 |
 | event-loop 定时器与 owner socket 的有期限等待 | `CompassSelector` 和 inline `WrappedSocket.poll()` 调用 NER | 需要预先安装并启动 runtime；API 已有条件性选择入口，但不负责 runtime 安装 |
@@ -607,7 +607,7 @@ Q7 继续要求估时拒绝时终止本次运行。若 Q8 启用 CPU 实测，�
 | 输出队列改为 `clock.relay_queue(...)` | owner 入队时记录逻辑发送时间，发送线程保留该时间戳 |
 | 初始化时调用 `clock.name_endpoints(...)` | 登记请求、控制、输出及配置中的其他通道地址 |
 
-无 runtime 时，上述入口使用原生时钟、队列和 ZMQ 行为。普通 `_process_engine_step()` 与 `_process_engine_step_inner()` 相对该基点没有改动，当前没有 schedule／postprocess 实测，也没有 forward 估价或对应的时间推进。文件中 prefill／decode 分离路径已有两对 `perf_counter()`，用途是原生 forward RPC 的耗时日志，并非 CPU 分段计费。当前生产入口仍未完成 `LPRuntime` 构造和安装。
+无 runtime 时，上述入口使用原生时钟、队列和 ZMQ 行为。此后三个提交改变了这张表之后的状态：后端安装到 runner、每步成本写进 `ScheduledBatchOutput.predicted_s`、以及三个 step loop 的 TAR／NER 钩子。因此 forward 估价与对应的时间推进**已经存在**，EngineCore 侧新增的是 `clock.idle()` 调用、`_idle_deadline` 与 `busy_loop` 返回后的 `clock.close()`。仍然没有的是 schedule／postprocess 实测（§9.4）、生产入口的 `LPRuntime` 构造与安装，以及 §9.3 的故障收尾。文件中 prefill／decode 分离路径已有两对 `perf_counter()`，用途是原生 forward RPC 的耗时日志，并非 CPU 分段计费。
 
 推荐保留原生方法调用与分支，在 Compass 集成适配层实现一个小型测时工具，集中处理启用条件、真实单调计时、输入提供的比例因子、记录及 owner 时间推进。EngineCore 仅在以下位置接入：
 
@@ -850,9 +850,11 @@ Compass 相关测试的执行在根 conftest 导入 `torch` 时失败，系统 P
 
 1. **目标快照与校准包格式**：定义 `CostTargetSnapshot` 的版本化字段、manifest schema、A1/A2/B/C 四级校验，以及 grid 的 `axis` 声明。在 MachineSpec 中新增 `device.compute.compute_units`（属实现改动，与代码同期进行）。
 2. **查表／恢复与 `TableResidualBackend`**：以 `corrections: []`、`ensemble: null` 的基础模式交付，验证输入映射、Decode 的 graph 模式轴分派、来源记录、毫秒到秒的单位边界与 Q4 拒绝路径。此阶段不导入 sklearn／CatBoost。
-3. **时钟闭环与运行记录**：engine 的目标执行元数据、LP 安装、busy／idle 推进、§9.3 的失败收尾，以及增量落盘的运行记录（默认 `summary`）。CPU 计时先取 `off`。
+3. **时钟闭环与运行记录**：busy TAR 与 idle NER 已由 `clock.charge` 和 `clock.idle` 接入，本步补齐其余部分——生产入口的 `LPRuntime` 构造与安装、engine 的目标执行元数据、§9.3 的失败收尾，以及增量落盘的运行记录（默认 `summary`）。CPU 计时先取 `off`。
 
 P1 结束时可以跑通合成闭环并产出指标。它真正做到"换目标只改输入"——这一承诺在查表层成立，在残差层不成立。
+
+后端安装、每步计价与时钟推进的接线已经存在：`install_cost_backend()` 把后端装到 runner，`NonAllocatingRunner.forward()` 为本 rank 批次定价并对 DP 组取最大值，成本经 `ScheduledBatchOutput.predicted_s` 回传，`clock.charge(reply)` 与 `clock.idle()` 分别承担 TAR 和 NER。因此 P1 的工作是把 `TableResidualBackend` 接到这个已有的位置上，而不是重建接线。
 
 ### P2：CPU 区段计时
 
