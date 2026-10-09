@@ -405,6 +405,29 @@ def test_no_finish_grant_goes_out_when_the_last_cannot_be_framed(
     assert released == [0, 2]
 
 
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+@pytest.mark.parametrize(
+    "closing, named", [("frontend", "frontend"), ("dp1", "engine member dp1")]
+)
+def test_a_connection_closed_mid_run_ends_it_for_every_pending_call(
+    served, endpoint, closing, named
+):
+    ca = _joined()
+    endpoint = served(ca, endpoint).endpoint
+    conns = {"frontend": connect(FRONTEND, endpoint)}
+    conns.update((rank, connect(ENGINE, endpoint, rank)) for rank in RANKS)
+    pending = []
+    for name, conn in conns.items():
+        if name != closing:
+            _result(_later(conn.send, (NER, INF, [], INF)))
+            pending.append(_later(conn.recv))
+    conns[closing].close()
+    for box in pending:
+        with pytest.raises(ClockAbort, match=f"^{named} closed its connection") as e:
+            _result(box)
+        assert e.value.table == ca.lp_table()
+
+
 def test_a_log_behind_its_receiver_is_refused(served):
     endpoint = served(ClockAuthority(_table())).endpoint
     a, b = connect(A, endpoint), connect(B, endpoint)

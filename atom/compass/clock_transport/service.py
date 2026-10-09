@@ -16,7 +16,9 @@ requester's `recv` raises it as the same type, and the loop goes on serving. A
 bound address's slot, waiting or not, and answers every later request. Any other
 exception from the authority, or while framing a reply, ends the run the same
 way, as a `ClockAbort` that names it; its table is empty when the LP table
-cannot be read or framed.
+cannot be read or framed. So does a bound connection that closes before the
+``+inf`` finish, as a `ClockAbort` naming its address: no finish can come
+without it.
 
 Only frames reach the loop: a carrier hands the serve side encoded frames and
 the serve side decodes them onto the queue, so the in-process carrier here moves
@@ -92,6 +94,10 @@ class _Server:
             )
         self._requests.put((address, message))
 
+    def _closed(self, address) -> None:
+        """The connection bound to `address` closed."""
+        self._requests.put((address, None))
+
     def close(self) -> None:
         """Stop the loop and give up the endpoint."""
         if _SERVED.get(self.endpoint) is self:
@@ -102,10 +108,19 @@ class _Server:
     def _loop(self) -> None:
         ended = None  # the refusal frame that ended the run, once one has
         while (item := self._requests.get()) is not None:
-            address, (kind, t, log, t_daemon) = item
+            address, request = item
             lp, member = address if isinstance(address, tuple) else (address, None)
             replies = [(address, ended)]
-            if ended is None:
+            if request is None:
+                replies = []
+                if ended is None:
+                    name = f"{lp} member {member}" if member else f"{lp}"
+                    ended = self._ending(
+                        f"{name} closed its connection, so the run ends here"
+                    )
+                    replies = [(i, ended) for i in list(self._slots)]
+            elif ended is None:
+                kind, t, log, t_daemon = request
                 try:
                     try:
                         grants = self._authority.on_request(
@@ -124,13 +139,17 @@ class _Server:
             for i, frame in replies:
                 self._slots[i].put(frame)
 
-    def _ending(self, fault: Exception) -> bytes:
-        """The refusal frame that ends the run on `fault`. Any fault but a
-        `ClockAbort` travels as one naming it, with the LP table, or with an
-        empty table naming why the table could not be read or framed."""
+    def _ending(self, fault: Exception | str) -> bytes:
+        """The refusal frame that ends the run on `fault`, an exception or a
+        reason. Anything but a `ClockAbort` travels as one naming it, with the
+        LP table, or with an empty table naming why the table could not be read
+        or framed."""
         if isinstance(fault, ClockAbort):
             return encode(_refusal(fault))
-        reason = f"the clock authority raised {fault!r}"
+        if isinstance(fault, str):
+            reason = fault
+        else:
+            reason = f"the clock authority raised {fault!r}"
         try:
             return encode(_refusal(ClockAbort(reason, self._authority.lp_table())))
         except Exception as unread:  # noqa: BLE001 - the run still ends, named
@@ -173,7 +192,8 @@ class _Connection:
         return g, released
 
     def close(self) -> None:
-        """Nothing to release: the reply slot is the LP's, not the connection's."""
+        """Tell the serve loop, as the end of a socket does; that ends the run."""
+        self._server._closed(self._lp)
 
 
 def serve(authority, endpoint: str = DEFAULT_ENDPOINT) -> _Server:
