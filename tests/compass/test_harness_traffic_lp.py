@@ -55,7 +55,6 @@ from compass_harness.router import CompassCreditRouter
 from compass_harness.scheduler import ClockPacedLoopScheduler
 from compass_harness.traffic_lp import (
     HTTP,
-    RUN_ENV,
     STREAM,
     TrafficLP,
 )
@@ -63,6 +62,7 @@ from compass_harness.transport import addresses, credit_key
 
 from atom.compass import clock_transport
 from atom.compass.clock import NER, ClockAuthority, LpId, single_engine_table
+from atom.compass.run import ENV as RUN_ENV
 from atom.utils.clock import LPRuntime
 from compass_harness import ADDRESS_ENV, fingerprint
 
@@ -188,7 +188,7 @@ def ca(tmp_path, monkeypatch):
     server = clock_transport.serve(ClockAuthority(TABLE), endpoint)
     clock_transport.connect(ENGINE, endpoint).send((NER, INF, [], INF))
     run_file = tmp_path / "run.json"
-    run_file.write_text(json.dumps({"clock_endpoint": endpoint, **RUN}))
+    run_file.write_text(json.dumps({"clock_endpoint": endpoint, "bound_s": 1e6, **RUN}))
     monkeypatch.setenv(RUN_ENV, str(run_file))
     monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / "lp"))
     monkeypatch.setattr(ClockPacedLoopScheduler, "clock", None)
@@ -322,6 +322,61 @@ def test_a_return_before_or_after_its_final_release_schedules_from_the_final(
     assert sends == {0: 0.0, 1: 1.0 + DELAY}
     # Nothing asks for time between the release and the return.
     assert calls[:2] == [INF, 1.0 + DELAY]
+
+
+@pytest.mark.parametrize("order", ["before", "after"])
+def test_an_errored_return_counts_its_released_final_as_returned(order, tmp_path):
+    """aiohttp can raise after ``[DONE]``: the return carries an error although
+    the final event was reported. Either side of the release, it is passed once
+    and the run reaches the finish."""
+
+    async def main():
+        rt = ScriptedRuntime([(1.0, {0})])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        passed = []
+
+        async def on_return(worker_id, ret):
+            passed.append(ret.credit.id)
+
+        held = traffic.hold(on_return)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(addresses(str(tmp_path / "lp"))[1])
+        traffic.send(_key(0))
+        push.send_pyobj((_key(0), 0, 1.0, True))
+        if order == "after":
+            while rt.now < 1.0 or 0 not in traffic._reports:
+                await asyncio.sleep(0.001)
+        error = SimpleNamespace(credit=_credit(0), error="ClientPayloadError")
+        await held("worker_0", error)
+        traffic.finish()
+        await asyncio.wait_for(traffic.done, 5)
+        push.close(linger=0)
+        return passed, rt.calls
+
+    passed, calls = _run(main())
+    assert passed == [0] and calls == [INF, INF]
+
+
+def test_a_raising_return_callback_does_not_stop_later_returns(tmp_path, caplog):
+    async def main():
+        traffic = TrafficLP(ScriptedRuntime([]), str(tmp_path / "lp"))
+        passed = []
+
+        async def on_return(worker_id, ret):
+            passed.append(ret.credit.id)
+            if ret.credit.id == 0:
+                raise RuntimeError("boom")
+
+        held = traffic.hold(on_return)
+        for num in (0, 1):
+            await held("w", SimpleNamespace(credit=_credit(num), error="refused"))
+        while len(passed) < 2:
+            await asyncio.sleep(0.001)
+        traffic.done.cancel()
+        return passed
+
+    assert _run(main()) == [0, 1]
+    assert "a return callback raised" in caplog.text
 
 
 def test_a_second_send_credit_call_site_refuses_the_package(tmp_path):

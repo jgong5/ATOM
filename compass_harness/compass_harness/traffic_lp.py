@@ -17,23 +17,20 @@ works on the wall clock and the simulation waits for it.
 """
 
 import asyncio
-import json
 import logging
 import math
 import os
-from pathlib import Path
 
 import zmq
 import zmq.asyncio
 
 from atom.compass import clock_transport
-from atom.compass.clock import LpId, single_engine_table
+from atom.compass import run as compass_run
+from atom.compass.clock import LpId
 from atom.utils.clock import DIAG_S, LPRuntime
 from compass_harness import ADDRESS_ENV
 from compass_harness.transport import addresses, credit_key
 
-#: The run file every process of the simulated deployment reads.
-RUN_ENV = "ATOM_COMPASS_RUN"
 HTTP = "traffic->frontend:http"
 STREAM = "frontend->traffic:stream"
 TRAFFIC = LpId("traffic")
@@ -61,7 +58,8 @@ class TrafficLP:
         self.open: dict[tuple, None] = {}  # sent, return not yet passed to aiperf
         self._reports: dict[int, tuple] = {}  # stream seq -> (key, final)
         self._handled: set[int] = set()
-        self._held: dict[tuple, object] = {}  # key -> its return, for aiperf
+        # key -> its return, for aiperf; None once passed
+        self._held: dict[tuple, object] = {}
         self._returns: asyncio.Queue = asyncio.Queue()  # passed in order, as upstream
         self._waiters: list[tuple[float, asyncio.Future]] = []
         self._finishing = False
@@ -74,22 +72,19 @@ class TrafficLP:
 
     @classmethod
     def from_env(cls) -> "TrafficLP":
-        """Join the run the deployment's run file at ``ATOM_COMPASS_RUN`` describes:
-        its Clock Authority at ``clock_endpoint`` and its channel table."""
-        path = os.environ.get(RUN_ENV)
-        if not path:
+        """Join the run the deployment's run file describes: its Clock Authority
+        at ``clock_endpoint`` and its channel table."""
+        run = compass_run.spec()
+        if run is None:
             raise RuntimeError(
-                f"{RUN_ENV} is not set: the traffic LP has no run file naming the "
-                "Clock Authority and the channel table."
+                f"{compass_run.ENV} is not set: the traffic LP has no run file naming "
+                "the Clock Authority and the channel table."
             )
-        run = json.loads(Path(path).read_text())
-        table = single_engine_table(
-            admission_path=run["admission_path"],
-            ipc_s=run["ipc_s"],
-            stream_s=run["stream_s"],
-        )
         conn = clock_transport.connect(TRAFFIC, run["clock_endpoint"])
-        return cls(LPRuntime(TRAFFIC, table, conn), os.environ[ADDRESS_ENV])
+        return cls(
+            LPRuntime(TRAFFIC, compass_run.channel_table(run), conn),
+            os.environ[ADDRESS_ENV],
+        )
 
     # ---- the clock ClockPacedLoopScheduler paces on ----
 
@@ -119,10 +114,12 @@ class TrafficLP:
             credit = message.credit
             key = credit_key(credit.phase, credit.phase_index, credit.id)
             if message.error is not None:
-                # No final event will come; the key stays open and the finish names it.
+                # Passed now, as upstream. A released final event counts as its
+                # return; with none, the key stays open and the finish names it.
                 self._returns.put_nowait(lambda: callback(worker_id, message))
-                return
-            self._held[key] = lambda: callback(worker_id, message)
+                self._held[key] = None
+            else:
+                self._held[key] = lambda: callback(worker_id, message)
             self._changed.set()
 
         return held
@@ -149,7 +146,11 @@ class TrafficLP:
 
     async def _pass_returns(self) -> None:
         while True:
-            await (await self._returns.get())()
+            ret = await self._returns.get()
+            try:
+                await ret()
+            except Exception:  # upstream loses that one return, not the rest
+                logger.exception("traffic: a return callback raised")
 
     async def _own(self) -> None:
         while True:
@@ -182,7 +183,8 @@ class TrafficLP:
                 self._handled.add(seq)
                 if final:
                     self.open.pop(key, None)
-                    self._returns.put_nowait(self._held.pop(key))
+                    if (ret := self._held.pop(key)) is not None:
+                        self._returns.put_nowait(ret)
             if unreported or unreturned:
                 self._changed.clear()
                 try:
