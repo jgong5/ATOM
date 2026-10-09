@@ -383,12 +383,11 @@ class CompassSelector(selectors.DefaultSelector):
                         else "a released request is read and not handled"
                     )
                 )
+                wall = time.monotonic()
                 if self.stall is None or self.stall[0] != what:
-                    self.stall = (what, time.monotonic() + rt.diag_s)
+                    self.stall = (what, wall + rt.diag_s)
                 warn_at = self.stall[1]
-                ready = super().select(
-                    None if warn_at is None else warn_at - time.monotonic()
-                )
+                ready = super().select(None if warn_at is None else warn_at - wall)
                 if ready:
                     return ready
                 if warn_at is not None:
