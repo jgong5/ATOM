@@ -14,6 +14,10 @@ the next turn is scheduled from the final arrival either way), and every task
 on the loop is waiting on something. It asks for time only while a request is
 open, a pacing timer is pending or the run is finishing; between phases aiperf
 works on the wall clock and the simulation waits for it.
+
+A request that errors mid-stream never reports the events after its last read.
+When released events stay unreported for ``DIAG_S`` wall seconds while an
+errored request is still open, the hold fails, naming those requests.
 """
 
 import asyncio
@@ -41,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 class UnansweredRequests(RuntimeError):
-    """The run finished with requests that never had their final response."""
+    """Requests that never had their final response."""
 
 
 class TrafficLP:
@@ -190,6 +194,14 @@ class TrafficLP:
                 try:
                     await asyncio.wait_for(self._changed.wait(), DIAG_S)
                 except TimeoutError:
+                    # An errored return leaves its key open with no return to pass.
+                    errored = [k for k, ret in self._held.items() if ret is None]
+                    if unreported and errored:
+                        raise UnansweredRequests(
+                            f"requests {errored} failed mid-stream: released stream "
+                            f"seqs {unreported} were not reported after {DIAG_S} wall "
+                            "seconds"
+                        ) from None
                     logger.warning(
                         "traffic at %s: released stream seqs %s not reported, returns "
                         "of %s not received after %s wall seconds; still waiting",
