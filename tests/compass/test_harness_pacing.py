@@ -450,6 +450,47 @@ def test_a_phase_end_cancel_with_a_timer_pending_leaves_the_clock_wait_whole(
 
 
 @pytest.mark.parametrize(
+    "earlier, expected",
+    [
+        (
+            lambda scheduler, turn: scheduler.schedule_later(1.0, turn("due +1")),
+            [("due +1", 1.0), ("due +5", 5.0)],
+        ),
+        (
+            lambda scheduler, turn: scheduler.cap_pending_delay(1.0),
+            [("due +5", 1.0)],
+        ),
+    ],
+    ids=["armed", "capped"],
+)
+def test_a_timer_due_before_the_driver_wait_starts_at_its_own_time(
+    earlier, expected, monkeypatch
+):
+    """A timer armed, or capped, earlier than the time the driver already waits for."""
+
+    async def main():
+        clock = GrantingClock()
+        monkeypatch.setattr(ClockPacedLoopScheduler, "clock", clock)
+        scheduler = ClockPacedLoopScheduler()
+        started = []
+
+        async def turn(name):
+            started.append((name, clock.now() - T0))
+
+        scheduler.schedule_later(5.0, turn("due +5"))
+        await asyncio.sleep(0)
+        assert [t for t, _ in clock.waits] == [T0 + 5.0]
+        earlier(scheduler, turn)
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if clock.waits:
+                clock.grant()
+        return started
+
+    assert asyncio.run(main()) == expected
+
+
+@pytest.mark.parametrize(
     "option, name",
     [
         ({"seamless": True}, "seamless"),

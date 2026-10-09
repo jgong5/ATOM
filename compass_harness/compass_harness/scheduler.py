@@ -32,7 +32,10 @@ class ClockPacedLoopScheduler(LoopScheduler):
     ``clock`` is bound before the first phase runner is built. It has
     ``now()``, the current time in seconds, and ``async advance_to(t)``, which
     returns once the clock may run to ``t``; it may return earlier, at a time
-    something else is due, and the scheduler then asks again.
+    something else is due, and the scheduler then asks again. Each grant wakes
+    every pending wait. A timer armed or capped earlier than the time the driver
+    waits for is asked for in a wait of its own, and the driver's wait stays
+    pending: cancelling it would cancel a future the clock holds.
     """
 
     clock = None
@@ -46,6 +49,9 @@ class ClockPacedLoopScheduler(LoopScheduler):
         super().__init__(*args, **kwargs)
         self._clock = self.clock
         self._driver: asyncio.Task | None = None
+        # While the driver waits on the clock: the earliest time asked since.
+        self._waiting_for: float | None = None
+        self._asks: set[asyncio.Task] = set()
 
     def schedule_later(self, delay_sec, coro, *, group_id=None):
         if delay_sec <= 0:
@@ -54,7 +60,18 @@ class ClockPacedLoopScheduler(LoopScheduler):
         handle_id = self._track_handle_and_return_id(timer, coro, group_id=group_id)
         if self._driver is None or self._driver.done():
             self._driver = self._loop.create_task(self._drive())
+        self._ask_earlier(timer.at)
         return handle_id
+
+    def _ask_earlier(self, at: float) -> None:
+        """Ask the clock for ``at`` beside the driver's wait for a later time."""
+        if self._waiting_for is None or at >= self._waiting_for:
+            return
+        self._waiting_for = at
+        # Not execute_async: cancel_all would cancel the wait the clock holds.
+        ask = self._loop.create_task(self._clock.advance_to(at))
+        self._asks.add(ask)
+        ask.add_done_callback(self._asks.discard)
 
     def _wall_clock(self, *args, **kwargs):
         raise NotImplementedError(
@@ -87,6 +104,7 @@ class ClockPacedLoopScheduler(LoopScheduler):
             return 0.0
         for t in timers:
             t.at -= shift
+        self._ask_earlier(self._clock.now() + max_delay_sec)
         return shift
 
     async def _drive(self) -> None:
@@ -96,7 +114,9 @@ class ClockPacedLoopScheduler(LoopScheduler):
         while self._handles:
             timer, coro = min(self._handles.values(), key=lambda entry: entry[0].at)
             if timer.at > self._clock.now():
+                self._waiting_for = timer.at
                 await self._clock.advance_to(timer.at)
+                self._waiting_for = None
             else:
                 self._safe_callback([timer], coro)
             await asyncio.sleep(0)
