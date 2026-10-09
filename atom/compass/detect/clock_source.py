@@ -174,6 +174,8 @@ _KEPT_REAL = (
      "K9", "the process shutdown grace period, after the simulated window", 2),
     ("atom/utils/backends.py", "compile", "time.time", "K9", _COMPILE, 3),
     ("atom/utils/backends.py", "__call__", "time.time", "K9", _COMPILE, 1),
+    ("atom/utils/compass_loop.py", "select", "time.monotonic", "K9",
+     "times a stall's diagnostic in wall seconds; the LP clock stands still", 1),
     ("atom/utils/decorators.py", "start_monitoring_torch_compile", "time.time",
      "K9", _COMPILE, 1),
     ("atom/utils/gc_utils.py", "_log", "time.perf_counter", "K9", _LOG_ONLY, 2),

@@ -37,6 +37,7 @@ from atom.compass.runner.overrides import (
     RunnerRefusal,
     install_cost_backend,
 )
+from atom.compass.runner.step_output import DeferredTokenStream
 from atom.model_engine.scheduler import ScheduledBatch, Scheduler
 from atom.model_engine.sequence import (
     Sequence,
@@ -98,6 +99,7 @@ def runner(backend, dp_size=1, dp_rank=0):
     )
     r.rank, r.label, r.block_size = 0, f"dp{dp_rank}", BLOCK
     r.capture_sizes_np, r.enforce_eager = np.array([0], dtype=np.int32), True
+    r._token_stream = DeferredTokenStream([0])
     if backend is not None:
         install_cost_backend(r, backend)
     return r
