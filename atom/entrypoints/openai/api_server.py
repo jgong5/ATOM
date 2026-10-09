@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from PIL import Image
 
 from atom import SamplingParams
+from atom.compass import run as compass_run
 from atom.compass.carriers import stamp_events, tracestate_stamp
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
@@ -2532,7 +2533,15 @@ def main():
         default=None,
         help="Path to JSONL file for logging all API requests and responses (debug)",
     )
+    parser.add_argument(
+        "--compass-run",
+        type=str,
+        default=None,
+        help=f"Compass run file: serve a simulated run (sets {compass_run.ENV})",
+    )
     args = parser.parse_args()
+    if args.compass_run:
+        os.environ[compass_run.ENV] = args.compass_run
 
     if args.request_log:
         _request_logger = logging.getLogger("atom.request_log")
@@ -2634,14 +2643,19 @@ def main():
     logger.info(
         f"Starting server on {args.host}:{args.server_port} (loop={loop_impl})..."
     )
-    uvicorn.run(
-        _served_app(),
-        host=args.host,
-        port=args.server_port,
-        loop=loop_impl,
-        access_log=not args.disable_uvicorn_access_log,
-        timeout_keep_alive=args.timeout_keep_alive,
-    )
+    try:
+        uvicorn.run(
+            _served_app(),
+            host=args.host,
+            port=args.server_port,
+            loop=loop_impl,
+            access_log=not args.disable_uvicorn_access_log,
+            timeout_keep_alive=args.timeout_keep_alive,
+        )
+    except RuntimeError:
+        # A simulated run's loop stops at its finish, before uvicorn's task ends.
+        if not compass_run.frontend_done(engine):
+            raise
 
 
 def _served_app():
