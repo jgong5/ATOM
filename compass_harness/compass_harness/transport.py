@@ -156,10 +156,10 @@ class CompassTransport(AioHttpTransport):
                 message=f"request {request_info.x_request_id} (credit {key}): the "
                 "stream ended without a stamped [DONE] event",
             )
-        # Every time aiperf derives a latency from is a stamp; the readings with
-        # none (response headers, the worker's credit drop) are dropped.
+        # Every time aiperf derives a latency or the run's duration from is a stamp;
+        # the readings with none (response headers, the credit drop) are dropped.
         record.responses = stamped
-        record.start_perf_ns = _ns(sent)
+        record.timestamp_ns = record.start_perf_ns = _ns(sent)
         record.end_perf_ns = stamped[-1].perf_ns if stamped else record.start_perf_ns
         record.recv_start_perf_ns = request_info.drop_perf_ns = None
         return record
