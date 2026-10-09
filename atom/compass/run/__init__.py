@@ -239,6 +239,6 @@ def frontend_done(llm_engine) -> bool:
     # A refused command leaves ATOM's half of it applied, so what ran after it
     # was not the deployment simulated.
     summary["coverage_report"] = any(r.startswith("command:") for r in reasons)
-    (out / STEP_TABLE_FILE).write_text(a.steps.text() + "\n")
+    (out / STEP_TABLE_FILE).write_text(a.steps.text())
     (out / SUMMARY_FILE).write_text(json.dumps(summary, sort_keys=True, indent=1))
     return True
