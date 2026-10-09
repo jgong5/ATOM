@@ -33,7 +33,23 @@ PINNED = {
     "aiperf.transports.aiohttp_client:AioHttpClient._request": "0435fa598b8182cb0c52d2e9fd35ede3d45af6e469361572d91bc06212abe9a5",
     "aiperf.common.models.record_models:SSEMessage.parse": "eb6bb061a28675669699fa2f34c7a2e5a0b1b968c27d9ef0df109ada64ab3f9b",
     "aiperf.workers.inference_client:InferenceClient._finalize_request_record": "fbe74fd8a5d4754cbe295bb17f187e961da1c958dc746c2e75f8c383823c324b",
+    # CompassCreditRouter: the stamp on the one send, the hold on the one return
+    # path, the worker wait, the finish, and the manager that builds the router.
+    "aiperf.credit.sticky_router:StickyCreditRouter.__init__": "fba91c833a57f0eaabb3b8ba458bb1de7dda142db147c121cd33660b983cbdd8",
+    "aiperf.credit.sticky_router:StickyCreditRouter.send_credit": "458eeb8e5eea035abc9fc15f4af3ace27a792e76bec6a93a697c0be589ef60f6",
+    "aiperf.credit.sticky_router:StickyCreditRouter.set_return_callback": "4debf458e16ad7f804e0700572ace0c210c2bb3a586906545a72643445c401de",
+    "aiperf.credit.sticky_router:StickyCreditRouter._handle_router_message": "0fbe77fb29177ae21af763546c60f08383d02adc2a4c95056f7d4780866497f3",
+    "aiperf.credit.sticky_router:StickyCreditRouter.wait_for_workers": "c4caa24397e021c49299899cef718e6038f2dc838c1217d68198a8cb2d0665ed",
+    "aiperf.credit.sticky_router:StickyCreditRouter.mark_credits_complete": "65c1844f45499a4d94207e446f5fc58919c9ff8341295d9f0fe46134f913b119",
+    "aiperf.credit.issuer:CreditIssuer._issue_credit_internal": "11e0184be4fc3af1ef5b4e5d71035f97623c05f0c8d1e9047e67967efdd13964",
+    "aiperf.timing.phase_orchestrator:PhaseOrchestrator._start_orchestrator": "2f84c93d885c6e68b77d0de540043dc84e62ff996e5b587f39c8722b350b8b30",
+    "aiperf.timing.manager:TimingManager.__init__": "fb1667460f69c2f48a8c04a0610cd64c59cf3ff48aba734f183f8c0d5885548a",
 }
+
+#: Call sites the router relies on being the only ones: every credit leaves
+#: through one ``send_credit`` call, every return reaches aiperf through one
+#: callback call.
+SCANS = {".send_credit(": 1, "._on_return_callback(": 1}
 
 
 def _digest(root: Path, name: str) -> str | None:
@@ -53,18 +69,32 @@ def _digest(root: Path, name: str) -> str | None:
     return hashlib.sha256(ast.get_source_segment(text, node).encode()).hexdigest()
 
 
+def _calls(root: Path, pattern: str) -> int:
+    return sum(
+        line.count(pattern)
+        for path in (root / "aiperf").rglob("*.py")
+        for line in path.read_text().splitlines()
+        if "def " not in line
+    )
+
+
 def changed(root: Path | None = None) -> list[str]:
-    """The pinned functions whose source differs in the aiperf under `root`."""
+    """The pinned functions whose source differs in the aiperf under `root`, and
+    the scanned call sites whose count does."""
     if root is None:
         spec = importlib.util.find_spec("aiperf")
         if spec is None:
             raise RuntimeError("compass_harness needs aiperf, and it is not installed")
         root = Path(spec.origin).parent.parent
-    return [name for name, sha in PINNED.items() if _digest(root, name) != sha]
+    return [name for name, sha in PINNED.items() if _digest(root, name) != sha] + [
+        f"{n} {pattern} call sites, not {want}"
+        for pattern, want in SCANS.items()
+        if (n := _calls(root, pattern)) != want
+    ]
 
 
 def check(root: Path | None = None) -> None:
-    """Raise naming every pinned aiperf function that changed."""
+    """Raise naming every pinned aiperf function or call-site count that changed."""
     if names := changed(root):
         raise RuntimeError(
             "compass_harness was built against other aiperf source; these "

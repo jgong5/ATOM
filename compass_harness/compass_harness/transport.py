@@ -23,8 +23,7 @@ from aiperf.common.models import ErrorDetails
 from aiperf.transports.aiohttp_transport import AioHttpTransport
 
 from atom.compass.carriers import sse_stamp, tracestate_with
-
-ADDRESS_ENV = "COMPASS_HARNESS_IPC"
+from compass_harness import ADDRESS_ENV
 
 
 def addresses(prefix: str) -> tuple[str, str]:

@@ -6,21 +6,35 @@ is still initialising, so nothing here imports aiperf at module level: an
 import error escaping from here makes discovery drop the whole plugin with one
 WARNING line.
 
-Importing the package installs a one-shot import hook. When
-``aiperf.timing.phase.runner`` has executed, the hook rebinds its
-``LoopScheduler`` to ``ClockPacedLoopScheduler``, so every phase runner's
+Importing the package installs an import hook that rebinds a module global of
+each aiperf module in ``REBIND`` once that module has executed. The runner's
+``LoopScheduler`` becomes ``ClockPacedLoopScheduler``, so every phase runner's
 scheduler, and the branch orchestrator and replay barrier it is handed to, pace
-on the Compass clock. It then refuses the run unless this package's strategy is
-the registered ``agentic_replay``.
+on the Compass clock; the hook then refuses the run unless this package's
+strategy is the registered ``agentic_replay``. The timing manager's
+``StickyCreditRouter`` becomes ``CompassCreditRouter``, which binds that clock
+to the traffic LP.
 """
 
+import importlib
 import importlib.util
+import os
 import sys
 
 from compass_harness import fingerprint
 
 RUNNER = "aiperf.timing.phase.runner"
 STRATEGY = "compass_harness.strategy:CompassAgenticReplay"
+#: The path prefix of the adapter's two sockets, shared by every aiperf process.
+ADDRESS_ENV = "COMPASS_HARNESS_IPC"
+#: aiperf module -> (its global to rebind, the replacement as module:qualname).
+REBIND = {
+    RUNNER: ("LoopScheduler", "compass_harness.scheduler:ClockPacedLoopScheduler"),
+    "aiperf.timing.manager": (
+        "StickyCreditRouter",
+        "compass_harness.router:CompassCreditRouter",
+    ),
+}
 
 
 def check_registered() -> None:
@@ -36,29 +50,37 @@ def check_registered() -> None:
         )
 
 
-class _RunnerHook:
-    """Meta-path finder that wraps the runner module's loader, then removes itself."""
+class _RebindHook:
+    """Meta-path finder that wraps each ``REBIND`` module's loader, then removes itself."""
+
+    def __init__(self, pending: dict) -> None:
+        self.pending = pending
 
     def find_spec(self, name, path=None, target=None):
-        if name != RUNNER:
+        if name not in self.pending:
             return None
-        sys.meta_path.remove(self)
+        attr, replacement = self.pending.pop(name)
+        if not self.pending:
+            sys.meta_path.remove(self)
         spec = importlib.util.find_spec(name)
         execute = spec.loader.exec_module
 
         def exec_module(module):
             execute(module)
-            from compass_harness.scheduler import ClockPacedLoopScheduler
-
-            module.LoopScheduler = ClockPacedLoopScheduler
-            check_registered()
+            path, _, qualname = replacement.partition(":")
+            setattr(module, attr, getattr(importlib.import_module(path), qualname))
+            if name == RUNNER:
+                check_registered()
 
         spec.loader.exec_module = exec_module
         return spec
 
 
-if RUNNER not in sys.modules:
-    sys.meta_path.insert(0, _RunnerHook())
+# Every aiperf process is spawned after the CLI process ran this, so all of
+# them share one adapter socket address.
+os.environ.setdefault(ADDRESS_ENV, f"/tmp/compass-harness-{os.getpid()}")
+if pending := {m: r for m, r in REBIND.items() if m not in sys.modules}:
+    sys.meta_path.insert(0, _RebindHook(pending))
 
 # After the hook: when discovery drops a refused plugin, the hook re-imports this
 # package as the runner loads, and the run fails on the same message.
