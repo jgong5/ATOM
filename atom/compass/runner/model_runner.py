@@ -9,6 +9,7 @@ from atom.compass.runner.overrides import (
     RPC_SURFACE,
     NonAllocatingRunner,
     RunnerRefusal,
+    start_on_host,
     unanswered_rpc_names,
 )
 from atom.model_engine.model_runner import ModelRunner
@@ -23,14 +24,15 @@ class CompassModelRunner(NonAllocatingRunner, ModelRunner):
     step itself, by overriding the six methods that own them; see `overrides`,
     which holds the bodies and says why each one does what it does.
 
-    Construction is not free of device memory. Almost all of what stays
-    resident is the base's forward-vars ring from `allocate_forward_vars`,
-    whose dominant term is a `max_num_batched_tokens` by `hidden_size` output
-    buffer; the rest is a stream, the ring's events, the attention metadata
-    builder and the expert-load-balancing runtime. So the residue is O(batch
-    budget x hidden size) rather than O(weights), and that dominant term is
-    allocated once however deep the pipeline is: a ring slot clones the
-    staging buffers and shares the one output buffer.
+    Construction sets no device and puts nothing on one: `start_on_host`
+    replaces the base's device and group setup, so `self.device` is the host
+    and the groups are on gloo. What stays resident is host memory, almost all
+    of it the base's forward-vars ring from `allocate_forward_vars`, whose
+    dominant term is a `max_num_batched_tokens` by `hidden_size` output
+    buffer; the rest is the ring's events, the attention metadata builder and
+    the expert-load-balancing runtime. That dominant term is allocated once
+    however deep the pipeline is: a ring slot clones the staging buffers and
+    shares the one output buffer.
 
     Two named attributes on the runner hold that ring for the life of the
     process: `forward_vars`, the dict `allocate_forward_vars` builds, and
@@ -49,6 +51,9 @@ class CompassModelRunner(NonAllocatingRunner, ModelRunner):
     subclass body would get control, so there is no point at which state set
     here would be visible to it.
     """
+
+    def _setup_device_and_distributed(self, rank, config):
+        start_on_host(self, rank, config)
 
 
 _UNANSWERED = unanswered_rpc_names(CompassModelRunner)
