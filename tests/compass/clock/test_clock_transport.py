@@ -405,15 +405,14 @@ def test_no_finish_grant_goes_out_when_the_last_cannot_be_framed(
     assert released == [0, 2]
 
 
-@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
 @pytest.mark.parametrize(
     "closing, named", [("frontend", "frontend"), ("dp1", "engine member dp1")]
 )
 def test_a_connection_closed_mid_run_ends_it_for_every_pending_call(
-    served, endpoint, closing, named
+    served, closing, named
 ):
     ca = _joined()
-    endpoint = served(ca, endpoint).endpoint
+    endpoint = served(ca, "tcp://127.0.0.1:0").endpoint
     conns = {"frontend": connect(FRONTEND, endpoint)}
     conns.update((rank, connect(ENGINE, endpoint, rank)) for rank in RANKS)
     pending = []

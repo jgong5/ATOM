@@ -16,15 +16,14 @@ requester's `recv` raises it as the same type, and the loop goes on serving. A
 bound address's slot, waiting or not, and answers every later request. Any other
 exception from the authority, or while framing a reply, ends the run the same
 way, as a `ClockAbort` that names it; its table is empty when the LP table
-cannot be read or framed. So does a bound connection that closes before the
-``+inf`` finish, as a `ClockAbort` naming its address: no finish can come
-without it.
+cannot be read or framed. So does the end of a bound socket connection, as a
+`ClockAbort` naming its address: no finish can come without it.
 
-Only frames reach the loop: a carrier hands the serve side encoded frames and
-the serve side decodes them onto the queue, so the in-process carrier here moves
-the same bytes a socket would. An LP waits for its reply on its own slot and
-under no lock shared with another connection, so one parked LP holds up no
-other.
+Frames and closes reach the loop: a carrier hands the serve side encoded frames
+and the serve side decodes them onto the queue, so the in-process carrier here
+moves the same bytes a socket would; a socket's end reaches it as a ``None``
+request. An LP waits for its reply on its own slot and under no lock shared with
+another connection, so one parked LP holds up no other.
 """
 
 import queue
@@ -51,7 +50,7 @@ _SERVED: dict[str, "_Server"] = {}
 
 
 class _Server:
-    """The serve side of one endpoint. Everything it takes in is a frame."""
+    """The serve side of one endpoint. It takes in frames and closes."""
 
     def __init__(self, authority, endpoint: str) -> None:
         self.endpoint = endpoint
@@ -146,10 +145,9 @@ class _Server:
         or framed."""
         if isinstance(fault, ClockAbort):
             return encode(_refusal(fault))
-        if isinstance(fault, str):
-            reason = fault
-        else:
-            reason = f"the clock authority raised {fault!r}"
+        reason = (
+            fault if isinstance(fault, str) else f"the clock authority raised {fault!r}"
+        )
         try:
             return encode(_refusal(ClockAbort(reason, self._authority.lp_table())))
         except Exception as unread:  # noqa: BLE001 - the run still ends, named
@@ -192,8 +190,7 @@ class _Connection:
         return g, released
 
     def close(self) -> None:
-        """Tell the serve loop, as the end of a socket does; that ends the run."""
-        self._server._closed(self._lp)
+        """Nothing to release: the reply slot is the LP's, not the connection's."""
 
 
 def serve(authority, endpoint: str = DEFAULT_ENDPOINT) -> _Server:
