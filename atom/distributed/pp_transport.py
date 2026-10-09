@@ -24,7 +24,7 @@ import logging
 import pickle
 from typing import Any
 
-import zmq
+from atom.utils import zmq_shim as zmq
 
 logger = logging.getLogger("atom")
 

@@ -9,7 +9,6 @@ import time
 from contextlib import ExitStack
 
 import torch
-import zmq
 
 from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
@@ -26,12 +25,14 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.utils import (
+    clock,
     engine_process_name,
     envs,
     init_exit_handler,
     make_zmq_socket,
     set_process_title,
 )
+from atom.utils import zmq_shim as zmq
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -69,7 +70,7 @@ class EngineCore:
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
-        self.output_queue = queue.Queue[list[Sequence]]()
+        self.output_queue = clock.relay_queue(config.parallel_config.data_parallel_rank)
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
@@ -89,6 +90,13 @@ class EngineCore:
         assert self.control_address, (
             "parallel_config.control_address is unset -- an EngineCore must be "
             "launched through CoreManager, which allocates the control channel"
+        )
+        clock.name_endpoints(
+            config.parallel_config.data_parallel_rank,
+            input_address=input_address,
+            control_address=self.control_address,
+            output_address=output_address,
+            config=config,
         )
         self.output_thread = threading.Thread(
             target=self.process_output_sockets, args=(self.output_address,), daemon=True
@@ -290,6 +298,7 @@ class EngineCore:
             else:
                 engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
+            clock.close()
         except Exception as e:
             logger.error(f"run_engine: exception: {e}", exc_info=True)
             raise e
@@ -314,11 +323,15 @@ class EngineCore:
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
-                now = time.monotonic()
+                now = clock.now(time.monotonic)
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
-                shutdown = shutdown or self.pull_and_process_input_queue()
+                shutdown = (
+                    clock.idle(self._idle_deadline, next_metrics_push)
+                    or shutdown
+                    or self.pull_and_process_input_queue()
+                )
                 if shutdown:
                     break
                 if self._is_idle_rl_weights_offloaded():
@@ -451,12 +464,19 @@ class EngineCore:
     def _advance_idle_kv_transfer(self) -> None:
         # No forward batch will run this tick, but offload load/save work may
         # still need to be dispatched or reported back to the scheduler.
-        now = time.monotonic()
+        now = clock.now(time.monotonic)
         if now < self._next_idle_kv_drain:
             return
         self._next_idle_kv_drain = now + KV_IDLE_DRAIN_INTERVAL_S
         self._dispatch_idle_offload_work()
         self._poll_kv_transfer_progress()
+
+    def _idle_deadline(self) -> float:
+        """When an idle loop next acts on its own: it polls pending KV work every
+        idle drain interval, and otherwise waits for input."""
+        if not self.has_pending_kv_work():
+            return float("inf")
+        return clock.now(time.monotonic) + KV_IDLE_DRAIN_INTERVAL_S
 
     def _drain_kv_work_at_exit(self) -> None:
         """Give in-flight KV transfers a bounded window to report back.
@@ -695,11 +715,15 @@ class DPEngineCoreProc(EngineCore):
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
-                now = time.monotonic()
+                now = clock.now(time.monotonic)
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
-                shutdown = shutdown or self.pull_and_process_input_queue()
+                shutdown = (
+                    clock.idle(self._idle_deadline, next_metrics_push)
+                    or shutdown
+                    or self.pull_and_process_input_queue()
+                )
                 local_unfinished = (
                     not self.scheduler.is_finished()
                     and not self._is_rl_weights_offloaded

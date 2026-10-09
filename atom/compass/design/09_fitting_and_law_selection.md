@@ -77,6 +77,31 @@ In place over 2,174 measured decode steps: **0.73% median**, per rung 0.46 / 0.4
 Twelve sequences cost *less* per step than one. A model assuming monotone growth in batch
 is wrong in direction, not just in magnitude.
 
+### Under DP and EP: one per-rank law, keyed by `(dp, ep)`
+
+Owner's DP ruling, 2026-10-01
+([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)). Tier a covers
+DP and EP with a **per-rank** law: it prices one rank's step, and the group's step is the
+`max` over ranks (`15` D90).
+
+- **Key.** `(dp, ep)`. A law fitted at one pair is not evidence about another, by the
+  per-width discipline of `15` D89.
+- **Features.** The rank's own batch features (D55), plus two the group decides: the
+  DP-unified rung every rank shares, settled by `ForwardMode.decide`, and `T_dp =
+  max_tokens_across_dp`. The MoE terms read `T_dp` only.
+- **The capture.** Full-engine steps on a real DP+EP deployment, logging per forward each
+  rank's batch features and `T_dp` beside the measured step seconds. Under DP-attention
+  each rank runs at TP 1, so this stays within the TP1-only full-engine calibration of
+  `07` D38.
+- **The fit: alternating max-affine regression.** The ranks wait for each other inside the
+  forward, so a rank's measured step is the group's step and its own cost is never seen:
+  the observation is `y = max_r f(x_r)`. The fit alternates two moves until no step
+  changes rank: assign each step to the rank with the largest prediction under the
+  current coefficients, then refit the one law on the assigned ranks' features, each
+  equation divided by its target (D53). This is the least-squares partition heuristic for
+  max-affine fitting (Magnani and Boyd, 2009), with the ranks in place of the affine
+  pieces and one coefficient vector shared by all of them.
+
 ---
 
 ## D55. Feature construction
@@ -93,7 +118,7 @@ Two constructions are load-bearing and both were originally wrong.
 Collapsing the batch to `tokens × history` and multiplying was a rank deficiency. ATOM
 already computes the correct form: `ScheduledBatch.detailed_sqsq / detailed_sqsk /
 detailed_sk` are **Σ N_Q², Σ N_Q·N_KV, Σ N_KV**, produced by `compute_detailed_aggregates`
-(`scheduler.py:2788-2842`).
+(`scheduler.py`).
 
 **2. The padding term is the *rung's* rectangle, not the batch's.** `rung·max(ctx) − Σctx`,
 **not** `len(ctx)·max(ctx) − Σctx`. Error tracked the ratio between them exactly:
@@ -300,6 +325,14 @@ Consequence, already in `07` D39: calibration batches are **replayed** from the 
 scheduler's step table, with explicit `block_tables`. Hand-built ladders are grouped by
 construction.
 
+**Declared treatment: uniform routing** (owner's DP ruling, 2026-10-01). Under DP and EP
+the MoE segment (dispatch, experts, combine) is priced from `T_dp` as if routing spread
+tokens evenly over the expert ranks, in every tier. Real routing is data-dependent
+(`15` D92 Q2) and no feature carries it, so whatever skew a capture's routing has is
+folded into the fitted MoE terms. Under this treatment `max` over ranks equals the
+per-layer critical path (`15` D90); where routing is not uniform, `max` underestimates
+the step, and that is a declared limit rather than a modelled effect.
+
 **Suspected treatments to check before fitting:** raggedness (workload-dependent, and it
 was a zero column for 2,997 samples), cached fraction, and the prefill chunk's position in
 its streak.
@@ -344,14 +377,14 @@ choice that must be visible.
 | # | Decision | Date |
 |---|---|---|
 | D53 | Fit relative error, not absolute seconds. MAD outlier test on the same relative residuals. | 2026-09-18 |
-| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. | 2026-09-18 |
+| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under DP and EP, tier a is one per-rank law keyed by `(dp, ep)`, with the DP-unified rung and `T_dp` as features, captured on a real DP+EP deployment and fitted by alternating max-affine regression. | 2026-09-18; revised 2026-10-01 |
 | D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. | 2026-09-18 |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |
 | D58 | Refuse rather than fall back. The extrapolation guard is a convex hull or k-NN distance, never a per-feature bounding box. | 2026-09-18 |
 | D59 | A family is validated on independently obtained data, never by LOO. Rank at least three candidates and report all held-out errors. A law that fits one axis is tested on a second before it ships. | 2026-09-18 |
 | D60 | Laws are piecewise over declared dispatch bands read from recorded kernel identity. A query with no same-band bracket refuses. | 2026-09-18 |
-| D61 | Treatments are declared and the calibration population matched. Decode row order is a known treatment worth 1.77×. | 2026-09-18 |
+| D61 | Treatments are declared and the calibration population matched. Decode row order is a known treatment worth 1.77×. Uniform routing of the MoE segment under DP and EP is a declared treatment, in every tier. | 2026-09-18; revised 2026-10-01 |
 | D62 | Leading warmth is measured and reported, never charged. Error is reported stratified by the axes the law is linear in. | 2026-09-18 |
 
 ---

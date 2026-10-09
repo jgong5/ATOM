@@ -80,8 +80,8 @@ if _UNANSWERED:
     # architecture probe and needs a driver, so a green CPU gate is not
     # evidence that the composed class answers the surface -- only an import on
     # a machine with a GPU is. And when it does fire inside a worker,
-    # `AsyncIOProc.__init__` resolves the runner class (`async_proc.py:166`)
-    # before assigning `self.runners = []` (`:167`), so the atexit finalizer
+    # `AsyncIOProc.__init__` (`atom/model_engine/async_proc.py`) resolves the
+    # runner class before assigning `self.runners = []`, so the atexit finalizer
     # then fails on the half-built object and the worker log *ends* with
     # `AttributeError: 'AsyncIOProc' object has no attribute 'runners'`. The
     # refusal is the traceback above that one.

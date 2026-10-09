@@ -425,7 +425,7 @@ them `all_reduce_`, coverage **98.3%**. One known failure: `c10d::broadcast_` ta
 `ProcessGroup` object no JSON artifact can hold — one operator per step.
 
 **(b) Invisible collectives, and the default path is the invisible one.**
-`ATOM_USE_CUSTOM_ALL_GATHER` defaults to **1** (`atom/utils/envs.py:354-355`); its
+`ATOM_USE_CUSTOM_ALL_GATHER` defaults to **1** (`atom/utils/envs.py::environment_variables`); its
 registration is *commented out* at `aiter/dist/parallel_state.py:467-468` and
 `all_gather_reg` / `all_gather_unreg` are in `NONE_WRAPPED_OP`. Zero dispatcher events end
 to end — while the RCCL path **is** visible (`c10d::allgather_into_tensor_`). These need
@@ -439,7 +439,7 @@ blocks co-resident**, so the kernel occupies the entire device. That is doc 04 D
 `exclusive` join policy, and it is a measured fact rather than a modelling choice. (On an
 80-CU MI308X, launching 128 blocks deadlocks.)
 
-**(d) p2p.** PP is `isend`/`recv` on NCCL (`atom/distributed/pp_comm.py:127-164`),
+**(d) p2p.** PP is `isend`/`recv` on NCCL (`atom/distributed/pp_comm.py::async_send_intermediate_tensors`, `commit_pp_send_work`),
 priceable like (a). **KV transfer is not priced at all** — doc 01 D6 simulates it as
 `latency + bytes/bandwidth` from the machine spec, which is what makes interconnect
 configurable.
