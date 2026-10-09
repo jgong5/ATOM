@@ -178,7 +178,7 @@ def test_the_pool_is_sized_by_atoms_arithmetic_with_the_card_unread(
     """The block count, its four keys, and the record it carries.
 
     `state_runtime` is put back through `StateRuntime.from_wire`, which is what
-    `engine_core.py:141` does with it and which raises unless its key set is
+    `EngineCore.__init__` does with it and which raises unless its key set is
     exactly the two it wants -- so a reply that would fail on the first RPC of
     the engine's life fails here instead.
     """

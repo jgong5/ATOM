@@ -7,11 +7,11 @@ pool means executing `ModelRunner.get_num_blocks`, which means importing
 raises where there is no GPU. That import is not stubbed around. The tree
 already carries an aiter stub for this exact problem (`tests/aiter_stub.py`),
 and it covers three module names -- measured 2026-09-22 in `xiaobizh_n18_cpu`,
-`model_runner.py:20` imports a fourth, `aiter.dist.parallel_state`, and the
-import fails there. Widening that stub is the thing `tests/conftest.py`'s own
-header records as having silently stopped four test modules from running, so
-the binding lives in `test_kv_budget_engine.py` and runs where there is a
-driver.
+`atom/model_engine/model_runner.py` imports a fourth at module scope,
+`aiter.dist.parallel_state`, and the import fails there. Widening that stub is
+the thing `tests/conftest.py`'s own header records as having silently stopped
+four test modules from running, so the binding lives in
+`test_kv_budget_engine.py` and runs where there is a driver.
 
 What this tier holds is the half that decides whether the binding is right
 rather than whether it runs: that ATOM's budget method reaches the device
@@ -369,10 +369,12 @@ def _fields_read_with_no_default():
     """Every name the overrides read through `_config_field`, off the source."""
     tree = ast.parse((COMPASS / "runner" / "overrides.py").read_text())
     return sorted(
-        node.args[1].value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and getattr(node.func, "id", None) == "_config_field"
+        {
+            node.args[1].value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "_config_field"
+        }
     )
 
 
@@ -387,9 +389,11 @@ def test_exactly_these_config_fields_are_read_with_no_default():
         "enforce_eager",
         "eos_token_id",
         "kv_transfer_config",
+        "model",
         "pipeline_parallel_size",
         "speculative_config",
         "stop_token_ids",
+        "trust_remote_code",
     ]
 
 

@@ -239,8 +239,8 @@ are `tokio::time` / `std::time::Instant`, and we want to touch it as little as p
 
 ### The mechanism that already exists
 
-The ATOM relay is strictly sequential (`http_pd_router.rs:969-1192`), unlike the SGLang
-path (`tokio::join!` on both, `:1463`) and the vLLM path (detached `spawn`, `:732`):
+The ATOM relay is strictly sequential (`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`), unlike the SGLang
+path (`tokio::join!` on both, `http_pd_router.rs::PDRouter::execute_dual_dispatch_internal`) and the vLLM path (detached `spawn`, `http_pd_router.rs::PDRouter::dispatch_vllm_mooncake_internal`):
 
 ```
 client --compass.arrival_s--> router --inject_prefill_fields--> PREFILL
@@ -253,11 +253,11 @@ client --compass.arrival_s--> router --inject_prefill_fields--> PREFILL
 client <--------------  router <-- decode response (streamed)
 ```
 
-`AtomAdapter::enrich_decode_kv` (`placement/backend/atom.rs:37-59`) only *adds* fields
+`AtomAdapter::enrich_decode_kv` (`placement/backend/atom.rs`) only *adds* fields
 (`remote_dp_size`, `remote_tp_size`, renames `dp_rank` -> `remote_dp_rank`). The blob
 itself is produced by `MoRIIOConnectorScheduler.request_finished`
-(`moriio_connector.py:970-1001`) and the router hard-errors if it is absent
-(`http_pd_router.rs:1073-1078`).
+(`moriio_connector.py`) and the router hard-errors if it is absent
+(`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`).
 
 ### Decision
 
@@ -342,7 +342,7 @@ the same property. That is what makes the comparison valid.
 
 If every request decodes the same filler id, two requests sharing a prompt prefix produce
 identically-chained decode blocks (`BlockManager.compute_hash` is xxhash chained with the
-parent hash, `block_manager.py:233-245`), and the second would **hit** the first. A real
+parent hash, `block_manager.py`), and the second would **hit** the first. A real
 run would not. That inflates cache hits — and since `num_cached_tokens` feeds chunked
 prefill sizing and admission, **it changes the schedule**, which is the thing this project
 is most sensitive to.
@@ -383,14 +383,14 @@ p50 input is 88,768 tokens and p90 is 204,288, this is not a rounding error.
 
 ### Where it happens
 
-**Encode** — `self.tokenizer.encode(prompt_or_tokens)` at `llm_engine.py:690`, inside
+**Encode** — `self.tokenizer.encode(prompt_or_tokens)` at `llm_engine.py::InputOutputProcessor.preprocess_fanout`, inside
 `InputOutputProcessor.preprocess`, reached from the API server via
-`await loop.run_in_executor(None, do_preprocess)` at `api_server.py:890`, `:1004`, `:1126`,
-`:1258`, `:1480`. That is Python's **implicit default executor**, width
+`await loop.run_in_executor(None, do_preprocess)` at `api_server.py::generate_async`, `generate_async_multimodal`, `generate_async_fanout`,
+`setup_streaming_request`, `setup_streaming_request_fanout`. That is Python's **implicit default executor**, width
 `min(32, cpu_count + 4)` — see doc 05 D24, which makes it an ATOM config option.
 
 **Decode** — `IncrementalStreamDetokenizer.update` at
-`atom/entrypoints/openai/streaming_dispatch.py:40-69`:
+`atom/entrypoints/openai/streaming_dispatch.py`:
 
 ```python
 self.tokens.extend(token_ids)
@@ -414,7 +414,7 @@ Four properties that shape the model:
    constraint.
 
 Note also the terminal `self.tokenizer.decode(req.completion_token_ids)` at
-`llm_engine.py:776` — but ATOM defect #6 records that `InputOutputProcessor.postprocess` is
+`llm_engine.py::InputOutputProcessor.postprocess` — but ATOM defect #6 records that `InputOutputProcessor.postprocess` is
 **never called from `api_server.py`**, so that path does not run under serving. It matters
 only for the offline `generate()` path.
 
@@ -427,6 +427,12 @@ rule as the forward pass.
 |---|---|---|---|
 | encode | default `ThreadPoolExecutor` | width from ATOM config | `encode_fixed_s + tokens / encode_tokens_per_s` |
 | decode | engine output thread, per stream per step | **1** | `2 x (decode_fixed_s + window / decode_tokens_per_s)` |
+| encode or decode on the loop thread | the API server's event loop: the final `decode` of a non-streaming completion in `generate_async`, `generate_async_multimodal` and `generate_async_fanout`, and the `encode` and `decode` calls in `anthropic_messages` | **1**, the loop itself | the same terms per call, over the tokens it encodes or decodes |
+
+A loop-thread call is not a station job. The event loop is the frontend LP's clock owner,
+so the call prices itself as an event cost (`01` K1): it advances the LP clock by its
+service time, and nothing else on the loop runs until it ends. Outside the simulation
+window it is charged nothing.
 
 Terms come from `host.tokenizers[]` in the machine spec (doc 05 D25), populated by the
 `compass spec probe tokenizer` Tier-0 probe.
@@ -852,7 +858,7 @@ requires genuine fan-out in every root is not constructible without reusing sess
 | D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes on that path. | 2026-09-18 |
 | D31 | Filler token is non-EOS, decodes to complete standalone ASCII, and is derived from the request id. | 2026-09-18 |
 | D32 | The decode->prefill cache chain is already broken by the harness for real servers too; guard only against false hits. `theoretical_prefix_cache_hit` is the oracle. | 2026-09-18 |
-| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. | 2026-09-18 |
+| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. A tokenizer call on the event loop thread (the final `decode` of a non-streaming completion, the calls in `anthropic_messages`) is no station job: it advances the frontend LP clock by its service time on the loop. | 2026-09-18; revised 2026-10-03 |
 | D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. | 2026-09-18 |
 | D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists; the rebind itself is deferred by a `sys.meta_path` hook, because the bootstrap runs while `aiperf.plugin.plugins` is still importing and cannot import `aiperf`; an inline attempt does not raise to the operator, it de-registers the whole plugin and logs one `WARNING` (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
 | D35 | Declare what the harness reproduces and what it cannot; cancellation is not available from this corpus. | 2026-09-18 |

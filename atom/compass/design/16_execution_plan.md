@@ -123,7 +123,7 @@ five-slot cap.
 | **P0.4** | **T5** — trace the 27B under `FakeTensorMode` at TP1 **and TP2**; diff the captured structures | spike → `capture/` | ~200 LOC | clean node |
 | **P0.5** | **T64** — does ATOM microbatch PP? | reading + 1 run | ~0 | clean node |
 | **P0.6** | **T65** — EP group membership per supported configuration | reading | ~0 | — |
-| **P0.7** | **T52** — root-cause the dispatch-mode 8-rank hang. **Only if P0.4 hits it.** | spike | — | quiet node |
+| **P0.7** | **T52** — root-cause the `DeviceContext` `__torch_function__` guard 8-rank hang. **Only if P0.4 hits it.** | spike | — | quiet node |
 
 **Why these seven.** Each can invalidate work that would otherwise be built on top of it.
 P0.3 swung an estimate by ~2,000 lines for one hour's work; it has since run and the swing
@@ -162,7 +162,7 @@ numbers — because each is an organisational question, not an engineering one.
 
 ## The measured test and lint baselines
 
-P0.2's result, and the reason the test gate in `AI_DEV_RULES.md` cannot be run as written.
+P0.2's result, and the reason the agents' original test gate cannot be run as written.
 That gate, `08` D43.1 and ATOM's own `CLAUDE.md` all assert the same thing — that the
 187-file suite under `tests/` runs GPU-free and green — and P0.2 measured both halves
 false. What is GPU-free is a **tier**, run per task; the rest is a GPU superset, run per
@@ -290,14 +290,14 @@ what keeps the headline example, and one currently changes no path:
   `import atom.*` lines are indented — inside a function, a `try`, or a
   `skipif(not torch.cuda.is_available())` guard. An earlier draft anchored the match at
   column 0 on both sides and silently dropped `atom/model_ops/topK.py`, whose only
-  excluded-side reference is `test_moe_dp_token_capacity.py:39`, indented under exactly such
+  excluded-side reference is `test_moe_dp_token_capacity.py::test_dpa_capacity_fits_gathered_topk_metadata`, indented under exactly such
   a guard.
 - *Coverage is credited only for a module-level import.* An indented import in a CPU-tier
   file is not proof that the CPU tier executes it, and crediting it would let a never-taken
   branch suppress a trigger. **This is the part that keeps
   `atom/model_engine/model_runner.py`** — the module Compass's runner seam replaces.
   `tests/test_mla_index_cache.py` imports `ModelRunner` at
-  `tests/test_mla_index_cache.py:99`, indented four spaces inside a test function, so that
+  `tests/test_mla_index_cache.py::test_model_runner_local_total_layers_adds_mtp_only_on_drafter_stage`, indented four spaces inside a test function, so that
   import is never credited whatever the file collects. Measured at `236abfd9a` in
   `xiaobizh_n18_cpu`: crediting coverage at any indentation drops the set 30 → 29, losing
   `topK.py`; doing that *and* crediting non-collecting files drops it 30 → 27, losing
@@ -530,7 +530,7 @@ never spent deciding what to run in it.
 at ~1 h (`12` T21) because that is what engine runs take, and the long calibration sweep
 is priced at six hours because it was measured at six hours — not estimated from
 throughput. Effort elsewhere is sized in lines of code, not wall-clock, precisely because
-most tasks have no such measurement to quote (`AI_DEV_RULES.md`).
+most tasks have no such measurement to quote (`agent-team` plugin, `plan.md`).
 
 ### The pre-flight gate — four checks, not one
 
@@ -602,11 +602,11 @@ decision that belongs to the project owner, not to the agent that ran it.
 arrives with the options and their costs already worked out, so the decision is one round
 trip rather than a fresh analysis under time pressure.
 
-The stop-and-diagnose rule (`AI_DEV_RULES.md`) is the general case: any surprise stops and
+The stop-and-diagnose rule (`agent-team` plugin, `rules.md`) is the general case: any surprise stops and
 is diagnosed, and becomes an escalation only when it needs an owner ruling.
 
 Reaching any of these, like the loop's halt above, is an escalation — so it applies
-`need human` too (`AI_DEV_RULES.md`), for the same reason: the stop should be visible on
+`need human` too (`agent-team` plugin, `rules.md`), for the same reason: the stop should be visible on
 GitHub, not only inside an agent's report.
 
 ---
@@ -616,7 +616,7 @@ GitHub, not only inside an agent's report.
 Stated so it is not mistaken for an omission.
 
 - **Dates.** Effort is LOC; wall-clock appears only where it is machine time with a
-  measured basis (`AI_DEV_RULES.md`).
+  measured basis (`agent-team` plugin, `plan.md`).
 - **Detail past v1.** Deliberate — see *After v1*.
 - **Agent prompts.** Task briefs are written to be close to a prompt and generated from at
   launch, because embedded prompts go stale as tasks move.
