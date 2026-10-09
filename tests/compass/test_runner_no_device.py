@@ -20,18 +20,16 @@ from atom.utils import CpuGpuBuffer
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
 
-def _config(dp=1):
+def _config(tp=1, dp=1):
     return SimpleNamespace(
-        tp_world_size=1,
-        tensor_parallel_size=1,
+        tp_world_size=tp,
+        tensor_parallel_size=tp,
         prefill_context_parallel_size=1,
-        decode_context_parallel_size=1,
         pipeline_parallel_size=1,
         master_addr="127.0.0.1",
         port=29500,
         parallel_config=SimpleNamespace(
             data_parallel_size=dp,
-            data_parallel_rank=0,
             data_parallel_master_ip="127.0.0.1",
             data_parallel_base_port=29501,
         ),
@@ -97,10 +95,13 @@ def test_a_stream_built_after_it_is_a_host_stand_in_that_cannot_queue_work(start
         stream.synchronize()
 
 
-def test_a_start_wider_than_one_rank_is_refused_before_anything_is_replaced(started):
+@pytest.mark.parametrize("width", [{"tp": 2}, {"dp": 2}])
+def test_a_start_wider_than_one_rank_is_refused_before_anything_is_replaced(
+    started, width
+):
     stream = torch.cuda.Stream
-    with pytest.raises(RunnerRefusal, match="spans 2 rank processes"):
-        started(_config(dp=2))
+    with pytest.raises(RunnerRefusal, match="2 ranks wide"):
+        started(_config(**width))
     assert torch.cuda.Stream is stream
 
 
