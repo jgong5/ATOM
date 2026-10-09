@@ -93,6 +93,7 @@ source and compare it with this table.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import torch
@@ -241,6 +242,71 @@ def _installed_backend(runner: Any) -> CostBackend:
             "engine's first step."
         )
     return backend
+
+
+class HostStream:
+    """Stands in for a device stream on a runner that starts on the host.
+
+    It has no methods, so code that tries to use it as a stream fails on the
+    attribute it asked for instead of queueing work on a device.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+
+def start_on_host(runner: Any, rank: int, config: Any) -> None:
+    """Start a TP1 runner on the host: no device set, its groups on gloo.
+
+    Replaces ATOM's `_setup_device_and_distributed`, which
+    `ModelRunner.__init__` calls before it builds any buffer, so every buffer
+    the rest of `__init__` builds on `runner.device` lands on the host. Two touches there do not follow the
+    device: `torch.cuda.Stream` refuses `cpu`, and `CpuGpuBuffer` pins its host
+    half, which is a driver allocation. Both are replaced for the life of the
+    worker process, which hosts this runner and nothing else.
+
+    The groups are the ones ATOM's own call builds at one rank, on gloo, where
+    aiter builds no device communicator. A wider start is refused: aiter would
+    build one on the device, and a simulated TP width needs
+    `apply_simulated_tp` on a device group.
+    """
+    pc = config.parallel_config
+    ranks = (
+        config.tensor_parallel_size
+        * config.prefill_context_parallel_size
+        * pc.data_parallel_size
+        * config.pipeline_parallel_size
+    )
+    if ranks != 1:
+        raise RunnerRefusal(
+            f"this start is {ranks} ranks wide; a runner starts on the host "
+            "only at one rank, because aiter builds a wider group's device "
+            "communicators on the device."
+        )
+    from aiter import init_dist_env
+    from aiter.dist.utils import get_distributed_init_method
+
+    from atom.utils import CpuGpuBuffer
+
+    pinned = CpuGpuBuffer.__init__
+
+    def unpinned(buffer: Any, *size: Any, pin_memory: bool = True, **kw: Any):
+        pinned(buffer, *size, pin_memory=False, **kw)
+
+    CpuGpuBuffer.__init__ = unpinned
+    torch.cuda.Stream = HostStream
+    runner.device = torch.device("cpu")
+    os.environ["MASTER_ADDR"] = config.master_addr
+    os.environ["MASTER_PORT"] = str(config.port)
+    init_dist_env(
+        1,
+        rankID=rank,
+        backend="gloo",
+        distributed_init_method=get_distributed_init_method(
+            pc.data_parallel_master_ip, pc.data_parallel_base_port
+        ),
+        local_rank=0,
+    )
 
 
 def _config_field(runner: Any, name: str) -> Any:
