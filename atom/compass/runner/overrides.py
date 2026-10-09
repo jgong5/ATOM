@@ -75,6 +75,14 @@ of which a single-process test can show:
   successor that wants its refusal diagnosable in the engine's own log has to
   put it there itself, on the worker side, before it raises.
 
+The worker control commands are refused the third way: by a reply. A raise
+would end the engine for a command a client sent while serving, and a None
+would park it, so `RefusedControlCommands` answers each with its reason,
+`command:<method>`. `busy_loop` forwards it, `EngineUtilityHandler` logs it
+and, for all but `update_weights`, sends it back to the client as the
+`UTILITY_RESPONSE` result; the runner also keeps every reason it answered for
+the run summary's refusals.
+
 `RPC_SURFACE` records, for each dispatched name, whether its caller waits for
 the reply. The names themselves are not a list anyone typed: they are the ones
 `engine_core`, `pp_engine_core` and `engine_utility` broadcast that a
@@ -113,7 +121,10 @@ logger = logging.getLogger(__name__)
 # so, and it is load-bearing. Other dispatched names are absent from this
 # table because `ModelRunner` does not define them -- some belong to
 # `RapidServeModelRunner`, the rest to the rollout extension. The rollout names
-# are unreachable here. The RapidServe names are kept out by `Config`, not by
+# do reach this runner: `AsyncLLMEngine.__init__` (`atom/rollout/async_engine.py`)
+# installs its own runner with `kwargs.setdefault`, so a caller that names this
+# one gets it, and `RefusedControlCommands` answers each with a refusal.
+# The RapidServe names are kept out by `Config`, not by
 # this module: `enable_rapidserve` picks `PrefillEngineCore` /
 # `DecodeEngineCore` (`LLMEngine.__init__`), those classes broadcast all of
 # them with `wait_out=True` without consulting `runner_qualname`, and the
@@ -122,16 +133,6 @@ logger = logging.getLogger(__name__)
 # overwrites. `Config` therefore raises `ValueError` for
 # `enable_rapidserve=True` with any runner not in `RAPIDSERVE_RUNNERS`, this
 # one included.
-#
-# Also outside the table, and outside anything a broadcast-derived enumeration
-# can see: some of these names are called in-process on the runner itself,
-# reached over the `resume_memory` RPC (`atom/rollout/memory_manager.py`).
-# `MemoryManagerMixin._resume_kv_cache` subscripts one key of `get_num_blocks`
-# and discards `allocate_kv_cache`, and
-# `MemoryManagerMixin._recapture_cudagraphs_if_needed` calls
-# `capture_cudagraph` without unpacking it, inside a `try` that degrades to
-# `enforce_eager=True`. Different arities, and the one place in the tree where
-# a refusal from this module would be caught rather than fatal.
 #
 # Call sites below are in `atom/model_engine/`.
 RPC_SURFACE: dict[str, bool] = {
@@ -146,9 +147,10 @@ RPC_SURFACE: dict[str, bool] = {
     "freeze_gc_heap": True,  # EngineCore._freeze_after_startup catches a raise, not a None
     "process_kvconnector_output": False,  # EngineCore does not wait
     "async_proc_aggregation": True,  # the one bounded wait, in EngineCore
+    "flush_pp_send": True,  # PPEngineCoreProc waits before the next send
+    # Refused by `RefusedControlCommands`: ATOM's own starts a real profiler.
     "start_profiler": True,  # EngineUtilityHandler forwards the reply unread
     "stop_profiler": True,  # EngineUtilityHandler forwards the reply unread
-    "flush_pp_send": True,  # PPEngineCoreProc waits before the next send
 }
 
 
@@ -273,7 +275,53 @@ class UnbuiltModel(torch.nn.Module):
         )
 
 
-class NonAllocatingRunner:
+def _refused(method: str):
+    """A worker method that answers with its refusal instead of doing its work."""
+
+    def refuse(self, *args: Any) -> str:
+        reason = f"command:{method}"
+        vars(self).setdefault("_refused_commands", []).append(reason)
+        logger.warning(
+            "%s refused: a simulated runner has no profiler, weights or KV "
+            "tensors for it to act on, and no cost model for the time it takes.",
+            method,
+        )
+        return reason
+
+    return refuse
+
+
+class RefusedControlCommands:
+    """The worker methods behind ATOM's utility commands, each refused by name.
+
+    The profiler pair would start a real profiler, and the other seven exist
+    only on ATOM's rollout runner, so without them here `busy_loop` skips the
+    name and the handler waits forever. Each answers `command:<method>` rather
+    than raising, so the engine keeps serving, and records it for
+    `refused_commands`.
+    """
+
+    start_profiler = _refused("start_profiler")
+    stop_profiler = _refused("stop_profiler")
+    update_weights = _refused("update_weights")
+    update_weights_from_shm = _refused("update_weights_from_shm")
+    update_weights_from_ipc = _refused("update_weights_from_ipc")
+    release_memory = _refused("release_memory")
+    resume_memory = _refused("resume_memory")
+    clear_kv_cache = _refused("clear_kv_cache")
+    configure_hidden_states = _refused("configure_hidden_states")
+
+    def refused_commands(self) -> tuple[str, ...]:
+        """Every refusal this runner answered, in order, for the run summary.
+
+        A method rather than an attribute so the engine can read it over the
+        same RPC the commands came in on; a tuple, so the caller gets a copy
+        and not the list the runner keeps appending to.
+        """
+        return tuple(vars(self).get("_refused_commands", ()))
+
+
+class NonAllocatingRunner(RefusedControlCommands):
     """Overrides that construct a model runner without touching device memory."""
 
     def _build_and_load_model(self, model_class: Any) -> None:
