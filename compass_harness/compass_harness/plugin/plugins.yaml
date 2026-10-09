@@ -1,0 +1,9 @@
+schema_version: "1.0"
+
+timing_strategy:
+  agentic_replay:
+    class: compass_harness.strategy:CompassAgenticReplay
+    description: |
+      agentic_replay paced on the Compass clock. Refuses a phase runner whose
+      scheduler is not ClockPacedLoopScheduler, and the options the clock does
+      not pace yet.
