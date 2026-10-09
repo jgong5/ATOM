@@ -27,6 +27,16 @@ Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
 ``ipc_s``, ``stream_s``, ``coefficients`` (a `Coefficients` mapping),
 ``machine`` (a machine spec mapping), ``parameter_count``, and ``out_dir``,
 where the step table, the run summary and the engine's command refusals go.
+
+A run file that also has ``router_s`` and ``kv_write_req_s`` describes a
+prefill-decode run over `prefill_decode_table`, and ``kv_link`` (``intra_node``
+or ``inter_node``) names the link its KV transfers are priced on. A deployment
+whose ``kv_connector`` is ``compass`` is its prefill (``kv_producer``) or
+decode side: `engine(config)` makes it the ``engine-P`` or ``engine-D`` LP and
+binds the connector's transfer model. The write-request address comes with the
+deployment's own ``kv_transfer_config``. `frontend(config)` refuses such a
+deployment: it co-hosts the authority, and a prefill-decode run spans two API
+servers that must share one.
 """
 
 import contextlib
@@ -41,6 +51,7 @@ from atom.compass.clock import (
     LpId,
     RefusalTally,
     RunSummary,
+    prefill_decode_table,
     single_engine_table,
 )
 from atom.compass.clock_transport import connect, serve
@@ -78,10 +89,42 @@ def spec() -> dict | None:
 
 
 def channel_table(run: dict):
-    return single_engine_table(
-        admission_path=run["admission_path"],
-        ipc_s=run["ipc_s"],
-        stream_s=run["stream_s"],
+    common = {k: run[k] for k in ("admission_path", "ipc_s", "stream_s")}
+    if "kv_write_req_s" in run:
+        return prefill_decode_table(
+            **common, router_s=run["router_s"], kv_write_req_s=run["kv_write_req_s"]
+        )
+    return single_engine_table(**common)
+
+
+def _pd_side(config) -> str | None:
+    """``P`` or ``D`` for a deployment on the simulated KV connector, else None."""
+    kv = config.kv_transfer_config
+    if not kv:
+        return None
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    if KVConnectorFactory.canonical_name(kv.get("kv_connector", "moriio")) != "compass":
+        return None
+    return "P" if kv.get("kv_role", "kv_producer") == "kv_producer" else "D"
+
+
+def _bind_transfer(config, run: dict) -> None:
+    """Price the simulated connector's transfers from the machine spec and the
+    KV block this deployment's workers hold."""
+    from atom.compass.backends import KvGeometry, Parallelism
+    from atom.compass.kv import TRANSFER_KEY, Scope, TransferModel
+    from atom.compass.spec import MachineSpec
+
+    config.kv_transfer_config[TRANSFER_KEY] = TransferModel.from_spec(
+        MachineSpec.from_mapping(_width_keys(run["machine"])),
+        KvGeometry.from_hf_config(
+            config.hf_config,
+            block_size=config.kv_cache_block_size,
+            parallelism=Parallelism(tp_size=config.tensor_parallel_size),
+            kv_dtype=config.kv_cache_dtype,
+        ),
+        Scope(run["kv_link"]),
     )
 
 
@@ -146,6 +189,11 @@ def frontend(config):
             f"runner {config.runner_qualname!r} is named, and a simulated run "
             f"prices its steps with {COMPASS_RUNNER_QUALNAME}"
         )
+    if _pd_side(config) is not None:
+        raise ValueError(
+            "this API server would co-host the clock authority, and a "
+            "prefill-decode run spans two API servers that must share one"
+        )
     config.runner_qualname = COMPASS_RUNNER_QUALNAME
     _authority = _RecordingAuthority(run)
     serve(_authority, run["clock_endpoint"])
@@ -159,9 +207,13 @@ def engine(config):
         return contextlib.nullcontext()
     from atom.utils.distributed import utils
 
+    lp, side = ENGINE, _pd_side(config)
+    if side is not None:
+        lp = LpId(f"{ENGINE.name}-{side}")
+        _bind_transfer(config, run)
     dp = config.parallel_config.data_parallel_size
-    utils.LP_OF_RANK = dict.fromkeys(range(dp), ENGINE)
-    return _start_on_leaving(_runtime(ENGINE, run))
+    utils.LP_OF_RANK = dict.fromkeys(range(dp), lp)
+    return _start_on_leaving(_runtime(lp, run))
 
 
 def runner(model_runner) -> None:
