@@ -230,7 +230,11 @@ def frontend_done(llm_engine) -> bool:
     llm_engine.close()
     run, a = spec(), _authority
     out = Path(run["out_dir"])
-    reasons = json.loads((out / COMMANDS_FILE).read_text()) + rt.loop.executor.refusals
+    reasons = (
+        json.loads((out / COMMANDS_FILE).read_text())
+        + rt.loop.executor.refusals
+        + rt.refusals
+    )
     steps = sum(r.lp == ENGINE.name and r.event == "TAR" for r in a.steps.rows)
     summary = RunSummary.of(
         a, a.finished - a.started, refusals=RefusalTally.of(reasons, steps)

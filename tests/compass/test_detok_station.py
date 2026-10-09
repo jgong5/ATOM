@@ -7,9 +7,11 @@ against the co-hosted clock authority. Stream updates go through ATOM's
 `StreamBatchDispatcher`, whose tokenizer's decode `wrap_decode` charges.
 """
 
+import json
 import math
 import pickle
 import threading
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -18,6 +20,7 @@ import zmq
 from aiter_stub import stubbed_aiter
 
 from atom.compass import clock_transport
+from atom.compass import run as compass_run
 from atom.compass.clock import NER, ClockAuthority, LpId, single_engine_table
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.streaming_dispatch import StreamBatchDispatcher
@@ -212,3 +215,91 @@ def test_a_decode_on_another_thread_with_no_job_open_is_refused(monkeypatch):
     with pytest.raises(RuntimeError, match="only the clock owner"):
         decode([1, 2])
     assert frontend.now == 0.0
+
+
+def test_a_frame_from_before_the_run_decoded_on_an_output_thread_is_a_summary_refusal(
+    monkeypatch, tmp_path
+):
+    # An engine frame sent outside the run reaches ATOM's output thread with no
+    # job open after the frontend's run has started; its decode is refused, and
+    # ATOM logs the refusal as `flush_stream_batch failed` and drops the update.
+    # A stamped frame after it keeps the run open until the first is handled.
+    run = {
+        "admission_path": "serving",
+        "ipc_s": IPC,
+        "stream_s": 0.002,
+        "bound_s": 10.0,
+        "clock_endpoint": f"inproc:test-detok-refusal-{uuid.uuid4().hex}",
+        "out_dir": str(tmp_path),
+    }
+    (tmp_path / "run.json").write_text(json.dumps(run))
+    (tmp_path / compass_run.COMMANDS_FILE).write_text("[]")
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    authority = compass_run._RecordingAuthority(run)
+    monkeypatch.setattr(compass_run, "_authority", authority)
+    server = clock_transport.serve(authority, run["clock_endpoint"])
+    clock_transport.connect(LpId("traffic"), run["clock_endpoint"]).send(
+        (NER, math.inf, [], math.inf)
+    )
+    frontend = LPRuntime(
+        LpId("frontend"),
+        TABLE,
+        clock_transport.connect(LpId("frontend"), run["clock_endpoint"]),
+    )
+    monkeypatch.setattr(clock, "_installed", frontend)
+    tokenizer = _Tokenizer()
+    tokenizer.decode = wrap_decode(tokenizer.decode, _entry())
+    dispatcher = StreamBatchDispatcher(tokenizer)
+    monkeypatch.setattr(api_server, "_stream_batch_dispatcher", dispatcher)
+    state = dispatcher.new_state()
+    address = get_open_zmq_ipc_path()
+    clock.name_endpoints(0, "", "", address)
+    ctx, raw = zmq_shim._Context(), zmq.Context()
+    loop = CompassEventLoop()
+    collector = SimpleNamespace(put_nowait=lambda c: None)
+    mgr = CoreManager.__new__(CoreManager)
+    mgr.ctx, mgr.label, mgr._lb_lock, mgr._seq_load = ctx, "fe", threading.Lock(), {}
+    mgr._seq_id_to_callback = {
+        7: lambda out: api_server._send_stream_chunk_direct(
+            out, "r", collector, loop, state
+        )
+    }
+    mgr._flush_stream_batch_fn = api_server.flush_stream_batch
+    thread = mgr._create_output_thread(
+        0, make_zmq_socket(ctx, address, zmq.PULL, bind=True), "inproc://detok-ref"
+    )
+    thread.start()
+    push = raw.socket(zmq.PUSH)
+    push.connect(address)
+    engine = LPRuntime(LpId("engine"), TABLE, None)
+    frontend.start_run()
+    authority.started = time.monotonic()
+    for n in (2, 3):
+        out = RequestOutput(7, list(range(n)), False)
+        frame = pickle.dumps((EngineCoreRequestType.STREAM, [(7, out)]))
+        WrappedSocket(engine, push, OUT).send(frame)
+        engine.start_run()  # so only the first frame is unstamped
+    clock_transport.connect(LpId("engine"), run["clock_endpoint"]).send(
+        (NER, math.inf, engine.send_log, math.inf)
+    )
+    guard = threading.Timer(20, loop.call_soon_threadsafe, (loop.stop,))
+    guard.start()
+    try:
+        loop.run_forever()
+    finally:
+        guard.cancel()
+        stop = ctx.socket(zmq.PAIR)
+        stop.connect("inproc://detok-ref")
+        stop.send(b"")
+        thread.join(5)
+        loop.close()
+        ctx.destroy(linger=0)
+        raw.destroy(linger=0)
+        server.close()
+    assert compass_run.frontend_done(SimpleNamespace(close=lambda: None))
+    summary = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())
+    refusals = summary["schedule"]["refusals"]
+    print("refusals:", json.dumps(refusals))
+    assert refusals["reasons"] == [
+        ["clock:advance_to from EngineCoreOutputThread-DP0", 1]
+    ]
