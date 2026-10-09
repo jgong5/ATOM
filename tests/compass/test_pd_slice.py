@@ -14,7 +14,8 @@ With `ATOM_COMPASS_PD_DECODE_EXEC` set, such as ``docker exec <container>``,
 the decode server runs through it, in a second container on this node.
 
 Without a driver: a frontend answers a request from outside the run while its
-grant is out, both ends of the relay stamp, and the standalone authority.
+grant is out, both ends of the relay stamp, the standalone authority, and an
+idle decode engine that a finished transfer leaves with a request to run.
 """
 
 import asyncio
@@ -28,10 +29,12 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 import uvicorn
+from aiter_stub import stubbed_aiter
 from conftest import atom_config_double
 from starlette.responses import JSONResponse
 from test_vertical_slice import MODEL, TREE, WALL_S, Traffic, _free_port, _run_file
@@ -358,3 +361,31 @@ def test_the_standalone_authority_writes_the_step_table_at_the_finish(
     assert all(r.split()[2] == "inf" for r in rows)
     for conn in conns:
         conn.close()
+
+
+def test_an_idle_engine_runs_at_once_a_request_a_finished_transfer_left_ready(
+    monkeypatch,
+):
+    """Decode's idle pass polls its transfers after `schedule()`, so the request
+    a finished transfer leaves ready runs on the next pass, with no time between."""
+    with stubbed_aiter():
+        from atom.model_engine.engine_core import KV_IDLE_DRAIN_INTERVAL_S, EngineCore
+    rt = LPRuntime(LpId("engine"), TABLE, None)
+    rt.now = 2.0
+    monkeypatch.setattr(clock, "_installed", rt)
+    engine = EngineCore.__new__(EngineCore)
+    engine.kv_transfer_enabled = True
+    connector = SimpleNamespace(has_pending_work=lambda: True)
+    engine.scheduler = SimpleNamespace(
+        waiting=[SimpleNamespace(id=7)],
+        finished_recving_kv_req_ids=[],
+        failed_recving_kv_req_ids=[],
+        deferred_free_blocks={},
+        kv_connector=connector,
+    )
+    assert engine._idle_deadline() == 2.0 + KV_IDLE_DRAIN_INTERVAL_S
+    connector.has_pending_work = lambda: False
+    engine.scheduler.finished_recving_kv_req_ids.append(8)  # no such request waits
+    assert engine._idle_deadline() == INF
+    engine.scheduler.finished_recving_kv_req_ids.append(7)
+    assert engine._idle_deadline() == 2.0
