@@ -7,6 +7,9 @@ written against it yet; implementation follows the execution plan in `16`.
 **Depends on:** `07_calibration_toolchain.md` (the artifacts being validated),
 `06_workload_harness_contract.md` (the workload driving both sides).
 
+**Revised 2026-10-09 for `16` D95:** the acceptance cells are M2's (D50), the TTFT target is
+15%, the ranking gate is explicit (D50), and the MI455 projection has its own gate (D50.2).
+
 **Scope.** What counts as evidence: which results are reported, how each is measured, what
 tolerance applies and where that tolerance comes from, and what invalidates a run.
 Acceptance is paired simulated and real execution of cc-traces proper, so every rule here
@@ -67,8 +70,8 @@ saying those three need the driver is stale.
 | `test_scheduled_batch_marshal.py` | CPU | the IPC payloads the channel wrappers timestamp (`01` D4, K4/K5) |
 | `test_block_table_marshal.py` | **GPU only** | the block-table half of those same payloads — excluded at collection time, so the CPU tier does not see it |
 | `test_kv_connector_scheduler.py` | **neither** | the connector factory doc `01` D6 registers a simulated connector into — except that it runs nothing in either tier: `1 skipped`, because ATOM #690 split `kv_transfer_engine` into `moriio` and the test's imports were never updated. |
-| `test_disagg_modes.py`, `test_disagg_types.py` | CPU | the PD paths of M4/M6 |
-| `test_dp_load_balance.py`, `test_dp_metadata.py`, `test_dp_sync_layout.py` | CPU | the DP paths of M7 |
+| `test_disagg_modes.py`, `test_disagg_types.py` | CPU | the PD paths of M1's simulated 1P+1D run and of M2's 1P+1D cells |
+| `test_dp_load_balance.py`, `test_dp_metadata.py`, `test_dp_sync_layout.py` | CPU | the DP paths of M2's DP-attention cells |
 
 **The two "neither" rows above are a finding, not a gap in the table**, and there is a
 third file in the same position that was never listed here at all.
@@ -205,8 +208,9 @@ but "how close is real to itself".
 ```
 
 Self-calibrating per cell, and it makes an ungradeable cell visible instead of passed or
-failed: **if a cell's real-vs-real spread swamps the 10% acceptance target, that cell
-demonstrates nothing** and must be reported as such.
+failed: **if a cell's real-vs-real spread swamps the metric's acceptance target — 10%, or
+15% for TTFT (`README.md`) — that cell demonstrates nothing** for that metric and must be
+reported as such.
 
 **Repeats must be spaced or interleaved.** Consecutive repeats reported **−2.2% ± 0.1**
 where five separated runs of the same command spanned **−6.1 / −14.0 / −14.7 / −14.4 /
@@ -485,15 +489,22 @@ so it could not be — *"the held-out axis the user actually wants is configurat
 
 ### The cell matrix
 
-Given doc 07 D38's calibration recipe — full-engine calibration at TP1 only, plus one TP2
-transfer test — the acceptance cells span what calibration did **not**:
+**Revised for `16` D95.** The cells are the configurations ATOM's nightly runs define, not
+widths chosen to span what calibration did not see: M2 is graded at the widths those
+configurations run, so width transfer (T21) is not on the acceptance path. The nightly runs
+define the configurations, never the real side, which this project runs itself (`16`
+P0b.3). Two sets, each driven by cc-traces:
 
-| Axis | Cells |
-|---|---|
-| parallel width | TP1, TP2, TP4 (and TP8 for Kimi-K3) |
-| client count | 1, 4, 16, 64, 256 |
-| workload class | short, long |
-| PD topology | aggregated; disaggregated from M4 |
+| Set | Model and hardware | Configurations | Client counts |
+|---|---|---|---|
+| **Stage 2**, M2's first gate | Qwen3.8-27B on MI308X | TP1, aggregated | 1, 4, 16, 64, 256 |
+| **M2** | DeepSeek-V4-Pro, 1P+1D on the MI355X pair | the four nightly configurations of [`recipes/mesh/DeepSeek-V4.md`](../../../recipes/mesh/DeepSeek-V4.md) as written, expert parallelism off: TP, DPA, TP MTP3, DPA MTP1 | each configuration's benchmark concurrencies in that recipe |
+
+Flags and concurrencies are the recipe's; this document does not copy them. **M2's EP8
+step** adds the two DPA configurations re-run with `--enable-expert-parallel` (`16` W4.11),
+graded the same way, and joins them to the ranking gate below. The aggregated DPA+TBO
+variant in `.github/benchmark/models.json` is not a cell: D95 grades M2 at its P/D
+configurations only.
 
 Client count means **agent session trees**, not requests; in-flight exceeds it during
 fan-out. Each cell is one `aiperf profile` invocation — the scenario rejects
@@ -501,26 +512,39 @@ comma-separated sweeps.
 
 **One corpus limit to design around:** only **175 of 393** sessions contain any subagent
 and only **144** offer a multi-request episode containing a descendant. A 256-client cell
-requiring genuine fan-out in every root is not constructible without reusing sessions.
-Whatever is done there must be declared, not discovered.
+requiring genuine fan-out in every root is not constructible without reusing sessions, and
+the recipe's largest DPA concurrency exceeds the corpus's sessions, so the cells at that
+concurrency reuse sessions whatever they require. Whatever is done there must be declared,
+not discovered (T27).
+
+### The ranking gate
+
+T28 asked whether ranking becomes an explicit gate; for M2 it does. The prior effort
+called it the gate that matters, and D48 already makes the top-1 choice the memory gate.
+Over M2's cells, for each end-to-end metric of D44 separately — throughput, TPOT, TTFT,
+never a combination of them:
+
+1. **The same best configuration as hardware at each concurrency.** Among the
+   configurations run at one client count, the simulated best is the real best. Where the
+   real best and runner-up differ by less than their real-vs-real spread (D45), that client
+   count has no determined best and is reported ungradeable, not passed.
+2. **Rank correlation across all cells.** Spearman's ρ between simulated and real values
+   over every cell, graded as D45 grades any metric: it must lie inside the spread of the
+   same ρ taken real-vs-real. Client count alone orders much of a matrix spanning one to
+   hundreds of clients, so ρ is the weaker check of the two.
+
+Stage 2 runs one configuration, so it has no ranking to grade; it is graded by D44's
+results alone.
 
 ### The DP cells
 
-Owner's DP ruling, 2026-10-01
-([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)). DP
-acceptance uses the DP-attention configurations of DeepSeek-V4-Pro on MI355X below, which
-ATOM's nightly benchmarks already run, and no other model:
-
-| Cell | Where ATOM defines it |
-|---|---|
-| DPA+TBO | the `DPA TBO` variant of `DeepSeek-V4-Pro` in `.github/benchmark/models.json`: aggregated, TP 8, `--enable-dp-attention --enable-tbo` |
-| DPA+MTP1 | the `ds-v4-1p1d-dpa-tp8-mtp1` case in `.github/benchmark/models_atomesh.yaml`: 1P1D, TP 8 per side, `--method mtp --num-speculative-tokens 1 --enable-dp-attention`, and the prefill side also passes `--enable-tbo` |
-
-Each cell is judged by cc-traces e2e and by the per-step error spread (D47), never by a
-total. TBO under DP (#531) and tier b pricing for V4-Pro are prerequisites, so neither
-cell is acceptance evidence before both exist. The DPA+MTP1 cell exists only as this
-atomesh 1P1D case, so it needs the M4 deployment form and waits for P/D, which is parked
-([#443](https://github.com/jgong5/ATOM/issues/443#issuecomment-5955155129)).
+The owner's DP ruling of 2026-10-01
+([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)) puts DP
+acceptance on DeepSeek-V4-Pro's DP-attention configurations on MI355X and no other model;
+D95 narrows those to the recipe's DPA and DPA MTP1 configurations above. Each is judged by
+cc-traces e2e and by the per-step error spread (D47), never by a total. TBO under DP (#531)
+and tier b pricing for V4-Pro are prerequisites, so neither cell is acceptance evidence
+before both exist.
 
 The mechanism tests run device-free on a CPU fake-model DP2: both ranks report the same
 step seconds, equal to the larger of the two; an idle rank's dummy batch is priced and
@@ -532,6 +556,52 @@ enters the `max`; the batch view refuses a DP run that states no `num_tokens_acr
 The simulator is **deterministic by construction** under doc 01 D3 (Clock Authority, ties
 broken by LP id) — so: **one simulated run plus an asserted reproducibility test**, and
 N≥3 **spaced** real runs per cell to establish the noise floor.
+
+---
+
+## D50.2. A projection is sound, not graded
+
+### Problem
+
+M2's MI455 roofline projection (`16` D95) has no real side. D45's tolerance has no
+real-vs-real spread to measure and D44's results have nothing to compare against, so any
+error bar quoted on the projection would be invented.
+
+### Decision
+
+**The projection is held to three checks instead of an error bar.** A projection that
+fails the first two, or ships without the third's measurement, is not M2's result.
+
+1. **The roofline is a lower bound on every measured MI355X step.** The bound prices each
+   leaf by `10` D64 at the spec's peaks, every derate at 1, with no host floor, and
+   composes the leaves the way the step composes them: each `Par` through its own join
+   (`04`, `Par`: concurrency) and TBO's two micro-batches through `16` W4.6's overlap,
+   never summed across concurrent work. D64's flat `Σ t_leaf` is not a lower bound on a
+   step that overlaps work, such as V4's compressor and indexer on side streams or the DPA
+   prefill side's TBO. The `max` join, the `resource_bound` join at derate 1 and the
+   `exclusive` sum each still are. Tier 0's own price is not the bound: it is derated and
+   floored, a central estimate (`10` D67.1). Applied as D47 applies cost accuracy, on the
+   real runs' own unprofiled steps (D49): no step's bound may exceed its measured time. One
+   that does is a defect in a law or in the spec, reported with its operator family; it is
+   a bound, not a statistic, so none is tolerated. The measured-to-roofline efficiency is
+   reported per operator family as a distribution, never as a mean alone: a step's measured
+   time has no per-family split, so a family's efficiency is its leaves' roofline time over
+   their measured time in `16` W4.4's MI355X calibration tables. `16` W5.3 runs this check.
+2. **Every MI455 input is sourced or marked assumed.** A machine-spec field's source is the
+   provenance of the fragment that supplied it, as `05` D26's `merge` records; a field
+   marked assumed comes from a fragment whose provenance method is `assumed`, a method the
+   spec task (`16` W5.1) adds to `05` D25. The projection artifact lists the assumed
+   fields a tier-0 law reads. A field no fragment supplies is refused (principle 6). `16`
+   W5.1 and W5.4 carry it.
+3. **The method's error is measured where both sides exist.** The same method —
+   measured-to-roofline efficiencies carried from a measured device onto a target spec —
+   projects Qwen3.8-27B from MI308X to MI355X and is scored against real MI355X runs by
+   D44's three results (`16` W5.5). That score is the error estimate quoted with the MI455
+   projection. It estimates the method, not MI455: it is taken on another model and another
+   device pair, because DeepSeek-V4-Pro's FP4 experts do not run on gfx942.
+
+Where a claim about MI455 can be a ranking rather than an absolute, prefer the ranking
+(`10` D69).
 
 ---
 
@@ -608,7 +678,8 @@ claims there are not.
 | D48 | Memory per term, never as a sum. The gate is whether the top-1 configuration choice survives, not the byte error. | 2026-09-18 |
 | D49 | Seven hygiene refusals, each with a prior incident behind it. | 2026-09-18 |
 | D50.1 | A refusal marks and continues: priced by the next answerable rung, tagged `refused(reason)`, never zero and never skipped. Refused fraction of **seconds** is a reported result; **>5% refused seconds is not acceptance evidence**. | 2026-09-19 |
-| D50 | Everything registered and hashed before evaluation; the case set never shrinks. One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The DP cells are DeepSeek-V4-Pro DPA+TBO and DPA+MTP1 on MI355X, judged by cc-traces e2e and the per-step error spread; DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01 |
+| D50 | Everything registered and hashed before evaluation; the case set never shrinks. One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The cells are stage 2's Qwen3.8-27B TP1 on MI308X and M2's four nightly P/D configurations of DeepSeek-V4-Pro on MI355X at their concurrencies, then the DPA two at EP8. M2's ranking gate: the same best configuration as hardware at each concurrency, and rank correlation across all cells, per end-to-end metric, each inside its real-vs-real spread. DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01, 2026-10-09 |
+| D50.2 | The MI455 projection is sound, not graded: the roofline at the spec's peaks, derates at 1, no host floor, composed by the step's own joins and never summed across concurrent work, is a lower bound on every measured MI355X step; every MI455 input is sourced or marked assumed; the method's error is measured by projecting Qwen3.8-27B from MI308X to MI355X. | 2026-10-09 |
 | D51 | Measure a saturated cell early. Account cold costs once; report the simulator's own per-step CPU cost alongside the ratio. | 2026-09-18 |
 | D52 | Eight fail-closed invalidation conditions. Scheduling claims require slack; throughput claims at saturation are fine. | 2026-09-18 |
 
@@ -625,5 +696,5 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T24 | Define "structural event" for family 3 beyond prefill streaks | streaks may be an artefact of prefill-first scheduling |
 | T25 | Measure the real-vs-real noise floor under **closed-loop** replay at high client count | the only prior data is 20 requests, one session, declared arrivals |
 | T26 | Assert simulator bit-reproducibility as a test | depends on the Clock Authority existing |
-| T27 | Decide the 256-client cell's construction given only 144 fan-out-capable sessions | doc 06 T14, surfaces again here |
-| T28 | Establish whether ranking/regret becomes an explicit acceptance gate | the prior effort called it the gate that matters; the current acceptance table does not list it |
+| T27 | Decide the construction of the cells the corpus cannot fill without reusing sessions: 256 clients with fan-out in every root, and the recipe's largest DPA concurrency | doc 06 T14, surfaces again here |
+| ~~T28~~ | ~~Establish whether ranking/regret becomes an explicit acceptance gate~~ — **done**: M2's ranking gate, D50 | — |

@@ -12,7 +12,7 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — per topic. T10, T15, T22, T48, T65, T71, T84 and T91 are struck
+3. **TODO register** — per topic. T10, T15, T22, T28, T48, T65, T71, T84 and T91 are struck
    through as done, and T77 was opened and closed by P0.1. The register is the rows of section 3
    below and nothing else: prose elsewhere in this file names T-numbers that belong to
    other branches. It is allocated across parallel task branches, so not contiguous
@@ -125,8 +125,8 @@ M-f `14`; M-g `01` D3.5.
 | T24 | Define "structural event" for family 3 beyond prefill streaks |
 | T25 | Measure the real-vs-real noise floor under closed-loop replay at high client count |
 | T26 | Assert simulator bit-reproducibility as a test — mechanism now `01` D3.4; this item is the CI wiring |
-| T27 | Decide the 256-client cell's construction |
-| T28 | Establish whether ranking/regret becomes an explicit acceptance gate |
+| T27 | Decide the construction of the cells the corpus cannot fill without reusing sessions: 256 clients with fan-out in every root, and the recipe's largest DPA concurrency (`08` D50) |
+| ~~T28~~ | ~~Establish whether ranking/regret becomes an explicit acceptance gate~~ - **DONE**: `08` D50, M2's ranking gate |
 | ~~T48~~ | ~~What a refusal does to a run~~ - **DONE**: `08` D50.1, mark-and-continue with a 5%-of-seconds admissibility gate |
 
 ### Topic 09 — fitting and law selection

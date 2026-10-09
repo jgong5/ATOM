@@ -222,7 +222,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L5 | `compass plan` and the calibration phases | [`07_calibration_toolchain.md`](07_calibration_toolchain.md) | D36–D43 |
 | L5 | Machine spec schema and probes | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
 | L0 | Artifact store, keys, invalidation | [`07`](07_calibration_toolchain.md) | D41, D43 |
-| — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D50.1) |
+| — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D50.1, D50.2) |
 | L5 | Configuration surface: flags, precedence, the `compass` CLI | [`13_configuration_surface.md`](13_configuration_surface.md) | D78–D81 |
 | L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 |
 | L1/L3 | Parallelism: TP, DP, PP, EP | [`15_parallelism_support.md`](15_parallelism_support.md) | D88–D94 |
@@ -557,7 +557,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D24 – D26 (+ D25.1) | `05` Machine Specification and its Probes |
 | D27 – D35 (+ D34.1) | `06` Workload Harness Contract |
 | D36 – D43 (+ D38.1, D40.1) | `07` Calibration and Benchmarking Toolchain |
-| D43.1, D44 – D52 (+ D50.1) | `08` Validation Protocol |
+| D43.1, D44 – D52 (+ D50.1, D50.2) | `08` Validation Protocol |
 | D53 – D62 | `09` Fitting and Law Selection |
 | D63 – D70 (+ D67.1) | `10` Analytic Laws (Tier 0) |
 | D71 – D77 | `11` Engine Metrics under Virtual Time |
