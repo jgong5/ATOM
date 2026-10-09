@@ -233,6 +233,7 @@ def test_aiperf_ttft_and_latency_are_the_stamped_differences(tmp_path, monkeypat
         assert ttft == _ns(first) - _ns(sent)
         assert latency == _ns(finish) - _ns(sent)
         assert record.credit_drop_latency is None
+        assert record.timestamp_ns == _ns(sent)  # the run duration's anchor
     print("\ncredit  sent  first  finish  aiperf TTFT  aiperf latency")
     for row in rows:
         print("{:6d} {:5.3f} {:6.3f} {:7.3f} {:12.3f} {:15.3f}".format(*row))
