@@ -500,14 +500,16 @@ their own hardware, and a coarse wave cannot be claimed as an issue. Every row t
 |---|---|---|---|---|
 | **W4.1** | `compass plan` and the CLI; calibration Phase 0 discovery and Phase 1a trace; the standalone `ModelRunner` bench | `cli/`, `capture/` | 400–700 | W2.4, W2.5 |
 | **W4.2** | DeepSeek-V4-Pro capture: a fake or meta implementation for every operator P0b.1 names — shape and dtype rules, no math — plus #501's launch interceptor for Triton, FlyDSL and MORI and its two host-query rules, with no ATOM change | `capture/`, `ir/` | 600–1000 | **P0b.1** |
-| **W4.3** | The real side: the nightly P/D configurations of `recipes/mesh/DeepSeek-V4.md` (TP; DP-attention + TBO; TP + MTP3; DP-attention + MTP1) on the MI355X pair, driven by cc-traces, with per-request records and a real-vs-real repeat per cell for the noise floor (`08` D45); then the EP8 cells, the DP-attention cells re-run with `--enable-expert-parallel` | `scripts/compass/` | 200–350 | **P0b.3**, GPU queue |
-| **W4.4** | Calibration Phases 1b / 1c on MI355X for DeepSeek-V4-Pro's operator families: FP4 MoE GEMMs, MLA attention, the CSA indexer, mHC, the DP group's variable-size gather; MORI dispatch/combine within a node for the EP8 step | `backends/`, calibration | 400–700 | W4.1, W4.2, GPU queue |
+| **W4.3** | The real side: the nightly P/D configurations of `recipes/mesh/DeepSeek-V4.md` (TP; DP-attention + TBO; TP + MTP3; DP-attention + MTP1) on the MI355X pair, driven by cc-traces, with per-request records and a real-vs-real repeat per cell for the noise floor (`08` D45) | `scripts/compass/` | 200–350 | **P0b.3**, GPU queue |
+| **W4.4** | Calibration Phases 1b / 1c on MI355X for DeepSeek-V4-Pro's operator families: FP4 MoE GEMMs, MLA attention, the CSA indexer, mHC, the DP group's variable-size gather | `backends/`, calibration | 400–700 | W4.1, W4.2, GPU queue |
 | **W4.5** | Fitting and law selection for those families (`09`) | `backends/` | 300–500 | W4.4 |
-| **W4.6** | The DP-attention step: the `max` over the DP group's ranks (W3.1) with the gather priced from W4.4, and TBO's overlap; at EP8, the all-to-all W4.10 prices in its place | `backends/` | 300–500 | W3.1, W4.5 |
+| **W4.6** | The DP-attention step: the `max` over the DP group's ranks (W3.1) with the gather priced from W4.4, and TBO's overlap | `backends/` | 300–500 | W3.1, W4.5 |
 | **W4.7** | MTP: per-position acceptance measured from W4.3's real runs, never declared (`08`), feeding the spec-decode pricing of `14` | `runner/`, `backends/` | 200–350 | W4.3 |
 | **W4.8** | Mooncake transfer time from the spec, checked against the transfer timings W4.3 records | `kv/` | 150–250 | W2.3, W4.3 |
 | **W4.9** | DeepSeek-V4-Pro 1P+1D at the nightly topology: W3.5's slice with one container per node, TP8 and DP-attention on each side as the cell sets it | wiring | 150–300 | W3.1, W3.5, W4.2 |
-| **W4.10** | M2's EP8 step: `exclusive` occupancy honoured in the IR; group membership per P0.6; MORI dispatch/combine carried as the group's collective and priced from W4.4 by a routing model (#501) | `ir/`, `backends/` | 350–600 | **P0.6**, **P0b.2**, W4.5, W4.6 |
+| **W4.10** | M2's EP8 step: `exclusive` occupancy honoured in the IR; group membership per P0.6; MORI dispatch/combine carried as the group's collective in W4.6's step, in place of the gather, and priced from W4.12 by a routing model (#501) | `ir/`, `backends/` | 350–600 | **P0.6**, **P0b.2**, W4.6, W4.12 |
+| **W4.11** | The EP8 real side: W4.3's DP-attention cells re-run with `--enable-expert-parallel` on the MI355X pair, with the same records and repeat, since no nightly cell passes it | `scripts/compass/` | 50–100 | W4.3, GPU queue |
+| **W4.12** | MORI dispatch/combine within a node on MI355X, measured and fitted (`09`) for W4.10's routing model | `backends/`, calibration | 150–300 | W4.1, W4.2, GPU queue |
 
 ### Wave 5 — MI455 by roofline
 
@@ -519,15 +521,17 @@ their own hardware, and a coarse wave cannot be claimed as an issue. Every row t
 | **W5.4** | The projection: MI355X efficiencies from W5.3 carried onto the MI455 spec, with every assumption written into the artifact | `backends/`, `artifacts/` | 150–300 | W5.1, W5.3 |
 | **W5.5** | The method's error: Qwen3.8-27B's MI308X tables projected to MI355X by W5.4's method and scored against real MI355X runs | `cli/` | 150–250 | W5.4, GPU queue |
 
-If MI455 hardware arrives during M2, W4.3–W4.5 repeat on it, and W5.4's projection becomes
+If MI455 hardware arrives during M2, W4.3–W4.5 repeat on it (W4.11 and W4.12 too, for the
+EP8 step), and W5.4's projection becomes
 a calibration.
 
 ### Wave 6 — M2 acceptance
 
 | ID | Task | Module | Effort | Depends on |
 |---|---|---|---|---|
-| **W6.1** | Paired acceptance over W4.3's cells, expert parallelism off and then EP8: the separable results of `08` D44, plus the ranking gate — the same best configuration as hardware at each concurrency, and rank correlation across all cells | `cli/` | 250–400 | W4.6–W4.10 |
+| **W6.1** | Paired acceptance over W4.3's cells, expert parallelism off: the separable results of `08` D44, plus the ranking gate — the same best configuration as hardware at each concurrency, and rank correlation across all cells | `cli/` | 250–400 | W4.6–W4.9 |
 | **W6.2** | The speed check on a saturated acceptance cell, against the target in `README.md` | `cli/` | ~100 | W6.1 |
+| **W6.3** | M2's EP8 step graded the same way: W6.1 over W4.11's cells, with W4.3's cells in the ranking | `cli/` | ~100 | W4.10, W4.11, W6.1 |
 
 ---
 
@@ -546,8 +550,8 @@ Listed so it is not mistaken for an omission; each is re-planned when v1 lands.
 
 ## The GPU booking queue
 
-**M2's hardware, by D95.** An RDMA-connected MI355X pair for W4.3's paired runs, and a
-third MI355X node for W4.4, so that calibration does not queue behind the pairs; an MI308X
+**M2's hardware, by D95.** An RDMA-connected MI355X pair for the paired runs of W4.3 and W4.11, and a
+third MI355X node for W4.4 and W4.12, so that calibration does not queue behind the pairs; an MI308X
 node for development, the CPU-and-GPU gates and W5.5's MI308X side. Until dedicated nodes
 exist, the shared pools below serve, with the pre-flight gate as written.
 

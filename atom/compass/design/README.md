@@ -373,9 +373,8 @@ One thing that **is** in scope and is worth stating as a limit rather than a non
   *reconstructed rather than recorded* is the **join**: no field in the corpus says a parent
   resumed because a child finished, so the harness imposes SPAWN/JOIN linkage. That is a
   fidelity caveat on the workload, not a scope exclusion.
-- **Asymmetric parallelism (EP, PP, DP).** M7 names all three, so they are in scope. There
-  is no design for them yet; that is a **gap**, recorded as `12` M-d, to be written before
-  M7 starts rather than deferred indefinitely.
+- **Asymmetric parallelism (EP, PP, DP).** DP-attention and EP8 within a node are in M2;
+  PP and EP beyond one node come after v1 (`16` D95). `15` designs all three.
 
 ---
 

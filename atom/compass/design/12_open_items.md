@@ -12,8 +12,8 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — per topic. T10, T15, T22, T48, T65 and T91 are struck through as
-   done, and T77 was opened and closed by P0.1. The register is the rows of section 3
+3. **TODO register** — per topic. T10, T15, T22, T48, T65, T71, T84 and T91 are struck
+   through as done, and T77 was opened and closed by P0.1. The register is the rows of section 3
    below and nothing else: prose elsewhere in this file names T-numbers that belong to
    other branches. It is allocated across parallel task branches, so not contiguous
 4. **Cross-cutting issues and pending amendments**
