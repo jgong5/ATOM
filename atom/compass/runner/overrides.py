@@ -123,7 +123,7 @@ logger = logging.getLogger(__name__)
 # `RapidServeModelRunner`, the rest to the rollout extension. The rollout names
 # do reach this runner: `AsyncLLMEngine.__init__` (`atom/rollout/async_engine.py`)
 # installs its own runner with `kwargs.setdefault`, so a caller that names this
-# one gets it, and `RefusedControlCommands` answers all seven with a refusal.
+# one gets it, and `RefusedControlCommands` answers each with a refusal.
 # The RapidServe names are kept out by `Config`, not by
 # this module: `enable_rapidserve` picks `PrefillEngineCore` /
 # `DecodeEngineCore` (`LLMEngine.__init__`), those classes broadcast all of
@@ -133,16 +133,6 @@ logger = logging.getLogger(__name__)
 # overwrites. `Config` therefore raises `ValueError` for
 # `enable_rapidserve=True` with any runner not in `RAPIDSERVE_RUNNERS`, this
 # one included.
-#
-# Also outside the table, and outside anything a broadcast-derived enumeration
-# can see: some of these names are called in-process on the runner itself,
-# reached over the `resume_memory` RPC (`atom/rollout/memory_manager.py`).
-# `MemoryManagerMixin._resume_kv_cache` subscripts one key of `get_num_blocks`
-# and discards `allocate_kv_cache`, and
-# `MemoryManagerMixin._recapture_cudagraphs_if_needed` calls
-# `capture_cudagraph` without unpacking it, inside a `try` that degrades to
-# `enforce_eager=True`. Different arities, and the one place in the tree where
-# a refusal from this module would be caught rather than fatal.
 #
 # Call sites below are in `atom/model_engine/`.
 RPC_SURFACE: dict[str, bool] = {
@@ -298,7 +288,6 @@ def _refused(method: str):
         )
         return reason
 
-    refuse.__name__ = refuse.__qualname__ = method
     return refuse
 
 
@@ -326,8 +315,8 @@ class RefusedControlCommands:
         """Every refusal this runner answered, in order, for the run summary.
 
         A method rather than an attribute so the engine can read it over the
-        same RPC the commands came in on; a tuple, so an empty answer still
-        reaches the caller.
+        same RPC the commands came in on; a tuple, so the caller gets a copy
+        and not the list the runner keeps appending to.
         """
         return tuple(vars(self).get("_refused_commands", ()))
 
