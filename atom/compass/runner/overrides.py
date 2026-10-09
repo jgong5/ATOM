@@ -256,9 +256,9 @@ class HostStream:
 def start_on_host(runner: Any, rank: int, config: Any) -> None:
     """Start a TP1 runner on the host: no device set, its groups on gloo.
 
-    Replaces ATOM's `_setup_device_and_distributed`, the first thing
-    `ModelRunner.__init__` calls, so every buffer the rest of `__init__` builds
-    on `runner.device` lands on the host. Two touches there do not follow the
+    Replaces ATOM's `_setup_device_and_distributed`, which
+    `ModelRunner.__init__` calls before it builds any buffer, so every buffer
+    the rest of `__init__` builds on `runner.device` lands on the host. Two touches there do not follow the
     device: `torch.cuda.Stream` refuses `cpu`, and `CpuGpuBuffer` pins its host
     half, which is a driver allocation. Both are replaced for the life of the
     worker process, which hosts this runner and nothing else.

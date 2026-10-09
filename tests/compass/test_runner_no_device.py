@@ -20,10 +20,10 @@ from atom.utils import CpuGpuBuffer
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
 
-def _config(tp=1, dp=1):
+def _config(tp=1, dp=1, simulated_tp=None):
     return SimpleNamespace(
         tp_world_size=tp,
-        tensor_parallel_size=tp,
+        tensor_parallel_size=tp if simulated_tp is None else simulated_tp,
         prefill_context_parallel_size=1,
         pipeline_parallel_size=1,
         master_addr="127.0.0.1",
@@ -95,7 +95,7 @@ def test_a_stream_built_after_it_is_a_host_stand_in_that_cannot_queue_work(start
         stream.synchronize()
 
 
-@pytest.mark.parametrize("width", [{"tp": 2}, {"dp": 2}])
+@pytest.mark.parametrize("width", [{"tp": 2}, {"dp": 2}, {"simulated_tp": 2}])
 def test_a_start_wider_than_one_rank_is_refused_before_anything_is_replaced(
     started, width
 ):
