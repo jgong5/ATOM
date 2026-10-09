@@ -83,7 +83,12 @@ CLOCK_READS = (
 #: directory names ending at the entry, so the same entry works from any root
 #: the check is run from and a directory that merely ends in the same letters
 #: does not collect the exemption.
-DEFAULT_ALLOW_LIST: dict[str, str] = {}
+DEFAULT_ALLOW_LIST: dict[str, str] = {
+    "atom/compass/run/__init__.py": (
+        "the run summary's wall seconds, from the run's start to its finish: "
+        "the speed result, which no simulated time reads"
+    ),
+}
 
 #: Packages under `atom/` a simulated run never executes, or that keep their
 #: own gate: `compass` its own, `mesh` is Rust, `benchmarks` and `examples` are

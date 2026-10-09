@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-from atom.compass import run as compass_run
 from atom.compass.runner.overrides import (
     RPC_SURFACE,
     NonAllocatingRunner,
@@ -47,15 +46,11 @@ class CompassModelRunner(NonAllocatingRunner, ModelRunner):
     runner as `compass_readings`. It also sets `config.num_kvcache_blocks`,
     which is a count and not a buffer.
 
-    `NonAllocatingRunner` comes first so its methods win over the base's. The
-    base runs all of its own `__init__` before this one gets control, so no
-    state set here is visible to it; on a simulated run, this then installs
-    the cost backend and the device readings the run file declares.
+    `NonAllocatingRunner` comes first so its methods win over the base's. There
+    is deliberately no `__init__`: the base runs all of its own before a
+    subclass body would get control, so there is no point at which state set
+    here would be visible to it.
     """
-
-    def __init__(self, rank: int, config) -> None:
-        super().__init__(rank, config)
-        compass_run.runner(self)
 
 
 _UNANSWERED = unanswered_rpc_names(CompassModelRunner)

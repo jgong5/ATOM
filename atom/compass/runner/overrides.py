@@ -339,6 +339,9 @@ class NonAllocatingRunner(RefusedControlCommands):
         never fills `seq.spec_token_ids`, and reads the zeros), so a caller
         that asked for speculation would get a prediction with it off and no
         error.
+
+        What stands in for the model is installed here instead, on a simulated
+        run: the cost backend and the device readings its run file declares.
         """
         self.model = UnbuiltModel(model_class)
         # Cleared on the way out, as both of ATOM's own implementations do: the
@@ -352,6 +355,9 @@ class NonAllocatingRunner(RefusedControlCommands):
                 "nothing about it; speculative decoding has no step semantics "
                 "here yet."
             )
+        from atom.compass import run
+
+        run.runner(self)
         logger.info(
             "%s not built and no checkpoint read; no weight bytes on the device.",
             self.model.model_class_name,

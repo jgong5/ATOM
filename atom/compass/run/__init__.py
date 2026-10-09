@@ -19,7 +19,7 @@ Authority is co-hosted in the frontend's process and served at the run file's
   same way, and maps every DP rank to the engine LP for the process-group
   check.
 - `runner(runner)` installs the cost backend and the device readings on a
-  `CompassModelRunner` as it is constructed, in the worker process.
+  `CompassModelRunner` where it would build its model, in the worker process.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
   finish; the frontend's writes the step table and the run summary.
 
