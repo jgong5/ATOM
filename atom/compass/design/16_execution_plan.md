@@ -517,7 +517,7 @@ their own hardware, and a coarse wave cannot be claimed as an issue. Every row t
 |---|---|---|---|---|
 | **W5.1** | The MI455 machine spec in the `05` schema; every field sourced or marked assumed | `spec/` | 100–200 | **P0b.4** |
 | **W5.2** | Tier-0 laws for DeepSeek-V4-Pro's operator families, per precision (`10`) | `backends/` | 400–600 | W4.2 |
-| **W5.3** | The soundness check (`08` D50.2): the roofline at the spec's peaks, derates at 1 and no host floor, is a lower bound on every measured MI355X step; the measured-to-roofline efficiency reported per operator family | `backends/`, `cli/` | 150–250 | W4.4, W5.2 |
+| **W5.3** | The soundness check (`08` D50.2): the roofline at the spec's peaks, derates at 1 and no host floor, composed by the step's `Par` joins and TBO's overlap, is a lower bound on every measured MI355X step; the measured-to-roofline efficiency reported per operator family from W4.4's tables | `backends/`, `cli/` | 150–250 | W4.4, W4.6, W5.2 |
 | **W5.4** | The projection: MI355X efficiencies from W5.3 carried onto the MI455 spec, with every assumption written into the artifact | `backends/`, `artifacts/` | 150–300 | W5.1, W5.3 |
 | **W5.5** | The method's error: Qwen3.8-27B's MI308X tables projected to MI355X by W5.4's method and scored against real MI355X runs | `cli/` | 150–250 | W5.4, GPU queue |
 

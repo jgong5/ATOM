@@ -572,14 +572,21 @@ error bar quoted on the projection would be invented.
 **The projection is held to three checks instead of an error bar.** A projection that
 fails the first two, or ships without the third's measurement, is not M2's result.
 
-1. **The roofline is a lower bound on every measured MI355X step.** The bound is `10` D64's
-   leaf sum at the spec's peaks: every derate at 1 and no host floor. Tier 0's own price is
-   not the bound: it is derated and floored, a central estimate (`10` D67.1). Applied as D47
-   applies cost accuracy, on the real runs' own unprofiled steps (D49): no step's bound may
-   exceed its measured time. One that does is a defect in a law or in the spec, reported
-   with its operator family; it is a bound, not a statistic, so none is tolerated. The
-   measured-to-roofline efficiency, the bound over the measured time, is reported per
-   operator family as a distribution, never as a mean alone. `16` W5.3 runs this check.
+1. **The roofline is a lower bound on every measured MI355X step.** The bound prices each
+   leaf by `10` D64 at the spec's peaks, every derate at 1, with no host floor, and
+   composes the leaves the way the step composes them: each `Par` through its own join
+   (`04`, `Par`: concurrency) and TBO's two micro-batches through `16` W4.6's overlap,
+   never summed across concurrent work. D64's flat `Σ t_leaf` is not a lower bound on a
+   step that overlaps work, such as V4's compressor and indexer on side streams or the DPA
+   prefill side's TBO. The `max` join, the `resource_bound` join at derate 1 and the
+   `exclusive` sum each still are. Tier 0's own price is not the bound: it is derated and
+   floored, a central estimate (`10` D67.1). Applied as D47 applies cost accuracy, on the
+   real runs' own unprofiled steps (D49): no step's bound may exceed its measured time. One
+   that does is a defect in a law or in the spec, reported with its operator family; it is
+   a bound, not a statistic, so none is tolerated. The measured-to-roofline efficiency is
+   reported per operator family as a distribution, never as a mean alone: a step's measured
+   time has no per-family split, so a family's efficiency is its leaves' roofline time over
+   their measured time in `16` W4.4's MI355X calibration tables. `16` W5.3 runs this check.
 2. **Every MI455 input is sourced or marked assumed.** A machine-spec field's source is the
    provenance of the fragment that supplied it, as `05` D26's `merge` records; a field
    marked assumed comes from a fragment whose provenance method is `assumed`, a method the
@@ -672,7 +679,7 @@ claims there are not.
 | D49 | Seven hygiene refusals, each with a prior incident behind it. | 2026-09-18 |
 | D50.1 | A refusal marks and continues: priced by the next answerable rung, tagged `refused(reason)`, never zero and never skipped. Refused fraction of **seconds** is a reported result; **>5% refused seconds is not acceptance evidence**. | 2026-09-19 |
 | D50 | Everything registered and hashed before evaluation; the case set never shrinks. One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The cells are stage 2's Qwen3.8-27B TP1 on MI308X and M2's four nightly P/D configurations of DeepSeek-V4-Pro on MI355X at their concurrencies, then the DPA two at EP8. M2's ranking gate: the same best configuration as hardware at each concurrency, and rank correlation across all cells, per end-to-end metric, each inside its real-vs-real spread. DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01, 2026-10-09 |
-| D50.2 | The MI455 projection is sound, not graded: the roofline at the spec's peaks, derates at 1 and no host floor, is a lower bound on every measured MI355X step; every MI455 input is sourced or marked assumed; the method's error is measured by projecting Qwen3.8-27B from MI308X to MI355X. | 2026-10-09 |
+| D50.2 | The MI455 projection is sound, not graded: the roofline at the spec's peaks, derates at 1, no host floor, composed by the step's own joins and never summed across concurrent work, is a lower bound on every measured MI355X step; every MI455 input is sourced or marked assumed; the method's error is measured by projecting Qwen3.8-27B from MI308X to MI355X. | 2026-10-09 |
 | D51 | Measure a saturated cell early. Account cold costs once; report the simulator's own per-step CPU cost alongside the ratio. | 2026-09-18 |
 | D52 | Eight fail-closed invalidation conditions. Scheduling claims require slack; throughput claims at saturation are fine. | 2026-09-18 |
 
