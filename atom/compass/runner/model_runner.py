@@ -21,7 +21,9 @@ class CompassModelRunner(NonAllocatingRunner, ModelRunner):
     block manager, the prefix index -- is ATOM's own and runs unchanged. What
     this class removes is the weights, the KV tensors, the graph capture and the
     step itself, by overriding the six methods that own them; see `overrides`,
-    which holds the bodies and says why each one does what it does.
+    which holds the bodies and says why each one does what it does. Through
+    `NonAllocatingRunner` it also inherits `RefusedControlCommands`, which
+    answers the worker methods behind ATOM's utility commands with a refusal.
 
     Construction is not free of device memory. Almost all of what stays
     resident is the base's forward-vars ring from `allocate_forward_vars`,
