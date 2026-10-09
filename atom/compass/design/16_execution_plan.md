@@ -11,8 +11,9 @@ allocated. Neither is counted here. The register is owned by `12`, restated once
 not own it has been stale before, and "open items" and "registered items" are two different
 numbers that a single figure here cannot distinguish.
 
-**Revised 2026-09-30 by D95 (draft, under review).** Priorities changed: M1 is redefined
-around DeepSeek-V4-Pro's P/D deployment, and M2 is v1. Phase 0 through Wave 3 stand, with
+**Revised 2026-09-30 by D95 (draft, under review), and aligned with the e2e stage order
+of [#627](https://github.com/jgong5/ATOM/issues/627).** Priorities changed: M1 is #627's
+stages 1 and 1b, and M2 is v1, its stage 3. Phase 0 through Wave 3 stand, with
 the rows D95 changes marked in place; Phase 0b is new; Waves 4–6 replace the coarse
 sketch that followed Wave 3.
 
@@ -33,21 +34,30 @@ focus is now an **MoE model with wide expert parallelism and P/D disaggregation*
 **full support on MI355X** and **roofline projection for MI455**. Calibration and pricing
 move onto MI455 as soon as MI455 hardware is available.
 
+Three owner rulings shape the milestones below: Compass work is ordered by the end-to-end
+cc-traces stages of [#627](https://github.com/jgong5/ATOM/issues/627); the real side is
+re-run on hardware this project books ([#503](https://github.com/jgong5/ATOM/issues/503));
+and a host that holds a GPU may run a GPU-free stage
+([#472](https://github.com/jgong5/ATOM/issues/472)).
+
 ### Decision
 
 - **The model is DeepSeek-V4-Pro as ATOM ships it** — routed experts in FP4 (e2m1
   microscaling), the rest in FP8. ATOM already serves it 1P+1D through atomesh and
   Mooncake with DP-attention, EP over MORI all-to-all, TBO and MTP, nightly on MI355X
-  (`recipes/mesh/DeepSeek-V4.md`), and carries gfx1250 paths for it. Every nightly
-  configuration is ground truth this project does not have to build.
+  (`recipes/mesh/DeepSeek-V4.md`), and carries gfx1250 paths for it. The nightly runs
+  define the configurations to measure; they are not ground truth. The real side runs on
+  the dedicated MI355X pair (P0b.3).
 - **Wide EP means DP-attention + EP8 within a node.** A P/D deployment is one prefill node
   and one decode node. EP beyond one node is out of scope, not projected.
-- **M1 is redefined** (`README.md` owns its text): GPU-free as deployed for that
-  topology — the PDES clock over 1P+1D, DP-attention + EP8 inside each node, Mooncake KV
-  transfer — and the same scheduling decisions as the real engine. Its exit criterion is
-  under *Wave 3*.
-- **M2 is v1**: DeepSeek-V4-Pro 1P+1D measured on MI355X within the acceptance targets,
-  and the MI455 roofline projection. Its grading is under *Waves 4–6*.
+- **M1 is #627's stages 1 and 1b** (`README.md` owns its text): cc-traces end to end on a
+  simulated run, at TP1 and then 1P+1D through atomesh, each ended by the finish. The run
+  is GPU-free: no compute and no allocation on the device. The scheduling-parity test
+  leaves M1 for M2. Its exit criterion is under *Wave 3*.
+- **M2 is v1, #627's stage 3**: DeepSeek-V4-Pro 1P+1D on MI355X, first with the same
+  scheduling decisions as the real engine, then within the acceptance targets; and the
+  MI455 roofline projection. **Stage 2 is its first gate**: Qwen3.8-27B TP1 on MI308X,
+  paired real and simulated cc-traces graded by `08`. Its grading is under *Waves 4–6*.
 - **The TTFT target is 15%, not 10%** (`README.md`). TTFT is the hardest serving metric
   to predict in every surveyed tool, and it carries prefill, queueing and P/D transfer at
   once. The other targets stand.
@@ -64,12 +74,13 @@ move onto MI455 as soon as MI455 hardware is available.
 
 | Old | Where its scope went |
 |---|---|
-| M1 | Redefined above; PP2 leaves its exit test |
-| M2, M3 | Qwen3.8-27B is the development and CI model and the projection check of M2, not a milestone |
+| M1 | Redefined above as #627 stages 1 and 1b; its scheduling-parity test moves to M2, and PP2 leaves that test |
+| M2 | M2's first gate, #627 stage 2: Qwen3.8-27B TP1 on MI308X, paired and graded by `08` |
+| M3 | Not a milestone: Qwen3.8-27B is the development and CI model and the projection check of M2 |
 | M3.5 | Into M2: MTP runs in the nightly configurations |
-| M4 | Into M1 (mechanism) and M2 (accuracy), on DeepSeek-V4-Pro and MI355X |
+| M4 | Into M1 (the simulated 1P+1D run) and M2 (accuracy, on DeepSeek-V4-Pro and MI355X) |
 | M5, M6 | Replaced by DeepSeek-V4-Pro |
-| M7 | EP into M1 and M2; DP as DP-attention into M1 and M2; PP deferred |
+| M7 | EP, and DP as DP-attention, into M2; PP deferred |
 
 ### Consequences
 
@@ -150,13 +161,13 @@ on anything else, and each ends in an escalation, not a decision.
 |---|---|---|---|---|
 | **P0b.1** | Trace DeepSeek-V4-Pro under `FakeTensorMode` with `--load_dummy empty` at the nightly shape (TP8, DP-attention + EP8, MTP on). Name every operator with no fake or meta implementation — the FP4 MoE, the CSA indexer, mHC, MORI dispatch/combine, the MTP draft path are the expected ones — and whether each needs a shape rule only or more | spike → `capture/` | ~200 LOC | CPU container; a clean node only if model construction reaches the driver |
 | **P0b.2** | DP-attention + EP8 in the fake-model run: which per-step exchanges the DP group makes (metadata sync, dummy batches for idle ranks, the MORI all-to-all), and whether each is already a classified site in `atom/compass/audit/sync_sites.json` | reading + one CPU run | ~50 LOC | — |
-| **P0b.3** | What the real side already records: can the nightly P/D runs of `recipes/mesh/DeepSeek-V4.md` supply per-request timings and the exact launch configuration, or must the paired runs be re-run on the dedicated MI355X pair. The runs live in upstream CI (`.github/workflows/atomesh-benchmark.yaml`) with logs on cluster storage, so this has two halves: what a run records, read from the workflow and its bench scripts; and access to the logs, which is the owner's | reading + owner input | ~0 | — |
+| **P0b.3** | What the real side needs recorded: per-request timings and the exact launch configuration. The nightly P/D runs of `recipes/mesh/DeepSeek-V4.md` define the configurations, not ground truth: the owner ruled on #503 that the paired runs are re-run on the dedicated MI355X pair. What is left is reading what a run records from the upstream workflow (`.github/workflows/atomesh-benchmark.yaml`) and its bench scripts, so W4.3 records the same | reading | ~0 | — |
 | **P0b.4** | The MI455 inputs: which fields of the `05` machine spec the tier-0 laws need for DeepSeek-V4-Pro's operator families (matrix-core rate per precision including FP4 and FP8, HBM and LDS bandwidth, the in-node fabric), and for each one a source or an "assumed" mark | reading + owner input | ~0 | — |
 
 **P0b.1 is the one most likely to reshape Waves 4–6**, for the reason P0.4 was: if the
-trace fails, `capture/` and the whole pricing path change shape. **P0b.3 and P0b.4 need the
-owner** for their second halves — access to upstream CI's logs, and pre-release MI455
-numbers — because each is an organisational question, not an engineering one.
+trace fails, `capture/` and the whole pricing path change shape. **P0b.4 needs the
+owner** for its second half, pre-release MI455 numbers, because it is an organisational
+question, not an engineering one.
 
 ---
 
@@ -441,7 +452,11 @@ Depends on Wave 1. The first three are the vertical slice.
 | **W3.6** | cc-traces harness driving a simulated run end to end | 300–500 | consumes W1.9 |
 | **W3.7** | CA observability: timeline log, stall diagnostic, run summary (`01` D3.5) | 300–450 | |
 
-**M1's exit criterion**, per `15` D94 as revised by D95, needs no cost model: **does a
+**M1's exit criterion** is #627's stages 1 and 1b, and needs no cost model: cc-traces
+through agentx-harness on a simulated TP1 run (W3.6), then through agentx-harness and
+atomesh on a simulated 1P+1D run (W3.5), each ended by the finish and both GPU-free.
+
+**The scheduling-parity test opens M2**, per `15` D94 as revised by D95: **does a
 fake-model run reach the same scheduling decisions as the real engine at the same
 configuration** — first at TP2 / DP2 / EP2 on one node, where it is cheap, with EP2 in its
 non-degenerate form, `-tp 2 --enable-dp-attention --enable-expert-parallel` (T84); then at
@@ -506,6 +521,7 @@ Listed so it is not mistaken for an omission; each is re-planned when v1 lands.
 - PP: W3.2, T64, and PP's accuracy.
 - EP beyond one node, and the multi-node rank mapping of T85.
 - GLM-5.2, Kimi-K3 and other models; MXFP4 beyond DeepSeek-V4-Pro's own experts.
+- DCP (decode context parallelism).
 - Width transfer (T21) as a claim.
 - The upstream RFC for ATOM-core edits.
 
@@ -592,7 +608,7 @@ decision that belongs to the project owner, not to the agent that ran it.
 | ~~**T10** fails~~ | ~~adapter cost rises to ~2,000 vendored lines — vendor, fork, or restrict the harness~~ — **did not fire.** P0.3, 2026-09-20: the subclass works and nothing is vendored. The escalation this row prepared for never arose |
 | **T5** fails | tier b has no IR at TP>1 — options and their effect on M2 onward |
 | **P0b.1** finds an operator that needs more than a shape rule | W4.2 grows or DeepSeek-V4-Pro's M2 depends on a stand-in — options and their cost |
-| **P0b.3** finds the nightly runs unusable as ground truth | every paired cell is re-run on the dedicated pair — W4.3's GPU booking grows |
+| ~~**P0b.3** finds the nightly runs unusable~~ | **ruled by the owner on #503**: every paired cell is re-run on the dedicated pair, and W4.3 is booked for it |
 | **P0b.4** leaves an MI455 input unsourced | the projection ships with that input marked assumed, or waits — the owner's call |
 | ~~**T21** fails~~ | ~~calibration does not transfer across width~~ — **off the critical path by D95**: M2 is graded at the nightly widths |
 | **T25** fails | the noise floor swamps 10% at high client count — those cells are **ungradeable**, and the acceptance set needs re-scoping |

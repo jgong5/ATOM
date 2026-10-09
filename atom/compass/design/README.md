@@ -332,8 +332,8 @@ Final proof is **paired simulated and real execution of cc-traces proper**.
 
 | # | Milestone |
 |---|---|
-| **M1** | **GPU-free as deployed, for DeepSeek-V4-Pro's P/D deployment** (`16` D95): the discrete-event foundation; fake models covering prefill, decode, KV need and TP/DP/EP; the test harness; 1P+1D through atomesh and Mooncake with DP-attention + EP8 inside each node; the same scheduling decisions as the real engine |
-| **M2 — v1** | **DeepSeek-V4-Pro 1P+1D on MI355X within the targets above**, graded by the separable results of `08` D44 and the configuration-ranking gate; **the MI455 roofline projection**, held to the soundness checks of `16` D95 |
+| **M1** | **[#627](https://github.com/jgong5/ATOM/issues/627) stages 1 and 1b: cc-traces end to end on a GPU-free simulated run** (`16` D95). Stage 1 drives cc-traces through agentx-harness at TP1; stage 1b adds atomesh at 1P+1D; each run ends by the finish. Built on the discrete-event foundation, fake models covering prefill, decode and KV need, and the test harness |
+| **M2 — v1** | **#627 stage 3: DeepSeek-V4-Pro 1P+1D on MI355X within the targets above** — first the same scheduling decisions as the real engine, then the separable results of `08` D44 and the configuration-ranking gate; **the MI455 roofline projection**, held to the soundness checks of `16` D95. **First gate, #627 stage 2:** Qwen3.8-27B TP1 on MI308X, paired real and simulated cc-traces graded by `08` |
 | ~~M3–M7~~ | Retired by `16` D95, which maps each one to where its scope went. PP, EP beyond one node, and further models come after v1 |
 
 Sequencing, dependencies and parallelisable work are in the execution plan (`16`). `00_initial_prompt.md` is the original seed and is
