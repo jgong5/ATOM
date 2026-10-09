@@ -99,7 +99,7 @@ Tasks are cut so each touches one module plus its tests.
 
 ```
 atom/compass/
-  clock/      CA core, grant rule, lookahead matrix, LP registry, both transports
+  clock/      CA core, grant rule, channel table and path distances, LP registry, both transports
   detect/     straggler check, stall diagnostic, CI clock-source lint
   runner/     CompassModelRunner - the seam, RPC surface, forward semantics
   backends/   CostBackend interface, StepCost, provenance; tier 0 / a / b
@@ -374,7 +374,7 @@ Phase 0's environment. All CPU-only.
 
 | ID | Task | Module | Effort | Implements / consumes |
 |---|---|---|---|---|
-| **W1.1** | CA core as the HLA RTI (`01` D3): TAR/NER/TAG, a grant strictly below the lookahead-distance LBTS with in-transit messages counted, lookahead matrix addressed by LP identity, LP registry, **both transports** (in-process and socket) from one implementation | `clock/` | 600–900 | implements the clock client API |
+| **W1.1** | CA core as the HLA RTI (`01` D3): TAR/NER/TAG, a grant strictly below the lookahead-distance LBTS with in-transit messages counted, a channel table addressed by LP and channel name with the path distances `D(j->i)` computed once by Floyd-Warshall (`atom/compass/clock/channels.py`, #453), LP registry, **both transports** (in-process and socket) from one implementation | `clock/` | 600–900 | implements the clock client API |
 | **W1.2** | Synthetic-LP harness modelling ATOM's **verified** topology — the ZMQ/shm/Gloo links of `01` D1 and the K1–K9 mechanisms of D4 — plus adversarial scenarios: a send missing from the sender's send log (induced straggler), a duplicate seq on one channel, a wait the CA cannot see | `tests/compass/clock/` | 400–600 | consumes W1.1 |
 | **W1.3** | Causality detectors (`01` D3.2): straggler check on arrival and at each drain (fails the run), `DIAG_S` stall diagnostic (keeps waiting, never aborts), CI clock-source lint | `detect/` | 250–400 | consumes W1.1 |
 | **W1.4** | `CompassModelRunner` skeleton: the `--runner-qualname` subclass, the full RPC surface, and the three forward semantics of `02` D10 (deferred output, the meaningful-step unit, `produces_output`) | `runner/` | 400–600 | implements the runner seam |
@@ -444,7 +444,7 @@ Depends on Wave 1. The first three are the vertical slice.
 
 | ID | Task | Effort | Notes |
 |---|---|---|---|
-| **W3.1** | LP structure for DP: the DP group is one LP and its step one compound event (one TAR), priced by the per-layer critical path across ranks, no operator-level TAR/NER (`01` D4); both collectives run for real; dummy-batch pricing for idle ranks (`15` D90) | 300–500 | |
+| **W3.1** | LP structure for DP: the DP group is one LP with one member process per rank, joined by the CA (#528); its step is one TAR costing the `max` over ranks of each rank's own cost, no operator-level TAR/NER (`01` D4, `15` D90); both collectives run for real; dummy-batch pricing for idle ranks (`15` D90) | 300–500 | |
 | ~~**W3.2**~~ | ~~LP structure for PP: one LP per stage; transfer as a size from the spec; layer split via `get_pp_indices`~~ | ~~400–600~~ | **deferred by D95** — see *After v1* |
 | **W3.3** | EP as DP-attention + EP8 within a node: `exclusive` occupancy honoured in the IR; group membership per P0.6; the MORI dispatch/combine exchange carried as the group's collective (D95) | 250–450 | shaped by **P0.6**, **P0b.2** |
 | **W3.4** | Standalone CA exercised against the synthetic-LP harness at multi-container topology | 200–300 | consumes W1.2 |
@@ -488,7 +488,7 @@ their own hardware, and a coarse wave cannot be claimed as an issue. Every row t
 | **W4.3** | The real side: the nightly P/D configurations of `recipes/mesh/DeepSeek-V4.md` (TP; DP-attention + TBO; TP + MTP3; DP-attention + MTP1) on the MI355X pair, driven by cc-traces, with per-request records and a real-vs-real repeat per cell for the noise floor (`08` D45) | `scripts/compass/` | 200–350 | **P0b.3**, GPU queue |
 | **W4.4** | Calibration Phases 1b / 1c on MI355X for DeepSeek-V4-Pro's operator families: FP4 MoE GEMMs, MLA attention, the CSA indexer, mHC, MORI dispatch/combine within a node | `backends/`, calibration | 400–700 | W4.1, W4.2, GPU queue |
 | **W4.5** | Fitting and law selection for those families (`09`) | `backends/` | 300–500 | W4.4 |
-| **W4.6** | The DP-attention step: the per-layer critical path across the DP group (W3.1) with the all-to-all priced from W4.4, and TBO's overlap | `backends/` | 300–500 | W3.1, W3.3, W4.5 |
+| **W4.6** | The DP-attention step: the `max` over the DP group's ranks (W3.1) with the all-to-all priced from W4.4, and TBO's overlap | `backends/` | 300–500 | W3.1, W3.3, W4.5 |
 | **W4.7** | MTP: per-position acceptance measured from W4.3's real runs, never declared (`08`), feeding the spec-decode pricing of `14` | `runner/`, `backends/` | 200–350 | W4.3 |
 | **W4.8** | Mooncake transfer time from the spec, checked against the transfer timings W4.3 records | `kv/` | 150–250 | W2.3, W4.3 |
 
