@@ -26,7 +26,8 @@ Authority is co-hosted in the frontend's process and served at the run file's
 Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
 ``ipc_s``, ``stream_s``, ``coefficients`` (a `Coefficients` mapping),
 ``machine`` (a machine spec mapping), ``parameter_count``, and ``out_dir``,
-where the step table, the run summary and the engine's command refusals go.
+where the step table, the run summary and the engine's refusals (the worker's
+refused commands and the engine's refused clock calls) go.
 """
 
 import contextlib
@@ -213,12 +214,13 @@ def _width_keys(node):
 
 def engine_done(engine_core) -> None:
     """After the engine's loop: leave the clock and keep the worker's command
-    refusals for the run summary."""
+    refusals and the engine's refused clock calls for the run summary."""
     clock.close()
     run = spec()
     if run is not None:
         refused = engine_core.runner_mgr.call_func("refused_commands", wait_out=True)
-        (Path(run["out_dir"]) / COMMANDS_FILE).write_text(json.dumps(list(refused)))
+        reasons = list(refused) + clock.installed().refusals
+        (Path(run["out_dir"]) / COMMANDS_FILE).write_text(json.dumps(reasons))
 
 
 def frontend_done(llm_engine) -> bool:
