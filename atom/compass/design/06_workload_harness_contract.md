@@ -164,8 +164,8 @@ Adding a Compass field for any of these would duplicate state that can disagree.
   (it cannot be earlier than the run's epoch, and the arrival gate of doc `01` D8 may
   defer it). Returning what the engine *used* is how the harness detects that its
   timeline was not honoured. Dropping this makes a clamped run silently misreport TTFT.
-- `compass.first_token_s` **(out)** — TTFT is a graded acceptance metric at ≤10%. The
-  harness's own stopwatch measures HTTP and wall time, which under simulation is
+- `compass.first_token_s` **(out)** — TTFT is a graded acceptance metric
+  ([target](README.md#acceptance-targets)). The harness's own stopwatch measures HTTP and wall time, which under simulation is
   unrelated to simulated time. There is no other source.
 - `compass.finish_s` **(out)** — same argument for TPOT and throughput; and
   `finish − first_token` over the generated count is TPOT, so this is not derivable from
