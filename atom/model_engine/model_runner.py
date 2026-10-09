@@ -1224,11 +1224,11 @@ class ModelRunner:
             scheduled_spec_decode_tokens=spec_tokens,
         )
 
-        self.forward(dummy_batch)
+        reply = self.forward(dummy_batch)
         logger.debug(
             f"{self.label}: dummy batch executed with {dummy_batch.total_tokens_num} tokens"
         )
-        return True
+        return reply
 
     def warmup_model(self):
         start_time = time.time()

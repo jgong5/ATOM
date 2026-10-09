@@ -8,21 +8,25 @@ job and cannot be re-derived. What *can* be re-derived is the set of call sites
 that exist, and these tests assert the two agree -- so a blocking call added to
 ATOM later fails here instead of quietly widening the blind spot.
 
-Three failures are worth telling apart, and each has its own test:
+Two failures are worth telling apart, and each has its own test:
 
 * a call site the list does not classify, or a listed site that has gone away
   (`test_every_scanned_site_is_classified`) -- read it and classify it;
-* a site whose recorded line has moved (`test_recorded_lines_match_the_tree`)
-  -- update the line, the classification still holds;
-* a pinned line of text that is no longer there
-  (`test_anchor_lines_are_still_where_they_say`) -- the same, for the points
-  that are not a call.
+* a pinned piece of text that is no longer exactly once in its symbol
+  (`test_anchors_are_still_where_they_say`) -- the same, for the points that
+  are not a call.
 
-The second message is only safe to act on if a row cannot silently change which
+Neither records a line number, so an edit above a site or an anchor changes
+nothing here.
+
+Separately, each row's mechanism is checked against what the rest of the row
+says (`test_every_mechanism_agrees_with_the_rest_of_its_row`).
+
+A row is only safe to keep across an edit if it cannot silently change which
 call it describes, which is what `test_inserting_a_call_above_another_leaves_
 its_neighbour_alone` pins: an earlier identity keyed on the callee alone, so
 inserting one `call_func("flush_pp_send", ...)` above a `call_func("forward",
-...)` moved every later row onto the wrong site and reported only a moved line.
+...)` moved every later row onto the wrong site.
 
 No driver, and no import of ATOM's serving modules: the scanner parses them.
 """
@@ -30,7 +34,7 @@ No driver, and no import of ATOM's serving modules: the scanner parses them.
 from __future__ import annotations
 
 import ast
-from pathlib import Path
+from collections import Counter
 
 import pytest
 
@@ -38,14 +42,13 @@ from atom.compass.audit import sync_scan
 
 TREE = sync_scan.repo_root_from_here()
 INVENTORY = sync_scan.load_inventory()
+ROWS = INVENTORY["sites"] + INVENTORY["anchors"]
 CATEGORIES = set(INVENTORY["categories"])
+MECHANISMS = set(INVENTORY["mechanisms"])
 
-# Every file that states the count per category. Each is parsed and compared
-# against the rows, so a table cannot drift from the data it describes.
-COUNT_TABLES = (
-    Path(sync_scan.__file__).with_name("README.md"),
-    TREE / "atom/compass/design/01_execution_and_time_model.md",
-)
+# The mechanism each first-classification category named. A row whose
+# mechanism is another one has to say why in `mechanism_why`.
+NAMED_BY_CATEGORY = {"A": "K1", "B": "K5", "C1": "K8", "C2": "K7", "ignore": "K9"}
 
 
 @pytest.fixture(scope="module")
@@ -73,31 +76,143 @@ def test_every_scanned_site_is_classified(scanned, listed):
     )
 
 
-def test_recorded_lines_match_the_tree(scanned, listed):
-    moved = [
-        f"{row['id']} recorded at line {row['line']}, found at {scanned[key].line}"
-        for key, row in listed.items()
-        if key in scanned and scanned[key].line != row["line"]
+def _key(row: dict) -> str:
+    return row.get("id") or f"{row['file']}::{row.get('symbol', '')}::{row['anchor']}"
+
+
+def _anchor_problem(row: dict, source: str) -> str | None:
+    """Why `row`'s anchor text is not exactly once in its symbol, or None.
+
+    A Python anchor names its enclosing symbol as a site id does; a file-wide
+    match is not enough, because `while True:` repeats in `engine_core.py`.
+    An anchor with no symbol (the Rust ones) is counted over the whole file.
+    """
+    lines = source.splitlines()
+    if "symbol" in row:
+        visitor = sync_scan._ScopedVisitor(row["file"], source)
+        visitor.visit(ast.parse(source))
+        spans = visitor.spans.get(row["symbol"])
+        if not spans:
+            return f"{_key(row)}: no symbol {row['symbol']!r} in the file"
+    else:
+        spans = [(1, len(lines))]
+    found = sum("\n".join(lines[a - 1 : b]).count(row["anchor"]) for a, b in spans)
+    if found != 1:
+        return f"{_key(row)}: the anchor occurs {found} times, not once"
+    return None
+
+
+def test_anchors_are_still_where_they_say():
+    wrong = [
+        problem
+        for row in INVENTORY["anchors"]
+        if (problem := _anchor_problem(row, (TREE / row["file"]).read_text()))
     ]
-    assert not moved, "recorded lines are stale: " + "; ".join(moved)
-
-
-def test_anchor_lines_are_still_where_they_say():
-    wrong = []
-    for row in INVENTORY["anchors"]:
-        lines = (TREE / row["file"]).read_text(encoding="utf-8").splitlines()
-        line = row["line"]
-        if not (1 <= line <= len(lines)) or row["anchor"] not in lines[line - 1]:
-            wrong.append(f"{row['file']}:{line} no longer holds {row['anchor']!r}")
     assert not wrong, "; ".join(wrong)
 
 
-def test_every_row_carries_a_category_and_a_reason():
-    for row in INVENTORY["sites"] + INVENTORY["anchors"]:
-        key = row.get("id") or f"{row['file']}:{row['line']}"
-        assert row["category"] in CATEGORIES, f"{key}: {row['category']}"
+def _row_anchored(anchor: str, symbol: str | None) -> dict:
+    """A real anchor row, re-pointed at `symbol`, or at the whole file for None."""
+    row = dict(next(r for r in INVENTORY["anchors"] if r["anchor"] == anchor))
+    row.pop("symbol")
+    return row if symbol is None else {**row, "symbol": symbol}
+
+
+@pytest.mark.parametrize(
+    "row,refusal",
+    [
+        (_row_anchored("def _passed_delay", "Scheduler.postprocess"), "occurs 0 times"),
+        (_row_anchored("while True:", "NoSuchClass.busy_loop"), "no symbol"),
+        (_row_anchored("while True:", None), "times, not once"),
+    ],
+)
+def test_a_seeded_misplaced_anchor_is_refused(row, refusal):
+    problem = _anchor_problem(row, (TREE / row["file"]).read_text())
+    assert problem is not None and refusal in problem, problem
+
+
+def test_an_anchor_twice_in_its_symbol_is_refused():
+    row = {"file": "made/up.py", "symbol": "Loop.run", "anchor": "while True:"}
+    once = "class Loop:\n    def run(self):\n        while True:\n            pass\n"
+    twice = once + "        while True:\n            pass\n"
+    assert _anchor_problem(row, once) is None
+    assert "occurs 2 times" in _anchor_problem(row, twice)
+
+
+def test_every_row_carries_a_mechanism_and_a_reason():
+    for row in ROWS:
+        key = _key(row)
+        assert row["mechanism"] in MECHANISMS, f"{key}: {row['mechanism']}"
+        assert isinstance(row["mechanism_why"], str), key
+        assert row.get("category") in CATEGORIES | {None}, key
         assert len(row["why"]) > 20, f"{key}: the justification is too short"
         assert row["peer"] in {"none", "thread", "process", "deployment"}, key
+
+
+def _bounded(row: dict) -> bool:
+    """A pinned line (a gate, a constant, a flag), a sleep, or a timed call."""
+    shape = row.get("shape", "anchor")
+    return shape in ("anchor", "sleep") or "timeout" in row.get("expr", "")
+
+
+def _inconsistencies(row: dict) -> list[str]:
+    """What a row's mechanism contradicts in the rest of the row.
+
+    `peer` names a thread, a process or a deployment, not an LP, so it can
+    refute a mechanism but not confirm one: a channel receive waits on another
+    process, and another deployment is never inside the waiter's own LP.
+    """
+    wrong = []
+    mechanism, peer = row["mechanism"], row["peer"]
+    if mechanism == "K5" and peer not in ("process", "deployment"):
+        wrong.append(f"a channel receive waits on another process, not a {peer}")
+    if mechanism == "K6" and peer == "deployment":
+        wrong.append("a wait inside one LP cannot wait on another deployment")
+    if mechanism == "K7" and not _bounded(row):
+        wrong.append("a virtual timer needs a bound to put on the LP clock")
+    named = NAMED_BY_CATEGORY.get(row.get("category"))
+    if mechanism != named and not row["mechanism_why"]:
+        wrong.append("the mechanism is not the one its category named; say why")
+    return wrong
+
+
+def test_every_mechanism_agrees_with_the_rest_of_its_row():
+    wrong = [f"{_key(row)}: {w}" for row in ROWS for w in _inconsistencies(row)]
+    assert not wrong, "; ".join(wrong)
+
+
+@pytest.mark.parametrize(
+    "mechanism,change,refusal",
+    [
+        ("K5", {"peer": "thread"}, "a channel receive waits on another process"),
+        ("K6", {"peer": "deployment"}, "a wait inside one LP cannot"),
+        ("K7", {"expr": "q.get()", "shape": "queue_get"}, "a virtual timer needs"),
+        ("K4", {"mechanism_why": ""}, "the mechanism is not the one"),
+        ("K4", {"category": None, "mechanism_why": ""}, "the mechanism is not the one"),
+    ],
+)
+def test_a_seeded_inconsistent_row_is_refused(mechanism, change, refusal):
+    row = next(r for r in INVENTORY["sites"] if r["mechanism"] == mechanism)
+    assert _inconsistencies(row) == [], _key(row)
+    wrong = _inconsistencies({**row, **change})
+    assert len(wrong) == 1 and wrong[0].startswith(refusal), wrong
+
+
+def test_mechanism_crosstab_against_the_first_classification():
+    """Rows per mechanism, and per first-classification category, printed.
+
+    Rows added after the first classification carry no category and are
+    counted under `-`.
+    """
+    cells = Counter((row.get("category", "-"), row["mechanism"]) for row in ROWS)
+    mechanisms = sorted(MECHANISMS)
+    categories = [*INVENTORY["categories"], "-"]
+    print("\ncategory", *mechanisms, "total", sep="\t")
+    for c in categories:
+        line = [cells[(c, m)] for m in mechanisms]
+        print(c, *line, sum(line), sep="\t")
+    totals = Counter(row["mechanism"] for row in ROWS)
+    print("total", *(totals[m] for m in mechanisms), len(ROWS), sep="\t")
 
 
 def test_calls_that_share_an_ordinal_are_answered_the_same_way(listed):
@@ -107,7 +222,9 @@ def test_calls_that_share_an_ordinal_are_answered_the_same_way(listed):
     by_text: dict[tuple, set] = {}
     for row in listed.values():
         key = (row["file"], row["symbol"], row["expr"], row["shape"])
-        by_text.setdefault(key, set()).add((row["category"], row["why"]))
+        by_text.setdefault(key, set()).add(
+            (row.get("category"), row["why"], row["mechanism"], row["mechanism_why"])
+        )
     split = {k: v for k, v in by_text.items() if len(v) > 1}
     assert not split, (
         "identical calls in one function are classified differently, so their "
@@ -127,33 +244,6 @@ def test_no_scanned_file_is_also_declared_unscanned():
     for rel, _why in sync_scan.UNSCANNED_ROOTS:
         inside = {f for f in scanned_files if f == rel or f.startswith(rel)}
         assert not inside, f"{rel} is excluded but these are scanned: {sorted(inside)}"
-
-
-def _stated_counts(text: str) -> dict[str, int]:
-    """Read every markdown table that has a column headed `Count`."""
-    counts: dict[str, int] = {}
-    column = None
-    for line in text.splitlines():
-        if not line.startswith("|"):
-            column = None
-            continue
-        cells = [c.strip().strip("*`") for c in line.strip().strip("|").split("|")]
-        if "Count" in cells:
-            column = cells.index("Count")
-            continue
-        if column is None or column >= len(cells):
-            continue
-        if cells[0] in CATEGORIES and cells[column].isdigit():
-            counts[cells[0]] = int(cells[column])
-    return counts
-
-
-@pytest.mark.parametrize("path", COUNT_TABLES, ids=lambda p: p.name)
-def test_every_stated_count_matches_the_rows(path):
-    """The count per category is written down twice and derived once here."""
-    stated = _stated_counts(path.read_text(encoding="utf-8"))
-    assert stated, f"{path} states no counts; the parser or the table changed"
-    assert stated == sync_scan.category_counts(INVENTORY), path
 
 
 # --- the shape rules, against the forms they are written to tell apart ------

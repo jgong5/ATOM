@@ -35,10 +35,10 @@ come from `self.config`, which the base sets first.
 
 A worker runs `AsyncIOProc.busy_loop`, which takes a name off a shared-memory
 ring, resolves it with `getattr(runner, name, None)`, calls it, and forwards the
-result **only when it is not None** (`async_proc.py:231-252`). The caller's side
-is `AsyncIOProcManager.call_func`, whose `wait_out=True` form blocks on
-`self.outputs_queue.get()` with no timeout. Three consequences, none of which a
-single-process test can show:
+result **only when it is not None** (`atom/model_engine/async_proc.py`). The
+caller's side is `AsyncIOProcManager.call_func`, whose `wait_out=True` form
+blocks on `self.outputs_queue.get()` with no timeout. Three consequences, none
+of which a single-process test can show:
 
 * **A name the runner does not have is skipped, not raised.** `getattr` returns
   None, the loop moves on, the worker stays healthy, and a caller that asked for
@@ -46,12 +46,12 @@ single-process test can show:
   on this surface, which is why `RPC_SURFACE` below names every dispatched
   method rather than leaving it to whatever the class happens to inherit.
 * **A method that is present and answers None parks its caller in exactly the
-  same way.** This is one line below the skip, not a separate mechanism:
-  `async_proc.py:243` is `if out is not None:`, and **both** of the loop's
-  `put_nowait` calls -- the primary output queue at `:248` and the KV queue at
-  `:250` -- are inside it, while the `getattr` skip is at `:237-239`. So from
-  the caller's side an answer of None and a method that was never defined are
-  one event: nothing is queued, nothing logs, and no timeout ends either wait.
+  same way.** This is one line below the skip, not a separate mechanism: in
+  `busy_loop`, **both** of the loop's `put_nowait` calls -- the primary output
+  queue and the KV queue -- are inside `if out is not None:`, just after the
+  `getattr` skip. So from the caller's side an answer of None and a method that
+  was never defined are one event: nothing is queued, nothing logs, and no
+  timeout ends either wait.
   Naming only absence is worse than saying nothing, because it sends whoever
   is debugging the hang to check whether the method is there, find that it is,
   and stop. The shapes here are therefore checked against what the call site
@@ -65,10 +65,12 @@ single-process test can show:
   which `call_func` re-raises in the caller. What crosses the boundary is the
   type and nothing else: the parent gets a bare `SystemExit()` with empty args,
   no message and no `__cause__`, so a refusal's name and its reason exist only
-  on the worker's stderr. `SystemExit()` also carries `code=None`, and
-  `engine_core.py:132` sits in a `try/finally` with no `except`, so letting it
-  propagate ends the parent process with status 0 -- a clean shutdown to any
-  supervisor reading exit codes. So a refusal reaches the caller and a silence
+  on the worker's stderr. `SystemExit()` also carries `code=None`, and the
+  `get_num_blocks` call in `EngineCore.__init__`
+  (`atom/model_engine/engine_core.py`) sits in a `try/finally` with no
+  `except`, so letting it propagate ends the parent process with status 0 -- a
+  clean shutdown to any supervisor reading exit codes. So a refusal reaches the
+  caller and a silence
   never does, but "reaches" means the fact of it and not the reason for it: a
   successor that wants its refusal diagnosable in the engine's own log has to
   put it there itself, on the worker side, before it raises.
@@ -87,6 +89,7 @@ from typing import Any
 
 import torch
 
+from atom.compass.backends.base import CostBackend
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
 from atom.compass.runner.step_output import (
     DeferredTokenStream,
@@ -107,40 +110,45 @@ logger = logging.getLogger(__name__)
 # inherited from the base implementation rather than a requirement.
 #
 # Scope: a runner reached through `EngineCore`. Nothing else in the tree says
-# so, and it is load-bearing. Fourteen dispatched names are absent from this
-# table because `ModelRunner` does not define them -- seven belong to
-# `RapidServeModelRunner`, seven to the rollout extension. The rollout seven are
-# unreachable here. The RapidServe seven are kept out by `Config`, not by this
-# module: `enable_rapidserve` picks `PrefillEngineCore` / `DecodeEngineCore`
-# (`llm_engine.py:140`), those classes broadcast all seven with `wait_out=True`
-# without consulting `runner_qualname`, and the substitution that installs a
-# RapidServe runner (`config.py:1730-1736`) fires only while `runner_qualname`
-# is still ATOM's default -- which Compass overwrites. `Config` therefore raises
-# `ValueError` for `enable_rapidserve=True` with any runner not in
-# `RAPIDSERVE_RUNNERS`, this one included.
+# so, and it is load-bearing. Other dispatched names are absent from this
+# table because `ModelRunner` does not define them -- some belong to
+# `RapidServeModelRunner`, the rest to the rollout extension. The rollout names
+# are unreachable here. The RapidServe names are kept out by `Config`, not by
+# this module: `enable_rapidserve` picks `PrefillEngineCore` /
+# `DecodeEngineCore` (`LLMEngine.__init__`), those classes broadcast all of
+# them with `wait_out=True` without consulting `runner_qualname`, and the
+# substitution that installs a RapidServe runner (`Config.__post_init__`) fires
+# only while `runner_qualname` is still ATOM's default -- which Compass
+# overwrites. `Config` therefore raises `ValueError` for
+# `enable_rapidserve=True` with any runner not in `RAPIDSERVE_RUNNERS`, this
+# one included.
 #
 # Also outside the table, and outside anything a broadcast-derived enumeration
-# can see: three of these twelve are called in-process on the runner itself,
-# reached over the `resume_memory` RPC. `rollout/memory_manager.py:176`
-# subscripts one key of `get_num_blocks`, `:183` discards `allocate_kv_cache`,
-# and `:209` calls `capture_cudagraph` without unpacking it, inside a `try` that
-# degrades to `enforce_eager=True`. Different arities, and the one place in the
-# tree where a refusal from this module would be caught rather than fatal.
+# can see: some of these names are called in-process on the runner itself,
+# reached over the `resume_memory` RPC (`atom/rollout/memory_manager.py`).
+# `MemoryManagerMixin._resume_kv_cache` subscripts one key of `get_num_blocks`
+# and discards `allocate_kv_cache`, and
+# `MemoryManagerMixin._recapture_cudagraphs_if_needed` calls
+# `capture_cudagraph` without unpacking it, inside a `try` that degrades to
+# `enforce_eager=True`. Different arities, and the one place in the tree where
+# a refusal from this module would be caught rather than fatal.
+#
+# Call sites below are in `atom/model_engine/`.
 RPC_SURFACE: dict[str, bool] = {
     # Replaced here, in this module.
-    "get_num_blocks": True,  # engine_core.py:132-141 reads four keys off a dict
-    "allocate_kv_cache": True,  # engine_core.py:142-145 asserts the reply
-    "capture_cudagraph": True,  # engine_core.py:149 unpacks three values
-    "forward": True,  # scheduler.py:2435-2542 reads nine attributes off it
+    "get_num_blocks": True,  # EngineCore.__init__ reads four keys off a dict
+    "allocate_kv_cache": True,  # EngineCore.__init__ asserts the reply
+    "capture_cudagraph": True,  # EngineCore.__init__ unpacks three values
+    "forward": True,  # Scheduler.postprocess reads its attributes
     # Answered by ATOM's own, which needs neither weights nor a device for them.
-    "dummy_execution": True,  # engine_core.py:749 returns it to its own caller
-    "exit": False,  # engine_core.py:260, the last call of the process's life
-    "freeze_gc_heap": True,  # engine_core.py:203-206 catches a raise, not a None
-    "process_kvconnector_output": False,  # engine_core.py:500 does not wait
-    "async_proc_aggregation": True,  # engine_core.py:488, the one bounded wait
-    "start_profiler": True,  # engine_utility.py:252 forwards the reply unread
-    "stop_profiler": True,  # engine_utility.py:264 forwards the reply unread
-    "flush_pp_send": True,  # pp_engine_core.py:81 waits before the next send
+    "dummy_execution": True,  # DPEngineCoreProc._execute_dummy_batch returns it
+    "exit": False,  # EngineCore.exit, the last call of the process's life
+    "freeze_gc_heap": True,  # EngineCore._freeze_after_startup catches a raise, not a None
+    "process_kvconnector_output": False,  # EngineCore does not wait
+    "async_proc_aggregation": True,  # the one bounded wait, in EngineCore
+    "start_profiler": True,  # EngineUtilityHandler forwards the reply unread
+    "stop_profiler": True,  # EngineUtilityHandler forwards the reply unread
+    "flush_pp_send": True,  # PPEngineCoreProc waits before the next send
 }
 
 
@@ -203,6 +211,36 @@ def _installed_readings(runner: Any) -> DeviceReadings:
     return readings
 
 
+def install_cost_backend(runner: Any, backend: CostBackend) -> None:
+    """Give a runner the cost backend its steps are priced by.
+
+    Set on the instance the way `install_device_readings` sets the readings,
+    and for the same reason. Choosing a backend from a flag or a config field
+    is the configuration surface's job and is not wired yet.
+    """
+    if not isinstance(backend, CostBackend):
+        raise RunnerRefusal(
+            "a step is priced by a `CostBackend`, and "
+            f"{type(backend).__name__} is not one"
+        )
+    runner.compass_backend = backend
+
+
+def _installed_backend(runner: Any) -> CostBackend:
+    """The installed backend, or a refusal that says what would supply it.
+
+    A step with no backend would take no time, which reads as a valid run.
+    """
+    backend = getattr(runner, "compass_backend", None)
+    if backend is None:
+        raise RunnerRefusal(
+            "no cost backend is installed on this runner, so there is nothing "
+            "to price a step with; call `install_cost_backend` before the "
+            "engine's first step."
+        )
+    return backend
+
+
 def _config_field(runner: Any, name: str) -> Any:
     """A config field read with no default; a missing one is refused by name."""
     try:
@@ -249,10 +287,10 @@ class NonAllocatingRunner:
         the base goes on to build the drafter on this rank's GPU and load its
         checkpoint. On any rank, it cannot be modelled: a predicted step's reply has
         `draft_token_ids` None and zero `num_rejected`/`num_bonus`, which the
-        scheduler accepts as a step that drafted nothing (`scheduler.py:2579`
-        never fills `seq.spec_token_ids`, and `:2521-2522` reads the zeros), so
-        a caller that asked for speculation would get a prediction with it off
-        and no error.
+        scheduler accepts as a step that drafted nothing (`Scheduler.postprocess`
+        never fills `seq.spec_token_ids`, and reads the zeros), so a caller
+        that asked for speculation would get a prediction with it off and no
+        error.
         """
         self.model = UnbuiltModel(model_class)
         # Cleared on the way out, as both of ATOM's own implementations do: the
@@ -326,7 +364,7 @@ class NonAllocatingRunner:
         `get_num_blocks` can run.
 
         `enforce_eager` is reconciled here rather than trusted. ATOM's own
-        returns zero under that flag (`model_runner.py:1570-1571`) and this
+        returns zero under that flag (`_estimate_cudagraph_overhead`) and this
         returns whatever was installed, so correctness would otherwise rest on
         whoever built the reading having passed the same flag this runner is
         configured with. A reading built for a capturing deployment, installed
@@ -359,16 +397,16 @@ class NonAllocatingRunner:
         written down anywhere in this package. The two methods above are, and
         `super()` does the rest.
 
-        The reply is the base's, forwarded unaltered, and
-        `engine_core.py:132-141` fixes its four keys: `num_kvcache_blocks`
-        (`:133`) and `state_runtime` (`:141`) are subscripted, `pool_entries`
-        (`:139`) and `pool_entries_per_req` (`:140`) are taken with a `{}`
-        default. The block count goes on to `BlockManager`, which asserts it is
-        greater than zero (`block_manager.py:78`); the base asserts the same
-        thing first and prints the whole budget with it. `state_runtime` is not
-        an opaque value: `:141` hands it to `StateRuntime.from_wire`
-        (`state_runtime.py:159-166`), which raises `TypeError` unless it is a
-        `Mapping` and `ValueError` unless its key set is exactly
+        The reply is the base's, forwarded unaltered, and `EngineCore.__init__`
+        (`atom/model_engine/engine_core.py`) fixes its four keys:
+        `num_kvcache_blocks` and `state_runtime` are subscripted, `pool_entries`
+        and `pool_entries_per_req` are taken with a `{}` default. The block
+        count goes on to `BlockManager`, which asserts it is greater than zero
+        in its `__init__`; the base asserts the same thing first and prints the
+        whole budget with it. `state_runtime` is not an opaque value: it is
+        handed to `StateRuntime.from_wire`
+        (`atom/model_engine/state_runtime.py`), which raises `TypeError` unless
+        it is a `Mapping` and `ValueError` unless its key set is exactly
         `{"transfer", "checkpoint_spec"}`. Building that dict here instead of
         forwarding the base's would put all of those failures on the first RPC
         of the engine's life, so it is not built here.
@@ -383,10 +421,11 @@ class NonAllocatingRunner:
         The decode process of intra-GPU prefill/decode disaggregation is
         refused rather than sized. ATOM's own runner for that answers a block
         count of zero there, because decode imports the pool from prefill and
-        owns no device memory (`model_runner.py:4272-4286`), and it holds back
-        four safety margins on the prefill side because two processes share the
-        card (`:4266-4270`). Substituting readings into the base method reaches
-        neither: this path would hand a decode process a pool it does not own.
+        owns no device memory (`RapidServeModelRunner.get_num_blocks`), and it
+        holds back four safety margins on the prefill side because two
+        processes share the card (`_kv_budget_extra_reserve`). Substituting
+        readings into the base method reaches neither: this path would hand a
+        decode process a pool it does not own.
         The base's `_kv_budget_extra_reserve` of zero is left alone for the
         same reason it is right -- the card these readings describe is a
         dedicated one, and a shared-card reservation would hold bytes back for a
@@ -450,7 +489,8 @@ class NonAllocatingRunner:
         weights to trace. Nothing is captured here, and the reply says exactly
         that: no seconds spent, no batch sizes captured, no pool bytes held.
 
-        The shape is fixed by `engine_core.py:149-151` and `1109-1111`, which
+        The shape is fixed by `EngineCore.__init__` and
+        `DecodeEngineCore.__init__` (`atom/model_engine/engine_core.py`), which
         both write `cap_cost, bs, pool_bytes = ...` and then format the first
         and third as numbers. Returning two values, or None, is not a test
         failure over there: the worker dies on the unpack, or never replies, and
@@ -461,10 +501,10 @@ class NonAllocatingRunner:
         attention metadata builder reads them on every step. The reply
         deliberately disagrees with the attribute it preserves: the base sends
         `self.capture_sizes` -- the same `[0]` -- as the second element
-        (`model_runner.py:4112`), and this sends `[]`. Both are only ever
-        formatted into a log line, and `[]` is the truthful one.
+        (`ModelRunner.capture_cudagraph`), and this sends `[]`. Both are only
+        ever formatted into a log line, and `[]` is the truthful one.
 
-        `engine_core.py:148` reaches this method only when `not enforce_eager
+        `EngineCore.__init__` reaches this method only when `not enforce_eager
         and not disagg_is_decode`, so on an eager deployment the override never
         runs at all. Replacing it anyway is the point: a runner must not depend
         on a caller-side flag to stay off the device.
@@ -484,30 +524,35 @@ class NonAllocatingRunner:
         scheduler accepts without complaining, so they are stated in one place
         with their reasons rather than inlined here.
 
-        What a replacement owes its callers. Four sites broadcast this name --
-        `engine_core.py:386` and `:1264`, and `pp_engine_core.py:118` (which
-        waits and discards the reply) and `:379`. None of them unpacks it; the
+        What a replacement owes its callers. These sites broadcast this name --
+        `EngineCore._process_engine_step_inner` and
+        `DecodeEngineCore._process_engine_step` in
+        `atom/model_engine/engine_core.py`, and
+        `PPEngineCoreProc._pp_head_step` (which waits and discards the reply)
+        and `PPEngineCoreProc._downstream_busy_loop` in
+        `atom/model_engine/pp_engine_core.py`. None of them unpacks it; the
         reply is one object, read for its attributes, and the reads are these:
 
         * `.req_ids`, an iterable of request ids in the batch's own order --
-          `pp_engine_core.py:144`. That read is on the head's side of the
-          transport, on what `recv_tokens()` returns at `:139`, not at the
-          `:379` call site, which only passes the object on.
+          `PPEngineCoreProc._pp_head_step`. That read is on the head's side of
+          the transport, on what `recv_tokens()` returns, not at the
+          `_downstream_busy_loop` call site, which only passes the object on.
         * `.token_ids`, `.draft_token_ids`, `.is_deferred_out`, `.logprobs`
-          (None or a `dict[int, float]`) -- `scheduler.py:2435-2438`.
+          (None or a `dict[int, float]`) -- `Scheduler.postprocess`.
         * `.get_idx(req_id)`, returning a row index or None --
-          `scheduler.py:2454`.
+          `Scheduler.postprocess`.
         * `.num_rejected[idx]` and `.num_bonus[idx]`, indexable by that row and
-          castable to `int` -- `scheduler.py:2521-2522`.
+          castable to `int` -- `Scheduler.postprocess`.
         * `.dspark_ell`, either None or a mapping answering `.get(seq.id)` --
-          `scheduler.py:2541-2542`.
+          `Scheduler.postprocess`.
 
-        Nine attributes, and picklable on top: under pipeline parallelism the
-        last stage sends the object whole (`pp_engine_core.py:385`) and the head
-        reads it back (`:139`), each hop through `pickle` in
-        `atom/distributed/pp_transport.py:141` and `:114`. ATOM's own answer is
-        a `ScheduledBatchOutput`; the contract a replacement has to meet is the
-        nine reads and the pickle, not that class.
+        Picklable on top: under pipeline parallelism the last stage sends the
+        object whole (`_downstream_busy_loop`) and the head reads it back
+        (`_pp_head_step`), each hop through `pickle` in
+        `PPStageTransport.send_tokens` and `PPStageTransport.recv_tokens`
+        (`atom/distributed/pp_transport.py`). ATOM's own answer is a
+        `ScheduledBatchOutput`; the contract a replacement has to meet is these
+        reads and the pickle, not that class.
 
         One decorator, not the base's two. ATOM's own carries
         `torch.inference_mode`, which is kept: the body no longer raises, and
@@ -523,8 +568,11 @@ class NonAllocatingRunner:
         `RapidServeModelRunner`, the other runner in this tree that declines
         to own its memory, carries the same one of the two.
 
-        No duration is reported. The reply has nowhere to put one: the engine
-        times the call itself, and the batch output it reads carries tokens.
+        The reply's `predicted_s` is the step's duration: this rank's batch
+        priced by the installed cost backend, then the max over its DP group.
+        A runner with no backend refuses the step rather than report one that
+        took no time. ATOM's `dummy_execution` answers with this reply too, so
+        an idle DP rank's dummy batch is priced and joins the group's max.
         """
         if not hasattr(batch, "produces_output"):
             # Not reachable from the engine, which only ever passes a scheduled
@@ -537,10 +585,17 @@ class NonAllocatingRunner:
                 f"{type(batch).__name__} cannot say whether its batch produces "
                 "output; there is nothing here to report from."
             )
-        # Imported at call time, not at module scope, so this module stays
-        # importable where there is no driver. By the time a step is reported
-        # the worker has imported the engine anyway.
+        backend = _installed_backend(self)
+        # Imported at call time, not at module scope: the scheduler so this
+        # module stays importable where there is no driver (by the time a step
+        # is reported the worker has imported the engine anyway), and the
+        # parity package because, at module scope, this module may import no
+        # `atom` package besides `atom.compass.runner` and `atom.compass.memory`
+        # (`test_only_the_binding_module_reaches_the_engine`).
+        from atom.compass.parity import record_step
         from atom.model_engine.scheduler import ScheduledBatchOutput
+
+        record_step(self, batch)
 
         stream = getattr(self, "_token_stream", None)
         if stream is None:
@@ -557,4 +612,37 @@ class NonAllocatingRunner:
                 ),
             )
             self._token_stream = stream
-        return ScheduledBatchOutput(**stream.step(batch))
+        return ScheduledBatchOutput(
+            **stream.step(batch),
+            predicted_s=_group_step_seconds(self, batch, backend),
+        )
+
+
+def _group_step_seconds(runner: Any, batch: Any, backend: CostBackend) -> float:
+    """This rank's step priced from its own batch, then the max over its DP group.
+
+    The `all_reduce(MAX)` stands in for the cross-rank collectives a real
+    forward makes, which a predicted one does not run, so every rank leaves the
+    step at the group's seconds. With one rank there is no group to exchange
+    with.
+
+    A pipeline stage is refused: it runs only its own layers, and a backend
+    prices the whole step, so every stage would charge the whole model.
+    """
+    from atom.compass.runner.projection import batch_view, dp_group, forward_mode
+
+    if int(_config_field(runner, "pipeline_parallel_size") or 1) > 1:
+        raise RunnerRefusal(
+            "this runner is one stage of a pipeline and runs only its own "
+            "layers, but a cost backend prices a whole step; charging each "
+            "stage the whole model would count it once per stage"
+        )
+    mode = forward_mode(batch, runner)
+    seconds = backend.estimate(batch_view(batch, mode, runner)).seconds
+    if mode.sync is None:
+        return seconds
+    group_max = torch.tensor([seconds], dtype=torch.float64)
+    torch.distributed.all_reduce(
+        group_max, op=torch.distributed.ReduceOp.MAX, group=dp_group()
+    )
+    return group_max.item()
