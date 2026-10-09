@@ -1378,8 +1378,14 @@ replies on the output channel.
 | `start_profile`, `stop_profile` (HTTP routes `start_profile` and `stop_profile` in `api_server.py`) | **refused** | a real profiler slows every later step; charging it zero is a silent simplification, and a profiled system is not what is simulated |
 | `update_weights`, `update_weights_shm`, `update_weights_ipc`, `release_memory`, `resume_memory`, `clear_kv_cache`, `configure_hidden_states` | **refused** | RL weight sync and sleep/wake. The API server has no route to them; the only senders in the tree are in `atom/rollout/` (`async_engine.py`, `weight_sync.py`), a Python interface for external RL frameworks. Simulating them needs cost models for weight transfer and memory release that do not exist |
 
-A command is refused by the **simulated runner**, in the worker method it reaches, with an
-exception naming the command, and is counted in the run summary's refusals (D3.5).
+A command is refused by the **simulated runner**, in the worker method it reaches, with a
+reply naming that method (`command:<method>`), not an exception, and is counted in the run
+summary's refusals (D3.5). An exception would end the engine for a command a client sent
+while serving; the reply goes back through ATOM's handler, and the run continues. Any
+`command:` refusal makes the run a coverage report, not acceptance evidence, whatever the
+refused fraction of seconds that `08` D50.1 gates: ATOM's handler still applies its own
+half of the command (it marks the profiler active, or the engine asleep), so what runs
+after it is no longer the deployment being simulated.
 ATOM's handlers are unchanged, the command travels its real channel, and a refusal is
 visible rather than a silent zero.
 
@@ -1810,7 +1816,7 @@ Ordered by how much they could cost.
 | D3.4 | Wall-clock interleaving may vary between runs; the `(LP, virtual time, event)` sequence may not. Thread scheduling inside an LP is irrelevant only under in-transit counting and TSO delivery; ties break by **(time, LP id, channel, sequence number), never arrival order**; the cost backend is a pure function of its batch view; **no `set` iteration on the simulated path** - string ids are hashed under `PYTHONHASHSEED` randomisation, so a set of request ids iterates differently in every process. Test is a byte-diff of two step tables, CPU-only, in CI. | 2026-09-20; revised 2026-09-28 |
 | D3.5 | The CA owns three outputs: an opt-in timeline log, a stall diagnostic (a stall the CA can see is resolved by deadlock detection and recovery; one it cannot see gets a diagnostic, never an abort), and an always-written run summary carrying grants, speed ratio, lazy-trace cost, detector state and the refusal fractions `08` D50.1 gates on. | 2026-09-20; revised 2026-09-28 |
 | D4 | Every synchronization site maps to one of the PDES mechanisms K1-K9, none undecided; the boundary is the LP, not the process; a DP step is one TAR costing the `max` over ranks, exchanged inside the forward by a K6 wait with no cost, and the lockstep `all_reduce` is K1 for its own cost; handler threads stay and TSO delivery runs them at their message's timestamp | 2026-09-18; revised 2026-09-28 and 2026-10-01 |
-| D5 | Every timer and clock read the CA can reach runs on the LP clock; only what it cannot reach is configured or left real; metric cadence is virtual time (revising `11` D72); the profiler and RL control commands are refused by the simulated runner and counted | 2026-09-18; revised 2026-09-28 |
+| D5 | Every timer and clock read the CA can reach runs on the LP clock; only what it cannot reach is configured or left real; metric cadence is virtual time (revising `11` D72); the profiler and RL control commands are refused by the simulated runner with a reply, counted, and make the run a coverage report | 2026-09-18; revised 2026-09-28, 2026-10-09 |
 | D5.1 | The simulated run uses stdlib asyncio, not uvloop: only a Python event loop can host virtual time | 2026-09-28 |
 | D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only | 2026-09-18; revised 2026-09-28 |
 | D7 | Atomesh gets no virtual clock: mesh-only mode; in 1P1D the router is one segment of a channel, not an LP, and its relay latency is that channel's lookahead; its bounds are configured (health check and circuit breaker off, `--worker-request-timeout-secs` set large); timestamps ride carriers it already relays; xPyD is deferred | 2026-09-18; revised 2026-09-30 |

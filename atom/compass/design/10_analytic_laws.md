@@ -204,24 +204,24 @@ width) — cheap, but not zero.
 
 ### Problem
 
-The empirical tiers carry declared gates (≤10% on throughput/TPOT/TTFT and each non-KV
-memory term, ≤5% on KV block count). Tier 0 has had none, which makes "tier 0 is
-available on day zero" an unfalsifiable claim. A number with no gate cannot be reported
+The empirical tiers carry declared gates on throughput, TPOT, TTFT, each non-KV memory
+term and KV block count, at the [acceptance targets](README.md#acceptance-targets).
+Tier 0 has had none, which makes "tier 0 is available on day zero" an unfalsifiable claim. A number with no gate cannot be reported
 as a result.
 
 ### Why tier 0's gate cannot be the empirical gate
 
-Not a matter of ambition. Three structural reasons the same 10% is the wrong target:
+Not a matter of ambition. Three structural reasons the empirical gates are the wrong target:
 
 1. **The derate absorbs everything tier 0 does not model.** A single scalar stands in for
    occupancy, tail effects, launch gaps, cache behaviour and kernel quality. Its own
    authoring error is comparable to the accuracy being demanded.
 2. **Roofline is measurably wrong in four named places** (D66 below), and the corrections
-   are exactly what the empirical campaign supplies. A tier 0 that hit 10% would mean the
-   empirical campaign was unnecessary.
+   are exactly what the empirical campaign supplies. A tier 0 that hit those gates would
+   mean the empirical campaign was unnecessary.
 3. **Tier 0's job is different.** It is asked *which configuration wins* and *does this
    fit*, on a device nobody has measured. Ranking and feasibility are its outputs.
-   Latency to 10% is not.
+   Latency to the empirical gates is not.
 
 ### The goal
 
