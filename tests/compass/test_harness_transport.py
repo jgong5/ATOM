@@ -173,6 +173,7 @@ class Harness:
             x_request_id=str(num),
             x_correlation_id=f"x{num}",
             drop_perf_ns=time.perf_counter_ns(),
+            credit_issued_ns=time.time_ns(),
             payload_bytes=b'{"model": "m", "messages": [], "stream": true}',
         )
         record = await self.client.send_request(info)
@@ -233,6 +234,7 @@ def test_aiperf_ttft_and_latency_are_the_stamped_differences(tmp_path, monkeypat
         assert ttft == _ns(first) - _ns(sent)
         assert latency == _ns(finish) - _ns(sent)
         assert record.credit_drop_latency is None
+        assert record.request_info.credit_issued_ns is None
         assert record.timestamp_ns == _ns(sent)  # the run duration's anchor
     print("\ncredit  sent  first  finish  aiperf TTFT  aiperf latency")
     for row in rows:
