@@ -93,7 +93,7 @@ from atom.compass.backends.base import CostBackend
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
 from atom.compass.runner.step_output import (
     DeferredTokenStream,
-    reported_token_id,
+    filler_token_ids,
     reports_previous_step,
 )
 
@@ -601,12 +601,26 @@ class NonAllocatingRunner:
         if stream is None:
             # Built on first use rather than in an `__init__`: the base class
             # runs the whole of its own before a subclass body would get
-            # control, and `self.config` is what this reads.
+            # control, and `self.config` is what this reads. The ids are vetted
+            # against the tokenizer the frontend serves with, loaded the same
+            # way.
+            from atom.model_engine.llm_engine import _load_tokenizer
+
+            model = _config_field(self, "model")
+            fillers = filler_token_ids(
+                _load_tokenizer(model, _config_field(self, "trust_remote_code")),
+                _config_field(self, "eos_token_id"),
+                _config_field(self, "stop_token_ids"),
+            )
+            if not fillers:
+                raise RunnerRefusal(
+                    f"the tokenizer of {model!r} has no id that is not a stop id "
+                    "and decodes on its own to ASCII letters and digits, so "
+                    "there is no token a predicted step can report without "
+                    "ending a request or stalling its stream"
+                )
             stream = DeferredTokenStream(
-                reported_token_id(
-                    _config_field(self, "eos_token_id"),
-                    _config_field(self, "stop_token_ids"),
-                ),
+                fillers,
                 deferred=reports_previous_step(
                     _config_field(self, "pipeline_parallel_size")
                 ),
