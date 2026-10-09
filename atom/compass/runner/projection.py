@@ -128,20 +128,35 @@ def capture_rung(batch: Any, runner: Any) -> int | None:
     by, rather than derived from the ladder here: deriving it is how a rung gets
     assigned to a prefill step, which replays nothing and would then be charged
     graph padding for a graph that did not run.
+    """
+    return _rung(forward_mode(batch, runner))
+
+
+def _rung(mode: ForwardMode) -> int | None:
+    return int(mode.running_bs) if mode.use_cudagraph else None
+
+
+def dp_group() -> Any:
+    """The DP group's CPU group: the one `ModelRunner.prepare_model` hands `decide`."""
+    from aiter.dist.parallel_state import get_dp_group
+
+    return get_dp_group().cpu_group
+
+
+def forward_mode(batch: Any, runner: Any) -> ForwardMode:
+    """The step's shape, settled by `ForwardMode.decide` as the real runner settles it.
+
+    Under data parallelism this runs the step's collective, `sync_dp_metadata`,
+    on the DP group, so every rank calls it once per step, as the real forward
+    does; the group's rung and token counts come back from it.
 
     The arguments below that do not reach the rung are passed at their inert
     values: `decide` settles a query length and a token count as well, and those
     are what `captured_tokens`, `is_block_drafter`, `tbo_on` and `local_tbo`
     feed. The width and the replay decision come from `capture_sizes`,
-    `enforce_eager` and the batch alone.
+    `enforce_eager`, the batch and the collective alone.
     """
     dp_size = _data_parallel_size(runner)
-    if dp_size > 1:
-        raise RunnerRefusal(
-            f"a rung under data parallelism is the group's, not this rank's: "
-            f"`decide` settles it from a collective over all {dp_size} ranks, "
-            "and this projection has no group to run one on"
-        )
     ladder = np.asarray(runner.capture_sizes_np, dtype=np.int32)
     if bool(np.any(ladder[1:] < ladder[:-1])):
         raise RunnerRefusal(
@@ -151,10 +166,10 @@ def capture_rung(batch: Any, runner: Any) -> int | None:
             "captured one holding this batch, and a rung too wide is the one "
             "direction the rows cannot contradict"
         )
-    mode = ForwardMode.decide(
+    return ForwardMode.decide(
         batch=batch,
-        dp_size=1,
-        dp_group=None,
+        dp_size=dp_size,
+        dp_group=dp_group() if dp_size > 1 else None,
         enforce_eager=bool(runner.enforce_eager),
         capture_sizes=ladder,
         captured_tokens=None,
@@ -163,25 +178,25 @@ def capture_rung(batch: Any, runner: Any) -> int | None:
         local_tbo=(False, False, 0, 0),
         max_seqlen_q=batch.num_spec_step + 1,
     )
-    return int(mode.running_bs) if mode.use_cudagraph else None
 
 
 def _data_parallel_size(runner: Any) -> int:
     """How many ranks `decide` would settle a rung across, or a refusal.
 
-    Absent is refused rather than read as one. A runner shaped differently
+    Absent, zero, negative or `False` is refused rather than read as one,
+    the set ATOM's `ParallelConfig` refuses too. A runner shaped differently
     from the engine's own would otherwise be priced as a single rank on a
-    default nothing checked, three lines above a refusal written for exactly
-    that subject.
+    default nothing checked; zero or a negative width would pass the `> 1`
+    test in `capture_rung` as the single-rank case.
     """
     parallel = getattr(getattr(runner, "config", None), "parallel_config", None)
     size = getattr(parallel, "data_parallel_size", None)
-    if size is None:
+    if size is None or size < 1:
         raise RunnerRefusal(
-            "this runner states no `config.parallel_config.data_parallel_size`, "
+            "this runner states no width in "
+            f"`config.parallel_config.data_parallel_size` (it reads {size!r}), "
             "and a rung is one rank's answer or a group's depending on it; "
-            "reading an absent width as 1 is the guess this would have to make "
-            "to carry on"
+            "reading that as 1 is the guess this would have to make to carry on"
         )
     return int(size)
 
@@ -190,4 +205,33 @@ def project(batch: Any, seqs: dict[int, Any], runner: Any) -> BatchView:
     """The whole projection: the batch's rows, and the rung it replayed."""
     return BatchView(
         request_rows(batch, seqs), capture_rung=capture_rung(batch, runner)
+    )
+
+
+def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
+    """The projection a worker builds: it holds the batch and not the sequences.
+
+    A row's kind is the convention `ModelRunner.prepare_inputs` reads: the
+    first `total_seqs_num_prefill` rows are prefill. The rung and the group's
+    token count come from `mode`, the step's one `forward_mode`; a data-parallel
+    runner handed a mode with no group counts is refused.
+    """
+    if mode.sync is not None:
+        group_tokens = int(mode.sync.num_tokens_across_dp.max())
+    elif _data_parallel_size(runner) > 1:
+        raise RunnerRefusal(
+            "this rank is one of a data-parallel group and its forward mode "
+            "states no num_tokens_across_dp, so the MoE segment has no group "
+            "token count to be priced from"
+        )
+    else:
+        group_tokens = None
+    prefill = batch.total_seqs_num_prefill
+    rows = zip(batch.num_scheduled_tokens, batch.context_lens)
+    return BatchView(
+        tuple(
+            RequestShape(int(q), int(c), i >= prefill) for i, (q, c) in enumerate(rows)
+        ),
+        capture_rung=_rung(mode),
+        max_tokens_across_dp=group_tokens,
     )

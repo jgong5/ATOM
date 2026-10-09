@@ -16,14 +16,37 @@ A service job's result reaches its coroutine at ``c_k``, through ``call_at``.
 
 A thread serving a station job reads the clock as the job's start plus the
 service charged so far (`atom.utils.clock.current_job_time`).
+
+A frontend output thread has a width-1 detokenization station of its own:
+handling one released frame is one job, from `LPRuntime.handed_over` to its
+next `LPRuntime.back_at_wait_point`, charged by the `wrap_decode` calls it
+makes. Callbacks it posts with ``call_soon_threadsafe`` run at its completion.
+A `wrap_encode` or `wrap_decode` call on the event loop thread, such as the
+final decode of a non-streaming completion, advances the LP clock instead.
+
+`CompassEventLoop` is the frontend's event loop in a simulated run: its
+``time()`` is the installed `LPRuntime`'s clock, so every timer is on LP time,
+and its selector is the frontend's idle point. Idle with nothing to read, it
+asks for time with `next_event`: its earliest essential timer as ``t``, its
+earliest daemon timer (`DAEMON_TIMERS`) as ``t_daemon``. While a released
+request is unread or a station job is open it only waits on its sockets. On
+the ``+inf`` grant it cancels its timers and stops. `HttpChannel` is the inline
+receive of HTTP requests.
 """
 
+import asyncio
+import collections
 import heapq
 import logging
+import math
+import selectors
+import sys
 import threading
+import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 
+from atom.utils import clock
 from atom.utils.clock import DIAG_S, job
 
 logger = logging.getLogger("atom")
@@ -165,9 +188,16 @@ class SimExecutor(ThreadPoolExecutor):
 
 
 def _charge(d: float) -> None:
+    """Charge `d` to this thread's station job; with none open, in the run, the
+    caller is the clock owner and advances the LP clock by `d` (`advance_to`
+    refuses any other thread)."""
     cur = getattr(job, "cur", None)
     if cur is not None:
         cur[0].charge(cur[1], d)
+        return
+    rt = clock.installed()
+    if rt is not None and rt.in_run:
+        rt.advance_to(rt.now + d)
 
 
 def wrap_encode(encode, entry):
@@ -180,3 +210,188 @@ def wrap_encode(encode, entry):
         return ids
 
     return charged
+
+
+def wrap_decode(decode, entry):
+    """`decode`, charging the current job ``fixed + tokens / derated rate``."""
+    rate = entry.decode_tokens_per_s * entry.derate
+
+    def charged(ids, *args, **kwargs):
+        _charge(entry.decode_fixed_s + len(ids) / rate)
+        return decode(ids, *args, **kwargs)
+
+    return charged
+
+
+#: Timers that do not keep the run alive, by the qualified name of their
+#: callback or of a coroutine on the stack that scheduled them: the API
+#: server's metrics refresh, uvicorn's server tick and its keep-alive timeout.
+DAEMON_TIMERS = frozenset(
+    {
+        "_metrics_refresh_loop",
+        "Server.main_loop",
+        "H11Protocol.timeout_keep_alive_handler",
+        "HttpToolsProtocol.timeout_keep_alive_handler",
+    }
+)
+
+#: Wall seconds of one socket wait while the loop may not ask for time.
+POLL_S = 0.001
+
+
+def _is_daemon(callback) -> bool:
+    if getattr(callback, "__qualname__", None) in DAEMON_TIMERS:
+        return True
+    f = sys._getframe(2)  # the caller of `call_at`
+    while f is not None and f.f_code.co_qualname not in DAEMON_TIMERS:
+        f = f.f_back
+    return f is not None
+
+
+class CompassEventLoop(asyncio.SelectorEventLoop):
+    """The frontend's event loop on its LP clock; uvicorn's ``loop`` in a simulated run."""
+
+    def __init__(self) -> None:
+        self.rt = clock.installed()
+        if self.rt is None:
+            raise RuntimeError(
+                "CompassEventLoop runs on an LP clock; install the frontend's "
+                "LPRuntime with atom.utils.clock.install first"
+            )
+        self.daemon = weakref.WeakSet()  # the daemon timers scheduled
+        # Requests read, not handed over: (channel, seq) -> (arrival, wake-up).
+        self.held: dict[tuple[str, int], tuple[float, asyncio.Future]] = {}
+        # Per output thread: its width-1 station, its open job, and the callbacks
+        # that job posted.
+        self.detok = threading.local()
+        super().__init__(CompassSelector(self))
+        self.executor = SimExecutor(self)
+        self.set_default_executor(self.executor)
+        self.rt.loop = self
+
+    def time(self) -> float:
+        return self.rt.read_clock()
+
+    def job_begin(self, arrival: float) -> None:
+        """A thread took a released frame: handling it is one job on its station."""
+        d = self.detok
+        if not hasattr(d, "station"):
+            d.station, d.due = Station(1), collections.deque()
+        d.k, d.posted = d.station.enqueue(arrival), []
+        job.cur = (d.station, d.k)
+
+    def job_end(self) -> None:
+        """The thread is back at its wait point: its job's callbacks run at completion."""
+        d = self.detok
+        posted = getattr(d, "posted", None)
+        if posted is None:
+            return
+        job.cur = d.posted = None
+        d.station.finish(d.k)
+        d.due.append(posted)
+        c = d.station.completion(d.k)
+        super().call_soon_threadsafe(self.call_at, c, self._post, d.due)
+
+    def _post(self, due) -> None:
+        # Timers that share a deadline fire in any order; each takes the oldest
+        # job's callbacks, so a thread's jobs post theirs in completion order.
+        for callback, args in due.popleft():
+            self.call_soon(callback, *args)
+
+    def call_soon_threadsafe(self, callback, *args, context=None):
+        posted = getattr(self.detok, "posted", None)
+        if posted is None:
+            return super().call_soon_threadsafe(callback, *args, context=context)
+        posted.append((callback, args))
+
+    def call_at(self, when, callback, *args, context=None):
+        handle = super().call_at(when, callback, *args, context=context)
+        if _is_daemon(callback):
+            self.daemon.add(handle)
+        return handle
+
+    def close(self) -> None:
+        super().close()
+        self.rt.close()
+
+    def hand_over(self) -> bool:
+        """Once every released request has been read, wake the released ones in
+        ``(arrival, seq)`` order; returns whether any was woken."""
+        rt = self.rt
+        with rt.lock:
+            if any(not rt.released[ch] <= rt.arrived[ch] for ch, _ in self.held):
+                return False
+            out = sorted(
+                (a, seq, ch)
+                for (ch, seq), (a, _) in self.held.items()
+                if rt.is_released(ch, seq)
+            )
+        for _, seq, ch in out:
+            self.held.pop((ch, seq))[1].set_result(None)
+        return bool(out)
+
+
+class CompassSelector(selectors.DefaultSelector):
+    """The loop's one blocking point: a socket wait, or a next-event request."""
+
+    def __init__(self, loop: CompassEventLoop) -> None:
+        super().__init__()
+        self.loop = loop
+
+    def select(self, timeout=None):
+        loop, rt = self.loop, self.loop.rt
+        if not rt.in_run:  # before the run, or after the +inf grant
+            return super().select(timeout)
+        if loop.executor.station is None:
+            loop.executor.start_run()
+        if loop.hand_over() or timeout == 0:
+            return super().select(0)
+        if rt.inline_pending() or loop.executor.station.unresolved():
+            return super().select(POLL_S)
+        t = t_daemon = math.inf
+        for h in loop._scheduled:
+            if h.cancelled():
+                continue
+            if h in loop.daemon:
+                t_daemon = min(t_daemon, h.when())
+            else:
+                t = min(t, h.when())
+        if rt.next_event(t, t_daemon) == math.inf:
+            for h in loop._scheduled:
+                h.cancel()
+            loop.stop()
+            return []
+        return super().select(0)
+
+
+class HttpChannel:
+    """ASGI middleware: the frontend's inline receive of HTTP requests.
+
+    `stamp(scope)` is a request's ``(arrival, seq)`` read from its carrier, or
+    ``None`` for one sent outside the run, which passes straight through. A
+    stamped request waits until it is released and every released request has
+    been read; released requests are handed on in ``(arrival, seq)`` order and
+    count as handled then.
+    """
+
+    def __init__(self, app, stamp) -> None:
+        self.app, self.stamp = app, stamp
+
+    async def __call__(self, scope, receive, send):
+        got = self.stamp(scope) if scope["type"] == "http" else None
+        if got is not None:
+            loop = asyncio.get_running_loop()
+            rt = loop.rt
+            ch = next(
+                c.name
+                for c in rt.table.channels_into(rt.me)
+                if c.name.endswith(":http")
+            )
+            arrival, seq = got
+            rt.check_arrival(ch, arrival, seq)
+            wake = loop.create_future()
+            loop.held[ch, seq] = (arrival, wake)
+            await wake
+            with rt.lock:
+                rt.count_done_locked(ch, seq)
+        await self.app(scope, receive, send)

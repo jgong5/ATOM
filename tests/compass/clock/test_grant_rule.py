@@ -30,6 +30,7 @@ from atom.compass.clock import (
     TAR,
     BackdatedEvent,
     ChannelTable,
+    ClockAbort,
     ClockAuthority,
     LpId,
     LpRegistry,
@@ -234,6 +235,13 @@ def test_zero_lookahead_is_granted_one_lp_at_a_time_in_name_order():
     # b answers at the same instant: a's next round, not a backdated message.
     replies = ca.on_request(B, NER, INF, [("b->a:m", 0, 10.3)])
     assert replies == [(A, 10.3, {"b->a:m": [(0, 10.3)]})]
+
+
+def test_the_bound_stops_a_recovery_grant():
+    ca = ClockAuthority(_two_way(0.0), bound_s=10.0)
+    assert ca.on_request(A, TAR, 10.3, []) == []
+    with pytest.raises(ClockAbort, match="a grant to 10.3 for a passes"):
+        ca.on_request(B, TAR, 10.3, [])
 
 
 def test_every_lookahead_at_zero_is_serialized_and_not_an_error():

@@ -45,10 +45,10 @@ one of those branches, on this hardware.
 
 These are measurements, not opinions, and they are load-bearing below:
 
-- **The seam needs no ATOM change.** `Config.runner_qualname` (`atom/config.py:1595`),
-  consumed at `engine_core.py:128` and `async_proc.py:166`. Two in-tree precedents:
-  `RLHFModelRunner` (`atom/rollout/async_engine.py:26-32`) and `RapidServeModelRunner`
-  (`Config.__post_init__`, `config.py:1730-1736`).
+- **The seam needs no ATOM change.** `Config.runner_qualname` (`atom/config.py`),
+  consumed in `engine_core.py::EngineCore.__init__` and `async_proc.py::AsyncIOProc.__init__`. Two in-tree precedents:
+  `RLHFModelRunner` (`atom/rollout/async_engine.py::AsyncLLMEngine.__init__`) and `RapidServeModelRunner`
+  (`Config.__post_init__`, `config.py`).
 - **Rank-0 single-sourcing of the clock is correct for symmetric TP.** TP=2 over 1727
   steps: per-step rank difference median 0.03%, worst 0.82%, rank 1 slower on 51% of
   steps. TP=4 over 2295 steps: rank totals within ±0.02%; charging every step to its
@@ -100,24 +100,24 @@ API server, one `EngineCore`, one `ModelRunner` worker. Wider configurations mul
 A discrete-event simulator needs a coherent notion of "now". The question is whether to
 keep that topology or collapse it.
 
-Verified topology (file:line):
+Verified topology (path and symbol):
 
 | Link | Mechanism |
 |---|---|
 | API server <-> CoreManager | in-process |
-| CoreManager -> EngineCore | ZMQ ROUTER/DEALER (`engine_core_mgr.py:441-449`, `engine_core.py:516-578`) |
-| EngineCore -> CoreManager | ZMQ PUSH/PULL (`engine_core.py:579-634`) |
-| EngineCore -> workers | `aiter.dist.shm_broadcast.MessageQueue`, POSIX shm, 16 MiB chunks (`async_proc.py:28,288-291,425-434`) |
-| worker rank0 -> EngineCore | ZMQ PUSH/PULL (`async_proc.py:310-311,391-406`) |
-| every worker -> EngineCore | per-rank ZMQ PUSH/PULL for KV status (`async_proc.py:302-306,408-423`) |
-| cross-DP | `torch.distributed` Gloo CPU group (`engine_core.py:664-686,751-815`) |
+| CoreManager -> EngineCore | ZMQ ROUTER/DEALER (`engine_core_mgr.py::CoreManager.__init__`, `engine_core.py::EngineCore.process_input_sockets`) |
+| EngineCore -> CoreManager | ZMQ PUSH/PULL (`engine_core.py::EngineCore.process_output_sockets`) |
+| EngineCore -> workers | `aiter.dist.shm_broadcast.MessageQueue`, POSIX shm, 16 MiB chunks (`async_proc.py::AsyncIOProcManager.__init__`, `AsyncIOProcManager.call_func`) |
+| worker rank0 -> EngineCore | ZMQ PUSH/PULL (`async_proc.py::AsyncIOProcManager.__init__`, `AsyncIOProcManager.process_output_sockets`) |
+| every worker -> EngineCore | per-rank ZMQ PUSH/PULL for KV status (`async_proc.py::AsyncIOProcManager.__init__`, `AsyncIOProcManager.process_kv_output_sockets`) |
+| cross-DP | `torch.distributed` Gloo CPU group (`engine_core.py::DPEngineCoreProc._init_data_parallel`, `DPEngineCoreProc._sync_dp_state`, `_sync_shutdown_state`, `_has_global_unfinished_reqs`) |
 | PP stage <-> stage | ZMQ metadata + NCCL tensors (`atom/distributed/pp_comm.py`, `pp_transport.py`) |
 
-`multiprocessing` start method is forced to `spawn` (`engine_core_mgr.py:337-338`,
-`:1423-1424`, `atom/utils/__init__.py:192-194`). **There is no in-process / single-process
+`multiprocessing` start method is forced to `spawn` (`engine_core_mgr.py::CoreManager.__init__`,
+`launch_engine_core`, `atom/utils/__init__.py::get_mp_context`). **There is no in-process / single-process
 mode**: `LLMEngine.__init__` unconditionally constructs a `CoreManager`
-(`llm_engine.py:139-142`) and `EngineCore.__init__` unconditionally constructs an
-`AsyncIOProcManager` (`engine_core.py:125`). Offline examples still go through the full
+(`llm_engine.py`) and `EngineCore.__init__` unconditionally constructs an
+`AsyncIOProcManager` (`engine_core.py`). Offline examples still go through the full
 stack.
 
 ### Options
@@ -163,7 +163,7 @@ is removed. The changes are:
 
 **One substitution that is not a topology change.** A simulated run starts the API server
 on a stdlib-asyncio `CompassEventLoop` instead of uvloop, through the `loop=` setting
-uvicorn already takes (`api_server.py:2625-2646` picks `"uvloop"` or `"auto"` there;
+uvicorn already takes (`api_server.py::main` picks `"uvloop"` or `"auto"` there;
 uvicorn also accepts a `"module:Class"` loop factory). Processes, threads and the service
 topology are unchanged; only the event loop's implementation differs. The reason is
 mechanical: the API server's event loop is an LP clock owner (D3), and virtual time can
@@ -264,7 +264,7 @@ that flags `time.time`, `time.monotonic`, `time.perf_counter`, `datetime.now` an
 `asyncio.sleep` outside an allow-list keeps that audit from rotting as ATOM's main
 branch moves. The allow-list is the set left on real time deliberately: transport, and
 the bounds the CA cannot reach, which D5 sends to configuration. Metrics are not on it:
-`11` D72 runs every metric clock on virtual time, so `metrics.py:408` is a
+`11` D72 runs every metric clock on virtual time, so `metrics.py::AtomMetricsExporter.update` is a
 substituted clock read like any other. Anything new lands as a CI failure on the day it
 is added, not at validation time.
 
@@ -298,7 +298,7 @@ disaggregation. Conflating them invalidates any performance model.
 
 | Name | Scope | Processes | How KV moves |
 |---|---|---|---|
-| **RapidServe** (`--enable-rapidserve`) | one node, one GPU set | 2 `EngineCore` procs on the **same** devices | **Never moves.** Decode owns the KV tensor; prefill imported it by CUDA IPC and writes directly into decode's buffer. Only the sampled first token crosses ZMQ. `PrefillScheduler.block_manager = None` (`scheduler.py:3141`). |
+| **RapidServe** (`--enable-rapidserve`) | one node, one GPU set | 2 `EngineCore` procs on the **same** devices | **Never moves.** Decode owns the KV tensor; prefill imported it by CUDA IPC and writes directly into decode's buffer. Only the sampled first token crosses ZMQ. `PrefillScheduler.block_manager = None` (`scheduler.py::PrefillScheduler.__init__`). |
 | **True PD disagg** (`--kv-transfer-config`) | two node groups | independent full servers | RDMA — MoRI-IO (read/pull) or Mooncake (write/push) |
 | **Atomesh** (`atom/mesh/`) | fleet router | Rust binary, **or** `libmesh.so` in-process via PyO3 | Never touches KV. HTTP relay only. |
 
@@ -317,10 +317,10 @@ disaggregation. Conflating them invalidates any performance model.
 - ATOM's CI-benchmarked multi-node PD path exists (`.github/scripts/atomesh/pd_server_atom.sh`),
   so real-run baselines for pairing are obtainable.
 - The ATOM relay is **strictly sequential and blocking**
-  (`http_pd_router.rs:969-1192`): POST prefill, await the full JSON, extract
+  (`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`): POST prefill, await the full JSON, extract
   `kv_transfer_params` (hard error if absent), enrich the decode body, POST decode.
-  Unlike the SGLang path (`tokio::join!` on both, `:1463`) and the vLLM path (detached
-  `tokio::spawn`, `:732`). **This sequentiality is a gift: the prefill->decode causal
+  Unlike the SGLang path (`tokio::join!` on both, `PDRouter::execute_dual_dispatch_internal`) and the vLLM path (detached
+  `tokio::spawn`, `PDRouter::dispatch_vllm_mooncake_internal`). **This sequentiality is a gift: the prefill->decode causal
   edge is explicit, one-way, and per-request.**
 
 ### Open issues
@@ -379,8 +379,8 @@ one LP:
 
 | ATOM group | OS processes | LPs | Why |
 |---|---|---|---|
-| TP group | 1 EngineCore + N workers | **1** | Workers are slaved by a blocking RPC (`async_proc.py:431`) and hold no clock. Rank-0 authority validated at 0.06% (D0). |
-| DP group | N EngineCores | **1** | Already `all_reduce`s every step for lockstep (`engine_core.py:751-781`) and runs `dummy_execution` on idle ranks (`:748-749`). A step is one compound event priced by its per-layer critical path (below). |
+| TP group | 1 EngineCore + N workers | **1** | Workers are slaved by a blocking RPC (`async_proc.py::AsyncIOProcManager.call_func`) and hold no clock. Rank-0 authority validated at 0.06% (D0). |
+| DP group | N EngineCores | **1** | Already `all_reduce`s every step for lockstep (`DPEngineCoreProc._sync_dp_state`) and runs `dummy_execution` on idle ranks (`DPEngineCoreProc._execute_dummy_batch`). A step costs the `max` over ranks of each rank's own cost (below). |
 | API server | 1 process: uvicorn, `CoreManager` and its threads | **1** (frontend) | Its asyncio event loop is a clock owner of its own: it tokenizes and streams while the engine runs a forward, so it overlaps the step loop in simulated time and cannot be folded into it. Offline, the owner is the loop that calls `get_output`. |
 | PD container (prefill or decode) | one full ATOM deployment | **2** | its frontend LP and its engine LP |
 | Traffic source | — | **1** | |
@@ -423,17 +423,12 @@ constraints.
    A startup assertion enforces the collective case: creating a process group whose ranks
    map to more than one LP raises.
 
-**A DP group is one LP, and its step is a compound event** priced by the critical path of
-the per-layer synchronization graph: nodes are `(rank, layer, operator)` costed on that
-rank's own batch; edges are program order within a rank plus a cross-rank barrier at each
-collective (e.g. the MoE all-to-all). The ranks exchange batch descriptors (or per-layer
-cost vectors) on the collective that already runs, all compute the same path, and every
-rank calls the CA as a member of the LP (below). No operator-level TAR/NER. `max(step_seconds)` is right only when
-the step is the only synchronization; with per-layer barriers it underestimates. Rank 0
-at attention 3 / MoE 1 per layer and rank 1 at 1 / 3 give `max` 4 but a critical path of
-`max(3,1) + max(1,3)` = 6: 240 against 360 over 60 layers. Per-rank LPs are right only
-if the ranks decouple at step level (no per-step collective) and interact only with
-lookahead > 0.
+**A DP group is one LP, and its step costs the `max` over ranks** of each rank's own cost
+(owner ruling 2026-10-01, `15` D90). Every rank prices its own batch, and the predicted
+forward exchanges the step seconds by one `all_reduce(MAX)` on the DP group after
+pricing; `15` D90 owns the `T_dp` and uniform-routing argument. Every rank then calls
+the CA as a member of the LP (below). No operator-level TAR/NER. Per-rank LPs are right only if the ranks decouple at step level (no per-step
+collective) and interact only with lookahead > 0.
 
 **A DP group's LP has one member process per rank, and the CA joins them** (owner
 ruling 2026-10-01, `12` T91, #528). Each DP rank is its own `EngineCore` process with its
@@ -443,7 +438,7 @@ frames. The CA completes the LP's request only when every member has called:
 
 1. Every member makes the same number of CA calls per loop iteration; a per-member call
    counter refuses a mismatch by name.
-2. One request kind per round: TAR with equal `T` on every member, or NER with `t` the
+2. One request kind per round: TAR with equal `T` on every member, or NER with `t`
    and `t_daemon` each the minimum over members. Unequal `T` or mixed kinds are refused.
 3. Every member's send log is merged before any grant is computed, so the LP's promised
    time never rises on a partial request.
@@ -550,7 +545,7 @@ the standard counting one (Fujimoto, Mattern):
    engine's output thread relays through a `RelayQueue` whose `put` registers on the step
    loop, so a late physical send changes nothing. Inside the simulation window (below) the
    output thread sends every item it takes (its one skip, an all-`EXIT_ENGINE` list at
-   `engine_core.py:618-625`, occurs only at shutdown), so an item it never sends raises
+   `engine_core.py::EngineCore.process_output_sockets`, occurs only at shutdown), so an item it never sends raises
    `UnsentRelayItem` rather than being covered by a null message. The send log
    rides in the same request as the owner's next TAR/NER, so the CA knows every message
    an LP produced before it moves that LP's clock.
@@ -567,7 +562,7 @@ the standard counting one (Fujimoto, Mattern):
    Inline channels are taken by the owner at its own receive point.
 
 **The simulation window.** Each LP's window opens once its process is ready to serve (an
-engine after it queues READY, `engine_core.py:225`) and closes at that LP's `+inf` grant,
+engine after it queues READY, `engine_core.py::EngineCore._send_ready_signal`) and closes at that LP's `+inf` grant,
 before its process begins to shut down (`LPRuntime.next_event` calls `end_run` on that
 grant). Inside it every cross-LP frame is stamped, registered and counted, and the
 thread-identity assertion (I3, I4) applies. Frames outside it — READY, SHUTDOWN and the
@@ -626,11 +621,11 @@ The grant rule relies on these invariants inside each LP:
   handler thread deadlocks. Checked at `f87413a7a` by searching `atom/model_engine`,
   `atom/entrypoints/openai`, `atom/distributed` and `atom/utils` for
   `threading.Lock/RLock/Condition/Semaphore`, the serving-path locks are
-  `PrefillScheduler._pending_lock` (`scheduler.py:3166`) and
-  `DecodeScheduler._prefill_lock` (`:3304`), both RapidServe;
-  `CoreManager._lb_lock` (`engine_core_mgr.py:254`) and `_control_send_lock` (`:261`);
-  the metrics exporter's `_lock` (`entrypoints/openai/metrics.py:398`); and the KV-event
-  publisher's `_lock` (`distributed/kv_events.py:177`). Each is held only in a short
+  `PrefillScheduler._pending_lock` (`scheduler.py`) and
+  `DecodeScheduler._prefill_lock`, both RapidServe;
+  `CoreManager._lb_lock` (`engine_core_mgr.py::CoreManager._init_shared_state`) and `_control_send_lock`;
+  the metrics exporter's `_lock` (`entrypoints/openai/metrics.py::AtomMetricsExporter`); and the KV-event
+  publisher's `_lock` (`distributed/kv_events.py::ZmqEventPublisher`). Each is held only in a short
   `with` block, none around a CA call site; an AST test asserts no TAR/NER call sits
   lexically inside a `with ...lock` block.
 - **I3** One sending thread per channel (a ZMQ socket is not thread-safe either).
@@ -660,14 +655,14 @@ receives it itself, at its own receive point.
 |---|---|---|---|
 | `traffic->frontend:http` | Compass traffic source | event loop (inline) | modelled admission delay. Prior work measured 13.7 ms end-to-end, worth ~4 points of TTFT. Path-specific: 13 ms offline batch, 9 ms serving. M4 adds the router hop. |
 | `frontend->traffic:stream` | event loop, writing the SSE stream | traffic source (inline) | declared return delay |
-| `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py:826` | engine input thread, `poller.poll()` at `engine_core.py:544` (thread) | declared IPC delay |
-| `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py:838`. Its second writer, the frontend output thread sending SHUTDOWN (`:592 -> :1364`), runs only outside the window | same (thread) | declared IPC delay |
-| `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py:579`) | frontend output thread, `poller.poll()` at `engine_core_mgr.py:576` (thread) | declared IPC delay |
+| `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_request` | engine input thread, `poller.poll()` in `engine_core.py::EngineCore.process_input_sockets` (thread) | declared IPC delay |
+| `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | declared IPC delay |
+| `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py::EngineCore.process_output_sockets`) | frontend output thread, `poller.poll()` in `engine_core_mgr.py::CoreManager._create_output_thread` (thread) | declared IPC delay |
 | `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | the router's per-request forward cost (D7) |
-| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py:2196`); Mooncake's write request, sent from the engine process rather than the worker | prefill step loop, drained in `process_completions` (`scheduler.py:3002-3004`) (inline) | declared request latency (D6) |
-| PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py:105/141/147` | the stage loop's own poll and receive (inline) | modelled NCCL send/recv of intermediate tensors. Microsecond scale. The only tight one. |
-| `engine-P->engine-D:prefill_done` (RapidServe only, outside M1-M7) | prefill step loop, direct send at `engine_core.py:1014` | decode handler thread `_recv_prefill_done`, `sock.recv()` at `:1204` (thread) | declared IPC delay |
-| `engine-D->engine-P:block_assignment` (RapidServe only, outside M1-M7) | decode step loop, direct send at `engine_core.py:1229` | prefill handler thread `_recv_block_assignments`, `sock.recv()` at `:946` (thread) | declared IPC delay |
+| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline) | declared request latency (D6) |
+| PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py::PPStageTransport.send_metadata` / `send_tokens` / `send_kv_status` | the stage loop's own poll and receive (inline) | modelled NCCL send/recv of intermediate tensors. Microsecond scale. The only tight one. |
+| `engine-P->engine-D:prefill_done` (RapidServe only, outside M1-M7) | prefill step loop, direct send in `engine_core.py::PrefillEngineCore._process_engine_step` | decode handler thread `DecodeEngineCore._recv_prefill_done`, `sock.recv()` (thread) | declared IPC delay |
+| `engine-D->engine-P:block_assignment` (RapidServe only, outside M1-M7) | decode step loop, direct send in `engine_core.py::DecodeEngineCore._send_block_assignment` | prefill handler thread `PrefillEngineCore._recv_block_assignments`, `sock.recv()` (thread) | declared IPC delay |
 
 The RapidServe rows exist only under `--enable-rapidserve` (D2), whose prefill and decode
 `EngineCore`s are two engine LPs of one deployment; they are the only channels received
@@ -697,8 +692,8 @@ PP8, 27B, ~10 ms step, 300 s modelled run: ~30k steps x 8 stages ~= **240k grant
 ~25x. For M1-M4 with 3-5 LPs the grant traffic is negligible.
 
 **PP is therefore an efficiency concern, not a correctness concern.** It is also
-single-node only (every PP address is ZMQ IPC, `engine_core_mgr.py:327-329`), and ATOM
-*rejects* PP+DP (`:298-300`) and multi-node DP+PP (`:272-279`). Defer it on scope
+single-node only (every PP address is ZMQ IPC, `engine_core_mgr.py::CoreManager.__init__`), and ATOM
+*rejects* PP+DP and multi-node DP+PP (both in `CoreManager.__init__`). Defer it on scope
 grounds.
 
 ### Open issues
@@ -723,8 +718,8 @@ protocol itself.
 ### The finding that settles the sizing: LP count does not scale with hardware
 
 A DP group is **one** LP however many ranks it holds, because it already
-`all_reduce`s every step (`engine_core.py:751-781`). A TP group is **one** LP however
-wide, because its workers are slaved by a blocking RPC (`async_proc.py:431`) and hold no
+`all_reduce`s every step (`engine_core.py::DPEngineCoreProc._sync_dp_state`). A TP group is **one** LP however
+wide, because its workers are slaved by a blocking RPC (`async_proc.py::AsyncIOProcManager.call_func`) and hold no
 clock. Adding GPUs to either does not create a time domain.
 
 Every ATOM deployment is two LPs: its API server's event loop (the frontend LP) and its
@@ -805,7 +800,7 @@ interface is identical in both.
 
 **C. No CA — carry time on a Compass-owned `torch.distributed` collective.**
 `all_reduce(MIN)` over a Gloo group built with ATOM's existing
-`stateless_init_torch_distributed_process_group` (`utils/distributed/utils.py:75-130`).
+`stateless_init_torch_distributed_process_group` (`utils/distributed/utils.py`).
 
 - *Pros:* no new process; scales exactly as `torch.distributed` scales; the collective
   **is** the barrier, so the safety property is structural rather than asserted.
@@ -1048,10 +1043,10 @@ undecided**.
 | K3 | Idle point | NER: `next_event(t, t_daemon)` | the step loops' spin, the PP bounded polls, offline `get_output` |
 | K4 | Channel send | timestamped send, logged on the clock owner | PD direct sends, PP sends, output sends through the relay queue |
 | K5 | Channel receive | counted at the wait point, then TSO delivery | the engine input thread, the frontend output thread, the PD handler threads, the PP receives and zero-bound drains, the PP `flush_pp_send` |
-| K6 | Wait inside one LP | LP aggregation: never reported to the CA | TP worker RPC and barriers, frontend coroutines awaiting their own process's data, control commands' calls to workers, the DP group's reduction |
+| K6 | Wait inside one LP | LP aggregation: never reported to the CA | TP worker RPC and barriers, frontend coroutines awaiting their own process's data, control commands' calls to workers, the DP group's reductions (the `PrefillDelayer` all_reduce, and the step-seconds `all_reduce(MAX)` in the predicted forward) |
 | K7 | Virtual timer | the timer runs on the LP clock | idle KV drain, metrics push and refresh, Anthropic ping, keep-alive, the silence warning, the control-command reply timeout |
 | K8 | Real bound | the CA cannot reach it, or it stays real on purpose: configuration | the Rust router's bounds and health check, process-death detection |
-| K9 | Outside the model | outside the simulation window, inside replaced code, or cannot park | startup and shutdown, the replaced runner and RDMA backends, collectives inside the real forward, text scanners |
+| K9 | Outside the model | outside the simulation window, inside replaced code, cannot park, or a timing only a log line reads | startup and shutdown, the replaced runner and RDMA backends, collectives inside the real forward, text scanners, the step-loop timings that only feed a log line |
 
 Each site's mechanism is the `mechanism` field #476 adds to its row in
 `atom/compass/audit/sync_sites.json`, produced by the scanner beside it. A row's
@@ -1076,14 +1071,15 @@ The rules that settle the boundaries #53's categories left in the wrong place:
   sizes both). So the TP workers and every rank of a lockstep DP group sit in the engine
   LP, and a startup assertion refuses a process group whose ranks map to more than one
   LP.
-- **A DP step is one TAR, priced by its per-layer critical path** (D3). The ranks exchange
-  their batch descriptions on the lockstep `all_reduce` they already run
-  (`DPEngineCoreProc._sync_dp_state`, `atom/model_engine/engine_core.py`), each computes
-  the same path, and every rank calls the CA as a member of the LP (D3) — which is why
-  that `all_reduce` is K1 rather than ignored: it is where the DP LP's step length is decided. **Second-order
-  bound:** a fast rank's output is stamped at the end of the whole step, late by at most
-  the difference between the ranks' tail times; the step is split with in-step TAR only
-  if that is measured to affect TPOT.
+- **A DP step is one TAR, costing the `max` over ranks** (D3, `15` D90). Each rank prices
+  its own batch, the ranks exchange the step seconds by one `all_reduce(MAX)` inside the
+  predicted forward, and every rank calls the CA as a member of the LP (D3). The exchange
+  is K6 and carries no cost (`15` D90). The lockstep `all_reduce`
+  (`DPEngineCoreProc._sync_dp_state`, `atom/model_engine/engine_core.py`) keeps its payload; it is K1 rather than ignored because it has a cost of its own, not
+  because the step is decided there. **Second-order bound:** a fast rank's output is
+  stamped at the end of the whole step, late by at most the difference between its own
+  cost and the `max`; the step is split with in-step TAR only if that is measured to
+  affect TPOT.
 - **A bound in Python is a virtual timer; only what the CA cannot reach is a real
   bound.** #53 split bounded waits by purpose, failure detector (C1) against pacing (C2).
   Both run on the LP clock now (K7, D5). K8 is the Rust router's bounds and health check,
@@ -1121,9 +1117,12 @@ The rules that settle the boundaries #53's categories left in the wrong place:
   (`atom/entrypoints/openai/api_server.py`): a multi-server resource station in the
   frontend LP whose completion times come from D33's service model. The multimodal
   preprocessing hand-off in `chat_completions` is K1 too, and is refused today because no
-  service time is modelled for it.
-- **K1**, the DP lockstep `all_reduce` (`DPEngineCoreProc._sync_dp_state`), per the DP
-  rule above
+  service time is modelled for it. A tokenizer call on the event loop thread itself, such
+  as the final `decode` of a non-streaming completion, is no station job: the loop is the
+  LP's clock owner, so the call is a TAR on the loop, `advance_to(now + d)` with `d` from
+  the same service model, and nothing else on the loop runs until it ends.
+- **K1**, the DP lockstep `all_reduce` (`DPEngineCoreProc._sync_dp_state`), for its own
+  cost, per the DP rule above
 - **K3**, **the idle jump, which is a real site in ATOM even though the name this list
   once gave it is not.** `Scheduler._advance_to_next_arrival` does not exist here — but
   the loops it would have served do, and each spins rather than waits when there is
@@ -1320,9 +1319,13 @@ The pacing timers are local next events the clock owner hands to
   engine's metrics push (`EngineCore.busy_loop` and `DPEngineCoreProc.busy_loop`), and
   the API server's refresh loop
   (`_metrics_refresh_loop` in `api_server.py`). **Metric cadence is virtual time again**,
-  which revises `11` D72's decision to keep it on the real clock: an observer in the
-  traffic LP scrapes `/metrics` every `scrape_interval` of simulated time. `11` D72
-  carries the observer and the reasons.
+  as revised `11` D72 also decides (its first version kept it on the real clock): an
+  observer in the traffic LP scrapes `/metrics` every `scrape_interval` of simulated
+  time. `11` D72 carries the observer and the reasons.
+- uvicorn's server tick, a 0.1 s `asyncio.sleep` in `Server.main_loop`, and its
+  keep-alive timeout are daemon deadlines too. They are uvicorn's code, not ATOM's, so the
+  sync inventory (`atom/compass/audit/sync_sites.json`) has no row for them; the frontend
+  declares them with the refresh loop in `DAEMON_TIMERS` (`atom/utils/compass_loop.py`).
 
 ### Must read the LP clock — these three change scheduling (K2)
 
@@ -1410,11 +1413,11 @@ therefore out.
 
 ### Connector landscape (verified)
 
-`KVConnectorFactory` (`atom/kv_transfer/disaggregation/factory.py:27-171`) registers:
+`KVConnectorFactory` (`atom/kv_transfer/disaggregation/factory.py`) registers:
 
 | Name | Model | Classes |
 |---|---|---|
-| `moriio` (**default** when unset, `factory.py:151`) | RDMA **read**, pull: decode reads from prefill | `moriio_connector.py` |
+| `moriio` (**default** when unset, `factory.py::KVConnectorFactory.create_connector`) | RDMA **read**, pull: decode reads from prefill | `moriio_connector.py` |
 | `mooncake` | RDMA **write**, push: producer writes into consumer | `mooncake_connector.py` |
 | `multi` | fan-out wrapper | |
 | `lmcache_offload` | CPU/NVMe offload, **not** P/D | `offload/connector.py` |
@@ -1424,10 +1427,10 @@ There is **no NIXL connector** in this tree.
 The ABC is small and has **no `send_kv` / `recv_kv` verb** to fake
 (`disaggregation/base.py`):
 
-- worker: `register_kv_caches` (`:33`), `start_load_kv` (`:49`), `get_finished` (`:57`),
-  `get_finished_recv_blocks` (`:67`)
-- scheduler: `get_num_new_matched_tokens` (`:83`), `build_connector_meta` (`:92`),
-  `update_state_after_alloc` (`:97`), `request_finished` (`:102`)
+- worker (`KVConnectorBase`): `register_kv_caches`, `start_load_kv`, `get_finished`,
+  `get_finished_recv_blocks`
+- scheduler (`KVConnectorSchedulerBase`): `get_num_new_matched_tokens`, `build_connector_meta`,
+  `update_state_after_alloc`, `request_finished`
 
 ### The seam
 
@@ -1435,8 +1438,8 @@ Every connector's completion reaches the scheduler through **one** method:
 
 ```
 model_runner.py::ModelRunner.async_proc_aggregation
-  -> EngineCore._poll_kv_transfer_progress   engine_core.py:485-489
-     -> Scheduler._update_from_kv_xfer_finished   scheduler.py:2989-3053
+  -> engine_core.py::EngineCore._poll_kv_transfer_progress
+     -> scheduler.py::Scheduler._update_from_kv_xfer_finished
 ```
 
 That single funnel covers any backend, which is why a simulated connector is cheap.
@@ -1453,13 +1456,13 @@ A `SimulatedKVConnector` registered through the existing factory:
   configurable" requirement directly.
 - It must still emit the `kv_transfer_params` blob that Atomesh relays, so
   `AtomAdapter` works unmodified. The router hard-errors if it is absent
-  (`http_pd_router.rs:1073-1078`). The two backends emit **different shapes** —
+  (`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`). The two backends emit **different shapes** —
   thirteen fields and seventeen — so the connector it stands in for decides which;
   see *The blob, per backend* below.
 - The consumer side must still return `(len(prompt), True)` from
   `get_num_new_matched_tokens` when `do_remote_prefill` is set, i.e. park the request
-  (`moriio_connector.py:904-917`), so `Scheduler._park_for_remote_load`
-  (`scheduler.py:2207-2212`) and the `WAITING_FOR_REMOTE_KVS` state behave identically.
+  (`moriio_connector.py::MoRIIOConnectorScheduler.get_num_new_matched_tokens`), so `Scheduler._park_for_remote_load`
+  (`scheduler.py`) and the `WAITING_FOR_REMOTE_KVS` state behave identically.
 
 ### The blob, per backend
 
@@ -1469,8 +1472,8 @@ list of that one dict literal, walked out of the AST at `92f1fdafe`.
 
 | Backend | Assignment | Keys | Field set, in source order |
 |---|---|---|---|
-| `moriio` (pull, the default) | `moriio_connector.py:983-997` | 13 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `transfer_id`, `first_token_id`, `draft_token_ids`, `prefix_cache_hit_tokens` |
-| `mooncake` (push) | `mooncake_connector.py:432-452` | 17 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_swa_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `remote_pp_size`, `hash_block_size`, `transfer_id`, `first_token_id`, `draft_token_ids`, `local_slot_index`, `prefix_cache_hit_tokens` |
+| `moriio` (pull, the default) | `moriio_connector.py::MoRIIOConnectorScheduler.request_finished` | 13 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `transfer_id`, `first_token_id`, `draft_token_ids`, `prefix_cache_hit_tokens` |
+| `mooncake` (push) | `mooncake_connector.py::MooncakeConnectorScheduler.request_finished` | 17 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_swa_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `remote_pp_size`, `hash_block_size`, `transfer_id`, `first_token_id`, `draft_token_ids`, `local_slot_index`, `prefix_cache_hit_tokens` |
 
 The push shape is the pull shape plus four: `remote_swa_block_ids`, `remote_pp_size`,
 `hash_block_size`, `local_slot_index`. They are a second backend's blob, not optional
@@ -1479,32 +1482,32 @@ fields of one, and a simulated connector standing in for `moriio` emits the thir
 One of the four is load-bearing rather than descriptive. The push consumer compares
 the producer's `hash_block_size` against its own and falls back to a full transfer —
 `num_computed_blocks = 0` — whenever it is absent or differs
-(`mooncake_connector.py:388-401`), so a blob carrying only the thirteen can never
+(`mooncake_connector.py::MooncakeConnectorScheduler.update_state_after_alloc`), so a blob carrying only the thirteen can never
 take the incremental path.
 
-`tests/compass/test_kv_blob_doc_table.py` re-derives both sets from the connectors and
-fails naming the field that differs, so this table cannot drift from the source the
-way its twelve-field predecessor did.
+`tests/compass/test_kv_blob_site.py` holds the one-site claim above. Nothing re-checks
+the field sets: they describe the connectors' code as read at `92f1fdafe`, and where the
+two differ the code is right.
 
 ### Pros
 
 - Removes RDMA, drivers and the handshake entirely.
 - Makes interconnect a first-class configured parameter, which a real RDMA run could not.
 - Deletes three busy-waits and two long blocking timeouts (D5).
-- The parked-duration gauge `_num_parked_remote_kv` (`scheduler.py:2216`, logged at
-  `:1648-1656`) is already almost the instrumentation needed to validate it.
+- The parked-duration gauge `_num_parked_remote_kv` (`scheduler.py::Scheduler._count_inflight_load`, logged in
+  `Scheduler.schedule`) is already almost the instrumentation needed to validate it.
 
 ### Cons / open issues
 
 - The transfer model is now **unvalidated** — a real RDMA baseline is needed at least
   once to fit `latency` and `bandwidth`, or the numbers are declared rather than
   measured. This is a calibration task, not a simulator task, but it must be named.
-- MoRI-IO's `_pop_done_transfers` (`moriio_connector.py:818-837`) polls only
+- MoRI-IO's `_pop_done_transfers` (`moriio_connector.py::MoRIIOConnector._pop_done_transfers`) polls only
   `status_list[-1].Succeeded()` — the *last* status in the list. If the simulated
   connector is ever compared against the real one, this is a semantic difference to
   watch.
 - Mooncake requires **all** `(pp_rank, tp_rank)` pairs to report before a request
-  completes (`mooncake_connector.py:1763-1832`); MoRI-IO does not. The simulated
+  completes (`mooncake_connector.py::MooncakeConnector._record_write_done`); MoRI-IO does not. The simulated
   connector must pick one and declare it.
 
 ---
@@ -1515,7 +1518,7 @@ way its twelve-field predecessor did.
 
 Atomesh is Rust. Every timing primitive in it is `tokio::time` or `std::time::Instant`,
 unreachable from a Python virtual clock. In standalone mode it runs a tokio runtime
-**inside the Python process** via PyO3 (`src/python.rs:59-84`), so the engine and the
+**inside the Python process** via PyO3 (`src/python.rs::launch_mesh`, `startup_runtime`), so the engine and the
 router share an OS process and run on two different clocks.
 
 ### Analysis
@@ -1530,7 +1533,7 @@ get disabled — not virtualized.
 ### Design
 
 1. **Run mesh-only mode, not standalone.** In standalone, the SSE drain at
-   `atom_standalone.rs:172-189` is a `loop { ... if chunks.is_empty() { continue } }`
+   `atom_standalone.rs::AtomStandaloneRouter::run_sse_service_stream` is a `loop { ... if chunks.is_empty() { continue } }`
    paced only by a Python `queue.get(timeout=0.05)`. Under a fast virtual clock that
    degenerates into a GIL-hammering spin. A separate binary keeps the two clocks from
    touching.
@@ -1544,17 +1547,20 @@ get disabled — not virtualized.
 
 ### An unused hook worth knowing about
 
-`mocker/virtual_workers/mock_case.rs:69-75` declares
+`mocker/virtual_workers/mock_case.rs` declares
 `SimulationFixture { ttft_ms, chunk_interval_ms }`, threads it through
-`MockCase.simulation` (`:92`), and ships it in all 8 fixtures — with **zero consumers**
+`MockCase.simulation`, and ships it in all 8 fixtures — with **zero consumers**
 anywhere in the crate. A purpose-built latency-injection point that nobody wired up. If
 router-side latency injection is ever wanted, this is where it goes.
 
 ### Open issues
 
-- The two hardcoded Rust timeouts (`worker.rs:29`, `worker_manager.rs:24`) require
-  touching the Rust crate, which means `ATOM_MESH_BUILD=1` and a Rust toolchain in the
-  loop. Confirm the container has one.
+- `worker.rs::DEFAULT_WORKER_HTTP_TIMEOUT_SECS` is the one Atomesh timeout still compiled
+  in; changing it means touching the Rust crate, with `ATOM_MESH_BUILD=1` and a Rust
+  toolchain in the loop. D5 finds a simulated launch never reaches it, so this stays open
+  only if that launch ever keeps the health check on.
+  `worker_manager.rs::DEFAULT_WORKER_REQUEST_TIMEOUT_SECS` is only the default of
+  `--worker-request-timeout-secs` (#478), which D5 sets large.
 - Mesh-only mode has not been exercised by this project. Confirm it serves the ATOM
   relay path correctly against two ATOM servers before depending on it.
 
@@ -1803,7 +1809,7 @@ Ordered by how much they could cost.
 | D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for M4/M6 multi-container runs | 2026-09-19 |
 | D3.4 | Wall-clock interleaving may vary between runs; the `(LP, virtual time, event)` sequence may not. Thread scheduling inside an LP is irrelevant only under in-transit counting and TSO delivery; ties break by **(time, LP id, channel, sequence number), never arrival order**; the cost backend is a pure function of its batch view; **no `set` iteration on the simulated path** - string ids are hashed under `PYTHONHASHSEED` randomisation, so a set of request ids iterates differently in every process. Test is a byte-diff of two step tables, CPU-only, in CI. | 2026-09-20; revised 2026-09-28 |
 | D3.5 | The CA owns three outputs: an opt-in timeline log, a stall diagnostic (a stall the CA can see is resolved by deadlock detection and recovery; one it cannot see gets a diagnostic, never an abort), and an always-written run summary carrying grants, speed ratio, lazy-trace cost, detector state and the refusal fractions `08` D50.1 gates on. | 2026-09-20; revised 2026-09-28 |
-| D4 | Every synchronization site maps to one of the PDES mechanisms K1-K9, none undecided; the boundary is the LP, not the process; a DP step is one compound event priced by its per-layer critical path; handler threads stay and TSO delivery runs them at their message's timestamp | 2026-09-18; revised 2026-09-28 |
+| D4 | Every synchronization site maps to one of the PDES mechanisms K1-K9, none undecided; the boundary is the LP, not the process; a DP step is one TAR costing the `max` over ranks, exchanged inside the forward by a K6 wait with no cost, and the lockstep `all_reduce` is K1 for its own cost; handler threads stay and TSO delivery runs them at their message's timestamp | 2026-09-18; revised 2026-09-28 and 2026-10-01 |
 | D5 | Every timer and clock read the CA can reach runs on the LP clock; only what it cannot reach is configured or left real; metric cadence is virtual time (revising `11` D72); the profiler and RL control commands are refused by the simulated runner and counted | 2026-09-18; revised 2026-09-28 |
 | D5.1 | The simulated run uses stdlib asyncio, not uvloop: only a Python event loop can host virtual time | 2026-09-28 |
 | D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only | 2026-09-18; revised 2026-09-28 |
@@ -1819,20 +1825,20 @@ Facts this design leans on, with their source, so a later reader can re-check ra
 re-derive.
 
 **The seam**
-- `Config.runner_qualname` — `atom/config.py:1595`; consumed `engine_core.py:128`,
-  `async_proc.py:166-169`
+- `Config.runner_qualname` — `atom/config.py`; consumed `engine_core.py::EngineCore.__init__`,
+  `async_proc.py::AsyncIOProc.__init__`
 - `model_runner.py::ModelRunner.forward`, whose signature is
   `forward(batch: ScheduledBatch) -> ScheduledBatchOutput`
-- the RPC boundary — `engine_core.py:386-388`
-- `ScheduledBatch` fields — `scheduler.py:579-820`; notably `detailed_sqsq` /
-  `detailed_sqsk` / `detailed_sk` at `:801-803`, which are sum(N_Q^2), sum(N_Q * N_KV),
-  sum(N_KV) per batch, computed by `compute_detailed_aggregates` (`:2788-2841`) and
+- the RPC boundary — `engine_core.py::EngineCore._process_engine_step_inner`
+- `ScheduledBatch` fields — `scheduler.py::ScheduledBatch.__init__`; notably `detailed_sqsq` /
+  `detailed_sqsk` / `detailed_sk`, which are sum(N_Q^2), sum(N_Q * N_KV),
+  sum(N_KV) per batch, computed by `Scheduler.compute_detailed_aggregates` and
   currently gated on `profile_active and ATOM_ENABLE_DETAILED_ANNOTATION`
-- `ScheduledBatchOutput` — `scheduler.py:841-885`; `produces_output()` at `:823-840`
+- `ScheduledBatchOutput` — `scheduler.py`; `ScheduledBatch.produces_output()`
 
 **Existing simulation-shaped hooks in ATOM**
-- `--load_dummy {empty,zero,xavier}` — `config.py:1556`, `arg_utils.py:260`,
-  `loader.py:179-227,309-310`, `loading_core.py:266-291`
+- `--load_dummy {empty,zero,xavier}` — `config.py::Config.load_dummy`, `arg_utils.py::EngineArgs.add_cli_args`,
+  `loader.py::initialize_dummy_weights`, `load_model`, `loading_core.py::load_weights_into_model`
 - meta-device model construction —
   `model_runner.py::RapidServeModelRunner._init_weight_params_on_meta`
 - a working non-allocating runner template — `model_runner.py::RapidServeModelRunner`,
@@ -1840,11 +1846,11 @@ re-derive.
   `get_num_blocks`, `allocate_kv_cache` and `forward`
 - `model_runner.py::ModelRunner.dummy_execution` shows how to hand-build
   a `ScheduledBatch`
-- `ScheduledBatch.is_dummy_run` — `scheduler.py:589,781`
+- `ScheduledBatch.is_dummy_run` — `scheduler.py::ScheduledBatch.__init__`
 - simulated TP (`--fake-eplb`) — `atom/distributed/simulated_tp.py`; explicit precedent
   for a shape-accurate, value-meaningless run
-- synthetic speculative acceptance — `config.py:1064-1190`,
-  `atom/model_ops/rejection_sampler.py:20-224`; the closest existing behaviour simulator
+- synthetic speculative acceptance — `config.py::SpeculativeConfig._resolve_synthetic_acceptance`,
+  `atom/model_ops/rejection_sampler.py::RejectionSampler`, `rejection_sample`; the closest existing behaviour simulator
 - profiler label taxonomy — `atom/model_engine/run_labels.py`; consumed by
   `tools/parse_trace.py`
 
@@ -1854,31 +1860,31 @@ re-derive.
   arithmetic: `mem_get_info`, `allocated_bytes.all.peak`,
   `(total - free) - memory_reserved()`, `_estimate_cudagraph_overhead()`, a 2% safety
   margin, then `min(budget - ..., free)` and `plan_pools`. Consumed
-  `engine_core.py:132-145`.
-- `BlockManager.__init__` asserts `num_blocks > 0` (`block_manager.py:77`), so a simulated
+  `engine_core.py::EngineCore.__init__`.
+- `BlockManager.__init__` asserts `num_blocks > 0` (`block_manager.py`), so a simulated
   runner must return a plausible count.
 - The prior work's rule: **substitute the readings, never the arithmetic.**
 
-**Prefix caching** (default on, `config.py:1546`)
-- hash: `BlockManager.compute_hash` — `block_manager.py:233-245`, xxhash xxh64 chained
+**Prefix caching** (default on, `config.py::Config.enable_prefix_caching`)
+- hash: `BlockManager.compute_hash` — `block_manager.py`, xxhash xxh64 chained
   with the parent hash
-- hit scan: `can_allocate` — `block_manager.py:469-561`
-- publish, deferred until after the forward computed the KV: `hash_blocks` —
-  `block_manager.py:696-771`, called from `Scheduler.postprocess` at `scheduler.py:2404,2420`
+- hit scan: `BlockManager.can_allocate` — `block_manager.py`
+- publish, deferred until after the forward computed the KV: `BlockManager.hash_blocks` —
+  `block_manager.py`, called from `scheduler.py::Scheduler.postprocess`
 
 **Timing call sites in the serving path**
 - request latency uses **`time.time()`** (wall) because `arrive_time` is stamped in the
-  API process and `first_token_time` in the EngineCore process: `llm_engine.py:745`,
-  `scheduler.py:2688`, `scheduler.py:3364`, `llm_engine.py:777`; TTFT/TPOT computed at
-  `llm_engine.py:781-799`
+  API process and `first_token_time` in the EngineCore process: `llm_engine.py::InputOutputProcessor.preprocess_fanout`,
+  `scheduler.py::Scheduler.postprocess`, `scheduler.py::DecodeScheduler.on_prefill_done`, `llm_engine.py::InputOutputProcessor.postprocess`; TTFT/TPOT computed in
+  `llm_engine.py::InputOutputProcessor.postprocess`
 - loop pacing uses `time.monotonic()`; benchmark clients use `time.perf_counter()`
 - **the main `EngineCore._process_engine_step_inner` does not time the forward.** Only the
-  RapidServe prefill/decode cores do (`engine_core.py:991-1001`, `:1263-1274`).
+  RapidServe prefill/decode cores do (`engine_core.py::PrefillEngineCore._process_engine_step`, `DecodeEngineCore._process_engine_step`).
 
 **Test harness that a compatible seam inherits**
-- `tests/conftest.py:49-78` — `MockConfig`, a GPU-free, download-free stand-in giving
+- `tests/conftest.py::MockConfig` — a GPU-free, download-free stand-in giving
   `BlockManager` / `Scheduler` exactly the fields they read
-- `tests/aiter_stub.py:11` — `stubbed_aiter()` so `async_proc` imports on a CPU runner
+- `tests/aiter_stub.py::stubbed_aiter` — so `async_proc` imports on a CPU runner
 - directly relevant existing tests: `test_scheduler.py`, `test_block_manager.py`,
   `test_block_pool.py`, `test_prefill_scheduler.py`, `test_scheduled_batch_marshal.py`,
   `test_forward_mode.py`, `test_prefill_delayer.py`, `test_dp_load_balance.py`,

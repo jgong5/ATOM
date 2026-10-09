@@ -8,24 +8,25 @@ job and cannot be re-derived. What *can* be re-derived is the set of call sites
 that exist, and these tests assert the two agree -- so a blocking call added to
 ATOM later fails here instead of quietly widening the blind spot.
 
-Three failures are worth telling apart, and each has its own test:
+Two failures are worth telling apart, and each has its own test:
 
 * a call site the list does not classify, or a listed site that has gone away
   (`test_every_scanned_site_is_classified`) -- read it and classify it;
-* a site whose recorded line has moved (`test_recorded_lines_match_the_tree`)
-  -- update the line, the classification still holds;
-* a pinned line of text that is no longer there
-  (`test_anchor_lines_are_still_where_they_say`) -- the same, for the points
-  that are not a call.
+* a pinned piece of text that is no longer exactly once in its symbol
+  (`test_anchors_are_still_where_they_say`) -- the same, for the points that
+  are not a call.
+
+Neither records a line number, so an edit above a site or an anchor changes
+nothing here.
 
 Separately, each row's mechanism is checked against what the rest of the row
 says (`test_every_mechanism_agrees_with_the_rest_of_its_row`).
 
-The second message is only safe to act on if a row cannot silently change which
+A row is only safe to keep across an edit if it cannot silently change which
 call it describes, which is what `test_inserting_a_call_above_another_leaves_
 its_neighbour_alone` pins: an earlier identity keyed on the callee alone, so
 inserting one `call_func("flush_pp_send", ...)` above a `call_func("forward",
-...)` moved every later row onto the wrong site and reported only a moved line.
+...)` moved every later row onto the wrong site.
 
 No driver, and no import of ATOM's serving modules: the scanner parses them.
 """
@@ -75,27 +76,67 @@ def test_every_scanned_site_is_classified(scanned, listed):
     )
 
 
-def test_recorded_lines_match_the_tree(scanned, listed):
-    moved = [
-        f"{row['id']} recorded at line {row['line']}, found at {scanned[key].line}"
-        for key, row in listed.items()
-        if key in scanned and scanned[key].line != row["line"]
+def _key(row: dict) -> str:
+    return row.get("id") or f"{row['file']}::{row.get('symbol', '')}::{row['anchor']}"
+
+
+def _anchor_problem(row: dict, source: str) -> str | None:
+    """Why `row`'s anchor text is not exactly once in its symbol, or None.
+
+    A Python anchor names its enclosing symbol as a site id does; a file-wide
+    match is not enough, because `while True:` repeats in `engine_core.py`.
+    An anchor with no symbol (the Rust ones) is counted over the whole file.
+    """
+    lines = source.splitlines()
+    if "symbol" in row:
+        visitor = sync_scan._ScopedVisitor(row["file"], source)
+        visitor.visit(ast.parse(source))
+        spans = visitor.spans.get(row["symbol"])
+        if not spans:
+            return f"{_key(row)}: no symbol {row['symbol']!r} in the file"
+    else:
+        spans = [(1, len(lines))]
+    found = sum("\n".join(lines[a - 1 : b]).count(row["anchor"]) for a, b in spans)
+    if found != 1:
+        return f"{_key(row)}: the anchor occurs {found} times, not once"
+    return None
+
+
+def test_anchors_are_still_where_they_say():
+    wrong = [
+        problem
+        for row in INVENTORY["anchors"]
+        if (problem := _anchor_problem(row, (TREE / row["file"]).read_text()))
     ]
-    assert not moved, "recorded lines are stale: " + "; ".join(moved)
-
-
-def test_anchor_lines_are_still_where_they_say():
-    wrong = []
-    for row in INVENTORY["anchors"]:
-        lines = (TREE / row["file"]).read_text(encoding="utf-8").splitlines()
-        line = row["line"]
-        if not (1 <= line <= len(lines)) or row["anchor"] not in lines[line - 1]:
-            wrong.append(f"{row['file']}:{line} no longer holds {row['anchor']!r}")
     assert not wrong, "; ".join(wrong)
 
 
-def _key(row: dict) -> str:
-    return row.get("id") or f"{row['file']}:{row['line']}"
+def _row_anchored(anchor: str, symbol: str | None) -> dict:
+    """A real anchor row, re-pointed at `symbol`, or at the whole file for None."""
+    row = dict(next(r for r in INVENTORY["anchors"] if r["anchor"] == anchor))
+    row.pop("symbol")
+    return row if symbol is None else {**row, "symbol": symbol}
+
+
+@pytest.mark.parametrize(
+    "row,refusal",
+    [
+        (_row_anchored("def _passed_delay", "Scheduler.postprocess"), "occurs 0 times"),
+        (_row_anchored("while True:", "NoSuchClass.busy_loop"), "no symbol"),
+        (_row_anchored("while True:", None), "times, not once"),
+    ],
+)
+def test_a_seeded_misplaced_anchor_is_refused(row, refusal):
+    problem = _anchor_problem(row, (TREE / row["file"]).read_text())
+    assert problem is not None and refusal in problem, problem
+
+
+def test_an_anchor_twice_in_its_symbol_is_refused():
+    row = {"file": "made/up.py", "symbol": "Loop.run", "anchor": "while True:"}
+    once = "class Loop:\n    def run(self):\n        while True:\n            pass\n"
+    twice = once + "        while True:\n            pass\n"
+    assert _anchor_problem(row, once) is None
+    assert "occurs 2 times" in _anchor_problem(row, twice)
 
 
 def test_every_row_carries_a_mechanism_and_a_reason():

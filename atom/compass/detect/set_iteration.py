@@ -44,8 +44,10 @@ they are listed separately below.
 applied to one of those, or to a `dict` view; a name or attribute assigned one
 of them, in the scope that assigned it and the scopes inside that one; a
 parameter or variable annotated as a set; a class or dataclass field annotated
-as a set and read through `self`; and a call to a function this module itself
-annotates as returning one.
+as a set and read through `self`; such a field of a class defined in any module
+scanned with this one, read through a parameter annotated with that class; a
+`set_or_none or ()`; and a call to a function this module itself annotates as
+returning one.
 
 **What it recognises as a read in order.** `for` and `async for`, a
 comprehension or generator expression, tuple and starred unpacking, `yield
@@ -83,7 +85,14 @@ from dataclasses import dataclass
 # The enclosing-scope question and the walk over a tree are the same ones the
 # clock-source pass answers, and the answers are taken from it rather than
 # written twice.
-from .clock_source import ClockSourceLint, scope_at, scopes
+from .clock_source import (
+    _REPLACED_TRANSFER,
+    ClockSourceLint,
+    _names,
+    scope_at,
+    scopes,
+    unkept,
+)
 
 #: Builders that produce a set from anything.
 SET_BUILDERS = ("set", "frozenset")
@@ -153,6 +162,49 @@ KEYED_READS = ("min", "max")
 SET_DRAINS = ("pop",)
 
 
+_STARTUP = "runs at startup, before the simulated window"
+_INTO_A_SET = "every member goes into a set or a dict lookup; no order survives"
+
+#: Ordered set reads in ATOM's core where the order cannot matter, by site:
+#: (file, the innermost def or class holding the reads) -> (reason, how many
+#: reads it holds). A def holding a different number fails, so a new read
+#: beside a kept one is not excused by it.
+# fmt: off
+_KEPT = (
+    ("atom/config.py", "init_with_cudagraph_sizes", "torch.compile sizes, " + _STARTUP, 1),
+    ("atom/entrypoints/atomesh/atom_standalone_service.py", "close",
+     "fails every pending future at shutdown, in any order", 1),
+    ("atom/kv_transfer/disaggregation/pp_kv_aggregator.py", "ingest", _INTO_A_SET, 6),
+    ("atom/kv_transfer/disaggregation/types.py", "__repr__", "log text", 7),
+    ("atom/kv_transfer/offload/_offload_common.py", "process_completions", _REPLACED_TRANSFER, 4),
+    ("atom/kv_transfer/offload/hybrid/dsv4/connector.py", "get_finished", _REPLACED_TRANSFER, 2),
+    ("atom/model_engine/block_pool.py", "num_reusable_free", "a count", 1),
+    ("atom/model_engine/block_pool.py", "free", "rebuilds a heap, which pops by block id", 1),
+    ("atom/model_engine/llm_engine.py", "__init__",
+     "stop-token ids, which the scheduler only tests for membership", 1),
+    ("atom/model_engine/scheduler.py", "_update_from_kv_xfer_finished",
+     "received request ids go to lists the scheduler only tests for membership", 2),
+    ("atom/model_engine/state_pool.py", "release", "rebuilds a heap, which pops by slot", 1),
+    ("atom/model_engine/state_pool.py", "occupancy", "a count", 1),
+    ("atom/model_loader/expert_staging.py", "missing_description", _INTO_A_SET, 1),
+    ("atom/model_loader/loading_core.py", "_report_coverage", _INTO_A_SET, 1),
+    ("atom/model_ops/eplb.py", "_placement_biased", "all() over the set", 1),
+    ("atom/model_ops/attentions/deepseek_v4_attn.py", "_discover_field_windows",
+     "sorted when there are several, popped when there is one", 2),
+    ("atom/model_ops/v4_kernels/fused_compress.py", "fused_compress_attn", "error text", 1),
+    ("atom/models/deepseek_v4.py", "load_weights", "pops each key; " + _STARTUP, 1),
+    ("atom/models/mimo_v2_mtp.py", "remap_mtp_weight_name", "any() over the set", 1),
+    ("atom/utils/__init__.py", "get_open_ports_list",
+     "real ports from the OS; nothing simulated reads which role got which", 1),
+    ("atom/utils/__init__.py", "getLogger", "names torch.compile tests for membership", 1),
+    ("atom/utils/cuda_piecewise_backend.py", "__init__", "a dict keyed by size, " + _STARTUP, 1),
+)
+# fmt: on
+CORE_SET_ALLOW_LIST: dict[tuple[str, str], tuple[str, int]] = {
+    (path, scope): (why, count) for path, scope, why, count in _KEPT
+}
+
+
 @dataclass(frozen=True)
 class SetIteration:
     """One ordered read of a set: where it is, what shape, and inside what."""
@@ -176,15 +228,30 @@ class SetIterationLint:
     which is a tree that compiles, imports and runs.
     """
 
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(self, enabled: bool = True, sites=CORE_SET_ALLOW_LIST) -> None:
         self.enabled = enabled
+        self.sites = dict(sites)
 
-    def scan_source(self, source: str, path: str) -> tuple[SetIteration, ...]:
-        """Every ordered read of a set in one module's text, in line order."""
+    def site(self, read: SetIteration) -> tuple[str, str] | None:
+        """The entry naming this read's def, if one does."""
+        for path, scope in self.sites:
+            if scope == read.scope and _names(read.path, path):
+                return path, scope
+        return None
+
+    def scan_source(
+        self, source: str, path: str, fields=None
+    ) -> tuple[SetIteration, ...]:
+        """Every ordered read of a set in one module's text, in line order.
+
+        `fields` is what `set_fields` returns for the modules scanned with this
+        one: a parameter annotated with one of those classes holds a set in
+        each of its set-annotated fields.
+        """
         if not self.enabled:
             return ()
         tree = ast.parse(source, filename=path)
-        known = _set_valued_names(tree)
+        known = _set_valued_names(tree, fields or {})
         enclosing = scopes(tree)
         found = {}
         for node, scope in _scoped(tree):
@@ -205,10 +272,14 @@ class SetIterationLint:
 
     def scan_modules(self, paths) -> tuple[SetIteration, ...]:
         """Every read in the modules named, in the order they were named."""
-        found = []
+        sources = {}
         for path in paths:
             with open(path, encoding="utf-8") as handle:
-                found.extend(self.scan_source(handle.read(), path))
+                sources[path] = handle.read()
+        fields = set_fields(sources.values())
+        found = []
+        for path, source in sources.items():
+            found.extend(self.scan_source(source, path, fields))
         return tuple(found)
 
     @staticmethod
@@ -221,12 +292,13 @@ class SetIterationLint:
         """
         return ClockSourceLint.modules(root)
 
-    def report(self, reads, scanned: int) -> str:
+    def report(self, reads, scanned: int, kept: int = 0) -> str:
         """What the check prints. Clean is a line; dirty is the list and the fix."""
         if not self.enabled:
             return "set-iteration lint: disabled, so this tree makes no claim about its set order"
         if not reads:
-            return f"set-iteration lint: clean over {scanned} module(s)"
+            by_site = f", {kept} read(s) kept by site" if kept else ""
+            return f"set-iteration lint: clean over {scanned} module(s){by_site}"
         lines = [f"set-iteration lint: {len(reads)} ordered read(s) of a set:"]
         lines.extend(f"  {read}" for read in reads)
         lines.append(
@@ -239,11 +311,18 @@ class SetIterationLint:
         )
         return "\n".join(lines)
 
-    def check(self, root: str) -> tuple[int, str]:
-        """Scan `root` and return an exit code beside the report. Non-zero fails CI."""
-        modules = self.modules(root)
+    def check(self, *roots: str) -> tuple[int, str]:
+        """Scan `roots` together and return an exit code beside the report.
+
+        Together, because a field annotated in one module is read in another.
+        Non-zero fails CI.
+        """
+        modules = tuple(path for root in roots for path in self.modules(root))
         reads = self.scan_modules(modules)
-        return (1 if reads else 0), self.report(reads, len(modules))
+        unlisted = unkept(reads, self.sites, self.site)
+        return (1 if unlisted else 0), self.report(
+            unlisted, len(modules), len(reads) - len(unlisted)
+        )
 
 
 def _scoped(node, scope=()):
@@ -339,6 +418,8 @@ def _is_set(node, known, scope) -> bool:
         )
     if isinstance(node, ast.IfExp):
         return _is_set(node.body, known, scope) or _is_set(node.orelse, known, scope)
+    if isinstance(node, ast.BoolOp):
+        return any(_is_set(value, known, scope) for value in node.values)
     return False
 
 
@@ -347,18 +428,49 @@ def _is_view(node) -> bool:
     return isinstance(node, ast.Call) and _tail(node.func) in VIEW_CALLS
 
 
-def _annotates_set(node) -> bool:
-    """Whether an annotation declares a set. A string annotation is parsed first."""
-    if node is None:
-        return False
+def _annotation(node):
+    """An annotation as an expression; a string annotation is parsed first."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         try:
-            node = ast.parse(node.value, mode="eval").body
+            return ast.parse(node.value, mode="eval").body
         except SyntaxError:
-            return False
+            return None
+    return node
+
+
+def _annotates_set(node) -> bool:
+    """Whether an annotation declares a set."""
+    node = _annotation(node)
     if isinstance(node, ast.Subscript):
         node = node.value
-    return _tail(node) in SET_ANNOTATIONS
+    return node is not None and _tail(node) in SET_ANNOTATIONS
+
+
+def _mentions(node) -> set[str]:
+    """Every name an annotation mentions: `Optional[Out]` and `Out | None` both name `Out`."""
+    node = _annotation(node)
+    return set() if node is None else {_tail(part) for part in ast.walk(node)}
+
+
+def set_fields(sources) -> dict[str, set[str]]:
+    """Class name -> the fields its body annotates as a set, over the modules given.
+
+    A class is known by its name alone, so two classes sharing one pool their
+    fields; a field annotated on `self` in a method is not collected.
+    """
+    fields: dict[str, set[str]] = {}
+    for source in sources:
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for item in node.body:
+                if (
+                    isinstance(item, ast.AnnAssign)
+                    and isinstance(item.target, ast.Name)
+                    and _annotates_set(item.annotation)
+                ):
+                    fields.setdefault(node.name, set()).add(item.target.id)
+    return fields
 
 
 class _Names:
@@ -443,7 +555,7 @@ def _declared(scope, name):
     return (name,)
 
 
-def _set_valued_names(tree) -> _Names:
+def _set_valued_names(tree, fields) -> _Names:
     """Every name this module says holds a set, and every name it says does not.
 
     The sets are taken to a fixed point first, because one name can be bound
@@ -457,6 +569,10 @@ def _set_valued_names(tree) -> _Names:
     for node, scope in _scoped(tree):
         if isinstance(node, ast.arg) and _annotates_set(node.annotation):
             known.learn(scope, node.arg, known.sets)
+        if isinstance(node, ast.arg):
+            for cls in sorted(_mentions(node.annotation) & fields.keys()):
+                for name in sorted(fields[cls]):
+                    known.learn(scope, f"{node.arg}.{name}", known.sets)
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         if _annotates_set(node.returns):
@@ -553,13 +669,9 @@ def main(argv=None) -> int:
     )
     parser.add_argument("roots", nargs="+", help="files or directories to check")
     arguments = parser.parse_args(argv)
-    lint = SetIterationLint()
-    worst = 0
-    for root in arguments.roots:
-        code, report = lint.check(root)
-        print(report)
-        worst = max(worst, code)
-    return worst
+    code, report = SetIterationLint().check(*arguments.roots)
+    print(report)
+    return code
 
 
 if __name__ == "__main__":

@@ -61,18 +61,17 @@ evidence about another until it is shown to transfer.
 
 ## D90. DP — the step shape is decided by a collective, and that is the design problem
 
-> **Replaced in part by the owner's DP ruling of 2026-10-01**
-> ([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)): the step is
-> the `max` over ranks of each rank's own cost, exchanged by one `all_reduce(MAX)` inside
-> the forward, and every DP rank holds its own LP runtime, joined by the CA. Where this
-> section differs, the ruling holds; #532 rewrites it.
+**Revised 2026-10-01 by the owner's DP ruling**
+([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)): the step's
+cost is the `max` over ranks, below. It replaces the per-layer critical-path pricing `01`
+D3 adopted on 2026-09-28.
 
 ### Q2 first, because it is the one with teeth
 
 DP is the only strategy that couples **scheduling decisions** across ranks. Under DP, the
 shape a rank runs is not a function of what that rank scheduled.
 
-`ForwardMode.decide` (`forward_context.py:227-300`) runs a DP collective *before* the
+`ForwardMode.decide` (`atom/utils/forward_context.py`) runs a DP collective *before* the
 step's shape is settled, and settles the shape **from the result**:
 
 ```
@@ -110,8 +109,8 @@ load-bearing one for this topic:
 
 | | Where | What it carries | Cadence |
 |---|---|---|---|
-| **liveness / lockstep** | `EngineCore._sync_dp_state` (`engine_core.py:751-781`) | Gloo CPU `all_reduce(MAX)` over three booleans: `has_unfinished`, `shutdown`, `offloaded` | engine-core loop |
-| **step shape** | `sync_dp_metadata` (`tbo/ubatching.py:199-224`), called from `ForwardMode.decide` | one packed `all_gather` of `n_fields` int32 per rank: DP token padding, the prefill fan-out, the cross-DP TBO gate, and the DSpark graph-shape MAX | **every forward** |
+| **liveness / lockstep** | `DPEngineCoreProc._sync_dp_state` (`atom/model_engine/engine_core.py`) | Gloo CPU `all_reduce(MAX)` over three booleans: `has_unfinished`, `shutdown`, `offloaded` | engine-core loop |
+| **step shape** | `sync_dp_metadata` (`atom/utils/tbo/ubatching.py`), called from `ForwardMode.decide` | one packed `all_gather` of `n_fields` int32 per rank: DP token padding, the prefill fan-out, the cross-DP TBO gate, and the DSpark graph-shape MAX | **every forward** |
 
 The second is cheap by construction — *"one all_gather of n_fields int32 values per rank
 suffices"*, down from up to three `all_reduce`s, and with TBO off only the first three
@@ -139,32 +138,62 @@ Consequences:
 3. **Both collectives are internal to the LP, and neither is ignored** (revised
    2026-09-28, #443). Neither is a cross-LP wait the CA sees. The lockstep `all_reduce`
    (`DPEngineCoreProc._sync_dp_state` in `atom/model_engine/engine_core.py`) is an event
-   cost (`01` D4, K1). Every collective's own cost is priced (Q3 below).
+   cost (`01` D4, K1). Both have their own cost priced (Q3 below). The
+   step-seconds exchange (below) is Compass's own and carries no cost (`01` D4, K6).
 
 ### Q1, Q3, Q4
 
 | | |
 |---|---|
-| **Q1 LPs** | **None added.** One LP per DP group, barriered twice per step. |
-| **Q3 cost** | Two collectives per step, both tiny and both on the **CPU/Gloo** path for the liveness one. Priced like any other collective (`07` D40), per width. The all-gather payload is `n_fields × dp_size` int32 — bandwidth-irrelevant, latency-dominated, which is the regime `10` D66 already models. |
+| **Q1 LPs** | **None added.** One LP per DP group, barriered at each of ATOM's DP collectives and at Compass's step-seconds exchange, every step. Each rank is a member process of that LP with its own LP runtime, and the CA joins the members (`01` D3). |
+| **Q3 cost** | ATOM's DP collectives (the table above) are tiny, and the liveness one runs on the **CPU/Gloo** path. Each is priced like any other collective (`07` D40), per width. The step-seconds exchange is not priced: it stands in for the MoE all-to-all, which the MoE segment already prices. The all-gather payload is `n_fields × dp_size` int32 — bandwidth-irrelevant, latency-dominated, which is the regime `10` D66 already models. |
 | **Q4 memory** | Weights and KV **replicate** per DP rank; nothing shards. So the memory model is per-replica and the width key is DP-independent — DP is the one strategy that does *not* add a `runtime_constants` dimension. |
 
-### The rule that bites harder under DP than under TP
+### The step costs the `max` over ranks
 
 `01` charges a step to its **slowest rank**, and measured that this costs 0.06% at TP=4
 because TP ranks are near-identical. **DP ranks are not.** Different DP ranks hold
 different requests and therefore genuinely different batches, so "slowest rank" is not a
 rounding correction here — it is the definition of the step, and it is what the
-`unified_bs` padding exists to express.
+`unified_bs` padding exists to express. Rank-0 single-sourcing is a TP result and does not
+transfer to DP.
 
-Two things follow:
-
-- **The LP's step duration is `max` over DP ranks, and it must be computed, not
-  approximated by rank 0.** Rank-0 single-sourcing is a TP result and does not transfer to
-  DP.
-- **Idle DP ranks still cost a step.** `EngineCore._execute_dummy_batch` runs
-  `dummy_execution` on ranks with nothing to do (`engine_core.py:748-749`), so a rank with
-  no work is not free and must be priced as the dummy shape rather than as zero.
+- **Combine.** The DP group's step costs the `max` over ranks of each rank's own step cost.
+  Every rank prices its own batch with its own runner and backend.
+- **Exchange.** After pricing, the predicted forward (`atom/compass/runner/overrides.py`,
+  #470) runs one `all_reduce(MAX)` of the step seconds on the DP group `sync_dp_metadata`
+  uses, before the forward's `advance_to`. It stands in for the cross-rank collectives a
+  real forward makes (the MoE all-to-all), which a predicted forward does not run. It
+  carries no cost of its own, because the MoE segment already prices that all-to-all; it
+  is a wait inside one LP (`01` D4, K6). With one rank it is skipped. The lockstep `all_reduce` in `DPEngineCoreProc._sync_dp_state`
+  keeps its payload, the three booleans above; the step's cost is not exchanged on it.
+- **Two token counts.** `T_own` is the rank's own scheduled token count. `T_dp =
+  max_tokens_across_dp` is the group's: `ForwardMode.decide` reads it from
+  `sync_dp_metadata` into `forward_mode.sync.num_tokens_across_dp`, the value
+  `ModelRunner.get_dp_padding` pads to. The batch view carries both, and refuses a DP run
+  that states no `num_tokens_across_dp`. The local segment (attention, dense layers, the
+  shared expert) is priced from the rank's own batch; the MoE segment (dispatch, experts,
+  combine) reads only `T_dp`, in every tier (`09` D54 for tier a, #530 for tier 0 and
+  tier b).
+- **Why `max` is the critical path here.** Under DP-attention and EP a layer's
+  barrier-delimited segments are the local segment and the MoE segment. Priced from `T_dp`
+  under uniform routing, the MoE segment costs the same on every rank, and when one
+  segment is rank-invariant the sum of per-segment maxima equals the max of per-rank sums.
+  Rank 0 at attention 3 per layer and rank 1 at 1, both at MoE `c`, give
+  `max(3 + c, 1 + c) = max(3, 1) + c`. A gap between the two, such as 240 against 360 over
+  60 layers for attention 3 / MoE 1 against 1 / 3, needs MoE cost to differ across ranks,
+  which only non-uniform routing produces.
+- **Non-uniform routing is a declared limit.** Real routing is data-dependent (D92 Q2).
+  Where it loads ranks unevenly the MoE segment differs across ranks and `max`
+  underestimates the step. Compass prices uniform routing as a declared treatment
+  (`09` D61) and does not model the difference.
+- **Idle ranks.** `DPEngineCoreProc._execute_dummy_batch` calls
+  `ModelRunner.dummy_execution`, which runs the same `forward` on a dummy batch. So an idle
+  rank's dummy batch is priced and enters the `max`; a rank with no work is never free and
+  never zero.
+- **Second-order effect.** Every rank stamps its outputs at the end of the group's step, so
+  a fast rank's output is late by at most the difference between its own cost and the
+  `max`. The step is split with in-step TAR only if that is measured to affect TPOT.
 
 ---
 
@@ -363,7 +392,7 @@ refused by name.
 ### Q4: memory — layers split, and the split is ATOM's
 
 `get_pp_indices(num_hidden_layers, pp_rank, pp_size)` (`atom/models/utils.py`, used at
-`kv_transfer/offload/config.py:332,439` and in the Mooncake connector) owns the layer
+`kv_transfer/offload/config.py::scale_cpu_size_for_pp`, `kv_transfer/offload/config.py::build_lmcache_metadata` and in the Mooncake connector) owns the layer
 range per stage. `ModelRunner._get_total_num_layers` already consults `get_pp_indices`
 when `pp_group.world_size > 1`.
 
@@ -474,11 +503,11 @@ they agree is a reading, not a guarantee, and no artifact key currently records 
 answered — **T86**.
 
 **ATOM does not construct the EP group — aiter does.** No ATOM file assigns `_EP`, and
-every use site imports `get_ep_group` from `aiter.dist.parallel_state` (`moe.py:599`,
-`fused_moe/mori_v2_prepare_finalize.py:153,636`, `fused_moe/flydsl_mega_experts.py:186`,
-`eplb.py:1768`, `models/glm4_moe.py:96`, `models/qwen3_next.py:171`,
+every use site imports `get_ep_group` from `aiter.dist.parallel_state` (`moe.py::FusedMoEMethodBase._maybe_make_prepare_finalize`,
+`fused_moe/mori_v2_prepare_finalize.py::_init_cco_comm`, `fused_moe/mori_v2_prepare_finalize.py::make_mori_v2_prepare_finalize`, `fused_moe/flydsl_mega_experts.py::run_mega_moe`,
+`eplb.py::EPLBManager._maybe_initialize_runtime`, `models/glm4_moe.py::Glm4MoE.__init__`, `models/qwen3_next.py::Qwen3NextSparseMoeBlock.__init__`,
 `model_runner.py::ModelRunner._force_aiter_unreg_capture_for_piecewise`). Both of ATOM's distributed-init paths —
-`init_pp_aware_dist_env` (`distributed/pp_comm.py:46`) when `pp_size > 1`, aiter's
+`init_pp_aware_dist_env` (`distributed/pp_comm.py`) when `pp_size > 1`, aiter's
 `init_dist_env` (`aiter/ops/communication.py:22`) otherwise, chosen by the
 `pipeline_parallel_size > 1` branch of
 `model_runner.py::ModelRunner._setup_device_and_distributed` — end in
@@ -513,10 +542,10 @@ ships or documents:
 | `-tp 4 -dp 2` (`docs/distributed_guide.md:20`) | 8 | 2/1/1/4 | `[0…7]` | 8 |
 | `-tp 2 -pp 2` | 4 | 1/2/1/2 | `[0,1]`, `[2,3]` | 2 |
 | `-tp 4 -pcp 2` | 8 | 1/1/2/4 | `[0…7]` | 8 |
-| `-tp 2 -pp 2 -dp 2` — **refused** at `engine_core_mgr.py:297-300` | 8 | 2/2/1/2 | `[0,1,4,5]`, `[2,3,6,7]` | 4 |
+| `-tp 2 -pp 2 -dp 2` — **refused** at `engine_core_mgr.py::CoreManager.__init__` | 8 | 2/2/1/2 | `[0,1,4,5]`, `[2,3,6,7]` | 4 |
 
 Under DP-attention `CoreManager` rewrites `dp := dp × tp, tp := 1` before any of this
-(`engine_core_mgr.py:281-295`), which is why those rows carry `tp 1`. The torch world is
+(`engine_core_mgr.py::CoreManager.__init__`), which is why those rows carry `tp 1`. The torch world is
 `dp × pcp × tp` either way: `init_dist_env` passes `world_size = pp × tp × pcp` with `pp`
 pinned to 1 (`aiter/ops/communication.py:33-40`) and `init_distributed_environment`
 multiplies DP back in (`parallel_state.py:1726-1729`); the PP branch computes the same
@@ -532,81 +561,81 @@ The strided last row is the only non-contiguous case, and ATOM refuses it
 `self.internode = not all(in_the_same_node_as(cpu_group, source_rank=0))`
 (`base_device_communicator.py:55`), MoRI picks `IntraNode` against `InterNodeV1` from it,
 and ATOM deliberately shares that one probe rather than re-deriving it from a width
-(`moe.py:692-698`).
+(`moe.py::FusedMoEMethodBase._maybe_make_prepare_finalize`).
 
 **Two configurations where ATOM does not own the answer at all.** Under the vLLM plugin
 ATOM adopts vLLM's group wholesale — `aiter_ps._EP = getattr(vllm_ps, "_EP", None)`
-(`plugin/vllm/tp_group_reuse.py:150-152`) — so membership is vLLM's decision there, and a
+(`plugin/vllm/tp_group_reuse.py::init_aiter_dist_from_vllm`) — so membership is vLLM's decision there, and a
 vLLM configuration with no `_EP` installs `None` and fails at the first `get_ep_group()`
 (`parallel_state.py:1586`). And EP width is never requested directly: ATOM has no
-`--ep-size` flag (`model_engine/arg_utils.py:271-275` offers only the boolean
+`--ep-size` flag (`model_engine/arg_utils.py::EngineArgs.add_cli_args` offers only the boolean
 `--enable-expert-parallel`), and the SGLang and rtp-llm frontends, which do carry an
-`ep_size`, have it reduced to that boolean (`plugin/config.py:612,690`) — so `ep_size=2`
+`ep_size`, have it reduced to that boolean (`plugin/config.py::_generate_atom_config_from_sglang_config`, `plugin/config.py::_generate_atom_config_from_rtpllm_config`) — so `ep_size=2`
 under `-tp 8` is accepted and silently means 8.
 
 ### `moe_parallel_config.ep_size` is a second number, and it is not the group size
 
 `FusedMoEParallelConfig.make` computes its own: `ep_size = tp_size; ep_rank = tp_rank`
-(`moe.py:299-300`), where `tp_size` has been flattened across DP **only if**
-`enable_dp_attention or moe_ep_flatten_tp_across_dp` (`moe.py:240-242`, `252-256`) and
-folded with PCP only under `ATOM_PCP_MOE_MERGE` (`moe.py:272-280`). The two numbers agree
+(`moe.py`), where `tp_size` has been flattened across DP **only if**
+`enable_dp_attention or moe_ep_flatten_tp_across_dp` (`moe.py`) and
+folded with PCP only under `ATOM_PCP_MOE_MERGE` (`moe.py`). The two numbers agree
 in every configuration ATOM ships a recipe for, and disagree in one it documents:
 
 | Configuration | group size (aiter) | `moe_parallel_config.ep_size` | agree |
 |---|---|---|---|
 | `-tp N`, DP 1 | `N` | `N` | yes |
 | `-tp N --enable-dp-attention` | `N` | `N` | yes |
-| vLLM plugin `--enable-expert-parallel` (`plugin/config.py:361`) | `dp × tp` | `dp × tp` | yes |
+| vLLM plugin `--enable-expert-parallel` (`plugin/config.py::_generate_atom_config_from_vllm_config`) | `dp × tp` | `dp × tp` | yes |
 | **`-tp 4 -dp 2 --enable-expert-parallel`, no DP-attention** | **8** | **4** | **no** |
 | `-pcp P` without `ATOM_PCP_MOE_MERGE` | `P × tp` | `tp` | **no** |
 
 MoRI v1 is handed `num_ep_ranks` from the group and `num_local_experts` from the config
-number (`moe.py:654,664`); MoRI v2 derives both from the group
-(`mori_v2_prepare_finalize.py:640,666`). The two paths therefore disagree exactly where
+number (`moe.py::FusedMoEMethodBase._maybe_make_prepare_finalize`); MoRI v2 derives both from the group
+(`mori_v2_prepare_finalize.py::make_mori_v2_prepare_finalize`). The two paths therefore disagree exactly where
 the two numbers do. **Compass must carry both and assert they agree**, because ATOM
 asserts nothing here — recorded as **T83**, which also covers `local_ep_size`
-(`moe.py:313-314`, MoRI's `gpu_per_node`) omitting PCP while the group includes it.
+(`moe.py::FusedMoEParallelConfig.make`, MoRI's `gpu_per_node`) omitting PCP while the group includes it.
 
 ### EP without DP runs no all-to-all at all
 
-`use_all2all_kernels` requires `dp_size > 1` (`moe.py:201-211`) and is the sole gate on
-building `MoriPrepareAndFinalize` (`moe.py:736-742`); without it `self.fused_experts`
-stays `None` (`moe.py:756-759`) and the layer falls through to a plain
-`fused_moe(…, expert_mask=…)` (`moe.py:907-915`). So under
+`use_all2all_kernels` requires `dp_size > 1` (`moe.py`) and is the sole gate on
+building `MoriPrepareAndFinalize` (`moe.py::FusedMoEMethodBase.maybe_make_prepare_finalize`); without it `self.fused_experts`
+stays `None` (`moe.py::FusedMoEMethodBase.init_prepare_finalize`) and the layer falls through to a plain
+`fused_moe(…, expert_mask=…)` (`moe.py::UnquantizedFusedMoEMethod.apply`). So under
 `-tp 8 --enable-expert-parallel` — `recipes/Qwen3-235b.md:24`, the flagship EP recipe —
 the MoE is masked local-expert compute plus the ordinary TP all-reduce
-(`moe.py:4370-4374`), and moves **zero all-to-all bytes**. That is the mechanism behind
+(`moe.py::FusedMoE.forward_impl_graph`), and moves **zero all-to-all bytes**. That is the mechanism behind
 `04`'s *"at `ep_size == tp_size` EP is close to a no-op"*, and it is stronger than close.
 
 **A cost model must refuse to price a MoRI all-to-all at `dp_size == 1` rather than price
 zero bytes** — a confident, precise, fictional number is the archetypal failure `README`
-names. The gate to mirror is `moe.py:201-211` in full, including `dp_logical_ratio == 1`
+names. The gate to mirror is `moe.py::FusedMoEParallelConfig.use_all2all_kernels` in full, including `dp_logical_ratio == 1`
 and `_has_module("mori")`. One exception: `--moe-backend mega` installs `MegaFusedExperts`
-unconditionally (`moe.py:1738-1753`) and reads the group directly for its rank and world
-(`flydsl_mega_experts.py:186-193`), so it does run peer-to-peer at `dp_size == 1`;
-`config.py:1677-1681` refuses `mega` without EP.
+unconditionally (`moe.py::MegaMxfp4MoEMethod.init_prepare_finalize`) and reads the group directly for its rank and world
+(`flydsl_mega_experts.py::run_mega_moe`), so it does run peer-to-peer at `dp_size == 1`;
+`config.py::Config.__post_init__` refuses `mega` without EP.
 
 ### Q1: no LPs added — the conclusion holds, the reason under it did not
 
 **The conclusion stands, and D93's formula is unchanged.** The EP group is exactly the set
 of ranks of one PP stage, and PP is the only LP-adding dimension (D88, D93). The one case
 where EP's membership could cut across an LP boundary is `pp > 1` together with `dp > 1`,
-and `engine_core_mgr.py:297-300` refuses it.
+and `engine_core_mgr.py::CoreManager.__init__` refuses it.
 
 **The reason previously given here was wrong, and is recorded rather than quietly
 dropped**, because a future reader who lifts that refusal will need to know which half
-survived. It read that EP *"inherits the TP group"*, citing `moe.py:265`; that line is a
+survived. It read that EP *"inherits the TP group"*, citing `moe.py::FusedMoEParallelConfig.make`; the cited line is a
 comment inside the PCP-merge block explaining that the *integers* `ep_size`/`ep_rank`
 inherit `tp_size`/`tp_rank`, and says nothing about the communicator. The caveat below it
 was stated conditionally — *"if a deployment configures EP to span the DP dimension"* —
 and EP spans DP in every configuration where DP exists. The second cross-DP
 synchronisation that caveat predicted **does** appear: MoRI dispatch/combine, over a
 membership different from `sync_dp_metadata`'s. ATOM confirms the two groups are distinct
-objects in code — `eplb.py:1784-1793` compares the DP group's global ranks against the EP
+objects in code — `eplb.py::EPLBManager._maybe_initialize_runtime` compares the DP group's global ranks against the EP
 group's to decide `_dp_is_migration_group`, a comparison with no purpose if they were the
 same group.
 
-`get_max_tokens_across_dispatchers` (`moe.py:495`) was cited here as hinting at a
+`get_max_tokens_across_dispatchers` (`moe.py`) was cited here as hinting at a
 cross-dispatcher reduction. It is `def …(input): return input.item()` — no collective —
 and a tree-wide `grep -rn` returns the definition and this document. It has no callers.
 
@@ -621,8 +650,8 @@ Expert assignment is a function of the routing computed inside the layer, not of
 scheduler decision — and **real routing is data-dependent, so it is not derivable from
 geometry**. The closed-form flat ring
 `expert_ids = (p % ep_size) × L + (p // ep_size) % L` is `init_balance_router_logits`
-(`moe.py:137-152`), the **synthetic** router built only under `--fake-eplb`
-(`moe.py:2974-2989`: *"if atom_config.fake_eplb else None"*). Class A under `--fake-eplb`,
+(`moe.py`), the **synthetic** router built only under `--fake-eplb`
+(`moe.py::FusedMoE.__init__`: *"if atom_config.fake_eplb else None"*). Class A under `--fake-eplb`,
 and nothing outside it.
 
 ### Q3: cost — the hard part, and it is already characterised
@@ -641,24 +670,24 @@ That is `04` D19's `exclusive` join policy, and it is a **measured fact rather t
 modelling choice** — an EP all-to-all cannot overlap with anything, so the IR must not
 place it in a `Par`. The cap is two numbers and not one —
 `min(128, CU)` blocks at 16 warps for prefill against `min(64, CU)` at 4 for decode
-(`fused_moe/mori_prepare_finalize.py:257-261`), which on the 80-CU MI308X is 80 and 64 —
+(`fused_moe/mori_prepare_finalize.py::MoriPrepareAndFinalize._get_dispatch_config`), which on the 80-CU MI308X is 80 and 64 —
 recorded as **T87**, since `07`'s price-list table states it as a single cell.
 
 ### Q4: memory — experts shard contiguously, and an indivisible count is refused
 
-`determine_expert_map` (`fused_moe/expert_layout.py:111-152`) gives rank `r` the
+`determine_expert_map` (`fused_moe/expert_layout.py`) gives rank `r` the
 contiguous run `[r×L, (r+1)×L)` with `L = E // ep_size`, and gives any remainder to the
-**last** rank (`expert_layout.py:147-152`) — it is not left unused. Expert weight bytes per
+**last** rank (`expert_layout.py::determine_expert_map`) — it is not left unused. Expert weight bytes per
 rank are `L × bytes_per_expert`, exact from geometry (Class A).
 
 **There is no remainder for a memory model to reproduce**, because a configuration whose
 expert count does not divide by `ep_size` is refused outright:
 `assert self.global_num_experts % self.ep_size == 0` whenever `use_ep`
-(`moe.py:2758-2763`). MoRI derives a token's destination as
-`expert_id // num_experts_per_rank` (`distributed/simulated_tp.py:105-107`,
-`moe.py:203-206`) and cannot represent an uneven last rank, so ATOM refuses rather than
+(`moe.py::FusedMoE.__init__`). MoRI derives a token's destination as
+`expert_id // num_experts_per_rank` (`distributed/simulated_tp.py::_reject_unsupported`,
+`moe.py::FusedMoEParallelConfig.use_all2all_kernels`) and cannot represent an uneven last rank, so ATOM refuses rather than
 pads. The *"a remainder is left unused"* comment this section used to quote is
-`moe.py:151`, inside the `--fake-eplb` synthetic router, not the real path.
+in `moe.py::init_balance_router_logits`, inside the `--fake-eplb` synthetic router, not the real path.
 
 ---
 
@@ -742,7 +771,7 @@ and `test_forward_mode.py` already cover the pieces on the CPU-only path (`08` D
 |---|---|---|
 | D88 | One frame of four questions per strategy — LPs and lookahead, scheduling coupling, cost, memory. **Only PP adds logical processes**; TP, DP and EP each sit behind an existing barrier. | 2026-09-19 |
 | D89 | TP is the settled instance and supplies the per-width discipline: width is a key, not a parameter. | 2026-09-19 |
-| D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP. Step duration is `max` over ranks, computed not rank-0-sourced, and idle ranks cost a dummy batch. Replaced in part by the owner's DP ruling ([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)); #532 rewrites this row. | 2026-09-19, revised 2026-09-28; ruling 2026-10-01 |
+| D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP, with one member process per rank. The step costs the `max` over ranks of each rank's own cost, computed not rank-0-sourced, and exchanged by one `all_reduce(MAX)` inside the predicted forward, a K6 wait that carries no cost; the lockstep `all_reduce` keeps its payload. The MoE segment reads `T_dp = max_tokens_across_dp` and is priced under uniform routing, which makes `max` the per-layer critical path; non-uniform routing is a declared limit. Idle ranks are priced through `dummy_execution`'s own `forward`. | 2026-09-19, revised 2026-09-28 and 2026-10-01 (owner's DP ruling, [#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)) |
 | D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. Revised: a send part completes on the sender's clock when eager and at `max(t_send, r_i) + T` when rendezvous, `r_i` the time its receive is posted, a per-carrier size threshold deciding which, and a send's `done` is the latest over its parts; the receiver returns a rendezvous completion on `stage(k+1)->stage(k):pp_ack#dp0`, lookahead `T_min - L_data`, and both waits receive it (K5). Confirmed by the owner on 2026-10-02: the send reaches the next stage on `stage(k)->stage(k+1):pp_data#dp0`, and the TP-rank-0 workers carry both channels' frames over the PP CPU group. | 2026-09-19, revised 2026-09-28 and 2026-09-30, confirmed 2026-10-02 |
 | D92 | EP adds no LPs (inherits the TP group) but its all-to-all is invisible and must be a declared node, and its `exclusive` occupancy forbids placing it in a `Par`. Expert sharding is Class A, remainder included. | 2026-09-19 |
 | D93 | LP count = 1 traffic LP + per deployment (1 frontend LP + one engine LP per PP stage): 3 aggregated, 5 for 1P1D, independent of GPU count. The clock protocol's cost tracks PP degree and PD roles, not width. | 2026-09-19, revised 2026-09-28 |
@@ -764,6 +793,6 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T85 | Multi-node EP rank-to-node mapping is assumed, not verified: MoRI infers node identity as `ep_rank // gpu_per_node`, which needs consecutive EP ranks to be physically consecutive GPUs | a 2-node DP+EP run logging `all2all_manager.internode` and each rank's EP group; M7-era |
 | T66 | Measure whether the Class-C runtime constants move with PP degree | one engine startup per PP degree |
 | T67 | Measure the step-duration spread across DP ranks, and what padding to `unified_bs` costs | needs a DP2 run with per-rank step timing |
-| T78 | `qwen3_5.py:427` and `glm4_moe.py:426` declare `"intermediate_tensors": 0`, so neither model can run PP at compilation level >= 2 | upstream ATOM fix; `15` D94's PP2 test is fake-model and CPU-only, so this is not on M1's path |
-| T79 | `gdn_attn.py:1329-1331` mixes a PP-local layer count with a global one; KV sizing sign-flips at PP2 | upstream ATOM fix; blocks real-model PP measurement, not M1 |
-| T82 | D91 Q2's "no scheduling coupling" is contradicted by `scheduler.py:1761-1763`, which skips `_pp_inflight_token_block` seqs inside the decode admission loop | the amendment to D91 and its LP consequence is its own task; this PR registers the contradiction rather than rewriting the decision |
+| T78 | `qwen3_5.py::Qwen3_5Model` and `glm4_moe.py::Glm4MoeModel` declare `"intermediate_tensors": 0`, so neither model can run PP at compilation level >= 2 | upstream ATOM fix; `15` D94's PP2 test is fake-model and CPU-only, so this is not on M1's path |
+| T79 | `gdn_attn.py::GDNAttentionMetadataBuilder.sub_pool_specs` mixes a PP-local layer count with a global one; KV sizing sign-flips at PP2 | upstream ATOM fix; blocks real-model PP measurement, not M1 |
+| T82 | D91 Q2's "no scheduling coupling" is contradicted by `scheduler.py::Scheduler.schedule`, which skips `_pp_inflight_token_block` seqs inside the decode admission loop | the amendment to D91 and its LP consequence is its own task; this PR registers the contradiction rather than rewriting the decision |

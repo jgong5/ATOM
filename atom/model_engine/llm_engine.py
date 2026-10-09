@@ -160,6 +160,7 @@ class LLMEngine:
 
     def close(self):
         """Shut down engine and release all GPU resources."""
+        clock.finish()
         if hasattr(self, "core_mgr"):
             self.core_mgr.close()
 

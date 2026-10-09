@@ -16,8 +16,8 @@ Two files:
 
 `tests/compass/test_sync_inventory.py` asserts the two agree. **A blocking call
 added to ATOM later fails that test** rather than being missed, and the failure
-message says which of the three things went wrong: an unclassified site, a
-recorded line that moved, or a pinned line of text that is gone. The same file
+message says which of the two things went wrong: an unclassified site, or a
+pinned piece of text that is no longer exactly once in its symbol. The same file
 checks each row's mechanism against what the row says about its peer and its
 bound.
 
@@ -104,22 +104,24 @@ It can be wrong in two directions, and both are visible rather than hidden:
 ## How a row keeps naming the same call
 
 A row's identity is `file::symbol::expression::shape#ordinal` — **not** the
-line, so an edit elsewhere in a file updates a line rather than re-opening a
-classification, and **with** the arguments, so two calls to one method in one
-function are told apart. An earlier version keyed on the callee alone: inserting
-one `call_func("flush_pp_send", ...)` above a `call_func("forward", ...)` then
-silently moved every later row onto the wrong site and reported only that a line
-had moved. Two sites that still share an ordinal are the same call written the
-same way in one function, and a test asserts the inventory answers both the same
-way, so the ordinal never carries meaning of its own.
+line, so an edit elsewhere in a file changes no row, and **with** the
+arguments, so two calls to one method in one function are told apart. An
+earlier version keyed on the callee alone: inserting one
+`call_func("flush_pp_send", ...)` above a `call_func("forward", ...)` then
+silently moved every later row onto the wrong site. Two sites that still share
+an ordinal are the same call written the same way in one function, and a test
+asserts the inventory answers both the same way, so the ordinal never carries
+meaning of its own.
 
 ## What the rows do not cover
 
 Every reading of the wall clock, as opposed to every wait. The rows under
 `anchors` carry the readings that gate scheduling or that the result reports —
 the delay gate, the queue-age guard, and the arrival, first-token and finish
-stamps — because a mechanism already applies to them. Every clock read on this
-path is classified by the clock-source lint instead
-(`atom/compass/detect/clock_source.py`): a read either goes through
-`atom.utils.clock.now` and returns the LP's time, or stays real under a
-`SERVING_ALLOW_LIST` entry naming its site, class and reason.
+stamps — because a mechanism already applies to them. An anchor names its
+enclosing symbol the way a site id does (`EngineCore.busy_loop`, or `<module>`),
+and its text must occur exactly once there; the Rust anchors name no symbol and
+must occur once in their file. Every clock read on this path is classified
+by the clock-source lint instead (`atom/compass/detect/clock_source.py`): a
+read either goes through `atom.utils.clock.now` and returns the LP's time, or
+stays real under a `CORE_ALLOW_LIST` entry naming its site, class and reason.

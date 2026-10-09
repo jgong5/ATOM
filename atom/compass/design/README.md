@@ -396,7 +396,7 @@ caveats.
 | **T21** | The in-situ calibration transfers across TP width | the "calibrate at TP1, predict TP2/4/8" recipe collapses. Overhead constants have **already** been measured moving 12% and 7% in *opposite directions* between TP1 and TP2 on the same GPUs. |
 | **T25** | The real-vs-real noise floor stays narrow under closed-loop replay at high client count | those cells become ungradeable. All prior data is 20 requests, one session, declared arrivals. |
 | **T5** | ATOM's model classes trace cleanly under `FakeTensorMode` at TP>1 | tier b has no IR, and docs `04`, `07`, `09` rest on it |
-| **T52** | `TorchDispatchMode` instrumentation does not hang ATOM at width | capture is unusable at TP>1; gates T5. A mode-induced 8-rank hang already exists in-tree and is being root-caused, not worked around. |
+| **T52** | `TorchDispatchMode` instrumentation does not hang ATOM at width | capture is unusable at TP>1; gates T5. A mode-induced 8-rank hang was observed while `dspark_scheduler.py::schedule_prefix_lengths_tensor` was written; no landed version makes the call that hung, and the hang is to be root-caused, not worked around. |
 | ~~**T10**~~ | ~~`AgenticReplayStrategy` can be subclassed rather than vendored~~ — **resolved 2026-09-20 by P0.3: yes, and nothing is vendored** | the ~2,000-line consequence does not occur. What the spike found instead is that a subclass reaches only four of the nine pacing calls, so the adapter rebinds the runner's `LoopScheduler` (`06` D34.1) |
 
 **Order to settle the four that remain:** T52 → T5 → T21, T25. T10 came first — an hour, no
@@ -503,7 +503,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it settles |
 |---|---|---|
-| [`01`](01_execution_and_time_model.md) | Execution and Time Model | Keep ATOM's multi-process topology. A central **Clock Authority** acts as the HLA RTI (TAR, NER, TAG); an LP is a process group with one clock owner, and zero-lookahead couplings share one LP. Every synchronization site maps to one PDES mechanism, K1–K9. A straggler fails the run; a stall the Clock Authority cannot see prints one diagnostic and never aborts. KV transfer is simulated, reproducing Mooncake through scheduler-side hooks; the Atomesh router is a configured segment of a channel; arrivals are messages in transit. |
+| [`01`](01_execution_and_time_model.md) | Execution and Time Model | Keep ATOM's multi-process topology. A central **Clock Authority** acts as the HLA RTI (TAR, NER, TAG); an LP is a process group with one clock owner per member process, the CA joins a DP group's members, and zero-lookahead couplings share one LP. Every synchronization site maps to one PDES mechanism, K1–K9. A straggler fails the run; a stall the Clock Authority cannot see prints one diagnostic and never aborts. KV transfer is simulated, reproducing Mooncake through scheduler-side hooks; the Atomesh router is a configured segment of a channel; arrivals are messages in transit. |
 | [`02`](02_model_runner_and_cost_backend.md) | Model Runner Seam and Cost Backend | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass — **no ATOM change for the injection**. The runner has no modes; the algorithm comes from a pluggable backend. Trace is device-free and may be lazy; measure needs a device and never is. The milestone-1 fake model. |
 
 ### Part II — What is modelled
@@ -528,7 +528,7 @@ The documents use these precisely; a reader will bounce off without them.
 |---|---|---|
 | [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced additive field each direction, audited for minimality. Timeline piggybacked on `kv_transfer_params` so Atomesh needs no change. Tokenizer cost is a queue, not a constant. |
 | [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two tiers: a CPU tier over every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free **as a batch** and held to green, and a GPU superset judged as a **delta** against **4779 / 5** (`fe9ea043c`, torch 2.10.0+rocm7.2.4, ROCm 7.2.4, AITER v0.1.21.dev0-49-gf4e7c7509, all five failing node-ids on file). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible only if stable *and* sensitive. |
-| [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. Both metrics clock reads stay real. |
+| [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. The metrics push and refresh are daemon timers on simulated time. |
 
 ### Part V — Cross-cutting
 

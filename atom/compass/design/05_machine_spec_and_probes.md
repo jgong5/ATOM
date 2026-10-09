@@ -40,9 +40,9 @@ Consequences in both directions:
 `set_default_executor`, no `ThreadPoolExecutor`, no `max_workers` under `entrypoints/` or
 `model_engine/`; `arg_utils.py` has no thread or worker argument; and
 `EngineCore.output_thread` / `input_thread` are hardcoded singletons
-(`engine_core.py:93`, `:105`). Tokenization runs on Python's *implicit* default executor
-via `await loop.run_in_executor(None, do_preprocess)` (`api_server.py:890`, `:1004`,
-`:1126`, `:1258`, `:1480`), whose width is `min(32, cpu_count + 4)` and is named nowhere.
+(`engine_core.py::EngineCore.__init__`). Tokenization runs on Python's *implicit* default executor
+via `await loop.run_in_executor(None, do_preprocess)` (`api_server.py::generate_async`, `generate_async_multimodal`,
+`generate_async_fanout`, `setup_streaming_request`, `setup_streaming_request_fanout`), whose width is `min(32, cpu_count + 4)` and is named nowhere.
 
 | Add to ATOM | Why |
 |---|---|
@@ -252,7 +252,7 @@ compass spec explain machine.yaml --term kv_blocks
 
 | Probe | Fills | Method |
 |---|---|---|
-| `tokenizer --model M` | `host.tokenizers[].*` | encode and decode a length sweep with **ATOM's own loaded tokenizer** (`_load_tokenizer`, `llm_engine.py:23`), fit `a + b*n`. Must sweep past 200k tokens: the workload's p90 input is 204,288. |
+| `tokenizer --model M` | `host.tokenizers[].*` | encode and decode a length sweep with **ATOM's own loaded tokenizer** (`_load_tokenizer`, `llm_engine.py`), fit `a + b*n`. Must sweep past 200k tokens: the workload's p90 input is 204,288. |
 | `ipc` | `host.ipc.*` | round-trip over ATOM's own `make_zmq_socket` and `aiter.dist.shm_broadcast.MessageQueue`, so it measures the transports ATOM actually uses |
 
 **Tier 1 — one GPU of the target type.**

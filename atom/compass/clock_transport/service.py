@@ -10,9 +10,13 @@ goes to an LP waiting in TAR or NER; the finish at the end of a run comes when
 every LP waits, and answers each one's request with ``+inf``. A requester whose reply is held gets nothing until a later request
 makes it due, and nothing times it out.
 
-A refused request, a `ClockAbort` such as `BackdatedEvent` or a `KeyError` or
-`ValueError` from the authority, is answered with a refusal frame. The
-requester's `recv` raises it as the same type, and the loop goes on serving.
+A `KeyError` or `ValueError` from the authority refuses the request: the
+requester's `recv` raises it as the same type, and the loop goes on serving. A
+`ClockAbort`, such as `BackdatedEvent`, ends the run: its refusal goes to every
+bound address's slot, waiting or not, and answers every later request. Any other
+exception from the authority, or while framing a reply, ends the run the same
+way, as a `ClockAbort` that names it; its table is empty when the LP table
+cannot be read or framed.
 
 Only frames reach the loop: a carrier hands the serve side encoded frames and
 the serve side decodes them onto the queue, so the in-process carrier here moves
@@ -96,20 +100,43 @@ class _Server:
         self._thread.join()
 
     def _loop(self) -> None:
+        ended = None  # the refusal frame that ended the run, once one has
         while (item := self._requests.get()) is not None:
             address, (kind, t, log, t_daemon) = item
             lp, member = address if isinstance(address, tuple) else (address, None)
-            try:
-                replies = [
-                    (i, (GRANT, g, released))
-                    for i, g, released in self._authority.on_request(
-                        lp, kind, t, log, t_daemon, member
-                    )
-                ]
-            except (ClockAbort, KeyError, ValueError) as refused:
-                replies = [(address, _refusal(refused))]
-            for i, reply in replies:
-                self._slots[i].put(encode(reply))
+            replies = [(address, ended)]
+            if ended is None:
+                try:
+                    try:
+                        grants = self._authority.on_request(
+                            lp, kind, t, log, t_daemon, member
+                        )
+                    except (KeyError, ValueError) as refused:
+                        replies = [(address, encode(_refusal(refused)))]
+                    else:
+                        # Outside the refusing branch: a grant that cannot be
+                        # framed ends the run, and no other grant goes out.
+                        replies = [(i, encode((GRANT, g, r))) for i, g, r in grants]
+                except Exception as fault:  # noqa: BLE001 - ends the run, named
+                    ended = self._ending(fault)
+                    # A copy: a carrier thread may bind a new slot meanwhile.
+                    replies = [(i, ended) for i in list(self._slots)]
+            for i, frame in replies:
+                self._slots[i].put(frame)
+
+    def _ending(self, fault: Exception) -> bytes:
+        """The refusal frame that ends the run on `fault`. Any fault but a
+        `ClockAbort` travels as one naming it, with the LP table, or with an
+        empty table naming why the table could not be read or framed."""
+        if isinstance(fault, ClockAbort):
+            return encode(_refusal(fault))
+        reason = f"the clock authority raised {fault!r}"
+        try:
+            return encode(_refusal(ClockAbort(reason, self._authority.lp_table())))
+        except Exception as unread:  # noqa: BLE001 - the run still ends, named
+            return encode(
+                _refusal(ClockAbort(f"{reason}; no LP table: {unread!r}", ()))
+            )
 
 
 def _refusal(refused: Exception) -> tuple:

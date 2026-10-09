@@ -35,12 +35,12 @@ with exactly one point of GPU contact.
 | `StateSlotPool` — stateful-attention slots, fork/checkpoint index | `state_pool.py` (795 lines) | **No** |
 | `PagedStateCheckpointCoordinator` | `page_unit_checkpoint.py` (577 lines) | **No** |
 | `plan_pools` over `SubPoolSpec` | `model_ops/attentions/sub_pool_spec.py` | **No** |
-| Prefix-cache hash (`compute_hash`, xxhash xxh64 chained with the parent) | `block_manager.py:233-245` | **No** |
-| Prefix-cache scan and claim (`can_allocate`, `allocate`) | `block_manager.py:469-561`, `:563-597` | **No** |
-| Prefix publish, deferred until the forward computed the KV (`hash_blocks`) | `block_manager.py:696-771` | **No** |
+| Prefix-cache hash (`compute_hash`, xxhash xxh64 chained with the parent) | `block_manager.py::BlockManager.compute_hash` | **No** |
+| Prefix-cache scan and claim (`can_allocate`, `allocate`) | `block_manager.py::BlockManager.can_allocate`, `BlockManager.allocate` | **No** |
+| Prefix publish, deferred until the forward computed the KV (`hash_blocks`) | `block_manager.py::BlockManager.hash_blocks` | **No** |
 | **`allocate_kv_cache`** — creating the actual tensors | **`model_runner.py::ModelRunner.allocate_kv_cache`** | **Yes** |
 
-`BlockManager.__init__` asserts `num_blocks > 0` (`block_manager.py:77`) and nothing else
+`BlockManager.__init__` asserts `num_blocks > 0` (`block_manager.py`) and nothing else
 about the device.
 
 ### Decision
@@ -99,7 +99,7 @@ a + b·tokens + c·Σ_req N_Q²  + d·Σ_req (N_Q · N_KV_cached)
 `d` is the cache-hit term. A 90k hit and a 10k hit on the same `N_Q` differ in `d ·
 N_Q · ΔN_KV`, linearly, which is the right shape: the query block is fixed, the KV it
 scans is not. ATOM already computes these sums itself — `detailed_sqsq`, `detailed_sqsk`
-and `detailed_sk` at `scheduler.py:801-803` are exactly `Σ N_Q²`, `Σ N_Q·N_KV` and
+and `detailed_sk` on `scheduler.py::ScheduledBatch` are exactly `Σ N_Q²`, `Σ N_Q·N_KV` and
 `Σ N_KV`, so the features are read from the batch rather than recomputed.
 
 **3. The calibration must have *seen* high-hit steps, or the hull refuses.** This is
@@ -121,15 +121,15 @@ the prefix index is host work proportional to block count, and it is charged to 
 — it currently falls inside the host floor of doc `07` Phase 1c as an unattributed
 constant. At cc-traces' p50 input of 88,768 tokens that is ~1,387 blocks hashed and
 probed per request. Whether that is 0.1 ms or 10 ms is unmeasured. Recorded as **T49**.
-- `hash_blocks` is deliberately called from `Scheduler.postprocess` (`scheduler.py:2404,
-  2420`) *after* the forward, because the real engine only publishes a prefix once the KV
+- `hash_blocks` is deliberately called from `Scheduler.postprocess` (`scheduler.py`)
+  *after* the forward, because the real engine only publishes a prefix once the KV
   behind it exists. The simulated forward must not disturb that ordering.
 
 ### Open issues
 
 - **Resolved by #428.** `model_runner.py::ModelRunner.allocate_kv_cache` also registers
   tensors globally via `set_kv_cache_data`. The Compass override makes the same call with
-  an empty registry, so the registry is `{}` (`forward_context.py:987`), and no stand-in
+  an empty registry, so the registry is `{}` (`forward_context.py::set_kv_cache_data`), and no stand-in
   is needed, because nothing reads it under the Compass runner:
   - No module under `atom/compass` or `scripts/compass` reads it.
   - Outside `atom/plugin`, ATOM reads it in three kinds of place. `set_forward_context`
@@ -150,7 +150,7 @@ probed per request. Whether that is 0.1 ms or 10 ms is unmeasured. Recorded as *
     capture. Its `_build_and_load_model` also sets the model to an `UnbuiltModel`,
     whose `forward` refuses, and refuses a speculative config.
 - `BlockManager.hash_block_size = block_size * dcp_world_size`
-  (`block_manager.py:93`) — decode context parallelism changes the hash granularity.
+  (`block_manager.py`) — decode context parallelism changes the hash granularity.
   Out of scope now; noted so it is not discovered later.
 
 ---
@@ -182,8 +182,8 @@ num_kvcache_blocks  = plan.paged_entries
 
 `_read_device_memory` is `model_runner.py::ModelRunner._read_device_memory`.
 
-Consumed at `engine_core.py:132-145`, which sets `config.num_kvcache_blocks` before the
-`Scheduler` and `BlockManager` are constructed at `:170`.
+Consumed at `engine_core.py::EngineCore.__init__`, which sets `config.num_kvcache_blocks` before the
+`Scheduler` and `BlockManager` are constructed.
 
 Running on an MI308X while modelling an MI355X, the real readings describe the wrong card.
 

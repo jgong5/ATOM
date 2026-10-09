@@ -53,6 +53,10 @@ before the round is complete registers its send log and nothing else: the LP
 stays running, so its ``N`` stays at its clock. Every member gets the common
 grant, carrying the releases on its own channels only.
 
+A finite grant past the simulated-time bound aborts the run with the LP table.
+A housekeeping timer nobody declared daemon keeps raising ``H`` and would
+otherwise keep the run alive forever.
+
 Nothing here reads a clock, opens a socket or starts a thread. The caller
 carries requests in and replies out.
 """
@@ -110,11 +114,19 @@ class ClockAuthority:
     finite grants by name. `final_clocks` is every LP's clock just before the run
     finished, and ``None`` until it has. `members` maps an LP to
     ``{member: names of the channels into or out of it that the member owns}``;
-    an LP not in it is its own single caller.
+    an LP not in it is its own single caller. `bound_s` is the simulated-time
+    bound, ``+inf`` for none.
     """
 
-    def __init__(self, channels: ChannelTable, timeline=None, members=None) -> None:
+    def __init__(
+        self,
+        channels: ChannelTable,
+        timeline=None,
+        members=None,
+        bound_s: float = math.inf,
+    ) -> None:
         self._channels = channels
+        self._bound = _seconds(bound_s, "the simulated-time bound", finite=False)
         self._ids = channels.registry.ids()
         self._now = dict.fromkeys(self._ids, 0.0)
         self._state = dict.fromkeys(self._ids, RUNNING)
@@ -372,6 +384,14 @@ class ClockAuthority:
         return self._grant(i, g, recovered=True)
 
     def _grant(self, i: LpId, g: float, recovered: bool = False) -> tuple:
+        if g > self._bound:
+            raise ClockAbort(
+                f"a grant to {g} for {i} passes the simulated-time bound "
+                f"{self._bound}; either the bound is shorter than the workload, "
+                "or something essential, such as a housekeeping timer not "
+                "declared daemon, keeps the run alive",
+                self.lp_table(),
+            )
         released = {}
         for name in self._into[i]:
             pending = self._undelivered[name]

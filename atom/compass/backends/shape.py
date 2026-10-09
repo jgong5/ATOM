@@ -301,9 +301,10 @@ class BatchView:
     Every shape sum is a function of the rows: no constructor argument takes a
     sum in place of them, so a caller cannot supply a collapsed pair of
     scalars instead, and cannot supply a sum that disagrees with the rows it
-    was supposedly computed from. `capture_rung` is the one batch-level
-    scalar, and it is one because a rung is a property of the replayed graph
-    and not of any row.
+    was supposedly computed from. `capture_rung` and `max_tokens_across_dp`
+    are the batch-level scalars: a rung is a property of the replayed graph,
+    and `max_tokens_across_dp` is the data-parallel group's largest token
+    count, which the MoE segment is priced from. It is None on one rank.
 
     What this does not do is make the collapsed form unreachable: one row is
     a legal batch, and a one-row batch is `tokens x history` by construction.
@@ -312,6 +313,7 @@ class BatchView:
 
     requests: tuple[RequestShape, ...]
     capture_rung: int | None = None
+    max_tokens_across_dp: int | None = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)

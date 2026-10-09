@@ -28,16 +28,16 @@ enough that it does not become a maintenance burden against upstream ATOM.
 |---|---|---|---|
 | `ModelRunner.run_model()` | `model_runner.py::ModelRunner.run_model` | `model(input_ids, positions)` + `compute_logits` | **Rejected.** Returns `(logits, hidden_states)` as real tensors that `postprocess` indexes, samples and gathers logprobs from. Faking it still requires a `[bs, vocab]` device allocation. |
 | `ModelRunner.forward()` | `model_runner.py::ModelRunner.forward` | the whole forward, sampling included | **Chosen.** Its contract is `ScheduledBatch` in, `ScheduledBatchOutput` out — both pure numpy/list/int, already pickled across the worker boundary. |
-| whole-runner replacement via `Config.runner_qualname` | `config.py:1595` | weights, KV tensors, CUDA graphs, sampling | **Chosen as the delivery mechanism** for the above. |
+| whole-runner replacement via `Config.runner_qualname` | `config.py::Config.runner_qualname` | weights, KV tensors, CUDA graphs, sampling | **Chosen as the delivery mechanism** for the above. |
 
 ### Decision
 
 **Subclass `ModelRunner` and inject it with `--runner-qualname`.**
 
-`Config.runner_qualname` (`atom/config.py:1595`) is consumed at `engine_core.py:125-130`
-and `async_proc.py:166-169`. It already has two in-tree users —
-`atom/rollout/async_engine.py:26-32` injects `RLHFModelRunner`, and `Config.__post_init__`
-(`config.py:1730-1736`) swaps in `RapidServeModelRunner` automatically. **The injection
+`Config.runner_qualname` (`atom/config.py`) is consumed at `engine_core.py::EngineCore.__init__`
+and `async_proc.py::AsyncIOProc.__init__`. It already has two in-tree users —
+`atom/rollout/async_engine.py::AsyncLLMEngine.__init__` injects `RLHFModelRunner`, and `Config.__post_init__`
+(`config.py`) swaps in `RapidServeModelRunner` automatically. **The injection
 itself requires no ATOM change.**
 
 `model_runner.py::RapidServeModelRunner` is a working template for a
@@ -48,14 +48,14 @@ through `model_runner.py::RapidServeModelRunner._init_weight_params_on_meta`.
 
 ### The RPC surface that must be honoured
 
-`AsyncIOProc.busy_loop` dispatches by name (`async_proc.py:236-250`). A replacement
+`AsyncIOProc.busy_loop` dispatches by name (`async_proc.py`). A replacement
 runner must answer all of: `get_num_blocks`, `allocate_kv_cache`, `capture_cudagraph`,
 `forward`, `dummy_execution`, `exit`, `freeze_gc_heap`, `process_kvconnector_output`,
 `async_proc_aggregation`, `start_profiler`, `stop_profiler`, `flush_pp_send`.
 
 **Return contracts are load-bearing across a process boundary.** `engine_core` calls
 `capture_cudagraph` with `wait_out=True` and unpacks three values — in the parent, at
-`engine_core.py:149`, not in the worker. The two ways that contract breaks do not fail
+`engine_core.py::EngineCore.__init__`, not in the worker. The two ways that contract breaks do not fail
 alike. A reply of the wrong **shape** arrives and raises where it is unpacked,
 in-process and with a traceback. A reply that never **arrives** queues nothing: a name
 the runner does not define is skipped by `busy_loop`, a method that answers `None` is
@@ -69,7 +69,7 @@ third case — a method that raises — and the table of which names wait.
 
 1. **Deferred output.** `tokenIDProcessor.is_deferred_out` is True by default: the tokens
    returned for step *N* belong to step *N-1*. `Scheduler.postprocess` depends on it
-   (`scheduler.py:2437, 2467-2480`). Returning the current batch's tokens with
+   (`scheduler.py`). Returning the current batch's tokens with
    `is_deferred_out=False` offers them one step early to a loop that cannot yet see the
    sequence, and **never offers them again until a decode batch happens to include the
    request** — on the prior 27B run every request whose prefill completed inside a
@@ -79,14 +79,14 @@ third case — a method that raises — and the table of which names wait.
    nothing sampled) with `is_deferred_out` unset. On the 27B that is **4,354 of 4,440
    `postprocess` calls** that defer. Mirroring `is_pure_middle_chunk` reproduced the lag
    step for step (mean 8.99 s vs a real 9.00 s).
-3. **`produces_output()`** (`scheduler.py:823-840`): a pure-middle-chunk prefill batch
+3. **`produces_output()`** (`scheduler.py::ScheduledBatch.produces_output`): a pure-middle-chunk prefill batch
    must return an **empty** `token_ids` list with the same `req_ids`, mirroring
    the early `return ScheduledBatchOutput(...)` in
    `model_runner.py::ModelRunner.forward`.
 
 Speculative decoding adds `num_rejected` / `num_bonus` sized `batch.total_seqs_num` and
 `draft_token_ids` shaped `[bs, mtp_k]`. ATOM's existing `synthetic_acceptance_rates` path
-(`config.py:1064-1190`, `rejection_sampler.py:20-224`) is the model to copy — it already
+(`config.py::SpeculativeConfig`, `rejection_sampler.py::rejection_sample`) is the model to copy — it already
 forces a chosen acceptance curve instead of computing one.
 
 ### Open issues
@@ -116,9 +116,9 @@ missing is a statement of which combination Compass uses, and when.
 
 | Piece | Where | What it does |
 |---|---|---|
-| `--load_dummy {empty,zero,xavier}` | `config.py:1556`, `arg_utils.py:69,260`, `loader.py:126,234,289-307` | skips the checkpoint read; `empty` leaves params uninitialised, the others fill them with finite values in place |
+| `--load_dummy {empty,zero,xavier}` | `config.py::Config.load_dummy`, `arg_utils.py::EngineArgs.load_dummy`, `EngineArgs.add_cli_args`, `loader.py::load_model_in_plugin_mode`, `load_model` | skips the checkpoint read; `empty` leaves params uninitialised, the others fill them with finite values in place |
 | `_init_weight_params_on_meta` | `model_runner.py::RapidServeModelRunner._init_weight_params_on_meta` | wraps `Module.register_parameter` so every `nn.Parameter` is replaced by a meta tensor as it is registered |
-| `no_init_weights` | `models/utils.py:457-496` | uses `torch.device("meta")` as a **context manager**, so construction itself lands on meta - no transient, no GPU, and it covers buffers. **Currently unused in ATOM.** |
+| `no_init_weights` | `models/utils.py::no_init_weights` | uses `torch.device("meta")` as a **context manager**, so construction itself lands on meta - no transient, no GPU, and it covers buffers. **Currently unused in ATOM.** |
 | `RapidServeModelRunner._build_and_load_model` | `model_runner.py::RapidServeModelRunner._build_and_load_model` | the override point where a runner declines to load |
 
 #### Why `_init_weight_params_on_meta` allocates on the real device, despite its name
@@ -155,7 +155,7 @@ the precise one.
 #### The transient is avoidable, and ATOM already ships the mechanism
 
 There is a second way, and it is strictly better than the `register_parameter` hook on
-both counts. **ATOM already has it**, at `atom/models/utils.py:457-496`:
+both counts. **ATOM already has it**, at `atom/models/utils.py::no_init_weights`:
 
 ```python
 with register_module_module_registration_hook(hook), torch.device("meta"):
@@ -210,7 +210,7 @@ Both matter, and both are measured:
   that mispredicted **3 of 11 dimensions** at a held-out point — including a ceil-division
   **9.5x off**, which two sample points straddling a block boundary hide entirely.
 - **Wrong device branch.** ATOM registers its ops at `dispatch_key="CUDA"`
-  (`atom/utils/custom_register.py:40`) and the model and runner branch on device
+  (`atom/utils/custom_register.py::direct_register_custom_op`) and the model and runner branch on device
   throughout. Under meta that code takes paths nobody runs — and *"meta accepts kernels
   real devices reject"*: AITER's fused qk-rmsnorm takes fp16/bf16 only, and meta traced it
   happily at fp32.
@@ -240,7 +240,7 @@ one of `16`'s named escalation points — not a silent substitution.
 | Need | Path | Device touched |
 |---|---|---|
 | **geometry only** — M1's fake model, the weight-bytes term, configuration sweeps | **HF config, no module tree at all.** Weight bytes are Class A, exact from declared geometry: measured **-0.00 / +0.00 / -0.02 / +0.01%** at TP 1/2/4/8 (`10` D63). | none |
-| **a module tree, no tracing** - parameter enumeration, a structural walk | **`torch.device("meta")` context** with `--load_dummy empty`. ATOM already has this shape at `models/utils.py:457-496`. | none |
+| **a module tree, no tracing** - parameter enumeration, a structural walk | **`torch.device("meta")` context** with `--load_dummy empty`. ATOM already has this shape at `models/utils.py::no_init_weights`. | none |
 | **a module tree for tracing** - tier b, the liveness walk, structure discovery | **Construct the model inside `FakeTensorMode`**, with `--load_dummy empty` so no checkpoint is read. | none |
 
 The second is not an addition to `04` D18 — it *is* D18, stated from the construction side.
@@ -402,7 +402,7 @@ From the engine's point of view the fake model must be *interface-indistinguisha
 
 1. **KV geometry** — enough that `get_num_blocks` returns a real number, `plan_pools`
    over `SubPoolSpec` runs for real, and `BlockManager.__init__`'s `assert num_blocks > 0`
-   (`block_manager.py:77`) passes. Derived from the HF config: layer count, KV head count,
+   (`block_manager.py`) passes. Derived from the HF config: layer count, KV head count,
    head dim, KV dtype, block size.
 2. **A step duration** from the cost backend.
 3. **A correctly-shaped output**, honouring the three semantics of D10.
@@ -473,9 +473,9 @@ decode:   a' + b'·batch  + c'·Sum ctx       + e'·( rung * max(ctx) - Sum ctx 
 ```
 
 **ATOM already computes the attention terms.** `ScheduledBatch.detailed_sqsq`,
-`detailed_sqsk`, `detailed_sk` (`scheduler.py:801-803`) are Sum N_Q^2, Sum N_Q*N_KV and
-Sum N_KV, produced by `Scheduler.compute_detailed_aggregates` (`:2788-2841`), currently
-gated on `self.profile_active and ATOM_ENABLE_DETAILED_ANNOTATION` (`:2819-2820`).
+`detailed_sqsk`, `detailed_sk` (`scheduler.py`) are Sum N_Q^2, Sum N_Q*N_KV and
+Sum N_KV, produced by `Scheduler.compute_detailed_aggregates`, currently
+gated on `self.profile_active and ATOM_ENABLE_DETAILED_ANNOTATION`.
 Ungating them is a flag, not code.
 
 Two properties of this form are free here and cost the prior effort real time to
@@ -526,6 +526,6 @@ scheduler at shapes no real model has.
 | # | Decision | Date |
 |---|---|---|
 | D10 | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass; no ATOM change for the injection | 2026-09-18 |
-| D10.1 | A model comes into existence three ways, none reading weights: HF-config geometry where only geometry is needed; a `torch.device("meta")` context where a module tree is needed without tracing (no transient, no GPU, covers buffers - ATOM already has this shape at `models/utils.py:457-496`, unused); and `FakeTensorMode` for tracing, the only one with symbolic shapes and the right device branch. `--load_dummy` is reused in all three. `_init_weight_params_on_meta` is not a bug but is superseded by the meta context. The T5 fallback is the meta context plus concrete traces. | 2026-09-20 |
+| D10.1 | A model comes into existence three ways, none reading weights: HF-config geometry where only geometry is needed; a `torch.device("meta")` context where a module tree is needed without tracing (no transient, no GPU, covers buffers - ATOM already has this shape at `models/utils.py::no_init_weights`, unused); and `FakeTensorMode` for tracing, the only one with symbolic shapes and the right device branch. `--load_dummy` is reused in all three. `_init_weight_params_on_meta` is not a bug but is superseded by the meta context. The T5 fallback is the meta context plus concrete traces. | 2026-09-20 |
 | D11 | No modes on the runner. Every run simulates; the algorithm comes from a pluggable cost backend. `measure` and `trace` are orthogonal flags. | 2026-09-18 |
 | D12 | M1 fake model = KV/weight geometry from the HF config + a shape-analytic cost stub including the quadratic query term; constant mode retained for bring-up | 2026-09-18 |

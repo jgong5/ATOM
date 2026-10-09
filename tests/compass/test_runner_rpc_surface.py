@@ -731,17 +731,21 @@ def test_the_pp_reply_is_read_in_the_head_and_not_at_the_last_stages_call():
 
 
 def test_dummy_execution_is_this_runners_forward_and_refuses_with_it():
-    """Which is why it is not replaced: it answers as soon as `forward` does."""
+    """Which is why it is not replaced: it answers when `forward` does, with its reply."""
     body = next(
         n
         for n in ast.walk(_classes(ATOM_RUNNER)["ModelRunner"])
         if isinstance(n, ast.FunctionDef) and n.name == "dummy_execution"
     )
-    assert any(
-        isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "forward"
-        for n in ast.walk(body)
-    )
-    assert body.body[-1].value.value is True
+    replies = {
+        target.id
+        for n in body.body
+        if isinstance(n, ast.Assign)
+        and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "attr", None) == "forward"
+        for target in n.targets
+    }
+    assert body.body[-1].value.id in replies
     # Its one site returns the reply to its own caller
     # (`DPEngineCoreProc._execute_dummy_batch`), which is a read and not a
     # discard. Scoring it 0 is the modelling error `_arity` exists to avoid,
