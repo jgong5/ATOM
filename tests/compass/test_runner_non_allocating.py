@@ -55,6 +55,7 @@ ATOM_RUNNER = ENGINE / "model_runner.py"
 # package; every other module, none.
 ENGINE_READS = {
     "model_runner.py": {"atom.model_engine.model_runner"},
+    "overrides.py": {"atom.compass.backends.base"},
     "projection.py": {
         "atom.compass.backends.shape",
         "atom.model_engine.sequence",
@@ -546,10 +547,12 @@ def test_only_the_binding_module_reaches_the_engine(path):
     The exemption is exactly the two packages whose closure something asserts;
     widening it to `atom.compass` would exempt packages nothing has checked.
 
-    Two modules read named engine modules, listed in `ENGINE_READS` by the
-    exact set. `model_runner` binds ATOM's runner. `projection` reads a
-    scheduled batch, a sequence's kind and the dispatch rule; none of the
-    three reaches `atom.model_engine.model_runner`, and
+    The modules that read named modules outside the exemption are listed in
+    `ENGINE_READS` by the exact set. `model_runner` binds ATOM's runner.
+    `overrides` reads the cost backend's base class, from a package whose own
+    test keeps it free of the engine. `projection` reads a scheduled batch, a
+    sequence's kind and the dispatch rule; none of those reaches
+    `atom.model_engine.model_runner`, and
     `test_every_other_module_imports_here` runs the import to measure it.
     """
     # A relative import is resolved against this module's package first, so

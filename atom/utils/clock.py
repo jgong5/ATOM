@@ -137,6 +137,8 @@ class LPRuntime:
         self.wakes: dict[threading.Thread, _Wakeup] = {}
         self.endpoints: dict[str, str] = {}  # address -> channel kind it carries
         self.relays: dict[str, RelayQueue] = {}  # channel -> the engine's output relay
+        self.calls = 0  # clock calls made, TAR and NER
+        self.idle_calls = 0  # `calls` when the step loop last passed its idle point
         # The frontend's event loop, once built: a frame a thread takes is a job on it.
         self.loop = None
 
@@ -207,6 +209,7 @@ class LPRuntime:
     def _ca_call(self, kind: str, t: float, t_daemon: float = float("inf")):
         with self.lock:
             log, self.send_log = self.send_log, []
+        self.calls += 1
         self.conn.send((kind, t, log, t_daemon))
         return self.conn.recv()
 
@@ -554,3 +557,64 @@ def relay_queue(dp: int):
     ch = channel_of(rt, f"output#dp{dp}")
     rt.relays[ch] = RelayQueue(rt, WrappedSocket(rt, None, ch))
     return rt.relays[ch]
+
+
+# ---- the engine step loop: hooks ATOM calls, each a no-op on a real run ----
+
+
+def charge(reply):
+    """A reply whose ``ScheduledBatchOutput.predicted_s`` is set advances the clock by it.
+
+    The reply is what says the call cost time, not the call's name. A real
+    forward leaves the field None, and no other reply has it.
+    """
+    rt = _installed
+    if rt is not None and getattr(reply, "predicted_s", None) is not None:
+        rt.advance_to(rt.now + reply.predicted_s)
+    return reply
+
+
+def idle(deadline, t_daemon: float = math.inf) -> bool:
+    """An idle point of a loop that never blocks; True once the run is finished.
+
+    A pass through the loop that made no clock call ran nothing, so this one
+    first waits for the LP's next event: an arrival, or ``deadline()``, the time
+    the loop next acts on its own. `t_daemon` is a deadline that does not keep
+    the run alive. The loop takes True as its shutdown.
+    """
+    rt = _installed
+    if rt is None:
+        return False
+    if rt.in_run and rt.calls == rt.idle_calls:
+        rt.next_event(deadline(), t_daemon)
+    rt.idle_calls = rt.calls
+    return rt.now == math.inf
+
+
+def finish() -> None:
+    """Offline teardown: wait for the run to finish before the engines are stopped.
+
+    An engine leaves its loop on the ``+inf`` grant, so a shutdown sent at a
+    finite time would take it out before the finish. Outside a run, or once it
+    has finished, this asks nothing.
+    """
+    rt = _installed
+    while rt is not None and rt.in_run:
+        rt.next_event(math.inf)
+
+
+def wait_output(q: queue.Queue) -> None:
+    """The offline driver's idle point: ask for time until `q` holds an output."""
+    rt = _installed
+    if rt is None:
+        return
+    while rt.in_run and q.empty():
+        rt.next_event(math.inf)
+    if rt.now == math.inf and q.empty():
+        raise RuntimeError(f"{rt.me}: the run finished with no output left to get")
+
+
+def close() -> None:
+    """The step loop's process leaves; refused before the ``+inf`` grant."""
+    if _installed is not None:
+        _installed.close()

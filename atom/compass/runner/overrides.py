@@ -89,6 +89,7 @@ from typing import Any
 
 import torch
 
+from atom.compass.backends.base import CostBackend
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
 from atom.compass.runner.step_output import (
     DeferredTokenStream,
@@ -208,6 +209,36 @@ def _installed_readings(runner: Any) -> DeviceReadings:
             "spec before the engine asks this worker for a block count."
         )
     return readings
+
+
+def install_cost_backend(runner: Any, backend: CostBackend) -> None:
+    """Give a runner the cost backend its steps are priced by.
+
+    Set on the instance the way `install_device_readings` sets the readings,
+    and for the same reason. Choosing a backend from a flag or a config field
+    is the configuration surface's job and is not wired yet.
+    """
+    if not isinstance(backend, CostBackend):
+        raise RunnerRefusal(
+            "a step is priced by a `CostBackend`, and "
+            f"{type(backend).__name__} is not one"
+        )
+    runner.compass_backend = backend
+
+
+def _installed_backend(runner: Any) -> CostBackend:
+    """The installed backend, or a refusal that says what would supply it.
+
+    A step with no backend would take no time, which reads as a valid run.
+    """
+    backend = getattr(runner, "compass_backend", None)
+    if backend is None:
+        raise RunnerRefusal(
+            "no cost backend is installed on this runner, so there is nothing "
+            "to price a step with; call `install_cost_backend` before the "
+            "engine's first step."
+        )
+    return backend
 
 
 def _config_field(runner: Any, name: str) -> Any:
@@ -537,8 +568,11 @@ class NonAllocatingRunner:
         `RapidServeModelRunner`, the other runner in this tree that declines
         to own its memory, carries the same one of the two.
 
-        No duration is reported. The reply has nowhere to put one: the engine
-        times the call itself, and the batch output it reads carries tokens.
+        The reply's `predicted_s` is the step's duration: this rank's batch
+        priced by the installed cost backend, then the max over its DP group.
+        A runner with no backend refuses the step rather than report one that
+        took no time. ATOM's `dummy_execution` answers with this reply too, so
+        an idle DP rank's dummy batch is priced and joins the group's max.
         """
         if not hasattr(batch, "produces_output"):
             # Not reachable from the engine, which only ever passes a scheduled
@@ -551,6 +585,7 @@ class NonAllocatingRunner:
                 f"{type(batch).__name__} cannot say whether its batch produces "
                 "output; there is nothing here to report from."
             )
+        backend = _installed_backend(self)
         # Imported at call time, not at module scope: the scheduler so this
         # module stays importable where there is no driver (by the time a step
         # is reported the worker has imported the engine anyway), and the
@@ -577,4 +612,37 @@ class NonAllocatingRunner:
                 ),
             )
             self._token_stream = stream
-        return ScheduledBatchOutput(**stream.step(batch))
+        return ScheduledBatchOutput(
+            **stream.step(batch),
+            predicted_s=_group_step_seconds(self, batch, backend),
+        )
+
+
+def _group_step_seconds(runner: Any, batch: Any, backend: CostBackend) -> float:
+    """This rank's step priced from its own batch, then the max over its DP group.
+
+    The `all_reduce(MAX)` stands in for the cross-rank collectives a real
+    forward makes, which a predicted one does not run, so every rank leaves the
+    step at the group's seconds. With one rank there is no group to exchange
+    with.
+
+    A pipeline stage is refused: it runs only its own layers, and a backend
+    prices the whole step, so every stage would charge the whole model.
+    """
+    from atom.compass.runner.projection import batch_view, dp_group, forward_mode
+
+    if int(_config_field(runner, "pipeline_parallel_size") or 1) > 1:
+        raise RunnerRefusal(
+            "this runner is one stage of a pipeline and runs only its own "
+            "layers, but a cost backend prices a whole step; charging each "
+            "stage the whole model would count it once per stage"
+        )
+    mode = forward_mode(batch, runner)
+    seconds = backend.estimate(batch_view(batch, mode, runner)).seconds
+    if mode.sync is None:
+        return seconds
+    group_max = torch.tensor([seconds], dtype=torch.float64)
+    torch.distributed.all_reduce(
+        group_max, op=torch.distributed.ReduceOp.MAX, group=dp_group()
+    )
+    return group_max.item()
