@@ -17,9 +17,11 @@ works on the wall clock and the simulation waits for it.
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
+from pathlib import Path
 
 import zmq
 import zmq.asyncio
@@ -30,7 +32,8 @@ from atom.utils.clock import DIAG_S, LPRuntime
 from compass_harness import ADDRESS_ENV
 from compass_harness.transport import addresses, credit_key
 
-ENDPOINT_ENV = "COMPASS_CLOCK_ENDPOINT"
+#: The run file every process of the simulated deployment reads.
+RUN_ENV = "ATOM_COMPASS_RUN"
 HTTP = "traffic->frontend:http"
 STREAM = "frontend->traffic:stream"
 TRAFFIC = LpId("traffic")
@@ -71,16 +74,21 @@ class TrafficLP:
 
     @classmethod
     def from_env(cls) -> "TrafficLP":
-        """Connect to the Clock Authority at ``COMPASS_CLOCK_ENDPOINT``."""
-        endpoint = os.environ.get(ENDPOINT_ENV)
-        if not endpoint:
+        """Join the run the deployment's run file at ``ATOM_COMPASS_RUN`` describes:
+        its Clock Authority at ``clock_endpoint`` and its channel table."""
+        path = os.environ.get(RUN_ENV)
+        if not path:
             raise RuntimeError(
-                f"{ENDPOINT_ENV} is not set: the traffic LP has no Clock Authority."
+                f"{RUN_ENV} is not set: the traffic LP has no run file naming the "
+                "Clock Authority and the channel table."
             )
-        # The traffic LP reads only its own channels: the request lookahead is the
-        # measured serving admission delay; the stream's is the frontend's to apply.
-        table = single_engine_table(admission_path="serving", ipc_s=0.0, stream_s=0.0)
-        conn = clock_transport.connect(TRAFFIC, endpoint)
+        run = json.loads(Path(path).read_text())
+        table = single_engine_table(
+            admission_path=run["admission_path"],
+            ipc_s=run["ipc_s"],
+            stream_s=run["stream_s"],
+        )
+        conn = clock_transport.connect(TRAFFIC, run["clock_endpoint"])
         return cls(LPRuntime(TRAFFIC, table, conn), os.environ[ADDRESS_ENV])
 
     # ---- the clock ClockPacedLoopScheduler paces on ----

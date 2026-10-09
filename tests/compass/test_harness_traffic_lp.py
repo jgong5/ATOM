@@ -14,6 +14,7 @@ on either side of its final event's release. Skips by name as
 
 import asyncio
 import heapq
+import json
 import math
 import re
 import shutil
@@ -53,8 +54,8 @@ from aiperf.credit.sticky_router import StickyCreditRouter
 from compass_harness.router import CompassCreditRouter
 from compass_harness.scheduler import ClockPacedLoopScheduler
 from compass_harness.traffic_lp import (
-    ENDPOINT_ENV,
     HTTP,
+    RUN_ENV,
     STREAM,
     TrafficLP,
 )
@@ -65,7 +66,9 @@ from atom.compass.clock import NER, ClockAuthority, LpId, single_engine_table
 from atom.utils.clock import LPRuntime
 from compass_harness import ADDRESS_ENV, fingerprint
 
-TABLE = single_engine_table(admission_path="serving", ipc_s=2.0**-10, stream_s=2.0**-9)
+#: The run file's table keys, as the deployment writes them.
+RUN = {"admission_path": "serving", "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+TABLE = single_engine_table(**RUN)
 FRONTEND, ENGINE = LpId("frontend"), LpId("engine")
 INF = math.inf
 ADMIT = TABLE.lookahead(HTTP)
@@ -184,7 +187,9 @@ def ca(tmp_path, monkeypatch):
     endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
     server = clock_transport.serve(ClockAuthority(TABLE), endpoint)
     clock_transport.connect(ENGINE, endpoint).send((NER, INF, [], INF))
-    monkeypatch.setenv(ENDPOINT_ENV, endpoint)
+    run_file = tmp_path / "run.json"
+    run_file.write_text(json.dumps({"clock_endpoint": endpoint, **RUN}))
+    monkeypatch.setenv(RUN_ENV, str(run_file))
     monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / "lp"))
     monkeypatch.setattr(ClockPacedLoopScheduler, "clock", None)
     try:
