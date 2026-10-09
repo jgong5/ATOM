@@ -513,8 +513,8 @@ comma-separated sweeps.
 **One corpus limit to design around:** only **175 of 393** sessions contain any subagent
 and only **144** offer a multi-request episode containing a descendant. A 256-client cell
 requiring genuine fan-out in every root is not constructible without reusing sessions, and
-the recipe runs the DPA configurations at more clients than the corpus has sessions, so
-those cells reuse sessions whatever they require. Whatever is done there must be declared,
+the recipe's largest DPA concurrency exceeds the corpus's sessions, so the cells at that
+concurrency reuse sessions whatever they require. Whatever is done there must be declared,
 not discovered (T27).
 
 ### The ranking gate
@@ -572,16 +572,20 @@ error bar quoted on the projection would be invented.
 **The projection is held to three checks instead of an error bar.** A projection that
 fails the first two, or ships without the third's measurement, is not M2's result.
 
-1. **Tier 0 is a lower bound on every measured MI355X step.** Applied as D47 applies cost
-   accuracy, on the real runs' own unprofiled steps (D49): no step's tier-0 price may exceed
-   its measured time. One that does is a defect in a law or in the spec, reported with its
-   operator family; it is a bound, not a statistic, so none is tolerated. The
-   measured-to-roofline efficiency is reported per operator family as a distribution,
-   never as a mean alone. `16` W5.3 runs this check.
-2. **Every MI455 input is sourced or marked assumed.** Each machine-spec field a tier-0 law
-   reads names its source or carries an `assumed` mark, and the projection artifact lists
-   the assumed fields. A field with neither is refused (principle 6). `16` W5.1 and W5.4
-   carry it.
+1. **The roofline is a lower bound on every measured MI355X step.** The bound is `10` D64's
+   leaf sum at the spec's peaks: every derate at 1 and no host floor. Tier 0's own price is
+   not the bound: it is derated and floored, a central estimate (`10` D67.1). Applied as D47
+   applies cost accuracy, on the real runs' own unprofiled steps (D49): no step's bound may
+   exceed its measured time. One that does is a defect in a law or in the spec, reported
+   with its operator family; it is a bound, not a statistic, so none is tolerated. The
+   measured-to-roofline efficiency, the bound over the measured time, is reported per
+   operator family as a distribution, never as a mean alone. `16` W5.3 runs this check.
+2. **Every MI455 input is sourced or marked assumed.** A machine-spec field's source is the
+   provenance of the fragment that supplied it, as `05` D26's `merge` records; a field
+   marked assumed comes from a fragment whose provenance method is `assumed`, a method the
+   spec task (`16` W5.1) adds to `05` D25. The projection artifact lists the assumed
+   fields a tier-0 law reads. A field no fragment supplies is refused (principle 6). `16`
+   W5.1 and W5.4 carry it.
 3. **The method's error is measured where both sides exist.** The same method —
    measured-to-roofline efficiencies carried from a measured device onto a target spec —
    projects Qwen3.8-27B from MI308X to MI355X and is scored against real MI355X runs by
@@ -668,7 +672,7 @@ claims there are not.
 | D49 | Seven hygiene refusals, each with a prior incident behind it. | 2026-09-18 |
 | D50.1 | A refusal marks and continues: priced by the next answerable rung, tagged `refused(reason)`, never zero and never skipped. Refused fraction of **seconds** is a reported result; **>5% refused seconds is not acceptance evidence**. | 2026-09-19 |
 | D50 | Everything registered and hashed before evaluation; the case set never shrinks. One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The cells are stage 2's Qwen3.8-27B TP1 on MI308X and M2's four nightly P/D configurations of DeepSeek-V4-Pro on MI355X at their concurrencies, then the DPA two at EP8. M2's ranking gate: the same best configuration as hardware at each concurrency, and rank correlation across all cells, per end-to-end metric, each inside its real-vs-real spread. DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01, 2026-10-09 |
-| D50.2 | The MI455 projection is sound, not graded: tier 0 is a lower bound on every measured MI355X step; every MI455 input is sourced or marked assumed; the method's error is measured by projecting Qwen3.8-27B from MI308X to MI355X. | 2026-10-09 |
+| D50.2 | The MI455 projection is sound, not graded: the roofline at the spec's peaks, derates at 1 and no host floor, is a lower bound on every measured MI355X step; every MI455 input is sourced or marked assumed; the method's error is measured by projecting Qwen3.8-27B from MI308X to MI355X. | 2026-10-09 |
 | D51 | Measure a saturated cell early. Account cold costs once; report the simulator's own per-step CPU cost alongside the ratio. | 2026-09-18 |
 | D52 | Eight fail-closed invalidation conditions. Scheduling claims require slack; throughput claims at saturation are fine. | 2026-09-18 |
 
@@ -685,5 +689,5 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T24 | Define "structural event" for family 3 beyond prefill streaks | streaks may be an artefact of prefill-first scheduling |
 | T25 | Measure the real-vs-real noise floor under **closed-loop** replay at high client count | the only prior data is 20 requests, one session, declared arrivals |
 | T26 | Assert simulator bit-reproducibility as a test | depends on the Clock Authority existing |
-| T27 | Decide the construction of the cells the corpus cannot fill without reusing sessions: 256 clients with fan-out in every root, and the DPA configurations' client counts | doc 06 T14, surfaces again here |
+| T27 | Decide the construction of the cells the corpus cannot fill without reusing sessions: 256 clients with fan-out in every root, and the recipe's largest DPA concurrency | doc 06 T14, surfaces again here |
 | ~~T28~~ | ~~Establish whether ranking/regret becomes an explicit acceptance gate~~ — **done**: M2's ranking gate, D50 | — |

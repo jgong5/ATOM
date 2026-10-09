@@ -125,7 +125,7 @@ M-f `14`; M-g `01` D3.5.
 | T24 | Define "structural event" for family 3 beyond prefill streaks |
 | T25 | Measure the real-vs-real noise floor under closed-loop replay at high client count |
 | T26 | Assert simulator bit-reproducibility as a test — mechanism now `01` D3.4; this item is the CI wiring |
-| T27 | Decide the construction of the cells the corpus cannot fill without reusing sessions: 256 clients with fan-out in every root, and the DPA configurations' client counts (`08` D50) |
+| T27 | Decide the construction of the cells the corpus cannot fill without reusing sessions: 256 clients with fan-out in every root, and the recipe's largest DPA concurrency (`08` D50) |
 | ~~T28~~ | ~~Establish whether ranking/regret becomes an explicit acceptance gate~~ - **DONE**: `08` D50, M2's ranking gate |
 | ~~T48~~ | ~~What a refusal does to a run~~ - **DONE**: `08` D50.1, mark-and-continue with a 5%-of-seconds admissibility gate |
 
