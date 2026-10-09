@@ -21,7 +21,8 @@ Authority is co-hosted in the frontend's process and served at the run file's
 - `runner(runner)` installs the cost backend and the device readings on a
   `CompassModelRunner` where it would build its model, in the worker process.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
-  finish; the frontend's writes the step table and the run summary.
+  finish; the frontend's, when it co-hosts the authority, writes the step table
+  and the run summary.
 
 Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
 ``ipc_s``, ``stream_s``, ``coefficients`` (a `Coefficients` mapping),
@@ -291,7 +292,8 @@ def engine_done(engine_core) -> None:
 
 def frontend_done(llm_engine) -> bool:
     """Whether the stopped server was a simulated run's finish. If it was, stop
-    the engines and write the step table and the run summary."""
+    the engines and, with the authority co-hosted, write the step table and the
+    run summary."""
     rt = clock.installed()
     if rt is None or rt.now != math.inf:
         return False
