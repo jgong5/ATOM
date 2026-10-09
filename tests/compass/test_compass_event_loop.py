@@ -10,6 +10,7 @@ and uvicorn's server tick and keep-alive timeout.
 import asyncio
 import http.client
 import importlib.util
+import logging
 import math
 import queue
 import threading
@@ -25,7 +26,7 @@ from atom.compass.clock import NER, ClockAuthority, LpId, single_engine_table
 from atom.entrypoints.openai import api_server
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
-from atom.utils.compass_loop import CompassEventLoop, HttpChannel
+from atom.utils.compass_loop import CompassEventLoop, CompassSelector, HttpChannel
 
 TABLE = single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002)
 TRAFFIC, FRONTEND, ENGINE = LpId("traffic"), LpId("frontend"), LpId("engine")
@@ -348,3 +349,74 @@ def test_compass_off_keeps_uvloop_and_on_names_a_loop_uvicorn_builds(run):
     clock.install(run.rt)
     config = uvicorn.Config(lambda *_: None, loop=api_server._loop_impl())
     assert config.get_loop_factory() is CompassEventLoop
+
+
+def test_select_returns_nothing_only_once_its_timeout_has_passed_on_the_lp_clock(
+    run, monkeypatch
+):
+    _idle_traffic(run)
+    calls, select = [], CompassSelector.select
+
+    def recorded(self, timeout=None):
+        t0 = self.loop.time()
+        got = select(self, timeout)
+        calls.append((t0, timeout, got, self.loop.time()))
+        return got
+
+    monkeypatch.setattr(CompassSelector, "select", recorded)
+    loop = CompassEventLoop()
+
+    async def go():
+        later = asyncio.ensure_future(asyncio.sleep(1))
+
+        def do_preprocess():
+            time.sleep(0.2)  # open across the loop's next select
+
+        await loop.run_in_executor(None, do_preprocess)
+        await later
+
+    loop.run_until_complete(go())
+    loop.run_forever()
+    loop.close()
+    early = [
+        c for c in calls if not c[2] and c[3] < c[0] + (INF if c[1] is None else c[1])
+    ]
+    assert calls and early == []
+
+
+def test_a_stall_warns_once_across_diag_s_periods_and_unrelated_fd_events(run, caplog):
+    _idle_traffic(run)
+    run.rt.diag_s = 0.05
+    loop = CompassEventLoop()
+    stop = threading.Event()
+
+    def poke():  # an unrelated fd event every 10 ms: a self-pipe write
+        while not stop.wait(0.01):
+            loop.call_soon_threadsafe(lambda: None)
+
+    async def go():
+        def do_preprocess():
+            time.sleep(0.5)  # open for ten diag_s periods
+
+        poker = threading.Thread(target=poke, daemon=True)
+        poker.start()
+        try:
+            await loop.run_in_executor(None, do_preprocess)
+        finally:
+            stop.set()
+            poker.join()
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        loop.run_until_complete(go())
+    loop.run_forever()
+    loop.close()
+    warned = [
+        r.getMessage() for r in caplog.records if "still waiting" in r.getMessage()
+    ]
+    assert len(warned) == 1 and "station job 0 is open" in warned[0]
+
+
+def test_http_channel_refuses_a_plain_asyncio_loop():
+    scope = {"type": "http", "headers": [(b"x-test-stamp", b"0.5 0")]}
+    with pytest.raises(TypeError, match="on a CompassEventLoop, not on"):
+        asyncio.run(HttpChannel(None, _stamp)(scope, None, None))
