@@ -11,8 +11,10 @@ class CompassAgenticReplay(AgenticReplayStrategy):
 
     The pacing itself is the rebound scheduler's; this class wraps nothing. It
     refuses, by name, the options whose timing the Compass clock does not reach:
-    a second live phase runner, the two idle caps (real-clock timers outside
-    the scheduler), and the collectors that poll on the wall clock.
+    a second live phase runner, the prefill slot released by a first token the
+    traffic LP does not hold, cancellation on a wall-clock timer, the two idle
+    caps (real-clock timers outside the scheduler), and the collectors that
+    poll on the wall clock.
     """
 
     def __init__(self, *, config, scheduler, run=None, **kwargs) -> None:
@@ -31,6 +33,14 @@ class CompassAgenticReplay(AgenticReplayStrategy):
             name
             for name, on in (
                 ("seamless", config.seamless),
+                (
+                    "prefill concurrency (--prefill-concurrency)",
+                    config.prefill_concurrency is not None,
+                ),
+                (
+                    "request cancellation (--request-cancellation-rate)",
+                    bool(config.request_cancellation.rate),
+                ),
                 (
                     "trace_idle_gap_cap_seconds",
                     getattr(
