@@ -80,7 +80,9 @@ class CompassTransport(AioHttpTransport):
         # a phase's stamps at its end if memory matters.
         while True:
             key, arrival, seq = await self._sub.recv_pyobj()
-            self._stamp(key).set_result((arrival, seq))
+            # A request that timed out waiting cancelled its future.
+            if not (fut := self._stamp(key)).done():
+                fut.set_result((arrival, seq))
 
     def _stamp(self, key: tuple) -> asyncio.Future:
         if key not in self._stamps:
