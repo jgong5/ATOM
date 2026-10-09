@@ -19,11 +19,15 @@
 #                       --max-model-len 2048)
 #   ATOMESH             the router binary (default: atomesh)
 #
-# Logs go beside RUN_FILE. It prints `pd_sim: ready` once the router answers;
-# start the traffic LP then. It exits once both servers have, 0 when both
-# exited 0.
+# It runs its own tree, as the gates do. Logs go beside RUN_FILE. It prints
+# `pd_sim: ready` once the router answers; start the traffic LP then. It exits
+# once both servers have, 0 when both exited 0.
 set -euo pipefail
+. "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
+ROOT=$(compass_tree_root) || exit $?
+compass_env "$ROOT"
+compass_require_tree "$ROOT" || exit $?
 RUN_FILE=$(realpath "${1:?usage: pd_sim.sh RUN_FILE}")
 MODEL=${MODEL:?MODEL names the model directory}
 OUT=$(dirname "$RUN_FILE")
