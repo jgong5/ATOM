@@ -2608,6 +2608,7 @@ def main():
     )
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
+    compass_run.tokenizer(tokenizer, engine.config)
     _stream_batch_dispatcher = StreamBatchDispatcher(tokenizer)
 
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer

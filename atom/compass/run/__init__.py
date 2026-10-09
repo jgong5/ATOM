@@ -20,6 +20,8 @@ Authority is co-hosted in the frontend's process and served at the run file's
   check.
 - `runner(runner)` installs the cost backend and the device readings on a
   `CompassModelRunner` where it would build its model, in the worker process.
+- `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
+  ``decode`` to the frontend's clock, at the rates the machine spec measured.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
   finish; the frontend's writes the step table and the run summary.
 
@@ -202,6 +204,23 @@ def runner(model_runner) -> None:
             cudagraph_overhead=reserves(enforce_eager=True),
         ),
     )
+
+
+def tokenizer(tok, config) -> None:
+    """Wrap `tok`'s ``encode`` and ``decode`` with the machine spec's entry for
+    the model's architecture and the backend that loaded."""
+    run = spec()
+    if run is None:
+        return
+    from atom.compass.spec import Backend, MachineSpec
+    from atom.utils.compass_loop import wrap_decode, wrap_encode
+
+    entry = MachineSpec.from_mapping(_width_keys(run["machine"])).tokenizer_for(
+        config.hf_config.architectures[0],
+        Backend.FAST if tok.is_fast else Backend.SLOW,
+    )
+    tok.encode = wrap_encode(tok.encode, entry)
+    tok.decode = wrap_decode(tok.decode, entry)
 
 
 def _width_keys(node):
