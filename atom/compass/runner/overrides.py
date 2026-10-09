@@ -457,8 +457,8 @@ class NonAllocatingRunner:
         recorded here. Only the tensors behind the blocks are absent.
 
         An empty registry still goes through ATOM's `set_kv_cache_data`: it is
-        the one call that builds the worker-side KV connector, without which no
-        transfer the scheduler announces ever starts or finishes.
+        the one call that builds the worker-side KV connector, which the engine
+        polls for transfer completions.
         """
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
         from atom.utils.forward_context import set_kv_cache_data
