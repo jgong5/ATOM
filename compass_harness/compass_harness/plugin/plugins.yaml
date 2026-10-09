@@ -7,3 +7,13 @@ timing_strategy:
       agentic_replay paced on the Compass clock. Refuses a phase runner whose
       scheduler is not ClockPacedLoopScheduler, and the options the clock does
       not pace yet.
+
+transport:
+  http:
+    class: compass_harness.transport:CompassTransport
+    description: |
+      aiperf's HTTP transport with each request's tracestate stamped by the
+      traffic LP, and record times read from the SSE events' compass stamps.
+    metadata:
+      transport_type: http
+      url_schemes: [http, https]

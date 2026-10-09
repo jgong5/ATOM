@@ -4,8 +4,9 @@
 Each pacing call on aiperf's AGENTIC_REPLAY path is driven through the upstream
 method that makes it, on the objects a real ``PhaseRunner`` built, with a
 stand-in clock and with the event loop's timers made to raise. Needs
-agentx-harness at 56a0cf70 (distribution ``aiperf`` 0.12.0) and compass-harness
-installed in the interpreter that runs this file; skips by name otherwise.
+compass-harness installed in the interpreter that runs this file, beside an
+aiperf whose pinned functions match (agentx-harness 56a0cf70); skips by name
+otherwise.
 """
 
 import asyncio
@@ -22,11 +23,12 @@ import pytest
 
 def _missing() -> str | None:
     try:
-        if metadata.version("aiperf") != "0.12.0":
-            return f"aiperf {metadata.version('aiperf')} is installed, not 0.12.0"
         metadata.version("compass-harness")
+        import compass_harness  # noqa: F401  checks aiperf against its pinned source
     except metadata.PackageNotFoundError as e:
         return f"{e.name} is not installed"
+    except RuntimeError as e:
+        return str(e)
     return None
 
 
