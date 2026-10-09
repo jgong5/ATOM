@@ -394,6 +394,56 @@ def test_an_unbound_clock_refuses_the_phase_runner(monkeypatch):
         asyncio.run(main())
 
 
+class GrantingClock:
+    """A clock whose ``advance_to`` suspends until ``grant()`` wakes every wait at once."""
+
+    def __init__(self) -> None:
+        self.t = T0
+        self.waits: list[tuple[float, asyncio.Future]] = []
+
+    def now(self) -> float:
+        return self.t
+
+    async def advance_to(self, t: float) -> None:
+        fut = asyncio.get_running_loop().create_future()
+        self.waits.append((t, fut))
+        await fut
+
+    def grant(self) -> None:
+        waits, self.waits = self.waits, []
+        self.t = min(t for t, _ in waits)
+        for _, fut in waits:
+            fut.set_result(None)
+
+
+def test_a_phase_end_cancel_with_a_timer_pending_leaves_the_clock_wait_whole(
+    monkeypatch,
+):
+    """The runner's phase-end ``cancel_all()`` while the driver waits on the clock."""
+
+    async def main():
+        clock = GrantingClock()
+        monkeypatch.setattr(ClockPacedLoopScheduler, "clock", clock)
+        scheduler = ClockPacedLoopScheduler()
+        started = []
+
+        async def turn(name):
+            started.append(name)
+
+        scheduler.schedule_later(5.0, turn("cancelled"))
+        await asyncio.sleep(0)
+        assert [t for t, _ in clock.waits] == [T0 + 5.0]
+        scheduler.cancel_all()
+        scheduler.schedule_later(1.0, turn("armed after the cancel"))
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if clock.waits:
+                clock.grant()
+        return started, scheduler.pending_count
+
+    assert asyncio.run(main()) == (["armed after the cancel"], 0)
+
+
 @pytest.mark.parametrize(
     "option, name",
     [
