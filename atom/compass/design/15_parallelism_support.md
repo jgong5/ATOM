@@ -167,16 +167,25 @@ transfer to DP.
   carries no cost of its own, because the MoE segment already prices that all-to-all; it
   is a wait inside one LP (`01` D4, K6). With one rank it is skipped. The lockstep `all_reduce` in `DPEngineCoreProc._sync_dp_state`
   keeps its payload, the three booleans above; the step's cost is not exchanged on it.
-- **Two token counts.** `T_own` is the rank's own scheduled token count. `T_dp =
-  max_tokens_across_dp` is the group's: `ForwardMode.decide` reads it from
-  `sync_dp_metadata` into `forward_mode.sync.num_tokens_across_dp`, the value
-  `ModelRunner.get_dp_padding` pads to. The batch view carries both, and refuses a DP run
-  that states no `num_tokens_across_dp`. The local segment (attention, dense layers, the
-  shared expert) is priced from the rank's own batch; the MoE segment (dispatch, experts,
-  combine) reads only `T_dp`, in every tier (`09` D54 for tier a, #530 for tier 0 and
-  tier b).
+- **Two token counts.** `T_own` is the rank's own scheduled token count. `T_moe` is the
+  rows the group's MoE gather carries with EP off (owner's ruling,
+  [#502](https://github.com/jgong5/ATOM/issues/502#issuecomment-6081138199)). It follows
+  `forward_mode.running_tokens_are_unified`, as `FusedMoE.forward_impl_graph` does:
+  - every rank decoding: the padded `all_gather`, `T_moe = dp x running_bs x
+    max_seqlen_q`, `running_bs` the capture rung at or above `max_bs_across_dp`, under
+    `enforce_eager` too;
+  - any rank prefilling, and an MTP draft's first pass: `all_gatherv`, `T_moe =
+    sum(num_tokens_across_dp)`.
+
+  Every input is on the step's `forward_mode`, so `T_moe` adds no exchange. The batch
+  view (`batch_view` in `atom/compass/runner/projection.py`) carries both, and refuses a
+  DP run that states no `num_tokens_across_dp`. The local segment (attention, dense
+  layers, the shared expert) is priced from the rank's own batch; the MoE segment
+  (gather, experts, reduce-scatter) reads only `T_moe`, in every tier (`09` D54 for tier
+  a, #530 for tier 0 and tier b). With EP on, MORI dispatches each rank's own rows with
+  no group pad, and the row count the MoE segment reads there is not settled.
 - **Why `max` is the critical path here.** Under DP-attention and EP a layer's
-  barrier-delimited segments are the local segment and the MoE segment. Priced from `T_dp`
+  barrier-delimited segments are the local segment and the MoE segment. Priced from `T_moe`
   under uniform routing, the MoE segment costs the same on every rank, and when one
   segment is rank-invariant the sum of per-segment maxima equals the max of per-rank sums.
   Rank 0 at attention 3 per layer and rank 1 at 1, both at MoE `c`, give
@@ -771,7 +780,7 @@ and `test_forward_mode.py` already cover the pieces on the CPU-only path (`08` D
 |---|---|---|
 | D88 | One frame of four questions per strategy — LPs and lookahead, scheduling coupling, cost, memory. **Only PP adds logical processes**; TP, DP and EP each sit behind an existing barrier. | 2026-09-19 |
 | D89 | TP is the settled instance and supplies the per-width discipline: width is a key, not a parameter. | 2026-09-19 |
-| D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP, with one member process per rank. The step costs the `max` over ranks of each rank's own cost, computed not rank-0-sourced, and exchanged by one `all_reduce(MAX)` inside the predicted forward, a K6 wait that carries no cost; the lockstep `all_reduce` keeps its payload. The MoE segment reads `T_dp = max_tokens_across_dp` and is priced under uniform routing, which makes `max` the per-layer critical path; non-uniform routing is a declared limit. Idle ranks are priced through `dummy_execution`'s own `forward`. | 2026-09-19, revised 2026-09-28 and 2026-10-01 (owner's DP ruling, [#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)) |
+| D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP, with one member process per rank. The step costs the `max` over ranks of each rank's own cost, computed not rank-0-sourced, and exchanged by one `all_reduce(MAX)` inside the predicted forward, a K6 wait that carries no cost; the lockstep `all_reduce` keeps its payload. With EP off the MoE segment reads `T_moe`, the rows the DP gather carries (`dp x running_bs x max_seqlen_q` when every rank decodes, `sum(num_tokens_across_dp)` otherwise), and is priced under uniform routing, which makes `max` the per-layer critical path; non-uniform routing is a declared limit. Idle ranks are priced through `dummy_execution`'s own `forward`. | 2026-09-19, revised 2026-09-28, 2026-10-01 (owner's DP ruling, [#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)) and 2026-10-09 (EP-off MoE rows, [#502](https://github.com/jgong5/ATOM/issues/502#issuecomment-6081138199)) |
 | D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. Revised: a send part completes on the sender's clock when eager and at `max(t_send, r_i) + T` when rendezvous, `r_i` the time its receive is posted, a per-carrier size threshold deciding which, and a send's `done` is the latest over its parts; the receiver returns a rendezvous completion on `stage(k+1)->stage(k):pp_ack#dp0`, lookahead `T_min - L_data`, and both waits receive it (K5). Confirmed by the owner on 2026-10-02: the send reaches the next stage on `stage(k)->stage(k+1):pp_data#dp0`, and the TP-rank-0 workers carry both channels' frames over the PP CPU group. | 2026-09-19, revised 2026-09-28 and 2026-09-30, confirmed 2026-10-02 |
 | D92 | EP adds no LPs (inherits the TP group) but its all-to-all is invisible and must be a declared node, and its `exclusive` occupancy forbids placing it in a `Par`. Expert sharding is Class A, remainder included. | 2026-09-19 |
 | D93 | LP count = 1 traffic LP + per deployment (1 frontend LP + one engine LP per PP stage): 3 aggregated, 5 for 1P1D, independent of GPU count. The clock protocol's cost tracks PP degree and PD roles, not width. | 2026-09-19, revised 2026-09-28 |

@@ -426,7 +426,7 @@ constraints.
 **A DP group is one LP, and its step costs the `max` over ranks** of each rank's own cost
 (owner ruling 2026-10-01, `15` D90). Every rank prices its own batch, and the predicted
 forward exchanges the step seconds by one `all_reduce(MAX)` on the DP group after
-pricing; `15` D90 owns the `T_dp` and uniform-routing argument. Every rank then calls
+pricing; `15` D90 owns the MoE row count and the uniform-routing argument. Every rank then calls
 the CA as a member of the LP (below). No operator-level TAR/NER. Per-rank LPs are right only if the ranks decouple at step level (no per-step
 collective) and interact only with lookahead > 0.
 

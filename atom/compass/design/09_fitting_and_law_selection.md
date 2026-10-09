@@ -87,10 +87,10 @@ DP and EP with a **per-rank** law: it prices one rank's step, and the group's st
 - **Key.** `(dp, ep)`. A law fitted at one pair is not evidence about another, by the
   per-width discipline of `15` D89.
 - **Features.** The rank's own batch features (D55), plus two the group decides: the
-  DP-unified rung every rank shares, settled by `ForwardMode.decide`, and `T_dp =
-  max_tokens_across_dp`. The MoE terms read `T_dp` only.
+  DP-unified rung every rank shares, settled by `ForwardMode.decide`, and `T_moe`, the
+  rows the MoE gather carries (`15` D90). The MoE terms read `T_moe` only.
 - **The capture.** Full-engine steps on a real DP+EP deployment, logging per forward each
-  rank's batch features and `T_dp` beside the measured step seconds. Under DP-attention
+  rank's batch features and `T_moe` beside the measured step seconds. Under DP-attention
   each rank runs at TP 1, so this stays within the TP1-only full-engine calibration of
   `07` D38.
 - **The fit: alternating max-affine regression.** The ranks wait for each other inside the
@@ -326,7 +326,7 @@ scheduler's step table, with explicit `block_tables`. Hand-built ladders are gro
 construction.
 
 **Declared treatment: uniform routing** (owner's DP ruling, 2026-10-01). Under DP and EP
-the MoE segment (dispatch, experts, combine) is priced from `T_dp` as if routing spread
+the MoE segment (dispatch, experts, combine) is priced from `T_moe` as if routing spread
 tokens evenly over the expert ranks, in every tier. Real routing is data-dependent
 (`15` D92 Q2) and no feature carries it, so whatever skew a capture's routing has is
 folded into the fitted MoE terms. Under this treatment `max` over ranks equals the
@@ -377,7 +377,7 @@ choice that must be visible.
 | # | Decision | Date |
 |---|---|---|
 | D53 | Fit relative error, not absolute seconds. MAD outlier test on the same relative residuals. | 2026-09-18 |
-| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under DP and EP, tier a is one per-rank law keyed by `(dp, ep)`, with the DP-unified rung and `T_dp` as features, captured on a real DP+EP deployment and fitted by alternating max-affine regression. | 2026-09-18; revised 2026-10-01 |
+| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under DP and EP, tier a is one per-rank law keyed by `(dp, ep)`, with the DP-unified rung and `T_moe` as features, captured on a real DP+EP deployment and fitted by alternating max-affine regression. | 2026-09-18; revised 2026-10-01 |
 | D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. | 2026-09-18 |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |
