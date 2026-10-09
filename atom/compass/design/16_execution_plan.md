@@ -11,7 +11,7 @@ allocated. Neither is counted here. The register is owned by `12`, restated once
 not own it has been stale before, and "open items" and "registered items" are two different
 numbers that a single figure here cannot distinguish.
 
-**Revised 2026-09-30 by D95 (draft, under review), and aligned with the e2e stage order
+**Revised 2026-09-30 by D95, and aligned with the e2e stage order
 of [#627](https://github.com/jgong5/ATOM/issues/627).** Priorities changed: M1 is #627's
 stages 1 and 1b, and M2 is v1, its stage 3. Phase 0 through Wave 3 stand, with
 the rows D95 changes marked in place; Phase 0b is new; Waves 4–6 replace the coarse
@@ -34,27 +34,37 @@ focus is now an **MoE model with wide expert parallelism and P/D disaggregation*
 **full support on MI355X** and **roofline projection for MI455**. Calibration and pricing
 move onto MI455 as soon as MI455 hardware is available.
 
-Three owner rulings shape the milestones below: Compass work is ordered by the end-to-end
+Owner rulings shape the milestones below: Compass work is ordered by the end-to-end
 cc-traces stages of [#627](https://github.com/jgong5/ATOM/issues/627); the real side is
 re-run on hardware this project books ([#503](https://github.com/jgong5/ATOM/issues/503));
-and a host that holds a GPU may run a GPU-free stage
-([#472](https://github.com/jgong5/ATOM/issues/472)).
+a host that holds a GPU may run a GPU-free stage
+([#472](https://github.com/jgong5/ATOM/issues/472)); stage 3 runs first on the nightly
+DP-attention cells as written, with expert parallelism off
+([#501](https://github.com/jgong5/ATOM/issues/501#issuecomment-6077912835)); and EP8 is
+part of v1, added after that
+([#646](https://github.com/jgong5/ATOM/issues/646#issuecomment-6078555307)).
 
 ### Decision
 
 - **The model is DeepSeek-V4-Pro as ATOM ships it** — routed experts in FP4 (e2m1
   microscaling), the rest in FP8. ATOM already serves it 1P+1D through atomesh and
-  Mooncake with DP-attention, EP over MORI all-to-all, TBO and MTP, nightly on MI355X
-  (`recipes/mesh/DeepSeek-V4.md`), and carries gfx1250 paths for it. The nightly runs
-  define the configurations to measure; they are not ground truth. The real side runs on
-  the dedicated MI355X pair (P0b.3).
-- **Wide EP means DP-attention + EP8 within a node.** A P/D deployment is one prefill node
-  and one decode node. EP beyond one node is out of scope, not projected.
+  Mooncake at TP8, with DP-attention, TBO and MTP, nightly on MI355X
+  (`recipes/mesh/DeepSeek-V4.md`), and carries gfx1250 paths for it. No nightly cell
+  enables expert parallelism. The nightly runs define the configurations to measure; they
+  are not ground truth. The real side runs on the dedicated MI355X pair (P0b.3).
+- **M2 runs in two steps, expert parallelism off and then EP8.** First the nightly cells
+  as written: TP8, DP-attention where the cell sets it, expert parallelism off (#501).
+  There is no MORI all-to-all; the DP group's exchange is the variable-size gather sized by
+  the peers' token counts. Then, before v1 is done, DP-attention + EP8 within a node, with
+  a MORI routing model, graded the same way; its real side is this project's own run with
+  `--enable-expert-parallel`, since no nightly cell passes it. A P/D deployment is one
+  prefill node and one decode node. EP beyond one node is out of scope, not projected.
 - **M1 is #627's stages 1 and 1b** (`README.md` owns its text): cc-traces end to end on a
   simulated run, at TP1 and then 1P+1D through atomesh, each ended by the finish. The run
   is GPU-free: no compute and no allocation on the device. The scheduling-parity test
   leaves M1 for M2. Its exit criterion is under *Wave 3*.
-- **M2 is v1, #627's stage 3**: DeepSeek-V4-Pro 1P+1D on MI355X, first with the same
+- **M2 is v1, #627's stage 3**: DeepSeek-V4-Pro 1P+1D on MI355X, in the nightly
+  configurations and then at EP8, each step first with the same
   scheduling decisions as the real engine, then within the acceptance targets; and the
   MI455 roofline projection. **Stage 2 is its first gate**: Qwen3.8-27B TP1 on MI308X,
   paired real and simulated cc-traces graded by `08`. Its grading is under *Waves 4–6*.
@@ -80,12 +90,15 @@ and a host that holds a GPU may run a GPU-free stage
 | M3.5 | Into M2: MTP runs in the nightly configurations |
 | M4 | Into M1 (the simulated 1P+1D run) and M2 (accuracy, on DeepSeek-V4-Pro and MI355X) |
 | M5, M6 | Replaced by DeepSeek-V4-Pro |
-| M7 | EP, and DP as DP-attention, into M2; PP deferred |
+| M7 | DP as DP-attention, then EP8, into M2; PP deferred |
 
 ### Consequences
 
-- W3.2 (PP) is deferred; W3.3 (EP) and W3.5 (P/D) grow to the new topology. T84 is
-  answered by this decision: EP means DP-attention + EP8, where the all-to-all runs.
+- W3.2 (PP) is deferred. W3.3 (EP) moves to M2's EP8 step as W4.10. W3.5 is M1's 1P+1D
+  slice, two containers on one node; W4.9 carries it to DeepSeek-V4-Pro's topology in M2.
+  T84 is answered by this decision: EP2 means
+  `-tp 2 --enable-dp-attention --enable-expert-parallel`, the form in which the all-to-all
+  runs, and is the cheap leg of the EP8 step's parity test.
 - The width-transfer question (T21) leaves the critical path: M2 is graded at the widths
   the nightly configurations run, not extrapolated across width.
 - Target dates live outside the design; the plan stays sized in lines of code, per
@@ -159,8 +172,8 @@ on anything else, and each ends in an escalation, not a decision.
 
 | ID | Task | Module | Effort | Hardware |
 |---|---|---|---|---|
-| **P0b.1** | Trace DeepSeek-V4-Pro under `FakeTensorMode` with `--load_dummy empty` at the nightly shape (TP8, DP-attention + EP8, MTP on). Name every operator with no fake or meta implementation — the FP4 MoE, the CSA indexer, mHC, MORI dispatch/combine, the MTP draft path are the expected ones — and whether each needs a shape rule only or more | spike → `capture/` | ~200 LOC | CPU container; a clean node only if model construction reaches the driver |
-| **P0b.2** | DP-attention + EP8 in the fake-model run: which per-step exchanges the DP group makes (metadata sync, dummy batches for idle ranks, the MORI all-to-all), and whether each is already a classified site in `atom/compass/audit/sync_sites.json` | reading + one CPU run | ~50 LOC | — |
+| **P0b.1** | Trace DeepSeek-V4-Pro under `FakeTensorMode` with `--load_dummy empty` at the nightly shape (TP8 with DP-attention, MTP on), with expert parallelism off as the nightly runs it and at EP8. Name every operator with no fake or meta implementation — the FP4 MoE, the CSA indexer, mHC, MORI dispatch/combine at EP8, the MTP draft path are the expected ones — and whether each needs a shape rule only or more. **Answered on #501** | spike → `capture/` | ~200 LOC | CPU container; a clean node only if model construction reaches the driver |
+| **P0b.2** | DP-attention in the fake-model run, expert parallelism off and at EP8: which per-step exchanges the DP group makes (metadata sync, dummy batches for idle ranks, the variable-size gather of the peers' tokens with EP off, the MORI all-to-all at EP8), and whether each is already a classified site in `atom/compass/audit/sync_sites.json` | reading + one CPU run | ~50 LOC | — |
 | **P0b.3** | What the real side needs recorded: per-request timings and the exact launch configuration. The nightly P/D runs of `recipes/mesh/DeepSeek-V4.md` define the configurations, not ground truth: the owner ruled on #503 that the paired runs are re-run on the dedicated MI355X pair. What is left is reading what a run records from the upstream workflow (`.github/workflows/atomesh-benchmark.yaml`) and its bench scripts, so W4.3 records the same | reading | ~0 | — |
 | **P0b.4** | The MI455 inputs: which fields of the `05` machine spec the tier-0 laws need for DeepSeek-V4-Pro's operator families (matrix-core rate per precision including FP4 and FP8, HBM and LDS bandwidth, the in-node fabric), and for each one a source or an "assumed" mark | reading + owner input | ~0 | — |
 
@@ -446,9 +459,9 @@ Depends on Wave 1. The first three are the vertical slice.
 |---|---|---|---|
 | **W3.1** | LP structure for DP: the DP group is one LP with one member process per rank, joined by the CA (#528); its step is one TAR costing the `max` over ranks of each rank's own cost, no operator-level TAR/NER (`01` D4, `15` D90); both collectives run for real; dummy-batch pricing for idle ranks (`15` D90) | 300–500 | |
 | ~~**W3.2**~~ | ~~LP structure for PP: one LP per stage; transfer as a size from the spec; layer split via `get_pp_indices`~~ | ~~400–600~~ | **deferred by D95** — see *After v1* |
-| **W3.3** | EP as DP-attention + EP8 within a node: `exclusive` occupancy honoured in the IR; group membership per P0.6; the MORI dispatch/combine exchange carried as the group's collective (D95) | 250–450 | shaped by **P0.6**, **P0b.2** |
+| ~~**W3.3**~~ | ~~EP: `exclusive` occupancy honoured in the IR; group membership per P0.6~~ | ~~200–350~~ | **moved to W4.10 by D95**, M2's EP8 step |
 | **W3.4** | Standalone CA exercised against the synthetic-LP harness at multi-container topology | 200–300 | consumes W1.2 |
-| **W3.5** | PD aggregation and disaggregation: DeepSeek-V4-Pro 1P+1D, one container per node, DP-attention + EP8 on each side (D95); the KV connector is W2.3's | 450–700 | shaped by **P0b.2** |
+| **W3.5** | The 1P+1D slice: a prefill and a decode container on one node, each a full ATOM deployment with W2.3's KV connector, `atomesh launch --pd-disaggregation` between them, a standalone CA; one request end to end (#637) | 400–600 | consumes W2.1, W2.3 |
 | **W3.6** | cc-traces harness driving a simulated run end to end | 300–500 | consumes W1.9 |
 | **W3.7** | CA observability: timeline log, stall diagnostic, run summary (`01` D3.5) | 300–450 | |
 
@@ -458,10 +471,12 @@ atomesh on a simulated 1P+1D run (W3.5), each ended by the finish and both GPU-f
 
 **The scheduling-parity test opens M2**, per `15` D94 as revised by D95: **does a
 fake-model run reach the same scheduling decisions as the real engine at the same
-configuration** — first at TP2 / DP2 / EP2 on one node, where it is cheap, with EP2 in its
-non-degenerate form, `-tp 2 --enable-dp-attention --enable-expert-parallel` (T84); then at
-DeepSeek-V4-Pro's 1P+1D with DP-attention + EP8 on each side, where it counts? PP2 left
-the test with W3.2. ATOM's own `test_dp_load_balance.py`, `test_dp_metadata.py`,
+configuration** — first at TP2 / DP2 on one node, where it is cheap,
+`-tp 2 --enable-dp-attention`; then at DeepSeek-V4-Pro's 1P+1D in the nightly DP-attention
+configuration, expert parallelism off, where it counts? M2's EP8 step repeats both legs
+with expert parallelism on: EP2 in its non-degenerate form,
+`-tp 2 --enable-dp-attention --enable-expert-parallel` (T84), then EP8. PP2 left the test
+with W3.2. ATOM's own `test_dp_load_balance.py`, `test_dp_metadata.py`,
 `test_dp_sync_layout.py` and `test_forward_mode.py` already cover the pieces, CPU-only —
 all four are in the CPU tier at `3afcb4880`, which was not true when this was written: the
 last three sat in a 32-entry exclusion list until they were re-measured and found green.
@@ -484,13 +499,15 @@ their own hardware, and a coarse wave cannot be claimed as an issue. Every row t
 | ID | Task | Module | Effort | Depends on |
 |---|---|---|---|---|
 | **W4.1** | `compass plan` and the CLI; calibration Phase 0 discovery and Phase 1a trace; the standalone `ModelRunner` bench | `cli/`, `capture/` | 400–700 | W2.4, W2.5 |
-| **W4.2** | DeepSeek-V4-Pro capture: a fake or meta implementation for every operator P0b.1 names — shape and dtype rules, no math | `capture/`, `ir/` | 300–600 | **P0b.1** |
-| **W4.3** | The real side: the nightly P/D configurations of `recipes/mesh/DeepSeek-V4.md` (TP; DP-attention + TBO; TP + MTP3; DP-attention + MTP1) on the MI355X pair, driven by cc-traces, with per-request records and a real-vs-real repeat per cell for the noise floor (`08` D45) | `scripts/compass/` | 200–350 | **P0b.3**, GPU queue |
-| **W4.4** | Calibration Phases 1b / 1c on MI355X for DeepSeek-V4-Pro's operator families: FP4 MoE GEMMs, MLA attention, the CSA indexer, mHC, MORI dispatch/combine within a node | `backends/`, calibration | 400–700 | W4.1, W4.2, GPU queue |
+| **W4.2** | DeepSeek-V4-Pro capture: a fake or meta implementation for every operator P0b.1 names — shape and dtype rules, no math — plus #501's launch interceptor for Triton, FlyDSL and MORI and its two host-query rules, with no ATOM change | `capture/`, `ir/` | 600–1000 | **P0b.1** |
+| **W4.3** | The real side: the nightly P/D configurations of `recipes/mesh/DeepSeek-V4.md` (TP; DP-attention + TBO; TP + MTP3; DP-attention + MTP1) on the MI355X pair, driven by cc-traces, with per-request records and a real-vs-real repeat per cell for the noise floor (`08` D45); then the EP8 cells, the DP-attention cells re-run with `--enable-expert-parallel` | `scripts/compass/` | 200–350 | **P0b.3**, GPU queue |
+| **W4.4** | Calibration Phases 1b / 1c on MI355X for DeepSeek-V4-Pro's operator families: FP4 MoE GEMMs, MLA attention, the CSA indexer, mHC, the DP group's variable-size gather; MORI dispatch/combine within a node for the EP8 step | `backends/`, calibration | 400–700 | W4.1, W4.2, GPU queue |
 | **W4.5** | Fitting and law selection for those families (`09`) | `backends/` | 300–500 | W4.4 |
-| **W4.6** | The DP-attention step: the `max` over the DP group's ranks (W3.1) with the all-to-all priced from W4.4, and TBO's overlap | `backends/` | 300–500 | W3.1, W3.3, W4.5 |
+| **W4.6** | The DP-attention step: the `max` over the DP group's ranks (W3.1) with the gather priced from W4.4, and TBO's overlap; at EP8, the all-to-all W4.10 prices in its place | `backends/` | 300–500 | W3.1, W4.5 |
 | **W4.7** | MTP: per-position acceptance measured from W4.3's real runs, never declared (`08`), feeding the spec-decode pricing of `14` | `runner/`, `backends/` | 200–350 | W4.3 |
 | **W4.8** | Mooncake transfer time from the spec, checked against the transfer timings W4.3 records | `kv/` | 150–250 | W2.3, W4.3 |
+| **W4.9** | DeepSeek-V4-Pro 1P+1D at the nightly topology: W3.5's slice with one container per node, TP8 and DP-attention on each side as the cell sets it | wiring | 150–300 | W3.1, W3.5, W4.2 |
+| **W4.10** | M2's EP8 step: `exclusive` occupancy honoured in the IR; group membership per P0.6; MORI dispatch/combine carried as the group's collective and priced from W4.4 by a routing model (#501) | `ir/`, `backends/` | 350–600 | **P0.6**, **P0b.2**, W4.5, W4.6 |
 
 ### Wave 5 — MI455 by roofline
 
@@ -509,7 +526,7 @@ a calibration.
 
 | ID | Task | Module | Effort | Depends on |
 |---|---|---|---|---|
-| **W6.1** | Paired acceptance over W4.3's cells: the separable results of `08` D44, plus the ranking gate — the same best configuration as hardware at each concurrency, and rank correlation across all cells | `cli/` | 250–400 | W3.5, W4.6–W4.8 |
+| **W6.1** | Paired acceptance over W4.3's cells, expert parallelism off and then EP8: the separable results of `08` D44, plus the ranking gate — the same best configuration as hardware at each concurrency, and rank correlation across all cells | `cli/` | 250–400 | W4.6–W4.10 |
 | **W6.2** | The speed check on a saturated acceptance cell, against the target in `README.md` | `cli/` | ~100 | W6.1 |
 
 ---
@@ -607,7 +624,7 @@ decision that belongs to the project owner, not to the agent that ran it.
 |---|---|
 | ~~**T10** fails~~ | ~~adapter cost rises to ~2,000 vendored lines — vendor, fork, or restrict the harness~~ — **did not fire.** P0.3, 2026-09-20: the subclass works and nothing is vendored. The escalation this row prepared for never arose |
 | **T5** fails | tier b has no IR at TP>1 — options and their effect on M2 onward |
-| **P0b.1** finds an operator that needs more than a shape rule | W4.2 grows or DeepSeek-V4-Pro's M2 depends on a stand-in — options and their cost |
+| ~~**P0b.1** finds an operator that needs more than a shape rule~~ | **ruled by the owner on #501**: two rows needed more, MORI at EP8 and the DP gather with EP off, both sized by the peers' token counts. W4.2 takes the launch interceptor; M2 runs expert parallelism off first, then EP8 with a MORI routing model (W4.10) |
 | ~~**P0b.3** finds the nightly runs unusable~~ | **ruled by the owner on #503**: every paired cell is re-run on the dedicated pair, and W4.3 is booked for it |
 | **P0b.4** leaves an MI455 input unsourced | the projection ships with that input marked assumed, or waits — the owner's call |
 | ~~**T21** fails~~ | ~~calibration does not transfer across width~~ — **off the critical path by D95**: M2 is graded at the nightly widths |
