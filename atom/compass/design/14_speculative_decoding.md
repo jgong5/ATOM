@@ -9,7 +9,9 @@ written against it yet; implementation follows the execution plan in `16`.
 
 **Scope.** What speculative decoding — Eagle3, DSpark, and MTP heads — changes for a
 simulator, and why one of those changes is different in kind from everything else in this
-design.
+design. The draft path it prices is DeepSeek-V4-Pro's serial MTP, in M2 (D87, *Milestone
+placement*); Eagle3 and DSpark are described because ATOM carries them, and are not on
+M2's path.
 
 ---
 
@@ -338,14 +340,25 @@ A new hygiene refusal for `08` D49: **a speculative acceptance cell run at tier 
 
 ### Milestone placement
 
-Not named in M1–M7, so it needs one. Recommendation:
+**M2, on DeepSeek-V4-Pro** (`16` D95). MTP runs in two of the nightly configurations M2
+grades, TP + MTP3 and DP-attention + MTP1 (`recipes/mesh/DeepSeek-V4.md`), so it enters
+with the model and is not a milestone of its own. The earlier placement, a mechanism check
+on Qwen3.8-27B and the claim on Kimi-K3, was retired with those milestones.
 
-| Where | Why |
-|---|---|
-| **Mechanism at M2/M3** (Qwen3.8-27B) | `qwen3_5` maps to `qwen3_5_mtp` in `_MTP_TYPE_MAP`, so the target model has an MTP path. Validating the structure/shape/memory changes here is cheap and keeps M5 from carrying two new variables at once. |
-| **The real claim at M5/M6** (Kimi-K3) | MTP is native to this model class and is how it would actually be deployed. |
+**The draft path priced is DeepSeek-V4-Pro's serial MTP**, as ATOM builds it:
 
-Adding it as **M3.5** rather than extending M3 keeps the milestone's own acceptance clean.
+| Item | In ATOM | For this topic |
+|---|---|---|
+| draft model | `deepseek_v4` maps to `deepseek_v4_mtp` (`SpeculativeConfig._MTP_TYPE_MAP`), built as `DeepseekV4MTPModel` (`atom/models/deepseek_v4_mtp.py`). A DSpark checkpoint is routed elsewhere by `SpeculativeConfig.hf_config_override` | serial MTP, not a draft stack |
+| draft steps | `hf_config_override` sets `num_nextn_predict_layers` to 1; the one `MTPBlock` runs `mtp_k` times, `K = --num-speculative-tokens`, 3 or 1 in the nightly cells | one draft structure per drafting step (D85); T60 is the serial case |
+| draft forward | `MTPBlock` subclasses V4's `Block` (the target's attention and MoE classes), adds `e_proj`, `h_proj`, three norms and its own `hc_head` parameters, and reads the target's un-reduced mHC residual | traced and priced like any structure (D85) |
+| draft weights | the MTP block only: `DeepseekV4MTP.share_with_target` binds the embedding and LM head to the target's | D86's weight term excludes both |
+| draft KV | one slot (`_num_draft_kv_layers` returns `num_nextn_predict_layers`) in the target's pool, at index `n_layers` (`mtp_start_layer_idx`) | D86 as written: call the method |
+
+**Every M2 MTP cell is an acceptance cell.** Its per-position rates are measured from the
+paired real run, tier 1 of D84 (`16` W4.7), and never declared. Tier 1 needs T63's
+transport, so T63 is on M2's path. For MTP1 the curve has one position and the mean
+carries it whole; MTP3 is where its shape matters.
 
 ---
 
@@ -358,7 +371,8 @@ Adding it as **M3.5** rather than extending M3 keeps the milestone's own accepta
   different acceptance semantics will compare as one. Recorded as **T59**.
 - **The DSpark hang of `04` T52 was observed in this subsystem** (`dspark_scheduler.py::schedule_prefix_lengths_tensor`,
   while the function was written; the landed function builds that value with `torch.full_like`, which avoids the call that hung).
-  Root-causing it is already a gating task; it is now also on this topic's critical path.
+  Root-causing it is already a gating task (`16` P0.7). DSpark is not the draft path M2
+  prices, so the hang is not on this topic's path to M2.
 - **Whether a draft forward's cost transfers across `K`** is untested. A serial MTP reusing
   one layer `mtp_k` times should be linear in `K`; a real draft stack need not be. One
   measurement at two values of `K` settles it. Recorded as **T60**.
