@@ -35,14 +35,21 @@ whose ``kv_connector`` is ``compass`` is its prefill (``kv_producer``) or
 decode side: `engine(config)` makes it the ``engine-P`` or ``engine-D`` LP and
 binds the connector's transfer model. The write-request address comes with the
 deployment's own ``kv_transfer_config``. `frontend(config)` refuses such a
-deployment: it co-hosts the authority, and a prefill-decode run spans two API
-servers that must share one.
+deployment unless the authority is standalone: a prefill-decode run spans two
+API servers that must share one.
+
+The API server's ``--compass-clock-endpoint`` sets `CLOCK_ENV`: the authority
+is not co-hosted but served by `authority`, its own process started before the
+engines (``python -m atom.compass.run``), and every LP connects to that
+endpoint. Its frontend is ``frontend-P`` or ``frontend-D`` by ``kv_role``. The
+standalone authority writes the step table at the finish.
 """
 
 import contextlib
 import json
 import math
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -60,6 +67,7 @@ from atom.compass.runner import COMPASS_RUNNER_QUALNAME
 from atom.utils import clock
 
 ENV = "ATOM_COMPASS_RUN"
+CLOCK_ENV = "ATOM_COMPASS_CLOCK_ENDPOINT"
 FRONTEND, ENGINE = LpId("frontend"), LpId("engine")
 ATOM_RUNNER = "atom.model_engine.model_runner.ModelRunner"
 #: Keys that differ between two runs of one configuration, kept out of its name.
@@ -85,6 +93,7 @@ def spec() -> dict | None:
             f"{path}: bound_s is {bound!r}; a run needs a finite simulated-time "
             "bound, or a timer nobody declared daemon keeps it alive forever"
         )
+    run["clock_endpoint"] = os.environ.get(CLOCK_ENV, run.get("clock_endpoint"))
     return run
 
 
@@ -134,13 +143,14 @@ def configuration(run: dict) -> dict:
 
 
 class _RecordingAuthority(ClockAuthority):
-    """The co-hosted authority, recording the step table: a row per reply and a
-    row per message each reply releases; and the wall seconds of the run, from
-    the frontend's start to the finish."""
+    """The authority, recording the step table: a row per reply and a row per
+    message each reply releases; and the wall seconds of the run, from the
+    frontend's start to the finish, which sets `done`."""
 
     def __init__(self, run: dict) -> None:
         self.steps = StepTable(json.dumps(configuration(run), sort_keys=True))
         self.started = self.finished = None
+        self.done = threading.Event()
         super().__init__(channel_table(run), timeline=self, bound_s=run["bound_s"])
 
     def record(self, lp, time_from, time_to, kind, recovered) -> None:
@@ -154,6 +164,7 @@ class _RecordingAuthority(ClockAuthority):
                     self.steps.record(lp, arrival, arrival, "release", ch, seq)
         if self.final_clocks is not None and self.finished is None:
             self.finished = time.monotonic()
+            self.done.set()
         return replies
 
 
@@ -189,15 +200,20 @@ def frontend(config):
             f"runner {config.runner_qualname!r} is named, and a simulated run "
             f"prices its steps with {COMPASS_RUNNER_QUALNAME}"
         )
-    if _pd_side(config) is not None:
+    side, standalone = _pd_side(config), CLOCK_ENV in os.environ
+    if side is not None and not standalone:
         raise ValueError(
             "this API server would co-host the clock authority, and a "
-            "prefill-decode run spans two API servers that must share one"
+            "prefill-decode run spans two API servers that must share one; "
+            "start it on its own and name it with --compass-clock-endpoint"
         )
     config.runner_qualname = COMPASS_RUNNER_QUALNAME
+    lp = FRONTEND if side is None else LpId(f"{FRONTEND.name}-{side}")
+    if standalone:
+        return _start_on_leaving(_runtime(lp, run))
     _authority = _RecordingAuthority(run)
     serve(_authority, run["clock_endpoint"])
-    return _start_on_leaving(_runtime(FRONTEND, run), _authority)
+    return _start_on_leaving(_runtime(lp, run), _authority)
 
 
 def engine(config):
@@ -281,6 +297,8 @@ def frontend_done(llm_engine) -> bool:
         return False
     llm_engine.close()
     run, a = spec(), _authority
+    if a is None:  # the standalone authority writes the step table
+        return True
     out = Path(run["out_dir"])
     reasons = json.loads((out / COMMANDS_FILE).read_text()) + rt.loop.executor.refusals
     steps = sum(r.lp == ENGINE.name and r.event == "TAR" for r in a.steps.rows)
@@ -294,3 +312,13 @@ def frontend_done(llm_engine) -> bool:
     (out / STEP_TABLE_FILE).write_text(a.steps.text())
     (out / SUMMARY_FILE).write_text(json.dumps(summary, sort_keys=True, indent=1))
     return True
+
+
+def authority(endpoint: str) -> None:
+    """Serve the run file's authority at `endpoint` until the finish, then write
+    its step table."""
+    run = spec()
+    a = _RecordingAuthority(run)
+    serve(a, endpoint)
+    a.done.wait()
+    (Path(run["out_dir"]) / STEP_TABLE_FILE).write_text(a.steps.text())
