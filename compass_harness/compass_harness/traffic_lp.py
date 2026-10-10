@@ -63,7 +63,6 @@ class TrafficLP:
         self._subscribers = 0
         self.open: dict[tuple, None] = {}  # sent, return not yet passed to aiperf
         self._reports: dict[int, tuple] = {}  # stream seq -> (key, final)
-        self._handled: set[int] = set()
         # key -> its return, for aiperf; None once passed
         self._held: dict[tuple, object] = {}
         self._returns: asyncio.Queue = asyncio.Queue()  # passed in order, as upstream
@@ -194,7 +193,9 @@ class TrafficLP:
         spins = 0
         while True:
             unreported, unreturned = [], []
-            for seq in sorted(self.rt.released[STREAM] - self._handled):
+            # A handled seq leaves the runtime's released set, so a pass scans
+            # only the open events, not every event of the run.
+            for seq in sorted(self.rt.released[STREAM]):
                 if seq not in self._reports:
                     unreported.append(seq)
                     continue
@@ -202,7 +203,7 @@ class TrafficLP:
                 if final and key not in self._held:
                     unreturned.append(key)
                     continue
-                self._handled.add(seq)
+                self.rt.released[STREAM].discard(seq)
                 if final:
                     self.open.pop(key, None)
                     if (ret := self._held.pop(key)) is not None:
