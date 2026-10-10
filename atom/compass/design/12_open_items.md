@@ -12,7 +12,7 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — per topic. T10, T15, T22, T28, T48, T65, T71, T84 and T91 are struck
+3. **TODO register** — per topic. T10, T13, T15, T22, T28, T48, T65, T71, T84 and T91 are struck
    through as done, and T77 was opened and closed by P0.1. The register is the rows of section 3
    below and nothing else: prose elsewhere in this file names T-numbers that belong to
    other branches. It is allocated across parallel task branches, so not contiguous
@@ -97,7 +97,7 @@ M-f `14`; M-g `01` D3.5.
 | ~~T10~~ | ~~Verify `AgenticReplayStrategy` can be subclassed rather than vendored~~ — **done**: yes, but the adapter rebinds the shared `LoopScheduler` global instead, which covers all nine pacing sites |
 | T11 | Build the per-tokenizer vetted filler-token set |
 | T12 | Chase the 32 `asyncio.wait_for` sites under virtual time |
-| T13 | Decide the simulated KV connector's completion semantic |
+| ~~T13~~ | ~~Decide the simulated KV connector's completion semantic~~ — **done**, `01` D6: Mooncake, one simulated write event per request |
 | T14 | Build the client-count matrix given only 144 fan-out-capable sessions |
 | ~~T15~~ | ~~Warmup handling in the harness contract~~ — **done**: warmup requests are ordinary requests; the rule is an exclusion window agreed by request id |
 | **T54** | Detect warmth that *recurs* mid-run (a new shape reaching autotune at minute 10); D62 measures leading warmth only |

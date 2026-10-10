@@ -65,6 +65,23 @@ the twelve names above have a caller that waits for the reply, and `exit` and
 `process_kvconnector_output` do not. `atom/compass/runner/overrides.py` carries the
 third case — a method that raises — and the table of which names wait.
 
+**`flush_pp_send` keeps ATOM's own answer, and the control-command worker methods are
+refused** (revised 2026-09-28 and 2026-09-30, #443):
+
+- `flush_pp_send` is **answered by ATOM's own, at once**: `ModelRunner.flush_pp_send`
+  returns `True` after waiting on any pending `isend`, and a simulated runner posts none.
+  The stage loop settles the pending send before the call
+  ([`01` D4](01_execution_and_time_model.md#d4-the-interception-contract-which-waits-must-be-touched),
+  K5; [`15` D91](15_parallelism_support.md#d91-pp--the-only-strategy-that-adds-logical-processes),
+  Q3). The runner gains the two methods that loop calls to move one `pp_data` or `pp_ack`
+  frame over the PP CPU group; only the stage loop's hooks call them, never ATOM.
+- The runner defines and refuses by name the worker methods the profiler and RL
+  control commands reach (`start_profiler`, `stop_profiler`, `update_weights`,
+  `update_weights_from_shm`, `update_weights_from_ipc`, `release_memory`,
+  `resume_memory`, `clear_kv_cache`, `configure_hidden_states`), as
+  [`01` D5](01_execution_and_time_model.md#d5-timers-clock-reads-and-control-commands)
+  decides.
+
 ### Three semantics `forward()` must reproduce
 
 1. **Deferred output.** `tokenIDProcessor.is_deferred_out` is True by default: the tokens
@@ -525,7 +542,7 @@ scheduler at shapes no real model has.
 
 | # | Decision | Date |
 |---|---|---|
-| D10 | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass; no ATOM change for the injection | 2026-09-18 |
+| D10 | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass; no ATOM change for the injection. Revised: `flush_pp_send` keeps ATOM's own answer and the stage loop settles the pending send before calling it; the control-command refusals are recorded in [`01` D5](01_execution_and_time_model.md#decision-log) | 2026-09-18, revised 2026-09-28 and 2026-09-30 |
 | D10.1 | A model comes into existence three ways, none reading weights: HF-config geometry where only geometry is needed; a `torch.device("meta")` context where a module tree is needed without tracing (no transient, no GPU, covers buffers - ATOM already has this shape at `models/utils.py::no_init_weights`, unused); and `FakeTensorMode` for tracing, the only one with symbolic shapes and the right device branch. `--load_dummy` is reused in all three. `_init_weight_params_on_meta` is not a bug but is superseded by the meta context. The T5 fallback is the meta context plus concrete traces. | 2026-09-20 |
 | D11 | No modes on the runner. Every run simulates; the algorithm comes from a pluggable cost backend. `measure` and `trace` are orthogonal flags. | 2026-09-18 |
 | D12 | M1 fake model = KV/weight geometry from the HF config + a shape-analytic cost stub including the quadratic query term; constant mode retained for bring-up | 2026-09-18 |

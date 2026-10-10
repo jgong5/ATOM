@@ -32,8 +32,11 @@ earliest daemon timer (`DAEMON_TIMERS`) as ``t_daemon``. While a released
 request is unread or a station job is open it only waits on its sockets, and
 warns once, naming what it waits for, if no socket event ends that wait within
 ``diag_s`` wall seconds. Its select returns nothing only once ``time()`` has
-reached the caller's timeout. On the ``+inf`` grant it cancels its timers and
-stops. `HttpChannel` is the inline receive of HTTP requests.
+reached the caller's timeout. The ``+inf`` grant ends the run: from then on
+``time()`` runs on from the run's last LP time at wall rate. A uvicorn server
+on the loop is asked to exit, as a signal would ask it, and shuts down with
+nothing pending; with none, the loop cancels its timers and stops.
+`HttpChannel` is the inline receive of HTTP requests.
 """
 
 import asyncio
@@ -264,13 +267,29 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         # Per output thread: its width-1 station, its open job, and the callbacks
         # that job posted.
         self.detok = threading.local()
+        self.ended = None  # at the +inf grant: (last LP time, wall time() then)
         super().__init__(CompassSelector(self))
         self.executor = SimExecutor(self)
         self.set_default_executor(self.executor)
         self.rt.loop = self
 
     def time(self) -> float:
-        return self.rt.read_clock()
+        if self.ended is None:
+            return self.rt.read_clock()
+        return self.ended[0] + super().time() - self.ended[1]
+
+    def finish(self, end: float) -> None:
+        """The ``+inf`` grant ended the run at LP time `end`."""
+        self.ended = (end, super().time())
+        self._write_to_self()  # so the select that got the grant reports an fd
+        for task in asyncio.all_tasks(self):
+            coro = task.get_coro()
+            if getattr(coro, "__qualname__", None) == "Server.serve":  # uvicorn's
+                coro.cr_frame.f_locals["self"].should_exit = True
+                return
+        for h in self._scheduled:
+            h.cancel()
+        self.stop()
 
     def job_begin(self, arrival: float) -> None:
         """A thread took a released frame: handling it is one job on its station."""
@@ -409,10 +428,10 @@ class CompassSelector(selectors.DefaultSelector):
                     t_daemon = min(t_daemon, h.when())
                 else:
                     t = min(t, h.when())
-            if rt.next_event(t, t_daemon) == math.inf:  # time() is +inf now
-                for h in loop._scheduled:
-                    h.cancel()
-                loop.stop()
+            end = rt.now
+            if rt.next_event(t, t_daemon) == math.inf:
+                loop.finish(end)
+                return super().select(0)
 
 
 class HttpChannel:
