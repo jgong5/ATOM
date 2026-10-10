@@ -11,6 +11,7 @@ Nothing here imports a tensor library, a symbolic-algebra library or a device
 runtime, so a graph can be built and checked anywhere.
 """
 
+from .applicability import GuardedApplicability, Verdict
 from .graph import Applicability, Graph
 from .nodes import (
     AMBIENT_READINGS,
@@ -38,6 +39,7 @@ __all__ = [
     "EqualPrice",
     "Graph",
     "GroupingEvidence",
+    "GuardedApplicability",
     "IdenticalStructure",
     "IndexBinding",
     "JoinPolicy",
@@ -50,6 +52,7 @@ __all__ = [
     "Shape",
     "SymDim",
     "SymExpr",
+    "Verdict",
     "as_dim",
     "as_shape",
     "as_shapes",
