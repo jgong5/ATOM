@@ -377,6 +377,11 @@ def _width_keys(node):
     return {int(k) if k.isdigit() else k: _width_keys(v) for k, v in node.items()}
 
 
+def _commands_file(member: str | None) -> str:
+    """The refusal record of the engine process that is `member` of the engine LP."""
+    return COMMANDS_FILE if member is None else f"commands.{member}.json"
+
+
 def engine_done(engine_core) -> None:
     """After the engine's loop: leave the clock and keep the worker's command
     refusals and the engine's refused clock calls for the run summary."""
@@ -385,8 +390,7 @@ def engine_done(engine_core) -> None:
     if run is not None:
         refused = engine_core.runner_mgr.call_func("refused_commands", wait_out=True)
         reasons = list(refused) + clock.installed().refusals
-        name = COMMANDS_FILE if _member is None else f"commands.{_member}.json"
-        (Path(run["out_dir"]) / name).write_text(json.dumps(reasons))
+        (Path(run["out_dir"]) / _commands_file(_member)).write_text(json.dumps(reasons))
 
 
 def frontend_done(llm_engine) -> bool:
@@ -402,9 +406,10 @@ def frontend_done(llm_engine) -> bool:
         return True
     out = Path(run["out_dir"])
     dp = _dp(run)
-    names = [COMMANDS_FILE] if dp == 1 else [f"commands.dp{r}.json" for r in range(dp)]
+    members = [None] if dp == 1 else [f"dp{r}" for r in range(dp)]
+    files = [out / _commands_file(m) for m in members]
     reasons = (
-        [r for n in names for r in json.loads((out / n).read_text())]
+        [r for f in files for r in json.loads(f.read_text())]
         + rt.loop.executor.refusals
         + rt.refusals
     )
