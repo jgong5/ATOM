@@ -42,9 +42,8 @@ tree, which needs the engine, which this tier does not import; and there is no
 recording of a card nobody has run. So `ModelTerms` takes those two terms rather
 than deriving them, with no default -- the same shape as the spec's "a runtime
 constant has no default" rule, and for the same reason. `from_declared_config`
-fills all three with declared formulas and labels every one of them. For the
-activation term a declared formula is the only answer while no op graph
-exists; this module gives the other two the same treatment, visibly.
+fills all three with declared formulas and labels every one of them, unless a
+real run measured the activation term's bytes per token in the machine spec.
 """
 
 from __future__ import annotations
@@ -135,6 +134,7 @@ class ModelTerms:
         warmup_tokens: int,
         dtype_bytes: int | None = None,
         config_json: dict | None = None,
+        measured_activations: tuple[str, float] | None = None,
     ) -> ModelTerms:
         """All three from geometry and declared coefficients, each labelled.
 
@@ -154,6 +154,10 @@ class ModelTerms:
         is 0.1 KB/token on the 0.6B against 39.6 KB/token on the 27B, the
         difference between -35.0% and +3.4% held out. A formula does not
         stand in for that on a real model.
+
+        `measured_activations`, what `MachineSpec.activations_for` returns,
+        replaces the activation formula with that entry's bytes per token
+        times `warmup_tokens`; the scratch is inside it.
         """
         if tp_size < 1:
             raise ValueError(f"tensor-parallel width is at least 1: {tp_size}")
@@ -255,12 +259,22 @@ class ModelTerms:
             f"{warmup_tokens} warmup tokens x {dtype_bytes} B x "
             f"({graph_pool.LIVE_TENSORS_PER_LAYER} x {hidden} hidden + "
             f"{_LIVE_INTERMEDIATE} x {live})",
-            "a liveness walk over a traced op graph, plus the per-leaf "
+            "a device.activations entry, or a liveness walk over a traced op "
+            "graph plus the per-leaf "
             "invisible-scratch constants, replace this; the per-layer "
             "coefficient is ATOM's own "
             "(ModelRunner._piecewise_per_token_bytes), over one live "
             "layer rather than all of them",
         )
+        if measured_activations is not None:
+            entry, per_token = measured_activations
+            activations = Term(
+                "activations",
+                int(warmup_tokens * per_token),
+                Basis.SPEC,
+                f"{warmup_tokens} warmup tokens x {per_token} B/token, "
+                f"device.activations[{entry}].bytes_per_token[{tp_size}]",
+            )
         return cls(weights, buffers, activations)
 
 

@@ -536,6 +536,56 @@ def test_the_graph_pool_reservation_follows_the_element_size(resident):
     assert reserved(config, 288.0e9).total == GRAPH_POOL_BY_DTYPE[name]
 
 
+#: A `device.activations` entry: one real run's `peak - current` after warmup
+#: over its warmup tokens, for this model at TP1.
+ACTIVATIONS = {
+    "id": "qwen3.8-27b",
+    "fingerprint": "sha256:" + "b" * 64,
+    "applies_to": ["Qwen3_5ForConditionalGeneration"],
+    "bytes_per_token": {1: 180_480},
+}
+
+
+def test_a_measured_entry_prices_the_activations_only_for_its_model_and_width(qwen):
+    document = copy.deepcopy(DOCUMENT)
+    document["device"]["activations"] = [ACTIVATIONS]
+    measured_spec = MachineSpec.from_mapping(document)
+    arch, digest = ACTIVATIONS["applies_to"][0], ACTIVATIONS["fingerprint"]
+
+    def activations(architecture, fingerprint, tp_width):
+        return ModelTerms.from_declared_config(
+            qwen,
+            parameter_count=PARAMETERS,
+            tp_size=tp_width,
+            warmup_tokens=WARMUP_TOKENS,
+            measured_activations=measured_spec.activations_for(
+                architecture, fingerprint, tp_width
+            ),
+        ).activations
+
+    term = activations(arch, digest, 1)
+    assert term.basis is Basis.SPEC
+    assert term.nbytes == WARMUP_TOKENS * 180_480
+    assert "device.activations[qwen3.8-27b].bytes_per_token[1]" in term.source
+    # Another size of the same architecture, an unmeasured width, and another
+    # architecture keep the declared form.
+    for key in (
+        (arch, "sha256:" + "c" * 64, 1),
+        (arch, digest, 2),
+        ("Qwen3ForCausalLM", digest, 1),
+    ):
+        fallback = activations(*key)
+        assert fallback.basis is Basis.DECLARED, key
+        assert fallback.nbytes == MODEL_TERMS_BY_DTYPE["bfloat16"]["activations"]
+
+
+def test_two_activation_entries_for_one_model_are_refused_where_the_spec_is_read():
+    document = copy.deepcopy(DOCUMENT)
+    document["device"]["activations"] = [ACTIVATIONS, dict(ACTIVATIONS, id="again")]
+    with pytest.raises(SpecRefusal, match="resolves to two entries"):
+        MachineSpec.from_mapping(document)
+
+
 def test_a_config_with_no_dtype_refuses_rather_than_assuming_one(qwen):
     nameless = copy.deepcopy(qwen)
     del nameless.dtype
@@ -620,9 +670,10 @@ def loaded(tmp_path, raw):
     """`raw` written as a model's config.json and loaded as `run.runner` sees
     it: ATOM's own config, and the file it came from."""
     (tmp_path / "config.json").write_text(json.dumps(raw))
-    return get_hf_config(str(tmp_path)), PretrainedConfig.get_config_dict(
-        str(tmp_path)
-    )[0]
+    return (
+        get_hf_config(str(tmp_path)),
+        PretrainedConfig.get_config_dict(str(tmp_path))[0],
+    )
 
 
 def terms_of(config, config_json):
