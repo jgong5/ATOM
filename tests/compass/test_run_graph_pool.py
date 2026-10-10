@@ -8,13 +8,17 @@ and reads back through that method, with a Qwen3.5-27B config at TP1 on the
 suite's machine document.
 """
 
+import copy
+import hashlib
 import json
 from types import SimpleNamespace
 
 import torch
 from test_memory_readings import (
+    ACTIVATIONS,
     CAPTURE_SIZES,
     CONFIG_JSON,
+    DOCUMENT,
     GPU_MEMORY_UTILIZATION,
     GRAPH_POOL_BY_DTYPE,
     MAX_NUM_BATCHED_TOKENS,
@@ -28,9 +32,11 @@ from atom.compass import run as compass_run
 from atom.compass.runner.overrides import NonAllocatingRunner
 
 
-def _reserved(monkeypatch, tmp_path, *, eager, piecewise=False, dp=1, sizes=None):
+def _reserved(
+    monkeypatch, tmp_path, *, eager, piecewise=False, dp=1, sizes=None, **run
+):
     """What the runner reserves after `run.runner` installed its readings."""
-    monkeypatch.setenv(compass_run.ENV, str(_run_file(tmp_path)))
+    monkeypatch.setenv(compass_run.ENV, str(_run_file(tmp_path, **run)))
     (tmp_path / "config.json").write_text(CONFIG_JSON.read_text())
     hf = PretrainedConfig.from_dict(json.loads(CONFIG_JSON.read_text())["text_config"])
     runner = SimpleNamespace(
@@ -78,3 +84,13 @@ def test_the_piecewise_estimate_takes_the_data_parallel_width(monkeypatch, tmp_p
         monkeypatch, tmp_path, eager=False, piecewise=True, dp=2, sizes=(1, 2)
     )
     assert reserved == int(per_token * 3)
+
+
+def test_a_measured_entry_sizes_the_whole_graph_reservation(monkeypatch, tmp_path):
+    # The entry is keyed by the served config.json's digest and travels in the
+    # run file as JSON, which writes its width keys as strings.
+    digest = "sha256:" + hashlib.sha256(CONFIG_JSON.read_bytes()).hexdigest()
+    machine = copy.deepcopy(DOCUMENT)
+    machine["device"]["activations"] = [dict(ACTIVATIONS, fingerprint=digest)]
+    reserved = _reserved(monkeypatch, tmp_path, eager=False, machine=machine)
+    assert reserved == int(MAX_NUM_BATCHED_TOKENS * 180_480 * 0.2)

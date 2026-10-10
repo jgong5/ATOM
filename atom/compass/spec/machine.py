@@ -79,6 +79,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
+from . import activations
+from .activations import ActivationEntry
 from .fields import (
     BLOCKS,
     BY_PATH,
@@ -99,6 +101,8 @@ from .rules import (
     refuse_unknown_key,
 )
 from .tokenizers import Backend, TokenizerEntry, TokenizerTable, table
+
+ACTIVATIONS = "device.activations"
 
 
 def _missing(field: Field) -> None:
@@ -237,6 +241,7 @@ class MachineSpec:
                     _missing(field)
                 continue
             values[field.path] = check(field, found[field.path], field.path)
+        activations.table(values.get(ACTIVATIONS, ()))
         return cls(values, table(values["host.tokenizers"]))
 
     def value(self, path: str) -> Any:
@@ -298,6 +303,14 @@ class MachineSpec:
     ) -> TokenizerEntry:
         """The measured tokenizer for a model architecture, or a refusal."""
         return self.tokenizers.resolve(architecture, backend, fingerprint)
+
+    def activations_for(
+        self, architecture: str | None, fingerprint: str | None, tp_width: int
+    ) -> tuple[ActivationEntry, float] | None:
+        """The activation bytes per token measured for a model at a width, with
+        its entry, or None when nothing was measured for it."""
+        entries = activations.table(self.values.get(ACTIVATIONS, ()))
+        return activations.resolve(entries, architecture, fingerprint, tp_width)
 
     def check_stack(
         self, observed: Mapping[str, str], *, carried_only: bool = False

@@ -356,12 +356,18 @@ def runner(model_runner) -> None:
         ),
     )
     machine = MachineSpec.from_mapping(_width_keys(run["machine"]))
+    config_json = PretrainedConfig.get_config_dict(config.model)[0]
     model = ModelTerms.from_declared_config(
         config.hf_config,
         parameter_count=run["parameter_count"],
         tp_size=tp,
         warmup_tokens=config.max_num_batched_tokens,
-        config_json=PretrainedConfig.get_config_dict(config.model)[0],
+        config_json=config_json,
+        measured_activations=machine.activations_for(
+            (config_json.get("architectures") or [None])[0],
+            _file_digest(config.model, "config.json"),
+            tp,
+        ),
     )
     install_device_readings(
         model_runner,
@@ -431,13 +437,19 @@ def tokenizer(tok, config) -> None:
 def _fingerprint(tok) -> str | None:
     """``sha256:<hex>`` of the ``tokenizer.json`` a fast tokenizer was loaded
     from, resolved from its ``name_or_path`` as loading did; None without one."""
-    from transformers.utils import cached_file
-
     name = getattr(tok, "name_or_path", None)
     if not (tok.is_fast and name):
         return None
+    return _file_digest(name, "tokenizer.json")
+
+
+def _file_digest(name: str, filename: str) -> str | None:
+    """``sha256:<hex>`` of a model's `filename`, resolved from `name` as loading
+    does; None when it is not there."""
+    from transformers.utils import cached_file
+
     try:
-        path = cached_file(name, "tokenizer.json", local_files_only=True)
+        path = cached_file(name, filename, local_files_only=True)
     except OSError:
         return None
     return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -445,6 +457,8 @@ def _fingerprint(tok) -> str | None:
 
 def _width_keys(node):
     """JSON writes a width table's integer keys as strings; read them back."""
+    if isinstance(node, list):
+        return [_width_keys(v) for v in node]
     if not isinstance(node, dict):
         return node
     return {int(k) if k.isdigit() else k: _width_keys(v) for k, v in node.items()}
