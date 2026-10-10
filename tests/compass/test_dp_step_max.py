@@ -174,7 +174,8 @@ def test_both_ranks_report_the_larger_cost_and_the_group_token_count(dp2):
     own = [priced(RequestShape(40, 40, False)), priced(RequestShape(8, 8, False))]
     assert own[0] > own[1]
     assert [r.predicted_s for r in replies] == [own[0], own[0]]
-    assert [b.views[0].max_tokens_across_dp for b in backends] == [40, 40]
+    # A rank prefills, so the variable-length gather carries both counts.
+    assert [b.views[0].moe_rows for b in backends] == [48, 48]
     assert [b.views[0].requests for b in backends] == [
         (RequestShape(40, 40, False),),
         (RequestShape(8, 8, False),),
