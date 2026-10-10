@@ -265,7 +265,7 @@ def runner(model_runner) -> None:
         return
     from atom.compass.backends.geometry import Parallelism
     from atom.compass.backends.shape import Coefficients, ShapeStubBackend
-    from atom.compass.memory import ModelTerms, device_readings, reserves
+    from atom.compass.memory import ModelTerms, device_readings
     from atom.compass.runner.overrides import (
         install_cost_backend,
         install_device_readings,
@@ -282,19 +282,56 @@ def runner(model_runner) -> None:
             stack_layers=config.hf_config.num_hidden_layers,
         ),
     )
+    machine = MachineSpec.from_mapping(_width_keys(run["machine"]))
+    model = ModelTerms.from_declared_config(
+        config.hf_config,
+        parameter_count=run["parameter_count"],
+        tp_size=tp,
+        warmup_tokens=config.max_num_batched_tokens,
+    )
     install_device_readings(
         model_runner,
         device_readings(
-            MachineSpec.from_mapping(_width_keys(run["machine"])),
+            machine,
             tp_width=tp,
-            model=ModelTerms.from_declared_config(
-                config.hf_config,
-                parameter_count=run["parameter_count"],
-                tp_size=tp,
-                warmup_tokens=config.max_num_batched_tokens,
-            ),
-            cudagraph_overhead=reserves(enforce_eager=True),
+            model=model,
+            cudagraph_overhead=_graph_pool(model_runner, machine, model),
         ),
+    )
+
+
+def _graph_pool(model_runner, machine, model):
+    """What ATOM's `_estimate_cudagraph_overhead` reserves for this deployment:
+    nothing under ``enforce_eager``, else the branch the runner's own
+    `_piecewise_cg_active` picks, over the same config fields it reads."""
+    from atom.compass.memory import (
+        PiecewiseCapture,
+        capture_token_shapes,
+        piecewise_per_token_bytes,
+        reserves,
+    )
+
+    config = model_runner.config
+    if config.enforce_eager:
+        return reserves(enforce_eager=True)
+    if not model_runner._piecewise_cg_active():
+        return reserves(activation_bytes=model.activations.nbytes)
+    hf = config.hf_config
+    sizes = config.compilation_config.cudagraph_capture_sizes or [config.max_num_seqs]
+    capacity = machine.value("device.memory.capacity_bytes")
+    return reserves(
+        piecewise=PiecewiseCapture(
+            per_token_bytes=piecewise_per_token_bytes(
+                hidden_size=int(hf.hidden_size),
+                layers=int(hf.num_hidden_layers),
+                dtype_bytes=config.torch_dtype.itemsize,
+                dp_size=config.parallel_config.data_parallel_size,
+            ),
+            token_shapes=capture_token_shapes(
+                sizes, max_num_batched_tokens=config.max_num_batched_tokens
+            ),
+            budget_bytes=int(config.gpu_memory_utilization * capacity),
+        )
     )
 
 

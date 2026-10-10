@@ -535,13 +535,33 @@ runs concurrently. So the tracer records `torch.cuda.current_stream()` as a fiel
 node and hooks `Event.record` / `wait_event` / `wait_stream` for the edges. `Par` is then
 **derived** from stream ids rather than declared.
 
-**Staging.** For M1-M4 every node carries one stream id and `Par` never materialises:
-Qwen3.8-27B is dense-MLP (no `num_experts`, no `shared_expert`) so dual-stream MoE cannot
-fire; it is not MLA so there is no metadata `prep_stream`; TBO defaults off and needs
-`--enable-tbo` plus `--enable-dp-attention` plus >=2 GPUs; and PP asserts `enforce_eager`
-so it cannot coexist with CUDA graphs. From M5, Kimi-K3 forks shared-expert against routed
-expert on an `alt_stream` whenever tokens <= 1024 — i.e. **every decode step, by default,
-baked into the replayed graph**. So `Par` is defined now and populated at M5.
+**Staging.** In M1 and in M2's first gate every node carries one stream id and `Par`
+never materialises: Qwen3.8-27B is dense-MLP (no `num_experts`, no `shared_expert`) so
+dual-stream MoE cannot fire; it is not MLA so there is no metadata `prep_stream`; TBO
+defaults off and needs `--enable-tbo` plus `--enable-dp-attention` plus >=2 GPUs; and PP
+asserts `enforce_eager` so it cannot coexist with CUDA graphs. **DeepSeek-V4-Pro populates
+`Par` in M2**, on both nodes of each nightly 1P+1D cell in `recipes/mesh/DeepSeek-V4.md`.
+Only the DPA cells pass `--enable-dp-attention`, and only their prefill node adds
+`--enable-tbo`.
+
+- **Decode, in every cell, runs without TBO.** Inside the replayed graph,
+  `DeepseekV4Attention.maybe_compressors_async` forks the compressors onto `alt_stream`
+  and `indexer_stream`, and `MoE` runs the shared expert on `alt_stream` against the
+  routed experts whenever this rank's tokens <= `ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`
+  (1024 by default) — i.e. **every decode step** at the cells' concurrencies. The shared
+  expert stays unfused because it is FP8 and the routed experts FP4.
+- **Prefill never forks the compressors**: it runs eager, and the compressor fork needs
+  `fc.in_hipgraph`, which only decode graph capture sets. A prefill step is one of:
+  - **a TBO step** (DPA cells only), taken when some DP rank reaches
+    `ATOM_TBO_PREFILL_MIN_TOKENS` (8192 by default) and every rank can split
+    (`local_tbo_precompute`, `atom/utils/tbo/ubatching.py`): two microbatches alternate
+    between a compute and a comm stream joined by events, and `tbo_active()` keeps the
+    shared-expert fork off;
+  - **any other step with at most 1024 tokens on this rank**: `maybe_dual_stream_forward`
+    forks the shared expert in eager mode, a `Par` on the prefill node;
+  - **any other step**: one stream.
+
+So `Par` is defined now and populated at M2, from its first DeepSeek-V4-Pro step.
 
 ### Symbolic shapes — what they buy
 
@@ -1152,6 +1172,6 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T4 | Establish scratch constants per leaf for the 27B | needed once the liveness walk replaces the measured activation coefficient (D22); unobservable device-free, so it needs a source or one measurement |
 | T5 | Verify ATOM's model classes trace cleanly under FakeTensorMode at TP>1 | needs a non-wedged node |
 | T6 | Validate that `Repeat` grouping reproduces the flat prices term by term | needs a first trace |
-| T7 | Validate `Par` reconstruction from stream ids | not exercised until M5 (Kimi-K3) |
+| T7 | Validate `Par` reconstruction from stream ids | not exercised until M2 (DeepSeek-V4-Pro) |
 | T8 | Decide whether tier (a) is fitted independently or derived from tier (b) | tier (b) does not exist yet |
 | T9 | Declare a row-ordering treatment for decode attention | 1.77x effect, invisible to every current feature |
