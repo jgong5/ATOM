@@ -981,9 +981,18 @@ Deliberately **not** per-operator attribution from a recorded curve: that reprod
 traced curve exactly, is worth nothing at any other shape, and is a recording dressed as a
 model.
 
+**Revised 2026-10-10: the walk is not the activation term's first source.** Until capture
+lands, the term is one coefficient per model and width measured on a real run
+(`03` D16, [#704](https://github.com/jgong5/ATOM/issues/704)), and the scratch is inside
+that reading, so neither this walk nor the per-leaf constants gate stages 2 and 3. The
+walk replaces the coefficient when it lands, and the per-leaf constants are needed from
+then (T4). A model with no measured coefficient takes a geometry form, which
+[#705](https://github.com/jgong5/ATOM/issues/705) tests (`10` T34).
+
 ### Open issues
 
-- Nothing establishes the scratch constants for Qwen3.8-27B under this design yet.
+- Nothing establishes the scratch constants for Qwen3.8-27B under this design yet; they
+  are needed once the walk replaces the measured coefficient.
 - The fault-4 case that is *not* an opaque leaf — the MLP's silu destination, **13.6 MB a
   layer at TP=1 and exactly where the high-water mark sits** — was handled by an
   out-variant rule: an operator returning no tensor is an out-variant, and what it produces
@@ -1124,7 +1133,7 @@ Deferred to future work by decision on 2026-09-18.
 | D19 | Hierarchical, symbolic, stream-annotated IR: `Seq` / `Repeat` / `Par`. No branches in the IR — applicability is a discrete key plus an evaluated guard domain | 2026-09-18 |
 | D20 | Opaque leaves are priced, not decomposed. Each carries a declared parameter extractor. FlyDSL and MORI need no IR node. | 2026-09-18 |
 | D21 | Declared nodes over chased coverage; refuse and record `unpriced` reasons; a failed forward writes no graph | 2026-09-18 |
-| D22 | Liveness stays observational under fake tensors; internal scratch of an opaque leaf is a declared per-leaf constant | 2026-09-18 |
+| D22 | Liveness stays observational under fake tensors; internal scratch of an opaque leaf is a declared per-leaf constant. Revised: until capture lands the activation term is a coefficient measured on a real run, scratch inside it, and the walk replaces it after | 2026-09-18; revised 2026-10-10 |
 | D23 | Trace eager, price with the regime constant of the real step. The inductor fusion gap (~4.8% decode) is a documented **TODO**, not a decision. | 2026-09-18 |
 
 ---
@@ -1139,7 +1148,7 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T1 | Inductor fusion correction (D23) | ~4.8% of a decode step; three candidate treatments, none chosen |
 | T2 | Enumerate the structure set for Qwen3.8-27B | needs tier (a) running against the real scheduler |
 | T3 | Build the per-leaf parameter-extractor table (~20 entries) | the main hand-written asset; needs the leaf list frozen first |
-| T4 | Establish scratch constants per leaf for the 27B | unobservable device-free; needs a source or one measurement |
+| T4 | Establish scratch constants per leaf for the 27B | needed once the liveness walk replaces the measured activation coefficient (D22); unobservable device-free, so it needs a source or one measurement |
 | T5 | Verify ATOM's model classes trace cleanly under FakeTensorMode at TP>1 | needs a non-wedged node |
 | T6 | Validate that `Repeat` grouping reproduces the flat prices term by term | needs a first trace |
 | T7 | Validate `Par` reconstruction from stream ids | not exercised until M5 (Kimi-K3) |
