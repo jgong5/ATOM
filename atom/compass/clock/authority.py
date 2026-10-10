@@ -63,7 +63,6 @@ carries requests in and replies out.
 
 import math
 from dataclasses import dataclass
-from operator import itemgetter
 
 from .channels import ChannelTable
 from .identity import LpId
@@ -388,7 +387,7 @@ class ClockAuthority:
             # N stay in name order without comparing two LpIds.
             waiting = sorted(
                 ((nv[i], i) for i, s in state.items() if s != RUNNING),
-                key=itemgetter(0),
+                key=lambda waiter: waiter[0],
             )
             grantable = [(n, i) for n, i in waiting if n <= self._horizon]
             due = next(((i, n) for n, i in grantable if n < self._lbts(i)), None)
