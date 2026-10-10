@@ -6,10 +6,12 @@ deployment reads; spawned processes inherit it. The API server's
 ``--compass-run`` sets it. With it unset, every function here returns at once
 and ATOM runs as it always does.
 
-One engine LP at data-parallel width one and one stage, one frontend LP, and
-the traffic LP the harness drives, over `single_engine_table`. The Clock
-Authority is co-hosted in the frontend's process and served at the run file's
-``clock_endpoint``, which every LP, the frontend's included, connects to.
+One engine LP at one stage, one frontend LP, and the traffic LP the harness
+drives, over `single_engine_table`. At data-parallel width above one, each DP
+rank's engine process is a member ``dp<rank>`` of the one engine LP and owns
+its rank's channels. The Clock Authority is co-hosted in the frontend's
+process and served at the run file's ``clock_endpoint``, which every LP and
+member, the frontend's included, connects to.
 
 - `frontend(config)` wraps the `CoreManager` construction in `LLMEngine`: it
   selects the simulated runner, serves the authority and installs the
@@ -32,7 +34,11 @@ Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
 where the step table, the run summary and each server LP's refusals go: an
 engine's are the worker's refused commands and the engine's refused clock
 calls, a frontend's its executor's refused jobs and its refused clock calls.
-The authority removes an earlier run's files there as it starts.
+The authority removes an earlier run's files there as it starts. An
+optional ``data_parallel_size``, 1 when absent, is the deployment's DP width,
+which under DP-attention is its TP size times its DP size; the traffic LP reads
+the channel table from the run file alone. Each DP rank's engine process hands
+in its own refusals, as ``<lp>.<member>``.
 
 A run file that also has ``router_s`` and ``kv_write_req_s`` describes a
 prefill-decode run over `prefill_decode_table`, and ``kv_link`` (``intra_node``
@@ -82,7 +88,7 @@ ATOM_RUNNER = "atom.model_engine.model_runner.ModelRunner"
 #: Keys that differ between two runs of one configuration, kept out of its name.
 PER_RUN = ("clock_endpoint", "out_dir")
 COMMANDS_FILE, STEP_TABLE_FILE, SUMMARY_FILE = (
-    "commands-{}.json",  # by LP name
+    "commands-{}.json",  # by LP name, or <lp>.<member> for a member
     "step_table.txt",
     "summary.json",
 )
@@ -90,6 +96,8 @@ COMMANDS_FILE, STEP_TABLE_FILE, SUMMARY_FILE = (
 HAND_IN_WAIT_S = 300.0
 
 _authority: "_RecordingAuthority | None" = None
+#: This engine process's member name in the engine LP, None at DP width one.
+_member: str | None = None
 
 
 def spec() -> dict | None:
@@ -108,13 +116,34 @@ def spec() -> dict | None:
     return run
 
 
+def _dp(run: dict) -> int:
+    return run.get("data_parallel_size", 1)
+
+
 def channel_table(run: dict):
     common = {k: run[k] for k in ("admission_path", "ipc_s", "stream_s")}
     if "kv_write_req_s" in run:
+        if _dp(run) != 1:
+            raise ValueError(
+                f"a prefill-decode run declares data_parallel_size {_dp(run)}; "
+                "its channel table has the channels of DP rank 0 only"
+            )
         return prefill_decode_table(
             **common, router_s=run["router_s"], kv_write_req_s=run["kv_write_req_s"]
         )
-    return single_engine_table(**common)
+    return single_engine_table(**common, dp=_dp(run))
+
+
+def _members(table, dp: int) -> dict | None:
+    """At DP width above one, the engine LP's members: each rank owns its ``#dp<rank>`` channels."""
+    if dp == 1:
+        return None
+    names = [c.name for c in table.channels_into(ENGINE) + table.channels_from(ENGINE)]
+    return {
+        ENGINE: {
+            f"dp{r}": [n for n in names if n.endswith(f"#dp{r}")] for r in range(dp)
+        }
+    }
 
 
 def _pd_side(config) -> str | None:
@@ -158,6 +187,17 @@ def _servers(run: dict) -> list[str]:
     return [lp.name for lp in channel_table(run).registry.ids() if lp != TRAFFIC]
 
 
+def _hand_ins(run: dict) -> list[str]:
+    """The name each server LP hands its refusals in under: ``<lp>.<member>`` for
+    each member of an LP declared with members, else the LP's name."""
+    members = _members(channel_table(run), _dp(run)) or {}
+    return [
+        f"{lp}.{m}" if m else lp
+        for lp in _servers(run)
+        for m in members.get(LpId(lp), [None])
+    ]
+
+
 class _RecordingAuthority(ClockAuthority):
     """The authority, recording the step table: a row per reply and a row per
     message each reply releases; and the wall seconds of the run, from its start
@@ -174,7 +214,13 @@ class _RecordingAuthority(ClockAuthority):
         for name in (COMMANDS_FILE.format("*"), STEP_TABLE_FILE, SUMMARY_FILE):
             for f in out.glob(name):
                 f.unlink()
-        super().__init__(channel_table(run), timeline=self, bound_s=run["bound_s"])
+        table = channel_table(run)
+        super().__init__(
+            table,
+            timeline=self,
+            members=_members(table, _dp(run)),
+            bound_s=run["bound_s"],
+        )
 
     def record(self, lp, time_from, time_to, kind, recovered) -> None:
         self.steps.record(lp, time_from, time_to, kind, detail="recovered" * recovered)
@@ -184,7 +230,9 @@ class _RecordingAuthority(ClockAuthority):
         if not self._joining and self.started is None:
             self.started = time.monotonic()
         replies = super().on_request(*args, **kwargs)
-        for lp, _, released in replies:
+        for to, _, released in replies:
+            # A member's reply is addressed (lp, member); its channels name its rank.
+            lp = to[0] if isinstance(to, tuple) else to
             for ch, msgs in released.items():
                 for seq, arrival in msgs:
                     self.steps.record(lp, arrival, arrival, "release", ch, seq)
@@ -194,8 +242,10 @@ class _RecordingAuthority(ClockAuthority):
         return replies
 
 
-def _runtime(lp: LpId, run: dict) -> clock.LPRuntime:
-    rt = clock.LPRuntime(lp, channel_table(run), connect(lp, run["clock_endpoint"]))
+def _runtime(lp: LpId, run: dict, member: str | None = None) -> clock.LPRuntime:
+    rt = clock.LPRuntime(
+        lp, channel_table(run), connect(lp, run["clock_endpoint"], member)
+    )
     clock.install(rt)
     return rt
 
@@ -214,12 +264,12 @@ def frontend(config):
     run = spec()
     if run is None:
         return contextlib.nullcontext()
-    widths = (config.parallel_config.data_parallel_size, config.pipeline_parallel_size)
-    if widths != (1, 1) or config.enable_rapidserve:
+    pc = config.parallel_config
+    widths = (pc.data_parallel_size, config.pipeline_parallel_size)
+    if widths[1] != 1 or config.enable_rapidserve:
         raise ValueError(
-            f"a simulated run here is one engine LP at data-parallel and pipeline "
-            f"width 1 without RapidServe, got (dp, pp)={widths}, "
-            f"rapidserve={config.enable_rapidserve}"
+            f"a simulated run here is one engine LP at pipeline width 1 without "
+            f"RapidServe, got (dp, pp)={widths}, rapidserve={config.enable_rapidserve}"
         )
     if config.runner_qualname not in (ATOM_RUNNER, COMPASS_RUNNER_QUALNAME):
         raise ValueError(
@@ -233,6 +283,21 @@ def frontend(config):
             "prefill-decode run spans two API servers that must share one; "
             "start it on its own and name it with --compass-clock-endpoint"
         )
+    # Read before `CoreManager` makes every TP rank a DP rank under DP-attention.
+    dp = pc.data_parallel_size * (
+        config.tensor_parallel_size if config.enable_dp_attention else 1
+    )
+    if dp != _dp(run):
+        raise ValueError(
+            f"the deployment runs {dp} data-parallel ranks and the run file's "
+            f"data_parallel_size is {_dp(run)}; the channel table every LP "
+            "reads would declare the wrong ranks"
+        )
+    if dp > 1 and config.fake_eplb:
+        raise ValueError(
+            "--fake-eplb may start fewer engines than the data-parallel ranks "
+            "the channel table declares, and a rank that never joins holds the run"
+        )
     config.runner_qualname = COMPASS_RUNNER_QUALNAME
     lp = FRONTEND if side is None else LpId(f"{FRONTEND.name}-{side}")
     if standalone:
@@ -243,7 +308,12 @@ def frontend(config):
 
 
 def engine(config):
-    """Around the engine's construction in its process; a no-op context on a real run."""
+    """Around the engine's construction in its process; a no-op context on a real run.
+
+    At DP width above one, the process joins the engine LP as the member of its
+    DP rank.
+    """
+    global _member
     run = spec()
     if run is None:
         return contextlib.nullcontext()
@@ -253,9 +323,10 @@ def engine(config):
     if side is not None:
         lp = LpId(f"{ENGINE.name}-{side}")
         _bind_transfer(config, run)
-    dp = config.parallel_config.data_parallel_size
-    utils.LP_OF_RANK = dict.fromkeys(range(dp), lp)
-    return _start_on_leaving(_runtime(lp, run))
+    pc = config.parallel_config
+    utils.LP_OF_RANK = dict.fromkeys(range(pc.data_parallel_size), lp)
+    _member = f"dp{pc.data_parallel_rank}" if pc.data_parallel_size > 1 else None
+    return _start_on_leaving(_runtime(lp, run, _member))
 
 
 def runner(model_runner) -> None:
@@ -263,6 +334,8 @@ def runner(model_runner) -> None:
     run = spec()
     if run is None:
         return
+    from transformers import PretrainedConfig
+
     from atom.compass.backends.geometry import Parallelism
     from atom.compass.backends.shape import Coefficients, ShapeStubBackend
     from atom.compass.memory import ModelTerms, device_readings
@@ -288,6 +361,7 @@ def runner(model_runner) -> None:
         parameter_count=run["parameter_count"],
         tp_size=tp,
         warmup_tokens=config.max_num_batched_tokens,
+        config_json=PretrainedConfig.get_config_dict(config.model)[0],
     )
     install_device_readings(
         model_runner,
@@ -397,7 +471,8 @@ def engine_done(engine_core) -> None:
     if run is not None:
         refused = engine_core.runner_mgr.call_func("refused_commands", wait_out=True)
         rt = clock.installed()
-        _hand_in(run, rt.me.name, list(refused) + rt.refusals)
+        lp = rt.me.name if _member is None else f"{rt.me.name}.{_member}"
+        _hand_in(run, lp, list(refused) + rt.refusals)
 
 
 def frontend_done(llm_engine) -> bool:
@@ -420,7 +495,7 @@ def frontend_done(llm_engine) -> bool:
 def _write_summary(run: dict, a: _RecordingAuthority) -> None:
     """Write the run summary once every server LP has handed in its refusals."""
     out = Path(run["out_dir"])
-    files = [out / COMMANDS_FILE.format(lp) for lp in _servers(run)]
+    files = [out / COMMANDS_FILE.format(n) for n in _hand_ins(run)]
     deadline = time.monotonic() + HAND_IN_WAIT_S
     while missing := [f.name for f in files if not f.exists()]:
         if time.monotonic() > deadline:
