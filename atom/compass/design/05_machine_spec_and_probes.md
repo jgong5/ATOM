@@ -77,6 +77,7 @@ provenance:                      # one block, not per-field tags
   date: 2026-09-18
   method: datasheet | probed | transferred-from:<spec-name> | assumed | mixed
   fragments: [...]               # filled by `merge`, see D26
+  assumed: [...]                 # a `mixed` spec only: its assumed fields, rule 5
   notes: free text
 
 host:
@@ -197,16 +198,19 @@ Mooncake's KV transfer between the prefill and the decode node (`01` D6).
    always refuse.
 4. **The whole resolved spec is echoed into every run artifact.** The KV gate is **≤5%**;
    a number whose spec cannot be recovered from the artifact is unattributable.
-5. **Every field is *sourced* or *assumed*, and the fragment that supplied it says which.**
-   `merge` records that fragment per field (D26). A fragment whose `method` is `assumed`
-   supplies values no source gives, and its `notes` say why each value was chosen; a
-   fragment with any other method is the source of what it supplies, and a `datasheet`
-   fragment's `notes` cite the document and the date it was read. A derate for a device
-   never run is assumed (`10` D69): a vendor's measured fraction of peak informs the
-   choice and does not source it. The MI455X spec's two link latencies are unpublished
-   and are assumed by owner ruling
-   ([#504](https://github.com/jgong5/ATOM/issues/504#issuecomment-6092687352)). `08` D50.2
-   says how the projection reports its assumed fields.
+5. **Every field is *sourced* or *assumed*, and the document says which.** A fragment
+   whose `method` is `assumed` assumes every value it supplies, and its `notes` say why
+   each value was chosen. A `mixed` fragment, which is what a saved merge is, assumes
+   exactly the fields its `provenance.assumed` names; one that does not state that list
+   is refused by name, and no other fragment may state it. A fragment with any other
+   method assumes nothing: it is the source of what it supplies, and a `datasheet`
+   fragment's `notes` cite the document and the date it was read. A field is assumed when
+   every fragment that supplied it assumes it. When the merged method is `mixed`, `merge`
+   writes those fields into `provenance.assumed`, keyed as `Merge.sources` keys them and
+   empty when there are none, so a saved merge re-merged next week keeps its assumed
+   fields assumed although the per-field record is not saved. A derate for a device never
+   run is assumed (`10` D69): a vendor's measured fraction of peak informs the choice and
+   does not source it. `08` D50.2 says how the projection reports its assumed fields.
 
 ### `host.tokenizer` is keyed by tokenizer identity, not by model
 
@@ -370,6 +374,6 @@ which cancelled — the largest being 25% of a single term.
 | # | Decision | Date |
 |---|---|---|
 | D24 | The spec describes the machine; ATOM's config describes the deployment. Thread-pool width becomes an ATOM config option, not a Compass one. | 2026-09-18 |
-| D25 | Four-section schema: `provenance`, `host`, `device`, `interconnect`. Mandatory derates, no defaults for `runtime_constants`, `software_pinned_to` checked, whole spec echoed into every artifact. Revised for the MI455 projection: an optional dense `fp4_flops`, `intra_node.domain_devices` for a scale-up fabric wider than a node, and every field *sourced* or *assumed* by the method of the fragment that supplied it. | 2026-09-18; revised 2026-10-10 |
+| D25 | Four-section schema: `provenance`, `host`, `device`, `interconnect`. Mandatory derates, no defaults for `runtime_constants`, `software_pinned_to` checked, whole spec echoed into every artifact. Revised for the MI455 projection: an optional dense `fp4_flops`, `intra_node.domain_devices` for a scale-up fabric wider than a node, and every field *sourced* or *assumed* by the fragments that supplied it, which a `mixed` spec records in `provenance.assumed`. | 2026-09-18; revised 2026-10-10 |
 | D26 | Probes emit fragments; `merge` / `validate` / `explain` combine and check them. Four hardware tiers plus datasheet and transfer paths. Every hardware probe implements the contamination refusals. | 2026-09-18 |
 | D25.1 | Runtime-constant fields renamed to say what they are; ATOM's own term recorded as a mapping column. `host.tokenizer` becomes `host.tokenizers[]`, keyed by tokenizer identity (id + backend + fingerprint) with `applies_to` model architectures. | 2026-09-19 |

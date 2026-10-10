@@ -313,8 +313,8 @@ counterpart:
 | the DP group's variable-size gather | D66 | `interconnect.intra_node.*` |
 | MORI dispatch and combine, for the EP8 step | D66 | `interconnect.intra_node.*` |
 
-Mooncake's KV transfer needs no law here: `01` D6 charges it `latency + bytes/bandwidth`
-from `interconnect.inter_node`. Most of these families are opaque leaves, so their FLOPs
+Mooncake's KV transfer needs no law here: it is charged `latency + bytes/bandwidth` from
+`interconnect.inter_node` (`05` D25). Most of these families are opaque leaves, so their FLOPs
 and bytes come from the hand-written extractors of T35, which W5.2 owes for these families
 first. Tier 0 is graded by D67.1.
 
