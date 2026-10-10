@@ -259,7 +259,11 @@ def _finish(monkeypatch, tmp_path, ranks):
     for rank in ranks:
         monkeypatch.setattr(compass_run, "_member", f"dp{rank}")
         refused = (f"command:on dp{rank}",)
-        worker = SimpleNamespace(call_func=lambda name, wait_out, r=refused: r)
+        worker = SimpleNamespace(
+            call_func=lambda name, wait_out, r=refused: (
+                r if name == "refused_commands" else {}
+            )
+        )
         compass_run.engine_done(SimpleNamespace(runner_mgr=worker))
 
     authority.started = authority.finished = time.monotonic()
