@@ -75,7 +75,7 @@ def _check(capsys, tmp_path, log) -> dict[str, str]:
     [
         (True, False, None),
         (False, False, sum(s for s in CAPTURE_SIZES if s <= 256)),
-        (False, True, sum(CAPTURE_SIZES)),
+        (False, True, sum(s for s in CAPTURE_SIZES if s <= 256)),
     ],
     ids=["eager", "whole-graph", "piecewise"],
 )

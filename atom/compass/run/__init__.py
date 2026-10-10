@@ -214,8 +214,7 @@ class _RecordingAuthority(ClockAuthority):
         self._joining = set(_servers(run))
         # A rerun into the same out_dir starts from none of the last run's files.
         out = Path(run["out_dir"])
-        stale = (COMMANDS_FILE, MEMORY_FILE, STEP_TABLE_FILE, SUMMARY_FILE)
-        for name in stale:
+        for name in (COMMANDS_FILE, MEMORY_FILE, STEP_TABLE_FILE, SUMMARY_FILE):
             for f in out.glob(name.format("*")):
                 f.unlink()
         table = channel_table(run)
@@ -391,7 +390,9 @@ def _graph_pool(model_runner, machine, model):
     """What ATOM's `_estimate_cudagraph_overhead` reserves for this deployment:
     nothing under ``enforce_eager``, else the branch the runner's own
     `_piecewise_cg_active` picks, over the same config fields it reads. With it,
-    the tokens the capture takes, None under ``enforce_eager``."""
+    the tokens `capture_cudagraph` captures, None under ``enforce_eager``. The
+    piecewise reservation caps only what it reserves; the capture takes the
+    same bounded ladder in both modes."""
     from atom.compass.memory import (
         PiecewiseCapture,
         capture_token_shapes,
@@ -402,14 +403,14 @@ def _graph_pool(model_runner, machine, model):
     config = model_runner.config
     if config.enforce_eager:
         return reserves(enforce_eager=True), None
+    # At one token per sequence a batch size is its token count, so the
+    # capture loop's schedulable bound applies to both.
+    bound = min(config.max_num_seqs, config.max_num_batched_tokens)
+    captured = sum(
+        capture_token_shapes(config.capture_sizes, max_num_batched_tokens=bound)
+    )
     if not model_runner._piecewise_cg_active():
-        # At one token per sequence a batch size is its token count, so the
-        # capture loop's schedulable bound applies to both.
-        bound = min(config.max_num_seqs, config.max_num_batched_tokens)
-        shapes = capture_token_shapes(
-            config.capture_sizes, max_num_batched_tokens=bound
-        )
-        return reserves(activation_bytes=model.activations.nbytes), sum(shapes)
+        return reserves(activation_bytes=model.activations.nbytes), captured
     hf = config.hf_config
     sizes = config.compilation_config.cudagraph_capture_sizes or [config.max_num_seqs]
     capacity = machine.value("device.memory.capacity_bytes")
@@ -425,7 +426,7 @@ def _graph_pool(model_runner, machine, model):
         ),
         budget_bytes=int(config.gpu_memory_utilization * capacity),
     )
-    return reserves(piecewise=capture), capture.taken()[1]
+    return reserves(piecewise=capture), captured
 
 
 def tokenizer(tok, config) -> None:
