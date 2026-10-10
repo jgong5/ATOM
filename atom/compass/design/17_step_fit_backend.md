@@ -18,7 +18,7 @@ non-graded evaluation on DeepSeek-V4-Pro. It does not cover tier b, the tier-a l
 D54 (DP-attention's tier a, [#529](https://github.com/jgong5/ATOM/issues/529)), or KV
 transfer (`01` D6).
 
-**Three deliberate departures**, each by owner ruling on #696. Every other conflict
+**Deliberate departures**, each by owner ruling on #696. Every other conflict
 between #626 and the decided design is resolved in the decided design's favour, and the
 decision that adopts it says which.
 
@@ -309,10 +309,10 @@ such recipe and comes after v1; it reads DCP's state as ATOM's own DCP helper re
 
 ### Identity
 
-- **A bundle is an artifact in `07` D41's sense**, beside D41's six: a key tuple plus a
-  content digest, the path only a location (D41 rule 1). The key is (model, device,
-  parallel configuration, the engine configuration the grid was planned for, source-root
-  digest).
+- **A bundle is an artifact in `07` D41's sense**, beside the artifacts that table lists:
+  a key tuple plus a content digest, the path only a location (D41 rule 1). The key is
+  (model, device, parallel configuration, the engine configuration the grid was planned
+  for, source-root digest).
 - **Immutable once handed off** (D41 rule 4). A changed coefficient is a new bundle, and
   accuracy reports are not inherited.
 - **#626's manifest** (digests, dependencies, a five-step load) is a proposal for `07`
@@ -328,7 +328,7 @@ covers all of them. A mismatch refuses. In particular a device or architecture m
 refuses (`08` D49 item 2), and drift in the ATOM source refuses rather than marking the
 bundle unverified.
 
-### Two kinds of condition
+### Keyed conditions and derived values
 
 - **Keyed conditions refuse on mismatch**: the key, D43's row, the graph mode, the
   ladder, block size, KV dtype, quantization, TP width, the chunk sizes a recipe reads,
