@@ -391,6 +391,39 @@ def test_a_request_failing_mid_stream_fails_the_hold_by_name(tmp_path, monkeypat
     )
 
 
+def test_a_slow_report_with_no_errored_request_keeps_the_hold_waiting(
+    tmp_path, monkeypatch
+):
+    """Credit 0's worker reports its released final, seq 0, six ``DIAG_S``
+    periods late and its request did not error: the hold waits for it."""
+    monkeypatch.setattr("compass_harness.traffic_lp.DIAG_S", 0.05)
+
+    async def main():
+        rt = ScriptedRuntime([(1.0, {0})])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        passed = []
+
+        async def on_return(worker_id, ret):
+            passed.append(ret.error)
+
+        held = traffic.hold(on_return)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(addresses(str(tmp_path / "lp"))[1])
+        traffic.send(_key(0))
+        await asyncio.sleep(0.3)
+        push.send_pyobj((_key(0), 0, 1.0, True))
+        await held("worker_0", SimpleNamespace(credit=_credit(0), error=None))
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 5)
+        finally:
+            push.close(linger=0)
+        return passed, rt.calls
+
+    passed, calls = _run(main())
+    assert passed == [None] and calls[-1] == INF
+
+
 def test_a_raising_return_callback_does_not_stop_later_returns(tmp_path, caplog):
     async def main():
         traffic = TrafficLP(ScriptedRuntime([]), str(tmp_path / "lp"))
