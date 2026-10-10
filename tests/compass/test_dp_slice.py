@@ -23,7 +23,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 from test_vertical_slice import (
-    HTTP,
     MODEL,
     NEEDS_A_RUN,
     TREE,
@@ -56,7 +55,7 @@ class Requests(Traffic):
         rt = self.rt
         rt.start_run()
         for i, n in enumerate(MAX_TOKENS):
-            self.sent, seq = rt.stamp_send(HTTP)
+            self.sent, seq = rt.stamp_send(self.http)
             self.open.add(i)
             body = {
                 "model": MODEL,
@@ -64,9 +63,8 @@ class Requests(Traffic):
                 "max_tokens": n,
                 "stream": True,
             }
-            self._carry(
-                "POST", "/v1/completions", body, tracestate_with(None, self.sent, seq)
-            )
+            stamp = tracestate_with(None, self.sent, seq)
+            self._carry("POST", "/v1/completions", body, stamp, self.port)
         while rt.next_event(math.inf) != math.inf:
             self._take()
         rt.close()
