@@ -128,6 +128,10 @@ def run_pd(out: Path, seed: str) -> dict:
     assert code == 0, f"pd_sim.sh exited {code}:\n{log.read_text()[-4000:]}"
     return {
         "table": (out / compass_run.STEP_TABLE_FILE).read_text(),
+        "summary": json.loads((out / compass_run.SUMMARY_FILE).read_text()),
+        "handed_in": sorted(
+            f.name for f in out.glob(compass_run.COMMANDS_FILE.format("*"))
+        ),
         "request": (traffic.sent, traffic.events[0][0], traffic.events[-1][0]),
         "events": traffic.events,
     }
@@ -165,6 +169,19 @@ def test_one_request_crosses_atomesh_to_prefill_and_decode(runs):
     finish = [r for r in rows if " inf " in r]
     assert sorted(r.split()[0] for r in finish) == LPS
     assert rows[-len(LPS) :] == finish
+
+
+@NEEDS_A_PD_RUN
+def test_the_run_summary_holds_every_server_lps_refusals(runs):
+    run = runs[0]
+    summary = run["summary"]
+    print("\nsummary:", json.dumps(summary, sort_keys=True))
+    assert run["handed_in"] == [compass_run.COMMANDS_FILE.format(lp) for lp in LPS[:-1]]
+    assert summary["schedule"]["grants_total"] > 0
+    assert summary["schedule"]["refusals"]["count"] == 0
+    assert summary["schedule"]["refusals"]["steps"] > 0
+    assert summary["coverage_report"] is False
+    assert 0 < summary["cost"]["wall_seconds"]
 
 
 @NEEDS_A_PD_RUN
@@ -332,10 +349,12 @@ def test_a_prefill_decode_frontend_joins_the_standalone_authority(
         authority.close()
 
 
-def test_the_standalone_authority_writes_the_step_table_at_the_finish(
+def test_the_standalone_authority_writes_the_step_table_at_the_finish_and_the_summary_once_every_server_lp_handed_in(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setenv(compass_run.ENV, str(_run_file(tmp_path, **PD)))
+    run = _run_file(tmp_path, **PD)
+    monkeypatch.setenv(compass_run.ENV, str(run))
+    monkeypatch.setattr(compass_run, "_authority", None)
     endpoint = f"tcp://127.0.0.1:{_free_port()}"
     serving = threading.Thread(
         target=compass_run.authority, args=(endpoint,), daemon=True
@@ -353,13 +372,48 @@ def test_the_standalone_authority_writes_the_step_table_at_the_finish(
     for conn in conns:
         conn.send((NER, INF, [], INF))
     assert [conn.recv()[0] for conn in conns] == [INF] * len(LPS)
-    serving.join(10)
-    assert not serving.is_alive()
-    rows = (tmp_path / compass_run.STEP_TABLE_FILE).read_text().splitlines()[1:]
+    table_file = tmp_path / compass_run.STEP_TABLE_FILE
+    while not table_file.exists():
+        assert time.monotonic() < deadline + 10, "no step table in 10 seconds"
+        time.sleep(0.05)
+    rows = table_file.read_text().splitlines()[1:]
     assert sorted(r.split()[0] for r in rows) == LPS
     assert all(r.split()[2] == "inf" for r in rows)
     for conn in conns:
         conn.close()
+
+    # Each server process hands in one refusal of each kind it holds.
+    table = compass_run.channel_table(json.loads(run.read_text()))
+    expected = []
+    for lp in LPS[:-1]:
+        rt = LPRuntime(LpId(lp), table, None)
+        rt.now = INF
+        rt.refusals.append(f"clock:advance_to on {lp}")
+        monkeypatch.setattr(clock, "_installed", rt)
+        if lp.startswith("engine"):
+            refused = [f"command:reset on {lp}"]
+            worker = SimpleNamespace(call_func=lambda name, wait_out, r=refused: r)
+            compass_run.engine_done(SimpleNamespace(runner_mgr=worker))
+        else:
+            assert not (tmp_path / compass_run.SUMMARY_FILE).exists()
+            refused = [f"executor:detok on {lp}"]
+            rt.loop = SimpleNamespace(executor=SimpleNamespace(refusals=refused))
+            assert compass_run.frontend_done(SimpleNamespace(close=lambda: None))
+        expected += [[refused[0], 1], [rt.refusals[0], 1]]
+    serving.join(10)
+    assert not serving.is_alive()
+    summary = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())
+    print("refusals:", json.dumps(summary["schedule"]["refusals"]))
+    assert summary["schedule"]["refusals"]["reasons"] == sorted(expected)
+    assert summary["coverage_report"] is True
+
+
+def test_a_summary_missing_a_server_lps_refusals_names_it(tmp_path, monkeypatch):
+    run = json.loads(_run_file(tmp_path, **PD).read_text())
+    monkeypatch.setattr(compass_run, "HAND_IN_WAIT_S", 0.2)
+    (tmp_path / compass_run.COMMANDS_FILE.format("engine-P")).write_text("[]")
+    with pytest.raises(TimeoutError, match="no commands-engine-D.json, commands-fr"):
+        compass_run._write_summary(run, compass_run._RecordingAuthority(run))
 
 
 def test_an_idle_engine_runs_at_once_a_request_a_finished_transfer_left_ready(
