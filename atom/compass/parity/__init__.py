@@ -32,7 +32,6 @@ import hashlib
 import json
 import os
 import pathlib
-import time
 from itertools import zip_longest
 
 import numpy as np
@@ -69,7 +68,7 @@ class StepRecord:
 
         The line is built before `forward` runs, since a real forward rewrites
         batch fields in place, and written after it returns, with `t_enter_ns`
-        and `t_exit_ns` read off the monotonic clock around it. Returns
+        and `t_exit_ns` read off `runner.step_clock_ns()` around it. Returns
         `forward`'s reply, or None without one.
         """
         from atom.compass.runner.projection import batch_view, forward_mode
@@ -123,9 +122,9 @@ class StepRecord:
         }
         reply = None
         if forward is not None:
-            line["t_enter_ns"] = time.monotonic_ns()
+            line["t_enter_ns"] = runner.step_clock_ns()
             reply = forward(batch)
-            line["t_exit_ns"] = time.monotonic_ns()
+            line["t_exit_ns"] = runner.step_clock_ns()
         with self.path.open("a") as f:
             f.write(json.dumps(line) + "\n")
         self.step += 1
@@ -161,7 +160,8 @@ class StepRecording:
 
     ATOM's `ModelRunner.__init__` warms up with a forward over a fabricated
     batch, which the simulated runner declines, so recording starts once
-    construction returns.
+    construction returns. The class it is composed into supplies
+    `step_clock_ns`, the clock its lines are timed by.
     """
 
     _recording = False

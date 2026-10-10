@@ -390,7 +390,7 @@ def test_the_mixin_records_from_the_first_forward_after_construction(
             return "ran"
 
     class _Recorded(StepRecording, _Base):
-        pass
+        step_clock_ns = staticmethod(time.monotonic_ns)
 
     monkeypatch.setenv(ENV, str(tmp_path / "out"))
     runner = _Recorded(0, _config())
@@ -422,7 +422,7 @@ def test_a_real_runner_records_the_batch_it_was_handed_and_times_its_forward(
             return "ran"
 
     class _Recorded(StepRecording, _Base):
-        pass
+        step_clock_ns = staticmethod(time.monotonic_ns)
 
     monkeypatch.setenv(ENV, str(tmp_path / "real"))
     runner = _Recorded(0, _config())
