@@ -20,6 +20,7 @@ from atom.compass.backends.shape import ShapeStubBackend
 from atom.compass.parity import ENV, StepRecording, compare, read
 from atom.compass.runner import overrides
 from atom.compass.runner.overrides import NonAllocatingRunner, install_cost_backend
+from atom.compass.runner.step_output import DeferredTokenStream
 from atom.model_engine.prefill_delayer import PrefillDelayer
 from atom.model_engine.scheduler import ScheduledBatch, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
@@ -55,6 +56,7 @@ class _Runner(NonAllocatingRunner):
     def __init__(self, config, rank=0):
         self.config, self.rank = config, rank
         install_cost_backend(self, ShapeStubBackend())
+        self._token_stream = DeferredTokenStream([0])
 
 
 @pytest.fixture(scope="module", autouse=True)

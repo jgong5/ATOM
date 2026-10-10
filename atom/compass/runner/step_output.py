@@ -59,24 +59,39 @@ from typing import Any
 import numpy as np
 
 
-def reported_token_id(eos_token_id: Any, stop_token_ids: Any) -> int:
-    """The id every predicted step reports for every request.
+def filler_token_ids(
+    tokenizer: Any, eos_token_id: Any, stop_token_ids: Any
+) -> list[int]:
+    """The ids a predicted step may report, one picked per request.
 
     A predicted step has no logits, so what a request generates is not modelled
-    -- only how many steps it takes to generate it. The scheduler still reads
-    these ids and ends a request that emits the end-of-text id or one of the
-    configured stop ids, so reporting either would cut every request short at
-    its first token and a predicted run would decide for itself the length it
-    was asked to predict. The lowest id that is neither is used, and requests
-    end on their token budget instead.
+    -- only how many steps it takes to generate it. Three readers still see the
+    ids. The scheduler ends a request that emits the end-of-text id or a
+    configured stop id, so either would cut every request short at its first
+    token. The serving path's stream detokenizer moves its window only when the
+    decoded text does not end in an incomplete character, so an id that decodes
+    to part of a UTF-8 sequence holds the window open and makes detokenizing a
+    stream quadratic in its length. And the prefix cache hashes generated
+    blocks, chained on the prompt's: one id for every request makes two
+    requests with a common prompt produce identical decode blocks, and the
+    second hits the first's where a real run would not.
+
+    So an id qualifies when it is not a stop id and decodes on its own, as the
+    stream detokenizer decodes it, to ASCII letters and digits. That excludes
+    every special token, which decodes to nothing there. Letters and digits
+    only: whitespace and punctuation are what per-request stop strings are
+    made of, and this runner never sees those.
     """
     stops = {int(t) for t in (stop_token_ids or ())}
     if eos_token_id is not None:
         stops.add(int(eos_token_id))
-    token_id = 0
-    while token_id in stops:
-        token_id += 1
-    return token_id
+    return [
+        token_id
+        for token_id in range(len(tokenizer))
+        if token_id not in stops
+        and (text := tokenizer.decode([token_id], skip_special_tokens=True)).isascii()
+        and text.isalnum()
+    ]
 
 
 def reports_previous_step(pipeline_parallel_size: Any) -> bool:
@@ -95,13 +110,13 @@ class DeferredTokenStream:
     """Carries one batch's reported tokens to the next output-producing step.
 
     One instance per runner, holding the single piece of state ATOM's own token
-    processor holds: the last batch that produced output. Nothing here is
-    per-request, because the lag is a property of the step sequence rather than
-    of any request in it.
+    processor holds: the last batch that produced output. The lag is a property
+    of the step sequence rather than of any request in it; only the id each
+    request is reported with depends on the request.
     """
 
-    def __init__(self, token_id: int, deferred: bool = True) -> None:
-        self.token_id = token_id
+    def __init__(self, token_ids: list[int], deferred: bool = True) -> None:
+        self.token_ids = token_ids
         self.deferred = deferred
         self.prev_batch: Any = None
 
@@ -146,9 +161,11 @@ class DeferredTokenStream:
         # one with it, which is why `overrides.forward` refuses a speculative
         # config rather than reporting these zeros for it.
         width = 0 if source is None else int(source.total_seqs_num)
+        # Picked by request id: requests fewer than len(ids) apart never share one.
+        ids = self.token_ids
         return {
             "req_ids": req_ids,
-            "token_ids": [(self.token_id,) for _ in req_ids],
+            "token_ids": [(ids[int(r) % len(ids)],) for r in req_ids],
             "num_rejected": np.zeros(width, dtype=np.int32),
             "num_bonus": np.zeros(width, dtype=np.int32),
             "draft_token_ids": None,

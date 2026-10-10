@@ -10,6 +10,7 @@ from typing import Any
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
+from atom.compass import run as compass_run
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.multimodal import get_mrope_input_positions
@@ -137,10 +138,11 @@ class LLMEngine:
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
-        if config.enable_rapidserve:
-            self.core_mgr = DisaggCoreManager(config)
-        else:
-            self.core_mgr = CoreManager(config)
+        with compass_run.frontend(config):
+            if config.enable_rapidserve:
+                self.core_mgr = DisaggCoreManager(config)
+            else:
+                self.core_mgr = CoreManager(config)
         self._step_lock = None
         self._pending_results = {}
         import json
