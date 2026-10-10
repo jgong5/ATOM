@@ -191,20 +191,27 @@ class ModelTerms:
         else:
             # Each token's routed experts and the shared ones are live at once.
             routed = int(_geometry(config, file, "num_experts_per_tok"))
-            klass = type(getattr(config, "text_config", config))
-            # An architecture's own config class with no shared-expert field
-            # (Qwen3MoeConfig) has no shared expert: 0 is its geometry. A bare
-            # PretrainedConfig, whose model_type is empty, names no architecture.
-            none = (
-                _stated(config, file, "n_shared_experts") is None
-                and getattr(klass, "model_type", "")
-                and not hasattr(klass, "n_shared_experts")
-                and not hasattr(klass, "shared_expert_intermediate_size")
-            )
-            if none:
+            text = getattr(config, "text_config", config)
+            klass = type(text)
+            named = sorted(k for k in {*vars(text), *dir(klass)} if "shared" in k)
+            shared, why = _stated(config, file, "n_shared_experts"), ""
+            if shared is None:
+                if named:
+                    raise MemoryRefusal(
+                        "this config states no `n_shared_experts`, and the "
+                        "memory model reads it",
+                        "state it in the model's config.json; this config "
+                        f"names a shared expert as {', '.join(named)}, which "
+                        "the memory model does not read as a count",
+                    )
+                if not klass.model_type:
+                    # A bare PretrainedConfig names no architecture.
+                    _geometry(config, file, "n_shared_experts")
+                # An architecture's own config class that names no shared
+                # expert, in its fields or in config.json (Qwen3MoeConfig),
+                # has none: 0 is its geometry.
                 shared, why = 0, f" ({klass.__name__} has none)"
-            else:
-                shared, why = int(_geometry(config, file, "n_shared_experts")), ""
+            shared = int(shared)
             intermediate = (routed + shared) * int(experts)
             live = (
                 f"({routed} num_experts_per_tok + {shared} n_shared_experts{why}) "

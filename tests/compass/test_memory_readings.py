@@ -719,13 +719,33 @@ def test_a_bare_config_with_no_shared_expert_count_is_refused():
         terms_of(config, raw)
 
 
-def test_a_class_with_a_shared_expert_width_field_is_refused(tmp_path):
-    # Qwen2MoeConfig sizes its shared expert by width, not by count.
-    raw = {**QWEN3_30B_A3B, "model_type": "qwen2_moe"}
-    config, config_json = loaded(tmp_path, raw)
-    assert type(config).__name__ == "Qwen2MoeConfig"
-    with pytest.raises(MemoryRefusal, match="states no `n_shared_experts`"):
+@pytest.mark.parametrize(
+    "extra,klass,named",
+    [
+        # A class that sizes its shared expert by width, not by count.
+        (
+            {"model_type": "qwen2_moe"},
+            "Qwen2MoeConfig",
+            "shared_expert_intermediate_size",
+        ),
+        # A class that counts its shared experts under another name.
+        ({"model_type": "exaone_moe"}, "ExaoneMoeConfig", "num_shared_experts"),
+        # A class with no shared-expert field, and a config.json that names one.
+        (
+            {"shared_expert_intermediate_size": 768},
+            "Qwen3MoeConfig",
+            "shared_expert_intermediate_size",
+        ),
+    ],
+)
+def test_a_config_naming_a_shared_expert_otherwise_is_refused(
+    tmp_path, extra, klass, named
+):
+    config, config_json = loaded(tmp_path, {**QWEN3_30B_A3B, **extra})
+    assert type(config).__name__ == klass
+    with pytest.raises(MemoryRefusal, match="states no `n_shared_experts`") as refusal:
         terms_of(config, config_json)
+    assert named in refusal.value.remedy
 
 
 def test_a_dense_model_through_atoms_loader_keeps_its_terms(tmp_path, qwen):
