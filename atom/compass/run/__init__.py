@@ -29,7 +29,8 @@ member, the frontend's included, connects to.
   the authority, then writes the step table and the run summary.
 
 Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
-``ipc_s``, ``stream_s``, ``coefficients`` (a `Coefficients` mapping),
+``ipc_s``, ``stream_s``, ``coefficients`` (a `Coefficients` mapping, priced by
+`ShapeStubBackend`) or ``law`` (a `CoarseLaw` mapping, priced by `CoarseBackend`),
 ``machine`` (a machine spec mapping), ``parameter_count``, and ``out_dir``,
 where the step table, the run summary and each server LP's refusals go: an
 engine's are the worker's refused commands and the engine's refused clock
@@ -353,6 +354,7 @@ def runner(model_runner) -> None:
         return
     from transformers import PretrainedConfig
 
+    from atom.compass.backends.coarse import CoarseBackend, CoarseLaw
     from atom.compass.backends.geometry import Parallelism
     from atom.compass.backends.shape import Coefficients, ShapeStubBackend
     from atom.compass.memory import ModelTerms, device_readings, predicts
@@ -365,14 +367,21 @@ def runner(model_runner) -> None:
 
     config = model_runner.config
     tp = config.tensor_parallel_size
-    install_cost_backend(
-        model_runner,
-        ShapeStubBackend(
+    keys = [k for k in ("coefficients", "law") if k in run]
+    if len(keys) != 1:
+        raise ValueError(
+            "a run file prices its steps from one of coefficients and law, and "
+            f"this one has {' and '.join(keys) or 'neither'}"
+        )
+    if "law" in run:
+        backend = CoarseBackend(CoarseLaw(run["law"]))
+    else:
+        backend = ShapeStubBackend(
             Coefficients(**run["coefficients"]),
             Parallelism(tp_size=tp),
             stack_layers=config.hf_config.num_hidden_layers,
-        ),
-    )
+        )
+    install_cost_backend(model_runner, backend)
     machine = MachineSpec.from_mapping(_width_keys(run["machine"]))
     config_json = PretrainedConfig.get_config_dict(config.model)[0]
     model = ModelTerms.from_declared_config(
