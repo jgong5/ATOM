@@ -424,6 +424,58 @@ def test_a_slow_report_with_no_errored_request_keeps_the_hold_waiting(
     assert passed == [None] and calls[-1] == INF
 
 
+class ScriptedConn:
+    """A Clock Authority connection whose grants are scripted: grant ``k``
+    releases stream seq ``k`` at ``k + 1``, then ``+inf`` ends the run. Each
+    clock call records how many released stream seqs the runtime still holds."""
+
+    def __init__(self, grants: int) -> None:
+        self.rt, self.grants, self.k, self.held_at_call = None, grants, 0, []
+
+    def send(self, msg) -> None:
+        self.held_at_call.append(len(self.rt.released[STREAM]))
+
+    def recv(self):
+        if self.k == self.grants:
+            return INF, {}
+        self.k += 1
+        return float(self.k), {STREAM: [(self.k - 1, float(self.k))]}
+
+
+def test_a_pass_scans_only_the_open_stream_events(tmp_path):
+    """Many requests, each with one final stream event, run through a real
+    runtime's grants: at every clock call the runtime holds no released event
+    the traffic LP has already handled."""
+    n = 200
+
+    async def main():
+        conn = ScriptedConn(n)
+        conn.rt = rt = LPRuntime(LpId("traffic"), TABLE, conn)
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        passed = []
+
+        async def on_return(worker_id, ret):
+            passed.append(ret.credit.id)
+
+        held = traffic.hold(on_return)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(addresses(str(tmp_path / "lp"))[1])
+        for num in range(n):
+            traffic.send(_key(num))
+            await held("worker_0", SimpleNamespace(credit=_credit(num), error=None))
+            push.send_pyobj((_key(num), num, float(num + 1), True))
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 10)
+        finally:
+            push.close(linger=0)
+        return passed, conn.held_at_call, rt
+
+    passed, held_at_call, rt = _run(main())
+    assert passed == list(range(n)) and rt.now == INF
+    assert held_at_call == [0] * (n + 1)
+
+
 def test_a_raising_return_callback_does_not_stop_later_returns(tmp_path, caplog):
     async def main():
         traffic = TrafficLP(ScriptedRuntime([]), str(tmp_path / "lp"))
