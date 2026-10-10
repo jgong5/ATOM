@@ -885,7 +885,8 @@ and a decode step is ~30x shorter.
 
 ### Problem
 
-`03_memory_and_kv_model.md` D16 requires a def-use liveness walk for the activation term.
+`03_memory_and_kv_model.md` D16 makes a def-use liveness walk the activation term's source
+once capture lands.
 The prior implementation was **observational** — `weakref.finalize` firing when the CUDA
 allocator reclaimed — and there is no allocator device-free.
 

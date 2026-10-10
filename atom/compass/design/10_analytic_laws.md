@@ -187,7 +187,7 @@ This is where tier 0 is strongest, because most terms are Class A.
 |---|---|---|---|
 | **weights** | A | ask a meta build, dedupe by storage | **exact at every width** — the existence proof |
 | **KV bytes/token** | A | layers × kv_heads/TP × head_dim × 2 × dtype | arithmetic |
-| **buffers** | A-ish | **recorded, not formula'd** | the formula matched the 0.6B and was **4× wrong** on the 27B |
+| **buffers** | A-ish | the declared formula over stated `config.json` fields, labelled declared, until a recording exists ([`03` D16's source table](03_memory_and_kv_model.md#the-source-of-each-term)) | the first formula matched the 0.6B and was **4× wrong** on the 27B |
 | **activations** | B | `k_model × tokens`, k measured on one real run per model and width; from geometry where no run exists | linear scaling is **validated** — a 3,494-token trace scaled to an independently measured 4,096-token peak at **+0.0% at TP=1/2/4**. Whether `k` itself is derivable from geometry is **untested**. |
 | **invisible scratch** | **C** | inside the measured `k` | kernel-internal. **0.1 KB/token on the 0.6B, 39.6 KB/token on the 27B** — worth the difference between −35.0% and +3.4% held out |
 | **`non_torch`, load residue** | **C** | — | no form fits; declared per width in the spec |

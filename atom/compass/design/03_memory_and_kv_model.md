@@ -461,8 +461,10 @@ term against the same term of a recorded real run, wired for stage 2's paired ru
   and bf16 parameters, and under DP-attention TP is 1 while the experts shard over the
   DP group, so at the nightly DeepSeek-V4-Pro DPA cell it was refused at 10.76x the card
   (#545).
-- **Buffers** — recorded, not formula'd. The formula that matched the 0.6B exactly was 4x
-  wrong on the 27B. Tested on a second model, failed, did not ship.
+- **Buffers** — the declared formula over fields `config.json` states, labelled declared,
+  until a recording exists (`ModelTerms.from_declared_config`,
+  [#701](https://github.com/jgong5/ATOM/issues/701)). The label is there because the
+  first formula, which matched the 0.6B exactly, was 4x wrong on the 27B (partial rotary).
 - **Activations** — until capture lands, the coefficient measured on a real run (the
   table above): the scaling in tokens is validated (`10` D67), and the reading is the one
   ATOM's `_estimate_cudagraph_overhead` takes, so the scratch is inside it. After that, a
