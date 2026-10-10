@@ -263,6 +263,8 @@ def runner(model_runner) -> None:
     run = spec()
     if run is None:
         return
+    from transformers import PretrainedConfig
+
     from atom.compass.backends.geometry import Parallelism
     from atom.compass.backends.shape import Coefficients, ShapeStubBackend
     from atom.compass.memory import ModelTerms, device_readings
@@ -288,6 +290,7 @@ def runner(model_runner) -> None:
         parameter_count=run["parameter_count"],
         tp_size=tp,
         warmup_tokens=config.max_num_batched_tokens,
+        config_json=PretrainedConfig.get_config_dict(config.model)[0],
     )
     install_device_readings(
         model_runner,
