@@ -96,6 +96,7 @@ python -m atom.entrypoints.openai_server \
     --compass-artifacts   ./compass-store \
     [--compass-clock-endpoint tcp://host:port] \
     [--compass-tier        b] \
+    [--compass-backend     step_fit] \
     [--compass-no-lazy-trace] \
     [--compass-on-refusal  mark|abort]
 ```
@@ -107,11 +108,13 @@ python -m atom.entrypoints.openai_server \
 | `--compass-artifacts` | artifact store root (`07` D41) | **none — refuses** |
 | `--compass-clock-endpoint` | where the Clock Authority listens. Absent means co-hosted in the API-server process (`01` D3.3). | co-hosted |
 | `--compass-tier` | `0`, `a` or `b`. Which cost model is asked; provenance records what each answer actually was. | `b` |
+| `--compass-backend` | `step_fit` selects topic `17`'s backend; valid only with `--compass-tier a` (`17` D103) | the tier's own |
 | `--compass-no-lazy-trace` | refuse an unknown structure rather than tracing it in-run (`02`) | lazy tracing on |
-| `--compass-on-refusal` | `mark` (record `provenance=refused`, continue) or `abort` | `mark` (`08` D50.1) |
+| `--compass-on-refusal` | `mark` (record `provenance=refused`, continue) or `abort` | `mark` (`08` D50.1); under step fit `abort`, and `mark` refuses (`17` D102) |
 | `--measure` | additionally run on a real GPU and record. **Never valid in an acceptance run** (`07` D42). | off |
 
-Eight flags, one of which is ATOM's. That is the whole engine-side surface.
+One of these is ATOM's; the table is the whole engine-side surface. `17` D103 added
+`--compass-backend`.
 
 ### Tool-side: the `compass` CLI
 
@@ -182,7 +185,7 @@ have changed.
 |---|---|---|
 | D78 | Three homes. A setting is Compass's only if it would be meaningless in a real ATOM run — which keeps the surface small by construction. | 2026-09-19 |
 | D79 | Precedence is CLI > env > artifact > **refuse**. No silent default for anything that changes a predicted number. The resolved configuration is echoed into every artifact. | 2026-09-19 |
-| D80 | Seven Compass flags plus ATOM's `--runner-qualname`; one `compass` executable whose subcommands mirror the calibration phases. Non-flags audited and recorded. | 2026-09-19 |
+| D80 | Seven Compass flags plus ATOM's `--runner-qualname`; one `compass` executable whose subcommands mirror the calibration phases. Non-flags audited and recorded. Extended by `17` D103 with `--compass-backend`, and by `17` D102 with `abort` as the default under step fit. | 2026-09-19; extended 2026-10-10 (`17`) |
 | D81 | The resolved configuration is part of every artifact, by value and never by reference. | 2026-09-19 |
 
 ---
