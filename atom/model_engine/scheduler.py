@@ -41,7 +41,7 @@ from atom.model_engine.state_runtime import (
     StateMaintenanceOps,
     StateRuntime,
 )
-from atom.utils import envs
+from atom.utils import clock, envs
 
 logger = logging.getLogger("atom")
 
@@ -847,6 +847,8 @@ class ScheduledBatchOutput:
         num_rejected: Per-request count of rejected speculative tokens.
         num_bonus: Per-request count of bonus accepted tokens.
         is_deferred_out: Whether output was deferred from a previous step.
+        predicted_s: The step's duration in seconds, as a runner that predicts
+            the step rather than running it prices it; None from a real forward.
     """
 
     def __init__(
@@ -860,6 +862,7 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        predicted_s: float | None = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -874,6 +877,7 @@ class ScheduledBatchOutput:
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
+        self.predicted_s = predicted_s
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
 
@@ -1191,7 +1195,7 @@ class Scheduler:
                 oldest_arrive = seq.arrive_time
         if oldest_arrive is None:
             return 0.0
-        return max(0.0, (time.time() - oldest_arrive) * 1000.0)
+        return max(0.0, (clock.now(time.time) - oldest_arrive) * 1000.0)
 
     def publish_kv_events(self) -> None:
         """Drain BlockManager's event log and publish as one EventBatch. Called
@@ -1471,7 +1475,7 @@ class Scheduler:
         # ---- Phase 2: new requests from waiting ----
         while (
             delayer_allows
-            and (self.delay_factor <= 0 or self._passed_delay(time.time()))
+            and (self.delay_factor <= 0 or self._passed_delay(clock.now(time.time)))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens
@@ -2685,7 +2689,7 @@ class Scheduler:
             # speculative tokens and cap/stop overflow have been removed. A
             # terminal response with no completion tokens must keep TTFT zero.
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
-                seq.first_token_time = time.time()
+                seq.first_token_time = clock.now(time.time)
 
             # Hash generated blocks. Deferred output: all tokens forwarded;
             # undeferred: last token not yet forwarded, so exclude it.
@@ -3015,14 +3019,14 @@ class Scheduler:
             )
             self.failed_recving_kv_req_ids.append(req_id)
 
-        for req_id in kv_connector_output.finished_loading or ():
+        for req_id in sorted(kv_connector_output.finished_loading or (), key=str):
             assert is_offload, "Only offload connector should update loading KV status"
             logger.debug("Finished offload KV load for request %s", req_id)
             if self._finish_aborted_load_cleanup(req_id):
                 continue
             self.finished_recving_kv_req_ids.append(req_id)
 
-        for req_id in kv_connector_output.failed_loading or ():
+        for req_id in sorted(kv_connector_output.failed_loading or (), key=str):
             assert (
                 is_offload
             ), "Only offload connector should update failed KV load status"
@@ -3034,8 +3038,8 @@ class Scheduler:
                 continue
             self.failed_recving_kv_req_ids.append(req_id)
 
-        finished_saving = kv_connector_output.finished_saving or ()
-        for req_id in kv_connector_output.finished_sending or ():
+        finished_saving = sorted(kv_connector_output.finished_saving or (), key=str)
+        for req_id in sorted(kv_connector_output.finished_sending or (), key=str):
             assert (
                 self.kv_connector.is_producer
             ), "Only producer should free blocks after sending KV"
@@ -3361,7 +3365,7 @@ class DecodeScheduler(Scheduler):
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
-            seq.first_token_time = time.time()
+            seq.first_token_time = clock.now(time.time)
             self.prefill_done.append(seq)
 
     def schedule(self):

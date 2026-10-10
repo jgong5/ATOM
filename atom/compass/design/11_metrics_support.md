@@ -31,21 +31,21 @@ Verified on `feature/atomcompass_new`:
 | metric families | **10 `GaugeMetricFamily`, 10 `CounterMetricFamily`** |
 | histograms / summaries | **none today** |
 | `.observe()` call sites | **none** (the `buckets=` hits in the tree are CUDA-graph query buckets, unrelated) |
-| API style | collector-style `prometheus_client.core.*MetricFamily` (`metrics.py:11-13`) |
+| API style | collector-style `prometheus_client.core.*MetricFamily` (`metrics.py::_AtomMetricsCollector.collect`) |
 | rate metrics (anything ÷ time) | **none.** The three that look like rates are not: `queued_prefill_tokens_per_rank` is per *rank*, `mtp_acceptance_rate` is a ratio of counts, `mtp_average_tokens_per_forward` is per *forward* |
 
-The pipeline: `EngineUtilityHandler.collect_metrics()` (`engine_utility.py:336-392`) →
-`push_metrics()` (`:322`) on the EngineCore busy loop → DP aggregation in
-`LLMEngine.get_metrics_statistics()` (`llm_engine.py:438-562`) → `_metrics_refresh_loop`
-(`api_server.py:1504-1526`) → `_AtomMetricsCollector` / `AtomMetricsExporter`
-(`atom/entrypoints/openai/metrics.py`) → `/metrics` (`api_server.py:2336-2344`).
+The pipeline: `EngineUtilityHandler.collect_metrics()` (`engine_utility.py`) →
+`push_metrics()` on the EngineCore busy loop → DP aggregation in
+`LLMEngine.get_metrics_statistics()` (`llm_engine.py`) → `_metrics_refresh_loop`
+(`api_server.py`) → `_AtomMetricsCollector` / `AtomMetricsExporter`
+(`atom/entrypoints/openai/metrics.py`) → `/metrics` (`api_server.py::metrics`).
 
 **Histograms are being added.** They are not present yet, which means this is the moment to
 influence how they land rather than retrofit them. See D73.
 
 ---
 
-## D72. Counters and gauges are valid by construction; their clocks are virtual
+## D72. Counters and gauges are valid by construction; their cadence is simulated time
 
 ### Why they are valid
 
@@ -54,63 +54,50 @@ influence how they land rather than retrofit them. See D73.
 run unmodified under simulation** (`03` D13). Nothing there is a timing read, and there are
 no rate denominators to correct.
 
-### The three clocks, and why all three are virtual
+### The two timers and the stamp, all on the LP clock
 
 ```python
-# engine_core.py:317-320   <- EngineCore.busy_loop, the engine LP's clock owner (DP loop: :698-701)
-now = time.monotonic()
+# EngineCore.busy_loop and DPEngineCoreProc.busy_loop (atom/model_engine/engine_core.py)
+now = clock.now(time.monotonic)
 if now >= next_metrics_push:
-    next_metrics_push = now + METRICS_PUSH_INTERVAL_S      # 5.0, engine_core.py:50
+    next_metrics_push = now + METRICS_PUSH_INTERVAL_S      # 5.0
     self.utility_handler.push_metrics()
 
-# api_server.py:1522       <- _metrics_refresh_loop, in the API-server process
-await asyncio.sleep(_METRICS_REFRESH_INTERVAL_SECONDS)     # 5.0, api_server.py:339
+# _metrics_refresh_loop (atom/entrypoints/openai/api_server.py), in the API-server process
+await asyncio.sleep(_METRICS_REFRESH_INTERVAL_SECONDS)     # 5.0
+await _refresh_metrics_once()
 
-# metrics.py:408           <- in the API-server process
-self._last_refresh = time.time()    # "when was this snapshot taken", returned by read()
+# AtomMetricsExporter.update (atom/entrypoints/openai/metrics.py)
+self._last_refresh = clock.now(time.time)   # "when was this snapshot taken", returned by read()
 ```
 
-**Decision: all three run on virtual time, and none goes on `01` D9's allowlist.**
+**Decision (owner ruling, 2026-10-02): the push and the refresh are timers on simulated
+time, declared daemon.** They follow `01` D5's rule like every other timer the CA can
+reach. The push reads the engine LP's clock through `atom.utils.clock.now`. The refresh
+sleeps on the frontend's event loop, whose `time()` is the frontend LP's clock (`01` D5.1),
+and `_last_refresh` stamps the simulated instant of the snapshot. As daemon deadlines they
+fire as usual but never keep a run alive: the run finishes when no essential work is left
+(`01` D3, #533). The frontend names its daemon timers in `DAEMON_TIMERS`
+(`atom/utils/compass_loop.py`).
 
-- **The push gate is a virtual timer.** Its clock read returns LP time, and
-  `next_metrics_push` is a local next event folded into the engine's idle-point (NER) time.
-  The push stays an ordinary message on the engine's output channel.
-- **The refresh loop is a virtual timer with no code change.** Under simulation the API
-  server's asyncio loop runs on virtual time, so this `sleep` is one.
-- **`_last_refresh` is a clock-read substitution** (`01` D9 item 2) and returns LP time:
-  *when, in virtual time, the snapshot was taken*. It is exported as
-  `atom:metrics_last_refresh_timestamp_seconds` (`metrics.py:41`), and the observer below
-  compares it against a virtual scrape time, so a staleness check reads true.
+The observer is in the simulation too: the traffic LP scrapes `/metrics` every
+`scrape_interval` of simulated time, a daemon timer of its own (`01` D9, item 13), so the
+scrape, the refresh, the push and the stamp share one clock.
 
-**Revised 2026-09-28.** This decision used to keep all three on the real clock, allowlisted,
-and to correct `01` D5's virtual push cadence; `01` D5 now stands. Neither reason held: a
-push every 5 virtual seconds at a 100× speed ratio is one small message per 50 ms of wall
-time, which changes how fast the simulator runs but not what it predicts, since every
-result is cost-model virtual time; and a snapshot goes stale on the wall clock only for
-someone watching the simulator on the wall clock, while the observer watches on simulated
-time.
+### This revises the first version of this decision
 
-### The observer: Prometheus's scrape, on simulated time
+The first version kept both clock reads on the real clock. Its reasons do not survive the
+ruling:
 
-A real deployment's Prometheus `GET`s `/metrics` every `scrape_interval`, and the
-simulation does the same. A periodic timer in the traffic LP (Compass code) fires every
-`scrape_interval` of simulated time, taken from the real deployment's configuration. It adds
-no LP, because the traffic LP's clock owner is already Compass's own event-driven code, and
-no channel, because `/metrics` is a real HTTP endpoint: the request rides
-`traffic->frontend:http` and the response `frontend->traffic:stream`. The frontend serves
-it at its arrival time from the exporter's current snapshot, which lags engine state by at
-most the push interval plus the IPC lookahead — the same lag, from the same source, as on a
-real system. Samples carry virtual timestamps. Idle stretches are not skipped: each firing
-is an event the Clock Authority grants, at the cost of a few extra grants per interval.
+| reason it gave | why it no longer holds |
+|---|---|
+| at 100× (idle-skipping) a 5 s virtual push is ~50 ms wall: **100× more pushes**, real load perturbing the measurement | emission never advances the virtual clock (D75), so the extra pushes cost wall time and change no simulated result |
+| at 0.3× (saturated) a 5 s virtual push is ~16.7 s wall, staler than the API server's real 5 s refresh | the refresh is on simulated time as well, so push and refresh keep their ratio at every speed |
+| a virtual `_last_refresh` read against wall time makes a scraper's staleness check nonsense | the scraper reads simulated time too (above) |
+| a redirected clock read in the engine's hot loop virtualizes the push whether or not that was intended | it is intended; the clock-source lint (`01` D1, detector (3)) treats both reads as substituted |
 
-### A periodic observer does not keep a run alive
-
-The push, the refresh and the scrape are all periodic timers, so every LP's next-event time
-stays finite and "every LP's next event is ∞" never holds. The run ends with its workload
-instead (`01` D3): once the traffic LP has sent every request, received every response and
-completed its last scrape, it calls `end_workload()`, whose `END` request makes the Clock
-Authority grant every LP to ∞. This is the usual discrete-event treatment of periodic
-statistics events.
+The simulated *timeline* still comes from D74's per-step sampling, not from the push
+cadence.
 
 ---
 
@@ -133,7 +120,7 @@ value derives from a clock delta is a site that must be on the virtual clock.
 
 ### The placement hazard
 
-The obvious place to feed a TTFT histogram is `api_server.py:936-943`, where ttft and tpot
+The obvious place to feed a TTFT histogram is `api_server.py::generate_async`, where ttft and tpot
 are already computed — from `time.time()` deltas in the API-server process. Under
 simulation those stamp **wall** time for an event that happened at a **simulated** instant.
 
@@ -248,8 +235,8 @@ what an operator's Prometheus would see, comparable with a real run's scrape at 
 
 The prior 27B cc-traces run was **106 prefill + 4,346 decode = ~4,450 steps over 267 s of
 virtual time**. At ~40 series that is ~178k data points for a whole run — trivial to buffer
-and to write. The transport still drains on the push timer of D72, so the ZMQ
-message **count** is unchanged; only the payload gets wider.
+and to write. The transport still drains on D72's push cadence, so the ZMQ message
+**count** is unchanged; only the payload gets wider.
 
 ```
   EngineCore (owns the virtual clock)
@@ -258,14 +245,14 @@ message **count** is unchanged; only the payload gets wider.
   |     snapshot = collect_metrics()    <- cheap   |
   |     buffer.append((virtual_ts, snapshot))      |
   |                                                |
-  |  virtual timer, every 5 VIRTUAL s  (D72)       |
+  |  daemon timer, every 5 SIMULATED s  (D72)      |
   |     push_metrics(buffer.drain())    <- costly  |
   +----------------------+-------------------------+
                          | same ZMQ, same message COUNT, bigger payload
                          v
    +---------------------------------------------+
    | API server                                  |
-   |   /metrics -> current values, D72 scrape    |  <- the scrape series
+   |   /metrics -> values, simulated-time scrape |  <- the traffic LP's daemon scrape (D72)
    |   run end  -> OpenMetrics text w/ virtual ts|  <- the simulated timeline
    +---------------------+-----------------------+
                          v
@@ -380,7 +367,7 @@ attach to where the number came from, not to how it is exposed.
 | **E — event tally** | a count incremented on an occurrence: requests finished, preemptions, tokens, histogram `_bucket` and `_count` | **valid by construction.** Monotone; sample per step. |
 | **D — duration** | a clock delta: TTFT, TPOT, step time, queue wait, histogram `_sum` over durations | **must be a simulated duration.** Audit the observation argument (D73). |
 | **R — rate** | a count divided by elapsed time | **do not export.** Export the underlying counter and let PromQL `rate()` compute it over virtual timestamps. If a rate must be exported, its denominator is virtual elapsed. |
-| **T — timestamp** | a wall-clock instant exported as a value: `process_start_time_seconds`, `_created`, `_last_refresh`, exemplar timestamps | **must declare its clock.** Usually real, because it describes the *process*; virtual if it describes the *run*, as `_last_refresh` does (D72). Never left implicit. |
+| **T — timestamp** | an instant exported as a value: `process_start_time_seconds`, `_created`, exemplar timestamps; `_last_refresh`, which stamps simulated time (D72) | **must declare its clock.** Usually real, because it describes the *process*; virtual if it describes the *run*. Never left implicit. |
 | **X — external** | measured outside the engine: GPU telemetry, host stats, the `server_metrics/` scraper | **invalid under simulation.** Refuse. |
 
 ATOM's current twenty metrics are all **S** or **E**, which is why D72's "valid by
@@ -419,7 +406,7 @@ Prometheus.
 
 | Hazard | Detail |
 |---|---|
-| **Summaries cannot be aggregated across DP ranks** | client-computed quantiles do not average. `LLMEngine.get_metrics_statistics()` (`llm_engine.py:438-562`) merges per-rank snapshots; summing histogram `_bucket` is valid, averaging summary quantiles is not. This is a general Prometheus truth that would bite ATOM whether or not Compass existed. |
+| **Summaries cannot be aggregated across DP ranks** | client-computed quantiles do not average. `LLMEngine.get_metrics_statistics()` (`llm_engine.py`) merges per-rank snapshots; summing histogram `_bucket` is valid, averaging summary quantiles is not. This is a general Prometheus truth that would bite ATOM whether or not Compass existed. |
 | **`_created` series** | opt-in — `CounterMetricFamily.add_metric(..., created=...)`. ATOM does not pass it today. If it starts, `created` is class **T** and must not be a wall-clock value inside a virtual-timeline block. |
 | **Exemplars** | `add_metric(..., exemplar=...)` exists and an `Exemplar` carries a timestamp. If trace linking is ever added, that timestamp is class **T**. |
 | **Counter resets** | PromQL `rate()`/`increase()` detect decreases as resets. Normal handling; no special treatment needed under backfill, provided timestamps are monotone in virtual time. |
@@ -435,7 +422,7 @@ openmetrics CONTENT_TYPE : application/openmetrics-text; version=1.0.0  <- what 
 ```
 
 `prometheus_client.openmetrics.exposition.generate_latest` exists. So D74's run-end writer
-uses **that**, not the `generate_latest` ATOM imports at `metrics.py:11`. The `/metrics`
+uses **that**, not the `generate_latest` ATOM imports in `metrics.py`. The `/metrics`
 endpoint keeps the text format it has.
 
 ### And the timestamp injection point already exists
@@ -461,9 +448,9 @@ infrastructure and add nothing" should mean in practice.
 | # | Decision | Date |
 |---|---|---|
 | D71 | Scope is ATOM's Prometheus engine metrics only. Harness metrics belong to `06`; simulator observability is run-artifact fields, not a metrics subsystem. | 2026-09-19 |
-| D72 | Counters and gauges are valid by construction. **All three metrics clocks are virtual:** the engine push gate and the API-server refresh loop are virtual timers, and `_last_refresh` is a clock-read substitution; none is allowlisted. A sim-time-aware observer in the traffic LP scrapes `/metrics` every `scrape_interval` of simulated time over the existing HTTP channels. The run ends with its workload (`end_workload`), so the periodic timers cannot keep it alive. | 2026-09-19; revised 2026-09-28 |
+| D72 | Counters and gauges are valid by construction. **The metrics push and refresh are timers on simulated time, declared daemon**, so they never keep a run alive (`01` D3, D5); `_last_refresh` stamps simulated time. | 2026-09-19; revised 2026-10-02 |
 | D73 | Histograms observe durations, so the clock audit extends from clock *reads* to observation *arguments*. Ask for classic histograms and for instrumentation that is handed a duration rather than computing one inline. | 2026-09-19 |
-| D74 | **Sample once per engine step** — virtual time is discrete-event, so state changes only at step boundaries and the per-step series is the ground truth. Transport on D72's push timer; coexists with D72's scrape series; write OpenMetrics with virtual timestamps; backfill into TSDB. Treat the real run identically, for overlay. | 2026-09-19; revised 2026-09-28 |
+| D74 | **Sample once per engine step** — virtual time is discrete-event, so state changes only at step boundaries and the per-step series is the ground truth. Transport on D72's push cadence; write OpenMetrics with virtual timestamps; backfill into TSDB. Treat the real run identically, for overlay. | 2026-09-19 |
 | D75 | Four classes of invalid metric, refused rather than reported. Emission never advances the virtual clock, and that is asserted. | 2026-09-19 |
 | D76 | The gauges supply `08`'s counting invariants for free; a histogram's `_count` is one too, and `_sum/_count` is a mean comparable at the noise floor. | 2026-09-19 |
 | D77 | Classify every metric by the **provenance of its value** (state, event tally, duration, rate, timestamp, external), not by its Prometheus type. Declare the class at construction; an unclassified metric refuses to export under simulation. The backfill writer uses the OpenMetrics serializer and the `timestamp=` argument that `add_metric` already provides. | 2026-09-19 |
@@ -483,4 +470,4 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T43 | Verify the backfill end to end — produce one block, load it, see the series in Grafana | the documented gotchas are silent ones (epoch-dated blocks, retention) |
 | T44 | Sanity-check histogram bucket ranges against simulated latencies | a quantile pinned to `+Inf` is worth catching once rather than discovering |
 | T45 | Tag ATOM's existing twenty metrics with their D77 class | ~20 tags; mechanical, but it is the gate for everything after |
-| T46 | Decide the DP-aggregation rule per class, and refuse summaries there | `llm_engine.py:438-562` merges per-rank snapshots; quantiles do not average |
+| T46 | Decide the DP-aggregation rule per class, and refuse summaries there | `llm_engine.py::LLMEngine.get_metrics_statistics` merges per-rank snapshots; quantiles do not average |

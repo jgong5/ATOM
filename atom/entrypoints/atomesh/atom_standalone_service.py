@@ -63,6 +63,7 @@ from atom.entrypoints.openai.tool_parser.registry import (
     resolve_tool_call_parser,
 )
 from atom.model_engine.sequence import new_token_ids
+from atom.utils import clock
 
 logger = logging.getLogger("atom")
 
@@ -490,7 +491,7 @@ class SingleRequestState:
         self.request_id = request_id
         self.tokenizer = tokenizer
         self.future = future
-        self.started_at = time.time()
+        self.started_at = clock.now(time.time)
         self.first_token_at: float | None = None
         self.last_token_at: float | None = None
         # An array for the same reason the engine's `token_ids` is one. It
@@ -512,7 +513,7 @@ class SingleRequestState:
             self.kv_transfer_output_meta_info = getattr(
                 request_output, "kv_transfer_params_output", None
             )
-            now = time.time()
+            now = clock.now(time.time)
             output_tokens = request_output.output_tokens or []
             if output_tokens:
                 if self.first_token_at is None:
@@ -521,7 +522,7 @@ class SingleRequestState:
                 self.token_ids.extend(output_tokens)
             if request_output.finished:
                 self.finish_reason = request_output.finish_reason
-                self.future.set_result([self._build_output(time.time())])
+                self.future.set_result([self._build_output(clock.now(time.time))])
 
     def _build_output(self, finished_at: float) -> dict[str, Any]:
         num_tokens_output = len(self.token_ids)
@@ -564,7 +565,7 @@ class FanoutRequestState:
         self.tokenizer = tokenizer
         self.future = future
         self.n = n
-        self.started_at = time.time()
+        self.started_at = clock.now(time.time)
         self.per_tokens = [new_token_ids() for _ in range(n)]
         self.per_first_token_at: list[float | None] = [None] * n
         self.per_last_token_at: list[float | None] = [None] * n
@@ -580,7 +581,7 @@ class FanoutRequestState:
         with self._lock:
             if self.future.done() or self.finished[index]:
                 return
-            now = time.time()
+            now = clock.now(time.time)
             output_tokens = request_output.output_tokens or []
             if output_tokens:
                 if self.per_first_token_at[index] is None:
@@ -591,7 +592,7 @@ class FanoutRequestState:
                 self.per_finish_reason[index] = request_output.finish_reason
                 self.finished[index] = True
                 if all(self.finished):
-                    self.future.set_result(self._build_outputs(time.time()))
+                    self.future.set_result(self._build_outputs(clock.now(time.time)))
 
     def _build_outputs(self, finished_at: float) -> list[dict[str, Any]]:
         outputs = []
@@ -905,7 +906,7 @@ class ChatCompletionStreamState:
         usage_chunk = {
             "id": self.request_id,
             "object": CHAT_COMPLETION_CHUNK_OBJECT,
-            "created": int(time.time()),
+            "created": int(clock.now(time.time)),
             "model": self.model_name,
             "usage": usage,
         }
@@ -1101,7 +1102,7 @@ class CompletionStreamState:
         usage_chunk = {
             "id": self.request_id,
             "object": TEXT_COMPLETION_OBJECT,
-            "created": int(time.time()),
+            "created": int(clock.now(time.time)),
             "model": self.model_name,
             "usage": usage,
         }

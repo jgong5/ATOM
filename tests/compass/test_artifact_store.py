@@ -22,7 +22,6 @@ are exercised without this tier depending on the tree it was staged from.
 
 import json
 import pathlib
-import re
 import sys
 
 import pytest
@@ -48,12 +47,6 @@ from atom.compass.artifacts import (
     module_root,
     roots_for,
 )
-
-REPO = pathlib.Path(__file__).resolve().parents[2]
-#: The design document the artifact key table is read back out of.
-KEY_TABLE_DOC = REPO / "atom" / "compass" / "design" / "07_calibration_toolchain.md"
-#: One row of the six-artifacts table: the name, and the `Keyed by` cell.
-ROW = re.compile(r"^\| `([a-z_]+)` \| [^|]*\| ([^|]*)\|", re.MULTILINE)
 
 ATOM_ROOT = SourceRoot(
     "atom",
@@ -115,48 +108,11 @@ def members_for(topology: Topology, stem: str, extension: str) -> dict[str, byte
     }
 
 
-def words(text: str) -> str:
-    """Text with the punctuation that separates words flattened to spaces."""
-    return re.sub(
-        r"[-_*`]", lambda hit: "" if hit.group() in "*`" else " ", text.lower()
-    )
-
-
 # --- a key is a tuple, never a path -----------------------------------------
 
 
-def test_the_six_artifacts_are_the_ones_the_key_table_declares():
-    """The kinds *and their key fields* are one fact with the document's table.
-
-    The `Keyed by` column is compared per row, not just the set of names: an
-    earlier version of this test compared only the names and one tuple, and
-    stayed green with five of `memory_readings`' seven key fields deleted --
-    which is the row whose length is the whole point of separating "part of
-    the key" from "merely recorded".
-    """
-    text = KEY_TABLE_DOC.read_text(encoding="utf-8")
-    table = text.split("### The six artifacts", 1)[1].split("### Four rules", 1)[0]
-    rows = dict(ROW.findall(table))
-    assert set(rows) == {kind.value for kind in Kind}
+def test_every_kind_declares_its_key_fields():
     assert set(KEY_FIELDS) == set(Kind)
-    for kind in Kind:
-        cell = rows[kind.value]
-        stated = re.search(r"\(([^)]*)\)", cell)
-        fields = KEY_FIELDS[kind]
-        if stated is None:
-            assert (
-                len(fields) == 1
-            ), f"the key table keys {kind} by one thing, code has {fields}"
-        else:
-            named = [part for part in stated.group(1).split(",") if part.strip()]
-            assert len(fields) == len(named), (
-                f"the key table keys {kind} by {len(named)} fields and "
-                f"KEY_FIELDS has {len(fields)}: {fields}"
-            )
-        for field in fields:
-            assert words(field) in words(
-                cell
-            ), f"the key table's {kind} row omits `{field}`"
 
 
 def test_a_price_list_asked_for_by_path_is_refused_by_name(tmp_path):

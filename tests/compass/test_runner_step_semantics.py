@@ -32,10 +32,15 @@ import pytest
 from conftest import MockConfig
 from test_runner_rpc_surface import SITES
 
-from atom.compass.runner.overrides import NonAllocatingRunner, RunnerRefusal
+from atom.compass.backends.shape import ShapeStubBackend
+from atom.compass.runner import overrides
+from atom.compass.runner.overrides import (
+    NonAllocatingRunner,
+    RunnerRefusal,
+    install_cost_backend,
+)
 from atom.compass.runner.step_output import (
     DeferredTokenStream,
-    reported_token_id,
     reports_previous_step,
 )
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
@@ -59,8 +64,16 @@ class _Runner(NonAllocatingRunner):
 
     def __init__(self, config, stream=None):
         self.config = config
-        if stream is not None:
-            self._token_stream = stream
+        install_cost_backend(self, ShapeStubBackend())
+        self._token_stream = DeferredTokenStream([0]) if stream is None else stream
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _unpriced():
+    """Reporting is under test here, not the price: `test_dp_step_max.py` prices."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(overrides, "_group_step_seconds", lambda *_: 0.0)
+        yield
 
 
 class _PerStep(DeferredTokenStream):
@@ -81,11 +94,13 @@ class _Eager(DeferredTokenStream):
 
 
 def _drive(stream=None, ignore_eos=True, stop_token_ids=(), **overrides):
-    """ATOM's engine step, run to completion, in `engine_core.py:382-412`'s order.
+    """ATOM's engine step, run to completion, in the engine's own order.
+
+    The order is `EngineCore._process_engine_step_inner`'s.
 
     `ignore_eos` is a parameter because it decides whether the scheduler's own
     end-of-text and stop-token checks run at all: both are gated on
-    `not seq.ignore_eos` (`scheduler.py:2630` and `:2633`), so a run that
+    `not seq.ignore_eos` (`Scheduler.postprocess`), so a run that
     leaves it True says nothing about the id this runner reports.
     """
     spec = {**STREAK, **overrides}
@@ -136,12 +151,12 @@ def _drive(stream=None, ignore_eos=True, stop_token_ids=(), **overrides):
                 if batch.is_final_chunk[i]:
                     final_chunk_at.setdefault(req_id, step)
         # Between `schedule()` and `forward` in the engine's own order
-        # (`engine_core.py:385`). It attaches the batch's attention aggregates
-        # in place and returns early unless profiling is active, so it moves
-        # nothing measured here -- it is called so that a successor extending
-        # this driver to a cost model inherits the loop and not a summary of
-        # it, since those aggregates are the batch-level attention terms such a
-        # model would read.
+        # (`EngineCore._process_engine_step_inner`). It attaches the batch's
+        # attention aggregates in place and returns early unless profiling is
+        # active, so it moves nothing measured here -- it is called so that a
+        # successor extending this driver to a cost model inherits the loop and
+        # not a summary of it, since those aggregates are the batch-level
+        # attention terms such a model would read.
         scheduler.compute_detailed_aggregates(batch, seqs)
         reply = runner.forward(batch)
         replies.append(reply)
@@ -212,7 +227,7 @@ def test_a_requests_tokens_surface_at_the_next_output_producing_step(run):
 
 def test_reporting_this_steps_tokens_strands_the_whole_prefill_streak():
     """No placeholder exists for them yet, so they are dropped and not re-offered."""
-    eager = _drive(stream=_Eager(0, deferred=True))
+    eager = _drive(stream=_Eager([0], deferred=True))
     assert eager.final_chunk_at == {0: 4, 1: 8, 2: 12, 3: 16}
     # Every one of them waits for the first batch that decodes it.
     assert set(eager.first_offer.values()) == {eager.output_steps[-4]}
@@ -220,7 +235,7 @@ def test_reporting_this_steps_tokens_strands_the_whole_prefill_streak():
 
 
 def test_counting_the_lag_in_steps_rather_than_meaningful_ones_surfaces_early():
-    per_step = _drive(stream=_PerStep(0, deferred=True))
+    per_step = _drive(stream=_PerStep([0], deferred=True))
     early = {r: s + 1 for r, s in per_step.final_chunk_at.items()}
     assert per_step.first_offer == early
     correct = _drive()
@@ -237,7 +252,7 @@ def test_counting_the_lag_in_steps_rather_than_meaningful_ones_surfaces_early():
 
 def test_a_middle_chunk_reports_its_requests_with_no_tokens(run):
     middle = [run.batches[s - 1] for s in run.middle_steps]
-    stream = DeferredTokenStream(7)
+    stream = DeferredTokenStream([7])
     for batch in middle:
         assert stream.step(batch) == {
             "req_ids": list(batch.req_ids),
@@ -287,7 +302,7 @@ def test_the_scheduler_cannot_tell_a_wrong_middle_chunk_reply_apart(run, wrong):
             if not self.is_pure_middle_chunk(batch):
                 return reply
             if wrong == "tokens":
-                reply["token_ids"] = [(self.token_id,) for _ in reply["req_ids"]]
+                reply["token_ids"] = [(self.token_ids[0],) for _ in reply["req_ids"]]
             elif wrong == "no_ids":
                 reply["req_ids"] = []
             else:
@@ -296,7 +311,7 @@ def test_the_scheduler_cannot_tell_a_wrong_middle_chunk_reply_apart(run, wrong):
                 reply["num_bonus"] = np.zeros(len(reply["req_ids"]), np.int32)
             return reply
 
-    silent = _drive(stream=_Wrong(0, deferred=True))
+    silent = _drive(stream=_Wrong([0], deferred=True))
     assert silent.offered_to == run.offered_to
     assert silent.middle_steps == run.middle_steps
 
@@ -304,17 +319,11 @@ def test_the_scheduler_cannot_tell_a_wrong_middle_chunk_reply_apart(run, wrong):
 # --- what the reply is made of, and what runs around it ----------------------
 
 
-def test_the_reported_token_is_never_one_that_would_end_a_request():
-    assert reported_token_id(2, []) == 0
-    assert reported_token_id(0, [1, 2]) == 3
-    assert reported_token_id(None, None) == 0
-
-
 def test_reporting_a_stop_id_lets_the_run_decide_the_length_it_predicts(run):
     """Driven with the scheduler's stop checks live, which the other runs are not.
 
     Every request in the default run sets `ignore_eos=True`, and both checks
-    are gated on `not seq.ignore_eos` (`scheduler.py:2630` and `:2633`). So
+    are gated on `not seq.ignore_eos` (`Scheduler.postprocess`). So
     that run would read exactly the same if every step reported the
     end-of-text id, and it is no evidence about the id this module picks. Here
     the checks run, against both ids they test for: reporting either one ends
@@ -327,29 +336,23 @@ def test_reporting_a_stop_id_lets_the_run_decide_the_length_it_predicts(run):
     assert len(live.batches) == len(run.batches)
     assert [s.num_completion_tokens for s in live.sequences] == [4] * 4
 
-    ends_on_eos = _drive(ignore_eos=False, stream=DeferredTokenStream(eos))
+    ends_on_eos = _drive(ignore_eos=False, stream=DeferredTokenStream([eos]))
     assert [s.leave_reason for s in ends_on_eos.sequences] == ["eos"] * 4
     assert len(ends_on_eos.batches) == 17
     assert [s.num_completion_tokens for s in ends_on_eos.sequences] == [1] * 4
 
-    # The same again for a configured stop id, and then the id the function
-    # answers for that config, driven through the same live checks.
+    # The same again for a configured stop id.
     ends_on_stop = _drive(
-        ignore_eos=False, stop_token_ids=(0,), stream=DeferredTokenStream(0)
+        ignore_eos=False, stop_token_ids=(0,), stream=DeferredTokenStream([0])
     )
     assert [s.leave_reason for s in ends_on_stop.sequences] == ["stop_0"] * 4
     assert len(ends_on_stop.batches) == 17
-
-    assert reported_token_id(eos, [0]) == 1
-    survives = _drive(ignore_eos=False, stop_token_ids=(0,))
-    assert [s.leave_reason for s in survives.sequences] == ["max_tokens"] * 4
-    assert len(survives.batches) == len(run.batches)
 
 
 def test_a_pipeline_stage_reports_the_step_it_ran(run):
     assert reports_previous_step(1) is True
     assert reports_previous_step(2) is False
-    staged = DeferredTokenStream(0, deferred=False)
+    staged = DeferredTokenStream([0], deferred=False)
     decode = run.batches[-1]
     reply = staged.step(decode)
     assert reply["req_ids"] == list(decode.req_ids)
@@ -414,7 +417,7 @@ def test_a_speculative_config_is_refused_before_the_drafter_is_built(run):
     assert ran == []
     # What the refusal is instead of: a reply nothing rejects, describing a run
     # in which nothing was drafted.
-    reply = DeferredTokenStream(0)._reply(run.batches[-1], deferred=True)
+    reply = DeferredTokenStream([0])._reply(run.batches[-1], deferred=True)
     assert reply["draft_token_ids"] is None
     assert not reply["num_rejected"].any() and not reply["num_bonus"].any()
     assert "if self.mtp_k > 0 and draft_token_ids is not None:" in SCHEDULER
@@ -423,8 +426,8 @@ def test_a_speculative_config_is_refused_before_the_drafter_is_built(run):
 def test_forward_never_answers_none_and_so_never_parks_its_caller(run):
     """A present method that answers None parks the caller exactly like an absent one.
 
-    `async_proc.py:243` is `if out is not None:` with both of the loop's
-    `put_nowait` calls inside it -- pinned as structure in
+    `AsyncIOProc.busy_loop` has both of its `put_nowait` calls inside
+    `if out is not None:` -- pinned as structure in
     `test_runner_rpc_surface.py`. This is the other side of that: the first
     method on this surface with a body that returns, and the property that its
     body has no way out that answers None.
@@ -453,17 +456,48 @@ def _decorators(path, class_name, name):
     return [ast.unparse(d) for d in _function(path, class_name, name).decorator_list]
 
 
+# The methods the reply is handed to whole. `postprocess` reads it under
+# `fwd_output`, which the walk below sees; `send_tokens` pickles it and reads
+# nothing. A hand-off to any other method is refused: it would read the reply
+# under a name this walk does not follow.
+HANDED_TO = ("postprocess", "send_tokens")
+
+
 def _reply_attribute_reads():
-    """Every attribute ATOM reads off a forward reply, from ATOM's own source."""
-    names = set()
+    """Every attribute ATOM reads off a forward reply, from ATOM's own source.
+
+    A read is `fwd_out.x` or `fwd_output.x`. The reply may also be handed on
+    whole -- passed positionally to one of `HANDED_TO`, returned, or tested
+    against `None`. Any other use of it, a `getattr`, an alias, a hand-off to
+    any other function or method, is refused by file and line: it
+    could read an attribute this set would never contain.
+    """
+    names, unread = set(), []
     for path in (REPO / "atom" / "model_engine").glob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text())):
-            if (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id in {"fwd_out", "fwd_output"}
+        tree = ast.parse(path.read_text())
+        parent = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Name)
+                and node.id in {"fwd_out", "fwd_output"}
+                and isinstance(node.ctx, ast.Load)
             ):
-                names.add(node.attr)
+                continue
+            up = parent[node]
+            handed_on = (
+                isinstance(up, ast.Return)
+                or ast.unparse(up) == f"{node.id} is None"
+                or (
+                    getattr(up, "func", None) is not None
+                    and getattr(up.func, "attr", None) in HANDED_TO
+                    and node in up.args
+                )
+            )
+            if isinstance(up, ast.Attribute):
+                names.add(up.attr)
+            elif not handed_on:
+                unread.append(f"{path.name}:{node.lineno}: {ast.unparse(up)}")
+    assert not unread, f"the forward reply is used in a form not read here: {unread}"
     return names
 
 

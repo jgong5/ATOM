@@ -9,7 +9,9 @@ written against it yet; implementation follows the execution plan in `16`.
 
 **Scope.** What speculative decoding — Eagle3, DSpark, and MTP heads — changes for a
 simulator, and why one of those changes is different in kind from everything else in this
-design.
+design. The draft path it prices is DeepSeek-V4-Pro's serial MTP, in M2 (D87, *Milestone
+placement*); Eagle3 and DSpark are described because ATOM carries them, and are not on
+M2's path.
 
 ---
 
@@ -43,7 +45,7 @@ reasons, before Compass existed.
 
 ### What is already in the tree
 
-`SpeculativeConfig` (`atom/config.py:1056-1078`) carries a synthetic-acceptance path added
+`SpeculativeConfig` (`atom/config.py`) carries a synthetic-acceptance path added
 for benchmarking against a published acceptance figure while a draft head is still
 training (ROCm/ATOM#555):
 
@@ -53,7 +55,7 @@ training (ROCm/ATOM#555):
 | `--spec-decode-acceptance-rate` (`synthetic_acceptance_rate`) | the same target as a mean rate in `[0,1]`, i.e. `(length − 1) / K`. Mutually exclusive with the above. |
 | `synthetic_acceptance_rates` | resolved by `__post_init__` into **per-position unconditional** rates: entry `i` is the marginal probability that the first `i+1` draft tokens are all accepted |
 
-The rejection sampler consumes them (`atom/model_ops/rejection_sampler.py:20-224`),
+The rejection sampler consumes them (`atom/model_ops/rejection_sampler.py::rejection_sample`, `atom/model_ops/rejection_sampler.py::_get_synthetic_cond_rates`),
 converting unconditional to conditional rates because the kernel walks positions
 sequentially, and force-accepting accordingly.
 
@@ -65,13 +67,13 @@ sequentially, and force-accepting accordingly.
 ### The sampler is a cost and a value, and only one of them can be traced
 
 `rejection_synthetic_sample_kernel` is a **Triton kernel**
-(`rejection_sampler.py:334`). Under Compass no kernel runs. So the sampler has to be
+(`rejection_sampler.py`). Under Compass no kernel runs. So the sampler has to be
 split into two halves that are handled differently:
 
 | Half | What it is | Treatment |
 |---|---|---|
 | **cost** | the kernel's duration | **Traced and priced like any other operator** — the sampler is dispatcher-visible and goes through `07` Phase 1b with everything else. Nothing special. |
-| **value** | `num_bonus_tokens` per sequence, written by `tl.store(num_bonus_tokens_ptr + req_idx, …)` (`:330`) | **Cannot be traced.** Compass needs the number itself — the scheduler updates `num_computed_tokens` from it, decides `max_tokens` completion from it, and sizes the next step from it. Without the value the simulation cannot advance. |
+| **value** | `num_bonus_tokens` per sequence, written by `tl.store(num_bonus_tokens_ptr + req_idx, …)` (`rejection_sampler.py::rejection_synthetic_sample_kernel`) | **Cannot be traced.** Compass needs the number itself — the scheduler updates `num_computed_tokens` from it, decides `max_tokens` completion from it, and sizes the next step from it. Without the value the simulation cannot advance. |
 
 So there is exactly one thing Compass must reimplement, and it is small:
 
@@ -79,9 +81,9 @@ So there is exactly one thing Compass must reimplement, and it is small:
 > compare a uniform against the conditional acceptance rate, stop at the first reject.**
 
 That is the whole of `rejection_synthetic_sample_kernel`'s logic
-(`:334-390`) — a sequential walk, no reduction, no tensor algebra. The conditional-rate
+— a sequential walk, no reduction, no tensor algebra. The conditional-rate
 conversion it consumes is *already host Python*
-(`_get_synthetic_cond_rates`, and `acceptance_length_to_rates` at `:52-75`), so only the
+(`_get_synthetic_cond_rates`, and `acceptance_length_to_rates`), so only the
 walk moves. Estimated at ~15 lines.
 
 **The rank-consistency machinery does not need reproducing, and this is the one place the
@@ -178,7 +180,7 @@ For contract 2, the flow:
 
 ```
   real run  --->  SpecStats.distribution       (dict: accepted_count -> occurrences,
-                  scheduler.py:49-74)           maintained per sequence per step)
+                  scheduler.py)                 maintained per sequence per step)
                         |
                         v
             per-position unconditional rates    P(first i+1 all accepted)
@@ -193,10 +195,10 @@ For contract 2, the flow:
 ### The transport for a list does not exist yet
 
 `synthetic_acceptance_rates` is a `list[float]` on `SpeculativeConfig`
-(`config.py:1077`), but it is **internal and derived** — filled by `__post_init__` from
-`acceptance_length_to_rates(length, n)` (`config.py:1184`). The CLI exposes only the two
+(`config.py`), but it is **internal and derived** — filled by `__post_init__` from
+`acceptance_length_to_rates(length, n)` (`config.py::SpeculativeConfig._resolve_synthetic_acceptance`). The CLI exposes only the two
 **scalars** — `--spec-decode-acceptance-length` and
-`--spec-decode-acceptance-rate` (`arg_utils.py:359,373`). There is no input path for a
+`--spec-decode-acceptance-rate` (`arg_utils.py::EngineArgs.add_cli_args`). There is no input path for a
 list, so contract 2 has nowhere to put its measurement.
 
 **The fix is an ATOM flag, not a Compass one**, by `13` D78's own test: a per-position
@@ -251,7 +253,7 @@ decode can no longer be priced by a form that assumes one token per row.
 > non-speculative decode be the `N_Q = 1` case.**
 
 The features are already on the batch: `detailed_sqsq`, `detailed_sqsk` and `detailed_sk`
-(`scheduler.py:790-792`) are `Σ N_Q²`, `Σ N_Q·N_KV` and `Σ N_KV`, computed by
+(`scheduler.py::ScheduledBatch`) are `Σ N_Q²`, `Σ N_Q·N_KV` and `Σ N_KV`, computed by
 `compute_detailed_aggregates`.
 
 ### What *is* new
@@ -260,7 +262,7 @@ The features are already on the batch: `detailed_sqsq`, `detailed_sqsk` and `det
 |---|---|
 | **draft forwards** | their own structures. Eagle3 and standalone DSpark run a real layer stack per drafting step; serial MTP reuses one layer `mtp_k` times. `07` Phase 0 discovers both. |
 | **rejection sampler** | an ordinary operator, priced by `07` Phase 1b. Small, but it is per step and it is not free. |
-| **`num_spec_steps`** | on `SpecDecodeMetadata` (`forward_context.py:170-176`); part of the structure key, because `K` changes the graph. |
+| **`num_spec_steps`** | on `SpecDecodeMetadata` (`forward_context.py`); part of the structure key, because `K` changes the graph. |
 | **CUDA-graph rungs** | the capture ladder is over `running_bs`, and a spec step's token count is `running_bs × (K+1)`. Rung padding is computed from the real ladder, as ever — but the rung set a spec run captures differs from a dense one, so `07` Phase 2's memory readings must be taken **with spec enabled**. |
 
 ---
@@ -271,7 +273,7 @@ Draft models add:
 
 | Term | Source |
 |---|---|
-| **draft weights** | Class A, exact from the draft's own HF config. `_MTP_CONFIG` (`config.py:1090-1096`) names the architecture and the `n_predict` attribute per model type. |
+| **draft weights** | Class A, exact from the draft's own HF config. `_MTP_CONFIG` (`config.py`) names the architecture and the `n_predict` attribute per model type. |
 | **draft KV layers** | `model_runner.py::ModelRunner._num_draft_kv_layers` — **the single source of truth, and it is already called out as such in the code.** A draft with a real layer stack (Eagle3, standalone DSpark) needs one slot per layer; serial MTP declares `num_nextn_predict_layers`. |
 
 Two properties inherited rather than designed, both consequences of `03` D13's decision to
@@ -338,14 +340,25 @@ A new hygiene refusal for `08` D49: **a speculative acceptance cell run at tier 
 
 ### Milestone placement
 
-Not named in M1–M7, so it needs one. Recommendation:
+**M2, on DeepSeek-V4-Pro** (`16` D95). MTP runs in two of the nightly configurations M2
+grades, TP + MTP3 and DP-attention + MTP1 (`recipes/mesh/DeepSeek-V4.md`), so it enters
+with the model and is not a milestone of its own. The earlier placement, a mechanism check
+on Qwen3.8-27B and the claim on Kimi-K3, was retired with those milestones.
 
-| Where | Why |
-|---|---|
-| **Mechanism at M2/M3** (Qwen3.8-27B) | `qwen3_5` maps to `qwen3_5_mtp` in `_MTP_TYPE_MAP`, so the target model has an MTP path. Validating the structure/shape/memory changes here is cheap and keeps M5 from carrying two new variables at once. |
-| **The real claim at M5/M6** (Kimi-K3) | MTP is native to this model class and is how it would actually be deployed. |
+**The draft path priced is DeepSeek-V4-Pro's serial MTP**, as ATOM builds it:
 
-Adding it as **M3.5** rather than extending M3 keeps the milestone's own acceptance clean.
+| Item | In ATOM | For this topic |
+|---|---|---|
+| draft model | `deepseek_v4` maps to `deepseek_v4_mtp` (`SpeculativeConfig._MTP_TYPE_MAP`), built as `DeepseekV4MTPModel` (`atom/models/deepseek_v4_mtp.py`). A DSpark checkpoint is routed elsewhere by `SpeculativeConfig.hf_config_override` | serial MTP, not a draft stack |
+| draft steps | `hf_config_override` sets `num_nextn_predict_layers` to 1; the one `MTPBlock` runs `mtp_k` times, `K = --num-speculative-tokens`, 3 or 1 in the nightly cells | one draft structure per drafting step (D85); T60 is the serial case |
+| draft forward | `MTPBlock` subclasses V4's `Block` (the target's attention and MoE classes), adds `e_proj`, `h_proj`, three norms and its own `hc_head` parameters, and reads the target's un-reduced mHC residual | traced and priced like any structure (D85) |
+| draft weights | the MTP block only: `DeepseekV4MTP.share_with_target` binds the embedding and LM head to the target's | D86's weight term excludes both |
+| draft KV | one slot (`_num_draft_kv_layers` returns `num_nextn_predict_layers`) in the target's pool, at index `n_layers` (`mtp_start_layer_idx`) | D86 as written: call the method |
+
+**Every M2 MTP cell is an acceptance cell.** Its per-position rates are measured from the
+paired real run, tier 1 of D84 (`16` W4.7), and never declared. Tier 1 needs T63's
+transport, so T63 is on M2's path. For MTP1 the curve has one position and the mean
+carries it whole; MTP3 is where its shape matters.
 
 ---
 
@@ -353,11 +366,13 @@ Adding it as **M3.5** rather than extending M3 keeps the milestone's own accepta
 
 - **`ATOM_ENABLE_RELAXED_MTP` changes acceptance semantics**, not just its rate —
   `RELAXED_TOP_N` goes 1 → 10 and `RELAXED_DELTA` 0 → 0.6
-  (`rejection_sampler.py:10-17`). It is an environment variable, so it is invisible to
+  (`rejection_sampler.py`). It is an environment variable, so it is invisible to
   every artifact key today. It must be captured in the run fingerprint or two runs with
   different acceptance semantics will compare as one. Recorded as **T59**.
-- **The DSpark hang of `04` T52 lives in this subsystem** (`dspark_scheduler.py:264`).
-  Root-causing it is already a gating task; it is now also on this topic's critical path.
+- **The DSpark hang of `04` T52 was observed in this subsystem** (`dspark_scheduler.py::schedule_prefix_lengths_tensor`,
+  while the function was written; the landed function builds that value with `torch.full_like`, which avoids the call that hung).
+  Root-causing it is already a gating task (`16` P0.7). DSpark is not the draft path M2
+  prices, so the hang is not on this topic's path to M2.
 - **Whether a draft forward's cost transfers across `K`** is untested. A serial MTP reusing
   one layer `mtp_k` times should be linear in `K`; a real draft stack need not be. One
   measurement at two values of `K` settles it. Recorded as **T60**.

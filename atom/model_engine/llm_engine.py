@@ -10,12 +10,13 @@ from typing import Any
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
+from atom.compass import run as compass_run
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
-from atom.utils import envs
+from atom.utils import clock, envs
 
 logger = logging.getLogger("atom")
 
@@ -137,10 +138,11 @@ class LLMEngine:
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
-        if config.enable_rapidserve:
-            self.core_mgr = DisaggCoreManager(config)
-        else:
-            self.core_mgr = CoreManager(config)
+        with compass_run.frontend(config):
+            if config.enable_rapidserve:
+                self.core_mgr = DisaggCoreManager(config)
+            else:
+                self.core_mgr = CoreManager(config)
         self._step_lock = None
         self._pending_results = {}
         import json
@@ -160,6 +162,7 @@ class LLMEngine:
 
     def close(self):
         """Shut down engine and release all GPU resources."""
+        clock.finish()
         if hasattr(self, "core_mgr"):
             self.core_mgr.close()
 
@@ -742,7 +745,7 @@ class InputOutputProcessor:
                 dp_session_id=dp_session_id,
                 dp_parent_session_id=dp_parent_session_id,
             )
-            seq.arrive_time = time.time()
+            seq.arrive_time = clock.now(time.time)
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:
                 self._external_to_internal[seq.external_request_id] = seq.id
@@ -774,7 +777,7 @@ class InputOutputProcessor:
             if external_request_id is not None:
                 self._external_to_internal.pop(external_request_id, None)
             output_str = self.tokenizer.decode(req.completion_token_ids)
-            req.leave_time = time.time()
+            req.leave_time = clock.now(time.time)
 
             # Calculate TTFT (Time To First Token) and TPOT (Time Per Output Token)
             ttft = 0.0
