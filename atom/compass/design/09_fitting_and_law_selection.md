@@ -87,12 +87,14 @@ DP and EP with a **per-rank** law: it prices one rank's step, and the group's st
 - **Key.** `(dp, ep)`. A law fitted at one pair is not evidence about another, by the
   per-width discipline of `15` D89.
 - **Features.** The rank's own batch features (D55), plus two the group decides: the
-  DP-unified rung every rank shares, settled by `ForwardMode.decide`, and `T_moe`, the
-  rows the MoE gather carries (`15` D90). The MoE terms read `T_moe` only.
-- **The capture.** Full-engine steps on a real DP+EP deployment, logging per forward each
-  rank's batch features and `T_moe` beside the measured step seconds. Under DP-attention
-  each rank runs at TP 1, so this stays within the TP1-only full-engine calibration of
-  `07` D38.
+  DP-unified rung every rank shares, settled by `ForwardMode.decide`, and the MoE row
+  count, which the MoE terms read alone. With EP off that count is `T_moe`, the rows the
+  group's MoE gather carries; with EP on it is open (`15` D90).
+- **The capture.** Full-engine steps on a real deployment at the law's `(dp, ep)`,
+  logging per forward each rank's batch features and the MoE row count beside the
+  measured step seconds. Under DP-attention the local segment runs at TP 1, as in the
+  TP1-only full-engine calibration of `07` D38; with EP off the MoE segment does not,
+  since `flatten_tp_across_dp` shards every expert `dp` ways.
 - **The fit: alternating max-affine regression.** The ranks wait for each other inside the
   forward, so a rank's measured step is the group's step and its own cost is never seen:
   the observation is `y = max_r f(x_r)`. The fit alternates two moves until no step
@@ -325,13 +327,13 @@ Consequence, already in `07` D39: calibration batches are **replayed** from the 
 scheduler's step table, with explicit `block_tables`. Hand-built ladders are grouped by
 construction.
 
-**Declared treatment: uniform routing** (owner's DP ruling, 2026-10-01). Under DP and EP
-the MoE segment (dispatch, experts, combine) is priced from `T_moe` as if routing spread
-tokens evenly over the expert ranks, in every tier. Real routing is data-dependent
-(`15` D92 Q2) and no feature carries it, so whatever skew a capture's routing has is
-folded into the fitted MoE terms. Under this treatment `max` over ranks equals the
-per-layer critical path (`15` D90); where routing is not uniform, `max` underestimates
-the step, and that is a declared limit rather than a modelled effect.
+**Declared treatment: uniform routing** (owner's DP ruling, 2026-10-01). Under DP the
+MoE segment is priced as if routing spread tokens evenly over the experts, in every
+tier, from `T_moe` with EP off; with EP on its row count is open (`15` D90). Real
+routing is data-dependent (`15` D92 Q2) and no feature carries it, so whatever skew a
+capture's routing has is folded into the fitted MoE terms. `max` over ranks is the
+per-layer critical path, by construction with EP off and under this treatment with EP on
+(`15` D90); where routing is not uniform under EP, `max` underestimates the step.
 
 **Suspected treatments to check before fitting:** raggedness (workload-dependent, and it
 was a zero column for 2,997 samples), cached fraction, and the prefill chunk's position in
@@ -377,7 +379,7 @@ choice that must be visible.
 | # | Decision | Date |
 |---|---|---|
 | D53 | Fit relative error, not absolute seconds. MAD outlier test on the same relative residuals. | 2026-09-18 |
-| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under DP and EP, tier a is one per-rank law keyed by `(dp, ep)`, with the DP-unified rung and `T_moe` as features, captured on a real DP+EP deployment and fitted by alternating max-affine regression. | 2026-09-18; revised 2026-10-01 |
+| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under DP and EP, tier a is one per-rank law keyed by `(dp, ep)`, with the DP-unified rung and the MoE row count as features (`T_moe` with EP off; open with EP on), captured on a real deployment at that `(dp, ep)` and fitted by alternating max-affine regression. | 2026-09-18; revised 2026-10-01 and 2026-10-09 (`T_moe`, #502) |
 | D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. | 2026-09-18 |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |

@@ -280,9 +280,16 @@ def test_both_filters_in_the_derivation_drop_nothing():
     dropped sets are empty turns both filters from a silent exclusion into a
     tripwire -- an f-string call site, or a compass-side broadcast, fails here
     and has to be accounted for rather than vanishing.
+
+    One compass-side broadcast is accounted for: the run bootstrap reads the
+    Compass runner's refusal tally, `refused_commands`, which no ATOM site
+    sends and so no `ModelRunner` is ever asked for.
     """
     assert NON_LITERAL == []
-    assert FROM_COMPASS == []
+    assert [where.rsplit(":", 1)[0] for where in FROM_COMPASS] == [
+        "atom/compass/run/__init__.py"
+    ]
+    assert "refused_commands" not in SITES
 
 
 def test_every_reply_is_taken_in_a_shape_the_arity_reads():

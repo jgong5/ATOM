@@ -10,6 +10,7 @@ from contextlib import ExitStack
 
 import torch
 
+from atom.compass import run as compass_run
 from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
@@ -289,16 +290,17 @@ class EngineCore:
 
         engine: EngineCore = None
         try:
-            if config.pipeline_parallel_size > 1:
-                from atom.model_engine.pp_engine_core import PPEngineCoreProc
+            with compass_run.engine(config):
+                if config.pipeline_parallel_size > 1:
+                    from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
-                engine = PPEngineCoreProc(config, input_address, output_address)
-            elif config.parallel_config.data_parallel_size > 1:
-                engine = DPEngineCoreProc(config, input_address, output_address)
-            else:
-                engine = EngineCore(config, input_address, output_address)
+                    engine = PPEngineCoreProc(config, input_address, output_address)
+                elif config.parallel_config.data_parallel_size > 1:
+                    engine = DPEngineCoreProc(config, input_address, output_address)
+                else:
+                    engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
-            clock.close()
+            compass_run.engine_done(engine)
         except Exception as e:
             logger.error(f"run_engine: exception: {e}", exc_info=True)
             raise e
