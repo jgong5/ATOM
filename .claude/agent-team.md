@@ -103,6 +103,11 @@ own `gh` login. Ownership is the assignee:
   caller outside `tests/` and on up to an entry point; a violation is a
   required finding and blocks APPROVE until the PR wires or deletes the
   code.
+- **Labels.** An issue or PR gets its `module: compass-*` and `dev-process`
+  labels from the `compass-labels` skill
+  (`.claude/skills/compass-labels/SKILL.md`): run
+  `compass_labels.py pr <N> --apply` when it is created, and again whenever a
+  PR round adds files the opening round did not touch.
 - **Inline comments.** `pr_state.py` and the issue-comments endpoint do not
   show inline comments (`pulls/<n>/comments`), and owners review with them.
   Read both endpoints before acting on a PR, and answer every inline
