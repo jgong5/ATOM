@@ -99,6 +99,7 @@ echo "pd_sim: ready"
 rc=0
 wait $prefill || rc=$?
 wait $decode || rc=$?
-# The authority leaves at the finish, once it has written the step table.
+# The authority leaves at the finish, once it has written the step table and
+# the run summary.
 ((rc != 0)) || wait $authority || rc=$?
 exit $rc
