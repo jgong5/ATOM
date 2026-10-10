@@ -246,14 +246,15 @@ def test_the_authority_joins_the_ranks_and_releases_each_its_own_channels(tmp_pa
     ]
 
 
-def test_every_ranks_refusals_reach_the_run_summary(monkeypatch, tmp_path):
+def _finish(monkeypatch, tmp_path, ranks):
+    """`engine_done` on each of `ranks` of a two-rank run, then `frontend_done`."""
     run = json.loads(_run_file(tmp_path, data_parallel_size=2).read_text())
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     table = compass_run.channel_table(run)
     engine = LPRuntime(compass_run.ENGINE, table, None)
     engine.now = math.inf
     monkeypatch.setattr(clock, "_installed", engine)
-    for rank in (0, 1):
+    for rank in ranks:
         monkeypatch.setattr(compass_run, "_member", f"dp{rank}")
         refused = (f"command:on dp{rank}",)
         worker = SimpleNamespace(call_func=lambda name, wait_out, r=refused: r)
@@ -266,13 +267,34 @@ def test_every_ranks_refusals_reach_the_run_summary(monkeypatch, tmp_path):
     frontend.now = math.inf
     frontend.loop = SimpleNamespace(executor=SimpleNamespace(refusals=[]))
     monkeypatch.setattr(clock, "_installed", frontend)
-    assert compass_run.frontend_done(SimpleNamespace(close=lambda: None))
+    return compass_run.frontend_done(SimpleNamespace(close=lambda: None))
+
+
+def test_every_ranks_refusals_reach_the_run_summary(monkeypatch, tmp_path):
+    # A rank file of another run in a reused out_dir is not this run's.
+    (tmp_path / "commands.dp7.json").write_text('["command:an earlier run"]')
+    assert _finish(monkeypatch, tmp_path, (0, 1))
 
     summary = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())
     assert summary["schedule"]["refusals"]["reasons"] == [
         ["command:on dp0", 1],
         ["command:on dp1", 1],
     ]
+
+
+def test_a_rank_that_wrote_no_refusal_record_fails_the_summary(monkeypatch, tmp_path):
+    with pytest.raises(FileNotFoundError, match="commands.dp0.json"):
+        _finish(monkeypatch, tmp_path, (1,))
+    assert not (tmp_path / compass_run.SUMMARY_FILE).exists()
+
+
+def test_fake_eplb_is_refused_at_dp_width_above_one(monkeypatch, tmp_path):
+    monkeypatch.setenv(compass_run.ENV, str(_run_file(tmp_path, data_parallel_size=2)))
+    deployment = _deployment(tp=2, dp_attention=True)
+    deployment.fake_eplb = True
+    with pytest.raises(ValueError, match="--fake-eplb"):
+        compass_run.frontend(deployment)
+    assert clock.installed() is None
 
 
 def test_a_dp_rank_starts_on_the_host_with_no_device_communicator(monkeypatch):

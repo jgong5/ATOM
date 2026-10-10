@@ -260,6 +260,11 @@ def frontend(config):
             f"data_parallel_size is {_dp(run)}; the channel table every LP "
             "reads would declare the wrong ranks"
         )
+    if dp > 1 and config.fake_eplb:
+        raise ValueError(
+            "--fake-eplb may start fewer engines than the data-parallel ranks "
+            "the channel table declares, and a rank that never joins holds the run"
+        )
     config.runner_qualname = COMPASS_RUNNER_QUALNAME
     lp = FRONTEND if side is None else LpId(f"{FRONTEND.name}-{side}")
     if standalone:
@@ -396,12 +401,10 @@ def frontend_done(llm_engine) -> bool:
     if a is None:  # the standalone authority writes the step table
         return True
     out = Path(run["out_dir"])
+    dp = _dp(run)
+    names = [COMMANDS_FILE] if dp == 1 else [f"commands.dp{r}.json" for r in range(dp)]
     reasons = (
-        [
-            r
-            for f in sorted(out.glob("commands*.json"))
-            for r in json.loads(f.read_text())
-        ]
+        [r for n in names for r in json.loads((out / n).read_text())]
         + rt.loop.executor.refusals
         + rt.refusals
     )
