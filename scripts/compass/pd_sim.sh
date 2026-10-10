@@ -53,9 +53,13 @@ for name in PYTHONPATH PYTHONHASHSEED AITER_LOG_LEVEL HIP_VISIBLE_DEVICES; do
 done
 
 server() { # role port kv_role
+    # uvicorn's keep-alive timeout runs on the LP clock, the router drops idle
+    # connections on the wall clock: which comes first, and with it whether the
+    # timeout takes a grant, would differ between runs. Only the router closes.
     # shellcheck disable=SC2086 # DECODE_EXEC and SERVER_ARGS are word lists
     ${4:-} env "${passed[@]}" python3 -m atom.entrypoints.openai_server \
-        --model "$MODEL" --host 127.0.0.1 --server-port "$2" $SERVER_ARGS \
+        --model "$MODEL" --host 127.0.0.1 --server-port "$2" --timeout-keep-alive 1000000 \
+        $SERVER_ARGS \
         --compass-run "$RUN_FILE" --compass-clock-endpoint "$CLOCK" \
         --kv-transfer-config "{\"kv_role\":\"$3\",\"kv_connector\":\"compass\",\"compass_kv_write_req\":\"$KV_WRITE_REQ\"}" \
         >"$OUT/$1.log" 2>&1 &

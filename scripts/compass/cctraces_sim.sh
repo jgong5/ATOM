@@ -110,9 +110,10 @@ if [[ $MODE == 1p1d ]]; then
     ready=("pd_sim: ready" "$OUT/pd_sim.log")
     PORT=$ROUTER_PORT
 else
+    # The keep-alive timeout as in pd_sim.sh, aiperf's pool in the router's place.
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
     python3 -m atom.entrypoints.openai.api_server --model "$MODEL" --host 127.0.0.1 \
-        --server-port "$PORT" $SERVER_ARGS --compass-run "$OUT/run.json" \
+        --server-port "$PORT" --timeout-keep-alive 1000000 $SERVER_ARGS --compass-run "$OUT/run.json" \
         >"$OUT/server.log" 2>&1 &
     # Not /health: before the traffic LP joins the run, the frontend answers nothing.
     ready=("Uvicorn running" "$OUT/server.log")
