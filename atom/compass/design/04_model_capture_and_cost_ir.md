@@ -704,8 +704,14 @@ constant the pricing ignores will fail to group, costing compression but never
 correctness. That is the right way round.
 
 **Recorded as T51:** enumerate the actual layer-pattern shapes for the two target models
-(Qwen3.8-27B, Kimi-K3) and confirm the detector reaches the nested form on both. Kimi-K3
-is the one that matters — a dense-then-MoE schedule with shared experts is exactly Way 2.
+(Qwen3.8-27B, DeepSeek-V4-Pro) and confirm the detector reaches the nested form on both.
+DeepSeek-V4-Pro is the one that matters. In `atom/models/deepseek_v4.py` every layer is the
+same `Block` with an `MoE` and one shared expert, so its shape comes from two per-layer
+switches: `MoE` routes by hash on layers below `n_hash_layers`, and
+`DeepseekV4Attention` picks CSA or HCA from `compress_ratios[layer_id]`. The DeepSeek-V4-Pro
+checkpoint's `config.json` makes the hash-routed layers HCA, HCA, CSA, then alternates HCA and CSA to
+the last layer: a prologue (Way 1) before a period-2 interleave (Way 2), in which a flat
+run-length scan finds nothing to group.
 
 ### Open issues
 
