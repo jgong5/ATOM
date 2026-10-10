@@ -13,9 +13,10 @@ so the four are comparable. It **applies** `01`'s clock protocol per strategy; i
 re-decide it.
 
 **Why this is not a late topic.** v1 runs DeepSeek-V4-Pro with DP-attention and then EP8
-(`16` D95), and DP couples *scheduling decisions*. So the LP structure, the clock topology
-and the memory-accounting shape come first, in **M1**; scheduling parity and then cost
-*accuracy* follow in **M2** — D94 splits them. PP comes after v1.
+(`16` D95), and DP couples *scheduling decisions*. So TP's and DP's LP structure, clock
+topology and memory-accounting shape come first, in **M1**; EP's come with M2's EP8 step.
+Scheduling parity and then cost *accuracy* follow in **M2** — D94 splits them. PP comes
+after v1.
 
 ---
 
@@ -760,8 +761,7 @@ as the real engine at the same configuration?** Its legs, in order:
 
 EP2 takes that form because `-tp 2 --enable-expert-parallel` at DP 1 runs no all-to-all
 at all (D92), so that leg would pass while exercising nothing (T84, answered by `16`
-D95). PP2 left the test with PP. Each step of M2 is parity first, then accuracy
-(`16` D95). The test is checkable without a cost model, it exercises exactly the couplings
+D95). The test is checkable without a cost model, it exercises exactly the couplings
 this topic is about, and ATOM's own `test_dp_load_balance.py`, `test_dp_metadata.py`,
 `test_dp_sync_layout.py` and `test_forward_mode.py` already cover the pieces on the
 CPU-only path (`08` D43.1).
