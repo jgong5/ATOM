@@ -97,7 +97,7 @@ M-f `14`; M-g `01` D3.5.
 | ~~T10~~ | ~~Verify `AgenticReplayStrategy` can be subclassed rather than vendored~~ — **done**: yes, but the adapter rebinds the shared `LoopScheduler` global instead, which covers all nine pacing sites |
 | T11 | Build the per-tokenizer vetted filler-token set |
 | T12 | Chase the 32 `asyncio.wait_for` sites under virtual time |
-| T13 | Decide the simulated KV connector's completion semantic |
+| ~~T13~~ | ~~Decide the simulated KV connector's completion semantic~~ — **done**, `01` D6: Mooncake, one simulated write event per request |
 | T14 | Build the client-count matrix given only 144 fan-out-capable sessions |
 | ~~T15~~ | ~~Warmup handling in the harness contract~~ — **done**: warmup requests are ordinary requests; the rule is an exclusion window agreed by request id |
 | **T54** | Detect warmth that *recurs* mid-run (a new shape reaching autotune at minute 10); D62 measures leading warmth only |
