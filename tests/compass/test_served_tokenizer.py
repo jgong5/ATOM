@@ -8,7 +8,10 @@ and the calls are made on the clock owner's thread, as the event loop makes the
 final decode of a non-streaming completion.
 """
 
+import copy
+import hashlib
 import json
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -16,7 +19,7 @@ from test_memory_readings import DOCUMENT, TOKENIZER
 
 from atom.compass import run as compass_run
 from atom.compass.clock import LpId, single_engine_table
-from atom.compass.spec import SpecRefusal
+from atom.compass.spec import FingerprintMismatch, SpecRefusal
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
 
@@ -96,3 +99,39 @@ def test_an_unmeasured_architecture_is_refused(run_file):
         SpecRefusal, match="no tokenizer measured for 'LlamaForCausalLM'"
     ):
         compass_run.tokenizer(_Tokenizer(), _config("LlamaForCausalLM"))
+
+
+class _LoadedFrom(_Tokenizer):
+    """A fast tokenizer loaded from a model directory, as ``from_pretrained``
+    records it."""
+
+    def __init__(self, directory):
+        self.name_or_path = str(directory)
+
+
+def _model_dir(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "tokenizer.json").write_text('{"version": "1.0"}')
+    return model, "sha256:" + hashlib.sha256(b'{"version": "1.0"}').hexdigest()
+
+
+def test_a_tokenizer_json_other_than_the_measured_one_warns(run_file, tmp_path):
+    model, loaded = _model_dir(tmp_path)
+    with pytest.warns(FingerprintMismatch) as caught:
+        compass_run.tokenizer(_LoadedFrom(model), _config())
+    message = str(caught[0].message)
+    print(f"\n{message}")
+    assert TOKENIZER["fingerprint"] in message and loaded in message
+
+
+def test_the_measured_tokenizer_json_is_silent(monkeypatch, tmp_path):
+    model, loaded = _model_dir(tmp_path)
+    machine = copy.deepcopy(DOCUMENT)
+    machine["host"]["tokenizers"] = [dict(TOKENIZER, fingerprint=loaded)]
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"bound_s": 600.0, "machine": machine}))
+    monkeypatch.setenv(compass_run.ENV, str(path))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        compass_run.tokenizer(_LoadedFrom(model), _config())

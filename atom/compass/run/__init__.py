@@ -32,6 +32,7 @@ where the step table, the run summary and the engine's command refusals go.
 """
 
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -208,7 +209,8 @@ def runner(model_runner) -> None:
 
 def tokenizer(tok, config) -> None:
     """Wrap `tok`'s ``encode`` and ``decode`` with the machine spec's entry for
-    the model's architecture and the backend that loaded."""
+    the model's architecture and the backend that loaded; the entry warns when
+    the loaded ``tokenizer.json`` is not the one it was measured on."""
     run = spec()
     if run is None:
         return
@@ -218,9 +220,25 @@ def tokenizer(tok, config) -> None:
     entry = MachineSpec.from_mapping(_width_keys(run["machine"])).tokenizer_for(
         config.hf_config.architectures[0],
         Backend.FAST if tok.is_fast else Backend.SLOW,
+        _fingerprint(tok),
     )
     tok.encode = wrap_encode(tok.encode, entry)
     tok.decode = wrap_decode(tok.decode, entry)
+
+
+def _fingerprint(tok) -> str | None:
+    """``sha256:<hex>`` of the ``tokenizer.json`` a fast tokenizer was loaded
+    from, resolved from its ``name_or_path`` as loading did; None without one."""
+    from transformers.utils import cached_file
+
+    name = getattr(tok, "name_or_path", None)
+    if not (tok.is_fast and name):
+        return None
+    try:
+        path = cached_file(name, "tokenizer.json", local_files_only=True)
+    except OSError:
+        return None
+    return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def _width_keys(node):
