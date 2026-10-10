@@ -141,7 +141,7 @@ in-process queues with modelled latency.
 - *Cons:* requires a time-coordination protocol between processes, and causality
   violations are silent.
 
-**C. Hybrid:** single-process for milestones 1-3, multi-process later.
+**C. Hybrid:** single-process for single-deployment runs, multi-process later.
 
 - *Cons:* defers the hard problem while designing the kernel around assumptions that
   break when it arrives.
@@ -393,7 +393,7 @@ LP counts for the milestones (`16` D95):
 |---|---|
 | M1, #627 stage 1 (one deployment, TP1) | **3** — traffic, frontend, engine |
 | M1, #627 stage 1b (atomesh 1P+1D, two containers on one node) | **5** — traffic, frontend-P, engine-P, frontend-D, engine-D |
-| M2 (DeepSeek-V4-Pro 1P+1D, one container per node, TP8 with DP-attention on each side) | **5**; the EP8 step keeps the same LPs |
+| M2 (DeepSeek-V4-Pro 1P+1D, one container per node, TP8 on each side, DP-attention where the nightly cell sets it) | **5**; the EP8 step keeps the same LPs |
 | After v1: PP | the engine LP becomes one LP per stage |
 
 So each side of M2 is **one** engine LP, not eight: ATOM runs `-tp 8
@@ -739,7 +739,7 @@ run (D3). Beyond that, only these create an LP:
 |---|---|---|
 | M1, #627 stage 1: TP1, one server | 1 | **3** |
 | M1, #627 stage 1b: TP1 prefill + TP1 decode, two containers on one node | 2 | **5** |
-| M2: DeepSeek-V4-Pro 1P+1D, one container per node, TP8 with DP-attention on each side; the EP8 step the same | 16 | **5** |
+| M2: DeepSeek-V4-Pro 1P+1D, one container per node, TP8 on each side, DP-attention where the nightly cell sets it; the EP8 step the same | 16 | **5** |
 
 After v1 (`16` D95), kept as sizing:
 
@@ -1594,13 +1594,12 @@ The ATOM relay is strictly sequential and blocking (D2). Atomesh therefore contr
 exactly two things to a request: a **routing decision**, and **two HTTP round trips of
 overhead**. It never overlaps prefill and decode.
 
-Every milestone's PD run is **1P1D**: one prefill and one decode instance, two containers
-on one node in M1, the only layout ATOM's single-node PD launch supports
-(`.github/scripts/atomesh/pd_server_atom.sh` refuses any other `SINGLE_NODE_PD` layout),
-and one container per node in M2 (`16` D95). The routing decision then has nothing to
-choose between, so no load count, random draw or clock read reaches its result, and the
-router is **one
-segment of a channel**, not an LP. Each of the three channels through it,
+Every milestone's PD run is **1P1D**, the only layout ATOM's single-node PD launch supports
+(`.github/scripts/atomesh/pd_server_atom.sh` refuses any other `SINGLE_NODE_PD` layout):
+one prefill and one decode instance, two containers on one node in M1, one container per
+node in M2 (`16` D95). The routing decision then has nothing to choose between, so no load
+count, random draw or clock read reaches its result, and the router is **one segment of a
+channel**, not an LP. Each of the three channels through it,
 `traffic->frontend-P:http`, `frontend-P->frontend-D:relay` and
 `frontend-D->traffic:stream`, has a real LP at both ends; D3's channel table names their
 senders.
