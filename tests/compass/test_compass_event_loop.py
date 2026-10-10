@@ -416,6 +416,45 @@ def test_requests_with_one_arrival_are_handed_over_in_seq_order(run):
     assert run.conn.grants == [arrival, INF] and run.conn.unread == []
 
 
+def test_requests_with_one_arrival_reach_the_app_in_seq_order_whatever_body_ends_first(
+    run,
+):
+    stamps, entered = queue.Queue(), []
+    traffic = _traffic(run, stamps, before_ner=lambda: None, n=2)
+    (arrival, _), (again, _) = stamps.get(timeout=10), stamps.get(timeout=10)
+    assert arrival == again
+
+    async def app(scope, receive, send):
+        entered.append(_stamp(scope)[1])
+
+    def read(seq):
+        async def receive():  # seq 0's body takes more socket reads than seq 1's
+            for _ in range(3 if seq == 0 else 0):
+                await asyncio.sleep(0)
+            return {"type": "http.request", "body": b"x", "more_body": False}
+
+        scope = {
+            "type": "http",
+            "headers": [(b"x-test-stamp", b"%r %d" % (arrival, seq))],
+        }
+        return HttpChannel(app, _stamp)(scope, receive, None)
+
+    async def go():
+        await asyncio.sleep(arrival)
+        await asyncio.gather(read(0), read(1))
+
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        traffic.join(10)
+    loop.close()
+    print(f"\n  app entered in seq order {entered}")
+    assert entered == [0, 1]
+    assert run.conn.grants == [arrival, INF] and run.conn.unread == []
+
+
 @pytest.mark.parametrize("order", [1, -1], ids=["entry-last", "entry-first"])
 def test_a_stamp_split_over_two_tracestate_lines_holds_the_served_app(
     run, monkeypatch, order
