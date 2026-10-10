@@ -105,11 +105,13 @@ def test_an_ner_reply_is_recorded_as_ner():
     assert ca.timeline.lines()[0] == "a 0.0 1.0 NER -"
 
 
-def _two_lps_ask(timeline, rounds=20):
+def _two_lps_ask(timeline):
     ca = ClockAuthority(_two_way(0.5), timeline)
-    for k in range(1, rounds + 1):
+    for k in range(1, 21):
         ca.on_request(A, TAR, float(k), [])
         ca.on_request(B, TAR, float(k), [])
+    ca.on_request(A, NER, INF, [])
+    ca.on_request(B, NER, INF, [])
 
 
 def test_a_run_with_the_log_off_never_calls_it(monkeypatch):
