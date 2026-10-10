@@ -191,10 +191,23 @@ class ModelTerms:
         else:
             # Each token's routed experts and the shared ones are live at once.
             routed = int(_geometry(config, file, "num_experts_per_tok"))
-            shared = int(_geometry(config, file, "n_shared_experts"))
+            klass = type(getattr(config, "text_config", config))
+            # An architecture's own config class with no shared-expert field
+            # (Qwen3MoeConfig) has no shared expert: 0 is its geometry. A bare
+            # PretrainedConfig, whose model_type is empty, names no architecture.
+            none = (
+                _stated(config, file, "n_shared_experts") is None
+                and getattr(klass, "model_type", "")
+                and not hasattr(klass, "n_shared_experts")
+                and not hasattr(klass, "shared_expert_intermediate_size")
+            )
+            if none:
+                shared, why = 0, f" ({klass.__name__} has none)"
+            else:
+                shared, why = int(_geometry(config, file, "n_shared_experts")), ""
             intermediate = (routed + shared) * int(experts)
             live = (
-                f"({routed} num_experts_per_tok + {shared} n_shared_experts) "
+                f"({routed} num_experts_per_tok + {shared} n_shared_experts{why}) "
                 f"x {experts} moe_intermediate_size"
             )
         weights = Term(

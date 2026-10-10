@@ -682,6 +682,52 @@ def test_without_its_config_json_a_class_default_cannot_count_as_stated(tmp_path
         terms_of(config, None)
 
 
+#: Qwen3-30B-A3B's config.json, the fields the model terms read. The
+#: architecture has no shared expert, so neither the file nor `Qwen3MoeConfig`
+#: names one.
+QWEN3_30B_A3B = {
+    "architectures": ["Qwen3MoeForCausalLM"],
+    "model_type": "qwen3_moe",
+    "hidden_size": 2048,
+    "head_dim": 128,
+    "intermediate_size": 6144,
+    "max_position_embeddings": 40960,
+    "moe_intermediate_size": 768,
+    "num_experts": 128,
+    "num_experts_per_tok": 8,
+    "num_hidden_layers": 48,
+    "torch_dtype": "bfloat16",
+}
+
+
+def test_an_moe_class_with_no_shared_expert_field_reads_zero(tmp_path):
+    config, config_json = loaded(tmp_path, QWEN3_30B_A3B)
+    assert type(config).__name__ == "Qwen3MoeConfig"
+    terms = terms_of(config, config_json)
+    # 8 x 768 is the dense 6144: the expert form changes no number here.
+    assert terms.activations.nbytes == int(WARMUP_TOKENS * 2 * (2.8 * 2048 + 2 * 6144))
+    assert terms.activations.source == (
+        "8192 warmup tokens x 2 B x (2.8 x 2048 hidden + 2 x (8 num_experts_per_tok"
+        " + 0 n_shared_experts (Qwen3MoeConfig has none)) x 768 moe_intermediate_size)"
+    )
+
+
+def test_a_bare_config_with_no_shared_expert_count_is_refused():
+    raw = {k: v for k, v in QWEN3_30B_A3B.items() if k != "model_type"}
+    config = PretrainedConfig.from_dict({**raw, "dtype": "bfloat16"})
+    with pytest.raises(MemoryRefusal, match="states no `n_shared_experts`"):
+        terms_of(config, raw)
+
+
+def test_a_class_with_a_shared_expert_width_field_is_refused(tmp_path):
+    # Qwen2MoeConfig sizes its shared expert by width, not by count.
+    raw = {**QWEN3_30B_A3B, "model_type": "qwen2_moe"}
+    config, config_json = loaded(tmp_path, raw)
+    assert type(config).__name__ == "Qwen2MoeConfig"
+    with pytest.raises(MemoryRefusal, match="states no `n_shared_experts`"):
+        terms_of(config, config_json)
+
+
 def test_a_dense_model_through_atoms_loader_keeps_its_terms(tmp_path, qwen):
     # Qwen3.8-27B loads as a text config class that has a default for every
     # field read here; its config.json states them all, under `text_config`.
