@@ -10,10 +10,12 @@ Before each clock call it holds until aiperf has caught up with the clock:
 every stream event the Clock Authority released has been reported by a worker,
 every credit whose final event is released has had its return passed to
 aiperf (a return that comes before its final event's release waits for it, so
-the next turn is scheduled from the final arrival either way), and every task
-on the loop is waiting on something. It asks for time only while a request is
-open, a pacing timer is pending or the run is finishing; between phases aiperf
-works on the wall clock and the simulation waits for it.
+the next turn is scheduled from the final arrival either way), no return is
+still inside aiperf's callback, and every task on the loop is waiting on
+something. It asks for time only while a request is open, a clock wait (a
+pacing timer, a phase deadline, the idle watchdog) is pending or the run is
+finishing; between phases aiperf works on the wall clock and the simulation
+waits for it.
 
 A request that errors mid-stream never reports the events after its last read.
 When released events stay unreported for ``DIAG_S`` wall seconds while an
@@ -66,6 +68,7 @@ class TrafficLP:
         self._held: dict[tuple, object] = {}
         self._returns: asyncio.Queue = asyncio.Queue()  # passed in order, as upstream
         self._waiters: list[tuple[float, asyncio.Future]] = []
+        self._passing = False  # a return is inside aiperf's callback
         self._finishing = False
         self._changed = asyncio.Event()
         self._tasks = [
@@ -97,10 +100,21 @@ class TrafficLP:
 
     async def advance_to(self, t: float) -> None:
         """Return at the next grant; the scheduler then reads its timers again."""
+        await self.wait(t)
+
+    def wait(self, t: float) -> asyncio.Future:
+        """A clock wait for ``t``, resolved at the next grant or by ``withdraw``."""
         fut = asyncio.get_running_loop().create_future()
         self._waiters.append((t, fut))
         self._changed.set()
-        await fut
+        return fut
+
+    def withdraw(self, fut: asyncio.Future) -> None:
+        """Drop a wait, so it asks the clock for nothing, and resolve it now."""
+        self._waiters = [w for w in self._waiters if w[1] is not fut]
+        if not fut.done():
+            fut.set_result(None)
+        self._changed.set()
 
     # ---- the router's side ----
 
@@ -151,10 +165,14 @@ class TrafficLP:
     async def _pass_returns(self) -> None:
         while True:
             ret = await self._returns.get()
+            self._passing = True
             try:
                 await ret()
             except Exception:  # upstream loses that one return, not the rest
                 logger.exception("traffic: a return callback raised")
+            finally:
+                self._passing = False
+                self._changed.set()
 
     async def _own(self) -> None:
         while True:
@@ -189,7 +207,7 @@ class TrafficLP:
                     self.open.pop(key, None)
                     if (ret := self._held.pop(key)) is not None:
                         self._returns.put_nowait(ret)
-            if unreported or unreturned:
+            if unreported or unreturned or self._passing:
                 self._changed.clear()
                 try:
                     await asyncio.wait_for(self._changed.wait(), DIAG_S)
