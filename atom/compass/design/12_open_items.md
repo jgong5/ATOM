@@ -160,7 +160,7 @@ M-f `14`; M-g `01` D3.5.
 | T42 | Measure `collect_metrics()` per-step cost on the real side; decide decimation |
 | T43 | Verify the backfill end to end — one block, loaded, visible in Grafana |
 | T44 | Sanity-check histogram bucket ranges against simulated latencies |
-| T45 | Tag ATOM's existing twenty metrics with their D77 class |
+| T45 | Tag ATOM's existing metrics with their D77 class |
 | T46 | Decide the DP-aggregation rule per class; refuse summaries there |
 
 ### Topic 13 — configuration surface
