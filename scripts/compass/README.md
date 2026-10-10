@@ -504,6 +504,13 @@ simulated and wall seconds from the run summary, both prefix-cache hit rates
 ITL and request throughput in simulated time, and the run's refusals. A
 `coverage_report=True` cell is a coverage report, not a result.
 
+A run file with `router_s` and `kv_write_req_s` makes the cell 1P1D: `pd_sim.sh`
+deploys it, taking `DECODE_EXEC` and `ATOMESH` from the environment, and aiperf
+drives the atomesh router. The traffic LP sends to `frontend-P` and reads the
+stream from `frontend-D`, as the run file's channel table names them. The result
+line adds `kv_transfers` and `kv_transfer_mean_s`, from the line the prefill
+engine logs per KV transfer.
+
 Two runs of a cell with different `PYTHONHASHSEED` must give byte-identical step
 tables: `cmp A/step_table.txt B/step_table.txt`.
 `tests/compass/test_cctraces_sim_smoke.py` runs that pair on one session for 60

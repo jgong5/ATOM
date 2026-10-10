@@ -62,7 +62,13 @@ from compass_harness.traffic_lp import (
 from compass_harness.transport import addresses, credit_key
 
 from atom.compass import clock_transport
-from atom.compass.clock import NER, ClockAuthority, LpId, single_engine_table
+from atom.compass.clock import (
+    NER,
+    ClockAuthority,
+    LpId,
+    prefill_decode_table,
+    single_engine_table,
+)
 from atom.compass.run import ENV as RUN_ENV
 from atom.utils.clock import LPRuntime
 from compass_harness import ADDRESS_ENV, fingerprint
@@ -248,9 +254,9 @@ class ScriptedRuntime:
     releases; a clock call whose target comes first is granted the target.
     """
 
-    def __init__(self, script) -> None:
+    def __init__(self, script, stream=STREAM) -> None:
         self.now, self.script, self.seq = 0.0, list(script), 0
-        self.released = {STREAM: set()}
+        self.stream, self.released = stream, {stream: set()}
         self.calls = []
 
     def stamp_send(self, ch):
@@ -264,7 +270,7 @@ class ScriptedRuntime:
         self.calls.append(t)
         if self.script and self.script[0][0] <= t:
             self.now, seqs = self.script.pop(0)
-            self.released[STREAM] |= seqs
+            self.released[self.stream] |= seqs
         else:
             self.now = t
         return self.now
@@ -516,3 +522,71 @@ def test_the_timing_manager_builds_the_compass_router():
     from aiperf.timing import manager
 
     assert manager.StickyCreditRouter is CompassCreditRouter
+
+
+def test_a_1p1d_run_file_sends_to_frontend_p_and_reads_from_frontend_d(
+    tmp_path, monkeypatch
+):
+    """Behind a prefill-decode router, requests enter at frontend-P and the
+    stream comes back from frontend-D, over the channels the run file's table
+    declares."""
+    pd = {"router_s": 2.0**-12, "kv_write_req_s": 2.0**-10}
+    endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
+    table = prefill_decode_table(**RUN, **pd)
+    server = clock_transport.serve(ClockAuthority(table), endpoint)
+    run_file = tmp_path / "run.json"
+    run_file.write_text(
+        json.dumps({"clock_endpoint": endpoint, "bound_s": 1e6, **RUN, **pd})
+    )
+    monkeypatch.setenv(RUN_ENV, str(run_file))
+    monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / "lp"))
+
+    async def main():
+        traffic = TrafficLP.from_env()
+        try:
+            traffic.send(_key(0))
+            traffic.rt.check_arrival("frontend-D->traffic:stream", 1.0, 0)
+            return traffic.rt.send_log, traffic.rt.unreleased
+        finally:
+            for task in (*traffic._tasks, traffic.done):
+                task.cancel()
+            traffic._pub.close(linger=0)
+            traffic._pull.close(linger=0)
+
+    try:
+        sent, unreleased = _run(main())
+    finally:
+        server.close()
+    http = "traffic->frontend-P:http"
+    assert sent == [(http, 0, table.lookahead(http))]
+    assert unreleased == {("frontend-D->traffic:stream", 0): 1.0}
+
+
+def test_a_1p1d_hold_settles_the_frontend_d_stream(tmp_path):
+    """Behind a prefill-decode router the hold reads frontend-D's stream: the
+    released final is reported, its return passed, and the run finishes."""
+    stream = "frontend-D->traffic:stream"
+
+    async def main():
+        rt = ScriptedRuntime([(1.0, {0})], stream)
+        traffic = TrafficLP(rt, str(tmp_path / "lp"), stream=stream)
+        passed = []
+
+        async def on_return(worker_id, ret):
+            passed.append(ret.credit.id)
+
+        held = traffic.hold(on_return)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(addresses(str(tmp_path / "lp"))[1])
+        traffic.send(_key(0))
+        push.send_pyobj((_key(0), 0, 1.0, True))
+        await held("worker_0", SimpleNamespace(credit=_credit(0), error=None))
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 5)
+        finally:
+            push.close(linger=0)
+        return passed, rt.released
+
+    passed, released = _run(main())
+    assert passed == [0] and released == {stream: set()}

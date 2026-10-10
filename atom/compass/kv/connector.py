@@ -28,6 +28,7 @@ The worker half reports nothing. The engine still builds and polls it.
 
 from __future__ import annotations
 
+import logging
 import pickle
 
 from atom.compass.kv.handoff import transfer_params, whole_number
@@ -37,6 +38,8 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+
+logger = logging.getLogger(__name__)
 
 #: Where the harness binds the priced transfer model.
 TRANSFER_KEY = "compass_transfer"
@@ -198,7 +201,11 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                     f"its prefill finished (at {r}); the router sends a request "
                     "to decode only after prefill has returned"
                 )
-            self._due[req_id] = max(a, r) + self._transfer.duration_s(blocks)
+            t = self._transfer.duration_s(blocks)
+            self._due[req_id] = max(a, r) + t
+            logger.info(
+                "compass: KV transfer %s, %d blocks, %r simulated s", req_id, blocks, t
+            )
         now = self._rt.read_clock()
         done = [req_id for req_id, t in self._due.items() if t <= now]
         for req_id in done:
