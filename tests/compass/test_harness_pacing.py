@@ -49,6 +49,7 @@ from aiperf.common.enums import CreditPhase
 from aiperf.common.loop_scheduler import LoopScheduler
 from aiperf.plugin.enums import TimingMode
 from aiperf.timing.config import CreditPhaseConfig
+from aiperf.timing.request_cancellation import RequestCancellationConfig
 from aiperf.timing.trajectory_source import TrajectorySource
 from compass_harness.scheduler import ClockPacedLoopScheduler
 from compass_harness.strategy import CompassAgenticReplay
@@ -95,6 +96,7 @@ def _build(
     system_cap=None,
     metrics_off=True,
     gpu_off=True,
+    **phase,
 ):
     """A real PhaseRunner for AGENTIC_REPLAY profiling, its collaborators mocked."""
     monkeypatch.setattr(ClockPacedLoopScheduler, "clock", clock)
@@ -114,6 +116,7 @@ def _build(
         timing_mode=TimingMode.AGENTIC_REPLAY,
         total_expected_requests=1,
         seamless=seamless,
+        **phase,
     )
     return runner_module.PhaseRunner(
         config=config,
@@ -454,6 +457,11 @@ def test_a_phase_end_cancel_with_a_timer_pending_leaves_the_clock_wait_whole(
         ({"system_cap": 10.0}, "system_idle_gap_cap_seconds"),
         ({"metrics_off": False}, "server metrics"),
         ({"gpu_off": False}, "GPU telemetry"),
+        ({"prefill_concurrency": 2}, "prefill concurrency (--prefill-concurrency)"),
+        (
+            {"request_cancellation": RequestCancellationConfig(rate=10.0)},
+            "request cancellation (--request-cancellation-rate)",
+        ),
     ],
 )
 def test_each_unpaced_option_is_refused_by_name(option, name, monkeypatch):
