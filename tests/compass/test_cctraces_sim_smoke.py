@@ -17,6 +17,11 @@ compass-harness installed).
 pair as a 1P1D cell, through `pd_sim.sh` and atomesh, which must be on PATH;
 ``ATOM_COMPASS_PD_DECODE_EXEC`` runs decode in another container, as
 ``test_pd_slice.py`` does.
+
+``test_a_real_cell_warms_up_on_the_simulated_cells_requests`` runs the cell
+once more with ``REAL=1`` on zero dummy weights, which needs the GPU free of
+anything else, and ``COMPASS_AIPERF_PYTHON``, a Python with agentx-harness
+56a0cf70 and without compass-harness.
 """
 
 import copy
@@ -109,6 +114,84 @@ def test_both_runs_answer_every_request_and_refuse_nothing(cells):
         assert int(fields["requests"]) > 0, result
         assert (fields["errors"], fields["refusals"]) == ("0", "0"), result
         assert fields["coverage_report"] == "False", result
+
+
+def test_the_step_records_are_byte_identical_and_carry_no_timestamps(cells):
+    (left, _), (right, _) = cells
+    record = (left / "steps/dp0.jsonl").read_bytes()
+    assert record == (right / "steps/dp0.jsonl").read_bytes()
+    steps = [json.loads(line) for line in record.splitlines()]
+    assert steps and all("rows" in s and "t_enter_ns" not in s for s in steps)
+
+
+def _warmup(cell: Path) -> list:
+    """(conversation, turn) of each request aiperf sent in its warmup phase."""
+    export = (cell / "artifacts/profile_export.jsonl").read_text().splitlines()
+    meta = [json.loads(line)["metadata"] for line in export]
+    return sorted(
+        (m["conversation_id"], m["turn_index"])
+        for m in meta
+        if m["benchmark_phase"] == "warmup"
+    )
+
+
+@pytest.mark.skipif(
+    not os.environ.get("COMPASS_AIPERF_PYTHON"),
+    reason="a real cell needs COMPASS_AIPERF_PYTHON",
+)
+def test_a_real_cell_warms_up_on_the_simulated_cells_requests(cells, tmp_path):
+    (sim, _), _ = cells
+    # A rocm-smi that lists pid 4242 on the cell's GPU and pid 1337009 on another,
+    # padded as rocm-smi pads a pid shorter than the PID column.
+    gpu = (os.environ.get("HIP_VISIBLE_DEVICES") or "0").split(",")[0]
+    listing = (
+        "KFD process information:\n"
+        "PID    \tPROCESS NAME\tGPU(s)\tVRAM USED\tSDMA USED\tCU OCCUPANCY\t\n"
+        "4242   \tUNKNOWN     \t1     \t481734656\t0        \t0           \t\n"
+        "1337009\tUNKNOWN     \t1     \t1024     \t0        \t0           \t\n"
+        "=== GPUs Indexed by PID ===\n"
+        f"PID 4242 is using 1 DRM device(s):\n{gpu} \n"
+        f"PID 1337009 is using 1 DRM device(s):\n{int(gpu) + 1} \n"
+    )
+    stub = tmp_path / "bin/rocm-smi"
+    stub.parent.mkdir()
+    stub.write_text(f"#!/bin/sh\ncat <<'EOF'\n{listing}EOF\n")
+    stub.chmod(0o755)
+    env = dict(
+        os.environ,
+        PATH=f"{stub.parent}:{os.environ['PATH']}",
+        REAL="1",
+        MODEL=MODEL,
+        TRACES=TRACES,
+        HARNESS_PYTHON=os.environ["COMPASS_AIPERF_PYTHON"],
+        SESSIONS="1",
+        DURATION_S="60",
+        SERVER_ARGS="--enforce-eager --max-model-len 262144 --load_dummy=zero",
+    )
+    real = tmp_path / "real"
+    done = subprocess.run(
+        ["bash", str(SCRIPT), str(sim.parent / "template.json"), str(real)],
+        cwd="/",
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    assert done.returncode == 0, done.stdout[-4000:] + done.stderr[-4000:]
+    result = done.stdout.strip().splitlines()[-1]
+    fields = dict(f.split("=", 1) for f in result.split()[1:])
+    assert int(fields["requests"]) > 0 and fields["errors"] == "0", result
+    assert fields["contaminated"] == "True", result
+    assert fields["gpu_before"] == fields["gpu_after"] == "4242:481734656", result
+    assert not (real / compass_run.STEP_TABLE_FILE).exists()
+    workload = [
+        json.loads((c / "run.json").read_text())["workload"] for c in (sim, real)
+    ]
+    assert workload[0] == workload[1]
+    steps = [json.loads(line) for line in (real / "steps/dp0.jsonl").open()]
+    assert steps and all(s["t_exit_ns"] >= s["t_enter_ns"] for s in steps)
+    assert _warmup(real) == _warmup(sim) != []
 
 
 def test_the_step_tables_are_byte_identical_and_name_the_workload(cells):

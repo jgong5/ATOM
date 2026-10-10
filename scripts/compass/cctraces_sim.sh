@@ -4,17 +4,24 @@
 # One cell of cc-traces through agentx-harness on a simulated TP1 or 1P1D run:
 # ATOM with --compass-run, driven by `aiperf profile` with the AgentX
 # scenario and compass-harness, until the scenario's duration has passed on the
-# simulated clock.
+# simulated clock. With REAL=1, the same cell on a real TP1 server: ATOM on the
+# GPU, aiperf as shipped, the duration on the wall clock.
 #
 # Usage: cctraces_sim.sh RUN_FILE OUT_DIR
 #   RUN_FILE        a run file; its out_dir and clock_endpoint are replaced
-#   MODEL           model directory: config.json and the tokenizer (required)
+#   MODEL           model directory: config.json and the tokenizer (required;
+#                   with REAL=1, the weights too)
 #   TRACES          a cc-traces traces.jsonl (required)
 #   HARNESS_PYTHON  the Python that has agentx-harness and compass-harness
-#                   installed (required)
-#   SESSIONS        replay the first SESSIONS traces (default 2)
+#                   installed; with REAL=1, agentx-harness without
+#                   compass-harness (required)
+#   REAL            1 for a real cell (default 0)
+#   RECORD          0 turns the step record off (default 1)
+#   FIRST_SESSION   skip the first FIRST_SESSION traces (default 0)
+#   SESSIONS        replay SESSIONS traces (default 2)
 #   CONCURRENCY     aiperf --concurrency (default 1)
-#   DURATION_S      aiperf --benchmark-duration, simulated seconds (default 1800)
+#   DURATION_S      aiperf --benchmark-duration, seconds on the cell's clock
+#                   (default 1800)
 #   SEED            aiperf --random-seed (default 20260707)
 #   SERVER_ARGS     more API server flags (default: --enforce-eager
 #                   --max-model-len 262144)
@@ -30,6 +37,11 @@
 # the KV transfer count and mean simulated seconds for a 1P1D cell. It exits
 # non-zero when aiperf or the deployment did, or when aiperf's benchmark id is
 # not the one recorded.
+#
+# A TP1 cell also writes its step record to steps/. A real cell writes no step
+# table or summary; it saves rocm-smi's process listing before and after it in
+# gpu_before.txt and gpu_after.txt, and its result names the processes on its
+# GPU (the first in HIP_VISIBLE_DEVICES, default 0), with their VRAM bytes.
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -43,6 +55,7 @@ MODEL=${MODEL:?MODEL names the model directory}
 TRACES=${TRACES:?TRACES names a cc-traces traces.jsonl}
 HARNESS_PYTHON=${HARNESS_PYTHON:?HARNESS_PYTHON names the Python with agentx-harness}
 SESSIONS=${SESSIONS:-2}
+REAL=${REAL:-0}
 SERVER_ARGS=${SERVER_ARGS:---enforce-eager --max-model-len 262144}
 WAIT_S=${WAIT_S:-600}
 # compass-harness pins aiperf's benchmark id: uuid4 is UUID(int=0).
@@ -50,11 +63,19 @@ BENCHMARK_ID=000000000000
 
 mkdir -p "$OUT/traces"
 OUT=$(realpath "$OUT")
+# Importing compass_harness also checks the aiperf it would run against.
 harness=$(cd / && "$HARNESS_PYTHON" -c 'import compass_harness; print(compass_harness.__file__)')
 [[ $harness == "$ROOT"/* ]] || { echo "cctraces_sim: compass_harness resolved to $harness" >&2; exit 92; }
+if ((REAL)); then
+    # Its plugin paces aiperf on a simulated clock, which a real cell has not got.
+    plugins=$(cd / && "$HARNESS_PYTHON" -c 'from importlib.metadata import entry_points as e
+print(*(p.value for p in e(group="aiperf.plugins")))')
+    [[ $plugins != *compass_harness* ]] || { echo "cctraces_sim: REAL=1 and $HARNESS_PYTHON has compass-harness installed" >&2; exit 92; }
+fi
 
-head -n "$SESSIONS" "$TRACES" |
-    awk -v d="$OUT/traces" '{f = sprintf("%s/%05d.json", d, NR - 1); print > f; close(f)}'
+awk -v d="$OUT/traces" -v first="${FIRST_SESSION:-0}" -v n="$SESSIONS" '
+    NR > first {f = sprintf("%s/%05d.json", d, NR - first - 1); print > f; close(f)}
+    NR >= first + n {exit}' "$TRACES"
 
 # Everything but paths and the URL, so it can be hashed into the run record.
 args=(--endpoint-type chat --custom-dataset-type weka_trace
@@ -101,7 +122,14 @@ print("1p1d" if "kv_write_req_s" in run else "tp1", *ports)
 EOF
 )
 
-trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
+trap 'kill -- $(jobs -p) ${server:+-$server} 2>/dev/null || true' EXIT
+gpu=${HIP_VISIBLE_DEVICES:-0}
+gpu=${gpu%%,*}
+gpu_processes() { rocm-smi --showpids --showpidgpus >"$OUT/gpu_$1.txt"; }
+if ((REAL)); then
+    [[ $MODE == tp1 ]] || { echo "cctraces_sim: a real cell is TP1, and the run file is 1P1D" >&2; exit 2; }
+    gpu_processes before
+fi
 if [[ $MODE == 1p1d ]]; then
     # pd_sim.sh takes the authority's port from its own variable; the run file
     # names the same one for the traffic LP.
@@ -110,11 +138,16 @@ if [[ $MODE == 1p1d ]]; then
     ready=("pd_sim: ready" "$OUT/pd_sim.log")
     PORT=$ROUTER_PORT
 else
+    compass=(--compass-run "$OUT/run.json")
+    ((REAL)) && compass=()
+    record=$OUT/steps
+    ((${RECORD:-1})) || record=
     # The keep-alive timeout as in pd_sim.sh, aiperf's pool in the router's place.
+    # Its own process group, so a real server's workers stop with it.
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
-    python3 -m atom.entrypoints.openai.api_server --model "$MODEL" --host 127.0.0.1 \
-        --server-port "$PORT" --timeout-keep-alive 1000000 $SERVER_ARGS --compass-run "$OUT/run.json" \
-        >"$OUT/server.log" 2>&1 &
+    ATOM_COMPASS_PARITY_RECORD=$record setsid python3 -m atom.entrypoints.openai.api_server \
+        --model "$MODEL" --host 127.0.0.1 --server-port "$PORT" --timeout-keep-alive 1000000 \
+        $SERVER_ARGS "${compass[@]}" >"$OUT/server.log" 2>&1 &
     # Not /health: before the traffic LP joins the run, the frontend answers nothing.
     ready=("Uvicorn running" "$OUT/server.log")
 fi
@@ -127,24 +160,55 @@ until grep -q "${ready[@]}"; do
 done
 
 rc=0
+aiperf=(-m aiperf)
+# Without compass-harness, the benchmark id is pinned here as it pins it, so
+# both modes send the same prompts.
+((REAL)) && aiperf=(-c 'import uuid, aiperf.cli_runner as r
+r.uuid4 = lambda: uuid.UUID(int=0)
+from aiperf.cli import app
+app()')
 (cd "$OUT" && ATOM_COMPASS_RUN=$OUT/run.json AIPERF_DATASET_MMAP_BASE_PATH=$OUT \
-    "$HARNESS_PYTHON" -m aiperf profile --url "127.0.0.1:$PORT" --model "$MODEL" \
+    "$HARNESS_PYTHON" "${aiperf[@]}" profile --url "127.0.0.1:$PORT" --model "$MODEL" \
     --tokenizer "$MODEL" --input-file "$OUT/traces" --artifact-dir "$OUT/artifacts" \
     "${args[@]}") >"$OUT/aiperf.log" 2>&1 || rc=$?
-# The deployment leaves at the finish, once the step table is written.
+# The deployment leaves at the finish, once the step table is written. A real
+# server serves until it is stopped, so one that has already left failed.
+((REAL)) && { kill -TERM -- -$server 2>/dev/null || rc=$((rc ? rc : 1)); }
 deadline=$((SECONDS + WAIT_S))
 while kill -0 $server 2>/dev/null && ((SECONDS < deadline)); do sleep 1; done
 kill -0 $server 2>/dev/null && { echo "cctraces_sim: the deployment is still up $WAIT_S s after aiperf" >&2; exit 1; }
-wait $server || rc=$((rc ? rc : $?))
+wait $server || rc=$((rc || REAL ? rc : $?))
+((REAL)) && { kill -KILL -- -$server 2>/dev/null || true; gpu_processes after; }
 
-python3 - "$OUT" "$BENCHMARK_ID" "$rc" <<'EOF'
+python3 - "$OUT" "$BENCHMARK_ID" "$rc" "$REAL" "$gpu" <<'EOF'
 import json, re, sys
 from pathlib import Path
 
 out, benchmark_id, rc = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
-summary = json.loads((out / "summary.json").read_text())
 export = json.loads((out / "artifacts/profile_export_aiperf.json").read_text())
 avg = lambda k: export[k]["avg"]
+if export["benchmark_id"] != benchmark_id:
+    sys.exit(f"cctraces_sim: benchmark id {export['benchmark_id']}, recorded {benchmark_id}")
+if sys.argv[4] == "1":
+    def others(when):
+        """pid:VRAM bytes of each KFD process on the cell's GPU."""
+        text = (out / f"gpu_{when}.txt").read_text()
+        vram = dict(re.findall(r"^(\d+) *\t[^\t]*\t[^\t]*\t(\d+)", text, re.M))
+        on = re.findall(r"PID (\d+) is using \d+ DRM device\(s\):\n([\d ]*)", text)
+        return ",".join(f"{p}:{vram.get(p, '?')}" for p, d in on if sys.argv[5] in d.split())
+
+    before, after = others("before"), others("after")
+    print(
+        f"cctraces_sim: rc={rc} requests={avg('request_count'):.0f} "
+        f"errors={len(export['error_summary'])} "
+        f"cache_read_pct={avg('overall_usage_prompt_cache_read_pct'):.2f} "
+        f"theoretical_hit_pct={avg('theoretical_prefix_cache_hit'):.2f} "
+        f"ttft_ms={avg('time_to_first_token'):.2f} itl_ms={avg('inter_token_latency'):.3f} "
+        f"request_throughput={avg('request_throughput'):.4f} "
+        f"contaminated={bool(before or after)} gpu_before={before} gpu_after={after}"
+    )
+    sys.exit(rc)
+summary = json.loads((out / "summary.json").read_text())
 # Prefill logs one line per KV transfer, with its simulated seconds.
 prefill = out / "prefill.log"
 kv = ""
@@ -163,7 +227,5 @@ print(
     f"coverage_report={summary['coverage_report']}"
     + kv
 )
-if export["benchmark_id"] != benchmark_id:
-    sys.exit(f"cctraces_sim: benchmark id {export['benchmark_id']}, recorded {benchmark_id}")
 sys.exit(rc)
 EOF
