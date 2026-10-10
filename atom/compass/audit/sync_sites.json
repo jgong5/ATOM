@@ -38,6 +38,10 @@
   {
    "path": "atom/kv_transfer/disaggregation/",
    "why": "the prefill/decode transfer connectors and their handshake threads"
+  },
+  {
+   "path": "atom/utils/tbo/ubatching.py",
+   "why": "the data-parallel step-shape all_gather every rank's worker runs once per step from ForwardMode.decide, a simulated step included"
   }
  ],
  "unscanned_roots": [
@@ -2672,6 +2676,54 @@
    "why": "preempts until the batch fits; it is arithmetic over block counts and does not park",
    "mechanism": "K9",
    "mechanism_why": ""
+  },
+  {
+   "id": "atom/utils/tbo/ubatching.py::sync_dp_metadata::torch.distributed.all_gather(gathered, local, group=dp_group)::collective#0",
+   "file": "atom/utils/tbo/ubatching.py",
+   "symbol": "sync_dp_metadata",
+   "call": "torch.distributed.all_gather",
+   "expr": "torch.distributed.all_gather(gathered, local, group=dp_group)",
+   "shape": "collective",
+   "peer": "process",
+   "why": "the step-shape exchange across the ranks of one data-parallel group: a blocking all_gather on the group's CPU group that every rank's worker runs once per step from ForwardMode.decide, and a simulated step runs unchanged to settle its rung",
+   "mechanism": "K1",
+   "mechanism_why": "the data-parallel group's per-step shape exchange decides the step the data-parallel LP is advanced by, and its own cost is priced into that step; the ranks wait on each other here as on the lockstep all_reduce in DPEngineCoreProc._sync_dp_state"
+  },
+  {
+   "id": "atom/utils/tbo/ubatching.py::TBOContext.__enter__::self.ready_barrier.wait()::event_wait#0",
+   "file": "atom/utils/tbo/ubatching.py",
+   "symbol": "TBOContext.__enter__",
+   "call": "self.ready_barrier.wait",
+   "expr": "self.ready_barrier.wait()",
+   "shape": "event_wait",
+   "peer": "thread",
+   "why": "a two-batch-overlap ubatch thread waiting for its partner thread in the same process, inside the model forward the simulated runner replaces",
+   "mechanism": "K9",
+   "mechanism_why": "inside the forward pass the simulator replaces: the wrapper that starts these threads wraps the real runner's model, and a simulated step never calls it"
+  },
+  {
+   "id": "atom/utils/tbo/ubatching.py::TBOContext.__enter__::self.cpu_wait_event.wait()::event_wait#0",
+   "file": "atom/utils/tbo/ubatching.py",
+   "symbol": "TBOContext.__enter__",
+   "call": "self.cpu_wait_event.wait",
+   "expr": "self.cpu_wait_event.wait()",
+   "shape": "event_wait",
+   "peer": "thread",
+   "why": "a two-batch-overlap ubatch thread waiting for its partner thread in the same process, inside the model forward the simulated runner replaces",
+   "mechanism": "K9",
+   "mechanism_why": "inside the forward pass the simulator replaces: the wrapper that starts these threads wraps the real runner's model, and a simulated step never calls it"
+  },
+  {
+   "id": "atom/utils/tbo/ubatching.py::TBOContext._cpu_yield::self.cpu_wait_event.wait()::event_wait#0",
+   "file": "atom/utils/tbo/ubatching.py",
+   "symbol": "TBOContext._cpu_yield",
+   "call": "self.cpu_wait_event.wait",
+   "expr": "self.cpu_wait_event.wait()",
+   "shape": "event_wait",
+   "peer": "thread",
+   "why": "a two-batch-overlap ubatch thread waiting for its partner thread in the same process, inside the model forward the simulated runner replaces",
+   "mechanism": "K9",
+   "mechanism_why": "inside the forward pass the simulator replaces: the wrapper that starts these threads wraps the real runner's model, and a simulated step never calls it"
   }
  ],
  "anchors": [

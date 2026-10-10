@@ -75,6 +75,14 @@ of which a single-process test can show:
   successor that wants its refusal diagnosable in the engine's own log has to
   put it there itself, on the worker side, before it raises.
 
+The worker control commands are refused the third way: by a reply. A raise
+would end the engine for a command a client sent while serving, and a None
+would park it, so `RefusedControlCommands` answers each with its reason,
+`command:<method>`. `busy_loop` forwards it, `EngineUtilityHandler` logs it
+and, for all but `update_weights`, sends it back to the client as the
+`UTILITY_RESPONSE` result; the runner also keeps every reason it answered for
+the run summary's refusals.
+
 `RPC_SURFACE` records, for each dispatched name, whether its caller waits for
 the reply. The names themselves are not a list anyone typed: they are the ones
 `engine_core`, `pp_engine_core` and `engine_utility` broadcast that a
@@ -85,6 +93,7 @@ source and compare it with this table.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import torch
@@ -93,7 +102,7 @@ from atom.compass.backends.base import CostBackend
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
 from atom.compass.runner.step_output import (
     DeferredTokenStream,
-    reported_token_id,
+    filler_token_ids,
     reports_previous_step,
 )
 
@@ -113,7 +122,10 @@ logger = logging.getLogger(__name__)
 # so, and it is load-bearing. Other dispatched names are absent from this
 # table because `ModelRunner` does not define them -- some belong to
 # `RapidServeModelRunner`, the rest to the rollout extension. The rollout names
-# are unreachable here. The RapidServe names are kept out by `Config`, not by
+# do reach this runner: `AsyncLLMEngine.__init__` (`atom/rollout/async_engine.py`)
+# installs its own runner with `kwargs.setdefault`, so a caller that names this
+# one gets it, and `RefusedControlCommands` answers each with a refusal.
+# The RapidServe names are kept out by `Config`, not by
 # this module: `enable_rapidserve` picks `PrefillEngineCore` /
 # `DecodeEngineCore` (`LLMEngine.__init__`), those classes broadcast all of
 # them with `wait_out=True` without consulting `runner_qualname`, and the
@@ -122,16 +134,6 @@ logger = logging.getLogger(__name__)
 # overwrites. `Config` therefore raises `ValueError` for
 # `enable_rapidserve=True` with any runner not in `RAPIDSERVE_RUNNERS`, this
 # one included.
-#
-# Also outside the table, and outside anything a broadcast-derived enumeration
-# can see: some of these names are called in-process on the runner itself,
-# reached over the `resume_memory` RPC (`atom/rollout/memory_manager.py`).
-# `MemoryManagerMixin._resume_kv_cache` subscripts one key of `get_num_blocks`
-# and discards `allocate_kv_cache`, and
-# `MemoryManagerMixin._recapture_cudagraphs_if_needed` calls
-# `capture_cudagraph` without unpacking it, inside a `try` that degrades to
-# `enforce_eager=True`. Different arities, and the one place in the tree where
-# a refusal from this module would be caught rather than fatal.
 #
 # Call sites below are in `atom/model_engine/`.
 RPC_SURFACE: dict[str, bool] = {
@@ -146,9 +148,10 @@ RPC_SURFACE: dict[str, bool] = {
     "freeze_gc_heap": True,  # EngineCore._freeze_after_startup catches a raise, not a None
     "process_kvconnector_output": False,  # EngineCore does not wait
     "async_proc_aggregation": True,  # the one bounded wait, in EngineCore
+    "flush_pp_send": True,  # PPEngineCoreProc waits before the next send
+    # Refused by `RefusedControlCommands`: ATOM's own starts a real profiler.
     "start_profiler": True,  # EngineUtilityHandler forwards the reply unread
     "stop_profiler": True,  # EngineUtilityHandler forwards the reply unread
-    "flush_pp_send": True,  # PPEngineCoreProc waits before the next send
 }
 
 
@@ -241,6 +244,71 @@ def _installed_backend(runner: Any) -> CostBackend:
     return backend
 
 
+class HostStream:
+    """Stands in for a device stream on a runner that starts on the host.
+
+    It has no methods, so code that tries to use it as a stream fails on the
+    attribute it asked for instead of queueing work on a device.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+
+def start_on_host(runner: Any, rank: int, config: Any) -> None:
+    """Start a TP1 runner on the host: no device set, its groups on gloo.
+
+    Replaces ATOM's `_setup_device_and_distributed`, which
+    `ModelRunner.__init__` calls before it builds any buffer, so every buffer
+    the rest of `__init__` builds on `runner.device` lands on the host. Two touches there do not follow the
+    device: `torch.cuda.Stream` refuses `cpu`, and `CpuGpuBuffer` pins its host
+    half, which is a driver allocation. Both are replaced for the life of the
+    worker process, which hosts this runner and nothing else.
+
+    The groups are the ones ATOM's own call builds at one rank, on gloo, where
+    aiter builds no device communicator. A wider start is refused: aiter would
+    build one on the device, and a simulated TP width needs
+    `apply_simulated_tp` on a device group.
+    """
+    pc = config.parallel_config
+    ranks = (
+        config.tensor_parallel_size
+        * config.prefill_context_parallel_size
+        * pc.data_parallel_size
+        * config.pipeline_parallel_size
+    )
+    if ranks != 1:
+        raise RunnerRefusal(
+            f"this start is {ranks} ranks wide; a runner starts on the host "
+            "only at one rank, because aiter builds a wider group's device "
+            "communicators on the device."
+        )
+    from aiter import init_dist_env
+    from aiter.dist.utils import get_distributed_init_method
+
+    from atom.utils import CpuGpuBuffer
+
+    pinned = CpuGpuBuffer.__init__
+
+    def unpinned(buffer: Any, *size: Any, pin_memory: bool = True, **kw: Any):
+        pinned(buffer, *size, pin_memory=False, **kw)
+
+    CpuGpuBuffer.__init__ = unpinned
+    torch.cuda.Stream = HostStream
+    runner.device = torch.device("cpu")
+    os.environ["MASTER_ADDR"] = config.master_addr
+    os.environ["MASTER_PORT"] = str(config.port)
+    init_dist_env(
+        1,
+        rankID=rank,
+        backend="gloo",
+        distributed_init_method=get_distributed_init_method(
+            pc.data_parallel_master_ip, pc.data_parallel_base_port
+        ),
+        local_rank=0,
+    )
+
+
 def _config_field(runner: Any, name: str) -> Any:
     """A config field read with no default; a missing one is refused by name."""
     try:
@@ -273,7 +341,53 @@ class UnbuiltModel(torch.nn.Module):
         )
 
 
-class NonAllocatingRunner:
+def _refused(method: str):
+    """A worker method that answers with its refusal instead of doing its work."""
+
+    def refuse(self, *args: Any) -> str:
+        reason = f"command:{method}"
+        vars(self).setdefault("_refused_commands", []).append(reason)
+        logger.warning(
+            "%s refused: a simulated runner has no profiler, weights or KV "
+            "tensors for it to act on, and no cost model for the time it takes.",
+            method,
+        )
+        return reason
+
+    return refuse
+
+
+class RefusedControlCommands:
+    """The worker methods behind ATOM's utility commands, each refused by name.
+
+    The profiler pair would start a real profiler, and the other seven exist
+    only on ATOM's rollout runner, so without them here `busy_loop` skips the
+    name and the handler waits forever. Each answers `command:<method>` rather
+    than raising, so the engine keeps serving, and records it for
+    `refused_commands`.
+    """
+
+    start_profiler = _refused("start_profiler")
+    stop_profiler = _refused("stop_profiler")
+    update_weights = _refused("update_weights")
+    update_weights_from_shm = _refused("update_weights_from_shm")
+    update_weights_from_ipc = _refused("update_weights_from_ipc")
+    release_memory = _refused("release_memory")
+    resume_memory = _refused("resume_memory")
+    clear_kv_cache = _refused("clear_kv_cache")
+    configure_hidden_states = _refused("configure_hidden_states")
+
+    def refused_commands(self) -> tuple[str, ...]:
+        """Every refusal this runner answered, in order, for the run summary.
+
+        A method rather than an attribute so the engine can read it over the
+        same RPC the commands came in on; a tuple, so the caller gets a copy
+        and not the list the runner keeps appending to.
+        """
+        return tuple(vars(self).get("_refused_commands", ()))
+
+
+class NonAllocatingRunner(RefusedControlCommands):
     """Overrides that construct a model runner without touching device memory."""
 
     def _build_and_load_model(self, model_class: Any) -> None:
@@ -291,6 +405,9 @@ class NonAllocatingRunner:
         never fills `seq.spec_token_ids`, and reads the zeros), so a caller
         that asked for speculation would get a prediction with it off and no
         error.
+
+        What stands in for the model is installed here instead, on a simulated
+        run: the cost backend and the device readings its run file declares.
         """
         self.model = UnbuiltModel(model_class)
         # Cleared on the way out, as both of ATOM's own implementations do: the
@@ -304,6 +421,9 @@ class NonAllocatingRunner:
                 "nothing about it; speculative decoding has no step semantics "
                 "here yet."
             )
+        from atom.compass import run
+
+        run.runner(self)
         logger.info(
             "%s not built and no checkpoint read; no weight bytes on the device.",
             self.model.model_class_name,
@@ -601,12 +721,26 @@ class NonAllocatingRunner:
         if stream is None:
             # Built on first use rather than in an `__init__`: the base class
             # runs the whole of its own before a subclass body would get
-            # control, and `self.config` is what this reads.
+            # control, and `self.config` is what this reads. The ids are vetted
+            # against the tokenizer the frontend serves with, loaded the same
+            # way.
+            from atom.model_engine.llm_engine import _load_tokenizer
+
+            model = _config_field(self, "model")
+            fillers = filler_token_ids(
+                _load_tokenizer(model, _config_field(self, "trust_remote_code")),
+                _config_field(self, "eos_token_id"),
+                _config_field(self, "stop_token_ids"),
+            )
+            if not fillers:
+                raise RunnerRefusal(
+                    f"the tokenizer of {model!r} has no id that is not a stop id "
+                    "and decodes on its own to ASCII letters and digits, so "
+                    "there is no token a predicted step can report without "
+                    "ending a request or stalling its stream"
+                )
             stream = DeferredTokenStream(
-                reported_token_id(
-                    _config_field(self, "eos_token_id"),
-                    _config_field(self, "stop_token_ids"),
-                ),
+                fillers,
                 deferred=reports_previous_step(
                     _config_field(self, "pipeline_parallel_size")
                 ),

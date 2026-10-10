@@ -29,9 +29,14 @@ final decode of a non-streaming completion, advances the LP clock instead.
 and its selector is the frontend's idle point. Idle with nothing to read, it
 asks for time with `next_event`: its earliest essential timer as ``t``, its
 earliest daemon timer (`DAEMON_TIMERS`) as ``t_daemon``. While a released
-request is unread or a station job is open it only waits on its sockets. On
-the ``+inf`` grant it cancels its timers and stops. `HttpChannel` is the inline
-receive of HTTP requests.
+request is unread or a station job is open it only waits on its sockets, and
+warns once, naming what it waits for, if no socket event ends that wait within
+``diag_s`` wall seconds. Its select returns nothing only once ``time()`` has
+reached the caller's timeout. The ``+inf`` grant ends the run: from then on
+``time()`` runs on from the run's last LP time at wall rate. A uvicorn server
+on the loop is asked to exit, as a signal would ask it, and shuts down with
+nothing pending; with none, the loop cancels its timers and stops.
+`HttpChannel` is the inline receive of HTTP requests.
 """
 
 import asyncio
@@ -42,6 +47,7 @@ import math
 import selectors
 import sys
 import threading
+import time
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
@@ -235,9 +241,6 @@ DAEMON_TIMERS = frozenset(
     }
 )
 
-#: Wall seconds of one socket wait while the loop may not ask for time.
-POLL_S = 0.001
-
 
 def _is_daemon(callback) -> bool:
     if getattr(callback, "__qualname__", None) in DAEMON_TIMERS:
@@ -264,13 +267,29 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         # Per output thread: its width-1 station, its open job, and the callbacks
         # that job posted.
         self.detok = threading.local()
+        self.ended = None  # at the +inf grant: (last LP time, wall time() then)
         super().__init__(CompassSelector(self))
         self.executor = SimExecutor(self)
         self.set_default_executor(self.executor)
         self.rt.loop = self
 
     def time(self) -> float:
-        return self.rt.read_clock()
+        if self.ended is None:
+            return self.rt.read_clock()
+        return self.ended[0] + super().time() - self.ended[1]
+
+    def finish(self, end: float) -> None:
+        """The ``+inf`` grant ended the run at LP time `end`."""
+        self.ended = (end, super().time())
+        self._write_to_self()  # so the select that got the grant reports an fd
+        for task in asyncio.all_tasks(self):
+            coro = task.get_coro()
+            if getattr(coro, "__qualname__", None) == "Server.serve":  # uvicorn's
+                coro.cr_frame.f_locals["self"].should_exit = True
+                return
+        for h in self._scheduled:
+            h.cancel()
+        self.stop()
 
     def job_begin(self, arrival: float) -> None:
         """A thread took a released frame: handling it is one job on its station."""
@@ -328,7 +347,23 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
             )
         for _, seq, ch in out:
             self.held.pop((ch, seq))[1].set_result(None)
+        if out:
+            self._write_to_self()  # so the select that woke them reports an fd
         return bool(out)
+
+    def unread(self) -> tuple[int, str] | None:
+        """The released request with the lowest seq not yet read, as
+        ``(seq, channel)``, or ``None``."""
+        rt = self.rt
+        with rt.lock:
+            return min(
+                (
+                    (seq, ch)
+                    for ch, got in rt.released.items()
+                    for seq in got - rt.arrived[ch]
+                ),
+                default=None,
+            )
 
 
 class CompassSelector(selectors.DefaultSelector):
@@ -337,6 +372,9 @@ class CompassSelector(selectors.DefaultSelector):
     def __init__(self, loop: CompassEventLoop) -> None:
         super().__init__()
         self.loop = loop
+        # The wait the loop cannot ask time through: (what, wall time to warn
+        # at, or None once warned). It outlives the selects an fd event ends.
+        self.stall = None
 
     def select(self, timeout=None):
         loop, rt = self.loop, self.loop.rt
@@ -344,24 +382,56 @@ class CompassSelector(selectors.DefaultSelector):
             return super().select(timeout)
         if loop.executor.station is None:
             loop.executor.start_run()
-        if loop.hand_over() or timeout == 0:
-            return super().select(0)
-        if rt.inline_pending() or loop.executor.station.unresolved():
-            return super().select(POLL_S)
-        t = t_daemon = math.inf
-        for h in loop._scheduled:
-            if h.cancelled():
+        station = loop.executor.station
+        # `timeout` is in time() units: it expires on the LP clock.
+        deadline = math.inf if timeout is None else loop.time() + max(timeout, 0)
+        while True:
+            loop.hand_over()
+            ready = super().select(0)
+            if ready or loop.time() >= deadline:
+                return ready
+            if rt.inline_pending() or station.unresolved():
+                # The LP clock stands still here: only an fd event ends the wait.
+                unread = loop.unread()
+                what = (
+                    f"released {unread[1]} seq {unread[0]} is unread"
+                    if unread
+                    else (
+                        f"station job {station.final} is open"
+                        if station.unresolved()
+                        else "a released request is read and not handled"
+                    )
+                )
+                wall = time.monotonic()
+                if self.stall is None or self.stall[0] != what:
+                    self.stall = (what, wall + rt.diag_s)
+                warn_at = self.stall[1]
+                ready = super().select(None if warn_at is None else warn_at - wall)
+                if ready:
+                    return ready
+                if warn_at is not None:
+                    logger.warning(
+                        "%s: event loop has had no fd event for %s wall seconds "
+                        "while %s; still waiting",
+                        rt.me,
+                        rt.diag_s,
+                        what,
+                    )
+                    self.stall = (what, None)
                 continue
-            if h in loop.daemon:
-                t_daemon = min(t_daemon, h.when())
-            else:
-                t = min(t, h.when())
-        if rt.next_event(t, t_daemon) == math.inf:
+            self.stall = None
+            t = t_daemon = math.inf
             for h in loop._scheduled:
-                h.cancel()
-            loop.stop()
-            return []
-        return super().select(0)
+                if h.cancelled():
+                    continue
+                if h in loop.daemon:
+                    t_daemon = min(t_daemon, h.when())
+                else:
+                    t = min(t, h.when())
+            end = rt.now
+            if rt.next_event(t, t_daemon) == math.inf:
+                loop.finish(end)
+                return super().select(0)
 
 
 class HttpChannel:
@@ -381,6 +451,11 @@ class HttpChannel:
         got = self.stamp(scope) if scope["type"] == "http" else None
         if got is not None:
             loop = asyncio.get_running_loop()
+            if not isinstance(loop, CompassEventLoop):
+                raise TypeError(
+                    f"a stamped request is received on a CompassEventLoop, not on "
+                    f"{type(loop).__qualname__}"
+                )
             rt = loop.rt
             ch = next(
                 c.name

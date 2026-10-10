@@ -7,7 +7,8 @@ gets one thread. Its first frame binds it to an LP through the serve loop, which
 answers by sending that frame back, or a refusal. After that, for each request
 frame, the thread queues it with the loop and writes back the next reply from
 that LP's slot. The thread waits on its own LP's slot under no lock, so an LP
-whose reply is held stops no other connection.
+whose reply is held stops no other connection. When a bound connection ends,
+however it ends, the thread tells the loop, which ends the run.
 
 ``connect(lp, "tcp://host:port")`` returns the in-process carrier's connection
 with a socket in place of the loop: the same ``send``, ``recv`` and ``close``,
@@ -86,8 +87,10 @@ class _StreamServer:
         # ponytail: a thread parked in `slot.get()` when the server closes stays
         # parked until the process exits; wake it with a sentinel if servers churn.
         slot = None
-        with sock, sock.makefile("rwb") as stream:
-            try:
+        # The writer flushes again on leaving the block, so a dead peer can
+        # raise there too.
+        try:
+            with sock, sock.makefile("rwb") as stream:
                 while (frame := _receive(stream)) is not None:
                     try:
                         if slot is None:
@@ -99,8 +102,11 @@ class _StreamServer:
                     except (KeyError, ValueError) as refused:
                         reply = encode(_refusal(refused))
                     _send(stream, reply)
-            except (MalformedMessage, OSError):
-                return
+        except (MalformedMessage, OSError):
+            pass
+        finally:
+            if slot is not None:
+                self._server._closed(address)
 
 
 class _Remote:

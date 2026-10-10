@@ -212,20 +212,30 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     """The projection a worker builds: it holds the batch and not the sequences.
 
     A row's kind is the convention `ModelRunner.prepare_inputs` reads: the
-    first `total_seqs_num_prefill` rows are prefill. The rung and the group's
-    token count come from `mode`, the step's one `forward_mode`; a data-parallel
-    runner handed a mode with no group counts is refused.
+    first `total_seqs_num_prefill` rows are prefill. The rung and the MoE
+    gather's rows come from `mode`, the step's one `forward_mode`; a
+    data-parallel runner handed a mode with no group counts is refused.
+
+    The MoE gather's rows follow `running_tokens_are_unified`, as
+    `FusedMoE.forward_impl_graph` does. Every rank decoding, the padded
+    `all_gather` carries `running_tokens` rows from each rank, the group's
+    agreed height, under `enforce_eager` too. Otherwise (a rank prefilling, an
+    MTP draft's first pass) the variable-length gather carries each rank's own
+    count.
     """
     if mode.sync is not None:
-        group_tokens = int(mode.sync.num_tokens_across_dp.max())
+        if mode.running_tokens_are_unified:
+            moe_rows = _data_parallel_size(runner) * mode.running_tokens
+        else:
+            moe_rows = int(mode.sync.num_tokens_across_dp.sum())
     elif _data_parallel_size(runner) > 1:
         raise RunnerRefusal(
             "this rank is one of a data-parallel group and its forward mode "
-            "states no num_tokens_across_dp, so the MoE segment has no group "
-            "token count to be priced from"
+            "states no num_tokens_across_dp, so the MoE segment has no gathered "
+            "row count to be priced from"
         )
     else:
-        group_tokens = None
+        moe_rows = None
     prefill = batch.total_seqs_num_prefill
     rows = zip(batch.num_scheduled_tokens, batch.context_lens)
     return BatchView(
@@ -233,5 +243,5 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
             RequestShape(int(q), int(c), i >= prefill) for i, (q, c) in enumerate(rows)
         ),
         capture_rung=_rung(mode),
-        max_tokens_across_dp=group_tokens,
+        moe_rows=moe_rows,
     )

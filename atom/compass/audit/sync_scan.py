@@ -52,7 +52,8 @@ from pathlib import Path
 # Directories, not a list of files: a file allowlist declares its blind spot at
 # a finer grain than it excludes, so a module added beside a scanned one is
 # invisible while the exclusion list still reads complete. Scanning the
-# directory makes a new file a test failure on the day it lands.
+# directory makes a new file a test failure on the day it lands. A single file
+# is named only where it alone of its directory runs on a simulated step.
 SCANNED_ROOTS: tuple[tuple[str, str], ...] = (
     (
         "atom/model_engine/",
@@ -76,6 +77,13 @@ SCANNED_ROOTS: tuple[tuple[str, str], ...] = (
     (
         "atom/kv_transfer/disaggregation/",
         "the prefill/decode transfer connectors and their handshake threads",
+    ),
+    (
+        "atom/utils/tbo/ubatching.py",
+        (
+            "the data-parallel step-shape all_gather every rank's worker runs "
+            "once per step from ForwardMode.decide, a simulated step included"
+        ),
     ),
 )
 

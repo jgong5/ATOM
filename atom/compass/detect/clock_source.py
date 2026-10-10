@@ -83,7 +83,12 @@ CLOCK_READS = (
 #: directory names ending at the entry, so the same entry works from any root
 #: the check is run from and a directory that merely ends in the same letters
 #: does not collect the exemption.
-DEFAULT_ALLOW_LIST: dict[str, str] = {}
+DEFAULT_ALLOW_LIST: dict[str, str] = {
+    "atom/compass/run/__init__.py": (
+        "the run summary's wall seconds, from the run's start to its finish: "
+        "the speed result, which no simulated time reads"
+    ),
+}
 
 #: Packages under `atom/` a simulated run never executes, or that keep their
 #: own gate: `compass` its own, `mesh` is Rust, `benchmarks` and `examples` are
@@ -169,6 +174,8 @@ _KEPT_REAL = (
      "K9", "the process shutdown grace period, after the simulated window", 2),
     ("atom/utils/backends.py", "compile", "time.time", "K9", _COMPILE, 3),
     ("atom/utils/backends.py", "__call__", "time.time", "K9", _COMPILE, 1),
+    ("atom/utils/compass_loop.py", "select", "time.monotonic", "K9",
+     "times a stall's diagnostic in wall seconds; the LP clock stands still", 1),
     ("atom/utils/decorators.py", "start_monitoring_torch_compile", "time.time",
      "K9", _COMPILE, 1),
     ("atom/utils/gc_utils.py", "_log", "time.perf_counter", "K9", _LOG_ONLY, 2),

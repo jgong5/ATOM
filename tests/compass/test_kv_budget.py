@@ -389,9 +389,11 @@ def test_exactly_these_config_fields_are_read_with_no_default():
         "enforce_eager",
         "eos_token_id",
         "kv_transfer_config",
+        "model",
         "pipeline_parallel_size",
         "speculative_config",
         "stop_token_ids",
+        "trust_remote_code",
     ]
 
 

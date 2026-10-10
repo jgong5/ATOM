@@ -1,11 +1,10 @@
 # ATOM Compass — Design
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
-against it yet.** Every document carries a matching header. **Decisions D0–D94,
-with no gaps, and their sub-decisions** are indexed at the end of this file; **88 registered
-TODOs — T1–T88 with no gaps, of which 82 are open** (T10, T15, T22, T48 and T65 are struck
-through as done, and T77 was opened and closed by P0.1); they, the load-bearing assumptions and the
-cross-cutting issues live in **`12_open_items.md`**. Implementation follows the execution
+against it yet.** Every document carries a matching header. **Decisions D0–D95,
+with no gaps, and their sub-decisions** are indexed at the end of this file. The TODOs are
+registered in **`12_open_items.md`**, with the load-bearing assumptions and the cross-cutting
+issues. Implementation follows the execution
 plan in `16`.
 
 ---
@@ -161,7 +160,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       flags, precedence, the `compass` executable   |
   |                                                docs 07, 05, 13      |
   +=====================================================================+
-  |  L4  WORKLOAD         clock client  |  wire fields (compass.*)      |
+  |  L4  WORKLOAD         clock client  |  compass stamps on the wire   |
   |                       per-harness adapter (out of tree)             |
   |                                                    doc 06           |
   +=====================================================================+
@@ -222,7 +221,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L5 | `compass plan` and the calibration phases | [`07_calibration_toolchain.md`](07_calibration_toolchain.md) | D36–D43 |
 | L5 | Machine spec schema and probes | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
 | L0 | Artifact store, keys, invalidation | [`07`](07_calibration_toolchain.md) | D41, D43 |
-| — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D50.1) |
+| — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D50.1, D50.2) |
 | L5 | Configuration surface: flags, precedence, the `compass` CLI | [`13_configuration_surface.md`](13_configuration_surface.md) | D78–D81 |
 | L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 |
 | L1/L3 | Parallelism: TP, DP, PP, EP | [`15_parallelism_support.md`](15_parallelism_support.md) | D88–D94 |
@@ -251,10 +250,10 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
      |                       |                 |                     |
      |                       |<-- postprocess -|                     |
      |<-- SSE chunk ---------|                 |                     |
-     |    + compass.{        |                 |                     |
-     |        arrival_s,     |                 |                     |
-     |        first_token_s, |                 |                     |
-     |        finish_s }      |                 |                     |
+     |    + ": compass a=..  |                 |                     |
+     |       s=.." comment   |                 |                     |
+     |    line before each   |                 |                     |
+     |    event              |                 |                     |
 ```
 
 Wall-clock time passes while that HTTP round trip happens. **Virtual time does not** — it
@@ -317,7 +316,7 @@ fitted, interpolated, extrapolated or analytical — and a step reports the mixt
 |---|---|
 | Throughput prediction | error ≤ 10% |
 | Time per output token (TPOT) | error ≤ 10% |
-| Time to first token (TTFT) | error ≤ 10% |
+| Time to first token (TTFT) | error ≤ 15% (`16` D95) |
 | Each non-KV memory term | error ≤ 10% |
 | KV capacity / block count | **error ≤ 5%** |
 | Generalization | predict beyond the configurations used for calibration |
@@ -332,14 +331,9 @@ Final proof is **paired simulated and real execution of cc-traces proper**.
 
 | # | Milestone |
 |---|---|
-| **M1** | Fake models covering prefill, decode, KV need and TP/DP/PP/EP; the discrete-event foundation; the test harness; PD aggregation and disaggregation driven by the cc-traces harness |
-| **M2** | Qwen3.8-27B on MI308X-class hardware, PD aggregation, **TP1** |
-| **M3** | Qwen3.8-27B, same hardware, **TP2 and TP4** |
-| **M3.5** | **Speculative decoding / MTP** mechanism on Qwen3.8-27B: structures, shapes, draft KV, declared acceptance (`14`) |
-| **M4** | Qwen3.8-27B, same hardware and TP configs, **PD disaggregation across two nodes** |
-| **M5** | Kimi-K3, same hardware, **TP8**, PD aggregation |
-| **M6** | Kimi-K3, **TP8, PD disaggregation** |
-| **M7** | Kimi-K3 with **DP, PP and EP** |
+| **M1** | **[#627](https://github.com/jgong5/ATOM/issues/627) stages 1 and 1b: cc-traces end to end on a GPU-free simulated run** (`16` D95). Stage 1 drives cc-traces through agentx-harness at TP1; stage 1b adds atomesh at 1P+1D; each run ends by the finish. Built on the discrete-event foundation, fake models covering prefill, decode and KV need, and the test harness |
+| **M2 — v1** | **#627 stage 3: DeepSeek-V4-Pro 1P+1D on MI355X within the targets above**, first in the nightly configurations with expert parallelism off, then at EP8 — each step first the same scheduling decisions as the real engine, then the separable results of `08` D44 and the configuration-ranking gate; **the MI455 roofline projection**, held to the soundness checks of `16` D95. **First gate, #627 stage 2:** Qwen3.8-27B TP1 on MI308X, paired real and simulated cc-traces graded by `08` |
+| ~~M3–M7~~ | Retired by `16` D95, which maps each one to where its scope went. PP, EP beyond one node, and further models come after v1 |
 
 Sequencing, dependencies and parallelisable work are in the execution plan (`16`). `00_initial_prompt.md` is the original seed and is
 **not** a design document — see *Development history*.
@@ -378,9 +372,8 @@ One thing that **is** in scope and is worth stating as a limit rather than a non
   *reconstructed rather than recorded* is the **join**: no field in the corpus says a parent
   resumed because a child finished, so the harness imposes SPAWN/JOIN linkage. That is a
   fidelity caveat on the workload, not a scope exclusion.
-- **Asymmetric parallelism (EP, PP, DP).** M7 names all three, so they are in scope. There
-  is no design for them yet; that is a **gap**, recorded as `12` M-d, to be written before
-  M7 starts rather than deferred indefinitely.
+- **Asymmetric parallelism (EP, PP, DP).** DP-attention and EP8 within a node are in M2;
+  PP and EP beyond one node come after v1 (`16` D95). `15` designs all three.
 
 ---
 
@@ -526,7 +519,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it settles |
 |---|---|---|
-| [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced additive field each direction, audited for minimality. Timeline piggybacked on `kv_transfer_params` so Atomesh needs no change. Tokenizer cost is a queue, not a constant. |
+| [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced stamp each direction, audited for minimality: a `tracestate` entry in, an SSE comment line per event out. The timeline rides carriers Atomesh already forwards, so it needs no change. Tokenizer cost is a queue, not a constant. |
 | [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two tiers: a CPU tier over every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free **as a batch** and held to green, and a GPU superset judged as a **delta** against **4779 / 5** (`fe9ea043c`, torch 2.10.0+rocm7.2.4, ROCm 7.2.4, AITER v0.1.21.dev0-49-gf4e7c7509, all five failing node-ids on file). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible only if stable *and* sensitive. |
 | [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. The metrics push and refresh are daemon timers on simulated time. |
 
@@ -563,13 +556,14 @@ The documents use these precisely; a reader will bounce off without them.
 | D24 – D26 (+ D25.1) | `05` Machine Specification and its Probes |
 | D27 – D35 (+ D34.1) | `06` Workload Harness Contract |
 | D36 – D43 (+ D38.1, D40.1) | `07` Calibration and Benchmarking Toolchain |
-| D43.1, D44 – D52 (+ D50.1) | `08` Validation Protocol |
+| D43.1, D44 – D52 (+ D50.1, D50.2) | `08` Validation Protocol |
 | D53 – D62 | `09` Fitting and Law Selection |
 | D63 – D70 (+ D67.1) | `10` Analytic Laws (Tier 0) |
 | D71 – D77 | `11` Engine Metrics under Virtual Time |
 | D78 – D81 | `13` The Configuration Surface |
 | D82 – D87 | `14` Speculative Decoding and MTP |
 | D88 – D94 | `15` Parallelism Support (TP, DP, PP, EP) |
+| D95 | `16` The Execution Plan |
 
 ### Headline decisions
 
@@ -584,8 +578,8 @@ The documents use these precisely; a reader will bounce off without them.
 | D18 | Capture with dispatch mode + FakeTensor + ShapeEnv; `_EnablePythonDispatcher()` is mandatory |
 | D19 | Hierarchical, symbolic, stream-annotated IR; no branches in the IR — applicability is a discrete key plus an evaluated guard domain |
 | D20 | Opaque leaves are priced, not decomposed; each carries a declared parameter extractor |
-| D28 | Additive optional fields on the **real** endpoint, both directions |
-| D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes |
+| D28 | Stamps on the **real** endpoint, both directions, in carriers a real server ignores: a `tracestate` entry in, SSE comment lines out |
+| D30 | Ride the simulated timeline on carriers Atomesh already forwards, `kv_transfer_params` on the prefill-to-decode hop among them; Atomesh needs zero changes |
 | D36 | Three tiers: analytic, coarse empirical, op-level empirical. Compass models a device it has been measured on |
 | D37 | `compass plan` — the tool tells the user what to measure |
 | D45 | The real-vs-real spread is the tolerance; a metric must be stable **and** sensitive |
