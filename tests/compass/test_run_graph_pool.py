@@ -31,9 +31,11 @@ from atom.compass.runner.overrides import NonAllocatingRunner
 def _reserved(monkeypatch, tmp_path, *, eager, piecewise=False, dp=1, sizes=None):
     """What the runner reserves after `run.runner` installed its readings."""
     monkeypatch.setenv(compass_run.ENV, str(_run_file(tmp_path)))
+    (tmp_path / "config.json").write_text(CONFIG_JSON.read_text())
     hf = PretrainedConfig.from_dict(json.loads(CONFIG_JSON.read_text())["text_config"])
     runner = SimpleNamespace(
         config=SimpleNamespace(
+            model=str(tmp_path),
             hf_config=hf,
             tensor_parallel_size=1,
             parallel_config=SimpleNamespace(data_parallel_size=dp),
