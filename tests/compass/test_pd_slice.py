@@ -228,8 +228,7 @@ def test_a_frontend_answers_a_request_from_outside_the_run_while_its_grant_is_ou
     thread = threading.Thread(target=router, daemon=True)
     thread.start()
     try:
-        with pytest.raises(RuntimeError, match="Event loop stopped before Future"):
-            server.run()
+        server.run()  # the finish ends it with nothing pending
     finally:
         thread.join(30)
         authority.close()
