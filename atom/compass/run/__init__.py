@@ -259,10 +259,24 @@ def _start_on_leaving(rt: clock.LPRuntime, authority=None):
 
 
 def frontend(config):
-    """Around the `CoreManager` construction; a no-op context on a real run."""
+    """Around the `CoreManager` construction; a no-op context on a real run.
+
+    A real run with the parity record's variable set runs ATOM's runner
+    through the recording one, and refuses any other runner, which would
+    record nothing.
+    """
     global _authority
     run = spec()
     if run is None:
+        from atom.compass import parity
+
+        if os.environ.get(parity.ENV):
+            if config.runner_qualname != ATOM_RUNNER:
+                raise ValueError(
+                    f"{parity.ENV} is set and runner {config.runner_qualname!r} "
+                    f"is named; only {ATOM_RUNNER} has a recording runner"
+                )
+            config.runner_qualname = parity.RUNNER
         return contextlib.nullcontext()
     pc = config.parallel_config
     widths = (pc.data_parallel_size, config.pipeline_parallel_size)
