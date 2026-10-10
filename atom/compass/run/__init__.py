@@ -34,11 +34,13 @@ Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
 where the step table, the run summary and each server LP's refusals go: an
 engine's are the worker's refused commands and the engine's refused clock
 calls, a frontend's its executor's refused jobs and its refused clock calls.
-The authority removes an earlier run's files there as it starts. An
-optional ``data_parallel_size``, 1 when absent, is the deployment's DP width,
-which under DP-attention is its TP size times its DP size; the traffic LP reads
-the channel table from the run file alone. Each DP rank's engine process hands
-in its own refusals, as ``<lp>.<member>``.
+Each engine's worker writes the memory it predicts there too, for
+``python -m atom.compass.memory.check``. The authority removes an earlier
+run's files there as it starts. An optional ``data_parallel_size``, 1 when
+absent, is the deployment's DP width, which under DP-attention is its TP size
+times its DP size; the traffic LP reads the channel table from the run file
+alone. Each DP rank's engine process hands in its own refusals, as
+``<lp>.<member>``.
 
 A run file that also has ``router_s`` and ``kv_write_req_s`` describes a
 prefill-decode run over `prefill_decode_table`, and ``kv_link`` (``intra_node``
@@ -87,8 +89,9 @@ FRONTEND, ENGINE, TRAFFIC = LpId("frontend"), LpId("engine"), LpId("traffic")
 ATOM_RUNNER = "atom.model_engine.model_runner.ModelRunner"
 #: Keys that differ between two runs of one configuration, kept out of its name.
 PER_RUN = ("clock_endpoint", "out_dir")
-COMMANDS_FILE, STEP_TABLE_FILE, SUMMARY_FILE = (
+COMMANDS_FILE, MEMORY_FILE, STEP_TABLE_FILE, SUMMARY_FILE = (
     "commands-{}.json",  # by LP name, or <lp>.<member> for a member
+    "memory-{}.json",  # by DP rank, after P or D on a prefill-decode side
     "step_table.txt",
     "summary.json",
 )
@@ -211,8 +214,8 @@ class _RecordingAuthority(ClockAuthority):
         self._joining = set(_servers(run))
         # A rerun into the same out_dir starts from none of the last run's files.
         out = Path(run["out_dir"])
-        for name in (COMMANDS_FILE.format("*"), STEP_TABLE_FILE, SUMMARY_FILE):
-            for f in out.glob(name):
+        for name in (COMMANDS_FILE, MEMORY_FILE, STEP_TABLE_FILE, SUMMARY_FILE):
+            for f in out.glob(name.format("*")):
                 f.unlink()
         table = channel_table(run)
         super().__init__(
@@ -352,7 +355,8 @@ def runner(model_runner) -> None:
 
     from atom.compass.backends.geometry import Parallelism
     from atom.compass.backends.shape import Coefficients, ShapeStubBackend
-    from atom.compass.memory import ModelTerms, device_readings
+    from atom.compass.memory import ModelTerms, device_readings, predicts
+    from atom.compass.memory.check import record
     from atom.compass.runner.overrides import (
         install_cost_backend,
         install_device_readings,
@@ -377,21 +381,32 @@ def runner(model_runner) -> None:
         warmup_tokens=config.max_num_batched_tokens,
         config_json=PretrainedConfig.get_config_dict(config.model)[0],
     )
-    install_device_readings(
-        model_runner,
-        device_readings(
-            machine,
-            tp_width=tp,
-            model=model,
-            cudagraph_overhead=_graph_pool(model_runner, machine, model),
-        ),
+    reserved, captured = _graph_pool(model_runner, machine, model)
+    readings = device_readings(
+        machine, tp_width=tp, model=model, cudagraph_overhead=reserved
+    )
+    install_device_readings(model_runner, readings)
+    pool = (
+        None
+        if captured is None
+        else predicts(machine, tp_width=tp, captured_tokens=captured)
+    )
+    name = f"dp{config.parallel_config.data_parallel_rank}"
+    if side := _pd_side(config):
+        name = f"{side}.{name}"
+    _write_whole(
+        Path(run["out_dir"]) / MEMORY_FILE.format(name),
+        json.dumps(record(readings, tokens=config.max_num_batched_tokens, pool=pool)),
     )
 
 
 def _graph_pool(model_runner, machine, model):
     """What ATOM's `_estimate_cudagraph_overhead` reserves for this deployment:
     nothing under ``enforce_eager``, else the branch the runner's own
-    `_piecewise_cg_active` picks, over the same config fields it reads."""
+    `_piecewise_cg_active` picks, over the same config fields it reads. With it,
+    the tokens `capture_cudagraph` captures, None under ``enforce_eager``. The
+    piecewise reservation caps only what it reserves; the capture takes the
+    same bounded ladder in both modes."""
     from atom.compass.memory import (
         PiecewiseCapture,
         capture_token_shapes,
@@ -401,26 +416,31 @@ def _graph_pool(model_runner, machine, model):
 
     config = model_runner.config
     if config.enforce_eager:
-        return reserves(enforce_eager=True)
+        return reserves(enforce_eager=True), None
+    # At one token per sequence a batch size is its token count, so the
+    # capture loop's schedulable bound applies to both.
+    bound = min(config.max_num_seqs, config.max_num_batched_tokens)
+    captured = sum(
+        capture_token_shapes(config.capture_sizes, max_num_batched_tokens=bound)
+    )
     if not model_runner._piecewise_cg_active():
-        return reserves(activation_bytes=model.activations.nbytes)
+        return reserves(activation_bytes=model.activations.nbytes), captured
     hf = config.hf_config
     sizes = config.compilation_config.cudagraph_capture_sizes or [config.max_num_seqs]
     capacity = machine.value("device.memory.capacity_bytes")
-    return reserves(
-        piecewise=PiecewiseCapture(
-            per_token_bytes=piecewise_per_token_bytes(
-                hidden_size=int(hf.hidden_size),
-                layers=int(hf.num_hidden_layers),
-                dtype_bytes=config.torch_dtype.itemsize,
-                dp_size=config.parallel_config.data_parallel_size,
-            ),
-            token_shapes=capture_token_shapes(
-                sizes, max_num_batched_tokens=config.max_num_batched_tokens
-            ),
-            budget_bytes=int(config.gpu_memory_utilization * capacity),
-        )
+    capture = PiecewiseCapture(
+        per_token_bytes=piecewise_per_token_bytes(
+            hidden_size=int(hf.hidden_size),
+            layers=int(hf.num_hidden_layers),
+            dtype_bytes=config.torch_dtype.itemsize,
+            dp_size=config.parallel_config.data_parallel_size,
+        ),
+        token_shapes=capture_token_shapes(
+            sizes, max_num_batched_tokens=config.max_num_batched_tokens
+        ),
+        budget_bytes=int(config.gpu_memory_utilization * capacity),
     )
+    return reserves(piecewise=capture), captured
 
 
 def tokenizer(tok, config) -> None:
