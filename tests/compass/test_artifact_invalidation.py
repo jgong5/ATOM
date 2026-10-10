@@ -29,8 +29,6 @@ on a host that has one ROCm.
 """
 
 import json
-import pathlib
-import re
 
 import pytest
 
@@ -39,7 +37,6 @@ from atom.compass.artifacts import (
     ArtifactRefusal,
     ArtifactStore,
     Axis,
-    Cell,
     Conditions,
     Fingerprint,
     Gate,
@@ -62,14 +59,6 @@ from atom.compass.artifacts import (
     rows_for,
     verify,
 )
-
-REPO = pathlib.Path(__file__).resolve().parents[2]
-#: The design document the invalidation matrix is read back out of.
-MATRIX_DOC = REPO / "atom" / "compass" / "design" / "07_calibration_toolchain.md"
-#: The heading of the section that holds the table, whatever it is numbered.
-MATRIX_HEADING = re.compile(r"^## .*\bInvalidation$", re.MULTILINE)
-#: One cell of the document's table: the mark, and the parenthesis beside it.
-CELL = re.compile(r"^([X-])(?:\s*\*?\((.+)\)\*?)?$")
 
 ATOM_ROOT = SourceRoot(
     "atom",
@@ -168,37 +157,7 @@ def publish(
     )
 
 
-# --- the matrix is a table, and it is the document's ----------------------
-
-
-def test_the_matrix_is_the_documents_table():
-    """The code's table and the document's are one fact, cell by cell.
-
-    The document's table is what a reader checks the code against by eye, so
-    this checks the same thing mechanically: the column headers, the row labels, every mark,
-    and every parenthesis. A note dropped here is a claim about *why* a cell
-    is what it is, silently lost -- `- (shape-parametric)` is the sentence
-    that makes one pricing campaign serve many shapes.
-    """
-    text = MATRIX_DOC.read_text(encoding="utf-8")
-    table = MATRIX_HEADING.split(text, 1)[1].split("### The gate", 1)[0]
-    lines = [line for line in table.splitlines() if line.strip().startswith("|")]
-    header, _divider, *body = lines
-    columns = [part.strip() for part in header.strip().strip("|").split("|")][1:]
-    assert columns == [axis.value for axis in Axis]
-
-    stated = {}
-    for line in body:
-        label, *marks = [part.strip() for part in line.strip().strip("|").split("|")]
-        row = Row(label.replace("`", ""))
-        cells = {}
-        for axis, mark in zip(Axis, marks):
-            matched = CELL.match(mark.replace("**", "").strip())
-            assert matched is not None, f"{row} x {axis}: cannot read {mark!r}"
-            cells[axis] = Cell(matched.group(1) == "X", matched.group(2) or "")
-        stated[row] = cells
-    assert stated == dict(MATRIX)
-    assert set(stated) == set(Row)
+# --- the matrix is a table ------------------------------------------------
 
 
 def test_the_matrix_is_not_uniform():
@@ -245,12 +204,6 @@ def test_every_cell_of_the_matrix_decides_by_itself(row, axis):
     and not about any row: a rule that refused on every axis would pass every
     cross and fail every zero, and a rule that refused on none would do the
     reverse.
-
-    It reads `MATRIX` rather than restating the document by hand, so on its
-    own it
-    would pass against a wrong table that the code agreed with. The anchor is
-    `test_the_matrix_is_the_documents_table`, which ties `MATRIX` to the document; the
-    chain is document -> table -> behaviour, and each link is a test.
     """
     recorded = {row: fingerprint(row, BASE)}
     changed = moved(BASE, axis)

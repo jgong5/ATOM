@@ -5,8 +5,9 @@
 
 The simulator substitutes predicted durations for real work, so any call that
 parks a thread on the real clock has to be accounted for: some become an
-advance of simulated time, some are only annotated, some are timeouts that
-must be raised, and some are invisible to simulated time and are left alone.
+advance of simulated time, some carry a message from one logical process to
+another, some are timeouts that move onto the simulated clock, and some are
+invisible to simulated time and are left alone.
 Deciding that per call site is a reading job; keeping the *list* honest as
 ATOM changes is not, and that is what this module does.
 
@@ -258,7 +259,7 @@ SHAPES: tuple[Shape, ...] = (
     ),
     Shape(
         "p2p",
-        frozenset({"send", "isend", "irecv", "batch_isend_irecv"}),
+        frozenset({"send", "send_multipart", "isend", "irecv", "batch_isend_irecv"}),
         "hands a message to a peer; parks when the transport's buffer is full",
     ),
     Shape(
@@ -333,7 +334,6 @@ class Site:
         return {
             "id": self.id,
             "file": self.file,
-            "line": self.line,
             "symbol": self.symbol,
             "call": self.call,
             "expr": self.expr,
@@ -341,15 +341,27 @@ class Site:
         }
 
 
-class _CallVisitor(ast.NodeVisitor):
+class _ScopedVisitor(ast.NodeVisitor):
+    """Tracks the enclosing qualified name a site or an anchor carries.
+
+    ``spans`` maps each such name to the line spans of the definitions it
+    names; ``<module>`` spans the whole file.
+    """
+
     def __init__(self, rel_path: str, source: str) -> None:
         self.rel_path = rel_path
         self.source = source
         self._scope: list[str] = []
         self.sites: list[Site] = []
+        self.spans = {"<module>": [(1, len(source.splitlines()))]}
+
+    @property
+    def symbol(self) -> str:
+        return ".".join(self._scope) or "<module>"
 
     def _push(self, node):
         self._scope.append(node.name)
+        self.spans.setdefault(self.symbol, []).append((node.lineno, node.end_lineno))
         self.generic_visit(node)
         self._scope.pop()
 
@@ -357,6 +369,8 @@ class _CallVisitor(ast.NodeVisitor):
     visit_AsyncFunctionDef = _push
     visit_ClassDef = _push
 
+
+class _CallVisitor(_ScopedVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
         if isinstance(func, ast.Attribute):
@@ -377,7 +391,7 @@ class _CallVisitor(ast.NodeVisitor):
                     Site(
                         file=self.rel_path,
                         line=node.lineno,
-                        symbol=".".join(self._scope) or "<module>",
+                        symbol=self.symbol,
                         call=text,
                         expr=whole,
                         shape=shape.name,
@@ -387,23 +401,8 @@ class _CallVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-class _SpinVisitor(ast.NodeVisitor):
+class _SpinVisitor(_ScopedVisitor):
     """Find ``while`` loops that go around without calling anything that parks."""
-
-    def __init__(self, rel_path: str, source: str) -> None:
-        self.rel_path = rel_path
-        self.source = source
-        self._scope: list[str] = []
-        self.sites: list[Site] = []
-
-    def _push(self, node):
-        self._scope.append(node.name)
-        self.generic_visit(node)
-        self._scope.pop()
-
-    visit_FunctionDef = _push
-    visit_AsyncFunctionDef = _push
-    visit_ClassDef = _push
 
     def visit_While(self, node: ast.While) -> None:
         if self._is_spin(node):
@@ -413,7 +412,7 @@ class _SpinVisitor(ast.NodeVisitor):
                 Site(
                     file=self.rel_path,
                     line=node.lineno,
-                    symbol=".".join(self._scope) or "<module>",
+                    symbol=self.symbol,
                     call=whole,
                     expr=whole,
                     shape="spin_loop",
@@ -448,8 +447,7 @@ def _number(sites: list[Site]) -> list[Site]:
     symbol plus the whole call expression plus its position among *textually
     identical* siblings. Siblings that share an ordinal are the same call
     written the same way in one function, so the inventory has to give them the
-    same answer, and a test asserts it does. The line is still recorded, and
-    checked separately, so the list stays quotable.
+    same answer, and a test asserts it does. The line only orders the sites.
     """
     seen: dict[tuple[str, str, str], int] = {}
     for site in sites:
@@ -503,15 +501,6 @@ INVENTORY_PATH = Path(__file__).with_name("sync_sites.json")
 def load_inventory(path: str | os.PathLike | None = None) -> dict:
     """The checked-in classification, as written."""
     return json.loads(Path(path or INVENTORY_PATH).read_text(encoding="utf-8"))
-
-
-def category_counts(inventory: dict | None = None) -> dict[str, int]:
-    """How many classified sites sit in each category."""
-    inv = inventory if inventory is not None else load_inventory()
-    counts: dict[str, int] = {}
-    for row in inv["sites"] + inv["anchors"]:
-        counts[row["category"]] = counts.get(row["category"], 0) + 1
-    return counts
 
 
 def repo_root_from_here() -> Path:

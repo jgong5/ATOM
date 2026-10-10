@@ -8,6 +8,8 @@ import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from atom.utils import clock
+
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
     STREAM_DONE_MESSAGE,
@@ -220,7 +222,7 @@ def create_chat_chunk(
     chunk = {
         "id": request_id,
         "object": CHAT_COMPLETION_CHUNK_OBJECT,
-        "created": int(time.time()),
+        "created": int(clock.now(time.time)),
         "model": model,
         "choices": [
             {
@@ -371,7 +373,7 @@ async def stream_chat_response(
         usage_chunk = {
             "id": request_id,
             "object": CHAT_COMPLETION_CHUNK_OBJECT,
-            "created": int(time.time()),
+            "created": int(clock.now(time.time)),
             "model": model,
             "choices": [],
             "usage": usage,
@@ -449,7 +451,7 @@ def build_chat_response(
     """Build a non-streaming chat completion response (single choice)."""
     response = ChatCompletionResponse(
         id=request_id,
-        created=int(time.time()),
+        created=int(clock.now(time.time)),
         model=model,
         choices=[
             _build_chat_choice(
@@ -518,7 +520,7 @@ def build_chat_response_multi(
     completion_tokens = sum(out["num_tokens_output"] for out in final_outputs)
     return ChatCompletionResponse(
         id=request_id,
-        created=int(time.time()),
+        created=int(clock.now(time.time)),
         model=model,
         choices=choices,
         usage={
@@ -688,7 +690,7 @@ async def stream_chat_response_fanout(
         usage_chunk = {
             "id": request_id,
             "object": CHAT_COMPLETION_CHUNK_OBJECT,
-            "created": int(time.time()),
+            "created": int(clock.now(time.time)),
             "model": model,
             "choices": [],
             "usage": usage,

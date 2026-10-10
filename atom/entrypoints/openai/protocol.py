@@ -9,6 +9,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from atom.utils import clock
+
 # ============================================================================
 # Constants
 # ============================================================================
@@ -297,7 +299,7 @@ class ModelCard(BaseModel):
 
     id: str
     object: str = "model"
-    created: int = Field(default_factory=lambda: int(time.time()))
+    created: int = Field(default_factory=lambda: int(clock.now(time.time)))
     owned_by: str = "atom"
 
 
