@@ -42,9 +42,8 @@ tree, which needs the engine, which this tier does not import; and there is no
 recording of a card nobody has run. So `ModelTerms` takes those two terms rather
 than deriving them, with no default -- the same shape as the spec's "a runtime
 constant has no default" rule, and for the same reason. `from_declared_config`
-fills all three with declared formulas and labels every one of them, except
-that the activation term comes from the machine spec when a real run measured
-bytes per token for this model at this width.
+fills all three with declared formulas and labels every one of them, unless a
+real run measured the activation term's bytes per token in the machine spec.
 """
 
 from __future__ import annotations
@@ -135,10 +134,9 @@ class ModelTerms:
         warmup_tokens: int,
         dtype_bytes: int | None = None,
         config_json: dict | None = None,
-        measured_activations: tuple | None = None,
+        measured_activations: tuple[str, float] | None = None,
     ) -> ModelTerms:
-        """All three from geometry and declared coefficients, each labelled,
-        except activations a real run measured.
+        """All three from geometry and declared coefficients, each labelled.
 
         `config_json` is the model's config.json as loaded; without it, a
         field `config`'s class has a default for is refused, since the
@@ -146,17 +144,20 @@ class ModelTerms:
         states `moe_intermediate_size`, takes its live intermediate from its
         expert fields.
 
-        `measured_activations` is what `MachineSpec.activations_for` returns,
-        an entry and its bytes per token at `tp_size`; given, the activation
-        term is those bytes times `warmup_tokens`, basis spec. Its scratch is
-        inside it: 0.1 KB/token on the 0.6B against 39.6 KB/token on the 27B,
-        the difference between -35.0% and +3.4% held out, which no geometry
-        formula reproduces.
+        With fake models, a declared formula suffices and must say so.
+        Every term below is `Basis.DECLARED` and every one names its
+        successor, because none of the three is its eventual source: weights
+        are owed a meta build, buffers a recording, and
+        activations a liveness walk over a traced op graph *plus* the
+        per-leaf invisible-scratch constants -- and the second is the one
+        with no law behind it. The measured spread that makes it load-bearing
+        is 0.1 KB/token on the 0.6B against 39.6 KB/token on the 27B, the
+        difference between -35.0% and +3.4% held out. A formula does not
+        stand in for that on a real model.
 
-        Otherwise every term below is `Basis.DECLARED` and names its
-        successor: weights are owed a meta build, buffers a recording, and
-        activations a measured entry or a liveness walk over a traced op
-        graph plus the per-leaf invisible-scratch constants.
+        `measured_activations`, what `MachineSpec.activations_for` returns,
+        replaces the activation formula with that entry's bytes per token
+        times `warmup_tokens`; the scratch is inside it.
         """
         if tp_size < 1:
             raise ValueError(f"tensor-parallel width is at least 1: {tp_size}")
@@ -258,10 +259,10 @@ class ModelTerms:
             f"{warmup_tokens} warmup tokens x {dtype_bytes} B x "
             f"({graph_pool.LIVE_TENSORS_PER_LAYER} x {hidden} hidden + "
             f"{_LIVE_INTERMEDIATE} x {live})",
-            "a device.activations entry measured on a real run of this model "
-            "at this width replaces this, as would a liveness walk over a "
-            "traced op graph plus the per-leaf invisible-scratch constants; "
-            "the per-layer coefficient is ATOM's own "
+            "a device.activations entry, or a liveness walk over a traced op "
+            "graph plus the per-leaf "
+            "invisible-scratch constants, replace this; the per-layer "
+            "coefficient is ATOM's own "
             "(ModelRunner._piecewise_per_token_bytes), over one live "
             "layer rather than all of them",
         )
@@ -272,7 +273,7 @@ class ModelTerms:
                 int(warmup_tokens * per_token),
                 Basis.SPEC,
                 f"{warmup_tokens} warmup tokens x {per_token} B/token, "
-                f"device.activations[{entry.id}].bytes_per_token[{tp_size}]",
+                f"device.activations[{entry}].bytes_per_token[{tp_size}]",
             )
         return cls(weights, buffers, activations)
 

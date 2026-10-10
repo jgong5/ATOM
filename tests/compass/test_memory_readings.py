@@ -582,7 +582,7 @@ def test_a_measured_entry_prices_the_activations_only_for_its_model_and_width(qw
 def test_two_activation_entries_for_one_model_are_refused_where_the_spec_is_read():
     document = copy.deepcopy(DOCUMENT)
     document["device"]["activations"] = [ACTIVATIONS, dict(ACTIVATIONS, id="again")]
-    with pytest.raises(SpecRefusal, match="resolves to both"):
+    with pytest.raises(SpecRefusal, match="resolves to two entries"):
         MachineSpec.from_mapping(document)
 
 

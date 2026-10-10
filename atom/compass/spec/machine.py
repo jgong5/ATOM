@@ -79,8 +79,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
-from . import activations
-from .activations import ActivationEntry
 from .fields import (
     BLOCKS,
     BY_PATH,
@@ -103,6 +101,40 @@ from .rules import (
 from .tokenizers import Backend, TokenizerEntry, TokenizerTable, table
 
 ACTIVATIONS = "device.activations"
+#: An activation entry: the model it was measured on, keyed by its
+#: architectures and its config.json's sha256 (one architecture serves every
+#: size of a family), and per tensor-parallel width one real run's warmup
+#: `peak - current` allocated bytes over its warmup tokens, the reading ATOM's
+#: `ModelRunner._estimate_cudagraph_overhead` takes.
+ACTIVATION_FIELDS = {
+    "id": Kind.TEXT,
+    "fingerprint": Kind.TEXT,
+    "applies_to": Kind.NAMES,
+    "bytes_per_token": Kind.WIDTH_TABLE,
+}
+
+
+def _check_activations(entries) -> None:
+    """Refuse an entry that is not one, and a model two entries answer for."""
+    seen = set()
+    for index, entry in enumerate(entries):
+        where = f"{ACTIVATIONS}[{index}]"
+        if not isinstance(entry, Mapping) or set(entry) != set(ACTIVATION_FIELDS):
+            raise SpecRefusal(
+                Rule.SHAPE,
+                f"`{where}` holds {entry!r}, which is not an activation entry",
+                f"write a mapping of exactly {', '.join(ACTIVATION_FIELDS)} there",
+            )
+        for name, kind in ACTIVATION_FIELDS.items():
+            check(Field(name, kind), entry[name], f"{where}.{name}")
+        for claim in ((a, entry["fingerprint"]) for a in entry["applies_to"]):
+            if claim in seen:
+                raise SpecRefusal(
+                    Rule.SHAPE,
+                    f"{claim[0]!r} with config {claim[1]} resolves to two entries",
+                    "one model resolves to one entry; merge their widths into it",
+                )
+            seen.add(claim)
 
 
 def _missing(field: Field) -> None:
@@ -241,7 +273,7 @@ class MachineSpec:
                     _missing(field)
                 continue
             values[field.path] = check(field, found[field.path], field.path)
-        activations.table(values.get(ACTIVATIONS, ()))
+        _check_activations(values.get(ACTIVATIONS, ()))
         return cls(values, table(values["host.tokenizers"]))
 
     def value(self, path: str) -> Any:
@@ -306,11 +338,17 @@ class MachineSpec:
 
     def activations_for(
         self, architecture: str | None, fingerprint: str | None, tp_width: int
-    ) -> tuple[ActivationEntry, float] | None:
-        """The activation bytes per token measured for a model at a width, with
-        its entry, or None when nothing was measured for it."""
-        entries = activations.table(self.values.get(ACTIVATIONS, ()))
-        return activations.resolve(entries, architecture, fingerprint, tp_width)
+    ) -> tuple[str, float] | None:
+        """The id of the entry measured for this model and its activation bytes
+        per token at this width, or None when nothing was measured for it."""
+        for entry in self.values.get(ACTIVATIONS, ()):
+            if (
+                architecture in entry["applies_to"]
+                and fingerprint == entry["fingerprint"]
+                and tp_width in entry["bytes_per_token"]
+            ):
+                return entry["id"], entry["bytes_per_token"][tp_width]
+        return None
 
     def check_stack(
         self, observed: Mapping[str, str], *, carried_only: bool = False
