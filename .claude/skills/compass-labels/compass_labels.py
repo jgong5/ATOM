@@ -126,11 +126,6 @@ def _pr_files_and_title(repo, number):
     return [f for f in files if f], title
 
 
-def _existing_labels(repo, number):
-    out = _gh_json(["api", "repos/%s/issues/%s" % (repo, number), "--jq", ".labels[].name"])
-    return {line for line in out.splitlines() if line}
-
-
 def _all_labels(modules):
     labels = {module_label(m): "atom/compass/%s/ and its tests" % m for m in modules}
     labels.update(FIXED_MODULE_LABELS)
