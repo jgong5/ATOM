@@ -8,6 +8,10 @@ written against it yet; implementation follows the execution plan in `16`.
 `04_model_capture_and_cost_ir.md` (cost) and `01_execution_and_time_model.md` D3
 (lookahead floors).
 
+**Revised 2026-10-10 for `16` D95:** the schema holds what the MI455 roofline projection
+needs: an FP4 matrix-core rate, the size of the domain the in-node fabric joins, and a
+*sourced* or *assumed* status on every field (D25).
+
 **Scope.** The single input artifact that tells Compass what machine it is simulating,
 its schema, and the tools that fill it in. A project requirement is that compute, memory
 size, bandwidth and interconnect are **configured and not read from a device runtime**, so
@@ -71,7 +75,7 @@ name: mi355x-8gpu-2node
 provenance:                      # one block, not per-field tags
   authored_by: <who>
   date: 2026-09-18
-  method: datasheet | probed | transferred-from:<spec-name> | mixed
+  method: datasheet | probed | transferred-from:<spec-name> | assumed | mixed
   fragments: [...]               # filled by `merge`, see D26
   notes: free text
 
@@ -106,6 +110,7 @@ device:
   compute:
     bf16_flops:                2.5e15
     fp8_flops:                 5.0e15
+    fp4_flops:                 10.0e15  # optional: absent where there is no FP4 matrix core
     derate:                    0.70
   runtime_constants:           # the "table, not a law" terms, keyed by TP width
     # Device memory held OUTSIDE the torch allocator: HIP context, loaded code
@@ -130,6 +135,7 @@ device:
 interconnect:
   intra_node:
     topology: fully_connected
+    domain_devices:             8        # devices the fabric joins; may exceed count_per_node
     link_bandwidth_bytes_per_s: 1.0e12
     link_latency_s:             2.0e-6
     derate:                     0.80
@@ -155,6 +161,8 @@ mapping so a reader can follow the term into ATOM's code without guessing.
 | `runtime_constants.cudagraph_pool` | `cudagraph_overhead` | measured `91.1 MiB + 0.3033 MiB per captured token` at W=1; flat **104 MiB** above W=1, where the allocated delta was byte-identical (79,692,800) across three widths and three ladders |
 | `tokenizers[].*` | admission queue | cc-traces p50 input is **88,768 tokens**; at 2 M tok/s that is ~44 ms, **3x take2's entire admission constant**, and it scales with prompt length while a constant does not |
 | `ipc.*`, `interconnect.*_latency_s` | **Clock Authority lookahead floors** (doc 01 D3) | a zero lookahead serializes the whole simulation |
+| `compute.fp4_flops` | tier-0 roofline (`10` D64) for an FP4 leaf | DeepSeek-V4-Pro's routed experts are FP4 (`16` D95), and MI455X's dense FP4 peak is twice its FP8 peak ([#504](https://github.com/jgong5/ATOM/issues/504#issuecomment-6080974531)); priced at the FP8 rate they would read twice as slow |
+| `intra_node.domain_devices` | the link a collective group rides (`10` D66) | MI455X's UALoE fabric joins 72 GPUs across compute trays of 4 (#504), so a TP8 or EP8 group spans two trays without touching the NICs; `count_per_node` alone would send it over `inter_node` |
 | every `derate` | cost model | no kernel reaches spec peak; the gap between datasheet and achievable is the user's to declare |
 
 **On `derate`.** The name was kept deliberately after considering `achievable_fraction`
@@ -163,6 +171,16 @@ in five places with identical meaning, and it is the term the schema rules make
 *mandatory* so that nobody quietly uses a datasheet FLOP as an achievable one. A name
 that reads like a neutral measurement would undercut that; `derate` reads like what it is
 — a declared haircut the author is responsible for.
+
+**Precisions and links.** Each `*_flops` is the dense matrix-core peak at one operand
+precision, never a structured-sparsity figure: `fp8_flops` covers OCP FP8 and MXFP8,
+`fp4_flops` is OCP MXFP4. `fp4_flops` is the one optional rate. A device with no FP4
+matrix-core path (gfx942) omits it, and a law asked to price an FP4 leaf on that spec
+refuses by name rather than borrowing another precision's rate. `intra_node` is the
+scale-up fabric: it carries TP collectives, the DP group's gather and MORI's all-to-all,
+and `topology` says how it joins its `domain_devices`, `fully_connected` (a link per pair)
+or `switched` (MI455X's UALoE). `inter_node` is the scale-out network: it carries
+Mooncake's KV transfer between the prefill and the decode node (`01` D6).
 
 ### Schema rules
 
@@ -179,6 +197,16 @@ that reads like a neutral measurement would undercut that; `derate` reads like w
    always refuse.
 4. **The whole resolved spec is echoed into every run artifact.** The KV gate is **≤5%**;
    a number whose spec cannot be recovered from the artifact is unattributable.
+5. **Every field is *sourced* or *assumed*, and the fragment that supplied it says which.**
+   `merge` records that fragment per field (D26). A fragment whose `method` is `assumed`
+   supplies values no source gives, and its `notes` say why each value was chosen; a
+   fragment with any other method is the source of what it supplies, and a `datasheet`
+   fragment's `notes` cite the document and the date it was read. A derate for a device
+   never run is assumed (`10` D69): a vendor's measured fraction of peak informs the
+   choice and does not source it. The MI455X spec's two link latencies are unpublished
+   and are assumed by owner ruling
+   ([#504](https://github.com/jgong5/ATOM/issues/504#issuecomment-6092687352)). `08` D50.2
+   says how the projection reports its assumed fields.
 
 ### `host.tokenizer` is keyed by tokenizer identity, not by model
 
@@ -342,6 +370,6 @@ which cancelled — the largest being 25% of a single term.
 | # | Decision | Date |
 |---|---|---|
 | D24 | The spec describes the machine; ATOM's config describes the deployment. Thread-pool width becomes an ATOM config option, not a Compass one. | 2026-09-18 |
-| D25 | Four-section schema: `provenance`, `host`, `device`, `interconnect`. Mandatory derates, no defaults for `runtime_constants`, `software_pinned_to` checked, whole spec echoed into every artifact. | 2026-09-18 |
+| D25 | Four-section schema: `provenance`, `host`, `device`, `interconnect`. Mandatory derates, no defaults for `runtime_constants`, `software_pinned_to` checked, whole spec echoed into every artifact. Revised for the MI455 projection: an optional dense `fp4_flops`, `intra_node.domain_devices` for a scale-up fabric wider than a node, and every field *sourced* or *assumed* by the method of the fragment that supplied it. | 2026-09-18; revised 2026-10-10 |
 | D26 | Probes emit fragments; `merge` / `validate` / `explain` combine and check them. Four hardware tiers plus datasheet and transfer paths. Every hardware probe implements the contamination refusals. | 2026-09-18 |
 | D25.1 | Runtime-constant fields renamed to say what they are; ATOM's own term recorded as a mapping column. `host.tokenizer` becomes `host.tokenizers[]`, keyed by tokenizer identity (id + backend + fingerprint) with `applies_to` model architectures. | 2026-09-19 |

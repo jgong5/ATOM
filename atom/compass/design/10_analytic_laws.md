@@ -10,6 +10,9 @@ its numbers as targets, not findings.
 **Depends on:** `05_machine_spec_and_probes.md` (the device parameters), `04` (the IR whose
 shapes feed a law), `07` D36 (the tier and the resolver ladder).
 
+**Revised 2026-10-10 for `16` D95:** tier 0 is on M2's critical path, and D68 names the
+DeepSeek-V4-Pro operator families whose laws M2 needs.
+
 **Scope.** Cost and memory derived from device parameters and model geometry, with **no
 measurement of the subject**. Serves three purposes: a standalone roofline tier usable on
 day zero, rung 4 of the resolver ladder where empirical data is missing, and the only route
@@ -77,7 +80,8 @@ addend**:
   t_step = max( Σ t_leaf ,  launches × h )
 ```
 
-All four parameters come from the machine spec (doc 05 D25): `compute.*_flops`,
+All four parameters come from the machine spec (doc 05 D25): `compute.*_flops` at the
+leaf's operand precision,
 `memory.bandwidth_bytes_per_s`, their `derate`s, and — for `h` — `host.*`.
 
 ### Why the host floor is not optional
@@ -165,7 +169,8 @@ A two-regime model keyed off the spec's `interconnect` section:
 with the **algorithm named in the spec**, not assumed — because AITER's one-stage reduce,
 its quick-reduce, the custom all-gather and RCCL all have different `message_bytes(N)`, and
 the default path is `ATOM_USE_CUSTOM_ALL_GATHER=1`, which is **entirely invisible to a
-dispatch trace** (doc 07 D40).
+dispatch trace** (doc 07 D40). A group rides `intra_node` while it fits in
+`intra_node.domain_devices` (doc 05 D25), whatever `count_per_node` is.
 
 Expected accuracy: poor at the sizes ATOM actually uses, because those are latency-bound
 and the latency term is the one least constrained by a datasheet. Collectives are ~6.6% of
@@ -289,8 +294,29 @@ For every leaf where **both** a measured price and an analytic law exist, the ra
 evidence about whether that law can be trusted where no measurement exists. Build tier 0
 after the empirical campaign and there is no way to check it except by measuring again.
 
-**So tier 0's laws are authored during the empirical campaign, not after it**, even though
-they are not needed until later.
+**So tier 0's laws are authored during the empirical campaign, not after it.**
+
+### On M2's critical path
+
+`16` D95 makes the laws needed during the campaign as well. M2's MI455 roofline projection
+is built from them, so they are an M2 deliverable rather than a side wave. `16` W5.2
+authors the laws for DeepSeek-V4-Pro's operator families below, per precision, alongside
+`16` W4.4's MI355X calibration of the same families, which supplies each law's measured
+counterpart:
+
+| Family | Law | Spec fields read (`05` D25) |
+|---|---|---|
+| MoE expert GEMMs | D64 | `compute.fp4_flops` for the FP4 routed experts, the operand precision's rate for the rest; `memory.bandwidth_bytes_per_s` |
+| attention, with its compressors | D64, with D65's band where a plateau lies in range | `compute.*_flops` at each leaf's operand precision; `memory.bandwidth_bytes_per_s` |
+| the CSA indexer | D64 | the same |
+| mHC | D64 | the same |
+| the DP group's variable-size gather | D66 | `interconnect.intra_node.*` |
+| MORI dispatch and combine, for the EP8 step | D66 | `interconnect.intra_node.*` |
+
+Mooncake's KV transfer needs no law here: `01` D6 charges it `latency + bytes/bandwidth`
+from `interconnect.inter_node`. Most of these families are opaque leaves, so their FLOPs
+and bytes come from the hand-written extractors of T35, which W5.2 owes for these families
+first. Tier 0 is graded by D67.1.
 
 ### The promotion rule
 
@@ -364,7 +390,7 @@ what tier b exists for.
 | D66 | Two-regime collective model with the algorithm named in the spec. Textbook ring/log models are refuted on this fabric. | 2026-09-19 |
 | D67.1 | Tier-0 accuracy goals declared per quantity: ≤5% on weights and on KV capacity/block count (the empirical gate for KV, tighter than it for weights), ≤25% each other non-KV memory term, ≤30% step time, ≤40% end-to-end. **Configuration ranking (top-1 and top-3 set) is the primary gate**; no false "fits". Checked against the empirical campaign at no extra GPU cost. | 2026-09-19 |
 | D67 | Analytic memory is the existing memory model with the activation coefficient derived rather than walked. Weights and KV exact; scratch, `non_torch` and load residue stay declared constants. | 2026-09-19 |
-| D68 | Tier 0's laws are authored **during** the empirical campaign, because that campaign is their only validation set. Promotion to rung 4 is per leaf, requires tracking the measured price within ~2%, and is revocable. | 2026-09-19 |
+| D68 | Tier 0's laws are authored **during** the empirical campaign, because that campaign is their only validation set. Promotion to rung 4 is per leaf, requires tracking the measured price within ~2%, and is revocable. Revised for `16` D95: the laws for DeepSeek-V4-Pro's operator families are on M2's critical path, for the MI455 projection. | 2026-09-19; revised 2026-10-10 |
 | D69 | On an unmeasured device, tier 0 is derate-dominated. Report the derate and a ±20% sensitivity band; prefer ranking claims to absolute ones. | 2026-09-19 |
 | D70 | Expected accuracy is declared in advance, per use. Single-digit latency error is not a tier-0 target. | 2026-09-19 |
 
