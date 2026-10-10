@@ -590,7 +590,15 @@ class _FromScratch(_Recorded):
 def test_the_kept_n_grants_what_n_recomputed_at_every_request_grants():
     for seed in SEEDS:
         for pick in PICKS.values():
-            kept = _drive(seed, pick)[0]
+            kept, _, finished = _drive(seed, pick)
             recomputed, _, ca = _drive(seed, pick, cls=_FromScratch)
             assert ca.drifted == 0, seed
             assert kept == recomputed, seed
+            # The table a run ends with reads every N from the state too.
+            table = finished.lp_table()
+            n = {row.lp: _rule_n(finished, row) for row in table}
+            for row in table:
+                d = finished._channels.distance
+                assert row.row == tuple(
+                    (j, n[j] + d(j, row.lp)) for j in n if j != row.lp
+                ), seed

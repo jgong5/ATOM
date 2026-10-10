@@ -412,8 +412,8 @@ class ClockAuthority:
         if self.timeline is not None:
             self.timeline.record(i, self._now[i], g, self._state[i], recovered)
         self.grants[i.name] += 1
+        # g is N[i], so N[i] is unchanged: a running LP's N is its clock.
         self._now[i], self._state[i], self._target[i] = g, RUNNING, None
-        self._nv[i] = g
         return (i, g, released)
 
     def _finish(self) -> list:
