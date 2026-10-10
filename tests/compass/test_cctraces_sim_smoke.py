@@ -68,14 +68,14 @@ def _template(path: Path, **extra) -> Path:
     return path
 
 
-def _pair(root: Path, template: Path, **env) -> list:
+def _pair(root: Path, template: Path, **extra_env) -> list:
     """The script run twice, `PYTHONHASHSEED` 1 and 2: each cell and its result line."""
     out = []
     for seed in ("1", "2"):
         cell = root / f"seed{seed}"
         env = dict(
             os.environ,
-            **env,
+            **extra_env,
             PYTHONHASHSEED=seed,
             MODEL=MODEL,
             TRACES=TRACES,
