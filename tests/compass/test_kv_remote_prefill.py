@@ -135,7 +135,12 @@ def pd(geometry, monkeypatch):
     p = connector(rt_p, monkeypatch, model, kv_role="kv_producer", address=address)
     d = connector(rt_d, monkeypatch, model, kv_role="kv_consumer", address=address)
     return SimpleNamespace(
-        model=model, rt_p=rt_p, rt_d=rt_d, p=scheduler_with(p), d=scheduler_with(d)
+        model=model,
+        address=address,
+        rt_p=rt_p,
+        rt_d=rt_d,
+        p=scheduler_with(p),
+        d=scheduler_with(d),
     )
 
 
@@ -218,6 +223,7 @@ def test_prefill_frees_at_max_a_r_plus_t_and_decode_is_ready_at_a_t_notify(
     (y,) = admitted(pd, [x], seq_factory, SEND)
     assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert y.kv_transfer_params["do_remote_prefill"] is False, "Mooncake clears it"
+    assert pd.d.kv_connector.has_pending_work() is True, "an idle decode stops polling"
 
     a = SEND + L
     T = pd.model.duration_s(len(y.block_table))
@@ -250,6 +256,65 @@ def test_a_write_request_for_an_unfinished_prefill_is_refused(pd, seq_factory):
     admitted(pd, [x], seq_factory, SEND)
     with pytest.raises(ValueError, match="before its prefill finished"):
         engine_step(pd.p, pd.rt_p, SEND + L, (0, SEND + L))
+
+
+#: The decode pool's block size (`MockConfig`'s), and a different one.
+HBS = 4
+
+
+@pytest.mark.parametrize(
+    "blob_hbs, priced",
+    [(HBS, 1), (4 * HBS, len(PROMPT) // HBS)],
+    ids=["matching", "different"],
+)
+def test_a_decode_side_prefix_hit_is_written_only_when_both_hash_alike(
+    pd, monkeypatch, seq_factory, blob_hbs, priced
+):
+    """Mooncake's rule: the blocks decode already caches are not written,
+    unless prefill hashed its blocks at another size."""
+    half = connector(
+        pd.rt_d,
+        monkeypatch,
+        pd.model,
+        kv_role="kv_consumer",
+        address=pd.address,
+        kv_cache_block_size=HBS,
+    )
+    pd.d = scheduler_with(half, enable_prefix_caching=True)
+    warm = seq_factory(PROMPT)
+    pd.d.block_manager.allocate(warm)
+    pd.d.block_manager.hash_blocks(warm, warm.num_tokens)
+    pd.d.block_manager.deallocate(warm)
+
+    blob = {"do_remote_prefill": True, "transfer_id": 0, "hash_block_size": blob_hbs}
+    (y,) = admitted(
+        pd, [SimpleNamespace(kv_transfer_params_output=blob)], seq_factory, SEND
+    )
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert y.num_cached_tokens == len(PROMPT) - HBS, "no decode-side hit"
+
+    ready = SEND + L + pd.model.duration_s(priced) + L
+    engine_step(pd.d, pd.rt_d, ready - TICK)
+    pd.d.schedule()
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS, "ready early"
+    engine_step(pd.d, pd.rt_d, ready)
+    pd.d.schedule()
+    assert y.status is SequenceStatus.RUNNING
+
+
+def test_pipeline_parallelism_is_refused_by_name(geometry, monkeypatch):
+    """A PP head never hands the connector an empty poll, so nothing completes."""
+    with pytest.raises(
+        ValueError,
+        match="pipeline_parallel_size is 2.*process_completions.*MSG_RELEASE",
+    ):
+        connector(
+            runtime("engine-P"),
+            monkeypatch,
+            model_for(geometry, PEAKS[0]),
+            kv_role="kv_producer",
+            pipeline_parallel_size=2,
+        )
 
 
 @pytest.mark.parametrize("follower", [False, True], ids=["idle", "follower"])
