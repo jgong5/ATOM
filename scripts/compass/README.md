@@ -511,8 +511,21 @@ stream from `frontend-D`, as the run file's channel table names them. The result
 line adds `kv_transfers` and `kv_transfer_mean_s`, from the line the prefill
 engine logs per KV transfer.
 
+`REAL=1` runs the same TP1 cell on a real server, on the GPU and the wall clock,
+so a real and a simulated cell at one seed, concurrency and traces hash send the
+same requests and warm up on the same ones. The server runs ATOM's own runner
+(no `--compass-run`), and aiperf runs as shipped: `HARNESS_PYTHON` must have
+agentx-harness without compass-harness (exit 92 otherwise), and the script pins
+the benchmark id as compass-harness does. The result line reads aiperf's export
+alone and adds `contaminated`, true when `rocm-smi` lists any process on the
+cell's GPU before or after it, with each one's pid and VRAM bytes. Both modes
+write the TP1 step record to `steps/dp0.jsonl` (`atom/compass/parity`);
+`RECORD=0` turns it off. `FIRST_SESSION` skips that many traces, so calibration
+and graded cells can replay disjoint ones.
+
 Two runs of a cell with different `PYTHONHASHSEED` must give byte-identical step
-tables: `cmp A/step_table.txt B/step_table.txt`.
+tables and step records: `cmp A/step_table.txt B/step_table.txt`.
 `tests/compass/test_cctraces_sim_smoke.py` runs that pair on one session for 60
 simulated seconds when `ATOM_COMPASS_SLICE_MODEL`, `ATOM_COMPASS_CCTRACES` and
-`COMPASS_HARNESS_PYTHON` are set.
+`COMPASS_HARNESS_PYTHON` are set, and with `COMPASS_AIPERF_PYTHON` (no
+compass-harness) a real cell on zero dummy weights beside it.
