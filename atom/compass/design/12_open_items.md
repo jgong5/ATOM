@@ -80,7 +80,7 @@ M-f `14`; M-g `01` D3.5.
 | T1 | Inductor fusion correction (~4.8% of a decode step) |
 | T2 | Enumerate the structure set for Qwen3.8-27B |
 | T3 | Build the per-leaf parameter-extractor table (~20 entries) |
-| T4 | Establish scratch constants per leaf for the 27B |
+| T4 | Establish scratch constants per leaf for the 27B, once the liveness walk replaces the measured activation coefficient (`03` D16) |
 | T5 | Verify ATOM's model classes trace cleanly under FakeTensorMode at TP>1 |
 | T6 | Validate that `Repeat` grouping reproduces the flat prices term by term |
 | T7 | Validate `Par` reconstruction from stream ids |
@@ -143,7 +143,7 @@ M-f `14`; M-g `01` D3.5.
 
 | # | Item |
 |---|---|
-| T34 | Test whether the activation coefficient is derivable from geometry |
+| T34 | Test whether the activation coefficient is derivable from geometry: the fallback for a model nobody has run, against the measured coefficient that is the source ([#705](https://github.com/jgong5/ATOM/issues/705)) |
 | T35 | Derive FLOPs and bytes-moved expressions for the ~20 opaque leaves |
 | T36 | Name the collective algorithm per code path in the machine spec schema |
 | T37 | Decide whether the host floor is derivable or stays a per-model constant |
