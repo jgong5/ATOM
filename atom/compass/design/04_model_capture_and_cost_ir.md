@@ -540,18 +540,18 @@ never materialises: Qwen3.8-27B is dense-MLP (no `num_experts`, no `shared_exper
 dual-stream MoE cannot fire; it is not MLA so there is no metadata `prep_stream`; TBO
 defaults off and needs `--enable-tbo` plus `--enable-dp-attention` plus >=2 GPUs; and PP
 asserts `enforce_eager` so it cannot coexist with CUDA graphs. **DeepSeek-V4-Pro populates
-`Par` in M2**, on both nodes of each nightly 1P+1D cell in `recipes/mesh/DeepSeek-V4.md`
-(TP, DPA, TP MTP3, DPA MTP1). Only the DPA and DPA MTP1 cells pass
-`--enable-dp-attention`, and only their prefill node adds `--enable-tbo`.
+`Par` in M2**, on both nodes of each nightly 1P+1D cell in `recipes/mesh/DeepSeek-V4.md`.
+Only the DPA cells pass `--enable-dp-attention`, and only their prefill node adds
+`--enable-tbo`.
 
-- **Decode, in all four cells, runs without TBO.** Inside the replayed graph,
+- **Decode, in every cell, runs without TBO.** Inside the replayed graph,
   `DeepseekV4Attention.maybe_compressors_async` forks the compressors onto `alt_stream`
   and `indexer_stream`, and `MoE` runs the shared expert on `alt_stream` against the
   routed experts whenever this rank's tokens <= `ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`
   (1024 by default) — i.e. **every decode step** at the cells' concurrencies. The shared
   expert stays unfused because it is FP8 and the routed experts FP4.
 - **Prefill never forks the compressors**: it runs eager, and the compressor fork needs
-  `fc.in_hipgraph`, which only decode graph capture sets. A prefill step is one of three:
+  `fc.in_hipgraph`, which only decode graph capture sets. A prefill step is one of:
   - **a TBO step** (DPA cells only), taken when some DP rank reaches
     `ATOM_TBO_PREFILL_MIN_TOKENS` (8192 by default) and every rank can split
     (`local_tbo_precompute`, `atom/utils/tbo/ubatching.py`): two microbatches alternate
