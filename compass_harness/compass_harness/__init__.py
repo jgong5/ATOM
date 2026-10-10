@@ -17,6 +17,8 @@ the registered ``agentic_replay``.
 import importlib.util
 import sys
 
+from compass_harness import fingerprint
+
 RUNNER = "aiperf.timing.phase.runner"
 STRATEGY = "compass_harness.strategy:CompassAgenticReplay"
 
@@ -57,3 +59,7 @@ class _RunnerHook:
 
 if RUNNER not in sys.modules:
     sys.meta_path.insert(0, _RunnerHook())
+
+# After the hook: when discovery drops a refused plugin, the hook re-imports this
+# package as the runner loads, and the run fails on the same message.
+fingerprint.check()
