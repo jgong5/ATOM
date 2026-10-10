@@ -225,7 +225,7 @@ class _Slot:
 
 
 def serve(authority, endpoint: str = DEFAULT_ENDPOINT) -> _Server:
-    """Serve `authority` at `endpoint`. `close()` on the result stops it."""
+    """Serve `authority` at `endpoint`. `close()` on the result gives it up."""
     if endpoint in _SERVED:
         raise ValueError(
             f"{endpoint} is already served in this process; two authorities at "
