@@ -353,6 +353,12 @@ def test_the_standalone_authority_writes_the_step_table_at_the_finish_and_the_su
     tmp_path, monkeypatch
 ):
     run = _run_file(tmp_path, **PD)
+    # What a previous run into the same out_dir left there.
+    for name in [compass_run.COMMANDS_FILE.format(lp) for lp in LPS[:-1]] + [
+        compass_run.STEP_TABLE_FILE,
+        compass_run.SUMMARY_FILE,
+    ]:
+        (tmp_path / name).write_text('["command:from the last run"]')
     monkeypatch.setenv(compass_run.ENV, str(run))
     monkeypatch.setattr(compass_run, "_authority", None)
     endpoint = f"tcp://127.0.0.1:{_free_port()}"
@@ -408,12 +414,16 @@ def test_the_standalone_authority_writes_the_step_table_at_the_finish_and_the_su
     assert summary["coverage_report"] is True
 
 
-def test_a_summary_missing_a_server_lps_refusals_names_it(tmp_path, monkeypatch):
+def test_a_summary_missing_a_server_lps_refusals_names_it_though_the_last_run_left_one(
+    tmp_path, monkeypatch
+):
     run = json.loads(_run_file(tmp_path, **PD).read_text())
     monkeypatch.setattr(compass_run, "HAND_IN_WAIT_S", 0.2)
+    (tmp_path / compass_run.COMMANDS_FILE.format("engine-D")).write_text("[]")
+    authority = compass_run._RecordingAuthority(run)
     (tmp_path / compass_run.COMMANDS_FILE.format("engine-P")).write_text("[]")
     with pytest.raises(TimeoutError, match="no commands-engine-D.json, commands-fr"):
-        compass_run._write_summary(run, compass_run._RecordingAuthority(run))
+        compass_run._write_summary(run, authority)
 
 
 def test_an_idle_engine_runs_at_once_a_request_a_finished_transfer_left_ready(

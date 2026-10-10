@@ -32,6 +32,7 @@ Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
 where the step table, the run summary and each server LP's refusals go: an
 engine's are the worker's refused commands and the engine's refused clock
 calls, a frontend's its executor's refused jobs and its refused clock calls.
+The authority removes an earlier run's files there as it starts.
 
 A run file that also has ``router_s`` and ``kv_write_req_s`` describes a
 prefill-decode run over `prefill_decode_table`, and ``kv_link`` (``intra_node``
@@ -168,6 +169,11 @@ class _RecordingAuthority(ClockAuthority):
         self.started = self.finished = None
         self.done = threading.Event()
         self._joining = set(_servers(run))
+        # A rerun into the same out_dir starts from none of the last run's files.
+        out = Path(run["out_dir"])
+        for name in (COMMANDS_FILE.format("*"), STEP_TABLE_FILE, SUMMARY_FILE):
+            for f in out.glob(name):
+                f.unlink()
         super().__init__(channel_table(run), timeline=self, bound_s=run["bound_s"])
 
     def record(self, lp, time_from, time_to, kind, recovered) -> None:
@@ -333,12 +339,17 @@ def _width_keys(node):
     return {int(k) if k.isdigit() else k: _width_keys(v) for k, v in node.items()}
 
 
+def _write_whole(path: Path, text: str) -> None:
+    """Write `path` whole or not at all, so a reader that polls for it never
+    reads it part-written."""
+    part = path.with_name(path.name + ".part")
+    part.write_text(text)
+    part.replace(path)
+
+
 def _hand_in(run: dict, lp: str, reasons: list) -> None:
-    """Write `lp`'s refusals for the summary's writer, whole or not at all."""
-    out = Path(run["out_dir"])
-    part = out / (COMMANDS_FILE.format(lp) + ".part")
-    part.write_text(json.dumps(reasons))
-    part.replace(out / COMMANDS_FILE.format(lp))
+    """Write `lp`'s refusals for the summary's writer."""
+    _write_whole(Path(run["out_dir"]) / COMMANDS_FILE.format(lp), json.dumps(reasons))
 
 
 def engine_done(engine_core) -> None:
@@ -364,7 +375,7 @@ def frontend_done(llm_engine) -> bool:
     _hand_in(run, rt.me.name, rt.loop.executor.refusals + rt.refusals)
     if _authority is not None:
         out = Path(run["out_dir"])
-        (out / STEP_TABLE_FILE).write_text(_authority.steps.text())
+        _write_whole(out / STEP_TABLE_FILE, _authority.steps.text())
         _write_summary(run, _authority)
     return True
 
@@ -390,7 +401,7 @@ def _write_summary(run: dict, a: _RecordingAuthority) -> None:
     # A refused command leaves ATOM's half of it applied, so what ran after it
     # was not the deployment simulated.
     summary["coverage_report"] = any(r.startswith("command:") for r in reasons)
-    (out / SUMMARY_FILE).write_text(json.dumps(summary, sort_keys=True, indent=1))
+    _write_whole(out / SUMMARY_FILE, json.dumps(summary, sort_keys=True, indent=1))
 
 
 def authority(endpoint: str) -> None:
@@ -400,5 +411,5 @@ def authority(endpoint: str) -> None:
     a = _RecordingAuthority(run)
     serve(a, endpoint)
     a.done.wait()
-    (Path(run["out_dir"]) / STEP_TABLE_FILE).write_text(a.steps.text())
+    _write_whole(Path(run["out_dir"]) / STEP_TABLE_FILE, a.steps.text())
     _write_summary(run, a)
