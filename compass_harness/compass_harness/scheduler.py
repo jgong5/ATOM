@@ -89,12 +89,9 @@ class ClockPacedLoopScheduler(LoopScheduler):
             t.at -= shift
         return shift
 
-    def cancel_all_pending(self) -> None:
-        super().cancel_all_pending()
-        if self._driver is not None:
-            self._driver.cancel()
-
     async def _drive(self) -> None:
+        # A cancel never interrupts the clock wait: the clock holds that wait and
+        # wakes it at its next grant, and the loop then exits if no timer is left.
         # ponytail: linear scan for the earliest timer; a heap if pending timers reach thousands.
         while self._handles:
             timer, coro = min(self._handles.values(), key=lambda entry: entry[0].at)
