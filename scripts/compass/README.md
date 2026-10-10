@@ -516,3 +516,10 @@ tables: `cmp A/step_table.txt B/step_table.txt`.
 `tests/compass/test_cctraces_sim_smoke.py` runs that pair on one session for 60
 simulated seconds when `ATOM_COMPASS_SLICE_MODEL`, `ATOM_COMPASS_CCTRACES` and
 `COMPASS_HARNESS_PYTHON` are set.
+
+The cell's `OUT_DIR` also holds `memory-dp0.json` (`memory-P.dp0.json` and
+`memory-D.dp0.json` for 1P1D): the readings the simulated KV pool was sized from.
+Against the server log of the paired real run, with the same deployment flags,
+`python -m atom.compass.memory.check OUT_DIR/memory-dp0.json REAL_SERVER_LOG`
+prints the per-term comparison of the non-KV memory and the graph pool. It takes
+the log of one rank.

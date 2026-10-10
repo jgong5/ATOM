@@ -88,7 +88,7 @@ def as_term(reading: Reading) -> Term:
         reading.total,
         Basis.DECLARED,
         source,
-        f"it sums {', '.join(owed)}, which cannot discharge a gate; a run "
+        f"It sums {', '.join(owed)}, which cannot discharge a gate; a run "
         f"that records {reading.name} split compares each term on its own",
     )
 
