@@ -85,9 +85,13 @@ class _Vector:
                 f"are not all among its features {list(features[1:])}"
             )
         self.vary = [i for i, f in enumerate(features[1:], 1) if f not in self.equal]
-        self.facets = np.asarray(hull["facets"], dtype=np.float64).reshape(
-            -1, len(self.vary) + 1
-        )
+        width = len(self.vary) + 1
+        if any(len(row) != width for row in hull["facets"]):
+            raise ValueError(
+                f"the {name} hull has a facet not {width} wide: one entry per "
+                f"varying feature {[features[i] for i in self.vary]}, then the offset"
+            )
+        self.facets = np.asarray(hull["facets"], dtype=np.float64).reshape(-1, width)
         if self.vary and not len(self.facets):
             raise ValueError(
                 f"the {name} hull bounds {len(self.vary)} varying features with no "
@@ -186,8 +190,4 @@ class CoarseBackend(CostBackend):
         )
 
     def describe(self) -> str:
-        rungs = ", ".join(
-            EAGER if r is None else str(r)
-            for r in sorted(self.law.decode, key=lambda r: -1 if r is None else r)
-        )
-        return f"tier-a coarse law, prefill and decode rungs [{rungs}]; {self.law.provenance}"
+        return f"tier-a coarse law; {self.law.provenance}"

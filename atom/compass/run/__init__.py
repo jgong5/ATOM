@@ -374,6 +374,11 @@ def runner(model_runner) -> None:
             f"this one has {' and '.join(keys) or 'neither'}"
         )
     if "law" in run:
+        if tp != 1:
+            raise ValueError(
+                f"a law is fitted on one rank of tensor-parallel width 1, and this "
+                f"run has tensor_parallel_size {tp}"
+            )
         backend = CoarseBackend(CoarseLaw(run["law"]))
     else:
         backend = ShapeStubBackend(

@@ -170,8 +170,21 @@ def test_a_step_mixing_prefill_and_decode_rows_is_refused_by_name():
             ),
             "not all among its features",
         ),
+        # Three-wide facets over four varying features: 12 entries, which
+        # reshape into three four-wide rows.
+        (
+            lambda m: m["prefill"].update(hull={"facets": PREFILL_HULL["facets"]}),
+            "facet not 4 wide",
+        ),
     ],
-    ids=["provenance", "missing-feature", "negative", "unbounded", "intercept"],
+    ids=[
+        "provenance",
+        "missing-feature",
+        "negative",
+        "unbounded",
+        "intercept",
+        "facet-width",
+    ],
 )
 def test_a_law_that_cannot_price_is_refused_when_read(edit, match):
     mapping = law()
@@ -266,3 +279,14 @@ def test_a_run_file_with_both_keys_or_neither_is_refused(
 ):
     with pytest.raises(ValueError, match=f"this one has {named}"):
         _installed(monkeypatch, tmp_path, **keys)
+
+
+def test_a_run_file_law_is_refused_above_tensor_parallel_width_one(monkeypatch):
+    from types import SimpleNamespace
+
+    from atom.compass import run
+
+    monkeypatch.setattr(run, "spec", lambda: {"law": law()})
+    tp2 = SimpleNamespace(config=SimpleNamespace(tensor_parallel_size=2))
+    with pytest.raises(ValueError, match="tensor_parallel_size 2"):
+        run.runner(tp2)
