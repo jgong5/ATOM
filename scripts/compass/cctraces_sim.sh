@@ -122,7 +122,7 @@ print("1p1d" if "kv_write_req_s" in run else "tp1", *ports)
 EOF
 )
 
-trap 'kill $(jobs -p) ${server:+-$server} 2>/dev/null || true' EXIT
+trap 'kill -- $(jobs -p) ${server:+-$server} 2>/dev/null || true' EXIT
 gpu=${HIP_VISIBLE_DEVICES:-0}
 gpu=${gpu%%,*}
 gpu_processes() { rocm-smi --showpids --showpidgpus >"$OUT/gpu_$1.txt"; }
@@ -193,7 +193,7 @@ if sys.argv[4] == "1":
     def others(when):
         """pid:VRAM bytes of each KFD process on the cell's GPU."""
         text = (out / f"gpu_{when}.txt").read_text()
-        vram = dict(re.findall(r"^(\d+)\t[^\t]*\t[^\t]*\t(\d+)", text, re.M))
+        vram = dict(re.findall(r"^(\d+) *\t[^\t]*\t[^\t]*\t(\d+)", text, re.M))
         on = re.findall(r"PID (\d+) is using \d+ DRM device\(s\):\n([\d ]*)", text)
         return ",".join(f"{p}:{vram.get(p, '?')}" for p, d in on if sys.argv[5] in d.split())
 

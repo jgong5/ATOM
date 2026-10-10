@@ -141,8 +141,25 @@ def _warmup(cell: Path) -> list:
 )
 def test_a_real_cell_warms_up_on_the_simulated_cells_requests(cells, tmp_path):
     (sim, _), _ = cells
+    # A rocm-smi that lists pid 4242 on the cell's GPU and pid 1337009 on another,
+    # padded as rocm-smi pads a pid shorter than the PID column.
+    gpu = (os.environ.get("HIP_VISIBLE_DEVICES") or "0").split(",")[0]
+    listing = (
+        "KFD process information:\n"
+        "PID    \tPROCESS NAME\tGPU(s)\tVRAM USED\tSDMA USED\tCU OCCUPANCY\t\n"
+        "4242   \tUNKNOWN     \t1     \t481734656\t0        \t0           \t\n"
+        "1337009\tUNKNOWN     \t1     \t1024     \t0        \t0           \t\n"
+        "=== GPUs Indexed by PID ===\n"
+        f"PID 4242 is using 1 DRM device(s):\n{gpu} \n"
+        f"PID 1337009 is using 1 DRM device(s):\n{int(gpu) + 1} \n"
+    )
+    stub = tmp_path / "bin/rocm-smi"
+    stub.parent.mkdir()
+    stub.write_text(f"#!/bin/sh\ncat <<'EOF'\n{listing}EOF\n")
+    stub.chmod(0o755)
     env = dict(
         os.environ,
+        PATH=f"{stub.parent}:{os.environ['PATH']}",
         REAL="1",
         MODEL=MODEL,
         TRACES=TRACES,
@@ -165,7 +182,8 @@ def test_a_real_cell_warms_up_on_the_simulated_cells_requests(cells, tmp_path):
     result = done.stdout.strip().splitlines()[-1]
     fields = dict(f.split("=", 1) for f in result.split()[1:])
     assert int(fields["requests"]) > 0 and fields["errors"] == "0", result
-    assert fields["contaminated"] in ("True", "False"), result
+    assert fields["contaminated"] == "True", result
+    assert fields["gpu_before"] == fields["gpu_after"] == "4242:481734656", result
     assert not (real / compass_run.STEP_TABLE_FILE).exists()
     workload = [
         json.loads((c / "run.json").read_text())["workload"] for c in (sim, real)
