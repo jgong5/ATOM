@@ -142,6 +142,14 @@ class ClockAuthority:
             name: {} for names in self._into.values() for name in names
         }
         self._next_seq = dict.fromkeys(self._undelivered, 0)
+        # N[j] of every LP, kept current by each call that changes one of its
+        # inputs, and D(j->i) of every pair: a grant scan reads both, never
+        # recomputing them.
+        self._nv = dict.fromkeys(self._ids, 0.0)
+        self._from = {
+            i: tuple((j, channels.distance(j, i)) for j in self._ids if j != i)
+            for i in self._ids
+        }
         self.timeline = timeline
         self.grants = {i.name: 0 for i in self._ids}
         self.final_clocks = None
@@ -244,6 +252,7 @@ class ClockAuthority:
         if t < math.inf:
             self._horizon = max(self._horizon, t)
         self._state[lp], self._target[lp], self._daemon[lp] = kind, t, daemon
+        self._nv[lp] = self._n(lp)
         return self._address(self._grant_due())
 
     def _refuse_unjoinable(self, lp: LpId, member: str, kind: str, t: float) -> None:
@@ -335,6 +344,8 @@ class ClockAuthority:
             self._undelivered[name][seq] = a
             self._horizon = max(self._horizon, a)
             self._next_seq[name] = seq + 1
+            if self._state[channel.target] == NER:
+                self._nv[channel.target] = self._n(channel.target)
             return
         raise BackdatedEvent(refusal, self.lp_table())
 
@@ -350,24 +361,24 @@ class ClockAuthority:
             return self._now[j]
         if self._state[j] == TAR:
             return self._target[j]
-        return min(
-            [self._target[j], self._daemon[j]] + [a for _, _, a in self._pending(j)]
-        )
+        n = min(self._target[j], self._daemon[j])
+        for name in self._into[j]:
+            for a in self._undelivered[name].values():
+                n = min(n, a)
+        return n
 
     def _row(self, i: LpId) -> tuple[tuple[LpId, float], ...]:
-        return tuple(
-            (j, self._n(j) + self._channels.distance(j, i)) for j in self._ids if j != i
-        )
+        nv = self._nv
+        return tuple((j, nv[j] + d) for j, d in self._from[i])
 
     def _lbts(self, i: LpId) -> float:
         return min((term for _, term in self._row(i)), default=math.inf)
 
     def _grant_due(self) -> list:
         replies = []
+        state, nv = self._state, self._nv
         while True:
-            waiting = sorted(
-                (self._n(i), i) for i in self._ids if self._state[i] != RUNNING
-            )
+            waiting = sorted((nv[i], i) for i in self._ids if state[i] != RUNNING)
             grantable = [(n, i) for n, i in waiting if n <= self._horizon]
             due = next(((i, n) for n, i in grantable if n < self._lbts(i)), None)
             if due is not None:
@@ -402,6 +413,7 @@ class ClockAuthority:
             self.timeline.record(i, self._now[i], g, self._state[i], recovered)
         self.grants[i.name] += 1
         self._now[i], self._state[i], self._target[i] = g, RUNNING, None
+        self._nv[i] = g
         return (i, g, released)
 
     def _finish(self) -> list:
@@ -410,4 +422,5 @@ class ClockAuthority:
             if self.timeline is not None:
                 self.timeline.record(i, self._now[i], math.inf, self._state[i], False)
             self._now[i], self._state[i], self._target[i] = math.inf, RUNNING, None
+            self._nv[i] = math.inf
         return [(i, math.inf, {name: [] for name in self._into[i]}) for i in self._ids]
