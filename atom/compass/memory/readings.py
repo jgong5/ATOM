@@ -69,15 +69,31 @@ class MemoryRefusal(Exception):
         super().__init__(f"{what}. {remedy}")
 
 
-def _geometry(config, name: str):
-    """One field off a HF config, refusing by name rather than defaulting."""
+def _stated(config, file, name: str):
+    """One field off a HF config, or None when the model does not state it.
+
+    A model's config class fills in its own default for a field the
+    checkpoint's config.json leaves out, and the object cannot tell the two
+    apart, so a field the class has a default for counts only when `file`,
+    the keys of that config.json, names it. DeepSeek-V4 loads through
+    `DeepseekV3Config`, whose `intermediate_size` default is not V4's geometry.
+    """
     text = getattr(config, "text_config", config)
     value = getattr(text, name, None)
+    if value is not None and hasattr(type(text), name) and name not in file:
+        return None
+    return value
+
+
+def _geometry(config, file, name: str):
+    """One stated field off a HF config, refusing by name rather than defaulting."""
+    value = _stated(config, file, name)
     if value is None:
         raise MemoryRefusal(
             f"this config states no `{name}`, and the memory model reads it",
-            "build the config through ATOM's own config classes, which fill it "
-            "in, or name the model whose geometry this is",
+            "state it in the model's config.json, and build the config through "
+            "ATOM's own config classes with that file beside it; a config class "
+            "default is not the model's geometry",
         )
     return value
 
@@ -118,8 +134,15 @@ class ModelTerms:
         tp_size: int,
         warmup_tokens: int,
         dtype_bytes: int | None = None,
+        config_json: dict | None = None,
     ) -> ModelTerms:
         """All three from geometry and declared coefficients, each labelled.
+
+        `config_json` is the model's config.json as loaded; without it, a
+        field `config`'s class has a default for is refused, since the
+        default cannot be told from a stated value. An MoE model, one that
+        states `moe_intermediate_size`, takes its live intermediate from its
+        expert fields.
 
         With fake models, a declared formula suffices and must say so.
         Every term below is `Basis.DECLARED` and every one names its
@@ -134,22 +157,46 @@ class ModelTerms:
         """
         if tp_size < 1:
             raise ValueError(f"tensor-parallel width is at least 1: {tp_size}")
-        text = getattr(config, "text_config", config)
-        hidden = int(_geometry(config, "hidden_size"))
-        intermediate = int(_geometry(config, "intermediate_size"))
-        head_dim = int(_geometry(config, "head_dim"))
-        positions = int(_geometry(config, "max_position_embeddings"))
+        file = config_json or {}
+        file = file.get("text_config", file)
+        hidden = int(_geometry(config, file, "hidden_size"))
+        positions = int(_geometry(config, file, "max_position_embeddings"))
         if dtype_bytes is None:
             dtype_bytes = element_bytes(_dtype(config))
-        # 1.0 is the right reading for a model with full rotary, so an absent
-        # field is not refused here. But a config that states 1.0 and one that
-        # states nothing must not render the same row: the second is the
-        # absence the recorded 4x came from, and an assumption that
-        # does not appear in the table is not an assumption a reader can see.
-        stated = getattr(text, "partial_rotary_factor", None)
-        partial = 1.0 if stated is None else float(stated)
-        assumed = "" if stated is not None else " (absent from config, assumed)"
-        rotary_dim = int(head_dim * partial)
+        rope = _stated(config, file, "qk_rope_head_dim")
+        if rope is not None:
+            # An MLA model rotates only this slice of each head.
+            rotary_dim = int(rope)
+            rotary = f"{rotary_dim} qk_rope_head_dim"
+        else:
+            head_dim = int(_geometry(config, file, "head_dim"))
+            # 1.0 is the right reading for a model with full rotary, so an
+            # absent field is not refused here. But a config that states 1.0
+            # and one that states nothing must not render the same row: the
+            # second is the absence the recorded 4x came from, and an
+            # assumption that does not appear in the table is not an
+            # assumption a reader can see.
+            stated = _stated(config, file, "partial_rotary_factor")
+            partial = 1.0 if stated is None else float(stated)
+            assumed = "" if stated is not None else " (absent from config, assumed)"
+            rotary_dim = int(head_dim * partial)
+            rotary = (
+                f"int({head_dim} head_dim x {partial} "
+                f"partial_rotary_factor{assumed})"
+            )
+        experts = _stated(config, file, "moe_intermediate_size")
+        if experts is None:
+            intermediate = int(_geometry(config, file, "intermediate_size"))
+            live = f"{intermediate} intermediate"
+        else:
+            # Each token's routed experts and the shared ones are live at once.
+            routed = int(_geometry(config, file, "num_experts_per_tok"))
+            shared = int(_geometry(config, file, "n_shared_experts"))
+            intermediate = (routed + shared) * int(experts)
+            live = (
+                f"({routed} num_experts_per_tok + {shared} n_shared_experts) "
+                f"x {experts} moe_intermediate_size"
+            )
         weights = Term(
             "weights",
             parameter_count * dtype_bytes // tp_size,
@@ -163,8 +210,7 @@ class ModelTerms:
             "buffers",
             positions * rotary_dim * dtype_bytes,
             Basis.DECLARED,
-            f"{positions} positions x int({head_dim} head_dim x {partial} "
-            f"partial_rotary_factor{assumed}) x {dtype_bytes} B",
+            f"{positions} positions x {rotary} x {dtype_bytes} B",
             "a recording off a card replaces this; this is "
             "not a recording -- it is derived from ATOM's own rotary source "
             "and validated against no card. cos and sin together are "
@@ -188,7 +234,7 @@ class ModelTerms:
             Basis.DECLARED,
             f"{warmup_tokens} warmup tokens x {dtype_bytes} B x "
             f"({graph_pool.LIVE_TENSORS_PER_LAYER} x {hidden} hidden + "
-            f"{_LIVE_INTERMEDIATE} x {intermediate} intermediate)",
+            f"{_LIVE_INTERMEDIATE} x {live})",
             "a liveness walk over a traced op graph, plus the per-leaf "
             "invisible-scratch constants, replace this; the per-layer "
             "coefficient is ATOM's own "

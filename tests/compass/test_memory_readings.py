@@ -56,6 +56,7 @@ from atom.compass.memory import (
     reserves,
 )
 from atom.compass.spec import MachineSpec, SpecRefusal
+from atom.config import get_hf_config
 
 # The package as the suite actually imported it, never as a walk up from this
 # file: if `atom` ever resolves from another root -- a PYTHONPATH ahead of the
@@ -592,6 +593,101 @@ def test_a_deployment_flag_is_not_labelled_geometry():
     # than to the machine or the model.
     assert reserves(enforce_eager=True).terms[0].basis is Basis.DEPLOYMENT
     assert not hasattr(Basis, "GEOMETRY")
+
+
+# --- fields the model's config.json does not state ---------------------------
+
+#: DeepSeek-V4-Pro's config.json: the fields the model terms read, and the
+#: model type that routes it through `DeepseekV3Config`. It states no
+#: `intermediate_size`, which that class defaults to 18432.
+V4_PRO = {
+    "architectures": ["DeepseekV4ForCausalLM"],
+    "model_type": "deepseek_v4",
+    "hidden_size": 7168,
+    "head_dim": 512,
+    "qk_rope_head_dim": 64,
+    "max_position_embeddings": 1048576,
+    "moe_intermediate_size": 3072,
+    "num_experts_per_tok": 6,
+    "n_shared_experts": 1,
+    "n_routed_experts": 384,
+    "num_hidden_layers": 61,
+    "torch_dtype": "bfloat16",
+}
+
+
+def loaded(tmp_path, raw):
+    """`raw` written as a model's config.json and loaded as `run.runner` sees
+    it: ATOM's own config, and the file it came from."""
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    return get_hf_config(str(tmp_path)), PretrainedConfig.get_config_dict(
+        str(tmp_path)
+    )[0]
+
+
+def terms_of(config, config_json):
+    return ModelTerms.from_declared_config(
+        config,
+        parameter_count=PARAMETERS,
+        tp_size=1,
+        warmup_tokens=WARMUP_TOKENS,
+        config_json=config_json,
+    )
+
+
+def test_v4_pro_terms_name_only_fields_its_config_json_states(tmp_path):
+    config, config_json = loaded(tmp_path, V4_PRO)
+    assert type(config).__name__ == "DeepseekV3Config"
+    assert config.intermediate_size == 18432  # the class default, still there
+    terms = terms_of(config, config_json)
+    assert terms.buffers.nbytes == 1_048_576 * 64 * 2
+    assert terms.buffers.source == "1048576 positions x 64 qk_rope_head_dim x 2 B"
+    assert terms.activations.nbytes == int(
+        WARMUP_TOKENS * 2 * (2.8 * 7168 + 2 * (6 + 1) * 3072)
+    )
+    assert terms.activations.source == (
+        "8192 warmup tokens x 2 B x (2.8 x 7168 hidden + 2 x (6 num_experts_per_tok"
+        " + 1 n_shared_experts) x 3072 moe_intermediate_size)"
+    )
+
+
+@pytest.mark.parametrize(
+    "dropped,named",
+    [
+        ("hidden_size", "hidden_size"),
+        ("max_position_embeddings", "max_position_embeddings"),
+        ("num_experts_per_tok", "num_experts_per_tok"),
+        ("n_shared_experts", "n_shared_experts"),
+        # Not an MoE model any more, so the dense field is read: unstated too.
+        ("moe_intermediate_size", "intermediate_size"),
+    ],
+)
+def test_a_field_only_the_config_class_supplies_is_refused_by_name(
+    tmp_path, dropped, named
+):
+    config, config_json = loaded(
+        tmp_path, {k: v for k, v in V4_PRO.items() if k != dropped}
+    )
+    assert getattr(config, named) is not None  # the class filled it in
+    with pytest.raises(MemoryRefusal) as refusal:
+        terms_of(config, config_json)
+    assert refusal.value.what == (
+        f"this config states no `{named}`, and the memory model reads it"
+    )
+
+
+def test_without_its_config_json_a_class_default_cannot_count_as_stated(tmp_path):
+    config, _ = loaded(tmp_path, V4_PRO)
+    with pytest.raises(MemoryRefusal, match="states no `hidden_size`"):
+        terms_of(config, None)
+
+
+def test_a_dense_model_through_atoms_loader_keeps_its_terms(tmp_path, qwen):
+    # Qwen3.8-27B loads as a text config class that has a default for every
+    # field read here; its config.json states them all, under `text_config`.
+    config, config_json = loaded(tmp_path, json.loads(CONFIG_JSON.read_text()))
+    assert type(config).__name__ != "PretrainedConfig"
+    assert terms_of(config, config_json) == terms_of(qwen, None)
 
 
 # --- no device, structurally -------------------------------------------------
