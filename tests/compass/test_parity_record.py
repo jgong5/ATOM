@@ -9,7 +9,9 @@ with every prompt distinct.
 import hashlib
 import json
 import queue
+import runpy
 import shutil
+import sys
 import time
 from types import SimpleNamespace
 
@@ -363,6 +365,22 @@ def test_only_tp_rank_0_records_and_only_when_asked(tmp_path, monkeypatch, env, 
     else:
         monkeypatch.setenv(ENV, str(tmp_path / env))
     _Runner(_config(), rank).forward(batches[0])
+
+    class _Base:
+        def __init__(self, config, rank):
+            self.config, self.rank, self.ran = config, rank, []
+
+        def forward(self, batch):
+            self.ran.append(batch)
+            return "ran"
+
+    class _Recorded(StepRecording, _Base):
+        step_clock_ns = staticmethod(time.monotonic_ns)
+
+    # A real runner that does not record still runs its forward.
+    recorded = _Recorded(_config(), rank)
+    assert recorded.forward(batches[0]) == "ran"
+    assert recorded.ran == [batches[0]]
     assert not (tmp_path / "out").exists()
 
 
@@ -400,7 +418,7 @@ def test_the_mixin_records_from_the_first_forward_after_construction(
 
 
 def test_a_real_runner_records_the_batch_it_was_handed_and_times_its_forward(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ):
     batches = _drive(tmp_path / "simulated", monkeypatch, {0: [0, 1]})[0][0]
     record = tmp_path / "real" / "dp0.jsonl"
@@ -433,6 +451,12 @@ def test_a_real_runner_records_the_batch_it_was_handed_and_times_its_forward(
     assert real == simulated
     report = compare(tmp_path / "real", tmp_path / "simulated")
     assert report["first_divergence"] == {0: None}
+
+    # The documented invocation prints the same report.
+    argv = ["python -m atom.compass.parity", str(tmp_path / "real")]
+    monkeypatch.setattr(sys, "argv", [*argv, str(tmp_path / "simulated")])
+    runpy.run_module("atom.compass.parity", run_name="__main__")
+    assert json.loads(capsys.readouterr().out) == json.loads(json.dumps(report))
 
 
 @pytest.mark.parametrize(
