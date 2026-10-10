@@ -22,7 +22,9 @@ version = "0.1.0"
 [tool.setuptools]
 packages = ["compass_harness"]
 """
-NO_AIPERF = 'raise RuntimeError("compass_harness needs aiperf, and it is not installed")\n'
+NO_AIPERF = (
+    'raise RuntimeError("compass_harness needs aiperf, and it is not installed")\n'
+)
 
 pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("setuptools") is None,
