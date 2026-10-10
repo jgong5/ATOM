@@ -218,14 +218,14 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
 
     The MoE gather's rows follow `running_tokens_are_unified`, as
     `FusedMoE.forward_impl_graph` does. Every rank decoding, the padded
-    `all_gather` carries `running_bs x max_seqlen_q` rows from each rank,
-    `running_bs` being the rung at or above the group's largest batch, under
-    `enforce_eager` too. Otherwise (a rank prefilling, an MTP draft's first
-    pass) the variable-length gather carries each rank's own count.
+    `all_gather` carries `running_tokens` rows from each rank, the group's
+    agreed height, under `enforce_eager` too. Otherwise (a rank prefilling, an
+    MTP draft's first pass) the variable-length gather carries each rank's own
+    count.
     """
     if mode.sync is not None:
         if mode.running_tokens_are_unified:
-            moe_rows = _data_parallel_size(runner) * mode.running_bs * mode.max_seqlen_q
+            moe_rows = _data_parallel_size(runner) * mode.running_tokens
         else:
             moe_rows = int(mode.sync.num_tokens_across_dp.sum())
     elif _data_parallel_size(runner) > 1:

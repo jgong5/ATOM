@@ -103,7 +103,6 @@ def test_a_decode_step_carries_every_rank_padded_to_the_rung(group):
 
     # The largest batch is 3; the rung at or above it is 4, one query row each.
     assert [view.moe_rows for _, view in ranks] == [DP * 4 * 1] * DP
-    assert DP * max(WIDTHS) == 24
 
 
 def test_a_mixed_prefill_step_carries_each_rank_its_own_count(group):
@@ -112,7 +111,6 @@ def test_a_mixed_prefill_step_carries_each_rank_its_own_count(group):
     ranks = group(batches)
 
     assert [view.moe_rows for _, view in ranks] == [40 + sum(WIDTHS[1:])] * DP
-    assert DP * 40 == 320
 
 
 def test_the_group_price_and_rows_do_not_depend_on_rank_order(group):
