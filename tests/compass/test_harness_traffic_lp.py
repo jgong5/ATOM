@@ -62,7 +62,13 @@ from compass_harness.traffic_lp import (
 from compass_harness.transport import addresses, credit_key
 
 from atom.compass import clock_transport
-from atom.compass.clock import NER, ClockAuthority, LpId, single_engine_table
+from atom.compass.clock import (
+    NER,
+    ClockAuthority,
+    LpId,
+    prefill_decode_table,
+    single_engine_table,
+)
 from atom.compass.run import ENV as RUN_ENV
 from atom.utils.clock import LPRuntime
 from compass_harness import ADDRESS_ENV, fingerprint
@@ -464,3 +470,41 @@ def test_the_timing_manager_builds_the_compass_router():
     from aiperf.timing import manager
 
     assert manager.StickyCreditRouter is CompassCreditRouter
+
+
+def test_a_1p1d_run_file_sends_to_frontend_p_and_reads_from_frontend_d(
+    tmp_path, monkeypatch
+):
+    """Behind a prefill-decode router, requests enter at frontend-P and the
+    stream comes back from frontend-D, over the channels the run file's table
+    declares."""
+    pd = {"router_s": 2.0**-12, "kv_write_req_s": 2.0**-10}
+    endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
+    table = prefill_decode_table(**RUN, **pd)
+    server = clock_transport.serve(ClockAuthority(table), endpoint)
+    run_file = tmp_path / "run.json"
+    run_file.write_text(
+        json.dumps({"clock_endpoint": endpoint, "bound_s": 1e6, **RUN, **pd})
+    )
+    monkeypatch.setenv(RUN_ENV, str(run_file))
+    monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / "lp"))
+
+    async def main():
+        traffic = TrafficLP.from_env()
+        try:
+            traffic.send(_key(0))
+            traffic.rt.check_arrival("frontend-D->traffic:stream", 1.0, 0)
+            return traffic.rt.send_log, traffic.rt.unreleased
+        finally:
+            for task in (*traffic._tasks, traffic.done):
+                task.cancel()
+            traffic._pub.close(linger=0)
+            traffic._pull.close(linger=0)
+
+    try:
+        sent, unreleased = _run(main())
+    finally:
+        server.close()
+    http = "traffic->frontend-P:http"
+    assert sent == [(http, 0, table.lookahead(http))]
+    assert unreleased == {("frontend-D->traffic:stream", 0): 1.0}

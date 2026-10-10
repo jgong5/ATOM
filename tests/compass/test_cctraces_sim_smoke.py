@@ -12,6 +12,11 @@ without ``ATOM_COMPASS_SLICE_MODEL`` (a model directory holding a config and a
 tokenizer), ``ATOM_COMPASS_CCTRACES`` (a cc-traces ``traces.jsonl``) and
 ``COMPASS_HARNESS_PYTHON`` (a Python with agentx-harness 56a0cf70 and
 compass-harness installed).
+
+``test_a_1p1d_pair_answers_through_the_router_and_transfers_kv`` runs the same
+pair as a 1P1D cell, through `pd_sim.sh` and atomesh, which must be on PATH;
+``ATOM_COMPASS_PD_DECODE_EXEC`` runs decode in another container, as
+``test_pd_slice.py`` does.
 """
 
 import copy
@@ -19,6 +24,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -43,7 +49,7 @@ TREE = Path(__file__).resolve().parents[2]
 SCRIPT = TREE / "scripts/compass/cctraces_sim.sh"
 
 
-def _template(path: Path) -> Path:
+def _template(path: Path, **extra) -> Path:
     """A run file whose declared tokenizer also covers the model's architecture."""
     machine = copy.deepcopy(DOCUMENT)
     arch = json.loads((Path(MODEL) / "config.json").read_text())["architectures"][0]
@@ -56,20 +62,20 @@ def _template(path: Path) -> Path:
         "coefficients": dataclasses.asdict(Coefficients()),
         "machine": machine,
         "parameter_count": 8_000_000_000,
+        **extra,
     }
     path.write_text(json.dumps(run))
     return path
 
 
-@pytest.fixture(scope="module")
-def cells(tmp_path_factory):
-    root = tmp_path_factory.mktemp("cctraces")
-    template = _template(root / "template.json")
+def _pair(root: Path, template: Path, **env) -> list:
+    """The script run twice, `PYTHONHASHSEED` 1 and 2: each cell and its result line."""
     out = []
     for seed in ("1", "2"):
         cell = root / f"seed{seed}"
         env = dict(
             os.environ,
+            **env,
             PYTHONHASHSEED=seed,
             MODEL=MODEL,
             TRACES=TRACES,
@@ -91,6 +97,12 @@ def cells(tmp_path_factory):
     return out
 
 
+@pytest.fixture(scope="module")
+def cells(tmp_path_factory):
+    root = tmp_path_factory.mktemp("cctraces")
+    return _pair(root, _template(root / "template.json"))
+
+
 def test_both_runs_answer_every_request_and_refuse_nothing(cells):
     for _, result in cells:
         fields = dict(f.split("=", 1) for f in result.split()[1:])
@@ -108,3 +120,23 @@ def test_the_step_tables_are_byte_identical_and_name_the_workload(cells):
     trace = (left / "traces/00000.json").read_bytes()
     assert workload["traces_sha256"] == [hashlib.sha256(trace).hexdigest()]
     assert "--benchmark-duration" in workload["aiperf_args"]
+
+
+@pytest.mark.skipif(not shutil.which("atomesh"), reason="a 1P1D cell needs atomesh")
+def test_a_1p1d_pair_answers_through_the_router_and_transfers_kv(tmp_path):
+    template = _template(
+        tmp_path / "template.json",
+        router_s=2.0**-12,
+        kv_write_req_s=2.0**-10,
+        kv_link="intra_node",
+    )
+    exec_ = os.environ.get("ATOM_COMPASS_PD_DECODE_EXEC", "")
+    (left, result), (right, _) = _pair(tmp_path, template, DECODE_EXEC=exec_)
+    fields = dict(f.split("=", 1) for f in result.split()[1:])
+    assert int(fields["requests"]) > 0, result
+    assert (fields["errors"], fields["refusals"]) == ("0", "0"), result
+    assert fields["coverage_report"] == "False", result
+    assert int(fields["kv_transfers"]) >= int(fields["requests"]), result
+    table = (left / compass_run.STEP_TABLE_FILE).read_bytes()
+    assert table == (right / compass_run.STEP_TABLE_FILE).read_bytes()
+    assert b" release engine-D->engine-P:kv_write_req " in table

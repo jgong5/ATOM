@@ -37,6 +37,7 @@ from atom.utils.clock import DIAG_S, LPRuntime
 from compass_harness import ADDRESS_ENV
 from compass_harness.transport import addresses, credit_key
 
+# The single-engine run's two channels; a run file names its own (`from_env`).
 HTTP = "traffic->frontend:http"
 STREAM = "frontend->traffic:stream"
 TRAFFIC = LpId("traffic")
@@ -51,8 +52,10 @@ class UnansweredRequests(RuntimeError):
 
 
 class TrafficLP:
-    def __init__(self, rt: LPRuntime, prefix: str) -> None:
-        self.rt = rt
+    def __init__(
+        self, rt: LPRuntime, prefix: str, http: str = HTTP, stream: str = STREAM
+    ) -> None:
+        self.rt, self.http, self.stream = rt, http, stream
         stamps, reports = addresses(prefix)
         ctx = zmq.asyncio.Context.instance()
         self._pub = ctx.socket(zmq.XPUB)
@@ -88,9 +91,15 @@ class TrafficLP:
                 "the Clock Authority and the channel table."
             )
         conn = clock_transport.connect(TRAFFIC, run["clock_endpoint"])
+        table = compass_run.channel_table(run)
+        # One channel each way: into the frontend (frontend-P behind a PD
+        # router) and back from the one that streams (frontend-D).
+        (http,), (stream,) = table.channels_from(TRAFFIC), table.channels_into(TRAFFIC)
         return cls(
-            LPRuntime(TRAFFIC, compass_run.channel_table(run), conn),
+            LPRuntime(TRAFFIC, table, conn),
             os.environ[ADDRESS_ENV],
+            http.name,
+            stream.name,
         )
 
     # ---- the clock ClockPacedLoopScheduler paces on ----
@@ -120,7 +129,7 @@ class TrafficLP:
 
     def send(self, key: tuple) -> None:
         """Stamp one request on the HTTP channel and publish the stamp."""
-        arrival, seq = self.rt.stamp_send(HTTP)
+        arrival, seq = self.rt.stamp_send(self.http)
         self.open[key] = None
         self._pub.send_pyobj((key, arrival, seq))
         self._changed.set()
@@ -158,7 +167,7 @@ class TrafficLP:
     async def _read_reports(self) -> None:
         while True:
             key, seq, arrival, final = await self._pull.recv_pyobj()
-            self.rt.check_arrival(STREAM, arrival, seq)
+            self.rt.check_arrival(self.stream, arrival, seq)
             self._reports[seq] = (key, final)
             self._changed.set()
 
@@ -194,7 +203,7 @@ class TrafficLP:
         spins = 0
         while True:
             unreported, unreturned = [], []
-            for seq in sorted(self.rt.released[STREAM] - self._handled):
+            for seq in sorted(self.rt.released[self.stream] - self._handled):
                 if seq not in self._reports:
                     unreported.append(seq)
                     continue
