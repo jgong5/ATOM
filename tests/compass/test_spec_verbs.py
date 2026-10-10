@@ -2241,6 +2241,10 @@ def test_the_checked_in_node_18_spec_validates_and_prices_its_activations():
     path = SPEC_ROOT / "scripts" / "compass" / "machines" / f"{script.NAME}.json"
     document = _width_keys(json.loads(path.read_text()))
     spec = validate(document, tp_widths=(1,)).raise_first()
+    for fragment in script.device_fragments():
+        for path, value in fragment.values.items():
+            if not path.startswith("provenance.") and path != "name":
+                assert spec.values[path] == value, path
     assert spec.activations_for(
         "Qwen3_5ForConditionalGeneration", script.CONFIG_JSON, 1
     ) == ("qwen3.8-27b", 180480.0)
