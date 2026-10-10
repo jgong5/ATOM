@@ -137,9 +137,10 @@ class RefusalTally:
     """Every refusal in a run, each reason named ``source:detail``.
 
     The sources in use are ``cost`` (the cost model declined to price a step),
-    ``command`` (a refused worker control command) and ``executor`` (a job the
-    simulated executor refused); any other name is tallied the same way. The
-    two fractions count ``cost`` reasons only, since only those are steps.
+    ``command`` (a refused worker control command), ``executor`` (a job the
+    simulated executor refused) and ``clock`` (a clock call from a thread other
+    than the clock owner); any other name is tallied the same way. The two
+    fractions count ``cost`` reasons only, since only those are steps.
     """
 
     steps: int = 0

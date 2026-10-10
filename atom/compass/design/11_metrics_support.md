@@ -80,9 +80,25 @@ fire as usual but never keep a run alive: the run finishes when no essential wor
 (`01` D3, #533). The frontend names its daemon timers in `DAEMON_TIMERS`
 (`atom/utils/compass_loop.py`).
 
-The observer is in the simulation too: the traffic LP scrapes `/metrics` every
-`scrape_interval` of simulated time, a daemon timer of its own (`01` D9, item 13), so the
-scrape, the refresh, the push and the stamp share one clock.
+### The observer: Prometheus's scrape, on simulated time
+
+A real deployment's Prometheus `GET`s `/metrics` every `scrape_interval`, and the
+simulation does the same: the traffic LP scrapes every `scrape_interval` of simulated time
+(`01` D9, item 13), with `scrape_interval` taken from the real deployment's configuration,
+so the scrape, the refresh, the push and the stamp share one clock. The scrape is Compass code in the traffic LP, whose clock owner is already
+Compass's own, so it adds no LP. It adds no channel either, because `/metrics` is a real
+HTTP endpoint: in a single deployment the request rides `traffic->frontend:http` and the
+response `frontend->traffic:stream` (`01` D3, the channel table). The frontend serves it
+at its arrival time from the exporter's current snapshot, so it sees the lag of the push
+and the refresh, from the same sources as on a real system. Each sample carries its
+simulated scrape time, and `atom:metrics_last_refresh_timestamp_seconds`
+(`_AtomMetricsCollector.collect`) exports `_last_refresh`, so a staleness check compares
+two simulated instants. The scrape timer is a daemon deadline, granted only once it is at
+most the essential horizon `H` (`01` D3), but its `GET` and the response are registered
+arrivals, which raise `H` (`atom/compass/clock/authority.py`): a scrape at `H` extends it
+by one round trip. While `scrape_interval` exceeds that round trip, the next scrape's
+deadline lies beyond the raised `H`, so no scrape chains into the next and the scrapes
+alone never keep a run alive.
 
 ### This revises the first version of this decision
 
@@ -226,6 +242,11 @@ not an approximation of it**.
                   one per step = every breakpoint
 ```
 
+This series coexists with D72's observer scrape, and the two serve different purposes: the
+per-step series is the simulated timeline's ground truth, for analysis; the scrape series is
+what an operator's Prometheus would see, comparable with a real run's scrape at the same
+`scrape_interval`.
+
 ### And it is cheap
 
 The prior 27B cc-traces run was **106 prefill + 4,346 decode = ~4,450 steps over 267 s of
@@ -316,7 +337,7 @@ exporter**.
 | any metric with a **wall-clock denominator** presented as a simulated rate | there are none today; this is a rule about future additions |
 | any **histogram observation of an un-virtualized duration** | D73 — the failure looks authoritative because it came from Prometheus |
 | GPU utilisation, power, temperature, and the `server_metrics/` Prometheus scraper | there is no GPU |
-| metric emission that **advances the virtual clock** | emission is simulator overhead, not modelled work. Under `01` D4 virtual time advances only for durations the cost model produced, so this is satisfied by construction — but it must be **asserted**, because a hook that accidentally sat inside a Category-A path would be invisible |
+| metric emission that **advances the virtual clock** | emission is simulator overhead, not modelled work. Under `01` D4 virtual time advances only for durations the cost model produced, so this is satisfied by construction — but it must be **asserted**, because a hook that accidentally sat inside a K1 (event cost, `advance_to`) path would be invisible |
 
 The standing reminder behind the last row: the instrument changes what it measures. Measure
 mode cost ~**11 ms of TTFT on the 27B (4%)**, and a variant that synchronised around each

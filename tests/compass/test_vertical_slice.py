@@ -29,14 +29,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from test_memory_readings import DOCUMENT
+from test_memory_readings import DOCUMENT, TOKENIZER
 
 from atom.compass import run as compass_run
 from atom.compass.backends.shape import Coefficients
 from atom.compass.carriers import sse_stamp, tracestate_with
 from atom.compass.clock import LpId
 from atom.compass.clock_transport import connect
-from atom.compass.detect.determinism import compare_step_tables
+from atom.compass.detect.determinism import CONFIGURATION_PREFIX, compare_step_tables
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
 
@@ -300,6 +300,31 @@ def test_two_hash_seeds_give_byte_identical_step_tables(runs):
     print(f"\n{report}")
     assert code == 0, report
     assert left == right
+
+
+def _release(table: str, lp: str, channel: str, seq: int) -> float:
+    """The time `lp` released message `seq` on `channel`, from a step table."""
+    for row in table.splitlines()[1:]:
+        f = row.split()
+        if f[0] == lp and f[3] == "release" and f[4] == channel and f[5] == str(seq):
+            return float(f[2])
+    raise AssertionError(f"{lp} released no {channel} {seq}")
+
+
+@NEEDS_A_RUN
+def test_the_served_tokenizer_charges_the_request_its_encode_and_decode(runs):
+    table = runs[0]["table"]
+    run = json.loads(table.splitlines()[0].removeprefix(CONFIGURATION_PREFIX))
+    # The request leaves for the engine once its prompt is encoded.
+    received = _release(table, "frontend", HTTP, 0)
+    sent = _release(table, "engine", "frontend->engine:request#dp0", 0)
+    encode = sent - received - run["ipc_s"]
+    # The first token leaves for the traffic LP once the frame carrying it is decoded.
+    output = _release(table, "frontend", "engine->frontend:output#dp0", 1)
+    decode = _release(table, "traffic", STREAM, 0) - output - run["stream_s"]
+    print(f"\nrequest 0: encode {encode!r} s, first frame's decode {decode!r} s")
+    assert encode >= TOKENIZER["encode_fixed_s"]
+    assert decode >= TOKENIZER["decode_fixed_s"]
 
 
 # --- without a driver: the bootstrap off, and its refusals -------------------

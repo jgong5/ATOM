@@ -2,10 +2,9 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header. **Decisions D0–D95,
-with no gaps, and their sub-decisions** are indexed at the end of this file; **88 registered
-TODOs — T1–T88 with no gaps, of which 80 are open** (T10, T15, T22, T48, T65, T71 and T84 are struck
-through as done, and T77 was opened and closed by P0.1); they, the load-bearing assumptions and the
-cross-cutting issues live in **`12_open_items.md`**. Implementation follows the execution
+with no gaps, and their sub-decisions** are indexed at the end of this file. The TODOs are
+registered in **`12_open_items.md`**, with the load-bearing assumptions and the cross-cutting
+issues. Implementation follows the execution
 plan in `16`.
 
 ---
@@ -161,7 +160,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       flags, precedence, the `compass` executable   |
   |                                                docs 07, 05, 13      |
   +=====================================================================+
-  |  L4  WORKLOAD         clock client  |  wire fields (compass.*)      |
+  |  L4  WORKLOAD         clock client  |  compass stamps on the wire   |
   |                       per-harness adapter (out of tree)             |
   |                                                    doc 06           |
   +=====================================================================+
@@ -251,10 +250,10 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
      |                       |                 |                     |
      |                       |<-- postprocess -|                     |
      |<-- SSE chunk ---------|                 |                     |
-     |    + compass.{        |                 |                     |
-     |        arrival_s,     |                 |                     |
-     |        first_token_s, |                 |                     |
-     |        finish_s }      |                 |                     |
+     |    + ": compass a=..  |                 |                     |
+     |       s=.." comment   |                 |                     |
+     |    line before each   |                 |                     |
+     |    event              |                 |                     |
 ```
 
 Wall-clock time passes while that HTTP round trip happens. **Virtual time does not** — it
@@ -520,7 +519,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it settles |
 |---|---|---|
-| [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced additive field each direction, audited for minimality. Timeline piggybacked on `kv_transfer_params` so Atomesh needs no change. Tokenizer cost is a queue, not a constant. |
+| [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced stamp each direction, audited for minimality: a `tracestate` entry in, an SSE comment line per event out. The timeline rides carriers Atomesh already forwards, so it needs no change. Tokenizer cost is a queue, not a constant. |
 | [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two tiers: a CPU tier over every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free **as a batch** and held to green, and a GPU superset judged as a **delta** against **4779 / 5** (`fe9ea043c`, torch 2.10.0+rocm7.2.4, ROCm 7.2.4, AITER v0.1.21.dev0-49-gf4e7c7509, all five failing node-ids on file). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible only if stable *and* sensitive. |
 | [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. The metrics push and refresh are daemon timers on simulated time. |
 
@@ -579,8 +578,8 @@ The documents use these precisely; a reader will bounce off without them.
 | D18 | Capture with dispatch mode + FakeTensor + ShapeEnv; `_EnablePythonDispatcher()` is mandatory |
 | D19 | Hierarchical, symbolic, stream-annotated IR; no branches in the IR — applicability is a discrete key plus an evaluated guard domain |
 | D20 | Opaque leaves are priced, not decomposed; each carries a declared parameter extractor |
-| D28 | Additive optional fields on the **real** endpoint, both directions |
-| D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes |
+| D28 | Stamps on the **real** endpoint, both directions, in carriers a real server ignores: a `tracestate` entry in, SSE comment lines out |
+| D30 | Ride the simulated timeline on carriers Atomesh already forwards, `kv_transfer_params` on the prefill-to-decode hop among them; Atomesh needs zero changes |
 | D36 | Three tiers: analytic, coarse empirical, op-level empirical. Compass models a device it has been measured on |
 | D37 | `compass plan` — the tool tells the user what to measure |
 | D45 | The real-vs-real spread is the tolerance; a metric must be stable **and** sensitive |

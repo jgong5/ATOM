@@ -141,6 +141,10 @@ class LPRuntime:
         self.idle_calls = 0  # `calls` when the step loop last passed its idle point
         # The frontend's event loop, once built: a frame a thread takes is a job on it.
         self.loop = None
+        # Clock calls refused off the owner thread, as run-summary reasons
+        # ``clock:<call> from <thread>``: a caller such as an output thread may
+        # log and drop the exception.
+        self.refusals: list[str] = []
 
     def start_run(self) -> None:
         self.in_run = True
@@ -205,9 +209,11 @@ class LPRuntime:
             )
 
     def _require_owner(self, what: str) -> None:
-        if threading.current_thread() is not self.owner:
+        me = threading.current_thread()
+        if me is not self.owner:
+            self.refusals.append(f"clock:{what} from {me.name}")
             raise RuntimeError(
-                f"{what} from thread {threading.current_thread().name!r}: only the clock "
+                f"{what} from thread {me.name!r}: only the clock "
                 f"owner {self.owner.name!r} of {self.me} moves its clock or sends"
             )
 

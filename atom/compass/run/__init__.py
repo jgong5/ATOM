@@ -20,6 +20,8 @@ Authority is co-hosted in the frontend's process and served at the run file's
   check.
 - `runner(runner)` installs the cost backend and the device readings on a
   `CompassModelRunner` where it would build its model, in the worker process.
+- `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
+  ``decode`` to the frontend's clock, at the rates the machine spec measured.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
   finish; the frontend's, when it co-hosts the authority, writes the step table
   and the run summary.
@@ -27,7 +29,8 @@ Authority is co-hosted in the frontend's process and served at the run file's
 Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
 ``ipc_s``, ``stream_s``, ``coefficients`` (a `Coefficients` mapping),
 ``machine`` (a machine spec mapping), ``parameter_count``, and ``out_dir``,
-where the step table, the run summary and the engine's command refusals go.
+where the step table, the run summary and the engine's refusals (the worker's
+refused commands and the engine's refused clock calls) go.
 
 A run file that also has ``router_s`` and ``kv_write_req_s`` describes a
 prefill-decode run over `prefill_decode_table`, and ``kv_link`` (``intra_node``
@@ -47,6 +50,7 @@ standalone authority writes the step table at the finish.
 """
 
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -273,6 +277,40 @@ def runner(model_runner) -> None:
     )
 
 
+def tokenizer(tok, config) -> None:
+    """Wrap `tok`'s ``encode`` and ``decode`` with the machine spec's entry for
+    the model's architecture and the backend that loaded; the entry warns when
+    the loaded ``tokenizer.json`` is not the one it was measured on."""
+    run = spec()
+    if run is None:
+        return
+    from atom.compass.spec import Backend, MachineSpec
+    from atom.utils.compass_loop import wrap_decode, wrap_encode
+
+    entry = MachineSpec.from_mapping(_width_keys(run["machine"])).tokenizer_for(
+        config.hf_config.architectures[0],
+        Backend.FAST if tok.is_fast else Backend.SLOW,
+        _fingerprint(tok),
+    )
+    tok.encode = wrap_encode(tok.encode, entry)
+    tok.decode = wrap_decode(tok.decode, entry)
+
+
+def _fingerprint(tok) -> str | None:
+    """``sha256:<hex>`` of the ``tokenizer.json`` a fast tokenizer was loaded
+    from, resolved from its ``name_or_path`` as loading did; None without one."""
+    from transformers.utils import cached_file
+
+    name = getattr(tok, "name_or_path", None)
+    if not (tok.is_fast and name):
+        return None
+    try:
+        path = cached_file(name, "tokenizer.json", local_files_only=True)
+    except OSError:
+        return None
+    return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 def _width_keys(node):
     """JSON writes a width table's integer keys as strings; read them back."""
     if not isinstance(node, dict):
@@ -282,12 +320,13 @@ def _width_keys(node):
 
 def engine_done(engine_core) -> None:
     """After the engine's loop: leave the clock and keep the worker's command
-    refusals for the run summary."""
+    refusals and the engine's refused clock calls for the run summary."""
     clock.close()
     run = spec()
     if run is not None:
         refused = engine_core.runner_mgr.call_func("refused_commands", wait_out=True)
-        (Path(run["out_dir"]) / COMMANDS_FILE).write_text(json.dumps(list(refused)))
+        reasons = list(refused) + clock.installed().refusals
+        (Path(run["out_dir"]) / COMMANDS_FILE).write_text(json.dumps(reasons))
 
 
 def frontend_done(llm_engine) -> bool:
@@ -302,7 +341,11 @@ def frontend_done(llm_engine) -> bool:
     if a is None:  # the standalone authority writes the step table
         return True
     out = Path(run["out_dir"])
-    reasons = json.loads((out / COMMANDS_FILE).read_text()) + rt.loop.executor.refusals
+    reasons = (
+        json.loads((out / COMMANDS_FILE).read_text())
+        + rt.loop.executor.refusals
+        + rt.refusals
+    )
     steps = sum(r.lp == ENGINE.name and r.event == "TAR" for r in a.steps.rows)
     summary = RunSummary.of(
         a, a.finished - a.started, refusals=RefusalTally.of(reasons, steps)
