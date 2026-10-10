@@ -65,42 +65,22 @@ the twelve names above have a caller that waits for the reply, and `exit` and
 `process_kvconnector_output` do not. `atom/compass/runner/overrides.py` carries the
 third case — a method that raises — and the table of which names wait.
 
-**`flush_pp_send` keeps ATOM's own answer, the profiler pair is refused, and the rollout
-methods must be defined to be refused** (revised 2026-09-28 and 2026-09-30, #443):
+**`flush_pp_send` keeps ATOM's own answer, and the control-command worker methods are
+refused** (revised 2026-09-28 and 2026-09-30, #443):
 
 - `flush_pp_send` is **answered by ATOM's own, at once**: `ModelRunner.flush_pp_send`
   returns `True` after waiting on any pending `isend`, and a simulated runner posts none.
-  The wait the call stands for is not the runner's to answer, because a large
-  stage-to-stage send completes by rendezvous at a time only the receiving stage's LP
-  knows. The stage loop settles it before the call: at the idle call sites in
-  `PPEngineCoreProc._pp_head_step` (the head launched nothing this round) and
-  `_downstream_busy_loop` (a downstream stage received nothing), it receives the pending
-  send's `stage(k+1)->stage(k):pp_ack#dp0` frame inline when the send was rendezvous, or
-  advances to the send's local completion when it was eager (`01` D4, K5; `15` D91 Q3).
-  The shutdown calls, in the `finally` blocks of `_head_busy_loop` and
-  `_downstream_busy_loop`, fall outside the simulated window. The runner gains two methods
-  that the stage loop calls to move one `pp_data` or `pp_ack` frame over the PP CPU group
-  (`15` D91 Q3, carrier); only the stage loop's hooks call them, never ATOM.
-- `start_profiler` and `stop_profiler` are **refused**. Both are reachable while serving
-  (`/start_profile` and `/stop_profile`, `api_server.py:2426` and `:2437`). A real
-  profiler slows every step after it, so a zero-cost answer is a silent simplification,
-  and a profiled system is not what Compass simulates.
-- `update_weights`, `update_weights_from_shm`, `update_weights_from_ipc`,
-  `release_memory`, `resume_memory`, `clear_kv_cache` and `configure_hidden_states` are
-  dispatched by `EngineUtilityHandler` (`engine_utility.py`) but defined only by the
-  rollout runner `RLHFModelRunner`, not by `ModelRunner`, so left alone each is a
-  skipped name that parks its caller. The runner defines all seven and **refuses**
-  them. Their only senders are in `atom/rollout/` (weight sync, sleep and wake-up,
-  hidden-state extraction for RL training), never the HTTP server; `AsyncLLMEngine`
-  injects its runner with `kwargs.setdefault`, so an explicit Compass runner wins and
-  the commands land here. Simulating inference inside RL training needs cost models
-  for weight transfer and memory release and resume; that is deferred.
-
-A refusal names its command and is counted in the run summary's refusals (`01` D3.5);
-none of the nine is a silent zero-cost success. ATOM's handlers are unchanged. The four
-utility commands that call no worker — `abort_request`, `get_mtp_stats`,
-`get_mtp_statistics`, `get_cache_statistics` — only read or write scheduler state and
-run as usual; `abort_request` changes scheduling and must stay.
+  The stage loop settles the pending send before the call
+  ([`01` D4](01_execution_and_time_model.md#d4-the-interception-contract-which-waits-must-be-touched),
+  K5; [`15` D91](15_parallelism_support.md#d91-pp--the-only-strategy-that-adds-logical-processes),
+  Q3). The runner gains the two methods that loop calls to move one `pp_data` or `pp_ack`
+  frame over the PP CPU group; only the stage loop's hooks call them, never ATOM.
+- The runner defines and refuses by name the worker methods the profiler and RL
+  control commands reach (`start_profiler`, `stop_profiler`, `update_weights`,
+  `update_weights_from_shm`, `update_weights_from_ipc`, `release_memory`,
+  `resume_memory`, `clear_kv_cache`, `configure_hidden_states`), as
+  [`01` D5](01_execution_and_time_model.md#d5-timers-clock-reads-and-control-commands)
+  decides.
 
 ### Three semantics `forward()` must reproduce
 
@@ -562,7 +542,7 @@ scheduler at shapes no real model has.
 
 | # | Decision | Date |
 |---|---|---|
-| D10 | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass; no ATOM change for the injection. Revised: `flush_pp_send` keeps ATOM's own answer and the stage loop receives the pending send's `pp_ack` before calling it; the two profiler and seven rollout worker methods are refused by name and counted | 2026-09-18, revised 2026-09-28 and 2026-09-30 |
+| D10 | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass; no ATOM change for the injection. Revised: `flush_pp_send` keeps ATOM's own answer and the stage loop settles the pending send before calling it; the control-command refusals are recorded in [`01` D5](01_execution_and_time_model.md#decision-log) | 2026-09-18, revised 2026-09-28 and 2026-09-30 |
 | D10.1 | A model comes into existence three ways, none reading weights: HF-config geometry where only geometry is needed; a `torch.device("meta")` context where a module tree is needed without tracing (no transient, no GPU, covers buffers - ATOM already has this shape at `models/utils.py::no_init_weights`, unused); and `FakeTensorMode` for tracing, the only one with symbolic shapes and the right device branch. `--load_dummy` is reused in all three. `_init_weight_params_on_meta` is not a bug but is superseded by the meta context. The T5 fallback is the meta context plus concrete traces. | 2026-09-20 |
 | D11 | No modes on the runner. Every run simulates; the algorithm comes from a pluggable cost backend. `measure` and `trace` are orthogonal flags. | 2026-09-18 |
 | D12 | M1 fake model = KV/weight geometry from the HF config + a shape-analytic cost stub including the quadratic query term; constant mode retained for bring-up | 2026-09-18 |
