@@ -146,7 +146,7 @@ Consequences:
 | | |
 |---|---|
 | **Q1 LPs** | **None added.** One LP per DP group, barriered at each of ATOM's DP collectives and at Compass's step-seconds exchange, every step. Each rank is a member process of that LP with its own LP runtime, and the CA joins the members (`01` D3). |
-| **Q3 cost** | ATOM's DP collectives (the table above) are tiny, and the liveness one runs on the **CPU/Gloo** path. Each is priced like any other collective (`07` D40), per width. The step-seconds exchange is not priced: it stands in for the MoE all-to-all, which the MoE segment already prices. The all-gather payload is `n_fields × dp_size` int32 — bandwidth-irrelevant, latency-dominated, which is the regime `10` D66 already models. |
+| **Q3 cost** | ATOM's DP collectives (the table above) are tiny, and the liveness one runs on the **CPU/Gloo** path. Each is priced like any other collective (`07` D40), per width. The step-seconds exchange is not priced: it stands in for the MoE gather and reduce-scatter (the all-to-all under EP), which the MoE segment already prices. The all-gather payload is `n_fields × dp_size` int32 — bandwidth-irrelevant, latency-dominated, which is the regime `10` D66 already models. |
 | **Q4 memory** | Weights and KV **replicate** per DP rank; nothing shards. So the memory model is per-replica and the width key is DP-independent — DP is the one strategy that does *not* add a `runtime_constants` dimension. |
 
 ### The step costs the `max` over ranks
@@ -175,7 +175,8 @@ transfer to DP.
   gather follows `forward_mode.running_tokens_are_unified`, not the CUDA graph:
   - Every rank decoding: the padded `all_gather`, `T_moe = dp x running_bs x
     max_seqlen_q`, where `running_bs` is the smallest capture size at or above
-    `max_bs_across_dp`, under `enforce_eager` too.
+    `max_bs_across_dp`, or `max_bs_across_dp` itself when no capture size is that large,
+    under `enforce_eager` too.
   - Any rank prefilling, and an MTP draft's first pass: the variable-size `all_gatherv`,
     `T_moe = sum(num_tokens_across_dp)`.
 
@@ -187,9 +188,8 @@ transfer to DP.
   (`MoriPrepareAndFinalize.prepare`) with no group pad; the MoE count under EP is not
   settled.
 - **Why `max` is the critical path here.** Under DP-attention a layer's barrier-delimited
-  segments are the local segment and the MoE segment. With EP off the MoE segment costs
-  the same on every rank by construction: every rank runs the same `T_moe` rows over the
-  same expert slices, whatever the routing. With EP on that holds under uniform routing.
+  segments are the local segment and the MoE segment. With EP off the MoE segment is
+  rank-invariant by construction (above). With EP on that holds under uniform routing.
   When one segment is rank-invariant the sum of per-segment maxima equals the max of
   per-rank sums.
   Rank 0 at attention 3 per layer and rank 1 at 1, both at MoE `c`, give
