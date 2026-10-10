@@ -540,18 +540,26 @@ never materialises: Qwen3.8-27B is dense-MLP (no `num_experts`, no `shared_exper
 dual-stream MoE cannot fire; it is not MLA so there is no metadata `prep_stream`; TBO
 defaults off and needs `--enable-tbo` plus `--enable-dp-attention` plus >=2 GPUs; and PP
 asserts `enforce_eager` so it cannot coexist with CUDA graphs. **DeepSeek-V4-Pro populates
-`Par` in M2**, differently on each node of the nightly 1P+1D cell
-(`recipes/mesh/DeepSeek-V4.md`):
+`Par` in M2**, on both nodes of each nightly 1P+1D cell in `recipes/mesh/DeepSeek-V4.md`
+(TP, DPA, TP MTP3, DPA MTP1). Only the DPA and DPA MTP1 cells pass
+`--enable-dp-attention`, and only their prefill node adds `--enable-tbo`.
 
-- **Decode runs DP-attention without TBO.** Inside the replayed graph,
+- **Decode, in all four cells, runs without TBO.** Inside the replayed graph,
   `DeepseekV4Attention.maybe_compressors_async` forks the compressors onto `alt_stream`
   and `indexer_stream`, and `MoE` runs the shared expert on `alt_stream` against the
-  routed experts whenever tokens <= `ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD` (1024 by
-  default) — i.e. **every decode step**. The shared expert stays unfused because it is FP8
-  and the routed experts FP4.
-- **Prefill adds `--enable-tbo`**, which turns both forks off (`tbo_active()`) and instead
-  alternates two microbatches between a compute and a comm stream joined by events
-  (`atom/utils/tbo/ubatching.py`).
+  routed experts whenever this rank's tokens <= `ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`
+  (1024 by default) — i.e. **every decode step** at the cells' concurrencies. The shared
+  expert stays unfused because it is FP8 and the routed experts FP4.
+- **Prefill never forks the compressors**: it runs eager, and the compressor fork needs
+  `fc.in_hipgraph`, which only decode graph capture sets. A prefill step is one of three:
+  - **a TBO step** (DPA cells only), taken when some DP rank reaches
+    `ATOM_TBO_PREFILL_MIN_TOKENS` (8192 by default) and every rank can split
+    (`local_tbo_precompute`, `atom/utils/tbo/ubatching.py`): two microbatches alternate
+    between a compute and a comm stream joined by events, and `tbo_active()` keeps the
+    shared-expert fork off;
+  - **any other step with at most 1024 tokens on this rank**: `maybe_dual_stream_forward`
+    forks the shared expert in eager mode, a `Par` on the prefill node;
+  - **any other step**: one stream.
 
 So `Par` is defined now and populated at M2, from its first DeepSeek-V4-Pro step.
 
