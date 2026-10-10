@@ -463,3 +463,40 @@ sets `PYTHONPATH` to the tree and **nothing else** — inherited entries are the
 hazard, not a convenience — then asserts the resolved path is under it, and exits
 92 if not. The probe runs from `/` on purpose: run in place, Python puts the cwd at
 the head of `sys.path` and the assertion passes whatever `PYTHONPATH` says.
+
+## A cc-traces cell on a simulated TP1 run — `cctraces_sim.sh`
+
+`cctraces_sim.sh RUN_FILE OUT_DIR` runs one cell in the GPU container: ATOM's API
+server with `--compass-run`, driven by `aiperf profile --scenario
+inferencex-agentx-mvp` through compass-harness, on the first `SESSIONS` traces of a
+cc-traces `traces.jsonl`. The cell ends when the scenario's `--benchmark-duration`
+has passed on the simulated clock; nothing is computed or allocated on the device.
+The header of the script lists its environment; `MODEL`, `TRACES` and
+`HARNESS_PYTHON` are required.
+
+- `RUN_FILE` is a run file as `atom/compass/run/__init__.py` describes it. The
+  script replaces its `out_dir` and `clock_endpoint` and adds a `workload` entry:
+  the sha256 of `TRACES` and of each replayed trace, the aiperf arguments and the
+  pinned benchmark id. The step table's configuration line and the run summary
+  carry it.
+- Since the served tokenizer is charged, a tokenizer entry of the run file's
+  machine spec must name the model's architecture
+  (`Qwen3_5ForConditionalGeneration` for a Qwen3.8-27B `config.json`), or the
+  server refuses to start.
+- `HARNESS_PYTHON` is a Python with agentx-harness 56a0cf70 and compass-harness
+  installed; the script puts this tree's `compass_harness` first on `PYTHONPATH`
+  and refuses (exit 92) when it resolves elsewhere.
+- Each cell writes its aiperf memory-mapped dataset under `OUT_DIR`, so cells run
+  side by side.
+
+The last line printed is the cell's result: aiperf's request count and errors,
+simulated and wall seconds from the run summary, both prefix-cache hit rates
+(`cache_read_pct` is the engine's, `theoretical_hit_pct` is aiperf's oracle), TTFT,
+ITL and request throughput in simulated time, and the run's refusals. A
+`coverage_report=True` cell is a coverage report, not a result.
+
+Two runs of a cell with different `PYTHONHASHSEED` must give byte-identical step
+tables: `cmp A/step_table.txt B/step_table.txt`.
+`tests/compass/test_cctraces_sim_smoke.py` runs that pair on one session for 60
+simulated seconds when `ATOM_COMPASS_SLICE_MODEL`, `ATOM_COMPASS_CCTRACES` and
+`COMPASS_HARNESS_PYTHON` are set.
