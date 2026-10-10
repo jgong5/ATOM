@@ -251,6 +251,8 @@ def _finish(monkeypatch, tmp_path, ranks):
     run = json.loads(_run_file(tmp_path, data_parallel_size=2).read_text())
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     table = compass_run.channel_table(run)
+    # The authority starts before the engines, clearing an earlier run's files.
+    authority = compass_run._RecordingAuthority(run)
     engine = LPRuntime(compass_run.ENGINE, table, None)
     engine.now = math.inf
     monkeypatch.setattr(clock, "_installed", engine)
@@ -260,7 +262,6 @@ def _finish(monkeypatch, tmp_path, ranks):
         worker = SimpleNamespace(call_func=lambda name, wait_out, r=refused: r)
         compass_run.engine_done(SimpleNamespace(runner_mgr=worker))
 
-    authority = compass_run._RecordingAuthority(run)
     authority.started = authority.finished = time.monotonic()
     monkeypatch.setattr(compass_run, "_authority", authority)
     frontend = LPRuntime(compass_run.FRONTEND, table, None)
@@ -272,7 +273,9 @@ def _finish(monkeypatch, tmp_path, ranks):
 
 def test_every_ranks_refusals_reach_the_run_summary(monkeypatch, tmp_path):
     # A rank file of another run in a reused out_dir is not this run's.
-    (tmp_path / "commands.dp7.json").write_text('["command:an earlier run"]')
+    (tmp_path / compass_run.COMMANDS_FILE.format("engine.dp7")).write_text(
+        '["command:an earlier run"]'
+    )
     assert _finish(monkeypatch, tmp_path, (0, 1))
 
     summary = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())
@@ -283,7 +286,8 @@ def test_every_ranks_refusals_reach_the_run_summary(monkeypatch, tmp_path):
 
 
 def test_a_rank_that_wrote_no_refusal_record_fails_the_summary(monkeypatch, tmp_path):
-    with pytest.raises(FileNotFoundError, match="commands.dp0.json"):
+    monkeypatch.setattr(compass_run, "HAND_IN_WAIT_S", 0.2)
+    with pytest.raises(TimeoutError, match=r"no commands-engine\.dp0\.json in"):
         _finish(monkeypatch, tmp_path, (1,))
     assert not (tmp_path / compass_run.SUMMARY_FILE).exists()
 

@@ -148,6 +148,28 @@ differs between `fe9ea043c` and the integration base `83daf636d` — the only de
 under `atom/` is markdown documentation, which no test imports. Cite the delta;
 do not claim green.
 
+## The compass_harness tests need an agentx-harness wheel
+
+`tests/compass/test_harness_*.py` skip when `compass-harness` or `aiperf` does not
+import. On a tree that carries `compass_harness/`, `gate_cpu.sh` installs the tree's
+own `compass_harness` into a run-local directory, with `--no-build-isolation`, so
+`setuptools` must be installed. `aiperf` comes from the wheel `COMPASS_AGENTX_HARNESS` names, or
+from the environment when that is unset. When the tests' skip condition still holds,
+the gate exits 96 before pytest and names the reason.
+
+The gate installs with `--no-index`, so it runs offline (inside `unshare -rn` too).
+Build the wheel once, where `pip` can fetch `hatchling`, and stage it beside the
+snapshot:
+
+```
+git -C <agentx-harness> archive 56a0cf70 | tar -x -C <src>
+python3 -m pip wheel --no-deps -w <dir> <src>       # aiperf-0.12.0-py3-none-any.whl
+COMPASS_AGENTX_HARNESS=<dir>/aiperf-0.12.0-py3-none-any.whl scripts/compass/gate_cpu.sh
+```
+
+`compass_harness` checks the installed `aiperf` source against its pinned
+functions on import, so a wheel from another commit fails the same way.
+
 ## A red CPU gate that may not be your diff — one flaky test in ATOM's suite
 
 `tests/entrypoints/test_stream_marker_properties.py::TestTheRegionIsNotCopiedPerChunk`
@@ -441,3 +463,40 @@ sets `PYTHONPATH` to the tree and **nothing else** — inherited entries are the
 hazard, not a convenience — then asserts the resolved path is under it, and exits
 92 if not. The probe runs from `/` on purpose: run in place, Python puts the cwd at
 the head of `sys.path` and the assertion passes whatever `PYTHONPATH` says.
+
+## A cc-traces cell on a simulated TP1 run — `cctraces_sim.sh`
+
+`cctraces_sim.sh RUN_FILE OUT_DIR` runs one cell in the GPU container: ATOM's API
+server with `--compass-run`, driven by `aiperf profile --scenario
+inferencex-agentx-mvp` through compass-harness, on the first `SESSIONS` traces of a
+cc-traces `traces.jsonl`. The cell ends when the scenario's `--benchmark-duration`
+has passed on the simulated clock; nothing is computed or allocated on the device.
+The header of the script lists its environment; `MODEL`, `TRACES` and
+`HARNESS_PYTHON` are required.
+
+- `RUN_FILE` is a run file as `atom/compass/run/__init__.py` describes it. The
+  script replaces its `out_dir` and `clock_endpoint` and adds a `workload` entry:
+  the sha256 of `TRACES` and of each replayed trace, the aiperf arguments and the
+  pinned benchmark id. The step table's configuration line and the run summary
+  carry it.
+- Since the served tokenizer is charged, a tokenizer entry of the run file's
+  machine spec must name the model's architecture
+  (`Qwen3_5ForConditionalGeneration` for a Qwen3.8-27B `config.json`), or the
+  server refuses to start.
+- `HARNESS_PYTHON` is a Python with agentx-harness 56a0cf70 and compass-harness
+  installed; the script puts this tree's `compass_harness` first on `PYTHONPATH`
+  and refuses (exit 92) when it resolves elsewhere.
+- Each cell writes its aiperf memory-mapped dataset under `OUT_DIR`, so cells run
+  side by side.
+
+The last line printed is the cell's result: aiperf's request count and errors,
+simulated and wall seconds from the run summary, both prefix-cache hit rates
+(`cache_read_pct` is the engine's, `theoretical_hit_pct` is aiperf's oracle), TTFT,
+ITL and request throughput in simulated time, and the run's refusals. A
+`coverage_report=True` cell is a coverage report, not a result.
+
+Two runs of a cell with different `PYTHONHASHSEED` must give byte-identical step
+tables: `cmp A/step_table.txt B/step_table.txt`.
+`tests/compass/test_cctraces_sim_smoke.py` runs that pair on one session for 60
+simulated seconds when `ATOM_COMPASS_SLICE_MODEL`, `ATOM_COMPASS_CCTRACES` and
+`COMPASS_HARNESS_PYTHON` are set.

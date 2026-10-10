@@ -25,17 +25,20 @@ member, the frontend's included, connects to.
 - `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
   ``decode`` to the frontend's clock, at the rates the machine spec measured.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
-  finish; the frontend's, when it co-hosts the authority, writes the step table
-  and the run summary.
+  finish, each handing in its LP's refusals; the frontend's, when it co-hosts
+  the authority, then writes the step table and the run summary.
 
 Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
 ``ipc_s``, ``stream_s``, ``coefficients`` (a `Coefficients` mapping),
 ``machine`` (a machine spec mapping), ``parameter_count``, and ``out_dir``,
-where the step table, the run summary and the engine's refusals (the worker's
-refused commands and the engine's refused clock calls) go. An optional
-``data_parallel_size``, 1 when absent, is the deployment's DP width, which
-under DP-attention is its TP size times its DP size; the traffic LP reads the
-channel table from the run file alone.
+where the step table, the run summary and each server LP's refusals go: an
+engine's are the worker's refused commands and the engine's refused clock
+calls, a frontend's its executor's refused jobs and its refused clock calls.
+The authority removes an earlier run's files there as it starts. An
+optional ``data_parallel_size``, 1 when absent, is the deployment's DP width,
+which under DP-attention is its TP size times its DP size; the traffic LP reads
+the channel table from the run file alone. Each DP rank's engine process hands
+in its own refusals, as ``<lp>.<member>``.
 
 A run file that also has ``router_s`` and ``kv_write_req_s`` describes a
 prefill-decode run over `prefill_decode_table`, and ``kv_link`` (``intra_node``
@@ -51,7 +54,9 @@ The API server's ``--compass-clock-endpoint`` sets `CLOCK_ENV`: the authority
 is not co-hosted but served by `authority`, its own process started before the
 engines (``python -m atom.compass.run``), and every LP connects to that
 endpoint. Its frontend is ``frontend-P`` or ``frontend-D`` by ``kv_role``. The
-standalone authority writes the step table at the finish.
+standalone authority writes the step table and the run summary once every
+server LP has handed in its refusals, which the out_dir both API servers share
+carries.
 """
 
 import contextlib
@@ -78,15 +83,17 @@ from atom.utils import clock
 
 ENV = "ATOM_COMPASS_RUN"
 CLOCK_ENV = "ATOM_COMPASS_CLOCK_ENDPOINT"
-FRONTEND, ENGINE = LpId("frontend"), LpId("engine")
+FRONTEND, ENGINE, TRAFFIC = LpId("frontend"), LpId("engine"), LpId("traffic")
 ATOM_RUNNER = "atom.model_engine.model_runner.ModelRunner"
 #: Keys that differ between two runs of one configuration, kept out of its name.
 PER_RUN = ("clock_endpoint", "out_dir")
 COMMANDS_FILE, STEP_TABLE_FILE, SUMMARY_FILE = (
-    "commands.json",
+    "commands-{}.json",  # by LP name, or <lp>.<member> for a member
     "step_table.txt",
     "summary.json",
 )
+#: Wall seconds the summary's writer waits for the server LPs' refusals.
+HAND_IN_WAIT_S = 300.0
 
 _authority: "_RecordingAuthority | None" = None
 #: This engine process's member name in the engine LP, None at DP width one.
@@ -175,15 +182,38 @@ def configuration(run: dict) -> dict:
     return {k: v for k, v in run.items() if k not in PER_RUN}
 
 
+def _servers(run: dict) -> list[str]:
+    """The run's server LPs by name: every LP but the traffic LP."""
+    return [lp.name for lp in channel_table(run).registry.ids() if lp != TRAFFIC]
+
+
+def _hand_ins(run: dict) -> list[str]:
+    """The name each server LP hands its refusals in under: ``<lp>.<member>`` for
+    each member of an LP declared with members, else the LP's name."""
+    members = _members(channel_table(run), _dp(run)) or {}
+    return [
+        f"{lp}.{m}" if m else lp
+        for lp in _servers(run)
+        for m in members.get(LpId(lp), [None])
+    ]
+
+
 class _RecordingAuthority(ClockAuthority):
     """The authority, recording the step table: a row per reply and a row per
-    message each reply releases; and the wall seconds of the run, from the
-    frontend's start to the finish, which sets `done`."""
+    message each reply releases; and the wall seconds of the run, from its start
+    to the finish, which sets `done`. A co-hosting frontend starts the run as it
+    starts its own; otherwise it starts once every server LP has asked once."""
 
     def __init__(self, run: dict) -> None:
         self.steps = StepTable(json.dumps(configuration(run), sort_keys=True))
         self.started = self.finished = None
         self.done = threading.Event()
+        self._joining = set(_servers(run))
+        # A rerun into the same out_dir starts from none of the last run's files.
+        out = Path(run["out_dir"])
+        for name in (COMMANDS_FILE.format("*"), STEP_TABLE_FILE, SUMMARY_FILE):
+            for f in out.glob(name):
+                f.unlink()
         table = channel_table(run)
         super().__init__(
             table,
@@ -196,6 +226,9 @@ class _RecordingAuthority(ClockAuthority):
         self.steps.record(lp, time_from, time_to, kind, detail="recovered" * recovered)
 
     def on_request(self, *args, **kwargs) -> list:
+        self._joining.discard(args[0].name)
+        if not self._joining and self.started is None:
+            self.started = time.monotonic()
         replies = super().on_request(*args, **kwargs)
         for to, _, released in replies:
             # A member's reply is addressed (lp, member); its channels name its rank.
@@ -303,7 +336,7 @@ def runner(model_runner) -> None:
         return
     from atom.compass.backends.geometry import Parallelism
     from atom.compass.backends.shape import Coefficients, ShapeStubBackend
-    from atom.compass.memory import ModelTerms, device_readings, reserves
+    from atom.compass.memory import ModelTerms, device_readings
     from atom.compass.runner.overrides import (
         install_cost_backend,
         install_device_readings,
@@ -320,19 +353,56 @@ def runner(model_runner) -> None:
             stack_layers=config.hf_config.num_hidden_layers,
         ),
     )
+    machine = MachineSpec.from_mapping(_width_keys(run["machine"]))
+    model = ModelTerms.from_declared_config(
+        config.hf_config,
+        parameter_count=run["parameter_count"],
+        tp_size=tp,
+        warmup_tokens=config.max_num_batched_tokens,
+    )
     install_device_readings(
         model_runner,
         device_readings(
-            MachineSpec.from_mapping(_width_keys(run["machine"])),
+            machine,
             tp_width=tp,
-            model=ModelTerms.from_declared_config(
-                config.hf_config,
-                parameter_count=run["parameter_count"],
-                tp_size=tp,
-                warmup_tokens=config.max_num_batched_tokens,
-            ),
-            cudagraph_overhead=reserves(enforce_eager=True),
+            model=model,
+            cudagraph_overhead=_graph_pool(model_runner, machine, model),
         ),
+    )
+
+
+def _graph_pool(model_runner, machine, model):
+    """What ATOM's `_estimate_cudagraph_overhead` reserves for this deployment:
+    nothing under ``enforce_eager``, else the branch the runner's own
+    `_piecewise_cg_active` picks, over the same config fields it reads."""
+    from atom.compass.memory import (
+        PiecewiseCapture,
+        capture_token_shapes,
+        piecewise_per_token_bytes,
+        reserves,
+    )
+
+    config = model_runner.config
+    if config.enforce_eager:
+        return reserves(enforce_eager=True)
+    if not model_runner._piecewise_cg_active():
+        return reserves(activation_bytes=model.activations.nbytes)
+    hf = config.hf_config
+    sizes = config.compilation_config.cudagraph_capture_sizes or [config.max_num_seqs]
+    capacity = machine.value("device.memory.capacity_bytes")
+    return reserves(
+        piecewise=PiecewiseCapture(
+            per_token_bytes=piecewise_per_token_bytes(
+                hidden_size=int(hf.hidden_size),
+                layers=int(hf.num_hidden_layers),
+                dtype_bytes=config.torch_dtype.itemsize,
+                dp_size=config.parallel_config.data_parallel_size,
+            ),
+            token_shapes=capture_token_shapes(
+                sizes, max_num_batched_tokens=config.max_num_batched_tokens
+            ),
+            budget_bytes=int(config.gpu_memory_utilization * capacity),
+        )
     )
 
 
@@ -377,43 +447,62 @@ def _width_keys(node):
     return {int(k) if k.isdigit() else k: _width_keys(v) for k, v in node.items()}
 
 
-def _commands_file(member: str | None) -> str:
-    """The refusal record of the engine process that is `member` of the engine LP."""
-    return COMMANDS_FILE if member is None else f"commands.{member}.json"
+def _write_whole(path: Path, text: str) -> None:
+    """Write `path` whole or not at all, so a reader that polls for it never
+    reads it part-written."""
+    part = path.with_name(path.name + ".part")
+    part.write_text(text)
+    part.replace(path)
+
+
+def _hand_in(run: dict, lp: str, reasons: list) -> None:
+    """Write `lp`'s refusals for the summary's writer."""
+    _write_whole(Path(run["out_dir"]) / COMMANDS_FILE.format(lp), json.dumps(reasons))
 
 
 def engine_done(engine_core) -> None:
-    """After the engine's loop: leave the clock and keep the worker's command
-    refusals and the engine's refused clock calls for the run summary."""
+    """After the engine's loop: leave the clock and hand in the worker's command
+    refusals and the engine's refused clock calls."""
     clock.close()
     run = spec()
     if run is not None:
         refused = engine_core.runner_mgr.call_func("refused_commands", wait_out=True)
-        reasons = list(refused) + clock.installed().refusals
-        (Path(run["out_dir"]) / _commands_file(_member)).write_text(json.dumps(reasons))
+        rt = clock.installed()
+        lp = rt.me.name if _member is None else f"{rt.me.name}.{_member}"
+        _hand_in(run, lp, list(refused) + rt.refusals)
 
 
 def frontend_done(llm_engine) -> bool:
     """Whether the stopped server was a simulated run's finish. If it was, stop
-    the engines and, with the authority co-hosted, write the step table and the
-    run summary."""
+    the engines, hand in the frontend's refusals and, with the authority
+    co-hosted, write the step table and the run summary."""
     rt = clock.installed()
     if rt is None or rt.now != math.inf:
         return False
     llm_engine.close()
-    run, a = spec(), _authority
-    if a is None:  # the standalone authority writes the step table
-        return True
+    run = spec()
+    _hand_in(run, rt.me.name, rt.loop.executor.refusals + rt.refusals)
+    if _authority is not None:
+        out = Path(run["out_dir"])
+        _write_whole(out / STEP_TABLE_FILE, _authority.steps.text())
+        _write_summary(run, _authority)
+    return True
+
+
+def _write_summary(run: dict, a: _RecordingAuthority) -> None:
+    """Write the run summary once every server LP has handed in its refusals."""
     out = Path(run["out_dir"])
-    dp = _dp(run)
-    members = [None] if dp == 1 else [f"dp{r}" for r in range(dp)]
-    files = [out / _commands_file(m) for m in members]
-    reasons = (
-        [r for f in files for r in json.loads(f.read_text())]
-        + rt.loop.executor.refusals
-        + rt.refusals
-    )
-    steps = sum(r.lp == ENGINE.name and r.event == "TAR" for r in a.steps.rows)
+    files = [out / COMMANDS_FILE.format(n) for n in _hand_ins(run)]
+    deadline = time.monotonic() + HAND_IN_WAIT_S
+    while missing := [f.name for f in files if not f.exists()]:
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"no {', '.join(missing)} in {out} after {HAND_IN_WAIT_S} wall "
+                "seconds, so the run summary would miss those LPs' refusals"
+            )
+        time.sleep(0.1)
+    reasons = [r for f in files for r in json.loads(f.read_text())]
+    steps = sum(r.lp.startswith(ENGINE.name) and r.event == "TAR" for r in a.steps.rows)
     summary = RunSummary.of(
         a, a.finished - a.started, refusals=RefusalTally.of(reasons, steps)
     ).as_record()
@@ -421,16 +510,15 @@ def frontend_done(llm_engine) -> bool:
     # A refused command leaves ATOM's half of it applied, so what ran after it
     # was not the deployment simulated.
     summary["coverage_report"] = any(r.startswith("command:") for r in reasons)
-    (out / STEP_TABLE_FILE).write_text(a.steps.text())
-    (out / SUMMARY_FILE).write_text(json.dumps(summary, sort_keys=True, indent=1))
-    return True
+    _write_whole(out / SUMMARY_FILE, json.dumps(summary, sort_keys=True, indent=1))
 
 
 def authority(endpoint: str) -> None:
     """Serve the run file's authority at `endpoint` until the finish, then write
-    its step table."""
+    its step table, and the run summary once the server LPs have handed in."""
     run = spec()
     a = _RecordingAuthority(run)
     serve(a, endpoint)
     a.done.wait()
-    (Path(run["out_dir"]) / STEP_TABLE_FILE).write_text(a.steps.text())
+    _write_whole(Path(run["out_dir"]) / STEP_TABLE_FILE, a.steps.text())
+    _write_summary(run, a)
