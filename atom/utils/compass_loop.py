@@ -264,6 +264,10 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         self.daemon = weakref.WeakSet()  # the daemon timers scheduled
         # Requests read, not handed over: (channel, seq) -> (arrival, wake-up).
         self.held: dict[tuple[str, int], tuple[float, asyncio.Future]] = {}
+        # `hand_over` wakes requests in (arrival, seq) order; each takes this
+        # lock as it wakes (asyncio locks are fair) and holds it until it is
+        # counted handled, so the app gets them in that order.
+        self.hand_on = asyncio.Lock()
         # Per output thread: its width-1 station, its open job, and the callbacks
         # that job posted.
         self.detok = threading.local()
@@ -468,13 +472,14 @@ class HttpChannel:
             wake = loop.create_future()
             loop.held[ch, seq] = (arrival, wake)
             await wake
-            # Read the whole body first: a request counts as handled only once
-            # nothing about it still waits on the socket.
-            body = [await receive()]
-            while body[-1].get("more_body"):
-                body.append(await receive())
-            with rt.lock:
-                rt.count_done_locked(ch, seq)
+            async with loop.hand_on:
+                # Read the whole body first: a request counts as handled only
+                # once nothing about it still waits on the socket.
+                body = [await receive()]
+                while body[-1].get("more_body"):
+                    body.append(await receive())
+                with rt.lock:
+                    rt.count_done_locked(ch, seq)
             inner = receive
 
             async def receive():
