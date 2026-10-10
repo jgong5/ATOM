@@ -8,6 +8,7 @@ call runs on a daemon thread with a bounded wait, so a reply that never comes
 fails the test instead of hanging it.
 """
 
+import asyncio
 import json
 import math
 import queue
@@ -35,6 +36,9 @@ from atom.compass.clock_transport import (
     serve,
     service,
 )
+from atom.utils import clock
+from atom.utils.clock import LPRuntime
+from atom.utils.compass_loop import CompassEventLoop
 
 from .test_member_join import ENGINE, FRONTEND, RANKS, _joined
 
@@ -239,8 +243,10 @@ def test_each_member_binds_its_own_connection_and_reads_its_own_releases(
     dp0, dp1 = (connect(ENGINE, endpoint, rank) for rank in RANKS)
     with pytest.raises(KeyError, match="engine member dp0 is already bound"):
         connect(ENGINE, endpoint, "dp0")
+    # Held to the end: closing a bound connection ends the run.
+    stray = connect(ENGINE, endpoint, "dp2")
     with pytest.raises(KeyError, match="called by member 'dp2'"):
-        _ask(connect(ENGINE, endpoint, "dp2"), (NER, INF, [], INF))
+        _ask(stray, (NER, INF, [], INF))
     _result(_later(frontend.send, (NER, INF, [(REQ1, 0, 1.0)], INF)))
     rounds = []
     for _ in range(2):
@@ -441,6 +447,62 @@ def test_a_reply_is_not_something_a_participant_may_send(served):
         with pytest.raises(MalformedMessage, match="sends only TAR, NER$"):
             a.send(message)
     assert _ask(a, (TAR, 1.0, [], INF)) == (1.0, {})
+
+
+# --- the co-hosted frontend ---------------------------------------------------
+
+
+class _Asked(ClockAuthority):
+    """Sets `frontend_asked` once the frontend's first request is served."""
+
+    def __init__(self, channels):
+        super().__init__(channels)
+        self.frontend_asked = threading.Event()
+
+    def on_request(self, lp, *args, **kwargs):
+        replies = super().on_request(lp, *args, **kwargs)
+        if lp == FRONTEND:
+            self.frontend_asked.set()
+        return replies
+
+
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+def test_a_cohosted_frontend_serves_its_loop_while_its_grant_is_held(served, endpoint):
+    """The frontend reaches the authority in-process, as a co-hosting API server
+    does, and the other LPs through `endpoint`. While its next-event grant is
+    held, a callback another thread posts still runs on its event loop."""
+    table = single_engine_table(
+        admission_path="serving", ipc_s=IPC_S, stream_s=STREAM_S
+    )
+    ca = _Asked(table)
+    endpoint = served(ca, endpoint).endpoint
+    connect(LpId("traffic"), endpoint).send((NER, INF, [], INF))
+    engine = connect(ENGINE, endpoint)
+    rt = LPRuntime(FRONTEND, table, service.connect(FRONTEND, endpoint))
+    rt.start_run()
+    clock.install(rt)
+    try:
+        loop = CompassEventLoop()
+        posted = []
+
+        def held_then_released():
+            ca.frontend_asked.wait(WAIT_S)
+            ran = threading.Event()
+            loop.call_soon_threadsafe(lambda: (posted.append(loop.time()), ran.set()))
+            ran.wait(1.0)
+            posted.append("engine idles")
+            engine.send((NER, INF, [], INF))
+
+        threading.Thread(target=held_then_released, daemon=True).start()
+        loop.run_until_complete(asyncio.sleep(5))
+        assert loop.time() == 5.0
+        loop.run_forever()  # the finish grants +inf and the loop stops
+        loop.close()
+    finally:
+        clock.install(None)
+    # The engine's silence held the grant at 0, and the callback ran then.
+    assert posted == [0.0, "engine idles"]
+    assert rt.calls == 2 and rt.now == INF
 
 
 # --- one entry into the rule --------------------------------------------------
