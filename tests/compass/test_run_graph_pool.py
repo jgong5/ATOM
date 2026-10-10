@@ -38,7 +38,9 @@ def _reserved(monkeypatch, tmp_path, *, eager, piecewise=False, dp=1, sizes=None
             model=str(tmp_path),
             hf_config=hf,
             tensor_parallel_size=1,
-            parallel_config=SimpleNamespace(data_parallel_size=dp),
+            parallel_config=SimpleNamespace(
+                data_parallel_size=dp, data_parallel_rank=0
+            ),
             max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
             max_num_seqs=256,
             gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
@@ -47,6 +49,8 @@ def _reserved(monkeypatch, tmp_path, *, eager, piecewise=False, dp=1, sizes=None
             compilation_config=SimpleNamespace(
                 cudagraph_capture_sizes=list(sizes or CAPTURE_SIZES)
             ),
+            capture_sizes=list(sizes or CAPTURE_SIZES),
+            kv_transfer_config={},
         ),
         _piecewise_cg_active=lambda: piecewise,
     )
