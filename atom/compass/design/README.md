@@ -2,10 +2,9 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header. **Decisions D0–D95,
-with no gaps, and their sub-decisions** are indexed at the end of this file; **88 registered
-TODOs — T1–T88 with no gaps, of which 79 are open** (T10, T13, T15, T22, T48, T65, T71 and T84 are struck
-through as done, and T77 was opened and closed by P0.1); they, the load-bearing assumptions and the
-cross-cutting issues live in **`12_open_items.md`**. Implementation follows the execution
+with no gaps, and their sub-decisions** are indexed at the end of this file. The TODOs are
+registered in **`12_open_items.md`**, with the load-bearing assumptions and the cross-cutting
+issues. Implementation follows the execution
 plan in `16`.
 
 ---

@@ -58,7 +58,7 @@ call. Each request it sends is logged on `traffic->frontend:http` (K4) and each 
 event counted where it is read on `frontend->traffic:stream` (K5); nothing is annotated.
 A run ends when no essential work is left (`01` D3): on its `+inf` grant the harness
 raises unless every request it sent has its final response, naming those that do not
-(revised 2026-09-28, #443). A thin library per language.
+(revised 2026-10-02, #533, #534). A thin library per language.
 
 **Part 2 - wire protocol.** Stamps on the existing OpenAI-compatible endpoint, in carriers
 a real server ignores and the router forwards. See D28.
@@ -190,7 +190,7 @@ already behind the frontend's clock when it is read is a straggler that fails th
 (`01` D3.2). There is no silent clamp
 left to detect.
 
-**What was considered and rejected as a fifth field:** a per-step or per-token timeline.
+**What was considered and rejected as a fourth field:** a per-step or per-token timeline.
 It would make TPOT *distribution* gradeable rather than just its mean. Rejected because
 the same information is already in the engine's own step table (doc `08`), which both
 sides emit, and putting it on the wire would grow every response by the output length.
@@ -949,14 +949,14 @@ requires genuine fan-out in every root is not constructible without reusing sess
 
 | # | Decision | Date |
 |---|---|---|
-| D27 | A three-part contract (clock client, wire fields, per-harness adapter), not a bespoke client. Harnesses live outside ATOM; more than one is supported. | 2026-09-18 |
+| D27 | A three-part contract (clock client, wire fields, per-harness adapter), not a bespoke client. Harnesses live outside ATOM; more than one is supported. Revised 2026-10-02 (#533, #534): the clock client is `now()` and `next_event(t, t_daemon)`, with no `END` call; on its `+inf` grant the harness raises unless every request it sent has its final response. | 2026-09-18; revised 2026-10-02 |
 | D28 | Additive optional fields on the real endpoint, both directions. Response-carried timings replace take2's bulk drain. Revised: the request carrier is the `compass` entry of `tracestate`, the response's SSE comment lines (a `compass` header when not streamed); the engine's arrival reading is dropped, since a request is held until its arrival is granted and nothing clamps it. | 2026-09-18; revised 2026-09-28 |
 | D29 | Real HTTP to ATOM's real uvicorn server, both PD topologies. Round trip is a Category-B blocking wait. Revised: two counted channels, a K4 send and a K5 receive; nothing is annotated. | 2026-09-18; revised 2026-09-28 |
 | D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes on that path. Revised: three carriers, `tracestate` on the request, a `kv_transfer_params` field on the forward and SSE comment lines on the stream; still zero Atomesh changes. | 2026-09-18; revised 2026-09-28 |
 | D31 | Filler token is non-EOS, decodes to complete standalone ASCII, and is derived from the request id. | 2026-09-18 |
 | D32 | The decode->prefill cache chain is already broken by the harness for real servers too; guard only against false hits. `theoretical_prefix_cache_hit` is the oracle. | 2026-09-18 |
 | D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. Revised: both are resource stations; encode width excludes the wait jobs resident when the run starts, pool jobs are classified by a registry and unregistered ones refused, and a clock read inside a job is its start plus accumulated service time. A tokenizer call on the event loop thread (the final `decode` of a non-streaming completion, the calls in `anthropic_messages`) is no station job: it advances the frontend LP clock by its service time on the loop. | 2026-09-18; revised 2026-09-28 and 2026-10-03 |
-| D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. Revised: arrival rides the `compass` entry of `tracestate`, output times ride SSE comment lines, and the `/metrics` scrape is paced on simulated time as a daemon deadline; the run ends when no essential work is left. | 2026-09-18; revised 2026-09-28 |
+| D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. Revised: arrival rides the `compass` entry of `tracestate`, output times ride SSE comment lines, and the `/metrics` scrape is paced on simulated time. Revised 2026-10-02 (#533, #534): the scrape is a daemon deadline, and the run ends when no essential work is left. | 2026-09-18; revised 2026-09-28 and 2026-10-02 |
 | D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists; the rebind itself is deferred by a `sys.meta_path` hook, because the bootstrap runs while `aiperf.plugin.plugins` is still importing and cannot import `aiperf`; an inline attempt does not raise to the operator, it de-registers the whole plugin and logs one `WARNING` (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
 | D35 | Declare what the harness reproduces and what it cannot; cancellation is not available from this corpus. | 2026-09-18 |
 
