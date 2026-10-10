@@ -147,6 +147,28 @@ differs between `fe9ea043c` and the integration base `83daf636d` — the only de
 under `atom/` is markdown documentation, which no test imports. Cite the delta;
 do not claim green.
 
+## The compass_harness tests need an agentx-harness wheel
+
+`tests/compass/test_harness_*.py` skip when `compass-harness` or `aiperf` does not
+import. On a tree that carries `compass_harness/`, `gate_cpu.sh` installs the tree's
+own `compass_harness` into a run-local directory, with `--no-build-isolation`, so
+`setuptools` must be installed. `aiperf` comes from the wheel `COMPASS_AGENTX_HARNESS` names, or
+from the environment when that is unset. When the tests' skip condition still holds,
+the gate exits 96 before pytest and names the reason.
+
+The gate installs with `--no-index`, so it runs offline (inside `unshare -rn` too).
+Build the wheel once, where `pip` can fetch `hatchling`, and stage it beside the
+snapshot:
+
+```
+git -C <agentx-harness> archive 56a0cf70 | tar -x -C <src>
+python3 -m pip wheel --no-deps -w <dir> <src>       # aiperf-0.12.0-py3-none-any.whl
+COMPASS_AGENTX_HARNESS=<dir>/aiperf-0.12.0-py3-none-any.whl scripts/compass/gate_cpu.sh
+```
+
+`compass_harness` checks the installed `aiperf` source against its pinned
+functions on import, so a wheel from another commit fails the same way.
+
 ## A red CPU gate that may not be your diff — one flaky test in ATOM's suite
 
 `tests/entrypoints/test_stream_marker_properties.py::TestTheRegionIsNotCopiedPerChunk`
