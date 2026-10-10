@@ -193,7 +193,7 @@ class ModelTerms:
             routed = int(_geometry(config, file, "num_experts_per_tok"))
             text = getattr(config, "text_config", config)
             klass = type(text)
-            named = sorted(k for k in {*vars(text), *dir(klass)} if "shared" in k)
+            named = sorted(k for k in vars(text) if "shared" in k)
             shared, why = _stated(config, file, "n_shared_experts"), ""
             if shared is None:
                 if named:
