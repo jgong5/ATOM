@@ -467,7 +467,8 @@ class HttpChannel:
     ``None`` for one sent outside the run, which passes straight through. A
     stamped request waits until it is released and every released request has
     been read; released requests are handed on in ``(arrival, seq)`` order and
-    count as handled then.
+    count as handled once their body has been received. The app gets the
+    received body messages again from its ``receive``.
 
     An LP whose requests come in on a ``relay`` channel reads each one's stamp
     from its body's ``kv_transfer_params`` instead. An LP that sends on one
@@ -509,8 +510,18 @@ class HttpChannel:
             wake = loop.create_future()
             loop.held[ch, seq] = (arrival, wake)
             await wake
+            # Read the whole body first: a request counts as handled only once
+            # nothing about it still waits on the socket.
+            body = [await receive()]
+            while body[-1].get("more_body"):
+                body.append(await receive())
             with rt.lock:
                 rt.count_done_locked(ch, seq)
+            inner = receive
+
+            async def receive():
+                return body.pop(0) if body else await inner()
+
         await self.app(scope, receive, send)
 
 

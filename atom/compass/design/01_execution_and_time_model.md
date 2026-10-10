@@ -141,7 +141,7 @@ in-process queues with modelled latency.
 - *Cons:* requires a time-coordination protocol between processes, and causality
   violations are silent.
 
-**C. Hybrid:** single-process for milestones 1-3, multi-process later.
+**C. Hybrid:** single-process for single-deployment runs, multi-process later.
 
 - *Cons:* defers the hard problem while designing the kernel around assumptions that
   break when it arrives.
@@ -387,17 +387,17 @@ one LP:
 | Atomesh router, 1P1D | 1 Rust process | **0** | Part of the channels that cross it: with one P and one D it has no choice to make, so it contributes only a fixed per-request forward cost, declared in those channels' lookahead (D7). With several P or D its policy reads time-varying state and it becomes an LP; that case is deferred. |
 | PP stages | N EngineCores | **N** | The only group the collapse does not cover. |
 
-LP counts for the milestones:
+LP counts for the milestones (`16` D95):
 
 | Milestone | LPs |
 |---|---|
-| M1-M3 (single deployment, TP1/2/4) | **3** — traffic, frontend, engine |
-| M4 (atomesh 1P1D, two containers) | **5** — traffic, frontend-P, engine-P, frontend-D, engine-D |
-| M5 (Kimi-K3, TP8, one deployment) | **3** |
-| M6 (Kimi-K3, TP8, PD disagg) | **5** |
-| M7 (PP) | the engine LP becomes one LP per stage |
+| M1, #627 stage 1 (one deployment, TP1) | **3** — traffic, frontend, engine |
+| M1, #627 stage 1b (atomesh 1P+1D, two containers on one node) | **5** — traffic, frontend-P, engine-P, frontend-D, engine-D |
+| M2 (DeepSeek-V4-Pro 1P+1D, one container per node, TP8 on each side, DP-attention where the nightly cell sets it) | **5**; the EP8 step keeps the same LPs |
+| After v1: PP | the engine LP becomes one LP per stage |
 
-So a TP4 x DP2 deployment is **one** engine LP, not eight.
+So each side of M2 is **one** engine LP, not eight: ATOM runs `-tp 8
+--enable-dp-attention` as eight `EngineCore`s in one DP group (`15`).
 
 **The partition principle.** Where LP boundaries fall is a modelling choice: a finer
 partition is not more correct, it only adds grants and wrapped channels, and the speedup
@@ -522,7 +522,7 @@ PDES term: Ayani's distance-between-objects LBTS (Fujimoto, ch. 3). Each part ma
   produces nothing (I1, below); messages released to it meanwhile are handled by receiver
   and handler threads, which send nothing across LPs (I4). With `now[j]` instead, two LPs
   in TAR whose targets cross would wait on each other for ever under the strict rule.
-- **Distance, not direct neighbours.** In M4, with illustrative lookaheads
+- **Distance, not direct neighbours.** In a 1P+1D run, with illustrative lookaheads
   `L(traffic->frontend-P:http) = 0.1` and `L(frontend-P->frontend-D:relay) = 0.5`:
   traffic is running at 9.0, and frontend-P, engine-P and engine-D are idle with `t = inf`
   and nothing undelivered, so each has `N = inf`; frontend-D waits. Its direct
@@ -653,7 +653,7 @@ receives it itself, at its own receive point.
 
 | Channel | Sender | Receiver (mode) | Lookahead |
 |---|---|---|---|
-| `traffic->frontend:http` | Compass traffic source | event loop (inline) | modelled admission delay. Prior work measured 13.7 ms end-to-end, worth ~4 points of TTFT. Path-specific: 13 ms offline batch, 9 ms serving. M4 adds the router hop. |
+| `traffic->frontend:http` | Compass traffic source | event loop (inline) | modelled admission delay. Prior work measured 13.7 ms end-to-end, worth ~4 points of TTFT. Path-specific: 13 ms offline batch, 9 ms serving. 1P+1D adds the router hop. |
 | `frontend->traffic:stream` | event loop, writing the SSE stream | traffic source (inline) | declared return delay |
 | `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_request` | engine input thread, `poller.poll()` in `engine_core.py::EngineCore.process_input_sockets` (thread) | declared IPC delay |
 | `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | declared IPC delay |
@@ -661,14 +661,15 @@ receives it itself, at its own receive point.
 | `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | the router's per-request forward cost (D7) |
 | `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline) | declared request latency (D6) |
 | PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py::PPStageTransport.send_metadata` / `send_tokens` / `send_kv_status` | the stage loop's own poll and receive (inline) | modelled NCCL send/recv of intermediate tensors. Microsecond scale. The only tight one. |
-| `engine-P->engine-D:prefill_done` (RapidServe only, outside M1-M7) | prefill step loop, direct send in `engine_core.py::PrefillEngineCore._process_engine_step` | decode handler thread `DecodeEngineCore._recv_prefill_done`, `sock.recv()` (thread) | declared IPC delay |
-| `engine-D->engine-P:block_assignment` (RapidServe only, outside M1-M7) | decode step loop, direct send in `engine_core.py::DecodeEngineCore._send_block_assignment` | prefill handler thread `PrefillEngineCore._recv_block_assignments`, `sock.recv()` (thread) | declared IPC delay |
+| `engine-P->engine-D:prefill_done` (RapidServe only, in neither M1 nor M2) | prefill step loop, direct send in `engine_core.py::PrefillEngineCore._process_engine_step` | decode handler thread `DecodeEngineCore._recv_prefill_done`, `sock.recv()` (thread) | declared IPC delay |
+| `engine-D->engine-P:block_assignment` (RapidServe only, in neither M1 nor M2) | decode step loop, direct send in `engine_core.py::DecodeEngineCore._send_block_assignment` | prefill handler thread `PrefillEngineCore._recv_block_assignments`, `sock.recv()` (thread) | declared IPC delay |
 
 The RapidServe rows exist only under `--enable-rapidserve` (D2), whose prefill and decode
 `EngineCore`s are two engine LPs of one deployment; they are the only channels received
-by a handler thread. No M1-M4 channel is.
+by a handler thread. No M1 or M2 channel is.
 
-The M4 channel list at DP1:
+The 1P+1D channel list at DP1, M1's stage 1b (M2's DP-attention sides carry each engine
+channel once per rank, `#dp0` to `#dp7`):
 
 - `traffic->frontend-P:http` and `frontend-D->traffic:stream`, both through the router;
 - `frontend-P->frontend-D:relay`;
@@ -690,7 +691,7 @@ everything.
 
 PP8, 27B, ~10 ms step, 300 s modelled run: ~30k steps x 8 stages ~= **240k grants**. At
 ~50 us per local IPC round trip, ~12 s of overhead against a 300 s real run — still
-~25x. For M1-M4 with 3-5 LPs the grant traffic is negligible.
+~25x. For M1 and M2, with 3-5 LPs, the grant traffic is negligible.
 
 **PP is therefore an efficiency concern, not a correctness concern.** It is also
 single-node only (every PP address is ZMQ IPC, `engine_core_mgr.py::CoreManager.__init__`), and ATOM
@@ -703,7 +704,7 @@ grounds.
 - Whether the CA should be a process or a thread in the API-server process is open. A
   separate process is cleaner for the PD case where the API server is not obviously the
   right host.
-- PP's microsecond lookahead will make the CA the bottleneck. When M7 arrives,
+- PP's microsecond lookahead will make the CA the bottleneck. When PP arrives after v1,
   re-evaluate option B for the PP sub-graph specifically.
 
 ---
@@ -736,11 +737,15 @@ run (D3). Beyond that, only these create an LP:
 
 | Deployment | GPUs | LPs |
 |---|---|---|
-| M1-M3: TP4, one server | 4 | **3** |
-| M4: TP4 prefill + TP4 decode, two containers | 8 | **5** |
-| M5: Kimi-K3 TP8, one server | 8 | **3** |
-| M6: Kimi-K3 TP8, PD disagg | 16 | **5** |
-| M7: Kimi-K3 TP8 + PP4, one server | 32 | **6** |
+| M1, #627 stage 1: TP1, one server | 1 | **3** |
+| M1, #627 stage 1b: TP1 prefill + TP1 decode, two containers on one node | 2 | **5** |
+| M2: DeepSeek-V4-Pro 1P+1D, one container per node, TP8 on each side, DP-attention where the nightly cell sets it; the EP8 step the same | 16 | **5** |
+
+After v1 (`16` D95), kept as sizing:
+
+| Deployment | GPUs | LPs |
+|---|---|---|
+| TP8 + PP4, one server | 32 | **6** |
 | 8 prefill + 8 decode replicas, each TP8 | 128 | **34** |
 | ... the same with PP4 | 512 | **82** |
 
@@ -774,7 +779,7 @@ protocol before the cost model would be optimising the wrong thing.
 Throughput headroom: a Python ZMQ ROUTER sustains roughly 50-200k msg/s; the largest case
 above is ~19k/s (365k grants over the ~19 s the pricing takes). The CA's own work per
 state change is an LBTS for each waiting LP, each a `min` over the other LPs: O(LPs²),
-nothing at the milestones' 3-6 LPs but ~6.7k terms at 82, so measure it before the
+nothing at the milestones' 3-5 LPs but ~6.7k terms at 82, so measure it before the
 replica scale. RTTs pipeline across LPs.
 
 ### Options
@@ -839,8 +844,8 @@ Settled: **two deployment forms of one implementation, not two implementations.*
 
 | Form | When | How it is reached |
 |---|---|---|
-| **Co-hosted in the API-server process** (default) | single-container runs — M1 through M3, M5, and every calibration or debug run | the LP's endpoint resolves to an in-process transport; no socket, no extra process to start or reap |
-| **Standalone CA server** | multi-container and multi-node runs — M4, M6, and anything with an Atomesh router between roles | `--compass-clock-endpoint tcp://host:port`; the CA is its own process, started before the engines |
+| **Co-hosted in the API-server process** (default) | single-container runs — M1's stage 1, M2's first gate (#627 stage 2), and every calibration or debug run | the LP's endpoint resolves to an in-process transport; no socket, no extra process to start or reap |
+| **Standalone CA server** | multi-container and multi-node runs — M1's stage 1b, M2, and anything with an Atomesh router between roles | `--compass-clock-endpoint tcp://host:port`; the CA is its own process, started before the engines |
 
 This is cheap precisely because requirement 1 above already forbids the LP-facing
 interface from naming the CA's location. The two forms differ only in which transport
@@ -852,7 +857,7 @@ are a real test of the expensive multi-container path.
 
 Default co-hosted rather than always-standalone because the overwhelming majority of
 runs are single-container, and a standalone CA there is one more process to start,
-supervise and leak. Standalone for M4/M6 because neither container is obviously the
+supervise and leak. Standalone for 1P+1D because neither container is obviously the
 right host and making one of them the clock owner would give the two roles asymmetric
 failure behaviour that the real deployment does not have.
 
@@ -1560,7 +1565,7 @@ two differ the code is right.
   simulated write is one event per request, priced on the whole block table, so ranks
   with unequal shares are not modelled.
 - **The simulated connector refuses PP** (`pp_size > 1`), naming the two reasons below.
-  No milestone pairs PD with PP: M4 and M6 run PP1, and M7 is one server (D3.1). Under
+  No milestone pairs PD with PP: M1 and M2 run PP1, and PP comes after v1 (`16` D95). Under
   PP, Mooncake adds a decode-to-prefill `MSG_RELEASE` channel
   (`MooncakeConnector._send_release`) that this section does not cover, and the release
   above never happens: the PP head's
@@ -1589,11 +1594,12 @@ The ATOM relay is strictly sequential and blocking (D2). Atomesh therefore contr
 exactly two things to a request: a **routing decision**, and **two HTTP round trips of
 overhead**. It never overlaps prefill and decode.
 
-M4 is **1P1D**: one prefill and one decode instance, the only layout ATOM's single-node
-PD launch supports (`.github/scripts/atomesh/pd_server_atom.sh` refuses any other
-`SINGLE_NODE_PD` layout). The routing decision then has nothing to choose between, so no
-load count, random draw or clock read reaches its result, and the router is **one
-segment of a channel**, not an LP. Each of the three channels through it,
+Every milestone's PD run is **1P1D**, the only layout ATOM's single-node PD launch supports
+(`.github/scripts/atomesh/pd_server_atom.sh` refuses any other `SINGLE_NODE_PD` layout):
+one prefill and one decode instance, two containers on one node in M1, one container per
+node in M2 (`16` D95). The routing decision then has nothing to choose between, so no load
+count, random draw or clock read reaches its result, and the router is **one segment of a
+channel**, not an LP. Each of the three channels through it,
 `traffic->frontend-P:http`, `frontend-P->frontend-D:relay` and
 `frontend-D->traffic:stream`, has a real LP at both ends; D3's channel table names their
 senders.
@@ -1643,7 +1649,7 @@ get disabled — not virtualized.
    | `frontend-P->frontend-D:relay` | Takes `kv_transfer_params` from prefill's JSON, lets the ATOM adapter insert fields, and writes it into the decode body (`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`). | A field inside `kv_transfer_params`, added by frontend-P after the connector has emitted its blob (D6). frontend-D also receives the original `tracestate`, so a request carrying `kv_transfer_params` takes its stamp from there (relay channel), any other from `tracestate` (traffic channel). |
    | `frontend-D->traffic:stream` | Streamed: passes the ATOM stream through byte for byte; `PDRouter::create_streaming_response` rewrites only with `return_logprob` and prefill logprobs, and the ATOM path has neither. Not streamed: returns decode's body unchanged with decode's response headers, less hop-by-hop ones (`header_utils.rs::preserve_response_headers`). | Streamed: an SSE comment line before each event, e.g. `: compass a=12.345 s=18`; SSE clients ignore lines starting with a colon. Not streamed: a `compass` response header, e.g. `compass: a=12.345;s=18`. |
 
-   A single deployment (M1-M3, no router) uses the same carriers.
+   A single deployment (M1's stage 1 and M2's first gate, no router) uses the same carriers.
 
 **xPyD is deferred.** With several instances per role, or `--dp-aware`, every policy
 this router ships (`atom/mesh/src/policies/`) reads state that changes over time:
@@ -1652,7 +1658,7 @@ requests start and finish; `random` draws from an unseeded generator; `round_rob
 counts requests in the order they reach the router, which is wall-clock order under
 concurrency; `dp_sticky` reads `Instant::now()`. A component whose time-varying state
 decides its output is an LP, so the router would have to become one, instrumented in its
-own process with the policy code untouched. That design is not done here; M4 stays 1P1D.
+own process with the policy code untouched. That design is not done here; every milestone stays 1P1D.
 
 ### An unused hook worth knowing about
 
@@ -1906,7 +1912,7 @@ Ordered by how much they could cost.
    unverified. If paired real-vs-simulated evidence is needed there, the real side may
    not exist yet.
 7. **CA placement and grant latency** are unresolved (D3).
-8. **PP will make the CA the bottleneck** when M7 arrives (D3).
+8. **PP will make the CA the bottleneck** when it arrives after v1 (D3).
 
 ---
 
@@ -1920,7 +1926,7 @@ Ordered by how much they could cost.
 | D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP only after every rank has called; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a run finishes when no essential work is left | 2026-09-18; revised 2026-09-28 and 2026-10-02 |
 | D3.1 | Single CA with a hierarchy-ready interface; LP count scales with replicas and PP stages, not with GPUs | 2026-09-18 |
 | D3.2 | Always-on causality detectors: a straggler check against the receiver's last drain (fails the run); a stall the CA cannot see prints one diagnostic after 30 wall seconds and keeps waiting, never aborting; clock-source CI lint | 2026-09-19; revised 2026-09-28 |
-| D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for M4/M6 multi-container runs | 2026-09-19 |
+| D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for multi-container runs (1P+1D in M1 and M2) | 2026-09-19 |
 | D3.4 | Wall-clock interleaving may vary between runs; the `(LP, virtual time, event)` sequence may not. Thread scheduling inside an LP is irrelevant only under in-transit counting and TSO delivery; ties break by **(time, LP id, channel, sequence number), never arrival order**; the cost backend is a pure function of its batch view; **no `set` iteration on the simulated path** - string ids are hashed under `PYTHONHASHSEED` randomisation, so a set of request ids iterates differently in every process. Test is a byte-diff of two step tables, CPU-only, in CI. | 2026-09-20; revised 2026-09-28 |
 | D3.5 | The CA owns three outputs: an opt-in timeline log, a stall diagnostic (a stall the CA can see is resolved by deadlock detection and recovery; one it cannot see gets a diagnostic, never an abort), and an always-written run summary carrying grants, speed ratio, lazy-trace cost, detector state and the refusal fractions `08` D50.1 gates on. | 2026-09-20; revised 2026-09-28 |
 | D4 | Every synchronization site maps to one of the PDES mechanisms K1-K9, none undecided; the boundary is the LP, not the process; a DP step is one TAR costing the `max` over ranks, exchanged inside the forward by a K6 wait with no cost, and the lockstep `all_reduce` is K1 for its own cost; handler threads stay and TSO delivery runs them at their message's timestamp | 2026-09-18; revised 2026-09-28 and 2026-10-01 |
