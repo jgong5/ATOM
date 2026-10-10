@@ -406,7 +406,36 @@ class RefusedControlCommands:
         return tuple(vars(self).get("_refused_commands", ()))
 
 
-class NonAllocatingRunner(RefusedControlCommands):
+class PricedSteps:
+    """What a runner's steps cost, read by the run summary over the worker RPC."""
+
+    def priced_steps(self) -> dict[str, Any]:
+        """This rank's own steps, folded into one `ProvenanceMix` as each was
+        priced, before the max over the DP group. ``reasons`` holds one
+        ``cost:`` reason per refused step. A dict even before the first step,
+        since a None reply parks the engine that asks.
+        """
+        from atom.compass.backends.cost import ProvenanceMix
+        from atom.compass.backends.provenance import Species
+
+        mix = vars(self).get("_priced") or ProvenanceMix()
+        return {
+            "steps": mix.steps,
+            "seconds": mix.seconds,
+            "refused_seconds": mix.refused_seconds,
+            "extrapolated_steps": mix.steps_by_species().get(Species.EXTRAPOLATED, 0),
+            "extrapolated_seconds": mix.seconds_by_species().get(
+                Species.EXTRAPOLATED, 0.0
+            ),
+            "reasons": [
+                f"cost:{chain}"
+                for chain, n in mix.refused_chains().items()
+                for _ in range(n)
+            ],
+        }
+
+
+class NonAllocatingRunner(RefusedControlCommands, PricedSteps):
     """Overrides that construct a model runner without touching device memory."""
 
     def _build_and_load_model(self, model_class: Any) -> None:
@@ -790,8 +819,12 @@ def _group_step_seconds(runner: Any, batch: Any, backend: CostBackend) -> float:
             "layers, but a cost backend prices a whole step; charging each "
             "stage the whole model would count it once per stage"
         )
+    from atom.compass.backends.cost import ProvenanceMix
+
     mode = forward_mode(batch, runner)
-    seconds = backend.estimate(batch_view(batch, mode, runner)).seconds
+    cost = backend.estimate(batch_view(batch, mode, runner))
+    vars(runner).setdefault("_priced", ProvenanceMix()).record(cost)
+    seconds = cost.seconds
     if mode.sync is None:
         return seconds
     group_max = torch.tensor([seconds], dtype=torch.float64)
