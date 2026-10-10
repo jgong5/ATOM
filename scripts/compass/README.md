@@ -252,6 +252,15 @@ prints no skip *reasons* (and refuses a caller's `-r`, which is how you would as
 for them), so that run did not name the test; the counts and the conserved total
 are what was observed.
 
+**Gloo timeouts in `tests/compass/test_dp_step_max.py`,
+`tests/compass/test_moe_gather_rows.py` and `tests/compass/test_process_group_lp.py`
+were DNS, not load.** Their gloo groups
+used to resolve the hostname once per rank to pick an address, and node 18's
+hostname is not in `/etc/hosts`. One stalled lookup outlasted the group timeout,
+and the others failed with `wait timeout after 5000ms`, `Connect timeout` or
+`Connection refused` (#726). The fixtures now set `GLOO_SOCKET_IFNAME=lo`, so no
+lookup happens; a red in those files is a real failure.
+
 ## Which tree a script acts on
 
 Each script resolves its tree from `$BASH_SOURCE`, so it acts on the checkout it
