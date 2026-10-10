@@ -47,6 +47,7 @@ __pycache__
 
 # claude local settings (personal permissions, not for repo)
 .claude/settings.local.json
+.claude/agent-team.local.md
 
 # debug folder
 debug

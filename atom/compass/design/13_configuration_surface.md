@@ -102,7 +102,7 @@ python -m atom.entrypoints.openai_server \
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--runner-qualname` | **ATOM's own, unchanged.** The seam. Two in-tree users already (`config.py:1595`). | ATOM's runner |
+| `--runner-qualname` | **ATOM's own, unchanged.** The seam. Two in-tree users already (`config.py::Config.runner_qualname`). | ATOM's runner |
 | `--compass-spec` | path to the machine specification (`05` D25) | **none — refuses** |
 | `--compass-artifacts` | artifact store root (`07` D41) | **none — refuses** |
 | `--compass-clock-endpoint` | where the Clock Authority listens. Absent means co-hosted in the API-server process (`01` D3.3). | co-hosted |
