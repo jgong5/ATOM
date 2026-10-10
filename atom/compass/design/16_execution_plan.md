@@ -4,9 +4,9 @@
 interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
 written against it yet; implementation follows the execution plan in `16`.
 
-**Depends on:** all of `01`–`15`, and `17`. This document turns those topics' decisions, and the
-register of open items in [`12_open_items.md`](12_open_items.md), into work that can be
-allocated. Neither is counted here. The register is owned by `12`, restated once on
+**Depends on:** all of `01`–`15`, and `17`. This document turns those topics' decisions,
+and the register of open items in [`12_open_items.md`](12_open_items.md), into work that
+can be allocated. Neither is counted here. The register is owned by `12`, restated once on
 `README.md`'s front page, and it moves as tasks land; a third copy in a document that does
 not own it has been stale before, and "open items" and "registered items" are two different
 numbers that a single figure here cannot distinguish.
