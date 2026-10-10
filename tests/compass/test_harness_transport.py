@@ -98,12 +98,14 @@ class _Frontend:
 class Harness:
     """A stub ATOM server, a stand-in traffic LP and aiperf's inference client."""
 
-    def __init__(self, tmp_path, monkeypatch) -> None:
+    def __init__(self, tmp_path, monkeypatch, timeout: float = 30.0) -> None:
         self.prefix = str(tmp_path / "lp")
         monkeypatch.setenv(ADDRESS_ENV, self.prefix)
         self.frontend = _Frontend()
+        self.timeout = timeout
         self.tracestate: dict[int, str] = {}
         self.unstamped: set[int] = set()
+        self.undone: set[int] = set()
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
         num = int(request.headers["X-Request-ID"])
@@ -116,7 +118,7 @@ class Harness:
             if num in self.unstamped and i == 1:
                 await resp.write(text.encode())
                 continue
-            if i == len(TOKENS[num]) - 1:
+            if i == len(TOKENS[num]) - 1 and num not in self.undone:
                 text += "data: [DONE]\n\n"
             await resp.write(stamp_events(text, self.frontend).encode())
             await asyncio.sleep(0.01)
@@ -146,7 +148,10 @@ class Harness:
                 model_selection_strategy=ModelSelectionStrategy.ROUND_ROBIN,
             ),
             endpoint=EndpointInfo(
-                type="chat", base_urls=[f"http://127.0.0.1:{port}"], streaming=True
+                type="chat",
+                base_urls=[f"http://127.0.0.1:{port}"],
+                streaming=True,
+                timeout=self.timeout,
             ),
         )
         self.client = InferenceClient(model_endpoint=endpoint, service_id="worker_0")
@@ -286,6 +291,41 @@ def test_an_unstamped_event_fails_its_request_by_name(tmp_path, monkeypatch):
     assert [r.perf_ns for r in record.responses] == [_ns(TOKENS[2][0])]
     assert record.end_perf_ns == _ns(TOKENS[2][0])
     assert record.recv_start_perf_ns is None
+
+
+def test_a_stream_without_a_stamped_done_fails_its_request_by_name(
+    tmp_path, monkeypatch
+):
+    async def run():
+        async with Harness(tmp_path, monkeypatch) as h:
+            h.undone.add(1)
+            await h.stamp(1)
+            return await h.send(1)
+
+    record = _run(run())
+    assert record.error.message == (
+        "request 1 (credit ('profiling', 0, 1)): the stream ended without a "
+        "stamped [DONE] event"
+    )
+    assert [r.perf_ns for r in record.responses] == [_ns(t) for t in TOKENS[1]]
+
+
+def test_a_stamp_after_its_request_timed_out_leaves_later_requests_served(
+    tmp_path, monkeypatch
+):
+    async def run():
+        async with Harness(tmp_path, monkeypatch, timeout=0.2) as h:
+            late = await h.send(0)
+            await h.stamp(0)
+            await h.stamp(1)
+            return late, await h.send(1)
+
+    late, served = _run(run())
+    assert "credit ('profiling', 0, 0): no send stamp from the traffic LP" in (
+        late.error.message
+    )
+    assert served.error is None
+    assert served.start_perf_ns == _ns(SENDS[1][0])
 
 
 def test_a_changed_pinned_function_refuses_the_run_by_name(tmp_path):
