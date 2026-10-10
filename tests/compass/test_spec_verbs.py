@@ -1109,6 +1109,22 @@ def test_a_quantity_names_the_fields_it_is_built_out_of():
     assert len(paths) == len(set(paths))
 
 
+def test_a_measured_activation_entry_is_part_of_the_kv_blocks_basis():
+    entry = {
+        "id": "m",
+        "fingerprint": "sha256:f",
+        "applies_to": ["A"],
+        "bytes_per_token": {1: 180480},
+    }
+    document = copy.deepcopy(merged().document)
+    document["device"]["activations"] = [entry]
+    basis = explain(MachineSpec.from_mapping(document), "kv_blocks", tp_width=1)
+    rows = {row.path: row.value for row in basis.contributions}
+    assert list(rows["device.activations"]) == [entry]
+    without = explain(resolved(), "kv_blocks", tp_width=1)
+    assert "device.activations" not in [row.path for row in without.contributions]
+
+
 def test_a_quantity_names_the_fragment_each_field_came_from():
     combination = merged()
     spec = MachineSpec.from_mapping(combination.document)
