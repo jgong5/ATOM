@@ -2644,19 +2644,15 @@ def main():
     logger.info(
         f"Starting server on {args.host}:{args.server_port} (loop={loop_impl})..."
     )
-    try:
-        uvicorn.run(
-            _served_app(),
-            host=args.host,
-            port=args.server_port,
-            loop=loop_impl,
-            access_log=not args.disable_uvicorn_access_log,
-            timeout_keep_alive=args.timeout_keep_alive,
-        )
-    except RuntimeError:
-        # A simulated run's loop stops at its finish, before uvicorn's task ends.
-        if not compass_run.frontend_done(engine):
-            raise
+    uvicorn.run(
+        _served_app(),
+        host=args.host,
+        port=args.server_port,
+        loop=loop_impl,
+        access_log=not args.disable_uvicorn_access_log,
+        timeout_keep_alive=args.timeout_keep_alive,
+    )
+    compass_run.frontend_done(engine)
 
 
 def _served_app():
