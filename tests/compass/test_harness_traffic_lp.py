@@ -57,6 +57,7 @@ from compass_harness.traffic_lp import (
     HTTP,
     STREAM,
     TrafficLP,
+    UnansweredRequests,
 )
 from compass_harness.transport import addresses, credit_key
 
@@ -355,6 +356,39 @@ def test_an_errored_return_counts_its_released_final_as_returned(order, tmp_path
 
     passed, calls = _run(main())
     assert passed == [0] and calls == [INF, INF]
+
+
+def test_a_request_failing_mid_stream_fails_the_hold_by_name(tmp_path, monkeypatch):
+    """Credit 0's worker reported seq 0, then its request failed: the released
+    final, seq 1, is never reported."""
+    monkeypatch.setattr("compass_harness.traffic_lp.DIAG_S", 0.05)
+
+    async def main():
+        rt = ScriptedRuntime([(1.0, {0, 1})])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+
+        async def on_return(worker_id, ret):
+            pass
+
+        held = traffic.hold(on_return)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(addresses(str(tmp_path / "lp"))[1])
+        traffic.send(_key(0))
+        push.send_pyobj((_key(0), 0, 1.0, False))
+        await held("worker_0", SimpleNamespace(credit=_credit(0), error="TimeoutError"))
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 5)
+        finally:
+            push.close(linger=0)
+
+    with pytest.raises(UnansweredRequests) as failed:
+        _run(main())
+    print(f"\n{failed.value}")
+    assert str(failed.value) == (
+        "requests [('profiling', 0, 0)] failed mid-stream: released stream seqs [1] "
+        "were not reported after 0.05 wall seconds"
+    )
 
 
 def test_a_raising_return_callback_does_not_stop_later_returns(tmp_path, caplog):
