@@ -5,17 +5,19 @@
 and the result's ``endpoint`` names the port it got. Each accepted connection
 gets one thread. Its first frame binds it to an LP through the serve loop, which
 answers by sending that frame back, or a refusal. After that, for each request
-frame, the thread queues it with the loop and writes back the next reply from
-that LP's slot. The thread waits on its own LP's slot under no lock, so an LP
-whose reply is held stops no other connection. When a bound connection ends,
-however it ends, the thread tells the loop, which ends the run.
+frame, the thread has the loop serve it, on this thread, and writes back the
+next reply from that LP's slot. The thread waits on its own LP's slot under no
+lock, so an LP whose reply is held stops no other connection. When a bound
+connection ends, however it ends, the thread tells the loop, which ends the run.
+The server is also reachable in its own process through the in-process
+carrier's ``connect``, at the same endpoint and with no socket.
 
 ``connect(lp, "tcp://host:port")`` returns the in-process carrier's connection
-with a socket in place of the loop: the same ``send``, ``recv`` and ``close``,
-and the same frames, each preceded by its length as four big-endian bytes, plus
-``fileno`` to wait for a reply alongside other sockets. A
+with a socket in place of the loop: the same ``send``, ``recv``, ``fileno`` and
+``close``, and the same frames, each preceded by its length as four big-endian
+bytes. A
 connection that ends inside a frame is a `MalformedMessage`. A frame the loop
-will not queue, such as a reply kind sent as a request, is refused at ``recv``
+will not serve, such as a reply kind sent as a request, is refused at ``recv``
 here and at ``send`` in-process, with the same reason, and reaches no authority.
 """
 
@@ -136,16 +138,16 @@ class _Remote:
             raise MalformedMessage("the clock closed the connection with no reply")
         return frame
 
+    def fileno(self) -> int:
+        """The socket's, readable once a reply is on its way."""
+        return self._sock.fileno()
+
     def close(self) -> None:
         self._stream.close()
         _end(self._sock)
 
 
 class _StreamConnection(_Connection):
-    def fileno(self) -> int:
-        """The socket's, readable once a reply is on its way."""
-        return self._server._sock.fileno()
-
     def close(self) -> None:
         """End the socket."""
         self._server.close()

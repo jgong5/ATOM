@@ -10,8 +10,8 @@ One engine LP at one stage, one frontend LP, and the traffic LP the harness
 drives, over `single_engine_table`. At data-parallel width above one, each DP
 rank's engine process is a member ``dp<rank>`` of the one engine LP and owns
 its rank's channels. The Clock Authority is co-hosted in the frontend's
-process and served at the run file's ``clock_endpoint``, which every LP and
-member, the frontend's included, connects to.
+process and served at the run file's ``clock_endpoint``, which every other LP
+and member connects to; the frontend reaches it in-process, with the same frames.
 
 - `frontend(config)` wraps the `CoreManager` construction in `LLMEngine`: it
   selects the simulated runner, serves the authority and installs the
@@ -76,7 +76,7 @@ from atom.compass.clock import (
     prefill_decode_table,
     single_engine_table,
 )
-from atom.compass.clock_transport import connect, serve
+from atom.compass.clock_transport import connect, serve, service
 from atom.compass.detect.determinism import StepTable
 from atom.compass.runner import COMPASS_RUNNER_QUALNAME
 from atom.utils import clock
@@ -242,9 +242,9 @@ class _RecordingAuthority(ClockAuthority):
         return replies
 
 
-def _runtime(lp: LpId, run: dict, member: str | None = None) -> clock.LPRuntime:
+def _runtime(lp: LpId, run: dict, member=None, carrier=None) -> clock.LPRuntime:
     rt = clock.LPRuntime(
-        lp, channel_table(run), connect(lp, run["clock_endpoint"], member)
+        lp, channel_table(run), (carrier or connect)(lp, run["clock_endpoint"], member)
     )
     clock.install(rt)
     return rt
@@ -304,7 +304,8 @@ def frontend(config):
         return _start_on_leaving(_runtime(lp, run))
     _authority = _RecordingAuthority(run)
     serve(_authority, run["clock_endpoint"])
-    return _start_on_leaving(_runtime(lp, run), _authority)
+    # In the authority's own process: the same frames, with no socket.
+    return _start_on_leaving(_runtime(lp, run, carrier=service.connect), _authority)
 
 
 def engine(config):

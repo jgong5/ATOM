@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """The Clock Authority's serve loop, and the in-process carrier to it.
 
-`serve` starts one thread that takes ``(address, request)`` off a single queue,
-in arrival order, and passes it to `ClockAuthority.on_request`. An address is
+The thread that hands in a request passes it to `ClockAuthority.on_request`
+itself, under one lock, so requests reach the authority one at a time in the
+order they take the lock. An address is
 an LP, or ``(lp, member)`` for a member of an LP declared with members; each
 member binds its own connection. Each reply that call returns goes to its
 address's own reply slot, whether or not it is waiting on it. A grant only ever
@@ -19,15 +20,21 @@ way, as a `ClockAbort` that names it; its table is empty when the LP table
 cannot be read or framed. So does the end of a bound socket connection, as a
 `ClockAbort` naming its address: no finish can come without it.
 
-Frames and closes reach the loop: a carrier hands the serve side encoded frames
-and the serve side decodes them onto the queue, so the in-process carrier here
-moves the same bytes a socket would; a socket's end reaches it as a ``None``
-request. An LP waits for its reply on its own slot and under no lock shared with
-another connection, so one parked LP holds up no other.
+Frames and closes reach the authority: a carrier hands the serve side encoded
+frames and the serve side decodes them, so the in-process carrier here moves
+the same bytes a socket would; a socket's end reaches it as a ``None`` request.
+An LP waits for its reply on its own slot and under no lock shared with another
+connection, so one parked LP holds up no other. A slot has a file descriptor,
+readable while a reply waits in it, so an in-process LP can wait for its grant
+and its sockets together. Every carrier's server is reachable in its own
+process through `connect`: an LP co-hosted with the authority it talks to needs
+no socket.
 """
 
-import queue
+import collections
+import os
 import threading
+import weakref
 
 from atom.compass.clock import ClockAbort, LpId
 
@@ -57,11 +64,9 @@ class _Server:
         self._authority = authority
         self._lps = [row.lp for row in authority.lp_table()]
         self._slots = {}
-        self._requests = queue.Queue()
-        self._thread = threading.Thread(
-            target=self._loop, name=f"clock {endpoint}", daemon=True
-        )
-        self._thread.start()
+        self._lock = threading.Lock()
+        self._ended = None  # the refusal frame that ended the run, once one has
+        _SERVED[endpoint] = self
 
     def bind(self, frame: bytes) -> tuple:
         """Bind a connection to the LP, or LP and member, its first frame names:
@@ -74,7 +79,7 @@ class _Server:
             )
         lp, *member = rest
         address = (lp, *member) if member else lp
-        slot = queue.Queue()
+        slot = _Slot()
         if lp not in self._lps or self._slots.setdefault(address, slot) is not slot:
             state = "already bound" if lp in self._lps else "not a participant"
             raise KeyError(
@@ -84,30 +89,29 @@ class _Server:
         return address, slot
 
     def submit(self, address, frame: bytes) -> None:
-        """Queue one request frame from the connection bound to `address`."""
+        """Serve one request frame from the connection bound to `address`."""
         message = decode(frame)
         if message[0] not in REQUESTS:
             raise MalformedMessage(
                 f"{address} sent {message[0]}; a bound connection sends only "
                 + ", ".join(REQUESTS)
             )
-        self._requests.put((address, message))
+        self._serve(address, message)
 
     def _closed(self, address) -> None:
         """The connection bound to `address` closed."""
-        self._requests.put((address, None))
+        self._serve(address, None)
 
     def close(self) -> None:
-        """Stop the loop and give up the endpoint."""
+        """Give up the endpoint."""
         if _SERVED.get(self.endpoint) is self:
             del _SERVED[self.endpoint]
-        self._requests.put(None)
-        self._thread.join()
 
-    def _loop(self) -> None:
-        ended = None  # the refusal frame that ended the run, once one has
-        while (item := self._requests.get()) is not None:
-            address, request = item
+    def _serve(self, address, request) -> None:
+        """Answer `request`, or a close when it is None, on the caller's thread
+        and under the one lock, and put each reply in its address's slot."""
+        with self._lock:
+            ended = self._ended
             lp, member = address if isinstance(address, tuple) else (address, None)
             replies = [(address, ended)]
             if request is None:
@@ -135,6 +139,7 @@ class _Server:
                     ended = self._ending(fault)
                     # A copy: a carrier thread may bind a new slot meanwhile.
                     replies = [(i, ended) for i in list(self._slots)]
+            self._ended = ended
             for i, frame in replies:
                 self._slots[i].put(frame)
 
@@ -189,8 +194,34 @@ class _Connection:
         _, g, released = _reply(self._slot.get())
         return g, released
 
+    def fileno(self) -> int:
+        """Readable once a reply is waiting for `recv`."""
+        return self._slot.fileno()
+
     def close(self) -> None:
         """Nothing to release: the reply slot is the LP's, not the connection's."""
+
+
+class _Slot:
+    """An address's reply frames, oldest first, behind an eventfd that counts
+    them, so a selector can wait on it beside sockets."""
+
+    def __init__(self) -> None:
+        self._frames = collections.deque()
+        self._fd = os.eventfd(0, os.EFD_SEMAPHORE)
+        weakref.finalize(self, os.close, self._fd)
+
+    def put(self, frame: bytes) -> None:
+        self._frames.append(frame)
+        os.eventfd_write(self._fd, 1)
+
+    def get(self) -> bytes:
+        """Block until a frame is here, then take the oldest."""
+        os.eventfd_read(self._fd)
+        return self._frames.popleft()
+
+    def fileno(self) -> int:
+        return self._fd
 
 
 def serve(authority, endpoint: str = DEFAULT_ENDPOINT) -> _Server:
@@ -200,14 +231,14 @@ def serve(authority, endpoint: str = DEFAULT_ENDPOINT) -> _Server:
             f"{endpoint} is already served in this process; two authorities at "
             "one endpoint would grant time from two states"
         )
-    _SERVED[endpoint] = _Server(authority, endpoint)
-    return _SERVED[endpoint]
+    return _Server(authority, endpoint)
 
 
 def connect(
     lp: LpId, endpoint: str = DEFAULT_ENDPOINT, member: str | None = None
 ) -> _Connection:
-    """`lp`'s connection, or its `member`'s, to the authority served at `endpoint`."""
+    """`lp`'s connection, or its `member`'s, to the authority this process
+    serves at `endpoint`, whichever carrier serves it to other processes."""
     server = _SERVED.get(endpoint)
     if server is None:
         raise KeyError(
