@@ -161,7 +161,8 @@ Decode is measured in replay mode on the target's own capture ladder, read from 
 config (`05` D24, `13` D78). For each rung `R`, at `B = R` and at `B = previous rung + 1`,
 over the context nodes. `B` is interpolated only inside one rung, never across: a batch
 replays its rung's graph and pays its rung's time, as `09` D54's per-rung decode fit also
-holds.
+holds. A decode step that replays no graph, being wider than the widest rung, is not on
+this grid and refuses (D99).
 
 **The lookup axis follows the graph mode at measurement.** The measurement this rests on
 (#626 at `1139bbca`, recomputed from the reference bundle of serving_simulator `2ce181d`):

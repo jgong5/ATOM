@@ -3,10 +3,8 @@
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header; `17` is a draft under review.
 **Decisions D0–D105, with no gaps, and their sub-decisions** are indexed at the end of this
-file. The TODOs are
-registered in **`12_open_items.md`**, with the load-bearing assumptions and the cross-cutting
-issues. Implementation follows the execution
-plan in `16`.
+file. The TODOs are registered in **`12_open_items.md`**, with the load-bearing assumptions
+and the cross-cutting issues. Implementation follows the execution plan in `16`.
 
 ---
 
