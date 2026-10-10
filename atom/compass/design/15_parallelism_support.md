@@ -175,8 +175,8 @@ transfer to DP.
   gather follows `forward_mode.running_tokens_are_unified`, not the CUDA graph:
   - Every rank decoding: the padded `all_gather`, `T_moe = dp x running_bs x
     max_seqlen_q`, where `running_bs` is the smallest capture size at or above
-    `max_bs_across_dp`, or `max_bs_across_dp` itself when no capture size is that large,
-    under `enforce_eager` too.
+    `max_bs_across_dp`, or `max_bs_across_dp` itself when no capture size is that large;
+    under `enforce_eager` nothing is captured, so `running_bs` is `max_bs_across_dp`.
   - Any rank prefilling, and an MTP draft's first pass: the variable-size `all_gatherv`,
     `T_moe = sum(num_tokens_across_dp)`.
 

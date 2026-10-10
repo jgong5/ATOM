@@ -331,10 +331,9 @@ construction.
 MoE segment is priced as if routing spread tokens evenly over the experts, in every
 tier, from `T_moe` with EP off; with EP on its row count is open (`15` D90). Real
 routing is data-dependent (`15` D92 Q2) and no feature carries it, so whatever skew a
-capture's routing has is folded into the fitted MoE terms. With EP off every rank runs every expert's slice on the same rows, so `max` over
-ranks equals the per-layer critical path whatever the routing (`15` D90). With EP on it
-does so under this treatment; where routing is not uniform, `max` underestimates the
-step, and that is a declared limit rather than a modelled effect.
+capture's routing has is folded into the fitted MoE terms. `max` over ranks is the
+per-layer critical path, by construction with EP off and under this treatment with EP on
+(`15` D90); where routing is not uniform under EP, `max` underestimates the step.
 
 **Suspected treatments to check before fitting:** raggedness (workload-dependent, and it
 was a zero column for 2,997 samples), cached fraction, and the prefill chunk's position in
