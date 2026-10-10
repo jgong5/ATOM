@@ -160,6 +160,27 @@ def test_a_deadline_met_early_withdraws_its_clock_wait(tmp_path, monkeypatch):
     assert traffic.rt.calls == [5.0] and traffic._waiters == []
 
 
+def test_a_wait_on_an_event_already_set_leaves_the_clock_alone(tmp_path, monkeypatch):
+    """The event is set before the wait: the 1800 s deadline is never armed."""
+
+    async def main():
+        traffic = await _traffic(tmp_path, monkeypatch)
+        event = asyncio.Event()
+        event.set()
+        before = traffic.now()
+        timed_out = await _runner()._wait_for_event_with_timeout(
+            name="sending", event=event, timeout=DURATION, task_to_cancel=None
+        )
+        for _ in range(100):  # let the owner settle with nothing left to ask for
+            await asyncio.sleep(0)
+        traffic.done.cancel()
+        return timed_out, before, traffic
+
+    timed_out, before, traffic = asyncio.run(main())
+    assert not timed_out
+    assert (before, traffic.now(), traffic.rt.calls) == (0.0, 0.0, [])
+
+
 def test_a_deadline_waits_for_a_return_still_inside_aiperfs_callback(
     tmp_path, monkeypatch
 ):

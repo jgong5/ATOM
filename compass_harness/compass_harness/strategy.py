@@ -98,6 +98,8 @@ class ClockPhaseRunner(PhaseRunner):
                 task_to_cancel=task_to_cancel,
                 set_event_on_timeout=set_event_on_timeout,
             )
+        if event.is_set():
+            return False
         self.info(f"Waiting for event '{name}' with timeout of {timeout}s on the clock")
         # One future both sides resolve in the task that sets the event or fires
         # the deadline, so the traffic LP's hold sees this task ready at once and
