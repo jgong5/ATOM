@@ -4,8 +4,9 @@
 interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
 written against it yet; implementation follows the execution plan in `16`.
 
-**Depends on:** `01_execution_and_time_model.md` (the Clock Authority and the Category-A/B
-wait contract), `05_machine_spec_and_probes.md` (the host terms the tokenizer model needs).
+**Depends on:** `01_execution_and_time_model.md` (the Clock Authority, its channels and
+the K1-K9 mechanisms), `05_machine_spec_and_probes.md` (the host terms the tokenizer
+model needs).
 
 **Scope.** How traffic reaches a simulated ATOM: the contract any harness must satisfy,
 the wire protocol, the per-harness adapter, and the serving-side costs the harness makes
@@ -35,41 +36,47 @@ downstream.
 Three parts:
 
 ```
-   +--------------+   1. clock: now() / advance_to(T) / blocked() / running()
+   +--------------+   1. clock: now() / next_event(t, t_daemon)
    |   harness    |<----------------------------------+
    | (any vendor) |                                   |
    +------+-------+                            +------+------+
-          |  2. wire:  compass.arrival_s  -->  |    Clock    |
-          |            <-- compass.{arrival_s,|  Authority  |
-          |                 first_token_s,    +------+------+
-          |                 finish_s}                |
+          |  2. wire: tracestate compass=..--> |    Clock    |
+          |            <-- SSE ": compass a=.."|  Authority  |
+          |                before each event   +------+------+
+          |                                           |
           v                                           |
    +--------------+                                   |
    | ATOM api_srv |-----------------------------------+
    +--------------+
 ```
 
-**Part 1 - clock client.** `now()`, `advance_to(T)`, `declare_blocked()`,
-`declare_running()`. This is doc 01 D4's Category-A (rewrite: do not wait, advance) and
-Category-B (annotate: leave the blocking call alone) contract, already specified. A thin
-library per language.
+**Part 1 - clock client.** `now()` and `next_event(t, t_daemon)` (NER; `01` D3, K3): the
+harness's pacing becomes an idle point whose `t` is its next arrival and whose `t_daemon`
+is its next periodic `/metrics` scrape, and a grant returns early when a response event is
+released to it. The harness prices no event of its own, so it makes no `advance_to` (TAR)
+call. Each request it sends is logged on `traffic->frontend:http` (K4) and each response
+event counted where it is read on `frontend->traffic:stream` (K5); nothing is annotated.
+A run ends when no essential work is left (`01` D3): on its `+inf` grant the harness
+raises unless every request it sent has its final response, naming those that do not
+(revised 2026-10-02, #533, #534). A thin library per language.
 
-**Part 2 - wire protocol.** Additive optional fields on the existing OpenAI-compatible
-endpoint, ignored by a real server. See D28.
+**Part 2 - wire protocol.** Stamps on the existing OpenAI-compatible endpoint, in carriers
+a real server ignores and the router forwards. See D28.
 
 **Part 3 - a per-harness adapter**, living outside both ATOM and the harness repo. It
 redirects pacing to the clock client and stamps the harness's latency anchors from the
-response fields.
+stream.
 
 ### What a second harness must implement
 
-Exactly three things: replace its inter-request sleep with a clock call; attach one field
-to an outgoing request; take its latency numbers from response fields rather than its own
-stopwatch. A harness that cannot do the third is still usable for throughput-only studies.
+Exactly three things: replace its inter-request sleep with a clock call; attach one
+`tracestate` entry to an outgoing request; take its latency numbers from the stream's
+stamps rather than its own stopwatch. A harness that cannot do the third is still usable
+for throughput-only studies.
 
 ### Warmup is not a protocol feature
 
-**Warmup requests are ordinary requests sent early.** They carry `compass.arrival_s` like
+**Warmup requests are ordinary requests sent early.** They carry the arrival stamp like
 any other, go through the same endpoint, and the contract gains nothing from special-casing
 them — nothing about a warmup *request* differs from a normal one.
 
@@ -110,7 +117,7 @@ Three consequences worth being explicit about:
 
 ### Problem
 
-Simulation needs one declared value in and three readings out. They can ride the production endpoint or a
+Simulation needs one declared value in and two readings out. They can ride the production endpoint or a
 dedicated one.
 
 ### Options
@@ -130,19 +137,27 @@ dedicated one.
 
 | Direction | Field | Meaning |
 |---|---|---|
-| request -> | `compass.arrival_s` | when this request counts as arriving, on the run's simulated timeline |
-| <- response | `compass.{arrival_s, first_token_s, finish_s}` | the engine's own readings |
+| request -> | the `compass` entry of the `tracestate` header, `compass=a:<arrival_s>;s:<seq>` | when this request counts as arriving, on the run's simulated timeline, and its sequence number on the channel |
+| <- response | an SSE comment line before each streamed event, `: compass a=<t> s=<seq>`; not streamed, a `compass` response header, `compass: a=<t>;s=<seq>` | when that event reaches the harness on the simulated timeline: the first content event's is `first_token_s`, the last event's `finish_s` |
 
-#### Minimality audit: why four values, and why not three or five
+**Revised 2026-09-28 (#443): a header entry and SSE comment lines, not body fields.**
+Atomesh re-serializes a chat request through a typed struct that keeps no unknown
+top-level field (`01` D7), so a body field is dropped on the PD path, while `tracestate`
+is forwarded to prefill and to decode. A comment line is ignored by every SSE client and
+passes the router byte for byte. Neither carrier is in the request or response schema, so
+the options table's two schema rows no longer apply. `atom/compass/carriers.py` holds
+both formats. The audit below was written for body fields: the need for each remaining
+value stands, the carrier changed, and the engine's arrival reading is dropped.
+
+#### Minimality audit: why three values, and why not two or four
 
 The requirement is that these are the minimum — nothing more, nothing less. Audited in
 both directions.
 
-**One nested object per direction, not four flat keys.** Four top-level names would mean
-four collisions with a schema ATOM does not own, and near-identical names for the declared
-arrival and the engine's own reading — two things that differ by a clamp and must never be
-confused. One `compass` object is **one** additive key each way, namespaced, and trivially
-ignorable by a server that does not know it.
+**One namespaced entry per direction, not several keys.** Several top-level names would
+mean several collisions with a schema ATOM does not own. One `compass` entry in
+`tracestate`, and one `compass` comment line per event, are each trivially ignorable by a
+server or client that does not know them.
 
 **What is deliberately NOT a Compass field, because the OpenAI schema already has it:**
 
@@ -155,37 +170,42 @@ ignorable by a server that does not know it.
 
 Adding a Compass field for any of these would duplicate state that can disagree.
 
-**Why each of the four is irreducible:**
+**Why each of the three is irreducible:**
 
-- `compass.arrival_s` **(in)** — the only field with no existing home. The server cannot
+- `arrival_s` **(in)** — the only value with no existing home. The server cannot
   infer it: under simulation the harness sends requests as fast as the socket allows and
   the *declared* arrival is the whole point. Without it there is no simulated timeline.
-- `compass.arrival_s` **(out)** — not an echo. The engine may clamp a declared arrival
-  (it cannot be earlier than the run's epoch, and the arrival gate of doc `01` D8 may
-  defer it). Returning what the engine *used* is how the harness detects that its
-  timeline was not honoured. Dropping this makes a clamped run silently misreport TTFT.
-- `compass.first_token_s` **(out)** — TTFT is a graded acceptance metric
+- `first_token_s` **(out)** — TTFT is a graded acceptance metric
   ([target](README.md#acceptance-targets)). The harness's own stopwatch measures HTTP and wall time, which under simulation is
   unrelated to simulated time. There is no other source.
-- `compass.finish_s` **(out)** — same argument for TPOT and throughput; and
+- `finish_s` **(out)** — same argument for TPOT and throughput; and
   `finish − first_token` over the generated count is TPOT, so this is not derivable from
-  the other three.
+  the other two.
 
-**What was considered and rejected as a fifth field:** a per-step or per-token timeline.
+**Dropped by the revision: `arrival_s` (out).** It was the clamp detector: the engine
+might clamp a declared arrival, and returning what it *used* let the harness see that its
+timeline was not honoured. Under `01` D8 a request is held at the receive wrapper until
+its arrival is granted, so ATOM never sees it early, and a request whose arrival is
+already behind the frontend's clock when it is read is a straggler that fails the run
+(`01` D3.2). There is no silent clamp
+left to detect.
+
+**What was considered and rejected as a fourth field:** a per-step or per-token timeline.
 It would make TPOT *distribution* gradeable rather than just its mean. Rejected because
 the same information is already in the engine's own step table (doc `08`), which both
 sides emit, and putting it on the wire would grow every response by the output length.
 If a later result needs per-token simulated stamps, it comes from the step table join,
 not from the endpoint.
 
-take2 built the request half: `CompletionRequest.compass_arrival` as an offset into the
+take2 built the request half in a body field, which the revised carrier above replaces
+with `tracestate`: `CompletionRequest.compass_arrival` as an offset into the
 run, `llm_engine._stamp_arrival` turning it into `epoch + offset` and warning plus falling
 back to `now()` on a real clock, and `Scheduler._declared_arrival_pending` putting a
 not-yet-arrived sequence back on the waiting queue — deliberately **not** via
 `_unschedulable_reason`, which would finish it.
 
 **The response half is a change from take2, and an improvement.** take2 used
-`GET /compass/requests` as a bulk drain. Response-carried fields are better for a
+`GET /compass/requests` as a bulk drain. Response-carried stamps are better for a
 streaming client: numbers arrive per request, in band, with no separate drain and **no
 id-space join**. take2 lost a day to exactly that join — the step table recorded internal
 sequence ids (`0, 1, 10`), `/compass/requests` recorded external completion ids
@@ -198,8 +218,9 @@ Keep `GET /compass/requests` as a bulk diagnostic, not the primary path.
 
 ### Open issues
 
-- Whether upstream ATOM will accept simulation fields in the public request schema, or
-  whether they must be namespaced or gated.
+- ~~Whether upstream ATOM will accept simulation fields in the public request schema, or
+  whether they must be namespaced or gated.~~ — moot since the revision: neither carrier
+  is in the schema.
 
 ---
 
@@ -219,9 +240,12 @@ Reasons, in order of weight:
 3. A real run and a simulated run then differ in exactly one thing: what the forward pass
    costs.
 
-The round trip is a doc 01 **Category-B** blocking wait: annotate `declare_blocked()` /
-`declare_running()` around the existing call, leave the call itself alone. Real wall time
-passes; virtual time does not advance; the Clock Authority routes grants elsewhere.
+The round trip is two channels (`01` D3; revised 2026-09-28, #443): the request is a send
+on `traffic->frontend:http` (K4), logged on the harness's clock owner, and the stream a
+receive on `frontend->traffic:stream` (K5), counted where the harness reads it; through
+atomesh they are `traffic->frontend-P:http` and `frontend-D->traffic:stream` (`01` D7).
+Nothing is annotated and the call itself is left alone. Real wall time passes in transit; the send
+and receive counts, not the wall clock, decide what a grant may pass.
 
 Rejected: aiperf's own `FakeTransport` (bypasses HTTP entirely) and an in-process ASGI
 call. Both are faster and both break reason 1.
@@ -243,7 +267,7 @@ The ATOM relay is strictly sequential (`http_pd_router.rs::PDRouter::dispatch_at
 path (`tokio::join!` on both, `http_pd_router.rs::PDRouter::execute_dual_dispatch_internal`) and the vLLM path (detached `spawn`, `http_pd_router.rs::PDRouter::dispatch_vllm_mooncake_internal`):
 
 ```
-client --compass.arrival_s--> router --inject_prefill_fields--> PREFILL
+client --tracestate compass-> router --inject_prefill_fields--> PREFILL
                                   (sets kv_transfer_params, stream=false,
                                    max_tokens=1; other fields pass through)
                         router <-- prefill response
@@ -255,29 +279,39 @@ client <--------------  router <-- decode response (streamed)
 
 `AtomAdapter::enrich_decode_kv` (`placement/backend/atom.rs`) only *adds* fields
 (`remote_dp_size`, `remote_tp_size`, renames `dp_rank` -> `remote_dp_rank`). The blob
-itself is produced by `MoRIIOConnectorScheduler.request_finished`
-(`moriio_connector.py`) and the router hard-errors if it is absent
+itself is produced by the connector's `request_finished`
+(`moriio_connector.py::MoRIIOConnectorScheduler` by default,
+`mooncake_connector.py::MooncakeConnectorScheduler` under Mooncake; `01` D6) and the
+router hard-errors if it is absent
 (`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`).
 
 ### Decision
 
-**Prefill writes `arrival_s` and `first_token_s` into `kv_transfer_params`. Decode reads
-them, adds `finish_s`, and emits the merged timeline in its response.**
+**Three carriers, each one the router already passes unchanged** (revised 2026-09-28,
+#443; `01` D7): the `compass` entry of `tracestate` on the request, which the router
+forwards to prefill and to decode; a field inside `kv_transfer_params` on the
+prefill-to-decode forward (`frontend-P->frontend-D:relay`), added by prefill after the
+connector has emitted its blob; and SSE comment lines on decode's stream, or a `compass`
+response header when not streamed. A decode request that carries `kv_transfer_params`
+takes its time from that field, any other request from `tracestate`.
 
 Consequences:
 
-- **Atomesh needs zero changes** on the timeline path. (It still needs its failure
-  detectors disabled per doc 01 D5, and two hardcoded Rust timeouts raised.)
+- **Atomesh needs zero changes** on the timeline path. (A simulated launch still switches
+  its health check and circuit breaker off and sets `--worker-request-timeout-secs`
+  large, `01` D5 and D7; no Rust change.)
 - **The harness cannot tell PD-aggregated from PD-disaggregated** — one uniform response
   shape in both topologies, which is exactly the property a fair comparison needs.
 
 ### Open issues
 
-- The simulated KV connector (doc 01 D6) must produce a `kv_transfer_params` blob of the
-  same shape as MoRI-IO's, or the router refuses.
-- Mooncake requires **all** `(pp_rank, tp_rank)` pairs to report before a request
+- ~~The simulated KV connector (doc 01 D6) must produce a `kv_transfer_params` blob of the
+  same shape as MoRI-IO's, or the router refuses.~~ — answered by `01` D6: it stands in
+  for Mooncake and emits Mooncake's field set.
+- ~~Mooncake requires **all** `(pp_rank, tp_rank)` pairs to report before a request
   completes; MoRI-IO does not. The simulated connector must pick one semantic and declare
-  it.
+  it.~~ — answered by `01` D6: Mooncake, which ATOM's PD CI deploys, with the simulated
+  write one event per request priced on the whole block table (T13).
 
 ---
 
@@ -387,7 +421,9 @@ p50 input is 88,768 tokens and p90 is 204,288, this is not a rounding error.
 `InputOutputProcessor.preprocess`, reached from the API server via
 `await loop.run_in_executor(None, do_preprocess)` at `api_server.py::generate_async`, `generate_async_multimodal`, `generate_async_fanout`,
 `setup_streaming_request`, `setup_streaming_request_fanout`. That is Python's **implicit default executor**, width
-`min(32, cpu_count + 4)` — see doc 05 D24, which makes it an ATOM config option.
+`min(32, cpu_count + 4)`. Doc 05 D24 decides to make that width an ATOM option,
+`--preprocess-pool-width`; how the simulated run's executor composes with it is open
+(below).
 
 **Decode** — `IncrementalStreamDetokenizer.update` at
 `atom/entrypoints/openai/streaming_dispatch.py`:
@@ -408,8 +444,9 @@ Four properties that shape the model:
 2. **Cost is O(sliding window), not O(total output).**
 3. It runs on the **engine output threads, batched per engine step** — the module
    docstring: *"buffers a whole engine step, detokenizes it, and schedules a single
-   callback per event loop."* One thread, all streams: a serialization point at high
-   concurrency.
+   callback per event loop."* One thread per DP rank (`EngineCoreOutputThread-DP<rank>`,
+   `engine_core_mgr.py::CoreManager._create_output_thread`), all of that rank's streams: a serialization point at
+   high concurrency.
 4. The window only advances when the decode does not end in `�`. Hence D31's ASCII
    constraint.
 
@@ -425,8 +462,8 @@ rule as the forward pass.
 
 | Stage | Where | Concurrency | Service time |
 |---|---|---|---|
-| encode | default `ThreadPoolExecutor` | width from ATOM config | `encode_fixed_s + tokens / encode_tokens_per_s` |
-| decode | engine output thread, per stream per step | **1** | `2 x (decode_fixed_s + window / decode_tokens_per_s)` |
+| encode | default `ThreadPoolExecutor` | the executor's actual width, **minus the wait jobs resident when the run starts** | `encode_fixed_s + tokens / encode_tokens_per_s` |
+| decode | engine output thread, per stream per step | **1**, one station per output thread | `2 x (decode_fixed_s + window / decode_tokens_per_s)` |
 | encode or decode on the loop thread | the API server's event loop: the final `decode` of a non-streaming completion in `generate_async`, `generate_async_multimodal` and `generate_async_fanout`, and the `encode` and `decode` calls in `anthropic_messages` | **1**, the loop itself | the same terms per call, over the tokens it encodes or decodes |
 
 A loop-thread call is not a station job. The event loop is the frontend LP's clock owner,
@@ -436,6 +473,30 @@ window it is charged nothing.
 
 Terms come from `host.tokenizers[]` in the machine spec (doc 05 D25), populated by the
 `compass spec probe tokenizer` Tier-0 probe.
+
+**The encode and decode stages are resource stations** (revised 2026-09-28, #443; PDES
+term: a multi-server FIFO queue). The simulated run installs its own default executor on
+the event loop. Each pool job is classified by a registry (`classify` in
+`atom/utils/compass_loop.py`): `do_preprocess` is a **service** job; the
+`outputs_queue.get` that `engine_core_mgr.py::CoreManager._async_output_handler` hands to
+the pool is a **wait** job, passed straight through because a channel event completes it
+at no cost, and it holds one thread for the life of the server, which is why the encode
+width subtracts it. **Anything unregistered is refused by name** and counted in the run
+summary's refusals, so a job ATOM later adds to the pool is reported rather than silently
+charged zero; the multimodal preprocessing hand-off in `api_server.py::chat_completions`
+(`_prepare_multimodal_inputs`) is refused today. A service job runs for real to get its
+result, takes a server in submission order, and its result reaches the coroutine at its
+completion time. On the decode side, each frame an output thread takes is one job on
+that thread's width-1 station, from when it takes the frame to when it is back at its
+wait point, starting at the later of the frame's arrival and the previous job's
+completion; the callbacks it posts to the event loop
+(`streaming_dispatch.py::StreamBatchDispatcher.flush`, and the per-request callbacks of
+`api_server.py::generate_async`, `generate_async_multimodal` and `generate_async_fanout`)
+run at its completion time. **Inside a job the clock
+reads the job's start time plus the service time accumulated so far**, charged by the
+wrapped `tokenizer.encode` / `decode`. So `seq.arrive_time`, read after tokenization in
+`llm_engine.py::InputOutputProcessor.preprocess_fanout`, is the tokenization completion
+time, as in a real run.
 
 **This is a queue, not a constant.** At the corpus p50 and a plausible 2 M tokens/s,
 encode is ~44 ms — roughly **3x take2's entire admission constant** (13.7 ms) — and it
@@ -455,6 +516,10 @@ request appearing in `scheduler.waiting`, **excluding** tokenize.
 - Admission is **path-specific**: 13 ms on the offline batch path, 9 ms on the serving
   path, same machine and model. And **instrumentation-specific**: measure mode cost ~11 ms
   of TTFT on the 27B (4%).
+- Doc 05 D24's `--preprocess-pool-width` and the simulated run both install the loop's
+  default executor (`loop.set_default_executor`). The simulated executor has to take the
+  width D24 configures, not replace the pool D24 sets up; how the two compose is not
+  designed.
 
 ---
 
@@ -730,17 +795,46 @@ sites below, which do not go through `LoopScheduler` either (T74).
 3. **Metrics are stamped in the transport**, so our transport controls them.
    `ttft_metric.py:49-56` is `content_responses[0].perf_ns - request.start_perf_ns`;
    `request_latency_metric.py:38-49` is `content_responses[-1].perf_ns - start_perf_ns`;
-   ITL is `(request_latency - ttft) / (osl - 1)`. A transport that sets `start_perf_ns`,
-   each SSE chunk's `perf_ns` and `end_perf_ns` from the response's `sim_*` fields makes
+   ITL is `(request_latency - ttft) / (osl - 1)`. A transport that sets `start_perf_ns`
+   from the simulated arrival time it sends, and each SSE chunk's `perf_ns` and
+   `end_perf_ns` from that chunk's simulated time, makes
    the **entire existing metric and export stack correct by construction** — TTFT, ITL,
    ICL, latency, throughput, percentiles, goodput, the JSON/CSV exporters, the swim-lane
    plot and `submission_valid`. Roughly 15,000 lines of metrics code for free.
+
+   **The carriers** (revised 2026-09-28, #443; `01` D8). The arrival time goes in the
+   **`compass` entry of the W3C `tracestate` header**, appended after any existing entries
+   (for example `tracestate: compass=a:12.345;s:17`), not in a body field: atomesh
+   re-serializes a chat request through a typed struct with no catch-all, so an unknown
+   top-level field is dropped, while `tracestate` is on the header allow-list it forwards
+   (`atom/mesh/src/routers/comm/header_utils.rs::should_forward_request_header`)
+   to both prefill and decode. Each streamed event's simulated time arrives on an **SSE
+   comment line** the server puts before that event (for example
+   `: compass a=12.345 s=18`); clients ignore comment lines, and aiperf's own parser
+   already keeps them on the message as `comment` packets
+   (`common/models/record_models.py::SSEMessage.parse`), so the transport reads them
+   without a parser change.
+
+   **The `/metrics` scrape runs on simulated time too** (`11` D72). aiperf's
+   `ServerMetricsDataCollector` (`server_metrics/data_collector.py`) scrapes on
+   `BaseMetricsCollectorMixin._collect_metrics_loop`
+   (`common/mixins/base_metrics_collector_mixin.py`), paced by `asyncio.sleep` in
+   `TaskManagerMixin._background_task_loop` (`common/mixins/task_manager_mixin.py`): a
+   real-clock timer the rebind above does not reach. The adapter paces it on the clock
+   client, every `scrape_interval` of simulated time, and stamps each sample with the
+   simulated time of its scrape. It is a real `GET /metrics` over the harness's existing
+   HTTP path, a send on the same `http` channel, so it adds no channel. The periodic
+   scrape is a **daemon deadline** (`01` D3): it fires as usual but does not keep the run
+   alive. The arrivals and one scrape after the last response are essential, so the run
+   finishes once the last response and that scrape are in, and the end-of-run check of
+   D27 runs on the `+inf` grant.
 
 ### Contents and size
 
 | Component | Lines | Status |
 |---|---|---|
-| Transport plugin — real HTTP, re-stamp anchors from `sim_*` | 150-250 | stands |
+| Transport plugin — real HTTP, `tracestate` arrival out, anchors re-stamped from SSE comment lines | 150-250 | stands |
+| `/metrics` scrape paced on the clock client as a daemon deadline, the end-of-run check | **not costed** | new scope, added by the PDES revision (#443) |
 | `ClockPacedLoopScheduler` — the `LoopScheduler` subclass, covering the nine pacing calls | 80-150 | **open** — costed against the option-A wrapper, which constraint 1 rules out |
 | Clock client library | 100-150 | stands |
 | Plugin manifest, bootstrap, config glue | ~100 | stands — T73's dotted entry-point value costs nothing; the ~20-line deferred rebind hook sits inside this row's ~100 |
@@ -795,6 +889,9 @@ P0.3 verified the seam for arrivals only and did not examine these. Tracked as *
   correct — but a run using it is `submission_valid: false`, which is worth knowing.
 - Dataset reconstruction is **minutes of real CPU** (tokenizing and decoding the whole
   corpus). It must run on the real clock before the measured window opens.
+- aiperf's scrape runs in its own service process, `ServerMetricsManager`
+  (`server_metrics/manager.py`), not the timing process that holds the rebound
+  `LoopScheduler`. How that process reaches the clock client is not designed.
 
 ---
 
@@ -852,14 +949,14 @@ requires genuine fan-out in every root is not constructible without reusing sess
 
 | # | Decision | Date |
 |---|---|---|
-| D27 | A three-part contract (clock client, wire fields, per-harness adapter), not a bespoke client. Harnesses live outside ATOM; more than one is supported. | 2026-09-18 |
-| D28 | Additive optional fields on the real endpoint, both directions. Response-carried timings replace take2's bulk drain. | 2026-09-18 |
-| D29 | Real HTTP to ATOM's real uvicorn server, both PD topologies. Round trip is a Category-B blocking wait. | 2026-09-18 |
-| D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes on that path. | 2026-09-18 |
+| D27 | A three-part contract (clock client, wire fields, per-harness adapter), not a bespoke client. Harnesses live outside ATOM; more than one is supported. Revised 2026-10-02 (#533, #534): the clock client is `now()` and `next_event(t, t_daemon)`, with no `END` call; on its `+inf` grant the harness raises unless every request it sent has its final response. | 2026-09-18; revised 2026-10-02 |
+| D28 | Additive optional fields on the real endpoint, both directions. Response-carried timings replace take2's bulk drain. Revised: the request carrier is the `compass` entry of `tracestate`, the response's SSE comment lines (a `compass` header when not streamed); the engine's arrival reading is dropped, since a request is held until its arrival is granted and nothing clamps it. | 2026-09-18; revised 2026-09-28 |
+| D29 | Real HTTP to ATOM's real uvicorn server, both PD topologies. Round trip is a Category-B blocking wait. Revised: two counted channels, a K4 send and a K5 receive; nothing is annotated. | 2026-09-18; revised 2026-09-28 |
+| D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes on that path. Revised: three carriers, `tracestate` on the request, a `kv_transfer_params` field on the forward and SSE comment lines on the stream; still zero Atomesh changes. | 2026-09-18; revised 2026-09-28 |
 | D31 | Filler token is non-EOS, decodes to complete standalone ASCII, and is derived from the request id. | 2026-09-18 |
 | D32 | The decode->prefill cache chain is already broken by the harness for real servers too; guard only against false hits. `theoretical_prefix_cache_hit` is the oracle. | 2026-09-18 |
-| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. A tokenizer call on the event loop thread (the final `decode` of a non-streaming completion, the calls in `anthropic_messages`) is no station job: it advances the frontend LP clock by its service time on the loop. | 2026-09-18; revised 2026-10-03 |
-| D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. | 2026-09-18 |
+| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. Revised: both are resource stations; encode width excludes the wait jobs resident when the run starts, pool jobs are classified by a registry and unregistered ones refused, and a clock read inside a job is its start plus accumulated service time. A tokenizer call on the event loop thread (the final `decode` of a non-streaming completion, the calls in `anthropic_messages`) is no station job: it advances the frontend LP clock by its service time on the loop. | 2026-09-18; revised 2026-09-28 and 2026-10-03 |
+| D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. Revised: arrival rides the `compass` entry of `tracestate`, output times ride SSE comment lines, and the `/metrics` scrape is paced on simulated time. Revised 2026-10-02 (#533, #534): the scrape is a daemon deadline, and the run ends when no essential work is left. | 2026-09-18; revised 2026-09-28 and 2026-10-02 |
 | D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists; the rebind itself is deferred by a `sys.meta_path` hook, because the bootstrap runs while `aiperf.plugin.plugins` is still importing and cannot import `aiperf`; an inline attempt does not raise to the operator, it de-registers the whole plugin and logs one `WARNING` (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
 | D35 | Declare what the harness reproduces and what it cannot; cancellation is not available from this corpus. | 2026-09-18 |
 
@@ -875,6 +972,6 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | ~~T10~~ | ~~Verify `AgenticReplayStrategy` can be subclassed rather than vendored~~ — **done**, P0.3: yes, but a subclass reaches only four of the nine pacing calls, so the adapter rebinds the runner's `LoopScheduler` instead (D34.1) | ~~changes the adapter estimate by 2,000 lines~~ — it does not; nothing is vendored |
 | T11 | Build the per-tokenizer vetted filler-token set | needs a tokenizer in hand |
 | T12 | Chase the 32 `asyncio.wait_for` sites under virtual time | only reachable once the adapter runs |
-| T13 | Decide the simulated KV connector's completion semantic (MoRI-IO's last-status vs Mooncake's all-ranks) | doc 01 D6 open issue, surfaces here |
+| ~~T13~~ | ~~Decide the simulated KV connector's completion semantic (MoRI-IO's last-status vs Mooncake's all-ranks)~~ — **done**, `01` D6: Mooncake, one simulated write event per request | ~~doc 01 D6 open issue, surfaces here~~ |
 | T14 | Build the client-count matrix given only 144 fan-out-capable sessions | affects the 256-client cell |
 | ~~T15~~ | ~~Warmup handling in the contract~~ — **done**, D27: warmup requests are ordinary requests; the rule is an exclusion window agreed by request id |
