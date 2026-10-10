@@ -102,6 +102,13 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         self._tp_size = whole_number("tp_size", config.tensor_parallel_size)
         self._dp_rank = whole_number("dp_rank", parallel.data_parallel_rank)
         self._pp_size = whole_number("pp_size", config.pipeline_parallel_size)
+        if self._pp_size > 1:
+            raise ValueError(
+                f"pipeline_parallel_size is {self._pp_size}, which this connector "
+                "refuses: a PP head passes worker KV output to the scheduler only "
+                "when it is non-empty, so process_completions never runs there, "
+                "and Mooncake's MSG_RELEASE channel is not modelled"
+            )
         self._hash_block_size = (
             config.kv_cache_block_size * config.decode_context_parallel_size
         )
