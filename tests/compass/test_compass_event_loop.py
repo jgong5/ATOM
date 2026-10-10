@@ -16,8 +16,10 @@ import queue
 import threading
 import time
 import uuid
+import warnings
 from types import SimpleNamespace
 
+import fastapi
 import pytest
 import uvicorn
 
@@ -241,8 +243,7 @@ def test_a_request_released_before_it_is_read_is_handed_over_at_its_arrival(run)
     thread = threading.Thread(target=client, name="client", daemon=True)
     thread.start()
     try:
-        with pytest.raises(RuntimeError, match="Event loop stopped before Future"):
-            server.run()
+        server.run()  # the finish ends it with nothing pending
     finally:
         thread.join(10)
         traffic.join(10)
@@ -253,6 +254,38 @@ def test_a_request_released_before_it_is_read_is_handed_over_at_its_arrival(run)
     # The server tick and the keep-alive timeout never move the clock.
     assert max(g for g in run.conn.grants if g < INF) == arrival
     assert run.conn.grants[-1] == INF
+
+
+def test_the_finish_shuts_uvicorn_down_with_no_error_and_no_join_warning(
+    run, caplog, monkeypatch
+):
+    _idle_traffic(run)
+    # An earlier server may have left uvicorn's log config: no propagation, WARNING.
+    monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
+    server = uvicorn.Server(
+        uvicorn.Config(
+            fastapi.FastAPI(),
+            host="127.0.0.1",
+            port=0,
+            loop="atom.utils.compass_loop:CompassEventLoop",
+            lifespan="on",
+            log_config=None,
+        )
+    )
+    with (
+        caplog.at_level(logging.INFO, "uvicorn.error"),
+        warnings.catch_warnings(record=True) as warned,
+    ):
+        warnings.simplefilter("always")
+        try:
+            server.run()
+            stopped = None
+        except RuntimeError as e:  # the loop stopped with uvicorn's task pending
+            stopped = str(e)
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    joins = [str(w.message) for w in warned if w.category is RuntimeWarning]
+    assert (stopped, errors, joins) == (None, [], [])
+    assert run.rt.now == INF and "Application shutdown complete." in caplog.messages
 
 
 def test_a_request_read_before_its_release_is_held_until_it(run):
