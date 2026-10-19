@@ -1505,11 +1505,12 @@ def _op_graphs(root: str, config):
     return graph
 
 
-def _price_list(run: dict, config, machine) -> dict:
-    """The params of the `price_list` the run file names by its key's fields,
-    loaded from its store under this run's readings, or a refusal naming the
-    reading that differs."""
+def _price_list(run: dict, config, machine):
+    """A `fit.ops.PriceList` of the `price_list` the run file names by its key's
+    fields, loaded from its store under this run's readings, or a refusal naming
+    the reading that differs."""
     from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind
+    from atom.compass.fit.ops import PriceList
     from atom.compass.fit.publish import RANK
     from atom.compass.run.step_grid import conditions
 
@@ -1517,7 +1518,7 @@ def _price_list(run: dict, config, machine) -> dict:
     entry = ArtifactStore(run["store"]).load(
         key, conditions=conditions(config, machine), gates=GateState.of()
     )
-    return json.loads(entry.read_member("params", RANK, "json"))
+    return PriceList(json.loads(entry.read_member("params", RANK, "json")))
 
 
 def _graph_pool(model_runner, machine, model):

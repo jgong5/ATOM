@@ -37,9 +37,13 @@ interpolate: its family lists it under `declined` with its reason, for the
 price list's reader to answer only its measured points along it. Per phase
 and operator the report gives the median and largest error on the lines that
 interpolate.
+
+`PriceList` is that reader: a run's first source for each leaf of an
+`op_graph` (`backends.op_graph`).
 """
 
 import argparse
+import functools
 import itertools
 import json
 import re
@@ -47,6 +51,10 @@ import statistics
 from pathlib import Path
 
 from atom.compass.artifacts import ArtifactStore, Key, Kind
+from atom.compass.backends.cost import CostTerm
+from atom.compass.backends.op_graph import LISTED, band
+from atom.compass.backends.provenance import Method, Provenance, Refusal
+from atom.compass.backends.resolver import CostSource
 from atom.compass.fit import publish
 from atom.compass.fit.samples import run_fields
 
@@ -149,13 +157,6 @@ def family(shape: str, leaf: str, free) -> str:
 def shape_counts(shape: str) -> dict:
     """The counts `shape` states, ``T`` and ``B`` for a prefill, ``B`` for a decode."""
     return {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", shape)}
-
-
-def band(rows, decode: bool) -> tuple[int, int]:
-    """The mean and max context of `rows`, each ``[query, context, ...]``: a
-    decode row's context, a prefill row's cached tokens."""
-    c = [row[1] - (0 if decode else row[0]) for row in rows]
-    return sum(c) // len(c), max(c)
 
 
 def _context(p) -> int:
@@ -324,3 +325,101 @@ def summary(rows) -> dict:
             out[name] |= {"median_error": statistics.median(kept)}
             out[name] |= {"max_error": max(kept)}
     return out
+
+
+class PriceList(CostSource):
+    """`compass fit ops`'s params as a leaf's first source: its family queried
+    at the step's count of each of its dimensions, ``context`` the mean of
+    `band`. It also declines along a line the fit declined, and rows
+    whose context from that mean to their max crosses into another kernel."""
+
+    name = LISTED
+
+    def __init__(self, params: dict) -> None:
+        self.params = params
+        # ponytail: bounded by entries, not bytes; a decode query changes every
+        # step, so only the last steps' answers come back
+        self._family = functools.lru_cache(maxsize=1 << 14)(self._family)
+        self._lookup = functools.lru_cache(maxsize=1 << 14)(self._lookup)
+        self._table = functools.cache(self._table)
+
+    def price(self, request: tuple) -> CostTerm | Refusal:
+        from atom.compass.bench.ops import signature
+
+        (leaf, (phase, *counts, top), _), kind = request, request[0]["op"]
+        name = self._family(phase, signature(leaf))
+        if name is None:
+            return self.refuse(f"{kind}: no point of its signature was measured")
+        dims = self.params["families"][name]["dims"]
+        at = dict(zip(("T", "B", "context"), counts))
+        top = top if dims[-1:] == ["context"] and top != at["context"] else None
+        got = self._lookup(name, tuple(at[d] for d in dims), top)
+        if isinstance(got, str):
+            return self.refuse(f"{kind}: {got}")
+        method = Method.MEASURED if got[1] else Method.ESTIMATED
+        return CostTerm(f"op.{kind}", got[0] * 1e-9, Provenance(method))
+
+    def _family(self, phase: str, sig: str) -> str | None:
+        """The family of a leaf of signature `sig`, or None."""
+
+        free = self.params["free"].get(skeleton(phase, sig))
+        name = None if free is None else family(phase, sig, free)
+        return name if name in self.params["families"] else None
+
+    def _lookup(self, name: str, at: tuple, top) -> tuple[float, bool] | str:
+        """The ns at `at`, and whether it is a measured point; or why not."""
+
+        points, axes = self._table(name)
+        ends = [at]
+        if top is not None:
+            inner = [v for v in axes[-1] if at[-1] < v < top]
+            ends += [(*at[:-1], v) for v in [*inner, top]]
+        try:
+            got = [self._at(name, e) for e in ends]
+        except Declined as why:
+            return str(why)
+        other = next((k for _, k in got if k != got[0][1]), None)
+        if other is not None:
+            first = next(
+                p for p in itertools.zip_longest(got[0][1], other) if p[0] != p[1]
+            )
+            return (
+                f"its rows' context from {at[-1]} to {top} crosses from {first[0]} "
+                f"to {first[1]}"
+            )
+        return got[0][0], at in points and top is None
+
+    def _table(self, name: str) -> tuple[dict, list]:
+        """A family's points by coordinates, and each dimension's values."""
+        f = self.params["families"][name]
+        points = {tuple(c): (ns, k) for c, ns, k in f["points"]}
+        return points, [sorted({c[i] for c in points}) for i in range(len(f["dims"]))]
+
+    def _at(self, name: str, at: tuple):
+        """`interpolate` at `at`, declining along a line the fit
+        declined: one along a dimension `at` lies between two values of,
+        whose other coordinates are `at`'s, or a value bracketing it."""
+
+        f, (points, axes) = self.params["families"][name], self._table(name)
+        dims = f["dims"]
+        near = [
+            (
+                {x}
+                if x in vs
+                else {
+                    max((v for v in vs if v < x), default=x),
+                    min((v for v in vs if v > x), default=x),
+                }
+            )
+            for x, vs in zip(at, axes)
+        ]
+        for dim, rest, why in f.get("declined", ()):
+            i = dims.index(dim)
+            others = [near[j] for j in range(len(dims)) if j != i]
+            between = axes[i][0] < at[i] < axes[i][-1] and at[i] not in axes[i]
+            if between and all(r in o for r, o in zip(rest, others)):
+                where = "".join(
+                    f" at {d} = {r}" for d, r in zip(dims[:i] + dims[i + 1 :], rest)
+                )
+                raise Declined(f"the fit declined {dim}{where}: {why}")
+        return interpolate(points, at, dims)

@@ -267,10 +267,11 @@ def pt(leaf, shape, ns, context=None, kernel="k", rows=None):
 
 
 def listed(*points):
-    """`compass fit ops`'s params over `points`, declined lines included."""
+    """`compass fit ops`'s params over `points`, declined lines included, as
+    the price list a run reads."""
     params = fit_ops.fit(list(points))
     fit_ops.held_out(params)
-    return params
+    return fit_ops.PriceList(params)
 
 
 # A GEMM whose time does not move with context: its family runs over B alone.
@@ -451,7 +452,7 @@ def _published(tmp_path, root=None):
         source_root="tree-" + "a" * 40,
     )
     args = SimpleNamespace(store=str(tmp_path / "store"), out=str(tmp_path), ptl=None)
-    publish(args, "compass fit ops", key, conditions, FLAT, {})
+    publish(args, "compass fit ops", key, conditions, FLAT.params, {})
     return key.values
 
 
@@ -461,7 +462,7 @@ def test_a_run_file_price_list_prices_leaves_from_the_store_s_entry(
     fields = _published(tmp_path)
     installed = _installed(monkeypatch, tmp_path, op_graph=True, price_list=fields)
 
-    assert installed.resolver.sources[0].params == FLAT
+    assert installed.resolver.sources[0].params == FLAT.params
 
 
 def test_a_run_file_price_list_from_another_tree_is_refused_at_load(
