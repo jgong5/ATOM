@@ -11,6 +11,7 @@ owns its process because the driverless declarations are process-global.
 
 import collections
 import copy
+import dataclasses
 import functools
 import json
 import os
@@ -37,7 +38,6 @@ from atom.compass.backends.work import (
     attention,
     bounds,
     gemm,
-    grouped_gemm,
     max_rank_load,
 )
 from atom.compass.runner import projection
@@ -45,9 +45,10 @@ from atom.compass.spec import MachineSpec
 
 TREE = pathlib.Path(__file__).resolve().parents[2]
 CONFIG = pathlib.Path(__file__).with_name("deepseek_v4_pro_config.json")
-#: Experts, local experts, top k, intermediate, hidden, group, DP width, split.
-EP_OFF = (8, 8, 2, 16, 32, 2, 2, 0)
-EP2 = (8, 4, 2, 32, 32, 2, 2, 0)
+#: Experts, local experts, top k, intermediate, hidden, group, DP width, split,
+#: and the bytes an expert holds: its fp4 weights and a byte per 32 of them.
+EP_OFF = (8, 8, 2, 16, 32, 2, 2, 0, 816)
+EP2 = (8, 4, 2, 32, 32, 2, 2, 0, 1632)
 #: The link: one hop of 2 us, 1e12 B/s derated by 0.8, one lane at two ranks.
 LINK = 1.0e12 * 0.80
 
@@ -57,6 +58,8 @@ def machine(bf16):
     document["device"]["kernel_floor_s"] = 1e-15
     document["device"]["memory"]["bandwidth_curve"] = [[1, 1e9], [2**40, 1e9]]
     document["device"]["compute"].update(bf16_flops=bf16, fp8_flops=2 * bf16)
+    document["device"]["compute"].update(fp4_flops=4 * bf16)
+    document["device"]["compute"]["derate"]["fp4"] = 0.7
     return MachineSpec.from_mapping(document)
 
 
@@ -96,33 +99,41 @@ def test_the_routed_experts_and_their_exchange_by_hand(spec):
     tokens, rows = 3, 10
     ep_off = Module("experts", "moe", EP_OFF, "fp4", ranks=2)
     ep2 = Module("experts", "moe", EP2, "fp4", ranks=2, act="fp8", wire=("fp4", "fp8"))
-    one_rank = Module("experts", "moe", (8, 8, 2, 16, 32, 2, 1, 0), "fp4", ranks=2)
+    one_rank = Module("experts", "moe", EP_OFF[:6] + (1, 0, 816), "fp4", ranks=2)
     step = view((tokens, tokens, False), moe_rows=rows)
-    # EP off: every expert a row reaches, at a sixteenth of the intermediate;
-    # the gathered hidden states and router logits, the output scattered back.
+    # EP off: every expert a row reaches, at a sixteenth of the intermediate,
+    # read once by one kernel, with each row's bf16 input and output and its
+    # two top-k ids and weights; the gate-up output stays inside. The gathered
+    # hidden states and router logits, the output scattered back.
     hit = 8 * (1 - (6 / 8) ** rows)
-    experts = grouped_gemm(20, 32, 32, hit, "bf16", "fp4")
-    experts += grouped_gemm(20, 32, 16, hit, "bf16", "fp4")
+    experts = Work({"bf16": 2 * 20 * (32 + 16) * 32}, hit * 816 + rows * (128 + 16))
     gather = 2e-6 + rows * (32 + 8) * 2 / 2 / LINK
     scatter = 2e-6 + rows * 32 * 2 / 2 / LINK
     assert _price([ep_off], step, spec)["roofline.moe"] == pytest.approx(
+        _module(experts, spec) + gather + scatter
+    )
+    # Activations the method quantizes to the weights' fp4: the products run
+    # at the fp4 rate, the kernel's boundary unchanged.
+    fp4 = dataclasses.replace(ep_off, act="fp4")
+    experts = Work({"fp4": 2 * 20 * (32 + 16) * 32}, experts.bytes)
+    assert _price([fp4], step, spec)["roofline.moe"] == pytest.approx(
         _module(experts, spec) + gather + scatter
     )
     # A graph's pad rows all carry one token: 6 real tokens and the pad reach
     # the experts, every row still computed.
     padded = BatchView(step.requests, moe_rows=rows, moe_tokens=6)
     hit7 = activated_experts(8, 2, 7)
-    experts = grouped_gemm(20, 32, 32, hit7, "bf16", "fp4")
-    experts += grouped_gemm(20, 32, 16, hit7, "bf16", "fp4")
+    experts = Work({"bf16": 2 * 20 * (32 + 16) * 32}, hit7 * 816 + rows * 144)
     assert _price([ep_off], padded, spec)["roofline.moe"] == pytest.approx(
         _module(experts, spec) + gather + scatter
     )
     # EP2: the busiest rank's share at the full intermediate, half the experts
-    # read; each token sent once to each rank holding one of its two experts,
-    # at fp4 and back at fp8.
+    # read, and its routes' share of the rows, which arrive at fp4; each token
+    # sent once to each rank holding one of its two experts, at fp4 and back
+    # at fp8.
     load = max_rank_load(rows, 2, 8, 2)
-    experts = grouped_gemm(load, 64, 32, hit / 2, "fp8", "fp4")
-    experts += grouped_gemm(load, 32, 32, hit / 2, "fp8", "fp4")
+    row = 32 * (0.5 + 2) + 16
+    experts = Work({"fp8": 2 * load * (64 + 32) * 32}, hit / 2 * 1632 + load / 2 * row)
     sent = tokens * 32 * 2 * (1 - comb(4, 2) / comb(8, 2))
     dispatch = 2e-6 + sent * 0.5 / 2 / LINK
     combine = 2e-6 + sent / 2 / LINK
@@ -132,8 +143,7 @@ def test_the_routed_experts_and_their_exchange_by_hand(spec):
     # One data-parallel rank: its graph's 8 rows, the output all-reduced; its
     # 3 decode tokens and the pad reach the experts.
     hit = activated_experts(8, 2, 4)
-    experts = grouped_gemm(16, 32, 32, hit, "bf16", "fp4")
-    experts += grouped_gemm(16, 32, 16, hit, "bf16", "fp4")
+    experts = Work({"bf16": 2 * 16 * (32 + 16) * 32}, hit * 816 + 8 * 144)
     experts += allreduce(2, 8 * 32 * 2)
     one = BatchView((RequestShape(1, 4, True),) * 3, capture_rung=8)
     assert _price([one_rank], one, spec)["roofline.moe"] == pytest.approx(
@@ -187,8 +197,7 @@ def test_a_split_step_lays_each_layers_micro_batches_on_two_streams(spec):
     segments = []
     for q, kv, rows in halves:
         hit = activated_experts(8, 2, rows)
-        experts = grouped_gemm(2 * rows, 32, 32, hit, "bf16", "fp4")
-        experts += grouped_gemm(2 * rows, 32, 16, hit, "bf16", "fp4")
+        experts = Work({"bf16": 2 * 2 * rows * (32 + 16) * 32}, hit * 816 + rows * 144)
         compute = _module(attention(q, kv, 4, 8, 1), spec)
         compute += _module(gemm(sum(q), 32, 32), spec)
         gather = bounds(allgather(2, rows * 40 * 2), spec)["comm"]
@@ -206,7 +215,7 @@ def test_a_split_step_lays_each_layers_micro_batches_on_two_streams(spec):
     "modules,step,refusal",
     [
         (
-            [Module("experts", "moe", EP2[:-1] + (1,), "fp4", ranks=2, layer=0)],
+            [Module("experts", "moe", EP2[:7] + (1, 1632), "fp4", ranks=2, layer=0)],
             view((4, 4, False), tbo=((2, 2), (2, 2))),
             "split send and receive",
         ),
@@ -394,7 +403,10 @@ def test_the_v4_pro_dpa_tp8_build_classifies_every_module(ep, tmp_path):
         dims = (128, 512, 128, ratio) + top
         assert found[("sparse_attention", dims, "fp8", "bf16")] == ratios.count(ratio)
     moe = (384, 48, 6, 3072) if ep else (384, 384, 6, 384)
-    assert found[("moe", moe + (7168, 8, 8, 0), "fp4", "bf16")] == 61
+    # The experts read fp4 activations, aiter quantizing them in the kernel,
+    # and hold their fp4 weights and a one-byte scale per 32 of them.
+    held = 3 * moe[3] * 7168 // 2 * 17 // 16
+    assert found[("moe", moe + (7168, 8, 8, 0, held), "fp4", "fp4")] == 61
     # The fp8 linears read fp8 activations; the block's norms run in its mixes.
     assert found[("gemm", (65536, 1536), "fp8", "fp8")] == 61
     assert found[("act", (3072,), "bf16", "bf16")] == 61
