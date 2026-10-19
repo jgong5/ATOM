@@ -40,15 +40,17 @@ SUBJECT = {"model": MODEL, "width": 8, "source_root": f"commit:{COMMIT}"}
 SUBJECT["record"] = f"sha256:{RECORD}"
 
 #: `http_intake.py`'s fit over one real c=256 first-turn cc-traces burst at
-#: `FLAGS`, run at the commit named; the record is the probe's stamp file. It is
-#: the only burst there, so each term's band is that burst's value at both ends.
+#: `FLAGS`, run at the commit named; the record is the probe's stamp file. The
+#: band is each term's p10 and p90 over six bursts, each fitted alone: the
+#: record and five more at 10a0609f7 on 2026-10-19, stamp files sha256
+#: 4e304c7a, 246e816a, 69148498, 0b987d21 and 59cac66f.
 INTAKE = (
     "2026-10-18",
     "19c5ab09e",
     {"fixed_s": 0.001966482509138914, "per_byte_s": 5.288974015662166e-09},
     {
-        "fixed_s": (0.001966482509138914, 0.001966482509138914),
-        "per_byte_s": (5.288974015662166e-09, 5.288974015662166e-09),
+        "fixed_s": (0.0019362225299832747, 0.0023826020769630186),
+        "per_byte_s": (3.617351613835432e-09, 5.241243893276638e-09),
     },
     "2397696f6df3a280660cbc95e7c8db0d61b77fba9986c3d388ccde75f2d5f574",
 )
