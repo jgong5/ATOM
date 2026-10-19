@@ -17,6 +17,7 @@ on, because until 2026-09-20 it was not — see "Which tree a script acts on" be
 | `regen_cpu_gate_exclude.sh` | CPU container | Regenerate the **GENERATED** section of the exclusion list by iterating `--collect-only` to a fixed point (three passes at `83daf636d`: 37 errors, 1, clean). Preserves the MANUAL section verbatim. |
 | `regen_gpu_gate_triggers.sh` | CPU container | Re-derive `gpu_gate_triggers.txt` from the exclusion list and the tree. Run after **any** change to `cpu_gate_exclude.txt` — the two files are derived from the same tree and are wrong separately. Writes the whole file, **header counts included**; nothing in it is maintained by hand. |
 | `snapshot.sh` | either | Build the `git archive` tarball a gate runs against (never `rsync`). Stamps `.compass-commit` (so output names its tree, and a `COMPASS_GPU_GATE_DONE` attestation can be checked) and `.compass-changed` (so the blind-spot question is answerable without `.git`). Refuses a dirty tree. |
+| `compass` | either | The `compass` console script, run from this tree, for an image whose ATOM install has none. The stage-2 cell below runs it. |
 | `pd_sim.sh` | GPU container | A simulated 1P1D run: the standalone clock authority (`python -m atom.compass.run`), a prefill and a decode API server on the simulated KV connector, and `atomesh` in PD mode between them. `tests/compass/test_pd_slice.py` drives one request through it. Its variables are in its header. |
 | `deploy.sh` | GPU container | A simulated prefill-decode deployment: one `compass run` per instance, joined to the clock authority the script starts, and `atomesh` between them; a client drives it through `OUT/server.json` as it drives one server. Its usage is in its header. |
 | `parity_one_node.sh` | GPU container, two devices (eight for `CONFIG=dsv4-dpa8`) | The scheduling-parity test: one workload (`python -m atom.compass.parity.traffic`) on a real `-tp 2 --enable-dp-attention` server (`CONFIG=tp2-plain`: `-tp 2` alone; `CONFIG=dsv4-dpa8`: DeepSeek-V4-Pro's nightly `-tp 8 --enable-dp-attention --enable-tbo` server) with the step record on, then on a simulated one whose steps each end when the real one's did (`atom/compass/parity/replay.py`; `step_stub` prices their device time into the cost record only), and `python -m atom.compass.parity` over the two records. With `STORE` unset it first runs `compass measure memory` on the real run's GPUs, flags and environment into `OUT_DIR/store`, under `LMCACHE=1` with an lmcache server of its own beside it, and the simulated run reads that store. The last lines are the real run's admission (send to response headers: minimum, median, maximum) and, per DP rank, the steps compared, the steps identical and the first divergence. Its variables are in its header. |
@@ -677,8 +678,8 @@ this node, in two checks: check 1, that `cctraces_sim.sh` handed the run file a
 `compass run` kept schedules the same steps; check 2, the cell graded against real
 runs. Run everything from one tree, `$T` below, in the GPU container: host laws are
 keyed by ATOM's source, so records, fits and runs from two trees refuse each other.
-In the image, `compass` is `PYTHONPATH=$T python3 -c 'from atom.compass.cli import
-main; main()'`, run from `/`, so every path it takes is absolute. Below, `$ATOM` is
+In the image, `compass` is `$T/scripts/compass/compass`, linked anywhere, and `python -m`
+runs with `PYTHONPATH=$T`, both from `/` so every path is absolute. Below, `$ATOM` is
 `--model <Qwen3.8-27B> --max-model-len 262144`, `$M` is `--machine
 $T/scripts/compass/machines/mi308x-hjbog39.json`, `$R` is a directory under `/data`
 or `/tmp` and `$S` is `--store $R/store`, empty at the start. The raw export keeps
@@ -708,8 +709,7 @@ which no cache directory above holds.
 1. `compass measure memory --gpu G $M $S --out $R/mem -- $ATOM`.
 2. Calibration, alone on the node: per concurrency 1, 4, 16, 64 and 256,
    `compass record --gpu G --out $R/cal/c<C> -- $ATOM` and `client.sh $R/cal/c<C>
-   --traces 256-392 --concurrency <C> --stop`, then
-   `python -m atom.compass.parity.recurrence $R/cal/c<C>/steps`.
+   --traces 256-392 --concurrency <C> --stop`.
 3. `compass fit steps --backend step-linear --form history $R/cal/c* --client-run
    $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M $S --out $R/fit` and
    `compass fit host` on the same inputs; each prints its store token.
@@ -719,8 +719,12 @@ which no cache directory above holds.
 5. `compass run --step-linear LAW --host-laws HOST $M $S --out
    $R/cell/c<C>/step_linear -- $ATOM`, with `client.sh $R/cell/c<C>/step_linear
    --traces 0-255 --concurrency <C> --stop`.
-6. Check 2: `python -m atom.compass.validate $R/cell/c<C>`.
-7. Check 1: `cctraces_sim.sh` with `RUN_FILE` the `run_file` of
+
+Developer checks, outside the `compass` path:
+- After step 2: `python -m atom.compass.parity.recurrence $R/cal/c<C>/steps`.
+- Check 2, after steps 5 and 9: `python -m atom.compass.validate $R/cell/c<C>`;
+  after step 9 it reads the bundle from the store the run file names, by key and digest.
+- Check 1: `cctraces_sim.sh` with `RUN_FILE` the `run_file` of
    `$R/cell/c<C>/step_linear/run.json`, `FIRST_SESSION=0 SESSIONS=256
    CONCURRENCY=<C>`, `SERVER_ARGS="--max-model-len 262144"`, `AIPERF_EXTRA_ARGS` the
    warmup arguments; then `python -m atom.compass.parity
@@ -744,25 +748,23 @@ and no margin:
  "decode": {"c": [0, 1, 2, 4, ..., 131072]}, "margin": 0}
 ```
 
-8. Per concurrency, `compass trace steps --step-linear LAW --host-laws HOST $M $S
+6. Per concurrency, `compass trace steps --step-linear LAW --host-laws HOST $M $S
    --out $R/pop/<traces>/c<C> -- $ATOM`, with `client.sh $R/pop/<traces>/c<C>
    --traces <traces> --concurrency <C> --stop`, `<traces>` 256-392 and 0-255; its
    stop publishes a `shape_population`, `POP` below.
-9. `compass measure steps --grid POP... --grid-definition $G --client-run POP
+7. `compass measure steps --grid POP... --grid-definition $G --client-run POP
    $R/pop/<traces>/c<C>/artifacts/client_run.json ... --sampling '{"ignore_eos":
    true}' --gpu G $S --out $R/grid -- $ATOM`. The deep-context prefill corners
    take most of its hours. Several GPUs each take a subset of the populations
    into a store of its own, starts a minute apart; copying each store's
    `step_measurement` entries into one, and this step again over every
    population, measures what remains.
-10. `compass fit steps --backend step-grid --grid POP... --grid-definition $G
+8. `compass fit steps --backend step-grid --grid POP... --grid-definition $G
     $R/cal/c* --client-run ...`, naming every population and record, `$M $S --out
     $R/fit-grid`; it prints the bundle's token. A second fit of one definition
     into one store is refused as an overwrite: refit into a fresh store.
-11. `compass run --step-grid BUNDLE --host-laws HOST --coverage $R/cell/c<C>/real*
+9. `compass run --step-grid BUNDLE --host-laws HOST --coverage $R/cell/c<C>/real*
     $M $S --out $R/cell/c<C>/step_grid -- $ATOM`, serving the same client run as
     step 5. The check counts the real steps the bundle covers, extrapolates past
     the residual's hull or the KV pool, and leaves to the step roofline; grading
     takes only a run that ran it.
-12. `python -m atom.compass.validate $R/cell/c<C>`, which reads the bundle from
-    the store the run file names, by key and digest.
