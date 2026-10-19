@@ -9,6 +9,10 @@ your `$PWD`, so the copy in a worktree exercises that worktree. Run **your**
 tree's copy: running another checkout's copy is refused rather than silently acted
 on, because until 2026-09-20 it was not — see "Which tree a script acts on" below.
 
+New to Compass? [QUICKSTART.md](QUICKSTART.md) takes a model from an empty store
+to a simulation graded against real runs, and `smoke_cell.sh` runs that path in
+about an hour.
+
 | Script | Where | What |
 |---|---|---|
 | `gate_cpu.sh` | CPU container | The CPU gate, run per task: every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, no driver **as a batch**: run alone, a file in it can still reach `rocminfo` (`tests/test_postprocess_width.py` did, through `atom.model_engine.model_runner`'s `from aiter import …`, measured on node 18 at `bdd244c57` while it was in the gate). **Must be green.** Also exits 98 when the diff is in the blind spot below and the GPU gate has not run on *this* tree. Refuses a caller-supplied `-r`. |
