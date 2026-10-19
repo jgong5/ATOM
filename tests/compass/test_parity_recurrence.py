@@ -104,6 +104,53 @@ def test_every_kind_can_pass_while_the_run_total_still_fails():
     assert not report["pass"]
 
 
+def test_one_middle_chunk_outside_the_band_fails_its_kind_of_nine():
+    """Ten chunks of one request, 1 ms of device work each, 4 ms apart; the
+    seventh waits 0.15 ms at a staging gate no rule predicts. Interpolated,
+    the nine middle chunks' p10 is -0.72% and the kind would pass."""
+    steps = []
+    for n in range(10):
+        enter = 4 * n + 0.15 * (n > 6)
+        wait = 0.15 * (n == 6)
+        launch = (enter + wait + 1, enter + wait + 2)
+        rows = [[50, 50 * (n + 1), False]]
+        s = line(n, rows, False, enter, (enter, enter + wait), launch, None, 0)
+        s["t_exit_ns"], s["d_busy_ns"] = (launch[1] + 1) * MS, MS
+        steps.append(s)
+    report = recurrence.check(steps)
+    n, p10, *_, ok = report["kinds"]["middle"]
+    assert (n, p10, ok) == (9, pytest.approx(100 * (4 / 4.15 - 1)), False)
+    [(step, kind, *_)] = report["failures"]
+    assert (step, kind) == (6, "middle") and not report["pass"]
+
+
+def test_one_decode_released_early_fails_its_kind_of_ten():
+    """The record's decode, then nine whose receives end with the device but
+    the sixth's 0.3 ms early: charged +3.09%; interpolated, p90 is +0.31%."""
+    steps, exit_ = record()[:4], 32
+    for i in range(9):
+        enter, launch = exit_ + 1, (exit_ + 2, exit_ + 3)
+        recv = (launch[1], enter + 8 - 0.3 * (i == 5))
+        steps.append(
+            line(
+                4 + i,
+                [[1, 152 + i, True]],
+                True,
+                enter,
+                (enter,) * 2,
+                launch,
+                recv,
+                recv[1] + 1,
+            )
+        )
+        exit_ = recv[1] + 1
+    report = recurrence.check(steps)
+    n, *_, p90, _, ok = report["kinds"]["decode"]
+    assert (n, p90, ok) == (10, pytest.approx(100 * (10 / 9.7 - 1)), False)
+    [(step, kind, *_)] = report["failures"]
+    assert (step, kind) == (9, "decode") and not report["pass"]
+
+
 def test_a_record_without_device_windows_is_refused():
     steps = record()
     del steps[2]["d_busy_ns"]
