@@ -296,9 +296,9 @@ reads about 1. The card's PTL state is read and keyed as
 [#1434](https://github.com/jgong5/ATOM/issues/1434) rules.
 
 **Points, planned from the steps of record directories (D37).** Per leaf: every decode rung; prefill rows on
-a ladder of chunk remainders, a kind that depends on context also over a ladder of the
-rows' cached tokens, each count twice the last: at one query length and kernel, attention
-time is linear in cached tokens, and a kernel change still densifies; attention's context features chosen per kind by data, under
+a ladder of chunk remainders, a kind that depends on context also over the same ladder of
+the rows' cached tokens: a ladder twice as wide missed a same-kernel attention midpoint by
+1.0%, its repeats spreading 0.4% ([#1620](https://github.com/jgong5/ATOM/issues/1620)); attention's context features chosen per kind by data, under
 [#941](https://github.com/jgong5/ATOM/issues/941)'s rule. MoE leaves run on independent
 uniform routing. Each point records the kernels the leaf launched there, its kernel
 identity.

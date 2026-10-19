@@ -212,7 +212,8 @@ def test_a_plan_measures_prefill_attention_over_cached_tokens_and_coverage_reads
         ([[1, 1000, True], [1, 3000, True]], 2),
         ([[40, 40, False]], None),
         ([[100, 2100, False]], None),
-        ([[100, 3100, False]], None),  # 3000 is under twice 2000: off the ladder
+        ([[100, 2500, False]], None),  # 2400 is under 1.25 times 2000: off the ladder
+        ([[100, 3100, False]], None),
         ([[150, 8150, False]], None),
     )
     records = _plan(bench, tmp_path, plan)
@@ -224,7 +225,7 @@ def test_a_plan_measures_prefill_attention_over_cached_tokens_and_coverage_reads
     # Every token count over the cached ladder, halved to 4999 | 5000.
     assert set(attn) == {f"prefill T={t} B=1" for t in (40, 100, 150)}
     for cached in attn.values():
-        assert {None, 2000, 4999, 5000, 8000} <= cached and 3000 not in cached
+        assert {None, 2000, 3000, 4999, 5000, 8000} <= cached and 2400 not in cached
         assert len(cached) < 20
     # GEMM does not depend on context: its prefill points stay fresh.
     gemm = [r for r in records if r["op"] == "aiter.gemm"]

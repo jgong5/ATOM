@@ -57,11 +57,10 @@ highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
 and each prefill family (`_family`) over a ladder of their token counts, chunk
 remainders among them, one of a kind that depends on context at each over a
-ladder, each `CACHED_STEP` times the last, of the cached tokens of steps of
-its rows; then the point halfway between two neighbours of a family, or of a
-prefill leaf's token count over cached tokens, that launched different
-kernels, until they are adjacent. DIR gets each round's ops.jsonl in
-`round<n>`, and every point held in plan.jsonl.
+ladder of the cached tokens of steps of its rows; then the point halfway
+between two neighbours of a family, or of a prefill leaf's token count over
+cached tokens, that launched different kernels, until they are adjacent. DIR
+gets each round's ops.jsonl in `round<n>`, and every point held in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
 covers (`coverage`), and prints the count by phase and why each leaf kind
@@ -764,10 +763,6 @@ def publish(store, key, config, run: dict, command: str, results, out: Path):
 
 #: A ladder keeps a value only this many times the last it kept, and the largest.
 LADDER_STEP = 1.25
-#: The cached-token ladder's step: at one token count and kernel, attention's
-#: time is linear in cached tokens, so a wider step loses nothing between
-#: points of one kernel, and a kernel change still densifies.
-CACHED_STEP = 2
 #: The spread of a leaf's cold times across contexts, over the largest, past
 #: which its kind depends on context; a repeat's spread stays within 4%.
 CONTEXT_MOVES = 0.10
@@ -839,7 +834,7 @@ def plan(store, key, config, run, args, command: str, out: Path) -> None:
         for tokens in _ladder(at):
             shape, op, sig = at[tokens]
             want[shape, None].add(fam)
-            for c in _ladder(cached[shape.seqs], CACHED_STEP) if _cut(fam) else ():
+            for c in _ladder(cached[shape.seqs]) if _cut(fam) else ():
                 if c:
                     want[shape, c].add(_family(shape, c, op, sig, dependent)[0])
     n = 1
@@ -949,12 +944,12 @@ def _cached(line) -> tuple[int, int]:
     return sum(cached) // len(cached), max(cached)
 
 
-def _ladder(values, step=LADDER_STEP) -> list:
-    """`values` in order, each kept only `step` times past the last kept,
+def _ladder(values) -> list:
+    """`values` in order, each kept only `LADDER_STEP` past the last kept,
     and the largest."""
     kept = []
     for v in sorted(set(values)):
-        if not kept or v >= kept[-1] * step:
+        if not kept or v >= kept[-1] * LADDER_STEP:
             kept.append(v)
     return kept + [v] if kept[-1] != v else kept
 
