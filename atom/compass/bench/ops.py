@@ -229,7 +229,9 @@ def _parser() -> argparse.ArgumentParser:
 
 def graph(store, config, shape) -> dict:
     """The `op_graph` `trace ops` published for `config` at `shape` on this GPU's
-    arch, as JSON."""
+    arch, of a step that produces output, as JSON: a prefill that produces none
+    runs the same leaves less the LM head and the sampler, so this graph's
+    points cover both."""
     from atom.compass.capture.forward import structure
 
     key = Key.of(

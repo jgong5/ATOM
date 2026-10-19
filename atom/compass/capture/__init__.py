@@ -14,7 +14,9 @@ into `Repeat` and forked streams into `Par` (`graph`).
 
 An `op_graph` is keyed by structure (`forward.structure`: the model's
 architecture and config.json digest, `--arch`, the TP width, the DP and EP widths when
-set, the phase and the mode) and by shape. ATOM's engine arguments after `--`
+set, the phase, the mode and whether the step produces output) and by shape:
+a prefill shape is published twice, as a middle chunk, which samples nothing,
+and as a final one. ATOM's engine arguments after `--`
 configure the engine as they would a server's; `--arch` names the declared
 device, which the entry also states as its `device` condition: a store holds a
 graph per arch of one structure and shape. Its members are
