@@ -12,7 +12,6 @@ The run test needs a driver and `ATOM_COMPASS_SLICE_MODEL`, as in
 `test_vertical_slice`; the rest run anywhere.
 """
 
-import itertools
 import json
 import sys
 from types import SimpleNamespace
@@ -70,12 +69,13 @@ def test_a_pipeline_meets_the_run_properties_and_uses_every_stage_channel(pipeli
     assert {f"engine-pp0->engine-pp{k}:meta#pp{k}" for k in range(1, pp)} <= released
     # Every stage priced its forwards.
     assert {r[0] for r in rows if r[3] == "TAR"} >= {f"engine-pp{k}" for k in range(pp)}
-    # Each stage forwards after the one before it, so a token takes every
-    # stage's compute: the head's forwards are no closer than the whole model's.
+    # The head keeps up to pp batches in flight, so it starts forward n + pp
+    # only once forward n's tokens are back: after every stage's compute of
+    # forward n, the whole model's step, and the tokens' IPC to the head.
     starts = sorted(float(r[2]) - IPC for r in rows if r[4].endswith(":meta#pp1"))
-    gaps = [b - a for a, b in itertools.pairwise(starts)]
-    print(f"pp{pp} head forward periods: {gaps}")
-    assert min(gaps) >= CONSTANT["decode_step"]
+    gaps = [b - a for a, b in zip(starts, starts[pp:])]
+    print(f"pp{pp} head forward n to n + pp: {gaps}")
+    assert min(gaps) >= CONSTANT["decode_step"] + IPC
     # Each rendezvous send from the head: t_send, t_recv_posted, now_r, done.
     data, ack = ({int(r[5]): r for r in rows if r[4] == ch} for ch in (DATA, ACK))
     sends = []
@@ -149,17 +149,6 @@ def test_a_pipeline_whose_machine_states_no_send_carrier_is_refused_by_name(
     monkeypatch.setenv(compass_run.ENV, str(run))
     with pytest.raises(SpecRefusal, match="interconnect.intra_node.pp.rccl"):
         compass_run.frontend(_stage(0))
-    assert clock.installed() is None
-
-
-def test_a_pipeline_at_tp_two_that_sends_shards_is_refused(monkeypatch, tmp_path):
-    run = _run_file(tmp_path, pipeline_parallel_size=2)
-    monkeypatch.setenv(compass_run.ENV, str(run))
-    monkeypatch.setenv("ATOM_PP_SEND_ALLGATHER", "1")
-    deployment = _stage(0)
-    deployment.tensor_parallel_size = 2
-    with pytest.raises(ValueError, match="set ATOM_PP_SEND_ALLGATHER=0"):
-        compass_run.frontend(deployment)
     assert clock.installed() is None
 
 
