@@ -184,6 +184,19 @@ def test_an_all_to_all_sends_all_but_its_own_split():
         work(op([]), ONE, 1, "bf16")
 
 
+def test_a_hashed_route_does_not_count_its_whole_table():
+    op = leaf(
+        "atom.model_ops.triton_hash_topk:hash_topk_triton",
+        ids=t([8], I32),
+        gating_output=t([8, 16]),
+        tid2eid=t([129280, 2], I32, role="weight"),
+        out_ids=t([8, 2], I32),
+        out_weights=t([8, 2], F32),
+    )
+
+    assert work(op, ONE, 1, "bf16") == Work({}, 8 * 4 + 8 * 16 * 2 + 8 * 2 * 8)
+
+
 def test_an_index_build_is_one_launch():
     op = leaf(
         "atom.model_ops.v4_kernels.paged_decode_indices:build_v4_paged_decode_indptr",
