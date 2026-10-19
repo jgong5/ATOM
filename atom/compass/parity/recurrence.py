@@ -5,8 +5,9 @@
 
 `HostDeviceRecurrence` charges each forward with `d_busy_ns` as its device
 time, plus `d_gap_ns` on a decode, and its line's host segments: `E` from the previous exit to the entry,
-`W_pre` to the launch less the staging gate's and MTP status waits, `W_launch`, and `W_post`
-from the launch to the exit less the recv and draft copy waits; with
+`W_pre` to the launch less the staging gate's and MTP status waits, `W_launch` to the
+recv wait (the sampler's launch included), and `W_post` from the recv wait to the exit
+less the draft copy wait; with
 `d_target_ns`, under MTP, the rest of `d_busy_ns` is draft, `W_inputs` is the part of
 `W_pre` after the MTP status wait, and no `d_gap_ns` is fed. Each forward is called at the
 exit predicted for the one before, so only the waits and device times move it.
@@ -17,12 +18,15 @@ carriers when one is given:
     python -m atom.compass.parity.recurrence RECORD_DIR MACHINE_JSON ROW_BYTES
 
 `ROW_BYTES` is one token's `hidden_states` in bytes, the hidden size times
-the model's dtype size.
+the model's dtype size. The carriers price whole tensors with no all-gather,
+so a record whose `.engine.json` states TP above 1 is refused there.
 
 Per kind (decode, output prefill, middle chunk, and idle: sharing no request
 with the forward before), p10 and p90 of charge over measured exit-to-exit
 period, less one, in percent, lie within `STEP_BAND`, the run total within
-`TOTAL_BAND`.
+`TOTAL_BAND`. Each percentile is a step's own value, the one on the outer side
+where it would fall between two, so a kind of ten steps or fewer passes only
+if every step is in the band.
 A failing kind's steps outside the band are named with their residual, the
 device work queued at their launch, and their recv release less the measured.
 A sending stage names the steps where the flush it infers and the record's
@@ -152,7 +156,7 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
                 )
             called = max(now, (held[n][1] - origin) * 1e-9)
         pre = l0 - s["t_enter_ns"] - (g1 - g0) - (m1 - m0)
-        post = s["t_exit_ns"] - l1 - (r1 - r0) - (d1 - d0)
+        post = s["t_exit_ns"] - r1 - (d1 - d0)
         entry = max(called + e * 1e-9, rec.ends[0])
         # The last send settled: the one before the last, or the last if flushed.
         flushed = called - now > (IDLE_FLUSH_S if stage and stage[0] else 0)
@@ -173,7 +177,7 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
                 tensors = [("rccl", sum(r[0] for r in s["rows"]) * width)] * 2
                 posted = max(sent, rec.ends[-1], hold)
                 done, ready = recv_done(models, max(ready, done), posted, tensors)
-        launch = l1 - l0 - (p1 - p0)
+        launch = r0 - l0 - (p1 - p0)
         law = {"E": e, "W_pre": pre - (l0 - m1), "W_launch": launch, "W_post": post}
         law |= {"W_inputs": l0 - m1, "W_recv": p0 - l0}
         law = {g: (v * 1e-9, 0, 0) for g, v in law.items()}
@@ -215,7 +219,8 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
     for k in KINDS:
         if err := [r[2] for r in rows if r[1] == k]:
             r1 = [r[5] for r in rows if r[1] == k and r[5] is not None]
-            p10, p50, p90 = np.percentile(err, (10, 50, 90))
+            p10 = np.percentile(err, 10, method="lower")
+            p50, p90 = np.median(err), np.percentile(err, 90, method="higher")
             ok = bool(-STEP_BAND <= p10 and p90 <= STEP_BAND)
             kinds[k] = (len(err), p10, p50, p90, np.median(r1) if r1 else None, ok)
     span = (steps[-1]["t_exit_ns"] - steps[0]["t_enter_ns"]) * 1e-9
@@ -239,6 +244,15 @@ def main(record: str, machine=None, row_bytes=None) -> int:
     while more := read(record, len(stages)):
         stages.append(more)
     pp, runs = len(stages), []
+    engines = [json.loads(p.read_text()) for p in Path(record).glob("*.engine.json")]
+    tp = max((e["tensor_parallel_size"] for e in engines), default=1)
+    # ponytail: ATOM_PP_SEND_ALLGATHER=0 is refused too, since the record does
+    # not state it; price shards and gathers as `StageSends.receive` once one is gated.
+    if carriers and pp > 1 and tp > 1:
+        raise ValueError(
+            f"{record} ran at TP {tp}: each stage sends shards its receiver "
+            "all-gathers, and the gate prices whole tensors with no all-gather"
+        )
     for rank, steps in stages[0].items():
         reports = (
             pipeline([d[rank] for d in stages], carriers) if pp > 1 else [check(steps)]

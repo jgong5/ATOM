@@ -23,28 +23,32 @@ builds its metadata and forward context, and the stub calls each leaf from its
 contract: an activation is random at its shape, dtype and stride; a weight is
 a tensor of the model of that shape, dtype and stride; a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
-the token ids ATOM passes the forward (`TOKEN_IDS`); a module or context key
-is the one each instance names. A leaf whose operator cannot run so refuses
-by name, a KV tensor argument among them.
+the token ids ATOM passes the forward (`TOKEN_IDS`); an integer the capture
+found affine in a decode step's context is taken at the point's; a module or
+context key is the one each instance names. A leaf whose operator cannot run so
+refuses by name, a KV tensor argument among them.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, the tensors
 of each module it names and, for a leaf that names a context key, the KV and
 per-request state its layer holds for the batch. One graph runs the leaf K
-times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of one
-eager call of copy 0, the fewer, at least one, cycling over N copies, N the
-least whose bytes pass `COLD` times the last-level cache and, for a context
-key, at least its I instances (at most K). Copy c takes fresh activations,
+times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
+kernels of one eager call of copy 0, the fewer, at least one, cycling over its
+copies: N built ones: M, the least count whose bytes pass `COLD` times the
+last-level cache, raised for a context key to its I instances (at most K),
+then, up to the most weights the model holds of a weight argument's spec (at
+most K), copy c mod N with the c-th weights on that copy's other arguments.
+Copy c < N takes fresh activations below M and copy c mod M's from there,
 the c-th of the model's weights of that spec (a clone past the last), and
 instance c mod I at placement (c div I) mod P, its metadata and module
 tensors cloned past the first round: a placement is the point's batch on KV
 blocks and state slots of its own, for which ATOM builds the forward context
-again. A second graph runs copy 0 K times, warm; with one copy, or K under
-`CALLS`, there is none.
+again, cloned where it differs from the last placement's. A second graph runs
+copy 0 K times, warm; with one copy, or K under `CALLS`, there is none.
 Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
 idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
-kernel times 0. The kernels one eager call of copy 0 launches are the point's
-kernel identity. A batch the KV pool cannot place refuses its leaves.
+kernel times 0. The kernels one eager call of copy 0 launches, memory copies
+aside, are the point's kernel identity. A batch the KV pool cannot place refuses its leaves.
 
 DIR gets run.json, the run's identity, and ops.jsonl, one line per point. S
 gets each measured point as an `op_measurement`, keyed by the model, the
@@ -105,7 +109,8 @@ from atom.compass.capture.forward import _weights
 from atom.compass.drive.gpu import add_gpu_flag
 
 PROG = "compass measure ops"
-#: The timing protocol's version; it changes whenever a count below does.
+#: The timing protocol's version; it changes whenever a count below or the
+#: copies a graph reads change.
 PROTOCOL = 6
 WARMUPS = 3
 REPEATS = 20
@@ -243,7 +248,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def graph(store, config, shape) -> dict:
-    """The `op_graph` `trace ops` published for `config` at `shape`, as JSON."""
+    """The `op_graph` `trace ops` published for `config` at `shape` on this GPU's
+    arch, as JSON."""
     from atom.compass.capture.forward import structure
 
     key = Key.of(
@@ -339,6 +345,7 @@ class Stub:
     def __init__(self, runner, llc: int) -> None:
         self.runner, self.llc = runner, llc
         self.weights, self.leaves, self.placed = {}, {}, []
+        self.cold_copies, self.clones = {}, {}
         for t in _weights(runner.model):
             if t.device.type != runner.device.type:
                 continue
@@ -372,10 +379,13 @@ class Stub:
                         meta[sig, path] = name, _clone(view)
                     except ValueError as error:  # the leaf refuses, not the step
                         meta[sig, path] = str(error), None
+        # one clone across placements of what none changed: a leaf may cache
+        # what it prepares on the host by its identity (linear attention's
+        # chunk indices), and a graph over placements replays all of it
         memo: dict = {}
         snap = copy.copy(fc)
-        snap.attn_metadata = _deep(fc.attn_metadata, memo)
-        snap.context = _deep(fc.context, memo)
+        snap.attn_metadata = _deep(fc.attn_metadata, memo, self.clones)
+        snap.context = _deep(fc.context, memo, self.clones)
         self.placed.append((snap, meta))
         hidden = self.runner.config.hf_config.get_text_config().hidden_size
         dtype = self.runner.config.torch_dtype
@@ -396,21 +406,23 @@ class Stub:
             s: self._plan(op, i, kv, blocks, len(rows)) for s, (op, i) in found.items()
         }
         need = max(p for _, _, p in plans.values())
-        self.leaves, self.placed = found, []
+        self.leaves, self.placed, self.context, self.clones = found, [], context, {}
+        self.cold_copies = {s: self._cold(size) for s, (_, size, _) in plans.items()}
         for p in range(max(min(need, *room), 1)):
             self.runner.forward(rule.batch(view, p * blocks, p * len(rows)))
         got = []
         for sig, (op, inst) in found.items():
             n, size, _ = plans[sig]
             names = {p: m[0] for (s, p), m in self.placed[0][1].items() if s == sig}
-            print(f"{shape}: {op['op']} over {n} copies {names or ''}", flush=True)
             record = {"shape": str(shape), "context": context, "op": op["op"]}
             record |= {"leaf": sig, "metadata": names, "rows": rows}
             try:
                 record |= self._time(op, sig, inst, n)
-                record["footprint_bytes"] = record["copies"] * size
+                record["footprint_bytes"] = min(n, record.get("copies", n)) * size
             except Exception as error:  # noqa: BLE001 - a refusal names what stopped it
                 record["refused"] = f"{type(error).__name__}: {error}"
+            copies = record.get("copies", n)
+            print(f"{shape}: {op['op']} over {copies} copies {names or ''}", flush=True)
             got.append(
                 record | {"instances": len(inst), "placements": len(self.placed)}
             )
@@ -433,25 +445,46 @@ class Stub:
                 need = None
             elif key in self.modules:
                 size += sum(t.nbytes for t in _own(self.modules[key]))
-        n = min(CALLS, COLD * self.llc // size + 1) if size else 1
+        n = self._cold(size)
         if need is None:  # cycle over every instance's state, which is held anyway
             n = min(CALLS, max(n, len(instances)))
         return n, size, need or -(-n // len(instances))
 
+    def _cold(self, size) -> int:
+        """Copies of `size` bytes a call whose bytes pass `COLD` times the cache."""
+        return min(CALLS, COLD * self.llc // size + 1) if size else 1
+
     def _time(self, op, sig, instances, n) -> dict:
-        """`op` timed cold over at most `n` copies and, in a graph of `CALLS`
-        calls, warm over one, with its kernels."""
+        """`op` timed in a graph of K calls, `CALLS` or as many as fill
+        `GRAPH_NS`, cold over at most `n` copies, past the first `m` its point
+        sized to the cache (`cold_copies`) each on copy `c mod m`'s
+        activations, then copy `c mod n` with the c-th weight up to every
+        weight the model holds of its spec, at most K; and, when K is `CALLS`,
+        warm over one; with its kernels."""
         from atom.utils import forward_context
 
-        fn = _function(op["op"])
+        fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
         calls = [self._copy(op, sig, instances, 0)]
+        # one weight can read a few percent off another of its spec, and every
+        # one is held anyway: cycle them all, on the n copies' other arguments
+        held = [
+            len(self.weights.get(_spec_of(s), ()))
+            for _, s in _specs(op["args"])
+            if s["role"] == "weight"
+        ]
         try:
             forward_context._forward_context = calls[0][1]
             fn(**calls[0][0])  # compiles and tunes outside the graphs
             kernels, ns = _kernels(fn, calls[0][0])
             k = min(CALLS, max(int(GRAPH_NS // ns), 1)) if ns else CALLS
             n = min(n, k)
-            calls += [self._copy(op, sig, instances, c) for c in range(1, n)]
+            calls += [self._copy(op, sig, instances, c) for c in range(1, min(n, m))]
+            calls += [
+                self._copy(op, sig, instances, c, calls[c % m]) for c in range(m, n)
+            ]
+            for c in range(n, min(k, max([n, *held]))):
+                calls.append(self._reweigh(op, calls[c % n], c))
+            n = len(calls)
             cycle = [calls[i % n] for i in range(k)]
             cold = _replay(fn, cycle)
             warm = _replay(fn, calls[:1] * k) if n > 1 and k == CALLS else None
@@ -471,28 +504,50 @@ class Stub:
             "protocol": PROTOCOL,
         }
 
-    def _copy(self, op, sig, instances, c):
-        """Copy `c` of `op`'s call: its keyword arguments and forward context."""
+    def _copy(self, op, sig, instances, c, like=None):
+        """Copy `c` of `op`'s call: its keyword arguments and forward context,
+        on the activations of copy `like` when given."""
         instance = instances[c % len(instances)]
         p = c // len(instances) % len(self.placed)
         snap, meta = self.placed[p]
         fresh = c >= len(self.placed) * len(instances)
 
-        def build(path, value):
+        def build(path, value, old):
             if isinstance(value, list):
-                return [build(f"{path}.{i}", v) for i, v in enumerate(value)]
+                return [
+                    build(f"{path}.{i}", v, old and old[i]) for i, v in enumerate(value)
+                ]
+            if isinstance(value, dict) and value.get("role") == "activation" and like:
+                return old
             if _ref(value) and "module" in value:
                 module = self.modules[instance[path]]
                 return _module_copy(module) if fresh else module
             if _ref(value):
                 return instance[path]
+            if isinstance(value, dict) and "affine" in value:
+                return ir.Affine(*value["affine"]).at(self.context)
             if isinstance(value, dict):
                 return self._tensor(value, meta.get((sig, path)), c, fresh)
             if isinstance(value, str) and value.startswith("torch."):
                 return getattr(torch, value[6:], value)
             return value
 
-        return {s: build(s, v) for s, v in op["args"].items()}, snap
+        args = op["args"].items()
+        return {s: build(s, v, like[0][s] if like else None) for s, v in args}, snap
+
+    def _reweigh(self, op, like, c):
+        """Copy `like` of `op`'s call with the c-th weight of each weight
+        argument's spec, its other arguments and forward context shared."""
+
+        def build(value, old):
+            if isinstance(value, list):
+                return [build(v, o) for v, o in zip(value, old)]
+            if isinstance(value, dict) and value.get("role") == "weight":
+                return self._tensor(value, None, c, False)
+            return old
+
+        kwargs, snap = like
+        return {s: build(v, kwargs[s]) for s, v in op["args"].items()}, snap
 
     def _tensor(self, spec, meta, c, fresh):
         role = spec["role"]
@@ -580,15 +635,19 @@ def _function(name: str):
 
 
 def _kernels(fn, kwargs) -> tuple[list[str], float]:
-    """The device activity one call of `fn` launches, in order, and its device
-    time in ns."""
+    """The kernels one call of `fn` launches, in order, and their device time
+    in ns: its device activity except memory copies, which the profiler
+    records at some calls of a leaf and misses at others."""
     from torch.profiler import ProfilerActivity, profile
 
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         fn(**kwargs)
         torch.cuda.synchronize()
     device = [
-        e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+        e
+        for e in prof.events()
+        if e.device_type == torch.autograd.DeviceType.CUDA
+        and not e.name.startswith("Memcpy")
     ]
     device.sort(key=lambda e: e.time_range.start)
     ns = 1e3 * sum(e.time_range.elapsed_us() for e in device)
@@ -668,22 +727,29 @@ def _clone(t) -> torch.Tensor:
     return flat.as_strided(t.shape, t.stride())
 
 
-def _deep(x, memo):
+def _deep(x, memo, clones=None):
     """`x` with every tensor it reaches through dataclasses, ATOM objects,
-    dicts and lists cloned, aliases kept."""
+    dicts and lists cloned, aliases kept; with `clones`, a tensor whose values
+    have not changed since the last clone of its live view takes that clone."""
     if id(x) in memo:
         return memo[id(x)]
     if torch.is_tensor(x):
-        memo[id(x)] = _clone(x)
+        key = x.data_ptr(), x.shape, x.stride(), x.dtype
+        twin = None if clones is None else clones.get(key)
+        if twin is None or not torch.equal(twin, x):
+            twin = _clone(x)
+        memo[id(x)] = twin
+        if clones is not None:
+            clones[key] = twin
     elif isinstance(x, dict):
-        memo[id(x)] = {k: _deep(v, memo) for k, v in x.items()}
+        memo[id(x)] = {k: _deep(v, memo, clones) for k, v in x.items()}
     elif isinstance(x, list):
-        memo[id(x)] = [_deep(v, memo) for v in x]
+        memo[id(x)] = [_deep(v, memo, clones) for v in x]
     elif dataclasses.is_dataclass(x) or type(x).__module__.startswith("atom.utils"):
         if not hasattr(x, "__dict__"):
             return x
         memo[id(x)] = twin = copy.copy(x)
-        vars(twin).update({k: _deep(v, memo) for k, v in vars(x).items()})
+        vars(twin).update({k: _deep(v, memo, clones) for k, v in vars(x).items()})
     else:
         return x
     return memo[id(x)]
@@ -1116,8 +1182,10 @@ def _capture(config, shapes, root) -> None:
     """`trace ops` of `shapes` into the store at `root`, in a process of its
     own that sees no GPU."""
     from atom.compass import capture
+    from atom.compass.capture.forward import device_arch
 
     argv = ["--model", config.model, "--tp", str(config.tensor_parallel_size)]
+    argv += ["--arch", device_arch()]
     for s in shapes:
         argv += ["--prefill", str(s.tokens)] if s.phase == "prefill" else ["--width"]
         argv.append(str(s.seqs))

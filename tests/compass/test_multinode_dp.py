@@ -30,13 +30,13 @@ from test_vertical_slice import (
     NEEDS_A_RUN,
     TREE,
     WALL_S,
-    _free_port,
     _run_file,
 )
 
 from atom.compass import run as compass_run
 from atom.compass.clock import LpId
 from atom.compass.detect.scenario import check_run
+from atom.compass.drive.serve import _free_ports
 from atom.compass.parity import read
 from atom.compass.runner import COMPASS_RUNNER_QUALNAME
 from atom.config import ParallelConfig
@@ -57,12 +57,13 @@ def _bound(port: int) -> bool:
     return True
 
 
-def _master_port() -> int:
-    """A DP master port whose engine sockets, 100 above it, are free too."""
+def _ports() -> list[int]:
+    """The clock, DP master, DP base and two server ports, drawn together; the
+    master's engine sockets, 100 above it, are free too."""
     while True:
-        port = _free_port()
-        if all(map(_bound, range(port + 100, port + 100 + 3 * DP))):
-            return port
+        ports = _free_ports(5)
+        if all(map(_bound, range(ports[1] + 100, ports[1] + 100 + 3 * DP))):
+            return ports
 
 
 def _wait_listening(endpoint: str, alive) -> None:
@@ -83,10 +84,15 @@ def _wait_listening(endpoint: str, alive) -> None:
 def run_two_trees(out: Path, seed: str) -> dict:
     """One run: the authority, then each node's API server, each its own tree."""
     out.mkdir()
+    clock_port, master_port, base_port, *ports = _ports()
+    endpoint = f"tcp://127.0.0.1:{clock_port}"
     run_file = _run_file(
-        out, data_parallel_size=DP, step_stub=CONSTANT, machine=MACHINE
+        out,
+        clock_endpoint=endpoint,
+        data_parallel_size=DP,
+        step_stub=CONSTANT,
+        machine=MACHINE,
     )
-    endpoint = json.loads(run_file.read_text())["clock_endpoint"]
     env = dict(
         os.environ,
         PYTHONHASHSEED=seed,
@@ -99,11 +105,10 @@ def run_two_trees(out: Path, seed: str) -> dict:
         *("--model", MODEL, "--host", "127.0.0.1", "-tp", "2"),
         *("--enable-dp-attention", "--enforce-eager", "--max-model-len", "2048"),
         *("--data-parallel-size", "2", "--data-parallel-size-local", "1"),
-        *("--data-parallel-master-port", str(_master_port())),
-        *("--data-parallel-base-port", str(_free_port())),
+        *("--data-parallel-master-port", str(master_port)),
+        *("--data-parallel-base-port", str(base_port)),
         *compass,
     ]
-    ports = [_free_port(), _free_port()]
     procs = []
 
     def start(name, *args):

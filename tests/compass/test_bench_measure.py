@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -492,6 +493,17 @@ def test_a_trace_its_export_gives_no_session_refuses_sessions(run, monkeypatch):
     rec, _, named = mixed(run, monkeypatch, lambda i: None if i == 1 else i)
     with pytest.raises(SystemExit, match=f"served {trace(1)}, which no export gives"):
         run(str(rec), "--sample", "all", "--sessions", "0:9", *named)
+
+
+@pytest.mark.parametrize("given", [(3, 7), (7, 3)])
+def test_a_trace_two_exports_give_two_sessions_refuses_in_either_order(run, given):
+    named = run.named(run.record)
+    for export, session in zip(named[2::3], given):
+        sent = json.loads(Path(export).read_text())
+        sent["sessions"] = {f"trace-{k}": k for k in range(4)} | {"trace-1": session}
+        Path(export).write_text(json.dumps(sent))
+    with pytest.raises(SystemExit, match="give trace-1 sessions 3 and 7, and"):
+        run(str(run.record), "--sample", "all", "--sessions", "0:4", *named)
 
 
 def test_a_deployment_above_tensor_parallel_1_refuses_naming_the_skew_issue(run):

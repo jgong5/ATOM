@@ -4,9 +4,7 @@
 An engine start needs a GPU, so the ranks' files stand in for one here: each
 is what `MemoryReadingModelRunner` writes as its rank starts, named by
 `run.memory`'s naming, holding the key its rank read off the resolved config,
-its engine and its readings. `measure_memory.publish` takes them from there,
-under the stack run.json's identity states, which these tests state as
-the suite's machine document pins it.
+its engine and its readings. `measure_memory.publish` takes them from there.
 
 The deployment is `test_run_step_grid`'s TP1 Qwen3.8-27B worker on the suite's
 machine document.
@@ -94,7 +92,7 @@ def test_each_rank_reads_its_own_member_of_the_entry_measure_memory_publishes(tm
     r = tp2(tmp_path)
     record = started(tmp_path / "out", r.config, [READINGS[2], RANK1])
 
-    measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c", STACK)
+    measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c")
 
     for rank, held in enumerate([READINGS[2], RANK1]):
         read = memory.load(tmp_path / "store", r.config, MACHINE, rank)
@@ -111,8 +109,8 @@ def test_each_rank_reads_its_own_member_of_the_entry_measure_memory_publishes(tm
 
 def a_start(tmp_path, monkeypatch, stack):
     """The suite's TP2 worker and `main`'s arguments for a start on GPU 5 under
-    `stack`, its engine and identity stood in for: the ranks write their files
-    as the engine starts, and run.json names `stack`."""
+    `stack`, its engine and identity stood in for: the command reads `stack`, the
+    ranks write their files as the engine starts, and run.json names `stack`."""
     r, out = tp2(tmp_path), tmp_path / "out"
 
     class Engine:
@@ -140,6 +138,7 @@ def a_start(tmp_path, monkeypatch, stack):
     monkeypatch.setattr(measure_memory, "_ptl", lambda gpus: "disabled")
     # rocm-smi GPU 5 as HIP device 2.
     monkeypatch.setattr(measure_memory, "hip_visible", {(5,): "2"}.get)
+    monkeypatch.setattr(measure_memory, "_stack", lambda: stack)
     monkeypatch.setattr(measure_memory, "identity", lambda *a: {"stack": stack})
     machine = tmp_path / "machine.json"
     machine.write_text(json.dumps(DOCUMENT))
@@ -199,7 +198,7 @@ def test_a_start_on_another_device_than_the_spec_states_refuses_naming_both(
     assert not (tmp_path / "out").exists() and not (tmp_path / "s").exists()
 
 
-def test_a_start_under_another_stack_than_the_spec_pins_publishes_nothing(
+def test_a_start_under_another_stack_than_the_spec_pins_refuses_before_it_starts(
     tmp_path, monkeypatch
 ):
     other = dict(STACK, aiter="9205e1059", torch="2.9.1")
@@ -209,11 +208,12 @@ def test_a_start_under_another_stack_than_the_spec_pins_publishes_nothing(
         measure_memory.main(argv)
 
     assert str(refused.value) == (
-        "the start ran another stack than the machine spec mi355x-8gpu-2node "
+        "the start runs another stack than the machine spec mi355x-8gpu-2node "
         "pins: aiter '9205e1059' in the start and 'f4e7c7509' in the spec; "
         "torch '2.9.1' in the start and '2.10.0' in the spec"
     )
-    assert not (tmp_path / "s").exists()
+    assert not (tmp_path / "hip").exists(), "the engine started"
+    assert not (tmp_path / "out").exists() and not (tmp_path / "s").exists()
 
 
 def test_the_engine_session_starts_the_command_beside_before_the_engine(
@@ -246,10 +246,11 @@ def test_the_engine_session_starts_the_command_beside_before_the_engine(
     assert started.value.args == (["lmcache", "server", "-p", "1"], {})
 
 
-def starts_autotuning(monkeypatch, r, out, autotuned):
-    """Engine starts that write each rank's file with the next count of kernels
-    inductor autotuned in `autotuned`, `non_torch` 12 MiB high when it is not
-    0; the environment each start was given."""
+def starts_autotuning(monkeypatch, r, out, autotuned, field="autotuned_kernels"):
+    """Engine starts that write each rank's file with the next count in
+    `autotuned` under `field`, kernels inductor autotuned unless named, and
+    `non_torch` 12 MiB high when it is not 0; the environment each start was
+    given."""
     left, envs = list(autotuned), []
 
     class Engine:
@@ -264,7 +265,7 @@ def starts_autotuning(monkeypatch, r, out, autotuned):
             ranks_wrote(out, r.config, [read] * 2)
             for rank in (out / measure_memory.READINGS).iterdir():
                 held = json.loads(rank.read_text())
-                rank.write_text(json.dumps(held | {"autotuned_kernels": tuned}))
+                rank.write_text(json.dumps(held | {field: tuned}))
 
         def wait(self, timeout=None):
             return 0
@@ -301,11 +302,58 @@ def test_a_second_start_that_autotunes_publishes_nothing(tmp_path, monkeypatch):
 
     assert str(refused.value) == (
         "readings.dp0of1.pp0of1.pcp0of1.tp0of2.json, "
-        "readings.dp0of1.pp0of1.pcp0of1.tp1of2.json autotuned kernels again on a "
+        "readings.dp0of1.pp0of1.pcp0of1.tp1of2.json missed inductor caches again on a "
         "second start; non_torch on a cold inductor cache reads high, so nothing is "
         "published"
     )
     assert not (tmp_path / "s").exists()
+
+
+def test_a_start_that_only_missed_the_fx_graph_cache_publishes_the_next_starts(
+    tmp_path, monkeypatch
+):
+    # On a cache a Compass-off start keyed, every graph misses; none autotunes.
+    r, argv = a_start(tmp_path, monkeypatch, STACK)
+    out = tmp_path / "out"
+    starts_autotuning(monkeypatch, r, out, [40, 0], "fxgraph_cache_misses")
+
+    measure_memory.main(argv)
+
+    read = memory.load(tmp_path / "s", r.config, MACHINE, 0).values
+    assert read["driver_and_collective_reserve_bytes"] == (
+        READINGS[2]["driver_and_collective_reserve_bytes"]
+    )
+
+
+def reading_runner(monkeypatch, model_runner):
+    """`memory_runner`, loaded over `model_runner` in place of ATOM's."""
+    engine = types.ModuleType("atom.model_engine.model_runner")
+    engine.ModelRunner = model_runner
+    monkeypatch.setitem(sys.modules, engine.__name__, engine)
+    path = Path(measure_memory.__file__).with_name("memory_runner.py")
+    spec = importlib.util.spec_from_file_location("reading_runner", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_reading_runner_writes_its_starts_fx_graph_cache_misses(
+    tmp_path, monkeypatch
+):
+    from torch._dynamo.utils import counters
+
+    runner = reading_runner(monkeypatch, object).MemoryReadingModelRunner()
+    runner.config, runner.rank = tp2(tmp_path).config, 0
+    runner._read = dict.fromkeys(
+        ["total", "non_torch", "loaded", "weights", "current", "peak"], 0
+    ) | {"warmup_tokens": 0, "num_kvcache_blocks": 1}
+    monkeypatch.setenv(measure_memory.OUT_ENV, str(tmp_path))
+    monkeypatch.setitem(counters["inductor"], "fxgraph_cache_miss", 40)
+
+    runner._write(None)
+
+    (written,) = tmp_path.glob("readings.*.json")
+    assert json.loads(written.read_text())["fxgraph_cache_misses"] == 40
 
 
 def test_the_reading_runner_warms_up_once_as_a_serving_start_does(monkeypatch):
@@ -320,14 +368,7 @@ def test_the_reading_runner_warms_up_once_as_a_serving_start_does(monkeypatch):
         def _maybe_warmup(self):
             warmups.append(self.forward(SimpleNamespace(total_tokens_num=16_384)))
 
-    engine = types.ModuleType("atom.model_engine.model_runner")
-    engine.ModelRunner = ModelRunner
-    monkeypatch.setitem(sys.modules, engine.__name__, engine)
-    path = Path(measure_memory.__file__).with_name("memory_runner.py")
-    spec = importlib.util.spec_from_file_location("reading_runner", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    runner = module.MemoryReadingModelRunner()
+    runner = reading_runner(monkeypatch, ModelRunner).MemoryReadingModelRunner()
     runner._read = {}
 
     runner._maybe_warmup()
@@ -365,9 +406,7 @@ def test_ranks_whose_reserves_spread_past_the_limit_publish_nothing(tmp_path):
     started(tmp_path / "out", r.config, [READINGS[2], crowded])
 
     with pytest.raises(SpecRefusal, match="spread"):
-        measure_memory.publish(
-            tmp_path / "out", MACHINE, tmp_path / "store", "c", STACK
-        )
+        measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c")
     assert not (tmp_path / "store").exists()
 
 
@@ -380,9 +419,7 @@ def test_ranks_that_read_two_configurations_publish_nothing(tmp_path):
     one.write_text(json.dumps(held))
 
     with pytest.raises(ValueError, match="the ranks read 2 keys"):
-        measure_memory.publish(
-            tmp_path / "out", MACHINE, tmp_path / "store", "c", STACK
-        )
+        measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c")
 
 
 def test_a_key_stating_another_layout_than_its_members_publishes_nothing(tmp_path):

@@ -174,47 +174,47 @@ PP = {
 #: Each derate is a reading over `DECLARED`'s peak.
 PEAKS = {
     "mi308x-hjbog18": (
-        "2026-10-18",
-        "347f5bcdd",
+        "2026-10-19",
+        "8c6fdc90b",
         {
-            "bf16": 268612779058716.53,
-            "fp8": 491258855184476.9,
+            "bf16": 268475551321345.22,
+            "fp8": 494223071135007.6,
             "bandwidth_curve": [
-                [4096, 2158866473.8772497],
-                [8192, 4315776622.192016],
-                [16384, 8629823253.168003],
-                [32768, 17253108088.676807],
-                [65536, 30279711843.07834],
-                [131072, 60502955989.42115],
-                [262144, 120815151122.93721],
-                [524288, 237295158987.3701],
-                [1048576, 453325655440.997],
-                [2097152, 861892287454.4998],
-                [4194304, 1395942726835.2988],
-                [8388608, 1963114394487.7944],
-                [16777216, 2500722601013.529],
-                [33554432, 2844669467186.9067],
-                [67108864, 3213380400772.1265],
-                [134217728, 3459254565659.331],
-                [268435456, 3580129945166.3345],
-                [536870912, 3657820717750.111],
-                [1073741824, 3662186989091.235],
-                [2147483648, 3670512192504.261],
-                [4294967296, 3670512192504.261],
+                [4096, 2150771370.8868217],
+                [8192, 4298607276.042466],
+                [16384, 8593158637.706385],
+                [32768, 17137416589.841352],
+                [65536, 32322051212.873974],
+                [131072, 64611604202.25433],
+                [262144, 120040546721.42656],
+                [524288, 258001269877.50293],
+                [1048576, 511282508162.2402],
+                [2097152, 960262991178.6322],
+                [4194304, 1596347426971.0535],
+                [8388608, 2351819077842.9453],
+                [16777216, 3078632069220.3477],
+                [33554432, 3699470851109.908],
+                [67108864, 4101667955644.0366],
+                [134217728, 4326433526471.947],
+                [268435456, 4453020550079.981],
+                [536870912, 4495340282477.746],
+                [1073741824, 4501845033268.779],
+                [2147483648, 4501845033268.779],
+                [4294967296, 4530716389717.617],
             ],
-            "link": 50647156223.07616,
+            "link": 50840468997.61543,
             "device.kernel_floor_s": [
-                1.7559914588928222e-06,
-                1.754871070384979e-06,
-                1.7566190481185917e-06,
+                1.7549520134925844e-06,
+                1.7540400743484496e-06,
+                1.7559359788894653e-06,
             ],
             "interconnect.intra_node.link_latency_s": [
-                8.984059989452361e-07,
-                8.71745502948761e-07,
-                9.11213505268097e-07,
+                9.736769795417785e-07,
+                9.649884879589081e-07,
+                9.892290234565733e-07,
             ],
         },
-        "774ab13e538536628e55aa65a5522e5f1fdd945243a367a87b75d546bf57e9c6",
+        "2849b199ff2bf2b307a9a7efbf31511ffa40dc0408822afd00fbf7d49fc5ee1a",
     ),
 }.get(NAME)
 
@@ -319,20 +319,26 @@ def device_fragments() -> list[Fragment]:
         probes.append(fragment("pp", body, "probed", how, subject, date, band))
     assumed = fragment("assumed", DECLARED, "assumed", "no probe fills these")
     if PEAKS:
-        date, root, found, record = PEAKS
-        subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
-        document = probe_device.fragment(
-            NAME, found, assumed.values, AUTHOR, date, subject
-        )
-        probes.append(Fragment.from_mapping(document, "peaks"))
-        probed = probes[-1].values.keys() - {"name", "schema_version"}
-        kept = {
-            k: v
-            for k, v in assumed.values.items()
-            if k.startswith("provenance.") or k not in probed
-        }
-        assumed = Fragment(assumed.source, kept)
+        found, assumed = peaks(PEAKS, assumed.values, assumed)
+        probes.append(found)
     return [fragment("device", DEVICE, "probed", notes, SUBJECT), assumed, *probes]
+
+
+def peaks(readings: tuple, stated: dict, assumed: Fragment) -> tuple:
+    """The fragment `probe_device.py`'s `readings`, a `PEAKS` entry, make
+    over the spec-peak numbers `stated` holds, and `assumed` less the fields
+    it fills."""
+    date, root, found, record = readings
+    subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
+    document = probe_device.fragment(NAME, found, stated, AUTHOR, date, subject)
+    probed = Fragment.from_mapping(document, "peaks")
+    filled = probed.values.keys() - {"name", "schema_version"}
+    kept = {
+        k: v
+        for k, v in assumed.values.items()
+        if k.startswith("provenance.") or k not in filled
+    }
+    return probed, Fragment(assumed.source, kept)
 
 
 def swept(model: str) -> Fragment:

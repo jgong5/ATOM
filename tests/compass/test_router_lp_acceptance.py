@@ -37,7 +37,7 @@ from pathlib import Path
 
 import pytest
 from test_pd_slice import PD
-from test_vertical_slice import CONSTANT, TREE, _free_port, _retry, _run_file
+from test_vertical_slice import CONSTANT, TREE, _retry, _run_file
 
 from atom.compass import run as compass_run
 from atom.compass.carriers import (
@@ -49,6 +49,7 @@ from atom.compass.carriers import (
 from atom.compass.clock import LpId
 from atom.compass.clock_transport import connect
 from atom.compass.detect.scenario import check_run
+from atom.compass.drive.serve import _free_ports
 from atom.compass.parity.traffic import Traffic
 from atom.utils.clock import LPRuntime, channel_of
 
@@ -277,7 +278,7 @@ def run_router_lp(
         ]
         for t in idle:
             t.start()
-        router_port = _free_port()
+        router_port, metrics_port = _free_ports(2)
         router = _launch(
             out,
             "router",
@@ -286,7 +287,7 @@ def run_router_lp(
             + ["--decode", frontends["D"].url, "--policy", policy, "--dp-aware"]
             + ["--backend", "atom", "--disable-health-check"]
             + ["--disable-circuit-breaker", "--disable-retries"]
-            + ["--prometheus-port", str(_free_port()), "--log-level", "info"],
+            + ["--prometheus-port", str(metrics_port), "--log-level", "info"],
             ATOM_COMPASS_CLOCK_ENDPOINT=endpoint,
             ATOM_COMPASS_SEED="20260707",
             ATOM_COMPASS_ROUTER_LOOKAHEADS=json.dumps(lookaheads),
@@ -359,13 +360,14 @@ def test_random_picks_the_same_ranks_from_one_seed_under_any_host_delay(
 def test_power_of_two_is_refused_by_name(atomesh, tmp_path):
     # A clock that accepts the bind and never answers: the refusal comes first.
     clock = socket.create_server(("127.0.0.1", 0))
+    router_port, metrics_port = _free_ports(2)
     router = _launch(
         tmp_path,
         "router",
-        [str(atomesh), "launch", "--host", "127.0.0.1", "--port", str(_free_port())]
+        [str(atomesh), "launch", "--host", "127.0.0.1", "--port", str(router_port)]
         + ["--pd-disaggregation", "--prefill", "http://127.0.0.1:9"]
         + ["--decode", "http://127.0.0.1:9", "--policy", "power_of_two", "--dp-aware"]
-        + ["--backend", "atom", "--prometheus-port", str(_free_port())],
+        + ["--backend", "atom", "--prometheus-port", str(metrics_port)],
         ATOM_COMPASS_CLOCK_ENDPOINT=f"tcp://127.0.0.1:{clock.getsockname()[1]}",
         ATOM_COMPASS_SEED="1",
         ATOM_COMPASS_ROUTER_LOOKAHEADS="{}",

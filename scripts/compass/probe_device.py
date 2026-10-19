@@ -8,18 +8,24 @@ cards 0 and 1 the link. Every sample is device time between two events queued
 behind a spin kernel, so no host time is in it.
 
 - Compute: per format, the median of `REPS` GEMMs ``x @ w.T``, x m by k and
-  w n by k, at each of `SHAPES`, BF16 through `torch.matmul` and FP8 through
-  `torch._scaled_mm`; the best shape's rate over SPEC's ``*_flops`` is the
-  format's derate. Each GEMM follows a spin, so the rate is a burst's: with PTL
-  enabled a sustained GEMM slows within a second or two.
-- Bandwidth: per size in `SIZES`, the bytes read plus written, a graph of up
-  to `GRAPH` copies through consecutive slices of two `POOL`-byte buffers,
-  replayed `REPS` times. Copies that together fit in the last-level cache run
-  warm, as small operators do, and larger ones from HBM. The kernel is a
-  Triton copy: `copy_` reaches about 2 TB/s on MI308X, a kernel about 3.6. The
-  running maximum of the median rate per size is ``memory.bandwidth_curve``,
-  so noise on the plateau keeps it monotone, and its largest point over SPEC's
-  bandwidth is ``memory.derate``.
+  w n by k, at each of `SHAPES`, BF16 through `torch.matmul`, FP8 through
+  `torch._scaled_mm`, and FP4 where SPEC states ``fp4_flops``: MXFP4, two
+  values a byte and a power-of-two scale per 32 along k, through both
+  `torch._scaled_mm` (hipBLASLt) and `aiter.gemm_a4w4` with w pre-shuffled,
+  as aiter's own tests call it. The best rate over shapes and libraries, over
+  SPEC's ``*_flops``, is the format's derate. Each GEMM follows a spin, so the
+  rate is a burst's: with PTL enabled a sustained GEMM slows within a second
+  or two.
+- Bandwidth: per kind in `KINDS` (read-only, write-only, copy) and per size
+  in `SIZES` of bytes moved, a graph of up to `GRAPH` kernels through
+  consecutive slices of one zeroed `2 * POOL`-byte buffer (a copy reads one
+  half and writes the other), replayed `REPS` times. Kernels that together fit
+  in the last-level cache run warm, as small operators do, and larger ones
+  from HBM. The kernels are Triton: `copy_` reaches about 2 TB/s on MI308X, a
+  kernel about 3.6. At each size the fastest kind's median rate bounds any mix
+  of reads and writes; the running maximum of it over sizes is
+  ``memory.bandwidth_curve``, so noise on the plateau keeps it monotone, and
+  its largest point over SPEC's bandwidth is ``memory.derate``.
 - Kernel floor: `GRAPH` empty kernels captured in one graph, replayed `REPS`
   times; ``kernel_floor_s`` is the median per kernel, with its p10 and p90.
 - Link: one kernel per card passes a counter `ROUNDS` times through the other
@@ -59,14 +65,16 @@ from atom.compass.spec.rules import Rule
 #: up to 2.7x between neighbouring large shapes, and each format peaks at another.
 SHAPES = tuple(itertools.product((8192, 10240, 12288, 16384), repeat=3))
 SIZES = tuple(2**k for k in range(12, 33))  # 4 KiB to 4 GiB moved
-POOL, COPY_BLOCK = 2**31, 4096  # bytes in each copy buffer, floats a program
+POOL, COPY_BLOCK = 2**31, 4096  # bytes in each copy half, floats a program
+#: Each bandwidth kind: whether its kernel reads, and whether it writes.
+KINDS = {"read": (True, False), "write": (False, True), "copy": (True, True)}
 GRAPH, ROUNDS, LINK_BYTES = 1000, 1000, 2**30
 REPS = 20
 SPIN = 10**7  # device cycles a sample waits behind, well past its host calls
 IDLE_BYTES = 2**30
 DRM = "/sys/class/drm"
 #: Each format's derate, by the spec-peak number it is taken over.
-FORMATS = {"bf16": "bf16_flops", "fp8": "fp8_flops"}
+FORMATS = {"bf16": "bf16_flops", "fp8": "fp8_flops", "fp4": "fp4_flops"}
 #: The fields read with a band, and each one's sample list in the record.
 BANDED = {
     "device.kernel_floor_s": "floor",
@@ -89,10 +97,14 @@ def _pingpong(mine, theirs, rounds, serve: tl.constexpr):
 
 
 @triton.jit
-def _copy(src, dst, n, BLOCK: tl.constexpr):
-    """Copy `n` floats, `BLOCK` a program."""
+def _stream(src, dst, n, BLOCK: tl.constexpr, READ: tl.constexpr, WRITE: tl.constexpr):
+    """Copy `n` floats, `BLOCK` a program, or only read or only write them. A
+    read alone stores the negative floats of a zeroed `src`: none."""
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    tl.store(dst + offs, tl.load(src + offs, mask=offs < n), mask=offs < n)
+    x = tl.zeros([BLOCK], tl.float32)
+    if READ:
+        x = tl.load(src + offs, mask=offs < n)
+    tl.store(dst + offs, x, mask=(offs < n) & ((x < 0) | WRITE))
 
 
 def cards(bdfs: list[str], drm: str = DRM) -> list[dict]:
@@ -148,36 +160,65 @@ def _timed(torch, fn, reps: int = REPS) -> list[float]:
     return out
 
 
-def probe(torch) -> dict:
-    """Every sample, on visible cards 0 and 1."""
+def _fp4(torch, rows: int, k: int):
+    """An MXFP4 operand of `rows` by `k` random values and its unit scales."""
+    cuda = {"dtype": torch.uint8, "device": "cuda"}
+    packed = torch.randint(0, 256, (rows, k // 2), **cuda)
+    scales = torch.full((rows, k // 32), 127, **cuda)  # 2**0 in E8M0
+    return packed.view(torch.float4_e2m1fn_x2), scales.view(torch.float8_e8m0fnu)
+
+
+def _a4w4(x, w):
+    """aiter's MXFP4 GEMM of bf16 `x` and `w`, quantised per 1x32 with shuffled
+    scales and `w` pre-shuffled, as aiter's own tests call it."""
+    import aiter
+    from aiter.ops.shuffle import shuffle_weight
+
+    quant = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    (x4, sx), (w4, sw) = quant(x, shuffle=True), quant(w, shuffle=True)
+    w4 = shuffle_weight(w4, layout=(16, 16))
+    return partial(aiter.gemm_a4w4, x4, w4, sx, sw, bpreshuffle=True)
+
+
+def probe(torch, formats) -> dict:
+    """Every sample, on visible cards 0 and 1, GEMMs in `formats`; FP4 also
+    through aiter, under ``aiter``."""
     torch.cuda.set_device(0)
     fp8 = torch.float8_e4m3fn
     if torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx942"):
         fp8 = torch.float8_e4m3fnuz
     one = torch.ones((), device="cuda")
-    gemm = {f: {} for f in FORMATS}
+    gemm = {f: {} for f in formats}
+    aiter = {"fp4": {}} if "fp4" in formats else {}
     for m, n, k in SHAPES:
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-        shape = f"{m}x{n}x{k}"
-        gemm["bf16"][shape] = _timed(torch, partial(torch.matmul, x, w.T))
-        time.sleep(1)  # let a PTL card recover before the next burst
-        x, w = x.to(fp8), w.to(fp8)
-        scaled = partial(torch._scaled_mm, x, w.T, one, one, out_dtype=torch.bfloat16)
-        gemm["fp8"][shape] = _timed(torch, scaled)
-        time.sleep(1)
-    src = torch.empty(POOL // 4, device="cuda")
-    dst = torch.empty_like(src)
-    copy = {}
-    for size in SIZES:
-        n, k = size // 8, min(GRAPH, 2 * POOL // size)  # floats a side, copies
-        grid = (triton.cdiv(n, COPY_BLOCK),)
-        _copy[grid](src, dst, n, COPY_BLOCK, num_warps=8)  # compiles uncaptured
+        scaled = partial(torch._scaled_mm, out_dtype=torch.bfloat16)
+        calls = {
+            "bf16": partial(torch.matmul, x, w.T),
+            "fp8": partial(scaled, x.to(fp8), w.to(fp8).T, one, one),
+        }
+        if "fp4" in formats:
+            (x4, sx), (w4, sw) = _fp4(torch, m, k), _fp4(torch, n, k)
+            calls["fp4"] = partial(scaled, x4, w4.T, sx, sw)
+        timings = [(gemm[f], calls[f]) for f in formats]
+        if aiter:
+            timings.append((aiter["fp4"], _a4w4(x, w)))
+        for samples, call in timings:
+            samples[f"{m}x{n}x{k}"] = _timed(torch, call)
+            time.sleep(1)  # let a PTL card recover before the next burst
+    pool = torch.zeros(2 * POOL // 4, device="cuda")
+    streams = {kind: {} for kind in KINDS}
+    for (kind, (read, write)), size in itertools.product(KINDS.items(), SIZES):
+        src, dst = pool.chunk(2) if read and write else (pool, pool)
+        n, k = size // 4 // (read + write), min(GRAPH, 2 * POOL // size)
+        grid, flags = (triton.cdiv(n, COPY_BLOCK),), (COPY_BLOCK, read, write)
+        _stream[grid](src, dst, n, *flags, num_warps=8)  # compiles uncaptured
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             for i in range(k):
-                _copy[grid](src[i * n :], dst[i * n :], n, COPY_BLOCK, num_warps=8)
-        copy[size] = [t / k for t in _timed(torch, graph.replay)]
+                _stream[grid](src[i * n :], dst[i * n :], n, *flags, num_warps=8)
+        streams[kind][size] = [t / k for t in _timed(torch, graph.replay)]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for _ in range(GRAPH):
@@ -204,34 +245,44 @@ def probe(torch) -> dict:
         torch.cuda.synchronize(1)
     return {
         "gemm": gemm,
-        "copy": copy,
+        "aiter": aiter,
+        **streams,
         "floor": floor,
         "link": link,
         "one_hop": [t / ROUNDS / 2 for t in trips[1:]],
     }
 
 
+def rates(record: dict) -> dict:
+    """Each bandwidth kind's median rate per size, bytes moved a second."""
+    med = statistics.median
+    return {k: {int(n): int(n) / med(t) for n, t in record[k].items()} for k in KINDS}
+
+
 def readings(record: dict) -> dict:
     """The attainable values a record's samples give: each format's best
-    median rate, the running maximum of the median copy rate per size, the
-    link's median rate, and each banded field's median, p10 and p90."""
+    median rate over shapes and libraries, the running maximum over sizes of
+    the fastest kind's median rate, the link's median rate, and each banded
+    field's median, p10 and p90."""
     med = statistics.median
 
     def band(samples):
         cut = statistics.quantiles(samples, n=10, method="inclusive")
         return [med(samples), cut[0], cut[8]]
 
+    libraries = (record["gemm"], record.get("aiter", {}))
     found = {
         f: max(
             2 * math.prod(map(int, s.split("x"))) / med(t)
-            for s, t in record["gemm"][f].items()
+            for gemm in libraries
+            for s, t in gemm.get(f, {}).items()
         )
-        for f in FORMATS
+        for f in record["gemm"]
     }
-    rates = itertools.accumulate(
-        (int(n) / med(t) for n, t in record["copy"].items()), max
-    )
-    found["bandwidth_curve"] = [[int(n), r] for n, r in zip(record["copy"], rates)]
+    kinds = rates(record)
+    sizes = sorted(kinds["copy"])
+    best = itertools.accumulate((max(r[n] for r in kinds.values()) for n in sizes), max)
+    found["bandwidth_curve"] = [[n, r] for n, r in zip(sizes, best)]
     found["link"] = med(record["link"])
     return found | {path: band(record[key]) for path, key in BANDED.items()}
 
@@ -246,6 +297,7 @@ def fragment(
         **{
             f"device.compute.derate.{f}": found[f] / peaks[f"device.compute.{peak}"]
             for f, peak in FORMATS.items()
+            if f in found
         },
         "device.memory.bandwidth_curve": curve,
         "device.memory.derate": curve[-1][1]
@@ -265,7 +317,7 @@ def fragment(
             "date": date,
             "origin": "mixed",
             "origins": origins,
-            "notes": "probe_device.py: GEMM, copy, graph and link samples",
+            "notes": "probe_device.py: GEMM, read, write, copy, graph and link samples",
         },
     }
     for path, value in values.items():
@@ -292,7 +344,10 @@ def main(argv: list[str] | None = None) -> int:
     ]
     record = {"cards": cards(bdfs), "arch": props[0].gcnArchName}
     refuse_unfit(record["cards"], ptl)
-    record |= probe(torch)
+    stated = [
+        f for f, peak in FORMATS.items() if f"device.compute.{peak}" in spec.values
+    ]
+    record |= probe(torch, stated)
     record |= {"torch": torch.__version__, "source": Path(__file__).read_text()}
     out.write_text(json.dumps(record) + "\n")
     root = git_tree_root("atom", str(ROOT))

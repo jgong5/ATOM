@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 
 import torch
-from torch._dynamo.utils import compilation_time_metrics
+from torch._dynamo.utils import compilation_time_metrics, counters
 
 from atom.compass.artifacts import member_name
 from atom.compass.drive.measure_memory import OUT_ENV
@@ -46,8 +46,8 @@ class MemoryReadingModelRunner(ModelRunner):
     the KV budget reads the device, less those; the warmup's peak above them
     over its tokens; the budget's
     `non_torch` and total; the reserved bytes graph capture adds; and the
-    kernels inductor autotuned, which `compass measure memory` starts again
-    for."""
+    kernels inductor autotuned and the graphs it missed, which
+    `compass measure memory` starts again for."""
 
     def _build_and_load_model(self, model_class):
         super()._build_and_load_model(model_class)
@@ -115,6 +115,7 @@ class MemoryReadingModelRunner(ModelRunner):
                     "engine": engine,
                     "readings": readings,
                     "autotuned_kernels": len(compilation_time_metrics.get(AUTOTUNE, ())),
+                    "fxgraph_cache_misses": counters["inductor"]["fxgraph_cache_miss"],
                 }
             )
         )

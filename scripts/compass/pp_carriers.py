@@ -18,8 +18,9 @@ per_byte_s`` from the send, weighted by relative error; eager sizes, or every
 size when none is eager, take that ``per_byte_s`` and fit ``overhead_s`` on the
 sender and ``latency_s`` from its completion to the arrival.
 
-A gloo sender blocked in its wait completes later the longer it was blocked
-before the receive was posted. Rank 1 then runs for each of `BLOCKS` seconds
+A gloo sender blocked in its wait completes later the longer the pair carried
+nothing before the receive was posted; here that is the block, since the
+barrier before it. Rank 1 then runs for each of `BLOCKS` seconds
 before it posts, rank 0 waiting on an 8-byte gloo send, as ATOM's next stage
 runs its own forward while the stage before waits on the send's size. The
 sender's completion past the rendezvous price fits ``wake_s x (1 - exp(-b /
@@ -73,6 +74,24 @@ def fit_wake(samples: list[dict], price: float) -> tuple[float, float]:
     return float(w) * 1e-6, float(rise)
 
 
+def _eager(samples: list[dict]) -> bool:
+    """Whether a late-order sender completes before the post, at the median."""
+    d, p = (np.median([s[k] - s["send"] for s in samples]) for k in ("done", "post"))
+    return d < p
+
+
+def threshold(sizes: list[int], eager):
+    """`sizes`, then a bisection past the largest `eager` one to 1/32 of it."""
+    lo = 0
+    for n in sizes:
+        yield n
+        lo = n if eager(n) else lo
+    hi, step = 2 * lo or sizes[0], max(lo // 32, 1)
+    while hi - lo > step:
+        yield (mid := (lo + hi) // 2)
+        lo, hi = (mid, hi) if eager(mid) else (lo, mid)
+
+
 def fit(samples: list[dict]) -> dict:
     """Each carrier's fields and residual spread from `samples`; gloo's wake
     when any sample has a ``block``."""
@@ -91,8 +110,12 @@ def fit(samples: list[dict]) -> dict:
             for late in (False, True)
         }
         eager = [n for n in sizes if med[n, True]["done"] < med[n, True]["post"]]
-        if eager != sizes[: len(eager)] or len(eager) == len(sizes):
-            raise SystemExit(f"{c}: eager sizes {eager} are not a proper prefix")
+        late = sorted(n for k, n, lt in got if k == c and lt)
+        seen = [n for n in late if _eager(got[c, n, True])]
+        if seen != late[: len(seen)] or eager == sizes:
+            raise SystemExit(
+                f"{c}: eager late sizes {seen} are not a prefix below {sizes[-1]}"
+            )
         rdv = sizes[len(eager) :]
         early = {n: med[n, False] for n in sizes}
         t = np.array([early[n]["end"] for n in rdv])
@@ -103,7 +126,7 @@ def fit(samples: list[dict]) -> dict:
         o = np.median([early[n]["done"] - n * g for n in base])
         lat = np.median([early[n]["end"] - early[n]["done"] for n in base])
         out[c] = {
-            "eager_threshold_bytes": eager[-1] if eager else 0,
+            "eager_threshold_bytes": seen[-1] if seen else 0,
             "latency_s": float(lat),
             "overhead_s": float(o),
             "per_byte_s": float(g),
@@ -166,8 +189,14 @@ def probe() -> list[dict]:
     stamps = []
     for c, sizes in SIZES.items():
         dev = "cuda" if c == "rccl" else "cpu"
+
+        def eager(n: int, c: str = c) -> bool:
+            both, mine = [None, None], [s for s in stamps if s[:3] == (c, n, True)]
+            dist.all_gather_object(both, mine, group=groups["gloo"])
+            return _eager([dict(zip(STAMPS, a[4:] + b[4:])) for a, b in zip(*both)])
+
         for late in (False, True):
-            for n in sizes:
+            for n in threshold(sizes, eager) if late else sizes:
                 x = torch.ones(n, dtype=torch.uint8, device=dev)
                 for i in range(WARM + REPS):
                     dist.barrier(groups["gloo"])

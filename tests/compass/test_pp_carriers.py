@@ -117,6 +117,25 @@ def test_the_script_prices_the_send_on_a_machine_specs_carriers(tmp_path):
     assert recurrence.main(str(tmp_path)) == 1
 
 
+@pytest.mark.parametrize("tp", [1, 2])
+def test_the_script_refuses_a_record_at_tp_above_one_on_the_carriers(tmp_path, tp):
+    """At TP 2 each stage sends shards its receiver all-gathers; the carriers
+    price whole tensors with no all-gather, so the record is refused there,
+    and only there."""
+    for name, steps in zip(("dp0", "pp1.dp0"), pp2_record()):
+        (tmp_path / f"{name}.jsonl").write_text(
+            "".join(json.dumps(s) + "\n" for s in steps)
+        )
+        engine = {"tensor_parallel_size": tp}
+        (tmp_path / f"{name}.engine.json").write_text(json.dumps(engine))
+    recurrence.main(str(tmp_path))
+    if tp == 1:
+        recurrence.main(str(tmp_path), str(SPEC), "500")
+        return
+    with pytest.raises(ValueError, match="ran at TP 2: each stage sends shards"):
+        recurrence.main(str(tmp_path), str(SPEC), "500")
+
+
 def test_a_carrier_may_have_no_eager_size_and_no_fewer():
     document = json.loads(SPEC.read_text())
     carrier_models(MachineSpec.from_mapping(document))  # the spec states both
@@ -255,3 +274,45 @@ def test_the_probe_prices_a_late_rendezvous_receive_with_its_threshold_moved():
         if s["carrier"] == "rccl" and s["late"] and s["bytes"] > eager:
             s["done"] = s["end"] = s["end"] - eager * g
     assert probe.fit(samples)["rccl"]["late"] == pytest.approx([0] * 5, abs=1e-15)
+
+
+def test_the_probe_bisects_a_threshold_to_a_32nd_of_the_power_below_it():
+    """RCCL eager up to 37.5 MiB: the late order's bisection past 32 MiB
+    states it to the MiB below. gloo, eager at no size, bisects to the byte."""
+    limit = 75 * 2**19
+    truth = TRUTH | {"rccl": (limit, *TRUTH["rccl"][1:])}
+    samples = []
+    for c, sizes in probe.SIZES.items():
+        late = probe.threshold(sizes, lambda n, c=c: n <= truth[c][0])
+        samples += [_sample(c, n, False, *truth[c]) for n in sizes]
+        samples += [_sample(c, n, True, *truth[c]) for n in late]
+    fit = probe.fit(samples)
+    assert fit["rccl"]["eager_threshold_bytes"] == 37 * 2**20
+    assert fit["gloo"]["eager_threshold_bytes"] == 0
+    gloo = sorted(s["bytes"] for s in samples if s["carrier"] == "gloo" and s["late"])
+    assert gloo[:4] == [1, 2, 4, 8]
+
+
+def test_the_probe_refuses_late_reads_whose_eager_sizes_are_not_a_prefix():
+    """Pooled records whose bisections differ can read 1100 bytes rendezvous
+    beside 1536 eager: the fit refuses, stating no threshold above a
+    rendezvous size."""
+    samples = _samples(TRUTH) + [
+        _sample("rccl", 1100, True, *TRUTH["rccl"]),
+        _sample("rccl", 1536, True, 2047, *TRUTH["rccl"][1:]),
+    ]
+    with pytest.raises(SystemExit, match=r"rccl: eager late sizes \[8, .*1024, 1536\]"):
+        probe.fit(samples)
+
+
+def test_the_probe_refuses_a_carrier_eager_at_every_power_of_two():
+    """RCCL eager up to 640 MiB: the bisection past 512 MiB reads late sizes
+    rendezvous, but no power of two is left to fit the rendezvous line."""
+    truth = TRUTH | {"rccl": (2**29 + 2**27, *TRUTH["rccl"][1:])}
+    samples = []
+    for c, sizes in probe.SIZES.items():
+        late = probe.threshold(sizes, lambda n, c=c: n <= truth[c][0])
+        samples += [_sample(c, n, False, *truth[c]) for n in sizes]
+        samples += [_sample(c, n, True, *truth[c]) for n in late]
+    with pytest.raises(SystemExit, match=r"rccl: .* not a prefix below 536870912"):
+        probe.fit(samples)

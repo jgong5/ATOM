@@ -12,10 +12,12 @@ are read, never timestamps. Reading records stays with the caller.
 
 `plan` reads its target from the engine its inputs' ranks state, each in its
 `dp<r>.engine.json`: `TARGET`, the scheduler's bounds, the KV block size and
-count, and the decode ladder. Inputs whose ranks state two engines are
-refused, and so is a step whose decode row computes more than one token: its
-run had a drafter, and the ladder its engine states holds rungs ATOM did not
-capture. The grid definition is a mapping:
+count, and the decode ladder. The block count is the smallest any rank
+states, since a real start sets it from its free memory; inputs whose ranks
+state two engines otherwise are refused, and so is a step whose decode row
+computes more than one token: its run had a drafter, and the ladder its
+engine states holds rungs ATOM did not capture. The grid definition is a
+mapping:
 
     {"prefill": {"B": [...], "T": [...], "c": [...]}, "decode": {"c": [...]},
      "margin": n}
@@ -89,21 +91,25 @@ def _views(steps) -> list[tuple[str, BatchView]]:
 
 
 def _target(definition: dict, engines: dict) -> dict:
-    """The `TARGET` fields of the one engine every input rank states."""
+    """The `TARGET` fields of the one engine every input rank states, at the
+    smallest KV block count any states, whose KV limits hold for every input."""
     if not engines:
         raise ValueError("no input states the engine its steps ran on")
+    for name, engine in engines.items():
+        missing = [key for key in TARGET if key not in engine]
+        if missing:
+            raise ValueError(f"{name} states no {', '.join(missing)}")
     (first, engine), *rest = engines.items()
     for name, other in rest:
-        keys = sorted(engine.keys() | other.keys())
+        keys = sorted((engine.keys() | other.keys()) - {"num_kvcache_blocks"})
         differ = [k for k in keys if engine.get(k) != other.get(k)]
         if differ:
             raise ValueError(
                 f"{first} and {name} state two engines, which differ on "
                 f"{', '.join(differ)}"
             )
-    missing = [key for key in TARGET if key not in engine]
-    if missing:
-        raise ValueError(f"{first} states no {', '.join(missing)}")
+    blocks = min(e["num_kvcache_blocks"] for e in engines.values())
+    engine = {**engine, "num_kvcache_blocks": blocks}
     unknown = sorted(set(definition) - {*DEFINITION, *TARGET})
     if unknown:
         raise ValueError(

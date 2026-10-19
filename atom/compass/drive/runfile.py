@@ -23,6 +23,10 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   real rows.
 - Not flags: `FIXED`, and ``data_parallel_size``, read from ATOM's arguments.
   The server serves client runs until it is stopped.
+
+`prefill_decode` builds the one run file of a prefill and a decode instance on
+one node, which `scripts/compass/deploy.sh` hands its clock authority and both
+instances.
 """
 
 import hashlib
@@ -43,6 +47,8 @@ FIXED = {
     "stream_s": 2.0**-12,
     "bound_s": 1e7,
 }
+#: A prefill-decode run's write-request lookahead, which no measurement backs.
+KV_WRITE_REQ_S = 2.0**-10
 
 
 def add_arguments(parser) -> None:
@@ -66,13 +72,10 @@ def build(args, atom_args) -> dict:
     """The run file of `args`, parsed with `add_arguments`, for a server
     started with ATOM's arguments `atom_args`."""
     store = ArtifactStore(Path(args.store).resolve())
-    engine = _engine_args(atom_args)
-    # Under DP-attention every TP rank is a DP rank, as `run.frontend` counts.
-    ranks = engine.tensor_parallel_size if engine.enable_dp_attention else 1
     out = {
         **FIXED,
         "client_runs": None,
-        "data_parallel_size": engine.data_parallel_size * ranks,
+        "data_parallel_size": _dp_width(atom_args),
         "machine": json.loads(Path(args.machine).read_text()),
         "store": str(store.root),
         "on_refusal": args.on_refusal,
@@ -126,6 +129,31 @@ def build(args, atom_args) -> dict:
     if args.padding:
         out["padding"] = args.padding
     return out
+
+
+def prefill_decode(args, prefill_args, decode_args) -> dict:
+    """The run file `build` builds from `args` for one prefill and one decode
+    instance on one node, started with ATOM's arguments `prefill_args` and
+    `decode_args`: each side's DP width read from its own, the router's
+    per-request forward cost the machine spec's ``interconnect.router_relay_s``,
+    the KV transfers priced on its intra-node link, and `KV_WRITE_REQ_S`."""
+    out = build(args, prefill_args)
+    del out["data_parallel_size"]
+    out[run.DP_WIDTHS["P"]] = _dp_width(prefill_args)
+    out[run.DP_WIDTHS["D"]] = _dp_width(decode_args)
+    return out | {
+        "router_s": run._machine(out).value("interconnect.router_relay_s"),
+        "kv_write_req_s": KV_WRITE_REQ_S,
+        "kv_link": "intra_node",
+    }
+
+
+def _dp_width(atom_args) -> int:
+    """The DP ranks ATOM's arguments run: under DP-attention every TP rank is
+    one, as `run.frontend` counts."""
+    engine = _engine_args(atom_args)
+    ranks = engine.tensor_parallel_size if engine.enable_dp_attention else 1
+    return engine.data_parallel_size * ranks
 
 
 def _member(entry, stem: str):
