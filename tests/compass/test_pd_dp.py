@@ -30,11 +30,12 @@ from test_dp_slice import DP_MACHINE, MAX_TOKENS, Requests
 from test_kv_remote_prefill import Script, connector
 from test_kv_simulated_connector import PEAKS, geometry, model_for  # noqa: F401
 from test_pd_slice import NEEDS_A_PD_RUN, PD, PORTS, PdTraffic
-from test_vertical_slice import CONSTANT, MODEL, TREE, WALL_S, _free_port, _run_file
+from test_vertical_slice import CONSTANT, MODEL, TREE, WALL_S, _run_file
 
 from atom.compass import run as compass_run
 from atom.compass.clock import NER, ClockAbort, LpId, prefill_decode_table
 from atom.compass.detect.scenario import check_run
+from atom.compass.drive.serve import _free_ports
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.utils.clock import LPRuntime
 
@@ -71,14 +72,15 @@ def run_pd_dp(out: Path, seed: str, form: str, sides=None) -> dict:
             for side, n in (("PREFILL", p), ("DECODE", d))
         }
     out.mkdir()
-    ports = {name: _free_port() for name in PORTS}
-    # The write requests take p * d ports from KV_WRITE_REQ_PORT; successive
-    # free ports are often a step of 2 apart, so the next one may be among them.
+    # The write requests take p * d ports from KV_WRITE_REQ_PORT, which may
+    # reach another drawn port: draw all of them again then.
     kv = "KV_WRITE_REQ_PORT"
-    while {port for n, port in ports.items() if n != kv} & set(
-        range(ports[kv], ports[kv] + p * d)
-    ):
-        ports[kv] = _free_port()
+    while True:
+        ports = dict(zip(PORTS, _free_ports(len(PORTS))))
+        if not {port for n, port in ports.items() if n != kv} & set(
+            range(ports[kv], ports[kv] + p * d)
+        ):
+            break
     run_file = _run_file(
         out,
         clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",

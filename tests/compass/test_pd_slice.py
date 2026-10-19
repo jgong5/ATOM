@@ -58,6 +58,7 @@ from atom.compass.clock import (
     single_engine_table,
 )
 from atom.compass.detect.scenario import check_run
+from atom.compass.drive.serve import _free_ports
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
 from atom.utils.compass_loop import HttpChannel
@@ -91,7 +92,7 @@ class PdTraffic(Traffic):
 def run_pd(out: Path, seed: str) -> dict:
     """One run under `pd_sim.sh`; its step table and request times."""
     out.mkdir()
-    ports = {name: _free_port() for name in PORTS}
+    ports = dict(zip(PORTS, _free_ports(len(PORTS))))
     endpoint = f"tcp://127.0.0.1:{ports['CLOCK_PORT']}"
     run_file = _run_file(out, clock_endpoint=endpoint, step_stub=CONSTANT, **PD)
     env = dict(

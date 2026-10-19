@@ -39,7 +39,6 @@ from test_vertical_slice import (
     TREE,
     WALL_S,
     Traffic,
-    _free_port,
     _run_file,
 )
 
@@ -49,6 +48,7 @@ from atom.compass.backends.step_stub import Coefficients
 from atom.compass.carriers import tracestate_with
 from atom.compass.clock import TAR
 from atom.compass.detect.scenario import check_run, expected_timeline
+from atom.compass.drive.serve import _free_ports
 from atom.compass.kv.lmcache_server import reply_channel
 from atom.compass.parity import ENV as RECORD
 from atom.compass.parity import StepRecording, read
@@ -129,14 +129,18 @@ def _measure(out: Path, machine: Path, width: list, port: int) -> None:
     )
 
 
-def run_scenario(root: Path, seed: str, dp: int, lmcache_port: int) -> dict:
-    """One run in its own process tree, reading the readings in ``root/store``."""
+def run_scenario(
+    root: Path, seed: str, dp: int, lmcache_port: int, ports: list[int]
+) -> dict:
+    """One run in its own process tree, reading the readings in ``root/store``,
+    its clock and server on `ports`."""
     out = root / f"seed{seed}"
     out.mkdir()
-    port, flags = _free_port(), _server(lmcache_port)
+    (clock_port, port), flags = ports, _server(lmcache_port)
     machine = json.loads((root / "machine.json").read_text())
     run_file = _run_file(
         out,
+        clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
         step_stub=CONSTANT,
         machine=machine,
         store=str(root / "store"),
@@ -197,13 +201,18 @@ def runs(request, tmp_path_factory):
         "latency_s": COPY_S,
     }
     machine.write_text(json.dumps(spec))
-    lmcache_port = _free_port()  # the run file names it, so both runs share it
+    # The run file names the lmcache port, so both runs share it; each run's
+    # clock and server ports are drawn with it.
+    lmcache_port, *ports = _free_ports(5)
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("AITER_LOG_LEVEL", "WARNING")  # the readings are keyed by it
         for name, value in _offload(lmcache_port).items():
             mp.setenv(name, value)
         _measure(root, machine, DP2 if dp > 1 else [], lmcache_port)
-    return dp, [run_scenario(root, seed, dp, lmcache_port) for seed in ("1", "2")]
+    return dp, [
+        run_scenario(root, seed, dp, lmcache_port, ports[2 * i : 2 * i + 2])
+        for i, seed in enumerate(("1", "2"))
+    ]
 
 
 def _releases(table: str, lp=None) -> list[tuple[float, str, int]]:
