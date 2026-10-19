@@ -5,8 +5,10 @@ its configuration's `memory_readings` entry.
     compass measure memory --gpu G --machine M --store S --out D -- <ATOM args>
 
 ATOM's engine starts from ATOM's arguments (`EngineArgs`) on the GPUs `--gpu`
-names, through `MemoryReadingModelRunner`, and stops once it has started: its
-weights loaded, its one warmup run, its KV cache sized and its graphs captured. `gpu.quiet` checks those GPUs before the
+names, through `MemoryReadingModelRunner` (under `--enable-rapidserve` its
+RapidServe form, whose prefill engine writes the readings), and stops once it
+has started: its weights loaded, its one warmup run, its KV cache sized and its
+graphs captured. `gpu.quiet` checks those GPUs before the
 start and after it. Each rank writes its readings and the key it read off its
 resolved config, and the ranks must agree on the key. The entry's key is that
 one with the digest of the machine spec `--machine` names; its conditions are
@@ -66,6 +68,9 @@ OUT_ENV = "ATOM_COMPASS_MEMORY_OUT"
 #: The command `--beside` names, which the start runs before the engine.
 BESIDE_ENV = "ATOM_COMPASS_MEMORY_BESIDE"
 RUNNER = "atom.compass.drive.memory_runner.MemoryReadingModelRunner"
+RAPIDSERVE_RUNNER = (
+    "atom.compass.drive.rapidserve_memory_runner.MemoryReadingRapidServeModelRunner"
+)
 #: ATOM's dummy weights flag; its parser reads `_` in a flag as `-`.
 LOAD_DUMMY = "--load-dummy"
 START_TIMEOUT_S = 3600
@@ -85,7 +90,8 @@ def start(argv: list[str]) -> None:
     EngineArgs.add_cli_args(parser)
     args = EngineArgs.from_cli_args(parser.parse_args(argv))
     kwargs = args._get_engine_kwargs()
-    LLMEngine(args.model, runner_qualname=RUNNER, **kwargs).close()
+    runner = RAPIDSERVE_RUNNER if args.enable_rapidserve else RUNNER
+    LLMEngine(args.model, runner_qualname=runner, **kwargs).close()
 
 
 def main(argv: list[str], again: bool = False) -> None:

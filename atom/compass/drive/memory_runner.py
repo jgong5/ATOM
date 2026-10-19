@@ -59,6 +59,8 @@ class MemoryReadingModelRunner(ModelRunner):
 
     def _maybe_warmup(self):
         tokens, forward = [], self.forward
+        # RapidServe's prefill runner binds `prefill_forward` on the instance.
+        bound = vars(self).get("forward")
 
         def counted(batch, *args, **kwargs):
             tokens.append(batch.total_tokens_num)
@@ -69,6 +71,8 @@ class MemoryReadingModelRunner(ModelRunner):
             super()._maybe_warmup()
         finally:
             del self.forward
+            if bound is not None:
+                self.forward = bound
         self._read["warmup_tokens"] = sum(tokens)
 
     def _read_device_memory(self):
