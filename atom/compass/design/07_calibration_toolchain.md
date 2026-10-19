@@ -282,7 +282,7 @@ Method, settled by elimination:
 | per-operator CUDA events in line | **rejected** — 3.9x instrumentation overhead; 327 operators summed to 45.664 ms against a 3.946 ms replayed step |
 | per-call back-to-back loop | **rejected** — measures the host. A flat ~30 µs floor from M=1 to M=256; 298 operators x 30 µs = 8.9 ms against a priced total of 9.24 ms, i.e. the price list was the operator count times the floor |
 | one event pair per call | **worst** — the device idles through the host dispatch; 52.20 µs at M=4 against ~9 µs of kernel |
-| **capture N calls into a CUDA graph and replay** | **the method.** A replay of K calls reads `kernel + F/K` a call, F the replay's fixed cost: 18.7 and 19.4 µs for the mrope leaf on MI308X between K = 32 and 256 ([#1513](https://github.com/jgong5/ATOM/pull/1513)), so a 2.7 µs leaf still reads 16% high at K = 32. Every graph holds the same K (`atom/compass/bench/ops.py::CALLS`), which adds F/K, about 0.1 µs, to every price |
+| **capture N calls into a CUDA graph and replay** | **the method.** A replay of K calls reads `kernel + F/K` a call, F the replay's fixed cost: 18.7 and 19.4 µs for the mrope leaf on MI308X between K = 32 and 256 ([#1513](https://github.com/jgong5/ATOM/pull/1513)), so a 2.7 µs leaf still reads 16% high at K = 32. A graph holds the same K (`atom/compass/bench/ops.py::CALLS`), which adds F/K, about 0.1 µs, to every price, unless K calls pass 10 ms of device time (`GRAPH_NS`): then it holds as many calls as fill 10 ms, at least one, and F is under 0.2% of the price. A cached prefill attention call runs up to about 1 s, and at a fixed K its grid cost about 350 GPU-hours ([#1620](https://github.com/jgong5/ATOM/issues/1620)) |
 
 **Cold, by rotating copies.** The replay rotates over copies of the leaf's inputs and
 ambient state whose total exceeds the device's last-level cache, so each repeat reads cold
@@ -290,11 +290,15 @@ data. The copies include tensors the leaf reads through module attributes: the m
 leaf's cos/sin caches are `rotary_emb` attributes, counted in its bytes. The prototype's
 mrope reading, 3.3% to 11.5% under the same call timed where ATOM's decode step makes it,
 was the fixed replay cost at two call counts (above), not warm caches. The warm-over-cold ratio, the same point replayed on one copy, is reported per point
-as a diagnostic and prices nothing. The card's PTL state is read and keyed as
+as a diagnostic and prices nothing. A graph under K calls has no copy floor and no warm
+graph: its 10 ms of calls pass the last-level cache many times over, so warm over cold
+reads about 1. The card's PTL state is read and keyed as
 [#1434](https://github.com/jgong5/ATOM/issues/1434) rules.
 
 **Points, planned from the steps of record directories (D37).** Per leaf: every decode rung; prefill rows on
-a ladder of chunk remainders; attention's context features chosen per kind by data, under
+a ladder of chunk remainders, a kind that depends on context also over a ladder of the
+rows' cached tokens, each count twice the last: at one query length and kernel, attention
+time is linear in cached tokens, and a kernel change still densifies; attention's context features chosen per kind by data, under
 [#941](https://github.com/jgong5/ATOM/issues/941)'s rule. MoE leaves run on independent
 uniform routing. Each point records the kernels the leaf launched there, its kernel
 identity.

@@ -367,13 +367,45 @@ def test_every_cold_and_warm_graph_holds_calls_calls_at_any_copies(copies):
 
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=["k"]),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         record = stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], copies)
 
     assert graphs == [ops.CALLS] * (2 if copies > 1 else 1)
     assert (record["copies"], record["calls"]) == (copies, ops.CALLS)
+
+
+@pytest.mark.parametrize(
+    "call_ns, calls, copies",
+    [
+        (ops.GRAPH_NS / 1000, ops.CALLS, 8),  # short: every graph holds CALLS
+        (ops.GRAPH_NS / 10, 10, 8),
+        (ops.GRAPH_NS / 3.5, 3, 3),  # fewer calls than copies: one copy a call
+        (ops.GRAPH_NS * 50, 1, 1),  # past the cap: at least one call
+    ],
+)
+def test_a_long_call_fills_a_graph_to_graph_ns_and_has_no_warm_graph(
+    call_ns, calls, copies
+):
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    graphs = []
+
+    def replay(fn, cycle):
+        graphs.append(len(cycle))
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], call_ns)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        record = stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], 8)
+
+    assert graphs == [calls] * (2 if calls == ops.CALLS else 1)
+    assert (record["copies"], record["calls"]) == (copies, calls)
+    assert (record["warm_ns"] is None) == (calls < ops.CALLS)
 
 
 def test_a_batch_takes_the_blocks_and_slots_it_is_placed_at(rule):  # noqa: F811
