@@ -119,7 +119,7 @@ Times were measured on node 18 for the cell in
 [PR #1336](https://github.com/jgong5/ATOM/pull/1336), at concurrencies 1, 4, 16,
 64 and 256 with a 1800 s benchmark each.
 
-**1. Memory readings** (GPU, about 3 min).
+**1. Memory readings** (GPU, 2 to 3 min; 6 min on a container's first start).
 
 ```bash
 compass measure memory --gpu $G $M $S --out $R/memory -- $ATOM
@@ -175,7 +175,7 @@ done
 Writes the step record, `step_table.txt`, `run.json` (what grading reads) and
 `client-0/summary.json`. Success: that summary reads `"coverage_report": false`.
 
-**6. Grading** (developer check, CPU, outside the `compass` CLI).
+**6. Grading** (developer check, CPU, seconds per cell, outside the `compass` CLI).
 
 ```bash
 PYTHONPATH=$T python3 -m atom.compass.validate $R/cell/c1 $R/cell/c4 ...
@@ -215,9 +215,14 @@ HIP_VISIBLE_DEVICES=$G MACHINE=$T/scripts/compass/machines/mi308x-hjbog18.json \
 
 It prints each step as it starts, then the grading table, then one line with the
 verdict, the wall time and each run's warmup. It refuses a GPU that is not idle,
-names the step that failed, and exits 1 unless the cell is graded. On these
-traces at c=1, no step in the first 600 s batches two requests, in calibration or
-in the cell, so the law covers every step the cell takes.
+names the step that failed, and exits 1 unless the cell is graded. On node 18 it
+took 44 min: 13 to 15 min per real server, 2 min for the simulated run.
+
+On these traces at c=1, no step in the first 600 s batches two requests, in
+calibration or in the cell, so the law has a vector for every step the cell
+takes. One short calibration record does not span the cell's contexts, though,
+so the cost rows read `unvalidated`: the smoke cell checks the path, not the
+law's accuracy.
 
 ## Traps
 
