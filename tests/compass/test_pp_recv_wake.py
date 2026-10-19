@@ -79,20 +79,22 @@ def test_a_later_stage_whose_law_lacks_its_receive_part_is_refused_by_name():
 
 def test_a_sender_blocked_on_its_previous_sends_ack_goes_on_its_wake_after_it():
     """Ack 0 is released inside the second forward's compute: no wait, no wake.
-    Ack 1 comes at 4 s, 4 - 3C after the third forward's launch end: the loop
-    goes on `W (1 - exp(-b / rise))` later and sends then."""
-    wake = (2.0**-10, 2.0**-3)
-    late = wake[0] * (1 - math.exp(-(4.0 - 3 * C) / wake[1]))
+    Ack 1 comes `B` after the third forward's launch end: the loop goes on
+    `W (1 - exp(-b / rise))` later and sends then, `b` the time since send 0's
+    gloo parts completed, not the block."""
+    wake, first, B = (2.0**-10, 2.0**-3), C + 2.0**-7, 2.0**-9
+    done = 3 * C + B
+    late = wake[0] * (1 - math.exp(-(done - first) / wake[1]))
     rt, run, sends, _ = _stage(
         0,
         (C, {}),
-        (2 * C, {ACK: [(0, C + 2.0**-7)]}),
+        (2 * C, {ACK: [(0, first)]}),
         (3 * C, {}),
-        (4.0, {ACK: [(1, 4.0)]}),
-        (4.0 + late, {}),
+        (done, {ACK: [(1, done)]}),
+        (done + late, {}),
         frames=[
-            {"seq": 0, "tensors_done": -math.inf},
-            {"seq": 1, "tensors_done": -math.inf},
+            {"seq": 0, "tensors_done": -math.inf, "gloo_done": first},
+            {"seq": 1, "tensors_done": -math.inf, "gloo_done": done},
         ],
     )
     sends.wake = wake
@@ -103,9 +105,27 @@ def test_a_sender_blocked_on_its_previous_sends_ack_goes_on_its_wake_after_it():
         ("TAR", 2 * C, [(DATA, 0, C + L_DATA)]),
         ("TAR", 3 * C, [(DATA, 1, 2 * C + L_DATA)]),
         ("NER", math.inf, []),
-        ("TAR", 4.0 + late, []),
+        ("TAR", done + late, []),
     ]
-    assert rt.send_log == [(DATA, 2, 4.0 + late + L_DATA)]
+    assert rt.send_log == [(DATA, 2, done + late + L_DATA)]
+
+
+def test_a_senders_first_wait_goes_on_the_whole_wake_however_briefly_it_blocked():
+    """No send completed before send 0: its pair has carried nothing."""
+    wake, done = (2.0**-10, 2.0**-3), 2 * C + 2.0**-9
+    rt, run, sends, _ = _stage(
+        0,
+        (C, {}),
+        (2 * C, {}),
+        (done, {ACK: [(0, done)]}),
+        (done + wake[0], {}),
+        frames=[{"seq": 0, "tensors_done": -math.inf, "gloo_done": done}],
+    )
+    sends.wake = wake
+    for _ in range(2):
+        run("forward")
+    assert _sent(rt)[-1] == ("TAR", done + wake[0], [])
+    assert rt.send_log == [(DATA, 1, done + wake[0] + L_DATA)]
 
 
 def test_a_stage_takes_gloos_wake_from_the_machine_spec(monkeypatch):

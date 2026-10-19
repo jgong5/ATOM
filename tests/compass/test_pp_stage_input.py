@@ -124,7 +124,7 @@ def test_a_middle_stage_receives_then_sends_and_acks_both_ways():
         (arrived + C, {}),
         (arrived + 2 * C, {}),
         (acked, {ack_in: [(0, acked)]}),
-        frames=[frame, {"seq": 0, "tensors_done": -math.inf}],
+        frames=[frame, {"seq": 0, "tensors_done": -math.inf, "gloo_done": acked}],
         ready=4 * C,
         parts=ACKED,
         pp=4,
@@ -143,7 +143,7 @@ def test_a_middle_stage_receives_then_sends_and_acks_both_ways():
     assert calls == [
         ("recv_pp_frame", "pp_data"),
         ("pp_recv_posted", 0.0, "decode", (1, 1, 1)),
-        ("send_pp_frame", "pp_ack", {"seq": 0, "tensors_done": end}),
+        ("send_pp_frame", "pp_ack", {"seq": 0, "tensors_done": end, "gloo_done": done}),
         ("forward", batch),
         ("send_pp_frame", "pp_data", sent),
         ("recv_pp_frame", "pp_ack"),

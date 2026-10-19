@@ -122,8 +122,8 @@ def test_an_ack_released_during_the_compute_sends_at_its_end_and_a_later_one_at_
         (3 * C, {}),
         (4.0, {ACK: [(1, 4.0)]}),
         frames=[
-            {"seq": 0, "tensors_done": -math.inf},
-            {"seq": 1, "tensors_done": -math.inf},
+            {"seq": 0, "tensors_done": -math.inf, "gloo_done": done},
+            {"seq": 1, "tensors_done": -math.inf, "gloo_done": 4.0},
         ],
     )
     for _ in range(3):
@@ -143,7 +143,7 @@ def test_an_idle_flush_ends_at_the_ack_or_the_local_completion_or_where_it_was()
         0,
         (C, {}),
         (0.75, {ACK: [(0, 0.75)]}),
-        frames=[{"seq": 0, "tensors_done": -math.inf}],
+        frames=[{"seq": 0, "tensors_done": -math.inf, "gloo_done": 0.75}],
     )
     run("forward")
     run("flush_pp_send")
