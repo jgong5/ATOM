@@ -201,54 +201,58 @@ def publish(out: Path, machine, store: str, command: str) -> None:
     and write the entry's readable copy; then, the same way, those a RapidServe
     decode engine wrote in `DECODE`, unless their key is prefill's, whose
     readings size the pool."""
-    record = "sha256:" + hashlib.sha256((out / LOG).read_bytes()).hexdigest()
     published = set()
     for files, readable in (
         (out / READINGS, "memory_readings.json"),
         (out / READINGS / DECODE, f"memory_readings.{DECODE}.json"),
     ):
         ranks = {p.name: json.loads(p.read_text()) for p in files.glob("*.json")}
-        for held in ranks.values():
-            held["readings"]["record"] = record
         keys = {json.dumps(r["key"], sort_keys=True) for r in ranks.values()}
-        if len(keys) > 1:
-            raise ValueError(
-                f"the ranks read {len(keys)} keys off their configs: {sorted(keys)}"
-            )
         # No files, or prefill's key: nothing to add.
-        if keys <= published:
-            continue
-        published |= keys
-        first = ranks[min(ranks)]
-        fields = first["key"]
-        reserve = [
-            r["readings"]["driver_and_collective_reserve_bytes"] for r in ranks.values()
-        ]
-        across_ranks("non_torch", reserve)
-        key = Key.of(
-            Kind.MEMORY_READINGS, machine_spec=machine_spec_digest(machine), **fields
+        if not keys <= published:
+            _publish(out, ranks, readable, machine, store, command)
+            published |= keys
+
+
+def _publish(out: Path, ranks: dict, readable: str, machine, store, command) -> None:
+    record = "sha256:" + hashlib.sha256((out / LOG).read_bytes()).hexdigest()
+    for held in ranks.values():
+        held["readings"]["record"] = record
+    keys = {json.dumps(r["key"], sort_keys=True) for r in ranks.values()}
+    if len(keys) != 1:
+        raise ValueError(
+            f"the ranks read {len(keys)} keys off their configs: {sorted(keys)}"
         )
-        members = {n: json.dumps(r["readings"]).encode() for n, r in ranks.items()}
-        ArtifactStore(store).publish(
-            key,
-            provenance=Provenance(
-                command,
-                datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                roots_for({"atom": "atom", "aiter": "aiter"}),
-            ),
-            topology=read_back(min(ranks))[1].topology,
-            conditions=memory.conditions(
-                fields,
-                **machine_spec_key(machine).values,
-                torch=machine.value("device.software_pinned_to.torch"),
-            ),
-            gates=GateState.of(),
-            members=members,
-        )
-        copy = {"key": key.values, "token": key.token()}
-        copy["members"] = {n: r["readings"] for n, r in sorted(ranks.items())}
-        (out / readable).write_text(json.dumps(copy, indent=1) + "\n")
-        print(f"published {key} as {key.token()}")
+    first = ranks[min(ranks)]
+    fields = first["key"]
+    reserve = [
+        r["readings"]["driver_and_collective_reserve_bytes"] for r in ranks.values()
+    ]
+    across_ranks("non_torch", reserve)
+    key = Key.of(
+        Kind.MEMORY_READINGS, machine_spec=machine_spec_digest(machine), **fields
+    )
+    members = {name: json.dumps(r["readings"]).encode() for name, r in ranks.items()}
+    ArtifactStore(store).publish(
+        key,
+        provenance=Provenance(
+            command,
+            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            roots_for({"atom": "atom", "aiter": "aiter"}),
+        ),
+        topology=read_back(min(ranks))[1].topology,
+        conditions=memory.conditions(
+            fields,
+            **machine_spec_key(machine).values,
+            torch=machine.value("device.software_pinned_to.torch"),
+        ),
+        gates=GateState.of(),
+        members=members,
+    )
+    copy = {"key": key.values, "token": key.token()}
+    copy["members"] = {name: r["readings"] for name, r in sorted(ranks.items())}
+    (out / readable).write_text(json.dumps(copy, indent=1) + "\n")
+    print(f"published {key} as {key.token()}")
 
 
 def _parser() -> argparse.ArgumentParser:
