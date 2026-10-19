@@ -5,9 +5,11 @@
 
 The device fragment is one DeepSeek-V4-Pro start at the nightly DPA-TP8 prefill
 side's arguments (`FLAGS`): the device, its capacity and the stack. One real
-burst at the same arguments adds the HTTP intake terms (`INTAKE`). The peaks
-are the datasheet's; the rest is assumed. An engine start's memory readings are
-`compass measure memory`'s, not the spec's.
+burst at the same arguments adds the HTTP intake terms (`INTAKE`), and
+`probe_device.py`'s readings (`PEAKS`) the compute and memory derates, the
+bandwidth curve, the kernel floor and the intra-node link's latency and derate.
+The peaks are the datasheet's; the rest is assumed. An engine start's memory
+readings are `compass measure memory`'s, not the spec's.
 `--sweep-from` takes the tokenizer sweep from a document this script wrote.
 """
 
@@ -84,32 +86,87 @@ DATASHEET = {
     },
 }
 
+#: `probe_device.py`'s readings on mi355-gpu-40 cards 0000:75:00.0 and
+#: 0000:05:00.0, neither with a ptl directory, under the stack `DEVICE` pins
+#: (rocm/atom-dev nightly-20261013), at the commit named; the record is its OUT.
+#: gpu-40 has this spec's device, stack and PTL state, which key it, so its
+#: readings are this machine's. Each derate is a reading over `DATASHEET`'s peak.
+PEAKS = (
+    "2026-10-19",
+    "02c743a6e",
+    {
+        "bf16": 1592852424549788.5,
+        "fp8": 3353120308999141.0,
+        "fp4": 3052731942761773.0,
+        "bandwidth_curve": [
+            [4096, 2602130981.865485],
+            [8192, 5206180305.518442],
+            [16384, 10409320523.24805],
+            [32768, 19708237776.594437],
+            [65536, 38343634838.264114],
+            [131072, 76715098263.08249],
+            [262144, 153082555494.58926],
+            [524288, 298610965227.9424],
+            [1048576, 582634150306.8932],
+            [2097152, 1087837701452.4324],
+            [4194304, 1986955944350.4614],
+            [8388608, 3068770872274.9883],
+            [16777216, 4098138045431.5854],
+            [33554432, 5143630214884.57],
+            [67108864, 5845672029158.266],
+            [134217728, 6039832798328.265],
+            [268435456, 6132106636004.084],
+            [536870912, 6329662577833.507],
+            [1073741824, 6388411360929.36],
+            [2147483648, 6461842963537.07],
+            [4294967296, 6498015386808.537],
+        ],
+        "link": 61203979897.65694,
+        "device.kernel_floor_s": [
+            1.4594929814338685e-06,
+            1.4582370281219483e-06,
+            1.460436975955963e-06,
+        ],
+        "interconnect.intra_node.link_latency_s": [
+            8.120374977588653e-07,
+            8.022254765033721e-07,
+            8.216075003147124e-07,
+        ],
+    },
+    "e6af127e9779d9ee422eab67d8b4ee366c1443fb8915e31f76e7a3b8adf4eb20",
+)
+
 #: No probe fills these: mi308x_spec's assumed values less what the datasheet
-#: states, the FP4 rate taking the others' derate and the bandwidth curve
-#: ending at this bandwidth derated. Its inter-node link is one 400 Gb/s NIC's
+#: states and what `PEAKS` fills. Its inter-node link is one 400 Gb/s NIC's
 #: line rate here too.
 DECLARED = copy.deepcopy(base.DECLARED)
 for block, groups in DATASHEET.items():
     for group, values in groups.items():
         for key in values:
             DECLARED[block][group].pop(key, None)
-DECLARED["device"]["compute"]["derate"]["fp4"] = 0.70
-DECLARED["device"]["memory"]["bandwidth_curve"] = [[4096, 1.1e11], [4294967296, 6.8e12]]
 
 
 def device_fragments() -> list[Fragment]:
-    """The start's readings, the burst's intake terms, the datasheet's peaks
-    and the assumed rest."""
+    """The start's readings, the burst's intake terms, the datasheet's peaks,
+    the probed peaks and the assumed rest."""
     notes = f"one DeepSeek-V4-Pro {FLAGS} start at {COMMIT}"
     ptl = {"device": {"ptl": "disabled"}}
+    datasheet = fragment(
+        "datasheet", DATASHEET, "datasheet", "MI355X datasheet", date=DATE
+    )
+    assumed = fragment(
+        "assumed", DECLARED, "assumed", "no probe fills these", date=DATE
+    )
+    probed, assumed = base.peaks(PEAKS, datasheet.values, assumed)
     return [
         fragment("device", DEVICE, "probed", notes, SUBJECT, DATE),
         base.intake(MODEL, *INTAKE),
-        fragment("datasheet", DATASHEET, "datasheet", "MI355X datasheet", date=DATE),
-        fragment("assumed", DECLARED, "assumed", "no probe fills these", date=DATE),
+        datasheet,
+        assumed,
         fragment(
             "ptl", ptl, "probed", "no card has a ptl directory", date="2026-10-18"
         ),
+        probed,
     ]
 
 

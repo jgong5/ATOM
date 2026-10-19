@@ -126,3 +126,23 @@ def test_cards_disagreeing_with_the_spec_ptl_holding_vram_or_busy_are_refused(tm
     assert "0000:c8:00.0 (ptl enabled, 300000000 B used, 37% busy)" in str(
         refused.value
     )
+
+
+def test_the_mi355x_script_publishes_the_probed_fields_fp4_included(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("COMPASS_MACHINE", raising=False)
+    script = _load("mi355x_spec")
+    gemm = RECORD["gemm"] | {"fp4": {"8192x8192x8192": [1e-3, 2e-3, 3e-3]}}
+    found = probe.readings(RECORD | {"gemm": gemm})
+    monkeypatch.setattr(script, "PEAKS", ("2026-10-19", "abc", found, "f00d"))
+    document = SCRIPTS / "machines" / "mi355x-gpu45.json"
+    out = tmp_path / "spec.json"
+    assert script.main(["--sweep-from", str(document), "--out", str(out)]) == 0
+    spec = MachineSpec.from_mapping(json.loads(out.read_text()))
+    # Each derate is over the datasheet's peak, FP4's over `fp4_flops`.
+    assert spec.value("device.compute.derate.fp4") == 2 * 8192**3 / 2e-3 / 1.00663e16
+    assert spec.value("device.memory.derate") == 2.048e9 / 8.0e12
+    for path in ("device.compute.derate.fp4", "device.memory.bandwidth_curve"):
+        assert spec.origin(path)["record"] == "sha256:f00d"
+    assert spec.origin("device.compute.fp4_flops")["origin"] == "datasheet"
