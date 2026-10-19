@@ -115,3 +115,23 @@ def test_a_decode_counts_q_the_sink_and_o_alone():
 
     moved = 2 * 4 * 16 + 2 * 4 * 4 * 2 + 4 * 4 + 2 * 4 * 16 * 2
     assert work(op, rows((1, 9), (1, 300)), 1, "fp8") == Work({}, moved)
+
+
+def test_a_compressor_state_update_counts_no_kv_or_score_row():
+    # A 4096-token chunk at ratio 4 with overlap: the plan names 8 rows per
+    # sequence, so the kernel reads 8 of the 4096 kv and score rows.
+    op = leaf(
+        V4 + "state_writes:update_compressor_states",
+        kv=t([4096, 512], F32),
+        score=t([4096, 512], F32),
+        ape=t([4, 512], F32, role="weight"),
+        kv_state=t([POOL, 8, 512], F32, role="kv"),
+        score_state=t([POOL, 8, 512], F32, role="kv"),
+        write_plan=t([8, 4], I32, role="metadata"),
+        state_slot_mapping=t([1], I32, role="metadata"),
+        ratio=4,
+        overlap=True,
+    )
+
+    moved = 4 * 512 * 4 + 4
+    assert work(op, rows((4096, 4096), decode=False), 1, "fp8") == Work({}, moved)

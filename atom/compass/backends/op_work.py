@@ -461,9 +461,9 @@ EXTRACTORS = {
     f"{V4}fused_compress:fused_compress_attn": _only(
         "kv_in", "score_in", "ape", "rms_weight", "state_slot_mapping"
     ),
-    f"{V4}state_writes:update_compressor_states": _only(
-        "kv", "score", "ape", "state_slot_mapping"
-    ),
+    # The kernel reads only the kv and score rows write_plan names, at most
+    # (1 + overlap) * ratio per sequence, so neither is counted.
+    f"{V4}state_writes:update_compressor_states": _only("ape", "state_slot_mapping"),
     f"{V4}state_writes:swa_write": _only(
         "positions", "cu_seqlens_q", "state_slot_per_seq"
     ),

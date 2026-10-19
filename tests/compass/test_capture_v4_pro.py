@@ -17,6 +17,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import types
 
 import pytest
 from test_capture_ir import _decoder, _ops
@@ -246,3 +247,46 @@ def test_a_step_split_into_two_micro_batches_is_refused_by_name(tmp_path):
         "prefill T=8192 B=1 runs two micro-batches under --enable-tbo"
         in done.stderr.splitlines()[-1]
     )
+
+
+def test_the_attention_body_runs_as_a_real_step_then_the_batch_is_dummy_again(
+    monkeypatch,
+):
+    import torch
+
+    from atom.compass.capture.forward import _v4_attention
+    from atom.utils.forward_context import Context, get_forward_context
+
+    def fused_compress_attn():
+        pass
+
+    def _sparse_attn_v4_paged_decode_asm():
+        pass
+
+    # The model and its kernels import aiter, which needs a device arch: they
+    # are stood in for, and so is the op the model registers.
+    decode = types.SimpleNamespace(
+        _sparse_attn_v4_paged_decode_asm=_sparse_attn_v4_paged_decode_asm
+    )
+    kernels = types.SimpleNamespace(paged_decode=decode)
+    monkeypatch.setitem(sys.modules, "atom.model_ops.v4_kernels", kernels)
+    monkeypatch.setattr(torch.ops.aiter, "v4_attention_with_output", None, False)
+    context = Context(positions=None, is_dummy_run=True)
+    monkeypatch.setattr(get_forward_context(), "context", context)
+    seen = []
+
+    def attention(x, positions, layer_name):
+        seen.append(context.is_dummy_run)
+        if layer_name == "raises":
+            raise RuntimeError(layer_name)
+
+    v4 = types.SimpleNamespace(
+        v4_attention_with_output=attention, fused_compress_attn=fused_compress_attn
+    )
+    with _v4_attention(v4, recorder=None):
+        torch.ops.aiter.v4_attention_with_output(None, None, "returns")
+        assert context.is_dummy_run
+        with pytest.raises(RuntimeError):
+            torch.ops.aiter.v4_attention_with_output(None, None, "raises")
+        assert context.is_dummy_run
+    assert seen == [False, False]
