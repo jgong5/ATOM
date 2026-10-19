@@ -15,6 +15,7 @@ summary into its out_dir; the summary after a refused step is the one
 import dataclasses
 import json
 import sys
+from pathlib import Path
 
 import pytest
 import test_drive_trace_steps
@@ -327,3 +328,77 @@ def test_run_json_names_the_assumed_memory_readings_its_engine_read(
     handed = json.loads((out / serve.RUN_FILE).read_text())
     provenance = handed["backend"] | {"memory_readings_assumed": [ASSUMED]}
     assert written["provenance"] == provenance
+
+
+#: The planted server, which also writes the arguments it was started with to
+#: the file `PLANTED_ARGV` names.
+SEEING = (
+    "import json, os, sys\n"
+    'json.dump(sys.argv[1:], open(os.environ["PLANTED_ARGV"], "w"))\n'
+) + PLANTED
+
+
+def deployed(tmp_path, monkeypatch, summary):
+    """A deployment's directory as `deploy.sh` leaves it before its instances
+    start: its run file, with both engines' hand-ins beside it, each from an
+    entry assumed as its side names; returns the run file's path."""
+    d = tmp_path / "deployment"
+    d.mkdir()
+    run = build(tmp_path, "--step-stub", stub(tmp_path))
+    run |= {"out_dir": str(d), "clock_endpoint": "tcp://127.0.0.1:1"}
+    (d / serve.RUN_FILE).write_text(json.dumps(run))
+    for side in ("P", "D"):
+        hand_in = {"refusals": [], "memory": {"assumed": f"assumed on {side}"}}
+        (d / compass_run.LP_FILE.format(f"engine-{side}")).write_text(
+            json.dumps(hand_in)
+        )
+    steps = recorded(tmp_path, monkeypatch, SHORT) / serve.STEPS
+    plant(tmp_path, monkeypatch, steps, summary)
+    (tmp_path / "planted.py").write_text(SEEING)
+    monkeypatch.setenv("PLANTED_ARGV", str(tmp_path / "argv.json"))
+    return d / serve.RUN_FILE
+
+
+def test_a_joined_instance_joins_its_deployment_s_authority_and_grades_from_there(
+    tmp_path, monkeypatch
+):
+    summary = refused_summary(tmp_path / "authority", monkeypatch)
+    joined = deployed(tmp_path, monkeypatch, summary)
+    out = tmp_path / "prefill"
+    kv = json.dumps({"kv_connector": "compass", "kv_role": "kv_producer"})
+
+    drive_run.main(
+        ["--join", str(joined), "--out", str(out), "--", "--model", str(tmp_path)]
+        + ["--kv-transfer-config", kv]
+    )
+
+    run = json.loads(joined.read_text())
+    seen = json.loads((tmp_path / "argv.json").read_text())
+    handed = seen[seen.index("--compass-run") + 1]
+    assert handed == str(out / serve.RUN_FILE)
+    assert json.loads(Path(handed).read_text()) == run
+    assert seen[seen.index("--compass-clock-endpoint") + 1] == run["clock_endpoint"]
+    ready = json.loads((out / serve.READY_FILE).read_text())
+    assert ready["clock_endpoint"] == run["clock_endpoint"]
+    written = json.loads((out / serve.RUN_JSON).read_text())
+    refusals = json.loads(summary.read_text())["schedule"]["refusals"]
+    assert written["refusals"] == refusals
+    assert written["run_file"] == run
+    provenance = run["backend"] | {"memory_readings_assumed": ["assumed on P"]}
+    assert written["provenance"] == provenance
+
+
+def test_a_joined_instance_refuses_a_run_file_flag_and_a_run_file_naming_no_authority(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(serve, "serve", unstarted)
+    run = build(tmp_path, "--step-stub", stub(tmp_path))
+    (tmp_path / "run_file.json").write_text(json.dumps(run))
+    join = ["--join", str(tmp_path / "run_file.json"), "--out", str(tmp_path / "out")]
+    atom = ["--", "--model", str(tmp_path)]
+
+    with pytest.raises(SystemExit):
+        drive_run.main([*join, "--step-roofline", *atom])
+    with pytest.raises(ValueError, match="names no clock_endpoint and out_dir"):
+        drive_run.main([*join, *atom])
+    assert not (tmp_path / "out").exists()

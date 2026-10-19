@@ -122,6 +122,7 @@ def test_a_cell_writes_its_client_run_s_export(tmp_path, ids, cell_rc):
                 "b": {"trace": "t1", "sampling": PARAMETERS},
             },
             "warmup": {},
+            "unnamed": [],
             "traces": ["s1", "s2"],
             "sessions": {"s1": 1, "s2": 2},
             "arguments": ARGUMENTS,

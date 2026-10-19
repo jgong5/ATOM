@@ -48,7 +48,6 @@ def identity(
     command calls this once its server stops."""
     engine = json.loads(Path(engine_file).read_text())
     keyed = keyed_of(engine)
-    rocm = Path(os.environ.get("ROCM_PATH", "/opt/rocm")) / ".info" / "version"
     return {
         "format_version": FORMAT_VERSION,
         "argv": list(argv),
@@ -56,13 +55,21 @@ def identity(
         "host_key": host_key_of(model, keyed),
         "device": _device(gpus),
         "ptl": _ptl(gpus),
-        "stack": {
-            "rocm": rocm.read_text().strip(),
-            "aiter": _commit(module_root("aiter")),
-            "rccl": ".".join(map(str, torch.cuda.nccl.version())),
-            "torch": torch.__version__,
-        },
+        "stack": _stack(),
         "profiled": False,  # a command that profiles ops sets it
+    }
+
+
+def _stack() -> dict:
+    """The stack this process runs, as a machine spec pins it: ROCm's version,
+    aiter's commit, RCCL's version and torch's. It needs no engine, so a
+    command can read it before it starts one."""
+    rocm = Path(os.environ.get("ROCM_PATH", "/opt/rocm")) / ".info" / "version"
+    return {
+        "rocm": rocm.read_text().strip(),
+        "aiter": _commit(module_root("aiter")),
+        "rccl": ".".join(map(str, torch.cuda.nccl.version())),
+        "torch": torch.__version__,
     }
 
 

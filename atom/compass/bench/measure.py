@@ -14,7 +14,7 @@ engine file. Its lines are read as `parity.served` reads a record, each with
 the traces the client runs `--client-run` names for it sent. Lines a dummy run
 wrote are dropped; under `--sessions A:B` so is every line serving no trace, or
 a trace whose session, as its client run's export states it, lies outside A to
-B, inclusive; a trace no export gives a session refuses.
+B, inclusive; a trace no export gives a session, or its exports give two, refuses.
 An input refuses unless a `--client-run` names it, its kept lines served
 requests under `--sampling` alone, and it states the engine ATOM's arguments
 resolve, `keyed`'s fields, at data-parallel width 1, the bench's.
@@ -376,7 +376,19 @@ def _read(name: str, store, client_runs, sessions, engine: dict, sampling: dict)
         )
     if sessions:
         exports = [json.loads(Path(c).read_text()) for c in client_runs]
-        given = {t: s for e in exports for t, s in e.get("sessions", {}).items()}
+        pairs = sorted(
+            {(t, s) for e in exports for t, s in e.get("sessions", {}).items()}
+        )
+        given = dict(pairs)
+        if twice := sorted({t for t, s in pairs if given[t] != s}):
+            raise ValueError(
+                f"the client runs naming {name} give "
+                + "; ".join(
+                    f"{t} sessions {' and '.join(str(s) for u, s in pairs if u == t)}"
+                    for t in twice
+                )
+                + ", and --sessions selects a trace by its one session"
+            )
         traces = sorted({r["trace"] for e in exports for r in e["requests"].values()})
         if unnumbered := [t for t in traces if t not in given]:
             raise ValueError(

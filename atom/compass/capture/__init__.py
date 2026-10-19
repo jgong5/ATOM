@@ -90,7 +90,10 @@ def population_shapes(names):
 
 def population_steps(names):
     """Each step the record directories `names` hold, DP's dummy runs aside,
-    as its shape and its step-record line."""
+    as its shape, the one the op-level backend prices it at
+    (`op_graph.step_shape`), and its step-record line."""
+    from atom.compass.backends.op_graph import step_shape
+
     from .forward import decode, prefill
 
     for name in names:
@@ -99,18 +102,14 @@ def population_steps(names):
             raise ValueError(f"{name} is not a record directory: it has no run.json")
         texts = [p.read_text() for p in (path / "steps").glob("dp*[0-9].jsonl")]
         for line in (json.loads(t) for text in texts for t in text.splitlines()):
-            rows = line["rows"]
             if line["is_dummy_run"]:
                 continue
-            if not all(row[2] for row in rows):
-                yield prefill(sum(row[0] for row in rows), len(rows)), line
-            elif wide := [row[0] for row in rows if row[0] != 1]:
-                raise ValueError(
-                    f"{name} step {line['step']} decodes {wide[0]} tokens in a row: "
-                    "a speculative decode step is not captured"
-                )
-            else:
-                yield decode(line["rung"] or len(rows)), line
+            rows = [(row[0], row[2]) for row in line["rows"]]
+            try:
+                phase, tokens, seqs = step_shape(rows, line["rung"])
+            except ValueError as exc:
+                raise ValueError(f"{name} step {line['step']} {exc}") from None
+            yield decode(tokens) if phase == "decode" else prefill(tokens, seqs), line
 
 
 def publish(store, graph, model, declared, tp, atom_args, command):

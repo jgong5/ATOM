@@ -268,3 +268,19 @@ def test_a_record_s_server_keeps_triton_s_autotune_choices_unless_the_caller_say
     run = json.loads((out / "run.json").read_text())
     assert run["env"] == {"TRITON_CACHE_AUTOTUNING": held}
     assert os.environ.get("TRITON_CACHE_AUTOTUNING") == caller
+
+
+@pytest.mark.skipif(GIT is None, reason="needs git")
+def test_a_record_binds_the_host_it_names_which_its_url_names(tmp_path, planted_gpu):
+    """A server bound only to the host its arguments name answers `/health`."""
+    server = tmp_path / "server.py"
+    host = 'sys.argv[sys.argv.index("--host") + 1]'
+    server.write_text(server.read_text().replace('"127.0.0.1"', host))
+    out = tmp_path / "out"
+
+    cli.main(
+        f"record --gpu 7 --host 127.0.0.2 --out {out} -- --model {planted_gpu}".split()
+    )
+
+    url = json.loads((out / serve.READY_FILE).read_text())["url"]
+    assert url.startswith("http://127.0.0.2:")
