@@ -29,6 +29,7 @@ import pytest
 from test_dp_slice import DP_MACHINE, MAX_TOKENS, Requests
 from test_kv_remote_prefill import Script, connector
 from test_kv_simulated_connector import PEAKS, geometry, model_for  # noqa: F401
+from test_multinode_dp import _bound
 from test_pd_slice import NEEDS_A_PD_RUN, PD, PORTS, PdTraffic
 from test_vertical_slice import CONSTANT, MODEL, TREE, WALL_S, _run_file
 
@@ -73,13 +74,14 @@ def run_pd_dp(out: Path, seed: str, form: str, sides=None) -> dict:
         }
     out.mkdir()
     # The write requests take p * d ports from KV_WRITE_REQ_PORT, which may
-    # reach another drawn port: draw all of them again then.
+    # reach another drawn port or one another process holds: draw all of
+    # them again then.
     kv = "KV_WRITE_REQ_PORT"
     while True:
         ports = dict(zip(PORTS, _free_ports(len(PORTS))))
-        if not {port for n, port in ports.items() if n != kv} & set(
-            range(ports[kv], ports[kv] + p * d)
-        ):
+        block = range(ports[kv], ports[kv] + p * d)
+        others = {port for n, port in ports.items() if n != kv}
+        if not others & set(block) and all(map(_bound, block)):
             break
     run_file = _run_file(
         out,

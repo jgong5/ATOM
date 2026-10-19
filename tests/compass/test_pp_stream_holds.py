@@ -17,7 +17,7 @@ import pytest
 import test_pp_launch_send as launch
 from test_dp_step_max import prefill
 from test_pp_launch_send import CARRIER, LAUNCH, POST, PRE, E
-from test_pp_stage_input import ACKED, DATA, SIZE, C, T, _decode
+from test_pp_stage_input import ACKED, DATA, MODELS, SIZE, C, T, _decode
 from test_pp_stage_input import _stage as fake_stage
 
 from atom.compass.runner import pp_send
@@ -59,7 +59,10 @@ def test_a_sending_stage_starts_its_device_work_after_the_send_it_waited_for(
         (t2 + launch_end, {}),
         (tb, {ACK: [(1, tb)]}),
         (tb + POST, {}),
-        frames=[{"seq": 0, "tensors_done": held}, {"seq": 1, "tensors_done": 5.0}],
+        frames=[
+            {"seq": 0, "tensors_done": held, "gloo_done": ta},
+            {"seq": 1, "tensors_done": 5.0, "gloo_done": tb},
+        ],
         pp=pp,
         models=ALL_RDV,
     )
@@ -102,7 +105,7 @@ def test_a_receiving_stage_takes_a_rendezvous_tensor_after_its_own_device_work(
     run("forward", batch)
     tensor = busy + ALL_RDV["rccl"].rendezvous_s(512)
     assert batch.compass_pp_release == tensor
-    assert sent == [{"seq": 0, "tensors_done": tensor}]
+    assert sent == [{"seq": 0, "tensors_done": tensor, "gloo_done": done}]
     assert rt.conn.sent[1][2] == [(ack, 0, done)]  # stamped where it was
 
 
@@ -148,7 +151,11 @@ def test_a_middle_stage_takes_its_input_after_the_send_its_stream_waited_for():
         (0.5, {ack_in: [(0, 0.5)]}),
         (1.0, {DATA: [(1, 1.0)]}),
         (1.0 + C, {}),
-        frames=[frames[0], {"seq": 0, "tensors_done": held}, frames[1]],
+        frames=[
+            frames[0],
+            {"seq": 0, "tensors_done": held, "gloo_done": 0.5},
+            frames[1],
+        ],
         parts=ACKED,
         pp=4,
     )
@@ -159,4 +166,5 @@ def test_a_middle_stage_takes_its_input_after_the_send_its_stream_waited_for():
     # Up since 1.0, the tensor moved its threshold's 1024 bytes before the post.
     end = held - 1024 * 2.0**-20 + T
     assert batch.compass_pp_release == end
-    assert calls[-3][2] == {"seq": 1, "tensors_done": end}
+    gloo_done = pp_send.arrivals(MODELS, frames[1], 1.0)[0]
+    assert calls[-3][2] == {"seq": 1, "tensors_done": end, "gloo_done": gloo_done}
