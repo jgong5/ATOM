@@ -391,6 +391,45 @@ def test_a_call_cycles_over_every_weight_of_its_spec_on_the_cold_copies_inputs()
     assert (n, record["copies"]) == (1, 2)
 
 
+def test_a_copy_past_the_cold_ones_takes_its_own_cold_copy_s_inputs_and_is_logged(
+    monkeypatch, capsys
+):
+    # A [2, 3] input and a [3, 3] weight are 60 bytes a call: 2 copies pass
+    # twice a 30-byte cache. The model holds four weights of that spec, so
+    # copies 2 and 3 are copies 0 and 1 with the third and fourth.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    runner = _Runner()
+    runner.model.extend([torch.nn.Linear(3, 3), torch.nn.Linear(3, 3)])
+    stub = ops.Stub(runner, 30)
+    mm = _leaf(
+        "aten.mm.default",
+        ("self", _t([2, 3], "activation")),
+        ("mat2", _t([3, 3], "weight")),
+    )
+    found = ops.leaves(_graph(mm, layers=1)["region"])
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    graphs = []
+
+    def replay(fn, calls):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(runner.model, "forward", stub),
+        patch.object(ops, "_kernels", return_value=["k"]),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        [record] = stub.point(placed, decode(2), 20, found)
+
+    cold = [kwargs for kwargs, _ in graphs[0][:4]]
+    assert cold[1]["self"] is not cold[0]["self"]
+    assert cold[2]["self"] is cold[0]["self"] and cold[3]["self"] is cold[1]["self"]
+    assert all(c["mat2"] is m.weight for c, m in zip(cold, runner.model))
+    assert record["copies"] == 4 and "over 4 copies" in capsys.readouterr().out
+
+
 def test_copy_c_rotates_weights_and_instances_and_clones_past_the_first_round():
     runner = _Runner()
     stub = ops.Stub(runner, 10_000)

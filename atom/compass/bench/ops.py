@@ -385,13 +385,14 @@ class Stub:
         for sig, (op, inst) in found.items():
             n, size, _ = plans[sig]
             names = {p: m[0] for (s, p), m in self.placed[0][1].items() if s == sig}
-            print(f"{shape}: {op['op']} over {n} copies {names or ''}", flush=True)
             record = {"shape": str(shape), "context": context, "op": op["op"]}
             record |= {"leaf": sig, "metadata": names}
             try:
                 record |= self._time(op, sig, inst, n) | {"footprint_bytes": n * size}
             except Exception as error:  # noqa: BLE001 - a refusal names what stopped it
                 record["refused"] = f"{type(error).__name__}: {error}"
+            copies = record.get("copies", n)
+            print(f"{shape}: {op['op']} over {copies} copies {names or ''}", flush=True)
             got.append(
                 record | {"instances": len(inst), "placements": len(self.placed)}
             )
