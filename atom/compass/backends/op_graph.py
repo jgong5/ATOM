@@ -40,9 +40,10 @@ neither from a datasheet nor probed, and `analytical` otherwise.
 Refused: a step with image tokens, since no graph holds the vision encoder; a
 two-batch-overlap step on MoRI's split send and receive (`split_send_recv`),
 whose transfer in flight lies on no stream, whose split names no pair for
-this rank, whose micro-batches' graphs exchange a different number of times,
-or whose ranks schedule different rows in one micro-batch, since capture runs
-one rank and its peers at this rank's rows; a speculative decode step; a
+this rank, whose micro-batches' graphs exchange a different number of times
+or run an exchange beside a second stream (the dual-stream MoE, which ATOM
+turns off under overlap), or whose ranks schedule different rows in one
+micro-batch, since capture runs one rank and its peers at this rank's rows; a speculative decode step; a
 prefill step whose view does not say whether it produces output; a shape with
 no graph; and, each reason once, a data-parallel step's (`moe_rows`) MoE
 exchange leaf, for that same reason, and a leaf whose kind has no extractor,
@@ -203,6 +204,13 @@ class OpGraphBackend(CostBackend):
             at.append(shape)
             run = [0.0]
             for _, seconds, stated, _, comm in self._priced(region, half, refused):
+                if comm is None:
+                    reason = (
+                        f"a two-batch-overlap step whose micro-batch graph at {shape} "
+                        "runs an MoE exchange beside a second stream, as the "
+                        "dual-stream MoE does, which ATOM turns off under overlap"
+                    )
+                    raise CostRefused(view, [Refusal(SOURCE, reason)])
                 notes += stated
                 if comm != (len(run) % 2 == 0):
                     run.append(0.0)
@@ -219,8 +227,9 @@ class OpGraphBackend(CostBackend):
     def _priced(self, region: dict, view: BatchView, refused: list) -> list:
         """`region`'s prices in run order, each ``(term, seconds, stated, work,
         comm)``, `work` what it adds to an enclosing resource_bound, `comm`
-        that it rides the comm stream under two-batch overlap; what refuses
-        goes to `refused`."""
+        that it rides the comm stream under two-batch overlap, None when it
+        joins an MoE exchange to work on another stream; what refuses goes to
+        `refused`."""
         if "op" in region:
             leaf = self._leaf(region, view, refused)
             comm = region["op"].startswith(MOE_EXCHANGES) and any(
@@ -234,18 +243,19 @@ class OpGraphBackend(CostBackend):
             return [p for i in region["seq"] for p in self._priced(i, view, refused)]
         branches = [self._priced(b, view, refused) for b in region["par"]]
         summed = sum((p[3] for b in branches for p in b), Work())
+        comm = None if any(p[4] is not False for b in branches for p in b) else False
         if region["join"] == "max":
             each = [fold_seconds(p[1] for p in b) for b in branches]
             longest = branches[each.index(max(each))]
             # The longest branch's prices stay under their own terms; the
             # first carries every branch's work for an enclosing resource_bound.
             return [
-                (*p[:3], summed if i == 0 else Work(), p[4])
+                (*p[:3], summed if i == 0 else Work(), comm)
                 for i, p in enumerate(longest)
             ]
         name = f"par.{region['join']}"
         unit = self._unit(name, summed, refused)
-        return [(name, *unit, summed, False)] if unit else []
+        return [(name, *unit, summed, comm)] if unit else []
 
     def _leaf(self, leaf: dict, view: BatchView, refused: list):
         """One leaf's ``(seconds, stated, work)``; None when it launches no

@@ -340,6 +340,15 @@ def test_a_split_step_with_no_price_is_refused_by_name(batch, graph, split, name
         backend(graph, split_send_recv=split).price(batch)
 
 
+@pytest.mark.parametrize("join", ["max", "resource_bound"])
+def test_a_micro_batch_whose_exchange_shares_a_par_is_refused(join):
+    routed = {"seq": [leaf(GATHER, [[2, 8]], x=t([1, 8])), g(1, 8, 8)]}
+    dual = {"par": [routed, g(1, 8, 8)], "join": join}
+
+    with pytest.raises(CostRefused, match="runs an MoE exchange beside a second"):
+        OpGraphBackend(SECOND, lambda *at: dual, kv="bf16").price(SPLIT)
+
+
 def test_micro_batches_whose_graphs_exchange_unalike_are_refused():
     def graph(phase, tokens, seqs, output):
         return layers(count=tokens - 2)
