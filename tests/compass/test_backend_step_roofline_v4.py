@@ -269,8 +269,10 @@ for cls in Mxfp4MoEMethod, MegaMxfp4MoEMethod, FusedMoE:
     cls.__module__ = "atom.model_ops.moe"
 
 walked = {}
-for case, (method, backend, off, combine, fp4) in json.loads(sys.argv[2]).items():
-    os.environ.update(ATOM_DISABLE_MORI_EP=off, ATOM_MORI_COMBINE_QUANT=combine)
+for case, (method, backend, off, combine, fp4, v2) in json.loads(sys.argv[2]).items():
+    os.environ.update(
+        ATOM_DISABLE_MORI_EP=off, ATOM_MORI_COMBINE_QUANT=combine, ATOM_MORI_V2=v2
+    )
     mori._FP4_DISPATCH = fp4
     # EP2 over two data-parallel ranks of TP1 attention.
     moe = FusedMoE()
@@ -288,14 +290,17 @@ for case, (method, backend, off, combine, fp4) in json.loads(sys.argv[2]).items(
 print(json.dumps(walked))
 """
 #: Method, all-to-all backend, ATOM_DISABLE_MORI_EP, ATOM_MORI_COMBINE_QUANT,
-#: ATOM_MORI_FP4_DISPATCH.
+#: ATOM_MORI_FP4_DISPATCH, ATOM_MORI_V2.
 WALKS = {
-    "mori": ("Mxfp4MoEMethod", "auto", "0", "none", False),
-    "mori-quantized": ("Mxfp4MoEMethod", "mori", "0", "fp8_blockwise", True),
-    "rccl": ("Mxfp4MoEMethod", "rccl", "0", "none", False),
-    "none": ("Mxfp4MoEMethod", "none", "0", "none", False),
-    "mori-disabled": ("Mxfp4MoEMethod", "auto", "1", "none", False),
-    "mega": ("MegaMxfp4MoEMethod", "mori", "0", "none", False),
+    "mori": ("Mxfp4MoEMethod", "auto", "0", "none", False, "0"),
+    "mori-quantized": ("Mxfp4MoEMethod", "mori", "0", "fp8_blockwise", True, "0"),
+    "rccl": ("Mxfp4MoEMethod", "rccl", "0", "none", False, "0"),
+    "none": ("Mxfp4MoEMethod", "none", "0", "none", False, "0"),
+    "mori-disabled": ("Mxfp4MoEMethod", "auto", "1", "none", False, "0"),
+    "mega": ("MegaMxfp4MoEMethod", "mori", "0", "none", False, "0"),
+    "mori-fp4-combine": ("Mxfp4MoEMethod", "auto", "0", "fp4_blockwise", False, "0"),
+    "unknown-combine": ("Mxfp4MoEMethod", "auto", "0", "int8", False, "0"),
+    "mori-v2": ("Mxfp4MoEMethod", "auto", "0", "none", False, "1"),
 }
 
 
@@ -321,9 +326,12 @@ def _walked():
 def test_mori_sends_at_the_formats_atom_resolves():
     assert _walked()["mori"] == [["moe", "experts", "bf16", "bf16"]]
     assert _walked()["mori-quantized"] == [["moe", "experts", "fp4", "fp8"]]
+    assert _walked()["mori-fp4-combine"] == [["moe", "experts", "bf16", "fp4"]]
 
 
-@pytest.mark.parametrize("case", ["rccl", "none", "mori-disabled", "mega"])
+@pytest.mark.parametrize(
+    "case", ["rccl", "none", "mori-disabled", "mega", "unknown-combine", "mori-v2"]
+)
 def test_an_ep_moe_off_moris_exchange_is_unclassified(case):
     refused = ["unclassified", "FusedMoE at experts", "bf16", "bf16"]
 

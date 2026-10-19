@@ -66,6 +66,13 @@ FORMATS = {
     "bf16": "bf16",
     "fp8": "fp8",
 }
+#: What MoRI's combine sends back, by `ATOM_MORI_COMBINE_QUANT`.
+MORI_COMBINE = {
+    "none": "bf16",
+    "fp8_direct_cast": "fp8",
+    "fp8_blockwise": "fp8",
+    "fp4_blockwise": "fp4",
+}
 #: A module that prices nothing; one to go into.
 NOTHING, DESCEND = object(), object()
 OPS = "atom.model_ops."
@@ -192,7 +199,8 @@ def _moe(module, name, parent):
     if getattr(method, "fp8_activations", False):
         act = "fp8"
     fmt, attention_tp = FORMATS.get(w13.dtype), getattr(parent, "tp_size", None)
-    if not (act and fmt and attention_tp):
+    mega = _is(method, OPS + "moe.MegaMxfp4MoEMethod")
+    if mega or not (act and fmt and attention_tp):
         return None
     config = module.moe_parallel_config
     ranks = config.ep_size if config.use_ep else config.tp_size
@@ -200,20 +208,16 @@ def _moe(module, name, parent):
     dims = (module.global_num_experts, w13.shape[0], module.top_k)
     dims += (w13.shape[1] // 2, module.hidden_size, ranks, ranks // attention_tp, split)
     fused = module._comm_fused_moe is not None
-    if _is(method, OPS + "moe.MegaMxfp4MoEMethod"):
-        return None
-    wire = ("bf16", "bf16")
-    if config.use_ep and dims[6] > 1:
-        from atom.model_ops.fused_moe.mori_prepare_finalize import (
-            resolve_mori_dispatch,
-        )
-        from atom.utils import envs
+    if not (config.use_ep and dims[6] > 1):
+        return Module(name, "moe", dims, fmt, ranks, fused, act=act)
+    from atom.model_ops.fused_moe.mori_prepare_finalize import resolve_mori_dispatch
+    from atom.utils import envs
 
-        mori = config.requested_all2all_backend in ("auto", "mori")
-        mori = mori and not envs.ATOM_DISABLE_MORI_EP
-        sent = resolve_mori_dispatch(module.moe_config.in_dtype, module.hidden_size)
-        sent = FORMATS.get(sent.dtype)
-        if not (mori and sent):
-            return None
-        wire = (sent, "bf16" if envs.ATOM_MORI_COMBINE_QUANT == "none" else "fp8")
+    mori = config.requested_all2all_backend in ("auto", "mori") and not (
+        envs.ATOM_DISABLE_MORI_EP or envs.ATOM_MORI_V2
+    )
+    sent = resolve_mori_dispatch(module.moe_config.in_dtype, module.hidden_size)
+    wire = (FORMATS.get(sent.dtype), MORI_COMBINE.get(envs.ATOM_MORI_COMBINE_QUANT))
+    if not (mori and all(wire)):
+        return None
     return Module(name, "moe", dims, fmt, ranks, fused, act=act, wire=wire)
