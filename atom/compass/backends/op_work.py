@@ -295,6 +295,59 @@ def _kv_indices(op, view, tp, kv) -> Work:
     return Work({}, _bytes(op["args"]["kv_indptr_convert"]))
 
 
+def _only(*slots, out=None):
+    """The `slots`' tensors each read or written once, and the outputs in the
+    `out` dtype. What else the leaf reaches by index (a KV pool, a rotary
+    cache, a state ring) is left out, which only lowers its bytes."""
+
+    def extract(op, view, tp, kv) -> Work:
+        args = op["args"]
+        moved = sum(_bytes(t) for s in slots for t in _tensors(args.get(s)))
+        if out is not None:
+            moved += sum(math.prod(s) * _size(out) for s in op["out"])
+        return Work({}, moved)
+
+    return extract
+
+
+def _quant(slot):
+    """A block quant: its boundary, the values in the `slot` dtype and their
+    e8m0 scales."""
+    return lambda op, view, tp, kv: _boundary(
+        op, outs=[op["args"][slot], "torch.float8_e8m0fnu"]
+    )
+
+
+def _batched_gemm(op, view, tp, kv) -> Work:
+    """V4's grouped output projection: `x [m, g, k]` through each group's
+    `[n, k]` weights, read once each, and both block scales read once. The
+    outputs are counted at `x`'s format, which only lowers them."""
+    args = op["args"]
+    x, w = args["x"], args["wo_a"]
+    m, groups, k = x["shape"]
+    fmt = _fmt(x["dtype"])
+    one = gemm(m, w["shape"][1], k, fmt, _fmt(w["dtype"]), fmt)
+    scales = _bytes(args["x_scale"]) + _bytes(args["w_scale"])
+    return sum([one] * groups, Work({}, scales))
+
+
+def _v4_prefill(op, view, tp, kv) -> Work:
+    """V4's prefill attention over the KV entries its index lists name, the
+    cached prefix's and the chunk's own: each query against each of its
+    entries, two products of the head width each, at Q's format. Q, the
+    chunk's KV, the index lists and O cross once; the prefix entries are
+    read from the pool and left out of the bytes."""
+    args = op["args"]
+    pairs = args["kv_indices_prefix"]["shape"][0]
+    pairs += args["kv_indices_extend"]["shape"][0]
+    _, heads, _ = args["q_nope"]["shape"]
+    flops = 4 * heads * op["out"][0][-1] * pairs
+    rest = [v for s, v in args.items() if not s.startswith("unified_kv")]
+    moved = sum(map(_bytes, _tensors(rest)))
+    moved += math.prod(op["out"][0]) * _size("torch.bfloat16")
+    return Work({_fmt(args["q_nope"]["dtype"]): flops}, moved)
+
+
 def _shape(value):
     if isinstance(value, dict) and "dtype" in value:
         return value["shape"]
@@ -354,20 +407,57 @@ def _aten(op, view, tp, kv) -> Work | None:
 MOE = "atom.model_ops.moe:"
 MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp."
 V4_INDICES = "atom.model_ops.v4_kernels.paged_"
+V4 = "atom.model_ops.v4_kernels."
+#: What V4's fused QK norm and RoPE writes: Q and K, each as its fp8 values
+#: with their scales and its bf16 rotary part.
+QK_OUT = ("q_nope_scale_buff", "q_rope_buff", "k_nope_scale_buff", "k_rope_buff")
 EXTRACTORS = {
     "aiter.gemm_a16w16.default": _gemm(),
     "aiter.gemm_a8w8_blockscale_preshuffle_impl.default": _gemm(
         "x", "weight", "dtype", ("x_scale", "w_scale")
     ),
-    "aiter.per_1x128_e8m0_quant.default": lambda op, view, tp, kv: _boundary(
-        op, outs=[op["args"]["quant_dtype"], "torch.float8_e8m0fnu"]
-    ),
+    "aiter.per_1x128_e8m0_quant.default": _quant("quant_dtype"),
     "aiter.rmsnorm2d_fwd_.default": _in_place(),
     "aiter.mhc_res_repeat.default": _in_place(),
     "aiter.mhc_pre.default": _mhc("residual"),
     "aiter.mhc_post.default": _in_place(),
     "aiter.mhc_fused_post_pre.default": _mhc("residual_in"),
     "aiter.v4_attention_with_output.default": _unstated,
+    "aiter._aiter_rms_quant.default": _quant("value_dtype"),
+    "aiter._fused_qk_norm_rope_group_quant_kernel.default": _only(
+        "q", "kv", "k_weight", "positions", *QK_OUT
+    ),
+    "aiter._inverse_rope_group_quant_kernel.default": _only(
+        "o", "positions", "x_fp8", "x_scale"
+    ),
+    "aiter._rope_rotate_activation_fp4quant.default": _only(
+        "input", "positions", "out", "scale"
+    ),
+    "aiter.batched_gemm_a8w8_mxscale.default": _batched_gemm,
+    # ponytail: the scores against each row's compressed index entries are
+    # left out; the leaf states neither the index cache nor its compression.
+    "aiter.indexer_score_topk.default": _in_place(),
+    "aiter.pa_sparse_prefill_fp8_opus.default": _v4_prefill,
+    # ponytail: decode counts Q, the sink and O only. Its index lists are
+    # sized for the deployment's longest row, and the leaf states no window,
+    # compression or top-k, so the KV each row reads and the products over it
+    # are left out. Count them when a decode leaf states its layer's geometry.
+    "aiter.mla_decode_v4_ps_asm.default": _only("Q", "qrope", "sink", "output"),
+    f"{V4}paged_decode:_sparse_attn_v4_paged_decode_asm": _only(
+        "q_packed_in", "q_rope_in", "attn_sink", out="torch.bfloat16"
+    ),
+    f"{V4}fused_compress:fused_compress_attn": _only(
+        "kv_in", "score_in", "ape", "rms_weight", "state_slot_mapping"
+    ),
+    f"{V4}state_writes:update_compressor_states": _only(
+        "kv", "score", "ape", "state_slot_mapping"
+    ),
+    f"{V4}state_writes:swa_write": _only(
+        "positions", "cu_seqlens_q", "state_slot_per_seq"
+    ),
+    f"{V4}csa_translate_pack:csa_translate_pack": _only(
+        "topk_local", "positions", "kv_indptr_csa", "batch_id_per_q_token"
+    ),
     "aiter.topk_gating_fwd.default": _in_place(),
     "atom.model_ops.triton_hash_topk:hash_topk_triton": _gather("tid2eid"),
     "aiter.fused_moe_.default": _fused_moe,

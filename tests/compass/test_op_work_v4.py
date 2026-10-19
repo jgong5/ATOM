@@ -2,9 +2,10 @@
 """DeepSeek-V4-Pro's op kinds, priced from each leaf's own arguments.
 
 Each extractor matches a hand count on one shape, the MoE's in expectation
-under uniform routing; every leaf of the nightly DPA-TP8 captures, EP off and
-EP8, has work that prices, but the attention, which is refused by name; and the
-op-level backend refuses a V4-Pro step for that reason alone.
+under uniform routing; the whole attention as one leaf is refused by name;
+every leaf of the nightly DPA-TP8 captures, EP off and EP8, has work that
+prices, the attention's own kernels among them; and the op-level backend
+prices a V4-Pro decode step and a prefill step.
 """
 
 from math import comb
@@ -30,6 +31,7 @@ F32, FP8, FP4 = "torch.float32", "torch.float8_e4m3fn", "torch.float4_e2m1fn_x2"
 E8M0 = "torch.float8_e8m0fnu"
 ATTENTION = "aiter.v4_attention_with_output.default"
 MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp."
+DECODE = "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_asm"
 
 
 def moe(rows, local, mask=None):
@@ -222,30 +224,27 @@ def test_the_attention_is_refused_by_name():
 
 
 @pytest.mark.parametrize("ep", ["", EP8], ids=["ep_off", "ep8"])
-def test_every_v4_pro_leaf_prices_but_the_attention(ep, tmp_path_factory):
+def test_every_v4_pro_leaf_prices(ep, tmp_path_factory):
     graphs = capture(tmp_path_factory, SHAPES + DPA_TP8 + ep)
-    kinds, refused = set(), set()
+    kinds = set()
     for shape, (graph, _) in graphs.items():
         view = _view(shape)
         for op, _ in leaves(graph["region"]).values():
             kinds.add(op["op"])
-            try:
-                w = work(op, view, 1, "fp8")
-            except CostRefused:
-                refused.add(op["op"])
-                continue
+            w = work(op, view, 1, "fp8")
             assert w is None or price(w, SPEC) > 0
 
-    assert refused == {ATTENTION}
+    assert ATTENTION not in kinds
     assert {"aiter.fused_moe_.default", "aiter.mhc_pre.default"} <= kinds
+    assert {"aiter.pa_sparse_prefill_fp8_opus.default", DECODE} <= kinds
     exchanges = {MORI + "dispatch", MORI + "combine"}
     assert exchanges <= kinds if ep else not exchanges & kinds
 
-    # The op-level backend refuses a V4-Pro step for the attention alone.
-    graph, _ = graphs["decode B=2"]
-    backend = OpGraphBackend(SPEC, lambda *shape: graph["region"], kv="fp8")
-    with pytest.raises(CostRefused) as refusal:
-        backend.price(rows((1, 1024), (1, 1024)))
-    assert [r.reason.split(":")[0] for r in refusal.value.declined] == [
-        f"the op kind {ATTENTION}"
-    ]
+    # The op-level backend prices a V4-Pro decode step and a prefill step.
+    for shape, view in (
+        ("decode B=2", rows((1, 1024), (1, 1024))),
+        ("prefill T=512 B=1", rows((512, 512), decode=False)),
+    ):
+        graph, _ = graphs[shape]
+        backend = OpGraphBackend(SPEC, lambda *s, g=graph: g["region"], kv="fp8")
+        assert backend.price(view).seconds > 0

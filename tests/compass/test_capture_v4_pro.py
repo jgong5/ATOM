@@ -35,6 +35,10 @@ EP8 = " --enable-expert-parallel"
 DP = 8
 MOE = "atom.model_ops.moe"
 MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp"
+V4 = "atom.model_ops.v4_kernels."
+DECODE = V4 + "paged_decode:_sparse_attn_v4_paged_decode_asm"
+#: The attention's core kernel, one a layer, by phase.
+CORE = {"decode": DECODE, "prefill": "aiter.pa_sparse_prefill_fp8_opus.default"}
 
 _CAPTURES: dict = {}
 
@@ -126,7 +130,9 @@ def test_each_layer_runs_its_shared_expert_beside_the_moe_on_every_rank_s_rows(
     assert len(layers) == LAYERS
     for layer in layers:
         names = [op["op"] for op in layer]
-        assert names.count("aiter.v4_attention_with_output.default") == 1
+        # The attention runs its body: its kernels are the layer's own leaves.
+        assert "aiter.v4_attention_with_output.default" not in names
+        assert names.count(CORE[shape.split()[0]]) == 1
         assert names.count("aiter.fused_moe_.default") == 1
         exchanged = [op for op in layer if op["kind"] == "declared"]
         if ep:
@@ -171,8 +177,11 @@ def test_a_prefill_s_head_takes_each_sequence_s_last_token(tmp_path_factory):
             for op in _ops(graph["region"])
             if op["op"] == "aiter.gemm_a16w16.default"
         ]
-        # Each layer's router takes every token; the head, after them, one per sequence.
-        assert [op["args"]["A"]["shape"][0] for op in gemms] == [512] * LAYERS + [seqs]
+        # Each layer's router and attention take every token; the head, after
+        # them, one per sequence.
+        taken = [op["args"]["A"]["shape"][0] for op in gemms]
+        assert len(taken) > LAYERS
+        assert taken == [512] * (len(taken) - 1) + [seqs]
 
 
 def test_a_lifted_function_holds_a_mapping_and_a_host_object(tmp_path_factory):
@@ -189,6 +198,22 @@ def test_a_lifted_function_holds_a_mapping_and_a_host_object(tmp_path_factory):
     assert rows and all(isinstance(k, int) and "shape" in t for k, t in rows)
 
 
+def test_two_attention_functions_are_leaves_at_their_call(tmp_path_factory):
+    graph, _ = capture(tmp_path_factory, SHAPES + DPA_TP8)["decode B=2"]
+
+    ops = _ops(graph["region"])
+    names = {op["op"] for op in ops}
+    assert V4 + "fused_compress:fused_compress_attn" in names
+    # The aiter kernel the decode function dispatches is folded into it.
+    assert "aiter.mla_decode_v4_asm.default" not in names
+    for op in ops:
+        if op["op"] == DECODE:
+            assert op["kind"] == "opaque_leaf"
+            # As called: the function trims it to the step's rows before its
+            # launches.
+            assert op["args"]["split_indptr"]["shape"][0] > 2 + 1
+
+
 def test_tp8_without_dp_attention_reduces_in_each_layer_and_declares_nothing(
     tmp_path_factory,
 ):
@@ -203,7 +228,8 @@ def test_tp8_without_dp_attention_reduces_in_each_layer_and_declares_nothing(
         assert len(layers) == LAYERS
         for layer in layers:
             names = [op["op"] for op in layer]
-            assert names.count("aiter.all_reduce_.default") == 1
+            # The attention's output projection and the MoE each reduce.
+            assert names.count("aiter.all_reduce_.default") == 2
             assert not [op for op in layer if op["kind"] == "declared"]
 
 
