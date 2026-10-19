@@ -16,8 +16,12 @@ at each shape, a value not the same at every shape, and that value is the
 shape's token or sequence count or one more. Any other integer names the leaf:
 the GEMMs of a decode step differ in N and K and share a family per weight.
 
-A family's points sit at the shape's counts, B and the context for a decode,
-T and B for a prefill. `interpolate` prices a query at a measured point as
+A family's dimensions are the shape's counts its masked integers follow, a
+decode's B always, and, for a kind that depends on context as `measure ops`
+decides (`bench.ops._dependent`), a prefill's B and the context (`band`'s
+mean): a decode row's, or the tokens a prefill row had cached. Points at one
+coordinate, its other counts or contexts dropped, are one point at their mean
+time. `interpolate` prices a query at a measured point as
 that point; between points, multilinearly over the neighbours that bracket it
 along each dimension, when they all launched the same kernels. It declines
 any other query: outside the measured range, with a neighbour missing, or
@@ -142,16 +146,34 @@ def family(shape: str, leaf: str, free) -> str:
     return _text([shape.split()[0], sig])
 
 
-def coords(shape: str, context) -> dict:
-    """A point's dimensions: the counts `shape` states, then the context."""
-    at = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", shape)}
-    return at | ({} if context is None else {"context": context})
+def shape_counts(shape: str) -> dict:
+    """The counts `shape` states, ``T`` and ``B`` for a prefill, ``B`` for a decode."""
+    return {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", shape)}
+
+
+def band(rows, decode: bool) -> tuple[int, int]:
+    """The mean and max context of `rows`, each ``[query, context, ...]``: a
+    decode row's context, a prefill row's cached tokens."""
+    c = [row[1] - (0 if decode else row[0]) for row in rows]
+    return sum(c) // len(c), max(c)
+
+
+def _context(p) -> int:
+    """A point's context: `band`'s mean over the rows it records, else its
+    ``context``, none cached on a prefill that states none."""
+    decode = p["shape"].startswith("decode")
+    if "rows" in p:
+        return band(p["rows"], decode)[0]
+    return p["context"] if decode else p["context"] or 0
 
 
 def fit(points) -> dict:
     """The price list's params: per skeleton, the integer positions that follow
     the shape, and per family, its dimensions and its points, each its
     coordinates, its cold time in ns and its kernels."""
+    from atom.compass.bench.ops import _dependent
+
+    dependent = _dependent(points)
     groups: dict[str, list] = {}
     for p in points:
         groups.setdefault(skeleton(p["shape"], p["leaf"]), []).append(p)
@@ -171,13 +193,37 @@ def fit(points) -> dict:
             and all(vs[0][i] in counts[s] for s, vs in at.items())
             and len({vs[0][i] for vs in at.values()}) > 1
         ]
+        follows = {
+            n
+            for i in free_of[skel]
+            for n in ("T", "B")
+            if all(
+                vs[0][i] - shape_counts(s).get(n, -9) in (0, 1) for s, vs in at.items()
+            )
+        }
         for p in members:
-            dims = coords(p["shape"], p["context"])
+            moves = dependent.get(p["op"], True)
+            at_p = shape_counts(p["shape"]) | {"context": _context(p)}
+            dims = ["B"]  # a decode step's graph is per B
+            if "T" in at_p:
+                dims = [d for d in ("T", "B") if d in follows or moves]
+            dims += ["context"] if moves else []
             f = families.setdefault(
                 family(p["shape"], p["leaf"], free_of[skel]),
-                {"op": p["op"], "dims": list(dims), "points": []},
+                {"op": p["op"], "dims": dims, "points": {}},
             )
-            f["points"].append([list(dims.values()), p["cold_ns"], p["kernels"]])
+            got = f["points"].setdefault(tuple(at_p[d] for d in dims), [])
+            got.append((p["cold_ns"], p["kernels"]))
+    for name, f in families.items():
+        merged = []
+        for c, got in f["points"].items():
+            if any(k != got[0][1] for _, k in got):
+                raise ValueError(
+                    f"{name} launched {got[0][1]} and other kernels at {f['dims']} "
+                    f"= {list(c)}: no one price stands there"
+                )
+            merged.append([list(c), statistics.mean(ns for ns, _ in got), got[0][1]])
+        f["points"] = merged
     return {"free": free_of, "families": families}
 
 

@@ -67,7 +67,9 @@ any other, and a law missing either refuses; a list of them is one per engine co
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
 holds at its shape, the run's TP width and KV cache format; capture traces
-eager forwards, so a graph-mode run reads the eager graphs too),
+eager forwards, so a graph-mode run reads the eager graphs too; with
+``price_list``, the fields of a `price_list` key ``store`` holds, loaded
+under this run's readings, it prices each leaf from it first),
 ``step_roofline`` (optional, ``true`` or ``false``: with ``true`` a
 `StepRooflineBackend` prices the steps the backend refuses, through
 `StepFallbackBackend`, as it always does under ``step_grid``, from the
@@ -279,7 +281,7 @@ COMPASS_ONLY = {
 }
 #: The run-file key of each backend a flag names (`atom.compass.drive.runfile`).
 STEP_STUB, STEP_LINEAR, STEP_GRID = "step_stub", "step_linear", "step_grid"
-OP_GRAPH = "op_graph"
+OP_GRAPH, PRICE_LIST = "op_graph", "price_list"
 #: The run-file key of the frontend's seconds to prepare one image of a chat request.
 IMAGE_PREPROCESS = "image_preprocess_s"
 #: Run-file keys that were renamed, to their names now.
@@ -1398,6 +1400,12 @@ def runner(model_runner, tree) -> None:
             tp=tp,
             kv=config.kv_cache_dtype,
             padded=padding != "none",
+            price_list=PRICE_LIST in run and _price_list(run, config, machine),
+        )
+    elif PRICE_LIST in run:
+        raise ValueError(
+            "the run file names a price_list and no op_graph, the one backend "
+            "that reads it"
         )
     if fallback or STEP_GRID in run:
         from atom.compass.run.modules import walk
@@ -1495,6 +1503,21 @@ def _op_graphs(root: str, config):
         return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
 
     return graph
+
+
+def _price_list(run: dict, config, machine) -> dict:
+    """The params of the `price_list` the run file names by its key's fields,
+    loaded from its store under this run's readings, or a refusal naming the
+    reading that differs."""
+    from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind
+    from atom.compass.fit.publish import RANK
+    from atom.compass.run.step_grid import conditions
+
+    key = Key.of(Kind.PRICE_LIST, **run[PRICE_LIST])
+    entry = ArtifactStore(run["store"]).load(
+        key, conditions=conditions(config, machine), gates=GateState.of()
+    )
+    return json.loads(entry.read_member("params", RANK, "json"))
 
 
 def _graph_pool(model_runner, machine, model):

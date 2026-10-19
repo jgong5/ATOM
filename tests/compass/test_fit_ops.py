@@ -210,3 +210,46 @@ def test_points_naming_two_price_lists_refuse(measured, tmp_path):
     with pytest.raises(SystemExit, match="^compass fit ops: the points name 2 price"):
         _fit(tmp_path / "fit", tmp_path / "store", a, b)
     assert not (tmp_path / "store" / "price_list").exists()
+
+
+def _prefill(t, b, ns, op="aiter.gemm", context=None, rows=None):
+    """A prefill point of `t` tokens over `b` rows, its GEMM over the tokens."""
+    point = _point(b, ns, context=context) | {"shape": f"prefill T={t} B={b}"}
+    point |= {"op": op, "leaf": _leaf(t, 128)}
+    return point | ({"rows": rows} if rows else {})
+
+
+def test_a_kind_that_does_not_move_with_context_runs_over_the_counts_it_follows():
+    # the GEMM reads within 10% at two contexts of each width, so the decode
+    # points at one B are one point; the prefill points at one T too, B aside
+    points = [_point(2, 10.0), _point(2, 10.4, context=2048)]
+    points += [_point(8, 16.0), _point(8, 16.0, context=2048)]
+    points += [_prefill(64, 1, 30.0), _prefill(64, 2, 32.0), _prefill(128, 1, 50.0)]
+
+    assert _families(points) == [
+        (["B"], [[[2], 10.2], [[8], 16.0]]),
+        (["T"], [[[64], 31.0], [[128], 50.0]]),
+    ]
+
+
+def test_a_point_sits_at_its_rows_mean_context_or_cached_tokens():
+    # the decode GEMM moves with context; the prefill kind is never timed at
+    # two contexts of one width, so it is taken to move with them
+    points = [_point(2, 10.0), _point(2, 20.0, context=3000)]
+    points += [
+        _point(2, 15.0, context=3000) | {"rows": [[1, 3000, True], [1, 1000, True]]}
+    ]
+    points += [_prefill(64, 1, 30.0, "attn"), _prefill(64, 1, 31.0, "attn", 0)]
+    points += [_prefill(64, 1, 40.0, "attn", 512, rows=[[64, 64 + 512, False]])]
+
+    assert _families(points) == [
+        (["B", "context"], [[[2, 1024], 10.0], [[2, 3000], 20.0], [[2, 2000], 15.0]]),
+        (["T", "B", "context"], [[[64, 1, 0], 30.5], [[64, 1, 512], 40.0]]),
+    ]
+
+
+def test_points_at_one_coordinate_that_launched_other_kernels_refuse():
+    points = [_point(2, 10.0), _point(2, 10.0, "x") | {"rows": [[1, 1024, True]] * 2}]
+
+    with pytest.raises(ValueError, match=r"launched \['k'\] and other kernels at"):
+        ops.fit(points)

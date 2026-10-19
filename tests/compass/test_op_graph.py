@@ -7,7 +7,11 @@ body's prices, a `max` `Par` takes its longest branch, and a
 graph, or its width's under ``padding: none``, a prefill at its tokens and
 rows; attention reads its context in the run's KV format. What cannot be
 priced is refused by name, each reason once. The Qwen3.8-27B TP1 capture prices leaf by leaf, and `run.runner` installs the
-backend from a run file's ``op_graph`` over the store's graphs.
+backend from a run file's ``op_graph`` over the store's graphs. With a price
+list, a leaf takes its price first, measured on a point or estimated between
+two of one kernel, at the step's counts and its rows' mean context; anything
+the list declines, a line the fit declined among them, is its roofline,
+carrying why.
 """
 
 import json
@@ -17,15 +21,19 @@ import pytest
 from test_backend_step_linear import _installed, law, view
 from test_backend_step_roofline import COMPUTE, MEMORY, _spec
 from test_capture_ir import CONFIG, WIDTH_2, _ops, capture
+from test_memory_readings import DOCUMENT
 from test_op_work import leaf, t
 from test_work import SPEC
 
+from atom.compass.artifacts import ArtifactRefusal
 from atom.compass.backends import BatchView, CostRefused, Method, RequestShape
 from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import NONE, OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.work import attention, gemm, price
+from atom.compass.bench.ops import signature
+from atom.compass.fit import ops as fit_ops
 from atom.compass.run import _op_graphs
 
 GEMM = "aiter.gemm_a16w16.default"
@@ -246,3 +254,220 @@ def test_a_run_file_op_graph_that_is_not_true_is_refused(monkeypatch, tmp_path):
 def test_a_run_file_with_op_graph_and_another_backend_is_refused(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="has step_linear and op_graph"):
         _installed(monkeypatch, tmp_path, step_linear=law(), op_graph=True)
+
+
+# --- the price list first ------------------------------------------------------
+
+
+def pt(leaf, shape, ns, context=None, kernel="k", rows=None):
+    """A `measure ops` point of `leaf` at `shape`."""
+    point = {"shape": shape, "context": context, "op": leaf["op"], "cold_ns": ns}
+    point |= {"leaf": signature(leaf), "kernels": [kernel]}
+    return point | ({"rows": rows} if rows else {})
+
+
+def listed(*points):
+    """`compass fit ops`'s params over `points`, declined lines included."""
+    params = fit_ops.fit(list(points))
+    fit_ops.held_out(params)
+    return params
+
+
+# A GEMM whose time does not move with context: its family runs over B alone.
+FLAT = listed(
+    *[
+        pt(g(b, 64, 64), f"decode B={b}", ns, c)
+        for b, ns in ((2, 5e3), (4, 7e3))
+        for c in (100, 1000)
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "batch,padded,priced,method",
+    [
+        (DECODE, True, 5e-6, Method.MEASURED),
+        (view(*[(1, 90, True)] * 3), False, 6e-6, Method.ESTIMATED),
+    ],
+    ids=["on-a-point", "between-two"],
+)
+def test_a_leaf_the_price_list_holds_is_priced_from_it(batch, padded, priced, method):
+    (term,) = backend(g(2, 64, 64), padded=padded, price_list=FLAT).price(batch).terms
+
+    assert (term.name, term.seconds) == (f"op.{GEMM}.price_list", pytest.approx(priced))
+    assert (term.provenance.method, term.provenance.source) == (method, "price-list")
+    assert not term.provenance.refusals
+
+
+def test_a_leaf_the_price_list_declines_is_its_roofline_and_carries_why():
+    wide = view(*[(1, 90, True)] * 5, rung=8)
+    alone = backend(g(2, 64, 64)).price(wide)
+    cost = backend(g(2, 64, 64), price_list=FLAT).price(wide)
+
+    assert (
+        by_name(cost) == by_name(alone) == {f"op.{GEMM}": by_name(alone)[f"op.{GEMM}"]}
+    )
+    assert cost.fell_back and cost.terms[0].provenance.method is Method.ANALYTICAL
+    assert cost.refusals == (
+        Refusal("price-list", f"{GEMM}: B = 8 is outside the measured 2 to 4"),
+    )
+
+
+# Along context at B = 2 the middle point reads +25% off its neighbours' line.
+BENT = listed(
+    *[
+        pt(g(2, 64, 64), "decode B=2", ns, c)
+        for c, ns in ((1000, 1e4), (2000, 2e4), (3000, 4e4))
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "rows,answer",
+    [
+        ([(1, 2000, True)] * 2, 2e-5),
+        (
+            [(1, 1500, True)] * 2,
+            (
+                f"{GEMM}: the fit declined context at B = 2: context = 2000 reads "
+                "+25.0% off its neighbours"
+            ),
+        ),
+    ],
+    ids=["its-measured-point", "along-it"],
+)
+def test_a_line_the_fit_declined_answers_its_points_only(rows, answer):
+    cost = backend(g(2, 64, 64), price_list=BENT).price(view(*rows, rung=2))
+
+    if isinstance(answer, float):
+        assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(answer)}
+    else:
+        assert cost.refusals == (Refusal("price-list", answer),)
+
+
+# Linear in context, one kernel to 2000 and another at 3000.
+BANDED = listed(
+    *[
+        pt(g(2, 64, 64), "decode B=2", ns, c, kernel)
+        for c, ns, kernel in ((1000, 1e4, "a"), (2000, 2e4, "a"), (3000, 3e4, "b"))
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "rows,answer",
+    [
+        ([(1, 1500, True)] * 2, 1.5e-5),
+        ([(1, 1000, True), (1, 2000, True)], 1.5e-5),
+        (
+            [(1, 1000, True), (1, 3000, True)],
+            f"{GEMM}: its rows' context from 2000 to 3000 crosses from a to b",
+        ),
+    ],
+    ids=["uniform", "uneven-in-one-kernel", "uneven-across-two"],
+)
+def test_a_step_s_rows_price_at_their_mean_inside_one_kernel_to_their_max(rows, answer):
+    cost = backend(g(2, 64, 64), price_list=BANDED).price(view(*rows, rung=2))
+
+    if isinstance(answer, float):
+        assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(answer)}
+        assert cost.terms[0].provenance.method is Method.ESTIMATED
+    else:
+        assert cost.refusals == (Refusal("price-list", answer),)
+
+
+ATTN = leaf(ATTENTION, [[64, 6144]], q=t([64, 24, 256]), k=t([64, 4, 256]))
+# A prefill of 64 tokens over two rows, each past 0, 1024 or 2048 cached tokens.
+CACHED = listed(
+    *[
+        pt(ATTN, "prefill T=64 B=2", ns, c, rows=[[32, 32 + c, False]] * 2)
+        for c, ns in ((0, 1e4), (1024, 2e4), (2048, 3e4))
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "rows,params,answer",
+    [
+        ([(32, 32 + 512, False)] * 2, CACHED, 1.5e-5),
+        ([(32, 32, False), (32, 32 + 2048, False)], CACHED, 2e-5),
+        (
+            [(32, 32 + 512, False)] * 2,
+            listed(pt(ATTN, "prefill T=64 B=2", 1e4)),
+            (
+                f"{ATTENTION}: at T = 64, at B = 2, context = 512 is outside the "
+                "measured 0 to 0"
+            ),
+        ),
+    ],
+    ids=["uniform", "uneven", "fresh-rows-only"],
+)
+def test_a_prefill_prices_linearly_in_its_rows_cached_tokens(rows, params, answer):
+    cost = backend(ATTN, price_list=params).price(view(*rows))
+
+    if isinstance(answer, float):
+        assert by_name(cost) == {f"op.{ATTENTION}.price_list": pytest.approx(answer)}
+    else:
+        assert cost.refusals == (Refusal("price-list", answer),)
+
+
+def test_a_resource_bound_par_prices_its_leaves_work_not_their_listed_prices():
+    pooled = {"par": [g(2, 64, 64), g(2, 64, 64)], "join": "resource_bound"}
+
+    assert by_name(backend(pooled, price_list=FLAT).price(DECODE)) == by_name(
+        backend(pooled).price(DECODE)
+    )
+
+
+def _published(tmp_path, root=None):
+    """The fields of a `price_list` key holding `FLAT`, published under the
+    readings a run on the suite's machine document takes from this tree, or
+    from the tree `root`."""
+    from atom.compass.artifacts import Key, Kind, Reading, git_tree_root, module_root
+    from atom.compass.fit.publish import publish
+    from atom.compass.run import _machine
+    from atom.compass.run.step_grid import readings
+
+    tree = git_tree_root("atom", module_root("atom"))
+    source = Reading("tree", root) if root else Reading.of_source_root(tree)
+    machine = _machine({"machine": DOCUMENT})
+    conditions = readings(machine, atom_src=source, model="m", engine_config="{}")
+    key = Key.of(
+        Kind.PRICE_LIST,
+        model="sha256:" + "0" * 64,
+        dp=1,
+        pp=1,
+        pcp=1,
+        tp=1,
+        decode_context_parallel_size=1,
+        enable_expert_parallel=False,
+        enable_dp_attention=False,
+        machine_spec="sha256:" + "1" * 64,
+        source_root="tree-" + "a" * 40,
+    )
+    args = SimpleNamespace(store=str(tmp_path / "store"), out=str(tmp_path), ptl=None)
+    publish(args, "compass fit ops", key, conditions, FLAT, {})
+    return key.values
+
+
+def test_a_run_file_price_list_prices_leaves_from_the_store_s_entry(
+    monkeypatch, tmp_path
+):
+    fields = _published(tmp_path)
+    installed = _installed(monkeypatch, tmp_path, op_graph=True, price_list=fields)
+
+    assert installed.resolver.sources[0].params == FLAT
+
+
+def test_a_run_file_price_list_from_another_tree_is_refused_at_load(
+    monkeypatch, tmp_path
+):
+    fields = _published(tmp_path, root="b" * 40)
+
+    with pytest.raises(ArtifactRefusal, match="`price_list` x `ATOM src`"):
+        _installed(monkeypatch, tmp_path, op_graph=True, price_list=fields)
+
+
+def test_a_run_file_price_list_without_op_graph_is_refused(monkeypatch, tmp_path):
+    with pytest.raises(ValueError, match="names a price_list and no op_graph"):
+        _installed(monkeypatch, tmp_path, step_linear=law(), price_list={})
