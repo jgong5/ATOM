@@ -36,7 +36,8 @@ behind a spin kernel, so no host time is in it.
 The run is refused unless every card is idle (under `IDLE_BYTES` of VRAM used,
 0% busy) and reads SPEC's ``device.ptl`` from
 ``ptl/ptl_enable`` under its sysfs device (`NO_PTL` where it has none). OUT
-is the record: the cards, every sample and this file's text; the fragment
+is the record: the cards, the stack (ROCm, aiter's commit, RCCL and torch),
+every sample and this file's text; the fragment
 printed names its sha256.
 """
 
@@ -333,6 +334,7 @@ def main(argv: list[str] | None = None) -> int:
     import torch
 
     from atom.compass.artifacts.provenance import git_tree_root
+    from atom.compass.drive.identity import _stack
 
     spec_path, out = (Path(a) for a in (argv or sys.argv[1:]))
     spec = MachineSpec.from_mapping(json.loads(spec_path.read_text()))
@@ -342,13 +344,13 @@ def main(argv: list[str] | None = None) -> int:
         f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"
         for p in props
     ]
-    record = {"cards": cards(bdfs), "arch": props[0].gcnArchName}
+    record = {"cards": cards(bdfs), "arch": props[0].gcnArchName, "stack": _stack()}
     refuse_unfit(record["cards"], ptl)
     stated = [
         f for f, peak in FORMATS.items() if f"device.compute.{peak}" in spec.values
     ]
     record |= probe(torch, stated)
-    record |= {"torch": torch.__version__, "source": Path(__file__).read_text()}
+    record["source"] = Path(__file__).read_text()
     out.write_text(json.dumps(record) + "\n")
     root = git_tree_root("atom", str(ROOT))
     subject = {"source_root": f"{root.revision_kind}:{root.revision}"}
