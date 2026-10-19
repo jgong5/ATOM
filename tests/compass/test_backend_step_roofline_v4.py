@@ -403,9 +403,11 @@ def test_the_v4_pro_dpa_tp8_build_classifies_every_module(ep, tmp_path):
         dims = (128, 512, 128, ratio) + top
         assert found[("sparse_attention", dims, "fp8", "bf16")] == ratios.count(ratio)
     moe = (384, 48, 6, 3072) if ep else (384, 384, 6, 384)
-    # The experts read fp4 activations, aiter quantizing them in the kernel,
-    # and hold their fp4 weights and a one-byte scale per 32 of them.
-    held = 3 * moe[3] * 7168 // 2 * 17 // 16
+    # The experts read fp4 activations, aiter quantizing them in the kernel.
+    # An expert holds its fp4 weights and a one-byte scale per 32 of them,
+    # each of w2's rows padded to 16 scales at EP off.
+    weights = 3 * moe[3] * 7168 // 2
+    held = weights + 2 * moe[3] * 224 + 7168 * (96 if ep else 16)
     assert found[("moe", moe + (7168, 8, 8, 0, held), "fp4", "fp4")] == 61
     # The fp8 linears read fp8 activations; the block's norms run in its mixes.
     assert found[("gemm", (65536, 1536), "fp8", "fp8")] == 61
