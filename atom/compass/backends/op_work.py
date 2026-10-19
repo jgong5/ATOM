@@ -26,8 +26,9 @@ no extractor, or a leaf its extractor cannot price, is refused by name.
 
 DeepSeek-V4's MoE takes the step roofline's expectation under independent
 uniform routing: the routed experts run the rows the leaf holds, under expert
-parallelism the busiest rank's expected share, and reach each activated expert
-once; an exchange's group width is read off its own shapes.
+parallelism the busiest rank's expected share, at the format the op quantizes
+its rows to, and read each activated expert once; an exchange's group width
+is read off its own shapes.
 """
 
 from __future__ import annotations
@@ -222,10 +223,15 @@ def _dp_exchange(op, view, tp, kv) -> Work:
 
 def _fused_moe(op, view, tp, kv) -> Work:
     """The routed experts on `hidden_states`' rows, each route through one
-    expert's gate-up and down products, at `hidden_states`' format: an
-    expectation under uniform routing, each activated expert read once. Under
-    expert parallelism `expert_mask` spans every rank's experts, of which this
-    rank holds `w1`'s, and it runs the busiest rank's expected share."""
+    expert's gate-up and down products: an expectation under uniform routing.
+    Under expert parallelism `expert_mask` spans every rank's experts, of which
+    this rank holds `w1`'s, and it runs the busiest rank's expected share.
+
+    With a nonzero `quant_type` the op quantizes `hidden_states` to the
+    weights' format inside it, so both products run at that format; otherwise
+    at `hidden_states`'. M is the leaf's boundary: each activated expert's
+    weights and scales read once, and the rows' tensors at the share of rows
+    this rank runs, at least its routes over `k`."""
     args = op["args"]
     (rows, hidden), k = args["hidden_states"]["shape"], args["topk_ids"]["shape"][1]
     local, up = args["w1"]["shape"][:2]
@@ -235,9 +241,16 @@ def _fused_moe(op, view, tp, kv) -> Work:
     if ranks > 1:
         routed = max_rank_load(rows, k, local * ranks, ranks)
         groups /= ranks
-    fmts = _fmt(args["hidden_states"]["dtype"]), _fmt(args["w1"]["dtype"])
-    work = grouped_gemm(routed, up, hidden, groups, *fmts)
-    return work + grouped_gemm(routed, hidden, up // 2, groups, *fmts)
+    b = _fmt(args["w1"]["dtype"])
+    a = b if args.get("quant_type") else _fmt(args["hidden_states"]["dtype"])
+    flops = grouped_gemm(routed, up, hidden, groups, a, b)
+    flops += grouped_gemm(routed, hidden, up // 2, groups, a, b)
+    held = ("w1", "w2", "w1_scale", "w2_scale", "bias1", "bias2")
+    weights = sum(_bytes(t) for s in held for t in _tensors(args.get(s)))
+    io = _boundary(op).bytes - weights
+    return Work(
+        flops.flops_by_format, weights * groups / local + io * routed / (rows * k)
+    )
 
 
 def _mori(*payload, dispatch: bool):
@@ -254,8 +267,7 @@ def _mori(*payload, dispatch: bool):
         buffer = op["out"][0] if dispatch else args["input"]["shape"]
         ranks = buffer[0] // tokens
         row = sum(_bytes(t) / t["shape"][0] for s in payload for t in _tensors(args[s]))
-        reach = 1 - (1 - 1 / ranks) ** k
-        return all_to_all(ranks, tokens * ranks * reach * row)
+        return all_to_all(ranks, tokens * activated_experts(ranks, 1, k) * row)
 
     return extract
 
