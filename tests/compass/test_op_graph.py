@@ -412,11 +412,16 @@ def test_a_prefill_prices_linearly_in_its_rows_cached_tokens(rows, params, answe
 
 
 def test_a_resource_bound_par_prices_its_leaves_work_not_their_listed_prices():
-    pooled = {"par": [g(2, 64, 64), g(2, 64, 64)], "join": "resource_bound"}
-
-    assert by_name(backend(pooled, price_list=FLAT).price(DECODE)) == by_name(
-        backend(pooled).price(DECODE)
+    big = g(2, 4096, 4096)
+    params = listed(
+        *[pt(g(b, 4096, 4096), f"decode B={b}", 1e3, c) for b in (2, 4) for c in (1, 9)]
     )
+    pooled = {"par": [big, big], "join": "resource_bound"}
+    cost = backend(pooled, price_list=params).price(DECODE)
+
+    summed = gemm(2, 4096, 4096) + gemm(2, 4096, 4096)
+
+    assert by_name(cost) == {"par.resource_bound": price(summed, SPEC)}
 
 
 def _published(tmp_path, root=None):
