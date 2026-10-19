@@ -6,9 +6,9 @@ its configuration's `memory_readings` entry.
 
 ATOM's engine starts from ATOM's arguments (`EngineArgs`) on the GPUs `--gpu`
 names, through `MemoryReadingModelRunner` (under `--enable-rapidserve` its
-RapidServe form, whose prefill engine writes the readings), and stops once it
-has started: its weights loaded, its one warmup run, its KV cache sized and its
-graphs captured. `gpu.quiet` checks those GPUs before the
+RapidServe form, whose decode engine writes its own readings beside prefill's),
+and stops once it has started: its weights loaded, its one warmup run, its KV
+cache sized and its graphs captured. `gpu.quiet` checks those GPUs before the
 start and after it. Each rank writes its readings and the key it read off its
 resolved config, and the ranks must agree on the key. The entry's key is that
 one with the digest of the machine spec `--machine` names; its conditions are
@@ -28,7 +28,8 @@ more, on the cache it warmed: what autotuning or a fresh compile left loaded
 reads in `non_torch`. A second such start refuses.
 
 ``--out`` gets the engine's log, run.json's identity from the rank-0 engine
-file, and ``memory_readings.json``, the entry's readable copy. ATOM's
+file, and ``memory_readings.json``, the entry's readable copy (a RapidServe
+decode entry's in ``memory_readings.decode.json``). ATOM's
 ``--load_dummy`` refuses until its readings are shown to match a real load's.
 """
 
@@ -75,6 +76,8 @@ RAPIDSERVE_RUNNER = (
 LOAD_DUMMY = "--load-dummy"
 START_TIMEOUT_S = 3600
 LOG, READINGS = "engine.log", "readings"
+#: Where in `READINGS` a RapidServe decode engine writes its readings.
+DECODE = "decode"
 
 
 def start(argv: list[str]) -> None:
@@ -176,7 +179,7 @@ def main(argv: list[str], again: bool = False) -> None:
         # the next start finds both cached.
         out.rename(f"{out}.cold")
         return main(argv, again=True)
-    first = json.loads(min((out / READINGS).iterdir()).read_text())
+    first = json.loads(min((out / READINGS).glob("*.json")).read_text())
     (out / "engine.json").write_text(json.dumps(first["engine"]))
     identified = identity(out / "engine.json", model, sys.argv, args.gpu)
     _write_whole(out / "run.json", json.dumps(identified))
@@ -186,8 +189,8 @@ def main(argv: list[str], again: bool = False) -> None:
 def _cold(out: Path) -> list[str]:
     """The ranks' files in `out` whose start autotuned a kernel or missed a graph."""
     return [
-        p.name
-        for p in sorted((out / READINGS).iterdir())
+        str(p.relative_to(out / READINGS))
+        for p in sorted((out / READINGS).rglob("*.json"))
         if (read := json.loads(p.read_text())).get("autotuned_kernels")
         or read.get("fxgraph_cache_misses")
     ]
@@ -195,46 +198,56 @@ def _cold(out: Path) -> list[str]:
 
 def publish(out: Path, machine, store: str, command: str) -> None:
     """Publish the readings the ranks wrote in `out` at their key on `machine`,
-    and write the entry's readable copy."""
-    ranks = {p.name: json.loads(p.read_text()) for p in (out / READINGS).iterdir()}
+    and write the entry's readable copy; then, the same way, those a RapidServe
+    decode engine wrote in `DECODE`, unless their key is prefill's, whose
+    readings size the pool."""
     record = "sha256:" + hashlib.sha256((out / LOG).read_bytes()).hexdigest()
-    for held in ranks.values():
-        held["readings"]["record"] = record
-    keys = {json.dumps(r["key"], sort_keys=True) for r in ranks.values()}
-    if len(keys) != 1:
-        raise ValueError(
-            f"the ranks read {len(keys)} keys off their configs: {sorted(keys)}"
+    published = set()
+    for files, readable in (
+        (out / READINGS, "memory_readings.json"),
+        (out / READINGS / DECODE, f"memory_readings.{DECODE}.json"),
+    ):
+        ranks = {p.name: json.loads(p.read_text()) for p in files.glob("*.json")}
+        for held in ranks.values():
+            held["readings"]["record"] = record
+        keys = {json.dumps(r["key"], sort_keys=True) for r in ranks.values()}
+        if len(keys) > 1:
+            raise ValueError(
+                f"the ranks read {len(keys)} keys off their configs: {sorted(keys)}"
+            )
+        if keys <= published:
+            continue
+        published |= keys
+        first = ranks[min(ranks)]
+        fields = first["key"]
+        reserve = [
+            r["readings"]["driver_and_collective_reserve_bytes"] for r in ranks.values()
+        ]
+        across_ranks("non_torch", reserve)
+        key = Key.of(
+            Kind.MEMORY_READINGS, machine_spec=machine_spec_digest(machine), **fields
         )
-    first = ranks[min(ranks)]
-    fields = first["key"]
-    reserve = [
-        r["readings"]["driver_and_collective_reserve_bytes"] for r in ranks.values()
-    ]
-    across_ranks("non_torch", reserve)
-    key = Key.of(
-        Kind.MEMORY_READINGS, machine_spec=machine_spec_digest(machine), **fields
-    )
-    members = {name: json.dumps(r["readings"]).encode() for name, r in ranks.items()}
-    ArtifactStore(store).publish(
-        key,
-        provenance=Provenance(
-            command,
-            datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            roots_for({"atom": "atom", "aiter": "aiter"}),
-        ),
-        topology=read_back(min(ranks))[1].topology,
-        conditions=memory.conditions(
-            fields,
-            **machine_spec_key(machine).values,
-            torch=machine.value("device.software_pinned_to.torch"),
-        ),
-        gates=GateState.of(),
-        members=members,
-    )
-    copy = {"key": key.values, "token": key.token()}
-    copy["members"] = {name: r["readings"] for name, r in sorted(ranks.items())}
-    (out / "memory_readings.json").write_text(json.dumps(copy, indent=1) + "\n")
-    print(f"published {key} as {key.token()}")
+        members = {n: json.dumps(r["readings"]).encode() for n, r in ranks.items()}
+        ArtifactStore(store).publish(
+            key,
+            provenance=Provenance(
+                command,
+                datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                roots_for({"atom": "atom", "aiter": "aiter"}),
+            ),
+            topology=read_back(min(ranks))[1].topology,
+            conditions=memory.conditions(
+                fields,
+                **machine_spec_key(machine).values,
+                torch=machine.value("device.software_pinned_to.torch"),
+            ),
+            gates=GateState.of(),
+            members=members,
+        )
+        copy = {"key": key.values, "token": key.token()}
+        copy["members"] = {n: r["readings"] for n, r in sorted(ranks.items())}
+        (out / readable).write_text(json.dumps(copy, indent=1) + "\n")
+        print(f"published {key} as {key.token()}")
 
 
 def _parser() -> argparse.ArgumentParser:
