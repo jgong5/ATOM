@@ -100,11 +100,18 @@ def prefill(tokens: int, seqs: int) -> Shape:
     return Shape("prefill", tokens, seqs)
 
 
-def structure(config, phase: str, eager: bool | None = None) -> str:
+def device_arch() -> str:
+    """The visible device's arch, its target features dropped."""
+    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+
+def structure(
+    config, phase: str, eager: bool | None = None, device: str | None = None
+) -> str:
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the TP width, the DP width and the EP
     group's when they are set, the phase and the mode, `config`'s unless `eager`
-    names it."""
+    names it, and the arch of `device`, else `device_arch()`."""
     from atom.compass.run import _file_digest
 
     digest = _file_digest(config.model, "config.json")
@@ -113,7 +120,7 @@ def structure(config, phase: str, eager: bool | None = None) -> str:
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     widths = f"tp={tp}" + (f" dp={dp}" if dp > 1 else "")
     widths += f" ep={tp * dp}" if config.enable_expert_parallel else ""
-    return f"{arch} {digest} {widths} {phase} {mode}"
+    return f"{arch} {device or device_arch()} {digest} {widths} {phase} {mode}"
 
 
 def _atom_frames():

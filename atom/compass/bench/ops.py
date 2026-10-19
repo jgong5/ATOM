@@ -228,7 +228,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def graph(store, config, shape) -> dict:
-    """The `op_graph` `trace ops` published for `config` at `shape`, as JSON."""
+    """The `op_graph` `trace ops` published for `config` at `shape` on this GPU's
+    arch, as JSON."""
     from atom.compass.capture.forward import structure
 
     key = Key.of(
@@ -1061,8 +1062,10 @@ def _capture(config, shapes, root) -> None:
     """`trace ops` of `shapes` into the store at `root`, in a process of its
     own that sees no GPU."""
     from atom.compass import capture
+    from atom.compass.capture.forward import device_arch
 
     argv = ["--model", config.model, "--tp", str(config.tensor_parallel_size)]
+    argv += ["--arch", device_arch()]
     for s in shapes:
         argv += ["--prefill", str(s.tokens)] if s.phase == "prefill" else ["--width"]
         argv.append(str(s.seqs))
