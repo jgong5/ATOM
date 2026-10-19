@@ -359,7 +359,7 @@ def test_each_reader_of_host_reads_every_entry_of_a_list(tmp_path):
     hosts = [{"laws": {}}, {"laws": {"prefill": {}}, "skip": ["E"]}]
     (tmp_path / "run.json").write_text(json.dumps({"host": hosts}))
     with pytest.raises(ValueError, match="skips host segments"):
-        runs.graded(tmp_path)
+        runs._refuse_by_run_file(tmp_path)
 
     constant = dataclasses.asdict(Coefficients.constant(0.1, 0.01))
     table = CONFIGURATION_PREFIX + json.dumps({"step_stub": constant, "host": hosts})
@@ -417,3 +417,32 @@ def test_two_laws_fitted_under_one_engine_config_refuse_naming_what_differs(
         r"this engine config, and they differ in \['provenance'\]$",
     ):
         install(tmp_path, monkeypatch, run, r)
+
+
+def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost(
+    tmp_path,
+):
+    stub = tmp_path / "stub.json"
+    stub.write_text(json.dumps(dataclasses.asdict(Coefficients())))
+    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
+    parser = argparse.ArgumentParser()
+    runfile.add_arguments(parser)
+    flags = ["--step-stub", str(stub), "--machine", str(tmp_path / "machine.json")]
+    args = parser.parse_args([*flags, "--store", str(tmp_path / "store")])
+    model = ["--model", str(tmp_path)]
+
+    run = runfile.prefill_decode(
+        args, [*model, "-tp", "2", "--enable-dp-attention"], model
+    )
+
+    assert "data_parallel_size" not in run
+    assert compass_run._widths(run) == (2, 1)
+    assert run["router_s"] == DOCUMENT["interconnect"]["router_relay_s"]
+    assert run["kv_link"] == "intra_node"
+    table = compass_run.channel_table(run)
+    lps = {lp.name for lp in table.registry.ids()}
+    assert lps == {"traffic", "frontend-P", "engine-P", "frontend-D", "engine-D"}
+    write = [f"engine-D->engine-P:kv_write_req#dp0.dp{p}" for p in (0, 1)]
+    assert [table.lookahead(c) for c in write] == [runfile.KV_WRITE_REQ_S] * 2
+    relay = table.lookahead("frontend-P->frontend-D:relay")
+    assert relay == run["router_s"]

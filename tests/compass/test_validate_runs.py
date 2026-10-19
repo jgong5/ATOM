@@ -13,6 +13,7 @@ wrote (`test_client_run_summary._serve`).
 
 import collections
 import json
+import re
 
 import pytest
 from test_client_run_summary import CLIENT_RUNS, _serve
@@ -336,6 +337,63 @@ def test_a_simulated_run_grading_does_not_take_is_refused_naming_why(
         grade(real, simulated)
 
 
+HOST = {"host": {"laws": {}}}
+NO_HOST = "its run file has no host laws, so it prices no host time"
+ROOFLINE = "the step roofline was on"
+
+
+@pytest.mark.parametrize(
+    "run, reason",
+    [
+        (HOST | {"step_linear": {}, "step_roofline": True}, ROOFLINE),
+        (HOST | {"step_stub": {}, "step_roofline": True}, ROOFLINE),
+        ({"step_linear": {}}, NO_HOST),
+        ({"step_linear": {}, "step_roofline": True}, f"{NO_HOST}; {ROOFLINE}"),
+        (HOST | {"step_linear": {}, "step_roofline": False}, None),
+        # The step grid prices below it by the roofline, switch or none.
+        (HOST | {"step_grid": {}, "step_roofline": True}, None),
+    ],
+    ids=["law-roofline", "stub-roofline", "no-host", "both", "law", "grid-roofline"],
+)
+def test_a_cctraces_sim_cell_grading_does_not_take_is_refused_naming_why(
+    tmp_path, run, reason
+):
+    *real, simulated = _four(tmp_path)
+    report = grade(real, simulated)
+    (simulated / "run.json").write_text(json.dumps(run))
+
+    if reason is None:
+        assert grade(real, simulated) == report
+        return
+    with pytest.raises(ValueError, match=f"sim is not graded: {reason}$"):
+        grade(real, simulated)
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        {"step_linear": {}},
+        HOST | {"step_linear": {}, "step_roofline": True},
+        {"host": {"skip": ["E"]}},
+    ],
+    ids=["no-host", "law-roofline", "skip"],
+)
+def test_real_cctraces_sim_cells_grade_whatever_run_file_they_were_handed(
+    tmp_path, run
+):
+    """A real cell's server never reads the run file its run.json holds; a
+    simulated cell handed the same one is refused, named."""
+    *real, simulated = _four(tmp_path)
+    report = grade(real, simulated)
+    for cell in real:
+        (cell / "run.json").write_text(json.dumps(run))
+    assert grade(real, simulated) == report
+
+    (simulated / "run.json").write_text(json.dumps(run))
+    with pytest.raises(ValueError, match="/sim (is not graded|skips host segments)"):
+        grade(real, simulated)
+
+
 def test_the_command_states_the_steps_extrapolated_and_priced_by_a_fallback(
     tmp_path, capsys
 ):
@@ -415,6 +473,28 @@ def test_a_client_run_s_warmup_steps_precede_its_own_and_are_not_graded(tmp_path
     )
 
     assert grade(real, simulated) == report
+
+
+def test_a_cell_cctraces_sim_wrote_with_its_export_grades_its_profiling_steps_alone(
+    tmp_path,
+):
+    *real, simulated = _four(tmp_path / "whole")
+    report = grade(real, simulated)
+
+    def cells(name, schedule):
+        out = _four(tmp_path / name, schedule, {6: "kw", 7: "ka", 8: "kb"})
+        for cell in out:
+            _recorded(cell, warmup={"kw"})
+            # run.json as `cctraces_sim.sh` writes it: a run file, no `format_version`
+            (cell / "run.json").write_text(json.dumps({"client_runs": 1} | HOST))
+        return out
+
+    warmed = cells("warmed", WARMED)
+    assert grade(warmed[:3], warmed[3]) == report
+    # A warmup still running past its first own step refuses it.
+    late = cells("late", LATE)
+    with pytest.raises(ValueError, match="r0 is not graded: .* has not ended"):
+        grade(late[:3], late[3])
 
 
 @pytest.mark.parametrize(
@@ -568,15 +648,20 @@ def test_a_client_run_whose_export_names_no_arguments_given_is_refused(tmp_path)
         grade(real, simulated)
 
 
-def _ran(monkeypatch, tmp_path, served):
+def _ran(monkeypatch, tmp_path, served, assumed=None):
     """Three real cells, and a simulated one whose run.json `compass run`
     wrote once its server, serving until stopped, served one client run per
-    entry of `served` and was stopped during the last."""
+    entry of `served` and was stopped during the last; with `assumed`, its
+    engine read a `memory_readings` member stating that assumption."""
     sim = _serve(monkeypatch, tmp_path / "sim", None, served, stop="bound")
     run = json.loads((sim / "run.json").read_text()) | GRADED["run_file"]
     run |= {"step_roofline": False, "backend": GRADED["provenance"]}
     (sim / serve.RUN_FILE).write_text(json.dumps(run))
     *real, simulated = (_recorded(c) for c in _four(tmp_path))
+    if assumed:
+        engine = simulated / compass_run.LP_FILE.format("engine")
+        hand_in = json.loads(engine.read_text()) | {"memory": {"assumed": assumed}}
+        engine.write_text(json.dumps(hand_in))
     drive_run.write_grading(simulated, None)
     return real, simulated
 
@@ -595,4 +680,16 @@ def test_a_stop_during_the_first_client_run_refuses_it(monkeypatch, tmp_path):
 
     unknown = "its first client run has no summary, so its refusals are unknown"
     with pytest.raises(ValueError, match=f"sim is not graded: {unknown}$"):
+        grade(real, simulated)
+
+
+def test_a_run_whose_engine_read_an_assumed_memory_reading_is_refused_naming_it(
+    monkeypatch, tmp_path
+):
+    assumed = "copied from MI355X's memory_readings entry of this configuration"
+    served = [UNREFUSED, CLIENT_RUNS[1]]
+    real, simulated = _ran(monkeypatch, tmp_path, served, assumed)
+
+    named = re.escape(f"its engines read assumed memory_readings members: {[assumed]}")
+    with pytest.raises(ValueError, match=f"sim is not graded: {named}$"):
         grade(real, simulated)
