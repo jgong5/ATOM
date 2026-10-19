@@ -5,7 +5,9 @@ rank pair.
 
 The script runs end to end with the stand-ins of
 ``test_cctraces_sim_no_export``, and its port pick gets planted ports first:
-PORT is one above KV_WRITE_REQ_PORT. Nothing needs a driver or aiperf.
+PORT is one above KV_WRITE_REQ_PORT. The test holds the planted ports until the
+script returns, so no other process takes one before the pick binds it. Nothing
+needs a driver or aiperf.
 """
 
 import json
@@ -26,39 +28,45 @@ WIDTHS = [
     ({"data_parallel_size": 2, "prefill_data_parallel_size": 1}, 2),
 ]
 
-# Binds to port 0 take the planted ports, in order, while any are left.
+# Binds to port 0 take the planted ports, in order, while any are left,
+# sharing them with the sockets the test holds.
 SITECUSTOMIZE = """\
 import os, socket
 planted = [int(p) for p in os.environ["PLANTED_PORTS"].split()]
 bind = socket.socket.bind
-socket.socket.bind = lambda s, a: bind(s, (a[0], planted.pop(0)) if a[1] == 0 and planted else a)
+def plant(s, a):
+    if a[1] == 0 and planted:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        a = (a[0], planted.pop(0))
+    bind(s, a)
+socket.socket.bind = plant
 """
 
 
-def _free_pair():
-    """A free port whose successor is free too."""
+def _hold(port=0):
+    """A socket bound to port, or to a free one for 0, that a planted bind can share."""
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    s.bind(("127.0.0.1", port))
+    return s
+
+
+def _held_pair():
+    """Sockets held on a free port and on its successor."""
     while True:
-        with socket.socket() as a, socket.socket() as b:
-            a.bind(("127.0.0.1", 0))
-            p = a.getsockname()[1]
-            try:
-                b.bind(("127.0.0.1", p + 1))
-            except OSError:
-                continue
-            return p
-
-
-def _free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+        a = _hold()
+        try:
+            return [a, _hold(a.getsockname()[1] + 1)]
+        except OSError:
+            a.close()
 
 
 @pytest.mark.parametrize("widths,block", WIDTHS, ids=["dp2", "P2D1", "P1D2"])
 def test_no_other_port_lands_in_the_write_request_block(tmp_path, widths, block):
-    kv = _free_pair()
+    held = _held_pair() + [_hold() for _ in range(4)]
+    kv, _, *free = (s.getsockname()[1] for s in held)
     # CLOCK_PORT PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT
-    planted = [_free_port(), kv + 1, _free_port(), _free_port(), kv, _free_port()]
+    planted = [free[0], kv + 1, free[1], free[2], kv, free[3]]
     site = tmp_path / "site"
     site.mkdir()
     (site / "sitecustomize.py").write_text(SITECUSTOMIZE)
@@ -106,8 +114,12 @@ def test_no_other_port_lands_in_the_write_request_block(tmp_path, widths, block)
         timeout=120,
         check=False,
     )
+    for s in held:
+        s.close()
     # The port pick is the first of the two `python3 -` runs.
-    ports = [int(p) for p in picked.read_text().splitlines()[0].split()[1:]]
+    lines = picked.read_text().splitlines()
+    assert lines, f"the port pick wrote nothing to {picked}:\n{done.stderr}"
+    ports = [int(p) for p in lines[0].split()[1:]]
     assert len(ports) == 6, done.stdout + done.stderr
     kv_port = ports.pop(4)
     # The planted picks held, so the block is clear because KV_WRITE_REQ_PORT moved.

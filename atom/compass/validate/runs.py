@@ -30,8 +30,10 @@ run.json holds `run_file`, is also refused when it skips host segments, or its
 run file has no host laws and so prices no host time; when the step roofline
 was on in a run of another backend than the step grid, which always prices
 below it; when its first client run refused anything, or has no summary to
-say; when it ran the step grid without a coverage check; and when its
-backend's fit inputs were profiled or served a trace it served. The step
+say; when it ran the step grid without a coverage check; when its
+backend's fit inputs were profiled or served a trace it served; and when its
+engines read an assumed `memory_readings` member, naming each assumption its
+`provenance` lists, since its KV blocks rest on readings no start took. The step
 grid's plan, an input of `source` `plan`, is not one: it placed the points
 from shapes alone, so it may have read any trace, a graded one included.
 Beside the table, the command states how many of that client run's steps its
@@ -255,6 +257,8 @@ def _not_graded(run, traces) -> list[str]:
         why.append(f"its backend was fitted on traces it served: {fitted}")
     if profiled := [i["run"] for i in inputs if i.get("profiled")]:
         why.append(f"its backend was fitted on profiled inputs: {profiled}")
+    if assumed := run["provenance"].get("memory_readings_assumed"):
+        why.append(f"its engines read assumed memory_readings members: {assumed}")
     return why
 
 

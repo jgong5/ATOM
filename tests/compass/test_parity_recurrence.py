@@ -56,6 +56,26 @@ def test_measured_inputs_reproduce_a_record_the_wait_rules_wrote():
     assert report["pass"] and not report["failures"]
 
 
+def test_an_output_forward_s_sampler_launch_overlaps_the_device_before_its_read():
+    """Step 4 launches its sampler from 35 to 37 ms, then waits for step 3's
+    device end at 41: the launch runs under the wait, so the exit stays 42."""
+    steps = record()
+    steps[4]["t_recv_ns"][0] = 37 * MS
+    report = recurrence.check(steps)
+    assert report["total"] == pytest.approx(0, abs=1e-9)
+    assert report["pass"] and not report["failures"]
+
+
+def test_a_host_bound_sampler_launch_delays_the_exit_past_the_device_end():
+    """Step 4 launches its sampler from 34 to 42 ms, after step 3's device end
+    at 41: the read starts at 42, so the exit is 43, not 42."""
+    steps = record(r1=42)
+    steps[4]["t_recv_ns"][0] = 42 * MS
+    report = recurrence.check(steps)
+    assert report["total"] == pytest.approx(0, abs=1e-9)
+    assert report["pass"] and not report["failures"]
+
+
 def test_a_late_r1_release_fails_its_kind_and_names_the_step():
     report = recurrence.check(record(r1=45))
     assert not report["kinds"]["decode"][-1]
@@ -102,6 +122,53 @@ def test_every_kind_can_pass_while_the_run_total_still_fails():
     assert all(k[-1] for k in report["kinds"].values()) and not report["failures"]
     assert abs(report["total"]) > recurrence.TOTAL_BAND
     assert not report["pass"]
+
+
+def test_one_middle_chunk_outside_the_band_fails_its_kind_of_nine():
+    """Ten chunks of one request, 1 ms of device work each, 4 ms apart; the
+    seventh waits 0.15 ms at a staging gate no rule predicts. Interpolated,
+    the nine middle chunks' p10 is -0.72% and the kind would pass."""
+    steps = []
+    for n in range(10):
+        enter = 4 * n + 0.15 * (n > 6)
+        wait = 0.15 * (n == 6)
+        launch = (enter + wait + 1, enter + wait + 2)
+        rows = [[50, 50 * (n + 1), False]]
+        s = line(n, rows, False, enter, (enter, enter + wait), launch, None, 0)
+        s["t_exit_ns"], s["d_busy_ns"] = (launch[1] + 1) * MS, MS
+        steps.append(s)
+    report = recurrence.check(steps)
+    n, p10, *_, ok = report["kinds"]["middle"]
+    assert (n, p10, ok) == (9, pytest.approx(100 * (4 / 4.15 - 1)), False)
+    [(step, kind, *_)] = report["failures"]
+    assert (step, kind) == (6, "middle") and not report["pass"]
+
+
+def test_one_decode_released_early_fails_its_kind_of_ten():
+    """The record's decode, then nine whose receives end with the device but
+    the sixth's 0.3 ms early: charged +3.09%; interpolated, p90 is +0.31%."""
+    steps, exit_ = record()[:4], 32
+    for i in range(9):
+        enter, launch = exit_ + 1, (exit_ + 2, exit_ + 3)
+        recv = (launch[1], enter + 8 - 0.3 * (i == 5))
+        steps.append(
+            line(
+                4 + i,
+                [[1, 152 + i, True]],
+                True,
+                enter,
+                (enter,) * 2,
+                launch,
+                recv,
+                recv[1] + 1,
+            )
+        )
+        exit_ = recv[1] + 1
+    report = recurrence.check(steps)
+    n, *_, p90, _, ok = report["kinds"]["decode"]
+    assert (n, p90, ok) == (10, pytest.approx(100 * (10 / 9.7 - 1)), False)
+    [(step, kind, *_)] = report["failures"]
+    assert (step, kind) == (9, "decode") and not report["pass"]
 
 
 def test_a_record_without_device_windows_is_refused():

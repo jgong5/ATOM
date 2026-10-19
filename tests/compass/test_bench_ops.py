@@ -23,7 +23,7 @@ from test_parity_record import _unpriced  # noqa: F401  an autouse fixture
 from atom.compass import cli, ir
 from atom.compass.artifacts import ArtifactStore, Kind, machine_spec_digest
 from atom.compass.bench import ops
-from atom.compass.capture.forward import decode
+from atom.compass.capture.forward import decode, prefill
 from atom.compass.capture.graph import Traced, build, to_json
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
@@ -393,6 +393,45 @@ def test_a_call_cycles_over_every_weight_of_its_spec_on_the_cold_copies_inputs()
     assert (n, record["copies"]) == (1, 2)
 
 
+def test_a_copy_past_the_cold_ones_takes_its_own_cold_copy_s_inputs_and_is_logged(
+    monkeypatch, capsys
+):
+    # A [2, 3] input and a [3, 3] weight are 60 bytes a call: 2 copies pass
+    # twice a 30-byte cache. The model holds four weights of that spec, so
+    # copies 2 and 3 are copies 0 and 1 with the third and fourth.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    runner = _Runner()
+    runner.model.extend([torch.nn.Linear(3, 3), torch.nn.Linear(3, 3)])
+    stub = ops.Stub(runner, 30)
+    mm = _leaf(
+        "aten.mm.default",
+        ("self", _t([2, 3], "activation")),
+        ("mat2", _t([3, 3], "weight")),
+    )
+    found = ops.leaves(_graph(mm, layers=1)["region"])
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    graphs = []
+
+    def replay(fn, calls):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(runner.model, "forward", stub),
+        patch.object(ops, "_kernels", return_value=["k"]),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        [record] = stub.point(placed, decode(2), 20, found)
+
+    cold = [kwargs for kwargs, _ in graphs[0][:4]]
+    assert cold[1]["self"] is not cold[0]["self"]
+    assert cold[2]["self"] is cold[0]["self"] and cold[3]["self"] is cold[1]["self"]
+    assert all(c["mat2"] is m.weight for c, m in zip(cold, runner.model))
+    assert record["copies"] == 4 and "over 4 copies" in capsys.readouterr().out
+
+
 def test_copy_c_rotates_weights_and_instances_and_clones_past_the_first_round():
     runner = _Runner()
     stub = ops.Stub(runner, 10_000)
@@ -556,6 +595,41 @@ def test_a_graph_over_placements_reads_one_clone_of_metadata_none_changed(
     assert record["placements"] == 5
 
 
+def test_a_replay_prices_each_timed_replay_per_call_each_under_its_context(
+    monkeypatch,
+):
+    # Replay i of the graph takes i + 1 ms on a stand-in clock; warmups are not
+    # timed, and a price is per call of the graph.
+    clock, seen = [0, 0], []
+
+    class Graph:
+        def replay(self):
+            clock[1] += 1
+            clock[0] += clock[1]
+
+    class Event:
+        def __init__(self, enable_timing):
+            self.synchronize = lambda: None
+
+        def record(self):
+            self.at = clock[0]
+
+        def elapsed_time(self, end):
+            return end.at - self.at
+
+    monkeypatch.setattr(fctx, "_forward_context", fctx._forward_context)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    calls = [({"x": i}, f"snap{i}") for i in range(4)]
+
+    times = ops._replay(lambda x: seen.append((x, fctx._forward_context)), calls)
+
+    assert seen == [(i, f"snap{i}") for i in range(4)]
+    timed = range(ops.WARMUPS, ops.WARMUPS + ops.REPEATS)
+    assert times == [(i + 1) * 1e6 / 4 for i in timed]
+
+
 def test_a_batch_takes_the_blocks_and_slots_it_is_placed_at(rule):  # noqa: F811
     line = _line([[1, 40, True], [1, 17, True]])
 
@@ -565,6 +639,44 @@ def test_a_batch_takes_the_blocks_and_slots_it_is_placed_at(rule):  # noqa: F811
     assert batch.state_slots == [[3], [4]]
     with pytest.raises(ValueError, match="hold 15 KV blocks .* the pool has 14"):
         rule(blocks=14).batch(line, block=10)
+
+
+@pytest.mark.parametrize(
+    "shape, context, rows",
+    [
+        # Four rows of 40 tokens take 12 of the pool's 14 blocks.
+        (decode(4), 40, [[1, 40, True]] * 4),
+        # Four of 100 would take 28: the first keeps 7, three share the rest.
+        (decode(4), 100, [[1, 100, True]] + [[1, 32, True]] * 3),
+        # 51 prefill tokens over two rows, the capture's split, 30 cached before each.
+        (prefill(51, 2), 30, [[26, 56, False], [25, 55, False]]),
+        (prefill(51, 2), None, [[26, 26, False], [25, 25, False]]),
+    ],
+)
+def test_point_rows_turn_ragged_past_the_pool(rule, shape, context, rows):  # noqa: F811
+    got = ops.point_rows(shape, context, 14, 16)
+
+    assert got == rows
+    rule(blocks=14).batch({"rows": got, "produces_output": True})
+
+
+def test_a_point_runs_and_records_the_rows_the_pool_holds(monkeypatch):
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    runner, views = _Runner(), []
+    placed = SimpleNamespace(
+        block_size=16,
+        batch=lambda view, block, slot: views.append(view["rows"]) or (block, slot),
+    )
+    stub = ops.Stub(runner, 10_000)
+    x = ("self", _t([2, 3], "activation"))
+    found = ops.leaves(_graph(_leaf("aten.neg.default", x), layers=1)["region"])
+
+    with patch.object(runner.model, "forward", stub):
+        [record] = stub.point(placed, decode(2), 600, found)
+
+    # 38 blocks a row, 64 in the pool: the second row takes the 26 left.
+    assert views == [[[1, 600, True], [1, 416, True]]]
+    assert record["rows"] == views[0]
 
 
 @pytest.mark.parametrize(

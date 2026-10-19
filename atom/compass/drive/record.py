@@ -2,10 +2,12 @@
 """`compass record`: one instance's real server, with its step record, serving
 whatever client runs reach it until it is stopped.
 
-    compass record --gpu G --out DIR -- <ATOM args>
+    compass record --gpu G [--host H] --out DIR -- <ATOM args>
 
 `serve` starts the server on the GPUs `--gpu` names with the step record on,
-and at its stop writes run.json's identity, unprofiled and with no workload.
+bound to `--host`, 127.0.0.1 unless named, an address a router on another node
+reaches, and at its stop writes run.json's identity, unprofiled and with no
+workload.
 Then each DP rank's record, ``steps/dp<r>.jsonl``, gets its cost lines beside
 it (``dp<r>.cost.jsonl``, `step_labels.write_table`; a rank that ran only DP's
 dummy forwards gets the version line alone), and run.json its
@@ -61,7 +63,7 @@ def main(argv: list[str]) -> None:
                 "and MoE routing follows them"
             )
     env = {AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1")}
-    serve.serve(atom_args, args.out, args.gpu, extra_env=env)
+    serve.serve(atom_args, args.out, args.gpu, extra_env=env, host=args.host)
     run_json = Path(args.out) / serve.RUN_JSON
     run = {**json.loads(run_json.read_text()), "env": env}
     _write_whole(run_json, json.dumps(run))
@@ -71,6 +73,7 @@ def main(argv: list[str]) -> None:
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n\n")[0])
     add_gpu_flag(p)
+    p.add_argument("--host", default=serve.HOST, help="the address the server binds")
     p.add_argument(
         "--out", required=True, help="an empty directory for the record and logs"
     )

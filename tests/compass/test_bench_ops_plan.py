@@ -211,6 +211,48 @@ def test_a_bracket_holds_only_between_points_of_one_kernel(lo, hi, why):
     assert ops._bracket(ats, kernels, lo, hi) == why
 
 
+@pytest.mark.parametrize(
+    "rows, rung, lo",
+    [
+        ([4000] * 5, 8, 2500),  # three rows of padding: the rung's mean
+        ([6, 10, 6], 3, 6),  # rows 0 and 2 against row 1: 12 over two
+        ([1000, 3000], 2, 2000),  # the mean
+        ([3], 8, 1),  # at least a token
+    ],
+)
+def test_a_decode_step_s_lowest_context_is_over_the_rung_s_rows(rows, rung, lo):
+    line = {"rows": [[1, c, True] for c in rows]}
+
+    assert ops._rows(line, rung) == (lo, max(rows))
+
+
+def test_a_plan_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_path):
+    # One row at rung 2: the lowest context is 3000 over two rows.
+    population = _records(tmp_path / "plan", ([[1, 3000, True]], 2))
+
+    records = _plan(bench, tmp_path, population)
+
+    assert {r["context"] for r in records} == {1500, 3000}
+
+
+def test_coverage_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_path):
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[1, 12000, True]], 1),
+    )
+    records = _plan(bench, tmp_path, plan)
+    # One row at rung 2: 1500, under the lowest context measured.
+    graded = _records(tmp_path / "graded", ([[1, 3000, True]], 2))
+    store, root, _, _ = bench
+
+    report = ops.coverage(store, root, CONFIG, [graded], records)
+
+    assert report["left out, by leaf kind"] == {
+        "aiter.attn": {"outside the measured range": 1}
+    }
+
+
 def test_a_ladder_keeps_values_a_step_apart_and_the_largest():
     assert ops._ladder([16384, 1, 2, 3, 4, 5, 100, 101, 16383]) == [
         1,
