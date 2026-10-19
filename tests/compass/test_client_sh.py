@@ -128,13 +128,15 @@ def test_an_out_with_no_server_json_names_it(tmp_path):
 def test_a_run_file_makes_the_client_simulated(tmp_path, simulated, warmup):
     server = SIM if simulated else {k: SIM[k] for k in ("url", "pid")}
     out, env = _setup(tmp_path, server)
-    done = _client(out, *GOOD, *warmup, env=env | {"ATOM_COMPASS_RUN": "/stale"})
+    stale = {"ATOM_COMPASS_RUN": "/stale", "ATOM_COMPASS_CLOCK_ENDPOINT": "tcp://h:1"}
+    done = _client(out, *GOOD, *warmup, env=env | stale)
     assert done.returncode == 0, done.stdout + done.stderr
 
     argv, aiperf_env, cwd = json.loads((tmp_path / "seen.json").read_text())
     assert (argv[:2] == ["-m", "aiperf"]) == simulated
     assert simulated or "uuid.UUID(int=0)" in argv[1]
     assert aiperf_env.get("ATOM_COMPASS_RUN") == server.get("run_file")
+    assert "ATOM_COMPASS_CLOCK_ENDPOINT" not in aiperf_env
     assert aiperf_env["AIPERF_DATASET_MMAP_BASE_PATH"] == cwd == str(out / "client")
     line = " ".join(argv)
     assert "--url 127.0.0.1:40165 " in line and " --concurrency 3 " in line

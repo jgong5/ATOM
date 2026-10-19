@@ -65,7 +65,7 @@ curl -sf --max-time 10 "$url/health" >/dev/null || fail "server: $url/health doe
 compass_env "$ROOT"
 export PYTHONPATH=$ROOT:$ROOT/compass_harness
 compass_require_tree "$ROOT" || exit $?
-unset ATOM_COMPASS_RUN
+unset ATOM_COMPASS_RUN ATOM_COMPASS_CLOCK_ENDPOINT
 # Importing compass_harness also checks the aiperf it would run against.
 harness=$(cd / && "$HARNESS_PYTHON" -c 'import compass_harness; print(compass_harness.__file__)') ||
     fail "harness: $HARNESS_PYTHON cannot import compass_harness"
