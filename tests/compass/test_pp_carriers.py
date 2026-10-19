@@ -117,6 +117,25 @@ def test_the_script_prices_the_send_on_a_machine_specs_carriers(tmp_path):
     assert recurrence.main(str(tmp_path)) == 1
 
 
+@pytest.mark.parametrize("tp", [1, 2])
+def test_the_script_refuses_a_record_at_tp_above_one_on_the_carriers(tmp_path, tp):
+    """At TP 2 each stage sends shards its receiver all-gathers; the carriers
+    price whole tensors with no all-gather, so the record is refused there,
+    and only there."""
+    for name, steps in zip(("dp0", "pp1.dp0"), pp2_record()):
+        (tmp_path / f"{name}.jsonl").write_text(
+            "".join(json.dumps(s) + "\n" for s in steps)
+        )
+        engine = {"tensor_parallel_size": tp}
+        (tmp_path / f"{name}.engine.json").write_text(json.dumps(engine))
+    recurrence.main(str(tmp_path))
+    if tp == 1:
+        recurrence.main(str(tmp_path), str(SPEC), "500")
+        return
+    with pytest.raises(ValueError, match="ran at TP 2: each stage sends shards"):
+        recurrence.main(str(tmp_path), str(SPEC), "500")
+
+
 def test_a_carrier_may_have_no_eager_size_and_no_fewer():
     document = json.loads(SPEC.read_text())
     carrier_models(MachineSpec.from_mapping(document))  # the spec states both

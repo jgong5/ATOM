@@ -27,11 +27,11 @@ neither from a datasheet nor probed, and `analytical` otherwise.
 
 Refused: a step with image tokens, since no graph holds the vision encoder; a
 two-batch-overlap step, since no graph holds a micro-batch or the MoE
-exchanges its comm stream carries; a data-parallel step (`moe_rows`), since
-capture runs one rank; a speculative decode step; a shape with no
-graph; and, each reason once, a leaf whose kind has no extractor, whose price
-reads a spec field the spec lacks, or whose collective leaves the scale-up
-domain.
+exchanges its comm stream carries; a speculative decode step; a shape with no
+graph; and, each reason once, a data-parallel step's (`moe_rows`) MoE
+exchange leaf, since capture runs one rank and its peers at this rank's rows,
+and a leaf whose kind has no extractor, whose price reads a spec field the
+spec lacks, or whose collective leaves the scale-up domain.
 """
 
 from __future__ import annotations
@@ -48,6 +48,9 @@ from atom.compass.backends.step_roofline import _reads
 from atom.compass.backends.work import Work, bounds
 
 SOURCE = "op-graph"
+#: The leaves a captured MoE layer exchanges its DP or EP group's rows by:
+#: ATOM's gathers and scatters, and MORI's dispatch and combine.
+MOE_EXCHANGES = ("atom.model_ops.moe:", "mori.ops.dispatch_combine:")
 NONE = "; no successor: the analytical law is the last op-level source"
 
 
@@ -127,12 +130,6 @@ class OpGraphBackend(CostBackend):
                 "a two-batch-overlap step: no captured graph holds a micro-batch, "
                 "nor the MoE exchanges its comm stream carries"
             )
-        elif view.moe_rows is not None:
-            reason = (
-                f"a data-parallel step whose MoE gathers {view.moe_rows} rows: "
-                "capture runs one rank, so no graph holds the gather, the "
-                "reduce-scatter or the experts at the group's rows"
-            )
         else:
             try:
                 rung = view.capture_rung if self.padded else None
@@ -178,6 +175,15 @@ class OpGraphBackend(CostBackend):
     def _leaf(self, leaf: dict, view: BatchView, refused: list):
         """One leaf's ``(seconds, stated, work)``; None when it launches no
         kernel or refuses."""
+        if view.moe_rows is not None and leaf["op"].startswith(MOE_EXCHANGES):
+            reason = (
+                f"a data-parallel step whose MoE gathers {view.moe_rows} rows: "
+                "capture runs one rank, so its graph holds the gather, the "
+                "reduce-scatter and the experts at every peer scheduling this "
+                "rank's rows"
+            )
+            refused.append(Refusal(SOURCE, reason))
+            return None
         try:
             w = work(leaf, view, self.tp, self.kv)
         except CostRefused as exc:
