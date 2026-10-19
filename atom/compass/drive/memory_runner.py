@@ -46,8 +46,8 @@ class MemoryReadingModelRunner(ModelRunner):
     the KV budget reads the device, less those; the warmup's peak above them
     over its tokens; the budget's
     `non_torch` and total; the reserved bytes graph capture adds; and the
-    kernels inductor autotuned and the graphs it missed, which `compass measure`
-    `memory` starts again for."""
+    kernels inductor autotuned and the graphs it missed, which
+    `compass measure memory` starts again for."""
 
     def _build_and_load_model(self, model_class):
         super()._build_and_load_model(model_class)

@@ -166,13 +166,15 @@ def _moe(m: Module, view: BatchView, tokens: int) -> tuple[Work, Work, Work]:
     after, routing uniform and independent.
 
     The experts run on the gathered rows, or under expert parallelism on the
-    busiest rank's expected share, reading each expert a row reaches once.
+    busiest rank's expected share, in one kernel: it reads each expert a row
+    reaches once, weights and scales, and its routes' share of the rows'
+    input, output, top-k ids and weights; the gate-up output never leaves it.
     On one data-parallel rank the output is all-reduced. Over a group, the
     hidden states and router logits are gathered and the output scattered
     back; under expert parallelism MoRI sends each of this rank's tokens once
     to every rank holding one of its experts, and back.
     """
-    experts, local, k, inter, hidden, ranks, dp, _ = m.dims
+    experts, local, k, inter, hidden, ranks, dp, _, held = m.dims
     rows, act = view.moe_rows if dp > 1 else tokens, ELEMENT_BYTES[ACT]
     real = view.moe_tokens if dp > 1 else sum_tokens(view.requests)
     # Pad rows all carry token 0 at position 0, so they route as one token.
@@ -180,8 +182,10 @@ def _moe(m: Module, view: BatchView, tokens: int) -> tuple[Work, Work, Work]:
     routed, groups = rows * k, activated_experts(experts, k, distinct)
     if local < experts:
         routed, groups = max_rank_load(rows, k, experts, ranks), groups / ranks
-    work = grouped_gemm(routed, 2 * inter, hidden, groups, m.act, m.fmt)
-    work += grouped_gemm(routed, hidden, inter, groups, m.act, m.fmt)
+    flops = grouped_gemm(routed, 2 * inter, hidden, groups, m.act, m.fmt)
+    flops += grouped_gemm(routed, hidden, inter, groups, m.act, m.fmt)
+    row = hidden * (ELEMENT_BYTES[m.wire[0]] + act) + 2 * k * ELEMENT_BYTES["fp32"]
+    work = Work(flops.flops_by_format, groups * held + routed / k * row)
     if dp == 1:
         return Work(), work, allreduce(ranks, tokens * hidden * act)
     if local == experts:
