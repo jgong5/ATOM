@@ -111,7 +111,7 @@ from atom.compass.drive.gpu import add_gpu_flag
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below or the
 #: copies a graph reads change.
-PROTOCOL = 6
+PROTOCOL = 7
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
