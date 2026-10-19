@@ -7,8 +7,10 @@ Each argument is a run directory: its step record in `steps/` and aiperf's
 export in `artifacts/profile_export_aiperf.json`. SIMULATED is the cell at its
 backend, and REAL two or more real runs of it, spaced in time.
 
-A directory `cctraces_sim.sh` wrote is graded whole, and refused when its
-run.json skips host segments. In one `record` or `run` wrote, whose run.json
+A directory `cctraces_sim.sh` wrote is graded whole. SIMULATED is refused
+when its run.json, the run file it ran, skips host segments, has no host laws,
+or turns the step roofline on with no step grid; a real run's server never
+reads the run file it was handed. In one `record` or `run` wrote, whose run.json
 states a `format_version`, the graded client run is the one whose export is
 `artifacts/client_run.json`, split from the record by `parity.served`: only
 its steps are graded, and every run's client must have been given the same
@@ -18,9 +20,11 @@ export names as its warmup's (`warmup`) is its warmup, and not graded. It is
 refused, naming every reason, when steps of any other request precede its own:
 it is then not its server's first client run, and meets the prefix cache an
 earlier one left; when its export names no warmup, since its first steps may
-then be cold; when no step up to its own first, that one included, holds a
-request the export names as the warmup's, since its graded steps may then
-precede it; and when its export lacks traces or arguments. A simulated run, whose
+then be cold; when no step before its own first holds a request the export
+names as the warmup's, since its graded steps may then precede it; when any
+step from its own first on, its own or not, holds such a request, since its
+warmup has then not ended when it starts; and when its export lacks traces or
+arguments. A simulated run, whose
 run.json holds `run_file`, is also refused when it skips host segments, or its
 run file has no host laws and so prices no host time; when the step roofline
 was on in a run of another backend than the step grid, which always prices
@@ -193,13 +197,20 @@ def _client_run(cell, run) -> tuple[list[dict], list[str], dict]:
     warm = [bool(names) and names <= warmup_names for names in held]
     mine = [s["client_run"] == 0 for s in split]
     traces = sorted({t for s, m in zip(split, mine) if m for t in s["traces"]})
-    before = warm[: mine.index(True)]
+    first = mine.index(True)
+    before = warm[:first]
     why = [] if all(before) else ["steps of requests it did not send precede its own"]
     if not warmup_names:
         why.append("its export names no warmup, so its first steps may be cold")
-    elif not any(names & warmup_names for names in held[: mine.index(True) + 1]):
+    elif not any(names & warmup_names for names in held[:first]):
         why.append(
-            "no step up to its own first holds its warmup, so its first steps may be cold"
+            "no step before its own first holds its warmup, so its first steps may be cold"
+        )
+    late = [s["step"] for s, n in zip(split[first:], held[first:]) if n & warmup_names]
+    if late:
+        why.append(
+            "steps from its own first on hold a request of its warmup, "
+            f"{len(late)} from step {late[0]}, so its warmup has not ended when it starts"
         )
     if "traces" not in export:
         why.append("its export names no traces its client was given")
@@ -213,16 +224,24 @@ def _client_run(cell, run) -> tuple[list[dict], list[str], dict]:
     return [s for s, m in zip(steps, mine) if m], export["traces"], warmup
 
 
+def _run_file_not_graded(run_file, roofline) -> list[str]:
+    """Why a simulated run of `run_file`, the step roofline on if `roofline`,
+    is not graded, as its run file says."""
+    why = []
+    if "host" not in run_file:
+        why.append("its run file has no host laws, so it prices no host time")
+    if roofline and STEP_GRID not in run_file:
+        why.append("the step roofline was on")
+    return why
+
+
 def _not_graded(run, traces) -> list[str]:
     """Why a simulated run, `run` its run.json, whose client run served
     `traces`, is not graded."""
     why, refused, coverage = [], run.get("refusals"), run["coverage"]
     if run["skip"]:
         why.append(f"it skips host segments {run['skip']}, a what-if run")
-    if "host" not in run["run_file"]:
-        why.append("its run file has no host laws, so it prices no host time")
-    if run["step_roofline"] and STEP_GRID not in run["run_file"]:
-        why.append("the step roofline was on")
+    why += _run_file_not_graded(run["run_file"], run["step_roofline"])
     if refused is None:
         why.append("its first client run has no summary, so its refusals are unknown")
     elif refused["count"]:
@@ -246,9 +265,22 @@ def graded(cell) -> tuple[list[dict], list[str] | None, dict | None]:
     run = json.loads(path.read_text()) if path.exists() else {}
     if "format_version" in run:
         return _client_run(cell, run)
+    return _steps(cell), None, None
+
+
+def _refuse_by_run_file(cell) -> None:
+    """Refuse the simulated `cell`, a directory `cctraces_sim.sh` wrote, when
+    the run file it ran, its run.json, says it is not graded."""
+    path = Path(cell) / "run.json"
+    if not path.exists():
+        return
+    run = json.loads(path.read_text())
+    if "format_version" in run:  # `_client_run` checks a `record` or `run` cell
+        return
     if any(h.get("skip") for h in entries(run, "host")):
         raise ValueError(f"{cell} skips host segments; a what-if run is not graded")
-    return _steps(cell), None, None
+    if why := _run_file_not_graded(run, run.get("step_roofline")):
+        raise ValueError(f"{cell} is not graded: " + "; ".join(why))
 
 
 def _read(cell) -> dict:
@@ -299,6 +331,7 @@ def grade(real_cells, simulated_cell) -> dict:
     """Every metric's grade: {family: {metric: grade}}, as the module says."""
     if len(real_cells) < 2:
         raise ValueError("a real spread needs two or more real runs")
+    _refuse_by_run_file(simulated_cell)
     real = [_read(c) for c in real_cells]
     simulated = _read(simulated_cell)
     given = {str(c): r["traces"] for c, r in zip(real_cells, real)}

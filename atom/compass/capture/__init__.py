@@ -3,7 +3,7 @@
 published as an `op_graph`.
 
     compass trace ops --model M [--tp N] [--width W ...] [--prefill T B ...]
-                      [--population P ...] --store S
+                      [--population P ...] [--arch A] --store S [-- ATOM args]
 
 A shape is a decode width (`--width`), a prefill of T tokens over B sequences
 (`--prefill`), or every shape the steps of a record directory hold
@@ -12,8 +12,12 @@ at its width, and any other step as a prefill of its query tokens over its
 rows. Each is traced at that concrete shape (`forward`), decoder layers folded
 into `Repeat` and forked streams into `Par` (`graph`).
 
-An `op_graph` is keyed by structure, the model's architecture and config.json
-digest, the TP width, the phase and eager, and by shape. Its members are
+An `op_graph` is keyed by structure (`forward.structure`: the model's
+architecture and config.json digest, the TP width, the DP and EP widths when
+set, the phase and the mode) and by shape. ATOM's engine arguments after `--`
+configure the engine as they would a server's; `--arch` names the declared
+device, which the entry states as its `device` condition and the key does not:
+a store holds one arch's graph per structure and shape. Its members are
 ``graph`` (`graph.to_json`) and ``declared``, what the capture stated in place
 of a device and the operators it left out of the graph, each with why. A TP
 group's ranks run one graph, so rank 0's is the entry's. The declarations are
@@ -29,6 +33,8 @@ import time
 
 
 def main(argv: list[str]) -> None:
+    split = argv.index("--") if "--" in argv else len(argv)
+    atom_args = argv[split + 1 :]
     p = argparse.ArgumentParser(prog="compass trace ops", description=__doc__)
     p.add_argument("--model", required=True, help="a model name or directory")
     p.add_argument("--tp", type=int, default=1, help="tensor-parallel width")
@@ -50,8 +56,9 @@ def main(argv: list[str]) -> None:
         default=[],
         help="a record directory; every shape its steps hold",
     )
+    p.add_argument("--arch", default="gfx942", help="the declared device's arch")
     p.add_argument("--store", required=True, help="the artifact store")
-    args = p.parse_args(argv)
+    args = p.parse_args(argv[:split])
 
     from atom.compass import artifacts as a
 
@@ -66,9 +73,10 @@ def main(argv: list[str]) -> None:
     command = " ".join(["compass", "trace", "ops", *argv])
     with tempfile.TemporaryDirectory(prefix="compass-capture-") as tmpdir:
         began = time.perf_counter()  # the first shape's seconds include the build
-        for graph, model, declared in capture(args.model, args.tp, shapes, tmpdir):
+        captured = capture(args.model, args.tp, shapes, tmpdir, atom_args, args.arch)
+        for graph, model, declared in captured:
             seconds = time.perf_counter() - began
-            key = publish(store, graph, model, declared, args.tp, command)
+            key = publish(store, graph, model, declared, args.tp, atom_args, command)
             print(f"captured {graph.applicability.shape} in {seconds:.1f} s")
             print(f"published {key} as {key.token()}")
             began = time.perf_counter()
@@ -77,9 +85,14 @@ def main(argv: list[str]) -> None:
 def population_shapes(names):
     """The shape of each step the record directories `names` hold, DP's dummy
     runs aside."""
+    return [shape for shape, _ in population_steps(names)]
+
+
+def population_steps(names):
+    """Each step the record directories `names` hold, DP's dummy runs aside,
+    as its shape and its step-record line."""
     from .forward import decode, prefill
 
-    shapes = []
     for name in names:
         path = pathlib.Path(name)
         if not (path / "run.json").is_file():
@@ -90,18 +103,17 @@ def population_shapes(names):
             if line["is_dummy_run"]:
                 continue
             if not all(row[2] for row in rows):
-                shapes.append(prefill(sum(row[0] for row in rows), len(rows)))
+                yield prefill(sum(row[0] for row in rows), len(rows)), line
             elif wide := [row[0] for row in rows if row[0] != 1]:
                 raise ValueError(
                     f"{name} step {line['step']} decodes {wide[0]} tokens in a row: "
                     "a speculative decode step is not captured"
                 )
             else:
-                shapes.append(decode(line["rung"] or len(rows)))
-    return shapes
+                yield decode(line["rung"] or len(rows)), line
 
 
-def publish(store, graph, model, declared, tp, command):
+def publish(store, graph, model, declared, tp, atom_args, command):
     """Publish `graph` of `model` at TP `tp` as one `op_graph` in `store`."""
     import torch
 
@@ -132,7 +144,9 @@ def publish(store, graph, model, declared, tp, command):
             device=declared["arch"],
             ptl=NO_PTL,
             host_cpu=host_cpu(),
-            engine_config=json.dumps({"enforce_eager": True, "tp": tp}),
+            engine_config=json.dumps(
+                {"enforce_eager": True, "tp": tp, "atom_args": atom_args}
+            ),
         ),
         gates=a.GateState.of(),
         members={

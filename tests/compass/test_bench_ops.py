@@ -241,6 +241,36 @@ def test_each_placement_keeps_its_own_forward_context_and_metadata():
         assert snap.context.positions.tolist() == [2 * p] * 2
 
 
+def test_a_shape_the_pool_cannot_place_refuses_its_leaves_and_the_next_is_measured(
+    monkeypatch,
+):
+    runner = _Runner()
+    runner.exit = lambda: runner.batches.append("exit")
+    monkeypatch.setattr(ops, "_runner", lambda config: runner)
+    monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda config: None)
+
+    def point(self, _rule, shape, context, found):
+        if shape.seqs == 2:
+            raise ValueError("no room for 2 rows")
+        return [{"shape": str(shape), "leaf": sig} for sig in found]
+
+    monkeypatch.setattr(ops.Stub, "point", point)
+    x = ("self", _t([2, 3], "activation"))
+    found = ops.leaves(
+        _graph(_leaf("aten.add.Tensor", x), _leaf("aten.mul.Tensor", x))["region"]
+    )
+
+    got = ops.measure(None, [(decode(2), 20, found), (decode(4), 20, found)], 10_000)
+
+    assert [(r["op"], r["refused"]) for r in got[:2]] == [
+        ("aten.add.Tensor", "ValueError: no room for 2 rows"),
+        ("aten.mul.Tensor", "ValueError: no room for 2 rows"),
+    ]
+    assert {r["shape"] for r in got[:2]} == {str(decode(2))}
+    assert got[2:] == [{"shape": str(decode(4)), "leaf": sig} for sig in found]
+    assert runner.batches == ["exit"]
+
+
 def test_an_embedding_reads_the_token_ids_the_forward_was_given():
     runner = _Runner()
     # An index buffer whose name holds the slot's, which the name rule picks.
@@ -274,6 +304,37 @@ def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
     # A Linear(3, 3) holds 12 floats, 48 bytes: 3 copies pass twice 50, on one
     # placement.
     assert stub._plan(rope, [{"rope": "0"}], kv, 4, 2) == (3, 48, 1)
+
+
+def test_a_call_cycles_over_every_weight_of_its_spec_on_the_cold_copies_inputs():
+    # One copy already passes twice a 1-byte cache. The model holds two
+    # Linear(3, 3) weights: copy 1 is copy 0 with the second, so a weight
+    # count past the cache-sized one allocates no activation.
+    runner = _Runner()
+    stub = ops.Stub(runner, 1)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    x = {"shape": [2, 3], "dtype": F32, "stride": [3, 1], "role": "activation"}
+    w = x | {"shape": [3, 3], "role": "weight"}
+    gemm = {"op": "x", "args": {"x": x, "w": [w]}}
+    graphs = []
+
+    def replay(fn, calls):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=["k"]),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        n, _, _ = stub._plan(gemm, [{}], {}, 4, 2)
+        record = stub._time(gemm, "sig", [{}], n)
+
+    (first, snap), (second, snap1) = graphs[0][:2]
+    assert second["x"] is first["x"] and snap1 is snap
+    assert first["w"][0] is runner.model[0].weight
+    assert second["w"][0] is runner.model[1].weight
+    assert (n, record["copies"]) == (1, 2)
 
 
 def test_copy_c_rotates_weights_and_instances_and_clones_past_the_first_round():

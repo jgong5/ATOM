@@ -26,7 +26,7 @@ D80).
 [#1489](https://github.com/jgong5/ATOM/issues/1489):** `trace ops` captures one
 `op_graph` per shape: each decode width and prefill (T, B) it is given, and each step of a
 record directory from `record` or `trace steps --out` (#1539); `measure ops` plans its
-points from a `shape_population`,
+points from the steps of such directories (#1527),
 measures every rank of the layout and writes an `op_measurement` per point; `fit ops`
 publishes a `price_list` only (D80).
 
@@ -182,11 +182,15 @@ with the `spec` package and per-machine scripts (`05` D26). A user passes one by
 compass record                                --out D -- <ATOM args>          [GPU]
 compass trace steps    <backend> --machine M  --out D --store S -- <ATOM args>
 compass trace ops      --model M [--tp N] [--width W]... [--prefill T B]... \
-                       [--population D]... --store S
+                       [--population D]... [--arch A] --store S [-- <ATOM args>]
 compass measure steps  [<batches>...] [--grid <population>... --grid-definition F] \
                        <sample> --sampling P --out D --store S -- <ATOM args> [GPU]
 compass measure ops    [--width W]... [--prefill T B]... [--context C] --llc-mib M \
                        --gpu G --out D --store S -- <ATOM args>               [GPU]
+compass measure ops    --plan RECORD [--plan RECORD]... --llc-mib M --gpu G \
+                       --out D --store S -- <ATOM args>                       [GPU]
+compass measure ops    --coverage RECORD [--coverage RECORD]... --out D --store S \
+                       -- <ATOM args>
 compass measure memory [--beside CMD] --machine M --out D --store S -- <ATOM args> [GPU]
 compass fit steps      --backend step-linear [--form FORM] [--seed SEED] \
                        RECORD... --client-run RECORD EXPORT... --machine M \
@@ -196,7 +200,7 @@ compass fit steps      --backend step-grid --grid <population>... --grid-definit
                        --client-run INPUT EXPORT... --machine M --out D --store S
 compass fit host       RECORD... --client-run RECORD EXPORT... --machine M \
                        --out D --store S
-compass fit ops                   (ops half)
+compass fit ops        MEASURED... --out D --store S
 compass run            <backend> --machine M  --out D --store S -- <ATOM args>
 
 <backend>   one of --step-linear KEY, --step-stub FILE, --step-grid KEY; --step-linear
@@ -207,19 +211,20 @@ compass run            <backend> --machine M  --out D --store S -- <ATOM args>
 <targets>   record directories, and the keys of step_measurement entries of replayed
             batches
 <sample>    --sample N --seed S, or --sample all
+MEASURED    measure ops --out directories, whose points fit ops reads from --store
 ```
 
 | Command | Phase (`07` D38) | Device | Reads | Writes |
 |---|---|---|---|---|
 | `record` | 1c's real runs | GPU | ATOM's arguments; the requests clients send | `--out`: the step record with its cost lines; `run.json` with the engine's bounds as ATOM resolved them; logs |
 | `trace steps` | 0 | none | `run`'s inputs | `--store`: one `shape_population`, keyed by the backend that priced it; `--out`: what `run` writes |
-| `trace ops` | 1a | none | the model at `--tp`; each decode width `--width` names and prefill of T tokens over B sequences `--prefill` names; with `--population`, every step of a record directory from `record` or `trace steps --out`, refusing a `shape_population` key; at least one shape | `--store`: one `op_graph` per shape (`07` D38, Phase 1a) |
+| `trace ops` | 1a | none | the model at `--tp` under ATOM's engine arguments after `--` (`--enable-dp-attention` traces one DP rank, every peer at its shape), on a declared `--arch` (`gfx942` by default); each decode width `--width` names and prefill of T tokens over B sequences `--prefill` names; with `--population`, every step of a record directory from `record` or `trace steps --out`, refusing a `shape_population` key; at least one shape | `--store`: one `op_graph` per shape (`07` D38, Phase 1a) |
 | `measure steps` | 1c, on the bench | GPU | its `<batches>`, and `--grid`'s inputs | `--store`: one `step_measurement` per distinct batch |
-| `measure ops` | 1b, collectives included | GPU, every rank of the layout | an `op_graph`; with `--plan`, the `shape_population` its planner places each leaf's points over (`07` D37); the stated collective entry points (`07` D40) | `--store`: one `op_measurement` per point, cold, with the kernels each leaf launched and its warm-over-cold ratio (`07` D41) |
+| `measure ops` | 1b, collectives included | GPU, every rank of the layout | an `op_graph`; with `--plan`, every step of a record directory from `record` or `trace steps --out`, which its planner places each leaf's points over (`07` D37); with `--coverage`, its own record directories of the same kind, the graded runs apart from `--plan`'s, and the `--plan` run's `--out`; the stated collective entry points (`07` D40) | `--store`: one `op_measurement` per point, cold, with the kernels each leaf launched and its warm-over-cold ratio (`07` D41) |
 | `measure memory` | 2 | GPU | ATOM's arguments; the machine spec | `--store`: one `memory_readings` for the configuration; `--out`: `run.json`, logs, a readable copy |
 | `fit steps` | from 1c's measurements | none | the machine spec; `record` directories, each with the exports of the client runs its server served, and `step_measurement` entries, as the backend accepts | `--store`: a `step_linear_law` or a step grid bundle, with its report; `--out`: a readable copy |
 | `fit host` | from real runs | none | the machine spec; `record` directories only, each with the exports of the client runs its server served | `--store`: `host_laws`, with its report |
-| `fit ops` | from 1b's measurements | none | `measure ops`'s `op_measurement` entries | `--store`: a `price_list`, interpolating only between same-kernel neighbours |
+| `fit ops` | from 1b's measurements | none | `measure ops` `--out` directories, whose `op_measurement` entries it reads from `--store` | `--store`: a `price_list`, interpolating only between same-kernel neighbours |
 | `run` | a simulated serve | none | a backend, the machine spec, the configuration's `memory_readings`, ATOM's arguments; the requests clients send | `--out`: the step record with its cost lines, the step table, the run summary, `run.json` with the run file and what grading reads (below), logs |
 
 **Shared by every command:**
