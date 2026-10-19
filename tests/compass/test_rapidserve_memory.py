@@ -11,8 +11,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from test_measure_memory import MACHINE, started
-from test_memory_readings import READINGS, publish_readings
+import test_measure_memory
+from test_measure_memory import MACHINE, a_start, started
+from test_memory_readings import READINGS, STACK, publish_readings
 from test_rapidserve_runner_config import _config
 from test_run_step_grid import deployment
 
@@ -179,3 +180,22 @@ def test_a_decode_start_that_missed_a_graph_starts_again(tmp_path):
     (decode / "readings.0.json").write_text(json.dumps({"fxgraph_cache_misses": 3}))
 
     assert measure_memory._cold(out) == ["decode/readings.0.json"]
+
+
+def test_a_rapidserve_run_is_identified_by_prefills_engine_file(tmp_path, monkeypatch):
+    r, argv = a_start(tmp_path, monkeypatch, STACK)
+    wrote = test_measure_memory.ranks_wrote
+
+    def and_decode(out, config, readings):
+        wrote(out, config, readings)
+        files = out / measure_memory.READINGS
+        (files / measure_memory.DECODE).mkdir()
+        for held in files.glob("*.json"):
+            decode = json.loads(held.read_text()) | {"engine": {"decode": True}}
+            (files / measure_memory.DECODE / held.name).write_text(json.dumps(decode))
+
+    monkeypatch.setattr(test_measure_memory, "ranks_wrote", and_decode)
+
+    measure_memory.main(argv)
+
+    assert json.loads((tmp_path / "out" / "engine.json").read_text()) == {}

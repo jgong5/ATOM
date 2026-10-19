@@ -215,6 +215,7 @@ def publish(out: Path, machine, store: str, command: str) -> None:
             raise ValueError(
                 f"the ranks read {len(keys)} keys off their configs: {sorted(keys)}"
             )
+        # No files, or prefill's key: nothing to add.
         if keys <= published:
             continue
         published |= keys
