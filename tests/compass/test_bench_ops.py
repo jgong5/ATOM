@@ -6,6 +6,7 @@ stub runs in a stand-in runner whose forward sets ATOM's forward context and
 calls the model, as ATOM's runner does.
 """
 
+import contextlib
 import dataclasses
 import json
 import pathlib
@@ -406,6 +407,36 @@ def test_a_long_call_fills_a_graph_to_graph_ns_and_has_no_warm_graph(
     assert graphs == [calls] * (2 if calls == ops.CALLS else 1)
     assert (record["copies"], record["calls"]) == (copies, calls)
     assert (record["warm_ns"] is None) == (calls < ops.CALLS)
+
+
+def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
+    # Replay i takes i + 1 ms on a stand-in clock; the host idles `REST` of that
+    # after every replay, warmups included, so the device stays off its power limit.
+    clock, slept = [0], []
+
+    class Graph:
+        def replay(self):
+            clock[0] += len(slept) + 1
+
+    class Event:
+        def __init__(self, enable_timing):
+            self.synchronize = lambda: None
+
+        def record(self):
+            self.at = clock[0]
+
+        def elapsed_time(self, end):
+            return end.at - self.at
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(ops.time, "sleep", slept.append)
+
+    ops._replay(lambda: None, [({}, fctx._forward_context)])
+
+    replays = range(ops.WARMUPS + ops.REPEATS)
+    assert slept == [(i + 1) * ops.REST / 1e3 for i in replays]
 
 
 def test_a_batch_takes_the_blocks_and_slots_it_is_placed_at(rule):  # noqa: F811

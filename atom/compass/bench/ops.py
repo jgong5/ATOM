@@ -40,7 +40,8 @@ tensors cloned past the first round: a placement is the point's batch on KV
 blocks and state slots of its own, for which ATOM builds the forward context
 again. A second graph runs copy 0 K times, warm; with one copy, or K under
 `CALLS`, there is none.
-Each graph is replayed `WARMUPS` times, then `REPEATS` times timed;
+Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
+idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches are the point's
 kernel identity. A batch the KV pool cannot place refuses its leaves.
@@ -80,6 +81,7 @@ import multiprocessing
 import os
 import re
 import statistics
+import time
 import warnings
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -104,7 +106,7 @@ from atom.compass.drive.gpu import add_gpu_flag
 
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below does.
-PROTOCOL = 5
+PROTOCOL = 6
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -118,6 +120,12 @@ GRAPH_NS = 10_000_000
 #: Times over the last-level cache the copies' bytes pass: just past it, part of
 #: them stays there, and an MI308X GEMM read up to 7% fast.
 COLD = 2
+#: Host idle after each replay, as a share of its device time. Back to back, a
+#: leaf that draws enough power holds the device at its power limit within
+#: about 100 ms, which lowers the memory clock a step running the leaf once
+#: between lighter kernels keeps: an MI308X lm_head GEMM read 2.9% slow so.
+#: After a replay `GRAPH_NS` bounds, the idle keeps the device under it.
+REST = 0.1
 #: Metadata arguments, by operator and slot, that are the token ids ATOM passes
 #: the model's forward; `_meta`'s name rule binds an embedding's `indices` to
 #: another index buffer.
@@ -606,8 +614,10 @@ def _replay(fn, calls) -> list[float]:
         graph.replay()
         end.record()
         end.synchronize()
+        ms = start.elapsed_time(end)
         if i >= WARMUPS:
-            times.append(start.elapsed_time(end) * 1e6 / len(calls))
+            times.append(ms * 1e6 / len(calls))
+        time.sleep(ms * REST / 1e3)
     return times
 
 
