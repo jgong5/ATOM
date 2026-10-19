@@ -50,7 +50,14 @@ forward step costs what a fitted law predicts. No GPU is used.
   every step from it. Records, fits and runs keyed by another tree's source refuse
   each other. A git worktree used in a root container fails git's ownership check,
   so a fit refuses it as "neither a git checkout nor a stamped snapshot"; a
-  snapshot avoids that.
+  snapshot avoids that. After switching trees, clear ATOM's compile cache in the
+  container (`rm -rf /root/.cache/atom/*`) while no server runs.
+- **The machine spec** of your node's GPUs, from `scripts/compass/machines/`,
+  where each file is named for its device and host (`mi308x-hjbog18.json` is node
+  18's). Its `device.ptl` must be the cards' PTL state, which
+  `cat /sys/bus/pci/devices/*/ptl/ptl_enable` prints; `measure memory` refuses a
+  spec that states another. A node with no spec of its own needs a developer to
+  write one with its per-machine script first.
 - **Inputs you supply:** a model directory; a cc-traces `traces.jsonl` (sha256
   `e39cd2ff3eba...`, 568,864,747 bytes); and two client Pythons. A real server's
   client is the image's `/opt/venv/bin/python3` (agentx-harness's aiperf). A
@@ -80,7 +87,7 @@ Run from `/` in the container, so no checkout's `atom` shadows `$T`'s.
 | `MODEL` | the model directory; `client.sh` reads it too | `/models/qwen38/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` |
 | `TRACES` | the cc-traces file; `client.sh` reads it | `/cc/traces.jsonl` |
 | `ATOM` | ATOM's arguments, identical for every step | `--model $MODEL --max-model-len 262144` |
-| `M` | the machine spec of this node's GPUs | `--machine $T/scripts/compass/machines/mi308x-hjbog18.json` |
+| `M` | the machine spec of this node's GPUs, as above | `--machine $T/scripts/compass/machines/mi308x-hjbog18.json` |
 | `S` | the store | `--store $R/store` |
 | `REAL_PY`, `SIM_PY` | the client Pythons, as above | `/opt/venv/bin/python3`, `$V/bin/python` |
 | `compass` | the CLI, run from its own tree; the image does not install it | `compass() { $T/scripts/compass/compass "$@"; }` |
@@ -135,15 +142,15 @@ plus 1800 s; the warmup grows to about 36 min at c=256.
 **3. Real runs** (GPU, at most two at once; 3 h 20 min for ten on two GPUs).
 
 ```bash
-for C in 1 4 16 64 256; do for k in 1 2; do
+for k in 1 2; do for C in 1 4 16 64 256; do
   serve $R/cell/c$C/real$k 0-255 $C $REAL_PY record --gpu $G
 done; done
 ```
 
 Each graded run is a fresh server: a second client run would meet the prefix
-cache the first left. Space the two runs of one concurrency apart; back-to-back
-repeats understate the real spread every metric is judged against. Success as
-in step 2.
+cache the first left. The loop spaces the two runs of one concurrency apart;
+back-to-back repeats understate the real spread every metric is judged against.
+Success as in step 2.
 
 **4. Fit** (CPU, under a minute each).
 
@@ -218,7 +225,7 @@ in the cell, so the law covers every step the cell takes.
 |---|---|---|
 | `<tree>/atom is neither a git checkout nor a stamped snapshot` | a git worktree in a root container fails git's ownership check | use a `snapshot.sh` tree (this page), or `git config --global safe.directory <tree>` in the container |
 | grading or a check imports `/app/ATOM` | `python -m` without `PYTHONPATH=$T`, or run from inside a checkout | `PYTHONPATH=$T`, from `/` |
-| `measure memory`: the cards read ptl `enabled`, and the spec states `disabled` | a machine spec for other cards | the spec of this node's cards, in `scripts/compass/machines/` |
+| `measure memory`: the cards read ptl `enabled`, and the spec states `disabled` | another node's machine spec, such as `mi308x-hjbog39.json` on node 18 | this node's spec (Environment) |
 | a GPU command refuses: `GPU N has PID P on it before the run` | the GPU is not idle | another GPU; never stop another user's work |
 | `run` refuses its law or host laws | records, fits and runs from two trees, two `$ATOM`s or two specs | one tree, one `$ATOM`, one spec for every step |
 | `... holds an earlier run's files`, or `client.sh` refuses its OUT | one server per `--out`, one client run per server | a fresh `--out` for every server |
@@ -227,7 +234,7 @@ in the cell, so the law covers every step the cell takes.
 | verdict `coverage report`, `no decode vector for rung N` | the cell decoded more requests at once than any calibration step did (a rung is the batch's captured-graph size) | calibrate at that concurrency or above; #1336's calibration reached no rung 48, so c=256 stayed a coverage report |
 | grading refuses a run: warmup | the client ran with `--no-warmup`, or its warmup overlapped its graded steps | keep `client.sh`'s default warmup |
 | grading refuses a run: fitted on the traces it grades | calibration and cell traces overlap | calibration 256 to 392, cell 0 to 255 |
-| disk full | raw exports keep every prompt | data under a large data disk |
+| disk full | raw exports keep every prompt | keep `$R` on a data disk with room |
 
 ## Appendix: the step grid
 
@@ -239,8 +246,8 @@ argument.
 
 1. **Shape populations** (CPU). Per concurrency, `compass trace steps
    --step-linear <LAW> --host-laws <HOST> $M $S --out $R/pop/<traces>/c$C --
-   $ATOM`, served one client run like a `run` server (`$SIM_PY`), once over
-   traces 256 to 392 and once over 0 to 255. Its stop publishes a
+   $ATOM`, serving one client run with `$SIM_PY` as a `run` server does, once
+   over traces 256 to 392 and once over 0 to 255. Its stop publishes a
    `shape_population` token. Plan from populations, not records: two real starts
    differ by a few KV blocks, which the planner refuses
    ([#1349](https://github.com/jgong5/ATOM/issues/1349)).
