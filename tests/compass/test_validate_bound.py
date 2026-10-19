@@ -80,7 +80,8 @@ def test_every_step_under_its_measured_time_passes_with_its_reports(tmp_path):
         assert (r["refused"], r["steps_refused"]) == ({}, 0)
         assert set(r["measured_over_analytical"]) == {"decode", "prefill", "mixed"}
         assert all(q["min"] > 1 for q in r["measured_over_analytical"].values())
-    one = BACKENDS["op"].price(BatchView((RequestShape(4096, 4096, False),)))
+    prefill = (RequestShape(4096, 4096, False),)
+    one = BACKENDS["op"].price(BatchView(prefill, produces_output=True))
     assert report["op"]["measured_over_analytical"]["prefill"][
         "median"
     ] == pytest.approx(1 / one.seconds)
