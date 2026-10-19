@@ -255,3 +255,45 @@ def test_the_probe_prices_a_late_rendezvous_receive_with_its_threshold_moved():
         if s["carrier"] == "rccl" and s["late"] and s["bytes"] > eager:
             s["done"] = s["end"] = s["end"] - eager * g
     assert probe.fit(samples)["rccl"]["late"] == pytest.approx([0] * 5, abs=1e-15)
+
+
+def test_the_probe_bisects_a_threshold_to_a_32nd_of_the_power_below_it():
+    """RCCL eager up to 37.5 MiB: the late order's bisection past 32 MiB
+    states it to the MiB below. gloo, eager at no size, bisects to the byte."""
+    limit = 75 * 2**19
+    truth = TRUTH | {"rccl": (limit, *TRUTH["rccl"][1:])}
+    samples = []
+    for c, sizes in probe.SIZES.items():
+        late = probe.threshold(sizes, lambda n, c=c: n <= truth[c][0])
+        samples += [_sample(c, n, False, *truth[c]) for n in sizes]
+        samples += [_sample(c, n, True, *truth[c]) for n in late]
+    fit = probe.fit(samples)
+    assert fit["rccl"]["eager_threshold_bytes"] == 37 * 2**20
+    assert fit["gloo"]["eager_threshold_bytes"] == 0
+    gloo = sorted(s["bytes"] for s in samples if s["carrier"] == "gloo" and s["late"])
+    assert gloo[:4] == [1, 2, 4, 8]
+
+
+def test_the_probe_refuses_late_reads_whose_eager_sizes_are_not_a_prefix():
+    """Pooled records whose bisections differ can read 1100 bytes rendezvous
+    beside 1536 eager: the fit refuses, stating no threshold above a
+    rendezvous size."""
+    samples = _samples(TRUTH) + [
+        _sample("rccl", 1100, True, *TRUTH["rccl"]),
+        _sample("rccl", 1536, True, 2047, *TRUTH["rccl"][1:]),
+    ]
+    with pytest.raises(SystemExit, match=r"rccl: eager late sizes \[8, .*1024, 1536\]"):
+        probe.fit(samples)
+
+
+def test_the_probe_refuses_a_carrier_eager_at_every_power_of_two():
+    """RCCL eager up to 640 MiB: the bisection past 512 MiB reads late sizes
+    rendezvous, but no power of two is left to fit the rendezvous line."""
+    truth = TRUTH | {"rccl": (2**29 + 2**27, *TRUTH["rccl"][1:])}
+    samples = []
+    for c, sizes in probe.SIZES.items():
+        late = probe.threshold(sizes, lambda n, c=c: n <= truth[c][0])
+        samples += [_sample(c, n, False, *truth[c]) for n in sizes]
+        samples += [_sample(c, n, True, *truth[c]) for n in late]
+    with pytest.raises(SystemExit, match=r"rccl: .* not a prefix below 536870912"):
+        probe.fit(samples)
