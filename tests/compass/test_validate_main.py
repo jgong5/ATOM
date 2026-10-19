@@ -323,6 +323,27 @@ def test_a_refusal_in_the_client_run_record_and_run_wrote_refuses_the_cell(
         main([str(tmp_path / "c4")])
 
 
+def test_a_later_client_runs_refusal_leaves_a_run_written_cell_graded(capsys, tmp_path):
+    _rows(capsys, tmp_path)
+    _as_recorded(tmp_path / "c4")
+    # Client run 0 refused nothing; a later one on its server refused once.
+    law = tmp_path / "c4" / "step_linear"
+    (law / "client-0").mkdir()
+    (law / "summary.json").rename(law / "client-0" / "summary.json")
+    summary = json.loads((law / "client-0" / "summary.json").read_text())
+    summary["coverage_report"] = True
+    summary["schedule"]["refusals"].update(count=1, by_source=[["clock", 1]])
+    (law / "summary.json").write_text(json.dumps(summary))
+
+    rows = _graded(capsys, tmp_path / "c4")
+
+    assert rows["cell", "verdict"] == ["3 real runs", "graded"]
+    assert rows["summary step_linear", "refusals"] == [
+        "0 {}; cost refused 0.0% of 20 steps",
+        "none",
+    ]
+
+
 def test_runs_record_and_run_wrote_that_were_given_other_traces_are_not_one_cell(
     capsys, tmp_path
 ):

@@ -224,7 +224,7 @@ also run lazily inside a simulated run (doc `02`).
 |---|---|
 | **Input** | the decode widths and prefill (T, B) it is given, and the steps of the record directories it is given, from `record` or `trace steps --out`; the model config; the engine config |
 | **Output** | one `op_graph` artifact per shape, keyed by the structure's discrete key and the shape (`04` D19) |
-| **Cost** | 7.6 s per shape on Qwen3.8-27B TP1, 2.2 s of it the traced forward ([#1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252)'s PoC) |
+| **Cost** | 7.6 s per shape on Qwen3.8-27B TP1, 2.2 s of it the traced forward ([#1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252)'s PoC); a decode shape traces two forwards, one per context its integer arguments are read at (`04` D20) |
 | **Needs a GPU** | **no** — but see the caveat below |
 
 **The caveat that makes this phase less free than it looks.** "Device-free" means no GPU
@@ -364,7 +364,7 @@ campaign and the one with the tightest acceptance gate behind it — KV block co
 | Reading | Source |
 |---|---|
 | `capacity_bytes` | the device, once; the capacity a run sizes against stays the machine spec's configured one (`13` D78) |
-| `driver_and_collective_reserve_bytes` | ATOM's own `get_num_blocks` `non_torch` term, from a start in which inductor autotuned no kernel: the configs autotuning tries stay loaded, +12 to 26 MiB a rank on a cold cache (Qwen3.8-27B TP2), so a start that autotuned is started again on the cache it warmed, under a free `ATOM_DP_MASTER_PORT`, since the first start to load ATOM's compiled-graph cache autotunes again ([#1428](https://github.com/jgong5/ATOM/issues/1428)) |
+| `driver_and_collective_reserve_bytes` | ATOM's own `get_num_blocks` `non_torch` term, from a start in which inductor autotuned no kernel and its FX graph cache missed no graph: the configs autotuning tries stay loaded, +12 to 26 MiB a rank on a cold cache (Qwen3.8-27B TP2), and a start that compiled every graph afresh on a cache a Compass-off start keyed, autotuning nothing, read 2 MiB more and sized 1 to 2 KV blocks fewer (Qwen3-0.6B TP1, [#1517](https://github.com/jgong5/ATOM/issues/1517)), so such a start is started again on the cache it warmed, under a free `ATOM_DP_MASTER_PORT`, since the first start to load ATOM's compiled-graph cache autotunes again ([#1428](https://github.com/jgong5/ATOM/issues/1428)) |
 | `allocator_retained_after_load_bytes` | torch allocator, after weight load completes, less the model's parameter and buffer storages |
 | `persistent_forward_buffer_bytes` | allocated bytes where `get_num_blocks` reads the device, less those after load: `allocate_forward_vars`, attention metadata setup |
 | `activation_bytes` over `warmup_tokens` | ATOM's one warmup forward's allocator peak above what stays allocated, as a serving start reads it, from a start in which inductor autotuned no kernel: on a cold compile cache the peak sat in inductor's autotuning tensors, +15.8% (Qwen3-0.6B) and +65.2% (Qwen3-30B-A3B) ([#705](https://github.com/jgong5/ATOM/issues/705)). A second warmup in the same start reads higher than the first, which is the one that sizes the KV pool ([#1481](https://github.com/jgong5/ATOM/issues/1481)) |
