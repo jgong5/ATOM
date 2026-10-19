@@ -856,9 +856,9 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
 - **An integer that moves with the context is stored affine in it.** A decode shape is
   traced at two contexts; an integer argument that differs between them is stored as
   `{"affine": [slope, intercept]}`, and `measure ops` binds it at the point's context
-  ([#1572](https://github.com/jgong5/ATOM/issues/1572)). One that is not affine, a
-  non-integer that moves, or traces that differ otherwise refuse the shape by operator
-  and slot.
+  ([#1572](https://github.com/jgong5/ATOM/issues/1572)). One that is not affine, or a
+  non-integer that moves, refuses the shape by operator and slot; traces that differ
+  otherwise refuse it by both operators or both operator counts.
 - **A raw Triton or FlyDSL launch lifts to its innermost ATOM function**, that frame's
   other dispatches folded in. On Qwen3.8-27B, `fused_qk_norm`, `try_mrope_qk_fused` and
   `kv_indices_generate_triton` are dedicated helpers with clean arguments; the FlyDSL
