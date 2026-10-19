@@ -24,8 +24,9 @@ earlier one left; when its export names no warmup, since its first steps may
 then be cold; when no step before its own first holds a request the export
 names as the warmup's, since its graded steps may then precede it; when any
 step from its own first on, its own or not, holds such a request, since its
-warmup has then not ended when it starts; and when its export lacks traces or
-arguments. A simulated run, whose
+warmup has then not ended when it starts; when its export lacks traces or
+arguments; and when its export lists `unnamed` requests, naming each by its
+`x_request_id`, since no step can be matched to them. A simulated run, whose
 run.json holds `run_file`, is also refused when it skips host segments, or its
 run file has no host laws and so prices no host time; when the step roofline
 was on in a run of another backend than the step grid, which always prices
@@ -219,6 +220,8 @@ def _client_run(cell, run) -> tuple[list[dict], list[str], dict]:
         why.append("its export names no traces its client was given")
     if "arguments" not in export:
         why.append("its export names no arguments its client was given")
+    if unnamed := [u["x_request_id"] for u in export.get("unnamed") or ()]:
+        why.append(f"its export lists requests no step can be matched to: {unnamed}")
     if "run_file" in run:
         why += _not_graded(run, traces)
     if why:

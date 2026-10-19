@@ -648,6 +648,26 @@ def test_a_client_run_whose_export_names_no_arguments_given_is_refused(tmp_path)
         grade(real, simulated)
 
 
+def test_a_client_run_whose_export_lists_unnamed_requests_is_refused_naming_them(
+    tmp_path,
+):
+    *real, simulated = (_recorded(c) for c in _four(tmp_path))
+    report = grade(real, simulated)
+
+    def unnamed(ids):
+        export = json.loads((real[1] / CLIENT_RUN).read_text())
+        rows = [{"x_request_id": i, "phase": "profiling", "trace": "t"} for i in ids]
+        (real[1] / CLIENT_RUN).write_text(json.dumps(export | {"unnamed": rows}))
+
+    # `report` read exports with no `unnamed`; one listing none grades the same.
+    unnamed([])
+    assert grade(real, simulated) == report
+    unnamed(["x-1", "x-2"])
+    why = "its export lists requests no step can be matched to: ['x-1', 'x-2']"
+    with pytest.raises(ValueError, match=f"r1 is not graded: {re.escape(why)}$"):
+        grade(real, simulated)
+
+
 def _ran(monkeypatch, tmp_path, served, assumed=None):
     """Three real cells, and a simulated one whose run.json `compass run`
     wrote once its server, serving until stopped, served one client run per
