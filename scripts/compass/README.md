@@ -698,11 +698,16 @@ profiling. The grace period after the duration stays aiperf's finite default:
 waiting on a credit the server no longer holds (upstream, in agentx-harness's
 aiperf).
 Until #1301, a real server's environment sets `TRITON_CACHE_AUTOTUNING=1` and one
-`TRITON_CACHE_DIR` for every run, as `cctraces_sim.sh` does for a real cell. Until
-#1319, take a graded record only in a container that has served one before: aiter
-builds its `mha_varlen_fwd` module on a server's first short prefill on a deep
-history, about 60 s inside the run, and keeps it in the container's aiter tree,
-which no cache directory above holds.
+`TRITON_CACHE_DIR` for every run, as `cctraces_sim.sh` does for a real cell. aiter
+builds a JIT module the first time a server meets a kernel variant its image did
+not prebuild, such as `mha_varlen_fwd`'s for a prefill step of one new token a
+row, about 60 s inside the run, and keeps it in the container's aiter tree, which
+no cache directory above holds. A record names each module its server built in
+run.json's `aiter_jit_built`, and grading refuses it, naming them. So warm a fresh
+container before its first record: serve the same workload for a few minutes on
+a server whose record nothing reads, `compass record --gpu G --out $R/warm --
+$ATOM` with `client.sh $R/warm --traces A-B --concurrency <C> --duration 300
+--stop` at the record's traces, and take again any record refused for a build.
 
 1. `compass measure memory --gpu G $M $S --out $R/mem -- $ATOM`.
 2. Calibration, alone on the node: per concurrency 1, 4, 16, 64 and 256,
