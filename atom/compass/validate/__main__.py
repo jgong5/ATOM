@@ -7,9 +7,10 @@ of several the one fitted under the engine config each real run states) or `step
 this process, refused unless its digest is the one the run summary records)
 and two or more `real*/`. `cctraces_sim.sh` writes each run.json as the run file with
 the `workload` every run must share; `record` and `run` write their own, the run file
-as `run_file`, and `validate.runs` decides which client run of theirs is graded, and
-whether one is. Rows: `validate.runs`' grades, TTFT p50 per band of uncached prompt
-tokens graded alike; per run `record` or `run` wrote, its warmup: how many requests
+as `run_file`. `validate.runs` decides which client run is graded, and whether one is,
+in a run `record` or `run` wrote and in a `cctraces_sim.sh` run holding
+`artifacts/client_run.json`. Rows: `validate.runs`' grades, TTFT p50 per band of
+uncached prompt tokens graded alike; per such run, its warmup: how many requests
 its export names as such and how many steps hold only those; `validate.cost` on the
 steps graded (with the steps it leaves out, declines with their most frequent
 reasons, or extrapolates) and `memory.check` per real run; and the simulated run's refusals by source, its steps
@@ -81,7 +82,7 @@ def _runs(real: list[Path], sim: Path):
 
 
 def _warmup(run: Path, warmup: dict | None):
-    if warmup is not None:  # None: a run `cctraces_sim.sh` wrote, graded whole
+    if warmup is not None:  # None: a run graded whole
         value = f"requests {warmup['requests']}, steps {warmup['steps']}"
         yield f"warmup {run.name}", "warmup", value, "not graded"
 

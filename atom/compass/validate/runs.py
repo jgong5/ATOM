@@ -7,7 +7,8 @@ Each argument is a run directory: its step record in `steps/` and aiperf's
 export in `artifacts/profile_export_aiperf.json`. SIMULATED is the cell at its
 backend, and REAL two or more real runs of it, spaced in time.
 
-A directory `cctraces_sim.sh` wrote is graded whole. SIMULATED is refused
+A directory `cctraces_sim.sh` wrote is graded as below when it holds
+`artifacts/client_run.json`, whole when it does not. SIMULATED is refused
 when its run.json, the run file it ran, skips host segments, has no host laws,
 or turns the step roofline on with no step grid; a real run's server never
 reads the run file it was handed. In one `record` or `run` wrote, whose run.json
@@ -258,12 +259,13 @@ def _not_graded(run, traces) -> list[str]:
 
 
 def graded(cell) -> tuple[list[dict], list[str] | None, dict | None]:
-    """The steps `cell` grades; the traces its client was given, None for a
-    directory `cctraces_sim.sh` wrote; and its warmup as `_client_run` gives
-    it, None where it is graded whole."""
+    """The steps `cell` grades; the traces its client was given, and its
+    warmup, as `_client_run` gives them, both None where it is graded whole."""
     path = Path(cell) / "run.json"
     run = json.loads(path.read_text()) if path.exists() else {}
     if "format_version" in run:
+        return _client_run(cell, run)
+    if (Path(cell) / CLIENT_RUN).is_file():
         return _client_run(cell, run)
     return _steps(cell), None, None
 
@@ -286,7 +288,7 @@ def _refuse_by_run_file(cell) -> None:
 def _read(cell) -> dict:
     steps, traces, _warmup = graded(cell)
     export = json.loads((Path(cell) / EXPORT).read_text())
-    # A run `cctraces_sim.sh` wrote, graded whole, states its arguments in run.json.
+    # A run graded whole states its arguments in run.json.
     client = {} if traces is None else json.loads((Path(cell) / CLIENT_RUN).read_text())
     return {
         "counts": _counts(steps, export),
