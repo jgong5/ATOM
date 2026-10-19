@@ -8,6 +8,7 @@ calls the model, as ATOM's runner does.
 
 import contextlib
 import dataclasses
+import functools
 import json
 import pathlib
 from types import SimpleNamespace
@@ -501,6 +502,99 @@ def test_every_cold_and_warm_graph_holds_calls_calls_at_any_copies(copies):
     assert (record["copies"], record["calls"]) == (copies, ops.CALLS)
 
 
+def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(
+    monkeypatch,
+):
+    # One call's 1056 bytes pass twice a 600-byte cache in two copies: four
+    # layers take four copies, and only the first two allocate activations.
+    layers = {f"model.layers.{i}.attn": SimpleNamespace(layer_num=i) for i in range(4)}
+    kv = {
+        f"layer_{i}": SimpleNamespace(k_cache=torch.zeros(64, 16, 4)) for i in range(4)
+    }
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", kv)
+    runner = _Runner(layers)
+    q = ("q", _t([2, 4], "activation"))
+    found = ops.leaves(
+        _graph(_leaf("x", q, ("layer", ir.ContextRef(KEY)), key=KEY))["region"]
+    )
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    graphs = []
+
+    def replay(fn, calls):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(runner.model, "forward", ops.Stub(runner, 600)) as stub,
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=["k"]),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        [record] = stub.point(placed, decode(2), 20, found)
+
+    assert [kw["layer"] for kw, _ in graphs[0][:4]] == list(layers)
+    qs = [kw["q"] for kw, _ in graphs[0]]
+    assert qs[0] is not qs[1]
+    assert all(q is qs[c % 2] for c, q in enumerate(qs))
+    assert record["copies"] == 4
+
+
+def test_a_graph_over_placements_reads_one_clone_of_metadata_none_changed(
+    monkeypatch,
+):
+    # The leaf prepares on the host for the last `cu_seqlens_q` it saw, by
+    # identity, as linear attention does its chunk indices; a capture cannot.
+    # Every placement's forward leaves it unchanged.
+    layers = {f"model.layers.{i}.attn": SimpleNamespace(layer_num=i) for i in (0, 1)}
+    kv = {f"layer_{i}": SimpleNamespace(k_cache=torch.zeros(64, 16, 4)) for i in (0, 1)}
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", kv)
+    cu = torch.tensor([0, 1, 2], dtype=torch.int32)
+    meta = functools.partial(fctx.AttentionMetaData, cu_seqlens_q=cu)
+    monkeypatch.setattr(fctx, "AttentionMetaData", meta)
+    runner = _Runner(layers)
+    q = ("q", _t([2, 4], "activation"))
+    leaf = _leaf("x", q, ("layer", ir.ContextRef(KEY)), key=KEY)
+    found = ops.leaves(_graph(leaf, layers=2)["region"])
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    prepared, capturing = {}, []
+
+    def call(**kwargs):
+        cu = fctx.get_forward_context().attn_metadata.cu_seqlens_q
+        if prepared.get("cu") is not cu:
+            assert not capturing, "operation not permitted when stream is capturing"
+            prepared["cu"] = cu
+
+    @contextlib.contextmanager
+    def graph(g, capture_error_mode=None):
+        capturing.append(g)
+        yield
+        capturing.clear()
+
+    def event(enable_timing):
+        return SimpleNamespace(
+            record=lambda: None, synchronize=lambda: None, elapsed_time=lambda e: 1.0
+        )
+
+    monkeypatch.setattr(torch.cuda, "graph", graph)
+    monkeypatch.setattr(
+        torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=lambda: None)
+    )
+    monkeypatch.setattr(torch.cuda, "Event", event)
+    with (
+        patch.object(runner.model, "forward", ops.Stub(runner, 5_000)) as stub,
+        patch.object(ops, "_function", return_value=call),
+        patch.object(ops, "_kernels", return_value=["k"]),
+    ):
+        [record] = stub.point(placed, decode(2), 20, found)
+
+    assert "refused" not in record
+    assert record["placements"] == 5
+
+
 def test_a_replay_prices_each_timed_replay_per_call_each_under_its_context(
     monkeypatch,
 ):
@@ -534,6 +628,48 @@ def test_a_replay_prices_each_timed_replay_per_call_each_under_its_context(
     assert seen == [(i, f"snap{i}") for i in range(4)]
     timed = range(ops.WARMUPS, ops.WARMUPS + ops.REPEATS)
     assert times == [(i + 1) * 1e6 / 4 for i in timed]
+
+
+def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
+    monkeypatch,
+):
+    # The same leaf at two contexts of one width, cold time flat: the profiler
+    # recorded its device-to-device copy at one and missed it at the other.
+    cuda, cpu = torch.autograd.DeviceType.CUDA, torch.autograd.DeviceType.CPU
+
+    def event(name, start, device=cuda):
+        span = SimpleNamespace(start=start)
+        return SimpleNamespace(name=name, device_type=device, time_range=span)
+
+    profiled = {
+        2436: [
+            "Memcpy DtoD (Device -> Device)",
+            "attn",
+            "Memcpy HtoD (Host -> Device)",
+        ],
+        452: ["attn"],
+    }
+
+    @contextlib.contextmanager
+    def profile(activities):
+        names = profiled[context]
+        yield SimpleNamespace(
+            events=lambda: [event("aten::copy_", -1, cpu)]
+            + [event(n, -i) for i, n in enumerate(names)]
+        )
+
+    monkeypatch.setattr("torch.profiler.profile", profile)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    records = []
+    for context in profiled:
+        kernels = ops._kernels(lambda: None, {})
+        records.append(
+            {"shape": "decode B=2", "context": context, "op": "aiter.attn"}
+            | {"leaf": "l", "kernels": kernels, "cold_ns": 31_700.0}
+        )
+
+    assert [r["kernels"] for r in records] == [["attn"], ["attn"]]
+    assert ops._dependent(records) == {"aiter.attn": False}
 
 
 def test_a_batch_takes_the_blocks_and_slots_it_is_placed_at(rule):  # noqa: F811

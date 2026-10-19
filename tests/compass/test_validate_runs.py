@@ -703,6 +703,17 @@ def test_a_stop_during_the_first_client_run_refuses_it(monkeypatch, tmp_path):
         grade(real, simulated)
 
 
+def test_a_client_run_that_sent_nothing_before_the_graded_one_refuses_it(
+    monkeypatch, tmp_path
+):
+    empty = ([], {"steps": 0, "seconds": 0.0, "treatments": collections.Counter()}, [])
+    real, simulated = _ran(monkeypatch, tmp_path, [empty, CLIENT_RUNS[1]])
+
+    nothing = "its first client run priced no step, so it is not the graded one"
+    with pytest.raises(ValueError, match=f"sim is not graded: {nothing}$"):
+        grade(real, simulated)
+
+
 def test_a_run_whose_engine_read_an_assumed_memory_reading_is_refused_naming_it(
     monkeypatch, tmp_path
 ):

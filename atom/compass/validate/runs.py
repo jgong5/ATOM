@@ -31,11 +31,11 @@ run.json holds `run_file`, is also refused when it skips host segments, or its
 run file has no host laws and so prices no host time; when the step roofline
 was on in a run of another backend than the step grid, which always prices
 below it; when its first client run refused anything, or has no summary to
-say; when it ran the step grid without a coverage check; when its
-backend's fit inputs were profiled or served a trace it served; and when its
-engines read an assumed `memory_readings` member, naming each assumption its
-`provenance` lists, since its KV blocks rest on readings no start took. The step
-grid's plan, an input of `source` `plan`, is not one: it placed the points
+say, or priced no step, since the graded client run then came later; when it
+ran the step grid without a coverage check; when its backend's fit inputs
+were profiled or served a trace it served; and when its engines read an
+assumed `memory_readings` member, naming each assumption its `provenance`
+lists, since its KV blocks rest on readings no start took. The step grid's plan, an input of `source` `plan`, is not one: it placed the points
 from shapes alone, so it may have read any trace, a graded one included.
 Beside the table, the command states how many of that client run's steps its
 backend extrapolated and a fallback below it priced.
@@ -252,6 +252,8 @@ def _not_graded(run, traces) -> list[str]:
         why.append("its first client run has no summary, so its refusals are unknown")
     elif refused["count"]:
         why.append(f"it refused {refused['count']}: {refused['reasons']}")
+    if refused and refused.get("steps") == 0:
+        why.append("its first client run priced no step, so it is not the graded one")
     if STEP_GRID in run["run_file"] and not coverage:
         why.append("it ran the step grid without a coverage check")
     provenance = run["provenance"]["provenance"] or {}
