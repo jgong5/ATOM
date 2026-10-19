@@ -73,16 +73,16 @@
         "model": "/models/DeepSeek-V4-Pro",
         "source_root": "commit:19c5ab09e",
         "record": "sha256:2397696f6df3a280660cbc95e7c8db0d61b77fba9986c3d388ccde75f2d5f574",
-        "p10": 0.001966482509138914,
-        "p90": 0.001966482509138914
+        "p10": 0.0019362225299832747,
+        "p90": 0.0023826020769630186
       },
       "host.http_intake.per_byte_s": {
         "origin": "probed",
         "model": "/models/DeepSeek-V4-Pro",
         "source_root": "commit:19c5ab09e",
         "record": "sha256:2397696f6df3a280660cbc95e7c8db0d61b77fba9986c3d388ccde75f2d5f574",
-        "p10": 5.288974015662166e-09,
-        "p90": 5.288974015662166e-09
+        "p10": 3.617351613835432e-09,
+        "p90": 5.241243893276638e-09
       },
       "device.memory.bandwidth_bytes_per_s": {
         "origin": "datasheet"
