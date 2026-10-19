@@ -235,9 +235,7 @@ def test_a_plan_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_pa
     assert {r["context"] for r in records} == {1500, 3000}
 
 
-def test_coverage_reads_a_padded_step_s_lowest_context_over_its_rung(
-    bench, tmp_path
-):
+def test_coverage_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_path):
     plan = _records(
         tmp_path / "plan",
         ([[1, 1000, True], [1, 3000, True]], 2),
