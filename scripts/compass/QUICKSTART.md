@@ -87,8 +87,10 @@ Run from `/` in the container, so no checkout's `atom` shadows `$T`'s.
 | `MODEL` | the model directory; `client.sh` reads it too | `/models/qwen38/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` |
 | `TRACES` | the cc-traces file; `client.sh` reads it | `/cc/traces.jsonl` |
 | `ATOM` | ATOM's arguments, identical for every step | `--model $MODEL --max-model-len 262144` |
-| `M` | the machine spec of this node's GPUs, as above | `--machine $T/scripts/compass/machines/mi308x-hjbog18.json` |
+| `SPEC` | the machine spec of this node's GPUs, as above | `$T/scripts/compass/machines/mi308x-hjbog18.json` |
+| `M` | the machine spec as a flag | `--machine $SPEC` |
 | `S` | the store | `--store $R/store` |
+| `V` | the compass-harness venv's directory, on the data disk | `/data/<user>/compass/venv-sim` |
 | `REAL_PY`, `SIM_PY` | the client Pythons, as above | `/opt/venv/bin/python3`, `$V/bin/python` |
 | `compass` | the CLI, run from its own tree; the image does not install it | `compass() { $T/scripts/compass/compass "$@"; }` |
 
@@ -139,7 +141,7 @@ engine's bounds under `engine`) and `artifacts/client_run.json`. Success:
 `client.sh` exits 0 and both files exist. Each concurrency spends its warmup
 plus 1800 s; the warmup grows to about 36 min at c=256.
 
-**3. Real runs** (GPU, at most two at once; 3 h 20 min for ten on two GPUs).
+**3. Real runs** (GPU; 3 h 20 min for ten on two GPUs, about 6 h 40 min on one).
 
 ```bash
 for k in 1 2; do for C in 1 4 16 64 256; do
@@ -150,7 +152,8 @@ done; done
 Each graded run is a fresh server: a second client run would meet the prefix
 cache the first left. The loop spaces the two runs of one concurrency apart;
 back-to-back repeats understate the real spread every metric is judged against.
-Success as in step 2.
+On two GPUs, run the `k=1` and `k=2` loops at once, each with its own `$G`; no
+more than two at once, since real runs time the host. Success as in step 2.
 
 **4. Fit** (CPU, under a minute each).
 
@@ -208,8 +211,7 @@ record of traces 256 to 263, two real runs and one simulated run of traces 0 to
 more GPU time. Its variables are in its header.
 
 ```bash
-HIP_VISIBLE_DEVICES=$G MACHINE=$T/scripts/compass/machines/mi308x-hjbog18.json \
-  HARNESS_PYTHON=$SIM_PY AIPERF_PYTHON=$REAL_PY \
+GPU=$G MACHINE=$SPEC HARNESS_PYTHON=$SIM_PY AIPERF_PYTHON=$REAL_PY \
   $T/scripts/compass/smoke_cell.sh $MODEL $R/smoke
 ```
 
@@ -220,8 +222,9 @@ took 44 min: 13 to 15 min per real server, 2 min for the simulated run.
 
 On these traces at c=1, no step in the first 600 s batches two requests, in
 calibration or in the cell, so the law has a vector for every step the cell
-takes. One short calibration record does not span the cell's contexts, though,
-so the cost rows read `unvalidated`: the smoke cell checks the path, not the
+takes. Its cost rows all read `unvalidated`, though: `fit steps` marks the
+region it validates by holding out each calibration record in turn, so it needs
+two or more, and the smoke cell has one. The smoke cell checks the path, not the
 law's accuracy.
 
 ## Traps
@@ -243,29 +246,7 @@ law's accuracy.
 
 ## Appendix: the step grid
 
-The step grid prices a step from measured points on a grid of batch shapes
-instead of a linear law. It reuses steps 1 to 3 and the host laws of step 4;
-the README's
-[step grid section](README.md#the-same-cell-under-the-step-grid) has every
-argument.
-
-1. **Shape populations** (CPU). Per concurrency, `compass trace steps
-   --step-linear <LAW> --host-laws <HOST> $M $S --out $R/pop/<traces>/c$C --
-   $ATOM`, serving one client run with `$SIM_PY` as a `run` server does, once
-   over traces 256 to 392 and once over 0 to 255. Its stop publishes a
-   `shape_population` token. Plan from populations, not records: two real starts
-   differ by a few KV blocks, which the planner refuses
-   ([#1349](https://github.com/jgong5/ATOM/issues/1349)).
-2. **Measure the grid** (GPU, hours: 412 points took 10 h on three GPUs).
-   `compass measure steps --grid <POP>... --grid-definition <G.json> --client-run
-   ... --sampling '{"ignore_eos": true}' --gpu $G $S --out $R/grid -- $ATOM`. The
-   grid definition holds the nodes, powers of two, and a margin of 0.
-3. **Fit** (CPU). `compass fit steps --backend step-grid --grid <POP>...
-   --grid-definition <G.json> $R/cal/c* $RUNS $M $S --out $R/fit-grid` prints the
-   bundle's token. Refit into a fresh store: a second fit of one definition into
-   one store is refused as an overwrite.
-4. **Run** (CPU). `compass run --step-grid <BUNDLE> --host-laws <HOST> --coverage
-   $R/cell/c$C/real* $M $S --out <cell>/step_grid -- $ATOM`, served as in step 5.
-   A cell holds one simulated run, so put it in its own cell directory beside
-   links to `real1` and `real2`. Grading takes only a run whose coverage check ran.
-5. **Grade** that cell as in step 6.
+The step grid prices each step from points measured on a grid of batch shapes
+instead of a linear law; the README's
+[step grid section](README.md#the-same-cell-under-the-step-grid) takes this cell
+through it.

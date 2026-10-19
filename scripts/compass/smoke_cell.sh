@@ -13,8 +13,8 @@
 #   MODEL           the model directory: config.json, tokenizer and weights
 #   OUT             an absent or empty directory, on a disk with room: the raw
 #                   exports keep every prompt
-#   HIP_VISIBLE_DEVICES  the one GPU, as HIP numbers it (required); it must
-#                   read 0% use and 0% VRAM
+#   GPU             the one GPU, as rocm-smi and `--gpu` number it (required);
+#                   it must read 0% use and 0% VRAM
 #   MACHINE         the machine spec of this node's GPUs (required)
 #   TRACES          a cc-traces traces.jsonl (required, as client.sh takes it)
 #   HARNESS_PYTHON  the Python with agentx-harness and compass-harness, for the
@@ -63,8 +63,7 @@ say() { echo "smoke_cell: $1 $(date -u +%FT%TZ)"; }
 
 # The compass commands check each start for processes on the GPU; this checks
 # its use and VRAM too, once, before the first.
-[[ $HIP_VISIBLE_DEVICES =~ ^[0-9]+$ ]] || fail gpu "HIP_VISIBLE_DEVICES names one GPU, not $HIP_VISIBLE_DEVICES"
-GPU=$(compass_gpus smi "$HIP_VISIBLE_DEVICES") || fail gpu "rocm-smi maps no GPU to HIP $HIP_VISIBLE_DEVICES"
+[[ ${GPU-} =~ ^[0-9]+$ ]] || fail gpu "GPU names one GPU as rocm-smi numbers it, not '${GPU-}'"
 busy=$(rocm-smi --showuse --showmemuse | awk -v g="GPU[$GPU]" 'index($0, g) == 1 && /use \(%\)|VRAM%/ && $NF != "0"')
 [[ -z $busy ]] || fail gpu "rocm-smi GPU $GPU is not idle: $busy"
 compass_head_sha "$ROOT" >/dev/null ||
