@@ -563,6 +563,47 @@ def test_inputs_whose_ranks_state_two_engines_are_refused(
         plan(*records)
 
 
+def test_inputs_differing_only_in_kv_block_count_plan_at_the_smallest(
+    tmp_path, monkeypatch
+):
+    """Real starts of one engine state the block count their free memory set;
+    the smaller pool, on the second rank, governs the plan."""
+    records = [
+        record(tmp_path, monkeypatch, *MIXED),
+        record(tmp_path, monkeypatch, *SHORT),
+    ]
+    named, engines = steps(*records)
+    first, second = engines
+    engines[first]["num_kvcache_blocks"] = 30
+    engines[second]["num_kvcache_blocks"] = 12
+    planned = step_grid_plan.plan(DEFINITION, named, engines)
+
+    assert planned["decode"]["pool"]["blocks"] == 12
+    assert planned == plan(*records, engine={"num_kvcache_blocks": 12})
+    assert planned != plan(*records, engine={"num_kvcache_blocks": 30})
+
+
+@pytest.mark.parametrize(
+    "field", [f for f in step_grid_plan.TARGET if f != "num_kvcache_blocks"]
+)
+def test_inputs_differing_in_another_target_field_are_refused(
+    tmp_path, monkeypatch, field
+):
+    named, engines = steps(
+        record(tmp_path, monkeypatch, *MIXED), record(tmp_path, monkeypatch, *SHORT)
+    )
+    first, second = engines
+    value = engines[second][field] + ([16] if field == "ladder" else 1)
+    engines[second] |= {field: value, "num_kvcache_blocks": 12}
+
+    with pytest.raises(
+        ValueError,
+        match=f"^{re.escape(f'{first} and {second}')} state two engines, which "
+        f"differ on {field}$",
+    ):
+        step_grid_plan.plan(DEFINITION, named, engines)
+
+
 def test_a_record_from_a_run_with_a_drafter_is_refused_at_its_first_such_step(
     tmp_path, monkeypatch
 ):
