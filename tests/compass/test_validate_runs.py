@@ -336,6 +336,63 @@ def test_a_simulated_run_grading_does_not_take_is_refused_naming_why(
         grade(real, simulated)
 
 
+HOST = {"host": {"laws": {}}}
+NO_HOST = "its run file has no host laws, so it prices no host time"
+ROOFLINE = "the step roofline was on"
+
+
+@pytest.mark.parametrize(
+    "run, reason",
+    [
+        (HOST | {"step_linear": {}, "step_roofline": True}, ROOFLINE),
+        (HOST | {"step_stub": {}, "step_roofline": True}, ROOFLINE),
+        ({"step_linear": {}}, NO_HOST),
+        ({"step_linear": {}, "step_roofline": True}, f"{NO_HOST}; {ROOFLINE}"),
+        (HOST | {"step_linear": {}, "step_roofline": False}, None),
+        # The step grid prices below it by the roofline, switch or none.
+        (HOST | {"step_grid": {}, "step_roofline": True}, None),
+    ],
+    ids=["law-roofline", "stub-roofline", "no-host", "both", "law", "grid-roofline"],
+)
+def test_a_cctraces_sim_cell_grading_does_not_take_is_refused_naming_why(
+    tmp_path, run, reason
+):
+    *real, simulated = _four(tmp_path)
+    report = grade(real, simulated)
+    (simulated / "run.json").write_text(json.dumps(run))
+
+    if reason is None:
+        assert grade(real, simulated) == report
+        return
+    with pytest.raises(ValueError, match=f"sim is not graded: {reason}$"):
+        grade(real, simulated)
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        {"step_linear": {}},
+        HOST | {"step_linear": {}, "step_roofline": True},
+        {"host": {"skip": ["E"]}},
+    ],
+    ids=["no-host", "law-roofline", "skip"],
+)
+def test_real_cctraces_sim_cells_grade_whatever_run_file_they_were_handed(
+    tmp_path, run
+):
+    """A real cell's server never reads the run file its run.json holds; a
+    simulated cell handed the same one is refused, named."""
+    *real, simulated = _four(tmp_path)
+    report = grade(real, simulated)
+    for cell in real:
+        (cell / "run.json").write_text(json.dumps(run))
+    assert grade(real, simulated) == report
+
+    (simulated / "run.json").write_text(json.dumps(run))
+    with pytest.raises(ValueError, match="/sim (is not graded|skips host segments)"):
+        grade(real, simulated)
+
+
 def test_the_command_states_the_steps_extrapolated_and_priced_by_a_fallback(
     tmp_path, capsys
 ):
@@ -428,7 +485,7 @@ def test_a_cell_cctraces_sim_wrote_with_its_export_grades_its_profiling_steps_al
         for cell in out:
             _recorded(cell, warmup={"kw"})
             # run.json as `cctraces_sim.sh` writes it: a run file, no `format_version`
-            (cell / "run.json").write_text(json.dumps({"client_runs": 1}))
+            (cell / "run.json").write_text(json.dumps({"client_runs": 1} | HOST))
         return out
 
     warmed = cells("warmed", WARMED)
