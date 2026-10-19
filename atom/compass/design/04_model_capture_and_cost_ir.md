@@ -914,14 +914,6 @@ shared expert's side stream and the expert kernels are inside. What the bodies d
 recorded like the rest of the step: the expert kernels as leaves (`fused_moe_`), the side
 stream as a `Par` (D19), a FlyDSL launch lifted to its innermost ATOM function.
 
-DeepSeek-V4's `v4_attention_with_output` is opened the same way (#1678), its body run as
-a real step's, not a dummy run's, so its projections, compressors and sparse attention are
-leaves. Two of its functions are recorded as one leaf at their call, arguments as passed,
-because a lift refuses them: `fused_compress_attn` reassigns a parameter before its
-launches, and the decode kernel's aiter entry dispatches a leaf before a Triton launch.
-The indexer's score and top-k stays one leaf: its FP4 kernels launch through aiter's own
-launcher.
-
 Their exchanges with other ranks are **declared nodes** (D21), as #1401 and the
 [ruling on #531](https://github.com/jgong5/ATOM/issues/531#issuecomment-6244543796) ask,
 since a TBO step lays MORI's dispatch and combine on the comm stream as ops of their own.
@@ -931,6 +923,14 @@ functions, MORI's dispatch and combine as `EpDispatchCombineOp`'s methods. A cap
 one rank, so each exchange's rows are stated, every peer at this rank's shape
 (`capture/peers.py`). A TBO step, two micro-batches interleaved, is refused by name until
 its graphs exist (#1581).
+
+DeepSeek-V4's `v4_attention_with_output` is opened the same way (#1678), its body run as
+a real step's, not a dummy run's, so its projections, compressors and sparse attention are
+leaves. Two of its functions are recorded as one leaf at their call, arguments as passed,
+because a lift refuses them: `fused_compress_attn` reassigns a parameter before its
+launches, and the decode kernel's aiter entry dispatches a leaf before a Triton launch.
+The indexer's score and top-k stays one leaf: its FP4 kernels launch through aiter's own
+launcher.
 
 FlyDSL never needs intercepting below a leaf. A FlyDSL launch outside an opaque leaf,
 the sampler's argmax or one in the MoE wrappers' bodies, lifts to its innermost ATOM
