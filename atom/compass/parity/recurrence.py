@@ -17,7 +17,8 @@ carriers when one is given:
     python -m atom.compass.parity.recurrence RECORD_DIR MACHINE_JSON ROW_BYTES
 
 `ROW_BYTES` is one token's `hidden_states` in bytes, the hidden size times
-the model's dtype size.
+the model's dtype size. The carriers price whole tensors with no all-gather,
+so a record whose `.engine.json` states TP above 1 is refused there.
 
 Per kind (decode, output prefill, middle chunk, and idle: sharing no request
 with the forward before), p10 and p90 of charge over measured exit-to-exit
@@ -239,6 +240,15 @@ def main(record: str, machine=None, row_bytes=None) -> int:
     while more := read(record, len(stages)):
         stages.append(more)
     pp, runs = len(stages), []
+    engines = [json.loads(p.read_text()) for p in Path(record).glob("*.engine.json")]
+    tp = max((e["tensor_parallel_size"] for e in engines), default=1)
+    # ponytail: ATOM_PP_SEND_ALLGATHER=0 is refused too, since the record does
+    # not state it; price shards and gathers as `StageSends.receive` once one is gated.
+    if carriers and pp > 1 and tp > 1:
+        raise ValueError(
+            f"{record} ran at TP {tp}: each stage sends shards its receiver "
+            "all-gathers, and the gate prices whole tensors with no all-gather"
+        )
     for rank, steps in stages[0].items():
         reports = (
             pipeline([d[rank] for d in stages], carriers) if pp > 1 else [check(steps)]
