@@ -34,14 +34,18 @@ from atom.compass.run import _write_whole
 BUILDS = "aiter_jit_builds"
 
 
-def _roots() -> set[Path]:
+def _roots() -> list[Path]:
     try:
         spec = importlib.util.find_spec("aiter")
     except ValueError:  # an `aiter` in sys.modules with no spec, as a stub is
         spec = None
-    package = (spec and spec.submodule_search_locations) or ()
-    env = {os.environ.get(k) for k in ("AITER_JIT_DIR", "AITER_ROOT_DIR")} - {None, ""}
-    return {Path.home() / ".aiter", *map(Path, env), *(Path(p, "jit") for p in package)}
+    package = [Path(p, "jit") for p in (spec and spec.submodule_search_locations) or ()]
+    env = [
+        Path(os.environ[k])
+        for k in ("AITER_JIT_DIR", "AITER_ROOT_DIR")
+        if os.environ.get(k)
+    ]
+    return sorted({Path.home() / ".aiter", *env, *package})
 
 
 def _module(parts: tuple[str, ...]) -> str | None:
