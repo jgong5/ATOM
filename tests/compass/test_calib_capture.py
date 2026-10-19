@@ -5,8 +5,10 @@ never on a GPU that holds a process.
 `cctraces_sim.sh` and `rocm-smi` are stubbed, so these run with no GPU: the stub
 cell runs a process named as aiperf's controller is, which writes a step and
 waits; as aiperf does, SIGINT ends it with status 0 and its export, or, with
-IN_WARMUP set, with status 1 and none; SIGTERM ends it with 143. The cell exits
-with its status, as cctraces_sim.sh exits with aiperf's.
+IN_WARMUP set, with status 1 and none; SIGTERM ends it with 143. With IN_GRACE
+set its duration has passed: it logs so, and ends after 15 s with status 0 and
+its export, or on SIGINT with status 1. The cell exits with its status, as
+cctraces_sim.sh exits with aiperf's.
 """
 
 import json
@@ -25,13 +27,20 @@ FREE = "No KFD PIDs currently running\n"
 BUSY = "PID 1 is using 1 DRM device(s):\n6\n"
 AIPERF = """import os, signal, sys, time
 cell = sys.argv[1]
-def stop(*_):
-    os.environ.get("IN_WARMUP") and sys.exit(1)
+def export():
     os.mkdir(cell + "/artifacts")
     open(cell + "/artifacts/client_run.json", "w").write("{}")
-    sys.exit(0)
+def stop(*_):
+    os.environ.get("IN_WARMUP") and sys.exit(1)
+    export()
+    sys.exit(1 if os.environ.get("IN_GRACE") else 0)
 signal.signal(signal.SIGINT, stop)
 open(cell + "/steps/dp0.jsonl", "w").write("{}")
+if os.environ.get("IN_GRACE"):
+    open(cell + "/aiperf.log", "w").write("Phase profiling (profiling) sending complete")
+    time.sleep(15)
+    export()
+    sys.exit(0)
 time.sleep(60)"""
 CELL = f"""#!/bin/bash
 mkdir -p "$2/steps" && echo '{{"workload": 1}}' > "$2/run.json"
@@ -103,6 +112,16 @@ def test_each_cell_is_stopped_and_logged_in_turn(tmp_path):
         assert log.startswith(f"cafe\nCONCURRENCY={c} GPU=6 ")
         assert "stopped aiperf" in log and "CELL_RC=0" in log
         assert log.count("uptime:") == 2
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_cell_whose_aiperf_duration_has_passed_ends_on_its_own(tmp_path):
+    r, cap = _capture(tmp_path, FREE, "1", IN_GRACE="1")
+    assert r.returncode == 0, r.stderr
+    log = (cap / "c1.log").read_text()
+    assert "aiperf duration ended" in log and "stopped aiperf" not in log, log
+    assert "CELL_RC=0" in log, log
+    assert (cap / "c1" / "artifacts" / "client_run.json").exists()
 
 
 @pytest.mark.skipif(BASH is None, reason="no bash on PATH")
