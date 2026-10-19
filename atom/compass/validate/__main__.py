@@ -14,7 +14,8 @@ uncached prompt tokens graded alike; per such run, its warmup: how many requests
 its export names as such and how many steps hold only those; `validate.cost` on the
 steps graded (with the steps it leaves out, declines with their most frequent
 reasons, or extrapolates) and `memory.check` per real run; and the simulated run's refusals by source, its steps
-extrapolated and priced by a fallback, shares and speed. Any refusal makes a
+extrapolated and priced by a fallback, shares and speed, from its first client run's
+summary when it has one. Any refusal makes a
 `cctraces_sim.sh` cell a coverage report; the shares grade nothing, and neither do the
 counts but preemptions and prefill tokens.
 """
@@ -30,9 +31,11 @@ from atom.compass.backends.cost import GROUPS
 from atom.compass.backends.step_linear_fit import TOKEN_BANDS, token_band
 from atom.compass.memory.check import MemoryRefusal, parts
 from atom.compass.run import (
+    CLIENT_DIR,
     LP_FILE,
     STEP_GRID,
     STEP_LINEAR,
+    SUMMARY_FILE,
     _fitted_here,
     entries,
     refuse_renamed_keys,
@@ -190,7 +193,9 @@ def rows(cell) -> list[tuple]:
         refuse_renamed_keys(f, cell / name / "run.json")
     if len({json.dumps(f.get("workload"), sort_keys=True) for f in run.values()}) != 1:
         raise ValueError(f"{cell}'s runs {sorted(run)} ran different workloads")
-    summary = json.loads((sim / "summary.json").read_text())
+    # A run `run` wrote grades its first client run, so its summary is that run's.
+    first = sim / CLIENT_DIR.format(0) / SUMMARY_FILE
+    summary = json.loads((first if first.is_file() else sim / SUMMARY_FILE).read_text())
     verdict = "coverage report" if summary["coverage_report"] else "graded"
     out = [("cell", "verdict", f"{len(real)} real runs", verdict)]
     out += _runs(real, sim)
