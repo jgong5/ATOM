@@ -583,6 +583,21 @@ def test_inputs_differing_only_in_kv_block_count_plan_at_the_smallest(
     assert planned != plan(*records, engine={"num_kvcache_blocks": 30})
 
 
+def test_a_second_rank_stating_no_kv_block_count_is_refused_by_name(
+    tmp_path, monkeypatch
+):
+    named, engines = steps(
+        record(tmp_path, monkeypatch, *MIXED), record(tmp_path, monkeypatch, *SHORT)
+    )
+    _, second = engines
+    del engines[second]["num_kvcache_blocks"]
+
+    with pytest.raises(
+        ValueError, match=f"^{re.escape(second)} states no num_kvcache_blocks$"
+    ):
+        step_grid_plan.plan(DEFINITION, named, engines)
+
+
 @pytest.mark.parametrize(
     "field", [f for f in step_grid_plan.TARGET if f != "num_kvcache_blocks"]
 )
