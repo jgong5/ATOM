@@ -630,6 +630,48 @@ def test_a_replay_prices_each_timed_replay_per_call_each_under_its_context(
     assert times == [(i + 1) * 1e6 / 4 for i in timed]
 
 
+def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
+    monkeypatch,
+):
+    # The same leaf at two contexts of one width, cold time flat: the profiler
+    # recorded its device-to-device copy at one and missed it at the other.
+    cuda, cpu = torch.autograd.DeviceType.CUDA, torch.autograd.DeviceType.CPU
+
+    def event(name, start, device=cuda):
+        span = SimpleNamespace(start=start)
+        return SimpleNamespace(name=name, device_type=device, time_range=span)
+
+    profiled = {
+        2436: [
+            "Memcpy DtoD (Device -> Device)",
+            "attn",
+            "Memcpy HtoD (Host -> Device)",
+        ],
+        452: ["attn"],
+    }
+
+    @contextlib.contextmanager
+    def profile(activities):
+        names = profiled[context]
+        yield SimpleNamespace(
+            events=lambda: [event("aten::copy_", -1, cpu)]
+            + [event(n, -i) for i, n in enumerate(names)]
+        )
+
+    monkeypatch.setattr("torch.profiler.profile", profile)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    records = []
+    for context in profiled:
+        kernels = ops._kernels(lambda: None, {})
+        records.append(
+            {"shape": "decode B=2", "context": context, "op": "aiter.attn"}
+            | {"leaf": "l", "kernels": kernels, "cold_ns": 31_700.0}
+        )
+
+    assert [r["kernels"] for r in records] == [["attn"], ["attn"]]
+    assert ops._dependent(records) == {"aiter.attn": False}
+
+
 def test_a_batch_takes_the_blocks_and_slots_it_is_placed_at(rule):  # noqa: F811
     line = _line([[1, 40, True], [1, 17, True]])
 
