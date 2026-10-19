@@ -18,8 +18,9 @@ per_byte_s`` from the send, weighted by relative error; eager sizes, or every
 size when none is eager, take that ``per_byte_s`` and fit ``overhead_s`` on the
 sender and ``latency_s`` from its completion to the arrival.
 
-A gloo sender blocked in its wait completes later the longer it was blocked
-before the receive was posted. Rank 1 then runs for each of `BLOCKS` seconds
+A gloo sender blocked in its wait completes later the longer the pair carried
+nothing before the receive was posted; here that is the block, since the
+barrier before it. Rank 1 then runs for each of `BLOCKS` seconds
 before it posts, rank 0 waiting on an 8-byte gloo send, as ATOM's next stage
 runs its own forward while the stage before waits on the send's size. The
 sender's completion past the rendezvous price fits ``wake_s x (1 - exp(-b /
