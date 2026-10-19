@@ -861,7 +861,7 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   at B >= 128, disappears into the leaf.
 
 Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers
-aside, below), so its ambient reads stay
+and DeepSeek-V4's attention aside, below), so its ambient reads stay
 invisible to the trace; the bench does not need them, because the leaf is timed inside
 ATOM's own forward, where ATOM has built the forward context for that point (`07` D39).
 That is also what the two failures below needed by hand.
@@ -907,6 +907,14 @@ runs their Python bodies in place of their fakes, because the step's MoE exchang
 shared expert's side stream and the expert kernels are inside. What the bodies dispatch is
 recorded like the rest of the step: the expert kernels as leaves (`fused_moe_`), the side
 stream as a `Par` (D19), a FlyDSL launch lifted to its innermost ATOM function.
+
+DeepSeek-V4's `v4_attention_with_output` is opened the same way (#1678), its body run as
+a real step's, not a dummy run's, so its projections, compressors and sparse attention are
+leaves. Two of its functions are recorded as one leaf at their call, arguments as passed,
+because a lift refuses them: `fused_compress_attn` reassigns a parameter before its
+launches, and the decode kernel's aiter entry dispatches a leaf before a Triton launch.
+The indexer's score and top-k stays one leaf: its FP4 kernels launch through aiter's own
+launcher.
 
 Their exchanges with other ranks are **declared nodes** (D21), as #1401 and the
 [ruling on #531](https://github.com/jgong5/ATOM/issues/531#issuecomment-6244543796) ask,
