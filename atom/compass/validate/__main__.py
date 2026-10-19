@@ -82,7 +82,7 @@ def _runs(real: list[Path], sim: Path):
 
 
 def _warmup(run: Path, warmup: dict | None):
-    if warmup is not None:  # None: a run `cctraces_sim.sh` wrote, graded whole
+    if warmup is not None:  # None: a run graded whole
         value = f"requests {warmup['requests']}, steps {warmup['steps']}"
         yield f"warmup {run.name}", "warmup", value, "not graded"
 
