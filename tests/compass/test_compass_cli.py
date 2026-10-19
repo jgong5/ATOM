@@ -7,7 +7,9 @@ command's module is planted where one is needed.
 """
 
 import json
+import os
 import re
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -130,3 +132,44 @@ def test_a_machine_spec_that_refuses_exits_fit_with_its_refusal(tmp_path, verb, 
     with pytest.raises(SystemExit) as exited:
         cli.main([*verb.split(), *args, *map(str, [a, *clients(a), *tail])])
     assert exited.value.code == f"compass {verb}: {refusal.value}"
+
+
+LAUNCHER = Path(__file__).parents[2] / "scripts/compass/compass"
+
+
+def test_the_launcher_runs_its_own_tree_from_anywhere_it_is_linked(tmp_path):
+    shadow = tmp_path / "atom"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("raise ImportError('the shadow atom')\n")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin/compass").symlink_to(LAUNCHER)
+    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+
+    done = subprocess.run(
+        [tmp_path / "bin/compass", "--help"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.startswith("usage: compass <command>")
+
+
+def test_the_launcher_refuses_inside_another_tree(tmp_path):
+    other = tmp_path / "other"
+    (other / "scripts/compass").mkdir(parents=True)
+    (other / "scripts/compass/_lib.sh").write_text("")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin/compass").symlink_to(LAUNCHER)
+
+    done = subprocess.run(
+        [tmp_path / "bin/compass", "--help"],
+        cwd=other / "scripts",
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert done.returncode == 99, done.stderr
+    assert done.stdout == ""

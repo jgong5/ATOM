@@ -21,15 +21,37 @@ module's own per-rank parameter shapes and attributes:
 - `Attention` (not MLA), `LinearAttention`: attention over the step's rows,
   at their own heads and dims; neither is gone into.
 - `SiluAndMul`: the input width of the one row-parallel linear beside it.
-- a torch or transformers activation module, and the vision tower: nothing.
-  ATOM's text stacks call no bare activation module (GDN holds one it never
-  calls), and the backend refuses a step with images.
+- a torch or transformers activation module, the vision tower, and V4's
+  rotary tables: nothing. ATOM's text stacks call no bare activation module
+  (GDN holds one it never calls), the backend refuses a step with images, and
+  V4 reads its tables inside the attention and compressor kernels.
+
+DeepSeek-V4's modules, each priced and then gone into:
+
+- `Block`: two hyper-connection mixes, one per sub-layer, each folding the
+  previous sub-layer's output into the widened residual and reducing it to the
+  next input; the block's two norms run inside them.
+- `DeepseekV4Attention`: sparse attention over the sliding window and the
+  compressed KV, with the indexer's scoring where the layer has one. Its
+  linears and the compressors' are priced as linears.
+- `Expert` (the shared expert): its activation, between its two linears.
+- `FusedMoE`, not gone into: the routed experts, at its quant method's
+  activation format, and the exchange around them: the data-parallel group's
+  gather and reduce-scatter, MoRI's dispatch and combine under expert
+  parallelism, at the formats MoRI sends, or the tensor-parallel all-reduce
+  on one data-parallel rank. An expert-parallel MoE over a data-parallel
+  group whose exchange is not MoRI's (`--all2all-backend rccl` or `none`,
+  `ATOM_DISABLE_MORI_EP`), and the Mega kernel, are unclassified.
 
 A module of any other class is gone into when it has children. One without,
 or a listed one in a format or layout not priced here, is unclassified: the
 first of each class comes back as an `unclassified` module named by class
-and path, which the backend refuses.
+and path, which the backend refuses. Each module carries the index of the
+decoder layer it sits in, read off its path.
 """
+
+import dataclasses
+import re
 
 import torch
 
@@ -40,12 +62,21 @@ FORMATS = {
     torch.bfloat16: "bf16",
     torch.float8_e4m3fn: "fp8",
     torch.float8_e4m3fnuz: "fp8",
+    torch.float4_e2m1fn_x2: "fp4",
     "bf16": "bf16",
     "fp8": "fp8",
+}
+#: What MoRI's combine sends back, by `ATOM_MORI_COMBINE_QUANT`.
+MORI_COMBINE = {
+    "none": "bf16",
+    "fp8_direct_cast": "fp8",
+    "fp8_blockwise": "fp8",
+    "fp4_blockwise": "fp4",
 }
 #: A module that prices nothing; one to go into.
 NOTHING, DESCEND = object(), object()
 OPS = "atom.model_ops."
+V4 = "atom.models.deepseek_v4."
 ROW = OPS + "linear.RowParallelLinear"
 NORMS = tuple(
     OPS + "layernorm." + n for n in ("RMSNorm", "GemmaRMSNorm", "RMSNormGated")
@@ -54,6 +85,11 @@ NORMS = tuple(
 #: never call, and the vision tower.
 SILENT = ("torch.nn.modules.activation", "transformers.activations")
 VISION = "atom.models.qwen3_5_vl.Qwen3VisionTransformer"
+#: V4's rotary tables, read inside the attention and compressor kernels.
+V4_ROPE = V4 + "_V4RoPE"
+#: Linear quant types whose activations stay bf16 into the matrix product.
+UNQUANTIZED_INPUT = ("No", "per_1x32")
+LAYER = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
 def walk(tree: torch.nn.Module) -> list[Module]:
@@ -63,16 +99,19 @@ def walk(tree: torch.nn.Module) -> list[Module]:
 
     def visit(module, name, parent):
         m = _classify(module, name, parent)
-        if m is DESCEND:
+        *priced, then = m if isinstance(m, tuple) else (m,)
+        if isinstance(then, Module):
+            priced, then = [then], NOTHING
+        layer = LAYER.search(name)
+        layer = int(layer.group(1)) if layer else -1
+        found.extend(dataclasses.replace(p, layer=layer) for p in priced)
+        if then is DESCEND:
             for child, sub in module.named_children():
                 visit(sub, f"{name}.{child}" if name else child, module)
-        elif m is None:
-            if type(module) not in seen:
-                seen.add(type(module))
-                where = f"{type(module).__name__} at {name or 'the root'}"
-                found.append(Module(where, UNCLASSIFIED))
-        elif m is not NOTHING:
-            found.append(m)
+        elif then is None and type(module) not in seen:
+            seen.add(type(module))
+            where = f"{type(module).__name__} at {name or 'the root'}"
+            found.append(Module(where, UNCLASSIFIED))
 
     visit(tree, "", None)
     return found
@@ -89,6 +128,21 @@ def _classify(module, name, parent):
     """`module`'s `Module`, `NOTHING`, `DESCEND`, or None if unclassified."""
     weight = getattr(module, "weight", None)
     fmt = FORMATS.get(getattr(weight, "dtype", None))
+    if _is(module, V4 + "Block"):
+        mix = Module(name, "mhc", (module.hc_mult, module.attn_norm.weight.shape[0]))
+        return mix, mix, DESCEND
+    if _is(module, V4 + "DeepseekV4Attention"):
+        ix = module.indexer
+        dims = (module.n_local_heads, module.head_dim, module.window_size)
+        dims += (module.compress_ratio,)
+        dims += (ix.index_topk, ix.n_heads, ix.head_dim) if ix else (0, 0, 0)
+        # ponytail: the KV is read at fp8, its narrowest format; the window
+        # rows held in bf16 are left out of this lower bound.
+        return Module(name, "sparse_attention", dims, "fp8"), DESCEND
+    if _is(module, V4 + "Expert"):
+        return Module(name, "act", (module.w2.weight.shape[1],)), DESCEND
+    if _is(module, OPS + "moe.FusedMoE"):
+        return _moe(module, name, parent)
     if _is(module, OPS + "embed_head.ParallelLMHead"):
         return fmt and Module(name, "lm_head", tuple(weight.shape), fmt, module.tp_size)
     if _is(module, OPS + "embed_head.VocabParallelEmbedding"):
@@ -100,8 +154,12 @@ def _classify(module, name, parent):
             return Module(name, "conv", (weight.shape[0],), fmt)
         reduces = _is(module, ROW) and module.reduce_results
         ranks = module.tp_size if reduces else 1
-        return Module(name, "gemm", tuple(weight.shape), fmt, ranks)
+        quant = getattr(getattr(module, "quant_type", None), "name", "No")
+        act = "bf16" if quant in UNQUANTIZED_INPUT else fmt
+        return Module(name, "gemm", tuple(weight.shape), fmt, ranks, act=act)
     if _is(module, *NORMS):
+        if parent is not None and _is(parent, V4 + "Block"):
+            return NOTHING
         fused = getattr(module, "fused_allreduce", False) and module.tp_size > 1
         ranks = module.tp_size if fused else 1
         return Module(name, "norm", (weight.shape[0],), ranks=ranks, fused=fused)
@@ -121,6 +179,45 @@ def _classify(module, name, parent):
         return (
             len(down) == 1 and Module(name, "act", (down[0].weight.shape[1],)) or None
         )
-    if _is(module, VISION) or type(module).__module__.startswith(SILENT):
+    if _is(module, VISION, V4_ROPE) or type(module).__module__.startswith(SILENT):
         return NOTHING
     return DESCEND if next(module.children(), None) is not None else None
+
+
+def _moe(module, name, parent):
+    """The routed experts and their exchange, or None if unclassified.
+
+    `dims` are (experts, local experts, top k, intermediate per rank, hidden,
+    group ranks, data-parallel ranks, MoRI's split send and receive). The
+    data-parallel width is the MoE group's over the attention's TP group,
+    which the parent MoE block holds. Under expert parallelism over that
+    group, `wire` is what MoRI's dispatch sends, as ATOM resolves it, and
+    what its combine sends back.
+    """
+    method, w13 = module.quant_method, module.w13_weight
+    act = getattr(getattr(method, "act_quant", None), "value", None)
+    if getattr(method, "fp8_activations", False):
+        act = "fp8"
+    fmt, attention_tp = FORMATS.get(w13.dtype), getattr(parent, "tp_size", None)
+    mega = _is(method, OPS + "moe.MegaMxfp4MoEMethod")
+    if mega or not (act and fmt and attention_tp):
+        return None
+    config = module.moe_parallel_config
+    ranks = config.ep_size if config.use_ep else config.tp_size
+    split = int(config.use_ep and config.low_latency)
+    dims = (module.global_num_experts, w13.shape[0], module.top_k)
+    dims += (w13.shape[1] // 2, module.hidden_size, ranks, ranks // attention_tp, split)
+    fused = module._comm_fused_moe is not None
+    if not (config.use_ep and dims[6] > 1):
+        return Module(name, "moe", dims, fmt, ranks, fused, act=act)
+    from atom.model_ops.fused_moe.mori_prepare_finalize import resolve_mori_dispatch
+    from atom.utils import envs
+
+    mori = config.requested_all2all_backend in ("auto", "mori") and not (
+        envs.ATOM_DISABLE_MORI_EP or envs.ATOM_MORI_V2
+    )
+    sent = resolve_mori_dispatch(module.moe_config.in_dtype, module.hidden_size)
+    wire = (FORMATS.get(sent.dtype), MORI_COMBINE.get(envs.ATOM_MORI_COMBINE_QUANT))
+    if not (mori and all(wire)):
+        return None
+    return Module(name, "moe", dims, fmt, ranks, fused, act=act, wire=wire)
