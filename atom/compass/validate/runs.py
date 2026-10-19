@@ -25,9 +25,10 @@ then be cold; when no step before its own first holds a request the export
 names as the warmup's, since its graded steps may then precede it; when any
 step from its own first on, its own or not, holds such a request, since its
 warmup has then not ended when it starts; when its export lacks traces or
-arguments; and when its run.json names `aiter_jit_built`, the aiter JIT
-modules its server built while it served, since a step may have waited on a
-build (`compass record` and a real `cctraces_sim.sh` cell write it). A
+arguments; and when its run.json names `aiter_jit_builds`, the aiter JIT
+modules its server built or began while it served, since a step may have
+waited on a build (`compass record` and a real `cctraces_sim.sh` cell write
+it). A
 simulated run, whose
 run.json holds `run_file`, is also refused when it skips host segments, or its
 run file has no host laws and so prices no host time; when the step roofline
@@ -83,7 +84,7 @@ from pathlib import Path
 
 from scipy.stats import ks_2samp
 
-from atom.compass.drive.aiter_jit import BUILT
+from atom.compass.drive.aiter_jit import BUILDS
 from atom.compass.parity.served import served
 from atom.compass.run import CLIENT_DIR, STEP_GRID, SUMMARY_FILE, entries
 
@@ -223,10 +224,10 @@ def _client_run(cell, run) -> tuple[list[dict], list[str], dict]:
         why.append("its export names no traces its client was given")
     if "arguments" not in export:
         why.append("its export names no arguments its client was given")
-    if built := run.get(BUILT):
+    if builds := run.get(BUILDS):
         why.append(
-            f"aiter built {built} while its server served, "
-            "so a step may have waited on a build"
+            f"aiter ran a JIT build of {builds} while its server served, "
+            "so a step may have waited on it"
         )
     if "run_file" in run:
         why += _not_graded(run, traces)

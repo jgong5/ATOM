@@ -22,10 +22,10 @@ Triton loads an autotuned kernel's choice for a shape an earlier server of the
 same ``TRITON_CACHE_DIR`` tuned; a shape the cache lacks still tunes on its
 first launch, inside the record.
 
-run.json's ``aiter_jit_built`` names each aiter JIT module written since serve
-wrote ``server.json``, when ``/health`` first answered (`aiter_jit`): a step
-may have waited on its build, so grading refuses the run. A server that built
-none leaves no entry.
+run.json's ``aiter_jit_builds`` names each aiter JIT module built, or begun,
+since serve wrote ``server.json``, when ``/health`` first answered
+(`aiter_jit`): a step may have waited on its build, so grading refuses the
+run. A server that built none leaves no entry.
 
 `--profile-ops` and `--profile-steps A:B`, the op-level half's profiled pass,
 refuse; so does ATOM's ``--load_dummy``: a record times real weights, and MoE
@@ -71,8 +71,8 @@ def main(argv: list[str]) -> None:
     # serve writes server.json when /health first answers, so its mtime is
     # when serving began; a server that never answered served nothing.
     ready = Path(args.out) / serve.READY_FILE
-    built = aiter_jit.built_since(ready.stat().st_mtime_ns) if ready.exists() else {}
-    run = {**json.loads(run_json.read_text()), "env": env, **built}
+    builds = aiter_jit.builds_since(ready.stat().st_mtime_ns) if ready.exists() else {}
+    run = {**json.loads(run_json.read_text()), "env": env, **builds}
     _write_whole(run_json, json.dumps(run))
     write_engine_and_costs(args.out)
 

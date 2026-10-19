@@ -301,13 +301,17 @@ for path in os.environ["PLANTED_BUILT"].split(os.pathsep):
 def test_a_record_names_each_aiter_module_its_server_built_while_it_served(
     tmp_path, planted_gpu, monkeypatch
 ):
-    """Not a module the image held, nor one its start built: of the
-    installed aiter's JIT directory and of ``AITER_ROOT_DIR``'s."""
+    """Of the installed aiter's JIT directory and of ``AITER_ROOT_DIR``'s, a
+    build cut short included; not a module the image held, nor one its start
+    built."""
     jit = _aiter(tmp_path, monkeypatch)
     root = tmp_path / "aiter_root"
     monkeypatch.setenv("AITER_ROOT_DIR", str(root))
-    (jit / "prebuilt.so").write_bytes(b"")
-    built = [jit / "mha_varlen_fwd_x.so", root / "build" / "pa_x" / "lib.so"]
+    built = [
+        *(jit / "build" / "mha_x" / "build" / "mha_x.so", jit / "mha_x.so"),
+        *(jit / "build" / "mha_y" / "blob.staging" / "kernel.cpp",),
+        *(root / "build" / "pa_x" / "lib.so",),
+    ]
     monkeypatch.setenv("PLANTED_START", str(root / "build" / "pa_ps_x" / "lib.so"))
     monkeypatch.setenv("PLANTED_BUILT", os.pathsep.join(map(str, built)))
     server = tmp_path / "server.py"
@@ -316,4 +320,4 @@ def test_a_record_names_each_aiter_module_its_server_built_while_it_served(
     cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
 
     run = json.loads((out / "run.json").read_text())
-    assert run[aiter_jit.BUILT] == sorted(map(str, built))
+    assert run[aiter_jit.BUILDS] == ["mha_x", "mha_y", "pa_x"]
