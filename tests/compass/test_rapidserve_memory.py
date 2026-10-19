@@ -10,8 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
 import test_measure_memory
+import torch
 from test_measure_memory import MACHINE, a_start, started
 from test_memory_readings import READINGS, STACK, publish_readings
 from test_rapidserve_runner_config import _config
@@ -183,7 +183,7 @@ def test_a_decode_start_that_missed_a_graph_starts_again(tmp_path):
 
 
 def test_a_rapidserve_run_is_identified_by_prefills_engine_file(tmp_path, monkeypatch):
-    r, argv = a_start(tmp_path, monkeypatch, STACK)
+    _, argv = a_start(tmp_path, monkeypatch, STACK)
     wrote = test_measure_memory.ranks_wrote
 
     def and_decode(out, config, readings):
