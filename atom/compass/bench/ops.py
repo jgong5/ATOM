@@ -29,8 +29,8 @@ refuses by name, a KV tensor argument among them.
 Cold, by copies. A call's bytes are its tensor arguments' spans, the tensors
 of each module it names and, for a leaf that names a context key, the KV and
 per-request state its layer holds for the batch. One graph runs the leaf K =
-`CALLS` times, cycling over its copies: N built ones, N the least M whose bytes
-pass `COLD` times the last-level cache and, for a context key, at least its I
+`CALLS` times, cycling over its copies: N built ones: M, the least count whose
+bytes pass `COLD` times the last-level cache, raised for a context key to its I
 instances (at most K), then, up to the most weights the model holds of a
 weight argument's spec (at most K), copy c mod N with the c-th weights on
 that copy's other arguments. Copy c < N takes fresh activations below M and
@@ -102,7 +102,8 @@ from atom.compass.capture.forward import _weights
 from atom.compass.drive.gpu import add_gpu_flag
 
 PROG = "compass measure ops"
-#: The timing protocol's version; it changes whenever a count below does.
+#: The timing protocol's version; it changes whenever a count below or the
+#: copies a graph reads change.
 PROTOCOL = 5
 WARMUPS = 3
 REPEATS = 20
@@ -483,9 +484,9 @@ class Stub:
 
         def build(path, value, old):
             if isinstance(value, list):
-                old = old or [None] * len(value)
-                pairs = enumerate(zip(value, old))
-                return [build(f"{path}.{i}", v, o) for i, (v, o) in pairs]
+                return [
+                    build(f"{path}.{i}", v, old and old[i]) for i, v in enumerate(value)
+                ]
             if isinstance(value, dict) and value.get("role") == "activation" and like:
                 return old
             if _ref(value) and "module" in value:

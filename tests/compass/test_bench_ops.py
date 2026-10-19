@@ -466,8 +466,8 @@ def test_every_cold_and_warm_graph_holds_calls_calls_at_any_copies(copies):
 def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(
     monkeypatch,
 ):
-    # One call's 1056 bytes pass twice a 50-byte cache: four layers take four
-    # copies, and only the first allocates its activation.
+    # One call's 1056 bytes pass twice a 600-byte cache in two copies: four
+    # layers take four copies, and only the first two allocate activations.
     layers = {f"model.layers.{i}.attn": SimpleNamespace(layer_num=i) for i in range(4)}
     kv = {
         f"layer_{i}": SimpleNamespace(k_cache=torch.zeros(64, 16, 4)) for i in range(4)
@@ -488,7 +488,7 @@ def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(
         return [1.0] * ops.REPEATS
 
     with (
-        patch.object(runner.model, "forward", ops.Stub(runner, 50)) as stub,
+        patch.object(runner.model, "forward", ops.Stub(runner, 600)) as stub,
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
         patch.object(ops, "_kernels", return_value=["k"]),
         patch.object(ops, "_replay", side_effect=replay),
@@ -496,7 +496,9 @@ def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(
         [record] = stub.point(placed, decode(2), 20, found)
 
     assert [kw["layer"] for kw, _ in graphs[0][:4]] == list(layers)
-    assert all(kw["q"] is graphs[0][0][0]["q"] for kw, _ in graphs[0])
+    qs = [kw["q"] for kw, _ in graphs[0]]
+    assert qs[0] is not qs[1]
+    assert all(q is qs[c % 2] for c, q in enumerate(qs))
     assert record["copies"] == 4
 
 
