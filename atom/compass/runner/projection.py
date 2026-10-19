@@ -224,7 +224,8 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     gather's rows come from `mode`, the step's one `forward_mode`; a
     data-parallel runner handed a mode with no group counts is refused.
     Whether the step produces output is `ScheduledBatch.produces_output`, and
-    the TBO split is the collective's `ub_tokens_across_dp`.
+    the TBO split is the collective's `ub_tokens_across_dp`, this rank's slot
+    in it the config's `data_parallel_rank`.
 
     The MoE gather's rows follow `running_tokens_are_unified`, as
     `FusedMoE.forward_impl_graph` does. Every rank decoding, the padded
@@ -235,8 +236,9 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     always the variable-length one (`EagleProposer.propose`); a block drafter
     pads its passes to the group and is left out.
     """
-    draft_moe_rows = moe_tokens = None
+    draft_moe_rows = moe_tokens = dp_rank = None
     if mode.sync is not None:
+        dp_rank = runner.config.parallel_config.data_parallel_rank
         gathered = moe_tokens = int(mode.sync.num_tokens_across_dp.sum())
         if mode.running_tokens_are_unified:
             moe_rows = _data_parallel_size(runner) * mode.running_tokens
@@ -266,6 +268,7 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
         tbo_tokens=None if mode.sync is None else mode.sync.ub_tokens_across_dp,
         image_tokens=image_tokens(batch, runner),
         moe_tokens=moe_tokens,
+        dp_rank=dp_rank,
     )
 
 

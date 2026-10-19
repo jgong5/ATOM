@@ -173,6 +173,7 @@ class TestPerRequestSums:
             "tbo_tokens",
             "image_tokens",
             "moe_tokens",
+            "dp_rank",
         ]
         assert [f.name for f in fields(RequestShape)] == [
             "query_tokens",
