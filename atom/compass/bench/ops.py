@@ -62,8 +62,8 @@ family that launched different kernels, until they are adjacent. DIR gets each
 round's ops.jsonl in `round<n>`, and every point held in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
-covers (`coverage`), and prints the count by phase and why each leaf kind
-left the rest out.
+covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
+and prints the count by phase and why each leaf kind left the rest out.
 """
 
 import argparse
@@ -227,13 +227,15 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
-def graph(store, config, shape) -> dict:
-    """The `op_graph` `trace ops` published for `config` at `shape` on this GPU's
-    arch, as JSON."""
+def graph(store, config, shape, arch=None) -> dict:
+    """The `op_graph` `trace ops` published for `config` at `shape` on `arch`,
+    this GPU's when it is None, as JSON."""
     from atom.compass.capture.forward import structure
 
     key = Key.of(
-        Kind.OP_GRAPH, structure=structure(config, shape.phase), shape=str(shape)
+        Kind.OP_GRAPH,
+        structure=structure(config, shape.phase, device=arch),
+        shape=str(shape),
     )
     return json.loads(store.read(key).read_member("graph", RANK, "json"))
 
@@ -867,13 +869,16 @@ def _coverage_main(argv: list[str], atom_args: list[str]) -> dict:
     p.add_argument("--store", required=True, help="the artifact store's root")
     p.add_argument("--out", required=True, help="the --plan run's --out")
     args = p.parse_args(argv)
-    lines = (Path(args.out) / "plan.jsonl").read_text().splitlines()
+    out = Path(args.out)
+    lines = (out / "plan.jsonl").read_text().splitlines()
     records = [json.loads(line) for line in lines]
     store = ArtifactStore(args.store)
-    return coverage(store, args.store, atom_config(atom_args), args.coverage, records)
+    arch = json.loads((out / "run.json").read_text())["device"][0]["arch"]
+    config = atom_config(atom_args)
+    return coverage(store, args.store, config, args.coverage, records, arch)
 
 
-def coverage(store, root, config, names, records) -> dict:
+def coverage(store, root, config, names, records, arch=None) -> dict:
     """How the measured points among `records` cover the steps of the record
     directories `names`: the steps and those covered by phase, and per leaf
     kind the steps it left out by why. A step is covered when each leaf of its
@@ -881,7 +886,8 @@ def coverage(store, root, config, names, records) -> dict:
     decode leaf of a kind that depends on context over its rows' lowest to
     highest context (`_rows`), any other decode leaf at its width, and a
     prefill leaf at its tokens, unless its kind depends on context and a row
-    was cached: the plan's prefill rows are fresh."""
+    was cached: the plan's prefill rows are fresh. The graphs are `arch`'s,
+    this GPU's when it is None."""
     from atom.compass.capture import population_steps
 
     steps = list(population_steps(names))
@@ -891,7 +897,7 @@ def coverage(store, root, config, names, records) -> dict:
         for fam, points in _families(records, dependent).items()
     }
     graphs, report, out = {}, defaultdict(Counter), defaultdict(Counter)
-    _load(store, config, root, {s for s, _ in steps}, graphs)
+    _load(store, config, root, {s for s, _ in steps}, graphs, arch)
     families = {
         s: [
             (op["op"], *_family(s, None, op["op"], sig, dependent))
@@ -1041,7 +1047,7 @@ def _densify(families, tried: set) -> dict:
     return want
 
 
-def _load(store, config, root, shapes, graphs: dict) -> None:
+def _load(store, config, root, shapes, graphs: dict, arch=None) -> None:
     """Each of `shapes`' leaves into `graphs`, its op_graph captured first when
     the store has none."""
     from atom.compass.artifacts import ArtifactRefusal
@@ -1049,23 +1055,23 @@ def _load(store, config, root, shapes, graphs: dict) -> None:
     missing = []
     for shape in sorted(shapes - graphs.keys()):
         try:
-            graphs[shape] = leaves(graph(store, config, shape)["region"])
+            graphs[shape] = leaves(graph(store, config, shape, arch)["region"])
         except ArtifactRefusal:
             missing.append(shape)
     if missing:
-        _capture(config, missing, root)
+        _capture(config, missing, root, arch)
     for shape in missing:
-        graphs[shape] = leaves(graph(store, config, shape)["region"])
+        graphs[shape] = leaves(graph(store, config, shape, arch)["region"])
 
 
-def _capture(config, shapes, root) -> None:
+def _capture(config, shapes, root, arch=None) -> None:
     """`trace ops` of `shapes` into the store at `root`, in a process of its
     own that sees no GPU."""
     from atom.compass import capture
     from atom.compass.capture.forward import device_arch
 
     argv = ["--model", config.model, "--tp", str(config.tensor_parallel_size)]
-    argv += ["--arch", device_arch()]
+    argv += ["--arch", arch or device_arch()]
     for s in shapes:
         argv += ["--prefill", str(s.tokens)] if s.phase == "prefill" else ["--width"]
         argv.append(str(s.seqs))

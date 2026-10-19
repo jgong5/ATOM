@@ -12,11 +12,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_artifact_store import CONDITIONS, GATES, stanza
 from test_bench_ops import KEY, TREE, _graph, _leaf, _t
 
 from atom.compass import ir
-from atom.compass.artifacts import ArtifactStore
+from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.bench import ops
+from atom.compass.capture.forward import decode, structure
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
 
@@ -28,7 +30,7 @@ CONFIG = SimpleNamespace(
 )
 
 
-def _graph_at(store, config, shape):
+def _graph_at(store, config, shape, arch=None):
     rows = shape.tokens if shape.phase == "prefill" else shape.seqs
     attn = _leaf(
         "aiter.attn",
@@ -287,3 +289,72 @@ def test_an_integer_activation_indexes_a_dimension_of_one():
     index = ops._random(spec, "cpu")
 
     assert torch.zeros(1, 3)[index].shape == (64, 3)
+
+
+def _publish_graph(store, config, arch, shape):
+    """A graph of `shape` keyed on `arch`, its one leaf named for the arch."""
+    key = Key.of(
+        Kind.OP_GRAPH,
+        structure=structure(config, shape.phase, device=arch),
+        shape=str(shape),
+    )
+    leaf = _leaf(f"aiter.{arch}", ("x", _t([shape.seqs, 8], "activation")))
+    store.publish(
+        key,
+        provenance=stanza("compass trace ops"),
+        topology=Topology(),
+        conditions=CONDITIONS,
+        gates=GATES,
+        members={
+            member_name("graph", ops.RANK, "json"): json.dumps(
+                _graph(leaf, layers=1)
+            ).encode()
+        },
+    )
+
+
+@pytest.mark.parametrize("held", [("gfx942", "gfx950"), ("gfx942",)])
+def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
+    tmp_path, monkeypatch, held
+):
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_text("{}")
+    config = SimpleNamespace(
+        model=str(tmp_path / "model"),
+        hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+    )
+    store = ArtifactStore(str(tmp_path / "store"))
+    for arch in held:
+        _publish_graph(store, config, arch, decode(1))
+
+    def no_gpu(*args, **kwargs):
+        raise RuntimeError("No HIP GPUs are available")
+
+    traced = []
+
+    def trace(fn, argv):
+        """`trace ops` as the capture publishes: on the arch `--arch` names."""
+        traced.append(argv[argv.index("--arch") + 1])
+        _publish_graph(store, config, traced[-1], decode(1))
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", no_gpu)
+    monkeypatch.setattr("atom.compass.bench.measure.atom_config", lambda a: config)
+    monkeypatch.setattr(ops, "_child", trace)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "plan.jsonl").write_text("")
+    device = {"index": 0, "name": "AMD Instinct MI355X", "arch": "gfx950"}
+    (out / "run.json").write_text(json.dumps({"device": [device]}))
+    graded = _records(tmp_path / "graded", ([[1, 100, True]], 1))
+
+    argv = ["--coverage", graded, "--store", str(store.root), "--out", str(out)]
+    report = ops._coverage_main(argv, [])
+
+    assert report["left out, by leaf kind"] == {
+        "aiter.gfx950": {"no measured point": 1}
+    }
+    assert traced == ([] if "gfx950" in held else ["gfx950"])
