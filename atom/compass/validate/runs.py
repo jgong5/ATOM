@@ -26,19 +26,17 @@ names as the warmup's, since its graded steps may then precede it; when any
 step from its own first on, its own or not, holds such a request, since its
 warmup has then not ended when it starts; when its export lacks traces or
 arguments; and when its run.json names `aiter_jit_builds`, the aiter JIT
-modules its server built or began while it served, since a step may have
-waited on a build (`compass record` and a real `cctraces_sim.sh` cell write
-it). A
-simulated run, whose
-run.json holds `run_file`, is also refused when it skips host segments, or its
-run file has no host laws and so prices no host time; when the step roofline
-was on in a run of another backend than the step grid, which always prices
-below it; when its first client run refused anything, or has no summary to
-say; when it ran the step grid without a coverage check; when its
-backend's fit inputs were profiled or served a trace it served; and when its
-engines read an assumed `memory_readings` member, naming each assumption its
-`provenance` lists, since its KV blocks rest on readings no start took. The step
-grid's plan, an input of `source` `plan`, is not one: it placed the points
+modules its server built or began while it served, since a step may have waited
+on a build (`compass record` and a real `cctraces_sim.sh` cell write it). A
+simulated run, whose run.json holds `run_file`, is also refused when it skips
+host segments, or its run file has no host laws and so prices no host time;
+when the step roofline was on in a run of another backend than the step grid,
+which always prices below it; when its first client run refused anything, or
+has no summary to say; when it ran the step grid without a coverage check; when
+its backend's fit inputs were profiled or served a trace it served; and when
+its engines read an assumed `memory_readings` member, naming each assumption
+its `provenance` lists, since its KV blocks rest on readings no start took. The
+step grid's plan, an input of `source` `plan`, is not one: it placed the points
 from shapes alone, so it may have read any trace, a graded one included.
 Beside the table, the command states how many of that client run's steps its
 backend extrapolated and a fallback below it priced.

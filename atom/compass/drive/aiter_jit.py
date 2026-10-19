@@ -13,8 +13,8 @@ build. The roots are found from the installed aiter, which is not imported. A
 module counts, named by its directory, when a path inside that directory was
 written at or after serving began, so a build the server's stop cut short
 counts too, and the modules a start builds, before ``/health`` answers, do
-not. One another server of the same aiter tree built meanwhile counts as well,
-since this server may have waited on it.
+not. A module another server of the same aiter tree built meanwhile counts as
+well, since this server may have waited on it.
 
     python -m atom.compass.drive.aiter_jit RUN_JSON SINCE_NS
 
