@@ -58,7 +58,9 @@
 # table or summary; it saves rocm-smi's process listing before and after it in
 # gpu_before.txt and gpu_after.txt, and its result names the processes on its
 # GPUs (HIP_VISIBLE_DEVICES, default 0, as rocm-smi indexes them), with their
-# VRAM bytes.
+# VRAM bytes; its run.json names in `aiter_jit_built` each aiter JIT module
+# built while its server served, which grading refuses
+# (atom/compass/drive/aiter_jit.py).
 # It keeps Triton's autotune results in TRITON_CACHE_DIR (Triton's default
 # ~/.triton/cache), so a kernel tuned by one real run of that directory loads
 # its choice in the next instead of tuning inside it.
@@ -207,6 +209,7 @@ until grep -q "${ready[@]}"; do
     ((SECONDS < deadline)) || { echo "cctraces_sim: no deployment after $WAIT_S s" >&2; exit 1; }
     sleep 1
 done
+serving_ns=$(date +%s%N)
 
 rc=0
 aiperf=(-m aiperf)
@@ -239,6 +242,7 @@ while kill -0 $server 2>/dev/null && ((SECONDS < deadline)); do sleep 1; done
 kill -0 $server 2>/dev/null && { echo "cctraces_sim: the deployment is still up $WAIT_S s after aiperf" >&2; exit 1; }
 wait $server || rc=$((rc || REAL ? rc : $?))
 ((REAL)) && { kill -KILL -- -$server 2>/dev/null || true; gpu_processes after; }
+((REAL)) && { python3 -m atom.compass.drive.aiter_jit "$OUT/run.json" "$serving_ns" || rc=$((rc ? rc : 1)); }
 # The raw records keep each response's chunks, so the export names each request
 # by its response id. A run that failed before aiperf wrote any has none.
 if [[ -e $OUT/artifacts/profile_export_raw.jsonl ]]; then

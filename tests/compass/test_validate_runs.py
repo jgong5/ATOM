@@ -13,15 +13,17 @@ wrote (`test_client_run_summary._serve`).
 
 import collections
 import json
+import os
 import re
+import sys
 
 import pytest
 from test_client_run_summary import CLIENT_RUNS, _serve
 from test_stop_between_client_runs import CLIENT_RUN as UNREFUSED
 
 from atom.compass import run as compass_run
+from atom.compass.drive import aiter_jit, serve
 from atom.compass.drive import run as drive_run
-from atom.compass.drive import serve
 from atom.compass.validate.runs import CLIENT_RUN, _requests, grade, main
 
 EXPORT = {
@@ -692,4 +694,55 @@ def test_a_run_whose_engine_read_an_assumed_memory_reading_is_refused_naming_it(
 
     named = re.escape(f"its engines read assumed memory_readings members: {[assumed]}")
     with pytest.raises(ValueError, match=f"sim is not graded: {named}$"):
+        grade(real, simulated)
+
+
+def _aiter(tmp_path, monkeypatch):
+    """An installed aiter of its own, its JIT directory `jit` returned, and a
+    home of its own, with no JIT directory named by the environment."""
+    site = tmp_path / "site"
+    (site / "aiter" / "jit").mkdir(parents=True)
+    (site / "aiter" / "__init__.py").write_text("")
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.delitem(sys.modules, "aiter", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for name in ("AITER_JIT_DIR", "AITER_ROOT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    return site / "aiter" / "jit"
+
+
+def test_a_record_whose_server_built_an_aiter_module_is_refused_naming_it(tmp_path):
+    *real, simulated = (_recorded(c) for c in _four(tmp_path))
+    built = ["/app/aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_nmask.so"]
+    _recorded(real[1], **{aiter_jit.BUILT: built})
+
+    named = re.escape(f"aiter built {built} while its server served")
+    with pytest.raises(ValueError, match=f"r1 is not graded: {named}, so a step"):
+        grade(real, simulated)
+
+
+def test_a_real_cctraces_sim_cell_whose_server_built_an_aiter_module_is_refused(
+    tmp_path, monkeypatch
+):
+    """Its run.json as `cctraces_sim.sh` writes it, then given the entry as
+    that script gives it, from the time its server began serving."""
+    jit = _aiter(tmp_path, monkeypatch)
+    (jit / "prebuilt.so").write_bytes(b"")
+    old = (jit / "prebuilt.so").stat().st_mtime_ns - 10**9
+    os.utime(jit / "prebuilt.so", ns=(old, old))
+    *real, simulated = _four(tmp_path / "cells")
+    for cell in (*real, simulated):
+        _recorded(cell)
+        (cell / "run.json").write_text(json.dumps({"client_runs": 1} | HOST))
+    report = grade(real, simulated)
+    since = (jit / "prebuilt.so").stat().st_mtime_ns + 1
+
+    aiter_jit.main([str(real[0] / "run.json"), str(since)])
+    assert json.loads((real[0] / "run.json").read_text()) == {"client_runs": 1} | HOST
+    assert grade(real, simulated) == report
+
+    (jit / "mha.so").write_bytes(b"")
+    aiter_jit.main([str(real[2] / "run.json"), str(since)])
+    named = re.escape(f"aiter built {[str(jit / 'mha.so')]} while its server served")
+    with pytest.raises(ValueError, match=f"r2 is not graded: {named}, so a step"):
         grade(real, simulated)
