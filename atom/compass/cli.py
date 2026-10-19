@@ -45,6 +45,10 @@ COMMANDS = {
     ),
     "fit host": ("atom.compass.fit.host", "the host laws, fitted on real runs"),
     "run": ("atom.compass.drive.run", "a simulated serve"),
+    "validate bound": (
+        "atom.compass.validate.bound",
+        "real runs' steps priced analytically at step and op level, none above measured",
+    ),
 }
 OPS = "the op-level half of the toolchain is not built yet"
 MACHINE = (
