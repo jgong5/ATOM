@@ -27,6 +27,7 @@ from atom.compass.backends.op_graph import NONE, OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.work import attention, gemm, price
+from atom.compass.capture.peers import MORI
 from atom.compass.run import _op_graphs
 
 GEMM = "aiter.gemm_a16w16.default"
@@ -125,8 +126,13 @@ def test_a_step_reads_the_graph_captured_at_its_shape(batch, padded, shape):
             {"seq": [g(9, 8, 8), leaf(GATHER, [[18, 8]], x=t([9, 8]))]},
             "a data-parallel step whose MoE gathers 18 rows",
         ),
+        (
+            BatchView((RequestShape(9, 9, False),), moe_rows=18),
+            leaf(f"{MORI}.dispatch", [[18, 8]], input=t([9, 8])),
+            "a data-parallel step whose MoE gathers 18 rows",
+        ),
     ],
-    ids=["speculative", "uncaptured", "tbo", "images", "data-parallel"],
+    ids=["speculative", "uncaptured", "tbo", "images", "data-parallel", "mori"],
 )
 def test_a_step_with_no_graph_to_price_it_is_refused_by_name(batch, graph, named):
     with pytest.raises(CostRefused, match=named):

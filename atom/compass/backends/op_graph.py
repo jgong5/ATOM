@@ -46,11 +46,11 @@ from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import IMAGES, BatchView
 from atom.compass.backends.step_roofline import _reads
 from atom.compass.backends.work import Work, bounds
-from atom.compass.capture.peers import MORI
 
 SOURCE = "op-graph"
-#: The leaves a captured MoE layer exchanges its DP or EP group's rows by.
-MOE_EXCHANGES = ("atom.model_ops.moe:", MORI)
+#: The leaves a captured MoE layer exchanges its DP or EP group's rows by:
+#: ATOM's gathers and scatters, and MORI's dispatch and combine.
+MOE_EXCHANGES = ("atom.model_ops.moe:", "mori.ops.dispatch_combine:")
 NONE = "; no successor: the analytical law is the last op-level source"
 
 
