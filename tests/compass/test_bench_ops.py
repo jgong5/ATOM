@@ -6,7 +6,9 @@ stub runs in a stand-in runner whose forward sets ATOM's forward context and
 calls the model, as ATOM's runner does.
 """
 
+import contextlib
 import dataclasses
+import functools
 import json
 import pathlib
 from types import SimpleNamespace
@@ -459,6 +461,97 @@ def test_every_cold_and_warm_graph_holds_calls_calls_at_any_copies(copies):
 
     assert graphs == [ops.CALLS] * (2 if copies > 1 else 1)
     assert (record["copies"], record["calls"]) == (copies, ops.CALLS)
+
+
+def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(
+    monkeypatch,
+):
+    # One call's 1056 bytes pass twice a 50-byte cache: four layers take four
+    # copies, and only the first allocates its activation.
+    layers = {f"model.layers.{i}.attn": SimpleNamespace(layer_num=i) for i in range(4)}
+    kv = {
+        f"layer_{i}": SimpleNamespace(k_cache=torch.zeros(64, 16, 4)) for i in range(4)
+    }
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", kv)
+    runner = _Runner(layers)
+    q = ("q", _t([2, 4], "activation"))
+    found = ops.leaves(
+        _graph(_leaf("x", q, ("layer", ir.ContextRef(KEY)), key=KEY))["region"]
+    )
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    graphs = []
+
+    def replay(fn, calls):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(runner.model, "forward", ops.Stub(runner, 50)) as stub,
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=["k"]),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        [record] = stub.point(placed, decode(2), 20, found)
+
+    assert [kw["layer"] for kw, _ in graphs[0][:4]] == list(layers)
+    assert all(kw["q"] is graphs[0][0][0]["q"] for kw, _ in graphs[0])
+    assert record["copies"] == 4
+
+
+def test_a_graph_over_placements_reads_one_clone_of_metadata_none_changed(
+    monkeypatch,
+):
+    # The leaf prepares on the host for the last `cu_seqlens_q` it saw, by
+    # identity, as linear attention does its chunk indices; a capture cannot.
+    # Every placement's forward leaves it unchanged.
+    layers = {f"model.layers.{i}.attn": SimpleNamespace(layer_num=i) for i in (0, 1)}
+    kv = {f"layer_{i}": SimpleNamespace(k_cache=torch.zeros(64, 16, 4)) for i in (0, 1)}
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", kv)
+    cu = torch.tensor([0, 1, 2], dtype=torch.int32)
+    meta = functools.partial(fctx.AttentionMetaData, cu_seqlens_q=cu)
+    monkeypatch.setattr(fctx, "AttentionMetaData", meta)
+    runner = _Runner(layers)
+    q = ("q", _t([2, 4], "activation"))
+    leaf = _leaf("x", q, ("layer", ir.ContextRef(KEY)), key=KEY)
+    found = ops.leaves(_graph(leaf, layers=2)["region"])
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    prepared, capturing = {}, []
+
+    def call(**kwargs):
+        cu = fctx.get_forward_context().attn_metadata.cu_seqlens_q
+        if prepared.get("cu") is not cu:
+            assert not capturing, "operation not permitted when stream is capturing"
+            prepared["cu"] = cu
+
+    @contextlib.contextmanager
+    def graph(g, capture_error_mode=None):
+        capturing.append(g)
+        yield
+        capturing.clear()
+
+    def event(enable_timing):
+        return SimpleNamespace(
+            record=lambda: None, synchronize=lambda: None, elapsed_time=lambda e: 1.0
+        )
+
+    monkeypatch.setattr(torch.cuda, "graph", graph)
+    monkeypatch.setattr(
+        torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=lambda: None)
+    )
+    monkeypatch.setattr(torch.cuda, "Event", event)
+    with (
+        patch.object(runner.model, "forward", ops.Stub(runner, 5_000)) as stub,
+        patch.object(ops, "_function", return_value=call),
+        patch.object(ops, "_kernels", return_value=["k"]),
+    ):
+        [record] = stub.point(placed, decode(2), 20, found)
+
+    assert "refused" not in record
+    assert record["placements"] == 5
 
 
 def test_a_batch_takes_the_blocks_and_slots_it_is_placed_at(rule):  # noqa: F811

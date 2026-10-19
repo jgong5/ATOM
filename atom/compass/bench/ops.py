@@ -29,16 +29,18 @@ refuses by name, a KV tensor argument among them.
 Cold, by copies. A call's bytes are its tensor arguments' spans, the tensors
 of each module it names and, for a leaf that names a context key, the KV and
 per-request state its layer holds for the batch. One graph runs the leaf K =
-`CALLS` times, cycling over its copies: N built ones, N the least whose bytes
+`CALLS` times, cycling over its copies: N built ones, N the least M whose bytes
 pass `COLD` times the last-level cache and, for a context key, at least its I
 instances (at most K), then, up to the most weights the model holds of a
 weight argument's spec (at most K), copy c mod N with the c-th weights on
-that copy's other arguments. Copy c < N takes fresh activations,
+that copy's other arguments. Copy c < N takes fresh activations below M and
+copy c mod M's from there,
 the c-th of the model's weights of that spec (a clone past the last), and
 instance c mod I at placement (c div I) mod P, its metadata and module
 tensors cloned past the first round: a placement is the point's batch on KV
 blocks and state slots of its own, for which ATOM builds the forward context
-again. A second graph runs copy 0 K times, warm; with one copy there is none.
+again, cloned where it differs from the last placement's. A second graph runs
+copy 0 K times, warm; with one copy there is none.
 Each graph is replayed `WARMUPS` times, then `REPEATS` times timed;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches are the point's
@@ -101,7 +103,7 @@ from atom.compass.drive.gpu import add_gpu_flag
 
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below does.
-PROTOCOL = 4
+PROTOCOL = 5
 WARMUPS = 3
 REPEATS = 20
 #: Calls every graph holds, and so the copies it cycles over at most. One count
@@ -318,6 +320,7 @@ class Stub:
     def __init__(self, runner, llc: int) -> None:
         self.runner, self.llc = runner, llc
         self.weights, self.leaves, self.placed = {}, {}, []
+        self.cold_copies, self.clones = {}, {}
         for t in _weights(runner.model):
             if t.device.type != runner.device.type:
                 continue
@@ -351,10 +354,13 @@ class Stub:
                         meta[sig, path] = name, _clone(view)
                     except ValueError as error:  # the leaf refuses, not the step
                         meta[sig, path] = str(error), None
+        # one clone across placements of what none changed: a leaf may cache
+        # what it prepares on the host by its identity (linear attention's
+        # chunk indices), and a graph over placements replays all of it
         memo: dict = {}
         snap = copy.copy(fc)
-        snap.attn_metadata = _deep(fc.attn_metadata, memo)
-        snap.context = _deep(fc.context, memo)
+        snap.attn_metadata = _deep(fc.attn_metadata, memo, self.clones)
+        snap.context = _deep(fc.context, memo, self.clones)
         self.placed.append((snap, meta))
         hidden = self.runner.config.hf_config.get_text_config().hidden_size
         dtype = self.runner.config.torch_dtype
@@ -378,7 +384,8 @@ class Stub:
             s: self._plan(op, i, kv, blocks, len(rows)) for s, (op, i) in found.items()
         }
         need = max(p for _, _, p in plans.values())
-        self.leaves, self.placed, self.context = found, [], context
+        self.leaves, self.placed, self.context, self.clones = found, [], context, {}
+        self.cold_copies = {s: self._cold(size) for s, (_, size, _) in plans.items()}
         for p in range(max(min(need, *room), 1)):
             self.runner.forward(rule.batch(view, p * blocks, p * len(rows)))
         got = []
@@ -414,19 +421,25 @@ class Stub:
                 need = None
             elif key in self.modules:
                 size += sum(t.nbytes for t in _own(self.modules[key]))
-        n = min(CALLS, COLD * self.llc // size + 1) if size else 1
+        n = self._cold(size)
         if need is None:  # cycle over every instance's state, which is held anyway
             n = min(CALLS, max(n, len(instances)))
         return n, size, need or -(-n // len(instances))
 
+    def _cold(self, size) -> int:
+        """Copies of `size` bytes a call whose bytes pass `COLD` times the cache."""
+        return min(CALLS, COLD * self.llc // size + 1) if size else 1
+
     def _time(self, op, sig, instances, n) -> dict:
-        """`op` timed cold over `n` copies, then copy `c mod n` with the c-th
-        weight up to every weight the model holds of its spec, and warm over
-        one, with its kernels."""
+        """`op` timed cold over `n` copies, past the first `m` its point sized
+        to the cache (`cold_copies`) each on copy `c mod m`'s activations, then
+        copy `c mod n` with the c-th weight up to every weight the model holds
+        of its spec, and warm over one, with its kernels."""
         from atom.utils import forward_context
 
-        fn = _function(op["op"])
-        calls = [self._copy(op, sig, instances, c) for c in range(n)]
+        fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
+        calls = [self._copy(op, sig, instances, c) for c in range(min(n, m))]
+        calls += [self._copy(op, sig, instances, c, calls[c % m]) for c in range(m, n)]
         # one weight can read a few percent off another of its spec, and every
         # one is held anyway: cycle them all, on the n copies' other arguments
         held = [
@@ -460,16 +473,21 @@ class Stub:
             "protocol": PROTOCOL,
         }
 
-    def _copy(self, op, sig, instances, c):
-        """Copy `c` of `op`'s call: its keyword arguments and forward context."""
+    def _copy(self, op, sig, instances, c, like=None):
+        """Copy `c` of `op`'s call: its keyword arguments and forward context,
+        on the activations of copy `like` when given."""
         instance = instances[c % len(instances)]
         p = c // len(instances) % len(self.placed)
         snap, meta = self.placed[p]
         fresh = c >= len(self.placed) * len(instances)
 
-        def build(path, value):
+        def build(path, value, old):
             if isinstance(value, list):
-                return [build(f"{path}.{i}", v) for i, v in enumerate(value)]
+                old = old or [None] * len(value)
+                pairs = enumerate(zip(value, old))
+                return [build(f"{path}.{i}", v, o) for i, (v, o) in pairs]
+            if isinstance(value, dict) and value.get("role") == "activation" and like:
+                return old
             if _ref(value) and "module" in value:
                 module = self.modules[instance[path]]
                 return _module_copy(module) if fresh else module
@@ -483,7 +501,8 @@ class Stub:
                 return getattr(torch, value[6:], value)
             return value
 
-        return {s: build(s, v) for s, v in op["args"].items()}, snap
+        args = op["args"].items()
+        return {s: build(s, v, like[0][s] if like else None) for s, v in args}, snap
 
     def _reweigh(self, op, like, c):
         """Copy `like` of `op`'s call with the c-th weight of each weight
@@ -648,22 +667,29 @@ def _clone(t) -> torch.Tensor:
     return flat.as_strided(t.shape, t.stride())
 
 
-def _deep(x, memo):
+def _deep(x, memo, clones=None):
     """`x` with every tensor it reaches through dataclasses, ATOM objects,
-    dicts and lists cloned, aliases kept."""
+    dicts and lists cloned, aliases kept; with `clones`, a tensor whose values
+    have not changed since the last clone of its live view takes that clone."""
     if id(x) in memo:
         return memo[id(x)]
     if torch.is_tensor(x):
-        memo[id(x)] = _clone(x)
+        key = x.data_ptr(), x.shape, x.stride(), x.dtype
+        twin = None if clones is None else clones.get(key)
+        if twin is None or not torch.equal(twin, x):
+            twin = _clone(x)
+        memo[id(x)] = twin
+        if clones is not None:
+            clones[key] = twin
     elif isinstance(x, dict):
-        memo[id(x)] = {k: _deep(v, memo) for k, v in x.items()}
+        memo[id(x)] = {k: _deep(v, memo, clones) for k, v in x.items()}
     elif isinstance(x, list):
-        memo[id(x)] = [_deep(v, memo) for v in x]
+        memo[id(x)] = [_deep(v, memo, clones) for v in x]
     elif dataclasses.is_dataclass(x) or type(x).__module__.startswith("atom.utils"):
         if not hasattr(x, "__dict__"):
             return x
         memo[id(x)] = twin = copy.copy(x)
-        vars(twin).update({k: _deep(v, memo) for k, v in vars(x).items()})
+        vars(twin).update({k: _deep(v, memo, clones) for k, v in vars(x).items()})
     else:
         return x
     return memo[id(x)]
