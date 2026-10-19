@@ -21,7 +21,7 @@ from test_stop_between_client_runs import CLIENT_RUN as UNREFUSED
 from atom.compass import run as compass_run
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import serve
-from atom.compass.validate.runs import CLIENT_RUN, _requests, grade, graded, main
+from atom.compass.validate.runs import CLIENT_RUN, _requests, grade, main
 
 EXPORT = {
     "request_count": {"unit": "requests", "avg": 3.0},
@@ -336,6 +336,63 @@ def test_a_simulated_run_grading_does_not_take_is_refused_naming_why(
         grade(real, simulated)
 
 
+HOST = {"host": {"laws": {}}}
+NO_HOST = "its run file has no host laws, so it prices no host time"
+ROOFLINE = "the step roofline was on"
+
+
+@pytest.mark.parametrize(
+    "run, reason",
+    [
+        (HOST | {"step_linear": {}, "step_roofline": True}, ROOFLINE),
+        (HOST | {"step_stub": {}, "step_roofline": True}, ROOFLINE),
+        ({"step_linear": {}}, NO_HOST),
+        ({"step_linear": {}, "step_roofline": True}, f"{NO_HOST}; {ROOFLINE}"),
+        (HOST | {"step_linear": {}, "step_roofline": False}, None),
+        # The step grid prices below it by the roofline, switch or none.
+        (HOST | {"step_grid": {}, "step_roofline": True}, None),
+    ],
+    ids=["law-roofline", "stub-roofline", "no-host", "both", "law", "grid-roofline"],
+)
+def test_a_cctraces_sim_cell_grading_does_not_take_is_refused_naming_why(
+    tmp_path, run, reason
+):
+    *real, simulated = _four(tmp_path)
+    report = grade(real, simulated)
+    (simulated / "run.json").write_text(json.dumps(run))
+
+    if reason is None:
+        assert grade(real, simulated) == report
+        return
+    with pytest.raises(ValueError, match=f"sim is not graded: {reason}$"):
+        grade(real, simulated)
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        {"step_linear": {}},
+        HOST | {"step_linear": {}, "step_roofline": True},
+        {"host": {"skip": ["E"]}},
+    ],
+    ids=["no-host", "law-roofline", "skip"],
+)
+def test_real_cctraces_sim_cells_grade_whatever_run_file_they_were_handed(
+    tmp_path, run
+):
+    """A real cell's server never reads the run file its run.json holds; a
+    simulated cell handed the same one is refused, named."""
+    *real, simulated = _four(tmp_path)
+    report = grade(real, simulated)
+    for cell in real:
+        (cell / "run.json").write_text(json.dumps(run))
+    assert grade(real, simulated) == report
+
+    (simulated / "run.json").write_text(json.dumps(run))
+    with pytest.raises(ValueError, match="/sim (is not graded|skips host segments)"):
+        grade(real, simulated)
+
+
 def test_the_command_states_the_steps_extrapolated_and_priced_by_a_fallback(
     tmp_path, capsys
 ):
@@ -417,6 +474,28 @@ def test_a_client_run_s_warmup_steps_precede_its_own_and_are_not_graded(tmp_path
     assert grade(real, simulated) == report
 
 
+def test_a_cell_cctraces_sim_wrote_with_its_export_grades_its_profiling_steps_alone(
+    tmp_path,
+):
+    *real, simulated = _four(tmp_path / "whole")
+    report = grade(real, simulated)
+
+    def cells(name, schedule):
+        out = _four(tmp_path / name, schedule, {6: "kw", 7: "ka", 8: "kb"})
+        for cell in out:
+            _recorded(cell, warmup={"kw"})
+            # run.json as `cctraces_sim.sh` writes it: a run file, no `format_version`
+            (cell / "run.json").write_text(json.dumps({"client_runs": 1} | HOST))
+        return out
+
+    warmed = cells("warmed", WARMED)
+    assert grade(warmed[:3], warmed[3]) == report
+    # A warmup still running past its first own step refuses it.
+    late = cells("late", LATE)
+    with pytest.raises(ValueError, match="r0 is not graded: .* has not ended"):
+        grade(late[:3], late[3])
+
+
 @pytest.mark.parametrize(
     "step", [[(9, 30, 30, False)], [(6, 1, 31, True), (9, 30, 30, False)]]
 )
@@ -444,29 +523,48 @@ def test_a_client_run_whose_export_names_no_warmup_is_refused(tmp_path, warmup):
         grade(real, simulated)
 
 
-#: Request `kw` warms the server up only after the client run's first step.
-LATE = [_schedule()[0], [(6, 30, 30, False)], *_schedule()[1:]]
-
-
-@pytest.mark.parametrize("schedule", [_schedule(), LATE], ids=["none", "late"])
-def test_a_client_run_whose_warmup_no_step_up_to_its_first_holds_is_refused(
-    tmp_path, schedule
+def test_a_client_run_whose_warmup_no_step_before_its_first_holds_is_refused(
+    tmp_path,
 ):
-    cells = _four(tmp_path, schedule, {6: "kw", 7: "ka", 8: "kb"})
+    cells = _four(tmp_path, _schedule(), {6: "kw", 7: "ka", 8: "kb"})
     *real, simulated = (_recorded(c, held=False) for c in cells)
 
-    unheld = "no step up to its own first holds its warmup, so its first steps"
+    unheld = "no step before its own first holds its warmup, so its first steps"
     with pytest.raises(ValueError, match=f"r0 is not graded: {unheld} may be cold$"):
         grade(real, simulated)
 
 
-def test_a_warmup_held_only_in_steps_its_client_run_shares_is_graded(tmp_path):
-    keys = {6: "kw", 7: "ka", 8: "kb"}
-    first, *rest = _schedule()
-    shared = [[(6, 30, 30, False), *first], *rest]
-    cells = [_recorded(c, warmup={"kw"}) for c in _four(tmp_path, shared, keys)]
+#: Request `kw` prefills in the client run's first step.
+SHARED = [[(6, 30, 30, False), *_schedule()[0]], *_schedule()[1:]]
+#: Request `kw` prefills alone first, and decodes on into the client run's second step.
+LONG = [WARMED[0], _schedule()[0], [WARMED[1][0], *_schedule()[1]], *_schedule()[2:]]
+#: Request `kw` prefills alone first, and decodes alone after the client run's first step.
+APART = [WARMED[0], _schedule()[0], WARMED[1], *_schedule()[1:]]
+#: Request `kw` warms the server up only after the client run's first step.
+LATE = [_schedule()[0], [(6, 30, 30, False)], *_schedule()[1:]]
 
-    assert [graded(c)[2] for c in cells] == [{"requests": 1, "steps": 0}] * 4
+
+@pytest.mark.parametrize(
+    "schedule, unheld, step",
+    [(SHARED, True, 0), (LONG, False, 2), (APART, False, 2), (LATE, True, 1)],
+    ids=["first", "later", "warmup-only-after-first-own", "late"],
+)
+def test_a_client_run_whose_warmup_runs_on_past_its_first_own_step_is_refused(
+    tmp_path, schedule, unheld, step
+):
+    keys = {6: "kw", 7: "ka", 8: "kb"}
+    cells = [_recorded(c, warmup={"kw"}) for c in _four(tmp_path, schedule, keys)]
+
+    cold = (
+        "no step before its own first holds its warmup, so its first steps may be cold"
+    )
+    why = [cold] if unheld else []
+    why.append(
+        f"steps from its own first on hold a request of its warmup, 1 from step {step}, "
+        "so its warmup has not ended when it starts"
+    )
+    with pytest.raises(ValueError, match=f"r0 is not graded: {'; '.join(why)}$"):
+        grade(cells[:3], cells[3])
 
 
 def test_the_steps_of_a_later_client_run_are_not_graded(tmp_path):

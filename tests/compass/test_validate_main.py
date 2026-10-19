@@ -62,9 +62,10 @@ def _run(
             for phase, u, c, ms in lines
         )
     )
-    (d / "run.json").write_text(
-        json.dumps({"workload": {"traces": workload}, "step_linear": LAW})
-    )
+    run = {"workload": {"traces": workload}, "step_linear": LAW}
+    if refusals is not None:
+        run["host"] = {"laws": {}}
+    (d / "run.json").write_text(json.dumps(run))
     if refusals is None:
         _log(d / "server.log", peak=50 * GIB, non_torch=non_torch * GIB)
         return
@@ -322,6 +323,27 @@ def test_a_refusal_in_the_client_run_record_and_run_wrote_refuses_the_cell(
         main([str(tmp_path / "c4")])
 
 
+def test_a_later_client_runs_refusal_leaves_a_run_written_cell_graded(capsys, tmp_path):
+    _rows(capsys, tmp_path)
+    _as_recorded(tmp_path / "c4")
+    # Client run 0 refused nothing; a later one on its server refused once.
+    law = tmp_path / "c4" / "step_linear"
+    (law / "client-0").mkdir()
+    (law / "summary.json").rename(law / "client-0" / "summary.json")
+    summary = json.loads((law / "client-0" / "summary.json").read_text())
+    summary["coverage_report"] = True
+    summary["schedule"]["refusals"].update(count=1, by_source=[["clock", 1]])
+    (law / "summary.json").write_text(json.dumps(summary))
+
+    rows = _graded(capsys, tmp_path / "c4")
+
+    assert rows["cell", "verdict"] == ["3 real runs", "graded"]
+    assert rows["summary step_linear", "refusals"] == [
+        "0 {}; cost refused 0.0% of 20 steps",
+        "none",
+    ]
+
+
 def test_runs_record_and_run_wrote_that_were_given_other_traces_are_not_one_cell(
     capsys, tmp_path
 ):
@@ -419,3 +441,22 @@ def test_the_steps_extrapolated_or_priced_by_a_fallback_are_stated_and_graded(
     assert rows["cell", "verdict"] == ["3 real runs", "graded"]
     assert rows["summary step_linear", "extrapolated steps"] == ["3 of 20", "not gated"]
     assert rows["summary step_linear", "fallback steps"] == ["2 of 20", "not gated"]
+
+
+def test_a_refused_cost_row_names_its_reasons(capsys, tmp_path):
+    # A law with no decode vector refuses each real run's ten decode steps.
+    _rows(capsys, tmp_path)
+    law = tmp_path / "c4" / "step_linear" / "run.json"
+    run = json.loads(law.read_text())
+    law.write_text(json.dumps(run | {"step_linear": {**LAW, "decode": {}}}))
+
+    main([str(tmp_path / "c4")])
+    out = capsys.readouterr().out.splitlines()
+    rows = {tuple(r.split(" | ")[1:3]): r.split(" | ")[3:] for r in out[1:]}
+
+    for real in ("real0", "real1", "real2"):
+        value, verdict = rows[f"cost {real}", "refused decode rung 1"]
+        assert value.endswith(
+            '; reasons {"step-linear: no decode vector for rung 1": 10}'
+        )
+        assert value.startswith("10 steps, real ") and verdict == "-"

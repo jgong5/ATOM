@@ -246,10 +246,11 @@ def test_the_engine_session_starts_the_command_beside_before_the_engine(
     assert started.value.args == (["lmcache", "server", "-p", "1"], {})
 
 
-def starts_autotuning(monkeypatch, r, out, autotuned):
-    """Engine starts that write each rank's file with the next count of kernels
-    inductor autotuned in `autotuned`, `non_torch` 12 MiB high when it is not
-    0; the environment each start was given."""
+def starts_autotuning(monkeypatch, r, out, autotuned, field="autotuned_kernels"):
+    """Engine starts that write each rank's file with the next count in
+    `autotuned` under `field`, kernels inductor autotuned unless named, and
+    `non_torch` 12 MiB high when it is not 0; the environment each start was
+    given."""
     left, envs = list(autotuned), []
 
     class Engine:
@@ -264,7 +265,7 @@ def starts_autotuning(monkeypatch, r, out, autotuned):
             ranks_wrote(out, r.config, [read] * 2)
             for rank in (out / measure_memory.READINGS).iterdir():
                 held = json.loads(rank.read_text())
-                rank.write_text(json.dumps(held | {"autotuned_kernels": tuned}))
+                rank.write_text(json.dumps(held | {field: tuned}))
 
         def wait(self, timeout=None):
             return 0
@@ -301,11 +302,53 @@ def test_a_second_start_that_autotunes_publishes_nothing(tmp_path, monkeypatch):
 
     assert str(refused.value) == (
         "readings.dp0of1.pp0of1.pcp0of1.tp0of2.json, "
-        "readings.dp0of1.pp0of1.pcp0of1.tp1of2.json autotuned kernels again on a "
+        "readings.dp0of1.pp0of1.pcp0of1.tp1of2.json missed inductor caches again on a "
         "second start; non_torch on a cold inductor cache reads high, so nothing is "
         "published"
     )
     assert not (tmp_path / "s").exists()
+
+
+def test_a_start_that_only_missed_the_fx_graph_cache_publishes_the_next_starts(
+    tmp_path, monkeypatch
+):
+    # On a cache a Compass-off start keyed, every graph misses; none autotunes.
+    r, argv = a_start(tmp_path, monkeypatch, STACK)
+    out = tmp_path / "out"
+    starts_autotuning(monkeypatch, r, out, [40, 0], "fxgraph_cache_misses")
+
+    measure_memory.main(argv)
+
+    read = memory.load(tmp_path / "s", r.config, MACHINE, 0).values
+    assert read["driver_and_collective_reserve_bytes"] == (
+        READINGS[2]["driver_and_collective_reserve_bytes"]
+    )
+
+
+def test_the_reading_runner_writes_its_starts_fx_graph_cache_misses(
+    tmp_path, monkeypatch
+):
+    from torch._dynamo.utils import counters
+
+    engine = types.ModuleType("atom.model_engine.model_runner")
+    engine.ModelRunner = object
+    monkeypatch.setitem(sys.modules, engine.__name__, engine)
+    path = Path(measure_memory.__file__).with_name("memory_runner.py")
+    spec = importlib.util.spec_from_file_location("reading_runner", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    runner = module.MemoryReadingModelRunner()
+    runner.config, runner.rank = tp2(tmp_path).config, 0
+    runner._read = dict.fromkeys(
+        ["total", "non_torch", "loaded", "weights", "current", "peak"], 0
+    ) | {"warmup_tokens": 0, "num_kvcache_blocks": 1}
+    monkeypatch.setenv(measure_memory.OUT_ENV, str(tmp_path))
+    monkeypatch.setitem(counters["inductor"], "fxgraph_cache_miss", 40)
+
+    runner._write(None)
+
+    (written,) = tmp_path.glob("readings.*.json")
+    assert json.loads(written.read_text())["fxgraph_cache_misses"] == 40
 
 
 def test_the_reading_runner_warms_up_once_as_a_serving_start_does(monkeypatch):
