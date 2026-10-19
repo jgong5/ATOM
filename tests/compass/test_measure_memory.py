@@ -4,9 +4,7 @@
 An engine start needs a GPU, so the ranks' files stand in for one here: each
 is what `MemoryReadingModelRunner` writes as its rank starts, named by
 `run.memory`'s naming, holding the key its rank read off the resolved config,
-its engine and its readings. `measure_memory.publish` takes them from there,
-under the stack run.json's identity states, which these tests state as
-the suite's machine document pins it.
+its engine and its readings. `measure_memory.publish` takes them from there.
 
 The deployment is `test_run_step_grid`'s TP1 Qwen3.8-27B worker on the suite's
 machine document.
@@ -94,7 +92,7 @@ def test_each_rank_reads_its_own_member_of_the_entry_measure_memory_publishes(tm
     r = tp2(tmp_path)
     record = started(tmp_path / "out", r.config, [READINGS[2], RANK1])
 
-    measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c", STACK)
+    measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c")
 
     for rank, held in enumerate([READINGS[2], RANK1]):
         read = memory.load(tmp_path / "store", r.config, MACHINE, rank)
@@ -111,8 +109,8 @@ def test_each_rank_reads_its_own_member_of_the_entry_measure_memory_publishes(tm
 
 def a_start(tmp_path, monkeypatch, stack):
     """The suite's TP2 worker and `main`'s arguments for a start on GPU 5 under
-    `stack`, its engine and identity stood in for: the ranks write their files
-    as the engine starts, and run.json names `stack`."""
+    `stack`, its engine and identity stood in for: the command reads `stack`, the
+    ranks write their files as the engine starts, and run.json names `stack`."""
     r, out = tp2(tmp_path), tmp_path / "out"
 
     class Engine:
@@ -140,6 +138,7 @@ def a_start(tmp_path, monkeypatch, stack):
     monkeypatch.setattr(measure_memory, "_ptl", lambda gpus: "disabled")
     # rocm-smi GPU 5 as HIP device 2.
     monkeypatch.setattr(measure_memory, "hip_visible", {(5,): "2"}.get)
+    monkeypatch.setattr(measure_memory, "_stack", lambda: stack)
     monkeypatch.setattr(measure_memory, "identity", lambda *a: {"stack": stack})
     machine = tmp_path / "machine.json"
     machine.write_text(json.dumps(DOCUMENT))
@@ -199,7 +198,7 @@ def test_a_start_on_another_device_than_the_spec_states_refuses_naming_both(
     assert not (tmp_path / "out").exists() and not (tmp_path / "s").exists()
 
 
-def test_a_start_under_another_stack_than_the_spec_pins_publishes_nothing(
+def test_a_start_under_another_stack_than_the_spec_pins_refuses_before_it_starts(
     tmp_path, monkeypatch
 ):
     other = dict(STACK, aiter="9205e1059", torch="2.9.1")
@@ -209,11 +208,12 @@ def test_a_start_under_another_stack_than_the_spec_pins_publishes_nothing(
         measure_memory.main(argv)
 
     assert str(refused.value) == (
-        "the start ran another stack than the machine spec mi355x-8gpu-2node "
+        "the start runs another stack than the machine spec mi355x-8gpu-2node "
         "pins: aiter '9205e1059' in the start and 'f4e7c7509' in the spec; "
         "torch '2.9.1' in the start and '2.10.0' in the spec"
     )
-    assert not (tmp_path / "s").exists()
+    assert not (tmp_path / "hip").exists(), "the engine started"
+    assert not (tmp_path / "out").exists() and not (tmp_path / "s").exists()
 
 
 def test_the_engine_session_starts_the_command_beside_before_the_engine(
@@ -408,9 +408,7 @@ def test_ranks_whose_reserves_spread_past_the_limit_publish_nothing(tmp_path):
     started(tmp_path / "out", r.config, [READINGS[2], crowded])
 
     with pytest.raises(SpecRefusal, match="spread"):
-        measure_memory.publish(
-            tmp_path / "out", MACHINE, tmp_path / "store", "c", STACK
-        )
+        measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c")
     assert not (tmp_path / "store").exists()
 
 
@@ -423,9 +421,7 @@ def test_ranks_that_read_two_configurations_publish_nothing(tmp_path):
     one.write_text(json.dumps(held))
 
     with pytest.raises(ValueError, match="the ranks read 2 keys"):
-        measure_memory.publish(
-            tmp_path / "out", MACHINE, tmp_path / "store", "c", STACK
-        )
+        measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c")
 
 
 def test_a_key_stating_another_layout_than_its_members_publishes_nothing(tmp_path):
