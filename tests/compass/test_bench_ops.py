@@ -411,7 +411,9 @@ def test_a_long_call_fills_a_graph_to_graph_ns_and_has_no_warm_graph(
 
 def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
     # Replay i takes i + 1 ms on a stand-in clock; the host idles `REST` of that
-    # after every replay, warmups included, so the device stays off its power limit.
+    # after every replay, warmups included, which keeps a leaf off the lower
+    # memory clock it reaches back to back.
+    assert ops.REST > 0
     clock, slept = [0], []
 
     class Graph:

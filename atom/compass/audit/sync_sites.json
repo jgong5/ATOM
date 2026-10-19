@@ -4430,7 +4430,7 @@
    "expr": "time.sleep(ms * REST / 1e3)",
    "shape": "sleep",
    "peer": "none",
-   "why": "the op bench idles the host a share of each replay's device time after it, so the device stays under its power limit while it times one leaf",
+   "why": "the op bench idles the host a share of each replay's device time after it, since back to back a leaf lowered the device's memory and fabric clocks and read slow",
    "mechanism": "K9",
    "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
   },
