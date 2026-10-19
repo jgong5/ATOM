@@ -218,6 +218,8 @@ def test_the_run_s_lookup_reads_the_eager_graph_at_a_shape(tmp_path_factory):
             model=str(store.parent / "model"),
             hf_config=hf,
             tensor_parallel_size=1,
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            enable_expert_parallel=False,
             enforce_eager=False,
         )
         lookup = _op_graphs(str(store), config)
