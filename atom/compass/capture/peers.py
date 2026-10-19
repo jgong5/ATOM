@@ -31,8 +31,9 @@ from atom.compass import ir
 MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp"
 
 
-def _declared(recorder, name, fn):
-    """`fn` as one declared op `name`; what it dispatches inside is not ATOM's."""
+def _declared(recorder, name, fn, kind=ir.NodeKind.DECLARED):
+    """`fn` as one op `name` of `kind`, its arguments as called; what it
+    dispatches inside is not recorded."""
     from .forward import _atom_frames
 
     signature = inspect.signature(fn)
@@ -45,7 +46,7 @@ def _declared(recorder, name, fn):
             slots.update(slots.pop("kwargs", {}))
             slots.pop("group", None)
             outs = [t for t in _pytree.tree_leaves(out) if isinstance(t, torch.Tensor)]
-            recorder.add(name, ir.NodeKind.DECLARED, slots, outs, None, _atom_frames())
+            recorder.add(name, kind, slots, outs, None, _atom_frames())
         return out
 
     return call
