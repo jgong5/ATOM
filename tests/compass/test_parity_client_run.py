@@ -258,10 +258,34 @@ def test_the_trace_is_the_conversation_and_the_parameters_are_what_shape_no_prom
             "b": {"trace": "t1", "sampling": {}},
         },
         "warmup": {},
+        "unnamed": [],
         "traces": ["trace-0"],
         "sessions": {},
         "arguments": ARGUMENTS,
     }
+
+
+def test_a_request_no_response_named_is_listed_by_its_request_id_phase_and_trace(
+    tmp_path,
+):
+    records = [
+        raw([sse(("data", '{"id": "a"}'))], "t0"),
+        raw(None, "t1::sa:agent-2:aux:0"),  # cancelled before any response
+        raw([sse(("comment", "compass a=1.0 s=0"))], "t2", phase="warmup"),
+        raw([sse(("data", '{"error": "too long"}'))], "t3"),
+    ]
+    for i, record in enumerate(records):
+        record["metadata"]["x_request_id"] = f"x-{i}"
+    _write_raw(tmp_path, records)
+
+    path, export, unnamed = write(tmp_path)
+
+    assert (unnamed, set(export["requests"])) == (3, {"a"})
+    assert json.loads(path.read_text())["unnamed"] == [
+        {"x_request_id": "x-1", "phase": "profiling", "trace": "t1"},
+        {"x_request_id": "x-2", "phase": "warmup", "trace": "t2"},
+        {"x_request_id": "x-3", "phase": "profiling", "trace": "t3"},
+    ]
 
 
 @pytest.mark.parametrize(
@@ -372,6 +396,7 @@ def test_a_dataset_not_of_weka_traces_at_a_path_refuses(tmp_path, entry):
             "two requests got response id a",
         ),
         ([raw([sse(("data", '{"id": "a"}'))], None)], "has no conversation_id"),
+        ([raw([], None)], "has no conversation_id"),
         ([raw([], phase="cooldown")], "neither warmup nor profiling"),
     ],
 )

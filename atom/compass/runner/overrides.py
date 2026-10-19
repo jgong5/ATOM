@@ -288,14 +288,18 @@ class HostDeviceRecurrence:
     for nothing. With `mtp`, a forward's device work is its target's and then
     its draft's, and a single-stage output forward waits before launch, for
     the previous output forward's target; `MTP_SEGMENT` runs after that wait,
-    before the launch. `ends[-1]` is the last forward's device end. `laws[kind][segment]` are coefficients on `(1,
+    before the launch. With `sync`, every forward leaves no earlier than its
+    own device end, as one that synchronizes its stream before it returns
+    does. `ends[-1]` is the last forward's device end. `laws[kind][segment]` are coefficients on `(1,
     tokens, seqs)`; `charge` says what an absent one costs. `now` reads the engine LP's clock.
     `segments` holds the seconds the last `charge` charged each segment, 0 for
     one in `skip`.
     """
 
-    def __init__(self, laws: dict, skip, now, stage=None, mtp=False) -> None:
-        self.laws, self.skip, self.now = laws, frozenset(skip), now
+    def __init__(
+        self, laws: dict, skip, now, stage=None, mtp=False, sync=False
+    ) -> None:
+        self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
         ring = 2 if stage is None else stage[1]
         self.ends = collections.deque([-math.inf] * ring, maxlen=ring)  # n-ring..n-1
         self.last = None if stage is None else stage[0] == stage[1] - 1
@@ -369,7 +373,9 @@ class HostDeviceRecurrence:
         now, launch_end, output, post = self._held
         self.ends.append(end)
         released = launch_end
-        if output:
+        if self.sync:
+            released = max(launch_end, end)
+        elif output:
             if self.last is None:
                 released, self.output_end = max(launch_end, self.output_end), target_end
             elif self.last:
@@ -739,7 +745,10 @@ class PipelineFrames:
         stage loop charges after its send, left out of `predicted_s`; and its parts as
         ``(carrier, bytes)`` in the order the next receives them, the size and
         the pickled metadata on gloo, then each tensor on RCCL, as ATOM splits
-        `_pp_output`'s `_PP_PROXY_KEYS`; a key it does not size is refused."""
+        `_pp_output`'s `_PP_PROXY_KEYS`; a key it does not size is refused.
+        With ATOM's `pp_send_allgather_group`, a tensor whose element count the
+        group's width divides is sent as this rank's shard,
+        ``(carrier, bytes / width, True)``."""
         pp = int(_config_field(self, "pipeline_parallel_size") or 1)
         if pp == 1 or self.config.parallel_config.pipeline_parallel_rank == pp - 1:
             return None
@@ -751,7 +760,16 @@ class PipelineFrames:
         sent = {k: out[k] for k in pp_comm._PP_PROXY_KEYS if out[k] is not None}
         # A "meta" device pickles to the length of ATOM's "cuda".
         meta, device_tensors = pp_comm._split_tensor_dict(sent)
-        tensors = [("rccl", t.nbytes) for t in device_tensors]
+        tp = getattr(self.config, "tensor_parallel_size", 1)
+        ag = pp_comm.pp_send_allgather_group() if tp > 1 else None
+        tensors = [
+            (
+                ("rccl", t.nbytes // ag.world_size, True)
+                if ag is not None and t.numel() % ag.world_size == 0
+                else ("rccl", t.nbytes)
+            )
+            for t in device_tensors
+        ]
         host = getattr(self, "compass_host", None)
         post = 0.0
         if isinstance(host, HostDeviceRecurrence) and self.rank == 0:
@@ -776,6 +794,11 @@ class PipelineFrames:
             return called, -math.inf
         end, seg = host.prepare_end(called, kind, x)
         return end + seg[PP_RECV_SEGMENT], host.ends[-1]
+
+    def pp_all_gather_s(self, rows: int) -> float:
+        """The all-gather this stage runs over its TP group on each sharded
+        tensor of `rows` rows it receives, priced by the installed backend."""
+        return _installed_backend(self).all_gather_s(rows)
 
     def send_pp_frame(self, kind: str, frame: dict) -> bool:
         """Post one stage-loop frame to the next stage (``pp_data``) or the one
@@ -990,11 +1013,9 @@ class NonAllocatingRunner(
         holds back four safety margins on the prefill side because two
         processes share the card (`_kv_budget_extra_reserve`). Substituting
         readings into the base method reaches neither: this path would hand a
-        decode process a pool it does not own.
-        The base's `_kv_budget_extra_reserve` of zero is left alone for the
-        same reason it is right -- the card these readings describe is a
-        dedicated one, and a shared-card reservation would hold bytes back for a
-        second tenant that those readings do not have.
+        decode process a pool it does not own. `CompassRapidServeModelRunner`
+        answers decode and inherits that reserve for prefill; this class adds
+        no reserve of its own.
         """
         if _config_field(self, "disagg_is_decode"):
             raise RunnerRefusal(
@@ -1415,7 +1436,9 @@ class RapidServeRpcs:
     The IPC exports hand over nothing, the imports take nothing in, and no
     stream is made. Decode sizes no pool: it answers as ATOM's
     `RapidServeModelRunner.get_num_blocks` does and allocates nothing, then
-    takes prefill's block count with the pool's import.
+    takes prefill's block count with the pool's import. Prefill's pool is
+    sized with that class's shared-card reserve, which the composed runner
+    inherits from it.
     """
 
     def get_num_blocks(self) -> dict[str, object]:
@@ -1451,8 +1474,9 @@ class RapidServeRpcs:
     def prefill_forward(self, batch: Any) -> SampledIds:
         """`forward`'s step, replied as ATOM's prefill replies: a token id per
         request in batch order, picked by request id as `DeferredTokenStream`
-        picks them, since prefill reports its tokens at once."""
-        out = self.forward(batch)
+        picks them, since prefill reports its tokens at once. The step is the
+        class's `forward`: prefill's instance `forward` is this method."""
+        out = super().forward(batch)
         ids = self._token_stream.token_ids
         sampled = SampledIds(ids[int(r) % len(ids)] for r in batch.req_ids)
         for name in ("predicted_s", "out_s", "group_targets", "group_out"):
