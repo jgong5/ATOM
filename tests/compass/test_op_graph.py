@@ -222,7 +222,7 @@ def test_the_run_s_lookup_reads_the_eager_graph_at_a_shape(tmp_path_factory):
             enable_expert_parallel=False,
             enforce_eager=False,
         )
-        lookup = _op_graphs(str(store), config)
+        lookup = _op_graphs(str(store), config, "gfx942")
         found.append((lookup("decode", 2, 2), lookup("decode", 3, 3)))
 
     assert (graph["region"], None) in found
