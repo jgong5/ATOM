@@ -60,8 +60,10 @@ highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
 and each prefill family (`_family`) over a ladder of their token counts, chunk
 remainders among them; then the point halfway between two neighbours of a
-family that launched different kernels, until they are adjacent. DIR gets each
-round's ops.jsonl in `round<n>`, and every point held in plan.jsonl.
+family that launched different kernels or, at a decode width, either side of
+a point off the line through theirs (`_densify`), until they are adjacent.
+DIR gets each round's ops.jsonl in `round<n>`, and every point held in
+plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
 covers (`coverage`), and prints the count by phase and why each leaf kind
@@ -815,6 +817,10 @@ LADDER_STEP = 1.25
 #: The spread of a leaf's cold times across contexts, over the largest, past
 #: which its kind depends on context; a repeat's spread stays within 4%.
 CONTEXT_MOVES = 0.10
+#: How far a decode point's cold time may lie off the line through its two
+#: neighbours', over the larger, when the three launched one kernel, before the
+#: plan halves the gaps either side: a price read off that line misses by as much.
+BENDS = 0.05
 
 
 def plan(store, key, config, run, args, command: str, out: Path) -> None:
@@ -1052,15 +1058,17 @@ def _bracket(ats, kernels, lo, hi) -> str:
 
 
 def _densify(families, tried: set) -> dict:
-    """The point halfway between each two neighbours of a family that launched
-    different kernels and lie more than one apart, unless `tried`."""
+    """The point halfway between each two neighbours of a family more than one
+    apart, unless `tried`, that launched different kernels or, in a decode
+    family, lie either side of a point `_bent` off the line through theirs."""
     from atom.compass.capture.forward import prefill
 
     want = defaultdict(set)
     for fam, points in families.items():
+        bent = _bent(points) if points[0][2]["shape"].startswith("decode") else ()
         for (a, ka, record), (b, kb, _) in itertools.pairwise(points):
             mid = (a + b) // 2
-            if ka == kb or b - a < 2 or (fam, mid) in tried:
+            if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
                 continue
             tried.add((fam, mid))
             shape = _shape(record["shape"])
@@ -1071,6 +1079,19 @@ def _densify(families, tried: set) -> dict:
             )
             want[at].add(fam)
     return want
+
+
+def _bent(points) -> set:
+    """The lower ends of the gaps either side of each middle point of three
+    neighbours that launched one kernel and whose cold time lies more than
+    `BENDS`, over the larger, off the line through the outer two's."""
+    ends = set()
+    for p, q, r in zip(points, points[1:], points[2:]):
+        y = [point[2]["cold_ns"] for point in (p, q, r)]
+        line = y[0] + (y[2] - y[0]) * (q[0] - p[0]) / (r[0] - p[0])
+        if p[1] == q[1] == r[1] and abs(y[1] - line) > BENDS * max(y[1], line):
+            ends |= {p[0], q[0]}
+    return ends
 
 
 def _load(store, config, root, shapes, graphs: dict) -> None:
