@@ -637,11 +637,13 @@ rather than the host it was captured on.
 `scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-gpu45-{prefill,decode}.json`
 are DeepSeek-V4-Pro's DPA-TP8 laws on mi355-gpu-45, one per side of a 1P1D
 deployment: the `base` form with host laws, each fitted alone on its side's
-capture (calibration cells at concurrency 1, 4, 16, 64 and 256, at ATOM
-8f1d8ef6e). The records predate the engine key's parallel layout, TBO and
-environment, so each law's `--engine` file states them from the cells'
-`server.log` engine arguments and the capture script's environment for that
-side; the law's `provenance` names both. Their host keys carry the `atom`
+capture at ATOM 2d4044b15 by `compass fit steps` and `compass fit host`.
+Each side's cells are concurrency 1, 4, 16, 64 and 256 at `cctraces_sim.sh`'s
+default `SEED` and 64 and 256 at `SEED=20260708`; the decode side adds 64 at
+`SEED=20260709`, the prefill side two more at 64 and `SEED=20260708`. At DP
+width 8 only steps every rank ran are fitted, and only the cells at 64 and
+above supply decode steps; each decode rung a law fits has such steps in two or more
+cells, so each carries a held-out hull. Their host keys carry the `atom`
 digest of the tree they were last re-keyed at; `provenance` names the
 capture tree's.
 
@@ -681,24 +683,20 @@ $T/scripts/compass/machines/mi308x-hjbog39.json`, `$R` is a directory under `/da
 or `/tmp` and `$S` is `--store $R/store`, empty at the start. The raw export keeps
 every prompt, about 100 KB to 760 KB a request on this cell.
 
-**A client run.** No command starts one. Each is `aiperf profile` with
-`cctraces_sim.sh`'s arguments, its benchmark id pinned as that script pins it for
-a real cell, `--input-file` a directory of one file per trace as that script
-splits them, `--url` from `OUT/server.json`, `--artifact-dir OUT/artifacts`,
-`--export-level raw`, and a warmup on both sides, so the cold first forward falls
-outside the graded window: `--trajectory-start-min-ratio 0
---trajectory-start-max-ratio 0 --warmup-requests-per-lane 1`, one one-token
-request per lane before profiling. The grace period after the duration stays
-aiperf's finite default: `--benchmark-grace-period inf` can hang aiperf's agentic
-replay after the cutoff, waiting on a credit the server no longer holds (upstream,
-in agentx-harness's aiperf). Each client sets its own
-`AIPERF_DATASET_MMAP_BASE_PATH`, such as `OUT`: every client pins one benchmark id,
-so two at once would share a dataset directory. A `run` server's client is the
-Python `cctraces_sim.sh` takes as `HARNESS_PYTHON`, with
-`PYTHONPATH=$T:$T/compass_harness` (with the harness alone it imports the image's
-ATOM) and `ATOM_COMPASS_RUN=OUT/run_file.json`. Then
-`python -m atom.compass.parity.client_run OUT/artifacts` writes its export,
-`OUT/artifacts/client_run.json`, and SIGTERM to the command stops its server.
+**A client run.** No command starts one: once `OUT/server.json` exists,
+`$T/scripts/compass/client.sh OUT --traces A-B --concurrency C --stop`, `client.sh`
+below, drives one against the server whose `--out` is `OUT`, writes its export,
+`OUT/artifacts/client_run.json`, and stops the command, which stops its server.
+Its header lists its options and the variables it reads: a `run` server's client
+is the Python `cctraces_sim.sh` takes as `HARNESS_PYTHON`, a `record` server's the
+image's aiperf. Both sides start every trajectory at its first turn after a
+warmup, so the cold first forward falls outside the graded window:
+`--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0
+--warmup-requests-per-lane 1`, one one-token request per lane before
+profiling. The grace period after the duration stays aiperf's finite default:
+`--benchmark-grace-period inf` can hang aiperf's agentic replay after the cutoff,
+waiting on a credit the server no longer holds (upstream, in agentx-harness's
+aiperf).
 Until #1301, a real server's environment sets `TRITON_CACHE_AUTOTUNING=1` and one
 `TRITON_CACHE_DIR` for every run, as `cctraces_sim.sh` does for a real cell. Until
 #1319, take a graded record only in a container that has served one before: aiter
@@ -708,17 +706,18 @@ which no cache directory above holds.
 
 1. `compass measure memory --gpu G $M $S --out $R/mem -- $ATOM`.
 2. Calibration, alone on the node: per concurrency 1, 4, 16, 64 and 256,
-   `compass record --gpu G --out $R/cal/c<C> -- $ATOM` serving one client run of
-   traces 256 to 392, then
+   `compass record --gpu G --out $R/cal/c<C> -- $ATOM` and `client.sh $R/cal/c<C>
+   --traces 256-392 --concurrency <C> --stop`, then
    `python -m atom.compass.parity.recurrence $R/cal/c<C>/steps`.
 3. `compass fit steps --backend step-linear --form history $R/cal/c* --client-run
    $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M $S --out $R/fit` and
    `compass fit host` on the same inputs; each prints its store token.
 4. Real runs: per concurrency, two `compass record --gpu G --out
-   $R/cell/c<C>/real<k> -- $ATOM`, each serving one client run of traces 0 to 255,
-   at most two GPUs at once.
+   $R/cell/c<C>/real<k> -- $ATOM`, each with `client.sh $R/cell/c<C>/real<k>
+   --traces 0-255 --concurrency <C> --stop`, at most two GPUs at once.
 5. `compass run --step-linear LAW --host-laws HOST $M $S --out
-   $R/cell/c<C>/step_linear -- $ATOM`, serving the same client run.
+   $R/cell/c<C>/step_linear -- $ATOM`, with `client.sh $R/cell/c<C>/step_linear
+   --traces 0-255 --concurrency <C> --stop`.
 6. Check 2: `python -m atom.compass.validate $R/cell/c<C>`.
 7. Check 1: `cctraces_sim.sh` with `RUN_FILE` the `run_file` of
    `$R/cell/c<C>/step_linear/run.json`, `FIRST_SESSION=0 SESSIONS=256
@@ -745,9 +744,9 @@ and no margin:
 ```
 
 8. Per concurrency, `compass trace steps --step-linear LAW --host-laws HOST $M $S
-   --out $R/pop/<traces>/c<C> -- $ATOM`, serving one client run as a `run`
-   server's client, of traces 256 to 392 and of traces 0 to 255; its stop
-   publishes a `shape_population`, `POP` below.
+   --out $R/pop/<traces>/c<C> -- $ATOM`, with `client.sh $R/pop/<traces>/c<C>
+   --traces <traces> --concurrency <C> --stop`, `<traces>` 256-392 and 0-255; its
+   stop publishes a `shape_population`, `POP` below.
 9. `compass measure steps --grid POP... --grid-definition $G --client-run POP
    $R/pop/<traces>/c<C>/artifacts/client_run.json ... --sampling '{"ignore_eos":
    true}' --gpu G $S --out $R/grid -- $ATOM`. The deep-context prefill corners

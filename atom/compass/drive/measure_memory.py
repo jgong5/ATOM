@@ -10,11 +10,10 @@ weights loaded, its one warmup run, its KV cache sized and its graphs captured. 
 start and after it. Each rank writes its readings and the key it read off its
 resolved config, and the ranks must agree on the key. The entry's key is that
 one with the digest of the machine spec `--machine` names; its conditions are
-that spec's device and stack, torch included. A start under a stack the
-spec does not pin, as run.json's identity states it, refuses before it
-publishes. A `--gpu` whose device or PTL state is not the spec's refuses before the
-start, so no entry measured on another card is keyed by that spec. `non_torch`
-refuses a spread across the ranks above `SPREAD_LIMIT`. One member per rank
+that spec's device and stack, torch included. A `--gpu` whose device or PTL
+state is not the spec's, or a stack the spec does not pin, refuses before the
+start, so no entry measured on another card or stack is keyed by that spec.
+`non_torch` refuses a spread across the ranks above `SPREAD_LIMIT`. One member per rank
 holds `memory.ENTRY_FIELDS`, its `record` the digest of the engine's log.
 `--beside` names a command the start runs first in the engine's session, such
 as the lmcache server an offload connector reaches, so the GPU checks hold it
@@ -22,9 +21,9 @@ to the engine's rule.
 
 Each start takes a free `ATOM_DP_MASTER_PORT`, which keys ATOM's compiled-graph
 cache, as a parity run's server does. A start in which inductor autotuned a
-kernel moves its files to `<out>.cold` and starts once more, on the cache it
-warmed: the configs autotuning tried stay loaded and read in `non_torch`. A
-second start that autotunes refuses.
+kernel or missed an FX graph moves its files to `<out>.cold` and starts once
+more, on the cache it warmed: the configs autotuning tried stay loaded and
+read in `non_torch`. A second such start refuses.
 
 ``--out`` gets the engine's log, run.json's identity from the rank-0 engine
 file, and ``memory_readings.json``, the entry's readable copy. ATOM's
@@ -56,7 +55,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.drive import serve
 from atom.compass.drive.gpu import add_gpu_flag, hip_visible, quiet
-from atom.compass.drive.identity import _device, _ptl, identity
+from atom.compass.drive.identity import _device, _ptl, _stack, identity
 from atom.compass.run import CLOCK_ENV, ENV, _write_whole, memory
 from atom.compass.spec import MachineSpec, across_ranks
 from atom.compass.spec.fields import PINNED
@@ -118,6 +117,17 @@ def main(argv: list[str], again: bool = False) -> None:
             f"the cards read ptl {ptl!r}, and {args.machine} states "
             f"{stated['ptl']!r}; name the machine spec of the cards' PTL state"
         )
+    pinned = {c: machine.value(f"device.software_pinned_to.{c}") for c in PINNED}
+    stack = _stack()
+    if differ := [
+        f"{c} {stack[c]!r} in the start and {pinned[c]!r} in the spec"
+        for c in PINNED
+        if stack[c] != pinned[c]
+    ]:
+        raise ValueError(
+            "the start runs another stack than the machine spec "
+            f"{machine.value('name')} pins: " + "; ".join(differ)
+        )
     out = Path(args.out)
     if out.exists() and any(out.iterdir()):
         raise ValueError(f"{out} holds an earlier run's files; one run per directory")
@@ -153,7 +163,7 @@ def main(argv: list[str], again: bool = False) -> None:
     if missed := _cold(out):
         if again:
             raise ValueError(
-                f"{', '.join(missed)} autotuned kernels again on a second start; "
+                f"{', '.join(missed)} missed inductor caches again on a second start; "
                 "non_torch on a cold inductor cache reads high, so nothing is published"
             )
         # The configs inductor's autotuning tried stay loaded and read in
@@ -164,33 +174,22 @@ def main(argv: list[str], again: bool = False) -> None:
     (out / "engine.json").write_text(json.dumps(first["engine"]))
     identified = identity(out / "engine.json", model, sys.argv, args.gpu)
     _write_whole(out / "run.json", json.dumps(identified))
-    publish(out, machine, args.store, " ".join([PROG, *argv]), identified["stack"])
+    publish(out, machine, args.store, " ".join([PROG, *argv]))
 
 
 def _cold(out: Path) -> list[str]:
-    """The ranks' files in `out` whose start autotuned a kernel."""
+    """The ranks' files in `out` whose start autotuned a kernel or missed a graph."""
     return [
         p.name
         for p in sorted((out / READINGS).iterdir())
-        if json.loads(p.read_text()).get("autotuned_kernels")
+        if (read := json.loads(p.read_text())).get("autotuned_kernels")
+        or read.get("fxgraph_cache_misses")
     ]
 
 
-def publish(out: Path, machine, store: str, command: str, stack: dict) -> None:
+def publish(out: Path, machine, store: str, command: str) -> None:
     """Publish the readings the ranks wrote in `out` at their key on `machine`,
-    and write the entry's readable copy; `stack`, the stack the start ran,
-    refuses unless `machine` pins it, naming each component that differs."""
-    pinned = {c: machine.value(f"device.software_pinned_to.{c}") for c in PINNED}
-    differ = [
-        f"{c} {stack[c]!r} in the start and {pinned[c]!r} in the spec"
-        for c in PINNED
-        if stack[c] != pinned[c]
-    ]
-    if differ:
-        raise ValueError(
-            "the start ran another stack than the machine spec "
-            f"{machine.value('name')} pins: " + "; ".join(differ)
-        )
+    and write the entry's readable copy."""
     ranks = {p.name: json.loads(p.read_text()) for p in (out / READINGS).iterdir()}
     record = "sha256:" + hashlib.sha256((out / LOG).read_bytes()).hexdigest()
     for held in ranks.values():
@@ -219,7 +218,9 @@ def publish(out: Path, machine, store: str, command: str, stack: dict) -> None:
         ),
         topology=read_back(min(ranks))[1].topology,
         conditions=memory.conditions(
-            fields, **machine_spec_key(machine).values, torch=pinned["torch"]
+            fields,
+            **machine_spec_key(machine).values,
+            torch=machine.value("device.software_pinned_to.torch"),
         ),
         gates=GateState.of(),
         members=members,
