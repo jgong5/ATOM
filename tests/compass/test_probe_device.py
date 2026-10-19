@@ -48,6 +48,16 @@ def test_readings_take_the_best_shape_and_keep_the_curve_monotone():
     assert found["device.kernel_floor_s"][0] == 3e-6
 
 
+def test_fp4_takes_the_faster_library_at_each_shape():
+    gemm = RECORD["gemm"] | {
+        "fp4": {"8192x8192x8192": [2e-3], "16384x8192x8192": [3e-3]}
+    }
+    aiter = {"fp4": {"8192x8192x8192": [1e-3], "16384x8192x8192": [8e-3]}}
+    found = probe.readings(RECORD | {"gemm": gemm, "aiter": aiter})
+    assert found["fp4"] == 2 * 8192**3 / 1e-3  # aiter's, at the first shape
+    assert found["bf16"] == probe.readings(RECORD)["bf16"]
+
+
 def test_the_curve_is_at_least_every_kind_at_every_size():
     record = RECORD | {
         "read": {"4096": [2e-6], "8192": [8e-6], "16384": [8e-6]},

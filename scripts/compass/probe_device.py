@@ -9,10 +9,13 @@ behind a spin kernel, so no host time is in it.
 
 - Compute: per format, the median of `REPS` GEMMs ``x @ w.T``, x m by k and
   w n by k, at each of `SHAPES`, BF16 through `torch.matmul`, FP8 through
-  `torch._scaled_mm`, and FP4 where SPEC states ``fp4_flops``: MXFP4 through
-  `torch._scaled_mm`, two values a byte and a power-of-two scale per 32 along
-  k. The best shape's rate over SPEC's ``*_flops`` is the format's derate. Each GEMM follows a spin, so the rate is a burst's: with PTL
-  enabled a sustained GEMM slows within a second or two.
+  `torch._scaled_mm`, and FP4 where SPEC states ``fp4_flops``: MXFP4, two
+  values a byte and a power-of-two scale per 32 along k, through both
+  `torch._scaled_mm` (hipBLASLt) and `aiter.gemm_a4w4` with w pre-shuffled,
+  as aiter's own tests call it. The best rate over shapes and libraries, over
+  SPEC's ``*_flops``, is the format's derate. Each GEMM follows a spin, so the
+  rate is a burst's: with PTL enabled a sustained GEMM slows within a second
+  or two.
 - Bandwidth: per kind in `KINDS` (read-only, write-only, copy) and per size
   in `SIZES` of bytes moved, a graph of up to `GRAPH` kernels through
   consecutive slices of one zeroed `2 * POOL`-byte buffer (a copy reads one
@@ -165,14 +168,28 @@ def _fp4(torch, rows: int, k: int):
     return packed.view(torch.float4_e2m1fn_x2), scales.view(torch.float8_e8m0fnu)
 
 
-def probe(torch, formats=("bf16", "fp8")) -> dict:
-    """Every sample, on visible cards 0 and 1, GEMMs in `formats`."""
+def _a4w4(x, w):
+    """aiter's MXFP4 GEMM of bf16 `x` and `w`, quantised per 1x32 with shuffled
+    scales and `w` pre-shuffled, as aiter's own tests call it."""
+    import aiter
+    from aiter.ops.shuffle import shuffle_weight
+
+    quant = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    (x4, sx), (w4, sw) = quant(x, shuffle=True), quant(w, shuffle=True)
+    w4 = shuffle_weight(w4, layout=(16, 16))
+    return partial(aiter.gemm_a4w4, x4, w4, sx, sw, bpreshuffle=True)
+
+
+def probe(torch, formats) -> dict:
+    """Every sample, on visible cards 0 and 1, GEMMs in `formats`; FP4 also
+    through aiter, under ``aiter``."""
     torch.cuda.set_device(0)
     fp8 = torch.float8_e4m3fn
     if torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx942"):
         fp8 = torch.float8_e4m3fnuz
     one = torch.ones((), device="cuda")
     gemm = {f: {} for f in formats}
+    aiter = {"fp4": {}} if "fp4" in formats else {}
     for m, n, k in SHAPES:
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
@@ -184,8 +201,11 @@ def probe(torch, formats=("bf16", "fp8")) -> dict:
         if "fp4" in formats:
             (x4, sx), (w4, sw) = _fp4(torch, m, k), _fp4(torch, n, k)
             calls["fp4"] = partial(scaled, x4, w4.T, sx, sw)
-        for f in formats:
-            gemm[f][f"{m}x{n}x{k}"] = _timed(torch, calls[f])
+        timings = [(gemm[f], calls[f]) for f in formats]
+        if aiter:
+            timings.append((aiter["fp4"], _a4w4(x, w)))
+        for samples, call in timings:
+            samples[f"{m}x{n}x{k}"] = _timed(torch, call)
             time.sleep(1)  # let a PTL card recover before the next burst
     pool = torch.zeros(2 * POOL // 4, device="cuda")
     streams = {kind: {} for kind in KINDS}
@@ -225,6 +245,7 @@ def probe(torch, formats=("bf16", "fp8")) -> dict:
         torch.cuda.synchronize(1)
     return {
         "gemm": gemm,
+        "aiter": aiter,
         **streams,
         "floor": floor,
         "link": link,
@@ -240,19 +261,21 @@ def rates(record: dict) -> dict:
 
 def readings(record: dict) -> dict:
     """The attainable values a record's samples give: each format's best
-    median rate, the running maximum over sizes of the fastest kind's median
-    rate, the link's median rate, and each banded field's median, p10 and
-    p90."""
+    median rate over shapes and libraries, the running maximum over sizes of
+    the fastest kind's median rate, the link's median rate, and each banded
+    field's median, p10 and p90."""
     med = statistics.median
 
     def band(samples):
         cut = statistics.quantiles(samples, n=10, method="inclusive")
         return [med(samples), cut[0], cut[8]]
 
+    libraries = (record["gemm"], record.get("aiter", {}))
     found = {
         f: max(
             2 * math.prod(map(int, s.split("x"))) / med(t)
-            for s, t in record["gemm"][f].items()
+            for gemm in libraries
+            for s, t in gemm.get(f, {}).items()
         )
         for f in record["gemm"]
     }
