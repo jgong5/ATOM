@@ -287,7 +287,11 @@ Method, settled by elimination:
 **Cold, by rotating copies.** The replay rotates over copies of the leaf's inputs and
 ambient state whose total exceeds the device's last-level cache, so each repeat reads cold
 data. The copies include tensors the leaf reads through module attributes: the mrope
-leaf's cos/sin caches are `rotary_emb` attributes, counted in its bytes. The prototype's
+leaf's cos/sin caches are `rotary_emb` attributes, counted in its bytes. A weight leaf
+also cycles over every weight the model holds of its spec, the population its decode step
+reads: one weight can read a few percent off another of the same spec
+([#1580](https://github.com/jgong5/ATOM/issues/1580)). Copies past the cache-sized count
+reuse that count's activations, so they hold no memory beyond the weights. The prototype's
 mrope reading, 3.3% to 11.5% under the same call timed where ATOM's decode step makes it,
 was the fixed replay cost at two call counts (above), not warm caches. The warm-over-cold ratio, the same point replayed on one copy, is reported per point
 as a diagnostic and prices nothing. The card's PTL state is read and keyed as
