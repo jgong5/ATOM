@@ -677,9 +677,8 @@ this node, in two checks: check 1, that `cctraces_sim.sh` handed the run file a
 `compass run` kept schedules the same steps; check 2, the cell graded against real
 runs. Run everything from one tree, `$T` below, in the GPU container: host laws are
 keyed by ATOM's source, so records, fits and runs from two trees refuse each other.
-The image's ATOM has no `compass` console script and no Compass, so `compass` is
-`$T/scripts/compass/compass`, from wherever it is linked, and `python -m` runs
-with `PYTHONPATH=$T`. Run both from `/`, so every path is absolute. Below, `$ATOM` is
+In the image, `compass` is `$T/scripts/compass/compass`, linked anywhere, and `python -m`
+runs with `PYTHONPATH=$T`, both from `/` so every path is absolute. Below, `$ATOM` is
 `--model <Qwen3.8-27B> --max-model-len 262144`, `$M` is `--machine
 $T/scripts/compass/machines/mi308x-hjbog39.json`, `$R` is a directory under `/data`
 or `/tmp` and `$S` is `--store $R/store`, empty at the start. The raw export keeps
@@ -725,7 +724,8 @@ which no cache directory above holds.
 
 Developer checks, outside the `compass` path:
 - After step 2: `python -m atom.compass.parity.recurrence $R/cal/c<C>/steps`.
-- Check 2, after steps 5 and 9: `python -m atom.compass.validate $R/cell/c<C>`.
+- Check 2, after steps 5 and 9: `python -m atom.compass.validate $R/cell/c<C>`;
+  after step 9 it reads the bundle from the store the run file names, by key and digest.
 - Check 1: `cctraces_sim.sh` with `RUN_FILE` the `run_file` of
    `$R/cell/c<C>/step_linear/run.json`, `FIRST_SESSION=0 SESSIONS=256
    CONCURRENCY=<C>`, `SERVER_ARGS="--max-model-len 262144"`, `AIPERF_EXTRA_ARGS` the
