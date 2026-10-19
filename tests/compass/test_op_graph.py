@@ -325,6 +325,12 @@ def test_a_gather_of_token_ids_runs_inline_on_the_compute_stream():
             False,
             r"ranks schedule \(3, 4\) rows of one micro-batch",
         ),
+        (
+            replace(SPLIT, tbo_tokens=((3, 3), (4, 2)), dp_rank=0),
+            layers(),
+            False,
+            r"ranks schedule \(4, 2\) rows of one micro-batch",
+        ),
         (SPLIT, None, False, "no op_graph holds a prefill step of 3 tokens"),
         (
             replace(SPLIT, produces_output=None),
@@ -332,8 +338,17 @@ def test_a_gather_of_token_ids_runs_inline_on_the_compute_stream():
             False,
             "does not say whether it produces output",
         ),
+        (replace(SPLIT, image_tokens=5), layers(), False, "5 image tokens"),
     ],
-    ids=["split-send-recv", "no-pair", "uneven", "uncaptured", "output-unsaid"],
+    ids=[
+        "split-send-recv",
+        "no-pair",
+        "uneven",
+        "uneven-second",
+        "uncaptured",
+        "output-unsaid",
+        "images",
+    ],
 )
 def test_a_split_step_with_no_price_is_refused_by_name(batch, graph, split, named):
     with pytest.raises(CostRefused, match=named):
@@ -355,6 +370,67 @@ def test_micro_batches_whose_graphs_exchange_unalike_are_refused():
 
     with pytest.raises(CostRefused, match="change streams 3 and 7 times"):
         OpGraphBackend(SECOND, graph, kv="bf16").price(SPLIT)
+
+
+def test_a_leaf_one_micro_batch_refuses_is_named_before_the_stream_count():
+    def graph(phase, tokens, seqs, output):
+        exchange = "atom.model_ops.moe:foo" if tokens == 3 else GATHER
+        return {"seq": [g(1, 8, 8), leaf(exchange, [[2, 8]], x=t([1, 8])), g(1, 8, 8)]}
+
+    with pytest.raises(CostRefused) as refused:
+        OpGraphBackend(SECOND, graph, kv="bf16").price(SPLIT)
+
+    assert refused.value.declined == (
+        Refusal("op-work", "no extractor for the op kind atom.model_ops.moe:foo"),
+    )
+
+
+def test_the_first_micro_batch_issues_first_on_each_stream():
+    gather = leaf(GATHER, [[2, 8]], x=t([1, 8]))
+
+    def graph(phase, tokens, seqs, output):
+        compute, exchange = {3: (1, 10), 4: (10, 1)}[tokens]
+        return {"seq": [g(1, 8, 8)] * compute + [gather] * exchange}
+
+    cost = OpGraphBackend(SECOND, graph, kv="bf16").price(SPLIT)
+
+    # The first micro-batch's long exchange hides under the second's compute:
+    # 12 seconds, against 21 issued the other way round.
+    assert by_name(cost) == {"op.tbo": 12.0}
+
+
+def test_a_mori_dispatch_with_an_unset_argument_rides_the_comm_stream():
+    dispatch = leaf(
+        f"{MORI}.dispatch",
+        [[2, 8]],
+        input=t([1, 8]),
+        weights=t([1, 2]),
+        scales=None,
+        indices=t([1, 2]),
+    )
+    region = {"seq": [g(1, 8, 8), dispatch, g(1, 8, 8)]}
+    cost = OpGraphBackend(SECOND, lambda *at: region, kv="bf16").price(SPLIT)
+
+    assert by_name(cost) == {"op.tbo": overlap([[(1, 1), (1, 1), (1, 1)]])}
+
+
+def test_an_exchange_two_pars_deep_is_refused():
+    routed = {"seq": [leaf(GATHER, [[2, 8]], x=t([1, 8])), g(1, 8, 8)]}
+    inner = {"par": [routed, g(1, 8, 8)], "join": "max"}
+    nested = {"par": [inner, g(1, 8, 8)], "join": "max"}
+
+    with pytest.raises(CostRefused, match="runs an MoE exchange beside a second"):
+        OpGraphBackend(SECOND, lambda *at: nested, kv="bf16").price(SPLIT)
+
+
+def test_a_split_step_s_note_names_the_stated_fields_of_every_price():
+    region = {"seq": [g(8192, 4096, 4096), g(1, 4096, 4096)]}
+    (term,) = backend(region, _spec("assumed")).price(SPLIT).terms
+
+    assert term.provenance.method is Method.DECLARED
+    assert [p for p in MEMORY + COMPUTE if p in term.provenance.note] == list(
+        MEMORY + COMPUTE
+    )
 
 
 # --- the published 27B -----------------------------------------------------------
