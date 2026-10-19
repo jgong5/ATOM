@@ -360,9 +360,10 @@ the time `p` after it to its exit, and the payload of send `n`:
    `t0 + c`, is released during this TAR, which is the common case.
 2. If that send took an ack and its ack is not yet released, the loop receives it
    inline: NER until the grant releases `(pp_ack, n-1)`, its clock reaching `done`. A
-   loop that blocked there for `b` goes on `wake_s x (1 - exp(-b / wake_rise_s))` later,
-   gloo's wake: a host blocked on a gloo wait wakes later the longer it blocked
-   (#1451). If it
+   loop that blocked there goes on `wake_s x (1 - exp(-b / wake_rise_s))` later,
+   gloo's wake, `b` the time from send `n-2`'s gloo completion, which the ack carries,
+   to `done`: a host blocked on a gloo wait wakes later the longer the pair carried
+   nothing, however briefly it blocked (#1451, #1476). If it
    was eager, `advance_to` its local completion when that is later than now.
 3. The loop issues send `n` at `t_send`, its clock, now past `done`, its tensors
    leaving at `e`, and registers `(pp_data, n)` (K4), noting whether it is eager (a local completion) or rendezvous (an ack to receive).
@@ -436,7 +437,11 @@ part's receive only when the previous part is done. With `r_1 = t_recv_posted` a
   later, and ends on both sides at `a_i = max(s_i, r_i - E × G) + T`, `E` its carrier's threshold;
 - the next receive is posted at `r_(i+1) = a_i + g_i`, where `g_i` is the TP-wide
   all-gather that the receiving stage runs right after receiving a sharded tensor (an
-  ordinary priced collective on the receiver's time), else 0.
+  ordinary priced collective on the receiver's time), else 0. The receiving worker's cost
+  backend prices it (`all_gather_s`, per gathered row; the step stub charges its
+  collective coefficient once per row). A PP run at TP above 1 with
+  `ATOM_PP_SEND_ALLGATHER` on whose backend prices no all-gather is refused by name when
+  the worker installs it ([#1182](https://github.com/jgong5/ATOM/issues/1182)).
 
 The receive ends at the last part's `a_i + g_i`. The send takes an ack when any gloo part
 is rendezvous, and `done` is the latest sender-side completion over its gloo parts, the

@@ -14,9 +14,11 @@ server sent it, the id the step record names it by; its trace is its
 ``conversation_id`` up to any ``::``, which aiperf's trace loader appends to
 name the conversations it derives from one trace; and its request parameters
 are its payload less the prompt, the model, the output length and the stream's
-framing. A request that got no response id, failing before its first chunk,
-names nothing and is counted. ``traces`` names every trace aiperf was given:
-the ``id`` of each weka trace its input config's dataset holds, a file or each
+framing. A request that got no response id, cancelled or failed before its
+first chunk, is listed under ``unnamed`` by its ``x_request_id``, phase and
+trace, so a reader knows which requests aiperf sent the export cannot name.
+``traces`` names every trace aiperf was given: the ``id`` of each weka trace
+its input config's dataset holds, a file or each
 ``*.json`` of a directory, as aiperf's weka trace loader reads them. Which of
 them a run's finished requests came from moves with its schedule, since aiperf
 records nothing of a request in flight at its cutoff. ``sessions`` gives each
@@ -114,7 +116,7 @@ def arguments(artifacts) -> dict:
 def write(artifacts) -> tuple[Path, dict, int]:
     """Write `artifacts`' export; its path, the export, and how many requests
     got no response id."""
-    artifacts, named, unnamed = Path(artifacts), {PROFILING: {}, WARMUP: {}}, 0
+    artifacts, named, unnamed = Path(artifacts), {PROFILING: {}, WARMUP: {}}, []
     for line in (artifacts / RAW).read_text().splitlines():
         record = json.loads(line)
         meta = record["metadata"]
@@ -123,19 +125,26 @@ def write(artifacts) -> tuple[Path, dict, int]:
                 f"request {meta.get('x_request_id')} is in phase "
                 f"{meta['benchmark_phase']!r}, neither {WARMUP} nor {PROFILING}"
             )
-        rid = response_id(record.get("responses"))
-        if rid is None:
-            unnamed += 1
-            continue
-        if rid in named[PROFILING] or rid in named[WARMUP]:
-            raise ValueError(f"two requests got response id {rid}")
         if not meta.get("conversation_id"):
             raise ValueError(
                 f"request {meta.get('x_request_id')} has no conversation_id, "
                 "so no trace"
             )
+        trace = meta["conversation_id"].split("::", 1)[0]
+        rid = response_id(record.get("responses"))
+        if rid is None:
+            unnamed.append(
+                {
+                    "x_request_id": meta.get("x_request_id"),
+                    "phase": meta["benchmark_phase"],
+                    "trace": trace,
+                }
+            )
+            continue
+        if rid in named[PROFILING] or rid in named[WARMUP]:
+            raise ValueError(f"two requests got response id {rid}")
         named[meta["benchmark_phase"]][rid] = {
-            "trace": meta["conversation_id"].split("::", 1)[0],
+            "trace": trace,
             "sampling": {
                 k: v for k, v in record["payload"].items() if k not in NOT_SAMPLING
             },
@@ -144,13 +153,14 @@ def write(artifacts) -> tuple[Path, dict, int]:
     export = {
         "requests": named[PROFILING],
         "warmup": named[WARMUP],
+        "unnamed": unnamed,
         "traces": sorted(traces),
         "sessions": {t: s for t, s in traces.items() if s is not None},
         "arguments": arguments(artifacts),
     }
     path = artifacts / NAME
     path.write_text(json.dumps(export, sort_keys=True))
-    return path, export, unnamed
+    return path, export, len(unnamed)
 
 
 if __name__ == "__main__":

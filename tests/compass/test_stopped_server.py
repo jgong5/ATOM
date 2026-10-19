@@ -22,7 +22,6 @@ import json
 import math
 import os
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -38,6 +37,7 @@ from atom.compass import clock_transport
 from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
 from atom.compass.clock import LpId, single_engine_table
+from atom.compass.drive.serve import _free_ports
 from atom.utils import clock
 from atom.utils.clock import LPRuntime, WrappedSocket
 from atom.utils.compass_loop import CompassEventLoop
@@ -152,12 +152,6 @@ print("frontend_done:", compass_run.frontend_done(SimpleNamespace(close=lambda: 
 """
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _answers(port: int) -> bool:
     try:
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -173,10 +167,11 @@ def _serve(tmp_path, script, *argv):
     of its own, once ``/health`` answers: its process, port and log. Leaving
     kills what is left of its process group."""
     run_file = tmp_path / "run.json"
+    clock_port, port = _free_ports(2)
     run_file.write_text(
         json.dumps(
             {
-                "clock_endpoint": f"tcp://127.0.0.1:{_free_port()}",
+                "clock_endpoint": f"tcp://127.0.0.1:{clock_port}",
                 "bound_s": 100.0,
                 "admission_path": "serving",
                 "ipc_s": 2.0**-10,
@@ -185,7 +180,6 @@ def _serve(tmp_path, script, *argv):
             }
         )
     )
-    port = _free_port()
     env = dict(os.environ, PYTHONPATH=str(TREE), **{compass_run.ENV: str(run_file)})
     log = tmp_path / "server.log"
     with log.open("w") as sink:

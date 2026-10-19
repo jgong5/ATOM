@@ -2,10 +2,11 @@
 """Start one ATOM instance's API server, real or simulated, and serve until the
 command is stopped or the server exits.
 
-A server handed a run file is simulated, and co-hosts its clock authority. One
-without a run file is real, on the GPUs the command names, which `gpu.quiet`
-checks before the server starts and after it stops. ATOM's arguments pass
-verbatim; the driver assigns the host, its ports and the run file, and
+A server handed a run file is simulated, and co-hosts its clock authority
+unless it joins one its run file names. One without a run file is real, on the
+GPUs the command names, which `gpu.quiet` checks before the server starts and
+after it stops. ATOM's arguments pass verbatim; the driver assigns the host,
+127.0.0.1 unless the command names another, its ports and the run file, and
 refuses them, and the clock endpoint flag, among ATOM's arguments. Each start
 takes a free `ATOM_DP_MASTER_PORT`: the port keys ATOM's compiled-graph cache,
 and the first start that loads that cache autotunes every graph's kernels
@@ -71,17 +72,22 @@ class ServeError(ValueError):
     `ValueError`, so the console script exits with its message."""
 
 
-def serve(atom_args, out, gpus=(), run=None, extra_env=None) -> None:
+def serve(
+    atom_args, out, gpus=(), run=None, extra_env=None, host=HOST, joined=False
+) -> None:
     """Serve one instance from ATOM's arguments `atom_args`, writing to the
     directory `out`, until SIGINT or SIGTERM or the server's exit.
 
     A real server names its GPUs in `gpus`; a simulated one is handed `run`,
     the run file's mapping, whose ``out_dir`` and ``clock_endpoint`` are set
-    here. `extra_env` maps variables the server's environment holds over the
-    command's. Raises `ServeError` when the server exits before ``/health``
-    answers, or on its own with a non-zero status, and `GpuRefusal` from the
-    GPU checks. Once the server has stopped, writes run.json from the engine
-    file, and raises `ServeError` when no step wrote one.
+    here, or, `joined`, kept: the server joins the authority its
+    ``clock_endpoint`` names, which reads the hand-ins in its ``out_dir``. The
+    server binds `host`, which its URL names. `extra_env` maps variables the
+    server's environment holds over the command's. Raises `ServeError` when
+    the server exits before ``/health`` answers, or on its own with a non-zero
+    status, and `GpuRefusal` from the GPU checks. Once the server has stopped,
+    writes run.json from the engine file, and raises `ServeError` when no step
+    wrote one.
     """
     _refuse(atom_args)
     model = _model(atom_args)
@@ -94,10 +100,10 @@ def serve(atom_args, out, gpus=(), run=None, extra_env=None) -> None:
     if out.exists() and any(out.iterdir()):
         raise ServeError(f"{out} holds an earlier run's files; one run per directory")
     out.mkdir(parents=True, exist_ok=True)
-    server_port, engine_port, clock_port, dp_port = _free_ports(4)
-    argv = [*SERVER, *KEEP_ALIVE, *atom_args, "--host", HOST]
+    server_port, engine_port, clock_port, dp_port = _free_ports(4, host)
+    argv = [*SERVER, *KEEP_ALIVE, *atom_args, "--host", host]
     argv += ["--server-port", str(server_port), "--port", str(engine_port)]
-    ready = {"url": f"http://{HOST}:{server_port}"}
+    ready = {"url": f"http://{host}:{server_port}"}
     # Nor can the environment hand the server a run file or a clock.
     env = {**os.environ, **(extra_env or {})}
     env = {k: v for k, v in env.items() if k not in (ENV, CLOCK_ENV)}
@@ -109,11 +115,15 @@ def serve(atom_args, out, gpus=(), run=None, extra_env=None) -> None:
     if run is None:
         env["HIP_VISIBLE_DEVICES"] = hip_visible(gpus)
     else:
-        endpoint, run_file = f"tcp://{HOST}:{clock_port}", out / RUN_FILE
-        run = {**run, "out_dir": str(out), "clock_endpoint": endpoint}
+        run_file = out / RUN_FILE
+        if joined:
+            argv += ["--compass-clock-endpoint", run["clock_endpoint"]]
+        else:
+            endpoint = f"tcp://{host}:{clock_port}"
+            run = {**run, "out_dir": str(out), "clock_endpoint": endpoint}
         run_file.write_text(json.dumps(run))
         argv += ["--compass-run", str(run_file)]
-        ready |= {"clock_endpoint": endpoint, "run_file": str(run_file)}
+        ready |= {"clock_endpoint": run["clock_endpoint"], "run_file": str(run_file)}
     with _stop_signals() as stopped, quiet(gpus, out) if gpus else nullcontext():
         with (out / LOG_FILE).open("w") as log:
             server = subprocess.Popen(
@@ -124,7 +134,7 @@ def serve(atom_args, out, gpus=(), run=None, extra_env=None) -> None:
                 start_new_session=True,
             )
         try:
-            while not (stopped or _answers(server_port)):
+            while not (stopped or _answers(host, server_port)):
                 if server.poll() is not None:
                     raise ServeError(
                         f"the server exited {server.returncode} before /health "
@@ -176,21 +186,21 @@ def _refuse(atom_args) -> None:
             raise ServeError(f"{arg} profiles the server, and only a profiled pass may")
 
 
-def _free_ports(n: int) -> list[int]:
-    """`n` free ports, bound together so no two are the same."""
+def _free_ports(n: int, host: str = HOST) -> list[int]:
+    """`n` free ports on `host`, bound together so no two are the same."""
     socks = [socket.socket() for _ in range(n)]
     try:
         for s in socks:
-            s.bind((HOST, 0))
+            s.bind((host, 0))
         return [s.getsockname()[1] for s in socks]
     finally:
         for s in socks:
             s.close()
 
 
-def _answers(port: int) -> bool:
+def _answers(host: str, port: int) -> bool:
     """Whether the server's ``/health`` answers 200."""
-    conn = http.client.HTTPConnection(HOST, port, timeout=5)
+    conn = http.client.HTTPConnection(host, port, timeout=5)
     try:
         conn.request("GET", "/health")
         return conn.getresponse().status == 200

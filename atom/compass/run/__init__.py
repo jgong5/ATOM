@@ -64,7 +64,10 @@ priced by `StepStubBackend`), ``step_linear`` (a `StepLinearLaw` mapping,
 priced by `StepLinearBackend`; its ``machine_spec`` digest and
 its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, and a law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
-bundle's key, priced by `StepGridBackend`; see `step_grid`),
+bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
+(``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
+holds at its shape, the run's TP width and KV cache format; capture traces
+eager forwards, so a graph-mode run reads the eager graphs too),
 ``step_roofline`` (optional, ``true`` or ``false``: with ``true`` a
 `StepRooflineBackend` prices the steps the backend refuses, through
 `StepFallbackBackend`, as it always does under ``step_grid``, from the
@@ -276,6 +279,7 @@ COMPASS_ONLY = {
 }
 #: The run-file key of each backend a flag names (`atom.compass.drive.runfile`).
 STEP_STUB, STEP_LINEAR, STEP_GRID = "step_stub", "step_linear", "step_grid"
+OP_GRAPH = "op_graph"
 #: The run-file key of the frontend's seconds to prepare one image of a chat request.
 IMAGE_PREPROCESS = "image_preprocess_s"
 #: Run-file keys that were renamed, to their names now.
@@ -951,15 +955,6 @@ def frontend(config):
             f"and the run file's pipeline_parallel_size is {_pp(run)}; the "
             "channel table every LP reads would declare the wrong stages"
         )
-    if config.pipeline_parallel_size > 1 and config.tensor_parallel_size > 1:
-        from atom.utils import envs
-
-        if envs.ATOM_PP_SEND_ALLGATHER:
-            raise ValueError(
-                "a pipeline stage at TP above 1 sends its shard of each tensor and "
-                "the next stage all-gathers it, which nothing prices; set "
-                "ATOM_PP_SEND_ALLGATHER=0"
-            )
     atom_runner, ours = ATOM_RUNNER, COMPASS_RUNNER_QUALNAME
     if rapid:
         atom_runner, ours = RAPIDSERVE_RUNNER, COMPASS_RAPIDSERVE_QUALNAME
@@ -1259,7 +1254,7 @@ def runner(model_runner, tree) -> None:
             from atom.compass.run.step_grid import keyed
 
             run[name] = _fitted_here(run[name], keyed(config), engine, name)
-    backends = (STEP_STUB, STEP_LINEAR, STEP_GRID)
+    backends = (STEP_STUB, STEP_LINEAR, STEP_GRID, OP_GRAPH)
     keys = [k for k in backends if k in run]
     if len(keys) != 1:
         raise ValueError(
@@ -1389,11 +1384,36 @@ def runner(model_runner, tree) -> None:
             "replayed graph's real rows, or executed or absent, which prices the "
             "rows it pads to"
         )
+    if OP_GRAPH in run:
+        if run[OP_GRAPH] is not True:
+            raise TypeError(
+                f"the run file's op_graph is {run[OP_GRAPH]!r}; it is true, which "
+                "prices each step from the op_graph the store holds at its shape"
+            )
+        from atom.compass.backends.op_graph import OpGraphBackend
+
+        backend = OpGraphBackend(
+            machine,
+            _op_graphs(run["store"], config, machine.value("device.arch")),
+            tp=tp,
+            kv=config.kv_cache_dtype,
+            padded=padding != "none",
+        )
     if fallback or STEP_GRID in run:
         from atom.compass.run.modules import walk
 
         roofline = StepRooflineBackend(machine, walk(tree), padded=padding != "none")
         backend = StepFallbackBackend(backend, roofline)
+    pp = getattr(config, "pipeline_parallel_size", 1)
+    if pp > 1 and tp > 1 and not hasattr(backend, "all_gather_s"):
+        from atom.utils import envs
+
+        if envs.ATOM_PP_SEND_ALLGATHER:
+            raise ValueError(
+                "a pipeline stage at TP above 1 all-gathers each sharded tensor it "
+                f"receives, and {type(backend).__name__} prices no all-gather; "
+                "set ATOM_PP_SEND_ALLGATHER=0"
+            )
     install_cost_backend(model_runner, backend)
     if NOW_ENV in os.environ:
         now = Path(os.environ[NOW_ENV])
@@ -1422,12 +1442,15 @@ def runner(model_runner, tree) -> None:
         mtp = bool(getattr(config, "speculative_config", None)) and (
             model_runner.tokenID_processor.is_deferred_out
         )
+        # RapidServe's prefill_forward synchronizes its stream before it returns.
+        rapid = getattr(config, "enable_rapidserve", False)
         model_runner.compass_host = replay or HostDeviceRecurrence(
             host.get("laws", {}),
             host.get("skip", ()),
             lambda: float(slot[0]),
             stage,
             mtp=mtp,
+            sync=rapid and not config.disagg_is_decode,
         )
         if replay is not None:
             replay.now = lambda: float(slot[0])
@@ -1451,6 +1474,27 @@ def runner(model_runner, tree) -> None:
     model_runner.compass_memory = record(readings, tokens=warmup, memory=measured)
     if bundle is not None:
         model_runner.compass_step_grid = {**bundle, "describe": backend.describe()}
+
+
+def _op_graphs(root: str, config, arch: str):
+    """The region of the eager `op_graph` of `config` on an `arch` device the
+    store at `root` holds at a shape, or None."""
+    from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
+    from atom.compass.capture.forward import Shape, structure
+
+    store, rank = ArtifactStore(root), Topology().ranks()[0]
+
+    @functools.lru_cache(maxsize=64)
+    def graph(phase: str, tokens: int, seqs: int) -> dict | None:
+        shape = str(Shape(phase, tokens, seqs))
+        key = Key.of(
+            Kind.OP_GRAPH, structure=structure(config, phase, True, arch), shape=shape
+        )
+        if not store.directory_for(key).exists():
+            return None
+        return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
+
+    return graph
 
 
 def _graph_pool(model_runner, machine, model):

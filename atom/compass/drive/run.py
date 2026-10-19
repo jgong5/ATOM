@@ -6,12 +6,20 @@ reach it until it is stopped, with run.json recording what grading reads.
         [--coverage INPUT...] [--on-refusal mark|abort] [--step-roofline]
         [--acceptance-record RECORD] --out D -- <ATOM args>
 
+    compass run --join RUN_FILE --out D -- <ATOM args>
+
 `runfile` builds the run file from the flags, the backend exactly one with no
 default, and `serve` starts the server simulated from it with the step record
 on. `--out` holds what `serve` writes and what the run writes there: each DP
 rank's step record and cost lines, the step table, the run summary and each
-LP's hand-in. A prefill or a decode instance refuses: it shares a clock with
-its peer, which one invocation does not start.
+LP's hand-in.
+
+`--join` names a deployment's run file in place of every flag but `--out`: the
+server joins the clock authority its ``clock_endpoint`` names, which writes the
+step table, the run summary and the hand-ins in its ``out_dir``, and grading
+reads them there. `scripts/compass/deploy.sh` builds that file, starts the
+authority and joins each instance to it. A prefill or a decode instance shares a
+clock with its peer, so it refuses without `--join`.
 
 `--coverage` names record directories and `shape_population` tokens whose steps
 the backend's coverage check reads before the server starts: the step grid's
@@ -60,23 +68,29 @@ SHAPING = (*BOUNDS, "ladder", "tensor_parallel_size")
 
 def main(argv: list[str]) -> None:
     cut = argv.index("--") if "--" in argv else len(argv)
-    args = _parser().parse_args(argv[:cut])
     atom_args = argv[cut + 1 :]
+    transfer = runfile._engine_args(atom_args).kv_transfer_config
+    side = compass_run._pd_side(
+        SimpleNamespace(kv_transfer_config=json.loads(transfer))
+    )
+    joining = argparse.ArgumentParser(prog=PROG, add_help=False)
+    joining.add_argument("--join")
+    if joining.parse_known_args(argv[:cut])[0].join:
+        join(_joining_parser().parse_args(argv[:cut]), atom_args, side)
+        return
+    args = _parser().parse_args(argv[:cut])
     if args.coverage and not getattr(args, STEP_GRID):
         key = next(k for k in (STEP_STUB, STEP_LINEAR) if getattr(args, k))
         raise ValueError(
             f"--coverage: --{key.replace('_', '-')} has no coverage check; only "
             "--step-grid's steps are checked"
         )
-    transfer = runfile._engine_args(atom_args).kv_transfer_config
-    side = compass_run._pd_side(
-        SimpleNamespace(kv_transfer_config=json.loads(transfer))
-    )
     if side is not None:
         raise ValueError(
             f"--kv-transfer-config {transfer} makes this a "
             f"{'prefill' if side == 'P' else 'decode'} instance, which shares a "
-            "clock with its peer; run starts one aggregated instance"
+            "clock with its peer: join its deployment's authority with --join, as "
+            "scripts/compass/deploy.sh does"
         )
     run = runfile.build(args, atom_args)
     if record := args.acceptance_record:
@@ -90,6 +104,26 @@ def main(argv: list[str]) -> None:
     report = check(args.coverage, run, atom_args) if args.coverage else None
     serve.serve(atom_args, args.out, run=run)
     write_grading(args.out, report)
+
+
+def join(args, atom_args, side) -> None:
+    """Serve one instance of a deployment whose authority already runs, from
+    its run file `args.join`, and record what grading reads for its `side`."""
+    run = json.loads(Path(args.join).read_text())
+    if not {"clock_endpoint", "out_dir"} <= run.keys():
+        raise ValueError(
+            f"--join {args.join} names no clock_endpoint and out_dir; a "
+            "deployment's run file names its authority and its directory"
+        )
+    serve.serve(atom_args, args.out, run=run, joined=True)
+    write_grading(args.out, None, side)
+
+
+def _joining_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n\n")[0])
+    p.add_argument("--join", required=True, metavar="RUN_FILE")
+    p.add_argument("--out", required=True, help="an empty directory for its files")
+    return p
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -211,14 +245,18 @@ def _config(atom_args):
     return Config(engine.model, **{k: v for k, v in kwargs if k in names})
 
 
-def write_grading(out, report) -> None:
+def write_grading(out, report, side=None) -> None:
     """Add what grading reads to the run.json of `out`, a stopped server's
-    directory, the coverage check's `report` among it."""
+    directory, the coverage check's `report` among it: from the run summary
+    and hand-ins in its run file's ``out_dir``, its own engine's of a
+    deployment's prefill (`side` ``P``) or decode (``D``) instance."""
     out = Path(out)
     run = json.loads((out / serve.RUN_FILE).read_text())
-    first = out / compass_run.CLIENT_DIR.format(0) / compass_run.SUMMARY_FILE
+    where = Path(run.get("out_dir", out))
+    first = where / compass_run.CLIENT_DIR.format(0) / compass_run.SUMMARY_FILE
     written = json.loads((out / serve.RUN_JSON).read_text())
-    engines = out.glob(compass_run.LP_FILE.format("engine*"))
+    engine = compass_run.ENGINE.name + (f"-{side}" if side else "")
+    engines = where.glob(compass_run.LP_FILE.format(f"{engine}*"))
     memory = [json.loads(p.read_text()).get("memory") or {} for p in engines]
     assumed = sorted({m["assumed"] for m in memory if m.get("assumed")})
     written |= {

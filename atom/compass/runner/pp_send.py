@@ -13,6 +13,9 @@ posts each part's receive when the part before it has arrived. The ``gloo``
 parts leave at ``t_send``, the sender's host send; the ``rccl`` parts at
 ``t_ready``, when the sender's device work ends, or when the previous send's
 ``rccl`` parts are done, whichever is later; their receive waits for the receiver's device end.
+At TP above 1 a tensor sent as its shard is a part ``(carrier, bytes, True)``:
+the receiver all-gathers it over its TP group before it posts the next
+part's receive.
 
 `StageSends` is the stage loop's side. Before a downstream stage's forward it
 receives that forward's input on ``pp_data``, the call and the metadata's arrival
@@ -20,8 +23,10 @@ as the batch's ``compass_pp_host`` and
 the tensors' as the batch's ``compass_pp_release``, and, when the ``gloo`` parts
 are rendezvous, returns their completion, and the ``rccl`` parts', on ``pp_ack`` stamped at it; at a
 non-last stage's forward's launch end it waits for its previous send's ``gloo``
-parts, then sends. A host that blocked on them for ``b`` seconds wakes
-``wake_s x (1 - exp(-b / wake_rise_s))`` after they complete, gloo's wake.
+parts, then sends. A host that blocked on them wakes
+``wake_s x (1 - exp(-b / wake_rise_s))`` after they complete, gloo's wake,
+``b`` the time since the send before them completed: the pair's idle, not
+the block.
 The ``rccl`` parts hold the sender's stream, not its host: its
 forwards after that wait start their device work no earlier. An idle
 flush waits for the previous send the same way. The frames move between the
@@ -84,21 +89,22 @@ def gloo_wake(spec) -> tuple[float, float]:
     return tuple(spec.value(f"{PREFIX}.gloo.{f}") for f in ("wake_s", "wake_rise_s"))
 
 
-def woken(wake, block: float) -> float:
-    """How long after its gloo parts complete a host that blocked on them for
-    `block` seconds goes on."""
-    return wake[0] * -math.expm1(-block / wake[1]) if block > 0 else 0.0
+def woken(wake, idle: float) -> float:
+    """How long after its gloo parts complete a host blocked on them goes on,
+    the pair having carried nothing for `idle` seconds before."""
+    return wake[0] * -math.expm1(-idle / wake[1]) if idle > 0 else 0.0
 
 
 def is_rendezvous(models, parts) -> bool:
-    return any(not models[c].eager(n) for c, n in parts)
+    return any(not models[c].eager(n) for c, n, *_ in parts)
 
 
-def recv_done(models, t_send: float, t_recv_posted: float, parts):
+def recv_done(models, t_send: float, t_recv_posted: float, parts, gather=0.0):
     """``(done, end)``: the send's latest sender-side completion, and the
-    receive's end, folding the parts in the receiver's order."""
+    receive's end, folding the parts in the receiver's order; a sharded part's
+    all-gather takes `gather` seconds after it arrives."""
     r, done = t_recv_posted, -math.inf
-    for c, n in parts:
+    for c, n, *sharded in parts:
         m = models[c]
         if m.eager(n):
             sent = t_send + m.overhead_s + n * m.per_byte_s
@@ -108,6 +114,8 @@ def recv_done(models, t_send: float, t_recv_posted: float, parts):
             pushed = m.eager_threshold_bytes * m.per_byte_s
             r = max(t_send, done, r - pushed) + m.rendezvous_s(n)
             done = max(done, r)
+        if sharded:
+            r += gather
     return done, r
 
 
@@ -146,6 +154,7 @@ class StageSends:
         self.pending = None  # the last send: ("ack", seq, _) or ("eager", done, held)
         self.tensors_done = -math.inf  # the previous frame received's rccl parts
         self.held = -math.inf  # the rccl parts' end of the send last waited for
+        self.acked = -math.inf  # the gloo parts' end of the send last acked
 
     def __call__(self, name, *args, wait_out=False):
         if not self.rt.in_run or name not in ("forward", "flush_pp_send"):
@@ -182,7 +191,8 @@ class StageSends:
     def receive(self, batch) -> tuple:
         """``(called, meta)`` and the tensors' arrival, posted at `batch`'s prepare end.
         The tensors wait for the stage's device end, and leave once the previous
-        frame's are done: one stream sends both."""
+        frame's are done: one stream sends both. Each sharded tensor's
+        all-gather is priced by the worker's cost backend."""
         from atom.compass.runner.overrides import forward_shape
 
         seq, called = self.received, self.rt.now
@@ -194,9 +204,13 @@ class StageSends:
         sent, meta = recv_done(self.models, frame["t_send"], posted, gloo)
         ready = max(frame["t_ready"], self.tensors_done)
         posted = max(meta, device, self.held)
-        self.tensors_done, end = recv_done(self.models, ready, posted, tensors)
+        gather = 0.0
+        if any(len(p) > 2 for p in tensors):
+            rows = batch.total_tokens_num
+            gather = self.call("pp_all_gather_s", rows, wait_out=True)
+        self.tensors_done, end = recv_done(self.models, ready, posted, tensors, gather)
         if is_rendezvous(self.models, gloo):
-            ack = {"seq": seq, "tensors_done": self.tensors_done}
+            ack = {"seq": seq, "tensors_done": self.tensors_done, "gloo_done": sent}
             self.call("send_pp_frame", "pp_ack", ack, wait_out=True)
             self.rt.stamp_send(self.ack_out, sent)
         return (called, meta), end
@@ -229,9 +243,10 @@ class StageSends:
             return
         kind, at, self.held = pending
         if kind == "ack":
-            entry = self.rt.now
-            self.held = self._frame("pp_ack", self.ack_in, at)["tensors_done"]
-            if late := woken(self.wake, self.rt.now - entry):
+            entry, last = self.rt.now, self.acked
+            ack = self._frame("pp_ack", self.ack_in, at)
+            self.held, self.acked = ack["tensors_done"], ack["gloo_done"]
+            if self.rt.now > entry and (late := woken(self.wake, self.acked - last)):
                 self.rt.advance_to(self.rt.now + late)
         elif at > self.rt.now:
             self.rt.advance_to(at)
