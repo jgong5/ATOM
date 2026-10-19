@@ -144,16 +144,16 @@ plus 1800 s; the warmup grows to about 36 min at c=256.
 **3. Real runs** (GPU; 3 h 20 min for ten on two GPUs, about 6 h 40 min on one).
 
 ```bash
-for k in 1 2; do for C in 1 4 16 64 256; do
-  serve $R/cell/c$C/real$k 0-255 $C $REAL_PY record --gpu $G
-done; done
+for C in 1 4 16 64 256; do serve $R/cell/c$C/real1 0-255 $C $REAL_PY record --gpu $G; done
+for C in 256 64 16 4 1; do serve $R/cell/c$C/real2 0-255 $C $REAL_PY record --gpu $G; done
 ```
 
 Each graded run is a fresh server: a second client run would meet the prefix
-cache the first left. The loop spaces the two runs of one concurrency apart;
-back-to-back repeats understate the real spread every metric is judged against.
-On two GPUs, run the `k=1` and `k=2` loops at once, each with its own `$G`; no
-more than two at once, since real runs time the host. Success as in step 2.
+cache the first left. The two loops take the concurrencies in opposite orders,
+so the two runs of one concurrency are spaced apart; repeats run back to back
+understate the real spread every metric is judged against. On two GPUs, run the
+two loops at once, each with its own `$G`; no more than two real runs at once,
+since real runs time the host. Success as in step 2.
 
 **4. Fit** (CPU, under a minute each).
 

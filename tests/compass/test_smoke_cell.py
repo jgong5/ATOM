@@ -79,16 +79,18 @@ def _smoke(tmp_path, use="0", stamp=True, **env):
         "Allocated (VRAM%%): 0\\nGPU[6]\\t\\t: GPU use (%%): 9\\n'\n"
     )
     (bindir / "rocm-smi").chmod(0o755)
-    env = dict(
-        os.environ,
-        PATH=f"{bindir}:{Path(sys.executable).parent}:{os.environ['PATH']}",
-        LOG=str(tmp_path / "log"),
-        GPU="7",
-        MACHINE=str(tmp_path / "spec.json"),
-        TRACES="/cc/traces.jsonl",
-        HARNESS_PYTHON="/sim/python",
-        AIPERF_PYTHON="/real/python",
-        **env,
+    env = (
+        dict(
+            os.environ,
+            PATH=f"{bindir}:{Path(sys.executable).parent}:{os.environ['PATH']}",
+            LOG=str(tmp_path / "log"),
+            GPU="7",
+            MACHINE=str(tmp_path / "spec.json"),
+            TRACES="/cc/traces.jsonl",
+            HARNESS_PYTHON="/sim/python",
+            AIPERF_PYTHON="/real/python",
+        )
+        | env
     )
     r = subprocess.run(
         ["bash", str(scripts / "smoke_cell.sh"), str(tmp_path / "m"), "o"],
@@ -157,6 +159,14 @@ def test_a_cell_that_is_a_coverage_report_fails_its_grade(tmp_path):
     r, _, _ = _smoke(tmp_path, VERDICT="coverage report")
     assert r.returncode == 1
     assert "step grade failed: the cell is coverage report, not graded" in r.stderr
+
+
+@pytest.mark.parametrize("gpu", ["", "7,6", "x"])
+def test_a_gpu_that_is_not_one_rocm_smi_index_runs_nothing(tmp_path, gpu):
+    r, log, _ = _smoke(tmp_path, GPU=gpu)
+    assert r.returncode == 1
+    assert "smoke_cell: step gpu failed: GPU names one GPU" in r.stderr
+    assert log == []
 
 
 def test_a_tree_neither_git_nor_snapshot_runs_nothing(tmp_path):
