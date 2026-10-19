@@ -251,7 +251,8 @@ WALK = """
 import json, os, sys, torch
 from types import SimpleNamespace
 from atom.compass.capture import driverless
-driverless.install(1, sys.argv[1])
+driverless.install(sys.argv[1], "gfx950")
+driverless.group(1, 1)
 from atom.model_ops.fused_moe import mori_prepare_finalize as mori
 from atom.compass.run.modules import walk
 
@@ -342,7 +343,8 @@ BUILD = """
 import json, pathlib, sys, torch
 ep, root = sys.argv[1] == "1", pathlib.Path(sys.argv[2])
 from atom.compass.capture import driverless
-driverless.install(1, str(root))
+driverless.install(str(root), "gfx950")
+driverless.group(1, 1)
 from atom.config import Config, set_current_atom_config
 config = Config(model=str(root / "model"), tensor_parallel_size=1, load_dummy="empty",
                 enable_dp_attention=True, dp_logical_size=8, enable_expert_parallel=ep,
@@ -366,9 +368,9 @@ print(json.dumps(found))
 def test_the_v4_pro_dpa_tp8_build_classifies_every_module(ep, tmp_path):
     (tmp_path / "model").mkdir()
     (tmp_path / "model" / "config.json").write_bytes(CONFIG.read_bytes())
-    # The declared device is an MI308X, whose EP-off default is a Triton MoE
-    # layout the meta build cannot lay out; the MI355X deployment runs aiter's.
-    env = {**os.environ, "PYTHONPATH": str(TREE), "ATOM_USE_TRITON_MOE": "0"}
+    # The declared device is the MI355X the cells run on, so ATOM takes its
+    # own gfx950 MoE default, aiter's, which the meta build can lay out.
+    env = {**os.environ, "PYTHONPATH": str(TREE)}
     done = subprocess.run(
         [sys.executable, "-c", BUILD, str(int(ep)), str(tmp_path)],
         capture_output=True,
