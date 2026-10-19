@@ -43,8 +43,8 @@ blocks and state slots of its own, for which ATOM builds the forward context
 again. A second graph runs copy 0 K times, warm; with one copy there is none.
 Each graph is replayed `WARMUPS` times, then `REPEATS` times timed;
 a repeat is the replay's device time over K, and a graph that captured no
-kernel times 0. The kernels one eager call of copy 0 launches are the point's
-kernel identity. A batch the KV pool cannot place refuses its leaves.
+kernel times 0. The kernels one eager call of copy 0 launches, memory copies
+aside, are the point's kernel identity. A batch the KV pool cannot place refuses its leaves.
 
 DIR gets run.json, the run's identity, and ops.jsonl, one line per point. S
 gets each measured point as an `op_measurement`, keyed by the model, the
@@ -589,14 +589,19 @@ def _function(name: str):
 
 
 def _kernels(fn, kwargs) -> list[str]:
-    """The device activity one call of `fn` launches, in order."""
+    """The kernels one call of `fn` launches, in order: its device activity
+    except memory copies, which the profiler records at some calls of a leaf
+    and misses at others."""
     from torch.profiler import ProfilerActivity, profile
 
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         fn(**kwargs)
         torch.cuda.synchronize()
     device = [
-        e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+        e
+        for e in prof.events()
+        if e.device_type == torch.autograd.DeviceType.CUDA
+        and not e.name.startswith("Memcpy")
     ]
     return [e.name for e in sorted(device, key=lambda e: e.time_range.start)]
 
