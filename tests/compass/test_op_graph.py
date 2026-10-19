@@ -17,6 +17,7 @@ import pytest
 from test_backend_step_linear import _installed, law, view
 from test_backend_step_roofline import COMPUTE, MEMORY, _spec
 from test_capture_ir import CONFIG, WIDTH_2, _ops, capture
+from test_memory_readings import WORKER
 from test_op_work import leaf, t
 from test_work import SPEC
 
@@ -26,10 +27,12 @@ from atom.compass.backends.op_graph import NONE, OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.work import attention, gemm, price
+from atom.compass.capture.peers import MORI
 from atom.compass.run import _op_graphs
 
 GEMM = "aiter.gemm_a16w16.default"
 ATTENTION = "aiter.unified_attention_with_output_base.default"
+GATHER = "atom.model_ops.moe:all_gatherv"
 DECODE = view((1, 900, True), (1, 300, True), rung=2)
 
 
@@ -56,7 +59,13 @@ def test_a_step_is_one_roofline_per_leaf_composed_by_the_graph_s_joins():
             {"par": [g(2, 2048, 4096), {"seq": [g(2, 4096, 4096)]}], "join": "max"},
             {
                 "par": [
-                    {"par": [g(4096, 4096, 4096), g(4096, 2048, 4096)], "join": "max"},
+                    {
+                        "par": [
+                            {"seq": [g(4096, 4096, 4096), g(4096, 4096, 4096)]},
+                            g(4096, 2048, 4096),
+                        ],
+                        "join": "max",
+                    },
                     g(4096, 1024, 4096),
                 ],
                 "join": "resource_bound",
@@ -66,7 +75,8 @@ def test_a_step_is_one_roofline_per_leaf_composed_by_the_graph_s_joins():
     cost = backend(region).price(DECODE)
     one, body = price(gemm(2, 64, 64), SPEC), price(gemm(2, 128, 64), SPEC)
     longest = price(gemm(2, 4096, 4096), SPEC)
-    summed = gemm(4096, 4096, 4096) + gemm(4096, 2048, 4096) + gemm(4096, 1024, 4096)
+    big = gemm(4096, 4096, 4096)
+    summed = big + big + gemm(4096, 2048, 4096) + gemm(4096, 1024, 4096)
 
     assert by_name(cost) == {
         f"op.{GEMM}": fold_seconds([one, body, body, body, longest]),
@@ -113,15 +123,27 @@ def test_a_step_reads_the_graph_captured_at_its_shape(batch, padded, shape):
         ),
         (
             BatchView((RequestShape(9, 9, False),), moe_rows=18),
-            g(1, 8, 8),
+            {"seq": [g(9, 8, 8), leaf(GATHER, [[18, 8]], x=t([9, 8]))]},
+            "a data-parallel step whose MoE gathers 18 rows",
+        ),
+        (
+            BatchView((RequestShape(9, 9, False),), moe_rows=18),
+            leaf(f"{MORI}.dispatch", [[18, 8]], input=t([9, 8])),
             "a data-parallel step whose MoE gathers 18 rows",
         ),
     ],
-    ids=["speculative", "uncaptured", "tbo", "images", "data-parallel"],
+    ids=["speculative", "uncaptured", "tbo", "images", "data-parallel", "mori"],
 )
 def test_a_step_with_no_graph_to_price_it_is_refused_by_name(batch, graph, named):
     with pytest.raises(CostRefused, match=named):
         backend(graph).price(batch)
+
+
+def test_a_data_parallel_step_with_no_moe_exchange_prices_as_its_own_rows():
+    rows = (RequestShape(9, 9, False),)
+    dp = backend(g(9, 8, 8)).price(BatchView(rows, moe_rows=18))
+
+    assert by_name(dp) == by_name(backend(g(9, 8, 8)).price(BatchView(rows)))
 
 
 def test_each_reason_a_graph_refuses_is_named_once():
@@ -222,7 +244,7 @@ def test_the_run_s_lookup_reads_the_eager_graph_at_a_shape(tmp_path_factory):
             enable_expert_parallel=False,
             enforce_eager=False,
         )
-        lookup = _op_graphs(str(store), config)
+        lookup = _op_graphs(str(store), config, "gfx942")
         found.append((lookup("decode", 2, 2), lookup("decode", 3, 3)))
 
     assert (graph["region"], None) in found
@@ -232,10 +254,11 @@ def test_the_run_s_lookup_reads_the_eager_graph_at_a_shape(tmp_path_factory):
 def test_a_run_file_op_graph_installs_the_op_level_backend(
     monkeypatch, tmp_path, padding, padded
 ):
+    monkeypatch.setitem(WORKER, "kv_cache_dtype", "fp8")
     installed = _installed(monkeypatch, tmp_path, op_graph=True, **padding)
 
     assert isinstance(installed, OpGraphBackend)
-    assert (installed.tp, installed.kv, installed.padded) == (1, "bf16", padded)
+    assert (installed.tp, installed.kv, installed.padded) == (1, "fp8", padded)
 
 
 def test_a_run_file_op_graph_that_is_not_true_is_refused(monkeypatch, tmp_path):

@@ -1394,7 +1394,7 @@ def runner(model_runner, tree) -> None:
 
         backend = OpGraphBackend(
             machine,
-            _op_graphs(run["store"], config),
+            _op_graphs(run["store"], config, machine.value("device.arch")),
             tp=tp,
             kv=config.kv_cache_dtype,
             padded=padding != "none",
@@ -1476,9 +1476,9 @@ def runner(model_runner, tree) -> None:
         model_runner.compass_step_grid = {**bundle, "describe": backend.describe()}
 
 
-def _op_graphs(root: str, config):
-    """The region of the eager `op_graph` of `config` the store at `root` holds
-    at a shape, or None."""
+def _op_graphs(root: str, config, arch: str):
+    """The region of the eager `op_graph` of `config` on an `arch` device the
+    store at `root` holds at a shape, or None."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
     from atom.compass.capture.forward import Shape, structure
 
@@ -1488,7 +1488,7 @@ def _op_graphs(root: str, config):
     def graph(phase: str, tokens: int, seqs: int) -> dict | None:
         shape = str(Shape(phase, tokens, seqs))
         key = Key.of(
-            Kind.OP_GRAPH, structure=structure(config, phase, eager=True), shape=shape
+            Kind.OP_GRAPH, structure=structure(config, phase, True, arch), shape=shape
         )
         if not store.directory_for(key).exists():
             return None

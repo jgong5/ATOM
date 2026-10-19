@@ -319,20 +319,26 @@ def device_fragments() -> list[Fragment]:
         probes.append(fragment("pp", body, "probed", how, subject, date, band))
     assumed = fragment("assumed", DECLARED, "assumed", "no probe fills these")
     if PEAKS:
-        date, root, found, record = PEAKS
-        subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
-        document = probe_device.fragment(
-            NAME, found, assumed.values, AUTHOR, date, subject
-        )
-        probes.append(Fragment.from_mapping(document, "peaks"))
-        probed = probes[-1].values.keys() - {"name", "schema_version"}
-        kept = {
-            k: v
-            for k, v in assumed.values.items()
-            if k.startswith("provenance.") or k not in probed
-        }
-        assumed = Fragment(assumed.source, kept)
+        found, assumed = peaks(PEAKS, assumed.values, assumed)
+        probes.append(found)
     return [fragment("device", DEVICE, "probed", notes, SUBJECT), assumed, *probes]
+
+
+def peaks(readings: tuple, stated: dict, assumed: Fragment) -> tuple:
+    """The fragment `probe_device.py`'s `readings`, a `PEAKS` entry, make
+    over the spec-peak numbers `stated` holds, and `assumed` less the fields
+    it fills."""
+    date, root, found, record = readings
+    subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
+    document = probe_device.fragment(NAME, found, stated, AUTHOR, date, subject)
+    probed = Fragment.from_mapping(document, "peaks")
+    filled = probed.values.keys() - {"name", "schema_version"}
+    kept = {
+        k: v
+        for k, v in assumed.values.items()
+        if k.startswith("provenance.") or k not in filled
+    }
+    return probed, Fragment(assumed.source, kept)
 
 
 def swept(model: str) -> Fragment:

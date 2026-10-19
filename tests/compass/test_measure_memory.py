@@ -325,19 +325,24 @@ def test_a_start_that_only_missed_the_fx_graph_cache_publishes_the_next_starts(
     )
 
 
-def test_the_reading_runner_writes_its_starts_fx_graph_cache_misses(
-    tmp_path, monkeypatch
-):
-    from torch._dynamo.utils import counters
-
+def reading_runner(monkeypatch, model_runner):
+    """`memory_runner`, loaded over `model_runner` in place of ATOM's."""
     engine = types.ModuleType("atom.model_engine.model_runner")
-    engine.ModelRunner = object
+    engine.ModelRunner = model_runner
     monkeypatch.setitem(sys.modules, engine.__name__, engine)
     path = Path(measure_memory.__file__).with_name("memory_runner.py")
     spec = importlib.util.spec_from_file_location("reading_runner", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    runner = module.MemoryReadingModelRunner()
+    return module
+
+
+def test_the_reading_runner_writes_its_starts_fx_graph_cache_misses(
+    tmp_path, monkeypatch
+):
+    from torch._dynamo.utils import counters
+
+    runner = reading_runner(monkeypatch, object).MemoryReadingModelRunner()
     runner.config, runner.rank = tp2(tmp_path).config, 0
     runner._read = dict.fromkeys(
         ["total", "non_torch", "loaded", "weights", "current", "peak"], 0
@@ -363,14 +368,7 @@ def test_the_reading_runner_warms_up_once_as_a_serving_start_does(monkeypatch):
         def _maybe_warmup(self):
             warmups.append(self.forward(SimpleNamespace(total_tokens_num=16_384)))
 
-    engine = types.ModuleType("atom.model_engine.model_runner")
-    engine.ModelRunner = ModelRunner
-    monkeypatch.setitem(sys.modules, engine.__name__, engine)
-    path = Path(measure_memory.__file__).with_name("memory_runner.py")
-    spec = importlib.util.spec_from_file_location("reading_runner", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    runner = module.MemoryReadingModelRunner()
+    runner = reading_runner(monkeypatch, ModelRunner).MemoryReadingModelRunner()
     runner._read = {}
 
     runner._maybe_warmup()

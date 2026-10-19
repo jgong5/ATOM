@@ -100,11 +100,18 @@ def prefill(tokens: int, seqs: int) -> Shape:
     return Shape("prefill", tokens, seqs)
 
 
-def structure(config, phase: str, eager: bool | None = None) -> str:
+def device_arch() -> str:
+    """The visible device's arch, its target features dropped."""
+    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+
+def structure(
+    config, phase: str, eager: bool | None = None, device: str | None = None
+) -> str:
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the TP width, the DP width and the EP
     group's when they are set, the phase and the mode, `config`'s unless `eager`
-    names it."""
+    names it, and the arch of `device`, else `device_arch()`."""
     from atom.compass.run import _file_digest
 
     digest = _file_digest(config.model, "config.json")
@@ -113,7 +120,7 @@ def structure(config, phase: str, eager: bool | None = None) -> str:
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     widths = f"tp={tp}" + (f" dp={dp}" if dp > 1 else "")
     widths += f" ep={tp * dp}" if config.enable_expert_parallel else ""
-    return f"{arch} {digest} {widths} {phase} {mode}"
+    return f"{arch} {device or device_arch()} {digest} {widths} {phase} {mode}"
 
 
 def _atom_frames():
@@ -420,6 +427,40 @@ def _patches(recorder):
     return stack
 
 
+def _v4_attention(v4, recorder):
+    """DeepSeek-V4's attention op runs its body, not its fake, so its kernels
+    are leaves of their own, as a real step runs it: the capture's batch is a
+    dummy run, which the body would skip. The indexer's score and top-k stays
+    one leaf: its FP4 kernels launch through aiter's own launcher, which no
+    patch here intercepts.
+
+    Two of its functions are one leaf each at their call, what they run inside
+    folded in: before its raw launches, `fused_compress_attn` derives its
+    `quant` parameter, and the decode kernel's aiter entry dispatches a leaf,
+    either of which a lift refuses.
+    """
+    from atom.model_ops.v4_kernels import paged_decode
+    from atom.utils.forward_context import get_forward_context
+
+    def body(x, positions, layer_name):
+        with patch.object(get_forward_context().context, "is_dummy_run", False):
+            return v4.v4_attention_with_output(x, positions, layer_name)
+
+    def at_call(owner, fn):
+        name = f"{fn.__module__}:{fn.__qualname__}"
+        leaf = peers._declared(recorder, name, fn, ir.NodeKind.OPAQUE_LEAF)
+        return patch.object(owner, fn.__name__, leaf)
+
+    stack = contextlib.ExitStack()
+    for each in (
+        patch.object(torch.ops.aiter, "v4_attention_with_output", body),
+        at_call(v4, v4.fused_compress_attn),
+        at_call(paged_decode, paged_decode._sparse_attn_v4_paged_decode_asm),
+    ):
+        stack.enter_context(each)
+    return stack
+
+
 def _build_runner(config, fake_mode):
     """ATOM's `ModelRunner`, built in the mode in the model's dtype, which it
     leaves torch's default for the steps, as ATOM's runner does.
@@ -588,6 +629,8 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
             peers.install_mori(recorder)
     with stack:
         runner = _build_runner(config, fake_mode)
+        if v4 := sys.modules.get("atom.models.deepseek_v4"):
+            stack.enter_context(_v4_attention(v4, recorder))
         stacks = [
             module
             for name, module in runner.model.named_modules()

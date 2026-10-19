@@ -49,6 +49,7 @@ from test_vertical_slice import CONSTANT, MODEL, TREE, _free_port, _retry, _run_
 from atom.compass import run as compass_run
 from atom.compass.clock import LpId, prefill_decode_table
 from atom.compass.detect.scenario import check_run
+from atom.compass.drive.serve import _free_ports
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.utils.clock import LPRuntime
 
@@ -298,7 +299,7 @@ def run_scripted_xpyd(binary: Path, out: Path, hash_seed: str, delay) -> list:
         for t in idle:
             t.daemon = True
             t.start()
-        router_port = _free_port()
+        router_port, metrics_port = _free_ports(2)
         urls = [
             arg
             for lp, f in frontends.items()
@@ -312,7 +313,7 @@ def run_scripted_xpyd(binary: Path, out: Path, hash_seed: str, delay) -> list:
                 + [str(router_port), "--pd-disaggregation", *urls]
                 + ["--policy", "dp_sticky", "--dp-aware", "--backend", "atom"]
                 + ["--disable-health-check", "--disable-circuit-breaker"]
-                + ["--disable-retries", "--prometheus-port", str(_free_port())]
+                + ["--disable-retries", "--prometheus-port", str(metrics_port)]
                 + ["--log-level", "info"],
                 ATOM_COMPASS_CLOCK_ENDPOINT=endpoint,
                 ATOM_COMPASS_SEED="20260707",
