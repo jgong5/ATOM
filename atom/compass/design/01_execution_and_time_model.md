@@ -1497,7 +1497,9 @@ steps (#1345).
 windows and host segments, the recurrence must reproduce the measured host period from
 p10 to p90 within 2% per step kind (decode, output prefill, middle chunk, first after
 idle), and the run total within 0.5%
-([#827](https://github.com/jgong5/ATOM/issues/827)). Without it a wrong wait rule reads as
+([#827](https://github.com/jgong5/ATOM/issues/827)). Each percentile is read at a step,
+outward of where interpolation would fall, so a kind of ten steps or fewer passes only
+with every step in the band ([#1463](https://github.com/jgong5/ATOM/issues/1463)). Without it a wrong wait rule reads as
 cost error. T97 records settling the thresholds.
 
 **Accepted approximations**, each added back only if that check shows its error: TP ranks

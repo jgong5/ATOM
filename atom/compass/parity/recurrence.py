@@ -24,7 +24,9 @@ so a record whose `.engine.json` states TP above 1 is refused there.
 Per kind (decode, output prefill, middle chunk, and idle: sharing no request
 with the forward before), p10 and p90 of charge over measured exit-to-exit
 period, less one, in percent, lie within `STEP_BAND`, the run total within
-`TOTAL_BAND`.
+`TOTAL_BAND`. Each percentile is a step's own value, the one on the outer side
+where it would fall between two, so a kind of ten steps or fewer passes only
+if every step is in the band.
 A failing kind's steps outside the band are named with their residual, the
 device work queued at their launch, and their recv release less the measured.
 A sending stage names the steps where the flush it infers and the record's
@@ -217,7 +219,8 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
     for k in KINDS:
         if err := [r[2] for r in rows if r[1] == k]:
             r1 = [r[5] for r in rows if r[1] == k and r[5] is not None]
-            p10, p50, p90 = np.percentile(err, (10, 50, 90))
+            p10 = np.percentile(err, 10, method="lower")
+            p50, p90 = np.median(err), np.percentile(err, 90, method="higher")
             ok = bool(-STEP_BAND <= p10 and p90 <= STEP_BAND)
             kinds[k] = (len(err), p10, p50, p90, np.median(r1) if r1 else None, ok)
     span = (steps[-1]["t_exit_ns"] - steps[0]["t_enter_ns"]) * 1e-9
