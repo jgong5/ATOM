@@ -112,7 +112,8 @@ REPEATS = 20
 #: same share to every such price.
 CALLS = 256
 #: Device time a graph's calls fill at most: a longer call takes fewer calls,
-#: at least one. A replay's fixed cost, about 19 us on MI308X, is under 0.2%.
+#: at least one, so a capped graph holds at least 5 ms: a replay's fixed cost,
+#: about 19 us on MI308X, is under 0.4% of it.
 GRAPH_NS = 10_000_000
 #: Times over the last-level cache the copies' bytes pass: just past it, part of
 #: them stays there, and an MI308X GEMM read up to 7% fast.
