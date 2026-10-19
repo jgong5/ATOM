@@ -6,6 +6,7 @@ stub runs in a stand-in runner whose forward sets ATOM's forward context and
 calls the model, as ATOM's runner does.
 """
 
+import contextlib
 import dataclasses
 import json
 import pathlib
@@ -444,6 +445,41 @@ def test_every_cold_and_warm_graph_holds_calls_calls_at_any_copies(copies):
 
     assert graphs == [ops.CALLS] * (2 if copies > 1 else 1)
     assert (record["copies"], record["calls"]) == (copies, ops.CALLS)
+
+
+def test_a_replay_prices_each_timed_replay_per_call_each_under_its_context(
+    monkeypatch,
+):
+    # Replay i of the graph takes i + 1 ms on a stand-in clock; warmups are not
+    # timed, and a price is per call of the graph.
+    clock, seen = [0, 0], []
+
+    class Graph:
+        def replay(self):
+            clock[1] += 1
+            clock[0] += clock[1]
+
+    class Event:
+        def __init__(self, enable_timing):
+            self.synchronize = lambda: None
+
+        def record(self):
+            self.at = clock[0]
+
+        def elapsed_time(self, end):
+            return end.at - self.at
+
+    monkeypatch.setattr(fctx, "_forward_context", fctx._forward_context)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    calls = [({"x": i}, f"snap{i}") for i in range(4)]
+
+    times = ops._replay(lambda x: seen.append((x, fctx._forward_context)), calls)
+
+    assert seen == [(i, f"snap{i}") for i in range(4)]
+    timed = range(ops.WARMUPS, ops.WARMUPS + ops.REPEATS)
+    assert times == [(i + 1) * 1e6 / 4 for i in timed]
 
 
 def test_a_batch_takes_the_blocks_and_slots_it_is_placed_at(rule):  # noqa: F811
