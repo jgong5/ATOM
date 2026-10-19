@@ -306,14 +306,35 @@ def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
     assert stub._plan(rope, [{"rope": "0"}], kv, 4, 2) == (3, 48, 1)
 
 
-def test_a_call_cycles_over_every_weight_the_model_holds_of_its_spec():
-    # The two Linear(3, 3) weights: one copy already passes twice a 1-byte
-    # cache, and the call still reads each.
-    stub = ops.Stub(_Runner(), 1)
-    gemm = {"op": "x", "args": {"w": {"shape": [3, 3], "dtype": F32}}}
-    gemm["args"]["w"] |= {"stride": [3, 1], "role": "weight"}
+def test_a_call_cycles_over_every_weight_of_its_spec_on_the_cold_copies_inputs():
+    # One copy already passes twice a 1-byte cache. The model holds two
+    # Linear(3, 3) weights: copy 1 is copy 0 with the second, so a weight
+    # count past the cache-sized one allocates no activation.
+    runner = _Runner()
+    stub = ops.Stub(runner, 1)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    x = {"shape": [2, 3], "dtype": F32, "stride": [3, 1], "role": "activation"}
+    w = x | {"shape": [3, 3], "role": "weight"}
+    gemm = {"op": "x", "args": {"x": x, "w": [w]}}
+    graphs = []
 
-    assert stub._plan(gemm, [{}], {}, 4, 2) == (2, 36, 1)
+    def replay(fn, calls):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=["k"]),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        n, _, _ = stub._plan(gemm, [{}], {}, 4, 2)
+        record = stub._time(gemm, "sig", [{}], n)
+
+    (first, snap), (second, snap1) = graphs[0][:2]
+    assert second["x"] is first["x"] and snap1 is snap
+    assert first["w"][0] is runner.model[0].weight
+    assert second["w"][0] is runner.model[1].weight
+    assert (n, record["copies"]) == (1, 2)
 
 
 def test_copy_c_rotates_weights_and_instances_and_clones_past_the_first_round():

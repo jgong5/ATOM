@@ -28,10 +28,11 @@ by name, a KV tensor argument among them.
 Cold, by copies. A call's bytes are its tensor arguments' spans, the tensors
 of each module it names and, for a leaf that names a context key, the KV and
 per-request state its layer holds for the batch. One graph runs the leaf K =
-`CALLS` times, cycling over N copies, N the least whose bytes pass `COLD`
-times the last-level cache, at least the model's weights of each weight
-argument's spec and, for a context key, at least its I instances (at most K).
-Copy c takes fresh activations,
+`CALLS` times, cycling over its copies: N built ones, N the least whose bytes
+pass `COLD` times the last-level cache and, for a context key, at least its I
+instances (at most K), then, up to the most weights the model holds of a
+weight argument's spec (at most K), copy c mod N with the c-th weights on
+that copy's other arguments. Copy c < N takes fresh activations,
 the c-th of the model's weights of that spec (a clone past the last), and
 instance c mod I at placement (c div I) mod P, its metadata and module
 tensors cloned past the first round: a placement is the point's batch on KV
@@ -413,22 +414,28 @@ class Stub:
             elif key in self.modules:
                 size += sum(t.nbytes for t in _own(self.modules[key]))
         n = min(CALLS, COLD * self.llc // size + 1) if size else 1
-        # cycle over every instance's state and every weight of the model, all
-        # held anyway: one weight can read a few percent off another of its spec
+        if need is None:  # cycle over every instance's state, which is held anyway
+            n = min(CALLS, max(n, len(instances)))
+        return n, size, need or -(-n // len(instances))
+
+    def _time(self, op, sig, instances, n) -> dict:
+        """`op` timed cold over `n` copies, then copy `c mod n` with the c-th
+        weight up to every weight the model holds of its spec, and warm over
+        one, with its kernels."""
+        from atom.utils import forward_context
+
+        fn = _function(op["op"])
+        calls = [self._copy(op, sig, instances, c) for c in range(n)]
+        # one weight can read a few percent off another of its spec, and every
+        # one is held anyway: cycle them all, on the n copies' other arguments
         held = [
             len(self.weights.get(_spec_of(s), ()))
             for _, s in _specs(op["args"])
             if s["role"] == "weight"
         ]
-        n = min(CALLS, max([n, *held, len(instances) if need is None else 0]))
-        return n, size, need or -(-n // len(instances))
-
-    def _time(self, op, sig, instances, n) -> dict:
-        """`op` timed cold over `n` copies and warm over one, with its kernels."""
-        from atom.utils import forward_context
-
-        fn = _function(op["op"])
-        calls = [self._copy(op, sig, instances, c) for c in range(n)]
+        for c in range(n, min(CALLS, max([n, *held]))):
+            calls.append(self._reweigh(op, calls[c % n], c))
+        n = len(calls)
         try:
             forward_context._forward_context = calls[0][1]
             fn(**calls[0][0])  # compiles and tunes outside the graphs
@@ -474,6 +481,20 @@ class Stub:
             return value
 
         return {s: build(s, v) for s, v in op["args"].items()}, snap
+
+    def _reweigh(self, op, like, c):
+        """Copy `like` of `op`'s call with the c-th weight of each weight
+        argument's spec, its other arguments and forward context shared."""
+
+        def build(value, old):
+            if isinstance(value, list):
+                return [build(v, o) for v, o in zip(value, old)]
+            if isinstance(value, dict) and value.get("role") == "weight":
+                return self._tensor(value, None, c, False)
+            return old
+
+        kwargs, snap = like
+        return {s: build(v, kwargs[s]) for s, v in op["args"].items()}, snap
 
     def _tensor(self, spec, meta, c, fresh):
         role = spec["role"]
