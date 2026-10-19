@@ -123,7 +123,7 @@ COLD = 2
 #: Host idle after each replay, as a share of its device time. Back to back, a
 #: leaf that draws enough power holds the device at its power limit within
 #: about 100 ms, which lowers the memory clock a step running the leaf once
-#: between lighter kernels keeps: an MI308X lm_head GEMM read 2.9% slow so.
+#: between lighter kernels keeps: an MI308X lm_head GEMM read up to 2.9% slow so.
 #: After a replay `GRAPH_NS` bounds, the idle keeps the device under it.
 REST = 0.1
 #: Metadata arguments, by operator and slot, that are the token ids ATOM passes
