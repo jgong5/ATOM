@@ -42,11 +42,7 @@ from torch.utils.flop_counter import flop_registry
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import BatchView
-from atom.compass.backends.step_roofline import (
-    Module,
-    _index_scores,
-    _sparse_products,
-)
+from atom.compass.backends.step_roofline import Module, _index_scores, _sparse_products
 from atom.compass.backends.step_roofline import _work as module_work
 from atom.compass.backends.work import (
     ELEMENT_BYTES,
