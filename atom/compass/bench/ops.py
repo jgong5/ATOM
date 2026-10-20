@@ -934,15 +934,18 @@ def plan(store, key, config, run, args, command: str, out: Path) -> None:
     def cached_ladder(top_only: bool) -> dict:
         """The points of each prefill family over its rows' cached tokens, of
         a kind `_dependent` reads as depending on context: only the most, its
-        reading's far end, while the kind has no cached point to read."""
+        reading's far end, while the kind has no cached point to read. None whose
+        first row, the cached tokens and its share of the token count, holds
+        more than `max_model_len` tokens, a row ATOM's runner cannot take."""
         dependent, want = _dependent(done.values()), defaultdict(set)
         for at in seen.values():
             for tokens in _ladder(at):
                 shape, op, sig = at[tokens]
                 ladder = _ladder(cached[shape.seqs])
+                room = config.max_model_len - -(-shape.tokens // shape.seqs)
                 for c in ladder[-1:] if top_only else ladder:
                     fam = _family(shape, c, op, sig, dependent)[0]
-                    if c and _cut(fam):
+                    if c and c <= room and _cut(fam):
                         want[shape, c].add(fam)
         return want
 
