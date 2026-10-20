@@ -5,10 +5,12 @@ Each command in `COMMANDS` runs its module's `main` with the arguments after
 its words; a module not yet built refuses as not built. Each command in
 `REFUSED` refuses with its reason.
 A refusal a command raises (`ValueError`, `OSError`, `ArtifactRefusal`,
-`GpuRefusal`, `SpecRefusal`) exits with its message rather than a traceback.
+`GpuRefusal`, `SpecRefusal`) exits with its message rather than a traceback;
+a `json.JSONDecodeError` names no file, so it keeps its traceback.
 """
 
 import importlib
+import json
 import sys
 
 from atom.compass.artifacts import ArtifactRefusal
@@ -89,5 +91,7 @@ def main(argv=None) -> None:
         raise SystemExit(f"compass {name}: not built yet") from missing
     try:
         command.main(argv[len(name.split()) :])
+    except json.JSONDecodeError:  # it names no file, so it keeps its traceback
+        raise
     except (ValueError, OSError, ArtifactRefusal, GpuRefusal, SpecRefusal) as refused:
         raise SystemExit(f"compass {name}: {refused}") from refused

@@ -9,12 +9,13 @@ names, through `MemoryReadingModelRunner` (under `--enable-rapidserve` its
 RapidServe form, whose decode engine writes its own readings beside prefill's),
 and stops once it has started: its weights loaded, its one warmup run, its KV
 cache sized and its graphs captured. `gpu.quiet` checks those GPUs before the
-start and after it. Each rank writes its readings and the key it read off its
-resolved config, and the ranks must agree on the key. The entry's key is that
-one with the digest of the machine spec `--machine` names; its conditions are
-that spec's device and stack, torch included. A `--gpu` whose device or PTL
-state is not the spec's, or a stack the spec does not pin, refuses before the
-start, so no entry measured on another card or stack is keyed by that spec.
+start and, once every process of the start has exited, after it. Each rank
+writes its readings and the key it read off its resolved config, and the ranks
+must agree on the key. The entry's key is that one with the digest of the
+machine spec `--machine` names; its conditions are that spec's device and
+stack, torch included. A `--gpu` whose device or PTL state is not the spec's,
+or a stack the spec does not pin, refuses before the start, so no entry
+measured on another card or stack is keyed by that spec.
 `non_torch` refuses a spread across the ranks above `SPREAD_LIMIT`. One member per rank
 holds `memory.ENTRY_FIELDS`, its `record` the digest of the engine's log.
 `--beside` names a command the start runs first in the engine's session, such
@@ -39,7 +40,6 @@ import hashlib
 import json
 import os
 import shlex
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -161,11 +161,9 @@ def main(argv: list[str], again: bool = False) -> None:
         except subprocess.TimeoutExpired:
             exited = f"no exit in {START_TIMEOUT_S} s"
         finally:
-            # The engine's own processes are in its session; none outlives it.
-            try:
-                os.killpg(engine.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            # A member of the engine's process group can outlive its leader:
+            # the after-check reads the GPUs once every member has exited.
+            serve._stop(engine.pid)
             engine.wait()
     if exited != 0:
         raise ValueError(f"the engine did not start ({exited}); see {out / LOG}")

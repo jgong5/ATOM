@@ -26,7 +26,8 @@
 # aiperf's artifacts at --export-level raw and the client run's export,
 # client_run.json (atom/compass/parity/client_run.py). One client run per OUT:
 # an OUT/client/ there refuses. The server keeps serving unless --stop. Exits 2
-# on bad arguments, else 1 naming the step that failed.
+# on bad arguments, 90 to 99 as _lib.sh's tree checks refuse, else 1 naming the
+# step that failed.
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -59,7 +60,8 @@ for v in MODEL TRACES HARNESS_PYTHON; do [[ -n ${!v-} ]] || bad "$v is not set";
 OUT=$(realpath "$OUT")
 read -r url pid run_file < <(python3 -c 'import json, sys
 s = json.load(open(sys.argv[1]))
-print(s["url"], s["pid"], s.get("run_file", ""))' "$OUT/server.json")
+print(s["url"], s["pid"], s.get("run_file", ""))' "$OUT/server.json") ||
+    fail "server: $OUT/server.json names no url and pid"
 curl -sf --max-time 10 "$url/health" >/dev/null || fail "server: $url/health does not answer"
 
 compass_env "$ROOT"
@@ -76,7 +78,8 @@ if [[ -n $run_file ]]; then
 else
     # Its plugin paces aiperf on a simulated clock, which a real server has not got.
     plugins=$(cd / && "$HARNESS_PYTHON" -c 'from importlib.metadata import entry_points as e
-print(*(p.value for p in e(group="aiperf.plugins")))')
+print(*(p.value for p in e(group="aiperf.plugins")))') ||
+        fail "harness: $HARNESS_PYTHON cannot list aiperf's plugins"
     [[ $plugins != *compass_harness* ]] || fail "harness: the server is real, and $HARNESS_PYTHON has compass-harness installed"
     aiperf=(-c 'import uuid, aiperf.cli_runner as r
 r.uuid4 = lambda: uuid.UUID(int=0)
@@ -88,7 +91,7 @@ mkdir "$OUT/client" 2>/dev/null || fail "out: $OUT/client exists; one client run
 mkdir "$OUT/client/traces"
 awk -v d="$OUT/client/traces" -v first="$first" -v last="$last" '
     NR > first {f = sprintf("%s/%05d.json", d, NR - 1); print > f; close(f)}
-    NR > last {exit}' "$TRACES"
+    NR > last {exit}' "$TRACES" || fail "traces: cannot read $TRACES"
 n=$(find "$OUT/client/traces" -type f | wc -l)
 ((n == last - first + 1)) || fail "traces: $TRACES holds $n of traces $first to $last"
 

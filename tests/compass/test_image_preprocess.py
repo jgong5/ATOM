@@ -26,6 +26,7 @@ from test_dp_step_max import BLOCK, runner
 from atom.compass import run as compass_run
 from atom.compass.backends import BatchView, RequestShape, StepStubBackend
 from atom.compass.backends.resolver import CostRefused
+from atom.compass.runner import projection
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import ChatMessage
 from atom.model_engine.scheduler import Scheduler
@@ -171,8 +172,10 @@ def test_a_steps_image_tokens_are_refused_by_every_fitted_backend(
     batch = _image_prefill(data, *prompts)
     r = runner(backend())
     r.config.multimodal_config = SimpleNamespace(image_token_id=IMAGE_ID)
+    mode = projection.forward_mode(batch, r)
+    assert projection.batch_view(batch, mode, r).image_tokens == tokens
     assert r.forward(batch).predicted_s == 0.0
-    why = f"{tokens} image tokens, and no vision encoder in what this prices from"
+    why = "a step with image tokens, and no vision encoder in what this prices from"
     assert r.refused_commands() == (f"cost:step-linear: {why}",)
     view = BatchView((RequestShape(16, 16, False),), image_tokens=tokens)
     for other in (replay(), roofline(), fallback()):

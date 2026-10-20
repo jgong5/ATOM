@@ -10,6 +10,7 @@ import contextlib
 import dataclasses
 import functools
 import json
+import os
 import pathlib
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -558,6 +559,38 @@ def test_a_long_call_fills_a_graph_to_graph_ns_and_has_no_warm_graph(
     assert (record["warm_ns"] is None) == (calls < ops.CALLS)
 
 
+def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
+    # Replay i takes i + 1 ms on a stand-in clock; the host idles `REST` of that
+    # after every replay, warmups included, which keeps a leaf off the lower
+    # memory clock it reaches back to back.
+    assert ops.REST > 0
+    clock, slept = [0], []
+
+    class Graph:
+        def replay(self):
+            clock[0] += len(slept) + 1
+
+    class Event:
+        def __init__(self, enable_timing):
+            self.synchronize = lambda: None
+
+        def record(self):
+            self.at = clock[0]
+
+        def elapsed_time(self, end):
+            return end.at - self.at
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(ops.time, "sleep", slept.append)
+
+    ops._replay(lambda: None, [({}, fctx._forward_context)])
+
+    replays = range(ops.WARMUPS + ops.REPEATS)
+    assert slept == [(i + 1) * ops.REST / 1e3 for i in replays]
+
+
 def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(
     monkeypatch,
 ):
@@ -832,3 +865,16 @@ def test_a_measured_point_is_keyed_by_the_spec_of_the_platform_it_ran_on(
         at.token(),
         key("decode B=2", 9, "b").token(),
     ]
+
+
+def test_the_capture_child_starts_with_every_gpu_hidden_below_hip(monkeypatch):
+    # The capture sets HIP_VISIBLE_DEVICES itself, so only ROCm's own mask
+    # keeps it off every GPU.
+    started = {}
+    monkeypatch.setattr(ops, "_child", lambda fn, argv: started.update(os.environ))
+    monkeypatch.setattr("atom.compass.capture.forward.device_arch", lambda: "gfx942")
+    config = SimpleNamespace(model="m", tensor_parallel_size=1)
+
+    ops._capture(config, [decode(4)], "store")
+
+    assert started["ROCR_VISIBLE_DEVICES"] == ""

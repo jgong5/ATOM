@@ -237,7 +237,7 @@ def test_a_population_names_each_step_s_shape(tmp_path):
 
 def test_a_speculative_decode_step_is_refused_by_name(tmp_path):
     record = _record(tmp_path, [{"rows": [[1, 9, True], [3, 9, True]]}])
-    with pytest.raises(ValueError, match="step 0 decodes 3 tokens in a row"):
+    with pytest.raises(ValueError, match="step 0 decodes more than one token in a row"):
         population_shapes([record])
 
 
