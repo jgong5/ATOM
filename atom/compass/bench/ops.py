@@ -183,6 +183,7 @@ def main(argv: list[str]) -> None:
             f"--level {config.compilation_config.level} compiles the model, whose "
             "forward the bench stubs; measure at --level 0"
         )
+    _eager(config)
     store = ArtifactStore(args.store)
     todo = [
         (s, args.context, leaves(graph(store, config, s)["region"])) for s in shapes
@@ -981,13 +982,24 @@ def _coverage_main(argv: list[str], atom_args: list[str]) -> dict:
     p.add_argument("--store", required=True, help="the artifact store's root")
     p.add_argument("--out", required=True, help="the --plan run's --out")
     args = p.parse_args(argv)
+    config = atom_config(atom_args)
+    _eager(config)
     out = Path(args.out)
     lines = (out / "plan.jsonl").read_text().splitlines()
     records = [json.loads(line) for line in lines]
     store = ArtifactStore(args.store)
     arch = json.loads((out / "run.json").read_text())["device"][0]["arch"]
-    config = atom_config(atom_args)
     return coverage(store, args.store, config, args.coverage, records, arch)
+
+
+def _eager(config) -> None:
+    """Refuse `config` unless ATOM runs it eager: `trace ops` captures and keys
+    every `op_graph` eager, so a graph-mode key names no graph it publishes."""
+    if not config.enforce_eager:
+        raise ValueError(
+            "ATOM's arguments run the model in CUDA graphs, and trace ops "
+            "publishes eager op_graphs only; measure with --enforce-eager"
+        )
 
 
 def coverage(store, root, config, names, records, arch) -> dict:

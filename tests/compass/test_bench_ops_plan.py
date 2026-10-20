@@ -655,6 +655,38 @@ def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
     assert traced == ([] if "gfx950" in held else ["gfx950"])
 
 
+@pytest.mark.parametrize("mode", ["--width", "--plan", "--coverage"])
+def test_measure_ops_without_enforce_eager_refuses_by_name_and_traces_nothing(
+    tmp_path, monkeypatch, mode, model_config  # noqa: F811
+):
+    graph_mode = SimpleNamespace(**vars(model_config))
+    graph_mode.enforce_eager, graph_mode.tp_world_size = False, 1
+    graph_mode.compilation_config = SimpleNamespace(level=0)
+    traced = []
+    monkeypatch.setattr("atom.compass.bench.measure.atom_config", lambda a: graph_mode)
+    monkeypatch.setattr("atom.compass.drive.gpu.hip_visible", lambda g: "0")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(ops, "_child", lambda fn, argv: traced.append(argv))
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "plan.jsonl").write_text("")
+    (out / "run.json").write_text(json.dumps({"device": [{"arch": "gfx950"}]}))
+    graded = _records(tmp_path / "graded", ([[1, 100, True]], 1))
+    common = ["--store", str(tmp_path / "store"), "--out", str(out)]
+    argv = {
+        "--width": ["--width", "1", "--context", "100"],
+        "--plan": ["--plan", graded],
+        "--coverage": ["--coverage", graded],
+    }[mode] + common
+    if mode != "--coverage":
+        argv += ["--llc-mib", "256", "--gpu", "0"]
+
+    with pytest.raises(ValueError, match="measure with --enforce-eager"):
+        ops.main([*argv, "--", "--model", model_config.model, "--level", "0"])
+
+    assert traced == []
+
+
 def _dies(*finished):
     """`_bench` as a child that dies once for each entry of `finished`, having
     journaled that many of its points, and then lives; and the records it was
