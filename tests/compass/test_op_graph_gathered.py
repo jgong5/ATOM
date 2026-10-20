@@ -39,7 +39,8 @@ RESPLIT = [7, 1, 1, 1, 1, 1, 1, 14]
 #: Each rank's two micro-batches: rank 0 cuts its 7 tokens 3 then 4.
 SPLIT = ((3, 2, 5, 1, 1, 1, 1, 1), (4, 3, 5, 0, 0, 0, 0, 0))
 RESPLIT_TBO = ((3, 1, 1, 1, 1, 1, 1, 6), (4, 0, 0, 0, 0, 0, 0, 8))
-#: Stored: each graph one GEMM over the rows its MoE gathers.
+#: Stored: each graph one GEMM, its rows 4096 times those its MoE gathers, so
+#: each prices above the kernel floor.
 STORED = [
     Shape("prefill", 7, 1, 27),
     Shape("prefill", 7, 1),
@@ -82,7 +83,7 @@ def backend(config, tmp_path):
                 gates=GATES,
                 members={
                     member_name("graph", RANK, "json"): json.dumps(
-                        {"region": g(gathered(shape), 8, 8)}
+                        {"region": g(4096 * gathered(shape), 64, 64)}
                     ).encode()
                 },
             )
@@ -108,7 +109,7 @@ def view(batch, counts, split=None, unified=False, rung=None):
 
 
 def gemms(*rows):
-    return sum(price(gemm(m, 8, 8), SPEC) for m in rows)
+    return sum(price(gemm(4096 * m, 64, 64), SPEC) for m in rows)
 
 
 def test_an_unequal_prefill_prices_from_the_graph_at_its_gathered_rows(backend):
