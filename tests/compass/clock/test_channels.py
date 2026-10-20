@@ -19,7 +19,7 @@ from atom.compass.clock import (
     prefill_decode_table,
     single_engine_table,
 )
-from atom.compass.clock.channels import ReceiveMode
+from atom.compass.clock.channels import ADMISSION_DELAY_S, ReceiveMode
 
 T, FP, EP, FD, ED = (
     LpId(n) for n in ("traffic", "frontend-P", "engine-P", "frontend-D", "engine-D")
@@ -68,7 +68,8 @@ def _enumerated(table, source, target):
 
 # --- the shipped tables ------------------------------------------------------
 
-ADMISSION = [("serving", 1.6e-3), ("offline_batch", 13.0e-3)]
+ADMISSION = sorted(ADMISSION_DELAY_S.items())
+SERVING = ADMISSION_DELAY_S["serving"]
 
 
 def _whole(table):
@@ -179,7 +180,7 @@ def test_with_router_in_s_each_path_is_a_hop_into_the_router_lp_and_one_out():
     whole = _whole(table)
     hops = {
         "traffic->router:http": (T, R, R_IN, "thread"),
-        "router->frontend-P:http": (R, FP, 1.6e-3 + ROUTER - R_IN, "inline"),
+        "router->frontend-P:http": (R, FP, SERVING + ROUTER - R_IN, "inline"),
         "frontend-D->router:stream": (FD, R, R_IN, "thread"),
         "router->traffic:stream": (R, T, STREAM + ROUTER - R_IN, "inline"),
         "frontend-P->router:relay": (FP, R, R_IN, "thread"),
@@ -223,7 +224,7 @@ def test_a_router_in_s_leaving_a_hop_no_lookahead_is_refused(bad):
 
 
 def test_the_prefill_decode_distances_match_the_hand_computed_paths():
-    A, S, I, R, K = 1.6e-3 + ROUTER, STREAM + ROUTER, IPC, ROUTER, KV
+    A, S, I, R, K = SERVING + ROUTER, STREAM + ROUTER, IPC, ROUTER, KV
     expected = {
         (T, FP): A, (T, EP): A + I, (T, FD): A + R, (T, ED): A + R + I,
         (FP, T): R + S, (FP, EP): I, (FP, FD): R, (FP, ED): R + I,
@@ -241,7 +242,7 @@ def test_the_prefill_decode_distances_match_the_hand_computed_paths():
 def test_the_single_engine_distances_match_the_hand_computed_paths():
     table = _single()
     F, E = LpId("frontend"), LpId("engine")
-    assert table.distance(T, E) == pytest.approx(1.6e-3 + IPC)
+    assert table.distance(T, E) == pytest.approx(SERVING + IPC)
     assert table.distance(E, T) == pytest.approx(IPC + STREAM)
     assert table.distance(F, E) == IPC
 

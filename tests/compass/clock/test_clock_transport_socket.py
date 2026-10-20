@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import threading
+from unittest import mock
 
 import pytest
 
@@ -28,6 +29,7 @@ from atom.compass.clock import (
     prefill_decode_table,
     single_engine_table,
 )
+from atom.compass.clock.channels import ADMISSION_DELAY_S
 from atom.compass.clock_transport import MalformedMessage, connect, serve
 
 from .test_clock_transport import (
@@ -149,7 +151,9 @@ def test_a_scripted_run_gives_each_lp_the_same_reply_bytes_over_both_carriers(
     served, run
 ):
     build, kwargs, scripts = RUNS[run]
-    table = build(**kwargs)
+    # The scripts' grant times are written for a 1.6 ms request lookahead.
+    with mock.patch.dict(ADMISSION_DELAY_S, serving=1.6e-3):
+        table = build(**kwargs)
     over = {
         endpoint: _replies(served(ClockAuthority(table), endpoint), table, scripts)
         for endpoint in ("inproc:conformance", LOCAL)
