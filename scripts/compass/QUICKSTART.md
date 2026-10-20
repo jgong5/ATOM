@@ -11,6 +11,8 @@ not a sustainable configuration
 `smoke_cell.sh` runs the same path at one concurrency in about an hour, so start
 there (below), then run the full cell.
 
+New to Compass? The `/compass-onboard` skill (`.claude/skills/compass-onboard/`) runs this page with you on your GPU and explains each step from your outputs.
+
 ## Concepts
 
 Compass replaces only ATOM's forward pass. The scheduler, the KV block manager,
