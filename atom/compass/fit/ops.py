@@ -17,7 +17,8 @@ shape's token or sequence count or one more. Any other integer names the leaf:
 the GEMMs of a decode step differ in N and K and share a family per weight.
 
 A family's points sit at the shape's counts, B and the context for a decode,
-T and B for a prefill. `interpolate` prices a query at a measured point as
+T and B for a prefill. A collective's points name their family themselves,
+`measure ops`'s `exchange`, and sit at their message bytes. `interpolate` prices a query at a measured point as
 that point; between points, multilinearly over the neighbours that bracket it
 along each dimension, when they all launched the same kernels. It declines
 any other query: outside the measured range, with a neighbour missing, or
@@ -153,9 +154,14 @@ def fit(points) -> dict:
     the shape, and per family, its dimensions and its points, each its
     coordinates, its cold time in ns and its kernels."""
     groups: dict[str, list] = {}
-    for p in points:
-        groups.setdefault(skeleton(p["shape"], p["leaf"]), []).append(p)
     free_of, families = {}, {}
+    for p in points:
+        if "exchange" in p:  # a collective: one family over its message bytes
+            fam, nbytes = p["exchange"]
+            f = families.setdefault(fam, {"op": p["op"], "dims": ["bytes"]})
+            f.setdefault("points", []).append([[nbytes], p["cold_ns"], p["kernels"]])
+        else:
+            groups.setdefault(skeleton(p["shape"], p["leaf"]), []).append(p)
     for skel, members in groups.items():
         at: dict[str, list] = {}
         for p in members:

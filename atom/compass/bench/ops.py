@@ -16,17 +16,19 @@ capture split them, follow `--context` cached tokens each, none when it is not
 given. Rows the KV pool cannot hold at once are ragged (`point_rows`), and the
 point records its rows.
 
-ATOM's runner is built on the one GPU from ATOM's arguments, its weights a
-dummy, through ATOM's warmup, and a `Stub` takes the place of the model's
-forward. Each point reaches the runner as a batch (`ReplayRule`), so ATOM
-builds its metadata and forward context, and the stub calls each leaf from its
-contract: an activation is random at its shape, dtype and stride; a weight is
-a tensor of the model of that shape, dtype and stride; a metadata tensor is a
+ATOM's runner is built from ATOM's arguments on each GPU `--gpu` names, one
+rank each of the layout the arguments resolve (`ranks`), its weights a dummy,
+through ATOM's warmup, and a `Stub` takes the place of the model's forward.
+Each point reaches the runner as a batch (`ReplayRule`), so ATOM builds its
+metadata and forward context, and the stub calls each leaf from its contract:
+an activation is random at its shape, dtype and stride; a weight is a tensor of the model of that shape, dtype and stride; a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM passes the forward (`TOKEN_IDS`); an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names. A leaf whose operator cannot run so
 refuses by name, a KV tensor argument among them.
+A collective leaf is one family over its message bytes, decode and prefill
+alike (`exchange`), which the plan ladders, densifies and covers.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, the tensors
 of each module it names and, for a leaf that names a context key, the KV and
@@ -141,6 +143,7 @@ RANK = Topology().ranks()[0]
 
 
 def main(argv: list[str]) -> None:
+    from atom.compass.bench import ranks
     from atom.compass.bench.measure import atom_config
     from atom.compass.capture.forward import decode, prefill
     from atom.compass.drive.gpu import hip_visible, quiet
@@ -151,8 +154,6 @@ def main(argv: list[str]) -> None:
     if "--coverage" in argv[:cut]:
         return print(json.dumps(_coverage_main(argv[:cut], argv[cut + 1 :]), indent=1))
     args = _parser().parse_args(argv[:cut])
-    if len(args.gpu) != 1:
-        raise ValueError(f"--gpu names {len(args.gpu)} GPUs; the op bench uses one")
     shapes = [decode(w) for w in args.width] + [prefill(*s) for s in args.prefill]
     if not shapes and not args.plan:
         raise ValueError("name a shape: --width or --prefill, or --plan")
@@ -162,10 +163,10 @@ def main(argv: list[str]) -> None:
         raise ValueError("a decode shape needs --context, each row's tokens")
     os.environ["HIP_VISIBLE_DEVICES"] = hip_visible(args.gpu)
     config = atom_config(argv[cut + 1 :])
-    if config.tp_world_size > 1:
+    if (world := ranks.layout(config)) != len(args.gpu):
         raise ValueError(
-            f"ATOM's arguments resolve {config.tp_world_size} ranks; the op bench "
-            "starts one"
+            f"ATOM's arguments resolve {world} ranks and --gpu names "
+            f"{len(args.gpu)} GPUs; the op bench runs a rank on each"
         )
     if config.compilation_config.level:
         raise ValueError(
@@ -193,7 +194,7 @@ def main(argv: list[str]) -> None:
                     held += 1
         print(f"{held} points already in the store", flush=True)
         todo = [point for point in todo if point[2]]
-        results = _child(measure, config, todo, args.llc_mib << 20)
+        results = ranks.measure(config, todo, args.llc_mib << 20, len(args.gpu))
     publish(store, key, config, run, " ".join(command), results, out)
     refused = [
         f"{r['op']} at {r['shape']}: {r['refused']}" for r in results if "refused" in r
@@ -294,13 +295,16 @@ def leaves(region: dict, env=None, found=None) -> dict[str, tuple[dict, list]]:
     return found
 
 
-def measure(config, todo, llc: int) -> list[dict]:
-    """Each point's record, shape by shape: its timing, or why it refused."""
+def measure(config, todo, llc: int, rank: int = 0) -> list[dict]:
+    """Each point's record, shape by shape: its timing, or why it refused; at
+    `rank` of `config`'s layout, over every rank's points (`ranks.union`)."""
+    from atom.compass.bench import ranks
     from atom.compass.bench.replay import ReplayRule
 
-    runner = _runner(config)
+    runner = _runner(config, rank)
     try:
         stub, rule, got = Stub(runner, llc), ReplayRule(config), []
+        todo = ranks.union(todo, ranks.cpu_group())
         with patch.object(runner.model, "forward", stub), torch.inference_mode():
             for shape, context, found in todo:
                 try:
@@ -316,23 +320,27 @@ def measure(config, todo, llc: int) -> list[dict]:
         runner.exit()
 
 
-def _runner(config):
-    """ATOM's runner on the one visible GPU, warmed up, its KV pool allocated."""
+def _runner(config, rank: int):
+    """ATOM's runner at TP `rank` of `config`'s DP rank, warmed up, its KV
+    pool allocated at the fewest blocks a rank has room for."""
     from torch.distributed import TCPStore
 
+    from atom.compass.bench.ranks import agreed, cpu_group
     from atom.model_engine.model_runner import ModelRunner
 
-    pc = config.parallel_config
-    store = TCPStore(
-        pc.data_parallel_master_ip,
-        pc.data_parallel_base_port,
-        is_master=True,
-        wait_for_workers=False,
-    )
-    pc.data_parallel_base_port, pc._managed_distributed_store = store.port, True
-    runner = ModelRunner(0, config)
+    pc, store = config.parallel_config, None
+    if not pc._managed_distributed_store:  # one rank: the store is its own
+        store = TCPStore(
+            pc.data_parallel_master_ip,
+            pc.data_parallel_base_port,
+            is_master=True,
+            wait_for_workers=False,
+        )
+        pc.data_parallel_base_port, pc._managed_distributed_store = store.port, True
+    runner = ModelRunner(rank, config)
     runner.store = store
-    config.num_kvcache_blocks = runner.get_num_blocks()["num_kvcache_blocks"]
+    blocks = runner.get_num_blocks()["num_kvcache_blocks"]
+    config.num_kvcache_blocks = agreed(blocks, cpu_group())
     runner.allocate_kv_cache(config.num_kvcache_blocks)
     return runner
 
@@ -418,6 +426,7 @@ class Stub:
             names = {p: m[0] for (s, p), m in self.placed[0][1].items() if s == sig}
             record = {"shape": str(shape), "context": context, "op": op["op"]}
             record |= {"leaf": sig, "metadata": names, "rows": rows}
+            record |= {"exchange": ex} if (ex := exchange(op)) else {}
             try:
                 record |= self._time(op, sig, inst, n)
                 record["footprint_bytes"] = min(n, record.get("copies", n)) * size
@@ -462,7 +471,9 @@ class Stub:
         sized to the cache (`cold_copies`) each on copy `c mod m`'s
         activations, then copy `c mod n` with the c-th weight up to every
         weight the model holds of its spec, at most K; and, when K is `CALLS`,
-        warm over one; with its kernels."""
+        warm over one; with its kernels. Every rank's graph holds the least K
+        any rank's call gives."""
+        from atom.compass.bench.ranks import agreed, cpu_group
         from atom.utils import forward_context
 
         fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
@@ -479,6 +490,7 @@ class Stub:
             fn(**calls[0][0])  # compiles and tunes outside the graphs
             kernels, ns = _kernels(fn, calls[0][0])
             k = min(CALLS, max(int(GRAPH_NS // ns), 1)) if ns else CALLS
+            k = agreed(k, cpu_group())  # a collective's graph holds as many calls
             n = min(n, k)
             calls += [self._copy(op, sig, instances, c) for c in range(1, min(n, m))]
             calls += [
@@ -657,13 +669,26 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
 
 
 def _replay(fn, calls) -> list[float]:
-    """Each timed replay of one graph of `calls`, in ns per call."""
+    """Each timed replay of one graph of `calls`, in ns per call. Over several
+    ranks, a decode step's graph is captured as ATOM captures one, each
+    collective on the buffers it registered, and every rank takes a barrier
+    before each replay."""
+    import contextlib
+
+    from atom.compass.bench.ranks import cpu_group
     from atom.utils import forward_context
 
+    group = cpu_group()
+    registered = group is not None and not calls[0][1].context.is_prefill
+    if registered:
+        from aiter.dist.parallel_state import graph_capture
     graph = torch.cuda.CUDAGraph()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+        with (
+            graph_capture() if registered else contextlib.nullcontext(),
+            torch.cuda.graph(graph, capture_error_mode="thread_local"),
+        ):
             for kwargs, snap in calls:
                 forward_context._forward_context = snap
                 fn(**kwargs)
@@ -672,6 +697,8 @@ def _replay(fn, calls) -> list[float]:
     start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
     times = []
     for i in range(WARMUPS + REPEATS):
+        if group is not None:
+            torch.distributed.barrier(group=group)
         start.record()
         graph.replay()
         end.record()
@@ -851,6 +878,7 @@ CONTEXT_MOVES = 0.10
 def plan(store, key, config, run, args, command: str, out: Path) -> None:
     """Measure the points the steps of `--plan`'s record directories call for,
     round by round, and write every point held to plan.jsonl in `out`."""
+    from atom.compass.bench import ranks
     from atom.compass.capture import population_steps
     from atom.compass.capture.forward import decode
     from atom.compass.runner.overrides import schedulable_ladder
@@ -885,7 +913,8 @@ def plan(store, key, config, run, args, command: str, out: Path) -> None:
                     found[sig] = op, instances
             todo += [(shape, context, found)] if found else []
         print(f"round {n}: {sum(len(f) for *_, f in todo)} points to measure")
-        results = _child(measure, config, todo, args.llc_mib << 20) if todo else []
+        gpus = len(run["device"])
+        results = ranks.measure(config, todo, args.llc_mib << 20, gpus) if todo else []
         (out / f"round{n}").mkdir(exist_ok=True)
         publish(store, key, config, run, command, results, out / f"round{n}")
         done.update(((r["shape"], r["context"], r["leaf"]), r) for r in results)
@@ -896,7 +925,7 @@ def plan(store, key, config, run, args, command: str, out: Path) -> None:
     dependent, want = _dependent(done.values()), defaultdict(set)
     for shape in rungs:
         for sig, (op, _) in graphs[shape].items():
-            if dependent.get(op["op"], True):
+            if dependent.get(op["op"], True) and not exchange(op):
                 for c in _ladder(contexts):
                     want[shape, c].add(_family(shape, c, op["op"], sig, dependent)[0])
     prefills, cached = set(), defaultdict(list)
@@ -985,7 +1014,7 @@ def coverage(store, root, config, names, records) -> dict:
                 )
             elif fam not in axes:
                 whys[name] = "no measured point"
-            elif shape.phase == "decode":
+            elif shape.phase == "decode" and not _exchanged(fam):
                 whys[name] = (
                     _bracket(*axes[fam], *_rows(line, shape.seqs)) if moves else ""
                 )
@@ -1053,10 +1082,52 @@ def _abstract(value, n: int):
     return "T" if type(value) is int and value == n else value
 
 
+#: Leaf kinds that exchange rows between ranks (`exchange`).
+COLLECTIVES = (
+    "atom.model_ops.moe:",
+    "mori.ops.dispatch_combine:",
+    "aiter.all_reduce_.",
+    "_c10d_functional.all_",
+    "_c10d_functional.broadcast.",
+    "_c10d_functional.reduce_scatter",
+)
+
+
+def exchange(op: dict) -> list | None:
+    """A collective leaf's family, decode and prefill alike, and its message
+    bytes, the axis it is priced over: the family is its kind, each tensor
+    argument's dtype and row width, its output rows' widths and its arguments
+    neither tensors nor numbers; the bytes the largest of its tensors and its
+    outputs, at its first tensor's dtype. None for any other leaf."""
+    import math
+
+    if not op["op"].startswith(COLLECTIVES):
+        return None
+    tensors = [s for _, s in _specs(op["args"])]
+    size = _dtype(tensors[0]["dtype"]).itemsize
+    nbytes = max(
+        [math.prod(t["shape"]) * _dtype(t["dtype"]).itemsize for t in tensors]
+        + [math.prod(o) * size for o in op["out"]]
+    )
+    fam = {
+        "op": op["op"],
+        "tensors": [[t["dtype"], t["shape"][1:], t["stride"][1:]] for t in tensors],
+        "out": [o[1:] for o in op["out"]],
+        "flags": {s: v for s, v in op["args"].items() if isinstance(v, (bool, str))},
+    }
+    return [json.dumps(["exchange", fam], sort_keys=True), nbytes]
+
+
+def _exchanged(fam: str) -> bool:
+    return json.loads(fam)[0] == "exchange"
+
+
 def _family(shape, context, op: str, sig: str, dependent: dict):
     """The family a leaf's point belongs to, and where on its axis: a decode
     leaf at its width over context; a prefill leaf over its tokens, at its rows
     and cached tokens too when its kind depends on context."""
+    if ex := exchange(json.loads(sig)):
+        return tuple(ex)
     if shape.phase == "decode":
         return json.dumps([str(shape), sig]), context
     leaf = _abstract(json.loads(sig), shape.tokens)
@@ -1136,8 +1207,10 @@ def _band(ats, lo, hi) -> slice | None:
 def _densify(families, tried: set) -> dict:
     """The point halfway between each two neighbours of a family, or of a
     prefill leaf's token count over cached tokens (`_cut`), that launched
-    different kernels and lie more than one apart, unless `tried`."""
-    from atom.compass.capture.forward import prefill
+    different kernels and lie more than one apart, unless `tried`; between two
+    points of a collective's family, the step of the rows halfway, a decode
+    when the farther is one, else a prefill of one sequence."""
+    from atom.compass.capture.forward import decode, prefill
 
     across = defaultdict(list)
     for fam, points in families.items():
@@ -1147,7 +1220,7 @@ def _densify(families, tried: set) -> dict:
     want = defaultdict(set)
     for fam, points in [*families.items(), *across.items()]:
         points = sorted(points, key=lambda p: p[0])
-        for (a, ka, record), (b, kb, _) in itertools.pairwise(points):
+        for (a, ka, record), (b, kb, other) in itertools.pairwise(points):
             mid = (a + b) // 2
             if ka == kb or b - a < 2 or (fam, mid) in tried:
                 continue
@@ -1156,6 +1229,11 @@ def _densify(families, tried: set) -> dict:
             if isinstance(fam, tuple):  # over cached tokens at one token count
                 new = json.dumps([*json.loads(fam[0]), mid], sort_keys=True)
                 want[shape, mid].add(new)
+            elif _exchanged(fam):
+                far = _shape(other["shape"])
+                rows = (shape.tokens + far.tokens) // 2
+                step = decode(rows) if far.phase == "decode" else prefill(rows, 1)
+                want[step, other["context"]].add(fam)
             elif shape.phase == "decode":
                 want[shape, mid].add(fam)
             else:
