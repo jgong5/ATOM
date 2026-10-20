@@ -137,7 +137,7 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     some ranks only are refused.
     So is a record whose run.json, beside `record`, names `aiter_jit_builds`.
     """
-    run = Path(record).parent / "run.json"
+    run = Path(record).resolve().parent / "run.json"
     if run.is_file() and (built := aiter_jit.refusal(json.loads(run.read_text()))):
         raise ValueError(f"{record} is not costed: {built}")
     ranks = sorted(Path(record).glob("dp*[0-9].jsonl"))

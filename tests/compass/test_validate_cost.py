@@ -349,3 +349,22 @@ def test_the_command_refuses_a_record_whose_server_built_an_aiter_module(
     named = f"{record} is not costed: aiter ran a JIT build of ['mha_varlen_fwd'] while"
     with pytest.raises(ValueError, match=re.escape(named)):
         main([str(record), str(law)])
+
+
+@pytest.mark.parametrize("spelling", [".", "../elsewhere/link"])
+def test_the_command_refuses_the_record_named_from_inside_it_or_by_a_link(
+    tmp_path, monkeypatch, spelling
+):
+    """Its run.json is found beside the directory `spelling` resolves to, run
+    from inside the record."""
+    record = _record(tmp_path / "steps", _steps())
+    (tmp_path / "run.json").write_text(json.dumps({BUILDS: ["mha_varlen_fwd"]}))
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "elsewhere/link").symlink_to(record)
+    law = tmp_path / "law.json"
+    law.write_text(json.dumps(LAW))
+    monkeypatch.chdir(record)
+
+    named = f"{spelling} is not costed: aiter ran a JIT build of ['mha_varlen_fwd']"
+    with pytest.raises(ValueError, match=re.escape(named)):
+        main([spelling, str(law)])
