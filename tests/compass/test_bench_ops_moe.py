@@ -136,3 +136,17 @@ def test_a_model_of_two_routings_refuses_by_name():
 
     with pytest.raises(ValueError, match=r"route \(experts, top-k\) \[\(8, 2\)"):
         stub._copy(MOE, "sig", [{}], 0)
+
+
+@pytest.mark.parametrize("streams", [None, 4])
+def test_the_stub_hands_the_logits_head_each_token_s_residual_streams(streams):
+    # DeepSeek-V4's logits head reduces `hc_mult` residual streams a token; a
+    # model without them takes one hidden state a token.
+    runner = _Runner()
+    runner.config.hf_config.get_text_config().hc_mult = streams
+    stub, got = ops.Stub(runner, 10_000), []
+
+    with patch.object(runner.model, "forward", lambda *a: got.append(stub(*a))):
+        runner.forward((0, 0))
+
+    assert got[0].shape == ((2, 4, 3) if streams else (2, 3))

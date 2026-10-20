@@ -400,9 +400,11 @@ class Stub:
         snap.attn_metadata = _deep(fc.attn_metadata, memo, self.clones)
         snap.context = _deep(fc.context, memo, self.clones)
         self.placed.append((snap, meta))
-        hidden = self.runner.config.hf_config.get_text_config().hidden_size
-        dtype = self.runner.config.torch_dtype
-        return input_ids.new_zeros((len(input_ids), hidden), dtype=dtype)
+        text = self.runner.config.hf_config.get_text_config()
+        # DeepSeek-V4 hands its logits head `hc_mult` residual streams a token
+        streams = (text.hc_mult,) if getattr(text, "hc_mult", None) else ()
+        shape = (len(input_ids), *streams, text.hidden_size)
+        return input_ids.new_zeros(shape, dtype=self.runner.config.torch_dtype)
 
     def point(self, rule, shape, context, found) -> list[dict]:
         """Each leaf of `found` timed at `shape` on `point_rows`."""
