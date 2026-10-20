@@ -10,6 +10,7 @@ import contextlib
 import dataclasses
 import functools
 import json
+import os
 import pathlib
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -832,3 +833,16 @@ def test_a_measured_point_is_keyed_by_the_spec_of_the_platform_it_ran_on(
         at.token(),
         key("decode B=2", 9, "b").token(),
     ]
+
+
+def test_the_capture_child_starts_with_every_gpu_hidden_below_hip(monkeypatch):
+    # The capture sets HIP_VISIBLE_DEVICES itself, so only ROCm's own mask
+    # keeps it off every GPU.
+    started = {}
+    monkeypatch.setattr(ops, "_child", lambda fn, argv: started.update(os.environ))
+    monkeypatch.setattr("atom.compass.capture.forward.device_arch", lambda: "gfx942")
+    config = SimpleNamespace(model="m", tensor_parallel_size=1)
+
+    ops._capture(config, [decode(4)], "store")
+
+    assert started["ROCR_VISIBLE_DEVICES"] == ""

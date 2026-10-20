@@ -1180,7 +1180,9 @@ def _capture(config, shapes, root) -> None:
     for s in shapes:
         argv += ["--prefill", str(s.tokens)] if s.phase == "prefill" else ["--width"]
         argv.append(str(s.seqs))
-    with patch.dict(os.environ, HIP_VISIBLE_DEVICES="", CUDA_VISIBLE_DEVICES=""):
+    # The capture sets HIP_VISIBLE_DEVICES itself, and HIP then holds memory on
+    # the GPU it names; ROCm's own mask, below HIP's, hides every GPU.
+    with patch.dict(os.environ, ROCR_VISIBLE_DEVICES=""):
         _child(capture.main, [*argv, "--store", str(root)])
 
 
