@@ -28,7 +28,9 @@ DeepSeek-V4's MoE takes the step roofline's expectation under independent
 uniform routing: the routed experts run the rows the leaf holds, under expert
 parallelism the busiest rank's expected share, at the format the op quantizes
 its rows to, and read each activated expert once; an exchange's group width
-is read off its own shapes.
+is read off its own shapes. ATOM's Triton experts under expert parallelism
+are refused: their leaf states neither the expert count nor the activation
+format.
 """
 
 from __future__ import annotations
@@ -253,6 +255,15 @@ def _fused_moe(op, view, tp, kv) -> Work:
     )
 
 
+def _triton_experts(op, view, tp, kv) -> Work:
+    raise _Unpriced(
+        "the leaf states neither how many experts its rows were routed over "
+        "(expert_map is routing_from_dispatched's argument), nor whether its "
+        "kernels run a8w4 or a4w4 (it reads ATOM_USE_TRITON_MOE_A4W4, and the "
+        "capture holds act_quant as its type)"
+    )
+
+
 def _mori(*payload, dispatch: bool):
     """MORI's dispatch, or its combine back: each of this rank's tokens, its
     `payload` rows, goes to every other rank holding one of its `k` experts.
@@ -418,6 +429,7 @@ def _aten(op, view, tp, kv) -> Work | None:
 #: The extractor of each op kind but aten's, by the name a leaf carries.
 MOE = "atom.model_ops.moe:"
 MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp."
+TRITON_MOE = "atom.model_ops.fused_moe_triton:"
 V4_INDICES = "atom.model_ops.v4_kernels.paged_"
 V4 = "atom.model_ops.v4_kernels."
 #: What V4's fused QK norm and RoPE writes: Q and K, each as its fp8 values
@@ -473,6 +485,9 @@ EXTRACTORS = {
     "aiter.topk_gating_fwd.default": _in_place(),
     "atom.model_ops.triton_hash_topk:hash_topk_triton": _gather("tid2eid"),
     "aiter.fused_moe_.default": _fused_moe,
+    # The lift records no outputs, so the routing's writes are left out.
+    TRITON_MOE + "routing_from_dispatched": _in_place(),
+    TRITON_MOE + "_fused_experts_silu_gugu": _triton_experts,
     MOE + "all_gather_with_padding": _dp_exchange,
     MOE + "all_gatherv": _dp_exchange,
     MOE + "reduce_scatter_with_unpadding": _dp_exchange,

@@ -32,6 +32,7 @@ F32, FP8, FP4 = "torch.float32", "torch.float8_e4m3fn", "torch.float4_e2m1fn_x2"
 E8M0, U8 = "torch.float8_e8m0fnu", "torch.uint8"
 ATTENTION = "aiter.v4_attention_with_output.default"
 MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp."
+TRITON = "atom.model_ops.fused_moe_triton:"
 DECODE = "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_asm"
 #: A machine stating an fp4 rate, as gfx950 does: V4-Pro's experts run at it.
 SPEC = machine(fp4_flops=10e15)
@@ -209,6 +210,43 @@ def test_a_hashed_route_does_not_count_its_whole_table():
     )
 
     assert work(op, ONE, 1, "bf16") == Work({}, 8 * 4 + 8 * 16 * 2 + 8 * 2 * 8)
+
+
+def test_atom_s_triton_ep_routing_reads_its_routes_once():
+    op = leaf(
+        TRITON + "routing_from_dispatched",
+        dispatch_weights=t([8, 6], F32),
+        dispatch_ids=t([8, 6], I32),
+        expert_map=t([385], I32, role="weight"),
+        num_local_experts=48,
+        num_local_tokens=t([1], I32),
+        ep_scatter_geometry=None,
+    )
+
+    assert work(op, ONE, 1, "bf16") == Work({}, 8 * 6 * 4 * 2 + 385 * 4 + 4)
+
+
+def test_atom_s_triton_ep_experts_are_refused_naming_what_the_leaf_lacks():
+    # As the capture records them under ATOM_USE_TRITON_MOE=1 and EP8: the
+    # rows, their routes and four of the experts, but neither the expert count
+    # nor the activations the fused SiLU kernels run.
+    op = leaf(
+        TRITON + "_fused_experts_silu_gugu",
+        hidden_states=t([8, 64]),
+        w1=t([4, 32, 64], U8, [2048, 1, 32], "weight"),
+        w2=t([4, 16, 64], U8, [1024, 1, 16], "weight"),
+        routing_data="<RoutingData>",
+        gather_indx=t([16], I32),
+        scatter_indx=t([16], I32),
+        w13_scale=t([4, 64, 2], U8, [128, 1, 64], "weight"),
+        w2_scale=t([4, 32, 2], U8, [64, 1, 32], "weight"),
+        a13_scale=None,
+        gate_valid=t([16], I32),
+        act_quant="<MoEActivationQuant>",
+    )
+
+    with pytest.raises(CostRefused, match="how many experts .* a8w4 or a4w4"):
+        work(op, ONE, 1, "bf16")
 
 
 def test_an_index_build_is_one_launch():
