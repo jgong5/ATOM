@@ -919,7 +919,8 @@ Their exchanges with other ranks are **declared nodes** (D21), as #1401 and the
 since a TBO step lays MORI's dispatch and combine on the comm stream as ops of their own.
 Each is named `module:qualname` for the function ATOM calls, its arguments by that
 function's parameter names: the DP gather and reduce-scatter as `atom.model_ops.moe`'s
-functions, MORI's dispatch and combine as `EpDispatchCombineOp`'s methods. A capture runs
+functions, MORI's dispatch and combine as `EpDispatchCombineOp`'s methods, which also
+state the EP width ATOM built their handle for (`num_ep_ranks`). A capture runs
 one rank, so each exchange's rows are stated, every peer at this rank's shape but for
 its token count: the peers split evenly the rows the shape's MoE gathers, G, less this
 rank's, every peer at this rank's count when G is its default (`capture/peers.py`;
