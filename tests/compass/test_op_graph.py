@@ -377,7 +377,7 @@ def test_a_gather_of_token_ids_runs_inline_on_the_compute_stream():
             False,
             "does not say whether it produces output",
         ),
-        (replace(SPLIT, image_tokens=5), layers(), False, "5 image tokens"),
+        (replace(SPLIT, image_tokens=5), layers(), False, "a step with image tokens"),
     ],
     ids=[
         "split-send-recv",
