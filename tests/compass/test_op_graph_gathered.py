@@ -19,13 +19,14 @@ from test_dp_step_max import prefill, runner
 from test_moe_gather_rows import decode
 from test_op_graph import by_name, g
 from test_op_work import ONE, leaf, t
+from test_op_work_v4 import close, experts, moe
 from test_work import SPEC
 
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
-from atom.compass.backends import CostRefused
+from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
-from atom.compass.backends.work import gemm, price
+from atom.compass.backends.work import activated_experts, gemm, price
 from atom.compass.capture import population_shapes
 from atom.compass.capture.forward import Shape, structure
 from atom.compass.capture.forward import prefill as prefill_shape
@@ -236,3 +237,13 @@ def test_a_mori_exchange_at_gathered_rows_spans_its_handle_s_width(call):
     [c] = work(exchange, ONE, 1, "bf16").comm
 
     assert c.ranks == DP
+
+
+def test_a_gather_s_pad_rows_activate_experts_as_one_token():
+    # Sixteen rows gathered over the group, five of them real tokens.
+    padded = BatchView(
+        (RequestShape(1, 9, True),), capture_rung=2, moe_rows=16, moe_tokens=5
+    )
+    hit = activated_experts(16, 2, 6)
+
+    close(work(moe(16, 16), padded, 1, "bf16"), experts(16, 32, hit))

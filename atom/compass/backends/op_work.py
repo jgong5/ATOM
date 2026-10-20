@@ -226,6 +226,8 @@ def _fused_moe(op, view, tp, kv) -> Work:
     expert's gate-up and down products: an expectation under uniform routing.
     Under expert parallelism `expert_mask` spans every rank's experts, of which
     this rank holds `w1`'s, and it runs the busiest rank's expected share.
+    A DP gather's pad rows (`moe_tokens` real among them) all carry token 0,
+    so they activate experts as one token.
 
     With a nonzero `quant_type` the op quantizes `hidden_states` to the
     weights' format inside it, so both products run at that format; otherwise
@@ -237,7 +239,9 @@ def _fused_moe(op, view, tp, kv) -> Work:
     local, up = args["w1"]["shape"][:2]
     mask = args.get("expert_mask")
     ranks = mask["shape"][0] // local if mask else 1
-    routed, groups = rows * k, activated_experts(local * ranks, k, rows)
+    real = view.moe_tokens
+    distinct = rows if real is None else min(rows, real + 1)
+    routed, groups = rows * k, activated_experts(local * ranks, k, distinct)
     if ranks > 1:
         routed = max_rank_load(rows, k, local * ranks, ranks)
         groups /= ranks
