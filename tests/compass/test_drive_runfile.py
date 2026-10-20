@@ -520,10 +520,3 @@ def test_a_prefill_decode_op_graph_whose_sides_name_two_price_lists_refuses(
 
     with pytest.raises(ValueError, match="the decode side's .*'tp': 2"):
         runfile.prefill_decode(args, model, [*model, "-tp", "2"])
-
-
-def test_coverage_under_op_graph_refuses_naming_the_flag(tmp_path):
-    with pytest.raises(ValueError, match="^--coverage: --op-graph has no coverage"):
-        drive_run.main(
-            ["--op-graph", *MACHINE_AND_STORE, "--coverage", "x", "--out", "o"]
-        )

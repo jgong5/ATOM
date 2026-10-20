@@ -22,10 +22,10 @@ import test_drive_trace_steps
 import torch
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_dp_step_max import runner
-from test_drive_runfile import build
+from test_drive_runfile import build, price_list_key, published
 from test_drive_trace_steps import IDENTITY
 from test_memory_readings import ASSUMED, DOCUMENT, READINGS
-from test_op_graph import BENT, GEMM, g
+from test_op_graph import BENT, GEMM, g, listed, pt
 from test_refused_step_continues import REFUSED, drive, finish, no_eager_rung
 from test_refused_step_continues import run_file as refusing_run_file
 from test_run_graph_pool import _installed
@@ -412,11 +412,13 @@ def step_line(*rows, rung=None):
     return {"rows": [list(r) for r in rows], "rung": rung, "produces_output": True}
 
 
-def test_op_coverage_counts_covered_steps_by_phase_and_why_each_kind_left_one_out():
-    def graph(phase, *shape):
-        return {"seq": [g(2, 64, 64)]} if phase == "decode" else None
+def decode_gemm(phase, *shape):
+    """A decode step's graph, one GEMM; a prefill has none."""
+    return {"seq": [g(2, 64, 64)]} if phase == "decode" else None
 
-    backend = OpGraphBackend(SPEC, graph, kv="bf16", price_list=BENT)
+
+def test_op_coverage_counts_covered_steps_by_phase_and_why_each_kind_left_one_out():
+    backend = OpGraphBackend(SPEC, decode_gemm, kv="bf16", price_list=BENT)
     steps = [
         step_line(*[(1, 2000, True)] * 2, rung=2),  # on a measured point
         step_line(*[(1, 1500, True)] * 2, rung=2),  # along the line the fit declined
@@ -446,3 +448,67 @@ def test_op_coverage_counts_covered_steps_by_phase_and_why_each_kind_left_one_ou
             },
         },
     }
+
+
+def op_graph_run(tmp_path, monkeypatch, steps, price_list):
+    """Serve from the planted server, which writes the record `steps`, with
+    ATOM's arguments resolving the deployment `bundle` does and the store
+    holding `price_list`'s params at its run's key when one is given, each
+    graph `decode_gemm`."""
+    bounds = {k: ENGINE[k] for k in ("max_num_seqs", "max_num_batched_tokens")}
+    r = deployment(tmp_path, **bounds, capture_sizes=LADDER)
+    monkeypatch.setattr(drive_run, "_config", lambda atom_args: r.config)
+    monkeypatch.setattr(compass_run, "_op_graphs", lambda *args: decode_gemm)
+    if price_list:
+        key = price_list_key(tmp_path)
+        published(tmp_path, r, Kind.PRICE_LIST, key, price_list.params)
+    (tmp_path / "authority").mkdir()
+    summary = tmp_path / "authority" / compass_run.SUMMARY_FILE
+    summary.write_text(json.dumps({"schedule": {"refusals": RefusalTally().record()}}))
+    plant(tmp_path, monkeypatch, steps, summary)
+
+
+def test_an_op_graph_run_records_its_price_list_s_coverage_in_run_json(
+    tmp_path, monkeypatch
+):
+    directory = recorded(tmp_path, monkeypatch, MIXED)
+    lines = [json.loads(x) for x in (directory / "steps/dp0.jsonl").open()]
+    lines = [line for line in lines if not line["is_dummy_run"]]
+    decode = [line for line in lines if all(row[2] for row in line["rows"])]
+    # The GEMM measured at each decode step's width and longest row.
+    widths = {
+        (line["rung"] or len(line["rows"]), max(row[1] for row in line["rows"]))
+        for line in decode
+    }
+    points = [pt(g(2, 64, 64), f"decode B={b}", 1e3, c) for b, c in widths]
+    op_graph_run(tmp_path, monkeypatch, directory / serve.STEPS, listed(*points))
+
+    drive_run.main(flags(tmp_path, "--op-graph", "--coverage", str(directory)))
+
+    coverage = json.loads((tmp_path / "out" / serve.RUN_JSON).read_text())["coverage"]
+    left_out = coverage.pop("left out, by leaf kind")
+    prefill = len(lines) - len(decode)
+    assert 0 < len(decode) < len(lines)
+    assert coverage == {
+        "inputs": [str(directory)],
+        "steps": len(lines),
+        "covered": len(decode),
+        "share": len(decode) / len(lines),
+        "by phase": {
+            "decode": {"steps": len(decode), "covered": len(decode)},
+            "prefill": {"steps": prefill, "covered": 0},
+        },
+    }
+    assert left_out.keys() == {"step refused"}
+    assert sum(left_out["step refused"].values()) == prefill
+
+
+def test_coverage_of_an_op_graph_run_with_no_price_list_refuses_before_any_server(
+    tmp_path, monkeypatch
+):
+    directory = recorded(tmp_path, monkeypatch, SHORT)
+    op_graph_run(tmp_path, monkeypatch, directory / serve.STEPS, None)
+    monkeypatch.setattr(serve, "serve", unstarted)
+
+    with pytest.raises(ValueError, match="^--coverage: the store holds no price_list"):
+        drive_run.main(flags(tmp_path, "--op-graph", "--coverage", str(directory)))
