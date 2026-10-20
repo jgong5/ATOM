@@ -304,6 +304,7 @@ NO_SUMMARY = "summary.json or client-0/summary.json; a simulated run holds one"
         (f"step_linear/{AIPERF}", f"['step_linear'] {NO_EXPORT}"),
         ("step_linear/summary.json", f"step_linear holds no run summary, {NO_SUMMARY}"),
     ],
+    ids=["real1 export", "step_linear export", "step_linear summary"],
 )
 def test_a_run_still_recording_refuses_naming_it(tmp_path, missing, refusal):
     """`cctraces_sim.sh` writes run.json before its server starts, and the
