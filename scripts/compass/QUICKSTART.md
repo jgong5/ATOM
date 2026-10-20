@@ -118,7 +118,9 @@ serve() {
 
 `client.sh`'s flags and exit codes are in its header. Before the graded window
 it runs aiperf's scenario warmup, the one `calib_capture.sh` runs: for each session
-active at a trajectory's sampled start, its last request before it. Grading
+active at a trajectory's sampled start, its last request before it. At c=16 on
+traces 0 to 255 that is 15 requests, which took 1334 s on one MI308X of
+hjbog-srdc-39 ([#1760](https://github.com/jgong5/ATOM/issues/1760)). Grading
 refuses a run whose warmup is missing or overlaps its graded steps.
 
 ## The path
