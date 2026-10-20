@@ -577,11 +577,11 @@ class HttpChannel:
 
     Taking in a stamped request other than a cancel costs the event loop
     ``fixed_s + body bytes x per_byte_s`` (`atom.compass.run.http_intake`),
-    with ``idle_s`` for ``fixed_s`` when the request arrives once the last
-    intake has ended. It is charged on the loop once its body is read, every
-    open tokenizer station job is placed and the callbacks due by then have
-    run (`SimExecutor.placed`), so a burst reaches the app one request at a
-    time. A run file with no machine spec charges nothing.
+    charged on the loop once its body is read, every open tokenizer station job
+    is placed and the callbacks due by then have run (`SimExecutor.placed`), so
+    a burst reaches the app one request at a time. A request that arrives once
+    the last intake has ended is charged ``idle_s`` in place of ``fixed_s``. A
+    run file with no machine spec charges nothing.
     """
 
     def __init__(self, app, stamp) -> None:

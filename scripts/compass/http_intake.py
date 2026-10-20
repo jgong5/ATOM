@@ -7,12 +7,11 @@
     python3 scripts/compass/http_intake.py idle STAMPS [PER_BYTE_S]
 
 `serve` runs `atom.entrypoints.openai.api_server` as ``python3 -m`` does and
-appends ``<end ns> <thread id> body|tmpl|app|prep <start ns> <size>`` to STAMPS
-for each request body first read (`Request.body`), chat template rendered
-(`apply_chat_template`), HTTP request handed to the ASGI app
-(`Starlette.__call__`, size 0) and tokenizer pool job
-(`InputOutputProcessor.preprocess_fanout`, size 0); `cctraces_sim.sh` runs it
-when HTTP_INTAKE is set.
+appends ``<end ns> <thread id> body|tmpl|app|prep <start ns> <size>`` to STAMPS for
+each request body first read (`Request.body`), chat template rendered
+(`apply_chat_template`) and HTTP request handed to the ASGI app
+(`Starlette.__call__`, size 0); `cctraces_sim.sh` runs it when HTTP_INTAKE is set.
+`prep` is a tokenizer pool job (`InputOutputProcessor.preprocess_fanout`, size 0).
 
 `floor` reads the transport from client send to ASGI app call off a server
 `serve` ran and the parity workload's real-run ARRIVALS

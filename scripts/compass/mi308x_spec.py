@@ -10,11 +10,12 @@ not the ones the device fragment recorded there. The device fragment is what
 ATOM's own `ModelRunner` read at one engine start (Qwen3.8-27B, TP1, CUDA
 graphs and prefix caching on, `--max-model-len 262144`): the device, its
 capacity and the stack; every field no probe fills is assumed, on either host.
-One real burst on each host adds the HTTP intake terms (`INTAKE`); on node 18,
-64 lone requests add the idle intake (`IDLE`), and `probe_device.py`'s readings
-(`PEAKS`) the compute and memory derates, the bandwidth curve, the kernel floor
-and the intra-node link's latency and derate. An engine start's memory readings
-are `compass measure memory`'s, not the spec's. One fragment per probe or origin. Writes the merged document to `--out` when
+One real burst on each host adds the HTTP intake terms (`INTAKE`), and on
+node 18 `probe_device.py`'s readings (`PEAKS`) the compute and memory derates,
+the bandwidth curve, the kernel floor and the intra-node link's latency and
+derate; there 64 lone requests add the idle intake (`IDLE`). An engine start's
+memory readings are `compass measure memory`'s,
+not the spec's. One fragment per probe or origin. Writes the merged document to `--out` when
 `validate` passes, then prints `explain`'s rows for the host, device and
 interconnect blocks, grouped by origin.
 `--sweep-from` takes the tokenizer sweep from a document this script wrote.
