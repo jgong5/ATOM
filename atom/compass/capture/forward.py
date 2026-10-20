@@ -257,11 +257,13 @@ class _Recorder(TorchDispatchMode):
     the kernel languages' own frames, closures and generic launchers (the
     kernel is one of the frame's arguments or an attribute of its `self`), the
     first function its `module:qualname` names. An untraced step finds these
-    functions (`launchers`); in a traced step each call of one is a leaf, its
-    arguments taken at entry, what it runs inside (another launching
-    function, an operator) folded into it, and it is called again, rebuilt
-    from its contract under the fake mode, to check it launches the same
-    kernels. A launch in a traced step outside every such call is refused.
+    functions (`launchers`); in a traced step each call of one that launches
+    a kernel or dispatches an operator outside torch's is a leaf, its
+    arguments taken at entry, what it runs inside (another launching function,
+    an operator) folded into it. It is called again, rebuilt from its contract
+    under the fake mode, to check it launches those kernels and dispatches
+    those operators again. A launch in a traced step outside every such call
+    is refused.
     """
 
     def __init__(self, contexts, fake_mode=None):
@@ -310,8 +312,13 @@ class _Recorder(TorchDispatchMode):
                 if storage not in read:
                     self.roles[storage] = self.creating
         name = str(func)
+        torch_own = name.split(".")[0] in TORCH_NAMESPACES
+        if not torch_own and not name.startswith(UNDISPATCHED):
+            if self.replaying is not None:
+                self.replaying.append(name)
+            elif self.on and self.leaf is not None:
+                self.kernels.append(name)
         if self.on and not name.startswith(UNDISPATCHED):
-            torch_own = name.split(".")[0] in TORCH_NAMESPACES
             kind = ir.NodeKind.CAPTURED if torch_own else ir.NodeKind.OPAQUE_LEAF
             stack = _atom_frames()
             why = "h2d" if stack and _where(stack[0]).startswith(H2D) else None
