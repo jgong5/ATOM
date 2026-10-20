@@ -22,12 +22,12 @@ printed and wrote. They learn Compass from their own run.
    to stop. Where those files and this one disagree, the files win: tell the
    developer what differs.
 2. **Announce, ask, run, explain.** Before each step say what it does, what it
-   holds (which GPU, how long it takes, how much disk and where) and what success
-   looks like, from QUICKSTART's own figures and success lines. Then ask, and
-   run it only on a yes. After it, explain it from its outputs (Explaining a
-   step). A check or a file read holds nothing and needs no yes. For a step
-   QUICKSTART gives no size for (the tree, the venv), say it is small next to
-   the runs and report its `du -sh` after.
+   holds (which GPU, how long it takes, how much disk and where) and what
+   success looks like, from QUICKSTART's own figures and success lines. Then
+   ask, and run it only on a yes. After it, explain it from its outputs
+   (Explaining a step). A check or a file read holds nothing and needs no
+   yes. For a step QUICKSTART gives no size for (the tree, the venv), say it is
+   small next to the runs and report its `du -sh` after.
 3. **Stop on any failure.** A non-zero exit, a refusal, or an output you cannot
    explain stops the session at that step: read it (Reading a failure), tell the
    developer the cause and the fix, and ask before anything runs again. Never
@@ -36,9 +36,11 @@ printed and wrote. They learn Compass from their own run.
    - A GPU only while the GPU check (Checks) reads it idle; check again before
      each GPU step.
    - `HIP_VISIBLE_DEVICES` set to the GPU's HIP ordinal in every container
-     shell that runs a step (`docker exec -e`). The compass commands set their servers' own from
-     `--gpu`; this keeps anything else in that shell on the same GPU.
-   - Containers named `<user>_<purpose>`, `<user>` from `id -un`, such as
+     shell that runs a step (`docker exec -e`). The compass commands set their
+     servers' own from `--gpu`; this keeps anything else in that shell on the
+     same GPU.
+   - Containers named `<user>_<purpose>`, `<user>` from `id -un`: QUICKSTART's
+     `<user>_<issue>_gpu` with a purpose for the issue, such as
      `<user>_compass_onboard`. Act only on containers whose name starts with
      `<user>_`. Never stop, remove, enter or signal another user's container or
      process, even one holding the GPU you wanted.
@@ -46,9 +48,10 @@ printed and wrote. They learn Compass from their own run.
 
 ## Checks, before anything starts
 
-Each is read-only; report each in one line. The first that fails refuses and
-ends the session: say what failed, what is missing, and that nothing was
-started.
+Each is read-only; report each that passes in one line. The first that fails
+refuses and ends the session: say what failed, what is missing, and that
+nothing was started. A check that offers the developer a choice (Disk) runs
+again on their answer, and refuses only when that fails too.
 
 1. **Target.** Ask which machine they want Compass to simulate; the default is
    the one they are on. A target with no hardware they can run, such as MI455,
@@ -67,8 +70,9 @@ started.
    - no profile names this host: name the host, its GPUs' GFX version and DID,
      the directory searched and what a profile states, and whether
      `scripts/compass/machines/` has a spec whose `device.arch` is that GFX
-     version (a spec says what the device is, not how to run on this node);
-   - the profile lacks a field Profiles lists;
+     version (specs are named for device and host; a spec says what the device
+     is, not how to run on this node);
+   - the profile lacks a front-matter field or a heading Profiles lists;
    - the machine spec it names is not in the tree;
    - the GPUs' GFX version or DID differs from the profile's, or the GFX
      version from the spec's `device.arch`;
@@ -77,12 +81,16 @@ started.
 3. **Runtime.** The profile's container tool runs for this user (`docker ps`),
    and its image is present (`docker image inspect`). A missing image does not
    refuse, but its pull is a step of its own: announce its size and ask.
-4. **Disk.** `df -h` on the profile's data directory and on Docker's storage
-   (`docker info -f '{{.DockerRootDir}}'`), where the container's writable
-   layer grows unless the profile mounts its caches elsewhere. QUICKSTART's
-   Disk says what the smoke cell and the container's cache take. Too little room
-   in either refuses: offer the profile's fallback or ask for a directory with
-   room. Never write to the root disk.
+4. **Disk.** `df -h`, as the developer, on the profile's data directory and
+   on Docker's storage (`docker info -f '{{.DockerRootDir}}'`). The data
+   directory needs what QUICKSTART's Disk gives for the path about to run (its
+   runs, the container's cache unless the profile mounts it elsewhere, a running
+   client's map) with room to spare; without it, offer the profile's fallback
+   or ask for a directory with room. Docker's storage takes the container's
+   writable layer, whatever the profile does not mount elsewhere; when it reads
+   no room, give the developer the profile's figure for that layer, say the
+   Docker daemon writes it as root into the disk's reserve, and ask. Never
+   write to the root disk.
 5. **Inputs.** The model directory (QUICKSTART's `MODEL`, inside the profile's
    model repo) holds `config.json`; the traces file's size is QUICKSTART's (its
    sha256 takes a minute: offer it).
@@ -92,10 +100,10 @@ started.
    and QUICKSTART's check reads it at 0% use and 0% VRAM with no process on it.
    Preflight's own compute rows can read 1% on every GPU while its `rocminfo`
    runs; judge by its idle list and the check after it. Ask which GPU they want,
-   within the profile's Allocation. Refuse a busy one, naming its VRAM or use
-   reading or the PID on it, and offer the idle ones, or none. Its HIP ordinal
-   is the entry of preflight's `export HIP_VISIBLE_DEVICES=` line at the GPU's
-   position in the idle list.
+   within the profile's Allocation (ask what it leaves to them). Refuse a busy
+   one, naming its VRAM or use reading or the PID on it, and offer the idle
+   ones, or none. Its HIP ordinal is the entry of preflight's `export
+   HIP_VISIBLE_DEVICES=` line at the GPU's position in the idle list.
 
 Then summarize in one block: host, machine spec, GPU and HIP ordinal, data
 directory, image, container name. Offer the smoke path.
@@ -203,7 +211,7 @@ body, one heading each:
   QUICKSTART's `docker run` needs here.
 - **Allocation**: how a GPU is booked (shared, or by a scheduler) and which.
 - **Inputs**: the model directory and traces, and where they mount.
-- **Disk**: the data directory, where Docker's storage is, and the fallback
-  when either is full.
+- **Disk**: the data directory, where Docker's storage is, the fallback when
+  either is full, and what the container's writable layer takes then.
 
 MI355X has a machine spec, `mi355x-gpu45.json`; its profile follows #1032.
