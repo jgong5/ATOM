@@ -20,7 +20,8 @@ A family's dimensions are the shape's counts its masked integers follow, a
 decode's B always, and, for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
 a prefill's B and the context: a decode point's ``context``, its longest
-row's, or a prefill point's rows' mean cached tokens (`band`). Points at one
+row's, or a prefill point's rows' mean cached tokens (`band`); and a
+prefill's B for a kind its rows move (``("rows", op)``). Points at one
 coordinate, its other counts or contexts dropped, are one point at their mean
 time. `interpolate` prices a query at a measured point as
 that point; between points, multilinearly over the neighbours that bracket it
@@ -211,6 +212,8 @@ def fit(points) -> dict:
             dims = ["B"]  # a decode step's graph is per B
             if "T" in at_p:
                 dims = [d for d in ("T", "B") if d in follows or moves]
+                if "B" not in dims and dependent.get(("rows", p["op"]), False):
+                    dims.append("B")
             dims += ["context"] if moves else []
             f = families.setdefault(
                 family(p["shape"], p["leaf"], free_of[skel]),

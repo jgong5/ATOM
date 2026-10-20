@@ -260,6 +260,14 @@ def test_a_prefill_kind_reads_its_own_prefill_points_on_context_first():
     ]
 
 
+def test_a_prefill_kind_its_rows_move_runs_over_its_rows():
+    # flat in cached tokens, yet twice the time over two rows of one T
+    points = [_prefill(64, 1, 300e3, context=0), _prefill(64, 1, 300e3, context=1024)]
+    points += [_prefill(64, 2, 6e5, context=0)]
+
+    assert _families(points) == [(["B"], [[[1], 300e3], [[2], 6e5]])]
+
+
 def test_points_at_one_coordinate_that_launched_other_kernels_refuse():
     points = [_point(2, 10.0), _point(2, 10.0, "x") | {"rows": [[1, 1024, True]] * 2}]
 
