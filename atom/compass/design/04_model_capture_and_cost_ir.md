@@ -675,7 +675,7 @@ A trace is a straight-line record of one path at one shape, so branch modelling 
 
 | Part | Covers |
 |---|---|
-| **discrete key** | `ForwardMode`, `has_cached`, `produces_output()`, spec width, replayed vs eager, `tbo_on`, attention backend, `is_dummy_run` |
+| **discrete key** | `ForwardMode`, `has_cached`, `produces_output()`, spec width, replayed vs eager, `tbo_on`, attention backend, routed-expert kernel path (aiter or Triton), `is_dummy_run` |
 | **shape** | the decode width, or the prefill (T, B), the graph was captured at |
 
 ATOM already emits most of the discrete key: `atom/model_engine/run_labels.py` builds

@@ -9,13 +9,20 @@ price; the export and the server log are as `test_validate_runs` and
 """
 
 import json
+import re
+import runpy
+import subprocess
+import sys
 
 import pytest
 from test_memory_check import GIB, _log
 from test_validate_cost import LAW, _record, _steps
 from test_validate_runs import ARGUMENTS, EXPORT
 
+from atom.compass import parity
+from atom.compass.backends import json_file, step_labels
 from atom.compass.backends.cost import GROUPS
+from atom.compass.memory.check import parts
 from atom.compass.run import LP_FILE
 from atom.compass.validate.__main__ import main
 from atom.compass.validate.runs import CLIENT_RUN
@@ -247,6 +254,156 @@ def test_a_cell_of_renamed_names_is_refused_naming_their_names_now(capsys, tmp_p
     (cell / "step_linear").rename(cell / "law")
     with pytest.raises(ValueError, match="now named step_linear/"):
         main([str(cell)])
+
+
+def test_a_cell_of_one_real_run_refuses_naming_it_and_the_count(tmp_path):
+    cell = tmp_path / "c4"
+    _run(cell / "real0", [(100, 1000, 100)], refusals=None)
+    _run(cell / "step_linear", [(100, 1000, 120.0)])
+
+    validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
+    done = subprocess.run(validate, capture_output=True, text=True, check=False)
+
+    refusal = f"{cell} holds 1 of real*/; a cell holds two or more real runs\n"
+    assert (done.returncode, done.stderr) == (1, refusal)
+
+
+@pytest.mark.parametrize("bare", ["real1", "step_linear"])
+def test_a_run_without_run_json_refuses_naming_it(tmp_path, bare):
+    cell = tmp_path / "c4"
+    for name in ("real0", "real1"):
+        _run(cell / name, [(100, 1000, 100)], refusals=None)
+    _run(cell / "step_linear", [(100, 1000, 120.0)])
+    # A run `record` or `run` writes holds none until it stops.
+    (cell / bare / "run.json").unlink()
+
+    validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
+    done = subprocess.run(validate, capture_output=True, text=True, check=False)
+
+    refusal = f"{cell}'s ['{bare}'] hold no run.json; every run of a cell holds one\n"
+    assert (done.returncode, done.stderr) == (1, refusal)
+
+
+def _cell(cell):
+    """`cell`, of real0/, real1/ and step_linear/."""
+    for name in ("real0", "real1"):
+        _run(cell / name, [(100, 1000, 100)], refusals=None)
+    _run(cell / "step_linear", [(100, 1000, 120.0)])
+    return cell
+
+
+AIPERF = "artifacts/profile_export_aiperf.json"
+NO_EXPORT = f"hold no {AIPERF}; every run of a cell holds one"
+NO_SUMMARY = "summary.json or client-0/summary.json; a simulated run holds one"
+
+
+@pytest.mark.parametrize(
+    "missing, refusal",
+    [
+        (f"real1/{AIPERF}", f"['real1'] {NO_EXPORT}"),
+        (f"step_linear/{AIPERF}", f"['step_linear'] {NO_EXPORT}"),
+        ("step_linear/summary.json", f"step_linear holds no run summary, {NO_SUMMARY}"),
+    ],
+    ids=["real1 export", "step_linear export", "step_linear summary"],
+)
+def test_a_run_still_recording_refuses_naming_it(tmp_path, missing, refusal):
+    """`cctraces_sim.sh` writes run.json before its server starts, and the
+    export and run summary once its client and server have ended."""
+    cell = _cell(tmp_path / "c4")
+    (cell / missing).unlink()
+
+    validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
+    done = subprocess.run(validate, capture_output=True, text=True, check=False)
+
+    assert (done.returncode, done.stderr) == (1, f"{cell}'s {refusal}\n")
+
+
+def test_a_malformed_run_json_refuses_naming_it(tmp_path):
+    cell = _cell(tmp_path / "c4")
+    (cell / "real1/run.json").write_text("{")
+
+    validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
+    done = subprocess.run(validate, capture_output=True, text=True, check=False)
+
+    what = "Expecting property name enclosed in double quotes: line 1 column 2"
+    refusal = f"{cell}/real1/run.json is not JSON: {what}\n"
+    assert (done.returncode, done.stderr) == (1, refusal)
+
+
+@pytest.mark.parametrize(
+    "command, runs, name",
+    [
+        ("atom.compass.validate", ["c4"], "real1/run.json"),
+        ("atom.compass.validate", ["c4"], "real1/steps/dp0.jsonl"),
+        (
+            "atom.compass.validate.runs",
+            ["c4/step_linear", "c4/real0", "c4/real1"],
+            "real1/run.json",
+        ),
+    ],
+)
+def test_an_input_that_is_not_utf8_refuses_naming_it(tmp_path, command, runs, name):
+    path = _cell(tmp_path / "c4") / name
+    path.write_bytes(b"\xff" + path.read_bytes())
+
+    argv = [sys.executable, "-m", command, *(str(tmp_path / r) for r in runs)]
+    done = subprocess.run(argv, capture_output=True, text=True, check=False)
+
+    what = "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"
+    assert (done.returncode, done.stderr) == (1, f"{path} is not JSON: {what}\n")
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "real1/steps/dp0.jsonl",
+        "real1/artifacts/profile_export.jsonl",
+        "real1/artifacts/profile_export_aiperf.json",
+        "step_linear/summary.json",
+        f"step_linear/{LP_FILE.format('engine')}",
+    ],
+)
+def test_a_malformed_input_refuses_naming_its_path(tmp_path, malformed):
+    path = _cell(tmp_path / "c4") / malformed
+    path.write_text(path.read_text()[:-3])  # its last line cut
+
+    with pytest.raises(ValueError, match=f"^{re.escape(str(path))} is not JSON: "):
+        main([str(tmp_path / "c4")])
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [step_labels.label, lambda p: parity.read(p.parent), lambda p: parts(p, p)],
+)
+def test_the_readers_it_reaches_refuse_a_malformed_file_naming_it(tmp_path, reader):
+    path = tmp_path / "dp0.jsonl"
+    path.write_text('{"step": 0}\n{"step"\n')
+
+    named = f"^{re.escape(str(path))} is not JSON: .*: line 2 "
+    with pytest.raises(ValueError, match=named):
+        reader(path)
+
+
+@pytest.mark.parametrize(
+    "command, runs",
+    [
+        ("atom.compass.validate.__main__", ["c4"]),
+        ("atom.compass.validate.runs", ["c4/step_linear", "c4/real0", "c4/real1"]),
+    ],
+)
+def test_a_json_error_no_reader_names_keeps_its_traceback(
+    tmp_path, monkeypatch, command, runs
+):
+    _cell(tmp_path / "c4")
+
+    def read_json(path):
+        raise json.JSONDecodeError("planted", "{", 1)
+
+    monkeypatch.setattr(json_file, "read_json", read_json)
+    monkeypatch.delitem(sys.modules, command)  # run fresh, on the planted reader
+    monkeypatch.setattr(sys, "argv", [command, *(str(tmp_path / r) for r in runs)])
+    with pytest.raises(json.JSONDecodeError, match="^planted"):
+        runpy.run_module(command, run_name="__main__")
 
 
 def _as_recorded(cell, warmup=()):

@@ -421,7 +421,7 @@ def test_a_target_the_grid_refuses_is_named_and_a_cut_one_counted(tmp_path, run)
 
     [step] = report["unpriced"]
     assert step["step"].endswith(f" dp0 step {len(nodes()) * 4 + 60}")
-    assert "T=8 is outside the prefill output grid's nodes 16..256" in step["reason"]
+    assert "T is below the prefill output grid's nodes 16..256" in step["reason"]
     assert report["cut"] == {"mixed": 1}
 
 

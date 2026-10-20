@@ -8,6 +8,7 @@ prices, the attention's own kernels among them; and the op-level backend
 prices a V4-Pro decode step and a prefill step.
 """
 
+from dataclasses import replace
 from math import comb
 
 import pytest
@@ -254,7 +255,10 @@ def test_every_v4_pro_leaf_prices(ep, tmp_path_factory):
     # The op-level backend prices a V4-Pro decode step and a prefill step.
     for shape, view in (
         ("decode B=2", rows((1, 1024), (1, 1024))),
-        ("prefill T=512 B=1", rows((512, 512), decode=False)),
+        (
+            "prefill T=512 B=1",
+            replace(rows((512, 512), decode=False), produces_output=True),
+        ),
     ):
         graph, _ = graphs[shape]
         backend = OpGraphBackend(SPEC, lambda *s, g=graph: g["region"], kv="fp8")

@@ -31,7 +31,6 @@ from test_vertical_slice import (
     TREE,
     WALL_S,
     Traffic,
-    _free_port,
     _release,
     _run_file,
 )
@@ -39,6 +38,7 @@ from test_vertical_slice import (
 from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
 from atom.compass.detect.scenario import check_run
+from atom.compass.drive.serve import _free_ports
 from atom.compass.parity.traffic import bodies
 
 MODEL = os.environ.get("ATOM_COMPASS_IMAGE_MODEL")
@@ -74,14 +74,15 @@ class Workload(Traffic):
 def run_images(out: Path, seed: str) -> dict:
     """One run in its own process tree, reading the readings in its parent's store."""
     out.mkdir()
+    clock_port, port = _free_ports(2)
     run_file = _run_file(
         out,
+        clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
         step_stub=CONSTANT,
         image_preprocess_s=IMAGE_S,
         machine=json.loads(MACHINE.read_text()),
         store=str(out.parent / "store"),
     )
-    port = _free_port()
     env = dict(
         os.environ,
         PYTHONHASHSEED=seed,

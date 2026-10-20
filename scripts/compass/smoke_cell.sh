@@ -8,6 +8,10 @@
 # then the cell graded by `python -m atom.compass.validate`. Each server serves
 # one `client.sh` run, with its warmup, which stops it. The fits run before the
 # real runs, so a failed fit costs no more GPU time.
+# Before calibration, a record nothing reads, warm/, serves the cell's traces
+# once, so that it takes the aiter JIT builds a fresh container meets while
+# serving, which grading, the fits and `validate.cost` refuse in a record
+# (run.json's `aiter_jit_builds`).
 #
 # Usage: smoke_cell.sh MODEL OUT
 #   MODEL           the model directory: config.json, tokenizer and weights
@@ -103,6 +107,7 @@ token() { awk '/^published / {t = $NF} END {print t}' "$1"; }
 M=(--machine "$MACHINE" --store "$OUT/store")
 CAL=256-$((255 + N)) CELL=0-$((N - 1))
 step memory python3 -c "$CLI" measure memory --gpu "$GPU" "${M[@]}" --out "$OUT/memory" -- "${ATOM_ARGS[@]}"
+serve warm "$OUT/warm" "$CELL" "$AIPERF_PYTHON" record --gpu "$GPU"
 serve calibration "$OUT/calibration" "$CAL" "$AIPERF_PYTHON" record --gpu "$GPU"
 RUNS=(--client-run "$OUT/calibration" "$OUT/calibration/artifacts/client_run.json")
 step fit_steps python3 -c "$CLI" fit steps --backend step-linear --form history \
