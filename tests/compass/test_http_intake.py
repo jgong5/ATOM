@@ -194,20 +194,32 @@ def test_the_mi308x_specs_rebuild_byte_for_byte_from_their_own_sweeps(
     assert out.read_bytes() == document.read_bytes()
 
 
-#: The stand-in server, handing one GET to a Starlette app.
+#: The stand-in server: a Starlette app's lifespan, as uvicorn starts it, then
+#: one GET; prints when the app sent the GET's response.
 APP_SERVER = """
-import asyncio, sys
+import asyncio, time
 from starlette.applications import Starlette
 
 async def main():
+    app, sends = Starlette(), []
+    lifespan = iter(["lifespan.startup", "lifespan.shutdown"])
+
+    async def started():
+        return {"type": next(lifespan)}
+
+    async def ignore(message):
+        pass
+
     async def receive():
         return {"type": "http.request", "body": b""}
 
     async def send(message):
-        pass
+        sends.append(time.monotonic_ns())
 
+    await app({"type": "lifespan"}, started, ignore)
     scope = {"type": "http", "method": "GET", "path": "/", "headers": []}
-    await Starlette()(scope | {"query_string": b"", "root_path": ""}, receive, send)
+    await app(scope | {"query_string": b"", "root_path": ""}, receive, send)
+    print(sends[0])
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -220,14 +232,19 @@ def test_serve_stamps_each_http_request_handed_to_the_asgi_app(tmp_path):
         (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / "atom" / name).write_text(text)
     stamps = tmp_path / "stamps"
-    subprocess.run(
+    done = subprocess.run(
         [sys.executable, PROBE, "serve", stamps],
         cwd=tmp_path,
         env=dict(os.environ, PYTHONPATH=str(tmp_path)),
+        capture_output=True,
+        text=True,
         check=True,
     )
     rows = [line.split() for line in stamps.read_text().splitlines()]
+    # The lifespan call is no request: `floor` would pair it with a send.
     assert [(r[2], r[4]) for r in rows] == [("app", "0")]
+    # Stamped as the app is called, before it answers.
+    assert int(rows[0][3]) < int(done.stdout)
 
 
 def test_the_floor_is_each_send_to_its_app_call_one_request_in_flight(tmp_path):

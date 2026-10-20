@@ -151,8 +151,12 @@ def test_a_scripted_run_gives_each_lp_the_same_reply_bytes_over_both_carriers(
     served, run
 ):
     build, kwargs, scripts = RUNS[run]
-    # The scripts' grant times are written for a 1.6 ms request lookahead.
-    with mock.patch.dict(ADMISSION_DELAY_S, serving=1.6e-3):
+    # The hand-written three-LP script assumes the engine's 2 ms daemon wake
+    # comes before the request, as it does at a 1.6 ms request lookahead. At
+    # the shipped one the request arrives first, the authority rightly grants
+    # every LP the finish, and the script then sends past it.
+    old = {"serving": 1.6e-3} if run == "three-lp" else {}
+    with mock.patch.dict(ADMISSION_DELAY_S, old):
         table = build(**kwargs)
     over = {
         endpoint: _replies(served(ClockAuthority(table), endpoint), table, scripts)

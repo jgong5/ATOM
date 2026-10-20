@@ -28,7 +28,6 @@ import hashlib
 import importlib.abc
 import importlib.machinery
 import json
-import math
 import os
 import runpy
 import sys
@@ -134,7 +133,7 @@ def floor(stamps: str, arrivals: str) -> dict:
     sent = sorted(json.loads(sent_data)["sent_ns"])
     # One request in flight: each call falls between its send and the next.
     if len(calls) != len(sent) or not all(
-        s < c < nxt for s, c, nxt in zip(sent, calls, sent[1:] + [math.inf])
+        s < c < nxt for s, c, nxt in zip(sent, calls, sent[1:] + [float("inf")])
     ):
         raise SystemExit(
             f"{stamps}: {len(calls)} app calls, not one after each of {len(sent)} sends"
