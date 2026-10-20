@@ -675,7 +675,7 @@ A trace is a straight-line record of one path at one shape, so branch modelling 
 
 | Part | Covers |
 |---|---|
-| **discrete key** | `ForwardMode`, `has_cached`, `produces_output()`, spec width, replayed vs eager, `tbo_on`, attention backend, `is_dummy_run` |
+| **discrete key** | `ForwardMode`, `has_cached`, `produces_output()`, spec width, replayed vs eager, `tbo_on`, attention backend, routed-expert kernel path (aiter or Triton), `is_dummy_run` |
 | **shape** | the decode width, or the prefill (T, B), the graph was captured at |
 
 ATOM already emits most of the discrete key: `atom/model_engine/run_labels.py` builds
@@ -867,7 +867,7 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   at B >= 128, disappears into the leaf.
 
 Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers
-aside, below), so its ambient reads stay
+and DeepSeek-V4's attention aside, below), so its ambient reads stay
 invisible to the trace; the bench does not need them, because the leaf is timed inside
 ATOM's own forward, where ATOM has built the forward context for that point (`07` D39).
 That is also what the two failures below needed by hand.
@@ -923,6 +923,14 @@ functions, MORI's dispatch and combine as `EpDispatchCombineOp`'s methods. A cap
 one rank, so each exchange's rows are stated, every peer at this rank's shape
 (`capture/peers.py`). A TBO step, two micro-batches interleaved, is refused by name until
 its graphs exist (#1581).
+
+DeepSeek-V4's `v4_attention_with_output` is opened the same way (#1678), its body run as
+a real step's, not a dummy run's, so its projections, compressors and sparse attention are
+leaves. Two of its functions are recorded as one leaf at their call, arguments as passed,
+because a lift refuses them: `fused_compress_attn` reassigns a parameter before its
+launches, and the decode kernel's aiter entry dispatches a leaf before a Triton launch.
+The indexer's score and top-k stays one leaf: its FP4 kernels launch through aiter's own
+launcher.
 
 FlyDSL never needs intercepting below a leaf. A FlyDSL launch outside an opaque leaf,
 the sampler's argmax or one in the MoE wrappers' bodies, lifts to its innermost ATOM

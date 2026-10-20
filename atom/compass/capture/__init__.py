@@ -13,11 +13,13 @@ rows. Each is traced at that concrete shape (`forward`), decoder layers folded
 into `Repeat` and forked streams into `Par` (`graph`).
 
 An `op_graph` is keyed by structure (`forward.structure`: the model's
-architecture and config.json digest, the TP width, the DP and EP widths when
-set, the phase and the mode) and by shape. ATOM's engine arguments after `--`
+architecture and config.json digest, `--arch`, the TP width, the DP and EP widths when
+set, the phase, the mode and whether the step produces output) and by shape:
+a prefill shape is published twice, as a middle chunk, which samples nothing,
+and as a final one. ATOM's engine arguments after `--`
 configure the engine as they would a server's; `--arch` names the declared
-device, which the entry states as its `device` condition and the key does not:
-a store holds one arch's graph per structure and shape. Its members are
+device, which the entry also states as its `device` condition: a store holds a
+graph per arch of one structure and shape. Its members are
 ``graph`` (`graph.to_json`) and ``declared``, what the capture stated in place
 of a device and the operators it left out of the graph, each with why. A TP
 group's ranks run one graph, so rank 0's is the entry's. The declarations are

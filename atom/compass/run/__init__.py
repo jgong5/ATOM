@@ -66,7 +66,7 @@ its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, and a law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
-holds at its shape, the run's TP width and KV cache format; capture traces
+holds at its shape and output, the run's TP width and KV cache format; capture traces
 eager forwards, so a graph-mode run reads the eager graphs too; with
 ``price_list``, the fields of a `price_list` key ``store`` holds, loaded
 under this run's readings, it prices each leaf from it first),
@@ -1396,10 +1396,12 @@ def runner(model_runner, tree) -> None:
 
         backend = OpGraphBackend(
             machine,
-            _op_graphs(run["store"], config),
+            _op_graphs(run["store"], config, machine.value("device.arch")),
             tp=tp,
             kv=config.kv_cache_dtype,
             padded=padding != "none",
+            split_send_recv=config.enable_expert_parallel
+            and getattr(config, "enable_low_latency", False),
             price_list=PRICE_LIST in run and _price_list(run, config, machine),
         )
     elif PRICE_LIST in run:
@@ -1484,20 +1486,20 @@ def runner(model_runner, tree) -> None:
         model_runner.compass_step_grid = {**bundle, "describe": backend.describe()}
 
 
-def _op_graphs(root: str, config):
-    """The region of the eager `op_graph` of `config` the store at `root` holds
-    at a shape, or None."""
+def _op_graphs(root: str, config, arch: str):
+    """The region of the eager `op_graph` of `config` on an `arch` device the
+    store at `root` holds at a shape, of a step that produces output or one
+    that does not, or None."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
     from atom.compass.capture.forward import Shape, structure
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
 
     @functools.lru_cache(maxsize=64)
-    def graph(phase: str, tokens: int, seqs: int) -> dict | None:
+    def graph(phase: str, tokens: int, seqs: int, output: bool = True) -> dict | None:
         shape = str(Shape(phase, tokens, seqs))
-        key = Key.of(
-            Kind.OP_GRAPH, structure=structure(config, phase, eager=True), shape=shape
-        )
+        at = structure(config, phase, True, arch, output)
+        key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
         if not store.directory_for(key).exists():
             return None
         return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]

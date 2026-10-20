@@ -360,9 +360,10 @@ the time `p` after it to its exit, and the payload of send `n`:
    `t0 + c`, is released during this TAR, which is the common case.
 2. If that send took an ack and its ack is not yet released, the loop receives it
    inline: NER until the grant releases `(pp_ack, n-1)`, its clock reaching `done`. A
-   loop that blocked there for `b` goes on `wake_s x (1 - exp(-b / wake_rise_s))` later,
-   gloo's wake: a host blocked on a gloo wait wakes later the longer it blocked
-   (#1451). If it
+   loop that blocked there goes on `wake_s x (1 - exp(-b / wake_rise_s))` later,
+   gloo's wake, `b` the time from send `n-2`'s gloo completion, which the ack carries,
+   to `done`: a host blocked on a gloo wait wakes later the longer the pair carried
+   nothing, however briefly it blocked (#1451, #1476). If it
    was eager, `advance_to` its local completion when that is later than now.
 3. The loop issues send `n` at `t_send`, its clock, now past `done`, its tensors
    leaving at `e`, and registers `(pp_data, n)` (K4), noting whether it is eager (a local completion) or rendezvous (an ack to receive).

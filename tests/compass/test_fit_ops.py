@@ -248,6 +248,17 @@ def test_a_point_sits_at_its_rows_mean_context_or_cached_tokens():
     ]
 
 
+def test_a_prefill_kind_reads_its_own_prefill_points_on_context_first():
+    # flat over a decode's context, yet twice the time past 1024 cached tokens
+    points = [_point(2, 10.0), _point(2, 10.0, context=2048)]
+    points += [_prefill(64, 1, 30.0, context=0), _prefill(64, 1, 60.0, context=1024)]
+
+    assert _families(points) == [
+        (["B"], [[[2], 10.0]]),
+        (["T", "B", "context"], [[[64, 1, 0], 30.0], [[64, 1, 1024], 60.0]]),
+    ]
+
+
 def test_points_at_one_coordinate_that_launched_other_kernels_refuse():
     points = [_point(2, 10.0), _point(2, 10.0, "x") | {"rows": [[1, 1024, True]] * 2}]
 

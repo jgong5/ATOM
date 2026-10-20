@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections import Counter
+from itertools import cycle
 from math import comb
 
 import numpy as np
@@ -166,13 +167,15 @@ def _moe(m: Module, view: BatchView, tokens: int) -> tuple[Work, Work, Work]:
     after, routing uniform and independent.
 
     The experts run on the gathered rows, or under expert parallelism on the
-    busiest rank's expected share, reading each expert a row reaches once.
+    busiest rank's expected share, in one kernel: it reads each expert a row
+    reaches once, weights and scales, and its routes' share of the rows'
+    input, output, top-k ids and weights; the gate-up output never leaves it.
     On one data-parallel rank the output is all-reduced. Over a group, the
     hidden states and router logits are gathered and the output scattered
     back; under expert parallelism MoRI sends each of this rank's tokens once
     to every rank holding one of its experts, and back.
     """
-    experts, local, k, inter, hidden, ranks, dp, _ = m.dims
+    experts, local, k, inter, hidden, ranks, dp, _, held = m.dims
     rows, act = view.moe_rows if dp > 1 else tokens, ELEMENT_BYTES[ACT]
     real = view.moe_tokens if dp > 1 else sum_tokens(view.requests)
     # Pad rows all carry token 0 at position 0, so they route as one token.
@@ -180,8 +183,10 @@ def _moe(m: Module, view: BatchView, tokens: int) -> tuple[Work, Work, Work]:
     routed, groups = rows * k, activated_experts(experts, k, distinct)
     if local < experts:
         routed, groups = max_rank_load(rows, k, experts, ranks), groups / ranks
-    work = grouped_gemm(routed, 2 * inter, hidden, groups, m.act, m.fmt)
-    work += grouped_gemm(routed, hidden, inter, groups, m.act, m.fmt)
+    flops = grouped_gemm(routed, 2 * inter, hidden, groups, m.act, m.fmt)
+    flops += grouped_gemm(routed, hidden, inter, groups, m.act, m.fmt)
+    row = hidden * (ELEMENT_BYTES[m.wire[0]] + act) + 2 * k * ELEMENT_BYTES["fp32"]
+    work = Work(flops.flops_by_format, groups * held + routed / k * row)
     if dp == 1:
         return Work(), work, allreduce(ranks, tokens * hidden * act)
     if local == experts:
@@ -233,19 +238,55 @@ def overlap(layers) -> float:
     """The finish time of two micro-batches' layers on one compute and one
     comm stream, in ATOM's issue order.
 
-    Each layer is four pairs of seconds, one per micro-batch: the compute
+    Each layer is pairs of seconds, one per micro-batch, on the compute and
+    comm streams in turn from compute: for a layer of modules, the compute
     before the MoE exchange, the exchange in, the routed experts, the exchange
     out. Within a layer every segment is issued for both micro-batches before
-    the next, compute and exchange alternating streams; a segment starts when
-    its stream is free and its micro-batch's previous segment is done.
+    the next; a segment starts when its stream is free and its micro-batch's
+    previous segment is done.
     """
     free = {"compute": 0.0, "comm": 0.0}
     done = [0.0, 0.0]
     for layer in layers:
-        for segment, stream in zip(layer, ("compute", "comm", "compute", "comm")):
+        for segment, stream in zip(layer, cycle(("compute", "comm"))):
             for k in 0, 1:
                 free[stream] = done[k] = max(free[stream], done[k]) + segment[k]
     return max(free.values())
+
+
+def micro_batches(view: BatchView) -> tuple[BatchView, BatchView]:
+    """A split step's two micro-batches on this rank, each with the group's
+    rows of it as `moe_rows`; a ValueError names a split that gives none.
+
+    This rank's pair is its `dp_rank` slot of `tbo_tokens`, or, unstated, the
+    one pair that sums to its tokens. The step is cut at the first one's
+    token count, a cut request's second part attending the first as history.
+    """
+    own = sum_tokens(view.requests)
+    pairs = list(zip(*view.tbo_tokens))
+    if view.dp_rank is not None:
+        pairs = pairs[view.dp_rank : view.dp_rank + 1]
+    pairs = list(dict.fromkeys(p for p in pairs if sum(p) == own))
+    if len(pairs) != 1:
+        raise ValueError(
+            f"the two-batch-overlap split {view.tbo_tokens} names no single "
+            f"pair of micro-batches for this rank's {own} tokens"
+        )
+    # ponytail: the micro-batches run their real rows; a split decode
+    # graph's padding is left out of this lower bound.
+    left, halves = pairs[0][0], ([], [])
+    for r in view.requests:
+        first = min(left, r.query_tokens)
+        left -= first
+        if first:
+            halves[0].append(RequestShape(first, r.cached_tokens + first, r.decode))
+        if r.query_tokens > first:
+            rest = r.query_tokens - first
+            halves[1].append(RequestShape(rest, r.context_tokens, r.decode))
+    a, b = (
+        BatchView(tuple(h), moe_rows=sum(t)) for h, t in zip(halves, view.tbo_tokens)
+    )
+    return a, b
 
 
 def _reads(work: Work) -> dict[str, list[str]]:
@@ -348,29 +389,11 @@ class StepRooflineBackend(CostBackend):
                 "on no stream"
             )
             return ""
-        own = sum_tokens(view.requests)
-        pairs = list(dict.fromkeys(p for p in zip(*view.tbo_tokens) if sum(p) == own))
-        if len(pairs) != 1:
-            refuse.append(
-                f"the two-batch-overlap split {view.tbo_tokens} names no single "
-                f"pair of micro-batches for this rank's {own} tokens"
-            )
+        try:
+            views = micro_batches(view)
+        except ValueError as exc:
+            refuse.append(str(exc))
             return ""
-        # ponytail: the micro-batches run their real rows; a split decode
-        # graph's padding is left out of this lower bound.
-        left, halves = pairs[0][0], ([], [])
-        for r in view.requests:
-            first = min(left, r.query_tokens)
-            left -= first
-            if first:
-                halves[0].append(RequestShape(first, r.cached_tokens + first, r.decode))
-            if r.query_tokens > first:
-                rest = r.query_tokens - first
-                halves[1].append(RequestShape(rest, r.context_tokens, r.decode))
-        views = [
-            BatchView(tuple(h), moe_rows=sum(t))
-            for h, t in zip(halves, view.tbo_tokens)
-        ]
         layers: dict[int, list[list[float]]] = {}
         units: dict = {}
         notes = stated.setdefault("tbo", [])
@@ -399,7 +422,7 @@ class StepRooflineBackend(CostBackend):
     def price(self, batch_view: BatchView) -> StepCost:
         refuse = []
         if batch_view.image_tokens:
-            refuse.append(IMAGES.format(batch_view.image_tokens))
+            refuse.append(IMAGES)
         if self.unclassified:
             refuse.append("unclassified modules: " + ", ".join(self.unclassified))
         if refuse:

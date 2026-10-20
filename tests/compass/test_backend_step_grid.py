@@ -29,6 +29,7 @@ from atom.compass.backends import (
     CostRefused,
     Granularity,
     Method,
+    ProvenanceMix,
     Refusal,
     RequestShape,
     StepGrid,
@@ -219,10 +220,7 @@ def test_with_one_corner_removed_the_step_refuses_naming_it(make, points, gone, 
     assert r.forward(decode(B37)).predicted_s == 0.0
     b, c = gone[-2:]
     assert r.refused_commands() == (
-        (
-            f"cost:step-grid: the {named} holding B=37, c=600 has no measurement "
-            f"at B={b}, c={c}"
-        ),
+        f"cost:step-grid: the {named} has no measurement at B={b}, c={c}",
     )
 
 
@@ -246,11 +244,71 @@ def test_a_hole_under_a_roofline_floor_is_priced_by_the_roofline():
     )
     assert r.refused_commands() == ()
     assert r.priced_steps()["declared_steps"] == 1
-    reason = (
-        "the decode rung 48 cell holding B=37, c=600 has no measurement at "
-        "B=48, c=1024"
-    )
+    reason = "the decode rung 48 cell has no measurement at B=48, c=1024"
     assert r._priced.reasons() == {("step-grid", reason): 1}
+
+
+def test_steps_missing_the_same_corner_share_one_reason():
+    """With (40, 1024) unmeasured, steps anywhere in the two cells beside it,
+    or on the B=40 node between them, are declined for that corner alone."""
+    holed = eager([p for p in EAGER if p["at"] != [40, 1024]])
+    mix = ProvenanceMix()
+    for b, c in ((36, 600), (34, 900), (40, 800), (44, 700)):
+        rows = [(1, c + 1, True)] * b
+        mix.record(StepFallbackBackend(holed, roofline()).price(view(*rows)))
+
+    reason = "the decode cell has no measurement at B=40, c=1024"
+    assert mix.reasons() == {("step-grid", reason): 4}
+
+
+@pytest.mark.parametrize(
+    "steps,reason",
+    [
+        (
+            [[(8, 8, False), (1, 10, True)], [(8, 8, False)] * 2 + [(1, 10, True)]],
+            (
+                "a step mixing prefill and decode rows; the grid prices a step "
+                "of one kind"
+            ),
+        ),
+        (
+            [[(2, 10, True)], [(3, 10, True)] * 2],
+            (
+                "a decode row computes more than one token; the decode grid has "
+                "no N_Q axis"
+            ),
+        ),
+        (
+            [[(1, 601, True)] * 37, [(1, 601, True)] * 40],
+            "a decode step replays no graph, and a replay bundle has no eager decode",
+        ),
+    ],
+    ids=["mixed", "speculative", "eager"],
+)
+def test_steps_declined_for_one_cause_share_one_reason(steps, reason):
+    """Steps of one kind the grid declines, whatever their row and token counts,
+    are counted under one reason."""
+    mix = ProvenanceMix()
+    for rows in steps:
+        mix.record(StepFallbackBackend(replay(), roofline()).price(view(*rows)))
+
+    assert mix.reasons() == {("step-grid", reason): 2}
+
+
+def test_steps_with_image_tokens_are_refused_for_one_reason():
+    reasons = set()
+    for tokens in (3, 10):
+        with pytest.raises(CostRefused) as refused:
+            replay().price(BatchView(view(*INSIDE).requests, image_tokens=tokens))
+        reasons.update(refused.value.declined)
+
+    assert reasons == {
+        Refusal(
+            "step-grid",
+            "a step with image tokens, and no vision encoder in what this prices "
+            "from",
+        )
+    }
 
 
 def test_a_decode_step_wider_than_the_widest_rung_refuses_under_a_replay_bundle():
@@ -259,8 +317,8 @@ def test_a_decode_step_wider_than_the_widest_rung_refuses_under_a_replay_bundle(
     assert r.forward(decode(B37)).predicted_s == 0.0
     assert r.refused_commands() == (
         (
-            "cost:step-grid: a decode step of 37 rows replays no graph, and a "
-            "replay bundle has no eager decode"
+            "cost:step-grid: a decode step replays no graph, and a replay bundle "
+            "has no eager decode"
         ),
     )
 
@@ -297,8 +355,8 @@ def test_a_middle_chunk_is_priced_from_the_no_output_grid_and_a_final_one_never_
     assert steps == [(False, 1e-3)] * 3 + [(True, 0.0)]
     assert refused == (
         (
-            "cost:step-grid: the prefill output cell holding B=1, T=8, c=192 "
-            "has no measurement at B=1, T=8, c=192"
+            "cost:step-grid: the prefill output cell has no measurement at "
+            "B=1, T=8, c=192"
         ),
     )
     final = [point(1, 8, 192, time=3)]
@@ -364,12 +422,12 @@ def test_only_a_homogeneous_batch_on_a_node_is_a_measured_lookup(rows, lookup, s
 @pytest.mark.parametrize(
     "batch,reason",
     [
-        (view(*[(1, 2001, True)] * 32), "c=2000 is outside the decode grid's"),
-        (view(*[(1, 601, True)] * 20), "B=20 is outside the decode grid's"),
-        (view((8, 8, False), (1, 10, True)), "1 prefill and 1 decode rows"),
-        (view((2, 10, True)), "a decode row computes 2 tokens"),
-        (view((64.0, 64, False), produces_output=True), "count 64.0 is not an"),
-        (view(*ON_NODE, rung=48.0), "the count 48.0 is not an int"),
+        (view(*[(1, 2001, True)] * 32), "c is above the decode grid's nodes 512..1024"),
+        (view(*[(1, 601, True)] * 20), "B is below the decode grid's nodes 32..48"),
+        (view((8, 8, False), (1, 10, True)), "mixing prefill and decode rows"),
+        (view((2, 10, True)), "a decode row computes more than one token"),
+        (view((64.0, 64, False), produces_output=True), "a count is a float"),
+        (view(*ON_NODE, rung=48.0), "a count is a float, not an int"),
         (view((64, 64, False)), "does not say whether it produces output"),
     ],
     ids=["past-c", "below-B", "mixed", "speculative", "float", "rung", "output"],
@@ -466,9 +524,8 @@ def test_a_falling_in_pool_edge_prices_the_past_pool_step_by_the_roofline(
     assert term.provenance.refusals == (
         Refusal(
             "step-grid",
-            f"the decode cell holding B={b}, c={c} is past the KV pool, and "
-            "B=48's in-pool edge falls from c=512 to 767, reaching no positive "
-            f"time at c={c}",
+            "the decode cell is past the KV pool, and B=48's in-pool edge falls "
+            "from c=512 to 767, reaching no positive time at the step's c",
         ),
     )
 

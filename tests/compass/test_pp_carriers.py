@@ -7,6 +7,9 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -115,6 +118,25 @@ def test_the_script_prices_the_send_on_a_machine_specs_carriers(tmp_path):
     spec.write_text(json.dumps(document))
     assert recurrence.main(str(tmp_path), str(spec), "500") == 0
     assert recurrence.main(str(tmp_path)) == 1
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_the_script_refuses_a_record_at_tp_above_one_on_the_carriers(tmp_path, tp):
+    """At TP 2 each stage sends shards its receiver all-gathers; the carriers
+    price whole tensors with no all-gather, so the record is refused there,
+    and only there."""
+    for name, steps in zip(("dp0", "pp1.dp0"), pp2_record()):
+        (tmp_path / f"{name}.jsonl").write_text(
+            "".join(json.dumps(s) + "\n" for s in steps)
+        )
+        engine = {"tensor_parallel_size": tp}
+        (tmp_path / f"{name}.engine.json").write_text(json.dumps(engine))
+    recurrence.main(str(tmp_path))
+    if tp == 1:
+        recurrence.main(str(tmp_path), str(SPEC), "500")
+        return
+    with pytest.raises(ValueError, match="ran at TP 2: each stage sends shards"):
+        recurrence.main(str(tmp_path), str(SPEC), "500")
 
 
 def test_a_carrier_may_have_no_eager_size_and_no_fewer():
@@ -243,6 +265,25 @@ def test_the_probe_pools_the_records_it_wrote(tmp_path):
     assert pooled["records"] == [
         hashlib.sha256(r.read_bytes()).hexdigest() for r in runs
     ]
+
+
+def test_the_probe_runs_from_the_root_on_its_own_tree(tmp_path):
+    """Run as its README gives it, from `/` and with no PYTHONPATH, the probe
+    imports this tree's `atom.compass`, not an ATOM installed elsewhere."""
+    run, out = tmp_path / "run.json", tmp_path / "out.json"
+    run.write_text(json.dumps({"samples": _samples(TRUTH)}) + "\n")
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    script = TREE / "scripts/compass/pp_carriers.py"
+    ran = subprocess.run(
+        [sys.executable, str(script), str(out), str(run)],
+        cwd="/",
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ran.returncode == 0, ran.stderr
+    assert json.loads(out.read_text())["carriers"] == probe.fit(_samples(TRUTH))
 
 
 def test_the_probe_prices_a_late_rendezvous_receive_with_its_threshold_moved():

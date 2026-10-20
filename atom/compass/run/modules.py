@@ -35,13 +35,14 @@ DeepSeek-V4's modules, each priced and then gone into:
   compressed KV, with the indexer's scoring where the layer has one. Its
   linears and the compressors' are priced as linears.
 - `Expert` (the shared expert): its activation, between its two linears.
-- `FusedMoE`, not gone into: the routed experts, at its quant method's
-  activation format, and the exchange around them: the data-parallel group's
-  gather and reduce-scatter, MoRI's dispatch and combine under expert
-  parallelism, at the formats MoRI sends, or the tensor-parallel all-reduce
-  on one data-parallel rank. An expert-parallel MoE over a data-parallel
-  group whose exchange is not MoRI's (`--all2all-backend rccl` or `none`,
-  `ATOM_DISABLE_MORI_EP`), and the Mega kernel, are unclassified.
+- `FusedMoE`, not gone into: the routed experts, at the activation format
+  its quant method runs them at, and the exchange around them: the
+  data-parallel group's gather and reduce-scatter, MoRI's dispatch and
+  combine under expert parallelism, at the formats MoRI sends, or the
+  tensor-parallel all-reduce on one data-parallel rank. An expert-parallel
+  MoE over a data-parallel group whose exchange is not MoRI's
+  (`--all2all-backend rccl` or `none`, `ATOM_DISABLE_MORI_EP`), the Mega
+  kernel, and experts picked by phase, are unclassified.
 
 A module of any other class is gone into when it has children. One without,
 or a listed one in a format or layout not priced here, is unclassified: the
@@ -87,6 +88,8 @@ SILENT = ("torch.nn.modules.activation", "transformers.activations")
 VISION = "atom.models.qwen3_5_vl.Qwen3VisionTransformer"
 #: V4's rotary tables, read inside the attention and compressor kernels.
 V4_ROPE = V4 + "_V4RoPE"
+#: What the routed experts' kernel reads once for each expert it runs.
+HELD = tuple(f"w{w}_{p}" for w in (13, 2) for p in ("weight", "weight_scale", "bias"))
 #: Linear quant types whose activations stay bf16 into the matrix product.
 UNQUANTIZED_INPUT = ("No", "per_1x32")
 LAYER = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
@@ -188,17 +191,43 @@ def _moe(module, name, parent):
     """The routed experts and their exchange, or None if unclassified.
 
     `dims` are (experts, local experts, top k, intermediate per rank, hidden,
-    group ranks, data-parallel ranks, MoRI's split send and receive). The
-    data-parallel width is the MoE group's over the attention's TP group,
-    which the parent MoE block holds. Under expert parallelism over that
-    group, `wire` is what MoRI's dispatch sends, as ATOM resolves it, and
-    what its combine sends back.
+    group ranks, data-parallel ranks, MoRI's split send and receive, the bytes
+    of one local expert's weights, scales and biases). The data-parallel
+    width is the MoE group's over the attention's TP group, which the parent
+    MoE block holds. Under expert parallelism over that group, `wire` is what
+    MoRI's dispatch sends, as ATOM resolves it, and what its combine sends
+    back.
+
+    The products read activations at the format of the kernel the method runs.
+    Its Triton experts under expert parallelism, and its fused SiLU ones
+    without, run fp8 or, under `ATOM_USE_TRITON_MOE_A4W4`, fp4 ones; its other
+    Triton experts run `act_quant`'s. aiter's run fp8 ones when the method
+    asks for them, and otherwise `act_quant`'s, or the weights' format when it
+    has a quant type: the kernel quantizes them to it. A method that picks its
+    experts by phase (`ATOM_USE_TRITON_MOE_DECODE`) is unclassified.
     """
+    from atom.utils import envs
+
     method, w13 = module.quant_method, module.w13_weight
     act = getattr(getattr(method, "act_quant", None), "value", None)
-    if getattr(method, "fp8_activations", False):
-        act = "fp8"
     fmt, attention_tp = FORMATS.get(w13.dtype), getattr(parent, "tp_size", None)
+    inter = w13.shape[1] // 2
+    tp, ep = (getattr(method, f, False) for f in ("use_triton", "use_triton_ep"))
+    if getattr(method, "use_triton_decode", False):
+        return None
+    if tp or ep:
+        # Its Triton prep re-lays the weights as bytes, in a layout of its own.
+        fmt, inter = FORMATS.get(method.quant_dtype), method.intermediate_size
+    if ep:
+        act = "fp4" if envs.ATOM_USE_TRITON_MOE_A4W4 else "fp8"
+    elif tp:
+        a4w4 = envs.ATOM_USE_TRITON_MOE_A4W4 or act == "fp4"
+        act = ("fp4" if a4w4 else "fp8") if module.use_fused_silu_gugu else act
+    elif getattr(method, "fp8_activations", False):
+        act = "fp8"
+    elif getattr(getattr(method, "quant_type", None), "value", 0):
+        act = act and fmt
+    held = sum(t.nbytes for p in HELD if (t := getattr(module, p, None)) is not None)
     mega = _is(method, OPS + "moe.MegaMxfp4MoEMethod")
     if mega or not (act and fmt and attention_tp):
         return None
@@ -206,12 +235,12 @@ def _moe(module, name, parent):
     ranks = config.ep_size if config.use_ep else config.tp_size
     split = int(config.use_ep and config.low_latency)
     dims = (module.global_num_experts, w13.shape[0], module.top_k)
-    dims += (w13.shape[1] // 2, module.hidden_size, ranks, ranks // attention_tp, split)
+    dims += (inter, module.hidden_size, ranks, ranks // attention_tp, split)
+    dims += (held // w13.shape[0],)
     fused = module._comm_fused_moe is not None
     if not (config.use_ep and dims[6] > 1):
         return Module(name, "moe", dims, fmt, ranks, fused, act=act)
     from atom.model_ops.fused_moe.mori_prepare_finalize import resolve_mori_dispatch
-    from atom.utils import envs
 
     mori = config.requested_all2all_backend in ("auto", "mori") and not (
         envs.ATOM_DISABLE_MORI_EP or envs.ATOM_MORI_V2

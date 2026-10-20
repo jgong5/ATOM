@@ -18,8 +18,9 @@ the GEMMs of a decode step differ in N and K and share a family per weight.
 
 A family's dimensions are the shape's counts its masked integers follow, a
 decode's B always, and, for a kind that depends on context as `measure ops`
-decides (`bench.ops._dependent`), a prefill's B and the context (`band`'s
-mean): a decode row's, or the tokens a prefill row had cached. Points at one
+decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
+a prefill's B and the context (`band`'s mean): a decode row's, or the tokens
+a prefill row had cached. Points at one
 coordinate, its other counts or contexts dropped, are one point at their mean
 time. `interpolate` prices a query at a measured point as
 that point; between points, multilinearly over the neighbours that bracket it
@@ -203,8 +204,10 @@ def fit(points) -> dict:
             )
         }
         for p in members:
-            moves = dependent.get(p["op"], True)
             at_p = shape_counts(p["shape"]) | {"context": _context(p)}
+            moves = dependent.get(p["op"], True)
+            if "T" in at_p:
+                moves = dependent.get(("prefill", p["op"]), moves)
             dims = ["B"]  # a decode step's graph is per B
             if "T" in at_p:
                 dims = [d for d in ("T", "B") if d in follows or moves]
