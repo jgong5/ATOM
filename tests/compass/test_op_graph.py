@@ -9,7 +9,8 @@ rows; attention reads its context in the run's KV format. What cannot be
 priced is refused by name, each reason once. The Qwen3.8-27B TP1 capture prices leaf by leaf, and `run.runner` installs the
 backend from a run file's ``op_graph`` over the store's graphs. With a price
 list, a leaf takes its price first, measured on a point or estimated between
-two of one kernel, at the step's counts and its rows' mean context; anything
+two of one kernel, at the step's counts and its rows' context, a decode's
+longest row and a prefill's mean cached tokens; anything
 the list declines, a line the fit declined among them, is its roofline,
 carrying why.
 """
@@ -689,25 +690,20 @@ BANDED = listed(
 
 
 @pytest.mark.parametrize(
-    "rows,answer",
+    "rows,priced,method",
     [
-        ([(1, 1500, True)] * 2, 1.5e-5),
-        ([(1, 1000, True), (1, 2000, True)], 1.5e-5),
-        (
-            [(1, 1000, True), (1, 3000, True)],
-            f"{GEMM}: its rows' context from 2000 to 3000 crosses from a to b",
-        ),
+        ([(1, 1500, True)] * 2, 1.5e-5, Method.ESTIMATED),
+        ([(1, 1000, True), (1, 2000, True)], 2e-5, Method.MEASURED),
+        ([(1, 1000, True), (1, 3000, True)], 3e-5, Method.MEASURED),
     ],
     ids=["uniform", "uneven-in-one-kernel", "uneven-across-two"],
 )
-def test_a_step_s_rows_price_at_their_mean_inside_one_kernel_to_their_max(rows, answer):
+def test_a_decode_step_prices_at_its_longest_row_s_context(rows, priced, method):
+    # decode attention's time follows its longest row, so does the query
     cost = backend(g(2, 64, 64), price_list=BANDED).price(view(*rows, rung=2))
 
-    if isinstance(answer, float):
-        assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(answer)}
-        assert cost.terms[0].provenance.method is Method.ESTIMATED
-    else:
-        assert cost.refusals == (Refusal("price-list", answer),)
+    assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(priced)}
+    assert cost.terms[0].provenance.method is method
 
 
 ATTN = leaf(ATTENTION, [[64, 6144]], q=t([64, 24, 256]), k=t([64, 4, 256]))
@@ -718,6 +714,13 @@ CACHED = listed(
         for c, ns in ((0, 1e4), (1024, 2e4), (2048, 3e4))
     ]
 )
+# The same, one kernel to 1024 cached tokens and another at 2048.
+BANDED_CACHED = listed(
+    *[
+        pt(ATTN, "prefill T=64 B=2", ns, c, kernel, [[32, 32 + c, False]] * 2)
+        for c, ns, kernel in ((0, 1e4, "a"), (1024, 2e4, "a"), (2048, 3e4, "b"))
+    ]
+)
 
 
 @pytest.mark.parametrize(
@@ -725,6 +728,11 @@ CACHED = listed(
     [
         ([(32, 32 + 512, False)] * 2, CACHED, 1.5e-5),
         ([(32, 32, False), (32, 32 + 2048, False)], CACHED, 2e-5),
+        (
+            [(32, 32, False), (32, 32 + 2048, False)],
+            BANDED_CACHED,
+            f"{ATTENTION}: its rows' cached tokens from 1024 to 2048 cross from a to b",
+        ),
         (
             [(32, 32 + 512, False)] * 2,
             listed(pt(ATTN, "prefill T=64 B=2", 1e4)),
@@ -734,7 +742,7 @@ CACHED = listed(
             ),
         ),
     ],
-    ids=["uniform", "uneven", "fresh-rows-only"],
+    ids=["uniform", "uneven", "uneven-across-two", "fresh-rows-only"],
 )
 def test_a_prefill_prices_linearly_in_its_rows_cached_tokens(rows, params, answer):
     final = replace(view(*rows), produces_output=True)

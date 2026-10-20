@@ -205,13 +205,14 @@ class OpGraphBackend(CostBackend):
 
     def _bound(self, view: BatchView) -> tuple:
         """What a price list reads of a step: its phase, its T and B, and its
-        rows' mean and max context (`band`)."""
+        rows' context and max context (`band`), the context a decode's max, a
+        prefill's mean cached tokens."""
         rung = view.capture_rung if self.padded else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, *counts = step_shape(rows, rung)
         rows = [(r.query_tokens, r.context_tokens) for r in view.requests]
         mean, top = band(rows, phase == "decode")
-        return (phase, *counts, mean, top)
+        return (phase, *counts, top if phase == "decode" else mean, top)
 
     def _region(self, view: BatchView) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region."""

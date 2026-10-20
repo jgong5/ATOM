@@ -19,8 +19,8 @@ the GEMMs of a decode step differ in N and K and share a family per weight.
 A family's dimensions are the shape's counts its masked integers follow, a
 decode's B always, and, for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
-a prefill's B and the context (`band`'s mean): a decode row's, or the tokens
-a prefill row had cached. Points at one
+a prefill's B and the context: a decode point's ``context``, its longest
+row's, or a prefill point's rows' mean cached tokens (`band`). Points at one
 coordinate, its other counts or contexts dropped, are one point at their mean
 time. `interpolate` prices a query at a measured point as
 that point; between points, multilinearly over the neighbours that bracket it
@@ -161,12 +161,12 @@ def shape_counts(shape: str) -> dict:
 
 
 def _context(p) -> int:
-    """A point's context: `band`'s mean over the rows it records, else its
-    ``context``, none cached on a prefill that states none."""
-    decode = p["shape"].startswith("decode")
-    if "rows" in p:
-        return band(p["rows"], decode)[0]
-    return p["context"] if decode else p["context"] or 0
+    """A point's context: a decode point's ``context``, its longest row's; a
+    prefill point's rows' mean cached tokens (`band`), else its ``context``,
+    none when it states none."""
+    if p["shape"].startswith("decode"):
+        return p["context"]
+    return band(p["rows"], False)[0] if "rows" in p else p["context"] or 0
 
 
 def fit(points) -> dict:
@@ -332,9 +332,10 @@ def summary(rows) -> dict:
 
 class PriceList(CostSource):
     """`compass fit ops`'s params as a leaf's first source: its family queried
-    at the step's count of each of its dimensions, ``context`` the mean of
-    `band`. It also declines along a line the fit declined, and rows
-    whose context from that mean to their max crosses into another kernel."""
+    at the step's count of each of its dimensions, ``context`` the bound's:
+    a decode step's rows' max, a prefill's rows' mean cached tokens. It also
+    declines along a line the fit declined, and prefill rows whose cached
+    tokens from that mean to their max cross into another kernel."""
 
     name = LISTED
 
@@ -387,8 +388,8 @@ class PriceList(CostSource):
                 p for p in itertools.zip_longest(got[0][1], other) if p[0] != p[1]
             )
             return (
-                f"its rows' context from {at[-1]} to {top} crosses from {first[0]} "
-                f"to {first[1]}"
+                f"its rows' cached tokens from {at[-1]} to {top} cross from "
+                f"{first[0]} to {first[1]}"
             )
         return got[0][0], at in points and top is None
 

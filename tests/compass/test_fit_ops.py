@@ -232,18 +232,17 @@ def test_a_kind_that_does_not_move_with_context_runs_over_the_counts_it_follows(
     ]
 
 
-def test_a_point_sits_at_its_rows_mean_context_or_cached_tokens():
-    # the decode GEMM moves with context; the prefill kind is never timed at
-    # two contexts of one width, so it is taken to move with them
-    points = [_point(2, 10.0), _point(2, 20.0, context=3000)]
+def test_a_decode_point_sits_at_its_longest_row_a_prefill_at_its_rows_mean_cached():
+    # the decode GEMM moves with context; the prefill kind with cached tokens
+    points = [_point(2, 10.0)]
     points += [
-        _point(2, 15.0, context=3000) | {"rows": [[1, 3000, True], [1, 1000, True]]}
+        _point(2, 20.0, context=3000) | {"rows": [[1, 3000, True], [1, 1000, True]]}
     ]
     points += [_prefill(64, 1, 30.0, "attn"), _prefill(64, 1, 31.0, "attn", 0)]
     points += [_prefill(64, 1, 40.0, "attn", 512, rows=[[64, 64 + 512, False]])]
 
     assert _families(points) == [
-        (["B", "context"], [[[2, 1024], 10.0], [[2, 3000], 20.0], [[2, 2000], 15.0]]),
+        (["B", "context"], [[[2, 1024], 10.0], [[2, 3000], 20.0]]),
         (["T", "B", "context"], [[[64, 1, 0], 30.5], [[64, 1, 512], 40.0]]),
     ]
 
