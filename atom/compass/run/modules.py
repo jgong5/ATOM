@@ -32,8 +32,9 @@ DeepSeek-V4's modules, each priced and then gone into:
   previous sub-layer's output into the widened residual and reducing it to the
   next input; the block's two norms run inside them.
 - `DeepseekV4Attention`: sparse attention over the sliding window and the
-  compressed KV, with the indexer's scoring where the layer has one; under
-  an fp8 KV cache its kernels take Q in fp8 as well. Its linears and the
+  compressed KV, with the indexer's scoring where the layer has one, at fp4
+  where the `Indexer` runs its fp4 path, else fp8; under an fp8 KV cache its
+  kernels take Q in fp8 as well. Its linears and the
   compressors' are priced as linears, `wo_a` at fp8 activations where it runs
   the fp8 batched GEMM.
 - `Expert` (the shared expert): its activation, between its two linears.
@@ -144,7 +145,9 @@ def _classify(module, name, parent):
         # ponytail: the KV is read at fp8, its narrowest format; the window
         # rows held in bf16 are left out of this lower bound.
         q = "fp8" if module.kv_fp8 else "bf16"
-        return Module(name, "sparse_attention", dims, "fp8", act=q), DESCEND
+        index = "fp4" if ix and ix._indexer_fp4 else "fp8"
+        attn = Module(name, "sparse_attention", dims, "fp8", act=q, index=index)
+        return attn, DESCEND
     if _is(module, V4 + "Expert"):
         return Module(name, "act", (module.w2.weight.shape[1],)), DESCEND
     if _is(module, OPS + "moe.FusedMoE"):
