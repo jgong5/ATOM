@@ -119,7 +119,7 @@ def test_a_pair_from_one_arrival_is_tokenized_side_by_side(report):
         if ":request#" in c
     )[:2]
     short, long = BRIEF.prompt_tokens
-    assert second - first == (long - short) / ENCODE_TOKENS_PER_S
+    assert second - first == pytest.approx((long - short) / ENCODE_TOKENS_PER_S)
 
 
 @pytest.mark.parametrize("name", sorted(DEPLOYMENTS))

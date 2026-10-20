@@ -236,6 +236,7 @@ def _arg(value):
 
 def _json(region):
     if isinstance(region, ir.Op):
+        stated = {name: _arg(value) for name, value in region.stated}
         return {
             "op": region.name,
             "kind": region.kind.value,
@@ -243,7 +244,7 @@ def _json(region):
             "out": [list(s) for s in region.out_shapes],
             "stream": region.stream_id,
             "context": region.context_ref and region.context_ref.key,
-        }
+        } | ({"stated": stated} if stated else {})
     if isinstance(region, ir.Seq):
         return {"seq": [_json(item) for item in region.items]}
     if isinstance(region, ir.Par):

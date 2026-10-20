@@ -7,6 +7,8 @@ coverage and in `fit ops`.
 """
 
 import json
+import os
+from concurrent.futures.process import BrokenProcessPool
 from types import SimpleNamespace
 
 import pytest
@@ -123,12 +125,46 @@ def test_a_point_is_rank_0_s_with_every_rank_s_time_refused_where_any_refused(
     ]
 
 
+def test_a_rank_that_dies_costs_only_the_point_the_ranks_were_measuring(
+    monkeypatch,
+):
+    todo = [(decode(2), 20, {s: _op(s) for s in "abc"})]
+    launches = []
+
+    def launch(fn, config, todo, llc):
+        names = [sig for *_, found in todo for sig in found]
+        launches.append(names)
+        point = {"shape": str(decode(2)), "context": 20}
+        by_rank = [
+            [point | {"op": s, "leaf": s, "cold_ns": float(r)} for s in names]
+            for r in (1, 2)
+        ]
+        if len(launches) > 1:
+            return by_rank
+        # Rank 1 dies measuring b, which rank 0 finished: the pool ends rank 0.
+        for r, finished in enumerate((2, 1)):
+            path = f"{os.environ[ops.JOURNAL]}.{r}"
+            ops._journal(path, by_rank[r][:finished])
+        raise BrokenProcessPool("rank 1 was killed")
+
+    monkeypatch.setattr(ranks, "launch", launch)
+
+    got = ops._measured(None, todo, 1, gpus=2)
+
+    assert launches == [["a", "b", "c"], ["c"]]
+    assert [(r["leaf"], r.get("rank_cold_ns"), r.get("refused")) for r in got] == [
+        ("a", [1.0, 2.0], None),
+        ("b", None, "the measuring process died"),
+        ("c", [1.0, 2.0], None),
+    ]
+
+
 def _gather(rows):
     x = ("x", _t([rows, 8], "activation"))
     return ir.Op(GATHER, "declared", (x, ("use_cag", True)), ((8 * rows, 8),))
 
 
-def _gather_graph(store, config, shape):
+def _gather_graph(store, config, shape, arch=None):
     rows = shape.tokens if shape.phase == "prefill" else shape.seqs
     return _graph(_gather(rows), layers=2)
 
@@ -155,7 +191,7 @@ def test_a_collective_is_one_family_over_its_bytes_across_decode_and_prefill(
         ([[1, 30, True], [1, 9000, True]], 2),
     )
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert ops.exchange(op)[1] == 8 * 4 * 8 * 4
     assert report["by phase"] == {

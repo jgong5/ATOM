@@ -5,7 +5,12 @@ Apart from `memory_runner` because importing `RapidServeModelRunner` beside
 `ModelRunner` is what a RapidServe start needs and a plain one does not.
 """
 
-from atom.compass.drive.memory_runner import MemoryReadingModelRunner
+from pathlib import Path
+
+import torch
+
+from atom.compass.drive.measure_memory import DECODE
+from atom.compass.drive.memory_runner import MemoryReadingModelRunner, _storage_bytes
 from atom.model_engine.model_runner import RapidServeModelRunner
 
 
@@ -14,8 +19,24 @@ class MemoryReadingRapidServeModelRunner(
 ):
     """`RapidServeModelRunner`, unchanged, read as `MemoryReadingModelRunner`
     reads a plain one. Prefill writes its readings, sized with the decode
-    process already on the card; decode owns no pool and writes none."""
+    process already on the card. Decode writes its own in `DECODE`, graph pool
+    included: it sizes no pool and warms up nothing, so it reads the device
+    once it holds prefill's weights, while prefill waits for it with no pool
+    yet, and reads no activations. That device-wide `non_torch` holds the
+    storages it imported, which decode's weights count, so they leave it."""
 
-    def _write(self, pool) -> None:
-        if not self.config.disagg_is_decode:
-            super()._write(pool)
+    def import_model_weight_ipc_handles(self, paths) -> bool:
+        reply = super().import_model_weight_ipc_handles(paths)
+        torch.cuda.reset_peak_memory_stats()
+        self._read_device_memory()
+        model = self.model
+        held = _storage_bytes([*model.parameters(), *model.buffers()])
+        self._read["non_torch"] -= held - self._read["weights"]
+        return reply
+
+    def _out(self) -> Path:
+        out = super()._out()
+        if self.config.disagg_is_decode:
+            out /= DECODE
+            out.mkdir(exist_ok=True)
+        return out

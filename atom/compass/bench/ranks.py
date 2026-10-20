@@ -8,7 +8,7 @@ whose ATOM runner builds the groups through ATOM's own initialisation. The
 ranks measure the union of their points in one order (`union`), agree on the
 calls a graph holds (`agreed`) and take a barrier before each replay, so a
 collective leaf runs on every rank at once. A point's record is rank 0's, with
-each rank's cold time beside it (`measure`).
+each rank's cold time beside it (`merge`).
 """
 
 import copy
@@ -67,7 +67,15 @@ def measure(config, todo, llc: int, gpus: int) -> list[dict]:
 
     if gpus == 1:
         return ops._child(ops.measure, config, todo, llc)
-    by_rank = launch(ops.measure, config, todo, llc)
+    return merge(launch(ops.measure, config, todo, llc))
+
+
+def merge(by_rank: list) -> list[dict]:
+    """Each point every rank recorded: rank 0's record, with every rank's
+    cold time, refused where any rank refused; one rank's records as they
+    are."""
+    if len(by_rank) == 1:
+        return by_rank[0]
     got = []
     for records in zip(*by_rank):
         record = records[0] | {"rank_cold_ns": [r.get("cold_ns") for r in records]}

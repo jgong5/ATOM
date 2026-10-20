@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""A RapidServe deployment's memory readings: taken by a RapidServe start, from
-its prefill engine, and keyed apart from a plain engine's."""
+"""A RapidServe deployment's memory readings: taken by a RapidServe start, one
+entry for each engine's key, and keyed apart from a plain engine's."""
 
 import importlib.util
 import json
@@ -10,8 +10,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from test_measure_memory import MACHINE
-from test_memory_readings import READINGS, publish_readings
+import test_measure_memory
+import torch
+from test_measure_memory import MACHINE, a_start, started
+from test_memory_readings import READINGS, STACK, publish_readings
 from test_rapidserve_runner_config import _config
 from test_run_step_grid import deployment
 
@@ -58,6 +60,11 @@ def _load(file, name):
     return module
 
 
+def _storage(ptr, nbytes, cuda=True):
+    held = SimpleNamespace(data_ptr=lambda: ptr, nbytes=lambda: nbytes)
+    return SimpleNamespace(is_cuda=cuda, untyped_storage=lambda: held)
+
+
 def _rapidserve_runner(monkeypatch, warmups):
     """The RapidServe reading runner, on stand-ins for ATOM's two runners that
     bind and warm up as theirs do."""
@@ -75,6 +82,14 @@ def _rapidserve_runner(monkeypatch, warmups):
 
         def _maybe_warmup(self):
             warmups.append(self.forward(SimpleNamespace(total_tokens_num=8)))
+
+        def import_model_weight_ipc_handles(self, paths):
+            # Prefill's storage, 3 bytes, replaces decode's meta parameter.
+            self.model.parameters = lambda: [_storage(2, 3)]
+            return True
+
+        def _read_device_memory(self):
+            return SimpleNamespace(total=100, non_torch=7)
 
     engine = types.ModuleType("atom.model_engine.model_runner")
     engine.ModelRunner = ModelRunner
@@ -98,7 +113,7 @@ def test_prefill_keeps_its_forward_after_the_counted_warmup(monkeypatch):
 
 
 @pytest.mark.parametrize("decode", [False, True])
-def test_only_prefill_writes_readings(tmp_path, monkeypatch, decode):
+def test_decode_writes_its_readings_beside_prefills(tmp_path, monkeypatch, decode):
     runner = _rapidserve_runner(monkeypatch, [])
     runner.rank, runner.config = 0, deployment(tmp_path).config
     vars(runner.config).update(enable_rapidserve=True, disagg_is_decode=decode)
@@ -111,6 +126,89 @@ def test_only_prefill_writes_readings(tmp_path, monkeypatch, decode):
 
     runner._write(None)
 
-    written = [json.loads(p.read_text())["key"] for p in out.iterdir()]
-    expected = [] if decode else [memory.key_fields(runner.config)]
-    assert written == expected
+    written = out / measure_memory.DECODE if decode else out
+    (held,) = written.glob("*.json")
+    assert json.loads(held.read_text())["key"] == memory.key_fields(runner.config)
+
+
+def test_decode_reads_the_device_once_it_holds_prefills_weights(monkeypatch):
+    # ATOM's decode sizes no pool, so nothing in it reads the device; and it
+    # warms up nothing, so its peak is where it stands. The device-wide
+    # reading holds the storage it imported, which its weights count.
+    runner = _rapidserve_runner(monkeypatch, [])
+    reading = sys.modules["atom.compass.drive.memory_runner"]
+    stats = {"current": 5, "peak": 9}
+    monkeypatch.setattr(reading, "_allocated", stats.get)
+    monkeypatch.setattr(
+        torch.cuda, "reset_peak_memory_stats", lambda: stats.update(peak=5)
+    )
+    own = _storage(1, 2)
+    runner.model = SimpleNamespace(
+        parameters=lambda: [_storage(0, 3, cuda=False)], buffers=lambda: [own]
+    )
+    runner._read = {"weights": 2}
+
+    assert runner.import_model_weight_ipc_handles(["handles"]) is True
+
+    read = {"weights": 2, "total": 100, "non_torch": 4, "current": 5, "peak": 5}
+    assert runner._read == read
+
+
+#: A RapidServe decode rank's readings: no warmup, so no activations, and the
+#: pool its capture took.
+DECODE = dict(
+    READINGS[1], activation_bytes=0, warmup_tokens=0, cudagraph_pool_bytes=1 << 20
+)
+
+
+@pytest.mark.parametrize("eager", [False, True])
+def test_decode_publishes_its_entry_unless_its_key_is_prefills(tmp_path, eager):
+    # ATOM's RapidServe makes prefill eager; decode keeps its own ladder.
+    prefill = deployment(tmp_path, enable_rapidserve=True, enforce_eager=True).config
+    decode = SimpleNamespace(**vars(prefill) | {"enforce_eager": eager})
+    out = tmp_path / "out"
+    record = started(out, prefill, [READINGS[1]])
+    (out / measure_memory.READINGS / measure_memory.DECODE).mkdir()
+    held = {k: v for k, v in DECODE.items() if k != "record"}
+    name = next((out / measure_memory.READINGS).glob("*.json")).name
+    (out / measure_memory.READINGS / measure_memory.DECODE / name).write_text(
+        json.dumps({"key": memory.key_fields(decode), "readings": held})
+    )
+
+    measure_memory.publish(out, MACHINE, tmp_path / "s", "c")
+
+    read = memory.load(tmp_path / "s", prefill, MACHINE, 0)
+    assert read.values == dict(READINGS[1], record=record)
+    read = memory.load(tmp_path / "s", decode, MACHINE, 0)
+    assert read.values == dict(READINGS[1] if eager else DECODE, record=record)
+    assert (out / "memory_readings.decode.json").exists() is not eager
+
+
+def test_a_decode_start_that_missed_a_graph_starts_again(tmp_path):
+    r = deployment(tmp_path)
+    out = tmp_path / "out"
+    started(out, r.config, [READINGS[1]])
+    decode = out / measure_memory.READINGS / measure_memory.DECODE
+    decode.mkdir()
+    (decode / "readings.0.json").write_text(json.dumps({"fxgraph_cache_misses": 3}))
+
+    assert measure_memory._cold(out) == ["decode/readings.0.json"]
+
+
+def test_a_rapidserve_run_is_identified_by_prefills_engine_file(tmp_path, monkeypatch):
+    _, argv = a_start(tmp_path, monkeypatch, STACK)
+    wrote = test_measure_memory.ranks_wrote
+
+    def and_decode(out, config, readings):
+        wrote(out, config, readings)
+        files = out / measure_memory.READINGS
+        (files / measure_memory.DECODE).mkdir()
+        for held in files.glob("*.json"):
+            decode = json.loads(held.read_text()) | {"engine": {"decode": True}}
+            (files / measure_memory.DECODE / held.name).write_text(json.dumps(decode))
+
+    monkeypatch.setattr(test_measure_memory, "ranks_wrote", and_decode)
+
+    measure_memory.main(argv)
+
+    assert json.loads((tmp_path / "out" / "engine.json").read_text()) == {}

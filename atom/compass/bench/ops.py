@@ -52,6 +52,10 @@ idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
 aside, are the point's kernel identity. A batch the KV pool cannot place refuses its leaves.
+The points run in a process of their own on each GPU; one that dies ends
+every rank, keeps the points every rank finished, the point it was measuring
+refuses, and new ones measure the rest; two in a row that die having finished
+no point fail the run.
 
 DIR gets run.json, the run's identity, and ops.jsonl, one line per point. S
 gets each measured point as an `op_measurement`, keyed by the model, the
@@ -64,15 +68,16 @@ every leaf at every rung of ATOM's decode ladder at the steps' lowest and
 highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
 and each prefill family (`_family`) over a ladder of their token counts, chunk
-remainders among them, one of a kind that depends on context at each over a
-ladder of the cached tokens of steps of its rows; then the point halfway
+remainders among them, one of a kind that depends on context at each at the
+most cached tokens of steps of its rows, and over a ladder of them once those
+points and the fresh ones show the kind still does; then the point halfway
 between two neighbours of a family, or of a prefill leaf's token count over
 cached tokens, that launched different kernels, until they are adjacent. DIR
 gets each round's ops.jsonl in `round<n>`, and every point held in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
-covers (`coverage`), and prints the count by phase and why each leaf kind
-left the rest out.
+covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
+and prints the count by phase and why each leaf kind left the rest out.
 """
 
 import argparse
@@ -88,10 +93,12 @@ import multiprocessing
 import os
 import re
 import statistics
+import tempfile
 import time
 import warnings
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from unittest.mock import patch
 
@@ -141,6 +148,9 @@ REST = 0.1
 TOKEN_IDS = {("aten.embedding.default", "indices")}
 #: The rank every member is written at: the bench is one rank.
 RANK = Topology().ranks()[0]
+#: The variable naming the file a measuring process appends each point's
+#: record to as it finishes it.
+JOURNAL = "COMPASS_OPS_JOURNAL"
 
 
 def main(argv: list[str]) -> None:
@@ -200,7 +210,7 @@ def main(argv: list[str]) -> None:
                     held += 1
         print(f"{held} points already in the store", flush=True)
         todo = [point for point in todo if point[2]]
-        results = ranks.measure(config, todo, args.llc_mib << 20, len(args.gpu))
+        results = _measured(config, todo, args.llc_mib << 20, len(args.gpu))
     publish(store, key, config, run, " ".join(command), results, out)
     refused = [
         f"{r['op']} at {r['shape']}: {r['refused']}" for r in results if "refused" in r
@@ -254,15 +264,17 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
-def graph(store, config, shape) -> dict:
-    """The `op_graph` `trace ops` published for `config` at `shape` on this GPU's
-    arch, of a step that produces output, as JSON: a prefill that produces none
-    runs the same leaves less the LM head and the sampler, so this graph's
-    points cover both."""
+def graph(store, config, shape, arch=None) -> dict:
+    """The `op_graph` `trace ops` published for `config` at `shape` on `arch`,
+    this GPU's when it is None, of a step that produces output, as JSON: a
+    prefill that produces none runs the same leaves less the LM head and the
+    sampler, so this graph's points cover both."""
     from atom.compass.capture.forward import structure
 
     key = Key.of(
-        Kind.OP_GRAPH, structure=structure(config, shape.phase), shape=str(shape)
+        Kind.OP_GRAPH,
+        structure=structure(config, shape.phase, device=arch),
+        shape=str(shape),
     )
     return json.loads(store.read(key).read_member("graph", RANK, "json"))
 
@@ -273,9 +285,11 @@ def _ref(value) -> bool:
 
 def signature(op: dict) -> str:
     """A leaf's identity across instances: its operator, arguments and outputs,
-    a context key or module path by its kind alone."""
+    a context key or module path by its kind alone, and what the capture
+    states beside its arguments when it states anything."""
     args = {s: {k: None for k in v} if _ref(v) else v for s, v in op["args"].items()}
     leaf = {"op": op["op"], "args": args, "out": op["out"]}
+    leaf |= {"stated": op["stated"]} if "stated" in op else {}
     return json.dumps(leaf, sort_keys=True, separators=(",", ":"))
 
 
@@ -303,24 +317,30 @@ def leaves(region: dict, env=None, found=None) -> dict[str, tuple[dict, list]]:
 
 def measure(config, todo, llc: int, rank: int = 0) -> list[dict]:
     """Each point's record, shape by shape: its timing, or why it refused; at
-    `rank` of `config`'s layout, over every rank's points (`ranks.union`)."""
+    `rank` of `config`'s layout, over every rank's points (`ranks.union`);
+    each also appended to the `JOURNAL` file as it is finished, when one is
+    named, suffixed `.<rank>` over several ranks."""
     from atom.compass.bench import ranks
     from atom.compass.bench.replay import ReplayRule
 
-    runner = _runner(config, rank)
+    runner, journal = _runner(config, rank), os.environ.get(JOURNAL)
     try:
-        stub, rule, got = Stub(runner, llc), ReplayRule(config), []
-        todo = ranks.union(todo, ranks.cpu_group())
+        group = ranks.cpu_group()
+        if journal and group is not None:
+            journal += f".{torch.distributed.get_rank()}"
+        stub, rule, got = Stub(runner, llc, journal), ReplayRule(config), []
+        todo = ranks.union(todo, group)
         with patch.object(runner.model, "forward", stub), torch.inference_mode():
             for shape, context, found in todo:
                 try:
                     got += stub.point(rule, shape, context, found)
                 except ValueError as error:  # a batch the KV pool cannot place
-                    got += [
+                    refused = [
                         {"shape": str(shape), "context": context, "op": op["op"]}
                         | {"leaf": sig, "refused": f"ValueError: {error}"}
                         for sig, (op, _) in found.items()
                     ]
+                    got += _journal(journal, refused)
         return got
     finally:
         runner.exit()
@@ -359,8 +379,8 @@ class Stub:
     the residual's width where the model widens it.
     """
 
-    def __init__(self, runner, llc: int) -> None:
-        self.runner, self.llc = runner, llc
+    def __init__(self, runner, llc: int, journal=None) -> None:
+        self.runner, self.llc, self.journal = runner, llc, journal
         self.weights, self.leaves, self.placed = {}, {}, []
         self.cold_copies, self.clones = {}, {}
         for t in _weights(runner.model):
@@ -444,9 +464,8 @@ class Stub:
                 record["refused"] = f"{type(error).__name__}: {error}"
             copies = record.get("copies", n)
             print(f"{shape}: {op['op']} over {copies} copies {names or ''}", flush=True)
-            got.append(
-                record | {"instances": len(inst), "placements": len(self.placed)}
-            )
+            record |= {"instances": len(inst), "placements": len(self.placed)}
+            got += _journal(self.journal, [record])
         self.placed = []
         return got
 
@@ -910,15 +929,20 @@ def publish(store, key, config, run: dict, command: str, results, out: Path):
 
 #: A ladder keeps a value only this many times the last it kept, and the largest.
 LADDER_STEP = 1.25
-#: The spread of a leaf's cold times across contexts, over the largest, past
-#: which its kind depends on context; a repeat's spread stays within 4%.
+#: The spread of a leaf's cold times across contexts, or a prefill leaf's
+#: across rows, over the largest, past which its kind depends on them; a
+#: repeat's spread stays within 4%.
 CONTEXT_MOVES = 0.10
+#: The spread of a leaf's cold times across contexts, or a prefill leaf's
+#: across rows, in ns, at or under which its kind does not depend on them
+#: whatever its share: one 3.5 us elementwise kernel on MI308X reads in two
+#: modes about 0.5 us apart, either one at any shape.
+CONTEXT_FLOOR_NS = 1000
 
 
 def plan(store, key, config, run, args, command: str, out: Path) -> None:
     """Measure the points the steps of `--plan`'s record directories call for,
     round by round, and write every point held to plan.jsonl in `out`."""
-    from atom.compass.bench import ranks
     from atom.compass.capture import population_steps
     from atom.compass.capture.forward import decode
     from atom.compass.runner.overrides import schedulable_ladder
@@ -954,7 +978,7 @@ def plan(store, key, config, run, args, command: str, out: Path) -> None:
             todo += [(shape, context, found)] if found else []
         print(f"round {n}: {sum(len(f) for *_, f in todo)} points to measure")
         gpus = len(run["device"])
-        results = ranks.measure(config, todo, args.llc_mib << 20, gpus) if todo else []
+        results = _measured(config, todo, args.llc_mib << 20, gpus)
         (out / f"round{n}").mkdir(exist_ok=True)
         publish(store, key, config, run, command, results, out / f"round{n}")
         done.update(((r["shape"], r["context"], r["leaf"]), r) for r in results)
@@ -979,18 +1003,35 @@ def plan(store, key, config, run, args, command: str, out: Path) -> None:
         for sig, (op, _) in graphs[shape].items():
             fam, tokens = _family(shape, None, op["op"], sig, dependent)
             seen[fam].setdefault(tokens, (shape, op["op"], sig))
+
+    def cached_ladder(top_only: bool) -> dict:
+        """The points of each prefill family over its rows' cached tokens, of
+        a kind `_dependent` reads as depending on context: only the most, its
+        reading's far end, while the kind has no cached point to read."""
+        dependent, want = _dependent(done.values()), defaultdict(set)
+        for at in seen.values():
+            for tokens in _ladder(at):
+                shape, op, sig = at[tokens]
+                ladder = _ladder(cached[shape.seqs])
+                for c in ladder[-1:] if top_only else ladder:
+                    fam = _family(shape, c, op, sig, dependent)[0]
+                    if c and _cut(fam):
+                        want[shape, c].add(fam)
+        return want
+
     for fam, at in seen.items():
         for tokens in _ladder(at):
-            shape, op, sig = at[tokens]
-            want[shape, None].add(fam)
-            for c in _ladder(cached[shape.seqs]) if _cut(fam) else ():
-                if c:
-                    want[shape, c].add(_family(shape, c, op, sig, dependent)[0])
+            want[at[tokens][0], None].add(fam)
+    for point, fams in cached_ladder(top_only=True).items():
+        want[point] |= fams
     n = 1
     while want:
         measure_round(want, n)
         n += 1
-        want = _densify(_families(done.values(), _dependent(done.values())), tried)
+        want = cached_ladder(top_only=False) if n == 2 else {}
+        want = want or _densify(
+            _families(done.values(), _dependent(done.values())), tried
+        )
     (out / "plan.jsonl").write_text(
         "".join(json.dumps(r) + "\n" for r in done.values())
     )
@@ -1007,13 +1048,16 @@ def _coverage_main(argv: list[str], atom_args: list[str]) -> dict:
     p.add_argument("--store", required=True, help="the artifact store's root")
     p.add_argument("--out", required=True, help="the --plan run's --out")
     args = p.parse_args(argv)
-    lines = (Path(args.out) / "plan.jsonl").read_text().splitlines()
+    out = Path(args.out)
+    lines = (out / "plan.jsonl").read_text().splitlines()
     records = [json.loads(line) for line in lines]
     store = ArtifactStore(args.store)
-    return coverage(store, args.store, atom_config(atom_args), args.coverage, records)
+    arch = json.loads((out / "run.json").read_text())["device"][0]["arch"]
+    config = atom_config(atom_args)
+    return coverage(store, args.store, config, args.coverage, records, arch)
 
 
-def coverage(store, root, config, names, records) -> dict:
+def coverage(store, root, config, names, records, arch) -> dict:
     """How the measured points among `records` cover the steps of the record
     directories `names`: the steps and those covered by phase, and per leaf
     kind the steps it left out by why. A step is covered when each leaf of its
@@ -1021,7 +1065,7 @@ def coverage(store, root, config, names, records) -> dict:
     decode leaf of a kind that depends on context over its rows' lowest to
     highest context (`_rows`), any other decode leaf at its width, a prefill
     leaf at its tokens, and one of a kind that depends on context over its
-    rows' cached tokens too (`_bracket_cached`)."""
+    rows' cached tokens too (`_bracket_cached`). The graphs are `arch`'s."""
     from atom.compass.capture import population_steps
 
     steps = list(population_steps(names))
@@ -1032,7 +1076,7 @@ def coverage(store, root, config, names, records) -> dict:
         if cut := _cut(fam):
             cuts[cut[0]][cut[1]] = axes[fam]
     graphs, report, out = {}, defaultdict(Counter), defaultdict(Counter)
-    _load(store, config, root, {s for s, _ in steps}, graphs)
+    _load(store, config, root, {s for s, _ in steps}, graphs, arch)
     families = {
         s: [
             (op["op"], *_family(s, None, op["op"], sig, dependent))
@@ -1165,14 +1209,18 @@ def _exchanged(fam: str) -> bool:
 def _family(shape, context, op: str, sig: str, dependent: dict):
     """The family a leaf's point belongs to, and where on its axis: a decode
     leaf at its width over context; a prefill leaf over its tokens, at its rows
-    and cached tokens too when its kind depends on context."""
-    if ex := exchange(json.loads(sig)):
-        return tuple(ex)
+    unless its kind's prefill points show it does not move with them, and at
+    its rows and cached tokens when its kind depends on context, as its
+    prefill points read it, else its decode points, else by default; a
+    collective over its message bytes (`exchange`)."""
+    if op.startswith(COLLECTIVES):
+        return tuple(exchange(json.loads(sig)))
     if shape.phase == "decode":
         return json.dumps([str(shape), sig]), context
     leaf = _abstract(json.loads(sig), shape.tokens)
-    if not dependent.get(op, True):
-        return json.dumps(["prefill", None, leaf], sort_keys=True), shape.tokens
+    if not dependent.get(("prefill", op), dependent.get(op, True)):
+        rows = shape.seqs if dependent.get(("rows", op), True) else None
+        return json.dumps(["prefill", rows, leaf], sort_keys=True), shape.tokens
     fam = ["prefill", shape.seqs, leaf, context or 0]
     return json.dumps(fam, sort_keys=True), shape.tokens
 
@@ -1184,20 +1232,32 @@ def _cut(fam: str):
     return (json.dumps(base, sort_keys=True), cached) if len(base) == 3 else None
 
 
-def _dependent(records) -> dict[str, bool]:
-    """Whether each leaf kind timed at two contexts of one width depends on
-    context: its kernels or its cold times differ there."""
+def _dependent(records) -> dict:
+    """Whether each leaf kind timed at two contexts of one shape depends on
+    context: its kernels differ there, or its cold times by more than
+    `CONTEXT_MOVES` of the largest and `CONTEXT_FLOOR_NS`. A decode kind, read
+    at two row contexts, is keyed by its name; a prefill kind, read fresh and
+    over cached tokens, by ``("prefill", name)``. Keyed ``("rows", name)``,
+    whether a prefill kind timed at two row counts of one token count and
+    cached tokens moves with its rows."""
     by = defaultdict(list)
     for r in records:
-        if "refused" not in r and r["shape"].startswith("decode"):
+        if "refused" in r:
+            continue
+        if r["shape"].startswith("decode"):
             by[r["op"], r["shape"], r["leaf"]].append(r)
+        else:
+            by[("prefill", r["op"]), r["shape"], r["leaf"]].append(r)
+            at = _shape(r["shape"]).tokens, r["context"]
+            by[("rows", r["op"]), at, r["leaf"]].append(r)
     kinds = {}
-    for (op, *_), points in by.items():
+    for (kind, *_), points in by.items():
         if len(points) > 1:
             cold = [p["cold_ns"] for p in points]
             kernels = {tuple(p["kernels"]) for p in points}
-            moved = max(cold) - min(cold) > CONTEXT_MOVES * max(cold)
-            kinds[op] = kinds.get(op, False) or moved or len(kernels) > 1
+            spread = max(cold) - min(cold)
+            moved = spread > max(CONTEXT_MOVES * max(cold), CONTEXT_FLOOR_NS)
+            kinds[kind] = kinds.get(kind, False) or moved or len(kernels) > 1
     return kinds
 
 
@@ -1281,7 +1341,7 @@ def _densify(families, tried: set) -> dict:
     return want
 
 
-def _load(store, config, root, shapes, graphs: dict) -> None:
+def _load(store, config, root, shapes, graphs: dict, arch=None) -> None:
     """Each of `shapes`' leaves into `graphs`, its op_graph captured first when
     the store has none."""
     from atom.compass.artifacts import ArtifactRefusal
@@ -1289,23 +1349,23 @@ def _load(store, config, root, shapes, graphs: dict) -> None:
     missing = []
     for shape in sorted(shapes - graphs.keys()):
         try:
-            graphs[shape] = leaves(graph(store, config, shape)["region"])
+            graphs[shape] = leaves(graph(store, config, shape, arch)["region"])
         except ArtifactRefusal:
             missing.append(shape)
     if missing:
-        _capture(config, missing, root)
+        _capture(config, missing, root, arch)
     for shape in missing:
-        graphs[shape] = leaves(graph(store, config, shape)["region"])
+        graphs[shape] = leaves(graph(store, config, shape, arch)["region"])
 
 
-def _capture(config, shapes, root) -> None:
+def _capture(config, shapes, root, arch=None) -> None:
     """`trace ops` of `shapes` into the store at `root`, in a process of its
     own that sees no GPU."""
     from atom.compass import capture
     from atom.compass.capture.forward import device_arch
 
     argv = ["--model", config.model, "--tp", str(config.tensor_parallel_size)]
-    argv += ["--arch", device_arch()]
+    argv += ["--arch", arch or device_arch()]
     for s in shapes:
         argv += ["--prefill", str(s.tokens)] if s.phase == "prefill" else ["--width"]
         argv.append(str(s.seqs))
@@ -1313,6 +1373,61 @@ def _capture(config, shapes, root) -> None:
     # the GPU it names; ROCm's own mask, below HIP's, hides every GPU.
     with patch.dict(os.environ, ROCR_VISIBLE_DEVICES=""):
         _child(capture.main, [*argv, "--store", str(root)])
+
+
+def _journal(path, records: list[dict]) -> list[dict]:
+    """`records`, each first appended to the file at `path` when one is named."""
+    if path:
+        with open(path, "a") as lines:
+            lines.writelines(json.dumps(r) + "\n" for r in records)
+    return records
+
+
+def _measured(config, todo, llc: int, gpus: int = 1) -> list[dict]:
+    """`measure` of `todo` on `gpus` GPUs (`ranks.measure`), a child of its own
+    on each. A launch whose child dies keeps the points every rank finished;
+    the first it left, the one it died measuring, refuses, and another launch
+    measures the rest: the pool ends every rank once one dies. Two launches in
+    a row that die having finished no point raise: a child itself is failing,
+    not a point."""
+    from atom.compass.bench import ranks
+
+    got, empty = [], False
+    with tempfile.TemporaryDirectory() as tmp:
+        journal = Path(tmp, "points.jsonl")
+        paths = (
+            [journal] if gpus == 1 else [Path(f"{journal}.{r}") for r in range(gpus)]
+        )
+        while todo:
+            for path in paths:
+                path.write_text("")
+            try:
+                with patch.dict(os.environ, {JOURNAL: str(journal)}):
+                    return got + ranks.measure(config, todo, llc, gpus)
+            except BrokenProcessPool:
+                new = ranks.merge(
+                    [[json.loads(x) for x in p.read_text().splitlines()] for p in paths]
+                )
+                if not new and empty:
+                    raise
+                got, empty = got + new, not new
+            done = {(r["shape"], r["context"], r["leaf"]) for r in got}
+            todo = [
+                (s, c, {k: v for k, v in found.items() if (str(s), c, k) not in done})
+                for s, c, found in todo
+            ]
+            todo = [point for point in todo if point[2]]
+            if todo:  # the first point it left is the one it died measuring
+                shape, context, found = todo[0]
+                sig = next(iter(found))
+                op = found.pop(sig)[0]["op"]
+                print(f"{shape}: {op}: the measuring process died", flush=True)
+                got.append(
+                    {"shape": str(shape), "context": context, "op": op}
+                    | {"leaf": sig, "refused": "the measuring process died"}
+                )
+                todo = todo if found else todo[1:]
+    return got
 
 
 def _child(fn, *args):

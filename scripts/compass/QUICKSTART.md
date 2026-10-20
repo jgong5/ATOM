@@ -11,6 +11,8 @@ not a sustainable configuration
 `smoke_cell.sh` runs the same path at one concurrency in about an hour, so start
 there (below), then run the full cell.
 
+New to Compass? The `/compass-onboard` skill (`.claude/skills/compass-onboard/`) runs this page with you on your GPU and explains each step from your outputs.
+
 ## Concepts
 
 Compass replaces only ATOM's forward pass. The scheduler, the KV block manager,
@@ -187,9 +189,12 @@ leave. To take a stopped loop again, `rm -rf` the `--out` of the stopped run and
 of any run a Ctrl-C cut short, and loop over only the concurrencies still to
 do, such as `for C in 4 16`: `serve` refuses an `--out` that exists.
 
-`client.sh`'s flags and exit codes are in its header. It sends one warmup request
-per lane before the graded window; keep it, since grading refuses a run whose
-warmup is missing or overlaps its graded steps.
+`client.sh`'s flags and exit codes are in its header. Before the graded window
+it runs aiperf's scenario warmup, the one `calib_capture.sh` runs: for each session
+active at a trajectory's sampled start, its last request before it. At c=16 on
+traces 0 to 255 that is 15 requests, which took 1334 s on one MI308X of
+hjbog-srdc-39 ([#1760](https://github.com/jgong5/ATOM/issues/1760)). Grading
+refuses a run whose warmup is missing or overlaps its graded steps.
 
 ## The path
 
@@ -353,7 +358,8 @@ law's accuracy.
 | `Triton cache error`, or `failed to map segment from shared object` | a `--tmpfs` without `exec` | the container as Environment starts it |
 | grading, a fit or `validate.cost` refuses a record: `aiter ran a JIT build of [...] while its server served` | the container met that kernel variant for the first time inside the record | take the record again, since the container now holds the build; warm a fresh container first (step 0) |
 | verdict `coverage report`, `no decode vector for rung N` | the cell decoded more requests at once than any calibration step did (a rung is the batch's captured-graph size) | calibrate at that concurrency or above; #1336's calibration reached no rung 48, so c=256 stayed a coverage report |
-| grading refuses a run: warmup | the client ran with `--no-warmup`, or its warmup overlapped its graded steps | keep `client.sh`'s default warmup |
+| grading refuses a run: `its export names no warmup` | no session was in flight at any lane's sampled start, so aiperf sent no warmup request: `artifacts/client_run.json` has an empty `warmup` and `client/aiperf.log` says `nothing to warm`. `client.sh` pins aiperf's seed, so the same traces and concurrency draw the same starts | no run of this cell is graded, since its first steps may be cold, and a fresh run repeats the draw; a higher concurrency adds lanes, each keeping its start; another trace range draws other starts |
+| grading refuses a run: warmup | its warmup overlapped its graded steps | a fresh server and client run |
 | grading refuses a run: fitted on the traces it grades | calibration and cell traces overlap | calibration 256 to 392, cell 0 to 255 |
 | disk full | raw exports keep every prompt, and caches with no tmpfs fill the container's layer | the data directory where Disk puts it, and the container's tmpfs mounts (Environment) |
 
