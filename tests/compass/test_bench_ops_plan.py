@@ -198,6 +198,83 @@ def test_coverage_counts_a_step_only_when_every_leaf_sits_in_one_kernel_s_band(
     }
 
 
+def _cached_bench(fn, config, todo, llc):
+    """`_bench` with prefill attention's kernel switching at 5000 cached tokens."""
+    got = _bench(fn, config, todo, llc)
+    for r in got:
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
+            r["kernels"] = [f"p{int((r['context'] or 0) >= 5000)}"]
+    return got
+
+
+def test_a_plan_measures_prefill_attention_over_cached_tokens_and_coverage_reads_them(
+    bench, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ops, "_child", _cached_bench)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[40, 40, False]], None),
+        ([[100, 2100, False]], None),
+        ([[100, 2500, False]], None),  # 2400 is under 1.25 times 2000: off the ladder
+        ([[100, 3100, False]], None),
+        ([[150, 8150, False]], None),
+    )
+    records = _plan(bench, tmp_path, plan)
+
+    attn = {}
+    for r in records:
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
+            attn.setdefault(r["shape"], set()).add(r["context"])
+    # Every token count over the cached ladder, halved to 4999 | 5000.
+    assert set(attn) == {f"prefill T={t} B=1" for t in (40, 100, 150)}
+    for cached in attn.values():
+        assert {None, 2000, 3000, 4999, 5000, 8000} <= cached and 2400 not in cached
+        assert len(cached) < 20
+    # GEMM does not depend on context: its prefill points stay fresh.
+    gemm = [r for r in records if r["op"] == "aiter.gemm"]
+    assert {r["context"] for r in gemm if r["shape"].startswith("prefill")} == {None}
+    graded = _records(
+        tmp_path / "graded",
+        ([[120, 1120, False]], None),  # between fresh and 2000 cached
+        ([[120, 6120, False]], None),  # between 5000 and 8000, past the switch
+        ([[120, 9120, False]], None),  # past the largest cached count measured
+        ([[160, 1160, False]], None),  # past the largest token count measured
+    )
+    store, root, _, _ = bench
+
+    report = ops.coverage(store, root, CONFIG, [graded], records)
+
+    assert report["by phase"] == {"prefill": {"steps": 4, "covered": 2}}
+    assert report["left out, by leaf kind"] == {
+        "aiter.attn": {"outside the measured range": 2},
+        "aiter.gemm": {"outside the measured range": 1},
+    }
+
+
+@pytest.mark.parametrize(
+    "tokens, lo, hi, why",
+    [
+        (120, 0, 1000, ""),  # fresh to 1000 cached, both of one kernel
+        (120, 1000, 2000, "between two kernels"),  # 1000 and 2000 differ
+        (120, 1000, 1000, ""),
+        (200, 0, 0, "outside the measured range"),  # past the token counts
+        (120, 1000, 5000, "outside the measured range"),  # past the cached counts
+        (60, 1000, 1000, "outside the measured range"),  # 1000 holds no 60
+    ],
+)
+def test_a_cached_bracket_holds_between_counts_and_tokens_of_one_kernel(
+    tokens, lo, hi, why
+):
+    cuts = {
+        0: ([40, 100, 150], ["a", "a", "a"]),
+        1000: ([100, 150], ["a", "a"]),
+        2000: ([40, 150], ["b", "b"]),
+    }
+
+    assert ops._bracket_cached(cuts, tokens, lo, hi) == why
+
+
 @pytest.mark.parametrize(
     "lo, hi, why",
     [

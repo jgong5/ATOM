@@ -241,7 +241,8 @@ def test_a_step_split_into_two_micro_batches_is_refused_by_name(tmp_path):
     )
 
     captured = re.findall(r"^captured (.*) in ", done.stdout, re.MULTILINE)
-    assert captured == ["prefill T=512 B=1"], done.stderr[-4000:]
+    # A prefill shape is captured twice: as a middle chunk, then a final one.
+    assert captured == ["prefill T=512 B=1"] * 2, done.stderr[-4000:]
     assert done.returncode != 0
     assert (
         "prefill T=8192 B=1 runs two micro-batches under --enable-tbo"
