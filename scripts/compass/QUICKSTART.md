@@ -219,7 +219,8 @@ serves the same record before its calibration, so a container it ran in is
 warm. Success: `serve` returns 0.
 
 **1. Memory readings** (GPU, 2 to 3 min after step 0; 5 min as a fresh
-container's first start, as in the smoke cell).
+container's first start, as in
+[PR #1762](https://github.com/jgong5/ATOM/pull/1762)'s smoke cell at 829cf661a).
 
 ```bash
 compass measure memory --gpu $G $M $S --out $R/memory -- $ATOM
@@ -335,11 +336,13 @@ names the step that failed, and exits 1 unless the cell is graded. At 873664d6d
 on node 18, in a container that held step 0's build, it took 61 min: 2 min for
 step 1, 13 min for calibration, 14 to 15 min per server of traces 0 to 7, step
 0's included, each with one warmup request of 113 s, and 2 min for the simulated
-run.
+run; then `grade` exited 1 with a coverage report.
 
-On these traces at c=1, no step in the first 600 s batches two requests, in
-calibration or in the cell, so the law has a vector for every step the cell
-takes. Its cost rows all read `unvalidated`, though: `fit steps` marks the
+In that run calibration batched no two requests, but the cell batched up to 4
+requests a step, so `grade` refused 8337 steps whose rung the law has no vector
+for, and the cell was not graded:
+[#1832](https://github.com/jgong5/ATOM/issues/1832). Its cost rows all read
+`unvalidated` too: `fit steps` marks the
 region it validates by holding out each calibration record in turn, so it needs
 two or more, and the smoke cell has one. The smoke cell checks the path, not the
 law's accuracy.
