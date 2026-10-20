@@ -5,7 +5,9 @@ A record is a real run's step record (`steps/dp<r>.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), read as JSON lines. `label` makes each forward
 that is not a dummy run a `Sample`: its batch view, its device label, its host
 labels and its provenance. `step_linear_fit` fits samples and `validate.cost`
-prices them; neither reads a step's stamps.
+prices them; neither reads a step's stamps. Neither takes a record whose
+run.json names `BUILDS`, aiter JIT modules its server built while it served;
+`refusal` says why.
 
 A step's device label is its device busy time, `d_busy_ns`, plus for a decode
 step the device work queued since the previous forward's exit, `d_gap_ns`. A
@@ -58,6 +60,20 @@ ANCHORS = 32
 CUTS = ("exposed", "mixed", "unsplit")
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
 TABLE_VERSION = 1
+#: run.json's entry naming the aiter JIT modules its server built while it
+#: served (`atom.compass.drive.aiter_jit`); a server that built none has none.
+BUILDS = "aiter_jit_builds"
+
+
+def refusal(run: dict) -> str | None:
+    """Why grading, a fit or `validate.cost` refuses a record whose run.json is
+    `run`, naming the modules of its `BUILDS`; None when it names none."""
+    if builds := run.get(BUILDS):
+        return (
+            f"aiter ran a JIT build of {builds} while its server served, "
+            "so a step may have waited on it"
+        )
+    return None
 
 
 @dataclass(frozen=True)
