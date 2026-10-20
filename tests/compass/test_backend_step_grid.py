@@ -29,6 +29,7 @@ from atom.compass.backends import (
     CostRefused,
     Granularity,
     Method,
+    ProvenanceMix,
     Refusal,
     RequestShape,
     StepGrid,
@@ -219,10 +220,7 @@ def test_with_one_corner_removed_the_step_refuses_naming_it(make, points, gone, 
     assert r.forward(decode(B37)).predicted_s == 0.0
     b, c = gone[-2:]
     assert r.refused_commands() == (
-        (
-            f"cost:step-grid: the {named} holding B=37, c=600 has no measurement "
-            f"at B={b}, c={c}"
-        ),
+        f"cost:step-grid: the {named} has no measurement at B={b}, c={c}",
     )
 
 
@@ -246,11 +244,21 @@ def test_a_hole_under_a_roofline_floor_is_priced_by_the_roofline():
     )
     assert r.refused_commands() == ()
     assert r.priced_steps()["declared_steps"] == 1
-    reason = (
-        "the decode rung 48 cell holding B=37, c=600 has no measurement at "
-        "B=48, c=1024"
-    )
+    reason = "the decode rung 48 cell has no measurement at B=48, c=1024"
     assert r._priced.reasons() == {("step-grid", reason): 1}
+
+
+def test_steps_missing_the_same_corner_share_one_reason():
+    """With (40, 1024) unmeasured, steps anywhere in the two cells beside it,
+    or on the B=40 node between them, are declined for that corner alone."""
+    holed = eager([p for p in EAGER if p["at"] != [40, 1024]])
+    mix = ProvenanceMix()
+    for b, c in ((36, 600), (34, 900), (40, 800), (44, 700)):
+        rows = [(1, c + 1, True)] * b
+        mix.record(StepFallbackBackend(holed, roofline()).price(view(*rows)))
+
+    reason = "the decode cell has no measurement at B=40, c=1024"
+    assert mix.reasons() == {("step-grid", reason): 4}
 
 
 def test_a_decode_step_wider_than_the_widest_rung_refuses_under_a_replay_bundle():
@@ -297,8 +305,8 @@ def test_a_middle_chunk_is_priced_from_the_no_output_grid_and_a_final_one_never_
     assert steps == [(False, 1e-3)] * 3 + [(True, 0.0)]
     assert refused == (
         (
-            "cost:step-grid: the prefill output cell holding B=1, T=8, c=192 "
-            "has no measurement at B=1, T=8, c=192"
+            "cost:step-grid: the prefill output cell has no measurement at "
+            "B=1, T=8, c=192"
         ),
     )
     final = [point(1, 8, 192, time=3)]
@@ -364,8 +372,8 @@ def test_only_a_homogeneous_batch_on_a_node_is_a_measured_lookup(rows, lookup, s
 @pytest.mark.parametrize(
     "batch,reason",
     [
-        (view(*[(1, 2001, True)] * 32), "c=2000 is outside the decode grid's"),
-        (view(*[(1, 601, True)] * 20), "B=20 is outside the decode grid's"),
+        (view(*[(1, 2001, True)] * 32), "c is above the decode grid's nodes 512..1024"),
+        (view(*[(1, 601, True)] * 20), "B is below the decode grid's nodes 32..48"),
         (view((8, 8, False), (1, 10, True)), "1 prefill and 1 decode rows"),
         (view((2, 10, True)), "a decode row computes 2 tokens"),
         (view((64.0, 64, False), produces_output=True), "count 64.0 is not an"),
@@ -466,9 +474,8 @@ def test_a_falling_in_pool_edge_prices_the_past_pool_step_by_the_roofline(
     assert term.provenance.refusals == (
         Refusal(
             "step-grid",
-            f"the decode cell holding B={b}, c={c} is past the KV pool, and "
-            "B=48's in-pool edge falls from c=512 to 767, reaching no positive "
-            f"time at c={c}",
+            "the decode cell is past the KV pool, and B=48's in-pool edge falls "
+            "from c=512 to 767, reaching no positive time at the step's c",
         ),
     )
 

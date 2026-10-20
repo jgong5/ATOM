@@ -168,8 +168,8 @@ class _Cells:
             if i in (0, len(nodes)):
                 raise _refused(
                     view,
-                    f"{axis}={x} is outside the {self.name} grid's nodes "
-                    f"{nodes[0]}..{nodes[-1]}",
+                    f"{axis} is {'below' if i == 0 else 'above'} the {self.name} "
+                    f"grid's nodes {nodes[0]}..{nodes[-1]}",
                 )
             low, high = nodes[i - 1], nodes[i]
             weight = (x - low) / (high - low)
@@ -205,8 +205,8 @@ class _Cells:
         if missing:
             raise _refused(
                 view,
-                f"the {self.name} cell holding {_named(self.axes, at)} has no "
-                f"measurement at {'; '.join(_named(self.axes, m) for m in missing)}",
+                f"the {self.name} cell has no measurement at "
+                f"{'; '.join(_named(self.axes, m) for m in missing)}",
             )
         value = sum(self.points[corner] * weight for corner, weight in corners)
         return value, len(corners) == 1, self._cell(self._sides(view, at))
@@ -243,9 +243,8 @@ class _Cells:
         if falls:
             raise _refused(
                 view,
-                f"the {self.name} cell holding {_named(self.axes, at)} is past "
-                f"the KV pool, and {'; '.join(falls)}, reaching no positive time "
-                f"at c={at[1]}",
+                f"the {self.name} cell is past the KV pool, and {'; '.join(falls)}, "
+                "reaching no positive time at the step's c",
             )
         return value, self._cell(sides), "; ".join(past)
 
