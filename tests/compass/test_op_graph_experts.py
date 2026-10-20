@@ -10,6 +10,10 @@ and ATOM's own `Mxfp4MoEMethod` decides the path on a stated arch.
 
 import itertools
 import json
+import os
+import pathlib
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -111,26 +115,9 @@ def test_aiter_and_dense_keys_are_unchanged(tmp_path, v4, monkeypatch):
     assert structure(v4, "decode").endswith(" ep=8 experts=triton decode eager")
 
 
-def _method(monkeypatch, arch, ep, eplb, mega):
-    from aiter import QuantType, dtypes
-
-    from atom.model_ops import moe
-
-    monkeypatch.setattr(moe, "get_gfx", lambda: arch)
-    current = SimpleNamespace(eplb_enable=eplb)
-    monkeypatch.setattr(moe, "get_current_atom_config", lambda: current)
-    quant = SimpleNamespace(
-        quant_type=QuantType.per_1x32,
-        quant_dtype=dtypes.fp4x2,
-        quant_method="",
-        is_dynamic=True,
-    )
-    config = SimpleNamespace(mxfp4_fp8_activations=False, a_quant_dtype=None, use_ep=ep)
-    return (moe.MegaMxfp4MoEMethod if mega else moe.Mxfp4MoEMethod)(quant, config)
-
-
-@pytest.mark.parametrize(
-    "arch,ep,eplb,mega,triton,gemm,decoding",
+#: Arch, EP, EPLB, MegaMoE, ATOM_USE_TRITON_MOE (None unset),
+#: ATOM_USE_TRITON_GEMM, ATOM_USE_TRITON_MOE_DECODE.
+GRID = list(
     itertools.product(
         ("gfx942", "gfx950", "gfx1250"),
         (False, True),
@@ -139,27 +126,84 @@ def _method(monkeypatch, arch, ep, eplb, mega):
         (None, "0", "1"),
         ("0", "1"),
         ("0", "1"),
-    ),
+    )
 )
-def test_the_key_names_the_path_atom_s_method_takes(
-    tmp_path, monkeypatch, arch, ep, eplb, mega, triton, gemm, decoding
-):
-    if triton:
-        monkeypatch.setenv("ATOM_USE_TRITON_MOE", triton)
-    monkeypatch.setenv("ATOM_USE_TRITON_GEMM", gemm)
-    monkeypatch.setenv("ATOM_USE_TRITON_MOE_DECODE", decoding)
-    config = _config(tmp_path, n_routed_experts=384, ep=ep)
-    config.eplb_enable = eplb
-    config.moe_backend = "mega" if mega else "standard"
-    method = _method(monkeypatch, arch, ep, eplb, mega)
+#: Builds ATOM's own method at every point of `GRID` in a process of its own,
+#: since the driverless declarations aiter's import needs are process-global;
+#: prints each point's key qualifier, the method's flags, and the capture
+#: check's refusal or None.
+METHODS = """
+import json, os, sys
+from types import SimpleNamespace
+from atom.compass.capture import driverless
+driverless.install(sys.argv[1], "gfx950")
+from aiter import QuantType, dtypes
+from atom.compass.capture.forward import _check_experts, experts
+from atom.model_ops import moe
+import torch
+quant = SimpleNamespace(quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp4x2,
+                        quant_method="", is_dynamic=True)
+out = []
+for arch, ep, eplb, mega, triton, gemm, decoding in json.loads(sys.argv[2]):
+    os.environ.pop("ATOM_USE_TRITON_MOE", None)
+    if triton is not None:
+        os.environ["ATOM_USE_TRITON_MOE"] = triton
+    os.environ["ATOM_USE_TRITON_GEMM"] = gemm
+    os.environ["ATOM_USE_TRITON_MOE_DECODE"] = decoding
+    moe.get_gfx = lambda: arch
+    current = SimpleNamespace(eplb_enable=eplb)
+    moe.get_current_atom_config = lambda: current
+    moe_config = SimpleNamespace(mxfp4_fp8_activations=False, a_quant_dtype=None,
+                                 use_ep=ep)
+    method = (moe.MegaMxfp4MoEMethod if mega else moe.Mxfp4MoEMethod)(quant, moe_config)
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(n_routed_experts=384), tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=8),
+        enable_expert_parallel=ep, eplb_enable=eplb,
+        moe_backend="mega" if mega else "standard")
+    named = experts(config, arch)
     model = torch.nn.Module()
     model.experts = torch.nn.Module()
     model.experts.quant_method = method
-    named = experts(config, arch)
+    try:
+        _check_experts(model, named)
+        refused = None
+    except ValueError as exc:
+        refused = str(exc)
+    flags = [method.use_triton, method.use_triton_ep, method.use_triton_decode]
+    out.append([named, *map(bool, flags), refused])
+print(json.dumps(out))
+"""
 
-    _check_experts(model, named)
-    assert ("triton" in named) == (method.use_triton or method.use_triton_ep)
-    assert ("+decode" in named) == method.use_triton_decode
+
+@pytest.fixture(scope="module")
+def methods(tmp_path_factory):
+    env = {k: v for k, v in os.environ.items() if k not in TRITON}
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            METHODS,
+            str(tmp_path_factory.mktemp("d")),
+            json.dumps(GRID),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        env=env,
+        cwd=pathlib.Path(__file__).resolve().parents[2],
+    )
+    assert done.returncode == 0, done.stderr[-3000:]
+    return dict(zip(GRID, json.loads(done.stdout.splitlines()[-1])))
+
+
+@pytest.mark.parametrize("point", GRID, ids=lambda p: "-".join(map(str, p)))
+def test_the_key_names_the_path_atom_s_method_takes(methods, point):
+    named, triton, triton_ep, triton_decode, refused = methods[point]
+
+    assert refused is None
+    assert ("triton" in named) == (triton or triton_ep)
+    assert ("+decode" in named) == triton_decode
 
 
 def test_a4w4_is_named_on_the_triton_path(v4, monkeypatch):
