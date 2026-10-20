@@ -23,10 +23,11 @@ from test_fit_samples import HOST, RUNS, edit
 from test_fit_samples import record as planted_out
 from test_parity_record import BLOCK, BUDGET, LADDER
 from test_parity_served import recorded
+from test_validate_runs import _aiter
 
 from atom.compass import cli
 from atom.compass.backends.step_labels import TABLE_VERSION, label
-from atom.compass.drive import identity, record, serve
+from atom.compass.drive import aiter_jit, identity, record, serve
 from atom.compass.fit.samples import load
 
 PLANTED = """\
@@ -284,3 +285,55 @@ def test_a_record_binds_the_host_it_names_which_its_url_names(tmp_path, planted_
 
     url = json.loads((out / serve.READY_FILE).read_text())["url"]
     assert url.startswith("http://127.0.0.2:")
+
+
+#: Put around the planted server: a module its start builds, written a second
+#: before it answers ``/health``, and those it builds once its ``server.json``
+#: is written, while it serves; each a path ``PLANTED_START`` or
+#: ``PLANTED_BUILT`` names.
+BUILDS = """\
+import os, pathlib, time
+def build(path):
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+    return path
+start = build(os.environ["PLANTED_START"])
+earlier = start.stat().st_mtime_ns - 10**9
+os.utime(start, ns=(earlier, earlier))
+"""
+SERVING = """
+ready = pathlib.Path(os.environ["ATOM_COMPASS_PARITY_RECORD"]).parent / "server.json"
+for _ in range(600):
+    if ready.exists():
+        break
+    time.sleep(0.05)
+for path in os.environ["PLANTED_BUILT"].split(os.pathsep):
+    build(path)
+"""
+
+
+@pytest.mark.skipif(GIT is None, reason="needs git")
+def test_a_record_names_each_aiter_module_its_server_built_while_it_served(
+    tmp_path, planted_gpu, monkeypatch
+):
+    """Of the installed aiter's JIT directory and of ``AITER_ROOT_DIR``'s, a
+    build cut short included; not a module the image held, nor one its start
+    built."""
+    jit = _aiter(tmp_path, monkeypatch)
+    root = tmp_path / "aiter_root"
+    monkeypatch.setenv("AITER_ROOT_DIR", str(root))
+    built = [
+        *(jit / "build" / "mha_x" / "build" / "mha_x.so", jit / "mha_x.so"),
+        *(jit / "build" / "mha_y" / "blob.staging" / "kernel.cpp",),
+        *(root / "build" / "pa_x" / "lib.so",),
+    ]
+    monkeypatch.setenv("PLANTED_START", str(root / "build" / "pa_ps_x" / "lib.so"))
+    monkeypatch.setenv("PLANTED_BUILT", os.pathsep.join(map(str, built)))
+    server = tmp_path / "server.py"
+    server.write_text(BUILDS + server.read_text() + SERVING)
+    out = tmp_path / "out"
+    cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
+
+    run = json.loads((out / "run.json").read_text())
+    assert run[aiter_jit.BUILDS] == ["mha_x", "mha_y", "pa_x"]
