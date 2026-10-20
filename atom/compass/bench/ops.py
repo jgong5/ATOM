@@ -30,20 +30,22 @@ refuses by name, a KV tensor argument among them.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, the tensors
 of each module it names and, for a leaf that names a context key, the KV and
-per-request state its layer holds for the batch. One graph runs the leaf K =
-`CALLS` times, cycling over its copies: N built ones: M, the least count whose
-bytes pass `COLD` times the last-level cache, raised for a context key to its I
-instances (at most K), then, up to the most weights the model holds of a
-weight argument's spec (at most K), copy c mod N with the c-th weights on
-that copy's other arguments. Copy c < N takes fresh activations below M and
-copy c mod M's from there,
+per-request state its layer holds for the batch. One graph runs the leaf K
+times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
+kernels of one eager call of copy 0, the fewer, at least one, cycling over its
+copies: N built ones: M, the least count whose bytes pass `COLD` times the
+last-level cache, raised for a context key to its I instances (at most K),
+then, up to the most weights the model holds of a weight argument's spec (at
+most K), copy c mod N with the c-th weights on that copy's other arguments.
+Copy c < N takes fresh activations below M and copy c mod M's from there,
 the c-th of the model's weights of that spec (a clone past the last), and
 instance c mod I at placement (c div I) mod P, its metadata and module
 tensors cloned past the first round: a placement is the point's batch on KV
 blocks and state slots of its own, for which ATOM builds the forward context
 again, cloned where it differs from the last placement's. A second graph runs
-copy 0 K times, warm; with one copy there is none.
-Each graph is replayed `WARMUPS` times, then `REPEATS` times timed;
+copy 0 K times, warm; with one copy, or K under `CALLS`, there is none.
+Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
+idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
 aside, are the point's kernel identity. A batch the KV pool cannot place refuses its leaves.
@@ -59,9 +61,11 @@ every leaf at every rung of ATOM's decode ladder at the steps' lowest and
 highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
 and each prefill family (`_family`) over a ladder of their token counts, chunk
-remainders among them; then the point halfway between two neighbours of a
-family that launched different kernels, until they are adjacent. DIR gets each
-round's ops.jsonl in `round<n>`, and every point held in plan.jsonl.
+remainders among them, one of a kind that depends on context at each over a
+ladder of the cached tokens of steps of its rows; then the point halfway
+between two neighbours of a family, or of a prefill leaf's token count over
+cached tokens, that launched different kernels, until they are adjacent. DIR
+gets each round's ops.jsonl in `round<n>`, and every point held in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
 covers (`coverage`), and prints the count by phase and why each leaf kind
@@ -81,6 +85,7 @@ import multiprocessing
 import os
 import re
 import statistics
+import time
 import warnings
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -106,15 +111,27 @@ from atom.compass.drive.gpu import add_gpu_flag
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below or the
 #: copies a graph reads change.
-PROTOCOL = 5
+PROTOCOL = 7
 WARMUPS = 3
 REPEATS = 20
-#: Calls every graph holds, and so the copies it cycles over at most. One count
-#: for every leaf: a replay's fixed cost adds the same share to every price.
+#: Calls a graph holds, and so the copies it cycles over at most. One count for
+#: every leaf a graph of which fits `GRAPH_NS`: a replay's fixed cost adds the
+#: same share to every such price.
 CALLS = 256
+#: Device time a graph's calls fill at most: a longer call takes fewer calls,
+#: at least one, so a capped graph holds at least 5 ms: a replay's fixed cost,
+#: about 19 us on MI308X, is under 0.4% of it.
+GRAPH_NS = 10_000_000
 #: Times over the last-level cache the copies' bytes pass: just past it, part of
 #: them stays there, and an MI308X GEMM read up to 7% fast.
 COLD = 2
+#: Host idle after each replay, as a share of its device time. Replayed back to
+#: back on an MI308X, the lm_head GEMM ran at a 1100 MHz memory and 1550 MHz
+#: fabric clock, against 1300 and 1800 MHz with an idle after each call, at the
+#: same socket power, and read up to 2.55% over ATOM's decode step by block
+#: median. A power limit is the suspected cause. With this idle after a replay
+#: `GRAPH_NS` bounds, it read 0.22% to 0.58% under the step.
+REST = 0.1
 #: Metadata arguments, by operator and slot, that are the token ids ATOM passes
 #: the model's forward; `_meta`'s name rule binds an embedding's `indices` to
 #: another index buffer.
@@ -402,7 +419,8 @@ class Stub:
             record = {"shape": str(shape), "context": context, "op": op["op"]}
             record |= {"leaf": sig, "metadata": names, "rows": rows}
             try:
-                record |= self._time(op, sig, inst, n) | {"footprint_bytes": n * size}
+                record |= self._time(op, sig, inst, n)
+                record["footprint_bytes"] = min(n, record.get("copies", n)) * size
             except Exception as error:  # noqa: BLE001 - a refusal names what stopped it
                 record["refused"] = f"{type(error).__name__}: {error}"
             copies = record.get("copies", n)
@@ -439,15 +457,16 @@ class Stub:
         return min(CALLS, COLD * self.llc // size + 1) if size else 1
 
     def _time(self, op, sig, instances, n) -> dict:
-        """`op` timed cold over `n` copies, past the first `m` its point sized
-        to the cache (`cold_copies`) each on copy `c mod m`'s activations, then
-        copy `c mod n` with the c-th weight up to every weight the model holds
-        of its spec, and warm over one, with its kernels."""
+        """`op` timed in a graph of K calls, `CALLS` or as many as fill
+        `GRAPH_NS`, cold over at most `n` copies, past the first `m` its point
+        sized to the cache (`cold_copies`) each on copy `c mod m`'s
+        activations, then copy `c mod n` with the c-th weight up to every
+        weight the model holds of its spec, at most K; and, when K is `CALLS`,
+        warm over one; with its kernels."""
         from atom.utils import forward_context
 
         fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
-        calls = [self._copy(op, sig, instances, c) for c in range(min(n, m))]
-        calls += [self._copy(op, sig, instances, c, calls[c % m]) for c in range(m, n)]
+        calls = [self._copy(op, sig, instances, 0)]
         # one weight can read a few percent off another of its spec, and every
         # one is held anyway: cycle them all, on the n copies' other arguments
         held = [
@@ -455,16 +474,22 @@ class Stub:
             for _, s in _specs(op["args"])
             if s["role"] == "weight"
         ]
-        for c in range(n, min(CALLS, max([n, *held]))):
-            calls.append(self._reweigh(op, calls[c % n], c))
-        n = len(calls)
         try:
             forward_context._forward_context = calls[0][1]
             fn(**calls[0][0])  # compiles and tunes outside the graphs
-            kernels = _kernels(fn, calls[0][0])
-            cycle = [calls[i % n] for i in range(CALLS)]
+            kernels, ns = _kernels(fn, calls[0][0])
+            k = min(CALLS, max(int(GRAPH_NS // ns), 1)) if ns else CALLS
+            n = min(n, k)
+            calls += [self._copy(op, sig, instances, c) for c in range(1, min(n, m))]
+            calls += [
+                self._copy(op, sig, instances, c, calls[c % m]) for c in range(m, n)
+            ]
+            for c in range(n, min(k, max([n, *held]))):
+                calls.append(self._reweigh(op, calls[c % n], c))
+            n = len(calls)
+            cycle = [calls[i % n] for i in range(k)]
             cold = _replay(fn, cycle)
-            warm = _replay(fn, calls[:1] * len(cycle)) if n > 1 else None
+            warm = _replay(fn, calls[:1] * k) if n > 1 and k == CALLS else None
         finally:
             forward_context._forward_context = forward_context.ForwardContext()
         medians = statistics.median(cold), warm and statistics.median(warm)
@@ -611,10 +636,10 @@ def _function(name: str):
     return fn
 
 
-def _kernels(fn, kwargs) -> list[str]:
-    """The kernels one call of `fn` launches, in order: its device activity
-    except memory copies, which the profiler records at some calls of a leaf
-    and misses at others."""
+def _kernels(fn, kwargs) -> tuple[list[str], float]:
+    """The kernels one call of `fn` launches, in order, and their device time
+    in ns: its device activity except memory copies, which the profiler
+    records at some calls of a leaf and misses at others."""
     from torch.profiler import ProfilerActivity, profile
 
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
@@ -626,7 +651,9 @@ def _kernels(fn, kwargs) -> list[str]:
         if e.device_type == torch.autograd.DeviceType.CUDA
         and not e.name.startswith("Memcpy")
     ]
-    return [e.name for e in sorted(device, key=lambda e: e.time_range.start)]
+    device.sort(key=lambda e: e.time_range.start)
+    ns = 1e3 * sum(e.time_range.elapsed_us() for e in device)
+    return [e.name for e in device], ns
 
 
 def _replay(fn, calls) -> list[float]:
@@ -649,8 +676,10 @@ def _replay(fn, calls) -> list[float]:
         graph.replay()
         end.record()
         end.synchronize()
+        ms = start.elapsed_time(end)
         if i >= WARMUPS:
-            times.append(start.elapsed_time(end) * 1e6 / len(calls))
+            times.append(ms * 1e6 / len(calls))
+        time.sleep(ms * REST / 1e3)
     return times
 
 
@@ -870,16 +899,24 @@ def plan(store, key, config, run, args, command: str, out: Path) -> None:
             if dependent.get(op["op"], True):
                 for c in _ladder(contexts):
                     want[shape, c].add(_family(shape, c, op["op"], sig, dependent)[0])
-    prefills = {s for s, _ in steps if s.phase == "prefill"}
+    prefills, cached = set(), defaultdict(list)
+    for s, line in steps:
+        if s.phase == "prefill":
+            prefills.add(s)
+            cached[s.seqs] += _cached(line)
     _load(store, config, args.store, prefills, graphs)
     seen = defaultdict(dict)
     for shape in sorted(prefills):
         for sig, (op, _) in graphs[shape].items():
             fam, tokens = _family(shape, None, op["op"], sig, dependent)
-            seen[fam].setdefault(tokens, shape)
+            seen[fam].setdefault(tokens, (shape, op["op"], sig))
     for fam, at in seen.items():
         for tokens in _ladder(at):
-            want[at[tokens], None].add(fam)
+            shape, op, sig = at[tokens]
+            want[shape, None].add(fam)
+            for c in _ladder(cached[shape.seqs]) if _cut(fam) else ():
+                if c:
+                    want[shape, c].add(_family(shape, c, op, sig, dependent)[0])
     n = 1
     while want:
         measure_round(want, n)
@@ -913,17 +950,18 @@ def coverage(store, root, config, names, records) -> dict:
     kind the steps it left out by why. A step is covered when each leaf of its
     `op_graph` lies on a point or between two of one kernel (`_bracket`): a
     decode leaf of a kind that depends on context over its rows' lowest to
-    highest context (`_rows`), any other decode leaf at its width, and a
-    prefill leaf at its tokens, unless its kind depends on context and a row
-    was cached: the plan's prefill rows are fresh."""
+    highest context (`_rows`), any other decode leaf at its width, a prefill
+    leaf at its tokens, and one of a kind that depends on context over its
+    rows' cached tokens too (`_bracket_cached`)."""
     from atom.compass.capture import population_steps
 
     steps = list(population_steps(names))
     dependent = _dependent(records)
-    axes = {
-        fam: ([p[0] for p in points], [p[1] for p in points])
-        for fam, points in _families(records, dependent).items()
-    }
+    axes, cuts = {}, defaultdict(dict)
+    for fam, points in _families(records, dependent).items():
+        axes[fam] = [p[0] for p in points], [p[1] for p in points]
+        if cut := _cut(fam):
+            cuts[cut[0]][cut[1]] = axes[fam]
     graphs, report, out = {}, defaultdict(Counter), defaultdict(Counter)
     _load(store, config, root, {s for s, _ in steps}, graphs)
     families = {
@@ -934,17 +972,23 @@ def coverage(store, root, config, names, records) -> dict:
         for s, g in graphs.items()
     }
     for shape, line in steps:
-        whys, cached = {}, any(row[1] > row[0] for row in line["rows"])
+        whys = {}
         for name, fam, tokens in families[shape]:
             moves = dependent.get(name, True)
-            if fam not in axes:
+            cut = _cut(fam)
+            if cut and cut[0] in cuts:
+                at, (lo, hi) = cuts[cut[0]], _cached(line)
+                whys[name] = (
+                    "a cached row, measured on fresh rows only"
+                    if hi and at.keys() == {0}
+                    else _bracket_cached(at, tokens, lo, hi)
+                )
+            elif fam not in axes:
                 whys[name] = "no measured point"
             elif shape.phase == "decode":
                 whys[name] = (
                     _bracket(*axes[fam], *_rows(line, shape.seqs)) if moves else ""
                 )
-            elif cached and moves:
-                whys[name] = "a cached row, measured on fresh rows only"
             else:
                 whys[name] = _bracket(*axes[fam], tokens, tokens)
         whys = {name: why for name, why in whys.items() if why}
@@ -972,6 +1016,12 @@ def _rows(line, rung: int) -> tuple[int, int]:
     ks = [1 << i for i in range(rung.bit_length())]
     lo = min(rowmod(contexts, k) // -(-rung // k) for k in ks)
     return max(lo, 1), max(contexts)
+
+
+def _cached(line) -> tuple[int, int]:
+    """A step's rows' mean and max cached tokens."""
+    cached = [row[1] - row[0] for row in line["rows"]]
+    return sum(cached) // len(cached), max(cached)
 
 
 def _ladder(values) -> list:
@@ -1006,12 +1056,21 @@ def _abstract(value, n: int):
 def _family(shape, context, op: str, sig: str, dependent: dict):
     """The family a leaf's point belongs to, and where on its axis: a decode
     leaf at its width over context; a prefill leaf over its tokens, at its rows
-    too when its kind depends on context."""
+    and cached tokens too when its kind depends on context."""
     if shape.phase == "decode":
         return json.dumps([str(shape), sig]), context
-    rows = shape.seqs if dependent.get(op, True) else None
     leaf = _abstract(json.loads(sig), shape.tokens)
-    return json.dumps(["prefill", rows, leaf], sort_keys=True), shape.tokens
+    if not dependent.get(op, True):
+        return json.dumps(["prefill", None, leaf], sort_keys=True), shape.tokens
+    fam = ["prefill", shape.seqs, leaf, context or 0]
+    return json.dumps(fam, sort_keys=True), shape.tokens
+
+
+def _cut(fam: str):
+    """A prefill family of a kind that depends on context as the family over
+    every cached-token count, and its count; None for any other."""
+    *base, cached = json.loads(fam)
+    return (json.dumps(base, sort_keys=True), cached) if len(base) == 3 else None
 
 
 def _dependent(records) -> dict[str, bool]:
@@ -1045,33 +1104,62 @@ def _families(records, dependent) -> dict:
 def _bracket(ats, kernels, lo, hi) -> str:
     """'' if `lo` to `hi` lies on or between two points, `ats` in order, that
     launched the same `kernels` as every point between them; else why not."""
-    i, j = bisect.bisect_right(ats, lo) - 1, bisect.bisect_left(ats, hi)
-    if i < 0 or j == len(ats):
+    band = _band(ats, lo, hi)
+    if band is None:
         return "outside the measured range"
-    if len(set(kernels[min(i, j) : max(i, j) + 1])) > 1:
-        return "between two kernels"
-    return ""
+    return "between two kernels" if len(set(kernels[band])) > 1 else ""
+
+
+def _bracket_cached(cuts: dict, tokens, lo, hi) -> str:
+    """`_bracket` over two axes: '' if `lo` to `hi` cached tokens lie on or
+    between two of `cuts`' cached-token counts, and `tokens` on or between two
+    points of each count from the one to the other, every point of one kernel;
+    else why not."""
+    cached = sorted(cuts)
+    if (band := _band(cached, lo, hi)) is None:
+        return "outside the measured range"
+    kernels = set()
+    for ats, ks in (cuts[c] for c in cached[band]):
+        if (inner := _band(ats, tokens, tokens)) is None:
+            return "outside the measured range"
+        kernels.update(ks[inner])
+    return "between two kernels" if len(kernels) > 1 else ""
+
+
+def _band(ats, lo, hi) -> slice | None:
+    """The points of `ats`, in order, from the last at or below `lo` to the
+    first at or above `hi`; None when either is missing."""
+    i, j = bisect.bisect_right(ats, lo) - 1, bisect.bisect_left(ats, hi)
+    return None if i < 0 or j == len(ats) else slice(min(i, j), max(i, j) + 1)
 
 
 def _densify(families, tried: set) -> dict:
-    """The point halfway between each two neighbours of a family that launched
+    """The point halfway between each two neighbours of a family, or of a
+    prefill leaf's token count over cached tokens (`_cut`), that launched
     different kernels and lie more than one apart, unless `tried`."""
     from atom.compass.capture.forward import prefill
 
-    want = defaultdict(set)
+    across = defaultdict(list)
     for fam, points in families.items():
+        if cut := _cut(fam):
+            for tokens, kernels, record in points:
+                across[cut[0], tokens].append((cut[1], kernels, record))
+    want = defaultdict(set)
+    for fam, points in [*families.items(), *across.items()]:
+        points = sorted(points, key=lambda p: p[0])
         for (a, ka, record), (b, kb, _) in itertools.pairwise(points):
             mid = (a + b) // 2
             if ka == kb or b - a < 2 or (fam, mid) in tried:
                 continue
             tried.add((fam, mid))
             shape = _shape(record["shape"])
-            at = (
-                (shape, mid)
-                if shape.phase == "decode"
-                else (prefill(mid, shape.seqs), None)
-            )
-            want[at].add(fam)
+            if isinstance(fam, tuple):  # over cached tokens at one token count
+                new = json.dumps([*json.loads(fam[0]), mid], sort_keys=True)
+                want[shape, mid].add(new)
+            elif shape.phase == "decode":
+                want[shape, mid].add(fam)
+            else:
+                want[prefill(mid, shape.seqs), record["context"]].add(fam)
     return want
 
 
