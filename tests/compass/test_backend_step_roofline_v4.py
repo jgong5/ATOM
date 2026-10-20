@@ -25,11 +25,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 from test_backend_step_roofline import ROOFLINE
-from test_dp_step_max import runner
+from test_dp_step_max import prefill, runner
 from test_moe_gather_rows import decode
 
 from atom.compass.backends import BatchView, CostRefused, RequestShape
-from atom.compass.backends.step_roofline import Module, StepRooflineBackend, overlap
+from atom.compass.backends.step_roofline import (
+    Module,
+    StepRooflineBackend,
+    micro_batches,
+    overlap,
+)
 from atom.compass.backends.work import (
     Work,
     activated_experts,
@@ -255,6 +260,26 @@ def test_the_batch_view_states_the_real_tokens_among_the_gathered_rows():
     view = projection.batch_view(decode(3), mode, r)
 
     assert (view.moe_rows, view.moe_tokens) == (8, 5)
+
+
+def test_a_rank_s_view_names_its_own_slot_of_the_split():
+    # Both ranks prefill 7 tokens; rank 1 splits 3 then 4, rank 0 4 then 3.
+    r = runner(None, dp_size=2, dp_rank=1)
+    r.drafter = None
+    sync = SimpleNamespace(
+        num_tokens_across_dp=torch.tensor([7, 7]), ub_tokens_across_dp=((4, 3), (3, 4))
+    )
+    mode = SimpleNamespace(
+        sync=sync, running_tokens_are_unified=False, use_cudagraph=False
+    )
+    view = projection.batch_view(prefill(7), mode, r)
+
+    assert [h.requests for h in micro_batches(view)] == [
+        (RequestShape(3, 3, False),),
+        (RequestShape(4, 7, False),),
+    ]
+    with pytest.raises(ValueError, match="names no single pair"):
+        micro_batches(dataclasses.replace(view, dp_rank=None))
 
 
 WALK = """
