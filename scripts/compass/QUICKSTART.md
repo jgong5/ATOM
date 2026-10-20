@@ -97,17 +97,18 @@ Run from `/` in the container, so no checkout's `atom` shadows `$T`'s.
 `export MODEL TRACES`. Every `python3 -m atom.compass...` below runs with
 `PYTHONPATH=$T`: without it, `atom` is the image's own copy in `/app/ATOM`.
 
-One server and its client run, used by steps 2, 3 and 5:
+One server and its client run, used by steps 0, 2, 3 and 5:
 
 ```bash
 # serve OUT TRACES C PYTHON COMMAND...: start a compass server writing to OUT,
-# send it one client run, and stop it. Its log goes under $R/logs.
+# send it one client run of D seconds (default 1800), and stop it. Its log goes
+# under $R/logs.
 serve() {
   local out=$1 traces=$2 c=$3 py=$4 log=$R/logs/${1#$R/}.log; shift 4
   mkdir -p ${log%/*} && compass "$@" --out $out -- $ATOM > $log 2>&1 &
   until [ -s $out/server.json ]; do sleep 5; done   # if it never appears, read $log
   HARNESS_PYTHON=$py $T/scripts/compass/client.sh $out --traces $traces \
-    --concurrency $c --duration 1800 --stop
+    --concurrency $c --duration ${D:-1800} --stop
 }
 ```
 
@@ -121,7 +122,21 @@ Times were measured on node 18 for the cell in
 [PR #1336](https://github.com/jgong5/ATOM/pull/1336), at concurrencies 1, 4, 16,
 64 and 256 with a 1800 s benchmark each.
 
-**1. Memory readings** (GPU, 2 to 3 min; 6 min on a container's first start).
+**0. Warm a fresh container** (GPU, once per container; 16 min).
+
+```bash
+D=600 serve $R/warm 0-7 1 $REAL_PY record --gpu $G
+```
+
+A server builds an aiter kernel the first time it meets a variant its image did
+not prebuild, such as `mha_varlen_fwd`'s for a prefill step of one new token a
+row, about 60 s inside the run, and the container keeps it for every later
+server. A record whose server built one names it in run.json's
+`aiter_jit_builds`, and grading refuses that record. This record takes those
+builds; nothing reads it. `smoke_cell.sh` serves the same record first, so a
+container it ran in is warm. Success: `client.sh` exits 0.
+
+**1. Memory readings** (GPU, 2 to 3 min).
 
 ```bash
 compass measure memory --gpu $G $M $S --out $R/memory -- $ATOM
@@ -150,8 +165,8 @@ for C in 16 64 256 1 4; do serve $R/cell/c$C/real2 0-255 $C $REAL_PY record --gp
 
 Each graded run is a fresh server: a second client run would meet the prefix
 cache the first left. The second loop takes the concurrencies in another order,
-so the two runs of one concurrency are at least two runs apart, whether the loops
-run one after the other on one GPU or at once on two; repeats run back to back
+so the two runs of one concurrency are at least two places apart in their loops:
+never back to back on one GPU, never together on two; repeats run back to back
 or together understate the real spread every metric is judged against. On two
 GPUs, run the two loops at once, each with its own `$G`; no more than two real
 runs at once, since real runs time the host. Success as in step 2.
@@ -206,10 +221,11 @@ Reference results: the graded tables of
 
 ## The smoke cell
 
-`smoke_cell.sh MODEL OUT` runs steps 1 to 6 at c=1 on one GPU: one calibration
-record of traces 256 to 263, two real runs and one simulated run of traces 0 to
-7, each client run 600 s. It fits before the real runs, so a failed fit costs no
-more GPU time. Its variables are in its header.
+`smoke_cell.sh MODEL OUT` runs steps 0 to 6 at c=1 on one GPU, step 1 first:
+step 0's record, one calibration record of traces 256 to 263, two real runs and
+one simulated run of traces 0 to 7, each client run 600 s. It fits before the
+real runs, so a failed fit costs no more GPU time. Its variables are in its
+header.
 
 ```bash
 GPU=$G MACHINE=$SPEC HARNESS_PYTHON=$SIM_PY AIPERF_PYTHON=$REAL_PY \
@@ -218,8 +234,9 @@ GPU=$G MACHINE=$SPEC HARNESS_PYTHON=$SIM_PY AIPERF_PYTHON=$REAL_PY \
 
 It prints each step as it starts, then the grading table, then one line with the
 verdict, the wall time and each run's warmup. It refuses a GPU that is not idle,
-names the step that failed, and exits 1 unless the cell is graded. On node 18 it
-took 44 min: 13 to 15 min per real server, 2 min for the simulated run.
+names the step that failed, and exits 1 unless the cell is graded. On node 18,
+in a fresh container, it took 60 min: 5 min for step 1, 13 to 14 min per real
+server, step 0's included, 2 min for the simulated run.
 
 On these traces at c=1, no step in the first 600 s batches two requests, in
 calibration or in the cell, so the law has a vector for every step the cell
@@ -239,7 +256,7 @@ law's accuracy.
 | `run` refuses its law or host laws | records, fits and runs from two trees, two `$ATOM`s or two specs | one tree, one `$ATOM`, one spec for every step |
 | `... holds an earlier run's files`, or `client.sh` refuses its OUT | one server per `--out`, one client run per server | a fresh `--out` for every server |
 | `fit` refuses `... is not a record directory (no run.json)` | a log file matched `$R/cal/c*` | keep logs outside the record directories |
-| a step of about 60 s early in a real run | aiter builds a kernel on the container's first short prefill over a long history ([#1319](https://github.com/jgong5/ATOM/issues/1319)) | take graded records in a container that has served one before |
+| grading refuses a run: `aiter ran a JIT build of [...] while its server served` | the container met that kernel variant for the first time inside the record | take the record again, since the container now holds the build; warm a fresh container first (step 0) |
 | verdict `coverage report`, `no decode vector for rung N` | the cell decoded more requests at once than any calibration step did (a rung is the batch's captured-graph size) | calibrate at that concurrency or above; #1336's calibration reached no rung 48, so c=256 stayed a coverage report |
 | grading refuses a run: warmup | the client ran with `--no-warmup`, or its warmup overlapped its graded steps | keep `client.sh`'s default warmup |
 | grading refuses a run: fitted on the traces it grades | calibration and cell traces overlap | calibration 256 to 392, cell 0 to 255 |
