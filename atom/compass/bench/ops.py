@@ -21,7 +21,7 @@ dummy, through ATOM's warmup, and a `Stub` takes the place of the model's
 forward. Each point reaches the runner as a batch (`ReplayRule`), so ATOM
 builds its metadata and forward context, and the stub calls each leaf from its
 contract: an activation is random at its shape, dtype and stride, except a
-router's top-k expert ids, drawn uniformly per copy (`_route`); a weight is
+router's top-k expert ids, drawn uniformly on every copy (`_route`); a weight is
 a tensor of the model of that shape, dtype and stride; a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM passes the forward (`TOKEN_IDS`); an integer the capture
@@ -530,10 +530,10 @@ class Stub:
                 return [
                     build(f"{path}.{i}", v, old and old[i]) for i, v in enumerate(value)
                 ]
-            if isinstance(value, dict) and value.get("role") == "activation" and like:
-                return old
             if isinstance(value, dict) and self._routed(value):
                 return self._route(value, c)
+            if isinstance(value, dict) and value.get("role") == "activation" and like:
+                return old
             if _ref(value) and "module" in value:
                 module = self.modules[instance[path]]
                 return _module_copy(module) if fresh else module
@@ -579,13 +579,16 @@ class Stub:
 
     def _reweigh(self, op, like, c):
         """Copy `like` of `op`'s call with the c-th weight of each weight
-        argument's spec, its other arguments and forward context shared."""
+        argument's spec and expert ids of its own, its other arguments and
+        forward context shared."""
 
         def build(value, old):
             if isinstance(value, list):
                 return [build(v, o) for v, o in zip(value, old)]
             if isinstance(value, dict) and value.get("role") == "weight":
                 return self._tensor(value, None, c, False)
+            if isinstance(value, dict) and self._routed(value):
+                return self._route(value, c)
             return old
 
         kwargs, snap = like

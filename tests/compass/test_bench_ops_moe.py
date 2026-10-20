@@ -11,7 +11,7 @@ from test_bench_ops import _Runner
 from atom.compass.bench import ops
 from atom.utils import forward_context as fctx
 
-I32 = "torch.int32"
+I32, F32 = "torch.int32", "torch.float32"
 
 
 class _Experts(torch.nn.Module):
@@ -39,8 +39,8 @@ def _spec(shape, dtype=I32, role="activation"):
 MOE = {
     "op": "aiter.fused_moe_.default",
     "args": {
-        "hidden_states": _spec([4, 3], "torch.float32"),
-        "topk_weight": _spec([4, 2], "torch.float32"),
+        "hidden_states": _spec([4, 3], F32),
+        "topk_weight": _spec([4, 2], F32),
         "topk_ids": _spec([4, 2]),
         "token_ids": _spec([4]),
     },
@@ -62,7 +62,7 @@ def _timed(stub, op, n):
         patch.object(ops, "_replay", side_effect=replay),
     ):
         record = stub._time(op, "sig", [{}], n)
-    return record, [kwargs for kwargs, _ in graphs[0][:n]]
+    return record, [kwargs for kwargs, _ in graphs[0][: record["copies"]]]
 
 
 def test_each_copy_draws_each_token_s_experts_distinct_and_records_their_loads():
@@ -83,6 +83,22 @@ def test_each_copy_draws_each_token_s_experts_distinct_and_records_their_loads()
     # A token id and the router's weights are no expert ids.
     assert all(not c["token_ids"].any() for c in copies)
     assert all(c["topk_weight"].dtype == torch.float32 for c in copies)
+
+
+@pytest.mark.parametrize("past", ["the cold copies", "the copies"])
+def test_a_copy_on_another_copy_s_inputs_draws_experts_of_its_own(past):
+    # Copy 1 takes copy 0's hidden states: past the cold copies (one passes the
+    # cache), or past the copies with the model's second Linear(3, 3) weight.
+    stub = _stub((16, 2))
+    moe = {"op": MOE["op"], "args": MOE["args"] | {"w": _spec([3, 3], F32, "weight")}}
+    if past == "the cold copies":
+        stub.cold_copies = {"sig": 1}
+
+    record, copies = _timed(stub, moe, 2 if past == "the cold copies" else 1)
+
+    assert copies[1]["hidden_states"] is copies[0]["hidden_states"]
+    assert not torch.equal(copies[0]["topk_ids"], copies[1]["topk_ids"])
+    assert len(record["routing"]["activated"]) == 2
 
 
 def test_the_draw_is_seeded_by_the_copy_and_the_seed():
