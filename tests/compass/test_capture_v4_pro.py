@@ -141,13 +141,15 @@ def test_each_layer_runs_its_shared_expert_beside_the_moe_on_every_rank_s_rows(
                 f"{MORI}.dispatch",
                 f"{MORI}.combine",
             ]
-            # Each names MORI's method, and its slots are that method's parameters.
+            # Each names MORI's method, and its slots are that method's parameters
+            # and the EP width its handle was built for.
             for op in exchanged:
                 module, _, qualname = op["op"].partition(":")
                 fn = functools.reduce(
                     getattr, qualname.split("."), importlib.import_module(module)
                 )
-                assert set(op["args"]) <= set(inspect.signature(fn).parameters)
+                params = set(inspect.signature(fn).parameters)
+                assert set(op["args"]) <= params | {"num_ep_ranks"}
         else:
             assert {op["op"].split(":")[0] for op in exchanged} == {MOE}
         # In: this rank's rows. Out of the dispatch or gather: every rank's.
