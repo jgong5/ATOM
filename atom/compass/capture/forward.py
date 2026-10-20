@@ -23,8 +23,8 @@ parameter before the launch, or that dispatched a leaf of its own other than a
 host query (`HOST_QUERIES`), is refused by name.
 
 The engine is ATOM's own `Config` for ATOM's engine arguments, on a declared
-device of one arch. Under DP the capture runs one rank and every peer runs its
-shape (`peers`).
+device of one arch. Under DP the capture runs one rank, and its peers the rest of
+the rows the group's MoE gathers (`peers`).
 """
 
 import ast
@@ -75,16 +75,24 @@ _IS_ATOM: dict = {}
 
 
 class Shape(NamedTuple):
-    """A step's shape: `tokens` query tokens over `seqs` sequences."""
+    """A step's shape: `tokens` query tokens over `seqs` sequences, and under DP
+    `gathered`, the rows the group's MoE gathers, None at every rank's `tokens`."""
 
     phase: str  # "decode" or "prefill"
     tokens: int
     seqs: int
+    gathered: int | None = None
 
     def __str__(self) -> str:
-        if self.phase == "prefill":
-            return f"prefill T={self.tokens} B={self.seqs}"
-        return f"decode B={self.seqs}"
+        text = f"prefill T={self.tokens} B={self.seqs}"
+        text = text if self.phase == "prefill" else f"decode B={self.seqs}"
+        return text if self.gathered is None else f"{text} G={self.gathered}"
+
+    def at(self, dp: int) -> "Shape":
+        """This shape in a DP group of `dp`: `gathered` only off `dp x tokens`."""
+        return (
+            self._replace(gathered=None) if self.gathered == dp * self.tokens else self
+        )
 
 
 def decode(width: int) -> Shape:
@@ -93,13 +101,18 @@ def decode(width: int) -> Shape:
     return Shape("decode", width, width)
 
 
-def prefill(tokens: int, seqs: int) -> Shape:
+def prefill(tokens: int, seqs: int, gathered: int | None = None) -> Shape:
     if not 1 <= seqs <= tokens:
         raise ValueError(
             f"a prefill of {tokens} tokens over {seqs} sequences: each sequence "
             "takes at least one token"
         )
-    return Shape("prefill", tokens, seqs)
+    if gathered is not None and gathered < tokens:
+        raise ValueError(
+            f"a prefill of {tokens} tokens whose MoE gathers {gathered} rows: the "
+            "gather holds this rank's"
+        )
+    return Shape("prefill", tokens, seqs, gathered)
 
 
 def device_arch() -> str:
@@ -665,6 +678,9 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
     config = _config(model, tp, atom_args)
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     ep = int(config.enable_expert_parallel)
+    shapes = list(dict.fromkeys(s.at(dp) for s in shapes))
+    if dp == 1 and (gathering := [s for s in shapes if s.gathered is not None]):
+        raise ValueError(f"{gathering[0]} gathers a DP group's rows on one rank")
     declared["group"] = driverless.group(tp, dp)
     set_current_atom_config(config)
     digest = _file_digest(config.model, "config.json")

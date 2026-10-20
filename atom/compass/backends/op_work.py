@@ -226,6 +226,8 @@ def _fused_moe(op, view, tp, kv) -> Work:
     expert's gate-up and down products: an expectation under uniform routing.
     Under expert parallelism `expert_mask` spans every rank's experts, of which
     this rank holds `w1`'s, and it runs the busiest rank's expected share.
+    A DP gather's pad rows (`moe_tokens` real among them) all carry token 0,
+    so they activate experts as one token.
 
     With a nonzero `quant_type` the op quantizes `hidden_states` to the
     weights' format inside it, so both products run at that format; otherwise
@@ -237,7 +239,9 @@ def _fused_moe(op, view, tp, kv) -> Work:
     local, up = args["w1"]["shape"][:2]
     mask = args.get("expert_mask")
     ranks = mask["shape"][0] // local if mask else 1
-    routed, groups = rows * k, activated_experts(local * ranks, k, rows)
+    real = view.moe_tokens
+    distinct = rows if real is None else min(rows, real + 1)
+    routed, groups = rows * k, activated_experts(local * ranks, k, distinct)
     if ranks > 1:
         routed = max_rank_load(rows, k, local * ranks, ranks)
         groups /= ranks
@@ -256,16 +260,17 @@ def _fused_moe(op, view, tp, kv) -> Work:
 def _mori(*payload, dispatch: bool):
     """MORI's dispatch, or its combine back: each of this rank's tokens, its
     `payload` rows, goes to every other rank holding one of its `k` experts.
-    The group is the received buffer's rows over the tokens wide. With the
-    experts split evenly, a rank holds one of a token's experts with chance
-    at least `1 - (1 - 1/N)^k`, whatever the expert count. The step roofline
+    The group is `num_ep_ranks` wide, or, in a graph that does not state it,
+    the received buffer's rows over the tokens. With the experts split evenly,
+    a rank holds one of a token's experts with chance at least
+    `1 - (1 - 1/N)^k`, whatever the expert count. The step roofline
     counts the exchange alone, and so does this."""
 
     def extract(op, view, tp, kv) -> Work:
         args = op["args"]
         tokens, k = args["indices"]["shape"]
         buffer = op["out"][0] if dispatch else args["input"]["shape"]
-        ranks = buffer[0] // tokens
+        ranks = args.get("num_ep_ranks") or buffer[0] // tokens
         row = sum(_bytes(t) / t["shape"][0] for s in payload for t in _tensors(args[s]))
         return all_to_all(ranks, tokens * activated_experts(ranks, 1, k) * row)
 

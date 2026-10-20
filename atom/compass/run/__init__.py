@@ -1481,15 +1481,18 @@ def runner(model_runner, tree) -> None:
 def _op_graphs(root: str, config, arch: str):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or None."""
+    that does not, or None; under DP, at the rows the step's MoE gathers."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
     from atom.compass.capture.forward import Shape, structure
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
+    dp = config.parallel_config.data_parallel_size
 
     @functools.lru_cache(maxsize=64)
-    def graph(phase: str, tokens: int, seqs: int, output: bool = True) -> dict | None:
-        shape = str(Shape(phase, tokens, seqs))
+    def graph(
+        phase: str, tokens: int, seqs: int, output: bool = True, gathered=None
+    ) -> dict | None:
+        shape = str(Shape(phase, tokens, seqs, gathered).at(dp))
         at = structure(config, phase, True, arch, output)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
         if not store.directory_for(key).exists():
