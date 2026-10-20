@@ -245,9 +245,10 @@ row is a result, not a failure.
    run (`... after the run, so it fails`), run the GPU check at once. If the
    PIDs it named are gone and the run's engine had just shut down (its log's
    last lines), the check most likely caught the run's own processes still
-   exiting, a known defect of the check: say so, and offer the step again into
-   a fresh OUT. If one stays on the GPU, the run shared it: say its record
-   cannot be trusted, and ask before taking it again.
+   exiting, a known defect of the check
+   ([#1787](https://github.com/jgong5/ATOM/issues/1787)): say so, and offer the
+   step again into a fresh OUT. If one stays on the GPU, the run shared it: say
+   its record cannot be trusted, and ask before taking it again.
 4. Exits 90 to 99 are the tree checks in `scripts/compass/_lib.sh`: `atom`
    resolved outside `$T`, usually a missing `PYTHONPATH=$T` or a command not
    run from `/`.
