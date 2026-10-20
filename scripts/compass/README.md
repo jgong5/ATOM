@@ -683,7 +683,12 @@ summaries into one table per cell directory: `step_linear/` or `step_grid/`, and
 Qwen3.8-27B TP1 on MI308X, priced by a step linear law `compass fit steps` fits on
 this node, in two checks: check 1, that `cctraces_sim.sh` handed the run file a
 `compass run` kept schedules the same steps; check 2, the cell graded against real
-runs. Run everything from one tree, `$T` below, in the GPU container: host laws are
+runs. The cell runs at concurrency 1, 4 and 16 only, in calibration and grading:
+at 64 and 256 aiperf's own warmup of this workload cannot finish within a
+capture's window, so the owner dropped them for this model and machine as not a
+sustainable configuration
+([ruling on #1590](https://github.com/jgong5/ATOM/issues/1590#issuecomment-6281930268)).
+Run everything from one tree, `$T` below, in the GPU container: host laws are
 keyed by ATOM's source, so records, fits and runs from two trees refuse each other.
 In the image, `compass` is `$T/scripts/compass/compass`, linked anywhere, and `python -m`
 runs with `PYTHONPATH=$T`, both from `/` so every path is absolute. Below, `$ATOM` is
@@ -720,7 +725,7 @@ $R/warm -- $ATOM` with `client.sh $R/warm --traces A-B --concurrency <C>
 for a build.
 
 1. `compass measure memory --gpu G $M $S --out $R/mem -- $ATOM`.
-2. Calibration, alone on the node: per concurrency 1, 4, 16, 64 and 256,
+2. Calibration, alone on the node: per concurrency 1, 4 and 16,
    `compass record --gpu G --out $R/cal/c<C> -- $ATOM` and `client.sh $R/cal/c<C>
    --traces 256-392 --concurrency <C> --stop`.
 3. `compass fit steps --backend step-linear --form history $R/cal/c* --client-run

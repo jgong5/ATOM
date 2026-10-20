@@ -3,8 +3,13 @@
 
 This page takes one model from an empty store to a graded simulation. The example
 is the cell Compass is graded on: Qwen3.8-27B, TP1, on one MI308X, driven by
-cc-traces agentic sessions. `smoke_cell.sh` runs the same path at one concurrency
-in about an hour, so start there (below), then run the full cell.
+cc-traces agentic sessions at concurrency 1, 4 and 16. Not at 64 or 256: there
+aiperf's own warmup of these sessions cannot finish within a capture's window, so
+the owner dropped them for this model and machine, in calibration and grading, as
+not a sustainable configuration
+([ruling on #1590](https://github.com/jgong5/ATOM/issues/1590#issuecomment-6281930268)).
+`smoke_cell.sh` runs the same path at one concurrency in about an hour, so start
+there (below), then run the full cell.
 
 ## Concepts
 
@@ -130,28 +135,27 @@ compass measure memory --gpu $G $M $S --out $R/memory -- $ATOM
 Writes a `memory_readings` entry to the store. Success: exit 0 and a `published
 memory_readings(...)` line.
 
-**2. Calibration records** (GPU, alone on the node; 3 h 45 min for all five).
+**2. Calibration records** (GPU, alone on the node; per concurrency, its warmup plus 1800 s).
 
 ```bash
-for C in 1 4 16 64 256; do serve $R/cal/c$C 256-392 $C $REAL_PY record --gpu $G; done
+for C in 1 4 16; do serve $R/cal/c$C 256-392 $C $REAL_PY record --gpu $G; done
 ```
 
 Writes per record `steps/dp0.jsonl` (the step record), `run.json` (with the
 engine's bounds under `engine`) and `artifacts/client_run.json`. Success:
-`client.sh` exits 0 and both files exist. Each concurrency spends its warmup
-plus 1800 s; the warmup grows to about 36 min at c=256.
+`client.sh` exits 0 and both files exist.
 
-**3. Real runs** (GPU; 3 h 20 min for ten on two GPUs, about 6 h 40 min on one).
+**3. Real runs** (GPU; per run, its warmup plus 1800 s).
 
 ```bash
-for C in 1 4 16 64 256; do serve $R/cell/c$C/real1 0-255 $C $REAL_PY record --gpu $G; done
-for C in 16 64 256 1 4; do serve $R/cell/c$C/real2 0-255 $C $REAL_PY record --gpu $G; done
+for C in 1 4 16; do serve $R/cell/c$C/real1 0-255 $C $REAL_PY record --gpu $G; done
+for C in 4 16 1; do serve $R/cell/c$C/real2 0-255 $C $REAL_PY record --gpu $G; done
 ```
 
 Each graded run is a fresh server: a second client run would meet the prefix
 cache the first left. The second loop takes the concurrencies in another order,
-so the two runs of one concurrency are at least two runs apart, whether the loops
-run one after the other on one GPU or at once on two; repeats run back to back
+so the two runs of one concurrency never run at once, nor back to back on one GPU,
+whether the loops run one after the other on one GPU or at once on two; repeats run back to back
 or together understate the real spread every metric is judged against. On two
 GPUs, run the two loops at once, each with its own `$G`; no more than two real
 runs at once, since real runs time the host. Success as in step 2.
@@ -171,7 +175,7 @@ reads `"unfitted": {}`; a vector named there refuses every step it prices.
 **5. Simulated runs** (CPU, 2 to 4 min per concurrency).
 
 ```bash
-for C in 1 4 16 64 256; do
+for C in 1 4 16; do
   serve $R/cell/c$C/step_linear 0-255 $C $SIM_PY run --step-linear <LAW> --host-laws <HOST> $M $S
 done
 ```
@@ -182,7 +186,7 @@ Writes the step record, `step_table.txt`, `run.json` (what grading reads) and
 **6. Grading** (developer check, CPU, seconds per cell, outside the `compass` CLI).
 
 ```bash
-PYTHONPATH=$T python3 -m atom.compass.validate $R/cell/c1 $R/cell/c4 ...
+PYTHONPATH=$T python3 -m atom.compass.validate $R/cell/c1 $R/cell/c4 $R/cell/c16
 ```
 
 Prints one table per cell. Its first row is the verdict: `graded`, or `coverage
