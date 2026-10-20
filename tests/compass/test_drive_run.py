@@ -25,6 +25,7 @@ from test_dp_step_max import runner
 from test_drive_runfile import build
 from test_drive_trace_steps import IDENTITY
 from test_memory_readings import ASSUMED, DOCUMENT, READINGS
+from test_op_graph import BENT, GEMM, g
 from test_refused_step_continues import REFUSED, drive, finish, no_eager_rung
 from test_refused_step_continues import run_file as refusing_run_file
 from test_run_graph_pool import _installed
@@ -41,9 +42,11 @@ from test_step_grid_plan import (
     record,
     refusing,
 )
+from test_work import SPEC
 
 from atom.compass import run as compass_run
 from atom.compass.artifacts import Key, Kind
+from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.clock import RefusalTally
 from atom.compass.drive import run as drive_run
@@ -402,3 +405,44 @@ def test_a_joined_instance_refuses_a_run_file_flag_and_a_run_file_naming_no_auth
     with pytest.raises(ValueError, match="names no clock_endpoint and out_dir"):
         drive_run.main([*join, *atom])
     assert not (tmp_path / "out").exists()
+
+
+def step_line(*rows, rung=None):
+    """A step-record line of `rows`, each ``(query, context, decode)``."""
+    return {"rows": [list(r) for r in rows], "rung": rung, "produces_output": True}
+
+
+def test_op_coverage_counts_covered_steps_by_phase_and_why_each_kind_left_one_out():
+    def graph(phase, *shape):
+        return {"seq": [g(2, 64, 64)]} if phase == "decode" else None
+
+    backend = OpGraphBackend(SPEC, graph, kv="bf16", price_list=BENT)
+    steps = [
+        step_line(*[(1, 2000, True)] * 2, rung=2),  # on a measured point
+        step_line(*[(1, 1500, True)] * 2, rung=2),  # along the line the fit declined
+        step_line(*[(1, 1000, True)] * 4, rung=4),  # past the measured widths
+        step_line((8, 8, False)),  # no graph at its shape
+    ]
+
+    report = drive_run.op_coverage(backend, [(str(i), s) for i, s in enumerate(steps)])
+
+    assert report == {
+        "steps": 4,
+        "covered": 1,
+        "share": 0.25,
+        "by phase": {
+            "decode": {"steps": 3, "covered": 1},
+            "prefill": {"steps": 1, "covered": 0},
+        },
+        "left out, by leaf kind": {
+            GEMM: {
+                "the fit declined context at B = #: context = # reads +#% off its "
+                "neighbours": 1,
+                "B = # is outside the measured # to #": 1,
+            },
+            "step refused": {
+                "no op_graph holds a prefill step of # tokens over # sequences; "
+                "compass trace ops captures one": 1
+            },
+        },
+    }
