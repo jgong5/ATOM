@@ -10,13 +10,14 @@ priced is refused by name, each reason once. The Qwen3.8-27B TP1 capture prices 
 backend from a run file's ``op_graph`` over the store's graphs.
 """
 
+import copy
 import json
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 from test_backend_step_linear import _installed, law, view
-from test_backend_step_roofline import COMPUTE, MEMORY, _spec
+from test_backend_step_roofline import COMPUTE, MEMORY, ROOFLINE, _spec
 from test_capture_ir import CONFIG, WIDTH_2, _ops, capture
 from test_memory_readings import WORKER
 from test_op_work import leaf, t
@@ -27,10 +28,12 @@ from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import NONE, OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.provenance import Refusal
+from atom.compass.backends.step_roofline import overlap
 from atom.compass.backends.work import attention, gemm, price
 from atom.compass.bench.ops import leaves
 from atom.compass.capture.peers import MORI
 from atom.compass.run import _op_graphs
+from atom.compass.spec import MachineSpec
 
 GEMM = "aiter.gemm_a16w16.default"
 ATTENTION = "aiter.unified_attention_with_output_base.default"
@@ -131,9 +134,14 @@ def test_a_step_reads_the_graph_captured_at_its_shape(batch, padded, shape):
             "a prefill step whose view does not say whether it produces output",
         ),
         (
-            BatchView((RequestShape(9, 9, False),), tbo_tokens=((5,), (4,))),
+            BatchView(
+                (RequestShape(9, 9, False),),
+                tbo_tokens=((5, 4), (4, 5)),
+                produces_output=True,
+                dp_rank=0,
+            ),
             g(1, 8, 8),
-            "two-batch-overlap",
+            r"two-batch-overlap step whose ranks schedule \(5, 4\) rows",
         ),
         (
             BatchView((RequestShape(9, 9, False),), image_tokens=5),
@@ -279,6 +287,191 @@ def test_a_term_is_declared_iff_a_field_its_winning_bound_reads_is_stated(
         assert note.endswith(NONE)
 
 
+# --- two-batch overlap -------------------------------------------------------------
+
+#: A machine whose kernel floor is a second, so each small leaf costs one.
+FLOOR = copy.deepcopy(ROOFLINE)
+FLOOR["device"]["kernel_floor_s"] = 1.0
+SECOND = MachineSpec.from_mapping(FLOOR)
+SCATTER = "atom.model_ops.moe:reduce_scatterv"
+#: This rank's 7 tokens split 3 then 4, cutting the first request; its peer
+#: splits the same.
+SPLIT = BatchView(
+    (RequestShape(4, 4, False), RequestShape(3, 10, False)),
+    moe_rows=14,
+    produces_output=True,
+    tbo_tokens=((3, 3), (4, 4)),
+)
+
+
+def layers(*lead, count=3):
+    """`lead`, then `count` layers of compute 3, gather 2, experts 4 and
+    scatter 2, each leaf a second."""
+    gather, scatter = leaf(GATHER, [[2, 8]], x=t([1, 8])), leaf(
+        SCATTER, [[1, 8]], x=t([2, 8])
+    )
+    layer = [g(1, 8, 8)] * 3 + [gather] * 2 + [g(1, 8, 8)] * 4 + [scatter] * 2
+    body = {"seq": layer}
+    return {
+        "seq": [
+            *lead,
+            {"repeat": body, "count": count, "index": "l0", "start": 0, "step": 1},
+        ]
+    }
+
+
+def test_a_split_step_lays_both_micro_batches_on_the_compute_and_comm_streams():
+    asked = []
+
+    def graph(*at):
+        asked.append(at)
+        return layers()
+
+    cost = OpGraphBackend(SECOND, graph, kv="bf16").price(SPLIT)
+
+    # Each micro-batch from its own shape's graph, the second with the output.
+    assert asked == [("prefill", 3, 1, False), ("prefill", 4, 2, True)]
+    # The timeline ATOM's TBO ring runs: 44 seconds, against 66 one after the
+    # other.
+    assert by_name(cost) == {"op.tbo": 44.0}
+    assert cost.terms[0].provenance.detail.endswith(
+        "prefill T=3 B=1 that produces no output and prefill T=4 B=2"
+    )
+
+
+def test_a_gather_of_token_ids_runs_inline_on_the_compute_stream():
+    ids = leaf(GATHER, [[2, 1]], x=t([1, 1], role="metadata"))
+    cost = OpGraphBackend(SECOND, lambda *at: layers(ids, count=1), kv="bf16").price(
+        SPLIT
+    )
+
+    assert by_name(cost) == {"op.tbo": overlap([[(4, 4), (2, 2), (4, 4), (2, 2)]])}
+
+
+@pytest.mark.parametrize(
+    "batch,graph,split,named",
+    [
+        (SPLIT, layers(), True, "on MoRI's split send and receive"),
+        (
+            replace(SPLIT, tbo_tokens=((3, 4), (4, 3))),
+            layers(),
+            False,
+            r"split \(\(3, 4\), \(4, 3\)\) names no single pair",
+        ),
+        (
+            replace(SPLIT, tbo_tokens=((3, 4), (4, 3)), dp_rank=0),
+            layers(),
+            False,
+            r"ranks schedule \(3, 4\) rows of one micro-batch",
+        ),
+        (
+            replace(SPLIT, tbo_tokens=((3, 3), (4, 2)), dp_rank=0),
+            layers(),
+            False,
+            r"ranks schedule \(4, 2\) rows of one micro-batch",
+        ),
+        (SPLIT, None, False, "no op_graph holds a prefill step of 3 tokens"),
+        (
+            replace(SPLIT, produces_output=None),
+            layers(),
+            False,
+            "does not say whether it produces output",
+        ),
+        (replace(SPLIT, image_tokens=5), layers(), False, "a step with image tokens"),
+    ],
+    ids=[
+        "split-send-recv",
+        "no-pair",
+        "uneven",
+        "uneven-second",
+        "uncaptured",
+        "output-unsaid",
+        "images",
+    ],
+)
+def test_a_split_step_with_no_price_is_refused_by_name(batch, graph, split, named):
+    with pytest.raises(CostRefused, match=named):
+        backend(graph, split_send_recv=split).price(batch)
+
+
+@pytest.mark.parametrize("join", ["max", "resource_bound"])
+def test_a_micro_batch_whose_exchange_shares_a_par_is_refused(join):
+    routed = {"seq": [leaf(GATHER, [[2, 8]], x=t([1, 8])), g(1, 8, 8)]}
+    dual = {"par": [routed, g(1, 8, 8)], "join": join}
+
+    with pytest.raises(CostRefused, match="runs an MoE exchange beside a second"):
+        OpGraphBackend(SECOND, lambda *at: dual, kv="bf16").price(SPLIT)
+
+
+def test_micro_batches_whose_graphs_exchange_unalike_are_refused():
+    def graph(phase, tokens, seqs, output):
+        return layers(count=tokens - 2)
+
+    with pytest.raises(CostRefused, match="change streams 3 and 7 times"):
+        OpGraphBackend(SECOND, graph, kv="bf16").price(SPLIT)
+
+
+def test_a_leaf_one_micro_batch_refuses_is_named_before_the_stream_count():
+    def graph(phase, tokens, seqs, output):
+        exchange = "atom.model_ops.moe:foo" if tokens == 3 else GATHER
+        return {"seq": [g(1, 8, 8), leaf(exchange, [[2, 8]], x=t([1, 8])), g(1, 8, 8)]}
+
+    with pytest.raises(CostRefused) as refused:
+        OpGraphBackend(SECOND, graph, kv="bf16").price(SPLIT)
+
+    assert refused.value.declined == (
+        Refusal("op-work", "no extractor for the op kind atom.model_ops.moe:foo"),
+    )
+
+
+def test_the_first_micro_batch_issues_first_on_each_stream():
+    gather = leaf(GATHER, [[2, 8]], x=t([1, 8]))
+
+    def graph(phase, tokens, seqs, output):
+        compute, exchange = {3: (1, 10), 4: (10, 1)}[tokens]
+        return {"seq": [g(1, 8, 8)] * compute + [gather] * exchange}
+
+    cost = OpGraphBackend(SECOND, graph, kv="bf16").price(SPLIT)
+
+    # The first micro-batch's long exchange hides under the second's compute:
+    # 12 seconds, against 21 issued the other way round.
+    assert by_name(cost) == {"op.tbo": 12.0}
+
+
+def test_a_mori_dispatch_with_an_unset_argument_rides_the_comm_stream():
+    dispatch = leaf(
+        f"{MORI}.dispatch",
+        [[2, 8]],
+        input=t([1, 8]),
+        weights=t([1, 2]),
+        scales=None,
+        indices=t([1, 2]),
+    )
+    region = {"seq": [g(1, 8, 8), dispatch, g(1, 8, 8)]}
+    cost = OpGraphBackend(SECOND, lambda *at: region, kv="bf16").price(SPLIT)
+
+    assert by_name(cost) == {"op.tbo": overlap([[(1, 1), (1, 1), (1, 1)]])}
+
+
+def test_an_exchange_two_pars_deep_is_refused():
+    routed = {"seq": [leaf(GATHER, [[2, 8]], x=t([1, 8])), g(1, 8, 8)]}
+    inner = {"par": [routed, g(1, 8, 8)], "join": "max"}
+    nested = {"par": [inner, g(1, 8, 8)], "join": "max"}
+
+    with pytest.raises(CostRefused, match="runs an MoE exchange beside a second"):
+        OpGraphBackend(SECOND, lambda *at: nested, kv="bf16").price(SPLIT)
+
+
+def test_a_split_step_s_note_names_the_stated_fields_of_every_price():
+    region = {"seq": [g(8192, 4096, 4096), g(1, 4096, 4096)]}
+    (term,) = backend(region, _spec("assumed")).price(SPLIT).terms
+
+    assert term.provenance.method is Method.DECLARED
+    assert [p for p in MEMORY + COMPUTE if p in term.provenance.note] == list(
+        MEMORY + COMPUTE
+    )
+
+
 # --- the published 27B -----------------------------------------------------------
 
 
@@ -367,6 +560,17 @@ def test_a_run_file_op_graph_installs_the_op_level_backend(
 
     assert isinstance(installed, OpGraphBackend)
     assert (installed.tp, installed.kv, installed.padded) == (1, "fp8", padded)
+
+
+def test_a_run_file_op_graph_under_low_latency_ep_refuses_its_split_steps(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setitem(WORKER, "enable_low_latency", True)
+    split = [
+        _installed(monkeypatch, tmp_path, op_graph=True, ep=ep) for ep in (False, True)
+    ]
+
+    assert [b.split_send_recv for b in split] == [False, True]
 
 
 def test_a_run_file_op_graph_that_is_not_true_is_refused(monkeypatch, tmp_path):

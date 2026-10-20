@@ -517,7 +517,11 @@ reproducing rather than averaging away.
 
 `ADMISSION_DELAY_S` (`atom/compass/clock/channels.py`) covers what is left, per admission
 path: the request channel's lookahead from the traffic source into the serving stack,
-**excluding** tokenize.
+**excluding** tokenize. On the serving path it is the HTTP transport alone (revised
+2026-10-20, [#1381](https://github.com/jgong5/ATOM/issues/1381)): client send to the
+ASGI app call with one request in flight, as `scripts/compass/http_intake.py floor`
+measures it. What the event loop does with the request after that call is the intake
+below.
 
 **HTTP intake is a serial cost on the event loop** (revised 2026-10-16, #1103). The real
 loop takes a burst in one request at a time: at c=256 first turn, about 3 ms each, so the
@@ -532,8 +536,11 @@ open encode job is placed and the callbacks due by then have run, so an encode t
 completes inside an intake hands its result on when the intake ends, whatever wall time
 its real thread took. A run file with no machine spec
 charges nothing. The client's own send spread is not modelled. The `http` channel's
-admission delay (`channels.py::ADMISSION_DELAY_S`) stays the channel's lookahead; it was
-measured at low load, so it overlaps one request's intake.
+admission delay (`channels.py::ADMISSION_DELAY_S`) stays the channel's lookahead and ends
+at the app call, where the intake starts, so the two do not overlap. The 1.6 ms it held
+before #1381 was send to response headers less encode, which counted one request's
+intake twice once `HttpChannel` charged it. A zero lookahead would not do instead: it
+puts every serving run on the deadlock-recovery path (`01`, Invariants).
 
 ### Open issues
 

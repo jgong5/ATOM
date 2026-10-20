@@ -853,8 +853,9 @@ def publish(store, key, config, run: dict, command: str, results, out: Path):
 
 #: A ladder keeps a value only this many times the last it kept, and the largest.
 LADDER_STEP = 1.25
-#: The spread of a leaf's cold times across contexts, over the largest, past
-#: which its kind depends on context; a repeat's spread stays within 4%.
+#: The spread of a leaf's cold times across contexts, or a prefill leaf's
+#: across rows, over the largest, past which its kind depends on them; a
+#: repeat's spread stays within 4%.
 CONTEXT_MOVES = 0.10
 #: The spread of a leaf's cold times across contexts, in ns, at or under which
 #: its kind does not depend on context whatever its share: one 3.5 us
@@ -1088,13 +1089,15 @@ def _abstract(value, n: int):
 def _family(shape, context, op: str, sig: str, dependent: dict):
     """The family a leaf's point belongs to, and where on its axis: a decode
     leaf at its width over context; a prefill leaf over its tokens, at its rows
-    and cached tokens too when its kind depends on context, as its prefill
-    points read it, else its decode points, else by default."""
+    unless its kind's prefill points show it does not move with them, and at
+    its rows and cached tokens when its kind depends on context, as its
+    prefill points read it, else its decode points, else by default."""
     if shape.phase == "decode":
         return json.dumps([str(shape), sig]), context
     leaf = _abstract(json.loads(sig), shape.tokens)
     if not dependent.get(("prefill", op), dependent.get(op, True)):
-        return json.dumps(["prefill", None, leaf], sort_keys=True), shape.tokens
+        rows = shape.seqs if dependent.get(("rows", op), True) else None
+        return json.dumps(["prefill", rows, leaf], sort_keys=True), shape.tokens
     fam = ["prefill", shape.seqs, leaf, context or 0]
     return json.dumps(fam, sort_keys=True), shape.tokens
 
@@ -1111,12 +1114,19 @@ def _dependent(records) -> dict:
     context: its kernels differ there, or its cold times by more than
     `CONTEXT_MOVES` of the largest and `CONTEXT_FLOOR_NS`. A decode kind, read
     at two row contexts, is keyed by its name; a prefill kind, read fresh and
-    over cached tokens, by ``("prefill", name)``."""
+    over cached tokens, by ``("prefill", name)``. Keyed ``("rows", name)``,
+    whether a prefill kind timed at two row counts of one token count and
+    cached tokens moves with its rows."""
     by = defaultdict(list)
     for r in records:
-        if "refused" not in r:
-            kind = r["op"] if r["shape"].startswith("decode") else ("prefill", r["op"])
-            by[kind, r["shape"], r["leaf"]].append(r)
+        if "refused" in r:
+            continue
+        if r["shape"].startswith("decode"):
+            by[r["op"], r["shape"], r["leaf"]].append(r)
+        else:
+            by[("prefill", r["op"]), r["shape"], r["leaf"]].append(r)
+            at = _shape(r["shape"]).tokens, r["context"]
+            by[("rows", r["op"]), at, r["leaf"]].append(r)
     kinds = {}
     for (kind, *_), points in by.items():
         if len(points) > 1:

@@ -1398,6 +1398,8 @@ def runner(model_runner, tree) -> None:
             tp=tp,
             kv=config.kv_cache_dtype,
             padded=padding != "none",
+            split_send_recv=config.enable_expert_parallel
+            and getattr(config, "enable_low_latency", False),
         )
     if fallback or STEP_GRID in run:
         from atom.compass.run.modules import walk

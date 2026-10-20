@@ -4,14 +4,13 @@
 # One client run against a `compass record` or `compass run` server: aiperf
 # with cctraces_sim.sh's arguments over traces A to B, then the run's export.
 #
-# Usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--no-warmup] [--stop]
+# Usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop]
 #   OUT              the server's --out, whose server.json names its URL and,
 #                    for a simulated server, its run file
 #   --traces A-B     TRACES' traces A to B, each counted from 0
 #   --concurrency C  aiperf --concurrency
 #   --duration S     aiperf --benchmark-duration, seconds on the server's clock
 #                    (default 1800)
-#   --no-warmup      no one-token warmup request per lane before profiling
 #   --stop           then SIGTERM the command that started the server, and wait
 #                    WAIT_S (default 600) for it to write OUT/run.json and leave
 #   MODEL, TRACES    as cctraces_sim.sh takes them
@@ -20,8 +19,8 @@
 #
 # A simulated server's client paces aiperf on the server's clock through this
 # tree's compass-harness; a real one's pins aiperf's benchmark id as
-# compass-harness does, so both send the same prompts. Every trajectory starts
-# at its first turn. OUT/client/ holds the traces aiperf is given, each a file
+# compass-harness does, so both send the same prompts, after the scenario's own
+# warmup. OUT/client/ holds the traces aiperf is given, each a file
 # named by its line in TRACES, aiperf's dataset and its log; OUT/artifacts/
 # aiperf's artifacts at --export-level raw and the client run's export,
 # client_run.json (atom/compass/parity/client_run.py). One client run per OUT:
@@ -31,12 +30,12 @@
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
-USAGE="usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--no-warmup] [--stop]"
+USAGE="usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop]"
 bad() { echo "client: $1; $USAGE" >&2; exit 2; }
 fail() { echo "client: $1" >&2; exit 1; }
 ROOT=$(compass_tree_root) || exit $?
 (($#)) && [[ $1 != -* ]] || bad "no OUT"
-OUT=$1 duration=1800 warmup=(--warmup-requests-per-lane 1) stop=0
+OUT=$1 duration=1800 stop=0
 shift
 while (($#)); do
     case $1 in
@@ -47,7 +46,6 @@ while (($#)); do
         shift ;;
     --concurrency) [[ ${2-} =~ ^[1-9][0-9]*$ ]] || bad "--concurrency takes a positive integer"; c=$2; shift ;;
     --duration) [[ ${2-} =~ ^[1-9][0-9]*$ ]] || bad "--duration takes whole seconds"; duration=$2; shift ;;
-    --no-warmup) warmup=() ;;
     --stop) stop=1 ;;
     *) bad "unknown argument $1" ;;
     esac
@@ -102,8 +100,7 @@ n=$(find "$OUT/client/traces" -type f | wc -l)
     --concurrency "$c" --benchmark-duration "$duration" \
     --random-seed 20260707 --scenario inferencex-agentx-mvp --unsafe-override \
     --streaming --use-server-token-count --extra-inputs ignore_eos:true \
-    --no-server-metrics --no-gpu-telemetry --ui none \
-    --trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0 "${warmup[@]}") \
+    --no-server-metrics --no-gpu-telemetry --ui none) \
     >"$OUT/client/aiperf.log" 2>&1 || fail "aiperf: exited $?; see $OUT/client/aiperf.log"
 (cd / && python3 -m atom.compass.parity.client_run "$OUT/artifacts") ||
     fail "export: atom.compass.parity.client_run exited $? on $OUT/artifacts"
