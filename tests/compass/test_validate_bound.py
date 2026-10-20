@@ -264,7 +264,7 @@ def test_each_measured_point_is_its_cold_time_over_its_leafs_price(tmp_path):
         view = BatchView(tuple(RequestShape(*r) for r in rows), produces_output=True)
         return price(op_work.work(op, view, 1, "bf16"), SPEC) * 1e9
 
-    decode = "decode T=2 B=2"
+    decode, empty = "decode T=2 B=2", leaf("aten.empty.memory_format", [[2, 4096]])
     out = plan(
         tmp_path,
         [
@@ -274,17 +274,18 @@ def test_each_measured_point_is_its_cold_time_over_its_leafs_price(tmp_path):
             point(silu, "prefill T=2 B=1", [[2, 2, False]], 2 * priced(silu, short)),
             point(attn, decode, long, 1.5 * priced(attn, long)),
             point(silu, decode, short, 0, refused="ValueError: no room"),
-            point(leaf("aten.empty.memory_format", [[2, 4096]]), decode, short, 0),
+            point(empty, decode, short, 0),
+            point(empty, decode, short, 1000),
             point(leaf("x.unknown.default"), decode, short, 1000),
         ],
     )
 
     r = bound.ops(out, SPEC, 1, "bf16")
 
-    assert (r["points"], r["unmeasured"]) == (8, 1)
+    assert r["points"] == 9
+    assert r["counts"] == {"unmeasured": 1, "no kernel": 1, "no kernel, timed": 1}
     assert r["refused"] == {
-        "refused(op-work: no extractor for the op kind x.unknown.default)": 1,
-        "aten.empty.memory_format: launches no kernel, so no price": 1,
+        "refused(op-work: no extractor for the op kind x.unknown.default)": 1
     }
     q = r["measured_over_analytical"]
     assert list(q) == [f"{SILU} decode", f"{SILU} prefill", f"{ATTN} decode"]
@@ -296,7 +297,10 @@ def test_each_measured_point_is_its_cold_time_over_its_leafs_price(tmp_path):
         (0.5, 3)
     )
     assert q[f"{SILU} prefill"]["median"] == pytest.approx(2)
-    assert "2 priced above their measured time" in bound.ops_text(r)
+    assert "2 of a leaf priced as launching no kernel (1 of them timed" in (
+        text := bound.ops_text(r)
+    )
+    assert "2 priced above their measured time" in text
 
 
 def test_main_reports_an_ops_run_and_refuses_one_of_another_engine(

@@ -224,34 +224,37 @@ def _ranking(rates: dict) -> dict | None:
 def ops(out, machine, tp: int, kv: str) -> dict:
     """The points a `measure ops --plan` run at `out` measured, each its cold
     time over the analytical price of its leaf at its shape and rows on
-    `machine`, in a TP group of `tp` with a `kv` KV cache, by op kind and phase."""
+    `machine`, in a TP group of `tp` with a `kv` KV cache, by op kind and phase.
+    A leaf the analytical price says launches no kernel is counted apart, by
+    whether its point timed any kernel."""
     from atom.compass.backends.op_work import work
     from atom.compass.backends.work import price
     from atom.compass.spec.rules import SpecRefusal
 
     lines = Path(out, "plan.jsonl").read_text().splitlines()
-    ratios, refused, unmeasured = defaultdict(list), Counter(), 0
+    ratios, refused, count = defaultdict(list), Counter(), Counter()
     for p in map(json.loads, lines):
         if "refused" in p:
-            unmeasured += 1
+            count["unmeasured"] += 1
             continue
         rows = tuple(RequestShape(q, c, bool(d)) for q, c, d in p["rows"])
         view = BatchView(rows, produces_output=True)
         try:
             w = work(json.loads(p["leaf"]), view, tp, kv)
-            if w is None:
-                raise ValueError("launches no kernel, so no price")
-            priced = price(w, machine)
+            priced = None if w is None else price(w, machine)
         except CostRefused as e:
             refused.update(str(r) for r in e.declined)
             continue
         except (SpecRefusal, ValueError) as e:
             refused[f"{p['op']}: {e}"] += 1
             continue
+        if priced is None:
+            count["no kernel, timed" if p["cold_ns"] else "no kernel"] += 1
+            continue
         ratios[p["op"], p["shape"].split()[0]].append(p["cold_ns"] * 1e-9 / priced)
     return {
         "points": len(lines),
-        "unmeasured": unmeasured,
+        "counts": dict(count),
         "refused": dict(refused.most_common()),
         "measured_over_analytical": {
             f"{kind} {phase}": {
@@ -270,17 +273,19 @@ def ops(out, machine, tp: int, kv: str) -> dict:
 
 
 def ops_text(r: dict) -> str:
-    rows = r["measured_over_analytical"]
+    rows, n = r["measured_over_analytical"], Counter(r["counts"])
     priced = sum(q["points"] for q in rows.values())
     above = sum(q["above"] for q in rows.values())
     out = [
         (
-            f"op points: {r['points']} planned, {r['unmeasured']} unmeasured, "
-            f"{priced} priced, {sum(r['refused'].values())} refused; {above} priced "
-            "above their measured time, reported, not gated: the bound holds per step"
+            f"op points: {r['points']} planned, {n['unmeasured']} unmeasured, "
+            f"{n['no kernel'] + n['no kernel, timed']} of a leaf priced as launching "
+            f"no kernel ({n['no kernel, timed']} of them timed a kernel), {priced} "
+            f"priced, {sum(r['refused'].values())} refused; {above} priced above "
+            "their measured time, reported, not gated: the bound holds per step"
         )
     ]
-    out += [f"  refused {n} points: {reason}" for reason, n in r["refused"].items()]
+    out += [f"  refused {k} points: {reason}" for reason, k in r["refused"].items()]
     out.append(
         "  measured over analytical: kind phase | points | above | min | p10 | median | p90 | max"
     )
