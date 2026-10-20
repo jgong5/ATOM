@@ -42,11 +42,13 @@ from torch.utils.flop_counter import flop_registry
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import BatchView
-from atom.compass.backends.step_roofline import Module
+from atom.compass.backends.step_roofline import Module, _sparse_reads
 from atom.compass.backends.step_roofline import _work as module_work
 from atom.compass.backends.work import (
+    ELEMENT_BYTES,
     Collective,
     Work,
+    _wider,
     activated_experts,
     all_to_all,
     allgather,
@@ -360,6 +362,54 @@ def _v4_prefill(op, view, tp, kv) -> Work:
     return Work({_fmt(args["q_nope"]["dtype"]): flops}, moved)
 
 
+def _stated(op, *names) -> list:
+    """What `op` states beside its arguments under `names`."""
+    stated = op.get("stated", {})
+    if missing := [name for name in names if name not in stated]:
+        raise _Unpriced(
+            f"the leaf states no {', '.join(missing)} of its layer, which its "
+            "reads depend on: trace its graph again"
+        )
+    return [stated[name] for name in names]
+
+
+def _v4_decode(q, *slots, out=None):
+    """V4's decode attention: `_only`'s `q`, `slots` and outputs, and the KV
+    entries each row reads at the window, compression ratio and top-k its
+    leaf states, as the step roofline counts them: two products of `q`'s head
+    width per head and entry, at the wider of Q's and the KV cache's formats,
+    and each entry read once at that width in the KV format. The rotary
+    part's products and bytes are left out, which only lowers both."""
+    boundary = _only(q, *slots, out=out)
+
+    def extract(op, view, tp, kv) -> Work:
+        geometry = _stated(op, "window_size", "compress_ratio", "index_topk")
+        keys, read, _, _ = _sparse_reads(view.requests, *geometry)
+        x = op["args"][q]
+        _, heads, dim = x["shape"]
+        fmt = _wider(_fmt(x["dtype"]), kv)
+        work = Work({fmt: 4 * heads * dim * keys}, read * dim * ELEMENT_BYTES[kv])
+        return boundary(op, view, tp, kv) + work
+
+    return extract
+
+
+def _indexer(op, view, tp, kv) -> Work:
+    """V4's indexer score and top-k: its boundary, and each new query scored
+    against every compressed entry before it at the ratio the leaf states, as
+    the step roofline counts them: one product of the index head width per
+    index head, at fp4 when the leaf takes `q_scale`, else at `q_quant`'s
+    format, and each entry read once at that width and format."""
+    (ratio,) = _stated(op, "compress_ratio")
+    q = op["args"]["q_quant"]
+    fmt = "fp4" if op["args"].get("q_scale") else _fmt(q["dtype"])
+    _, heads, packed = q["shape"]
+    dim = int(packed * _size(q["dtype"]) / ELEMENT_BYTES[fmt])
+    _, _, scored, entries = _sparse_reads(view.requests, 0, ratio)
+    work = Work({fmt: 2 * heads * dim * scored}, entries * dim * ELEMENT_BYTES[fmt])
+    return _boundary(op) + work
+
+
 def _shape(value):
     if isinstance(value, dict) and "dtype" in value:
         return value["shape"]
@@ -446,16 +496,10 @@ EXTRACTORS = {
         "input", "positions", "out", "scale"
     ),
     "aiter.batched_gemm_a8w8_mxscale.default": _batched_gemm,
-    # ponytail: the scores against each row's compressed index entries are
-    # left out; the leaf states neither the index cache nor its compression.
-    "aiter.indexer_score_topk.default": _in_place(),
+    "aiter.indexer_score_topk.default": _indexer,
     "aiter.pa_sparse_prefill_fp8_opus.default": _v4_prefill,
-    # ponytail: decode counts Q, the sink and O only. Its index lists are
-    # sized for the deployment's longest row, and the leaf states no window,
-    # compression or top-k, so the KV each row reads and the products over it
-    # are left out. Count them when a decode leaf states its layer's geometry.
-    "aiter.mla_decode_v4_ps_asm.default": _only("Q", "qrope", "sink", "output"),
-    f"{V4}paged_decode:_sparse_attn_v4_paged_decode_asm": _only(
+    "aiter.mla_decode_v4_ps_asm.default": _v4_decode("Q", "qrope", "sink", "output"),
+    f"{V4}paged_decode:_sparse_attn_v4_paged_decode_asm": _v4_decode(
         "q_packed_in", "q_rope_in", "attn_sink", out="torch.bfloat16"
     ),
     f"{V4}fused_compress:fused_compress_attn": _only(

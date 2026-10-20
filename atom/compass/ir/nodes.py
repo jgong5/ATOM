@@ -173,6 +173,10 @@ class Op(Region):
     bytes, enum member, `None` or a tuple of those. Anything else, a live
     symbolic value among it, is refused by its type, without being asked
     anything.
+
+    `stated` holds, by name, values of those types the capture states about
+    the operator beside its arguments: what it reads without being passed it,
+    such as its layer's attention geometry. A call does not take them.
     """
 
     name: str
@@ -181,10 +185,12 @@ class Op(Region):
     out_shapes: tuple[tuple, ...]
     stream_id: int = 0
     context_ref: ContextRef | None = None
+    stated: tuple[tuple[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", NodeKind(self.kind))
         object.__setattr__(self, "args", _as_args(self.args))
+        object.__setattr__(self, "stated", _as_args(self.stated))
         object.__setattr__(self, "out_shapes", as_shapes(self.out_shapes))
 
     @property
