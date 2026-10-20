@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_backend_step_linear_fit import _steps, _timed_record
-from test_fit_samples import DEVICE, SOURCE, idle_rank
+from test_fit_samples import DEVICE, SOURCE, edit, idle_rank
 from test_memory_readings import DOCUMENT, STACK
 from test_parity_served import SAMPLING
 
@@ -31,6 +31,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends import StepLinearLaw, step_linear_fit
 from atom.compass.backends.step_labels import digest
+from atom.compass.drive.aiter_jit import BUILDS
 from atom.compass.fit import publish
 from atom.compass.run.step_grid import BOUNDS
 from atom.compass.spec import MachineSpec
@@ -309,3 +310,13 @@ def test_records_predating_the_data_parallel_width_refuse_naming_it(tmp_path):
     a = record(tmp_path / "a", 19, key={**HOST, "engine": engine})
     with pytest.raises(SystemExit, match="states no data_parallel_size"):
         fit(tmp_path, "fit steps", *LINEAR, a, *clients(a))
+
+
+def test_a_record_whose_server_built_an_aiter_module_refuses_naming_it(tmp_path):
+    a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
+    edit(b / "run.json", lambda r: r.update({BUILDS: ["mha_varlen_fwd"]}))
+
+    named = f"{b} is not fitted: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    with pytest.raises(SystemExit, match=re.escape(named)):
+        fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
+    assert not (tmp_path / "store").exists()

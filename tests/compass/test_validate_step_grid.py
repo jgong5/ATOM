@@ -42,10 +42,7 @@ from atom.compass.validate.cost import cost_accuracy, declined_text
 
 ATOM_ARGS = ["--model", "planted", "--max-model-len", "2048"]
 # The grid's reason for a decode step at context c + 1 whose node holds no point.
-NO_POINT = (
-    "step-grid: the decode rung 1 cell holding B=1, c={0} has no measurement at "
-    "B=1, c={0}"
-)
+NO_POINT = "step-grid: the decode rung 1 cell has no measurement at B=1, c={0}"
 
 
 def _box(n):
@@ -181,8 +178,9 @@ def test_a_real_step_the_grid_declines_is_counted_apart_as_a_fallback(
 
 
 def test_a_fallback_row_names_its_most_frequent_reasons_and_counts_the_rest(tmp_path):
-    """The grid names a declined step's cell, so a band declines for as many
-    reasons as it has steps: its row names the most frequent first."""
+    """Each declined step here is on its own unmeasured node, so a band declines
+    for as many reasons as it has distinct steps: its row names the most
+    frequent first."""
     steps = _steps()
     member = _bundle(steps, missing={12, 13, 14, 15})
     grid = StepGridBackend(StepGrid(member["grid"]), Residual(member["residual"]), "b")

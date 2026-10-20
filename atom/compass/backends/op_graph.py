@@ -150,7 +150,7 @@ class OpGraphBackend(CostBackend):
     def _region(self, view: BatchView) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region."""
         if view.image_tokens:
-            reason = IMAGES.format(view.image_tokens)
+            reason = IMAGES
         else:
             try:
                 rung = view.capture_rung if self.padded else None

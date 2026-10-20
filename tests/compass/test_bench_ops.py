@@ -10,6 +10,7 @@ import contextlib
 import dataclasses
 import functools
 import json
+import os
 import pathlib
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -380,7 +381,7 @@ def test_a_call_cycles_over_every_weight_of_its_spec_on_the_cold_copies_inputs()
 
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=["k"]),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         n, _, _ = stub._plan(gemm, [{}], {}, 4, 2)
@@ -391,6 +392,30 @@ def test_a_call_cycles_over_every_weight_of_its_spec_on_the_cold_copies_inputs()
     assert first["w"][0] is runner.model[0].weight
     assert second["w"][0] is runner.model[1].weight
     assert (n, record["copies"]) == (1, 2)
+
+
+def test_a_call_that_fills_a_graph_alone_cycles_no_second_weight():
+    # The model holds two weights of the spec, but one call fills `GRAPH_NS`:
+    # the graph holds one call, so one copy, and no warm graph.
+    stub = ops.Stub(_Runner(), 1)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    x = {"shape": [2, 3], "dtype": F32, "stride": [3, 1], "role": "activation"}
+    gemm = {"op": "x", "args": {"x": x, "w": [x | {"shape": [3, 3], "role": "weight"}]}}
+    graphs = []
+
+    def replay(fn, calls):
+        graphs.append(len(calls))
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], ops.GRAPH_NS * 2)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        record = stub._time(gemm, "sig", [{}], 1)
+
+    assert graphs == [1]
+    assert (record["copies"], record["calls"], record["warm_ns"]) == (1, 1, None)
 
 
 def test_a_copy_past_the_cold_ones_takes_its_own_cold_copy_s_inputs_and_is_logged(
@@ -420,7 +445,7 @@ def test_a_copy_past_the_cold_ones_takes_its_own_cold_copy_s_inputs_and_is_logge
 
     with (
         patch.object(runner.model, "forward", stub),
-        patch.object(ops, "_kernels", return_value=["k"]),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         [record] = stub.point(placed, decode(2), 20, found)
@@ -493,13 +518,77 @@ def test_every_cold_and_warm_graph_holds_calls_calls_at_any_copies(copies):
 
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=["k"]),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         record = stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], copies)
 
     assert graphs == [ops.CALLS] * (2 if copies > 1 else 1)
     assert (record["copies"], record["calls"]) == (copies, ops.CALLS)
+
+
+@pytest.mark.parametrize(
+    "call_ns, calls, copies",
+    [
+        (ops.GRAPH_NS / 1000, ops.CALLS, 8),  # short: every graph holds CALLS
+        (ops.GRAPH_NS / 10, 10, 8),
+        (ops.GRAPH_NS / 3.5, 3, 3),  # fewer calls than copies: one copy a call
+        (ops.GRAPH_NS * 50, 1, 1),  # past the cap: at least one call
+    ],
+)
+def test_a_long_call_fills_a_graph_to_graph_ns_and_has_no_warm_graph(
+    call_ns, calls, copies
+):
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    graphs = []
+
+    def replay(fn, cycle):
+        graphs.append(len(cycle))
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], call_ns)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        record = stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], 8)
+
+    assert graphs == [calls] * (2 if calls == ops.CALLS else 1)
+    assert (record["copies"], record["calls"]) == (copies, calls)
+    assert (record["warm_ns"] is None) == (calls < ops.CALLS)
+
+
+def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
+    # Replay i takes i + 1 ms on a stand-in clock; the host idles `REST` of that
+    # after every replay, warmups included, which keeps a leaf off the lower
+    # memory clock it reaches back to back.
+    assert ops.REST > 0
+    clock, slept = [0], []
+
+    class Graph:
+        def replay(self):
+            clock[0] += len(slept) + 1
+
+    class Event:
+        def __init__(self, enable_timing):
+            self.synchronize = lambda: None
+
+        def record(self):
+            self.at = clock[0]
+
+        def elapsed_time(self, end):
+            return end.at - self.at
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(ops.time, "sleep", slept.append)
+
+    ops._replay(lambda: None, [({}, fctx._forward_context)])
+
+    replays = range(ops.WARMUPS + ops.REPEATS)
+    assert slept == [(i + 1) * ops.REST / 1e3 for i in replays]
 
 
 def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(
@@ -529,7 +618,7 @@ def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(
     with (
         patch.object(runner.model, "forward", ops.Stub(runner, 600)) as stub,
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=["k"]),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         [record] = stub.point(placed, decode(2), 20, found)
@@ -587,7 +676,7 @@ def test_a_graph_over_placements_reads_one_clone_of_metadata_none_changed(
     with (
         patch.object(runner.model, "forward", ops.Stub(runner, 5_000)) as stub,
         patch.object(ops, "_function", return_value=call),
-        patch.object(ops, "_kernels", return_value=["k"]),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
     ):
         [record] = stub.point(placed, decode(2), 20, found)
 
@@ -638,7 +727,7 @@ def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
     cuda, cpu = torch.autograd.DeviceType.CUDA, torch.autograd.DeviceType.CPU
 
     def event(name, start, device=cuda):
-        span = SimpleNamespace(start=start)
+        span = SimpleNamespace(start=start, elapsed_us=lambda: 1.0)
         return SimpleNamespace(name=name, device_type=device, time_range=span)
 
     profiled = {
@@ -662,7 +751,7 @@ def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     records = []
     for context in profiled:
-        kernels = ops._kernels(lambda: None, {})
+        kernels, _ = ops._kernels(lambda: None, {})
         records.append(
             {"shape": "decode B=2", "context": context, "op": "aiter.attn"}
             | {"leaf": "l", "kernels": kernels, "cold_ns": 31_700.0}
@@ -776,3 +865,16 @@ def test_a_measured_point_is_keyed_by_the_spec_of_the_platform_it_ran_on(
         at.token(),
         key("decode B=2", 9, "b").token(),
     ]
+
+
+def test_the_capture_child_starts_with_every_gpu_hidden_below_hip(monkeypatch):
+    # The capture sets HIP_VISIBLE_DEVICES itself, so only ROCm's own mask
+    # keeps it off every GPU.
+    started = {}
+    monkeypatch.setattr(ops, "_child", lambda fn, argv: started.update(os.environ))
+    monkeypatch.setattr("atom.compass.capture.forward.device_arch", lambda: "gfx942")
+    config = SimpleNamespace(model="m", tensor_parallel_size=1)
+
+    ops._capture(config, [decode(4)], "store")
+
+    assert started["ROCR_VISIBLE_DEVICES"] == ""

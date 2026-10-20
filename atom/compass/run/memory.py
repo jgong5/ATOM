@@ -6,7 +6,7 @@ The run file's ``store`` is the artifact store's root. The key is the
 machine spec's digest and `key_fields`, read off the resolved ATOM config: the
 served config.json's digest, the parallel layout, and as sorted JSON the
 engine config the readings move with, `step_grid.keyed`'s fields and the
-scheduler bounds and any KV offload connector. `compass measure memory`
+scheduler bounds, any KV offload connector and RapidServe. `compass measure memory`
 publishes one member per rank, ``readings.<rank>.json``, holding
 `ENTRY_FIELDS`; each rank reads its own. A configuration with no entry
 refuses, naming its key and the fields the nearest entry differs in, and so
@@ -68,6 +68,9 @@ def key_fields(config) -> dict:
     offload = [n for n, _ in leaves if KVConnectorFactory.is_offload_backend(n)]
     if offload:
         engine["kv_offload"] = sorted(offload)
+    # A RapidServe prefill engine reads the card with its decode process on it.
+    if getattr(config, "enable_rapidserve", False):
+        engine["enable_rapidserve"] = True
     return {
         "model": _file_digest(config.model, "config.json"),
         **topology(config).widths,

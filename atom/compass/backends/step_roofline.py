@@ -422,7 +422,7 @@ class StepRooflineBackend(CostBackend):
     def price(self, batch_view: BatchView) -> StepCost:
         refuse = []
         if batch_view.image_tokens:
-            refuse.append(IMAGES.format(batch_view.image_tokens))
+            refuse.append(IMAGES)
         if self.unclassified:
             refuse.append("unclassified modules: " + ", ".join(self.unclassified))
         if refuse:
