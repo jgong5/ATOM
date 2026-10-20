@@ -231,7 +231,7 @@ def test_an_instance_that_exits_before_it_answers_fails_the_deployment_naming_it
 @pytest.mark.parametrize(
     "case, refusal",
     [
-        ("record", "the command after OUT is run"),
+        ("command", "the command after OUT is run or record"),
         ("kv", "--kv-transfer-config"),
         ("dp-aware", "carry --dp-aware"),
         ("no router", "--router -- come once each"),
@@ -241,8 +241,8 @@ def test_an_instance_that_exits_before_it_answers_fails_the_deployment_naming_it
 def test_bad_arguments_exit_2_before_anything_starts(tmp_path, planted, case, refusal):
     env, flags = planted
     words = argv(tmp_path, flags)
-    if case == "record":
-        words[3] = "record"
+    if case == "command":
+        words[3] = "trace"
     elif case == "kv":
         words.insert(words.index("--decode"), "--kv-transfer-config={}")
     elif case == "dp-aware":
