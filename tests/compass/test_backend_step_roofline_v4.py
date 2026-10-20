@@ -212,6 +212,29 @@ def test_sparse_attention_over_an_fp8_q_and_without_an_indexer_by_hand(spec):
 
 
 @BOUND
+def test_the_fp4_indexer_scores_at_fp4_by_hand(spec):
+    # Window 4, every 3 tokens compressed, the indexer keeping the top 2; Q and
+    # the KV in fp8, the indexer's queries and keys in fp4.
+    attn = Module(
+        "attn", "sparse_attention", (2, 8, 4, 3, 2, 3, 4), "fp8", act="fp8", index="fp4"
+    )
+    rows = [(3, 10, False), (1, 7, True)]
+    keys = scored = 0
+    for q, kv, _ in rows:
+        for p in range(kv - q + 1, kv + 1):
+            keys += min(p, 4) + min(p // 3, 2)
+            scored += p // 3
+    # Q read at a byte, O written in bf16, the window and the top 2 at a byte;
+    # the 3 and 2 index keys at half a byte.
+    work = Work({"fp8": 4 * 2 * 8 * keys}, 4 * 2 * 8 * (1 + 2) + 12 * 8)
+    work += Work({"fp4": 2 * 3 * 4 * scored}, (3 + 2) * 4 / 2)
+
+    assert _price([attn], view(*rows), spec)["roofline.sparse_attention"] == (
+        pytest.approx(_module(work, spec))
+    )
+
+
+@BOUND
 def test_a_split_step_lays_each_layers_micro_batches_on_two_streams(spec):
     layers = []
     for i in range(2):
@@ -468,6 +491,45 @@ def test_the_v4_pro_dpa_tp8_build_classifies_every_module(ep, tmp_path):
     assert found[("gemm", (16384, 4096), "fp8", "fp8")] == 61
     assert found[("act", (3072,), "bf16", "bf16")] == 61
     assert found[("norm", (7168,), "bf16", "bf16")] == 1
+
+
+#: The build at the indexer cache format the third argument names, ATOM's
+#: default when it is empty, each module's indexer format in place of its layer.
+INDEX_BUILD = BUILD.replace(
+    'kv_cache_dtype="fp8")',
+    'kv_cache_dtype="fp8", index_cache_dtype=sys.argv[3] or None)',
+).replace("m.act, m.layer]", "m.act, m.index]")
+
+
+@pytest.mark.parametrize(
+    "cache, index", [("", "fp4"), ("fp8", "fp8")], ids=["default", "fp8-cache"]
+)
+def test_the_v4_pro_indexer_scores_at_the_format_atom_runs_it(cache, index, tmp_path):
+    # gfx950 runs the fp4 indexer by default; asked for an fp8 indexer cache,
+    # the fp8 one. A layer without an indexer scores nothing.
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_bytes(CONFIG.read_bytes())
+    done = subprocess.run(
+        [sys.executable, "-c", INDEX_BUILD, "0", str(tmp_path), cache],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=900,
+        cwd=TREE,
+        env={**os.environ, "PYTHONPATH": str(TREE)},
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    found = collections.Counter(
+        (tuple(dims[3:5]), ix)
+        for kind, dims, _, _, ix in json.loads(done.stdout.splitlines()[-1])
+        if kind == "sparse_attention"
+    )
+    ratios = json.loads(CONFIG.read_text())["compress_ratios"][:61]
+
+    assert found == {
+        ((128, 0), "fp8"): ratios.count(128),
+        ((4, 1024), index): ratios.count(4),
+    }
 
 
 #: The build on a declared arch, the third argument.

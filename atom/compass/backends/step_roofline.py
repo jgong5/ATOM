@@ -104,7 +104,8 @@ class Module:
     format its matrix products read activations in; `ranks` the group of the
     collective it joins, 1 for none; `fused` that the collective runs in the
     module's kernel; `layer` the decoder layer it sits in, -1 outside them;
-    `wire` the formats a `moe`'s all-to-all dispatch and combine send.
+    `wire` the formats a `moe`'s all-to-all dispatch and combine send;
+    `index` the format a `sparse_attention`'s indexer scores at.
     An unclassified module's `name` says what it is.
     """
 
@@ -117,6 +118,7 @@ class Module:
     act: str = ACT
     layer: int = -1
     wire: tuple[str, str] = (ACT, ACT)
+    index: str = "fp8"
 
 
 def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
@@ -247,13 +249,13 @@ def _index_scores(rows, ratio, heads, dim, fmt) -> Work:
 def _sparse_attention(m: Module, rows) -> Work:
     """V4's attention (`_sparse_products`) at Q's format `act` and the KV's
     `fmt`, at most the indexer's top `k` compressed entries where it has one,
-    which scores every compressed entry. Q is read at `act`, O written in
-    bf16."""
+    which scores every compressed entry at `index`. Q is read at `act`, O
+    written in bf16."""
     heads, dim, window, ratio, top, index_heads, index_dim = m.dims
     top = top if index_heads else None
     work = _sparse_products(rows, heads, dim, m.act, m.fmt, window, ratio, top)
     if ratio and index_heads:
-        work += _index_scores(rows, ratio, index_heads, index_dim, m.fmt)
+        work += _index_scores(rows, ratio, index_heads, index_dim, m.index)
     q = sum_tokens(rows) * heads * dim
     return work + Work({}, q * (ELEMENT_BYTES[m.act] + ELEMENT_BYTES[ACT]))
 
