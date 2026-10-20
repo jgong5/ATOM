@@ -201,7 +201,7 @@ def test_fit_ops_holds_out_no_point_between_neighbours_one_apart(
 ):
     # one kernel stepping just above the middle point, which its neighbours price
     # 6.7% to 13.3% high unless both are one away along that dimension
-    points = zip(rows, contexts, (10, 10, 12))
+    points = zip(rows, contexts, (1e4, 1e4, 12e3))
     d, _ = measured("m", [_point(b, ns, context=c) for b, c, ns in points])
 
     got = _fit(tmp_path / "fit", tmp_path / "store", d)

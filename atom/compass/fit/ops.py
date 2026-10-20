@@ -18,7 +18,7 @@ the GEMMs of a decode step differ in N and K and share a family per weight.
 
 A family's dimensions are the shape's counts its masked integers follow, a
 decode's B always, the rows its MoE gathers, ``G``, when the shape states them
-(a shape that does not gathers every rank's T, and is another family), and,
+(a shape that states no ``G`` gathers every rank's T, and is another family), and,
 for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
 a prefill's B and the context: a decode point's ``context``, its longest

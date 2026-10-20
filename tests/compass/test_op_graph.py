@@ -833,6 +833,23 @@ def test_a_run_file_price_list_prices_leaves_from_the_store_s_entry(
     assert installed.resolver.sources[0].params == FLAT.params
 
 
+def test_a_run_file_price_list_under_dp_2_prices_a_step_gathering_2t(
+    monkeypatch, tmp_path
+):
+    fields = _published(tmp_path)
+    installed = _installed(
+        monkeypatch, tmp_path, dp=2, op_graph=True, price_list=fields
+    )
+    installed.graph = lambda *shape: {"seq": [g(2, 64, 64)]}
+
+    (term,) = installed.price(replace(DECODE, moe_rows=4)).terms
+
+    assert (term.seconds, term.provenance.method) == (
+        pytest.approx(5e-6),
+        Method.MEASURED,
+    )
+
+
 def test_a_run_file_price_list_from_another_tree_is_refused_at_load(
     monkeypatch, tmp_path
 ):
