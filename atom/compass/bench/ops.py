@@ -275,9 +275,11 @@ def _ref(value) -> bool:
 
 def signature(op: dict) -> str:
     """A leaf's identity across instances: its operator, arguments and outputs,
-    a context key or module path by its kind alone."""
+    a context key or module path by its kind alone, and what the capture
+    states beside its arguments when it states anything."""
     args = {s: {k: None for k in v} if _ref(v) else v for s, v in op["args"].items()}
     leaf = {"op": op["op"], "args": args, "out": op["out"]}
+    leaf |= {"stated": op["stated"]} if "stated" in op else {}
     return json.dumps(leaf, sort_keys=True, separators=(",", ":"))
 
 

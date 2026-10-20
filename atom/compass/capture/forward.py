@@ -69,6 +69,9 @@ HOST_QUERIES = ("aiter.get_gfx_custom_op.default",)
 UNDISPATCHED = ("profiler.", "prim.device")
 #: The hf config fields, or its text config's, that count a model's routed experts.
 ROUTED = ("n_routed_experts", "num_experts", "num_local_experts")
+#: DeepSeek-V4's persistent decode kernel and its indexer's score and top-k.
+V4_PS_DECODE = "aiter.mla_decode_v4_ps_asm.default"
+V4_INDEXER = "aiter.indexer_score_topk.default"
 
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
@@ -229,13 +232,15 @@ class _Recorder(TorchDispatchMode):
 
     What is not ATOM's work at the traced shape goes to `left_out`, with why.
     `creating` is the role a storage allocated now takes; `roles` holds every
-    role given so far.
+    role given so far. `stated` is what an op of each kind recorded now
+    states beside its arguments (`ir.Op.stated`), by its name.
     """
 
     def __init__(self, contexts, fake_mode=None):
         super().__init__()
         self.contexts, self.modules, self.roles = contexts, {}, {}
         self.creating, self.on, self.fake_mode = None, False, fake_mode
+        self.stated = {}
         self.start()
 
     def start(self):
@@ -360,7 +365,8 @@ class _Recorder(TorchDispatchMode):
             args = tuple((slot, self._arg(value)) for slot, value in slots.items())
             ref = next((v for _, v in args if type(v) is ir.ContextRef), None)
             stream = driverless.current[0].stream_id
-            return ir.Op(name, kind, args, out_shapes, stream, ref)
+            stated = self.stated.get(name, ())
+            return ir.Op(name, kind, args, out_shapes, stream, ref, stated)
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"{name} has no contract a graph can hold: {exc}"
@@ -498,12 +504,28 @@ def _v4_attention(v4, recorder):
     folded in: before its raw launches, `fused_compress_attn` derives its
     `quant` parameter, and the decode kernel's aiter entry dispatches a leaf,
     either of which a lift refuses.
+
+    The two decode kernels' leaves state the layer's `window_size`,
+    `compress_ratio` and `index_topk` (None when it has no indexer), and the
+    indexer's its `compress_ratio`, none of which they are passed: read off
+    the layer `layer_name` names.
     """
     from atom.model_ops.v4_kernels import paged_decode
     from atom.utils.forward_context import get_forward_context
 
+    decode = paged_decode._sparse_attn_v4_paged_decode_asm
+    decodes = (f"{decode.__module__}:{decode.__qualname__}", V4_PS_DECODE)
+
     def body(x, positions, layer_name):
-        with patch.object(get_forward_context().context, "is_dummy_run", False):
+        layer = recorder.contexts[layer_name]
+        top = layer.indexer and layer.indexer.index_topk
+        ratio = (("compress_ratio", layer.compress_ratio),)
+        geometry = (("window_size", layer.window_size), *ratio, ("index_topk", top))
+        stated = {**dict.fromkeys(decodes, geometry), V4_INDEXER: ratio}
+        with (
+            patch.object(recorder, "stated", stated),
+            patch.object(get_forward_context().context, "is_dummy_run", False),
+        ):
             return v4.v4_attention_with_output(x, positions, layer_name)
 
     def at_call(owner, fn):
@@ -515,7 +537,7 @@ def _v4_attention(v4, recorder):
     for each in (
         patch.object(torch.ops.aiter, "v4_attention_with_output", body),
         at_call(v4, v4.fused_compress_attn),
-        at_call(paged_decode, paged_decode._sparse_attn_v4_paged_decode_asm),
+        at_call(paged_decode, decode),
     ):
         stack.enter_context(each)
     return stack

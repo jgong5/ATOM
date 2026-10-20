@@ -520,7 +520,7 @@ a graph holds one shape (D18), and a node's arguments are its contract (D20).
 Graph   := (applicability, Region)
 Region  := Seq[Node] | Repeat(body: Region, count: int) | Par([Region], join: JoinPolicy)
 Node    := Op(name, kind, args: {slot: Arg}, out_shapes: [Shape],
-              stream_id, context_ref)
+              stream_id, context_ref, stated: {name: Value})
 Arg     := Tensor(shape, dtype, stride, role) | Value | ModuleRef(path)
 role    := activation | weight | KV | metadata
 ```
@@ -865,6 +865,15 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   argmax lifts to `_apply_greedy_tokens`, whose host arch query `get_gfx_custom_op` is
   allowed inside the lifted frame. A kernel switch inside the frame, mrope's tiled kernel
   at B >= 128, disappears into the leaf.
+- **What a leaf reads but is not passed may be stated beside its arguments**, in the
+  op's `stated` field, by name; a call does not take it, and `bench.ops.signature`
+  includes it. Owner's [ruling on #1689](https://github.com/jgong5/ATOM/issues/1689#issuecomment-6292555659):
+  only DeepSeek-V4's two decode attention leaves state their layer's `window_size`,
+  `compress_ratio` and `index_topk` (null for a layer with no indexer), and its
+  indexer's score and top-k states its `compress_ratio`, read in the opened
+  attention's body from the layer `layer_name` names. Their index lists are sized for
+  the deployment's longest row, so the entries a row reads follow from these and its
+  context, not from the lists.
 
 Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers
 and DeepSeek-V4's attention aside, below), so its ambient reads stay
