@@ -241,9 +241,13 @@ row is a result, not a failure.
    is `server.log` in its directory. Read the tail first.
 2. Match the symptom against QUICKSTART's Traps and give its fix.
 3. A GPU refusal before a run (`... before the run, so it was not started`)
-   means a neighbour arrived: never stop it; run the GPU check and ask. One
-   after a run (`... after the run, so it fails`) means the run shared its GPU:
-   say its record cannot be trusted, and ask before taking it again.
+   means a neighbour arrived: never stop it; run the GPU check and ask. After a
+   run (`... after the run, so it fails`), run the GPU check at once. If the
+   PIDs it named are gone and the run's engine had just shut down (its log's
+   last lines), the check most likely caught the run's own processes still
+   exiting, a known defect of the check: say so, and offer the step again into
+   a fresh OUT. If one stays on the GPU, the run shared it: say its record
+   cannot be trusted, and ask before taking it again.
 4. Exits 90 to 99 are the tree checks in `scripts/compass/_lib.sh`: `atom`
    resolved outside `$T`, usually a missing `PYTHONPATH=$T` or a command not
    run from `/`.
