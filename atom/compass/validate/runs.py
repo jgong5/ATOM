@@ -11,7 +11,9 @@ A directory `cctraces_sim.sh` wrote is graded as below when it holds
 `artifacts/client_run.json`, whole when it does not. SIMULATED is refused
 when its run.json, the run file it ran, skips host segments, has no host laws,
 or turns the step roofline on with no step grid; a real run's server never
-reads the run file it was handed. In one `record` or `run` wrote, whose run.json
+reads the run file it was handed. It is also refused when an engine's hand-in
+in it, `lp-engine*.json`, states an assumed `memory_readings` member, naming
+each assumption. In one `record` or `run` wrote, whose run.json
 states a `format_version`, the graded client run is the one whose export is
 `artifacts/client_run.json`, split from the record by `parity.served`: only
 its steps are graded, and every run's client must have been given the same
@@ -87,13 +89,21 @@ from scipy.stats import ks_2samp
 
 from atom.compass.drive.aiter_jit import BUILDS
 from atom.compass.parity.served import served
-from atom.compass.run import CLIENT_DIR, STEP_GRID, SUMMARY_FILE, entries
+from atom.compass.run import (
+    CLIENT_DIR,
+    ENGINE,
+    LP_FILE,
+    STEP_GRID,
+    SUMMARY_FILE,
+    entries,
+)
 
 EXPORT = "artifacts/profile_export_aiperf.json"
 #: The export of the client run a `record` or `run` directory grades.
 CLIENT_RUN = "artifacts/client_run.json"
 TARGET = {"ttft": 0.15}
 DEFAULT_TARGET = 0.10
+ASSUMED = "its engines read assumed memory_readings members: {}"
 END_TO_END = {
     "ttft mean": ("time_to_first_token", "avg"),
     "ttft p50": ("time_to_first_token", "p50"),
@@ -273,7 +283,7 @@ def _not_graded(run, traces) -> list[str]:
     if profiled := [i["run"] for i in inputs if i.get("profiled")]:
         why.append(f"its backend was fitted on profiled inputs: {profiled}")
     if assumed := run["provenance"].get("memory_readings_assumed"):
-        why.append(f"its engines read assumed memory_readings members: {assumed}")
+        why.append(ASSUMED.format(assumed))
     return why
 
 
@@ -291,7 +301,9 @@ def graded(cell) -> tuple[list[dict], list[str] | None, dict | None]:
 
 def _refuse_by_run_file(cell) -> None:
     """Refuse the simulated `cell`, a directory `cctraces_sim.sh` wrote, when
-    the run file it ran, its run.json, says it is not graded."""
+    the run file it ran, its run.json, says it is not graded, or when an
+    engine's hand-in in it, of either side of a 1P1D cell, states an assumed
+    `memory_readings` member."""
     path = Path(cell) / "run.json"
     if not path.exists():
         return
@@ -300,7 +312,12 @@ def _refuse_by_run_file(cell) -> None:
         return
     if any(h.get("skip") for h in entries(run, "host")):
         raise ValueError(f"{cell} skips host segments; a what-if run is not graded")
-    if why := _run_file_not_graded(run, run.get("step_roofline")):
+    engines = Path(cell).glob(LP_FILE.format(f"{ENGINE.name}*"))
+    memory = [json.loads(p.read_text()).get("memory") or {} for p in engines]
+    why = _run_file_not_graded(run, run.get("step_roofline"))
+    if assumed := sorted({m["assumed"] for m in memory if m.get("assumed")}):
+        why.append(ASSUMED.format(assumed))
+    if why:
         raise ValueError(f"{cell} is not graded: " + "; ".join(why))
 
 
