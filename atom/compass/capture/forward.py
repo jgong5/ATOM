@@ -100,11 +100,23 @@ def prefill(tokens: int, seqs: int) -> Shape:
     return Shape("prefill", tokens, seqs)
 
 
-def structure(config, phase: str, eager: bool | None = None) -> str:
+def device_arch() -> str:
+    """The visible device's arch, its target features dropped."""
+    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+
+def structure(
+    config,
+    phase: str,
+    eager: bool | None = None,
+    device: str | None = None,
+    output: bool = True,
+) -> str:
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the TP width, the DP width and the EP
     group's when they are set, the phase and the mode, `config`'s unless `eager`
-    names it."""
+    names it, the arch of `device`, else `device_arch()`, and ``no output``
+    unless the step produces output (`output`)."""
     from atom.compass.run import _file_digest
 
     digest = _file_digest(config.model, "config.json")
@@ -113,7 +125,8 @@ def structure(config, phase: str, eager: bool | None = None) -> str:
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     widths = f"tp={tp}" + (f" dp={dp}" if dp > 1 else "")
     widths += f" ep={tp * dp}" if config.enable_expert_parallel else ""
-    return f"{arch} {digest} {widths} {phase} {mode}"
+    key = f"{arch} {device or device_arch()} {digest} {widths} {phase} {mode}"
+    return key if output else f"{key} no output"
 
 
 def _atom_frames():
@@ -420,6 +433,40 @@ def _patches(recorder):
     return stack
 
 
+def _v4_attention(v4, recorder):
+    """DeepSeek-V4's attention op runs its body, not its fake, so its kernels
+    are leaves of their own, as a real step runs it: the capture's batch is a
+    dummy run, which the body would skip. The indexer's score and top-k stays
+    one leaf: its FP4 kernels launch through aiter's own launcher, which no
+    patch here intercepts.
+
+    Two of its functions are one leaf each at their call, what they run inside
+    folded in: before its raw launches, `fused_compress_attn` derives its
+    `quant` parameter, and the decode kernel's aiter entry dispatches a leaf,
+    either of which a lift refuses.
+    """
+    from atom.model_ops.v4_kernels import paged_decode
+    from atom.utils.forward_context import get_forward_context
+
+    def body(x, positions, layer_name):
+        with patch.object(get_forward_context().context, "is_dummy_run", False):
+            return v4.v4_attention_with_output(x, positions, layer_name)
+
+    def at_call(owner, fn):
+        name = f"{fn.__module__}:{fn.__qualname__}"
+        leaf = peers._declared(recorder, name, fn, ir.NodeKind.OPAQUE_LEAF)
+        return patch.object(owner, fn.__name__, leaf)
+
+    stack = contextlib.ExitStack()
+    for each in (
+        patch.object(torch.ops.aiter, "v4_attention_with_output", body),
+        at_call(v4, v4.fused_compress_attn),
+        at_call(paged_decode, paged_decode._sparse_attn_v4_paged_decode_asm),
+    ):
+        stack.enter_context(each)
+    return stack
+
+
 def _build_runner(config, fake_mode):
     """ATOM's `ModelRunner`, built in the mode in the model's dtype, which it
     leaves torch's default for the steps, as ATOM's runner does.
@@ -457,10 +504,12 @@ def _weights(model):
                 yield value
 
 
-def _batch(shape, block_size, context=1):
+def _batch(shape, block_size, context=1, output=True):
     """`shape.seqs` sequences of `shape.tokens` new tokens between them, the
     first `tokens % seqs` one longer, each in blocks of its own; and the
-    blocks they take. A decode sequence holds `context` tokens."""
+    blocks they take. A decode sequence holds `context` tokens. Unless
+    `output`, every prefill sequence is a middle chunk, so the step samples
+    nothing."""
     from atom.model_engine import sequence
     from atom.model_engine.scheduler import ScheduledBatch
 
@@ -485,6 +534,7 @@ def _batch(shape, block_size, context=1):
         **{f"total_tokens_num_{shape.phase}": shape.tokens},
         **{f"total_seqs_num_{shape.phase}": shape.seqs},
         is_dummy_run=True,
+        is_final_chunk=None if output else [False] * shape.seqs,
     )
     return batch, blocks
 
@@ -561,7 +611,8 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
     under ATOM's engine arguments `atom_args` on a declared `arch`.
 
     Yields, per shape, the graph, the model's config digest, what the capture
-    declared, the operators it left out of the graph among it.
+    declared, the operators it left out of the graph among it; per prefill
+    shape, the middle chunk's and then the final one's.
     """
     declared = driverless.install(tmpdir, arch)
 
@@ -588,6 +639,8 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
             peers.install_mori(recorder)
     with stack:
         runner = _build_runner(config, fake_mode)
+        if v4 := sys.modules.get("atom.models.deepseek_v4"):
+            stack.enter_context(_v4_attention(v4, recorder))
         stacks = [
             module
             for name, module in runner.model.named_modules()
@@ -616,7 +669,14 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
         runner.attn_metadata_builder.warmup_per_req_cache = lambda: None
         with fake_mode, recorder:
             runner.allocate_kv_cache(max(KV_BLOCKS, blocks))
-        for shape in shapes:
+        # A prefill is traced as a middle chunk, which samples nothing, then as
+        # a final one; a decode step always samples.
+        variants = [
+            (shape, output)
+            for shape in shapes
+            for output in ((False, True) if shape.phase == "prefill" else (True,))
+        ]
+        for shape, output in variants:
             recorder.shape = shape
             traces = []
             for context in CONTEXTS if shape.phase == "decode" else CONTEXTS[:1]:
@@ -625,16 +685,17 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
                     # A runner's first step takes its own path, so the traced
                     # step follows one of its own shape: no graph depends on
                     # another's.
-                    runner.forward(_batch(shape, block_size, context)[0])
+                    runner.forward(_batch(shape, block_size, context, output)[0])
                     recorder.start()
                     recorder.creating, recorder.on = ir.Role.METADATA, True
-                    runner.forward(_batch(shape, block_size, context)[0])
+                    runner.forward(_batch(shape, block_size, context, output)[0])
                 recorder.creating, recorder.on = None, False
                 traces.append((recorder.items, recorder.left_out))
             items, left_out = traces[0]
             if len(traces) > 1:
                 items = _affine(str(shape), items, traces[1][0])
-            crossing, traced = [], Traced(structure(config, shape.phase), str(shape))
+            key = structure(config, shape.phase, output=output)
+            crossing, traced = [], Traced(key, str(shape))
             graph = build(items, traced, crossing)
             left_out = [*left_out, *(("step-crossing", op) for op in crossing)]
             declared["left_out"] = [{"why": why, **_json(op)} for why, op in left_out]

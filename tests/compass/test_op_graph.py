@@ -11,12 +11,14 @@ backend from a run file's ``op_graph`` over the store's graphs.
 """
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 from test_backend_step_linear import _installed, law, view
 from test_backend_step_roofline import COMPUTE, MEMORY, _spec
 from test_capture_ir import CONFIG, WIDTH_2, _ops, capture
+from test_memory_readings import WORKER
 from test_op_work import leaf, t
 from test_work import SPEC
 
@@ -26,11 +28,15 @@ from atom.compass.backends.op_graph import NONE, OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.work import attention, gemm, price
+from atom.compass.bench.ops import leaves
+from atom.compass.capture.peers import MORI
 from atom.compass.run import _op_graphs
 
 GEMM = "aiter.gemm_a16w16.default"
 ATTENTION = "aiter.unified_attention_with_output_base.default"
+GATHER = "atom.model_ops.moe:all_gatherv"
 DECODE = view((1, 900, True), (1, 300, True), rung=2)
+PREFILLS = "--prefill 512 2 --prefill 300 3"
 
 
 def g(m, n, k):
@@ -56,7 +62,13 @@ def test_a_step_is_one_roofline_per_leaf_composed_by_the_graph_s_joins():
             {"par": [g(2, 2048, 4096), {"seq": [g(2, 4096, 4096)]}], "join": "max"},
             {
                 "par": [
-                    {"par": [g(4096, 4096, 4096), g(4096, 2048, 4096)], "join": "max"},
+                    {
+                        "par": [
+                            {"seq": [g(4096, 4096, 4096), g(4096, 4096, 4096)]},
+                            g(4096, 2048, 4096),
+                        ],
+                        "join": "max",
+                    },
                     g(4096, 1024, 4096),
                 ],
                 "join": "resource_bound",
@@ -66,7 +78,8 @@ def test_a_step_is_one_roofline_per_leaf_composed_by_the_graph_s_joins():
     cost = backend(region).price(DECODE)
     one, body = price(gemm(2, 64, 64), SPEC), price(gemm(2, 128, 64), SPEC)
     longest = price(gemm(2, 4096, 4096), SPEC)
-    summed = gemm(4096, 4096, 4096) + gemm(4096, 2048, 4096) + gemm(4096, 1024, 4096)
+    big = gemm(4096, 4096, 4096)
+    summed = big + big + gemm(4096, 2048, 4096) + gemm(4096, 1024, 4096)
 
     assert by_name(cost) == {
         f"op.{GEMM}": fold_seconds([one, body, body, body, longest]),
@@ -74,15 +87,21 @@ def test_a_step_is_one_roofline_per_leaf_composed_by_the_graph_s_joins():
     }
 
 
+MIDDLE = BatchView((RequestShape(9, 9, False),), produces_output=False)
+FINAL = BatchView((RequestShape(9, 9, False),), produces_output=True)
+
+
 @pytest.mark.parametrize(
     "batch,padded,shape",
     [
-        (view(*[(1, 90, True)] * 3, rung=4), True, ("decode", 4, 4)),
-        (view(*[(1, 90, True)] * 3, rung=4), False, ("decode", 3, 3)),
-        (view((1, 90, True), (1, 9, True)), True, ("decode", 2, 2)),
-        (view((100, 100, False), (1, 50, True)), True, ("prefill", 101, 2)),
+        (view(*[(1, 90, True)] * 3, rung=4), True, ("decode", 4, 4, True)),
+        (view(*[(1, 90, True)] * 3, rung=4), False, ("decode", 3, 3, True)),
+        (view((1, 90, True), (1, 9, True)), True, ("decode", 2, 2, True)),
+        (view((100, 100, False), (1, 50, True)), True, ("prefill", 101, 2, True)),
+        (MIDDLE, True, ("prefill", 9, 1, False)),
+        (FINAL, True, ("prefill", 9, 1, True)),
     ],
-    ids=["rung", "padding-none", "eager-decode", "mixed"],
+    ids=["rung", "padding-none", "eager-decode", "mixed", "middle", "final"],
 )
 def test_a_step_reads_the_graph_captured_at_its_shape(batch, padded, shape):
     asked = []
@@ -101,6 +120,12 @@ def test_a_step_reads_the_graph_captured_at_its_shape(batch, padded, shape):
     [
         (view((2, 9, True)), g(1, 8, 8), "a step that decodes 2 tokens in a row"),
         (view((1, 9, True)), None, "no op_graph holds a decode step of 1 tokens"),
+        (MIDDLE, None, "of 9 tokens over 1 sequences that produces no output;"),
+        (
+            BatchView((RequestShape(9, 9, False),)),
+            g(1, 8, 8),
+            "a prefill step whose view does not say whether it produces output",
+        ),
         (
             BatchView((RequestShape(9, 9, False),), tbo_tokens=((5,), (4,))),
             g(1, 8, 8),
@@ -112,16 +137,36 @@ def test_a_step_reads_the_graph_captured_at_its_shape(batch, padded, shape):
             "5 image tokens",
         ),
         (
-            BatchView((RequestShape(9, 9, False),), moe_rows=18),
-            g(1, 8, 8),
+            replace(FINAL, moe_rows=18),
+            {"seq": [g(9, 8, 8), leaf(GATHER, [[18, 8]], x=t([9, 8]))]},
+            "a data-parallel step whose MoE gathers 18 rows",
+        ),
+        (
+            replace(FINAL, moe_rows=18),
+            leaf(f"{MORI}.dispatch", [[18, 8]], input=t([9, 8])),
             "a data-parallel step whose MoE gathers 18 rows",
         ),
     ],
-    ids=["speculative", "uncaptured", "tbo", "images", "data-parallel"],
+    ids=[
+        "speculative",
+        "uncaptured",
+        "uncaptured-middle",
+        "output-unsaid",
+        "tbo",
+        "images",
+        "data-parallel",
+        "mori",
+    ],
 )
 def test_a_step_with_no_graph_to_price_it_is_refused_by_name(batch, graph, named):
     with pytest.raises(CostRefused, match=named):
         backend(graph).price(batch)
+
+
+def test_a_data_parallel_step_with_no_moe_exchange_prices_as_its_own_rows():
+    dp = backend(g(9, 8, 8)).price(replace(FINAL, moe_rows=18))
+
+    assert by_name(dp) == by_name(backend(g(9, 8, 8)).price(FINAL))
 
 
 def test_each_reason_a_graph_refuses_is_named_once():
@@ -173,7 +218,10 @@ def test_attention_reads_its_context_in_the_run_s_kv_format(kv):
 
 @pytest.mark.parametrize(
     "batch,reads",
-    [(view((1, 900, True)), MEMORY), (view((8192, 8192, False)), COMPUTE)],
+    [
+        (view((1, 900, True)), MEMORY),
+        (BatchView((RequestShape(8192, 8192, False),), produces_output=True), COMPUTE),
+    ],
     ids=["memory", "compute"],
 )
 @pytest.mark.parametrize("origin", ["probed", "assumed"])
@@ -222,20 +270,64 @@ def test_the_run_s_lookup_reads_the_eager_graph_at_a_shape(tmp_path_factory):
             enable_expert_parallel=False,
             enforce_eager=False,
         )
-        lookup = _op_graphs(str(store), config)
+        lookup = _op_graphs(str(store), config, "gfx942")
         found.append((lookup("decode", 2, 2), lookup("decode", 3, 3)))
 
     assert (graph["region"], None) in found
+
+
+def test_a_27b_middle_chunk_prices_from_its_graph_with_no_lm_head(tmp_path_factory):
+    capture(1, PREFILLS, tmp_path_factory)
+    hf = SimpleNamespace(architectures=json.loads(CONFIG.read_text())["architectures"])
+    lookups = [
+        _op_graphs(
+            str(store),
+            SimpleNamespace(
+                model=str(store.parent / "model"),
+                hf_config=hf,
+                tensor_parallel_size=1,
+                parallel_config=SimpleNamespace(data_parallel_size=1),
+                enable_expert_parallel=False,
+                enforce_eager=True,
+            ),
+            "gfx942",
+        )
+        for store in tmp_path_factory.getbasetemp().glob("tp1*/store")
+    ]
+    lookup = next(at for at in lookups if at("prefill", 512, 2))
+    final, middle = lookup("prefill", 512, 2, True), lookup("prefill", 512, 2, False)
+
+    def rows(region):
+        return {op["args"]["A"]["shape"][0] for op in _ops(region) if op["op"] == GEMM}
+
+    # The head takes each sequence's last token; a middle chunk runs no head.
+    assert (rows(final), rows(middle)) == ({512, 2}, {512})
+    assert leaves(middle).keys() < leaves(final).keys()
+    chunk = (RequestShape(256, 256, False),) * 2
+    priced = {
+        output: by_name(
+            OpGraphBackend(SPEC, lookup, kv="bf16").price(
+                BatchView(chunk, produces_output=output)
+            )
+        )
+        for output in (True, False)
+    }
+    assert priced[False].keys() <= priced[True].keys()
+    assert sum(priced[False].values()) < sum(priced[True].values())
+    (head,) = [op for op in _ops(final) if rows(op) == {2}]
+    dropped = priced[True][f"op.{GEMM}"] - priced[False][f"op.{GEMM}"]
+    assert dropped == pytest.approx(price(work(head, FINAL, 1, "bf16"), SPEC))
 
 
 @pytest.mark.parametrize("padding,padded", [({}, True), ({"padding": "none"}, False)])
 def test_a_run_file_op_graph_installs_the_op_level_backend(
     monkeypatch, tmp_path, padding, padded
 ):
+    monkeypatch.setitem(WORKER, "kv_cache_dtype", "fp8")
     installed = _installed(monkeypatch, tmp_path, op_graph=True, **padding)
 
     assert isinstance(installed, OpGraphBackend)
-    assert (installed.tp, installed.kv, installed.padded) == (1, "bf16", padded)
+    assert (installed.tp, installed.kv, installed.padded) == (1, "fp8", padded)
 
 
 def test_a_run_file_op_graph_that_is_not_true_is_refused(monkeypatch, tmp_path):

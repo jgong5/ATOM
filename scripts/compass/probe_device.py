@@ -8,10 +8,14 @@ cards 0 and 1 the link. Every sample is device time between two events queued
 behind a spin kernel, so no host time is in it.
 
 - Compute: per format, the median of `REPS` GEMMs ``x @ w.T``, x m by k and
-  w n by k, at each of `SHAPES`, BF16 through `torch.matmul` and FP8 through
-  `torch._scaled_mm`; the best shape's rate over SPEC's ``*_flops`` is the
-  format's derate. Each GEMM follows a spin, so the rate is a burst's: with PTL
-  enabled a sustained GEMM slows within a second or two.
+  w n by k, at each of `SHAPES`, BF16 through `torch.matmul`, FP8 through
+  `torch._scaled_mm`, and FP4 where SPEC states ``fp4_flops``: MXFP4, two
+  values a byte and a power-of-two scale per 32 along k, through both
+  `torch._scaled_mm` (hipBLASLt) and `aiter.gemm_a4w4` with w pre-shuffled,
+  as aiter's own tests call it. The best rate over shapes and libraries, over
+  SPEC's ``*_flops``, is the format's derate. Each GEMM follows a spin, so the
+  rate is a burst's: with PTL enabled a sustained GEMM slows within a second
+  or two.
 - Bandwidth: per kind in `KINDS` (read-only, write-only, copy) and per size
   in `SIZES` of bytes moved, a graph of up to `GRAPH` kernels through
   consecutive slices of one zeroed `2 * POOL`-byte buffer (a copy reads one
@@ -32,7 +36,8 @@ behind a spin kernel, so no host time is in it.
 The run is refused unless every card is idle (under `IDLE_BYTES` of VRAM used,
 0% busy) and reads SPEC's ``device.ptl`` from
 ``ptl/ptl_enable`` under its sysfs device (`NO_PTL` where it has none). OUT
-is the record: the cards, every sample and this file's text; the fragment
+is the record: the cards, the stack (ROCm, aiter's commit, RCCL and torch),
+every sample and this file's text; the fragment
 printed names its sha256.
 """
 
@@ -70,7 +75,7 @@ SPIN = 10**7  # device cycles a sample waits behind, well past its host calls
 IDLE_BYTES = 2**30
 DRM = "/sys/class/drm"
 #: Each format's derate, by the spec-peak number it is taken over.
-FORMATS = {"bf16": "bf16_flops", "fp8": "fp8_flops"}
+FORMATS = {"bf16": "bf16_flops", "fp8": "fp8_flops", "fp4": "fp4_flops"}
 #: The fields read with a band, and each one's sample list in the record.
 BANDED = {
     "device.kernel_floor_s": "floor",
@@ -156,24 +161,53 @@ def _timed(torch, fn, reps: int = REPS) -> list[float]:
     return out
 
 
-def probe(torch) -> dict:
-    """Every sample, on visible cards 0 and 1."""
+def _fp4(torch, rows: int, k: int):
+    """An MXFP4 operand of `rows` by `k` random values and its unit scales."""
+    cuda = {"dtype": torch.uint8, "device": "cuda"}
+    packed = torch.randint(0, 256, (rows, k // 2), **cuda)
+    scales = torch.full((rows, k // 32), 127, **cuda)  # 2**0 in E8M0
+    return packed.view(torch.float4_e2m1fn_x2), scales.view(torch.float8_e8m0fnu)
+
+
+def _a4w4(x, w):
+    """aiter's MXFP4 GEMM of bf16 `x` and `w`, quantised per 1x32 with shuffled
+    scales and `w` pre-shuffled, as aiter's own tests call it."""
+    import aiter
+    from aiter.ops.shuffle import shuffle_weight
+
+    quant = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    (x4, sx), (w4, sw) = quant(x, shuffle=True), quant(w, shuffle=True)
+    w4 = shuffle_weight(w4, layout=(16, 16))
+    return partial(aiter.gemm_a4w4, x4, w4, sx, sw, bpreshuffle=True)
+
+
+def probe(torch, formats) -> dict:
+    """Every sample, on visible cards 0 and 1, GEMMs in `formats`; FP4 also
+    through aiter, under ``aiter``."""
     torch.cuda.set_device(0)
     fp8 = torch.float8_e4m3fn
     if torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx942"):
         fp8 = torch.float8_e4m3fnuz
     one = torch.ones((), device="cuda")
-    gemm = {f: {} for f in FORMATS}
+    gemm = {f: {} for f in formats}
+    aiter = {"fp4": {}} if "fp4" in formats else {}
     for m, n, k in SHAPES:
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-        shape = f"{m}x{n}x{k}"
-        gemm["bf16"][shape] = _timed(torch, partial(torch.matmul, x, w.T))
-        time.sleep(1)  # let a PTL card recover before the next burst
-        x, w = x.to(fp8), w.to(fp8)
-        scaled = partial(torch._scaled_mm, x, w.T, one, one, out_dtype=torch.bfloat16)
-        gemm["fp8"][shape] = _timed(torch, scaled)
-        time.sleep(1)
+        scaled = partial(torch._scaled_mm, out_dtype=torch.bfloat16)
+        calls = {
+            "bf16": partial(torch.matmul, x, w.T),
+            "fp8": partial(scaled, x.to(fp8), w.to(fp8).T, one, one),
+        }
+        if "fp4" in formats:
+            (x4, sx), (w4, sw) = _fp4(torch, m, k), _fp4(torch, n, k)
+            calls["fp4"] = partial(scaled, x4, w4.T, sx, sw)
+        timings = [(gemm[f], calls[f]) for f in formats]
+        if aiter:
+            timings.append((aiter["fp4"], _a4w4(x, w)))
+        for samples, call in timings:
+            samples[f"{m}x{n}x{k}"] = _timed(torch, call)
+            time.sleep(1)  # let a PTL card recover before the next burst
     pool = torch.zeros(2 * POOL // 4, device="cuda")
     streams = {kind: {} for kind in KINDS}
     for (kind, (read, write)), size in itertools.product(KINDS.items(), SIZES):
@@ -212,6 +246,7 @@ def probe(torch) -> dict:
         torch.cuda.synchronize(1)
     return {
         "gemm": gemm,
+        "aiter": aiter,
         **streams,
         "floor": floor,
         "link": link,
@@ -227,21 +262,23 @@ def rates(record: dict) -> dict:
 
 def readings(record: dict) -> dict:
     """The attainable values a record's samples give: each format's best
-    median rate, the running maximum over sizes of the fastest kind's median
-    rate, the link's median rate, and each banded field's median, p10 and
-    p90."""
+    median rate over shapes and libraries, the running maximum over sizes of
+    the fastest kind's median rate, the link's median rate, and each banded
+    field's median, p10 and p90."""
     med = statistics.median
 
     def band(samples):
         cut = statistics.quantiles(samples, n=10, method="inclusive")
         return [med(samples), cut[0], cut[8]]
 
+    libraries = (record["gemm"], record.get("aiter", {}))
     found = {
         f: max(
             2 * math.prod(map(int, s.split("x"))) / med(t)
-            for s, t in record["gemm"][f].items()
+            for gemm in libraries
+            for s, t in gemm.get(f, {}).items()
         )
-        for f in FORMATS
+        for f in record["gemm"]
     }
     kinds = rates(record)
     sizes = sorted(kinds["copy"])
@@ -261,6 +298,7 @@ def fragment(
         **{
             f"device.compute.derate.{f}": found[f] / peaks[f"device.compute.{peak}"]
             for f, peak in FORMATS.items()
+            if f in found
         },
         "device.memory.bandwidth_curve": curve,
         "device.memory.derate": curve[-1][1]
@@ -296,6 +334,7 @@ def main(argv: list[str] | None = None) -> int:
     import torch
 
     from atom.compass.artifacts.provenance import git_tree_root
+    from atom.compass.drive.identity import _stack
 
     spec_path, out = (Path(a) for a in (argv or sys.argv[1:]))
     spec = MachineSpec.from_mapping(json.loads(spec_path.read_text()))
@@ -305,10 +344,13 @@ def main(argv: list[str] | None = None) -> int:
         f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"
         for p in props
     ]
-    record = {"cards": cards(bdfs), "arch": props[0].gcnArchName}
+    record = {"cards": cards(bdfs), "arch": props[0].gcnArchName, "stack": _stack()}
     refuse_unfit(record["cards"], ptl)
-    record |= probe(torch)
-    record |= {"torch": torch.__version__, "source": Path(__file__).read_text()}
+    stated = [
+        f for f, peak in FORMATS.items() if f"device.compute.{peak}" in spec.values
+    ]
+    record |= probe(torch, stated)
+    record["source"] = Path(__file__).read_text()
     out.write_text(json.dumps(record) + "\n")
     root = git_tree_root("atom", str(ROOT))
     subject = {"source_root": f"{root.revision_kind}:{root.revision}"}

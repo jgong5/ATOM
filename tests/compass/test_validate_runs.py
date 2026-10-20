@@ -651,6 +651,26 @@ def test_a_client_run_whose_export_names_no_arguments_given_is_refused(tmp_path)
         grade(real, simulated)
 
 
+def test_a_client_run_whose_export_lists_unnamed_requests_is_refused_naming_them(
+    tmp_path,
+):
+    *real, simulated = (_recorded(c) for c in _four(tmp_path))
+    report = grade(real, simulated)
+
+    def unnamed(ids):
+        export = json.loads((real[1] / CLIENT_RUN).read_text())
+        rows = [{"x_request_id": i, "phase": "profiling", "trace": "t"} for i in ids]
+        (real[1] / CLIENT_RUN).write_text(json.dumps(export | {"unnamed": rows}))
+
+    # `report` read exports with no `unnamed`; one listing none grades the same.
+    unnamed([])
+    assert grade(real, simulated) == report
+    unnamed(["x-1", "x-2"])
+    why = "its export lists requests no step can be matched to: ['x-1', 'x-2']"
+    with pytest.raises(ValueError, match=f"r1 is not graded: {re.escape(why)}$"):
+        grade(real, simulated)
+
+
 def _ran(monkeypatch, tmp_path, served, assumed=None):
     """Three real cells, and a simulated one whose run.json `compass run`
     wrote once its server, serving until stopped, served one client run per
@@ -683,6 +703,17 @@ def test_a_stop_during_the_first_client_run_refuses_it(monkeypatch, tmp_path):
 
     unknown = "its first client run has no summary, so its refusals are unknown"
     with pytest.raises(ValueError, match=f"sim is not graded: {unknown}$"):
+        grade(real, simulated)
+
+
+def test_a_client_run_that_sent_nothing_before_the_graded_one_refuses_it(
+    monkeypatch, tmp_path
+):
+    empty = ([], {"steps": 0, "seconds": 0.0, "treatments": collections.Counter()}, [])
+    real, simulated = _ran(monkeypatch, tmp_path, [empty, CLIENT_RUNS[1]])
+
+    nothing = "its first client run priced no step, so it is not the graded one"
+    with pytest.raises(ValueError, match=f"sim is not graded: {nothing}$"):
         grade(real, simulated)
 
 

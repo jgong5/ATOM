@@ -32,7 +32,6 @@ from test_vertical_slice import (
     WALL_S,
     Traffic,
     UnansweredRequests,
-    _free_port,
     _run_file,
 )
 
@@ -40,6 +39,7 @@ from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
 from atom.compass.clock import NER, LpId
 from atom.compass.detect.scenario import check_run
+from atom.compass.drive.serve import _free_ports
 from atom.compass.parity import read
 from atom.compass.runner.overrides import start_on_host
 from atom.utils import CpuGpuBuffer, clock
@@ -125,14 +125,15 @@ def run_dp_slice(
     `width` is the server's parallelism flags, `dp` the DP ranks and `pp` the
     pipeline stages they start; a pipeline keeps no parity record."""
     out.mkdir()
+    clock_port, port = _free_ports(2)
     run_file = _run_file(
         out,
+        clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
         data_parallel_size=dp,
         pipeline_parallel_size=pp,
         step_stub=CONSTANT,
         machine=machine,
     )
-    port = _free_port()
     env = dict(
         os.environ,
         PYTHONHASHSEED=seed,

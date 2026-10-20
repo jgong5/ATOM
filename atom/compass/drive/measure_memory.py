@@ -5,8 +5,10 @@ its configuration's `memory_readings` entry.
     compass measure memory --gpu G --machine M --store S --out D -- <ATOM args>
 
 ATOM's engine starts from ATOM's arguments (`EngineArgs`) on the GPUs `--gpu`
-names, through `MemoryReadingModelRunner`, and stops once it has started: its
-weights loaded, its one warmup run, its KV cache sized and its graphs captured. `gpu.quiet` checks those GPUs before the
+names, through `MemoryReadingModelRunner` (under `--enable-rapidserve` its
+RapidServe form, whose prefill engine writes the readings), and stops once it
+has started: its weights loaded, its one warmup run, its KV cache sized and its
+graphs captured. `gpu.quiet` checks those GPUs before the
 start and after it. Each rank writes its readings and the key it read off its
 resolved config, and the ranks must agree on the key. The entry's key is that
 one with the digest of the machine spec `--machine` names; its conditions are
@@ -22,8 +24,8 @@ to the engine's rule.
 Each start takes a free `ATOM_DP_MASTER_PORT`, which keys ATOM's compiled-graph
 cache, as a parity run's server does. A start in which inductor autotuned a
 kernel or missed an FX graph moves its files to `<out>.cold` and starts once
-more, on the cache it warmed: the configs autotuning tried stay loaded and
-read in `non_torch`. A second such start refuses.
+more, on the cache it warmed: what autotuning or a fresh compile left loaded
+reads in `non_torch`. A second such start refuses.
 
 ``--out`` gets the engine's log, run.json's identity from the rank-0 engine
 file, and ``memory_readings.json``, the entry's readable copy. ATOM's
@@ -66,6 +68,9 @@ OUT_ENV = "ATOM_COMPASS_MEMORY_OUT"
 #: The command `--beside` names, which the start runs before the engine.
 BESIDE_ENV = "ATOM_COMPASS_MEMORY_BESIDE"
 RUNNER = "atom.compass.drive.memory_runner.MemoryReadingModelRunner"
+RAPIDSERVE_RUNNER = (
+    "atom.compass.drive.rapidserve_memory_runner.MemoryReadingRapidServeModelRunner"
+)
 #: ATOM's dummy weights flag; its parser reads `_` in a flag as `-`.
 LOAD_DUMMY = "--load-dummy"
 START_TIMEOUT_S = 3600
@@ -85,7 +90,8 @@ def start(argv: list[str]) -> None:
     EngineArgs.add_cli_args(parser)
     args = EngineArgs.from_cli_args(parser.parse_args(argv))
     kwargs = args._get_engine_kwargs()
-    LLMEngine(args.model, runner_qualname=RUNNER, **kwargs).close()
+    runner = RAPIDSERVE_RUNNER if args.enable_rapidserve else RUNNER
+    LLMEngine(args.model, runner_qualname=runner, **kwargs).close()
 
 
 def main(argv: list[str], again: bool = False) -> None:
@@ -166,8 +172,8 @@ def main(argv: list[str], again: bool = False) -> None:
                 f"{', '.join(missed)} missed inductor caches again on a second start; "
                 "non_torch on a cold inductor cache reads high, so nothing is published"
             )
-        # The configs inductor's autotuning tried stay loaded and read in
-        # `non_torch`; the next start finds their best configs cached.
+        # What autotuning or a fresh compile left loaded reads in `non_torch`;
+        # the next start finds both cached.
         out.rename(f"{out}.cold")
         return main(argv, again=True)
     first = json.loads(min((out / READINGS).iterdir()).read_text())

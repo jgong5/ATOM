@@ -38,6 +38,7 @@ from atom.compass.clock import LpId
 from atom.compass.clock_transport import connect
 from atom.compass.detect.determinism import CONFIGURATION_PREFIX
 from atom.compass.detect.scenario import check_run
+from atom.compass.drive.serve import _free_ports
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
 
@@ -221,8 +222,9 @@ def _run_file(out: Path, **overrides) -> Path:
 def run_slice(out: Path, seed: str) -> dict:
     """One run in its own process tree; its step table, summary and request times."""
     out.mkdir()
-    run_file = _run_file(out, step_stub=CONSTANT)
-    port = _free_port()
+    clock_port, port = _free_ports(2)
+    endpoint = f"tcp://127.0.0.1:{clock_port}"
+    run_file = _run_file(out, clock_endpoint=endpoint, step_stub=CONSTANT)
     env = dict(
         os.environ,
         PYTHONHASHSEED=seed,

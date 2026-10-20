@@ -6,9 +6,12 @@
 A step runs at one shape (`step_shape`): a decode step at the CUDA-graph rung
 it replayed, or at its width when it replayed none or the backend prices real
 rows (``padded=False``, the run file's ``padding: none``), and any other step
-as a prefill of its query tokens over its rows. `graph(phase, tokens, seqs)`
-gives the region of the `op_graph` captured at that shape, as
-`capture.graph.to_json` writes it, or None when there is none.
+as a prefill of its query tokens over its rows. `graph(phase, tokens, seqs,
+output)` gives the region of the `op_graph` captured at that shape, as
+`capture.graph.to_json` writes it, or None when there is none. `output` is
+whether the step samples, as ATOM's `ScheduledBatch.produces_output` says: a
+step with a decode row does, and a prefill step when the view says so, which
+it does when any row is a final chunk.
 
 Each leaf is one pricing unit, `max(t0, F / peak, M / BW(M), t_comm)` over its
 work (`op_work.work`): its own tensors at the captured shape, the state it
@@ -27,11 +30,12 @@ neither from a datasheet nor probed, and `analytical` otherwise.
 
 Refused: a step with image tokens, since no graph holds the vision encoder; a
 two-batch-overlap step, since no graph holds a micro-batch or the MoE
-exchanges its comm stream carries; a data-parallel step (`moe_rows`), since
-capture runs one rank; a speculative decode step; a shape with no
-graph; and, each reason once, a leaf whose kind has no extractor, whose price
-reads a spec field the spec lacks, or whose collective leaves the scale-up
-domain.
+exchanges its comm stream carries; a speculative decode step; a prefill step
+whose view does not say whether it produces output; a shape with no graph;
+and, each reason once, a data-parallel step's (`moe_rows`) MoE
+exchange leaf, since capture runs one rank and its peers at this rank's rows,
+and a leaf whose kind has no extractor, whose price reads a spec field the
+spec lacks, or whose collective leaves the scale-up domain.
 """
 
 from __future__ import annotations
@@ -48,6 +52,9 @@ from atom.compass.backends.step_roofline import _reads
 from atom.compass.backends.work import Work, bounds
 
 SOURCE = "op-graph"
+#: The leaves a captured MoE layer exchanges its DP or EP group's rows by:
+#: ATOM's gathers and scatters, and MORI's dispatch and combine.
+MOE_EXCHANGES = ("atom.model_ops.moe:", "mori.ops.dispatch_combine:")
 NONE = "; no successor: the analytical law is the last op-level source"
 
 
@@ -94,7 +101,7 @@ class OpGraphBackend(CostBackend):
         return Granularity.OP
 
     def price(self, batch_view: BatchView) -> StepCost:
-        shape, region = self._region(batch_view)
+        at, region = self._region(batch_view)
         refused: list[Refusal] = []
         priced = self._priced(region, batch_view, refused)
         if refused:
@@ -104,12 +111,11 @@ class OpGraphBackend(CostBackend):
         for name, s, notes, _ in priced:
             seconds.setdefault(name, []).append(s)
             stated.setdefault(name, []).extend(notes)
-        at = "{} T={} B={}".format(*shape)
         terms = []
         for name, values in seconds.items():
             note = "; ".join(dict.fromkeys(stated[name]))
             method = Method.DECLARED if note else Method.ANALYTICAL
-            detail = f"{len(values)} prices of the {at} graph"
+            detail = f"{len(values)} prices of the graph at {at}"
             provenance = Provenance(method, detail, SOURCE, note=note and note + NONE)
             terms.append(CostTerm(name, fold_seconds(values), provenance))
         return StepCost(terms)
@@ -118,20 +124,14 @@ class OpGraphBackend(CostBackend):
         rows = "the rows a graph pads to" if self.padded else "real rows"
         return f"op graph at TP {self.tp}, one roofline per leaf, at {rows}"
 
-    def _region(self, view: BatchView) -> tuple[tuple[str, int, int], dict]:
-        """The step's shape and the region captured at it."""
+    def _region(self, view: BatchView) -> tuple[str, dict]:
+        """The graph the step reads, by its shape and output, and its region."""
         if view.image_tokens:
             reason = IMAGES.format(view.image_tokens)
         elif view.tbo_tokens is not None:
             reason = (
                 "a two-batch-overlap step: no captured graph holds a micro-batch, "
                 "nor the MoE exchanges its comm stream carries"
-            )
-        elif view.moe_rows is not None:
-            reason = (
-                f"a data-parallel step whose MoE gathers {view.moe_rows} rows: "
-                "capture runs one rank, so no graph holds the gather, the "
-                "reduce-scatter or the experts at the group's rows"
             )
         else:
             try:
@@ -141,13 +141,21 @@ class OpGraphBackend(CostBackend):
             except ValueError as exc:
                 reason = f"a step that {exc}"
             else:
-                region = self.graph(*shape)
-                if region is not None:
-                    return shape, region
-                reason = (
-                    "no op_graph holds a {} step of {} tokens over {} sequences; "
-                    "compass trace ops captures one".format(*shape)
-                )
+                output = any(d for _, d in rows) or view.produces_output
+                none = "" if output else " that produces no output"
+                if output is None:
+                    reason = (
+                        "a prefill step whose view does not say whether it "
+                        "produces output, so whether it runs the LM head and the "
+                        "sampler"
+                    )
+                elif (region := self.graph(*shape, output)) is not None:
+                    return "{} T={} B={}".format(*shape) + none, region
+                else:
+                    reason = (
+                        "no op_graph holds a {} step of {} tokens over {} sequences"
+                        "{}; compass trace ops captures one".format(*shape, none)
+                    )
         raise CostRefused(view, [Refusal(SOURCE, reason)])
 
     def _priced(self, region: dict, view: BatchView, refused: list) -> list:
@@ -178,6 +186,15 @@ class OpGraphBackend(CostBackend):
     def _leaf(self, leaf: dict, view: BatchView, refused: list):
         """One leaf's ``(seconds, stated, work)``; None when it launches no
         kernel or refuses."""
+        if view.moe_rows is not None and leaf["op"].startswith(MOE_EXCHANGES):
+            reason = (
+                f"a data-parallel step whose MoE gathers {view.moe_rows} rows: "
+                "capture runs one rank, so its graph holds the gather, the "
+                "reduce-scatter and the experts at every peer scheduling this "
+                "rank's rows"
+            )
+            refused.append(Refusal(SOURCE, reason))
+            return None
         try:
             w = work(leaf, view, self.tp, self.kv)
         except CostRefused as exc:
