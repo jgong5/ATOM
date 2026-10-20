@@ -355,7 +355,8 @@ class Stub:
     """The model's forward in ATOM's runner, and the leaves timed beside it.
 
     Each call ATOM makes of the model snapshots the forward context ATOM built
-    and the live metadata each leaf names, and returns zero hidden states.
+    and the live metadata each leaf names, and returns zero hidden states, of
+    the residual's width where the model widens it.
     """
 
     def __init__(self, runner, llc: int) -> None:
@@ -403,9 +404,12 @@ class Stub:
         snap.attn_metadata = _deep(fc.attn_metadata, memo, self.clones)
         snap.context = _deep(fc.context, memo, self.clones)
         self.placed.append((snap, meta))
-        hidden = self.runner.config.hf_config.get_text_config().hidden_size
+        n = len(input_ids)
+        text = self.runner.config.hf_config.get_text_config()
+        # a widened residual (DeepSeek-V4's mHC) reaches the LM head widened
+        wide = (n, text.hc_mult) if hasattr(text, "hc_mult") else (n,)
         dtype = self.runner.config.torch_dtype
-        return input_ids.new_zeros((len(input_ids), hidden), dtype=dtype)
+        return input_ids.new_zeros((*wide, text.hidden_size), dtype=dtype)
 
     def point(self, rule, shape, context, found) -> list[dict]:
         """Each leaf of `found` timed at `shape` on `point_rows`."""
