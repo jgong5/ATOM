@@ -24,6 +24,12 @@ Triton loads an autotuned kernel's choice for a shape an earlier server of the
 same ``TRITON_CACHE_DIR`` tuned; a shape the cache lacks still tunes on its
 first launch, inside the record.
 
+run.json's ``aiter_jit_builds`` names each aiter JIT module built, or begun,
+since serve wrote ``server.json``, when ``/health`` first answered
+(`aiter_jit`): a step may have waited on its build, so grading, `compass fit
+steps`, `compass fit host`, `step_linear_fit` and `validate.cost` refuse the
+record. A server that built none leaves no entry.
+
 `--profile-ops` and `--profile-steps A:B`, the op-level half's profiled pass,
 refuse; so does ATOM's ``--load_dummy``: a record times real weights, and MoE
 routing follows them.
@@ -37,7 +43,7 @@ from pathlib import Path
 from atom.compass.backends.step_grid_plan import TARGET
 from atom.compass.backends.step_labels import label, write_table
 from atom.compass.cli import OPS
-from atom.compass.drive import serve
+from atom.compass.drive import aiter_jit, serve
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.compass.run import _write_whole
 
@@ -65,7 +71,11 @@ def main(argv: list[str]) -> None:
     env = {AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1")}
     serve.serve(atom_args, args.out, args.gpu, extra_env=env, host=args.host)
     run_json = Path(args.out) / serve.RUN_JSON
-    run = {**json.loads(run_json.read_text()), "env": env}
+    # serve writes server.json when /health first answers, so its mtime is
+    # when serving began; a server that never answered served nothing.
+    ready = Path(args.out) / serve.READY_FILE
+    builds = aiter_jit.builds_since(ready.stat().st_mtime_ns) if ready.exists() else {}
+    run = {**json.loads(run_json.read_text()), "env": env, **builds}
     _write_whole(run_json, json.dumps(run))
     write_engine_and_costs(args.out)
 

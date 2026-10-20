@@ -187,7 +187,15 @@ def rows(cell) -> list[tuple]:
             f"{cell} holds {[s.name for s in simulated]} of step_linear/ and "
             "step_grid/; a cell holds one simulated run"
         )
+    if len(real) < 2:
+        raise ValueError(
+            f"{cell} holds {len(real)} of real*/; a cell holds two or more real runs"
+        )
     (sim,) = simulated
+    if bare := [r.name for r in (*real, sim) if not (r / "run.json").is_file()]:
+        raise ValueError(
+            f"{cell}'s {bare} hold no run.json; every run of a cell holds one"
+        )
     run = {r.name: json.loads((r / "run.json").read_text()) for r in (*real, sim)}
     for name, f in run.items():
         refuse_renamed_keys(f, cell / name / "run.json")
@@ -217,4 +225,7 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as refused:  # a refusal: its reason, exit 1, no traceback
+        raise SystemExit(str(refused)) from refused

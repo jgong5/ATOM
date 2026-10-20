@@ -27,18 +27,22 @@ then be cold; when no step before its own first holds a request the export
 names as the warmup's, since its graded steps may then precede it; when any
 step from its own first on, its own or not, holds such a request, since its
 warmup has then not ended when it starts; when its export lacks traces or
-arguments; and when its export lists `unnamed` requests, naming each by its
-`x_request_id`, since no step can be matched to them. A simulated run, whose
-run.json holds `run_file`, is also refused when it skips host segments, or its
-run file has no host laws and so prices no host time; when the step roofline
-was on in a run of another backend than the step grid, which always prices
-below it; when its first client run refused anything, or has no summary to
-say, or priced no step, since the graded client run then came later; when it
-ran the step grid without a coverage check; when its backend's fit inputs
-were profiled or served a trace it served; and when its engines read an
-assumed `memory_readings` member, naming each assumption its `provenance`
-lists, since its KV blocks rest on readings no start took. The step grid's plan, an input of `source` `plan`, is not one: it placed the points
-from shapes alone, so it may have read any trace, a graded one included.
+arguments; when its export lists `unnamed` requests, naming each by its
+`x_request_id`, since no step can be matched to them; and when its run.json
+names `aiter_jit_builds`, the aiter JIT modules its server built or began while
+it served, since a step may have waited on a build (`compass record` and a real
+`cctraces_sim.sh` cell write it). A simulated run, whose run.json holds
+`run_file`, is also refused when it skips host segments, or its run file has no
+host laws and so prices no host time; when the step roofline was on in a run of
+another backend than the step grid, which always prices below it; when its
+first client run refused anything, or has no summary to say, or priced no step,
+since the graded client run then came later; when it ran the step grid without
+a coverage check; when its backend's fit inputs were profiled or served a trace
+it served; and when its engines read an assumed `memory_readings` member,
+naming each assumption its `provenance` lists, since its KV blocks rest on
+readings no start took. The step grid's plan, an input of `source` `plan`, is
+not one: it placed the points from shapes alone, so it may have read any trace,
+a graded one included.
 Beside the table, the command states how many of that client run's steps its
 backend extrapolated and a fallback below it priced.
 
@@ -83,6 +87,7 @@ from pathlib import Path
 
 from scipy.stats import ks_2samp
 
+from atom.compass.drive import aiter_jit
 from atom.compass.parity.served import served
 from atom.compass.run import (
     CLIENT_DIR,
@@ -232,6 +237,8 @@ def _client_run(cell, run) -> tuple[list[dict], list[str], dict]:
         why.append("its export names no arguments its client was given")
     if unnamed := [u["x_request_id"] for u in export.get("unnamed") or ()]:
         why.append(f"its export lists requests no step can be matched to: {unnamed}")
+    if built := aiter_jit.refusal(run):
+        why.append(built)
     if "run_file" in run:
         why += _not_graded(run, traces)
     if why:
@@ -358,7 +365,8 @@ def _grade(family, name, real, simulated, d=None) -> dict:
 def grade(real_cells, simulated_cell) -> dict:
     """Every metric's grade: {family: {metric: grade}}, as the module says."""
     if len(real_cells) < 2:
-        raise ValueError("a real spread needs two or more real runs")
+        names = [str(c) for c in real_cells]
+        raise ValueError(f"{names}: a real spread needs two or more real runs")
     _refuse_by_run_file(simulated_cell)
     real = [_read(c) for c in real_cells]
     simulated = _read(simulated_cell)
@@ -436,4 +444,7 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as refused:  # a refusal: its reason, exit 1, no traceback
+        raise SystemExit(str(refused)) from refused

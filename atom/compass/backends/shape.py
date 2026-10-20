@@ -172,7 +172,7 @@ def sum_context(rows: Sequence[RequestShape]) -> int:
 
 
 #: The refusal of a backend with no vision encoder in what it prices from.
-IMAGES = "{} image tokens, and no vision encoder in what this prices from"
+IMAGES = "a step with image tokens, and no vision encoder in what this prices from"
 
 
 @dataclass(frozen=True)

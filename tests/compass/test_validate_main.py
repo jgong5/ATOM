@@ -9,6 +9,8 @@ price; the export and the server log are as `test_validate_runs` and
 """
 
 import json
+import subprocess
+import sys
 
 import pytest
 from test_memory_check import GIB, _log
@@ -247,6 +249,33 @@ def test_a_cell_of_renamed_names_is_refused_naming_their_names_now(capsys, tmp_p
     (cell / "step_linear").rename(cell / "law")
     with pytest.raises(ValueError, match="now named step_linear/"):
         main([str(cell)])
+
+
+def test_a_cell_of_one_real_run_refuses_naming_it_and_the_count(tmp_path):
+    cell = tmp_path / "c4"
+    _run(cell / "real0", [(100, 1000, 100)], refusals=None)
+    _run(cell / "step_linear", [(100, 1000, 120.0)])
+
+    validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
+    done = subprocess.run(validate, capture_output=True, text=True, check=False)
+
+    refusal = f"{cell} holds 1 of real*/; a cell holds two or more real runs\n"
+    assert (done.returncode, done.stderr) == (1, refusal)
+
+
+@pytest.mark.parametrize("bare", ["real1", "step_linear"])
+def test_a_run_without_run_json_refuses_naming_it(tmp_path, bare):
+    cell = tmp_path / "c4"
+    for name in ("real0", "real1"):
+        _run(cell / name, [(100, 1000, 100)], refusals=None)
+    _run(cell / "step_linear", [(100, 1000, 120.0)])
+    (cell / bare / "run.json").unlink()  # a run still recording has written none
+
+    validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
+    done = subprocess.run(validate, capture_output=True, text=True, check=False)
+
+    refusal = f"{cell}'s ['{bare}'] hold no run.json; every run of a cell holds one\n"
+    assert (done.returncode, done.stderr) == (1, refusal)
 
 
 def _as_recorded(cell, warmup=()):
