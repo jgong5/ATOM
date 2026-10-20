@@ -7,13 +7,21 @@ from pathlib import Path
 
 def read_json(path):
     """The JSON document in the file at `path`."""
-    return _parsed(Path(path).read_text(), path)
+    return _parsed(_text(path), path)
 
 
 def read_jsonl(path) -> list:
     """The JSON document on each line of the file at `path`."""
-    lines = Path(path).read_text().splitlines()
+    lines = _text(path).splitlines()
     return [_parsed(text, path, n) for n, text in enumerate(lines)]
+
+
+def _text(path) -> str:
+    """The file at `path` decoded, refused naming it when its bytes do not decode."""
+    try:
+        return Path(path).read_text()
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{path} is not JSON: {error}") from error
 
 
 def _parsed(text: str, path, before: int = 0):

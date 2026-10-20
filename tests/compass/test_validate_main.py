@@ -304,6 +304,29 @@ def test_a_malformed_run_json_refuses_naming_it(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "command, runs, name",
+    [
+        ("atom.compass.validate", ["c4"], "real1/run.json"),
+        ("atom.compass.validate", ["c4"], "real1/steps/dp0.jsonl"),
+        (
+            "atom.compass.validate.runs",
+            ["c4/step_linear", "c4/real0", "c4/real1"],
+            "real1/run.json",
+        ),
+    ],
+)
+def test_an_input_that_is_not_utf8_refuses_naming_it(tmp_path, command, runs, name):
+    path = _cell(tmp_path / "c4") / name
+    path.write_bytes(b"\xff" + path.read_bytes())
+
+    argv = [sys.executable, "-m", command, *(str(tmp_path / r) for r in runs)]
+    done = subprocess.run(argv, capture_output=True, text=True, check=False)
+
+    what = "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"
+    assert (done.returncode, done.stderr) == (1, f"{path} is not JSON: {what}\n")
+
+
+@pytest.mark.parametrize(
     "malformed",
     [
         "real1/steps/dp0.jsonl",
