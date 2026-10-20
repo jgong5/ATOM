@@ -172,9 +172,10 @@ A server builds an aiter kernel the first time it meets a variant its image did
 not prebuild, such as `mha_varlen_fwd`'s for a prefill step of one new token a
 row, about 60 s inside the run, and the container keeps it for every later
 server. A record whose server built one names it in run.json's
-`aiter_jit_builds`, and grading refuses that record. This record takes those
-builds; nothing reads it. `smoke_cell.sh` serves the same record before its
-calibration, so a container it ran in is warm. Success: `serve` returns 0.
+`aiter_jit_builds`, and grading, the fits and `validate.cost` refuse that
+record. This record takes those builds; nothing reads it. `smoke_cell.sh`
+serves the same record before its calibration, so a container it ran in is
+warm. Success: `serve` returns 0.
 
 **1. Memory readings** (GPU, 2 to 3 min).
 
