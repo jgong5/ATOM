@@ -9,6 +9,8 @@ price; the export and the server log are as `test_validate_runs` and
 """
 
 import json
+import re
+import runpy
 import subprocess
 import sys
 
@@ -17,7 +19,10 @@ from test_memory_check import GIB, _log
 from test_validate_cost import LAW, _record, _steps
 from test_validate_runs import ARGUMENTS, EXPORT
 
+from atom.compass import parity
+from atom.compass.backends import json_file, step_labels
 from atom.compass.backends.cost import GROUPS
+from atom.compass.memory.check import parts
 from atom.compass.run import LP_FILE
 from atom.compass.validate.__main__ import main
 from atom.compass.validate.runs import CLIENT_RUN
@@ -276,6 +281,79 @@ def test_a_run_without_run_json_refuses_naming_it(tmp_path, bare):
 
     refusal = f"{cell}'s ['{bare}'] hold no run.json; every run of a cell holds one\n"
     assert (done.returncode, done.stderr) == (1, refusal)
+
+
+def _cell(cell):
+    """`cell`, of real0/, real1/ and step_linear/."""
+    for name in ("real0", "real1"):
+        _run(cell / name, [(100, 1000, 100)], refusals=None)
+    _run(cell / "step_linear", [(100, 1000, 120.0)])
+    return cell
+
+
+def test_a_malformed_run_json_refuses_naming_it(tmp_path):
+    cell = _cell(tmp_path / "c4")
+    (cell / "real1/run.json").write_text("{")
+
+    validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
+    done = subprocess.run(validate, capture_output=True, text=True, check=False)
+
+    what = "Expecting property name enclosed in double quotes: line 1 column 2"
+    refusal = f"{cell}/real1/run.json is not JSON: {what}\n"
+    assert (done.returncode, done.stderr) == (1, refusal)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "real1/steps/dp0.jsonl",
+        "real1/artifacts/profile_export.jsonl",
+        "real1/artifacts/profile_export_aiperf.json",
+        "step_linear/summary.json",
+        f"step_linear/{LP_FILE.format('engine')}",
+    ],
+)
+def test_a_malformed_input_refuses_naming_its_path(tmp_path, malformed):
+    path = _cell(tmp_path / "c4") / malformed
+    path.write_text(path.read_text()[:-3])  # its last line cut
+
+    with pytest.raises(ValueError, match=f"^{re.escape(str(path))} is not JSON: "):
+        main([str(tmp_path / "c4")])
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [step_labels.label, lambda p: parity.read(p.parent), lambda p: parts(p, p)],
+)
+def test_the_readers_it_reaches_refuse_a_malformed_file_naming_it(tmp_path, reader):
+    path = tmp_path / "dp0.jsonl"
+    path.write_text('{"step": 0}\n{"step"\n')
+
+    named = f"^{re.escape(str(path))} is not JSON: .*: line 2 "
+    with pytest.raises(ValueError, match=named):
+        reader(path)
+
+
+@pytest.mark.parametrize(
+    "command, runs",
+    [
+        ("atom.compass.validate.__main__", ["c4"]),
+        ("atom.compass.validate.runs", ["c4/step_linear", "c4/real0", "c4/real1"]),
+    ],
+)
+def test_a_json_error_no_reader_names_keeps_its_traceback(
+    tmp_path, monkeypatch, command, runs
+):
+    _cell(tmp_path / "c4")
+
+    def read_json(path):
+        raise json.JSONDecodeError("planted", "{", 1)
+
+    monkeypatch.setattr(json_file, "read_json", read_json)
+    monkeypatch.delitem(sys.modules, command)  # run fresh, on the planted reader
+    monkeypatch.setattr(sys, "argv", [command, *(str(tmp_path / r) for r in runs)])
+    with pytest.raises(json.JSONDecodeError, match="^planted"):
+        runpy.run_module(command, run_name="__main__")
 
 
 def _as_recorded(cell, warmup=()):

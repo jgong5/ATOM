@@ -52,6 +52,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
+from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.shape import BatchView, RequestShape
 
 #: Token copy wait exits whose tightest bound is a step's host clock lead.
@@ -154,7 +155,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
     default.
     """
     path = Path(record)
-    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    lines = read_jsonl(path)
     steps = [s for s in lines if not s["is_dummy_run"]]
     if not steps or "t_enter_ns" not in steps[0]:
         raise ValueError(
@@ -168,7 +169,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
     exposed = _launch_exposed(lines)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
-    config = json.loads(key.read_text()) if key.exists() else None
+    config = read_json(key) if key.exists() else None
     run = run or digest(record)
     samples, table, prev = [], [], None
     for s in lines:

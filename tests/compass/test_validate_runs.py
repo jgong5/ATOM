@@ -174,6 +174,17 @@ def test_the_command_refuses_one_real_run_naming_it(tmp_path):
     assert (done.returncode, done.stderr) == (1, refusal)
 
 
+def test_the_command_refuses_a_malformed_run_json_naming_it(tmp_path):
+    cells = [_cell(tmp_path / c, _schedule(), {}) for c in ("sim", "real0", "real1")]
+    (cells[2] / "run.json").write_text("{")
+    runs = [sys.executable, "-m", "atom.compass.validate.runs", *map(str, cells)]
+    done = subprocess.run(runs, capture_output=True, text=True, check=False)
+
+    what = "Expecting property name enclosed in double quotes: line 1 column 2"
+    refusal = f"{cells[2]}/run.json is not JSON: {what}\n"
+    assert (done.returncode, done.stderr) == (1, refusal)
+
+
 def test_prefill_tokens_grade_the_requests_both_runs_issued(tmp_path):
     def run(name, ids, hit=0, extra=False):
         """Requests of 100 and 50 prompt tokens, `hit` of the second cached;

@@ -23,10 +23,10 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
-import json
 import re
 from pathlib import Path
 
+from atom.compass.backends.json_file import read_json
 from atom.compass.backends.provenance import Method
 from atom.compass.memory import graph_pool
 from atom.compass.memory.budget import SUBTRACTED
@@ -135,7 +135,7 @@ def recorded(log: Path) -> tuple[Recorded, Term | None]:
 
 def parts(predicted_file: Path, log: Path) -> list:
     """The per-term comparison, the predicted readings, and the graph pool's."""
-    if not (saved := json.loads(predicted_file.read_text()).get("memory")):
+    if not (saved := read_json(predicted_file).get("memory")):
         what = f"{predicted_file} has no memory section"
         raise MemoryRefusal(what, "pass an engine's hand-in, lp-engine*.json")
     readings = {name: _reading(name, rows) for name, rows in saved["readings"].items()}
