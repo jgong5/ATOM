@@ -477,7 +477,7 @@ def test_coverage_counts_apart_the_prefill_steps_cached_past_the_top_c_node(
     directory = record(tmp_path, monkeypatch, 2040, budget=48)
     planned = plan(directory)
     last = f"{directory} dp0 step 42"
-    reason = "c=2016 is outside the prefill output grid's nodes 0..2000"
+    reason = "c is above the prefill output grid's nodes 0..2000"
     assert planned["bounds"]["max_num_batched_tokens"] == 48
     assert planned["unplaced"] == [{"step": last, "reason": reason}]
 
