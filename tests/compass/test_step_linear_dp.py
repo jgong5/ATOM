@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """The step linear law under DP-attention with EP off: one law per rank, priced at
-the deployment's DP width, the group's step the max over its ranks.
+the deployment's DP width, the group's step the max over its ranks. The checked-in
+DeepSeek-V4-Pro EP8 laws install at their own side's engine config only.
 
 Each rank's record is written from a known per-rank law, every line labelled
 with the group's step, the max over the ranks' prices, as a real DP group's
@@ -9,12 +10,18 @@ ranks each measure it. The fitted law is read by `StepLinearLaw` and priced by
 """
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from test_backend_step_linear import _installed, law
+from test_backend_step_linear import _installed, _without_step_stub, law
 from test_backend_step_linear_fit import SPEC, _engine_file, _fit, _record
+from test_memory_readings import META_8B, publish_readings
+from test_run_step_grid import deployment
 
+from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
+from atom.compass import run as compass_run
 from atom.compass.backends import (
     BatchView,
     CostRefused,
@@ -22,6 +29,7 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
+from atom.compass.backends.step_linear import UNIFORM_ROUTING
 
 DP = 4
 PREFILL = {
@@ -204,3 +212,47 @@ def test_a_stated_engine_file_contradicting_the_records_own_refuses(tmp_path):
     with pytest.raises(ValueError, match=r"contradicts .* in \['data_parallel_size'\]"):
         main([*map(str, records), *out, "--engine", str(stated)])
     assert not (tmp_path / "law.json").exists()
+
+
+COMPASS = Path(__file__).resolve().parents[2] / "scripts" / "compass"
+GPU45 = json.loads((COMPASS / "machines" / "mi355x-gpu45.json").read_text())
+
+
+@pytest.mark.parametrize("side", ["prefill", "decode"])
+def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
+    monkeypatch, tmp_path, side
+):
+    name = f"deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{side}.json"
+    fitted = json.loads((COMPASS / "laws" / name).read_text())
+    engine = fitted["engine_config"]
+    for key in PERFORMANCE_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    for key, value in engine["env"].items():
+        monkeypatch.setenv(key, value)
+    run = _without_step_stub(tmp_path, step_linear=fitted, machine=GPU45)
+    monkeypatch.setenv(compass_run.ENV, str(run))
+
+    def installed(ep):
+        r = deployment(
+            tmp_path,
+            **{k: engine[k] for k in ("kv_cache_block_size", "kv_cache_dtype")},
+            quant_config=SimpleNamespace(compute_hash=lambda: engine["quantization"]),
+            parallel_config=SimpleNamespace(
+                data_parallel_size=8, data_parallel_rank=0, pipeline_parallel_rank=0
+            ),
+            capture_sizes=engine["ladder"],
+            max_num_seqs=512,
+            max_num_batched_tokens=16384,
+            enable_dp_attention=True,
+            enable_expert_parallel=ep,
+            enable_tbo=engine["enable_tbo"],
+        )
+        publish_readings(tmp_path / "store", r.config, GPU45)
+        compass_run.runner(r, META_8B)
+        return r.compass_backend
+
+    assert installed(True).treatments == (UNIFORM_ROUTING,)
+    with pytest.raises(
+        ValueError, match="enable_expert_parallel True in the law and False here"
+    ):
+        installed(False)

@@ -656,6 +656,13 @@ cells, so each carries a held-out hull. Their host keys carry the `atom`
 digest of the tree they were last re-keyed at; `provenance` names the
 capture tree's.
 
+`scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json`
+are the same pair with expert parallelism on (MORI): the `history` form, fitted by
+`compass fit steps` and `compass fit host` on each side's cells at concurrency 1, 4, 16,
+64 and 256, captured on mi355-gpu-40 at ATOM 78f8c0adf, which shares
+`mi355x-gpu45.json`'s device, stack and PTL state ([#1526](https://github.com/jgong5/ATOM/issues/1526)).
+Each decode rung sits in one cell, so only prefill carries a held-out hull. Host keys as above.
+
 ## Cost accuracy on a real run's own steps — `validate.cost`
 
 `PYTHONPATH=$T python -m atom.compass.validate.cost RECORD LAW` prices each step of a real
