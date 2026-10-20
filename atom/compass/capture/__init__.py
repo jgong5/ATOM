@@ -9,12 +9,15 @@ A shape is a decode width (`--width`), a prefill of T tokens over B sequences
 (`--prefill`), or every shape the steps of a record directory hold
 (`--population`): a decode step at its CUDA-graph rung when it ran at one, else
 at its width, and any other step as a prefill of its query tokens over its
-rows. Each is traced at that concrete shape (`forward`), decoder layers folded
+rows, and under DP the rows the step's MoE gathered over the group, its line's
+`moe_rows`. Each is traced at that concrete shape (`forward`), decoder layers folded
 into `Repeat` and forked streams into `Par` (`graph`).
 
 An `op_graph` is keyed by structure (`forward.structure`: the model's
 architecture and config.json digest, `--arch`, the TP width, the DP and EP widths when
-set, the phase, the mode and whether the step produces output) and by shape:
+set, the phase, the mode and whether the step produces output) and by shape, which
+names the rows a DP group's MoE gathers only off its default, every rank at
+this one's tokens (`forward.Shape`):
 a prefill shape is published twice, as a middle chunk, which samples nothing,
 and as a final one. ATOM's engine arguments after `--`
 configure the engine as they would a server's; `--arch` names the declared
@@ -93,7 +96,8 @@ def population_shapes(names):
 def population_steps(names):
     """Each step the record directories `names` hold, DP's dummy runs aside,
     as its shape, the one the op-level backend prices it at
-    (`op_graph.step_shape`), and its step-record line."""
+    (`op_graph.step_shape`), a prefill's with the rows its DP group's MoE
+    gathered (`moe_rows`), and its step-record line."""
     from atom.compass.backends.op_graph import step_shape
 
     from .forward import decode, prefill
@@ -103,6 +107,7 @@ def population_steps(names):
         if not (path / "run.json").is_file():
             raise ValueError(f"{name} is not a record directory: it has no run.json")
         texts = [p.read_text() for p in (path / "steps").glob("dp*[0-9].jsonl")]
+        dp = len(texts)
         for line in (json.loads(t) for text in texts for t in text.splitlines()):
             if line["is_dummy_run"]:
                 continue
@@ -111,7 +116,10 @@ def population_steps(names):
                 phase, tokens, seqs = step_shape(rows, line["rung"])
             except ValueError as exc:
                 raise ValueError(f"{name} step {line['step']} {exc}") from None
-            yield decode(tokens) if phase == "decode" else prefill(tokens, seqs), line
+            if phase == "decode":
+                yield decode(tokens), line
+            else:
+                yield prefill(tokens, seqs, line.get("moe_rows")).at(dp), line
 
 
 def publish(store, graph, model, declared, tp, atom_args, command):

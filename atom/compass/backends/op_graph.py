@@ -6,12 +6,14 @@
 A step runs at one shape (`step_shape`): a decode step at the CUDA-graph rung
 it replayed, or at its width when it replayed none or the backend prices real
 rows (``padded=False``, the run file's ``padding: none``), and any other step
-as a prefill of its query tokens over its rows. `graph(phase, tokens, seqs,
-output)` gives the region of the `op_graph` captured at that shape, as
-`capture.graph.to_json` writes it, or None when there is none. `output` is
-whether the step samples, as ATOM's `ScheduledBatch.produces_output` says: a
-step with a decode row does, and a prefill step when the view says so, which
-it does when any row is a final chunk.
+as a prefill of its query tokens over its rows; a data-parallel step also at
+the rows its MoE gathers over the group (`moe_rows`). `graph(phase, tokens,
+seqs, output[, gathered])` gives the region of the `op_graph` captured at that
+shape, as `capture.graph.to_json` writes it, or None when there is none,
+`gathered` stated for a data-parallel step. `output` is whether the step
+samples, as ATOM's `ScheduledBatch.produces_output` says: a step with a decode
+row does, and a prefill step when the view says so, which it does when any row
+is a final chunk.
 
 Each leaf is one pricing unit, `max(t0, F / peak, M / BW(M), t_comm)` over its
 work (`op_work.work`): its own tensors at the captured shape, the state it
@@ -25,12 +27,12 @@ composes host time.
 
 Two-batch overlap. A step the data-parallel group split (`tbo_tokens`) runs
 this rank's tokens as two micro-batches (`step_roofline.micro_batches`), each
-priced from the graph at its own prefill shape, the second with the step's
-output and the first with none. Each graph's prices in run order fall into
-segments that alternate streams: an MoE exchange of activations rides the
-comm stream, everything else the compute stream. Both micro-batches' segments
-go on the two streams in ATOM's order (`step_roofline.overlap`); the finish
-time is the one term ``op.tbo``.
+priced from the graph at its own prefill shape and the group's rows of it
+(`moe_rows`), the second with the step's output and the first with none.
+Each graph's prices in run order fall into segments that alternate streams: an
+MoE exchange of activations rides the comm stream, everything else the compute
+stream. Both micro-batches' segments go on the two streams in ATOM's order
+(`step_roofline.overlap`); the finish time is the one term ``op.tbo``.
 
 Terms. One per op kind, ``op.<kind>``, and ``par.resource_bound``, each
 the fold of its prices in run order. A term is `declared`, its note naming
@@ -42,13 +44,11 @@ two-batch-overlap step on MoRI's split send and receive (`split_send_recv`),
 whose transfer in flight lies on no stream, whose split names no pair for
 this rank, whose micro-batches' graphs exchange a different number of times
 or run an exchange beside a second stream (the dual-stream MoE, which ATOM
-turns off under overlap), or whose ranks schedule different rows in one
-micro-batch, since capture runs one rank and its peers at this rank's rows; a speculative decode step; a
-prefill step whose view does not say whether it produces output; a shape with
-no graph; and, each reason once, a data-parallel step's (`moe_rows`) MoE
-exchange leaf, for that same reason, and a leaf whose kind has no extractor,
-whose price reads a spec field the spec lacks, or whose collective leaves the
-scale-up domain.
+turns off under overlap); a speculative decode step; a prefill step whose view
+does not say whether it produces output; a shape with no graph, a
+data-parallel step's naming the rows it gathers; and, each reason once, a leaf
+whose kind has no extractor, whose price reads a spec field the spec lacks, or
+whose collective leaves the scale-up domain.
 """
 
 from __future__ import annotations
@@ -98,7 +98,7 @@ class OpGraphBackend(CostBackend):
     def __init__(
         self,
         machine,
-        graph: Callable[[str, int, int], dict | None],
+        graph: Callable[..., dict | None],
         *,
         tp: int = 1,
         kv: str,
@@ -161,18 +161,22 @@ class OpGraphBackend(CostBackend):
             else:
                 output = any(d for _, d in rows) or view.produces_output
                 none = "" if output else " that produces no output"
+                g = () if view.moe_rows is None else (view.moe_rows,)
+                at = "".join(f" G={n}" for n in g)
                 if output is None:
                     reason = (
                         "a prefill step whose view does not say whether it "
                         "produces output, so whether it runs the LM head and the "
                         "sampler"
                     )
-                elif (region := self.graph(*shape, output)) is not None:
-                    return "{} T={} B={}".format(*shape) + none, region
+                elif (region := self.graph(*shape, output, *g)) is not None:
+                    return "{} T={} B={}".format(*shape) + at + none, region
                 else:
                     reason = (
                         "no op_graph holds a {} step of {} tokens over {} sequences"
-                        "{}; compass trace ops captures one".format(*shape, none)
+                        "{}{}; compass trace ops captures one".format(
+                            *shape, "".join(f" gathering {n} rows" for n in g), none
+                        )
                     )
         raise CostRefused(view, [Refusal(SOURCE, reason)])
 
@@ -187,19 +191,12 @@ class OpGraphBackend(CostBackend):
                     "lies on no stream"
                 )
             halves = micro_batches(view)
-            if uneven := [t for t in view.tbo_tokens if len(set(t)) > 1]:
-                raise ValueError(
-                    "a two-batch-overlap step whose ranks schedule "
-                    f"{uneven[0]} rows of one micro-batch: capture runs one rank, "
-                    "so its graph holds every peer at this rank's rows"
-                )
         except ValueError as exc:
             raise CostRefused(view, [Refusal(SOURCE, str(exc))]) from None
         at, runs, notes = [], [], []
         for k, half in enumerate(halves):
-            # Every peer schedules this rank's rows: the graph's own exchange.
             output = k == 1 and view.produces_output
-            half = replace(half, moe_rows=None, produces_output=output)
+            half = replace(half, produces_output=output)
             shape, region = self._region(half)
             at.append(shape)
             run = [0.0]
@@ -261,15 +258,6 @@ class OpGraphBackend(CostBackend):
     def _leaf(self, leaf: dict, view: BatchView, refused: list):
         """One leaf's ``(seconds, stated, work)``; None when it launches no
         kernel or refuses."""
-        if view.moe_rows is not None and leaf["op"].startswith(MOE_EXCHANGES):
-            reason = (
-                f"a data-parallel step whose MoE gathers {view.moe_rows} rows: "
-                "capture runs one rank, so its graph holds the gather, the "
-                "reduce-scatter and the experts at every peer scheduling this "
-                "rank's rows"
-            )
-            refused.append(Refusal(SOURCE, reason))
-            return None
         try:
             w = work(leaf, view, self.tp, self.kv)
         except CostRefused as exc:

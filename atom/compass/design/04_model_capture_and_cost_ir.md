@@ -920,8 +920,10 @@ since a TBO step lays MORI's dispatch and combine on the comm stream as ops of t
 Each is named `module:qualname` for the function ATOM calls, its arguments by that
 function's parameter names: the DP gather and reduce-scatter as `atom.model_ops.moe`'s
 functions, MORI's dispatch and combine as `EpDispatchCombineOp`'s methods. A capture runs
-one rank, so each exchange's rows are stated, every peer at this rank's shape
-(`capture/peers.py`). A TBO step, two micro-batches interleaved, is refused by name until
+one rank, so each exchange's rows are stated, every peer at this rank's shape but for
+its token count: the peers split evenly the rows the shape's MoE gathers, G, less this
+rank's, every peer at this rank's count when G is its default (`capture/peers.py`;
+`07` Phase 1a). A TBO step, two micro-batches interleaved, is refused by name until
 its graphs exist (#1581).
 
 DeepSeek-V4's `v4_attention_with_output` is opened the same way (#1678), its body run as

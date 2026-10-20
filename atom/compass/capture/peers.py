@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
 """What a capture states for the other ranks of its DP and EP groups.
 
-A capture runs one rank. Where ATOM reads its peers, two rules answer:
+A capture runs one rank, rank 0. Where ATOM reads its peers, two rules answer:
 
-* Every peer scheduled what this rank did. The step's one DP all-gather
-  (`sync_dp_metadata`), the per-rank counts built from it
-  and the sizes read off them (`DPMetadata.make`, `get_sizes_across_dp`)
-  run on the host with this rank's row in every slot.
+* Every peer scheduled what this rank did, but for its token count: the peers
+  split evenly the rows the shape's MoE gathers (`Shape.gathered`) less this
+  rank's, or each schedules this rank's count when the shape states none. The
+  step's one DP all-gather (`sync_dp_metadata`), the per-rank counts built from
+  it and the sizes read off them (`DPMetadata.make`, `get_sizes_across_dp`) run
+  on the host with these rows.
 * What the DP group gathers for the MoE, or MORI dispatches to this rank, is
-  every rank's rows, the group's width times this rank's: for MORI, the height
-  ATOM trims its buffer to, `T_moe`. The DP reduce-scatter gives back this
+  every rank's rows, the shape's gathered rows, by default the group's width
+  times this rank's: for MORI, the height ATOM trims its buffer to, `T_moe`. The DP reduce-scatter gives back this
   rank's rows; MORI's combine gives back its buffer of
   `max_num_tokens_per_dp_rank` rows, which ATOM's finalize slices.
 
@@ -70,12 +72,16 @@ def patches(recorder):
         with unset_fake_temporarily():
             return fn(*args, **kwargs)
 
-    def every_peer_is_this_rank(gathered, local, group=None, async_op=False):
+    def peers(gathered, local, group=None, async_op=False):
         for slot in gathered:
             slot.copy_(local)
+        if (rows := recorder.shape.gathered) is not None:
+            each, extra = divmod(rows - int(local[0]), dp - 1)
+            for k, slot in enumerate(gathered[1:]):
+                slot[0] = each + (k < extra)
 
     def sync_dp_metadata(**kwargs):
-        gather, dist.all_gather = dist.all_gather, every_peer_is_this_rank
+        gather, dist.all_gather = dist.all_gather, peers
         try:
             return on_host(sync, **kwargs)
         finally:
@@ -84,7 +90,7 @@ def patches(recorder):
     def rows(x, height):
         return x.new_empty((height, *x.shape[1:]))
 
-    # `sizes` holds this rank's count in every slot.
+    # `sizes` holds this rank's count in slot 0.
     def all_gatherv(x, sizes, group):
         return rows(x, sum(sizes))
 
@@ -116,9 +122,9 @@ def patches(recorder):
 
 def install_mori(recorder):
     """Give the EP group an all-to-all manager whose MORI handles are declared."""
-    from aiter.dist.parallel_state import get_ep_group
+    from aiter.dist.parallel_state import get_dp_group, get_ep_group
 
-    group = get_ep_group()
+    group, dp = get_ep_group(), get_dp_group().world_size
 
     class Handle:
         """MORI's `EpDispatchCombineOp`, its two calls by its parameter names."""
@@ -134,6 +140,8 @@ def install_mori(recorder):
 
         def _dispatch(self, input, weights, scales, indices, **kwargs):
             n, k = group.world_size * input.shape[0], indices.shape[1]
+            if (rows := recorder.shape.gathered) is not None:
+                n = rows * group.world_size // dp
             return (
                 input.new_empty((n, input.shape[1])),
                 weights.new_empty((n, k)),
