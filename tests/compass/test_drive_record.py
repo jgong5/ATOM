@@ -276,7 +276,9 @@ def test_a_record_binds_the_host_it_names_which_its_url_names(tmp_path, planted_
     """A server bound only to the host its arguments name answers `/health`."""
     server = tmp_path / "server.py"
     host = 'sys.argv[sys.argv.index("--host") + 1]'
-    server.write_text(server.read_text().replace('"127.0.0.1"', host))
+    # Unasked for 10 s, the server exits, so one bound elsewhere fails `serve`.
+    timeout = "import http.server\nhttp.server.HTTPServer.timeout = 10\n"
+    server.write_text(timeout + server.read_text().replace('"127.0.0.1"', host))
     out = tmp_path / "out"
 
     cli.main(
