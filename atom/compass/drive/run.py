@@ -57,7 +57,7 @@ from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactStore, Kind
 from atom.compass.backends.step_grid_plan import BOUNDS, coverage
 from atom.compass.drive import runfile, serve
-from atom.compass.run import STEP_GRID, STEP_LINEAR, STEP_STUB, step_grid
+from atom.compass.run import OP_GRAPH, STEP_GRID, STEP_LINEAR, STEP_STUB, step_grid
 
 PROG = "compass run"
 #: The engine fields that shape a step's batches: the scheduler's bounds, the
@@ -80,7 +80,7 @@ def main(argv: list[str]) -> None:
         return
     args = _parser().parse_args(argv[:cut])
     if args.coverage and not getattr(args, STEP_GRID):
-        key = next(k for k in (STEP_STUB, STEP_LINEAR) if getattr(args, k))
+        key = next(k for k in (STEP_STUB, STEP_LINEAR, OP_GRAPH) if getattr(args, k))
         raise ValueError(
             f"--coverage: --{key.replace('_', '-')} has no coverage check; only "
             "--step-grid's steps are checked"

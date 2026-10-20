@@ -17,6 +17,7 @@ import pytest
 from test_artifact_invalidation import STANZA
 from test_backend_step_linear import law
 from test_memory_readings import DOCUMENT, META_8B
+from test_op_graph import FLAT
 from test_run_step_grid import (
     KEY,
     NEW_KINDS,
@@ -35,9 +36,12 @@ from atom.compass.artifacts import (
     Key,
     Kind,
     Topology,
+    git_tree_root,
     member_name,
+    module_root,
 )
 from atom.compass.backends import StepGridBackend, StepLinearBackend, StepStubBackend
+from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.step_linear import UNIFORM_ROUTING
 from atom.compass.backends.step_roofline import StepFallbackBackend
 from atom.compass.backends.step_stub import Coefficients
@@ -446,3 +450,80 @@ def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost
     assert [table.lookahead(c) for c in write] == [runfile.KV_WRITE_REQ_S] * 2
     relay = table.lookahead("frontend-P->frontend-D:relay")
     assert relay == run["router_s"]
+
+
+def price_list_key(tmp_path, **layout):
+    """The `price_list` key fields of the suite's model, on its machine, from
+    this tree, at the deployment's layout less `layout`."""
+    tree = git_tree_root("atom", module_root("atom"))
+    config = (tmp_path / "config.json").read_bytes()
+    return {
+        "model": "sha256:" + hashlib.sha256(config).hexdigest(),
+        "dp": 1,
+        "pp": 1,
+        "pcp": 1,
+        "tp": 1,
+        "decode_context_parallel_size": 1,
+        "enable_expert_parallel": False,
+        "enable_dp_attention": False,
+        "machine_spec": SPEC_DIGEST,
+        "source_root": f"{tree.revision_kind}-{tree.revision}",
+        **layout,
+    }
+
+
+def test_op_graph_names_the_price_list_at_its_run_s_key_and_installs_it(
+    monkeypatch, tmp_path
+):
+    r = deployment(tmp_path)
+    key = price_list_key(tmp_path)
+    entry = published(tmp_path, r, Kind.PRICE_LIST, key, FLAT.params)
+
+    run = build(tmp_path, "--op-graph")
+    install(tmp_path, monkeypatch, run, r)
+
+    assert isinstance(r.compass_backend, OpGraphBackend)
+    assert r.compass_backend.resolver.sources[0].params == FLAT.params
+    assert run["op_graph"] is True and run["price_list"] == key
+    assert run["backend"]["digest"] == entry.digest
+    assert run["backend"]["provenance"]["inputs"] == REPORT["provenance"]
+
+
+def test_op_graph_with_no_price_list_at_its_key_installs_analytically(
+    monkeypatch, tmp_path
+):
+    r = deployment(tmp_path)
+    other = price_list_key(tmp_path, source_root="tree-" + "b" * 40)
+    published(tmp_path, r, Kind.PRICE_LIST, other, {})
+
+    run = build(tmp_path, "--op-graph")
+    install(tmp_path, monkeypatch, run, r)
+
+    assert isinstance(r.compass_backend, OpGraphBackend)
+    assert not r.compass_backend.resolver and "price_list" not in run
+    stated = json.dumps({"op_graph": True}).encode()
+    digest = "sha256:" + hashlib.sha256(stated).hexdigest()
+    assert run["backend"] == {"digest": digest, "provenance": None}
+
+
+def test_a_prefill_decode_op_graph_whose_sides_name_two_price_lists_refuses(
+    tmp_path,
+):
+    r = deployment(tmp_path)
+    published(tmp_path, r, Kind.PRICE_LIST, price_list_key(tmp_path), {})
+    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
+    parser = argparse.ArgumentParser()
+    runfile.add_arguments(parser)
+    flags = ["--op-graph", "--machine", str(tmp_path / "machine.json")]
+    args = parser.parse_args([*flags, "--store", str(tmp_path / "store")])
+    model = ["--model", str(tmp_path)]
+
+    with pytest.raises(ValueError, match="the decode side's .*'tp': 2"):
+        runfile.prefill_decode(args, model, [*model, "-tp", "2"])
+
+
+def test_coverage_under_op_graph_refuses_naming_the_flag(tmp_path):
+    with pytest.raises(ValueError, match="^--coverage: --op-graph has no coverage"):
+        drive_run.main(
+            ["--op-graph", *MACHINE_AND_STORE, "--coverage", "x", "--out", "o"]
+        )
