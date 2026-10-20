@@ -44,4 +44,5 @@ their own client venv (QUICKSTART's recipe) in the data directory.
   is lost at reboot, so copy out what should stay.
 - The writable layer then takes aiter's built modules and aiperf's bytecode:
   20 MB through step 0 of a node-18 run on 2026-10-20, when `/root/.aiter`, now
-  on tmpfs, held 227 MB.
+  on tmpfs, held 227 MB. Step 0 takes the container's builds; a later record
+  that builds one is refused by grading.

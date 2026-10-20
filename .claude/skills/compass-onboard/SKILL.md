@@ -27,8 +27,9 @@ printed and wrote. They learn Compass from their own run.
    success looks like, from QUICKSTART's own figures and success lines. Then
    ask, and run it only on a yes. After it, explain it from its outputs
    (Explaining a step). A check or a file read holds nothing and needs no
-   yes. For a step QUICKSTART gives no size for (the tree, the venv), say it is
-   small next to the runs and report its `du -sh` after.
+   yes. For a step QUICKSTART gives no size, time or success line for (the
+   container, the tree, the venv), say so, say what you will take as success,
+   and report its `du -sh` after.
 3. **Stop on any failure.** A non-zero exit, a refusal, or an output you cannot
    explain stops the session at that step: read it (Reading a failure), tell the
    developer the cause and the fix, and ask before anything runs again. Never
@@ -72,7 +73,9 @@ runs again on their answer, and the session ends only when they take none.
      the directory searched and what a profile states, and whether
      `scripts/compass/machines/` has a spec whose `device.arch` is that GFX
      version (specs are named for device and host; a spec says what the device
-     is, not how to run on this node);
+     is, not how to run on this node). Say that someone who has run the
+     quickstart on this node adds the profile, and offer another node that has
+     one;
    - the profile lacks a front-matter field or a heading Profiles lists;
    - the machine spec it names is not in the tree;
    - the GPUs' GFX version or DID differs from the profile's, or the GFX
@@ -90,8 +93,9 @@ runs again on their answer, and the session ends only when they take none.
    with room. Docker's storage takes the container's writable layer: its cache
    and whatever else the profile does not mount elsewhere. When it reads no
    room, give the developer the profile's figure for that layer and where the
-   daemon, which writes as root, would put it, and ask. Never write to the root
-   disk.
+   daemon, which writes as root, would put it, and ask. Keep runs, trees,
+   venvs and caches off the root disk; QUICKSTART's `git fetch` in the
+   checkout is the only write there.
 5. **Inputs.** The model directory (QUICKSTART's `MODEL`, a container path:
    read it on the host through the profile's mounts) resolves `config.json`;
    the traces file's size is QUICKSTART's (its sha256 takes a minute, and
@@ -99,7 +103,9 @@ runs again on their answer, and the session ends only when they take none.
 6. **GPU.** Run the tree's `scripts/compass/preflight.sh` on the host, then
    QUICKSTART's check of a shared GPU (its use, VRAM and process listing). A GPU
    is idle when `PREFLIGHT_RC=0`, preflight lists it under `idle and empty`,
-   and QUICKSTART's check reads it at 0% use and 0% VRAM with no process on it.
+   and QUICKSTART's check reads it at 0% use and 0% VRAM with no process on it:
+   a process is on it when `--showpidgpus` lists the GPU's index under the PID
+   (the `GPU(s)` column of `--showpids` is a count, not an index).
    Preflight's own compute rows can read 1% on every GPU while its `rocminfo`
    runs; judge by its idle list and the check after it. Ask which GPU they want,
    within the profile's Allocation (ask which GPUs it leaves to them). Refuse
@@ -114,8 +120,10 @@ directory, image, container name. Offer the smoke path.
 
 Each step announced, confirmed, run and explained. QUICKSTART's blocks marked
 `# host` run on the node, the rest through `docker exec` in the container.
-Write QUICKSTART's Variables, filled for this session, into one file in the
-data directory and source it in every `docker exec`: a tool call keeps no shell.
+Create the data directory as the developer before the container mounts it, or
+the daemon creates it as root. Once the tree step names `$T`, write
+QUICKSTART's Variables, filled for this session, into one file in the data
+directory and source it in every `docker exec`: a tool call keeps no shell.
 
 1. **Container.** QUICKSTART's `docker run`, with the profile's image, mounts
    and options, named `<user>_<purpose>`. If a container of that name is the
