@@ -155,15 +155,13 @@ that file and show it; it holds nothing, so it needs no yes.
    the time QUICKSTART measured and takes the disk QUICKSTART's Disk gives. Say
    what QUICKSTART's Environment (GPUs are shared) says of running it beside
    other work, and that this one yes covers all its steps, which run back to
-   back. Run it
-   detached in the container, its output in a log outside its OUT (it refuses
-   an OUT that is not empty), since it outlives any one tool call. `docker exec
-   -d` drops the exit status, so keep it in a file: the block, then
-   `> $R/smoke_cell.log 2>&1; echo $? > $R/smoke_cell.exit`. Follow the
+   back. Run it detached in the container, its output in a log outside its OUT
+   (it refuses an OUT that is not empty), since it outlives any one tool call.
+   `docker exec -d` drops the exit status, so keep it in a file: the block,
+   then `> $R/smoke_cell.log 2>&1; echo $? > $R/smoke_cell.exit`. Follow the
    log without holding a tool call open: each `smoke_cell: <step>` line means
    the step before it finished, so explain that step from its directory while
-   the next runs. When it exits, explain the grading table and its last
-   line.
+   the next runs. When it exits, explain the grading table and its last line.
 
 Then offer the full path, or Cleanup.
 
