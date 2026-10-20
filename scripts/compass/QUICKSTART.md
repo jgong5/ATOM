@@ -202,7 +202,8 @@ Times were measured on node 18 for the cell in
 [PR #1336](https://github.com/jgong5/ATOM/pull/1336), at concurrencies 1, 4, 16,
 64 and 256 with a 1800 s benchmark each.
 
-**0. Warm a fresh container** (GPU, once per container; 16 min).
+**0. Warm a fresh container** (GPU, once per container; 15 min as in the smoke
+cell, and a minute more for the build below).
 
 ```bash
 D=600 serve $R/warm 0-7 1 $REAL_PY record --gpu $G
@@ -330,9 +331,11 @@ GPU=$G MACHINE=$SPEC HARNESS_PYTHON=$SIM_PY AIPERF_PYTHON=$REAL_PY \
 
 It prints each step as it starts, then the grading table, then one line with the
 verdict, the wall time and each run's warmup. It refuses a GPU that is not idle,
-names the step that failed, and exits 1 unless the cell is graded. On node 18,
-in a fresh container, it took 60 min: 5 min for step 1, 13 to 14 min per real
-server, step 0's included, 2 min for the simulated run.
+names the step that failed, and exits 1 unless the cell is graded. At 873664d6d
+on node 18, in a container that held step 0's build, it took 61 min: 2 min for
+step 1, 13 min for calibration, 14 to 15 min per server of traces 0 to 7, step
+0's included, each with one warmup request of 113 s, and 2 min for the simulated
+run.
 
 On these traces at c=1, no step in the first 600 s batches two requests, in
 calibration or in the cell, so the law has a vector for every step the cell
