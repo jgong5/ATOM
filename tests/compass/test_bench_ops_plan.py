@@ -473,6 +473,38 @@ def test_a_plan_halves_decode_attention_until_no_point_bends_off_its_neighbours(
     assert any(3000 < c < 4125 for c in at) and {4999, 5000} <= at
 
 
+def test_a_plan_finds_a_step_its_points_hold_on_a_line_where_the_kind_steps_elsewhere(
+    bench, tmp_path, monkeypatch
+):
+    def stepped(fn, config, todo, llc):
+        # Decode attention steps up past 2500 tokens under one kernel: by 1500
+        # us at width 1, which bends its points; by 150 us, 6%, at the other
+        # widths, too little to bend theirs over 5% about a point the plan holds.
+        got = _bench(fn, config, todo, llc)
+        for r in got:
+            if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
+                high = 1500e3 if r["shape"] == "decode B=1" else 150e3
+                r["cold_ns"] += high * (r["context"] > 2500)
+        return got
+
+    monkeypatch.setattr(ops, "_child", stepped)
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[1, 12000, True]], 1),
+    )
+
+    records = _plan(bench, tmp_path, population)
+
+    at = {}
+    for r in records:
+        if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
+            at.setdefault(r["shape"], set()).add(r["context"])
+    assert len(at) > 1
+    for shape, contexts in at.items():
+        assert {2500, 2501} <= contexts, shape
+
+
 @pytest.mark.parametrize(
     "points, rows",
     [

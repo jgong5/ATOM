@@ -69,9 +69,10 @@ most cached tokens of steps of its rows, and over a ladder of them once those
 points and the fresh ones show the kind still does; then the point halfway
 between two neighbours of a family, or of a prefill leaf's token count over
 cached tokens, that launched different kernels or, at a decode width, either
-side of a point off the line through theirs (`_densify`), until they are
-adjacent. DIR gets each round's ops.jsonl in `round<n>`, and every point held
-in plan.jsonl.
+side of a point off the line through theirs, or whose cold times differ where
+the leaf's kind steps under one kernel between two adjacent contexts at some
+width (`_densify`), until they are adjacent. DIR gets each round's ops.jsonl
+in `round<n>`, and every point held in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
 covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
@@ -865,7 +866,9 @@ LADDER_STEP = 1.25
 CONTEXT_MOVES = 0.10
 #: How far the line through a decode point's two neighbours may price it off its
 #: measured cold time, over that time as `fit ops` reads a held-out error, when
-#: the three launched one kernel, before the plan halves the gaps either side.
+#: the three launched one kernel, before the plan halves the gaps either side;
+#: and how far a gap's ends' cold times may differ, over the lower, before the
+#: plan halves it where the leaf's kind steps (`_apart`).
 BENDS = 0.05
 #: The spread of a leaf's cold times across contexts, or a prefill leaf's
 #: across rows, in ns, at or under which its kind does not depend on them
@@ -1198,9 +1201,18 @@ def _densify(families, tried: set) -> dict:
     """The point halfway between each two neighbours of a family, or of a
     prefill leaf's token count over cached tokens (`_cut`), more than one
     apart, unless `tried`, that launched different kernels or, in a decode
-    family, lie either side of a point `_bent` off the line through theirs."""
+    family, lie either side of a point `_bent` off the line through theirs or
+    are `_apart` where the leaf's kind steps: some decode family of the kind
+    holds two adjacent contexts of one kernel that are `_apart`."""
     from atom.compass.capture.forward import prefill
 
+    steps = {
+        p[2]["op"]
+        for points in families.values()
+        for p, q in itertools.pairwise(points)
+        if p[2]["shape"].startswith("decode") and q[0] - p[0] == 1
+        if p[1] == q[1] and _apart(p, q)
+    }
     across = defaultdict(list)
     for fam, points in families.items():
         if cut := _cut(fam):
@@ -1209,7 +1221,8 @@ def _densify(families, tried: set) -> dict:
     want = defaultdict(set)
     for fam, points in [*families.items(), *across.items()]:
         points = sorted(points, key=lambda p: p[0])
-        bent = _bent(points) if points[0][2]["shape"].startswith("decode") else ()
+        decode = points[0][2]["shape"].startswith("decode")
+        bent = _bent(points, steps) if decode else ()
         for (a, ka, record), (b, kb, _) in itertools.pairwise(points):
             mid = (a + b) // 2
             if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
@@ -1226,17 +1239,28 @@ def _densify(families, tried: set) -> dict:
     return want
 
 
-def _bent(points) -> set:
+def _bent(points, steps=()) -> set:
     """The lower ends of the gaps either side of each middle point of three
     neighbours that launched one kernel and whose cold time the line through
-    the outer two's prices more than `BENDS` off, over that cold time."""
+    the outer two's prices more than `BENDS` off, over that cold time; and,
+    for a leaf of a kind in `steps`, of each gap whose ends are `_apart`."""
     ends = set()
+    if steps and points[0][2]["op"] in steps:
+        ends = {p[0] for p, q in itertools.pairwise(points) if _apart(p, q)}
     for p, q, r in zip(points, points[1:], points[2:]):
         y = [point[2]["cold_ns"] for point in (p, q, r)]
         line = y[0] + (y[2] - y[0]) * (q[0] - p[0]) / (r[0] - p[0])
         if p[1] == q[1] == r[1] and abs(line - y[1]) > BENDS * y[1]:
             ends |= {p[0], q[0]}
     return ends
+
+
+def _apart(p, q) -> bool:
+    """Whether two points' cold times differ by more than `BENDS` of the
+    lower: the line across them may then price a point between them more
+    than `BENDS` off its cold time."""
+    lo, hi = sorted(point[2]["cold_ns"] for point in (p, q))
+    return hi - lo > BENDS * lo
 
 
 def _load(store, config, root, shapes, graphs: dict, arch=None) -> None:
