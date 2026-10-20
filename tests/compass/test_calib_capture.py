@@ -6,9 +6,10 @@ never on a GPU that holds a process.
 cell runs a process named as aiperf's controller is, which writes a step and
 waits; as aiperf does, SIGINT ends it with status 0 and its export, or, with
 IN_WARMUP set, with status 1 and none; SIGTERM ends it with 143. With IN_GRACE
-set its duration has passed: it logs so, and ends after 15 s with status 0 and
-its export, or on SIGINT with status 1. The cell exits with its status, as
-cctraces_sim.sh exits with aiperf's.
+set its duration has passed: it logs so, and ends 15 s after the cell's log
+reads that its duration ended, with status 0 and its export, or on SIGINT with
+status 1; with no such line within 40 s it exits 2. The cell exits with its
+status, as cctraces_sim.sh exits with aiperf's.
 """
 
 import json
@@ -38,9 +39,13 @@ signal.signal(signal.SIGINT, stop)
 open(cell + "/steps/dp0.jsonl", "w").write("{}")
 if os.environ.get("IN_GRACE"):
     open(cell + "/aiperf.log", "w").write("Phase profiling (profiling) sending complete")
-    time.sleep(15)
-    export()
-    sys.exit(0)
+    for _ in range(400):
+        time.sleep(0.1)
+        if "aiperf duration ended" in open(cell + ".log").read():
+            time.sleep(15)
+            export()
+            sys.exit(0)
+    sys.exit(2)
 time.sleep(60)"""
 CELL = f"""#!/bin/bash
 mkdir -p "$2/steps" && echo '{{"workload": 1}}' > "$2/run.json"
