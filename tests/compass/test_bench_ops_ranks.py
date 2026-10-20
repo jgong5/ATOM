@@ -12,6 +12,7 @@ import json
 import os
 import sys
 from concurrent.futures.process import BrokenProcessPool
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -141,7 +142,8 @@ def _found(*names):
 def _measuring_rank(config, todo, refuse, rank):
     """One rank of `ops.measure` in a gloo group: ATOM's runner, the device
     and its kernels stand-ins, every cross-rank call on the group; rank 1
-    refusing `NEG` at `refuse`, its copy, its first call or its capture."""
+    refusing `NEG` at `refuse`: from its copy 0, from its copy 1, its first
+    call or its capture."""
     from atom.compass.bench import replay
 
     pc = config.parallel_config
@@ -175,8 +177,13 @@ def _measuring_rank(config, todo, refuse, rank):
         return no() if (me, refuse, len(captures)) == (1, "capture", 1) else None
 
     copy, function = ops.Stub._copy, ops._function
-    if (me, refuse) == (1, "copy"):
-        ops.Stub._copy = lambda s, op, *a: no() if op["op"] == NEG else copy(s, op, *a)
+    first = {"copy": 0, "later_copy": 1}.get(refuse) if me == 1 else None
+
+    def copying(s, op, sig, inst, c, *a):
+        refused = first is not None and op["op"] == NEG and c >= first
+        return no() if refused else copy(s, op, sig, inst, c, *a)
+
+    ops.Stub._copy = copying
     if (me, refuse) == (1, "call"):
         ops._function = lambda name: no if name == NEG else function(name)
     torch.cuda.graph = lambda *a, **k: contextlib.nullcontext(graph())
@@ -197,13 +204,15 @@ def test_ranks_measuring_different_points_each_measure_their_union_in_one_order(
     assert [_leaves(r) for r in by_rank] == [[(ABS, None), (NEG, None)]] * 2
 
 
-@pytest.mark.parametrize("refuse", ["copy", "call", "capture"])
+@pytest.mark.parametrize("refuse", ["copy", "later_copy", "call", "capture"])
 def test_a_leaf_one_rank_refuses_every_rank_refuses_and_the_next_is_measured(
-    refuse,
+    refuse, tmp_path, monkeypatch
 ):
     config = _config(2)
     ranks.layout(config)
     todo = [[(decode(2), 20, _found(NEG, ABS))]] * 2
+    journal = tmp_path / "points.jsonl"
+    monkeypatch.setenv(ops.JOURNAL, str(journal))
 
     by_rank = ranks.launch(_measuring_rank, config, todo, refuse)
 
@@ -213,6 +222,10 @@ def test_a_leaf_one_rank_refuses_every_rank_refuses_and_the_next_is_measured(
         [(NEG, own), (ABS, None)],
     ]
     assert [r.get("refused") for r in ranks.merge(by_rank)] == [own, None]
+    # each rank journals its own records, which `_measured` reads by rank
+    lines = [Path(f"{journal}.{r}").read_text().splitlines() for r in (0, 1)]
+    assert [_leaves(map(json.loads, r)) for r in lines] == [_leaves(r) for r in by_rank]
+    assert not journal.exists()
 
 
 def test_a_rank_that_dies_costs_only_the_point_the_ranks_were_measuring(
