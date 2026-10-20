@@ -187,6 +187,16 @@ def _leaves(records):
     return [(r["op"], r.get("refused")) for r in records]
 
 
+def test_ranks_measuring_different_points_each_measure_their_union_in_one_order():
+    config = _config(2)
+    ranks.layout(config)
+    todo = [[(decode(2), 20, _found(ABS))], [(decode(2), 20, _found(NEG, ABS))]]
+
+    by_rank = ranks.launch(_measuring_rank, config, todo, None)
+
+    assert [_leaves(r) for r in by_rank] == [[(ABS, None), (NEG, None)]] * 2
+
+
 @pytest.mark.parametrize("refuse", ["copy", "call", "capture"])
 def test_a_leaf_one_rank_refuses_every_rank_refuses_and_the_next_is_measured(
     refuse,
