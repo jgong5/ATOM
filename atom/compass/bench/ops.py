@@ -72,8 +72,10 @@ remainders among them, one of a kind that depends on context at each at the
 most cached tokens of steps of its rows, and over a ladder of them once those
 points and the fresh ones show the kind still does; then the point halfway
 between two neighbours of a family, or of a prefill leaf's token count over
-cached tokens, that launched different kernels, until they are adjacent. DIR
-gets each round's ops.jsonl in `round<n>`, and every point held in plan.jsonl.
+cached tokens, that launched different kernels or, at a decode width, either
+side of a point off the line through theirs (`_densify`), until they are
+adjacent. DIR gets each round's ops.jsonl in `round<n>`, and every point held
+in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
 covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
@@ -942,6 +944,10 @@ LADDER_STEP = 1.25
 #: across rows, over the largest, past which its kind depends on them; a
 #: repeat's spread stays within 4%.
 CONTEXT_MOVES = 0.10
+#: How far the line through a decode point's two neighbours may price it off its
+#: measured cold time, over that time as `fit ops` reads a held-out error, when
+#: the three launched one kernel, before the plan halves the gaps either side.
+BENDS = 0.05
 #: The spread of a leaf's cold times across contexts, or a prefill leaf's
 #: across rows, in ns, at or under which its kind does not depend on them
 #: whatever its share: one 3.5 us elementwise kernel on MI308X reads in two
@@ -1317,10 +1323,12 @@ def _band(ats, lo, hi) -> slice | None:
 
 def _densify(families, tried: set) -> dict:
     """The point halfway between each two neighbours of a family, or of a
-    prefill leaf's token count over cached tokens (`_cut`), that launched
-    different kernels and lie more than one apart, unless `tried`; between two
-    points of a collective's family, the step of the rows halfway, a decode
-    when the farther is one, else a prefill of one sequence."""
+    prefill leaf's token count over cached tokens (`_cut`), more than one
+    apart, unless `tried`, that launched different kernels or, in a decode
+    family, lie either side of a point `_bent` off the line through theirs;
+    between two points of a collective's family, the step of the rows
+    halfway, a decode when the farther is one, else a prefill of one
+    sequence."""
     from atom.compass.capture.forward import decode, prefill
 
     across = defaultdict(list)
@@ -1331,9 +1339,11 @@ def _densify(families, tried: set) -> dict:
     want = defaultdict(set)
     for fam, points in [*families.items(), *across.items()]:
         points = sorted(points, key=lambda p: p[0])
+        decoding = points[0][2]["shape"].startswith("decode")
+        bent = _bent(points) if decoding and not _exchanged(fam) else ()
         for (a, ka, record), (b, kb, other) in itertools.pairwise(points):
             mid = (a + b) // 2
-            if ka == kb or b - a < 2 or (fam, mid) in tried:
+            if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
                 continue
             tried.add((fam, mid))
             shape = _shape(record["shape"])
@@ -1350,6 +1360,19 @@ def _densify(families, tried: set) -> dict:
             else:
                 want[prefill(mid, shape.seqs), record["context"]].add(fam)
     return want
+
+
+def _bent(points) -> set:
+    """The lower ends of the gaps either side of each middle point of three
+    neighbours that launched one kernel and whose cold time the line through
+    the outer two's prices more than `BENDS` off, over that cold time."""
+    ends = set()
+    for p, q, r in zip(points, points[1:], points[2:]):
+        y = [point[2]["cold_ns"] for point in (p, q, r)]
+        line = y[0] + (y[2] - y[0]) * (q[0] - p[0]) / (r[0] - p[0])
+        if p[1] == q[1] == r[1] and abs(line - y[1]) > BENDS * y[1]:
+            ends |= {p[0], q[0]}
+    return ends
 
 
 def _load(store, config, root, shapes, graphs: dict, arch=None) -> None:

@@ -406,6 +406,73 @@ def test_coverage_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_
     }
 
 
+def test_a_decode_family_halves_either_side_of_a_point_off_its_neighbours_line():
+    def family(times, kernels="kkkk", shape="decode B=2"):
+        return [
+            (at, (k,), {"shape": shape, "context": at, "cold_ns": ns})
+            for (at, ns), k in zip(times, kernels)
+        ]
+
+    families = {
+        "line": family([(1000, 10.0), (2000, 20.0), (3000, 30.0)]),
+        # 26 at 2000 against 20 on the line from 1000 to 3000; 30 at 3000 is on
+        # the line from 2000 to 4000.
+        "bent": family([(1000, 10.0), (2000, 26.0), (3000, 30.0), (4000, 34.0)]),
+        # The line prices 1000 at 1051: 5.1% over 1000, 4.9% over 1051.
+        "under": family([(1000, 1000.0), (2000, 1000.0), (3000, 1102.0)]),
+        # The same bend across a kernel switch halves only the switch.
+        "switch": family([(1000, 10.0), (2000, 26.0), (3000, 30.0)], "kkj"),
+    }
+    families = {json.dumps(["decode B=2", sig]): f for sig, f in families.items()}
+    prefill = json.dumps(["prefill", None, "leaf"], sort_keys=True)
+    families[prefill] = family(
+        [(10, 1.0), (20, 9.0), (30, 3.0)], shape="prefill T=10 B=1"
+    )
+
+    want = ops._densify(families, set())
+
+    assert {at: {json.loads(f)[1] for f in fams} for at, fams in want.items()} == {
+        (decode(2), 1500): {"bent", "under"},
+        (decode(2), 2500): {"bent", "under", "switch"},
+    }
+
+
+def test_a_plan_halves_decode_attention_until_no_point_bends_off_its_neighbours(
+    bench, tmp_path, monkeypatch
+):
+    def steeper(fn, config, todo, llc):
+        # Decode attention turns three times steeper at 3500 tokens, one kernel.
+        got = _bench(fn, config, todo, llc)
+        for r in got:
+            if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
+                r["cold_ns"] += 2e3 * max(r["context"] - 3500, 0)
+        return got
+
+    monkeypatch.setattr(ops, "_child", steeper)
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[1, 12000, True]], 1),
+    )
+
+    records = _plan(bench, tmp_path, population)
+
+    by = {}
+    for r in records:
+        if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
+            by.setdefault(r["shape"], []).append(
+                (r["context"], r["kernels"], r["cold_ns"])
+            )
+    for points in by.values():
+        points.sort()
+        for p, q, s in zip(points, points[1:], points[2:]):
+            line = p[2] + (s[2] - p[2]) * (q[0] - p[0]) / (s[0] - p[0])
+            if p[1] == q[1] == s[1] and s[0] - p[0] > 2:
+                assert abs(line - q[2]) <= 0.05 * q[2], (p, q, s)
+    at = {c for c, *_ in by["decode B=1"]}
+    assert any(3000 < c < 4125 for c in at) and {4999, 5000} <= at
+
+
 @pytest.mark.parametrize(
     "points, rows",
     [
