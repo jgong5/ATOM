@@ -69,7 +69,8 @@ while (($#)); do
     elif ((head)) && [[ $1 == -- ]]; then
         head=0
     elif [[ $side$head$1 == decode1--on ]]; then
-        read -ra on <<<"${2-}"
+        [[ ${2-} == [!-]* ]] || bad "--on takes a command prefix, a command and its words"
+        read -ra on <<<"$2"
         shift
     else
         case $side$head in

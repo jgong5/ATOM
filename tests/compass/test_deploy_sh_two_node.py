@@ -143,3 +143,25 @@ def test_a_deployment_that_fails_stops_the_decode_through_its_prefix(
             break
         time.sleep(0.1)
     assert (d / "decode" / "run.json").exists()
+
+
+def test_on_as_the_last_word_exits_2_naming_it_before_anything_starts(
+    tmp_path, planted  # noqa: F811
+):
+    env, _ = planted
+    words = _record(tmp_path, "unused")
+    del words[words.index("--on") + 1 :]
+
+    done = subprocess.run(
+        words,
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert done.returncode == 2, done.stderr
+    assert "deploy: --on takes a command prefix" in done.stderr
+    assert not (tmp_path / "d").exists()
