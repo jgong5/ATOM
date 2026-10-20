@@ -184,26 +184,30 @@ def test_a_line_holding_an_error_over_5pct_either_way_is_declined_with_its_reaso
     assert ops.summary(rows)["decode aiter.gemm"]["max_error"] == pytest.approx(0.04)
 
 
-def test_fit_ops_holds_out_no_point_between_neighbours_one_context_away(
-    measured, tmp_path
+@pytest.mark.parametrize(
+    "rows, contexts, declined",
+    [
+        ((2, 2, 2), (511, 512, 513), []),
+        ((2, 2, 2), (510, 512, 514), ["context = 512 reads +10.0%"]),
+        ((2, 2, 2), (511, 512, 514), ["context = 512 reads +6.7%"]),
+        ((2, 2, 2), (510, 512, 513), ["context = 512 reads +13.3%"]),
+        ((1, 2, 3), (512, 512, 512), []),
+    ],
+)
+def test_fit_ops_holds_out_no_point_between_neighbours_one_apart(
+    rows, contexts, declined, measured, tmp_path
 ):
-    # one kernel stepping between contexts 512 and 513: 512 priced from 511 and
-    # 513 reads +10%, as it does from 510 and 514, where 511 and 513 go unmeasured
-    adjacent = [_point(2, ns, context=c) for c, ns in ((511, 10), (512, 10), (513, 12))]
-    wide = [
-        _point(2, ns, n=256, context=c) for c, ns in ((510, 10), (512, 10), (514, 12))
-    ]
-    d, _ = measured("m", adjacent + wide)
+    # one kernel stepping just above the middle point, which its neighbours price
+    # 6.7% to 13.3% high unless both are one away along that dimension
+    points = zip(rows, contexts, (10, 10, 12))
+    d, _ = measured("m", [_point(b, ns, context=c) for b, c, ns in points])
 
     got = _fit(tmp_path / "fit", tmp_path / "store", d)
 
-    families = got["params"]["families"].values()
-    declined = {min(p[0][1] for p in f["points"]): f["declined"] for f in families}
-    assert declined[511] == []
-    assert declined[510] == [
-        ["context", [2], "context = 512 reads +10.0% off its neighbours"]
-    ]
-    assert [r["at"] for r in got["report"]["held_out"]] == [[2, 512]]
+    (f,) = got["params"]["families"].values()
+    assert [why.split(" off")[0] for _, _, why in f["declined"]] == declined
+    held = [r["at"] for r in got["report"]["held_out"]]
+    assert held == ([[2, 512]] if declined else [])
 
 
 @pytest.mark.parametrize(
