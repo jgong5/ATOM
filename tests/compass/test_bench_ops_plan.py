@@ -258,14 +258,21 @@ def _moving_bench(fn, config, todo, llc):
 
 
 @pytest.mark.parametrize(
-    "stand_in, cached, covered",
+    "stand_in, cached, covered, round2",
     [
-        (_bench, {None, 8000}, 2),  # one kernel and time: only the far end
-        (_moving_bench, {None, 2000, 3000, 8000}, 1),  # its time grows: the ladder
+        # one kernel and time: only the far end, and round 2 densifies
+        (_bench, {None, 8000}, 2, {("aiter.gemm", None)}),
+        # its time grows: round 2 is the ladder alone, densifying after it
+        (
+            _moving_bench,
+            {None, 2000, 3000, 8000},
+            1,
+            {("aiter.attn", 2000), ("aiter.attn", 3000)},
+        ),
     ],
 )
 def test_a_plan_ladders_cached_tokens_only_for_a_prefill_kind_that_moves_there(
-    bench, tmp_path, monkeypatch, stand_in, cached, covered
+    bench, tmp_path, monkeypatch, stand_in, cached, covered, round2
 ):
     monkeypatch.setattr(ops, "_child", stand_in)
     plan = _records(
@@ -283,6 +290,8 @@ def test_a_plan_ladders_cached_tokens_only_for_a_prefill_kind_that_moves_there(
         if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
             attn.setdefault(r["shape"], set()).add(r["context"])
     assert attn == {f"prefill T={t} B=1": cached for t in (40, 100, 150)}
+    lines = (tmp_path / "out" / "round2" / "ops.jsonl").read_text().splitlines()
+    assert {(r["op"], r["context"]) for r in map(json.loads, lines)} == round2
     graded = _records(
         tmp_path / "graded",
         ([[120, 1120, False]], None),
