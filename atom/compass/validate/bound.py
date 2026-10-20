@@ -3,7 +3,7 @@
 time on every measured step, at step and at op level.
 
     compass validate bound --model M [--tp N] --machine SPEC --store S
-        RECORD... [-- ATOM args]
+        [--ops DIR] RECORD... [-- ATOM args]
 
 A RECORD is a real run's directory, its step record in `steps/`. Each forward
 there that is not a DP dummy run is priced at step level by the step roofline,
@@ -29,6 +29,14 @@ second over the steps priced at that granularity, analytical against
 measured: whether measured's fastest is analytical's fastest (top-1), or
 among its first three (top-3).
 
+Per op kind (`--ops`, a `measure ops --plan` run's `--out`): each point its
+plan.jsonl holds measured, its cold time over the analytical price of the same
+leaf at the point's shape and rows (`op_work.work`, `work.price`), as a
+distribution per op kind and phase, with the points priced above their
+measured time counted. Not gated: the bound holds per step, not per leaf. A
+point whose leaf the analytical price refuses is counted by its reason; one
+the plan refused to measure is counted apart.
+
 Refused: a record whose engine block (`dp<r>.engine.json`, else the `engine`
 of `dp<r>.key.json`) states another TP width or KV cache format than ATOM's
 arguments resolve; two-batch overlap of decode steps or on one rank, whose
@@ -41,7 +49,7 @@ import argparse
 import json
 import re
 import tempfile
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -213,6 +221,77 @@ def _ranking(rates: dict) -> dict | None:
     }
 
 
+def ops(out, machine, tp: int, kv: str) -> dict:
+    """The points a `measure ops --plan` run at `out` measured, each its cold
+    time over the analytical price of its leaf at its shape and rows on
+    `machine`, in a TP group of `tp` with a `kv` KV cache, by op kind and phase."""
+    from atom.compass.backends.op_work import work
+    from atom.compass.backends.work import price
+    from atom.compass.spec.rules import SpecRefusal
+
+    lines = Path(out, "plan.jsonl").read_text().splitlines()
+    ratios, refused, unmeasured = defaultdict(list), Counter(), 0
+    for p in map(json.loads, lines):
+        if "refused" in p:
+            unmeasured += 1
+            continue
+        rows = tuple(RequestShape(q, c, bool(d)) for q, c, d in p["rows"])
+        view = BatchView(rows, produces_output=True)
+        try:
+            w = work(json.loads(p["leaf"]), view, tp, kv)
+            if w is None:
+                raise ValueError("launches no kernel, so no price")
+            priced = price(w, machine)
+        except CostRefused as e:
+            refused.update(str(r) for r in e.declined)
+            continue
+        except (SpecRefusal, ValueError) as e:
+            refused[f"{p['op']}: {e}"] += 1
+            continue
+        ratios[p["op"], p["shape"].split()[0]].append(p["cold_ns"] * 1e-9 / priced)
+    return {
+        "points": len(lines),
+        "unmeasured": unmeasured,
+        "refused": dict(refused.most_common()),
+        "measured_over_analytical": {
+            f"{kind} {phase}": {
+                "points": len(r),
+                "above": sum(x < 1 for x in r),
+                **dict(
+                    zip(
+                        ("min", "p10", "median", "p90", "max"),
+                        np.percentile(r, (0, 10, 50, 90, 100)),
+                    )
+                ),
+            }
+            for (kind, phase), r in sorted(ratios.items())
+        },
+    }
+
+
+def ops_text(r: dict) -> str:
+    rows = r["measured_over_analytical"]
+    priced = sum(q["points"] for q in rows.values())
+    above = sum(q["above"] for q in rows.values())
+    out = [
+        (
+            f"op points: {r['points']} planned, {r['unmeasured']} unmeasured, "
+            f"{priced} priced, {sum(r['refused'].values())} refused; {above} priced "
+            "above their measured time, reported, not gated: the bound holds per step"
+        )
+    ]
+    out += [f"  refused {n} points: {reason}" for reason, n in r["refused"].items()]
+    out.append(
+        "  measured over analytical: kind phase | points | above | min | p10 | median | p90 | max"
+    )
+    for name, q in rows.items():
+        out.append(
+            f"  {name} | {q['points']} | {q['above']} | "
+            + " | ".join(f"{q[k]:.3f}" for k in ("min", "p10", "median", "p90", "max"))
+        )
+    return "\n".join(out)
+
+
 def text(report: dict) -> str:
     out = []
     for level, r in report.items():
@@ -297,6 +376,12 @@ def main(argv: list[str]) -> None:
     p.add_argument(
         "--store", required=True, help="the artifact store holding the op_graphs"
     )
+    p.add_argument(
+        "--ops",
+        metavar="DIR",
+        help="a `measure ops --plan` run's --out, whose points are each priced "
+        "at their leaf, shape and rows",
+    )
     args = p.parse_args(argv[:cut])
 
     from atom.compass.backends.op_graph import OpGraphBackend
@@ -316,6 +401,7 @@ def main(argv: list[str]) -> None:
             "states its split, and only a data-parallel group's prefill split "
             "is rebuilt from the group's lines"
         )
+    engines = []
     for record in args.records:
         for path in sorted(Path(record, "steps").glob("dp*[0-9].jsonl")):
             engine = path.with_suffix(".engine.json")
@@ -323,14 +409,20 @@ def main(argv: list[str]) -> None:
                 ran = json.loads(engine.read_text())
             else:
                 ran = json.loads(path.with_suffix(".key.json").read_text())["engine"]
-            if differ := [k for k in PRICED if ran.get(k) != getattr(config, k)]:
-                raise ValueError(
-                    f"{path.parent} ran under another engine than ATOM's arguments resolve: "
-                    + "; ".join(
-                        f"{k} {ran.get(k)!r} there, {getattr(config, k)!r} here"
-                        for k in differ
-                    )
+            engines.append((path.parent, ran))
+    if args.ops:
+        engines.append(
+            (args.ops, json.loads(Path(args.ops, "engine.json").read_text()))
+        )
+    for where, ran in engines:
+        if differ := [k for k in PRICED if ran.get(k) != getattr(config, k)]:
+            raise ValueError(
+                f"{where} ran under another engine than ATOM's arguments resolve: "
+                + "; ".join(
+                    f"{k} {ran.get(k)!r} there, {getattr(config, k)!r} here"
+                    for k in differ
                 )
+            )
     backends = {
         "step": StepRooflineBackend(machine, walk(tree)),
         "op": OpGraphBackend(
@@ -343,5 +435,16 @@ def main(argv: list[str]) -> None:
     mtp = config.speculative_config is not None
     report = gate(args.records, backends, config.enable_tbo, mtp)
     print(text(report))
+    if args.ops:
+        print(
+            ops_text(
+                ops(
+                    args.ops,
+                    machine,
+                    config.tensor_parallel_size,
+                    config.kv_cache_dtype,
+                )
+            )
+        )
     if any(r["violations"] for r in report.values()):
         raise SystemExit(1)

@@ -23,7 +23,7 @@ from atom.compass.backends.cost import CostTerm, StepCost
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.step_roofline import Module, StepRooflineBackend
-from atom.compass.backends.work import Work
+from atom.compass.backends.work import Work, price
 from atom.compass.validate import bound
 
 SILU = "aiter.silu_and_mul.default"
@@ -200,7 +200,7 @@ def test_an_mtp_record_is_measured_by_its_target(tmp_path):
     assert refused == Refusal(bound.SOURCE, bound.UNSPLIT)
 
 
-def _main(monkeypatch, tmp_path, records, tp=1):
+def _main(monkeypatch, tmp_path, records, tp=1, more=()):
     config = SimpleNamespace(
         tensor_parallel_size=tp,
         kv_cache_dtype="bf16",
@@ -214,7 +214,8 @@ def _main(monkeypatch, tmp_path, records, tp=1):
     monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: graph)
     spec = tmp_path / "spec.json"
     spec.write_text(json.dumps(ROOFLINE))
-    argv = ["--model", "m", "--machine", str(spec), "--store", "s", *map(str, records)]
+    argv = ["--model", "m", "--machine", str(spec), "--store", "s", *more]
+    argv += map(str, records)
     bound.main(argv)
 
 
@@ -237,3 +238,79 @@ def test_main_refuses_a_record_its_key_states_another_tp_for(monkeypatch, tmp_pa
 
     with pytest.raises(ValueError, match="tensor_parallel_size 2 there, 1 here"):
         _main(monkeypatch, tmp_path, [slow])
+
+
+def plan(path, points):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "plan.jsonl").write_text("".join(json.dumps(p) + "\n" for p in points))
+    return path
+
+
+def point(op, shape, rows, cold_ns, **more):
+    record = {"shape": shape, "context": None, "op": op["op"], "rows": rows}
+    return record | {"leaf": json.dumps(op), "cold_ns": cold_ns, **more}
+
+
+ATTN = "aiter.unified_attention_with_output_base.default"
+
+
+def test_each_measured_point_is_its_cold_time_over_its_leafs_price(tmp_path):
+    short, long = [[1, 900, True], [1, 300, True]], [[1, 200000, True]] * 2
+    silu = leaf(SILU, [[2, 4096]], input=t([2, 8192]))
+    attn = leaf(ATTN, [[2, 6144]], q=t([2, 6144]), k=t([2, 1024]), v=t([2, 1024]))
+    attn["args"] |= {"layer_name": {"context": None}, "use_mla": False}
+
+    def priced(op, rows):
+        view = BatchView(tuple(RequestShape(*r) for r in rows), produces_output=True)
+        return price(op_work.work(op, view, 1, "bf16"), SPEC) * 1e9
+
+    decode = "decode T=2 B=2"
+    out = plan(
+        tmp_path,
+        [
+            point(silu, decode, short, 3 * priced(silu, short)),
+            point(silu, decode, short, 0.5 * priced(silu, short)),
+            point(silu, decode, short, 0.8 * priced(silu, short)),
+            point(silu, "prefill T=2 B=1", [[2, 2, False]], 2 * priced(silu, short)),
+            point(attn, decode, long, 1.5 * priced(attn, long)),
+            point(silu, decode, short, 0, refused="ValueError: no room"),
+            point(leaf("aten.empty.memory_format", [[2, 4096]]), decode, short, 0),
+            point(leaf("x.unknown.default"), decode, short, 1000),
+        ],
+    )
+
+    r = bound.ops(out, SPEC, 1, "bf16")
+
+    assert (r["points"], r["unmeasured"]) == (8, 1)
+    assert r["refused"] == {
+        "refused(op-work: no extractor for the op kind x.unknown.default)": 1,
+        "aten.empty.memory_format: launches no kernel, so no price": 1,
+    }
+    q = r["measured_over_analytical"]
+    assert list(q) == [f"{SILU} decode", f"{SILU} prefill", f"{ATTN} decode"]
+    # Attention reads the KV of the point's rows, not of its shape alone.
+    assert priced(attn, long) > 10 * priced(attn, short)
+    assert q[f"{ATTN} decode"]["median"] == pytest.approx(1.5)
+    assert (q[f"{SILU} decode"]["points"], q[f"{SILU} decode"]["above"]) == (3, 2)
+    assert (q[f"{SILU} decode"]["min"], q[f"{SILU} decode"]["max"]) == pytest.approx(
+        (0.5, 3)
+    )
+    assert q[f"{SILU} prefill"]["median"] == pytest.approx(2)
+    assert "2 priced above their measured time" in bound.ops_text(r)
+
+
+def test_main_reports_an_ops_run_and_refuses_one_of_another_engine(
+    monkeypatch, tmp_path, capsys
+):
+    slow = record(tmp_path / "slow", LINES[:3])
+    engine = {"tensor_parallel_size": 1, "kv_cache_dtype": "bf16"}
+    (slow / "steps" / "dp0.engine.json").write_text(json.dumps(engine))
+    out = plan(tmp_path / "plan", [])
+    (out / "engine.json").write_text(json.dumps(engine))
+
+    _main(monkeypatch, tmp_path, [slow], more=["--ops", str(out)])
+    assert "op points: 0 planned" in capsys.readouterr().out
+
+    (out / "engine.json").write_text(json.dumps(engine | {"kv_cache_dtype": "fp8"}))
+    with pytest.raises(ValueError, match="kv_cache_dtype 'fp8' there, 'bf16' here"):
+        _main(monkeypatch, tmp_path, [slow], more=["--ops", str(out)])
