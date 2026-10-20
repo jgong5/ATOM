@@ -16,6 +16,7 @@ import pytest
 import torch
 from test_artifact_store import CONDITIONS, GATES, stanza
 from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
+from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 
 from atom.compass import ir
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
@@ -182,7 +183,7 @@ def test_coverage_counts_a_step_only_when_every_leaf_sits_in_one_kernel_s_band(
     )
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert (report["steps"], report["covered"]) == (6, 2)
     assert report["by phase"] == {
@@ -244,7 +245,7 @@ def test_a_plan_measures_prefill_attention_over_cached_tokens_and_coverage_reads
     )
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["by phase"] == {"prefill": {"steps": 4, "covered": 2}}
     assert report["left out, by leaf kind"] == {
@@ -304,7 +305,7 @@ def test_a_plan_ladders_cached_tokens_only_for_a_prefill_kind_that_moves_there(
     )
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["by phase"] == {"prefill": {"steps": 2, "covered": covered}}
 
@@ -384,7 +385,7 @@ def test_coverage_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_
     graded = _records(tmp_path / "graded", ([[1, 3000, True]], 2))
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["left out, by leaf kind"] == {
         "aiter.attn": {"outside the measured range": 1}
@@ -451,21 +452,11 @@ def _publish_graph(store, config, arch, shape):
 
 @pytest.mark.parametrize("held", [("gfx942", "gfx950"), ("gfx942",)])
 def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
-    tmp_path, monkeypatch, held
+    tmp_path, monkeypatch, held, model_config  # noqa: F811
 ):
-    (tmp_path / "model").mkdir()
-    (tmp_path / "model" / "config.json").write_text("{}")
-    config = SimpleNamespace(
-        model=str(tmp_path / "model"),
-        hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
-        tensor_parallel_size=1,
-        parallel_config=SimpleNamespace(data_parallel_size=1),
-        enable_expert_parallel=False,
-        enforce_eager=True,
-    )
     store = ArtifactStore(str(tmp_path / "store"))
     for arch in held:
-        _publish_graph(store, config, arch, decode(1))
+        _publish_graph(store, model_config, arch, decode(1))
 
     def no_gpu(*args, **kwargs):
         raise RuntimeError("No HIP GPUs are available")
@@ -475,10 +466,12 @@ def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
     def trace(fn, argv):
         """`trace ops` as the capture publishes: on the arch `--arch` names."""
         traced.append(argv[argv.index("--arch") + 1])
-        _publish_graph(store, config, traced[-1], decode(1))
+        _publish_graph(store, model_config, traced[-1], decode(1))
 
     monkeypatch.setattr(torch.cuda, "get_device_properties", no_gpu)
-    monkeypatch.setattr("atom.compass.bench.measure.atom_config", lambda a: config)
+    monkeypatch.setattr(
+        "atom.compass.bench.measure.atom_config", lambda a: model_config
+    )
     monkeypatch.setattr(ops, "_child", trace)
     out = tmp_path / "out"
     out.mkdir()

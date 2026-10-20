@@ -976,7 +976,7 @@ def _coverage_main(argv: list[str], atom_args: list[str]) -> dict:
     return coverage(store, args.store, config, args.coverage, records, arch)
 
 
-def coverage(store, root, config, names, records, arch=None) -> dict:
+def coverage(store, root, config, names, records, arch) -> dict:
     """How the measured points among `records` cover the steps of the record
     directories `names`: the steps and those covered by phase, and per leaf
     kind the steps it left out by why. A step is covered when each leaf of its
@@ -984,8 +984,7 @@ def coverage(store, root, config, names, records, arch=None) -> dict:
     decode leaf of a kind that depends on context over its rows' lowest to
     highest context (`_rows`), any other decode leaf at its width, a prefill
     leaf at its tokens, and one of a kind that depends on context over its
-    rows' cached tokens too (`_bracket_cached`). The graphs are `arch`'s,
-    this GPU's when it is None."""
+    rows' cached tokens too (`_bracket_cached`). The graphs are `arch`'s."""
     from atom.compass.capture import population_steps
 
     steps = list(population_steps(names))
