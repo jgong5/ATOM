@@ -16,6 +16,7 @@ import itertools
 import json
 import math
 import re
+import sys
 
 import numpy as np
 import pytest
@@ -38,7 +39,11 @@ from atom.compass.artifacts import (
     member_name,
 )
 from atom.compass.backends import BatchView, CostRefused, RequestShape
-from atom.compass.backends.step_grid import StepGridBackend, equivalent_shape
+from atom.compass.backends.step_grid import (
+    StepGridBackend,
+    equivalent_shape,
+    length_statistics,
+)
 from atom.compass.backends.step_grid_residual import Residual, order, raggedness
 from atom.compass.backends.step_labels import digest
 from atom.compass.bench import window
@@ -442,3 +447,83 @@ def test_a_flag_step_grid_does_not_read_or_lacks_refuses(tmp_path, run, args, na
     with pytest.raises(SystemExit, match=re.escape(named)):
         fit(tmp_path, "fit steps", *argv)
     assert not (tmp_path / "store" / "step_grid_bundle").exists()
+
+
+def ragged_lines(seed, n, rows=(2, 9), low=400):
+    """`n` decode batches at rung 8, of 2 to 8 rows on contexts `low` to 1024,
+    so the longest row is at most 2.6 times the mean."""
+    rng = np.random.default_rng(seed)
+    return [
+        batch([(1, int(k), True) for k in rng.integers(low, 1025, rng.integers(*rows))])
+        for _ in range(n)
+    ]
+
+
+def alpha_true(rows) -> float:
+    ratio, _ = length_statistics(rows)
+    return 0.2 + 0.3 * ratio
+
+
+def ragged_time(line) -> float:
+    """`time`, but a decode line is read `alpha_true` of the way from B rows at
+    its mean to B rows at its longest row."""
+    rows = view(line).requests
+    if not rows[0].decode:
+        return planted_time(line)
+    cached = [r.context_tokens - 1 for r in rows]
+    b, mean = len(rows), sum(cached) / len(rows)
+
+    def g(c):
+        return 2e-3 + 1e-5 * b + 1e-7 * c + 1e-9 * b * c
+
+    return g(mean) + alpha_true(rows) * (g(max(cached)) - g(mean))
+
+
+planted_time = time
+
+
+@pytest.mark.parametrize("records_alpha", [True, False], ids=["kept", "dropped"])
+def test_alpha_is_fitted_on_ragged_views_and_kept_only_where_no_cell_gets_worse(
+    tmp_path, run, monkeypatch, records_alpha
+):
+    """The ragged views read alpha = 0.2 + 0.3 (longest / mean - 1). Where the
+    calibration records run that way too, each record's steps priced by a
+    residual fitted on the other's come nearer their times with alpha, and the
+    rung keeps it; where they run at their mean, alpha moves them away, and the
+    grid holds none."""
+    g = record(tmp_path, run, nodes(), name="g")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    views = [
+        measured(tmp_path, run, x, "ragged", ragged_time(x))
+        for x in ragged_lines(5, 40)
+    ]
+    if records_alpha:
+        monkeypatch.setattr(sys.modules[__name__], "time", ragged_time)
+    cells = [
+        record(tmp_path, run, ragged_lines(s, 120), name=n)
+        for s, n in ((6, "a"), (7, "b"))
+    ]
+
+    copy = fitted(
+        tmp_path,
+        *cells,
+        *views,
+        *clients(g),
+        *[a for c in cells for a in clients(c)],
+        grid="g",
+    )
+
+    report, grid = copy["report"]["alpha"]["8"], copy["params"]["grid"]
+    assert report["views"] == 40 and report["unread"] == []
+    terms = report["forms"][report["form"]]["terms"]
+    assert terms[:2] == pytest.approx([0.2, 0.3], abs=1e-6)
+    assert len(report["cells"]) == 2 and report["kept"] is records_alpha
+    assert set(grid["decode"]["alpha"]) == ({"8"} if records_alpha else set())
+    assert copy["params"]["sources"] == ["record"]
+    assert list(copy["report"]["kinds"]["decode"]["sources"]) == ["record"]
+    backend = loaded(tmp_path, run, copy)
+    for line in ragged_lines(8, 10):
+        priced = backend.price(view(line)).seconds
+        expected = ragged_time(line) if records_alpha else planted_time(line)
+        assert priced == pytest.approx(expected * factor(line), rel=1e-5)

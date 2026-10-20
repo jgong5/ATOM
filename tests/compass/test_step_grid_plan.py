@@ -692,3 +692,24 @@ def test_no_step_is_refused(tmp_path):
         plan(tmp_path)
     with pytest.raises(ValueError, match="there is no step to read"):
         step_grid_plan.coverage(None, [])
+
+
+def test_a_grid_holding_alpha_reads_every_planned_steps_longest_row_measured(
+    tmp_path, monkeypatch
+):
+    """The decode steps of 200-, 20- and 50-token prompts read their mean near
+    c 90 and their longest row near c 200, two cells apart; the plan measures
+    both, so with alpha on every rung each step is read at both."""
+    records = [record(tmp_path, monkeypatch, *n) for n in (MIXED, SHORT)]
+    planned = plan(*records)
+    member = measured(planned, located(tmp_path, planned))
+    alpha = {"intercept": 1.0, "ratio": 0.0, "spread": 0.0}
+    member["grid"]["decode"]["alpha"] = dict.fromkeys(map(str, LADDER), alpha)
+    grid = StepGrid(member["grid"])
+
+    ragged = 0
+    for _, line in steps(*records)[0]:
+        if line["rows"][0][2]:
+            cell = grid.value(view(line))[4]
+            ragged += "longest row's cell" in cell
+    assert ragged > 0
