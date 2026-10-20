@@ -76,11 +76,24 @@ def serve(stamps: str, args: list[str]) -> None:
 
         module.Starlette.__call__ = __call__
 
+    def preprocessors(module) -> None:
+        cls = module.InputOutputProcessor
+        tokenize = cls.preprocess_fanout
+
+        def preprocess_fanout(*a, **k):
+            start = time.monotonic_ns()
+            got = tokenize(*a, **k)
+            stamp("prep", start, 0)
+            return got
+
+        cls.preprocess_fanout = preprocess_fanout
+
     # Each module is patched once it has run, before anything imports from it.
     patches = {
         "starlette.requests": requests,
         "starlette.applications": apps,
         "atom.entrypoints.openai.chat_encoders": encoders,
+        "atom.model_engine.llm_engine": preprocessors,
     }
 
     class Patcher(importlib.abc.MetaPathFinder):
