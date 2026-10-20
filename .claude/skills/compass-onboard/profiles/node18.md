@@ -39,9 +39,16 @@ their own client venv (QUICKSTART's recipe) in the data directory.
 - Fallback when `/data` has no room for the developer: the data directory on
   the host's tmpfs, such as `/tmp/<user>_compass`, mounted in the container at
   the same path, and the container started with a tmpfs at each directory the
-  runs fill: `--tmpfs /root/.cache:size=64g --tmpfs /root/.aiter:size=64g
-  --tmpfs /root/.triton:size=16g --tmpfs /tmp:size=64g`. A tmpfs is memory: it
-  is lost at reboot, so copy out what should stay.
+  runs fill:
+
+  ```
+  --tmpfs /root/.cache:size=64g,exec --tmpfs /root/.aiter:size=64g,exec
+  --tmpfs /root/.triton:size=16g,exec --tmpfs /tmp:size=64g,exec
+  ```
+
+  Docker mounts a tmpfs `noexec` unless told `exec`, and these caches hold
+  shared objects the engine loads. A tmpfs is memory: it is lost at reboot, so
+  copy out what should stay.
 - The writable layer then takes aiter's built modules and aiperf's bytecode:
   20 MB through step 0 of a node-18 run on 2026-10-20, when `/root/.aiter`, now
   on tmpfs, held 227 MB. Step 0 takes the container's builds; a later record

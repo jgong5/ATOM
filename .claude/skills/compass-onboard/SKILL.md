@@ -33,7 +33,12 @@ printed and wrote. They learn Compass from their own run.
 3. **Stop on any failure.** A non-zero exit, a refusal, or an output you cannot
    explain stops the session at that step: read it (Reading a failure), tell the
    developer the cause and the fix, and ask before anything runs again. Never
-   edit a script, a machine spec or a profile to get past a refusal.
+   edit a script, a machine spec or a profile to get past a refusal. One
+   exception: when you have verified in the container that a container option
+   the profile gives is the cause, you may, on the developer's yes, take the
+   container step again with that option fixed (Taking the container step
+   again). Tell them it is a defect in this skill's profile, to file as an
+   issue.
 4. **Safety.**
    - A GPU only while the GPU check (Checks) reads it idle; check again before
      each GPU step.
@@ -55,20 +60,20 @@ refuses and ends the session: say what failed, what is missing, and that
 nothing was started. A check that offers the developer a choice (Disk, GPU)
 runs again on their answer, and the session ends only when they take none.
 
-1. **Target.** Ask which machine they want Compass to simulate; the default is
-   the one they are on. A target with no hardware they can run, such as MI455,
-   cannot be onboarded: the quickstart calibrates on real runs of the device
-   and grades against them. Explain that such a target is a projection only: a
-   machine spec whose unmeasured fields are marked assumed
+1. **Target.** Read `hostname` and `rocm-smi --showhw` (each GPU's GFX version
+   and device id, DID), name them, and ask which machine they want Compass to
+   simulate: these GPUs, or another target. A target with no hardware they can
+   run, such as MI455, cannot be onboarded: the quickstart calibrates on real
+   runs of the device and grades against them. Explain that such a target is a
+   projection only: a machine spec whose unmeasured fields are marked assumed
    (`atom/compass/design/05_machine_spec_and_probes.md`, D25's schema rules and
    D26), priced analytically from peaks carried over from a measured device,
    and held to soundness checks instead of a grade
    (`atom/compass/design/08_validation_protocol.md`, D50.2). Offer to onboard
    on a device they can run, and stop.
-2. **Profile and machine spec.** On the host, read `hostname` and `rocm-smi
-   --showhw` (each GPU's GFX version and device id, DID). Find the profile in
-   this skill's `profiles/` whose `hosts` holds the hostname (Profiles), then
-   the machine spec it names. Refuse, naming each missing piece, when:
+2. **Profile and machine spec.** Find the profile in this skill's `profiles/`
+   whose `hosts` holds the hostname (Profiles), then the machine spec it
+   names. Refuse, naming each missing piece, when:
    - no profile names this host: name the host, its GPUs' GFX version and DID,
      the directory searched and what a profile states, and whether
      `scripts/compass/machines/` has a spec whose `device.arch` is that GFX
@@ -88,19 +93,21 @@ runs again on their answer, and the session ends only when they take none.
 4. **Disk.** `df -h`, as the developer, on the profile's data directory (its
    nearest existing parent if it does not exist yet) and on Docker's storage
    (`docker info -f '{{.DockerRootDir}}'`). The data directory needs what
-   QUICKSTART's Disk gives for its runs and a running client's map, with room
-   to spare; without it, offer the profile's fallback or ask for a directory
-   with room. Docker's storage takes the container's writable layer: its cache
-   and whatever else the profile does not mount elsewhere. When it reads no
-   room, give the developer the profile's figure for that layer and where the
-   daemon, which writes as root, would put it, and ask. Keep runs, trees,
-   venvs and caches off the root disk; QUICKSTART's `git fetch` in the
+   QUICKSTART's Disk gives for the path about to run (the smoke cell's figures
+   now, the full cell's before the full path) and a running client's map, with
+   room to spare; without it, offer the profile's fallback or ask for a
+   directory with room. Docker's storage takes the container's writable layer:
+   its cache and whatever else the profile does not mount elsewhere. When it
+   reads no room, give the developer the profile's figure for that layer and
+   where the daemon, which writes as root, would put it, and ask. Keep runs,
+   trees, venvs and caches off the root disk; QUICKSTART's `git fetch` in the
    checkout is the only write there.
 5. **Inputs.** The model directory (QUICKSTART's `MODEL`, a container path:
    read it on the host through the profile's mounts) resolves `config.json`;
-   the traces file's size is QUICKSTART's (its sha256 takes a minute, and
-   QUICKSTART gives its prefix: offer it).
-6. **GPU.** Run the tree's `scripts/compass/preflight.sh` on the host, then
+   the traces file's size is QUICKSTART's (its sha256 reads the whole file, up
+   to a minute when it is not cached, against the prefix QUICKSTART gives:
+   offer it).
+6. **GPU.** Run the checkout's `scripts/compass/preflight.sh` on the host, then
    QUICKSTART's check of a shared GPU (its use, VRAM and process listing). A GPU
    is idle when `PREFLIGHT_RC=0`, preflight lists it under `idle and empty`,
    and QUICKSTART's check reads it at 0% use and 0% VRAM with no process on it:
@@ -110,8 +117,9 @@ runs again on their answer, and the session ends only when they take none.
    runs; judge by its idle list and the check after it. Ask which GPU they want,
    within the profile's Allocation (ask which GPUs it leaves to them). Refuse
    a busy one, naming its VRAM or use reading or the PID on it, and offer the
-   idle ones, or none. Its HIP ordinal is the entry of preflight's `export
-   HIP_VISIBLE_DEVICES=` line at the GPU's position in the idle list.
+   idle ones within the Allocation, or none. Its HIP ordinal is the entry of
+   preflight's `export HIP_VISIBLE_DEVICES=` line at the GPU's position in the
+   idle list.
 
 Then summarize in one block: host, machine spec, GPU and HIP ordinal, data
 directory, image, container name. Offer the smoke path.
@@ -124,6 +132,7 @@ Create the data directory as the developer before the container mounts it, or
 the daemon creates it as root. Once the tree step names `$T`, write
 QUICKSTART's Variables, filled for this session, into one file in the data
 directory and source it in every `docker exec`: a tool call keeps no shell.
+Announce that file and show it; it holds nothing, so it needs no yes.
 
 1. **Container.** QUICKSTART's `docker run`, with the profile's image, mounts
    and options, named `<user>_<purpose>`. If a container of that name is the
@@ -141,17 +150,18 @@ directory and source it in every `docker exec`: a tool call keeps no shell.
    simulated server's paces aiperf on the server's virtual clock through
    compass-harness (`atom/compass/design/06_workload_harness_contract.md`, D34).
 4. **The smoke cell.** QUICKSTART's The smoke cell block. It holds the GPU for
-   the time QUICKSTART measured, wants the node to itself while it calibrates,
-   and takes the disk QUICKSTART's Disk gives. Say that this one yes covers all
-   its steps, which run back to back. Run it detached in the container, its
-   output in a log outside its OUT (it refuses an OUT that is not empty), since
-   it outlives any one tool call. Follow the log without holding a tool call
-   open: each `smoke_cell: <step>` line means the step before it finished, so
-   explain that step from its directory while the next runs. To stop it, send
-   `smoke_cell.sh` SIGTERM; it stops its server as it exits. When it exits,
-   explain the grading table and its last line.
+   the time QUICKSTART measured and takes the disk QUICKSTART's Disk gives. Its
+   calibration times the host, so show what the GPU check reads on the node's
+   other GPUs and ask the developer to confirm the node is quiet enough. Say
+   that this one yes covers all its steps, which run back to back. Run it
+   detached in the container, its output in a log outside its OUT (it refuses
+   an OUT that is not empty), since it outlives any one tool call. Follow the
+   log without holding a tool call open: each `smoke_cell: <step>` line means
+   the step before it finished, so explain that step from its directory while
+   the next runs. When it exits, explain the grading table and its last
+   line.
 
-Then offer the full path.
+Then offer the full path, or Cleanup.
 
 ## The full path
 
@@ -163,7 +173,39 @@ be skipped: say so and let the developer choose. Step 2 times the host as well:
 before it, show what preflight reads on the other GPUs and ask the developer to
 confirm the node is quiet enough, since a neighbour's run skews a calibration
 record. Run step 3's two loops at once only on two GPUs that both pass the GPU
-check.
+check. Then offer Cleanup.
+
+## Stopping a step
+
+Signal only the step's own processes, in the container. SIGTERM the detached
+step's script first, then whatever it started that still runs: `smoke_cell.sh`
+on its exit stops a server it started in the background, but not the command it
+was running in the foreground (`measure memory`, a fit, `client.sh`,
+grading), and a stopped `serve` loop leaves its compass command running. `ps
+-ef` in the container shows them; SIGTERM each, and a compass command stops its
+own server and engine. The step has stopped once the GPU check reads no
+process on the GPU. Take it again into a fresh OUT (QUICKSTART, stopping a
+step).
+
+## Taking the container step again
+
+Under Rule 3's exception only. Stop any step still running in the container
+(Stopping a step), remove that container, and run QUICKSTART's `docker run`
+again with the same name, image and mounts and the one option fixed. Check the
+fix in the new container (for a mount option, `/proc/mounts`). The tree, the
+venv (`$V`) and the variables file live in the data directory on the host and
+are kept, so steps 2 and 3 are not taken again; the failed step is, into a
+fresh OUT.
+
+## Cleanup
+
+A step of its own, offered when the developer is done. Say what it removes and
+what to copy out first, such as the cell's `grade.log` and logs. The container
+runs as root, so what it wrote in the data directory is root's on the host:
+remove the data directory's contents from inside the container, then the
+container, then the empty data directory on the host. After it, `docker ps -a`
+lists no container of this session and the GPU check reads the GPU free.
+Remove nothing outside this session's data directory and container.
 
 ## Explaining a step
 
@@ -172,7 +214,7 @@ mean. Design topics are under `atom/compass/design/`; give the one named.
 
 | After | Open | Explain |
 |---|---|---|
-| memory | `memory/memory_readings.json`; the log's `published ... as <token>` line | What an engine start reads off the device (`members`: capacity, reserves, activations, the graph pool), taken once so that a simulated run sizes ATOM's own KV pool from them with no device. Its `key` is what it was measured under; the token names it in the store. `03` D14 |
+| memory | `memory/memory_readings.json`; the log's `published ... as <token>` line; `memory/engine.log` | What an engine start reads off the device (`members`: capacity, reserves, activations, the graph pool), taken once so that a simulated run sizes ATOM's own KV pool from them with no device. Its `key` is what it was measured under; the token names it in the store. `03` D14. The engine sees only the GPU `HIP_VISIBLE_DEVICES` names and numbers it 0, so its log's `GPUs 0 to 0` and `cuda:0` are rocm-smi's GPU G. |
 | warm | `warm/run.json`, `aiter_jit_builds` | The kernels aiter built the first time this container met them. The cost model does not model warmth, so nothing reads this record and grading refuses a record that built one (`06` D27, *Warmup is not a protocol feature*). |
 | a record: calibration, real1, real2 | `run.json`; `steps/dp0.jsonl` and `dp0.engine.json`; `artifacts/client_run.json`; `server.log`; `preflight_*.txt`, `gpu_*.txt` | `run.json`: the tree (`source`), the stack, the device and PTL, the environment, the engine's bounds (`engine`). The step record: one line per forward step, its batch and its times (`atom/compass/parity/__init__.py` says what each field holds); show one prefill and one decode line with their durations. The client run names every request sent. The GPU checks before and after the server. `07` D38 |
 | fit_steps | `fit_steps/step_linear_law.json` | The step linear law: per vector, a step cost fitted in relative error on the calibration steps (`09` D53 to D55). `params.unfitted` must be `{}`; `report.vectors` holds the samples behind each. `report.held_out` is empty with one calibration record, which is why the smoke cell's cost rows read unvalidated. |
@@ -205,10 +247,16 @@ row is a result, not a failure.
 4. Exits 90 to 99 are the tree checks in `scripts/compass/_lib.sh`: `atom`
    resolved outside `$T`, usually a missing `PYTHONPATH=$T` or a command not
    run from `/`.
-5. A step taken again needs a fresh OUT (QUICKSTART, stopping a step).
-6. A symptom Traps does not hold: show the developer the log lines that matter
+5. `failed to map segment from shared object`, or `Triton cache error:
+   compiled module ... could not be loaded`: a cache on a mount without `exec`.
+   Read `/proc/mounts` in the container: `noexec` on `/root/.cache`,
+   `/root/.aiter`, `/root/.triton` or `/tmp` is the cause, and the fix is that
+   mount with `exec` (Rule 3's exception).
+6. A step taken again needs a fresh OUT (QUICKSTART, stopping a step).
+7. A symptom Traps does not hold: show the developer the log lines that matter
    and ask. Do not guess a fix or patch a script; a quickstart defect is an
-   issue to file.
+   issue to file. A cause you have verified in a container option the profile
+   gives is Rule 3's exception.
 
 ## Profiles
 
