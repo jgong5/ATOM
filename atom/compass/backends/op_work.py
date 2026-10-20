@@ -20,7 +20,7 @@ so one call prices every instance of a signature at a view.
 
 Aten operators share one extractor, whose F is `torch.utils.flop_counter`'s
 formula where it has one. A leaf that launches no kernel (a view, an
-allocation, a wait) has no work: None. A collective spans the `tp` ranks of
+allocation, a wait, one whose outputs hold no element) has no work: None. A collective spans the `tp` ranks of
 the tensor-parallel group unless the leaf states its group size. A kind with
 no extractor, or a leaf its extractor cannot price, is refused by name.
 
@@ -515,6 +515,10 @@ def work(op: dict, view: BatchView, tp: int, kv_format: str) -> Work | None:
     if not extract:
         reason = f"no extractor for the op kind {name}"
         raise CostRefused(view, [Refusal(SOURCE, reason)])
+    # Its outputs, an in-place leaf's target among them, hold no element: it
+    # writes nothing, whatever its sources hold.
+    if op["out"] and not any(map(math.prod, op["out"])):
+        return None
     try:
         return extract(op, view, tp, kv_format)
     except _Unpriced as error:
