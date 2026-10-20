@@ -113,6 +113,8 @@ def test_the_path_runs_in_order_and_ends_with_the_cell_s_verdict(tmp_path):
     client = "--concurrency 1 --duration 600 --stop"
     assert log == [
         f"measure memory --gpu 7 {machine} --out {o}/memory",
+        f"record --gpu 7 --out {o}/warm",
+        f"client {o}/warm --traces 0-7 {client} /real/python",
         f"record --gpu 7 --out {o}/calibration",
         f"client {o}/calibration --traces 256-263 {client} /real/python",
         f"fit steps --backend step-linear --form history {cal} {machine} --out {o}/fit_steps",
@@ -140,12 +142,13 @@ def test_a_busy_gpu_runs_nothing(tmp_path):
     "fail, step, ran",
     [
         ("measure memory", "memory", 1),
-        ("calibration", "calibration", 2),
-        ("fit steps", "fit_steps", 4),
-        ("fit host", "fit_host", 5),
-        ("real2", "real2", 8),
-        ("step_linear", "step_linear", 10),
-        ("validate", "grade", 11),
+        ("warm", "warm", 2),
+        ("calibration", "calibration", 4),
+        ("fit steps", "fit_steps", 6),
+        ("fit host", "fit_host", 7),
+        ("real2", "real2", 10),
+        ("step_linear", "step_linear", 12),
+        ("validate", "grade", 13),
     ],
 )
 def test_a_failed_step_is_named_and_ends_the_run(tmp_path, fail, step, ran):
@@ -197,7 +200,7 @@ def test_a_failed_client_run_stops_its_server_and_names_its_step(tmp_path):
     r, log, o = _smoke(tmp_path, CLIENT_FAIL="real1")
     assert r.returncode == 1
     assert "smoke_cell: step real1 failed: client.sh exit 1" in r.stderr
-    assert len(log) == 7
+    assert len(log) == 9
     pid = json.loads((o / "cell" / "real1" / "server.json").read_text())["pid"]
     assert not _alive(pid)
 
@@ -206,4 +209,4 @@ def test_a_server_that_exits_non_zero_names_its_step(tmp_path):
     r, log, _ = _smoke(tmp_path, STOP_FAIL="real2")
     assert r.returncode == 1
     assert "smoke_cell: step real2 failed: its server exit 3" in r.stderr
-    assert len(log) == 9
+    assert len(log) == 11

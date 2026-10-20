@@ -142,7 +142,7 @@ def test_a_step_reads_the_graph_captured_at_its_shape(batch, padded, shape):
         (
             BatchView((RequestShape(9, 9, False),), image_tokens=5),
             g(1, 8, 8),
-            "5 image tokens",
+            "a step with image tokens",
         ),
         (
             replace(FINAL, moe_rows=18),
@@ -338,7 +338,7 @@ def test_a_gather_of_token_ids_runs_inline_on_the_compute_stream():
             False,
             "does not say whether it produces output",
         ),
-        (replace(SPLIT, image_tokens=5), layers(), False, "5 image tokens"),
+        (replace(SPLIT, image_tokens=5), layers(), False, "a step with image tokens"),
     ],
     ids=[
         "split-send-recv",

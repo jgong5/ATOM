@@ -7,7 +7,8 @@ The checked-in PTL-off law loads under hjbog-srdc-39's machine file and refuses
 under node 18's, and under one that differs from hjbog-srdc-39's in its PTL
 state alone, naming both digests and this run's key. Records whose cards read
 another PTL state than the spec states refuse at the fit, naming it, and so do
-step grid bundles and step measurements at load.
+step grid bundles and step measurements at load. Every checked-in law states
+this tree's `atom` digest, so a run that carries one installs it.
 """
 
 import copy
@@ -45,6 +46,7 @@ from atom.compass.artifacts import (
 from atom.compass.backends import StepLinearBackend
 from atom.compass.drive import identity, measure_memory
 from atom.compass.drive.gpu import GpuRefusal
+from atom.compass.run import host_key_of
 from atom.compass.spec import MachineSpec
 
 ROOT = Path(__file__).resolve().parents[2] / "scripts" / "compass"
@@ -89,6 +91,13 @@ def test_every_checked_in_law_stamps_the_digest_of_its_spec(name):
     law = json.loads((ROOT / "laws" / name).read_text())
     spec = json.loads((ROOT / "machines" / LAW_SPECS[name]).read_text())
     assert law["machine_spec"] == law["host"]["key"]["machine_spec"] == digest(spec)
+
+
+def test_every_checked_in_law_stamps_this_trees_atom_digest():
+    tree = host_key_of("/nonexistent-model", {})["atom"]
+    laws = sorted((ROOT / "laws").glob("*.json"))
+    stamps = {p.name: json.loads(p.read_text())["host"]["key"]["atom"] for p in laws}
+    assert stamps == dict.fromkeys(stamps, tree)
 
 
 def test_the_ptl_off_law_refuses_on_cards_of_its_stack_with_ptl_on(

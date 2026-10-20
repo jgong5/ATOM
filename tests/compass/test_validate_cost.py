@@ -7,9 +7,11 @@ is read by `parity.read` and priced by `StepLinearBackend.price`.
 """
 
 import json
+import re
 
 import pytest
 
+from atom.compass.drive.aiter_jit import BUILDS
 from atom.compass.validate.cost import cost_accuracy, main
 
 # Prefill hull: tokens 100-1000, Sum N_Q^2 1e4-1e6, Sum N_Q (N_KV - N_Q) 0-1e7.
@@ -329,3 +331,40 @@ def test_a_group_step_is_banded_by_its_costliest_rank_not_rank_0(tmp_path):
     assert {band: r["steps"] for band, r in report["refused"].items()} == {
         "prefill tokens 512-2048": 10
     }
+
+
+def test_the_command_refuses_a_record_whose_server_built_an_aiter_module(
+    tmp_path, capsys
+):
+    """Its run.json beside it as `record` writes one: without the entry the
+    record prices as before."""
+    record = _record(tmp_path / "steps", _steps(), stretch={4: 0.2})
+    law = tmp_path / "law.json"
+    law.write_text(json.dumps(LAW))
+    (tmp_path / "run.json").write_text(json.dumps({"profiled": False}))
+    main([str(record), str(law)])
+    assert "holding out step 4 " in capsys.readouterr().out
+
+    (tmp_path / "run.json").write_text(json.dumps({BUILDS: ["mha_varlen_fwd"]}))
+    named = f"{record} is not costed: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    with pytest.raises(ValueError, match=re.escape(named)):
+        main([str(record), str(law)])
+
+
+@pytest.mark.parametrize("spelling", [".", "../elsewhere/link"])
+def test_the_command_refuses_the_record_named_from_inside_it_or_by_a_link(
+    tmp_path, monkeypatch, spelling
+):
+    """Its run.json is found beside the directory `spelling` resolves to, run
+    from inside the record."""
+    record = _record(tmp_path / "steps", _steps())
+    (tmp_path / "run.json").write_text(json.dumps({BUILDS: ["mha_varlen_fwd"]}))
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "elsewhere/link").symlink_to(record)
+    law = tmp_path / "law.json"
+    law.write_text(json.dumps(LAW))
+    monkeypatch.chdir(record)
+
+    named = f"{spelling} is not costed: aiter ran a JIT build of ['mha_varlen_fwd']"
+    with pytest.raises(ValueError, match=re.escape(named)):
+        main([spelling, str(law)])

@@ -13,16 +13,20 @@ wrote (`test_client_run_summary._serve`).
 
 import collections
 import json
+import os
 import re
+import subprocess
+import sys
+import time
 
 import pytest
 from test_client_run_summary import CLIENT_RUNS, _serve
 from test_stop_between_client_runs import CLIENT_RUN as UNREFUSED
 
 from atom.compass import run as compass_run
+from atom.compass.drive import aiter_jit, serve
 from atom.compass.drive import run as drive_run
-from atom.compass.drive import serve
-from atom.compass.validate.runs import CLIENT_RUN, _requests, grade, main
+from atom.compass.validate.runs import ASSUMED, CLIENT_RUN, _requests, grade, main
 
 EXPORT = {
     "request_count": {"unit": "requests", "avg": 3.0},
@@ -159,6 +163,15 @@ def test_the_command_prints_every_metric_and_needs_two_real_runs(tmp_path, capsy
     assert any(row.startswith("end to end | output token throughput |") for row in out)
     with pytest.raises(ValueError, match="two or more real runs"):
         grade(cells[:1], cells[1])
+
+
+def test_the_command_refuses_one_real_run_naming_it(tmp_path):
+    sim, real = (str(_cell(tmp_path / c, _schedule(), {})) for c in ("sim", "real0"))
+    runs = [sys.executable, "-m", "atom.compass.validate.runs", sim, real]
+    done = subprocess.run(runs, capture_output=True, text=True, check=False)
+
+    refusal = f"{[real]}: a real spread needs two or more real runs\n"
+    assert (done.returncode, done.stderr) == (1, refusal)
 
 
 def test_prefill_tokens_grade_the_requests_both_runs_issued(tmp_path):
@@ -703,6 +716,17 @@ def test_a_stop_during_the_first_client_run_refuses_it(monkeypatch, tmp_path):
         grade(real, simulated)
 
 
+def test_a_client_run_that_sent_nothing_before_the_graded_one_refuses_it(
+    monkeypatch, tmp_path
+):
+    empty = ([], {"steps": 0, "seconds": 0.0, "treatments": collections.Counter()}, [])
+    real, simulated = _ran(monkeypatch, tmp_path, [empty, CLIENT_RUNS[1]])
+
+    nothing = "its first client run priced no step, so it is not the graded one"
+    with pytest.raises(ValueError, match=f"sim is not graded: {nothing}$"):
+        grade(real, simulated)
+
+
 def test_a_run_whose_engine_read_an_assumed_memory_reading_is_refused_naming_it(
     monkeypatch, tmp_path
 ):
@@ -712,4 +736,97 @@ def test_a_run_whose_engine_read_an_assumed_memory_reading_is_refused_naming_it(
 
     named = re.escape(f"its engines read assumed memory_readings members: {[assumed]}")
     with pytest.raises(ValueError, match=f"sim is not graded: {named}$"):
+        grade(real, simulated)
+
+
+CCTRACES_SIM = HOST | {"step_linear": {}, "client_runs": 1}
+
+
+@pytest.mark.parametrize(
+    "layout, run, sides",
+    [
+        ("whole", CCTRACES_SIM, [""]),
+        ("export", CCTRACES_SIM, [""]),
+        ("1p1d", CCTRACES_SIM | {"router_s": 0.0, "kv_write_req_s": 0.0}, ["-P", "-D"]),
+    ],
+    ids=["whole", "export", "1p1d"],
+)
+def test_a_cctraces_sim_cell_whose_engine_read_an_assumed_member_is_refused_naming_it(
+    tmp_path, layout, run, sides
+):
+    """A cell `cctraces_sim.sh` wrote, with its client run's export or without,
+    or through `pd_sim.sh`, whose run.json is the run file it ran."""
+    cells = _four(tmp_path)
+    *real, simulated = [_recorded(c) for c in cells] if layout == "export" else cells
+    for cell in cells:
+        (cell / "run.json").write_text(json.dumps(run))
+    report = grade(real, simulated)
+
+    def hand_ins(assumed):
+        for side in sides:
+            memory = {"assumed": assumed and f"{assumed}{side}"}
+            engine = simulated / compass_run.LP_FILE.format(f"engine{side}")
+            engine.write_text(json.dumps({"refusals": [], "memory": memory}))
+
+    hand_ins(None)
+    assert grade(real, simulated) == report
+    hand_ins("copied from MI355X")
+    named = re.escape(ASSUMED.format(sorted(f"copied from MI355X{s}" for s in sides)))
+    with pytest.raises(ValueError, match=f"sim is not graded: {named}$"):
+        grade(real, simulated)
+
+
+def _aiter(tmp_path, monkeypatch):
+    """An installed aiter of its own, its JIT directory `jit` returned holding
+    one module the image built, and a home of its own, with no JIT directory
+    named by the environment."""
+    site = tmp_path / "site"
+    (site / "aiter" / "jit" / "build" / "old" / "build").mkdir(parents=True)
+    (site / "aiter" / "jit" / "build" / "old" / "build" / "old.so").write_bytes(b"")
+    (site / "aiter" / "jit" / "old.so").write_bytes(b"")
+    (site / "aiter" / "__init__.py").write_text("")
+    old = time.time_ns() - 10**12
+    for path in (site, *site.rglob("*")):
+        os.utime(path, ns=(old, old))
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.delitem(sys.modules, "aiter", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for name in ("AITER_JIT_DIR", "AITER_ROOT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    return site / "aiter" / "jit"
+
+
+def test_a_record_whose_server_built_an_aiter_module_is_refused_naming_it(tmp_path):
+    *real, simulated = (_recorded(c) for c in _four(tmp_path))
+    builds = ["mha_varlen_fwd_bf16_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale"]
+    _recorded(real[1], **{aiter_jit.BUILDS: builds})
+
+    named = re.escape(f"aiter ran a JIT build of {builds} while its server served")
+    with pytest.raises(ValueError, match=f"r1 is not graded: {named}, so a step"):
+        grade(real, simulated)
+
+
+def test_a_real_cctraces_sim_cell_whose_server_began_an_aiter_build_is_refused(
+    tmp_path, monkeypatch
+):
+    """Its run.json as `cctraces_sim.sh` writes it, then given the entry as
+    that script gives it, from the time its server began serving: a build
+    the stop cut short, with no module written, counts."""
+    jit = _aiter(tmp_path, monkeypatch)
+    *real, simulated = _four(tmp_path / "cells")
+    for cell in (*real, simulated):
+        _recorded(cell)
+        (cell / "run.json").write_text(json.dumps({"client_runs": 1} | HOST))
+    report = grade(real, simulated)
+    since = time.time_ns() - 10**9
+
+    aiter_jit.main([str(real[0] / "run.json"), str(since)])
+    assert json.loads((real[0] / "run.json").read_text()) == {"client_runs": 1} | HOST
+    assert grade(real, simulated) == report
+
+    (jit / "build" / "mha" / "blob.staging").mkdir(parents=True)
+    (jit / "build" / "mha" / "blob.staging" / "kernel.cpp").write_text("")
+    aiter_jit.main([str(real[2] / "run.json"), str(since)])
+    named = re.escape("aiter ran a JIT build of ['mha'] while its server served")
+    with pytest.raises(ValueError, match=f"r2 is not graded: {named}, so a step"):
         grade(real, simulated)
