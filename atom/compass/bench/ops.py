@@ -85,8 +85,10 @@ import bisect
 import copy
 import dataclasses
 import datetime
+import functools
 import hashlib
 import importlib
+import inspect
 import itertools
 import json
 import multiprocessing
@@ -674,7 +676,8 @@ def _meta(spec, slot, live) -> tuple[str, torch.Tensor]:
 def _function(name: str):
     """The callable a leaf names: `ns.op.overload`, or a lifted `module:qualname`;
     a functional collective waited on, as the in-place one ATOM calls is; a
-    declared exchange that takes a group on ATOM's DP group, the one it runs on."""
+    lifted collective that takes a group on the one ATOM calls it on
+    (`DP_GROUP`), refused when ATOM's group is not known."""
     if ":" in name:
         module, qualname = name.split(":")
         fn, path = importlib.import_module(module), qualname.split(".")
@@ -683,17 +686,16 @@ def _function(name: str):
         fn, path = getattr(torch.ops, namespace), rest.split(".")
     for attr in path:
         fn = getattr(fn, attr)
-    if name.startswith(COLLECTIVES) and ":" in name:
-        import functools
-        import inspect
-
-        if "group" in inspect.signature(fn).parameters:  # the capture drops it
+    if name.startswith(COLLECTIVES):
+        if name in DP_GROUP:  # the capture drops the group
             from aiter.dist.parallel_state import get_dp_group
 
             return functools.partial(fn, group=get_dp_group())
-    if name.startswith(COLLECTIVES) and name.startswith("_c10d_functional."):
-        wait = torch.ops._c10d_functional.wait_tensor
-        return lambda **kwargs: wait(fn(**kwargs))
+        if ":" in name and "group" in inspect.signature(fn).parameters:
+            raise ValueError(f"{name} takes a group no leaf name maps to")
+        if name.startswith("_c10d_functional."):
+            wait = torch.ops._c10d_functional.wait_tensor
+            return lambda **kwargs: wait(fn(**kwargs))
     return fn
 
 
@@ -1182,6 +1184,8 @@ COLLECTIVES = (
     "_c10d_functional.broadcast.",
     "_c10d_functional.reduce_scatter",
 )
+#: Lifted collectives every ATOM caller passes aiter's DP group.
+DP_GROUP = ("atom.model_ops.moe:all_gatherv", "atom.model_ops.moe:reduce_scatterv")
 
 
 def exchange(op: dict) -> list | None:

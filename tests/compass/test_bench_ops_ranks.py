@@ -249,6 +249,24 @@ def test_a_rank_that_dies_costs_only_the_point_the_ranks_were_measuring(
     ]
 
 
+def test_a_lifted_collective_runs_on_the_group_atom_calls_it_on_or_refuses(
+    monkeypatch,
+):
+    # moe's own signatures, which take the group the capture drops
+    moe = SimpleNamespace(
+        all_gatherv=lambda x, sizes, group: x, tp_gather=lambda x, group: x
+    )
+    dp = SimpleNamespace(get_dp_group=lambda: "dp")
+    monkeypatch.setitem(sys.modules, "atom.model_ops.moe", moe)
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", dp)
+
+    gatherv = ops._function("atom.model_ops.moe:all_gatherv")
+
+    assert (gatherv.func, gatherv.keywords) == (moe.all_gatherv, {"group": "dp"})
+    with pytest.raises(ValueError, match="tp_gather takes a group"):
+        ops._function("atom.model_ops.moe:tp_gather")
+
+
 def _gather(rows):
     x = ("x", _t([rows, 8], "activation"))
     return ir.Op(GATHER, "declared", (x, ("use_cag", True)), ((8 * rows, 8),))
