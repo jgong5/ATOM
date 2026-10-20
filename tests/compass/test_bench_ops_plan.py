@@ -8,12 +8,14 @@ read back from a real store.
 """
 
 import json
+import os
+from concurrent.futures.process import BrokenProcessPool
 from types import SimpleNamespace
 
 import pytest
 import torch
 from test_artifact_store import CONDITIONS, GATES, stanza
-from test_bench_ops import KEY, TREE, _graph, _leaf, _t
+from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
 
 from atom.compass import ir
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
@@ -21,6 +23,7 @@ from atom.compass.bench import ops
 from atom.compass.capture.forward import decode, structure
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
+from atom.utils import forward_context as fctx
 
 CONFIG = SimpleNamespace(
     capture_sizes=[1, 2, 4],
@@ -196,6 +199,139 @@ def test_coverage_counts_a_step_only_when_every_leaf_sits_in_one_kernel_s_band(
     }
 
 
+def _cached_bench(fn, config, todo, llc):
+    """`_bench` with prefill attention's kernel switching at 5000 cached tokens."""
+    got = _bench(fn, config, todo, llc)
+    for r in got:
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
+            r["kernels"] = [f"p{int((r['context'] or 0) >= 5000)}"]
+    return got
+
+
+def test_a_plan_measures_prefill_attention_over_cached_tokens_and_coverage_reads_them(
+    bench, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ops, "_child", _cached_bench)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[40, 40, False]], None),
+        ([[100, 2100, False]], None),
+        ([[100, 2500, False]], None),  # 2400 is under 1.25 times 2000: off the ladder
+        ([[100, 3100, False]], None),
+        ([[150, 8150, False]], None),
+    )
+    records = _plan(bench, tmp_path, plan)
+
+    attn = {}
+    for r in records:
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
+            attn.setdefault(r["shape"], set()).add(r["context"])
+    # Every token count over the cached ladder, halved to 4999 | 5000.
+    assert set(attn) == {f"prefill T={t} B=1" for t in (40, 100, 150)}
+    for cached in attn.values():
+        assert {None, 2000, 3000, 4999, 5000, 8000} <= cached and 2400 not in cached
+        assert len(cached) < 20
+    # GEMM does not depend on context: its prefill points stay fresh.
+    gemm = [r for r in records if r["op"] == "aiter.gemm"]
+    assert {r["context"] for r in gemm if r["shape"].startswith("prefill")} == {None}
+    graded = _records(
+        tmp_path / "graded",
+        ([[120, 1120, False]], None),  # between fresh and 2000 cached
+        ([[120, 6120, False]], None),  # between 5000 and 8000, past the switch
+        ([[120, 9120, False]], None),  # past the largest cached count measured
+        ([[160, 1160, False]], None),  # past the largest token count measured
+    )
+    store, root, _, _ = bench
+
+    report = ops.coverage(store, root, CONFIG, [graded], records)
+
+    assert report["by phase"] == {"prefill": {"steps": 4, "covered": 2}}
+    assert report["left out, by leaf kind"] == {
+        "aiter.attn": {"outside the measured range": 2},
+        "aiter.gemm": {"outside the measured range": 1},
+    }
+
+
+def _moving_bench(fn, config, todo, llc):
+    """`_bench` with prefill attention's time growing with its cached tokens."""
+    got = _bench(fn, config, todo, llc)
+    for r in got:
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
+            r["cold_ns"] += r["context"] or 0
+    return got
+
+
+@pytest.mark.parametrize(
+    "stand_in, cached, covered, round2",
+    [
+        # one kernel and time: only the far end, and round 2 densifies
+        (_bench, {None, 8000}, 2, {("aiter.gemm", None)}),
+        # its time grows: round 2 is the ladder alone, densifying after it
+        (
+            _moving_bench,
+            {None, 2000, 3000, 8000},
+            1,
+            {("aiter.attn", 2000), ("aiter.attn", 3000)},
+        ),
+    ],
+)
+def test_a_plan_ladders_cached_tokens_only_for_a_prefill_kind_that_moves_there(
+    bench, tmp_path, monkeypatch, stand_in, cached, covered, round2
+):
+    monkeypatch.setattr(ops, "_child", stand_in)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),  # decode attention moves
+        ([[40, 40, False]], None),
+        ([[100, 2100, False]], None),
+        ([[100, 3100, False]], None),
+        ([[150, 8150, False]], None),
+    )
+    records = _plan(bench, tmp_path, plan)
+
+    attn = {}
+    for r in records:
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
+            attn.setdefault(r["shape"], set()).add(r["context"])
+    assert attn == {f"prefill T={t} B=1": cached for t in (40, 100, 150)}
+    lines = (tmp_path / "out" / "round2" / "ops.jsonl").read_text().splitlines()
+    assert {(r["op"], r["context"]) for r in map(json.loads, lines)} == round2
+    graded = _records(
+        tmp_path / "graded",
+        ([[120, 1120, False]], None),
+        ([[120, 9120, False]], None),  # past the most cached tokens measured
+    )
+    store, root, _, _ = bench
+
+    report = ops.coverage(store, root, CONFIG, [graded], records)
+
+    assert report["by phase"] == {"prefill": {"steps": 2, "covered": covered}}
+
+
+@pytest.mark.parametrize(
+    "tokens, lo, hi, why",
+    [
+        (120, 0, 1000, ""),  # fresh to 1000 cached, both of one kernel
+        (120, 1000, 2000, "between two kernels"),  # 1000 and 2000 differ
+        (120, 1000, 1000, ""),
+        (200, 0, 0, "outside the measured range"),  # past the token counts
+        (120, 1000, 5000, "outside the measured range"),  # past the cached counts
+        (60, 1000, 1000, "outside the measured range"),  # 1000 holds no 60
+    ],
+)
+def test_a_cached_bracket_holds_between_counts_and_tokens_of_one_kernel(
+    tokens, lo, hi, why
+):
+    cuts = {
+        0: ([40, 100, 150], ["a", "a", "a"]),
+        1000: ([100, 150], ["a", "a"]),
+        2000: ([40, 150], ["b", "b"]),
+    }
+
+    assert ops._bracket_cached(cuts, tokens, lo, hi) == why
+
+
 @pytest.mark.parametrize(
     "lo, hi, why",
     [
@@ -358,3 +494,81 @@ def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
         "aiter.gfx950": {"no measured point": 1}
     }
     assert traced == ([] if "gfx950" in held else ["gfx950"])
+
+
+def _dies(*finished):
+    """`_bench` as a child that dies once for each entry of `finished`, having
+    journaled that many of its points, and then lives; and the records it was
+    measuring when it died."""
+    deaths, dead = list(finished), []
+
+    def child(fn, config, todo, llc):
+        got = _bench(fn, config, todo, llc)
+        if not deaths:
+            return got
+        n = deaths.pop(0)
+        dead.append(got[n])
+        ops._journal(os.environ[ops.JOURNAL], got[:n])
+        raise BrokenProcessPool("killed")
+
+    return child, dead
+
+
+POPULATION = ([[1, 1000, True], [1, 3000, True]], 2), ([[40, 40, False]], None)
+
+
+def test_a_child_that_dies_costs_the_plan_only_the_point_it_was_measuring(
+    bench, tmp_path, monkeypatch
+):
+    population = _records(tmp_path / "plan", *POPULATION)
+    *_, key, run = bench
+    clean = str(tmp_path / "clean")
+    whole = _plan((ArtifactStore(clean), clean, key, run), tmp_path, population)
+    # The first dies on a point's attention leaf, its GEMM leaf still to come;
+    # the second dies on that GEMM leaf having finished nothing.
+    child, dead = _dies(2, 0)
+    monkeypatch.setattr(ops, "_child", child)
+    records = _plan(bench, tmp_path, population)
+
+    assert [r for r in records if "refused" in r] == [
+        {k: d[k] for k in ("shape", "context", "op", "leaf")}
+        | {"refused": "the measuring process died"}
+        for d in dead
+    ]
+    assert [r for r in records if "refused" not in r] == [
+        r for r in whole if r not in dead
+    ]
+    monkeypatch.setattr(ops, "_child", _bench)
+    again = _plan(bench, tmp_path, population)  # the next plan retries them
+    assert sorted(again, key=json.dumps) == sorted(whole, key=json.dumps)
+
+
+def test_a_child_that_dies_at_startup_every_time_fails_the_plan(
+    bench, tmp_path, monkeypatch
+):
+    population = _records(tmp_path / "plan", *POPULATION)
+    child, dead = _dies(0, 0)
+    monkeypatch.setattr(ops, "_child", child)
+
+    with pytest.raises(BrokenProcessPool):
+        _plan(bench, tmp_path, population)
+    assert len(dead) == 2
+
+
+def test_measure_journals_each_record_as_it_finishes_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    runner, journal = _Runner(), tmp_path / "points.jsonl"
+    runner.exit = lambda: None
+    placed = SimpleNamespace(block_size=16, batch=lambda view, block, slot: (0, 0))
+    monkeypatch.setattr(ops, "_runner", lambda config: runner)
+    monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda c: placed)
+    monkeypatch.setenv(ops.JOURNAL, str(journal))
+    x = ("self", _t([2, 3], "activation"))
+    found = ops.leaves(
+        _graph(_leaf("aten.neg.default", x), _leaf("aten.abs.default", x))["region"]
+    )
+
+    got = ops.measure(None, [(decode(2), 20, found)], 10_000)
+
+    assert len(got) == 2
+    assert [json.loads(line) for line in journal.read_text().splitlines()] == got

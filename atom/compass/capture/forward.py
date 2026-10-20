@@ -67,6 +67,8 @@ H2D = "atom/utils/h2d.py"
 HOST_QUERIES = ("aiter.get_gfx_custom_op.default",)
 #: Operators that ask a fake tensor where it is and run nothing on a device.
 UNDISPATCHED = ("profiler.", "prim.device")
+#: The hf config fields, or its text config's, that count a model's routed experts.
+ROUTED = ("n_routed_experts", "num_experts", "num_local_experts")
 
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
@@ -106,21 +108,66 @@ def device_arch() -> str:
 
 
 def structure(
-    config, phase: str, eager: bool | None = None, device: str | None = None
+    config,
+    phase: str,
+    eager: bool | None = None,
+    device: str | None = None,
+    output: bool = True,
 ) -> str:
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the TP width, the DP width and the EP
     group's when they are set, the phase and the mode, `config`'s unless `eager`
-    names it, and the arch of `device`, else `device_arch()`."""
+    names it, the arch of `device`, else `device_arch()`, the routed experts'
+    Triton path when it is taken (`experts`), and ``no output`` unless the step
+    produces output (`output`)."""
     from atom.compass.run import _file_digest
 
     digest = _file_digest(config.model, "config.json")
     mode = "eager" if (config.enforce_eager if eager is None else eager) else "graph"
-    arch = config.hf_config.architectures[0]
+    arch, device = config.hf_config.architectures[0], device or device_arch()
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     widths = f"tp={tp}" + (f" dp={dp}" if dp > 1 else "")
     widths += f" ep={tp * dp}" if config.enable_expert_parallel else ""
-    return f"{arch} {device or device_arch()} {digest} {widths} {phase} {mode}"
+    key = f"{arch} {device} {digest} {widths}{experts(config, device)} {phase} {mode}"
+    return key if output else f"{key} no output"
+
+
+def experts(config, device: str) -> str:
+    """`` experts=triton`` when the MXFP4 routed experts run Triton's kernels on
+    a `device` arch, from what `Mxfp4MoEMethod` reads to pick them, then
+    ``+a4w4`` and ``+decode`` (only decode steps run them) as set. Empty for
+    aiter's path and for a model with no routed experts."""
+    from atom.utils import envs
+
+    tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
+    hf = (config.hf_config, getattr(config.hf_config, "text_config", None))
+    if not any(getattr(c, n, None) for c in hf for n in ROUTED):
+        return ""
+    ep = config.enable_expert_parallel and tp * dp > 1
+    arches = ("gfx94", "gfx95") if envs.ATOM_USE_TRITON_GEMM else ("gfx94",)
+    on = not ep and device.startswith(arches)
+    if envs.is_set("ATOM_USE_TRITON_MOE"):
+        on = envs.ATOM_USE_TRITON_MOE
+    # MegaMoE's method keeps Triton's EP path alone, and no phase split.
+    mega = getattr(config, "moe_backend", "") == "mega"
+    on = on and not getattr(config, "eplb_enable", False) and not (mega and not ep)
+    if not on or ep and not device.startswith(("gfx95", "gfx125")):
+        return ""
+    a4w4, decode = envs.ATOM_USE_TRITON_MOE_A4W4, envs.ATOM_USE_TRITON_MOE_DECODE
+    return " experts=triton" + "+a4w4" * a4w4 + "+decode" * (decode and not mega)
+
+
+def _check_experts(model, named: str) -> None:
+    """Refuses a model whose MXFP4 experts take another path than `named`."""
+    for name, module in model.named_modules():
+        m = getattr(module, "quant_method", None)
+        if hasattr(m, "use_triton_ep"):
+            took = (m.use_triton or m.use_triton_ep, m.use_triton_decode)
+            if took != ("triton" in named, "+decode" in named):
+                raise ValueError(
+                    f"ATOM's experts at {name} take Triton's, decode only: {took}; "
+                    f"the op_graph key names {named.strip() or 'aiter'}"
+                )
 
 
 def _atom_frames():
@@ -498,10 +545,12 @@ def _weights(model):
                 yield value
 
 
-def _batch(shape, block_size, context=1):
+def _batch(shape, block_size, context=1, output=True):
     """`shape.seqs` sequences of `shape.tokens` new tokens between them, the
     first `tokens % seqs` one longer, each in blocks of its own; and the
-    blocks they take. A decode sequence holds `context` tokens."""
+    blocks they take. A decode sequence holds `context` tokens. Unless
+    `output`, every prefill sequence is a middle chunk, so the step samples
+    nothing."""
     from atom.model_engine import sequence
     from atom.model_engine.scheduler import ScheduledBatch
 
@@ -526,6 +575,7 @@ def _batch(shape, block_size, context=1):
         **{f"total_tokens_num_{shape.phase}": shape.tokens},
         **{f"total_seqs_num_{shape.phase}": shape.seqs},
         is_dummy_run=True,
+        is_final_chunk=None if output else [False] * shape.seqs,
     )
     return batch, blocks
 
@@ -602,7 +652,8 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
     under ATOM's engine arguments `atom_args` on a declared `arch`.
 
     Yields, per shape, the graph, the model's config digest, what the capture
-    declared, the operators it left out of the graph among it.
+    declared, the operators it left out of the graph among it; per prefill
+    shape, the middle chunk's and then the final one's.
     """
     declared = driverless.install(tmpdir, arch)
 
@@ -629,6 +680,7 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
             peers.install_mori(recorder)
     with stack:
         runner = _build_runner(config, fake_mode)
+        _check_experts(runner.model, experts(config, arch))
         if v4 := sys.modules.get("atom.models.deepseek_v4"):
             stack.enter_context(_v4_attention(v4, recorder))
         stacks = [
@@ -659,7 +711,14 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
         runner.attn_metadata_builder.warmup_per_req_cache = lambda: None
         with fake_mode, recorder:
             runner.allocate_kv_cache(max(KV_BLOCKS, blocks))
-        for shape in shapes:
+        # A prefill is traced as a middle chunk, which samples nothing, then as
+        # a final one; a decode step always samples.
+        variants = [
+            (shape, output)
+            for shape in shapes
+            for output in ((False, True) if shape.phase == "prefill" else (True,))
+        ]
+        for shape, output in variants:
             recorder.shape = shape
             traces = []
             for context in CONTEXTS if shape.phase == "decode" else CONTEXTS[:1]:
@@ -668,16 +727,17 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
                     # A runner's first step takes its own path, so the traced
                     # step follows one of its own shape: no graph depends on
                     # another's.
-                    runner.forward(_batch(shape, block_size, context)[0])
+                    runner.forward(_batch(shape, block_size, context, output)[0])
                     recorder.start()
                     recorder.creating, recorder.on = ir.Role.METADATA, True
-                    runner.forward(_batch(shape, block_size, context)[0])
+                    runner.forward(_batch(shape, block_size, context, output)[0])
                 recorder.creating, recorder.on = None, False
                 traces.append((recorder.items, recorder.left_out))
             items, left_out = traces[0]
             if len(traces) > 1:
                 items = _affine(str(shape), items, traces[1][0])
-            crossing, traced = [], Traced(structure(config, shape.phase), str(shape))
+            key = structure(config, shape.phase, output=output)
+            crossing, traced = [], Traced(key, str(shape))
             graph = build(items, traced, crossing)
             left_out = [*left_out, *(("step-crossing", op) for op in crossing)]
             declared["left_out"] = [{"why": why, **_json(op)} for why, op in left_out]

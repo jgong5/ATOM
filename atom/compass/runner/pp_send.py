@@ -23,8 +23,10 @@ as the batch's ``compass_pp_host`` and
 the tensors' as the batch's ``compass_pp_release``, and, when the ``gloo`` parts
 are rendezvous, returns their completion, and the ``rccl`` parts', on ``pp_ack`` stamped at it; at a
 non-last stage's forward's launch end it waits for its previous send's ``gloo``
-parts, then sends. A host that blocked on them for ``b`` seconds wakes
-``wake_s x (1 - exp(-b / wake_rise_s))`` after they complete, gloo's wake.
+parts, then sends. A host that blocked on them wakes
+``wake_s x (1 - exp(-b / wake_rise_s))`` after they complete, gloo's wake,
+``b`` the time since the send before them completed: the pair's idle, not
+the block.
 The ``rccl`` parts hold the sender's stream, not its host: its
 forwards after that wait start their device work no earlier. An idle
 flush waits for the previous send the same way. The frames move between the
@@ -87,10 +89,10 @@ def gloo_wake(spec) -> tuple[float, float]:
     return tuple(spec.value(f"{PREFIX}.gloo.{f}") for f in ("wake_s", "wake_rise_s"))
 
 
-def woken(wake, block: float) -> float:
-    """How long after its gloo parts complete a host that blocked on them for
-    `block` seconds goes on."""
-    return wake[0] * -math.expm1(-block / wake[1]) if block > 0 else 0.0
+def woken(wake, idle: float) -> float:
+    """How long after its gloo parts complete a host blocked on them goes on,
+    the pair having carried nothing for `idle` seconds before."""
+    return wake[0] * -math.expm1(-idle / wake[1]) if idle > 0 else 0.0
 
 
 def is_rendezvous(models, parts) -> bool:
@@ -152,6 +154,7 @@ class StageSends:
         self.pending = None  # the last send: ("ack", seq, _) or ("eager", done, held)
         self.tensors_done = -math.inf  # the previous frame received's rccl parts
         self.held = -math.inf  # the rccl parts' end of the send last waited for
+        self.acked = -math.inf  # the gloo parts' end of the send last acked
 
     def __call__(self, name, *args, wait_out=False):
         if not self.rt.in_run or name not in ("forward", "flush_pp_send"):
@@ -207,7 +210,7 @@ class StageSends:
             gather = self.call("pp_all_gather_s", rows, wait_out=True)
         self.tensors_done, end = recv_done(self.models, ready, posted, tensors, gather)
         if is_rendezvous(self.models, gloo):
-            ack = {"seq": seq, "tensors_done": self.tensors_done}
+            ack = {"seq": seq, "tensors_done": self.tensors_done, "gloo_done": sent}
             self.call("send_pp_frame", "pp_ack", ack, wait_out=True)
             self.rt.stamp_send(self.ack_out, sent)
         return (called, meta), end
@@ -240,9 +243,10 @@ class StageSends:
             return
         kind, at, self.held = pending
         if kind == "ack":
-            entry = self.rt.now
-            self.held = self._frame("pp_ack", self.ack_in, at)["tensors_done"]
-            if late := woken(self.wake, self.rt.now - entry):
+            entry, last = self.rt.now, self.acked
+            ack = self._frame("pp_ack", self.ack_in, at)
+            self.held, self.acked = ack["tensors_done"], ack["gloo_done"]
+            if self.rt.now > entry and (late := woken(self.wake, self.acked - last)):
                 self.rt.advance_to(self.rt.now + late)
         elif at > self.rt.now:
             self.rt.advance_to(at)

@@ -156,3 +156,51 @@ def test_the_mi355x_script_publishes_the_probed_fields_fp4_included(
     for path in ("device.compute.derate.fp4", "device.memory.bandwidth_curve"):
         assert spec.origin(path)["record"] == "sha256:f00d"
     assert spec.origin("device.compute.fp4_flops")["origin"] == "datasheet"
+
+
+def test_the_record_names_the_stack_aiter_s_commit_included(monkeypatch, tmp_path):
+    import shutil
+    import subprocess
+    from types import SimpleNamespace
+
+    import torch
+
+    from atom.compass.drive import identity
+
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("needs git")
+    aiter = tmp_path / "aiter"
+    aiter.mkdir()
+    (aiter / "a.py").write_text("a = 1\n")
+    for argv in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "s"]):
+        subprocess.run(
+            [git, "-C", str(aiter), "-c", "user.name=t", "-c", "user.email=t@t", *argv],
+            check=True,
+        )
+    head = subprocess.run(
+        [git, "-C", str(aiter), "rev-parse", "--short=9", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    monkeypatch.setattr(identity, "module_root", lambda module: str(aiter))
+    (tmp_path / "rocm" / ".info").mkdir(parents=True)
+    (tmp_path / "rocm" / ".info" / "version").write_text("7.2.4\n")
+    monkeypatch.setenv("ROCM_PATH", str(tmp_path / "rocm"))
+    monkeypatch.setattr(torch.cuda.nccl, "version", lambda: (2, 27, 7))
+    card = SimpleNamespace(
+        pci_domain_id=0, pci_bus_id=10, pci_device_id=0, gcnArchName="gfx942"
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: card)
+    monkeypatch.setattr(probe, "cards", lambda bdfs: [])  # no card to refuse
+    monkeypatch.setattr(probe, "probe", lambda torch, formats: RECORD)
+    out = tmp_path / "record.json"
+    spec = SCRIPTS / "machines" / "mi308x-hjbog18.json"
+    assert probe.main([str(spec), str(out)]) == 0
+    assert json.loads(out.read_text())["stack"] == {
+        "rocm": "7.2.4",
+        "aiter": head,
+        "rccl": "2.27.7",
+        "torch": torch.__version__,
+    }

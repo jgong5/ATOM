@@ -7,6 +7,9 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -262,6 +265,25 @@ def test_the_probe_pools_the_records_it_wrote(tmp_path):
     assert pooled["records"] == [
         hashlib.sha256(r.read_bytes()).hexdigest() for r in runs
     ]
+
+
+def test_the_probe_runs_from_the_root_on_its_own_tree(tmp_path):
+    """Run as its README gives it, from `/` and with no PYTHONPATH, the probe
+    imports this tree's `atom.compass`, not an ATOM installed elsewhere."""
+    run, out = tmp_path / "run.json", tmp_path / "out.json"
+    run.write_text(json.dumps({"samples": _samples(TRUTH)}) + "\n")
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    script = TREE / "scripts/compass/pp_carriers.py"
+    ran = subprocess.run(
+        [sys.executable, str(script), str(out), str(run)],
+        cwd="/",
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ran.returncode == 0, ran.stderr
+    assert json.loads(out.read_text())["carriers"] == probe.fit(_samples(TRUTH))
 
 
 def test_the_probe_prices_a_late_rendezvous_receive_with_its_threshold_moved():

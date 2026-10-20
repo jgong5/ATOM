@@ -22,7 +22,7 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
-from atom.compass.backends.step_labels import label
+from atom.compass.backends.step_labels import BUILDS, label
 from atom.compass.backends.step_linear_fit import (
     _solve,
     fit,
@@ -957,6 +957,37 @@ def test_the_command_refuses_records_without_one_engine_config_naming_the_field(
     with pytest.raises(ValueError, match=re.escape(named)):
         main([*map(str, records), "--out", str(tmp_path / "law.json"), *SPEC])
     assert not (tmp_path / "law.json").exists()
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["{out}/steps/dp0.jsonl", "dp0.jsonl", "{tmp}/elsewhere/link/dp0.jsonl"],
+    ids=["its path", "from inside it", "by a link"],
+)
+def test_the_command_refuses_a_record_whose_server_built_an_aiter_module(
+    tmp_path, monkeypatch, spelling
+):
+    """Its run.json is the one beside the steps directory its path resolves
+    into: naming a build, nothing is written; without it the record fits."""
+    steps = tmp_path / "out/steps"
+    steps.mkdir(parents=True)
+    _record(steps / "dp0.jsonl", _steps(6))
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "elsewhere/link").symlink_to(steps)
+    monkeypatch.chdir(steps)
+    record = spelling.format(out=tmp_path / "out", tmp=tmp_path)
+    args = [record, "--out", str(tmp_path / "law.json"), *SPEC]
+
+    (tmp_path / "out/run.json").write_text(json.dumps({BUILDS: ["mha_varlen_fwd"]}))
+    named = f"{record} is not fitted: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    with pytest.raises(ValueError, match=re.escape(named)):
+        main(args)
+    assert not (steps / "dp0.cost.jsonl").exists()
+    assert not (tmp_path / "law.json").exists()
+
+    (tmp_path / "out/run.json").write_text(json.dumps({"profiled": False}))
+    main(args)
+    assert (tmp_path / "law.json").exists()
 
 
 def test_a_dp_law_is_held_out_run_by_run_and_validates_every_rank_inside(

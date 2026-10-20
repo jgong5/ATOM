@@ -6,16 +6,18 @@ with ``atom.compass.parity.client_run``.
 Stand-ins on ``PATH``: a ``curl`` the server's ``/health`` answers, and a
 harness Python whose probes answer as one holding this tree's compass-harness
 and whose aiperf saves how it ran to ``$SEEN`` and writes the export and raw
-records ``$SPEC`` holds, its dataset the trace files it was given. With
-``--stop``, a stand-in compass command serves a ``sleep``. Nothing needs a
-driver, a server or aiperf.
+records ``$SPEC`` holds, its dataset the trace files it was given. Each
+breaks the step ``$BREAK`` names. With ``--stop``, a stand-in compass command
+serves a ``sleep``. Nothing needs a driver, a server or aiperf.
 """
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 import pytest
@@ -28,11 +30,18 @@ SCRIPT = TREE / "scripts/compass/client.sh"
 HARNESS = r"""
 import json, os, sys
 from pathlib import Path
-a = sys.argv[1:]
+a, brk = sys.argv[1:], os.environ.get("BREAK")
 if "import compass_harness" in a[1]:
-    print(os.environ["PYTHONPATH"].split(":")[0] + "/compass_harness/x.py")
+    tree = "/elsewhere" if brk == "elsewhere" else os.environ["PYTHONPATH"].split(":")[0]
+    print(tree + "/compass_harness/x.py")
+if "entry_points" in a[1] and brk == "probe":
+    sys.exit("no metadata")
+if "entry_points" in a[1] and brk == "plugin":
+    print("compass_harness.plugin:Plugin")
 if "profile" not in a:
     sys.exit()
+if brk == "aiperf":
+    sys.exit(3)
 Path(os.environ["SEEN"]).write_text(json.dumps([a, dict(os.environ), os.getcwd()]))
 spec = json.loads(Path(os.environ["SPEC"]).read_text())
 art = Path(a[a.index("--artifact-dir") + 1])
@@ -65,7 +74,7 @@ SIM = {"url": "http://127.0.0.1:40165", "pid": 0, "run_file": "/sim/run_file.jso
 def _setup(tmp_path, server=None, ids=("a", "b")):
     bin_, out, traces = tmp_path / "bin", tmp_path / "out", tmp_path / "traces.jsonl"
     bin_.mkdir(), out.mkdir()
-    (bin_ / "curl").write_text("#!/bin/sh\n")
+    (bin_ / "curl").write_text('#!/bin/sh\n[ "$BREAK" != health ]\n')
     (bin_ / "harness").write_text(f"#!{sys.executable}{HARNESS}")
     for f in bin_.iterdir():
         f.chmod(0o755)
@@ -105,7 +114,7 @@ def _client(*args, env):
         (["--traces", "2-1", "--concurrency", "3"], None, "--traces takes A-B"),
         (["--traces", "1-2"], None, "--traces and --concurrency are required"),
         ([*GOOD, "--duration"], None, "--duration takes whole seconds"),
-        ([*GOOD, "--warm"], None, "unknown argument --warm"),
+        ([*GOOD, "--no-warmup"], None, "unknown argument --no-warmup"),
         (GOOD, "TRACES", "TRACES is not set"),
     ],
 )
@@ -124,12 +133,12 @@ def test_an_out_with_no_server_json_names_it(tmp_path):
     assert done.stderr.startswith(f"client: server: no {out}/server.json")
 
 
-@pytest.mark.parametrize("simulated, warmup", [(True, []), (False, ["--no-warmup"])])
-def test_a_run_file_makes_the_client_simulated(tmp_path, simulated, warmup):
+@pytest.mark.parametrize("simulated", [True, False])
+def test_a_run_file_makes_the_client_simulated(tmp_path, simulated):
     server = SIM if simulated else {k: SIM[k] for k in ("url", "pid")}
     out, env = _setup(tmp_path, server)
     stale = {"ATOM_COMPASS_RUN": "/stale", "ATOM_COMPASS_CLOCK_ENDPOINT": "tcp://h:1"}
-    done = _client(out, *GOOD, *warmup, env=env | stale)
+    done = _client(out, *GOOD, env=env | stale)
     assert done.returncode == 0, done.stdout + done.stderr
 
     argv, aiperf_env, cwd = json.loads((tmp_path / "seen.json").read_text())
@@ -141,7 +150,7 @@ def test_a_run_file_makes_the_client_simulated(tmp_path, simulated, warmup):
     line = " ".join(argv)
     assert "--url 127.0.0.1:40165 " in line and " --concurrency 3 " in line
     assert " --export-level raw " in line
-    assert ("--warmup-requests-per-lane 1" in line) != bool(warmup)
+    assert "--trajectory-start-" not in line and "--warmup-" not in line
     assert sorted(os.listdir(out / "client/traces")) == ["00001.json", "00002.json"]
     assert json.loads((out / "artifacts" / NAME).read_text()) == {
         "requests": {
@@ -176,3 +185,60 @@ def test_stop_stops_the_command_once_the_export_is_written(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert command.wait(timeout=10) == 0
     assert (out / "run.json").exists() and (out / "artifacts" / NAME).exists()
+
+
+#: The step `$BREAK` breaks, and the refusal it gets.
+REFUSALS = {
+    "health": "server: http://h:1/health does not answer",
+    "server.json": "server: */server.json names no url and pid",
+    "probe": "harness: * cannot list aiperf's plugins",
+    "plugin": "harness: the server is real, and * has compass-harness installed",
+    "elsewhere": "harness: compass_harness resolved to /elsewhere/*",
+    "client": "out: */client exists; one client run per server --out",
+    "traces": "traces: * holds 2 of traces 2 to 9",
+    "unreadable": "traces: cannot read */none",
+    "aiperf": "aiperf: exited 3; see */client/aiperf.log",
+}
+#: The server's parent's last argument, and the refusal `--stop` gets.
+STOP_REFUSALS = {
+    "sh": "stop: process *, the server's parent, is no compass command",
+    "compass": "stop: the command left without writing */run.json",
+}
+
+
+@pytest.mark.parametrize("step", REFUSALS)
+def test_each_refusal_exits_1_naming_its_step(tmp_path, step):
+    out, env = _setup(tmp_path, {"url": "http://h:1", "pid": 0})
+    args, env["BREAK"] = [*GOOD], step
+    if step == "server.json":
+        (out / step).write_text("{}")
+    if step == "client":
+        (out / step).mkdir()
+    if step == "traces":
+        args[1] = "2-9"
+    if step == "unreadable":
+        env["TRACES"] = str(tmp_path / "none")
+    done = _client(out, *args, env=env)
+    assert done.returncode == 1, done.stdout + done.stderr
+    last = done.stderr.splitlines()[-1]
+    assert fnmatchcase(last, "client: " + REFUSALS[step]), done.stderr
+
+
+@pytest.mark.parametrize("parent", STOP_REFUSALS)
+def test_stop_refuses_a_parent_that_is_no_compass_command_or_writes_no_run(
+    tmp_path, parent
+):
+    """The server is a shell's `sleep`; the shell's cmdline ends in `parent`,
+    and SIGTERM ends it without a run.json."""
+    out, env = _setup(tmp_path)
+    shell = ["sh", "-c", "sleep 600 & echo $!; wait", parent]
+    with subprocess.Popen(shell, stdout=subprocess.PIPE, start_new_session=True) as sh:
+        server = {"url": "http://h:1", "pid": int(sh.stdout.readline())}
+        (out / "server.json").write_text(json.dumps(server))
+        try:
+            done = _client(out, *GOOD, "--stop", env=env)
+        finally:
+            os.killpg(sh.pid, signal.SIGKILL)
+    assert done.returncode == 1, done.stdout + done.stderr
+    last = done.stderr.splitlines()[-1]
+    assert fnmatchcase(last, "client: " + STOP_REFUSALS[parent]), done.stderr

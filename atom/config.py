@@ -2799,6 +2799,7 @@ RAPIDSERVE_RUNNERS = frozenset(
     {
         "atom.model_engine.model_runner.RapidServeModelRunner",
         "atom.compass.runner.model_runner.CompassRapidServeModelRunner",
+        "atom.compass.drive.rapidserve_memory_runner.MemoryReadingRapidServeModelRunner",
     }
 )
 
