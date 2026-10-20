@@ -14,13 +14,14 @@ gives the same work. That shape is read in one grid:
     decode, replay bundle:  (B, c), from the grid of the rung the step replays
     decode, eager bundle:   (B, c), the rung ignored
 
-A decode row computes one token, so that c is the rows' mean cached context.
-A ragged decode batch costs more than B rows at its mean: on a rung whose grid
-holds `alpha`, its lookup is G(mean) + alpha (G(longest) - G(mean)), G read at
-B rows of the mean and of the longest row's cached context, so between the
-two. alpha = clip(intercept + ratio . (longest / mean - 1) + spread . sd /
-mean, 0, 1), over the rows' cached contexts (`length_statistics`). On any
-other rung, or a batch whose rows read one context, the lookup is G(mean).
+A decode row computes one token, so that c is the rows' mean cached context,
+and the lookup there, G(mean), keeps the attention work but not how it is
+spread over the rows. On a rung whose grid holds `alpha`, a decode batch's
+lookup is G(mean) + alpha (G(longest) - G(mean)), G read at B rows of the
+mean and of the longest row's cached context, so between the two, with
+alpha = clip(intercept + ratio . (longest / mean - 1) + spread . sd / mean,
+0, 1) over the rows' cached contexts (`length_statistics`). On any other
+rung, or for a batch whose rows read one context, the lookup is G(mean).
 
 A cell is the box between adjacent nodes on every axis; a coordinate on a node
 reads that node alone, so an exact hit needs one point. The answer is the
