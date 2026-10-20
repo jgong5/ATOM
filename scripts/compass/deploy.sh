@@ -202,6 +202,10 @@ ROUTER=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --prometheus-po
 "${ROUTER[@]}" >"$OUT/router.log" 2>&1 &
 R=$!
 compass_wait_up router $R "http://127.0.0.1:$ROUTER_PORT/v1/models"
+# A stop from here on, one server.json's reader sends included, also stops the
+# router, so the wait below ends even when the stop comes before it.
+stopped=0
+trap 'stopped=1; kill -TERM $R 2>/dev/null || true' TERM INT
 # The router's parent is this script, which a client's stop signals.
 python3 -c 'import json, sys
 url, pid, run_file, clock, out = sys.argv[1:]
@@ -213,8 +217,6 @@ open(out + ".part", "w").write(json.dumps(ready))' \
 mv "$OUT/server.json.part" "$OUT/server.json"
 echo "deploy: ready at http://127.0.0.1:$ROUTER_PORT"
 
-stopped=0
-trap 'stopped=1' TERM INT
 wait -n $authority $P $D $R || true
 rc=$((!stopped))
 ((stopped)) || echo "deploy: a process of the deployment left before a stop" >&2
