@@ -30,16 +30,18 @@ their own client venv (QUICKSTART's recipe) in the data directory.
 
 ## Disk
 
-- Data directory: `/data/<user>/compass`.
+- Data directory: a fresh subdirectory per session, such as
+  `/data/<user>/compass/onboard-<date>`. `/data/<user>/compass` itself may
+  hold inputs and other work.
 - Docker's storage is `/data/docker`, on the same disk, so the container's
   writable layer takes room from it too. `/data` is ext4: when it reads full
   for users, the daemon still writes into the root-only reserve every user
   shares.
 - The root disk is small: nothing goes there.
-- Fallback when `/data` has no room for the developer: the data directory on
-  the host's tmpfs, such as `/tmp/<user>_compass`, mounted in the container at
-  the same path, and the container started with a tmpfs at each directory the
-  runs fill:
+- Fallback when `/data` has no room for the developer: the session's data
+  directory on the host's tmpfs, such as `/tmp/<user>_compass/onboard-<date>`,
+  mounted in the container at the same path, and the container started with a
+  tmpfs at each directory the runs fill:
 
   ```
   --tmpfs /root/.cache:size=64g,exec --tmpfs /root/.aiter:size=64g,exec

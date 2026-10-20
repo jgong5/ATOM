@@ -29,7 +29,8 @@ printed and wrote. They learn Compass from their own run.
    (Explaining a step). A check or a file read holds nothing and needs no
    yes. For a step QUICKSTART gives no size, time or success line for (the
    container, the tree, the venv), say so, say what you will take as success,
-   and report its `du -sh` after.
+   and report its size after: `du -sh` for a directory, `docker ps -s` for a
+   container's writable layer.
 3. **Stop on any failure.** A non-zero exit, a refusal, or an output you cannot
    explain stops the session at that step: read it (Reading a failure), tell the
    developer the cause and the fix, and ask before anything runs again. Never
@@ -90,8 +91,11 @@ runs again on their answer, and the session ends only when they take none.
 3. **Runtime.** The profile's container tool runs for this user (`docker ps`),
    and its image is present (`docker image inspect`). A missing image does not
    refuse, but its pull is a step of its own: announce its size and ask.
-4. **Disk.** `df -h`, as the developer, on the profile's data directory (its
-   nearest existing parent if it does not exist yet) and on Docker's storage
+4. **Disk.** The data directory is a new one for this session, where the
+   profile's Disk says. Refuse one that exists and is not empty, so that the
+   session's files mix with nothing else, and ask for another name. `df -h`, as
+   the developer, on it (on its nearest existing parent while it does not
+   exist) and on Docker's storage
    (`docker info -f '{{.DockerRootDir}}'`). The data directory needs what
    QUICKSTART's Disk gives for the path about to run (the smoke cell's figures
    now, the full cell's before the full path) and a running client's map, with
@@ -155,7 +159,9 @@ Announce that file and show it; it holds nothing, so it needs no yes.
    other GPUs and ask the developer to confirm the node is quiet enough. Say
    that this one yes covers all its steps, which run back to back. Run it
    detached in the container, its output in a log outside its OUT (it refuses
-   an OUT that is not empty), since it outlives any one tool call. Follow the
+   an OUT that is not empty), since it outlives any one tool call. `docker exec
+   -d` drops the exit status, so keep it in a file: the block, then
+   `> $R/smoke_cell.log 2>&1; echo $? > $R/smoke_cell.exit`. Follow the
    log without holding a tool call open: each `smoke_cell: <step>` line means
    the step before it finished, so explain that step from its directory while
    the next runs. When it exits, explain the grading table and its last
@@ -183,7 +189,10 @@ on its exit stops a server it started in the background, but not the command it
 was running in the foreground (`measure memory`, a fit, `client.sh`,
 grading), and a stopped `serve` loop leaves its compass command running. `ps
 -ef` in the container shows them; SIGTERM each, and a compass command stops its
-own server and engine. The step has stopped once the GPU check reads no
+own server and engine. Ignore `<defunct>` entries: finished processes that a
+container started with no init never reaps
+([#1792](https://github.com/jgong5/ATOM/pull/1792) adds `--init` to
+QUICKSTART's `docker run`). The step has stopped once the GPU check reads no
 process on the GPU. Take it again into a fresh OUT (QUICKSTART, stopping a
 step).
 
@@ -200,12 +209,14 @@ fresh OUT.
 ## Cleanup
 
 A step of its own, offered when the developer is done. Say what it removes and
-what to copy out first, such as the cell's `grade.log` and logs. The container
-runs as root, so what it wrote in the data directory is root's on the host:
-remove the data directory's contents from inside the container, then the
-container, then the empty data directory on the host. After it, `docker ps -a`
-lists no container of this session and the GPU check reads the GPU free.
-Remove nothing outside this session's data directory and container.
+what to copy out first, such as the cell's `grade.log` and logs. It removes
+only what the session created, each by its path: `$R`, `$V`, the tree
+`tree/<sha>` and its tarball, and the variables file. The container runs as
+root, so what it wrote there is root's on the host: remove those paths from
+inside the container, then the container, then on the host the `tree`
+directory and the data directory with `rmdir`, which refuses one that is not
+empty. After it, `docker ps -a` lists no container of this session and the GPU
+check reads the GPU free. Never remove a directory's contents by wildcard.
 
 ## Explaining a step
 
@@ -214,9 +225,9 @@ mean. Design topics are under `atom/compass/design/`; give the one named.
 
 | After | Open | Explain |
 |---|---|---|
-| memory | `memory/memory_readings.json`; the log's `published ... as <token>` line; `memory/engine.log` | What an engine start reads off the device (`members`: capacity, reserves, activations, the graph pool), taken once so that a simulated run sizes ATOM's own KV pool from them with no device. Its `key` is what it was measured under; the token names it in the store. `03` D14. The engine sees only the GPU `HIP_VISIBLE_DEVICES` names and numbers it 0, so its log's `GPUs 0 to 0` and `cuda:0` are rocm-smi's GPU G. |
+| memory | `memory/memory_readings.json`; the log's `published ... as <token>` line; `memory/engine.log` | What an engine start reads off the device (`members`: capacity, reserves, activations, the graph pool), taken once so that a simulated run sizes ATOM's own KV pool from them with no device. Its `key` is what it was measured under; the token names it in the store. `03` D14. The engine sees only the GPU `HIP_VISIBLE_DEVICES` names and numbers it 0, so its log's `GPUs 0 to 0` and `cuda:0` are rocm-smi's GPU G. A `memory.cold/` beside it means the first start compiled (inductor autotuned a kernel or missed a graph), so its files moved to `<out>.cold` and it started again on the warmed cache. |
 | warm | `warm/run.json`, `aiter_jit_builds` | The kernels aiter built the first time this container met them. The cost model does not model warmth, so nothing reads this record and grading refuses a record that built one (`06` D27, *Warmup is not a protocol feature*). |
-| a record: calibration, real1, real2 | `run.json`; `steps/dp0.jsonl` and `dp0.engine.json`; `artifacts/client_run.json`; `server.log`; `preflight_*.txt`, `gpu_*.txt` | `run.json`: the tree (`source`), the stack, the device and PTL, the environment, the engine's bounds (`engine`). The step record: one line per forward step, its batch and its times (`atom/compass/parity/__init__.py` says what each field holds); show one prefill and one decode line with their durations. The client run names every request sent. The GPU checks before and after the server. `07` D38 |
+| a record: calibration, real1, real2 | `run.json`; `steps/dp0.jsonl` and `dp0.engine.json`; `artifacts/client_run.json`; `server.log`; `preflight_*.txt`, `gpu_*.txt` | `run.json`: the tree (`source`), the stack, the device and PTL, the environment, the engine's bounds (`engine`). The step record: one line per forward step, its batch and its times (`atom/compass/parity/__init__.py` says what each field holds); show one prefill and one decode line with their durations. The client run names every request sent. The GPU checks before and after the server: a `preflight_after.txt` that leaves the just-freed GPU out of `idle and empty` while it reads `PREFLIGHT_RC=0` and `gpu_after.txt` lists no PID is normal, its VRAM still being released. `07` D38 |
 | fit_steps | `fit_steps/step_linear_law.json` | The step linear law: per vector, a step cost fitted in relative error on the calibration steps (`09` D53 to D55). `params.unfitted` must be `{}`; `report.vectors` holds the samples behind each. `report.held_out` is empty with one calibration record, which is why the smoke cell's cost rows read unvalidated. |
 | fit_host | `fit_host/host_laws.json` | The CPU time around each step, per step kind, which a simulated server charges on its clock (`09` D54, composed by `01` D4). |
 | real2 | real1's and real2's step records | Two real runs of one workload: how far apart they land is the spread every metric is judged against (`08` D45). |
@@ -230,9 +241,27 @@ end (TTFT, TPOT, throughput), and cost (each real run's own steps priced by the
 law, `08` D47). Memory rows are per term (`08` D48); warmup rows state each
 run's warmup (`06` D27); summary rows give the refusals, the extrapolated and
 fallback steps, each method's share of the seconds (the design README,
-principles 6 and 7) and the speed. QUICKSTART's step 6 says what the value and
-each verdict mean. Show one row of each family from their table. An `outside`
-row is a result, not a failure.
+principles 6 and 7) and the speed. Counts and distributions cover only the
+graded window, the steps after the warmup, so they differ from a step record's
+line count. QUICKSTART's step 6 says what the value means and defines `within
+target`, `inside the real spread`, `outside` and `ungradeable`. The other
+verdicts (`atom/compass/validate/__main__.py` and `runs.py` make them):
+
+- `exact`: a count the simulated run shares with every real run.
+- `not gated`, alone or after a count's verdict (`exact, not gated`): a row
+  reported and not graded: counts other than preemptions and prefill tokens,
+  cost on unvalidated steps, the summary's step counts and shares.
+- `not graded`: a warmup row; those requests and steps are kept out of the
+  graded window.
+- `pass` (or `fail`): a memory term against its gate.
+- `meets <N>x` (or `below <N>x`): simulated seconds per wall second against
+  the speed target.
+- `none`: the simulated run refused no step (`coverage report` when it did).
+- `-`: a row stated, not judged: cost on validated steps, cost's steps left
+  out, declined or extrapolated, a band with no request, the graph pool.
+
+Show one row of each family from their table. An `outside` row is a result,
+not a failure.
 
 ## Reading a failure
 
@@ -274,7 +303,8 @@ body, one heading each:
   QUICKSTART's `docker run` needs here.
 - **Allocation**: how a GPU is booked (shared, or by a scheduler) and which.
 - **Inputs**: the model directory and traces, and where they mount.
-- **Disk**: the data directory, where Docker's storage is, the fallback when
-  either is full, and what the container's writable layer takes then.
+- **Disk**: where a session's own data directory goes, where Docker's storage
+  is, the fallback when either is full, and what the container's writable
+  layer takes then.
 
 MI355X has a machine spec, `mi355x-gpu45.json`; its profile follows #1032.
