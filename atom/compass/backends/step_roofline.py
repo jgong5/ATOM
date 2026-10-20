@@ -67,6 +67,7 @@ from atom.compass.backends.shape import IMAGES, BatchView, RequestShape, sum_tok
 from atom.compass.backends.work import (
     ELEMENT_BYTES,
     Work,
+    _wider,
     activated_experts,
     all_to_all,
     allgather,
@@ -227,20 +228,34 @@ def _sparse_reads(rows, window: int, ratio: int, top: int | None = None):
     return keys, read, span(ratio=ratio), int(entries.sum())
 
 
+def _sparse_products(rows, heads, dim, q, kv, window, ratio, top=None) -> Work:
+    """V4's attention products over `rows` (`_sparse_reads`): two of `dim` per
+    head and key, at the wider of Q's format `q` and the KV's `kv`, and the KV
+    entries each request reads, once each at `dim` in `kv`."""
+    keys, read, _, _ = _sparse_reads(rows, window, ratio, top)
+    return Work({_wider(q, kv): 4 * heads * dim * keys}, read * dim * ELEMENT_BYTES[kv])
+
+
+def _index_scores(rows, ratio, heads, dim, fmt) -> Work:
+    """V4's indexer over `rows`: each new query scored against every
+    compressed entry before it, one product of `dim` per head at `fmt`, and
+    each request's entries read once at `dim` in `fmt`."""
+    _, _, scored, entries = _sparse_reads(rows, 0, ratio)
+    return Work({fmt: 2 * heads * dim * scored}, entries * dim * ELEMENT_BYTES[fmt])
+
+
 def _sparse_attention(m: Module, rows) -> Work:
-    """V4's attention (`_sparse_reads`), at most the indexer's top `k`
-    compressed entries where it has one, which scores every compressed entry.
-    The KV each request reads is read once."""
+    """V4's attention (`_sparse_products`) at Q's format `act` and the KV's
+    `fmt`, at most the indexer's top `k` compressed entries where it has one,
+    which scores every compressed entry. Q is read at `act`, O written in
+    bf16."""
     heads, dim, window, ratio, top, index_heads, index_dim = m.dims
     top = top if index_heads else None
-    keys, read, scored, indexed = _sparse_reads(rows, window, ratio, top)
-    work = Work()
+    work = _sparse_products(rows, heads, dim, m.act, m.fmt, window, ratio, top)
     if ratio and index_heads:
-        scores = 2 * index_heads * index_dim * scored
-        work = Work({m.fmt: scores}, indexed * index_dim * ELEMENT_BYTES[m.fmt])
-    q = sum_tokens(rows) * heads * dim * ELEMENT_BYTES[ACT]
-    flops = {ACT: 4 * heads * dim * keys}
-    return work + Work(flops, 2 * q + read * dim * ELEMENT_BYTES[m.fmt])
+        work += _index_scores(rows, ratio, index_heads, index_dim, m.fmt)
+    q = sum_tokens(rows) * heads * dim
+    return work + Work({}, q * (ELEMENT_BYTES[m.act] + ELEMENT_BYTES[ACT]))
 
 
 def overlap(layers) -> float:

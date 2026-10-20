@@ -186,6 +186,32 @@ def test_sparse_attention_and_the_hyper_connection_mix_by_hand(spec):
 
 
 @BOUND
+def test_sparse_attention_over_an_fp8_q_and_without_an_indexer_by_hand(spec):
+    # Window 4, every 3 tokens compressed; Q in fp8 as the KV is.
+    csa = Module("attn", "sparse_attention", (2, 8, 4, 3, 2, 3, 4), "fp8", act="fp8")
+    hca = dataclasses.replace(csa, dims=(2, 8, 4, 3, 0, 0, 0))
+    rows = [(3, 10, False), (1, 7, True)]
+    top = every = scored = 0
+    for q, kv, _ in rows:
+        for p in range(kv - q + 1, kv + 1):
+            top += min(p, 4) + min(p // 3, 2)
+            every += min(p, 4) + p // 3
+            scored += p // 3
+    # The products run at fp8 and Q is read at a byte, O written in bf16. A
+    # layer with no indexer reads every compressed entry: 3 and 2.
+    q = 4 * 2 * 8 * (1 + 2)
+    work = Work({"fp8": 4 * 2 * 8 * top + 2 * 3 * 4 * scored}, q + 12 * 8 + 5 * 4)
+    hca_work = Work({"fp8": 4 * 2 * 8 * every}, q + (7 + 6) * 8)
+
+    assert _price([csa], view(*rows), spec)["roofline.sparse_attention"] == (
+        pytest.approx(_module(work, spec))
+    )
+    assert _price([hca], view(*rows), spec)["roofline.sparse_attention"] == (
+        pytest.approx(_module(hca_work, spec))
+    )
+
+
+@BOUND
 def test_a_split_step_lays_each_layers_micro_batches_on_two_streams(spec):
     layers = []
     for i in range(2):
@@ -425,9 +451,10 @@ def test_the_v4_pro_dpa_tp8_build_classifies_every_module(ep, tmp_path):
     assert not [m for m in found if m[0] == "unclassified"]
     assert {layer for *_, layer in walked} == set(range(61)) | {-1}
     assert found[("mhc", (4, 7168), "bf16", "bf16")] == 2 * 61
+    # The fp8 KV cache's kernels take Q in fp8.
     for ratio, top in ((128, (0, 0, 0)), (4, (1024, 64, 128))):
         dims = (128, 512, 128, ratio) + top
-        assert found[("sparse_attention", dims, "fp8", "bf16")] == ratios.count(ratio)
+        assert found[("sparse_attention", dims, "fp8", "fp8")] == ratios.count(ratio)
     moe = (384, 48, 6, 3072) if ep else (384, 384, 6, 384)
     # The experts read fp4 activations, aiter quantizing them in the kernel.
     # An expert holds its fp4 weights and a one-byte scale per 32 of them,
@@ -437,6 +464,8 @@ def test_the_v4_pro_dpa_tp8_build_classifies_every_module(ep, tmp_path):
     assert found[("moe", moe + (7168, 8, 8, 0, held), "fp4", "fp4")] == 61
     # The fp8 linears read fp8 activations; the block's norms run in its mixes.
     assert found[("gemm", (65536, 1536), "fp8", "fp8")] == 61
+    # So does wo_a, which gfx950 runs as an fp8 batched GEMM.
+    assert found[("gemm", (16384, 4096), "fp8", "fp8")] == 61
     assert found[("act", (3072,), "bf16", "bf16")] == 61
     assert found[("norm", (7168,), "bf16", "bf16")] == 1
 
