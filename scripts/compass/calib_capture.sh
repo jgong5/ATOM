@@ -5,12 +5,16 @@
 # to 392 on a real TP1 server through `REAL=1 cctraces_sim.sh`, at each
 # concurrency in CELLS, one cell at a time, since a cell run beside another
 # moves the host time the host laws measure. Each cell is stopped STEPS_S
-# seconds after its first recorded step: at concurrency 64 and above aiperf's
-# warmup alone outlasts the benchmark duration.
+# seconds after its first recorded step, so a cell whose aiperf warmup outlasts
+# that window ends without its export. Qwen3.8-27B TP1 on MI308X captures with
+# CELLS="1 4 16": at 64 and 256 its warmup cannot finish within STEPS_S, so the
+# owner dropped them for that model and machine as not a sustainable
+# configuration (https://github.com/jgong5/ATOM/issues/1590#issuecomment-6281930268).
 #
 # Usage: calib_capture.sh RUN_FILE OUT_DIR
 #   RUN_FILE, MODEL, TRACES, HARNESS_PYTHON  as cctraces_sim.sh takes them
-#   CELLS        concurrencies, in run order (default: 1 4 16 64 256)
+#   CELLS        concurrencies, in run order (default: 1 4 16 64 256, which
+#                DeepSeek-V4-Pro DPA-TP8 captures at)
 #   STEPS_S      wall seconds recorded per cell (default 1800)
 #   SERVER_ARGS  API server flags (default: --max-model-len 262144, so decode
 #                runs on captured graphs)

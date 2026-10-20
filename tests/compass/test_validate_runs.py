@@ -15,6 +15,7 @@ import collections
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -162,6 +163,26 @@ def test_the_command_prints_every_metric_and_needs_two_real_runs(tmp_path, capsy
     assert any(row.startswith("end to end | output token throughput |") for row in out)
     with pytest.raises(ValueError, match="two or more real runs"):
         grade(cells[:1], cells[1])
+
+
+def test_the_command_refuses_one_real_run_naming_it(tmp_path):
+    sim, real = (str(_cell(tmp_path / c, _schedule(), {})) for c in ("sim", "real0"))
+    runs = [sys.executable, "-m", "atom.compass.validate.runs", sim, real]
+    done = subprocess.run(runs, capture_output=True, text=True, check=False)
+
+    refusal = f"{[real]}: a real spread needs two or more real runs\n"
+    assert (done.returncode, done.stderr) == (1, refusal)
+
+
+def test_the_command_refuses_a_malformed_run_json_naming_it(tmp_path):
+    cells = [_cell(tmp_path / c, _schedule(), {}) for c in ("sim", "real0", "real1")]
+    (cells[2] / "run.json").write_text("{")
+    runs = [sys.executable, "-m", "atom.compass.validate.runs", *map(str, cells)]
+    done = subprocess.run(runs, capture_output=True, text=True, check=False)
+
+    what = "Expecting property name enclosed in double quotes: line 1 column 2"
+    refusal = f"{cells[2]}/run.json is not JSON: {what}\n"
+    assert (done.returncode, done.stderr) == (1, refusal)
 
 
 def test_prefill_tokens_grade_the_requests_both_runs_issued(tmp_path):

@@ -87,7 +87,8 @@ from pathlib import Path
 
 from scipy.stats import ks_2samp
 
-from atom.compass.drive.aiter_jit import BUILDS
+from atom.compass.backends.json_file import read_json, read_jsonl
+from atom.compass.drive import aiter_jit
 from atom.compass.parity.served import served
 from atom.compass.run import (
     CLIENT_DIR,
@@ -121,8 +122,7 @@ def _steps(cell) -> list[dict]:
         raise ValueError(
             f"{cell} holds {len(ranks)} DP ranks' records; this grades one"
         )
-    steps = (json.loads(line) for line in ranks[0].read_text().splitlines())
-    return [s for s in steps if not s["is_dummy_run"]]
+    return [s for s in read_jsonl(ranks[0]) if not s["is_dummy_run"]]
 
 
 def _requests(steps) -> collections.Counter:
@@ -207,7 +207,7 @@ def _client_run(cell, run) -> tuple[list[dict], list[str], dict]:
     and how many steps hold only those; refuses, naming every reason, a run
     grading does not take."""
     steps = _steps(cell)
-    export = json.loads((Path(cell) / CLIENT_RUN).read_text())
+    export = read_json(Path(cell) / CLIENT_RUN)
     warmup_names = set(export.get("warmup") or ())
     (split,) = served(Path(cell) / "steps", [export["requests"]]).values()
     split = [s for s in split if not s["is_dummy_run"]]
@@ -237,11 +237,8 @@ def _client_run(cell, run) -> tuple[list[dict], list[str], dict]:
         why.append("its export names no arguments its client was given")
     if unnamed := [u["x_request_id"] for u in export.get("unnamed") or ()]:
         why.append(f"its export lists requests no step can be matched to: {unnamed}")
-    if builds := run.get(BUILDS):
-        why.append(
-            f"aiter ran a JIT build of {builds} while its server served, "
-            "so a step may have waited on it"
-        )
+    if built := aiter_jit.refusal(run):
+        why.append(built)
     if "run_file" in run:
         why += _not_graded(run, traces)
     if why:
@@ -291,7 +288,7 @@ def graded(cell) -> tuple[list[dict], list[str] | None, dict | None]:
     """The steps `cell` grades; the traces its client was given, and its
     warmup, as `_client_run` gives them, both None where it is graded whole."""
     path = Path(cell) / "run.json"
-    run = json.loads(path.read_text()) if path.exists() else {}
+    run = read_json(path) if path.exists() else {}
     if "format_version" in run:
         return _client_run(cell, run)
     if (Path(cell) / CLIENT_RUN).is_file():
@@ -307,13 +304,13 @@ def _refuse_by_run_file(cell) -> None:
     path = Path(cell) / "run.json"
     if not path.exists():
         return
-    run = json.loads(path.read_text())
+    run = read_json(path)
     if "format_version" in run:  # `_client_run` checks a `record` or `run` cell
         return
     if any(h.get("skip") for h in entries(run, "host")):
         raise ValueError(f"{cell} skips host segments; a what-if run is not graded")
     engines = Path(cell).glob(LP_FILE.format(f"{ENGINE.name}*"))
-    memory = [json.loads(p.read_text()).get("memory") or {} for p in engines]
+    memory = [read_json(p).get("memory") or {} for p in engines]
     why = _run_file_not_graded(run, run.get("step_roofline"))
     if assumed := sorted({m["assumed"] for m in memory if m.get("assumed")}):
         why.append(ASSUMED.format(assumed))
@@ -323,9 +320,9 @@ def _refuse_by_run_file(cell) -> None:
 
 def _read(cell) -> dict:
     steps, traces, _warmup = graded(cell)
-    export = json.loads((Path(cell) / EXPORT).read_text())
+    export = read_json(Path(cell) / EXPORT)
     # A run graded whole states its arguments in run.json.
-    client = {} if traces is None else json.loads((Path(cell) / CLIENT_RUN).read_text())
+    client = {} if traces is None else read_json(Path(cell) / CLIENT_RUN)
     return {
         "counts": _counts(steps, export),
         "distributions": _distributions(steps),
@@ -368,7 +365,8 @@ def _grade(family, name, real, simulated, d=None) -> dict:
 def grade(real_cells, simulated_cell) -> dict:
     """Every metric's grade: {family: {metric: grade}}, as the module says."""
     if len(real_cells) < 2:
-        raise ValueError("a real spread needs two or more real runs")
+        names = [str(c) for c in real_cells]
+        raise ValueError(f"{names}: a real spread needs two or more real runs")
     _refuse_by_run_file(simulated_cell)
     real = [_read(c) for c in real_cells]
     simulated = _read(simulated_cell)
@@ -425,7 +423,7 @@ def priced_apart(cell) -> str | None:
     run's summary counts them; None for a cell with no summary."""
     for path in (Path(cell) / CLIENT_DIR.format(0), Path(cell)):
         if (path / SUMMARY_FILE).is_file():
-            schedule = json.loads((path / SUMMARY_FILE).read_text())["schedule"]
+            schedule = read_json(path / SUMMARY_FILE)["schedule"]
             n = [schedule.get(f"{k}_steps") for k in ("extrapolated", "fallback")]
             total = schedule["refusals"]["steps"]
             return f"of {total} steps priced: extrapolated {n[0]}, fallback {n[1]}"
@@ -446,4 +444,9 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except json.JSONDecodeError:  # it names no file, so it keeps its traceback
+        raise
+    except ValueError as refused:  # a refusal: its reason, exit 1, no traceback
+        raise SystemExit(str(refused)) from refused

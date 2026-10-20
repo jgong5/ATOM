@@ -67,6 +67,8 @@ from itertools import zip_longest
 
 import numpy as np
 
+from atom.compass.backends.json_file import read_json, read_jsonl
+
 ENV = "ATOM_COMPASS_PARITY_RECORD"
 #: The file in a real run's record directory holding when its workload was sent
 #: and when the server admitted each request.
@@ -523,11 +525,11 @@ def read(directory, stage: int = 0) -> dict[int, list[dict]]:
     """
     directory, record, start = pathlib.Path(directory), {}, None
     if (directory / ARRIVALS).exists():
-        start = min(json.loads((directory / ARRIVALS).read_text())["sent_ns"])
+        start = min(read_json(directory / ARRIVALS)["sent_ns"])
     # Each rank's record, and not the cost lines a simulated run writes beside it.
     prefix = f"pp{stage}." if stage else ""
     for path in sorted(directory.glob(f"{prefix}dp*[0-9].jsonl")):
-        steps = [json.loads(line) for line in path.read_text().splitlines()]
+        steps = read_jsonl(path)
         if (pulls := path.with_suffix(".pulls.jsonl")).exists():
             _join_stamps(steps, pulls)
         keys = {}
@@ -551,8 +553,8 @@ def _join_stamps(steps: list[dict], path) -> None:
     """Put into each step the first stamp of each key in `path` at or after
     its exit and before the next step's entry."""
     times = collections.defaultdict(list)
-    for line in path.read_text().splitlines():
-        for key, ns in json.loads(line).items():
+    for stamps in read_jsonl(path):
+        for key, ns in stamps.items():
             times[key].append(ns)
     ends = [s["t_enter_ns"] for s in steps[1:]] + [float("inf")]
     for step, end in zip(steps, ends):

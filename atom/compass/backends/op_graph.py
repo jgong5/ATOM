@@ -67,9 +67,9 @@ def step_shape(
     query tokens over its rows. A speculative decode step is refused."""
     if not all(decode for _, decode in rows):
         return "prefill", sum(q for q, _ in rows), len(rows)
-    if wide := [q for q, _ in rows if q != 1]:
+    if any(q != 1 for q, _ in rows):
         raise ValueError(
-            f"decodes {wide[0]} tokens in a row: a speculative decode step is "
+            "decodes more than one token in a row: a speculative decode step is "
             "not captured"
         )
     width = rung or len(rows)
@@ -127,7 +127,7 @@ class OpGraphBackend(CostBackend):
     def _region(self, view: BatchView) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region."""
         if view.image_tokens:
-            reason = IMAGES.format(view.image_tokens)
+            reason = IMAGES
         elif view.tbo_tokens is not None:
             reason = (
                 "a two-batch-overlap step: no captured graph holds a micro-batch, "
@@ -188,7 +188,7 @@ class OpGraphBackend(CostBackend):
         kernel or refuses."""
         if view.moe_rows is not None and leaf["op"].startswith(MOE_EXCHANGES):
             reason = (
-                f"a data-parallel step whose MoE gathers {view.moe_rows} rows: "
+                "a data-parallel step whose MoE gathers its group's rows: "
                 "capture runs one rank, so its graph holds the gather, the "
                 "reduce-scatter and the experts at every peer scheduling this "
                 "rank's rows"
