@@ -647,7 +647,8 @@ def _meta(spec, slot, live) -> tuple[str, torch.Tensor]:
 
 def _function(name: str):
     """The callable a leaf names: `ns.op.overload`, or a lifted `module:qualname`;
-    a functional collective waited on, as the in-place one ATOM calls is."""
+    a functional collective waited on, as the in-place one ATOM calls is; a
+    declared exchange that takes a group on ATOM's DP group, the one it runs on."""
     if ":" in name:
         module, qualname = name.split(":")
         fn, path = importlib.import_module(module), qualname.split(".")
@@ -656,6 +657,14 @@ def _function(name: str):
         fn, path = getattr(torch.ops, namespace), rest.split(".")
     for attr in path:
         fn = getattr(fn, attr)
+    if name.startswith(COLLECTIVES) and ":" in name:
+        import functools
+        import inspect
+
+        if "group" in inspect.signature(fn).parameters:  # the capture drops it
+            from aiter.dist.parallel_state import get_dp_group
+
+            return functools.partial(fn, group=get_dp_group())
     if name.startswith(COLLECTIVES) and name.startswith("_c10d_functional."):
         wait = torch.ops._c10d_functional.wait_tensor
         return lambda **kwargs: wait(fn(**kwargs))
@@ -685,8 +694,9 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
 def _replay(fn, calls) -> list[float]:
     """Each timed replay of one graph of `calls`, in ns per call. Over several
     ranks, a decode step's graph is captured as ATOM captures one, each
-    collective on the buffers it registered, and every rank takes a barrier
-    before each replay."""
+    collective on the buffers it registered, and before each replay every
+    rank takes a barrier on the host, then waits on one all-reduce on the
+    device, so each rank's replay starts as the others' do."""
     import contextlib
 
     from atom.compass.bench.ranks import cpu_group
@@ -694,8 +704,10 @@ def _replay(fn, calls) -> list[float]:
 
     group = cpu_group()
     registered = group is not None and not calls[0][1].context.is_prefill
-    if registered:
-        from aiter.dist.parallel_state import graph_capture
+    if group is not None:
+        from aiter.dist.parallel_state import get_world_group, graph_capture
+
+        device, flag = get_world_group().device_group, torch.zeros(1, device="cuda")
     graph = torch.cuda.CUDAGraph()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -713,6 +725,7 @@ def _replay(fn, calls) -> list[float]:
     for i in range(WARMUPS + REPEATS):
         if group is not None:
             torch.distributed.barrier(group=group)
+            torch.distributed.all_reduce(flag, group=device)
         start.record()
         graph.replay()
         end.record()
