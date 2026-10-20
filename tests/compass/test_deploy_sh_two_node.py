@@ -7,8 +7,9 @@ simulated deployment's run file does.
 The planted pieces are `test_deploy_sh`'s, its `compass` instance standing in
 for `compass record`, and a prefix that stands in for `ssh <node>`: it passes
 its words through a shell again, and a signal to it does not reach them. It
-can start its command late (`PLANTED_ON_DELAY`), or hang instead of running
-the start or the stop (`PLANTED_ON_HANG`).
+can run its command late, whether or not it is still there
+(`PLANTED_ON_DELAY`), or hang instead of running the start or the stop
+(`PLANTED_ON_HANG`).
 """
 
 import json
@@ -29,9 +30,8 @@ echo "$node $*" >>"$PLANTED_ON"
 trap 'exit 143' TERM
 case "$1:${PLANTED_ON_HANG-}" in
 bash:start | kill:kill) sleep 100 & wait $! ;;
-bash:*) sleep "${PLANTED_ON_DELAY:-0}" & wait $! ;;
 esac
-sh -c "$*" &
+sh -c "sleep ${PLANTED_ON_DELAY:-0}; $*" &
 wait $!
 """
 
@@ -229,6 +229,10 @@ def test_a_stop_before_the_decode_wrote_its_pid_still_reaches_it_there(
     script.send_signal(signal.SIGTERM)
     script.communicate(timeout=60)
 
+    for _ in range(100):  # the prefix runs the command late
+        if (d / "decode.pid").exists():
+            break
+        time.sleep(0.1)
     pid = int((d / "decode.pid").read_text())
     assert _on(tmp_path) == [f"node-b bash {d}/decode.sh", f"node-b kill -TERM {pid}"]
     assert _gone(pid)
