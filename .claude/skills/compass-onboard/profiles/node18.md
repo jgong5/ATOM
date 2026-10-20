@@ -32,7 +32,9 @@ their own client venv (QUICKSTART's recipe) in the data directory.
 
 - Data directory: `/data/<user>/compass`.
 - Docker's storage is `/data/docker`, on the same disk, so the container's
-  writable layer takes room from it too.
+  writable layer takes room from it too. `/data` is ext4: when it reads full
+  for users, the daemon still writes into the root-only reserve every user
+  shares.
 - The root disk is small: nothing goes there.
 - Fallback when `/data` has no room for the developer: the data directory on
   the host's tmpfs, such as `/tmp/<user>_compass`, mounted in the container at

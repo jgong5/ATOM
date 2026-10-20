@@ -19,8 +19,9 @@ printed and wrote. They learn Compass from their own run.
    --show-toplevel` where they invoked you) and take every step's command from
    them as they read then, placeholders filled from this session. This file
    holds its read-only checks, what to explain, how to read a failure and where
-   to stop. Where those files and this one disagree, the files win: tell the
-   developer what differs.
+   to stop. Where those files and this one disagree on a command or a figure,
+   the files win: tell the developer what differs. They never stand in for a
+   check here.
 2. **Announce, ask, run, explain.** Before each step say what it does, what it
    holds (which GPU, how long it takes, how much disk and where) and what
    success looks like, from QUICKSTART's own figures and success lines. Then
@@ -41,7 +42,7 @@ printed and wrote. They learn Compass from their own run.
      same GPU.
    - Containers named `<user>_<purpose>`, `<user>` from `id -un`: QUICKSTART's
      `<user>_<issue>_gpu` with a purpose for the issue, such as
-     `<user>_compass_onboard`. Act only on containers whose name starts with
+     `<user>_onboard_gpu`. Act only on containers whose name starts with
      `<user>_`. Never stop, remove, enter or signal another user's container or
      process, even one holding the GPU you wanted.
    - Disk checked before anything writes.
@@ -50,8 +51,8 @@ printed and wrote. They learn Compass from their own run.
 
 Each is read-only; report each that passes in one line. The first that fails
 refuses and ends the session: say what failed, what is missing, and that
-nothing was started. A check that offers the developer a choice (Disk) runs
-again on their answer, and refuses only when that fails too.
+nothing was started. A check that offers the developer a choice (Disk, GPU)
+runs again on their answer, and the session ends only when they take none.
 
 1. **Target.** Ask which machine they want Compass to simulate; the default is
    the one they are on. A target with no hardware they can run, such as MI455,
@@ -81,28 +82,29 @@ again on their answer, and refuses only when that fails too.
 3. **Runtime.** The profile's container tool runs for this user (`docker ps`),
    and its image is present (`docker image inspect`). A missing image does not
    refuse, but its pull is a step of its own: announce its size and ask.
-4. **Disk.** `df -h`, as the developer, on the profile's data directory and
-   on Docker's storage (`docker info -f '{{.DockerRootDir}}'`). The data
-   directory needs what QUICKSTART's Disk gives for the path about to run (its
-   runs, the container's cache unless the profile mounts it elsewhere, a running
-   client's map) with room to spare; without it, offer the profile's fallback
-   or ask for a directory with room. Docker's storage takes the container's
-   writable layer, whatever the profile does not mount elsewhere; when it reads
-   no room, give the developer the profile's figure for that layer, say the
-   Docker daemon writes it as root into the disk's reserve, and ask. Never
-   write to the root disk.
-5. **Inputs.** The model directory (QUICKSTART's `MODEL`, inside the profile's
-   model repo) holds `config.json`; the traces file's size is QUICKSTART's (its
-   sha256 takes a minute: offer it).
+4. **Disk.** `df -h`, as the developer, on the profile's data directory (its
+   nearest existing parent if it does not exist yet) and on Docker's storage
+   (`docker info -f '{{.DockerRootDir}}'`). The data directory needs what
+   QUICKSTART's Disk gives for its runs and a running client's map, with room
+   to spare; without it, offer the profile's fallback or ask for a directory
+   with room. Docker's storage takes the container's writable layer: its cache
+   and whatever else the profile does not mount elsewhere. When it reads no
+   room, give the developer the profile's figure for that layer and where the
+   daemon, which writes as root, would put it, and ask. Never write to the root
+   disk.
+5. **Inputs.** The model directory (QUICKSTART's `MODEL`, a container path:
+   read it on the host through the profile's mounts) resolves `config.json`;
+   the traces file's size is QUICKSTART's (its sha256 takes a minute, and
+   QUICKSTART gives its prefix: offer it).
 6. **GPU.** Run the tree's `scripts/compass/preflight.sh` on the host, then
    QUICKSTART's check of a shared GPU (its use, VRAM and process listing). A GPU
    is idle when `PREFLIGHT_RC=0`, preflight lists it under `idle and empty`,
    and QUICKSTART's check reads it at 0% use and 0% VRAM with no process on it.
    Preflight's own compute rows can read 1% on every GPU while its `rocminfo`
    runs; judge by its idle list and the check after it. Ask which GPU they want,
-   within the profile's Allocation (ask what it leaves to them). Refuse a busy
-   one, naming its VRAM or use reading or the PID on it, and offer the idle
-   ones, or none. Its HIP ordinal is the entry of preflight's `export
+   within the profile's Allocation (ask which GPUs it leaves to them). Refuse
+   a busy one, naming its VRAM or use reading or the PID on it, and offer the
+   idle ones, or none. Its HIP ordinal is the entry of preflight's `export
    HIP_VISIBLE_DEVICES=` line at the GPU's position in the idle list.
 
 Then summarize in one block: host, machine spec, GPU and HIP ordinal, data
