@@ -67,6 +67,8 @@ H2D = "atom/utils/h2d.py"
 HOST_QUERIES = ("aiter.get_gfx_custom_op.default",)
 #: Operators that ask a fake tensor where it is and run nothing on a device.
 UNDISPATCHED = ("profiler.", "prim.device")
+#: The hf config fields that count a model's routed experts.
+ROUTED = ("n_routed_experts", "num_experts", "num_local_experts")
 
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
@@ -115,18 +117,56 @@ def structure(
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the TP width, the DP width and the EP
     group's when they are set, the phase and the mode, `config`'s unless `eager`
-    names it, the arch of `device`, else `device_arch()`, and ``no output``
-    unless the step produces output (`output`)."""
+    names it, the arch of `device`, else `device_arch()`, the routed experts'
+    Triton path when it is taken (`experts`), and ``no output`` unless the step
+    produces output (`output`)."""
     from atom.compass.run import _file_digest
 
     digest = _file_digest(config.model, "config.json")
     mode = "eager" if (config.enforce_eager if eager is None else eager) else "graph"
-    arch = config.hf_config.architectures[0]
+    arch, device = config.hf_config.architectures[0], device or device_arch()
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     widths = f"tp={tp}" + (f" dp={dp}" if dp > 1 else "")
     widths += f" ep={tp * dp}" if config.enable_expert_parallel else ""
-    key = f"{arch} {device or device_arch()} {digest} {widths} {phase} {mode}"
+    key = f"{arch} {device} {digest} {widths}{experts(config, device)} {phase} {mode}"
     return key if output else f"{key} no output"
+
+
+def experts(config, device: str) -> str:
+    """`` experts=triton`` when the MXFP4 routed experts run Triton's kernels on
+    a `device` arch, from what `Mxfp4MoEMethod` reads to pick them, then
+    ``+a4w4`` and ``+decode`` (only decode steps run them) as set. Empty for
+    aiter's path and for a model with no routed experts."""
+    from atom.utils import envs
+
+    tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
+    if not any(getattr(config.hf_config, n, None) for n in ROUTED):
+        return ""
+    ep = config.enable_expert_parallel and tp * dp > 1
+    arches = ("gfx94", "gfx95") if envs.ATOM_USE_TRITON_GEMM else ("gfx94",)
+    on = not ep and device.startswith(arches)
+    if envs.is_set("ATOM_USE_TRITON_MOE"):
+        on = envs.ATOM_USE_TRITON_MOE
+    # MegaMoE's method keeps Triton's EP path alone, and no phase split.
+    mega = getattr(config, "moe_backend", "") == "mega"
+    on = on and not getattr(config, "eplb_enable", False) and not (mega and not ep)
+    if not on or ep and not device.startswith(("gfx95", "gfx125")):
+        return ""
+    a4w4, decode = envs.ATOM_USE_TRITON_MOE_A4W4, envs.ATOM_USE_TRITON_MOE_DECODE
+    return " experts=triton" + "+a4w4" * a4w4 + "+decode" * (decode and not mega)
+
+
+def _check_experts(model, named: str) -> None:
+    """Refuses a model whose MXFP4 experts take another path than `named`."""
+    for name, module in model.named_modules():
+        m = getattr(module, "quant_method", None)
+        if hasattr(m, "use_triton_ep"):
+            took = (m.use_triton or m.use_triton_ep, m.use_triton_decode)
+            if took != ("triton" in named, "+decode" in named):
+                raise ValueError(
+                    f"ATOM's experts at {name} take Triton's, decode only: {took}; "
+                    f"the op_graph key names {named.strip() or 'aiter'}"
+                )
 
 
 def _atom_frames():
@@ -639,6 +679,7 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
             peers.install_mori(recorder)
     with stack:
         runner = _build_runner(config, fake_mode)
+        _check_experts(runner.model, experts(config, arch))
         if v4 := sys.modules.get("atom.models.deepseek_v4"):
             stack.enter_context(_v4_attention(v4, recorder))
         stacks = [
