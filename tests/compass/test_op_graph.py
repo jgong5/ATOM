@@ -734,10 +734,62 @@ def test_each_micro_batch_of_a_split_step_prices_at_its_own_shape():
     def graph(phase, tokens, seqs, output, gathered):
         return {"seq": [g(tokens, 8, 8)]}
 
-    cost = OpGraphBackend(SECOND, graph, kv="bf16", price_list=params).price(SPLIT)
+    cost = OpGraphBackend(SECOND, graph, kv="bf16", dp=2, price_list=params)
+    cost = cost.price(SPLIT)
 
     # each a second as a roofline: 3 and 4 seconds are the list's
     assert by_name(cost) == {"op.tbo.price_list": overlap([[(3.0, 4.0)]])}
+    assert cost.terms[0].provenance.method is Method.MEASURED
+
+
+# An MoE GEMM over the rows a DP-2 group gathers, at T = 4 and two stated G;
+# flat in cached tokens, so its family runs over G alone.
+GATHERED = listed(
+    *[
+        pt(g(rows, 8, 8), f"prefill T=4 B=1 G={rows}", ns, c)
+        for rows, ns in ((12, 3e9), (16, 4e9))
+        for c in (0, 8)
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "rows,answer,method",
+    [
+        (12, 3.0, Method.MEASURED),
+        (14, 3.5, Method.ESTIMATED),
+        (32, f"{GEMM}: G = 32 is outside the measured 12 to 16", None),
+        (8, f"{GEMM}: no point of its signature was measured", None),
+    ],
+    ids=["measured", "between-two", "unmeasured", "every-rank-s-t"],
+)
+def test_a_gathered_count_nobody_measured_is_declined(rows, answer, method):
+    def graph(phase, tokens, seqs, output, gathered):
+        return {"seq": [g(gathered, 8, 8)]}
+
+    step = replace(FINAL, requests=(RequestShape(4, 4, False),), moe_rows=rows)
+    cost = OpGraphBackend(SPEC, graph, kv="bf16", dp=2, price_list=GATHERED).price(step)
+
+    if method is None:
+        assert cost.refusals == (Refusal("price-list", answer),)
+    else:
+        assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(answer)}
+        assert cost.terms[0].provenance.method is method
+
+
+def test_a_prefill_kind_measured_at_one_row_count_prices_another():
+    # no two points share T and cached tokens, so no point says rows move it
+    params = listed(
+        *[
+            pt(g(t, 8, 8), f"prefill T={t} B=1", ns, c)
+            for t, ns in ((4, 4e9), (8, 8e9))
+            for c in (0, 8)
+        ]
+    )
+    step = replace(FINAL, requests=(RequestShape(2, 2, False),) * 2)
+    cost = backend(g(4, 8, 8), price_list=params).price(step)
+
+    assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(4.0)}
     assert cost.terms[0].provenance.method is Method.MEASURED
 
 

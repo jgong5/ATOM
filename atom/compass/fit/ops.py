@@ -17,7 +17,9 @@ shape's token or sequence count or one more. Any other integer names the leaf:
 the GEMMs of a decode step differ in N and K and share a family per weight.
 
 A family's dimensions are the shape's counts its masked integers follow, a
-decode's B always, and, for a kind that depends on context as `measure ops`
+decode's B always, the rows its MoE gathers, ``G``, when the shape states them
+(a shape that does not gathers every rank's T, and is another family), and,
+for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
 a prefill's B and the context: a decode point's ``context``, its longest
 row's, or a prefill point's rows' mean cached tokens (`band`); and a
@@ -150,14 +152,17 @@ def skeleton(shape: str, leaf: str) -> str:
 
 
 def family(shape: str, leaf: str, free) -> str:
-    """The phase of `shape` and `leaf`'s signature with the positions `free`
-    holds masked: the integers that follow the shape."""
+    """The phase of `shape`, ``G`` after it when `shape` states one, and
+    `leaf`'s signature with the positions `free` holds masked: the integers
+    that follow the shape."""
     sig = _walk(json.loads(leaf), lambda i, v: MASK if i in free else v, [0])
-    return _text([shape.split()[0], sig])
+    head = shape.split()[0] + (" G" if "G" in shape_counts(shape) else "")
+    return _text([head, sig])
 
 
 def shape_counts(shape: str) -> dict:
-    """The counts `shape` states, ``T`` and ``B`` for a prefill, ``B`` for a decode."""
+    """The counts `shape` states, ``T`` and ``B`` for a prefill, ``B`` for a
+    decode, and ``G`` when it states the rows its MoE gathers."""
     return {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", shape)}
 
 
@@ -214,6 +219,7 @@ def fit(points) -> dict:
                 dims = [d for d in ("T", "B") if d in follows or moves]
                 if "B" not in dims and dependent.get(("rows", p["op"]), False):
                     dims.append("B")
+            dims += ["G"] if "G" in at_p else []
             dims += ["context"] if moves else []
             f = families.setdefault(
                 family(p["shape"], p["leaf"], free_of[skel]),
@@ -354,11 +360,12 @@ class PriceList(CostSource):
         from atom.compass.bench.ops import signature
 
         (leaf, (phase, *counts, top), _), kind = request, request[0]["op"]
-        name = self._family(phase, signature(leaf))
+        at = dict(zip(("T", "B", "G", "context"), counts))
+        shape = phase if at["G"] is None else f"{phase} G={at['G']}"
+        name = self._family(shape, signature(leaf))
         if name is None:
             return self.refuse(f"{kind}: no point of its signature was measured")
         dims = self.params["families"][name]["dims"]
-        at = dict(zip(("T", "B", "context"), counts))
         top = top if dims[-1:] == ["context"] and top != at["context"] else None
         got = self._lookup(name, tuple(at[d] for d in dims), top)
         if isinstance(got, str):
@@ -366,11 +373,11 @@ class PriceList(CostSource):
         method = Method.MEASURED if got[1] else Method.ESTIMATED
         return CostTerm(f"op.{kind}", got[0] * 1e-9, Provenance(method))
 
-    def _family(self, phase: str, sig: str) -> str | None:
-        """The family of a leaf of signature `sig`, or None."""
+    def _family(self, shape: str, sig: str) -> str | None:
+        """The family of a leaf of signature `sig` at `shape`, or None."""
 
-        free = self.params["free"].get(skeleton(phase, sig))
-        name = None if free is None else family(phase, sig, free)
+        free = self.params["free"].get(skeleton(shape, sig))
+        name = None if free is None else family(shape, sig, free)
         return name if name in self.params["families"] else None
 
     def _lookup(self, name: str, at: tuple, top) -> tuple[float, bool] | str:

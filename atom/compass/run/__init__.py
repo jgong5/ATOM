@@ -1398,6 +1398,7 @@ def runner(model_runner, tree) -> None:
             machine,
             _op_graphs(run["store"], config, machine.value("device.arch")),
             tp=tp,
+            dp=config.parallel_config.data_parallel_size,
             kv=config.kv_cache_dtype,
             padded=padding != "none",
             split_send_recv=config.enable_expert_parallel

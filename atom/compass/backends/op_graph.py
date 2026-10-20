@@ -140,6 +140,7 @@ class OpGraphBackend(CostBackend):
         graph: Callable[..., dict | None],
         *,
         tp: int = 1,
+        dp: int = 1,
         kv: str,
         padded: bool = True,
         split_send_recv: bool = False,
@@ -148,6 +149,7 @@ class OpGraphBackend(CostBackend):
         self.machine = machine
         self.graph = graph
         self.tp = tp
+        self.dp = dp
         self.kv = kv
         self.padded = padded
         self.split_send_recv = split_send_recv
@@ -204,15 +206,17 @@ class OpGraphBackend(CostBackend):
         return f"op graph at TP {self.tp}, {first}one roofline per leaf, at {rows}"
 
     def _bound(self, view: BatchView) -> tuple:
-        """What a price list reads of a step: its phase, its T and B, and its
-        rows' context and max context (`band`), the context a decode's max, a
-        prefill's mean cached tokens."""
+        """What a price list reads of a step: its phase, its T and B, the rows
+        its MoE gathers, None at every rank's T (`dp` x T, as `Shape.at`
+        drops them), and its rows' context and max context (`band`), the
+        context a decode's max, a prefill's mean cached tokens."""
         rung = view.capture_rung if self.padded else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
-        phase, *counts = step_shape(rows, rung)
+        phase, t, b = step_shape(rows, rung)
+        g = None if view.moe_rows == self.dp * t else view.moe_rows
         rows = [(r.query_tokens, r.context_tokens) for r in view.requests]
         mean, top = band(rows, phase == "decode")
-        return (phase, *counts, top if phase == "decode" else mean, top)
+        return (phase, t, b, g, top if phase == "decode" else mean, top)
 
     def _region(self, view: BatchView) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region."""

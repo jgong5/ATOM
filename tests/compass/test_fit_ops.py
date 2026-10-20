@@ -268,6 +268,32 @@ def test_a_prefill_kind_its_rows_move_runs_over_its_rows():
     assert _families(points) == [(["B"], [[[1], 300e3], [[2], 6e5]])]
 
 
+def test_a_stated_gathered_count_is_a_dimension_its_points_kept_apart():
+    # an MoE leaf over the rows the group gathers, at two G of each T
+    points = [
+        _prefill(t, 1, ns)
+        | {"shape": f"prefill T={t} B=1 G={g}", "leaf": _leaf(g, 128)}
+        for t, g, ns in (
+            (64, 128, 1e5),
+            (64, 256, 2e5),
+            (128, 256, 21e4),
+            (128, 512, 4e5),
+        )
+    ]
+
+    assert _families(points) == [
+        (
+            ["T", "B", "G", "context"],
+            [
+                [[64, 1, 128, 0], 1e5],
+                [[64, 1, 256, 0], 2e5],
+                [[128, 1, 256, 0], 21e4],
+                [[128, 1, 512, 0], 4e5],
+            ],
+        )
+    ]
+
+
 def test_points_at_one_coordinate_that_launched_other_kernels_refuse():
     points = [_point(2, 10.0), _point(2, 10.0, "x") | {"rows": [[1, 1024, True]] * 2}]
 
