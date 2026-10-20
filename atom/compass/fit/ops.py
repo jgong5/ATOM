@@ -25,10 +25,11 @@ between neighbours that launched different kernels, naming the dimension, the
 neighbours and their first differing kernel.
 
 The report holds, for each point and dimension along which the point has a
-measured neighbour on both sides, the price the other points of that line
-give it and its error. A point that launched other kernels than the neighbours
-it is priced from is a hidden band: no check of the neighbours' kernels can
-see it. A line holding a hidden band or an error over `LIMIT` does not
+measured neighbour on both sides, not both one away, the price the other
+points of that line give it and its error; between neighbours one away, every
+query is the point itself. A point that launched other kernels than the
+neighbours it is priced from is a hidden band: no check of the neighbours'
+kernels can see it. A line holding a hidden band or an error over `LIMIT` does not
 interpolate: its family lists it under `declined` with its reason, for the
 price list's reader to answer only its measured points along it. Per phase
 and operator the report gives the median and largest error on the lines that
@@ -215,8 +216,9 @@ def interpolate(points: dict, at: tuple, dims):
 
 def held_out(params) -> list[dict]:
     """Each point priced along each dimension by the other points of its line,
-    where it has a neighbour on both sides; a hidden band is a point whose
-    kernels are not the ones its neighbours launched. Each family gets its
+    where it has a neighbour on both sides and they are not both one away; a
+    hidden band is a point whose kernels are not the ones its neighbours
+    launched. Each family gets its
     `declined` lines, [dimension, the other coordinates, reason]: those
     holding a hidden band or an error over `LIMIT`."""
     rows = []
@@ -233,6 +235,8 @@ def held_out(params) -> list[dict]:
                 }
                 xs = [x for (x,) in line]
                 if not (xs and min(xs) < c[i] < max(xs)):
+                    continue
+                if c[i] - 1 in xs and c[i] + 1 in xs:
                     continue
                 row = {"op": f["op"], "phase": json.loads(name)[0], "dim": dim}
                 row |= {"at": list(c), "measured_ns": ns}

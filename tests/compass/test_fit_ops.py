@@ -184,6 +184,28 @@ def test_a_line_holding_an_error_over_5pct_either_way_is_declined_with_its_reaso
     assert ops.summary(rows)["decode aiter.gemm"]["max_error"] == pytest.approx(0.04)
 
 
+def test_fit_ops_holds_out_no_point_between_neighbours_one_context_away(
+    measured, tmp_path
+):
+    # one kernel stepping between contexts 512 and 513: 512 priced from 511 and
+    # 513 reads +10%, as it does from 510 and 514, where 511 and 513 go unmeasured
+    adjacent = [_point(2, ns, context=c) for c, ns in ((511, 10), (512, 10), (513, 12))]
+    wide = [
+        _point(2, ns, n=256, context=c) for c, ns in ((510, 10), (512, 10), (514, 12))
+    ]
+    d, _ = measured("m", adjacent + wide)
+
+    got = _fit(tmp_path / "fit", tmp_path / "store", d)
+
+    families = got["params"]["families"].values()
+    declined = {min(p[0][1] for p in f["points"]): f["declined"] for f in families}
+    assert declined[511] == []
+    assert declined[510] == [
+        ["context", [2], "context = 512 reads +10.0% off its neighbours"]
+    ]
+    assert [r["at"] for r in got["report"]["held_out"]] == [[2, 512]]
+
+
 @pytest.mark.parametrize(
     "moved, cell",
     [({"ptl": "disabled"}, "PTL"), ({"source_root": "tree-" + "b" * 40}, "ATOM src")],
