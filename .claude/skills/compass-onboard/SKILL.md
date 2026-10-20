@@ -47,11 +47,10 @@ printed and wrote. They learn Compass from their own run.
      shell that runs a step (`docker exec -e`). The compass commands set their
      servers' own from `--gpu`; this keeps anything else in that shell on the
      same GPU.
-   - Containers named `<user>_<purpose>`, `<user>` from `id -un`: QUICKSTART's
-     `<user>_<issue>_gpu` with a purpose for the issue, such as
-     `<user>_onboard_gpu`. Act only on containers whose name starts with
-     `<user>_`. Never stop, remove, enter or signal another user's container or
-     process, even one holding the GPU you wanted.
+   - Containers named `<user>_<purpose>`, `<user>` from `id -un`, as
+     QUICKSTART's `docker run` names its own. Act only on containers whose name
+     starts with `<user>_`. Never stop, remove, enter or signal another user's
+     container or process, even one holding the GPU you wanted.
    - Disk checked before anything writes.
 
 ## Checks, before anything starts
@@ -96,16 +95,16 @@ runs again on their answer, and the session ends only when they take none.
    session's files mix with nothing else, and ask for another name. `df -h`, as
    the developer, on it (on its nearest existing parent while it does not
    exist) and on Docker's storage
-   (`docker info -f '{{.DockerRootDir}}'`). The data directory needs what
-   QUICKSTART's Disk gives for the path about to run (the smoke cell's figures
-   now, the full cell's before the full path) and a running client's map, with
-   room to spare; without it, offer the profile's fallback or ask for a
-   directory with room. Docker's storage takes the container's writable layer:
-   its cache and whatever else the profile does not mount elsewhere. When it
-   reads no room, give the developer the profile's figure for that layer and
-   where the daemon, which writes as root, would put it, and ask. Keep runs,
-   trees, venvs and caches off the root disk; QUICKSTART's `git fetch` in the
-   checkout is the only write there.
+   (`docker info -f '{{.DockerRootDir}}'`). Each needs what QUICKSTART's Disk
+   gives it for the path about to run (the smoke cell's figures now, the full
+   cell's before the full path), with room to spare: the data directory its
+   runs and a running client's map, Docker's storage the container's layer.
+   Without room for the data directory, offer QUICKSTART's Disk fallback where
+   the profile's Disk puts it, or ask for a directory with room. When Docker's
+   storage reads no room, give the developer QUICKSTART's figure for the layer
+   and where the daemon, which writes as root, would put it, and ask. Keep
+   runs, trees, venvs and caches off the root disk; QUICKSTART's `git fetch`
+   and `git checkout` in the clone are the only writes there.
 5. **Inputs.** The model directory (QUICKSTART's `MODEL`, a container path:
    read it on the host through the profile's mounts) resolves `config.json`;
    the traces file's size is QUICKSTART's (its sha256 reads the whole file, up
@@ -130,34 +129,33 @@ directory, image, container name. Offer the smoke path.
 
 ## The smoke path
 
-Each step announced, confirmed, run and explained. QUICKSTART's blocks marked
-`# host` run on the node, the rest through `docker exec` in the container.
-Create the data directory as the developer before the container mounts it, or
-the daemon creates it as root. Once the tree step names `$T`, write
-QUICKSTART's Variables, filled for this session, into one file in the data
-directory and source it in every `docker exec`: a tool call keeps no shell.
-Announce that file and show it; it holds nothing, so it needs no yes.
+Each step announced, confirmed, run and explained. QUICKSTART's Environment
+says where each block runs; run the container's through `docker exec`. Once
+the tree step names `$T`, write QUICKSTART's Variables block and `serve`,
+filled for this session, into one file in the data directory and source it in
+every `docker exec`: a tool call keeps no shell to paste them into. Announce
+that file and show it; it holds nothing, so it needs no yes.
 
-1. **Container.** QUICKSTART's `docker run`, with the profile's image, mounts
-   and options, named `<user>_<purpose>`. If a container of that name is the
-   developer's already, ask whether to reuse it. It holds no GPU until a
-   command runs. Explain: one container serves every step, and its image is the
-   stack the machine spec was measured on; a fit refuses records from another
-   (a record's `run.json` `stack` against the spec's
-   `device.software_pinned_to`).
-2. **Tree.** QUICKSTART's One tree, on the host. Its lines on commits behind,
-   changed files and `gate_cpu.sh` are for the gates: say so. Explain from the
-   extracted tree's `.compass-commit`: every record, fit and run is keyed by its
-   tree, so two trees' artifacts refuse each other.
+1. **Container.** QUICKSTART's `docker run`, its placeholders filled from the
+   profile and this session, with any option the profile's Runtime adds. If a
+   container of that name is the developer's already, ask whether to reuse it
+   or name another purpose. It holds no GPU until a command runs. Explain: one
+   container serves every step, and its image is the stack the machine spec
+   was measured on; a fit refuses records from another (a record's `run.json`
+   `stack` against the spec's `device.software_pinned_to`).
+2. **Tree.** QUICKSTART's One tree, on the host. Say that its checkout leaves
+   the developer's clone detached at the tip. Explain from the extracted tree's
+   `.compass-commit`: every record, fit and run is keyed by its tree, so two
+   trees' artifacts refuse each other.
 3. **Client Python.** QUICKSTART's venv recipe, in the container. Explain the
    two client Pythons: a real server's client is the image's aiperf; a
    simulated server's paces aiperf on the server's virtual clock through
    compass-harness (`atom/compass/design/06_workload_harness_contract.md`, D34).
 4. **The smoke cell.** QUICKSTART's The smoke cell block. It holds the GPU for
-   the time QUICKSTART measured and takes the disk QUICKSTART's Disk gives. Its
-   calibration times the host, so show what the GPU check reads on the node's
-   other GPUs and ask the developer to confirm the node is quiet enough. Say
-   that this one yes covers all its steps, which run back to back. Run it
+   the time QUICKSTART measured and takes the disk QUICKSTART's Disk gives. Say
+   what QUICKSTART's Environment (GPUs are shared) says of running it beside
+   other work, and that this one yes covers all its steps, which run back to
+   back. Run it
    detached in the container, its output in a log outside its OUT (it refuses
    an OUT that is not empty), since it outlives any one tool call. `docker exec
    -d` drops the exit status, so keep it in a file: the block, then
@@ -174,27 +172,25 @@ Then offer the full path, or Cleanup.
 QUICKSTART's The path, steps 0 to 6, each a step of its own: announce it from
 QUICKSTART's times and Disk, check the GPU (steps 0 to 3) and the disk, ask,
 run it detached as above, explain it. Use a new cell directory. The smoke
-cell's container and tree may be reused; that container is warm, so step 0 may
-be skipped: say so and let the developer choose. Step 2 times the host as well:
-before it, show what preflight reads on the other GPUs and ask the developer to
-confirm the node is quiet enough, since a neighbour's run skews a calibration
-record. Run step 3's two loops at once only on two GPUs that both pass the GPU
-check. Then offer Cleanup.
+cell's container and tree may be reused; that container is warm (QUICKSTART's
+step 0), so step 0 may be skipped: say so and let the developer choose. Before
+step 2, wait for the quiet node QUICKSTART's Environment asks for (GPUs are
+shared). Run step 3's two loops at once only on two GPUs that both pass the GPU
+check. Step 5 reads step 4's `LAW` and `HOST`: add them to the variables file
+after step 4. Then offer Cleanup.
 
 ## Stopping a step
 
-Signal only the step's own processes, in the container. SIGTERM the detached
-step's script first, then whatever it started that still runs: `smoke_cell.sh`
-on its exit stops a server it started in the background, but not the command it
-was running in the foreground (`measure memory`, a fit, `client.sh`,
-grading), and a stopped `serve` loop leaves its compass command running. `ps
--ef` in the container shows them; SIGTERM each, and a compass command stops its
-own server and engine. Ignore `<defunct>` entries: finished processes that a
-container started with no init never reaps
-([#1792](https://github.com/jgong5/ATOM/pull/1792) adds `--init` to
-QUICKSTART's `docker run`). The step has stopped once the GPU check reads no
-process on the GPU. Take it again into a fresh OUT (QUICKSTART, stopping a
-step).
+QUICKSTART stops a step from the shell running it (its paragraph after
+`serve`); a detached step has no such shell. Signal only the step's own
+processes, in the container. SIGTERM the detached step's script first, then
+whatever it started that still runs: `smoke_cell.sh` on its exit stops a server
+it started in the background, but not the command it was running in the
+foreground (`measure memory`, a fit, `client.sh`, grading), and a stopped
+`serve` loop leaves its compass command running. `ps -ef` in the container
+shows them; SIGTERM each, and a compass command stops its own server and
+engine. The step has stopped once the GPU check reads no process on the GPU.
+Take it again as that paragraph says.
 
 ## Taking the container step again
 
@@ -204,7 +200,8 @@ again with the same name, image and mounts and the one option fixed. Check the
 fix in the new container (for a mount option, `/proc/mounts`). The tree, the
 venv (`$V`) and the variables file live in the data directory on the host and
 are kept, so steps 2 and 3 are not taken again; the failed step is, into a
-fresh OUT.
+fresh OUT. The new container is fresh (QUICKSTART's Environment): on the full
+path, step 0 comes first again.
 
 ## Cleanup
 
@@ -281,13 +278,8 @@ not a failure.
 4. Exits 90 to 99 are the tree checks in `scripts/compass/_lib.sh`: `atom`
    resolved outside `$T`, usually a missing `PYTHONPATH=$T` or a command not
    run from `/`.
-5. `failed to map segment from shared object`, or `Triton cache error:
-   compiled module ... could not be loaded`: a cache on a mount without `exec`.
-   Read `/proc/mounts` in the container: `noexec` on `/root/.cache`,
-   `/root/.aiter`, `/root/.triton` or `/tmp` is the cause, and the fix is that
-   mount with `exec` (Rule 3's exception).
-6. A step taken again needs a fresh OUT (QUICKSTART, stopping a step).
-7. A symptom Traps does not hold: show the developer the log lines that matter
+5. A step taken again goes as QUICKSTART's paragraph after `serve` says.
+6. A symptom Traps does not hold: show the developer the log lines that matter
    and ask. Do not guess a fix or patch a script; a quickstart defect is an
    issue to file. A cause you have verified in a container option the profile
    gives is Rule 3's exception.
@@ -299,12 +291,12 @@ the quickstart there. Its front matter: `hosts` (hostnames, short or full),
 `machine_spec` (the spec's path in the tree), `gfx` and `did` (its GPUs'). Its
 body, one heading each:
 
-- **Runtime**: the container tool, the image's tag, and the mounts and options
-  QUICKSTART's `docker run` needs here.
+- **Runtime**: the container tool, the image's tag, and any mount or option
+  QUICKSTART's `docker run` needs here beyond its own.
 - **Allocation**: how a GPU is booked (shared, or by a scheduler) and which.
 - **Inputs**: the model directory and traces, and where they mount.
-- **Disk**: where a session's own data directory goes, where Docker's storage
-  is, the fallback when either is full, and what the container's writable
-  layer takes then.
+- **Disk**: where a session's own data directory goes, and where when that
+  disk is full. QUICKSTART's Disk gives the sizes, the fallback and the
+  container's layer.
 
 MI355X has a machine spec, `mi355x-gpu45.json`; its profile follows #1032.

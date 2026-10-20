@@ -12,9 +12,9 @@ Eight MI308X on one host, shared by several users, with no scheduler.
 ## Runtime
 
 Docker on the host, run as the developer's own user, who must be in the
-`docker` group. `rocm-smi`, `rocminfo` and the tree's `preflight.sh` run on the
-host too. The image is the node-18 tag QUICKSTART's Environment names. Other
-users' containers run here: touch none.
+`docker` group. `rocm-smi`, `rocminfo` and `preflight.sh` run on the host too.
+The image is the node-18 tag QUICKSTART's Environment names, and its `docker
+run` needs nothing more here. Other users' containers run here: touch none.
 
 ## Allocation
 
@@ -25,35 +25,13 @@ their team uses here and keep to those.
 ## Inputs
 
 The model repo and traces directory QUICKSTART's Environment names for node 18,
-mounted read-only where it says. Both are world-readable. The developer builds
-their own client venv (QUICKSTART's recipe) in the data directory.
+mounted read-only where it says. Both are world-readable.
 
 ## Disk
 
 - Data directory: a fresh subdirectory per session, such as
   `/data/<user>/compass/onboard-<date>`. `/data/<user>/compass` itself may
   hold inputs and other work.
-- Docker's storage is `/data/docker`, on the same disk, so the container's
-  writable layer takes room from it too. `/data` is ext4: when it reads full
-  for users, the daemon still writes into the root-only reserve every user
-  shares.
-- The root disk is small: nothing goes there.
-- Fallback when `/data` has no room for the developer: the session's data
-  directory on the host's tmpfs, such as `/tmp/<user>_compass/onboard-<date>`,
-  mounted in the container at the same path, and the container started with a
-  tmpfs at each directory the runs fill:
-
-  ```
-  --tmpfs /root/.cache:size=64g,exec --tmpfs /root/.aiter:size=64g,exec
-  --tmpfs /root/.triton:size=16g,exec --tmpfs /tmp:size=64g,exec
-  ```
-
-  Docker mounts a tmpfs `noexec` unless told `exec`, and these caches hold
-  shared objects the engine loads. A tmpfs is memory: it is lost at reboot, so
-  copy out what should stay.
-- The writable layer then takes aiter's built modules and aiperf's bytecode:
-  22 MB through step 0, run on 2026-10-20 in a fresh container with these
-  options (14 MB of aiter's one build, `mha_varlen_fwd`, and 6 MB of
-  bytecode), while the tmpfs `/root/.aiter` held 222 MB and `/root/.cache`
-  400 MB. Step 0 takes the container's builds; a later record that builds one
-  is refused by grading.
+- When `/data` has no room for it: QUICKSTART's Disk fallback on the host's
+  tmpfs, again a fresh subdirectory per session, such as
+  `/tmp/<user>_compass/onboard-<date>`.
