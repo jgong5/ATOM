@@ -18,11 +18,13 @@ from test_capture_v4_pro import DPA_TP8, EP8, MOE, MORI, _rows, capture, trace
 from test_dp_step_max import prefill, runner
 from test_moe_gather_rows import decode
 from test_op_graph import by_name, g
+from test_op_work import ONE, leaf, t
 from test_work import SPEC
 
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.backends import CostRefused
 from atom.compass.backends.op_graph import OpGraphBackend
+from atom.compass.backends.op_work import work
 from atom.compass.backends.work import gemm, price
 from atom.compass.capture import population_shapes
 from atom.compass.capture.forward import Shape, structure
@@ -212,7 +214,25 @@ def test_a_capture_gives_the_peers_the_rest_of_the_gathered_rows(ep, tmp_path_fa
         names = [op["op"] for op in exchanged]
         if ep:
             assert names == [f"{MORI}.dispatch", f"{MORI}.combine"]
+            assert {op["args"]["num_ep_ranks"] for op in exchanged} == {DP}
         else:
             assert names == [f"{MOE}:all_gatherv", f"{MOE}:reduce_scatterv"]
             assert _rows(exchanged[1]) == (767, 64)
         assert _rows(exchanged[0]) == (64, 767)
+
+
+@pytest.mark.parametrize("call", ["dispatch", "combine"])
+def test_a_mori_exchange_at_gathered_rows_spans_its_handle_s_width(call):
+    # This rank's 2 tokens; the group's 27 rows, not 8 x 2.
+    exchange = leaf(
+        f"{MORI}.{call}",
+        [[27, 64]],
+        input=t([27 if call == "combine" else 2, 64]),
+        weights=None,
+        scales=None,
+        indices=t([2, 2], "torch.int32"),
+        num_ep_ranks=DP,
+    )
+    [c] = work(exchange, ONE, 1, "bf16").comm
+
+    assert c.ranks == DP

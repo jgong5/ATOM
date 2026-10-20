@@ -10,15 +10,17 @@ A capture runs one rank, rank 0. Where ATOM reads its peers, two rules answer:
   it and the sizes read off them (`DPMetadata.make`, `get_sizes_across_dp`) run
   on the host with these rows.
 * What the DP group gathers for the MoE, or MORI dispatches to this rank, is
-  every rank's rows, the shape's gathered rows, by default the group's width
-  times this rank's: for MORI, the height ATOM trims its buffer to, `T_moe`. The DP reduce-scatter gives back this
-  rank's rows; MORI's combine gives back its buffer of
-  `max_num_tokens_per_dp_rank` rows, which ATOM's finalize slices.
+  every rank's rows: the shape's gathered rows, by default the group's width
+  times this rank's; for MORI, the height ATOM trims its buffer to, `T_moe`.
+  The DP reduce-scatter gives back this rank's rows; MORI's combine gives back
+  its buffer of `max_num_tokens_per_dp_rank` rows, which ATOM's finalize slices.
 
 Each exchange is one `declared` op named `module:qualname` for the function
 ATOM calls (`atom.model_ops.moe:all_gatherv`,
 `mori.ops.dispatch_combine:EpDispatchCombineOp.dispatch`), its arguments the
-ones ATOM passed by that function's parameter names, the group aside.
+ones ATOM passed by that function's parameter names, the group aside; MORI's
+also state the EP width ATOM built their handle for, `num_ep_ranks`, which
+their rows no longer give.
 """
 
 import inspect
@@ -33,9 +35,9 @@ from atom.compass import ir
 MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp"
 
 
-def _declared(recorder, name, fn, kind=ir.NodeKind.DECLARED):
-    """`fn` as one op `name` of `kind`, its arguments as called; what it
-    dispatches inside is not recorded."""
+def _declared(recorder, name, fn, kind=ir.NodeKind.DECLARED, stated=None):
+    """`fn` as one op `name` of `kind`, its arguments as called and `stated`;
+    what it dispatches inside is not recorded."""
     from .forward import _atom_frames
 
     signature = inspect.signature(fn)
@@ -47,6 +49,7 @@ def _declared(recorder, name, fn, kind=ir.NodeKind.DECLARED):
             slots = signature.bind(*args, **kwargs).arguments
             slots.update(slots.pop("kwargs", {}))
             slots.pop("group", None)
+            slots.update(stated or {})
             outs = [t for t in _pytree.tree_leaves(out) if isinstance(t, torch.Tensor)]
             recorder.add(name, kind, slots, outs, None, _atom_frames())
         return out
@@ -135,8 +138,13 @@ def install_mori(recorder):
 
         def __init__(self, args):
             self.capacity = args["max_num_tokens_per_dp_rank"]
-            self.dispatch = _declared(recorder, f"{MORI}.dispatch", self._dispatch)
-            self.combine = _declared(recorder, f"{MORI}.combine", self._combine)
+            width = {"num_ep_ranks": args["num_ep_ranks"]}
+            self.dispatch = _declared(
+                recorder, f"{MORI}.dispatch", self._dispatch, stated=width
+            )
+            self.combine = _declared(
+                recorder, f"{MORI}.combine", self._combine, stated=width
+            )
 
         def _dispatch(self, input, weights, scales, indices, **kwargs):
             n, k = group.world_size * input.shape[0], indices.shape[1]
