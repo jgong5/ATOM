@@ -12,10 +12,9 @@
 # once, so that it takes the aiter JIT builds a fresh container meets while
 # serving, which grading, the fits and `validate.cost` refuse in a record
 # (run.json's `aiter_jit_builds`).
-# Calibration serves traces 353 on because, at client.sh's seed, trace 353's
-# sampled start puts 2 to 6 requests in flight within a minute, so the law has a
-# decode vector for each batch size the cell takes; traces 256 on start at a first
-# request and batch nothing.
+# Calibration serves traces 353 on: at client.sh's seed, its sampled start reaches
+# subagents and batches 1 to 7 requests a step, so the law has a decode vector for
+# each batch size the cell takes; traces 256 on start at a first request.
 #
 # Usage: smoke_cell.sh MODEL OUT
 #   MODEL           the model directory: config.json, tokenizer and weights

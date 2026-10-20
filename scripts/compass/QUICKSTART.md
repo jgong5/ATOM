@@ -319,7 +319,7 @@ Reference results: the graded tables of
 ## The smoke cell
 
 `smoke_cell.sh MODEL OUT` runs steps 0 to 6 at c=1 on one GPU, step 1 first:
-step 0's record, one calibration record of traces 256 to 263, two real runs and
+step 0's record, one calibration record of traces 353 to 360, two real runs and
 one simulated run of traces 0 to 7, each client run 600 s. It fits before the
 real runs, so a failed fit costs no more GPU time. Its variables are in its
 header. It may run on a busy node (GPUs are shared), and its real runs count
@@ -332,16 +332,20 @@ GPU=$G MACHINE=$SPEC HARNESS_PYTHON=$SIM_PY AIPERF_PYTHON=$REAL_PY \
 
 It prints each step as it starts, then the grading table, then one line with the
 verdict, the wall time and each run's warmup. It refuses a GPU that is not idle,
-names the step that failed, and exits 1 unless the cell is graded. At 873664d6d
+names the step that failed, and exits 1 unless the cell is graded. At abc5f542f
 on node 18, in a container that held step 0's build, it took 61 min: 2 min for
-step 1, 13 min for calibration, 14 to 15 min per server of traces 0 to 7, step
+step 1, 14 min for calibration, 14 to 15 min per server of traces 0 to 7, step
 0's included, each with one warmup request of 113 s, and 2 min for the simulated
-run; then `grade` exited 1 with a coverage report.
+run; the cell was graded.
 
-In that run calibration batched no two requests, but the cell batched up to 4
-requests a step, so `grade` refused 8337 steps whose rung the law has no vector
-for, and the cell was not graded:
-[#1832](https://github.com/jgong5/ATOM/issues/1832). Its cost rows all read
+A law has a decode vector only for the batch sizes its calibration took. At
+`client.sh`'s seed, traces 0 to 7 start mid-session and batch up to 4 requests a
+step; trace 256 starts at a first request and batched none, so the cell was a
+coverage report ([#1832](https://github.com/jgong5/ATOM/issues/1832)), while trace
+353's start reaches its subagents and calibration batched 1 to 7. A higher
+concurrency does not help: aiperf sends each lane's next request at its
+trace-time offset from the lane's start and caps an idle gap only while no lane
+is busy, so at c=4 one lane carried the 600 s. Its cost rows all read
 `unvalidated` too: `fit steps` marks the
 region it validates by holding out each calibration record in turn, so it needs
 two or more, and the smoke cell has one. The smoke cell checks the path, not the
