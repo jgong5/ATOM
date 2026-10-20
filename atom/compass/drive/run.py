@@ -31,7 +31,8 @@ both values. The check refuses no step: it counts those the grid extrapolates
 and those that fall to the step roofline below it, naming each with the grid's
 reasons. The op graph's is `op_coverage`, over the backend `run.op_graph`
 builds from the run file: a step is covered when its price list prices every
-leaf. Another backend has no check, and refuses `--coverage`.
+leaf, and a run file that names no price list refuses. Another backend has no
+check, and refuses `--coverage`.
 
 `--acceptance-record` names a speculative `compass record` directory: its
 histograms' rates (`measured`) go to ATOM as ``--spec-decode-acceptance-rates``,
@@ -61,7 +62,14 @@ from atom.compass.artifacts import ArtifactStore, Kind
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.step_grid_plan import BOUNDS, coverage
 from atom.compass.drive import runfile, serve
-from atom.compass.run import OP_GRAPH, STEP_GRID, STEP_LINEAR, STEP_STUB, step_grid
+from atom.compass.run import (
+    OP_GRAPH,
+    PRICE_LIST,
+    STEP_GRID,
+    STEP_LINEAR,
+    STEP_STUB,
+    step_grid,
+)
 
 PROG = "compass run"
 #: The engine fields that shape a step's batches: the scheduler's bounds, the
@@ -203,6 +211,12 @@ def check(inputs, run: dict, atom_args) -> dict:
     steps = [s for name in inputs for s in _steps(name, store, here)]
     machine = compass_run._machine(run)
     if run.get(OP_GRAPH):
+        if PRICE_LIST not in run:
+            raise ValueError(
+                "--coverage: the store holds no price_list at this run's key, so "
+                "the op graph prices every leaf by its roofline and no step is "
+                "covered; compass fit ops publishes one"
+            )
         backend = compass_run.op_graph(run, config, machine)
         return {"inputs": list(inputs), **op_coverage(backend, steps)}
     backend, _ = step_grid.load(run[STEP_GRID], config, machine)
@@ -237,7 +251,7 @@ def op_coverage(backend, steps) -> dict:
             for r in refusals
         }
         phase = "prefill" if view.prefill else "decode"
-        by_phase[phase].update(steps=1, covered=not whys)
+        by_phase[phase].update(steps=1, covered=int(not whys))
         for kind, why in whys:
             out[kind][why] += 1
     total = sum(by_phase.values(), Counter())
