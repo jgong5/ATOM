@@ -185,6 +185,9 @@ def test_an_aten_operator_takes_torch_s_flop_formula_and_its_boundary():
         ),
         leaf("aten.empty.memory_format", [[6]], size=[6], dtype=BF16),
         leaf("_c10d_functional.wait_tensor.default", [[6]], tensor=t([6])),
+        # It writes no element, whatever its source holds.
+        leaf("aten.fill_.Scalar", [[0]], self=t([0], I32), value=-1),
+        leaf("aten.copy_.default", [[0]], self=t([0], I32), src=t([1], I32)),
     ],
 )
 def test_a_leaf_that_launches_no_kernel_has_no_work(op):
