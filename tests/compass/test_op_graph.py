@@ -731,7 +731,7 @@ def test_each_micro_batch_of_a_split_step_prices_at_its_own_shape():
         ]
     )
 
-    def graph(phase, tokens, seqs, output):
+    def graph(phase, tokens, seqs, output, gathered):
         return {"seq": [g(tokens, 8, 8)]}
 
     cost = OpGraphBackend(SECOND, graph, kv="bf16", price_list=params).price(SPLIT)

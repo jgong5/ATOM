@@ -170,9 +170,11 @@ def test_fit_ops_publishes_its_points_key_and_their_held_out_error(measured, tmp
 def test_a_line_holding_an_error_over_5pct_either_way_is_declined_with_its_reason():
     # held out along B, B = 4 reads -4% at context 1024 and -20% at 2048;
     # along context at B = 2, context 2048 reads +25%
-    points = [_point(2, 10.0), _point(4, 12.5), _point(8, 16.0)]
-    points += [_point(b, ns, context=2048) for b, ns in ((2, 20), (4, 30), (8, 32))]
-    points += [_point(2, 40.0, context=3072)]
+    points = [_point(2, 10e3), _point(4, 12.5e3), _point(8, 16e3)]
+    points += [
+        _point(b, ns, context=2048) for b, ns in ((2, 20e3), (4, 30e3), (8, 32e3))
+    ]
+    points += [_point(2, 40e3, context=3072)]
     params = ops.fit(points)
     rows = ops.held_out(params)
     (f,) = params["families"].values()
@@ -222,39 +224,39 @@ def _prefill(t, b, ns, op="aiter.gemm", context=None, rows=None):
 def test_a_kind_that_does_not_move_with_context_runs_over_the_counts_it_follows():
     # the GEMM reads within 10% at two contexts of each width, so the decode
     # points at one B are one point; the prefill points at one T too, B aside
-    points = [_point(2, 10.0), _point(2, 10.4, context=2048)]
-    points += [_point(8, 16.0), _point(8, 16.0, context=2048)]
-    points += [_prefill(64, 1, 30.0), _prefill(64, 2, 32.0), _prefill(128, 1, 50.0)]
+    points = [_point(2, 100e3), _point(2, 104e3, context=2048)]
+    points += [_point(8, 160e3), _point(8, 160e3, context=2048)]
+    points += [_prefill(64, 1, 300e3), _prefill(64, 2, 320e3), _prefill(128, 1, 5e5)]
 
     assert _families(points) == [
-        (["B"], [[[2], 10.2], [[8], 16.0]]),
-        (["T"], [[[64], 31.0], [[128], 50.0]]),
+        (["B"], [[[2], 102e3], [[8], 160e3]]),
+        (["T"], [[[64], 310e3], [[128], 5e5]]),
     ]
 
 
 def test_a_decode_point_sits_at_its_longest_row_a_prefill_at_its_rows_mean_cached():
     # the decode GEMM moves with context; the prefill kind with cached tokens
-    points = [_point(2, 10.0)]
+    points = [_point(2, 100e3)]
     points += [
-        _point(2, 20.0, context=3000) | {"rows": [[1, 3000, True], [1, 1000, True]]}
+        _point(2, 200e3, context=3000) | {"rows": [[1, 3000, True], [1, 1000, True]]}
     ]
-    points += [_prefill(64, 1, 30.0, "attn"), _prefill(64, 1, 31.0, "attn", 0)]
-    points += [_prefill(64, 1, 40.0, "attn", 512, rows=[[64, 64 + 512, False]])]
+    points += [_prefill(64, 1, 300e3, "attn"), _prefill(64, 1, 310e3, "attn", 0)]
+    points += [_prefill(64, 1, 400e3, "attn", 512, rows=[[64, 64 + 512, False]])]
 
     assert _families(points) == [
-        (["B", "context"], [[[2, 1024], 10.0], [[2, 3000], 20.0]]),
-        (["T", "B", "context"], [[[64, 1, 0], 30.5], [[64, 1, 512], 40.0]]),
+        (["B", "context"], [[[2, 1024], 100e3], [[2, 3000], 200e3]]),
+        (["T", "B", "context"], [[[64, 1, 0], 305e3], [[64, 1, 512], 400e3]]),
     ]
 
 
 def test_a_prefill_kind_reads_its_own_prefill_points_on_context_first():
     # flat over a decode's context, yet twice the time past 1024 cached tokens
-    points = [_point(2, 10.0), _point(2, 10.0, context=2048)]
-    points += [_prefill(64, 1, 30.0, context=0), _prefill(64, 1, 60.0, context=1024)]
+    points = [_point(2, 100e3), _point(2, 100e3, context=2048)]
+    points += [_prefill(64, 1, 300e3, context=0), _prefill(64, 1, 6e5, context=1024)]
 
     assert _families(points) == [
-        (["B"], [[[2], 10.0]]),
-        (["T", "B", "context"], [[[64, 1, 0], 30.0], [[64, 1, 1024], 60.0]]),
+        (["B"], [[[2], 100e3]]),
+        (["T", "B", "context"], [[[64, 1, 0], 300e3], [[64, 1, 1024], 6e5]]),
     ]
 
 
