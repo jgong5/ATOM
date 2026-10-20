@@ -357,11 +357,13 @@ class Stub:
             self.weights.setdefault(_spec(t), {})[t.data_ptr()] = t
         self.modules = dict(runner.model.named_modules())
         self.contexts = runner.config.compilation_config.static_forward_context
-        self.moe = {
-            (m.global_num_experts, m.top_k)
-            for m in self.modules.values()
-            if hasattr(m, "global_num_experts")
-        }
+        self.moe = sorted(
+            {
+                (m.global_num_experts, m.top_k)
+                for m in self.modules.values()
+                if hasattr(m, "global_num_experts")
+            }
+        )
         self.loads = []
 
     def __call__(self, input_ids, positions, *args, **kwargs):
@@ -566,7 +568,7 @@ class Stub:
         seeded by `SEED` and `c`; the copy's expert loads go to `loads`."""
         if len(self.moe) > 1:
             raise ValueError(
-                f"the model's MoE layers route (experts, top-k) {sorted(self.moe)}: "
+                f"the model's MoE layers route (experts, top-k) {self.moe}: "
                 f"which one draws {_text(spec)} is not known"
             )
         [(experts, k)] = self.moe
