@@ -67,7 +67,7 @@ H2D = "atom/utils/h2d.py"
 HOST_QUERIES = ("aiter.get_gfx_custom_op.default",)
 #: Operators that ask a fake tensor where it is and run nothing on a device.
 UNDISPATCHED = ("profiler.", "prim.device")
-#: The hf config fields that count a model's routed experts.
+#: The hf config fields, or its text config's, that count a model's routed experts.
 ROUTED = ("n_routed_experts", "num_experts", "num_local_experts")
 
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
@@ -140,7 +140,8 @@ def experts(config, device: str) -> str:
     from atom.utils import envs
 
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
-    if not any(getattr(config.hf_config, n, None) for n in ROUTED):
+    hf = (config.hf_config, getattr(config.hf_config, "text_config", None))
+    if not any(getattr(c, n, None) for c in hf for n in ROUTED):
         return ""
     ep = config.enable_expert_parallel and tp * dp > 1
     arches = ("gfx94", "gfx95") if envs.ATOM_USE_TRITON_GEMM else ("gfx94",)

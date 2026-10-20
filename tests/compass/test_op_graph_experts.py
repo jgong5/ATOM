@@ -169,6 +169,14 @@ def test_a4w4_is_named_on_the_triton_path(v4, monkeypatch):
     assert experts(v4, "gfx950") == " experts=triton+a4w4"
 
 
+def test_a_text_config_s_routed_experts_count(tmp_path, monkeypatch):
+    monkeypatch.setenv("ATOM_USE_TRITON_MOE", "1")
+    text = SimpleNamespace(num_experts=512)
+    vision = _config(tmp_path, "Qwen3_5MoeForConditionalGeneration", text_config=text)
+
+    assert experts(vision, "gfx950") == " experts=triton"
+
+
 def test_a_capture_refuses_experts_on_another_path_than_its_key_names():
     model = torch.nn.Module()
     model.experts = torch.nn.Module()
