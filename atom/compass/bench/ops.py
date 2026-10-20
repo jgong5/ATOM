@@ -674,9 +674,11 @@ def _function(name: str):
 def _kernels(fn, kwargs) -> tuple[list[str], float]:
     """The kernels one call of `fn` launches, in order, and their device time
     in ns: its device activity except memory copies, which the profiler
-    records at some calls of a leaf and misses at others."""
+    records at some calls of a leaf and misses at others; started on every
+    rank together (`_together`)."""
     from torch.profiler import ProfilerActivity, profile
 
+    _together()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         fn(**kwargs)
         torch.cuda.synchronize()
@@ -692,22 +694,18 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
 
 
 def _replay(fn, calls) -> list[float]:
-    """Each timed replay of one graph of `calls`, in ns per call. Over several
-    ranks, a decode step's graph is captured as ATOM captures one, each
-    collective on the buffers it registered, and before each replay every
-    rank takes a barrier on the host, then waits on one all-reduce on the
-    device, so each rank's replay starts as the others' do."""
+    """Each timed replay of one graph of `calls`, in ns per call, each started
+    on every rank together (`_together`). Over several ranks, a decode step's
+    graph is captured as ATOM captures one, each collective on the buffers it
+    registered."""
     import contextlib
 
     from atom.compass.bench.ranks import cpu_group
     from atom.utils import forward_context
 
-    group = cpu_group()
-    registered = group is not None and not calls[0][1].context.is_prefill
-    if group is not None:
-        from aiter.dist.parallel_state import get_world_group, graph_capture
-
-        device, flag = get_world_group().device_group, torch.zeros(1, device="cuda")
+    registered = cpu_group() is not None and not calls[0][1].context.is_prefill
+    if registered:
+        from aiter.dist.parallel_state import graph_capture
     graph = torch.cuda.CUDAGraph()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -723,9 +721,7 @@ def _replay(fn, calls) -> list[float]:
     start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
     times = []
     for i in range(WARMUPS + REPEATS):
-        if group is not None:
-            torch.distributed.barrier(group=group)
-            torch.distributed.all_reduce(flag, group=device)
+        _together()
         start.record()
         graph.replay()
         end.record()
@@ -735,6 +731,21 @@ def _replay(fn, calls) -> list[float]:
             times.append(ms * 1e6 / len(calls))
         time.sleep(ms * REST / 1e3)
     return times
+
+
+def _together() -> None:
+    """Over several ranks, a barrier on the host, then one all-reduce each
+    rank's stream waits on, so what is launched next starts on every rank's
+    device as on the others': a collective's time holds no peer's lateness."""
+    from atom.compass.bench.ranks import cpu_group
+
+    if (group := cpu_group()) is None:
+        return
+    from aiter.dist.parallel_state import get_world_group
+
+    torch.distributed.barrier(group=group)
+    device, flag = get_world_group().device_group, torch.zeros(1, device="cuda")
+    torch.distributed.all_reduce(flag, group=device)
 
 
 def _span(shape, stride) -> int:

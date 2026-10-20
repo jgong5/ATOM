@@ -4544,26 +4544,26 @@
    "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
   },
   {
-   "id": "atom/compass/bench/ops.py::_replay::torch.distributed.all_reduce(flag, group=device)::collective#0",
+   "id": "atom/compass/bench/ops.py::_together::torch.distributed.all_reduce(flag, group=device)::collective#0",
    "file": "atom/compass/bench/ops.py",
-   "symbol": "_replay",
+   "symbol": "_together",
    "call": "torch.distributed.all_reduce",
    "expr": "torch.distributed.all_reduce(flag, group=device)",
    "shape": "collective",
    "peer": "process",
-   "why": "over several ranks, each rank's stream waits on one all-reduce before each replay, so the ranks' replays start together on the device",
+   "why": "over several ranks, each rank's stream waits on one all-reduce before each replay and each profiled call, so they start together on every device",
    "mechanism": "K9",
    "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
   },
   {
-   "id": "atom/compass/bench/ops.py::_replay::torch.distributed.barrier(group=group)::barrier#0",
+   "id": "atom/compass/bench/ops.py::_together::torch.distributed.barrier(group=group)::barrier#0",
    "file": "atom/compass/bench/ops.py",
-   "symbol": "_replay",
+   "symbol": "_together",
    "call": "torch.distributed.barrier",
    "expr": "torch.distributed.barrier(group=group)",
    "shape": "barrier",
    "peer": "process",
-   "why": "over several ranks, every rank of the op bench waits for the others on their CPU group before each replay, so the hosts enqueue each replay together",
+   "why": "over several ranks, every rank of the op bench waits for the others on their CPU group before each replay, so the hosts launch each replay, and each profiled call, together",
    "mechanism": "K9",
    "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
   },
