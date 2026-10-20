@@ -276,7 +276,7 @@ def test_prefill_is_planned_by_whether_the_chunk_produces_output(tmp_path, monke
         [2, 32, 64],
     ]
     assert planned["counts"] == {
-        "decode rung 4": 2,
+        "decode rung 4": 4,
         "prefill no_output": 3,
         "prefill output": 6,
     }
@@ -297,14 +297,18 @@ def test_decode_is_planned_on_the_targets_ladder_and_the_margin_widens_every_axi
         "4": [3, 4],
         "8": [5, 8],
     }
-    # B = 3 on rung 4, c 90 to 92 between the nodes 64 and 128.
-    assert located(tmp_path, narrow)["decode"] == [[4, 3, 64], [4, 3, 128]]
-    # One node outward on B and c, and the rungs either side.
+    # B = 3 on rung 4, c 90 to 92 between the nodes 64 and 128, on to its
+    # longest row's, c 200 to 202 between 192 and 256.
+    assert located(tmp_path, narrow)["decode"] == [
+        [4, 3, c] for c in (64, 128, 192, 256)
+    ]
+    # One node outward on B and c, max_model_len - 1 above 256, and the rungs
+    # either side.
     assert wide["decode"] == [
         [rung, b, c]
         for rung, bs in ((2, [2]), (4, [3, 4]), (8, [5, 8]))
         for b in bs
-        for c in (0, 64, 128, 192)
+        for c in (0, 64, 128, 192, 256, 2047)
     ]
     assert [1, 64, 192] in wide["prefill no_output"]
 

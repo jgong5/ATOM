@@ -39,9 +39,10 @@ extrapolates past.
 
 It then plans every corner of each step's cell, widened by `margin` nodes on
 every axis and to `margin` rungs either side, each such rung at all its B
-nodes; and, on any rung between two planned rungs, its B nodes at its c nodes
-spanning those planned, since a bundle whose measured rungs skip one of the
-ladder's does not load. A point that is no batch the target runs is not
+nodes, a decode step's c span reaching on to the node at or above its longest
+row's cached context, which the lookup also reads; and, on any rung between
+two planned rungs, its B nodes at its c nodes spanning those planned, since a
+bundle whose measured rungs skip one of the ladder's does not load. A point that is no batch the target runs is not
 planned: B above `max_num_seqs`, T above `max_num_batched_tokens`, T not a
 multiple of B or below it, c + N_Q above `max_model_len`, or
 B * ceil((c + N_Q) / block size) above the block count, assuming no prefix
@@ -309,7 +310,9 @@ def plan(definition: dict, steps, engines: dict) -> dict:
             key = "output" if view.produces_output else "no_output"
             planned["prefill", key].update(itertools.product(*spans))
             continue
-        # On a rung either side, every B node, at the c nodes spanning the cell's.
+        # On a rung either side, every B node, at the c nodes spanning the cell's
+        # and on to the longest row's.
+        longest = max(r.context_tokens - r.query_tokens for r in view.decode)
         k = ladder.index(view.capture_rung)
         for rung in ladder[max(0, k - margin) : k + margin + 1]:
             bs, cs = grid.decode[rung].nodes
@@ -317,7 +320,7 @@ def plan(definition: dict, steps, engines: dict) -> dict:
                 bs = _span(bs, low[0], high[0], margin)
             planned["decode", "points"].update(
                 (rung, *p)
-                for p in itertools.product(bs, _span(cs, low[1], high[1], margin))
+                for p in itertools.product(bs, _span(cs, low[1], longest, margin))
             )
     # A bundle whose measured rungs skip one of the ladder's does not load.
     decode = planned["decode", "points"]
