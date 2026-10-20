@@ -7,10 +7,12 @@ does (`layout`). Each rank is a process of its own on its own GPU (`launch`),
 whose ATOM runner builds the groups through ATOM's own initialisation. The
 ranks measure the union of their points in one order (`union`), agree on the
 calls a graph holds (`agreed`) and take a barrier before each replay, so a
-collective leaf runs on every rank at once. A point's record is rank 0's, with
-each rank's cold time beside it (`merge`).
+collective leaf runs on every rank at once; a leaf one rank refuses, every
+rank refuses (`refused_together`). A point's record is rank 0's, with each
+rank's cold time beside it (`merge`).
 """
 
+import contextlib
 import copy
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
@@ -72,14 +74,15 @@ def measure(config, todo, llc: int, gpus: int) -> list[dict]:
 
 def merge(by_rank: list) -> list[dict]:
     """Each point every rank recorded: rank 0's record, with every rank's
-    cold time, refused where any rank refused; one rank's records as they
-    are."""
+    cold time, refused where any rank refused, with a rank's own refusal
+    before one that followed another rank's; one rank's records as they are."""
     if len(by_rank) == 1:
         return by_rank[0]
     got = []
     for records in zip(*by_rank):
         record = records[0] | {"rank_cold_ns": [r.get("cold_ns") for r in records]}
         refused = [r["refused"] for r in records if "refused" in r]
+        refused.sort(key=lambda why: PEER_REFUSED in why)
         got.append(record | ({"refused": refused[0]} if refused else {}))
     return got
 
@@ -125,3 +128,20 @@ def agreed(n: int, group, most: bool = False) -> int:
     op = dist.ReduceOp.MAX if most else dist.ReduceOp.MIN
     dist.all_reduce(value, op=op, group=group)
     return int(value)
+
+
+#: Why a rank refuses a leaf it could have measured.
+PEER_REFUSED = "another rank refused"
+
+
+@contextlib.contextmanager
+def refused_together():
+    """The block, raising on every rank when it raised on any: a rank that
+    refused a leaf alone would skip the calls its peers wait on it for."""
+    failed = True
+    try:
+        yield
+        failed = False
+    finally:
+        if agreed(int(failed), cpu_group(), most=True) and not failed:
+            raise ValueError(PEER_REFUSED)

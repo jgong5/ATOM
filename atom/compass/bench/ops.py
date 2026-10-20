@@ -501,12 +501,13 @@ class Stub:
         activations, then copy `c mod n` with the c-th weight up to every
         weight the model holds of its spec, at most K; and, when K is `CALLS`,
         warm over one; with its kernels. Every rank's graph holds the most K
-        any rank's call gives."""
-        from atom.compass.bench.ranks import agreed, cpu_group
+        any rank's call gives, and a leaf any rank refuses, every rank does."""
+        from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
 
         fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
-        calls = [self._copy(op, sig, instances, 0)]
+        with refused_together():
+            calls = [self._copy(op, sig, instances, 0)]
         # one weight can read a few percent off another of its spec, and every
         # one is held anyway: cycle them all, on the n copies' other arguments
         held = [
@@ -516,19 +517,23 @@ class Stub:
         ]
         try:
             forward_context._forward_context = calls[0][1]
-            fn(**calls[0][0])  # compiles and tunes outside the graphs
+            with refused_together():
+                fn(**calls[0][0])  # compiles and tunes outside the graphs
             kernels, ns = _kernels(fn, calls[0][0])
             k = min(CALLS, max(int(GRAPH_NS // ns), 1)) if ns else CALLS
             # a collective's call holds its wait on the last rank to arrive,
             # whose own call is the shortest: every graph takes its calls
             k = agreed(k, cpu_group(), most=True)
             n = min(n, k)
-            calls += [self._copy(op, sig, instances, c) for c in range(1, min(n, m))]
-            calls += [
-                self._copy(op, sig, instances, c, calls[c % m]) for c in range(m, n)
-            ]
-            for c in range(n, min(k, max([n, *held]))):
-                calls.append(self._reweigh(op, calls[c % n], c))
+            with refused_together():
+                calls += [
+                    self._copy(op, sig, instances, c) for c in range(1, min(n, m))
+                ]
+                calls += [
+                    self._copy(op, sig, instances, c, calls[c % m]) for c in range(m, n)
+                ]
+                for c in range(n, min(k, max([n, *held]))):
+                    calls.append(self._reweigh(op, calls[c % n], c))
             n = len(calls)
             cycle = [calls[i % n] for i in range(k)]
             cold = _replay(fn, cycle)
@@ -716,12 +721,13 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
 
 def _replay(fn, calls) -> list[float]:
     """Each timed replay of one graph of `calls`, in ns per call, each started
-    on every rank together (`_together`). Over several ranks, a decode step's
-    graph is captured as ATOM captures one, each collective on the buffers it
+    on every rank together (`_together`), the capture refused on every rank
+    when any rank's refused. Over several ranks, a decode step's graph is
+    captured as ATOM captures one, each collective on the buffers it
     registered."""
     import contextlib
 
-    from atom.compass.bench.ranks import cpu_group
+    from atom.compass.bench.ranks import cpu_group, refused_together
     from atom.utils import forward_context
 
     registered = cpu_group() is not None and not calls[0][1].context.is_prefill
@@ -731,6 +737,7 @@ def _replay(fn, calls) -> list[float]:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         with (
+            refused_together(),
             graph_capture() if registered else contextlib.nullcontext(),
             torch.cuda.graph(graph, capture_error_mode="thread_local"),
         ):

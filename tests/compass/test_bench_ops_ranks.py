@@ -6,20 +6,25 @@ holds; collective leaves are a family over their message bytes in the plan's
 coverage and in `fit ops`.
 """
 
+import contextlib
+import datetime
 import json
 import os
+import sys
 from concurrent.futures.process import BrokenProcessPool
 from types import SimpleNamespace
 
 import pytest
+import torch
 import torch.distributed as dist
-from test_bench_ops import _graph, _t
+from test_bench_ops import _graph, _leaf, _Runner, _t
 from test_bench_ops_plan import CONFIG, _records, bench  # noqa: F401  the fixture
 
 from atom.compass import ir
 from atom.compass.bench import ops, ranks
 from atom.compass.capture.forward import decode, prefill
 from atom.compass.fit import ops as fit
+from atom.utils import forward_context as fctx
 
 GATHER = "atom.model_ops.moe:all_gather_with_padding"
 
@@ -123,6 +128,81 @@ def test_a_point_is_rank_0_s_with_every_rank_s_time_refused_where_any_refused(
         {"leaf": "b", "cold_ns": 1.0, "rank_cold_ns": [1.0, None]}
         | {"refused": "no room"},
     ]
+
+
+NEG, ABS = "aten.neg.default", "aten.abs.default"
+
+
+def _found(*names):
+    x = ("self", _t([2, 3], "activation"))
+    return ops.leaves(_graph(*(_leaf(n, x) for n in names), layers=1)["region"])
+
+
+def _measuring_rank(config, todo, refuse, rank):
+    """One rank of `ops.measure` in a gloo group: ATOM's runner, the device
+    and its kernels stand-ins, every cross-rank call on the group; rank 1
+    refusing `NEG` at `refuse`, its copy, its first call or its capture."""
+    from atom.compass.bench import replay
+
+    pc = config.parallel_config
+    me = pc.data_parallel_rank * config.tensor_parallel_size + rank
+    store = dist.TCPStore(pc.data_parallel_master_ip, pc.data_parallel_base_port)
+    wait = datetime.timedelta(seconds=10)  # a rank left waiting fails, not hangs
+    dist.init_process_group("gloo", store=store, rank=me, world_size=2, timeout=wait)
+    runner, captures = _Runner(), []
+    runner.exit = dist.destroy_process_group
+    fctx._forward_kv_cache_context.kv_cache_data = {}
+    ops._runner = lambda config, rank: runner
+    ops._kernels = lambda fn, kwargs: (["k"], 1.0)
+    ops._together = dist.barrier
+    ranks.cpu_group = lambda: dist.group.WORLD
+    replay.ReplayRule = lambda config: SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    sys.modules["aiter.dist.parallel_state"] = SimpleNamespace(
+        graph_capture=contextlib.nullcontext
+    )
+    torch.cuda.CUDAGraph = lambda: SimpleNamespace(replay=lambda: None)
+    torch.cuda.Event = lambda enable_timing: SimpleNamespace(
+        record=lambda: None, synchronize=lambda: None, elapsed_time=lambda e: 1.0
+    )
+
+    def no(*args, **kwargs):
+        raise ValueError("rank 1 refuses")
+
+    def graph(*args, **kwargs):
+        captures.append(1)
+        return no() if (me, refuse, len(captures)) == (1, "capture", 1) else None
+
+    copy, function = ops.Stub._copy, ops._function
+    if (me, refuse) == (1, "copy"):
+        ops.Stub._copy = lambda s, op, *a: no() if op["op"] == NEG else copy(s, op, *a)
+    if (me, refuse) == (1, "call"):
+        ops._function = lambda name: no if name == NEG else function(name)
+    torch.cuda.graph = lambda *a, **k: contextlib.nullcontext(graph())
+    return ops.measure(config, todo[me], 10_000, rank)
+
+
+def _leaves(records):
+    return [(r["op"], r.get("refused")) for r in records]
+
+
+@pytest.mark.parametrize("refuse", ["copy", "call", "capture"])
+def test_a_leaf_one_rank_refuses_every_rank_refuses_and_the_next_is_measured(
+    refuse,
+):
+    config = _config(2)
+    ranks.layout(config)
+    todo = [[(decode(2), 20, _found(NEG, ABS))]] * 2
+
+    by_rank = ranks.launch(_measuring_rank, config, todo, refuse)
+
+    own = "ValueError: rank 1 refuses"
+    assert [_leaves(r) for r in by_rank] == [
+        [(NEG, f"ValueError: {ranks.PEER_REFUSED}"), (ABS, None)],
+        [(NEG, own), (ABS, None)],
+    ]
+    assert [r.get("refused") for r in ranks.merge(by_rank)] == [own, None]
 
 
 def test_a_rank_that_dies_costs_only_the_point_the_ranks_were_measuring(
