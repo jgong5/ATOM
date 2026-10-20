@@ -8,6 +8,9 @@
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
 states the labels; the command writes each record's per-step table beside it.
+A record refuses, before any table is written, when the run.json beside the
+`steps` directory its path resolves into names aiter JIT builds
+(`step_labels.refusal`).
 A step whose device label is cut is counted under its reason and not fitted.
 `fit` and `fit_host` take the labelled samples, grouped into runs by their
 provenance's `run`, and each returns its laws and a report. `fit`'s report
@@ -728,6 +731,12 @@ def main(argv=None) -> None:
         ".engine.json beside each; refused where one contradicts it",
     )
     args = parser.parse_args(argv)
+    for record in args.records:
+        run = Path(record).resolve().parent.parent / "run.json"
+        if run.is_file() and (
+            built := step_labels.refusal(json.loads(run.read_text()))
+        ):
+            raise ValueError(f"{record} is not fitted: {built}")
     if args.engine:
         engine = keyed_of(json.loads(Path(args.engine).read_text()))
         for own in (Path(r).with_suffix(".engine.json") for r in args.records):

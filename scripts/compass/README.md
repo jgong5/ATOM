@@ -717,7 +717,8 @@ builds a JIT module the first time a server meets a kernel variant its image did
 not prebuild, such as `mha_varlen_fwd`'s for a prefill step of one new token a
 row, about 60 s inside the run, and keeps it in the container's aiter tree, which
 no cache directory above holds. A record names each module its server built, or
-began to, in run.json's `aiter_jit_builds`, and grading refuses it, naming them.
+began to, in run.json's `aiter_jit_builds`, and grading, `compass fit steps`,
+`compass fit host`, `step_linear_fit` and `validate.cost` refuse it, naming them.
 So warm a fresh container before its first record: serve the same workload for a
 few minutes on a server whose record nothing reads, `compass record --gpu G --out
 $R/warm -- $ATOM` with `client.sh $R/warm --traces A-B --concurrency <C>

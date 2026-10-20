@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """The aiter JIT modules a real server built, or began to, while it served,
-which run.json names as ``aiter_jit_builds`` and grading refuses.
+which run.json names as ``aiter_jit_builds`` and grading, the fits and
+`validate.cost` refuse (`step_labels.refusal`).
 
 aiter builds a module the first time a process meets a kernel variant its
 image did not prebuild, and keeps it for every later process of that aiter
@@ -28,10 +29,8 @@ import os
 import sys
 from pathlib import Path
 
+from atom.compass.backends.step_labels import BUILDS, refusal  # noqa: F401
 from atom.compass.run import _write_whole
-
-#: run.json's entry naming them; a run whose server built none has no entry.
-BUILDS = "aiter_jit_builds"
 
 
 def _roots() -> list[Path]:
@@ -66,17 +65,6 @@ def builds_since(since_ns: int) -> dict:
         if path.lstat().st_mtime_ns >= since_ns
     } - {None}
     return {BUILDS: sorted(built)} if built else {}
-
-
-def refusal(run: dict) -> str | None:
-    """Why grading, a fit or `validate.cost` refuses a record whose run.json is
-    `run`, naming the modules of its `BUILDS`; None when it names none."""
-    if builds := run.get(BUILDS):
-        return (
-            f"aiter ran a JIT build of {builds} while its server served, "
-            "so a step may have waited on it"
-        )
-    return None
 
 
 def main(argv=None) -> None:

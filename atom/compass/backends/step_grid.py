@@ -314,7 +314,7 @@ class StepGrid:
         if prefill and decode:
             raise _refused(
                 view,
-                f"a step of {len(prefill)} prefill and {len(decode)} decode rows; "
+                "a step mixing prefill and decode rows; "
                 "the grid prices a step of one kind",
             )
         counts = [n for row in rows for n in (row.query_tokens, row.context_tokens)]
@@ -324,7 +324,7 @@ class StepGrid:
             if n is not None and type(n) is not int
         ]
         if odd:
-            raise _refused(view, f"the count {odd[0]!r} is not an int")
+            raise _refused(view, f"a count is a {type(odd[0]).__name__}, not an int")
         at = coordinates(rows, bool(prefill))
         if prefill:
             if view.produces_output is None:
@@ -339,7 +339,7 @@ class StepGrid:
             if widest > 1:
                 raise _refused(
                     view,
-                    f"a decode row computes {widest} tokens; the decode grid has "
+                    "a decode row computes more than one token; the decode grid has "
                     "no N_Q axis",
                 )
             if self.graph_mode == "eager":
@@ -347,7 +347,7 @@ class StepGrid:
             elif view.capture_rung is None:
                 raise _refused(
                     view,
-                    f"a decode step of {len(decode)} rows replays no graph, "
+                    "a decode step replays no graph, "
                     "and a replay bundle has no eager decode",
                 )
             else:
@@ -375,7 +375,7 @@ class StepGridBackend(CostBackend):
             )
         view, rows = batch_view, batch_view.requests
         if view.image_tokens:
-            raise _refused(view, IMAGES.format(view.image_tokens))
+            raise _refused(view, IMAGES)
         cells, at = self.grid.locate(view)
         try:
             value, on_node, cell = cells.lookup(view, at)

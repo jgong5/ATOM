@@ -26,8 +26,9 @@ first launch, inside the record.
 
 run.json's ``aiter_jit_builds`` names each aiter JIT module built, or begun,
 since serve wrote ``server.json``, when ``/health`` first answered
-(`aiter_jit`): a step may have waited on its build, so grading refuses the
-run. A server that built none leaves no entry.
+(`aiter_jit`): a step may have waited on its build, so grading, `compass fit
+steps`, `compass fit host`, `step_linear_fit` and `validate.cost` refuse the
+record. A server that built none leaves no entry.
 
 `--profile-ops` and `--profile-steps A:B`, the op-level half's profiled pass,
 refuse; so does ATOM's ``--load_dummy``: a record times real weights, and MoE

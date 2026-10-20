@@ -365,7 +365,8 @@ def _grade(family, name, real, simulated, d=None) -> dict:
 def grade(real_cells, simulated_cell) -> dict:
     """Every metric's grade: {family: {metric: grade}}, as the module says."""
     if len(real_cells) < 2:
-        raise ValueError("a real spread needs two or more real runs")
+        names = [str(c) for c in real_cells]
+        raise ValueError(f"{names}: a real spread needs two or more real runs")
     _refuse_by_run_file(simulated_cell)
     real = [_read(c) for c in real_cells]
     simulated = _read(simulated_cell)
@@ -443,4 +444,7 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as refused:  # a refusal: its reason, exit 1, no traceback
+        raise SystemExit(str(refused)) from refused
