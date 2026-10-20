@@ -32,41 +32,56 @@ forward step costs what a fitted law predicts. No GPU is used.
 ## Environment
 
 Blocks marked `# host` run on the node; every other block runs in the GPU
-container, entered with `docker exec -it <name> bash`.
+container, entered with `docker exec -it ${USER}_compass_gpu bash`.
 
 - **Image.** `rocm/atom-dev:vllm-v0.31.0-nightly_20261013`. Node 18 holds it as
   `compass-next:nightly-20261013`, the same image: name that tag there, or Docker
   pulls. The machine specs were measured in it, and a fit refuses records from
   another stack than its machine spec states.
 - **One GPU container**, named for its owner and purpose, with the GPU devices,
-  host networking, the inputs mounted read-only and a data directory with room:
+  host networking, the inputs mounted read-only, the data directory (Disk) at
+  its own path, and a tmpfs over each cache the runs fill:
 
   ```bash
   # host
-  docker run -d --name <user>_<issue>_gpu --network host \
+  mkdir -p <data dir>
+  docker run -d --init --name ${USER}_compass_gpu --network host \
     --device /dev/kfd --device /dev/dri \
     --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" \
+    --tmpfs /root/.cache:exec --tmpfs /root/.aiter:exec --tmpfs /tmp:exec \
     -v <model repo>:/models/qwen38:ro -v <traces dir>:/cc:ro -v <data dir>:<data dir> \
     <image> sleep infinity
   ```
 
+  `--init` reaps what a stopped server leaves; without it, processes stay
+  defunct. A tmpfs needs `exec`, since the engine loads the shared objects built
+  there, and it empties when the container stops: treat a restarted container as
+  fresh (step 0).
 - **GPUs are shared.** Use a GPU that `rocm-smi --showuse --showmemuse` reads at 0%
   use and 0% VRAM, with no process in `rocm-smi --showpids --showpidgpus`. Every
   GPU command checks this before and after it runs and refuses a busy GPU. Never
   stop another user's process or container. Real runs time the host too, so run
-  calibration alone on the node and at most two real runs at once.
-- **One tree.** Snapshot a clean commit of your checkout and extract it into the
-  data directory:
+  at most two real runs at once, and step 2's calibration alone on the node:
+  start it when `rocm-smi --showpids` prints `No KFD PIDs currently running`. On
+  a busy node, wait for that before step 2, since a calibration beside other
+  work fits their load into its laws. The smoke cell checks the path, not the
+  laws, so it may run beside them.
+- **One tree.** Snapshot the integration branch's tip from a clone of
+  `https://github.com/jgong5/ATOM` (its `origin`), with no uncommitted change,
+  and extract it into the data directory:
 
   ```bash
-  # host, in your checkout
+  # host, in the clone
   git fetch origin
+  git checkout --detach origin/feature/atomcompass_new
   mkdir -p <data dir>/tree
   COMPASS_INTEGRATION_REF=origin/feature/atomcompass_new scripts/compass/snapshot.sh <data dir>/tree
   mkdir -p <data dir>/tree/<sha> && tar -x -C <data dir>/tree/<sha> -f <data dir>/tree/compass-<sha>.tar
   ```
 
-  `snapshot.sh` names the tarball, `<sha>` being the commit's first 9 characters;
+  `snapshot.sh` archives HEAD, which `git fetch` does not move: without the
+  checkout it snapshots a stale commit and says nothing. It names the tarball,
+  `<sha>` being the commit's first 9 characters;
   its lines on commits behind, changed files and `gate_cpu.sh` are for the gates.
   `<data dir>/tree/<sha>/ATOM` is `$T`. Run every step from it. Records, fits and
   runs keyed by another tree's source refuse each other. A git worktree used in a
@@ -88,29 +103,43 @@ container, entered with `docker exec -it <name> bash`.
 - **Disk.** A run takes about 400 MB, since the raw export keeps every prompt; the
   full cell about 8 GB, the smoke cell 180 MB. A client of 256 traces maps about
   1.4 GB more in its `OUT/client` while it runs. The container's `/root/.cache`
-  grows by about 1 GB in the smoke cell and 3.5 GB on the full path, 2.3 GB of it
-  aiperf's dataset maps. Keep data off the root disk.
+  tmpfs grows by about 1 GB in the smoke cell and 3.5 GB on the full path, 2.3 GB
+  of it aiperf's dataset maps, and `/root/.aiter`, where aiter builds its
+  templated modules, by about 230 MB: about 1.5 GB in all for the smoke cell.
+  aiter's JIT directory, `/app/aiter-test/aiter/jit`, holds the image's prebuilt
+  modules, so it stays in the container's layer on Docker's storage disk
+  (`docker info -f '{{.DockerRootDir}}'`), gaining each module a server builds,
+  10 MB for step 0's. Keep data off the root disk. When no disk has room for the data
+  directory, use the host's tmpfs, such
+  as `/tmp/<user>_compass`: memory, lost at reboot, its files written as root,
+  so copy out what should stay and remove the rest from inside the container.
 
 ## Variables
 
-Run from `/` in the container, so no checkout's `atom` shadows `$T`'s.
+Paste this and `serve` (below) into every container shell, with your data
+directory, tree and GPU. Run steps 4 and 5 in one shell: step 5 reads step 4's
+`LAW` and `HOST`.
 
-| Name | What | Example |
-|---|---|---|
-| `T` | the snapshot tree | `/data/<user>/compass/tree/<sha>/ATOM` |
-| `R` | this cell's data directory | `/data/<user>/compass/qwen38-tp1` |
-| `G` | the GPU, as `rocm-smi` numbers it | `7` |
-| `MODEL` | the model directory; `client.sh` reads it too | `/models/qwen38/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` |
-| `TRACES` | the cc-traces file; `client.sh` reads it | `/cc/traces.jsonl` |
-| `ATOM` | ATOM's arguments, identical for every step | `--model $MODEL --max-model-len 262144` |
-| `SPEC` | the machine spec of this node's GPUs, as above | `$T/scripts/compass/machines/mi308x-hjbog18.json` |
-| `M` | the machine spec as a flag | `--machine $SPEC` |
-| `S` | the store | `--store $R/store` |
-| `V` | the compass-harness venv's directory, on the data disk | `/data/<user>/compass/venv-sim` |
-| `REAL_PY`, `SIM_PY` | the client Pythons: a real server's is the image's (agentx-harness's aiperf); a simulated one's also needs compass-harness, in `$V` (below) | `/opt/venv/bin/python3`, `$V/bin/python` |
-| `compass` | the CLI, run from its own tree; the image does not install it | `compass() { $T/scripts/compass/compass "$@"; }` |
+```bash
+DATA=<data dir>                  # the data directory (Disk)
+T=$DATA/tree/<sha>/ATOM          # the snapshot tree (One tree)
+R=$DATA/qwen38-tp1               # this cell's data directory
+G=<gpu>                          # the GPU, as rocm-smi numbers it
+MODEL=/models/qwen38/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0  # client.sh reads it too
+TRACES=/cc/traces.jsonl          # the cc-traces file; client.sh reads it
+ATOM="--model $MODEL --max-model-len 262144"   # ATOM's arguments, identical for every step
+SPEC=$T/scripts/compass/machines/mi308x-hjbog18.json   # this node's machine spec (Environment)
+M="--machine $SPEC"
+S="--store $R/store"
+V=$DATA/venv-sim                 # the compass-harness venv (below)
+REAL_PY=/opt/venv/bin/python3    # a real server's client: the image's, with agentx-harness's aiperf
+SIM_PY=$V/bin/python             # a simulated server's: also compass-harness
+compass() { $T/scripts/compass/compass "$@"; }   # the CLI, from its own tree; the image does not install it
+export MODEL TRACES AITER_LOG_LEVEL=WARNING
+cd /                             # so no checkout's atom shadows $T's
+```
 
-`export MODEL TRACES AITER_LOG_LEVEL=WARNING`. A law refuses a run whose
+Its `AITER_LOG_LEVEL` counts: a law refuses a run whose
 environment differs from its records', and `smoke_cell.sh` sets that level too.
 Every `python3 -m atom.compass...` below runs with `PYTHONPATH=$T`: without it,
 `atom` is the image's own copy in `/app/ATOM`.
@@ -129,12 +158,14 @@ One server and its client run, used by steps 0, 2, 3 and 5:
 
 ```bash
 # serve OUT TRACES C PYTHON COMMAND...: start a compass server writing to OUT,
-# send it one client run of D seconds (default 1800), and stop it. The compass
-# command logs to $R/logs/, the server to OUT/server.log. It fails when the
+# send it one client run of D seconds (default 1800), and stop it. The server
+# logs to OUT/server.log; the compass command's own output, empty unless it
+# refuses, goes to $R/logs/. It refuses an OUT that exists, and fails when the
 # server dies or does not answer within 30 min, or the client run fails.
 serve() {
   local out=$1 traces=$2 c=$3 py=$4 log=$R/logs/${1#$R/}.log pid end=$((SECONDS + 1800))
   shift 4
+  [ ! -e $out ] || { echo "serve: $out exists; leave a finished run out, rm -rf a stopped one" >&2; return 1; }
   mkdir -p ${log%/*}
   $T/scripts/compass/compass "$@" --out $out -- $ATOM > $log 2>&1 &
   pid=$!
@@ -149,8 +180,12 @@ serve() {
 }
 ```
 
-To stop a step, press Ctrl-C, then `kill %%`: the compass command stops its
-server and leaves. Take the step again with a fresh `--out`.
+To stop a step, press Ctrl-C until the prompt returns: a Ctrl-C can end a
+client run early and let its loop go on to the next. Then run `jobs`; if it
+lists a compass command, `kill %%; wait` stops its server and waits for it to
+leave. To take a stopped loop again, `rm -rf` the `--out` of the stopped run and
+of any run a Ctrl-C cut short, and loop over only the concurrencies still to
+do, such as `for C in 4 16`: `serve` refuses an `--out` that exists.
 
 `client.sh`'s flags and exit codes are in its header. It sends one warmup request
 per lane before the graded window; keep it, since grading refuses a run whose
@@ -177,7 +212,8 @@ record. This record takes those builds; nothing reads it. `smoke_cell.sh`
 serves the same record before its calibration, so a container it ran in is
 warm. Success: `serve` returns 0.
 
-**1. Memory readings** (GPU, 2 to 3 min).
+**1. Memory readings** (GPU, 2 to 3 min after step 0; 5 min as a fresh
+container's first start, as in the smoke cell).
 
 ```bash
 compass measure memory --gpu $G $M $S --out $R/memory -- $ATOM
@@ -186,7 +222,8 @@ compass measure memory --gpu $G $M $S --out $R/memory -- $ATOM
 Writes a `memory_readings` entry to the store. Success: exit 0 and a `published
 memory_readings(...)` line.
 
-**2. Calibration records** (GPU, alone on the node; per concurrency, its warmup plus 1800 s).
+**2. Calibration records** (GPU, alone on the node; per concurrency, its warmup
+plus 1800 s, about 35 min with the server's start and stop: 1 h 45 min in all).
 
 ```bash
 for C in 1 4 16; do serve $R/cal/c$C 256-392 $C $REAL_PY record --gpu $G || break; done
@@ -196,7 +233,8 @@ Writes per record `steps/dp0.jsonl` (the step record), `run.json` (with the
 engine's bounds under `engine`) and `artifacts/client_run.json`. Success:
 `client.sh` exits 0, and `run.json` and `artifacts/client_run.json` exist.
 
-**3. Real runs** (GPU; per run, its warmup plus 1800 s).
+**3. Real runs** (GPU; per run about 35 min, as in step 2: 3 h 30 min on one GPU,
+1 h 45 min on two).
 
 ```bash
 for C in 1 4 16; do serve $R/cell/c$C/real1 0-255 $C $REAL_PY record --gpu $G || break; done
@@ -245,8 +283,9 @@ Writes the step record, `step_table.txt`, `run.json` (what grading reads) and
 PYTHONPATH=$T python3 -m atom.compass.validate $R/cell/c1 $R/cell/c4 $R/cell/c16
 ```
 
-Grade a cell once its `real1`, `real2` and `step_linear` runs are complete; one
-missing stops grading with a traceback. It prints one table per cell, a header
+Grade a cell once its `real1`, `real2` and `step_linear` runs are complete; a
+cell short of one refuses in one line, such as `<cell> holds 1 of real*/; a cell
+holds two or more real runs`. It prints one table per cell, a header
 row and then the verdict: `graded`, or `coverage report` when the simulated run
 refused any step; a run that cannot be graded at all, such as one fitted on the
 traces it grades, refuses with the reason. `graded` says the cell could be
@@ -276,8 +315,8 @@ Reference results: the graded tables of
 step 0's record, one calibration record of traces 256 to 263, two real runs and
 one simulated run of traces 0 to 7, each client run 600 s. It fits before the
 real runs, so a failed fit costs no more GPU time. Its variables are in its
-header. Environment's rule holds for it: its calibration record wants the node
-to itself, and its real runs count toward the two at once.
+header. It may run on a busy node (GPUs are shared), and its real runs count
+toward the two at once.
 
 ```bash
 GPU=$G MACHINE=$SPEC HARNESS_PYTHON=$SIM_PY AIPERF_PYTHON=$REAL_PY \
@@ -308,11 +347,15 @@ law's accuracy.
 | `run` refuses its law or host laws | records, fits and runs from two trees, two `$ATOM`s, two specs or two environments | one tree, one `$ATOM`, one spec and one environment (Variables) for every step |
 | `... holds an earlier run's files`, or `client.sh` refuses its OUT | one server per `--out`, one client run per server | a fresh `--out` for every server |
 | `fit` refuses `... is not a record directory (no run.json)` | a log file matched `$R/cal/c*` | keep logs outside the record directories |
-| grading refuses a run: `aiter ran a JIT build of [...] while its server served` | the container met that kernel variant for the first time inside the record | take the record again, since the container now holds the build; warm a fresh container first (step 0) |
+| `fit` refuses: `[Errno 2] No such file or directory: '<record>/artifacts/client_run.json'` | a stopped calibration record under `$R/cal/` | `rm -rf` it and take it again |
+| `kill: %%: no such job` | `serve` already stopped that server, when its client run failed or ended | nothing to stop; run `jobs` first |
+| `serve: OUT exists; leave a finished run out, rm -rf a stopped one` | a loop taken again over a run it already took | leave a finished concurrency out of the loop; `rm -rf` a stopped or short run's `--out` |
+| `Triton cache error`, or `failed to map segment from shared object` | a `--tmpfs` without `exec` | the container as Environment starts it |
+| grading, a fit or `validate.cost` refuses a record: `aiter ran a JIT build of [...] while its server served` | the container met that kernel variant for the first time inside the record | take the record again, since the container now holds the build; warm a fresh container first (step 0) |
 | verdict `coverage report`, `no decode vector for rung N` | the cell decoded more requests at once than any calibration step did (a rung is the batch's captured-graph size) | calibrate at that concurrency or above; #1336's calibration reached no rung 48, so c=256 stayed a coverage report |
 | grading refuses a run: warmup | the client ran with `--no-warmup`, or its warmup overlapped its graded steps | keep `client.sh`'s default warmup |
 | grading refuses a run: fitted on the traces it grades | calibration and cell traces overlap | calibration 256 to 392, cell 0 to 255 |
-| disk full | raw exports keep every prompt | keep `$R` on a data disk with room |
+| disk full | raw exports keep every prompt, and caches with no tmpfs fill the container's layer | the data directory where Disk puts it, and the container's tmpfs mounts (Environment) |
 
 ## Appendix: the step grid
 
