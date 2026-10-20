@@ -10,6 +10,7 @@ price; the export and the server log are as `test_validate_runs` and
 
 import json
 import re
+import runpy
 import subprocess
 import sys
 
@@ -19,7 +20,7 @@ from test_validate_cost import LAW, _record, _steps
 from test_validate_runs import ARGUMENTS, EXPORT
 
 from atom.compass import parity
-from atom.compass.backends import step_labels
+from atom.compass.backends import json_file, step_labels
 from atom.compass.backends.cost import GROUPS
 from atom.compass.memory.check import parts
 from atom.compass.run import LP_FILE
@@ -331,6 +332,28 @@ def test_the_readers_it_reaches_refuse_a_malformed_file_naming_it(tmp_path, read
     named = f"^{re.escape(str(path))} is not JSON: .*: line 2 "
     with pytest.raises(ValueError, match=named):
         reader(path)
+
+
+@pytest.mark.parametrize(
+    "command, runs",
+    [
+        ("atom.compass.validate.__main__", ["c4"]),
+        ("atom.compass.validate.runs", ["c4/step_linear", "c4/real0", "c4/real1"]),
+    ],
+)
+def test_a_json_error_no_reader_names_keeps_its_traceback(
+    tmp_path, monkeypatch, command, runs
+):
+    _cell(tmp_path / "c4")
+
+    def read_json(path):
+        raise json.JSONDecodeError("planted", "{", 1)
+
+    monkeypatch.setattr(json_file, "read_json", read_json)
+    monkeypatch.delitem(sys.modules, command)  # run fresh, on the planted reader
+    monkeypatch.setattr(sys, "argv", [command, *(str(tmp_path / r) for r in runs)])
+    with pytest.raises(json.JSONDecodeError, match="^planted"):
+        runpy.run_module(command, run_name="__main__")
 
 
 def _as_recorded(cell, warmup=()):
