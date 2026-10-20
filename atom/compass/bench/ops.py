@@ -843,8 +843,9 @@ def publish(store, key, config, run: dict, command: str, results, out: Path):
 
 #: A ladder keeps a value only this many times the last it kept, and the largest.
 LADDER_STEP = 1.25
-#: The spread of a leaf's cold times across contexts, over the largest, past
-#: which its kind depends on context; a repeat's spread stays within 4%.
+#: The spread of a leaf's cold times across contexts, or a prefill leaf's
+#: across rows, over the largest, past which its kind depends on them; a
+#: repeat's spread stays within 4%.
 CONTEXT_MOVES = 0.10
 
 
@@ -1056,12 +1057,14 @@ def _abstract(value, n: int):
 def _family(shape, context, op: str, sig: str, dependent: dict):
     """The family a leaf's point belongs to, and where on its axis: a decode
     leaf at its width over context; a prefill leaf over its tokens, at its rows
-    and cached tokens too when its kind depends on context."""
+    unless its kind's prefill points show it does not move with them, and at
+    its rows and cached tokens when its kind depends on context."""
     if shape.phase == "decode":
         return json.dumps([str(shape), sig]), context
     leaf = _abstract(json.loads(sig), shape.tokens)
     if not dependent.get(op, True):
-        return json.dumps(["prefill", None, leaf], sort_keys=True), shape.tokens
+        rows = shape.seqs if dependent.get(("rows", op), True) else None
+        return json.dumps(["prefill", rows, leaf], sort_keys=True), shape.tokens
     fam = ["prefill", shape.seqs, leaf, context or 0]
     return json.dumps(fam, sort_keys=True), shape.tokens
 
@@ -1073,13 +1076,20 @@ def _cut(fam: str):
     return (json.dumps(base, sort_keys=True), cached) if len(base) == 3 else None
 
 
-def _dependent(records) -> dict[str, bool]:
+def _dependent(records) -> dict:
     """Whether each leaf kind timed at two contexts of one width depends on
-    context: its kernels or its cold times differ there."""
+    context: its kernels or its cold times differ there; and, keyed
+    ``("rows", name)``, whether one timed at two row counts of one token count
+    and cached tokens moves with its rows."""
     by = defaultdict(list)
     for r in records:
-        if "refused" not in r and r["shape"].startswith("decode"):
+        if "refused" in r:
+            continue
+        if r["shape"].startswith("decode"):
             by[r["op"], r["shape"], r["leaf"]].append(r)
+        else:
+            at = _shape(r["shape"]).tokens, r["context"]
+            by[("rows", r["op"]), at, r["leaf"]].append(r)
     kinds = {}
     for (op, *_), points in by.items():
         if len(points) > 1:

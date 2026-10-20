@@ -173,7 +173,7 @@ def test_coverage_counts_a_step_only_when_every_leaf_sits_in_one_kernel_s_band(
         ([[1, 20000, True]], 1),  # past the largest context measured
         ([[120, 120, False]], None),  # GEMM between 100 and 150
         ([[120, 1120, False]], None),  # a cached row
-        ([[40, 40, False]] * 3, None),  # attention never measured at three rows
+        ([[40, 40, False]] * 3, None),  # no leaf measured at three rows
     )
     store, root, _, _ = bench
 
@@ -190,7 +190,8 @@ def test_coverage_counts_a_step_only_when_every_leaf_sits_in_one_kernel_s_band(
             "outside the measured range": 1,
             "a cached row, measured on fresh rows only": 1,
             "no measured point": 1,
-        }
+        },
+        "aiter.gemm": {"no measured point": 1},
     }
 
 
@@ -328,6 +329,91 @@ def test_coverage_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_
     assert report["left out, by leaf kind"] == {
         "aiter.attn": {"outside the measured range": 1}
     }
+
+
+@pytest.mark.parametrize(
+    "points, rows",
+    [
+        # one token count at three row counts, its time growing with them
+        (
+            [
+                (64, 1, 150.4, "k"),
+                (64, 2, 179.9, "k"),
+                (64, 4, 245.0, "k"),
+                (48, 4, 120.0, "k"),
+            ],
+            [[1], [2], [4]],
+        ),
+        ([(64, 1, 150.0, "a"), (64, 2, 150.0, "b"), (48, 2, 120.0, "b")], [[1], [2]]),
+        # flat across rows: one family
+        (
+            [
+                (64, 1, 150.0, "k"),
+                (64, 2, 152.0, "k"),
+                (64, 4, 151.0, "k"),
+                (48, 4, 120.0, "k"),
+            ],
+            [[1, 2, 4]],
+        ),
+        # no token count at two row counts: nothing shows the rows do not matter
+        ([(64, 1, 150.0, "k"), (48, 4, 120.0, "k")], [[1], [4]]),
+    ],
+)
+def test_a_prefill_family_keeps_its_rows_unless_its_points_show_they_do_not_move_it(
+    points, rows
+):
+    def point(shape, context, ns, kernel):
+        record = {"shape": shape, "context": context, "op": "lin", "leaf": "{}"}
+        return record | {"cold_ns": ns, "kernels": [kernel]}
+
+    # Flat over decode context, so the decode check reads it context-independent.
+    records = [point("decode B=2", c, 10.0, "d") for c in (1, 9)]
+    records += [point(f"prefill T={t} B={b}", None, ns, k) for t, b, ns, k in points]
+
+    families = ops._families(records, ops._dependent(records))
+
+    got = [
+        sorted({ops._shape(r["shape"]).seqs for *_, r in found})
+        for fam, found in families.items()
+        if fam.startswith('["prefill"')
+    ]
+    assert sorted(got) == rows
+
+
+def _rows_bench(fn, config, todo, llc):
+    """`_bench` with the prefill GEMM's time growing with its rows."""
+    got = _bench(fn, config, todo, llc)
+    for r in got:
+        if r["op"] == "aiter.gemm" and r["shape"].startswith("prefill"):
+            r["cold_ns"] *= ops._shape(r["shape"]).seqs
+    return got
+
+
+@pytest.mark.parametrize("stand_in, densified", [(_bench, 1), (_rows_bench, 2)])
+def test_a_plan_densifies_a_prefill_leaf_at_each_row_count_only_where_rows_move_it(
+    bench, tmp_path, monkeypatch, stand_in, densified
+):
+    monkeypatch.setattr(ops, "_child", stand_in)
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[40, 40, False]], None),
+        ([[150, 150, False]], None),
+        ([[20, 20, False]] * 2, None),
+        ([[75, 75, False]] * 2, None),
+    )
+
+    records = _plan(bench, tmp_path, population)
+
+    tokens = {1: set(), 2: set()}
+    for r in records:
+        if r["op"] == "aiter.gemm" and r["shape"].startswith("prefill"):
+            shape = ops._shape(r["shape"])
+            tokens[shape.seqs].add(shape.tokens)
+    # Both row counts hold 40 and 150; the halving to 99 | 100 runs at one of
+    # them when the GEMM reads flat across rows, at each when it moves.
+    assert all({40, 150} <= t for t in tokens.values())
+    assert sum({99, 100} <= t for t in tokens.values()) == densified
 
 
 def test_a_ladder_keeps_values_a_step_apart_and_the_largest():
