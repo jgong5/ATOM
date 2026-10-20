@@ -49,6 +49,9 @@ idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
 aside, are the point's kernel identity. A batch the KV pool cannot place refuses its leaves.
+The points run in a process of their own; one that dies keeps the points it
+finished, the point it was measuring refuses, and a new one measures the rest;
+two in a row that die having finished no point fail the run.
 
 DIR gets run.json, the run's identity, and ops.jsonl, one line per point. S
 gets each measured point as an `op_measurement`, keyed by the model, the
@@ -85,10 +88,12 @@ import multiprocessing
 import os
 import re
 import statistics
+import tempfile
 import time
 import warnings
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from unittest.mock import patch
 
@@ -138,6 +143,9 @@ REST = 0.1
 TOKEN_IDS = {("aten.embedding.default", "indices")}
 #: The rank every member is written at: the bench is one rank.
 RANK = Topology().ranks()[0]
+#: The variable naming the file a measuring process appends each point's
+#: record to as it finishes it.
+JOURNAL = "COMPASS_OPS_JOURNAL"
 
 
 def main(argv: list[str]) -> None:
@@ -193,7 +201,7 @@ def main(argv: list[str]) -> None:
                     held += 1
         print(f"{held} points already in the store", flush=True)
         todo = [point for point in todo if point[2]]
-        results = _child(measure, config, todo, args.llc_mib << 20)
+        results = _measured(config, todo, args.llc_mib << 20)
     publish(store, key, config, run, " ".join(command), results, out)
     refused = [
         f"{r['op']} at {r['shape']}: {r['refused']}" for r in results if "refused" in r
@@ -295,22 +303,24 @@ def leaves(region: dict, env=None, found=None) -> dict[str, tuple[dict, list]]:
 
 
 def measure(config, todo, llc: int) -> list[dict]:
-    """Each point's record, shape by shape: its timing, or why it refused."""
+    """Each point's record, shape by shape: its timing, or why it refused; each
+    also appended to the `JOURNAL` file as it is finished, when one is named."""
     from atom.compass.bench.replay import ReplayRule
 
-    runner = _runner(config)
+    runner, journal = _runner(config), os.environ.get(JOURNAL)
     try:
-        stub, rule, got = Stub(runner, llc), ReplayRule(config), []
+        stub, rule, got = Stub(runner, llc, journal), ReplayRule(config), []
         with patch.object(runner.model, "forward", stub), torch.inference_mode():
             for shape, context, found in todo:
                 try:
                     got += stub.point(rule, shape, context, found)
                 except ValueError as error:  # a batch the KV pool cannot place
-                    got += [
+                    refused = [
                         {"shape": str(shape), "context": context, "op": op["op"]}
                         | {"leaf": sig, "refused": f"ValueError: {error}"}
                         for sig, (op, _) in found.items()
                     ]
+                    got += _journal(journal, refused)
         return got
     finally:
         runner.exit()
@@ -344,8 +354,8 @@ class Stub:
     and the live metadata each leaf names, and returns zero hidden states.
     """
 
-    def __init__(self, runner, llc: int) -> None:
-        self.runner, self.llc = runner, llc
+    def __init__(self, runner, llc: int, journal=None) -> None:
+        self.runner, self.llc, self.journal = runner, llc, journal
         self.weights, self.leaves, self.placed = {}, {}, []
         self.cold_copies, self.clones = {}, {}
         for t in _weights(runner.model):
@@ -425,9 +435,8 @@ class Stub:
                 record["refused"] = f"{type(error).__name__}: {error}"
             copies = record.get("copies", n)
             print(f"{shape}: {op['op']} over {copies} copies {names or ''}", flush=True)
-            got.append(
-                record | {"instances": len(inst), "placements": len(self.placed)}
-            )
+            record |= {"instances": len(inst), "placements": len(self.placed)}
+            got += _journal(self.journal, [record])
         self.placed = []
         return got
 
@@ -885,7 +894,7 @@ def plan(store, key, config, run, args, command: str, out: Path) -> None:
                     found[sig] = op, instances
             todo += [(shape, context, found)] if found else []
         print(f"round {n}: {sum(len(f) for *_, f in todo)} points to measure")
-        results = _child(measure, config, todo, args.llc_mib << 20) if todo else []
+        results = _measured(config, todo, args.llc_mib << 20)
         (out / f"round{n}").mkdir(exist_ok=True)
         publish(store, key, config, run, command, results, out / f"round{n}")
         done.update(((r["shape"], r["context"], r["leaf"]), r) for r in results)
@@ -1195,6 +1204,51 @@ def _capture(config, shapes, root) -> None:
     # the GPU it names; ROCm's own mask, below HIP's, hides every GPU.
     with patch.dict(os.environ, ROCR_VISIBLE_DEVICES=""):
         _child(capture.main, [*argv, "--store", str(root)])
+
+
+def _journal(path, records: list[dict]) -> list[dict]:
+    """`records`, each first appended to the file at `path` when one is named."""
+    if path:
+        with open(path, "a") as lines:
+            lines.writelines(json.dumps(r) + "\n" for r in records)
+    return records
+
+
+def _measured(config, todo, llc: int) -> list[dict]:
+    """`measure` of `todo` in a child of its own. A child that dies keeps the
+    points it finished; the first it left, the one it died measuring, refuses,
+    and another child measures the rest. Two children in a row that die
+    having finished no point raise: the child itself is failing, not a point."""
+    got, empty = [], False
+    with tempfile.TemporaryDirectory() as tmp:
+        journal = Path(tmp, "points.jsonl")
+        while todo:
+            journal.write_text("")
+            try:
+                with patch.dict(os.environ, {JOURNAL: str(journal)}):
+                    return got + _child(measure, config, todo, llc)
+            except BrokenProcessPool:
+                new = [json.loads(line) for line in journal.read_text().splitlines()]
+                if not new and empty:
+                    raise
+                got, empty = got + new, not new
+            done = {(r["shape"], r["context"], r["leaf"]) for r in got}
+            todo = [
+                (s, c, {k: v for k, v in found.items() if (str(s), c, k) not in done})
+                for s, c, found in todo
+            ]
+            todo = [point for point in todo if point[2]]
+            if todo:  # the first point it left is the one it died measuring
+                shape, context, found = todo[0]
+                sig = next(iter(found))
+                op = found.pop(sig)[0]["op"]
+                print(f"{shape}: {op}: the measuring process died", flush=True)
+                got.append(
+                    {"shape": str(shape), "context": context, "op": op}
+                    | {"leaf": sig, "refused": "the measuring process died"}
+                )
+                todo = todo if found else todo[1:]
+    return got
 
 
 def _child(fn, *args):
