@@ -57,6 +57,7 @@ from atom.compass.backends import (
     step_linear_fit,
 )
 from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band, _groups
+from atom.compass.drive import aiter_jit
 
 WITHIN = 0.10
 REASONS = 3  # a declined band names this many of its most frequent reasons
@@ -134,7 +135,11 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     ranks fall to different vectors, is counted under `cut.ranks`. Ranks whose
     records differ in length by more than the one step a stopped run leaves on
     some ranks only are refused.
+    So is a record whose run.json, beside `record`, names `aiter_jit_builds`.
     """
+    run = Path(record).parent / "run.json"
+    if run.is_file() and (built := aiter_jit.refusal(json.loads(run.read_text()))):
+        raise ValueError(f"{record} is not costed: {built}")
     ranks = sorted(Path(record).glob("dp*[0-9].jsonl"))
     lines = {r.name: len(r.read_text().splitlines()) for r in ranks}
     if not ranks or max(lines.values()) - min(lines.values()) > 1:

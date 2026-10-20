@@ -87,7 +87,7 @@ from pathlib import Path
 
 from scipy.stats import ks_2samp
 
-from atom.compass.drive.aiter_jit import BUILDS
+from atom.compass.drive import aiter_jit
 from atom.compass.parity.served import served
 from atom.compass.run import (
     CLIENT_DIR,
@@ -237,11 +237,8 @@ def _client_run(cell, run) -> tuple[list[dict], list[str], dict]:
         why.append("its export names no arguments its client was given")
     if unnamed := [u["x_request_id"] for u in export.get("unnamed") or ()]:
         why.append(f"its export lists requests no step can be matched to: {unnamed}")
-    if builds := run.get(BUILDS):
-        why.append(
-            f"aiter ran a JIT build of {builds} while its server served, "
-            "so a step may have waited on it"
-        )
+    if built := aiter_jit.refusal(run):
+        why.append(built)
     if "run_file" in run:
         why += _not_graded(run, traces)
     if why:
