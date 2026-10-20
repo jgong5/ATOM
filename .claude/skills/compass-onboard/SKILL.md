@@ -14,10 +14,11 @@ printed and wrote. They learn Compass from their own run.
 
 ## Rules
 
-1. **This file holds no step's command.** At the start, read `QUICKSTART.md`
-   and `smoke_cell.sh` in full from the developer's checkout (`git rev-parse
+1. **This file holds no step's command.** At the start, and again after the
+   tree step moves the checkout (Tree), read `QUICKSTART.md` and
+   `smoke_cell.sh` in full from the developer's checkout (`git rev-parse
    --show-toplevel` where they invoked you) and take every step's command from
-   them as they read then, placeholders filled from this session. This file
+   them as last read, placeholders filled from this session. This file
    holds its read-only checks, what to explain, how to read a failure and where
    to stop. Where those files and this one disagree on a command or a figure,
    the files win: tell the developer what differs. They never stand in for a
@@ -34,12 +35,7 @@ printed and wrote. They learn Compass from their own run.
 3. **Stop on any failure.** A non-zero exit, a refusal, or an output you cannot
    explain stops the session at that step: read it (Reading a failure), tell the
    developer the cause and the fix, and ask before anything runs again. Never
-   edit a script, a machine spec or a profile to get past a refusal. One
-   exception: when you have verified in the container that a container option
-   the profile gives is the cause, you may, on the developer's yes, take the
-   container step again with that option fixed (Taking the container step
-   again). Tell them it is a defect in this skill's profile, to file as an
-   issue.
+   edit a script, a machine spec or a profile to get past a refusal.
 4. **Safety.**
    - A GPU only while the GPU check (Checks) reads it idle; check again before
      each GPU step.
@@ -138,15 +134,16 @@ that file and show it; it holds nothing, so it needs no yes.
 
 1. **Container.** QUICKSTART's `docker run`, its placeholders filled from the
    profile and this session, with any option the profile's Runtime adds. If a
-   container of that name is the developer's already, ask whether to reuse it
-   or name another purpose. It holds no GPU until a command runs. Explain: one
+   container of that name exists, start the session's own under another
+   purpose; never adopt one. It holds no GPU until a command runs. Explain: one
    container serves every step, and its image is the stack the machine spec
    was measured on; a fit refuses records from another (a record's `run.json`
    `stack` against the spec's `device.software_pinned_to`).
 2. **Tree.** QUICKSTART's One tree, on the host. Say that its checkout leaves
-   the developer's clone detached at the tip. Explain from the extracted tree's
-   `.compass-commit`: every record, fit and run is keyed by its tree, so two
-   trees' artifacts refuse each other.
+   the developer's clone detached at the tip. After it, read `QUICKSTART.md`
+   and `smoke_cell.sh` again (Rule 1) and tell the developer what changed.
+   Explain from the extracted tree's `.compass-commit`: every record, fit and
+   run is keyed by its tree, so two trees' artifacts refuse each other.
 3. **Client Python.** QUICKSTART's venv recipe, in the container. Explain the
    two client Pythons: a real server's client is the image's aiperf; a
    simulated server's paces aiperf on the server's virtual clock through
@@ -157,11 +154,13 @@ that file and show it; it holds nothing, so it needs no yes.
    other work, and that this one yes covers all its steps, which run back to
    back. Run it detached in the container, its output in a log outside its OUT
    (it refuses an OUT that is not empty), since it outlives any one tool call.
-   `docker exec -d` drops the exit status, so keep it in a file: the block,
-   then `> $R/smoke_cell.log 2>&1; echo $? > $R/smoke_cell.exit`. Follow the
-   log without holding a tool call open: each `smoke_cell: <step>` line means
-   the step before it finished, so explain that step from its directory while
-   the next runs. When it exits, explain the grading table and its last line.
+   `docker exec -d` drops the exit status, so keep it in a file beside the
+   log, in `$R`, which nothing has created yet: `mkdir -p $R`, then the block
+   followed by `> $R/smoke_cell.log 2>&1; echo $? > $R/smoke_cell.exit`.
+   Follow the log without holding a tool call open: each `smoke_cell: <step>`
+   line means the step before it finished, so explain that step from its
+   directory while the next runs. When it exits, explain the grading table and
+   its last line.
 
 Then offer the full path, or Cleanup.
 
@@ -190,17 +189,6 @@ shows them; SIGTERM each, and a compass command stops its own server and
 engine. The step has stopped once the GPU check reads no process on the GPU.
 Take it again as that paragraph says.
 
-## Taking the container step again
-
-Under Rule 3's exception only. Stop any step still running in the container
-(Stopping a step), remove that container, and run QUICKSTART's `docker run`
-again with the same name, image and mounts and the one option fixed. Check the
-fix in the new container (for a mount option, `/proc/mounts`). The tree, the
-venv (`$V`) and the variables file live in the data directory on the host and
-are kept, so steps 2 and 3 are not taken again; the failed step is, into a
-fresh OUT. The new container is fresh (QUICKSTART's Environment): on the full
-path, step 0 comes first again.
-
 ## Cleanup
 
 A step of its own, offered when the developer is done. Say what it removes and
@@ -208,9 +196,9 @@ what to copy out first, such as the cell's `grade.log` and logs. It removes
 only what the session created, each by its path: `$R`, `$V`, the tree
 `tree/<sha>` and its tarball, and the variables file. The container runs as
 root, so what it wrote there is root's on the host: remove those paths from
-inside the container, then the container, then on the host the `tree`
-directory and the data directory with `rmdir`, which refuses one that is not
-empty. After it, `docker ps -a` lists no container of this session and the GPU
+inside the container, then the container the session started, then on the
+host the `tree` directory and the data directory with `rmdir`, which refuses
+one that is not empty. After it, `docker ps -a` lists no container of this session and the GPU
 check reads the GPU free. Never remove a directory's contents by wildcard.
 
 ## Explaining a step
@@ -279,8 +267,7 @@ not a failure.
 5. A step taken again goes as QUICKSTART's paragraph after `serve` says.
 6. A symptom Traps does not hold: show the developer the log lines that matter
    and ask. Do not guess a fix or patch a script; a quickstart defect is an
-   issue to file. A cause you have verified in a container option the profile
-   gives is Rule 3's exception.
+   issue to file.
 
 ## Profiles
 
