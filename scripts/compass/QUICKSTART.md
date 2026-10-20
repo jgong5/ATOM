@@ -110,13 +110,15 @@ container, entered with `docker exec -it ${USER}_compass_gpu bash`.
   modules, so it stays in the container's layer on Docker's storage disk
   (`docker info -f '{{.DockerRootDir}}'`), gaining each module a server builds,
   10 MB for step 0's. Keep data off the root disk. When no disk has room for the data
-  directory, as on node 18 while `/data` reads full, use the host's tmpfs, such
+  directory, use the host's tmpfs, such
   as `/tmp/<user>_compass`: memory, lost at reboot, its files written as root,
   so copy out what should stay and remove the rest from inside the container.
 
 ## Variables
 
-Paste this into every container shell, with your data directory, tree and GPU:
+Paste this and `serve` (below) into every container shell, with your data
+directory, tree and GPU. Run steps 4 and 5 in one shell: step 5 reads step 4's
+`LAW` and `HOST`.
 
 ```bash
 DATA=<data dir>                  # the data directory (Disk)
@@ -163,7 +165,7 @@ One server and its client run, used by steps 0, 2, 3 and 5:
 serve() {
   local out=$1 traces=$2 c=$3 py=$4 log=$R/logs/${1#$R/}.log pid end=$((SECONDS + 1800))
   shift 4
-  [ ! -e $out ] || { echo "serve: $out exists; rm -rf it to take the step again" >&2; return 1; }
+  [ ! -e $out ] || { echo "serve: $out exists; leave a finished run out, rm -rf a stopped one" >&2; return 1; }
   mkdir -p ${log%/*}
   $T/scripts/compass/compass "$@" --out $out -- $ATOM > $log 2>&1 &
   pid=$!
@@ -181,8 +183,9 @@ serve() {
 To stop a step, press Ctrl-C until the prompt returns: a Ctrl-C can end a
 client run early and let its loop go on to the next. Then run `jobs`; if it
 lists a compass command, `kill %%; wait` stops its server and waits for it to
-leave. Before taking a stopped step again, `rm -rf` its `--out`: it holds a
-partial or a short run.
+leave. To take a stopped loop again, `rm -rf` the `--out` of the stopped run and
+of any run a Ctrl-C cut short, and loop over only the concurrencies still to
+do, such as `for C in 4 16`: `serve` refuses an `--out` that exists.
 
 `client.sh`'s flags and exit codes are in its header. It sends one warmup request
 per lane before the graded window; keep it, since grading refuses a run whose
@@ -346,7 +349,7 @@ law's accuracy.
 | `fit` refuses `... is not a record directory (no run.json)` | a log file matched `$R/cal/c*` | keep logs outside the record directories |
 | `fit` refuses: `[Errno 2] No such file or directory: '<record>/artifacts/client_run.json'` | a stopped calibration record under `$R/cal/` | `rm -rf` it and take it again |
 | `kill: %%: no such job` | `serve` already stopped that server, when its client run failed or ended | nothing to stop; run `jobs` first |
-| `serve: OUT exists; rm -rf it to take the step again` | a stopped step's `--out` | `rm -rf` it, as the line says |
+| `serve: OUT exists; leave a finished run out, rm -rf a stopped one` | a loop taken again over a run it already took | leave a finished concurrency out of the loop; `rm -rf` a stopped or short run's `--out` |
 | `Triton cache error`, or `failed to map segment from shared object` | a `--tmpfs` without `exec` | the container as Environment starts it |
 | grading, a fit or `validate.cost` refuses a record: `aiter ran a JIT build of [...] while its server served` | the container met that kernel variant for the first time inside the record | take the record again, since the container now holds the build; warm a fresh container first (step 0) |
 | verdict `coverage report`, `no decode vector for rung N` | the cell decoded more requests at once than any calibration step did (a rung is the batch's captured-graph size) | calibrate at that concurrency or above; #1336's calibration reached no rung 48, so c=256 stayed a coverage report |
