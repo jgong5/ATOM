@@ -206,32 +206,41 @@ def _prefix(n: np.ndarray, ratio: int = 1, cap: int | None = None) -> np.ndarray
     return ratio * whole * (whole - 1) // 2 + whole * (n - whole * ratio + 1)
 
 
-def _sparse_attention(m: Module, rows) -> Work:
-    """V4's attention: a query at position `p` reads the last `window` tokens
-    and the `p // ratio` compressed entries before it, or the indexer's top
-    `k` of them, which the indexer scores against every compressed entry. The
-    KV each request reads is read once."""
-    heads, dim, window, ratio, top, index_heads, index_dim = m.dims
+def _sparse_reads(rows, window: int, ratio: int, top: int | None = None):
+    """V4's attention over `rows`: a query at position `p` reads the last
+    `window` tokens and the `p // ratio` compressed entries before it, at most
+    `top` of them when `top` is set. Returns the new queries' keys and the KV
+    entries each request reads once, summed; then the new queries' compressed
+    entries, each of which an indexer scores, and each request's, summed."""
     seen = np.array([r.context_tokens for r in rows])
     held = seen - np.array([r.query_tokens for r in rows])
 
     def span(**k) -> int:
         return int((_prefix(seen, **k) - _prefix(held, **k)).sum())
 
-    keys, read = span(cap=window), np.minimum(seen, window).sum()
+    keys, read = span(cap=window), int(np.minimum(seen, window).sum())
+    if not ratio:
+        return keys, read, 0, 0
+    entries = seen // ratio
+    keys += span(ratio=ratio, cap=top)
+    read += int((entries if top is None else np.minimum(entries, top)).sum())
+    return keys, read, span(ratio=ratio), int(entries.sum())
+
+
+def _sparse_attention(m: Module, rows) -> Work:
+    """V4's attention (`_sparse_reads`), at most the indexer's top `k`
+    compressed entries where it has one, which scores every compressed entry.
+    The KV each request reads is read once."""
+    heads, dim, window, ratio, top, index_heads, index_dim = m.dims
+    top = top if index_heads else None
+    keys, read, scored, indexed = _sparse_reads(rows, window, ratio, top)
     work = Work()
-    if ratio:
-        entries = seen // ratio
-        if index_heads:
-            scores = 2 * index_heads * index_dim * span(ratio=ratio)
-            index = int(entries.sum()) * index_dim * ELEMENT_BYTES[m.fmt]
-            work = Work({m.fmt: scores}, index)
-            entries = np.minimum(entries, top)
-        keys += span(ratio=ratio, cap=top if index_heads else None)
-        read += entries.sum()
+    if ratio and index_heads:
+        scores = 2 * index_heads * index_dim * scored
+        work = Work({m.fmt: scores}, indexed * index_dim * ELEMENT_BYTES[m.fmt])
     q = sum_tokens(rows) * heads * dim * ELEMENT_BYTES[ACT]
     flops = {ACT: 4 * heads * dim * keys}
-    return work + Work(flops, 2 * q + int(read) * dim * ELEMENT_BYTES[m.fmt])
+    return work + Work(flops, 2 * q + read * dim * ELEMENT_BYTES[m.fmt])
 
 
 def overlap(layers) -> float:

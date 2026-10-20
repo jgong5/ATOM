@@ -220,6 +220,16 @@ one symbolic graph per structure. Nothing is allocated on a GPU and no kernel ru
 is what makes this phase schedulable anywhere, and what makes it the one phase that may
 also run lazily inside a simulated run (doc `02`).
 
+Under DP a capture runs one rank. A prefill shape also carries G, the rows the step's
+MoE gathers over the DP group, its default `dp x T`; a capture gives the peers G less
+this rank's T, split evenly, and a record's steps give each prefill its line's
+`moe_rows`. Revised 2026-10-20 by the owner's ruling on
+[#1731](https://github.com/jgong5/ATOM/issues/1731#issuecomment-6284509620): a
+data-parallel graph is keyed by its gathered rows, and the op-level backend reads a DP
+step, and each two-batch-overlap micro-batch, at (T, B, G), refused only when no graph is
+captured there. A decode shape carries no G: a balanced DP decode gathers its rung's
+default.
+
 | | |
 |---|---|
 | **Input** | the decode widths and prefill (T, B) it is given, and the steps of the record directories it is given, from `record` or `trace steps --out`; the model config; the engine config |
@@ -569,7 +579,7 @@ each server in steps 2, 3 and 6 serves the client runs a client started apart se
 
  Ops half: the op-level backend (16 Stage 3d), after the steps half's 1, 2, 3 and 5
  1.  compass trace ops --population <records> ...          [CPU, seconds per shape]
-       -> op_graph per decode width and prefill (T, B) of the steps in the
+       -> op_graph per decode width and prefill (T, B, G) of the steps in the
           steps half's 3 --out, or 2's records
  2.  compass measure ops --plan <record> [--plan <record>]... ...  [GPU, every rank]
        -> the op-level planner over the steps in the steps half's 3 --out,
@@ -752,7 +762,7 @@ only, and an `op_graph` is keyed by its shape.
 |---|---|---|
 | `machine_spec` | doc 05 probes | (device, software stack, PTL state) |
 | `shape_population` | Phase 0, `trace steps` | (model, workload, engine config, the pricing backend's digest) |
-| `op_graph` | Phase 1a, `trace ops` | (**structure**, shape): the structure's discrete key and a decode width or a prefill (T, B) |
+| `op_graph` | Phase 1a, `trace ops` | (**structure**, shape): the structure's discrete key and a decode width or a prefill (T, B), with its gathered rows G when they are not `dp x T` |
 | `op_measurement` | Phase 1b, `measure ops` | (model, parallel layout, machine-spec digest, source-root digest, the point's digest) |
 | `price_list` | Phase 1b, `fit ops` | **(model, parallel layout, machine-spec digest, source-root digest)** — a tuple, never a path |
 | `memory_readings` | Phase 2, `measure memory`; published with every reading assumed for a device never measured | (model, machine-spec digest, parallel layout, engine config) |

@@ -23,8 +23,8 @@ parameter before the launch, or that dispatched a leaf of its own other than a
 host query (`HOST_QUERIES`), is refused by name.
 
 The engine is ATOM's own `Config` for ATOM's engine arguments, on a declared
-device of one arch. Under DP the capture runs one rank and every peer runs its
-shape (`peers`).
+device of one arch. Under DP the capture runs one rank, and its peers the rest of
+the rows the group's MoE gathers (`peers`).
 """
 
 import ast
@@ -69,22 +69,33 @@ HOST_QUERIES = ("aiter.get_gfx_custom_op.default",)
 UNDISPATCHED = ("profiler.", "prim.device")
 #: The hf config fields, or its text config's, that count a model's routed experts.
 ROUTED = ("n_routed_experts", "num_experts", "num_local_experts")
+#: DeepSeek-V4's persistent decode kernel and its indexer's score and top-k.
+V4_PS_DECODE = "aiter.mla_decode_v4_ps_asm.default"
+V4_INDEXER = "aiter.indexer_score_topk.default"
 
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
 
 
 class Shape(NamedTuple):
-    """A step's shape: `tokens` query tokens over `seqs` sequences."""
+    """A step's shape: `tokens` query tokens over `seqs` sequences, and under DP
+    `gathered`, the rows the group's MoE gathers, None at every rank's `tokens`."""
 
     phase: str  # "decode" or "prefill"
     tokens: int
     seqs: int
+    gathered: int | None = None
 
     def __str__(self) -> str:
-        if self.phase == "prefill":
-            return f"prefill T={self.tokens} B={self.seqs}"
-        return f"decode B={self.seqs}"
+        text = f"prefill T={self.tokens} B={self.seqs}"
+        text = text if self.phase == "prefill" else f"decode B={self.seqs}"
+        return text if self.gathered is None else f"{text} G={self.gathered}"
+
+    def at(self, dp: int) -> "Shape":
+        """This shape in a DP group of `dp`: `gathered` only off `dp x tokens`."""
+        return (
+            self._replace(gathered=None) if self.gathered == dp * self.tokens else self
+        )
 
 
 def decode(width: int) -> Shape:
@@ -93,13 +104,18 @@ def decode(width: int) -> Shape:
     return Shape("decode", width, width)
 
 
-def prefill(tokens: int, seqs: int) -> Shape:
+def prefill(tokens: int, seqs: int, gathered: int | None = None) -> Shape:
     if not 1 <= seqs <= tokens:
         raise ValueError(
             f"a prefill of {tokens} tokens over {seqs} sequences: each sequence "
             "takes at least one token"
         )
-    return Shape("prefill", tokens, seqs)
+    if gathered is not None and gathered < tokens:
+        raise ValueError(
+            f"a prefill of {tokens} tokens whose MoE gathers {gathered} rows: the "
+            "gather holds this rank's"
+        )
+    return Shape("prefill", tokens, seqs, gathered)
 
 
 def device_arch() -> str:
@@ -216,13 +232,15 @@ class _Recorder(TorchDispatchMode):
 
     What is not ATOM's work at the traced shape goes to `left_out`, with why.
     `creating` is the role a storage allocated now takes; `roles` holds every
-    role given so far.
+    role given so far. `stated` is what an op of each kind recorded now
+    states beside its arguments (`ir.Op.stated`), by its name.
     """
 
     def __init__(self, contexts, fake_mode=None):
         super().__init__()
         self.contexts, self.modules, self.roles = contexts, {}, {}
         self.creating, self.on, self.fake_mode = None, False, fake_mode
+        self.stated = {}
         self.start()
 
     def start(self):
@@ -347,7 +365,8 @@ class _Recorder(TorchDispatchMode):
             args = tuple((slot, self._arg(value)) for slot, value in slots.items())
             ref = next((v for _, v in args if type(v) is ir.ContextRef), None)
             stream = driverless.current[0].stream_id
-            return ir.Op(name, kind, args, out_shapes, stream, ref)
+            stated = self.stated.get(name, ())
+            return ir.Op(name, kind, args, out_shapes, stream, ref, stated)
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"{name} has no contract a graph can hold: {exc}"
@@ -485,12 +504,28 @@ def _v4_attention(v4, recorder):
     folded in: before its raw launches, `fused_compress_attn` derives its
     `quant` parameter, and the decode kernel's aiter entry dispatches a leaf,
     either of which a lift refuses.
+
+    The two decode kernels' leaves state the layer's `window_size`,
+    `compress_ratio` and `index_topk` (None when it has no indexer), and the
+    indexer's its `compress_ratio`, none of which they are passed: read off
+    the layer `layer_name` names.
     """
     from atom.model_ops.v4_kernels import paged_decode
     from atom.utils.forward_context import get_forward_context
 
+    decode = paged_decode._sparse_attn_v4_paged_decode_asm
+    decodes = (f"{decode.__module__}:{decode.__qualname__}", V4_PS_DECODE)
+
     def body(x, positions, layer_name):
-        with patch.object(get_forward_context().context, "is_dummy_run", False):
+        layer = recorder.contexts[layer_name]
+        top = layer.indexer and layer.indexer.index_topk
+        ratio = (("compress_ratio", layer.compress_ratio),)
+        geometry = (("window_size", layer.window_size), *ratio, ("index_topk", top))
+        stated = {**dict.fromkeys(decodes, geometry), V4_INDEXER: ratio}
+        with (
+            patch.object(recorder, "stated", stated),
+            patch.object(get_forward_context().context, "is_dummy_run", False),
+        ):
             return v4.v4_attention_with_output(x, positions, layer_name)
 
     def at_call(owner, fn):
@@ -502,7 +537,7 @@ def _v4_attention(v4, recorder):
     for each in (
         patch.object(torch.ops.aiter, "v4_attention_with_output", body),
         at_call(v4, v4.fused_compress_attn),
-        at_call(paged_decode, paged_decode._sparse_attn_v4_paged_decode_asm),
+        at_call(paged_decode, decode),
     ):
         stack.enter_context(each)
     return stack
@@ -665,6 +700,9 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
     config = _config(model, tp, atom_args)
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     ep = int(config.enable_expert_parallel)
+    shapes = list(dict.fromkeys(s.at(dp) for s in shapes))
+    if dp == 1 and (gathering := [s for s in shapes if s.gathered is not None]):
+        raise ValueError(f"{gathering[0]} gathers a DP group's rows on one rank")
     declared["group"] = driverless.group(tp, dp)
     set_current_atom_config(config)
     digest = _file_digest(config.model, "config.json")

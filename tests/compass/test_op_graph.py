@@ -141,29 +141,9 @@ def test_a_step_reads_the_graph_captured_at_its_shape(batch, padded, shape):
             "a prefill step whose view does not say whether it produces output",
         ),
         (
-            BatchView(
-                (RequestShape(9, 9, False),),
-                tbo_tokens=((5, 4), (4, 5)),
-                produces_output=True,
-                dp_rank=0,
-            ),
-            g(1, 8, 8),
-            r"two-batch-overlap step whose ranks schedule \(5, 4\) rows",
-        ),
-        (
             BatchView((RequestShape(9, 9, False),), image_tokens=5),
             g(1, 8, 8),
             "a step with image tokens",
-        ),
-        (
-            replace(FINAL, moe_rows=18),
-            {"seq": [g(9, 8, 8), leaf(GATHER, [[18, 8]], x=t([9, 8]))]},
-            "a data-parallel step whose MoE gathers its group's rows",
-        ),
-        (
-            replace(FINAL, moe_rows=18),
-            leaf(f"{MORI}.dispatch", [[18, 8]], input=t([9, 8])),
-            "a data-parallel step whose MoE gathers its group's rows",
         ),
     ],
     ids=[
@@ -171,10 +151,7 @@ def test_a_step_reads_the_graph_captured_at_its_shape(batch, padded, shape):
         "uncaptured",
         "uncaptured-middle",
         "output-unsaid",
-        "tbo",
         "images",
-        "data-parallel",
-        "mori",
     ],
 )
 def test_a_step_with_no_graph_to_price_it_is_refused_by_name(batch, graph, named):
@@ -193,17 +170,8 @@ def test_a_step_with_no_graph_to_price_it_is_refused_by_name(batch, graph, named
                 "decode step is not captured"
             ),
         ),
-        (
-            [replace(FINAL, moe_rows=18), replace(FINAL, moe_rows=27)],
-            {"seq": [g(9, 8, 8), leaf(GATHER, [[18, 8]], x=t([9, 8]))]},
-            (
-                "a data-parallel step whose MoE gathers its group's rows: capture "
-                "runs one rank, so its graph holds the gather, the reduce-scatter "
-                "and the experts at every peer scheduling this rank's rows"
-            ),
-        ),
     ],
-    ids=["speculative", "data-parallel"],
+    ids=["speculative"],
 )
 def test_steps_declined_for_one_cause_share_one_reason(steps, graph, reason):
     """Steps of one kind the graph declines, whatever their counts, are
@@ -337,12 +305,12 @@ def test_a_split_step_lays_both_micro_batches_on_the_compute_and_comm_streams():
     cost = OpGraphBackend(SECOND, graph, kv="bf16").price(SPLIT)
 
     # Each micro-batch from its own shape's graph, the second with the output.
-    assert asked == [("prefill", 3, 1, False), ("prefill", 4, 2, True)]
+    assert asked == [("prefill", 3, 1, False, 6), ("prefill", 4, 2, True, 8)]
     # The timeline ATOM's TBO ring runs: 44 seconds, against 66 one after the
     # other.
     assert by_name(cost) == {"op.tbo": 44.0}
     assert cost.terms[0].provenance.detail.endswith(
-        "prefill T=3 B=1 that produces no output and prefill T=4 B=2"
+        "prefill T=3 B=1 G=6 that produces no output and prefill T=4 B=2 G=8"
     )
 
 
@@ -365,18 +333,6 @@ def test_a_gather_of_token_ids_runs_inline_on_the_compute_stream():
             False,
             r"split \(\(3, 4\), \(4, 3\)\) names no single pair",
         ),
-        (
-            replace(SPLIT, tbo_tokens=((3, 4), (4, 3)), dp_rank=0),
-            layers(),
-            False,
-            r"ranks schedule \(3, 4\) rows of one micro-batch",
-        ),
-        (
-            replace(SPLIT, tbo_tokens=((3, 3), (4, 2)), dp_rank=0),
-            layers(),
-            False,
-            r"ranks schedule \(4, 2\) rows of one micro-batch",
-        ),
         (SPLIT, None, False, "no op_graph holds a prefill step of 3 tokens"),
         (
             replace(SPLIT, produces_output=None),
@@ -389,8 +345,6 @@ def test_a_gather_of_token_ids_runs_inline_on_the_compute_stream():
     ids=[
         "split-send-recv",
         "no-pair",
-        "uneven",
-        "uneven-second",
         "uncaptured",
         "output-unsaid",
         "images",
@@ -411,7 +365,7 @@ def test_a_micro_batch_whose_exchange_shares_a_par_is_refused(join):
 
 
 def test_micro_batches_whose_graphs_exchange_unalike_are_refused():
-    def graph(phase, tokens, seqs, output):
+    def graph(phase, tokens, seqs, output, gathered):
         return layers(count=tokens - 2)
 
     with pytest.raises(CostRefused, match="change streams 3 and 7 times"):
@@ -419,7 +373,7 @@ def test_micro_batches_whose_graphs_exchange_unalike_are_refused():
 
 
 def test_a_leaf_one_micro_batch_refuses_is_named_before_the_stream_count():
-    def graph(phase, tokens, seqs, output):
+    def graph(phase, tokens, seqs, output, gathered):
         exchange = "atom.model_ops.moe:foo" if tokens == 3 else GATHER
         return {"seq": [g(1, 8, 8), leaf(exchange, [[2, 8]], x=t([1, 8])), g(1, 8, 8)]}
 
@@ -434,7 +388,7 @@ def test_a_leaf_one_micro_batch_refuses_is_named_before_the_stream_count():
 def test_the_first_micro_batch_issues_first_on_each_stream():
     gather = leaf(GATHER, [[2, 8]], x=t([1, 8]))
 
-    def graph(phase, tokens, seqs, output):
+    def graph(phase, tokens, seqs, output, gathered):
         compute, exchange = {3: (1, 10), 4: (10, 1)}[tokens]
         return {"seq": [g(1, 8, 8)] * compute + [gather] * exchange}
 
