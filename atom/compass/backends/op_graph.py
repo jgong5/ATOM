@@ -83,9 +83,9 @@ def step_shape(
     query tokens over its rows. A speculative decode step is refused."""
     if not all(decode for _, decode in rows):
         return "prefill", sum(q for q, _ in rows), len(rows)
-    if wide := [q for q, _ in rows if q != 1]:
+    if any(q != 1 for q, _ in rows):
         raise ValueError(
-            f"decodes {wide[0]} tokens in a row: a speculative decode step is "
+            "decodes more than one token in a row: a speculative decode step is "
             "not captured"
         )
     width = rung or len(rows)

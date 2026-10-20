@@ -28,6 +28,7 @@ from pathlib import Path
 from statistics import median
 
 from atom.compass.backends.cost import GROUPS
+from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.step_linear_fit import TOKEN_BANDS, token_band
 from atom.compass.memory.check import MemoryRefusal, parts
 from atom.compass.run import (
@@ -50,8 +51,7 @@ GATED_COUNTS = {"preemptions", "prefill tokens"}
 
 def _ttft(run: Path) -> dict[str, float]:
     by = {}
-    for line in (run / "artifacts/profile_export.jsonl").read_text().splitlines():
-        r = json.loads(line)
+    for r in read_jsonl(run / "artifacts/profile_export.jsonl"):
         m, phase = r["metrics"], r["metadata"]["benchmark_phase"]
         if phase == "profiling" and "time_to_first_token" in m:
             n = m["usage_prompt_tokens"]["value"]
@@ -157,7 +157,7 @@ def _law(run_file: dict, real: Path) -> dict:
     under the engine config its record states."""
     laws = entries(run_file, STEP_LINEAR)
     if len(laws) > 1:
-        here = keyed_of(json.loads((real / "steps/dp0.engine.json").read_text()))
+        here = keyed_of(read_json(real / "steps/dp0.engine.json"))
         return _fitted_here(laws, here, lambda e: e.get("engine_config"), STEP_LINEAR)
     return laws[0]
 
@@ -192,18 +192,25 @@ def rows(cell) -> list[tuple]:
             f"{cell} holds {len(real)} of real*/; a cell holds two or more real runs"
         )
     (sim,) = simulated
-    if bare := [r.name for r in (*real, sim) if not (r / "run.json").is_file()]:
+    for needed in ("run.json", runs.EXPORT):
+        if bare := [r.name for r in (*real, sim) if not (r / needed).is_file()]:
+            raise ValueError(
+                f"{cell}'s {bare} hold no {needed}; every run of a cell holds one"
+            )
+    # A run `run` wrote grades its first client run, so its summary is that run's.
+    first = sim / CLIENT_DIR.format(0) / SUMMARY_FILE
+    summary_file = first if first.is_file() else sim / SUMMARY_FILE
+    if not summary_file.is_file():
         raise ValueError(
-            f"{cell}'s {bare} hold no run.json; every run of a cell holds one"
+            f"{cell}'s {sim.name} holds no run summary, {SUMMARY_FILE} or "
+            f"{first.relative_to(sim)}; a simulated run holds one"
         )
-    run = {r.name: json.loads((r / "run.json").read_text()) for r in (*real, sim)}
+    run = {r.name: read_json(r / "run.json") for r in (*real, sim)}
     for name, f in run.items():
         refuse_renamed_keys(f, cell / name / "run.json")
     if len({json.dumps(f.get("workload"), sort_keys=True) for f in run.values()}) != 1:
         raise ValueError(f"{cell}'s runs {sorted(run)} ran different workloads")
-    # A run `run` wrote grades its first client run, so its summary is that run's.
-    first = sim / CLIENT_DIR.format(0) / SUMMARY_FILE
-    summary = json.loads((first if first.is_file() else sim / SUMMARY_FILE).read_text())
+    summary = read_json(summary_file)
     verdict = "coverage report" if summary["coverage_report"] else "graded"
     out = [("cell", "verdict", f"{len(real)} real runs", verdict)]
     out += _runs(real, sim)
@@ -227,5 +234,7 @@ def main(argv=None) -> None:
 if __name__ == "__main__":
     try:
         main()
+    except json.JSONDecodeError:  # it names no file, so it keeps its traceback
+        raise
     except ValueError as refused:  # a refusal: its reason, exit 1, no traceback
         raise SystemExit(str(refused)) from refused

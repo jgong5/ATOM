@@ -56,6 +56,7 @@ from atom.compass.backends import (
     step_labels,
     step_linear_fit,
 )
+from atom.compass.backends.json_file import read_json
 from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band, _groups
 from atom.compass.drive import aiter_jit
 
@@ -138,7 +139,7 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     So is a record whose run.json, beside `record`, names `aiter_jit_builds`.
     """
     run = Path(record).resolve().parent / "run.json"
-    if run.is_file() and (built := aiter_jit.refusal(json.loads(run.read_text()))):
+    if run.is_file() and (built := aiter_jit.refusal(read_json(run))):
         raise ValueError(f"{record} is not costed: {built}")
     ranks = sorted(Path(record).glob("dp*[0-9].jsonl"))
     lines = {r.name: len(r.read_text().splitlines()) for r in ranks}

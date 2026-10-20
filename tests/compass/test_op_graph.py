@@ -121,7 +121,11 @@ def test_a_step_reads_the_graph_captured_at_its_shape(batch, padded, shape):
 @pytest.mark.parametrize(
     "batch,graph,named",
     [
-        (view((2, 9, True)), g(1, 8, 8), "a step that decodes 2 tokens in a row"),
+        (
+            view((2, 9, True)),
+            g(1, 8, 8),
+            "a step that decodes more than one token in a row",
+        ),
         (view((1, 9, True)), None, "no op_graph holds a decode step of 1 tokens"),
         (MIDDLE, None, "of 9 tokens over 1 sequences that produces no output;"),
         (
@@ -146,6 +150,32 @@ def test_a_step_reads_the_graph_captured_at_its_shape(batch, padded, shape):
 def test_a_step_with_no_graph_to_price_it_is_refused_by_name(batch, graph, named):
     with pytest.raises(CostRefused, match=named):
         backend(graph).price(batch)
+
+
+@pytest.mark.parametrize(
+    "steps,graph,reason",
+    [
+        (
+            [view((2, 9, True)), view((3, 9, True), (1, 9, True))],
+            g(1, 8, 8),
+            (
+                "a step that decodes more than one token in a row: a speculative "
+                "decode step is not captured"
+            ),
+        ),
+    ],
+    ids=["speculative"],
+)
+def test_steps_declined_for_one_cause_share_one_reason(steps, graph, reason):
+    """Steps of one kind the graph declines, whatever their counts, are
+    refused for one reason."""
+    reasons = set()
+    for step in steps:
+        with pytest.raises(CostRefused) as refused:
+            backend(graph).price(step)
+        reasons.update(refused.value.declined)
+
+    assert reasons == {Refusal("op-graph", reason)}
 
 
 def test_a_data_parallel_step_with_no_moe_exchange_prices_as_its_own_rows():
