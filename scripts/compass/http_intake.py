@@ -3,11 +3,18 @@
 
     python3 scripts/compass/http_intake.py serve STAMPS API_SERVER_ARGS...
     python3 scripts/compass/http_intake.py fit STAMPS [N]
+    python3 scripts/compass/http_intake.py floor STAMPS ARRIVALS
 
 `serve` runs `atom.entrypoints.openai.api_server` as ``python3 -m`` does and
-appends ``<end ns> <thread id> body|tmpl <start ns> <size>`` to STAMPS for each
-request body first read (`Request.body`) and chat template rendered
-(`apply_chat_template`); `cctraces_sim.sh` runs it when HTTP_INTAKE is set.
+appends ``<end ns> <thread id> body|tmpl|app <start ns> <size>`` to STAMPS for
+each request body first read (`Request.body`), chat template rendered
+(`apply_chat_template`) and HTTP request handed to the ASGI app
+(`Starlette.__call__`, size 0); `cctraces_sim.sh` runs it when HTTP_INTAKE is set.
+
+`floor` reads the transport from client send to ASGI app call off a server
+`serve` ran and the parity workload's real-run ARRIVALS
+(`atom.compass.parity.traffic`), sent one request in flight: a gap longer than
+any request. Prints the median, p10 and p90 in seconds, N and both sha256s as JSON.
 
 `fit` reads a burst of N first-turn requests (default 256), which the loop takes
 in one at a time: each gap between template starts is the next request's
@@ -21,6 +28,7 @@ import hashlib
 import importlib.abc
 import importlib.machinery
 import json
+import math
 import os
 import runpy
 import sys
@@ -59,9 +67,20 @@ def serve(stamps: str, args: list[str]) -> None:
 
         module.apply_chat_template = apply_chat_template
 
+    def apps(module) -> None:
+        call = module.Starlette.__call__
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                stamp("app", time.monotonic_ns(), 0)
+            await call(self, scope, receive, send)
+
+        module.Starlette.__call__ = __call__
+
     # Each module is patched once it has run, before anything imports from it.
     patches = {
         "starlette.requests": requests,
+        "starlette.applications": apps,
         "atom.entrypoints.openai.chat_encoders": encoders,
     }
 
@@ -108,9 +127,34 @@ def fit(stamps: str, n: int = 256) -> dict:
     }
 
 
+def floor(stamps: str, arrivals: str) -> dict:
+    data, sent_data = Path(stamps).read_bytes(), Path(arrivals).read_bytes()
+    rows = [line.split() for line in data.decode().splitlines()]
+    calls = sorted(int(r[3]) for r in rows if r[2] == "app")
+    sent = sorted(json.loads(sent_data)["sent_ns"])
+    # One request in flight: each call falls between its send and the next.
+    if len(calls) != len(sent) or not all(
+        s < c < nxt for s, c, nxt in zip(sent, calls, sent[1:] + [math.inf])
+    ):
+        raise SystemExit(
+            f"{stamps}: {len(calls)} app calls, not one after each of {len(sent)} sends"
+        )
+    p10, median, p90 = np.percentile((np.array(calls) - sent) / 1e9, [10, 50, 90])
+    return {
+        "median_s": float(median),
+        "p10_s": float(p10),
+        "p90_s": float(p90),
+        "requests": len(sent),
+        "record": f"sha256:{hashlib.sha256(data).hexdigest()}",
+        "arrivals": f"sha256:{hashlib.sha256(sent_data).hexdigest()}",
+    }
+
+
 if __name__ == "__main__":
     verb, stamps, *rest = sys.argv[1:]
     if verb == "serve":
         serve(stamps, rest)
+    elif verb == "floor":
+        print(json.dumps(floor(stamps, *rest)))
     else:
         print(json.dumps(fit(stamps, *map(int, rest))))
