@@ -577,10 +577,11 @@ class HttpChannel:
 
     Taking in a stamped request other than a cancel costs the event loop
     ``fixed_s + body bytes x per_byte_s`` (`atom.compass.run.http_intake`),
-    charged on the loop once its body is read, every open tokenizer station job
-    is placed and the callbacks due by then have run (`SimExecutor.placed`), so
-    a burst reaches the app one request at a time. A run file with no machine
-    spec charges nothing.
+    with ``idle_s`` for ``fixed_s`` when the request arrives once the last
+    intake has ended. It is charged on the loop once its body is read, every
+    open tokenizer station job is placed and the callbacks due by then have
+    run (`SimExecutor.placed`), so a burst reaches the app one request at a
+    time. A run file with no machine spec charges nothing.
     """
 
     def __init__(self, app, stamp) -> None:
@@ -588,6 +589,7 @@ class HttpChannel:
 
         self.app, self.stamp = app, stamp
         self.intake = http_intake()
+        self.intake_end = -math.inf  # the LP time the last intake ended
         # http seq -> its hang-up, for each stamped request the app is serving
         self.hangups: dict[int, asyncio.Event] = {}
 
@@ -634,9 +636,12 @@ class HttpChannel:
                     # the job is placed; the intake is charged once every open
                     # one is, and those due by now have run.
                     await loop.executor.placed()
-                    fixed, per_byte = self.intake
+                    fixed, per_byte, idle = self.intake
+                    if arrival >= self.intake_end:
+                        fixed = idle
                     nbytes = sum(len(m.get("body", b"")) for m in body)
                     charge(fixed + per_byte * nbytes)
+                    self.intake_end = loop.time()
                 with rt.lock:
                     rt.count_done_locked(ch, seq)
             if relay_in is None:

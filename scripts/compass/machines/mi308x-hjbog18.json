@@ -3,7 +3,7 @@
   "name": "mi308x-hjbog18",
   "provenance": {
     "authored_by": "compass agent for jgong5",
-    "date": "2026-10-19",
+    "date": "2026-10-20",
     "origin": "mixed",
     "origins": {
       "host.cpu.cores_physical": {
@@ -123,6 +123,14 @@
         "p10": 3.728040935451147e-09,
         "p90": 6.552659606331298e-09
       },
+      "host.http_intake.idle_s": {
+        "origin": "probed",
+        "model": "Qwen/Qwen3.8-27B",
+        "source_root": "commit:276b5f0dc",
+        "record": "sha256:c0bbc3155c2927e0527f83977ff5527715f4fc3a13cc9a855fb1270ad0bb346f",
+        "p10": 0.00045064317464686227,
+        "p90": 0.0006483709502861491
+      },
       "device.memory.bandwidth_curve": {
         "origin": "probed",
         "source_root": "commit:8c6fdc90b",
@@ -186,9 +194,10 @@
       "assumed",
       "ptl",
       "intake",
+      "idle",
       "peaks"
     ],
-    "notes": "one Qwen3.8-27B TP1 start at 0f045543d | no probe fills these | ptl_enable | one real c=256 first-turn cc-traces burst at 19c5ab09e | probe_device.py: GEMM, read, write, copy, graph and link samples"
+    "notes": "one Qwen3.8-27B TP1 start at 0f045543d | no probe fills these | ptl_enable | one real c=256 first-turn cc-traces burst at 19c5ab09e | http_intake.py idle over 64 lone requests at 276b5f0dc | probe_device.py: GEMM, read, write, copy, graph and link samples"
   },
   "host": {
     "cpu": {
@@ -217,7 +226,8 @@
     },
     "http_intake": {
       "fixed_s": 0.0026078916675536866,
-      "per_byte_s": 5.082586258228853e-09
+      "per_byte_s": 5.082586258228853e-09,
+      "idle_s": 0.0004972740363723576
     }
   },
   "device": {

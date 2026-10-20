@@ -769,7 +769,8 @@ def _intake_run_file(monkeypatch, tmp_path, intake) -> None:
     run = {"bound_s": 600.0}
     if intake is not None:
         machine = run["machine"] = copy.deepcopy(DOCUMENT)
-        machine["host"]["http_intake"] = dict(zip(("fixed_s", "per_byte_s"), intake))
+        terms = ("fixed_s", "per_byte_s", "idle_s")
+        machine["host"]["http_intake"] = dict(zip(terms, intake))
     path = tmp_path / "run.json"
     path.write_text(json.dumps(run))
     monkeypatch.setenv(compass_run.ENV, str(path))
@@ -824,6 +825,63 @@ def test_a_burst_reaches_the_app_one_intake_charge_at_a_time(
     first = arrival + fixed + sizes[0] * per_byte
     print(f"\n  app entered at {entered}")
     assert entered == pytest.approx([first, first + fixed + sizes[1] * per_byte])
+
+
+def test_a_request_that_finds_no_intake_on_the_loop_is_charged_the_idle_one(
+    run, monkeypatch, tmp_path
+):
+    # Requests 0 and 1 arrive together; request 2 arrives after both intakes
+    # have ended, and request 3 while request 2's is still being charged.
+    fixed, per_byte, idle = 2e-3, 1e-6, 5e-4
+    _intake_run_file(monkeypatch, tmp_path, (fixed, per_byte, idle))
+    sends, stamps = [0.0, 0.0, 1.0, 1.0001], queue.Queue()
+
+    def traffic():
+        rt = LPRuntime(TRAFFIC, TABLE, clock_transport.connect(TRAFFIC, run.endpoint))
+        rt.start_run()
+        for at in sends:
+            rt.advance_to(at)
+            stamps.put(rt.stamp_send(HTTP))
+        rt.next_event(INF)
+        rt.close()
+
+    thread = threading.Thread(target=traffic, name="traffic", daemon=True)
+    thread.start()
+    arrivals = [at + TABLE.lookahead(HTTP) for at in sends]
+    sizes, entered = [1000, 3000, 2000, 4000], {}
+
+    async def app(scope, receive, send):
+        entered[_stamp(scope)[1]] = asyncio.get_running_loop().time()
+
+    def request(seq):
+        scope = {
+            "type": "http",
+            "headers": [(b"x-test-stamp", b"%r %d" % (arrivals[seq], seq))],
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"x" * sizes[seq]}
+
+        return scope, receive, None
+
+    async def go():
+        channel = HttpChannel(app, _stamp)
+        await asyncio.gather(*(channel(*request(seq)) for seq in range(len(sends))))
+
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        thread.join(10)
+    loop.close()
+    assert [stamps.get(timeout=10) for _ in sends] == list(zip(arrivals, range(4)))
+    e0 = arrivals[0] + idle + sizes[0] * per_byte
+    e1 = e0 + fixed + sizes[1] * per_byte
+    e2 = arrivals[2] + idle + sizes[2] * per_byte
+    e3 = e2 + fixed + sizes[3] * per_byte
+    print(f"\n  app entered at {entered}")
+    assert [entered[seq] for seq in range(4)] == pytest.approx([e0, e1, e2, e3])
 
 
 def test_an_intake_waits_for_the_open_tokenizer_job_so_its_result_is_not_late(

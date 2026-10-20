@@ -4,17 +4,23 @@
     python3 scripts/compass/http_intake.py serve STAMPS API_SERVER_ARGS...
     python3 scripts/compass/http_intake.py fit STAMPS [N]
     python3 scripts/compass/http_intake.py floor STAMPS ARRIVALS
+    python3 scripts/compass/http_intake.py idle STAMPS [PER_BYTE_S]
 
 `serve` runs `atom.entrypoints.openai.api_server` as ``python3 -m`` does and
-appends ``<end ns> <thread id> body|tmpl|app <start ns> <size>`` to STAMPS for
-each request body first read (`Request.body`), chat template rendered
-(`apply_chat_template`) and HTTP request handed to the ASGI app
-(`Starlette.__call__`, size 0); `cctraces_sim.sh` runs it when HTTP_INTAKE is set.
+appends ``<end ns> <thread id> body|tmpl|app|prep <start ns> <size>`` to STAMPS
+for each request body first read (`Request.body`), chat template rendered
+(`apply_chat_template`), HTTP request handed to the ASGI app
+(`Starlette.__call__`, size 0) and tokenizer pool job
+(`InputOutputProcessor.preprocess_fanout`, size 0); `cctraces_sim.sh` runs it
+when HTTP_INTAKE is set.
 
 `floor` reads the transport from client send to ASGI app call off a server
 `serve` ran and the parity workload's real-run ARRIVALS
 (`atom.compass.parity.traffic`), sent one request in flight: a gap longer than
 any request. Prints the median, p10 and p90 in seconds, N and both sha256s as JSON.
+`idle` reads the same run's intake on a loop with no other: each ASGI app call
+to its pool job's start, less PER_BYTE_S (default 0) per body byte. Prints the
+median as `idle_s`, p10, p90, PER_BYTE_S, N and the sha256 as JSON.
 
 `fit` reads a burst of N first-turn requests (default 256), which the loop takes
 in one at a time: each gap between template starts is the next request's
@@ -162,11 +168,41 @@ def floor(stamps: str, arrivals: str) -> dict:
     }
 
 
+def idle(stamps: str, per_byte: float = 0.0) -> dict:
+    data = Path(stamps).read_bytes()
+    rows = [line.split() for line in data.decode().splitlines()]
+    calls = sorted(int(r[3]) for r in rows if r[2] == "app")
+    jobs = sorted(int(r[3]) for r in rows if r[2] == "prep")
+    # One request at a time: each app call's job starts before the next call.
+    if len(jobs) != len(calls) or not all(
+        c < j < nxt for c, j, nxt in zip(calls, jobs, calls[1:] + [float("inf")])
+    ):
+        raise SystemExit(
+            f"{stamps}: {len(jobs)} pool jobs, not one after each of {len(calls)} app calls"
+        )
+    nbytes = [
+        sum(int(r[4]) for r in rows if r[2] == "body" and c < int(r[3]) < j)
+        for c, j in zip(calls, jobs)
+    ]
+    took = (np.array(jobs) - calls) / 1e9 - per_byte * np.array(nbytes)
+    p10, median, p90 = np.percentile(took, [10, 50, 90])
+    return {
+        "idle_s": float(median),
+        "p10_s": float(p10),
+        "p90_s": float(p90),
+        "per_byte_s": per_byte,
+        "requests": len(jobs),
+        "record": f"sha256:{hashlib.sha256(data).hexdigest()}",
+    }
+
+
 if __name__ == "__main__":
     verb, stamps, *rest = sys.argv[1:]
     if verb == "serve":
         serve(stamps, rest)
     elif verb == "floor":
         print(json.dumps(floor(stamps, *rest)))
+    elif verb == "idle":
+        print(json.dumps(idle(stamps, *map(float, rest))))
     else:
         print(json.dumps(fit(stamps, *map(int, rest))))
