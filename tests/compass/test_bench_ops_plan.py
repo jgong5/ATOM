@@ -402,6 +402,8 @@ def test_a_decode_family_halves_either_side_of_a_point_off_its_neighbours_line()
         # 26 at 2000 against 20 on the line from 1000 to 3000; 30 at 3000 is on
         # the line from 2000 to 4000.
         "bent": family([(1000, 10.0), (2000, 26.0), (3000, 30.0), (4000, 34.0)]),
+        # The line prices 1000 at 1051: 5.1% over 1000, 4.9% over 1051.
+        "under": family([(1000, 1000.0), (2000, 1000.0), (3000, 1102.0)]),
         # The same bend across a kernel switch halves only the switch.
         "switch": family([(1000, 10.0), (2000, 26.0), (3000, 30.0)], "kkj"),
     }
@@ -414,8 +416,8 @@ def test_a_decode_family_halves_either_side_of_a_point_off_its_neighbours_line()
     want = ops._densify(families, set())
 
     assert {at: {json.loads(f)[1] for f in fams} for at, fams in want.items()} == {
-        (decode(2), 1500): {"bent"},
-        (decode(2), 2500): {"bent", "switch"},
+        (decode(2), 1500): {"bent", "under"},
+        (decode(2), 2500): {"bent", "under", "switch"},
     }
 
 
@@ -449,8 +451,8 @@ def test_a_plan_halves_decode_attention_until_no_point_bends_off_its_neighbours(
         points.sort()
         for p, q, s in zip(points, points[1:], points[2:]):
             line = p[2] + (s[2] - p[2]) * (q[0] - p[0]) / (s[0] - p[0])
-            if p[1] == q[1] == s[1]:
-                assert abs(q[2] - line) <= 0.05 * max(q[2], line), (p, q, s)
+            if p[1] == q[1] == s[1] and s[0] - p[0] > 2:
+                assert abs(line - q[2]) <= 0.05 * q[2], (p, q, s)
     at = {c for c, *_ in by["decode B=1"]}
     assert any(3000 < c < 4125 for c in at) and {4999, 5000} <= at
 

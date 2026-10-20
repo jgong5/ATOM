@@ -858,9 +858,9 @@ LADDER_STEP = 1.25
 #: The spread of a leaf's cold times across contexts, over the largest, past
 #: which its kind depends on context; a repeat's spread stays within 4%.
 CONTEXT_MOVES = 0.10
-#: How far a decode point's cold time may lie off the line through its two
-#: neighbours', over the larger, when the three launched one kernel, before the
-#: plan halves the gaps either side: a price read off that line misses by as much.
+#: How far the line through a decode point's two neighbours may price it off its
+#: measured cold time, over that time as `fit ops` reads a held-out error, when
+#: the three launched one kernel, before the plan halves the gaps either side.
 BENDS = 0.05
 
 
@@ -1204,13 +1204,13 @@ def _densify(families, tried: set) -> dict:
 
 def _bent(points) -> set:
     """The lower ends of the gaps either side of each middle point of three
-    neighbours that launched one kernel and whose cold time lies more than
-    `BENDS`, over the larger, off the line through the outer two's."""
+    neighbours that launched one kernel and whose cold time the line through
+    the outer two's prices more than `BENDS` off, over that cold time."""
     ends = set()
     for p, q, r in zip(points, points[1:], points[2:]):
         y = [point[2]["cold_ns"] for point in (p, q, r)]
         line = y[0] + (y[2] - y[0]) * (q[0] - p[0]) / (r[0] - p[0])
-        if p[1] == q[1] == r[1] and abs(y[1] - line) > BENDS * max(y[1], line):
+        if p[1] == q[1] == r[1] and abs(line - y[1]) > BENDS * y[1]:
             ends |= {p[0], q[0]}
     return ends
 
