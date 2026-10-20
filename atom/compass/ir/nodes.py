@@ -9,8 +9,8 @@
 
 An `Op` holds its arguments by schema slot, which is what calling it again
 needs: a tensor as a `Tensor` (shape, dtype, stride, role), a module as a
-`ModuleRef`, an integer affine in a decode step's context as an `Affine`,
-anything else as its value.
+`ModuleRef`, an integer affine in a decode step's context as an `Affine`, any
+other object as pickle reduces it (`Reduced`), anything else as its value.
 
 An operator's cost-deciding per-step state (block tables, context lengths) is
 ambient, not an argument, so an `Op` names where to find it again
@@ -21,6 +21,7 @@ leaves free.
 """
 
 import enum
+import importlib
 import string
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -165,12 +166,55 @@ class ModuleRef(ContextRef):
 
 
 @dataclass(frozen=True, slots=True)
+class Reduced:
+    """An object argument in the shape pickle reduces it to: its class by
+    `module:qualname` and its state, the attributes by name, each an argument
+    value; a dict's state is its items, an enum member's its value."""
+
+    cls: str
+    state: Any
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "state", _as_value(self.cls, self.state))
+
+    def rebuild(self, live):
+        """The object again, each value of its state passed through `live`
+        first (`Reduced` ones rebuilt alike)."""
+        module, qualname = self.cls.split(":")
+        cls = importlib.import_module(module)
+        for name in qualname.split("."):
+            cls = getattr(cls, name)
+        if issubclass(cls, enum.Enum):
+            return cls(self.state)
+        state = {rebuild(k, live): rebuild(v, live) for k, v in self.state}
+        if cls is dict:
+            return state
+        obj = cls.__new__(cls)
+        if setstate := getattr(obj, "__setstate__", None):
+            setstate(state)
+        else:
+            obj.__dict__.update(state)
+        return obj
+
+
+def rebuild(value: Any, live) -> Any:
+    """An argument value as a call takes it: `Reduced` objects rebuilt, tuples
+    item by item, and `Tensor`, `ContextRef` and `Affine` values through
+    `live`."""
+    if isinstance(value, Reduced):
+        return value.rebuild(live)
+    if isinstance(value, tuple):
+        return tuple(rebuild(item, live) for item in value)
+    return live(value) if isinstance(value, (Tensor, ContextRef, Affine)) else value
+
+
+@dataclass(frozen=True, slots=True)
 class Op(Region):
     """One operator: what ran, with which arguments, on which stream.
 
     `args` holds each argument by its slot, in the order the operator takes
-    them: a `Tensor`, a `ModuleRef`, a `ContextRef`, an `Affine`, a number, str,
-    bytes, enum member, `None` or a tuple of those. Anything else, a live
+    them: a `Tensor`, a `ModuleRef`, a `ContextRef`, an `Affine`, a `Reduced`
+    object, a number, str, bytes, enum member, `None` or a tuple of those. Anything else, a live
     symbolic value among it, is refused by its type, without being asked
     anything.
 
@@ -218,14 +262,16 @@ def _as_args(args: Any) -> tuple[tuple[str, Any], ...]:
 
 def _as_value(slot: str, value: Any) -> Any:
     if value is None or isinstance(
-        value, (bool, int, float, str, bytes, enum.Enum, Tensor, ContextRef, Affine)
+        value,
+        (bool, int, float, str, bytes, enum.Enum, Tensor, ContextRef, Affine, Reduced),
     ):
         return value
     if isinstance(value, tuple):
         return tuple(_as_value(slot, item) for item in value)
     raise TypeError(
         f"argument {slot!r} is a {type(value).__name__}. An argument is a Tensor, "
-        "ModuleRef, ContextRef, Affine, number, str, bytes, enum member, None, or a "
+        "ModuleRef, ContextRef, Affine, Reduced, number, str, bytes, enum member, "
+        "None, or a "
         "tuple of those."
     )
 
