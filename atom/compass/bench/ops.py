@@ -64,8 +64,9 @@ every leaf at every rung of ATOM's decode ladder at the steps' lowest and
 highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
 and each prefill family (`_family`) over a ladder of their token counts, chunk
-remainders among them, one of a kind that depends on context at each over a
-ladder of the cached tokens of steps of its rows; then the point halfway
+remainders among them, one of a kind that depends on context at each at the
+most cached tokens of steps of its rows, and over a ladder of them once those
+points and the fresh ones show the kind still does; then the point halfway
 between two neighbours of a family, or of a prefill leaf's token count over
 cached tokens, that launched different kernels, until they are adjacent. DIR
 gets each round's ops.jsonl in `round<n>`, and every point held in plan.jsonl.
@@ -919,18 +920,35 @@ def plan(store, key, config, run, args, command: str, out: Path) -> None:
         for sig, (op, _) in graphs[shape].items():
             fam, tokens = _family(shape, None, op["op"], sig, dependent)
             seen[fam].setdefault(tokens, (shape, op["op"], sig))
+
+    def cached_ladder(top_only: bool) -> dict:
+        """The points of each prefill family over its rows' cached tokens, of
+        a kind `_dependent` reads as depending on context: only the most, its
+        reading's far end, while the kind has no cached point to read."""
+        dependent, want = _dependent(done.values()), defaultdict(set)
+        for at in seen.values():
+            for tokens in _ladder(at):
+                shape, op, sig = at[tokens]
+                ladder = _ladder(cached[shape.seqs])
+                for c in ladder[-1:] if top_only else ladder:
+                    fam = _family(shape, c, op, sig, dependent)[0]
+                    if c and _cut(fam):
+                        want[shape, c].add(fam)
+        return want
+
     for fam, at in seen.items():
         for tokens in _ladder(at):
-            shape, op, sig = at[tokens]
-            want[shape, None].add(fam)
-            for c in _ladder(cached[shape.seqs]) if _cut(fam) else ():
-                if c:
-                    want[shape, c].add(_family(shape, c, op, sig, dependent)[0])
+            want[at[tokens][0], None].add(fam)
+    for point, fams in cached_ladder(top_only=True).items():
+        want[point] |= fams
     n = 1
     while want:
         measure_round(want, n)
         n += 1
-        want = _densify(_families(done.values(), _dependent(done.values())), tried)
+        want = cached_ladder(top_only=False) if n == 2 else {}
+        want = want or _densify(
+            _families(done.values(), _dependent(done.values())), tried
+        )
     (out / "plan.jsonl").write_text(
         "".join(json.dumps(r) + "\n" for r in done.values())
     )
@@ -1065,11 +1083,12 @@ def _abstract(value, n: int):
 def _family(shape, context, op: str, sig: str, dependent: dict):
     """The family a leaf's point belongs to, and where on its axis: a decode
     leaf at its width over context; a prefill leaf over its tokens, at its rows
-    and cached tokens too when its kind depends on context."""
+    and cached tokens too when its kind depends on context, as its prefill
+    points read it, else its decode points, else by default."""
     if shape.phase == "decode":
         return json.dumps([str(shape), sig]), context
     leaf = _abstract(json.loads(sig), shape.tokens)
-    if not dependent.get(op, True):
+    if not dependent.get(("prefill", op), dependent.get(op, True)):
         return json.dumps(["prefill", None, leaf], sort_keys=True), shape.tokens
     fam = ["prefill", shape.seqs, leaf, context or 0]
     return json.dumps(fam, sort_keys=True), shape.tokens
@@ -1082,20 +1101,23 @@ def _cut(fam: str):
     return (json.dumps(base, sort_keys=True), cached) if len(base) == 3 else None
 
 
-def _dependent(records) -> dict[str, bool]:
-    """Whether each leaf kind timed at two contexts of one width depends on
-    context: its kernels or its cold times differ there."""
+def _dependent(records) -> dict:
+    """Whether each leaf kind timed at two contexts of one shape depends on
+    context: its kernels or its cold times differ there. A decode kind, read
+    at two row contexts, is keyed by its name; a prefill kind, read fresh and
+    over cached tokens, by ``("prefill", name)``."""
     by = defaultdict(list)
     for r in records:
-        if "refused" not in r and r["shape"].startswith("decode"):
-            by[r["op"], r["shape"], r["leaf"]].append(r)
+        if "refused" not in r:
+            kind = r["op"] if r["shape"].startswith("decode") else ("prefill", r["op"])
+            by[kind, r["shape"], r["leaf"]].append(r)
     kinds = {}
-    for (op, *_), points in by.items():
+    for (kind, *_), points in by.items():
         if len(points) > 1:
             cold = [p["cold_ns"] for p in points]
             kernels = {tuple(p["kernels"]) for p in points}
             moved = max(cold) - min(cold) > CONTEXT_MOVES * max(cold)
-            kinds[op] = kinds.get(op, False) or moved or len(kernels) > 1
+            kinds[kind] = kinds.get(kind, False) or moved or len(kernels) > 1
     return kinds
 
 
