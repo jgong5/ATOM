@@ -60,6 +60,11 @@ def _load(file, name):
     return module
 
 
+def _storage(ptr, nbytes, cuda=True):
+    held = SimpleNamespace(data_ptr=lambda: ptr, nbytes=lambda: nbytes)
+    return SimpleNamespace(is_cuda=cuda, untyped_storage=lambda: held)
+
+
 def _rapidserve_runner(monkeypatch, warmups):
     """The RapidServe reading runner, on stand-ins for ATOM's two runners that
     bind and warm up as theirs do."""
@@ -79,6 +84,8 @@ def _rapidserve_runner(monkeypatch, warmups):
             warmups.append(self.forward(SimpleNamespace(total_tokens_num=8)))
 
         def import_model_weight_ipc_handles(self, paths):
+            # Prefill's storage, 3 bytes, replaces decode's meta parameter.
+            self.model.parameters = lambda: [_storage(2, 3)]
             return True
 
         def _read_device_memory(self):
@@ -126,7 +133,8 @@ def test_decode_writes_its_readings_beside_prefills(tmp_path, monkeypatch, decod
 
 def test_decode_reads_the_device_once_it_holds_prefills_weights(monkeypatch):
     # ATOM's decode sizes no pool, so nothing in it reads the device; and it
-    # warms up nothing, so its peak is where it stands.
+    # warms up nothing, so its peak is where it stands. The device-wide
+    # reading holds the storage it imported, which its weights count.
     runner = _rapidserve_runner(monkeypatch, [])
     reading = sys.modules["atom.compass.drive.memory_runner"]
     stats = {"current": 5, "peak": 9}
@@ -134,11 +142,16 @@ def test_decode_reads_the_device_once_it_holds_prefills_weights(monkeypatch):
     monkeypatch.setattr(
         torch.cuda, "reset_peak_memory_stats", lambda: stats.update(peak=5)
     )
-    runner._read = {}
+    own = _storage(1, 2)
+    runner.model = SimpleNamespace(
+        parameters=lambda: [_storage(0, 3, cuda=False)], buffers=lambda: [own]
+    )
+    runner._read = {"weights": 2}
 
     assert runner.import_model_weight_ipc_handles(["handles"]) is True
 
-    assert runner._read == {"total": 100, "non_torch": 7, "current": 5, "peak": 5}
+    read = {"weights": 2, "total": 100, "non_torch": 4, "current": 5, "peak": 5}
+    assert runner._read == read
 
 
 #: A RapidServe decode rank's readings: no warmup, so no activations, and the
