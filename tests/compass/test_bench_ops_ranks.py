@@ -341,6 +341,17 @@ def test_two_kernels_of_a_collective_densify_to_the_rows_halfway():
     assert want == {(prefill(17, 1), None): {fam}}
 
 
+def test_a_collective_halves_only_a_kernel_switch_not_a_bend():
+    # 26 at 2048 bytes against 19.3 on the line from 256 to 4096, one kernel.
+    fam = ops.exchange(json.loads(_sig(1)))[0]
+    points = [
+        (256 * w, ("one",), {"shape": str(decode(w)), "context": 20, "cold_ns": ns})
+        for w, ns in ((1, 10.0), (8, 26.0), (16, 30.0))
+    ]
+
+    assert ops._densify({fam: points}, set()) == {}
+
+
 def test_fit_ops_prices_a_collective_between_two_message_sizes():
     points = []
     for rows, ns in ((1, 10.0), (3, 30.0)):
