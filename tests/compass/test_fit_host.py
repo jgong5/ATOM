@@ -7,6 +7,7 @@ import json
 import re
 
 import pytest
+from test_fit_samples import edit
 from test_fit_steps import (  # noqa: F401
     DIGEST,
     clients,
@@ -23,6 +24,7 @@ from atom.compass import run as compass_run
 from atom.compass.artifacts import Key, Kind
 from atom.compass.backends.step_labels import digest
 from atom.compass.backends.step_linear_fit import fit_host, label_records
+from atom.compass.drive.aiter_jit import BUILDS
 
 
 def host_laws_key(key) -> Key:
@@ -69,6 +71,16 @@ def test_a_record_without_its_host_key_refuses(tmp_path):
     a = record(tmp_path / "a", 19, keyed=False)
 
     named = f"{digest(a / 'steps/dp0.jsonl')} holds steps with no host labels under a host key"
+    with pytest.raises(SystemExit, match=re.escape(named)):
+        fit(tmp_path, "fit host", a, *clients(a))
+    assert not (tmp_path / "store").exists()
+
+
+def test_a_record_whose_server_built_an_aiter_module_refuses_naming_it(tmp_path):
+    a = record(tmp_path / "a", 19)
+    edit(a / "run.json", lambda r: r.update({BUILDS: ["mha_varlen_fwd"]}))
+
+    named = f"{a} is not fitted: aiter ran a JIT build of ['mha_varlen_fwd'] while"
     with pytest.raises(SystemExit, match=re.escape(named)):
         fit(tmp_path, "fit host", a, *clients(a))
     assert not (tmp_path / "store").exists()

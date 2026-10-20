@@ -68,6 +68,17 @@ def builds_since(since_ns: int) -> dict:
     return {BUILDS: sorted(built)} if built else {}
 
 
+def refusal(run: dict) -> str | None:
+    """Why grading, a fit or `validate.cost` refuses a record whose run.json is
+    `run`, naming the modules of its `BUILDS`; None when it names none."""
+    if builds := run.get(BUILDS):
+        return (
+            f"aiter ran a JIT build of {builds} while its server served, "
+            "so a step may have waited on it"
+        )
+    return None
+
+
 def main(argv=None) -> None:
     run_json, since_ns = sys.argv[1:] if argv is None else argv
     run = json.loads(Path(run_json).read_text()) | builds_since(int(since_ns))
