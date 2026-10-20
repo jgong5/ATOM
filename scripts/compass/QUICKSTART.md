@@ -109,7 +109,7 @@ container, entered with `docker exec -it ${USER}_compass_gpu bash`.
   aiter's JIT directory, `/app/aiter-test/aiter/jit`, holds the image's prebuilt
   modules, so it stays in the container's layer on Docker's storage disk
   (`docker info -f '{{.DockerRootDir}}'`), gaining each module a server builds,
-  a few MB. Keep data off the root disk. When no disk has room for the data
+  10 MB for step 0's. Keep data off the root disk. When no disk has room for the data
   directory, as on node 18 while `/data` reads full, use the host's tmpfs, such
   as `/tmp/<user>_compass`: memory, lost at reboot, its files written as root,
   so copy out what should stay and remove the rest from inside the container.
