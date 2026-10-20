@@ -50,6 +50,8 @@ their own client venv (QUICKSTART's recipe) in the data directory.
   shared objects the engine loads. A tmpfs is memory: it is lost at reboot, so
   copy out what should stay.
 - The writable layer then takes aiter's built modules and aiperf's bytecode:
-  20 MB through step 0 of a node-18 run on 2026-10-20, when `/root/.aiter`, now
-  on tmpfs, held 227 MB. Step 0 takes the container's builds; a later record
-  that builds one is refused by grading.
+  22 MB through step 0, run on 2026-10-20 in a fresh container with these
+  options (14 MB of aiter's one build, `mha_varlen_fwd`, and 6 MB of
+  bytecode), while the tmpfs `/root/.aiter` held 222 MB and `/root/.cache`
+  400 MB. Step 0 takes the container's builds; a later record that builds one
+  is refused by grading.
