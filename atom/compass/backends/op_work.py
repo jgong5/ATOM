@@ -52,7 +52,6 @@ from atom.compass.backends.work import (
     ELEMENT_BYTES,
     Collective,
     Work,
-    _wider,
     activated_experts,
     all_to_all,
     allgather,
