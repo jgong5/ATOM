@@ -21,8 +21,9 @@ rank each of the layout the arguments resolve (`ranks`), its weights a dummy,
 through ATOM's warmup, and a `Stub` takes the place of the model's forward.
 Each point reaches the runner as a batch (`ReplayRule`), so ATOM builds its
 metadata and forward context, and the stub calls each leaf from its contract:
-an activation is random at its shape, dtype and stride; a weight is a tensor of the model of that shape, dtype and stride; a metadata tensor is a
-view of ATOM's live metadata (`meta`), whose name the point records, or of
+an activation is random at its shape, dtype and stride; a weight is a tensor
+of the model of that shape, dtype and stride; a metadata tensor is a view of
+ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM passes the forward (`TOKEN_IDS`); an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names. A leaf whose operator cannot run so
@@ -149,6 +150,7 @@ def main(argv: list[str]) -> None:
     from atom.compass.drive.gpu import hip_visible, quiet
     from atom.compass.drive.identity import identity
     from atom.compass.run.step_grid import keyed
+    from atom.model_engine.arg_utils import EngineArgs
 
     cut = argv.index("--") if "--" in argv else len(argv)
     if "--coverage" in argv[:cut]:
@@ -161,13 +163,17 @@ def main(argv: list[str]) -> None:
         raise ValueError("--plan places every point; name no --width or --prefill")
     if args.context is None and any(s.phase == "decode" for s in shapes):
         raise ValueError("a decode shape needs --context, each row's tokens")
+    engine = EngineArgs.add_cli_args(argparse.ArgumentParser(prog=f"{PROG} --"))
+    engine = engine.parse_args(argv[cut + 1 :])
+    world = engine.tensor_parallel_size * engine.data_parallel_size
+    if world != len(args.gpu):  # DP attention makes each TP rank a DP rank
+        raise ValueError(
+            f"--gpu names {len(args.gpu)} GPUs and ATOM's arguments resolve "
+            f"{world} ranks; the op bench runs one on each"
+        )
     os.environ["HIP_VISIBLE_DEVICES"] = hip_visible(args.gpu)
     config = atom_config(argv[cut + 1 :])
-    if (world := ranks.layout(config)) != len(args.gpu):
-        raise ValueError(
-            f"ATOM's arguments resolve {world} ranks and --gpu names "
-            f"{len(args.gpu)} GPUs; the op bench runs a rank on each"
-        )
+    ranks.layout(config)
     if config.compilation_config.level:
         raise ValueError(
             f"--level {config.compilation_config.level} compiles the model, whose "
@@ -636,7 +642,8 @@ def _meta(spec, slot, live) -> tuple[str, torch.Tensor]:
 
 
 def _function(name: str):
-    """The callable a leaf names: `ns.op.overload`, or a lifted `module:qualname`."""
+    """The callable a leaf names: `ns.op.overload`, or a lifted `module:qualname`;
+    a functional collective waited on, as the in-place one ATOM calls is."""
     if ":" in name:
         module, qualname = name.split(":")
         fn, path = importlib.import_module(module), qualname.split(".")
@@ -645,6 +652,9 @@ def _function(name: str):
         fn, path = getattr(torch.ops, namespace), rest.split(".")
     for attr in path:
         fn = getattr(fn, attr)
+    if name.startswith(COLLECTIVES) and name.startswith("_c10d_functional."):
+        wait = torch.ops._c10d_functional.wait_tensor
+        return lambda **kwargs: wait(fn(**kwargs))
     return fn
 
 

@@ -18,9 +18,9 @@ the GEMMs of a decode step differ in N and K and share a family per weight.
 
 A family's points sit at the shape's counts, B and the context for a decode,
 T and B for a prefill. A collective's points name their family themselves,
-`measure ops`'s `exchange`, and sit at their message bytes. `interpolate` prices a query at a measured point as
-that point; between points, multilinearly over the neighbours that bracket it
-along each dimension, when they all launched the same kernels. It declines
+`measure ops`'s `exchange`, and sit at their message bytes. `interpolate`
+prices a query at a measured point as that point; between points,
+multilinearly over the neighbours that bracket it along each dimension, when they all launched the same kernels. It declines
 any other query: outside the measured range, with a neighbour missing, or
 between neighbours that launched different kernels, naming the dimension, the
 neighbours and their first differing kernel.
