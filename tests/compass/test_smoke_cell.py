@@ -111,12 +111,13 @@ def test_the_path_runs_in_order_and_ends_with_the_cell_s_verdict(tmp_path):
     machine = f"--machine {tmp_path}/spec.json --store {o}/store"
     cal = f"{o}/calibration --client-run {o}/calibration {o}/calibration/artifacts/client_run.json"
     client = "--concurrency 1 --duration 600 --stop"
+    calibration = client.replace("--concurrency 1", "--concurrency 4")
     assert log == [
         f"measure memory --gpu 7 {machine} --out {o}/memory",
         f"record --gpu 7 --out {o}/warm",
         f"client {o}/warm --traces 0-7 {client} /real/python",
         f"record --gpu 7 --out {o}/calibration",
-        f"client {o}/calibration --traces 256-263 {client} /real/python",
+        f"client {o}/calibration --traces 256-263 {calibration} /real/python",
         f"fit steps --backend step-linear --form history {cal} {machine} --out {o}/fit_steps",
         f"fit host {cal} {machine} --out {o}/fit_host",
         f"record --gpu 7 --out {o}/cell/real1",

@@ -12,6 +12,9 @@
 # once, so that it takes the aiter JIT builds a fresh container meets while
 # serving, which grading, the fits and `validate.cost` refuse in a record
 # (run.json's `aiter_jit_builds`).
+# Calibration runs at concurrency 4: its traces start at a first request and batch
+# nothing alone, the cell's start mid-session and batch up to 4 requests a step,
+# and the law has a decode vector only for batch sizes calibration took.
 #
 # Usage: smoke_cell.sh MODEL OUT
 #   MODEL           the model directory: config.json, tokenizer and weights
@@ -50,7 +53,7 @@ MACHINE=$(realpath "${MACHINE:?MACHINE names the machine spec of the GPUs}")
 : "${TRACES:?TRACES names a cc-traces traces.jsonl}"
 : "${HARNESS_PYTHON:?HARNESS_PYTHON names the Python with compass-harness}"
 : "${AIPERF_PYTHON:?AIPERF_PYTHON names the Python without compass-harness}"
-N=${N_TRACES:-8} DURATION_S=${DURATION_S:-600} WAIT_S=${WAIT_S:-1800}
+N=${N_TRACES:-8} DURATION_S=${DURATION_S:-600} WAIT_S=${WAIT_S:-1800} C=1
 # shellcheck disable=SC2206 # SERVER_ARGS is a word list
 ATOM_ARGS=(--model "$MODEL" ${SERVER_ARGS:---max-model-len 262144})
 CLI='from atom.compass.cli import main; main()'
@@ -82,7 +85,8 @@ step() {
 }
 
 # serve NAME DIR A-B PYTHON COMMAND...: one compass server writing to DIR, one
-# client run of traces A to B under PYTHON, which stops the server.
+# client run of traces A to B at concurrency C (1 unless set) under PYTHON, which
+# stops the server.
 serve() {
     local name=$1 dir=$2 traces=$3 python=$4 pid deadline
     shift 4
@@ -96,7 +100,7 @@ serve() {
         sleep 1
     done
     HARNESS_PYTHON=$python "$ROOT/scripts/compass/client.sh" "$dir" --traces "$traces" \
-        --concurrency 1 --duration "$DURATION_S" --stop >"$OUT/$name.client.log" 2>&1 ||
+        --concurrency "$C" --duration "$DURATION_S" --stop >"$OUT/$name.client.log" 2>&1 ||
         fail "$name" "client.sh exit $?; see $OUT/$name.client.log"
     wait $pid || fail "$name" "its server exit $?; see $OUT/$name.log"
 }
@@ -108,7 +112,7 @@ M=(--machine "$MACHINE" --store "$OUT/store")
 CAL=256-$((255 + N)) CELL=0-$((N - 1))
 step memory python3 -c "$CLI" measure memory --gpu "$GPU" "${M[@]}" --out "$OUT/memory" -- "${ATOM_ARGS[@]}"
 serve warm "$OUT/warm" "$CELL" "$AIPERF_PYTHON" record --gpu "$GPU"
-serve calibration "$OUT/calibration" "$CAL" "$AIPERF_PYTHON" record --gpu "$GPU"
+C=4 serve calibration "$OUT/calibration" "$CAL" "$AIPERF_PYTHON" record --gpu "$GPU"
 RUNS=(--client-run "$OUT/calibration" "$OUT/calibration/artifacts/client_run.json")
 step fit_steps python3 -c "$CLI" fit steps --backend step-linear --form history \
     "$OUT/calibration" "${RUNS[@]}" "${M[@]}" --out "$OUT/fit_steps"
