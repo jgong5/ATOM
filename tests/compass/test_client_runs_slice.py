@@ -29,11 +29,11 @@ from test_vertical_slice import (
     TREE,
     WALL_S,
     Traffic,
-    _free_port,
     _run_file,
 )
 
 from atom.compass import run as compass_run
+from atom.compass.drive.serve import _free_ports
 
 PROMPTS = ("one request through the slice", "a second client with its own prompt")
 
@@ -55,8 +55,9 @@ def serve(out: Path, prompts) -> list[dict]:
     run's summary, and its stream events and request times less its start."""
     out.mkdir()
     overrides = {"client_runs": len(prompts)} if len(prompts) > 1 else {}
-    run_file = _run_file(out, **overrides)
-    port = _free_port()
+    clock_port, port = _free_ports(2)
+    endpoint = f"tcp://127.0.0.1:{clock_port}"
+    run_file = _run_file(out, clock_endpoint=endpoint, **overrides)
     env = dict(
         os.environ,
         PYTHONPATH=str(TREE),

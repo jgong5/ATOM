@@ -66,7 +66,7 @@ its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, and a law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
-holds at its shape, the run's TP width and KV cache format; capture traces
+holds at its shape and output, the run's TP width and KV cache format; capture traces
 eager forwards, so a graph-mode run reads the eager graphs too),
 ``step_roofline`` (optional, ``true`` or ``false``: with ``true`` a
 `StepRooflineBackend` prices the steps the backend refuses, through
@@ -1478,18 +1478,18 @@ def runner(model_runner, tree) -> None:
 
 def _op_graphs(root: str, config, arch: str):
     """The region of the eager `op_graph` of `config` on an `arch` device the
-    store at `root` holds at a shape, or None."""
+    store at `root` holds at a shape, of a step that produces output or one
+    that does not, or None."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
     from atom.compass.capture.forward import Shape, structure
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
 
     @functools.lru_cache(maxsize=64)
-    def graph(phase: str, tokens: int, seqs: int) -> dict | None:
+    def graph(phase: str, tokens: int, seqs: int, output: bool = True) -> dict | None:
         shape = str(Shape(phase, tokens, seqs))
-        key = Key.of(
-            Kind.OP_GRAPH, structure=structure(config, phase, True, arch), shape=shape
-        )
+        at = structure(config, phase, True, arch, output)
+        key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
         if not store.directory_for(key).exists():
             return None
         return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
