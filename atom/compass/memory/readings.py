@@ -59,7 +59,8 @@ from atom.compass.memory.terms import Reading, Term, spec_term
 #: What one rank's member of a `memory_readings` entry holds, in bytes but for
 #: `warmup_tokens` and `record`: an engine start's readings (`compass measure
 #: memory`), with the activation coefficient as `activation_bytes` over
-#: `warmup_tokens`, `cudagraph_pool_bytes` null for an engine that captures
+#: `warmup_tokens` (0 over none for an engine that warms up nothing, as
+#: RapidServe's decode), `cudagraph_pool_bytes` null for an engine that captures
 #: nothing, and `record` the digest of the start's log, as
 #: `python -m atom.compass.memory.check` names a run.
 ENTRY_FIELDS = (
@@ -184,7 +185,9 @@ class MemoryReadings:
             if name == "record":
                 whole = isinstance(value, str) and value.startswith("sha256:")
             elif whole:
-                whole = value >= (name == "warmup_tokens")
+                # An engine that warms up nothing reads no activations.
+                warm = name == "warmup_tokens" and member["activation_bytes"] != 0
+                whole = value >= warm
             if not (whole or (value is None and name == "cudagraph_pool_bytes")):
                 raise MemoryRefusal(
                     f"{source} holds {name} {value!r}, which is no reading",

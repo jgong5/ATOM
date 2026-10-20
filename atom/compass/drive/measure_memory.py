@@ -6,16 +6,16 @@ its configuration's `memory_readings` entry.
 
 ATOM's engine starts from ATOM's arguments (`EngineArgs`) on the GPUs `--gpu`
 names, through `MemoryReadingModelRunner` (under `--enable-rapidserve` its
-RapidServe form, whose prefill engine writes the readings), and stops once it
-has started: its weights loaded, its one warmup run, its KV cache sized and its
-graphs captured. `gpu.quiet` checks those GPUs before the start and, once
-every process of the start has exited, after it. Each rank writes its readings
-and the key it read off its resolved config, and the ranks must agree on the
-key. The entry's key is that one with the digest of the machine spec `--machine`
-names; its conditions are that spec's device and stack, torch included. A
-`--gpu` whose device or PTL state is not the spec's, or a stack the spec does
-not pin, refuses before the start, so no entry measured on another card or
-stack is keyed by that spec.
+RapidServe form, whose decode engine writes its own readings beside prefill's),
+and stops once it has started: its weights loaded, its one warmup run, its KV
+cache sized and its graphs captured. `gpu.quiet` checks those GPUs before the
+start and, once every process of the start has exited, after it. Each rank
+writes its readings and the key it read off its resolved config, and the ranks
+must agree on the key. The entry's key is that one with the digest of the
+machine spec `--machine` names; its conditions are that spec's device and
+stack, torch included. A `--gpu` whose device or PTL state is not the spec's,
+or a stack the spec does not pin, refuses before the start, so no entry
+measured on another card or stack is keyed by that spec.
 `non_torch` refuses a spread across the ranks above `SPREAD_LIMIT`. One member per rank
 holds `memory.ENTRY_FIELDS`, its `record` the digest of the engine's log.
 `--beside` names a command the start runs first in the engine's session, such
@@ -29,7 +29,8 @@ more, on the cache it warmed: what autotuning or a fresh compile left loaded
 reads in `non_torch`. A second such start refuses.
 
 ``--out`` gets the engine's log, run.json's identity from the rank-0 engine
-file, and ``memory_readings.json``, the entry's readable copy. ATOM's
+file, and ``memory_readings.json``, the entry's readable copy (a RapidServe
+decode entry's in ``memory_readings.decode.json``). ATOM's
 ``--load_dummy`` refuses until its readings are shown to match a real load's.
 """
 
@@ -75,6 +76,8 @@ RAPIDSERVE_RUNNER = (
 LOAD_DUMMY = "--load-dummy"
 START_TIMEOUT_S = 3600
 LOG, READINGS = "engine.log", "readings"
+#: Where in `READINGS` a RapidServe decode engine writes its readings.
+DECODE = "decode"
 
 
 def start(argv: list[str]) -> None:
@@ -174,7 +177,7 @@ def main(argv: list[str], again: bool = False) -> None:
         # the next start finds both cached.
         out.rename(f"{out}.cold")
         return main(argv, again=True)
-    first = json.loads(min((out / READINGS).iterdir()).read_text())
+    first = json.loads(min((out / READINGS).glob("*.json")).read_text())
     (out / "engine.json").write_text(json.dumps(first["engine"]))
     identified = identity(out / "engine.json", model, sys.argv, args.gpu)
     _write_whole(out / "run.json", json.dumps(identified))
@@ -184,8 +187,8 @@ def main(argv: list[str], again: bool = False) -> None:
 def _cold(out: Path) -> list[str]:
     """The ranks' files in `out` whose start autotuned a kernel or missed a graph."""
     return [
-        p.name
-        for p in sorted((out / READINGS).iterdir())
+        str(p.relative_to(out / READINGS))
+        for p in sorted((out / READINGS).rglob("*.json"))
         if (read := json.loads(p.read_text())).get("autotuned_kernels")
         or read.get("fxgraph_cache_misses")
     ]
@@ -193,8 +196,23 @@ def _cold(out: Path) -> list[str]:
 
 def publish(out: Path, machine, store: str, command: str) -> None:
     """Publish the readings the ranks wrote in `out` at their key on `machine`,
-    and write the entry's readable copy."""
-    ranks = {p.name: json.loads(p.read_text()) for p in (out / READINGS).iterdir()}
+    and write the entry's readable copy; then, the same way, those a RapidServe
+    decode engine wrote in `DECODE`, unless their key is prefill's, whose
+    readings size the pool."""
+    published = set()
+    for files, readable in (
+        (out / READINGS, "memory_readings.json"),
+        (out / READINGS / DECODE, f"memory_readings.{DECODE}.json"),
+    ):
+        ranks = {p.name: json.loads(p.read_text()) for p in files.glob("*.json")}
+        keys = {json.dumps(r["key"], sort_keys=True) for r in ranks.values()}
+        # No files, or prefill's key: nothing to add.
+        if not keys <= published:
+            _publish(out, ranks, readable, machine, store, command)
+            published |= keys
+
+
+def _publish(out: Path, ranks: dict, readable: str, machine, store, command) -> None:
     record = "sha256:" + hashlib.sha256((out / LOG).read_bytes()).hexdigest()
     for held in ranks.values():
         held["readings"]["record"] = record
@@ -231,7 +249,7 @@ def publish(out: Path, machine, store: str, command: str) -> None:
     )
     copy = {"key": key.values, "token": key.token()}
     copy["members"] = {name: r["readings"] for name, r in sorted(ranks.items())}
-    (out / "memory_readings.json").write_text(json.dumps(copy, indent=1) + "\n")
+    (out / readable).write_text(json.dumps(copy, indent=1) + "\n")
     print(f"published {key} as {key.token()}")
 
 
