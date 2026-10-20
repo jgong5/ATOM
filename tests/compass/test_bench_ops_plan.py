@@ -45,8 +45,9 @@ def _graph_at(store, config, shape):
 
 
 def _bench(fn, config, todo, llc):
-    """`measure` as a device would time each point: the GEMM by its tokens, the
-    attention by its context, each kernel switching at its threshold."""
+    """`measure` as a device would time each point, a microsecond per unit: the
+    GEMM by its tokens, the attention by its context, each kernel switching at
+    its threshold."""
     assert fn is ops.measure
     _bench.calls += 1
     got = []
@@ -61,7 +62,7 @@ def _bench(fn, config, todo, llc):
                 n, kernel = 1, "gemm"
             got.append(
                 {"shape": str(shape), "context": context, "op": op["op"], "leaf": sig}
-                | {"kernels": [kernel], "cold_ns": float(n)}
+                | {"kernels": [kernel], "cold_ns": n * 1e3}
             )
     return got
 
@@ -257,7 +258,17 @@ def _moving_bench(fn, config, todo, llc):
     got = _bench(fn, config, todo, llc)
     for r in got:
         if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
-            r["cold_ns"] += r["context"] or 0
+            r["cold_ns"] += (r["context"] or 0) * 1e3
+    return got
+
+
+def _two_mode_bench(fn, config, todo, llc):
+    """`_bench` with prefill attention a short kernel that reads in one of two
+    modes, 0.4 us apart, past `CONTEXT_MOVES` between fresh and cached rows."""
+    got = _bench(fn, config, todo, llc)
+    for r in got:
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
+            r["cold_ns"] = 3300.0 if r["context"] else 3700.0
     return got
 
 
@@ -266,6 +277,8 @@ def _moving_bench(fn, config, todo, llc):
     [
         # one kernel and time: only the far end, and round 2 densifies
         (_bench, {None, 8000}, 2, {("aiter.gemm", None)}),
+        # its two modes, under the floor: as one time
+        (_two_mode_bench, {None, 8000}, 2, {("aiter.gemm", None)}),
         # its time grows: round 2 is the ladder alone, densifying after it
         (
             _moving_bench,
@@ -406,7 +419,7 @@ def test_a_ladder_keeps_values_a_step_apart_and_the_largest():
 def test_a_kind_depends_on_context_when_its_times_or_its_kernels_move():
     def point(op, context, ns, kernel):
         record = {"shape": "decode B=2", "context": context, "op": op, "leaf": op}
-        return record | {"cold_ns": ns, "kernels": [kernel]}
+        return record | {"cold_ns": ns * 1e3, "kernels": [kernel]}
 
     records = [
         *(point("state", c, ns, "s") for c, ns in ((1, 10.0), (9, 20.0))),

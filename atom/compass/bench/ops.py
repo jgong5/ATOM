@@ -856,6 +856,11 @@ LADDER_STEP = 1.25
 #: The spread of a leaf's cold times across contexts, over the largest, past
 #: which its kind depends on context; a repeat's spread stays within 4%.
 CONTEXT_MOVES = 0.10
+#: The spread of a leaf's cold times across contexts, in ns, at or under which
+#: its kind does not depend on context whatever its share: one 3.5 us
+#: elementwise kernel on MI308X reads in two modes about 0.5 us apart, either
+#: one at any context.
+CONTEXT_FLOOR_NS = 1000
 
 
 def plan(store, key, config, run, args, command: str, out: Path) -> None:
@@ -1103,7 +1108,8 @@ def _cut(fam: str):
 
 def _dependent(records) -> dict:
     """Whether each leaf kind timed at two contexts of one shape depends on
-    context: its kernels or its cold times differ there. A decode kind, read
+    context: its kernels differ there, or its cold times by more than
+    `CONTEXT_MOVES` of the largest and `CONTEXT_FLOOR_NS`. A decode kind, read
     at two row contexts, is keyed by its name; a prefill kind, read fresh and
     over cached tokens, by ``("prefill", name)``."""
     by = defaultdict(list)
@@ -1116,7 +1122,8 @@ def _dependent(records) -> dict:
         if len(points) > 1:
             cold = [p["cold_ns"] for p in points]
             kernels = {tuple(p["kernels"]) for p in points}
-            moved = max(cold) - min(cold) > CONTEXT_MOVES * max(cold)
+            spread = max(cold) - min(cold)
+            moved = spread > max(CONTEXT_MOVES * max(cold), CONTEXT_FLOOR_NS)
             kinds[kind] = kinds.get(kind, False) or moved or len(kernels) > 1
     return kinds
 
