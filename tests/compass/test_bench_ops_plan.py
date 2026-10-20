@@ -14,12 +14,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_artifact_store import CONDITIONS, GATES, stanza
 from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
+from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 
 from atom.compass import ir
-from atom.compass.artifacts import ArtifactStore
+from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.bench import ops
-from atom.compass.capture.forward import decode
+from atom.compass.capture.forward import decode, structure
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
 from atom.utils import forward_context as fctx
@@ -32,7 +34,7 @@ CONFIG = SimpleNamespace(
 )
 
 
-def _graph_at(store, config, shape):
+def _graph_at(store, config, shape, arch=None):
     rows = shape.tokens if shape.phase == "prefill" else shape.seqs
     attn = _leaf(
         "aiter.attn",
@@ -181,7 +183,7 @@ def test_coverage_counts_a_step_only_when_every_leaf_sits_in_one_kernel_s_band(
     )
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert (report["steps"], report["covered"]) == (6, 2)
     assert report["by phase"] == {
@@ -244,7 +246,7 @@ def test_a_plan_measures_prefill_attention_over_cached_tokens_and_coverage_reads
     )
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["by phase"] == {"prefill": {"steps": 4, "covered": 2}}
     assert report["left out, by leaf kind"] == {
@@ -304,7 +306,7 @@ def test_a_plan_ladders_cached_tokens_only_for_a_prefill_kind_that_moves_there(
     )
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["by phase"] == {"prefill": {"steps": 2, "covered": covered}}
 
@@ -384,7 +386,7 @@ def test_coverage_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_
     graded = _records(tmp_path / "graded", ([[1, 3000, True]], 2))
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["left out, by leaf kind"] == {
         "aiter.attn": {"outside the measured range": 1}
@@ -510,6 +512,67 @@ def test_an_integer_activation_indexes_a_dimension_of_one():
     index = ops._random(spec, "cpu")
 
     assert torch.zeros(1, 3)[index].shape == (64, 3)
+
+
+def _publish_graph(store, config, arch, shape):
+    """A graph of `shape` keyed on `arch`, its one leaf named for the arch."""
+    key = Key.of(
+        Kind.OP_GRAPH,
+        structure=structure(config, shape.phase, device=arch),
+        shape=str(shape),
+    )
+    leaf = _leaf(f"aiter.{arch}", ("x", _t([shape.seqs, 8], "activation")))
+    store.publish(
+        key,
+        provenance=stanza("compass trace ops"),
+        topology=Topology(),
+        conditions=CONDITIONS,
+        gates=GATES,
+        members={
+            member_name("graph", ops.RANK, "json"): json.dumps(
+                _graph(leaf, layers=1)
+            ).encode()
+        },
+    )
+
+
+@pytest.mark.parametrize("held", [("gfx942", "gfx950"), ("gfx942",)])
+def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
+    tmp_path, monkeypatch, held, model_config  # noqa: F811
+):
+    store = ArtifactStore(str(tmp_path / "store"))
+    for arch in held:
+        _publish_graph(store, model_config, arch, decode(1))
+
+    def no_gpu(*args, **kwargs):
+        raise RuntimeError("No HIP GPUs are available")
+
+    traced = []
+
+    def trace(fn, argv):
+        """`trace ops` as the capture publishes: on the arch `--arch` names."""
+        traced.append(argv[argv.index("--arch") + 1])
+        _publish_graph(store, model_config, traced[-1], decode(1))
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", no_gpu)
+    monkeypatch.setattr(
+        "atom.compass.bench.measure.atom_config", lambda a: model_config
+    )
+    monkeypatch.setattr(ops, "_child", trace)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "plan.jsonl").write_text("")
+    device = {"index": 0, "name": "AMD Instinct MI355X", "arch": "gfx950"}
+    (out / "run.json").write_text(json.dumps({"device": [device]}))
+    graded = _records(tmp_path / "graded", ([[1, 100, True]], 1))
+
+    argv = ["--coverage", graded, "--store", str(store.root), "--out", str(out)]
+    report = ops._coverage_main(argv, [])
+
+    assert report["left out, by leaf kind"] == {
+        "aiter.gfx950": {"no measured point": 1}
+    }
+    assert traced == ([] if "gfx950" in held else ["gfx950"])
 
 
 def _dies(*finished):
