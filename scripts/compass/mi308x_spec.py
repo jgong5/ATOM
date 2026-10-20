@@ -123,15 +123,15 @@ INTAKE = {
 }[NAME]
 #: The intake of a request that finds no other on the loop, on node 18:
 #: `http_intake.py idle` less `INTAKE`'s per-byte rate, over 64 lone requests
-#: (`floor`'s run, GPU 2, 2026-10-20) at the commit named, the record its stamp
+#: (`floor`'s run, GPU 0, 2026-10-20) at the commit named, the record its stamp
 #: file; the band is the p10 and p90 over those requests.
 IDLE = {
     "mi308x-hjbog18": (
         "2026-10-20",
-        "276b5f0dc",
-        0.0004972740363723576,
-        (0.00045064317464686227, 0.0006483709502861491),
-        "c0bbc3155c2927e0527f83977ff5527715f4fc3a13cc9a855fb1270ad0bb346f",
+        "dee1854db",
+        0.0008174736867329385,
+        (0.0007076265928628138, 0.0010018610641255089),
+        "eaaf420687a928940f535d8a3d4e8d449e896c7c155516fad1e3fcacab90d44c",
     ),
 }.get(NAME)
 

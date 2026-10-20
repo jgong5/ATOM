@@ -539,10 +539,12 @@ its real thread took. A request that arrives once the last intake has ended is c
 [#1775](https://github.com/jgong5/ATOM/issues/1775)). In a burst, `fixed_s` is the loop's
 whole time per request: between two template starts the loop also parses the next request
 and finishes earlier ones after their encode (the result, `add_request`, the response
-start). A lone request waits for none of that, only for its own path from the ASGI app call
-to its tokenizer pool job, which `scripts/compass/http_intake.py idle` reads: on node 18
-`idle_s` is 0.50 ms against a `fixed_s` of 2.61 ms. A spec with no `idle_s` charges `fixed_s`
-to every request, and a run file with no machine spec charges nothing. The client's own
+start). A lone request waits for none of that, only for its own path: from the ASGI app call
+to its tokenizer pool job, and from the job's end to its engine send, as
+`scripts/compass/http_intake.py idle` reads it. Both parts are charged at the intake, which
+starts the encode later by the second part and leaves the engine arrival unchanged. On
+node 18 `idle_s` is 0.82 ms against a `fixed_s` of 2.61 ms. A spec with no `idle_s`
+charges `fixed_s` to every request, and a run file with no machine spec charges nothing. The client's own
 send spread is not modelled. The `http` channel's admission delay
 (`channels.py::ADMISSION_DELAY_S`) stays the channel's lookahead and ends at the app call,
 where the idle intake starts, so the two do not overlap. A burst's `fixed_s` holds
