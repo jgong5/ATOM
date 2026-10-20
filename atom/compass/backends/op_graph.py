@@ -127,7 +127,7 @@ class OpGraphBackend(CostBackend):
     def _region(self, view: BatchView) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region."""
         if view.image_tokens:
-            reason = IMAGES.format(view.image_tokens)
+            reason = IMAGES
         elif view.tbo_tokens is not None:
             reason = (
                 "a two-batch-overlap step: no captured graph holds a micro-batch, "
