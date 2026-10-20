@@ -22,7 +22,7 @@ from test_stop_between_client_runs import CLIENT_RUN as UNREFUSED
 from atom.compass import run as compass_run
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import serve
-from atom.compass.validate.runs import CLIENT_RUN, _requests, grade, main
+from atom.compass.validate.runs import ASSUMED, CLIENT_RUN, _requests, grade, main
 
 EXPORT = {
     "request_count": {"unit": "requests", "avg": 3.0},
@@ -722,5 +722,42 @@ def test_a_run_whose_engine_read_an_assumed_memory_reading_is_refused_naming_it(
     real, simulated = _ran(monkeypatch, tmp_path, served, assumed)
 
     named = re.escape(f"its engines read assumed memory_readings members: {[assumed]}")
+    with pytest.raises(ValueError, match=f"sim is not graded: {named}$"):
+        grade(real, simulated)
+
+
+CCTRACES_SIM = HOST | {"step_linear": {}, "client_runs": 1}
+
+
+@pytest.mark.parametrize(
+    "layout, run, sides",
+    [
+        ("whole", CCTRACES_SIM, [""]),
+        ("export", CCTRACES_SIM, [""]),
+        ("1p1d", CCTRACES_SIM | {"router_s": 0.0, "kv_write_req_s": 0.0}, ["-P", "-D"]),
+    ],
+    ids=["whole", "export", "1p1d"],
+)
+def test_a_cctraces_sim_cell_whose_engine_read_an_assumed_member_is_refused_naming_it(
+    tmp_path, layout, run, sides
+):
+    """A cell `cctraces_sim.sh` wrote, with its client run's export or without,
+    or through `pd_sim.sh`, whose run.json is the run file it ran."""
+    cells = _four(tmp_path)
+    *real, simulated = [_recorded(c) for c in cells] if layout == "export" else cells
+    for cell in cells:
+        (cell / "run.json").write_text(json.dumps(run))
+    report = grade(real, simulated)
+
+    def hand_ins(assumed):
+        for side in sides:
+            memory = {"assumed": assumed and f"{assumed}{side}"}
+            engine = simulated / compass_run.LP_FILE.format(f"engine{side}")
+            engine.write_text(json.dumps({"refusals": [], "memory": memory}))
+
+    hand_ins(None)
+    assert grade(real, simulated) == report
+    hand_ins("copied from MI355X")
+    named = re.escape(ASSUMED.format(sorted(f"copied from MI355X{s}" for s in sides)))
     with pytest.raises(ValueError, match=f"sim is not graded: {named}$"):
         grade(real, simulated)
