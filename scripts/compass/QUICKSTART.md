@@ -116,9 +116,10 @@ serve() {
 }
 ```
 
-`client.sh`'s flags and exit codes are in its header. It sends one warmup request
-per lane before the graded window; keep it, since grading refuses a run whose
-warmup is missing or overlaps its graded steps.
+`client.sh`'s flags and exit codes are in its header. Before the graded window
+it runs aiperf's scenario warmup, the one `calib_capture.sh` runs: for each session
+active at a trajectory's sampled start, its last request before it. Grading
+refuses a run whose warmup is missing or overlaps its graded steps.
 
 ## The path
 
@@ -245,7 +246,7 @@ law's accuracy.
 | `fit` refuses `... is not a record directory (no run.json)` | a log file matched `$R/cal/c*` | keep logs outside the record directories |
 | a step of about 60 s early in a real run | aiter builds a kernel on the container's first short prefill over a long history ([#1319](https://github.com/jgong5/ATOM/issues/1319)) | take graded records in a container that has served one before |
 | verdict `coverage report`, `no decode vector for rung N` | the cell decoded more requests at once than any calibration step did (a rung is the batch's captured-graph size) | calibrate at that concurrency or above; #1336's calibration reached no rung 48, so c=256 stayed a coverage report |
-| grading refuses a run: warmup | the client ran with `--no-warmup`, or its warmup overlapped its graded steps | keep `client.sh`'s default warmup |
+| grading refuses a run: warmup | aiperf sent no warmup request, or its warmup overlapped its graded steps | a fresh server and client run |
 | grading refuses a run: fitted on the traces it grades | calibration and cell traces overlap | calibration 256 to 392, cell 0 to 255 |
 | disk full | raw exports keep every prompt | keep `$R` on a data disk with room |
 

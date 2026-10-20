@@ -703,11 +703,11 @@ below, drives one against the server whose `--out` is `OUT`, writes its export,
 `OUT/artifacts/client_run.json`, and stops the command, which stops its server.
 Its header lists its options and the variables it reads: a `run` server's client
 is the Python `cctraces_sim.sh` takes as `HARNESS_PYTHON`, a `record` server's the
-image's aiperf. Both sides start every trajectory at its first turn after a
-warmup, so the cold first forward falls outside the graded window:
-`--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0
---warmup-requests-per-lane 1`, one one-token request per lane before
-profiling. The grace period after the duration stays aiperf's finite default:
+image's aiperf. Both sides run the scenario's own warmup, as `calib_capture.sh`
+does: aiperf starts each trajectory at a sampled point and first sends, for
+each session active there, its last request before that point, so the cold
+first forward and the prefix cache's fill fall outside the graded window.
+The grace period after the duration stays aiperf's finite default:
 `--benchmark-grace-period inf` can hang aiperf's agentic replay after the cutoff,
 waiting on a credit the server no longer holds (upstream, in agentx-harness's
 aiperf).
@@ -744,8 +744,8 @@ Developer checks, outside the `compass` path:
   after step 9, whose bundle it reads from the store the run file names, by key and digest.
 - Check 1: `cctraces_sim.sh` with `RUN_FILE` the `run_file` of
    `$R/cell/c<C>/step_linear/run.json`, `FIRST_SESSION=0 SESSIONS=256
-   CONCURRENCY=<C>`, `SERVER_ARGS="--max-model-len 262144"`, `AIPERF_EXTRA_ARGS` the
-   warmup arguments; then `python -m atom.compass.parity
+   CONCURRENCY=<C>`, `SERVER_ARGS="--max-model-len 262144"` and no
+   `AIPERF_EXTRA_ARGS`; then `python -m atom.compass.parity
    $R/cell/c<C>/step_linear/steps OUT/steps`.
 
 ### The same cell under the step grid

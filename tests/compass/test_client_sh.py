@@ -114,7 +114,7 @@ def _client(*args, env):
         (["--traces", "2-1", "--concurrency", "3"], None, "--traces takes A-B"),
         (["--traces", "1-2"], None, "--traces and --concurrency are required"),
         ([*GOOD, "--duration"], None, "--duration takes whole seconds"),
-        ([*GOOD, "--warm"], None, "unknown argument --warm"),
+        ([*GOOD, "--no-warmup"], None, "unknown argument --no-warmup"),
         (GOOD, "TRACES", "TRACES is not set"),
     ],
 )
@@ -133,12 +133,12 @@ def test_an_out_with_no_server_json_names_it(tmp_path):
     assert done.stderr.startswith(f"client: server: no {out}/server.json")
 
 
-@pytest.mark.parametrize("simulated, warmup", [(True, []), (False, ["--no-warmup"])])
-def test_a_run_file_makes_the_client_simulated(tmp_path, simulated, warmup):
+@pytest.mark.parametrize("simulated", [True, False])
+def test_a_run_file_makes_the_client_simulated(tmp_path, simulated):
     server = SIM if simulated else {k: SIM[k] for k in ("url", "pid")}
     out, env = _setup(tmp_path, server)
     stale = {"ATOM_COMPASS_RUN": "/stale", "ATOM_COMPASS_CLOCK_ENDPOINT": "tcp://h:1"}
-    done = _client(out, *GOOD, *warmup, env=env | stale)
+    done = _client(out, *GOOD, env=env | stale)
     assert done.returncode == 0, done.stdout + done.stderr
 
     argv, aiperf_env, cwd = json.loads((tmp_path / "seen.json").read_text())
@@ -150,7 +150,7 @@ def test_a_run_file_makes_the_client_simulated(tmp_path, simulated, warmup):
     line = " ".join(argv)
     assert "--url 127.0.0.1:40165 " in line and " --concurrency 3 " in line
     assert " --export-level raw " in line
-    assert ("--warmup-requests-per-lane 1" in line) != bool(warmup)
+    assert "--trajectory-start-" not in line and "--warmup-" not in line
     assert sorted(os.listdir(out / "client/traces")) == ["00001.json", "00002.json"]
     assert json.loads((out / "artifacts" / NAME).read_text()) == {
         "requests": {
