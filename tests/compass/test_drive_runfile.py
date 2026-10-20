@@ -432,13 +432,13 @@ def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost
     model = ["--model", str(tmp_path)]
 
     run = runfile.prefill_decode(
-        args, [*model, "-tp", "2", "--enable-dp-attention"], model
+        args, [*model, "-tp", "2", "--enable-dp-attention"], model, "inter_node"
     )
 
     assert "data_parallel_size" not in run
     assert compass_run._widths(run) == (2, 1)
     assert run["router_s"] == DOCUMENT["interconnect"]["router_relay_s"]
-    assert run["kv_link"] == "intra_node"
+    assert run["kv_link"] == "inter_node"
     table = compass_run.channel_table(run)
     lps = {lp.name for lp in table.registry.ids()}
     assert lps == {"traffic", "frontend-P", "engine-P", "frontend-D", "engine-D"}

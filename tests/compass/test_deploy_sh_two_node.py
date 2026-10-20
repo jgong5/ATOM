@@ -6,13 +6,17 @@ simulated deployment's run file does.
 
 The planted pieces are `test_deploy_sh`'s, its `compass` instance standing in
 for `compass record`, and a prefix that stands in for `ssh <node>`: it passes
-its words through a shell again, and a signal to it does not reach them.
+its words through a shell again, and a signal to it does not reach them. It
+can start its command late (`PLANTED_ON_DELAY`), or hang instead of running
+the start or the stop (`PLANTED_ON_HANG`).
 """
 
 import json
+import os
 import signal
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 from test_deploy_sh import ROUTER_ARGS, _until, argv, planted  # noqa: F401
@@ -23,6 +27,10 @@ node=$1
 shift
 echo "$node $*" >>"$PLANTED_ON"
 trap 'exit 143' TERM
+case "$1:${PLANTED_ON_HANG-}" in
+bash:start | kill:kill) sleep 100 & wait $! ;;
+bash:*) sleep "${PLANTED_ON_DELAY:-0}" & wait $! ;;
+esac
 sh -c "$*" &
 wait $!
 """
@@ -41,6 +49,31 @@ def on(tmp_path, planted):  # noqa: F811
 def _on(tmp_path) -> list[str]:
     log = tmp_path / "on.log"
     return log.read_text().splitlines() if log.exists() else []
+
+
+def _gone(pid: int) -> bool:
+    """Whether process `pid` exits within 15 s; a zombie has."""
+    for _ in range(150):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except FileNotFoundError:
+            return True
+        if stat.rsplit(")", 1)[1].split()[0] == "Z":
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _run(words, env, cwd):
+    return subprocess.run(
+        words,
+        env=env,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
 
 
 def _record(tmp_path, on, router=ROUTER_ARGS):
@@ -165,3 +198,123 @@ def test_on_as_the_last_word_exits_2_naming_it_before_anything_starts(
     assert done.returncode == 2, done.stderr
     assert "deploy: --on takes a command prefix" in done.stderr
     assert not (tmp_path / "d").exists()
+
+
+def test_with_on_an_out_a_shell_would_split_exits_2_before_anything_starts(
+    tmp_path, planted, on  # noqa: F811
+):
+    env, _ = planted
+    words = _record(tmp_path, on)
+    words[2] = str(tmp_path / "a b" / "d")
+
+    done = _run(words, env, tmp_path)
+
+    assert done.returncode == 2, done.stderr
+    assert "--on's prefix may parse" in done.stderr
+    assert not (tmp_path / "a b").exists()
+
+
+def test_a_stop_before_the_decode_wrote_its_pid_still_reaches_it_there(
+    tmp_path, planted, on  # noqa: F811
+):
+    env, _ = planted
+    env["PLANTED_ON_DELAY"] = "3"
+    d = tmp_path / "d"
+    script = subprocess.Popen(
+        _record(tmp_path, on), env=env, cwd=tmp_path, stdout=subprocess.PIPE
+    )
+    _until(d / "decode.sh", script)
+    assert not (d / "decode.pid").exists()
+
+    script.send_signal(signal.SIGTERM)
+    script.communicate(timeout=60)
+
+    pid = int((d / "decode.pid").read_text())
+    assert _on(tmp_path) == [f"node-b bash {d}/decode.sh", f"node-b kill -TERM {pid}"]
+    assert _gone(pid)
+
+
+def test_a_prefix_that_never_starts_the_decode_fails_in_prefix_s(
+    tmp_path, planted, on  # noqa: F811
+):
+    env, _ = planted
+    env |= {"PLANTED_ON_HANG": "start", "PREFIX_S": "2", "WAIT_S": "30"}
+    start = time.monotonic()
+
+    done = _run(_record(tmp_path, on), env, tmp_path)
+
+    assert done.returncode == 1
+    assert "deploy: the decode instance wrote no process id in 2 s" in done.stderr
+    assert time.monotonic() - start < 20
+
+
+def test_a_decode_that_exits_at_once_fails_the_deployment_before_the_prefill_answers(
+    tmp_path, planted, on  # noqa: F811
+):
+    env, _ = planted
+    env["PLANTED_FAIL"] = "decode"
+    # The prefill instance's command starts 30 s late.
+    bindir = tmp_path / "bin"
+    (bindir / "python3").rename(bindir / "python3-planted")
+    (bindir / "python3").write_text(
+        '#!/bin/sh\ncase "$*" in *"/prefill --"*) sleep 30 ;; esac\n'
+        'exec "$(dirname "$0")/python3-planted" "$@"\n'
+    )
+    (bindir / "python3").chmod(0o755)
+    start = time.monotonic()
+
+    done = _run(_record(tmp_path, on), env, tmp_path)
+
+    assert done.returncode == 1
+    assert "deploy: the decode instance exited before it answered" in done.stderr
+    assert time.monotonic() - start < 20
+
+
+def test_a_stop_whose_prefix_hangs_gives_up_after_prefix_s(
+    tmp_path, planted, on  # noqa: F811
+):
+    env, _ = planted
+    env |= {"PLANTED_ON_HANG": "kill", "PREFIX_S": "2", "WAIT_S": "5"}
+    d = tmp_path / "d"
+    script = subprocess.Popen(
+        _record(tmp_path, on),
+        env=env,
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    _until(d / "server.json", script)
+
+    script.send_signal(signal.SIGTERM)
+    try:
+        _, err = script.communicate(timeout=60)
+    finally:
+        # The decode instance the stop never reached.
+        os.kill(int((d / "decode.pid").read_text()), signal.SIGKILL)
+
+    assert script.returncode == 1
+    assert "killed after 5 s" in err
+
+
+def test_a_stop_as_server_json_appears_stops_the_deployment_whole(
+    tmp_path, planted  # noqa: F811
+):
+    env, flags = planted
+    # `mv` holds 2 s once it has put server.json in place.
+    mv = tmp_path / "bin" / "mv"
+    mv.write_text(
+        '#!/bin/sh\n/bin/mv "$@" || exit\ncase "$2" in */server.json) sleep 2 ;; esac\n'
+    )
+    mv.chmod(0o755)
+    d = tmp_path / "d"
+    script = subprocess.Popen(
+        argv(tmp_path, flags), env=env, cwd=tmp_path, stdout=subprocess.PIPE
+    )
+    _until(d / "server.json", script)
+
+    script.send_signal(signal.SIGTERM)
+    out, _ = script.communicate(timeout=60)
+
+    assert script.returncode == 0, out
+    assert (d / "run.json").exists()

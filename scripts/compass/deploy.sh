@@ -25,6 +25,8 @@
 #   ATOMESH        the router binary (default atomesh)
 #   WAIT_S         seconds each instance and the router have to answer, and
 #                  the deployment to leave once stopped (default 600)
+#   PREFIX_S       seconds --on's prefix has to start the decode's command,
+#                  and to send it a stop (default 60)
 #
 # OUT gets run_file.json, the deployment's one run file, built from the run
 # flags and both sides' ATOM arguments (`runfile.prefill_decode`), whose
@@ -47,8 +49,10 @@
 # and the KV link is then inter_node, else intra_node. Each instance runs its
 # command, OUT/<side>.sh, which first writes its process id to OUT/<side>.pid;
 # the decode's as `PREFIX bash OUT/decode.sh`, stopped as `PREFIX kill -TERM
-# <pid>`, words a shell may parse again. That node sees OUT, this tree and the
-# caller's directory at their paths, and, simulated, this node's 127.0.0.1.
+# <pid>`, a second command under the first, so srun inside an allocation takes
+# --overlap. A shell may parse those words again, so OUT, this tree and the
+# caller's directory must be paths `printf %q` leaves as they are. That node
+# sees them at their paths, and, simulated, this node's 127.0.0.1.
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -83,11 +87,15 @@ done
 [[ $seen == " prefill decode router" ]] || bad "--prefill --, --decode -- and --router -- come once each, in that order"
 [[ " ${prefill[*]} ${decode[*]} " != *" --kv-transfer-config"* ]] || bad "an instance's ATOM arguments carry --kv-transfer-config, which the script fills"
 [[ $cmd == record || " ${router[*]} " != *" --dp-aware "* ]] || bad "the router's arguments carry --dp-aware, which has the router choose among DP ranks, and this deployment's router has one worker per side"
+for path in "$(realpath -m "$OUT")" "$ROOT" "$PWD"; do
+    ((${#on[@]} == 0)) || [[ $(printf %q "$path") == "$path" ]] || bad "--on's prefix may parse $path again, which a shell would split or expand"
+done
 mkdir -p "$OUT"
 [[ -z $(ls -A "$OUT") ]] || bad "$OUT holds an earlier deployment's files"
 OUT=$(realpath "$OUT")
 ATOMESH=${ATOMESH:-atomesh}
 WAIT_S=${WAIT_S:-600}
+PREFIX_S=${PREFIX_S:-60}
 KV_LINK=intra_node
 ((${#on[@]} == 0)) || KV_LINK=inter_node
 
@@ -150,8 +158,18 @@ EOF
 # Its last line; an import may print before it.
 read -r ROUTER_PORT PROMETHEUS_PORT PREFILL_KV_PORT DECODE_KV_PORT CLOCK_PORT <<<"${ports##*$'\n'}"
 
+decode_pid() { # the decode's command's process id, waiting up to PREFIX_S while its prefix runs
+    local deadline=$((SECONDS + PREFIX_S))
+    until [[ -s $OUT/decode.pid ]]; do
+        [[ -n ${D-} ]] && kill -0 "$D" 2>/dev/null && ((SECONDS < deadline)) || return 1
+        sleep 0.2
+    done
+    cat "$OUT/decode.pid"
+}
 stop_decode() { # SIGTERM the decode instance's command, through its prefix
-    [[ ! -s $OUT/decode.pid ]] || "${on[@]}" kill -TERM "$(<"$OUT/decode.pid")" 2>/dev/null || true
+    local pid
+    pid=$(decode_pid) || return 0
+    timeout "$PREFIX_S" "${on[@]}" kill -TERM "$pid" </dev/null 2>/dev/null || true
 }
 trap 'stop_decode; kill $(jobs -p) 2>/dev/null || true' EXIT
 authority=
@@ -182,10 +200,11 @@ instance() { # SIDE KV_ROLE KV_PORT: write the instance's command, OUT/SIDE.sh, 
     printf ' %q' python3 -c 'from atom.compass.cli import main; main()' "${command[@]}" >>"$OUT/$1.sh"
     "${prefix[@]}" bash "$OUT/$1.sh" >"$OUT/$1.log" 2>&1 &
 }
-url() { # SIDE PID: the instance's URL, once its server.json names it
+url() { # SIDE: the instance's URL, once its server.json names it, while both instances run
     local deadline=$((SECONDS + WAIT_S))
     until [[ -s $OUT/$1/server.json ]]; do
-        kill -0 "$2" 2>/dev/null || fail "the $1 instance exited before it answered; see $OUT/$1.log"
+        kill -0 $P 2>/dev/null || fail "the prefill instance exited before it answered; see $OUT/prefill.log"
+        kill -0 $D 2>/dev/null || fail "the decode instance exited before it answered; see $OUT/decode.log"
         ((SECONDS < deadline)) || fail "no $1 instance after $WAIT_S s"
         sleep 1
     done
@@ -195,8 +214,13 @@ instance prefill kv_producer "$PREFILL_KV_PORT"
 P=$!
 instance decode kv_consumer "$DECODE_KV_PORT"
 D=$!
-prefill_url=$(url prefill $P)
-decode_url=$(url decode $D)
+# Its process id first, so that any stop from here on reaches it.
+decode_pid >/dev/null || {
+    kill -0 $D 2>/dev/null || fail "the decode instance exited before it answered; see $OUT/decode.log"
+    fail "the decode instance wrote no process id in $PREFIX_S s; see $OUT/decode.log"
+}
+prefill_url=$(url prefill)
+decode_url=$(url decode)
 
 ROUTER=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --prometheus-port "$PROMETHEUS_PORT"
     --pd-disaggregation --prefill "$prefill_url" --decode "$decode_url" "${router[@]}")

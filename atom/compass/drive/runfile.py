@@ -130,7 +130,7 @@ def build(args, atom_args) -> dict:
     return out
 
 
-def prefill_decode(args, prefill_args, decode_args, kv_link="intra_node") -> dict:
+def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     """The run file `build` builds from `args` for one prefill and one decode
     instance, started with ATOM's arguments `prefill_args` and `decode_args`:
     each side's DP width read from its own, the router's per-request forward
