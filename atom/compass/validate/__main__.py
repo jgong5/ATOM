@@ -192,18 +192,25 @@ def rows(cell) -> list[tuple]:
             f"{cell} holds {len(real)} of real*/; a cell holds two or more real runs"
         )
     (sim,) = simulated
-    if bare := [r.name for r in (*real, sim) if not (r / "run.json").is_file()]:
+    for needed in ("run.json", runs.EXPORT):
+        if bare := [r.name for r in (*real, sim) if not (r / needed).is_file()]:
+            raise ValueError(
+                f"{cell}'s {bare} hold no {needed}; every run of a cell holds one"
+            )
+    # A run `run` wrote grades its first client run, so its summary is that run's.
+    first = sim / CLIENT_DIR.format(0) / SUMMARY_FILE
+    summary_file = first if first.is_file() else sim / SUMMARY_FILE
+    if not summary_file.is_file():
         raise ValueError(
-            f"{cell}'s {bare} hold no run.json; every run of a cell holds one"
+            f"{cell}'s {sim.name} holds no run summary, {SUMMARY_FILE} or "
+            f"{first.relative_to(sim)}; a simulated run holds one"
         )
     run = {r.name: read_json(r / "run.json") for r in (*real, sim)}
     for name, f in run.items():
         refuse_renamed_keys(f, cell / name / "run.json")
     if len({json.dumps(f.get("workload"), sort_keys=True) for f in run.values()}) != 1:
         raise ValueError(f"{cell}'s runs {sorted(run)} ran different workloads")
-    # A run `run` wrote grades its first client run, so its summary is that run's.
-    first = sim / CLIENT_DIR.format(0) / SUMMARY_FILE
-    summary = read_json(first if first.is_file() else sim / SUMMARY_FILE)
+    summary = read_json(summary_file)
     verdict = "coverage report" if summary["coverage_report"] else "graded"
     out = [("cell", "verdict", f"{len(real)} real runs", verdict)]
     out += _runs(real, sim)

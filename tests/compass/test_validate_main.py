@@ -274,7 +274,8 @@ def test_a_run_without_run_json_refuses_naming_it(tmp_path, bare):
     for name in ("real0", "real1"):
         _run(cell / name, [(100, 1000, 100)], refusals=None)
     _run(cell / "step_linear", [(100, 1000, 120.0)])
-    (cell / bare / "run.json").unlink()  # a run still recording has written none
+    # A run `record` or `run` writes holds none until it stops.
+    (cell / bare / "run.json").unlink()
 
     validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
     done = subprocess.run(validate, capture_output=True, text=True, check=False)
@@ -289,6 +290,32 @@ def _cell(cell):
         _run(cell / name, [(100, 1000, 100)], refusals=None)
     _run(cell / "step_linear", [(100, 1000, 120.0)])
     return cell
+
+
+AIPERF = "artifacts/profile_export_aiperf.json"
+NO_EXPORT = f"hold no {AIPERF}; every run of a cell holds one"
+NO_SUMMARY = "summary.json or client-0/summary.json; a simulated run holds one"
+
+
+@pytest.mark.parametrize(
+    "missing, refusal",
+    [
+        (f"real1/{AIPERF}", f"['real1'] {NO_EXPORT}"),
+        (f"step_linear/{AIPERF}", f"['step_linear'] {NO_EXPORT}"),
+        ("step_linear/summary.json", f"step_linear holds no run summary, {NO_SUMMARY}"),
+    ],
+    ids=["real1 export", "step_linear export", "step_linear summary"],
+)
+def test_a_run_still_recording_refuses_naming_it(tmp_path, missing, refusal):
+    """`cctraces_sim.sh` writes run.json before its server starts, and the
+    export and run summary once its client and server have ended."""
+    cell = _cell(tmp_path / "c4")
+    (cell / missing).unlink()
+
+    validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
+    done = subprocess.run(validate, capture_output=True, text=True, check=False)
+
+    assert (done.returncode, done.stderr) == (1, f"{cell}'s {refusal}\n")
 
 
 def test_a_malformed_run_json_refuses_naming_it(tmp_path):
