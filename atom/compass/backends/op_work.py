@@ -20,7 +20,7 @@ so one call prices every instance of a signature at a view.
 
 Aten operators share one extractor, whose F is `torch.utils.flop_counter`'s
 formula where it has one. A leaf that launches no kernel (a view, an
-allocation, a wait) has no work: None. A collective spans the `tp` ranks of
+allocation, a wait, one whose outputs hold no element) has no work: None. A collective spans the `tp` ranks of
 the tensor-parallel group unless the leaf states its group size. A kind with
 no extractor, or a leaf its extractor cannot price, is refused by name.
 
@@ -42,13 +42,12 @@ from torch.utils.flop_counter import flop_registry
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import BatchView
-from atom.compass.backends.step_roofline import Module, _sparse_reads
+from atom.compass.backends.step_roofline import Module, _index_scores, _sparse_products
 from atom.compass.backends.step_roofline import _work as module_work
 from atom.compass.backends.work import (
     ELEMENT_BYTES,
     Collective,
     Work,
-    _wider,
     activated_experts,
     all_to_all,
     allgather,
@@ -389,11 +388,10 @@ def _v4_decode(q, *slots, out=None):
 
     def extract(op, view, tp, kv) -> Work:
         geometry = _stated(op, "window_size", "compress_ratio", "index_topk")
-        keys, read, _, _ = _sparse_reads(view.requests, *geometry)
         x = op["args"][q]
         _, heads, dim = x["shape"]
-        fmt = _wider(_fmt(x["dtype"]), kv)
-        work = Work({fmt: 4 * heads * dim * keys}, read * dim * ELEMENT_BYTES[kv])
+        fmt, rows = _fmt(x["dtype"]), view.requests
+        work = _sparse_products(rows, heads, dim, fmt, kv, *geometry)
         return boundary(op, view, tp, kv) + work
 
     return extract
@@ -410,9 +408,7 @@ def _indexer(op, view, tp, kv) -> Work:
     fmt = "fp4" if op["args"].get("q_scale") else _fmt(q["dtype"])
     _, heads, packed = q["shape"]
     dim = int(packed * _size(q["dtype"]) / ELEMENT_BYTES[fmt])
-    _, _, scored, entries = _sparse_reads(view.requests, 0, ratio)
-    work = Work({fmt: 2 * heads * dim * scored}, entries * dim * ELEMENT_BYTES[fmt])
-    return _boundary(op) + work
+    return _boundary(op) + _index_scores(view.requests, ratio, heads, dim, fmt)
 
 
 def _shape(value):
@@ -564,6 +560,10 @@ def work(op: dict, view: BatchView, tp: int, kv_format: str) -> Work | None:
     if not extract:
         reason = f"no extractor for the op kind {name}"
         raise CostRefused(view, [Refusal(SOURCE, reason)])
+    # Its outputs, an in-place leaf's target among them, hold no element: it
+    # writes nothing, whatever its sources hold.
+    if op["out"] and not any(map(math.prod, op["out"])):
+        return None
     try:
         return extract(op, view, tp, kv_format)
     except _Unpriced as error:

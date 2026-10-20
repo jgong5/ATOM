@@ -32,8 +32,11 @@ DeepSeek-V4's modules, each priced and then gone into:
   previous sub-layer's output into the widened residual and reducing it to the
   next input; the block's two norms run inside them.
 - `DeepseekV4Attention`: sparse attention over the sliding window and the
-  compressed KV, with the indexer's scoring where the layer has one. Its
-  linears and the compressors' are priced as linears.
+  compressed KV, with the indexer's scoring where the layer has one, at fp4
+  where the `Indexer` runs its fp4 path, else fp8; under an fp8 KV cache its
+  kernels take Q in fp8 as well. Its linears and the
+  compressors' are priced as linears, `wo_a` at fp8 activations where it runs
+  the fp8 batched GEMM.
 - `Expert` (the shared expert): its activation, between its two linears.
 - `FusedMoE`, not gone into: the routed experts, at the activation format
   its quant method runs them at, and the exchange around them: the
@@ -141,7 +144,10 @@ def _classify(module, name, parent):
         dims += (ix.index_topk, ix.n_heads, ix.head_dim) if ix else (0, 0, 0)
         # ponytail: the KV is read at fp8, its narrowest format; the window
         # rows held in bf16 are left out of this lower bound.
-        return Module(name, "sparse_attention", dims, "fp8"), DESCEND
+        q = "fp8" if module.kv_fp8 else "bf16"
+        index = "fp4" if ix and ix._indexer_fp4 else "fp8"
+        attn = Module(name, "sparse_attention", dims, "fp8", act=q, index=index)
+        return attn, DESCEND
     if _is(module, V4 + "Expert"):
         return Module(name, "act", (module.w2.weight.shape[1],)), DESCEND
     if _is(module, OPS + "moe.FusedMoE"):
@@ -159,6 +165,9 @@ def _classify(module, name, parent):
         ranks = module.tp_size if reduces else 1
         quant = getattr(getattr(module, "quant_type", None), "name", "No")
         act = "bf16" if quant in UNQUANTIZED_INPUT else fmt
+        if getattr(parent, "_wo_a_mxscale", False) and module is parent.wo_a:
+            # V4 quantizes the input to the weight's fp8 for its batched GEMM.
+            act = FORMATS.get(parent._wo_a_fp8_dtype)
         return Module(name, "gemm", tuple(weight.shape), fmt, ranks, act=act)
     if _is(module, *NORMS):
         if parent is not None and _is(parent, V4 + "Block"):
