@@ -857,10 +857,10 @@ LADDER_STEP = 1.25
 #: across rows, over the largest, past which its kind depends on them; a
 #: repeat's spread stays within 4%.
 CONTEXT_MOVES = 0.10
-#: The spread of a leaf's cold times across contexts, in ns, at or under which
-#: its kind does not depend on context whatever its share: one 3.5 us
-#: elementwise kernel on MI308X reads in two modes about 0.5 us apart, either
-#: one at any context.
+#: The spread of a leaf's cold times across contexts, or a prefill leaf's
+#: across rows, in ns, at or under which its kind does not depend on them
+#: whatever its share: one 3.5 us elementwise kernel on MI308X reads in two
+#: modes about 0.5 us apart, either one at any shape.
 CONTEXT_FLOOR_NS = 1000
 
 

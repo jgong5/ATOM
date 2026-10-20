@@ -437,7 +437,7 @@ def test_a_prefill_family_keeps_its_rows_unless_its_points_show_they_do_not_move
 ):
     def point(shape, context, ns, kernel):
         record = {"shape": shape, "context": context, "op": "lin", "leaf": "{}"}
-        return record | {"cold_ns": ns, "kernels": [kernel]}
+        return record | {"cold_ns": ns * 1e3, "kernels": [kernel]}
 
     # Flat over decode context, so the decode check reads it context-independent.
     records = [point("decode B=2", c, 10.0, "d") for c in (1, 9)]
