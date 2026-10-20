@@ -481,7 +481,7 @@ class Stub:
         sized to the cache (`cold_copies`) each on copy `c mod m`'s
         activations, then copy `c mod n` with the c-th weight up to every
         weight the model holds of its spec, at most K; and, when K is `CALLS`,
-        warm over one; with its kernels. Every rank's graph holds the least K
+        warm over one; with its kernels. Every rank's graph holds the most K
         any rank's call gives."""
         from atom.compass.bench.ranks import agreed, cpu_group
         from atom.utils import forward_context
@@ -500,7 +500,9 @@ class Stub:
             fn(**calls[0][0])  # compiles and tunes outside the graphs
             kernels, ns = _kernels(fn, calls[0][0])
             k = min(CALLS, max(int(GRAPH_NS // ns), 1)) if ns else CALLS
-            k = agreed(k, cpu_group())  # a collective's graph holds as many calls
+            # a collective's call holds its wait on the last rank to arrive,
+            # whose own call is the shortest: every graph takes its calls
+            k = agreed(k, cpu_group(), most=True)
             n = min(n, k)
             calls += [self._copy(op, sig, instances, c) for c in range(1, min(n, m))]
             calls += [

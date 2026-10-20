@@ -106,13 +106,14 @@ def union(todo: list, group) -> list:
     return [(shape, context, found) for (shape, context), found in points.items()]
 
 
-def agreed(n: int, group) -> int:
-    """The least of every rank's `n`."""
+def agreed(n: int, group, most: bool = False) -> int:
+    """The least of every rank's `n`, or the most."""
     import torch
     import torch.distributed as dist
 
     if group is None:
         return n
-    least = torch.tensor([n])
-    dist.all_reduce(least, op=dist.ReduceOp.MIN, group=group)
-    return int(least)
+    value = torch.tensor([n])
+    op = dist.ReduceOp.MAX if most else dist.ReduceOp.MIN
+    dist.all_reduce(value, op=op, group=group)
+    return int(value)

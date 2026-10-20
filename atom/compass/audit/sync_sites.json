@@ -4568,14 +4568,14 @@
    "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
   },
   {
-   "id": "atom/compass/bench/ranks.py::agreed::dist.all_reduce(least, op=dist.ReduceOp.MIN, group=group)::collective#0",
+   "id": "atom/compass/bench/ranks.py::agreed::dist.all_reduce(value, op=op, group=group)::collective#0",
    "file": "atom/compass/bench/ranks.py",
    "symbol": "agreed",
    "call": "dist.all_reduce",
-   "expr": "dist.all_reduce(least, op=dist.ReduceOp.MIN, group=group)",
+   "expr": "dist.all_reduce(value, op=op, group=group)",
    "shape": "collective",
    "peer": "process",
-   "why": "the op bench's ranks agree on the least of a count over their CPU group: the KV blocks each allocates and the calls a leaf's graph holds",
+   "why": "the op bench's ranks agree on a count over their CPU group: the fewest KV blocks any can allocate, the most calls a leaf's graph holds",
    "mechanism": "K9",
    "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
   },

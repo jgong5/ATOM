@@ -66,7 +66,7 @@ TODO = [
 
 def _rank(config, todo, rank):
     """One rank: join the gloo group at `launch`'s store, then its union of
-    `todo` and the least of every rank's number."""
+    `todo`, and the least and the most of every rank's number."""
     pc = config.parallel_config
     me = pc.data_parallel_rank * config.tensor_parallel_size + rank
     store = dist.TCPStore(pc.data_parallel_master_ip, pc.data_parallel_base_port)
@@ -74,7 +74,8 @@ def _rank(config, todo, rank):
     try:
         group = dist.group.WORLD
         got = [(str(s), c, list(f)) for s, c, f in ranks.union(todo[me], group)]
-        return (pc.data_parallel_rank, rank), got, ranks.agreed(10 - me, group)
+        agreed = ranks.agreed(10 - me, group), ranks.agreed(10 - me, group, most=True)
+        return (pc.data_parallel_rank, rank), got, agreed
     finally:
         dist.destroy_process_group()
 
@@ -97,7 +98,7 @@ def test_two_ranks_naming_different_points_each_measure_their_union_in_one_order
     ]
     dpa = config.enable_dp_attention
     assert [r[0] for r in by_rank] == ([(0, 0), (1, 0)] if dpa else [(0, 0), (0, 1)])
-    assert [r[1:] for r in by_rank] == [(union, 9)] * 2
+    assert [r[1:] for r in by_rank] == [(union, (9, 10))] * 2
     assert config.parallel_config._managed_distributed_store is False
 
 
