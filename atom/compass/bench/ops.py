@@ -44,7 +44,8 @@ tensors cloned past the first round: a placement is the point's batch on KV
 blocks and state slots of its own, for which ATOM builds the forward context
 again, cloned where it differs from the last placement's. A second graph runs
 copy 0 K times, warm; with one copy, or K under `CALLS`, there is none.
-Each graph is replayed `WARMUPS` times, then `REPEATS` times timed;
+Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
+idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
 aside, are the point's kernel identity. A batch the KV pool cannot place refuses its leaves.
@@ -84,6 +85,7 @@ import multiprocessing
 import os
 import re
 import statistics
+import time
 import warnings
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -109,7 +111,7 @@ from atom.compass.drive.gpu import add_gpu_flag
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below or the
 #: copies a graph reads change.
-PROTOCOL = 6
+PROTOCOL = 7
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -123,6 +125,13 @@ GRAPH_NS = 10_000_000
 #: Times over the last-level cache the copies' bytes pass: just past it, part of
 #: them stays there, and an MI308X GEMM read up to 7% fast.
 COLD = 2
+#: Host idle after each replay, as a share of its device time. Replayed back to
+#: back on an MI308X, the lm_head GEMM ran at a 1100 MHz memory and 1550 MHz
+#: fabric clock, against 1300 and 1800 MHz with an idle after each call, at the
+#: same socket power, and read up to 2.55% over ATOM's decode step by block
+#: median. A power limit is the suspected cause. With this idle after a replay
+#: `GRAPH_NS` bounds, it read 0.22% to 0.58% under the step.
+REST = 0.1
 #: Metadata arguments, by operator and slot, that are the token ids ATOM passes
 #: the model's forward; `_meta`'s name rule binds an embedding's `indices` to
 #: another index buffer.
@@ -667,8 +676,10 @@ def _replay(fn, calls) -> list[float]:
         graph.replay()
         end.record()
         end.synchronize()
+        ms = start.elapsed_time(end)
         if i >= WARMUPS:
-            times.append(start.elapsed_time(end) * 1e6 / len(calls))
+            times.append(ms * 1e6 / len(calls))
+        time.sleep(ms * REST / 1e3)
     return times
 
 
