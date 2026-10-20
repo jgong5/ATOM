@@ -220,9 +220,7 @@ def test_with_one_corner_removed_the_step_refuses_naming_it(make, points, gone, 
     assert r.forward(decode(B37)).predicted_s == 0.0
     b, c = gone[-2:]
     assert r.refused_commands() == (
-        (
-            f"cost:step-grid: the {named} has no measurement at B={b}, c={c}"
-        ),
+        f"cost:step-grid: the {named} has no measurement at B={b}, c={c}",
     )
 
 
