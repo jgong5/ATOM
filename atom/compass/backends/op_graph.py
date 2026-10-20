@@ -216,7 +216,8 @@ class OpGraphBackend(CostBackend):
                     run.append(0.0)
                 run[-1] += seconds
             runs.append(run)
-        if len(runs[0]) != len(runs[1]):
+        # A refused leaf is missing from its run: `price` names it instead.
+        if len(runs[0]) != len(runs[1]) and not refused:
             reason = (
                 "a two-batch-overlap step whose micro-batches' graphs change "
                 f"streams {len(runs[0]) - 1} and {len(runs[1]) - 1} times"
