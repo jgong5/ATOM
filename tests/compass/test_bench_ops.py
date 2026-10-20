@@ -73,6 +73,26 @@ def test_each_leaf_holds_every_instance_s_context_key_and_module_path():
     }
 
 
+def test_stated_values_part_signatures_and_stating_nothing_keeps_the_key():
+    plain = _leaf("aiter.decode", ("x", _t([2, 8], "activation")))
+    csa, hca = (
+        dataclasses.replace(plain, stated=(("compress_ratio", r), ("index_topk", k)))
+        for r, k in ((4, 1024), (128, None))
+    )
+
+    found = ops.leaves(_graph(plain, csa, hca, layers=1)["region"])
+
+    assert [op.get("stated") for op, _ in found.values()] == [
+        None,
+        {"compress_ratio": 4, "index_topk": 1024},
+        {"compress_ratio": 128, "index_topk": None},
+    ]
+    # The key a leaf stating nothing had before any leaf stated anything.
+    op, _ = next(iter(found.values()))
+    leaf = {"op": "aiter.decode", "args": op["args"], "out": []}
+    assert ops.signature(op) == json.dumps(leaf, sort_keys=True, separators=(",", ":"))
+
+
 LIVE = {
     "kv_indptr": torch.arange(9, dtype=torch.int32),
     # Its own shape and stride, with more room than `kv_indptr`.

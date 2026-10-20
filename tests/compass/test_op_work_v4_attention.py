@@ -4,12 +4,15 @@
 Each extractor matches a hand count on one shape: what a leaf reaches by index
 (the KV pool, the rotary cache) stays out of its bytes, a prefill's products
 run over the entries its index lists name, and a decode, whose lists are sized
-for the longest row, counts no products.
+for the longest row, and the indexer run over the entries the layer geometry
+their leaves state gives each row.
 """
 
+import pytest
 from test_op_work import I32, ONE, leaf, rows, t
 
 from atom.compass.backends.op_work import work
+from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.work import Work
 
 FP8, F32, U8 = "torch.float8_e4m3fn", "torch.float32", "torch.uint8"
@@ -99,7 +102,8 @@ def test_a_prefill_attends_each_entry_its_index_lists_name():
     )
 
 
-def test_a_decode_counts_q_the_sink_and_o_alone():
+def decode(**stated):
+    """A paged decode over 2 rows of 4 heads of width 16, stating `stated`."""
     op = leaf(
         V4 + "paged_decode:_sparse_attn_v4_paged_decode_asm",
         [[2, 4, 16]],
@@ -112,9 +116,62 @@ def test_a_decode_counts_q_the_sink_and_o_alone():
         q_rope_in=t([2, 4, 4]),
         num_kv_splits=16,
     )
+    return op | ({"stated": stated} if stated else {})
 
-    moved = 2 * 4 * 16 + 2 * 4 * 4 * 2 + 4 * 4 + 2 * 4 * 16 * 2
-    assert work(op, rows((1, 9), (1, 300)), 1, "fp8") == Work({}, moved)
+
+@pytest.mark.parametrize(
+    "ratio, top, entries",
+    [
+        # Rows at 9 and 300: the last 4 tokens each, and 9 // 4 = 2 and
+        # 300 // 4 = 75 compressed entries, at most 16.
+        (4, 16, 4 + 2 + 4 + 16),
+        # No indexer: every entry, 9 // 8 = 1 and 300 // 8 = 37.
+        (8, None, 4 + 1 + 4 + 37),
+        # The window alone.
+        (0, None, 4 + 4),
+    ],
+    ids=["csa", "hca", "window"],
+)
+def test_a_decode_reads_each_row_s_window_and_compressed_entries(ratio, top, entries):
+    op = decode(window_size=4, compress_ratio=ratio, index_topk=top)
+
+    # Q, its rotary part and the sink read, O written in bf16; each entry's
+    # 16 fp8 values read once, and two products of width 16 per head and entry.
+    moved = 2 * 4 * 16 + 2 * 4 * 4 * 2 + 4 * 4 + 2 * 4 * 16 * 2 + entries * 16
+    assert work(op, rows((1, 9), (1, 300)), 1, "fp8") == Work(
+        {"fp8": 4 * 4 * 16 * entries}, moved
+    )
+
+
+def test_a_decode_stating_no_geometry_is_refused_by_name():
+    with pytest.raises(CostRefused, match="states no window_size, compress_ratio"):
+        work(decode(), rows((1, 9)), 1, "fp8")
+
+
+@pytest.mark.parametrize(
+    "q, scale, fmt",
+    [(t([4, 4, 8], U8), t([4, 1, 1], U8), "fp4"), (t([4, 4, 16], FP8), None, "fp8")],
+    ids=["fp4", "fp8"],
+)
+def test_the_indexer_scores_each_new_query_against_every_entry_before_it(q, scale, fmt):
+    op = leaf(
+        "aiter.indexer_score_topk.default",
+        [[4, 16]],
+        q_quant=q,
+        weights=t([4, 4]),
+        q_scale=scale,
+        layer_name={"context": "layers.2.attn.indexer"},
+        topk=16,
+    )
+    op["stated"] = {"compress_ratio": 4}
+
+    # 4 new tokens at positions 9 to 12 over 4 heads of width 16, packed two
+    # to a byte in fp4: 2 + 2 + 2 + 3 entries scored, the row's 12 // 4 read.
+    size = {"fp4": 0.5, "fp8": 1}[fmt]
+    boundary = 4 * 4 * 16 * size + 4 * 4 * 2 + 4 * 16 * 1 + (4 if scale else 0)
+    assert work(op, rows((4, 12), decode=False), 1, "fp8") == Work(
+        {fmt: 2 * 4 * 16 * 9}, boundary + 3 * 16 * size
+    )
 
 
 def test_a_compressor_state_update_counts_no_kv_or_score_row():

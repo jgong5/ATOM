@@ -192,3 +192,75 @@ def test_the_mi308x_specs_rebuild_byte_for_byte_from_their_own_sweeps(
     out = tmp_path / "rebuilt.json"
     assert script.main(["--sweep-from", str(document), "--out", str(out)]) == 0
     assert out.read_bytes() == document.read_bytes()
+
+
+#: The stand-in server: a Starlette app's lifespan, as uvicorn starts it, then
+#: one GET; prints when the app sent the GET's response.
+APP_SERVER = """
+import asyncio, time
+from starlette.applications import Starlette
+
+async def main():
+    app, sends = Starlette(), []
+    lifespan = iter(["lifespan.startup", "lifespan.shutdown"])
+
+    async def started():
+        return {"type": next(lifespan)}
+
+    async def ignore(message):
+        pass
+
+    async def receive():
+        return {"type": "http.request", "body": b""}
+
+    async def send(message):
+        sends.append(time.monotonic_ns())
+
+    await app({"type": "lifespan"}, started, ignore)
+    scope = {"type": "http", "method": "GET", "path": "/", "headers": []}
+    await app(scope | {"query_string": b"", "root_path": ""}, receive, send)
+    print(sends[0])
+
+if __name__ == "__main__":
+    asyncio.run(main())
+"""
+
+
+def test_serve_stamps_each_http_request_handed_to_the_asgi_app(tmp_path):
+    server = SERVER | {"entrypoints/openai/api_server.py": APP_SERVER}
+    for name, text in server.items():
+        (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "atom" / name).write_text(text)
+    stamps = tmp_path / "stamps"
+    done = subprocess.run(
+        [sys.executable, PROBE, "serve", stamps],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path)),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    # The lifespan call is no request: `floor` would pair it with a send.
+    assert [(r[2], r[4]) for r in rows] == [("app", "0")]
+    # Stamped as the app is called, before it answers.
+    assert int(rows[0][3]) < int(done.stdout)
+
+
+def test_the_floor_is_each_send_to_its_app_call_one_request_in_flight(tmp_path):
+    sent = [10**12 + k * 10**9 for k in range(10)]
+    floors = [400_000 + 10_000 * k for k in range(10)]
+    stamps, arrivals = tmp_path / "stamps", tmp_path / "arrivals.json"
+    stamps.write_text(
+        "".join(f"{s + f} 1 app {s + f} 0\n" for s, f in zip(sent, floors))
+        + f"{sent[0] + 9} 1 body {sent[0] + 8} 7\n"
+    )
+    arrivals.write_text(json.dumps({"sent_ns": sent[::-1], "admitted_ns": sent}))
+    got = probe.floor(str(stamps), str(arrivals))
+    assert got["median_s"] == pytest.approx(445e-6)
+    assert (got["p10_s"], got["p90_s"]) == pytest.approx((409e-6, 481e-6))
+    assert got["requests"] == 10
+    # A second request sent before the first reached the app pairs nothing.
+    arrivals.write_text(json.dumps({"sent_ns": [sent[0], sent[0] + 1] + sent[2:]}))
+    with pytest.raises(SystemExit, match="10 app calls, not one after each of 10"):
+        probe.floor(str(stamps), str(arrivals))

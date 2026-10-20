@@ -14,12 +14,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_artifact_store import CONDITIONS, GATES, stanza
 from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
+from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 
 from atom.compass import ir
-from atom.compass.artifacts import ArtifactStore
+from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.bench import ops
-from atom.compass.capture.forward import decode
+from atom.compass.capture.forward import decode, structure
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
 from atom.utils import forward_context as fctx
@@ -32,7 +34,7 @@ CONFIG = SimpleNamespace(
 )
 
 
-def _graph_at(store, config, shape):
+def _graph_at(store, config, shape, arch=None):
     rows = shape.tokens if shape.phase == "prefill" else shape.seqs
     attn = _leaf(
         "aiter.attn",
@@ -45,8 +47,9 @@ def _graph_at(store, config, shape):
 
 
 def _bench(fn, config, todo, llc):
-    """`measure` as a device would time each point: the GEMM by its tokens, the
-    attention by its context, each kernel switching at its threshold."""
+    """`measure` as a device would time each point, a microsecond per unit: the
+    GEMM by its tokens, the attention by its context, each kernel switching at
+    its threshold."""
     assert fn is ops.measure
     _bench.calls += 1
     got = []
@@ -61,7 +64,7 @@ def _bench(fn, config, todo, llc):
                 n, kernel = 1, "gemm"
             got.append(
                 {"shape": str(shape), "context": context, "op": op["op"], "leaf": sig}
-                | {"kernels": [kernel], "cold_ns": float(n)}
+                | {"kernels": [kernel], "cold_ns": n * 1e3}
             )
     return got
 
@@ -177,11 +180,11 @@ def test_coverage_counts_a_step_only_when_every_leaf_sits_in_one_kernel_s_band(
         ([[1, 20000, True]], 1),  # past the largest context measured
         ([[120, 120, False]], None),  # GEMM between 100 and 150
         ([[120, 1120, False]], None),  # a cached row
-        ([[40, 40, False]] * 3, None),  # attention never measured at three rows
+        ([[40, 40, False]] * 3, None),  # no leaf measured at three rows
     )
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert (report["steps"], report["covered"]) == (6, 2)
     assert report["by phase"] == {
@@ -194,7 +197,8 @@ def test_coverage_counts_a_step_only_when_every_leaf_sits_in_one_kernel_s_band(
             "outside the measured range": 1,
             "a cached row, measured on fresh rows only": 1,
             "no measured point": 1,
-        }
+        },
+        "aiter.gemm": {"no measured point": 1},
     }
 
 
@@ -243,7 +247,7 @@ def test_a_plan_measures_prefill_attention_over_cached_tokens_and_coverage_reads
     )
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["by phase"] == {"prefill": {"steps": 4, "covered": 2}}
     assert report["left out, by leaf kind"] == {
@@ -257,7 +261,17 @@ def _moving_bench(fn, config, todo, llc):
     got = _bench(fn, config, todo, llc)
     for r in got:
         if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
-            r["cold_ns"] += r["context"] or 0
+            r["cold_ns"] += (r["context"] or 0) * 1e3
+    return got
+
+
+def _two_mode_bench(fn, config, todo, llc):
+    """`_bench` with prefill attention a short kernel that reads in one of two
+    modes, 0.4 us apart, past `CONTEXT_MOVES` between fresh and cached rows."""
+    got = _bench(fn, config, todo, llc)
+    for r in got:
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
+            r["cold_ns"] = 3300.0 if r["context"] else 3700.0
     return got
 
 
@@ -266,6 +280,8 @@ def _moving_bench(fn, config, todo, llc):
     [
         # one kernel and time: only the far end, and round 2 densifies
         (_bench, {None, 8000}, 2, {("aiter.gemm", None)}),
+        # its two modes, under the floor: as one time
+        (_two_mode_bench, {None, 8000}, 2, {("aiter.gemm", None)}),
         # its time grows: round 2 is the ladder alone, densifying after it
         (
             _moving_bench,
@@ -303,7 +319,7 @@ def test_a_plan_ladders_cached_tokens_only_for_a_prefill_kind_that_moves_there(
     )
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["by phase"] == {"prefill": {"steps": 2, "covered": covered}}
 
@@ -383,7 +399,7 @@ def test_coverage_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_
     graded = _records(tmp_path / "graded", ([[1, 3000, True]], 2))
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["left out, by leaf kind"] == {
         "aiter.attn": {"outside the measured range": 1}
@@ -429,7 +445,7 @@ def test_a_plan_halves_decode_attention_until_no_point_bends_off_its_neighbours(
         got = _bench(fn, config, todo, llc)
         for r in got:
             if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
-                r["cold_ns"] += 2.0 * max(r["context"] - 3500, 0)
+                r["cold_ns"] += 2e3 * max(r["context"] - 3500, 0)
         return got
 
     monkeypatch.setattr(ops, "_child", steeper)
@@ -457,6 +473,91 @@ def test_a_plan_halves_decode_attention_until_no_point_bends_off_its_neighbours(
     assert any(3000 < c < 4125 for c in at) and {4999, 5000} <= at
 
 
+@pytest.mark.parametrize(
+    "points, rows",
+    [
+        # one token count at three row counts, its time growing with them
+        (
+            [
+                (64, 1, 150.4, "k"),
+                (64, 2, 179.9, "k"),
+                (64, 4, 245.0, "k"),
+                (48, 4, 120.0, "k"),
+            ],
+            [[1], [2], [4]],
+        ),
+        ([(64, 1, 150.0, "a"), (64, 2, 150.0, "b"), (48, 2, 120.0, "b")], [[1], [2]]),
+        # flat across rows: one family
+        (
+            [
+                (64, 1, 150.0, "k"),
+                (64, 2, 152.0, "k"),
+                (64, 4, 151.0, "k"),
+                (48, 4, 120.0, "k"),
+            ],
+            [[1, 2, 4]],
+        ),
+        # no token count at two row counts: nothing shows the rows do not matter
+        ([(64, 1, 150.0, "k"), (48, 4, 120.0, "k")], [[1], [4]]),
+    ],
+)
+def test_a_prefill_family_keeps_its_rows_unless_its_points_show_they_do_not_move_it(
+    points, rows
+):
+    def point(shape, context, ns, kernel):
+        record = {"shape": shape, "context": context, "op": "lin", "leaf": "{}"}
+        return record | {"cold_ns": ns * 1e3, "kernels": [kernel]}
+
+    # Flat over decode context, so the decode check reads it context-independent.
+    records = [point("decode B=2", c, 10.0, "d") for c in (1, 9)]
+    records += [point(f"prefill T={t} B={b}", None, ns, k) for t, b, ns, k in points]
+
+    families = ops._families(records, ops._dependent(records))
+
+    got = [
+        sorted({ops._shape(r["shape"]).seqs for *_, r in found})
+        for fam, found in families.items()
+        if fam.startswith('["prefill"')
+    ]
+    assert sorted(got) == rows
+
+
+def _rows_bench(fn, config, todo, llc):
+    """`_bench` with the prefill GEMM's time growing with its rows."""
+    got = _bench(fn, config, todo, llc)
+    for r in got:
+        if r["op"] == "aiter.gemm" and r["shape"].startswith("prefill"):
+            r["cold_ns"] *= ops._shape(r["shape"]).seqs
+    return got
+
+
+@pytest.mark.parametrize("stand_in, densified", [(_bench, 1), (_rows_bench, 2)])
+def test_a_plan_densifies_a_prefill_leaf_at_each_row_count_only_where_rows_move_it(
+    bench, tmp_path, monkeypatch, stand_in, densified
+):
+    monkeypatch.setattr(ops, "_child", stand_in)
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[40, 40, False]], None),
+        ([[150, 150, False]], None),
+        ([[20, 20, False]] * 2, None),
+        ([[75, 75, False]] * 2, None),
+    )
+
+    records = _plan(bench, tmp_path, population)
+
+    tokens = {1: set(), 2: set()}
+    for r in records:
+        if r["op"] == "aiter.gemm" and r["shape"].startswith("prefill"):
+            shape = ops._shape(r["shape"])
+            tokens[shape.seqs].add(shape.tokens)
+    # Both row counts hold 40 and 150; the halving to 99 | 100 runs at one of
+    # them when the GEMM reads flat across rows, at each when it moves.
+    assert all({40, 150} <= t for t in tokens.values())
+    assert sum({99, 100} <= t for t in tokens.values()) == densified
+
+
 def test_a_ladder_keeps_values_a_step_apart_and_the_largest():
     assert ops._ladder([16384, 1, 2, 3, 4, 5, 100, 101, 16383]) == [
         1,
@@ -473,7 +574,7 @@ def test_a_ladder_keeps_values_a_step_apart_and_the_largest():
 def test_a_kind_depends_on_context_when_its_times_or_its_kernels_move():
     def point(op, context, ns, kernel):
         record = {"shape": "decode B=2", "context": context, "op": op, "leaf": op}
-        return record | {"cold_ns": ns, "kernels": [kernel]}
+        return record | {"cold_ns": ns * 1e3, "kernels": [kernel]}
 
     records = [
         *(point("state", c, ns, "s") for c, ns in ((1, 10.0), (9, 20.0))),
@@ -491,6 +592,67 @@ def test_an_integer_activation_indexes_a_dimension_of_one():
     index = ops._random(spec, "cpu")
 
     assert torch.zeros(1, 3)[index].shape == (64, 3)
+
+
+def _publish_graph(store, config, arch, shape):
+    """A graph of `shape` keyed on `arch`, its one leaf named for the arch."""
+    key = Key.of(
+        Kind.OP_GRAPH,
+        structure=structure(config, shape.phase, device=arch),
+        shape=str(shape),
+    )
+    leaf = _leaf(f"aiter.{arch}", ("x", _t([shape.seqs, 8], "activation")))
+    store.publish(
+        key,
+        provenance=stanza("compass trace ops"),
+        topology=Topology(),
+        conditions=CONDITIONS,
+        gates=GATES,
+        members={
+            member_name("graph", ops.RANK, "json"): json.dumps(
+                _graph(leaf, layers=1)
+            ).encode()
+        },
+    )
+
+
+@pytest.mark.parametrize("held", [("gfx942", "gfx950"), ("gfx942",)])
+def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
+    tmp_path, monkeypatch, held, model_config  # noqa: F811
+):
+    store = ArtifactStore(str(tmp_path / "store"))
+    for arch in held:
+        _publish_graph(store, model_config, arch, decode(1))
+
+    def no_gpu(*args, **kwargs):
+        raise RuntimeError("No HIP GPUs are available")
+
+    traced = []
+
+    def trace(fn, argv):
+        """`trace ops` as the capture publishes: on the arch `--arch` names."""
+        traced.append(argv[argv.index("--arch") + 1])
+        _publish_graph(store, model_config, traced[-1], decode(1))
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", no_gpu)
+    monkeypatch.setattr(
+        "atom.compass.bench.measure.atom_config", lambda a: model_config
+    )
+    monkeypatch.setattr(ops, "_child", trace)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "plan.jsonl").write_text("")
+    device = {"index": 0, "name": "AMD Instinct MI355X", "arch": "gfx950"}
+    (out / "run.json").write_text(json.dumps({"device": [device]}))
+    graded = _records(tmp_path / "graded", ([[1, 100, True]], 1))
+
+    argv = ["--coverage", graded, "--store", str(store.root), "--out", str(out)]
+    report = ops._coverage_main(argv, [])
+
+    assert report["left out, by leaf kind"] == {
+        "aiter.gfx950": {"no measured point": 1}
+    }
+    assert traced == ([] if "gfx950" in held else ["gfx950"])
 
 
 def _dies(*finished):
