@@ -658,10 +658,14 @@ capture tree's.
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json`
 are the same pair with expert parallelism on (MORI): the `history` form, fitted by
-`compass fit steps` and `compass fit host` on each side's cells at concurrency 1, 4, 16,
-64 and 256, captured on mi355-gpu-40 at ATOM 78f8c0adf, which shares
-`mi355x-gpu45.json`'s device, stack and PTL state ([#1526](https://github.com/jgong5/ATOM/issues/1526)).
-Each decode rung sits in one cell, so only prefill carries a held-out hull. Host keys as above.
+`compass fit steps` and `compass fit host` on each side's cells, captured on mi355-gpu-40
+at ATOM 78f8c0adf, which shares `mi355x-gpu45.json`'s device, stack and PTL state:
+concurrency 1, 4, 16, 64 and 256 at `cctraces_sim.sh`'s default `SEED`
+([#1526](https://github.com/jgong5/ATOM/issues/1526)) and 64 and 256 at `SEED=20260708`;
+the prefill side adds 64 three more times at `SEED=20260708` and once at the default,
+the decode side 64 once more at the default ([#1810](https://github.com/jgong5/ATOM/issues/1810)).
+Each decode rung a law fits has steps in two or more cells, so each carries a held-out
+hull. Host keys as above.
 
 ## Cost accuracy on a real run's own steps — `validate.cost`
 
