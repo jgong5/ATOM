@@ -80,8 +80,8 @@ container, entered with `docker exec -it ${USER}_compass_gpu bash`.
   ```
 
   `snapshot.sh` archives HEAD, which `git fetch` does not move: without the
-  checkout it snapshots a stale commit and says nothing.
-  `snapshot.sh` names the tarball, `<sha>` being the commit's first 9 characters;
+  checkout it snapshots a stale commit and says nothing. It names the tarball,
+  `<sha>` being the commit's first 9 characters;
   its lines on commits behind, changed files and `gate_cpu.sh` are for the gates.
   `<data dir>/tree/<sha>/ATOM` is `$T`. Run every step from it. Records, fits and
   runs keyed by another tree's source refuse each other. A git worktree used in a
@@ -343,11 +343,11 @@ law's accuracy.
 | `run` refuses its law or host laws | records, fits and runs from two trees, two `$ATOM`s, two specs or two environments | one tree, one `$ATOM`, one spec and one environment (Variables) for every step |
 | `... holds an earlier run's files`, or `client.sh` refuses its OUT | one server per `--out`, one client run per server | a fresh `--out` for every server |
 | `fit` refuses `... is not a record directory (no run.json)` | a log file matched `$R/cal/c*` | keep logs outside the record directories |
-| `fit steps` refuses on a missing `artifacts/client_run.json` | a stopped calibration record under `$R/cal/` | `rm -rf` it and take it again |
+| `fit` refuses: `[Errno 2] No such file or directory: '<record>/artifacts/client_run.json'` | a stopped calibration record under `$R/cal/` | `rm -rf` it and take it again |
 | `kill: %%: no such job` | `serve` already stopped that server, when its client run failed or ended | nothing to stop; run `jobs` first |
 | `serve: OUT exists; rm -rf it to take the step again` | a stopped step's `--out` | `rm -rf` it, as the line says |
 | `Triton cache error`, or `failed to map segment from shared object` | a `--tmpfs` without `exec` | the container as Environment starts it |
-| grading refuses a run: `aiter ran a JIT build of [...] while its server served` | the container met that kernel variant for the first time inside the record | take the record again, since the container now holds the build; warm a fresh container first (step 0) |
+| grading, a fit or `validate.cost` refuses a record: `aiter ran a JIT build of [...] while its server served` | the container met that kernel variant for the first time inside the record | take the record again, since the container now holds the build; warm a fresh container first (step 0) |
 | verdict `coverage report`, `no decode vector for rung N` | the cell decoded more requests at once than any calibration step did (a rung is the batch's captured-graph size) | calibrate at that concurrency or above; #1336's calibration reached no rung 48, so c=256 stayed a coverage report |
 | grading refuses a run: warmup | the client ran with `--no-warmup`, or its warmup overlapped its graded steps | keep `client.sh`'s default warmup |
 | grading refuses a run: fitted on the traces it grades | calibration and cell traces overlap | calibration 256 to 392, cell 0 to 255 |

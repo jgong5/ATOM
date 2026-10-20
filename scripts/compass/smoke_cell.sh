@@ -10,7 +10,8 @@
 # real runs, so a failed fit costs no more GPU time.
 # Before calibration, a record nothing reads, warm/, serves the cell's traces
 # once, so that it takes the aiter JIT builds a fresh container meets while
-# serving, which grading refuses in a record (run.json's `aiter_jit_builds`).
+# serving, which grading, the fits and `validate.cost` refuse in a record
+# (run.json's `aiter_jit_builds`).
 #
 # Usage: smoke_cell.sh MODEL OUT
 #   MODEL           the model directory: config.json, tokenizer and weights
