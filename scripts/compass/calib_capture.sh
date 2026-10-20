@@ -21,7 +21,9 @@
 # steps/; OUT_DIR/c<C>.log holds the tree's commit, the host load (`uptime`),
 # the GPUs' processes, VRAM and use at the cell's start and end, and the cell's
 # exit status, aiperf's: on SIGINT aiperf writes its export, or, stopped in its
-# warmup, none and exits 1. The cell's run.json gains a `compass record` identity.
+# warmup, none and exits 1. A cell whose aiperf duration has passed is not
+# stopped: aiperf ends it with its export. The cell's run.json gains a
+# `compass record` identity.
 # The capture exits 1 naming each cell left without artifacts/client_run.json
 # or without that identity.
 #   compass fit steps --backend step-linear OUT_DIR/c<C>... --client-run OUT_DIR/c<C> \
@@ -60,8 +62,14 @@ for c in ${CELLS:-1 4 16 64 256}; do
         echo "first step $(date -u +%FT%TZ)" >>"$log"
         # Wakes each 10 s, so a cell that ends on its own is not held to STEPS_S.
         for ((t = 0; t < ${STEPS_S:-1800}; t += 10)); do kill -0 $sim 2>/dev/null && sleep 10; done
-        # aiperf runs as a child of cctraces_sim.sh, which runs under timeout.
-        pkill -INT -P "$(pgrep -P $sim)" -f "^aiperf system_controller" && echo "stopped aiperf $(date -u +%FT%TZ)" >>"$log"
+        # Once aiperf's duration has passed it ends the cell itself after its
+        # grace period, and a SIGINT within that period exits 1.
+        if grep -qsF "Phase profiling (profiling) sending complete" "$o/aiperf.log"; then
+            echo "aiperf duration ended $(date -u +%FT%TZ)" >>"$log"
+        else
+            # aiperf runs as a child of cctraces_sim.sh, which runs under timeout.
+            pkill -INT -P "$(pgrep -P $sim)" -f "^aiperf system_controller" && echo "stopped aiperf $(date -u +%FT%TZ)" >>"$log"
+        fi
     fi
     wait $sim
     echo "CELL_RC=$?" >>"$log"
