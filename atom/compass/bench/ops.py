@@ -48,7 +48,8 @@ a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
 aside, are the point's kernel identity. A batch the KV pool cannot place refuses its leaves.
 The points run in a process of their own; one that dies keeps the points it
-finished, the point it was measuring refuses, and a new one measures the rest.
+finished, the point it was measuring refuses, and a new one measures the rest;
+two in a row that die having finished no point fail the run.
 
 DIR gets run.json, the run's identity, and ops.jsonl, one line per point. S
 gets each measured point as an `op_measurement`, keyed by the model, the
@@ -1124,8 +1125,9 @@ def _journal(path, records: list[dict]) -> list[dict]:
 def _measured(config, todo, llc: int) -> list[dict]:
     """`measure` of `todo` in a child of its own. A child that dies keeps the
     points it finished; the first it left, the one it died measuring, refuses,
-    and another child measures the rest."""
-    got = []
+    and another child measures the rest. Two children in a row that die
+    having finished no point raise: the child itself is failing, not a point."""
+    got, empty = [], False
     with tempfile.TemporaryDirectory() as tmp:
         journal = Path(tmp, "points.jsonl")
         while todo:
@@ -1134,7 +1136,10 @@ def _measured(config, todo, llc: int) -> list[dict]:
                 with patch.dict(os.environ, {JOURNAL: str(journal)}):
                     return got + _child(measure, config, todo, llc)
             except BrokenProcessPool:
-                got += [json.loads(line) for line in journal.read_text().splitlines()]
+                new = [json.loads(line) for line in journal.read_text().splitlines()]
+                if not new and empty:
+                    raise
+                got, empty = got + new, not new
             done = {(r["shape"], r["context"], r["leaf"]) for r in got}
             todo = [
                 (s, c, {k: v for k, v in found.items() if (str(s), c, k) not in done})
