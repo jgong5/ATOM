@@ -38,6 +38,7 @@ from test_memory_readings import (
 from test_run_step_grid import deployment
 from test_vertical_slice import _run_file
 
+from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import cli
 from atom.compass import run as compass_run
 from atom.compass.artifacts import (
@@ -497,6 +498,29 @@ def test_a_pd_connector_reads_the_readings_measured_without_one(tmp_path):
     measured = memory.load(tmp_path / "store", r.config, MACHINE, 0).values
     r.config.kv_transfer_config = {"kv_connector": "moriio", "kv_role": "kv_producer"}
     assert memory.load(tmp_path / "store", r.config, MACHINE, 0).values == measured
+
+
+@pytest.mark.parametrize("moved", ["enable_tbo", "ladder", "env"])
+def test_a_pd_decode_side_reads_its_own_entry_beside_the_prefill_sides(
+    tmp_path, monkeypatch, moved
+):
+    """The 1P1D decode side starts without --enable-tbo, on its own capture
+    ladder and without the prefill side's GPU_MAX_HW_QUEUES; each alone keys
+    its readings apart from the prefill side's."""
+    for name in PERFORMANCE_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GPU_MAX_HW_QUEUES", "5")
+    r, store = deployment(tmp_path, enable_tbo=True), tmp_path / "store"
+    prefill = memory.load(store, r.config, MACHINE, 0).values
+    if moved == "enable_tbo":
+        r.config.enable_tbo = False
+    elif moved == "ladder":
+        r.config.capture_sizes = [1, 2, *range(4, 257, 4)]
+    else:
+        monkeypatch.delenv("GPU_MAX_HW_QUEUES")
+
+    publish_readings(store, r.config, readings=READINGS[2])
+    assert memory.load(store, r.config, MACHINE, 0).values == READINGS[2] != prefill
 
 
 def test_ranks_whose_reserves_spread_past_the_limit_publish_nothing(tmp_path):
