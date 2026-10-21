@@ -36,6 +36,8 @@ such wait; `W_post` from that wait's end to the exit, less the draft copy wait,
 and a middle chunk has none. With an MTP status wait,
 `W_pre` ends at it and `W_inputs` runs from it to the launch. On a later
 pipeline stage, `W_recv` runs from the launch to the receive of its input.
+Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
+pull after the previous exit, and `E_out` from the exit to the pull after it.
 
 `write_table` writes a record's labels beside it, `dp<r>.cost.jsonl`, for
 people: a first line `{"version": TABLE_VERSION}`, then per step `step`,
@@ -46,9 +48,10 @@ the step has none.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -143,6 +146,21 @@ def _launch_exposed(lines) -> set[int]:
     return exposed
 
 
+def join_stamps(steps: list[dict], path) -> None:
+    """Put into each step the first stamp of each key in `path` at or after
+    its exit and before the next step's entry."""
+    times = defaultdict(list)
+    for stamps in read_jsonl(path):
+        for key, ns in stamps.items():
+            times[key].append(ns)
+    ends = [s["t_enter_ns"] for s in steps[1:]] + [float("inf")]
+    for step, end in zip(steps, ends):
+        for key, ts in times.items():
+            i = bisect.bisect_left(ts, step["t_exit_ns"])
+            if i < len(ts) and ts[i] < end:
+                step[key] = ts[i]
+
+
 def _shared(step, other) -> bool:
     """Whether two steps' batches hold a request in common."""
     return bool({r[0] for r in step["batch"]} & {r[0] for r in other["batch"]})
@@ -156,6 +174,8 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
     """
     path = Path(record)
     lines = read_jsonl(path)
+    if (pulls := path.with_suffix(".pulls.jsonl")).exists():
+        join_stamps(lines, pulls)
     steps = [s for s in lines if not s["is_dummy_run"]]
     if not steps or "t_enter_ns" not in steps[0]:
         raise ValueError(
@@ -207,9 +227,11 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
         if host_kind(view) != "middle":
             d0, d1 = s.get("t_draft_recv_ns", (0, 0))
             host["W_post"] = s["t_exit_ns"] - r1 - (d1 - d0)
+        if "t_pull_ns" in s:
+            host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]
         idle = prev is not None and not _shared(s, prev)
         if prev is not None and not idle:
-            host["E"] = enter - prev["t_exit_ns"]
+            host["E"] = enter - prev.get("t_pull_ns", prev["t_exit_ns"])
         host = {k: v * 1e-9 for k, v in host.items()}
         provenance = {
             "source": "record",
@@ -238,7 +260,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
                 "d_gap_s": None if gap_ns is None else gap_ns * 1e-9,
                 "launch_exposed": s["step"] in exposed,
                 "idle": idle,
-                **{k: host.get(k) for k in (*HOST_SEGMENTS, "W_inputs")},
+                **{k: host.get(k) for k in (*HOST_SEGMENTS, "W_inputs", "E_out")},
                 "label_s": device,
                 "draft_s": draft,
                 "cut": cut,

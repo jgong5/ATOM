@@ -22,7 +22,8 @@ resolve, `keyed`'s fields, at data-parallel width 1, the bench's.
 The bench measures at tensor parallel 1: above it, a point charges the ranks'
 preload skew (#1188), so a deployment of more ranks refuses.
 
-A batch is a line's view: its `rows`, `rung` and `produces_output`. The
+A batch is a line's view: its `rows`, `rung` and `produces_output`, and the
+KV blocks its rows share where a planned line states them (`shared`). The
 positional inputs' distinct views are replayed, origin `replay`, drawn by
 `--sample N --seed S`, N from each stratum (a decode rung, or a prefill kind
 in a token band of `step_linear_fit.TOKEN_BANDS`), or all of them by `--sample
@@ -88,7 +89,8 @@ from atom.compass.run import _write_whole
 from atom.compass.run.step_grid import BOUNDS, keyed, keyed_of
 
 PROG = "compass measure steps"
-#: What of a step-record line is the batch it measures.
+#: What of a step-record line is the batch it measures; a planned line may also
+#: state the KV blocks its rows share, `shared`.
 VIEW = ("rows", "rung", "produces_output")
 
 
@@ -444,8 +446,14 @@ def _read(name: str, store, client_runs, sessions, engine: dict, sampling: dict)
     return source, lines, stated
 
 
-def _add(points: dict, line: dict, origin: str, sources, traces, plan=None):
+def view_of(line: dict) -> dict:
+    """The batch `line` states, as its measurement's key digests it."""
     view = {k: line[k] for k in VIEW}
+    return view | {"shared": line["shared"]} if "shared" in line else view
+
+
+def _add(points: dict, line: dict, origin: str, sources, traces, plan=None):
+    view = view_of(line)
     point = points.setdefault(
         _digest(view),
         {"view": view, "origin": origin, "sources": set(), "traces": set()},

@@ -41,7 +41,13 @@ from atom.compass.artifacts import (
     Topology,
     member_name,
 )
-from atom.compass.backends import BatchView, CostRefused, RequestShape, step_grid_fit
+from atom.compass.backends import (
+    BatchView,
+    CostRefused,
+    RequestShape,
+    step_grid_fit,
+    step_grid_plan,
+)
 from atom.compass.backends.step_grid import (
     StepGridBackend,
     equivalent_shape,
@@ -50,7 +56,7 @@ from atom.compass.backends.step_grid import (
 from atom.compass.backends.step_grid_residual import Residual, order, raggedness
 from atom.compass.backends.step_labels import digest
 from atom.compass.bench import window
-from atom.compass.bench.measure import measurement_key
+from atom.compass.bench.measure import measurement_key, view_of
 from atom.compass.fit.samples import MEMBER
 from atom.compass.run import step_grid
 from atom.compass.spec import MachineSpec
@@ -130,10 +136,11 @@ def run(tmp_path):
     return r, here, configuration
 
 
-def record(tmp_path, run, lines, name="a", trace="trace-300", session=300):
+def record(tmp_path, run, lines, name="a", trace="trace-300", session=300, blocks=1024):
     """`tmp_path/name`, a real run's record of `lines`, each timed at its lookup
-    times `factor`, with the export `client.json` of the client run sending it
-    from `trace`, which the export gives `session`."""
+    times `factor`, on a pool of `blocks` KV blocks, with the export
+    `client.json` of the client run sending it from `trace`, which the export
+    gives `session`."""
     r, _, configuration = run
     directory = tmp_path / name
     path = directory / "steps" / "dp0.jsonl"
@@ -147,7 +154,7 @@ def record(tmp_path, run, lines, name="a", trace="trace-300", session=300):
     path.write_text("".join(json.dumps(x) + "\n" for x in written))
     export = {"requests": sent, "sessions": {trace: session}}
     (directory / "client.json").write_text(json.dumps(export))
-    engine = {**step_grid.keyed(r.config), **BOUNDS, "num_kvcache_blocks": 1024}
+    engine = {**step_grid.keyed(r.config), **BOUNDS, "num_kvcache_blocks": blocks}
     (path.parent / "dp0.engine.json").write_text(json.dumps(engine))
     kind, revision = configuration["source_root"].split("-", 1)
     run_json = {
@@ -286,6 +293,31 @@ def test_a_fitted_bundle_validates_its_held_out_batches_and_not_a_batch_outside_
         del fitted_kind["held_out"]
     bare = StepGridBackend(backend.grid, Residual(residual), "bare")
     assert [validated(x, bare) for x in held] == [o and False for o in outcomes]
+
+
+def test_a_decode_node_past_the_pool_is_measured_shared_and_read_as_measured(
+    tmp_path, run
+):
+    """At a 511-block pool, 8 decode rows on c 1023 hold 512 blocks apart; the
+    plan has them share 1, and puts c 1007, their KV limit, among rung 8's c
+    nodes. The bundle states the share, and a step on that node reads it."""
+    lines = nodes() * 4 + mixed()
+    a = record(tmp_path, run, lines, blocks=511)
+    engine = json.loads((a / "steps/dp0.engine.json").read_text())
+    planned = step_grid_plan.plan(DEFINITION, enumerate(lines), {"a": engine})
+    for line in planned["lines"]:
+        measured(tmp_path, run, view_of(line))
+
+    copy = fitted(tmp_path, a, *clients(a))
+
+    points = copy["params"]["grid"]["decode"]["points"]
+    assert [(p["at"], p["shared"]) for p in points if "shared" in p] == [
+        ([8, 8, 1023], 1)
+    ]
+    top = view(batch([(1, 1024, True)] * 8))
+    (term,) = loaded(tmp_path, run, copy).price(top).terms
+    assert term.provenance.source == "step-grid"
+    assert term.provenance.detail.split(";")[0].endswith("measured")
 
 
 def test_a_planned_point_the_store_does_not_hold_refuses_naming_each(tmp_path, run):
