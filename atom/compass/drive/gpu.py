@@ -11,12 +11,10 @@ that GPU's index, or when KFD charges it memory of that GPU
 (`/sys/class/kfd/kfd/proc/<n>/vram_<gpu_id>`), which also counts a process that
 holds memory there without having opened the GPU's DRM device.
 
-The listing's PIDs are the kernel's, which a container with its own PID
-namespace does not show. The calling process, which may itself hold a named
-GPU's memory (importing LMCache opens a HIP context), is left out by the PID of
-the KFD entry its own open of `/dev/kfd` adds (`kfd_pid`), which takes an open
-before it touches a GPU; without one, by the PID `/proc/self/sched` prints, the
-kernel's only outside such a namespace. The run's own processes are told apart by when the checks run: before
+The listing's PIDs are the kernel's. The calling process, which may itself hold
+a named GPU's memory (importing LMCache opens a HIP context), is left out by
+its own KFD entry (`kfd_pid`), whose PID differs from the one it sees in a
+container. The run's own processes are told apart by when the checks run: before
 the run none has started, and after it every one has exited, so any other
 process listed on a named GPU at either check is not this run's.
 
@@ -113,21 +111,19 @@ def quiet(gpus: tuple[int, ...], out: Path):
     Enter it before the run touches a GPU, and leave it once the run's
     processes have exited.
     """
-    me = kfd_pid()
-    if held := _check(gpus, out, "before", me):
+    if held := _check(gpus, out, "before"):
         raise GpuRefusal(f"{held} before the run, so it was not started")
     try:
         yield
     finally:
-        if held := _check(gpus, out, "after", me):
+        if held := _check(gpus, out, "after"):
             raise GpuRefusal(f"{held} after the run, so it fails")
 
 
 def kfd_pid() -> str:
-    """This process's PID as KFD and rocm-smi list it: the KFD entry its own
-    open of `/dev/kfd` added, while KFD lists it. Only an open before anything
-    else in the process opens a GPU adds one, so call this first. Without one,
-    the PID `/proc/self/sched` prints."""
+    """This process's PID as KFD lists it: the KFD entry its first open of
+    `/dev/kfd` added, which takes that open before the process opens a GPU;
+    without one, the PID `/proc/self/sched` prints."""
     procs = KFD / "proc"
 
     def listed() -> set[str]:
@@ -145,9 +141,8 @@ def kfd_pid() -> str:
     return re.search(r"\((\d+), #threads", SCHED.read_text()).group(1)
 
 
-def _check(gpus: tuple[int, ...], out: Path, when: str, me: str) -> str:
-    """Run preflight.sh and save the process listing; name what is on `gpus`
-    by any process but `me`."""
+def _check(gpus: tuple[int, ...], out: Path, when: str) -> str:
+    """Run preflight.sh and save the process listing; name what is on `gpus`."""
     log = out / f"preflight_{when}.txt"
     with log.open("w") as f:
         # A file, not a pipe: a rocminfo wedged past preflight's own timeout
@@ -166,6 +161,7 @@ def _check(gpus: tuple[int, ...], out: Path, when: str, me: str) -> str:
     (out / f"gpu_{when}.txt").write_text(listing)
     on = {pid: drm.split() for pid, drm in _ON.findall(listing)}
     nodes = cache(partial(_nodes, gpus))
+    me = kfd_pid()
     return ", ".join(
         f"GPU {gpu} has PID {pid} on it"
         for pid in _PID.findall(listing)
