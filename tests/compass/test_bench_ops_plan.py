@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 from concurrent.futures.process import BrokenProcessPool
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -847,6 +848,31 @@ def test_measure_ops_without_enforce_eager_refuses_by_name_and_traces_nothing(
     assert traced == []
 
 
+def test_measure_ops_plan_hands_plan_the_atom_arguments_after_the_separator(
+    tmp_path, monkeypatch, model_config  # noqa: F811
+):
+    config = SimpleNamespace(**vars(model_config))
+    config.pipeline_parallel_size = config.prefill_context_parallel_size = 1
+    config.enable_dp_attention = False
+    config.compilation_config = SimpleNamespace(level=0)
+    got = []
+    monkeypatch.setattr("atom.compass.bench.measure.atom_config", lambda a: config)
+    monkeypatch.setattr("atom.compass.drive.gpu.hip_visible", lambda g: "0")
+    monkeypatch.setattr("atom.compass.drive.gpu.quiet", lambda g, out: nullcontext())
+    monkeypatch.setattr("atom.compass.drive.identity.identity", lambda *a: {})
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(step_grid, "keyed", lambda c: {})
+    monkeypatch.setattr(ops, "keys", lambda c, r: None)
+    monkeypatch.setattr(ops, "plan", lambda *a: got.append(a[7:]))
+    atom_args = ["--model", config.model, "--enforce-eager", "--enable-expert-parallel"]
+    argv = ["--plan", "records", "--store", str(tmp_path / "store")]
+    argv += ["--out", str(tmp_path / "out"), "--llc-mib", "256", "--gpu", "0"]
+
+    ops.main([*argv, "--", *atom_args])
+
+    assert got == [(atom_args,)]
+
+
 def _dies(*finished):
     """`_bench` as a child that dies once for each entry of `finished`, having
     journaled that many of its points, and then lives; and the records it was
@@ -959,7 +985,7 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     atom_args = ["--model", str(model), "-tp", "8", "--enforce-eager", parallel]
     monkeypatch.setattr("atom.config.Config", _Config)
     config = forward._config(str(model), 8, atom_args)  # laid out, as `main` does
-    config.max_num_seqs = 4
+    config.max_num_seqs, config.max_model_len = 4, CONFIG.max_model_len
     published = []
 
     def trace(model, tp, shapes, tmpdir, atom_args, arch):
@@ -1001,10 +1027,9 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     monkeypatch.setattr(step_grid, "keyed", KEYED)
     monkeypatch.setattr(ops, "_child", child)
     monkeypatch.setattr(forward, "device_arch", lambda: "gfx942")
+    steps = ([[1, 1000, True]], 1), ([[40, 40, False]], None)
     args = SimpleNamespace(
-        plan=[_records(tmp_path / "plan", ([[1, 1000, True]], 1))],
-        store=root,
-        llc_mib=256,
+        plan=[_records(tmp_path / "plan", *steps)], store=root, llc_mib=256
     )
 
     ops.plan(
@@ -1013,11 +1038,13 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
 
     assert published
     assert {(s.split("} ")[-1], tp) for s, tp in published} == {
-        (f"{widths} decode eager", 8)
+        (f"{widths} {phase} eager", 8) for phase in ("decode", "prefill")
     }
     records = [
         json.loads(x) for x in (tmp_path / "plan.jsonl").read_text().splitlines()
     ]
     rungs = {f"decode B={b}" for b in schedulable_ladder(config)}
-    assert {r["shape"] for r in records} == rungs
+    shapes = {r["shape"] for r in records}
+    assert {s for s in shapes if s.startswith("decode")} == rungs
+    assert "prefill T=40 B=1" in shapes
     assert not [r for r in records if "refused" in r]
