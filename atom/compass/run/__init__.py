@@ -1291,11 +1291,11 @@ def runner(model_runner, tree) -> None:
         if "engine_config" in law:
             from atom.compass.run.step_grid import keyed
 
-            fitted = law["engine_config"]
+            fitted, here = law["engine_config"], keyed(config)
             differ = [
-                f"{name} {fitted.get(name)!r} in the law and {value!r} here"
-                for name, value in keyed(config).items()
-                if fitted.get(name) != value
+                f"{name} {fitted.get(name)!r} in the law and {here.get(name)!r} here"
+                for name in {**fitted, **here}
+                if fitted.get(name) != here.get(name)
             ]
             if differ:
                 raise ValueError(

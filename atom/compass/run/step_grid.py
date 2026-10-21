@@ -22,8 +22,9 @@ definition and the residual's sources, which loading does not read.
 Its publisher states the readings `conditions` takes. The engine-config reading
 is `keyed`, as JSON: the ladder the runner replays (none under
 ``enforce_eager``), the KV block size and dtype, the quantization, the TP and
-DP widths, DP attention, expert parallelism, TBO, the performance
-environment and, under speculation, its method and draft width. Loading refuses, naming what differs:
+DP widths, DP attention, expert parallelism, TBO, the MoE backend and EPLB when
+off ATOM's default, the performance environment and, under speculation, its
+method and draft width. Loading refuses, naming what differs:
 
 - a run at data-parallel width above one, since every bundle is measured at one;
 - a keyed condition, the grid's graph mode, a timing scope other than the
@@ -70,16 +71,27 @@ from atom.compass.runner.overrides import schedulable_ladder
 
 #: The bundle's member a run reads: a group's step has a single writer.
 MEMBER = ("params", Topology().ranks()[0], "json")
+#: Engine fields keyed only off ATOM's default, so keys written before they
+#: were read do not move.
+OFF_DEFAULT = ("moe_backend", "eplb_enable")
 
 
-def keyed(config) -> dict:
+def keyed(config, ladder: bool = True) -> dict:
     """The conditions a bundle is measured under, as the resolved config holds them,
-    and the performance environment of this process less the client's and the
-    device selection, and under speculation its method and draft width."""
+    `OFF_DEFAULT` only where it is off ATOM's default, and the performance
+    environment of this process less the client's and the device selection, and
+    under speculation its method and draft width; the ladder only with `ladder`."""
+    from atom.config import Config
+
     spec = getattr(config, "speculative_config", None)
     drafts = {"speculative": [spec.method, spec.num_speculative_tokens]} if spec else {}
+    if ladder:
+        drafts["ladder"] = [] if config.enforce_eager else schedulable_ladder(config)
+    for name in OFF_DEFAULT:
+        default = Config.__dataclass_fields__[name].default
+        if (value := getattr(config, name, default)) != default:
+            drafts[name] = value
     return drafts | {
-        "ladder": [] if config.enforce_eager else schedulable_ladder(config),
         "kv_cache_block_size": config.kv_cache_block_size,
         "kv_cache_dtype": config.kv_cache_dtype,
         "quantization": config.quant_config.compute_hash(),

@@ -1,235 +1,145 @@
 # SPDX-License-Identifier: MIT
-"""An `op_graph`'s key names the routed experts' Triton path: one store holds
-an aiter and a Triton graph of V4-Pro at EP8 for one shape, and each reader
-takes the one its environment selects. Keys of aiter's path and of dense
-models are what they were.
+"""An `op_graph`'s key holds the engine config a step law is keyed by, less its
+ladder: one store holds V4-Pro graphs of one shape that differ only in the KV
+cache dtype, or only in ``ATOM_USE_TRITON_MOE``, and each reader takes its own.
+A step law is checked on the same fields, so one fitted on aiter's experts
+refuses a Triton run; a config at ATOM's MoE defaults keys the fields an
+existing law states.
 
-No device: `torch.cuda` reports the arch as a capture's declared device does,
-and ATOM's own `Mxfp4MoEMethod` decides the path on a stated arch.
+No device: `torch.cuda` reports the arch as a capture's declared device does.
 """
 
-import itertools
 import json
-import os
 import pathlib
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 from test_artifact_store import CONDITIONS, GATES, stanza
+from test_drive_runfile import build, install, step_linear
+from test_op_graph_arch import ENGINE
+from test_run_step_grid import deployment
 
+from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.bench import ops
 from atom.compass.capture import driverless
-from atom.compass.capture.forward import _check_experts, decode, experts, structure
+from atom.compass.capture.forward import decode, structure
 from atom.compass.run import _op_graphs
+from atom.compass.run.step_grid import keyed
 
 RANK = Topology().ranks()[0]
-TRITON = (
-    "ATOM_USE_TRITON_MOE",
-    "ATOM_USE_TRITON_MOE_A4W4",
-    "ATOM_USE_TRITON_MOE_DECODE",
-)
+LAW = pathlib.Path(__file__).parents[2] / "scripts/compass/laws"
+LAW /= "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json"
+#: Each graph's config fields and environment off the first's.
+VARIANTS = {
+    "bf16": ({}, {}),
+    "fp8": ({"kv_cache_dtype": "fp8"}, {}),
+    "triton": ({}, {"ATOM_USE_TRITON_MOE": "1"}),
+}
 
 
 @pytest.fixture(autouse=True)
 def environment(monkeypatch):
-    for name in (*TRITON, "ATOM_USE_TRITON_GEMM"):
+    for name in PERFORMANCE_KEYS:
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(
-        torch.cuda, "get_device_properties", lambda *a, **k: driverless._props("gfx950")
-    )
 
 
-def _config(tmp_path, architecture="DeepseekV4ForCausalLM", ep=True, **hf):
+def _v4(tmp_path, **fields):
+    """DeepSeek-V4-Pro at DPA-TP8 EP8."""
     (tmp_path / "model").mkdir(exist_ok=True)
     (tmp_path / "model" / "config.json").write_text("{}")
     return SimpleNamespace(
         model=str(tmp_path / "model"),
-        hf_config=SimpleNamespace(architectures=[architecture], **hf),
+        hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
         tensor_parallel_size=1,
         parallel_config=SimpleNamespace(data_parallel_size=8),
-        enable_expert_parallel=ep,
+        enable_expert_parallel=True,
         enforce_eager=True,
+        **ENGINE | {"enable_dp_attention": True} | fields,
     )
 
 
 @pytest.fixture
-def v4(tmp_path):
-    return _config(tmp_path, n_routed_experts=384)
-
-
-@pytest.fixture
-def store(tmp_path, v4, monkeypatch):
-    """A `decode B=2` graph of V4-Pro at EP8 on gfx950 keyed as a capture keys
-    it with ATOM's environment unset, and one under ``ATOM_USE_TRITON_MOE=1``,
-    each region naming its path."""
+def store(tmp_path, monkeypatch):
+    """A `decode B=2` graph of each variant on gfx950, keyed as a capture keys
+    it, its region naming the variant."""
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda *a, **k: driverless._props("gfx950")
+    )
     store = ArtifactStore(str(tmp_path / "store"))
-    for path, env in (("aiter", None), ("triton", "1")):
-        if env:
-            monkeypatch.setenv("ATOM_USE_TRITON_MOE", env)
-        key = Key.of(
-            Kind.OP_GRAPH, structure=structure(v4, "decode"), shape="decode B=2"
-        )
+    for name, (fields, env) in VARIANTS.items():
+        with monkeypatch.context() as m:
+            for k, v in env.items():
+                m.setenv(k, v)
+            at = structure(_v4(tmp_path, **fields), "decode")
         store.publish(
-            key,
+            Key.of(Kind.OP_GRAPH, structure=at, shape="decode B=2"),
             provenance=stanza("compass trace ops"),
             topology=Topology(),
             conditions=CONDITIONS,
             gates=GATES,
             members={
                 member_name("graph", RANK, "json"): json.dumps(
-                    {"region": {"op": path}}
+                    {"region": {"op": name}}
                 ).encode()
             },
         )
-    monkeypatch.delenv("ATOM_USE_TRITON_MOE")
     return store
 
 
-@pytest.mark.parametrize("env,path", [(None, "aiter"), ("0", "aiter"), ("1", "triton")])
-def test_each_reader_takes_the_graph_its_environment_selects(
-    store, v4, monkeypatch, env, path
+@pytest.mark.parametrize("name", VARIANTS)
+def test_each_reader_takes_the_graph_of_its_own_engine(
+    store, tmp_path, monkeypatch, name
 ):
-    if env:
-        monkeypatch.setenv("ATOM_USE_TRITON_MOE", env)
+    fields, env = VARIANTS[name]
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    config = _v4(tmp_path, **fields)
 
-    assert _op_graphs(store.root, v4, "gfx950")("decode", 2, 2) == {"op": path}
-    assert ops.graph(store, v4, decode(2))["region"] == {"op": path}
-
-
-def test_aiter_and_dense_keys_are_unchanged(tmp_path, v4, monkeypatch):
-    digest = structure(v4, "decode").split()[2]
-    assert structure(v4, "decode") == (
-        f"DeepseekV4ForCausalLM gfx950 {digest} tp=1 dp=8 ep=8 decode eager"
-    )
-    monkeypatch.setenv("ATOM_USE_TRITON_MOE", "1")
-    dense = _config(tmp_path, "Qwen3ForCausalLM", ep=False)
-    dense.parallel_config.data_parallel_size = 1
-
-    assert structure(dense, "decode", device="gfx942") == (
-        f"Qwen3ForCausalLM gfx942 {digest} tp=1 decode eager"
-    )
-    assert structure(v4, "decode").endswith(" ep=8 experts=triton decode eager")
+    assert _op_graphs(store.root, config, "gfx950")("decode", 2, 2) == {"op": name}
+    assert ops.graph(store, config, decode(2))["region"] == {"op": name}
 
 
-#: Arch, EP, EPLB, MegaMoE, ATOM_USE_TRITON_MOE (None unset),
-#: ATOM_USE_TRITON_GEMM, ATOM_USE_TRITON_MOE_DECODE.
-GRID = list(
-    itertools.product(
-        ("gfx942", "gfx950", "gfx1250"),
-        (False, True),
-        (False, True),
-        (False, True),
-        (None, "0", "1"),
-        ("0", "1"),
-        ("0", "1"),
-    )
+@pytest.mark.parametrize(
+    "fitted, here, env, named",
+    [
+        (
+            {},
+            {},
+            {"ATOM_USE_TRITON_MOE": "1"},
+            "env {} in the law and {'ATOM_USE_TRITON_MOE': '1'} here",
+        ),
+        (
+            {"moe_backend": "mega"},
+            {},
+            {},
+            "moe_backend 'mega' in the law and None here",
+        ),
+        ({}, {"eplb_enable": True}, {}, "eplb_enable None in the law and True here"),
+    ],
+    ids=["triton-run", "mega-law", "eplb-run"],
 )
-#: Builds ATOM's own method at every point of `GRID` in a process of its own,
-#: since the driverless declarations aiter's import needs are process-global;
-#: prints each point's key qualifier, the method's flags, and the capture
-#: check's refusal or None.
-METHODS = """
-import json, os, sys
-from types import SimpleNamespace
-from atom.compass.capture import driverless
-driverless.install(sys.argv[1], "gfx950")
-from aiter import QuantType, dtypes
-from atom.compass.capture.forward import _check_experts, experts
-from atom.model_ops import moe
-import torch
-quant = SimpleNamespace(quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp4x2,
-                        quant_method="", is_dynamic=True)
-out = []
-for arch, ep, eplb, mega, triton, gemm, decoding in json.loads(sys.argv[2]):
-    os.environ.pop("ATOM_USE_TRITON_MOE", None)
-    if triton is not None:
-        os.environ["ATOM_USE_TRITON_MOE"] = triton
-    os.environ["ATOM_USE_TRITON_GEMM"] = gemm
-    os.environ["ATOM_USE_TRITON_MOE_DECODE"] = decoding
-    moe.get_gfx = lambda: arch
-    current = SimpleNamespace(eplb_enable=eplb)
-    moe.get_current_atom_config = lambda: current
-    moe_config = SimpleNamespace(mxfp4_fp8_activations=False, a_quant_dtype=None,
-                                 use_ep=ep)
-    method = (moe.MegaMxfp4MoEMethod if mega else moe.Mxfp4MoEMethod)(quant, moe_config)
-    config = SimpleNamespace(
-        hf_config=SimpleNamespace(n_routed_experts=384), tensor_parallel_size=1,
-        parallel_config=SimpleNamespace(data_parallel_size=8),
-        enable_expert_parallel=ep, eplb_enable=eplb,
-        moe_backend="mega" if mega else "standard")
-    named = experts(config, arch)
-    model = torch.nn.Module()
-    model.experts = torch.nn.Module()
-    model.experts.quant_method = method
-    try:
-        _check_experts(model, named)
-        refused = None
-    except ValueError as exc:
-        refused = str(exc)
-    flags = [method.use_triton, method.use_triton_ep, method.use_triton_decode]
-    out.append([named, *map(bool, flags), refused])
-print(json.dumps(out))
-"""
+def test_a_step_law_refuses_a_run_on_other_experts_naming_the_field(
+    monkeypatch, tmp_path, fitted, here, env, named
+):
+    entry = step_linear(tmp_path, deployment(tmp_path, **fitted))
+    run = build(tmp_path, "--step-linear", entry.key.token())
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+    with pytest.raises(ValueError, match="fitted under another engine config") as e:
+        install(tmp_path, monkeypatch, run, deployment(tmp_path, **here))
+    assert named in str(e.value)
 
 
-@pytest.fixture(scope="module")
-def methods(tmp_path_factory):
-    env = {k: v for k, v in os.environ.items() if k not in TRITON}
-    done = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            METHODS,
-            str(tmp_path_factory.mktemp("d")),
-            json.dumps(GRID),
-        ],
-        capture_output=True,
-        check=False,
-        text=True,
-        env=env,
-        cwd=pathlib.Path(__file__).resolve().parents[2],
-    )
-    assert done.returncode == 0, done.stderr[-3000:]
-    return dict(zip(GRID, json.loads(done.stdout.splitlines()[-1])))
+def test_atom_s_moe_defaults_key_the_fields_an_existing_law_states(tmp_path):
+    law = json.loads(LAW.read_text())["engine_config"]
+    default = keyed(deployment(tmp_path, moe_backend="standard").config)
+    moved = keyed(deployment(tmp_path, moe_backend="mega", eplb_enable=True).config)
 
-
-@pytest.mark.parametrize("point", GRID, ids=lambda p: "-".join(map(str, p)))
-def test_the_key_names_the_path_atom_s_method_takes(methods, point):
-    named, triton, triton_ep, triton_decode, refused = methods[point]
-
-    assert refused is None
-    assert ("triton" in named) == (triton or triton_ep)
-    assert ("+decode" in named) == triton_decode
-
-
-def test_a4w4_is_named_on_the_triton_path(v4, monkeypatch):
-    monkeypatch.setenv("ATOM_USE_TRITON_MOE", "1")
-    monkeypatch.setenv("ATOM_USE_TRITON_MOE_A4W4", "1")
-
-    assert experts(v4, "gfx950") == " experts=triton+a4w4"
-
-
-def test_a_text_config_s_routed_experts_count(tmp_path, monkeypatch):
-    monkeypatch.setenv("ATOM_USE_TRITON_MOE", "1")
-    text = SimpleNamespace(num_experts=512)
-    vision = _config(tmp_path, "Qwen3_5MoeForConditionalGeneration", text_config=text)
-
-    assert experts(vision, "gfx950") == " experts=triton"
-
-
-def test_a_capture_refuses_experts_on_another_path_than_its_key_names():
-    model = torch.nn.Module()
-    model.experts = torch.nn.Module()
-    model.experts.quant_method = SimpleNamespace(
-        use_triton=False, use_triton_ep=True, use_triton_decode=False
-    )
-
-    with pytest.raises(
-        ValueError,
-        match=r"at experts take .*\(True, False\); the op_graph key names aiter",
-    ):
-        _check_experts(model, "")
+    assert default.keys() == law.keys()
+    assert {k: v for k, v in moved.items() if k not in law} == {
+        "moe_backend": "mega",
+        "eplb_enable": True,
+    }
