@@ -267,8 +267,10 @@ def test_each_placement_keeps_its_own_forward_context_and_metadata():
 
 def _measuring(monkeypatch):
     """A stand-in runner `measure` builds, a rule that refuses a batch of two
-    rows, and two points of two leaves each: two rows, then four."""
+    rows, and two points of two leaves each: two rows, then four. A leaf times
+    1 ns, with or without a device to time it on."""
     monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
     runner = _Runner()
     runner.exit = lambda: runner.batches.append("exit")
 
