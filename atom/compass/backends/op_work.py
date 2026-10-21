@@ -27,7 +27,7 @@ no extractor, or a leaf its extractor cannot price, is refused by name.
 DeepSeek-V4's MoE takes the step roofline's expectation under independent
 uniform routing: the routed experts run the rows the leaf holds, under expert
 parallelism the busiest rank's expected share, at the format the op quantizes
-its rows to, and read each activated expert once; an exchange's group width
+its rows to, and read each activated expert once; a DP exchange's group width
 is read off its own shapes. ATOM's Triton experts run as aiter's grouped
 GEMMs, each priced so, at the activation format its kind names; their
 expert-parallel width is the run's `ep`, the experts `ep` times a rank's.
@@ -35,6 +35,7 @@ expert-parallel width is the run's `ep`, the experts `ep` times a rank's.
 
 from __future__ import annotations
 
+import inspect
 import math
 
 import torch
@@ -238,11 +239,10 @@ def _routing(view, tokens, k, experts, ranks):
     return max_rank_load(tokens, k, experts, ranks), groups / ranks
 
 
-def _fused_moe(op, view, tp, kv) -> Work:
+def _fused_moe(op, view, tp, kv, ep) -> Work:
     """The routed experts on `hidden_states`' rows, each route through one
     expert's gate-up and down products, routed as `_routing` says. Under
-    expert parallelism `expert_mask` spans every rank's experts, of which
-    this rank holds `w1`'s.
+    expert parallelism `w1` holds this rank's share of `ep` times its experts.
 
     With a nonzero `quant_type` the op quantizes `hidden_states` to the
     weights' format inside it, so both products run at that format; otherwise
@@ -252,9 +252,7 @@ def _fused_moe(op, view, tp, kv) -> Work:
     args = op["args"]
     (rows, hidden), k = args["hidden_states"]["shape"], args["topk_ids"]["shape"][1]
     local, up = args["w1"]["shape"][:2]
-    mask = args.get("expert_mask")
-    ranks = mask["shape"][0] // local if mask else 1
-    routed, groups = _routing(view, rows, k, local * ranks, ranks)
+    routed, groups = _routing(view, rows, k, local * ep, ep)
     b = _fmt(args["w1"]["dtype"])
     a = b if args.get("quant_type") else _fmt(args["hidden_states"]["dtype"])
     flops = grouped_gemm(routed, up, hidden, groups, a, b)
@@ -310,20 +308,17 @@ def _downcast(op, view, tp, kv) -> Work:
     return _boundary(op) + Work({}, values * (_size(args["out_quant_type"]) + 1 / 32))
 
 
-def _mori(*payload, dispatch: bool):
+def _mori(*payload):
     """MORI's dispatch, or its combine back: each of this rank's tokens, its
     `payload` rows, goes to every other rank holding one of its `k` experts.
-    The group is `num_ep_ranks` wide, or, in a graph that does not state it,
-    the received buffer's rows over the tokens. With the experts split evenly,
+    The group is the run's EP width, N `ranks`. With the experts split evenly,
     a rank holds one of a token's experts with chance at least
     `1 - (1 - 1/N)^k`, whatever the expert count. The step roofline
     counts the exchange alone, and so does this."""
 
-    def extract(op, view, tp, kv) -> Work:
+    def extract(op, view, tp, kv, ranks) -> Work:
         args = op["args"]
         tokens, k = args["indices"]["shape"]
-        buffer = op["out"][0] if dispatch else args["input"]["shape"]
-        ranks = args.get("num_ep_ranks") or buffer[0] // tokens
         row = sum(_bytes(t) / t["shape"][0] for s in payload for t in _tensors(args[s]))
         return all_to_all(ranks, tokens * activated_experts(ranks, 1, k) * row)
 
@@ -611,8 +606,8 @@ EXTRACTORS = {
     MOE + "all_gatherv": _dp_exchange,
     MOE + "reduce_scatter_with_unpadding": _dp_exchange,
     MOE + "reduce_scatterv": _dp_exchange,
-    MORI + "dispatch": _mori("input", "weights", "scales", "indices", dispatch=True),
-    MORI + "combine": _mori("input", "weights", dispatch=False),
+    MORI + "dispatch": _mori("input", "weights", "scales", "indices"),
+    MORI + "combine": _mori("input", "weights"),
     "_c10d_functional.all_to_all_single.default": _all_to_all,
     V4_INDICES + "decode_indices:build_v4_paged_decode_indptr": _launch,
     V4_INDICES + "decode_indices:write_v4_paged_decode_indices": _launch,
@@ -636,6 +631,8 @@ EXTRACTORS = {
     "atom.model_ops.decode_input_ids:fill_deferred_decode_ids": _in_place(),
     "atom.utils.block_convert:kv_indices_generate_triton": _kv_indices,
 }
+#: Every kind whose extractor takes the EP width, as a fifth parameter.
+SHARDED = {n for n, f in EXTRACTORS.items() if len(inspect.signature(f).parameters) > 4}
 
 
 def work(
@@ -655,7 +652,7 @@ def work(
     if op["out"] and not any(map(math.prod, op["out"])):
         return None
     try:
-        return extract(op, view, tp, kv_format, *([ep] if name in EXPERTS else []))
+        return extract(op, view, tp, kv_format, *([ep] if name in SHARDED else []))
     except _Unpriced as error:
         reason = f"the op kind {name}: {error}"
     raise CostRefused(view, [Refusal(SOURCE, reason)])

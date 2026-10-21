@@ -1152,6 +1152,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
 
 
 def _coverage_main(argv: list[str], atom_args: list[str]) -> dict:
+    from atom.compass.bench import ranks
     from atom.compass.bench.measure import atom_config
     from atom.compass.capture import driverless
 
@@ -1172,6 +1173,7 @@ def _coverage_main(argv: list[str], atom_args: list[str]) -> dict:
         # aiter asks rocminfo for an arch at import, which the config reaches.
         driverless._declare_arch(tmpdir, arch)
         config = atom_config(atom_args)
+        ranks.layout(config)
         _eager(config)
         names = args.coverage
         return coverage(store, args.store, config, names, records, arch, atom_args)

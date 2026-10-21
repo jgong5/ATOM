@@ -200,7 +200,7 @@ def test_an_mtp_record_is_measured_by_its_target(tmp_path):
     assert refused == Refusal(bound.SOURCE, bound.UNSPLIT)
 
 
-def _main(monkeypatch, tmp_path, records, tp=1, more=()):
+def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1):
     config = SimpleNamespace(
         tensor_parallel_size=tp,
         kv_cache_dtype="bf16",
@@ -209,7 +209,9 @@ def _main(monkeypatch, tmp_path, records, tp=1, more=()):
         speculative_config=None,
         parallel_config=SimpleNamespace(data_parallel_size=1),
     )
-    monkeypatch.setattr(bound, "_build", lambda *a: (config, None))
+    moe = SimpleNamespace(moe_parallel_config=SimpleNamespace(ep_size=ep))
+    tree = SimpleNamespace(modules=lambda: [SimpleNamespace(), moe])
+    monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
     monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree: STACK)
     monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: graph)
     spec = tmp_path / "spec.json"
@@ -318,3 +320,40 @@ def test_main_reports_an_ops_run_and_refuses_one_of_another_engine(
     (out / "engine.json").write_text(json.dumps(engine | {"kv_cache_dtype": "fp8"}))
     with pytest.raises(ValueError, match="kv_cache_dtype 'fp8' there, 'bf16' here"):
         _main(monkeypatch, tmp_path, [slow], more=["--ops", str(out)])
+
+
+def test_main_prices_ops_and_points_at_the_model_s_ep_width(monkeypatch, tmp_path):
+    slow = record(tmp_path / "slow", LINES[:3])
+    engine = {"tensor_parallel_size": 1, "kv_cache_dtype": "bf16"}
+    (slow / "steps" / "dp0.engine.json").write_text(json.dumps(engine))
+    out = plan(tmp_path / "plan", [])
+    (out / "engine.json").write_text(json.dumps(engine))
+    seen = {}
+    monkeypatch.setattr(
+        bound, "gate", lambda _, b, *a: seen.update(op=b["op"].ep) or {}
+    )
+    monkeypatch.setattr(bound, "ops", lambda *a: seen.update(points=a[-1]))
+    monkeypatch.setattr(bound, "text", lambda r: "")
+    monkeypatch.setattr(bound, "ops_text", lambda r: "")
+
+    _main(monkeypatch, tmp_path, [slow], more=["--ops", str(out)], ep=8)
+
+    assert seen == {"op": 8, "points": 8}
+
+
+def test_a_measured_point_prices_at_the_ep_width(tmp_path):
+    op = leaf(
+        "mori.ops.dispatch_combine:EpDispatchCombineOp.combine",
+        [[16384, 7168]],
+        input=t([16384, 7168]),
+        weights=None,
+        indices=t([2048, 6], "torch.int32"),
+    )
+    rows = [[2048, 2048, False]]
+    view = BatchView(tuple(RequestShape(*r) for r in rows), produces_output=True)
+    cold = price(op_work.work(op, view, 1, "bf16", 8), SPEC) * 1e9
+    out = plan(tmp_path, [point(op, "prefill T=2048 B=1", rows, cold)])
+
+    [q] = bound.ops(out, SPEC, 1, "bf16", 8)["measured_over_analytical"].values()
+
+    assert q["median"] == pytest.approx(1)

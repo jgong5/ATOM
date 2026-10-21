@@ -4266,6 +4266,43 @@
    "mechanism_why": "in the measuring command, which is no LP, before its run starts or after it stops; a GPU command serves no simulated run, so the bound stays real"
   },
   {
+   "id": "atom/compass/drive/run.py::_ep_width::ProcessPoolExecutor(1, mp_context=spawn)::thread_start#0",
+   "file": "atom/compass/drive/run.py",
+   "symbol": "_ep_width",
+   "call": "ProcessPoolExecutor",
+   "expr": "ProcessPoolExecutor(1, mp_context=spawn)",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "none",
+   "why": "compass run's coverage check builds the model on the meta device in one spawned process, to read the EP width ATOM's MoE resolves, before the command starts its server",
+   "mechanism": "K9",
+   "mechanism_why": "starting a process cannot park; the check runs in the compass run command before its server starts, and the command is no LP"
+  },
+  {
+   "id": "atom/compass/drive/run.py::_ep_width::pool.submit(_built_ep_width, atom_args, arch)::executor_handoff#0",
+   "file": "atom/compass/drive/run.py",
+   "symbol": "_ep_width",
+   "call": "pool.submit",
+   "expr": "pool.submit(_built_ep_width, atom_args, arch)",
+   "shape": "executor_handoff",
+   "peer": "process",
+   "why": "the coverage check hands ATOM's arguments and the declared arch to that process",
+   "mechanism": "K9",
+   "mechanism_why": "before the compass run command starts its server, and the command is no LP"
+  },
+  {
+   "id": "atom/compass/drive/run.py::_ep_width::pool.submit(_built_ep_width, atom_args, arch).result()::event_wait#0",
+   "file": "atom/compass/drive/run.py",
+   "symbol": "_ep_width",
+   "call": "pool.submit(_built_ep_width, atom_args, arch).result",
+   "expr": "pool.submit(_built_ep_width, atom_args, arch).result()",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "the coverage check waits for that process to return the EP width",
+   "mechanism": "K9",
+   "mechanism_why": "before the compass run command starts its server, and the command is no LP"
+  },
+  {
    "id": "atom/compass/drive/serve.py::serve::subprocess.Popen( argv, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True, )::thread_start#0",
    "file": "atom/compass/drive/serve.py",
    "symbol": "serve",
