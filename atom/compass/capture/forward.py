@@ -238,11 +238,11 @@ def _function(name: str):
 def _rebuilt(value, live):
     """An argument value as a call takes it: a `Reduced` object rebuilt (an
     enum member from its value, a dict from its items, any other object from
-    its class and state), tuples item by item, and `Tensor`, `ContextRef` and
-    `Affine` values through `live`."""
+    its class and state), tuples item by item, and `Tensor` and `ContextRef`
+    values through `live`."""
     if isinstance(value, tuple):
         return tuple(_rebuilt(item, live) for item in value)
-    if isinstance(value, (ir.Tensor, ir.ContextRef, ir.Affine)):
+    if isinstance(value, (ir.Tensor, ir.ContextRef)):
         return live(value)
     if not isinstance(value, Reduced):
         return value
@@ -293,7 +293,9 @@ class _Recorder(TorchDispatchMode):
     an operator) folded into it. It is called again, rebuilt from its contract
     under the fake mode, to check it launches those kernels and dispatches
     those operators again. A launch in a traced step outside every such call
-    is refused.
+    is refused, and so is a leaf that raises after it launched, or is still
+    open when the step ends; one that raises having launched nothing gives
+    back what it ran.
     """
 
     def __init__(self, contexts, fake_mode=None):
@@ -308,6 +310,14 @@ class _Recorder(TorchDispatchMode):
     def start(self):
         self.layer, self.items, self.left_out = None, [], []
         self.leaf = None  # the frame of the leaf call in progress
+
+    def __exit__(self, *exc):
+        super().__exit__(*exc)
+        if self.leaf is not None and exc[0] is None:
+            raise ValueError(
+                f"{self.items[-1][1].name} is still open when the step ends: "
+                "a call that neither returned nor raised has no end to fold to"
+            )
 
     @contextlib.contextmanager
     def quiet(self):
@@ -424,8 +434,22 @@ class _Recorder(TorchDispatchMode):
     def leave(self, code, offset, value):
         """A launching function's call ends: its leaf holds what ran inside,
         or, when it launched nothing, gives it back."""
+        if self.leaf is sys._getframe(1):
+            self._close()
+
+    def unwind(self, code, offset, exc):
+        """A launching function's call raises: refused once it launched, as no
+        replay can check a call cut short; else it gives back what it ran."""
         if self.leaf is not sys._getframe(1):
             return
+        if self.kernels:
+            raise ValueError(
+                f"{self.items[-1][1].name} raised {exc!r} after it launched "
+                f"{self.kernels}: a call cut short has no contract to replay"
+            )
+        self._close()
+
+    def _close(self):
         self.leaf, op = None, self.items[-1][1]
         if not self.kernels:
             self.items.pop()
@@ -571,7 +595,8 @@ def _patches(recorder):
       is refused; FlyDSL's at `JitFunction.__call__` and at a
       `CompiledFunction`'s call, which `flyc.compile` maps to its jit function.
     * Each call of a launching function, its entry and its return, is told to
-      the recorder through `sys.monitoring`, on those functions alone.
+      the recorder through `sys.monitoring`, on those functions alone; a raise
+      that unwinds a frame, on every function.
     * `CpuGpuBuffer.__init__` (ATOM's own) allocates its host side and that
       side's numpy view outside the fake mode, unpinned (pinning is a driver
       allocation); its device side is ATOM's `zeros_like`, faked.
@@ -692,19 +717,24 @@ def _patches(recorder):
 @contextlib.contextmanager
 def _entries(recorder):
     """`recorder.enter` and `recorder.leave` on each call of the functions it
-    turns `sys.monitoring`'s events on for, under a free tool id."""
+    turns `sys.monitoring`'s events on for, and `recorder.unwind` on every
+    frame a raise unwinds (an event no single function can take), under a
+    free tool id."""
     monitoring = sys.monitoring
     events = monitoring.events
     recorder.tool = next(i for i in range(6) if monitoring.get_tool(i) is None)
     monitoring.use_tool_id(recorder.tool, "compass capture")
     monitoring.register_callback(recorder.tool, events.PY_START, recorder.enter)
     monitoring.register_callback(recorder.tool, events.PY_RETURN, recorder.leave)
+    monitoring.register_callback(recorder.tool, events.PY_UNWIND, recorder.unwind)
+    monitoring.set_events(recorder.tool, events.PY_UNWIND)
     try:
         yield
     finally:
         for code in recorder.launchers:
             monitoring.set_local_events(recorder.tool, code, 0)
-        for event in (events.PY_START, events.PY_RETURN):
+        monitoring.set_events(recorder.tool, 0)
+        for event in (events.PY_START, events.PY_RETURN, events.PY_UNWIND):
             monitoring.register_callback(recorder.tool, event, None)
         monitoring.free_tool_id(recorder.tool)
 

@@ -40,6 +40,10 @@ V4 = "atom.model_ops.v4_kernels."
 DECODE = "aiter.mla:mla_decode_fwd_v4_nm"
 PS_DECODE = "aiter.mla_decode_v4_ps_asm.default"
 INDEXER = "aiter.indexer_score_topk.default"
+#: The bf16 KV cache's decode leaf, a Triton launch lifted to its function.
+BF16_DECODE = (
+    "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
+)
 #: The attention's core kernel, one a layer, by phase.
 CORE = {"decode": DECODE, "prefill": "aiter.pa_sparse_prefill_fp8_opus.default"}
 
@@ -294,7 +298,7 @@ def test_the_attention_body_runs_as_a_real_step_then_the_batch_is_dummy_again(
 ):
     import torch
 
-    from atom.compass.capture.forward import V4_DECODES, _v4_attention
+    from atom.compass.capture.forward import _v4_attention
     from atom.utils.forward_context import Context, get_forward_context
 
     # The model imports aiter, which needs a device arch: it is stood in for,
@@ -331,6 +335,7 @@ def test_the_attention_body_runs_as_a_real_step_then_the_batch_is_dummy_again(
     def stated(ratio, top):
         geometry = {"window_size": 64, "compress_ratio": ratio, "index_topk": top}
         ratio = {"compress_ratio": ratio}
-        return {**dict.fromkeys(V4_DECODES, geometry), INDEXER: ratio}
+        decodes = (DECODE, BF16_DECODE, PS_DECODE)
+        return {**dict.fromkeys(decodes, geometry), INDEXER: ratio}
 
     assert seen == [(False, stated(4, 512)), (False, stated(128, None))]

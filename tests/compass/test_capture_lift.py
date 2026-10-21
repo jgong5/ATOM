@@ -15,6 +15,9 @@ The rule runs here on functions written in this file, then through
 
 import dataclasses
 import enum
+import os
+import subprocess
+import sys
 import types
 
 import pytest
@@ -86,9 +89,44 @@ def _scaled(x, scale):
     return y.view(-1)
 
 
+def _held(x):
+    _Launcher(_tail_kernel)(x)
+
+
 def _outer(x):
     _scaled(x, 0.5)
     _run(_kernel, x)
+
+
+def _launch_then_raise(x, fail):
+    _run(_kernel, x)
+    if fail:
+        raise RuntimeError("fallback")
+
+
+def _raise_then_launch(x, fail):
+    x.add(1)
+    if fail:
+        raise RuntimeError("fallback")
+    _run(_kernel, x)
+
+
+def _caught(launcher):
+    """A caller that falls back when `launcher` raises, then runs on."""
+
+    def step(x):
+        try:
+            launcher(x, True)
+        except RuntimeError:
+            pass
+        x.mul(2)
+
+    return step
+
+
+def _launch_then_yield(x):
+    _run(_kernel, x)
+    yield
 
 
 def _maybe(x, launch):
@@ -155,6 +193,87 @@ def test_a_launch_lifts_past_closures_and_generic_launchers_with_its_entry_argum
     # As called: the function doubles `scale` before its launches.
     x = ir.Tensor((4, 8), "torch.float32", (8, 1), ir.Role.METADATA)
     assert dict(leaf.args) == {"x": x, "scale": 0.5}
+
+
+def test_a_launcher_holding_its_kernel_on_self_lifts_to_its_caller(recorder):
+    assert steps(recorder, _held, _held) == [f"{__name__}:_held"]
+
+
+def test_a_leaf_that_raises_after_it_launched_is_refused_by_name(recorder):
+    with pytest.raises(
+        ValueError,
+        match=r"_launch_then_raise raised RuntimeError\('fallback'\) after it "
+        r"launched \['triton._kernel'\]",
+    ):
+        steps(
+            recorder,
+            lambda x: _launch_then_raise(x, False),
+            _caught(_launch_then_raise),
+        )
+
+
+def test_a_leaf_that_raises_having_launched_nothing_gives_back_what_it_ran(
+    recorder,
+):
+    names = steps(
+        recorder, lambda x: _raise_then_launch(x, False), _caught(_raise_then_launch)
+    )
+
+    assert names == ["aten.add.Tensor", "aten.mul.Tensor"]
+
+
+def test_a_leaf_still_open_when_the_step_ends_is_refused_by_name(recorder):
+    held = []
+
+    def traced(x):
+        held.append(_launch_then_yield(x))
+        next(held[0])
+
+    with pytest.raises(ValueError, match="_launch_then_yield is still open"):
+        steps(recorder, lambda x: next(_launch_then_yield(x)), traced)
+    recorder.start()  # the generator's close unwinds a leaf no step traces
+
+
+def test_a_triton_warmup_launches_nothing_and_a_compiled_kernel_is_refused(
+    request, tmp_path
+):
+    if "COMPASS_ARCH_DECLARED" not in os.environ:
+        # The patches import aiter, which needs an arch declared: once per
+        # process, so in a process of its own.
+        env = {**os.environ, "COMPASS_ARCH_DECLARED": "1"}
+        test = f"{__file__}::{request.node.name}"
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", test],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+        assert done.returncode == 0, done.stdout[-4000:]
+        return
+    driverless.install(str(tmp_path), "gfx942")
+    import triton
+    from flydsl.compiler import jit_function as fly
+    from triton.compiler.compiler import CompiledKernel
+
+    @triton.jit
+    def kernel(x):
+        pass
+
+    recorder = forward._Recorder({})
+    compiled = CompiledKernel.__new__(CompiledKernel)
+    compiled.name, compiled.module = "kernel", None
+    with forward._patches(recorder):
+        recorder.on = True  # a launch outside every leaf is refused
+        kernel.warmup(1, grid=(1,))
+        with pytest.raises(ValueError, match="triton.kernel lifts to"):
+            kernel.run(1, grid=(1,), warmup=False)
+        for launch in (lambda: compiled.run, lambda: compiled[1]):
+            with pytest.raises(ValueError, match="through CompiledKernel.run"):
+                launch()
+        with pytest.raises(ValueError, match="compiled outside the capture"):
+            fly.CompiledFunction(None, None)()
 
 
 def test_a_launching_function_called_inside_another_folds_into_the_outermost(
