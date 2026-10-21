@@ -17,11 +17,14 @@ import json
 import math
 import re
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from test_artifact_invalidation import moved
 from test_artifact_store import stanza
+from test_backend_step_grid import past_pool_alpha
+from test_backend_step_grid import view as rows_view
 from test_backend_step_linear_fit import _record
 from test_bench_window import BUSY, MS, Bench
 from test_bench_window import batch as bench_batch
@@ -38,7 +41,7 @@ from atom.compass.artifacts import (
     Topology,
     member_name,
 )
-from atom.compass.backends import BatchView, CostRefused, RequestShape
+from atom.compass.backends import BatchView, CostRefused, RequestShape, step_grid_fit
 from atom.compass.backends.step_grid import (
     StepGridBackend,
     equivalent_shape,
@@ -537,3 +540,20 @@ def test_alpha_is_fitted_on_ragged_views_and_kept_only_where_no_cell_gets_worse(
         priced = backend.price(view(line)).seconds
         expected = ragged_time(line) if records_alpha else planted_time(line)
         assert priced == pytest.approx(expected * factor(line), rel=1e-5)
+
+
+def test_alpha_counts_the_views_it_reads_at_their_longest_row_past_the_kv_pool():
+    """32 rows, 31 at c 600 and the longest at c 900 or 1500: the pool holds 32
+    rows to c 1151, so a longest row at 1500 is read past it, and counted."""
+    views = [
+        SimpleNamespace(
+            view=rows_view(*[(1, 601, True)] * 31, (1, c + 1, True), rung=32),
+            device_s=5e-3,
+        )
+        for c in (900, 1500) * 4
+    ]
+
+    _, report = step_grid_fit._alpha(past_pool_alpha().grid, views, seed=0)
+
+    assert report["32"]["views"] == 8 and report["32"]["unread"] == []
+    assert report["32"]["past_pool"] == 4

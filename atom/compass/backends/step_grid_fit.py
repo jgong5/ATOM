@@ -42,8 +42,8 @@ relative residuals over those fitted, and the median absolute one over those
 held out, a band it holds no factor for counting as a factor of 0, as the fit
 counts it. It counts the triples whose lookup is extrapolated past the KV
 pool, and gives per rung each alpha form's terms and errors, the views the
-grid does not read, the cells' p50 without and with alpha, and whether the
-rung keeps it.
+grid does not read, how many it reads at their longest row past the KV pool,
+the cells' p50 without and with alpha, and whether the rung keeps it.
 """
 
 import copy
@@ -140,16 +140,17 @@ def _alpha(grid: StepGrid, views, seed: int) -> tuple[dict, dict]:
     rows, report = {}, {}
     for s in views:
         rung = s.view.capture_rung
-        got = report.setdefault(str(rung), {"views": 0, "unread": []})
+        got = report.setdefault(str(rung), {"views": 0, "unread": [], "past_pool": 0})
         got["views"] += 1
         longest = max(r.context_tokens - r.query_tokens for r in s.view.requests)
         try:
             cells, at = grid.locate(s.view)
             mean = grid.read(cells, s.view, at)[0]
-            top = grid.read(cells, s.view, (at[0], Fraction(longest)))[0]
+            top, _, _, beyond = grid.read(cells, s.view, (at[0], Fraction(longest)))
         except CostRefused as refused:
             got["unread"].append("; ".join(r.reason for r in refused.declined))
             continue
+        got["past_pool"] += bool(beyond)
         ratio, spread = length_statistics(s.view.requests)
         if ratio:
             g, t = float(mean * grid.unit), float(top * grid.unit)
