@@ -423,6 +423,37 @@ def test_a_plan_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_pa
     assert {r["context"] for r in records} == {1500, 3000}
 
 
+def test_coverage_keeps_a_leaf_s_reason_whichever_leaf_of_its_op_comes_later(
+    bench, tmp_path, monkeypatch
+):
+    def two_gemms(store, config, shape, arch=None):
+        rows = shape.tokens if shape.phase == "prefill" else shape.seqs
+        x = [_t([rows, width], "activation") for width in (8, 16)]
+        return _graph(*(_leaf("aiter.gemm", ("x", t)) for t in x), layers=1)
+
+    monkeypatch.setattr(ops, "graph", two_gemms)
+    plan = _records(
+        tmp_path / "plan", ([[1, 1000, True]], 1), ([[40, 40, False]], None)
+    )
+    records = _plan(bench, tmp_path, plan)
+    sigs = list(
+        dict.fromkeys(r["leaf"] for r in records if r["shape"] == "prefill T=40 B=1")
+    )
+    assert len(sigs) == 2
+    graded = _records(tmp_path / "graded", ([[40, 40, False]], None))
+    store, root, _, _ = bench
+
+    # Each leaf in turn has no point; the other sits on one.
+    for sig in sigs:
+        kept = [r for r in records if r["leaf"] != sig]
+        report = ops.coverage(store, root, CONFIG, [graded], kept, "gfx942")
+
+        assert report["by phase"] == {"prefill": {"steps": 1, "covered": 0}}
+        assert report["left out, by leaf kind"] == {
+            "aiter.gemm": {"no measured point": 1}
+        }
+
+
 def test_coverage_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_path):
     plan = _records(
         tmp_path / "plan",

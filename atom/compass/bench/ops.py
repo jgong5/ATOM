@@ -1131,20 +1131,19 @@ def coverage(store, root, config, names, records, arch) -> dict:
             cut = _cut(fam)
             if cut and cut[0] in cuts:
                 at, (lo, hi) = cuts[cut[0]], _cached(line)
-                whys[name] = (
+                why = (
                     "a cached row, measured on fresh rows only"
                     if hi and at.keys() == {0}
                     else _bracket_cached(at, tokens, lo, hi)
                 )
             elif fam not in axes:
-                whys[name] = "no measured point"
+                why = "no measured point"
             elif shape.phase == "decode" and not _exchanged(fam):
-                whys[name] = (
-                    _bracket(*axes[fam], *_rows(line, shape.seqs)) if moves else ""
-                )
+                why = _bracket(*axes[fam], *_rows(line, shape.seqs)) if moves else ""
             else:
-                whys[name] = _bracket(*axes[fam], tokens, tokens)
-        whys = {name: why for name, why in whys.items() if why}
+                why = _bracket(*axes[fam], tokens, tokens)
+            if why:
+                whys[name] = why
         report[shape.phase].update(steps=1, covered=not whys)
         for name, why in whys.items():
             out[name][why] += 1
