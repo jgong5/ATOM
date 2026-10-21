@@ -75,12 +75,12 @@ remainders among them, one of a kind that depends on context at each at the
 most cached tokens of steps of its rows, and over a ladder of them once those
 points and the fresh ones show the kind still does; then the point halfway
 between two neighbours of a family, or of a prefill leaf's token count over
-cached tokens, that launched different kernels or, at a decode width or over
-a collective's message bytes, either side of a point off the line through
-theirs, or whose cold times differ where the leaf's kind steps under one
-kernel between two adjacent contexts at some width (`_densify`), until they
-are adjacent. DIR gets each round's ops.jsonl in `round<n>`, and every point
-held in plan.jsonl.
+cached tokens, that launched different kernels or, at a decode width, either
+side of a point off the line through theirs, or whose cold times differ where
+the leaf's kind steps under one kernel between two adjacent contexts at some
+width (`_densify`), until they are adjacent; a collective's message bytes bend
+as a decode width does. DIR gets each round's ops.jsonl in `round<n>`, and
+every point held in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
 covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
@@ -1035,11 +1035,12 @@ LADDER_STEP = 1.25
 #: across rows, over the largest, past which its kind depends on them; a
 #: repeat's spread stays within 4%.
 CONTEXT_MOVES = 0.10
-#: How far the line through a decode or collective point's two neighbours may
-#: price it off its measured cold time, over that time as `fit ops` reads a
-#: held-out error, when the three launched one kernel, before the plan halves
-#: the gaps either side; and how far a gap's ends' cold times may differ, over
-#: the lower, before the plan halves it where the leaf's kind steps (`_apart`).
+#: How far the line through a decode point's two neighbours may price it off its
+#: measured cold time, over that time as `fit ops` reads a held-out error, when
+#: the three launched one kernel, before the plan halves the gaps either side;
+#: and how far a gap's ends' cold times may differ, over the lower, before the
+#: plan halves it where the leaf's kind steps (`_apart`). A collective's point
+#: over its message bytes is read as a decode one.
 BENDS = 0.05
 #: The spread of a leaf's cold times across contexts, or a prefill leaf's
 #: across rows, in ns, at or under which its kind does not depend on them
@@ -1440,13 +1441,13 @@ def _densify(families, tried: set) -> dict:
     """The point halfway between each two neighbours of a family, or of a
     prefill leaf's token count over cached tokens (`_cut`), more than one
     apart, unless `tried`, that launched different kernels or, in a decode
-    family or a collective's, at the mean of its readings at each message size
-    as `fit ops` merges them, lie either side of a point `_bent` off the line
-    through theirs or, in a decode family, are `_apart` where the leaf's kind
-    steps: some decode family of the kind holds two adjacent contexts of one
-    kernel that are `_apart`;
-    between two points of a collective's family, the step of the rows halfway,
-    a decode when the farther is one, else a prefill of one sequence."""
+    family, lie either side of a point `_bent` off the line through theirs or
+    are `_apart` where the leaf's kind steps: some decode family of the kind
+    holds two adjacent contexts of one kernel that are `_apart`; between two
+    points of a collective's family, the step of the rows halfway, a decode
+    when the farther is one, else a prefill of one sequence. A collective's
+    family is `_bent` too, each message size at the mean of its readings, as
+    `fit ops` merges them."""
     from atom.compass.capture.forward import decode, prefill
 
     steps = {
@@ -1468,14 +1469,8 @@ def _densify(families, tried: set) -> dict:
         if isinstance(fam, str) and _exchanged(fam):
             sizes = [[*g] for _, g in itertools.groupby(points, key=lambda p: p[0])]
             mean = (statistics.mean(p[2]["cold_ns"] for p in g) for g in sizes)
-            bent = ()  # `_bent` reads no cold time under three sizes
-            if len(sizes) > 2:
-                bent = _bent(
-                    [
-                        (*g[0][:2], {**g[0][2], "cold_ns": ns})
-                        for g, ns in zip(sizes, mean)
-                    ]
-                )
+            at = ((*g[0][:2], {"cold_ns": ns}) for g, ns in zip(sizes, mean))
+            bent = _bent([*at]) if len(sizes) > 2 else ()  # no line under three
         else:
             bent = _bent(points, steps) if decoding else ()
         for (a, ka, record), (b, kb, other) in itertools.pairwise(points):
