@@ -366,8 +366,8 @@ def measure(config, todo, llc: int, rank: int = 0) -> list[dict]:
 def _runner(config, rank: int):
     """ATOM's runner at TP `rank` of `config`'s DP rank, its parameters built on
     the meta device and no warmup run, its KV pool allocated at the fewest
-    blocks a rank has room for with the model's parameter bytes held back for
-    the weights each leaf builds."""
+    blocks a rank has room for, sized by ATOM with the parameters' bytes held
+    on the device and then freed for the weights each leaf builds."""
     from torch.distributed import TCPStore
 
     from atom.compass.bench.ranks import agreed, cpu_group
@@ -382,9 +382,6 @@ def _runner(config, rank: int):
         def _maybe_warmup(self):
             pass
 
-        def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
-            return sum(p.nbytes for p in self.model.parameters())
-
     pc, store = config.parallel_config, None
     if not pc._managed_distributed_store:  # one rank: the store is its own
         store = TCPStore(
@@ -396,9 +393,12 @@ def _runner(config, rank: int):
         pc.data_parallel_base_port, pc._managed_distributed_store = store.port, True
     runner = MetaRunner(rank, config)
     runner.store = store
+    nbytes = sum(p.nbytes for p in runner.model.parameters())
+    held = torch.empty(nbytes, dtype=torch.uint8, device=runner.device)
     blocks = runner.get_num_blocks()["num_kvcache_blocks"]
     config.num_kvcache_blocks = agreed(blocks, cpu_group())
     runner.allocate_kv_cache(config.num_kvcache_blocks)
+    del held
     return runner
 
 
