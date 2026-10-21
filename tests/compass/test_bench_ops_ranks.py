@@ -500,7 +500,12 @@ def _dpa_main(argv, bench, tmp_path, monkeypatch, config):  # noqa: F811
     placed = SimpleNamespace(
         block_size=16, batch=lambda view, block, slot: (block, slot)
     )
-    monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda c: placed)
+
+    def rule(c):  # the runner's own config, DP 1 with its KV pool sized
+        assert c is _AtomRunner.built[-1]
+        return placed
+
+    monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", rule)
     x = ("self", _t([2, 8], "activation"))
     graph = _graph(_gather(2), _leaf(NEG, x), layers=1)
     monkeypatch.setattr(ops, "graph", lambda *a: graph)

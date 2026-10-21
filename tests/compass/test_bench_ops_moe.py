@@ -208,7 +208,10 @@ def test_ids_and_weights_viewed_in_atom_s_top_k_buffers_draw_ids_and_read_weight
     # views of ATOM's top-k buffers, which the capture holds as metadata.
     weights = torch.full((6, 4), 0.5)
     topk = SimpleNamespace(
-        aiter_topK_meta_data=(weights, torch.tensor(FUSED["without EP"]))
+        aiter_topK_meta_data=(
+            weights,
+            torch.tensor(FUSED["without EP"], dtype=torch.int32),
+        )
     )
     monkeypatch.setitem(sys.modules, "atom.model_ops.topK", topk)
     runner = _Runner()
@@ -218,7 +221,9 @@ def test_ids_and_weights_viewed_in_atom_s_top_k_buffers_draw_ids_and_read_weight
         "topk_weight": _spec([4, 4], F32, "metadata"),
         "topk_ids": _spec([4, 4], role="metadata"),
     }
-    moe = {"op": MOE["op"], "args": MOE["args"] | viewed}
+    # a weight of 9 occurrences: copy 8 is copy 0's call on the ninth weight
+    viewed["w"] = _spec([3, 3], F32, "weight")
+    moe = {"op": MOE["op"], "args": MOE["args"] | viewed, "occurrences": 9}
     stub.leaves = {"sig": (moe, [{}])}
     stub._prepare((0, 0))
 
@@ -229,7 +234,39 @@ def test_ids_and_weights_viewed_in_atom_s_top_k_buffers_draw_ids_and_read_weight
         assert all(len(set(row)) == 2 for row in t[:, :2].tolist())
         assert 0 <= t[:, :2].min() and t[:, :2].max() < 16
         assert t[:, 2:].tolist() == [[16, 17]] * 4
-    assert len({tuple(t[:, :2].flatten().tolist()) for t in ids}) == 8
+    assert len({tuple(t[:, :2].flatten().tolist()) for t in ids}) == 9
     assert record["routing"]["activated"] == [len(t[:, :2].unique()) for t in ids]
     assert torch.equal(copies[0]["topk_weight"], weights[:4])
     assert stub.placed[0][1]["sig", "topk_weight"][0] == "topk_weights"
+    assert stub.placed[0][1]["sig", "topk_ids"][0] == "topk_ids"
+
+
+@pytest.mark.parametrize("width", [2, 4])
+def test_a_block_table_as_wide_as_top_k_or_atom_s_ids_buffer_keeps_its_blocks(
+    monkeypatch, width
+):
+    # Top-k 2, and ATOM's ids buffer 4 wide: integer metadata of either width
+    # that is not a view of the ids buffer is read live, never drawn.
+    topk = SimpleNamespace(
+        aiter_topK_meta_data=(
+            None,
+            torch.tensor(FUSED["without EP"], dtype=torch.int32),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "atom.model_ops.topK", topk)
+    runner = _Runner()
+    runner.model.append(_Experts(16, 2))
+    stub = ops.Stub(runner, 10_000)
+    tables = {
+        "q": _spec([4, 3], F32),
+        "block_tables": _spec([4, width], role="metadata"),
+    }
+    attention = {"op": "aiter.some_attention.default", "args": tables}
+    stub.leaves = {"sig": (attention, [{}])}
+    stub._prepare((5, 0))
+
+    record, copies = _timed(stub, attention, 4)
+
+    assert stub.placed[0][1]["sig", "block_tables"][0] == "block_tables"
+    assert all(c["block_tables"].eq(5).all() for c in copies)
+    assert record["routing"] is None

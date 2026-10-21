@@ -611,7 +611,7 @@ class Stub:
                     self._copy(op, sig, instances, c, calls[c % m]) for c in range(m, n)
                 ]
                 for c in range(n, min(k, max([n, *held]))):
-                    calls.append(self._reweigh(op, calls[c % n], c))
+                    calls.append(self._reweigh(op, sig, calls[c % n], c))
             n = len(calls)
             cycle = [calls[i % n] for i in range(k)]
             cold = _replay(fn, cycle)
@@ -646,7 +646,7 @@ class Stub:
                 return [
                     build(f"{path}.{i}", v, old and old[i]) for i, v in enumerate(value)
                 ]
-            if isinstance(value, dict) and self._routed(value):
+            if isinstance(value, dict) and self._routed(value, sig, path):
                 return self._route(value, c)
             if isinstance(value, dict) and value.get("role") == "weight":
                 return self._weight(value, c, op["occurrences"])
@@ -669,16 +669,18 @@ class Stub:
         args = op["args"].items()
         return {s: build(s, v, like[0][s] if like else None) for s, v in args}, snap
 
-    def _routed(self, spec) -> bool:
-        """Whether `spec` is a router's top-k expert ids: an integer activation,
-        or a view of ATOM's ids buffer, a row per token, a column per expert an
-        MoE layer of the model takes, or per column of ATOM's ids buffer with
-        its fused shared experts."""
+    def _routed(self, spec, sig, path) -> bool:
+        """Whether `spec` at `sig`'s `path` is a router's top-k expert ids: an
+        integer activation, or a metadata view `_meta` bound to ATOM's ids
+        buffer, a row per token, a column per expert an MoE layer of the model
+        takes, or per column of ATOM's ids buffer with its fused shared
+        experts."""
         widths = {k for _, k in self.moe}
         if self.shared is not None:
             widths.add(self.shared.shape[1])
+        bound = self.placed[0][1].get((sig, path), ("",))[0]
         return (
-            spec.get("role") in ("activation", "metadata")
+            (spec.get("role") == "activation" or bound == "topk_ids")
             and len(spec["shape"]) == 2
             and not _dtype(spec["dtype"]).is_floating_point
             and spec["shape"][1] in widths
@@ -706,22 +708,25 @@ class Stub:
             out[:, k:] = self.shared[: len(out), k:]
         return out
 
-    def _reweigh(self, op, like, c):
+    def _reweigh(self, op, sig, like, c):
         """Copy `like` of `op`'s call with the c-th weight of each weight
         argument's spec and expert ids of its own, its other arguments and
         forward context shared."""
 
-        def build(value, old):
+        def build(path, value, old):
             if isinstance(value, list):
-                return [build(v, o) for v, o in zip(value, old)]
+                return [
+                    build(f"{path}.{i}", v, o)
+                    for i, (v, o) in enumerate(zip(value, old))
+                ]
             if isinstance(value, dict) and value.get("role") == "weight":
                 return self._weight(value, c, op["occurrences"])
-            if isinstance(value, dict) and self._routed(value):
+            if isinstance(value, dict) and self._routed(value, sig, path):
                 return self._route(value, c)
             return old
 
         kwargs, snap = like
-        return {s: build(v, kwargs[s]) for s, v in op["args"].items()}, snap
+        return {s: build(s, v, kwargs[s]) for s, v in op["args"].items()}, snap
 
     def _tensor(self, spec, meta, fresh):
         role = spec["role"]
