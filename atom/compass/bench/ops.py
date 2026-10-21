@@ -438,12 +438,16 @@ class Stub:
                 if hasattr(m, "global_num_experts")
             }
         )
-        # ATOM's top-k ids buffer when its MoE layers fuse shared experts into
-        # top-k (`init_aiter_topK_meta_data`): past top-k, the shared experts'
-        # ids, under EP one more, and the fake expert's on rows another rank owns
+        # ATOM's top-k weights and ids buffers when its MoE layers fuse shared
+        # experts into top-k (`init_aiter_topK_meta_data`), live metadata a
+        # leaf may read: past top-k, the shared experts' ids, under EP one
+        # more, and the fake expert's on rows another rank owns
         topk = sys.modules.get("atom.model_ops.topK")
         meta = getattr(topk, "aiter_topK_meta_data", None)
-        self.shared = meta[1] if meta and self.moe else None
+        self.topk = dict(
+            zip(("topk_weights", "topk_ids"), meta if meta and self.moe else ())
+        )
+        self.shared = self.topk.get("topk_ids")
         self.loads = []
 
     def _prepare(self, batch) -> None:
@@ -455,7 +459,7 @@ class Stub:
         self.runner._gate_staging_reuse()
         input_ids = self.runner.prepare_model(batch)[0]
         self.runner._mark_staging_h2d_enqueued()
-        fc, live = get_forward_context(), {"input_ids": input_ids}
+        fc, live = get_forward_context(), {"input_ids": input_ids, **self.topk}
         for name, buffer in self.runner.forward_vars.items():
             live[name] = getattr(buffer, "gpu", buffer)
         for owner in (fc.attn_metadata, fc.context):
@@ -540,20 +544,22 @@ class Stub:
 
     def _plan(self, op, instances, kv, blocks, rows):
         """A leaf's copies, its bytes per call, and the placements its context
-        keys take."""
+        keys take; a context key of a module that holds no layer's KV, as a
+        module path."""
         need, size = 1, sum(
             _span(s["shape"], s["stride"]) * _dtype(s["dtype"]).itemsize
             for _, s in _specs(op["args"])
         )
         for key in instances[0].values():
-            if key in self.contexts:
+            held = self.contexts.get(key, self.modules.get(key))
+            if hasattr(held, "layer_num"):
                 held = kv.get(f"layer_{self.contexts[key].layer_num}")
                 unit = rows if _stateful(held) else blocks
                 # ponytail: a tensor's first dim is its blocks or its state slots
                 size += sum(t.nbytes // t.shape[0] * unit for t in _fields(held))
                 need = None
-            elif key in self.modules:
-                size += sum(t.nbytes for t in _own(self.modules[key]))
+            elif isinstance(held, torch.nn.Module):
+                size += sum(t.nbytes for t in _own(held))
         n = self._cold(size)
         if need is None:  # cycle over every instance's state, which is held anyway
             n = min(CALLS, max(n, len(instances)))
@@ -665,13 +671,14 @@ class Stub:
 
     def _routed(self, spec) -> bool:
         """Whether `spec` is a router's top-k expert ids: an integer activation,
-        a row per token, a column per expert an MoE layer of the model takes,
-        or per column of ATOM's ids buffer with its fused shared experts."""
+        or a view of ATOM's ids buffer, a row per token, a column per expert an
+        MoE layer of the model takes, or per column of ATOM's ids buffer with
+        its fused shared experts."""
         widths = {k for _, k in self.moe}
         if self.shared is not None:
             widths.add(self.shared.shape[1])
         return (
-            spec.get("role") == "activation"
+            spec.get("role") in ("activation", "metadata")
             and len(spec["shape"]) == 2
             and not _dtype(spec["dtype"]).is_floating_point
             and spec["shape"][1] in widths
