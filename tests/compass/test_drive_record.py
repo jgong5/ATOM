@@ -75,13 +75,16 @@ def test_a_stopped_server_s_directory_gains_its_engine_entry_and_cost_lines(
     assert table[1:] == json.loads(json.dumps(label(out / "steps/dp0.jsonl")[1]))
 
 
-def _two_ranks(tmp_path, monkeypatch, blocks):
+def _two_ranks(tmp_path, monkeypatch, blocks, **other):
     """A planted out directory whose DP rank 1 copies rank 0's record and
-    states `blocks` KV blocks."""
+    states `blocks` KV blocks and the engine fields `other` names."""
     out = planted_out(tmp_path, monkeypatch)
     for suffix in (".jsonl", ".engine.json"):
         shutil.copy(out / f"steps/dp0{suffix}", out / f"steps/dp1{suffix}")
-    edit(out / "steps/dp1.engine.json", lambda e: e.update(num_kvcache_blocks=blocks))
+    edit(
+        out / "steps/dp1.engine.json",
+        lambda e: e.update(num_kvcache_blocks=blocks, **other),
+    )
     return out
 
 
@@ -109,10 +112,18 @@ def test_a_dp_rank_no_request_reached_gets_the_version_line_alone(
     assert len(_lines(out / "steps/dp0.cost.jsonl")) > 1
 
 
-def test_dp_ranks_resolving_different_engines_refuse_the_entry(tmp_path, monkeypatch):
+def test_dp_ranks_differing_only_in_kv_blocks_state_the_smallest(tmp_path, monkeypatch):
     out = _two_ranks(tmp_path, monkeypatch, 4000)
+    record.write_engine_and_costs(out)
 
-    refusal = "num_kvcache_blocks: 4096 in dp0; 4000 in dp1$"
+    engine = json.loads((out / "run.json").read_text())["engine"]
+    assert engine == {**ENGINE, "num_kvcache_blocks": 4000}
+
+
+def test_dp_ranks_resolving_different_engines_refuse_the_entry(tmp_path, monkeypatch):
+    out = _two_ranks(tmp_path, monkeypatch, 4000, max_num_seqs=4)
+
+    refusal = "states none:\nmax_num_seqs: 8 in dp0; 4 in dp1$"
     with pytest.raises(ValueError, match=refusal):
         record.write_engine_and_costs(out)
     assert "engine" not in json.loads((out / "run.json").read_text())
@@ -121,7 +132,7 @@ def test_dp_ranks_resolving_different_engines_refuse_the_entry(tmp_path, monkeyp
 def test_dp_ranks_resolving_different_engines_keep_their_cost_lines(
     tmp_path, monkeypatch
 ):
-    out = _two_ranks(tmp_path, monkeypatch, 4000)
+    out = _two_ranks(tmp_path, monkeypatch, 4000, max_num_seqs=4)
 
     with pytest.raises(ValueError, match="resolved different engines"):
         record.write_engine_and_costs(out)

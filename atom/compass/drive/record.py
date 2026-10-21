@@ -12,9 +12,11 @@ Then each DP rank's record, ``steps/dp<r>.jsonl``, gets its cost lines beside
 it (``dp<r>.cost.jsonl``, `step_labels.write_table`; a rank that ran only DP's
 dummy forwards gets the version line alone), and run.json its
 ``engine`` entry: the engine's bounds as the record's engine files state them,
-the fields `TARGET` names. DP ranks whose engine files state different bounds
-refuse the entry, naming each. A speculative engine's stop writes
-``steps/dp<r>.acceptance.json``, which `compass run --acceptance-record` reads.
+the fields `TARGET` names, at the smallest KV block count any rank states, since
+each rank sizes its pool from its own free memory. DP ranks whose engine files
+state different bounds otherwise refuse the entry, naming each. A speculative
+engine's stop writes ``steps/dp<r>.acceptance.json``, which `compass run
+--acceptance-record` reads.
 One record spans the server's lifetime, every
 client run it served included; `parity.served` splits it per client run.
 
@@ -111,13 +113,15 @@ def write_engine_and_costs(out) -> None:
     differ = [
         f"{k}: " + "; ".join(f"{json.dumps(e[k])} in {r}" for r, e in engines.items())
         for k in TARGET
-        if len({json.dumps(e[k]) for e in engines.values()}) > 1
+        if k != "num_kvcache_blocks"
+        and len({json.dumps(e[k]) for e in engines.values()}) > 1
     ]
     if differ:
         raise ValueError(
             "the DP ranks resolved different engines, so run.json states none:\n"
             + "\n".join(differ)
         )
+    blocks = min(e["num_kvcache_blocks"] for e in engines.values())
     run = json.loads((out / serve.RUN_JSON).read_text())
-    run["engine"] = engines[records[0].stem]
+    run["engine"] = {**engines[records[0].stem], "num_kvcache_blocks": blocks}
     _write_whole(out / serve.RUN_JSON, json.dumps(run))
