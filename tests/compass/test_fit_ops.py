@@ -10,7 +10,7 @@ import pathlib
 
 import pytest
 
-from atom.compass import cli
+from atom.compass import cli, run
 from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, GateState, Key, Kind
 from atom.compass.bench import ops as bench
 from atom.compass.fit import ops, publish
@@ -229,6 +229,30 @@ def test_a_price_list_refuses_at_load_on_another_ptl_state_or_source_root(
     assert store.load(key, conditions=publish.conditions(config), gates=gates)
     with pytest.raises(ArtifactRefusal, match=f"`price_list` x `{cell}`: recorded"):
         store.load(key, conditions=publish.conditions(config | moved), gates=gates)
+
+
+def test_tp2_points_publish_a_tp2_price_list_that_a_tp2_run_loads(
+    measured, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "atom.compass.run.memory.key_fields", lambda c: LAYOUT | {"tp": 2}
+    )
+    d, _ = measured("m", [_point(2, 10.0), _point(8, 16.0)])
+
+    got = _fit(tmp_path / "fit", tmp_path / "store", d)
+
+    store = ArtifactStore(str(tmp_path / "store"))
+    _, config, _ = ops.read(store, [d])
+    monkeypatch.setattr(
+        "atom.compass.run.step_grid.conditions",
+        lambda c, m: publish.conditions(config),
+    )
+    loaded = run._price_list(
+        {"store": str(tmp_path / "store"), "price_list": got["key"]}, None, None
+    )
+    assert got["key"]["tp"] == 2
+    assert store.read(Key.of(Kind.PRICE_LIST, **got["key"])).topology.tp == 2
+    assert loaded.params == got["params"]
 
 
 def test_points_naming_two_price_lists_refuse(measured, tmp_path):

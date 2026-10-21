@@ -24,6 +24,16 @@ innermost ATOM function (D20).
 **Revised 2026-10-19 by #1401's capture of DeepSeek-V4-Pro:** capture runs ATOM's two MoE
 wrappers, and the DP gathers and MORI dispatch and combine are declared nodes (D20, D21).
 
+**Revised 2026-10-20 by the owner's [ruling on #1811](https://github.com/jgong5/ATOM/issues/1811),
+as #1812 and #1813 built it:** a raw Triton or FlyDSL launch lifts to the function that
+issues it, its arguments taken at call entry, objects kept in pickle's reduce shape,
+nested launching calls folded into the outermost; an `op_graph` is keyed by the step
+law's engine config less its ladder (D20).
+
+**Revised 2026-10-21 by the owner's
+[ruling on #1812](https://github.com/jgong5/ATOM/issues/1812#issuecomment-6304727730):**
+each traced step follows two untraced steps of its shape (D20).
+
 **Depends on:** `02_model_runner_and_cost_backend.md` (the backend plug point this fills),
 `03_memory_and_kv_model.md` (the activation term this supplies).
 
@@ -853,22 +863,34 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   tensor's storage came from rather than from the argument's name, so an ambient tensor
   passed under another name, such as `kv_indptr_convert`, still reads metadata.
 - **Non-tensor arguments and module references are kept**, the module by its path.
+- **Objects are kept in pickle's reduce shape.** Owner's
+  [ruling on #1811](https://github.com/jgong5/ATOM/issues/1811), 2026-10-20. An argument
+  or receiver that is a direct attribute of the live runner is recorded as
+  `ModuleRef("runner.<attr>")`. Any other object that pickle reduces to its class and a
+  dict of attributes, each attribute contract-legal in turn, is recorded in that shape
+  (`ir.nodes.Reduced`): its class by `module:qualname` and its state, an enum member by
+  its value, a plain dict by its items. Anything else, a callable among it, refuses the
+  leaf by its type. Widening to the runner's whole object graph or the full reduce
+  protocol is additive, and a refusal on an in-scope configuration forces it.
+  [#1812's census](https://github.com/jgong5/ATOM/issues/1812#issuecomment-6296604735)
+  holds the Triton MoE's `RoutingData`, `ExptData`, `Bitmatrix` and
+  `DequantScaleRoundingMode` and V4's `UnifiedPoolGeometry`, `ClassLayout` and
+  `WindowParams` this way, and finds no argument that is a runner attribute. `measure
+  ops` does not rebuild such an argument yet
+  ([#1853](https://github.com/jgong5/ATOM/issues/1853)).
 - **An integer that moves with the context is stored affine in it.** A decode shape is
   traced at two contexts; an integer argument that differs between them is stored as
   `{"affine": [slope, intercept]}`, and `measure ops` binds it at the point's context
   ([#1572](https://github.com/jgong5/ATOM/issues/1572)). One that is not affine, or a
   non-integer that moves, refuses the shape by operator and slot; traces that differ
   otherwise refuse it by both operators or both operator counts.
-- **A raw Triton or FlyDSL launch lifts to its innermost ATOM function**, that frame's
-  other dispatches folded in. On Qwen3.8-27B, `fused_qk_norm`, `try_mrope_qk_fused` and
-  `kv_indices_generate_triton` are dedicated helpers with clean arguments; the FlyDSL
-  argmax lifts to `_apply_greedy_tokens`, whose host arch query `get_gfx_custom_op` is
-  allowed inside the lifted frame. A kernel switch inside the frame, mrope's tiled kernel
-  at B >= 128, disappears into the leaf.
+- **A raw Triton or FlyDSL launch lifts to the function that issues it** (the lift rule
+  below).
 - **What a leaf reads but is not passed may be stated beside its arguments**, in the
   op's `stated` field, by name; a call does not take it, and `bench.ops.signature`
   includes it. Owner's [ruling on #1689](https://github.com/jgong5/ATOM/issues/1689#issuecomment-6292555659):
-  only DeepSeek-V4's two decode attention leaves state their layer's `window_size`,
+  only DeepSeek-V4's decode attention leaves (`capture.forward.V4_DECODES`: the fp8 KV
+  cache's, the bf16 one's and the persistent kernel) state their layer's `window_size`,
   `compress_ratio` and `index_topk` (null for a layer with no indexer), and its
   indexer's score and top-k states its `compress_ratio`, read in the opened
   attention's body from the layer `layer_name` names. Their index lists are sized for
@@ -877,9 +899,94 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
 
 Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers
 and DeepSeek-V4's attention aside, below), so its ambient reads stay
-invisible to the trace; the bench does not need them, because the leaf is timed inside
-ATOM's own forward, where ATOM has built the forward context for that point (`07` D39).
+invisible to the trace; the bench does not need them, because it times the leaf at a
+point `ModelRunner.prepare_model` prepared, where ATOM has built the forward context for
+that point, and runs no forward (`07` D39).
 That is also what the two failures below needed by hand.
+
+### The lift rule
+
+Owner's [ruling on #1811](https://github.com/jgong5/ATOM/issues/1811), 2026-10-20, as
+[#1854](https://github.com/jgong5/ATOM/pull/1854) built it. It replaces the rule that a
+launch lifts to its innermost ATOM function, which hid ATOM's Triton MXFP4 experts in one
+function whose arguments state neither their format nor their expert count
+([#1744](https://github.com/jgong5/ATOM/issues/1744)). One leaf has one contract, for
+the analytical extractor and `measure ops` alike.
+
+- **A leaf is the function that issues the kernel launch.** From the launch, capture
+  walks outward past Triton's and FlyDSL's own frames, closures and lambdas (a function
+  its `module:qualname` does not name), and generic launchers (a frame one of whose
+  arguments, or an attribute of whose first argument, is the launched kernel object or
+  an autotuner wrapping it), to the first function its `module:qualname` names, in
+  whichever package: aiter's `mla_decode_fwd_v4_nm`, not the ATOM function that calls
+  it.
+- **The entry points.** Triton is taken at `JITFunction.run`, gluon included; a
+  `warmup=True` call launches nothing; a direct `CompiledKernel.run` is refused by name.
+  FlyDSL is taken at `JitFunction.__call__` and at `CompiledFunction.__call__`, which
+  capture's `_compile_impl` maps back to its jit function, so both give one leaf name and
+  contract; a `CompiledFunction` compiled before the capture names no jit function and is
+  refused by name.
+- **A leaf is one complete call.** A launching function called inside another, and a
+  dispatcher-visible custom op inside one, fold into the outermost, so a replay never
+  runs a nested leaf twice. On V4-Pro fp8 prefill `swa_write` holds its two inner calls:
+  61 leaves where the innermost rule gave 122, 95.5 us less per step, one `t0` floor per
+  layer fewer, which prices low (#1854). A call that launches no kernel and dispatches
+  no operator outside torch's gives back what it ran.
+- **Arguments come from call entry.** Each traced step follows two untraced steps of its
+  own shape (owner's [ruling on #1812](https://github.com/jgong5/ATOM/issues/1812#issuecomment-6304727730),
+  2026-10-21): a runner's first step takes its own path, a decode filling no deferred
+  ids, so `fill_deferred_decode_ids` first launches in the second. The untraced steps
+  find the launching functions; the traced one snapshots each call's parameters as it
+  enters, through `sys.monitoring` on those functions alone, so a parameter the function
+  reassigns before its launch is recorded as passed. A launch in the traced step outside
+  every found function is refused by name.
+- **Each contract replays to the same work.** The first call of each distinct contract
+  is called again, rebuilt from it under the fake mode, and must launch the same kernels
+  and dispatch the same operators outside torch's; one that does not, or does not rebuild, is refused by
+  name. So is a leaf that raises after it launched, or is still open when the step ends:
+  a call cut short has no contract to replay. One that raises having launched nothing
+  gives back what it ran.
+- **A leaf that holds cross-rank communication gets no rule of its own**: one pricing
+  unit, its comm term inside `10` D64's `max`, measured on the multi-rank bench.
+
+[#1812's census](https://github.com/jgong5/ATOM/issues/1812#issuecomment-6296604735)
+covers Qwen3.8-27B TP1 and V4-Pro at TP8, DPA-TP8 and DPA EP8, each at fp8 and bf16 KV,
+with `ATOM_USE_TRITON_MOE` off and on: every configuration captures, where the innermost
+rule refused 8 of the 16, and the rule refuses none. Qwen's leaves keep their names
+(`fused_qk_norm`, `try_mrope_qk_fused`, `kv_indices_generate_triton`) but one: the
+sampler's FlyDSL argmax is `topk_per_row_argmax`, not `_apply_greedy_tokens`, whose
+`le` and `where` are now graph operators. A kernel switch inside a function stays in its
+leaf: `try_mrope_qk_fused` launches mrope's tiled kernel at B >= 128.
+
+### The `op_graph` key
+
+Owner's [ruling on #1811](https://github.com/jgong5/ATOM/issues/1811), 2026-10-20, as
+[#1867](https://github.com/jgong5/ATOM/pull/1867) built it. An `op_graph` is keyed by its
+structure and its shape (`07` D41). The structure (`capture.forward.structure`) is the
+model's architecture, the device arch, the config.json digest, the engine config the
+step law is keyed by less its ladder (`run.step_grid.keyed`, `09` D54), the TP width and
+the DP and EP widths when set, the phase, the mode, and whether the step produces
+output. That engine config holds the KV block size and dtype, the quantization's hash,
+the parallel layout, TBO, speculation when it is on, `moe_backend` and `eplb_enable` when
+they are off ATOM's default, and the performance environment
+(`atom.benchmarks.results.metadata.PERFORMANCE_KEYS`) less the client's `AIPERF_*`
+variables and the device selection; ATOM's Triton expert and GEMM switches
+(`ATOM_USE_TRITON_MOE`, `ATOM_USE_TRITON_MOE_A4W4`, `ATOM_USE_TRITON_MOE_DECODE`,
+`ATOM_USE_TRITON_GEMM`) are in it. One store holds V4-Pro graphs of one shape that
+differ only in `kv_cache_dtype`, or only in `ATOM_USE_TRITON_MOE`, and each run reads its
+own.
+
+A run, or `measure ops`, that finds no graph at its key where the store holds one at
+the same shape and otherwise the same structure refuses, naming each engine field that
+differs, a performance variable by its own name (`run.step_grid.differ`, which the step
+law's engine check shares). Every key moved with #1867, so a store is traced again in the
+environment its reader runs in.
+
+**Keying on an environment variable that changes what an operator computes is a
+workaround.** ATOM chooses its MoE and GEMM kernels from the process environment, not
+from an argument the call takes, so no leaf's contract records the choice, and the key
+has to. The ruling records this as a workaround for an ATOM design that should take the
+choice as an argument.
 
 ### What getting it wrong costs, both directions, measured
 
@@ -920,8 +1027,12 @@ one tuned kernel family.
 `moe_forward` and `maybe_dual_stream_forward` are the two opaque leaves capture opens: it
 runs their Python bodies in place of their fakes, because the step's MoE exchanges, the
 shared expert's side stream and the expert kernels are inside. What the bodies dispatch is
-recorded like the rest of the step: the expert kernels as leaves (`fused_moe_`), the side
-stream as a `Par` (D19), a FlyDSL launch lifted to its innermost ATOM function.
+recorded like the rest of the step: the expert kernels as leaves, the side stream as a
+`Par` (D19), each Triton or FlyDSL launch lifted by the lift rule. aiter's experts are
+`fused_moe_`; under `ATOM_USE_TRITON_MOE=1` the census finds aiter's Triton launchers,
+`downcast_to_mxfp`, `moe_gemm_a8w4` twice (the second holding `_reduce_grouped`) and
+`ep_sort_routing` at EP8, and `topk`, `sort_tokens`, `sort_tokens_fused`,
+`moe_gemm_a16w4` and `fused_clamp_act_mul` with EP off.
 
 Their exchanges with other ranks are **declared nodes** (D21), as #1401 and the
 [ruling on #531](https://github.com/jgong5/ATOM/issues/531#issuecomment-6244543796) ask,
@@ -938,15 +1049,15 @@ its graphs exist (#1581).
 
 DeepSeek-V4's `v4_attention_with_output` is opened the same way (#1678), its body run as
 a real step's, not a dummy run's, so its projections, compressors and sparse attention are
-leaves. Two of its functions are recorded as one leaf at their call, arguments as passed,
-because a lift refuses them: `fused_compress_attn` reassigns a parameter before its
-launches, and the decode kernel's aiter entry dispatches a leaf before a Triton launch.
-The indexer's score and top-k stays one leaf: its FP4 kernels launch through aiter's own
-launcher.
+leaves under the lift rule, with no special case: the compressors as FlyDSL's
+`flydsl_fused_compress_attn` and `flydsl_hca_compress_attn`, the fp8 KV cache's decode
+as `aiter.mla:mla_decode_fwd_v4_nm`, the bf16 one's as
+`_sparse_attn_v4_paged_decode_triton`, with its KV quantization a FlyDSL leaf of its
+own, `flydsl_qk_norm_rope_quant`. The indexer's score and top-k stays one leaf: its FP4 kernels
+launch through aiter's own launcher.
 
-FlyDSL never needs intercepting below a leaf. A FlyDSL launch outside an opaque leaf,
-the sampler's argmax or one in the MoE wrappers' bodies, lifts to its innermost ATOM
-function (the leaf contract above).
+A FlyDSL launch outside an opaque leaf capture keeps closed, the sampler's argmax or one
+in the opened bodies, lifts by the lift rule; inside a closed one it is never reached.
 
 Recorded for completeness, since it would otherwise look like an unexamined hole: FlyDSL
 is a standalone Python-embedded **MLIR DSL and JIT compiler** (`flydsl` 0.3.1), not part
@@ -955,14 +1066,15 @@ code -> mgpuLaunchKernel -> HIP`; arguments are erased to `data_ptr()` before th
 even a tensor-subclass trace would see nothing. aiter's integration has **96 `@flyc.kernel`,
 132 `@flyc.jit`, 87 `.launch(...)` sites**, and **one `JitFunction.__call__` is 1 to 12
 kernel launches** (`moe_sorting_kernel.py` has 12). Under `--moe-backend mega` a single
-dispatcher event covers the entire EP-MoE step: dispatch + GEMM1 + quant + GEMM2 + combine.
-If it ever *does* need intercepting, the chokepoint is
-`flydsl/compiler/jit_executor.py:210` (`CallState.__call__`) for both entry paths, with
-`jit_function.py:1357` and `:1632` for named arguments.
+dispatcher event covers the entire EP-MoE step: dispatch + GEMM1 + quant + GEMM2 + combine
+([#1815](https://github.com/jgong5/ATOM/issues/1815)). Capture intercepts FlyDSL at its two
+Python entries, before the arguments are erased.
 
 ### Open issues
 
-- The parameter-extractor table does not exist and is the main hand-written work item.
+- The op-level extractor table is `backends/op_work.py::EXTRACTORS` (`10` D64); a leaf
+  kind with none is refused by name, V4-Pro bf16 prefill's `pa_sparse_prefill_opus`
+  among them.
 - Leaf prices are not repeatable to better than about 1%: two runs of one graph, one box,
   back to back, identical code moved the summed contribution **0.96%**, median
   per-signature **1.18%**, **p90 32%**. **Any residual quoted below ~2% is quoting the
@@ -1290,7 +1402,7 @@ Deferred to future work by decision on 2026-09-18.
 | D18 | Capture with `TorchDispatchMode` + `FakeTensorMode`, on FakeTensor rather than bare meta, at concrete shapes: one graph per decode width and prefill (T, B) that `trace ops` is given or that a record directory's steps hold. The symbolic route A and its four disciplines (the fourth: the engine's host arithmetic asks a symbol for a number, so a symbolic capture keeps the conversion, logs it with its line, and asserts that log against a stated set) are recorded, not built | 2026-09-18, fourth discipline 2026-09-22; concrete 2026-10-18 (#1489) |
 | D18.1 | `torch.export` recorded as an unverified alternative; rejected now on decomposition fidelity and on capturing a model call rather than an engine step | 2026-09-18 |
 | D19 | Hierarchical, concrete, stream-annotated IR: `Seq` / `Repeat` / `Par`, a node's arguments its leaf contract. No branches in the IR — applicability is a discrete key and the captured shape, matched by equality | 2026-09-18; revised 2026-10-18 (#531); concrete 2026-10-18 (#1489) |
-| D20 | Opaque leaves are priced, not decomposed. Each carries a stated parameter extractor and a contract: arguments by schema slot, each tensor's stride and role by provenance (activation, weight, KV, metadata), non-tensor arguments and module references kept; a raw Triton or FlyDSL launch lifts to its innermost ATOM function. Capture runs the two MoE wrappers' bodies; their DP and MORI exchanges are declared nodes named for the function ATOM calls, and a TBO step is refused. | 2026-09-18; contract 2026-10-18 (#1489); MoE exchanges 2026-10-19 (#1401) |
+| D20 | Opaque leaves are priced, not decomposed. Each carries a stated parameter extractor and a contract: arguments by schema slot, each tensor's stride and role by provenance (activation, weight, KV, metadata), non-tensor arguments and module references kept, a runner attribute as `runner.<attr>`, any other object in pickle's reduce shape or refused by its type. A raw Triton (`JITFunction.run`, a warmup aside) or FlyDSL (`JitFunction.__call__`, `CompiledFunction.__call__`) launch lifts to the first function its `module:qualname` names, past the languages' frames, closures and generic launchers; a direct `CompiledKernel.run` is refused. Nested launching calls and custom ops fold into the outermost; arguments come from call entry in a traced step that follows two untraced steps of its shape; each contract must replay to the same kernels and operators outside torch's, and a launch outside a found function, a raise after a launch or a call open at the step's end is refused. An `op_graph` is keyed by the step law's engine config less its ladder, the performance environment in it, and a miss names each differing field; keying on a kernel-selecting environment variable is a workaround for an ATOM design that should take the choice as an argument. Capture runs the two MoE wrappers' bodies; their DP and MORI exchanges are declared nodes named for the function ATOM calls, and a TBO step is refused. | 2026-09-18; contract 2026-10-18 (#1489); MoE exchanges 2026-10-19 (#1401); lift rule and key 2026-10-20 (#1811); two untraced steps 2026-10-21 (#1812) |
 | D21 | Stated nodes over chased coverage, their terms declared; refuse and record `unpriced` reasons; a failed forward writes no graph. The MoE exchanges are the first stated nodes | 2026-09-18; revised 2026-10-14 (#952); MoE exchanges 2026-10-19 (#1401) |
 | D22 | Liveness stays observational under fake tensors; internal scratch of an opaque leaf is a stated per-leaf constant. Revised: until capture lands the activation term is a coefficient measured on a real run, scratch inside it, and the walk replaces it after | 2026-09-18; revised 2026-10-10 |
 | D23 | Trace eager, price with the regime constant of the real step. The inductor fusion gap (~4.8% decode) is a documented **TODO**, not a decision. | 2026-09-18 |

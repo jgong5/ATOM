@@ -219,7 +219,8 @@ def group(tp: int, dp: int) -> dict:
     """A TP x DP process group in one process, its transport declined.
 
     Every shard is the one a `tp`-way deployment holds and every collective ATOM
-    issues is dispatched; aiter's `all_reduce_` answers from its fake. The
+    issues is dispatched; aiter's `all_reduce_` and fused all-reduce norms
+    answer from their fakes. The
     legacy `c10d` collectives ATOM reaches have no fake kernel, so they go
     through their functional forms, which give the same shapes, and copy the
     result back under `standing_in`, since the legacy ones write in place.
@@ -261,6 +262,22 @@ def group(tp: int, dp: int) -> dict:
     finally:
         parallel_state.init_model_parallel_group, dist.new_group = group, new_group
 
+    coordinator = parallel_state.GroupCoordinator
+    per_group = coordinator.fused_allreduce_rmsnorm_quant_per_group
+
+    def fused_allreduce_rmsnorm_quant_per_group(self, *args, **kwargs):
+        # aiter asks for a communicator before it dispatches its registered op,
+        # whose fake answers; the op itself never reaches this stand-in.
+        declined, self.device_communicator = self.device_communicator, object()
+        try:
+            return per_group(self, *args, **kwargs)
+        finally:
+            self.device_communicator = declined
+
+    coordinator.fused_allreduce_rmsnorm_quant_per_group = (
+        fused_allreduce_rmsnorm_quant_per_group
+    )
+
     def all_gather_into_tensor(output, input, group=None, async_op=False):
         with _stand_in():
             gathered = functional.all_gather_tensor(input, 0, group or dist.group.WORLD)
@@ -283,4 +300,5 @@ def group(tp: int, dp: int) -> dict:
         "dp": parallel_state.get_dp_group().world_size,
         "declined": ["device_communicator", "message_queue_broadcaster", "barrier"],
         "functional": ["all_gather_into_tensor", "broadcast", "all_to_all_single"],
+        "communicator_checked_only": ["fused_allreduce_rmsnorm_quant_per_group"],
     }

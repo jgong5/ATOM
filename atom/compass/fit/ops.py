@@ -112,7 +112,8 @@ def read(store, dirs) -> tuple[list[dict], dict, dict]:
             # campaign's thousands of points make the fit slow
             key = store.key_from_token(Kind.OP_MEASUREMENT, record["token"])
             entry = store.read(key)
-            points[key] = json.loads(entry.read_member("point", publish.RANK, "json"))
+            rank = entry.topology.ranks()[0]
+            points[key] = json.loads(entry.read_member("point", rank, "json"))
             fields = {k: v for k, v in key.values.items() if k != "point"}
             torch = publish.platform(config)["torch"]
             named.setdefault(json.dumps([fields, torch], sort_keys=True), d)
