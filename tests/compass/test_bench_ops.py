@@ -448,6 +448,29 @@ def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
     assert stub._plan(rope, [{"rope": "0"}], kv, 4, 2) == (3, 48, 1)
 
 
+def test_a_context_module_with_no_kv_layer_is_sized_by_its_own_tensors(monkeypatch):
+    # DeepSeek-V4's Indexer: bound by its layer name, its pool on itself, no
+    # layer_num and no entry in ATOM's KV registry.
+    indexer = torch.nn.Module()
+    indexer.register_buffer("kv_cache", torch.zeros(4, 16, 4))
+    runner = _Runner({KEY.format(L=0): indexer})
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+    q = ("q", _t([2, 4], "activation"))
+    leaf = _leaf("aten.nowhere.default", q, ("layer", ir.ContextRef(KEY)), key=KEY)
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    stub = ops.Stub(runner, 5_000)
+
+    [record] = stub.point(placed, decode(2), 20, found)
+
+    # 32 bytes of q and 1024 of pool a call: 10 copies pass twice 5000, on one
+    # placement.
+    assert "refused" not in record
+    assert (record["cold_ns"], record["footprint_bytes"]) == (1.0, 10 * 1056)
+    assert record["placements"] == 1
+
+
 def test_a_call_cycles_a_weight_per_occurrence_on_the_cold_copies_inputs():
     # One copy already passes twice a 1-byte cache. The leaf occurs twice in
     # the step: copy 1 is copy 0 with a second weight, so a weight count past

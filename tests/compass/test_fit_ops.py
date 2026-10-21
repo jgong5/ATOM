@@ -13,6 +13,7 @@ import pytest
 from atom.compass import cli, run
 from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, GateState, Key, Kind
 from atom.compass.bench import ops as bench
+from atom.compass.capture.peers import MORI
 from atom.compass.fit import ops, publish
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
@@ -210,6 +211,52 @@ def test_fit_ops_holds_out_no_point_between_neighbours_one_apart(
     assert [why.split(" off")[0] for _, _, why in f["declined"]] == declined
     held = [r["at"] for r in got["report"]["held_out"]]
     assert held == ([[2, 512]] if declined else [])
+
+
+BEND = "bytes = 8192 reads +10.0%"
+MOE = "atom.model_ops.moe:"
+
+
+@pytest.mark.parametrize(
+    "rows, nbytes, declined, shape, op",
+    [
+        ((7, 8, 9), (7, 8, 9), [], "decode B={}", "_c10d_functional.all_"),
+        ((6, 8, 10), (6, 8, 10), [BEND], "decode B={}", "_c10d_functional.all_"),
+        ((7, 8, 10), (7, 8, 9), [BEND], "decode B={}", "_c10d_functional.all_"),
+        ((7, 8, 9), (7, 8, 9), [], "prefill T={} B=1", "_c10d_functional.all_"),
+        ((7, 8, 9), (7, 8, 9), [BEND], "decode B={}", bench.DP_GROUP[0]),
+        ((7, 8, 9), (7, 8, 9), [BEND], "prefill T={} B=1", MORI + ".dispatch"),
+        ((7, 8, 9), (7, 8, 9), [BEND], "decode B={}", bench.DP_GROUP[1]),
+        ((7, 8, 9), (7, 8, 9), [BEND], "prefill T={} B=1", MORI + ".combine"),
+        ((7, 8, 9), (7, 8, 9), [], "decode B={}", MOE + "all_gather_with_padding"),
+        (
+            (7, 8, 9),
+            (7, 8, 9),
+            [],
+            "decode B={}",
+            MOE + "reduce_scatter_with_unpadding",
+        ),
+    ],
+)
+def test_fit_ops_holds_out_no_collective_point_between_neighbours_one_row_apart(
+    rows, nbytes, declined, shape, op, measured, tmp_path
+):
+    # nbytes in rows of 1024 bytes; the third case's points move other bytes per
+    # row, so a row's bytes are not known; all_gatherv's, reduce_scatterv's and
+    # MORI's ranks' rows can differ, so a step can hold between two points' rows;
+    # the padded pair pads every rank to the same rows, so a row keeps its bytes
+    fam = json.dumps(["exchange", {"op": op}])
+    points = [
+        {"shape": shape.format(b), "context": 1024, "op": op}
+        | {"leaf": "{}", "exchange": [fam, n * 1024], "cold_ns": ns, "kernels": ["k"]}
+        for b, n, ns in zip(rows, nbytes, (1e4, 1e4, 12e3))
+    ]
+    d, _ = measured("m", points)
+
+    got = _fit(tmp_path / "fit", tmp_path / "store", d)
+
+    (f,) = got["params"]["families"].values()
+    assert [why.split(" off")[0] for _, _, why in f["declined"]] == declined
 
 
 @pytest.mark.parametrize(
