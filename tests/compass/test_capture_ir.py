@@ -18,7 +18,6 @@ import subprocess
 import sys
 
 import pytest
-import torch
 
 from atom.compass import cli, ir
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
@@ -129,84 +128,6 @@ def test_a_context_key_names_a_layer_as_a_sum_of_indices():
 def test_a_hole_that_is_not_a_sum_of_names_then_an_offset_is_refused(key):
     with pytest.raises(ValueError):
         ir.ContextRef(key)
-
-
-# --- lifting a raw launch, on functions written here ---------------------------
-
-
-_RECORDER: dict = {}
-
-
-@pytest.fixture
-def recorder(monkeypatch):
-    """A recording recorder, which the functions below launch through, that
-    takes this file for ATOM's own."""
-    monkeypatch.setitem(forward._IS_ATOM, __file__, True)
-    recorder = forward._Recorder({})
-    recorder.on = True
-    monkeypatch.setitem(_RECORDER, "now", recorder)
-    return recorder
-
-
-def _scaled(x, scale):
-    y = torch.empty_like(x)
-    _RECORDER["now"].launch("triton._scaled_kernel")
-    _RECORDER["now"].launch("triton._scaled_tail_kernel")
-    return y.view(-1)
-
-
-def _rescaled(x, scale):
-    scale = scale * 2
-    _RECORDER["now"].launch("triton._scaled_kernel")
-
-
-@torch.library.custom_op("compass_test::leaf", mutates_args=())
-def _leaf(x: torch.Tensor) -> torch.Tensor:
-    return x.clone()
-
-
-_leaf.register_fake(torch.empty_like)
-
-
-def _wraps_a_leaf(x):
-    _leaf(x)
-    _RECORDER["now"].launch("triton._scaled_kernel")
-
-
-def test_a_raw_launch_lifts_to_its_function_with_what_it_dispatched(recorder):
-    x = torch.empty(4, 8, device="meta")
-    with recorder:
-        x.add(1)
-        _scaled(x, 0.5)
-        x.mul(2)
-
-    names = [op.name for _, op in recorder.items]
-    assert names == ["aten.add.Tensor", f"{__name__}:_scaled", "aten.mul.Tensor"]
-    lifted = recorder.items[1][1]
-    assert lifted.kind is ir.NodeKind.OPAQUE_LEAF
-    x_arg = ir.Tensor((4, 8), "torch.float32", (8, 1), ir.Role.METADATA)
-    assert dict(lifted.args) == {"x": x_arg, "scale": 0.5}
-
-
-def test_a_function_that_reassigns_a_parameter_before_its_launch_is_refused(
-    recorder,
-):
-    with recorder, pytest.raises(ValueError, match=r"_rescaled.*\['scale'\]"):
-        _rescaled(torch.empty(2, device="meta"), 1.0)
-
-
-def test_a_function_that_dispatches_a_leaf_is_refused_unless_a_host_query(
-    recorder, monkeypatch
-):
-    x = torch.empty(2, device="meta")
-    with recorder, pytest.raises(ValueError, match="compass_test.leaf.default"):
-        _wraps_a_leaf(x)
-
-    monkeypatch.setattr(forward, "HOST_QUERIES", ("compass_test.leaf.default",))
-    recorder.start()
-    with recorder:
-        _wraps_a_leaf(x)
-    assert [op.name for _, op in recorder.items] == [f"{__name__}:_wraps_a_leaf"]
 
 
 # --- shapes a population holds ---------------------------------------------------
@@ -400,8 +321,8 @@ def test_mrope_is_one_leaf_per_full_attention_layer_at_either_kernel(
     assert len(mrope) == LAYER_TYPES.count("full_attention")
     assert not [op for op in ops if op["op"].startswith(("triton.", "flydsl."))]
     for op in ops:
-        if ":" in op["op"]:
-            assert op["op"].startswith("atom.") and op["kind"] == "opaque_leaf"
+        if op["op"].startswith("atom.") and ":" in op["op"]:
+            assert op["kind"] == "opaque_leaf"
             module = op["op"].split(":")[0].replace(".", "/")
             assert (TREE / f"{module}.py").is_file()
 

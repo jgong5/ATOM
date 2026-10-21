@@ -70,8 +70,13 @@ H2D = "atom/utils/h2d.py"
 UNDISPATCHED = ("profiler.", "prim.device")
 #: The hf config fields, or its text config's, that count a model's routed experts.
 ROUTED = ("n_routed_experts", "num_experts", "num_local_experts")
-#: DeepSeek-V4's persistent decode kernel and its indexer's score and top-k.
-V4_PS_DECODE = "aiter.mla_decode_v4_ps_asm.default"
+#: DeepSeek-V4's decode attention leaves: the fp8 KV cache's, the bf16 one's and the
+#: persistent kernel; and its indexer's score and top-k.
+V4_DECODES = (
+    "aiter.mla:mla_decode_fwd_v4_nm",
+    "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton",
+    "aiter.mla_decode_v4_ps_asm.default",
+)
 V4_INDEXER = "aiter.indexer_score_topk.default"
 
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
@@ -271,7 +276,7 @@ class _Recorder(TorchDispatchMode):
         self.contexts, self.modules, self.roles = contexts, {}, {}
         self.creating, self.on, self.fake_mode = None, False, fake_mode
         self.stated, self.runner, self.replayed = {}, None, set()
-        self.launchers, self.languages, self.compiled = set(), (), {}
+        self.launchers, self.languages = set(), ()
         self.replaying = None  # the kernels a replay launched, while one runs
         self.start()
 
@@ -686,28 +691,19 @@ def _v4_attention(v4, recorder):
     one leaf: its FP4 kernels launch through aiter's own launcher, which no
     patch here intercepts.
 
-    Two of its functions are one leaf each at their call, what they run inside
-    folded in: before its raw launches, `fused_compress_attn` derives its
-    `quant` parameter, and the decode kernel's aiter entry dispatches a leaf,
-    either of which a lift refuses.
-
-    The two decode kernels' leaves state the layer's `window_size`,
+    The decode leaves (`V4_DECODES`) state the layer's `window_size`,
     `compress_ratio` and `index_topk` (None when it has no indexer), and the
     indexer's its `compress_ratio`, none of which they are passed: read off
     the layer `layer_name` names.
     """
-    from atom.model_ops.v4_kernels import paged_decode
     from atom.utils.forward_context import get_forward_context
-
-    decode = paged_decode._sparse_attn_v4_paged_decode_asm
-    decodes = (f"{decode.__module__}:{decode.__qualname__}", V4_PS_DECODE)
 
     def body(x, positions, layer_name):
         layer = recorder.contexts[layer_name]
         top = layer.indexer and layer.indexer.index_topk
         ratio = (("compress_ratio", layer.compress_ratio),)
         geometry = (("window_size", layer.window_size), *ratio, ("index_topk", top))
-        stated = {**dict.fromkeys(decodes, geometry), V4_INDEXER: ratio}
+        stated = {**dict.fromkeys(V4_DECODES, geometry), V4_INDEXER: ratio}
         with (
             patch.object(recorder, "stated", stated),
             patch.object(get_forward_context().context, "is_dummy_run", False),

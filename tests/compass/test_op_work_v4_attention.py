@@ -105,15 +105,16 @@ def test_a_prefill_attends_each_entry_its_index_lists_name():
 def decode(**stated):
     """A paged decode over 2 rows of 4 heads of width 16, stating `stated`."""
     op = leaf(
-        V4 + "paged_decode:_sparse_attn_v4_paged_decode_asm",
-        [[2, 4, 16]],
-        unified_kv=t([POOL, 16], FP8, role="kv"),
-        kv_indices=t([POOL], I32, role="metadata"),
+        "aiter.mla:mla_decode_fwd_v4_nm",
+        [],
+        q=t([2, 4, 16], FP8),
+        qrope=t([2, 4, 4]),
+        kv_buffer=t([POOL, 1, 1, 16], FP8, role="kv"),
+        kvrope=t([POOL, 1, 1, 4], role="kv"),
+        output=t([2, 4, 16]),
         kv_indptr=t([3], I32, role="metadata"),
-        attn_sink=t([4], F32, role="weight"),
-        unified_kv_rope=t([POOL, 4], role="kv"),
-        q_packed_in=t([2, 4, 16], FP8),
-        q_rope_in=t([2, 4, 4]),
+        kv_page_indices=t([POOL], I32, role="metadata"),
+        sink=t([4], F32, role="weight"),
         num_kv_splits=16,
     )
     return op | ({"stated": stated} if stated else {})
@@ -192,3 +193,24 @@ def test_a_compressor_state_update_counts_no_kv_or_score_row():
 
     moved = 4 * 512 * 4 + 4
     assert work(op, rows((4096, 4096), decode=False), 1, "fp8") == Work({}, moved)
+
+
+def test_a_bf16_cache_s_decode_reads_the_same_entries_at_its_width():
+    op = leaf(
+        V4 + "paged_decode:_sparse_attn_v4_paged_decode_triton",
+        [],
+        q=t([2, 4, 16]),
+        unified_kv=t([POOL, 16], role="kv"),
+        kv_indices=t([POOL], I32, role="metadata"),
+        kv_indptr=t([3], I32, role="metadata"),
+        attn_sink=t([4], F32, role="weight"),
+        softmax_scale=0.25,
+    ) | {"stated": {"window_size": 4, "compress_ratio": 8, "index_topk": None}}
+
+    # Q and the sink read; each of 4 + 1 + 4 + 37 entries' 16 bf16 values read
+    # once, two products of width 16 per head and entry.
+    entries = 4 + 1 + 4 + 37
+    moved = 2 * 4 * 16 * 2 + 4 * 4 + entries * 16 * 2
+    assert work(op, rows((1, 9), (1, 300)), 1, "bf16") == Work(
+        {"bf16": 4 * 4 * 16 * entries}, moved
+    )
