@@ -102,7 +102,8 @@ def population_steps(names):
     """Each step the record directories `names` hold, DP's dummy runs aside,
     as its shape, the one the op-level backend prices it at
     (`op_graph.step_shape`), a prefill's with the rows its DP group's MoE
-    gathered (`moe_rows`), and its step-record line."""
+    gathered (`moe_rows`), and its step-record line. A decode step verifies
+    as many drafts in each row as its shortest row does."""
     from atom.compass.backends.op_graph import step_shape
 
     from .forward import decode, prefill
@@ -118,7 +119,8 @@ def population_steps(names):
                 continue
             rows = [(row[0], row[2]) for row in line["rows"]]
             try:
-                phase, tokens, seqs = step_shape(rows, line["rung"])
+                drafts = min(q for q, _ in rows) - 1
+                phase, tokens, seqs = step_shape(rows, line["rung"], drafts)
             except ValueError as exc:
                 raise ValueError(f"{name} step {line['step']} {exc}") from None
             if phase == "decode":
