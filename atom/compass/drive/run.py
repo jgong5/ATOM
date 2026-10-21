@@ -29,7 +29,10 @@ record's `steps/dp<r>.engine.json`, a population's `engine` member) states
 another `SHAPING` field than that config refuses first, naming each field and
 both values. The check refuses no step: it counts those the grid extrapolates
 and those that fall to the step roofline below it, naming each with the grid's
-reasons. Another backend has no check, and refuses `--coverage`.
+reasons. The op graph's is `op_coverage`, over the backend `run.op_graph`
+builds from the run file: a step is covered when its price list prices every
+leaf, and a run file that names no price list refuses. Another backend has no
+check, and refuses `--coverage`.
 
 `--acceptance-record` names a speculative `compass record` directory: its
 histograms' rates (`measured`) go to ATOM as ``--spec-decode-acceptance-rates``,
@@ -49,21 +52,33 @@ member an engine read states, empty when every one was measured.
 import argparse
 import dataclasses
 import json
-from collections import Counter
+import re
+from collections import Counter, defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactStore, Kind
+from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.step_grid_plan import BOUNDS, coverage
 from atom.compass.drive import runfile, serve
-from atom.compass.run import OP_GRAPH, STEP_GRID, STEP_LINEAR, STEP_STUB, step_grid
+from atom.compass.run import (
+    OP_GRAPH,
+    PRICE_LIST,
+    STEP_GRID,
+    STEP_LINEAR,
+    STEP_STUB,
+    step_grid,
+)
 
 PROG = "compass run"
 #: The engine fields that shape a step's batches: the scheduler's bounds, the
 #: capture ladder and the TP width. An input states them as this run resolves
 #: them, or refuses.
 SHAPING = (*BOUNDS, "ladder", "tensor_parallel_size")
+#: A number standing alone in a reason, which `op_coverage` masks so one cause
+#: at many steps' counts is one reason; a kernel's name keeps its digits.
+NUMBER = r"(?<![\w.])\d+(?:\.\d+)?"
 
 
 def main(argv: list[str]) -> None:
@@ -79,11 +94,11 @@ def main(argv: list[str]) -> None:
         join(_joining_parser().parse_args(argv[:cut]), atom_args, side)
         return
     args = _parser().parse_args(argv[:cut])
-    if args.coverage and not getattr(args, STEP_GRID):
-        key = next(k for k in (STEP_STUB, STEP_LINEAR, OP_GRAPH) if getattr(args, k))
+    if args.coverage and not (getattr(args, STEP_GRID) or getattr(args, OP_GRAPH)):
+        key = next(k for k in (STEP_STUB, STEP_LINEAR) if getattr(args, k))
         raise ValueError(
             f"--coverage: --{key.replace('_', '-')} has no coverage check; only "
-            "--step-grid's steps are checked"
+            "--step-grid's and --op-graph's steps are checked"
         )
     if side is not None:
         raise ValueError(
@@ -187,14 +202,67 @@ def measured(record, atom_args, ranks: int) -> list[float]:
 
 
 def check(inputs, run: dict, atom_args) -> dict:
-    """The step grid's coverage of the steps `inputs` hold, over the bundle the
-    run file `run` names, loaded under the config `atom_args` resolve; an
-    input that ran under other `SHAPING` fields refuses."""
+    """The coverage of the steps `inputs` hold by the step grid or the op
+    graph's price list the run file `run` names, loaded under the config
+    `atom_args` resolve; an input that ran under other `SHAPING` fields
+    refuses."""
     store, config = ArtifactStore(run["store"]), _config(atom_args)
     here = step_grid.keyed(config) | {name: getattr(config, name) for name in BOUNDS}
     steps = [s for name in inputs for s in _steps(name, store, here)]
-    backend, _ = step_grid.load(run[STEP_GRID], config, compass_run._machine(run))
+    machine = compass_run._machine(run)
+    if run.get(OP_GRAPH):
+        if PRICE_LIST not in run:
+            raise ValueError(
+                "--coverage: the store holds no price_list at this run's key, so "
+                "the op graph prices every leaf by its roofline and no step is "
+                "covered; compass fit ops publishes one"
+            )
+        backend = compass_run.op_graph(run, config, machine)
+        return {"inputs": list(inputs), **op_coverage(backend, steps)}
+    backend, _ = step_grid.load(run[STEP_GRID], config, machine)
     return {"inputs": list(inputs), **coverage(backend, steps)}
+
+
+def op_coverage(backend, steps) -> dict:
+    """How the price list of `backend`, an `OpGraphBackend`, covers the named
+    step-record lines `steps`: the steps and those covered by phase, and per
+    leaf kind the steps it left out by why, numbers masked, one why (its last)
+    per kind per step so a kind's counts sum to steps. A step is covered
+    when the list prices each leaf the backend asks it for; a leaf it declines,
+    on a line the fit declined among them, goes to the roofline and leaves its
+    step out. A step the backend refuses is left out under ``step refused``."""
+    by_phase, out = defaultdict(Counter), defaultdict(Counter)
+    for _, line in steps:
+        view = BatchView(
+            tuple(RequestShape(*row) for row in line["rows"]),
+            capture_rung=line["rung"],
+            moe_rows=line.get("moe_rows"),
+            produces_output=line["produces_output"],
+        )
+        try:
+            terms = [
+                (t.name.removeprefix("op."), t.refusals)
+                for t in backend.price(view).terms
+            ]
+        except CostRefused as refused:
+            terms = [("step refused", refused.declined)]
+        whys = {
+            kind: re.sub(NUMBER, "#", r.reason.removeprefix(f"{kind}: "))
+            for kind, refusals in terms
+            for r in refusals
+        }
+        phase = "prefill" if view.prefill else "decode"
+        by_phase[phase].update(steps=1, covered=int(not whys))
+        for kind, why in whys.items():
+            out[kind][why] += 1
+    total = sum(by_phase.values(), Counter())
+    return {
+        "steps": total["steps"],
+        "covered": total["covered"],
+        "share": total["covered"] / max(total["steps"], 1),
+        "by phase": {phase: dict(c) for phase, c in sorted(by_phase.items())},
+        "left out, by leaf kind": {k: dict(v) for k, v in sorted(out.items())},
+    }
 
 
 def _steps(name: str, store, here: dict) -> list:

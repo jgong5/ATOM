@@ -1392,19 +1392,7 @@ def runner(model_runner, tree) -> None:
                 f"the run file's op_graph is {run[OP_GRAPH]!r}; it is true, which "
                 "prices each step from the op_graph the store holds at its shape"
             )
-        from atom.compass.backends.op_graph import OpGraphBackend
-
-        backend = OpGraphBackend(
-            machine,
-            _op_graphs(run["store"], config, machine.value("device.arch")),
-            tp=tp,
-            dp=config.parallel_config.data_parallel_size,
-            kv=config.kv_cache_dtype,
-            padded=padding != "none",
-            split_send_recv=config.enable_expert_parallel
-            and getattr(config, "enable_low_latency", False),
-            price_list=PRICE_LIST in run and _price_list(run, config, machine),
-        )
+        backend = op_graph(run, config, machine)
     elif PRICE_LIST in run:
         raise ValueError(
             "the run file names a price_list and no op_graph, the one backend "
@@ -1485,6 +1473,24 @@ def runner(model_runner, tree) -> None:
     model_runner.compass_memory = record(readings, tokens=warmup, memory=measured)
     if bundle is not None:
         model_runner.compass_step_grid = {**bundle, "describe": backend.describe()}
+
+
+def op_graph(run: dict, config, machine):
+    """The `OpGraphBackend` the run file `run` names for `config` on
+    `machine`, with its price list when it names one."""
+    from atom.compass.backends.op_graph import OpGraphBackend
+
+    return OpGraphBackend(
+        machine,
+        _op_graphs(run["store"], config, machine.value("device.arch")),
+        tp=config.tensor_parallel_size,
+        dp=config.parallel_config.data_parallel_size,
+        kv=config.kv_cache_dtype,
+        padded=run.get("padding", "executed") != "none",
+        split_send_recv=config.enable_expert_parallel
+        and getattr(config, "enable_low_latency", False),
+        price_list=PRICE_LIST in run and _price_list(run, config, machine),
+    )
 
 
 def _op_graphs(root: str, config, arch: str):
