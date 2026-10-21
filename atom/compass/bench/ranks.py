@@ -15,7 +15,7 @@ rank's cold time beside it (`merge`).
 import contextlib
 import copy
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ProcessPoolExecutor, wait
 
 
 def layout(config) -> int:
@@ -37,7 +37,8 @@ def layout(config) -> int:
 def launch(fn, config, *args) -> list:
     """`fn(rank_config, *args, rank=r)` on every rank of `config`'s layout, as
     `CoreManager` configures each DP rank, in spawned processes that meet at a
-    store this process holds; what each returned, by rank."""
+    store this process holds; what each returned, by rank. The first rank to
+    raise ends the others, and its exception is raised."""
     from torch.distributed import TCPStore
 
     config = copy.deepcopy(config)
@@ -58,6 +59,12 @@ def launch(fn, config, *args) -> list:
     spawn = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(len(calls), mp_context=spawn) as pool:
         running = [pool.submit(fn, c, *args, rank=tp) for c, tp in calls]
+        done, _ = wait(running, return_when=FIRST_EXCEPTION)
+        failed = [r.exception() for r in running if r in done and r.exception()]
+        if failed:  # the others would wait on it in their next cross-rank call
+            for process in list(pool._processes.values()):
+                process.kill()
+            raise failed[0]
         return [r.result() for r in running]
 
 
