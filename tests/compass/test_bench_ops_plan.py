@@ -24,12 +24,13 @@ from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 from atom.compass import capture, ir
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.bench import ops
-from atom.compass.capture import driverless, forward
+from atom.compass.capture import forward
 from atom.compass.capture.forward import decode, structure
 from atom.compass.run import step_grid
 from atom.compass.runner.overrides import schedulable_ladder
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
+from atom.config import Config
 from atom.utils import forward_context as fctx
 
 CONFIG = SimpleNamespace(
@@ -928,19 +929,18 @@ def test_measure_journals_each_record_as_it_finishes_it(tmp_path, monkeypatch):
 #: config an op_graph's key states.
 GRAPH, KEYED = ops.graph, step_grid.keyed
 
-#: A dense model's config.json, as little as ATOM's config reads.
-QWEN3 = {
-    "architectures": ["Qwen3ForCausalLM"],
-    "model_type": "qwen3",
-    "hidden_size": 64,
-    "num_attention_heads": 8,
-    "num_key_value_heads": 8,
-    "head_dim": 8,
-    "num_hidden_layers": 2,
-    "intermediate_size": 64,
-    "vocab_size": 128,
-    "max_position_embeddings": 4096,
-}
+#: The architecture of the model whose config.json the test writes.
+ARCH = "Qwen3ForCausalLM"
+
+
+class _Config(Config):
+    """ATOM's `Config` with its fields as ATOM's arguments resolve them, the
+    model and quantization left unread: reading them imports aiter, which a
+    process with no driver cannot do twice."""
+
+    def __post_init__(self):
+        self.hf_config = SimpleNamespace(architectures=[ARCH])
+        self.quant_config = SimpleNamespace(compute_hash=lambda: "unquantized")
 
 
 @pytest.mark.parametrize(
@@ -955,9 +955,9 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     store, root, key, run = bench
     model = tmp_path / "model"
     model.mkdir()
-    (model / "config.json").write_text(json.dumps(QWEN3))
+    (model / "config.json").write_text(json.dumps({"architectures": [ARCH]}))
     atom_args = ["--model", str(model), "-tp", "8", "--enforce-eager", parallel]
-    driverless._declare_arch(str(tmp_path), "gfx942")
+    monkeypatch.setattr("atom.config.Config", _Config)
     config = forward._config(str(model), 8, atom_args)  # laid out, as `main` does
     config.max_num_seqs = 4
     published = []
