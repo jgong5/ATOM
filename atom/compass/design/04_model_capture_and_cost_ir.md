@@ -34,6 +34,11 @@ law's engine config less its ladder (D20).
 [ruling on #1812](https://github.com/jgong5/ATOM/issues/1812#issuecomment-6304727730):**
 each traced step follows two untraced steps of its shape (D20).
 
+**Revised 2026-10-21 by [#1270](https://github.com/jgong5/ATOM/issues/1270):** under a
+drafter, a step that samples is captured as two graphs, its target's and its drafter's, cut
+where ATOM records `forward_done_event`, and the op-level backend tags the drafter's terms
+`draft` (D18).
+
 **Depends on:** `02_model_runner_and_cost_backend.md` (the backend plug point this fills),
 `03_memory_and_kv_model.md` (the activation term this supplies).
 
@@ -456,6 +461,40 @@ The test that enumerated both operator sets by name — so that a future torch g
 meta kernel for one of the legacy forms would fail there rather than leave unexplained
 code behind — was withdrawn along with the capture module it exercised. Nothing on this
 tree holds either set in place today.
+
+### A drafter's step: target and drafter cut at `forward_done_event`
+
+Under a drafter (`--method mtp`), a step that samples runs the target forward, the
+rejection sampler and the sampling, records `forward_done_event`, then runs the drafter:
+`num_speculative_tokens` passes of its MTP layer in sequence, each through the target's
+shared embedding and LM head and a greedy pick. The parity record splits the measured
+device window at that event (`d_target_ns`, [#1208](https://github.com/jgong5/ATOM/pull/1208)),
+and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
+[#1565](https://github.com/jgong5/ATOM/pull/1565)). Capture cuts at the same point
+([#1270](https://github.com/jgong5/ATOM/issues/1270)):
+
+- **A decode shape is a verify step.** Each row schedules K + 1 tokens, K of them stated
+  drafts, as ATOM's scheduler builds the batch, and the batch is not a dummy run, since
+  ATOM scores drafts only on a real step. The MTP status and draft ids the runner reads
+  back from the device read as zeros: nothing computed them, and no shape depends on them.
+- **Two graphs per step that samples.** The recorder marks the cut when the runner records
+  `forward_done_event`. What precedes it is the target's graph, keyed as before: its
+  engine config names the drafter's method and width; what follows is the drafter's, the
+  same key plus `draft`. Sampling and the rejection sampler are the target's, as in the record.
+- **Priced apart.** The op-level backend prices the drafter's graph at the step's rows
+  and tags each of its terms `draft` (`draft op.<kind>`), so `StepCost.draft_seconds` is
+  the drafter's and `target_seconds` the target's.
+- **Refused by name.** A middle chunk under a drafter: ATOM runs its draft-KV pass
+  (`compute_draft_kv`) on a real step only, and a prefill shape is traced as a dummy run,
+  so no graph holds that pass. A block drafter (DSpark): it writes its draft KV before
+  `forward_done_event` on a step that samples ([#1607](https://github.com/jgong5/ATOM/pull/1607)),
+  so one cut does not part its target from its draft.
+
+The drafter's roofline is not its measured time. On #1208's MTP1 record
+(Qwen3.5-35B-A3B-FP8, TP1, MI308X) the drafter's roofline is 0.39 of the measured draft at
+p50, 342 us against 874 us; the LM head's weight read is 232 us of it. The rest is time no
+leaf's roofline holds, and the op level fits no residual
+([#1489](https://github.com/jgong5/ATOM/issues/1489)).
 
 ### Open issues
 
@@ -1399,7 +1438,7 @@ Deferred to future work by decision on 2026-09-18.
 | # | Decision | Date |
 |---|---|---|
 | D17 | Two granularities behind one `CostBackend`; the step level discovers the shapes the op level captures. No fallback crosses granularity: a capture failure fails the run, lazy trace off makes an uncaptured shape a refusal | 2026-09-18; revised 2026-10-14 (#952); per shape 2026-10-18 (#1489) |
-| D18 | Capture with `TorchDispatchMode` + `FakeTensorMode`, on FakeTensor rather than bare meta, at concrete shapes: one graph per decode width and prefill (T, B) that `trace ops` is given or that a record directory's steps hold. The symbolic route A and its four disciplines (the fourth: the engine's host arithmetic asks a symbol for a number, so a symbolic capture keeps the conversion, logs it with its line, and asserts that log against a stated set) are recorded, not built | 2026-09-18, fourth discipline 2026-09-22; concrete 2026-10-18 (#1489) |
+| D18 | Capture with `TorchDispatchMode` + `FakeTensorMode`, on FakeTensor rather than bare meta, at concrete shapes: one graph per decode width and prefill (T, B) that `trace ops` is given or that a record directory's steps hold. The symbolic route A and its four disciplines (the fourth: the engine's host arithmetic asks a symbol for a number, so a symbolic capture keeps the conversion, logs it with its line, and asserts that log against a stated set) are recorded, not built. Under a drafter a step that samples is two graphs, the target's and the drafter's, cut at `forward_done_event` | 2026-09-18, fourth discipline 2026-09-22; concrete 2026-10-18 (#1489); drafter 2026-10-21 (#1270) |
 | D18.1 | `torch.export` recorded as an unverified alternative; rejected now on decomposition fidelity and on capturing a model call rather than an engine step | 2026-09-18 |
 | D19 | Hierarchical, concrete, stream-annotated IR: `Seq` / `Repeat` / `Par`, a node's arguments its leaf contract. No branches in the IR — applicability is a discrete key and the captured shape, matched by equality | 2026-09-18; revised 2026-10-18 (#531); concrete 2026-10-18 (#1489) |
 | D20 | Opaque leaves are priced, not decomposed. Each carries a stated parameter extractor and a contract: arguments by schema slot, each tensor's stride and role by provenance (activation, weight, KV, metadata), non-tensor arguments and module references kept, a runner attribute as `runner.<attr>`, any other object in pickle's reduce shape or refused by its type. A raw Triton (`JITFunction.run`, a warmup aside) or FlyDSL (`JitFunction.__call__`, `CompiledFunction.__call__`) launch lifts to the first function its `module:qualname` names, past the languages' frames, closures and generic launchers; a direct `CompiledKernel.run` is refused. Nested launching calls and custom ops fold into the outermost; arguments come from call entry in a traced step that follows two untraced steps of its shape; each contract must replay to the same kernels and operators outside torch's, and a launch outside a found function, a raise after a launch or a call open at the step's end is refused. An `op_graph` is keyed by the step law's engine config less its ladder, the performance environment in it, and a miss names each differing field; keying on a kernel-selecting environment variable is a workaround for an ATOM design that should take the choice as an argument. Capture runs the two MoE wrappers' bodies; their DP and MORI exchanges are declared nodes named for the function ATOM calls, and a TBO step is refused. | 2026-09-18; contract 2026-10-18 (#1489); MoE exchanges 2026-10-19 (#1401); lift rule and key 2026-10-20 (#1811); two untraced steps 2026-10-21 (#1812) |
