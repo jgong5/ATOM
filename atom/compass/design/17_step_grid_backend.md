@@ -329,7 +329,8 @@ raggedness, is the residual's job (D100). A decode batch's raggedness is the loo
 (#1793): on a rung where the bundle holds α, the lookup is `G(mean) + α·(G(max) − G(mean))`,
 G read at B rows of the mean and of the longest row's cached context, α in [0, 1] from the
 rows' length statistics, fitted on bench-measured ragged batches and kept on a rung only
-where no calibration cell's held-out p50 worsens with it; on any other rung it is G(mean).
+where #941's gate admits it: two or more calibration cells of 100 steps there, none of
+whose held-out p50 worsens with it; on any other rung it is G(mean).
 
 ### Decision
 
