@@ -89,7 +89,7 @@ def test_a_verify_step_is_cut_at_forward_done_event_into_target_and_drafter(
     _, graphs = capture(drafts, tmp_path_factory)
     [target] = [key for key in graphs if not key.endswith(" draft")]
     assert set(graphs) == {target, f"{target} draft"}
-    assert f" mtp={drafts} " in target
+    assert f'"speculative":["mtp",{drafts}]' in target
     ours, theirs = (_ops(graphs[key]["region"]) for key in (target, f"{target} draft"))
     vocab = json.loads(CONFIG.read_text())["text_config"]["vocab_size"]
 

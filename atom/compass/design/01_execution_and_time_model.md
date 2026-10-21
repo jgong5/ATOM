@@ -1378,6 +1378,8 @@ stage and per DP rank, with a TP group modelled on its rank 0.
 - `E`: `scheduler.postprocess()`, `scheduler.schedule()` and the dispatch to the worker,
   measured as the gap from one forward's exit to the next one's entry. It is the
   recurrence's first term.
+  Under host laws that carry `E_out` (below), it runs from the engine's input pull
+  to the entry, `E_in`, and `postprocess()` and the output put fall in `E_out`.
 - `W_pre`: prepare (`ModelRunner.prepare_model`), which waits only at its two ends;
   under MTP, an output forward's prepare up to R1's wait.
 - `W_inputs`: under MTP, an output forward's prepare after R1's wait: the input ids,
@@ -1421,9 +1423,11 @@ forward returns. `clock.charge` advances the reply's `predicted_s`, the forward'
 then its `out_s`, `E_out`, so the engine's input pull and output send sit at
 `exit + E_out`; the forward's charge stays the forward. `E` stays the recurrence's first
 term and, where `out_s` is set, covers the pull to the next entry, `E_in`. A replay sends
-a real record's `t_pull_ns - t_exit_ns`; predict sends none until an `E_out` host law is
-fitted ([#1480](https://github.com/jgong5/ATOM/issues/1480)), so `E` stays whole and the
-pull sits at the exit. Under DP each member's pull, its own release plus its `out_s`,
+a real record's `t_pull_ns - t_exit_ns`; predict sends the charged forward's `E_out` host
+law, fitted on records that stamp the pull
+([#1480](https://github.com/jgong5/ATOM/issues/1480)). Host laws with no `E_out` leave `E` whole
+and the pull at the exit; once any kind has one, a kind without one is refused. Under DP
+each member's pull, its own release plus its `out_s`,
 joins the group's rounds (`group_out`), never the device-end `max`; the member returns
 at its own pull and `group_targets` keeps releases only. The put lands at the pull,
 after the real put: the records' `t_put_ns` measure that gap.

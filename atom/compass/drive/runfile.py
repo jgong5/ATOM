@@ -8,10 +8,14 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
 - The backend, exactly one, each flag named by its `run` run-file key:
   ``--step-stub FILE``, the stated `Coefficients`; ``--step-linear KEY``, a
   `step_linear_law` entry's params with its key's ``engine_config``;
-  ``--step-grid KEY``, the store's root and a `step_grid_bundle` entry's key.
+  ``--step-grid KEY``, the store's root and a `step_grid_bundle` entry's key;
+  ``--op-graph``, ``true``, and as ``price_list`` the fields of the
+  `price_list` key this run's model, parallel layout, machine spec and ATOM
+  tree name, when ``--store`` holds one there.
   A KEY is the token `Key.token` prints, resolved under ``--store``.
   ``backend`` holds the backend's ``digest`` and, for a store entry, its
-  ``provenance``, with its report's as ``inputs``; a stub's is None.
+  ``provenance``, with its report's as ``inputs``; a stub's, and an op graph's
+  with no price list, is None, its digest over what the run file states.
 - ``--host-laws KEY``, a `host_laws` entry's params, as ``host``; without it
   the run charges no host time.
 - ``--step-linear`` and ``--host-laws`` repeat, one entry per engine config:
@@ -34,7 +38,15 @@ import json
 from pathlib import Path
 
 from atom.compass import run
-from atom.compass.artifacts import ArtifactStore, Kind, member_name
+from atom.compass.artifacts import (
+    ArtifactStore,
+    Key,
+    Kind,
+    git_tree_root,
+    machine_spec_digest,
+    member_name,
+    module_root,
+)
 from atom.compass.fit.publish import RANK
 
 #: Each backend flag's store kind; the step stub's coefficients are a file.
@@ -58,6 +70,7 @@ def add_arguments(parser) -> None:
         flag, stub = "--" + key.replace("_", "-"), key == run.STEP_STUB
         many = {"action": "append"} if key == run.STEP_LINEAR else {}
         backend.add_argument(flag, dest=key, metavar="FILE" if stub else "KEY", **many)
+    backend.add_argument("--op-graph", dest=run.OP_GRAPH, action="store_true")
     parser.add_argument(
         "--host-laws", metavar="KEY", action="append", help="a host_laws token"
     )
@@ -83,14 +96,18 @@ def build(args, atom_args) -> dict:
     }
     # Read as the runner and `compass fit` read it, so a spec they would
     # refuse refuses before a server starts.
-    run._machine(out)
+    machine = run._machine(out)
     if stub := getattr(args, run.STEP_STUB):
         out[run.STEP_STUB] = json.loads(Path(stub).read_text())
-        stated = json.dumps(out[run.STEP_STUB], sort_keys=True).encode()
-        out["backend"] = {
-            "digest": "sha256:" + hashlib.sha256(stated).hexdigest(),
-            "provenance": None,
-        }
+        out["backend"] = _stated(out[run.STEP_STUB])
+    elif getattr(args, run.OP_GRAPH):
+        out[run.OP_GRAPH] = True
+        key = _price_list_key(atom_args, machine)
+        if store.directory_for(key).exists():
+            out[run.PRICE_LIST] = key.values
+            out["backend"] = _backend(store.read(key))
+        else:
+            out["backend"] = _stated({run.OP_GRAPH: True})
     else:
         name = next(k for k in KINDS if getattr(args, k))
         tokens, laws, backends = getattr(args, name), [], []
@@ -104,10 +121,7 @@ def build(args, atom_args) -> dict:
                 laws.append(
                     {**_member(entry, "params"), "engine_config": engine_config}
                 )
-            reported = member_name("report", RANK, "json") in entry.members
-            inputs = _member(entry, "report").get("provenance") if reported else None
-            provenance = {**entry.provenance.as_json(), "inputs": inputs}
-            backends.append({"digest": entry.digest, "provenance": provenance})
+            backends.append(_backend(entry))
         out[name], out["backend"] = laws[0], backends[0]
         if len(laws) > 1:
             digests = " ".join(sorted(b["digest"] for b in backends)).encode()
@@ -136,8 +150,16 @@ def prefill_decode(args, prefill_args, decode_args) -> dict:
     instance on one node, started with ATOM's arguments `prefill_args` and
     `decode_args`: each side's DP width read from its own, the router's
     per-request forward cost the machine spec's ``interconnect.router_relay_s``,
-    the KV transfers priced on its intra-node link, and `KV_WRITE_REQ_S`."""
+    the KV transfers priced on its intra-node link, and `KV_WRITE_REQ_S`. A
+    price list the prefill side names that is not the decode side's refuses."""
     out = build(args, prefill_args)
+    if run.PRICE_LIST in out:
+        decode = _price_list_key(decode_args, run._machine(out)).values
+        if decode != out[run.PRICE_LIST]:
+            raise ValueError(
+                f"--op-graph: the prefill side's price list is {out[run.PRICE_LIST]} "
+                f"and the decode side's {decode}; one run file names one"
+            )
     del out["data_parallel_size"]
     out[run.DP_WIDTHS["P"]] = _dp_width(prefill_args)
     out[run.DP_WIDTHS["D"]] = _dp_width(decode_args)
@@ -154,6 +176,44 @@ def _dp_width(atom_args) -> int:
     engine = _engine_args(atom_args)
     ranks = engine.tensor_parallel_size if engine.enable_dp_attention else 1
     return engine.data_parallel_size * ranks
+
+
+def _stated(value) -> dict:
+    """The ``backend`` of a backend the run file states whole as `value`."""
+    stated = json.dumps(value, sort_keys=True).encode()
+    return {
+        "digest": "sha256:" + hashlib.sha256(stated).hexdigest(),
+        "provenance": None,
+    }
+
+
+def _backend(entry) -> dict:
+    """The ``backend`` of the store entry `entry`: its digest and provenance,
+    with its report's provenance as ``inputs``."""
+    reported = member_name("report", RANK, "json") in entry.members
+    inputs = _member(entry, "report").get("provenance") if reported else None
+    provenance = {**entry.provenance.as_json(), "inputs": inputs}
+    return {"digest": entry.digest, "provenance": provenance}
+
+
+def _price_list_key(atom_args, machine) -> Key:
+    """The `price_list` key of the model and parallel layout ATOM's arguments
+    serve, on `machine`, from this ATOM tree."""
+    engine = _engine_args(atom_args)
+    tree = git_tree_root("atom", module_root("atom"))
+    return Key.of(
+        Kind.PRICE_LIST,
+        model=run._file_digest(engine.model, "config.json"),
+        dp=engine.data_parallel_size,
+        pp=engine.pipeline_parallel_size,
+        pcp=engine.prefill_context_parallel_size,
+        tp=engine.tensor_parallel_size,
+        enable_expert_parallel=engine.enable_expert_parallel,
+        enable_dp_attention=engine.enable_dp_attention,
+        decode_context_parallel_size=engine.decode_context_parallel_size,
+        machine_spec=machine_spec_digest(machine),
+        source_root=f"{tree.revision_kind}-{tree.revision}",
+    )
 
 
 def _member(entry, stem: str):

@@ -25,6 +25,7 @@ from test_backend_step_linear import _installed, law, view
 from test_backend_step_roofline import COMPUTE, MEMORY, ROOFLINE, _spec
 from test_capture_ir import CONFIG, WIDTH_2, _ops, capture
 from test_memory_readings import DOCUMENT, WORKER
+from test_op_graph_arch import ENGINE
 from test_op_work import leaf, t
 from test_work import SPEC
 
@@ -449,6 +450,16 @@ def test_the_27b_s_captured_decode_step_prices_leaf_by_leaf(tmp_path_factory):
     assert {f"op.{GEMM}", f"op.{ATTENTION}"} <= by_name(cost).keys()
 
 
+def _engine(graph) -> dict:
+    """`ENGINE` at the quantization hash the capture's own config keyed `graph`
+    by, which a stand-in config cannot compute."""
+    quantization = json.loads(graph["structure"].split()[3])["quantization"]
+    return {
+        **ENGINE,
+        "quant_config": SimpleNamespace(compute_hash=lambda: quantization),
+    }
+
+
 def test_the_run_s_lookup_reads_the_eager_graph_at_a_shape(tmp_path_factory):
     graph, _ = capture(1, WIDTH_2, tmp_path_factory)["decode B=2"]
     base = tmp_path_factory.getbasetemp()
@@ -462,6 +473,7 @@ def test_the_run_s_lookup_reads_the_eager_graph_at_a_shape(tmp_path_factory):
             parallel_config=SimpleNamespace(data_parallel_size=1),
             enable_expert_parallel=False,
             enforce_eager=False,
+            **_engine(graph),
         )
         lookup = _op_graphs(str(store), config, "gfx942")
         found.append((lookup("decode", 2, 2), lookup("decode", 3, 3)))
@@ -470,7 +482,7 @@ def test_the_run_s_lookup_reads_the_eager_graph_at_a_shape(tmp_path_factory):
 
 
 def test_a_27b_middle_chunk_prices_from_its_graph_with_no_lm_head(tmp_path_factory):
-    capture(1, PREFILLS, tmp_path_factory)
+    (graph, _), *_ = capture(1, PREFILLS, tmp_path_factory).values()
     hf = SimpleNamespace(architectures=json.loads(CONFIG.read_text())["architectures"])
     lookups = [
         _op_graphs(
@@ -482,6 +494,7 @@ def test_a_27b_middle_chunk_prices_from_its_graph_with_no_lm_head(tmp_path_facto
                 parallel_config=SimpleNamespace(data_parallel_size=1),
                 enable_expert_parallel=False,
                 enforce_eager=True,
+                **_engine(graph),
             ),
             "gfx942",
         )
@@ -742,10 +755,17 @@ def test_each_micro_batch_of_a_split_step_prices_at_its_own_shape():
     assert cost.terms[0].provenance.method is Method.MEASURED
 
 
-def test_a_split_step_the_list_prices_in_part_is_a_roofline_carrying_why():
-    # the list holds the first micro-batch's GEMM only; the second's is its
+@pytest.mark.parametrize(
+    "rows,shape,ns,want",
+    [(3, "prefill T=3 B=1", 3e9, (3.0, 1.0)), (4, "prefill T=4 B=2", 4e9, (1.0, 4.0))],
+    ids=["first-listed", "second-listed"],
+)
+def test_a_split_step_the_list_prices_in_part_is_a_roofline_carrying_why(
+    rows, shape, ns, want
+):
+    # the list holds one micro-batch's GEMM only; the other's is its
     # roofline, a second
-    params = listed(*[pt(g(3, 8, 8), "prefill T=3 B=1", 3e9, c) for c in (0, 8)])
+    params = listed(*[pt(g(rows, 8, 8), shape, ns, c) for c in (0, 8)])
 
     def graph(phase, tokens, seqs, output, gathered):
         return {"seq": [g(tokens, 8, 8)]}
@@ -753,7 +773,7 @@ def test_a_split_step_the_list_prices_in_part_is_a_roofline_carrying_why():
     cost = OpGraphBackend(SECOND, graph, kv="bf16", dp=2, price_list=params)
     cost = cost.price(SPLIT)
 
-    assert by_name(cost) == {"op.tbo": overlap([[(3.0, 1.0)]])}
+    assert by_name(cost) == {"op.tbo": overlap([[want]])}
     assert cost.refusals == (
         Refusal("price-list", f"{GEMM}: no point of its signature was measured"),
     )

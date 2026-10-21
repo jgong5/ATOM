@@ -468,9 +468,9 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   ATOM scores drafts only on a real step. The MTP status and draft ids the runner reads
   back from the device read as zeros: nothing computed them, and no shape depends on them.
 - **Two graphs per step that samples.** The recorder marks the cut when the runner records
-  `forward_done_event`. What precedes it is the target's graph, keyed as before plus the
-  drafter's method and width (`mtp=K`); what follows is the drafter's, the same key plus
-  `draft`. Sampling and the rejection sampler are the target's, as in the record.
+  `forward_done_event`. What precedes it is the target's graph, keyed as before: its
+  engine config names the drafter's method and width; what follows is the drafter's, the
+  same key plus `draft`. Sampling and the rejection sampler are the target's, as in the record.
 - **Priced apart.** The op-level backend prices the drafter's graph at the step's rows
   and tags each of its terms `draft` (`draft op.<kind>`), so `StepCost.draft_seconds` is
   the drafter's and `target_seconds` the target's.

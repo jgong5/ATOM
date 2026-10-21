@@ -21,9 +21,11 @@ rank each of the layout the arguments resolve (`ranks`), its weights a dummy,
 through ATOM's warmup, and a `Stub` takes the place of the model's forward.
 Each point reaches the runner as a batch (`ReplayRule`), so ATOM builds its
 metadata and forward context, and the stub calls each leaf from its contract:
-an activation is random at its shape, dtype and stride; a weight is a tensor
-of the model of that shape, dtype and stride; a metadata tensor is a view of
-ATOM's live metadata (`meta`), whose name the point records, or of
+an activation is random at its shape, dtype and stride, except a router's
+top-k expert ids, drawn uniformly on every copy, past top-k the shared
+experts' ids ATOM fuses into them (`_route`); a weight is a
+tensor of the model of that shape, dtype and stride; a metadata tensor is a
+view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM passes the forward (`TOKEN_IDS`); an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names. A leaf whose operator cannot run so
@@ -51,7 +53,8 @@ Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
 idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
-aside, are the point's kernel identity. A batch the KV pool cannot place refuses its leaves.
+aside, are the point's kernel identity. When `ReplayRule` refuses a batch, its
+leaves refuse; an error in ATOM's forward fails the run, naming the point.
 The points run in a process of their own on each GPU; one that dies ends
 every rank, keeps the points every rank finished, the point it was measuring
 refuses, and new ones measure the rest; two in a row that die having finished
@@ -98,6 +101,7 @@ import multiprocessing
 import os
 import re
 import statistics
+import sys
 import tempfile
 import time
 import warnings
@@ -126,7 +130,7 @@ from atom.compass.drive.gpu import add_gpu_flag
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below or the
 #: copies a graph reads change.
-PROTOCOL = 7
+PROTOCOL = 8
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -151,6 +155,8 @@ REST = 0.1
 #: the model's forward; `_meta`'s name rule binds an embedding's `indices` to
 #: another index buffer.
 TOKEN_IDS = {("aten.embedding.default", "indices")}
+#: The seed of a copy's drawn expert ids, with the copy's index.
+SEED = 0
 #: The rank every member is written at: the bench is one rank.
 RANK = Topology().ranks()[0]
 #: The variable naming the file a measuring process appends each point's
@@ -274,14 +280,22 @@ def graph(store, config, shape, arch=None) -> dict:
     """The `op_graph` `trace ops` published for `config` at `shape` on `arch`,
     this GPU's when it is None, of a step that produces output, as JSON: a
     prefill that produces none runs the same leaves less the LM head and the
-    sampler, so this graph's points cover both."""
-    from atom.compass.capture.forward import structure
+    sampler, so this graph's points cover both. A miss where the store holds
+    the shape under another engine config refuses naming what differs."""
+    from atom.compass.artifacts import ArtifactRefusal, Rule
+    from atom.compass.capture.forward import missed, structure
 
     key = Key.of(
         Kind.OP_GRAPH,
         structure=structure(config, shape.phase, device=arch),
         shape=str(shape),
     )
+    if not store.directory_for(key).exists() and (why := missed(store, key)):
+        raise ArtifactRefusal(
+            Rule.RESOLUTION,
+            f"no op_graph holds {shape} under this engine config{why}",
+            "compass trace ops captures one under this process's environment",
+        )
     return json.loads(store.read(key).read_member("graph", RANK, "json"))
 
 
@@ -338,15 +352,7 @@ def measure(config, todo, llc: int, rank: int = 0) -> list[dict]:
         todo = ranks.union(todo, group)
         with patch.object(runner.model, "forward", stub), torch.inference_mode():
             for shape, context, found in todo:
-                try:
-                    got += stub.point(rule, shape, context, found)
-                except ValueError as error:  # a batch the KV pool cannot place
-                    refused = [
-                        {"shape": str(shape), "context": context, "op": op["op"]}
-                        | {"leaf": sig, "refused": f"ValueError: {error}"}
-                        for sig, (op, _) in found.items()
-                    ]
-                    got += _journal(journal, refused)
+                got += stub.point(rule, shape, context, found)
         return got
     finally:
         runner.exit()
@@ -395,6 +401,20 @@ class Stub:
             self.weights.setdefault(_spec(t), {})[t.data_ptr()] = t
         self.modules = dict(runner.model.named_modules())
         self.contexts = runner.config.compilation_config.static_forward_context
+        self.moe = sorted(
+            {
+                (m.global_num_experts, m.top_k)
+                for m in self.modules.values()
+                if hasattr(m, "global_num_experts")
+            }
+        )
+        # ATOM's top-k ids buffer when its MoE layers fuse shared experts into
+        # top-k (`init_aiter_topK_meta_data`): past top-k, the shared experts'
+        # ids, under EP one more, and the fake expert's on rows another rank owns
+        topk = sys.modules.get("atom.model_ops.topK")
+        meta = getattr(topk, "aiter_topK_meta_data", None)
+        self.shared = meta[1] if meta and self.moe else None
+        self.loads = []
 
     def __call__(self, input_ids, positions, *args, **kwargs):
         from atom.utils.forward_context import get_forward_context
@@ -438,7 +458,8 @@ class Stub:
         return input_ids.new_zeros((*wide, text.hidden_size), dtype=dtype)
 
     def point(self, rule, shape, context, found) -> list[dict]:
-        """Each leaf of `found` timed at `shape` on `point_rows`."""
+        """Each leaf of `found` timed at `shape` on `point_rows`, or every leaf
+        refused when `rule` refuses the batch."""
         from atom.utils.forward_context import _forward_kv_cache_context
 
         pool = self.runner.config.num_kvcache_blocks
@@ -455,7 +476,20 @@ class Stub:
         self.leaves, self.placed, self.context, self.clones = found, [], context, {}
         self.cold_copies = {s: self._cold(size) for s, (_, size, _) in plans.items()}
         for p in range(max(min(need, *room), 1)):
-            self.runner.forward(rule.batch(view, p * blocks, p * len(rows)))
+            try:
+                batch = rule.batch(view, p * blocks, p * len(rows))
+            except ValueError as error:  # the rule refuses, before any forward
+                refused = [
+                    {"shape": str(shape), "context": context, "op": op["op"]}
+                    | {"leaf": sig, "refused": f"ValueError: {error}"}
+                    for sig, (op, _) in found.items()
+                ]
+                return _journal(self.journal, refused)
+            try:
+                self.runner.forward(batch)
+            except Exception as error:
+                error.add_note(f"measuring {shape} at context {context}")
+                raise
         got = []
         for sig, (op, inst) in found.items():
             n, size, _ = plans[sig]
@@ -512,6 +546,7 @@ class Stub:
         from atom.utils import forward_context
 
         fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
+        self.loads = []
         with refused_together():
             calls = [self._copy(op, sig, instances, 0)]
         # one weight can read a few percent off another of its spec, and every
@@ -558,6 +593,7 @@ class Stub:
             "calls": len(cycle),
             "llc_bytes": self.llc,
             "protocol": PROTOCOL,
+            "routing": _routing(self.loads) if self.loads else None,
         }
 
     def _copy(self, op, sig, instances, c, like=None):
@@ -573,6 +609,8 @@ class Stub:
                 return [
                     build(f"{path}.{i}", v, old and old[i]) for i, v in enumerate(value)
                 ]
+            if isinstance(value, dict) and self._routed(value):
+                return self._route(value, c)
             if isinstance(value, dict) and value.get("role") == "activation" and like:
                 return old
             if _ref(value) and "module" in value:
@@ -591,15 +629,54 @@ class Stub:
         args = op["args"].items()
         return {s: build(s, v, like[0][s] if like else None) for s, v in args}, snap
 
+    def _routed(self, spec) -> bool:
+        """Whether `spec` is a router's top-k expert ids: an integer activation,
+        a row per token, a column per expert an MoE layer of the model takes,
+        or per column of ATOM's ids buffer with its fused shared experts."""
+        widths = {k for _, k in self.moe}
+        if self.shared is not None:
+            widths.add(self.shared.shape[1])
+        return (
+            spec.get("role") == "activation"
+            and len(spec["shape"]) == 2
+            and not _dtype(spec["dtype"]).is_floating_point
+            and spec["shape"][1] in widths
+        )
+
+    def _route(self, spec, c):
+        """Copy `c`'s expert ids for `spec`: each row's experts drawn
+        independently and uniformly, distinct, from the model's routed experts,
+        seeded by `SEED` and `c`, and past top-k the row's ids in ATOM's buffer;
+        the copy's expert loads go to `loads`."""
+        if len(self.moe) > 1:
+            raise ValueError(
+                f"the model's MoE layers route (experts, top-k) {self.moe}: "
+                f"which one draws {_text(spec)} is not known"
+            )
+        [(experts, k)] = self.moe
+        device = self.runner.device
+        seed = torch.Generator(device).manual_seed(SEED * CALLS + c)
+        draw = torch.rand(spec["shape"][0], experts, generator=seed, device=device)
+        ids = draw.topk(k).indices
+        self.loads.append(torch.bincount(ids.flatten(), minlength=experts).tolist())
+        out = _random(spec, device)
+        out[:, :k] = ids
+        if out.shape[1] > k:
+            out[:, k:] = self.shared[: len(out), k:]
+        return out
+
     def _reweigh(self, op, like, c):
         """Copy `like` of `op`'s call with the c-th weight of each weight
-        argument's spec, its other arguments and forward context shared."""
+        argument's spec and expert ids of its own, its other arguments and
+        forward context shared."""
 
         def build(value, old):
             if isinstance(value, list):
                 return [build(v, o) for v, o in zip(value, old)]
             if isinstance(value, dict) and value.get("role") == "weight":
                 return self._tensor(value, None, c, False)
+            if isinstance(value, dict) and self._routed(value):
+                return self._route(value, c)
             return old
 
         kwargs, snap = like
@@ -619,6 +696,17 @@ class Stub:
                 raise ValueError(f"no tensor of the model is a weight {_text(spec)}")
             return held[c] if c < len(held) else _clone(held[c % len(held)])
         raise ValueError(f"a {role} tensor argument {_text(spec)} is not built")
+
+
+def _routing(loads) -> dict:
+    """The drawn copies' imbalance, recorded and not priced: each copy's
+    experts that took a token, and the most tokens one expert took."""
+    return {
+        "seed": SEED,
+        "experts": len(loads[0]),
+        "activated": [sum(n > 0 for n in load) for load in loads],
+        "max_load": [max(load) for load in loads],
+    }
 
 
 def point_rows(shape, context, pool: int, block_size: int) -> list[list]:

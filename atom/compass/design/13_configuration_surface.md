@@ -145,7 +145,7 @@ python -m atom.entrypoints.openai_server <ATOM arguments> \
 | `run` flag | Meaning | Default |
 |---|---|---|
 | `--machine` | the machine specification (`05` D25) | **none — refuses** |
-| `--step-linear`, `--step-stub`, `--step-grid` | the backend, exactly one kind, each named by its run-file key: a step linear law by store key, a step stub's stated coefficients by file (its terms declared, never fitted), a step grid bundle by store key (`17` D103). There is no granularity or method flag. `--step-linear` repeats, one law per engine config: the run file then holds a list, and each process installs the law fitted under its own engine config and refuses when none or several were (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | **none — refuses**, as do two kinds |
+| `--step-linear`, `--step-stub`, `--step-grid`, `--op-graph` | the backend, exactly one kind, each named by its run-file key: a step linear law by store key, a step stub's stated coefficients by file (its terms declared, never fitted), a step grid bundle by store key (`17` D103), the `op_graph` entries `--store` holds, each leaf priced first from the `price_list` the store holds at the run's model, parallel layout, machine spec and ATOM tree when there is one (#1715). There is no granularity or method flag. `--step-linear` repeats, one law per engine config: the run file then holds a list, and each process installs the law fitted under its own engine config and refuses when none or several were (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | **none — refuses**, as do two kinds |
 | `--store` | the artifact store keys resolve in, the configuration's `memory_readings` included (`07` D41) | **none — refuses** |
 | `--host-laws` | the host laws by store key (`09` D54), composed by `01` D4's recurrence. Repeats, one entry per engine config, each process installing its own config's, as `--step-linear` does (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | none: the run charges no host time and records that |
 | `--on-refusal` | `mark`: a refused step costs 0 s, its reason is recorded, and the run continues. `abort`: stop at the first refusal; the run summary is still written. Either way a refusal makes the run a coverage report (`08` D50.1) | `mark` (`08` D50.1) |
@@ -211,7 +211,7 @@ compass fit ops        MEASURED... --out D --store S
 compass run            <backend> --machine M  --out D --store S -- <ATOM args>
 compass run            --join RUN_FILE        --out D -- <ATOM args>
 
-<backend>   one of --step-linear KEY, --step-stub FILE, --step-grid KEY; --step-linear
+<backend>   one of --step-linear KEY, --step-stub FILE, --step-grid KEY, --op-graph; --step-linear
             repeats, one KEY per engine config, as --host-laws does (#973 ruling)
 <batches>   record directories and shape_population keys, whose batches it replays
 --grid      shape_population keys, and record directories, that the step grid's planner

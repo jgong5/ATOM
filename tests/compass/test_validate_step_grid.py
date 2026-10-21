@@ -334,7 +334,7 @@ def test_a_real_step_past_the_residuals_hull_is_priced_unvalidated_and_counted(
     query_context to 10000 / 2^20 leaves steps 2 to 9 past it."""
     member = _bundle(_steps())
     member["residual"]["kinds"]["decode"]["hull"] = {
-        "facets": [[0, 1, 0, 0, -10000 / 2**20]]
+        "facets": [[0, 1, 0, -10000 / 2**20]]
     }
     grid, residual = StepGrid(member["grid"]), Residual(member["residual"])
 

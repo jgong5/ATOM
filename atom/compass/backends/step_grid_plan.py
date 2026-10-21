@@ -39,13 +39,17 @@ extrapolates past.
 
 It then plans every corner of each step's cell, widened by `margin` nodes on
 every axis and to `margin` rungs either side, each such rung at all its B
-nodes; and, on any rung between two planned rungs, its B nodes at its c nodes
-spanning those planned, since a bundle whose measured rungs skip one of the
-ladder's does not load. A point that is no batch the target runs is not
-planned: B above `max_num_seqs`, T above `max_num_batched_tokens`, T not a
-multiple of B or below it, c + N_Q above `max_model_len`, or
-B * ceil((c + N_Q) / block size) above the block count, assuming no prefix
-sharing.
+nodes, a decode step's c span reaching on to the node at or above its longest
+row's cached context, which the lookup also reads; and, on any rung between
+two planned rungs, its B nodes at its c nodes spanning those planned, since a
+bundle whose measured rungs skip one of the ladder's does not load. A point
+that is no batch the target runs is not planned: B above `max_num_seqs`, T
+above `max_num_batched_tokens`, T not a multiple of B or below it, c + N_Q
+above `max_model_len`, or more KV blocks than the block count. B rows hold
+B * ceil((c + N_Q) / block size) blocks; past the count, a decode point's
+rows share the fewest leading blocks that bring them into it, as a server's
+prefix cache lets rows share, and its line states them as `shared`; they are
+full blocks of the cached context, so at most floor(c / block size).
 """
 
 import bisect
@@ -142,11 +146,20 @@ def _span(nodes, low, high, margin: int) -> list:
     return nodes[max(0, first - margin) : last + margin + 1]
 
 
+def _shared(target: dict, b: int, c: int) -> int:
+    """The leading KV blocks B decode rows on c cached share to fit the
+    target's pool: none where they fit apart, else the fewest that bring them
+    into it, at most the full blocks their cached context fills."""
+    size = target["kv_cache_block_size"]
+    over = b * -(-(c + 1) // size) - target["num_kvcache_blocks"]
+    return min(c // size, -(-over // (b - 1))) if over > 0 and b > 1 else 0
+
+
 def _infeasible(target: dict, b: int, t: int, c: int, prefill: bool) -> str:
     """Why the target cannot run B rows of T tokens in all on c cached each,
-    or ''."""
-    n_q = t // b
-    blocks = b * -(-(c + n_q) // target["kv_cache_block_size"])
+    decode rows sharing `_shared` blocks, or ''."""
+    n_q, shared = t // b, 0 if prefill else _shared(target, b, c)
+    blocks = b * -(-(c + n_q) // target["kv_cache_block_size"]) - (b - 1) * shared
     checks = [
         (b > target["max_num_seqs"], f"B {b} is above max_num_seqs"),
         (
@@ -161,7 +174,8 @@ def _infeasible(target: dict, b: int, t: int, c: int, prefill: bool) -> str:
         ),
         (
             blocks > target["num_kvcache_blocks"],
-            f"{blocks} KV blocks are above num_kvcache_blocks",
+            f"{blocks} KV blocks are above num_kvcache_blocks"
+            + (f", the rows sharing {shared}" if shared else ""),
         ),
     ]
     return next((why for over, why in checks if over), "")
@@ -216,9 +230,10 @@ def _layout(definition: dict, b_nodes: dict) -> dict:
     }
 
 
-def _line(step: int, phase: str, key: str, at: list) -> dict:
+def _line(step: int, phase: str, key: str, at: list, shared: int) -> dict:
     """The planned point `at`, `[B, T, c]` or `[rung, B, c]`, as a step-record
-    line: B rows of N_Q = T/B tokens, or of one decode token, on c cached."""
+    line: B rows of N_Q = T/B tokens, or of one decode token, on c cached,
+    sharing their first `shared` KV blocks."""
     if phase == "prefill":
         (b, t, c), rung, output = at, None, key == "output"
         row = [t // b, c + t // b, False]
@@ -235,7 +250,7 @@ def _line(step: int, phase: str, key: str, at: list) -> dict:
         "rows": [list(row) for _ in range(b)],
         "rung": rung,
         "origin": "plan",
-    }
+    } | ({"shared": shared} if shared else {})
 
 
 def plan(definition: dict, steps, engines: dict) -> dict:
@@ -246,7 +261,8 @@ def plan(definition: dict, steps, engines: dict) -> dict:
     It returns `graph_mode`, `scope` and `bounds`, and `prefill` and `decode`
     in a bundle grid's layout (`step_grid.py`) with no point measured;
     `lines`, each planned point as a step-record line with origin `plan`,
-    which that grid locates on the point's node; `counts` per grid;
+    which that grid locates on the point's node, a decode point past the KV
+    pool stating the blocks its rows share; `counts` per grid;
     `infeasible`, the points not planned and why; and `unplaced`, the steps
     outside the grid with the backend's reason.
     """
@@ -309,7 +325,9 @@ def plan(definition: dict, steps, engines: dict) -> dict:
             key = "output" if view.produces_output else "no_output"
             planned["prefill", key].update(itertools.product(*spans))
             continue
-        # On a rung either side, every B node, at the c nodes spanning the cell's.
+        # On a rung either side, every B node, at the c nodes spanning the cell's
+        # and on to the longest row's.
+        longest = max(r.context_tokens - r.query_tokens for r in view.decode)
         k = ladder.index(view.capture_rung)
         for rung in ladder[max(0, k - margin) : k + margin + 1]:
             bs, cs = grid.decode[rung].nodes
@@ -317,7 +335,7 @@ def plan(definition: dict, steps, engines: dict) -> dict:
                 bs = _span(bs, low[0], high[0], margin)
             planned["decode", "points"].update(
                 (rung, *p)
-                for p in itertools.product(bs, _span(cs, low[1], high[1], margin))
+                for p in itertools.product(bs, _span(cs, low[1], longest, margin))
             )
     # A bundle whose measured rungs skip one of the ladder's does not load.
     decode = planned["decode", "points"]
@@ -340,7 +358,8 @@ def plan(definition: dict, steps, engines: dict) -> dict:
             if why:
                 out["infeasible"].append({"grid": name, "at": at, "reason": why})
                 continue
-            out["lines"].append(_line(len(out["lines"]), phase, key, at))
+            shared = 0 if phase == "prefill" else _shared(definition, *at[1:])
+            out["lines"].append(_line(len(out["lines"]), phase, key, at, shared))
             out["counts"][name] = out["counts"].get(name, 0) + 1
     return out
 
@@ -356,7 +375,8 @@ def coverage(backend, steps) -> dict:
     It returns `steps`, `covered`, `share` (covered over steps),
     `extrapolated` and `fallback`, each a count; `declined`, each step the
     grid does not answer, with its reasons; `missing`, the unmeasured corners
-    of their cells by grid, keyed `prefill output`, `prefill no_output` or
+    of their cells by grid, a decode step's longest row's cell among them where
+    its rung holds alpha, keyed `prefill output`, `prefill no_output` or
     `decode rung <R>`; and, apart, `prefill_above_top_c`, how many prefill
     steps are cached past prefill's top c node, which fall back: a prefix hit
     near `max_model_len`, or a long prompt's last chunk when `max_model_len`
@@ -369,8 +389,11 @@ def coverage(backend, steps) -> dict:
         try:
             cells, at = backend.grid.locate(view)
             above += bool(view.prefill) and at[-1] > cells.nodes[-1][-1]
-            corners = cells.corners(view, at)
-            gaps = cells.name, {c for c, _ in corners if c not in cells.points}
+            longest = backend.grid.longest(view, at)
+            gaps = cells.name, set()
+            for x in [at] + ([longest[1]] if longest else []):
+                corners = cells.corners(view, x)
+                gaps[1].update(c for c, _ in corners if c not in cells.points)
         except CostRefused:
             pass
         try:

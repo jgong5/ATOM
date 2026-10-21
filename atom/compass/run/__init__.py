@@ -380,11 +380,12 @@ def _check_host(path, host: dict) -> None:
         FORWARD_KINDS,
         HOST_SEGMENTS,
         MTP_SEGMENT,
+        OUT_SEGMENT,
         PP_RECV_SEGMENT,
     )
 
     laws = host.get("laws", {})
-    segments = (*HOST_SEGMENTS, MTP_SEGMENT, PP_RECV_SEGMENT)
+    segments = (*HOST_SEGMENTS, MTP_SEGMENT, PP_RECV_SEGMENT, OUT_SEGMENT)
     if (
         set(host) - {"laws", "skip", "key"}
         or set(host.get("skip", ())) - set(segments)
@@ -1289,18 +1290,12 @@ def runner(model_runner, tree) -> None:
         law = run[STEP_LINEAR]
         backend = StepLinearBackend(StepLinearLaw(law), dp)
         if "engine_config" in law:
-            from atom.compass.run.step_grid import keyed
+            from atom.compass.run.step_grid import differ, keyed
 
-            fitted = law["engine_config"]
-            differ = [
-                f"{name} {fitted.get(name)!r} in the law and {value!r} here"
-                for name, value in keyed(config).items()
-                if fitted.get(name) != value
-            ]
-            if differ:
+            if named := differ(law["engine_config"], keyed(config), "the law"):
                 raise ValueError(
                     "the step linear law was fitted under another engine "
-                    "config: " + "; ".join(differ)
+                    "config: " + "; ".join(named)
                 )
         else:
             raise ValueError(
@@ -1392,22 +1387,7 @@ def runner(model_runner, tree) -> None:
                 f"the run file's op_graph is {run[OP_GRAPH]!r}; it is true, which "
                 "prices each step from the op_graph the store holds at its shape"
             )
-        from atom.compass.backends.op_graph import OpGraphBackend
-
-        drafter = getattr(config, "speculative_config", None)
-
-        backend = OpGraphBackend(
-            machine,
-            _op_graphs(run["store"], config, machine.value("device.arch")),
-            tp=tp,
-            dp=config.parallel_config.data_parallel_size,
-            kv=config.kv_cache_dtype,
-            padded=padding != "none",
-            split_send_recv=config.enable_expert_parallel
-            and getattr(config, "enable_low_latency", False),
-            price_list=PRICE_LIST in run and _price_list(run, config, machine),
-            drafts=drafter.num_speculative_tokens if drafter else 0,
-        )
+        backend = op_graph(run, config, machine)
     elif PRICE_LIST in run:
         raise ValueError(
             "the run file names a price_list and no op_graph, the one backend "
@@ -1490,13 +1470,34 @@ def runner(model_runner, tree) -> None:
         model_runner.compass_step_grid = {**bundle, "describe": backend.describe()}
 
 
+def op_graph(run: dict, config, machine):
+    """The `OpGraphBackend` the run file `run` names for `config` on
+    `machine`, with its price list when it names one."""
+    from atom.compass.backends.op_graph import OpGraphBackend
+
+    drafter = getattr(config, "speculative_config", None)
+    return OpGraphBackend(
+        machine,
+        _op_graphs(run["store"], config, machine.value("device.arch")),
+        tp=config.tensor_parallel_size,
+        dp=config.parallel_config.data_parallel_size,
+        kv=config.kv_cache_dtype,
+        padded=run.get("padding", "executed") != "none",
+        split_send_recv=config.enable_expert_parallel
+        and getattr(config, "enable_low_latency", False),
+        price_list=PRICE_LIST in run and _price_list(run, config, machine),
+        drafts=drafter.num_speculative_tokens if drafter else 0,
+    )
+
+
 def _op_graphs(root: str, config, arch: str):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or of its drafter's part (`draft`), or None; under DP, at the
-    rows the step's MoE gathers."""
+    that does not, or of its drafter's part (`draft`), or when it holds none
+    `forward.missed`'s text, None for no text; under DP, at the rows the
+    step's MoE gathers."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
-    from atom.compass.capture.forward import Shape, structure
+    from atom.compass.capture.forward import Shape, missed, structure
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
     dp = config.parallel_config.data_parallel_size
@@ -1504,12 +1505,12 @@ def _op_graphs(root: str, config, arch: str):
     @functools.lru_cache(maxsize=64)
     def graph(
         phase: str, tokens: int, seqs: int, output=True, gathered=None, draft=False
-    ) -> dict | None:
+    ) -> dict | str | None:
         shape = str(Shape(phase, tokens, seqs, gathered).at(dp))
         at = structure(config, phase, True, arch, output, draft)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
         if not store.directory_for(key).exists():
-            return None
+            return missed(store, key) or None
         return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
 
     return graph

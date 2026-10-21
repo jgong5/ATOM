@@ -618,28 +618,23 @@ Given two or more records, the command also prints each form's error on every
 record under a law fitted on the others, per decode rung and prefill token band.
 
 `scripts/compass/laws/qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json` is the
-`history` form with the host laws (`host`), labelled by device time, fitted on
+`history` form, labelled by device time, fitted on
 records captured on hjbog-srdc-39 at ce625ddd9 (ROCm/ATOM 661ef7661) in the
 nightly-20261013 image, in this order: concurrency 1, 4, 16, 64 and 256 as
 `calib_capture.sh` captures them, then first-turn cells at concurrency 64 and
 256, which decode at rungs 16 and up, and at 8 and 14, which give it its rung-8
 vector. A first-turn cell runs with `AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0
 --trajectory-start-max-ratio 0"`, which starts every trajectory at its first
-turn. The law carries the host key the records carry with its `atom`
-digest replaced by the one `host_key` gives a tree that
-adds `ScheduledBatchOutput.group_targets`, changes `clock.charge`, makes the
-plugin and diffusion bootstraps refuse a simulated run, names a pipeline
-stage's channels by its stage, has a downstream stage's loop leave on
-the `+inf` grant, moves the lmcache_mp lookup defer, lookup timeout,
-transfer deadlines and deferred-save restamp to the LP clock, and gives
-lmcache_mp's lookup poll sleep, transfer start stamps and scheduler adapter a
-simulated run's LP clock, runs the simulated P/D connector inside a `multi`,
-and has `clock.charge` advance a reply's `out_s` and stamp a recording's
-input pulls and output puts; none of these changes a real run's host time. Its
-engine key also states the fields the records predate, as their `server.log`
-engine arguments and the capture's environment give them: DP width 1, no DP
-attention, expert parallelism or TBO, and `AITER_LOG_LEVEL=WARNING`; the law
-states that engine key as its `engine_config`. The law
+turn. Its `engine_config` also states the fields those records predate, as
+their `server.log` engine arguments and the capture's environment give them: DP
+width 1, no DP attention, expert parallelism or TBO, and `AITER_LOG_LEVEL=WARNING`.
+Its host laws (`host`, with `compass fit host`'s report as `host_fit`) are fitted
+apart, by `compass fit host`, on calibration cells at concurrency 1, 4 and 16
+over traces 256 to 392, each a `compass record` server and one `client.sh` run
+with aiperf's scenario warmup, captured one at a time on one card of
+hjbog-srdc-39 at ae5bab999 in the same image after a warm cell nothing reads.
+Those records stamp the engine's input pulls, so every kind carries `E_out`,
+`E` runs from the pull and `W_launch` ends at the token read. The host key is the one those records carry. The law
 and its host key state `machine_spec`, the digest `machine_spec_digest` gives
 `scripts/compass/machines/mi308x-hjbog39.json`, so it refuses under any other
 spec's device, software stack or PTL state. Its name states that PTL state

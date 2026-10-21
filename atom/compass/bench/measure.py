@@ -3,7 +3,7 @@
 measured on the bench once and published as one `step_measurement`.
 
     compass measure steps [INPUT...] [--grid INPUT... --grid-definition FILE]
-        [--sample N --seed S | --sample all] [--sessions A:B]
+        [--sample N --seed S | --sample all] [--ragged] [--sessions A:B]
         [--client-run INPUT EXPORT]... --sampling JSON --gpu G --store ROOT
         --out DIR -- <ATOM args>
 
@@ -22,14 +22,20 @@ resolve, `keyed`'s fields, at data-parallel width 1, the bench's.
 The bench measures at tensor parallel 1: above it, a point charges the ranks'
 preload skew (#1188), so a deployment of more ranks refuses.
 
-A batch is a line's view: its `rows`, `rung` and `produces_output`. The
+A batch is a line's view: its `rows`, `rung` and `produces_output`, and the
+KV blocks its rows share where a planned line states them (`shared`). The
 positional inputs' distinct views are replayed, origin `replay`, drawn by
 `--sample N --seed S`, N from each stratum (a decode rung, or a prefill kind
 in a token band of `step_linear_fit.TOKEN_BANDS`), or all of them by `--sample
-all`. `--grid` runs the step grid's planner over its inputs' lines for the
-engine they state and the nodes and margin `--grid-definition` states, and its
-points are measured with origin `plan`, the digest of the plan, which
-`<out>/plan.json` holds, and the `--grid` inputs as their sources. A planned
+all`. Under `--ragged` each drawn decode view is measured not itself but as
+the ragged views `ragged.compose` makes of it, by `--seed` and the view's
+digest, from the contexts of the positional inputs' decode rows, origin
+`ragged`, naming those inputs and every trace their lines served; a drawn
+prefill view is not measured. `--grid` runs the step grid's planner over its
+inputs' lines for the engine they state and the nodes and margin
+`--grid-definition` states, and its points are measured with origin `plan`,
+the digest of the plan, which `<out>/plan.json` holds, and the `--grid`
+inputs as their sources. A planned
 point that is also a replayed view is measured once, as that replay alone: its
 origin, sources and traces are the replay's, and it names no plan.
 
@@ -73,6 +79,7 @@ from atom.compass.artifacts import (
 from atom.compass.backends.step_grid_plan import plan
 from atom.compass.backends.step_labels import digest as file_digest
 from atom.compass.backends.step_linear_fit import token_band
+from atom.compass.bench import ragged
 from atom.compass.drive.gpu import add_gpu_flag, hip_visible, quiet
 from atom.compass.drive.identity import identity, phase
 from atom.compass.fit.publish import conditions
@@ -82,7 +89,8 @@ from atom.compass.run import _write_whole
 from atom.compass.run.step_grid import BOUNDS, keyed, keyed_of
 
 PROG = "compass measure steps"
-#: What of a step-record line is the batch it measures.
+#: What of a step-record line is the batch it measures; a planned line may also
+#: state the KV blocks its rows share, `shared`.
 VIEW = ("rows", "rung", "produces_output")
 
 
@@ -199,6 +207,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--grid-definition", metavar="FILE", help="the grid's nodes")
     p.add_argument("--sample", type=_count, help="N per stratum, or all")
     p.add_argument("--seed", type=int)
+    p.add_argument(
+        "--ragged",
+        action="store_true",
+        help="measure ragged views composed from each drawn decode view instead",
+    )
     p.add_argument("--sessions", type=_span, metavar="A:B")
     p.add_argument(
         "--client-run",
@@ -237,6 +250,7 @@ def _check(args) -> None:
             "replayed batches are drawn by --sample N --seed S or --sample all",
         ),
         (args.sample and not args.inputs, "--sample draws from no replayed input"),
+        (args.ragged and not args.inputs, "--ragged composes from no replayed input"),
         (isinstance(args.sample, int) and args.seed is None, "--sample N needs --seed"),
         (
             args.grid and not args.grid_definition,
@@ -324,6 +338,8 @@ def _points(args, store, engine: dict, sampling: dict, out: Path) -> tuple[dict,
             views = sorted(strata[stratum])
             drawn.update(rng.sample(views, min(args.sample, len(views))))
         points = {v: p for v, p in points.items() if v in drawn}
+    if args.ragged:
+        points = _ragged(points, [read[n] for n in args.inputs], args.seed)
     if args.grid:
         definition = json.loads(Path(args.grid_definition).read_text())
         steps = [
@@ -336,6 +352,24 @@ def _points(args, store, engine: dict, sampling: dict, out: Path) -> tuple[dict,
         for line in planned["lines"]:
             _add(points, line, "plan", [read[n][0] for n in args.grid], traces, digest)
     return points, max(r[2]["num_kvcache_blocks"] for r in read.values())
+
+
+def _ragged(points: dict, read: list, seed) -> dict:
+    """The ragged views of each decode view of `points`, from the decode rows
+    of `read`'s lines, each input's source, lines and engine."""
+    lines = [line for _, kept, _ in read for line in kept]
+    contexts = sorted({c for line in lines for _, c, decode in line["rows"] if decode})
+    engine = read[0][2]
+    blocks = max(stated["num_kvcache_blocks"] for *_, stated in read)
+    size, top = engine["kv_cache_block_size"], engine["max_model_len"]
+    sources, traces = [s for s, *_ in read], {t for x in lines for t in x["traces"]}
+    out = {}
+    for digest, point in sorted(points.items()):
+        if _kind(point["view"]).startswith("decode"):
+            rng = random.Random(f"{seed} {digest}")
+            for view in ragged.compose(point["view"], contexts, rng, blocks, size, top):
+                _add(out, view, "ragged", sources, traces)
+    return out
 
 
 def _read(name: str, store, client_runs, sessions, engine: dict, sampling: dict):
@@ -412,8 +446,14 @@ def _read(name: str, store, client_runs, sessions, engine: dict, sampling: dict)
     return source, lines, stated
 
 
-def _add(points: dict, line: dict, origin: str, sources, traces, plan=None):
+def view_of(line: dict) -> dict:
+    """The batch `line` states, as its measurement's key digests it."""
     view = {k: line[k] for k in VIEW}
+    return view | {"shared": line["shared"]} if "shared" in line else view
+
+
+def _add(points: dict, line: dict, origin: str, sources, traces, plan=None):
+    view = view_of(line)
     point = points.setdefault(
         _digest(view),
         {"view": view, "origin": origin, "sources": set(), "traces": set()},
