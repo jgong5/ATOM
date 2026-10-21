@@ -4605,6 +4605,18 @@
    "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
   },
   {
+   "id": "atom/compass/bench/ranks.py::launch::wait(running, return_when=FIRST_EXCEPTION)::event_wait#0",
+   "file": "atom/compass/bench/ranks.py",
+   "symbol": "launch",
+   "call": "wait",
+   "expr": "wait(running, return_when=FIRST_EXCEPTION)",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "measure ops waits until every rank's process has returned or one has raised, which ends the others",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
    "id": "atom/compass/bench/ranks.py::launch::r.result()::event_wait#0",
    "file": "atom/compass/bench/ranks.py",
    "symbol": "launch",
