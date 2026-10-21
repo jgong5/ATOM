@@ -28,13 +28,18 @@ the backends, artifacts and flags carry the step stub, step linear and step grid
 [bench, band and capture ruling](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252):**
 the op-level backend is empirical on a measured device. Capture is concrete, one graph
 per decode width and prefill (T, B) (Phase 1a). `measure ops` times each IR leaf cold
-from its contract inside ATOM's own forward, a stub model in place of the model, at
-points planned from the steps of record directories (#1527), recording the kernels each point launched (D38,
+from its contract, at points planned from the steps of record directories (#1527),
+recording the kernels each point launched (D38,
 D39); collectives are leaves measured across every rank of the layout (D40); `fit ops`
 publishes a `price_list` that interpolates only between same-kernel neighbours, as `09`
 D60 requires, and nothing else, so region terms and the op-level residual are retired
 (D38.1, D41, D43); a leaf the price list declines falls to its analytical law, counted
 (D36, D42).
+
+**Revised 2026-10-21 by the owner's
+[decision on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6308315167),
+recorded by [#1868](https://github.com/jgong5/ATOM/issues/1868):** `measure ops` runs no
+forward (Phase 1b, D39).
 
 **Depends on:** `04_model_capture_and_cost_ir.md` (what is traced and priced),
 `05_machine_spec_and_probes.md` (the machine artifact and its probes).
@@ -48,7 +53,7 @@ design topic (`10`).
 
 | Term | Unit | Produced by |
 |---|---|---|
-| **op price** | one IR leaf at one point | `measure ops`: the leaf from its contract inside ATOM's forward, CUDA-graph replay over cold copies (D38) |
+| **op price** | one IR leaf at one point | `measure ops`: the leaf from its contract at a point ATOM's runner prepared, CUDA-graph replay over cold copies (D38) |
 | **step measurement** | one whole forward | CUDA events in situ |
 | **calibration** | the *act* of deriving model terms from either of the above | — |
 
@@ -263,13 +268,23 @@ diagnostic rather than a failure.
 
 **Revised 2026-10-18 by the owner's ruling on
 [#1489](https://github.com/jgong5/ATOM/issues/1489) and its
-[bench, band and capture ruling](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252).**
-`measure ops` times each IR leaf alone, from its contract (`04` D20), inside ATOM's own
-forward: the op bench (D39) runs the full model on dummy weights after ATOM's warmup,
-with a stub model in place of the model. For each planned point ATOM builds the metadata
-and forward context; the stub calls each leaf with activations random by its contract's
-spec and stride, and weights, KV and metadata from the live runner. Attribution from
-profiled steps is not built.
+[bench, band and capture ruling](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252);
+the bench revised 2026-10-21 by the owner's
+[decision on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6308315167)
+([#1868](https://github.com/jgong5/ATOM/issues/1868)).**
+`measure ops` times each IR leaf alone, from its contract (`04` D20), at a point ATOM's
+runner prepared, and runs no forward: not the model's, not its LM head's, not ATOM's
+warmup. The op bench (D39) builds the runner with its parameters on the meta device
+(`model_runner.py::RapidServeModelRunner._init_weight_params_on_meta`) and no warmup.
+Each placement of a planned point goes through `ModelRunner.prepare_model`, which builds
+the metadata and forward context. The bench then calls each leaf with activations random
+by its contract's spec and stride; a weight argument built from its contract, random at
+its spec, copy c taking the c-th of as many such tensors as the leaf has instances; and
+metadata, forward context, KV and module tensors from the runner.
+`_init_weight_params_on_meta` makes every parameter meta as it is registered and leaves
+buffers and other tensor attributes on the device (`02` D10.1), so such a tensor a leaf
+reads through a module reference is the model's own, and a leaf that reads a parameter through a module reference refuses
+by name. Attribution from profiled steps is not built.
 
 Two placement constraints put pricing inside the runner process, and the op bench is
 that process:
@@ -277,13 +292,16 @@ that process:
 - **AITER registers kernels lazily on first call *in the calling process*.** Importing the
   defining module does not put `gemm_a16w16` in `torch.ops.aiter`; even a process that
   built an engine and generated tokens still reports it missing, because ATOM runs the
-  model in a worker subprocess. The stub calls each leaf in the worker that runs ATOM's
-  forward; a leaf whose operator cannot run from its contract refuses by name.
-- **An operator that walks paged KV needs a KV cache.** The live runner's, with the block
-  table ATOM builds for the point's batch.
+  model in a worker subprocess. The bench calls each leaf in the process that holds
+  ATOM's runner; a leaf whose operator cannot run from its contract refuses by name.
+- **An operator that walks paged KV needs a KV cache.** The runner's, with the block
+  table `prepare_model` builds for the point's batch.
 
-Weights are ambient rather than random by spec, measured: random GEMM weights read one
-signature 5% high, where the layer's own weights match.
+Weights are random by spec, so the runner holds no device memory for the model's
+weights. The [#1489 PoC](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252)
+read one GEMM signature 5% high on random weights against ATOM's dummy weights;
+[#1869](https://github.com/jgong5/ATOM/issues/1869)'s named result compares every leaf
+with the bench it replaces, which ran ATOM's warmup on ATOM's dummy weights.
 
 Method, settled by elimination:
 
@@ -298,7 +316,7 @@ Method, settled by elimination:
 ambient state whose total exceeds the device's last-level cache, so each repeat reads cold
 data. The copies include tensors the leaf reads through module attributes: the mrope
 leaf's cos/sin caches are `rotary_emb` attributes, counted in its bytes. A weight leaf
-also cycles over every weight the model holds of its spec, the population its decode step
+also cycles over one weight of its spec per instance, the population its decode step
 reads: one weight can read a few percent off another of the same spec
 ([#1580](https://github.com/jgong5/ATOM/issues/1580)). Copies past the cache-sized count
 reuse that count's activations, so they hold no memory beyond the weights. The prototype's
@@ -454,22 +472,34 @@ the boundary this decision first left open (T17).
 
 **Revised 2026-10-18 by the owner's ruling on
 [#1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252): this is
-the step bench, and the op bench is ATOM's own forward with a stub model.** The op bench
-starts the full model on dummy weights as `EngineCore` starts its runner, through ATOM's
-warmup, and puts a stub in place of the model's forward. Each point its planner placed
-reaches the runner as a batch, so ATOM builds the metadata and forward context as for any
-step; the stub then times each leaf of the point's `op_graph` from its contract, cold
-(D38, Phase 1b). Nothing of ATOM's input preparation is copied. At width it starts every
-rank of the layout through ATOM's own group initialisation (D40). The step bench is not
+the step bench, and the op bench is apart from it. Revised 2026-10-21 by the owner's
+[decision on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6308315167)
+([#1868](https://github.com/jgong5/ATOM/issues/1868)): the op bench runs no forward.**
+It builds ATOM's runner for the whole model with its parameters on the meta device
+(`RapidServeModelRunner._init_weight_params_on_meta`), skips ATOM's warmup, and sizes
+the KV pool without a forward. Each placement of a planned point reaches the
+runner as a batch through `ModelRunner.prepare_model`, so ATOM builds the metadata and
+forward context as for any step, and the bench snapshots them; it then times each leaf of
+the point's `op_graph` from its contract, cold (D38, Phase 1b). No forward of the
+model, its LM head or its sampler runs. Nothing of ATOM's input preparation is copied.
+At width it starts every rank of the layout through ATOM's own group initialisation
+(D40). On one GPU at a DP-attention layout it builds the runner at one DP rank's own
+layout, TP 1 and DP 1, while the `op_graph` it reads and every record key keep the
+deployed layout; a leaf's weights come from its contract, so it runs at its deployed
+shard, and a collective leaf refuses by name, measured across the layout's ranks instead
+([#1870](https://github.com/jgong5/ATOM/issues/1870)). The step bench is not
 reused for ops: it times whole forwards, and it refuses DP.
 
 Measured on [#1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252)'s
-PoC, Qwen3.8-27B TP1: a leaf timed from its contract, with ambient state from ATOM's input
-preparation, came within 1.6% of the same call timed in ATOM's decode step for attention,
-GDN, six GEMM signatures and `silu_and_mul` at B = 2 and 16, and within 1.1% for nine
-prefill leaves at two points. The full model is the one that runs: a 4-layer runner read
-GDN 12.6% low at B = 16, its state staying in the last-level cache, and without ATOM's
-warmup GDN read about 5% low.
+PoC, Qwen3.8-27B TP1: a leaf timed from its contract with no model forward, its
+ambient state from ATOM's input preparation, came within 1.6% of the same call timed in
+ATOM's decode step for attention, GDN, six GEMM signatures and `silu_and_mul` at B = 2
+and 16, and within 1.1% for nine prefill leaves at two points. That PoC held
+ATOM's dummy weights and ran ATOM's warmup. The runner is the whole model's: a 4-layer
+runner read GDN 12.6% low at B = 16, its state staying in the last-level cache. Without
+ATOM's warmup the PoC read GDN about 5% low, cause not found; if that gap shows on this
+bench, the missing state is diagnosed and set up in the leaf's own warmup, never by a
+forward ([#1869](https://github.com/jgong5/ATOM/issues/1869)).
 
 The constraints point at the *runner*, not the server — a `ModelRunner` **is** the worker.
 ATOM already shows how to drive one
@@ -526,7 +556,7 @@ wrong in ways that matter:
 
 | Measurement | Step bench with replayed batches | Synthetic shapes |
 |---|---|---|
-| op price | no: the op bench | **yes** — a planned point is a batch ATOM prepares; activations come from the leaf's contract, the rest from the live runner |
+| op price | no: the op bench | **yes** — a planned point is a batch ATOM prepares; activations and weights come from the leaf's contract, the rest from the runner |
 | step measurement | **required** | no |
 
 Op pricing on synthetic shapes is what keeps cc-traces off a GPU during calibration.
@@ -546,7 +576,7 @@ settle is *which process* each phase runs in, which was previously implicit.
 |---|---|---|---|
 | 0 discovery | `trace steps` | a simulated serve, device-free | drives ATOM's real `Scheduler`, priced by the backend it names |
 | 1a trace | `trace ops` | any CPU process, **or** lazily inside a sim run | device-free (with the ROCm caveat above) |
-| 1b price ops | `measure ops` | **the op bench**: ATOM's forward with a stub model | ATOM builds each point's metadata and forward context, and the stub times each leaf from its contract; at width every rank of the layout (D40) |
+| 1b price ops | `measure ops` | **the op bench**: ATOM's runner on meta weights, running no forward | `prepare_model` builds each point's metadata and forward context, and the bench times each leaf from its contract; at width every rank of the layout (D40) |
 | 1c in-situ | `measure steps`; `record` for real runs | **the step bench**; a real serve | needs whole real steps; the step bench replays recorded and planned batches into them |
 | 2 memory | `measure memory` | **a plain engine startup**, not a bench | it measures startup, so a bench that skips parts of startup would measure the wrong thing |
 
@@ -995,13 +1025,13 @@ So: every gate's state is written into the artifact and checked there.
 |---|---|---|
 | D36 | Two granularities, step-level and op-level, and a method per term (analytical, declared, measured, estimated) replace the three-way split of cost models; fallback runs only along method inside one granularity. Compass models a device it has been measured on; an input observed on another subject makes a term declared, and doc 05 D26 has no `transfer` probe. The op-level backend is empirical on a measured device, over a concrete IR graph per decode width and prefill (T, B): each leaf priced from a `price_list`, else by its analytical law, with no residual, so a new engine config, layout or shape needs only its missing leaf signatures measured. | 2026-09-18; probe dropped 2026-10-14 (#937); two granularities 2026-10-14 (#952); op level empirical 2026-10-18 (#1489) |
 | D37 | The tool tells the user what to measure: a backend that needs measurements plans them beside its own code and owns the coverage check that `compass run --coverage` calls before the run starts; the step grid's planner runs inside `measure steps`, over `shape_population` entries and `record` directories, and the op-level backend's inside `measure ops --plan`, over the steps of record directories from `record` or `trace steps --out`; no single command plans the campaign. Coverage checks use a convex hull or k-NN distance, never a bounding box. | 2026-09-18; revised 2026-10-13 and 2026-10-14 (#851); op-level planner 2026-10-18 (#1489); its input, record directories, 2026-10-18 (#1527) |
-| D38 | Phase 0 discovery (shapes only) -> 1a trace -> 1b price -> 1c in-situ (+ one TP2 transfer test) -> Phase 2 memory. Client count and workload are not calibration axes. `13` D80's commands run them: `trace steps`, `trace ops`, `measure ops` and `fit ops`, `record` and `measure steps` then `fit steps\|host`, and `measure memory` for Phase 2, one engine start per configuration whose `memory_readings` a run reads and refuses without; `measure` writes per point, `fit` makes laws, bundles and leaves. Phase 1a captures one concrete graph per decode width and prefill (T, B). Phase 1b times each IR leaf alone from its contract inside ATOM's own forward with a stub model, activations random by spec and weights, KV and metadata from the live runner, by CUDA-graph replay over rotating copies, module-attribute tensors included, whose total exceeds the last-level cache, at points planned from the steps of record directories from `record` or `trace steps --out`, each point recording the kernels its leaf launched, with the warm-over-cold ratio reported and the card's PTL state keyed; MoE leaves on uniform routing; `fit ops` interpolates only between same-kernel neighbours (`09` D60) and declines any other query, which the leaf's analytical law answers, counted. Phase 1c feeds the op-level backend nothing. | 2026-09-18; commands 2026-10-13 (#851); Phase 2 2026-10-14 (#851); Phases 1b and 1c 2026-10-18 (#1489); 1b's points planned from record directories 2026-10-18 (#1527) |
-| D39 | The step bench is `EngineCore` without its scheduler: every TP rank's `RecordingModelRunner` started through its runner manager in its order, at any TP width, a step charged to its slowest rank, fed **replayed** batches rebuilt from step records by a versioned rule. One window for both step kinds: device time from an event at the forward's entry to one at its exit, with device work queued ahead, a repeat counting only if the entry event is still pending when the forward returns; whatever is fitted on it states that value kind. Step measurements may not use synthetic shapes, the step grid's excepted (`17` D98). The op bench is ATOM's own forward with a stub model, apart from the step bench: the full model on dummy weights after ATOM's warmup, ATOM building each point's metadata and forward context, and the stub timing each leaf from its contract. | 2026-09-18; revised 2026-10-13 (#851); op bench 2026-10-18 (#1489) |
+| D38 | Phase 0 discovery (shapes only) -> 1a trace -> 1b price -> 1c in-situ (+ one TP2 transfer test) -> Phase 2 memory. Client count and workload are not calibration axes. `13` D80's commands run them: `trace steps`, `trace ops`, `measure ops` and `fit ops`, `record` and `measure steps` then `fit steps\|host`, and `measure memory` for Phase 2, one engine start per configuration whose `memory_readings` a run reads and refuses without; `measure` writes per point, `fit` makes laws, bundles and leaves. Phase 1a captures one concrete graph per decode width and prefill (T, B). Phase 1b times each IR leaf alone from its contract at a point `ModelRunner.prepare_model` prepared, on a runner whose parameters are on the meta device, running no forward, warmup included: activations random by spec, weights random by spec over as many tensors as the leaf has instances, and metadata, forward context, KV and module tensors from the runner, by CUDA-graph replay over rotating copies, module-attribute tensors included, whose total exceeds the last-level cache, at points planned from the steps of record directories from `record` or `trace steps --out`, each point recording the kernels its leaf launched, with the warm-over-cold ratio reported and the card's PTL state keyed; MoE leaves on uniform routing; `fit ops` interpolates only between same-kernel neighbours (`09` D60) and declines any other query, which the leaf's analytical law answers, counted. Phase 1c feeds the op-level backend nothing. | 2026-09-18; commands 2026-10-13 (#851); Phase 2 2026-10-14 (#851); Phases 1b and 1c 2026-10-18 (#1489); 1b's points planned from record directories 2026-10-18 (#1527); 1b without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)) |
+| D39 | The step bench is `EngineCore` without its scheduler: every TP rank's `RecordingModelRunner` started through its runner manager in its order, at any TP width, a step charged to its slowest rank, fed **replayed** batches rebuilt from step records by a versioned rule. One window for both step kinds: device time from an event at the forward's entry to one at its exit, with device work queued ahead, a repeat counting only if the entry event is still pending when the forward returns; whatever is fitted on it states that value kind. Step measurements may not use synthetic shapes, the step grid's excepted (`17` D98). The op bench, apart from the step bench, runs no forward: ATOM's runner with its parameters on the meta device and no warmup, `ModelRunner.prepare_model` building each placement's metadata and forward context, and the bench timing each leaf from its contract; on one GPU at a DP-attention layout, the runner at one rank's own width, collectives measured across the layout's ranks. | 2026-09-18; revised 2026-10-13 (#851); op bench 2026-10-18 (#1489); op bench without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)) |
 | D40 | Four classes of communication, priced separately. Scaling is measured per width, never modelled. A collective's measured duration is an upper bound on device work. Collectives are leaves, interpolated over message bytes, measured on a multi-rank op bench that starts every rank of the layout through ATOM's own group initialisation, takes a barrier before each timed replay and measures the union of all ranks' signatures; the step bench is not reused. | 2026-09-18; collectives as leaves 2026-10-18 (#1489) |
 | D41 | Artifacts, each with key, digest, fingerprint and provenance. Keys are tuples; source roots are `git archive` digests; resolution names its answer; handed-off artifacts are immutable. `step_measurement`, `step_linear_law` and `host_laws` added, and `shape_population` keyed by its pricing backend. `memory_readings` from `measure memory`, keyed as `step_linear_law` is, or published with every reading assumed for a device never measured. `price_list` and `memory_readings` keyed by the parallel layout, not a scalar width. The region-term artifact retired; `op_measurement` added, one per `measure ops` point, keyed as `price_list` is plus the point; `op_graph` keyed by structure and shape. | 2026-09-18; kinds 2026-10-13 (#851); `memory_readings` 2026-10-14 (#851); parallel layout 2026-10-15 (#165, #537); region terms retired, `op_measurement`, `op_graph` per shape 2026-10-18 (#1489) |
 | D42 | Trace is JIT and cached; pricing is offline or opt-in `--measure`. A `--measure` run is never an acceptance run. A new shape is captured, and each leaf in it interpolated between same-kernel neighbours; anywhere else, and for a new operator kind, the leaf falls to its analytical law, counted, and refuses without one. | 2026-09-18; same-kernel interpolation 2026-10-18 (#1489) |
 | D43 | Per-artifact invalidation matrix, not a global fingerprint. Every gate's state is written into the artifact and checked there. Rows for `shape_population`, `step_measurement`, `step_linear_law` and `host_laws`, and a host-CPU axis. The region-term row retired; `op_measurement` on `price_list`'s row. | 2026-09-18; rows 2026-10-13 (#851); region-term row retired, `op_measurement` 2026-10-18 (#1489) |
-| D38.1 | One recommended flow per half: steps (`measure memory`, `record`, `trace steps`, `measure steps` with the step grid's planner, `fit host` and `fit steps`, `run --coverage`, then grading outside the CLI), each server driven by a client started apart, and ops, after the steps half's `measure memory`, `record`, `trace steps` and `fit host` (`trace ops --population`, `measure ops --plan` over the record directories of `record` or `trace steps --out`, `fit ops` publishing a `price_list` only, then `run` and grading). Phases unchanged; the op bench, ATOM's forward with a stub model, hosts 1b and the step bench 1c, Phase 2 is a plain startup `measure memory` runs. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); ops half 2026-10-18 (#1489); `measure ops --plan` reads record directories 2026-10-18 (#1527) |
+| D38.1 | One recommended flow per half: steps (`measure memory`, `record`, `trace steps`, `measure steps` with the step grid's planner, `fit host` and `fit steps`, `run --coverage`, then grading outside the CLI), each server driven by a client started apart, and ops, after the steps half's `measure memory`, `record`, `trace steps` and `fit host` (`trace ops --population`, `measure ops --plan` over the record directories of `record` or `trace steps --out`, `fit ops` publishing a `price_list` only, then `run` and grading). Phases unchanged; the op bench, ATOM's runner preparing each point and running no forward, hosts 1b and the step bench 1c, Phase 2 is a plain startup `measure memory` runs. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); ops half 2026-10-18 (#1489); `measure ops --plan` reads record directories 2026-10-18 (#1527); op bench without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)) |
 | D40.1 | Classes (a) and p2p ride `measure ops` unchanged. Classes (b) and (c) share one new stated-entry-point benchmark inside the same multi-rank op bench, also run by `measure ops`. KV transfer is never priced. Collective prices are labelled upper bounds. | 2026-09-19; one command 2026-10-13 (#851); the multi-rank op bench 2026-10-18 (#1489) |
 
 ---
