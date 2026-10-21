@@ -622,9 +622,9 @@ def _patches(recorder):
     * GDN's causal-conv1d metadata is host arithmetic over the staged
       `cu_seqlens`, and it runs outside the fake mode too.
     * A real host tensor's values are read on the host, `tolist` as `numpy`;
-      a device value copied to the host, which nothing computed, reads as
-      zeros (a drafter's runner reads back the last step's MTP status and
-      draft ids).
+      under a drafter a device value copied to the host, which nothing
+      computed, reads as zeros (its runner reads back the last step's MTP
+      status and draft ids). Without one, such a read raises.
     * ATOM's MoE wrappers run their bodies, not their fakes: inside are the
       collectives, the streams and the expert kernels.
     * The checkpoint's weights iterator yields nothing: ATOM's dummy load still
@@ -680,6 +680,8 @@ def _patches(recorder):
     fake_tolist = FakeTensor.tolist
 
     def landed(tensor):
+        if not getattr(recorder.runner, "drafter", None):
+            return tensor
         if isinstance(tensor, FakeTensor) and tensor.device.type == "cpu":
             with unset_fake_temporarily():
                 return zeros(tensor.shape, dtype=tensor.dtype)

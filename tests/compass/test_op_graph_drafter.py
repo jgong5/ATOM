@@ -14,11 +14,13 @@ import pathlib
 import re
 import subprocess
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from test_backend_step_linear import view
+from test_backend_step_linear import _installed, view
 from test_capture_ir import TREE, _ops, _record
+from test_memory_readings import WORKER
 from test_op_graph import MIDDLE, g
 from test_work import SPEC
 
@@ -164,8 +166,13 @@ def test_a_step_that_samples_reads_its_drafter_s_graph_as_draft_terms(batch, sha
         (view((1, 9, True)), g(1, 8, 8), "a step that decodes a row of other than 2"),
         (MIDDLE, g(1, 8, 8), "a step under a drafter that produces no output"),
         (VERIFY, None, "over 2 sequences for its drafter"),
+        (
+            replace(VERIFY, tbo_tokens=((2,), (2,))),
+            g(1, 8, 8),
+            "a two-batch-overlap step under a drafter",
+        ),
     ],
-    ids=["unverified-row", "middle-chunk", "uncaptured-drafter"],
+    ids=["unverified-row", "middle-chunk", "uncaptured-drafter", "two-batch-overlap"],
 )
 def test_a_step_under_a_drafter_with_no_draft_to_price_is_refused_by_name(
     batch, drafted, named
@@ -175,6 +182,13 @@ def test_a_step_under_a_drafter_with_no_draft_to_price_is_refused_by_name(
 
     with pytest.raises(CostRefused, match=named):
         OpGraphBackend(SPEC, graph, kv="bf16", drafts=1).price(batch)
+
+
+def test_a_run_file_op_graph_under_a_drafter_prices_its_drafts(monkeypatch, tmp_path):
+    drafter = SimpleNamespace(method="mtp", num_speculative_tokens=2)
+    monkeypatch.setitem(WORKER, "speculative_config", drafter)
+
+    assert _installed(monkeypatch, tmp_path, op_graph=True).drafts == 2
 
 
 def test_a_population_captures_a_verify_step_at_its_width(tmp_path):

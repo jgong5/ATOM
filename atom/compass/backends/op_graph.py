@@ -60,9 +60,10 @@ two-batch-overlap step on MoRI's split send and receive (`split_send_recv`),
 whose transfer in flight lies on no stream, whose split names no pair for
 this rank, whose micro-batches' graphs exchange a different number of times
 or run an exchange beside a second stream (the dual-stream MoE, which ATOM
-turns off under overlap); a decode step whose rows do not each verify the
-drafter's tokens and one, and under a drafter a step that samples nothing,
-whose draft-KV pass no graph holds; a prefill step whose view
+turns off under overlap), or that runs under a drafter, whose draft pass no
+graph places on the overlapped streams; a decode step whose rows do not each
+verify the drafter's tokens and one, and under a drafter a step that samples
+nothing, whose draft-KV pass no graph holds; a prefill step whose view
 does not say whether it produces output; a shape with no graph, a
 data-parallel step's naming the rows it gathers; and, each reason once, a leaf
 whose kind has no extractor, whose price reads a spec field the spec lacks, or
@@ -293,6 +294,11 @@ class OpGraphBackend(CostBackend):
                     "a two-batch-overlap step on MoRI's split send and receive "
                     "(--all2all-backend low-latency): its transfer in flight "
                     "lies on no stream"
+                )
+            if self.drafts:
+                raise ValueError(
+                    "a two-batch-overlap step under a drafter: no graph places its "
+                    "draft pass on the overlapped streams"
                 )
             halves = micro_batches(view)
         except ValueError as exc:
