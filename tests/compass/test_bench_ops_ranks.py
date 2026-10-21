@@ -365,15 +365,28 @@ def test_two_kernels_of_a_collective_densify_to_the_rows_halfway():
     assert want == {(prefill(17, 1), None): {fam}}
 
 
-def test_a_collective_halves_only_a_kernel_switch_not_a_bend():
-    # 26 at 2048 bytes against 19.3 on the line from 256 to 4096, one kernel.
+@pytest.mark.parametrize(
+    "middle, want",
+    [
+        # 26 at 2048 bytes against 20 on the line from 256 to 4096, one kernel.
+        (26.0, {(decode(4), 20), (decode(12), 20)}),
+        (20.0, set()),
+    ],
+)
+def test_a_collective_halves_either_side_of_a_size_off_its_ends_line(middle, want):
+    # Each size read at two contexts; the second reading at 256 bytes, 6% off
+    # the first, is a repeat, not a bend.
     fam = ops.exchange(json.loads(_sig(1)))[0]
     points = [
-        (256 * w, ("one",), {"shape": str(decode(w)), "context": 20, "cold_ns": ns})
-        for w, ns in ((1, 10.0), (8, 26.0), (16, 30.0))
+        (256 * w, ("one",), {"shape": str(decode(w)), "context": c, "cold_ns": ns})
+        for w, ns, again in ((1, 10.0, 10.6), (8, middle, middle), (16, 30.0, 30.0))
+        for c, ns in ((20, ns), (3000, again))
     ]
 
-    assert ops._densify({fam: points}, set()) == {}
+    got = ops._densify({fam: points}, set())
+
+    assert set(got) == want
+    assert all(fams == {fam} for fams in got.values())
 
 
 def test_fit_ops_prices_a_collective_between_two_message_sizes():
