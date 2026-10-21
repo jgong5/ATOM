@@ -544,22 +544,20 @@ class Stub:
 
     def _plan(self, op, instances, kv, blocks, rows):
         """A leaf's copies, its bytes per call, and the placements its context
-        keys take; a context key of a module that holds no layer's KV, as a
-        module path."""
+        keys take."""
         need, size = 1, sum(
             _span(s["shape"], s["stride"]) * _dtype(s["dtype"]).itemsize
             for _, s in _specs(op["args"])
         )
         for key in instances[0].values():
-            held = self.contexts.get(key, self.modules.get(key))
-            if key in self.contexts and hasattr(held, "layer_num"):
-                held = kv.get(f"layer_{held.layer_num}")
+            if key in self.contexts:
+                held = kv.get(f"layer_{self.contexts[key].layer_num}")
                 unit = rows if _stateful(held) else blocks
                 # ponytail: a tensor's first dim is its blocks or its state slots
                 size += sum(t.nbytes // t.shape[0] * unit for t in _fields(held))
                 need = None
-            elif isinstance(held, torch.nn.Module):
-                size += sum(t.nbytes for t in _own(held))
+            elif key in self.modules:
+                size += sum(t.nbytes for t in _own(self.modules[key]))
         n = self._cold(size)
         if need is None:  # cycle over every instance's state, which is held anyway
             n = min(CALLS, max(n, len(instances)))

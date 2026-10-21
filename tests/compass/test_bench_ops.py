@@ -250,25 +250,6 @@ def test_a_point_places_its_batch_for_its_context_keys_and_refuses_by_name(
     assert {r["placements"] for r in got} == {5}
 
 
-def test_a_context_key_of_a_module_holding_no_kv_is_sized_by_its_own_tensors():
-    # DeepSeek-V4's indexer is a context key with buffers of its own and no KV.
-    indexer = torch.nn.Module()
-    indexer.register_buffer("cache", torch.zeros(10, 4))
-    runner = _Runner({"model.layers.0.attn.indexer": indexer})
-    stub = ops.Stub(runner, 10_000)
-    op = {
-        "args": {
-            "q": {"shape": [2, 4], "dtype": F32, "stride": [4, 1], "role": "activation"}
-        }
-    }
-    instances = [{"layer": "model.layers.0.attn.indexer"}]
-
-    n, size, need = stub._plan(op, instances, {}, blocks=4, rows=2)
-
-    assert size == (2 * 4 + 10 * 4) * 4
-    assert (n, need) == (stub._cold(size), 1)
-
-
 def test_each_placement_keeps_its_own_forward_context_and_metadata():
     runner = _Runner()
     stub = ops.Stub(runner, 10_000)
