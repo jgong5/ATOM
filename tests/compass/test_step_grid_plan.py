@@ -353,7 +353,8 @@ def test_a_rung_between_planned_rungs_is_planned_on_its_own_c_nodes(
 def test_the_margin_reads_a_neighbouring_rungs_own_c_nodes(tmp_path, monkeypatch):
     """The step's cell on rung 4 is c 64..128. At a 12-block pool rung 2's c
     nodes are 0, 64, 95 (its KV limit), 128, ..., so one node of margin spans
-    0 to 192 there, and 128 and 192 do not fit."""
+    0 to 192 there; 128 fits with the two rows sharing 6 blocks, and 192 does
+    not fit sharing all 12 full ones."""
     directory = record(tmp_path, monkeypatch, *MIXED)
     planned = plan(directory, margin=1, engine={"num_kvcache_blocks": 12})
 
@@ -361,6 +362,7 @@ def test_the_margin_reads_a_neighbouring_rungs_own_c_nodes(tmp_path, monkeypatch
         [2, 2, 0],
         [2, 2, 64],
         [2, 2, 95],
+        [2, 2, 128],
     ]
 
 
@@ -378,15 +380,15 @@ def test_the_margin_reads_a_neighbouring_rungs_own_c_nodes(tmp_path, monkeypatch
             "20 KV blocks are above num_kvcache_blocks",
             [2, 64, 64],
         ),
-        # 3 decode rows of 64 cached + 1 tokens hold 5 blocks of 16 each;
-        # counting 65 // 16 = 4 a row would fit the 12. 63 is c_max(3).
+        # 3 decode rows of 192 cached + 1 tokens hold 13 blocks of 16 each,
+        # 12 of them full and shared; at 128 they share 8 of 9 to fit the 12.
         (
             {"num_kvcache_blocks": 12},
             {},
             "decode rung 4",
-            [4, 3, 64],
-            "15 KV blocks are above num_kvcache_blocks",
-            [4, 3, 63],
+            [4, 3, 192],
+            "15 KV blocks are above num_kvcache_blocks, the rows sharing 12",
+            [4, 3, 128],
         ),
         (
             {},
@@ -453,6 +455,26 @@ def test_the_limits_are_nodes_and_each_c_range_ends_on_one(tmp_path, monkeypatch
         for b in bs:
             runs = [c for c in cs if not infeasible(target, b, b, c, False)]
             assert infeasible(target, b, b, runs[-1] + 1, False)
+
+
+def test_a_decode_point_past_the_kv_pool_is_planned_shared_and_read_measured(
+    tmp_path, monkeypatch
+):
+    """At a 12-block pool, 3 decode rows on c 64 and on 128 hold 15 and 27
+    blocks apart; sharing the fewest leading blocks that fit, 2 and 8, they
+    hold 11. MIXED's decode steps, between the two, are read off both."""
+    directory = record(tmp_path, monkeypatch, *MIXED)
+    planned = plan(directory, engine={"num_kvcache_blocks": 12})
+    points = located(tmp_path, planned)
+
+    shared = {
+        (x["rung"], len(x["rows"]), x["rows"][0][1] - 1): x.get("shared", 0)
+        for x in planned["lines"]
+        if x["rung"]
+    }
+    assert shared == {(4, 3, 64): 2, (4, 3, 128): 8}
+    out = coverage(tmp_path, measured(planned, points), directory)
+    assert (out["extrapolated"], out["fallback"], out["share"]) == (0, 0, 1.0)
 
 
 def test_a_rung_gains_a_b_node_where_steps_reach_past_the_rungs_kv_limit(
