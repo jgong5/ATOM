@@ -52,8 +52,11 @@ member an engine read states, empty when every one was measured.
 import argparse
 import dataclasses
 import json
+import multiprocessing
 import re
+import tempfile
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -217,10 +220,41 @@ def check(inputs, run: dict, atom_args) -> dict:
                 "the op graph prices every leaf by its roofline and no step is "
                 "covered; compass fit ops publishes one"
             )
-        backend = compass_run.op_graph(run, config, machine)
+        # ATOM's MoE shards no experts without expert parallelism.
+        ep = _ep_width(atom_args, machine) if config.enable_expert_parallel else 1
+        backend = compass_run.op_graph(run, config, machine, ep)
         return {"inputs": list(inputs), **op_coverage(backend, steps)}
     backend, _ = step_grid.load(run[STEP_GRID], config, machine)
     return {"inputs": list(inputs), **coverage(backend, steps)}
+
+
+def _ep_width(atom_args, machine) -> int:
+    """`run.ep_width` of the model ATOM's arguments `atom_args` build on the meta
+    device of `machine`'s arch, in a process of its own: the build declares a
+    device process-wide, which the server this process starts must not inherit."""
+    arch, spawn = machine.value("device.arch"), multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(1, mp_context=spawn) as pool:
+        return pool.submit(_built_ep_width, atom_args, arch).result()
+
+
+def _built_ep_width(atom_args, arch: str) -> int:
+    from atom.compass.validate.bound import _build
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(add_help=False))
+    engine, server = parser.parse_known_args(atom_args)
+    # The build parses ATOM's engine arguments only: drop the server's.
+    left, kept = iter(server), []
+    drop = next(left, None)
+    for arg in atom_args:
+        if arg == drop:
+            drop = next(left, None)
+        else:
+            kept.append(arg)
+    with tempfile.TemporaryDirectory(prefix="compass-run-ep-") as tmpdir:
+        _, tree = _build(engine.model, engine.tensor_parallel_size, kept, arch, tmpdir)
+    return compass_run.ep_width(tree)
 
 
 def op_coverage(backend, steps) -> dict:

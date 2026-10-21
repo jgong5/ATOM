@@ -221,10 +221,11 @@ def _ranking(rates: dict) -> dict | None:
     }
 
 
-def ops(out, machine, tp: int, kv: str) -> dict:
+def ops(out, machine, tp: int, kv: str, ep: int = 1) -> dict:
     """The points a `measure ops --plan` run at `out` measured, each its cold
     time over the analytical price of its leaf at its shape and rows on
-    `machine`, in a TP group of `tp` with a `kv` KV cache, by op kind and phase.
+    `machine`, in a TP group of `tp` and an EP group of `ep` with a `kv` KV cache,
+    by op kind and phase.
     A leaf the analytical price says launches no kernel is counted apart, by
     whether its point timed any kernel."""
     from atom.compass.backends.op_work import work
@@ -240,7 +241,7 @@ def ops(out, machine, tp: int, kv: str) -> dict:
         rows = tuple(RequestShape(q, c, bool(d)) for q, c, d in p["rows"])
         view = BatchView(rows, produces_output=True)
         try:
-            w = work(json.loads(p["leaf"]), view, tp, kv)
+            w = work(json.loads(p["leaf"]), view, tp, kv, ep)
             priced = None if w is None else price(w, machine)
         except CostRefused as e:
             refused.update(str(r) for r in e.declined)
@@ -391,7 +392,7 @@ def main(argv: list[str]) -> None:
 
     from atom.compass.backends.op_graph import OpGraphBackend
     from atom.compass.backends.step_roofline import StepRooflineBackend
-    from atom.compass.run import _op_graphs
+    from atom.compass.run import _op_graphs, ep_width
     from atom.compass.run.modules import walk
     from atom.compass.spec import MachineSpec
 
@@ -399,6 +400,7 @@ def main(argv: list[str]) -> None:
     arch = machine.value("device.arch")
     with tempfile.TemporaryDirectory(prefix="compass-bound-") as tmpdir:
         config, tree = _build(args.model, args.tp, argv[cut + 1 :], arch, tmpdir)
+    ep = ep_width(tree)
     dp = config.parallel_config.data_parallel_size
     if config.enable_tbo_decode or config.enable_tbo and dp == 1:
         raise ValueError(
@@ -434,6 +436,7 @@ def main(argv: list[str]) -> None:
             machine,
             _op_graphs(args.store, config, arch),
             tp=config.tensor_parallel_size,
+            ep=ep,
             kv=config.kv_cache_dtype,
         ),
     }
@@ -448,6 +451,7 @@ def main(argv: list[str]) -> None:
                     machine,
                     config.tensor_parallel_size,
                     config.kv_cache_dtype,
+                    ep,
                 )
             )
         )
