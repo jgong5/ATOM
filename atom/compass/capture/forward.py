@@ -14,7 +14,8 @@ shape, dtype, stride and role. A tensor's role is where its storage came from:
 the model's parameters, buffers and tensor attributes are weights, what
 `allocate_kv_cache` allocated is KV, what the model's forward and the sampler
 after it allocated is an activation, and anything else (the runner's buffers,
-what its input preparation allocated) is metadata.
+what its input preparation allocated) is metadata. A functional collective's
+group is the aiter coordinator it belongs to (`_coordinator`).
 
 A raw Triton or FlyDSL launch lifts to the function that issues it
 (`_Recorder`): one leaf, that function by its module and name, its parameters at
@@ -382,7 +383,10 @@ class _Recorder(TorchDispatchMode):
             if driverless.standing_in[0] and not name.startswith("_c10d_functional."):
                 why = "stand-in"
             slots = {a.name: v for a, v in zip(func._schema.arguments, args)}
-            self.add(name, kind, {**slots, **kwargs}, outs, why)
+            slots |= kwargs
+            if name.startswith("_c10d_functional.") and "group_name" in slots:
+                slots["group_name"] = _coordinator(slots["group_name"])
+            self.add(name, kind, slots, outs, why)
         return out
 
     def add(self, name, kind, slots, outs, why):
@@ -594,6 +598,16 @@ class _Recorder(TorchDispatchMode):
         if self.layer is None:
             return path
         return re.sub(rf"\blayers\.{self.layer}\b", f"layers.{{{LAYER}}}", path)
+
+
+def _coordinator(group_name: str) -> str:
+    """The aiter coordinator (`tp:0`) whose device group torch names
+    `group_name`, or the name as it is when none is: torch numbers groups in
+    the order a process creates them, which the bench's ranks need not share."""
+    from aiter.dist.parallel_state import _groups
+
+    held = {g.device_group.group_name: k for k, r in _groups.items() if (g := r())}
+    return held.get(group_name, group_name)
 
 
 def _class(value) -> str:
