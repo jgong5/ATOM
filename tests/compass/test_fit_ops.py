@@ -213,6 +213,33 @@ def test_fit_ops_holds_out_no_point_between_neighbours_one_apart(
 
 
 @pytest.mark.parametrize(
+    "rows, nbytes, declined",
+    [
+        ((7, 8, 9), (7, 8, 9), []),
+        ((6, 8, 10), (6, 8, 10), ["bytes = 8192 reads +10.0%"]),
+        ((7, 8, 10), (7, 8, 9), ["bytes = 8192 reads +10.0%"]),
+    ],
+)
+def test_fit_ops_holds_out_no_collective_point_between_neighbours_one_row_apart(
+    rows, nbytes, declined, measured, tmp_path
+):
+    # nbytes in rows of 1024 bytes; the last case's points move other bytes per
+    # row, so a row's bytes are not known
+    fam = json.dumps(["exchange", {"op": "_c10d_functional.all_gather"}])
+    points = [
+        {"shape": f"decode B={b}", "context": 1024, "op": "_c10d_functional.all_"}
+        | {"leaf": "{}", "exchange": [fam, n * 1024], "cold_ns": ns, "kernels": ["k"]}
+        for b, n, ns in zip(rows, nbytes, (1e4, 1e4, 12e3))
+    ]
+    d, _ = measured("m", points)
+
+    got = _fit(tmp_path / "fit", tmp_path / "store", d)
+
+    (f,) = got["params"]["families"].values()
+    assert [why.split(" off")[0] for _, _, why in f["declined"]] == declined
+
+
+@pytest.mark.parametrize(
     "moved, cell",
     [({"ptl": "disabled"}, "PTL"), ({"source_root": "tree-" + "b" * 40}, "ATOM src")],
 )
