@@ -331,9 +331,10 @@ def test_the_router_reaches_each_instance_whatever_proxy_the_environment_names(
     for name in ("NO_PROXY", "no_proxy"):
         env.pop(name, None)
     env |= dict.fromkeys(("HTTP_PROXY", "http_proxy"), "http://127.0.0.1:1")
-    script = subprocess.Popen(
-        _record(tmp_path, on), env=env, cwd=tmp_path, stdout=subprocess.PIPE
-    )
+    words = _record(tmp_path, on)
+    # The decode on a host of its own, as on another node.
+    words[words.index("--host") + 1] = "127.0.0.2"
+    script = subprocess.Popen(words, env=env, cwd=tmp_path, stdout=subprocess.PIPE)
     _until(tmp_path / "d" / "server.json", script)
 
     script.send_signal(signal.SIGTERM)
