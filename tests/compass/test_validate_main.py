@@ -11,6 +11,7 @@ price; the export and the server log are as `test_validate_runs` and
 import json
 import re
 import runpy
+import shutil
 import subprocess
 import sys
 
@@ -25,7 +26,7 @@ from atom.compass.backends.cost import GROUPS
 from atom.compass.memory.check import parts
 from atom.compass.run import LP_FILE
 from atom.compass.validate.__main__ import main
-from atom.compass.validate.runs import CLIENT_RUN
+from atom.compass.validate.runs import CLIENT_RUN, SIDES
 
 TERM = {"method": "measured", "source": "planted"}
 SHARE = {"steps": 3, "fraction_of_predicted_seconds": 0.4}
@@ -617,3 +618,57 @@ def test_a_refused_cost_row_names_its_reasons(capsys, tmp_path):
             '; reasons {"step-linear: no decode vector for rung 1": 10}'
         )
         assert value.startswith("10 steps, real ") and verdict == "-"
+
+
+def _deploy(cell):
+    """Lay each run of `cell` out as `deploy.sh` writes a deployment, both its
+    sides that run's server: its steps, run.json and server log in prefill/
+    and decode/, each side under the engine config one of the run file's two
+    laws was fitted under; its client's export beside them; and a simulated
+    run's engine hand-in as each side's."""
+    laws = [LAW | {"engine_config": {"enable_tbo": tbo}} for tbo in (True, False)]
+    for d in sorted(cell.iterdir()):
+        for side, tbo in zip(SIDES, (True, False)):
+            shutil.copytree(d / "steps", d / side / "steps")
+            for name in ("run.json", "server.log"):
+                if (d / name).exists():
+                    shutil.copy(d / name, d / side / name)
+            engine = {"enable_tbo": tbo, "num_kvcache_blocks": 8, "max_num_seqs": 4}
+            (d / side / "steps" / "dp0.engine.json").write_text(json.dumps(engine))
+            hand_in = d / LP_FILE.format("engine")
+            if hand_in.exists():
+                shutil.copy(hand_in, d / LP_FILE.format(f"engine-{side[0].upper()}"))
+        shutil.rmtree(d / "steps")
+        run = {"kv_link": "inter_node"}
+        if d.name == "step_linear":
+            run["run_file"] = {"step_linear": laws, "host": {"laws": {}}}
+            (d / LP_FILE.format("engine")).unlink()
+        else:
+            (d / "server.log").unlink()
+        (d / "run.json").write_text(json.dumps(run))
+
+
+def test_a_deployment_cell_is_graded_per_side_as_each_side_alone_would_be(
+    capsys, tmp_path
+):
+    cell = tmp_path / "c4"
+    _rows(capsys, tmp_path)
+    _as_recorded(cell)
+    alone = _graded(capsys, cell)
+    _deploy(cell)
+
+    rows = _graded(capsys, cell)
+
+    per_side = ("counts", "distributions", "one run", "cost ", "memory ", "warmup ")
+    expected = {}
+    for (result, metric), value in alone.items():
+        if not result.startswith(per_side):
+            expected[result, metric] = value
+            continue
+        for side in SIDES:
+            expected[f"{result} {side}", metric] = value
+    assert rows == expected
+    assert rows["memory real1 decode", "non_torch"] == [
+        "-33.33% (-536,870,912 B)",
+        "fail",
+    ]

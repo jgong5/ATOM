@@ -46,6 +46,15 @@ a graded one included.
 Beside the table, the command states how many of that client run's steps its
 backend extrapolated and a fallback below it priced.
 
+A deployment `deploy.sh` wrote holds a server's directory per side,
+`prefill/` and `decode/`, and its client's export beside them. Each side is
+checked and graded as a run `record` or `run` wrote, against that export, and
+the step families below are per side (`counts prefill`, `counts decode`, ...);
+end to end is the deployment's, once. A record of several DP ranks is graded
+over every rank's steps: counts summed over ranks, distributions over every
+rank's steps, and the warmup checks on its steps in step order, every rank's
+step k one forward.
+
 The tolerance of a metric is the real runs' own spread: its distance between
 every ordered pair of real runs, at most. A metric's result is its distance
 from the simulated cell to each real run. The families:
@@ -102,6 +111,8 @@ from atom.compass.run import (
 EXPORT = "artifacts/profile_export_aiperf.json"
 #: The export of the client run a `record` or `run` directory grades.
 CLIENT_RUN = "artifacts/client_run.json"
+#: A deployment's sides, each its servers' directory in it.
+SIDES = ("prefill", "decode")
 TARGET = {"ttft": 0.15}
 DEFAULT_TARGET = 0.10
 ASSUMED = "its engines read assumed memory_readings members: {}"
@@ -115,27 +126,34 @@ END_TO_END = {
 }
 
 
-def _steps(cell) -> list[dict]:
+def sides(run) -> list[Path]:
+    """Where `run`'s servers wrote their records: the prefill/ and decode/ of a
+    deployment `deploy.sh` wrote, else `run` itself."""
+    run = Path(run)
+    return [run / s for s in SIDES] if (run / SIDES[0]).is_dir() else [run]
+
+
+def _steps(cell) -> list[list[dict]]:
+    """Each DP rank's steps, its dummy runs left out."""
     # Each rank's record, and not the cost lines a simulated run writes beside it.
     ranks = sorted((Path(cell) / "steps").glob("dp*[0-9].jsonl"))
-    if len(ranks) != 1:
-        raise ValueError(
-            f"{cell} holds {len(ranks)} DP ranks' records; this grades one"
-        )
-    return [s for s in read_jsonl(ranks[0]) if not s["is_dummy_run"]]
+    if not ranks:
+        raise ValueError(f"{cell} holds no DP rank's record")
+    return [[s for s in read_jsonl(r) if not s["is_dummy_run"]] for r in ranks]
 
 
 def _requests(steps) -> collections.Counter:
     """Prefill tokens per request, keyed by (prompt length, arrival place)."""
     tokens, length = collections.Counter(), {}
     for step in steps:
+        rank = step.get("dp_rank")  # each rank numbers its own requests
         named = {request for request, _key, *_response_id in step["named"]}
         for (request, _n, context), (q, _c, decode) in zip(step["batch"], step["rows"]):
-            tokens[request] += 0 if decode else q
+            tokens[rank, request] += 0 if decode else q
             if request in named:  # its final chunk: the context is the prompt
-                length[request] = context
+                length[rank, request] = context
     out, seen = collections.Counter(), collections.Counter()
-    for request in sorted(tokens):  # request ids number arrivals
+    for request in sorted(tokens):  # request ids number a rank's arrivals
         n = length.get(request)
         out[None if n is None else (n, seen[n])] += tokens[request]
         seen[n] += 1
@@ -167,18 +185,19 @@ def _counts(steps, export) -> dict:
         ),
         0,
     )
-    last, was_prefill = {}, False
+    # Summed over DP ranks: each rank's streaks and requests are its own.
+    last, was_prefill = {}, {}
     for step in steps:
-        prefill = _prefill(step)
+        prefill, rank = _prefill(step), step.get("dp_rank")
         out["prefill steps" if prefill else "decode steps"] += 1
-        out["prefill streaks"] += int(prefill and not was_prefill)
-        was_prefill = prefill
+        out["prefill streaks"] += int(prefill and not was_prefill.get(rank))
+        was_prefill[rank] = prefill
         for (request, _n, _c), (q, context, decode) in zip(step["batch"], step["rows"]):
             out[f"{'decode' if decode else 'prefill'} tokens"] += q
-            before = last.get(request)
+            before = last.get((rank, request))
             if before and not decode and (before[1] or context <= before[0]):
                 out["preemptions"] += 1
-            last[request] = (context, decode)
+            last[rank, request] = (context, decode)
     out["requests completed"] = export["request_count"]["avg"]
     return out
 
@@ -201,18 +220,25 @@ def _end_to_end(export) -> dict:
     return {name: export[k][stat] for name, (k, stat) in END_TO_END.items()}
 
 
-def _client_run(cell, run) -> tuple[list[dict], list[str], dict]:
+def _client_run(cell, run, client) -> tuple[list[dict], list[str], dict]:
     """The steps of the client run `cell` grades, the traces its client was
-    given, and its warmup: how many requests its export names as the warmup's,
-    and how many steps hold only those; refuses, naming every reason, a run
-    grading does not take."""
-    steps = _steps(cell)
-    export = read_json(Path(cell) / CLIENT_RUN)
+    given, and its warmup: how many requests its export, in `client`, names as
+    the warmup's, and how many steps hold only those; refuses, naming every
+    reason, a run grading does not take. Its DP ranks step together, so their
+    steps are taken in step order, every rank's step k one."""
+    export = read_json(Path(client) / CLIENT_RUN)
     warmup_names = set(export.get("warmup") or ())
-    (split,) = served(Path(cell) / "steps", [export["requests"]]).values()
-    split = [s for s in split if not s["is_dummy_run"]]
-    ids = {k: v for s in split for k, v in s.get("response_ids", {}).items()}
-    held = [{ids.get(r[0], r[0]) for r in s["batch"]} for s in split]
+    record = served(Path(cell) / "steps", [export["requests"]])
+    rows = []
+    for raw, split in zip(_steps(cell), record.values()):
+        split = [s for s in split if not s["is_dummy_run"]]
+        ids = {k: v for s in split for k, v in s.get("response_ids", {}).items()}
+        rows += [
+            (r, s, {ids.get(b[0], b[0]) for b in s["batch"]})
+            for r, s in zip(raw, split)
+        ]
+    rows.sort(key=lambda row: row[1]["step"])
+    steps, split, held = zip(*rows)
     warm = [bool(names) and names <= warmup_names for names in held]
     mine = [s["client_run"] == 0 for s in split]
     traces = sorted({t for s, m in zip(split, mine) if m for t in s["traces"]})
@@ -284,16 +310,17 @@ def _not_graded(run, traces) -> list[str]:
     return why
 
 
-def graded(cell) -> tuple[list[dict], list[str] | None, dict | None]:
-    """The steps `cell` grades; the traces its client was given, and its
-    warmup, as `_client_run` gives them, both None where it is graded whole."""
+def graded(cell, client=None) -> tuple[list[dict], list[str] | None, dict | None]:
+    """The steps `cell` grades, every DP rank's; the traces its client was
+    given, and its warmup, as `_client_run` gives them, both None where it is
+    graded whole. `client` holds the client's export, `cell` itself unless
+    `cell` is a deployment's side."""
+    client = client or cell
     path = Path(cell) / "run.json"
     run = read_json(path) if path.exists() else {}
-    if "format_version" in run:
-        return _client_run(cell, run)
-    if (Path(cell) / CLIENT_RUN).is_file():
-        return _client_run(cell, run)
-    return _steps(cell), None, None
+    if "format_version" in run or (Path(client) / CLIENT_RUN).is_file():
+        return _client_run(cell, run, client)
+    return [s for rank in _steps(cell) for s in rank], None, None
 
 
 def _refuse_by_run_file(cell) -> None:
@@ -305,7 +332,8 @@ def _refuse_by_run_file(cell) -> None:
     if not path.exists():
         return
     run = read_json(path)
-    if "format_version" in run:  # `_client_run` checks a `record` or `run` cell
+    # `_client_run` checks a `record` or `run` cell, and a deployment's sides.
+    if "format_version" in run or len(sides(cell)) > 1:
         return
     if any(h.get("skip") for h in entries(run, "host")):
         raise ValueError(f"{cell} skips host segments; a what-if run is not graded")
@@ -319,18 +347,18 @@ def _refuse_by_run_file(cell) -> None:
 
 
 def _read(cell) -> dict:
-    steps, traces, _warmup = graded(cell)
     export = read_json(Path(cell) / EXPORT)
+    out = {"end to end": _end_to_end(export), "sides": {}}
+    for side in sides(cell):
+        steps, traces, _warmup = graded(side, cell)
+        out["sides"]["" if side == Path(cell) else f" {side.name}"] = {
+            "counts": _counts(steps, export),
+            "distributions": _distributions(steps),
+            "requests": _requests(steps),
+        }
     # A run graded whole states its arguments in run.json.
     client = {} if traces is None else read_json(Path(cell) / CLIENT_RUN)
-    return {
-        "counts": _counts(steps, export),
-        "distributions": _distributions(steps),
-        "end to end": _end_to_end(export),
-        "requests": _requests(steps),
-        "traces": traces,
-        "arguments": client.get("arguments", {}),
-    }
+    return out | {"traces": traces, "arguments": client.get("arguments", {})}
 
 
 DISTANCE = {
@@ -387,23 +415,35 @@ def grade(real_cells, simulated_cell) -> dict:
     }
     if odd:
         raise ValueError(f"the runs' clients were given different arguments: {odd}")
-    report = {
-        family: {
-            name: _grade(
-                family, name, [r[family][name] for r in real], simulated[family][name]
-            )
-            for name in simulated[family]
+    named = {c: sorted(r["sides"]) for c, r in zip(given, (*real, simulated))}
+    if len({json.dumps(s) for s in named.values()}) > 1:
+        raise ValueError(f"the runs' servers wrote different sides: {named}")
+
+    def every(family, theirs, mine) -> dict:
+        return {
+            name: _grade(family, name, [t[name] for t in theirs], mine[name])
+            for name in mine
         }
-        for family in DISTANCE
-    }
-    totals = {k: report["counts"]["prefill tokens"][k] for k in ("real", "simulated")}
-    requests = [r["requests"] for r in real], simulated["requests"]
-    report["counts"]["prefill tokens"] = (
-        _grade("counts", "prefill tokens", *requests, _both) | totals
-    )
-    one_run = _grade("counts", "prefill tokens", *requests, _one_run) | totals
-    report["one run"] = {"prefill tokens": one_run | {"verdict": "not gated"}}
-    return report
+
+    # A deployment's schedule per side, `counts prefill` and up; its end to end once.
+    report, one_run = {}, {}
+    for at, mine in simulated["sides"].items():
+        theirs = [r["sides"][at] for r in real]
+        for family in ("counts", "distributions"):
+            report[family + at] = every(
+                family, [t[family] for t in theirs], mine[family]
+            )
+        counts = report["counts" + at]
+        totals = {k: counts["prefill tokens"][k] for k in ("real", "simulated")}
+        requests = [t["requests"] for t in theirs], mine["requests"]
+        counts["prefill tokens"] = (
+            _grade("counts", "prefill tokens", *requests, _both) | totals
+        )
+        once = _grade("counts", "prefill tokens", *requests, _one_run) | totals
+        one_run["one run" + at] = {"prefill tokens": once | {"verdict": "not gated"}}
+    end = [r["end to end"] for r in real], simulated["end to end"]
+    report["end to end"] = every("end to end", *end)
+    return report | one_run
 
 
 def _text(report: dict) -> str:

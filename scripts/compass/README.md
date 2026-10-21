@@ -690,6 +690,13 @@ docstring lists the metrics, their distances and the verdicts.
 summaries into one table per cell directory: `step_linear/` or `step_grid/`, and two or more
 `real*/` runs of one workload. Its docstring lists the rows.
 
+A prefill-decode cell's runs are `deploy.sh` directories: real ones from `deploy.sh
+record`, the simulated one from `deploy.sh run`. Each holds `prefill/` and `decode/`
+and the client's `artifacts/` beside them, and the table grades it per side: schedule
+over every DP rank of that side, cost at the law fitted under that side's engine config,
+memory against that side's hand-in (`lp-engine-P.json`, `lp-engine-D.json`); end to
+end once, from the deployment's export.
+
 ## The stage-2 cell through the `compass` CLI, from an empty store
 
 Qwen3.8-27B TP1 on MI308X, priced by a step linear law `compass fit steps` fits on
