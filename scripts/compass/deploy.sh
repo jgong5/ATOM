@@ -20,9 +20,13 @@
 #                  port free here, and refuses one among them
 #   <router args>  `atomesh launch` arguments, as given; the script adds the
 #                  router's host and ports, --pd-disaggregation and each
-#                  instance's URL; run refuses --dp-aware, which makes the
-#                  router choose among DP ranks
+#                  instance's URL; run with --dp-aware, which makes the
+#                  router choose among DP ranks, runs it as LP `router` of the
+#                  run, and refuses an ATOMESH not built from this tree's
+#                  atom/mesh (`router_binary` in atom/compass/run)
 #   ATOMESH        the router binary (default atomesh)
+#   SEED           run, --dp-aware: the seed the router LP's policies draw
+#                  from (default 20260707, client.sh's)
 #   WAIT_S         seconds each instance and the router have to answer, and
 #                  the deployment to leave once stopped (default 600)
 #   PREFIX_S       seconds --on's prefix has to start the decode's command,
@@ -86,7 +90,6 @@ while (($#)); do
 done
 [[ $seen == " prefill decode router" ]] || bad "--prefill --, --decode -- and --router -- come once each, in that order"
 [[ " ${prefill[*]} ${decode[*]} " != *" --kv-transfer-config"* ]] || bad "an instance's ATOM arguments carry --kv-transfer-config, which the script fills"
-[[ $cmd == record || " ${router[*]} " != *" --dp-aware "* ]] || bad "the router's arguments carry --dp-aware, which has the router choose among DP ranks, and this deployment's router has one worker per side"
 for path in "$(realpath -m "$OUT")" "$ROOT" "$PWD"; do
     ((${#on[@]} == 0)) || [[ $(printf %q "$path") == "$path" ]] || bad "--on's prefix may parse $path again, which a shell would split or expand"
 done
@@ -103,19 +106,23 @@ compass_env "$ROOT"
 compass_require_tree "$ROOT" || exit $?
 RUN_FILE= CLOCK=
 [[ $cmd == record ]] || RUN_FILE=$OUT/run_file.json
+# Run, --dp-aware: the router is LP `router`, run by ATOMESH, which the run file names.
+ROUTER_LP=
+[[ -z $RUN_FILE || " ${router[*]} " != *" --dp-aware "* ]] || ROUTER_LP=$ATOMESH
 # The ports, all held together so no two are the same: the router's and its
 # metrics', and each side's KV block. Simulated, both sides share one block of
 # write requests, one per prefill and decode rank pair, and the authority
 # takes one more, as the run file states; real, each side's Mooncake side
 # channels take one per rank from its handshake port.
-ports=$(python3 - "$RUN_FILE" "$KV_LINK" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
-import argparse, json, random, socket, sys
+ports=$(python3 - "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
+import argparse, json, random, socket, subprocess, sys
 from pathlib import Path
+from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactRefusal
 from atom.compass.drive import runfile
 from atom.compass.spec import SpecRefusal
 
-run_file, kv_link, n, *words = sys.argv[1:]
+run_file, kv_link, router_lp, n, *words = sys.argv[1:]
 flags, words = words[: int(n)], words[int(n) :]
 k = int(words[0])
 prefill, decode = words[1 : 1 + k], words[1 + k :]
@@ -145,17 +152,25 @@ runfile.add_arguments(parser)
 args = parser.parse_args(flags)
 try:
     run = runfile.prefill_decode(args, prefill, decode, kv_link)
-except (ValueError, OSError, ArtifactRefusal, SpecRefusal) as refused:
+    lookaheads = "-"
+    if router_lp:
+        # Each hop into the router takes the run's ipc_s, as pd_sim.sh's does.
+        run["router"] = compass_run.router_binary(router_lp)
+        run.setdefault("router_in_s", run["ipc_s"])
+        table = compass_run.channel_table(run)
+        out = {c.name: table.lookahead(c.name) for c in table.channels_from(compass_run.ROUTER)}
+        lookaheads = json.dumps(out, separators=(",", ":"))
+except (ValueError, OSError, subprocess.CalledProcessError, ArtifactRefusal, SpecRefusal) as refused:
     sys.exit(f"deploy: {refused}")
 clock = block(1)
 base = block(run["prefill_data_parallel_size"] * run["decode_data_parallel_size"])
 run |= {"out_dir": str(Path(run_file).parent), "clock_endpoint": f"tcp://127.0.0.1:{clock}"}
 Path(run_file).write_text(json.dumps(run))
-print(router, prometheus, base, base, clock)
+print(router, prometheus, base, base, clock, lookaheads)
 EOF
 )
 # Its last line; an import may print before it.
-read -r ROUTER_PORT PROMETHEUS_PORT PREFILL_KV_PORT DECODE_KV_PORT CLOCK_PORT <<<"${ports##*$'\n'}"
+read -r ROUTER_PORT PROMETHEUS_PORT PREFILL_KV_PORT DECODE_KV_PORT CLOCK_PORT LOOKAHEADS <<<"${ports##*$'\n'}"
 
 decode_pid() { # the decode's command's process id, waiting up to PREFIX_S while its prefix runs
     local deadline=$((SECONDS + PREFIX_S))
@@ -228,7 +243,10 @@ export NO_PROXY=$hosts${NO_PROXY:+,$NO_PROXY} no_proxy=$hosts${no_proxy:+,$no_pr
 
 ROUTER=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --prometheus-port "$PROMETHEUS_PORT"
     --pd-disaggregation --prefill "$prefill_url" --decode "$decode_url" "${router[@]}")
-"${ROUTER[@]}" >"$OUT/router.log" 2>&1 &
+router_env=()
+[[ -z $ROUTER_LP ]] || router_env=(ATOM_COMPASS_CLOCK_ENDPOINT="$CLOCK" ATOM_COMPASS_SEED="${SEED:-20260707}"
+    ATOM_COMPASS_ROUTER_LOOKAHEADS="$LOOKAHEADS")
+env "${router_env[@]}" "${ROUTER[@]}" >"$OUT/router.log" 2>&1 &
 R=$!
 compass_wait_up router $R "http://127.0.0.1:$ROUTER_PORT/v1/models"
 # A stop from here on, one server.json's reader sends included, also stops the
