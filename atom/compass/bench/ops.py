@@ -976,7 +976,7 @@ def keys(config, run: dict):
 def publish(store, key, config, run: dict, command: str, results, out: Path):
     """Write `results` to ``ops.jsonl`` in `out` and each measured one to
     `store` at its `key`."""
-    from atom.compass.fit.publish import conditions
+    from atom.compass.fit.publish import conditions, ranks
     from atom.compass.fit.samples import run_fields
     from atom.compass.run.step_grid import keyed
 
@@ -991,15 +991,14 @@ def publish(store, key, config, run: dict, command: str, results, out: Path):
             at = key(record["shape"], record["context"], record["leaf"])
             lines.write(json.dumps(record | {"token": at.token()}) + "\n")
             if "refused" not in record:
+                body, every = json.dumps(record).encode(), ranks(at)
                 store.publish(
                     at,
                     provenance=Provenance(command, now, roots),
-                    topology=Topology(),
+                    topology=every[0].topology,
                     conditions=readings,
                     gates=GateState.of(),
-                    members={
-                        member_name("point", RANK, "json"): json.dumps(record).encode()
-                    },
+                    members={member_name("point", r, "json"): body for r in every},
                 )
 
 
@@ -1053,7 +1052,8 @@ def plan(store, key, config, run, args, command: str, out: Path) -> None:
                 ):
                     continue
                 if store.directory_for(at := key(shape, context, sig)).exists():
-                    held = store.read(at).read_member("point", RANK, "json")
+                    entry = store.read(at)
+                    held = entry.read_member("point", entry.topology.ranks()[0], "json")
                     done[str(shape), context, sig] = json.loads(held)
                 else:
                     found[sig] = op, instances

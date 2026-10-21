@@ -28,6 +28,7 @@ import json
 from pathlib import Path
 
 from atom.compass.artifacts import (
+    AXES,
     ArtifactStore,
     Conditions,
     GateState,
@@ -45,8 +46,14 @@ from atom.compass.fit.samples import UNRECORDED, load
 from atom.compass.run.step_grid import readings as run_readings
 from atom.compass.spec import MachineSpec
 
-#: The rank every member is written at: a fit has one writer.
+#: The rank a fit whose key states no layout writes at.
 RANK = Topology().ranks()[0]
+
+
+def ranks(key) -> tuple:
+    """Every rank of the layout `key` states, one when it states none; a fit
+    has one writer, so each rank holds the same file."""
+    return Topology(**{a: key.values.get(a, 1) for a in AXES}).ranks()
 
 
 def parser(prog: str, description: str) -> argparse.ArgumentParser:
@@ -178,7 +185,7 @@ def publish(args, command: str, key, readings: Conditions, params, report):
     and write their readable copy in `args.out`."""
     if args.ptl:
         report = {**report, "stated_ptl": args.ptl}
-    members = {"params": params, "report": report}
+    members, at = {"params": params, "report": report}, ranks(key)
     ArtifactStore(args.store).publish(
         key,
         provenance=Provenance(
@@ -186,12 +193,13 @@ def publish(args, command: str, key, readings: Conditions, params, report):
             datetime.datetime.now(datetime.timezone.utc).isoformat(),
             roots_for({"atom": "atom", "aiter": "aiter"}),
         ),
-        topology=Topology(),
+        topology=at[0].topology,
         conditions=readings,
         gates=GateState.of(),
         members={
-            member_name(stem, RANK, "json"): json.dumps(body).encode()
+            member_name(stem, rank, "json"): json.dumps(body).encode()
             for stem, body in members.items()
+            for rank in at
         },
     )
     out = Path(args.out)
