@@ -737,6 +737,7 @@ def _publish_graph(store, config, arch, shape):
 def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
     tmp_path, monkeypatch, held, model_config  # noqa: F811
 ):
+    model_config.pipeline_parallel_size = model_config.prefill_context_parallel_size = 1
     store = ArtifactStore(str(tmp_path / "store"))
     for arch in held:
         _publish_graph(store, model_config, arch, decode(1))
@@ -788,6 +789,7 @@ def test_coverage_declares_the_plan_s_arch_to_aiter_before_it_builds_the_config(
 ):
     """ATOM's config imports aiter, which asks `GPU_ARCHS` and `rocminfo` for
     the arch; with no driver, `rocminfo` names none."""
+    model_config.pipeline_parallel_size = model_config.prefill_context_parallel_size = 1
     driverless_bin = tmp_path / "bin"
     driverless_bin.mkdir()
     (driverless_bin / "rocminfo").write_text("#!/bin/sh\nexit 0\n")
@@ -1062,3 +1064,45 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     assert {s for s in shapes if s.startswith("decode")} == rungs
     assert "prefill T=40 B=1" in shapes
     assert not [r for r in records if "refused" in r]
+
+
+def test_coverage_traces_a_dpa_tp8_graph_and_reads_it_at_tp1_dp8(tmp_path, monkeypatch):
+    """`--coverage` builds ATOM's config from its arguments, lays it out as
+    `CoreManager` does, and traces a graph the store lacks under the same
+    arguments, keyed by `trace ops`'s own parsing; the read after finds it."""
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"architectures": [ARCH]}))
+    atom_args = ["--model", str(model), "-tp", "8", "--enforce-eager"]
+    atom_args.append("--enable-dp-attention")
+    tokenizer = SimpleNamespace(bos_token_id=1, eos_token_id=2)
+    monkeypatch.setattr("atom.config.Config", _Config)
+    monkeypatch.setattr(
+        "atom.model_engine.llm_engine._load_tokenizer", lambda *a: tokenizer
+    )
+    store, traced = ArtifactStore(str(tmp_path / "store")), set()
+
+    def trace(model, tp, shapes, tmpdir, atom_args, arch):
+        config = forward._config(model, tp, atom_args)
+        for shape in shapes:
+            traced.add(structure(config, shape.phase, device=arch).split("} ")[-1])
+            _publish_graph(store, config, arch, shape)
+        return []
+
+    monkeypatch.setattr(forward, "capture", trace)
+    monkeypatch.setattr(ops, "_child", lambda fn, argv: fn(argv))
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "plan.jsonl").write_text("")
+    (out / "run.json").write_text(json.dumps({"device": [{"arch": "gfx942"}]}))
+    steps = ([[1, 1000, True]], 1), ([[40, 40, False]], None)
+    graded = _records(tmp_path / "graded", *steps)
+
+    argv = ["--coverage", graded, "--store", str(store.root), "--out", str(out)]
+    report = ops._coverage_main(argv, atom_args)
+
+    assert traced == {"tp=1 dp=8 decode eager", "tp=1 dp=8 prefill eager"}
+    assert report["by phase"] == {
+        "decode": {"steps": 1, "covered": 0},
+        "prefill": {"steps": 1, "covered": 0},
+    }
