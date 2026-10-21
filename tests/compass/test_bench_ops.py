@@ -265,34 +265,64 @@ def test_each_placement_keeps_its_own_forward_context_and_metadata():
         assert snap.context.positions.tolist() == [2 * p] * 2
 
 
-def test_a_shape_the_pool_cannot_place_refuses_its_leaves_and_the_next_is_measured(
-    monkeypatch,
-):
+def _measuring(monkeypatch):
+    """A stand-in runner `measure` builds, a rule that refuses a batch of two
+    rows, and two points of two leaves each: two rows, then four. A leaf times
+    1 ns, with or without a device to time it on."""
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
     runner = _Runner()
     runner.exit = lambda: runner.batches.append("exit")
-    monkeypatch.setattr(ops, "_runner", lambda config, rank: runner)
-    monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda config: None)
 
-    def point(self, _rule, shape, context, found):
-        if shape.seqs == 2:
+    def batch(view, block, slot):
+        if len(view["rows"]) == 2:
             raise ValueError("no room for 2 rows")
-        return [{"shape": str(shape), "leaf": sig} for sig in found]
+        return len(view["rows"]), slot
 
-    monkeypatch.setattr(ops.Stub, "point", point)
+    placed = SimpleNamespace(block_size=16, batch=batch)
+    monkeypatch.setattr(ops, "_runner", lambda config, rank: runner)
+    monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda c: placed)
     x = ("self", _t([2, 3], "activation"))
     found = ops.leaves(
-        _graph(_leaf("aten.add.Tensor", x), _leaf("aten.mul.Tensor", x))["region"]
+        _graph(_leaf("aten.neg.default", x), _leaf("aten.abs.default", x))["region"]
     )
+    return runner, [(decode(2), 20, found), (decode(4), 20, found)]
 
-    got = ops.measure(None, [(decode(2), 20, found), (decode(4), 20, found)], 10_000)
 
-    assert [(r["op"], r["refused"]) for r in got[:2]] == [
-        ("aten.add.Tensor", "ValueError: no room for 2 rows"),
-        ("aten.mul.Tensor", "ValueError: no room for 2 rows"),
+def test_a_shape_the_rule_refuses_refuses_its_leaves_and_the_next_is_measured(
+    monkeypatch, tmp_path
+):
+    runner, todo = _measuring(monkeypatch)
+    journal = tmp_path / "points.jsonl"
+    monkeypatch.setenv(ops.JOURNAL, str(journal))
+
+    got = ops.measure(None, todo, 10_000)
+
+    lines = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert [r.get("refused") for r in lines] == [r.get("refused") for r in got]
+    assert [(r["shape"], r["op"], r.get("refused")) for r in got] == [
+        (str(decode(2)), "aten.neg.default", "ValueError: no room for 2 rows"),
+        (str(decode(2)), "aten.abs.default", "ValueError: no room for 2 rows"),
+        (str(decode(4)), "aten.neg.default", None),
+        (str(decode(4)), "aten.abs.default", None),
     ]
-    assert {r["shape"] for r in got[:2]} == {str(decode(2))}
-    assert got[2:] == [{"shape": str(decode(4)), "leaf": sig} for sig in found]
-    assert runner.batches == ["exit"]
+    assert {b[0] for b in runner.batches[:-1]} == {4}
+    assert runner.batches[-1] == "exit"
+
+
+def test_an_error_in_atom_s_forward_fails_measure_with_that_error(monkeypatch):
+    runner, todo = _measuring(monkeypatch)
+
+    def forward(batch):
+        runner.batches.append(batch)
+        raise ValueError("cannot begin: owner is active")
+
+    runner.forward = forward
+
+    with pytest.raises(ValueError, match="cannot begin: owner is active") as raised:
+        ops.measure(None, todo, 10_000)
+    assert raised.value.__notes__ == [f"measuring {decode(4)} at context 20"]
+    assert runner.batches == [(4, 0), "exit"]
 
 
 class _Launches:

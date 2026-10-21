@@ -9,8 +9,9 @@ rows (``padded=False``, the run file's ``padding: none``), and any other step
 as a prefill of its query tokens over its rows; a data-parallel step also at
 the rows its MoE gathers over the group (`moe_rows`). `graph(phase, tokens,
 seqs, output[, gathered])` gives the region of the `op_graph` captured at that
-shape, as `capture.graph.to_json` writes it, or None when there is none,
-`gathered` stated for a data-parallel step. `output` is whether the step
+shape, as `capture.graph.to_json` writes it, or when there is none None or
+the text its refusal adds (`forward.missed`), `gathered` stated for a
+data-parallel step. `output` is whether the step
 samples, as ATOM's `ScheduledBatch.produces_output` says: a step with a decode
 row does, and a prefill step when the view says so, which it does when any row
 is a final chunk.
@@ -240,13 +241,16 @@ class OpGraphBackend(CostBackend):
                         "produces output, so whether it runs the LM head and the "
                         "sampler"
                     )
-                elif (region := self.graph(*shape, output, *g)) is not None:
+                elif isinstance(region := self.graph(*shape, output, *g), dict):
                     return "{} T={} B={}".format(*shape) + at + none, region
                 else:
                     reason = (
                         "no op_graph holds a {} step of {} tokens over {} sequences"
-                        "{}{}; compass trace ops captures one".format(
-                            *shape, "".join(f" gathering {n} rows" for n in g), none
+                        "{}{}{}; compass trace ops captures one".format(
+                            *shape,
+                            "".join(f" gathering {n} rows" for n in g),
+                            none,
+                            region or "",
                         )
                     )
         raise CostRefused(view, [Refusal(SOURCE, reason)])

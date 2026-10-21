@@ -18,6 +18,7 @@ from test_capture_v4_pro import DPA_TP8, EP8, MOE, MORI, _rows, capture, trace
 from test_dp_step_max import prefill, runner
 from test_moe_gather_rows import decode
 from test_op_graph import by_name, g
+from test_op_graph_arch import ENGINE
 from test_op_work import ONE, leaf, t
 from test_op_work_v4 import close, experts, moe
 from test_work import SPEC
@@ -64,6 +65,7 @@ def config(request, tmp_path):
         parallel_config=SimpleNamespace(data_parallel_size=DP),
         enable_expert_parallel=request.param,
         enforce_eager=True,
+        **ENGINE,
     )
 
 
