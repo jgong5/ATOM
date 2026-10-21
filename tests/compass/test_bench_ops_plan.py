@@ -14,12 +14,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_artifact_store import CONDITIONS, GATES, stanza
 from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
+from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 
 from atom.compass import ir
-from atom.compass.artifacts import ArtifactStore
+from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.bench import ops
-from atom.compass.capture.forward import decode
+from atom.compass.capture.forward import decode, structure
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
 from atom.utils import forward_context as fctx
@@ -32,7 +34,7 @@ CONFIG = SimpleNamespace(
 )
 
 
-def _graph_at(store, config, shape):
+def _graph_at(store, config, shape, arch=None):
     rows = shape.tokens if shape.phase == "prefill" else shape.seqs
     attn = _leaf(
         "aiter.attn",
@@ -45,8 +47,9 @@ def _graph_at(store, config, shape):
 
 
 def _bench(fn, config, todo, llc):
-    """`measure` as a device would time each point: the GEMM by its tokens, the
-    attention by its context, each kernel switching at its threshold."""
+    """`measure` as a device would time each point, a microsecond per unit: the
+    GEMM by its tokens, the attention by its context, each kernel switching at
+    its threshold."""
     assert fn is ops.measure
     _bench.calls += 1
     got = []
@@ -61,7 +64,7 @@ def _bench(fn, config, todo, llc):
                 n, kernel = 1, "gemm"
             got.append(
                 {"shape": str(shape), "context": context, "op": op["op"], "leaf": sig}
-                | {"kernels": [kernel], "cold_ns": float(n)}
+                | {"kernels": [kernel], "cold_ns": n * 1e3}
             )
     return got
 
@@ -181,7 +184,7 @@ def test_coverage_counts_a_step_only_when_every_leaf_sits_in_one_kernel_s_band(
     )
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert (report["steps"], report["covered"]) == (6, 2)
     assert report["by phase"] == {
@@ -244,7 +247,7 @@ def test_a_plan_measures_prefill_attention_over_cached_tokens_and_coverage_reads
     )
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["by phase"] == {"prefill": {"steps": 4, "covered": 2}}
     assert report["left out, by leaf kind"] == {
@@ -258,7 +261,17 @@ def _moving_bench(fn, config, todo, llc):
     got = _bench(fn, config, todo, llc)
     for r in got:
         if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
-            r["cold_ns"] += r["context"] or 0
+            r["cold_ns"] += (r["context"] or 0) * 1e3
+    return got
+
+
+def _two_mode_bench(fn, config, todo, llc):
+    """`_bench` with prefill attention a short kernel that reads in one of two
+    modes, 0.4 us apart, past `CONTEXT_MOVES` between fresh and cached rows."""
+    got = _bench(fn, config, todo, llc)
+    for r in got:
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
+            r["cold_ns"] = 3300.0 if r["context"] else 3700.0
     return got
 
 
@@ -267,6 +280,8 @@ def _moving_bench(fn, config, todo, llc):
     [
         # one kernel and time: only the far end, and round 2 densifies
         (_bench, {None, 8000}, 2, {("aiter.gemm", None)}),
+        # its two modes, under the floor: as one time
+        (_two_mode_bench, {None, 8000}, 2, {("aiter.gemm", None)}),
         # its time grows: round 2 is the ladder alone, densifying after it
         (
             _moving_bench,
@@ -304,7 +319,7 @@ def test_a_plan_ladders_cached_tokens_only_for_a_prefill_kind_that_moves_there(
     )
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["by phase"] == {"prefill": {"steps": 2, "covered": covered}}
 
@@ -384,11 +399,78 @@ def test_coverage_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_
     graded = _records(tmp_path / "graded", ([[1, 3000, True]], 2))
     store, root, _, _ = bench
 
-    report = ops.coverage(store, root, CONFIG, [graded], records)
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["left out, by leaf kind"] == {
         "aiter.attn": {"outside the measured range": 1}
     }
+
+
+def test_a_decode_family_halves_either_side_of_a_point_off_its_neighbours_line():
+    def family(times, kernels="kkkk", shape="decode B=2"):
+        return [
+            (at, (k,), {"shape": shape, "context": at, "cold_ns": ns})
+            for (at, ns), k in zip(times, kernels)
+        ]
+
+    families = {
+        "line": family([(1000, 10.0), (2000, 20.0), (3000, 30.0)]),
+        # 26 at 2000 against 20 on the line from 1000 to 3000; 30 at 3000 is on
+        # the line from 2000 to 4000.
+        "bent": family([(1000, 10.0), (2000, 26.0), (3000, 30.0), (4000, 34.0)]),
+        # The line prices 1000 at 1051: 5.1% over 1000, 4.9% over 1051.
+        "under": family([(1000, 1000.0), (2000, 1000.0), (3000, 1102.0)]),
+        # The same bend across a kernel switch halves only the switch.
+        "switch": family([(1000, 10.0), (2000, 26.0), (3000, 30.0)], "kkj"),
+    }
+    families = {json.dumps(["decode B=2", sig]): f for sig, f in families.items()}
+    prefill = json.dumps(["prefill", None, "leaf"], sort_keys=True)
+    families[prefill] = family(
+        [(10, 1.0), (20, 9.0), (30, 3.0)], shape="prefill T=10 B=1"
+    )
+
+    want = ops._densify(families, set())
+
+    assert {at: {json.loads(f)[1] for f in fams} for at, fams in want.items()} == {
+        (decode(2), 1500): {"bent", "under"},
+        (decode(2), 2500): {"bent", "under", "switch"},
+    }
+
+
+def test_a_plan_halves_decode_attention_until_no_point_bends_off_its_neighbours(
+    bench, tmp_path, monkeypatch
+):
+    def steeper(fn, config, todo, llc):
+        # Decode attention turns three times steeper at 3500 tokens, one kernel.
+        got = _bench(fn, config, todo, llc)
+        for r in got:
+            if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
+                r["cold_ns"] += 2e3 * max(r["context"] - 3500, 0)
+        return got
+
+    monkeypatch.setattr(ops, "_child", steeper)
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[1, 12000, True]], 1),
+    )
+
+    records = _plan(bench, tmp_path, population)
+
+    by = {}
+    for r in records:
+        if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
+            by.setdefault(r["shape"], []).append(
+                (r["context"], r["kernels"], r["cold_ns"])
+            )
+    for points in by.values():
+        points.sort()
+        for p, q, s in zip(points, points[1:], points[2:]):
+            line = p[2] + (s[2] - p[2]) * (q[0] - p[0]) / (s[0] - p[0])
+            if p[1] == q[1] == s[1] and s[0] - p[0] > 2:
+                assert abs(line - q[2]) <= 0.05 * q[2], (p, q, s)
+    at = {c for c, *_ in by["decode B=1"]}
+    assert any(3000 < c < 4125 for c in at) and {4999, 5000} <= at
 
 
 @pytest.mark.parametrize(
@@ -424,7 +506,7 @@ def test_a_prefill_family_keeps_its_rows_unless_its_points_show_they_do_not_move
 ):
     def point(shape, context, ns, kernel):
         record = {"shape": shape, "context": context, "op": "lin", "leaf": "{}"}
-        return record | {"cold_ns": ns, "kernels": [kernel]}
+        return record | {"cold_ns": ns * 1e3, "kernels": [kernel]}
 
     # Flat over decode context, so the decode check reads it context-independent.
     records = [point("decode B=2", c, 10.0, "d") for c in (1, 9)]
@@ -492,7 +574,7 @@ def test_a_ladder_keeps_values_a_step_apart_and_the_largest():
 def test_a_kind_depends_on_context_when_its_times_or_its_kernels_move():
     def point(op, context, ns, kernel):
         record = {"shape": "decode B=2", "context": context, "op": op, "leaf": op}
-        return record | {"cold_ns": ns, "kernels": [kernel]}
+        return record | {"cold_ns": ns * 1e3, "kernels": [kernel]}
 
     records = [
         *(point("state", c, ns, "s") for c, ns in ((1, 10.0), (9, 20.0))),
@@ -510,6 +592,99 @@ def test_an_integer_activation_indexes_a_dimension_of_one():
     index = ops._random(spec, "cpu")
 
     assert torch.zeros(1, 3)[index].shape == (64, 3)
+
+
+def _publish_graph(store, config, arch, shape):
+    """A graph of `shape` keyed on `arch`, its one leaf named for the arch."""
+    key = Key.of(
+        Kind.OP_GRAPH,
+        structure=structure(config, shape.phase, device=arch),
+        shape=str(shape),
+    )
+    leaf = _leaf(f"aiter.{arch}", ("x", _t([shape.seqs, 8], "activation")))
+    store.publish(
+        key,
+        provenance=stanza("compass trace ops"),
+        topology=Topology(),
+        conditions=CONDITIONS,
+        gates=GATES,
+        members={
+            member_name("graph", ops.RANK, "json"): json.dumps(
+                _graph(leaf, layers=1)
+            ).encode()
+        },
+    )
+
+
+@pytest.mark.parametrize("held", [("gfx942", "gfx950"), ("gfx942",)])
+def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
+    tmp_path, monkeypatch, held, model_config  # noqa: F811
+):
+    store = ArtifactStore(str(tmp_path / "store"))
+    for arch in held:
+        _publish_graph(store, model_config, arch, decode(1))
+
+    def no_gpu(*args, **kwargs):
+        raise RuntimeError("No HIP GPUs are available")
+
+    traced = []
+
+    def trace(fn, argv):
+        """`trace ops` as the capture publishes: on the arch `--arch` names."""
+        traced.append(argv[argv.index("--arch") + 1])
+        _publish_graph(store, model_config, traced[-1], decode(1))
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", no_gpu)
+    monkeypatch.setattr(
+        "atom.compass.bench.measure.atom_config", lambda a: model_config
+    )
+    monkeypatch.setattr(ops, "_child", trace)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "plan.jsonl").write_text("")
+    device = {"index": 0, "name": "AMD Instinct MI355X", "arch": "gfx950"}
+    (out / "run.json").write_text(json.dumps({"device": [device]}))
+    graded = _records(tmp_path / "graded", ([[1, 100, True]], 1))
+
+    argv = ["--coverage", graded, "--store", str(store.root), "--out", str(out)]
+    report = ops._coverage_main(argv, [])
+
+    assert report["left out, by leaf kind"] == {
+        "aiter.gfx950": {"no measured point": 1}
+    }
+    assert traced == ([] if "gfx950" in held else ["gfx950"])
+
+
+@pytest.mark.parametrize("mode", ["--width", "--plan", "--coverage"])
+def test_measure_ops_without_enforce_eager_refuses_by_name_and_traces_nothing(
+    tmp_path, monkeypatch, mode, model_config  # noqa: F811
+):
+    graph_mode = SimpleNamespace(**vars(model_config))
+    graph_mode.enforce_eager, graph_mode.tp_world_size = False, 1
+    graph_mode.compilation_config = SimpleNamespace(level=0)
+    traced = []
+    monkeypatch.setattr("atom.compass.bench.measure.atom_config", lambda a: graph_mode)
+    monkeypatch.setattr("atom.compass.drive.gpu.hip_visible", lambda g: "0")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(ops, "_child", lambda fn, argv: traced.append(argv))
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "plan.jsonl").write_text("")
+    (out / "run.json").write_text(json.dumps({"device": [{"arch": "gfx950"}]}))
+    graded = _records(tmp_path / "graded", ([[1, 100, True]], 1))
+    common = ["--store", str(tmp_path / "store"), "--out", str(out)]
+    argv = {
+        "--width": ["--width", "1", "--context", "100"],
+        "--plan": ["--plan", graded],
+        "--coverage": ["--coverage", graded],
+    }[mode] + common
+    if mode != "--coverage":
+        argv += ["--llc-mib", "256", "--gpu", "0"]
+
+    with pytest.raises(ValueError, match="measure with --enforce-eager"):
+        ops.main([*argv, "--", "--model", model_config.model, "--level", "0"])
+
+    assert traced == []
 
 
 def _dies(*finished):

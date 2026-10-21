@@ -170,9 +170,11 @@ def test_fit_ops_publishes_its_points_key_and_their_held_out_error(measured, tmp
 def test_a_line_holding_an_error_over_5pct_either_way_is_declined_with_its_reason():
     # held out along B, B = 4 reads -4% at context 1024 and -20% at 2048;
     # along context at B = 2, context 2048 reads +25%
-    points = [_point(2, 10.0), _point(4, 12.5), _point(8, 16.0)]
-    points += [_point(b, ns, context=2048) for b, ns in ((2, 20), (4, 30), (8, 32))]
-    points += [_point(2, 40.0, context=3072)]
+    points = [_point(2, 10e3), _point(4, 12.5e3), _point(8, 16e3)]
+    points += [
+        _point(b, ns, context=2048) for b, ns in ((2, 20e3), (4, 30e3), (8, 32e3))
+    ]
+    points += [_point(2, 40e3, context=3072)]
     params = ops.fit(points)
     rows = ops.held_out(params)
     (f,) = params["families"].values()
@@ -182,6 +184,32 @@ def test_a_line_holding_an_error_over_5pct_either_way_is_declined_with_its_reaso
         ["B", [2048], "B = 4 reads -20.0% off its neighbours"],
     ]
     assert ops.summary(rows)["decode aiter.gemm"]["max_error"] == pytest.approx(0.04)
+
+
+@pytest.mark.parametrize(
+    "rows, contexts, declined",
+    [
+        ((2, 2, 2), (511, 512, 513), []),
+        ((2, 2, 2), (510, 512, 514), ["context = 512 reads +10.0%"]),
+        ((2, 2, 2), (511, 512, 514), ["context = 512 reads +6.7%"]),
+        ((2, 2, 2), (510, 512, 513), ["context = 512 reads +13.3%"]),
+        ((1, 2, 3), (512, 512, 512), []),
+    ],
+)
+def test_fit_ops_holds_out_no_point_between_neighbours_one_apart(
+    rows, contexts, declined, measured, tmp_path
+):
+    # one kernel stepping just above the middle point, which its neighbours price
+    # 6.7% to 13.3% high unless both are one away along that dimension
+    points = zip(rows, contexts, (1e4, 1e4, 12e3))
+    d, _ = measured("m", [_point(b, ns, context=c) for b, c, ns in points])
+
+    got = _fit(tmp_path / "fit", tmp_path / "store", d)
+
+    (f,) = got["params"]["families"].values()
+    assert [why.split(" off")[0] for _, _, why in f["declined"]] == declined
+    held = [r["at"] for r in got["report"]["held_out"]]
+    assert held == ([[2, 512]] if declined else [])
 
 
 @pytest.mark.parametrize(
@@ -210,3 +238,90 @@ def test_points_naming_two_price_lists_refuse(measured, tmp_path):
     with pytest.raises(SystemExit, match="^compass fit ops: the points name 2 price"):
         _fit(tmp_path / "fit", tmp_path / "store", a, b)
     assert not (tmp_path / "store" / "price_list").exists()
+
+
+def _prefill(t, b, ns, op="aiter.gemm", context=None, rows=None):
+    """A prefill point of `t` tokens over `b` rows, its GEMM over the tokens."""
+    point = _point(b, ns, context=context) | {"shape": f"prefill T={t} B={b}"}
+    point |= {"op": op, "leaf": _leaf(t, 128)}
+    return point | ({"rows": rows} if rows else {})
+
+
+def test_a_kind_that_does_not_move_with_context_runs_over_the_counts_it_follows():
+    # the GEMM reads within 10% at two contexts of each width, so the decode
+    # points at one B are one point; the prefill points at one T too, B aside
+    points = [_point(2, 100e3), _point(2, 104e3, context=2048)]
+    points += [_point(8, 160e3), _point(8, 160e3, context=2048)]
+    points += [_prefill(64, 1, 300e3), _prefill(64, 2, 320e3), _prefill(128, 1, 5e5)]
+
+    assert _families(points) == [
+        (["B"], [[[2], 102e3], [[8], 160e3]]),
+        (["T"], [[[64], 310e3], [[128], 5e5]]),
+    ]
+
+
+def test_a_decode_point_sits_at_its_longest_row_a_prefill_at_its_rows_mean_cached():
+    # the decode GEMM moves with context; the prefill kind with cached tokens
+    points = [_point(2, 100e3)]
+    points += [
+        _point(2, 200e3, context=3000) | {"rows": [[1, 3000, True], [1, 1000, True]]}
+    ]
+    points += [_prefill(64, 1, 300e3, "attn"), _prefill(64, 1, 310e3, "attn", 0)]
+    points += [_prefill(64, 1, 400e3, "attn", 512, rows=[[64, 64 + 512, False]])]
+
+    assert _families(points) == [
+        (["B", "context"], [[[2, 1024], 100e3], [[2, 3000], 200e3]]),
+        (["T", "B", "context"], [[[64, 1, 0], 305e3], [[64, 1, 512], 400e3]]),
+    ]
+
+
+def test_a_prefill_kind_reads_its_own_prefill_points_on_context_first():
+    # flat over a decode's context, yet twice the time past 1024 cached tokens
+    points = [_point(2, 100e3), _point(2, 100e3, context=2048)]
+    points += [_prefill(64, 1, 300e3, context=0), _prefill(64, 1, 6e5, context=1024)]
+
+    assert _families(points) == [
+        (["B"], [[[2], 100e3]]),
+        (["T", "B", "context"], [[[64, 1, 0], 300e3], [[64, 1, 1024], 6e5]]),
+    ]
+
+
+def test_a_prefill_kind_its_rows_move_runs_over_its_rows():
+    # flat in cached tokens, yet twice the time over two rows of one T
+    points = [_prefill(64, 1, 300e3, context=0), _prefill(64, 1, 300e3, context=1024)]
+    points += [_prefill(64, 2, 6e5, context=0)]
+
+    assert _families(points) == [(["B"], [[[1], 300e3], [[2], 6e5]])]
+
+
+def test_a_stated_gathered_count_is_a_dimension_its_points_kept_apart():
+    # an MoE leaf over the rows the group gathers, at two G of each T
+    points = [
+        _prefill(t, 1, ns)
+        | {"shape": f"prefill T={t} B=1 G={g}", "leaf": _leaf(g, 128)}
+        for t, g, ns in (
+            (64, 128, 1e5),
+            (64, 256, 2e5),
+            (128, 256, 21e4),
+            (128, 512, 4e5),
+        )
+    ]
+
+    assert _families(points) == [
+        (
+            ["T", "B", "G", "context"],
+            [
+                [[64, 1, 128, 0], 1e5],
+                [[64, 1, 256, 0], 2e5],
+                [[128, 1, 256, 0], 21e4],
+                [[128, 1, 512, 0], 4e5],
+            ],
+        )
+    ]
+
+
+def test_points_at_one_coordinate_that_launched_other_kernels_refuse():
+    points = [_point(2, 10.0), _point(2, 10.0, "x") | {"rows": [[1, 1024, True]] * 2}]
+
+    with pytest.raises(ValueError, match=r"launched \['k'\] and other kernels at"):
+        ops.fit(points)

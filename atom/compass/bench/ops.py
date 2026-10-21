@@ -68,12 +68,14 @@ remainders among them, one of a kind that depends on context at each at the
 most cached tokens of steps of its rows, and over a ladder of them once those
 points and the fresh ones show the kind still does; then the point halfway
 between two neighbours of a family, or of a prefill leaf's token count over
-cached tokens, that launched different kernels, until they are adjacent. DIR
-gets each round's ops.jsonl in `round<n>`, and every point held in plan.jsonl.
+cached tokens, that launched different kernels or, at a decode width, either
+side of a point off the line through theirs (`_densify`), until they are
+adjacent. DIR gets each round's ops.jsonl in `round<n>`, and every point held
+in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
-covers (`coverage`), and prints the count by phase and why each leaf kind
-left the rest out.
+covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
+and prints the count by phase and why each leaf kind left the rest out.
 """
 
 import argparse
@@ -181,6 +183,7 @@ def main(argv: list[str]) -> None:
             f"--level {config.compilation_config.level} compiles the model, whose "
             "forward the bench stubs; measure at --level 0"
         )
+    _eager(config)
     store = ArtifactStore(args.store)
     todo = [
         (s, args.context, leaves(graph(store, config, s)["region"])) for s in shapes
@@ -256,15 +259,17 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
-def graph(store, config, shape) -> dict:
-    """The `op_graph` `trace ops` published for `config` at `shape` on this GPU's
-    arch, of a step that produces output, as JSON: a prefill that produces none
-    runs the same leaves less the LM head and the sampler, so this graph's
-    points cover both."""
+def graph(store, config, shape, arch=None) -> dict:
+    """The `op_graph` `trace ops` published for `config` at `shape` on `arch`,
+    this GPU's when it is None, of a step that produces output, as JSON: a
+    prefill that produces none runs the same leaves less the LM head and the
+    sampler, so this graph's points cover both."""
     from atom.compass.capture.forward import structure
 
     key = Key.of(
-        Kind.OP_GRAPH, structure=structure(config, shape.phase), shape=str(shape)
+        Kind.OP_GRAPH,
+        structure=structure(config, shape.phase, device=arch),
+        shape=str(shape),
     )
     return json.loads(store.read(key).read_member("graph", RANK, "json"))
 
@@ -859,6 +864,15 @@ LADDER_STEP = 1.25
 #: across rows, over the largest, past which its kind depends on them; a
 #: repeat's spread stays within 4%.
 CONTEXT_MOVES = 0.10
+#: How far the line through a decode point's two neighbours may price it off its
+#: measured cold time, over that time as `fit ops` reads a held-out error, when
+#: the three launched one kernel, before the plan halves the gaps either side.
+BENDS = 0.05
+#: The spread of a leaf's cold times across contexts, or a prefill leaf's
+#: across rows, in ns, at or under which its kind does not depend on them
+#: whatever its share: one 3.5 us elementwise kernel on MI308X reads in two
+#: modes about 0.5 us apart, either one at any shape.
+CONTEXT_FLOOR_NS = 1000
 
 
 def plan(store, key, config, run, args, command: str, out: Path) -> None:
@@ -968,13 +982,27 @@ def _coverage_main(argv: list[str], atom_args: list[str]) -> dict:
     p.add_argument("--store", required=True, help="the artifact store's root")
     p.add_argument("--out", required=True, help="the --plan run's --out")
     args = p.parse_args(argv)
-    lines = (Path(args.out) / "plan.jsonl").read_text().splitlines()
+    config = atom_config(atom_args)
+    _eager(config)
+    out = Path(args.out)
+    lines = (out / "plan.jsonl").read_text().splitlines()
     records = [json.loads(line) for line in lines]
     store = ArtifactStore(args.store)
-    return coverage(store, args.store, atom_config(atom_args), args.coverage, records)
+    arch = json.loads((out / "run.json").read_text())["device"][0]["arch"]
+    return coverage(store, args.store, config, args.coverage, records, arch)
 
 
-def coverage(store, root, config, names, records) -> dict:
+def _eager(config) -> None:
+    """Refuse `config` unless ATOM runs it eager: `trace ops` captures and keys
+    every `op_graph` eager, so a graph-mode key names no graph it publishes."""
+    if not config.enforce_eager:
+        raise ValueError(
+            "ATOM's arguments run the model in CUDA graphs, and trace ops "
+            "publishes eager op_graphs only; measure with --enforce-eager"
+        )
+
+
+def coverage(store, root, config, names, records, arch) -> dict:
     """How the measured points among `records` cover the steps of the record
     directories `names`: the steps and those covered by phase, and per leaf
     kind the steps it left out by why. A step is covered when each leaf of its
@@ -982,7 +1010,7 @@ def coverage(store, root, config, names, records) -> dict:
     decode leaf of a kind that depends on context over its rows' lowest to
     highest context (`_rows`), any other decode leaf at its width, a prefill
     leaf at its tokens, and one of a kind that depends on context over its
-    rows' cached tokens too (`_bracket_cached`)."""
+    rows' cached tokens too (`_bracket_cached`). The graphs are `arch`'s."""
     from atom.compass.capture import population_steps
 
     steps = list(population_steps(names))
@@ -993,7 +1021,7 @@ def coverage(store, root, config, names, records) -> dict:
         if cut := _cut(fam):
             cuts[cut[0]][cut[1]] = axes[fam]
     graphs, report, out = {}, defaultdict(Counter), defaultdict(Counter)
-    _load(store, config, root, {s for s, _ in steps}, graphs)
+    _load(store, config, root, {s for s, _ in steps}, graphs, arch)
     families = {
         s: [
             (op["op"], *_family(s, None, op["op"], sig, dependent))
@@ -1108,7 +1136,8 @@ def _cut(fam: str):
 
 def _dependent(records) -> dict:
     """Whether each leaf kind timed at two contexts of one shape depends on
-    context: its kernels or its cold times differ there. A decode kind, read
+    context: its kernels differ there, or its cold times by more than
+    `CONTEXT_MOVES` of the largest and `CONTEXT_FLOOR_NS`. A decode kind, read
     at two row contexts, is keyed by its name; a prefill kind, read fresh and
     over cached tokens, by ``("prefill", name)``. Keyed ``("rows", name)``,
     whether a prefill kind timed at two row counts of one token count and
@@ -1128,7 +1157,8 @@ def _dependent(records) -> dict:
         if len(points) > 1:
             cold = [p["cold_ns"] for p in points]
             kernels = {tuple(p["kernels"]) for p in points}
-            moved = max(cold) - min(cold) > CONTEXT_MOVES * max(cold)
+            spread = max(cold) - min(cold)
+            moved = spread > max(CONTEXT_MOVES * max(cold), CONTEXT_FLOOR_NS)
             kinds[kind] = kinds.get(kind, False) or moved or len(kernels) > 1
     return kinds
 
@@ -1178,8 +1208,9 @@ def _band(ats, lo, hi) -> slice | None:
 
 def _densify(families, tried: set) -> dict:
     """The point halfway between each two neighbours of a family, or of a
-    prefill leaf's token count over cached tokens (`_cut`), that launched
-    different kernels and lie more than one apart, unless `tried`."""
+    prefill leaf's token count over cached tokens (`_cut`), more than one
+    apart, unless `tried`, that launched different kernels or, in a decode
+    family, lie either side of a point `_bent` off the line through theirs."""
     from atom.compass.capture.forward import prefill
 
     across = defaultdict(list)
@@ -1190,9 +1221,10 @@ def _densify(families, tried: set) -> dict:
     want = defaultdict(set)
     for fam, points in [*families.items(), *across.items()]:
         points = sorted(points, key=lambda p: p[0])
+        bent = _bent(points) if points[0][2]["shape"].startswith("decode") else ()
         for (a, ka, record), (b, kb, _) in itertools.pairwise(points):
             mid = (a + b) // 2
-            if ka == kb or b - a < 2 or (fam, mid) in tried:
+            if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
                 continue
             tried.add((fam, mid))
             shape = _shape(record["shape"])
@@ -1206,7 +1238,20 @@ def _densify(families, tried: set) -> dict:
     return want
 
 
-def _load(store, config, root, shapes, graphs: dict) -> None:
+def _bent(points) -> set:
+    """The lower ends of the gaps either side of each middle point of three
+    neighbours that launched one kernel and whose cold time the line through
+    the outer two's prices more than `BENDS` off, over that cold time."""
+    ends = set()
+    for p, q, r in zip(points, points[1:], points[2:]):
+        y = [point[2]["cold_ns"] for point in (p, q, r)]
+        line = y[0] + (y[2] - y[0]) * (q[0] - p[0]) / (r[0] - p[0])
+        if p[1] == q[1] == r[1] and abs(line - y[1]) > BENDS * y[1]:
+            ends |= {p[0], q[0]}
+    return ends
+
+
+def _load(store, config, root, shapes, graphs: dict, arch=None) -> None:
     """Each of `shapes`' leaves into `graphs`, its op_graph captured first when
     the store has none."""
     from atom.compass.artifacts import ArtifactRefusal
@@ -1214,23 +1259,23 @@ def _load(store, config, root, shapes, graphs: dict) -> None:
     missing = []
     for shape in sorted(shapes - graphs.keys()):
         try:
-            graphs[shape] = leaves(graph(store, config, shape)["region"])
+            graphs[shape] = leaves(graph(store, config, shape, arch)["region"])
         except ArtifactRefusal:
             missing.append(shape)
     if missing:
-        _capture(config, missing, root)
+        _capture(config, missing, root, arch)
     for shape in missing:
-        graphs[shape] = leaves(graph(store, config, shape)["region"])
+        graphs[shape] = leaves(graph(store, config, shape, arch)["region"])
 
 
-def _capture(config, shapes, root) -> None:
+def _capture(config, shapes, root, arch=None) -> None:
     """`trace ops` of `shapes` into the store at `root`, in a process of its
     own that sees no GPU."""
     from atom.compass import capture
     from atom.compass.capture.forward import device_arch
 
     argv = ["--model", config.model, "--tp", str(config.tensor_parallel_size)]
-    argv += ["--arch", device_arch()]
+    argv += ["--arch", arch or device_arch()]
     for s in shapes:
         argv += ["--prefill", str(s.tokens)] if s.phase == "prefill" else ["--width"]
         argv.append(str(s.seqs))
