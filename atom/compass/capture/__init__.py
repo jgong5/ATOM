@@ -14,8 +14,11 @@ rows, and under DP the rows the step's MoE gathered over the group, its line's
 into `Repeat` and forked streams into `Par` (`graph`).
 
 An `op_graph` is keyed by structure (`forward.structure`: the model's
-architecture and config.json digest, `--arch`, the TP width, the DP and EP widths when
-set, the phase, the mode and whether the step produces output) and by shape, which
+architecture and config.json digest, `--arch`, the engine config a step law is
+keyed by less its ladder, which holds ATOM's engine arguments and this
+process's performance environment (`run.step_grid.keyed`), the TP width, the DP
+and EP widths when set, the phase, the mode and whether the step produces
+output) and by shape, which
 names the rows a DP group's MoE gathers only off its default, every rank at
 this one's tokens (`forward.Shape`):
 a prefill shape is published twice, as a middle chunk, which samples nothing,
@@ -27,6 +30,8 @@ graph per arch of one structure and shape. Its members are
 of a device and the operators it left out of the graph, each with why. A TP
 group's ranks run one graph, so rank 0's is the entry's. The declarations are
 process-global, so a process runs one capture, of every shape it was given.
+Trace in the environment of the run or bench that reads the graphs: a reader in
+another misses them, and its refusal names each field that differs.
 """
 
 import argparse
