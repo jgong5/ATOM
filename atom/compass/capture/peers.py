@@ -38,8 +38,6 @@ MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp"
 def _declared(recorder, name, fn, kind=ir.NodeKind.DECLARED, stated=None):
     """`fn` as one op `name` of `kind`, its arguments as called and `stated`;
     what it dispatches inside is not recorded."""
-    from .forward import _atom_frames
-
     signature = inspect.signature(fn)
 
     def call(*args, **kwargs):
@@ -51,7 +49,7 @@ def _declared(recorder, name, fn, kind=ir.NodeKind.DECLARED, stated=None):
             slots.pop("group", None)
             slots.update(stated or {})
             outs = [t for t in _pytree.tree_leaves(out) if isinstance(t, torch.Tensor)]
-            recorder.add(name, kind, slots, outs, None, _atom_frames())
+            recorder.add(name, kind, slots, outs, None)
         return out
 
     return call

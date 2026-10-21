@@ -471,6 +471,10 @@ MOE = "atom.model_ops.moe:"
 MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp."
 V4_INDICES = "atom.model_ops.v4_kernels.paged_"
 V4 = "atom.model_ops.v4_kernels."
+FLYDSL = "aiter.ops.flydsl.kernels."
+#: V4's compressor: its sources and parameters read once. The KV and score
+#: state rings it reads by slot and the cache rows it writes are left out.
+COMPRESS = _only("kv_in", "score_in", "ape", "rms_weight", "state_slot_mapping")
 #: What V4's fused QK norm and RoPE writes: Q and K, each as its fp8 values
 #: with their scales and its bf16 rotary part.
 QK_OUT = ("q_nope_scale_buff", "q_rope_buff", "k_nope_scale_buff", "k_rope_buff")
@@ -490,6 +494,10 @@ EXTRACTORS = {
     "aiter._fused_qk_norm_rope_group_quant_kernel.default": _only(
         "q", "kv", "k_weight", "positions", *QK_OUT
     ),
+    FLYDSL
+    + "qk_norm_rope_quant:flydsl_qk_norm_rope_quant": _only(
+        "q", "kv", "kv_weight", "q_weight", "positions", "q_out", "kv_out"
+    ),
     "aiter._inverse_rope_group_quant_kernel.default": _only(
         "o", "positions", "x_fp8", "x_scale"
     ),
@@ -500,12 +508,12 @@ EXTRACTORS = {
     "aiter.indexer_score_topk.default": _indexer,
     "aiter.pa_sparse_prefill_fp8_opus.default": _v4_prefill,
     "aiter.mla_decode_v4_ps_asm.default": _v4_decode("Q", "qrope", "sink", "output"),
-    f"{V4}paged_decode:_sparse_attn_v4_paged_decode_asm": _v4_decode(
-        "q_packed_in", "q_rope_in", "attn_sink", out="torch.bfloat16"
+    "aiter.mla:mla_decode_fwd_v4_nm": _v4_decode("q", "qrope", "sink", "output"),
+    f"{V4}paged_decode:_sparse_attn_v4_paged_decode_triton": _v4_decode(
+        "q", "attn_sink"
     ),
-    f"{V4}fused_compress:fused_compress_attn": _only(
-        "kv_in", "score_in", "ape", "rms_weight", "state_slot_mapping"
-    ),
+    FLYDSL + "fused_compress_attn:flydsl_fused_compress_attn": COMPRESS,
+    FLYDSL + "fused_compress_attn_hca:flydsl_hca_compress_attn": COMPRESS,
     # The kernel reads only the kv and score rows write_plan names, at most
     # (1 + overlap) * ratio per sequence, so neither is counted.
     f"{V4}state_writes:update_compressor_states": _only("ape", "state_slot_mapping"),
@@ -528,8 +536,7 @@ EXTRACTORS = {
     V4_INDICES + "decode_indices:build_v4_paged_decode_indptr": _launch,
     V4_INDICES + "decode_indices:write_v4_paged_decode_indices": _launch,
     V4_INDICES + "prefill_indices:write_v4_paged_prefill_indices": _launch,
-    "atom.model_ops.attentions.deepseek_v4_attn:"
-    "DeepseekV4AttentionMetadataBuilder._build_v4_indexer_meta": _launch,
+    FLYDSL + "mqa_logits.pa_mqa_logits_fp4_prefill:compute_prefill_schedule": _launch,
     "aiter.unified_attention_with_output_base.default": _attention,
     "aiter.linear_attention_with_output_base.default": _linear_attention,
     "aiter.silu_and_mul.default": _in_place(),
@@ -544,7 +551,7 @@ EXTRACTORS = {
     "_c10d_functional.wait_tensor.default": lambda op, view, tp, kv: None,
     "atom.model_ops.layernorm:fused_qk_norm": _in_place("q", "k"),
     "atom.model_ops.triton_mrope:try_mrope_qk_fused": _in_place("q", "k"),
-    "atom.model_ops.sampler:_apply_greedy_tokens": _in_place(),
+    "aiter.ops.flydsl.topk.topk_per_row_argmax:topk_per_row_argmax": _in_place(),
     "atom.model_ops.decode_input_ids:fill_deferred_decode_ids": _in_place(),
     "atom.utils.block_convert:kv_indices_generate_triton": _kv_indices,
 }
