@@ -768,8 +768,9 @@ def _meta(spec, slot, live) -> tuple[str, torch.Tensor]:
 
 def _function(name: str):
     """The callable a leaf names: `ns.op.overload`, or a lifted `module:qualname`;
-    a functional collective waited on, as the in-place one ATOM calls is; a
-    lifted collective that takes a group on the one ATOM calls it on
+    a functional collective waited on, as the in-place one ATOM calls is, and
+    refused unless its group is one the layout gives this rank (`_on_layout`);
+    a lifted collective that takes a group on the one ATOM calls it on
     (`DP_GROUP`), refused when ATOM's group is not known."""
     if ":" in name:
         module, qualname = name.split(":")
@@ -787,9 +788,32 @@ def _function(name: str):
         if ":" in name and "group" in inspect.signature(fn).parameters:
             raise ValueError(f"{name} takes a group no leaf name maps to")
         if name.startswith("_c10d_functional."):
-            wait = torch.ops._c10d_functional.wait_tensor
+            wait, fn = torch.ops._c10d_functional.wait_tensor, _on_layout(name, fn)
             return lambda **kwargs: wait(fn(**kwargs))
     return fn
+
+
+def _on_layout(name: str, fn):
+    """`fn`, refusing a call whose `group_name` names none of the device groups
+    of aiter's coordinators on this rank, the groups of the layout ATOM's
+    collectives run on: a name only resolves on the ranks its group holds."""
+
+    def call(**kwargs):
+        from aiter.dist.parallel_state import _groups
+
+        layout = {
+            g.device_group.group_name: (key, g.ranks)
+            for key, ref in _groups.items()
+            if (g := ref())
+        }
+        if (group := kwargs["group_name"]) not in layout:
+            raise ValueError(
+                f"{name} on group_name {group!r}, which names no group the layout "
+                f"gives rank {torch.distributed.get_rank()}: {layout}"
+            )
+        return fn(**kwargs)
+
+    return call
 
 
 def _kernels(fn, kwargs) -> tuple[list[str], float]:
