@@ -172,7 +172,7 @@ def main(argv: list[str]) -> None:
     from atom.compass.bench import ranks
     from atom.compass.bench.measure import atom_config
     from atom.compass.capture.forward import decode, prefill
-    from atom.compass.drive.gpu import hip_visible, quiet
+    from atom.compass.drive.gpu import hip_visible, kfd_pid, quiet
     from atom.compass.drive.identity import identity
     from atom.compass.run.step_grid import keyed
     from atom.model_engine.arg_utils import EngineArgs
@@ -197,6 +197,7 @@ def main(argv: list[str]) -> None:
             f"{world} ranks; the op bench runs one on each"
         )
     os.environ["HIP_VISIBLE_DEVICES"] = hip_visible(args.gpu)
+    kfd_pid()  # before atom_config opens a GPU, so quiet leaves this process out
     config = atom_config(argv[cut + 1 :])
     ranks.layout(config)
     if config.compilation_config.level:
