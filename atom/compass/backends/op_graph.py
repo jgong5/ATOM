@@ -25,7 +25,8 @@ target's.
 Each leaf is one pricing unit, `max(t0, F / peak, M / BW(M), t_comm)` over its
 work (`op_work.work`): its own tensors at the captured shape, the state it
 reads at the step's rows, attention's context in `kv`, the run's KV cache
-format. A leaf that launches no kernel costs nothing. Regions compose by the
+format, the routed experts over the run's `ep` ranks. A leaf that launches
+no kernel costs nothing. Regions compose by the
 IR's joins: a `Seq` adds its items in order, a `Repeat` re-emits its body's
 prices once per instance, a `max` `Par` emits its longest branch's prices, and a
 `resource_bound` `Par` one roofline over its branches' summed work. The price
@@ -156,6 +157,7 @@ class OpGraphBackend(CostBackend):
         graph: Callable[..., dict | None],
         *,
         tp: int = 1,
+        ep: int = 1,
         dp: int = 1,
         kv: str,
         padded: bool = True,
@@ -166,6 +168,7 @@ class OpGraphBackend(CostBackend):
         self.machine = machine
         self.graph = graph
         self.tp = tp
+        self.ep = ep
         self.dp = dp
         self.kv = kv
         self.padded = padded
@@ -391,7 +394,7 @@ class OpGraphBackend(CostBackend):
         """One leaf's ``(term, seconds, stated, work, (methods, declined))`` as
         `_priced` lists it; None when it launches no kernel or refuses."""
         try:
-            w = work(leaf, view, self.tp, self.kv)
+            w = work(leaf, view, self.tp, self.kv, self.ep)
         except CostRefused as exc:
             w = tuple(exc.declined)
         except ValueError as exc:
