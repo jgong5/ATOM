@@ -13,6 +13,7 @@ import pytest
 from atom.compass import cli, run
 from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, GateState, Key, Kind
 from atom.compass.bench import ops as bench
+from atom.compass.capture.peers import MORI
 from atom.compass.fit import ops, publish
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
@@ -212,22 +213,29 @@ def test_fit_ops_holds_out_no_point_between_neighbours_one_apart(
     assert held == ([[2, 512]] if declined else [])
 
 
+BEND = "bytes = 8192 reads +10.0%"
+
+
 @pytest.mark.parametrize(
-    "rows, nbytes, declined",
+    "rows, nbytes, declined, shape, op",
     [
-        ((7, 8, 9), (7, 8, 9), []),
-        ((6, 8, 10), (6, 8, 10), ["bytes = 8192 reads +10.0%"]),
-        ((7, 8, 10), (7, 8, 9), ["bytes = 8192 reads +10.0%"]),
+        ((7, 8, 9), (7, 8, 9), [], "decode B={}", "_c10d_functional.all_"),
+        ((6, 8, 10), (6, 8, 10), [BEND], "decode B={}", "_c10d_functional.all_"),
+        ((7, 8, 10), (7, 8, 9), [BEND], "decode B={}", "_c10d_functional.all_"),
+        ((7, 8, 9), (7, 8, 9), [], "prefill T={} B=1", "_c10d_functional.all_"),
+        ((7, 8, 9), (7, 8, 9), [BEND], "decode B={}", bench.DP_GROUP[0]),
+        ((7, 8, 9), (7, 8, 9), [BEND], "prefill T={} B=1", MORI + ".dispatch"),
     ],
 )
 def test_fit_ops_holds_out_no_collective_point_between_neighbours_one_row_apart(
-    rows, nbytes, declined, measured, tmp_path
+    rows, nbytes, declined, shape, op, measured, tmp_path
 ):
-    # nbytes in rows of 1024 bytes; the last case's points move other bytes per
-    # row, so a row's bytes are not known
-    fam = json.dumps(["exchange", {"op": "_c10d_functional.all_gather"}])
+    # nbytes in rows of 1024 bytes; the third case's points move other bytes per
+    # row, so a row's bytes are not known; the DP group's and MORI's bytes are
+    # the group's gathered rows, which a step can hold between two points' rows
+    fam = json.dumps(["exchange", {"op": op}])
     points = [
-        {"shape": f"decode B={b}", "context": 1024, "op": "_c10d_functional.all_"}
+        {"shape": shape.format(b), "context": 1024, "op": op}
         | {"leaf": "{}", "exchange": [fam, n * 1024], "cold_ns": ns, "kernels": ["k"]}
         for b, n, ns in zip(rows, nbytes, (1e4, 1e4, 12e3))
     ]
