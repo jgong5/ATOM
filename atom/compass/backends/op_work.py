@@ -224,13 +224,25 @@ def _dp_exchange(op, view, tp, kv) -> Work:
     return _boundary(op) + collective(ranks, every)
 
 
+def _routing(view, tokens, k, experts, ranks):
+    """The routes and activated experts of `tokens` each routed to `k` of
+    `experts` spread over `ranks`, an expectation under uniform routing: the
+    busiest rank's expected share under expert parallelism. A DP gather's pad
+    rows (`moe_tokens` real among them) all carry token 0, so they activate
+    experts as one token."""
+    real = view.moe_tokens
+    distinct = tokens if real is None else min(tokens, real + 1)
+    groups = activated_experts(experts, k, distinct)
+    if ranks == 1:
+        return tokens * k, groups
+    return max_rank_load(tokens, k, experts, ranks), groups / ranks
+
+
 def _fused_moe(op, view, tp, kv) -> Work:
     """The routed experts on `hidden_states`' rows, each route through one
-    expert's gate-up and down products: an expectation under uniform routing.
-    Under expert parallelism `expert_mask` spans every rank's experts, of which
-    this rank holds `w1`'s, and it runs the busiest rank's expected share.
-    A DP gather's pad rows (`moe_tokens` real among them) all carry token 0,
-    so they activate experts as one token.
+    expert's gate-up and down products, routed as `_routing` says. Under
+    expert parallelism `expert_mask` spans every rank's experts, of which
+    this rank holds `w1`'s.
 
     With a nonzero `quant_type` the op quantizes `hidden_states` to the
     weights' format inside it, so both products run at that format; otherwise
@@ -242,12 +254,7 @@ def _fused_moe(op, view, tp, kv) -> Work:
     local, up = args["w1"]["shape"][:2]
     mask = args.get("expert_mask")
     ranks = mask["shape"][0] // local if mask else 1
-    real = view.moe_tokens
-    distinct = rows if real is None else min(rows, real + 1)
-    routed, groups = rows * k, activated_experts(local * ranks, k, distinct)
-    if ranks > 1:
-        routed = max_rank_load(rows, k, local * ranks, ranks)
-        groups /= ranks
+    routed, groups = _routing(view, rows, k, local * ranks, ranks)
     b = _fmt(args["w1"]["dtype"])
     a = b if args.get("quant_type") else _fmt(args["hidden_states"]["dtype"])
     flops = grouped_gemm(routed, up, hidden, groups, a, b)
@@ -262,14 +269,14 @@ def _fused_moe(op, view, tp, kv) -> Work:
 
 def _experts(act: str):
     """One of aiter's Triton grouped GEMMs of the routed experts, `x` in `act`
-    through fp4 weights `w` (each expert's `K x N` packed two to a byte), an
-    expectation under uniform routing as `_fused_moe`'s: `routing_data` states
-    the top k, the gather or scatter index one slot per route. Under expert
-    parallelism over `ep` ranks `w` holds this rank's share of `ep` times its
-    experts, and it runs the busiest rank's expected share. M is the leaf's
+    through fp4 weights `w` (each expert's `K x N` packed two to a byte),
+    routed as `_routing` says: `routing_data` states the top k, the gather or
+    scatter index one slot per route. Under expert parallelism over `ep` ranks
+    `w` holds this rank's share of `ep` times its experts. M is the leaf's
     boundary: each activated expert's weights and scales read once, and the
     rows' tensors and its output (SwiGLU's half of the gate-up, or the tokens'
-    rows a scatter reduces into) at the share of routes this rank runs."""
+    rows a scatter reduces into, unless `y_out` holds them and so they are
+    read as an argument) at the share of routes this rank runs."""
 
     def extract(op, view, tp, kv, ep) -> Work:
         args = op["args"]
@@ -282,12 +289,7 @@ def _experts(act: str):
         tokens = routes // k
         width = int(x["shape"][-1] * _size(x["dtype"]) / ELEMENT_BYTES[act])
         n = round(_bytes(w) / local / (width * ELEMENT_BYTES["fp4"]))
-        real = view.moe_tokens
-        distinct = tokens if real is None else min(tokens, real + 1)
-        routed, groups = routes, activated_experts(local * ep, k, distinct)
-        if ep > 1:
-            routed = max_rank_load(tokens, k, local * ep, ep)
-            groups /= ep
+        routed, groups = _routing(view, tokens, k, local * ep, ep)
         flops = grouped_gemm(routed, n, width, groups, act, "fp4").flops_by_format
         held = ("w", "w_scales", "bias")
         weights = sum(_bytes(t) for s in held for t in _tensors(args.get(s)))

@@ -144,6 +144,16 @@ def test_the_triton_experts_gemms_are_the_routed_experts_products(ep):
         close(got, Work({"fp8": 2 * load * flops}, held * hit + moved * share))
 
 
+def test_a_triton_down_gemm_writing_into_y_out_moves_the_same_bytes():
+    # ATOM's EP path hands the down GEMM the tokens' leading rows of mori's
+    # buffer as `y_out`: read as an argument, not written a second time.
+    op = triton("a8", 8, 16, gemm2=True)
+    alone = work(op, ONE, 1, "bf16")
+    op["args"]["y_out"] = t([8, 64], BF16)
+
+    assert work(op, ONE, 1, "bf16") == alone
+
+
 @pytest.mark.parametrize("kind, fmt", [("a16", "bf16"), ("a8", "fp8"), ("a4", "fp4")])
 def test_the_triton_experts_run_at_the_activation_format_their_kind_names(kind, fmt):
     for gemm2 in (False, True):
