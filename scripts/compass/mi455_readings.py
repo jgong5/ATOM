@@ -9,9 +9,10 @@ cannot take MI455's readings. TOKEN names an entry it published in the store
 S, keyed by `machines/mi355x-gpu45.json`. This publishes that entry's members
 again in S, at the key `machines/mi455.json` gives the same configuration,
 each stating `assumed`: the entry it was copied from. A run on MI455 reads it,
-and every term built on it is declared. The copy states MI455's device, stack
-and PTL state and keeps everything else the original was published under, the
-ATOM tree included, so it answers where the original does.
+and every term built on it is declared. The copy states MI455's device, stack,
+torch and PTL state and keeps the rest of the conditions the original was
+published under, its ATOM tree included, so it answers only where the original
+does.
 """
 
 import argparse

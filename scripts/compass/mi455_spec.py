@@ -97,7 +97,7 @@ def device_fragments() -> list[Fragment]:
         "real start and MI308X's 192 GB reads 192 GiB less 16 MiB"
     )
     arch = "LLVM's AMDGPUUsage lists gfx1250 for MI455X; AMD has not confirmed it"
-    took = f"MI455X never ran: {MI355X.stem}'s"
+    never_ran = f"MI455X never ran: {MI355X.stem}'s"
     return [
         fragment("datasheet", DATASHEET, "datasheet", sheet, date="2026-10-09"),
         fragment("arch", {"device.arch": "gfx1250"}, "assumed", arch),
@@ -105,14 +105,14 @@ def device_fragments() -> list[Fragment]:
             "ratios",
             ratios,
             "assumed",
-            f"{took} derates, and its bandwidth curve over its datasheet "
+            f"{never_ran} derates, and its bandwidth curve over its datasheet "
             "bandwidth times MI455X's",
         ),
         fragment(
             "carried",
             carried,
             "assumed",
-            f"{took} values where no datasheet states one: its probed kernel "
+            f"{never_ran} values where no datasheet states one: its probed kernel "
             "floor and intra-node link latency, its host and stack, and the "
             "inter-node link latency and router relay it assumes",
         ),
