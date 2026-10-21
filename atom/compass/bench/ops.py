@@ -1440,10 +1440,11 @@ def _densify(families, tried: set) -> dict:
     """The point halfway between each two neighbours of a family, or of a
     prefill leaf's token count over cached tokens (`_cut`), more than one
     apart, unless `tried`, that launched different kernels or, in a decode
-    family or a collective's, at its first reading of each message size, lie
-    either side of a point `_bent` off the line through theirs or, in a decode
-    family, are `_apart` where the leaf's kind steps: some decode family of
-    the kind holds two adjacent contexts of one kernel that are `_apart`;
+    family or a collective's, at the mean of its readings at each message size
+    as `fit ops` merges them, lie either side of a point `_bent` off the line
+    through theirs or, in a decode family, are `_apart` where the leaf's kind
+    steps: some decode family of the kind holds two adjacent contexts of one
+    kernel that are `_apart`;
     between two points of a collective's family, the step of the rows halfway,
     a decode when the farther is one, else a prefill of one sequence."""
     from atom.compass.capture.forward import decode, prefill
@@ -1465,9 +1466,16 @@ def _densify(families, tried: set) -> dict:
         points = sorted(points, key=lambda p: p[0])
         decoding = points[0][2]["shape"].startswith("decode")
         if isinstance(fam, str) and _exchanged(fam):
-            # One reading per size: a collective holds one per size and context read.
-            groups = itertools.groupby(points, key=lambda p: p[0])
-            bent = _bent([next(g) for _, g in groups])
+            sizes = [[*g] for _, g in itertools.groupby(points, key=lambda p: p[0])]
+            mean = (statistics.mean(p[2]["cold_ns"] for p in g) for g in sizes)
+            bent = ()  # `_bent` reads no cold time under three sizes
+            if len(sizes) > 2:
+                bent = _bent(
+                    [
+                        (*g[0][:2], {**g[0][2], "cold_ns": ns})
+                        for g, ns in zip(sizes, mean)
+                    ]
+                )
         else:
             bent = _bent(points, steps) if decoding else ()
         for (a, ka, record), (b, kb, other) in itertools.pairwise(points):
