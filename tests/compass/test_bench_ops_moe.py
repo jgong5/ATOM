@@ -90,9 +90,10 @@ def test_each_copy_draws_each_token_s_experts_distinct_and_records_their_loads()
 @pytest.mark.parametrize("past", ["the cold copies", "the copies"])
 def test_a_copy_on_another_copy_s_inputs_draws_experts_of_its_own(past):
     # Copy 1 takes copy 0's hidden states: past the cold copies (one passes the
-    # cache), or past the copies with the model's second Linear(3, 3) weight.
+    # cache), or past the copies with the second of the leaf's two weights.
     stub = _stub((16, 2))
-    moe = {"op": MOE["op"], "args": MOE["args"] | {"w": _spec([3, 3], F32, "weight")}}
+    w = {"w": _spec([3, 3], F32, "weight")}
+    moe = {"op": MOE["op"], "args": MOE["args"] | w, "occurrences": 2}
     if past == "the cold copies":
         stub.cold_copies = {"sig": 1}
 
@@ -149,21 +150,6 @@ def test_a_model_of_two_routings_refuses_by_name():
 
     with pytest.raises(ValueError, match=r"route \(experts, top-k\) \[\(8, 2\)"):
         stub._copy(MOE, "sig", [{}], 0)
-
-
-@pytest.mark.parametrize("streams", [None, 4])
-def test_the_stub_hands_the_logits_head_each_token_s_residual_streams(streams):
-    # DeepSeek-V4's logits head reduces `hc_mult` residual streams a token; a
-    # model without them takes one hidden state a token.
-    runner = _Runner()
-    if streams:
-        runner.config.hf_config.get_text_config().hc_mult = streams
-    stub, got = ops.Stub(runner, 10_000), []
-
-    with patch.object(runner.model, "forward", lambda *a: got.append(stub(*a))):
-        runner.forward((0, 0))
-
-    assert got[0].shape == ((2, 4, 3) if streams else (2, 3))
 
 
 # ATOM's ids buffer as `init_aiter_topK_meta_data` builds it for 16 routed

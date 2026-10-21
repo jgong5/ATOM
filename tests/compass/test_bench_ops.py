@@ -2,8 +2,8 @@
 """`compass measure ops`, the parts that run with no device.
 
 Graphs are built by `trace ops`'s own folding (`capture.graph.build`); the
-stub runs in a stand-in runner whose forward sets ATOM's forward context and
-calls the model, as ATOM's runner does.
+stub runs beside a stand-in runner whose input preparation sets ATOM's forward
+context, as ATOM's runner does, and whose forward raises.
 """
 
 import contextlib
@@ -71,6 +71,7 @@ def test_each_leaf_holds_every_instance_s_context_key_and_module_path():
         ],
         "aiter.gemm": [{}],
     }
+    assert [op["occurrences"] for op, _ in found.values()] == [4, 4]
 
 
 def test_stated_values_part_signatures_and_stating_nothing_keeps_the_key():
@@ -164,34 +165,44 @@ def test_a_module_copy_holds_tensors_of_its_own():
 
 
 class _Runner:
-    """ATOM's runner as the stub sees it: a model, its persistent buffers, and
-    a forward that writes a batch's blocks and slots into them, sets the
-    forward context on them and calls the model."""
+    """ATOM's runner as the stub sees it: a model whose parameters are on the
+    meta device, its persistent buffers, an input preparation that writes a
+    batch's blocks and slots into them and sets the forward context on them,
+    between the staging gate's two ends, and a forward that raises."""
 
     device = torch.device("cpu")
 
     def __init__(self, contexts=()):
-        self.model = torch.nn.Sequential(torch.nn.Linear(3, 3), torch.nn.Linear(3, 3))
+        self.model = torch.nn.Sequential(
+            *(torch.nn.Linear(3, 3, device="meta") for _ in range(2))
+        )
         self.forward_vars = {"block_tables": torch.zeros(4, 8, dtype=torch.int32)}
         self.positions = torch.zeros(2, dtype=torch.int64)
-        text = SimpleNamespace(hidden_size=3)
         self.config = SimpleNamespace(
             compilation_config=SimpleNamespace(static_forward_context=dict(contexts)),
             num_kvcache_blocks=64,
-            hf_config=SimpleNamespace(get_text_config=lambda: text),
-            torch_dtype=torch.float32,
         )
-        self.batches = []
+        self.batches, self.staged = [], []
 
-    def forward(self, batch):
+    def _gate_staging_reuse(self):
+        self.staged.append("begin")
+
+    def _mark_staging_h2d_enqueued(self):
+        self.staged.append("finish")
+
+    def prepare_model(self, batch):
         self.batches.append(batch)
+        self.staged.append(batch)
         block, slot = batch
         self.forward_vars["block_tables"].fill_(block)
         self.positions.fill_(slot)
         meta = fctx.AttentionMetaData(block_tables=self.forward_vars["block_tables"])
         context = fctx.Context(positions=self.positions)
         fctx._forward_context = fctx.ForwardContext(attn_metadata=meta, context=context)
-        self.model(torch.zeros(2, dtype=torch.int32), context.positions)
+        return torch.zeros(2, dtype=torch.int32), None, None, None, True, False
+
+    def forward(self, batch):
+        raise AssertionError("the op bench runs no forward")
 
 
 def test_a_point_places_its_batch_for_its_context_keys_and_refuses_by_name(
@@ -211,11 +222,7 @@ def test_a_point_places_its_batch_for_its_context_keys_and_refuses_by_name(
                 ("layer", ir.ContextRef(KEY)),
                 key=KEY,
             ),
-            _leaf(
-                "aten.mm.default",
-                ("self", _t([2, 3], "activation")),
-                ("mat2", _t([5, 5], "weight")),
-            ),
+            _leaf("aten.neg.default", ("rope", ir.ModuleRef("1"))),
             _leaf("aten.add.Tensor", ("self", _t([2, 3], "kv"))),
             _leaf(
                 "aten.add_.Tensor",
@@ -229,16 +236,14 @@ def test_a_point_places_its_batch_for_its_context_keys_and_refuses_by_name(
     )
     stub = ops.Stub(runner, 5_000)
 
-    with patch.object(runner.model, "forward", stub):
-        got = stub.point(placed, decode(2), 20, found)
+    got = stub.point(placed, decode(2), 20, found)
 
     assert runner.batches == [(4 * p, 2 * p) for p in range(5)]
+    assert runner.staged == [s for b in runner.batches for s in ("begin", b, "finish")]
     why = {r["op"]: r["refused"] for r in got}
     assert "'nowhere'" in why["aten.nowhere.default"]
-    assert (
-        "no tensor of the model is a weight [5, 5] torch.float32"
-        in why["aten.mm.default"]
-    )
+    # every parameter is on the meta device, a module's too
+    assert "1 holds parameter weight, on the meta device" in why["aten.neg.default"]
     assert "a kv tensor argument [2, 3]" in why["aten.add.Tensor"]
     [meta] = [r for r in got if r["op"] == "aten.add_.Tensor"]
     assert meta["metadata"] == {"self": "block_tables"}
@@ -253,9 +258,8 @@ def test_each_placement_keeps_its_own_forward_context_and_metadata():
         _graph(_leaf("aten.add_.Tensor", ("self", meta)), layers=1)["region"]
     )
 
-    with patch.object(runner.model, "forward", stub):
-        for p in range(3):
-            runner.forward((4 * p, 2 * p))
+    for p in range(3):
+        stub._prepare((4 * p, 2 * p))
 
     for p, (snap, views) in enumerate(stub.placed):
         [(name, view)] = views.values()
@@ -310,14 +314,47 @@ def test_a_shape_the_rule_refuses_refuses_its_leaves_and_the_next_is_measured(
     assert runner.batches[-1] == "exit"
 
 
-def test_an_error_in_atom_s_forward_fails_measure_with_that_error(monkeypatch):
+def test_measure_times_a_point_atom_prepared_and_runs_no_forward(monkeypatch):
+    # ATOM's runner and its model both raise on a forward; a GEMM over two
+    # layers is timed on random weights, one a layer, on what ATOM prepared.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    runner = _Runner()
+    runner.exit = lambda: None
+    runner.model.forward = runner.forward
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    monkeypatch.setattr(ops, "_runner", lambda config, rank: runner)
+    monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda c: placed)
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
+    timed = []
+    monkeypatch.setattr(
+        ops, "_replay", lambda fn, calls: timed.append(calls) or [1.0] * ops.REPEATS
+    )
+    mm = _leaf(
+        "aten.mm.default",
+        ("self", _t([2, 3], "activation")),
+        ("mat2", _t([3, 3], "weight")),
+    )
+    found = ops.leaves(_graph(mm, layers=2)["region"])
+
+    [record] = ops.measure(None, [(decode(2), 20, found)], 10_000)
+
+    assert "refused" not in record and record["cold_ns"] == 1.0
+    assert runner.staged == [s for b in runner.batches for s in ("begin", b, "finish")]
+    assert record["placements"] == len(runner.batches) > 0
+    weights = {id(kwargs["mat2"]) for kwargs, _ in timed[0]}
+    assert len(weights) == 2
+
+
+def test_an_error_in_atom_s_preparation_fails_measure_with_that_error(monkeypatch):
     runner, todo = _measuring(monkeypatch)
 
-    def forward(batch):
+    def prepare_model(batch):
         runner.batches.append(batch)
         raise ValueError("cannot begin: owner is active")
 
-    runner.forward = forward
+    runner.prepare_model = prepare_model
 
     with pytest.raises(ValueError, match="cannot begin: owner is active") as raised:
         ops.measure(None, todo, 10_000)
@@ -364,8 +401,7 @@ def test_a_decode_point_takes_an_integer_affine_in_the_context_at_its_own(
         block_size=16, batch=lambda view, block, slot: (block, slot)
     )
 
-    with patch.object(runner.model, "forward", stub):
-        [record] = stub.point(placed, decode(2), 8192, found)
+    [record] = stub.point(placed, decode(2), 8192, found)
 
     # ATOM's own step at decode B = 2, context 8192 passes its rows' longest
     # context.
@@ -378,7 +414,7 @@ def test_a_decode_point_takes_an_integer_affine_in_the_context_at_its_own(
     assert kernel.grids == [(2, 2), (2, 2)]
 
 
-def test_an_embedding_reads_the_token_ids_the_forward_was_given():
+def test_an_embedding_reads_the_token_ids_atom_prepared():
     runner = _Runner()
     # An index buffer whose name holds the slot's, which the name rule picks.
     runner.forward_vars["spec_state_indices"] = torch.zeros(8, dtype=torch.int32)
@@ -390,8 +426,7 @@ def test_an_embedding_reads_the_token_ids_the_forward_was_given():
     )
     stub.leaves = ops.leaves(_graph(embedding, layers=1)["region"])
 
-    with patch.object(runner.model, "forward", stub):
-        runner.forward((0, 0))
+    stub._prepare((0, 0))
 
     [(_, views)] = stub.placed
     assert [name for name, _ in views.values()] == ["input_ids"]
@@ -413,16 +448,16 @@ def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
     assert stub._plan(rope, [{"rope": "0"}], kv, 4, 2) == (3, 48, 1)
 
 
-def test_a_call_cycles_over_every_weight_of_its_spec_on_the_cold_copies_inputs():
-    # One copy already passes twice a 1-byte cache. The model holds two
-    # Linear(3, 3) weights: copy 1 is copy 0 with the second, so a weight
-    # count past the cache-sized one allocates no activation.
+def test_a_call_cycles_a_weight_per_occurrence_on_the_cold_copies_inputs():
+    # One copy already passes twice a 1-byte cache. The leaf occurs twice in
+    # the step: copy 1 is copy 0 with a second weight, so a weight count past
+    # the cache-sized one allocates no activation.
     runner = _Runner()
     stub = ops.Stub(runner, 1)
     stub.placed = [(fctx.ForwardContext(), {})]
     x = {"shape": [2, 3], "dtype": F32, "stride": [3, 1], "role": "activation"}
     w = x | {"shape": [3, 3], "role": "weight"}
-    gemm = {"op": "x", "args": {"x": x, "w": [w]}}
+    gemm = {"op": "x", "args": {"x": x, "w": [w]}, "occurrences": 2}
     graphs = []
 
     def replay(fn, calls):
@@ -439,18 +474,21 @@ def test_a_call_cycles_over_every_weight_of_its_spec_on_the_cold_copies_inputs()
 
     (first, snap), (second, snap1) = graphs[0][:2]
     assert second["x"] is first["x"] and snap1 is snap
-    assert first["w"][0] is runner.model[0].weight
-    assert second["w"][0] is runner.model[1].weight
+    weights = [first["w"][0], second["w"][0]]
+    assert weights[0] is not weights[1]
+    assert all(t.shape == (3, 3) and t.stride() == (3, 1) for t in weights)
+    assert all(t.device == runner.device and t.std() > 0 for t in weights)
     assert (n, record["copies"]) == (1, 2)
 
 
 def test_a_call_that_fills_a_graph_alone_cycles_no_second_weight():
-    # The model holds two weights of the spec, but one call fills `GRAPH_NS`:
-    # the graph holds one call, so one copy, and no warm graph.
+    # The leaf occurs twice, but one call fills `GRAPH_NS`: the graph holds
+    # one call, so one copy, and no warm graph.
     stub = ops.Stub(_Runner(), 1)
     stub.placed = [(fctx.ForwardContext(), {})]
     x = {"shape": [2, 3], "dtype": F32, "stride": [3, 1], "role": "activation"}
-    gemm = {"op": "x", "args": {"x": x, "w": [x | {"shape": [3, 3], "role": "weight"}]}}
+    w = x | {"shape": [3, 3], "role": "weight"}
+    gemm = {"op": "x", "args": {"x": x, "w": [w]}, "occurrences": 2}
     graphs = []
 
     def replay(fn, calls):
@@ -472,18 +510,17 @@ def test_a_copy_past_the_cold_ones_takes_its_own_cold_copy_s_inputs_and_is_logge
     monkeypatch, capsys
 ):
     # A [2, 3] input and a [3, 3] weight are 60 bytes a call: 2 copies pass
-    # twice a 30-byte cache. The model holds four weights of that spec, so
-    # copies 2 and 3 are copies 0 and 1 with the third and fourth.
+    # twice a 30-byte cache. The leaf occurs in four layers, so copies 2 and 3
+    # are copies 0 and 1 with the third and fourth weights.
     monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
     runner = _Runner()
-    runner.model.extend([torch.nn.Linear(3, 3), torch.nn.Linear(3, 3)])
     stub = ops.Stub(runner, 30)
     mm = _leaf(
         "aten.mm.default",
         ("self", _t([2, 3], "activation")),
         ("mat2", _t([3, 3], "weight")),
     )
-    found = ops.leaves(_graph(mm, layers=1)["region"])
+    found = ops.leaves(_graph(mm, layers=4)["region"])
     placed = SimpleNamespace(
         block_size=16, batch=lambda view, block, slot: (block, slot)
     )
@@ -494,21 +531,24 @@ def test_a_copy_past_the_cold_ones_takes_its_own_cold_copy_s_inputs_and_is_logge
         return [1.0] * ops.REPEATS
 
     with (
-        patch.object(runner.model, "forward", stub),
         patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         [record] = stub.point(placed, decode(2), 20, found)
 
-    cold = [kwargs for kwargs, _ in graphs[0][:4]]
+    cold = [kwargs for kwargs, _ in graphs[0]]
     assert cold[1]["self"] is not cold[0]["self"]
     assert cold[2]["self"] is cold[0]["self"] and cold[3]["self"] is cold[1]["self"]
-    assert all(c["mat2"] is m.weight for c, m in zip(cold, runner.model))
+    assert len({id(c["mat2"]) for c in cold[:4]}) == 4
+    assert all(c["mat2"] is cold[i % 4]["mat2"] for i, c in enumerate(cold))
     assert record["copies"] == 4 and "over 4 copies" in capsys.readouterr().out
 
 
 def test_copy_c_rotates_weights_and_instances_and_clones_past_the_first_round():
     runner = _Runner()
+    rope = torch.nn.Module()
+    rope.register_buffer("cos_sin_cache", torch.ones(4))
+    runner.model.append(rope)
     stub = ops.Stub(runner, 10_000)
     op = {
         "op": "aten.mm.default",
@@ -524,14 +564,15 @@ def test_copy_c_rotates_weights_and_instances_and_clones_past_the_first_round():
             "layer": {"context": None},
             "out_dtype": "torch.bfloat16",
         },
+        "occurrences": 4,
     }
     live = torch.ones(2, 3)
     stub.placed = [(f"snap{p}", {("sig", "self"): ("x", live + p)}) for p in (0, 1)]
-    instances = [{"rope": "0", "layer": f"model.layers.{i}.attn"} for i in (0, 1)]
+    instances = [{"rope": "2", "layer": f"model.layers.{i}.attn"} for i in (0, 1)]
 
     copies = [stub._copy(op, "sig", instances, c) for c in range(6)]
 
-    weights = [m.weight for m in runner.model]
+    weights = [kw["mat2"] for kw, _ in copies]
     assert [kw["layer"] for kw, _ in copies] == [
         "model.layers.0.attn",
         "model.layers.1.attn",
@@ -544,13 +585,13 @@ def test_copy_c_rotates_weights_and_instances_and_clones_past_the_first_round():
         "snap0",
         "snap0",
     ]
-    assert copies[0][0]["mat2"] is weights[0] and copies[1][0]["mat2"] is weights[1]
-    assert torch.equal(copies[2][0]["mat2"], weights[0])
-    assert copies[2][0]["mat2"].data_ptr() != weights[0].data_ptr()
+    # one random weight per occurrence of the leaf, copy c taking the c-th
+    assert len({id(w) for w in weights[:4]}) == 4
+    assert weights[4] is weights[0] and weights[5] is weights[1]
     assert copies[3][0]["self"] is stub.placed[1][1][("sig", "self")][1]
     assert copies[4][0]["self"].data_ptr() != copies[0][0]["self"].data_ptr()
-    assert copies[3][0]["rope"] is runner.model[0]
-    assert copies[4][0]["rope"] is not runner.model[0]
+    assert copies[3][0]["rope"] is rope
+    assert copies[4][0]["rope"] is not rope
     assert copies[0][0]["out_dtype"] is torch.bfloat16
 
 
@@ -665,8 +706,8 @@ def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(
         graphs.append(calls)
         return [1.0] * ops.REPEATS
 
+    stub = ops.Stub(runner, 600)
     with (
-        patch.object(runner.model, "forward", ops.Stub(runner, 600)) as stub,
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
         patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
@@ -723,8 +764,8 @@ def test_a_graph_over_placements_reads_one_clone_of_metadata_none_changed(
         torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=lambda: None)
     )
     monkeypatch.setattr(torch.cuda, "Event", event)
+    stub = ops.Stub(runner, 5_000)
     with (
-        patch.object(runner.model, "forward", ops.Stub(runner, 5_000)) as stub,
         patch.object(ops, "_function", return_value=call),
         patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
     ):
@@ -852,8 +893,7 @@ def test_a_point_runs_and_records_the_rows_the_pool_holds(monkeypatch):
     x = ("self", _t([2, 3], "activation"))
     found = ops.leaves(_graph(_leaf("aten.neg.default", x), layers=1)["region"])
 
-    with patch.object(runner.model, "forward", stub):
-        [record] = stub.point(placed, decode(2), 600, found)
+    [record] = stub.point(placed, decode(2), 600, found)
 
     # 38 blocks a row, 64 in the pool: the second row takes the 26 left.
     assert views == [[[1, 600, True], [1, 416, True]]]

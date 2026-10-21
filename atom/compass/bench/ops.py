@@ -17,19 +17,22 @@ given. Rows the KV pool cannot hold at once are ragged (`point_rows`), and the
 point records its rows.
 
 ATOM's runner is built from ATOM's arguments on each GPU `--gpu` names, one
-rank each of the layout the arguments resolve (`ranks`), its weights a dummy,
-through ATOM's warmup, and a `Stub` takes the place of the model's forward.
-Each point reaches the runner as a batch (`ReplayRule`), so ATOM builds its
-metadata and forward context, and the stub calls each leaf from its contract:
+rank each of the layout the arguments resolve (`ranks`), its parameters on the
+meta device and with no warmup (`_runner`): no forward of the model, its LM
+head or its sampler runs. Each point reaches the runner as a batch
+(`ReplayRule`) that `ModelRunner.prepare_model` prepares, so ATOM builds its
+metadata and forward context, and a `Stub` calls each leaf from its contract:
 an activation is random at its shape, dtype and stride, except a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
-experts' ids ATOM fuses into them (`_route`); a weight is a
-tensor of the model of that shape, dtype and stride; a metadata tensor is a
+experts' ids ATOM fuses into them (`_route`); a weight is random at its
+shape, dtype and stride, one tensor per occurrence of the leaf in the step;
+a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
-the token ids ATOM passes the forward (`TOKEN_IDS`); an integer the capture
+the token ids ATOM prepared (`TOKEN_IDS`); an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names. A leaf whose operator cannot run so
-refuses by name, a KV tensor argument among them.
+refuses by name, a KV tensor argument among them, and so does one that takes
+a module holding a parameter, which is on the meta device.
 A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
 
@@ -40,13 +43,13 @@ times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
 kernels of one eager call of copy 0, the fewer, at least one, cycling over its
 copies: N built ones: M, the least count whose bytes pass `COLD` times the
 last-level cache, raised for a context key to its I instances (at most K),
-then, up to the most weights the model holds of a weight argument's spec (at
-most K), copy c mod N with the c-th weights on that copy's other arguments.
+then, up to the leaf's occurrences when it takes a weight (at most K), copy
+c mod N with the c-th weights on that copy's other arguments.
 Copy c < N takes fresh activations below M and copy c mod M's from there,
-the c-th of the model's weights of that spec (a clone past the last), and
+weight c mod the leaf's occurrences, and
 instance c mod I at placement (c div I) mod P, its metadata and module
 tensors cloned past the first round: a placement is the point's batch on KV
-blocks and state slots of its own, for which ATOM builds the forward context
+blocks and state slots of its own, for which ATOM prepares the forward context
 again, cloned where it differs from the last placement's. A second graph runs
 copy 0 K times, warm; with one copy, or K under `CALLS`, there is none.
 Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
@@ -54,7 +57,7 @@ idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
 aside, are the point's kernel identity. When `ReplayRule` refuses a batch, its
-leaves refuse; an error in ATOM's forward fails the run, naming the point.
+leaves refuse; an error in ATOM's preparation fails the run, naming the point.
 The points run in a process of their own on each GPU; one that dies ends
 every rank, keeps the points every rank finished, the point it was measuring
 refuses, and new ones measure the rest; two in a row that die having finished
@@ -124,7 +127,6 @@ from atom.compass.artifacts import (
     member_name,
     roots_for,
 )
-from atom.compass.capture.forward import _weights
 from atom.compass.drive.gpu import add_gpu_flag
 
 PROG = "compass measure ops"
@@ -198,7 +200,7 @@ def main(argv: list[str]) -> None:
     if config.compilation_config.level:
         raise ValueError(
             f"--level {config.compilation_config.level} compiles the model, whose "
-            "forward the bench stubs; measure at --level 0"
+            "forward the bench never runs; measure at --level 0"
         )
     _eager(config)
     store = ArtifactStore(args.store)
@@ -314,8 +316,9 @@ def signature(op: dict) -> str:
 
 
 def leaves(region: dict, env=None, found=None) -> dict[str, tuple[dict, list]]:
-    """Each leaf of a graph's JSON region by `signature`: one of its ops, and
-    its instances in run order, each the key or path every reference slot binds."""
+    """Each leaf of a graph's JSON region by `signature`: one of its ops, its
+    times in the step under ``occurrences``, and its instances in run order,
+    each the key or path every reference slot binds."""
     env, found = env or {}, {} if found is None else found
     if "op" in region:
         bound = {}
@@ -323,7 +326,9 @@ def leaves(region: dict, env=None, found=None) -> dict[str, tuple[dict, list]]:
             if _ref(value):
                 ref = ir.ContextRef(next(iter(value.values())))
                 bound[slot] = ref.bind(**{n: env[n] for n in ref.index_names}).key
-        instances = found.setdefault(signature(region), (region, []))[1]
+        leaf = region | {"occurrences": 0}
+        op, instances = found.setdefault(signature(region), (leaf, []))
+        op["occurrences"] += 1
         instances += [bound] if bound not in instances else []
     elif "repeat" in region:
         for i in range(region["count"]):
@@ -350,7 +355,7 @@ def measure(config, todo, llc: int, rank: int = 0) -> list[dict]:
             journal += f".{torch.distributed.get_rank()}"
         stub, rule, got = Stub(runner, llc, journal), ReplayRule(config), []
         todo = ranks.union(todo, group)
-        with patch.object(runner.model, "forward", stub), torch.inference_mode():
+        with torch.inference_mode():
             for shape, context, found in todo:
                 got += stub.point(rule, shape, context, found)
         return got
@@ -359,12 +364,26 @@ def measure(config, todo, llc: int, rank: int = 0) -> list[dict]:
 
 
 def _runner(config, rank: int):
-    """ATOM's runner at TP `rank` of `config`'s DP rank, warmed up, its KV
-    pool allocated at the fewest blocks a rank has room for."""
+    """ATOM's runner at TP `rank` of `config`'s DP rank, its parameters built on
+    the meta device and no warmup run, its KV pool allocated at the fewest
+    blocks a rank has room for with the model's parameter bytes held back for
+    the weights each leaf builds."""
     from torch.distributed import TCPStore
 
     from atom.compass.bench.ranks import agreed, cpu_group
-    from atom.model_engine.model_runner import ModelRunner
+    from atom.model_engine.model_runner import ModelRunner, RapidServeModelRunner
+
+    class MetaRunner(ModelRunner):
+        def _build_and_load_model(self, model_class):
+            with RapidServeModelRunner._init_weight_params_on_meta():
+                self.model = model_class(self.config)
+            torch.set_default_device(None)
+
+        def _maybe_warmup(self):
+            pass
+
+        def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
+            return sum(p.nbytes for p in self.model.parameters())
 
     pc, store = config.parallel_config, None
     if not pc._managed_distributed_store:  # one rank: the store is its own
@@ -375,7 +394,7 @@ def _runner(config, rank: int):
             wait_for_workers=False,
         )
         pc.data_parallel_base_port, pc._managed_distributed_store = store.port, True
-    runner = ModelRunner(rank, config)
+    runner = MetaRunner(rank, config)
     runner.store = store
     blocks = runner.get_num_blocks()["num_kvcache_blocks"]
     config.num_kvcache_blocks = agreed(blocks, cpu_group())
@@ -384,21 +403,13 @@ def _runner(config, rank: int):
 
 
 class Stub:
-    """The model's forward in ATOM's runner, and the leaves timed beside it.
-
-    Each call ATOM makes of the model snapshots the forward context ATOM built
-    and the live metadata each leaf names, and returns zero hidden states, of
-    the residual's width where the model widens it.
-    """
+    """The leaves of a point timed beside ATOM's runner, on the forward context
+    and live metadata ATOM prepared for each placement of its batch."""
 
     def __init__(self, runner, llc: int, journal=None) -> None:
         self.runner, self.llc, self.journal = runner, llc, journal
-        self.weights, self.leaves, self.placed = {}, {}, []
+        self.built, self.leaves, self.placed = {}, {}, []
         self.cold_copies, self.clones = {}, {}
-        for t in _weights(runner.model):
-            if t.device.type != runner.device.type:
-                continue
-            self.weights.setdefault(_spec(t), {})[t.data_ptr()] = t
         self.modules = dict(runner.model.named_modules())
         self.contexts = runner.config.compilation_config.static_forward_context
         self.moe = sorted(
@@ -416,11 +427,16 @@ class Stub:
         self.shared = meta[1] if meta and self.moe else None
         self.loads = []
 
-    def __call__(self, input_ids, positions, *args, **kwargs):
+    def _prepare(self, batch) -> None:
+        """`batch` prepared by ATOM's runner as its forward prepares one, no
+        forward run, and a snapshot of the forward context it built and the
+        live metadata each leaf names."""
         from atom.utils.forward_context import get_forward_context
 
-        fc = get_forward_context()
-        live = {"input_ids": input_ids, "positions": positions}
+        self.runner._gate_staging_reuse()
+        input_ids = self.runner.prepare_model(batch)[0]
+        self.runner._mark_staging_h2d_enqueued()
+        fc, live = get_forward_context(), {"input_ids": input_ids}
         for name, buffer in self.runner.forward_vars.items():
             live[name] = getattr(buffer, "gpu", buffer)
         for owner in (fc.attn_metadata, fc.context):
@@ -450,12 +466,6 @@ class Stub:
         snap.attn_metadata = _deep(fc.attn_metadata, memo, self.clones)
         snap.context = _deep(fc.context, memo, self.clones)
         self.placed.append((snap, meta))
-        n = len(input_ids)
-        text = self.runner.config.hf_config.get_text_config()
-        # a widened residual (DeepSeek-V4's mHC) reaches the LM head widened
-        wide = (n, text.hc_mult) if hasattr(text, "hc_mult") else (n,)
-        dtype = self.runner.config.torch_dtype
-        return input_ids.new_zeros((*wide, text.hidden_size), dtype=dtype)
 
     def point(self, rule, shape, context, found) -> list[dict]:
         """Each leaf of `found` timed at `shape` on `point_rows`, or every leaf
@@ -478,7 +488,7 @@ class Stub:
         for p in range(max(min(need, *room), 1)):
             try:
                 batch = rule.batch(view, p * blocks, p * len(rows))
-            except ValueError as error:  # the rule refuses, before any forward
+            except ValueError as error:  # the rule refuses, before any preparation
                 refused = [
                     {"shape": str(shape), "context": context, "op": op["op"]}
                     | {"leaf": sig, "refused": f"ValueError: {error}"}
@@ -486,7 +496,7 @@ class Stub:
                 ]
                 return _journal(self.journal, refused)
             try:
-                self.runner.forward(batch)
+                self._prepare(batch)
             except Exception as error:
                 error.add_note(f"measuring {shape} at context {context}")
                 raise
@@ -506,7 +516,7 @@ class Stub:
             print(f"{shape}: {op['op']} over {copies} copies {names or ''}", flush=True)
             record |= {"instances": len(inst), "placements": len(self.placed)}
             got += _journal(self.journal, [record])
-        self.placed = []
+        self.placed, self.built = [], {}
         return got
 
     def _plan(self, op, instances, kv, blocks, rows):
@@ -538,24 +548,21 @@ class Stub:
         """`op` timed in a graph of K calls, `CALLS` or as many as fill
         `GRAPH_NS`, cold over at most `n` copies, past the first `m` its point
         sized to the cache (`cold_copies`) each on copy `c mod m`'s
-        activations, then copy `c mod n` with the c-th weight up to every
-        weight the model holds of its spec, at most K; and, when K is `CALLS`,
+        activations, then copy `c mod n` with the c-th weight up to the
+        leaf's occurrences when it takes one, at most K; and, when K is `CALLS`,
         warm over one; with its kernels. Every rank's graph holds the most K
         any rank's call gives, and a leaf any rank refuses, every rank does."""
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
 
         fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
-        self.loads = []
+        self.loads, self.built = [], {}
         with refused_together():
             calls = [self._copy(op, sig, instances, 0)]
-        # one weight can read a few percent off another of its spec, and every
-        # one is held anyway: cycle them all, on the n copies' other arguments
-        held = [
-            len(self.weights.get(_spec_of(s), ()))
-            for _, s in _specs(op["args"])
-            if s["role"] == "weight"
-        ]
+        # one weight can read a few percent off another of its spec: cycle one
+        # per occurrence of the leaf, on the n copies' other arguments
+        weighs = any(s["role"] == "weight" for _, s in _specs(op["args"]))
+        held = [op["occurrences"]] if weighs else []
         try:
             forward_context._forward_context = calls[0][1]
             with refused_together():
@@ -611,17 +618,24 @@ class Stub:
                 ]
             if isinstance(value, dict) and self._routed(value):
                 return self._route(value, c)
+            if isinstance(value, dict) and value.get("role") == "weight":
+                return self._weight(value, c % op["occurrences"])
             if isinstance(value, dict) and value.get("role") == "activation" and like:
                 return old
             if _ref(value) and "module" in value:
                 module = self.modules[instance[path]]
+                if held := next((n for n, _ in module.named_parameters()), None):
+                    raise ValueError(
+                        f"{instance[path]} holds parameter {held}, on the meta "
+                        "device: a leaf reading it through the module is not timed"
+                    )
                 return _module_copy(module) if fresh else module
             if _ref(value):
                 return instance[path]
             if isinstance(value, dict) and "affine" in value:
                 return ir.Affine(*value["affine"]).at(self.context)
             if isinstance(value, dict):
-                return self._tensor(value, meta.get((sig, path)), c, fresh)
+                return self._tensor(value, meta.get((sig, path)), fresh)
             if isinstance(value, str) and value.startswith("torch."):
                 return getattr(torch, value[6:], value)
             return value
@@ -674,7 +688,7 @@ class Stub:
             if isinstance(value, list):
                 return [build(v, o) for v, o in zip(value, old)]
             if isinstance(value, dict) and value.get("role") == "weight":
-                return self._tensor(value, None, c, False)
+                return self._weight(value, c % op["occurrences"])
             if isinstance(value, dict) and self._routed(value):
                 return self._route(value, c)
             return old
@@ -682,7 +696,7 @@ class Stub:
         kwargs, snap = like
         return {s: build(v, kwargs[s]) for s, v in op["args"].items()}, snap
 
-    def _tensor(self, spec, meta, c, fresh):
+    def _tensor(self, spec, meta, fresh):
         role = spec["role"]
         if role == "activation":
             return _random(spec, self.runner.device)
@@ -690,12 +704,13 @@ class Stub:
             if meta[1] is None:
                 raise ValueError(meta[0])
             return _clone(meta[1]) if fresh else meta[1]
-        if role == "weight":
-            held = list(self.weights.get(_spec_of(spec), {}).values())
-            if not held:
-                raise ValueError(f"no tensor of the model is a weight {_text(spec)}")
-            return held[c] if c < len(held) else _clone(held[c % len(held)])
         raise ValueError(f"a {role} tensor argument {_text(spec)} is not built")
+
+    def _weight(self, spec, i):
+        """Weight `i` of `spec`, random, built once a leaf."""
+        if (key := (_spec_of(spec), i)) not in self.built:
+            self.built[key] = _random(spec, self.runner.device)
+        return self.built[key]
 
 
 def _routing(loads) -> dict:
