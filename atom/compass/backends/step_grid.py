@@ -68,7 +68,11 @@ every decode batch at G(mean).
 
     replay: NODES = {"<rung>": [...], ...}, a POINT at [rung, B, c]
     eager:  NODES = [...],                  a POINT at [B, c]
-    POINT = {"at": [...], "time": <in unit>, "statistic": <name>, "repeats": n}
+    POINT = {"at": [...], "time": <in unit>, "statistic": <name>, "repeats": n,
+             "shared": n}                                      # shared optional
+
+A point measured with its rows sharing leading KV blocks, past the pool
+unshared, states how many as `shared`.
 """
 
 from __future__ import annotations
