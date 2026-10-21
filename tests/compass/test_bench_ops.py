@@ -595,6 +595,22 @@ def test_copy_c_rotates_weights_and_instances_and_clones_past_the_first_round():
     assert copies[0][0]["out_dtype"] is torch.bfloat16
 
 
+@pytest.mark.parametrize("kind, key", [("module", "2"), ("context", KEY)])
+def test_a_reference_to_a_module_holding_a_parameter_refuses_by_name(kind, key):
+    # Every parameter of ATOM's model is on the meta device: a leaf reaching
+    # one through a module path or its layer's context key reads no memory.
+    layer = torch.nn.Module()
+    layer.A_log = torch.nn.Parameter(torch.empty(4, device="meta"))
+    runner = _Runner({KEY: layer})
+    runner.model.append(layer)
+    stub = ops.Stub(runner, 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    op = {"op": "x", "args": {"layer": {kind: None}}}
+
+    with pytest.raises(ValueError, match=f"^{key} holds parameter A_log, on the meta"):
+        stub._copy(op, "sig", [{"layer": key}], 0)
+
+
 @pytest.mark.parametrize("copies", [1, 8])
 def test_every_cold_and_warm_graph_holds_calls_calls_at_any_copies(copies):
     # A replay's fixed cost is spread over a graph's calls: a count that moved

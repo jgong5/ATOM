@@ -32,7 +32,7 @@ the token ids ATOM prepared (`TOKEN_IDS`); an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names. A leaf whose operator cannot run so
 refuses by name, a KV tensor argument among them, and so does one that takes
-a module holding a parameter, which is on the meta device.
+a module or context key whose module holds a parameter, on the meta device.
 A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
 
@@ -622,16 +622,16 @@ class Stub:
                 return self._weight(value, c % op["occurrences"])
             if isinstance(value, dict) and value.get("role") == "activation" and like:
                 return old
-            if _ref(value) and "module" in value:
-                module = self.modules[instance[path]]
-                if held := next((n for n, _ in module.named_parameters()), None):
-                    raise ValueError(
-                        f"{instance[path]} holds parameter {held}, on the meta "
-                        "device: a leaf reading it through the module is not timed"
-                    )
-                return _module_copy(module) if fresh else module
             if _ref(value):
-                return instance[path]
+                key, module = instance[path], "module" in value
+                held = self.modules[key] if module else self.contexts.get(key)
+                params = getattr(held, "named_parameters", tuple)()
+                if name := next((n for n, p in params if p.is_meta), None):
+                    raise ValueError(
+                        f"{key} holds parameter {name}, on the meta device: a "
+                        "leaf reading it through a reference is not timed"
+                    )
+                return (_module_copy(held) if fresh else held) if module else key
             if isinstance(value, dict) and "affine" in value:
                 return ir.Affine(*value["affine"]).at(self.context)
             if isinstance(value, dict):
