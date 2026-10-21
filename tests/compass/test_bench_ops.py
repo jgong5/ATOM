@@ -270,7 +270,7 @@ def test_a_shape_the_pool_cannot_place_refuses_its_leaves_and_the_next_is_measur
 ):
     runner = _Runner()
     runner.exit = lambda: runner.batches.append("exit")
-    monkeypatch.setattr(ops, "_runner", lambda config: runner)
+    monkeypatch.setattr(ops, "_runner", lambda config, rank: runner)
     monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda config: None)
 
     def point(self, _rule, shape, context, found):
