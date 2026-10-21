@@ -51,7 +51,8 @@ Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
 idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
-aside, are the point's kernel identity. A batch the KV pool cannot place refuses its leaves.
+aside, are the point's kernel identity. When `ReplayRule` refuses a batch, its
+leaves refuse; an error in ATOM's forward fails the run, naming the point.
 The points run in a process of their own on each GPU; one that dies ends
 every rank, keeps the points every rank finished, the point it was measuring
 refuses, and new ones measure the rest; two in a row that die having finished
@@ -338,15 +339,7 @@ def measure(config, todo, llc: int, rank: int = 0) -> list[dict]:
         todo = ranks.union(todo, group)
         with patch.object(runner.model, "forward", stub), torch.inference_mode():
             for shape, context, found in todo:
-                try:
-                    got += stub.point(rule, shape, context, found)
-                except ValueError as error:  # a batch the KV pool cannot place
-                    refused = [
-                        {"shape": str(shape), "context": context, "op": op["op"]}
-                        | {"leaf": sig, "refused": f"ValueError: {error}"}
-                        for sig, (op, _) in found.items()
-                    ]
-                    got += _journal(journal, refused)
+                got += stub.point(rule, shape, context, found)
         return got
     finally:
         runner.exit()
@@ -438,7 +431,8 @@ class Stub:
         return input_ids.new_zeros((*wide, text.hidden_size), dtype=dtype)
 
     def point(self, rule, shape, context, found) -> list[dict]:
-        """Each leaf of `found` timed at `shape` on `point_rows`."""
+        """Each leaf of `found` timed at `shape` on `point_rows`, or every leaf
+        refused when `rule` refuses the batch."""
         from atom.utils.forward_context import _forward_kv_cache_context
 
         pool = self.runner.config.num_kvcache_blocks
@@ -455,7 +449,20 @@ class Stub:
         self.leaves, self.placed, self.context, self.clones = found, [], context, {}
         self.cold_copies = {s: self._cold(size) for s, (_, size, _) in plans.items()}
         for p in range(max(min(need, *room), 1)):
-            self.runner.forward(rule.batch(view, p * blocks, p * len(rows)))
+            try:
+                batch = rule.batch(view, p * blocks, p * len(rows))
+            except ValueError as error:  # the rule refuses, before any forward
+                refused = [
+                    {"shape": str(shape), "context": context, "op": op["op"]}
+                    | {"leaf": sig, "refused": f"ValueError: {error}"}
+                    for sig, (op, _) in found.items()
+                ]
+                return _journal(self.journal, refused)
+            try:
+                self.runner.forward(batch)
+            except Exception as error:
+                error.add_note(f"measuring {shape} at context {context}")
+                raise
         got = []
         for sig, (op, inst) in found.items():
             n, size, _ = plans[sig]
