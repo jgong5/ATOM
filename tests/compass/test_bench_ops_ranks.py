@@ -11,6 +11,7 @@ import datetime
 import json
 import os
 import sys
+import time
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from types import SimpleNamespace
@@ -139,22 +140,33 @@ def _found(*names):
     return ops.leaves(_graph(*(_leaf(n, x) for n in names), layers=1)["region"])
 
 
+#: The gloo timeout of a rank whose peer raises building its runner.
+RUNNER_WAIT = 60
+
+
 def _measuring_rank(config, todo, refuse, rank):
     """One rank of `ops.measure` in a gloo group: ATOM's runner, the device
     and its kernels stand-ins, every cross-rank call on the group; rank 1
     refusing `NEG` at `refuse`: from its copy 0, from its copy 1, its first
-    call or its capture."""
+    call or its capture; or raising as it builds its runner."""
     from atom.compass.bench import replay
 
     pc = config.parallel_config
     me = pc.data_parallel_rank * config.tensor_parallel_size + rank
     store = dist.TCPStore(pc.data_parallel_master_ip, pc.data_parallel_base_port)
-    wait = datetime.timedelta(seconds=10)  # a rank left waiting fails, not hangs
+    # a rank left waiting fails, not hangs
+    wait = datetime.timedelta(seconds=RUNNER_WAIT if refuse == "runner" else 10)
     dist.init_process_group("gloo", store=store, rank=me, world_size=2, timeout=wait)
     runner, captures = _Runner(), []
     runner.exit = dist.destroy_process_group
     fctx._forward_kv_cache_context.kv_cache_data = {}
-    ops._runner = lambda config, rank: runner
+
+    def build(config, rank):
+        if (me, refuse) == (1, "runner"):
+            raise RuntimeError("rank 1 has no runner")
+        return runner
+
+    ops._runner = build
     ops._kernels = lambda fn, kwargs: (["k"], 1.0)
     ops._together = dist.barrier
     ranks.cpu_group = lambda: dist.group.WORLD
@@ -226,6 +238,18 @@ def test_a_leaf_one_rank_refuses_every_rank_refuses_and_the_next_is_measured(
     lines = [Path(f"{journal}.{r}").read_text().splitlines() for r in (0, 1)]
     assert [_leaves(map(json.loads, r)) for r in lines] == [_leaves(r) for r in by_rank]
     assert not journal.exists()
+
+
+def test_a_rank_raising_before_its_first_cross_rank_call_ends_the_others():
+    config = _config(2)
+    ranks.layout(config)
+    todo = [[(decode(2), 20, _found(NEG))]] * 2
+
+    start = time.monotonic()
+    with pytest.raises(RuntimeError, match="rank 1 has no runner"):
+        ranks.launch(_measuring_rank, config, todo, "runner")
+
+    assert time.monotonic() - start < RUNNER_WAIT  # not rank 0's gloo timeout
 
 
 def test_a_rank_that_dies_costs_only_the_point_the_ranks_were_measuring(
