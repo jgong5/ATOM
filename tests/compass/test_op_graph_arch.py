@@ -21,6 +21,15 @@ from atom.compass.run import _op_graphs
 
 ARCHES = ("gfx942", "gfx950")
 RANK = Topology().ranks()[0]
+#: The engine fields a stand-in config states, which an op_graph key reads.
+ENGINE = {
+    "kv_cache_block_size": 16,
+    "kv_cache_dtype": "bf16",
+    "quant_config": SimpleNamespace(compute_hash=lambda: "unquantized-bf16"),
+    "enable_dp_attention": False,
+    "enable_tbo": False,
+    "enable_tbo_decode": False,
+}
 
 
 def _device(monkeypatch, props):
@@ -38,6 +47,7 @@ def config(tmp_path):
         parallel_config=SimpleNamespace(data_parallel_size=1),
         enable_expert_parallel=False,
         enforce_eager=True,
+        **ENGINE,
     )
 
 

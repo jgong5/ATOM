@@ -16,7 +16,10 @@ them the same way for every line:
   replays share a request.
 - Row i holds `ceil(context / block_size)` KV blocks, contiguous, from a fresh
   pool: row 0 starts at block 0, or the block `batch` is given, and each row
-  starts where the one before ended.
+  starts where the one before ended. A line stating `shared`, n, has every
+  row's first n blocks be the same n blocks, ahead of the rows' own, as a
+  prefix cache shares them: they hold cached tokens alone, so n is at most
+  the full blocks each row's cached context fills.
 - Every token of row i is the filler id `DeferredTokenStream` reports for a
   request numbered i, out of the ids `filler_token_ids` keeps for the model's
   tokenizer, as the simulated runner keeps them.
@@ -96,6 +99,15 @@ class ReplayRule:
                 f"{self.max_model_len}"
             )
         final = bool(line["produces_output"])
+        shared = line.get("shared", 0)
+        full = min((context - query) // self.block_size for query, context, _ in rows)
+        if type(shared) is not int or not 0 <= shared <= full:
+            raise ValueError(
+                f"rows {rows} share {shared!r} KV blocks, and the shortest "
+                f"cached context among them fills {full}"
+            )
+        prefix = list(range(block, block + shared))
+        block += shared
         seqs = {}
         for i, (query, context, _) in enumerate(rows):
             filler = self.fillers[i % len(self.fillers)]
@@ -107,8 +119,9 @@ class ReplayRule:
             )
             seq.type = SequenceType.DECODE if decode else SequenceType.PREFILL
             seq.num_cached_tokens = context - query
-            seq.block_table = new_block_table(range(block, block + seq.num_blocks))
-            block += seq.num_blocks
+            own = seq.num_blocks - shared
+            seq.block_table = new_block_table([*prefix, *range(block, block + own)])
+            block += own
             if self.stateful:
                 seq.state_slots = [slot + i]
             seqs[seq.id] = seq
