@@ -101,6 +101,17 @@ def test_a_copy_on_another_copy_s_inputs_draws_experts_of_its_own(past):
     assert len(record["routing"]["activated"]) == 2
 
 
+def test_a_leaf_records_only_its_own_draws():
+    stub = _stub((16, 2))
+    _timed(stub, MOE, 3)
+
+    record, copies = _timed(stub, MOE, 2)
+
+    assert record["routing"]["activated"] == [
+        len(c["topk_ids"].unique()) for c in copies
+    ]
+
+
 def test_the_draw_is_seeded_by_the_copy_and_the_seed():
     def ids(seed):
         with patch.object(ops, "SEED", seed):
@@ -143,7 +154,8 @@ def test_the_stub_hands_the_logits_head_each_token_s_residual_streams(streams):
     # DeepSeek-V4's logits head reduces `hc_mult` residual streams a token; a
     # model without them takes one hidden state a token.
     runner = _Runner()
-    runner.config.hf_config.get_text_config().hc_mult = streams
+    if streams:
+        runner.config.hf_config.get_text_config().hc_mult = streams
     stub, got = ops.Stub(runner, 10_000), []
 
     with patch.object(runner.model, "forward", lambda *a: got.append(stub(*a))):
