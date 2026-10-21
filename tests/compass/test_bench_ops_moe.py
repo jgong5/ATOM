@@ -199,3 +199,37 @@ def test_ids_wider_than_top_k_that_atom_s_buffer_does_not_explain_draw_nothing(
     record, [copy] = _timed(stub, _moe(width), 1)
 
     assert not copy["topk_ids"].any() and record["routing"] is None
+
+
+def test_ids_and_weights_viewed_in_atom_s_top_k_buffers_draw_ids_and_read_weights(
+    monkeypatch,
+):
+    # DeepSeek-V4 on gfx942 fuses its shared expert: its fused-MoE leaf reads
+    # views of ATOM's top-k buffers, which the capture holds as metadata.
+    weights = torch.full((6, 4), 0.5)
+    topk = SimpleNamespace(
+        aiter_topK_meta_data=(weights, torch.tensor(FUSED["without EP"]))
+    )
+    monkeypatch.setitem(sys.modules, "atom.model_ops.topK", topk)
+    runner = _Runner()
+    runner.model.append(_Experts(16, 2))
+    stub = ops.Stub(runner, 10_000)
+    viewed = {
+        "topk_weight": _spec([4, 4], F32, "metadata"),
+        "topk_ids": _spec([4, 4], role="metadata"),
+    }
+    moe = {"op": MOE["op"], "args": MOE["args"] | viewed}
+    stub.leaves = {"sig": (moe, [{}])}
+    stub._prepare((0, 0))
+
+    record, copies = _timed(stub, moe, 8)
+
+    ids = [c["topk_ids"] for c in copies]
+    for t in ids:
+        assert all(len(set(row)) == 2 for row in t[:, :2].tolist())
+        assert 0 <= t[:, :2].min() and t[:, :2].max() < 16
+        assert t[:, 2:].tolist() == [[16, 17]] * 4
+    assert len({tuple(t[:, :2].flatten().tolist()) for t in ids}) == 8
+    assert record["routing"]["activated"] == [len(t[:, :2].unique()) for t in ids]
+    assert torch.equal(copies[0]["topk_weight"], weights[:4])
+    assert stub.placed[0][1]["sig", "topk_weight"][0] == "topk_weights"
