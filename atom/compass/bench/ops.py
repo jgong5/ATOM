@@ -398,7 +398,10 @@ def _runner(config, rank: int):
     blocks = runner.get_num_blocks()["num_kvcache_blocks"]
     config.num_kvcache_blocks = agreed(blocks, cpu_group())
     runner.allocate_kv_cache(config.num_kvcache_blocks)
+    # a leaf's weights carved from this cached block read a decode GEMM up to
+    # 25% slow on an MI308X; allocated afresh, within 1%
     del held
+    torch.cuda.empty_cache()
     return runner
 
 
