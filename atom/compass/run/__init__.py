@@ -1594,15 +1594,16 @@ def tokenizer(tok, config) -> None:
     tok.decode = wrap_decode(tok.decode, entry)
 
 
-def http_intake() -> tuple[float, float] | None:
-    """``(fixed_s, per_byte_s)``, the frontend loop's time to take in one HTTP
-    request, from the run's machine spec; None on a real run or a run file with
-    no machine spec."""
+def http_intake() -> tuple[float, float, float] | None:
+    """``(fixed_s, per_byte_s, idle_s)``, the frontend loop's time to take in one
+    HTTP request, from the run's machine spec, ``fixed_s`` standing for an unstated
+    ``idle_s``; None on a real run or a run file with no machine spec."""
     run = spec()
     if run is None or "machine" not in run:
         return None
     machine, terms = _machine(run), ("fixed_s", "per_byte_s")
-    return tuple(machine.value(f"host.http_intake.{k}") for k in terms)
+    fixed, per_byte = (machine.value(f"host.http_intake.{k}") for k in terms)
+    return fixed, per_byte, machine.values.get("host.http_intake.idle_s", fixed)
 
 
 def _fingerprint(tok) -> str | None:

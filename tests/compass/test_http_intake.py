@@ -264,3 +264,73 @@ def test_the_floor_is_each_send_to_its_app_call_one_request_in_flight(tmp_path):
     arrivals.write_text(json.dumps({"sent_ns": [sent[0], sent[0] + 1] + sent[2:]}))
     with pytest.raises(SystemExit, match="10 app calls, not one after each of 10"):
         probe.floor(str(stamps), str(arrivals))
+
+
+def test_serve_stamps_each_tokenizer_pool_job_and_engine_send(tmp_path):
+    server = SERVER | {
+        "model_engine/__init__.py": "",
+        "model_engine/llm_engine.py": (
+            "class InputOutputProcessor:\n"
+            "    def preprocess(self, prompt):\n"
+            "        return self.preprocess_fanout(prompt)[0]\n"
+            "    def preprocess_fanout(self, prompt):\n"
+            "        return [prompt]\n"
+        ),
+        "model_engine/engine_core_mgr.py": (
+            "class CoreManager:\n"
+            "    def add_request(self, seqs):\n"
+            "        print(seqs)\n"
+        ),
+        "entrypoints/openai/api_server.py": (
+            "from atom.model_engine.engine_core_mgr import CoreManager\n"
+            "from atom.model_engine.llm_engine import InputOutputProcessor\n"
+            "if __name__ == '__main__':\n"
+            "    CoreManager().add_request([InputOutputProcessor().preprocess('p')])\n"
+        ),
+    }
+    for name, text in server.items():
+        (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "atom" / name).write_text(text)
+    stamps = tmp_path / "stamps"
+    done = subprocess.run(
+        [sys.executable, PROBE, "serve", stamps],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path)),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert done.stdout == "['p']\n"
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    assert [(r[2], r[4]) for r in rows] == [("prep", "0"), ("send", "0")]
+    assert int(rows[0][3]) <= int(rows[0][0]) <= int(rows[1][3]) <= int(rows[1][0])
+
+
+def test_the_idle_intake_is_the_loops_time_on_a_lone_request_less_the_bytes(
+    tmp_path,
+):
+    # Each request: app call, body, 300 us + 5 ns/B to its pool job, a 2 ms job,
+    # then 100 us + 10 us k to its engine send.
+    calls = [10**12 + k * 10**9 for k in range(10)]
+    sizes = [1000 * (k + 1) for k in range(10)]
+    lines = []
+    for k, (c, b) in enumerate(zip(calls, sizes)):
+        j = c + 300_000 + 5 * b
+        e = j + 2_000_000
+        s = e + 100_000 + 10_000 * k
+        lines.append(
+            f"{c} 1 app {c} 0\n{c + 2} 1 body {c + 1} {b}\n"
+            f"{e} 2 prep {j} 0\n{s} 1 send {s - 50} 0\n"
+        )
+    stamps = tmp_path / "stamps"
+    stamps.write_text("".join(lines[::-1]))
+    got = probe.idle(str(stamps), 5e-9)
+    assert got["idle_s"] == pytest.approx(445e-6)
+    assert (got["p10_s"], got["p90_s"]) == pytest.approx((409e-6, 481e-6))
+    assert (got["requests"], got["per_byte_s"]) == (10, 5e-9)
+    # A second app call before the first request's engine send pairs nothing.
+    stamps.write_text("".join(lines) + f"{calls[0] + 1} 1 app {calls[0] + 1} 0\n")
+    with pytest.raises(
+        SystemExit, match="10 engine sends, not one each after each of 11"
+    ):
+        probe.idle(str(stamps))
