@@ -266,12 +266,13 @@ def test_a_decode_point_sits_at_its_longest_row_a_prefill_at_its_rows_mean_cache
     points += [
         _point(2, 200e3, context=3000) | {"rows": [[1, 3000, True], [1, 1000, True]]}
     ]
-    points += [_prefill(64, 1, 300e3, "attn"), _prefill(64, 1, 310e3, "attn", 0)]
-    points += [_prefill(64, 1, 400e3, "attn", 512, rows=[[64, 64 + 512, False]])]
+    points += [_prefill(64, 2, 300e3, "attn"), _prefill(64, 2, 310e3, "attn", 0)]
+    uneven = [[32, 32 + 256, False], [32, 32 + 768, False]]
+    points += [_prefill(64, 2, 400e3, "attn", 512, rows=uneven)]
 
     assert _families(points) == [
         (["B", "context"], [[[2, 1024], 100e3], [[2, 3000], 200e3]]),
-        (["T", "B", "context"], [[[64, 1, 0], 305e3], [[64, 1, 512], 400e3]]),
+        (["T", "B", "context"], [[[64, 2, 0], 305e3], [[64, 2, 512], 400e3]]),
     ]
 
 
