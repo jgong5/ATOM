@@ -539,7 +539,7 @@ def test_it_is_one_step_granularity_line():
     assert replay().granularity is Granularity.STEP
     assert replay().describe() == (
         "step grid, bundle replay; replay decode grid, timing scope forward; "
-        "recipe step-grid-residual v2, members decode: unit; prefill_output: unit; "
+        "recipe step-grid-residual v3, members decode: unit; prefill_output: unit; "
         "prefill_no_output: unit"
     )
 
