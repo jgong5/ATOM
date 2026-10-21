@@ -98,6 +98,7 @@ import copy
 import dataclasses
 import datetime
 import functools
+import gc
 import hashlib
 import importlib
 import inspect
@@ -908,9 +909,14 @@ def _replay(fn, calls) -> list[float]:
 
 @contextlib.contextmanager
 def _contained(capture):
-    """`capture` entered, and when it fails, undone what it leaves behind for
-    later leaves: its stream current, the generator in capture, and the
-    capture HIP leaves open on its stream when a call invalidated it."""
+    """`capture` entered with no garbage collection, and when it fails,
+    undone what it leaves behind for later leaves: its stream current, the
+    generator in capture, and the capture HIP leaves open on its stream when
+    a call invalidated it. A failed capture's graph can sit in a reference
+    cycle, and a graph freed during a capture synchronizes the device, which
+    ends the process."""
+    collecting = gc.isenabled()
+    gc.disable()
     try:
         with capture:
             yield
@@ -924,6 +930,9 @@ def _contained(capture):
         generator = torch.cuda.default_generators[torch.cuda.current_device()]
         generator.graphsafe_set_state(generator.clone_state())
         raise
+    finally:
+        if collecting:
+            gc.enable()
 
 
 def _end_capture(stream) -> None:

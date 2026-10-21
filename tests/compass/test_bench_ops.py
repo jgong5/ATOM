@@ -9,6 +9,7 @@ context, as ATOM's runner does, and whose forward raises.
 import contextlib
 import dataclasses
 import functools
+import gc
 import json
 import os
 import pathlib
@@ -886,8 +887,10 @@ def test_a_capture_that_fails_refuses_its_leaf_and_the_next_draws_its_activation
 ):
     # HIP's capture end refuses a graph a call invalidated and leaves its
     # stream current and still capturing, and the generator in capture: a
-    # draw then raises, and so does the next capture on that stream.
+    # draw then raises, and so does the next capture on that stream. A graph
+    # a garbage collection frees in a capture would end the process.
     world = {"stream": "main", "capturing": set(), "generator": "free"}
+    collecting = []
     randn = torch.randn
 
     def draw(*args, **kwargs):
@@ -906,6 +909,7 @@ def test_a_capture_that_fails_refuses_its_leaf_and_the_next_draws_its_activation
             if "capture" in world["capturing"]:
                 raise RuntimeError("Cannot register the state during capturing")
             self.found = world["stream"]
+            collecting.append(gc.isenabled())
             world.update(stream="capture", generator="capturing")
             world["capturing"].add("capture")
 
@@ -960,6 +964,7 @@ def test_a_capture_that_fails_refuses_its_leaf_and_the_next_draws_its_activation
     assert "previous error" in neg["refused"]
     assert "refused" not in abs_ and abs_["cold_ns"] > 0
     assert world == {"stream": "main", "capturing": set(), "generator": "free"}
+    assert collecting == [False] * 3 and gc.isenabled()
 
 
 def test_a_device_argument_is_the_rank_s_own_device():
