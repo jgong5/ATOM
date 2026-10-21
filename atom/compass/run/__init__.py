@@ -1289,18 +1289,12 @@ def runner(model_runner, tree) -> None:
         law = run[STEP_LINEAR]
         backend = StepLinearBackend(StepLinearLaw(law), dp)
         if "engine_config" in law:
-            from atom.compass.run.step_grid import keyed
+            from atom.compass.run.step_grid import differ, keyed
 
-            fitted, here = law["engine_config"], keyed(config)
-            differ = [
-                f"{name} {fitted.get(name)!r} in the law and {here.get(name)!r} here"
-                for name in {**fitted, **here}
-                if fitted.get(name) != here.get(name)
-            ]
-            if differ:
+            if named := differ(law["engine_config"], keyed(config), "the law"):
                 raise ValueError(
                     "the step linear law was fitted under another engine "
-                    "config: " + "; ".join(differ)
+                    "config: " + "; ".join(named)
                 )
         else:
             raise ValueError(
@@ -1490,9 +1484,10 @@ def runner(model_runner, tree) -> None:
 def _op_graphs(root: str, config, arch: str):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or None; under DP, at the rows the step's MoE gathers."""
+    that does not, or when it holds none `forward.missed`'s text, None for no
+    text; under DP, at the rows the step's MoE gathers."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
-    from atom.compass.capture.forward import Shape, structure
+    from atom.compass.capture.forward import Shape, missed, structure
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
     dp = config.parallel_config.data_parallel_size
@@ -1500,12 +1495,12 @@ def _op_graphs(root: str, config, arch: str):
     @functools.lru_cache(maxsize=64)
     def graph(
         phase: str, tokens: int, seqs: int, output: bool = True, gathered=None
-    ) -> dict | None:
+    ) -> dict | str | None:
         shape = str(Shape(phase, tokens, seqs, gathered).at(dp))
         at = structure(config, phase, True, arch, output)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
         if not store.directory_for(key).exists():
-            return None
+            return missed(store, key) or None
         return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
 
     return graph

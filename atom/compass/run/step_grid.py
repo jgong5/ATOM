@@ -109,6 +109,22 @@ def keyed(config, ladder: bool = True) -> dict:
     }
 
 
+def differ(there: dict, here: dict, where: str) -> list[str]:
+    """Each field of two `keyed` engine configs that differs, with `there`'s
+    value as `where` states it and `here`'s, a field both state as a mapping by
+    each of its entries, so a performance variable by its own name."""
+    named = []
+    for name in {**there, **here}:
+        a, b = there.get(name), here.get(name)
+        if isinstance(a, dict) and isinstance(b, dict):
+            named += differ(
+                *({f"{name} {k}": v for k, v in c.items()} for c in (a, b)), where
+            )
+        elif a != b:
+            named.append(f"{name} {a!r} in {where} and {b!r} here")
+    return named
+
+
 def conditions(config, machine) -> Conditions:
     """This run's readings: `readings` of this process's ATOM tree, the served
     config.json and `keyed`."""

@@ -157,6 +157,39 @@ def structure(
     return key if output else f"{key} no output"
 
 
+def _engine(text: str):
+    """A structure's `text` before its engine config, the config, and the text
+    after; None for a structure that states none."""
+    head = " ".join(text.split(" ", 3)[:3])
+    try:
+        engine, end = json.JSONDecoder().raw_decode(text, len(head) + 1)
+    except ValueError:
+        return None
+    return isinstance(engine, dict) and (head, engine, text[end:])
+
+
+def missed(store, key) -> str:
+    """For an `op_graph` `key` `store` holds no entry at, each engine field
+    (`step_grid.differ`) in which a graph it holds at the key's shape and
+    otherwise the key's structure differs, as text; "" when it holds none."""
+    from atom.compass.artifacts.store import ENTRY_FILE
+    from atom.compass.run.step_grid import differ
+
+    head, here, tail = _engine(key.values["structure"])
+    named = []
+    for path in sorted((store.root / key.kind.value).glob(f"[!.]*/{ENTRY_FILE}")):
+        there = json.loads(path.read_bytes())["key"]
+        if there.get("shape") == key.values["shape"]:
+            at = _engine(there.get("structure", ""))
+            if at and (at[0], at[2]) == (head, tail):
+                named.append(", ".join(differ(at[1], here, "the graph")))
+    return "".join(
+        f"; a graph the store holds at this shape and structure differs in engine "
+        f"config: {n}"
+        for n in named
+    )
+
+
 def _atom_frames():
     """The ATOM frames on the stack, innermost first, Compass's own excluded."""
     frames, frame = [], sys._getframe(1)

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 """An `op_graph`'s key holds the engine config a step law is keyed by, less its
 ladder: one store holds V4-Pro graphs of one shape that differ only in the KV
-cache dtype, or only in ``ATOM_USE_TRITON_MOE``, and each reader takes its own.
+cache dtype, or only in ``ATOM_USE_TRITON_MOE`` or ``ATOM_USE_TRITON_MOE_DECODE``,
+and each reader takes its own; a reader in another environment refuses naming
+each variable that differs.
 A step law is checked on the same fields, so one fitted on aiter's experts
 refuses a Triton run; a config at ATOM's MoE defaults keys the fields an
 existing law states.
@@ -16,12 +18,23 @@ from types import SimpleNamespace
 import pytest
 import torch
 from test_artifact_store import CONDITIONS, GATES, stanza
+from test_backend_step_linear import view
 from test_drive_runfile import build, install, step_linear
 from test_op_graph_arch import ENGINE
 from test_run_step_grid import deployment
+from test_work import SPEC
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
-from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
+from atom.compass.artifacts import (
+    ArtifactRefusal,
+    ArtifactStore,
+    Key,
+    Kind,
+    Topology,
+    member_name,
+)
+from atom.compass.backends import CostRefused
+from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.bench import ops
 from atom.compass.capture import driverless
 from atom.compass.capture.forward import decode, structure
@@ -36,6 +49,10 @@ VARIANTS = {
     "bf16": ({}, {}),
     "fp8": ({"kv_cache_dtype": "fp8"}, {}),
     "triton": ({}, {"ATOM_USE_TRITON_MOE": "1"}),
+    "triton-decode": (
+        {},
+        {"ATOM_USE_TRITON_MOE": "1", "ATOM_USE_TRITON_MOE_DECODE": "1"},
+    ),
 }
 
 
@@ -108,7 +125,7 @@ def test_each_reader_takes_the_graph_of_its_own_engine(
             {},
             {},
             {"ATOM_USE_TRITON_MOE": "1"},
-            "env {} in the law and {'ATOM_USE_TRITON_MOE': '1'} here",
+            "env ATOM_USE_TRITON_MOE None in the law and '1' here",
         ),
         (
             {"moe_backend": "mega"},
@@ -143,3 +160,24 @@ def test_atom_s_moe_defaults_key_the_fields_an_existing_law_states(tmp_path):
         "moe_backend": "mega",
         "eplb_enable": True,
     }
+
+
+def test_a_graph_traced_in_another_environment_is_refused_naming_the_variable(
+    store, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    config = _v4(tmp_path)
+    lookup = _op_graphs(store.root, config, "gfx950")
+    named = (
+        "a graph the store holds at this shape and structure differs in engine "
+        "config: env OMP_NUM_THREADS None in the graph and '8' here"
+    )
+
+    with pytest.raises(CostRefused) as run:
+        OpGraphBackend(SPEC, lookup, dp=8, kv="bf16").price(view(*[(1, 9, True)] * 2))
+    with pytest.raises(ArtifactRefusal) as bench:
+        ops.graph(store, config, decode(2))
+    assert lookup("decode", 3, 3) is None
+    for refused in (run, bench):
+        assert named in str(refused.value)
+        assert "kv_cache_dtype 'fp8' in the graph and 'bf16' here" in str(refused.value)
