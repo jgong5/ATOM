@@ -5,15 +5,18 @@ Each extractor matches a hand count on one shape, the MoE's in expectation
 under uniform routing; the whole attention as one leaf is refused by name;
 every leaf of the nightly DPA-TP8 captures, EP off and EP8, has work that
 prices, the attention's own kernels among them; and the op-level backend
-prices a V4-Pro decode step and a prefill step.
+prices a V4-Pro decode step and a prefill step. Under `ATOM_USE_TRITON_MOE`
+every leaf prices too, the experts at bf16 at EP off, fp8 at EP8, and fp4
+under `ATOM_USE_TRITON_MOE_A4W4`.
 """
 
 from dataclasses import replace
 from math import comb
 
 import pytest
+import test_capture_v4_pro
 from test_capture_v4_pro import DPA_TP8, EP8, SHAPES, capture
-from test_op_work import I32, ONE, _view, leaf, rows, t
+from test_op_work import BF16, I32, ONE, _view, leaf, rows, t
 from test_work import machine
 
 from atom.compass.backends.op_graph import OpGraphBackend
@@ -86,6 +89,86 @@ def test_under_expert_parallelism_the_busiest_rank_s_share_runs(mask):
     load, hit = max_rank_load(8, 2, 16, 4), activated_experts(16, 2, 8) / 4
 
     close(work(moe(8, 4, mask), ONE, 1, "bf16"), experts(8, load, hit, mask))
+
+
+TRITON = "aiter.ops.triton.moe."
+GEMM = TRITON + "moe_op_gemm_{0}w4:moe_gemm_{0}w4"
+#: The activation each Triton experts GEMM kind takes, as its leaf states it:
+#: dtype and packed width of a 64-wide row.
+ACTS = {"a16": (BF16, 64), "a8": (FP8, 64), "a4": (U8, 32)}
+
+
+def triton(kind, rows, local, gemm2=False):
+    """One of the Triton experts' GEMMs over the routed experts of `moe`'s
+    shapes: the gate-up, which gathers the rows and applies SwiGLU, or the
+    down, which scatters its routes back into the rows."""
+    dtype, packed = ACTS[kind]
+    k, n = (32, 64) if gemm2 else (64, 64)
+    slot = "scatter_indx" if gemm2 else "gather_indx"
+    state = [["gate_scal", t([rows * 2], F32)], ["n_expts_tot", local]]
+    return leaf(
+        GEMM.format(kind),
+        x=t([rows * 2, packed // 2] if gemm2 else [rows, packed], dtype),
+        w=t([local, k // 2, n], U8, role="weight"),
+        x_scales=t([rows, 2], U8),
+        w_scales=t([local, n, k // 32], U8, role="weight"),
+        bias=None,
+        routing_data={
+            "object": TRITON + "moe_routing.routing:RoutingData",
+            "state": state + [["n_expts_act", 2]],
+        },
+        **{slot: t([rows * 2], I32)},
+        gammas=t([rows * 2], F32) if gemm2 else None,
+        out_dtype=BF16 if gemm2 else FP8,
+        apply_swiglu=not gemm2,
+        y_out=None,
+    )
+
+
+@pytest.mark.parametrize("ep", [1, 4], ids=["ep_off", "ep4"])
+def test_the_triton_experts_gemms_are_the_routed_experts_products(ep):
+    # Sixteen experts in all: every one local at EP off, four a rank at EP4.
+    local = 16 // ep
+    load = 8 * 2 if ep == 1 else max_rank_load(8, 2, 16, ep)
+    hit = activated_experts(16, 2, 8) / ep
+    share = load / 16
+
+    up, down = (work(triton("a8", 8, local, g), ONE, 1, "bf16", ep) for g in (0, 1))
+
+    weights = (32 * 64 + 64 * 2, 16 * 64 + 64 * 1)
+    # Gate-up: the fp8 rows, their scales and gather index, and SwiGLU's half
+    # written in fp8; down: the routes' fp8 rows, scales, index and weights,
+    # and the tokens' bf16 rows.
+    io = (8 * 64 + 8 * 2 + 16 * 4 + 16 * 32, 16 * 32 + 8 * 2 + 16 * 8 + 8 * 64 * 2)
+    for got, flops, held, moved in zip((up, down), (64 * 64, 32 * 64), weights, io):
+        close(got, Work({"fp8": 2 * load * flops}, held * hit + moved * share))
+
+
+@pytest.mark.parametrize("kind, fmt", [("a16", "bf16"), ("a8", "fp8"), ("a4", "fp4")])
+def test_the_triton_experts_run_at_the_activation_format_their_kind_names(kind, fmt):
+    for gemm2 in (False, True):
+        got = work(triton(kind, 8, 16, gemm2), ONE, 1, "bf16")
+
+        assert got.flops_by_format == {fmt: 2 * 16 * 64 * (32 if gemm2 else 64)}
+
+
+def test_a_triton_experts_gemm_with_no_routes_is_refused_by_name():
+    op = triton("a8", 8, 16)
+    op["args"]["gather_indx"] = None
+
+    with pytest.raises(CostRefused, match="moe_gemm_a8w4: no top k in routing_data"):
+        work(op, ONE, 1, "bf16")
+
+
+def test_an_mx_downcast_writes_its_values_and_a_scale_byte_per_32():
+    op = leaf(
+        TRITON + "quant_moe:downcast_to_mxfp",
+        src_tensor=t([8, 64]),
+        out_quant_type=FP8,
+        axis=-1,
+    )
+
+    assert work(op, ONE, 1, "bf16") == Work({}, 8 * 64 * 2 + 8 * 64 + 8 * 2)
 
 
 def test_a_block_scaled_fp8_gemm_reads_its_scales_once():
@@ -263,3 +346,39 @@ def test_every_v4_pro_leaf_prices(ep, tmp_path_factory):
         graph, _ = graphs[shape]
         backend = OpGraphBackend(SPEC, lambda *s, g=graph: g["region"], kv="fp8")
         assert backend.price(view).seconds > 0
+
+
+@pytest.mark.parametrize(
+    "ep, a4w4, fmt",
+    [("", "0", "bf16"), (EP8, "0", "fp8"), (EP8, "1", "fp4")],
+    ids=["ep_off", "ep8", "ep8_a4w4"],
+)
+def test_v4_pro_s_triton_experts_price_at_the_format_their_kernels_run(
+    ep, a4w4, fmt, tmp_path_factory, monkeypatch
+):
+    monkeypatch.setenv("ATOM_USE_TRITON_MOE", "1")
+    monkeypatch.setenv("ATOM_USE_TRITON_MOE_A4W4", a4w4)
+    # `capture` keys its cache by the arguments alone, not the environment.
+    monkeypatch.setattr(test_capture_v4_pro, "_CAPTURES", {})
+    graphs = capture(tmp_path_factory, "--width 1 --prefill 512 1" + DPA_TP8 + ep)
+    width = 8 if ep else 1
+
+    formats = set()
+    for shape, (graph, _) in graphs.items():
+        view = _view(shape)
+        for op, _ in leaves(graph["region"]).values():
+            w = work(op, view, 1, "fp8", width)
+            assert w is None or price(w, SPEC) > 0
+            gemm = op["op"].startswith(TRITON + "moe_op_gemm_")
+            formats |= set(w.flops_by_format) if gemm else set()
+    assert formats == {fmt}
+
+    # The backend hands its EP width to the experts: a rank runs its share of
+    # every rank's experts, not every route over its own.
+    graph, _ = graphs["prefill T=512 B=1"]
+    view = replace(_view("prefill T=512 B=1"), produces_output=True)
+    seconds = [
+        OpGraphBackend(SPEC, lambda *s: graph["region"], kv="fp8", ep=n).price(view)
+        for n in (width, 1)
+    ]
+    assert seconds[0].seconds < seconds[1].seconds if ep else seconds[0].seconds > 0
