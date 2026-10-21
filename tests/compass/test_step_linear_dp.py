@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """The step linear law under DP-attention with EP off: one law per rank, priced at
 the deployment's DP width, the group's step the max over its ranks. The checked-in
-DeepSeek-V4-Pro EP8 laws install at their own side's engine config only.
+DeepSeek-V4-Pro EP8 laws install at their own side's engine config only, and
+validate a step at every decode rung they fit.
 
 Each rank's record is written from a known per-rank law, every line labelled
 with the group's step, the max over the ranks' prices, as a real DP group's
@@ -10,6 +11,7 @@ ranks each measure it. The fitted law is read by `StepLinearLaw` and priced by
 """
 
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -256,3 +258,37 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
         ValueError, match="enable_expert_parallel True in the law and False here"
     ):
         installed(False)
+
+
+def _inside(hull: dict, features: tuple) -> dict:
+    """The centre of the largest ball inside `hull`, a law's HULL over `features`."""
+    from scipy.optimize import linprog
+
+    vary = [f for f in features if f not in hull["equal"]]
+    a = np.array(hull["facets"], dtype=np.float64).reshape(-1, len(vary) + 1)
+    rows = np.column_stack([a[:, :-1], np.linalg.norm(a[:, :-1], axis=1)])
+    free = [(None, None)] * len(vary) + [(0, None)]
+    x = linprog([0] * len(vary) + [-1], A_ub=rows, b_ub=-a[:, -1], bounds=free).x
+    return {**hull["equal"], **dict(zip(vary, x[:-1]))}
+
+
+def _decode_step(rung: int, context: float, graph_padding: float) -> BatchView:
+    """A step replaying `rung` at about that point: its widest row sets
+    `rung * widest = Sum N_KV + padding`, and the others share the rest."""
+    widest = math.ceil((context + graph_padding) / rung)
+    rest = max(0, round(context) - widest)
+    n = math.ceil(rest / widest)
+    shares = [rest // n + (i < rest % n) for i in range(n)]
+    return BatchView(tuple(RequestShape(1, c, True) for c in [widest, *shares]), rung)
+
+
+@pytest.mark.parametrize("side", ["prefill", "decode"])
+def test_each_v4_pro_ep8_law_validates_a_step_at_every_decode_rung_it_fits(side):
+    name = f"deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{side}.json"
+    fitted = json.loads((COMPASS / "laws" / name).read_text())
+    backend = StepLinearBackend(StepLinearLaw(fitted))
+    for rung, vector in fitted["decode"].items():
+        assert "held_out" in vector, f"rung {rung} has no held-out hull"
+        at = _inside(vector["held_out"]["hull"], ("context", "graph_padding"))
+        cost = backend.price(_decode_step(int(rung), **at))
+        assert all(t.provenance.validated for t in cost.terms), f"rung {rung}"
