@@ -478,7 +478,7 @@ the step bench, and the op bench is apart from it. Revised 2026-10-21 by the own
 ([#1868](https://github.com/jgong5/ATOM/issues/1868)): the op bench runs no forward.**
 It builds ATOM's runner for the whole model with its parameters on the meta device
 (`RapidServeModelRunner._init_weight_params_on_meta`), skips ATOM's warmup, and sizes
-the KV pool without a forward. Each placement of a point its planner placed reaches the
+the KV pool without a forward. Each placement of a planned point reaches the
 runner as a batch through `ModelRunner.prepare_model`, so ATOM builds the metadata and
 forward context as for any step, and the bench snapshots them; it then times each leaf of
 the point's `op_graph` from its contract, cold (D38, Phase 1b). No forward of the
