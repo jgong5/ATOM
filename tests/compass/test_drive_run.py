@@ -450,6 +450,20 @@ def test_op_coverage_counts_covered_steps_by_phase_and_why_each_kind_left_one_ou
     }
 
 
+def test_op_coverage_counts_a_step_once_per_kind_however_many_whys_it_has():
+    def two_gemms(phase, *shape):
+        return {"seq": [g(2, 64, 64), g(2, 128, 64)]}
+
+    backend = OpGraphBackend(SPEC, two_gemms, kv="bf16", price_list=BENT)
+    step = step_line(*[(1, 1500, True)] * 2, rung=2)
+
+    report = drive_run.op_coverage(backend, [("0", step)])
+
+    assert report["left out, by leaf kind"] == {
+        GEMM: {"no point of its signature was measured": 1}
+    }
+
+
 def op_graph_run(tmp_path, monkeypatch, steps, price_list):
     """Serve from the planted server, which writes the record `steps`, with
     ATOM's arguments resolving the deployment `bundle` does and the store

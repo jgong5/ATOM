@@ -226,7 +226,8 @@ def check(inputs, run: dict, atom_args) -> dict:
 def op_coverage(backend, steps) -> dict:
     """How the price list of `backend`, an `OpGraphBackend`, covers the named
     step-record lines `steps`: the steps and those covered by phase, and per
-    leaf kind the steps it left out by why, numbers masked. A step is covered
+    leaf kind the steps it left out by why, numbers masked, one why (its last)
+    per kind per step so a kind's counts sum to steps. A step is covered
     when the list prices each leaf the backend asks it for; a leaf it declines,
     on a line the fit declined among them, goes to the roofline and leaves its
     step out. A step the backend refuses is left out under ``step refused``."""
@@ -245,14 +246,14 @@ def op_coverage(backend, steps) -> dict:
             ]
         except CostRefused as refused:
             terms = [("step refused", refused.declined)]
-        whys = dict.fromkeys(
-            (kind, re.sub(NUMBER, "#", r.reason.removeprefix(f"{kind}: ")))
+        whys = {
+            kind: re.sub(NUMBER, "#", r.reason.removeprefix(f"{kind}: "))
             for kind, refusals in terms
             for r in refusals
-        )
+        }
         phase = "prefill" if view.prefill else "decode"
         by_phase[phase].update(steps=1, covered=int(not whys))
-        for kind, why in whys:
+        for kind, why in whys.items():
             out[kind][why] += 1
     total = sum(by_phase.values(), Counter())
     return {
