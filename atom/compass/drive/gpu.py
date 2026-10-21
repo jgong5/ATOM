@@ -126,16 +126,16 @@ def kfd_pid() -> str:
     without one, the PID `/proc/self/sched` prints."""
     procs = KFD / "proc"
 
-    def listed() -> set[str]:
-        return set(os.listdir(procs)) if procs.is_dir() else set()
+    def listed() -> list[str]:
+        return os.listdir(procs) if procs.is_dir() else []
 
     if os.getpid() not in _ADDED:
         seen = listed()
         with suppress(OSError), DEV_KFD.open("rb"):
             # ponytail: a neighbour opening KFD in the same instant adds a
             # second entry; neither is taken, and the checks may name this one.
-            if len(added := listed() - seen) == 1:
-                _ADDED[os.getpid()] = added.pop()
+            if len(added := [p for p in listed() if p not in seen]) == 1:
+                _ADDED[os.getpid()] = added[0]
     if _ADDED.get(os.getpid()) in listed():
         return _ADDED[os.getpid()]
     return re.search(r"\((\d+), #threads", SCHED.read_text()).group(1)
