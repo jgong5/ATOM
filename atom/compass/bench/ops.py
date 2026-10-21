@@ -552,8 +552,8 @@ class Stub:
         )
         for key in instances[0].values():
             held = self.contexts.get(key, self.modules.get(key))
-            if hasattr(held, "layer_num"):
-                held = kv.get(f"layer_{self.contexts[key].layer_num}")
+            if key in self.contexts and hasattr(held, "layer_num"):
+                held = kv.get(f"layer_{held.layer_num}")
                 unit = rows if _stateful(held) else blocks
                 # ponytail: a tensor's first dim is its blocks or its state slots
                 size += sum(t.nbytes // t.shape[0] * unit for t in _fields(held))
