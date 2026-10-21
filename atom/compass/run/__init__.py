@@ -1533,14 +1533,14 @@ def _price_list(run: dict, config, machine):
     the reading that differs."""
     from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind
     from atom.compass.fit.ops import PriceList
-    from atom.compass.fit.publish import RANK
     from atom.compass.run.step_grid import conditions
 
     key = Key.of(Kind.PRICE_LIST, **run[PRICE_LIST])
     entry = ArtifactStore(run["store"]).load(
         key, conditions=conditions(config, machine), gates=GateState.of()
     )
-    return PriceList(json.loads(entry.read_member("params", RANK, "json")))
+    rank = entry.topology.ranks()[0]
+    return PriceList(json.loads(entry.read_member("params", rank, "json")))
 
 
 def _graph_pool(model_runner, machine, model):
