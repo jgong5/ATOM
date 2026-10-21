@@ -133,13 +133,13 @@ def sides(run) -> list[Path]:
     return [run / s for s in SIDES] if (run / SIDES[0]).is_dir() else [run]
 
 
-def _steps(cell) -> list[list[dict]]:
-    """Each DP rank's steps, its dummy runs left out."""
+def _steps(cell) -> list[dict]:
+    """Every DP rank's steps, rank by rank, their dummy runs left out."""
     # Each rank's record, and not the cost lines a simulated run writes beside it.
     ranks = sorted((Path(cell) / "steps").glob("dp*[0-9].jsonl"))
     if not ranks:
         raise ValueError(f"{cell} holds no DP rank's record")
-    return [[s for s in read_jsonl(r) if not s["is_dummy_run"]] for r in ranks]
+    return [s for r in ranks for s in read_jsonl(r) if not s["is_dummy_run"]]
 
 
 def _requests(steps) -> collections.Counter:
@@ -226,19 +226,15 @@ def _client_run(cell, run, client) -> tuple[list[dict], list[str], dict]:
     the warmup's, and how many steps hold only those; refuses, naming every
     reason, a run grading does not take. Its DP ranks step together, so their
     steps are taken in step order, every rank's step k one."""
+    steps = _steps(cell)
     export = read_json(Path(client) / CLIENT_RUN)
     warmup_names = set(export.get("warmup") or ())
     record = served(Path(cell) / "steps", [export["requests"]])
-    rows = []
-    for raw, split in zip(_steps(cell), record.values()):
-        split = [s for s in split if not s["is_dummy_run"]]
-        ids = {k: v for s in split for k, v in s.get("response_ids", {}).items()}
-        rows += [
-            (r, s, {ids.get(b[0], b[0]) for b in s["batch"]})
-            for r, s in zip(raw, split)
-        ]
-    rows.sort(key=lambda row: row[1]["step"])
-    steps, split, held = zip(*rows)
+    split = [s for rank in record.values() for s in rank if not s["is_dummy_run"]]
+    order = sorted(range(len(split)), key=lambda i: split[i]["step"])
+    steps, split = [steps[i] for i in order], [split[i] for i in order]
+    ids = {k: v for s in split for k, v in s.get("response_ids", {}).items()}
+    held = [{ids.get(r[0], r[0]) for r in s["batch"]} for s in split]
     warm = [bool(names) and names <= warmup_names for names in held]
     mine = [s["client_run"] == 0 for s in split]
     traces = sorted({t for s, m in zip(split, mine) if m for t in s["traces"]})
@@ -320,7 +316,7 @@ def graded(cell, client=None) -> tuple[list[dict], list[str] | None, dict | None
     run = read_json(path) if path.exists() else {}
     if "format_version" in run or (Path(client) / CLIENT_RUN).is_file():
         return _client_run(cell, run, client)
-    return [s for rank in _steps(cell) for s in rank], None, None
+    return _steps(cell), None, None
 
 
 def _refuse_by_run_file(cell) -> None:
