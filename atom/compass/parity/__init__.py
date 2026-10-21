@@ -53,7 +53,6 @@ schedules them in the other order names them the other way round, and `compare`
 may then report a step where the twins' rows differ.
 """
 
-import bisect
 import collections
 import copy
 import functools
@@ -68,6 +67,7 @@ from itertools import zip_longest
 import numpy as np
 
 from atom.compass.backends.json_file import read_json, read_jsonl
+from atom.compass.backends.step_labels import join_stamps
 
 ENV = "ATOM_COMPASS_PARITY_RECORD"
 #: The file in a real run's record directory holding when its workload was sent
@@ -531,7 +531,7 @@ def read(directory, stage: int = 0) -> dict[int, list[dict]]:
     for path in sorted(directory.glob(f"{prefix}dp*[0-9].jsonl")):
         steps = read_jsonl(path)
         if (pulls := path.with_suffix(".pulls.jsonl")).exists():
-            _join_stamps(steps, pulls)
+            join_stamps(steps, pulls)
         keys = {}
         for step in steps:
             for req_id, key, *response_id in step.pop("named"):
@@ -547,21 +547,6 @@ def read(directory, stage: int = 0) -> dict[int, list[dict]]:
                 row[0] = keys.get(row[0], row[0])
         record[int(path.stem[len(prefix) + 2 :])] = steps
     return record
-
-
-def _join_stamps(steps: list[dict], path) -> None:
-    """Put into each step the first stamp of each key in `path` at or after
-    its exit and before the next step's entry."""
-    times = collections.defaultdict(list)
-    for stamps in read_jsonl(path):
-        for key, ns in stamps.items():
-            times[key].append(ns)
-    ends = [s["t_enter_ns"] for s in steps[1:]] + [float("inf")]
-    for step, end in zip(steps, ends):
-        for key, ts in times.items():
-            i = bisect.bisect_left(ts, step["t_exit_ns"])
-            if i < len(ts) and ts[i] < end:
-                step[key] = ts[i]
 
 
 def _request_ranks(name: str, record: dict[int, list[dict]]) -> dict[str, int]:

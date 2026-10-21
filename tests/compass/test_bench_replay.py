@@ -111,6 +111,20 @@ def test_rows_hold_contiguous_blocks_of_a_fresh_pool_in_row_order(rule):
         rule(blocks=7).batch(line)
 
 
+def test_rows_sharing_blocks_hold_the_same_leading_blocks_then_their_own(rule):
+    """40 and 70 tokens, 39 and 69 cached, fill 3 and 5 blocks of 16 apart;
+    sharing 2 they hold 6, and the shorter's cached context fills 2."""
+    line = _line([[1, 40, True], [1, 70, True]]) | {"shared": 2}
+    batch = rule(blocks=6).batch(line)
+    assert [list(t) for t in batch.block_tables] == [[0, 1, 2], [0, 1, 3, 4, 5]]
+    assert batch.context_lens.tolist() == [40, 70]
+    with pytest.raises(ValueError, match="hold 6 KV blocks .* the pool has 5"):
+        rule(blocks=5).batch(line)
+    for shared in (3, -1, 1.0):
+        with pytest.raises(ValueError, match=f"share {shared} KV blocks, .* fills 2"):
+            rule().batch(line | {"shared": shared})
+
+
 def test_tokens_are_the_fillers_the_simulated_runner_reports(
     rule, model_dir  # noqa: F811
 ):
