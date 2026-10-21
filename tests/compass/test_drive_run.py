@@ -21,11 +21,13 @@ import pytest
 import test_drive_trace_steps
 import torch
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
+from test_capture_v4_pro import CONFIG as V4_PRO
 from test_dp_step_max import runner
 from test_drive_runfile import build, price_list_key, published
 from test_drive_trace_steps import IDENTITY
 from test_memory_readings import ASSUMED, DOCUMENT, READINGS
 from test_op_graph import BENT, GEMM, g, listed, pt
+from test_op_work_v4 import MORI
 from test_refused_step_continues import REFUSED, drive, finish, no_eager_rung
 from test_refused_step_continues import run_file as refusing_run_file
 from test_run_graph_pool import _installed
@@ -46,8 +48,13 @@ from test_work import SPEC
 
 from atom.compass import run as compass_run
 from atom.compass.artifacts import Key, Kind
-from atom.compass.backends.op_graph import OpGraphBackend
+from atom.compass.backends import op_graph
+from atom.compass.backends.cost import CostTerm
+from atom.compass.backends.op_graph import LISTED, OpGraphBackend
+from atom.compass.backends.provenance import Method, Provenance
+from atom.compass.backends.resolver import CostSource
 from atom.compass.backends.step_stub import Coefficients
+from atom.compass.backends.work import Work
 from atom.compass.clock import RefusalTally
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import serve, trace_steps
@@ -526,3 +533,55 @@ def test_coverage_of_an_op_graph_run_with_no_price_list_refuses_before_any_serve
 
     with pytest.raises(ValueError, match="^--coverage: the store holds no price_list"):
         drive_run.main(flags(tmp_path, "--op-graph", "--coverage", str(directory)))
+
+
+class Asked(CostSource):
+    """A price list that prices every leaf, keeping the kinds it was asked for."""
+
+    name = LISTED
+
+    def __init__(self):
+        self.kinds = set()
+
+    def price(self, request):
+        self.kinds.add(kind := request[0]["op"])
+        return CostTerm(f"op.{kind}", 1e-6, Provenance(Method.MEASURED))
+
+
+def test_coverage_of_a_v4_pro_ep8_run_asks_its_price_list_at_atom_s_ep_width(
+    tmp_path, monkeypatch
+):
+    # The nightly DPA-TP8 EP8 deployment, its server's own flags among ATOM's
+    # arguments. ATOM's MoE spans its eight DP ranks, as `compass run` reads
+    # off the model it builds.
+    (tmp_path / "v4").mkdir()
+    (tmp_path / "v4" / "config.json").write_bytes(V4_PRO.read_bytes())
+    atom = ["--model", str(tmp_path / "v4"), "-tp", "8", "--kv_cache_dtype", "fp8"]
+    atom += ["--enable-dp-attention", "--enable-expert-parallel"]
+    atom += ["--server-port", "8000"]
+    directory = recorded(tmp_path, monkeypatch, SHORT)
+    bounds = {k: ENGINE[k] for k in ("max_num_seqs", "max_num_batched_tokens")}
+    r = deployment(
+        tmp_path, **bounds, capture_sizes=LADDER, enable_expert_parallel=True
+    )
+    monkeypatch.setattr(drive_run, "_config", lambda atom_args: r.config)
+    kinds = ("aiter.fused_moe_.default", MORI + "dispatch", MORI + "combine")
+    region = {"seq": [{"op": kind, "args": {}} for kind in kinds]}
+    monkeypatch.setattr(compass_run, "_op_graphs", lambda *args: lambda *s: region)
+    asked = Asked()
+    monkeypatch.setattr(compass_run, "_price_list", lambda *args: asked)
+    widths = set()
+
+    def work(leaf, view, tp, kv, ep):
+        widths.add((leaf["op"], ep))
+        return Work()
+
+    monkeypatch.setattr(op_graph, "work", work)
+    run = {"store": str(tmp_path / "store"), "machine": DOCUMENT}
+    run |= {compass_run.OP_GRAPH: True, compass_run.PRICE_LIST: {}}
+
+    report = drive_run.check([str(directory)], run, atom)
+
+    assert report["covered"] == report["steps"] > 0
+    assert asked.kinds == set(kinds)
+    assert widths == {(kind, 8) for kind in kinds}
