@@ -520,7 +520,7 @@ a graph holds one shape (D18), and a node's arguments are its contract (D20).
 Graph   := (applicability, Region)
 Region  := Seq[Node] | Repeat(body: Region, count: int) | Par([Region], join: JoinPolicy)
 Node    := Op(name, kind, args: {slot: Arg}, out_shapes: [Shape],
-              stream_id, context_ref)
+              stream_id, context_ref, stated: {name: Value})
 Arg     := Tensor(shape, dtype, stride, role) | Value | ModuleRef(path)
 role    := activation | weight | KV | metadata
 ```
@@ -675,7 +675,7 @@ A trace is a straight-line record of one path at one shape, so branch modelling 
 
 | Part | Covers |
 |---|---|
-| **discrete key** | `ForwardMode`, `has_cached`, `produces_output()`, spec width, replayed vs eager, `tbo_on`, attention backend, `is_dummy_run` |
+| **discrete key** | `ForwardMode`, `has_cached`, `produces_output()`, spec width, replayed vs eager, `tbo_on`, attention backend, routed-expert kernel path (aiter or Triton), `is_dummy_run` |
 | **shape** | the decode width, or the prefill (T, B), the graph was captured at |
 
 ATOM already emits most of the discrete key: `atom/model_engine/run_labels.py` builds
@@ -865,6 +865,15 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   argmax lifts to `_apply_greedy_tokens`, whose host arch query `get_gfx_custom_op` is
   allowed inside the lifted frame. A kernel switch inside the frame, mrope's tiled kernel
   at B >= 128, disappears into the leaf.
+- **What a leaf reads but is not passed may be stated beside its arguments**, in the
+  op's `stated` field, by name; a call does not take it, and `bench.ops.signature`
+  includes it. Owner's [ruling on #1689](https://github.com/jgong5/ATOM/issues/1689#issuecomment-6292555659):
+  only DeepSeek-V4's two decode attention leaves state their layer's `window_size`,
+  `compress_ratio` and `index_topk` (null for a layer with no indexer), and its
+  indexer's score and top-k states its `compress_ratio`, read in the opened
+  attention's body from the layer `layer_name` names. Their index lists are sized for
+  the deployment's longest row, so the entries a row reads follow from these and its
+  context, not from the lists.
 
 Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers
 and DeepSeek-V4's attention aside, below), so its ambient reads stay
@@ -919,9 +928,12 @@ Their exchanges with other ranks are **declared nodes** (D21), as #1401 and the
 since a TBO step lays MORI's dispatch and combine on the comm stream as ops of their own.
 Each is named `module:qualname` for the function ATOM calls, its arguments by that
 function's parameter names: the DP gather and reduce-scatter as `atom.model_ops.moe`'s
-functions, MORI's dispatch and combine as `EpDispatchCombineOp`'s methods. A capture runs
-one rank, so each exchange's rows are stated, every peer at this rank's shape
-(`capture/peers.py`). A TBO step, two micro-batches interleaved, is refused by name until
+functions, MORI's dispatch and combine as `EpDispatchCombineOp`'s methods, which also
+state the EP width ATOM built their handle for (`num_ep_ranks`). A capture runs
+one rank, so each exchange's rows are stated, every peer at this rank's shape but for
+its token count: the peers split evenly the rows the shape's MoE gathers, G, less this
+rank's, every peer at this rank's count when G is its default (`capture/peers.py`;
+`07` Phase 1a). A TBO step, two micro-batches interleaved, is refused by name until
 its graphs exist (#1581).
 
 DeepSeek-V4's `v4_attention_with_output` is opened the same way (#1678), its body run as

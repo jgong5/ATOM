@@ -134,6 +134,17 @@ def test_a_machine_spec_that_refuses_exits_fit_with_its_refusal(tmp_path, verb, 
     assert exited.value.code == f"compass {verb}: {refusal.value}"
 
 
+def test_a_malformed_record_exits_fit_with_its_traceback(tmp_path):
+    """Its message names no file, so it is not printed as a refusal."""
+    a, machine = record(tmp_path / "a", 19), tmp_path / "spec.json"
+    machine.write_text(json.dumps(DOCUMENT))
+    (a / "run.json").write_text("{")
+
+    tail = ["--machine", machine, "--store", tmp_path / "store", "--out", tmp_path]
+    with pytest.raises(json.JSONDecodeError):
+        cli.main(["fit", "host", *map(str, [a, *clients(a), *tail])])
+
+
 LAUNCHER = Path(__file__).parents[2] / "scripts/compass/compass"
 
 

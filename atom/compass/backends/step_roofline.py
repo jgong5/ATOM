@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections import Counter
+from itertools import cycle
 from math import comb
 
 import numpy as np
@@ -66,6 +67,7 @@ from atom.compass.backends.shape import IMAGES, BatchView, RequestShape, sum_tok
 from atom.compass.backends.work import (
     ELEMENT_BYTES,
     Work,
+    _wider,
     activated_experts,
     all_to_all,
     allgather,
@@ -102,7 +104,8 @@ class Module:
     format its matrix products read activations in; `ranks` the group of the
     collective it joins, 1 for none; `fused` that the collective runs in the
     module's kernel; `layer` the decoder layer it sits in, -1 outside them;
-    `wire` the formats a `moe`'s all-to-all dispatch and combine send.
+    `wire` the formats a `moe`'s all-to-all dispatch and combine send;
+    `index` the format a `sparse_attention`'s indexer scores at.
     An unclassified module's `name` says what it is.
     """
 
@@ -115,6 +118,7 @@ class Module:
     act: str = ACT
     layer: int = -1
     wire: tuple[str, str] = (ACT, ACT)
+    index: str = "fp8"
 
 
 def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
@@ -205,51 +209,110 @@ def _prefix(n: np.ndarray, ratio: int = 1, cap: int | None = None) -> np.ndarray
     return ratio * whole * (whole - 1) // 2 + whole * (n - whole * ratio + 1)
 
 
-def _sparse_attention(m: Module, rows) -> Work:
-    """V4's attention: a query at position `p` reads the last `window` tokens
-    and the `p // ratio` compressed entries before it, or the indexer's top
-    `k` of them, which the indexer scores against every compressed entry. The
-    KV each request reads is read once."""
-    heads, dim, window, ratio, top, index_heads, index_dim = m.dims
+def _sparse_reads(rows, window: int, ratio: int, top: int | None = None):
+    """V4's attention over `rows`: a query at position `p` reads the last
+    `window` tokens and the `p // ratio` compressed entries before it, at most
+    `top` of them when `top` is set. Returns the new queries' keys and the KV
+    entries each request reads once, summed; then the new queries' compressed
+    entries, each of which an indexer scores, and each request's, summed."""
     seen = np.array([r.context_tokens for r in rows])
     held = seen - np.array([r.query_tokens for r in rows])
 
     def span(**k) -> int:
         return int((_prefix(seen, **k) - _prefix(held, **k)).sum())
 
-    keys, read = span(cap=window), np.minimum(seen, window).sum()
-    work = Work()
-    if ratio:
-        entries = seen // ratio
-        if index_heads:
-            scores = 2 * index_heads * index_dim * span(ratio=ratio)
-            index = int(entries.sum()) * index_dim * ELEMENT_BYTES[m.fmt]
-            work = Work({m.fmt: scores}, index)
-            entries = np.minimum(entries, top)
-        keys += span(ratio=ratio, cap=top if index_heads else None)
-        read += entries.sum()
-    q = sum_tokens(rows) * heads * dim * ELEMENT_BYTES[ACT]
-    flops = {ACT: 4 * heads * dim * keys}
-    return work + Work(flops, 2 * q + int(read) * dim * ELEMENT_BYTES[m.fmt])
+    keys, read = span(cap=window), int(np.minimum(seen, window).sum())
+    if not ratio:
+        return keys, read, 0, 0
+    entries = seen // ratio
+    keys += span(ratio=ratio, cap=top)
+    read += int((entries if top is None else np.minimum(entries, top)).sum())
+    return keys, read, span(ratio=ratio), int(entries.sum())
+
+
+def _sparse_products(rows, heads, dim, q, kv, window, ratio, top=None) -> Work:
+    """V4's attention products over `rows` (`_sparse_reads`): two of `dim` per
+    head and key, at the wider of Q's format `q` and the KV's `kv`, and the KV
+    entries each request reads, once each at `dim` in `kv`."""
+    keys, read, _, _ = _sparse_reads(rows, window, ratio, top)
+    return Work({_wider(q, kv): 4 * heads * dim * keys}, read * dim * ELEMENT_BYTES[kv])
+
+
+def _index_scores(rows, ratio, heads, dim, fmt) -> Work:
+    """V4's indexer over `rows`: each new query scored against every
+    compressed entry before it, one product of `dim` per head at `fmt`, and
+    each request's entries read once at `dim` in `fmt`."""
+    _, _, scored, entries = _sparse_reads(rows, 0, ratio)
+    return Work({fmt: 2 * heads * dim * scored}, entries * dim * ELEMENT_BYTES[fmt])
+
+
+def _sparse_attention(m: Module, rows) -> Work:
+    """V4's attention (`_sparse_products`) at Q's format `act` and the KV's
+    `fmt`, at most the indexer's top `k` compressed entries where it has one,
+    which scores every compressed entry at `index`. Q is read at `act`, O
+    written in bf16."""
+    heads, dim, window, ratio, top, index_heads, index_dim = m.dims
+    top = top if index_heads else None
+    work = _sparse_products(rows, heads, dim, m.act, m.fmt, window, ratio, top)
+    if ratio and index_heads:
+        work += _index_scores(rows, ratio, index_heads, index_dim, m.index)
+    q = sum_tokens(rows) * heads * dim
+    return work + Work({}, q * (ELEMENT_BYTES[m.act] + ELEMENT_BYTES[ACT]))
 
 
 def overlap(layers) -> float:
     """The finish time of two micro-batches' layers on one compute and one
     comm stream, in ATOM's issue order.
 
-    Each layer is four pairs of seconds, one per micro-batch: the compute
+    Each layer is pairs of seconds, one per micro-batch, on the compute and
+    comm streams in turn from compute: for a layer of modules, the compute
     before the MoE exchange, the exchange in, the routed experts, the exchange
     out. Within a layer every segment is issued for both micro-batches before
-    the next, compute and exchange alternating streams; a segment starts when
-    its stream is free and its micro-batch's previous segment is done.
+    the next; a segment starts when its stream is free and its micro-batch's
+    previous segment is done.
     """
     free = {"compute": 0.0, "comm": 0.0}
     done = [0.0, 0.0]
     for layer in layers:
-        for segment, stream in zip(layer, ("compute", "comm", "compute", "comm")):
+        for segment, stream in zip(layer, cycle(("compute", "comm"))):
             for k in 0, 1:
                 free[stream] = done[k] = max(free[stream], done[k]) + segment[k]
     return max(free.values())
+
+
+def micro_batches(view: BatchView) -> tuple[BatchView, BatchView]:
+    """A split step's two micro-batches on this rank, each with the group's
+    rows of it as `moe_rows`; a ValueError names a split that gives none.
+
+    This rank's pair is its `dp_rank` slot of `tbo_tokens`, or, unstated, the
+    one pair that sums to its tokens. The step is cut at the first one's
+    token count, a cut request's second part attending the first as history.
+    """
+    own = sum_tokens(view.requests)
+    pairs = list(zip(*view.tbo_tokens))
+    if view.dp_rank is not None:
+        pairs = pairs[view.dp_rank : view.dp_rank + 1]
+    pairs = list(dict.fromkeys(p for p in pairs if sum(p) == own))
+    if len(pairs) != 1:
+        raise ValueError(
+            f"the two-batch-overlap split {view.tbo_tokens} names no single "
+            f"pair of micro-batches for this rank's {own} tokens"
+        )
+    # ponytail: the micro-batches run their real rows; a split decode
+    # graph's padding is left out of this lower bound.
+    left, halves = pairs[0][0], ([], [])
+    for r in view.requests:
+        first = min(left, r.query_tokens)
+        left -= first
+        if first:
+            halves[0].append(RequestShape(first, r.cached_tokens + first, r.decode))
+        if r.query_tokens > first:
+            rest = r.query_tokens - first
+            halves[1].append(RequestShape(rest, r.context_tokens, r.decode))
+    a, b = (
+        BatchView(tuple(h), moe_rows=sum(t)) for h, t in zip(halves, view.tbo_tokens)
+    )
+    return a, b
 
 
 def _reads(work: Work) -> dict[str, list[str]]:
@@ -352,29 +415,11 @@ class StepRooflineBackend(CostBackend):
                 "on no stream"
             )
             return ""
-        own = sum_tokens(view.requests)
-        pairs = list(dict.fromkeys(p for p in zip(*view.tbo_tokens) if sum(p) == own))
-        if len(pairs) != 1:
-            refuse.append(
-                f"the two-batch-overlap split {view.tbo_tokens} names no single "
-                f"pair of micro-batches for this rank's {own} tokens"
-            )
+        try:
+            views = micro_batches(view)
+        except ValueError as exc:
+            refuse.append(str(exc))
             return ""
-        # ponytail: the micro-batches run their real rows; a split decode
-        # graph's padding is left out of this lower bound.
-        left, halves = pairs[0][0], ([], [])
-        for r in view.requests:
-            first = min(left, r.query_tokens)
-            left -= first
-            if first:
-                halves[0].append(RequestShape(first, r.cached_tokens + first, r.decode))
-            if r.query_tokens > first:
-                rest = r.query_tokens - first
-                halves[1].append(RequestShape(rest, r.context_tokens, r.decode))
-        views = [
-            BatchView(tuple(h), moe_rows=sum(t))
-            for h, t in zip(halves, view.tbo_tokens)
-        ]
         layers: dict[int, list[list[float]]] = {}
         units: dict = {}
         notes = stated.setdefault("tbo", [])
@@ -403,7 +448,7 @@ class StepRooflineBackend(CostBackend):
     def price(self, batch_view: BatchView) -> StepCost:
         refuse = []
         if batch_view.image_tokens:
-            refuse.append(IMAGES.format(batch_view.image_tokens))
+            refuse.append(IMAGES)
         if self.unclassified:
             refuse.append("unclassified modules: " + ", ".join(self.unclassified))
         if refuse:

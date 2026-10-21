@@ -31,15 +31,16 @@ class ReceiveMode(StrEnum):
 
 
 #: Measured admission delay from the traffic source into the serving stack, per
-#: path, in seconds; a run charges tokenization on top. ``serving`` was measured
-#: on hjbog-srdc-18 with the parity workload (`atom/compass/parity/traffic.py`,
-#: Qwen3-30B-A3B at TP2 with DP attention): the median, over its requests, of
-#: send to response headers less the prompt's encode time on that host.
+#: path, in seconds; a run charges tokenization on top. ``serving`` is the HTTP
+#: transport alone, measured on hjbog-srdc-18 by `scripts/compass/http_intake.py
+#: floor`: the median, over parity workload requests sent one at a time, of
+#: client send to the ASGI app call. The event loop's intake after that call is
+#: the machine spec's ``host.http_intake``, charged on top.
 #: ``offline_batch`` is from earlier work, which measured 13.7 ms end-to-end and
 #: found the two paths differ enough that one number would misprice one of them.
 ADMISSION_DELAY_S = {
     "offline_batch": 13.0e-3,
-    "serving": 1.6e-3,
+    "serving": 0.54e-3,
 }
 
 

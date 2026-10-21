@@ -4363,6 +4363,18 @@
    "mechanism_why": "a capture runs in the trace ops command, which is no LP and serves no simulated run, and its group has no peer to wait for"
   },
   {
+   "id": "atom/compass/capture/forward.py::_Recorder.wait::self.wait(waiter, waited)::event_wait#0",
+   "file": "atom/compass/capture/forward.py",
+   "symbol": "_Recorder.wait",
+   "call": "self.wait",
+   "expr": "self.wait(waiter, waited)",
+   "shape": "event_wait",
+   "peer": "none",
+   "why": "trace ops holds a stream fork or join seen inside a lifted function's call until the call ends, then records it again if the call launched nothing; it is the recorder's own bookkeeping of a fake stream, and nothing waits",
+   "mechanism": "K9",
+   "mechanism_why": "a capture runs in the trace ops command, which is no LP and serves no simulated run, and its streams are fakes with nothing to wait for"
+  },
+  {
    "id": "atom/compass/bench/engine.py::Bench.__init__::self.runner_mgr.call_func(\"get_num_blocks\", wait_out=True)::worker_rpc#0",
    "file": "atom/compass/bench/engine.py",
    "symbol": "Bench.__init__",
@@ -4471,6 +4483,18 @@
    "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
   },
   {
+   "id": "atom/compass/bench/ops.py::_replay::time.sleep(ms * REST / 1e3)::sleep#0",
+   "file": "atom/compass/bench/ops.py",
+   "symbol": "_replay",
+   "call": "time.sleep",
+   "expr": "time.sleep(ms * REST / 1e3)",
+   "shape": "sleep",
+   "peer": "none",
+   "why": "the op bench idles the host a share of each replay's device time after it, since back to back a leaf lowered the device's memory and fabric clocks and read slow",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
    "id": "atom/compass/bench/ops.py::_kernels::torch.cuda.synchronize()::device_sync#0",
    "file": "atom/compass/bench/ops.py",
    "symbol": "_kernels",
@@ -4516,6 +4540,115 @@
    "shape": "event_wait",
    "peer": "process",
    "why": "measure ops waits for that process to return its points or finish the capture",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
+   "id": "atom/compass/bench/ops.py::_function::wait(fn(**kwargs))::event_wait#0",
+   "file": "atom/compass/bench/ops.py",
+   "symbol": "_function",
+   "call": "wait",
+   "expr": "wait(fn(**kwargs))",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "the op bench waits on a functional collective leaf's result on its stream, as the in-place collective ATOM calls does",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
+   "id": "atom/compass/bench/ops.py::_together::torch.distributed.all_reduce(flag, group=device)::collective#0",
+   "file": "atom/compass/bench/ops.py",
+   "symbol": "_together",
+   "call": "torch.distributed.all_reduce",
+   "expr": "torch.distributed.all_reduce(flag, group=device)",
+   "shape": "collective",
+   "peer": "process",
+   "why": "over several ranks, each rank's stream waits on one all-reduce before each replay and each profiled call, so they start together on every device",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
+   "id": "atom/compass/bench/ops.py::_together::torch.distributed.barrier(group=group)::barrier#0",
+   "file": "atom/compass/bench/ops.py",
+   "symbol": "_together",
+   "call": "torch.distributed.barrier",
+   "expr": "torch.distributed.barrier(group=group)",
+   "shape": "barrier",
+   "peer": "process",
+   "why": "over several ranks, every rank of the op bench waits for the others on their CPU group before each replay, so the hosts launch each replay, and each profiled call, together",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
+   "id": "atom/compass/bench/ranks.py::agreed::dist.all_reduce(value, op=op, group=group)::collective#0",
+   "file": "atom/compass/bench/ranks.py",
+   "symbol": "agreed",
+   "call": "dist.all_reduce",
+   "expr": "dist.all_reduce(value, op=op, group=group)",
+   "shape": "collective",
+   "peer": "process",
+   "why": "the op bench's ranks agree on a count over their CPU group: the fewest KV blocks any can allocate, the most calls a leaf's graph holds",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
+   "id": "atom/compass/bench/ranks.py::launch::ProcessPoolExecutor(len(calls), mp_context=spawn)::thread_start#0",
+   "file": "atom/compass/bench/ranks.py",
+   "symbol": "launch",
+   "call": "ProcessPoolExecutor",
+   "expr": "ProcessPoolExecutor(len(calls), mp_context=spawn)",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "none",
+   "why": "measure ops over several GPUs runs each rank of the layout in a spawned process of its own",
+   "mechanism": "K9",
+   "mechanism_why": "starting a process cannot park; the measuring command is no LP, and a GPU command serves no simulated run"
+  },
+  {
+   "id": "atom/compass/bench/ranks.py::launch::pool.submit(fn, c, *args, rank=tp)::executor_handoff#0",
+   "file": "atom/compass/bench/ranks.py",
+   "symbol": "launch",
+   "call": "pool.submit",
+   "expr": "pool.submit(fn, c, *args, rank=tp)",
+   "shape": "executor_handoff",
+   "peer": "process",
+   "why": "measure ops hands each rank's process its config, rank and points",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
+   "id": "atom/compass/bench/ranks.py::launch::wait(running, return_when=FIRST_EXCEPTION)::event_wait#0",
+   "file": "atom/compass/bench/ranks.py",
+   "symbol": "launch",
+   "call": "wait",
+   "expr": "wait(running, return_when=FIRST_EXCEPTION)",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "measure ops waits until every rank's process has returned or one has raised, which ends the others",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
+   "id": "atom/compass/bench/ranks.py::launch::r.result()::event_wait#0",
+   "file": "atom/compass/bench/ranks.py",
+   "symbol": "launch",
+   "call": "r.result",
+   "expr": "r.result()",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "measure ops waits for every rank's process to return its points",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
+   "id": "atom/compass/bench/ranks.py::union::dist.all_gather_object(every, todo, group=group)::object_collective#0",
+   "file": "atom/compass/bench/ranks.py",
+   "symbol": "union",
+   "call": "dist.all_gather_object",
+   "expr": "dist.all_gather_object(every, todo, group=group)",
+   "shape": "object_collective",
+   "peer": "process",
+   "why": "the op bench's ranks gather every rank's points over their CPU group, so each measures their union in one order",
    "mechanism": "K9",
    "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
   },

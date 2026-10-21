@@ -194,7 +194,7 @@ def test_a_rung_with_no_vector_is_refused_by_name():
 
 
 def test_a_step_mixing_prefill_and_decode_rows_is_refused_by_name():
-    with pytest.raises(CostRefused, match="1 prefill and 1 decode rows"):
+    with pytest.raises(CostRefused, match="mixing prefill and decode rows"):
         backend().price(view((8, 8, False), (1, 10, True)))
 
 
