@@ -116,7 +116,13 @@ format.
 
 **MoE** work takes the expectation under independent uniform routing: `E(1-(1-k/E)^B)`
 activated experts for `B` rows, each routed to `k` of `E`, and under EP the expected
-maximum rank load.
+maximum rank load. The EP width reaches an op-level MoE extractor from the backend, as
+`tp` does, and global experts are local times EP (owner's
+[ruling on #1811](https://github.com/jgong5/ATOM/issues/1811), 2026-10-20).
+[#1744](https://github.com/jgong5/ATOM/issues/1744) passes it to the Triton experts'
+extractors; aiter's experts still read the width from `expert_mask` and MORI's
+exchanges from `num_ep_ranks`, until
+[#1889](https://github.com/jgong5/ATOM/issues/1889) passes it to them.
 
 **Graph padding** is priced as executed, at the rows `capture_rung` pads to; a run option
 prices the real rows instead.
@@ -126,8 +132,9 @@ prices the real rows instead.
 - The op list comes from capture into the IR (`04`).
 - A leaf's interface is everything needed to execute it: tensor specs and values plus the
   ambient values it reads. An estimate reads the leaf's contract (`04` D20); the benchmark
-  times the same call inside ATOM's own forward, which supplies its weights, KV and
-  metadata (`07` D39). Kernel
+  times the same call at a point ATOM's runner prepared, with KV, metadata and forward
+  context from the runner and weights random at the contract's spec; no forward runs
+  (`07` D39). Kernel
   selection and environment belong to the benchmark.
 - An extractor registry maps an op kind to work primitives. `F` and `C` sum over the
   primitives; `M` is the leaf's own boundary. A fused op is one leaf priced once, so fusion
@@ -478,7 +485,7 @@ claimed. That is what the empirical op-level backend exists for.
 | # | Decision | Date |
 |---|---|---|
 | D63 | Three classes: A exact from geometry, B device-parameterised, C policy-determined. An analytical law works where the quantity is a pure function of stated geometry and fails where a runtime or library policy decides it. `analytical` is #952's method: a form from first principles over geometry, deployment config and datasheet or probed device parameters; an assumed parameter makes a term declared. Class B prices at attainable peaks probed on the device. | 2026-09-19; revised 2026-10-14 (#952) and 2026-10-17 (#1392) |
-| D64 | One pricing unit costs `max(t0, F/peak_c, M/BW(M), t_comm)` at attainable peaks probed on the device: one rate per format, the wider format's for a mixed pair, a bandwidth curve, an empty-kernel floor and link alpha-beta. Work comes from the contract only; MoE in expectation under uniform routing; graph padding as executed. Op level: the captured IR, an extractor registry by op kind, refused by name without one, composed by the IR's joins. Step level: module extractors over the meta build, one `max` and one `t0` per module, summed; refused by name for an unclassified module. Every analytical law prices device time only; the host floor's `max` lives in `01` D4's recurrence, with the launch time from the measured `W_launch` law. The step roofline's method counts the inputs it reads; it has no host bound; the run-file key `step_roofline` turns it on. Replaces the derated leaf model first stated here. | 2026-09-19; revised 2026-10-11 (#815), 2026-10-15 (#1011), 2026-10-15 (#1047) and 2026-10-17 (#1392) |
+| D64 | One pricing unit costs `max(t0, F/peak_c, M/BW(M), t_comm)` at attainable peaks probed on the device: one rate per format, the wider format's for a mixed pair, a bandwidth curve, an empty-kernel floor and link alpha-beta. Work comes from the contract only; MoE in expectation under uniform routing, the EP width reaching MoE extractors from the backend as `tp` does; graph padding as executed. Op level: the captured IR, an extractor registry by op kind, refused by name without one, composed by the IR's joins. Step level: module extractors over the meta build, one `max` and one `t0` per module, summed; refused by name for an unclassified module. Every analytical law prices device time only; the host floor's `max` lives in `01` D4's recurrence, with the launch time from the measured `W_launch` law. The step roofline's method counts the inputs it reads; it has no host bound; the run-file key `step_roofline` turns it on. Replaces the derated leaf model first stated here. | 2026-09-19; revised 2026-10-11 (#815), 2026-10-15 (#1011), 2026-10-15 (#1047), 2026-10-17 (#1392) and 2026-10-20 (#1811) |
 | D65 | An analytical law is a smooth bound and says so: the known discontinuities are where the measured time sits furthest above it, shown by the measured-over-analytical report. A pricing unit has one price; the band first required here is withdrawn. | 2026-09-19; revised 2026-10-14 (#952) and 2026-10-17 (#1392) |
 | D66 | A collective takes an algorithm-free alpha-beta lower bound: one hop of link latency plus the minimum bytes any algorithm must send, over the link bandwidth. The spec names no algorithm (T36 withdrawn). Textbook ring/log models are refuted on this fabric as predictions. Replaces the two-regime form first stated here. | 2026-09-19; revised 2026-10-17 (#1392) |
 | D67.1 | The gate is the bound: on every measured step, at both granularities, analytical is at most measured. Reported, not gated: configuration ranking (top-1, top-3) over the four P/D cells, measured over analytical per op kind and per phase, and the MI308X-to-MI355X method error. Memory goals: ≤5% on weights and on KV capacity/block count (the empirical gate for KV, tighter than it for weights), ≤25% each other non-KV memory term, no false "fits". The step and end-to-end latency goals and ranking as the primary gate, first stated here, are withdrawn. | 2026-09-19; revised 2026-10-14 (#952) and 2026-10-17 (#1392) |

@@ -25,6 +25,7 @@ from atom.compass import ir
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.bench import ops
 from atom.compass.capture.forward import decode, structure
+from atom.compass.run import memory
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
 from atom.utils import forward_context as fctx
@@ -412,6 +413,20 @@ def test_a_decode_step_s_lowest_context_is_over_the_rung_s_rows(rows, rung, lo):
     line = {"rows": [[1, c, True] for c in rows]}
 
     assert ops._rows(line, rung) == (lo, max(rows))
+
+
+def test_a_tp2_plan_reads_back_every_point_it_holds(bench, tmp_path, monkeypatch):
+    store, root, _, run = bench
+    layout = memory.key_fields(None) | {"tp": 2}
+    monkeypatch.setattr("atom.compass.run.memory.key_fields", lambda c: layout)
+    at_tp2 = (store, root, ops.keys(None, run), run)
+    population = _records(tmp_path / "plan", ([[1, 3000, True]], 2))
+
+    records = _plan(at_tp2, tmp_path, population)
+    calls = _bench.calls
+
+    assert _plan(at_tp2, tmp_path, population) == records
+    assert _bench.calls == calls
 
 
 def test_a_plan_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_path):

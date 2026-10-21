@@ -1486,6 +1486,7 @@ def op_graph(run: dict, config, machine, ep: int = 1):
     `machine` at EP width `ep`, with its price list when it names one."""
     from atom.compass.backends.op_graph import OpGraphBackend
 
+    drafter = getattr(config, "speculative_config", None)
     return OpGraphBackend(
         machine,
         _op_graphs(run["store"], config, machine.value("device.arch")),
@@ -1497,14 +1498,16 @@ def op_graph(run: dict, config, machine, ep: int = 1):
         split_send_recv=config.enable_expert_parallel
         and getattr(config, "enable_low_latency", False),
         price_list=PRICE_LIST in run and _price_list(run, config, machine),
+        drafts=drafter.num_speculative_tokens if drafter else 0,
     )
 
 
 def _op_graphs(root: str, config, arch: str):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or when it holds none `forward.missed`'s text, None for no
-    text; under DP, at the rows the step's MoE gathers."""
+    that does not, or of its drafter's part (`draft`), or when it holds none
+    `forward.missed`'s text, None for no text; under DP, at the rows the
+    step's MoE gathers."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
     from atom.compass.capture.forward import Shape, missed, structure
 
@@ -1513,10 +1516,10 @@ def _op_graphs(root: str, config, arch: str):
 
     @functools.lru_cache(maxsize=64)
     def graph(
-        phase: str, tokens: int, seqs: int, output: bool = True, gathered=None
+        phase: str, tokens: int, seqs: int, output=True, gathered=None, draft=False
     ) -> dict | str | None:
         shape = str(Shape(phase, tokens, seqs, gathered).at(dp))
-        at = structure(config, phase, True, arch, output)
+        at = structure(config, phase, True, arch, output, draft)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
         if not store.directory_for(key).exists():
             return missed(store, key) or None
@@ -1531,14 +1534,14 @@ def _price_list(run: dict, config, machine):
     the reading that differs."""
     from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind
     from atom.compass.fit.ops import PriceList
-    from atom.compass.fit.publish import RANK
     from atom.compass.run.step_grid import conditions
 
     key = Key.of(Kind.PRICE_LIST, **run[PRICE_LIST])
     entry = ArtifactStore(run["store"]).load(
         key, conditions=conditions(config, machine), gates=GateState.of()
     )
-    return PriceList(json.loads(entry.read_member("params", RANK, "json")))
+    rank = entry.topology.ranks()[0]
+    return PriceList(json.loads(entry.read_member("params", rank, "json")))
 
 
 def _graph_pool(model_runner, machine, model):
