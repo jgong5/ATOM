@@ -12,6 +12,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -302,6 +303,27 @@ def test_what_ignores_sigterm_is_killed_after_the_grace(monkeypatch):
     stubborn.stdout.readline()
     serve._stop(stubborn.pid)
     assert stubborn.wait(timeout=5) == -signal.SIGKILL
+
+
+def test_a_stop_lasts_until_kfd_has_freed_what_the_group_held(tmp_path, monkeypatch):
+    """KFD frees an exited process's GPU memory after the exit, so the GPU
+    check after the stop would find the server's own rank on its GPU."""
+    rank = subprocess.Popen(
+        [sys.executable, "-c", "print(flush=True)\nimport time\ntime.sleep(600)"],
+        stdout=subprocess.PIPE,
+        start_new_session=True,
+    )
+    rank.stdout.readline()
+    sched = Path(f"/proc/{rank.pid}/sched").read_text()
+    charged = tmp_path / "proc" / re.search(r"\((\d+), #threads", sched)[1]
+    charged.mkdir(parents=True)
+    monkeypatch.setattr(serve, "KFD", tmp_path)
+    freed = threading.Timer(2, charged.rmdir)
+    freed.start()
+    serve._stop(rank.pid)
+    assert not charged.exists()
+    assert rank.wait(timeout=5) == -signal.SIGTERM
+    freed.join()
 
 
 def test_each_start_takes_a_free_dp_master_port_over_the_callers(planted, monkeypatch):

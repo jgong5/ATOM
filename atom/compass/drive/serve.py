@@ -18,7 +18,9 @@ processes stop with it, and writes ``<out>/server.log`` and its step record in
 names its URL and process id and, for a simulated server, its clock endpoint
 and run file. SIGINT or SIGTERM to the command, or the server's exit, stops the
 whole group: SIGTERM first, SIGKILL for what is left after `STOP_GRACE_S`.
-Then ``<out>/run.json`` gets the run's identity, read off the engine file its
+The GPU check after the stop waits until KFD, which frees a process's GPU
+memory after it exits, charges none of the group's processes any. Then
+``<out>/run.json`` gets the run's identity, read off the engine file its
 first step wrote. No command starts the client.
 """
 
@@ -26,6 +28,7 @@ import argparse
 import http.client
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -36,7 +39,7 @@ from pathlib import Path
 
 import atom
 from atom.compass import parity
-from atom.compass.drive.gpu import hip_visible, quiet
+from atom.compass.drive.gpu import KFD, hip_visible, quiet
 from atom.compass.drive.identity import identity
 from atom.compass.run import CLOCK_ENV, ENV, _write_whole
 
@@ -228,25 +231,47 @@ def _stop_signals():
 
 def _stop(group: int) -> None:
     """SIGTERM the process group `group`; SIGKILL what is left after
-    `STOP_GRACE_S`."""
+    `STOP_GRACE_S`. A process has left once it has exited and KFD charges it
+    no GPU memory, which KFD frees only after the exit."""
+    held = _kernel_pids(group)
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(group, sig)
         except ProcessLookupError:
-            return
+            pass
         for _ in range(int(STOP_GRACE_S / POLL_S)):
-            if not _live(group):
+            if not _live(group, held):
                 return
             time.sleep(POLL_S)
 
 
-def _live(group: int) -> bool:
-    """Whether a process of `group` has not exited; a zombie has."""
+def _members(group: int):
+    """The /proc directory of each process of `group` that has not exited; a
+    zombie has."""
     for stat in Path("/proc").glob("[0-9]*/stat"):
         try:
             state, _, pgrp = stat.read_text().rsplit(")", 1)[1].split()[:3]
         except OSError:
             continue
         if int(pgrp) == group and state != "Z":
-            return True
-    return False
+            yield stat.parent
+
+
+def _kernel_pids(group: int) -> list[str]:
+    """The kernel's PIDs of `group`'s processes, by which KFD names them; in a
+    container they differ from /proc's."""
+    pids = []
+    for proc in _members(group):
+        try:
+            pids.append(
+                re.search(r"\((\d+), #threads", (proc / "sched").read_text())[1]
+            )
+        except OSError:
+            continue
+    return pids
+
+
+def _live(group: int, held=()) -> bool:
+    """Whether a process of `group` has not exited, or KFD still charges one
+    of the kernel PIDs `held` GPU memory."""
+    return any(_members(group)) or any((KFD / "proc" / pid).is_dir() for pid in held)
