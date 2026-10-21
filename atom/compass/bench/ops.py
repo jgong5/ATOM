@@ -78,8 +78,9 @@ between two neighbours of a family, or of a prefill leaf's token count over
 cached tokens, that launched different kernels or, at a decode width, either
 side of a point off the line through theirs, or whose cold times differ where
 the leaf's kind steps under one kernel between two adjacent contexts at some
-width (`_densify`), until they are adjacent. DIR gets each round's ops.jsonl
-in `round<n>`, and every point held in plan.jsonl.
+width (`_densify`), until they are adjacent; a collective's message bytes bend
+as a decode width does. DIR gets each round's ops.jsonl in `round<n>`, and
+every point held in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
 covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
@@ -1038,7 +1039,8 @@ CONTEXT_MOVES = 0.10
 #: measured cold time, over that time as `fit ops` reads a held-out error, when
 #: the three launched one kernel, before the plan halves the gaps either side;
 #: and how far a gap's ends' cold times may differ, over the lower, before the
-#: plan halves it where the leaf's kind steps (`_apart`).
+#: plan halves it where the leaf's kind steps (`_apart`). A collective's point
+#: over its message bytes is read as a decode one.
 BENDS = 0.05
 #: The spread of a leaf's cold times across contexts, or a prefill leaf's
 #: across rows, in ns, at or under which its kind does not depend on them
@@ -1445,7 +1447,9 @@ def _densify(families, tried: set) -> dict:
     are `_apart` where the leaf's kind steps: some decode family of the kind
     holds two adjacent contexts of one kernel that are `_apart`; between two
     points of a collective's family, the step of the rows halfway, a decode
-    when the farther is one, else a prefill of one sequence."""
+    when the farther is one, else a prefill of one sequence. A collective's
+    family is `_bent` too, each message size at the mean of its readings, as
+    `fit ops` merges them."""
     from atom.compass.capture.forward import decode, prefill
 
     steps = {
@@ -1464,7 +1468,13 @@ def _densify(families, tried: set) -> dict:
     for fam, points in [*families.items(), *across.items()]:
         points = sorted(points, key=lambda p: p[0])
         decoding = points[0][2]["shape"].startswith("decode")
-        bent = _bent(points, steps) if decoding and not _exchanged(fam) else ()
+        if isinstance(fam, str) and _exchanged(fam):
+            sizes = [[*g] for _, g in itertools.groupby(points, key=lambda p: p[0])]
+            mean = (statistics.mean(p[2]["cold_ns"] for p in g) for g in sizes)
+            at = ((*g[0][:2], {"cold_ns": ns}) for g, ns in zip(sizes, mean))
+            bent = _bent([*at]) if len(sizes) > 2 else ()  # no line under three
+        else:
+            bent = _bent(points, steps) if decoding else ()
         for (a, ka, record), (b, kb, other) in itertools.pairwise(points):
             mid = (a + b) // 2
             if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
