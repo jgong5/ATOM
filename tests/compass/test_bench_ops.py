@@ -858,6 +858,100 @@ def test_a_replay_prices_each_timed_replay_per_call_each_under_its_context(
     assert times == [(i + 1) * 1e6 / 4 for i in timed]
 
 
+def test_a_capture_that_fails_refuses_its_leaf_and_the_next_draws_its_activations(
+    monkeypatch,
+):
+    # HIP's capture end refuses a graph a call invalidated and leaves its
+    # stream current and still capturing, and the generator in capture: a
+    # draw then raises, and so does the next capture on that stream.
+    world = {"stream": "main", "capturing": set(), "generator": "free"}
+    randn = torch.randn
+
+    def draw(*args, **kwargs):
+        if world["generator"] != "free":
+            raise RuntimeError("Offset increment outside graph capture")
+        return randn(*args, **kwargs)
+
+    class Capture:
+        capture_stream = "capture"
+
+        def __init__(self, graph, capture_error_mode):
+            restore = lambda *_: world.update(stream=self.found)
+            self.stream_ctx = SimpleNamespace(__exit__=restore)
+
+        def __enter__(self):
+            if "capture" in world["capturing"]:
+                raise RuntimeError("Cannot register the state during capturing")
+            self.found = world["stream"]
+            world.update(stream="capture", generator="capturing")
+            world["capturing"].add("capture")
+
+        def __exit__(self, *exc):
+            if world.pop("invalid", False):
+                raise RuntimeError("operation failed due to a previous error")
+            world["capturing"].discard("capture")
+            world["generator"] = "free"
+            self.stream_ctx.__exit__()
+
+    @contextlib.contextmanager
+    def stream(s):
+        found, world["stream"] = world["stream"], s
+        yield
+        world["stream"] = found
+
+    def function(name):
+        def call(**kwargs):
+            if name == "aten.neg.default" and world["stream"] == "capture":
+                world["invalid"] = True
+
+        return call
+
+    generator = SimpleNamespace(
+        clone_state=lambda: "fresh",
+        graphsafe_set_state=lambda s: world.update(generator=s == "fresh" and "free"),
+    )
+    event = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
+    event.elapsed_time = lambda end: 1.0
+    for name, value in {
+        "CUDAGraph": lambda: SimpleNamespace(replay=lambda: None),
+        "graph": Capture,
+        "Event": lambda enable_timing: event,
+        "current_stream": lambda: world["stream"],
+        "stream": stream,
+        "is_current_stream_capturing": lambda: world["stream"] in world["capturing"],
+        "default_generators": (generator,),
+        "current_device": lambda: 0,
+    }.items():
+        monkeypatch.setattr(torch.cuda, name, value)
+    monkeypatch.setattr(torch, "randn", draw)
+    monkeypatch.setattr(ops, "_end_capture", world["capturing"].discard, raising=False)
+    monkeypatch.setattr(ops, "_function", function)
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
+    monkeypatch.setattr(ops.time, "sleep", lambda s: None)
+    time = ops.Stub._time
+    _, [_, point] = _measuring(monkeypatch)
+    monkeypatch.setattr(ops.Stub, "_time", time)
+
+    neg, abs_ = ops.measure(None, [point], 10_000)
+
+    assert "previous error" in neg["refused"]
+    assert "refused" not in abs_ and abs_["cold_ns"] > 0
+    assert world == {"stream": "main", "capturing": set(), "generator": "free"}
+
+
+def test_a_device_argument_is_the_rank_s_own_device():
+    # The capture ran on device 0: on another rank a call there would leave
+    # the rank's device, and its capture.
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    args = {"size": [1, 2], "dtype": "torch.float32", "device": "cuda:0"}
+    op = {"op": "aten.empty.memory_format", "args": args}
+
+    kwargs, _ = stub._copy(op, "sig", [{}], 0)
+
+    assert kwargs == {**args, "dtype": torch.float32, "device": _Runner.device}
+
+
 def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
     monkeypatch,
 ):
