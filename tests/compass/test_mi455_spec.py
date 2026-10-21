@@ -69,21 +69,25 @@ def test_each_field_is_the_datasheet_or_assumed_its_peaks_at_mi355x_ratios():
         assert (mi455.value(path), origins[path]) == (mi355x.value(path), "assumed")
 
 
-def _copied_run(monkeypatch, tmp_path, readings, tree=None):
+def _copied_run(monkeypatch, tmp_path, readings, revision=None):
     """A worker on MI455 after `run.runner` installed its readings: the entry
     measure memory published on mi355-gpu-45 holding `readings`, at the ATOM
-    tree `tree` when one is given, copied by `mi455_readings.py`. Returns the
+    `revision` when one is given, copied by `mi455_readings.py`. Returns the
     runner and both entries' keys."""
-    keys = []
+    keys, taken = [], memory.conditions
+
+    def elsewhere(*args, **kwargs):
+        """The conditions here, the ATOM source read the same way at `revision`."""
+        here = taken(*args, **kwargs)
+        kind = here.reading(Axis.ATOM_SRC).kind
+        return here.with_reading(Axis.ATOM_SRC, Reading(kind, revision))
 
     def copied(runner, store, readings, machine):
         with_readings(runner, store, None)
         mi355x = json.loads(MI355X.read_text())
         with monkeypatch.context() as m:
-            if tree:
-                taken = memory.conditions
-                moved = lambda *a, **k: taken(*a, **k).with_reading(Axis.ATOM_SRC, tree)
-                m.setattr(memory, "conditions", moved)
+            if revision:
+                m.setattr(memory, "conditions", elsewhere)
             keys.append(publish_readings(store, runner.config, mi355x, readings))
         keys.append(readings_script.publish(str(store), keys[0].token(), "test"))
         return runner
@@ -120,7 +124,7 @@ def test_a_run_on_mi455_reads_the_copied_entry_and_declares_each_term_on_it(
 
 def test_the_copy_answers_only_at_the_atom_tree_of_its_original(monkeypatch, tmp_path):
     with pytest.raises(ArtifactRefusal, match="`ATOM src`: recorded '0{40}'"):
-        _copied_run(monkeypatch, tmp_path, READINGS[1], Reading("tree", "0" * 40))
+        _copied_run(monkeypatch, tmp_path, READINGS[1], "0" * 40)
 
 
 def test_an_entry_measure_memory_did_not_take_on_mi355x_is_refused(
