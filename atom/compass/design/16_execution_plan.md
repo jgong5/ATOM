@@ -608,7 +608,7 @@ IR and `OpGraphBackend`. Every issue carries `e2e-stage3d`.
 | ID | Task | Module | Effort | Depends on |
 |---|---|---|---|---|
 | **S3d.1** | The design text, and the region-term artifact retired from the store ([#1490](https://github.com/jgong5/ATOM/issues/1490)) | design, `artifacts/` | 20–40 removed | — |
-| **S3d.2** | `measure ops` on one device: ATOM's forward with a stub model timing each leaf from its contract, cold, with its kernels, warm-over-cold and the PTL state (`07` D38, D39; [#1491](https://github.com/jgong5/ATOM/issues/1491)) | `bench/`, `cli.py` | 300–400 | S3c.8, S3d.12, GPU queue |
+| **S3d.2** | `measure ops` on one device: each leaf timed from its contract at points ATOM's runner prepares, cold, with its kernels, warm-over-cold and the PTL state; its runner revised by S3d.13 (`07` D38, D39; [#1491](https://github.com/jgong5/ATOM/issues/1491)) | `bench/`, `cli.py` | 300–400 | S3c.8, S3d.12, GPU queue |
 | **S3d.3** | The point planner inside `measure ops`, and its coverage check (`07` D37; [#1492](https://github.com/jgong5/ATOM/issues/1492)) | `bench/` | 150–200 | S3d.2 |
 | **S3d.4** | `fit ops`: a `price_list` interpolating only between same-kernel neighbours (`07` D38, `09` D60; [#1493](https://github.com/jgong5/ATOM/issues/1493)) | `fit/`, `cli.py` | 200–250 | S3d.2 |
 | **S3d.5** | `OpGraphBackend` resolves each leaf from the `price_list`, then analytically (`07` D36; [#1494](https://github.com/jgong5/ATOM/issues/1494)) | `backends/`, `run/` | 100–150 | S3d.4, S3c.12 |
@@ -619,6 +619,8 @@ IR and `OpGraphBackend`. Every issue carries `e2e-stage3d`.
 | **S3d.10** | The MTP cells, and the four-configuration ranking ([#1499](https://github.com/jgong5/ATOM/issues/1499)) | `scripts/compass/` | 30–60, README and two run files | S3d.9, #1270, #1090 |
 | **S3d.11** | MORI dispatch and combine measured, and the EP8 cells graded ([#1500](https://github.com/jgong5/ATOM/issues/1500)) | `bench/`, `scripts/compass/` | 150–250 | S3d.9, #1111 |
 | **S3d.12** | Concrete capture per decode width and prefill (T, B), with each leaf's contract (`04` D18, D20; [#1539](https://github.com/jgong5/ATOM/issues/1539)) | `capture/`, `ir/`, `cli.py` | 300–400, about 100 removed | S3c.8, S3c.9 |
+| **S3d.13** | `measure ops` runs no forward: its runner holds meta weights and skips warmup, each point prepared by `ModelRunner.prepare_model`, a weight argument random at its contract's spec (`07` D38, D39; [#1869](https://github.com/jgong5/ATOM/issues/1869)) | `bench/` | 120–200 | S3d.8, #1837, GPU queue |
+| **S3d.14** | `measure ops` times a DP-attention layout's leaves other than collectives on one GPU, the runner at one rank's own width, the records keyed by the deployed layout (`07` D39; [#1870](https://github.com/jgong5/ATOM/issues/1870)) | `bench/` | 60–120 | S3d.13, GPU queue |
 
 **Wave 4 rows it carries**, so an older citation resolves here: W4.1's `trace ops` is S3c.8
 and S3d.12, its `measure ops` and `fit ops` S3d.2 to S3d.4, its run settings S3d.5; W4.4's
