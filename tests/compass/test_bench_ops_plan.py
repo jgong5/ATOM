@@ -423,6 +423,37 @@ def test_a_plan_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_pa
     assert {r["context"] for r in records} == {1500, 3000}
 
 
+def test_coverage_keeps_a_leaf_s_reason_whichever_leaf_of_its_op_comes_later(
+    bench, tmp_path, monkeypatch
+):
+    def two_gemms(store, config, shape, arch=None):
+        rows = shape.tokens if shape.phase == "prefill" else shape.seqs
+        x = [_t([rows, width], "activation") for width in (8, 16)]
+        return _graph(*(_leaf("aiter.gemm", ("x", t)) for t in x), layers=1)
+
+    monkeypatch.setattr(ops, "graph", two_gemms)
+    plan = _records(
+        tmp_path / "plan", ([[1, 1000, True]], 1), ([[40, 40, False]], None)
+    )
+    records = _plan(bench, tmp_path, plan)
+    sigs = list(
+        dict.fromkeys(r["leaf"] for r in records if r["shape"] == "prefill T=40 B=1")
+    )
+    assert len(sigs) == 2
+    graded = _records(tmp_path / "graded", ([[40, 40, False]], None))
+    store, root, _, _ = bench
+
+    # Each leaf in turn has no point; the other sits on one.
+    for sig in sigs:
+        kept = [r for r in records if r["leaf"] != sig]
+        report = ops.coverage(store, root, CONFIG, [graded], kept, "gfx942")
+
+        assert report["by phase"] == {"prefill": {"steps": 1, "covered": 0}}
+        assert report["left out, by leaf kind"] == {
+            "aiter.gemm": {"no measured point": 1}
+        }
+
+
 def test_coverage_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_path):
     plan = _records(
         tmp_path / "plan",
@@ -506,6 +537,38 @@ def test_a_plan_halves_decode_attention_until_no_point_bends_off_its_neighbours(
                 assert abs(line - q[2]) <= 0.05 * q[2], (p, q, s)
     at = {c for c, *_ in by["decode B=1"]}
     assert any(3000 < c < 4125 for c in at) and {4999, 5000} <= at
+
+
+def test_a_plan_finds_a_step_its_points_hold_on_a_line_where_the_kind_steps_elsewhere(
+    bench, tmp_path, monkeypatch
+):
+    def stepped(fn, config, todo, llc):
+        # Decode attention steps up past 2500 tokens under one kernel: by 1500
+        # us at width 1, which bends its points; by 150 us, 6%, at the other
+        # widths, too little to bend theirs over 5% about a point the plan holds.
+        got = _bench(fn, config, todo, llc)
+        for r in got:
+            if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
+                high = 1500e3 if r["shape"] == "decode B=1" else 150e3
+                r["cold_ns"] += high * (r["context"] > 2500)
+        return got
+
+    monkeypatch.setattr(ops, "_child", stepped)
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[1, 12000, True]], 1),
+    )
+
+    records = _plan(bench, tmp_path, population)
+
+    at = {}
+    for r in records:
+        if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
+            at.setdefault(r["shape"], set()).add(r["context"])
+    assert len(at) > 1
+    for shape, contexts in at.items():
+        assert {2500, 2501} <= contexts, shape
 
 
 @pytest.mark.parametrize(
