@@ -36,13 +36,14 @@ def test_each_view_keeps_the_seeds_rung_rows_and_sum_and_reaches_its_ratio():
     for ratio in ragged.RATIOS:
         hits = [r for r in longest if abs(r - ratio) <= ragged.NEAR * ratio]
         assert len(hits) == (1 if ratio == 1.0 else 2)
-    # The wider spread spreads the other rows further at the same ratio.
+    # At each ratio the view of the wider spread, composed second, spreads its
+    # rows further.
     spreads = {}
     for view in views:
         rows = [RequestShape(*r) for r in view["rows"]]
         ratio, spread = length_statistics(rows)
         spreads.setdefault(round(ratio, 1), []).append(spread)
-    assert all(len(s) == 2 and s[0] != s[1] for r, s in spreads.items() if r)
+    assert all(len(s) == 2 and s[1] > s[0] for r, s in spreads.items() if r)
 
 
 def ratios(views, mean=1000):

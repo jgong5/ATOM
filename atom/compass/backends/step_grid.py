@@ -368,19 +368,26 @@ class StepGrid:
             value, cell, beyond = extended
             return value, False, cell, beyond
 
+    def longest(self, view: BatchView, at) -> tuple[float, tuple] | None:
+        """A decode batch's alpha and where its lookup also reads, B rows of
+        its longest row's cached context; None where it reads `at` alone."""
+        terms = None if view.prefill else self.alpha.get(view.capture_rung)
+        alpha = alpha_of(terms, view.requests) if terms else 0.0
+        if not alpha:
+            return None
+        longest = max(r.context_tokens - r.query_tokens for r in view.requests)
+        return alpha, (at[0], Fraction(longest))
+
     def value(self, view: BatchView) -> tuple[_Cells, tuple, Fraction, bool, str, str]:
         """The step's grid, its coordinates there, its lookup, whether that is
         one node's, the cells read, and how far past the KV pool; or a refusal."""
         cells, at = self.locate(view)
         value, on_node, cell, beyond = self.read(cells, view, at)
-        terms = None if view.prefill else self.alpha.get(view.capture_rung)
-        alpha = alpha_of(terms, view.requests) if terms else 0.0
-        if not alpha:
+        read = self.longest(view, at)
+        if read is None:
             return cells, at, value, on_node, cell, beyond
-        longest = max(r.context_tokens - r.query_tokens for r in view.requests)
-        top, _, top_cell, top_beyond = self.read(
-            cells, view, (at[0], Fraction(longest))
-        )
+        alpha, top_at = read
+        top, _, top_cell, top_beyond = self.read(cells, view, top_at)
         value += Fraction(alpha) * (top - value)
         cell = f"{cell}; longest row's cell {top_cell}, alpha {alpha!r}"
         beyond = "; ".join(p for p in (beyond, top_beyond) if p)

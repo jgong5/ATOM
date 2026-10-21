@@ -713,3 +713,24 @@ def test_a_grid_holding_alpha_reads_every_planned_steps_longest_row_measured(
             cell = grid.value(view(line))[4]
             ragged += "longest row's cell" in cell
     assert ragged > 0
+
+
+def test_coverage_names_a_missing_corner_of_the_longest_rows_cell_alpha_reads(
+    tmp_path, monkeypatch
+):
+    """MIXED's decode steps read their mean in the cell c 64..128 and, with
+    alpha on rung 4, their longest row in c 192..256; with (B 3, c 256)
+    unmeasured, each is declined, and that corner named."""
+    records = [record(tmp_path, monkeypatch, *MIXED)]
+    planned = plan(*records)
+    member = measured(planned, located(tmp_path, planned), drop=("decode", [4, 3, 256]))
+    alpha = {"intercept": 1.0, "ratio": 0.0, "spread": 0.0}
+    member["grid"]["decode"]["alpha"] = {"4": alpha}
+    backend = loaded(tmp_path, member, grid="alpha-minus")
+    named = steps(*records)[0]
+
+    out = step_grid_plan.coverage(backend, named)
+
+    assert out["missing"] == {"decode rung 4": [[3, 256]]}
+    declined = [d["step"] for d in out["declined"]]
+    assert declined == refusing(backend, named) != []

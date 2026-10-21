@@ -42,11 +42,11 @@ every axis and to `margin` rungs either side, each such rung at all its B
 nodes, a decode step's c span reaching on to the node at or above its longest
 row's cached context, which the lookup also reads; and, on any rung between
 two planned rungs, its B nodes at its c nodes spanning those planned, since a
-bundle whose measured rungs skip one of the ladder's does not load. A point that is no batch the target runs is not
-planned: B above `max_num_seqs`, T above `max_num_batched_tokens`, T not a
-multiple of B or below it, c + N_Q above `max_model_len`, or
-B * ceil((c + N_Q) / block size) above the block count, assuming no prefix
-sharing.
+bundle whose measured rungs skip one of the ladder's does not load. A point
+that is no batch the target runs is not planned: B above `max_num_seqs`, T
+above `max_num_batched_tokens`, T not a multiple of B or below it, c + N_Q
+above `max_model_len`, or B * ceil((c + N_Q) / block size) above the block
+count, assuming no prefix sharing.
 """
 
 import bisect
@@ -359,7 +359,8 @@ def coverage(backend, steps) -> dict:
     It returns `steps`, `covered`, `share` (covered over steps),
     `extrapolated` and `fallback`, each a count; `declined`, each step the
     grid does not answer, with its reasons; `missing`, the unmeasured corners
-    of their cells by grid, keyed `prefill output`, `prefill no_output` or
+    of their cells by grid, a decode step's longest row's cell among them where
+    its rung holds alpha, keyed `prefill output`, `prefill no_output` or
     `decode rung <R>`; and, apart, `prefill_above_top_c`, how many prefill
     steps are cached past prefill's top c node, which fall back: a prefix hit
     near `max_model_len`, or a long prompt's last chunk when `max_model_len`
@@ -372,8 +373,11 @@ def coverage(backend, steps) -> dict:
         try:
             cells, at = backend.grid.locate(view)
             above += bool(view.prefill) and at[-1] > cells.nodes[-1][-1]
-            corners = cells.corners(view, at)
-            gaps = cells.name, {c for c, _ in corners if c not in cells.points}
+            longest = backend.grid.longest(view, at)
+            gaps = cells.name, set()
+            for x in [at] + ([longest[1]] if longest else []):
+                corners = cells.corners(view, x)
+                gaps[1].update(c for c, _ in corners if c not in cells.points)
         except CostRefused:
             pass
         try:

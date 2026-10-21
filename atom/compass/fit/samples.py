@@ -14,9 +14,9 @@ A record whose run.json names `aiter_jit_builds` refuses, naming them.
 A step measurement is a `step_measurement` entry `measure steps` published,
 read by key; its member `MEMBER` holds the batch view as a step-record line
 does (`rows`, `rung`, `produces_output`), its device seconds (`seconds`), its
-`origin` (`replay` or `plan`) and the `traces` the batch came from. Its sample's
-provenance holds its `source`, the origin, its `run`, the entry's digest, and
-those `traces`.
+`origin` (`replay`, `plan` or `ragged`) and the `traces` the batch came from.
+Its sample's provenance holds its `source`, the origin, its `run`, the entry's
+digest, and those `traces`.
 
 Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
