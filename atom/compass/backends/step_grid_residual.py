@@ -4,13 +4,14 @@
 """The step grid's residual: a factor on the lookup for what its shape cannot see.
 
 The lookup reads a batch at its equivalent homogeneous shape, which keeps the
-token count and the attention work and drops how the rows differ and the order
-they run in. The residual multiplies the lookup by a factor, fitted as relative
-error on replayed batches, over features a recipe computes from the rows in the
-batch's own order. It is fitted apart for each grid a batch is read in, the
-batch's kind (`kind`): `decode`, and `prefill_output` and `prefill_no_output`
-for prefill chunks that produce output and that do not. Recipe v2's features,
-with k_i the context N_KV (cached plus query) of the i-th row:
+token count and the attention work and drops the order the rows run in and,
+but for a decode rung's alpha, how they differ. The residual multiplies the
+lookup by a factor, fitted as relative error on replayed batches, over features
+a recipe computes from the rows in the batch's own order. It is fitted apart
+for each grid a batch is read in, the batch's kind (`kind`): `decode`, and
+`prefill_output` and `prefill_no_output` for prefill chunks that produce output
+and that do not. Recipe v3's features, with k_i the context N_KV (cached plus
+query) of the i-th row:
 
     tokens         Sum N_Q / 2^10
     query_square   Sum N_Q^2 / 2^20, prefill only: a decode row computes one
@@ -21,7 +22,9 @@ with k_i the context N_KV (cached plus query) of the i-th row:
                    row reads one context, small when like rows are grouped,
                    largest when they alternate.
     raggedness     B.max k / Sum k: the longest row over the mean, 1 when every
-                   row reads one context.
+                   row reads one context. Prefill only: a decode batch's
+                   longest row is the lookup's, through its rung's alpha
+                   (`step_grid.py`).
 
 The divisors are the recipe's normalisers, frozen with it. No feature reads a
 geometry or hardware constant. A recipe is fixed code: its name and version are
@@ -32,7 +35,7 @@ another recipe name, version or digest fails loading.
 
 A residual is a mapping, as a bundle holds it, of one or more kinds:
 
-    {"recipe": {"name": "step-grid-residual", "version": 2, "digest": <hex>},
+    {"recipe": {"name": "step-grid-residual", "version": 3, "digest": <hex>},
      "kinds": {<kind>: KIND, ...}}
 
     KIND = {"hull": {"equal": {<feature>: value, ...},
@@ -182,9 +185,9 @@ class Recipe:
 PREFILL = (tokens, query_square, query_context, order, raggedness)
 RECIPE = Recipe(
     "step-grid-residual",
-    2,
+    3,
     {
-        "decode": (tokens, query_context, order, raggedness),
+        "decode": (tokens, query_context, order),
         "prefill_output": PREFILL,
         "prefill_no_output": PREFILL,
     },

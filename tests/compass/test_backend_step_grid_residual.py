@@ -8,12 +8,12 @@ Decode steps come from ATOM's `Scheduler` and are priced through the runner's
 and 959 tokens, or 767, so every batch's equivalent shape is B = 32 at c = 767,
 and its lookup in the eager grid is f(32, 767) = 1000 + 960 + 767 + 1534 =
 4261 us. All three share tokens 1/32 and query_context 3/128; with k = N_KV,
-they differ in
+they differ in order, the one other decode feature:
 
-    batch         prompts                  order   raggedness
-    homogeneous   767 x 32                 0       1
-    grouped       575 x 16, then 959 x 16  1/64    5/4      (384 / 24576)
-    alternating   575, 959, ... x 16       31/64   5/4      (31 x 384 / 24576)
+    batch         prompts                  order
+    homogeneous   767 x 32                 0
+    grouped       575 x 16, then 959 x 16  1/64    (384 / 24576)
+    alternating   575, 959, ... x 16       31/64   (31 x 384 / 24576)
 
 A fitted residual is loaded the same way and prices the grouped and alternating
 batches at the lookup times the factor its triples were planted with.
@@ -55,8 +55,8 @@ from atom.compass.backends.step_grid_residual import (
 HOMOGENEOUS = [767] * 32
 GROUPED = [575] * 16 + [959] * 16
 ALTERNATING = [575, 959] * 16
-# 0.75 + 0.5 x order + 0.25 x raggedness: 1, 1.0703125 and 1.3046875 above.
-ORDERED = linear(0.75, order=0.5, raggedness=0.25)
+# 1 + 0.5 x order: 1, 1.0078125 and 1.2421875 above.
+ORDERED = linear(order=0.5)
 FINAL = [point(1, 8, 192, time=3)]
 MEMBERS = [("identity", "linear", "identity"), ("exp", "linear", "exp")]
 MEMBERS += [("band", "band", None)]
@@ -71,39 +71,34 @@ def price(prompts, backend):
     return r.forward(decode(prompts)).predicted_s, r.refused_commands()
 
 
-def test_one_shape_in_another_order_or_raggedness_is_priced_apart():
+def test_one_shape_in_another_order_is_priced_apart():
     batches = (HOMOGENEOUS, GROUPED, ALTERNATING)
 
     # One equivalent shape, so one lookup.
     assert [price(p, eager()) for p in batches] == [(4261e-6, ())] * 3
     assert [price(p, eager(residual=residual(o=ORDERED))) for p in batches] == [
         (4261e-6 * 1.0, ()),
-        (4261e-6 * 1.0703125, ()),
-        (4261e-6 * 1.3046875, ()),
+        (4261e-6 * 1.0078125, ()),
+        (4261e-6 * 1.2421875, ()),
     ]
 
 
 @pytest.mark.parametrize(
-    "rows,order,raggedness",
+    "rows,order",
     [
-        ([(1, 768, True)] * 32, 0, 1),
-        ([(1, 576, True)] * 16 + [(1, 960, True)] * 16, Fraction(1, 64), 1.25),
-        ([(1, 576, True), (1, 960, True)] * 16, Fraction(31, 64), 1.25),
+        ([(1, 768, True)] * 32, 0),
+        ([(1, 576, True)] * 16 + [(1, 960, True)] * 16, Fraction(1, 64)),
+        ([(1, 576, True), (1, 960, True)] * 16, Fraction(31, 64)),
     ],
     ids=["homogeneous", "grouped", "alternating"],
 )
-def test_decode_is_read_on_order_and_raggedness_in_row_order_and_no_query_square(
-    rows, order, raggedness
+def test_decode_is_read_on_order_in_row_order_and_no_query_square_or_raggedness(
+    rows, order
 ):
     rows = tuple(RequestShape(*r) for r in rows)
 
     assert equivalent_shape(rows) == (32, 1, 767)
-    assert RECIPE("decode", rows) == (
-        Fraction(1, 32),
-        Fraction(3, 128),
-        order,
-        raggedness,
-    )
+    assert RECIPE("decode", rows) == (Fraction(1, 32), Fraction(3, 128), order)
 
 
 def test_a_prefill_chunk_is_read_on_query_square_too():
@@ -168,15 +163,15 @@ def test_the_term_is_fitted_and_its_detail_holds_the_lookup_and_each_member():
     rows = [(1, 576, True), (1, 960, True)] * 16
 
     (term,) = backend.price(view(*rows)).terms
-    factor = 1.3046875 + math.exp(0.484375)
+    factor = 1.2421875 + math.exp(0.484375)
     assert term.seconds == 4261e-6 * factor
     assert term.provenance.method is Method.ESTIMATED
     assert term.provenance.detail == (
         "lookup 0.004261 s, interpolated; decode cell B=32, c 512..1024; "
-        f"residual {factor!r} = 1.0 x o 1.3046875 + 1.0 x e {math.exp(0.484375)!r}"
+        f"residual {factor!r} = 1.0 x o 1.2421875 + 1.0 x e {math.exp(0.484375)!r}"
     )
     assert backend.describe().endswith(
-        "; recipe step-grid-residual v2, members decode: o, e; "
+        "; recipe step-grid-residual v3, members decode: o, e; "
         "prefill_output: o, e; prefill_no_output: o, e"
     )
 
@@ -188,19 +183,19 @@ def source(prompts, backend):
     return term.provenance
 
 
-# Both decode hulls bound order <= 1/4; the second also holds raggedness at 1, so
-# its facet has no raggedness entry. Alternating passes the first by its order,
-# 31/64 - 1/4; grouped differs from the second's raggedness by 1/4.
+# The first decode hull bounds order <= 1/4; the second holds order at 0, so its
+# facet, tokens <= 1, has no order entry. Alternating passes the first by its
+# order, 31/64 - 1/4; grouped differs from the second's order by 1/64.
 @pytest.mark.parametrize(
     "hull,inside,outside,factor,past",
     [
-        ({"facets": [[0, 0, 1, 0, -0.25]]}, GROUPED, ALTERNATING, 1.3046875, 0.234),
+        ({"facets": [[0, 0, 1, -0.25]]}, GROUPED, ALTERNATING, 1.2421875, 0.234),
         (
-            {"equal": {"raggedness": 1.0}, "facets": [[0, 0, 1, -0.25]]},
+            {"equal": {"order": 0.0}, "facets": [[1, 0, -1]]},
             HOMOGENEOUS,
             GROUPED,
-            1.0703125,
-            0.25,
+            1.0078125,
+            0.0156,
         ),
     ],
     ids=["facet", "equal"],
@@ -276,7 +271,10 @@ def raggedness(rows):
     return Fraction(len(rows) * longest, 2 * sum_context(rows))
 
 
-EDITED = {k: fs[:-1] + (raggedness,) for k, fs in RECIPE.features.items()}
+EDITED = {
+    k: tuple(raggedness if f.__name__ == "raggedness" else f for f in fs)
+    for k, fs in RECIPE.features.items()
+}
 
 
 def test_the_digest_is_over_the_feature_functions_source_and_each_kinds_names():
@@ -305,6 +303,17 @@ def test_a_residual_fitted_under_another_recipe_fails_loading(field, value):
     mapping["recipe"][field] = value
 
     with pytest.raises(ValueError, match="fitted under recipe"):
+        Residual(mapping)
+
+
+def test_a_residual_fitted_under_recipe_v2_which_read_raggedness_on_decode_fails_loading():
+    prefill = RECIPE.features["prefill_output"]
+    decode = tuple(f for f in prefill if f.__name__ != "query_square")
+    v2 = Recipe(RECIPE.name, 2, {**RECIPE.features, "decode": decode})
+    mapping = fitted({"u": linear()}, {"u": 1.0})
+    mapping["recipe"] |= {"version": 2, "digest": v2.digest}
+
+    with pytest.raises(ValueError, match=f"v2 digest {v2.digest}, and this code's"):
         Residual(mapping)
 
 
@@ -353,9 +362,9 @@ def test_a_selected_member_that_cannot_load_fails_loading_naming_it(
     [
         ({}, None, "selects no decode member"),
         ({"ghost": 1.0}, None, "decode member ghost does not load: KeyError"),
-        ({"u": 1.0}, {"facets": [[1, 0]]}, "decode hull has a facet not 5 wide"),
+        ({"u": 1.0}, {"facets": [[1, 0]]}, "decode hull has a facet not 4 wide"),
         ({"u": 1.0}, {"facets": []}, "with no facets"),
-        ({"u": 1.0}, {"facets": [[0, 0, 0, 1, -math.inf]]}, "not finite"),
+        ({"u": 1.0}, {"facets": [[0, 0, 1, -math.inf]]}, "not finite"),
         ({"u": 1.0}, {"equal": {"rows": 1}, "facets": []}, "not all among"),
     ],
     ids=["none", "absent", "width", "no-facets", "infinite", "unknown-equal"],
@@ -450,8 +459,9 @@ def load_and_price(mapping, factor):
 
 
 def planted(v):
+    """On order, and on prefill raggedness too, which decode does not read."""
     x = features(v)
-    return math.exp(0.05 + 0.2 * x["order"] - 0.1 * x["raggedness"])
+    return math.exp(0.05 + 0.2 * x["order"] - 0.1 * x.get("raggedness", 1))
 
 
 def test_the_fit_recovers_a_planted_factor_within_1pc_on_held_out_views():
@@ -502,7 +512,7 @@ def test_each_kind_is_fitted_on_its_own_triples_alone():
 
 def curved(v):
     x = features(v)
-    return math.exp(0.05 + 2 * x["order"] - x["raggedness"])
+    return math.exp(0.05 + 2 * x["order"] - x.get("raggedness", 1))
 
 
 def straight(v):
@@ -672,8 +682,8 @@ def negated(triples):
     "triples,match",
     [
         (
-            lambda: triples_of(planted)[:8],
-            "the decode fit: 6 triples hold out 1 and leave 5 to fit 5",
+            lambda: triples_of(planted)[:7],
+            "the decode fit: 5 triples hold out 1 and leave 4 to fit 4",
         ),
         (
             lambda: negated(triples_of(planted)),
@@ -687,8 +697,8 @@ def negated(triples):
             lambda: replaced(triples_of(planted), view((8, 8, False))),
             "triple 3: a prefill batch that does not say whether it produces",
         ),
-        # Decode rows at one context: order and raggedness are constant, and
-        # query_context is tokens times that context.
+        # Decode rows at one context: order is constant, and query_context is
+        # tokens times that context.
         (
             lambda: [
                 (view(*[(1, 700, True)] * b), 1e-3, 1e-3)

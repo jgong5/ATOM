@@ -572,3 +572,44 @@ def test_a_batch_the_bench_refuses_is_not_published_and_is_named_after_the_rest(
     held = entries(ArtifactStore(run.tmp / "store"))
     assert refused not in {sum(q for q, *_ in m["rows"]) for _, m in held}
     assert len(Bench.measured) == len(views(lines)) > len(held)
+
+
+def test_ragged_measures_the_views_composed_from_each_drawn_decode_view(run):
+    """Each view keeps a decode line's rung, rows and summed context within a
+    token a row; its rows are contexts the record's decode rows ran, and no
+    prefill view is measured."""
+    rec = str(run.record)
+    store = run(rec, "--sample", "2", "--seed", "3", "--ragged", *run.named(rec))
+
+    split = served(run.record / "steps", RUNS)[0]
+    decode = [s for s in split if s["rows"][0][2]]
+    contexts = {c for s in decode for _, c, _ in s["rows"]}
+    seeds = {
+        (s["rung"], len(s["rows"]), sum(c for _, c, _ in s["rows"])) for s in decode
+    }
+    held = entries(store)
+    assert len(held) == len(Bench.measured) > 0
+    for key, member in held:
+        rows, n = member["rows"], len(member["rows"])
+        total = sum(c for _, c, _ in rows)
+        assert member["origin"] == "ragged" and key.values["step_kind"].startswith(
+            "decode rung"
+        )
+        assert {c for _, c, _ in rows} <= contexts and all(d for *_, d in rows)
+        assert any(
+            (r, b) == (member["rung"], n) and abs(t - total) <= n for r, b, t in seeds
+        )
+        assert member["sources"] == [
+            measure.file_digest(run.record / "steps/dp0.jsonl")
+        ]
+        assert member["traces"] == sorted({t for s in split for t in s["traces"]})
+
+
+def test_ragged_without_a_replayed_input_refuses(run):
+    rec = str(run.record)
+    definition = run.tmp / "definition.json"
+    definition.write_text(json.dumps(DEFINITION))
+    args = ["--grid", rec, "--grid-definition", str(definition), "--ragged"]
+    with pytest.raises(SystemExit, match="--ragged composes from no replayed input"):
+        run(*args, *run.named(rec))
+    assert Bench.started == []

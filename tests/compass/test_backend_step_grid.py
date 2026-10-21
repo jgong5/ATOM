@@ -539,7 +539,7 @@ def test_it_is_one_step_granularity_line():
     assert replay().granularity is Granularity.STEP
     assert replay().describe() == (
         "step grid, bundle replay; replay decode grid, timing scope forward; "
-        "recipe step-grid-residual v2, members decode: unit; prefill_output: unit; "
+        "recipe step-grid-residual v3, members decode: unit; prefill_output: unit; "
         "prefill_no_output: unit"
     )
 
@@ -623,4 +623,104 @@ def _edited(edit, mode="eager"):
 )
 def test_a_bundle_that_cannot_be_read_fails_loading(mapping, match):
     with pytest.raises(ValueError, match=match):
+        StepGrid(mapping)
+
+
+# Rung 32 holds alpha; 20 rows: 18 at c 560, one at 600 and one at 1000, so the
+# mean is 584 and the longest row 1000, both inside the cell B 17..32, c 512..1024.
+RAGGED = [(1, 561, True)] * 18 + [(1, 601, True), (1, 1001, True)]
+LONGEST, MEAN = 1000, 584
+
+
+def alpha_replay(**alpha):
+    grid = bundle("replay", REPLAY)
+    grid["decode"]["alpha"] = {"32": {"ratio": 0.0, "spread": 0.0, **alpha}}
+    return StepGridBackend(StepGrid(grid), UNIT, "alpha")
+
+
+@pytest.mark.parametrize(
+    "alpha, expected",
+    [
+        ({"intercept": 0.1, "ratio": 0.5}, 0.1 + 0.5 * (LONGEST / MEAN - 1)),
+        ({"intercept": 0.9, "ratio": 0.5}, 1.0),
+        ({"intercept": -0.5}, 0.0),
+    ],
+    ids=["between", "clipped-to-the-longest-row", "clipped-to-the-mean"],
+)
+def test_a_ragged_decode_batch_is_read_between_its_mean_and_longest_row(
+    alpha, expected
+):
+    def g(c):
+        return f(20, c) + 3200
+
+    (term,) = alpha_replay(**alpha).price(view(*RAGGED, rung=32)).terms
+
+    looked_up = g(MEAN) + expected * (g(LONGEST) - g(MEAN))
+    assert term.seconds == pytest.approx(looked_up * 1e-6, rel=1e-12)
+    assert ("longest row's cell" in term.provenance.detail) == bool(expected)
+
+
+def test_a_batch_of_one_context_or_on_a_rung_without_alpha_is_read_at_its_mean():
+    backend = alpha_replay(intercept=1.0)
+    even = view(*[(1, 585, True)] * 20, rung=32)
+    other = view(*[(1, c + 1, True) for _, c, _ in RAGGED] * 2, rung=48)
+
+    assert backend.price(even).seconds == replay().price(even).seconds
+    assert backend.price(other).seconds == replay().price(other).seconds
+    assert (
+        backend.price(view(*RAGGED, rung=32)).seconds
+        > replay().price(view(*RAGGED, rung=32)).seconds
+    )
+
+
+# A pool of 2304 16-token blocks holds 32 rows to c = 1151, so (32, 2047) is
+# past it: a longest row at c 1500 is read along c from (32, 767) and (32, 1024).
+def past_pool_alpha(gone=()):
+    at = [(32, 32, c) for c in (512, 767, 1024)]
+    points = [point(*p, time=f(*p[1:]) + 3200) for p in at if p not in gone]
+    grid = bundle("replay", points)
+    grid["decode"]["nodes"] = {"B": {"32": [32]}, "c": {"32": [512, 767, 1024, 2047]}}
+    grid["decode"]["pool"] = POOL
+    grid["decode"]["alpha"] = {"32": {"intercept": 0.5, "ratio": 0.0, "spread": 0.0}}
+    return StepGridBackend(StepGrid(grid), UNIT, "past-pool")
+
+
+def test_a_longest_row_past_the_kv_pool_is_extended_and_named_as_extrapolated():
+    rows = [(1, 601, True)] * 31 + [(1, 1501, True)]
+    mean = (600 * 31 + 1500) / 32
+
+    (term,) = past_pool_alpha().price(view(*rows, rung=32)).terms
+
+    assert term.seconds * 1e6 == pytest.approx(
+        f(32, mean + 0.5 * (1500 - mean)) + 3200, rel=1e-12
+    )
+    assert term.provenance.source == (
+        "step-grid-extrapolated: c 476 past 1024, the pool's edge at B=32"
+    )
+    assert (term.provenance.validated, term.provenance.extrapolated) == (False, True)
+
+
+def test_a_longest_row_whose_cell_misses_a_corner_inside_the_pool_refuses():
+    backend = past_pool_alpha(gone=[(32, 32, 1024)])
+    rows = [(1, 601, True)] * 31 + [(1, 1501, True)]
+
+    with pytest.raises(CostRefused, match="has no measurement at B=32, c=1024"):
+        backend.price(view(*rows, rung=32))
+    even = view(*[(1, 601, True)] * 32, rung=32)
+    assert backend.price(even).seconds == pytest.approx((f(32, 600) + 3200) * 1e-6)
+
+
+@pytest.mark.parametrize(
+    "mode, alpha, match",
+    [
+        ("replay", {"16": {"intercept": 0, "ratio": 0, "spread": 0}}, "rung 16"),
+        ("replay", {"32": {"intercept": "nan", "ratio": 0, "spread": 0}}, "finite"),
+        ("replay", {"32": {"intercept": 0, "ratio": 0}}, "spread"),
+        ("eager", {"32": {"intercept": 0, "ratio": 0, "spread": 0}}, "no rung"),
+    ],
+    ids=["no-such-rung", "nan", "missing-term", "eager"],
+)
+def test_an_alpha_the_grid_cannot_read_fails_loading(mode, alpha, match):
+    mapping = _edited(lambda m: m["decode"].update(alpha=alpha), mode)
+    with pytest.raises((ValueError, KeyError), match=match):
         StepGrid(mapping)
