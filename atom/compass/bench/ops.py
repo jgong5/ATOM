@@ -279,14 +279,22 @@ def graph(store, config, shape, arch=None) -> dict:
     """The `op_graph` `trace ops` published for `config` at `shape` on `arch`,
     this GPU's when it is None, of a step that produces output, as JSON: a
     prefill that produces none runs the same leaves less the LM head and the
-    sampler, so this graph's points cover both."""
-    from atom.compass.capture.forward import structure
+    sampler, so this graph's points cover both. A miss where the store holds
+    the shape under another engine config refuses naming what differs."""
+    from atom.compass.artifacts import ArtifactRefusal, Rule
+    from atom.compass.capture.forward import missed, structure
 
     key = Key.of(
         Kind.OP_GRAPH,
         structure=structure(config, shape.phase, device=arch),
         shape=str(shape),
     )
+    if not store.directory_for(key).exists() and (why := missed(store, key)):
+        raise ArtifactRefusal(
+            Rule.RESOLUTION,
+            f"no op_graph holds {shape} under this engine config{why}",
+            "compass trace ops captures one under this process's environment",
+        )
     return json.loads(store.read(key).read_member("graph", RANK, "json"))
 
 
