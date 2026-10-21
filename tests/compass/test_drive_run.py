@@ -16,6 +16,7 @@ import dataclasses
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import test_drive_trace_steps
@@ -55,6 +56,7 @@ from atom.compass.backends.provenance import Method, Provenance
 from atom.compass.backends.resolver import CostSource
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.backends.work import Work
+from atom.compass.capture.forward import structure
 from atom.compass.clock import RefusalTally
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import serve, trace_steps
@@ -585,3 +587,51 @@ def test_coverage_of_a_v4_pro_ep8_run_asks_its_price_list_at_atom_s_ep_width(
     assert report["covered"] == report["steps"] > 0
     assert asked.kinds == set(kinds)
     assert widths == {(kind, 8) for kind in kinds}
+
+
+@pytest.mark.parametrize("layout", [["-tp", "8"], ["-tp", "4", "-dp", "2"]])
+def test_coverage_of_a_v4_pro_dpa_run_reads_graphs_at_the_widths_its_ranks_run(
+    tmp_path, monkeypatch, layout
+):
+    # The nightly DPA-TP8 EP8 deployment, and a DP 2 x TP 4 one of the same
+    # eight ranks. Its record states each rank's TP 1, as `CoreManager`
+    # rewrites it; ATOM's MoE spans all eight.
+    (tmp_path / "v4").mkdir()
+    (tmp_path / "v4" / "config.json").write_bytes(V4_PRO.read_bytes())
+    atom = ["--model", str(tmp_path / "v4"), *layout, "--kv_cache_dtype", "fp8"]
+    atom += ["--index-cache-dtype", "fp4"]  # what V4 resolves on gfx950
+    atom += ["--enable-dp-attention", "--enable-expert-parallel"]
+    atom += ["--max-num-seqs", "8", "--max-num-batched-tokens", "64"]
+    atom += ["--max-model-len", "2048", "--cudagraph-capture-sizes", str(LADDER)]
+    directory = recorded(tmp_path, monkeypatch, SHORT)
+    # Reading the quantization imports aiter, which a process with no driver
+    # cannot do; the build that reads the EP width does it in its own process.
+    quant = SimpleNamespace(compute_hash=lambda: "fp8", exclude_layers=[])
+    monkeypatch.setattr("atom.config.QuantizationConfig", lambda *args: quant)
+    kinds = ("aiter.fused_moe_.default", MORI + "dispatch", MORI + "combine")
+    region = {"seq": [{"op": kind, "args": {}} for kind in kinds]}
+    structures = []
+
+    def graphs(root, config, arch):
+        structures.append(structure(config, "decode", True, arch))
+        return lambda *shape: region
+
+    monkeypatch.setattr(compass_run, "_op_graphs", graphs)
+    asked = Asked()
+    monkeypatch.setattr(compass_run, "_price_list", lambda *args: asked)
+    widths = set()
+
+    def work(leaf, view, tp, kv, ep):
+        widths.add((leaf["op"], tp, ep))
+        return Work()
+
+    monkeypatch.setattr(op_graph, "work", work)
+    run = {"store": str(tmp_path / "store"), "machine": DOCUMENT}
+    run |= {compass_run.OP_GRAPH: True, compass_run.PRICE_LIST: {}}
+
+    report = drive_run.check([str(directory)], run, atom)
+
+    assert report["covered"] == report["steps"] > 0
+    assert asked.kinds == set(kinds)
+    assert widths == {(kind, 1, 8) for kind in kinds}
+    assert [s.endswith(" tp=1 dp=8 ep=8 decode eager") for s in structures] == [True]
