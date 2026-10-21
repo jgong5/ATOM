@@ -9,8 +9,11 @@ read back from a real store.
 
 import json
 import os
+import re
+import subprocess
 from concurrent.futures.process import BrokenProcessPool
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -30,6 +33,7 @@ CONFIG = SimpleNamespace(
     capture_sizes=[1, 2, 4],
     max_num_seqs=4,
     max_num_batched_tokens=8192,
+    max_model_len=262144,
     speculative_config=None,
 )
 
@@ -322,6 +326,37 @@ def test_a_plan_ladders_cached_tokens_only_for_a_prefill_kind_that_moves_there(
     report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["by phase"] == {"prefill": {"steps": 2, "covered": covered}}
+
+
+@pytest.mark.parametrize(
+    "max_model_len, at_8000", [(8100, {40, 100}), (8150, {40, 100, 150})]
+)
+def test_a_plan_places_no_cached_prefill_point_past_max_model_len(
+    bench, tmp_path, monkeypatch, max_model_len, at_8000
+):
+    monkeypatch.setattr(ops, "_child", _moving_bench)
+    monkeypatch.setattr(CONFIG, "max_model_len", max_model_len)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[40, 8040, False]], None),  # the most cached tokens, on a short chunk
+        ([[100, 2100, False]], None),
+        ([[150, 150, False]], None),
+    )
+    records = _plan(bench, tmp_path, plan)
+
+    prefill = [r for r in records if r["shape"].startswith("prefill")]
+    for r in prefill:
+        shape = ops._shape(r["shape"])
+        row = -(-shape.tokens // shape.seqs) + (r["context"] or 0)
+        assert row <= max_model_len, r
+    attn = {
+        ops._shape(r["shape"]).tokens
+        for r in prefill
+        if r["op"] == "aiter.attn" and r["context"] == 8000
+    }
+    # At 8100, 150 tokens past 8000 cached is a row past max_model_len.
+    assert attn == at_8000
 
 
 @pytest.mark.parametrize(
@@ -687,6 +722,96 @@ def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
     assert traced == ([] if "gfx950" in held else ["gfx950"])
 
 
+@pytest.fixture(autouse=True)
+def _declared_arch_ends_with_its_test(monkeypatch):
+    """`--coverage` declares the plan's arch to the whole process, in its
+    environment and Triton's driver; each test's declaration ends with it."""
+    import triton
+
+    monkeypatch.setattr(triton.runtime.driver, "_active", triton.runtime.driver._active)
+    with patch.dict(os.environ):
+        yield
+
+
+def test_coverage_declares_the_plan_s_arch_to_aiter_before_it_builds_the_config(
+    tmp_path, monkeypatch, model_config  # noqa: F811
+):
+    """ATOM's config imports aiter, which asks `GPU_ARCHS` and `rocminfo` for
+    the arch; with no driver, `rocminfo` names none."""
+    driverless_bin = tmp_path / "bin"
+    driverless_bin.mkdir()
+    (driverless_bin / "rocminfo").write_text("#!/bin/sh\nexit 0\n")
+    (driverless_bin / "rocminfo").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{driverless_bin}:{os.environ['PATH']}")
+    asked = []
+
+    def atom_config(args):
+        found = subprocess.run(["rocminfo"], capture_output=True, text=True, check=True)
+        listing = found.stdout
+        asked.append((re.findall(r"\bgfx\w+", listing), os.environ.get("GPU_ARCHS")))
+        return model_config
+
+    monkeypatch.setattr("atom.compass.bench.measure.atom_config", atom_config)
+    store = ArtifactStore(str(tmp_path / "store"))
+    _publish_graph(store, model_config, "gfx950", decode(1))
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "plan.jsonl").write_text("")
+    (out / "run.json").write_text(json.dumps({"device": [{"arch": "gfx950"}]}))
+    graded = _records(tmp_path / "graded", ([[1, 100, True]], 1))
+
+    argv = ["--coverage", graded, "--store", str(store.root), "--out", str(out)]
+    report = ops._coverage_main(argv, [])
+
+    assert asked == [(["gfx950"], "gfx950")]
+    assert report["steps"] == 1
+
+
+def test_coverage_refuses_a_plan_arch_with_no_declared_device_by_name(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "plan.jsonl").write_text("")
+    (out / "run.json").write_text(json.dumps({"device": [{"arch": "gfx90a"}]}))
+    argv = ["--coverage", "graded", "--store", str(tmp_path), "--out", str(out)]
+
+    with pytest.raises(ValueError, match="no declared device for gfx90a"):
+        ops._coverage_main(argv, [])
+
+
+@pytest.mark.parametrize("mode", ["--width", "--plan", "--coverage"])
+def test_measure_ops_without_enforce_eager_refuses_by_name_and_traces_nothing(
+    tmp_path, monkeypatch, mode, model_config  # noqa: F811
+):
+    graph_mode = SimpleNamespace(**vars(model_config))
+    graph_mode.enforce_eager, graph_mode.tp_world_size = False, 1
+    graph_mode.pipeline_parallel_size = graph_mode.prefill_context_parallel_size = 1
+    graph_mode.enable_dp_attention = False
+    graph_mode.compilation_config = SimpleNamespace(level=0)
+    traced = []
+    monkeypatch.setattr("atom.compass.bench.measure.atom_config", lambda a: graph_mode)
+    monkeypatch.setattr("atom.compass.drive.gpu.hip_visible", lambda g: "0")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(ops, "_child", lambda fn, argv: traced.append(argv))
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "plan.jsonl").write_text("")
+    (out / "run.json").write_text(json.dumps({"device": [{"arch": "gfx950"}]}))
+    graded = _records(tmp_path / "graded", ([[1, 100, True]], 1))
+    common = ["--store", str(tmp_path / "store"), "--out", str(out)]
+    argv = {
+        "--width": ["--width", "1", "--context", "100"],
+        "--plan": ["--plan", graded],
+        "--coverage": ["--coverage", graded],
+    }[mode] + common
+    if mode != "--coverage":
+        argv += ["--llc-mib", "256", "--gpu", "0"]
+
+    with pytest.raises(ValueError, match="measure with --enforce-eager"):
+        ops.main([*argv, "--", "--model", model_config.model, "--level", "0"])
+
+    assert traced == []
+
+
 def _dies(*finished):
     """`_bench` as a child that dies once for each entry of `finished`, having
     journaled that many of its points, and then lives; and the records it was
@@ -751,7 +876,7 @@ def test_measure_journals_each_record_as_it_finishes_it(tmp_path, monkeypatch):
     runner, journal = _Runner(), tmp_path / "points.jsonl"
     runner.exit = lambda: None
     placed = SimpleNamespace(block_size=16, batch=lambda view, block, slot: (0, 0))
-    monkeypatch.setattr(ops, "_runner", lambda config: runner)
+    monkeypatch.setattr(ops, "_runner", lambda config, rank: runner)
     monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda c: placed)
     monkeypatch.setenv(ops.JOURNAL, str(journal))
     x = ("self", _t([2, 3], "activation"))

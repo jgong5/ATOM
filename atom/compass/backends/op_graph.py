@@ -34,10 +34,20 @@ MoE exchange of activations rides the comm stream, everything else the compute
 stream. Both micro-batches' segments go on the two streams in ATOM's order
 (`step_roofline.overlap`); the finish time is the one term ``op.tbo``.
 
+With a `price_list`, a source named `LISTED` (`fit.ops.PriceList` in a run),
+each leaf outside a `resource_bound` `Par` resolves through a `Resolver`: the
+price list, asked ``(leaf, bound, work)`` with `bound` the step's or
+micro-batch's (`_bound`), then its roofline. A `resource_bound` `Par` prices
+its branches' summed work, so its leaves take no price of their own.
+
 Terms. One per op kind, ``op.<kind>``, and ``par.resource_bound``, each
 the fold of its prices in run order. A term is `declared`, its note naming
 each input, when a spec field the winning bound of one of its prices read is
-neither from a datasheet nor probed, and `analytical` otherwise.
+neither from a datasheet nor probed, and `analytical` otherwise; it carries
+each reason the price list declined one of its leaves. A price list's prices
+are ``op.<kind>.price_list``, and ``op.tbo.price_list`` when it priced every
+leaf of both micro-batches, `measured` when each sat on a measured point and
+`estimated` otherwise.
 
 Refused: a step with image tokens, since no graph holds the vision encoder; a
 two-batch-overlap step on MoRI's split send and receive (`split_send_recv`),
@@ -59,19 +69,48 @@ from dataclasses import replace
 from atom.compass.backends.base import CostBackend, Granularity
 from atom.compass.backends.cost import CostTerm, StepCost, fold_seconds
 from atom.compass.backends.op_work import work
-from atom.compass.backends.provenance import Method, Provenance, Refusal
-from atom.compass.backends.resolver import CostRefused
+from atom.compass.backends.provenance import Method, Provenance, Refusal, combine
+from atom.compass.backends.resolver import CostRefused, CostSource, Resolver
 from atom.compass.backends.shape import IMAGES, BatchView
 from atom.compass.backends.step_roofline import _reads, micro_batches, overlap
 from atom.compass.backends.work import Work, bounds
 
 SOURCE = "op-graph"
+LISTED = "price-list"
 #: The leaves a captured MoE layer exchanges its DP or EP group's rows by:
 #: ATOM's gathers and scatters, and MORI's dispatch and combine.
 MOE_EXCHANGES = ("atom.model_ops.moe:", "mori.ops.dispatch_combine:")
 #: The term a two-batch-overlap step's one price is.
 TBO = "op.tbo"
 NONE = "; no successor: the analytical law is the last op-level source"
+
+
+class _Roofline(CostSource):
+    """A leaf's roofline, as `OpGraphBackend._unit` prices it."""
+
+    name = SOURCE
+
+    def __init__(self, backend: OpGraphBackend) -> None:
+        self.backend = backend
+
+    def price(self, request: tuple) -> CostTerm:
+        (leaf, _, w), refused = request, []
+        if isinstance(w, tuple):
+            raise CostRefused(request, w)
+        kind = leaf["op"]
+        unit = self.backend._unit(kind, w, refused)
+        if unit is None:
+            raise CostRefused(request, refused)
+        note = "; ".join(unit[1])
+        method = Method.DECLARED if note else Method.ANALYTICAL
+        return CostTerm(f"op.{kind}", unit[0], Provenance(method, note=note))
+
+
+def band(rows, decode: bool) -> tuple[int, int]:
+    """The mean and max context of `rows`, each ``[query, context, ...]``: a
+    decode row's context, a prefill row's cached tokens."""
+    c = [row[1] - (0 if decode else row[0]) for row in rows]
+    return sum(c) // len(c), max(c)
 
 
 def step_shape(
@@ -101,18 +140,22 @@ class OpGraphBackend(CostBackend):
         graph: Callable[..., dict | None],
         *,
         tp: int = 1,
+        dp: int = 1,
         kv: str,
         padded: bool = True,
         split_send_recv: bool = False,
+        price_list: CostSource | None = None,
     ) -> None:
         self.machine = machine
         self.graph = graph
         self.tp = tp
+        self.dp = dp
         self.kv = kv
         self.padded = padded
         self.split_send_recv = split_send_recv
         self.name = machine.values.get("name", "")
         self._stated_as: dict[str, str] = {}
+        self.resolver = price_list and Resolver([price_list, _Roofline(self)])
 
     @property
     def granularity(self) -> Granularity:
@@ -122,30 +165,58 @@ class OpGraphBackend(CostBackend):
         refused: list[Refusal] = []
         if batch_view.tbo_tokens is None or batch_view.image_tokens:
             at, region = self._region(batch_view)
-            priced = self._priced(region, batch_view, refused)
+            bound = self.resolver and self._bound(batch_view)
+            priced = self._priced(region, batch_view, refused, bound)
         else:
             at, priced = self._overlapped(batch_view, refused)
         if refused:
             raise CostRefused(batch_view, list(dict.fromkeys(refused)))
         seconds: dict[str, list[float]] = {}
         stated: dict[str, list[str]] = {}
-        for name, s, notes, *_ in priced:
+        how: dict[str, tuple[list, list]] = {}
+        for name, s, notes, _, _, (methods, declined) in priced:
             seconds.setdefault(name, []).append(s)
             stated.setdefault(name, []).extend(notes)
+            got = how.setdefault(name, ([], []))
+            got[0].extend(methods)
+            got[1].extend(declined)
         terms = []
         for name, values in seconds.items():
             note = "; ".join(dict.fromkeys(stated[name]))
             method = Method.DECLARED if note else Method.ANALYTICAL
+            source, (methods, why) = SOURCE, how[name]
+            if name.endswith(".price_list"):
+                method, source = combine(methods), LISTED
             detail = f"{len(values)} prices of the graph at {at}"
-            if name == TBO:
+            if name.startswith(TBO):
                 detail = f"two micro-batches overlapped, from the graphs at {at}"
-            provenance = Provenance(method, detail, SOURCE, note=note and note + NONE)
+            provenance = Provenance(
+                method,
+                detail,
+                source,
+                tuple(dict.fromkeys(why)),
+                note=note and note + NONE,
+            )
             terms.append(CostTerm(name, fold_seconds(values), provenance))
         return StepCost(terms)
 
     def describe(self) -> str:
         rows = "the rows a graph pads to" if self.padded else "real rows"
-        return f"op graph at TP {self.tp}, one roofline per leaf, at {rows}"
+        first = "a price list, then " if self.resolver else ""
+        return f"op graph at TP {self.tp}, {first}one roofline per leaf, at {rows}"
+
+    def _bound(self, view: BatchView) -> tuple:
+        """What a price list reads of a step: its phase, its T and B, the rows
+        its MoE gathers, None at every rank's T (`dp` x T, as `Shape.at`
+        drops them), and its rows' context and max context (`band`), the
+        context a decode's max, a prefill's mean cached tokens."""
+        rung = view.capture_rung if self.padded else None
+        rows = [(r.query_tokens, r.decode) for r in view.requests]
+        phase, t, b = step_shape(rows, rung)
+        g = None if view.moe_rows == self.dp * t else view.moe_rows
+        rows = [(r.query_tokens, r.context_tokens) for r in view.requests]
+        mean, top = band(rows, phase == "decode")
+        return (phase, t, b, g, top if phase == "decode" else mean, top)
 
     def _region(self, view: BatchView) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region."""
@@ -193,14 +264,18 @@ class OpGraphBackend(CostBackend):
             halves = micro_batches(view)
         except ValueError as exc:
             raise CostRefused(view, [Refusal(SOURCE, str(exc))]) from None
-        at, runs, notes = [], [], []
+        at, runs, notes, methods, why = [], [], [], [], []
+        listed = bool(self.resolver)
         for k, half in enumerate(halves):
             output = k == 1 and view.produces_output
             half = replace(half, produces_output=output)
             shape, region = self._region(half)
             at.append(shape)
+            bound = self.resolver and self._bound(half)
             run = [0.0]
-            for _, seconds, stated, _, comm in self._priced(region, half, refused):
+            for name, seconds, stated, _, comm, how in self._priced(
+                region, half, refused, bound
+            ):
                 if comm is None:
                     reason = (
                         f"a two-batch-overlap step whose micro-batch graph at {shape} "
@@ -209,6 +284,9 @@ class OpGraphBackend(CostBackend):
                     )
                     raise CostRefused(view, [Refusal(SOURCE, reason)])
                 notes += stated
+                methods += how[0]
+                why += how[1]
+                listed = listed and name.endswith(".price_list")
                 if comm != (len(run) % 2 == 0):
                     run.append(0.0)
                 run[-1] += seconds
@@ -220,26 +298,37 @@ class OpGraphBackend(CostBackend):
                 f"streams {len(runs[0]) - 1} and {len(runs[1]) - 1} times"
             )
             raise CostRefused(view, [Refusal(SOURCE, reason)])
-        return " and ".join(at), [(TBO, overlap([zip(*runs)]), notes, Work(), False)]
+        name = TBO + ".price_list" if listed else TBO
+        price = (name, overlap([zip(*runs)]), notes, Work(), False, (methods, why))
+        return " and ".join(at), [price]
 
-    def _priced(self, region: dict, view: BatchView, refused: list) -> list:
+    def _priced(self, region: dict, view: BatchView, refused: list, bound) -> list:
         """`region`'s prices in run order, each ``(term, seconds, stated, work,
-        comm)``, `work` what it adds to an enclosing resource_bound, `comm`
-        that it rides the comm stream under two-batch overlap, None when it
-        joins an MoE exchange to work on another stream; what refuses goes to
-        `refused`."""
+        comm, (methods, declined))``, `work` what it adds to an enclosing
+        resource_bound, `comm` that it rides the comm stream under two-batch
+        overlap, None when it joins an MoE exchange to work on another stream,
+        `methods` the price list's and `declined` its reasons for a roofline;
+        what refuses goes to `refused`. With a `bound`, a leaf resolves through
+        the price list first."""
         if "op" in region:
-            leaf = self._leaf(region, view, refused)
+            leaf = self._leaf(region, view, refused, bound)
             comm = region["op"].startswith(MOE_EXCHANGES) and any(
                 isinstance(a, dict) and a.get("role") == "activation"
                 for a in region["args"].values()
             )
-            return [(f"op.{region['op']}", *leaf, comm)] if leaf else []
+            return [(*leaf[:4], comm, leaf[4])] if leaf else []
         if "repeat" in region:
-            return self._priced(region["repeat"], view, refused) * region["count"]
+            body = self._priced(region["repeat"], view, refused, bound)
+            return body * region["count"]
         if "seq" in region:
-            return [p for i in region["seq"] for p in self._priced(i, view, refused)]
-        branches = [self._priced(b, view, refused) for b in region["par"]]
+            return [
+                p for i in region["seq"] for p in self._priced(i, view, refused, bound)
+            ]
+        pooled = region["join"] == "resource_bound"
+        branches = [
+            self._priced(b, view, refused, None if pooled else bound)
+            for b in region["par"]
+        ]
         summed = sum((p[3] for b in branches for p in b), Work())
         comm = None if any(p[4] is not False for b in branches for p in b) else False
         if region["join"] == "max":
@@ -248,26 +337,40 @@ class OpGraphBackend(CostBackend):
             # The longest branch's prices stay under their own terms; the
             # first carries every branch's work for an enclosing resource_bound.
             return [
-                (*p[:3], summed if i == 0 else Work(), comm)
+                (*p[:3], summed if i == 0 else Work(), comm, p[5])
                 for i, p in enumerate(longest)
             ]
         name = f"par.{region['join']}"
         unit = self._unit(name, summed, refused)
-        return [(name, *unit, summed, comm)] if unit else []
+        return [(name, *unit, summed, comm, ((), ()))] if unit else []
 
-    def _leaf(self, leaf: dict, view: BatchView, refused: list):
-        """One leaf's ``(seconds, stated, work)``; None when it launches no
-        kernel or refuses."""
+    def _leaf(self, leaf: dict, view: BatchView, refused: list, bound):
+        """One leaf's ``(term, seconds, stated, work, (methods, declined))`` as
+        `_priced` lists it; None when it launches no kernel or refuses."""
         try:
             w = work(leaf, view, self.tp, self.kv)
         except CostRefused as exc:
-            refused.extend(exc.declined)
-            return None
+            w = tuple(exc.declined)
         except ValueError as exc:
-            refused.append(Refusal(SOURCE, f"{leaf['op']}: {exc}"))
+            w = (Refusal(SOURCE, f"{leaf['op']}: {exc}"),)
+        if w is None:
             return None
-        unit = w and self._unit(leaf["op"], w, refused)
-        return unit and (*unit, w)
+        if bound:
+            try:
+                got = self.resolver.resolve((leaf, bound, w))
+            except CostRefused as exc:
+                refused.extend(exc.declined)
+                return None
+            term, listed = got.term, got.source == LISTED
+            notes = term.provenance.note.split("; ") if term.provenance.note else []
+            name = f"{term.name}.price_list" if listed else term.name
+            how = ((term.provenance.method,) if listed else (), got.declined)
+            return name, term.seconds, notes, Work(), how
+        if isinstance(w, tuple):
+            refused.extend(w)
+            return None
+        unit = self._unit(leaf["op"], w, refused)
+        return unit and (f"op.{leaf['op']}", *unit, w, ((), ()))
 
     def _unit(self, what: str, w: Work, refused: list):
         """One pricing unit's seconds and the stated spec fields its largest

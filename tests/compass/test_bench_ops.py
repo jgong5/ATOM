@@ -270,7 +270,7 @@ def test_a_shape_the_pool_cannot_place_refuses_its_leaves_and_the_next_is_measur
 ):
     runner = _Runner()
     runner.exit = lambda: runner.batches.append("exit")
-    monkeypatch.setattr(ops, "_runner", lambda config: runner)
+    monkeypatch.setattr(ops, "_runner", lambda config, rank: runner)
     monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda config: None)
 
     def point(self, _rule, shape, context, found):
@@ -339,7 +339,7 @@ def test_a_decode_point_takes_an_integer_affine_in_the_context_at_its_own(
 
     # ATOM's own step at decode B = 2, context 8192 passes its rows' longest
     # context.
-    batch = rule().batch(_line([[1, 8192, True]] * 2))
+    batch = rule(max_model_len=8192).batch(_line([[1, 8192, True]] * 2))
     tables = torch.zeros(2, 8, dtype=torch.int32)
     block_convert.kv_indices_generate_triton(
         tables, tables, tables, 1, batch.context_lens.max()

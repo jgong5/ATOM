@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 #
 # QUICKSTART.md's path end to end at concurrency 1 on one GPU, in about an hour:
-# `compass measure memory`; a calibration `compass record` serving cc-traces 256
+# `compass measure memory`; a calibration `compass record` serving cc-traces 353
 # on; `compass fit steps` (step linear, history form) and `compass fit host` on
 # it; two real `compass record` runs and one `compass run`, serving traces 0 on;
 # then the cell graded by `python -m atom.compass.validate`. Each server serves
@@ -12,6 +12,9 @@
 # once, so that it takes the aiter JIT builds a fresh container meets while
 # serving, which grading, the fits and `validate.cost` refuse in a record
 # (run.json's `aiter_jit_builds`).
+# Calibration serves traces 353 on: at client.sh's seed, its sampled start reaches
+# subagents and batches 1 to 7 requests a step, so the law has a decode vector for
+# each batch size the cell takes; traces 256 on start at a first request.
 #
 # Usage: smoke_cell.sh MODEL OUT
 #   MODEL           the model directory: config.json, tokenizer and weights
@@ -25,7 +28,7 @@
 #                   simulated run's client (required)
 #   AIPERF_PYTHON   the Python with agentx-harness and no compass-harness, for
 #                   the real runs' clients (required)
-#   N_TRACES        traces each client is given (default 8): 256 on for
+#   N_TRACES        traces each client is given (default 8): 353 on for
 #                   calibration, 0 on for the cell
 #   DURATION_S      each client run's benchmark duration (default 600)
 #   SERVER_ARGS     ATOM's arguments after --model (default: --max-model-len
@@ -105,7 +108,7 @@ serve() {
 token() { awk '/^published / {t = $NF} END {print t}' "$1"; }
 
 M=(--machine "$MACHINE" --store "$OUT/store")
-CAL=256-$((255 + N)) CELL=0-$((N - 1))
+CAL=353-$((352 + N)) CELL=0-$((N - 1))
 step memory python3 -c "$CLI" measure memory --gpu "$GPU" "${M[@]}" --out "$OUT/memory" -- "${ATOM_ARGS[@]}"
 serve warm "$OUT/warm" "$CELL" "$AIPERF_PYTHON" record --gpu "$GPU"
 serve calibration "$OUT/calibration" "$CAL" "$AIPERF_PYTHON" record --gpu "$GPU"
