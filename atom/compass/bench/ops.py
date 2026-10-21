@@ -377,7 +377,7 @@ def _runner(config, rank: int):
     blocks a rank has room for, sized by ATOM with the parameters' bytes held
     on the device and then freed for the weights each leaf builds. One DP rank
     of several run alone is built as ATOM's simulated DP attention builds it:
-    DP 1, its experts cut and their token buffers sized as across the ranks."""
+    DP 1, its experts cut as across the ranks."""
     from torch.distributed import TCPStore
 
     from atom.compass.bench.ranks import agreed, cpu_group
@@ -395,6 +395,8 @@ def _runner(config, rank: int):
     pc, store = config.parallel_config, None
     if not pc._managed_distributed_store:  # one rank: the store is its own
         if pc.data_parallel_size > 1:
+            # ponytail: ATOM's top-k buffers then hold one rank's batched
+            # tokens, not the rows the layout gathers: a leaf past them refuses
             config = copy.deepcopy(config)
             config.dp_logical_size = pc.data_parallel_size
             pc = config.parallel_config
