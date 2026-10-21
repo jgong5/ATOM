@@ -51,8 +51,8 @@ Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
 idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
-aside, are the point's kernel identity. A batch `ReplayRule` refuses refuses its
-leaves; an error in ATOM's forward fails the run.
+aside, are the point's kernel identity. When `ReplayRule` refuses a batch, its
+leaves refuse; an error in ATOM's forward fails the run, naming the point.
 The points run in a process of their own on each GPU; one that dies ends
 every rank, keeps the points every rank finished, the point it was measuring
 refuses, and new ones measure the rest; two in a row that die having finished
@@ -457,7 +457,11 @@ class Stub:
                     for sig, (op, _) in found.items()
                 ]
                 return _journal(self.journal, refused)
-            self.runner.forward(batch)
+            try:
+                self.runner.forward(batch)
+            except Exception as error:
+                error.add_note(f"measuring {shape} at context {context}")
+                raise
         got = []
         for sig, (op, inst) in found.items():
             n, size, _ = plans[sig]

@@ -290,12 +290,16 @@ def _measuring(monkeypatch):
 
 
 def test_a_shape_the_rule_refuses_refuses_its_leaves_and_the_next_is_measured(
-    monkeypatch,
+    monkeypatch, tmp_path
 ):
     runner, todo = _measuring(monkeypatch)
+    journal = tmp_path / "points.jsonl"
+    monkeypatch.setenv(ops.JOURNAL, str(journal))
 
     got = ops.measure(None, todo, 10_000)
 
+    lines = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert [r.get("refused") for r in lines] == [r.get("refused") for r in got]
     assert [(r["shape"], r["op"], r.get("refused")) for r in got] == [
         (str(decode(2)), "aten.neg.default", "ValueError: no room for 2 rows"),
         (str(decode(2)), "aten.abs.default", "ValueError: no room for 2 rows"),
@@ -315,8 +319,9 @@ def test_an_error_in_atom_s_forward_fails_measure_with_that_error(monkeypatch):
 
     runner.forward = forward
 
-    with pytest.raises(ValueError, match="cannot begin: owner is active"):
+    with pytest.raises(ValueError, match="cannot begin: owner is active") as raised:
         ops.measure(None, todo, 10_000)
+    assert raised.value.__notes__ == [f"measuring {decode(4)} at context 20"]
     assert runner.batches == [(4, 0), "exit"]
 
 
