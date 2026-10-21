@@ -13,7 +13,8 @@ capacity and the stack; every field no probe fills is assumed, on either host.
 One real burst on each host adds the HTTP intake terms (`INTAKE`), and on
 node 18 `probe_device.py`'s readings (`PEAKS`) the compute and memory derates,
 the bandwidth curve, the kernel floor and the intra-node link's latency and
-derate. An engine start's memory readings are `compass measure memory`'s,
+derate; there 64 lone requests add the idle intake (`IDLE`). An engine start's
+memory readings are `compass measure memory`'s,
 not the spec's. One fragment per probe or origin. Writes the merged document to `--out` when
 `validate` passes, then prints `explain`'s rows for the host, device and
 interconnect blocks, grouped by origin.
@@ -120,6 +121,19 @@ INTAKE = {
         "40da90fe439e06efa8aeb8d8b3d5a17a955c507afb6f9aa18401cbbc957739de",
     ),
 }[NAME]
+#: The intake of a request that finds no other on the loop, on node 18:
+#: `http_intake.py idle` less `INTAKE`'s per-byte rate, over 64 lone requests
+#: (`floor`'s run, GPU 0, 2026-10-20) at the commit named, the record its stamp
+#: file; the band is the p10 and p90 over those requests.
+IDLE = {
+    "mi308x-hjbog18": (
+        "2026-10-20",
+        "dee1854db",
+        0.0008174736867329385,
+        (0.0007076265928628138, 0.0010018610641255089),
+        "eaaf420687a928940f535d8a3d4e8d449e896c7c155516fad1e3fcacab90d44c",
+    ),
+}.get(NAME)
 
 #: A pipeline stage's send, per carrier, fitted on hjbog-srdc-39 GPUs 4 and 5
 #: by `scripts/compass/pp_carriers.py`, pooled at commit f61652a37 over six of
@@ -306,6 +320,14 @@ def device_fragments() -> list[Fragment]:
     ptl = {"device": {"ptl": PTL}}
     probes = [fragment("ptl", ptl, "probed", "ptl_enable", date="2026-10-18")]
     probes.append(intake("Qwen/Qwen3.8-27B", *INTAKE))
+    if IDLE:
+        date, root, value, band, record = IDLE
+        subject = {"model": "Qwen/Qwen3.8-27B", "source_root": f"commit:{root}"}
+        subject["record"] = f"sha256:{record}"
+        body = {"host": {"http_intake": {"idle_s": value}}}
+        band = {"host.http_intake.idle_s": band}
+        how = f"http_intake.py idle over 64 lone requests at {root}"
+        probes.append(fragment("idle", body, "probed", how, subject, date, band))
     if PP:
         date, root, carriers, band, record = PP
         subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}

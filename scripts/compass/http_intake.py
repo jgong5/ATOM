@@ -4,17 +4,24 @@
     python3 scripts/compass/http_intake.py serve STAMPS API_SERVER_ARGS...
     python3 scripts/compass/http_intake.py fit STAMPS [N]
     python3 scripts/compass/http_intake.py floor STAMPS ARRIVALS
+    python3 scripts/compass/http_intake.py idle STAMPS [PER_BYTE_S]
 
 `serve` runs `atom.entrypoints.openai.api_server` as ``python3 -m`` does and
-appends ``<end ns> <thread id> body|tmpl|app <start ns> <size>`` to STAMPS for
+appends ``<end ns> <thread id> body|tmpl|app|prep|send <start ns> <size>`` to STAMPS for
 each request body first read (`Request.body`), chat template rendered
 (`apply_chat_template`) and HTTP request handed to the ASGI app
 (`Starlette.__call__`, size 0); `cctraces_sim.sh` runs it when HTTP_INTAKE is set.
+`prep` is a tokenizer pool job (`InputOutputProcessor.preprocess_fanout`) and `send`
+a request handed to the engine (`CoreManager.add_request`), both size 0.
 
 `floor` reads the transport from client send to ASGI app call off a server
 `serve` ran and the parity workload's real-run ARRIVALS
 (`atom.compass.parity.traffic`), sent one request in flight: a gap longer than
 any request. Prints the median, p10 and p90 in seconds, N and both sha256s as JSON.
+`idle` reads the same run's intake on a loop with no other: the event loop's time
+from each ASGI app call to its pool job's start and from the job's end to its
+engine send, less PER_BYTE_S (default 0) per body byte. Prints the
+median as `idle_s`, p10, p90, PER_BYTE_S, N and the sha256 as JSON.
 
 `fit` reads a burst of N first-turn requests (default 256), which the loop takes
 in one at a time: each gap between template starts is the next request's
@@ -76,11 +83,32 @@ def serve(stamps: str, args: list[str]) -> None:
 
         module.Starlette.__call__ = __call__
 
+    def stamped(owner: str, name: str, kind: str):
+        def patch(module) -> None:
+            cls = getattr(module, owner)
+            call = getattr(cls, name)
+
+            def timed(*a, **k):
+                start = time.monotonic_ns()
+                got = call(*a, **k)
+                stamp(kind, start, 0)
+                return got
+
+            setattr(cls, name, timed)
+
+        return patch
+
     # Each module is patched once it has run, before anything imports from it.
     patches = {
         "starlette.requests": requests,
         "starlette.applications": apps,
         "atom.entrypoints.openai.chat_encoders": encoders,
+        "atom.model_engine.llm_engine": stamped(
+            "InputOutputProcessor", "preprocess_fanout", "prep"
+        ),
+        "atom.model_engine.engine_core_mgr": stamped(
+            "CoreManager", "add_request", "send"
+        ),
     }
 
     class Patcher(importlib.abc.MetaPathFinder):
@@ -149,11 +177,45 @@ def floor(stamps: str, arrivals: str) -> dict:
     }
 
 
+def idle(stamps: str, per_byte: float = 0.0) -> dict:
+    data = Path(stamps).read_bytes()
+    rows = [line.split() for line in data.decode().splitlines()]
+    calls = sorted(int(r[3]) for r in rows if r[2] == "app")
+    jobs = sorted((int(r[3]), int(r[0])) for r in rows if r[2] == "prep")
+    sends = sorted(int(r[0]) for r in rows if r[2] == "send")
+    # One request at a time: its pool job and engine send come before the next call.
+    after = calls[1:] + [float("inf")]
+    if not len(calls) == len(jobs) == len(sends) or not all(
+        c < j < e < s < nxt for c, (j, e), s, nxt in zip(calls, jobs, sends, after)
+    ):
+        raise SystemExit(
+            f"{stamps}: {len(jobs)} pool jobs and {len(sends)} engine sends, "
+            f"not one each after each of {len(calls)} app calls"
+        )
+    nbytes = [
+        sum(int(r[4]) for r in rows if r[2] == "body" and c < int(r[3]) < j)
+        for c, (j, _) in zip(calls, jobs)
+    ]
+    loop = [j - c + s - e for c, (j, e), s in zip(calls, jobs, sends)]
+    took = np.array(loop) / 1e9 - per_byte * np.array(nbytes)
+    p10, median, p90 = np.percentile(took, [10, 50, 90])
+    return {
+        "idle_s": float(median),
+        "p10_s": float(p10),
+        "p90_s": float(p90),
+        "per_byte_s": per_byte,
+        "requests": len(jobs),
+        "record": f"sha256:{hashlib.sha256(data).hexdigest()}",
+    }
+
+
 if __name__ == "__main__":
     verb, stamps, *rest = sys.argv[1:]
     if verb == "serve":
         serve(stamps, rest)
     elif verb == "floor":
         print(json.dumps(floor(stamps, *rest)))
+    elif verb == "idle":
+        print(json.dumps(idle(stamps, *map(float, rest))))
     else:
         print(json.dumps(fit(stamps, *map(int, rest))))
