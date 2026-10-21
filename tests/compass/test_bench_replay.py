@@ -30,11 +30,13 @@ from atom.model_engine.llm_engine import _load_tokenizer
 @pytest.fixture
 def rule(model_dir):  # noqa: F811
     """The rule for a model of `model_type`, over a pool of `blocks` blocks,
-    for the request parameters `sampling`."""
+    for rows of at most `max_model_len` tokens and the request parameters
+    `sampling`."""
 
-    def build(model_type="llama", blocks=4096, sampling=None):
+    def build(model_type="llama", blocks=4096, sampling=None, max_model_len=2048):
         config = _config(blocks=blocks)
         config.model, config.trust_remote_code = str(model_dir), False
+        config.max_model_len = max_model_len
         config.hf_config = SimpleNamespace(model_type=model_type)
         return replay.ReplayRule(config, sampling)
 
@@ -176,6 +178,13 @@ def test_the_batch_carries_the_rules_name_and_version(rule):
 def test_a_line_the_rule_cannot_rebuild_is_refused(rule, line, refusal):
     with pytest.raises(ValueError, match=refusal):
         rule().batch(line)
+
+
+def test_a_row_past_max_model_len_is_refused_and_one_at_it_is_built(rule):
+    rebuild = rule(max_model_len=2048)
+    assert rebuild.batch(_line([[8, 2048, False]])).context_lens.tolist() == [2048]
+    with pytest.raises(ValueError, match="a row of 2049 tokens, past max_model_len"):
+        rebuild.batch(_line([[8, 40, False], [8, 2049, False]]))
 
 
 def test_a_tokenizer_with_no_filler_id_is_refused(rule, monkeypatch):

@@ -30,6 +30,7 @@ CONFIG = SimpleNamespace(
     capture_sizes=[1, 2, 4],
     max_num_seqs=4,
     max_num_batched_tokens=8192,
+    max_model_len=262144,
     speculative_config=None,
 )
 
@@ -322,6 +323,37 @@ def test_a_plan_ladders_cached_tokens_only_for_a_prefill_kind_that_moves_there(
     report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["by phase"] == {"prefill": {"steps": 2, "covered": covered}}
+
+
+@pytest.mark.parametrize(
+    "max_model_len, at_8000", [(8100, {40, 100}), (8150, {40, 100, 150})]
+)
+def test_a_plan_places_no_cached_prefill_point_past_max_model_len(
+    bench, tmp_path, monkeypatch, max_model_len, at_8000
+):
+    monkeypatch.setattr(ops, "_child", _moving_bench)
+    monkeypatch.setattr(CONFIG, "max_model_len", max_model_len)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[40, 8040, False]], None),  # the most cached tokens, on a short chunk
+        ([[100, 2100, False]], None),
+        ([[150, 150, False]], None),
+    )
+    records = _plan(bench, tmp_path, plan)
+
+    prefill = [r for r in records if r["shape"].startswith("prefill")]
+    for r in prefill:
+        shape = ops._shape(r["shape"])
+        row = -(-shape.tokens // shape.seqs) + (r["context"] or 0)
+        assert row <= max_model_len, r
+    attn = {
+        ops._shape(r["shape"]).tokens
+        for r in prefill
+        if r["op"] == "aiter.attn" and r["context"] == 8000
+    }
+    # At 8100, 150 tokens past 8000 cached is a row past max_model_len.
+    assert attn == at_8000
 
 
 @pytest.mark.parametrize(
