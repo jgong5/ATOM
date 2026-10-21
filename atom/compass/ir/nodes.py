@@ -21,7 +21,6 @@ leaves free.
 """
 
 import enum
-import importlib
 import string
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -176,36 +175,6 @@ class Reduced:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "state", _as_value(self.cls, self.state))
-
-    def rebuild(self, live):
-        """The object again, each value of its state passed through `live`
-        first (`Reduced` ones rebuilt alike)."""
-        module, qualname = self.cls.split(":")
-        cls = importlib.import_module(module)
-        for name in qualname.split("."):
-            cls = getattr(cls, name)
-        if issubclass(cls, enum.Enum):
-            return cls(self.state)
-        state = {rebuild(k, live): rebuild(v, live) for k, v in self.state}
-        if cls is dict:
-            return state
-        obj = cls.__new__(cls)
-        if setstate := getattr(obj, "__setstate__", None):
-            setstate(state)
-        else:
-            obj.__dict__.update(state)
-        return obj
-
-
-def rebuild(value: Any, live) -> Any:
-    """An argument value as a call takes it: `Reduced` objects rebuilt, tuples
-    item by item, and `Tensor`, `ContextRef` and `Affine` values through
-    `live`."""
-    if isinstance(value, Reduced):
-        return value.rebuild(live)
-    if isinstance(value, tuple):
-        return tuple(rebuild(item, live) for item in value)
-    return live(value) if isinstance(value, (Tensor, ContextRef, Affine)) else value
 
 
 @dataclass(frozen=True, slots=True)

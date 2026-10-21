@@ -49,7 +49,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 import atom
 from atom.compass import ir
-from atom.compass.ir.nodes import Reduced, rebuild
+from atom.compass.ir.nodes import Reduced
 
 from . import driverless, peers
 from .graph import LAYER, Fork, Join, Traced, _json, build
@@ -233,6 +233,31 @@ def _function(name: str):
     for attr in qualname.split("."):
         fn = getattr(fn, attr)
     return fn
+
+
+def _rebuilt(value, live):
+    """An argument value as a call takes it: a `Reduced` object rebuilt (an
+    enum member from its value, a dict from its items, any other object from
+    its class and state), tuples item by item, and `Tensor`, `ContextRef` and
+    `Affine` values through `live`."""
+    if isinstance(value, tuple):
+        return tuple(_rebuilt(item, live) for item in value)
+    if isinstance(value, (ir.Tensor, ir.ContextRef, ir.Affine)):
+        return live(value)
+    if not isinstance(value, Reduced):
+        return value
+    cls = _function(value.cls)
+    if issubclass(cls, enum.Enum):
+        return cls(value.state)
+    state = {_rebuilt(k, live): _rebuilt(v, live) for k, v in value.state}
+    if cls is dict:
+        return state
+    obj = cls.__new__(cls)
+    if setstate := getattr(obj, "__setstate__", None):
+        setstate(state)
+    else:
+        obj.__dict__.update(state)
+    return obj
 
 
 def _addressable(frame) -> bool:
@@ -420,7 +445,7 @@ class _Recorder(TorchDispatchMode):
         on, creating, self.on, self.creating = self.on, self.creating, False, None
         self.replaying = []
         try:
-            kwargs = {slot: rebuild(value, self._live) for slot, value in op.args}
+            kwargs = {slot: _rebuilt(value, self._live) for slot, value in op.args}
             for slot, value in kwargs.items():  # a dtype is held as its text
                 held = isinstance(value, str) and value.startswith("torch.")
                 held = held and getattr(torch, value[6:], None)
