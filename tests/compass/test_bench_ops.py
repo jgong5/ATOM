@@ -222,7 +222,6 @@ def test_a_point_places_its_batch_for_its_context_keys_and_refuses_by_name(
                 ("layer", ir.ContextRef(KEY)),
                 key=KEY,
             ),
-            _leaf("aten.neg.default", ("rope", ir.ModuleRef("1"))),
             _leaf("aten.add.Tensor", ("self", _t([2, 3], "kv"))),
             _leaf(
                 "aten.add_.Tensor",
@@ -242,8 +241,6 @@ def test_a_point_places_its_batch_for_its_context_keys_and_refuses_by_name(
     assert runner.staged == [s for b in runner.batches for s in ("begin", b, "finish")]
     why = {r["op"]: r["refused"] for r in got}
     assert "'nowhere'" in why["aten.nowhere.default"]
-    # every parameter is on the meta device, a module's too
-    assert "1 holds parameter weight, on the meta device" in why["aten.neg.default"]
     assert "a kv tensor argument [2, 3]" in why["aten.add.Tensor"]
     [meta] = [r for r in got if r["op"] == "aten.add_.Tensor"]
     assert meta["metadata"] == {"self": "block_tables"}
@@ -601,19 +598,29 @@ def test_copy_c_rotates_weights_and_instances_and_clones_past_the_first_round():
 
 
 @pytest.mark.parametrize("kind, key", [("module", "2"), ("context", KEY)])
-def test_a_reference_to_a_module_holding_a_parameter_refuses_by_name(kind, key):
+def test_a_referenced_module_s_meta_parameters_are_filled_as_load_dummy_xavier(
+    kind, key
+):
     # Every parameter of ATOM's model is on the meta device: a leaf reaching
-    # one through a module path or its layer's context key reads no memory.
+    # one through a module path or its layer's context key reads it on the
+    # device, filled as ATOM's `--load_dummy xavier` fills it.
     layer = torch.nn.Module()
     layer.A_log = torch.nn.Parameter(torch.empty(4, device="meta"))
+    layer.conv1d = torch.nn.Linear(3, 2, device="meta")
     runner = _Runner({KEY: layer})
     runner.model.append(layer)
     stub = ops.Stub(runner, 10_000)
     stub.placed = [(fctx.ForwardContext(), {})]
     op = {"op": "x", "args": {"layer": {kind: None}}}
 
-    with pytest.raises(ValueError, match=f"^{key} holds parameter A_log, on the meta"):
-        stub._copy(op, "sig", [{"layer": key}], 0)
+    stub._copy(op, "sig", [{"layer": key}], 0)
+
+    assert {p.device.type for p in layer.parameters()} == {"cpu"}
+    assert torch.equal(layer.A_log, torch.ones(4))
+    assert torch.equal(layer.conv1d.bias, torch.zeros(2))
+    weight = layer.conv1d.weight
+    assert 0 < weight.abs().max() <= (6 / (3 + 2)) ** 0.5
+    assert runner.model[0].weight.is_meta  # a module no leaf references
 
 
 @pytest.mark.parametrize("copies", [1, 8])

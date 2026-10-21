@@ -30,9 +30,10 @@ a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM prepared (`TOKEN_IDS`); an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
-context key is the one each instance names. A leaf whose operator cannot run so
-refuses by name, a KV tensor argument among them, and so does one that takes
-a module or context key whose module holds a parameter, on the meta device.
+context key is the one each instance names, its module's meta parameters
+moved to the device and filled as `--load_dummy xavier` fills them (`_fill`).
+A leaf whose operator cannot run so refuses by name, a KV tensor argument
+among them.
 A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
 
@@ -626,12 +627,8 @@ class Stub:
             if _ref(value):
                 key, module = instance[path], "module" in value
                 held = self.modules[key] if module else self.contexts.get(key)
-                params = getattr(held, "named_parameters", tuple)()
-                if name := next((n for n, p in params if p.is_meta), None):
-                    raise ValueError(
-                        f"{key} holds parameter {name}, on the meta device: a "
-                        "leaf reading it through a reference is not timed"
-                    )
+                if isinstance(held, torch.nn.Module):
+                    _fill(held, self.runner.device)
                 return (_module_copy(held) if fresh else held) if module else key
             if isinstance(value, dict) and "affine" in value:
                 return ir.Affine(*value["affine"]).at(self.context)
@@ -974,6 +971,24 @@ def _own(module):
     """The tensors `module` holds itself: attributes, parameters and buffers."""
     held = [*vars(module).values(), *module._parameters.values()]
     return [t for t in [*held, *module._buffers.values()] if torch.is_tensor(t)]
+
+
+def _fill(module, device) -> None:
+    """`module`'s meta parameters moved to `device` and filled as ATOM's
+    `--load_dummy xavier` fills a model's."""
+    from atom.model_loader.loader import initialize_dummy_weights
+
+    meta = [
+        (m, n, p)
+        for m in module.modules()
+        for n, p in m._parameters.items()
+        if p is not None and p.is_meta
+    ]
+    for m, n, p in meta:
+        t = torch.empty_like(p, device=device)
+        m._parameters[n] = torch.nn.Parameter(t, requires_grad=False)
+    if meta:
+        initialize_dummy_weights(module, "xavier")
 
 
 def _module_copy(module):
