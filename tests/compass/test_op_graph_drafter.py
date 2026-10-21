@@ -39,6 +39,7 @@ MACHINE = TREE / "scripts" / "compass" / "machines" / "mi308x-hjbog39.json"
 ATTENTION = "aiter.unified_attention_with_output_base.default"
 SAMPLER = "atom.model_ops.rejection_sampler:rejection_sample"
 ARGMAX = "aiter.ops.flydsl.topk.topk_per_row_argmax:topk_per_row_argmax"
+MOE = "aiter.rocm_aiter_fused_moe.default"
 #: Two rows, each verifying one draft and its bonus token.
 VERIFY = view((2, 90, True), (2, 9, True), rung=2)
 
@@ -106,7 +107,8 @@ def test_a_verify_step_is_cut_at_forward_done_event_into_target_and_drafter(
     assert [op["args"]["weight"]["shape"][0] for op in tables] == [vocab] * drafts
 
 
-def test_a_run_prices_a_verify_step_s_drafter_from_its_own_graph(tmp_path_factory):
+@pytest.mark.parametrize("ep", [1, 8], ids=["ep_off", "ep8"])
+def test_a_run_prices_a_verify_step_s_drafter_from_its_own_graph(ep, tmp_path_factory):
     root, graphs = capture(1, tmp_path_factory)
     [drafter] = [graph for key, graph in graphs.items() if key.endswith(" draft")]
     text = json.loads(CONFIG.read_text())
@@ -122,15 +124,19 @@ def test_a_run_prices_a_verify_step_s_drafter_from_its_own_graph(tmp_path_factor
     )
     machine = MachineSpec.from_mapping(json.loads(MACHINE.read_text()))
     lookup = _op_graphs(str(root / "store"), config, "gfx942")
-    cost = OpGraphBackend(machine, lookup, kv="bf16", drafts=1).price(VERIFY)
-    flat: dict = {}
-    for op in _ops(drafter["region"]):
-        if (w := work(op, VERIFY, 1, "bf16")) is not None:
-            flat.setdefault(f"draft op.{op['op']}", []).append(price(w, machine))
+    cost = OpGraphBackend(machine, lookup, kv="bf16", ep=ep, drafts=1).price(VERIFY)
 
-    assert {t.name: t.seconds for t in cost.terms if t.draft} == {
-        name: fold_seconds(s) for name, s in flat.items()
-    }
+    def drafted(width):
+        flat: dict = {}
+        for op in _ops(drafter["region"]):
+            if (w := work(op, VERIFY, 1, "bf16", width)) is not None:
+                flat.setdefault(f"draft op.{op['op']}", []).append(price(w, machine))
+        return {name: fold_seconds(s) for name, s in flat.items()}
+
+    assert {t.name: t.seconds for t in cost.terms if t.draft} == drafted(ep)
+    # The drafter's experts run over the target's EP ranks, as ATOM builds them.
+    moe = f"draft op.{MOE}"
+    assert (drafted(ep)[moe] == drafted(1)[moe]) == (ep == 1)
     assert f"op.{SAMPLER}" in {t.name for t in cost.terms if not t.draft}
 
 

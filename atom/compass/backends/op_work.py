@@ -35,6 +35,7 @@ expert-parallel width is the run's `ep`, the experts `ep` times a rank's.
 
 from __future__ import annotations
 
+import inspect
 import math
 
 import torch
@@ -525,8 +526,6 @@ EXPERTS = {
     f"{TRITON_MOE}moe_op_gemm_{a}w4:moe_gemm_{a}w4": fmt
     for a, fmt in (("a16", "bf16"), ("a8", "fp8"), ("a4", "fp4"))
 }
-#: Every kind whose extractor takes the EP width.
-SHARDED = {*EXPERTS, "aiter.fused_moe_.default", MORI + "dispatch", MORI + "combine"}
 #: V4's compressor: its sources and parameters read once. The KV and score
 #: state rings it reads by slot and the cache rows it writes are left out.
 COMPRESS = _only("kv_in", "score_in", "ape", "rms_weight", "state_slot_mapping")
@@ -632,6 +631,8 @@ EXTRACTORS = {
     "atom.model_ops.decode_input_ids:fill_deferred_decode_ids": _in_place(),
     "atom.utils.block_convert:kv_indices_generate_triton": _kv_indices,
 }
+#: Every kind whose extractor takes the EP width, as a fifth parameter.
+SHARDED = {n for n, f in EXTRACTORS.items() if len(inspect.signature(f).parameters) > 4}
 
 
 def work(
