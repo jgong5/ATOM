@@ -35,6 +35,7 @@ expert-parallel width is the run's `ep`, the experts `ep` times a rank's.
 
 from __future__ import annotations
 
+import inspect
 import math
 
 import torch
@@ -525,8 +526,6 @@ EXPERTS = {
     f"{TRITON_MOE}moe_op_gemm_{a}w4:moe_gemm_{a}w4": fmt
     for a, fmt in (("a16", "bf16"), ("a8", "fp8"), ("a4", "fp4"))
 }
-#: Every kind whose extractor takes the EP width.
-SHARDED = {*EXPERTS, "aiter.fused_moe_.default", MORI + "dispatch", MORI + "combine"}
 #: V4's compressor: its sources and parameters read once. The KV and score
 #: state rings it reads by slot and the cache rows it writes are left out.
 COMPRESS = _only("kv_in", "score_in", "ape", "rms_weight", "state_slot_mapping")
@@ -581,6 +580,18 @@ EXTRACTORS = {
     "aiter.topk_gating_fwd.default": _in_place(),
     "atom.model_ops.triton_hash_topk:hash_topk_triton": _gather("tid2eid"),
     "aiter.fused_moe_.default": _fused_moe,
+    "aiter.rocm_aiter_fused_moe.default": _fused_moe,
+    "aiter._topk_softmax.default": _in_place(
+        "topk_weights", "topk_indices", "token_expert_indices"
+    ),
+    "aiter.per_group_quant_hip.default": lambda op, view, tp, kv: _boundary(
+        op, outs=[op["args"]["quant_dtype"], "torch.float32"]
+    ),
+    "aiter.gated_rmsnorm_fp8_group_quant.default": _in_place("out", "scale"),
+    "atom.model_ops.fla_ops.replayssm:replayssm_commit": _only(
+        "slot_idx", "num_accepted"
+    ),
+    "atom.model_ops.rejection_sampler:rejection_sample": _in_place(),
     **{kind: _experts(fmt) for kind, fmt in EXPERTS.items()},
     TRITON_MOE + "quant_moe:downcast_to_mxfp": _downcast,
     "aiter.ops.triton.quant.quant:dynamic_mxfp4_quant": _in_place(),
@@ -620,6 +631,8 @@ EXTRACTORS = {
     "atom.model_ops.decode_input_ids:fill_deferred_decode_ids": _in_place(),
     "atom.utils.block_convert:kv_indices_generate_triton": _kv_indices,
 }
+#: Every kind whose extractor takes the EP width, as a fifth parameter.
+SHARDED = {n for n, f in EXTRACTORS.items() if len(inspect.signature(f).parameters) > 4}
 
 
 def work(

@@ -16,6 +16,12 @@ samples, as ATOM's `ScheduledBatch.produces_output` says: a step with a decode
 row does, and a prefill step when the view says so, which it does when any row
 is a final chunk.
 
+Under a drafter of `drafts` tokens a decode step verifies `drafts` and one in
+each row, and a step that samples also reads its drafter's graph,
+`graph(..., draft=True)`, the work ATOM queues after `forward_done_event`: its
+prices are terms named ``draft op.<kind>``, each tagged draft. Sampling is the
+target's.
+
 Each leaf is one pricing unit, `max(t0, F / peak, M / BW(M), t_comm)` over its
 work (`op_work.work`): its own tensors at the captured shape, the state it
 reads at the step's rows, attention's context in `kv`, the run's KV cache
@@ -56,7 +62,10 @@ two-batch-overlap step on MoRI's split send and receive (`split_send_recv`),
 whose transfer in flight lies on no stream, whose split names no pair for
 this rank, whose micro-batches' graphs exchange a different number of times
 or run an exchange beside a second stream (the dual-stream MoE, which ATOM
-turns off under overlap); a speculative decode step; a prefill step whose view
+turns off under overlap), or that runs under a drafter, whose draft pass no
+graph places on the overlapped streams; a decode step whose rows do not each
+verify the drafter's tokens and one, and under a drafter a step that samples
+nothing, whose draft-KV pass no graph holds; a prefill step whose view
 does not say whether it produces output; a shape with no graph, a
 data-parallel step's naming the rows it gathers; and, each reason once, a leaf
 whose kind has no extractor, whose price reads a spec field the spec lacks, or
@@ -85,6 +94,8 @@ MOE_EXCHANGES = ("atom.model_ops.moe:", "mori.ops.dispatch_combine:")
 #: The term a two-batch-overlap step's one price is.
 TBO = "op.tbo"
 NONE = "; no successor: the analytical law is the last op-level source"
+#: The prefix of a drafter's terms.
+DRAFT = "draft "
 
 
 class _Roofline(CostSource):
@@ -116,18 +127,22 @@ def band(rows, decode: bool) -> tuple[int, int]:
 
 
 def step_shape(
-    rows: Sequence[tuple[int, bool]], rung: int | None
+    rows: Sequence[tuple[int, bool]], rung: int | None, drafts: int = 0
 ) -> tuple[str, int, int]:
     """The shape a step of `rows`, each its query tokens and whether it
     decodes, runs at, ``(phase, tokens, seqs)``: a decode step at `rung` when it
     replayed one, else at its width, and any other step as a prefill of its
-    query tokens over its rows. A speculative decode step is refused."""
+    query tokens over its rows. A decode step whose rows do not each verify a
+    drafter's `drafts` tokens and one is refused."""
     if not all(decode for _, decode in rows):
         return "prefill", sum(q for q, _ in rows), len(rows)
-    if any(q != 1 for q, _ in rows):
+    if any(q != drafts + 1 for q, _ in rows):
         raise ValueError(
-            "decodes more than one token in a row: a speculative decode step is "
-            "not captured"
+            f"decodes a row of other than {drafts + 1} tokens, which a drafter "
+            f"of {drafts} verifies"
+            if drafts
+            else "decodes more than one token in a row: a speculative decode step "
+            "is not captured"
         )
     width = rung or len(rows)
     return "decode", width, width
@@ -148,6 +163,7 @@ class OpGraphBackend(CostBackend):
         padded: bool = True,
         split_send_recv: bool = False,
         price_list: CostSource | None = None,
+        drafts: int = 0,
     ) -> None:
         self.machine = machine
         self.graph = graph
@@ -157,6 +173,7 @@ class OpGraphBackend(CostBackend):
         self.kv = kv
         self.padded = padded
         self.split_send_recv = split_send_recv
+        self.drafts = drafts
         self.name = machine.values.get("name", "")
         self._stated_as: dict[str, str] = {}
         self.resolver = price_list and Resolver([price_list, _Roofline(self)])
@@ -171,6 +188,12 @@ class OpGraphBackend(CostBackend):
             at, region = self._region(batch_view)
             bound = self.resolver and self._bound(batch_view)
             priced = self._priced(region, batch_view, refused, bound)
+            if self.drafts:
+                _, region = self._region(batch_view, draft=True)
+                priced += [
+                    (DRAFT + p[0], *p[1:])
+                    for p in self._priced(region, batch_view, refused, bound)
+                ]
         else:
             at, priced = self._overlapped(batch_view, refused)
         if refused:
@@ -201,7 +224,8 @@ class OpGraphBackend(CostBackend):
                 tuple(dict.fromkeys(why)),
                 note=note and note + NONE,
             )
-            terms.append(CostTerm(name, fold_seconds(values), provenance))
+            drafted = name.startswith(DRAFT)
+            terms.append(CostTerm(name, fold_seconds(values), provenance, drafted))
         return StepCost(terms)
 
     def describe(self) -> str:
@@ -216,27 +240,29 @@ class OpGraphBackend(CostBackend):
         context a decode's max, a prefill's mean cached tokens."""
         rung = view.capture_rung if self.padded else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
-        phase, t, b = step_shape(rows, rung)
+        phase, t, b = step_shape(rows, rung, self.drafts)
         g = None if view.moe_rows == self.dp * t else view.moe_rows
         rows = [(r.query_tokens, r.context_tokens) for r in view.requests]
         mean, top = band(rows, phase == "decode")
         return (phase, t, b, g, top if phase == "decode" else mean, top)
 
-    def _region(self, view: BatchView) -> tuple[str, dict]:
-        """The graph the step reads, by its shape and output, and its region."""
+    def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
+        """The graph the step reads, by its shape and output, and its region;
+        with `draft`, its drafter's."""
         if view.image_tokens:
             reason = IMAGES
         else:
             try:
                 rung = view.capture_rung if self.padded else None
                 rows = [(r.query_tokens, r.decode) for r in view.requests]
-                shape = step_shape(rows, rung)
+                shape = step_shape(rows, rung, self.drafts)
             except ValueError as exc:
                 reason = f"a step that {exc}"
             else:
                 output = any(d for _, d in rows) or view.produces_output
                 none = "" if output else " that produces no output"
                 g = () if view.moe_rows is None else (view.moe_rows,)
+                drafted = {"draft": True} if draft else {}
                 at = "".join(f" G={n}" for n in g)
                 if output is None:
                     reason = (
@@ -244,15 +270,23 @@ class OpGraphBackend(CostBackend):
                         "produces output, so whether it runs the LM head and the "
                         "sampler"
                     )
-                elif isinstance(region := self.graph(*shape, output, *g), dict):
+                elif draft and not output:
+                    reason = (
+                        "a step under a drafter that produces no output: its "
+                        "draft-KV pass runs off the path a capture traces"
+                    )
+                elif isinstance(
+                    region := self.graph(*shape, output, *g, **drafted), dict
+                ):
                     return "{} T={} B={}".format(*shape) + at + none, region
                 else:
                     reason = (
                         "no op_graph holds a {} step of {} tokens over {} sequences"
-                        "{}{}{}; compass trace ops captures one".format(
+                        "{}{}{}{}; compass trace ops captures one".format(
                             *shape,
                             "".join(f" gathering {n} rows" for n in g),
                             none,
+                            " for its drafter" * draft,
                             region or "",
                         )
                     )
@@ -267,6 +301,11 @@ class OpGraphBackend(CostBackend):
                     "a two-batch-overlap step on MoRI's split send and receive "
                     "(--all2all-backend low-latency): its transfer in flight "
                     "lies on no stream"
+                )
+            if self.drafts:
+                raise ValueError(
+                    "a two-batch-overlap step under a drafter: no graph places its "
+                    "draft pass on the overlapped streams"
                 )
             halves = micro_batches(view)
         except ValueError as exc:
