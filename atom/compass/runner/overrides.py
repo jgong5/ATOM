@@ -266,6 +266,8 @@ HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")  # in the order the host ru
 MTP_SEGMENT = "W_inputs"
 #: The part of `W_launch` a later pipeline stage runs before it receives its input.
 PP_RECV_SEGMENT = "W_recv"
+#: The engine loop from a forward's exit to its next input pull: the charge's `out_s`.
+OUT_SEGMENT = "E_out"
 FORWARD_KINDS = ("decode", "prefill", "middle")
 #: The format of a simulated run's `dp<r>.cost.jsonl`, its first line.
 COST_TABLE_VERSION = 1
@@ -329,12 +331,15 @@ class HostDeviceRecurrence:
         is refused, naming each ``<kind>.<segment>``, the state as it was;
         without `refuse` that segment is 0. A segment in `skip` needs none, a
         middle chunk runs no `W_post`, and only an output forward under `mtp`
-        runs `MTP_SEGMENT`; a stage after the first runs `PP_RECV_SEGMENT`."""
+        runs `MTP_SEGMENT`; a stage after the first runs `PP_RECV_SEGMENT`. Once
+        any kind's law has `OUT_SEGMENT` every kind runs it, as `out_s`, else None."""
         kind, x = forward_shape(batch)
         law = self.laws.get(kind, {})
         ran = HOST_SEGMENTS[: 3 if kind == "middle" else 4]
         ran += (MTP_SEGMENT,) if self.mtp and kind != "middle" else ()
         ran += (PP_RECV_SEGMENT,) if self.recv else ()
+        out = any(OUT_SEGMENT in v for v in self.laws.values())
+        ran += (OUT_SEGMENT,) if out else ()
         missing = [s for s in ran if s not in {*law, *self.skip}]
         if refuse and self.laws and missing:
             from atom.compass.backends.resolver import CostRefused, Refusal
@@ -344,6 +349,7 @@ class HostDeviceRecurrence:
         now = self.now()
         called, meta = getattr(batch, "compass_pp_host", (now, -math.inf))
         prepared, self.segments = self.prepare_end(called, kind, x)
+        self.out_s = self.segments[OUT_SEGMENT] if out else None
         launch, post = self.segments["W_launch"], self.segments["W_post"]
         host = max(prepared, meta)
         output = batch.produces_output()
@@ -359,7 +365,7 @@ class HostDeviceRecurrence:
         law = self.laws.get(kind, {})
         seg = {
             s: float(np.dot(law.get(s, (0, 0, 0)), x)) * (s not in self.skip)
-            for s in (*HOST_SEGMENTS, MTP_SEGMENT, PP_RECV_SEGMENT)
+            for s in (*HOST_SEGMENTS, MTP_SEGMENT, PP_RECV_SEGMENT, OUT_SEGMENT)
         }
         host = max(called + seg["E"], self.ends[0]) + seg["W_pre"]
         if self.mtp and kind != "middle":  # output_end stays -inf on a PP stage

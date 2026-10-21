@@ -263,3 +263,38 @@ def test_host_laws_fitted_under_a_stated_engine_load_at_that_engine(
     )
     compass_run.runner(r, META_8B)
     assert r.compass_host.laws == law["host"]["laws"]
+
+
+def pulled(record):
+    """Write `record`'s pull stamps beside it, a put and then a pull a third of
+    the way from each line's exit to the next line's entry; returns the pulls."""
+    lines = [json.loads(x) for x in record.read_text().splitlines()]
+    ends = [s["t_enter_ns"] for s in lines[1:]] + [lines[-1]["t_exit_ns"] + 9]
+    pulls = [s["t_exit_ns"] + (e - s["t_exit_ns"]) // 3 for s, e in zip(lines, ends)]
+    stamps = [x for p in pulls for x in ({"t_put_ns": p - 1}, {"t_pull_ns": p})]
+    path = record.with_suffix(".pulls.jsonl")
+    path.write_text("".join(json.dumps(x) + "\n" for x in stamps))
+    return pulls
+
+
+def test_a_record_with_pull_stamps_labels_E_out_and_E_from_the_pull(tmp_path):
+    record = _timed_record(tmp_path / "dp0.jsonl", _steps(19), {30})[0]
+    lines = [json.loads(x) for x in record.read_text().splitlines()]
+    unstamped = label(record)[0]
+    assert not any("E_out" in s.host for s in unstamped)
+
+    pulls = pulled(record)
+    samples, table = label(record)
+    for n, (s, u, row) in enumerate(zip(samples, unstamped, table)):
+        assert (
+            s.host["E_out"] == row["E_out"] == (pulls[n] - lines[n]["t_exit_ns"]) * 1e-9
+        )
+        assert ("E" in s.host) == ("E" in u.host)
+        if "E" in s.host:
+            assert s.host["E"] == (lines[n]["t_enter_ns"] - pulls[n - 1]) * 1e-9
+            assert (
+                u.host["E"]
+                == (lines[n]["t_enter_ns"] - lines[n - 1]["t_exit_ns"]) * 1e-9
+            )
+        others = {k: v for k, v in s.host.items() if k not in ("E", "E_out")}
+        assert others == {k: v for k, v in u.host.items() if k != "E"}

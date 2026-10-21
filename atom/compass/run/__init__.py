@@ -380,11 +380,12 @@ def _check_host(path, host: dict) -> None:
         FORWARD_KINDS,
         HOST_SEGMENTS,
         MTP_SEGMENT,
+        OUT_SEGMENT,
         PP_RECV_SEGMENT,
     )
 
     laws = host.get("laws", {})
-    segments = (*HOST_SEGMENTS, MTP_SEGMENT, PP_RECV_SEGMENT)
+    segments = (*HOST_SEGMENTS, MTP_SEGMENT, PP_RECV_SEGMENT, OUT_SEGMENT)
     if (
         set(host) - {"laws", "skip", "key"}
         or set(host.get("skip", ())) - set(segments)

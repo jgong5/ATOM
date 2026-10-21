@@ -24,12 +24,14 @@ from test_validate_runs import _cell, _schedule
 from atom.compass import parity
 from atom.compass import run as compass_run
 from atom.compass.backends.cost import fold_seconds
+from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.step_stub import SOURCE, StepStubBackend
 from atom.compass.runner import overrides
 from atom.compass.runner.overrides import (
     FORWARD_KINDS,
     HOST_SEGMENTS,
     MTP_SEGMENT,
+    OUT_SEGMENT,
     HostDeviceRecurrence,
 )
 from atom.compass.validate import runs
@@ -302,3 +304,46 @@ def test_with_mtp_an_output_forward_waits_for_the_target_before_its_launch(mtp, 
         out.append(clock[0])
     assert out == pytest.approx(exits)
     assert list(host.ends) == [30, 44]
+
+
+def replies(batches, laws, start=0.0):
+    """Each forward's reply and exit, the clock advanced by its charge and then
+    by its `out_s`, as `atom.utils.clock.charge` advances the engine LP."""
+    r, clock = _Runner(_config()), [start]
+    r.compass_host = HostDeviceRecurrence(laws, (), lambda: clock[0])
+    out, exits = [], []
+    for b in batches:
+        out.append(r.forward(b))
+        exits.append(clock[0] + out[-1].predicted_s)
+        clock[0] = exits[-1] + (out[-1].out_s or 0.0)
+    return out, exits
+
+
+def test_an_E_out_law_puts_the_pull_at_the_exit_plus_its_price(streak):
+    """`E` of 3 ms whole, then as 1 ms of `E_out` to the pull and 2 ms after it:
+    every forward exits at the same time, and the second run's first pull
+    follows a forward that exited at 0."""
+    seg = {s: [1e-3, 0, 0] for s in HOST_SEGMENTS}
+    whole = {k: {**seg, "E": [3e-3, 0, 0]} for k in FORWARD_KINDS}
+    split = {**seg, "E": [2e-3, 0, 0], OUT_SEGMENT: [1e-3, 0, 0]}
+    base, at = replies(streak, whole)
+    out, exits = replies(streak, dict.fromkeys(FORWARD_KINDS, split), 1e-3)
+    assert [r.out_s for r in base] == [None] * len(streak)
+    assert [r.out_s for r in out] == pytest.approx([1e-3] * len(streak))
+    assert exits == pytest.approx(at, abs=1e-12)
+
+
+def test_once_one_kind_has_an_E_out_law_a_kind_without_one_is_refused(streak):
+    seg = {s: [1e-3, 0, 0] for s in HOST_SEGMENTS}
+    laws = {
+        **dict.fromkeys(FORWARD_KINDS, seg),
+        "decode": {**seg, OUT_SEGMENT: [0, 0, 0]},
+    }
+    host = HostDeviceRecurrence(laws, (), lambda: 0.0)
+    for batch in streak:
+        kind = overrides.forward_shape(batch)[0]
+        if kind == "decode":
+            host.charge(batch, 1e-3, 0.0)
+        else:
+            with pytest.raises(CostRefused, match=rf"no law for {kind}\.E_out"):
+                host.charge(batch, 1e-3, 0.0)
