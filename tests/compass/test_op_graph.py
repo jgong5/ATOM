@@ -743,9 +743,9 @@ def test_each_micro_batch_of_a_split_step_prices_at_its_own_shape():
 
 
 def test_a_split_step_the_list_prices_in_part_is_a_roofline_carrying_why():
-    # the list holds the first micro-batch's GEMM only; the second's is its
+    # the list holds the second micro-batch's GEMM only; the first's is its
     # roofline, a second
-    params = listed(*[pt(g(3, 8, 8), "prefill T=3 B=1", 3e9, c) for c in (0, 8)])
+    params = listed(*[pt(g(4, 8, 8), "prefill T=4 B=2", 4e9, c) for c in (0, 8)])
 
     def graph(phase, tokens, seqs, output, gathered):
         return {"seq": [g(tokens, 8, 8)]}
@@ -753,7 +753,7 @@ def test_a_split_step_the_list_prices_in_part_is_a_roofline_carrying_why():
     cost = OpGraphBackend(SECOND, graph, kv="bf16", dp=2, price_list=params)
     cost = cost.price(SPLIT)
 
-    assert by_name(cost) == {"op.tbo": overlap([[(3.0, 1.0)]])}
+    assert by_name(cost) == {"op.tbo": overlap([[(1.0, 4.0)]])}
     assert cost.refusals == (
         Refusal("price-list", f"{GEMM}: no point of its signature was measured"),
     )
