@@ -585,9 +585,14 @@ def test_copy_c_rotates_weights_and_instances_and_clones_past_the_first_round():
         "snap0",
         "snap0",
     ]
-    # one random weight per occurrence of the leaf, copy c taking the c-th
-    assert len({id(w) for w in weights[:4]}) == 4
+    # one random weight per occurrence of the leaf, copy c taking the c-th,
+    # every one a slice of one tensor
+    assert len({w.data_ptr() for w in weights[:4]}) == 4
+    assert {w.untyped_storage().data_ptr() for w in weights} == {
+        weights[0].untyped_storage().data_ptr()
+    }
     assert weights[4] is weights[0] and weights[5] is weights[1]
+    assert all(w.shape == (3, 3) and w.stride() == (3, 1) for w in weights)
     assert copies[3][0]["self"] is stub.placed[1][1][("sig", "self")][1]
     assert copies[4][0]["self"].data_ptr() != copies[0][0]["self"].data_ptr()
     assert copies[3][0]["rope"] is rope

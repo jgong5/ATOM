@@ -619,7 +619,7 @@ class Stub:
             if isinstance(value, dict) and self._routed(value):
                 return self._route(value, c)
             if isinstance(value, dict) and value.get("role") == "weight":
-                return self._weight(value, c % op["occurrences"])
+                return self._weight(value, c, op["occurrences"])
             if isinstance(value, dict) and value.get("role") == "activation" and like:
                 return old
             if _ref(value):
@@ -688,7 +688,7 @@ class Stub:
             if isinstance(value, list):
                 return [build(v, o) for v, o in zip(value, old)]
             if isinstance(value, dict) and value.get("role") == "weight":
-                return self._weight(value, c % op["occurrences"])
+                return self._weight(value, c, op["occurrences"])
             if isinstance(value, dict) and self._routed(value):
                 return self._route(value, c)
             return old
@@ -706,11 +706,21 @@ class Stub:
             return _clone(meta[1]) if fresh else meta[1]
         raise ValueError(f"a {role} tensor argument {_text(spec)} is not built")
 
-    def _weight(self, spec, i):
-        """Weight `i` of `spec`, random, built once a leaf."""
-        if (key := (_spec_of(spec), i)) not in self.built:
-            self.built[key] = _random(spec, self.runner.device)
-        return self.built[key]
+    def _weight(self, spec, c, count):
+        """Weight `c mod count` of `spec`, random: the `count` of a leaf are
+        built once, as slices of one tensor. One tensor each, allocated after
+        the KV pool, read an MI308X decode GEMM up to 15% slower than the
+        model's own weights; slices of one read within 1.5%."""
+        if (_spec_of(spec), 0) not in self.built:
+            n = _span(spec["shape"], spec["stride"])
+            dtype, device = _dtype(spec["dtype"]), self.runner.device
+            whole = torch.empty(count * n, dtype=dtype, device=device)
+            for i in range(count):
+                w = whole[i * n : (i + 1) * n]
+                w.copy_(_random({**spec, "shape": [n], "stride": [1]}, device))
+                view = w.as_strided(spec["shape"], spec["stride"])
+                self.built[_spec_of(spec), i] = view
+        return self.built[_spec_of(spec), c % count]
 
 
 def _routing(loads) -> dict:
