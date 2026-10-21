@@ -192,6 +192,37 @@ def test_a_population_names_a_dp_prefill_s_rows_off_their_default(tmp_path):
     ]
 
 
+@pytest.mark.parametrize("tbo", [False, True], ids=["whole", "tbo"])
+def test_a_population_names_a_split_step_s_micro_batches(tbo, tmp_path):
+    # Rank 0 clears the 8192-token bar: each rank cuts at its midpoint.
+    ranks = [([[9000, 9000, False]], 9100), ([[100, 100, False]], 9100)]
+    record = _record(tmp_path, ranks)
+
+    shapes = sorted(map(str, population_shapes([record], tbo)))
+
+    if tbo:
+        # Two micro-batches a rank, each gathering both ranks' rows of it.
+        first = ["prefill T=4500 B=1 G=4550"] * 2
+        assert shapes == first + ["prefill T=50 B=1 G=4550"] * 2
+    else:
+        assert shapes == ["prefill T=100 B=1 G=9100", "prefill T=9000 B=1 G=9100"]
+
+
+def test_a_population_s_micro_batch_is_traced_as_one_forward(
+    monkeypatch, tmp_path_factory
+):
+    # Each rank's 1024 tokens split 512 and 512, at the bar a 512-token step
+    # would split again.
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "512")
+    ranks = [([[1024, 1024, False]], DP * 1024)] * DP
+    record = _record(tmp_path_factory.mktemp("record"), ranks)
+    graphs = capture(tmp_path_factory, f"--population {record}{DPA_TP8} --enable-tbo")
+
+    assert list(graphs) == ["prefill T=512 B=1"]
+    graph, _ = graphs["prefill T=512 B=1"]
+    assert '"enable_tbo":true' in graph["structure"]
+
+
 def test_a_prefill_gathers_at_least_its_own_rows():
     with pytest.raises(ValueError, match="the gather holds this rank's"):
         prefill_shape(7, 1, 6)
