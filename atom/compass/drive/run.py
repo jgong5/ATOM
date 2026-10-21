@@ -245,11 +245,11 @@ def op_coverage(backend, steps) -> dict:
             ]
         except CostRefused as refused:
             terms = [("step refused", refused.declined)]
-        whys = {
+        whys = dict.fromkeys(
             (kind, re.sub(NUMBER, "#", r.reason.removeprefix(f"{kind}: ")))
             for kind, refusals in terms
             for r in refusals
-        }
+        )
         phase = "prefill" if view.prefill else "decode"
         by_phase[phase].update(steps=1, covered=int(not whys))
         for kind, why in whys:
