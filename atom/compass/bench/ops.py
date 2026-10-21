@@ -212,7 +212,8 @@ def main(argv: list[str]) -> None:
         (out / "run.json").write_text(json.dumps(run))
         key, held = keys(config, run), 0
         if args.plan:
-            return plan(store, key, config, run, args, " ".join(command), out)
+            command, atom_args = " ".join(command), argv[cut + 1 :]
+            return plan(store, key, config, run, args, command, out, atom_args)
         for shape, context, found in todo:
             for sig in list(found):
                 if store.directory_for(key(shape, context, sig)).exists():
@@ -1022,7 +1023,7 @@ BENDS = 0.05
 CONTEXT_FLOOR_NS = 1000
 
 
-def plan(store, key, config, run, args, command: str, out: Path) -> None:
+def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -> None:
     """Measure the points the steps of `--plan`'s record directories call for,
     round by round, and write every point held to plan.jsonl in `out`."""
     from atom.compass.capture import population_steps
@@ -1040,7 +1041,7 @@ def plan(store, key, config, run, args, command: str, out: Path) -> None:
 
     def measure_round(want, n):
         dependent = _dependent(done.values())
-        _load(store, config, args.store, {s for s, _ in want}, graphs)
+        _load(store, config, args.store, {s for s, _ in want}, graphs, None, atom_args)
         todo = []
         for (shape, context), families in want.items():
             found = {}
@@ -1079,7 +1080,7 @@ def plan(store, key, config, run, args, command: str, out: Path) -> None:
         if s.phase == "prefill":
             prefills.add(s)
             cached[s.seqs] += _cached(line)
-    _load(store, config, args.store, prefills, graphs)
+    _load(store, config, args.store, prefills, graphs, None, atom_args)
     seen = defaultdict(dict)
     for shape in sorted(prefills):
         for sig, (op, _) in graphs[shape].items():
@@ -1147,7 +1148,8 @@ def _coverage_main(argv: list[str], atom_args: list[str]) -> dict:
         driverless._declare_arch(tmpdir, arch)
         config = atom_config(atom_args)
         _eager(config)
-        return coverage(store, args.store, config, args.coverage, records, arch)
+        names = args.coverage
+        return coverage(store, args.store, config, names, records, arch, atom_args)
 
 
 def _eager(config) -> None:
@@ -1160,7 +1162,7 @@ def _eager(config) -> None:
         )
 
 
-def coverage(store, root, config, names, records, arch) -> dict:
+def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     """How the measured points among `records` cover the steps of the record
     directories `names`: the steps and those covered by phase, and per leaf
     kind the steps it left out by why. A step is covered when each leaf of its
@@ -1179,7 +1181,7 @@ def coverage(store, root, config, names, records, arch) -> dict:
         if cut := _cut(fam):
             cuts[cut[0]][cut[1]] = axes[fam]
     graphs, report, out = {}, defaultdict(Counter), defaultdict(Counter)
-    _load(store, config, root, {s for s, _ in steps}, graphs, arch)
+    _load(store, config, root, {s for s, _ in steps}, graphs, arch, atom_args)
     families = {
         s: [
             (op["op"], *_family(s, None, op["op"], sig, dependent))
@@ -1481,7 +1483,7 @@ def _apart(p, q) -> bool:
     return hi - lo > BENDS * lo
 
 
-def _load(store, config, root, shapes, graphs: dict, arch=None) -> None:
+def _load(store, config, root, shapes, graphs: dict, arch=None, atom_args=()) -> None:
     """Each of `shapes`' leaves into `graphs`, its op_graph captured first when
     the store has none."""
     from atom.compass.artifacts import ArtifactRefusal
@@ -1493,18 +1495,20 @@ def _load(store, config, root, shapes, graphs: dict, arch=None) -> None:
         except ArtifactRefusal:
             missing.append(shape)
     if missing:
-        _capture(config, missing, root, arch)
+        _capture(config, missing, root, arch, atom_args)
     for shape in missing:
         graphs[shape] = leaves(graph(store, config, shape, arch)["region"])
 
 
-def _capture(config, shapes, root, arch=None) -> None:
-    """`trace ops` of `shapes` into the store at `root`, in a process of its
-    own that sees no GPU."""
+def _capture(config, shapes, root, arch=None, atom_args=()) -> None:
+    """`trace ops` of `shapes` under ATOM's arguments `atom_args` into the store
+    at `root`, in a process of its own that sees no GPU."""
     from atom.compass import capture
     from atom.compass.capture.forward import device_arch
+    from atom.model_engine.arg_utils import EngineArgs
 
-    argv = ["--model", config.model, "--tp", str(config.tensor_parallel_size)]
+    engine = EngineArgs.add_cli_args(argparse.ArgumentParser()).parse_args(atom_args)
+    argv = ["--model", config.model, "--tp", str(engine.tensor_parallel_size)]
     argv += ["--arch", arch or device_arch()]
     for s in shapes:
         argv += ["--prefill", str(s.tokens)] if s.phase == "prefill" else ["--width"]
@@ -1512,7 +1516,7 @@ def _capture(config, shapes, root, arch=None) -> None:
     # The capture sets HIP_VISIBLE_DEVICES itself, and HIP then holds memory on
     # the GPU it names; ROCm's own mask, below HIP's, hides every GPU.
     with patch.dict(os.environ, ROCR_VISIBLE_DEVICES=""):
-        _child(capture.main, [*argv, "--store", str(root)])
+        _child(capture.main, [*argv, "--store", str(root), "--", *atom_args])
 
 
 def _journal(path, records: list[dict]) -> list[dict]:

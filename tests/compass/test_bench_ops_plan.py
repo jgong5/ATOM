@@ -21,10 +21,12 @@ from test_artifact_store import CONDITIONS, GATES, stanza
 from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
 from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 
-from atom.compass import ir
+from atom.compass import capture, ir
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
-from atom.compass.bench import ops
+from atom.compass.bench import ops, ranks
+from atom.compass.capture import driverless, forward
 from atom.compass.capture.forward import decode, structure
+from atom.compass.run import _file_digest
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
 from atom.utils import forward_context as fctx
@@ -919,3 +921,109 @@ def test_measure_journals_each_record_as_it_finishes_it(tmp_path, monkeypatch):
 
     assert len(got) == 2
     assert [json.loads(line) for line in journal.read_text().splitlines()] == got
+
+
+#: The op_graph reader the `bench` fixture stands `_graph_at` in for.
+GRAPH = ops.graph
+
+#: A dense model's config.json, as little as ATOM's config reads.
+QWEN3 = {
+    "architectures": ["Qwen3ForCausalLM"],
+    "model_type": "qwen3",
+    "hidden_size": 64,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 8,
+    "head_dim": 8,
+    "num_hidden_layers": 2,
+    "intermediate_size": 64,
+    "vocab_size": 128,
+    "max_position_embeddings": 4096,
+}
+
+
+@pytest.mark.parametrize(
+    "parallel, widths",
+    [("--enable-dp-attention", "tp=1 dp=8"), ("--enable-expert-parallel", "tp=8 ep=8")],
+)
+def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
+    bench, tmp_path, monkeypatch, parallel, widths
+):
+    """`trace ops` runs as `--plan` starts it, its trace left out: the config
+    it builds from its arguments keys the graph it publishes."""
+    store, root, key, run = bench
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps(QWEN3))
+    atom_args = ["--model", str(model), "-tp", "8", "--enforce-eager", parallel]
+    config = SimpleNamespace(
+        **vars(CONFIG),
+        model=str(model),
+        hf_config=SimpleNamespace(architectures=QWEN3["architectures"]),
+        tensor_parallel_size=8,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_dp_attention=parallel == "--enable-dp-attention",
+        enable_expert_parallel=parallel == "--enable-expert-parallel",
+        enforce_eager=True,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+    )
+    ranks.layout(config)  # as `main` lays out ATOM's config
+    published = []
+
+    def trace(model, tp, shapes, tmpdir, atom_args, arch):
+        driverless._declare_arch(tmpdir, arch)
+        traced = forward._config(model, tp, atom_args)
+        for shape in shapes:
+            at = structure(traced, shape.phase, device=arch)
+            yield SimpleNamespace(
+                applicability=SimpleNamespace(structure=at, shape=shape)
+            ), None, {}
+
+    def publish(store, graph, model, declared, tp, atom_args, command):
+        at = graph.applicability
+        published.append((at.structure, tp))
+        key = Key.of(Kind.OP_GRAPH, structure=at.structure, shape=str(at.shape))
+        store.publish(
+            key,
+            provenance=stanza("compass trace ops"),
+            topology=Topology(),
+            conditions=CONDITIONS,
+            gates=GATES,
+            members={
+                member_name("graph", ops.RANK, "json"): json.dumps(
+                    _graph_at(store, None, at.shape)
+                ).encode()
+            },
+        )
+        return key
+
+    def child(fn, *args):
+        if fn is not capture.main:
+            return _bench(fn, *args)
+        with (
+            patch.object(forward, "capture", trace),
+            patch.object(capture, "publish", publish),
+        ):
+            return fn(*args)
+
+    monkeypatch.setattr(ops, "graph", GRAPH)
+    monkeypatch.setattr(ops, "_child", child)
+    monkeypatch.setattr(forward, "device_arch", lambda: "gfx942")
+    args = SimpleNamespace(
+        plan=[_records(tmp_path / "plan", ([[1, 1000, True]], 1))],
+        store=root,
+        llc_mib=256,
+    )
+
+    ops.plan(
+        store, key, config, run, args, "compass measure ops --plan", tmp_path, atom_args
+    )
+
+    digest = _file_digest(str(model), "config.json")
+    structure_of_record = f"Qwen3ForCausalLM gfx942 {digest} {widths} decode eager"
+    assert set(published) == {(structure_of_record, 8)}
+    records = [
+        json.loads(x) for x in (tmp_path / "plan.jsonl").read_text().splitlines()
+    ]
+    assert {r["shape"] for r in records} == {"decode B=1", "decode B=2", "decode B=4"}
+    assert not [r for r in records if "refused" in r]
