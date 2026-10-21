@@ -1391,15 +1391,7 @@ def runner(model_runner, tree) -> None:
             run,
             config,
             machine,
-            # The EP width as ATOM's MoE resolves it, 1 when it does not shard.
-            ep=next(
-                (
-                    m.moe_parallel_config.ep_size
-                    for m in tree.modules()
-                    if hasattr(m, "moe_parallel_config")
-                ),
-                1,
-            ),
+            ep=ep_width(tree),
         )
     elif PRICE_LIST in run:
         raise ValueError(
@@ -1481,6 +1473,12 @@ def runner(model_runner, tree) -> None:
     model_runner.compass_memory = record(readings, tokens=warmup, memory=measured)
     if bundle is not None:
         model_runner.compass_step_grid = {**bundle, "describe": backend.describe()}
+
+
+def ep_width(tree) -> int:
+    """The EP width as ATOM's MoE in `tree` resolves it, 1 when it does not shard."""
+    moe = [m for m in tree.modules() if hasattr(m, "moe_parallel_config")]
+    return moe[0].moe_parallel_config.ep_size if moe else 1
 
 
 def op_graph(run: dict, config, machine, ep: int = 1):

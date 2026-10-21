@@ -225,7 +225,7 @@ def test_a_capture_gives_the_peers_the_rest_of_the_gathered_rows(ep, tmp_path_fa
 
 
 @pytest.mark.parametrize("call", ["dispatch", "combine"])
-def test_a_mori_exchange_at_gathered_rows_spans_its_handle_s_width(call):
+def test_a_mori_exchange_at_gathered_rows_spans_the_ep_width(call):
     # This rank's 2 tokens; the group's 27 rows, not 8 x 2.
     exchange = leaf(
         f"{MORI}.{call}",
@@ -236,7 +236,7 @@ def test_a_mori_exchange_at_gathered_rows_spans_its_handle_s_width(call):
         indices=t([2, 2], "torch.int32"),
         num_ep_ranks=DP,
     )
-    [c] = work(exchange, ONE, 1, "bf16").comm
+    [c] = work(exchange, ONE, 1, "bf16", DP).comm
 
     assert c.ranks == DP
 

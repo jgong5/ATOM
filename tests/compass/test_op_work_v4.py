@@ -82,13 +82,15 @@ def test_the_routed_experts_run_every_route_on_one_rank(quant_type, fmt):
     close(got, experts(8, 16, hit, fmt=fmt))
 
 
-@pytest.mark.parametrize("mask", [16, 17], ids=["mask", "mask_and_sentinel"])
+@pytest.mark.parametrize(
+    "mask", [0, 16, 17, 32], ids=["none", "mask", "mask_and_sentinel", "eight_ranks"]
+)
 def test_under_expert_parallelism_the_busiest_rank_s_share_runs(mask):
-    # Four of sixteen experts here: four ranks, whether or not the mask
-    # carries the sentinel slot for non-local routes.
+    # Four of sixteen experts here: the run's four ranks, whatever mask the
+    # leaf carries, the sentinel slot for non-local routes or eight ranks'.
     load, hit = max_rank_load(8, 2, 16, 4), activated_experts(16, 2, 8) / 4
 
-    close(work(moe(8, 4, mask), ONE, 1, "bf16"), experts(8, load, hit, mask))
+    close(work(moe(8, 4, mask), ONE, 1, "bf16", 4), experts(8, load, hit, mask))
 
 
 TRITON = "aiter.ops.triton.moe."
@@ -257,18 +259,19 @@ def test_mori_sends_each_token_to_the_ranks_holding_its_experts():
         weights=weights,
         scales=None,
         indices=indices,
+        num_ep_ranks=4,
     )
     combine = leaf(
         MORI + "combine", [[4096, 64]], input=t([16, 64]), weights=None, indices=indices
     )
-    # Eight ranks, top 2: another rank holds one of a token's experts with
+    # The run's eight ranks, whatever the leaf states, top 2: another rank holds one of a token's experts with
     # chance at least 1 - (7/8)^2, which sixteen experts over eight ranks meet.
     reach = 1 - (7 / 8) ** 2
     assert reach <= 1 - comb(14, 2) / comb(16, 2)
 
     for op, row in ((dispatch, 64 * 2 + 2 * 4 + 2 * 4), (combine, 64 * 2)):
         sent = 2 * 7 * reach * row
-        [c] = work(op, ONE, 1, "bf16").comm
+        [c] = work(op, ONE, 1, "bf16", 8).comm
         assert (c.ranks, c.bytes) == (8, pytest.approx(sent))
 
 
@@ -356,6 +359,25 @@ def test_every_v4_pro_leaf_prices(ep, tmp_path_factory):
         graph, _ = graphs[shape]
         backend = OpGraphBackend(SPEC, lambda *s, g=graph: g["region"], kv="fp8")
         assert backend.price(view).seconds > 0
+
+
+def test_v4_pro_s_moe_leaves_take_the_run_s_ep_width(tmp_path_factory):
+    graph, _ = capture(tmp_path_factory, SHAPES + DPA_TP8 + EP8)["prefill T=512 B=1"]
+    view = _view("prefill T=512 B=1")
+    found = {op["op"]: op for op, _ in leaves(graph["region"]).values()}
+    kinds = ("aiter.fused_moe_.default", MORI + "dispatch", MORI + "combine")
+    moe, dispatch, combine = map(found.get, kinds)
+
+    # The run's eight ranks are the width the leaves record: a rank runs its
+    # share of every rank's experts, and MORI exchanges among the eight. At
+    # one rank every route runs here and nothing is exchanged.
+    assert moe["args"]["expert_mask"]["shape"][0] // moe["args"]["w1"]["shape"][0] == 8
+    eight, one = (work(moe, view, 1, "fp8", n) for n in (8, 1))
+    assert sum(eight.flops_by_format.values()) < sum(one.flops_by_format.values())
+    for op in (dispatch, combine):
+        assert op["args"]["num_ep_ranks"] == 8
+        assert [c.ranks for c in work(op, view, 1, "fp8", 8).comm] == [8]
+        assert work(op, view, 1, "fp8", 1).comm == ()
 
 
 @pytest.mark.parametrize(
