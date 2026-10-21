@@ -39,10 +39,7 @@ D60 requires, and nothing else, so region terms and the op-level residual are re
 **Revised 2026-10-21 by the owner's
 [decision on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6308315167),
 recorded by [#1868](https://github.com/jgong5/ATOM/issues/1868):** `measure ops` runs no
-forward, neither the model's nor ATOM's warmup. Its runner holds its parameters on the
-meta device and prepares each point through `ModelRunner.prepare_model`; a weight
-argument is random at its contract's spec. A DP-attention layout's leaves other than
-collectives are timed on one GPU at one rank's own width (D38, D39).
+forward (Phase 1b, D39).
 
 **Depends on:** `04_model_capture_and_cost_ir.md` (what is traced and priced),
 `05_machine_spec_and_probes.md` (the machine artifact and its probes).
@@ -283,9 +280,11 @@ Each placement of a planned point goes through `ModelRunner.prepare_model`, whic
 the metadata and forward context. The bench then calls each leaf with activations random
 by its contract's spec and stride; a weight argument built from its contract, random at
 its spec, copy c taking the c-th of as many such tensors as the leaf has instances; and
-metadata, forward context, KV and module tensors from the runner. The meta context
-leaves buffers on the device (`02` D10.1), so a tensor a leaf reads through a module
-attribute is the model's own. Attribution from profiled steps is not built.
+metadata, forward context, KV and module tensors from the runner.
+`_init_weight_params_on_meta` makes every parameter meta as it is registered and leaves
+buffers and other tensor attributes on the device (`02` D10.1), so such a tensor a leaf
+reads through a module reference is the model's own, and a leaf that reads a parameter through a module reference refuses
+by name. Attribution from profiled steps is not built.
 
 Two placement constraints put pricing inside the runner process, and the op bench is
 that process:
@@ -300,9 +299,9 @@ that process:
 
 Weights are random by spec, so the runner holds no device memory for the model's
 weights. The [#1489 PoC](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252)
-read one GEMM signature 5% high on random weights where the layer's own weights matched;
+read one GEMM signature 5% high on random weights against ATOM's dummy weights;
 [#1869](https://github.com/jgong5/ATOM/issues/1869)'s named result compares every leaf
-with the path that used the model's weights.
+with the bench it replaces, which ran ATOM's warmup on ATOM's dummy weights.
 
 Method, settled by elimination:
 
@@ -492,11 +491,11 @@ shard, and a collective leaf refuses by name, measured across the layout's ranks
 reused for ops: it times whole forwards, and it refuses DP.
 
 Measured on [#1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252)'s
-PoC, Qwen3.8-27B TP1, which ran no model forward: a leaf timed from its contract, with
+PoC, Qwen3.8-27B TP1: a leaf timed from its contract with no model forward, its
 ambient state from ATOM's input preparation, came within 1.6% of the same call timed in
 ATOM's decode step for attention, GDN, six GEMM signatures and `silu_and_mul` at B = 2
-and 16, and within 1.1% for nine prefill leaves at two points. That PoC held the
-model's own weights and ran ATOM's warmup. The runner is the whole model's: a 4-layer
+and 16, and within 1.1% for nine prefill leaves at two points. That PoC held
+ATOM's dummy weights and ran ATOM's warmup. The runner is the whole model's: a 4-layer
 runner read GDN 12.6% low at B = 16, its state staying in the last-level cache. Without
 ATOM's warmup the PoC read GDN about 5% low, cause not found; if that gap shows on this
 bench, the missing state is diagnosed and set up in the leaf's own warmup, never by a
