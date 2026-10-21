@@ -91,7 +91,7 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
             {f: config[f] for f in fields},
             engine,
             sampling,
-            {k: line[k] for k in measure.VIEW},
+            measure.view_of(line),
         )
         for line in planned["lines"]
     ]
