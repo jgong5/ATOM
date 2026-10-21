@@ -157,7 +157,7 @@ REST = 0.1
 TOKEN_IDS = {("aten.embedding.default", "indices")}
 #: The seed of a copy's drawn expert ids, with the copy's index.
 SEED = 0
-#: The rank every member is written at: the bench is one rank.
+#: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
 RANK = Topology().ranks()[0]
 #: The variable naming the file a measuring process appends each point's
 #: record to as it finishes it.
