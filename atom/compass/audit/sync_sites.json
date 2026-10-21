@@ -4363,6 +4363,18 @@
    "mechanism_why": "a capture runs in the trace ops command, which is no LP and serves no simulated run, and its group has no peer to wait for"
   },
   {
+   "id": "atom/compass/capture/forward.py::_Recorder.wait::self.wait(waiter, waited)::event_wait#0",
+   "file": "atom/compass/capture/forward.py",
+   "symbol": "_Recorder.wait",
+   "call": "self.wait",
+   "expr": "self.wait(waiter, waited)",
+   "shape": "event_wait",
+   "peer": "none",
+   "why": "trace ops holds a stream fork or join seen inside a lifted function's call until the call ends, then records it again if the call launched nothing; it is the recorder's own bookkeeping of a fake stream, and nothing waits",
+   "mechanism": "K9",
+   "mechanism_why": "a capture runs in the trace ops command, which is no LP and serves no simulated run, and its streams are fakes with nothing to wait for"
+  },
+  {
    "id": "atom/compass/bench/engine.py::Bench.__init__::self.runner_mgr.call_func(\"get_num_blocks\", wait_out=True)::worker_rpc#0",
    "file": "atom/compass/bench/engine.py",
    "symbol": "Bench.__init__",
