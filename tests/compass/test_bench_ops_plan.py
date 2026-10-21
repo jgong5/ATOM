@@ -703,6 +703,17 @@ def test_coverage_declares_the_plan_s_arch_to_aiter_before_it_builds_the_config(
     assert report["steps"] == 1
 
 
+def test_coverage_refuses_a_plan_arch_with_no_declared_device_by_name(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "plan.jsonl").write_text("")
+    (out / "run.json").write_text(json.dumps({"device": [{"arch": "gfx90a"}]}))
+    argv = ["--coverage", "graded", "--store", str(tmp_path), "--out", str(out)]
+
+    with pytest.raises(ValueError, match="no declared device for gfx90a"):
+        ops._coverage_main(argv, [])
+
+
 @pytest.mark.parametrize("mode", ["--width", "--plan", "--coverage"])
 def test_measure_ops_without_enforce_eager_refuses_by_name_and_traces_nothing(
     tmp_path, monkeypatch, mode, model_config  # noqa: F811

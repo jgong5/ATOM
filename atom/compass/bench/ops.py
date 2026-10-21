@@ -984,15 +984,18 @@ def _coverage_main(argv: list[str], atom_args: list[str]) -> dict:
     p.add_argument("--out", required=True, help="the --plan run's --out")
     args = p.parse_args(argv)
     out = Path(args.out)
+    lines = (out / "plan.jsonl").read_text().splitlines()
+    records = [json.loads(line) for line in lines]
+    store = ArtifactStore(args.store)
     arch = json.loads((out / "run.json").read_text())["device"][0]["arch"]
+    if arch not in driverless.DEVICES:
+        declared = sorted(driverless.DEVICES)
+        raise ValueError(f"no declared device for {arch}; declared: {declared}")
     with tempfile.TemporaryDirectory() as tmpdir:
         # aiter asks rocminfo for an arch at import, which the config reaches.
         driverless._declare_arch(tmpdir, arch)
         config = atom_config(atom_args)
         _eager(config)
-        lines = (out / "plan.jsonl").read_text().splitlines()
-        records = [json.loads(line) for line in lines]
-        store = ArtifactStore(args.store)
         return coverage(store, args.store, config, args.coverage, records, arch)
 
 
