@@ -2,6 +2,8 @@
 """`compass measure ops` on an MoE leaf: the router's top-k expert ids it reads
 are drawn independently and uniformly per copy, and their loads recorded."""
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -162,3 +164,52 @@ def test_the_stub_hands_the_logits_head_each_token_s_residual_streams(streams):
         runner.forward((0, 0))
 
     assert got[0].shape == ((2, 4, 3) if streams else (2, 3))
+
+
+# ATOM's ids buffer as `init_aiter_topK_meta_data` builds it for 16 routed
+# experts, top-2, over 6 rows: without EP two fused shared experts, ids 16 and
+# 17 on every row; under EP rank 1 of 2 one shared expert plus one column, ids
+# 16 and 17 on the rows rank 1 owns and the fake expert 17 on the others. The
+# top-k columns are the router's, here -1.
+FUSED = {
+    "without EP": [[-1, -1, 16, 17]] * 6,
+    "under EP": [[-1, -1, 17, 17], [-1, -1, 16, 17]] * 3,
+}
+
+
+def _fused(monkeypatch, buffer):
+    topk = SimpleNamespace(aiter_topK_meta_data=(None, torch.tensor(buffer)))
+    monkeypatch.setitem(sys.modules, "atom.model_ops.topK", topk)
+    return _stub((16, 2))
+
+
+def _moe(width):
+    return {"op": MOE["op"], "args": MOE["args"] | {"topk_ids": _spec([4, width])}}
+
+
+@pytest.mark.parametrize("ep", FUSED)
+def test_fused_shared_expert_ids_draw_routed_columns_and_keep_atom_s_shared_ones(
+    monkeypatch, ep
+):
+    record, copies = _timed(_fused(monkeypatch, FUSED[ep]), _moe(4), 8)
+
+    ids = [c["topk_ids"] for c in copies]
+    for t in ids:
+        assert t.dtype == torch.int32 and t.shape == (4, 4)
+        assert all(len(set(row)) == 2 for row in t[:, :2].tolist())
+        assert 0 <= t[:, :2].min() and t[:, :2].max() < 16
+        assert t[:, 2:].tolist() == [row[2:] for row in FUSED[ep][:4]]
+    assert len({tuple(t[:, :2].flatten().tolist()) for t in ids}) == 8
+    assert record["routing"]["activated"] == [len(t[:, :2].unique()) for t in ids]
+
+
+@pytest.mark.parametrize("width", [3, 5])
+def test_ids_wider_than_top_k_that_atom_s_buffer_does_not_explain_draw_nothing(
+    monkeypatch, width
+):
+    # Width 3 with no fused shared experts; width 5 past a buffer 4 wide.
+    stub = _fused(monkeypatch, FUSED["under EP"]) if width == 5 else _stub((16, 2))
+
+    record, [copy] = _timed(stub, _moe(width), 1)
+
+    assert not copy["topk_ids"].any() and record["routing"] is None

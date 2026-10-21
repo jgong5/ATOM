@@ -22,7 +22,8 @@ through ATOM's warmup, and a `Stub` takes the place of the model's forward.
 Each point reaches the runner as a batch (`ReplayRule`), so ATOM builds its
 metadata and forward context, and the stub calls each leaf from its contract:
 an activation is random at its shape, dtype and stride, except a router's
-top-k expert ids, drawn uniformly on every copy (`_route`); a weight is a
+top-k expert ids, drawn uniformly on every copy, past top-k the shared
+experts' ids ATOM fuses into them (`_route`); a weight is a
 tensor of the model of that shape, dtype and stride; a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM passes the forward (`TOKEN_IDS`); an integer the capture
@@ -100,6 +101,7 @@ import multiprocessing
 import os
 import re
 import statistics
+import sys
 import tempfile
 import time
 import warnings
@@ -406,6 +408,12 @@ class Stub:
                 if hasattr(m, "global_num_experts")
             }
         )
+        # ATOM's top-k ids buffer when its MoE layers fuse shared experts into
+        # top-k (`init_aiter_topK_meta_data`): past top-k, the shared experts'
+        # ids, under EP one more, and the fake expert's on rows another rank owns
+        topk = sys.modules.get("atom.model_ops.topK")
+        meta = getattr(topk, "aiter_topK_meta_data", None)
+        self.shared = meta[1] if meta and self.moe else None
         self.loads = []
 
     def __call__(self, input_ids, positions, *args, **kwargs):
@@ -623,18 +631,23 @@ class Stub:
 
     def _routed(self, spec) -> bool:
         """Whether `spec` is a router's top-k expert ids: an integer activation,
-        a row per token, a column per expert an MoE layer of the model takes."""
+        a row per token, a column per expert an MoE layer of the model takes,
+        or per column of ATOM's ids buffer with its fused shared experts."""
+        widths = {k for _, k in self.moe}
+        if self.shared is not None:
+            widths.add(self.shared.shape[1])
         return (
             spec.get("role") == "activation"
             and len(spec["shape"]) == 2
             and not _dtype(spec["dtype"]).is_floating_point
-            and spec["shape"][1] in {k for _, k in self.moe}
+            and spec["shape"][1] in widths
         )
 
     def _route(self, spec, c):
         """Copy `c`'s expert ids for `spec`: each row's experts drawn
         independently and uniformly, distinct, from the model's routed experts,
-        seeded by `SEED` and `c`; the copy's expert loads go to `loads`."""
+        seeded by `SEED` and `c`, and past top-k the row's ids in ATOM's buffer;
+        the copy's expert loads go to `loads`."""
         if len(self.moe) > 1:
             raise ValueError(
                 f"the model's MoE layers route (experts, top-k) {self.moe}: "
@@ -646,7 +659,11 @@ class Stub:
         draw = torch.rand(spec["shape"][0], experts, generator=seed, device=device)
         ids = draw.topk(k).indices
         self.loads.append(torch.bincount(ids.flatten(), minlength=experts).tolist())
-        return _random(spec, device).copy_(ids)
+        out = _random(spec, device)
+        out[:, :k] = ids
+        if out.shape[1] > k:
+            out[:, k:] = self.shared[: len(out), k:]
+        return out
 
     def _reweigh(self, op, like, c):
         """Copy `like` of `op`'s call with the c-th weight of each weight
