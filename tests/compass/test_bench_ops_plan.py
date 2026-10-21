@@ -862,6 +862,30 @@ def test_measure_ops_without_enforce_eager_refuses_by_name_and_traces_nothing(
     assert traced == []
 
 
+def test_measure_ops_learns_its_kfd_pid_before_atom_config_opens_a_gpu(
+    tmp_path, monkeypatch
+):
+    order = []
+
+    def atom_config(args):
+        order.append("atom_config")
+        raise InterruptedError
+
+    monkeypatch.setattr("atom.compass.bench.measure.atom_config", atom_config)
+    monkeypatch.setattr("atom.compass.drive.gpu.hip_visible", lambda g: "0")
+    monkeypatch.setattr(
+        "atom.compass.drive.gpu.kfd_pid", lambda: order.append("kfd_pid")
+    )
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "")
+    argv = ["--plan", "records", "--store", str(tmp_path / "store")]
+    argv += ["--out", str(tmp_path / "out"), "--llc-mib", "256", "--gpu", "0"]
+
+    with pytest.raises(InterruptedError):
+        ops.main([*argv, "--", "--model", "m", "--enforce-eager"])
+
+    assert order == ["kfd_pid", "atom_config"]
+
+
 def test_measure_ops_plan_hands_plan_the_atom_arguments_after_the_separator(
     tmp_path, monkeypatch, model_config  # noqa: F811
 ):

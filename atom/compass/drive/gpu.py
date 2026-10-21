@@ -11,10 +11,12 @@ that GPU's index, or when KFD charges it memory of that GPU
 (`/sys/class/kfd/kfd/proc/<n>/vram_<gpu_id>`), which also counts a process that
 holds memory there without having opened the GPU's DRM device.
 
-The listing's PIDs are the kernel's. The calling process, which may itself hold
-a named GPU's memory (importing LMCache opens a HIP context), is left out by
-the kernel PID `/proc/self/sched` prints, which differs from `os.getpid()` in a
-container. The run's own processes are told apart by when the checks run: before
+The listing's PIDs are the kernel's, which a container with its own PID
+namespace does not show. The calling process, which may itself hold a named
+GPU's memory (importing LMCache opens a HIP context), is left out by the PID of
+the KFD entry its own open of `/dev/kfd` adds (`kfd_pid`), which takes an open
+before it touches a GPU; without one, by the PID `/proc/self/sched` prints, the
+kernel's only outside such a namespace. The run's own processes are told apart by when the checks run: before
 the run none has started, and after it every one has exited, so any other
 process listed on a named GPU at either check is not this run's.
 
@@ -23,9 +25,10 @@ GPUs by KFD node, the one `rocm-smi --showhw` lists for each (`_nodes`).
 """
 
 import argparse
+import os
 import re
 import subprocess
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from functools import cache, partial
 from pathlib import Path
 
@@ -39,6 +42,9 @@ _NODE = re.compile(r"^(\d+) +(\d+) ", re.MULTILINE)
 _PID = re.compile(r"PID (\d+) is using")
 KFD = Path("/sys/class/kfd/kfd")
 SCHED = Path("/proc/self/sched")
+DEV_KFD = Path("/dev/kfd")
+#: Each process's KFD entry, by `os.getpid()`, once its own open added one.
+_ADDED: dict[int, str] = {}
 
 
 class GpuRefusal(Exception):
@@ -107,17 +113,41 @@ def quiet(gpus: tuple[int, ...], out: Path):
     Enter it before the run touches a GPU, and leave it once the run's
     processes have exited.
     """
-    if held := _check(gpus, out, "before"):
+    me = kfd_pid()
+    if held := _check(gpus, out, "before", me):
         raise GpuRefusal(f"{held} before the run, so it was not started")
     try:
         yield
     finally:
-        if held := _check(gpus, out, "after"):
+        if held := _check(gpus, out, "after", me):
             raise GpuRefusal(f"{held} after the run, so it fails")
 
 
-def _check(gpus: tuple[int, ...], out: Path, when: str) -> str:
-    """Run preflight.sh and save the process listing; name what is on `gpus`."""
+def kfd_pid() -> str:
+    """This process's PID as KFD and rocm-smi list it: the KFD entry its own
+    open of `/dev/kfd` added, while KFD lists it. Only an open before anything
+    else in the process opens a GPU adds one, so call this first. Without one,
+    the PID `/proc/self/sched` prints."""
+    procs = KFD / "proc"
+
+    def listed() -> set[str]:
+        return set(os.listdir(procs)) if procs.is_dir() else set()
+
+    if os.getpid() not in _ADDED:
+        seen = listed()
+        with suppress(OSError), DEV_KFD.open("rb"):
+            # ponytail: a neighbour opening KFD in the same instant adds a
+            # second entry; neither is taken, and the checks may name this one.
+            if len(added := listed() - seen) == 1:
+                _ADDED[os.getpid()] = added.pop()
+    if _ADDED.get(os.getpid()) in listed():
+        return _ADDED[os.getpid()]
+    return re.search(r"\((\d+), #threads", SCHED.read_text()).group(1)
+
+
+def _check(gpus: tuple[int, ...], out: Path, when: str, me: str) -> str:
+    """Run preflight.sh and save the process listing; name what is on `gpus`
+    by any process but `me`."""
     log = out / f"preflight_{when}.txt"
     with log.open("w") as f:
         # A file, not a pipe: a rocminfo wedged past preflight's own timeout
@@ -136,7 +166,6 @@ def _check(gpus: tuple[int, ...], out: Path, when: str) -> str:
     (out / f"gpu_{when}.txt").write_text(listing)
     on = {pid: drm.split() for pid, drm in _ON.findall(listing)}
     nodes = cache(partial(_nodes, gpus))
-    me = re.search(r"\((\d+), #threads", SCHED.read_text()).group(1)
     return ", ".join(
         f"GPU {gpu} has PID {pid} on it"
         for pid in _PID.findall(listing)
