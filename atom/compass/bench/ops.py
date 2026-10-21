@@ -33,7 +33,9 @@ found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names, its module's meta parameters
 moved to the device and filled as `--load_dummy xavier` fills them (`_fill`).
 A leaf whose operator cannot run so refuses by name, a KV tensor argument
-among them.
+among them. On one GPU at a DP-attention layout, the runner is one DP rank's
+own, TP 1 and DP 1, the graphs read and the keys written keep the layout, and
+a collective leaf refuses: it is measured across the layout's ranks.
 A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
 
@@ -191,10 +193,13 @@ def main(argv: list[str]) -> None:
     engine = EngineArgs.add_cli_args(argparse.ArgumentParser(prog=f"{PROG} --"))
     engine = engine.parse_args(argv[cut + 1 :])
     world = engine.tensor_parallel_size * engine.data_parallel_size
-    if world != len(args.gpu):  # DP attention makes each TP rank a DP rank
+    # DP attention makes each TP rank a DP rank, and one GPU can run one alone
+    alone = engine.enable_dp_attention and len(args.gpu) == 1
+    if world != len(args.gpu) and not alone:
         raise ValueError(
             f"--gpu names {len(args.gpu)} GPUs and ATOM's arguments resolve "
-            f"{world} ranks; the op bench runs one on each"
+            f"{world} ranks; the op bench runs one on each, or one DP-attention "
+            "rank on one GPU"
         )
     os.environ["HIP_VISIBLE_DEVICES"] = hip_visible(args.gpu)
     config = atom_config(argv[cut + 1 :])
@@ -356,7 +361,7 @@ def measure(config, todo, llc: int, rank: int = 0) -> list[dict]:
         group = ranks.cpu_group()
         if journal and group is not None:
             journal += f".{torch.distributed.get_rank()}"
-        stub, rule, got = Stub(runner, llc, journal), ReplayRule(config), []
+        stub, rule, got = Stub(runner, llc, journal), ReplayRule(runner.config), []
         todo = ranks.union(todo, group)
         with torch.inference_mode():
             for shape, context, found in todo:
@@ -370,7 +375,9 @@ def _runner(config, rank: int):
     """ATOM's runner at TP `rank` of `config`'s DP rank, its parameters built on
     the meta device and no warmup run, its KV pool allocated at the fewest
     blocks a rank has room for, sized by ATOM with the parameters' bytes held
-    on the device and then freed for the weights each leaf builds."""
+    on the device and then freed for the weights each leaf builds. One DP rank
+    of several run alone is built as ATOM's simulated DP attention builds it:
+    DP 1, its experts cut and their token buffers sized as across the ranks."""
     from torch.distributed import TCPStore
 
     from atom.compass.bench.ranks import agreed, cpu_group
@@ -387,6 +394,11 @@ def _runner(config, rank: int):
 
     pc, store = config.parallel_config, None
     if not pc._managed_distributed_store:  # one rank: the store is its own
+        if pc.data_parallel_size > 1:
+            config = copy.deepcopy(config)
+            config.dp_logical_size = pc.data_parallel_size
+            pc = config.parallel_config
+            pc.data_parallel_size = pc.data_parallel_size_local = 1
         store = TCPStore(
             pc.data_parallel_master_ip,
             pc.data_parallel_base_port,
@@ -408,10 +420,13 @@ def _runner(config, rank: int):
 
 class Stub:
     """The leaves of a point timed beside ATOM's runner, on the forward context
-    and live metadata ATOM prepared for each placement of its batch."""
+    and live metadata ATOM prepared for each placement of its batch. `alone`
+    is the layout's ranks when the runner runs one of them by itself, and then
+    a collective leaf refuses."""
 
     def __init__(self, runner, llc: int, journal=None) -> None:
         self.runner, self.llc, self.journal = runner, llc, journal
+        self.alone = getattr(runner.config, "dp_logical_size", 0)
         self.built, self.leaves, self.placed = {}, {}, []
         self.cold_copies, self.clones = {}, {}
         self.modules = dict(runner.model.named_modules())
@@ -559,6 +574,11 @@ class Stub:
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
 
+        if self.alone and exchange(op):
+            raise ValueError(
+                f"a collective over the layout's {self.alone} ranks, measured "
+                "across them, not on a runner that runs one alone"
+            )
         fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
         self.loads, self.built = [], {}
         with refused_together():
