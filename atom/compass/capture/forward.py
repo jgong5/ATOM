@@ -26,6 +26,12 @@ by its type.
 The engine is ATOM's own `Config` for ATOM's engine arguments, on a declared
 device of one arch. Under DP the capture runs one rank, and its peers the rest of
 the rows the group's MoE gathers (`peers`).
+
+Under a drafter a decode row verifies the drafter's tokens, a real step's
+batch so the rejection sampler runs, and a step that samples is cut where ATOM
+records `forward_done_event`: the target's work before it, the drafter's after
+it (its passes, the shared embedding and LM head among them), each its own
+graph. A block drafter writes its draft KV before the cut and is refused.
 """
 
 import contextlib
@@ -77,6 +83,8 @@ V4_DECODES = (
     "aiter.mla_decode_v4_ps_asm.default",
 )
 V4_INDEXER = "aiter.indexer_score_topk.default"
+#: Where a drafter's step ends its target's work: ATOM records `forward_done_event`.
+CUT = "forward_done_event"
 
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
@@ -134,14 +142,16 @@ def structure(
     eager: bool | None = None,
     device: str | None = None,
     output: bool = True,
+    draft: bool = False,
 ) -> str:
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the arch of `device`, else
     `device_arch()`, the engine config a step law is keyed by less its ladder
-    (`run.step_grid.keyed`), which names every variable that picks a kernel,
-    the TP width, the DP width and the EP group's when they are set, the phase
-    and the mode, `config`'s unless `eager` names it, and ``no output`` unless
-    the step produces output (`output`)."""
+    (`run.step_grid.keyed`), which names every variable that picks a kernel and
+    a drafter's method and width, the TP width, the DP width and the EP group's
+    when they are set, the phase and the mode, `config`'s unless `eager` names
+    it, ``no output`` unless the step produces output (`output`), and ``draft``
+    for the drafter's part of the step (`draft`)."""
     from atom.compass.run import _file_digest
     from atom.compass.run.step_grid import keyed
 
@@ -154,7 +164,8 @@ def structure(
     widths = f"tp={tp}" + (f" dp={dp}" if dp > 1 else "")
     widths += f" ep={tp * dp}" if config.enable_expert_parallel else ""
     key = f"{arch} {device} {digest} {engine} {widths} {phase} {mode}"
-    return key if output else f"{key} no output"
+    key = key if output else f"{key} no output"
+    return f"{key} draft" if draft else key
 
 
 def _engine(text: str):
@@ -316,6 +327,12 @@ class _Recorder(TorchDispatchMode):
                 f"{self.items[-1][1].name} is still open when the step ends: "
                 "a call that neither returned nor raised has no end to fold to"
             )
+
+    def cut(self):
+        """ATOM records `forward_done_event`: the target's work ends here, and
+        what follows is the drafter's."""
+        if self.on:
+            self.items.append((None, CUT))
 
     @contextlib.contextmanager
     def quiet(self):
@@ -600,7 +617,10 @@ def _patches(recorder):
       allocation); its device side is ATOM's `zeros_like`, faked.
     * GDN's causal-conv1d metadata is host arithmetic over the staged
       `cu_seqlens`, and it runs outside the fake mode too.
-    * A real host tensor's values are read on the host, `tolist` as `numpy`.
+    * A real host tensor's values are read on the host, `tolist` as `numpy`;
+      under a drafter a device value copied to the host, which nothing
+      computed, reads as zeros (its runner reads back the last step's MTP
+      status and draft ids). Without one, such a read raises.
     * ATOM's MoE wrappers run their bodies, not their fakes: inside are the
       collectives, the streams and the expert kernels.
     * The checkpoint's weights iterator yields nothing: ATOM's dummy load still
@@ -653,10 +673,20 @@ def _patches(recorder):
 
     init, zeros, numpy = CpuGpuBuffer.__init__, torch.zeros, torch.Tensor.numpy
     conv1d, tolist = gdn_attn.compute_causal_conv1d_metadata, torch.Tensor.tolist
+    fake_tolist = FakeTensor.tolist
+
+    def landed(tensor):
+        if not getattr(recorder.runner, "drafter", None):
+            return tensor
+        if isinstance(tensor, FakeTensor) and tensor.device.type == "cpu":
+            with unset_fake_temporarily():
+                return zeros(tensor.shape, dtype=tensor.dtype)
+        return tensor
 
     def host_tolist(tensor):
+        tensor = landed(tensor)
         if isinstance(tensor, FakeTensor):
-            return tolist(tensor)
+            return fake_tolist(tensor)
         with unset_fake_temporarily():
             return tolist(tensor)
 
@@ -698,6 +728,8 @@ def _patches(recorder):
         (CpuGpuBuffer, "__init__", staged_init),
         (gdn_attn, "compute_causal_conv1d_metadata", host_conv1d),
         (torch.Tensor, "tolist", host_tolist),
+        (FakeTensor, "tolist", host_tolist),
+        (torch.Tensor, "numpy", lambda t, *a, **k: host_numpy(landed(t), *a, **k)),
         (loader, "safetensors_weights_iterator", lambda *a, **k: iter(())),
         (UBatchWrapper, "_run_ubatches", micro_batches),
         (torch.ops.aiter, "moe_forward", moe.moe_forward),
@@ -803,20 +835,22 @@ def _weights(model):
                 yield value
 
 
-def _batch(shape, block_size, context=1, output=True):
+def _batch(shape, block_size, context=1, output=True, drafts=0):
     """`shape.seqs` sequences of `shape.tokens` new tokens between them, the
     first `tokens % seqs` one longer, each in blocks of its own; and the
-    blocks they take. A decode sequence holds `context` tokens. Unless
-    `output`, every prefill sequence is a middle chunk, so the step samples
-    nothing."""
+    blocks they take. A decode sequence holds `context` tokens, and under a
+    drafter of `drafts` tokens verifies that many more, as ATOM's scheduler
+    schedules it. Unless `output`, every prefill sequence is a middle chunk,
+    so the step samples nothing."""
     from atom.model_engine import sequence
     from atom.model_engine.scheduler import ScheduledBatch
 
+    drafts = drafts if shape.phase == "decode" else 0
     per, extra = divmod(shape.tokens, shape.seqs)
-    counts = [per + (i < extra) for i in range(shape.seqs)]
+    counts = [per + (i < extra) + drafts for i in range(shape.seqs)]
     seqs, blocks = {}, 0
     for index, count in enumerate(counts):
-        held = context if shape.phase == "decode" else count
+        held = context + drafts if shape.phase == "decode" else count
         # An id of 0 would draw one from the class counter instead.
         seq = sequence.Sequence([0] * held, block_size=block_size, id=index + 1)
         seq.status = sequence.SequenceStatus.RUNNING
@@ -828,12 +862,17 @@ def _batch(shape, block_size, context=1, output=True):
     batch = ScheduledBatch(
         seqs=seqs,
         num_scheduled_tokens=numpy.array(counts, dtype=numpy.int32),
-        total_tokens_num=shape.tokens,
+        total_tokens_num=sum(counts),
         total_seqs_num=shape.seqs,
-        **{f"total_tokens_num_{shape.phase}": shape.tokens},
+        **{f"total_tokens_num_{shape.phase}": sum(counts)},
         **{f"total_seqs_num_{shape.phase}": shape.seqs},
-        is_dummy_run=True,
+        # ATOM scores drafts only on a step that is not a dummy run.
+        is_dummy_run=not drafts,
         is_final_chunk=None if output else [False] * shape.seqs,
+        num_spec_step=drafts,
+        scheduled_spec_decode_tokens={
+            i: numpy.zeros(drafts, dtype=numpy.int32) for i in seqs
+        },
     )
     return batch, blocks
 
@@ -911,7 +950,10 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
 
     Yields, per shape, the graph, the model's config digest, what the capture
     declared, the operators it left out of the graph among it; per prefill
-    shape, the middle chunk's and then the final one's.
+    shape, the middle chunk's and then the final one's. Under a drafter a step
+    that samples is two graphs, its target's and then its drafter's, cut where
+    ATOM records `forward_done_event`; a decode step verifies the drafter's
+    tokens in each row.
     """
     declared = driverless.install(tmpdir, arch)
 
@@ -933,6 +975,10 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
     contexts = config.compilation_config.static_forward_context
     recorder, block_size = _Recorder(contexts, fake_mode), config.kv_cache_block_size
     driverless.on_wait = recorder.wait
+    # A drafter's runner imports inductor, whose decomposition table walks
+    # every `torch.ops.aiter` op, which the patches below replace by functions.
+    import torch._inductor.decomposition
+
     stack = _patches(recorder)
     if dp > 1:
         for owner, name, value in peers.patches(recorder):
@@ -962,10 +1008,23 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
         )
         recorder.runner = runner
         recorder.modules = {id(m): n for n, m in runner.model.named_modules() if n}
-        weights = map(_storage, _weights(runner.model))
+        models, drafts = [runner.model], 0
+        if drafter := getattr(runner, "drafter", None):
+            if drafter.is_block_drafter:
+                raise ValueError(
+                    f"{type(drafter).__name__} writes its draft KV before "
+                    "forward_done_event on a step that samples: no cut parts its "
+                    "target from its draft"
+                )
+            drafts, done = drafter.mtp_k, runner.forward_done_event
+            models.append(drafter.model)
+            done.record = lambda *a: (recorder.cut(), driverless.Event.record(done, *a))
+        weights = map(_storage, (w for m in models for w in _weights(m)))
         recorder.roles = dict.fromkeys(weights, ir.Role.WEIGHT)
         recorder.creating = ir.Role.KV
-        blocks = max(_batch(s, block_size, max(CONTEXTS))[1] for s in shapes)
+        blocks = max(
+            _batch(s, block_size, max(CONTEXTS), True, drafts)[1] for s in shapes
+        )
         with fake_mode:
             runner.get_num_blocks()  # sizes the pools, as `EngineCore` does
         # A warmup copy whose bytes nobody reads, like `_maybe_warmup`.
@@ -984,24 +1043,30 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
             traces = []
             for context in CONTEXTS if shape.phase == "decode" else CONTEXTS[:1]:
                 recorder.creating = ir.Role.METADATA
+                batch = (shape, block_size, context, output, drafts)
                 with fake_mode, torch._C._EnablePythonDispatcher(), recorder:
                     # A runner's first step takes its own path (a decode
                     # fills no deferred ids), so the traced step follows two
                     # of its own shape, which find its launching functions:
                     # no graph depends on another's.
                     for _ in range(2):
-                        runner.forward(_batch(shape, block_size, context, output)[0])
+                        runner.forward(_batch(*batch)[0])
                     recorder.start()
                     recorder.creating, recorder.on = ir.Role.METADATA, True
-                    runner.forward(_batch(shape, block_size, context, output)[0])
+                    runner.forward(_batch(*batch)[0])
                 recorder.creating, recorder.on = None, False
                 traces.append((recorder.items, recorder.left_out))
             items, left_out = traces[0]
             if len(traces) > 1:
                 items = _affine(str(shape), items, traces[1][0])
-            key = structure(config, shape.phase, output=output)
-            crossing, traced = [], Traced(key, str(shape))
-            graph = build(items, traced, crossing)
-            left_out = [*left_out, *(("step-crossing", op) for op in crossing)]
-            declared["left_out"] = [{"why": why, **_json(op)} for why, op in left_out]
-            yield graph, digest, dict(declared)
+            # A drafter's work follows its target's: its own graph.
+            cut = [i for i, (_, item) in enumerate(items) if item is CUT][:1]
+            for draft, part in enumerate(
+                (items[: cut[0]], items[cut[0] + 1 :]) if cut else (items,)
+            ):
+                key = structure(config, shape.phase, output=output, draft=bool(draft))
+                crossing, traced = [], Traced(key, str(shape))
+                graph = build(part, traced, crossing)
+                gone = [*left_out, *(("step-crossing", op) for op in crossing)]
+                declared["left_out"] = [{"why": why, **_json(op)} for why, op in gone]
+                yield graph, digest, dict(declared)
