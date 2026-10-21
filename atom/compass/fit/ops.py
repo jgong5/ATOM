@@ -23,7 +23,9 @@ for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
 a prefill's B and the context: a decode point's ``context``, its longest
 row's, or a prefill point's rows' mean cached tokens (`band`); and a
-prefill's B for a kind its rows move (``("rows", op)``). Points at one
+prefill's B for a kind its rows move (``("rows", op)``). A collective's
+points name their family themselves, `measure ops`'s `exchange`, and its one
+dimension is their message bytes. Points at one
 coordinate, its other counts or contexts dropped, are one point at their mean
 time. `interpolate` prices a query at a measured point as
 that point; between points, multilinearly over the neighbours that bracket it
@@ -184,9 +186,16 @@ def fit(points) -> dict:
 
     dependent = _dependent(points)
     groups: dict[str, list] = {}
-    for p in points:
-        groups.setdefault(skeleton(p["shape"], p["leaf"]), []).append(p)
     free_of, families = {}, {}
+    for p in points:
+        if "exchange" in p:  # a collective: one family over its message bytes
+            fam, nbytes = p["exchange"]
+            f = families.setdefault(
+                fam, {"op": p["op"], "dims": ["bytes"], "points": {}}
+            )
+            f["points"].setdefault((nbytes,), []).append((p["cold_ns"], p["kernels"]))
+        else:
+            groups.setdefault(skeleton(p["shape"], p["leaf"]), []).append(p)
     for skel, members in groups.items():
         at: dict[str, list] = {}
         for p in members:

@@ -693,6 +693,8 @@ def test_measure_ops_without_enforce_eager_refuses_by_name_and_traces_nothing(
 ):
     graph_mode = SimpleNamespace(**vars(model_config))
     graph_mode.enforce_eager, graph_mode.tp_world_size = False, 1
+    graph_mode.pipeline_parallel_size = graph_mode.prefill_context_parallel_size = 1
+    graph_mode.enable_dp_attention = False
     graph_mode.compilation_config = SimpleNamespace(level=0)
     traced = []
     monkeypatch.setattr("atom.compass.bench.measure.atom_config", lambda a: graph_mode)
@@ -783,7 +785,7 @@ def test_measure_journals_each_record_as_it_finishes_it(tmp_path, monkeypatch):
     runner, journal = _Runner(), tmp_path / "points.jsonl"
     runner.exit = lambda: None
     placed = SimpleNamespace(block_size=16, batch=lambda view, block, slot: (0, 0))
-    monkeypatch.setattr(ops, "_runner", lambda config: runner)
+    monkeypatch.setattr(ops, "_runner", lambda config, rank: runner)
     monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda c: placed)
     monkeypatch.setenv(ops.JOURNAL, str(journal))
     x = ("self", _t([2, 3], "activation"))
