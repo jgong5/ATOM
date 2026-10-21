@@ -20,13 +20,10 @@
 #                  port free here, and refuses one among them
 #   <router args>  `atomesh launch` arguments, as given; the script adds the
 #                  router's host and ports, --pd-disaggregation and each
-#                  instance's URL; run with --dp-aware, which makes the
-#                  router choose among DP ranks, runs it as LP `router` of the
-#                  run, and refuses an ATOMESH not built from this tree's
-#                  atom/mesh (`router_binary` in atom/compass/run)
+#                  instance's URL; run with --dp-aware runs the router as LP
+#                  `router`, refusing an ATOMESH not built from this tree
 #   ATOMESH        the router binary (default atomesh)
-#   SEED           run, --dp-aware: the seed the router LP's policies draw
-#                  from (default 20260707, client.sh's)
+#   SEED           the router LP's seed (default 20260707, client.sh's)
 #   WAIT_S         seconds each instance and the router have to answer, and
 #                  the deployment to leave once stopped (default 600)
 #   PREFIX_S       seconds --on's prefix has to start the decode's command,
@@ -106,7 +103,6 @@ compass_env "$ROOT"
 compass_require_tree "$ROOT" || exit $?
 RUN_FILE= CLOCK=
 [[ $cmd == record ]] || RUN_FILE=$OUT/run_file.json
-# Run, --dp-aware: the router is LP `router`, run by ATOMESH, which the run file names.
 ROUTER_LP=
 [[ -z $RUN_FILE || " ${router[*]} " != *" --dp-aware "* ]] || ROUTER_LP=$ATOMESH
 # The ports, all held together so no two are the same: the router's and its
@@ -115,7 +111,7 @@ ROUTER_LP=
 # takes one more, as the run file states; real, each side's Mooncake side
 # channels take one per rank from its handshake port.
 ports=$(python3 - "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
-import argparse, json, random, socket, subprocess, sys
+import argparse, json, random, socket, sys
 from pathlib import Path
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactRefusal
@@ -154,13 +150,11 @@ try:
     run = runfile.prefill_decode(args, prefill, decode, kv_link)
     lookaheads = "-"
     if router_lp:
-        # Each hop into the router takes the run's ipc_s, as pd_sim.sh's does.
         run["router"] = compass_run.router_binary(router_lp)
         run.setdefault("router_in_s", run["ipc_s"])
         table = compass_run.channel_table(run)
-        out = {c.name: table.lookahead(c.name) for c in table.channels_from(compass_run.ROUTER)}
-        lookaheads = json.dumps(out, separators=(",", ":"))
-except (ValueError, OSError, subprocess.CalledProcessError, ArtifactRefusal, SpecRefusal) as refused:
+        lookaheads = json.dumps({c.name: table.lookahead(c.name) for c in table.channels_from(compass_run.ROUTER)}, separators=(",", ":"))
+except (ValueError, OSError, ArtifactRefusal, SpecRefusal) as refused:
     sys.exit(f"deploy: {refused}")
 clock = block(1)
 base = block(run["prefill_data_parallel_size"] * run["decode_data_parallel_size"])
@@ -244,15 +238,14 @@ export NO_PROXY=$hosts${NO_PROXY:+,$NO_PROXY} no_proxy=$hosts${no_proxy:+,$no_pr
 ROUTER=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --prometheus-port "$PROMETHEUS_PORT"
     --pd-disaggregation --prefill "$prefill_url" --decode "$decode_url" "${router[@]}")
 router_env=()
-[[ -z $ROUTER_LP ]] || router_env=(ATOM_COMPASS_CLOCK_ENDPOINT="$CLOCK" ATOM_COMPASS_SEED="${SEED:-20260707}"
-    ATOM_COMPASS_ROUTER_LOOKAHEADS="$LOOKAHEADS")
+[[ -z $ROUTER_LP ]] || router_env=(ATOM_COMPASS_CLOCK_ENDPOINT="$CLOCK" ATOM_COMPASS_SEED="${SEED:-20260707}" ATOM_COMPASS_ROUTER_LOOKAHEADS="$LOOKAHEADS")
 env "${router_env[@]}" "${ROUTER[@]}" >"$OUT/router.log" 2>&1 &
 R=$!
 compass_wait_up router $R "http://127.0.0.1:$ROUTER_PORT/v1/models"
 # A stop from here on, one server.json's reader sends included, also stops the
-# router, so the wait below ends even when the stop comes before it.
+# prefill instance, so the wait below ends even when the stop comes before it.
 stopped=0
-trap 'stopped=1; kill -TERM $R 2>/dev/null || true' TERM INT
+trap 'stopped=1; kill -TERM $P 2>/dev/null || true' TERM INT
 # The router's parent is this script, which a client's stop signals.
 python3 -c 'import json, sys
 url, pid, run_file, clock, out = sys.argv[1:]
@@ -269,10 +262,12 @@ rc=$((!stopped))
 ((stopped)) || echo "deploy: a process of the deployment left before a stop" >&2
 # Each instance stops its server, whose frontend ends a simulated run through
 # the authority; the authority leaves once it has written the summary.
-kill -TERM $P $R 2>/dev/null || true
+# The router stops last: a router LP's run needs it until then.
+kill -TERM $P 2>/dev/null || true
 stop_decode
 deadline=$((SECONDS + WAIT_S))
-for pid in $P $D $R $authority; do
+for pid in $P $D $authority $R; do
+    ((pid != R)) || kill -TERM $R 2>/dev/null || true
     while kill -0 $pid 2>/dev/null; do
         ((SECONDS < deadline)) || { kill -KILL $pid; rc=1; echo "deploy: process $pid killed after $WAIT_S s" >&2; }
         sleep 1

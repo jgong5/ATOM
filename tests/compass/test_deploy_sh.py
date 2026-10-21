@@ -83,7 +83,12 @@ if argv == ["--version-verbose"]:
     sys.exit()
 lp = {k: v for k, v in os.environ.items() if k.startswith("ATOM_COMPASS_")}
 json.dump({"argv": argv, "pid": os.getpid(), "env": lp}, open(os.environ["PLANTED_ROUTER"], "w"))
-signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+def stop(*_):
+    summary = os.path.exists(os.environ["PLANTED_SUMMARY"])
+    open(os.environ["PLANTED_ROUTER"] + ".stop", "w").write(json.dumps(summary))
+    os._exit(0)
+
+signal.signal(signal.SIGTERM, stop)
 # As atomesh does, it asks each instance first, through any proxy the environment names.
 for flag in ("--prefill", "--decode"):
     urllib.request.urlopen(argv[argv.index(flag) + 1] + "/health", timeout=10)
@@ -126,6 +131,7 @@ def planted(tmp_path):
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "ATOMESH": str(bindir / "atomesh"),
         "PLANTED_ROUTER": str(tmp_path / "router.json"),
+        "PLANTED_SUMMARY": str(tmp_path / "d" / "summary.json"),
         "WAIT_S": "60",
     }
     flags = ["--step-stub", str(tmp_path / "stub.json")]
@@ -281,6 +287,8 @@ def test_a_dp_aware_router_runs_as_the_router_lp_on_the_run_s_clock(tmp_path, pl
     script.send_signal(signal.SIGTERM)
     out, _ = script.communicate(timeout=60)
     assert script.returncode == 0, out
+    # The router LP outlives the run: it is stopped once the summary is written.
+    assert json.loads((tmp_path / "router.json.stop").read_text()) is True
 
 
 def test_a_dp_aware_run_refuses_a_router_built_dirty_before_anything_starts(
