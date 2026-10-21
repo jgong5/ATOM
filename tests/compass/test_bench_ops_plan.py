@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 from concurrent.futures.process import BrokenProcessPool
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -21,13 +22,16 @@ from test_artifact_store import CONDITIONS, GATES, stanza
 from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
 from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 
-from atom.compass import ir
+from atom.compass import capture, ir
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.bench import ops
+from atom.compass.capture import forward
 from atom.compass.capture.forward import decode, structure
-from atom.compass.run import memory
+from atom.compass.run import memory, step_grid
+from atom.compass.runner.overrides import schedulable_ladder
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
+from atom.config import Config
 from atom.utils import forward_context as fctx
 
 CONFIG = SimpleNamespace(
@@ -858,6 +862,31 @@ def test_measure_ops_without_enforce_eager_refuses_by_name_and_traces_nothing(
     assert traced == []
 
 
+def test_measure_ops_plan_hands_plan_the_atom_arguments_after_the_separator(
+    tmp_path, monkeypatch, model_config  # noqa: F811
+):
+    config = SimpleNamespace(**vars(model_config))
+    config.pipeline_parallel_size = config.prefill_context_parallel_size = 1
+    config.enable_dp_attention = False
+    config.compilation_config = SimpleNamespace(level=0)
+    got = []
+    monkeypatch.setattr("atom.compass.bench.measure.atom_config", lambda a: config)
+    monkeypatch.setattr("atom.compass.drive.gpu.hip_visible", lambda g: "0")
+    monkeypatch.setattr("atom.compass.drive.gpu.quiet", lambda g, out: nullcontext())
+    monkeypatch.setattr("atom.compass.drive.identity.identity", lambda *a: {})
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(step_grid, "keyed", lambda c: {})
+    monkeypatch.setattr(ops, "keys", lambda c, r: None)
+    monkeypatch.setattr(ops, "plan", lambda *a: got.append(a[7:]))
+    atom_args = ["--model", config.model, "--enforce-eager", "--enable-expert-parallel"]
+    argv = ["--plan", "records", "--store", str(tmp_path / "store")]
+    argv += ["--out", str(tmp_path / "out"), "--llc-mib", "256", "--gpu", "0"]
+
+    ops.main([*argv, "--", *atom_args])
+
+    assert got == [(atom_args,)]
+
+
 def _dies(*finished):
     """`_bench` as a child that dies once for each entry of `finished`, having
     journaled that many of its points, and then lives; and the records it was
@@ -934,3 +963,102 @@ def test_measure_journals_each_record_as_it_finishes_it(tmp_path, monkeypatch):
 
     assert len(got) == 2
     assert [json.loads(line) for line in journal.read_text().splitlines()] == got
+
+
+#: What the `bench` fixture stands in for: the op_graph reader and the engine
+#: config an op_graph's key states.
+GRAPH, KEYED = ops.graph, step_grid.keyed
+
+#: The architecture of the model whose config.json the test writes.
+ARCH = "Qwen3ForCausalLM"
+
+
+class _Config(Config):
+    """ATOM's `Config` with its fields as ATOM's arguments resolve them, the
+    model and quantization left unread: reading them imports aiter, which a
+    process with no driver cannot do twice."""
+
+    def __post_init__(self):
+        self.hf_config = SimpleNamespace(architectures=[ARCH])
+        self.quant_config = SimpleNamespace(compute_hash=lambda: "unquantized")
+
+
+@pytest.mark.parametrize(
+    "parallel, widths",
+    [("--enable-dp-attention", "tp=1 dp=8"), ("--enable-expert-parallel", "tp=8 ep=8")],
+)
+def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
+    bench, tmp_path, monkeypatch, parallel, widths
+):
+    """`trace ops` runs as `--plan` starts it, its trace left out: the config
+    it builds from its arguments keys the graph it publishes."""
+    store, root, key, run = bench
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"architectures": [ARCH]}))
+    atom_args = ["--model", str(model), "-tp", "8", "--enforce-eager", parallel]
+    monkeypatch.setattr("atom.config.Config", _Config)
+    config = forward._config(str(model), 8, atom_args)  # laid out, as `main` does
+    config.max_num_seqs, config.max_model_len = 4, CONFIG.max_model_len
+    published = []
+
+    def trace(model, tp, shapes, tmpdir, atom_args, arch):
+        traced = forward._config(model, tp, atom_args)
+        for shape in shapes:
+            at = structure(traced, shape.phase, device=arch)
+            yield SimpleNamespace(
+                applicability=SimpleNamespace(structure=at, shape=shape)
+            ), None, {}
+
+    def publish(store, graph, model, declared, tp, atom_args, command):
+        at = graph.applicability
+        published.append((at.structure, tp))
+        key = Key.of(Kind.OP_GRAPH, structure=at.structure, shape=str(at.shape))
+        store.publish(
+            key,
+            provenance=stanza("compass trace ops"),
+            topology=Topology(),
+            conditions=CONDITIONS,
+            gates=GATES,
+            members={
+                member_name("graph", ops.RANK, "json"): json.dumps(
+                    _graph_at(store, None, at.shape)
+                ).encode()
+            },
+        )
+        return key
+
+    def child(fn, *args):
+        if fn is not capture.main:
+            return _bench(fn, *args)
+        with (
+            patch.object(forward, "capture", trace),
+            patch.object(capture, "publish", publish),
+        ):
+            return fn(*args)
+
+    monkeypatch.setattr(ops, "graph", GRAPH)
+    monkeypatch.setattr(step_grid, "keyed", KEYED)
+    monkeypatch.setattr(ops, "_child", child)
+    monkeypatch.setattr(forward, "device_arch", lambda: "gfx942")
+    steps = ([[1, 1000, True]], 1), ([[40, 40, False]], None)
+    args = SimpleNamespace(
+        plan=[_records(tmp_path / "plan", *steps)], store=root, llc_mib=256
+    )
+
+    ops.plan(
+        store, key, config, run, args, "compass measure ops --plan", tmp_path, atom_args
+    )
+
+    assert published
+    assert {(s.split("} ")[-1], tp) for s, tp in published} == {
+        (f"{widths} {phase} eager", 8) for phase in ("decode", "prefill")
+    }
+    records = [
+        json.loads(x) for x in (tmp_path / "plan.jsonl").read_text().splitlines()
+    ]
+    rungs = {f"decode B={b}" for b in schedulable_ladder(config)}
+    shapes = {r["shape"] for r in records}
+    assert {s for s in shapes if s.startswith("decode")} == rungs
+    assert "prefill T=40 B=1" in shapes
+    assert not [r for r in records if "refused" in r]
