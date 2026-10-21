@@ -1061,20 +1061,27 @@ def plan(store, key, config, run, args, command: str, out: Path) -> None:
 
 def _coverage_main(argv: list[str], atom_args: list[str]) -> dict:
     from atom.compass.bench.measure import atom_config
+    from atom.compass.capture import driverless
 
     p = argparse.ArgumentParser(prog=f"{PROG} --coverage")
     p.add_argument("--coverage", action="append", required=True, metavar="RECORD")
     p.add_argument("--store", required=True, help="the artifact store's root")
     p.add_argument("--out", required=True, help="the --plan run's --out")
     args = p.parse_args(argv)
-    config = atom_config(atom_args)
-    _eager(config)
     out = Path(args.out)
     lines = (out / "plan.jsonl").read_text().splitlines()
     records = [json.loads(line) for line in lines]
     store = ArtifactStore(args.store)
     arch = json.loads((out / "run.json").read_text())["device"][0]["arch"]
-    return coverage(store, args.store, config, args.coverage, records, arch)
+    if arch not in driverless.DEVICES:
+        declared = sorted(driverless.DEVICES)
+        raise ValueError(f"no declared device for {arch}; declared: {declared}")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # aiter asks rocminfo for an arch at import, which the config reaches.
+        driverless._declare_arch(tmpdir, arch)
+        config = atom_config(atom_args)
+        _eager(config)
+        return coverage(store, args.store, config, args.coverage, records, arch)
 
 
 def _eager(config) -> None:
