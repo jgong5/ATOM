@@ -519,7 +519,7 @@ class Stub:
             print(f"{shape}: {op['op']} over {copies} copies {names or ''}", flush=True)
             record |= {"instances": len(inst), "placements": len(self.placed)}
             got += _journal(self.journal, [record])
-        self.placed, self.built = [], {}
+        self.placed = []
         return got
 
     def _plan(self, op, instances, kv, blocks, rows):
@@ -707,9 +707,7 @@ class Stub:
 
     def _weight(self, spec, c, count):
         """Weight `c mod count` of `spec`, random: the `count` of a leaf are
-        built once, as slices of one tensor. One tensor each, allocated after
-        the KV pool, read an MI308X decode GEMM up to 15% slower than the
-        model's own weights; slices of one read within 1.5%."""
+        built once, as slices of one tensor."""
         if (_spec_of(spec), 0) not in self.built:
             n = _span(spec["shape"], spec["stride"])
             dtype, device = _dtype(spec["dtype"]), self.runner.device
