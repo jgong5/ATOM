@@ -119,9 +119,10 @@ activated experts for `B` rows, each routed to `k` of `E`, and under EP the expe
 maximum rank load. The EP width reaches an op-level MoE extractor from the backend, as
 `tp` does, and global experts are local times EP (owner's
 [ruling on #1811](https://github.com/jgong5/ATOM/issues/1811), 2026-10-20).
-[#1744](https://github.com/jgong5/ATOM/issues/1744) builds it; until then
-`backends/op_work.py` reads the width off the leaf, aiter's experts from `expert_mask`
-and MORI's exchanges from `num_ep_ranks`.
+[#1744](https://github.com/jgong5/ATOM/issues/1744) passes it to the Triton experts'
+extractors; aiter's experts still read the width from `expert_mask` and MORI's
+exchanges from `num_ep_ranks`, until
+[#1889](https://github.com/jgong5/ATOM/issues/1889) passes it to them.
 
 **Graph padding** is priced as executed, at the rows `capture_rung` pads to; a run option
 prices the real rows instead.

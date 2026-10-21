@@ -26,9 +26,13 @@ wrappers, and the DP gathers and MORI dispatch and combine are declared nodes (D
 
 **Revised 2026-10-20 by the owner's [ruling on #1811](https://github.com/jgong5/ATOM/issues/1811),
 as #1812 and #1813 built it:** a raw Triton or FlyDSL launch lifts to the function that
-issues it, its arguments taken at call entry after two untraced steps, objects kept in
-pickle's reduce shape, nested launching calls folded into the outermost; an `op_graph`
-is keyed by the step law's engine config less its ladder (D20).
+issues it, its arguments taken at call entry, objects kept in pickle's reduce shape,
+nested launching calls folded into the outermost; an `op_graph` is keyed by the step
+law's engine config less its ladder (D20).
+
+**Revised 2026-10-21 by the owner's
+[ruling on #1812](https://github.com/jgong5/ATOM/issues/1812#issuecomment-6304727730):**
+each traced step follows two untraced steps of its shape (D20).
 
 **Depends on:** `02_model_runner_and_cost_backend.md` (the backend plug point this fills),
 `03_memory_and_kv_model.md` (the activation term this supplies).
@@ -937,7 +941,7 @@ the analytical extractor and `measure ops` alike.
   every found function is refused by name.
 - **Each contract replays to the same work.** The first call of each distinct contract
   is called again, rebuilt from it under the fake mode, and must launch the same kernels
-  and dispatch the same operators; one that does not, or does not rebuild, is refused by
+  and dispatch the same operators outside torch's; one that does not, or does not rebuild, is refused by
   name. So is a leaf that raises after it launched, or is still open when the step ends:
   a call cut short has no contract to replay. One that raises having launched nothing
   gives back what it ran.
@@ -947,7 +951,7 @@ the analytical extractor and `measure ops` alike.
 [#1812's census](https://github.com/jgong5/ATOM/issues/1812#issuecomment-6296604735)
 covers Qwen3.8-27B TP1 and V4-Pro at TP8, DPA-TP8 and DPA EP8, each at fp8 and bf16 KV,
 with `ATOM_USE_TRITON_MOE` off and on: every configuration captures, where the innermost
-rule refused 9 of the 16, and the rule refuses none. Qwen's leaves keep their names
+rule refused 8 of the 16, and the rule refuses none. Qwen's leaves keep their names
 (`fused_qk_norm`, `try_mrope_qk_fused`, `kv_indices_generate_triton`) but one: the
 sampler's FlyDSL argmax is `topk_per_row_argmax`, not `_apply_greedy_tokens`, whose
 `le` and `where` are now graph operators. A kernel switch inside a function stays in its
@@ -1026,8 +1030,8 @@ recorded like the rest of the step: the expert kernels as leaves, the side strea
 `Par` (D19), each Triton or FlyDSL launch lifted by the lift rule. aiter's experts are
 `fused_moe_`; under `ATOM_USE_TRITON_MOE=1` the census finds aiter's Triton launchers,
 `downcast_to_mxfp`, `moe_gemm_a8w4` twice (the second holding `_reduce_grouped`) and
-`ep_sort_routing` at EP8, and `topk`, `sort_tokens`, `moe_gemm_a16w4` and
-`fused_clamp_act_mul` with EP off.
+`ep_sort_routing` at EP8, and `topk`, `sort_tokens`, `sort_tokens_fused`,
+`moe_gemm_a16w4` and `fused_clamp_act_mul` with EP off.
 
 Their exchanges with other ranks are **declared nodes** (D21), as #1401 and the
 [ruling on #531](https://github.com/jgong5/ATOM/issues/531#issuecomment-6244543796) ask,
@@ -1397,7 +1401,7 @@ Deferred to future work by decision on 2026-09-18.
 | D18 | Capture with `TorchDispatchMode` + `FakeTensorMode`, on FakeTensor rather than bare meta, at concrete shapes: one graph per decode width and prefill (T, B) that `trace ops` is given or that a record directory's steps hold. The symbolic route A and its four disciplines (the fourth: the engine's host arithmetic asks a symbol for a number, so a symbolic capture keeps the conversion, logs it with its line, and asserts that log against a stated set) are recorded, not built | 2026-09-18, fourth discipline 2026-09-22; concrete 2026-10-18 (#1489) |
 | D18.1 | `torch.export` recorded as an unverified alternative; rejected now on decomposition fidelity and on capturing a model call rather than an engine step | 2026-09-18 |
 | D19 | Hierarchical, concrete, stream-annotated IR: `Seq` / `Repeat` / `Par`, a node's arguments its leaf contract. No branches in the IR — applicability is a discrete key and the captured shape, matched by equality | 2026-09-18; revised 2026-10-18 (#531); concrete 2026-10-18 (#1489) |
-| D20 | Opaque leaves are priced, not decomposed. Each carries a stated parameter extractor and a contract: arguments by schema slot, each tensor's stride and role by provenance (activation, weight, KV, metadata), non-tensor arguments and module references kept, a runner attribute as `runner.<attr>`, any other object in pickle's reduce shape or refused by its type. A raw Triton (`JITFunction.run`, a warmup aside) or FlyDSL (`JitFunction.__call__`, `CompiledFunction.__call__`) launch lifts to the first function its `module:qualname` names, past the languages' frames, closures and generic launchers; a direct `CompiledKernel.run` is refused. Nested launching calls and custom ops fold into the outermost; arguments come from call entry in a traced step that follows two untraced steps of its shape; each contract must replay to the same kernels and operators, and a launch outside a found function, a raise after a launch or a call open at the step's end is refused. An `op_graph` is keyed by the step law's engine config less its ladder, the performance environment in it, and a miss names each differing field; keying on a kernel-selecting environment variable is a workaround for an ATOM design that should take the choice as an argument. Capture runs the two MoE wrappers' bodies; their DP and MORI exchanges are declared nodes named for the function ATOM calls, and a TBO step is refused. | 2026-09-18; contract 2026-10-18 (#1489); MoE exchanges 2026-10-19 (#1401); lift rule and key 2026-10-20 (#1811); two untraced steps 2026-10-21 (#1812) |
+| D20 | Opaque leaves are priced, not decomposed. Each carries a stated parameter extractor and a contract: arguments by schema slot, each tensor's stride and role by provenance (activation, weight, KV, metadata), non-tensor arguments and module references kept, a runner attribute as `runner.<attr>`, any other object in pickle's reduce shape or refused by its type. A raw Triton (`JITFunction.run`, a warmup aside) or FlyDSL (`JitFunction.__call__`, `CompiledFunction.__call__`) launch lifts to the first function its `module:qualname` names, past the languages' frames, closures and generic launchers; a direct `CompiledKernel.run` is refused. Nested launching calls and custom ops fold into the outermost; arguments come from call entry in a traced step that follows two untraced steps of its shape; each contract must replay to the same kernels and operators outside torch's, and a launch outside a found function, a raise after a launch or a call open at the step's end is refused. An `op_graph` is keyed by the step law's engine config less its ladder, the performance environment in it, and a miss names each differing field; keying on a kernel-selecting environment variable is a workaround for an ATOM design that should take the choice as an argument. Capture runs the two MoE wrappers' bodies; their DP and MORI exchanges are declared nodes named for the function ATOM calls, and a TBO step is refused. | 2026-09-18; contract 2026-10-18 (#1489); MoE exchanges 2026-10-19 (#1401); lift rule and key 2026-10-20 (#1811); two untraced steps 2026-10-21 (#1812) |
 | D21 | Stated nodes over chased coverage, their terms declared; refuse and record `unpriced` reasons; a failed forward writes no graph. The MoE exchanges are the first stated nodes | 2026-09-18; revised 2026-10-14 (#952); MoE exchanges 2026-10-19 (#1401) |
 | D22 | Liveness stays observational under fake tensors; internal scratch of an opaque leaf is a stated per-leaf constant. Revised: until capture lands the activation term is a coefficient measured on a real run, scratch inside it, and the walk replaces it after | 2026-09-18; revised 2026-10-10 |
 | D23 | Trace eager, price with the regime constant of the real step. The inductor fusion gap (~4.8% decode) is a documented **TODO**, not a decision. | 2026-09-18 |
