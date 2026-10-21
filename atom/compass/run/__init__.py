@@ -66,7 +66,7 @@ its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, and a law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
-holds at its shape and output, the run's TP width and KV cache format; capture traces
+holds at its shape and output, the run's TP and EP widths and KV cache format; capture traces
 eager forwards, so a graph-mode run reads the eager graphs too; with
 ``price_list``, the fields of a `price_list` key ``store`` holds, loaded
 under this run's readings, it prices each leaf from it first),
@@ -1387,7 +1387,20 @@ def runner(model_runner, tree) -> None:
                 f"the run file's op_graph is {run[OP_GRAPH]!r}; it is true, which "
                 "prices each step from the op_graph the store holds at its shape"
             )
-        backend = op_graph(run, config, machine)
+        backend = op_graph(
+            run,
+            config,
+            machine,
+            # The EP width as ATOM's MoE resolves it, 1 when it does not shard.
+            ep=next(
+                (
+                    m.moe_parallel_config.ep_size
+                    for m in tree.modules()
+                    if hasattr(m, "moe_parallel_config")
+                ),
+                1,
+            ),
+        )
     elif PRICE_LIST in run:
         raise ValueError(
             "the run file names a price_list and no op_graph, the one backend "
@@ -1470,15 +1483,16 @@ def runner(model_runner, tree) -> None:
         model_runner.compass_step_grid = {**bundle, "describe": backend.describe()}
 
 
-def op_graph(run: dict, config, machine):
+def op_graph(run: dict, config, machine, ep: int = 1):
     """The `OpGraphBackend` the run file `run` names for `config` on
-    `machine`, with its price list when it names one."""
+    `machine` at EP width `ep`, with its price list when it names one."""
     from atom.compass.backends.op_graph import OpGraphBackend
 
     return OpGraphBackend(
         machine,
         _op_graphs(run["store"], config, machine.value("device.arch")),
         tp=config.tensor_parallel_size,
+        ep=ep,
         dp=config.parallel_config.data_parallel_size,
         kv=config.kv_cache_dtype,
         padded=run.get("padding", "executed") != "none",

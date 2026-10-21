@@ -5,8 +5,8 @@
 
 A leaf is one operator of an `op_graph` as its JSON holds it: `op`, its kind;
 `args` by schema slot, a tensor as its shape, dtype, stride and role; `out`,
-its output shapes. `work(leaf, view, tp, kv_format)` is the leaf's `Work` on a
-step of `view`'s rows: F and C from the primitives its kind's extractor emits,
+its output shapes. `work(leaf, view, tp, kv_format, ep)` is the leaf's `Work`
+on a step of `view`'s rows: F and C from the primitives its kind's extractor emits,
 M the leaf's own tensor arguments read once and its outputs written once, plus
 the ambient state it reads (the KV context in `kv_format`, the recurrent
 state). A fused leaf is
@@ -28,7 +28,9 @@ DeepSeek-V4's MoE takes the step roofline's expectation under independent
 uniform routing: the routed experts run the rows the leaf holds, under expert
 parallelism the busiest rank's expected share, at the format the op quantizes
 its rows to, and read each activated expert once; an exchange's group width
-is read off its own shapes.
+is read off its own shapes. ATOM's Triton experts run as aiter's grouped
+GEMMs, each priced so, at the activation format its kind names; their
+expert-parallel width is the run's `ep`, the experts `ep` times a rank's.
 """
 
 from __future__ import annotations
@@ -222,13 +224,25 @@ def _dp_exchange(op, view, tp, kv) -> Work:
     return _boundary(op) + collective(ranks, every)
 
 
+def _routing(view, tokens, k, experts, ranks):
+    """The routes and activated experts of `tokens` each routed to `k` of
+    `experts` spread over `ranks`, an expectation under uniform routing: the
+    busiest rank's expected share under expert parallelism. A DP gather's pad
+    rows (`moe_tokens` real among them) all carry token 0, so they activate
+    experts as one token."""
+    real = view.moe_tokens
+    distinct = tokens if real is None else min(tokens, real + 1)
+    groups = activated_experts(experts, k, distinct)
+    if ranks == 1:
+        return tokens * k, groups
+    return max_rank_load(tokens, k, experts, ranks), groups / ranks
+
+
 def _fused_moe(op, view, tp, kv) -> Work:
     """The routed experts on `hidden_states`' rows, each route through one
-    expert's gate-up and down products: an expectation under uniform routing.
-    Under expert parallelism `expert_mask` spans every rank's experts, of which
-    this rank holds `w1`'s, and it runs the busiest rank's expected share.
-    A DP gather's pad rows (`moe_tokens` real among them) all carry token 0,
-    so they activate experts as one token.
+    expert's gate-up and down products, routed as `_routing` says. Under
+    expert parallelism `expert_mask` spans every rank's experts, of which
+    this rank holds `w1`'s.
 
     With a nonzero `quant_type` the op quantizes `hidden_states` to the
     weights' format inside it, so both products run at that format; otherwise
@@ -240,12 +254,7 @@ def _fused_moe(op, view, tp, kv) -> Work:
     local, up = args["w1"]["shape"][:2]
     mask = args.get("expert_mask")
     ranks = mask["shape"][0] // local if mask else 1
-    real = view.moe_tokens
-    distinct = rows if real is None else min(rows, real + 1)
-    routed, groups = rows * k, activated_experts(local * ranks, k, distinct)
-    if ranks > 1:
-        routed = max_rank_load(rows, k, local * ranks, ranks)
-        groups /= ranks
+    routed, groups = _routing(view, rows, k, local * ranks, ranks)
     b = _fmt(args["w1"]["dtype"])
     a = b if args.get("quant_type") else _fmt(args["hidden_states"]["dtype"])
     flops = grouped_gemm(routed, up, hidden, groups, a, b)
@@ -256,6 +265,49 @@ def _fused_moe(op, view, tp, kv) -> Work:
     return Work(
         flops.flops_by_format, weights * groups / local + io * routed / (rows * k)
     )
+
+
+def _experts(act: str):
+    """One of aiter's Triton grouped GEMMs of the routed experts, `x` in `act`
+    through fp4 weights `w` (each expert's `K x N` packed two to a byte),
+    routed as `_routing` says: `routing_data` states the top k, the gather or
+    scatter index one slot per route. Under expert parallelism over `ep` ranks
+    `w` holds this rank's share of `ep` times its experts. M is the leaf's
+    boundary: each activated expert's weights and scales read once, and the
+    rows' tensors and its output (SwiGLU's half of the gate-up, or the tokens'
+    rows a scatter reduces into, unless `y_out` holds them and so they are
+    read as an argument) at the share of routes this rank runs."""
+
+    def extract(op, view, tp, kv, ep) -> Work:
+        args = op["args"]
+        x, w = args["x"], args["w"]
+        k = dict((args.get("routing_data") or {}).get("state", ())).get("n_expts_act")
+        index = args.get("gather_indx") or args.get("scatter_indx")
+        if not (k and index):
+            raise _Unpriced("no top k in routing_data, or no gather or scatter index")
+        routes, local = index["shape"][0], w["shape"][0]
+        tokens = routes // k
+        width = int(x["shape"][-1] * _size(x["dtype"]) / ELEMENT_BYTES[act])
+        n = round(_bytes(w) / local / (width * ELEMENT_BYTES["fp4"]))
+        routed, groups = _routing(view, tokens, k, local * ep, ep)
+        flops = grouped_gemm(routed, n, width, groups, act, "fp4").flops_by_format
+        held = ("w", "w_scales", "bias")
+        weights = sum(_bytes(t) for s in held for t in _tensors(args.get(s)))
+        rows = tokens if args.get("scatter_indx") else routes
+        out = n // 2 if args.get("apply_swiglu") else n
+        written = 0 if args.get("y_out") else rows * out * _size(args["out_dtype"])
+        io = _boundary(op).bytes - weights + written
+        return Work(flops, weights * groups / local + io * routed / routes)
+
+    return extract
+
+
+def _downcast(op, view, tp, kv) -> Work:
+    """aiter's MX downcast along the last axis: its source read once, its
+    values written in `out_quant_type`, and one e8m0 scale byte per 32."""
+    args = op["args"]
+    values = math.prod(args["src_tensor"]["shape"])
+    return _boundary(op) + Work({}, values * (_size(args["out_quant_type"]) + 1 / 32))
 
 
 def _mori(*payload, dispatch: bool):
@@ -472,6 +524,13 @@ MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp."
 V4_INDICES = "atom.model_ops.v4_kernels.paged_"
 V4 = "atom.model_ops.v4_kernels."
 FLYDSL = "aiter.ops.flydsl.kernels."
+TRITON_MOE = "aiter.ops.triton.moe."
+#: aiter's Triton grouped GEMMs of the routed experts, by kind: the format
+#: their activations run in. Their extractors also take the EP width.
+EXPERTS = {
+    f"{TRITON_MOE}moe_op_gemm_{a}w4:moe_gemm_{a}w4": fmt
+    for a, fmt in (("a16", "bf16"), ("a8", "fp8"), ("a4", "fp4"))
+}
 #: V4's compressor: its sources and parameters read once. The KV and score
 #: state rings it reads by slot and the cache rows it writes are left out.
 COMPRESS = _only("kv_in", "score_in", "ape", "rms_weight", "state_slot_mapping")
@@ -526,6 +585,16 @@ EXTRACTORS = {
     "aiter.topk_gating_fwd.default": _in_place(),
     "atom.model_ops.triton_hash_topk:hash_topk_triton": _gather("tid2eid"),
     "aiter.fused_moe_.default": _fused_moe,
+    **{kind: _experts(fmt) for kind, fmt in EXPERTS.items()},
+    TRITON_MOE + "quant_moe:downcast_to_mxfp": _downcast,
+    "aiter.ops.triton.quant.quant:dynamic_mxfp4_quant": _in_place(),
+    "aiter.ops.triton.fusions.fused_clamp_act_mul:fused_clamp_act_mul": _in_place(),
+    # A lifted leaf records no outputs: the index and weight tensors the
+    # routing returns are left out, which only lowers M.
+    TRITON_MOE + "moe_routing.topk:topk": _in_place(),
+    TRITON_MOE + "moe_routing.routing:sort_tokens": _in_place(),
+    TRITON_MOE + "moe_routing.routing:sort_tokens_fused": _in_place(),
+    TRITON_MOE + "moe_routing.routing:ep_sort_routing": _in_place(),
     MOE + "all_gather_with_padding": _dp_exchange,
     MOE + "all_gatherv": _dp_exchange,
     MOE + "reduce_scatter_with_unpadding": _dp_exchange,
@@ -557,11 +626,13 @@ EXTRACTORS = {
 }
 
 
-def work(op: dict, view: BatchView, tp: int, kv_format: str) -> Work | None:
+def work(
+    op: dict, view: BatchView, tp: int, kv_format: str, ep: int = 1
+) -> Work | None:
     """`op`'s work on a step of `view`'s rows in a TP group of `tp` ranks
-    whose KV cache holds `kv_format` (a work format, "bf16" or "fp8"), or None
-    when it launches no kernel. A kind with no extractor, or a leaf its
-    extractor cannot price, is refused."""
+    whose KV cache holds `kv_format` (a work format, "bf16" or "fp8"), its
+    experts sharded over `ep` ranks, or None when it launches no kernel. A
+    kind with no extractor, or a leaf its extractor cannot price, is refused."""
     name = op["op"]
     extract = EXTRACTORS.get(name) or (name.startswith("aten.") and _aten)
     if not extract:
@@ -572,7 +643,7 @@ def work(op: dict, view: BatchView, tp: int, kv_format: str) -> Work | None:
     if op["out"] and not any(map(math.prod, op["out"])):
         return None
     try:
-        return extract(op, view, tp, kv_format)
+        return extract(op, view, tp, kv_format, *([ep] if name in EXPERTS else []))
     except _Unpriced as error:
         reason = f"the op kind {name}: {error}"
     raise CostRefused(view, [Refusal(SOURCE, reason)])
