@@ -18,8 +18,10 @@ processes stop with it, and writes ``<out>/server.log`` and its step record in
 names its URL and process id and, for a simulated server, its clock endpoint
 and run file. SIGINT or SIGTERM to the command, or the server's exit, stops the
 whole group: SIGTERM first, SIGKILL for what is left after `STOP_GRACE_S`.
-Then ``<out>/run.json`` gets the run's identity, read off the engine file its
-first step wrote. No command starts the client.
+A real server's stop, for the GPU check after it, lasts until KFD, which
+frees a process's GPU memory after it exits, lists no process it did not list
+before the server started. Then ``<out>/run.json`` gets the run's identity,
+read off the engine file its first step wrote. No command starts the client.
 """
 
 import argparse
@@ -36,7 +38,7 @@ from pathlib import Path
 
 import atom
 from atom.compass import parity
-from atom.compass.drive.gpu import hip_visible, quiet
+from atom.compass.drive.gpu import KFD, hip_visible, quiet
 from atom.compass.drive.identity import identity
 from atom.compass.run import CLOCK_ENV, ENV, _write_whole
 
@@ -125,6 +127,7 @@ def serve(
         argv += ["--compass-run", str(run_file)]
         ready |= {"clock_endpoint": run["clock_endpoint"], "run_file": str(run_file)}
     with _stop_signals() as stopped, quiet(gpus, out) if gpus else nullcontext():
+        kfd = _kfd() if gpus else None
         with (out / LOG_FILE).open("w") as log:
             server = subprocess.Popen(
                 argv,
@@ -147,7 +150,7 @@ def serve(
             while not stopped and server.poll() is None:
                 time.sleep(POLL_S)
         finally:
-            _stop(server.pid)
+            _stop(server.pid, kfd)
             server.wait()
     if not stopped and server.returncode:
         raise ServeError(f"the server exited {server.returncode}; see {out / LOG_FILE}")
@@ -226,22 +229,35 @@ def _stop_signals():
             signal.signal(s, handler)
 
 
-def _stop(group: int) -> None:
+def _stop(group: int, kfd=None) -> None:
     """SIGTERM the process group `group`; SIGKILL what is left after
-    `STOP_GRACE_S`."""
+    `STOP_GRACE_S`. Given `kfd`, the processes KFD listed before the server
+    started, the group has left only once KFD lists none it did not, as it
+    lists an exited process until it has freed its GPU memory. KFD names a
+    process by a PID a container's /proc may not show, so no PID is mapped:
+    another tenant's process that opened a GPU since holds the stop as long."""
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(group, sig)
         except ProcessLookupError:
-            return
+            pass
         for _ in range(int(STOP_GRACE_S / POLL_S)):
-            if not _live(group):
+            if not _live(group, kfd):
                 return
             time.sleep(POLL_S)
 
 
-def _live(group: int) -> bool:
-    """Whether a process of `group` has not exited; a zombie has."""
+def _kfd() -> set[str]:
+    """The processes KFD lists, by name; none where there is no KFD."""
+    try:
+        return {p.name for p in (KFD / "proc").iterdir()}
+    except FileNotFoundError:
+        return set()
+
+
+def _live(group: int, kfd=None) -> bool:
+    """Whether a process of `group` has not exited, a zombie has, or, given
+    `kfd`, KFD lists a process `kfd` does not."""
     for stat in Path("/proc").glob("[0-9]*/stat"):
         try:
             state, _, pgrp = stat.read_text().rsplit(")", 1)[1].split()[:3]
@@ -249,4 +265,4 @@ def _live(group: int) -> bool:
             continue
         if int(pgrp) == group and state != "Z":
             return True
-    return False
+    return kfd is not None and bool(_kfd() - kfd)

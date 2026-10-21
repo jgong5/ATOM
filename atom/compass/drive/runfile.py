@@ -28,9 +28,8 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
 - Not flags: `FIXED`, and ``data_parallel_size``, read from ATOM's arguments.
   The server serves client runs until it is stopped.
 
-`prefill_decode` builds the one run file of a prefill and a decode instance on
-one node, which `scripts/compass/deploy.sh` hands its clock authority and both
-instances.
+`prefill_decode` builds the one run file of a prefill and a decode instance,
+which `scripts/compass/deploy.sh` hands its clock authority and both instances.
 """
 
 import hashlib
@@ -145,13 +144,14 @@ def build(args, atom_args) -> dict:
     return out
 
 
-def prefill_decode(args, prefill_args, decode_args) -> dict:
+def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     """The run file `build` builds from `args` for one prefill and one decode
-    instance on one node, started with ATOM's arguments `prefill_args` and
-    `decode_args`: each side's DP width read from its own, the router's
-    per-request forward cost the machine spec's ``interconnect.router_relay_s``,
-    the KV transfers priced on its intra-node link, and `KV_WRITE_REQ_S`. A
-    price list the prefill side names that is not the decode side's refuses."""
+    instance, started with ATOM's arguments `prefill_args` and `decode_args`:
+    each side's DP width read from its own, the router's per-request forward
+    cost the machine spec's ``interconnect.router_relay_s``, the KV transfers
+    priced on the spec's `kv_link`, ``intra_node`` for two instances on one node
+    and ``inter_node`` across two, and `KV_WRITE_REQ_S`. A price list the
+    prefill side names that is not the decode side's refuses."""
     out = build(args, prefill_args)
     if run.PRICE_LIST in out:
         decode = _price_list_key(decode_args, run._machine(out)).values
@@ -166,7 +166,7 @@ def prefill_decode(args, prefill_args, decode_args) -> dict:
     return out | {
         "router_s": run._machine(out).value("interconnect.router_relay_s"),
         "kv_write_req_s": KV_WRITE_REQ_S,
-        "kv_link": "intra_node",
+        "kv_link": kv_link,
     }
 
 

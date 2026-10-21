@@ -330,6 +330,7 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
     server.json run.json   the deployment's
     run_file.json          its one run file; simulated
     prefill/ decode/       each instance's --out: server.json, run.json, steps/, logs
+    prefill.sh decode.sh prefill.pid decode.pid   each instance's command, and the process id it writes first
     step_table.txt summary.json client-<k>/ lp-<lp>.json   the authority's; simulated
     authority.log router.log prefill.log decode.log
     client/ artifacts/     the client's, as beside one server

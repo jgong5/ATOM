@@ -58,7 +58,8 @@ class Health(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
-server = http.server.HTTPServer(("127.0.0.1", 0), Health)
+host = argv[argv.index("--host") + 1] if "--host" in argv else "127.0.0.1"
+server = http.server.HTTPServer((host, 0), Health)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 
 def stop(*_):
@@ -66,17 +67,20 @@ def stop(*_):
     os._exit(0)
 
 signal.signal(signal.SIGTERM, stop)
-ready = {"url": f"http://127.0.0.1:{server.server_port}", "pid": os.getpid()}
+ready = {"url": f"http://{host}:{server.server_port}", "pid": os.getpid()}
 open(out + "/server.json.part", "w").write(json.dumps(ready))
 os.rename(out + "/server.json.part", out + "/server.json")
 while True:
     signal.pause()
 """
 ROUTER = """\
-import http.server, json, os, signal, sys
+import http.server, json, os, signal, sys, urllib.request
 argv = sys.argv[1:]
 json.dump({"argv": argv, "pid": os.getpid()}, open(os.environ["PLANTED_ROUTER"], "w"))
 signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+# As atomesh does, it asks each instance first, through any proxy the environment names.
+for flag in ("--prefill", "--decode"):
+    urllib.request.urlopen(argv[argv.index(flag) + 1] + "/health", timeout=10)
 
 class Models(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -231,7 +235,7 @@ def test_an_instance_that_exits_before_it_answers_fails_the_deployment_naming_it
 @pytest.mark.parametrize(
     "case, refusal",
     [
-        ("record", "the command after OUT is run"),
+        ("command", "the command after OUT is run or record"),
         ("kv", "--kv-transfer-config"),
         ("dp-aware", "carry --dp-aware"),
         ("no router", "--router -- come once each"),
@@ -241,8 +245,8 @@ def test_an_instance_that_exits_before_it_answers_fails_the_deployment_naming_it
 def test_bad_arguments_exit_2_before_anything_starts(tmp_path, planted, case, refusal):
     env, flags = planted
     words = argv(tmp_path, flags)
-    if case == "record":
-        words[3] = "record"
+    if case == "command":
+        words[3] = "trace"
     elif case == "kv":
         words.insert(words.index("--decode"), "--kv-transfer-config={}")
     elif case == "dp-aware":

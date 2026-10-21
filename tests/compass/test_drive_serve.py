@@ -9,16 +9,19 @@ rather than hanging it.
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
-from test_drive_gpu import FREE, GPU45, LISTING, _plant
+from test_drive_gpu import FREE, GPU45, LISTING, _kfd, _plant
 
+from atom.compass.drive import gpu as drive_gpu
 from atom.compass.drive import serve
 from atom.compass.drive.gpu import GpuRefusal
 from atom.compass.run import ENV
@@ -64,6 +67,7 @@ import sys
 from atom.compass.drive import serve
 serve.SERVER = (sys.executable, sys.argv[1])
 serve.identity = lambda *args: {"identity": "planted"}
+serve.KFD = serve.Path(sys.argv[2], "kfd")
 serve.serve(sys.argv[3:], sys.argv[2], (7,))
 """
 ARGS = ["--model", "m", "-tp", "2", "--kv-transfer-config", '{"kv_role": "x"}']
@@ -79,6 +83,8 @@ def planted(tmp_path, monkeypatch):
     (tmp_path / "planted.py").write_text(PLANTED)
     monkeypatch.setattr(serve, "SERVER", (sys.executable, str(tmp_path / "planted.py")))
     monkeypatch.setenv("PLANTED_DIR", str(tmp_path))
+    # Not this node's KFD, which another process may join during a stop.
+    monkeypatch.setattr(serve, "KFD", tmp_path / "kfd", raising=False)
 
     def identity(*args):
         child = (tmp_path / "child").read_text()
@@ -302,6 +308,39 @@ def test_what_ignores_sigterm_is_killed_after_the_grace(monkeypatch):
     stubborn.stdout.readline()
     serve._stop(stubborn.pid)
     assert stubborn.wait(timeout=5) == -signal.SIGKILL
+
+
+def test_a_stop_lasts_until_kfd_has_freed_what_appeared_since_the_start(
+    planted, monkeypatch
+):
+    """KFD frees an exited process's GPU memory after the exit, so the GPU
+    check after the stop would find the server's own rank on its GPU. KFD
+    names it by the kernel's PID, which a container's /proc need not show;
+    what KFD listed before the start does not hold the stop."""
+    monkeypatch.setenv("PLANTED_EXIT", "late:0")
+    monkeypatch.setattr(serve, "STOP_GRACE_S", 10)
+    (planted / "bin" / "listing1").write_text(LISTING)
+    _kfd(planted, monkeypatch, gpu=9, vram=2 << 20)
+    rank = drive_gpu.KFD / "proc/3362894"
+    rank.rename(planted / "rank")
+    (drive_gpu.KFD / "proc/1").mkdir()
+
+    def charge():
+        """KFD lists the rank once the server's child runs, until 5 s after
+        it exits."""
+        child = planted / "child"
+        while not (child.exists() and child.read_text()):
+            time.sleep(0.05)
+        (planted / "rank").rename(rank)
+        while _running(child.read_text()):
+            time.sleep(0.05)
+        time.sleep(5)
+        shutil.rmtree(rank)
+
+    threading.Thread(target=charge, daemon=True).start()
+    start = time.monotonic()
+    serve.serve(ARGS, planted / "out", (9,))
+    assert time.monotonic() - start < 2 * serve.STOP_GRACE_S
 
 
 def test_each_start_takes_a_free_dp_master_port_over_the_callers(planted, monkeypatch):
