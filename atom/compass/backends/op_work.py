@@ -526,6 +526,18 @@ EXTRACTORS = {
     "aiter.topk_gating_fwd.default": _in_place(),
     "atom.model_ops.triton_hash_topk:hash_topk_triton": _gather("tid2eid"),
     "aiter.fused_moe_.default": _fused_moe,
+    "aiter.rocm_aiter_fused_moe.default": _fused_moe,
+    "aiter._topk_softmax.default": _in_place(
+        "topk_weights", "topk_indices", "token_expert_indices"
+    ),
+    "aiter.per_group_quant_hip.default": lambda op, view, tp, kv: _boundary(
+        op, outs=[op["args"]["quant_dtype"], "torch.float32"]
+    ),
+    "aiter.gated_rmsnorm_fp8_group_quant.default": _in_place("out", "scale"),
+    "atom.model_ops.fla_ops.replayssm:replayssm_commit": _only(
+        "slot_idx", "num_accepted"
+    ),
+    "atom.model_ops.rejection_sampler:rejection_sample": _in_place(),
     MOE + "all_gather_with_padding": _dp_exchange,
     MOE + "all_gatherv": _dp_exchange,
     MOE + "reduce_scatter_with_unpadding": _dp_exchange,

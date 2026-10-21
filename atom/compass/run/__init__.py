@@ -1394,6 +1394,8 @@ def runner(model_runner, tree) -> None:
             )
         from atom.compass.backends.op_graph import OpGraphBackend
 
+        drafter = getattr(config, "speculative_config", None)
+
         backend = OpGraphBackend(
             machine,
             _op_graphs(run["store"], config, machine.value("device.arch")),
@@ -1404,6 +1406,7 @@ def runner(model_runner, tree) -> None:
             split_send_recv=config.enable_expert_parallel
             and getattr(config, "enable_low_latency", False),
             price_list=PRICE_LIST in run and _price_list(run, config, machine),
+            drafts=drafter.num_speculative_tokens if drafter else 0,
         )
     elif PRICE_LIST in run:
         raise ValueError(
@@ -1490,7 +1493,8 @@ def runner(model_runner, tree) -> None:
 def _op_graphs(root: str, config, arch: str):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or None; under DP, at the rows the step's MoE gathers."""
+    that does not, or of its drafter's part (`draft`), or None; under DP, at the
+    rows the step's MoE gathers."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
     from atom.compass.capture.forward import Shape, structure
 
@@ -1499,10 +1503,10 @@ def _op_graphs(root: str, config, arch: str):
 
     @functools.lru_cache(maxsize=64)
     def graph(
-        phase: str, tokens: int, seqs: int, output: bool = True, gathered=None
+        phase: str, tokens: int, seqs: int, output=True, gathered=None, draft=False
     ) -> dict | None:
         shape = str(Shape(phase, tokens, seqs, gathered).at(dp))
-        at = structure(config, phase, True, arch, output)
+        at = structure(config, phase, True, arch, output, draft)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
         if not store.directory_for(key).exists():
             return None
