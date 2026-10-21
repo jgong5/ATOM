@@ -13,6 +13,7 @@ import math
 import queue
 import re
 import threading
+from unittest import mock
 
 import pytest
 
@@ -27,6 +28,7 @@ from atom.compass.clock import (
     LpRegistry,
     single_engine_table,
 )
+from atom.compass.clock.channels import ADMISSION_DELAY_S
 from atom.compass.clock_transport import (
     MalformedMessage,
     connect,
@@ -184,9 +186,11 @@ def _drive(conn, table, script):
 
 def _three_lp_run(cls, served):
     """Serve a `cls` over the single-engine table and run `SCRIPTS` on it."""
-    table = single_engine_table(
-        admission_path="serving", ipc_s=IPC_S, stream_s=STREAM_S
-    )
+    # SCRIPTS' grant times are written for a 1.6 ms request lookahead.
+    with mock.patch.dict(ADMISSION_DELAY_S, serving=1.6e-3):
+        table = single_engine_table(
+            admission_path="serving", ipc_s=IPC_S, stream_s=STREAM_S
+        )
     ca = cls(table)
     endpoint = served(ca).endpoint
     conns = {name: connect(LpId(name), endpoint) for name in SCRIPTS}

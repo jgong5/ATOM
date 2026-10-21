@@ -73,6 +73,26 @@ def test_each_leaf_holds_every_instance_s_context_key_and_module_path():
     }
 
 
+def test_stated_values_part_signatures_and_stating_nothing_keeps_the_key():
+    plain = _leaf("aiter.decode", ("x", _t([2, 8], "activation")))
+    csa, hca = (
+        dataclasses.replace(plain, stated=(("compress_ratio", r), ("index_topk", k)))
+        for r, k in ((4, 1024), (128, None))
+    )
+
+    found = ops.leaves(_graph(plain, csa, hca, layers=1)["region"])
+
+    assert [op.get("stated") for op, _ in found.values()] == [
+        None,
+        {"compress_ratio": 4, "index_topk": 1024},
+        {"compress_ratio": 128, "index_topk": None},
+    ]
+    # The key a leaf stating nothing had before any leaf stated anything.
+    op, _ = next(iter(found.values()))
+    leaf = {"op": "aiter.decode", "args": op["args"], "out": []}
+    assert ops.signature(op) == json.dumps(leaf, sort_keys=True, separators=(",", ":"))
+
+
 LIVE = {
     "kv_indptr": torch.arange(9, dtype=torch.int32),
     # Its own shape and stride, with more room than `kv_indptr`.
@@ -250,7 +270,7 @@ def test_a_shape_the_pool_cannot_place_refuses_its_leaves_and_the_next_is_measur
 ):
     runner = _Runner()
     runner.exit = lambda: runner.batches.append("exit")
-    monkeypatch.setattr(ops, "_runner", lambda config: runner)
+    monkeypatch.setattr(ops, "_runner", lambda config, rank: runner)
     monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda config: None)
 
     def point(self, _rule, shape, context, found):
@@ -319,7 +339,7 @@ def test_a_decode_point_takes_an_integer_affine_in_the_context_at_its_own(
 
     # ATOM's own step at decode B = 2, context 8192 passes its rows' longest
     # context.
-    batch = rule().batch(_line([[1, 8192, True]] * 2))
+    batch = rule(max_model_len=8192).batch(_line([[1, 8192, True]] * 2))
     tables = torch.zeros(2, 8, dtype=torch.int32)
     block_convert.kv_indices_generate_triton(
         tables, tables, tables, 1, batch.context_lens.max()

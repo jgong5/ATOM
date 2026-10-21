@@ -11,6 +11,8 @@ not a sustainable configuration
 `smoke_cell.sh` runs the same path at one concurrency in about an hour, so start
 there (below), then run the full cell.
 
+New to Compass? The `/compass-onboard` skill (`.claude/skills/compass-onboard/`) runs this page with you on your GPU and explains each step from your outputs.
+
 ## Concepts
 
 Compass replaces only ATOM's forward pass. The scheduler, the KV block manager,
@@ -187,9 +189,12 @@ leave. To take a stopped loop again, `rm -rf` the `--out` of the stopped run and
 of any run a Ctrl-C cut short, and loop over only the concurrencies still to
 do, such as `for C in 4 16`: `serve` refuses an `--out` that exists.
 
-`client.sh`'s flags and exit codes are in its header. It sends one warmup request
-per lane before the graded window; keep it, since grading refuses a run whose
-warmup is missing or overlaps its graded steps.
+`client.sh`'s flags and exit codes are in its header. Before the graded window
+it runs aiperf's scenario warmup, the one `calib_capture.sh` runs: for each session
+active at a trajectory's sampled start, its last request before it. At c=16 on
+traces 0 to 255 that is 15 requests, which took 1334 s on one MI308X of
+hjbog-srdc-39 ([#1760](https://github.com/jgong5/ATOM/issues/1760)). Grading
+refuses a run whose warmup is missing or overlaps its graded steps.
 
 ## The path
 
@@ -197,7 +202,8 @@ Times were measured on node 18 for the cell in
 [PR #1336](https://github.com/jgong5/ATOM/pull/1336), at concurrencies 1, 4, 16,
 64 and 256 with a 1800 s benchmark each.
 
-**0. Warm a fresh container** (GPU, once per container; 16 min).
+**0. Warm a fresh container** (GPU, once per container; 15 min as in the smoke
+cell, and a minute more for the build below).
 
 ```bash
 D=600 serve $R/warm 0-7 1 $REAL_PY record --gpu $G
@@ -213,7 +219,8 @@ serves the same record before its calibration, so a container it ran in is
 warm. Success: `serve` returns 0.
 
 **1. Memory readings** (GPU, 2 to 3 min after step 0; 5 min as a fresh
-container's first start, as in the smoke cell).
+container's first start, as in
+[PR #1762](https://github.com/jgong5/ATOM/pull/1762)'s smoke cell at 829cf661a).
 
 ```bash
 compass measure memory --gpu $G $M $S --out $R/memory -- $ATOM
@@ -312,7 +319,7 @@ Reference results: the graded tables of
 ## The smoke cell
 
 `smoke_cell.sh MODEL OUT` runs steps 0 to 6 at c=1 on one GPU, step 1 first:
-step 0's record, one calibration record of traces 256 to 263, two real runs and
+step 0's record, one calibration record of traces 353 to 360, two real runs and
 one simulated run of traces 0 to 7, each client run 600 s. It fits before the
 real runs, so a failed fit costs no more GPU time. Its variables are in its
 header. It may run on a busy node (GPUs are shared), and its real runs count
@@ -325,13 +332,21 @@ GPU=$G MACHINE=$SPEC HARNESS_PYTHON=$SIM_PY AIPERF_PYTHON=$REAL_PY \
 
 It prints each step as it starts, then the grading table, then one line with the
 verdict, the wall time and each run's warmup. It refuses a GPU that is not idle,
-names the step that failed, and exits 1 unless the cell is graded. On node 18,
-in a fresh container, it took 60 min: 5 min for step 1, 13 to 14 min per real
-server, step 0's included, 2 min for the simulated run.
+names the step that failed, and exits 1 unless the cell is graded. At abc5f542f
+on node 18, in a container that held step 0's build, it took 61 min: 2 min for
+step 1, 14 min for calibration, 14 to 15 min per server of traces 0 to 7, step
+0's included, each with one warmup request of 113 s, and 2 min for the simulated
+run; the cell was graded.
 
-On these traces at c=1, no step in the first 600 s batches two requests, in
-calibration or in the cell, so the law has a vector for every step the cell
-takes. Its cost rows all read `unvalidated`, though: `fit steps` marks the
+A law has a decode vector only for the batch sizes its calibration took. At
+`client.sh`'s seed, traces 0 to 7 start mid-session and batch up to 4 requests a
+step; trace 256 starts at a first request and batched none, so the cell was a
+coverage report ([#1832](https://github.com/jgong5/ATOM/issues/1832)), while trace
+353's start reaches its subagents and calibration batched 1 to 7. A higher
+concurrency does not help: aiperf sends each lane's next request at its
+trace-time offset from the lane's start and caps an idle gap only while no lane
+is busy, so at c=4 one lane carried the 600 s. Its cost rows all read
+`unvalidated` too: `fit steps` marks the
 region it validates by holding out each calibration record in turn, so it needs
 two or more, and the smoke cell has one. The smoke cell checks the path, not the
 law's accuracy.
@@ -352,8 +367,9 @@ law's accuracy.
 | `serve: OUT exists; leave a finished run out, rm -rf a stopped one` | a loop taken again over a run it already took | leave a finished concurrency out of the loop; `rm -rf` a stopped or short run's `--out` |
 | `Triton cache error`, or `failed to map segment from shared object` | a `--tmpfs` without `exec` | the container as Environment starts it |
 | grading, a fit or `validate.cost` refuses a record: `aiter ran a JIT build of [...] while its server served` | the container met that kernel variant for the first time inside the record | take the record again, since the container now holds the build; warm a fresh container first (step 0) |
-| verdict `coverage report`, `no decode vector for rung N` | the cell decoded more requests at once than any calibration step did (a rung is the batch's captured-graph size) | calibrate at that concurrency or above; #1336's calibration reached no rung 48, so c=256 stayed a coverage report |
-| grading refuses a run: warmup | the client ran with `--no-warmup`, or its warmup overlapped its graded steps | keep `client.sh`'s default warmup |
+| verdict `coverage report`, `no decode vector for rung N` | no calibration step decoded N requests at once (a rung is the batch's captured-graph size). Concurrency alone does not reach N, since each lane replays from its own sampled start: for Qwen3.8-27B TP1 on one MI308X, calibration at c=16 (traces 256 to 392) decoded at most 7 at once, the graded cell (traces 0 to 255) up to 8 ([#1840](https://github.com/jgong5/ATOM/issues/1840)) | add a calibration record that starts every trajectory at its first turn, at concurrency N, to step 4's records: `calib_capture.sh` with `CELLS=N AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"` (`cctraces_sim.sh`'s header); such records at c=8 and c=14 added rung 8 |
+| grading refuses a run: `its export names no warmup` | no session was in flight at any lane's sampled start, so aiperf sent no warmup request: `artifacts/client_run.json` has an empty `warmup` and `client/aiperf.log` says `nothing to warm`. `client.sh` pins aiperf's seed, so the same traces and concurrency draw the same starts | no run of this cell is graded, since its first steps may be cold, and a fresh run repeats the draw; a higher concurrency adds lanes, each keeping its start; another trace range draws other starts |
+| grading refuses a run: warmup | its warmup overlapped its graded steps | a fresh server and client run |
 | grading refuses a run: fitted on the traces it grades | calibration and cell traces overlap | calibration 256 to 392, cell 0 to 255 |
 | disk full | raw exports keep every prompt, and caches with no tmpfs fill the container's layer | the data directory where Disk puts it, and the container's tmpfs mounts (Environment) |
 

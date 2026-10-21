@@ -25,11 +25,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 from test_backend_step_roofline import ROOFLINE
-from test_dp_step_max import runner
+from test_dp_step_max import prefill, runner
 from test_moe_gather_rows import decode
 
 from atom.compass.backends import BatchView, CostRefused, RequestShape
-from atom.compass.backends.step_roofline import Module, StepRooflineBackend, overlap
+from atom.compass.backends.step_roofline import (
+    Module,
+    StepRooflineBackend,
+    micro_batches,
+    overlap,
+)
 from atom.compass.backends.work import (
     Work,
     activated_experts,
@@ -181,6 +186,55 @@ def test_sparse_attention_and_the_hyper_connection_mix_by_hand(spec):
 
 
 @BOUND
+def test_sparse_attention_over_an_fp8_q_and_without_an_indexer_by_hand(spec):
+    # Window 4, every 3 tokens compressed; Q in fp8 as the KV is.
+    csa = Module("attn", "sparse_attention", (2, 8, 4, 3, 2, 3, 4), "fp8", act="fp8")
+    hca = dataclasses.replace(csa, dims=(2, 8, 4, 3, 0, 0, 0))
+    rows = [(3, 10, False), (1, 7, True)]
+    top = every = scored = 0
+    for q, kv, _ in rows:
+        for p in range(kv - q + 1, kv + 1):
+            top += min(p, 4) + min(p // 3, 2)
+            every += min(p, 4) + p // 3
+            scored += p // 3
+    # The products run at fp8 and Q is read at a byte, O written in bf16. A
+    # layer with no indexer reads every compressed entry: 3 and 2.
+    q = 4 * 2 * 8 * (1 + 2)
+    work = Work({"fp8": 4 * 2 * 8 * top + 2 * 3 * 4 * scored}, q + 12 * 8 + 5 * 4)
+    hca_work = Work({"fp8": 4 * 2 * 8 * every}, q + (7 + 6) * 8)
+
+    assert _price([csa], view(*rows), spec)["roofline.sparse_attention"] == (
+        pytest.approx(_module(work, spec))
+    )
+    assert _price([hca], view(*rows), spec)["roofline.sparse_attention"] == (
+        pytest.approx(_module(hca_work, spec))
+    )
+
+
+@BOUND
+def test_the_fp4_indexer_scores_at_fp4_by_hand(spec):
+    # Window 4, every 3 tokens compressed, the indexer keeping the top 2; Q and
+    # the KV in fp8, the indexer's queries and keys in fp4.
+    attn = Module(
+        "attn", "sparse_attention", (2, 8, 4, 3, 2, 3, 4), "fp8", act="fp8", index="fp4"
+    )
+    rows = [(3, 10, False), (1, 7, True)]
+    keys = scored = 0
+    for q, kv, _ in rows:
+        for p in range(kv - q + 1, kv + 1):
+            keys += min(p, 4) + min(p // 3, 2)
+            scored += p // 3
+    # Q read at a byte, O written in bf16, the window and the top 2 at a byte;
+    # the 3 and 2 index keys at half a byte.
+    work = Work({"fp8": 4 * 2 * 8 * keys}, 4 * 2 * 8 * (1 + 2) + 12 * 8)
+    work += Work({"fp4": 2 * 3 * 4 * scored}, (3 + 2) * 4 / 2)
+
+    assert _price([attn], view(*rows), spec)["roofline.sparse_attention"] == (
+        pytest.approx(_module(work, spec))
+    )
+
+
+@BOUND
 def test_a_split_step_lays_each_layers_micro_batches_on_two_streams(spec):
     layers = []
     for i in range(2):
@@ -255,6 +309,26 @@ def test_the_batch_view_states_the_real_tokens_among_the_gathered_rows():
     view = projection.batch_view(decode(3), mode, r)
 
     assert (view.moe_rows, view.moe_tokens) == (8, 5)
+
+
+def test_a_rank_s_view_names_its_own_slot_of_the_split():
+    # Both ranks prefill 7 tokens; rank 1 splits 3 then 4, rank 0 4 then 3.
+    r = runner(None, dp_size=2, dp_rank=1)
+    r.drafter = None
+    sync = SimpleNamespace(
+        num_tokens_across_dp=torch.tensor([7, 7]), ub_tokens_across_dp=((4, 3), (3, 4))
+    )
+    mode = SimpleNamespace(
+        sync=sync, running_tokens_are_unified=False, use_cudagraph=False
+    )
+    view = projection.batch_view(prefill(7), mode, r)
+
+    assert [h.requests for h in micro_batches(view)] == [
+        (RequestShape(3, 3, False),),
+        (RequestShape(4, 7, False),),
+    ]
+    with pytest.raises(ValueError, match="names no single pair"):
+        micro_batches(dataclasses.replace(view, dp_rank=None))
 
 
 WALK = """
@@ -400,9 +474,10 @@ def test_the_v4_pro_dpa_tp8_build_classifies_every_module(ep, tmp_path):
     assert not [m for m in found if m[0] == "unclassified"]
     assert {layer for *_, layer in walked} == set(range(61)) | {-1}
     assert found[("mhc", (4, 7168), "bf16", "bf16")] == 2 * 61
+    # The fp8 KV cache's kernels take Q in fp8.
     for ratio, top in ((128, (0, 0, 0)), (4, (1024, 64, 128))):
         dims = (128, 512, 128, ratio) + top
-        assert found[("sparse_attention", dims, "fp8", "bf16")] == ratios.count(ratio)
+        assert found[("sparse_attention", dims, "fp8", "fp8")] == ratios.count(ratio)
     moe = (384, 48, 6, 3072) if ep else (384, 384, 6, 384)
     # The experts read fp4 activations, aiter quantizing them in the kernel.
     # An expert holds its fp4 weights and a one-byte scale per 32 of them,
@@ -412,8 +487,49 @@ def test_the_v4_pro_dpa_tp8_build_classifies_every_module(ep, tmp_path):
     assert found[("moe", moe + (7168, 8, 8, 0, held), "fp4", "fp4")] == 61
     # The fp8 linears read fp8 activations; the block's norms run in its mixes.
     assert found[("gemm", (65536, 1536), "fp8", "fp8")] == 61
+    # So does wo_a, which gfx950 runs as an fp8 batched GEMM.
+    assert found[("gemm", (16384, 4096), "fp8", "fp8")] == 61
     assert found[("act", (3072,), "bf16", "bf16")] == 61
     assert found[("norm", (7168,), "bf16", "bf16")] == 1
+
+
+#: The build at the indexer cache format the third argument names, ATOM's
+#: default when it is empty, each module's indexer format in place of its layer.
+INDEX_BUILD = BUILD.replace(
+    'kv_cache_dtype="fp8")',
+    'kv_cache_dtype="fp8", index_cache_dtype=sys.argv[3] or None)',
+).replace("m.act, m.layer]", "m.act, m.index]")
+
+
+@pytest.mark.parametrize(
+    "cache, index", [("", "fp4"), ("fp8", "fp8")], ids=["default", "fp8-cache"]
+)
+def test_the_v4_pro_indexer_scores_at_the_format_atom_runs_it(cache, index, tmp_path):
+    # gfx950 runs the fp4 indexer by default; asked for an fp8 indexer cache,
+    # the fp8 one. A layer without an indexer scores nothing.
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_bytes(CONFIG.read_bytes())
+    done = subprocess.run(
+        [sys.executable, "-c", INDEX_BUILD, "0", str(tmp_path), cache],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=900,
+        cwd=TREE,
+        env={**os.environ, "PYTHONPATH": str(TREE)},
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    found = collections.Counter(
+        (tuple(dims[3:5]), ix)
+        for kind, dims, _, _, ix in json.loads(done.stdout.splitlines()[-1])
+        if kind == "sparse_attention"
+    )
+    ratios = json.loads(CONFIG.read_text())["compress_ratios"][:61]
+
+    assert found == {
+        ((128, 0), "fp8"): ratios.count(128),
+        ((4, 1024), index): ratios.count(4),
+    }
 
 
 #: The build on a declared arch, the third argument.

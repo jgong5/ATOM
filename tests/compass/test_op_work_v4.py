@@ -32,7 +32,7 @@ F32, FP8, FP4 = "torch.float32", "torch.float8_e4m3fn", "torch.float4_e2m1fn_x2"
 E8M0, U8 = "torch.float8_e8m0fnu", "torch.uint8"
 ATTENTION = "aiter.v4_attention_with_output.default"
 MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp."
-DECODE = "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_asm"
+DECODE = "aiter.mla:mla_decode_fwd_v4_nm"
 #: A machine stating an fp4 rate, as gfx950 does: V4-Pro's experts run at it.
 SPEC = machine(fp4_flops=10e15)
 

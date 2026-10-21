@@ -67,7 +67,9 @@ any other, and a law missing either refuses; a list of them is one per engine co
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
 holds at its shape and output, the run's TP width and KV cache format; capture traces
-eager forwards, so a graph-mode run reads the eager graphs too),
+eager forwards, so a graph-mode run reads the eager graphs too; with
+``price_list``, the fields of a `price_list` key ``store`` holds, loaded
+under this run's readings, it prices each leaf from it first),
 ``step_roofline`` (optional, ``true`` or ``false``: with ``true`` a
 `StepRooflineBackend` prices the steps the backend refuses, through
 `StepFallbackBackend`, as it always does under ``step_grid``, from the
@@ -279,7 +281,7 @@ COMPASS_ONLY = {
 }
 #: The run-file key of each backend a flag names (`atom.compass.drive.runfile`).
 STEP_STUB, STEP_LINEAR, STEP_GRID = "step_stub", "step_linear", "step_grid"
-OP_GRAPH = "op_graph"
+OP_GRAPH, PRICE_LIST = "op_graph", "price_list"
 #: The run-file key of the frontend's seconds to prepare one image of a chat request.
 IMAGE_PREPROCESS = "image_preprocess_s"
 #: Run-file keys that were renamed, to their names now.
@@ -1396,8 +1398,17 @@ def runner(model_runner, tree) -> None:
             machine,
             _op_graphs(run["store"], config, machine.value("device.arch")),
             tp=tp,
+            dp=config.parallel_config.data_parallel_size,
             kv=config.kv_cache_dtype,
             padded=padding != "none",
+            split_send_recv=config.enable_expert_parallel
+            and getattr(config, "enable_low_latency", False),
+            price_list=PRICE_LIST in run and _price_list(run, config, machine),
+        )
+    elif PRICE_LIST in run:
+        raise ValueError(
+            "the run file names a price_list and no op_graph, the one backend "
+            "that reads it"
         )
     if fallback or STEP_GRID in run:
         from atom.compass.run.modules import walk
@@ -1479,15 +1490,18 @@ def runner(model_runner, tree) -> None:
 def _op_graphs(root: str, config, arch: str):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or None."""
+    that does not, or None; under DP, at the rows the step's MoE gathers."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
     from atom.compass.capture.forward import Shape, structure
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
+    dp = config.parallel_config.data_parallel_size
 
     @functools.lru_cache(maxsize=64)
-    def graph(phase: str, tokens: int, seqs: int, output: bool = True) -> dict | None:
-        shape = str(Shape(phase, tokens, seqs))
+    def graph(
+        phase: str, tokens: int, seqs: int, output: bool = True, gathered=None
+    ) -> dict | None:
+        shape = str(Shape(phase, tokens, seqs, gathered).at(dp))
         at = structure(config, phase, True, arch, output)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
         if not store.directory_for(key).exists():
@@ -1495,6 +1509,22 @@ def _op_graphs(root: str, config, arch: str):
         return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
 
     return graph
+
+
+def _price_list(run: dict, config, machine):
+    """A `fit.ops.PriceList` of the `price_list` the run file names by its key's
+    fields, loaded from its store under this run's readings, or a refusal naming
+    the reading that differs."""
+    from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind
+    from atom.compass.fit.ops import PriceList
+    from atom.compass.fit.publish import RANK
+    from atom.compass.run.step_grid import conditions
+
+    key = Key.of(Kind.PRICE_LIST, **run[PRICE_LIST])
+    entry = ArtifactStore(run["store"]).load(
+        key, conditions=conditions(config, machine), gates=GateState.of()
+    )
+    return PriceList(json.loads(entry.read_member("params", RANK, "json")))
 
 
 def _graph_pool(model_runner, machine, model):
@@ -1555,15 +1585,16 @@ def tokenizer(tok, config) -> None:
     tok.decode = wrap_decode(tok.decode, entry)
 
 
-def http_intake() -> tuple[float, float] | None:
-    """``(fixed_s, per_byte_s)``, the frontend loop's time to take in one HTTP
-    request, from the run's machine spec; None on a real run or a run file with
-    no machine spec."""
+def http_intake() -> tuple[float, float, float] | None:
+    """``(fixed_s, per_byte_s, idle_s)``, the frontend loop's time to take in one
+    HTTP request, from the run's machine spec, ``fixed_s`` standing for an unstated
+    ``idle_s``; None on a real run or a run file with no machine spec."""
     run = spec()
     if run is None or "machine" not in run:
         return None
     machine, terms = _machine(run), ("fixed_s", "per_byte_s")
-    return tuple(machine.value(f"host.http_intake.{k}") for k in terms)
+    fixed, per_byte = (machine.value(f"host.http_intake.{k}") for k in terms)
+    return fixed, per_byte, machine.values.get("host.http_intake.idle_s", fixed)
 
 
 def _fingerprint(tok) -> str | None:

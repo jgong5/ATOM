@@ -20,7 +20,7 @@ so one call prices every instance of a signature at a view.
 
 Aten operators share one extractor, whose F is `torch.utils.flop_counter`'s
 formula where it has one. A leaf that launches no kernel (a view, an
-allocation, a wait) has no work: None. A collective spans the `tp` ranks of
+allocation, a wait, one whose outputs hold no element) has no work: None. A collective spans the `tp` ranks of
 the tensor-parallel group unless the leaf states its group size. A kind with
 no extractor, or a leaf its extractor cannot price, is refused by name.
 
@@ -42,9 +42,10 @@ from torch.utils.flop_counter import flop_registry
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import BatchView
-from atom.compass.backends.step_roofline import Module
+from atom.compass.backends.step_roofline import Module, _index_scores, _sparse_products
 from atom.compass.backends.step_roofline import _work as module_work
 from atom.compass.backends.work import (
+    ELEMENT_BYTES,
     Collective,
     Work,
     activated_experts,
@@ -226,6 +227,8 @@ def _fused_moe(op, view, tp, kv) -> Work:
     expert's gate-up and down products: an expectation under uniform routing.
     Under expert parallelism `expert_mask` spans every rank's experts, of which
     this rank holds `w1`'s, and it runs the busiest rank's expected share.
+    A DP gather's pad rows (`moe_tokens` real among them) all carry token 0,
+    so they activate experts as one token.
 
     With a nonzero `quant_type` the op quantizes `hidden_states` to the
     weights' format inside it, so both products run at that format; otherwise
@@ -237,7 +240,9 @@ def _fused_moe(op, view, tp, kv) -> Work:
     local, up = args["w1"]["shape"][:2]
     mask = args.get("expert_mask")
     ranks = mask["shape"][0] // local if mask else 1
-    routed, groups = rows * k, activated_experts(local * ranks, k, rows)
+    real = view.moe_tokens
+    distinct = rows if real is None else min(rows, real + 1)
+    routed, groups = rows * k, activated_experts(local * ranks, k, distinct)
     if ranks > 1:
         routed = max_rank_load(rows, k, local * ranks, ranks)
         groups /= ranks
@@ -256,16 +261,17 @@ def _fused_moe(op, view, tp, kv) -> Work:
 def _mori(*payload, dispatch: bool):
     """MORI's dispatch, or its combine back: each of this rank's tokens, its
     `payload` rows, goes to every other rank holding one of its `k` experts.
-    The group is the received buffer's rows over the tokens wide. With the
-    experts split evenly, a rank holds one of a token's experts with chance
-    at least `1 - (1 - 1/N)^k`, whatever the expert count. The step roofline
+    The group is `num_ep_ranks` wide, or, in a graph that does not state it,
+    the received buffer's rows over the tokens. With the experts split evenly,
+    a rank holds one of a token's experts with chance at least
+    `1 - (1 - 1/N)^k`, whatever the expert count. The step roofline
     counts the exchange alone, and so does this."""
 
     def extract(op, view, tp, kv) -> Work:
         args = op["args"]
         tokens, k = args["indices"]["shape"]
         buffer = op["out"][0] if dispatch else args["input"]["shape"]
-        ranks = buffer[0] // tokens
+        ranks = args.get("num_ep_ranks") or buffer[0] // tokens
         row = sum(_bytes(t) / t["shape"][0] for s in payload for t in _tensors(args[s]))
         return all_to_all(ranks, tokens * activated_experts(ranks, 1, k) * row)
 
@@ -360,6 +366,51 @@ def _v4_prefill(op, view, tp, kv) -> Work:
     return Work({_fmt(args["q_nope"]["dtype"]): flops}, moved)
 
 
+def _stated(op, *names) -> list:
+    """What `op` states beside its arguments under `names`."""
+    stated = op.get("stated", {})
+    if missing := [name for name in names if name not in stated]:
+        raise _Unpriced(
+            f"the leaf states no {', '.join(missing)} of its layer, which its "
+            "reads depend on: trace its graph again"
+        )
+    return [stated[name] for name in names]
+
+
+def _v4_decode(q, *slots, out=None):
+    """V4's decode attention: `_only`'s `q`, `slots` and outputs, and the KV
+    entries each row reads at the window, compression ratio and top-k its
+    leaf states, as the step roofline counts them: two products of `q`'s head
+    width per head and entry, at the wider of Q's and the KV cache's formats,
+    and each entry read once at that width in the KV format. The rotary
+    part's products and bytes are left out, which only lowers both."""
+    boundary = _only(q, *slots, out=out)
+
+    def extract(op, view, tp, kv) -> Work:
+        geometry = _stated(op, "window_size", "compress_ratio", "index_topk")
+        x = op["args"][q]
+        _, heads, dim = x["shape"]
+        fmt, rows = _fmt(x["dtype"]), view.requests
+        work = _sparse_products(rows, heads, dim, fmt, kv, *geometry)
+        return boundary(op, view, tp, kv) + work
+
+    return extract
+
+
+def _indexer(op, view, tp, kv) -> Work:
+    """V4's indexer score and top-k: its boundary, and each new query scored
+    against every compressed entry before it at the ratio the leaf states, as
+    the step roofline counts them: one product of the index head width per
+    index head, at fp4 when the leaf takes `q_scale`, else at `q_quant`'s
+    format, and each entry read once at that width and format."""
+    (ratio,) = _stated(op, "compress_ratio")
+    q = op["args"]["q_quant"]
+    fmt = "fp4" if op["args"].get("q_scale") else _fmt(q["dtype"])
+    _, heads, packed = q["shape"]
+    dim = int(packed * _size(q["dtype"]) / ELEMENT_BYTES[fmt])
+    return _boundary(op) + _index_scores(view.requests, ratio, heads, dim, fmt)
+
+
 def _shape(value):
     if isinstance(value, dict) and "dtype" in value:
         return value["shape"]
@@ -420,6 +471,10 @@ MOE = "atom.model_ops.moe:"
 MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp."
 V4_INDICES = "atom.model_ops.v4_kernels.paged_"
 V4 = "atom.model_ops.v4_kernels."
+FLYDSL = "aiter.ops.flydsl.kernels."
+#: V4's compressor: its sources and parameters read once. The KV and score
+#: state rings it reads by slot and the cache rows it writes are left out.
+COMPRESS = _only("kv_in", "score_in", "ape", "rms_weight", "state_slot_mapping")
 #: What V4's fused QK norm and RoPE writes: Q and K, each as its fp8 values
 #: with their scales and its bf16 rotary part.
 QK_OUT = ("q_nope_scale_buff", "q_rope_buff", "k_nope_scale_buff", "k_rope_buff")
@@ -439,6 +494,10 @@ EXTRACTORS = {
     "aiter._fused_qk_norm_rope_group_quant_kernel.default": _only(
         "q", "kv", "k_weight", "positions", *QK_OUT
     ),
+    FLYDSL
+    + "qk_norm_rope_quant:flydsl_qk_norm_rope_quant": _only(
+        "q", "kv", "kv_weight", "q_weight", "positions", "q_out", "kv_out"
+    ),
     "aiter._inverse_rope_group_quant_kernel.default": _only(
         "o", "positions", "x_fp8", "x_scale"
     ),
@@ -446,21 +505,15 @@ EXTRACTORS = {
         "input", "positions", "out", "scale"
     ),
     "aiter.batched_gemm_a8w8_mxscale.default": _batched_gemm,
-    # ponytail: the scores against each row's compressed index entries are
-    # left out; the leaf states neither the index cache nor its compression.
-    "aiter.indexer_score_topk.default": _in_place(),
+    "aiter.indexer_score_topk.default": _indexer,
     "aiter.pa_sparse_prefill_fp8_opus.default": _v4_prefill,
-    # ponytail: decode counts Q, the sink and O only. Its index lists are
-    # sized for the deployment's longest row, and the leaf states no window,
-    # compression or top-k, so the KV each row reads and the products over it
-    # are left out. Count them when a decode leaf states its layer's geometry.
-    "aiter.mla_decode_v4_ps_asm.default": _only("Q", "qrope", "sink", "output"),
-    f"{V4}paged_decode:_sparse_attn_v4_paged_decode_asm": _only(
-        "q_packed_in", "q_rope_in", "attn_sink", out="torch.bfloat16"
+    "aiter.mla_decode_v4_ps_asm.default": _v4_decode("Q", "qrope", "sink", "output"),
+    "aiter.mla:mla_decode_fwd_v4_nm": _v4_decode("q", "qrope", "sink", "output"),
+    f"{V4}paged_decode:_sparse_attn_v4_paged_decode_triton": _v4_decode(
+        "q", "attn_sink"
     ),
-    f"{V4}fused_compress:fused_compress_attn": _only(
-        "kv_in", "score_in", "ape", "rms_weight", "state_slot_mapping"
-    ),
+    FLYDSL + "fused_compress_attn:flydsl_fused_compress_attn": COMPRESS,
+    FLYDSL + "fused_compress_attn_hca:flydsl_hca_compress_attn": COMPRESS,
     # The kernel reads only the kv and score rows write_plan names, at most
     # (1 + overlap) * ratio per sequence, so neither is counted.
     f"{V4}state_writes:update_compressor_states": _only("ape", "state_slot_mapping"),
@@ -483,8 +536,7 @@ EXTRACTORS = {
     V4_INDICES + "decode_indices:build_v4_paged_decode_indptr": _launch,
     V4_INDICES + "decode_indices:write_v4_paged_decode_indices": _launch,
     V4_INDICES + "prefill_indices:write_v4_paged_prefill_indices": _launch,
-    "atom.model_ops.attentions.deepseek_v4_attn:"
-    "DeepseekV4AttentionMetadataBuilder._build_v4_indexer_meta": _launch,
+    FLYDSL + "mqa_logits.pa_mqa_logits_fp4_prefill:compute_prefill_schedule": _launch,
     "aiter.unified_attention_with_output_base.default": _attention,
     "aiter.linear_attention_with_output_base.default": _linear_attention,
     "aiter.silu_and_mul.default": _in_place(),
@@ -499,7 +551,7 @@ EXTRACTORS = {
     "_c10d_functional.wait_tensor.default": lambda op, view, tp, kv: None,
     "atom.model_ops.layernorm:fused_qk_norm": _in_place("q", "k"),
     "atom.model_ops.triton_mrope:try_mrope_qk_fused": _in_place("q", "k"),
-    "atom.model_ops.sampler:_apply_greedy_tokens": _in_place(),
+    "aiter.ops.flydsl.topk.topk_per_row_argmax:topk_per_row_argmax": _in_place(),
     "atom.model_ops.decode_input_ids:fill_deferred_decode_ids": _in_place(),
     "atom.utils.block_convert:kv_indices_generate_triton": _kv_indices,
 }
@@ -515,6 +567,10 @@ def work(op: dict, view: BatchView, tp: int, kv_format: str) -> Work | None:
     if not extract:
         reason = f"no extractor for the op kind {name}"
         raise CostRefused(view, [Refusal(SOURCE, reason)])
+    # Its outputs, an in-place leaf's target among them, hold no element: it
+    # writes nothing, whatever its sources hold.
+    if op["out"] and not any(map(math.prod, op["out"])):
+        return None
     try:
         return extract(op, view, tp, kv_format)
     except _Unpriced as error:

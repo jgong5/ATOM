@@ -203,7 +203,9 @@ class BatchView:
     the caller did not say.
     `tbo_tokens` is the two-batch-overlap split the data-parallel group
     agreed: per micro-batch, each rank's token count. It is None when the
-    step is not split, and on one rank. `image_tokens` counts the scheduled
+    step is not split, and on one rank. `dp_rank` is this rank's slot in the
+    data-parallel group's counts, `tbo_tokens`' among them; None on one rank
+    or when the caller did not say. `image_tokens` counts the scheduled
     tokens whose embedding the step's vision encoder supplies; a backend that
     has no basis for pricing that encoder refuses a step with any.
 
@@ -220,6 +222,7 @@ class BatchView:
     tbo_tokens: tuple[tuple[int, ...], ...] | None = None
     image_tokens: int = 0
     moe_tokens: int | None = None
+    dp_rank: int | None = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
