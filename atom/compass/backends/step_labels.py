@@ -5,7 +5,9 @@ A record is a real run's step record (`steps/dp<r>.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), read as JSON lines. `label` makes each forward
 that is not a dummy run a `Sample`: its batch view, its device label, its host
 labels and its provenance. `step_linear_fit` fits samples and `validate.cost`
-prices them; neither reads a step's stamps.
+prices them; neither reads a step's stamps. Neither takes a record whose
+run.json names `BUILDS`, aiter JIT modules its server built while it served;
+`refusal` says why.
 
 A step's device label is its device busy time, `d_busy_ns`, plus for a decode
 step the device work queued since the previous forward's exit, `d_gap_ns`. A
@@ -34,6 +36,8 @@ such wait; `W_post` from that wait's end to the exit, less the draft copy wait,
 and a middle chunk has none. With an MTP status wait,
 `W_pre` ends at it and `W_inputs` runs from it to the launch. On a later
 pipeline stage, `W_recv` runs from the launch to the receive of its input.
+Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
+pull after the previous exit, and `E_out` from the exit to the pull after it.
 
 `write_table` writes a record's labels beside it, `dp<r>.cost.jsonl`, for
 people: a first line `{"version": TABLE_VERSION}`, then per step `step`,
@@ -44,12 +48,14 @@ the step has none.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 
+from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.shape import BatchView, RequestShape
 
 #: Token copy wait exits whose tightest bound is a step's host clock lead.
@@ -58,6 +64,20 @@ ANCHORS = 32
 CUTS = ("exposed", "mixed", "unsplit")
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
 TABLE_VERSION = 1
+#: run.json's entry naming the aiter JIT modules its server built while it
+#: served (`atom.compass.drive.aiter_jit`); a server that built none has none.
+BUILDS = "aiter_jit_builds"
+
+
+def refusal(run: dict) -> str | None:
+    """Why grading, a fit or `validate.cost` refuses a record whose run.json is
+    `run`, naming the modules of its `BUILDS`; None when it names none."""
+    if builds := run.get(BUILDS):
+        return (
+            f"aiter ran a JIT build of {builds} while its server served, "
+            "so a step may have waited on it"
+        )
+    return None
 
 
 @dataclass(frozen=True)
@@ -126,6 +146,21 @@ def _launch_exposed(lines) -> set[int]:
     return exposed
 
 
+def join_stamps(steps: list[dict], path) -> None:
+    """Put into each step the first stamp of each key in `path` at or after
+    its exit and before the next step's entry."""
+    times = defaultdict(list)
+    for stamps in read_jsonl(path):
+        for key, ns in stamps.items():
+            times[key].append(ns)
+    ends = [s["t_enter_ns"] for s in steps[1:]] + [float("inf")]
+    for step, end in zip(steps, ends):
+        for key, ts in times.items():
+            i = bisect.bisect_left(ts, step["t_exit_ns"])
+            if i < len(ts) and ts[i] < end:
+                step[key] = ts[i]
+
+
 def _shared(step, other) -> bool:
     """Whether two steps' batches hold a request in common."""
     return bool({r[0] for r in step["batch"]} & {r[0] for r in other["batch"]})
@@ -138,7 +173,9 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
     default.
     """
     path = Path(record)
-    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    lines = read_jsonl(path)
+    if (pulls := path.with_suffix(".pulls.jsonl")).exists():
+        join_stamps(lines, pulls)
     steps = [s for s in lines if not s["is_dummy_run"]]
     if not steps or "t_enter_ns" not in steps[0]:
         raise ValueError(
@@ -152,7 +189,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
     exposed = _launch_exposed(lines)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
-    config = json.loads(key.read_text()) if key.exists() else None
+    config = read_json(key) if key.exists() else None
     run = run or digest(record)
     samples, table, prev = [], [], None
     for s in lines:
@@ -190,9 +227,11 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
         if host_kind(view) != "middle":
             d0, d1 = s.get("t_draft_recv_ns", (0, 0))
             host["W_post"] = s["t_exit_ns"] - r1 - (d1 - d0)
+        if "t_pull_ns" in s:
+            host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]
         idle = prev is not None and not _shared(s, prev)
         if prev is not None and not idle:
-            host["E"] = enter - prev["t_exit_ns"]
+            host["E"] = enter - prev.get("t_pull_ns", prev["t_exit_ns"])
         host = {k: v * 1e-9 for k, v in host.items()}
         provenance = {
             "source": "record",
@@ -221,7 +260,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
                 "d_gap_s": None if gap_ns is None else gap_ns * 1e-9,
                 "launch_exposed": s["step"] in exposed,
                 "idle": idle,
-                **{k: host.get(k) for k in (*HOST_SEGMENTS, "W_inputs")},
+                **{k: host.get(k) for k in (*HOST_SEGMENTS, "W_inputs", "E_out")},
                 "label_s": device,
                 "draft_s": draft,
                 "cut": cut,

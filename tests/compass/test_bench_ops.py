@@ -10,6 +10,7 @@ import contextlib
 import dataclasses
 import functools
 import json
+import os
 import pathlib
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -70,6 +71,26 @@ def test_each_leaf_holds_every_instance_s_context_key_and_module_path():
         ],
         "aiter.gemm": [{}],
     }
+
+
+def test_stated_values_part_signatures_and_stating_nothing_keeps_the_key():
+    plain = _leaf("aiter.decode", ("x", _t([2, 8], "activation")))
+    csa, hca = (
+        dataclasses.replace(plain, stated=(("compress_ratio", r), ("index_topk", k)))
+        for r, k in ((4, 1024), (128, None))
+    )
+
+    found = ops.leaves(_graph(plain, csa, hca, layers=1)["region"])
+
+    assert [op.get("stated") for op, _ in found.values()] == [
+        None,
+        {"compress_ratio": 4, "index_topk": 1024},
+        {"compress_ratio": 128, "index_topk": None},
+    ]
+    # The key a leaf stating nothing had before any leaf stated anything.
+    op, _ = next(iter(found.values()))
+    leaf = {"op": "aiter.decode", "args": op["args"], "out": []}
+    assert ops.signature(op) == json.dumps(leaf, sort_keys=True, separators=(",", ":"))
 
 
 LIVE = {
@@ -244,34 +265,64 @@ def test_each_placement_keeps_its_own_forward_context_and_metadata():
         assert snap.context.positions.tolist() == [2 * p] * 2
 
 
-def test_a_shape_the_pool_cannot_place_refuses_its_leaves_and_the_next_is_measured(
-    monkeypatch,
-):
+def _measuring(monkeypatch):
+    """A stand-in runner `measure` builds, a rule that refuses a batch of two
+    rows, and two points of two leaves each: two rows, then four. A leaf times
+    1 ns, with or without a device to time it on."""
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
     runner = _Runner()
     runner.exit = lambda: runner.batches.append("exit")
-    monkeypatch.setattr(ops, "_runner", lambda config: runner)
-    monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda config: None)
 
-    def point(self, _rule, shape, context, found):
-        if shape.seqs == 2:
+    def batch(view, block, slot):
+        if len(view["rows"]) == 2:
             raise ValueError("no room for 2 rows")
-        return [{"shape": str(shape), "leaf": sig} for sig in found]
+        return len(view["rows"]), slot
 
-    monkeypatch.setattr(ops.Stub, "point", point)
+    placed = SimpleNamespace(block_size=16, batch=batch)
+    monkeypatch.setattr(ops, "_runner", lambda config, rank: runner)
+    monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda c: placed)
     x = ("self", _t([2, 3], "activation"))
     found = ops.leaves(
-        _graph(_leaf("aten.add.Tensor", x), _leaf("aten.mul.Tensor", x))["region"]
+        _graph(_leaf("aten.neg.default", x), _leaf("aten.abs.default", x))["region"]
     )
+    return runner, [(decode(2), 20, found), (decode(4), 20, found)]
 
-    got = ops.measure(None, [(decode(2), 20, found), (decode(4), 20, found)], 10_000)
 
-    assert [(r["op"], r["refused"]) for r in got[:2]] == [
-        ("aten.add.Tensor", "ValueError: no room for 2 rows"),
-        ("aten.mul.Tensor", "ValueError: no room for 2 rows"),
+def test_a_shape_the_rule_refuses_refuses_its_leaves_and_the_next_is_measured(
+    monkeypatch, tmp_path
+):
+    runner, todo = _measuring(monkeypatch)
+    journal = tmp_path / "points.jsonl"
+    monkeypatch.setenv(ops.JOURNAL, str(journal))
+
+    got = ops.measure(None, todo, 10_000)
+
+    lines = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert [r.get("refused") for r in lines] == [r.get("refused") for r in got]
+    assert [(r["shape"], r["op"], r.get("refused")) for r in got] == [
+        (str(decode(2)), "aten.neg.default", "ValueError: no room for 2 rows"),
+        (str(decode(2)), "aten.abs.default", "ValueError: no room for 2 rows"),
+        (str(decode(4)), "aten.neg.default", None),
+        (str(decode(4)), "aten.abs.default", None),
     ]
-    assert {r["shape"] for r in got[:2]} == {str(decode(2))}
-    assert got[2:] == [{"shape": str(decode(4)), "leaf": sig} for sig in found]
-    assert runner.batches == ["exit"]
+    assert {b[0] for b in runner.batches[:-1]} == {4}
+    assert runner.batches[-1] == "exit"
+
+
+def test_an_error_in_atom_s_forward_fails_measure_with_that_error(monkeypatch):
+    runner, todo = _measuring(monkeypatch)
+
+    def forward(batch):
+        runner.batches.append(batch)
+        raise ValueError("cannot begin: owner is active")
+
+    runner.forward = forward
+
+    with pytest.raises(ValueError, match="cannot begin: owner is active") as raised:
+        ops.measure(None, todo, 10_000)
+    assert raised.value.__notes__ == [f"measuring {decode(4)} at context 20"]
+    assert runner.batches == [(4, 0), "exit"]
 
 
 class _Launches:
@@ -318,7 +369,7 @@ def test_a_decode_point_takes_an_integer_affine_in_the_context_at_its_own(
 
     # ATOM's own step at decode B = 2, context 8192 passes its rows' longest
     # context.
-    batch = rule().batch(_line([[1, 8192, True]] * 2))
+    batch = rule(max_model_len=8192).batch(_line([[1, 8192, True]] * 2))
     tables = torch.zeros(2, 8, dtype=torch.int32)
     block_convert.kv_indices_generate_triton(
         tables, tables, tables, 1, batch.context_lens.max()
@@ -556,6 +607,38 @@ def test_a_long_call_fills_a_graph_to_graph_ns_and_has_no_warm_graph(
     assert graphs == [calls] * (2 if calls == ops.CALLS else 1)
     assert (record["copies"], record["calls"]) == (copies, calls)
     assert (record["warm_ns"] is None) == (calls < ops.CALLS)
+
+
+def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
+    # Replay i takes i + 1 ms on a stand-in clock; the host idles `REST` of that
+    # after every replay, warmups included, which keeps a leaf off the lower
+    # memory clock it reaches back to back.
+    assert ops.REST > 0
+    clock, slept = [0], []
+
+    class Graph:
+        def replay(self):
+            clock[0] += len(slept) + 1
+
+    class Event:
+        def __init__(self, enable_timing):
+            self.synchronize = lambda: None
+
+        def record(self):
+            self.at = clock[0]
+
+        def elapsed_time(self, end):
+            return end.at - self.at
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(ops.time, "sleep", slept.append)
+
+    ops._replay(lambda: None, [({}, fctx._forward_context)])
+
+    replays = range(ops.WARMUPS + ops.REPEATS)
+    assert slept == [(i + 1) * ops.REST / 1e3 for i in replays]
 
 
 def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(
@@ -832,3 +915,16 @@ def test_a_measured_point_is_keyed_by_the_spec_of_the_platform_it_ran_on(
         at.token(),
         key("decode B=2", 9, "b").token(),
     ]
+
+
+def test_the_capture_child_starts_with_every_gpu_hidden_below_hip(monkeypatch):
+    # The capture sets HIP_VISIBLE_DEVICES itself, so only ROCm's own mask
+    # keeps it off every GPU.
+    started = {}
+    monkeypatch.setattr(ops, "_child", lambda fn, argv: started.update(os.environ))
+    monkeypatch.setattr("atom.compass.capture.forward.device_arch", lambda: "gfx942")
+    config = SimpleNamespace(model="m", tensor_parallel_size=1)
+
+    ops._capture(config, [decode(4)], "store")
+
+    assert started["ROCR_VISIBLE_DEVICES"] == ""

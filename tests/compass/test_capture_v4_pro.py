@@ -37,7 +37,13 @@ DP = 8
 MOE = "atom.model_ops.moe"
 MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp"
 V4 = "atom.model_ops.v4_kernels."
-DECODE = V4 + "paged_decode:_sparse_attn_v4_paged_decode_asm"
+DECODE = "aiter.mla:mla_decode_fwd_v4_nm"
+PS_DECODE = "aiter.mla_decode_v4_ps_asm.default"
+INDEXER = "aiter.indexer_score_topk.default"
+#: The bf16 KV cache's decode leaf, a Triton launch lifted to its function.
+BF16_DECODE = (
+    "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
+)
 #: The attention's core kernel, one a layer, by phase.
 CORE = {"decode": DECODE, "prefill": "aiter.pa_sparse_prefill_fp8_opus.default"}
 
@@ -141,13 +147,15 @@ def test_each_layer_runs_its_shared_expert_beside_the_moe_on_every_rank_s_rows(
                 f"{MORI}.dispatch",
                 f"{MORI}.combine",
             ]
-            # Each names MORI's method, and its slots are that method's parameters.
+            # Each names MORI's method, and its slots are that method's parameters
+            # and the EP width its handle was built for.
             for op in exchanged:
                 module, _, qualname = op["op"].partition(":")
                 fn = functools.reduce(
                     getattr, qualname.split("."), importlib.import_module(module)
                 )
-                assert set(op["args"]) <= set(inspect.signature(fn).parameters)
+                params = set(inspect.signature(fn).parameters)
+                assert set(op["args"]) <= params | {"num_ep_ranks"}
         else:
             assert {op["op"].split(":")[0] for op in exchanged} == {MOE}
         # In: this rank's rows. Out of the dispatch or gather: every rank's.
@@ -194,25 +202,60 @@ def test_a_lifted_function_holds_a_mapping_and_a_host_object(tmp_path_factory):
         if op["op"].endswith("paged_decode_indices:write_v4_paged_decode_indices")
     ]
     assert write["kind"] == "opaque_leaf"
-    assert write["args"]["geometry"] == "<UnifiedPoolGeometry>"
+    # Each object as pickle reduces it: its class and its attributes.
+    geometry = write["args"]["geometry"]
+    assert geometry["object"].endswith(":UnifiedPoolGeometry")
+    classes = dict(geometry["state"])["classes"]
+    assert classes["object"] == "builtins:dict"
+    assert all(c["object"].endswith(":ClassLayout") for _, c in classes["state"])
     rows = write["args"]["dest_rows"]
-    assert rows and all(isinstance(k, int) and "shape" in t for k, t in rows)
+    assert rows["object"] == "builtins:dict"
+    assert all(isinstance(k, int) and "shape" in t for k, t in rows["state"])
 
 
-def test_two_attention_functions_are_leaves_at_their_call(tmp_path_factory):
+def test_the_attention_s_leaves_are_the_functions_that_launch_its_kernels(
+    tmp_path_factory,
+):
     graph, _ = capture(tmp_path_factory, SHAPES + DPA_TP8)["decode B=2"]
 
     ops = _ops(graph["region"])
     names = {op["op"] for op in ops}
-    assert V4 + "fused_compress:fused_compress_attn" in names
-    # The aiter kernel the decode function dispatches is folded into it.
+    flydsl = "aiter.ops.flydsl.kernels.fused_compress_attn"
+    assert {
+        f"{flydsl}:flydsl_fused_compress_attn",
+        f"{flydsl}_hca:flydsl_hca_compress_attn",
+    } <= names
+    assert V4 + "fused_compress:fused_compress_attn" not in names
+    # The asm kernel the decode leaf dispatches beside its Triton reduce is
+    # folded into it.
     assert "aiter.mla_decode_v4_asm.default" not in names
     for op in ops:
         if op["op"] == DECODE:
             assert op["kind"] == "opaque_leaf"
-            # As called: the function trims it to the step's rows before its
-            # launches.
-            assert op["args"]["split_indptr"]["shape"][0] > 2 + 1
+            # As ATOM's caller passed it, trimmed to the step's rows.
+            assert op["args"]["split_indptr"]["shape"] == [2 + 1]
+
+
+def test_the_decode_and_indexer_leaves_alone_state_their_layer_s_geometry(
+    tmp_path_factory,
+):
+    config = json.loads(CONFIG.read_text())
+    graphs = capture(tmp_path_factory, SHAPES + DPA_TP8)
+
+    for graph, _ in graphs.values():
+        stating = {op["op"] for op in _ops(graph["region"]) if "stated" in op}
+        assert stating <= {DECODE, PS_DECODE, INDEXER}
+    layers = _decoder(graphs["decode B=2"][0])
+    for layer, ratio in zip(layers, config["compress_ratios"], strict=False):
+        top = config["index_topk"] if ratio == 4 else None
+        window = config["sliding_window"]
+        geometry = {"window_size": window, "compress_ratio": ratio, "index_topk": top}
+        stated = {op["op"]: op["stated"] for op in layer if "stated" in op}
+        assert stated.keys() & {DECODE, PS_DECODE}
+        assert stated == {
+            **{kind: geometry for kind in stated.keys() - {INDEXER}},
+            **({INDEXER: {"compress_ratio": 4}} if ratio == 4 else {}),
+        }
 
 
 def test_tp8_without_dp_attention_reduces_in_each_layer_and_declares_nothing(
@@ -258,36 +301,41 @@ def test_the_attention_body_runs_as_a_real_step_then_the_batch_is_dummy_again(
     from atom.compass.capture.forward import _v4_attention
     from atom.utils.forward_context import Context, get_forward_context
 
-    def fused_compress_attn():
-        pass
-
-    def _sparse_attn_v4_paged_decode_asm():
-        pass
-
-    # The model and its kernels import aiter, which needs a device arch: they
-    # are stood in for, and so is the op the model registers.
-    decode = types.SimpleNamespace(
-        _sparse_attn_v4_paged_decode_asm=_sparse_attn_v4_paged_decode_asm
-    )
-    kernels = types.SimpleNamespace(paged_decode=decode)
-    monkeypatch.setitem(sys.modules, "atom.model_ops.v4_kernels", kernels)
+    # The model imports aiter, which needs a device arch: it is stood in for,
+    # and so is the op it registers.
     monkeypatch.setattr(torch.ops.aiter, "v4_attention_with_output", None, False)
     context = Context(positions=None, is_dummy_run=True)
     monkeypatch.setattr(get_forward_context(), "context", context)
+    indexer = types.SimpleNamespace(index_topk=512)
+    layers = {
+        "returns": types.SimpleNamespace(
+            window_size=64, compress_ratio=4, indexer=indexer
+        ),
+        "raises": types.SimpleNamespace(
+            window_size=64, compress_ratio=128, indexer=None
+        ),
+    }
+    recorder = types.SimpleNamespace(contexts=layers, stated={})
     seen = []
 
     def attention(x, positions, layer_name):
-        seen.append(context.is_dummy_run)
+        stated = {kind: dict(values) for kind, values in recorder.stated.items()}
+        seen.append((context.is_dummy_run, stated))
         if layer_name == "raises":
             raise RuntimeError(layer_name)
 
-    v4 = types.SimpleNamespace(
-        v4_attention_with_output=attention, fused_compress_attn=fused_compress_attn
-    )
-    with _v4_attention(v4, recorder=None):
+    v4 = types.SimpleNamespace(v4_attention_with_output=attention)
+    with _v4_attention(v4, recorder=recorder):
         torch.ops.aiter.v4_attention_with_output(None, None, "returns")
-        assert context.is_dummy_run
+        assert context.is_dummy_run and recorder.stated == {}
         with pytest.raises(RuntimeError):
             torch.ops.aiter.v4_attention_with_output(None, None, "raises")
-        assert context.is_dummy_run
-    assert seen == [False, False]
+        assert context.is_dummy_run and recorder.stated == {}
+
+    def stated(ratio, top):
+        geometry = {"window_size": 64, "compress_ratio": ratio, "index_topk": top}
+        ratio = {"compress_ratio": ratio}
+        decodes = (DECODE, BF16_DECODE, PS_DECODE)
+        return {**dict.fromkeys(decodes, geometry), INDEXER: ratio}
+
+    assert seen == [(False, stated(4, 512)), (False, stated(128, None))]

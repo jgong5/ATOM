@@ -66,8 +66,10 @@ its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, and a law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
-holds at its shape and output, the run's TP width and KV cache format; capture traces
-eager forwards, so a graph-mode run reads the eager graphs too),
+holds at its shape and output, the run's TP and EP widths and KV cache format; capture traces
+eager forwards, so a graph-mode run reads the eager graphs too; with
+``price_list``, the fields of a `price_list` key ``store`` holds, loaded
+under this run's readings, it prices each leaf from it first),
 ``step_roofline`` (optional, ``true`` or ``false``: with ``true`` a
 `StepRooflineBackend` prices the steps the backend refuses, through
 `StepFallbackBackend`, as it always does under ``step_grid``, from the
@@ -279,7 +281,7 @@ COMPASS_ONLY = {
 }
 #: The run-file key of each backend a flag names (`atom.compass.drive.runfile`).
 STEP_STUB, STEP_LINEAR, STEP_GRID = "step_stub", "step_linear", "step_grid"
-OP_GRAPH = "op_graph"
+OP_GRAPH, PRICE_LIST = "op_graph", "price_list"
 #: The run-file key of the frontend's seconds to prepare one image of a chat request.
 IMAGE_PREPROCESS = "image_preprocess_s"
 #: Run-file keys that were renamed, to their names now.
@@ -378,11 +380,12 @@ def _check_host(path, host: dict) -> None:
         FORWARD_KINDS,
         HOST_SEGMENTS,
         MTP_SEGMENT,
+        OUT_SEGMENT,
         PP_RECV_SEGMENT,
     )
 
     laws = host.get("laws", {})
-    segments = (*HOST_SEGMENTS, MTP_SEGMENT, PP_RECV_SEGMENT)
+    segments = (*HOST_SEGMENTS, MTP_SEGMENT, PP_RECV_SEGMENT, OUT_SEGMENT)
     if (
         set(host) - {"laws", "skip", "key"}
         or set(host.get("skip", ())) - set(segments)
@@ -1287,18 +1290,12 @@ def runner(model_runner, tree) -> None:
         law = run[STEP_LINEAR]
         backend = StepLinearBackend(StepLinearLaw(law), dp)
         if "engine_config" in law:
-            from atom.compass.run.step_grid import keyed
+            from atom.compass.run.step_grid import differ, keyed
 
-            fitted = law["engine_config"]
-            differ = [
-                f"{name} {fitted.get(name)!r} in the law and {value!r} here"
-                for name, value in keyed(config).items()
-                if fitted.get(name) != value
-            ]
-            if differ:
+            if named := differ(law["engine_config"], keyed(config), "the law"):
                 raise ValueError(
                     "the step linear law was fitted under another engine "
-                    "config: " + "; ".join(differ)
+                    "config: " + "; ".join(named)
                 )
         else:
             raise ValueError(
@@ -1390,14 +1387,24 @@ def runner(model_runner, tree) -> None:
                 f"the run file's op_graph is {run[OP_GRAPH]!r}; it is true, which "
                 "prices each step from the op_graph the store holds at its shape"
             )
-        from atom.compass.backends.op_graph import OpGraphBackend
-
-        backend = OpGraphBackend(
+        backend = op_graph(
+            run,
+            config,
             machine,
-            _op_graphs(run["store"], config, machine.value("device.arch")),
-            tp=tp,
-            kv=config.kv_cache_dtype,
-            padded=padding != "none",
+            # The EP width as ATOM's MoE resolves it, 1 when it does not shard.
+            ep=next(
+                (
+                    m.moe_parallel_config.ep_size
+                    for m in tree.modules()
+                    if hasattr(m, "moe_parallel_config")
+                ),
+                1,
+            ),
+        )
+    elif PRICE_LIST in run:
+        raise ValueError(
+            "the run file names a price_list and no op_graph, the one backend "
+            "that reads it"
         )
     if fallback or STEP_GRID in run:
         from atom.compass.run.modules import walk
@@ -1476,25 +1483,67 @@ def runner(model_runner, tree) -> None:
         model_runner.compass_step_grid = {**bundle, "describe": backend.describe()}
 
 
+def op_graph(run: dict, config, machine, ep: int = 1):
+    """The `OpGraphBackend` the run file `run` names for `config` on
+    `machine` at EP width `ep`, with its price list when it names one."""
+    from atom.compass.backends.op_graph import OpGraphBackend
+
+    drafter = getattr(config, "speculative_config", None)
+    return OpGraphBackend(
+        machine,
+        _op_graphs(run["store"], config, machine.value("device.arch")),
+        tp=config.tensor_parallel_size,
+        ep=ep,
+        dp=config.parallel_config.data_parallel_size,
+        kv=config.kv_cache_dtype,
+        padded=run.get("padding", "executed") != "none",
+        split_send_recv=config.enable_expert_parallel
+        and getattr(config, "enable_low_latency", False),
+        price_list=PRICE_LIST in run and _price_list(run, config, machine),
+        drafts=drafter.num_speculative_tokens if drafter else 0,
+    )
+
+
 def _op_graphs(root: str, config, arch: str):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or None."""
+    that does not, or of its drafter's part (`draft`), or when it holds none
+    `forward.missed`'s text, None for no text; under DP, at the rows the
+    step's MoE gathers."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
-    from atom.compass.capture.forward import Shape, structure
+    from atom.compass.capture.forward import Shape, missed, structure
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
+    dp = config.parallel_config.data_parallel_size
 
     @functools.lru_cache(maxsize=64)
-    def graph(phase: str, tokens: int, seqs: int, output: bool = True) -> dict | None:
-        shape = str(Shape(phase, tokens, seqs))
-        at = structure(config, phase, True, arch, output)
+    def graph(
+        phase: str, tokens: int, seqs: int, output=True, gathered=None, draft=False
+    ) -> dict | str | None:
+        shape = str(Shape(phase, tokens, seqs, gathered).at(dp))
+        at = structure(config, phase, True, arch, output, draft)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
         if not store.directory_for(key).exists():
-            return None
+            return missed(store, key) or None
         return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
 
     return graph
+
+
+def _price_list(run: dict, config, machine):
+    """A `fit.ops.PriceList` of the `price_list` the run file names by its key's
+    fields, loaded from its store under this run's readings, or a refusal naming
+    the reading that differs."""
+    from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind
+    from atom.compass.fit.ops import PriceList
+    from atom.compass.run.step_grid import conditions
+
+    key = Key.of(Kind.PRICE_LIST, **run[PRICE_LIST])
+    entry = ArtifactStore(run["store"]).load(
+        key, conditions=conditions(config, machine), gates=GateState.of()
+    )
+    rank = entry.topology.ranks()[0]
+    return PriceList(json.loads(entry.read_member("params", rank, "json")))
 
 
 def _graph_pool(model_runner, machine, model):
@@ -1555,15 +1604,16 @@ def tokenizer(tok, config) -> None:
     tok.decode = wrap_decode(tok.decode, entry)
 
 
-def http_intake() -> tuple[float, float] | None:
-    """``(fixed_s, per_byte_s)``, the frontend loop's time to take in one HTTP
-    request, from the run's machine spec; None on a real run or a run file with
-    no machine spec."""
+def http_intake() -> tuple[float, float, float] | None:
+    """``(fixed_s, per_byte_s, idle_s)``, the frontend loop's time to take in one
+    HTTP request, from the run's machine spec, ``fixed_s`` standing for an unstated
+    ``idle_s``; None on a real run or a run file with no machine spec."""
     run = spec()
     if run is None or "machine" not in run:
         return None
     machine, terms = _machine(run), ("fixed_s", "per_byte_s")
-    return tuple(machine.value(f"host.http_intake.{k}") for k in terms)
+    fixed, per_byte = (machine.value(f"host.http_intake.{k}") for k in terms)
+    return fixed, per_byte, machine.values.get("host.http_intake.idle_s", fixed)
 
 
 def _fingerprint(tok) -> str | None:

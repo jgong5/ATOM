@@ -27,6 +27,7 @@ import json
 from typing import NamedTuple
 
 from atom.compass import ir
+from atom.compass.ir.nodes import Reduced
 
 #: The placeholder a recorded key writes its own layer's number as.
 LAYER = "L"
@@ -215,8 +216,10 @@ def to_json(graph: ir.Graph) -> str:
 
 
 def _arg(value):
-    """An argument as JSON: a tensor, module, context key or integer affine in
-    the context as an object."""
+    """An argument as JSON: a tensor, module, context key, integer affine in
+    the context or reduced object as an object."""
+    if isinstance(value, Reduced):
+        return {"object": value.cls, "state": _arg(value.state)}
     if isinstance(value, ir.Affine):
         return {"affine": [value.slope, value.intercept]}
     if isinstance(value, ir.Tensor):
@@ -236,6 +239,7 @@ def _arg(value):
 
 def _json(region):
     if isinstance(region, ir.Op):
+        stated = {name: _arg(value) for name, value in region.stated}
         return {
             "op": region.name,
             "kind": region.kind.value,
@@ -243,7 +247,7 @@ def _json(region):
             "out": [list(s) for s in region.out_shapes],
             "stream": region.stream_id,
             "context": region.context_ref and region.context_ref.key,
-        }
+        } | ({"stated": stated} if stated else {})
     if isinstance(region, ir.Seq):
         return {"seq": [_json(item) for item in region.items]}
     if isinstance(region, ir.Par):

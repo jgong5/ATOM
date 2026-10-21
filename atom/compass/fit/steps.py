@@ -30,7 +30,8 @@ states, as `measure steps` plans, and reads each planned point's
 whichever replay or plan measured it; a planned point the store does not hold
 refuses, naming each, and no other measurement is read as a point. Its targets
 are records and the tokens of `measure steps`' replayed batches (`TARGET`); a
-planned point named as one refuses. `step_grid_fit.bundle` fits the bundle,
+planned point named as one refuses, and a ragged one (`measure steps
+--ragged`) fits the decode lookup's alpha, not the residual. `step_grid_fit.bundle` fits the bundle,
 keyed by the grid definition's digest; `--seed` fixes its held-out split. The
 report's provenance names each target run with every trace it served, and the
 plan with the `--grid` inputs it read and the traces their lines served.
@@ -90,7 +91,7 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
             {f: config[f] for f in fields},
             engine,
             sampling,
-            {k: line[k] for k in measure.VIEW},
+            measure.view_of(line),
         )
         for line in planned["lines"]
     ]

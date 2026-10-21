@@ -81,6 +81,9 @@ own `gh` login. Ownership is the assignee:
 
 ## Project rules
 
+- **`atom-issue` is not claimable.** An issue labelled `atom-issue` is a
+  defect or inefficiency in ATOM itself, which Compass does not model; ATOM's
+  side fixes it. A `run` never claims, briefs or develops one.
 - **Few ATOM hook points.** Hook Compass into ATOM at the fewest points (a
   factory, a constructor, or a bootstrap patch applied only when Compass is
   on), never with per-use-site wrappers in ATOM's engine or frontend files.

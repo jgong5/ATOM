@@ -10,11 +10,16 @@ them the same way for every line:
 - Rows keep the line's order, and are all prefill or all decode: ATOM's
   runner runs a batch holding prefill tokens over its prefill rows alone, and
   its scheduler builds no batch that mixes the two.
+- No row holds more than `max_model_len` tokens: ATOM's scheduler admits no
+  such request, and its runner's block tables have no room for one.
 - Each row is a new request, numbered by `Sequence`'s own counter, so no two
   replays share a request.
 - Row i holds `ceil(context / block_size)` KV blocks, contiguous, from a fresh
   pool: row 0 starts at block 0, or the block `batch` is given, and each row
-  starts where the one before ended.
+  starts where the one before ended. A line stating `shared`, n, has every
+  row's first n blocks be the same n blocks, ahead of the rows' own, as a
+  prefix cache shares them: they hold cached tokens alone, so n is at most
+  the full blocks each row's cached context fills.
 - Every token of row i is the filler id `DeferredTokenStream` reports for a
   request numbered i, out of the ids `filler_token_ids` keeps for the model's
   tokenizer, as the simulated runner keeps them.
@@ -66,6 +71,7 @@ class ReplayRule:
             )
         self.block_size = config.kv_cache_block_size
         self.num_blocks = config.num_kvcache_blocks
+        self.max_model_len = config.max_model_len
         self.stateful = (
             config.hf_config.model_type
             in InputOutputProcessor._per_req_cache_model_types()
@@ -86,7 +92,22 @@ class ReplayRule:
                 f"rows {rows} decode more than one token in a row, a speculative "
                 "step, which this rule does not build"
             )
+        longest = max(context for _, context, _ in rows)
+        if longest > self.max_model_len:
+            raise ValueError(
+                f"rows {rows} hold a row of {longest} tokens, past max_model_len "
+                f"{self.max_model_len}"
+            )
         final = bool(line["produces_output"])
+        shared = line.get("shared", 0)
+        full = min((context - query) // self.block_size for query, context, _ in rows)
+        if type(shared) is not int or not 0 <= shared <= full:
+            raise ValueError(
+                f"rows {rows} share {shared!r} KV blocks, and the shortest "
+                f"cached context among them fills {full}"
+            )
+        prefix = list(range(block, block + shared))
+        block += shared
         seqs = {}
         for i, (query, context, _) in enumerate(rows):
             filler = self.fillers[i % len(self.fillers)]
@@ -98,8 +119,9 @@ class ReplayRule:
             )
             seq.type = SequenceType.DECODE if decode else SequenceType.PREFILL
             seq.num_cached_tokens = context - query
-            seq.block_table = new_block_table(range(block, block + seq.num_blocks))
-            block += seq.num_blocks
+            own = seq.num_blocks - shared
+            seq.block_table = new_block_table([*prefix, *range(block, block + own)])
+            block += own
             if self.stateful:
                 seq.state_slots = [slot + i]
             seqs[seq.id] = seq

@@ -16,25 +16,34 @@ the model's parameters, buffers and tensor attributes are weights, what
 after it allocated is an activation, and anything else (the runner's buffers,
 what its input preparation allocated) is metadata.
 
-A raw Triton or FlyDSL launch lifts to its innermost ATOM function: one leaf,
-that function by its module and name, its parameters as the arguments, with
-what else the function dispatched folded in. A function that reassigned a
-parameter before the launch, or that dispatched a leaf of its own other than a
-host query (`HOST_QUERIES`), is refused by name.
+A raw Triton or FlyDSL launch lifts to the function that issues it
+(`_Recorder`): one leaf, that function by its module and name, its parameters at
+call entry as the arguments, with whatever else the call ran folded in. An
+argument that is an attribute of the runner is a `ModuleRef` `runner.<attr>`;
+any other object is held as pickle reduces it (`ir.nodes.Reduced`), or refused
+by its type.
 
 The engine is ATOM's own `Config` for ATOM's engine arguments, on a declared
-device of one arch. Under DP the capture runs one rank and every peer runs its
-shape (`peers`).
+device of one arch. Under DP the capture runs one rank, and its peers the rest of
+the rows the group's MoE gathers (`peers`).
+
+Under a drafter a decode row verifies the drafter's tokens, a real step's
+batch so the rejection sampler runs, and a step that samples is cut where ATOM
+records `forward_done_event`: the target's work before it, the drafter's after
+it (its passes, the shared embedding and LM head among them), each its own
+graph. A block drafter writes its draft KV before the cut and is refused.
 """
 
-import ast
 import contextlib
+import copyreg
 import dataclasses
+import enum
+import importlib
 import inspect
+import json
 import pathlib
 import re
 import sys
-import textwrap
 from typing import NamedTuple
 from unittest.mock import patch
 
@@ -47,6 +56,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 import atom
 from atom.compass import ir
+from atom.compass.ir.nodes import Reduced
 
 from . import driverless, peers
 from .graph import LAYER, Fork, Join, Traced, _json, build
@@ -63,26 +73,42 @@ TORCH_NAMESPACES = ("aten", "prim", "prims", "_c10d_functional", "c10d")
 #: ATOM's H2D publication copies the runner's host-staged inputs to the device:
 #: input preparation, not the step's device work, so its copies are left out.
 H2D = "atom/utils/h2d.py"
-#: Host queries a lifted function may dispatch: they launch nothing.
-HOST_QUERIES = ("aiter.get_gfx_custom_op.default",)
 #: Operators that ask a fake tensor where it is and run nothing on a device.
 UNDISPATCHED = ("profiler.", "prim.device")
+#: DeepSeek-V4's decode attention leaves: the fp8 KV cache's, the bf16 one's and the
+#: persistent kernel; and its indexer's score and top-k.
+V4_DECODES = (
+    "aiter.mla:mla_decode_fwd_v4_nm",
+    "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton",
+    "aiter.mla_decode_v4_ps_asm.default",
+)
+V4_INDEXER = "aiter.indexer_score_topk.default"
+#: Where a drafter's step ends its target's work: ATOM records `forward_done_event`.
+CUT = "forward_done_event"
 
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
 
 
 class Shape(NamedTuple):
-    """A step's shape: `tokens` query tokens over `seqs` sequences."""
+    """A step's shape: `tokens` query tokens over `seqs` sequences, and under DP
+    `gathered`, the rows the group's MoE gathers, None at every rank's `tokens`."""
 
     phase: str  # "decode" or "prefill"
     tokens: int
     seqs: int
+    gathered: int | None = None
 
     def __str__(self) -> str:
-        if self.phase == "prefill":
-            return f"prefill T={self.tokens} B={self.seqs}"
-        return f"decode B={self.seqs}"
+        text = f"prefill T={self.tokens} B={self.seqs}"
+        text = text if self.phase == "prefill" else f"decode B={self.seqs}"
+        return text if self.gathered is None else f"{text} G={self.gathered}"
+
+    def at(self, dp: int) -> "Shape":
+        """This shape in a DP group of `dp`: `gathered` only off `dp x tokens`."""
+        return (
+            self._replace(gathered=None) if self.gathered == dp * self.tokens else self
+        )
 
 
 def decode(width: int) -> Shape:
@@ -91,13 +117,18 @@ def decode(width: int) -> Shape:
     return Shape("decode", width, width)
 
 
-def prefill(tokens: int, seqs: int) -> Shape:
+def prefill(tokens: int, seqs: int, gathered: int | None = None) -> Shape:
     if not 1 <= seqs <= tokens:
         raise ValueError(
             f"a prefill of {tokens} tokens over {seqs} sequences: each sequence "
             "takes at least one token"
         )
-    return Shape("prefill", tokens, seqs)
+    if gathered is not None and gathered < tokens:
+        raise ValueError(
+            f"a prefill of {tokens} tokens whose MoE gathers {gathered} rows: the "
+            "gather holds this rank's"
+        )
+    return Shape("prefill", tokens, seqs, gathered)
 
 
 def device_arch() -> str:
@@ -111,22 +142,63 @@ def structure(
     eager: bool | None = None,
     device: str | None = None,
     output: bool = True,
+    draft: bool = False,
 ) -> str:
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
-    architecture, the config.json digest, the TP width, the DP width and the EP
-    group's when they are set, the phase and the mode, `config`'s unless `eager`
-    names it, the arch of `device`, else `device_arch()`, and ``no output``
-    unless the step produces output (`output`)."""
+    architecture, the config.json digest, the arch of `device`, else
+    `device_arch()`, the engine config a step law is keyed by less its ladder
+    (`run.step_grid.keyed`), which names every variable that picks a kernel and
+    a drafter's method and width, the TP width, the DP width and the EP group's
+    when they are set, the phase and the mode, `config`'s unless `eager` names
+    it, ``no output`` unless the step produces output (`output`), and ``draft``
+    for the drafter's part of the step (`draft`)."""
     from atom.compass.run import _file_digest
+    from atom.compass.run.step_grid import keyed
 
     digest = _file_digest(config.model, "config.json")
+    engine = keyed(config, ladder=False)
+    engine = json.dumps(engine, sort_keys=True, separators=(",", ":"))
     mode = "eager" if (config.enforce_eager if eager is None else eager) else "graph"
-    arch = config.hf_config.architectures[0]
+    arch, device = config.hf_config.architectures[0], device or device_arch()
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     widths = f"tp={tp}" + (f" dp={dp}" if dp > 1 else "")
     widths += f" ep={tp * dp}" if config.enable_expert_parallel else ""
-    key = f"{arch} {device or device_arch()} {digest} {widths} {phase} {mode}"
-    return key if output else f"{key} no output"
+    key = f"{arch} {device} {digest} {engine} {widths} {phase} {mode}"
+    key = key if output else f"{key} no output"
+    return f"{key} draft" if draft else key
+
+
+def _engine(text: str):
+    """A structure's `text` before its engine config, the config, and the text
+    after; None for a structure that states none."""
+    head = " ".join(text.split(" ", 3)[:3])
+    try:
+        engine, end = json.JSONDecoder().raw_decode(text, len(head) + 1)
+    except ValueError:
+        return None
+    return isinstance(engine, dict) and (head, engine, text[end:])
+
+
+def missed(store, key) -> str:
+    """For an `op_graph` `key` `store` holds no entry at, each engine field
+    (`step_grid.differ`) in which a graph it holds at the key's shape and
+    otherwise the key's structure differs, as text; "" when it holds none."""
+    from atom.compass.artifacts.store import ENTRY_FILE
+    from atom.compass.run.step_grid import differ
+
+    head, here, tail = _engine(key.values["structure"])
+    named = []
+    for path in sorted((store.root / key.kind.value).glob(f"[!.]*/{ENTRY_FILE}")):
+        there = json.loads(path.read_bytes())["key"]
+        if there.get("shape") == key.values["shape"]:
+            at = _engine(there.get("structure", ""))
+            if at and (at[0], at[2]) == (head, tail):
+                named.append(", ".join(differ(at[1], here, "the graph")))
+    return "".join(
+        f"; a graph the store holds at this shape and structure differs in engine "
+        f"config: {n}"
+        for n in named
+    )
 
 
 def _atom_frames():
@@ -146,7 +218,8 @@ def _atom_frames():
 
 
 def _where(frame) -> str:
-    path = pathlib.Path(frame.f_code.co_filename).relative_to(_ROOT)
+    path = pathlib.Path(frame.f_code.co_filename)
+    path = path.relative_to(_ROOT) if path.is_relative_to(_ROOT) else path
     return f"{path}:{frame.f_lineno} in {frame.f_code.co_qualname}"
 
 
@@ -154,20 +227,61 @@ def _storage(tensor) -> StorageWeakRef:
     return StorageWeakRef(tensor.untyped_storage())
 
 
-def _reassigned(frame, names) -> list[str]:
-    """The parameters `frame`'s function stores to before its current line."""
-    lines, first = inspect.getsourcelines(frame.f_code)
-    tree = ast.parse(textwrap.dedent("".join(lines)))
-    return sorted(
-        {
-            node.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Name)
-            and isinstance(node.ctx, ast.Store)
-            and node.id in names
-            and node.lineno + first - 1 < frame.f_lineno
-        }
-    )
+def _params(code) -> tuple[str, ...]:
+    """A function's parameters, by name, as its code object lists them."""
+    count = code.co_argcount + code.co_kwonlyargcount
+    count += bool(code.co_flags & inspect.CO_VARARGS)
+    count += bool(code.co_flags & inspect.CO_VARKEYWORDS)
+    return code.co_varnames[:count]
+
+
+def _function(name: str):
+    """The function a lifted leaf names, `module:qualname`."""
+    module, qualname = name.split(":")
+    fn = importlib.import_module(module)
+    for attr in qualname.split("."):
+        fn = getattr(fn, attr)
+    return fn
+
+
+def _rebuilt(value, live):
+    """An argument value as a call takes it: a `Reduced` object rebuilt (an
+    enum member from its value, a dict from its items, any other object from
+    its class and state), tuples item by item, and `Tensor` and `ContextRef`
+    values through `live`."""
+    if isinstance(value, tuple):
+        return tuple(_rebuilt(item, live) for item in value)
+    if isinstance(value, (ir.Tensor, ir.ContextRef)):
+        return live(value)
+    if not isinstance(value, Reduced):
+        return value
+    cls = _function(value.cls)
+    if issubclass(cls, enum.Enum):
+        return cls(value.state)
+    state = {_rebuilt(k, live): _rebuilt(v, live) for k, v in value.state}
+    if cls is dict:
+        return state
+    obj = cls.__new__(cls)
+    if setstate := getattr(obj, "__setstate__", None):
+        setstate(state)
+    else:
+        obj.__dict__.update(state)
+    return obj
+
+
+def _addressable(frame) -> bool:
+    """Whether the function `frame` runs is the one its `module:qualname` names
+    (through `functools.wraps`), so a replay can call it again: a closure, a
+    lambda or a function a decorator hides is not."""
+    code = frame.f_code
+    if "<" in code.co_qualname:
+        return False
+    try:
+        fn = _function(f"{frame.f_globals['__name__']}:{code.co_qualname}")
+        fn = inspect.unwrap(getattr(fn, "__func__", fn))
+    except (AttributeError, ImportError, KeyError, ValueError):
+        return False
+    return getattr(fn, "__code__", None) is code
 
 
 class _Recorder(TorchDispatchMode):
@@ -175,18 +289,50 @@ class _Recorder(TorchDispatchMode):
 
     What is not ATOM's work at the traced shape goes to `left_out`, with why.
     `creating` is the role a storage allocated now takes; `roles` holds every
-    role given so far.
+    role given so far. `stated` is what an op of each kind recorded now
+    states beside its arguments (`ir.Op.stated`), by its name.
+
+    A raw Triton or FlyDSL launch lifts to the function that issues it: past
+    the kernel languages' own frames, closures and generic launchers (the
+    kernel is one of the frame's arguments or an attribute of its `self`), the
+    first function its `module:qualname` names. An untraced step finds these
+    functions (`launchers`); in a traced step each call of one that launches
+    a kernel or dispatches an operator outside torch's is a leaf, its
+    arguments taken at entry, what it runs inside (another launching function,
+    an operator) folded into it. It is called again, rebuilt from its contract
+    under the fake mode, to check it launches those kernels and dispatches
+    those operators again. A launch in a traced step outside every such call
+    is refused, and so is a leaf that raises after it launched, or is still
+    open when the step ends; one that raises having launched nothing gives
+    back what it ran.
     """
 
     def __init__(self, contexts, fake_mode=None):
         super().__init__()
         self.contexts, self.modules, self.roles = contexts, {}, {}
         self.creating, self.on, self.fake_mode = None, False, fake_mode
+        self.stated, self.runner, self.replayed = {}, None, set()
+        self.launchers, self.languages = set(), ()
+        self.replaying = None  # the kernels a replay launched, while one runs
         self.start()
 
     def start(self):
-        self.layer, self.items, self.stacks, self.left_out = None, [], [], []
-        self.lifting = None  # the frame the last item lifted to
+        self.layer, self.items, self.left_out = None, [], []
+        self.leaf = None  # the frame of the leaf call in progress
+
+    def __exit__(self, *exc):
+        super().__exit__(*exc)
+        if self.leaf is not None and exc[0] is None:
+            raise ValueError(
+                f"{self.items[-1][1].name} is still open when the step ends: "
+                "a call that neither returned nor raised has no end to fold to"
+            )
+
+    def cut(self):
+        """ATOM records `forward_done_event`: the target's work ends here, and
+        what follows is the drafter's."""
+        if self.on:
+            self.items.append((None, CUT))
 
     @contextlib.contextmanager
     def quiet(self):
@@ -221,8 +367,13 @@ class _Recorder(TorchDispatchMode):
                 if storage not in read:
                     self.roles[storage] = self.creating
         name = str(func)
+        torch_own = name.split(".")[0] in TORCH_NAMESPACES
+        if not torch_own and not name.startswith(UNDISPATCHED):
+            if self.replaying is not None:
+                self.replaying.append(name)
+            elif self.on and self.leaf is not None:
+                self.kernels.append(name)
         if self.on and not name.startswith(UNDISPATCHED):
-            torch_own = name.split(".")[0] in TORCH_NAMESPACES
             kind = ir.NodeKind.CAPTURED if torch_own else ir.NodeKind.OPAQUE_LEAF
             stack = _atom_frames()
             why = "h2d" if stack and _where(stack[0]).startswith(H2D) else None
@@ -231,64 +382,142 @@ class _Recorder(TorchDispatchMode):
             if driverless.standing_in[0] and not name.startswith("_c10d_functional."):
                 why = "stand-in"
             slots = {a.name: v for a, v in zip(func._schema.arguments, args)}
-            self.add(name, kind, {**slots, **kwargs}, outs, why, stack)
+            self.add(name, kind, {**slots, **kwargs}, outs, why)
         return out
 
-    def add(self, name, kind, slots, outs, why, stack):
+    def add(self, name, kind, slots, outs, why):
+        if self.leaf is not None:  # part of the leaf call in progress
+            self.inner.append(lambda: self.add(name, kind, slots, outs, why))
+            return
         op = self._op(name, kind, slots, [tuple(t.shape) for t in outs])
         if why:
             self.left_out.append((why, op))
-        elif self.lifting is not None and any(f is self.lifting for f in stack):
-            self._fold(op, self.lifting)
         else:
-            self.lifting = None
             self.items.append((self.layer, op))
-            self.stacks.append(stack)
 
-    def launch(self, name):
-        """A raw Triton or FlyDSL launch, lifted to its innermost ATOM function."""
-        if not self.on:
-            return
-        stack = _atom_frames()
-        if not stack:
-            raise ValueError(f"{name} launches from no ATOM function to lift it to")
-        frame = stack[0]
-        if frame is self.lifting:  # another kernel of the function being lifted
-            return
-        code = frame.f_code
-        count = code.co_argcount + code.co_kwonlyargcount
-        count += bool(code.co_flags & inspect.CO_VARARGS)
-        count += bool(code.co_flags & inspect.CO_VARKEYWORDS)
-        params = code.co_varnames[:count]
-        if reassigned := _reassigned(frame, params):
-            raise ValueError(
-                f"{name} lifts to {_where(frame)}, which reassigns its parameters "
-                f"{reassigned} before the launch: they are not what it was called with"
-            )
-        while (
-            self.items
-            and self.items[-1][0] == self.layer
-            and any(f is frame for f in self.stacks[-1])
-        ):
-            self.stacks.pop()
-            self._fold(self.items.pop()[1], frame)
-        lifted = f"{frame.f_globals['__name__']}:{code.co_qualname}"
-        slots = {p: frame.f_locals[p] for p in params}
-        op = self._op(lifted, ir.NodeKind.OPAQUE_LEAF, slots, ())
-        self.items.append((self.layer, op))
-        self.stacks.append([])
-        self.lifting = frame
+    def launch(self, name, *held):
+        """A raw Triton or FlyDSL launch of `name`, whose kernel objects are
+        `held`: found in an untraced step, part of a leaf call in a traced one."""
+        if self.replaying is not None:
+            self.replaying.append(name)
+        elif self.on and self.leaf is not None:
+            self.kernels.append(name)
+        else:
+            frame = self._lift({id(k) for k in held})
+            if self.on:
+                where = f"lifts to {_where(frame)}" if frame else "lifts to nothing"
+                raise ValueError(
+                    f"{name} {where}, which launched nothing in the untraced "
+                    "step: no call entry took its arguments"
+                )
+            if frame and frame.f_code not in self.launchers:
+                self.launchers.add(frame.f_code)
+                events = sys.monitoring.events
+                sys.monitoring.set_local_events(
+                    self.tool, frame.f_code, events.PY_START | events.PY_RETURN
+                )
 
-    def _fold(self, op, frame):
-        if op.kind is ir.NodeKind.OPAQUE_LEAF and op.name not in HOST_QUERIES:
+    def _lift(self, held):
+        """The frame of the function a launch of the kernel objects `held`
+        lifts to, or None."""
+        frame = sys._getframe(1)
+        while frame is not None:
+            local = frame.f_locals
+            if frame.f_code.co_filename.startswith(self.languages):
+                if "self" in local:  # a wrapper of the kernel: an autotuner
+                    held.add(id(local["self"]))
+            elif frame.f_code.co_filename != __file__ and _addressable(frame):
+                values = [local.get(p) for p in _params(frame.f_code)]
+                owner = getattr(values[0], "__dict__", {}) if values else {}
+                if not any(id(v) in held for v in [*values, *owner.values()]):
+                    return frame
+            frame = frame.f_back
+        return None
+
+    def enter(self, code, offset):
+        """A launching function's call begins: a leaf, unless one is open."""
+        if not self.on or self.leaf is not None:
+            return
+        frame = sys._getframe(1)
+        name = f"{frame.f_globals['__name__']}:{code.co_qualname}"
+        slots = {p: frame.f_locals[p] for p in _params(code)}
+        self.items.append(
+            (self.layer, self._op(name, ir.NodeKind.OPAQUE_LEAF, slots, ()))
+        )
+        self.leaf, self.kernels, self.inner = frame, [], []
+
+    def leave(self, code, offset, value):
+        """A launching function's call ends: its leaf holds what ran inside,
+        or, when it launched nothing, gives it back."""
+        if self.leaf is sys._getframe(1):
+            self._close()
+
+    def unwind(self, code, offset, exc):
+        """A launching function's call raises: refused once it launched, as no
+        replay can check a call cut short; else it gives back what it ran."""
+        if self.leaf is not sys._getframe(1):
+            return
+        if self.kernels:
             raise ValueError(
-                f"a launch lifts to {_where(frame)}, which also dispatches the leaf "
-                f"{op.name}: one leaf cannot hold another"
+                f"{self.items[-1][1].name} raised {exc!r} after it launched "
+                f"{self.kernels}: a call cut short has no contract to replay"
             )
+        self._close()
+
+    def _close(self):
+        self.leaf, op = None, self.items[-1][1]
+        if not self.kernels:
+            self.items.pop()
+            for each in self.inner:
+                each()
+        elif op not in self.replayed:
+            self.replayed.add(op)
+            if (again := self._replay(op)) != self.kernels:
+                raise ValueError(
+                    f"{op.name}, called again from its contract, launches {again}, "
+                    f"not {self.kernels}"
+                )
+
+    def _replay(self, op):
+        """The kernels `op` launches, called again on fresh fakes of its
+        tensors and its other arguments rebuilt."""
+        on, creating, self.on, self.creating = self.on, self.creating, False, None
+        self.replaying = []
+        try:
+            kwargs = {slot: _rebuilt(value, self._live) for slot, value in op.args}
+            for slot, value in kwargs.items():  # a dtype is held as its text
+                held = isinstance(value, str) and value.startswith("torch.")
+                held = held and getattr(torch, value[6:], None)
+                kwargs[slot] = held if isinstance(held, torch.dtype) else value
+            _function(op.name)(**kwargs)
+            return self.replaying
+        except Exception as exc:  # noqa: BLE001 - refused with what stopped it
+            raise ValueError(
+                f"{op.name} does not rebuild from its contract: {exc!r}"
+            ) from None
+        finally:
+            self.on, self.creating, self.replaying = on, creating, None
+
+    def _live(self, value):
+        if isinstance(value, ir.Tensor):
+            dtype = getattr(torch, value.dtype.removeprefix("torch."))
+            return torch.empty_strided(
+                value.shape, value.stride, dtype=dtype, device="cuda"
+            )
+        if isinstance(value, ir.ContextRef) and LAYER in value.index_names:
+            value = value.bind(**{LAYER: self.layer})
+        if not isinstance(value, ir.ModuleRef):
+            return value.key
+        if value.key.startswith("runner."):
+            return getattr(self.runner, value.key.removeprefix("runner."))
+        return self.runner.model.get_submodule(value.key)
 
     def wait(self, waiter, waited):
         """A side stream waiting on the main one forks; the reverse joins."""
         if not self.on:
+            return
+        if self.leaf is not None:
+            self.inner.append(lambda: self.wait(waiter, waited))
             return
         if waited is driverless.main_stream and waiter is not waited:
             item = Fork(waiter.stream_id)
@@ -297,8 +526,6 @@ class _Recorder(TorchDispatchMode):
         else:
             return
         self.items.append((self.layer, item))
-        self.stacks.append([])
-        self.lifting = None
 
     def _op(self, name, kind, slots, out_shapes):
         """`name` as an `Op`, or a refusal naming it and what it cannot hold."""
@@ -306,8 +533,9 @@ class _Recorder(TorchDispatchMode):
             args = tuple((slot, self._arg(value)) for slot, value in slots.items())
             ref = next((v for _, v in args if type(v) is ir.ContextRef), None)
             stream = driverless.current[0].stream_id
-            return ir.Op(name, kind, args, out_shapes, stream, ref)
-        except (TypeError, ValueError) as exc:
+            stated = self.stated.get(name, ())
+            return ir.Op(name, kind, args, out_shapes, stream, ref, stated)
+        except (TypeError, ValueError, RecursionError) as exc:
             raise ValueError(
                 f"{name} has no contract a graph can hold: {exc}"
             ) from None
@@ -317,9 +545,7 @@ class _Recorder(TorchDispatchMode):
             role = self.roles.get(_storage(value), ir.Role.METADATA)
             shape, stride = tuple(value.shape), value.stride()
             return ir.Tensor(shape, str(value.dtype), stride, role)
-        if isinstance(value, torch.nn.Module):
-            if id(value) not in self.modules:
-                raise TypeError(f"a {type(value).__name__} outside the model")
+        if isinstance(value, torch.nn.Module) and id(value) in self.modules:
             return ir.ModuleRef(self._layered(self.modules[id(value)]))
         if isinstance(value, str) and value in self.contexts:
             return ir.ContextRef(self._layered(value))
@@ -329,13 +555,40 @@ class _Recorder(TorchDispatchMode):
             return str(value)
         if isinstance(value, numpy.generic):
             return value.item()
-        if isinstance(value, dict):
-            return tuple((k, self._arg(v)) for k, v in value.items())
-        if hasattr(value, "__dict__") and not callable(value):
-            # A host object the engine built from its configuration, which the
-            # graph's key names: its type stands for it.
-            return f"<{type(value).__qualname__}>"
-        return value
+        if type(value) is dict:
+            items = tuple((self._arg(k), self._arg(v)) for k, v in value.items())
+            return Reduced("builtins:dict", items)
+        if isinstance(value, enum.Enum):
+            return Reduced(_class(value), value.value)
+        if value is None or isinstance(value, (bool, int, float, str, bytes)):
+            return value
+        held = vars(self.runner).items() if self.runner is not None else ()
+        if attr := next((a for a, v in held if v is value), None):
+            return ir.ModuleRef(f"runner.{attr}")
+        return self._reduced(value)
+
+    def _reduced(self, value):
+        """An object as pickle reduces it, its state a dict of attributes each
+        contract-legal; anything else is refused by its type."""
+        try:
+            reduced = () if callable(value) else value.__reduce_ex__(2)
+        except TypeError:  # an object pickle refuses
+            reduced = ()
+        if (
+            len(reduced) < 3
+            or reduced[0] is not copyreg.__newobj__
+            or reduced[1] != (type(value),)
+            or not isinstance(reduced[2] or {}, dict)
+            or any(item is not None for item in reduced[3:])
+        ):
+            raise TypeError(
+                f"a {type(value).__qualname__} is neither an argument value nor "
+                "an object pickle reduces to its class and a dict of attributes"
+            )
+        state = reduced[2] or {}
+        return Reduced(
+            _class(value), tuple((k, self._arg(v)) for k, v in state.items())
+        )
 
     def _layered(self, path):
         if self.layer is None:
@@ -343,17 +596,31 @@ class _Recorder(TorchDispatchMode):
         return re.sub(rf"\blayers\.{self.layer}\b", f"layers.{{{LAYER}}}", path)
 
 
+def _class(value) -> str:
+    cls = type(value)
+    return f"{cls.__module__}:{cls.__qualname__}"
+
+
 def _patches(recorder):
     """What the step runs under besides the modes, as one stack of patches.
 
     * A raw Triton or FlyDSL launch goes to the driver below the dispatcher: it
-      is lifted to its ATOM function and not launched.
+      is told to the recorder and not launched. Triton's is taken at
+      `JITFunction.run`, a warmup aside, and a direct `CompiledKernel` launch
+      is refused; FlyDSL's at `JitFunction.__call__` and at a
+      `CompiledFunction`'s call, which `flyc.compile` maps to its jit function.
+    * Each call of a launching function, its entry and its return, is told to
+      the recorder through `sys.monitoring`, on those functions alone; a raise
+      that unwinds a frame, on every function.
     * `CpuGpuBuffer.__init__` (ATOM's own) allocates its host side and that
       side's numpy view outside the fake mode, unpinned (pinning is a driver
       allocation); its device side is ATOM's `zeros_like`, faked.
     * GDN's causal-conv1d metadata is host arithmetic over the staged
       `cu_seqlens`, and it runs outside the fake mode too.
-    * A real host tensor's values are read on the host, `tolist` as `numpy`.
+    * A real host tensor's values are read on the host, `tolist` as `numpy`;
+      under a drafter a device value copied to the host, which nothing
+      computed, reads as zeros (its runner reads back the last step's MTP
+      status and draft ids). Without one, such a read raises.
     * ATOM's MoE wrappers run their bodies, not their fakes: inside are the
       collectives, the streams and the expert kernels.
     * The checkpoint's weights iterator yields nothing: ATOM's dummy load still
@@ -361,8 +628,11 @@ def _patches(recorder):
     * A step ATOM splits into two micro-batches (`--enable-tbo`) is refused by
       name before its threads start: one graph cannot hold the two.
     """
-    import flydsl.compiler
+    import flydsl
+    import triton
+    from flydsl.compiler import jit_function as fly
     from torch._subclasses.fake_tensor import unset_fake_temporarily
+    from triton.compiler.compiler import CompiledKernel
     from triton.runtime.jit import JITFunction
 
     from atom.model_loader import loader
@@ -371,18 +641,52 @@ def _patches(recorder):
     from atom.utils import CpuGpuBuffer
     from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
-    def run(kernel, *args, **kwargs):
-        recorder.launch(f"triton.{kernel.__name__}")
+    recorder.languages = tuple(
+        f"{pathlib.Path(m.__file__).parent}/" for m in (triton, flydsl)
+    )
 
-    def launch(kernel, *args):
-        recorder.launch(f"flydsl.{getattr(kernel, 'func', kernel).__name__}")
+    def run(kernel, *args, grid=None, warmup=False, **kwargs):
+        if not warmup:  # a warmup compiles and launches nothing
+            recorder.launch(f"triton.{kernel.__name__}", kernel)
+
+    def compiled_kernel(kernel, *args):
+        raise ValueError(
+            f"triton.{kernel.name} launches through CompiledKernel.run, past "
+            "JITFunction.run: a call that took no arguments to lift"
+        )
+
+    def jit_call(jit, *args, **kwargs):
+        recorder.launch(f"flydsl.{jit.func.__name__}", jit)
+
+    def compile_impl(jit, *args):
+        jit(*args)  # flyc.compile launches the kernel as it compiles it
+        return fly.CompiledFunction(None, jit)
+
+    def compiled_call(compiled, *args):
+        jit = compiled._keepalive
+        if not isinstance(jit, fly.JitFunction):  # compiled before the capture
+            raise ValueError(  # noqa: TRY004 - a refusal the CLI names
+                f"a FlyDSL CompiledFunction of {getattr(jit, '_entry', jit)!r} "
+                "compiled outside the capture: no jit function names its kernel"
+            )
+        recorder.launch(f"flydsl.{jit.func.__name__}", compiled, jit)
 
     init, zeros, numpy = CpuGpuBuffer.__init__, torch.zeros, torch.Tensor.numpy
     conv1d, tolist = gdn_attn.compute_causal_conv1d_metadata, torch.Tensor.tolist
+    fake_tolist = FakeTensor.tolist
+
+    def landed(tensor):
+        if not getattr(recorder.runner, "drafter", None):
+            return tensor
+        if isinstance(tensor, FakeTensor) and tensor.device.type == "cpu":
+            with unset_fake_temporarily():
+                return zeros(tensor.shape, dtype=tensor.dtype)
+        return tensor
 
     def host_tolist(tensor):
+        tensor = landed(tensor)
         if isinstance(tensor, FakeTensor):
-            return tolist(tensor)
+            return fake_tolist(tensor)
         with unset_fake_temporarily():
             return tolist(tensor)
 
@@ -416,10 +720,16 @@ def _patches(recorder):
     stack = contextlib.ExitStack()
     for owner, name, value in (
         (JITFunction, "run", run),
-        (flydsl.compiler, "compile", launch),
+        (CompiledKernel, "run", property(compiled_kernel)),
+        (CompiledKernel, "__getitem__", compiled_kernel),
+        (fly.JitFunction, "__call__", jit_call),
+        (fly, "_compile_impl", compile_impl),
+        (fly.CompiledFunction, "__call__", compiled_call),
         (CpuGpuBuffer, "__init__", staged_init),
         (gdn_attn, "compute_causal_conv1d_metadata", host_conv1d),
         (torch.Tensor, "tolist", host_tolist),
+        (FakeTensor, "tolist", host_tolist),
+        (torch.Tensor, "numpy", lambda t, *a, **k: host_numpy(landed(t), *a, **k)),
         (loader, "safetensors_weights_iterator", lambda *a, **k: iter(())),
         (UBatchWrapper, "_run_ubatches", micro_batches),
         (torch.ops.aiter, "moe_forward", moe.moe_forward),
@@ -430,7 +740,33 @@ def _patches(recorder):
         ),
     ):
         stack.enter_context(patch.object(owner, name, value))
+    stack.enter_context(_entries(recorder))
     return stack
+
+
+@contextlib.contextmanager
+def _entries(recorder):
+    """`recorder.enter` and `recorder.leave` on each call of the functions it
+    turns `sys.monitoring`'s events on for, and `recorder.unwind` on every
+    frame a raise unwinds (an event no single function can take), under a
+    free tool id."""
+    monitoring = sys.monitoring
+    events = monitoring.events
+    recorder.tool = next(i for i in range(6) if monitoring.get_tool(i) is None)
+    monitoring.use_tool_id(recorder.tool, "compass capture")
+    monitoring.register_callback(recorder.tool, events.PY_START, recorder.enter)
+    monitoring.register_callback(recorder.tool, events.PY_RETURN, recorder.leave)
+    monitoring.register_callback(recorder.tool, events.PY_UNWIND, recorder.unwind)
+    monitoring.set_events(recorder.tool, events.PY_UNWIND)
+    try:
+        yield
+    finally:
+        for code in recorder.launchers:
+            monitoring.set_local_events(recorder.tool, code, 0)
+        monitoring.set_events(recorder.tool, 0)
+        for event in (events.PY_START, events.PY_RETURN, events.PY_UNWIND):
+            monitoring.register_callback(recorder.tool, event, None)
+        monitoring.free_tool_id(recorder.tool)
 
 
 def _v4_attention(v4, recorder):
@@ -440,31 +776,26 @@ def _v4_attention(v4, recorder):
     one leaf: its FP4 kernels launch through aiter's own launcher, which no
     patch here intercepts.
 
-    Two of its functions are one leaf each at their call, what they run inside
-    folded in: before its raw launches, `fused_compress_attn` derives its
-    `quant` parameter, and the decode kernel's aiter entry dispatches a leaf,
-    either of which a lift refuses.
+    The decode leaves (`V4_DECODES`) state the layer's `window_size`,
+    `compress_ratio` and `index_topk` (None when it has no indexer), and the
+    indexer's its `compress_ratio`, none of which they are passed: read off
+    the layer `layer_name` names.
     """
-    from atom.model_ops.v4_kernels import paged_decode
     from atom.utils.forward_context import get_forward_context
 
     def body(x, positions, layer_name):
-        with patch.object(get_forward_context().context, "is_dummy_run", False):
+        layer = recorder.contexts[layer_name]
+        top = layer.indexer and layer.indexer.index_topk
+        ratio = (("compress_ratio", layer.compress_ratio),)
+        geometry = (("window_size", layer.window_size), *ratio, ("index_topk", top))
+        stated = {**dict.fromkeys(V4_DECODES, geometry), V4_INDEXER: ratio}
+        with (
+            patch.object(recorder, "stated", stated),
+            patch.object(get_forward_context().context, "is_dummy_run", False),
+        ):
             return v4.v4_attention_with_output(x, positions, layer_name)
 
-    def at_call(owner, fn):
-        name = f"{fn.__module__}:{fn.__qualname__}"
-        leaf = peers._declared(recorder, name, fn, ir.NodeKind.OPAQUE_LEAF)
-        return patch.object(owner, fn.__name__, leaf)
-
-    stack = contextlib.ExitStack()
-    for each in (
-        patch.object(torch.ops.aiter, "v4_attention_with_output", body),
-        at_call(v4, v4.fused_compress_attn),
-        at_call(paged_decode, paged_decode._sparse_attn_v4_paged_decode_asm),
-    ):
-        stack.enter_context(each)
-    return stack
+    return patch.object(torch.ops.aiter, "v4_attention_with_output", body)
 
 
 def _build_runner(config, fake_mode):
@@ -504,20 +835,22 @@ def _weights(model):
                 yield value
 
 
-def _batch(shape, block_size, context=1, output=True):
+def _batch(shape, block_size, context=1, output=True, drafts=0):
     """`shape.seqs` sequences of `shape.tokens` new tokens between them, the
     first `tokens % seqs` one longer, each in blocks of its own; and the
-    blocks they take. A decode sequence holds `context` tokens. Unless
-    `output`, every prefill sequence is a middle chunk, so the step samples
-    nothing."""
+    blocks they take. A decode sequence holds `context` tokens, and under a
+    drafter of `drafts` tokens verifies that many more, as ATOM's scheduler
+    schedules it. Unless `output`, every prefill sequence is a middle chunk,
+    so the step samples nothing."""
     from atom.model_engine import sequence
     from atom.model_engine.scheduler import ScheduledBatch
 
+    drafts = drafts if shape.phase == "decode" else 0
     per, extra = divmod(shape.tokens, shape.seqs)
-    counts = [per + (i < extra) for i in range(shape.seqs)]
+    counts = [per + (i < extra) + drafts for i in range(shape.seqs)]
     seqs, blocks = {}, 0
     for index, count in enumerate(counts):
-        held = context if shape.phase == "decode" else count
+        held = context + drafts if shape.phase == "decode" else count
         # An id of 0 would draw one from the class counter instead.
         seq = sequence.Sequence([0] * held, block_size=block_size, id=index + 1)
         seq.status = sequence.SequenceStatus.RUNNING
@@ -529,12 +862,17 @@ def _batch(shape, block_size, context=1, output=True):
     batch = ScheduledBatch(
         seqs=seqs,
         num_scheduled_tokens=numpy.array(counts, dtype=numpy.int32),
-        total_tokens_num=shape.tokens,
+        total_tokens_num=sum(counts),
         total_seqs_num=shape.seqs,
-        **{f"total_tokens_num_{shape.phase}": shape.tokens},
+        **{f"total_tokens_num_{shape.phase}": sum(counts)},
         **{f"total_seqs_num_{shape.phase}": shape.seqs},
-        is_dummy_run=True,
+        # ATOM scores drafts only on a step that is not a dummy run.
+        is_dummy_run=not drafts,
         is_final_chunk=None if output else [False] * shape.seqs,
+        num_spec_step=drafts,
+        scheduled_spec_decode_tokens={
+            i: numpy.zeros(drafts, dtype=numpy.int32) for i in seqs
+        },
     )
     return batch, blocks
 
@@ -612,7 +950,10 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
 
     Yields, per shape, the graph, the model's config digest, what the capture
     declared, the operators it left out of the graph among it; per prefill
-    shape, the middle chunk's and then the final one's.
+    shape, the middle chunk's and then the final one's. Under a drafter a step
+    that samples is two graphs, its target's and then its drafter's, cut where
+    ATOM records `forward_done_event`; a decode step verifies the drafter's
+    tokens in each row.
     """
     declared = driverless.install(tmpdir, arch)
 
@@ -624,6 +965,9 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
     config = _config(model, tp, atom_args)
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     ep = int(config.enable_expert_parallel)
+    shapes = list(dict.fromkeys(s.at(dp) for s in shapes))
+    if dp == 1 and (gathering := [s for s in shapes if s.gathered is not None]):
+        raise ValueError(f"{gathering[0]} gathers a DP group's rows on one rank")
     declared["group"] = driverless.group(tp, dp)
     set_current_atom_config(config)
     digest = _file_digest(config.model, "config.json")
@@ -631,6 +975,10 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
     contexts = config.compilation_config.static_forward_context
     recorder, block_size = _Recorder(contexts, fake_mode), config.kv_cache_block_size
     driverless.on_wait = recorder.wait
+    # A drafter's runner imports inductor, whose decomposition table walks
+    # every `torch.ops.aiter` op, which the patches below replace by functions.
+    import torch._inductor.decomposition
+
     stack = _patches(recorder)
     if dp > 1:
         for owner, name, value in peers.patches(recorder):
@@ -658,11 +1006,25 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
         runner.model.register_forward_pre_hook(
             lambda m, a: setattr(recorder, "creating", ir.Role.ACTIVATION)
         )
-        recorder.modules = {id(m): n for n, m in runner.model.named_modules()}
-        weights = map(_storage, _weights(runner.model))
+        recorder.runner = runner
+        recorder.modules = {id(m): n for n, m in runner.model.named_modules() if n}
+        models, drafts = [runner.model], 0
+        if drafter := getattr(runner, "drafter", None):
+            if drafter.is_block_drafter:
+                raise ValueError(
+                    f"{type(drafter).__name__} writes its draft KV before "
+                    "forward_done_event on a step that samples: no cut parts its "
+                    "target from its draft"
+                )
+            drafts, done = drafter.mtp_k, runner.forward_done_event
+            models.append(drafter.model)
+            done.record = lambda *a: (recorder.cut(), driverless.Event.record(done, *a))
+        weights = map(_storage, (w for m in models for w in _weights(m)))
         recorder.roles = dict.fromkeys(weights, ir.Role.WEIGHT)
         recorder.creating = ir.Role.KV
-        blocks = max(_batch(s, block_size, max(CONTEXTS))[1] for s in shapes)
+        blocks = max(
+            _batch(s, block_size, max(CONTEXTS), True, drafts)[1] for s in shapes
+        )
         with fake_mode:
             runner.get_num_blocks()  # sizes the pools, as `EngineCore` does
         # A warmup copy whose bytes nobody reads, like `_maybe_warmup`.
@@ -681,22 +1043,30 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
             traces = []
             for context in CONTEXTS if shape.phase == "decode" else CONTEXTS[:1]:
                 recorder.creating = ir.Role.METADATA
+                batch = (shape, block_size, context, output, drafts)
                 with fake_mode, torch._C._EnablePythonDispatcher(), recorder:
-                    # A runner's first step takes its own path, so the traced
-                    # step follows one of its own shape: no graph depends on
-                    # another's.
-                    runner.forward(_batch(shape, block_size, context, output)[0])
+                    # A runner's first step takes its own path (a decode
+                    # fills no deferred ids), so the traced step follows two
+                    # of its own shape, which find its launching functions:
+                    # no graph depends on another's.
+                    for _ in range(2):
+                        runner.forward(_batch(*batch)[0])
                     recorder.start()
                     recorder.creating, recorder.on = ir.Role.METADATA, True
-                    runner.forward(_batch(shape, block_size, context, output)[0])
+                    runner.forward(_batch(*batch)[0])
                 recorder.creating, recorder.on = None, False
                 traces.append((recorder.items, recorder.left_out))
             items, left_out = traces[0]
             if len(traces) > 1:
                 items = _affine(str(shape), items, traces[1][0])
-            key = structure(config, shape.phase, output=output)
-            crossing, traced = [], Traced(key, str(shape))
-            graph = build(items, traced, crossing)
-            left_out = [*left_out, *(("step-crossing", op) for op in crossing)]
-            declared["left_out"] = [{"why": why, **_json(op)} for why, op in left_out]
-            yield graph, digest, dict(declared)
+            # A drafter's work follows its target's: its own graph.
+            cut = [i for i, (_, item) in enumerate(items) if item is CUT][:1]
+            for draft, part in enumerate(
+                (items[: cut[0]], items[cut[0] + 1 :]) if cut else (items,)
+            ):
+                key = structure(config, shape.phase, output=output, draft=bool(draft))
+                crossing, traced = [], Traced(key, str(shape))
+                graph = build(part, traced, crossing)
+                gone = [*left_out, *(("step-crossing", op) for op in crossing)]
+                declared["left_out"] = [{"why": why, **_json(op)} for why, op in gone]
+                yield graph, digest, dict(declared)

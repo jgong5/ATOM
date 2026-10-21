@@ -96,6 +96,10 @@ class MemoryReadingModelRunner(ModelRunner):
         self._write(reply[2])
         return reply
 
+    def _out(self) -> Path:
+        """The directory this rank writes its readings in."""
+        return Path(os.environ[OUT_ENV])
+
     def _write(self, pool) -> None:
         read, config = self._read, self.config
         engine = keyed(config) | {name: getattr(config, name) for name in BOUNDS}
@@ -112,7 +116,7 @@ class MemoryReadingModelRunner(ModelRunner):
         name = member_name(
             memory.STEM, memory.coords(config, self.rank), memory.EXTENSION
         )
-        Path(os.environ[OUT_ENV], name).write_text(
+        (self._out() / name).write_text(
             json.dumps(
                 {
                     "key": memory.key_fields(config),

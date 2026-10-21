@@ -11,6 +11,7 @@ pass and the provenance names planted trees.
 """
 
 import copy
+import itertools
 import json
 import os
 import re
@@ -439,6 +440,45 @@ def test_points_planned_at_the_inputs_pool_are_measured_where_the_budget_is_smal
     assert engine["num_kvcache_blocks"] == pool
 
 
+def test_a_point_planned_past_the_pool_is_measured_with_its_rows_sharing_blocks(
+    run,
+):
+    """The engine states a pool one block under the record's largest decode
+    step, so the plan shares blocks at the corners past it; each is keyed by
+    its share, and its rows hold the same leading blocks of the pool."""
+    steps, rec = run.record / "steps", str(run.record)
+    lines = read(steps)[0]
+    stated = json.loads((steps / "dp0.engine.json").read_text())
+    size = stated["kv_cache_block_size"]
+    stated["num_kvcache_blocks"] = pool = (
+        max(kv_blocks(line, size) for line in lines if line["rows"][0][2]) - 1
+    )
+    (steps / "dp0.engine.json").write_text(json.dumps(stated))
+    named = [(str(s["step"]), s) for s in lines]
+    shared = [
+        x for x in plan(DEFINITION, named, {"r": stated})["lines"] if "shared" in x
+    ]
+    assert shared
+    definition = run.tmp / "definition.json"
+    definition.write_text(json.dumps(DEFINITION))
+    store = run("--grid", rec, "--grid-definition", str(definition), *run.named(rec))
+
+    held = by_view(store)
+    for line in shared:
+        view = measure._digest(measure.view_of(line))
+        assert held[view][1]["shared"] == line["shared"] > 0
+        assert view not in views([line])
+    tables = [[list(t) for t in batch.block_tables] for batch in Bench.measured]
+    assert max(b for table in tables for row in table for b in row) < pool
+    # The leading blocks every row of a batch holds alike.
+    alike = [
+        len(list(itertools.takewhile(lambda ids: len(set(ids)) == 1, zip(*table))))
+        for table in tables
+        if len(table) > 1
+    ]
+    assert sorted(n for n in alike if n) == sorted(x["shared"] for x in shared)
+
+
 def test_the_bench_holds_the_largest_pool_an_input_states(run):
     rec, other = str(run.record), run.tmp / "other"
     shutil.copytree(run.record, other)
@@ -572,3 +612,44 @@ def test_a_batch_the_bench_refuses_is_not_published_and_is_named_after_the_rest(
     held = entries(ArtifactStore(run.tmp / "store"))
     assert refused not in {sum(q for q, *_ in m["rows"]) for _, m in held}
     assert len(Bench.measured) == len(views(lines)) > len(held)
+
+
+def test_ragged_measures_the_views_composed_from_each_drawn_decode_view(run):
+    """Each view keeps a decode line's rung, rows and summed context within a
+    token a row; its rows are contexts the record's decode rows ran, and no
+    prefill view is measured."""
+    rec = str(run.record)
+    store = run(rec, "--sample", "2", "--seed", "3", "--ragged", *run.named(rec))
+
+    split = served(run.record / "steps", RUNS)[0]
+    decode = [s for s in split if s["rows"][0][2]]
+    contexts = {c for s in decode for _, c, _ in s["rows"]}
+    seeds = {
+        (s["rung"], len(s["rows"]), sum(c for _, c, _ in s["rows"])) for s in decode
+    }
+    held = entries(store)
+    assert len(held) == len(Bench.measured) > 0
+    for key, member in held:
+        rows, n = member["rows"], len(member["rows"])
+        total = sum(c for _, c, _ in rows)
+        assert member["origin"] == "ragged" and key.values["step_kind"].startswith(
+            "decode rung"
+        )
+        assert {c for _, c, _ in rows} <= contexts and all(d for *_, d in rows)
+        assert any(
+            (r, b) == (member["rung"], n) and abs(t - total) <= n for r, b, t in seeds
+        )
+        assert member["sources"] == [
+            measure.file_digest(run.record / "steps/dp0.jsonl")
+        ]
+        assert member["traces"] == sorted({t for s in split for t in s["traces"]})
+
+
+def test_ragged_without_a_replayed_input_refuses(run):
+    rec = str(run.record)
+    definition = run.tmp / "definition.json"
+    definition.write_text(json.dumps(DEFINITION))
+    args = ["--grid", rec, "--grid-definition", str(definition), "--ragged"]
+    with pytest.raises(SystemExit, match="--ragged composes from no replayed input"):
+        run(*args, *run.named(rec))
+    assert Bench.started == []

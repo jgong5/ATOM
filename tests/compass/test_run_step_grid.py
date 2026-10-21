@@ -194,7 +194,7 @@ def test_a_run_file_bundle_prices_the_runs_steps_and_the_summary_names_it(
             "digest": entry.digest,
             "describe": (
                 f"step grid, bundle {entry.key}; replay decode grid, "
-                "timing scope forward; recipe step-grid-residual v2, members "
+                "timing scope forward; recipe step-grid-residual v3, members "
                 "decode: unit; prefill_output: unit; prefill_no_output: unit; "
                 "below it, step roofline; 1 modules"
             ),
@@ -256,7 +256,7 @@ def test_the_step_roofline_prices_below_the_step_grid_and_the_summary_counts_bot
     monkeypatch.setattr(torch.distributed, "all_reduce", None)
     r = deployment(tmp_path)
     member = copy.deepcopy(BUNDLE)
-    hull = {"facets": [[1, 0, 0, 0, -(2**-10)]]}
+    hull = {"facets": [[1, 0, 0, -(2**-10)]]}
     member["residual"]["kinds"]["decode"]["hull"] = hull
     machine = MachineSpec.from_mapping(ROOFLINE)
     publish_readings(tmp_path / "store", r.config, document=ROOFLINE)

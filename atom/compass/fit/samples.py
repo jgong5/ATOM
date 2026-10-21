@@ -9,13 +9,14 @@ client runs its server served (`parity.served`). Its steps are labelled by
 A DP rank no request reached writes a line per dummy forward it runs, and gives
 no sample; its file still counts in the run's digest. An empty
 rank file lost its lines, and refuses.
+A record whose run.json names `aiter_jit_builds` refuses, naming them.
 
 A step measurement is a `step_measurement` entry `measure steps` published,
 read by key; its member `MEMBER` holds the batch view as a step-record line
 does (`rows`, `rung`, `produces_output`), its device seconds (`seconds`), its
-`origin` (`replay` or `plan`) and the `traces` the batch came from. Its sample's
-provenance holds its `source`, the origin, its `run`, the entry's digest, and
-those `traces`.
+`origin` (`replay`, `plan` or `ragged`) and the `traces` the batch came from.
+Its sample's provenance holds its `source`, the origin, its `run`, the entry's
+digest, and those `traces`.
 
 Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
@@ -40,6 +41,7 @@ from pathlib import Path
 from atom.compass.artifacts import ArtifactStore, Topology
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_labels import Sample, digest, label
+from atom.compass.drive import aiter_jit
 from atom.compass.parity import ARRIVALS
 from atom.compass.parity.served import served
 from atom.compass.run.step_grid import keyed_of
@@ -92,6 +94,8 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
             f"{directory} was profiled, and profiling splits the steps it times, "
             "so no fit takes them"
         )
+    if built := aiter_jit.refusal(run):
+        raise ValueError(f"{directory} is not fitted: {built}")
     steps = directory / "steps"
     if (steps / ARRIVALS).exists():
         # `parity.read` then drops the engine's start and renumbers the rest.

@@ -180,11 +180,11 @@ class StepLinearBackend(CostBackend):
             )
         prefill, decode = batch_view.prefill, batch_view.decode
         if batch_view.image_tokens:
-            raise self._refuse(batch_view, IMAGES.format(batch_view.image_tokens))
+            raise self._refuse(batch_view, IMAGES)
         if prefill and decode:
             raise self._refuse(
                 batch_view,
-                f"a step of {len(prefill)} prefill and {len(decode)} decode rows; "
+                "a step mixing prefill and decode rows; "
                 "the law prices a step of one kind",
             )
         terms = self._terms(self.law, batch_view, "")

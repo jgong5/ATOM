@@ -14,6 +14,15 @@ gives the same work. That shape is read in one grid:
     decode, replay bundle:  (B, c), from the grid of the rung the step replays
     decode, eager bundle:   (B, c), the rung ignored
 
+A decode row computes one token, so that c is the rows' mean cached context,
+and the lookup there, G(mean), keeps the attention work but not how it is
+spread over the rows. On a rung whose grid holds `alpha`, a decode batch's
+lookup is G(mean) + alpha (G(longest) - G(mean)), G read at B rows of the
+mean and of the longest row's cached context, so between the two, with
+alpha = clip(intercept + ratio . (longest / mean - 1) + spread . sd / mean,
+0, 1) over the rows' cached contexts (`length_statistics`). On any other
+rung, or for a batch whose rows read one context, the lookup is G(mean).
+
 A cell is the box between adjacent nodes on every axis; a coordinate on a node
 reads that node alone, so an exact hit needs one point. The answer is the
 multilinear interpolation over the cell's corners when every corner was
@@ -50,13 +59,20 @@ The grid is a mapping, as a bundle holds it:
      "prefill": {"nodes": {"B": [...], "T": [...], "c": [...]},
                  "output": [POINT, ...], "no_output": [POINT, ...]},
      "decode": {"nodes": {"B": NODES, "c": NODES}, "points": [POINT, ...],
-                "pool": {"block_size": n, "blocks": n}}}  # pool optional
+                "pool": {"block_size": n, "blocks": n},       # optional
+                "alpha": {"<rung>": {"intercept": a, "ratio": b,
+                                     "spread": d}, ...}}}     # optional
 
-A grid without `pool` extrapolates no decode corner.
+A grid without `pool` extrapolates no decode corner; one without `alpha` reads
+every decode batch at G(mean).
 
     replay: NODES = {"<rung>": [...], ...}, a POINT at [rung, B, c]
     eager:  NODES = [...],                  a POINT at [B, c]
-    POINT = {"at": [...], "time": <in unit>, "statistic": <name>, "repeats": n}
+    POINT = {"at": [...], "time": <in unit>, "statistic": <name>, "repeats": n,
+             "shared": n}                                      # shared optional
+
+A point measured with its rows sharing leading KV blocks, past the pool
+unshared, states how many as `shared`.
 """
 
 from __future__ import annotations
@@ -64,6 +80,7 @@ from __future__ import annotations
 import bisect
 import itertools
 import math
+import statistics
 from collections.abc import Mapping, Sequence
 from fractions import Fraction
 from typing import TYPE_CHECKING
@@ -86,6 +103,8 @@ if TYPE_CHECKING:
     from atom.compass.backends.step_grid_residual import Residual
 
 SOURCE = "step-grid"
+#: A decode rung's alpha terms, as the grid holds them.
+ALPHA = ("intercept", "ratio", "spread")
 EXTRAPOLATED = f"{SOURCE}{provenance.EXTRAPOLATED}"
 UNITS = {"s": Fraction(1), "ms": Fraction(1, 10**3), "us": Fraction(1, 10**6)}
 
@@ -110,6 +129,26 @@ def coordinates(rows: Sequence[RequestShape], prefill: bool) -> tuple[Fraction, 
     decode."""
     rows_n, query, cached = equivalent_shape(rows)
     return (rows_n, rows_n * query, cached) if prefill else (rows_n, cached)
+
+
+def length_statistics(rows: Sequence[RequestShape]) -> tuple[float, float]:
+    """The longest cached context over the mean, less 1, and the cached
+    contexts' standard deviation over their mean: 0 and 0 when every row reads
+    one context."""
+    cached = [row.context_tokens - row.query_tokens for row in rows]
+    mean = statistics.fmean(cached)
+    if not mean:
+        return 0.0, 0.0
+    return max(cached) / mean - 1.0, statistics.pstdev(cached) / mean
+
+
+def alpha_of(terms: Sequence[float], rows: Sequence[RequestShape]) -> float:
+    """The alpha a rung's `terms` give a decode batch of `rows`, 0 when its rows
+    read one context."""
+    ratio, spread = length_statistics(rows)
+    if not ratio:
+        return 0.0
+    return min(1.0, max(0.0, terms[0] + terms[1] * ratio + terms[2] * spread))
 
 
 def _refused(view: BatchView, reason: str) -> CostRefused:
@@ -168,8 +207,8 @@ class _Cells:
             if i in (0, len(nodes)):
                 raise _refused(
                     view,
-                    f"{axis}={x} is outside the {self.name} grid's nodes "
-                    f"{nodes[0]}..{nodes[-1]}",
+                    f"{axis} is {'below' if i == 0 else 'above'} the {self.name} "
+                    f"grid's nodes {nodes[0]}..{nodes[-1]}",
                 )
             low, high = nodes[i - 1], nodes[i]
             weight = (x - low) / (high - low)
@@ -205,8 +244,8 @@ class _Cells:
         if missing:
             raise _refused(
                 view,
-                f"the {self.name} cell holding {_named(self.axes, at)} has no "
-                f"measurement at {'; '.join(_named(self.axes, m) for m in missing)}",
+                f"the {self.name} cell has no measurement at "
+                f"{'; '.join(_named(self.axes, m) for m in missing)}",
             )
         value = sum(self.points[corner] * weight for corner, weight in corners)
         return value, len(corners) == 1, self._cell(self._sides(view, at))
@@ -243,9 +282,8 @@ class _Cells:
         if falls:
             raise _refused(
                 view,
-                f"the {self.name} cell holding {_named(self.axes, at)} is past "
-                f"the KV pool, and {'; '.join(falls)}, reaching no positive time "
-                f"at c={at[1]}",
+                f"the {self.name} cell is past the KV pool, and {'; '.join(falls)}, "
+                "reaching no positive time at the step's c",
             )
         return value, self._cell(sides), "; ".join(past)
 
@@ -284,7 +322,10 @@ class StepGrid:
                     f"are {'one list per rung' if replay else 'one list'}, not a "
                     f"{type(nodes).__name__}"
                 )
+        self.alpha = {}
         if not replay:
+            if decode.get("alpha"):
+                raise ValueError("alpha is per rung, and an eager grid reads no rung")
             self.decode = _Cells(
                 "decode", ("B", "c"), [b_nodes, c_nodes], decode["points"]
             )
@@ -307,6 +348,54 @@ class StepGrid:
             )
             for rung, nodes in b_nodes.items()
         }
+        for rung, alpha in decode.get("alpha", {}).items():
+            terms = tuple(float(alpha[k]) for k in ALPHA)
+            if int(rung) not in self.decode or not all(map(math.isfinite, terms)):
+                raise ValueError(
+                    f"alpha {alpha} is for rung {rung}, which has no decode grid, "
+                    "or is not finite"
+                )
+            self.alpha[int(rung)] = terms
+
+    def read(
+        self, cells: _Cells, view: BatchView, at
+    ) -> tuple[Fraction, bool, str, str]:
+        """The value at `at` in `cells`, whether it is a node, the cell, and how
+        far past the KV pool it is extrapolated, '' inside; or a refusal."""
+        try:
+            return (*cells.lookup(view, at), "")
+        except CostRefused:
+            pool = self.pool
+            extended = pool and not view.prefill and cells.past_pool(view, at, *pool)
+            if not extended:
+                raise
+            value, cell, beyond = extended
+            return value, False, cell, beyond
+
+    def longest(self, view: BatchView, at) -> tuple[float, tuple] | None:
+        """A decode batch's alpha and where its lookup also reads, B rows of
+        its longest row's cached context; None where it reads `at` alone."""
+        terms = None if view.prefill else self.alpha.get(view.capture_rung)
+        alpha = alpha_of(terms, view.requests) if terms else 0.0
+        if not alpha:
+            return None
+        longest = max(r.context_tokens - r.query_tokens for r in view.requests)
+        return alpha, (at[0], Fraction(longest))
+
+    def value(self, view: BatchView) -> tuple[_Cells, tuple, Fraction, bool, str, str]:
+        """The step's grid, its coordinates there, its lookup, whether that is
+        one node's, the cells read, and how far past the KV pool; or a refusal."""
+        cells, at = self.locate(view)
+        value, on_node, cell, beyond = self.read(cells, view, at)
+        read = self.longest(view, at)
+        if read is None:
+            return cells, at, value, on_node, cell, beyond
+        alpha, top_at = read
+        top, _, top_cell, top_beyond = self.read(cells, view, top_at)
+        value += Fraction(alpha) * (top - value)
+        cell = f"{cell}; longest row's cell {top_cell}, alpha {alpha!r}"
+        beyond = "; ".join(p for p in (beyond, top_beyond) if p)
+        return cells, at, value, False, cell, beyond
 
     def locate(self, view: BatchView) -> tuple[_Cells, tuple[Fraction, ...]]:
         """The grid a step is read in and its coordinates there; or a refusal."""
@@ -315,7 +404,7 @@ class StepGrid:
         if prefill and decode:
             raise _refused(
                 view,
-                f"a step of {len(prefill)} prefill and {len(decode)} decode rows; "
+                "a step mixing prefill and decode rows; "
                 "the grid prices a step of one kind",
             )
         counts = [n for row in rows for n in (row.query_tokens, row.context_tokens)]
@@ -325,7 +414,7 @@ class StepGrid:
             if n is not None and type(n) is not int
         ]
         if odd:
-            raise _refused(view, f"the count {odd[0]!r} is not an int")
+            raise _refused(view, f"a count is a {type(odd[0]).__name__}, not an int")
         at = coordinates(rows, bool(prefill))
         if prefill:
             if view.produces_output is None:
@@ -340,7 +429,7 @@ class StepGrid:
             if widest > 1:
                 raise _refused(
                     view,
-                    f"a decode row computes {widest} tokens; the decode grid has "
+                    "a decode row computes more than one token; the decode grid has "
                     "no N_Q axis",
                 )
             if self.graph_mode == "eager":
@@ -348,7 +437,7 @@ class StepGrid:
             elif view.capture_rung is None:
                 raise _refused(
                     view,
-                    f"a decode step of {len(decode)} rows replays no graph, "
+                    "a decode step replays no graph, "
                     "and a replay bundle has no eager decode",
                 )
             else:
@@ -376,17 +465,8 @@ class StepGridBackend(CostBackend):
             )
         view, rows = batch_view, batch_view.requests
         if view.image_tokens:
-            raise _refused(view, IMAGES.format(view.image_tokens))
-        cells, at = self.grid.locate(view)
-        try:
-            value, on_node, cell = cells.lookup(view, at)
-            beyond = ""
-        except CostRefused:
-            pool = self.grid.pool
-            extended = pool and not view.prefill and cells.past_pool(view, at, *pool)
-            if not extended:
-                raise
-            (value, cell, beyond), on_node = extended, False
+            raise _refused(view, IMAGES)
+        cells, at, value, on_node, cell, beyond = self.grid.value(view)
         homogeneous = len({(r.query_tokens, r.context_tokens) for r in rows}) == 1
         looked_up = "measured" if on_node and homogeneous else "interpolated"
         lookup = float(value * self.grid.unit)

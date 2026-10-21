@@ -16,6 +16,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import types
@@ -24,6 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 from test_artifact_invalidation import BASE, STANZA
+from test_drive_gpu import FREE, _plant
 from test_memory_readings import (
     CONFIG_JSON,
     DOCUMENT,
@@ -36,6 +38,7 @@ from test_memory_readings import (
 from test_run_step_grid import deployment
 from test_vertical_slice import _run_file
 
+from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import cli
 from atom.compass import run as compass_run
 from atom.compass.artifacts import (
@@ -50,7 +53,8 @@ from atom.compass.artifacts import (
     machine_spec_digest,
     member_name,
 )
-from atom.compass.drive import measure_memory
+from atom.compass.drive import gpu, measure_memory, serve
+from atom.compass.drive.gpu import GpuRefusal
 from atom.compass.memory import ModelTerms, device_readings, reserves
 from atom.compass.memory.readings import MemoryReadings
 from atom.compass.run import memory
@@ -246,6 +250,102 @@ def test_the_engine_session_starts_the_command_beside_before_the_engine(
     assert started.value.args == (["lmcache", "server", "-p", "1"], {})
 
 
+#: An engine that starts two members in its process group, each taking argv[2]
+#: seconds to exit once signalled ("stays": never), writes their pids to
+#: argv[1] once both are up, and exits.
+GROUP = """\
+import subprocess, sys
+s = sys.argv[2]
+handler = "signal.SIG_IGN" if s == "stays" else f"lambda *a: (time.sleep({s}), sys.exit())"
+member = (
+    "import signal, sys, time\\n"
+    f"signal.signal(signal.SIGTERM, {handler})\\n"
+    "print(flush=True)\\n"
+    "time.sleep(600)\\n"
+)
+up = [
+    subprocess.Popen([sys.executable, "-c", member], stdout=subprocess.PIPE)
+    for _ in range(2)
+]
+for m in up:
+    m.stdout.readline()
+with open(sys.argv[1], "w") as f:
+    f.write(" ".join(str(m.pid) for m in up))
+"""
+
+
+@pytest.fixture
+def group_start(tmp_path, monkeypatch):
+    """`main`'s arguments for a start of `GROUP` on GPU 5, between the real GPU
+    checks; the planted `rocm-smi` lists a member on GPU 5 until it has exited.
+    SIGKILL lands as SIGTERM, which a member takes its time to obey: no CPU
+    process outlives a SIGKILL, and the members stand in for ones still exiting
+    when the engine's leader has."""
+    kill, started = os.killpg, []
+    members = tmp_path / "members"
+
+    def start(exit_s: str) -> list[str]:
+        r, argv = a_start(tmp_path, monkeypatch, STACK)
+        out = _plant(tmp_path, monkeypatch, FREE)
+        smi = tmp_path / "bin" / "rocm-smi"
+        listed = (
+            f"for p in $(cat {members} 2>/dev/null); do\n"
+            "  s=$(sed 's/.*) //' /proc/$p/stat 2>/dev/null | cut -d' ' -f1)\n"
+            '  [ -n "$s" ] && [ "$s" != Z ] && '
+            "printf 'PID %s is using 1 DRM device(s):\\n5\\n' $p\n"
+            "done\n"
+        )
+        smi.write_text(
+            smi.read_text().replace("*--showpids*)\n", "*--showpids*)\n" + listed)
+        )
+
+        def popen(command, **kwargs):
+            ranks_wrote(out, r.config, [READINGS[2]] * 2)
+            group = [sys.executable, "-c", GROUP, str(members), exit_s]
+            started.append(subprocess.Popen(group, **kwargs))
+            return started[-1]
+
+        started_by = SimpleNamespace(
+            Popen=popen,
+            STDOUT=subprocess.STDOUT,
+            TimeoutExpired=subprocess.TimeoutExpired,
+        )
+        monkeypatch.setattr(measure_memory, "subprocess", started_by)
+        monkeypatch.setattr(measure_memory, "quiet", gpu.quiet)
+        sent = {signal.SIGKILL: signal.SIGTERM}
+        monkeypatch.setattr(os, "killpg", lambda g, sig: kill(g, sent.get(sig, sig)))
+        return argv
+
+    yield start
+    for engine in started:
+        with contextlib.suppress(ProcessLookupError):
+            kill(engine.pid, signal.SIGKILL)
+
+
+def test_the_after_check_waits_for_members_that_outlive_the_engine(
+    tmp_path, group_start
+):
+    """The named result: each member exits 3 s after the engine's stop."""
+    measure_memory.main(group_start("3"))
+
+    assert (tmp_path / "out" / "gpu_after.txt").read_text() == FREE
+    assert (tmp_path / "out" / "memory_readings.json").exists()
+
+
+def test_a_member_that_stays_fails_the_after_check_naming_it(
+    tmp_path, group_start, monkeypatch
+):
+    monkeypatch.setattr(serve, "STOP_GRACE_S", 1)
+
+    with pytest.raises(GpuRefusal) as refused:
+        measure_memory.main(group_start("stays"))
+
+    on = [
+        f"GPU 5 has PID {p} on it" for p in (tmp_path / "members").read_text().split()
+    ]
+    assert str(refused.value) == f"{', '.join(on)} after the run, so it fails"
+
+
 def starts_autotuning(monkeypatch, r, out, autotuned, field="autotuned_kernels"):
     """Engine starts that write each rank's file with the next count in
     `autotuned` under `field`, kernels inductor autotuned unless named, and
@@ -398,6 +498,29 @@ def test_a_pd_connector_reads_the_readings_measured_without_one(tmp_path):
     measured = memory.load(tmp_path / "store", r.config, MACHINE, 0).values
     r.config.kv_transfer_config = {"kv_connector": "moriio", "kv_role": "kv_producer"}
     assert memory.load(tmp_path / "store", r.config, MACHINE, 0).values == measured
+
+
+@pytest.mark.parametrize("moved", ["enable_tbo", "ladder", "env"])
+def test_a_pd_decode_side_reads_its_own_entry_beside_the_prefill_sides(
+    tmp_path, monkeypatch, moved
+):
+    """The 1P1D decode side starts without --enable-tbo, on its own capture
+    ladder and without the prefill side's GPU_MAX_HW_QUEUES; each alone keys
+    its readings apart from the prefill side's."""
+    for name in PERFORMANCE_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GPU_MAX_HW_QUEUES", "5")
+    r, store = deployment(tmp_path, enable_tbo=True), tmp_path / "store"
+    prefill = memory.load(store, r.config, MACHINE, 0).values
+    if moved == "enable_tbo":
+        r.config.enable_tbo = False
+    elif moved == "ladder":
+        r.config.capture_sizes = [1, 2, *range(4, 257, 4)]
+    else:
+        monkeypatch.delenv("GPU_MAX_HW_QUEUES")
+
+    publish_readings(store, r.config, readings=READINGS[2])
+    assert memory.load(store, r.config, MACHINE, 0).values == READINGS[2] != prefill
 
 
 def test_ranks_whose_reserves_spread_past_the_limit_publish_nothing(tmp_path):

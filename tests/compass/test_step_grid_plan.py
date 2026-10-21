@@ -276,7 +276,7 @@ def test_prefill_is_planned_by_whether_the_chunk_produces_output(tmp_path, monke
         [2, 32, 64],
     ]
     assert planned["counts"] == {
-        "decode rung 4": 2,
+        "decode rung 4": 4,
         "prefill no_output": 3,
         "prefill output": 6,
     }
@@ -297,14 +297,18 @@ def test_decode_is_planned_on_the_targets_ladder_and_the_margin_widens_every_axi
         "4": [3, 4],
         "8": [5, 8],
     }
-    # B = 3 on rung 4, c 90 to 92 between the nodes 64 and 128.
-    assert located(tmp_path, narrow)["decode"] == [[4, 3, 64], [4, 3, 128]]
-    # One node outward on B and c, and the rungs either side.
+    # B = 3 on rung 4, c 90 to 92 between the nodes 64 and 128, on to its
+    # longest row's, c 200 to 202 between 192 and 256.
+    assert located(tmp_path, narrow)["decode"] == [
+        [4, 3, c] for c in (64, 128, 192, 256)
+    ]
+    # One node outward on B and c, max_model_len - 1 above 256, and the rungs
+    # either side.
     assert wide["decode"] == [
         [rung, b, c]
         for rung, bs in ((2, [2]), (4, [3, 4]), (8, [5, 8]))
         for b in bs
-        for c in (0, 64, 128, 192)
+        for c in (0, 64, 128, 192, 256, 2047)
     ]
     assert [1, 64, 192] in wide["prefill no_output"]
 
@@ -349,7 +353,8 @@ def test_a_rung_between_planned_rungs_is_planned_on_its_own_c_nodes(
 def test_the_margin_reads_a_neighbouring_rungs_own_c_nodes(tmp_path, monkeypatch):
     """The step's cell on rung 4 is c 64..128. At a 12-block pool rung 2's c
     nodes are 0, 64, 95 (its KV limit), 128, ..., so one node of margin spans
-    0 to 192 there, and 128 and 192 do not fit."""
+    0 to 192 there; 128 fits with the two rows sharing 6 blocks, and 192 does
+    not fit sharing all 12 full ones."""
     directory = record(tmp_path, monkeypatch, *MIXED)
     planned = plan(directory, margin=1, engine={"num_kvcache_blocks": 12})
 
@@ -357,6 +362,7 @@ def test_the_margin_reads_a_neighbouring_rungs_own_c_nodes(tmp_path, monkeypatch
         [2, 2, 0],
         [2, 2, 64],
         [2, 2, 95],
+        [2, 2, 128],
     ]
 
 
@@ -374,15 +380,15 @@ def test_the_margin_reads_a_neighbouring_rungs_own_c_nodes(tmp_path, monkeypatch
             "20 KV blocks are above num_kvcache_blocks",
             [2, 64, 64],
         ),
-        # 3 decode rows of 64 cached + 1 tokens hold 5 blocks of 16 each;
-        # counting 65 // 16 = 4 a row would fit the 12. 63 is c_max(3).
+        # 3 decode rows of 192 cached + 1 tokens hold 13 blocks of 16 each,
+        # 12 of them full and shared; at 128 they share 8 of 9 to fit the 12.
         (
             {"num_kvcache_blocks": 12},
             {},
             "decode rung 4",
-            [4, 3, 64],
-            "15 KV blocks are above num_kvcache_blocks",
-            [4, 3, 63],
+            [4, 3, 192],
+            "15 KV blocks are above num_kvcache_blocks, the rows sharing 12",
+            [4, 3, 128],
         ),
         (
             {},
@@ -451,6 +457,26 @@ def test_the_limits_are_nodes_and_each_c_range_ends_on_one(tmp_path, monkeypatch
             assert infeasible(target, b, b, runs[-1] + 1, False)
 
 
+def test_a_decode_point_past_the_kv_pool_is_planned_shared_and_read_measured(
+    tmp_path, monkeypatch
+):
+    """At a 12-block pool, 3 decode rows on c 64 and on 128 hold 15 and 27
+    blocks apart; sharing the fewest leading blocks that fit, 2 and 8, they
+    hold 11. MIXED's decode steps, between the two, are read off both."""
+    directory = record(tmp_path, monkeypatch, *MIXED)
+    planned = plan(directory, engine={"num_kvcache_blocks": 12})
+    points = located(tmp_path, planned)
+
+    shared = {
+        (x["rung"], len(x["rows"]), x["rows"][0][1] - 1): x.get("shared", 0)
+        for x in planned["lines"]
+        if x["rung"]
+    }
+    assert shared == {(4, 3, 64): 2, (4, 3, 128): 8}
+    out = coverage(tmp_path, measured(planned, points), directory)
+    assert (out["extrapolated"], out["fallback"], out["share"]) == (0, 0, 1.0)
+
+
 def test_a_rung_gains_a_b_node_where_steps_reach_past_the_rungs_kv_limit(
     tmp_path, monkeypatch
 ):
@@ -477,7 +503,7 @@ def test_coverage_counts_apart_the_prefill_steps_cached_past_the_top_c_node(
     directory = record(tmp_path, monkeypatch, 2040, budget=48)
     planned = plan(directory)
     last = f"{directory} dp0 step 42"
-    reason = "c=2016 is outside the prefill output grid's nodes 0..2000"
+    reason = "c is above the prefill output grid's nodes 0..2000"
     assert planned["bounds"]["max_num_batched_tokens"] == 48
     assert planned["unplaced"] == [{"step": last, "reason": reason}]
 
@@ -688,3 +714,45 @@ def test_no_step_is_refused(tmp_path):
         plan(tmp_path)
     with pytest.raises(ValueError, match="there is no step to read"):
         step_grid_plan.coverage(None, [])
+
+
+def test_a_grid_holding_alpha_reads_every_planned_steps_longest_row_measured(
+    tmp_path, monkeypatch
+):
+    """The decode steps of 200-, 20- and 50-token prompts read their mean near
+    c 90 and their longest row near c 200, two cells apart; the plan measures
+    both, so with alpha on every rung each step is read at both."""
+    records = [record(tmp_path, monkeypatch, *n) for n in (MIXED, SHORT)]
+    planned = plan(*records)
+    member = measured(planned, located(tmp_path, planned))
+    alpha = {"intercept": 1.0, "ratio": 0.0, "spread": 0.0}
+    member["grid"]["decode"]["alpha"] = dict.fromkeys(map(str, LADDER), alpha)
+    grid = StepGrid(member["grid"])
+
+    ragged = 0
+    for _, line in steps(*records)[0]:
+        if line["rows"][0][2]:
+            cell = grid.value(view(line))[4]
+            ragged += "longest row's cell" in cell
+    assert ragged > 0
+
+
+def test_coverage_names_a_missing_corner_of_the_longest_rows_cell_alpha_reads(
+    tmp_path, monkeypatch
+):
+    """MIXED's decode steps read their mean in the cell c 64..128 and, with
+    alpha on rung 4, their longest row in c 192..256; with (B 3, c 256)
+    unmeasured, each is declined, and that corner named."""
+    records = [record(tmp_path, monkeypatch, *MIXED)]
+    planned = plan(*records)
+    member = measured(planned, located(tmp_path, planned), drop=("decode", [4, 3, 256]))
+    alpha = {"intercept": 1.0, "ratio": 0.0, "spread": 0.0}
+    member["grid"]["decode"]["alpha"] = {"4": alpha}
+    backend = loaded(tmp_path, member, grid="alpha-minus")
+    named = steps(*records)[0]
+
+    out = step_grid_plan.coverage(backend, named)
+
+    assert out["missing"] == {"decode rung 4": [[3, 256]]}
+    declined = [d["step"] for d in out["declined"]]
+    assert declined == refusing(backend, named) != []

@@ -16,11 +16,15 @@ import itertools
 import json
 import math
 import re
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from test_artifact_invalidation import moved
 from test_artifact_store import stanza
+from test_backend_step_grid import past_pool_alpha
+from test_backend_step_grid import view as rows_view
 from test_backend_step_linear_fit import _record
 from test_bench_window import BUSY, MS, Bench
 from test_bench_window import batch as bench_batch
@@ -37,12 +41,22 @@ from atom.compass.artifacts import (
     Topology,
     member_name,
 )
-from atom.compass.backends import BatchView, CostRefused, RequestShape
-from atom.compass.backends.step_grid import StepGridBackend, equivalent_shape
+from atom.compass.backends import (
+    BatchView,
+    CostRefused,
+    RequestShape,
+    step_grid_fit,
+    step_grid_plan,
+)
+from atom.compass.backends.step_grid import (
+    StepGridBackend,
+    equivalent_shape,
+    length_statistics,
+)
 from atom.compass.backends.step_grid_residual import Residual, order, raggedness
 from atom.compass.backends.step_labels import digest
 from atom.compass.bench import window
-from atom.compass.bench.measure import measurement_key
+from atom.compass.bench.measure import measurement_key, view_of
 from atom.compass.fit.samples import MEMBER
 from atom.compass.run import step_grid
 from atom.compass.spec import MachineSpec
@@ -103,8 +117,10 @@ def time(line) -> float:
 
 
 def factor(line) -> float:
+    """The residual's planted factor: on order, and on prefill raggedness too."""
     rows = view(line).requests
-    return 1.25 * math.exp(0.2 * float(order(rows)) - 0.1 * float(raggedness(rows) - 1))
+    ragged = 0 if rows[0].decode else float(raggedness(rows) - 1)
+    return 1.25 * math.exp(0.2 * float(order(rows)) - 0.1 * ragged)
 
 
 @pytest.fixture
@@ -120,10 +136,11 @@ def run(tmp_path):
     return r, here, configuration
 
 
-def record(tmp_path, run, lines, name="a", trace="trace-300", session=300):
+def record(tmp_path, run, lines, name="a", trace="trace-300", session=300, blocks=1024):
     """`tmp_path/name`, a real run's record of `lines`, each timed at its lookup
-    times `factor`, with the export `client.json` of the client run sending it
-    from `trace`, which the export gives `session`."""
+    times `factor`, on a pool of `blocks` KV blocks, with the export
+    `client.json` of the client run sending it from `trace`, which the export
+    gives `session`."""
     r, _, configuration = run
     directory = tmp_path / name
     path = directory / "steps" / "dp0.jsonl"
@@ -137,7 +154,7 @@ def record(tmp_path, run, lines, name="a", trace="trace-300", session=300):
     path.write_text("".join(json.dumps(x) + "\n" for x in written))
     export = {"requests": sent, "sessions": {trace: session}}
     (directory / "client.json").write_text(json.dumps(export))
-    engine = {**step_grid.keyed(r.config), **BOUNDS, "num_kvcache_blocks": 1024}
+    engine = {**step_grid.keyed(r.config), **BOUNDS, "num_kvcache_blocks": blocks}
     (path.parent / "dp0.engine.json").write_text(json.dumps(engine))
     kind, revision = configuration["source_root"].split("-", 1)
     run_json = {
@@ -276,6 +293,31 @@ def test_a_fitted_bundle_validates_its_held_out_batches_and_not_a_batch_outside_
         del fitted_kind["held_out"]
     bare = StepGridBackend(backend.grid, Residual(residual), "bare")
     assert [validated(x, bare) for x in held] == [o and False for o in outcomes]
+
+
+def test_a_decode_node_past_the_pool_is_measured_shared_and_read_as_measured(
+    tmp_path, run
+):
+    """At a 511-block pool, 8 decode rows on c 1023 hold 512 blocks apart; the
+    plan has them share 1, and puts c 1007, their KV limit, among rung 8's c
+    nodes. The bundle states the share, and a step on that node reads it."""
+    lines = nodes() * 4 + mixed()
+    a = record(tmp_path, run, lines, blocks=511)
+    engine = json.loads((a / "steps/dp0.engine.json").read_text())
+    planned = step_grid_plan.plan(DEFINITION, enumerate(lines), {"a": engine})
+    for line in planned["lines"]:
+        measured(tmp_path, run, view_of(line))
+
+    copy = fitted(tmp_path, a, *clients(a))
+
+    points = copy["params"]["grid"]["decode"]["points"]
+    assert [(p["at"], p["shared"]) for p in points if "shared" in p] == [
+        ([8, 8, 1023], 1)
+    ]
+    top = view(batch([(1, 1024, True)] * 8))
+    (term,) = loaded(tmp_path, run, copy).price(top).terms
+    assert term.provenance.source == "step-grid"
+    assert term.provenance.detail.split(";")[0].endswith("measured")
 
 
 def test_a_planned_point_the_store_does_not_hold_refuses_naming_each(tmp_path, run):
@@ -421,7 +463,7 @@ def test_a_target_the_grid_refuses_is_named_and_a_cut_one_counted(tmp_path, run)
 
     [step] = report["unpriced"]
     assert step["step"].endswith(f" dp0 step {len(nodes()) * 4 + 60}")
-    assert "T=8 is outside the prefill output grid's nodes 16..256" in step["reason"]
+    assert "T is below the prefill output grid's nodes 16..256" in step["reason"]
     assert report["cut"] == {"mixed": 1}
 
 
@@ -442,3 +484,108 @@ def test_a_flag_step_grid_does_not_read_or_lacks_refuses(tmp_path, run, args, na
     with pytest.raises(SystemExit, match=re.escape(named)):
         fit(tmp_path, "fit steps", *argv)
     assert not (tmp_path / "store" / "step_grid_bundle").exists()
+
+
+def ragged_lines(seed, n, rows=(2, 9), low=400):
+    """`n` decode batches at rung 8, of 2 to 8 rows on contexts `low` to 1024,
+    so the longest row is at most 2.6 times the mean."""
+    rng = np.random.default_rng(seed)
+    return [
+        batch([(1, int(k), True) for k in rng.integers(low, 1025, rng.integers(*rows))])
+        for _ in range(n)
+    ]
+
+
+def alpha_true(rows) -> float:
+    ratio, _ = length_statistics(rows)
+    return 0.2 + 0.3 * ratio
+
+
+def ragged_time(line) -> float:
+    """`time`, but a decode line is read `alpha_true` of the way from B rows at
+    its mean to B rows at its longest row."""
+    rows = view(line).requests
+    if not rows[0].decode:
+        return planted_time(line)
+    cached = [r.context_tokens - 1 for r in rows]
+    b, mean = len(rows), sum(cached) / len(rows)
+
+    def g(c):
+        return 2e-3 + 1e-5 * b + 1e-7 * c + 1e-9 * b * c
+
+    return g(mean) + alpha_true(rows) * (g(max(cached)) - g(mean))
+
+
+planted_time = time
+
+
+@pytest.mark.parametrize(
+    "records_alpha,steps",
+    [(True, 120), (False, 120), (True, 50)],
+    ids=["kept", "dropped", "one cell"],
+)
+def test_alpha_is_fitted_on_ragged_views_and_kept_only_where_no_cell_gets_worse(
+    tmp_path, run, monkeypatch, records_alpha, steps
+):
+    """The ragged views read alpha = 0.2 + 0.3 (longest / mean - 1). Where the
+    calibration records run that way too, each record's steps priced by a
+    residual fitted on the other's come nearer their times with alpha, and the
+    rung keeps it; where they run at their mean, alpha moves them away, and the
+    grid holds none. Nor does it when the second record has fewer than 100
+    steps at the rung: a rung needs two cells."""
+    g = record(tmp_path, run, nodes(), name="g")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    views = [
+        measured(tmp_path, run, x, "ragged", ragged_time(x))
+        for x in ragged_lines(5, 40)
+    ]
+    if records_alpha:
+        monkeypatch.setattr(sys.modules[__name__], "time", ragged_time)
+    cells = [
+        record(tmp_path, run, ragged_lines(s, n), name=name)
+        for s, n, name in ((6, 120, "a"), (7, steps, "b"))
+    ]
+
+    copy = fitted(
+        tmp_path,
+        *cells,
+        *views,
+        *clients(g),
+        *[a for c in cells for a in clients(c)],
+        grid="g",
+    )
+
+    report, grid = copy["report"]["alpha"]["8"], copy["params"]["grid"]
+    assert report["views"] == 40 and report["unread"] == []
+    terms = report["forms"][report["form"]]["terms"]
+    assert terms[:2] == pytest.approx([0.2, 0.3], abs=1e-6)
+    kept = records_alpha and steps >= 100
+    assert len(report["cells"]) == 1 + (steps >= 100) and report["kept"] is kept
+    assert set(grid["decode"]["alpha"]) == ({"8"} if kept else set())
+    assert copy["params"]["sources"] == ["record"]
+    assert list(copy["report"]["kinds"]["decode"]["sources"]) == ["record"]
+    if records_alpha and not kept:
+        return  # the records run ragged, and the grid reads them at their mean
+    backend = loaded(tmp_path, run, copy)
+    for line in ragged_lines(8, 10):
+        priced = backend.price(view(line)).seconds
+        expected = ragged_time(line) if records_alpha else planted_time(line)
+        assert priced == pytest.approx(expected * factor(line), rel=1e-5)
+
+
+def test_alpha_counts_the_views_it_reads_at_their_longest_row_past_the_kv_pool():
+    """32 rows, 31 at c 600 and the longest at c 900 or 1500: the pool holds 32
+    rows to c 1151, so a longest row at 1500 is read past it, and counted."""
+    views = [
+        SimpleNamespace(
+            view=rows_view(*[(1, 601, True)] * 31, (1, c + 1, True), rung=32),
+            device_s=5e-3,
+        )
+        for c in (900, 1500) * 4
+    ]
+
+    _, report = step_grid_fit._alpha(past_pool_alpha().grid, views, seed=0)
+
+    assert report["32"]["views"] == 8 and report["32"]["unread"] == []
+    assert report["32"]["past_pool"] == 4

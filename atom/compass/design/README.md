@@ -45,12 +45,13 @@ Where a decision looks odd, it is usually principle 1 or 2 being applied literal
 | **5** | **Start small; cut work into stages that are individually verifiable.** | M1's fake model exists to validate the clock, the KV path and the harness *before* any real cost model. |
 | **6** | **Refuse rather than guess. The only fallback is along method inside one granularity, and its share is always reported.** A declined answer with a named reason is a result. A guessed one is a defect. | Everywhere. The archetypal failure is in *Conventions* below. |
 
-Two more that the evidence added, and that are not in the original brief:
+Added later, from the evidence and the owner's rulings, and not in the original brief:
 
 | # | Principle | Why it was added |
 |---|---|---|
 | **7** | **Never report an aggregate without its decomposition.** | Aggregates have hidden compensating errors here at least six times. See finding 2. |
 | **8** | **Every claim carries its measurement.** A number without a source is a defect. | Several "known" constants turned out to be one data point. |
+| **9** | **Model ATOM as it is meant to run.** An ATOM functional or performance bug gets no price term, probe field, host segment or planner rule. It is filed against ATOM under the [`atom-issue`](https://github.com/jgong5/ATOM/issues?q=label%3Aatom-issue) label for ATOM's side to fix, and the residual it leaves is stated in the named result of the task that found it. | Measured gaps that were ATOM's own: PP's gloo round trip before the RCCL receive and its serial RCCL parts ([#1559 Ruling](https://github.com/jgong5/ATOM/issues/1559#issuecomment-6266312440)), and gluon `pa_decode` running a 128- or 256-token split faster than its neighbours ([#1752 Ruling](https://github.com/jgong5/ATOM/issues/1752#issuecomment-6306960229)). |
 
 ---
 
@@ -542,7 +543,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it settles |
 |---|---|---|
-| [`07`](07_calibration_toolchain.md) | Calibration and Benchmarking Toolchain | The phases and the commands that run them; the backend that needs a measurement plans it; the step bench is `EngineCore` without its scheduler, with one window for every step; the op bench times each leaf from its contract inside ATOM's forward with a stub model, cold, and `fit ops` interpolates only between same-kernel neighbours. One recommended flow per half, steps and ops. The minimal recipe: one full-engine run at TP1, plus one TP2 transfer test, plus an engine start per configuration (`measure memory`). Four classes of communication pricing. The artifact store, its keys and its invalidation matrix. |
+| [`07`](07_calibration_toolchain.md) | Calibration and Benchmarking Toolchain | The phases and the commands that run them; the backend that needs a measurement plans it; the step bench is `EngineCore` without its scheduler, with one window for every step; the op bench times each leaf from its contract, cold, at points ATOM's runner prepares without a forward, and `fit ops` interpolates only between same-kernel neighbours. One recommended flow per half, steps and ops. The minimal recipe: one full-engine run at TP1, plus one TP2 transfer test, plus an engine start per configuration (`measure memory`). Four classes of communication pricing. The artifact store, its keys and its invalidation matrix. |
 | [`09`](09_fitting_and_law_selection.md) | Fitting and Law Selection | How measurements become a model: fit relative error, per-rung decode, hull guards not bounding boxes, and why leave-one-out cannot choose a family. Owns coverage geometry for every other document. |
 
 ### Part IV — How it is driven and judged

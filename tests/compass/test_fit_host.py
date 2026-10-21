@@ -6,7 +6,10 @@ file on `test_run_step_grid.py`'s deployment."""
 import json
 import re
 
+import numpy as np
 import pytest
+from test_backend_step_labels import pulled
+from test_fit_samples import edit
 from test_fit_steps import (  # noqa: F401
     DIGEST,
     clients,
@@ -17,12 +20,14 @@ from test_fit_steps import (  # noqa: F401
     served,
 )
 from test_memory_readings import META_8B
-from test_run_step_grid import deployment, publish, run_file
+from test_run_step_grid import B37, decode, deployment, publish, run_file
 
 from atom.compass import run as compass_run
 from atom.compass.artifacts import Key, Kind
 from atom.compass.backends.step_labels import digest
 from atom.compass.backends.step_linear_fit import fit_host, label_records
+from atom.compass.drive.aiter_jit import BUILDS
+from atom.compass.runner.overrides import OUT_SEGMENT, forward_shape
 
 
 def host_laws_key(key) -> Key:
@@ -72,3 +77,39 @@ def test_a_record_without_its_host_key_refuses(tmp_path):
     with pytest.raises(SystemExit, match=re.escape(named)):
         fit(tmp_path, "fit host", a, *clients(a))
     assert not (tmp_path / "store").exists()
+
+
+def test_a_record_whose_server_built_an_aiter_module_refuses_naming_it(tmp_path):
+    a = record(tmp_path / "a", 19)
+    edit(a / "run.json", lambda r: r.update({BUILDS: ["mha_varlen_fwd"]}))
+
+    named = f"{a} is not fitted: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    with pytest.raises(SystemExit, match=re.escape(named)):
+        fit(tmp_path, "fit host", a, *clients(a))
+    assert not (tmp_path / "store").exists()
+
+
+def test_records_with_pull_stamps_give_every_kind_an_E_out_law_a_run_prices(
+    tmp_path, monkeypatch
+):
+    r = deployment(tmp_path)
+    publish(tmp_path, r)
+    key = compass_run.host_key(r.config)
+    a = record(tmp_path / "a", 19, key=key)
+    pulled(a / "steps/dp0.jsonl")
+    fit(tmp_path, "fit host", a, *clients(a))
+
+    host = member(tmp_path / "store", host_laws_key(key), "params")
+    assert {k: OUT_SEGMENT in v for k, v in host["laws"].items()} == {
+        k: True for k in ("decode", "prefill", "middle")
+    }
+    run = run_file(tmp_path, monkeypatch, host=host)
+    monkeypatch.setenv(compass_run.NOW_ENV, str(tmp_path / "now.bin"))
+    compass_run._PublishedClock(
+        compass_run.ENGINE, compass_run.channel_table(run), None
+    )
+    compass_run.runner(r, META_8B)
+    batch = decode(B37)
+    kind, x = forward_shape(batch)
+    out_s = np.dot(host["laws"][kind][OUT_SEGMENT], x)
+    assert r.forward(batch).out_s == pytest.approx(out_s) and out_s > 0
