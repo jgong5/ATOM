@@ -502,8 +502,8 @@ ATOM's decode step for attention, GDN, six GEMM signatures and `silu_and_mul` at
 and 16, and within 1.1% for nine prefill leaves at two points. That PoC held
 ATOM's dummy weights and ran ATOM's warmup. The runner is the whole model's: a 4-layer
 runner read GDN 12.6% low at B = 16, its state staying in the last-level cache. Without
-ATOM's warmup the PoC read GDN about 5% low, cause not found. This bench reads GDN at
-0.950 of the bench it replaced at decode B = 2 and 16 and 1.000 at prefill; the gap is
+ATOM's warmup the PoC read GDN about 5% low, cause not found. This bench reads GDN about
+5% under the bench it replaced at decode B = 2 and 16 and within 0.1% at prefill; the gap is
 diagnosed on [#1902](https://github.com/jgong5/ATOM/issues/1902) and set up in the
 leaf's own preparation, never by a forward.
 

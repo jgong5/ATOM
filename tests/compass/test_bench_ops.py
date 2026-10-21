@@ -12,6 +12,8 @@ import functools
 import json
 import os
 import pathlib
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -24,6 +26,7 @@ from test_parity_record import _unpriced  # noqa: F401  an autouse fixture
 from atom.compass import cli, ir
 from atom.compass.artifacts import ArtifactStore, Kind, machine_spec_digest
 from atom.compass.bench import ops
+from atom.compass.capture import driverless
 from atom.compass.capture.forward import decode, prefill
 from atom.compass.capture.graph import Traced, build, to_json
 from atom.compass.spec import MachineSpec
@@ -597,29 +600,46 @@ def test_copy_c_rotates_weights_and_instances_and_clones_past_the_first_round():
     assert copies[0][0]["out_dtype"] is torch.bfloat16
 
 
-@pytest.mark.parametrize("kind, key", [("module", "2"), ("context", KEY)])
 def test_a_referenced_module_s_meta_parameters_are_filled_as_load_dummy_xavier(
-    kind, key
+    request, tmp_path
 ):
     # Every parameter of ATOM's model is on the meta device: a leaf reaching
     # one through a module path or its layer's context key reads it on the
     # device, filled as ATOM's `--load_dummy xavier` fills it.
-    layer = torch.nn.Module()
-    layer.A_log = torch.nn.Parameter(torch.empty(4, device="meta"))
-    layer.conv1d = torch.nn.Linear(3, 2, device="meta")
-    runner = _Runner({KEY: layer})
-    runner.model.append(layer)
+    if "COMPASS_ARCH_DECLARED" not in os.environ:
+        # ATOM's loader imports aiter, which needs an arch declared: once per
+        # process, so in a process of its own.
+        env = {**os.environ, "COMPASS_ARCH_DECLARED": "1"}
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+            + [f"{__file__}::{request.node.name}"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+        assert done.returncode == 0, done.stdout[-4000:]
+        return
+    driverless.install(str(tmp_path), "gfx942")
+    layers = {"module": torch.nn.Module(), "context": torch.nn.Module()}
+    for layer in layers.values():
+        layer.A_log = torch.nn.Parameter(torch.empty(4, device="meta"))
+        layer.conv1d = torch.nn.Linear(3, 2, device="meta")
+    runner = _Runner({KEY: layers["context"]})
+    runner.model.append(layers["module"])
     stub = ops.Stub(runner, 10_000)
     stub.placed = [(fctx.ForwardContext(), {})]
-    op = {"op": "x", "args": {"layer": {kind: None}}}
 
-    stub._copy(op, "sig", [{"layer": key}], 0)
+    for kind, key in (("module", "2"), ("context", KEY)):
+        op = {"op": "x", "args": {"layer": {kind: None}}}
+        stub._copy(op, "sig", [{"layer": key}], 0)
 
-    assert {p.device.type for p in layer.parameters()} == {"cpu"}
-    assert torch.equal(layer.A_log, torch.ones(4))
-    assert torch.equal(layer.conv1d.bias, torch.zeros(2))
-    weight = layer.conv1d.weight
-    assert 0 < weight.abs().max() <= (6 / (3 + 2)) ** 0.5
+    for layer in layers.values():
+        assert {p.device.type for p in layer.parameters()} == {"cpu"}
+        # 1-D and bias as xavier fills them; the declared device stubs uniform_
+        assert torch.equal(layer.A_log, torch.ones(4))
+        assert torch.equal(layer.conv1d.bias, torch.zeros(2))
     assert runner.model[0].weight.is_meta  # a module no leaf references
 
 

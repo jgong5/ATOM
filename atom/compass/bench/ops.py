@@ -977,19 +977,20 @@ def _own(module):
 def _fill(module, device) -> None:
     """`module`'s meta parameters moved to `device` and filled as ATOM's
     `--load_dummy xavier` fills a model's."""
-    from atom.model_loader.loader import initialize_dummy_weights
-
     meta = [
         (m, n, p)
         for m in module.modules()
         for n, p in m._parameters.items()
         if p is not None and p.is_meta
     ]
+    if not meta:
+        return
+    from atom.model_loader.loader import initialize_dummy_weights
+
     for m, n, p in meta:
         t = torch.empty_like(p, device=device)
         m._parameters[n] = torch.nn.Parameter(t, requires_grad=False)
-    if meta:
-        initialize_dummy_weights(module, "xavier")
+    initialize_dummy_weights(module, "xavier")
 
 
 def _module_copy(module):
