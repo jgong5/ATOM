@@ -532,14 +532,15 @@ class Stub:
             for _, s in _specs(op["args"])
         )
         for key in instances[0].values():
-            if key in self.contexts:
-                held = kv.get(f"layer_{self.contexts[key].layer_num}")
+            module = self.contexts.get(key)
+            if hasattr(module, "layer_num"):  # a layer of ATOM's KV registry
+                held = kv.get(f"layer_{module.layer_num}")
                 unit = rows if _stateful(held) else blocks
                 # ponytail: a tensor's first dim is its blocks or its state slots
                 size += sum(t.nbytes // t.shape[0] * unit for t in _fields(held))
                 need = None
-            elif key in self.modules:
-                size += sum(t.nbytes for t in _own(self.modules[key]))
+            elif (module := self.modules.get(key, module)) is not None:
+                size += sum(t.nbytes for t in _own(module))
         n = self._cold(size)
         if need is None:  # cycle over every instance's state, which is held anyway
             n = min(CALLS, max(n, len(instances)))
