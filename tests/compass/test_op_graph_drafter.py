@@ -21,7 +21,7 @@ import pytest
 from test_backend_step_linear import _installed, view
 from test_capture_ir import TREE, _ops, _record
 from test_memory_readings import WORKER
-from test_op_graph import MIDDLE, g
+from test_op_graph import MIDDLE, _engine, g
 from test_work import SPEC
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
@@ -108,23 +108,21 @@ def test_a_verify_step_is_cut_at_forward_done_event_into_target_and_drafter(
 
 def test_a_run_prices_a_verify_step_s_drafter_from_its_own_graph(tmp_path_factory):
     root, graphs = capture(1, tmp_path_factory)
+    [drafter] = [graph for key, graph in graphs.items() if key.endswith(" draft")]
     text = json.loads(CONFIG.read_text())
     config = SimpleNamespace(
         model=str(root / "model"),
-        hf_config=SimpleNamespace(
-            architectures=text["architectures"],
-            text_config=SimpleNamespace(num_experts=text["text_config"]["num_experts"]),
-        ),
+        hf_config=SimpleNamespace(architectures=text["architectures"]),
         tensor_parallel_size=1,
         parallel_config=SimpleNamespace(data_parallel_size=1),
         enable_expert_parallel=False,
         enforce_eager=True,
         speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=1),
+        **_engine(drafter),
     )
     machine = MachineSpec.from_mapping(json.loads(MACHINE.read_text()))
     lookup = _op_graphs(str(root / "store"), config, "gfx942")
     cost = OpGraphBackend(machine, lookup, kv="bf16", drafts=1).price(VERIFY)
-    [drafter] = [graph for key, graph in graphs.items() if key.endswith(" draft")]
     flat: dict = {}
     for op in _ops(drafter["region"]):
         if (w := work(op, VERIFY, 1, "bf16")) is not None:
