@@ -170,6 +170,9 @@ mixed the two would misprice both. Its `W_post` is zero and not fitted. On a rec
 that stamps the MTP status wait, an output forward's `W_pre` ends at that wait and a
 further law, `W_inputs`, is fitted from it to the launch
 ([#829](https://github.com/jgong5/ATOM/issues/829)).
+On a record that stamps the engine's input pulls (`dp<r>.pulls.jsonl`), every kind also
+fits `E_out`, from a forward's exit to the pull after it, and `E` runs from that pull to
+the next entry ([#1480](https://github.com/jgong5/ATOM/issues/1480)).
 They use the step linear law's solver: D53's relative error and MAD drops, D57's report, D58's hull. An
 `E` sample whose gap spans an idle engine is cut as idle and counted apart.
 
