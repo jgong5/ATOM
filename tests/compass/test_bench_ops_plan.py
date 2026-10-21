@@ -9,8 +9,11 @@ read back from a real store.
 
 import json
 import os
+import re
+import subprocess
 from concurrent.futures.process import BrokenProcessPool
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -685,6 +688,62 @@ def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
         "aiter.gfx950": {"no measured point": 1}
     }
     assert traced == ([] if "gfx950" in held else ["gfx950"])
+
+
+@pytest.fixture(autouse=True)
+def _declared_arch_ends_with_its_test(monkeypatch):
+    """`--coverage` declares the plan's arch to the whole process, in its
+    environment and Triton's driver; each test's declaration ends with it."""
+    import triton
+
+    monkeypatch.setattr(triton.runtime.driver, "_active", triton.runtime.driver._active)
+    with patch.dict(os.environ):
+        yield
+
+
+def test_coverage_declares_the_plan_s_arch_to_aiter_before_it_builds_the_config(
+    tmp_path, monkeypatch, model_config  # noqa: F811
+):
+    """ATOM's config imports aiter, which asks `GPU_ARCHS` and `rocminfo` for
+    the arch; with no driver, `rocminfo` names none."""
+    driverless_bin = tmp_path / "bin"
+    driverless_bin.mkdir()
+    (driverless_bin / "rocminfo").write_text("#!/bin/sh\nexit 0\n")
+    (driverless_bin / "rocminfo").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{driverless_bin}:{os.environ['PATH']}")
+    asked = []
+
+    def atom_config(args):
+        found = subprocess.run(["rocminfo"], capture_output=True, text=True, check=True)
+        listing = found.stdout
+        asked.append((re.findall(r"\bgfx\w+", listing), os.environ.get("GPU_ARCHS")))
+        return model_config
+
+    monkeypatch.setattr("atom.compass.bench.measure.atom_config", atom_config)
+    store = ArtifactStore(str(tmp_path / "store"))
+    _publish_graph(store, model_config, "gfx950", decode(1))
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "plan.jsonl").write_text("")
+    (out / "run.json").write_text(json.dumps({"device": [{"arch": "gfx950"}]}))
+    graded = _records(tmp_path / "graded", ([[1, 100, True]], 1))
+
+    argv = ["--coverage", graded, "--store", str(store.root), "--out", str(out)]
+    report = ops._coverage_main(argv, [])
+
+    assert asked == [(["gfx950"], "gfx950")]
+    assert report["steps"] == 1
+
+
+def test_coverage_refuses_a_plan_arch_with_no_declared_device_by_name(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "plan.jsonl").write_text("")
+    (out / "run.json").write_text(json.dumps({"device": [{"arch": "gfx90a"}]}))
+    argv = ["--coverage", "graded", "--store", str(tmp_path), "--out", str(out)]
+
+    with pytest.raises(ValueError, match="no declared device for gfx90a"):
+        ops._coverage_main(argv, [])
 
 
 @pytest.mark.parametrize("mode", ["--width", "--plan", "--coverage"])

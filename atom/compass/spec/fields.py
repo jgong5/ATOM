@@ -132,6 +132,8 @@ FIELDS = (
     # The frontend event loop's time to take in one HTTP request.
     Field("host.http_intake.fixed_s", Kind.QUANTITY),
     Field("host.http_intake.per_byte_s", Kind.QUANTITY),
+    # The same for a request that finds no other intake on the loop.
+    Field("host.http_intake.idle_s", Kind.QUANTITY, required=False),
     Field("device.name", Kind.TEXT),
     Field("device.arch", Kind.TEXT),
     Field("device.count_per_node", Kind.COUNT),
