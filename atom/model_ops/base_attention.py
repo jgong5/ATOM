@@ -79,6 +79,8 @@ PA_DENSE_SPLIT_TARGET_WG = 128
 # only bounds the gluon fallback; raising it would just enlarge static scratch
 # a planned call never reads.
 PA_DENSE_SPLIT_MAX = 32
+# A sliding window no context reaches: see run_pa_decode.
+PA_GLUON_NO_WINDOW = 1 << 30
 
 
 def dense_decode_splits(num_seqs: int, num_kv_heads: int) -> int:
@@ -661,6 +663,21 @@ def run_pa_decode(
             max_context_length=context_bound,
         )
 
+    # gluon's PS kernel without a window cuts each context into splits of
+    # cdiv(length, splits) tokens and runs every whole partition a split
+    # touches, so a split that straddles a partition edge runs two: on MI308X
+    # at batch 3 and 8 splits, length 1,016 costs 41.9 us against 33.0 at
+    # 1,024. Its windowed branch gives each split whole partitions instead
+    # (19.8 us at both); a window longer than any context selects it and masks
+    # nothing. Not for one split, which has no edge to straddle, nor for blocks
+    # larger than a partition, where a window takes a different kernel.
+    if (
+        ps
+        and sliding_window <= 0
+        and max_context_partition_num > 1
+        and k_cache.shape[-2] <= context_partition_size
+    ):
+        sliding_window = PA_GLUON_NO_WINDOW
     return torch.ops.aiter.pa_decode_gluon(
         output,
         q,
