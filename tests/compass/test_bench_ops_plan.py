@@ -23,10 +23,11 @@ from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 
 from atom.compass import capture, ir
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
-from atom.compass.bench import ops, ranks
+from atom.compass.bench import ops
 from atom.compass.capture import driverless, forward
 from atom.compass.capture.forward import decode, structure
-from atom.compass.run import _file_digest
+from atom.compass.run import step_grid
+from atom.compass.runner.overrides import schedulable_ladder
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
 from atom.utils import forward_context as fctx
@@ -923,8 +924,9 @@ def test_measure_journals_each_record_as_it_finishes_it(tmp_path, monkeypatch):
     assert [json.loads(line) for line in journal.read_text().splitlines()] == got
 
 
-#: The op_graph reader the `bench` fixture stands `_graph_at` in for.
-GRAPH = ops.graph
+#: What the `bench` fixture stands in for: the op_graph reader and the engine
+#: config an op_graph's key states.
+GRAPH, KEYED = ops.graph, step_grid.keyed
 
 #: A dense model's config.json, as little as ATOM's config reads.
 QWEN3 = {
@@ -955,23 +957,12 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     model.mkdir()
     (model / "config.json").write_text(json.dumps(QWEN3))
     atom_args = ["--model", str(model), "-tp", "8", "--enforce-eager", parallel]
-    config = SimpleNamespace(
-        **vars(CONFIG),
-        model=str(model),
-        hf_config=SimpleNamespace(architectures=QWEN3["architectures"]),
-        tensor_parallel_size=8,
-        parallel_config=SimpleNamespace(data_parallel_size=1),
-        enable_dp_attention=parallel == "--enable-dp-attention",
-        enable_expert_parallel=parallel == "--enable-expert-parallel",
-        enforce_eager=True,
-        pipeline_parallel_size=1,
-        prefill_context_parallel_size=1,
-    )
-    ranks.layout(config)  # as `main` lays out ATOM's config
+    driverless._declare_arch(str(tmp_path), "gfx942")
+    config = forward._config(str(model), 8, atom_args)  # laid out, as `main` does
+    config.max_num_seqs = 4
     published = []
 
     def trace(model, tp, shapes, tmpdir, atom_args, arch):
-        driverless._declare_arch(tmpdir, arch)
         traced = forward._config(model, tp, atom_args)
         for shape in shapes:
             at = structure(traced, shape.phase, device=arch)
@@ -1007,6 +998,7 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
             return fn(*args)
 
     monkeypatch.setattr(ops, "graph", GRAPH)
+    monkeypatch.setattr(step_grid, "keyed", KEYED)
     monkeypatch.setattr(ops, "_child", child)
     monkeypatch.setattr(forward, "device_arch", lambda: "gfx942")
     args = SimpleNamespace(
@@ -1019,11 +1011,13 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
         store, key, config, run, args, "compass measure ops --plan", tmp_path, atom_args
     )
 
-    digest = _file_digest(str(model), "config.json")
-    structure_of_record = f"Qwen3ForCausalLM gfx942 {digest} {widths} decode eager"
-    assert set(published) == {(structure_of_record, 8)}
+    assert published
+    assert {(s.split("} ")[-1], tp) for s, tp in published} == {
+        (f"{widths} decode eager", 8)
+    }
     records = [
         json.loads(x) for x in (tmp_path / "plan.jsonl").read_text().splitlines()
     ]
-    assert {r["shape"] for r in records} == {"decode B=1", "decode B=2", "decode B=4"}
+    rungs = {f"decode B={b}" for b in schedulable_ladder(config)}
+    assert {r["shape"] for r in records} == rungs
     assert not [r for r in records if "refused" in r]
