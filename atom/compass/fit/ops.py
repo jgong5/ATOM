@@ -27,8 +27,10 @@ prefill's B for a kind its rows move (``("rows", op)``). A collective's
 points name their family themselves, `measure ops`'s `exchange`, and its one
 dimension is their message bytes; one apart along it is one row's bytes
 (``row_bytes``, a decode's B or a prefill's T being its rows), when every point
-moves that many bytes per row and is not the DP group's gather or scatter
-or MORI's, whose rows are the group's. Points at one
+moves that many bytes per row. Where ranks' row counts can differ (``all_gatherv``,
+``reduce_scatterv``, MORI's dispatch and combine) it is one byte;
+``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad every
+rank to the same rows and keep one row. Points at one
 coordinate, its other counts or contexts dropped, are one point at their mean
 time. `interpolate` prices a query at a measured point as
 that point; between points, multilinearly over the neighbours that bracket it
@@ -186,10 +188,11 @@ def fit(points) -> dict:
     """The price list's params: per skeleton, the integer positions that follow
     the shape, and per family, its dimensions and its points, each its
     coordinates, its cold time in ns and its kernels, and a collective's
-    ``row_bytes``, None when its points move other bytes per row or when it
-    exchanges the group's gathered rows, which a step may hold between two
-    points' rows (the DP group's gather and scatter, MORI's dispatch and
-    combine)."""
+    ``row_bytes``, None when its points move other bytes per row or when
+    ranks' row counts can differ (``all_gatherv``, ``reduce_scatterv``, MORI's
+    dispatch and combine), so a step may hold between two points' rows;
+    ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad
+    every rank to the same rows and keep it."""
     from atom.compass.bench.ops import DP_GROUP, _dependent
     from atom.compass.capture.peers import MORI
 

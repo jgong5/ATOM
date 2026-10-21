@@ -214,6 +214,7 @@ def test_fit_ops_holds_out_no_point_between_neighbours_one_apart(
 
 
 BEND = "bytes = 8192 reads +10.0%"
+MOE = "atom.model_ops.moe:"
 
 
 @pytest.mark.parametrize(
@@ -225,14 +226,25 @@ BEND = "bytes = 8192 reads +10.0%"
         ((7, 8, 9), (7, 8, 9), [], "prefill T={} B=1", "_c10d_functional.all_"),
         ((7, 8, 9), (7, 8, 9), [BEND], "decode B={}", bench.DP_GROUP[0]),
         ((7, 8, 9), (7, 8, 9), [BEND], "prefill T={} B=1", MORI + ".dispatch"),
+        ((7, 8, 9), (7, 8, 9), [BEND], "decode B={}", bench.DP_GROUP[1]),
+        ((7, 8, 9), (7, 8, 9), [BEND], "prefill T={} B=1", MORI + ".combine"),
+        ((7, 8, 9), (7, 8, 9), [], "decode B={}", MOE + "all_gather_with_padding"),
+        (
+            (7, 8, 9),
+            (7, 8, 9),
+            [],
+            "decode B={}",
+            MOE + "reduce_scatter_with_unpadding",
+        ),
     ],
 )
 def test_fit_ops_holds_out_no_collective_point_between_neighbours_one_row_apart(
     rows, nbytes, declined, shape, op, measured, tmp_path
 ):
     # nbytes in rows of 1024 bytes; the third case's points move other bytes per
-    # row, so a row's bytes are not known; the DP group's and MORI's bytes are
-    # the group's gathered rows, which a step can hold between two points' rows
+    # row, so a row's bytes are not known; all_gatherv's, reduce_scatterv's and
+    # MORI's ranks' rows can differ, so a step can hold between two points' rows;
+    # the padded pair pads every rank to the same rows, so a row keeps its bytes
     fam = json.dumps(["exchange", {"op": op}])
     points = [
         {"shape": shape.format(b), "context": 1024, "op": op}
