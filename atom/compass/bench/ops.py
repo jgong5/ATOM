@@ -21,9 +21,10 @@ rank each of the layout the arguments resolve (`ranks`), its weights a dummy,
 through ATOM's warmup, and a `Stub` takes the place of the model's forward.
 Each point reaches the runner as a batch (`ReplayRule`), so ATOM builds its
 metadata and forward context, and the stub calls each leaf from its contract:
-an activation is random at its shape, dtype and stride; a weight is a tensor
-of the model of that shape, dtype and stride; a metadata tensor is a view of
-ATOM's live metadata (`meta`), whose name the point records, or of
+an activation is random at its shape, dtype and stride, except a router's
+top-k expert ids, drawn uniformly on every copy (`_route`); a weight is a
+tensor of the model of that shape, dtype and stride; a metadata tensor is a
+view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM passes the forward (`TOKEN_IDS`); an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names. A leaf whose operator cannot run so
@@ -127,7 +128,7 @@ from atom.compass.drive.gpu import add_gpu_flag
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below or the
 #: copies a graph reads change.
-PROTOCOL = 7
+PROTOCOL = 8
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -152,6 +153,8 @@ REST = 0.1
 #: the model's forward; `_meta`'s name rule binds an embedding's `indices` to
 #: another index buffer.
 TOKEN_IDS = {("aten.embedding.default", "indices")}
+#: The seed of a copy's drawn expert ids, with the copy's index.
+SEED = 0
 #: The rank every member is written at: the bench is one rank.
 RANK = Topology().ranks()[0]
 #: The variable naming the file a measuring process appends each point's
@@ -388,6 +391,14 @@ class Stub:
             self.weights.setdefault(_spec(t), {})[t.data_ptr()] = t
         self.modules = dict(runner.model.named_modules())
         self.contexts = runner.config.compilation_config.static_forward_context
+        self.moe = sorted(
+            {
+                (m.global_num_experts, m.top_k)
+                for m in self.modules.values()
+                if hasattr(m, "global_num_experts")
+            }
+        )
+        self.loads = []
 
     def __call__(self, input_ids, positions, *args, **kwargs):
         from atom.utils.forward_context import get_forward_context
@@ -519,6 +530,7 @@ class Stub:
         from atom.utils import forward_context
 
         fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
+        self.loads = []
         with refused_together():
             calls = [self._copy(op, sig, instances, 0)]
         # one weight can read a few percent off another of its spec, and every
@@ -565,6 +577,7 @@ class Stub:
             "calls": len(cycle),
             "llc_bytes": self.llc,
             "protocol": PROTOCOL,
+            "routing": _routing(self.loads) if self.loads else None,
         }
 
     def _copy(self, op, sig, instances, c, like=None):
@@ -580,6 +593,8 @@ class Stub:
                 return [
                     build(f"{path}.{i}", v, old and old[i]) for i, v in enumerate(value)
                 ]
+            if isinstance(value, dict) and self._routed(value):
+                return self._route(value, c)
             if isinstance(value, dict) and value.get("role") == "activation" and like:
                 return old
             if _ref(value) and "module" in value:
@@ -598,15 +613,45 @@ class Stub:
         args = op["args"].items()
         return {s: build(s, v, like[0][s] if like else None) for s, v in args}, snap
 
+    def _routed(self, spec) -> bool:
+        """Whether `spec` is a router's top-k expert ids: an integer activation,
+        a row per token, a column per expert an MoE layer of the model takes."""
+        return (
+            spec.get("role") == "activation"
+            and len(spec["shape"]) == 2
+            and not _dtype(spec["dtype"]).is_floating_point
+            and spec["shape"][1] in {k for _, k in self.moe}
+        )
+
+    def _route(self, spec, c):
+        """Copy `c`'s expert ids for `spec`: each row's experts drawn
+        independently and uniformly, distinct, from the model's routed experts,
+        seeded by `SEED` and `c`; the copy's expert loads go to `loads`."""
+        if len(self.moe) > 1:
+            raise ValueError(
+                f"the model's MoE layers route (experts, top-k) {self.moe}: "
+                f"which one draws {_text(spec)} is not known"
+            )
+        [(experts, k)] = self.moe
+        device = self.runner.device
+        seed = torch.Generator(device).manual_seed(SEED * CALLS + c)
+        draw = torch.rand(spec["shape"][0], experts, generator=seed, device=device)
+        ids = draw.topk(k).indices
+        self.loads.append(torch.bincount(ids.flatten(), minlength=experts).tolist())
+        return _random(spec, device).copy_(ids)
+
     def _reweigh(self, op, like, c):
         """Copy `like` of `op`'s call with the c-th weight of each weight
-        argument's spec, its other arguments and forward context shared."""
+        argument's spec and expert ids of its own, its other arguments and
+        forward context shared."""
 
         def build(value, old):
             if isinstance(value, list):
                 return [build(v, o) for v, o in zip(value, old)]
             if isinstance(value, dict) and value.get("role") == "weight":
                 return self._tensor(value, None, c, False)
+            if isinstance(value, dict) and self._routed(value):
+                return self._route(value, c)
             return old
 
         kwargs, snap = like
@@ -626,6 +671,17 @@ class Stub:
                 raise ValueError(f"no tensor of the model is a weight {_text(spec)}")
             return held[c] if c < len(held) else _clone(held[c % len(held)])
         raise ValueError(f"a {role} tensor argument {_text(spec)} is not built")
+
+
+def _routing(loads) -> dict:
+    """The drawn copies' imbalance, recorded and not priced: each copy's
+    experts that took a token, and the most tokens one expert took."""
+    return {
+        "seed": SEED,
+        "experts": len(loads[0]),
+        "activated": [sum(n > 0 for n in load) for load in loads],
+        "max_load": [max(load) for load in loads],
+    }
 
 
 def point_rows(shape, context, pool: int, block_size: int) -> list[list]:
