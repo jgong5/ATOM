@@ -109,7 +109,7 @@ RUN_FILE= CLOCK=
 # takes one more, as the run file states; real, each side's Mooncake side
 # channels take one per rank from its handshake port.
 ports=$(python3 - "$RUN_FILE" "$KV_LINK" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
-import argparse, json, socket, sys
+import argparse, json, random, socket, sys
 from pathlib import Path
 from atom.compass.artifacts import ArtifactRefusal
 from atom.compass.drive import runfile
@@ -120,21 +120,20 @@ flags, words = words[: int(n)], words[int(n) :]
 k = int(words[0])
 prefill, decode = words[1 : 1 + k], words[1 + k :]
 held = []
-def bind(port=0):
-    s = socket.socket()
-    s.bind(("127.0.0.1", port))
-    held.append(s)
-    return s.getsockname()[1]
+# Below the kernel's ephemeral range: a bind to port 0, as ATOM's own ranks
+# make while they load, or an outgoing connection never hands one out.
+ephemeral = int(Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()[0])
 def block(n):
     while True:
+        base = random.randrange(10000, ephemeral - n)
         try:
-            base = bind()
-            for p in range(base + 1, base + n):
-                bind(p)
+            for p in range(base, base + n):
+                held.append(socket.socket())
+                held[-1].bind(("", p))
             return base
         except OSError:
             continue
-router, prometheus = bind(), bind()
+router, prometheus = block(1), block(1)
 if not run_file:
     def ranks(atom_args):
         engine = runfile._engine_args(atom_args)
@@ -148,7 +147,7 @@ try:
     run = runfile.prefill_decode(args, prefill, decode, kv_link)
 except (ValueError, OSError, ArtifactRefusal, SpecRefusal) as refused:
     sys.exit(f"deploy: {refused}")
-clock = bind()
+clock = block(1)
 base = block(run["prefill_data_parallel_size"] * run["decode_data_parallel_size"])
 run |= {"out_dir": str(Path(run_file).parent), "clock_endpoint": f"tcp://127.0.0.1:{clock}"}
 Path(run_file).write_text(json.dumps(run))
@@ -221,6 +220,11 @@ decode_pid >/dev/null || {
 }
 prefill_url=$(url prefill)
 decode_url=$(url decode)
+# The router's requests to each instance, and the wait on the router, go
+# direct, never through a proxy the environment names.
+hosts=127.0.0.1
+for u in "$prefill_url" "$decode_url"; do u=${u#*://} && hosts+=,${u%:*}; done
+export NO_PROXY=$hosts${NO_PROXY:+,$NO_PROXY} no_proxy=$hosts${no_proxy:+,$no_proxy}
 
 ROUTER=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --prometheus-port "$PROMETHEUS_PORT"
     --pd-disaggregation --prefill "$prefill_url" --decode "$decode_url" "${router[@]}")

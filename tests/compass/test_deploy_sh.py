@@ -73,10 +73,13 @@ while True:
     signal.pause()
 """
 ROUTER = """\
-import http.server, json, os, signal, sys
+import http.server, json, os, signal, sys, urllib.request
 argv = sys.argv[1:]
 json.dump({"argv": argv, "pid": os.getpid()}, open(os.environ["PLANTED_ROUTER"], "w"))
 signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+# As atomesh does, it asks each instance first, through any proxy the environment names.
+for flag in ("--prefill", "--decode"):
+    urllib.request.urlopen(argv[argv.index(flag) + 1] + "/health", timeout=10)
 
 class Models(http.server.BaseHTTPRequestHandler):
     def do_GET(self):

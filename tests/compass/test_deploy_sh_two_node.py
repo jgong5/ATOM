@@ -322,3 +322,46 @@ def test_a_stop_as_server_json_appears_stops_the_deployment_whole(
 
     assert script.returncode == 0, out
     assert (d / "run.json").exists()
+
+
+def test_the_router_reaches_each_instance_whatever_proxy_the_environment_names(
+    tmp_path, planted, on  # noqa: F811
+):
+    env, _ = planted
+    for name in ("NO_PROXY", "no_proxy"):
+        env.pop(name, None)
+    env |= dict.fromkeys(("HTTP_PROXY", "http_proxy"), "http://127.0.0.1:1")
+    script = subprocess.Popen(
+        _record(tmp_path, on), env=env, cwd=tmp_path, stdout=subprocess.PIPE
+    )
+    _until(tmp_path / "d" / "server.json", script)
+
+    script.send_signal(signal.SIGTERM)
+    out, _ = script.communicate(timeout=60)
+
+    assert script.returncode == 0, out
+
+
+def test_every_port_the_deployment_holds_free_is_one_no_bind_to_port_0_takes(
+    tmp_path, planted, on  # noqa: F811
+):
+    """ATOM's ranks bind ports the kernel hands out while they load, before
+    Mooncake binds its handshake ports."""
+    env, _ = planted
+    d = tmp_path / "d"
+    script = subprocess.Popen(
+        _record(tmp_path, on), env=env, cwd=tmp_path, stdout=subprocess.PIPE
+    )
+    _until(d / "server.json", script)
+    script.send_signal(signal.SIGTERM)
+    script.communicate(timeout=60)
+
+    router = json.loads((tmp_path / "router.json").read_text())["argv"]
+    ends = [
+        int(router[router.index(f) + 1]) + 1 for f in ("--port", "--prometheus-port")
+    ]
+    for side, ranks in (("prefill", 2), ("decode", 1)):
+        kv = json.loads(json.loads((d / f"{side}.argv.json").read_text())[-1])
+        ends.append(kv["handshake_port"] + ranks)
+    ephemeral = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()[0]
+    assert max(ends) <= int(ephemeral), ends
