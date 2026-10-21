@@ -108,8 +108,10 @@ def time(line) -> float:
 
 
 def factor(line) -> float:
+    """The residual's planted factor: on order, and on prefill raggedness too."""
     rows = view(line).requests
-    return 1.25 * math.exp(0.2 * float(order(rows)) - 0.1 * float(raggedness(rows) - 1))
+    ragged = 0 if rows[0].decode else float(raggedness(rows) - 1)
+    return 1.25 * math.exp(0.2 * float(order(rows)) - 0.1 * ragged)
 
 
 @pytest.fixture
@@ -482,15 +484,20 @@ def ragged_time(line) -> float:
 planted_time = time
 
 
-@pytest.mark.parametrize("records_alpha", [True, False], ids=["kept", "dropped"])
+@pytest.mark.parametrize(
+    "records_alpha,steps",
+    [(True, 120), (False, 120), (True, 50)],
+    ids=["kept", "dropped", "one cell"],
+)
 def test_alpha_is_fitted_on_ragged_views_and_kept_only_where_no_cell_gets_worse(
-    tmp_path, run, monkeypatch, records_alpha
+    tmp_path, run, monkeypatch, records_alpha, steps
 ):
     """The ragged views read alpha = 0.2 + 0.3 (longest / mean - 1). Where the
     calibration records run that way too, each record's steps priced by a
     residual fitted on the other's come nearer their times with alpha, and the
     rung keeps it; where they run at their mean, alpha moves them away, and the
-    grid holds none."""
+    grid holds none. Nor does it when the second record has fewer than 100
+    steps at the rung: a rung needs two cells."""
     g = record(tmp_path, run, nodes(), name="g")
     for line in nodes():
         measured(tmp_path, run, line)
@@ -501,8 +508,8 @@ def test_alpha_is_fitted_on_ragged_views_and_kept_only_where_no_cell_gets_worse(
     if records_alpha:
         monkeypatch.setattr(sys.modules[__name__], "time", ragged_time)
     cells = [
-        record(tmp_path, run, ragged_lines(s, 120), name=n)
-        for s, n in ((6, "a"), (7, "b"))
+        record(tmp_path, run, ragged_lines(s, n), name=name)
+        for s, n, name in ((6, 120, "a"), (7, steps, "b"))
     ]
 
     copy = fitted(
@@ -518,10 +525,13 @@ def test_alpha_is_fitted_on_ragged_views_and_kept_only_where_no_cell_gets_worse(
     assert report["views"] == 40 and report["unread"] == []
     terms = report["forms"][report["form"]]["terms"]
     assert terms[:2] == pytest.approx([0.2, 0.3], abs=1e-6)
-    assert len(report["cells"]) == 2 and report["kept"] is records_alpha
-    assert set(grid["decode"]["alpha"]) == ({"8"} if records_alpha else set())
+    kept = records_alpha and steps >= 100
+    assert len(report["cells"]) == 1 + (steps >= 100) and report["kept"] is kept
+    assert set(grid["decode"]["alpha"]) == ({"8"} if kept else set())
     assert copy["params"]["sources"] == ["record"]
     assert list(copy["report"]["kinds"]["decode"]["sources"]) == ["record"]
+    if records_alpha and not kept:
+        return  # the records run ragged, and the grid reads them at their mean
     backend = loaded(tmp_path, run, copy)
     for line in ragged_lines(8, 10):
         priced = backend.price(view(line)).seconds

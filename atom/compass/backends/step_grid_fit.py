@@ -19,12 +19,13 @@ each `ALPHA_FORMS` form is fitted on the rung's ragged views, by least squares
 on lookup over measured time less 1, `HELD_OUT` of them held out by `seed`;
 a view whose rows read one context, or whose mean or longest row the grid
 does not read, takes no part. The form with the least median absolute error
-on its held-out views is the rung's. A rung keeps it only if a calibration
-cell (a target run) has `CELL_STEPS` decode steps at the rung that the grid
-reads with and without it, and at none of them does the residual, fitted
-without that cell, price the cell's steps at the rung further from their
-times at p50 with alpha than without; rungs that fail drop out and the rest are
-judged again until none fails. The grid holds the alpha of each rung kept.
+on its held-out views is the rung's. A rung keeps it only if two calibration
+cells (target runs) have `CELL_STEPS` decode steps at the rung that the grid
+reads with and without it, a cell with fewer not counted, and at none of them
+does the residual, fitted without that cell, price the cell's steps at the rung
+further from their times at p50 with alpha than without; rungs that fail drop
+out and the rest are judged again until none fails. The grid holds the alpha
+of each rung kept.
 
 Every other target with a device label that the grid answers, past the KV
 pool included, becomes a triple of its view, the lookup and its label, and
@@ -202,7 +203,7 @@ def _kept(grid: dict, terms: dict, targets, seed: int, report: dict) -> list:
                 if (c, rung) in base and (c, rung) in tried
             }
             report[str(rung)]["cells"] = pairs
-            if pairs and all(abs(w) <= abs(o) for o, w in pairs.values()):
+            if len(pairs) >= 2 and all(abs(w) <= abs(o) for o, w in pairs.values()):
                 now.append(rung)
         if now == kept:
             break
