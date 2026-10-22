@@ -2264,7 +2264,8 @@ own process with the policy code untouched. It is (owner ruling on
   (`PDRouter::create_streaming_response`) wait until released, and are handled one at a
   time in (arrival, channel, seq) order. Each sends exactly one message on, stamped at
   its arrival plus the hop out's lookahead, which keeps every path's total, except a
-  prefill response read after its request's cancel (below), which sends nothing. A request is
+  prefill response read after its request's cancel and a cancel whose request is
+  nowhere (below), which send nothing. A request is
   handled once its pair holds load, a prefill response once prefill's load is dropped,
   and a stream's last event once decode's load is dropped. The router prices no work and
   waits with NER only.
