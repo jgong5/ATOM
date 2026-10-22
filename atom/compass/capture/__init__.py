@@ -106,7 +106,7 @@ def population_shapes(names, tbo=False):
 def population_steps(names, tbo=False):
     """Each step the record directories `names` hold, DP's dummy runs aside,
     as its shape, the one the op-level backend prices it at
-    (`op_graph.step_shape`), a prefill's with the rows its DP group's MoE
+    (`op_graph.step_shape`), with the rows its DP group's MoE
     gathered (`moe_rows`), and its step-record line. A decode step verifies
     as many drafts in each row as its shortest row does. Under two-batch
     overlap (`tbo`, ATOM's `enable_tbo`) a DP step the group split, by the
@@ -147,7 +147,10 @@ def population_steps(names, tbo=False):
             except ValueError as exc:
                 raise ValueError(f"{name} step {line['step']} {exc}") from None
             if phase == "decode":
-                yield decode(tokens), line
+                # Every rank decodes `drafts` and one in each row by default.
+                g = line.get("moe_rows")
+                g = None if g == dp * tokens * (drafts + 1) else g
+                yield decode(tokens, g), line
             elif not split:
                 yield prefill(tokens, seqs, line.get("moe_rows")).at(dp), line
             else:
