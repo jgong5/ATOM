@@ -1028,7 +1028,7 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     config.max_num_seqs, config.max_model_len = 4, CONFIG.max_model_len
     published = []
 
-    def trace(model, tp, shapes, tmpdir, atom_args, arch):
+    def trace(model, tp, shapes, tmpdir, atom_args, arch, population=()):
         traced = forward._config(model, tp, atom_args)
         for shape in shapes:
             at = structure(traced, shape.phase, device=arch)
@@ -1106,7 +1106,7 @@ def test_coverage_traces_a_dpa_tp8_graph_and_reads_it_at_tp1_dp8(tmp_path, monke
     )
     store, traced = ArtifactStore(str(tmp_path / "store")), set()
 
-    def trace(model, tp, shapes, tmpdir, atom_args, arch):
+    def trace(model, tp, shapes, tmpdir, atom_args, arch, population=()):
         config = forward._config(model, tp, atom_args)
         for shape in shapes:
             traced.add(structure(config, shape.phase, device=arch).split("} ")[-1])

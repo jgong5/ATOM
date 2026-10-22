@@ -32,14 +32,18 @@ the token ids ATOM prepared (`TOKEN_IDS`); an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names, its module's meta parameters
 moved to the device and filled as `--load_dummy xavier` fills them (`_fill`),
-and a runner attribute this runner's own; an object is rebuilt from its class
+and a runner attribute this runner's own; a KV tensor is a view of a tensor
+ATOM's KV allocation bound (`_kv`), whose name the point records, the same on
+every copy; an object is rebuilt from its class
 and state as the capture's replay rebuilds one, its tensors built as any other
 argument's, its activations fresh on every copy. A leaf whose operator cannot
-run so refuses by name, a KV tensor argument among them.
+run so refuses by name.
 A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
 
-Cold, by copies. A call's bytes are its tensor arguments' spans, the tensors
+Cold, by copies. A call's bytes are its tensor arguments' spans, a KV
+argument's as many entries of its first dimension as the batch's state slots,
+or its blocks when the model keeps no per-request state, the tensors
 of each module it names and, for a leaf that names a context key, the KV and
 per-request state its layer holds for the batch. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
@@ -52,8 +56,11 @@ Copy c < N takes fresh activations below M and copy c mod M's from there,
 weight c mod the leaf's occurrences, and
 instance c mod I at placement (c div I) mod P, its metadata and module
 tensors cloned past the first round: a placement is the point's batch on KV
-blocks and state slots of its own, for which ATOM prepares the forward context
-again, cloned where it differs from the last placement's. A second graph runs
+blocks and state slots of its own, as many as the pool and the slots hold,
+for which ATOM prepares the forward context
+again, it and the metadata views cloned once each, and only where they differ
+from the last placement's. A KV argument
+places a leaf's copies as a context key does. A second graph runs
 copy 0 K times, warm; with one copy, or K under `CALLS`, there is none.
 Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
 idle `REST` times a replay's device time after each replay;
@@ -95,10 +102,12 @@ and prints the count by phase and why each leaf kind left the rest out.
 
 import argparse
 import bisect
+import contextlib
 import copy
 import dataclasses
 import datetime
 import functools
+import gc
 import hashlib
 import importlib
 import inspect
@@ -373,7 +382,8 @@ def _runner(config, rank: int):
     """ATOM's runner at TP `rank` of `config`'s DP rank, its parameters built on
     the meta device and no warmup run, its KV pool allocated at the fewest
     blocks a rank has room for, sized by ATOM with the parameters' bytes held
-    on the device and then freed for the weights each leaf builds."""
+    on the device and then freed for the weights each leaf builds; the runner
+    attributes the allocation set are in its `kv_held`."""
     from torch.distributed import TCPStore
 
     from atom.compass.bench.ranks import agreed, cpu_group
@@ -405,7 +415,11 @@ def _runner(config, rank: int):
     del held
     torch.cuda.empty_cache()  # the pool takes the room the hold had
     config.num_kvcache_blocks = agreed(blocks, cpu_group())
+    before = dict(vars(runner))
     runner.allocate_kv_cache(config.num_kvcache_blocks)
+    # what the allocation bound on the runner: `trace ops` reads a tensor
+    # made there as KV
+    runner.kv_held = {k: v for k, v in vars(runner).items() if before.get(k) is not v}
     return runner
 
 
@@ -414,9 +428,12 @@ class Stub:
     and live metadata ATOM prepared for each placement of its batch."""
 
     def __init__(self, runner, llc: int, journal=None) -> None:
+        from atom.model_engine.kv_block import STATE_SLOT_CLASS
+
         self.runner, self.llc, self.journal = runner, llc, journal
+        self.slots = runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
         self.built, self.leaves, self.placed = {}, {}, []
-        self.cold_copies, self.clones = {}, {}
+        self.cold_copies, self.clones, self.kv = {}, {}, {}
         self.modules = dict(runner.model.named_modules())
         self.contexts = runner.config.compilation_config.static_forward_context
         self.moe = sorted(
@@ -437,7 +454,7 @@ class Stub:
     def _prepare(self, batch) -> None:
         """`batch` prepared by ATOM's runner as its forward prepares one, no
         forward run, and a snapshot of the forward context it built and the
-        live metadata each leaf names."""
+        live metadata each leaf names, beside the KV `point` found for it."""
         from atom.utils.forward_context import get_forward_context
 
         self.runner._gate_staging_reuse()
@@ -454,7 +471,7 @@ class Stub:
             for k, v in live.items()
             if torch.is_tensor(v) and v.device.type == device
         }
-        meta = {}
+        meta = dict(self.kv)
         for sig, (op, _) in self.leaves.items():
             for path, spec in _specs(op["args"]):
                 if spec["role"] == "metadata":
@@ -462,7 +479,9 @@ class Stub:
                     pool = {"input_ids": input_ids} if token else live
                     try:
                         name, view = _meta(spec, path, pool)
-                        meta[sig, path] = name, _clone(view)
+                        # leaves share a view's clone: DeepSeek-V4's decode
+                        # leaves view 2.7 GB of it at a placement
+                        meta[sig, path] = name, _deep(view, {}, self.clones)
                     except ValueError as error:  # the leaf refuses, not the step
                         meta[sig, path] = str(error), None
         # one clone across placements of what none changed: a leaf may cache
@@ -484,8 +503,16 @@ class Stub:
         view = {"rows": rows, "produces_output": True}
         blocks = sum(-(-row[1] // rule.block_size) for row in rows)
         kv = _forward_kv_cache_context.kv_cache_data
+        held = _held(self.runner, kv)
+        self.kv = {
+            (s, path): _kv(spec, path, held)
+            for s, (op, _) in found.items()
+            for path, spec in _specs(op["args"])
+            if spec["role"] == "kv"
+        }
         room = [pool // blocks]
         room += [t.k_cache.shape[0] // len(rows) for t in kv.values() if _stateful(t)]
+        room += [self.slots // len(rows)] if self.slots else []
         plans = {
             s: self._plan(op, i, kv, blocks, len(rows)) for s, (op, i) in found.items()
         }
@@ -528,11 +555,16 @@ class Stub:
 
     def _plan(self, op, instances, kv, blocks, rows):
         """A leaf's copies, its bytes per call, and the placements its context
-        keys take."""
-        need, size = 1, sum(
-            _span(s["shape"], s["stride"]) * _dtype(s["dtype"]).itemsize
-            for _, s in _specs(op["args"])
-        )
+        keys and KV arguments take."""
+        need, size = 1, 0
+        for _, s in _specs(op["args"]):
+            nbytes = _span(s["shape"], s["stride"]) * _dtype(s["dtype"]).itemsize
+            if s["role"] == "kv":
+                # ponytail: its first dim taken as blocks or state slots; one
+                # of plane rows, as DeepSeek-V4's, reads under its bytes
+                unit = rows if self.slots else blocks
+                nbytes, need = nbytes // max(s["shape"][0], 1) * unit, None
+            size += nbytes
         for key in instances[0].values():
             module = self.contexts.get(key)
             if hasattr(module, "layer_num"):  # a layer of ATOM's KV registry
@@ -654,6 +686,8 @@ class Stub:
                 return self._tensor(value, meta.get((sig, path)), fresh)
             if isinstance(value, str) and value.startswith("torch."):
                 return getattr(torch, value[6:], value)
+            if isinstance(value, str) and value.split(":")[0] == "cuda":
+                return self.runner.device  # the capture ran on device 0
             return value
 
         args = op["args"].items()
@@ -716,10 +750,10 @@ class Stub:
         role = spec["role"]
         if role == "activation":
             return _random(spec, self.runner.device)
-        if role == "metadata":
+        if role in ("metadata", "kv"):
             if meta[1] is None:
                 raise ValueError(meta[0])
-            return _clone(meta[1]) if fresh else meta[1]
+            return _clone(meta[1]) if fresh and role == "metadata" else meta[1]
         raise ValueError(f"a {role} tensor argument {_text(spec)} is not built")
 
     def _weight(self, spec, c, count):
@@ -787,7 +821,7 @@ def _values(args, path=""):
             yield where, value
 
 
-def _meta(spec, slot, live) -> tuple[str, torch.Tensor]:
+def _meta(spec, slot, live, what="metadata") -> tuple[str, torch.Tensor]:
     """The live metadata tensor a metadata argument is a view of, and its name:
     one of its dtype with room for its span: one whose name the slot holds or
     that holds the slot's first, then one of its shape and stride, then the
@@ -799,7 +833,7 @@ def _meta(spec, slot, live) -> tuple[str, torch.Tensor]:
         if str(t.dtype) == spec["dtype"] and _room(t) >= need
     ]
     if not fits:
-        raise ValueError(f"ATOM's live metadata has no room for {slot} {_text(spec)}")
+        raise ValueError(f"ATOM's live {what} has no room for {slot} {_text(spec)}")
     slot = slot.split(".")[0]
     name, t = min(
         fits,
@@ -810,6 +844,43 @@ def _meta(spec, slot, live) -> tuple[str, torch.Tensor]:
         ),
     )
     return name, t.as_strided(spec["shape"], spec["stride"], t.storage_offset())
+
+
+def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
+    """The live KV tensor a KV argument is a view of, and its name, picked as
+    `_meta` picks among those whose layout past the first dimension's size
+    is its own (`_layout`), when any is: the capture's pool sized that one;
+    or why none fits, and None."""
+    want = _layout(spec["shape"], spec["stride"])
+    own = {n: t for n, t in live.items() if _layout(t.shape, t.stride()) == want}
+    try:
+        return _meta(spec, slot, own or live, "KV")
+    except ValueError as error:  # the leaf refuses, not the point
+        return str(error), None
+
+
+def _layout(shape, stride) -> list:
+    """Each dimension's size and stride, but the first's size and any
+    dimension of one."""
+    dims = zip(range(len(shape)), shape, stride)
+    return [(n if i else None, s) for i, n, s in dims if n != 1 or not i]
+
+
+def _held(runner, registry) -> dict[str, torch.Tensor]:
+    """Each tensor ATOM's KV allocation bound, by name: the runner attributes
+    it set (`kv_held`), a list's items as `name.i`, and each field of a KV
+    `registry` entry as `layer_<n>.field`."""
+    named = [
+        (f"{key}.{field}", t)
+        for key, entry in (registry or {}).items()
+        for field, t in vars(entry).items()
+    ]
+    for name, value in runner.kv_held.items():
+        if isinstance(value, (list, tuple)):
+            named += [(f"{name}.{i}", t) for i, t in enumerate(value)]
+        else:
+            named.append((name, value))
+    return {name: t for name, t in named if torch.is_tensor(t)}
 
 
 def _function(name: str):
@@ -883,11 +954,9 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
 def _replay(fn, calls) -> list[float]:
     """Each timed replay of one graph of `calls`, in ns per call, each started
     on every rank together (`_together`), the capture refused on every rank
-    when any rank's refused. Over several ranks, a decode step's graph is
-    captured as ATOM captures one, each collective on the buffers it
-    registered."""
-    import contextlib
-
+    when any rank's refused, and nothing it left read by a later one
+    (`_contained`). Over several ranks, a decode step's graph is captured as
+    ATOM captures one, each collective on the buffers it registered."""
     from atom.compass.bench.ranks import cpu_group, refused_together
     from atom.utils import forward_context
 
@@ -900,7 +969,7 @@ def _replay(fn, calls) -> list[float]:
         with (
             refused_together(),
             graph_capture() if registered else contextlib.nullcontext(),
-            torch.cuda.graph(graph, capture_error_mode="thread_local"),
+            _contained(torch.cuda.graph(graph, capture_error_mode="thread_local")),
         ):
             for kwargs, snap in calls:
                 forward_context._forward_context = snap
@@ -920,6 +989,50 @@ def _replay(fn, calls) -> list[float]:
             times.append(ms * 1e6 / len(calls))
         time.sleep(ms * REST / 1e3)
     return times
+
+
+@contextlib.contextmanager
+def _contained(capture):
+    """`capture` entered with no garbage collection, and when it fails,
+    undone what it leaves behind for later leaves: its stream current, the
+    generator in capture, and the capture HIP leaves open on its stream when
+    a call invalidated it. A failed capture's graph can sit in a reference
+    cycle, and a graph freed during a capture synchronizes the device, which
+    ends the process."""
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        with capture:
+            yield
+    except BaseException:
+        if torch.cuda.current_stream() == capture.capture_stream:
+            capture.stream_ctx.__exit__(None, None, None)
+        with torch.cuda.stream(capture.capture_stream):
+            stuck = torch.cuda.is_current_stream_capturing()
+        if stuck:
+            _end_capture(capture.capture_stream)
+        generator = torch.cuda.default_generators[torch.cuda.current_device()]
+        generator.graphsafe_set_state(generator.clone_state())
+        raise
+    finally:
+        if collecting:
+            gc.enable()
+
+
+def _end_capture(stream) -> None:
+    """End the capture HIP keeps open on `stream` after its end refused it, by
+    beginning and ending an empty one on it, through the HIP runtime this
+    process loaded."""
+    import ctypes
+
+    maps = Path("/proc/self/maps").read_text().splitlines()
+    hip = ctypes.CDLL(next(m.split()[-1] for m in maps if "libamdhip64" in m))
+    handle, graph = ctypes.c_void_p(stream.cuda_stream), ctypes.c_void_p()
+    if hip.hipStreamBeginCapture(handle, 2) or hip.hipStreamEndCapture(  # relaxed
+        handle, ctypes.byref(graph)
+    ):
+        raise RuntimeError(f"the capture HIP left open on {stream} does not end")
+    hip.hipGraphDestroy(graph)
 
 
 def _together() -> None:
