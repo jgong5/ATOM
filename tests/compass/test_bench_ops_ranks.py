@@ -522,7 +522,7 @@ class _AtomRunner(_Runner):
         return {"num_kvcache_blocks": 64}
 
     def allocate_kv_cache(self, blocks):
-        pass
+        self.kv_cache = torch.empty(blocks)
 
     def exit(self):
         pass
@@ -573,6 +573,7 @@ def test_one_dp_rank_alone_is_built_as_atom_s_simulated_dp_attention(
     assert got == ((1, 2, 0) if managed else (1, 1, 2))
     assert pc.data_parallel_size_local == got[1]
     assert built.num_kvcache_blocks == 64
+    assert list(runner.kv_held) == ["kv_cache"]  # `trace ops` reads it as KV
     assert ops.Stub(runner, 10_000).alone == got[2]
     assert config.parallel_config.data_parallel_size == 2  # the layout's own
 
