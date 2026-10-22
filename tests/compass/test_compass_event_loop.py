@@ -27,7 +27,13 @@ import pytest
 import uvicorn
 
 from atom.compass import carriers, clock_transport
-from atom.compass.clock import NER, ClockAuthority, LpId, single_engine_table
+from atom.compass.clock import (
+    NER,
+    ClockAuthority,
+    LpId,
+    prefill_decode_table,
+    single_engine_table,
+)
 from atom.entrypoints.openai import api_server
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
@@ -753,6 +759,96 @@ def test_a_stamped_cancel_hangs_its_request_up_at_its_arrival_never_the_socket(r
         (cancel_at, cancel),
     ]
     assert served == [b"{}", ("http.disconnect", cancel_at)]
+    assert answered == [
+        {"type": "http.response.start", "status": 204},
+        {"type": "http.response.body", "body": b""},
+    ]
+
+
+def test_a_cancel_on_the_relay_hangs_its_request_up_at_its_arrival_never_the_socket():
+    """Behind a router LP, frontend-D's requests come in on ``relay``, each
+    stamped in its body. Request 0 is relayed at 0 and its socket closes as
+    soon as its body is read; the cancel the router hands on for it, relay seq
+    1, is stamped at 1. The app serving request 0 reads ``http.disconnect`` at
+    the cancel's arrival, and the cancel reaches no app: it is answered 204."""
+    table = prefill_decode_table(
+        admission_path="serving",
+        ipc_s=0.001,
+        stream_s=0.002,
+        router_s=2.0**-12,
+        kv_write_req_s=2.0**-10,
+        router_in_s=2.0**-14,
+    )
+    relay, router, me = "router->frontend-D:relay", LpId("router"), LpId("frontend-D")
+    endpoint = f"inproc:test-compass-loop-{uuid.uuid4().hex}"
+    server = clock_transport.serve(ClockAuthority(table), endpoint)
+    for lp in table.registry.ids():
+        if lp not in (router, me):
+            clock_transport.connect(lp, endpoint).send((NER, INF, [], INF))
+    rt = LPRuntime(me, table, clock_transport.connect(me, endpoint))
+    rt.start_run()
+    clock.install(rt)
+    stamps = queue.Queue()
+
+    def hop():
+        rt = LPRuntime(router, table, clock_transport.connect(router, endpoint))
+        rt.start_run()
+        stamps.put(rt.stamp_send(relay))
+        rt.advance_to(1.0)
+        stamps.put(rt.stamp_send(relay))
+        rt.next_event(INF)
+        rt.close()
+
+    thread = threading.Thread(target=hop, name="router", daemon=True)
+    thread.start()
+    arrival, seq = table.lookahead(relay), 0
+    cancel_at, cancel = 1.0 + arrival, 1
+    loop = CompassEventLoop()
+    guard = threading.Timer(20, loop.call_soon_threadsafe, (loop.stop,))
+    served, answered = [], []
+    request = b'{"kv_transfer_params": {"compass": "a:%r;s:%d"}}' % (arrival, seq)
+    cancelled = (
+        b'{"compass_cancel": %d, "kv_transfer_params": {"compass": "a:%r;s:%d"}}'
+    )
+
+    async def app(scope, receive, send):
+        served.append((await receive())["body"])
+        served.append(((await receive())["type"], loop.time()))
+
+    def wire(body: bytes):
+        parts = [{"type": "http.request", "body": body, "more_body": False}]
+
+        async def receive():
+            return parts.pop(0) if parts else {"type": "http.disconnect"}
+
+        return receive
+
+    async def answer(message):
+        answered.append(message)
+
+    async def go():
+        channel = HttpChannel(app, _stamp)
+        scope = {"type": "http", "headers": []}
+        await asyncio.gather(
+            channel(scope, wire(request), None),
+            channel(scope, wire(cancelled % (seq, cancel_at, cancel)), answer),
+        )
+
+    guard.start()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        guard.cancel()
+        thread.join(10)
+        clock.install(None)
+        server.close()
+    loop.close()
+    assert [stamps.get(timeout=10) for _ in range(2)] == [
+        (arrival, seq),
+        (cancel_at, cancel),
+    ]
+    assert served == [request, ("http.disconnect", cancel_at)]
     assert answered == [
         {"type": "http.response.start", "status": 204},
         {"type": "http.response.body", "body": b""},
