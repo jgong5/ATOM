@@ -144,6 +144,30 @@ def test_a_decode_reads_each_row_s_window_and_compressed_entries(ratio, top, ent
     )
 
 
+def indexer(tokens):
+    op = leaf(
+        "aiter.indexer_score_topk.default",
+        [[tokens, 16]],
+        q_quant=t([tokens, 4, 16], FP8),
+        weights=t([tokens, 4]),
+        layer_name={"context": "layers.2.attn.indexer"},
+        topk=16,
+    )
+    return op | {"stated": {"compress_ratio": 4}}
+
+
+@pytest.mark.parametrize(
+    "op",
+    [decode(window_size=4, compress_ratio=4, index_topk=16), indexer(2)],
+    ids=["decode", "indexer"],
+)
+def test_a_drafter_s_later_pass_reads_one_query_token_a_row(op):
+    # Q of 2 tokens over two rows each verifying two drafts: a later draft pass.
+    later = work(op, rows((3, 9), (3, 300)), 1, "fp8")
+
+    assert later == work(op, rows((1, 9), (1, 300)), 1, "fp8")
+
+
 def test_a_decode_stating_no_geometry_is_refused_by_name():
     with pytest.raises(CostRefused, match="states no window_size, compress_ratio"):
         work(decode(), rows((1, 9)), 1, "fp8")
