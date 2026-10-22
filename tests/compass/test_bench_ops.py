@@ -460,6 +460,75 @@ def test_an_embedding_reads_the_token_ids_atom_prepared():
     assert [name for name, _ in views.values()] == ["input_ids"]
 
 
+def test_a_v4_metadata_slot_is_a_view_of_the_buffer_atom_passes_or_refuses():
+    # Each buffer ATOM passes is wider than one of its dtype `_meta`'s rules
+    # take: one of the slot's own spec, or a tighter one its name also holds.
+    # No HCA indptr is live, so the persistent decode's refuses past a decoy.
+    nm, ps = "aiter.mla:mla_decode_fwd_v4_nm", "aiter.mla_decode_v4_ps_asm.default"
+    csa = "aiter.ops.flydsl.kernels.fused_compress_attn:flydsl_fused_compress_attn"
+    state = "atom.model_ops.v4_kernels.state_writes:update_compressor_states"
+    qkn = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
+
+    def i32(*shape):
+        return torch.zeros(shape, dtype=torch.int32)
+
+    def meta(slot, *shape):
+        return slot, _t(list(shape), "metadata", dtype="torch.int32")
+
+    runner = _Runner()
+    runner.forward_vars |= {
+        "context_lens": i32(3),
+        "top_ks": i32(4, 4),
+        "v4_compress_plan_4": i32(8, 4),
+        "v4_write_plan_4": i32(4, 4),
+        "v4_write_plan_128": i32(8, 4),
+    }
+    v4 = {
+        "kv_indptr_swa": i32(5),
+        "kv_indptr_csa": i32(9),
+        "state_slot_in": i32(8),
+        "state_slot_out": i32(8),
+        "batch_id_per_q_token": i32(8),
+    }
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):
+        prepared = prepare(batch)
+        vars(fctx.get_forward_context().attn_metadata).update(v4)
+        return prepared
+
+    runner.prepare_model = prepare_model
+    slots = meta("state_slot_mapping", 3)
+    leaves = [
+        dataclasses.replace(
+            _leaf(name, meta("kv_indptr", 5)), stated=(("compress_ratio", r),)
+        )
+        for name, r in ((nm, 4), (ps, 128))
+    ]
+    leaves += [
+        _leaf(csa, ("ratio", 4), slots, meta("plan_gpu", 4, 4)),
+        _leaf(state, ("ratio", 128), slots, meta("write_plan", 4, 4)),
+        _leaf(qkn, meta("batch_id_per_token", 3)),
+    ]
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(*leaves, layers=1)["region"])
+
+    stub._prepare((0, 0))
+
+    [(_, views)] = stub.placed
+    got = {(stub.leaves[s][0]["op"], p): n for (s, p), (n, _) in views.items()}
+    assert got == {
+        (nm, "kv_indptr"): "kv_indptr_csa",
+        (ps, "kv_indptr"): "ATOM's live kv_indptr_hca has no room for kv_indptr "
+        "[5] torch.int32 stride [1]",
+        (csa, "state_slot_mapping"): "state_slot_in",
+        (csa, "plan_gpu"): "v4_compress_plan_4",
+        (state, "state_slot_mapping"): "state_slot_out",
+        (state, "write_plan"): "v4_write_plan_128",
+        (qkn, "batch_id_per_token"): "batch_id_per_q_token",
+    }
+
+
 def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
     layers = {f"model.layers.{i}.attn": SimpleNamespace(layer_num=i) for i in (0, 1)}
     kv = {f"layer_{i}": SimpleNamespace(k_cache=torch.zeros(64, 16, 4)) for i in (0, 1)}
