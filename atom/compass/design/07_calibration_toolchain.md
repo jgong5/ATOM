@@ -351,9 +351,8 @@ measured point takes that point's price; one between two points that launched th
 kernel is interpolated; any other query, outside the measured range, between two
 kernels, or along a line whose held-out points show a hidden band or an error over 5%
 (`09` D60), is declined with its reason, and the leaf falls to its analytical law, its
-share counted (D42, `08` D50.3). A point whose neighbours along a line lie one coordinate
-below and one above it is not held out: every query between them is that point
-([#1817](https://github.com/jgong5/ATOM/issues/1817)).
+share counted (D42, `08` D50.3). Which points are not held out, as adjacent to both
+neighbours, is [`09` D60](09_fitting_and_law_selection.md#d60-cost-is-piecewise-interpolation-is-not-sound-but-imprecise)'s rule.
 
 ### Phase 1c — and the one extra run
 

@@ -255,10 +255,17 @@ def _rebuilt(value, live):
         return live(value)
     if not isinstance(value, Reduced):
         return value
-    cls = _function(value.cls)
+    return rebuild_object(value.cls, _rebuilt(value.state, live))
+
+
+def rebuild_object(cls: str, state):
+    """The object pickle reduced to class `cls`, `module:qualname`, and `state`:
+    an enum member from its value, a dict from its (key, value) pairs, any other
+    object from its (attribute, value) pairs."""
+    cls = _function(cls)
     if issubclass(cls, enum.Enum):
-        return cls(value.state)
-    state = {_rebuilt(k, live): _rebuilt(v, live) for k, v in value.state}
+        return cls(state)
+    state = dict(state)
     if cls is dict:
         return state
     obj = cls.__new__(cls)
@@ -267,6 +274,14 @@ def _rebuilt(value, live):
     else:
         obj.__dict__.update(state)
     return obj
+
+
+def referenced(runner, key: str):
+    """What a `ModuleRef` key names on `runner`: an attribute of the runner
+    itself, `runner.<attr>`, or a module of its model by path."""
+    if key.startswith("runner."):
+        return getattr(runner, key.removeprefix("runner."))
+    return runner.model.get_submodule(key)
 
 
 def _addressable(frame) -> bool:
@@ -508,9 +523,7 @@ class _Recorder(TorchDispatchMode):
             value = value.bind(**{LAYER: self.layer})
         if not isinstance(value, ir.ModuleRef):
             return value.key
-        if value.key.startswith("runner."):
-            return getattr(self.runner, value.key.removeprefix("runner."))
-        return self.runner.model.get_submodule(value.key)
+        return referenced(self.runner, value.key)
 
     def wait(self, waiter, waited):
         """A side stream waiting on the main one forks; the reverse joins."""
