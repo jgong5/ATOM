@@ -18,9 +18,9 @@ is a final chunk.
 
 Under a drafter of `drafts` tokens a decode step verifies `drafts` and one in
 each row, and a step that samples also reads its drafter's graph,
-`graph(..., draft=True)` at the rows its first pass gathers (`draft_moe_rows`),
-the work ATOM queues after `forward_done_event`: its prices are terms named
-``draft op.<kind>``, each tagged draft. Sampling is the target's.
+`graph(..., draft=True)`, the work ATOM queues after `forward_done_event`: its
+prices are terms named ``draft op.<kind>``, each tagged draft. Sampling is the
+target's.
 
 Each leaf is one pricing unit, `max(t0, F / peak, M / BW(M), t_comm)` over its
 work (`op_work.work`): its own tensors at the captured shape, the state it
@@ -151,9 +151,8 @@ def step_shape(
 def gathered_off_default(
     phase: str, tokens: int, gathered: int | None, dp: int, drafts: int = 0
 ) -> int | None:
-    """The rows a step's MoE `gathered` in a DP group of `dp`, None at their
-    default, every rank at this one's `tokens`, a decode's rows each verifying
-    a drafter's `drafts` and one."""
+    """`gathered`, a DP step's MoE rows, or None at their default: `dp` ranks
+    at `tokens`, a decode's rows each verifying `drafts` and one."""
     rows = tokens * (drafts + 1 if phase == "decode" else 1)
     return None if gathered == dp * rows else gathered
 
@@ -245,9 +244,9 @@ class OpGraphBackend(CostBackend):
 
     def _bound(self, view: BatchView) -> tuple:
         """What a price list reads of a step: its phase, its T and B, the rows
-        its MoE gathers off their default (`gathered_off_default`), and its
-        rows' context and max context (`band`), the context a decode's max, a
-        prefill's mean cached tokens."""
+        its MoE gathers, None at their default (`gathered_off_default`),
+        and its rows' context and max context (`band`), the
+        context a decode's max, a prefill's mean cached tokens."""
         rung = view.capture_rung if self.padded else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
@@ -258,8 +257,7 @@ class OpGraphBackend(CostBackend):
 
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
-        with `draft`, its drafter's, at the rows its first pass gathers
-        (`draft_moe_rows`)."""
+        with `draft`, its drafter's at `draft_moe_rows`."""
         if view.image_tokens:
             reason = IMAGES
         else:
