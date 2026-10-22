@@ -43,9 +43,9 @@ ARGMAX = "aiter.ops.flydsl.topk.topk_per_row_argmax:topk_per_row_argmax"
 MOE = "aiter.rocm_aiter_fused_moe.default"
 #: Two rows, each verifying one draft and its bonus token.
 VERIFY = view((2, 90, True), (2, 9, True), rung=2)
-#: A prefill of 64 tokens over 2 sequences, and two middle chunks of it.
-PREFILL = ("--prefill", "64", "2")
-CHUNK = BatchView((RequestShape(32, 32, False),) * 2, produces_output=False)
+#: A prefill of 64 tokens in one sequence, and a middle chunk of it.
+PREFILL = ("--prefill", "64", "1")
+CHUNK = BatchView((RequestShape(64, 64, False),), produces_output=False)
 
 _CAPTURES: dict = {}
 

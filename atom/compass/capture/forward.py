@@ -235,9 +235,15 @@ def _storage(tensor) -> StorageWeakRef:
 
 
 def _concrete(shape) -> tuple:
-    """`shape`, each symbolic size a check has bound as its int."""
-    bound = (d.node.maybe_as_int() if isinstance(d, torch.SymInt) else d for d in shape)
-    return tuple(b if b is not None else d for b, d in zip(bound, shape))
+    """`shape`, each symbolic size a check has bound to one value as that int."""
+
+    def bound(dim):
+        if not isinstance(dim, torch.SymInt):
+            return dim
+        held = dim.node.shape_env.bound_sympy(dim.node.expr)
+        return int(held.lower) if held.is_singleton() else dim
+
+    return tuple(map(bound, shape))
 
 
 def _params(code) -> tuple[str, ...]:
@@ -391,8 +397,8 @@ class _Recorder(TorchDispatchMode):
         ins = [t for t in leaves if isinstance(t, torch.Tensor)]
         outs = [t for t in _pytree.tree_leaves(out) if isinstance(t, torch.Tensor)]
         if self.counted is not None:
-            for dim in (d for t in outs for d in t.shape):
-                if isinstance(dim, torch.SymInt) and dim.node.maybe_as_int() is None:
+            for dim in (d for t in outs for d in _concrete(t.shape)):
+                if isinstance(dim, torch.SymInt):
                     torch._check(dim == self.counted)
         if self.creating is not None:
             read = set(map(_storage, ins))

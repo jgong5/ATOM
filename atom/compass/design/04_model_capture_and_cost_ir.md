@@ -484,9 +484,16 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
 - **Priced apart.** The op-level backend prices the drafter's graph at the step's rows
   and tags each of its terms `draft` (`draft op.<kind>`), so `StepCost.draft_seconds` is
   the drafter's and `target_seconds` the target's.
-- **Refused by name.** A middle chunk under a drafter: ATOM runs its draft-KV pass
-  (`compute_draft_kv`) on a real step only, and a prefill shape is traced as a dummy run,
-  so no graph holds that pass. A block drafter (DSpark): it writes its draft KV before
+- **A middle chunk is cut where its draft-KV pass starts.** ATOM runs that pass
+  (`compute_draft_kv`) after every target forward of a real step, a middle chunk's included,
+  and a middle chunk records no `forward_done_event`. Under a drafter a prefill shape is
+  therefore traced as a real step's batch, each row stating its next token as ATOM's
+  scheduler does, and the middle chunk is cut where the pass starts, as the parity record
+  stamps `d_target_ns` there ([#1585](https://github.com/jgong5/ATOM/pull/1585),
+  [#1874](https://github.com/jgong5/ATOM/issues/1874)). A GDN prefill under ReplaySSM counts
+  its live state slots with a boolean index, a size no fake tensor holds; the host-staged
+  slot indices bind it.
+- **Refused by name.** A block drafter (DSpark): it writes its draft KV before
   `forward_done_event` on a step that samples ([#1607](https://github.com/jgong5/ATOM/pull/1607)),
   so one cut does not part its target from its draft.
 
