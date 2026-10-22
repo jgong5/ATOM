@@ -29,6 +29,8 @@ take at a different cost; `rowmod(1)` is Sum N_KV.
 
 A decode step that replays no graph (an eager runner, or a batch wider than
 the widest captured size) is the rung named `eager`, whose padding is zero.
+A DP dummy forward (`BatchView.dp_dummy`) at that rung, under a law with no
+`eager` vector, is `eager_dp_dummy`: 0 s, not refused.
 
 Every term is `estimated`. Each vector carries the convex hull of the features
 it was fitted on. A step outside it is priced by the same vector, its terms'
@@ -78,7 +80,7 @@ import math
 from collections.abc import Mapping
 
 from atom.compass.backends.base import CostBackend, Granularity
-from atom.compass.backends.cost import CostTerm, StepCost
+from atom.compass.backends.cost import CostTerm, StepCost, eager_dp_dummy
 from atom.compass.backends.hull import Hull
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostRefused
@@ -196,6 +198,9 @@ class StepLinearBackend(CostBackend):
                 "a step mixing prefill and decode rows; "
                 "the law prices a step of one kind",
             )
+        eager = not prefill and batch_view.capture_rung is None
+        if eager and batch_view.dp_dummy and None not in self.law.decode:
+            return eager_dp_dummy(SOURCE)
         terms = self._terms(self.law, batch_view, "")
         if self.law.draft is not None:
             terms += self._terms(self.law.draft, batch_view, "draft ")
