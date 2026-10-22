@@ -182,7 +182,9 @@ TIMEOUTS = {
 }
 
 
-@pytest.mark.parametrize("seed", ["", " --random-seed 42", " --random-seed=42"])
+@pytest.mark.parametrize(
+    "seed", ["", " --random-seed 42", " --random-seed=42", "\n--random-seed 42"]
+)
 def test_extra_arguments_follow_the_clients_own_and_their_seed_replaces_its(
     tmp_path, seed
 ):

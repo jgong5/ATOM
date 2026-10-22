@@ -18,8 +18,9 @@
 #                    when the server is simulated and only then
 #   AIPERF_EXTRA_ARGS  more aiperf arguments, after client.sh's own, as
 #                    cctraces_sim.sh takes them (default none); a --random-seed
-#                    there replaces client.sh's, and aiperf refuses any other
-#                    option given twice. aiperf reads its AIPERF_* settings,
+#                    there replaces client.sh's; aiperf appends a --url, --model
+#                    or --extra-inputs there to client.sh's, and refuses any
+#                    other option given twice. aiperf reads its AIPERF_* settings,
 #                    its timeouts among them, from client.sh's environment
 #
 # A simulated server's client paces aiperf on the server's clock through this
@@ -97,7 +98,7 @@ awk -v d="$OUT/client/traces" -v first="$first" -v last="$last" '
     NR > last {exit}' "$TRACES" || fail "traces: cannot read $TRACES"
 n=$(find "$OUT/client/traces" -type f | wc -l)
 ((n == last - first + 1)) || fail "traces: $TRACES holds $n of traces $first to $last"
-read -ra extra <<<"${AIPERF_EXTRA_ARGS-}"
+read -rd '' -a extra <<<"${AIPERF_EXTRA_ARGS-}" || :
 [[ " ${extra[*]} " =~ \ --random-seed[\ =] ]] && seed=() || seed=(--random-seed 20260707)
 
 # Each request carries X-Session-ID, as the nightly's agentic cell sends it: a
