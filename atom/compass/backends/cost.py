@@ -222,6 +222,17 @@ class StepCost:
         )
 
 
+#: The treatment of a DP dummy forward that replays no graph, priced 0 s.
+EAGER_DP_DUMMY = "eager DP dummy"
+
+
+def eager_dp_dummy(source: str) -> StepCost:
+    """0 s: the group's device-end max already carries the peer it waits on."""
+    note = "real DP records give an eager dummy its busiest peer's device time"
+    said = Provenance(Method.DECLARED, "0 s", source, note=note)
+    return StepCost([CostTerm("dp_dummy", 0.0, said)], (EAGER_DP_DUMMY,))
+
+
 #: How a run summary groups seconds: a method each, estimated seconds split
 #: into validated (`estimated`) and not (`unvalidated`).
 GROUPS = ("analytical", "declared", "measured", "estimated", "unvalidated")

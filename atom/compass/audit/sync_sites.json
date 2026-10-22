@@ -4495,6 +4495,18 @@
    "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
   },
   {
+   "id": "atom/compass/bench/ops.py::_release::time.sleep(0.005)::sleep#0",
+   "file": "atom/compass/bench/ops.py",
+   "symbol": "_release",
+   "call": "time.sleep",
+   "expr": "time.sleep(0.005)",
+   "shape": "sleep",
+   "peer": "none",
+   "why": "the op bench polls the card's VRAM in use until the driver has cleared the memory the bench returned, at most CLEAR_S, since a leaf timed during that clear read slow",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
    "id": "atom/compass/bench/ops.py::_kernels::torch.cuda.synchronize()::device_sync#0",
    "file": "atom/compass/bench/ops.py",
    "symbol": "_kernels",

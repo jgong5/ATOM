@@ -205,7 +205,9 @@ class BatchView:
     agreed: per micro-batch, each rank's token count. It is None when the
     step is not split, and on one rank. `dp_rank` is this rank's slot in the
     data-parallel group's counts, `tbo_tokens`' among them; None on one rank
-    or when the caller did not say. `image_tokens` counts the scheduled
+    or when the caller did not say. `dp_dummy` says the step is a DP rank's
+    dummy forward, run because a peer has work and this rank has none; False
+    on one rank. `image_tokens` counts the scheduled
     tokens whose embedding the step's vision encoder supplies; a backend that
     has no basis for pricing that encoder refuses a step with any.
 
@@ -223,6 +225,7 @@ class BatchView:
     image_tokens: int = 0
     moe_tokens: int | None = None
     dp_rank: int | None = None
+    dp_dummy: bool = False
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
