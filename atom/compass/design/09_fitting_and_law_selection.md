@@ -484,6 +484,17 @@ fixed by the rung and the rung's intercept holds it. The measured received-row
 imbalance, whose size `15` D90 states, is reported beside the law's accuracy
 ([#1108](https://github.com/jgong5/ATOM/issues/1108)).
 
+**Assumed treatment: eager DP dummy** (owner ruling on
+[#1959](https://github.com/jgong5/ATOM/issues/1959#issuecomment-6338036921), 2026-10-22).
+A DP rank with no work runs a dummy forward beside a peer that has work; when the group
+replays no graph the dummy runs eagerly. A step linear law fitted under DP has no `eager`
+decode vector, since the fit drops dummies, and a replay step grid has no eager decode.
+Both price such a dummy at 0 s under this treatment, which the run summary counts by
+step, instead of refusing it: in real records its device time is its busiest peer's
+(p50 0.999 at DP2, 0.9999 at DPA8 EP8), and the group's device-end max (`15`, #1267)
+already charges the peer. A decode step that replays no graph and is no dummy is still
+refused.
+
 **Suspected treatments to check before fitting:** raggedness (workload-dependent, and it
 was a zero column for 2,997 samples), cached fraction, and the prefill chunk's position in
 its streak.
