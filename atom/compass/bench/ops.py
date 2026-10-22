@@ -47,10 +47,11 @@ A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, a KV
-argument's as many entries of its first dimension as the batch's state slots,
-or its blocks when the model keeps no per-request state, or, of a decode
-attention leaf that states its layer's window and compress ratio, the plane
-rows the batch's blocks hold at that ratio, the tensors
+argument's as many entries of its first dimension, each the span of the
+others, as the batch's state slots, or its blocks when the model keeps no
+per-request state, or, of a decode attention leaf that states its layer's
+window and compress ratio, the plane rows the batch's blocks hold at that
+ratio, the tensors
 of each module it names and, for a leaf that names a context key, the KV and
 per-request state its layer holds for the batch. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
@@ -157,7 +158,7 @@ from atom.compass.drive.gpu import add_gpu_flag
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads or what a capture waits for change.
-PROTOCOL = 9
+PROTOCOL = 10
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -624,10 +625,13 @@ class Stub:
         keys and KV arguments take."""
         need, size = 1, 0
         for _, s in _specs(op["args"]):
-            nbytes = _span(s["shape"], s["stride"]) * _dtype(s["dtype"]).itemsize
+            itemsize = _dtype(s["dtype"]).itemsize
+            nbytes = _span(s["shape"], s["stride"]) * itemsize
             if s["role"] == "kv":
                 # ponytail: its first dim taken as blocks or state slots, or as
-                # plane rows when the leaf states its layer's attention geometry
+                # plane rows when the leaf states its layer's attention geometry;
+                # beside state slots a block view is one block a request, the
+                # one a decode compressor writes its row to
                 unit = rows if self.slots else blocks
                 stated = op.get("stated", {})
                 if "window_size" in stated and (ratio := stated["compress_ratio"]):
@@ -637,7 +641,10 @@ class Stub:
                     # of which a request reads at most its indexer's top-k
                     if top := stated.get("index_topk"):
                         unit = min(unit, rows * top)
-                nbytes, need = nbytes // max(s["shape"][0], 1) * unit, None
+                # an entry is the span of its trailing dims: a view may be
+                # strided by a whole state slot or by every layer's block
+                entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
+                nbytes, need = entry * unit, None
             size += nbytes
         for key in instances[0].values():
             module = self.contexts.get(key)
