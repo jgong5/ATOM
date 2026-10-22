@@ -504,6 +504,23 @@ def test_a_call_cycles_a_weight_per_occurrence_on_the_cold_copies_inputs():
     assert (n, record["copies"]) == (1, 2)
 
 
+def test_a_packed_fp4_activation_and_weight_are_built_at_their_shape_and_stride():
+    # No cast reaches torch.float4_e2m1fn_x2, so a draw cast to it refuses.
+    stub = ops.Stub(_Runner(), 1)
+    x = {
+        "shape": [2, 3],
+        "dtype": "torch.float4_e2m1fn_x2",
+        "stride": [4, 1],
+        "role": "activation",
+    }
+    built = [stub._tensor(x, None, False), stub._weight(x | {"role": "weight"}, 0, 2)]
+
+    for t in built:
+        assert t.dtype == torch.float4_e2m1fn_x2
+        assert (t.shape, t.stride()) == ((2, 3), (4, 1))
+        assert t.view(torch.uint8).unique().numel() > 1
+
+
 def test_a_call_that_fills_a_graph_alone_cycles_no_second_weight():
     # The leaf occurs twice, but one call fills `GRAPH_NS`: the graph holds
     # one call, so one copy, and no warm graph.
