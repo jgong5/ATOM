@@ -2,11 +2,12 @@
 """A DP dummy forward that replays no graph, beside a peer with work, is priced
 0 s under the `eager DP dummy` treatment by a step linear law with no `eager`
 vector and by a replay step grid, where each refused it before. A real eager
-decode step is still refused, and the run summary counts the treatment by step.
+decode step and a dummy forward on one rank are still refused, an eager bundle
+prices the dummy from its grid, and the run summary counts the treatment by step.
 """
 
 import pytest
-from test_backend_step_grid import replay
+from test_backend_step_grid import ON_NODE, eager, replay
 from test_backend_step_linear import law
 from test_dp_step_max import dp2, prefill, runner  # noqa: F401  the dp2 fixture
 from test_run_treatments import dp_summary
@@ -78,3 +79,20 @@ def test_the_run_summary_counts_each_eager_dummy_step(
         "uniform routing": 2,
     }
     assert [r.refused_commands() for r in ranks] == [(), ()]
+
+
+def test_an_eager_bundle_prices_the_dummy_from_its_grid():
+    rows = tuple(RequestShape(*r) for r in ON_NODE)
+    cost = eager().price(BatchView(rows, dp_dummy=True))
+
+    assert cost.seconds > 0.0
+    assert EAGER_DP_DUMMY not in cost.treatments
+
+
+def test_a_dummy_forward_on_one_rank_still_refuses():
+    r = runner(no_eager())
+
+    assert r.dummy_execution().predicted_s == 0.0
+    assert r.refused_commands() == (
+        "cost:step-linear: no decode vector for rung eager",
+    )
