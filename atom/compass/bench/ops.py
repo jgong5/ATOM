@@ -95,10 +95,12 @@ and prints the count by phase and why each leaf kind left the rest out.
 
 import argparse
 import bisect
+import contextlib
 import copy
 import dataclasses
 import datetime
 import functools
+import gc
 import hashlib
 import importlib
 import inspect
@@ -654,6 +656,8 @@ class Stub:
                 return self._tensor(value, meta.get((sig, path)), fresh)
             if isinstance(value, str) and value.startswith("torch."):
                 return getattr(torch, value[6:], value)
+            if isinstance(value, str) and value.split(":")[0] == "cuda":
+                return self.runner.device  # the capture ran on device 0
             return value
 
         args = op["args"].items()
@@ -883,11 +887,9 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
 def _replay(fn, calls) -> list[float]:
     """Each timed replay of one graph of `calls`, in ns per call, each started
     on every rank together (`_together`), the capture refused on every rank
-    when any rank's refused. Over several ranks, a decode step's graph is
-    captured as ATOM captures one, each collective on the buffers it
-    registered."""
-    import contextlib
-
+    when any rank's refused, and nothing it left read by a later one
+    (`_contained`). Over several ranks, a decode step's graph is captured as
+    ATOM captures one, each collective on the buffers it registered."""
     from atom.compass.bench.ranks import cpu_group, refused_together
     from atom.utils import forward_context
 
@@ -900,7 +902,7 @@ def _replay(fn, calls) -> list[float]:
         with (
             refused_together(),
             graph_capture() if registered else contextlib.nullcontext(),
-            torch.cuda.graph(graph, capture_error_mode="thread_local"),
+            _contained(torch.cuda.graph(graph, capture_error_mode="thread_local")),
         ):
             for kwargs, snap in calls:
                 forward_context._forward_context = snap
@@ -920,6 +922,50 @@ def _replay(fn, calls) -> list[float]:
             times.append(ms * 1e6 / len(calls))
         time.sleep(ms * REST / 1e3)
     return times
+
+
+@contextlib.contextmanager
+def _contained(capture):
+    """`capture` entered with no garbage collection, and when it fails,
+    undone what it leaves behind for later leaves: its stream current, the
+    generator in capture, and the capture HIP leaves open on its stream when
+    a call invalidated it. A failed capture's graph can sit in a reference
+    cycle, and a graph freed during a capture synchronizes the device, which
+    ends the process."""
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        with capture:
+            yield
+    except BaseException:
+        if torch.cuda.current_stream() == capture.capture_stream:
+            capture.stream_ctx.__exit__(None, None, None)
+        with torch.cuda.stream(capture.capture_stream):
+            stuck = torch.cuda.is_current_stream_capturing()
+        if stuck:
+            _end_capture(capture.capture_stream)
+        generator = torch.cuda.default_generators[torch.cuda.current_device()]
+        generator.graphsafe_set_state(generator.clone_state())
+        raise
+    finally:
+        if collecting:
+            gc.enable()
+
+
+def _end_capture(stream) -> None:
+    """End the capture HIP keeps open on `stream` after its end refused it, by
+    beginning and ending an empty one on it, through the HIP runtime this
+    process loaded."""
+    import ctypes
+
+    maps = Path("/proc/self/maps").read_text().splitlines()
+    hip = ctypes.CDLL(next(m.split()[-1] for m in maps if "libamdhip64" in m))
+    handle, graph = ctypes.c_void_p(stream.cuda_stream), ctypes.c_void_p()
+    if hip.hipStreamBeginCapture(handle, 2) or hip.hipStreamEndCapture(  # relaxed
+        handle, ctypes.byref(graph)
+    ):
+        raise RuntimeError(f"the capture HIP left open on {stream} does not end")
+    hip.hipGraphDestroy(graph)
 
 
 def _together() -> None:
