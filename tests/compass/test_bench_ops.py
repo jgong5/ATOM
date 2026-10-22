@@ -1229,6 +1229,26 @@ def test_a_device_argument_is_the_rank_s_own_device():
     assert kwargs == {**args, "dtype": torch.float32, "device": _Runner.device}
 
 
+@pytest.mark.parametrize("splits, room", [(1, 2 * 2 * 4 * 8), (5, 2 * 4 * 8)])
+def test_v4_nm_output_at_one_kv_split_has_room_for_the_fp32_stride(splits, room):
+    # At one split aiter's kernel writes its BF16 output at the FP32 split
+    # stride; an exact buffer let it write past the end and kill the process.
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    out = {"shape": [2, 4, 8], "dtype": "torch.bfloat16", "stride": [32, 8, 1]}
+    args = {"output": out | {"role": "activation"}, "num_kv_splits": splits}
+    op = {"op": "aiter.mla:mla_decode_fwd_v4_nm", "args": args}
+
+    built = stub._copy(op, "sig", [{}], 0)[0]["output"]
+
+    assert (built.shape, built.stride(), built.storage_offset()) == (
+        (2, 4, 8),
+        (32, 8, 1),
+        0,
+    )
+    assert built.dtype == torch.bfloat16 and ops._room(built) == room
+
+
 def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
     monkeypatch,
 ):
