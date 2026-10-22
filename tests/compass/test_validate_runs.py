@@ -27,6 +27,7 @@ from test_stop_between_client_runs import CLIENT_RUN as UNREFUSED
 from atom.compass import run as compass_run
 from atom.compass.drive import aiter_jit, serve
 from atom.compass.drive import run as drive_run
+from atom.compass.parity import TRANSFERS
 from atom.compass.validate.runs import (
     ASSUMED,
     CLIENT_RUN,
@@ -860,7 +861,8 @@ def _deployed(cell, late=None, **run):
     `_recorded`'s steps, with `run`'s entries in its run.json, on DP rank 0
     and again on rank 1 as requests `kc` and `kd`, the ranks stepping
     together; on side `late` rank 1 runs its warmup's step after its first own
-    one. The client's export, naming all four, is beside them."""
+    one. The client's export, naming all four, is beside them;
+    their requests are named as `_named_as_deployed` names them."""
     for side in SIDES:
         _recorded(_cell(cell / side, _schedule(), {7: "ka", 8: "kb"}), **run)
         steps = cell / side / "steps"
@@ -886,7 +888,38 @@ def _deployed(cell, late=None, **run):
         (cell / side / "artifacts").rename(cell / "artifacts")
         (cell / CLIENT_RUN).write_text(json.dumps(export))
     (cell / "run.json").write_text(json.dumps({"kv_link": "inter_node"}))
+    _named_as_deployed(cell)
     return cell
+
+
+def _named_as_deployed(cell):
+    """Name the requests of deployment `cell`, each side's record named as
+    one server's, as a deployment's two records name them: prefill by its own
+    response ids, `p-<id>`, which the export does not name; decode, its
+    request ids 100 above prefill's, at its first step by its request id, and
+    each joined in `transfers.jsonl` to its prefill DP rank and request id."""
+    for path in sorted((cell / "prefill" / "steps").glob("dp*[0-9].jsonl")):
+        lines = [json.loads(x) for x in path.read_text().splitlines()]
+        for line in lines:
+            line["named"] = [[r, k, f"p-{i}"] for r, k, i in line["named"]]
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    sent = []
+    for path in sorted((cell / "decode" / "steps").glob("dp*[0-9].jsonl")):
+        lines = [json.loads(x) for x in path.read_text().splitlines()]
+        ids = {r: i for line in lines for r, _k, i in line["named"]}
+        seen = set()
+        for line in lines:
+            first = [r for r, *_ in line["batch"] if r in ids and r not in seen]
+            seen.update(first)
+            line["named"] = [[r + 100, r + 100, ids[r]] for r in first]
+            line["batch"] = [[r + 100, *rest] for r, *rest in line["batch"]]
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+        sent += [
+            {"response_id": i, "remote_dp_rank": int(path.stem[2:]), "transfer_id": r}
+            for r, i in ids.items()
+        ]
+    text = "".join(json.dumps(x) + "\n" for x in sent)
+    (cell / "decode" / "steps" / TRANSFERS).write_text(text)
 
 
 def test_a_deployment_is_graded_per_side_over_every_dp_rank(tmp_path):

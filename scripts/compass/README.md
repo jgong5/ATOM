@@ -695,7 +695,8 @@ record`, the simulated one from `deploy.sh run`. Each holds `prefill/` and `deco
 and the client's `artifacts/` beside them, and the table grades it per side: schedule
 over every DP rank of that side, cost at the law fitted under that side's engine config,
 memory against that side's hand-in (`lp-engine-P.json`, `lp-engine-D.json`); end to
-end once, from the deployment's export.
+end once, from the deployment's export. The export names decode's response ids, so
+prefill's side is split through decode's `transfers.jsonl` (`parity.transfers`).
 
 ## The stage-2 cell through the `compass` CLI, from an empty store
 

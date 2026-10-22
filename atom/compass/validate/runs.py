@@ -50,7 +50,10 @@ A deployment `deploy.sh` wrote holds a server's directory per side,
 `prefill/` and `decode/`, and its client's export beside them. Each side is
 checked and graded as a run `record` or `run` wrote, against that export, and
 the step families below are per side (`counts prefill`, `counts decode`, ...);
-end to end is the deployment's, once. A record of several DP ranks is graded
+end to end is the deployment's, once. The export names decode's response
+ids; prefill's record names a request by its own, so its side is split through
+decode's `transfers`, which joins prefill's DP rank and request id to the
+decode response id. A record of several DP ranks is graded
 over every rank's steps: counts summed over ranks, distributions over every
 rank's steps, and the warmup checks on its steps in step order, every rank's
 step k one forward.
@@ -98,6 +101,7 @@ from scipy.stats import ks_2samp
 
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.drive import aiter_jit
+from atom.compass.parity import read, transfers
 from atom.compass.parity.served import served
 from atom.compass.run import (
     CLIENT_DIR,
@@ -220,6 +224,25 @@ def _end_to_end(export) -> dict:
     return {name: export[k][stat] for name, (k, stat) in END_TO_END.items()}
 
 
+def _named_by_prefill(export, prefill, decode) -> dict:
+    """`export`, whose names are decode's response ids, with each request
+    renamed by the response id `prefill`'s record names it by: its prefill DP
+    rank and request id join the decode response id in `decode`'s
+    `transfers`."""
+    sent = transfers(Path(decode) / "steps")
+    names = {}
+    for rank, steps in read(Path(prefill) / "steps").items():
+        for step in steps:
+            for key, request in step.get("request_ids", {}).items():
+                if (name := sent.get((rank, request))) is not None:
+                    names[name] = step["response_ids"][key]
+
+    def renamed(requests):
+        return {names.get(n, n): r for n, r in (requests or {}).items()}
+
+    return export | {k: renamed(export.get(k)) for k in ("requests", "warmup")}
+
+
 def _client_run(cell, run, client) -> tuple[list[dict], list[str], dict]:
     """The steps of the client run `cell` grades, the traces its client was
     given, and its warmup: how many requests its export, in `client`, names as
@@ -228,6 +251,8 @@ def _client_run(cell, run, client) -> tuple[list[dict], list[str], dict]:
     steps are taken in step order, every rank's step k one."""
     steps = _steps(cell)
     export = read_json(Path(client) / CLIENT_RUN)
+    if Path(cell) == Path(client) / SIDES[0]:
+        export = _named_by_prefill(export, cell, Path(client) / SIDES[1])
     warmup_names = set(export.get("warmup") or ())
     record = served(Path(cell) / "steps", [export["requests"]])
     split = [s for rank in record.values() for s in rank if not s["is_dummy_run"]]

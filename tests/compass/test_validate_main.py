@@ -18,7 +18,7 @@ import sys
 import pytest
 from test_memory_check import GIB, _log
 from test_validate_cost import LAW, _record, _steps
-from test_validate_runs import ARGUMENTS, EXPORT
+from test_validate_runs import ARGUMENTS, EXPORT, _named_as_deployed
 
 from atom.compass import parity
 from atom.compass.backends import json_file, step_labels
@@ -625,7 +625,8 @@ def _deploy(cell):
     sides that run's server: its steps, run.json and server log in prefill/
     and decode/, each side under the engine config one of the run file's two
     laws was fitted under; its client's export beside them; and a simulated
-    run's engine hand-in as each side's."""
+    run's engine hand-in as each side's; their requests named as
+    `_named_as_deployed` names them."""
     laws = [LAW | {"engine_config": {"enable_tbo": tbo}} for tbo in (True, False)]
     for d in sorted(cell.iterdir()):
         for side, tbo in zip(SIDES, (True, False)):
@@ -638,6 +639,7 @@ def _deploy(cell):
             hand_in = d / LP_FILE.format("engine")
             if hand_in.exists():
                 shutil.copy(hand_in, d / LP_FILE.format(f"engine-{side[0].upper()}"))
+        _named_as_deployed(d)
         shutil.rmtree(d / "steps")
         run = {"kv_link": "inter_node"}
         if d.name == "step_linear":
