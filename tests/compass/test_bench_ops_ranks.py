@@ -512,6 +512,7 @@ class _AtomRunner(_Runner):
     on kept in `built`."""
 
     built: ClassVar[list] = []
+    tokenID_processor = SimpleNamespace(is_deferred_out=False)
 
     def __init__(self, rank, config):
         super().__init__()

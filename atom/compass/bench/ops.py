@@ -56,7 +56,7 @@ last-level cache, raised for a context key to its I instances (at most K),
 then, up to the leaf's occurrences when it takes a weight (at most K), copy
 c mod N with the c-th weights on that copy's other arguments.
 Copy c < N takes fresh activations below M and copy c mod M's from there,
-weight c mod the leaf's occurrences, and
+weight c mod the more of M and the leaf's occurrences, and
 instance c mod I at placement (c div I) mod P, its metadata and module
 tensors cloned past the first round: a placement is the point's batch on KV
 blocks and state slots of its own, as many as the pool and the slots hold,
@@ -389,9 +389,11 @@ def _runner(config, rank: int):
     the meta device and no warmup run, its KV pool allocated at the fewest
     blocks a rank has room for, sized by ATOM with the parameters' bytes held
     on the device and then freed for the weights each leaf builds; the runner
-    attributes the allocation set are in its `kv_held`. One DP rank of several
-    run alone is built as ATOM's simulated DP attention builds it: DP 1, its
-    experts cut as across the ranks."""
+    attributes the allocation set are in its `kv_held`; and, when the runner
+    defers its output, one sampled-id handoff to the host on ATOM's copy
+    stream, as ATOM's postprocess makes one after every forward. One DP rank
+    of several run alone is built as ATOM's simulated DP attention builds it:
+    DP 1, its experts cut as across the ranks."""
     from torch.distributed import TCPStore
 
     from atom.compass.bench.ranks import agreed, cpu_group
@@ -435,6 +437,14 @@ def _runner(config, rank: int):
     # what the allocation bound on the runner: `trace ops` reads a tensor
     # made there as KV
     runner.kv_held = {k: v for k, v in vars(runner).items() if before.get(k) is not v}
+    # with no handoff made, a Qwen3.8-27B GDN decode leaf read 5% under a
+    # runner that had made one
+    ids, done = runner.tokenID_processor, torch.cuda.Event()
+    if ids.is_deferred_out:
+        done.record()
+        zero = torch.zeros(1, dtype=torch.int32, device=runner.device)
+        ids.send_to_cpu_async(zero, ids.token_ids_cpu, done)
+        ids.recv_async_output(ids.token_ids_cpu)
     return runner
 
 
@@ -688,7 +698,9 @@ class Stub:
             if isinstance(value, dict) and self._routed(value, sig, path):
                 return self._route(value, c)
             if isinstance(value, dict) and value.get("role") == "weight":
-                return self._weight(value, c, op["occurrences"])
+                # each cache-sized copy takes a weight of its own, as it does activations
+                count = max(op["occurrences"], self.cold_copies.get(sig, 1))
+                return self._weight(value, c, count)
             if isinstance(value, dict) and "object" in value:
                 return rebuild_object(
                     value["object"], build(path, value["state"], None)
@@ -1112,10 +1124,13 @@ def _text(spec: dict) -> str:
 
 def _random(spec, device) -> torch.Tensor:
     """A tensor of `spec`'s shape, dtype and stride, random over its span when
-    floating, else zero: an integer one may index a dimension of one."""
+    floating, else zero: an integer one may index a dimension of one. Packed
+    fp4, which no cast reaches, takes random bytes: every e2m1 code is finite."""
     dtype = _dtype(spec["dtype"])
     n = _span(spec["shape"], spec["stride"])
-    if dtype.is_floating_point:
+    if dtype == torch.float4_e2m1fn_x2:
+        flat = torch.randint(256, (n,), dtype=torch.uint8, device=device).view(dtype)
+    elif dtype.is_floating_point:
         flat = torch.randn(n, device=device).mul_(0.1).to(dtype)
     else:
         flat = torch.zeros(n, device=device, dtype=dtype)
