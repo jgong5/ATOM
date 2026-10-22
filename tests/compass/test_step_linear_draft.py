@@ -174,6 +174,8 @@ def test_a_final_chunk_s_propose_pass_is_fitted_apart_and_a_middle_chunk_prices_
         line.update(produces_output=output, d_target_ns=round(s * 1e9))
         if propose:
             line["d_propose_ns"] = round(propose * 1e9)
+    # A final chunk whose draft is all `propose` has no draft-KV label to fit.
+    lines[2]["d_target_ns"] = lines[2]["d_busy_ns"] - lines[2]["d_propose_ns"]
     path.write_text("".join(json.dumps(x) + "\n" for x in lines))
     law = _fit([path])
     propose = law["draft"]["propose"]["coefficients"]
