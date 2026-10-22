@@ -879,13 +879,12 @@ def _replay(fn, calls) -> list[float]:
     if registered:
         from aiter.dist.parallel_state import graph_capture
     graph = torch.cuda.CUDAGraph()
-    capture = torch.cuda.graph(graph, capture_error_mode="thread_local")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         with (
             refused_together(),
             graph_capture() if registered else contextlib.nullcontext(),
-            _contained(capture),
+            _contained(torch.cuda.graph(graph, capture_error_mode="thread_local")),
         ):
             for kwargs, snap in calls:
                 forward_context._forward_context = snap
