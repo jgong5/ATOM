@@ -18,7 +18,7 @@ has no `exclusive` value (D19).
 [bench, band and capture ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252):**
 capture is concrete, one graph per decode width and prefill (T, B) that `trace ops` is
 given or that a record directory's steps hold (D17, D18, D19); each leaf carries a contract, its arguments by schema
-slot with each tensor's stride and role, and a raw Triton or FlyDSL launch lifts to its
+slot with each tensor's stride, role and preshuffled mark, and a raw Triton or FlyDSL launch lifts to its
 innermost ATOM function (D20).
 
 **Revised 2026-10-19 by #1401's capture of DeepSeek-V4-Pro:** capture runs ATOM's two MoE

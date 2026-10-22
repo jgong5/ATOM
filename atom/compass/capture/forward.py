@@ -10,7 +10,8 @@ integer argument that differs between the two is affine in the context
 (`ir.Affine`), or the shape is refused by operator and slot.
 
 Each leaf carries its contract: its arguments by schema slot, a tensor as its
-shape, dtype, stride and role. A tensor's role is where its storage came from:
+shape, dtype, stride, role and the `is_shuffled` mark ATOM sets on a
+preshuffled weight. A tensor's role is where its storage came from:
 the model's parameters, buffers and tensor attributes are weights, what
 `allocate_kv_cache` allocated is KV, what the model's forward and the sampler
 after it allocated is an activation, and anything else (the runner's buffers,
