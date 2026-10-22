@@ -51,7 +51,8 @@ argument's as many entries of its first dimension as the batch's state slots,
 or its blocks when the model keeps no per-request state, or, of a decode
 attention leaf that states its layer's window and compress ratio, the plane
 rows the batch's blocks hold at that ratio, the tensors
-of each module it names and, for a leaf that names a context key, the KV and
+of each module it names, of one whose first dimension is the pool's blocks
+the batch's blocks, and, for a leaf that names a context key, the KV and
 per-request state its layer holds for the batch. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
 kernels of one eager call of copy 0, the fewer, at least one, cycling over its
@@ -648,7 +649,15 @@ class Stub:
                 size += sum(t.nbytes // t.shape[0] * unit for t in _fields(held))
                 need = None
             elif (module := self.modules.get(key, module)) is not None:
-                size += sum(t.nbytes for t in _own(module))
+                pool = self.runner.config.num_kvcache_blocks
+                for t in _own(module):
+                    # ponytail: a first dim of the pool's blocks is a view of
+                    # the KV pool (DeepSeek-V4's Indexer), read at the batch's
+                    if t.dim() and t.shape[0] == pool:
+                        size += t.nbytes // pool * blocks
+                        need = None
+                    else:
+                        size += t.nbytes
         n = self._cold(size)
         if need is None:  # cycle over every instance's state, which is held anyway
             n = min(CALLS, max(n, len(instances)))
