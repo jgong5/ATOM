@@ -124,7 +124,10 @@ def population_steps(names):
             except ValueError as exc:
                 raise ValueError(f"{name} step {line['step']} {exc}") from None
             if phase == "decode":
-                yield decode(tokens, line.get("moe_rows")).at(dp), line
+                # Every rank decodes `drafts` and one in each row by default.
+                g = line.get("moe_rows")
+                g = None if g == dp * tokens * (drafts + 1) else g
+                yield decode(tokens, g), line
             else:
                 yield prefill(tokens, seqs, line.get("moe_rows")).at(dp), line
 

@@ -203,6 +203,13 @@ def test_a_population_names_a_dp_prefill_s_rows_off_their_default(tmp_path):
     ]
 
 
+def test_a_population_s_drafted_decode_at_its_default_names_no_rows(tmp_path):
+    # Two ranks, each two rows verifying one draft: 2 x 2 x 2 rows.
+    record = _record(tmp_path, [([[2, 9, True]] * 2, 8)] * 2)
+
+    assert list(map(str, population_shapes([record]))) == ["decode B=2"] * 2
+
+
 def test_a_prefill_gathers_at_least_its_own_rows():
     with pytest.raises(ValueError, match="the gather holds this rank's"):
         prefill_shape(7, 1, 6)
