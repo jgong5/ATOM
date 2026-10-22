@@ -75,7 +75,8 @@ from the simulated cell to each real run. The families:
   never names, their prefill unfinished, are one request.
 - distributions, per step from the step record: batch width, scheduled
   tokens, context tokens, and the cached fraction of a prefill step's context.
-  Distance: the two-sample KS statistic.
+  Distance: the two-sample KS statistic. A distribution no run samples, as
+  a decode side's cached fraction, is left out.
 - end to end, from the export: TTFT, TPOT (aiperf's inter-token latency) mean
   and p50, request and output-token throughput. Distance `|a / b - 1|`.
   `ungradeable` where the real spread exceeds the target (15% TTFT, 10% the
@@ -444,6 +445,8 @@ def grade(real_cells, simulated_cell) -> dict:
         return {
             name: _grade(family, name, [t[name] for t in theirs], mine[name])
             for name in mine
+            # A distribution no run samples, a decode side's cached fraction.
+            if family != "distributions" or any(t[name] for t in (*theirs, mine))
         }
 
     # A deployment's schedule per side, `counts prefill` and up; its end to end once.

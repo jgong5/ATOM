@@ -231,6 +231,33 @@ def test_requests_keys_by_the_final_chunks_context_not_a_later_decode_row():
     assert _requests(steps) == collections.Counter({(100, 0): 100})
 
 
+def test_requests_of_one_id_on_two_dp_ranks_are_two_requests():
+    """Each DP rank numbers its own requests, so request 1 on rank 0 and
+    request 1 on rank 1 are two prompts of 100 tokens, not one of 200."""
+    steps = [
+        {
+            "dp_rank": rank,
+            "named": [[1, f"k{rank}"]],
+            "batch": [[1, 100, 100]],
+            "rows": [[100, 100, False]],
+        }
+        for rank in (0, 1)
+    ]
+    assert _requests(steps) == collections.Counter({(100, 0): 100, (100, 1): 100})
+
+
+def test_a_distribution_no_run_samples_is_left_out(tmp_path):
+    """A schedule of decode steps alone, as a deployment's decode side runs,
+    has no prefill step's cached fraction in any run."""
+    decode = [[(7, 1, 101, True)], [(7, 1, 102, True)]]
+    real = [_cell(tmp_path / f"r{i}", decode, {}) for i in range(2)]
+    report = grade(real, _cell(tmp_path / "sim", decode, {}))
+
+    distributions = report["distributions"]
+    assert set(distributions) == {"batch width", "scheduled tokens", "context tokens"}
+    assert {g["verdict"] for g in distributions.values()} == {"inside the real spread"}
+
+
 #: A simulated run's run.json entries that grading reads, as `run` writes
 #: them, for a run it grades: host laws on, no roofline, no refusal, and a
 #: backend fitted on a trace no cell here sends.
