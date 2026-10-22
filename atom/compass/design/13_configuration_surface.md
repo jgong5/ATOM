@@ -320,7 +320,10 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
     or decode `run` without `--join` refuses: it shares a clock with its peer.
   - *The deployment's `server.json`.* Once the router answers, the deployment
     directory holds a `server.json` as `serve` writes one, naming the router's URL and
-    process id, whose parent is the script, and adding the run file and clock endpoint.
+    the process id of a child of the script that lives as long as the script, and
+    adding the run file and clock endpoint. A router LP that leaves when the traffic
+    closes its clock connection has ended the run, not failed it: the script serves
+    on until the stop.
     SIGTERM to the script stops each instance, the router and the authority, and
     writes the deployment's `run.json`: the script's command line, the run file and the
     router's command.

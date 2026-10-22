@@ -28,7 +28,8 @@ experts' ids ATOM fuses into them (`_route`); a weight is random at its
 shape, dtype and stride, one tensor per occurrence of the leaf in the step;
 a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
-the token ids ATOM prepared (`TOKEN_IDS`); an integer the capture
+the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
+HCA decode workspace an `HCA_DECODE` slot names; an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names, its module's meta parameters
 moved to the device and filled as `--load_dummy xavier` fills them (`_fill`),
@@ -173,6 +174,9 @@ REST = 0.1
 #: the model's forward; `_meta`'s name rule binds an embedding's `indices` to
 #: another index buffer.
 TOKEN_IDS = {("aten.embedding.default", "indices")}
+#: The operator whose metadata slots are named as the fields of DeepSeek-V4's
+#: HCA decode workspace: aiter defines its schema and the workspace together.
+HCA_DECODE = "aiter.mla_decode_v4_ps_asm.default"
 #: The seed of a copy's drawn expert ids, with the copy's index.
 SEED = 0
 #: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
@@ -503,14 +507,22 @@ class Stub:
             for k, v in live.items()
             if torch.is_tensor(v) and v.device.type == device
         }
+        # DeepSeek-V4's persistent HCA decode workspace, one per device: a slot
+        # of `HCA_DECODE` named as one of its fields is a view of that field
+        hca = sys.modules.get("atom.model_ops.v4_kernels.hca_persist")
+        work = getattr(hca, "_workspaces", {}).get(self.runner.device.index)
+        work = work._asdict() if work is not None else {}
         meta = dict(self.kv)
         for sig, (op, _) in self.leaves.items():
             for path, spec in _specs(op["args"]):
                 if spec["role"] == "metadata":
                     token = (op["op"], path) in TOKEN_IDS
                     pool = {"input_ids": input_ids} if token else live
+                    what, field = "metadata", path.split(".")[0]
+                    if op["op"] == HCA_DECODE and field in work:
+                        pool, what = {field: work[field]}, "HCA workspace"
                     try:
-                        name, view = _meta(spec, path, pool)
+                        name, view = _meta(spec, path, pool, what)
                         # leaves share a view's clone: DeepSeek-V4's decode
                         # leaves view 2.7 GB of it at a placement
                         meta[sig, path] = name, _deep(view, {}, self.clones)
@@ -803,7 +815,8 @@ class Stub:
 
     def _weight(self, spec, c, count):
         """Weight `c mod count` of `spec`, random: the `count` of a leaf are
-        built once, as slices of one tensor."""
+        built once, as slices of one tensor, each marked preshuffled when ATOM
+        marked the captured one, so the operator picks the kernel it picked."""
         if (_spec_of(spec), 0) not in self.built:
             n = _span(spec["shape"], spec["stride"])
             dtype, device = _dtype(spec["dtype"]), self.runner.device
@@ -812,6 +825,8 @@ class Stub:
                 w = whole[i * n : (i + 1) * n]
                 w.copy_(_random({**spec, "shape": [n], "stride": [1]}, device))
                 view = w.as_strided(spec["shape"], spec["stride"])
+                if spec.get("is_shuffled"):
+                    view.is_shuffled = True
                 self.built[_spec_of(spec), i] = view
         return self.built[_spec_of(spec), c % count]
 

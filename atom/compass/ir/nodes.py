@@ -8,9 +8,10 @@
 * `Par`     regions that overlap on the device, combined by a `JoinPolicy`.
 
 An `Op` holds its arguments by schema slot, which is what calling it again
-needs: a tensor as a `Tensor` (shape, dtype, stride, role), a module as a
-`ModuleRef`, an integer affine in a decode step's context as an `Affine`, any
-other object as pickle reduces it (`Reduced`), anything else as its value.
+needs: a tensor as a `Tensor` (shape, dtype, stride, role, preshuffled mark),
+a module as a `ModuleRef`, an integer affine in a decode step's context as an
+`Affine`, any other object as pickle reduces it (`Reduced`), anything else as
+its value.
 
 An operator's cost-deciding per-step state (block tables, context lengths) is
 ambient, not an argument, so an `Op` names where to find it again
@@ -55,12 +56,15 @@ class Role(enum.Enum):
 
 @dataclass(frozen=True, slots=True)
 class Tensor:
-    """A tensor argument: enough to make one like it, and where it came from."""
+    """A tensor argument: enough to make one like it, and where it came from.
+    `shuffled` is the `is_shuffled` mark ATOM sets on a preshuffled weight,
+    which an operator such as aiter's `fused_moe_` reads to pick its kernel."""
 
     shape: tuple
     dtype: str
     stride: tuple
     role: Role
+    shuffled: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "shape", as_shape(self.shape))
