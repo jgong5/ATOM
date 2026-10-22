@@ -68,6 +68,7 @@ under the law's `draft`; it holds no `held_out`. A step with a propose label
 (`step_labels`) is fitted there on its draft label less that label, the
 draft-KV pass a middle chunk runs too, and left out when nothing remains; the
 propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`.
+The draft law's prefill vector adds `seqs` and `out` (`StepLinearLaw`).
 
 Forms (`FORMS`): `base`, the features `StepLinearLaw` always prices; `history`,
 prefill plus `Sum (N_KV - N_Q)`, the KV a short chunk reads on a deep history;
@@ -141,12 +142,15 @@ def _rung_key(rung: int | None) -> str:
     return EAGER if rung is None else str(rung)
 
 
-def _features(samples, form: str, dp: int) -> tuple[list[tuple], dict]:
+def _features(
+    samples, form: str, dp: int, draft: bool = False
+) -> tuple[list[tuple], dict]:
     """One rank's fittable samples as (vector, features, seconds, step, context),
     and how many were cut, per reason.
 
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
-    order, plus `history` for that form and, above `dp` 1, `moe_rows` on prefill;
+    order, plus `history` for that form, above `dp` 1 `moe_rows` on prefill, and
+    under `draft` `seqs` and `out` on prefill, as `StepLinearBackend` counts them;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill.
     """
     cut, rows = dict.fromkeys(CUTS, 0), []
@@ -168,6 +172,9 @@ def _features(samples, form: str, dp: int) -> tuple[list[tuple], dict]:
                             "a data-parallel law prices prefill from"
                         )
                     counts += (view.moe_rows,)
+                if draft:
+                    output = bool(view.produces_output)
+                    counts += (len(r) if output else 0, int(output))
             else:
                 key = _rung_key(view.capture_rung)
                 counts = (1, sum_context(view.decode), view.graph_padding)
@@ -374,10 +381,12 @@ def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
     return {"equal": equal, "facets": facets}
 
 
-def _groups(run, form: str) -> tuple[list[list[tuple]], dict, list[float]]:
+def _groups(
+    run, form: str, draft: bool = False
+) -> tuple[list[list[tuple]], dict, list[float]]:
     """One run's steps, each its ranks' `_features` rows labelled with the smallest
     rank label; what was cut; and each step's rank label spread."""
-    got = [_features(rank, form, len(run)) for rank in run]
+    got = [_features(rank, form, len(run), draft) for rank in run]
     cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
     if len(run) == 1:
         return [[r] for r in got[0][0]], cut, []
@@ -431,11 +440,12 @@ def _options(options) -> tuple[str, int]:
     return options["form"], options["dp"]
 
 
-def fit(samples, options=None, seed: int = 0) -> tuple[dict, dict]:
+def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict, dict]:
     """The law over `samples`, as the mapping `StepLinearLaw` reads, and its report.
 
     `options` takes `form` (`base` by default) and `dp`, the ranks each run
-    holds (1 by default); `seed` fixes the `rowmod` shuffles.
+    holds (1 by default); `seed` fixes the `rowmod` shuffles; `draft` adds
+    `seqs` and `out` to the prefill vector.
     """
     from scipy.spatial import QhullError
 
@@ -443,12 +453,13 @@ def fit(samples, options=None, seed: int = 0) -> tuple[dict, dict]:
     runs = _runs(samples, dp)
     groups, cut, spread = [], {"warm": 0, "warm_s": 0.0}, []
     for i, run in enumerate(runs.values()):
-        got, c, s = _groups(run, form)
+        got, c, s = _groups(run, form, draft)
         groups += [[(i, *r) for r in g] for g in got]
         spread += s
         for k, v in c.items():
             cut[k] = cut.get(k, 0) + v
     prefill = list(HISTORY if form == "history" else PREFILL) + ["moe_rows"] * (dp > 1)
+    prefill += ["seqs", "out"] * draft
     rows, alternation = _slowest(groups, prefill)
     law = {
         "provenance": f"step_linear_fit {form} on {len(runs) * dp} real records "
@@ -562,7 +573,7 @@ def fit(samples, options=None, seed: int = 0) -> tuple[dict, dict]:
         if s.draft_s is not None and s.draft_s > (s.propose_s or 0.0)
     ]
     if drafts:
-        law["draft"] = fit(drafts, options, seed)[0]
+        law["draft"] = fit(drafts, options, seed, draft=True)[0]
         if proposes := [s for s in samples if s.propose_s is not None]:
             law["draft"]["propose"] = _propose(proposes)
     return law, report

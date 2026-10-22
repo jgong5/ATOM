@@ -48,8 +48,11 @@ same features, on a step that produces no output too: there the draft is the
 pass that fills the drafter's KV over the chunk.
 A draft law may also hold a `propose` vector over `[1, seqs]`, seqs the step's
 requests: on a prefill step that produces output it adds the drafter's
-`propose` pass, which a middle chunk does not run, and a prefill step that does
-not say whether it produces output is refused.
+`propose` pass, which a middle chunk does not run. Its prefill vector may add
+`seqs` and `out`, the step's requests and 1 on a prefill step that produces
+output and 0 on one that does not: the draft-KV pass projects and writes a tail
+only for requests that finish their prompts. Under either, a prefill step that
+does not say whether it produces output is refused.
 
 The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
 
@@ -154,7 +157,11 @@ class StepLinearLaw:
         self.prefill = None
         if "prefill" in law:
             prefill = law["prefill"]
-            extra = [f for f in ("history", "moe_rows") if f in prefill["coefficients"]]
+            extra = [
+                f
+                for f in ("history", "moe_rows", "seqs", "out")
+                if f in prefill["coefficients"]
+            ]
             self.prefill = _Vector("prefill", PREFILL + tuple(extra), prefill)
         self.decode = {
             None if rung == EAGER else int(rung): _Vector(
@@ -225,6 +232,19 @@ class StepLinearBackend(CostBackend):
                 if batch_view.moe_rows is None:
                     raise self._refuse(batch_view, "no MoE gather rows on this step")
                 counts += (batch_view.moe_rows,)
+            output = batch_view.produces_output
+            by_output = {
+                "seqs": len(prefill) if output else 0,
+                "out": int(bool(output)),
+            }
+            mine = [f for f in by_output if f in vector.features]
+            if output is None and (law.propose or mine):
+                raise self._refuse(
+                    batch_view,
+                    "a prefill step that does not say whether it produces output, "
+                    f"which its {what}prefill terms depend on",
+                )
+            counts += tuple(by_output[f] for f in mine)
         else:
             rung, kind = batch_view.capture_rung, "decode"
             vector = law.decode.get(rung)
@@ -237,16 +257,9 @@ class StepLinearBackend(CostBackend):
             if vector.rowmod:
                 counts += (rowmod([r.context_tokens for r in decode], vector.rowmod),)
         terms = self._priced(law, vector, kind, counts, what)
-        if prefill and law.propose is not None:
-            if batch_view.produces_output is None:
-                raise self._refuse(
-                    batch_view,
-                    "a prefill step that does not say whether it produces output, "
-                    f"which decides its {what}propose pass",
-                )
-            if batch_view.produces_output:
-                seqs = (1, len(batch_view.requests))
-                terms += self._priced(law, law.propose, "propose", seqs, what)
+        if prefill and law.propose is not None and batch_view.produces_output:
+            seqs = (1, len(batch_view.requests))
+            terms += self._priced(law, law.propose, "propose", seqs, what)
         return terms
 
     def _priced(self, law, vector: _Vector, kind: str, counts: tuple, what: str):
