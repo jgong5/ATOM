@@ -56,7 +56,8 @@ _CAPTURES: dict = {}
 def capture(drafts, tmp_path_factory, dp=1):
     """`compass trace ops --width 2` under an MTP drafter of `drafts` tokens,
     or at DP `dp` `--population` of a record whose every rank verifies 2 rows
-    at rung 2: the capture's directory and its graphs by structure."""
+    at rung 2, then beside a peer prefilling 16 tokens: the capture's directory
+    and its graphs by structure, the first shape's."""
     if (drafts, dp) in _CAPTURES:
         return _CAPTURES[drafts, dp]
     root = tmp_path_factory.mktemp(f"mtp{drafts}")
@@ -66,7 +67,9 @@ def capture(drafts, tmp_path_factory, dp=1):
     if dp > 1:
         (root / "record").mkdir()
         line = {"rows": [[drafts + 1, 90, True]] * 2, "rung": 2}
-        record = _record(root / "record", [line | {"moe_rows": dp * 2 * (drafts + 1)}])
+        local = 2 * (drafts + 1)
+        beside = line | {"rung": None, "moe_rows": local + 16}
+        record = _record(root / "record", [line | {"moe_rows": dp * local}, beside])
         steps = root / "record" / "steps"
         for r in range(1, dp):
             (steps / f"dp{r}.jsonl").write_bytes((steps / "dp0.jsonl").read_bytes())
@@ -95,7 +98,7 @@ def capture(drafts, tmp_path_factory, dp=1):
     for token in tokens:
         entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
         graph = json.loads(entry.read_member("graph", rank, "json"))
-        graphs[graph["structure"]] = graph
+        graphs.setdefault(graph["structure"], graph)
     _CAPTURES[drafts, dp] = root, graphs
     return root, graphs
 
@@ -221,10 +224,10 @@ def test_a_population_captures_a_verify_step_at_its_width(tmp_path):
 # --- a data-parallel verify step ---------------------------------------------
 
 
-def dp_view(width, rung, dp):
+def dp_view(width, rung, dp, counts=None):
     """Rank 0's view of a decode of `width` rows, each verifying one draft, at
-    `rung`, every rank of `dp` alike, as `batch_view` builds it from the
-    step's mode."""
+    `rung`, every rank of `dp` alike or at its tokens in `counts`, as
+    `batch_view` builds it from the step's mode."""
     batch = SimpleNamespace(
         total_seqs_num_prefill=0,
         num_scheduled_tokens=[2] * width,
@@ -234,7 +237,7 @@ def dp_view(width, rung, dp):
     )
     r = runner(None, dp_size=dp)
     r.drafter = SimpleNamespace(is_block_drafter=False)
-    counts = torch.tensor([2 * width] * dp)
+    counts = torch.tensor(counts or [2 * width] * dp)
     mode = SimpleNamespace(
         sync=SimpleNamespace(num_tokens_across_dp=counts, ub_tokens_across_dp=None),
         running_tokens_are_unified=True,
@@ -274,29 +277,38 @@ def test_a_balanced_dp_verify_step_prices_from_its_population_s_graphs(
     assert sum(first["args"]["sizes"]) == step.draft_moe_rows == 8
 
 
-def test_a_padded_dp_verify_step_reads_its_drafter_at_the_drafter_s_rows(tmp_path):
+def test_a_dp_drafter_beside_a_prefilling_peer_gathers_the_step_s_rows(
+    tmp_path_factory,
+):
+    root, graphs = capture(1, tmp_path_factory, dp=2)
+    [target] = [key for key in graphs if not key.endswith(" draft")]
+    store, rank = ArtifactStore(str(root / "store")), Topology().ranks()[0]
+    key = Key.of(Kind.OP_GRAPH, structure=f"{target} draft", shape="decode B=2 G=20")
+    drafter = json.loads(store.read(key).read_member("graph", rank, "json"))
+
+    # Its first pass gathers this rank's 4 verified tokens and the peer's 16.
+    first = next(op for op in _ops(drafter["region"]) if op["op"].endswith("gatherv"))
+    assert sum(first["args"]["sizes"]) == 20
+
+
+def _lookup(tmp_path, dp, stored):
+    """`_op_graphs` at DP `dp` under MTP1 over a store of `stored`'s regions,
+    each keyed by its phase, shape and whether it is the drafter's."""
     (tmp_path / "model").mkdir()
     (tmp_path / "model" / "config.json").write_text("{}")
     config = SimpleNamespace(
         model=str(tmp_path / "model"),
         hf_config=SimpleNamespace(architectures=CONFIG_ARCHITECTURES),
         tensor_parallel_size=1,
-        parallel_config=SimpleNamespace(data_parallel_size=8),
+        parallel_config=SimpleNamespace(data_parallel_size=dp),
         enable_expert_parallel=False,
         enforce_eager=True,
         speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=1),
         **ENGINE,
     )
-    # 3 rows at rung 4: the target gathers every rank's 8 padded tokens, the
-    # drafter's first pass every rank's 6.
-    stored = {
-        ("decode B=4", False): g(4, 64, 64),
-        ("decode B=4", True): g(4096 * 64, 128, 128),
-        ("decode B=4 G=48", True): g(4096 * 48, 128, 128),
-    }
     store, rank = ArtifactStore(str(tmp_path / "store")), Topology().ranks()[0]
-    for (shape, draft), region in stored.items():
-        at = structure(config, "decode", True, "gfx950", True, draft)
+    for (phase, shape, draft), region in stored.items():
+        at = structure(config, phase, True, "gfx950", True, draft)
         store.publish(
             Key.of(Kind.OP_GRAPH, structure=at, shape=shape),
             provenance=stanza("compass trace ops"),
@@ -309,13 +321,60 @@ def test_a_padded_dp_verify_step_reads_its_drafter_at_the_drafter_s_rows(tmp_pat
                 ).encode()
             },
         )
-    lookup = _op_graphs(store.root, config, "gfx950")
-    backend = OpGraphBackend(SPEC, lookup, kv="bf16", dp=8, drafts=1, price_list=FLAT)
-    step = dp_view(3, 4, dp=8)
+    return _op_graphs(store.root, config, "gfx950")
 
-    assert (step.moe_rows, step.draft_moe_rows) == (64, 48)
+
+def test_a_dp_verify_step_reads_its_drafter_at_its_rows_and_refuses_it_padded(
+    tmp_path,
+):
+    # Rung 4 on 8 ranks: the target gathers every rank's 8 padded tokens, the
+    # drafter's first pass every rank's own.
+    lookup = _lookup(
+        tmp_path,
+        8,
+        {
+            ("decode", "decode B=4", False): g(4, 64, 64),
+            ("decode", "decode B=4", True): g(4096 * 64, 128, 128),
+            ("decode", "decode B=4 G=50", True): g(4096 * 50, 128, 128),
+            ("decode", "decode B=4 G=48", True): g(4096 * 48, 128, 128),
+        },
+    )
+    backend = OpGraphBackend(SPEC, lookup, kv="bf16", dp=8, drafts=1, price_list=FLAT)
+    at_rung = dp_view(4, 4, dp=8, counts=[8] + [6] * 7)
+    padded = dp_view(3, 4, dp=8)
+
+    assert (at_rung.moe_rows, at_rung.draft_moe_rows) == (64, 50)
     # The price list holds the target's GEMM at `decode B=4`, no rows named.
-    assert by_name(backend.price(step)) == {
+    assert by_name(backend.price(at_rung)) == {
         f"op.{GEMM}.price_list": pytest.approx(7e-6),
-        f"draft op.{GEMM}": price(gemm(4096 * 48, 128, 128), SPEC),
+        f"draft op.{GEMM}": price(gemm(4096 * 50, 128, 128), SPEC),
     }
+    # Padded, it runs 6 tokens where `decode B=4 G=48`'s drafter traces 8.
+    assert (padded.moe_rows, padded.draft_moe_rows) == (64, 48)
+    named = (
+        "a DP decode under a drafter padded from 3 rows to its rung of 4: its "
+        "drafter's first pass runs the rows' 6 tokens unpadded, and a graph at "
+        "the rung traces 8 (#1961)"
+    )
+    with pytest.raises(CostRefused, match=re.escape(named)):
+        backend.price(padded)
+
+
+def test_a_dp_prefill_under_a_drafter_reads_its_graphs_at_their_default(tmp_path):
+    # A prefill's default G is every rank's tokens: its rows verify no drafts.
+    lookup = _lookup(
+        tmp_path,
+        2,
+        {
+            ("prefill", "prefill T=9 B=1", False): g(9, 64, 64),
+            ("prefill", "prefill T=9 B=1", True): g(9, 128, 128),
+        },
+    )
+    step = replace(FINAL, moe_rows=18, draft_moe_rows=18)
+
+    cost = OpGraphBackend(SPEC, lookup, kv="bf16", dp=2, drafts=1).price(step)
+
+    assert (cost.target_seconds, cost.draft_seconds) == (
+        price(gemm(9, 64, 64), SPEC),
+        price(gemm(9, 128, 128), SPEC),
+    )

@@ -65,11 +65,12 @@ or run an exchange beside a second stream (the dual-stream MoE, which ATOM
 turns off under overlap), or that runs under a drafter, whose draft pass no
 graph places on the overlapped streams; a decode step whose rows do not each
 verify the drafter's tokens and one, and under a drafter a step that samples
-nothing, whose draft-KV pass no graph holds; a prefill step whose view
-does not say whether it produces output; a shape with no graph, a
-data-parallel step's naming the rows it gathers; and, each reason once, a leaf
-whose kind has no extractor, whose price reads a spec field the spec lacks, or
-whose collective leaves the scale-up domain.
+nothing, whose draft-KV pass no graph holds, or a DP decode padded to its
+rung, whose drafter's first pass runs fewer tokens than its graph traces; a
+prefill step whose view does not say whether it produces output; a shape with
+no graph, a data-parallel step's naming the rows it gathers; and, each reason
+once, a leaf whose kind has no extractor, whose price reads a spec field the
+spec lacks, or whose collective leaves the scale-up domain.
 """
 
 from __future__ import annotations
@@ -257,7 +258,8 @@ class OpGraphBackend(CostBackend):
 
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
-        with `draft`, its drafter's at `draft_moe_rows`."""
+        with `draft`, its drafter's at `draft_moe_rows`, refused for a DP
+        decode padded to its rung."""
         if view.image_tokens:
             reason = IMAGES
         else:
@@ -284,6 +286,14 @@ class OpGraphBackend(CostBackend):
                     reason = (
                         "a step under a drafter that produces no output: its "
                         "draft-KV pass runs off the path a capture traces"
+                    )
+                elif draft and g and shape[2] != len(rows):
+                    reason = (
+                        f"a DP decode under a drafter padded from {len(rows)} rows "
+                        f"to its rung of {shape[2]}: its drafter's first pass runs "
+                        f"the rows' {sum(q for q, _ in rows)} tokens unpadded, and a "
+                        f"graph at the rung traces {shape[1] * (self.drafts + 1)} "
+                        "(#1961)"
                     )
                 elif isinstance(
                     region := self.graph(*shape, output, *g, **drafted), dict

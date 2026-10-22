@@ -490,7 +490,10 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   (`compute_draft_kv`) on a real step only, and a prefill shape is traced as a dummy run,
   so no graph holds that pass. A block drafter (DSpark): it writes its draft KV before
   `forward_done_event` on a step that samples ([#1607](https://github.com/jgong5/ATOM/pull/1607)),
-  so one cut does not part its target from its draft.
+  so one cut does not part its target from its draft. The drafter of a DP decode padded
+  to its rung: its first pass runs the rows' tokens unpadded, and a graph at the rung
+  traces the rung's, so it would price high
+  ([#1961](https://github.com/jgong5/ATOM/issues/1961)).
 
 The drafter's roofline is not its measured time. On #1208's MTP1 record
 (Qwen3.5-35B-A3B-FP8, TP1, MI308X) the drafter's roofline is 0.39 of the measured draft at
