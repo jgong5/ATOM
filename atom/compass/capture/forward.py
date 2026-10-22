@@ -32,7 +32,9 @@ Under a drafter a decode row verifies the drafter's tokens, a real step's
 batch so the rejection sampler runs, and a step that samples is cut where ATOM
 records `forward_done_event`: the target's work before it, the drafter's after
 it (its passes, the shared embedding and LM head among them), each its own
-graph. A block drafter writes its draft KV before the cut and is refused.
+graph. A middle chunk, which samples nothing, is a real step's batch too, so
+ATOM runs its draft-KV pass, and is cut where that pass starts. A block
+drafter writes its draft KV before `forward_done_event` and is refused.
 """
 
 import contextlib
@@ -232,6 +234,12 @@ def _storage(tensor) -> StorageWeakRef:
     return StorageWeakRef(tensor.untyped_storage())
 
 
+def _concrete(shape) -> tuple:
+    """`shape`, each symbolic size a check has bound as its int."""
+    bound = (d.node.maybe_as_int() if isinstance(d, torch.SymInt) else d for d in shape)
+    return tuple(b if b is not None else d for b, d in zip(bound, shape))
+
+
 def _params(code) -> tuple[str, ...]:
     """A function's parameters, by name, as its code object lists them."""
     count = code.co_argcount + code.co_kwonlyargcount
@@ -334,6 +342,7 @@ class _Recorder(TorchDispatchMode):
         self.stated, self.runner, self.replayed = {}, None, set()
         self.launchers, self.languages = set(), ()
         self.replaying = None  # the kernels a replay launched, while one runs
+        self.counted = None  # what a size the step's data sets counts, if stated
         self.start()
 
     def start(self):
@@ -381,6 +390,10 @@ class _Recorder(TorchDispatchMode):
         leaves = _pytree.tree_leaves((args, kwargs))
         ins = [t for t in leaves if isinstance(t, torch.Tensor)]
         outs = [t for t in _pytree.tree_leaves(out) if isinstance(t, torch.Tensor)]
+        if self.counted is not None:
+            for dim in (d for t in outs for d in t.shape):
+                if isinstance(dim, torch.SymInt) and dim.node.maybe_as_int() is None:
+                    torch._check(dim == self.counted)
         if self.creating is not None:
             read = set(map(_storage, ins))
             for storage in map(_storage, outs):
@@ -412,7 +425,7 @@ class _Recorder(TorchDispatchMode):
         if self.leaf is not None:  # part of the leaf call in progress
             self.inner.append(lambda: self.add(name, kind, slots, outs, why))
             return
-        op = self._op(name, kind, slots, [tuple(t.shape) for t in outs])
+        op = self._op(name, kind, slots, [_concrete(t.shape) for t in outs])
         if why:
             self.left_out.append((why, op))
         else:
@@ -564,7 +577,7 @@ class _Recorder(TorchDispatchMode):
     def _arg(self, value):
         if isinstance(value, torch.Tensor):
             role = self.roles.get(_storage(value), ir.Role.METADATA)
-            shape, stride = tuple(value.shape), value.stride()
+            shape, stride = _concrete(value.shape), value.stride()
             return ir.Tensor(shape, str(value.dtype), stride, role)
         if isinstance(value, torch.nn.Module) and id(value) in self.modules:
             return ir.ModuleRef(self._layered(self.modules[id(value)]))
@@ -648,6 +661,9 @@ def _patches(recorder):
       allocation); its device side is ATOM's `zeros_like`, faked.
     * GDN's causal-conv1d metadata is host arithmetic over the staged
       `cu_seqlens`, and it runs outside the fake mode too.
+    * A GDN prefill under ReplaySSM parks the cursors of its live state
+      slots, a count of the device's slot indices no fake tensor holds: the
+      host-staged indices state it (`_Recorder.counted`).
     * A real host tensor's values are read on the host, `tolist` as `numpy`;
       under a drafter a device value copied to the host, which nothing
       computed, reads as zeros (its runner reads back the last step's MTP
@@ -704,6 +720,7 @@ def _patches(recorder):
 
     init, zeros, numpy = CpuGpuBuffer.__init__, torch.zeros, torch.Tensor.numpy
     conv1d, tolist = gdn_attn.compute_causal_conv1d_metadata, torch.Tensor.tolist
+    attach = gdn_attn.GDNStateMixin._attach_replayssm
     fake_tolist = FakeTensor.tolist
 
     def landed(tensor):
@@ -748,6 +765,12 @@ def _patches(recorder):
         with unset_fake_temporarily():
             return conv1d(*args, **kwargs)
 
+    def replayssm(builder, md, num_reqs, is_prefill):
+        staged = builder.non_spec_state_indices_tensor.np[:num_reqs]
+        live = int((staged >= 0).sum()) if is_prefill else None
+        with patch.object(recorder, "counted", live):
+            return attach(builder, md, num_reqs, is_prefill)
+
     stack = contextlib.ExitStack()
     for owner, name, value in (
         (JITFunction, "run", run),
@@ -758,6 +781,7 @@ def _patches(recorder):
         (fly.CompiledFunction, "__call__", compiled_call),
         (CpuGpuBuffer, "__init__", staged_init),
         (gdn_attn, "compute_causal_conv1d_metadata", host_conv1d),
+        (gdn_attn.GDNStateMixin, "_attach_replayssm", replayssm),
         (torch.Tensor, "tolist", host_tolist),
         (FakeTensor, "tolist", host_tolist),
         (torch.Tensor, "numpy", lambda t, *a, **k: host_numpy(landed(t), *a, **k)),
@@ -857,6 +881,33 @@ def _build_runner(config, fake_mode):
         return _CapturedRunner(0, config)
 
 
+def _drafter(runner, recorder):
+    """The width of `runner`'s drafter and its models, none without one. Its
+    step is cut where its target's work ends, as the parity record stamps it:
+    at `forward_done_event` on a step that samples, else where the drafter's
+    draft-KV pass starts. A block drafter writes its draft KV before
+    `forward_done_event` on a step that samples, and is refused."""
+    drafter = getattr(runner, "drafter", None)
+    if drafter is None:
+        return 0, []
+    if drafter.is_block_drafter:
+        raise ValueError(
+            f"{type(drafter).__name__} writes its draft KV before "
+            "forward_done_event on a step that samples: no cut parts its "
+            "target from its draft"
+        )
+    done, draft_kv = runner.forward_done_event, drafter.compute_draft_kv
+    done.record = lambda *a: (recorder.cut(), driverless.Event.record(done, *a))
+
+    def compute_draft_kv(*args, **kwargs):
+        if not recorder.output:
+            recorder.cut()
+        return draft_kv(*args, **kwargs)
+
+    drafter.compute_draft_kv = compute_draft_kv
+    return drafter.mtp_k, [drafter.model]
+
+
 def _weights(model):
     """Every tensor the model holds: parameters, buffers and tensor attributes."""
     for module in model.modules():
@@ -872,11 +923,13 @@ def _batch(shape, block_size, context=1, output=True, drafts=0):
     blocks they take. A decode sequence holds `context` tokens, and under a
     drafter of `drafts` tokens verifies that many more, as ATOM's scheduler
     schedules it. Unless `output`, every prefill sequence is a middle chunk,
-    so the step samples nothing."""
+    so the step samples nothing. Under a drafter a prefill row states its next
+    token, -1 where the step samples it, as ATOM's scheduler states it."""
     from atom.model_engine import sequence
     from atom.model_engine.scheduler import ScheduledBatch
 
-    drafts = drafts if shape.phase == "decode" else 0
+    drafter, prefill = bool(drafts), shape.phase == "prefill"
+    drafts = 0 if prefill else drafts
     per, extra = divmod(shape.tokens, shape.seqs)
     counts = [per + (i < extra) + drafts for i in range(shape.seqs)]
     seqs, blocks = {}, 0
@@ -897,9 +950,13 @@ def _batch(shape, block_size, context=1, output=True, drafts=0):
         total_seqs_num=shape.seqs,
         **{f"total_tokens_num_{shape.phase}": sum(counts)},
         **{f"total_seqs_num_{shape.phase}": shape.seqs},
-        # ATOM scores drafts only on a step that is not a dummy run.
-        is_dummy_run=not drafts,
+        # ATOM scores drafts, and writes a prefill's draft KV, only on a step
+        # that is not a dummy run.
+        is_dummy_run=not drafter,
         is_final_chunk=None if output else [False] * shape.seqs,
+        next_token_ids=(
+            [-1 if output else 0] * shape.seqs if drafter and prefill else None
+        ),
         num_spec_step=drafts,
         scheduled_spec_decode_tokens={
             i: numpy.zeros(drafts, dtype=numpy.int32) for i in seqs
@@ -983,13 +1040,13 @@ def capture(
 
     Yields, per shape, the graph, the model's config digest, what the capture
     declared, the operators it left out of the graph among it; per prefill
-    shape, the middle chunk's and then the final one's. Under a drafter a step
-    that samples is two graphs, its target's and then its drafter's, cut where
-    ATOM records `forward_done_event`; a decode step verifies the drafter's
-    tokens in each row. The steps of the record directories `population` are
-    shapes too (`population_shapes`), under two-batch overlap a split one's
-    two micro-batches; each of their prefills runs as one forward, as it ran,
-    this rank answering that it cannot split it.
+    shape, the middle chunk's and then the final one's. Under a drafter each
+    step is two graphs, its target's and then its drafter's (`_drafter`), and a
+    decode step verifies the drafter's tokens in each row. The steps of the
+    record directories `population` are shapes too (`population_shapes`),
+    under two-batch overlap a split one's two micro-batches; each of their
+    prefills runs as one forward, as it ran, this rank answering that it
+    cannot split it.
     """
     declared = driverless.install(tmpdir, arch)
 
@@ -1049,17 +1106,8 @@ def capture(
         )
         recorder.runner = runner
         recorder.modules = {id(m): n for n, m in runner.model.named_modules() if n}
-        models, drafts = [runner.model], 0
-        if drafter := getattr(runner, "drafter", None):
-            if drafter.is_block_drafter:
-                raise ValueError(
-                    f"{type(drafter).__name__} writes its draft KV before "
-                    "forward_done_event on a step that samples: no cut parts its "
-                    "target from its draft"
-                )
-            drafts, done = drafter.mtp_k, runner.forward_done_event
-            models.append(drafter.model)
-            done.record = lambda *a: (recorder.cut(), driverless.Event.record(done, *a))
+        drafts, drafted = _drafter(runner, recorder)
+        models = [runner.model, *drafted]
         weights = map(_storage, (w for m in models for w in _weights(m)))
         recorder.roles = dict.fromkeys(weights, ir.Role.WEIGHT)
         recorder.creating = ir.Role.KV
@@ -1086,7 +1134,7 @@ def capture(
             return (False, False, 0, 0)
 
         for shape, output in variants:
-            recorder.shape = shape
+            recorder.shape, recorder.output = shape, output
             runner._local_tbo_eligibility = unsplittable if shape in unsplit else own
             traces = []
             for context in CONTEXTS if shape.phase == "decode" else CONTEXTS[:1]:
