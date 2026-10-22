@@ -13,6 +13,9 @@ which the router copies onto the decode request. The arrival is written as
 
 A client's cancel of a request is itself a stamped request to the same URL,
 whose body names the cancelled request's seq: ``{"compass_cancel": <seq>}``.
+A router hands a cancel on along the request's path; on a relay it carries
+its own stamp in the body, after the seq:
+``{"compass_cancel": <seq>, "kv_transfer_params": {"compass": "a:<arrival>;s:<seq>"}}``.
 """
 
 import json
@@ -116,7 +119,9 @@ def with_relay_stamp(body: bytes, stamp) -> bytes:
     return json.dumps(doc).encode()
 
 
-_CANCEL = re.compile(rb'\{"compass_cancel": (\d+)\}')
+_CANCEL = re.compile(
+    rb'\{"compass_cancel": (\d+)(?:, "kv_transfer_params": \{"compass": "[^"]*"\})?\}'
+)
 
 
 def cancel_body(seq: int) -> bytes:
@@ -125,6 +130,6 @@ def cancel_body(seq: int) -> bytes:
 
 
 def cancel_seq(body: bytes) -> int | None:
-    """The http seq a cancel's body names; None for any other body."""
+    """The seq a cancel's body names; None for any other body."""
     m = _CANCEL.fullmatch(body)
     return None if m is None else int(m[1])

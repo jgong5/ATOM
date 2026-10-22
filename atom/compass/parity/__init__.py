@@ -175,13 +175,17 @@ class StepRecord:
                 digest, end = self.prompts.pop(
                     req_id, (hashlib.blake2b(digest_size=8), start)
                 )
-                if start != end:
+                # A forward the scheduler backed off below where the prefill
+                # resumed recomputes the rows between: digested once already.
+                replay = batch.replaying.get(i)
+                skip = end - start if replay is not None and replay.until == end else 0
+                if start + skip != end:
                     raise ValueError(
                         f"request {req_id}'s prefill window starts at token "
                         f"{start}, not at {end} where its last one ended, so its "
                         "prompt cannot be digested whole."
                     )
-                window = batch.scheduled_tokens[ends[i] - num : ends[i]]
+                window = batch.scheduled_tokens[ends[i] - num + skip : ends[i]]
                 digest.update(np.asarray(window, dtype=np.int32).tobytes())
                 if not batch.is_final_chunk[i]:
                     self.prompts[req_id] = (digest, start + num)

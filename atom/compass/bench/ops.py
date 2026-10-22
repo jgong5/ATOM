@@ -50,7 +50,9 @@ alike (`exchange`), which the plan ladders, densifies and covers.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, a KV
 argument's as many entries of its first dimension as the batch's state slots,
-or its blocks when the model keeps no per-request state, the tensors
+or its blocks when the model keeps no per-request state, or, of a decode
+attention leaf that states its layer's window and compress ratio, the plane
+rows the batch's blocks hold at that ratio, the tensors
 of each module it names and, for a leaf that names a context key, the KV and
 per-request state its layer holds for the batch. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
@@ -63,8 +65,9 @@ Copy c < N takes fresh activations below M and copy c mod M's from there,
 weight c mod the more of M and the leaf's occurrences, and
 instance c mod I at placement (c div I) mod P, its metadata and module
 tensors cloned past the first round: a placement is the point's batch on KV
-blocks and state slots of its own, as many as the pool and the slots hold,
-for which ATOM prepares the forward context
+blocks and state slots of its own, as many as the pool and a KV registry
+entry of per-request state hold, past what the state slots hold on the first
+placements' slots again, for which ATOM prepares the forward context
 again, it and the metadata views cloned once each, and only where they differ
 from the last placement's. A KV argument
 places a leaf's copies as a context key does. A second graph runs
@@ -621,7 +624,6 @@ class Stub:
         }
         room = [pool // blocks]
         room += [t.k_cache.shape[0] // len(rows) for t in kv.values() if _stateful(t)]
-        room += [self.slots // len(rows)] if self.slots else []
         plans = {
             s: self._plan(op, i, kv, blocks, len(rows)) for s, (op, i) in found.items()
         }
@@ -629,8 +631,11 @@ class Stub:
         self.leaves, self.placed, self.context, self.clones = found, [], context, {}
         self.cold_copies = {s: self._cold(size) for s, (_, size, _) in plans.items()}
         for p in range(max(min(need, *room), 1)):
+            slot = p * len(rows)
+            if self.slots >= len(rows):  # past the state slots, take them again
+                slot %= self.slots - self.slots % len(rows)
             try:
-                batch = rule.batch(view, p * blocks, p * len(rows))
+                batch = rule.batch(view, p * blocks, slot)
             except ValueError as error:  # the rule refuses, before any preparation
                 refused = [
                     {"shape": str(shape), "context": context, "op": op["op"]}
@@ -670,9 +675,17 @@ class Stub:
         for _, s in _specs(op["args"]):
             nbytes = _span(s["shape"], s["stride"]) * _dtype(s["dtype"]).itemsize
             if s["role"] == "kv":
-                # ponytail: its first dim taken as blocks or state slots; one
-                # of plane rows, as DeepSeek-V4's, reads under its bytes
+                # ponytail: its first dim taken as blocks or state slots, or as
+                # plane rows when the leaf states its layer's attention geometry
                 unit = rows if self.slots else blocks
+                stated = op.get("stated", {})
+                if "window_size" in stated and (ratio := stated["compress_ratio"]):
+                    # the rows the batch's blocks hold at its layer: a row
+                    # per `ratio` tokens; its window rows are left out
+                    unit = blocks * self.runner.config.kv_cache_block_size // ratio
+                    # of which a request reads at most its indexer's top-k
+                    if top := stated.get("index_topk"):
+                        unit = min(unit, rows * top)
                 nbytes, need = nbytes // max(s["shape"][0], 1) * unit, None
             size += nbytes
         for key in instances[0].values():

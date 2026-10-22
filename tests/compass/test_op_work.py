@@ -8,14 +8,16 @@ dtype with no operand format, is refused by name; and every leaf of the
 27B's captures at TP1 and TP2 has work that `price` prices.
 """
 
+import math
+
 import pytest
-from test_capture_ir import WIDTH_2, capture
+from test_capture_ir import WIDTH_2, _ops, capture
 from test_work import SPEC
 
 from atom.compass.backends.op_work import work
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import BatchView, RequestShape
-from atom.compass.backends.work import Collective, Work, price
+from atom.compass.backends.work import Collective, Work, attention, price
 from atom.compass.bench.ops import leaves
 
 BF16, I32, F32, F16 = "torch.bfloat16", "torch.int32", "torch.float32", "torch.float16"
@@ -93,6 +95,47 @@ def test_attention_counts_the_view_s_rows_over_the_leaf_s_head_widths(
     assert work(op, view, 1, kv) == Work(
         {"bf16": 4 * 6144 * pairs}, tokens * 2 * 6144 * 2 + keys * 2 * 1024 * width
     )
+
+
+#: Two rows, each verifying two drafts and their bonus token.
+VERIFY_2 = rows((3, 90), (3, 9))
+ATTENTION = "aiter.unified_attention_with_output_base.default"
+
+
+def _at(op, per_row):
+    """The attention leaf `op`'s work over `VERIFY_2` at `per_row` queries a row."""
+    q, k = (math.prod(op["args"][s]["shape"][1:]) for s in "qk")
+    return attention([per_row] * 2, [90, 9], q, 1, k)
+
+
+@pytest.mark.parametrize("tokens, per_row", [(6, 3), (2, 1)], ids=["first", "later"])
+def test_a_drafter_s_later_pass_attends_one_query_token_a_row(tokens, per_row):
+    # A drafter's first pass runs every verified token; each later pass, whose
+    # Q holds fewer tokens than the rows query, one token a row.
+    op = leaf(
+        ATTENTION,
+        [[tokens, 6144]],
+        q=t([tokens, 6144]),
+        k=t([tokens, 1024]),
+        v=t([tokens, 1024]),
+        layer_name={"context": "mtp.layers.0.self_attn"},
+    )
+
+    assert work(op, VERIFY_2, 1, "bf16") == _at(op, per_row)
+
+
+def test_a_captured_drafter_attends_each_pass_after_its_first_at_one_token(
+    tmp_path_factory,
+):
+    # MTP2 at width 2, traced through ATOM's EagleProposer.propose.
+    from test_op_graph_drafter import capture as drafted  # it imports this module
+
+    _, graphs = drafted(2, tmp_path_factory)
+    [drafter] = [graph for key, graph in graphs.items() if key.endswith(" draft")]
+    first, later = [op for op in _ops(drafter["region"]) if op["op"] == ATTENTION]
+
+    assert work(first, VERIFY_2, 1, "bf16") == _at(first, 3)
+    assert work(later, VERIFY_2, 1, "bf16") == _at(later, 1)
 
 
 def test_linear_attention_counts_the_recurrence_and_each_row_s_state():
