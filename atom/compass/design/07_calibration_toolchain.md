@@ -339,6 +339,19 @@ graph: its 10 ms of calls pass the last-level cache many times over, so warm ove
 reads about 1. The card's PTL state is read and keyed as
 [#1434](https://github.com/jgong5/ATOM/issues/1434) rules.
 
+**Each release cleared before the next capture
+([ruling on #1932](https://github.com/jgong5/ATOM/issues/1932)).** The driver clears VRAM
+a process returns in the background, about 31 GiB/s on MI308X, and `torch.cuda.graph`
+returns the caching allocator's free memory before each capture: the previous leaf's
+weights, up to 21 GiB for Qwen3.8-27B. A memory-bound leaf timed during that clear read up
+to 1.20 of the same leaf timed after it ([#1947](https://github.com/jgong5/ATOM/issues/1947)).
+So before each capture, and after the runner frees the hold that sized its KV pool, the
+bench returns that memory itself and waits until the card's VRAM in use
+(`mem_info_vram_used` in the card's PCI sysfs directory) falls by what it returned, at
+most 3 s (`ops.py::_release`). Each point records the seconds waited since the point before
+it and how many waits ended at the cap, which leaves a clear possibly still running while
+it was timed.
+
 **Points, planned from the steps of record directories (D37).** Per leaf: every decode rung; prefill rows on
 a ladder of chunk remainders, a kind that depends on context also over the same ladder of
 the rows' cached tokens, once its points at the most cached tokens still differ from its

@@ -957,6 +957,52 @@ def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
     assert slept == [(i + 1) * ops.REST / 1e3 for i in replays]
 
 
+def test_a_capture_waits_for_the_driver_to_clear_a_release_and_a_capped_wait_is_recorded(
+    monkeypatch,
+):
+    # Each capture returns 8 GiB the allocator held. The cold graph's clear
+    # lands at the card's third reading after its release, and its wait ends
+    # there; the warm graph's never lands, and its wait ends at the cap.
+    gib = 1 << 30
+    readings = [20 * gib, 20 * gib, 20 * gib, 12 * gib, 20 * gib]
+    read, captured = [], []
+    monkeypatch.setattr(ops, "CLEAR_S", 0.05)
+    monkeypatch.setattr(ops, "_waited", ops.Counter())
+    monkeypatch.setattr(
+        ops, "_vram_used", lambda: read.append(1) or readings[min(len(read), 5) - 1]
+    )
+    monkeypatch.setattr(torch.cuda, "memory_reserved", iter([8 * gib, 0] * 2).__next__)
+
+    @contextlib.contextmanager
+    def graph(g, capture_error_mode=None):
+        captured.append(len(read))
+        yield
+
+    def event(enable_timing):
+        return SimpleNamespace(
+            record=lambda: None, synchronize=lambda: None, elapsed_time=lambda e: 1.0
+        )
+
+    monkeypatch.setattr(torch.cuda, "graph", graph)
+    monkeypatch.setattr(
+        torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=lambda: None)
+    )
+    monkeypatch.setattr(torch.cuda, "Event", event)
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+    ):
+        record = stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], 8)
+
+    assert captured[0] == 4  # the cold graph captured once the 12 GiB reading came
+    assert len(read) > 6  # the warm graph's wait read until the cap
+    assert record["release_capped"] == 1
+    assert ops.CLEAR_S <= record["release_wait_s"] < ops.CLEAR_S + 1
+    assert not ops._waited  # taken by the point
+
+
 def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(
     monkeypatch,
 ):
