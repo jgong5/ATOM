@@ -28,7 +28,8 @@ experts' ids ATOM fuses into them (`_route`); a weight is random at its
 shape, dtype and stride, one tensor per occurrence of the leaf in the step;
 a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
-the token ids ATOM prepared (`TOKEN_IDS`); an integer the capture
+the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
+HCA decode workspace its slot names; an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names, its module's meta parameters
 moved to the device and filled as `--load_dummy xavier` fills them (`_fill`),
@@ -481,12 +482,19 @@ class Stub:
             for k, v in live.items()
             if torch.is_tensor(v) and v.device.type == device
         }
+        # DeepSeek-V4's persistent HCA decode workspace, one per device: a slot
+        # named as one of its fields is a view of that field and nothing else
+        hca = sys.modules.get("atom.model_ops.v4_kernels.hca_persist")
+        work = getattr(hca, "_workspaces", {}).get(self.runner.device.index)
+        work = work._asdict() if work is not None else {}
         meta = dict(self.kv)
         for sig, (op, _) in self.leaves.items():
             for path, spec in _specs(op["args"]):
                 if spec["role"] == "metadata":
                     token = (op["op"], path) in TOKEN_IDS
                     pool = {"input_ids": input_ids} if token else live
+                    if (field := path.split(".")[0]) in work:
+                        pool = {field: work[field]}
                     try:
                         name, view = _meta(spec, path, pool)
                         # leaves share a view's clone: DeepSeek-V4's decode

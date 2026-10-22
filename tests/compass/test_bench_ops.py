@@ -6,6 +6,7 @@ stub runs beside a stand-in runner whose input preparation sets ATOM's forward
 context, as ATOM's runner does, and whose forward raises.
 """
 
+import collections
 import contextlib
 import dataclasses
 import functools
@@ -557,6 +558,58 @@ def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placeme
         assert kwargs["st"].data_ptr() == state.data_ptr()
         assert set(snap.attn_metadata.block_tables.flatten().tolist()) == {4 * (c % 3)}
     assert "ATOM's live KV has no room for kv [500, 4]" in got["y"]["refused"]
+
+
+def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
+    monkeypatch,
+):
+    from atom.model_ops.v4_kernels import hca_persist
+
+    # aiter's workspace is a NamedTuple; a live buffer of o_acc's own spec and
+    # one with room for cnt would take them by `_meta`'s rules
+    workspace = collections.namedtuple("Workspace", "o_acc cnt")(
+        torch.randn(4, 2, 3), torch.arange(7, 12, dtype=torch.int32)
+    )
+    monkeypatch.setitem(hca_persist._workspaces, 0, workspace)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    runner = _Runner()
+    runner.device = torch.device("cpu", 0)
+    runner.forward_vars["partials"] = torch.zeros(4, 2, 3)
+    cnt = ("cnt", _t([5], "metadata", dtype="torch.int32"))
+    found = ops.leaves(
+        _graph(
+            _leaf(
+                "aiter.mla_decode_v4_ps_asm.default",
+                ("o_acc", _t([4, 2, 3], "metadata")),
+                cnt,
+            ),
+            # a slot of another name keeps the live pick, though cnt is tighter
+            _leaf("aten.add_.Tensor", ("self", cnt[1])),
+            layers=1,
+        )["region"]
+    )
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    graphs = []
+
+    def replay(fn, calls):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        got = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+
+    asm, add = got
+    assert asm["metadata"] == {"o_acc": "o_acc", "cnt": "cnt"}
+    assert add["metadata"] == {"self": "block_tables"}
+    for kwargs, _ in graphs[0]:
+        assert torch.equal(kwargs["o_acc"], workspace.o_acc)
+        assert torch.equal(kwargs["cnt"], workspace.cnt)
 
 
 def test_a_call_cycles_a_weight_per_occurrence_on_the_cold_copies_inputs():
