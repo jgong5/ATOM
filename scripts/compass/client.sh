@@ -93,7 +93,10 @@ awk -v d="$OUT/client/traces" -v first="$first" -v last="$last" '
 n=$(find "$OUT/client/traces" -type f | wc -l)
 ((n == last - first + 1)) || fail "traces: $TRACES holds $n of traces $first to $last"
 
-(cd "$OUT/client" && AIPERF_DATASET_MMAP_BASE_PATH=$OUT/client exec "$HARNESS_PYTHON" "${aiperf[@]}" \
+# Each request carries X-Session-ID, as the nightly's agentic cell sends it: a
+# dp_sticky router keys off it, and a server alone ignores it.
+(cd "$OUT/client" && AIPERF_DATASET_MMAP_BASE_PATH=$OUT/client AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true \
+    exec "$HARNESS_PYTHON" "${aiperf[@]}" \
     profile --url "${url#http://}" --model "$MODEL" --tokenizer "$MODEL" \
     --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" --export-level raw \
     --endpoint-type chat --custom-dataset-type weka_trace \
