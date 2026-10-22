@@ -14,7 +14,8 @@ shape, dtype, stride and role. A tensor's role is where its storage came from:
 the model's parameters, buffers and tensor attributes are weights, what
 `allocate_kv_cache` allocated is KV, what the model's forward and the sampler
 after it allocated is an activation, and anything else (the runner's buffers,
-what its input preparation allocated) is metadata.
+what its input preparation allocated) is metadata. A functional collective's
+group is the aiter coordinator it belongs to (`_coordinator`).
 
 A raw Triton or FlyDSL launch lifts to the function that issues it
 (`_Recorder`): one leaf, that function by its module and name, its parameters at
@@ -255,10 +256,17 @@ def _rebuilt(value, live):
         return live(value)
     if not isinstance(value, Reduced):
         return value
-    cls = _function(value.cls)
+    return rebuild_object(value.cls, _rebuilt(value.state, live))
+
+
+def rebuild_object(cls: str, state):
+    """The object pickle reduced to class `cls`, `module:qualname`, and `state`:
+    an enum member from its value, a dict from its (key, value) pairs, any other
+    object from its (attribute, value) pairs."""
+    cls = _function(cls)
     if issubclass(cls, enum.Enum):
-        return cls(value.state)
-    state = {_rebuilt(k, live): _rebuilt(v, live) for k, v in value.state}
+        return cls(state)
+    state = dict(state)
     if cls is dict:
         return state
     obj = cls.__new__(cls)
@@ -267,6 +275,14 @@ def _rebuilt(value, live):
     else:
         obj.__dict__.update(state)
     return obj
+
+
+def referenced(runner, key: str):
+    """What a `ModuleRef` key names on `runner`: an attribute of the runner
+    itself, `runner.<attr>`, or a module of its model by path."""
+    if key.startswith("runner."):
+        return getattr(runner, key.removeprefix("runner."))
+    return runner.model.get_submodule(key)
 
 
 def _addressable(frame) -> bool:
@@ -382,7 +398,10 @@ class _Recorder(TorchDispatchMode):
             if driverless.standing_in[0] and not name.startswith("_c10d_functional."):
                 why = "stand-in"
             slots = {a.name: v for a, v in zip(func._schema.arguments, args)}
-            self.add(name, kind, {**slots, **kwargs}, outs, why)
+            slots |= kwargs
+            if name.startswith("_c10d_functional.") and "group_name" in slots:
+                slots["group_name"] = _coordinator(slots["group_name"])
+            self.add(name, kind, slots, outs, why)
         return out
 
     def add(self, name, kind, slots, outs, why):
@@ -508,9 +527,7 @@ class _Recorder(TorchDispatchMode):
             value = value.bind(**{LAYER: self.layer})
         if not isinstance(value, ir.ModuleRef):
             return value.key
-        if value.key.startswith("runner."):
-            return getattr(self.runner, value.key.removeprefix("runner."))
-        return self.runner.model.get_submodule(value.key)
+        return referenced(self.runner, value.key)
 
     def wait(self, waiter, waited):
         """A side stream waiting on the main one forks; the reverse joins."""
@@ -594,6 +611,16 @@ class _Recorder(TorchDispatchMode):
         if self.layer is None:
             return path
         return re.sub(rf"\blayers\.{self.layer}\b", f"layers.{{{LAYER}}}", path)
+
+
+def _coordinator(group_name: str) -> str:
+    """The aiter coordinator (`tp:0`) whose device group torch names
+    `group_name`, or the name as it is when none is: torch numbers groups in
+    the order a process creates them, which the bench's ranks need not share."""
+    from aiter.dist.parallel_state import _groups
+
+    held = {g.device_group.group_name: k for k, r in _groups.items() if (g := r())}
+    return held.get(group_name, group_name)
 
 
 def _class(value) -> str:

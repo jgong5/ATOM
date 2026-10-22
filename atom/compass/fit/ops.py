@@ -25,7 +25,12 @@ a prefill's B and the context: a decode point's ``context``, its longest
 row's, or a prefill point's rows' mean cached tokens (`band`); and a
 prefill's B for a kind its rows move (``("rows", op)``). A collective's
 points name their family themselves, `measure ops`'s `exchange`, and its one
-dimension is their message bytes. Points at one
+dimension is their message bytes; one apart along it is one row's bytes
+(``row_bytes``, a decode's B or a prefill's T being its rows), when every point
+moves that many bytes per row. Where ranks' row counts can differ (``all_gatherv``,
+``reduce_scatterv``, MORI's dispatch and combine) it is one byte;
+``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad every
+rank to the same rows and keep one row. Points at one
 coordinate, its other counts or contexts dropped, are one point at their mean
 time. `interpolate` prices a query at a measured point as
 that point; between points, multilinearly over the neighbours that bracket it
@@ -182,8 +187,14 @@ def _context(p) -> int:
 def fit(points) -> dict:
     """The price list's params: per skeleton, the integer positions that follow
     the shape, and per family, its dimensions and its points, each its
-    coordinates, its cold time in ns and its kernels."""
-    from atom.compass.bench.ops import _dependent
+    coordinates, its cold time in ns and its kernels, and a collective's
+    ``row_bytes``, None when its points move other bytes per row or when
+    ranks' row counts can differ (``all_gatherv``, ``reduce_scatterv``, MORI's
+    dispatch and combine), so a step may hold between two points' rows;
+    ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad
+    every rank to the same rows and keep it."""
+    from atom.compass.bench.ops import DP_GROUP, _dependent
+    from atom.compass.capture.peers import MORI
 
     dependent = _dependent(points)
     groups: dict[str, list] = {}
@@ -192,9 +203,15 @@ def fit(points) -> dict:
         if "exchange" in p:  # a collective: one family over its message bytes
             fam, nbytes = p["exchange"]
             f = families.setdefault(
-                fam, {"op": p["op"], "dims": ["bytes"], "points": {}}
+                fam,
+                {"op": p["op"], "dims": ["bytes"], "points": {}, "row_bytes": set()},
             )
             f["points"].setdefault((nbytes,), []).append((p["cold_ns"], p["kernels"]))
+            counts = shape_counts(p["shape"])
+            gathered = p["op"].startswith(DP_GROUP + (MORI,))
+            f["row_bytes"].add(
+                None if gathered else nbytes / counts.get("T", counts["B"])
+            )
         else:
             groups.setdefault(skeleton(p["shape"], p["leaf"]), []).append(p)
     for skel, members in groups.items():
@@ -248,6 +265,9 @@ def fit(points) -> dict:
                 )
             merged.append([list(c), statistics.mean(ns for ns, _ in got), got[0][1]])
         f["points"] = merged
+        if "row_bytes" in f:
+            one = f["row_bytes"]
+            f["row_bytes"] = one.pop() if len(one) == 1 else None
     return {"free": free_of, "families": families}
 
 
@@ -285,9 +305,9 @@ def interpolate(points: dict, at: tuple, dims):
 
 def held_out(params) -> list[dict]:
     """Each point priced along each dimension by the other points of its line,
-    where it has a neighbour on both sides and they are not both one away; a
-    hidden band is a point whose kernels are not the ones its neighbours
-    launched. Each family gets its
+    where it has a neighbour on both sides and they are not both one away (a
+    collective's `row_bytes` away); a hidden band is a point whose kernels are
+    not the ones its neighbours launched. Each family gets its
     `declined` lines, [dimension, the other coordinates, reason]: those
     holding a hidden band or an error over `LIMIT`."""
     rows = []
@@ -305,7 +325,8 @@ def held_out(params) -> list[dict]:
                 xs = [x for (x,) in line]
                 if not (xs and min(xs) < c[i] < max(xs)):
                     continue
-                if c[i] - 1 in xs and c[i] + 1 in xs:
+                one = f.get("row_bytes") or 1
+                if c[i] - one in xs and c[i] + one in xs:
                     continue
                 row = {"op": f["op"], "phase": json.loads(name)[0], "dim": dim}
                 row |= {"at": list(c), "measured_ns": ns}

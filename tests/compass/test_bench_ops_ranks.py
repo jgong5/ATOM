@@ -10,6 +10,7 @@ import contextlib
 import datetime
 import json
 import os
+import subprocess
 import sys
 import time
 from concurrent.futures.process import BrokenProcessPool
@@ -302,6 +303,99 @@ def test_a_lifted_collective_runs_on_the_group_atom_calls_it_on_or_refuses(
     assert (gatherv.func, gatherv.keywords) == (moe.all_gatherv, {"group": "dp"})
     with pytest.raises(ValueError, match="tp_gather takes a group"):
         ops._function("atom.model_ops.moe:tp_gather")
+
+
+C10D = "_c10d_functional.all_gather_into_tensor.default"
+
+
+def test_a_capture_names_a_functional_collective_s_group_by_its_coordinator(
+    request, tmp_path
+):
+    if "COMPASS_ARCH_DECLARED" not in os.environ:
+        # The declared device and group are process-global: a process of its own.
+        env = {**os.environ, "COMPASS_ARCH_DECLARED": "1"}
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+            + [f"{__file__}::{request.node.name}"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+        assert done.returncode == 0, done.stdout[-4000:]
+        return
+    from torch.distributed import _functional_collectives as functional
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    from atom.compass.capture import driverless, forward
+
+    driverless.install(str(tmp_path), "gfx942")
+    driverless.group(4, 2)
+    from aiter.dist import parallel_state
+
+    tp, dp = parallel_state.get_tp_group(), parallel_state.get_dp_group()
+    recorder = forward._Recorder({}, driverless.driverless_mode(ShapeEnv()))
+    with recorder.fake_mode, recorder:
+        x = torch.empty(4, 8, device="cuda")
+        recorder.on = True
+        for group in (tp.device_group, dp.device_group, dist.group.WORLD):
+            functional.all_gather_tensor(x, 0, group)
+
+    named = [dict(op.args).get("group_name") for _, op in recorder.items]
+    # the default group belongs to no coordinator: its name stays torch's
+    assert [n for n in named if n] == ["tp:0", "dp:0", dist.group.WORLD.group_name]
+
+
+def _layout_rank(config, todo, rank):
+    """`_measuring_rank`, measuring `C10D` on aiter's coordinators `tp:0`, each
+    rank's group of itself, and `dp:0`, of both ranks, their groups created in
+    another order than a capture's (DP first); on `ep:0`, which no rank holds;
+    and on the name torch gives the DP group here."""
+    measure = ops.measure
+
+    def on_groups(config, todo, llc, rank):
+        dp = dist.new_group([0, 1])
+        tp = [dist.new_group([r]) for r in (0, 1)][dist.get_rank()]
+        sys.modules["aiter.dist.parallel_state"]._groups = {
+            key: (lambda g=g: SimpleNamespace(device_group=g))
+            for key, g in (("tp:0", tp), ("dp:0", dp))
+        }
+        x = ("input", _t([2, 8], "activation"))
+        gathers = [
+            _leaf(C10D, x, ("group_size", size), ("group_name", name))
+            for name, size in (
+                ("tp:0", 1),
+                ("dp:0", 2),
+                ("ep:0", 2),
+                (dp.group_name, 2),
+            )
+        ]
+        found = ops.leaves(_graph(*gathers, layers=1)["region"])
+        return measure(config, [(decode(2), 20, found)], llc, rank)
+
+    ops.measure = on_groups
+    return _measuring_rank(config, todo, None, rank)
+
+
+def test_a_c10d_leaf_runs_on_its_coordinator_s_group_whatever_torch_named_it():
+    config = _config(2, dp_attention=True)
+    ranks.layout(config)
+
+    by_rank = ranks.launch(_layout_rank, config, [[], []])
+
+    merged = {
+        json.loads(r["leaf"])["args"]["group_name"]: r for r in ranks.merge(by_rank)
+    }
+    tp, dp, ep = (merged.pop(name) for name in ("tp:0", "dp:0", "ep:0"))
+    [(torch_name, raw)] = merged.items()
+    # a TP leaf of group size 1 on the DP group of two ranks would fail in torch
+    assert [len(r["rank_cold_ns"]) for r in (tp, dp)] == [2, 2]
+    assert "refused" not in tp and "refused" not in dp
+    for record, name in ((ep, "ep:0"), (raw, torch_name)):
+        assert record["refused"].startswith(
+            f"ValueError: {C10D} on coordinator '{name}', which rank 0 does not hold"
+        )
 
 
 def _gather(rows):

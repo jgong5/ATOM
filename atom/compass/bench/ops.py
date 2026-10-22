@@ -31,9 +31,11 @@ view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM prepared (`TOKEN_IDS`); an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names, its module's meta parameters
-moved to the device and filled as `--load_dummy xavier` fills them (`_fill`).
-A leaf whose operator cannot run so refuses by name, a KV tensor argument
-among them.
+moved to the device and filled as `--load_dummy xavier` fills them (`_fill`),
+and a runner attribute this runner's own; an object is rebuilt from its class
+and state as the capture's replay rebuilds one, its tensors built as any other
+argument's, its activations fresh on every copy. A leaf whose operator cannot
+run so refuses by name, a KV tensor argument among them.
 A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
 
@@ -172,7 +174,7 @@ def main(argv: list[str]) -> None:
     from atom.compass.bench import ranks
     from atom.compass.bench.measure import atom_config
     from atom.compass.capture.forward import decode, prefill
-    from atom.compass.drive.gpu import hip_visible, quiet
+    from atom.compass.drive.gpu import hip_visible, kfd_pid, quiet
     from atom.compass.drive.identity import identity
     from atom.compass.run.step_grid import keyed
     from atom.model_engine.arg_utils import EngineArgs
@@ -197,6 +199,7 @@ def main(argv: list[str]) -> None:
             f"{world} ranks; the op bench runs one on each"
         )
     os.environ["HIP_VISIBLE_DEVICES"] = hip_visible(args.gpu)
+    kfd_pid()  # before atom_config opens a GPU, so quiet leaves this process out
     config = atom_config(argv[cut + 1 :])
     ranks.layout(config)
     if config.compilation_config.level:
@@ -325,7 +328,7 @@ def leaves(region: dict, env=None, found=None) -> dict[str, tuple[dict, list]]:
     env, found = env or {}, {} if found is None else found
     if "op" in region:
         bound = {}
-        for slot, value in region["args"].items():
+        for slot, value in _values(region["args"]):
             if _ref(value):
                 ref = ir.ContextRef(next(iter(value.values())))
                 bound[slot] = ref.bind(**{n: env[n] for n in ref.index_names}).key
@@ -531,14 +534,15 @@ class Stub:
             for _, s in _specs(op["args"])
         )
         for key in instances[0].values():
-            if key in self.contexts:
-                held = kv.get(f"layer_{self.contexts[key].layer_num}")
+            module = self.contexts.get(key)
+            if hasattr(module, "layer_num"):  # a layer of ATOM's KV registry
+                held = kv.get(f"layer_{module.layer_num}")
                 unit = rows if _stateful(held) else blocks
                 # ponytail: a tensor's first dim is its blocks or its state slots
                 size += sum(t.nbytes // t.shape[0] * unit for t in _fields(held))
                 need = None
-            elif key in self.modules:
-                size += sum(t.nbytes for t in _own(self.modules[key]))
+            elif (module := self.modules.get(key, module)) is not None:
+                size += sum(t.nbytes for t in _own(module))
         n = self._cold(size)
         if need is None:  # cycle over every instance's state, which is held anyway
             n = min(CALLS, max(n, len(instances)))
@@ -610,6 +614,8 @@ class Stub:
     def _copy(self, op, sig, instances, c, like=None):
         """Copy `c` of `op`'s call: its keyword arguments and forward context,
         on the activations of copy `like` when given."""
+        from atom.compass.capture.forward import rebuild_object, referenced
+
         instance = instances[c % len(instances)]
         p = c // len(instances) % len(self.placed)
         snap, meta = self.placed[p]
@@ -624,11 +630,21 @@ class Stub:
                 return self._route(value, c)
             if isinstance(value, dict) and value.get("role") == "weight":
                 return self._weight(value, c, op["occurrences"])
-            if isinstance(value, dict) and value.get("role") == "activation" and like:
+            if isinstance(value, dict) and "object" in value:
+                return rebuild_object(
+                    value["object"], build(path, value["state"], None)
+                )
+            if (
+                isinstance(value, dict)
+                and value.get("role") == "activation"
+                and old is not None
+            ):
                 return old
             if _ref(value):
                 key, module = instance[path], "module" in value
-                held = self.modules[key] if module else self.contexts.get(key)
+                held = (
+                    referenced(self.runner, key) if module else self.contexts.get(key)
+                )
                 if isinstance(held, torch.nn.Module):
                     _fill(held, self.runner.device)
                 return (_module_copy(held) if fresh else held) if module else key
@@ -752,14 +768,22 @@ def point_rows(shape, context, pool: int, block_size: int) -> list[list]:
     return rows
 
 
-def _specs(args, path=""):
-    """Each tensor argument in `args`, by its slot path, `slot` or `slot.i`."""
+def _specs(args):
+    """Each tensor argument in `args`, by its slot path."""
+    return [(p, v) for p, v in _values(args) if isinstance(v, dict) and "role" in v]
+
+
+def _values(args, path=""):
+    """Each argument value in `args` by its slot path, `slot`, `slot.i` in a
+    list, `slot.i.1` for an object's i-th attribute or item."""
     items = args.items() if isinstance(args, dict) else enumerate(args)
     for slot, value in items:
         where = f"{path}.{slot}" if path else str(slot)
+        if isinstance(value, dict) and "object" in value:
+            value = value["state"]
         if isinstance(value, list):
-            yield from _specs(value, where)
-        elif isinstance(value, dict) and "role" in value:
+            yield from _values(value, where)
+        else:
             yield where, value
 
 
@@ -790,8 +814,9 @@ def _meta(spec, slot, live) -> tuple[str, torch.Tensor]:
 
 def _function(name: str):
     """The callable a leaf names: `ns.op.overload`, or a lifted `module:qualname`;
-    a functional collective waited on, as the in-place one ATOM calls is; a
-    lifted collective that takes a group on the one ATOM calls it on
+    a functional collective waited on, as the in-place one ATOM calls is, on
+    this rank's group of the coordinator it was captured on (`_on_coordinator`);
+    a lifted collective that takes a group on the one ATOM calls it on
     (`DP_GROUP`), refused when ATOM's group is not known."""
     if ":" in name:
         module, qualname = name.split(":")
@@ -809,9 +834,28 @@ def _function(name: str):
         if ":" in name and "group" in inspect.signature(fn).parameters:
             raise ValueError(f"{name} takes a group no leaf name maps to")
         if name.startswith("_c10d_functional."):
-            wait = torch.ops._c10d_functional.wait_tensor
+            wait, fn = torch.ops._c10d_functional.wait_tensor, _on_coordinator(name, fn)
             return lambda **kwargs: wait(fn(**kwargs))
     return fn
+
+
+def _on_coordinator(name: str, fn):
+    """`fn` on this rank's device group of the aiter coordinator a call's
+    `group_name` holds (`tp:0`), whatever torch named that group here; refused
+    naming the coordinator when this rank has none by that name."""
+
+    def call(**kwargs):
+        from aiter.dist.parallel_state import _groups
+
+        ref = _groups.get(coordinator := kwargs["group_name"])
+        if (group := ref and ref()) is None:
+            raise ValueError(
+                f"{name} on coordinator {coordinator!r}, which rank "
+                f"{torch.distributed.get_rank()} does not hold: {sorted(_groups)}"
+            )
+        return fn(**kwargs | {"group_name": group.device_group.group_name})
+
+    return call
 
 
 def _kernels(fn, kwargs) -> tuple[list[str], float]:

@@ -80,7 +80,7 @@ from atom.compass.backends.step_grid_plan import plan
 from atom.compass.backends.step_labels import digest as file_digest
 from atom.compass.backends.step_linear_fit import token_band
 from atom.compass.bench import ragged
-from atom.compass.drive.gpu import add_gpu_flag, hip_visible, quiet
+from atom.compass.drive.gpu import add_gpu_flag, hip_visible, kfd_pid, quiet
 from atom.compass.drive.identity import identity, phase
 from atom.compass.fit.publish import conditions
 from atom.compass.fit.samples import MEMBER, run_fields
@@ -100,6 +100,7 @@ def main(argv: list[str]) -> None:
     _check(args)
     sampling = _sampling(args.sampling)
     os.environ["HIP_VISIBLE_DEVICES"] = hip_visible(args.gpu)
+    kfd_pid()  # before atom_config opens a GPU, so quiet leaves this process out
     config = atom_config(argv[cut + 1 :])
     if config.tensor_parallel_size > 1:
         raise ValueError(

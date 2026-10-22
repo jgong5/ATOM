@@ -143,6 +143,19 @@ def test_the_bench_runs_on_the_hip_device_of_its_rocm_smi_gpu(run):
     assert os.environ["HIP_VISIBLE_DEVICES"] == "3"
 
 
+def test_the_command_learns_its_kfd_pid_before_atom_config_opens_a_gpu(
+    run, monkeypatch
+):
+    order, atom_config = [], measure.atom_config
+    monkeypatch.setattr(measure, "kfd_pid", lambda: order.append("kfd_pid"))
+    monkeypatch.setattr(
+        measure, "atom_config", lambda a: order.append("atom_config") or atom_config(a)
+    )
+    rec = str(run.record)
+    run(rec, "--sample", "all", *run.named(rec))
+    assert order == ["kfd_pid", "atom_config"]
+
+
 def test_measuring_one_record_twice_publishes_each_view_once_and_then_nothing(run):
     rec = str(run.record)
     store = run(rec, "--sample", "all", *run.named(rec))

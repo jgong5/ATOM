@@ -138,6 +138,7 @@ def test_a_run_file_makes_the_client_simulated(tmp_path, simulated):
     server = SIM if simulated else {k: SIM[k] for k in ("url", "pid")}
     out, env = _setup(tmp_path, server)
     stale = {"ATOM_COMPASS_RUN": "/stale", "ATOM_COMPASS_CLOCK_ENDPOINT": "tcp://h:1"}
+    stale["AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID"] = "false"
     done = _client(out, *GOOD, env=env | stale)
     assert done.returncode == 0, done.stdout + done.stderr
 
@@ -146,6 +147,8 @@ def test_a_run_file_makes_the_client_simulated(tmp_path, simulated):
     assert simulated or "uuid.UUID(int=0)" in argv[1]
     assert aiperf_env.get("ATOM_COMPASS_RUN") == server.get("run_file")
     assert "ATOM_COMPASS_CLOCK_ENDPOINT" not in aiperf_env
+    # aiperf then sends each request's X-Correlation-ID as its X-Session-ID too.
+    assert aiperf_env["AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID"] == "true"
     assert aiperf_env["AIPERF_DATASET_MMAP_BASE_PATH"] == cwd == str(out / "client")
     line = " ".join(argv)
     assert "--url 127.0.0.1:40165 " in line and " --concurrency 3 " in line

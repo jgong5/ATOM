@@ -13,7 +13,7 @@ holds memory there without having opened the GPU's DRM device.
 
 The listing's PIDs are the kernel's. The calling process, which may itself hold
 a named GPU's memory (importing LMCache opens a HIP context), is left out by
-the kernel PID `/proc/self/sched` prints, which differs from `os.getpid()` in a
+its own KFD entry (`kfd_pid`), whose PID differs from the one it sees in a
 container. The run's own processes are told apart by when the checks run: before
 the run none has started, and after it every one has exited, so any other
 process listed on a named GPU at either check is not this run's.
@@ -23,9 +23,10 @@ GPUs by KFD node, the one `rocm-smi --showhw` lists for each (`_nodes`).
 """
 
 import argparse
+import os
 import re
 import subprocess
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from functools import cache, partial
 from pathlib import Path
 
@@ -39,6 +40,9 @@ _NODE = re.compile(r"^(\d+) +(\d+) ", re.MULTILINE)
 _PID = re.compile(r"PID (\d+) is using")
 KFD = Path("/sys/class/kfd/kfd")
 SCHED = Path("/proc/self/sched")
+DEV_KFD = Path("/dev/kfd")
+#: Each process's KFD entry, by `os.getpid()`, once its own open added one.
+_ADDED: dict[int, str] = {}
 
 
 class GpuRefusal(Exception):
@@ -116,6 +120,27 @@ def quiet(gpus: tuple[int, ...], out: Path):
             raise GpuRefusal(f"{held} after the run, so it fails")
 
 
+def kfd_pid() -> str:
+    """This process's PID as KFD lists it: the KFD entry its first open of
+    `/dev/kfd` added, which takes that open before the process opens a GPU;
+    without one, the PID `/proc/self/sched` prints."""
+    procs = KFD / "proc"
+
+    def listed() -> list[str]:
+        return os.listdir(procs) if procs.is_dir() else []
+
+    if os.getpid() not in _ADDED:
+        seen = listed()
+        with suppress(OSError), DEV_KFD.open("rb"):
+            # ponytail: a neighbour opening KFD in the same instant adds a
+            # second entry; neither is taken, and the checks may name this one.
+            if len(added := [p for p in listed() if p not in seen]) == 1:
+                _ADDED[os.getpid()] = added[0]
+    if _ADDED.get(os.getpid()) in listed():
+        return _ADDED[os.getpid()]
+    return re.search(r"\((\d+), #threads", SCHED.read_text()).group(1)
+
+
 def _check(gpus: tuple[int, ...], out: Path, when: str) -> str:
     """Run preflight.sh and save the process listing; name what is on `gpus`."""
     log = out / f"preflight_{when}.txt"
@@ -136,7 +161,7 @@ def _check(gpus: tuple[int, ...], out: Path, when: str) -> str:
     (out / f"gpu_{when}.txt").write_text(listing)
     on = {pid: drm.split() for pid, drm in _ON.findall(listing)}
     nodes = cache(partial(_nodes, gpus))
-    me = re.search(r"\((\d+), #threads", SCHED.read_text()).group(1)
+    me = kfd_pid()
     return ", ".join(
         f"GPU {gpu} has PID {pid} on it"
         for pid in _PID.findall(listing)
