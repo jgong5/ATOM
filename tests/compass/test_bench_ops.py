@@ -536,6 +536,85 @@ def test_a_v4_metadata_slot_is_a_view_of_the_buffer_atom_passes_or_refuses():
     }
 
 
+def test_v4_index_leaves_write_the_indptrs_atom_passes_and_a_decode_its_split_plan(
+    monkeypatch,
+):
+    # The leaves of a placement share a metadata view's clone, and ATOM's
+    # index builder writes its three indptrs. Bound by size, all three were
+    # `cu_seqlens_q`, which the CSA decode then read as its split plan.
+    indices = "atom.model_ops.v4_kernels.paged_decode_indices"
+    build, write = (
+        f"{indices}:build_v4_paged_decode_indptr",
+        f"{indices}:write_v4_paged_decode_indices",
+    )
+    nm = "aiter.mla:mla_decode_fwd_v4_nm"
+    cu = "atom.model_ops.decode_input_ids:fill_deferred_decode_ids"
+    indptr = _t([3], "metadata", dtype="torch.int32")
+    v4 = {
+        "cu_seqlens_q": torch.arange(3, dtype=torch.int32),
+        **{
+            f"kv_indptr_{k}": torch.zeros(9, dtype=torch.int32)
+            for k in ("swa", "csa", "hca")
+        },
+        # aiter's uniform plan of 5 splits a row, a row of ATOM's table
+        "split_plan_csa": (
+            5,
+            (torch.arange(1, 17)[:, None] * torch.arange(9)).int()[4],
+        ),
+    }
+    runner, read = _Runner(), {}
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):
+        prepared = prepare(batch)
+        vars(fctx.get_forward_context().attn_metadata).update(v4)
+        return prepared
+
+    def written(swa_indptr, csa_indptr, hca_indptr):
+        for t, per_row in ((swa_indptr, 2), (csa_indptr, 6), (hca_indptr, 3)):
+            t.copy_(torch.arange(3) * per_row)
+
+    calls = {
+        build: written,
+        write: lambda csa_indptr: read.update(write=csa_indptr.tolist()),
+        nm: lambda kv_indptr, split_indptr: read.update(
+            nm=kv_indptr.tolist(), split=split_indptr.tolist()
+        ),
+        cu: lambda cu: read.update(cu=cu.tolist()),
+    }
+
+    def time(self, op, sig, instances, n):
+        calls[op["op"]](**self._copy(op, sig, instances, 0)[0])
+        return {"cold_ns": 1.0}
+
+    runner.prepare_model = prepare_model
+    monkeypatch.setattr(ops.Stub, "_time", time)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    found = ops.leaves(
+        _graph(
+            _leaf(build, *((f"{k}_indptr", indptr) for k in ("swa", "csa", "hca"))),
+            _leaf(write, ("csa_indptr", indptr)),
+            dataclasses.replace(
+                _leaf(nm, ("kv_indptr", indptr), ("split_indptr", indptr)),
+                stated=(("compress_ratio", 4),),
+            ),
+            _leaf(cu, ("cu", indptr)),
+            layers=1,
+        )["region"]
+    )
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    got = ops.Stub(runner, 5_000).point(placed, decode(2), 20, found)
+
+    assert [r for r in got if "refused" in r] == []
+    assert read == {
+        "write": [0, 6, 12],
+        "nm": [0, 6, 12],
+        "split": [0, 5, 10],
+        "cu": [0, 1, 2],
+    }
+
+
 def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
     layers = {f"model.layers.{i}.attn": SimpleNamespace(layer_num=i) for i in (0, 1)}
     kv = {f"layer_{i}": SimpleNamespace(k_cache=torch.zeros(64, 16, 4)) for i in (0, 1)}
@@ -673,17 +752,20 @@ def test_a_compressor_state_is_a_layer_of_its_own_field_and_every_slot_stays_in_
 
 @pytest.mark.parametrize("faulted", [False, True])
 def test_a_rank_whose_device_faulted_dies_and_one_that_refused_measures_on(
-    monkeypatch, faulted
+    monkeypatch, tmp_path, faulted
 ):
     # A HIP fault is sticky: a rank that refused the leaf and went on would
-    # hold its peers in their next collective until that timed out.
+    # hold its peers in their next collective until that timed out. One that
+    # journaled the leaf first would have the next leaf refused in its place.
     def synchronize(device):
         if faulted:
             raise RuntimeError("HIP error: an illegal memory access was encountered")
 
-    exits = []
+    exits, journal = [], tmp_path / "points.jsonl"
     monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
-    monkeypatch.setattr(ops.os, "_exit", exits.append)
+    monkeypatch.setattr(
+        ops.os, "_exit", lambda code: exits.append((code, journal.exists()))
+    )
     monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
     monkeypatch.setattr(ops.Stub, "_time", lambda *_: 1 / 0)
     runner = _Runner()
@@ -693,10 +775,11 @@ def test_a_rank_whose_device_faulted_dies_and_one_that_refused_measures_on(
         _graph(_leaf("x", ("q", _t([2, 4], "activation"))), layers=1)["region"]
     )
 
-    [record] = ops.Stub(runner, 5_000).point(placed, decode(2), 20, found)
+    [record] = ops.Stub(runner, 5_000, journal).point(placed, decode(2), 20, found)
 
     assert record["refused"] == "ZeroDivisionError: division by zero"
-    assert exits == ([1] if faulted else [])
+    # the journal holds no record of the leaf when the rank ends
+    assert exits == ([(1, False)] if faulted else [])
 
 
 def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
