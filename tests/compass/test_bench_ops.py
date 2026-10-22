@@ -563,28 +563,26 @@ def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placeme
 def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
     monkeypatch,
 ):
-    # aiter's workspace is a NamedTuple; a live buffer of o_acc's own spec and
-    # one with room for cnt would take them by `_meta`'s rules. The module
-    # stands in for hca_persist, whose package needs aiter's JIT to import.
-    workspace = collections.namedtuple("Workspace", "o_acc cnt")(
-        torch.randn(4, 2, 3), torch.arange(7, 12, dtype=torch.int32)
-    )
-    hca = SimpleNamespace(_workspaces={0: workspace})
+    # aiter's workspace is a NamedTuple, one per device: this runner's is at
+    # index 1, another's at 0. A live buffer of o_acc's own spec and one with
+    # room for cnt would take them by `_meta`'s rules. The module stands in for
+    # hca_persist, whose package needs aiter's JIT to import.
+    work = collections.namedtuple("Workspace", "o_acc cnt")
+    other = work(torch.randn(4, 2, 3), torch.arange(5, dtype=torch.int32))
+    workspace = work(torch.randn(4, 2, 3), torch.arange(7, 12, dtype=torch.int32))
+    hca = SimpleNamespace(_workspaces={0: other, 1: workspace})
     monkeypatch.setitem(sys.modules, "atom.model_ops.v4_kernels.hca_persist", hca)
     monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
     runner = _Runner()
-    runner.device = torch.device("cpu", 0)
+    runner.device = torch.device("cpu", 1)
     runner.forward_vars["partials"] = torch.zeros(4, 2, 3)
     cnt = ("cnt", _t([5], "metadata", dtype="torch.int32"))
     found = ops.leaves(
         _graph(
-            _leaf(
-                "aiter.mla_decode_v4_ps_asm.default",
-                ("o_acc", _t([4, 2, 3], "metadata")),
-                cnt,
-            ),
-            # a slot of another name keeps the live pick, though cnt is tighter
-            _leaf("aten.add_.Tensor", ("self", cnt[1])),
+            _leaf(ops.HCA_DECODE, ("o_acc", _t([4, 2, 3], "metadata")), cnt),
+            # another operator's slot of a field's name keeps the live pick
+            _leaf("aten.add_.Tensor", cnt),
+            _leaf(ops.HCA_DECODE, ("cnt", _t([9], "metadata", dtype="torch.int32"))),
             layers=1,
         )["region"]
     )
@@ -604,9 +602,10 @@ def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
     ):
         got = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
 
-    asm, add = got
+    asm, add, wide = got
     assert asm["metadata"] == {"o_acc": "o_acc", "cnt": "cnt"}
-    assert add["metadata"] == {"self": "block_tables"}
+    assert add["metadata"] == {"cnt": "block_tables"}
+    assert "ATOM's live HCA workspace has no room for cnt" in wide["refused"]
     for kwargs, _ in graphs[0]:
         assert torch.equal(kwargs["o_acc"], workspace.o_acc)
         assert torch.equal(kwargs["cnt"], workspace.cnt)
