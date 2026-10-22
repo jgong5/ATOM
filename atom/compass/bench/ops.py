@@ -65,6 +65,10 @@ again, it and the metadata views cloned once each, and only where they differ
 from the last placement's. A KV argument
 places a leaf's copies as a context key does. A second graph runs
 copy 0 K times, warm; with one copy, or K under `CALLS`, there is none.
+Before each capture, and once the runner sized its KV pool, the memory the
+bench freed goes back to the driver, and the bench waits, at most `CLEAR_S`,
+until the card's VRAM in use falls by it (`_release`); a point records the
+seconds waited since the last point and how many waits the cap ended.
 Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
 idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
@@ -146,9 +150,9 @@ from atom.compass.artifacts import (
 from atom.compass.drive.gpu import add_gpu_flag
 
 PROG = "compass measure ops"
-#: The timing protocol's version; it changes whenever a count below or the
-#: copies a graph reads change.
-PROTOCOL = 8
+#: The timing protocol's version; it changes whenever a count below, the
+#: copies a graph reads or what a capture waits for change.
+PROTOCOL = 9
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -169,6 +173,12 @@ COLD = 2
 #: median. A power limit is the suspected cause. With this idle after a replay
 #: `GRAPH_NS` bounds, it read 0.22% to 0.58% under the step.
 REST = 0.1
+#: Seconds a release waits at most for the driver to clear what it returned
+#: (`_release`), and the VRAM in use over the release's target that ends it.
+CLEAR_S, CLEAR_SLACK = 3.0, 64 << 20
+#: The release waits since a point last recorded them: seconds, and how many
+#: ended at `CLEAR_S`.
+_waited: Counter = Counter()
 #: Metadata arguments, by operator and slot, that are the token ids ATOM passes
 #: the model's forward; `_meta`'s name rule binds an embedding's `indices` to
 #: another index buffer.
@@ -430,7 +440,7 @@ def _runner(config, rank: int):
     held = torch.empty(nbytes, dtype=torch.uint8, device=runner.device)
     blocks = runner.get_num_blocks()["num_kvcache_blocks"]
     del held
-    torch.cuda.empty_cache()  # the pool takes the room the hold had
+    _release()  # the pool takes the room the hold had
     config.num_kvcache_blocks = agreed(blocks, cpu_group())
     before = dict(vars(runner))
     runner.allocate_kv_cache(config.num_kvcache_blocks)
@@ -677,6 +687,8 @@ class Stub:
             "calls": len(cycle),
             "llc_bytes": self.llc,
             "protocol": PROTOCOL,
+            "release_wait_s": _waited.pop("s", 0.0),
+            "release_capped": _waited.pop("capped", 0),
             "routing": _routing(self.loads) if self.loads else None,
         }
 
@@ -1000,7 +1012,8 @@ def _replay(fn, calls) -> list[float]:
     """Each timed replay of one graph of `calls`, in ns per call, each started
     on every rank together (`_together`), the capture refused on every rank
     when any rank's refused, and nothing it left read by a later one
-    (`_contained`). Over several ranks, a decode step's graph is captured as
+    (`_contained`), captured once the memory earlier leaves freed is cleared
+    (`_release`). Over several ranks, a decode step's graph is captured as
     ATOM captures one, each collective on the buffers it registered."""
     from atom.compass.bench.ranks import cpu_group, refused_together
     from atom.utils import forward_context
@@ -1008,6 +1021,7 @@ def _replay(fn, calls) -> list[float]:
     registered = cpu_group() is not None and not calls[0][1].context.is_prefill
     if registered:
         from aiter.dist.parallel_state import graph_capture
+    _release()  # the capture's own release then has nothing to return
     graph = torch.cuda.CUDAGraph()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -1034,6 +1048,36 @@ def _replay(fn, calls) -> list[float]:
             times.append(ms * 1e6 / len(calls))
         time.sleep(ms * REST / 1e3)
     return times
+
+
+def _release() -> None:
+    """The caching allocator's free memory returned to the driver, then a wait,
+    at most `CLEAR_S`, until the card's VRAM in use falls by it, added to
+    `_waited`. The driver clears VRAM a process returns in the background,
+    about 31 GiB/s on MI308X, and a memory-bound leaf timed during the clear
+    read up to 1.20 of its time after it."""
+    used, held = _vram_used(), torch.cuda.memory_reserved()
+    torch.cuda.empty_cache()
+    if used is None:
+        return
+    target = used - (held - torch.cuda.memory_reserved()) + CLEAR_SLACK
+    start = time.monotonic()
+    while (over := _vram_used() > target) and time.monotonic() - start < CLEAR_S:
+        time.sleep(0.005)
+    _waited["s"] += time.monotonic() - start
+    _waited["capped"] += over
+
+
+def _vram_used() -> int | None:
+    """The bytes in use on this process's GPU as its driver counts them, or
+    None when the process has no GPU in use."""
+    from atom.compass.drive.identity import PCI
+
+    if not torch.cuda.is_initialized():
+        return None
+    p = torch.cuda.get_device_properties(torch.cuda.current_device())
+    bus = f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"
+    return int(Path(PCI, bus, "mem_info_vram_used").read_text())
 
 
 @contextlib.contextmanager
