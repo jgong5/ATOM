@@ -148,6 +148,16 @@ def step_shape(
     return "decode", width, width
 
 
+def gathered_off_default(
+    phase: str, tokens: int, gathered: int | None, dp: int, drafts: int = 0
+) -> int | None:
+    """The rows a step's MoE `gathered` in a DP group of `dp`, None at their
+    default, every rank at this one's `tokens`, a decode's rows each verifying
+    a drafter's `drafts` and one."""
+    rows = tokens * (drafts + 1 if phase == "decode" else 1)
+    return None if gathered == dp * rows else gathered
+
+
 class OpGraphBackend(CostBackend):
     """A step as its shape's graph, one roofline per leaf, composed by its joins."""
 
@@ -235,15 +245,13 @@ class OpGraphBackend(CostBackend):
 
     def _bound(self, view: BatchView) -> tuple:
         """What a price list reads of a step: its phase, its T and B, the rows
-        its MoE gathers, None at every rank's rows (as `Shape.at` drops them),
-        and its rows' context and max context (`band`), the context a
-        decode's max, a prefill's mean cached tokens."""
-        from atom.compass.capture.forward import Shape
-
+        its MoE gathers off their default (`gathered_off_default`), and its
+        rows' context and max context (`band`), the context a decode's max, a
+        prefill's mean cached tokens."""
         rung = view.capture_rung if self.padded else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
-        g = Shape(phase, t, b, view.moe_rows).at(self.dp, self.drafts).gathered
+        g = gathered_off_default(phase, t, view.moe_rows, self.dp, self.drafts)
         rows = [(r.query_tokens, r.context_tokens) for r in view.requests]
         mean, top = band(rows, phase == "decode")
         return (phase, t, b, g, top if phase == "decode" else mean, top)

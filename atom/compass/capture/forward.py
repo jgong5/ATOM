@@ -57,6 +57,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 import atom
 from atom.compass import ir
+from atom.compass.backends.op_graph import gathered_off_default
 from atom.compass.ir.nodes import Reduced
 
 from . import driverless, peers
@@ -106,11 +107,10 @@ class Shape(NamedTuple):
         return text if self.gathered is None else f"{text} G={self.gathered}"
 
     def at(self, dp: int, drafts: int = 0) -> "Shape":
-        """This shape in a DP group of `dp`: `gathered` only off every rank's
-        rows, `dp x tokens`, a decode's under a drafter of `drafts` each
-        verifying that many and one."""
-        rows = self.tokens * (drafts + 1 if self.phase == "decode" else 1)
-        return self._replace(gathered=None) if self.gathered == dp * rows else self
+        """This shape in a DP group of `dp` under a drafter of `drafts`:
+        `gathered` only off its default (`gathered_off_default`)."""
+        g = gathered_off_default(self.phase, self.tokens, self.gathered, dp, drafts)
+        return self._replace(gathered=g)
 
 
 def decode(width: int, gathered: int | None = None) -> Shape:
