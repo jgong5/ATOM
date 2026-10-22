@@ -174,7 +174,7 @@ def main(argv: list[str]) -> None:
     from atom.compass.bench import ranks
     from atom.compass.bench.measure import atom_config
     from atom.compass.capture.forward import decode, prefill
-    from atom.compass.drive.gpu import hip_visible, quiet
+    from atom.compass.drive.gpu import hip_visible, kfd_pid, quiet
     from atom.compass.drive.identity import identity
     from atom.compass.run.step_grid import keyed
     from atom.model_engine.arg_utils import EngineArgs
@@ -202,6 +202,7 @@ def main(argv: list[str]) -> None:
             "rank on one GPU"
         )
     os.environ["HIP_VISIBLE_DEVICES"] = hip_visible(args.gpu)
+    kfd_pid()  # before atom_config opens a GPU, so quiet leaves this process out
     config = atom_config(argv[cut + 1 :])
     ranks.layout(config)
     if config.compilation_config.level:
@@ -552,14 +553,15 @@ class Stub:
             for _, s in _specs(op["args"])
         )
         for key in instances[0].values():
-            if key in self.contexts:
-                held = kv.get(f"layer_{self.contexts[key].layer_num}")
+            module = self.contexts.get(key)
+            if hasattr(module, "layer_num"):  # a layer of ATOM's KV registry
+                held = kv.get(f"layer_{module.layer_num}")
                 unit = rows if _stateful(held) else blocks
                 # ponytail: a tensor's first dim is its blocks or its state slots
                 size += sum(t.nbytes // t.shape[0] * unit for t in _fields(held))
                 need = None
-            elif key in self.modules:
-                size += sum(t.nbytes for t in _own(self.modules[key]))
+            elif (module := self.modules.get(key, module)) is not None:
+                size += sum(t.nbytes for t in _own(module))
         n = self._cold(size)
         if need is None:  # cycle over every instance's state, which is held anyway
             n = min(CALLS, max(n, len(instances)))
@@ -822,8 +824,9 @@ def _meta(spec, slot, live) -> tuple[str, torch.Tensor]:
 
 def _function(name: str):
     """The callable a leaf names: `ns.op.overload`, or a lifted `module:qualname`;
-    a functional collective waited on, as the in-place one ATOM calls is; a
-    lifted collective that takes a group on the one ATOM calls it on
+    a functional collective waited on, as the in-place one ATOM calls is, and
+    refused unless its group is one the layout gives this rank (`_on_layout`);
+    a lifted collective that takes a group on the one ATOM calls it on
     (`DP_GROUP`), refused when ATOM's group is not known."""
     if ":" in name:
         module, qualname = name.split(":")
@@ -841,9 +844,32 @@ def _function(name: str):
         if ":" in name and "group" in inspect.signature(fn).parameters:
             raise ValueError(f"{name} takes a group no leaf name maps to")
         if name.startswith("_c10d_functional."):
-            wait = torch.ops._c10d_functional.wait_tensor
+            wait, fn = torch.ops._c10d_functional.wait_tensor, _on_layout(name, fn)
             return lambda **kwargs: wait(fn(**kwargs))
     return fn
+
+
+def _on_layout(name: str, fn):
+    """`fn`, refusing a call whose `group_name` names none of the device groups
+    of aiter's coordinators on this rank, the groups of the layout ATOM's
+    collectives run on: a name only resolves on the ranks its group holds."""
+
+    def call(**kwargs):
+        from aiter.dist.parallel_state import _groups
+
+        layout = {
+            g.device_group.group_name: (key, g.ranks)
+            for key, ref in _groups.items()
+            if (g := ref())
+        }
+        if (group := kwargs["group_name"]) not in layout:
+            raise ValueError(
+                f"{name} on group_name {group!r}, which names no group the layout "
+                f"gives rank {torch.distributed.get_rank()}: {layout}"
+            )
+        return fn(**kwargs)
+
+    return call
 
 
 def _kernels(fn, kwargs) -> tuple[list[str], float]:

@@ -8,6 +8,7 @@ import argparse
 import os
 import shutil
 import subprocess
+from contextlib import nullcontext
 
 import pytest
 
@@ -258,6 +259,30 @@ def test_the_caller_holding_a_named_gpu_is_left_out_and_others_are_not(
         pass
     refused = "^GPU 7 has PID 4242 on it before the run, so it was not started$"
     with pytest.raises(GpuRefusal, match=refused), quiet((7, 9), out):
+        pass
+
+
+def test_the_caller_is_the_kfd_entry_its_first_open_of_dev_kfd_added(
+    tmp_path, monkeypatch
+):
+    # In a container with its own PID namespace, /proc/self/sched names the
+    # container's PID; here it names this pytest process, which LISTING lacks.
+    out = _plant(tmp_path, monkeypatch, LISTING)
+    _kfd(tmp_path, monkeypatch, gpu=9, vram=2 << 20)
+    entry = tmp_path / "kfd/proc/3362894"
+    entry.rename(tmp_path / "entry")
+
+    class Device:
+        def open(self, mode):  # as KFD's, adds the opener's entry
+            (tmp_path / "entry").rename(entry)
+            return nullcontext()
+
+    monkeypatch.setattr(drive_gpu, "DEV_KFD", Device())
+    monkeypatch.setattr(drive_gpu, "_ADDED", {})
+    assert drive_gpu.kfd_pid() == "3362894"
+    # Once the process holds a GPU its opens add nothing; it is still left out.
+    monkeypatch.setattr(drive_gpu, "DEV_KFD", tmp_path / "held")
+    with quiet((8, 9), out):
         pass
 
 

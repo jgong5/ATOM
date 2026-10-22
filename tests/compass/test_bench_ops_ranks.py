@@ -305,6 +305,55 @@ def test_a_lifted_collective_runs_on_the_group_atom_calls_it_on_or_refuses(
         ops._function("atom.model_ops.moe:tp_gather")
 
 
+C10D = "_c10d_functional.all_gather_into_tensor.default"
+
+
+def _layout_rank(config, todo, rank):
+    """`_measuring_rank`, measuring `C10D` on three groups of a layout aiter
+    registered: its DP group of both ranks, a gloo group of the same two ranks
+    outside the layout, and rank 0's TP group, of rank 0 alone."""
+    measure = ops.measure
+
+    def on_groups(config, todo, llc, rank):
+        me = dist.get_rank()
+        dp, twin = dist.new_group([0, 1]), dist.new_group([0, 1])
+        tp = [dist.new_group([r]) for r in (0, 1)]
+        names = [dp.group_name, twin.group_name, tp[0].group_name if me == 0 else None]
+        dist.broadcast_object_list(names, src=0)
+        dp_group = SimpleNamespace(ranks=[0, 1], device_group=dp)
+        tp_group = SimpleNamespace(ranks=[me], device_group=tp[me])
+        groups = {"dp:0": dp_group, "tp:0": tp_group}
+        sys.modules["aiter.dist.parallel_state"]._groups = {
+            key: (lambda g=g: g) for key, g in groups.items()
+        }
+        x = ("input", _t([2, 8], "activation"))
+        gathers = [
+            _leaf(C10D, x, ("group_size", size), ("group_name", name))
+            for name, size in zip(names, (2, 2, 1))
+        ]
+        found = ops.leaves(_graph(*gathers, layers=1)["region"])
+        return measure(config, [(decode(2), 20, found)], llc, rank)
+
+    ops.measure = on_groups
+    return _measuring_rank(config, todo, None, rank)
+
+
+def test_a_c10d_leaf_refuses_naming_its_group_unless_the_layout_gives_it():
+    config = _config(2, dp_attention=True)
+    ranks.layout(config)
+
+    by_rank = ranks.launch(_layout_rank, config, [[], []])
+
+    _, twin, tp0 = [json.loads(r["leaf"])["args"]["group_name"] for r in by_rank[0]]
+    merged = ranks.merge(by_rank)
+    assert "refused" not in merged[0] and len(merged[0]["rank_cold_ns"]) == 2
+    for record, rank, name in ((merged[1], 0, twin), (merged[2], 1, tp0)):
+        assert record["refused"].startswith(
+            f"ValueError: {C10D} on group_name '{name}'"
+        )
+        assert f"gives rank {rank}:" in record["refused"]
+
+
 def _gather(rows):
     x = ("x", _t([rows, 8], "activation"))
     return ir.Op(GATHER, "declared", (x, ("use_cag", True)), ((8 * rows, 8),))
