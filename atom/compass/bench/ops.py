@@ -28,8 +28,10 @@ experts' ids ATOM fuses into them (`_route`); a weight is random at its
 shape, dtype and stride, one tensor per occurrence of the leaf in the step;
 a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
-the token ids ATOM prepared (`TOKEN_IDS`), or of the buffer `V4_METADATA`
-names for a DeepSeek-V4 slot, refused when it is not live; an integer the capture
+the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
+HCA decode workspace an `HCA_DECODE` slot names, or of the buffer
+`V4_METADATA` names for a DeepSeek-V4 slot, refused when it is not live; an
+integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names, its module's meta parameters
 moved to the device and filled as `--load_dummy xavier` fills them (`_fill`),
@@ -174,11 +176,14 @@ REST = 0.1
 #: the model's forward; `_meta`'s name rule binds an embedding's `indices` to
 #: another index buffer.
 TOKEN_IDS = {("aten.embedding.default", "indices")}
+#: The operator whose metadata slots are named as the fields of DeepSeek-V4's
+#: HCA decode workspace: aiter defines its schema and the workspace together.
+HCA_DECODE = "aiter.mla_decode_v4_ps_asm.default"
 #: DeepSeek-V4's metadata arguments, by operator and slot, and the live buffer
 #: ATOM passes each, at the compress ratio the leaf takes or states (`{ratio}`)
 #: and that ratio's attention kind (`{kind}`): `_meta`'s rules bind them to a
 #: tighter buffer of their dtype. A leaf whose buffer is not live refuses.
-_NM, _PS = "aiter.mla:mla_decode_fwd_v4_nm", "aiter.mla_decode_v4_ps_asm.default"
+_NM = "aiter.mla:mla_decode_fwd_v4_nm"
 _CSA = "aiter.ops.flydsl.kernels.fused_compress_attn:flydsl_fused_compress_attn"
 _HCA = "aiter.ops.flydsl.kernels.fused_compress_attn_hca:flydsl_hca_compress_attn"
 _STATE = "atom.model_ops.v4_kernels.state_writes:update_compressor_states"
@@ -186,7 +191,7 @@ _QKN = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
 _BF16 = "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
 V4_METADATA = {
     (_NM, "kv_indptr"): "kv_indptr_{kind}",
-    (_PS, "kv_indptr"): "kv_indptr_{kind}",
+    (HCA_DECODE, "kv_indptr"): "kv_indptr_{kind}",
     (_BF16, "kv_indptr"): "kv_indptr_{kind}",
     (_CSA, "state_slot_mapping"): "state_slot_in",
     (_CSA, "plan_gpu"): "v4_compress_plan_{ratio}",
@@ -527,6 +532,11 @@ class Stub:
             for k, v in live.items()
             if torch.is_tensor(v) and v.device.type == device
         }
+        # DeepSeek-V4's persistent HCA decode workspace, one per device: a slot
+        # of `HCA_DECODE` named as one of its fields is a view of that field
+        hca = sys.modules.get("atom.model_ops.v4_kernels.hca_persist")
+        work = getattr(hca, "_workspaces", {}).get(self.runner.device.index)
+        work = work._asdict() if work is not None else {}
         meta = dict(self.kv)
         for sig, (op, _) in self.leaves.items():
             ratio = op["args"].get("ratio", op.get("stated", {}).get("compress_ratio"))
@@ -535,6 +545,8 @@ class Stub:
                     token = (op["op"], path) in TOKEN_IDS
                     pool = {"input_ids": input_ids} if token else live
                     what, field = "metadata", path.split(".")[0]
+                    if op["op"] == HCA_DECODE and field in work:
+                        pool, what = {field: work[field]}, "HCA workspace"
                     if wanted := V4_METADATA.get((op["op"], field)):
                         what = wanted.format(ratio=ratio, kind=V4_KINDS.get(ratio))
                         pool = {what: live[what]} if what in live else {}
