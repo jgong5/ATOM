@@ -28,7 +28,8 @@ experts' ids ATOM fuses into them (`_route`); a weight is random at its
 shape, dtype and stride, one tensor per occurrence of the leaf in the step;
 a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
-the token ids ATOM prepared (`TOKEN_IDS`); an integer the capture
+the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
+HCA decode workspace an `HCA_DECODE` slot names; an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names, its module's meta parameters
 moved to the device and filled as `--load_dummy xavier` fills them (`_fill`),
@@ -65,6 +66,10 @@ again, it and the metadata views cloned once each, and only where they differ
 from the last placement's. A KV argument
 places a leaf's copies as a context key does. A second graph runs
 copy 0 K times, warm; with one copy, or K under `CALLS`, there is none.
+Before each capture, and once the runner sized its KV pool, the memory the
+bench freed goes back to the driver, and the bench waits, at most `CLEAR_S`,
+until the card's VRAM in use falls by it (`_release`); a point records the
+seconds waited since the last point and how many waits the cap ended.
 Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
 idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
@@ -146,9 +151,9 @@ from atom.compass.artifacts import (
 from atom.compass.drive.gpu import add_gpu_flag
 
 PROG = "compass measure ops"
-#: The timing protocol's version; it changes whenever a count below or the
-#: copies a graph reads change.
-PROTOCOL = 8
+#: The timing protocol's version; it changes whenever a count below, the
+#: copies a graph reads or what a capture waits for change.
+PROTOCOL = 9
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -169,10 +174,21 @@ COLD = 2
 #: median. A power limit is the suspected cause. With this idle after a replay
 #: `GRAPH_NS` bounds, it read 0.22% to 0.58% under the step.
 REST = 0.1
+#: Seconds a release waits at most for the driver to clear what it returned
+#: (`_release`), and the VRAM in use over the release's target that ends it:
+#: on MI308X a release of 78 to 208 MiB left VRAM in use where it was for 3 s,
+#: while 2.4 to 51 GiB fell by the release's bytes.
+CLEAR_S, CLEAR_SLACK = 3.0, 256 << 20
+#: The release waits since a point last recorded them: seconds, and how many
+#: ended at `CLEAR_S`.
+_waited: Counter = Counter()
 #: Metadata arguments, by operator and slot, that are the token ids ATOM passes
 #: the model's forward; `_meta`'s name rule binds an embedding's `indices` to
 #: another index buffer.
 TOKEN_IDS = {("aten.embedding.default", "indices")}
+#: The operator whose metadata slots are named as the fields of DeepSeek-V4's
+#: HCA decode workspace: aiter defines its schema and the workspace together.
+HCA_DECODE = "aiter.mla_decode_v4_ps_asm.default"
 #: The seed of a copy's drawn expert ids, with the copy's index.
 SEED = 0
 #: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
@@ -430,7 +446,7 @@ def _runner(config, rank: int):
     held = torch.empty(nbytes, dtype=torch.uint8, device=runner.device)
     blocks = runner.get_num_blocks()["num_kvcache_blocks"]
     del held
-    torch.cuda.empty_cache()  # the pool takes the room the hold had
+    _release()  # the pool takes the room the hold had
     config.num_kvcache_blocks = agreed(blocks, cpu_group())
     before = dict(vars(runner))
     runner.allocate_kv_cache(config.num_kvcache_blocks)
@@ -503,14 +519,22 @@ class Stub:
             for k, v in live.items()
             if torch.is_tensor(v) and v.device.type == device
         }
+        # DeepSeek-V4's persistent HCA decode workspace, one per device: a slot
+        # of `HCA_DECODE` named as one of its fields is a view of that field
+        hca = sys.modules.get("atom.model_ops.v4_kernels.hca_persist")
+        work = getattr(hca, "_workspaces", {}).get(self.runner.device.index)
+        work = work._asdict() if work is not None else {}
         meta = dict(self.kv)
         for sig, (op, _) in self.leaves.items():
             for path, spec in _specs(op["args"]):
                 if spec["role"] == "metadata":
                     token = (op["op"], path) in TOKEN_IDS
                     pool = {"input_ids": input_ids} if token else live
+                    what, field = "metadata", path.split(".")[0]
+                    if op["op"] == HCA_DECODE and field in work:
+                        pool, what = {field: work[field]}, "HCA workspace"
                     try:
-                        name, view = _meta(spec, path, pool)
+                        name, view = _meta(spec, path, pool, what)
                         # leaves share a view's clone: DeepSeek-V4's decode
                         # leaves view 2.7 GB of it at a placement
                         meta[sig, path] = name, _deep(view, {}, self.clones)
@@ -677,6 +701,8 @@ class Stub:
             "calls": len(cycle),
             "llc_bytes": self.llc,
             "protocol": PROTOCOL,
+            "release_wait_s": _waited.pop("s", 0.0),
+            "release_capped": _waited.pop("capped", 0),
             "routing": _routing(self.loads) if self.loads else None,
         }
 
@@ -762,7 +788,12 @@ class Stub:
         [(experts, k)] = self.moe
         device = self.runner.device
         seed = torch.Generator(device).manual_seed(SEED * CALLS + c)
-        draw = torch.rand(spec["shape"][0], experts, generator=seed, device=device)
+        # double, not the default dtype ATOM's runner sets to the model's: a
+        # bfloat16 or float32 draw ties, and the device's top-k breaks a tie
+        # differently from call to call
+        draw = torch.rand(
+            spec["shape"][0], experts, generator=seed, device=device, dtype=torch.double
+        )
         ids = draw.topk(k).indices
         self.loads.append(torch.bincount(ids.flatten(), minlength=experts).tolist())
         out = _random(spec, device)
@@ -803,7 +834,8 @@ class Stub:
 
     def _weight(self, spec, c, count):
         """Weight `c mod count` of `spec`, random: the `count` of a leaf are
-        built once, as slices of one tensor."""
+        built once, as slices of one tensor, each marked preshuffled when ATOM
+        marked the captured one, so the operator picks the kernel it picked."""
         if (_spec_of(spec), 0) not in self.built:
             n = _span(spec["shape"], spec["stride"])
             dtype, device = _dtype(spec["dtype"]), self.runner.device
@@ -812,6 +844,8 @@ class Stub:
                 w = whole[i * n : (i + 1) * n]
                 w.copy_(_random({**spec, "shape": [n], "stride": [1]}, device))
                 view = w.as_strided(spec["shape"], spec["stride"])
+                if spec.get("is_shuffled"):
+                    view.is_shuffled = True
                 self.built[_spec_of(spec), i] = view
         return self.built[_spec_of(spec), c % count]
 
@@ -1000,7 +1034,8 @@ def _replay(fn, calls) -> list[float]:
     """Each timed replay of one graph of `calls`, in ns per call, each started
     on every rank together (`_together`), the capture refused on every rank
     when any rank's refused, and nothing it left read by a later one
-    (`_contained`). Over several ranks, a decode step's graph is captured as
+    (`_contained`), captured once the memory earlier leaves freed is cleared
+    (`_release`). Over several ranks, a decode step's graph is captured as
     ATOM captures one, each collective on the buffers it registered."""
     from atom.compass.bench.ranks import cpu_group, refused_together
     from atom.utils import forward_context
@@ -1008,6 +1043,7 @@ def _replay(fn, calls) -> list[float]:
     registered = cpu_group() is not None and not calls[0][1].context.is_prefill
     if registered:
         from aiter.dist.parallel_state import graph_capture
+    _release()  # the capture's own release then has nothing to return
     graph = torch.cuda.CUDAGraph()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -1034,6 +1070,36 @@ def _replay(fn, calls) -> list[float]:
             times.append(ms * 1e6 / len(calls))
         time.sleep(ms * REST / 1e3)
     return times
+
+
+def _release() -> None:
+    """The caching allocator's free memory returned to the driver, then a wait,
+    at most `CLEAR_S`, until the card's VRAM in use falls by it, added to
+    `_waited`. The driver clears VRAM a process returns in the background,
+    about 31 GiB/s on MI308X, and a memory-bound leaf timed during the clear
+    read up to 1.20 of its time after it."""
+    used, held = _vram_used(), torch.cuda.memory_reserved()
+    torch.cuda.empty_cache()
+    if used is None:
+        return
+    target = used - (held - torch.cuda.memory_reserved()) + CLEAR_SLACK
+    start = time.monotonic()
+    while (over := _vram_used() > target) and time.monotonic() - start < CLEAR_S:
+        time.sleep(0.005)
+    _waited["s"] += time.monotonic() - start
+    _waited["capped"] += over
+
+
+def _vram_used() -> int | None:
+    """The bytes in use on this process's GPU as its driver counts them, or
+    None when the process has no GPU in use."""
+    from atom.compass.drive.identity import PCI
+
+    if not torch.cuda.is_initialized():
+        return None
+    p = torch.cuda.get_device_properties(torch.cuda.current_device())
+    bus = f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"
+    return int(Path(PCI, bus, "mem_info_vram_used").read_text())
 
 
 @contextlib.contextmanager

@@ -4,7 +4,8 @@
 Under ``--method mtp`` `compass trace ops` traces a decode step whose rows
 verify the drafter's tokens, and cuts each step that samples where ATOM records
 `forward_done_event`: the target's work before the cut, the drafter's after
-it, each an `op_graph` of its own. `OpGraphBackend` prices the drafter's graph
+it, each an `op_graph` of its own. A middle chunk, which samples nothing, is
+cut where its draft-KV pass starts. `OpGraphBackend` prices the drafter's graph
 as terms tagged draft. Traced on Qwen3.5-35B-A3B-FP8's published config.
 """
 
@@ -34,7 +35,7 @@ from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.work import gemm, price
-from atom.compass.capture import population_shapes
+from atom.compass.capture import forward, population_shapes
 from atom.compass.capture.forward import structure
 from atom.compass.run import _op_graphs
 from atom.compass.runner import projection
@@ -49,21 +50,24 @@ ARGMAX = "aiter.ops.flydsl.topk.topk_per_row_argmax:topk_per_row_argmax"
 MOE = "aiter.rocm_aiter_fused_moe.default"
 #: Two rows, each verifying one draft and its bonus token.
 VERIFY = view((2, 90, True), (2, 9, True), rung=2)
+#: A prefill of 64 tokens in one sequence, and a middle chunk of it.
+PREFILL = ("--prefill", "64", "1")
+CHUNK = BatchView((RequestShape(64, 64, False),), produces_output=False)
 
 _CAPTURES: dict = {}
 
 
-def capture(drafts, tmp_path_factory, dp=1):
-    """`compass trace ops --width 2` under an MTP drafter of `drafts` tokens,
+def capture(drafts, tmp_path_factory, shape=("--width", "2"), dp=1):
+    """`compass trace ops` at `shape` under an MTP drafter of `drafts` tokens,
     or at DP `dp` `--population` of a record whose every rank verifies 2 rows
     at rung 2, then beside a peer prefilling 16 tokens: the capture's directory
     and its graphs by structure, the first shape's."""
-    if (drafts, dp) in _CAPTURES:
-        return _CAPTURES[drafts, dp]
+    if (drafts, shape, dp) in _CAPTURES:
+        return _CAPTURES[drafts, shape, dp]
     root = tmp_path_factory.mktemp(f"mtp{drafts}")
     (root / "model").mkdir()
     (root / "model" / "config.json").write_bytes(CONFIG.read_bytes())
-    argv = ["trace", "ops", "--model", str(root / "model"), "--width", "2"]
+    argv = ["trace", "ops", "--model", str(root / "model"), *shape]
     if dp > 1:
         (root / "record").mkdir()
         line = {"rows": [[drafts + 1, 90, True]] * 2, "rung": 2}
@@ -73,7 +77,7 @@ def capture(drafts, tmp_path_factory, dp=1):
         steps = root / "record" / "steps"
         for r in range(1, dp):
             (steps / f"dp{r}.jsonl").write_bytes((steps / "dp0.jsonl").read_bytes())
-        argv[-2:] = ["--tp", str(dp), "--population", record]
+        argv[-len(shape) :] = ["--tp", str(dp), "--population", record]
     argv += ["--store", str(root / "store"), "--", "--method", "mtp"]
     argv += ["--enable-dp-attention"] * (dp > 1)
     argv += ["--num-speculative-tokens", str(drafts)]
@@ -99,7 +103,7 @@ def capture(drafts, tmp_path_factory, dp=1):
         entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
         graph = json.loads(entry.read_member("graph", rank, "json"))
         graphs.setdefault(graph["structure"], graph)
-    _CAPTURES[drafts, dp] = root, graphs
+    _CAPTURES[drafts, shape, dp] = root, graphs
     return root, graphs
 
 
@@ -127,10 +131,9 @@ def test_a_verify_step_is_cut_at_forward_done_event_into_target_and_drafter(
     assert [op["args"]["weight"]["shape"][0] for op in tables] == [vocab] * drafts
 
 
-@pytest.mark.parametrize("ep", [1, 8], ids=["ep_off", "ep8"])
-def test_a_run_prices_a_verify_step_s_drafter_from_its_own_graph(ep, tmp_path_factory):
-    root, graphs = capture(1, tmp_path_factory)
-    [drafter] = [graph for key, graph in graphs.items() if key.endswith(" draft")]
+def _priced(root, drafter, batch, ep=1):
+    """`batch` priced as a run prices it from the capture at `root`, and its
+    drafter's graph `drafter` priced at it over each EP width, as draft terms."""
     text = json.loads(CONFIG.read_text())
     config = SimpleNamespace(
         model=str(root / "model"),
@@ -144,14 +147,23 @@ def test_a_run_prices_a_verify_step_s_drafter_from_its_own_graph(ep, tmp_path_fa
     )
     machine = MachineSpec.from_mapping(json.loads(MACHINE.read_text()))
     lookup = _op_graphs(str(root / "store"), config, "gfx942")
-    cost = OpGraphBackend(machine, lookup, kv="bf16", ep=ep, drafts=1).price(VERIFY)
+    cost = OpGraphBackend(machine, lookup, kv="bf16", ep=ep, drafts=1).price(batch)
 
     def drafted(width):
         flat: dict = {}
         for op in _ops(drafter["region"]):
-            if (w := work(op, VERIFY, 1, "bf16", width)) is not None:
+            if (w := work(op, batch, 1, "bf16", width)) is not None:
                 flat.setdefault(f"draft op.{op['op']}", []).append(price(w, machine))
         return {name: fold_seconds(s) for name, s in flat.items()}
+
+    return cost, drafted
+
+
+@pytest.mark.parametrize("ep", [1, 8], ids=["ep_off", "ep8"])
+def test_a_run_prices_a_verify_step_s_drafter_from_its_own_graph(ep, tmp_path_factory):
+    root, graphs = capture(1, tmp_path_factory)
+    [drafter] = [graph for key, graph in graphs.items() if key.endswith(" draft")]
+    cost, drafted = _priced(root, drafter, VERIFY, ep)
 
     assert {t.name: t.seconds for t in cost.terms if t.draft} == drafted(ep)
     # The drafter's experts run over the target's EP ranks, as ATOM builds them.
@@ -160,15 +172,59 @@ def test_a_run_prices_a_verify_step_s_drafter_from_its_own_graph(ep, tmp_path_fa
     assert f"op.{SAMPLER}" in {t.name for t in cost.terms if not t.draft}
 
 
+def test_a_middle_chunk_is_cut_where_its_draft_kv_pass_starts(tmp_path_factory):
+    _, graphs = capture(1, tmp_path_factory, PREFILL)
+    [middle] = [key for key in graphs if key.endswith(" no output")]
+    final = middle.removesuffix(" no output")
+    assert set(graphs) == {middle, f"{middle} draft", final, f"{final} draft"}
+    ours, theirs, done = (
+        _ops(graphs[key]["region"]) for key in (middle, f"{middle} draft", final)
+    )
+    names = [op["op"] for op in ours + theirs]
+
+    # The drafter's layer takes each of the chunk's tokens, and nothing samples.
+    queries = [op["args"]["q"]["shape"][0] for op in theirs if op["op"] == ATTENTION]
+    assert queries == [64]
+    assert ARGMAX not in names
+    # The target holds no drafter pass: its attention is the final chunk's.
+    attended = [sum(op["op"] == ATTENTION for op in ops) for ops in (ours, done)]
+    assert attended[0] == attended[1]
+
+
+def test_a_run_prices_a_middle_chunk_s_draft_kv_pass_from_its_own_graph(
+    tmp_path_factory,
+):
+    root, graphs = capture(1, tmp_path_factory, PREFILL)
+    [drafter] = [
+        graph for key, graph in graphs.items() if key.endswith(" no output draft")
+    ]
+    cost, drafted = _priced(root, drafter, CHUNK)
+
+    assert {t.name: t.seconds for t in cost.terms if t.draft} == drafted(1)
+
+
+def test_a_block_drafter_is_refused_by_name_before_any_step():
+    class DSparkProposer:
+        is_block_drafter = True
+
+    runner = SimpleNamespace(drafter=DSparkProposer())
+    with pytest.raises(ValueError, match="DSparkProposer writes its draft KV before"):
+        forward._drafter(runner, None)
+
+
 FINAL = BatchView((RequestShape(9, 9, False),), produces_output=True)
 
 
 @pytest.mark.parametrize(
     "batch,shape",
-    [(VERIFY, ("decode", 2, 2, True)), (FINAL, ("prefill", 9, 1, True))],
-    ids=["verify", "final-chunk"],
+    [
+        (VERIFY, ("decode", 2, 2, True)),
+        (FINAL, ("prefill", 9, 1, True)),
+        (MIDDLE, ("prefill", 9, 1, False)),
+    ],
+    ids=["verify", "final-chunk", "middle-chunk"],
 )
-def test_a_step_that_samples_reads_its_drafter_s_graph_as_draft_terms(batch, shape):
+def test_a_step_reads_its_drafter_s_graph_as_draft_terms(batch, shape):
     asked = []
 
     def graph(*at, draft=False):
@@ -188,7 +244,6 @@ def test_a_step_that_samples_reads_its_drafter_s_graph_as_draft_terms(batch, sha
     "batch,drafted,named",
     [
         (view((1, 9, True)), g(1, 8, 8), "a step that decodes a row of other than 2"),
-        (MIDDLE, g(1, 8, 8), "a step under a drafter that produces no output"),
         (VERIFY, None, "over 2 sequences for its drafter"),
         (
             replace(VERIFY, tbo_tokens=((2,), (2,))),
@@ -196,7 +251,7 @@ def test_a_step_that_samples_reads_its_drafter_s_graph_as_draft_terms(batch, sha
             "a two-batch-overlap step under a drafter",
         ),
     ],
-    ids=["unverified-row", "middle-chunk", "uncaptured-drafter", "two-batch-overlap"],
+    ids=["unverified-row", "uncaptured-drafter", "two-batch-overlap"],
 )
 def test_a_step_under_a_drafter_with_no_draft_to_price_is_refused_by_name(
     batch, drafted, named
@@ -234,6 +289,7 @@ def dp_view(width, rung, dp, counts=None):
         context_lens=[90] * width,
         req_ids=list(range(width)),
         produces_output=lambda: True,
+        is_dummy_run=False,
     )
     r = runner(None, dp_size=dp)
     r.drafter = SimpleNamespace(is_block_drafter=False)
@@ -374,6 +430,16 @@ def test_a_dp_prefill_under_a_drafter_reads_its_graphs_at_their_default(tmp_path
         price(gemm(9, 64, 64), SPEC),
         price(gemm(9, 128, 128), SPEC),
     )
+
+
+def test_a_dp_middle_chunk_s_drafter_is_refused_by_name():
+    # Under DP its drafter's passes run inside the target's graph.
+    def graph(*at, draft=False):
+        return g(9, 128, 128) if draft else g(9, 64, 64)
+
+    step = replace(MIDDLE, moe_rows=18, draft_moe_rows=18)
+    with pytest.raises(CostRefused, match="a DP middle chunk under a drafter"):
+        OpGraphBackend(SPEC, graph, kv="bf16", dp=2, drafts=1).price(step)
 
 
 # --- a decode padded to its rung ----------------------------------------------
