@@ -174,8 +174,10 @@ COLD = 2
 #: `GRAPH_NS` bounds, it read 0.22% to 0.58% under the step.
 REST = 0.1
 #: Seconds a release waits at most for the driver to clear what it returned
-#: (`_release`), and the VRAM in use over the release's target that ends it.
-CLEAR_S, CLEAR_SLACK = 3.0, 64 << 20
+#: (`_release`), and the VRAM in use over the release's target that ends it:
+#: on MI308X a release of 78 to 208 MiB left VRAM in use where it was for 3 s,
+#: while 2.4 to 51 GiB fell by the release's bytes.
+CLEAR_S, CLEAR_SLACK = 3.0, 256 << 20
 #: The release waits since a point last recorded them: seconds, and how many
 #: ended at `CLEAR_S`.
 _waited: Counter = Counter()
