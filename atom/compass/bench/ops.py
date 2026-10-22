@@ -814,8 +814,8 @@ def _meta(spec, slot, live) -> tuple[str, torch.Tensor]:
 
 def _function(name: str):
     """The callable a leaf names: `ns.op.overload`, or a lifted `module:qualname`;
-    a functional collective waited on, as the in-place one ATOM calls is, and
-    refused unless its group is one the layout gives this rank (`_on_layout`);
+    a functional collective waited on, as the in-place one ATOM calls is, on
+    this rank's group of the coordinator it was captured on (`_on_coordinator`);
     a lifted collective that takes a group on the one ATOM calls it on
     (`DP_GROUP`), refused when ATOM's group is not known."""
     if ":" in name:
@@ -834,30 +834,26 @@ def _function(name: str):
         if ":" in name and "group" in inspect.signature(fn).parameters:
             raise ValueError(f"{name} takes a group no leaf name maps to")
         if name.startswith("_c10d_functional."):
-            wait, fn = torch.ops._c10d_functional.wait_tensor, _on_layout(name, fn)
+            wait, fn = torch.ops._c10d_functional.wait_tensor, _on_coordinator(name, fn)
             return lambda **kwargs: wait(fn(**kwargs))
     return fn
 
 
-def _on_layout(name: str, fn):
-    """`fn`, refusing a call whose `group_name` names none of the device groups
-    of aiter's coordinators on this rank, the groups of the layout ATOM's
-    collectives run on: a name only resolves on the ranks its group holds."""
+def _on_coordinator(name: str, fn):
+    """`fn` on this rank's device group of the aiter coordinator a call's
+    `group_name` holds (`tp:0`), whatever torch named that group here; refused
+    naming the coordinator when this rank has none by that name."""
 
     def call(**kwargs):
         from aiter.dist.parallel_state import _groups
 
-        layout = {
-            g.device_group.group_name: (key, g.ranks)
-            for key, ref in _groups.items()
-            if (g := ref())
-        }
-        if (group := kwargs["group_name"]) not in layout:
+        ref = _groups.get(coordinator := kwargs["group_name"])
+        if (group := ref and ref()) is None:
             raise ValueError(
-                f"{name} on group_name {group!r}, which names no group the layout "
-                f"gives rank {torch.distributed.get_rank()}: {layout}"
+                f"{name} on coordinator {coordinator!r}, which rank "
+                f"{torch.distributed.get_rank()} does not hold: {sorted(_groups)}"
             )
-        return fn(**kwargs)
+        return fn(**kwargs | {"group_name": group.device_group.group_name})
 
     return call
 
