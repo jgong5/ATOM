@@ -112,10 +112,10 @@ class Shape(NamedTuple):
         )
 
 
-def decode(width: int) -> Shape:
+def decode(width: int, gathered: int | None = None) -> Shape:
     if width < 1:
         raise ValueError(f"a decode width is at least 1, got {width}")
-    return Shape("decode", width, width)
+    return _gathering(Shape("decode", width, width, gathered))
 
 
 def prefill(tokens: int, seqs: int, gathered: int | None = None) -> Shape:
@@ -124,12 +124,16 @@ def prefill(tokens: int, seqs: int, gathered: int | None = None) -> Shape:
             f"a prefill of {tokens} tokens over {seqs} sequences: each sequence "
             "takes at least one token"
         )
-    if gathered is not None and gathered < tokens:
+    return _gathering(Shape("prefill", tokens, seqs, gathered))
+
+
+def _gathering(shape: Shape) -> Shape:
+    if shape.gathered is not None and shape.gathered < shape.tokens:
         raise ValueError(
-            f"a prefill of {tokens} tokens whose MoE gathers {gathered} rows: the "
-            "gather holds this rank's"
+            f"a {shape.phase} of {shape.tokens} tokens whose MoE gathers "
+            f"{shape.gathered} rows: the gather holds this rank's"
         )
-    return Shape("prefill", tokens, seqs, gathered)
+    return shape
 
 
 def device_arch() -> str:
