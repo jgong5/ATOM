@@ -60,18 +60,18 @@ class _Processor:
 
 
 TARGET, SAMPLE, KV, PROPOSE = 60_000, 2_000, 9_000, 5_000  # ns
-#: `eagle-dp` is EAGLE under DP lockstep; DSpark writes its draft KV on every forward.
-DRAFTERS = ("eagle", "eagle-dp", "dspark")
+#: `-dp` is the drafter under DP lockstep; DSpark writes its draft KV on every forward.
+DRAFTERS = ("eagle", "eagle-dp", "dspark", "dspark-dp")
 
 
 def _recorded(warmup, drafter=None):
     """With `drafter` (`DRAFTERS`), a forward calls the drafter's
-    `compute_draft_kv` after its target, except an `eagle-dp` middle chunk,
-    which runs an align-only `propose_draft_token_ids` instead. An output
-    forward also waits for the MTP status before its launch, then samples,
-    calls `prepare_sampled_ids` right after `forward_done_event`, proposes and
-    waits for the draft copy, as ATOM does. The device work each call queues
-    lands on the next event recorded."""
+    `compute_draft_kv` after its target. A `-dp` middle chunk then runs an
+    align-only `propose_draft_token_ids`; an `eagle-dp` one runs it instead of
+    the draft-KV pass. An output forward also waits for the MTP status before
+    its launch, then samples, calls `prepare_sampled_ids` right after
+    `forward_done_event`, proposes and waits for the draft copy, as ATOM
+    does. The device work each call queues lands on the next event recorded."""
     device = _Device()
     clock = iter(range(1, 10**9))
 
@@ -87,7 +87,7 @@ def _recorded(warmup, drafter=None):
 
                 def draft_kv(positions, hidden, next_token_ids):
                     # EAGLE's returns early where a row samples (-1).
-                    if drafter == "dspark" or -1 not in next_token_ids:
+                    if drafter.startswith("dspark") or -1 not in next_token_ids:
                         self.queued.append("kv")
 
                 self.drafter = SimpleNamespace(compute_draft_kv=draft_kv)
@@ -108,8 +108,8 @@ def _recorded(warmup, drafter=None):
             self.queued = ["launch"]
             assert self.run_model([], batch) == "logits"
             self.queued.append("target" if drafter else "busy")
-            align = drafter == "eagle-dp" and not output
-            if drafter and not align:
+            align = drafter and drafter.endswith("-dp") and not output
+            if drafter and not (align and drafter == "eagle-dp"):
                 self.drafter.compute_draft_kv([], "hidden", [-1] if output else [7])
             if align:
                 self.propose_draft_token_ids(batch, align_only=True)
@@ -188,7 +188,8 @@ def test_with_a_drafter_each_line_splits_its_device_window_at_the_target(
     tmp_path, monkeypatch, drafter
 ):
     """A middle chunk's target ends where its first drafter pass starts; an
-    output forward's where it samples, less a draft-KV pass before that."""
+    output forward's where it samples, less a draft-KV pass before that. Each
+    drafter pass a forward runs, the second one included, is timed apart."""
     batches = _drive(tmp_path / "simulated", monkeypatch, {0: [0, 1]})[0][0]
     recorded, device = _recorded(batches[-1], drafter=drafter)
     device.tick = 10**12
@@ -204,9 +205,15 @@ def test_with_a_drafter_each_line_splits_its_device_window_at_the_target(
         keys = {"t_mtp_ns", "t_recv_ns", "t_draft_recv_ns"}
         assert keys <= step.keys() if output else not keys & step.keys()
         target = TARGET + SAMPLE * output
-        kv = KV * (drafter == "dspark" or drafter == "eagle" and not output)
-        draft = kv + PROPOSE * (output or drafter == "eagle-dp")
+        kv = KV * (drafter.startswith("dspark") or drafter == "eagle" and not output)
+        proposes = output or drafter.endswith("-dp")
+        draft = kv + PROPOSE * proposes
         assert (step["d_target_ns"], step["d_busy_ns"]) == (target, target + draft)
+        # An EAGLE output step's draft-KV pass returns at once; an `eagle-dp`
+        # middle chunk runs none.
+        passes = (step.get("d_draft_kv_ns"), step.get("d_propose_ns"))
+        ran_kv = output or drafter != "eagle-dp"
+        assert passes == (kv if ran_kv else None, PROPOSE if proposes else None)
         if output:
             stamps = [step["t_enter_ns"], *step["t_gate_ns"], *step["t_mtp_ns"]]
             stamps += [*step["t_launch_ns"], *step["t_recv_ns"]]
@@ -214,3 +221,6 @@ def test_with_a_drafter_each_line_splits_its_device_window_at_the_target(
             assert stamps == sorted(stamps)
     # No step of the record is left without its target end.
     assert {s.cut for s in label(tmp_path / "real" / "dp0.jsonl")[0]} <= {None, "mixed"}
+    # The drafter's timings are not part of a step's decision.
+    first = compare(tmp_path / "real", tmp_path / "simulated")["first_divergence"]
+    assert first == {0: None}
