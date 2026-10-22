@@ -469,6 +469,8 @@ def test_a_v4_metadata_slot_is_a_view_of_the_buffer_atom_passes_or_refuses():
     csa = "aiter.ops.flydsl.kernels.fused_compress_attn:flydsl_fused_compress_attn"
     state = "atom.model_ops.v4_kernels.state_writes:update_compressor_states"
     qkn = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
+    hca = "aiter.ops.flydsl.kernels.fused_compress_attn_hca:flydsl_hca_compress_attn"
+    bf16 = "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
 
     def i32(*shape):
         return torch.zeros(shape, dtype=torch.int32)
@@ -481,6 +483,7 @@ def test_a_v4_metadata_slot_is_a_view_of_the_buffer_atom_passes_or_refuses():
         "context_lens": i32(3),
         "top_ks": i32(4, 4),
         "v4_compress_plan_4": i32(8, 4),
+        "v4_compress_plan_128": i32(8, 4),
         "v4_write_plan_4": i32(4, 4),
         "v4_write_plan_128": i32(8, 4),
     }
@@ -504,10 +507,11 @@ def test_a_v4_metadata_slot_is_a_view_of_the_buffer_atom_passes_or_refuses():
         dataclasses.replace(
             _leaf(name, meta("kv_indptr", 5)), stated=(("compress_ratio", r),)
         )
-        for name, r in ((nm, 4), (ps, 128))
+        for name, r in ((nm, 4), (ps, 128), (bf16, 4))
     ]
     leaves += [
         _leaf(csa, ("ratio", 4), slots, meta("plan_gpu", 4, 4)),
+        _leaf(hca, ("ratio", 128), slots, meta("plan_gpu", 4, 4)),
         _leaf(state, ("ratio", 128), slots, meta("write_plan", 4, 4)),
         _leaf(qkn, meta("batch_id_per_token", 3)),
     ]
@@ -520,10 +524,12 @@ def test_a_v4_metadata_slot_is_a_view_of_the_buffer_atom_passes_or_refuses():
     got = {(stub.leaves[s][0]["op"], p): n for (s, p), (n, _) in views.items()}
     assert got == {
         (nm, "kv_indptr"): "kv_indptr_csa",
-        (ps, "kv_indptr"): "ATOM's live kv_indptr_hca has no room for kv_indptr "
-        "[5] torch.int32 stride [1]",
+        (ps, "kv_indptr"): "ATOM passes kv_indptr kv_indptr_hca: not live",
+        (bf16, "kv_indptr"): "kv_indptr_csa",
         (csa, "state_slot_mapping"): "state_slot_in",
         (csa, "plan_gpu"): "v4_compress_plan_4",
+        (hca, "state_slot_mapping"): "state_slot_in",
+        (hca, "plan_gpu"): "v4_compress_plan_128",
         (state, "state_slot_mapping"): "state_slot_out",
         (state, "write_plan"): "v4_write_plan_128",
         (qkn, "batch_id_per_token"): "batch_id_per_q_token",

@@ -563,6 +563,8 @@ class Stub:
                         what = wanted.format(ratio=ratio, kind=V4_KINDS.get(ratio))
                         pool = {what: live[what]} if what in live else {}
                     try:
+                        if not pool:
+                            raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
                         # leaves share a view's clone: DeepSeek-V4's decode
                         # leaves view 2.7 GB of it at a placement
