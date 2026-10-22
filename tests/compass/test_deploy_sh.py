@@ -7,7 +7,8 @@ stops them all and writes its `run.json`.
 `python3` is stubbed on `PATH`: the authority listens on its endpoint and
 leaves once both instances have; a `compass run` serves `/health` on a port of
 its own, writes its `server.json` and, at SIGTERM, its `run.json`. The router is
-a planted `ATOMESH`. Every other `python3` is the real one, so the run file is
+a planted `ATOMESH`, built at the commit and status `PLANTED_BUILD` names.
+Every other `python3` is the real one, so the run file is
 `runfile.prefill_decode`'s. Nothing needs a driver.
 """
 
@@ -42,6 +43,8 @@ while not all(os.path.exists(f"{out}/{side}/run.json") for side in ("prefill", "
     if time.monotonic() > deadline:
         sys.exit(9)
     time.sleep(0.1)
+# A real authority summarises a while after both instances stop.
+time.sleep(2)
 open(out + "/summary.json", "w").write("{}")
 """
 INSTANCE = """\
@@ -76,8 +79,18 @@ while True:
 ROUTER = """\
 import http.server, json, os, signal, sys, urllib.request
 argv = sys.argv[1:]
-json.dump({"argv": argv, "pid": os.getpid()}, open(os.environ["PLANTED_ROUTER"], "w"))
-signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+if argv == ["--version-verbose"]:
+    commit, status = os.environ["PLANTED_BUILD"].split()
+    print(f"atomesh 0.1.0\\n  Git Commit: {commit}\\n  Git Status: {status}")
+    sys.exit()
+lp = {k: v for k, v in os.environ.items() if k.startswith("ATOM_COMPASS_")}
+json.dump({"argv": argv, "pid": os.getpid(), "env": lp}, open(os.environ["PLANTED_ROUTER"], "w"))
+def stop(*_):
+    summary = os.path.exists(os.environ["PLANTED_SUMMARY"])
+    open(os.environ["PLANTED_ROUTER"] + ".stop", "w").write(json.dumps(summary))
+    os._exit(0)
+
+signal.signal(signal.SIGTERM, stop)
 # As atomesh does, it asks each instance first, through any proxy the environment names.
 for flag in ("--prefill", "--decode"):
     urllib.request.urlopen(argv[argv.index(flag) + 1] + "/health", timeout=10)
@@ -120,6 +133,7 @@ def planted(tmp_path):
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "ATOMESH": str(bindir / "atomesh"),
         "PLANTED_ROUTER": str(tmp_path / "router.json"),
+        "PLANTED_SUMMARY": str(tmp_path / "d" / "summary.json"),
         "WAIT_S": "60",
     }
     flags = ["--step-stub", str(tmp_path / "stub.json")]
@@ -232,12 +246,76 @@ def test_an_instance_that_exits_before_it_answers_fails_the_deployment_naming_it
     assert not (tmp_path / "d" / "server.json").exists()
 
 
+def _tree_commit() -> str:
+    stamp = TREE / ".compass-commit"
+    if stamp.exists():
+        return stamp.read_text().strip()
+    git = ["git", "-C", str(TREE), "rev-parse", "HEAD"]
+    return subprocess.run(
+        git, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def test_a_dp_aware_router_runs_as_the_router_lp_on_the_run_s_clock(tmp_path, planted):
+    env, flags = planted
+    env["PLANTED_BUILD"] = f"{_tree_commit()} clean"
+    d = tmp_path / "d"
+    words = argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"])
+    script = subprocess.Popen(
+        words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, text=True
+    )
+    _until(d / "server.json", script)
+
+    run = json.loads((d / "run_file.json").read_text())
+    assert run["router"] == {
+        "path": env["ATOMESH"],
+        "commit": _tree_commit(),
+        "status": "clean",
+    }
+    assert run["router_in_s"] == run["ipc_s"]
+    table = compass_run.channel_table(run)
+    assert compass_run.ROUTER in table.registry.ids()
+    router = json.loads((tmp_path / "router.json").read_text())
+    assert router["argv"][-1] == "--dp-aware"
+    lookaheads = json.loads(router["env"].pop("ATOM_COMPASS_ROUTER_LOOKAHEADS"))
+    assert lookaheads == {
+        c.name: table.lookahead(c.name) for c in table.channels_from(compass_run.ROUTER)
+    }
+    assert router["env"] == {
+        "ATOM_COMPASS_CLOCK_ENDPOINT": run["clock_endpoint"],
+        "ATOM_COMPASS_SEED": "20260707",
+    }
+
+    script.send_signal(signal.SIGTERM)
+    out, _ = script.communicate(timeout=60)
+    assert script.returncode == 0, out
+    # The router LP outlives the run: it is stopped once the summary is written.
+    assert json.loads((tmp_path / "router.json.stop").read_text()) is True
+
+
+def test_a_dp_aware_run_refuses_a_router_built_dirty_before_anything_starts(
+    tmp_path, planted
+):
+    env, flags = planted
+    env["PLANTED_BUILD"] = f"{_tree_commit()} dirty"
+    words = argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"])
+
+    done = subprocess.run(
+        words, env=env, cwd=tmp_path, capture_output=True, text=True, check=False
+    )
+
+    assert done.returncode == 1, done.stderr
+    assert f"deploy: router binary {env['ATOMESH']}" in done.stderr
+    assert "built from an uncommitted tree" in done.stderr
+    assert not (tmp_path / "d" / "run_file.json").exists()
+    assert not (tmp_path / "d" / "authority.argv.json").exists()
+
+
 @pytest.mark.parametrize(
     "case, refusal",
     [
         ("command", "the command after OUT is run or record"),
         ("kv", "--kv-transfer-config"),
-        ("dp-aware", "carry --dp-aware"),
         ("no router", "--router -- come once each"),
         ("occupied", "holds an earlier deployment's files"),
     ],
@@ -249,8 +327,6 @@ def test_bad_arguments_exit_2_before_anything_starts(tmp_path, planted, case, re
         words[3] = "trace"
     elif case == "kv":
         words.insert(words.index("--decode"), "--kv-transfer-config={}")
-    elif case == "dp-aware":
-        words.append("--dp-aware")
     elif case == "no router":
         del words[words.index("--router") :]
     else:
