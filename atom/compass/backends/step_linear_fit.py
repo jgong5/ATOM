@@ -85,9 +85,10 @@ With two or more runs it also prints, per form, the error on each run of a
 law fitted on the others, warm steps left out: per kind and rung, or prefill
 token band, the p10, p50 and p90 of `predicted / measured - 1`; and the same
 per host law. The law's own form's errors are written into it: under each
-vector's `held_out`, the convex hull of every rank's steps they were measured on and
-their percentiles per band, which `StepLinearLaw` reads to mark a term
-validated. A vector whose held-out steps span no hull gets none.
+vector's `held_out`, the convex hull of the rows they were priced by, each
+step's costliest rank's, and their percentiles per band, which `StepLinearLaw`
+reads to mark a term validated. A cheaper rank's row is not hulled: no error was
+measured at it. A vector whose held-out steps span no hull gets none.
 """
 
 from __future__ import annotations
@@ -607,7 +608,7 @@ def _band(key: str, counts) -> str:
 
 def _held_out(samples, options, seed, warm=None):
     """Each step of each run, warm steps left out, priced as its costliest rank
-    by the law fitted on the other runs: (run, vector, band, each rank's (counts,
+    by the law fitted on the other runs: (run, vector, band, that rank's (counts,
     context), relative error), the error nan where that law has no vector."""
     form, dp = _options(options)
     runs = _runs(samples, dp)
@@ -629,8 +630,10 @@ def _held_out(samples, options, seed, warm=None):
                     float(np.dot(c, x + _rowmod_count(vector, n))) for x, n in mine
                 ]
                 error = max(price) / seconds - 1.0
-            top = mine[int(np.argmax(price))][0]
-            yield run, key, _band(key, top), mine, error
+            # A tie goes to the rank of larger features, which a law blind to them
+            # prices the same and the step still waits for.
+            top = max(zip(price, mine), key=lambda p: (p[0], p[1][0]))[1]
+            yield run, key, _band(key, top[0]), top, error
 
 
 def _rowmod_count(vector: dict, context) -> tuple:
@@ -658,8 +661,8 @@ def _bands(rows) -> dict:
 
 def mark_held_out(law: dict, report: dict, samples, options=None, seed: int = 0):
     """Write the held-out errors: under each of `law`'s vectors, as `held_out`,
-    the hull of every rank's step `_held_out` priced, their errors per band; under
-    `report`'s `held_out`, each run's errors per band."""
+    the hull of the rank rows `_held_out` priced its steps by, their errors per
+    band; under `report`'s `held_out`, each run's errors per band."""
     from scipy.spatial import QhullError
 
     rows = [
@@ -673,7 +676,7 @@ def mark_held_out(law: dict, report: dict, samples, options=None, seed: int = 0)
         mine = [r for r in rows if r[1] == key]
         if vector is None or not mine:
             continue
-        points = [c + _rowmod_count(vector, x) for r in mine for c, x in r[3]]
+        points = [r[3][0] + _rowmod_count(vector, r[3][1]) for r in mine]
         try:
             hull = _hull(
                 np.array(points, dtype=np.float64)[:, 1:],
