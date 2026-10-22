@@ -176,6 +176,7 @@ class _Runner:
     device = torch.device("cpu")
 
     def __init__(self, contexts=()):
+        self.pool_plan, self.kv_held = SimpleNamespace(entries={}), {}
         self.model = torch.nn.Sequential(
             *(torch.nn.Linear(3, 3, device="meta") for _ in range(2))
         )
@@ -225,7 +226,6 @@ def test_a_point_places_its_batch_for_its_context_keys_and_refuses_by_name(
                 ("layer", ir.ContextRef(KEY)),
                 key=KEY,
             ),
-            _leaf("aten.add.Tensor", ("self", _t([2, 3], "kv"))),
             _leaf(
                 "aten.add_.Tensor",
                 ("self", _t([2, 8], "metadata", dtype="torch.int32")),
@@ -244,7 +244,6 @@ def test_a_point_places_its_batch_for_its_context_keys_and_refuses_by_name(
     assert runner.staged == [s for b in runner.batches for s in ("begin", b, "finish")]
     why = {r["op"]: r["refused"] for r in got}
     assert "'nowhere'" in why["aten.nowhere.default"]
-    assert "a kv tensor argument [2, 3]" in why["aten.add.Tensor"]
     [meta] = [r for r in got if r["op"] == "aten.add_.Tensor"]
     assert meta["metadata"] == {"self": "block_tables"}
     assert {r["placements"] for r in got} == {5}
@@ -469,6 +468,66 @@ def test_a_context_module_with_no_kv_layer_is_sized_by_its_own_tensors(monkeypat
     assert "refused" not in record
     assert (record["cold_ns"], record["footprint_bytes"]) == (1.0, 10 * 1056)
     assert record["placements"] == 1
+
+
+def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placements(
+    monkeypatch,
+):
+    # DeepSeek-V4: the pools are runner attributes, each layer's view of the
+    # plane from its base row to the end, the state slots a strided view; the
+    # capture's pool was sized otherwise.
+    plane, state = torch.zeros(100, 4), torch.zeros(6, 2, 4)
+    runner = _Runner()
+    runner.pool_plan = SimpleNamespace(entries={"state": 6})
+    runner.kv_held = {
+        "v4_unified_kv": [plane, plane[2:]],
+        "v4_state": state,
+        "num_kv_heads": 1,
+    }
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    kv = ("kv", _t([60, 1, 1, 4], "kv", stride=[4, 4, 4, 1]))
+    found = ops.leaves(
+        _graph(
+            _leaf(
+                "x", ("q", _t([2, 4], "activation")), kv, ("st", _t([5, 2, 4], "kv"))
+            ),
+            _leaf("y", ("kv", _t([500, 4], "kv"))),
+            layers=1,
+        )["region"]
+    )
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    graphs = []
+
+    def replay(fn, calls):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        got = {
+            r["op"]: r
+            for r in ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+        }
+
+    # 32 bytes of q, and per state slot of the two rows 16 of kv and 32 of
+    # state: 128 a call, 16 copies past twice 1000 bytes, each its own
+    # placement, of which 6 slots hold 3 of two rows.
+    record = got["x"]
+    assert record["metadata"] == {"kv": "v4_unified_kv.1", "st": "v4_state"}
+    assert (record["copies"], record["placements"]) == (16, 3)
+    assert runner.batches == [(4 * p, 2 * p) for p in range(3)]
+    for c, (kwargs, snap) in enumerate(graphs[0][:16]):
+        assert kwargs["kv"].untyped_storage().data_ptr() == plane.data_ptr()
+        assert kwargs["kv"].storage_offset() == 8
+        assert kwargs["kv"].shape == (60, 1, 1, 4)
+        assert kwargs["st"].data_ptr() == state.data_ptr()
+        assert set(snap.attn_metadata.block_tables.flatten().tolist()) == {4 * (c % 3)}
+    assert "ATOM's live KV has no room for kv [500, 4]" in got["y"]["refused"]
 
 
 def test_a_call_cycles_a_weight_per_occurrence_on_the_cold_copies_inputs():
