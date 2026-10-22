@@ -17,10 +17,10 @@ row does, and a prefill step when the view says so, which it does when any row
 is a final chunk.
 
 Under a drafter of `drafts` tokens a decode step verifies `drafts` and one in
-each row, and a step that samples also reads its drafter's graph,
-`graph(..., draft=True)`, the work ATOM queues after `forward_done_event`: its
-prices are terms named ``draft op.<kind>``, each tagged draft. Sampling is the
-target's.
+each row, and a step also reads its drafter's graph, `graph(..., draft=True)`,
+the work ATOM queues after `forward_done_event` on a step that samples, else
+from its draft-KV pass on: its prices are terms named ``draft op.<kind>``,
+each tagged draft. Sampling is the target's.
 
 Each leaf is one pricing unit, `max(t0, F / peak, M / BW(M), t_comm)` over its
 work (`op_work.work`): its own tensors at the captured shape, the state it
@@ -64,8 +64,7 @@ this rank, whose micro-batches' graphs exchange a different number of times
 or run an exchange beside a second stream (the dual-stream MoE, which ATOM
 turns off under overlap), or that runs under a drafter, whose draft pass no
 graph places on the overlapped streams; a decode step whose rows do not each
-verify the drafter's tokens and one, and under a drafter a step that samples
-nothing, whose draft-KV pass no graph holds; a prefill step whose view
+verify the drafter's tokens and one; a prefill step whose view
 does not say whether it produces output; a shape with no graph, a
 data-parallel step's naming the rows it gathers; and, each reason once, a leaf
 whose kind has no extractor, whose price reads a spec field the spec lacks, or
@@ -269,11 +268,6 @@ class OpGraphBackend(CostBackend):
                         "a prefill step whose view does not say whether it "
                         "produces output, so whether it runs the LM head and the "
                         "sampler"
-                    )
-                elif draft and not output:
-                    reason = (
-                        "a step under a drafter that produces no output: its "
-                        "draft-KV pass runs off the path a capture traces"
                     )
                 elif isinstance(
                     region := self.graph(*shape, output, *g, **drafted), dict
