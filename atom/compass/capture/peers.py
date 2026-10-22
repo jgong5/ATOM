@@ -5,10 +5,11 @@ A capture runs one rank, rank 0. Where ATOM reads its peers, two rules answer:
 
 * Every peer scheduled what this rank did, but for its token count: the peers
   split evenly the rows the shape's MoE gathers (`Shape.gathered`) less this
-  rank's, or each schedules this rank's count when the shape states none. The
-  step's one DP all-gather (`sync_dp_metadata`), the per-rank counts built from
-  it and the sizes read off them (`DPMetadata.make`, `get_sizes_across_dp`) run
-  on the host with these rows.
+  rank's, the first of them a prefill, as a decode gathering other than every
+  rank's count has a prefilling peer, or each schedules this rank's count when
+  the shape states none. The step's one DP all-gather (`sync_dp_metadata`), the
+  per-rank counts built from it and the sizes read off them (`DPMetadata.make`,
+  `get_sizes_across_dp`) run on the host with these rows.
 * What the DP group gathers for the MoE, or MORI dispatches to this rank, is
   every rank's rows: the shape's gathered rows, by default the group's width
   times this rank's; for MORI, the height ATOM trims its buffer to, `T_moe`.
@@ -80,6 +81,7 @@ def patches(recorder):
             each, extra = divmod(rows - int(local[0]), dp - 1)
             for k, slot in enumerate(gathered[1:]):
                 slot[0] = each + (k < extra)
+            gathered[1][2] = 1  # is_prefill
 
     def sync_dp_metadata(**kwargs):
         gather, dist.all_gather = dist.all_gather, peers

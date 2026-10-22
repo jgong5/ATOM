@@ -51,6 +51,7 @@ STORED = [
     Shape("prefill", 3, 1, 15),
     Shape("prefill", 4, 1, 12),
     Shape("decode", 4, 4),
+    Shape("decode", 1, 1, 27),
 ]
 
 
@@ -140,6 +141,16 @@ def test_a_balanced_decode_prices_from_its_rung_s_graph(backend):
     assert cost.terms[0].provenance.detail.endswith("decode T=4 B=4 G=32")
 
 
+def test_a_decode_beside_a_prefilling_peer_prices_from_the_graph_at_its_gathered_rows(
+    backend,
+):
+    # Rank 1 prefills 20 tokens; the other seven decode one each.
+    cost = backend.price(view(decode(1), [1, 20, 1, 1, 1, 1, 1, 1]))
+
+    assert by_name(cost) == {"op.aiter.gemm_a16w16.default": gemms(27)}
+    assert cost.terms[0].provenance.detail.endswith("decode T=1 B=1 G=27")
+
+
 @pytest.mark.parametrize(
     "counts,split,named",
     [
@@ -183,9 +194,9 @@ def test_a_population_names_a_dp_prefill_s_rows_off_their_default(tmp_path):
     ranks += [([[1, 9, True]] * 2, 6)]
     record = _record(tmp_path, ranks)
 
-    # Four ranks: 4 x 8 rows is the default; a decode states no rows.
+    # Four ranks: 4 x 8 rows is the default, 4 x 2 a decode's.
     assert sorted(map(str, population_shapes([record]))) == [
-        "decode B=2",
+        "decode B=2 G=6",
         "prefill T=5 B=1 G=27",
         "prefill T=7 B=1 G=27",
         "prefill T=8 B=1",
@@ -222,6 +233,31 @@ def test_a_capture_gives_the_peers_the_rest_of_the_gathered_rows(ep, tmp_path_fa
             assert names == [f"{MOE}:all_gatherv", f"{MOE}:reduce_scatterv"]
             assert _rows(exchanged[1]) == (767, 64)
         assert _rows(exchanged[0]) == (64, 767)
+
+
+@pytest.mark.parametrize("ep", [False, True], ids=["ep_off", "ep8"])
+def test_a_decode_at_gathered_rows_has_a_prefilling_peer(ep, tmp_path_factory):
+    # Rank 0 decodes one token while a peer prefills: the MoE gathers 70 rows.
+    ranks = [([[1, 9, True]], 70)] + [(None, 70)] * (DP - 1)
+    record = _record(tmp_path_factory.mktemp("record"), ranks)
+    graphs = capture(tmp_path_factory, f"--population {record}" + DPA_TP8 + EP8 * ep)
+    graph, _ = graphs["decode B=1 G=70"]
+
+    for layer in _decoder(graph):
+        exchanged = [op for op in layer if op["kind"] == "declared"]
+        if ep:
+            assert [op["op"] for op in exchanged] == [
+                f"{MORI}.dispatch",
+                f"{MORI}.combine",
+            ]
+        else:
+            # The variable-length gather, not every rank padded to one height.
+            assert [op["op"] for op in exchanged] == [
+                f"{MOE}:all_gatherv",
+                f"{MOE}:reduce_scatterv",
+            ]
+            assert _rows(exchanged[1]) == (70, 1)
+        assert _rows(exchanged[0]) == (1, 70)
 
 
 @pytest.mark.parametrize("call", ["dispatch", "combine"])
