@@ -33,6 +33,9 @@ batch so the rejection sampler runs, and a step that samples is cut where ATOM
 records `forward_done_event`: the target's work before it, the drafter's after
 it (its passes, the shared embedding and LM head among them), each its own
 graph. A block drafter writes its draft KV before the cut and is refused.
+A decode of fewer rows than its width ran padded to that rung: its rows run
+the drafter's first pass, which takes the target's tokens unpadded, and the
+step continues at the rung past the cut; only its drafter's graph is kept.
 """
 
 import contextlib
@@ -93,7 +96,8 @@ _IS_ATOM: dict = {}
 
 
 class Shape(NamedTuple):
-    """A step's shape: `tokens` query tokens over `seqs` sequences, and under DP
+    """A step's shape: `tokens` query tokens over `seqs` sequences, a decode's
+    `tokens` its rows, fewer than `seqs` padded to a rung of `seqs`; and under DP
     `gathered`, the rows the group's MoE gathers, None at every rank's `tokens`."""
 
     phase: str  # "decode" or "prefill"
@@ -102,8 +106,9 @@ class Shape(NamedTuple):
     gathered: int | None = None
 
     def __str__(self) -> str:
-        text = f"prefill T={self.tokens} B={self.seqs}"
-        text = text if self.phase == "prefill" else f"decode B={self.seqs}"
+        text = f"{self.phase} T={self.tokens} B={self.seqs}"
+        if self.phase == "decode" and self.tokens == self.seqs:
+            text = f"decode B={self.seqs}"
         return text if self.gathered is None else f"{text} G={self.gathered}"
 
     def at(self, dp: int, drafts: int = 0) -> "Shape":
@@ -113,10 +118,10 @@ class Shape(NamedTuple):
         return self._replace(gathered=g)
 
 
-def decode(width: int, gathered: int | None = None) -> Shape:
+def decode(width: int, gathered: int | None = None, rows: int | None = None) -> Shape:
     if width < 1:
         raise ValueError(f"a decode width is at least 1, got {width}")
-    return _gathering(Shape("decode", width, width, gathered))
+    return _gathering(Shape("decode", rows or width, width, gathered))
 
 
 def prefill(tokens: int, seqs: int, gathered: int | None = None) -> Shape:
@@ -351,9 +356,13 @@ class _Recorder(TorchDispatchMode):
 
     def cut(self):
         """ATOM records `forward_done_event`: the target's work ends here, and
-        what follows is the drafter's."""
+        what follows is the drafter's, a padded decode's later passes at its rung."""
         if self.on:
             self.items.append((None, CUT))
+        if self.shape.phase == "decode":
+            from atom.utils.forward_context import get_forward_context
+
+            get_forward_context().context.running_bs = self.shape.seqs
 
     @contextlib.contextmanager
     def quiet(self):
@@ -878,6 +887,7 @@ def _batch(shape, block_size, context=1, output=True, drafts=0):
     from atom.model_engine.scheduler import ScheduledBatch
 
     drafts = drafts if shape.phase == "decode" else 0
+    shape = shape._replace(seqs=shape.tokens) if shape.phase == "decode" else shape
     per, extra = divmod(shape.tokens, shape.seqs)
     counts = [per + (i < extra) + drafts for i in range(shape.seqs)]
     seqs, blocks = {}, 0
@@ -1113,6 +1123,8 @@ def capture(
             for draft, part in enumerate(
                 (items[: cut[0]], items[cut[0] + 1 :]) if cut else (items,)
             ):
+                if shape.tokens < shape.seqs and not draft:
+                    continue  # its target ran at its rung, not its rows
                 key = structure(config, shape.phase, output=output, draft=bool(draft))
                 crossing, traced = [], Traced(key, str(shape))
                 graph = build(part, traced, crossing)

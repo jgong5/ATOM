@@ -15,7 +15,8 @@ A capture runs one rank, rank 0. Where ATOM reads its peers, two rules answer:
   sequence, this rank's at every peer.
 * What the DP group gathers for the MoE, or MORI dispatches to this rank, is
   every rank's rows: the shape's gathered rows, by default the group's width
-  times this rank's; for MORI, the height ATOM trims its buffer to, `T_moe`.
+  times this rank's; for MORI, the height ATOM trims its buffer to, `T_moe`. A
+  drafter's later pass, a row a sequence, takes this rank's rows at every peer.
   The DP reduce-scatter gives back this rank's rows; MORI's combine gives back
   its buffer of `max_num_tokens_per_dp_rank` rows, which ATOM's finalize slices.
 
@@ -77,7 +78,7 @@ def patches(recorder):
         with unset_fake_temporarily():
             return fn(*args, **kwargs)
 
-    counts = {}
+    counts = recorder.counts = {}
 
     def peers(gathered, local, group=None, async_op=False):
         for slot in gathered:
@@ -158,9 +159,8 @@ def install_mori(recorder):
             )
 
         def _dispatch(self, input, weights, scales, indices, **kwargs):
-            n, k = group.world_size * input.shape[0], indices.shape[1]
-            if (rows := recorder.shape.gathered) is not None:
-                n = rows * group.world_size // dp
+            rows, k = input.shape[0], indices.shape[1]
+            n = sum(recorder.counts.get(rows, [rows] * dp)) * group.world_size // dp
             return (
                 input.new_empty((n, input.shape[1])),
                 weights.new_empty((n, k)),

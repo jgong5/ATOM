@@ -486,14 +486,20 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   verified tokens, unpadded), and tags each of its terms `draft` (`draft op.<kind>`), so
   `StepCost.draft_seconds` is the drafter's and `target_seconds` the target's. A decode's
   default G counts each row's drafts, `dp x width x (drafts + 1)` (`Shape.at`).
+- **A padded decode's drafter at its rows.** A decode of fewer rows than its rung replays
+  the target at the rung, but `EagleProposer.propose` runs the drafter's first pass
+  eagerly on the target's real tokens, the rows' `drafts + 1` each, and its later passes,
+  a row a sequence, at the rung (`running_bs`) when it declares a draft graph, at the
+  rows otherwise (MRoPE, one draft). The drafter's graph is keyed by both, `decode T=<rows>
+  B=<rung>`: `--population` captures it from the rows' batch, its later passes at the
+  rung, and publishes the drafter's half alone, as the target ran at the rung
+  ([#1961](https://github.com/jgong5/ATOM/issues/1961)). Its default G is every rank's
+  rows' tokens.
 - **Refused by name.** A middle chunk under a drafter: ATOM runs its draft-KV pass
   (`compute_draft_kv`) on a real step only, and a prefill shape is traced as a dummy run,
   so no graph holds that pass. A block drafter (DSpark): it writes its draft KV before
   `forward_done_event` on a step that samples ([#1607](https://github.com/jgong5/ATOM/pull/1607)),
-  so one cut does not part its target from its draft. The drafter of a DP decode padded
-  to its rung: its first pass runs the rows' tokens unpadded, and a graph at the rung
-  traces the rung's, so it would price high
-  ([#1961](https://github.com/jgong5/ATOM/issues/1961)).
+  so one cut does not part its target from its draft.
 
 The drafter's roofline is not its measured time. On #1208's MTP1 record
 (Qwen3.5-35B-A3B-FP8, TP1, MI308X) the drafter's roofline is 0.39 of the measured draft at
@@ -1089,7 +1095,8 @@ one rank, so each exchange's rows are stated, every peer at this rank's shape bu
 its token count: the peers split evenly the rows the shape's MoE gathers, G, less this
 rank's, every peer at this rank's count when G is its default (`capture/peers.py`;
 `07` Phase 1a). A drafter's pass all-reduces its own count: its first, the target's
-stream, takes the step's counts; a later one, a row a sequence, this rank's at every peer. A TBO step, two micro-batches interleaved, is refused by name until
+stream, takes the step's counts; a later one, a row a sequence, this rank's at every
+peer, MORI's dispatch included. A TBO step, two micro-batches interleaved, is refused by name until
 its graphs exist (#1581).
 
 DeepSeek-V4's `v4_attention_with_output` is opened the same way (#1678), its body run as
