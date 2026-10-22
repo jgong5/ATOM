@@ -142,11 +142,16 @@ def _attention(op, view, tp, kv) -> Work:
     """Causal attention over the view's rows: Q read and O written, each row's
     K and V over its context read once in the KV cache's format `kv`, the new
     tokens' among them. F and M take heads times head dim only, so each side
-    counts as one head of its width."""
+    counts as one head of its width. A leaf whose Q holds fewer tokens than
+    the rows query runs a drafter's later pass, one query token a row, as
+    ATOM's `EagleProposer.propose` runs every pass after its first."""
     q, k = op["args"]["q"], op["args"]["k"]
     rows = view.requests
+    queries = [r.query_tokens for r in rows]
+    if q["shape"][0] < sum(queries):
+        queries = [1] * len(rows)
     return attention(
-        [r.query_tokens for r in rows],
+        queries,
         [r.context_tokens for r in rows],
         math.prod(q["shape"][1:]),
         1,
