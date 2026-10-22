@@ -55,7 +55,8 @@ instance c mod I at placement (c div I) mod P, its metadata and module
 tensors cloned past the first round: a placement is the point's batch on KV
 blocks and state slots of its own, as many as the pool and the slots hold,
 for which ATOM prepares the forward context
-again, cloned where it differs from the last placement's. A KV argument
+again, it and the metadata views cloned once each, and only where they differ
+from the last placement's. A KV argument
 places a leaf's copies as a context key does. A second graph runs
 copy 0 K times, warm; with one copy, or K under `CALLS`, there is none.
 Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
@@ -473,7 +474,9 @@ class Stub:
                     pool = {"input_ids": input_ids} if token else live
                     try:
                         name, view = _meta(spec, path, pool)
-                        meta[sig, path] = name, _clone(view)
+                        # leaves share a view's clone: DeepSeek-V4's decode
+                        # leaves view 2.7 GB of it at a placement
+                        meta[sig, path] = name, _deep(view, {}, self.clones)
                     except ValueError as error:  # the leaf refuses, not the step
                         meta[sig, path] = str(error), None
         # one clone across placements of what none changed: a leaf may cache

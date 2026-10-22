@@ -268,6 +268,33 @@ def test_each_placement_keeps_its_own_forward_context_and_metadata():
         assert snap.context.positions.tolist() == [2 * p] * 2
 
 
+def test_leaves_share_a_metadata_view_s_clone_and_placements_share_it_unchanged():
+    runner = _Runner()
+    runner.forward_vars["scratch"] = torch.zeros(6)
+    stub = ops.Stub(runner, 10_000)
+    tables = _t([2, 8], "metadata", dtype="torch.int32")
+    scratch = ("out", _t([6], "metadata"))
+    stub.leaves = ops.leaves(
+        _graph(
+            _leaf("aten.add_.Tensor", ("self", tables), scratch),
+            _leaf("aten.mul_.Tensor", ("self", tables), scratch),
+            layers=1,
+        )["region"]
+    )
+
+    for p in range(2):
+        stub._prepare((4 * p, 2 * p))
+
+    def views(p, path):
+        return [v for (_, at), (_, v) in stub.placed[p][1].items() if at == path]
+
+    # both leaves read one clone at a placement; the block tables changed
+    # between placements, the scratch did not
+    (a0, b0), (a1, b1) = views(0, "self"), views(1, "self")
+    assert a0 is b0 and a1 is b1 and a0 is not a1
+    assert len({id(v) for p in (0, 1) for v in views(p, "out")}) == 1
+
+
 def _measuring(monkeypatch):
     """A stand-in runner `measure` builds, a rule that refuses a batch of two
     rows, and two points of two leaves each: two rows, then four. A leaf times
