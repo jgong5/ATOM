@@ -617,6 +617,9 @@ class Stub:
                     # the rows the batch's blocks hold at its layer: a row
                     # per `ratio` tokens; its window rows are left out
                     unit = blocks * self.runner.config.kv_cache_block_size // ratio
+                    # of which a request reads at most its indexer's top-k
+                    if top := stated.get("index_topk"):
+                        unit = min(unit, rows * top)
                 nbytes, need = nbytes // max(s["shape"][0], 1) * unit, None
             size += nbytes
         for key in instances[0].values():

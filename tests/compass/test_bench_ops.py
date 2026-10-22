@@ -564,9 +564,10 @@ def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placeme
 def test_a_plane_argument_is_sized_by_the_rows_of_the_batch_s_blocks(monkeypatch):
     # DeepSeek-V4's decode attention states its layer's window and compress
     # ratio and reads a plane indexed by rows, beside a model's state slots;
-    # a leaf stating the ratio alone writes a row per state slot.
+    # a leaf stating the ratio alone writes a row per state slot; one stating
+    # an indexer's top-k reads at most that many rows a request.
     runner = _Runner()
-    runner.pool_plan = SimpleNamespace(entries={"state": 6})
+    runner.pool_plan = SimpleNamespace(entries={"state": 7})
     runner.config.kv_cache_block_size = 16
     runner.kv_held = {"v4_unified_kv": [torch.zeros(100, 4)]}
     monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
@@ -582,6 +583,11 @@ def test_a_plane_argument_is_sized_by_the_rows_of_the_batch_s_blocks(monkeypatch
             dataclasses.replace(
                 leaf, name="aiter.write", stated=(("compress_ratio", 4),)
             ),
+            dataclasses.replace(
+                leaf,
+                name="aiter.sparse",
+                stated=(("window_size", 8), ("compress_ratio", 4), ("index_topk", 3)),
+            ),
             layers=1,
         )["region"]
     )
@@ -594,9 +600,11 @@ def test_a_plane_argument_is_sized_by_the_rows_of_the_batch_s_blocks(monkeypatch
     # Two rows of 20 tokens hold 4 blocks of 16, 16 rows at ratio 4: 256 bytes
     # of kv and 32 of q a call, 7 copies past twice 1000 bytes. Per slot, 32
     # of kv: 32 copies, each its own placement, of which the pool holds 16;
-    # 6 slots hold 3 of two rows, the rest take them again.
+    # 7 slots hold 3 of two rows, the rest take the first 6 again. Past 4 x 3
+    # tokens a request reads 3 of its 5 rows: 96 bytes of kv, 16 copies.
     assert got["aiter.decode"]["footprint_bytes"] == 7 * 288
     assert got["aiter.write"]["footprint_bytes"] == 32 * 64
+    assert got["aiter.sparse"]["footprint_bytes"] == 16 * 128
     assert got["aiter.decode"]["placements"] == 16
     assert runner.batches == [(4 * p, 2 * p % 6) for p in range(16)]
 
