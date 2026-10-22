@@ -77,7 +77,7 @@ while True:
     signal.pause()
 """
 ROUTER = """\
-import http.server, json, os, signal, sys, urllib.request
+import http.server, json, os, signal, sys, threading, time, urllib.request
 argv = sys.argv[1:]
 if argv == ["--version-verbose"]:
     commit, status = os.environ["PLANTED_BUILD"].split()
@@ -91,6 +91,16 @@ def stop(*_):
     os._exit(0)
 
 signal.signal(signal.SIGTERM, stop)
+
+def leave(path):
+    # Once PLANTED_LEAVE exists: its words to the log, then exit 1, as fail() does.
+    while not os.path.exists(path):
+        time.sleep(0.1)
+    print(open(path).read(), file=sys.stderr, flush=True)
+    os._exit(1)
+
+if "PLANTED_LEAVE" in os.environ:
+    threading.Thread(target=leave, args=(os.environ["PLANTED_LEAVE"],), daemon=True).start()
 # As atomesh does, it asks each instance first, through any proxy the environment names.
 for flag in ("--prefill", "--decode"):
     urllib.request.urlopen(argv[argv.index(flag) + 1] + "/health", timeout=10)
@@ -206,13 +216,12 @@ def test_a_deployment_joins_both_instances_to_its_authority_behind_the_router(
         *ROUTER_ARGS,
     ]  # fmt: skip
     ready = json.loads((d / "server.json").read_text())
+    assert _parent(ready.pop("pid")) == script.pid
     assert ready == {
         "url": f"http://127.0.0.1:{port}",
-        "pid": router["pid"],
         "clock_endpoint": clock,
         "run_file": str(run_file),
     }
-    assert _parent(router["pid"]) == script.pid
 
     script.send_signal(signal.SIGTERM)
     out, _ = script.communicate(timeout=60)
@@ -291,6 +300,50 @@ def test_a_dp_aware_router_runs_as_the_router_lp_on_the_run_s_clock(tmp_path, pl
     assert script.returncode == 0, out
     # The router LP outlives the run: it is stopped once the summary is written.
     assert json.loads((tmp_path / "router.json.stop").read_text()) is True
+
+
+@pytest.mark.parametrize(
+    "last_words, ended",
+    [
+        ("ClockAbort: traffic closed its connection, so the run ends here", True),
+        ("no outbound channel router->frontend-P:http", False),
+    ],
+)
+def test_a_router_lp_that_leaves_as_the_traffic_closes_waits_for_the_client_s_stop(
+    tmp_path, planted, last_words, ended
+):
+    env, flags = planted
+    env["PLANTED_BUILD"] = f"{_tree_commit()} clean"
+    env["PLANTED_LEAVE"] = str(tmp_path / "leave")
+    d = tmp_path / "d"
+    words = argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"])
+    script = subprocess.Popen(
+        words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )  # fmt: skip
+    try:
+        _until(d / "server.json", script)
+        router = json.loads((tmp_path / "router.json").read_text())["pid"]
+
+        (tmp_path / "leave").write_text(f"router LP: {last_words}; ending the run")
+        while Path(f"/proc/{router}").exists():
+            time.sleep(0.1)
+        if ended:
+            time.sleep(1)  # the script has seen the router leave
+            # client.sh --stop: SIGTERM to the parent of the process server.json names.
+            ready = json.loads((d / "server.json").read_text())
+            os.kill(_parent(ready["pid"]), signal.SIGTERM)
+        _, err = script.communicate(timeout=60)
+    finally:
+        script.terminate()  # a deployment serving on stops with its test
+
+    if not ended:
+        assert script.returncode == 1, err
+        assert "a process of the deployment left before a stop" in err
+        return
+    assert script.returncode == 0, err
+    assert "left before a stop" not in err
+    assert (d / "summary.json").exists() and (d / "run.json").exists()
 
 
 def test_a_dp_aware_run_refuses_a_router_built_dirty_before_anything_starts(

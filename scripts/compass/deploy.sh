@@ -34,14 +34,15 @@
 # out_dir is OUT and whose clock_endpoint the authority's; authority.log;
 # prefill/ and decode/, each instance's `compass run --out`, its step record
 # among it, with its command's log beside it; router.log; and, once the router
-# answers, server.json as `compass run` writes one: the router's URL and
-# process id, the run file and the clock endpoint. The authority writes the
-# step table, the run summaries and the hand-ins in OUT. A client drives the
-# deployment through server.json as it drives one server (client.sh); no
-# client starts here. It serves until SIGTERM or SIGINT, then stops the
-# instances, the router and the authority, writes OUT/run.json, the command
-# line, the KV link, the run file and the router's command, and exits 0, or 1
-# when something left on its own or failed to stop. Exits 2 on bad arguments.
+# answers, server.json as `compass run` writes one: the router's URL, the
+# process id of a child of this script, the run file and the clock endpoint.
+# The authority writes the step table, the run summaries and the hand-ins in
+# OUT. A client drives the deployment through server.json as it drives one
+# server (client.sh); no client starts here. It serves until SIGTERM or SIGINT,
+# then stops the instances, the router and the authority, writes OUT/run.json,
+# the command line, the KV link, the run file and the router's command, and
+# exits 0, or 1 when something left on its own, a router LP as the traffic
+# closes aside, or failed to stop. Exits 2 on bad arguments.
 #
 # Real, there is no run file or authority: each instance is one `compass
 # record --out`, which checks its node's GPUs before and after.
@@ -246,18 +247,26 @@ compass_wait_up router $R "http://127.0.0.1:$ROUTER_PORT/v1/models"
 # prefill instance, so the wait below ends even when the stop comes before it.
 stopped=0
 trap 'stopped=1; kill -TERM $P 2>/dev/null || true' TERM INT
-# The router's parent is this script, which a client's stop signals.
+# server.json names a child of this script that lives as long as it does, so a
+# client's stop, sent to its parent, reaches the script whatever else has left.
+# It holds none of the script's output, which its caller may read to the end.
+tail --pid=$$ -f /dev/null >/dev/null 2>&1 &
 python3 -c 'import json, sys
 url, pid, run_file, clock, out = sys.argv[1:]
 ready = {"url": url, "pid": int(pid)}
 if run_file:
     ready |= {"clock_endpoint": clock, "run_file": run_file}
 open(out + ".part", "w").write(json.dumps(ready))' \
-    "http://127.0.0.1:$ROUTER_PORT" $R "$RUN_FILE" "$CLOCK" "$OUT/server.json"
+    "http://127.0.0.1:$ROUTER_PORT" $! "$RUN_FILE" "$CLOCK" "$OUT/server.json"
 mv "$OUT/server.json.part" "$OUT/server.json"
 echo "deploy: ready at http://127.0.0.1:$ROUTER_PORT"
 
 wait -n $authority $P $D $R || true
+# A router LP leaves when the traffic closes its clock connection as aiperf
+# ends, which ends the run: no failure, so serve on until the stop.
+if ((!stopped)) && [[ -n $ROUTER_LP ]] && grep -qs 'ClockAbort: traffic closed its connection' "$OUT/router.log"; then
+    until ((stopped)); do sleep 1; done
+fi
 rc=$((!stopped))
 ((stopped)) || echo "deploy: a process of the deployment left before a stop" >&2
 # Each instance stops its server, whose frontend ends a simulated run through
