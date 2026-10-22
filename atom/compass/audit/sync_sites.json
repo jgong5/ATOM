@@ -4519,6 +4519,18 @@
    "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
   },
   {
+   "id": "atom/compass/bench/ops.py::_alive::torch.cuda.synchronize(device)::device_sync#0",
+   "file": "atom/compass/bench/ops.py",
+   "symbol": "_alive",
+   "call": "torch.cuda.synchronize",
+   "expr": "torch.cuda.synchronize(device)",
+   "shape": "device_sync",
+   "peer": "none",
+   "why": "the op bench checks after a leaf refused that its device still runs, and ends the measuring process when the device faulted",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
    "id": "atom/compass/bench/ops.py::_child::ProcessPoolExecutor(1, mp_context=spawn)::thread_start#0",
    "file": "atom/compass/bench/ops.py",
    "symbol": "_child",
