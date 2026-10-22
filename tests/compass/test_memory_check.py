@@ -11,6 +11,7 @@ does.
 
 import json
 import math
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -72,7 +73,7 @@ def _log(path, *, peak, non_torch, tokens=MAX_NUM_BATCHED_TOKENS, pool=None, ran
         "safety=3.84GB, available_for_kv=113.24GB, block_bytes=1056768, "
         "num_kvcache_blocks=77049"
     )
-    lines = [warmup] + [budget] * ranks
+    lines = [warmup, budget] * ranks
     if pool is not None:
         lines.append(
             "[atom 08:32:24] CUDA graph capture memory: 11 graphs | "
@@ -159,6 +160,41 @@ def test_a_log_of_two_ranks_is_refused(monkeypatch, tmp_path):
     log = _log(tmp_path / "real.log", peak=GIB, non_torch=GIB, ranks=2)
     with pytest.raises(MemoryRefusal, match="has 2 lines matching"):
         main([str(tmp_path / compass_run.LP_FILE.format("engine")), str(log)])
+
+
+def _ranks(tmp_path) -> list[str]:
+    """The engine's hand-in as each of two DP ranks hands it in."""
+    engine = tmp_path / compass_run.LP_FILE.format("engine")
+    ranks = [engine.with_suffix(f".dp{r}.json") for r in (0, 1)]
+    for rank in ranks:
+        shutil.copy(engine, rank)
+    return [str(r) for r in ranks]
+
+
+def test_a_log_of_two_ranks_is_checked_against_each_ranks_hand_in(
+    monkeypatch, tmp_path, capsys
+):
+    saved = _memory(monkeypatch, tmp_path, eager=True)
+    real = {
+        "peak": _total(saved, "peak_torch"),
+        "non_torch": _total(saved, "non_torch"),
+    }
+    log = _log(tmp_path / "real.log", **real)
+    main([str(tmp_path / compass_run.LP_FILE.format("engine")), str(log)])
+    one = capsys.readouterr().out
+    assert "non_torch" in one
+    main([*_ranks(tmp_path), str(_log(log, **real, ranks=2))])
+    assert capsys.readouterr().out == one * 2
+
+
+def test_a_log_whose_ranks_disagree_is_refused(monkeypatch, tmp_path):
+    _memory(monkeypatch, tmp_path, eager=True)
+    log = _log(tmp_path / "real.log", peak=GIB, non_torch=GIB, ranks=2)
+    log.write_text(log.read_text().replace("non_torch=1.00GB", "non_torch=2.00GB", 1))
+    with pytest.raises(
+        MemoryRefusal, match="which name no rank to pair with a hand-in"
+    ):
+        main([*_ranks(tmp_path), str(log)])
 
 
 def test_a_hand_in_with_no_memory_section_is_refused_by_name(tmp_path):

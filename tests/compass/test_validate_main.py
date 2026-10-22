@@ -674,3 +674,27 @@ def test_a_deployment_cell_is_graded_per_side_as_each_side_alone_would_be(
         "-33.33% (-536,870,912 B)",
         "fail",
     ]
+
+
+def test_a_deployment_at_two_dp_ranks_checks_each_ranks_memory(capsys, tmp_path):
+    cell = tmp_path / "c4"
+    _rows(capsys, tmp_path)
+    _as_recorded(cell)
+    _deploy(cell)
+    one = _graded(capsys, cell)
+    # Each simulated rank hands in as <engine>.dp<r>; each real rank logs its lines.
+    for engine in sorted(cell.glob(f"step_linear/{LP_FILE.format('engine-*')}")):
+        for r in (0, 1):
+            shutil.copy(engine, engine.with_suffix(f".dp{r}.json"))
+        engine.unlink()
+    for log in cell.glob("real*/*/server.log"):
+        log.write_text(log.read_text() * 2)
+
+    rows = _graded(capsys, cell)
+
+    expected = {}
+    for (result, metric), value in one.items():
+        ranks = (" dp0", " dp1") if result.startswith("memory ") else ("",)
+        expected |= {(result + r, metric): value for r in ranks}
+    assert rows == expected
+    assert rows["memory real1 decode dp1", "non_torch"][1] == "fail"

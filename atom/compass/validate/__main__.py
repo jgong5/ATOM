@@ -22,7 +22,8 @@ counts but preemptions and prefill tokens.
 A run `deploy.sh` wrote, a deployment, holds `prefill/` and `decode/` with its client's
 export beside them: its warmup, cost and memory rows are per side (`cost real0 prefill`),
 each side costed at the law fitted under its engine config and checked against its
-engine's hand-in, `lp-engine-P.json` or `lp-engine-D.json`; `validate.runs` grades its
+engine's hand-in, `lp-engine-P.json` or `lp-engine-D.json`, at DP width above 1
+each rank's (`lp-engine-P.dp0.json`, a row per rank); `validate.runs` grades its
 schedule per side, its end to end once.
 """
 
@@ -122,10 +123,18 @@ def _cost(name: str, run: Path, backend, steps: list[dict]):
     yield where, "extrapolated", f"{report['extrapolated']} steps", "-"
 
 
-def _memory(name: str, hand_in: Path, real: Path):
-    where = f"memory {name}"
+def _memory(name: str, sim: Path, engine: str, real: Path):
+    """`real`'s memory against `engine`'s hand-in in `sim`, per rank at DP width
+    above 1, where each rank hands in as `<engine>.dp<r>`."""
+    ranks = sorted(sim.glob(LP_FILE.format(f"{engine}.dp*")))
+    for hand_in in ranks or [sim / LP_FILE.format(engine)]:
+        rank = f" {hand_in.stem.rsplit('.', 1)[1]}" if ranks else ""
+        yield from _checked(f"memory {name}{rank}", hand_in, real, len(ranks) or 1)
+
+
+def _checked(where: str, hand_in: Path, real: Path, ranks: int):
     try:
-        comparison, *_, graph = parts(hand_in, real / "server.log")
+        comparison, *_, graph = parts(hand_in, real / "server.log", ranks)
     except MemoryRefusal as e:
         yield where, "memory", e.what, "refused"
         return
@@ -231,8 +240,7 @@ def rows(cell) -> list[tuple]:
             )
             steps, _traces, warmup = runs.graded(side, r)
             out += [*_warmup(name, warmup), *_cost(name, side, backend, steps)]
-            engine = HAND_IN.get(side.name, ENGINE.name)
-            out += _memory(name, sim / LP_FILE.format(engine), side)
+            out += _memory(name, sim, HAND_IN.get(side.name, ENGINE.name), side)
     for side in runs.sides(sim):
         name = " ".join(side.relative_to(cell).parts)
         out += _warmup(name, runs.graded(side, sim)[2])
