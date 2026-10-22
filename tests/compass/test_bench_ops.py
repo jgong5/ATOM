@@ -563,14 +563,14 @@ def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placeme
 def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
     monkeypatch,
 ):
-    from atom.model_ops.v4_kernels import hca_persist
-
     # aiter's workspace is a NamedTuple; a live buffer of o_acc's own spec and
-    # one with room for cnt would take them by `_meta`'s rules
+    # one with room for cnt would take them by `_meta`'s rules. The module
+    # stands in for hca_persist, whose package needs aiter's JIT to import.
     workspace = collections.namedtuple("Workspace", "o_acc cnt")(
         torch.randn(4, 2, 3), torch.arange(7, 12, dtype=torch.int32)
     )
-    monkeypatch.setitem(hca_persist._workspaces, 0, workspace)
+    hca = SimpleNamespace(_workspaces={0: workspace})
+    monkeypatch.setitem(sys.modules, "atom.model_ops.v4_kernels.hca_persist", hca)
     monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
     runner = _Runner()
     runner.device = torch.device("cpu", 0)
