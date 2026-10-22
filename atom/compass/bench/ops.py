@@ -803,7 +803,8 @@ class Stub:
 
     def _weight(self, spec, c, count):
         """Weight `c mod count` of `spec`, random: the `count` of a leaf are
-        built once, as slices of one tensor."""
+        built once, as slices of one tensor, each marked preshuffled when ATOM
+        marked the captured one, so the operator picks the kernel it picked."""
         if (_spec_of(spec), 0) not in self.built:
             n = _span(spec["shape"], spec["stride"])
             dtype, device = _dtype(spec["dtype"]), self.runner.device
@@ -812,6 +813,8 @@ class Stub:
                 w = whole[i * n : (i + 1) * n]
                 w.copy_(_random({**spec, "shape": [n], "stride": [1]}, device))
                 view = w.as_strided(spec["shape"], spec["stride"])
+                if spec.get("is_shuffled"):
+                    view.is_shuffled = True
                 self.built[_spec_of(spec), i] = view
         return self.built[_spec_of(spec), c % count]
 

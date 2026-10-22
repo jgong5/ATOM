@@ -10,7 +10,8 @@ integer argument that differs between the two is affine in the context
 (`ir.Affine`), or the shape is refused by operator and slot.
 
 Each leaf carries its contract: its arguments by schema slot, a tensor as its
-shape, dtype, stride and role. A tensor's role is where its storage came from:
+shape, dtype, stride, role and the `is_shuffled` mark ATOM sets on a
+preshuffled weight. A tensor's role is where its storage came from:
 the model's parameters, buffers and tensor attributes are weights, what
 `allocate_kv_cache` allocated is KV, what the model's forward and the sampler
 after it allocated is an activation, and anything else (the runner's buffers,
@@ -565,7 +566,8 @@ class _Recorder(TorchDispatchMode):
         if isinstance(value, torch.Tensor):
             role = self.roles.get(_storage(value), ir.Role.METADATA)
             shape, stride = tuple(value.shape), value.stride()
-            return ir.Tensor(shape, str(value.dtype), stride, role)
+            shuffled = bool(getattr(value, "is_shuffled", False))
+            return ir.Tensor(shape, str(value.dtype), stride, role, shuffled)
         if isinstance(value, torch.nn.Module) and id(value) in self.modules:
             return ir.ModuleRef(self._layered(self.modules[id(value)]))
         if isinstance(value, str) and value in self.contexts:
