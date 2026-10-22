@@ -325,7 +325,6 @@ def test_a_capture_names_a_functional_collective_s_group_by_its_coordinator(
         )
         assert done.returncode == 0, done.stdout[-4000:]
         return
-    from aiter.dist import parallel_state
     from torch.distributed import _functional_collectives as functional
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
@@ -333,13 +332,15 @@ def test_a_capture_names_a_functional_collective_s_group_by_its_coordinator(
 
     driverless.install(str(tmp_path), "gfx942")
     driverless.group(4, 2)
+    from aiter.dist import parallel_state
+
     tp, dp = parallel_state.get_tp_group(), parallel_state.get_dp_group()
     recorder = forward._Recorder({}, driverless.driverless_mode(ShapeEnv()))
     with recorder.fake_mode, recorder:
         x = torch.empty(4, 8, device="cuda")
         recorder.on = True
         for group in (tp.device_group, dp.device_group, dist.group.WORLD):
-            functional.all_gather_tensor(x, 0, group).wait()
+            functional.all_gather_tensor(x, 0, group)
 
     named = [dict(op.args).get("group_name") for _, op in recorder.items]
     # the default group belongs to no coordinator: its name stays torch's
