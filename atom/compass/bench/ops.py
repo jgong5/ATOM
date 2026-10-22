@@ -38,7 +38,10 @@ ATOM's KV allocation bound (`_kv`), whose name the point records, the same on
 every copy; an object is rebuilt from its class
 and state as the capture's replay rebuilds one, its tensors built as any other
 argument's, its activations fresh on every copy. A leaf whose operator cannot
-run so refuses by name.
+run so refuses by name. On one GPU at a
+DP-attention layout, the runner is one DP rank's own, TP 1 and DP 1, the
+graphs read and the keys written keep the layout, and a collective leaf
+refuses: it is measured across the layout's ranks.
 A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
 
@@ -203,10 +206,13 @@ def main(argv: list[str]) -> None:
     engine = EngineArgs.add_cli_args(argparse.ArgumentParser(prog=f"{PROG} --"))
     engine = engine.parse_args(argv[cut + 1 :])
     world = engine.tensor_parallel_size * engine.data_parallel_size
-    if world != len(args.gpu):  # DP attention makes each TP rank a DP rank
+    # DP attention makes each TP rank a DP rank, and one GPU can run one alone
+    alone = engine.enable_dp_attention and len(args.gpu) == 1
+    if world != len(args.gpu) and not alone:
         raise ValueError(
             f"--gpu names {len(args.gpu)} GPUs and ATOM's arguments resolve "
-            f"{world} ranks; the op bench runs one on each"
+            f"{world} ranks; the op bench runs one on each, or one DP-attention "
+            "rank on one GPU"
         )
     os.environ["HIP_VISIBLE_DEVICES"] = hip_visible(args.gpu)
     kfd_pid()  # before atom_config opens a GPU, so quiet leaves this process out
@@ -369,7 +375,7 @@ def measure(config, todo, llc: int, rank: int = 0) -> list[dict]:
         group = ranks.cpu_group()
         if journal and group is not None:
             journal += f".{torch.distributed.get_rank()}"
-        stub, rule, got = Stub(runner, llc, journal), ReplayRule(config), []
+        stub, rule, got = Stub(runner, llc, journal), ReplayRule(runner.config), []
         todo = ranks.union(todo, group)
         with torch.inference_mode():
             for shape, context, found in todo:
@@ -386,7 +392,9 @@ def _runner(config, rank: int):
     on the device and then freed for the weights each leaf builds; the runner
     attributes the allocation set are in its `kv_held`; and, when the runner
     defers its output, one sampled-id handoff to the host on ATOM's copy
-    stream, as ATOM's postprocess makes one after every forward."""
+    stream, as ATOM's postprocess makes one after every forward. One DP rank
+    of several run alone is built as ATOM's simulated DP attention builds it:
+    DP 1, its experts cut as across the ranks."""
     from torch.distributed import TCPStore
 
     from atom.compass.bench.ranks import agreed, cpu_group
@@ -403,6 +411,13 @@ def _runner(config, rank: int):
 
     pc, store = config.parallel_config, None
     if not pc._managed_distributed_store:  # one rank: the store is its own
+        if pc.data_parallel_size > 1:
+            # ponytail: ATOM's top-k buffers then hold one rank's batched
+            # tokens, not the rows the layout gathers: a leaf past them refuses
+            config = copy.deepcopy(config)
+            config.dp_logical_size = pc.data_parallel_size
+            pc = config.parallel_config
+            pc.data_parallel_size = pc.data_parallel_size_local = 1
         store = TCPStore(
             pc.data_parallel_master_ip,
             pc.data_parallel_base_port,
@@ -436,12 +451,15 @@ def _runner(config, rank: int):
 
 class Stub:
     """The leaves of a point timed beside ATOM's runner, on the forward context
-    and live metadata ATOM prepared for each placement of its batch."""
+    and live metadata ATOM prepared for each placement of its batch. `alone`
+    is the layout's ranks when the runner runs one of them by itself, and then
+    a collective leaf refuses."""
 
     def __init__(self, runner, llc: int, journal=None) -> None:
         from atom.model_engine.kv_block import STATE_SLOT_CLASS
 
         self.runner, self.llc, self.journal = runner, llc, journal
+        self.alone = getattr(runner.config, "dp_logical_size", 0)
         self.slots = runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
         self.built, self.leaves, self.placed = {}, {}, []
         self.cold_copies, self.clones, self.kv = {}, {}, {}
@@ -454,12 +472,16 @@ class Stub:
                 if hasattr(m, "global_num_experts")
             }
         )
-        # ATOM's top-k ids buffer when its MoE layers fuse shared experts into
-        # top-k (`init_aiter_topK_meta_data`): past top-k, the shared experts'
-        # ids, under EP one more, and the fake expert's on rows another rank owns
+        # ATOM's top-k weights and ids buffers when its MoE layers fuse shared
+        # experts into top-k (`init_aiter_topK_meta_data`), live metadata a
+        # leaf may read: past top-k, the shared experts' ids, under EP one
+        # more, and the fake expert's on rows another rank owns
         topk = sys.modules.get("atom.model_ops.topK")
         meta = getattr(topk, "aiter_topK_meta_data", None)
-        self.shared = meta[1] if meta and self.moe else None
+        self.topk = dict(
+            zip(("topk_weights", "topk_ids"), meta if meta and self.moe else ())
+        )
+        self.shared = self.topk.get("topk_ids")
         self.loads = []
 
     def _prepare(self, batch) -> None:
@@ -471,7 +493,7 @@ class Stub:
         self.runner._gate_staging_reuse()
         input_ids = self.runner.prepare_model(batch)[0]
         self.runner._mark_staging_h2d_enqueued()
-        fc, live = get_forward_context(), {"input_ids": input_ids}
+        fc, live = get_forward_context(), {"input_ids": input_ids, **self.topk}
         for name, buffer in self.runner.forward_vars.items():
             live[name] = getattr(buffer, "gpu", buffer)
         for owner in (fc.attn_metadata, fc.context):
@@ -613,6 +635,11 @@ class Stub:
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
 
+        if self.alone and exchange(op):
+            raise ValueError(
+                f"a collective over the layout's {self.alone} ranks, measured "
+                "across them, not on a runner that runs one alone"
+            )
         fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
         self.loads, self.built = [], {}
         with refused_together():
@@ -639,7 +666,7 @@ class Stub:
                     self._copy(op, sig, instances, c, calls[c % m]) for c in range(m, n)
                 ]
                 for c in range(n, min(k, max([n, *held]))):
-                    calls.append(self._reweigh(op, calls[c % n], c))
+                    calls.append(self._reweigh(op, sig, calls[c % n], c))
             n = len(calls)
             cycle = [calls[i % n] for i in range(k)]
             cold = _replay(fn, cycle)
@@ -676,7 +703,7 @@ class Stub:
                 return [
                     build(f"{path}.{i}", v, old and old[i]) for i, v in enumerate(value)
                 ]
-            if isinstance(value, dict) and self._routed(value):
+            if isinstance(value, dict) and self._routed(value, sig, path):
                 return self._route(value, c)
             if isinstance(value, dict) and value.get("role") == "weight":
                 # each cache-sized copy takes a weight of its own, as it does activations
@@ -713,15 +740,18 @@ class Stub:
         args = op["args"].items()
         return {s: build(s, v, like[0][s] if like else None) for s, v in args}, snap
 
-    def _routed(self, spec) -> bool:
-        """Whether `spec` is a router's top-k expert ids: an integer activation,
-        a row per token, a column per expert an MoE layer of the model takes,
-        or per column of ATOM's ids buffer with its fused shared experts."""
+    def _routed(self, spec, sig, path) -> bool:
+        """Whether `spec` at `sig`'s `path` is a router's top-k expert ids: an
+        integer activation, or a metadata view `_meta` bound to ATOM's ids
+        buffer, a row per token, a column per expert an MoE layer of the model
+        takes, or per column of ATOM's ids buffer with its fused shared
+        experts."""
         widths = {k for _, k in self.moe}
         if self.shared is not None:
             widths.add(self.shared.shape[1])
+        bound = self.placed[0][1].get((sig, path), ("",))[0]
         return (
-            spec.get("role") == "activation"
+            (spec.get("role") == "activation" or bound == "topk_ids")
             and len(spec["shape"]) == 2
             and not _dtype(spec["dtype"]).is_floating_point
             and spec["shape"][1] in widths
@@ -749,22 +779,25 @@ class Stub:
             out[:, k:] = self.shared[: len(out), k:]
         return out
 
-    def _reweigh(self, op, like, c):
+    def _reweigh(self, op, sig, like, c):
         """Copy `like` of `op`'s call with the c-th weight of each weight
         argument's spec and expert ids of its own, its other arguments and
         forward context shared."""
 
-        def build(value, old):
+        def build(path, value, old):
             if isinstance(value, list):
-                return [build(v, o) for v, o in zip(value, old)]
+                return [
+                    build(f"{path}.{i}", v, o)
+                    for i, (v, o) in enumerate(zip(value, old))
+                ]
             if isinstance(value, dict) and value.get("role") == "weight":
                 return self._weight(value, c, op["occurrences"])
-            if isinstance(value, dict) and self._routed(value):
+            if isinstance(value, dict) and self._routed(value, sig, path):
                 return self._route(value, c)
             return old
 
         kwargs, snap = like
-        return {s: build(v, kwargs[s]) for s, v in op["args"].items()}, snap
+        return {s: build(s, v, kwargs[s]) for s, v in op["args"].items()}, snap
 
     def _tensor(self, spec, meta, fresh):
         role = spec["role"]

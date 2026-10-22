@@ -225,15 +225,17 @@ one symbolic graph per structure. Nothing is allocated on a GPU and no kernel ru
 is what makes this phase schedulable anywhere, and what makes it the one phase that may
 also run lazily inside a simulated run (doc `02`).
 
-Under DP a capture runs one rank. A prefill shape also carries G, the rows the step's
-MoE gathers over the DP group, its default `dp x T`; a capture gives the peers G less
-this rank's T, split evenly, and a record's steps give each prefill its line's
-`moe_rows`. Revised 2026-10-20 by the owner's ruling on
+Under DP a capture runs one rank. A shape also carries G, the rows the step's MoE
+gathers over the DP group, its default `dp x T`; a capture gives the peers G less this
+rank's T, split evenly, and a record's steps give each shape its line's `moe_rows`. A
+decode gathers other than its rung's default only beside a prefilling peer, which turns
+ATOM's MoE to the variable-length gather, so at G a capture's first peer prefills.
+Revised 2026-10-20 by the owner's ruling on
 [#1731](https://github.com/jgong5/ATOM/issues/1731#issuecomment-6284509620): a
 data-parallel graph is keyed by its gathered rows, and the op-level backend reads a DP
 step, and each two-batch-overlap micro-batch, at (T, B, G), refused only when no graph is
-captured there. A decode shape carries no G: a balanced DP decode gathers its rung's
-default.
+captured there; a decode's G since
+[#1802](https://github.com/jgong5/ATOM/issues/1802), 2026-10-22.
 
 | | |
 |---|---|

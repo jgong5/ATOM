@@ -51,6 +51,7 @@ STORED = [
     Shape("prefill", 3, 1, 15),
     Shape("prefill", 4, 1, 12),
     Shape("decode", 4, 4),
+    Shape("decode", 1, 1, 27),
 ]
 
 
@@ -140,6 +141,16 @@ def test_a_balanced_decode_prices_from_its_rung_s_graph(backend):
     assert cost.terms[0].provenance.detail.endswith("decode T=4 B=4 G=32")
 
 
+def test_a_decode_beside_a_prefilling_peer_prices_from_the_graph_at_its_gathered_rows(
+    backend,
+):
+    # Rank 1 prefills 20 tokens; the other seven decode one each.
+    cost = backend.price(view(decode(1), [1, 20, 1, 1, 1, 1, 1, 1]))
+
+    assert by_name(cost) == {"op.aiter.gemm_a16w16.default": gemms(27)}
+    assert cost.terms[0].provenance.detail.endswith("decode T=1 B=1 G=27")
+
+
 @pytest.mark.parametrize(
     "counts,split,named",
     [
@@ -183,13 +194,23 @@ def test_a_population_names_a_dp_prefill_s_rows_off_their_default(tmp_path):
     ranks += [([[1, 9, True]] * 2, 6)]
     record = _record(tmp_path, ranks)
 
-    # Four ranks: 4 x 8 rows is the default; a decode states no rows.
+    # Four ranks: 4 x 8 rows is the default, 4 x 2 a decode's.
     assert sorted(map(str, population_shapes([record]))) == [
-        "decode B=2",
+        "decode B=2 G=6",
         "prefill T=5 B=1 G=27",
         "prefill T=7 B=1 G=27",
         "prefill T=8 B=1",
     ]
+
+
+def test_a_population_s_decode_at_its_default_names_no_rows(tmp_path):
+    # Two ranks, each two rows verifying one draft: 2 x 2 x 2 rows.
+    drafted = _record(tmp_path / "drafted", [([[2, 9, True]] * 2, 8)] * 2)
+    # Two ranks, each two rows and no drafter: 2 x 2 rows.
+    plain = _record(tmp_path / "plain", [([[1, 9, True]] * 2, 4)] * 2)
+
+    shapes = population_shapes([drafted, plain])
+    assert list(map(str, shapes)) == ["decode B=2"] * 4
 
 
 @pytest.mark.parametrize("tbo", [False, True], ids=["whole", "tbo"])
@@ -223,6 +244,21 @@ def test_a_population_s_micro_batch_is_traced_as_one_forward(
     assert '"enable_tbo":true' in graph["structure"]
 
 
+def test_a_tbo_population_splits_a_prefill_and_names_a_decode_s_rows(tmp_path):
+    # Step 1 splits as above; at step 2 rank 0 decodes 2 rows, rank 1 3.
+    ranks = [([[9000, 9000, False]], 9100), ([[100, 100, False]], 9100)]
+    record = _record(tmp_path, ranks)
+    for r, rows in enumerate([[[1, 9, True]] * 2, [[1, 9, True]] * 3]):
+        line = {"step": 2, "is_dummy_run": False, "rung": None, "rows": rows}
+        with open(tmp_path / "steps" / f"dp{r}.jsonl", "a") as f:
+            f.write(json.dumps(dict(line, moe_rows=5)) + "\n")
+
+    shapes = sorted(map(str, population_shapes([record], tbo=True)))
+
+    halves = ["prefill T=4500 B=1 G=4550"] * 2 + ["prefill T=50 B=1 G=4550"] * 2
+    assert shapes == ["decode B=2 G=5", "decode B=3 G=5"] + halves
+
+
 def test_a_prefill_gathers_at_least_its_own_rows():
     with pytest.raises(ValueError, match="the gather holds this rank's"):
         prefill_shape(7, 1, 6)
@@ -253,6 +289,31 @@ def test_a_capture_gives_the_peers_the_rest_of_the_gathered_rows(ep, tmp_path_fa
             assert names == [f"{MOE}:all_gatherv", f"{MOE}:reduce_scatterv"]
             assert _rows(exchanged[1]) == (767, 64)
         assert _rows(exchanged[0]) == (64, 767)
+
+
+@pytest.mark.parametrize("ep", [False, True], ids=["ep_off", "ep8"])
+def test_a_decode_at_gathered_rows_has_a_prefilling_peer(ep, tmp_path_factory):
+    # Rank 0 decodes one token while a peer prefills: the MoE gathers 70 rows.
+    ranks = [([[1, 9, True]], 70)] + [(None, 70)] * (DP - 1)
+    record = _record(tmp_path_factory.mktemp("record"), ranks)
+    graphs = capture(tmp_path_factory, f"--population {record}" + DPA_TP8 + EP8 * ep)
+    graph, _ = graphs["decode B=1 G=70"]
+
+    for layer in _decoder(graph):
+        exchanged = [op for op in layer if op["kind"] == "declared"]
+        if ep:
+            assert [op["op"] for op in exchanged] == [
+                f"{MORI}.dispatch",
+                f"{MORI}.combine",
+            ]
+        else:
+            # The variable-length gather, not every rank padded to one height.
+            assert [op["op"] for op in exchanged] == [
+                f"{MOE}:all_gatherv",
+                f"{MOE}:reduce_scatterv",
+            ]
+            assert _rows(exchanged[1]) == (70, 1)
+        assert _rows(exchanged[0]) == (1, 70)
 
 
 @pytest.mark.parametrize("call", ["dispatch", "combine"])
