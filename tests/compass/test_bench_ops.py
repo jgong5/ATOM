@@ -546,18 +546,67 @@ def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placeme
 
     # 32 bytes of q, and per state slot of the two rows 16 of kv and 32 of
     # state: 128 a call, 16 copies past twice 1000 bytes, each its own
-    # placement, of which 6 slots hold 3 of two rows.
+    # placement, which the pool's 64 blocks hold; 6 slots hold 3 of two rows,
+    # and the placements past them take those slots again.
     record = got["x"]
     assert record["metadata"] == {"kv": "v4_unified_kv.1", "st": "v4_state"}
-    assert (record["copies"], record["placements"]) == (16, 3)
-    assert runner.batches == [(4 * p, 2 * p) for p in range(3)]
+    assert (record["copies"], record["placements"]) == (16, 16)
+    assert runner.batches == [(4 * p, 2 * p % 6) for p in range(16)]
     for c, (kwargs, snap) in enumerate(graphs[0][:16]):
         assert kwargs["kv"].untyped_storage().data_ptr() == plane.data_ptr()
         assert kwargs["kv"].storage_offset() == 8
         assert kwargs["kv"].shape == (60, 1, 1, 4)
         assert kwargs["st"].data_ptr() == state.data_ptr()
-        assert set(snap.attn_metadata.block_tables.flatten().tolist()) == {4 * (c % 3)}
+        assert set(snap.attn_metadata.block_tables.flatten().tolist()) == {4 * c}
     assert "ATOM's live KV has no room for kv [500, 4]" in got["y"]["refused"]
+
+
+def test_a_plane_argument_is_sized_by_the_rows_of_the_batch_s_blocks(monkeypatch):
+    # DeepSeek-V4's decode attention states its layer's window and compress
+    # ratio and reads a plane indexed by rows, beside a model's state slots;
+    # a leaf stating the ratio alone writes a row per state slot; one stating
+    # an indexer's top-k reads at most that many rows a request.
+    runner = _Runner()
+    runner.pool_plan = SimpleNamespace(entries={"state": 7})
+    runner.config.kv_cache_block_size = 16
+    runner.kv_held = {"v4_unified_kv": [torch.zeros(100, 4)]}
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    leaf = _leaf(
+        "aiter.decode", ("q", _t([2, 4], "activation")), ("kv", _t([60, 4], "kv"))
+    )
+    found = ops.leaves(
+        _graph(
+            dataclasses.replace(
+                leaf, stated=(("window_size", 8), ("compress_ratio", 4))
+            ),
+            dataclasses.replace(
+                leaf, name="aiter.write", stated=(("compress_ratio", 4),)
+            ),
+            dataclasses.replace(
+                leaf,
+                name="aiter.sparse",
+                stated=(("window_size", 8), ("compress_ratio", 4), ("index_topk", 3)),
+            ),
+            layers=1,
+        )["region"]
+    )
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    got = {
+        r["op"]: r for r in ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+    }
+
+    # Two rows of 20 tokens hold 4 blocks of 16, 16 rows at ratio 4: 256 bytes
+    # of kv and 32 of q a call, 7 copies past twice 1000 bytes. Per slot, 32
+    # of kv: 32 copies, each its own placement, of which the pool holds 16;
+    # 7 slots hold 3 of two rows, the rest take the first 6 again. Past 4 x 3
+    # tokens a request reads 3 of its 5 rows: 96 bytes of kv, 16 copies.
+    assert got["aiter.decode"]["footprint_bytes"] == 7 * 288
+    assert got["aiter.write"]["footprint_bytes"] == 32 * 64
+    assert got["aiter.sparse"]["footprint_bytes"] == 16 * 128
+    assert got["aiter.decode"]["placements"] == 16
+    assert runner.batches == [(4 * p, 2 * p % 6) for p in range(16)]
 
 
 def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
@@ -1227,6 +1276,26 @@ def test_a_device_argument_is_the_rank_s_own_device():
     kwargs, _ = stub._copy(op, "sig", [{}], 0)
 
     assert kwargs == {**args, "dtype": torch.float32, "device": _Runner.device}
+
+
+@pytest.mark.parametrize("splits, room", [(1, 2 * 2 * 4 * 8), (5, 2 * 4 * 8)])
+def test_v4_nm_output_at_one_kv_split_has_room_for_the_fp32_stride(splits, room):
+    # At one split aiter's kernel writes its BF16 output at the FP32 split
+    # stride; an exact buffer let it write past the end and kill the process.
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    out = {"shape": [2, 4, 8], "dtype": "torch.bfloat16", "stride": [32, 8, 1]}
+    args = {"output": out | {"role": "activation"}, "num_kv_splits": splits}
+    op = {"op": "aiter.mla:mla_decode_fwd_v4_nm", "args": args}
+
+    built = stub._copy(op, "sig", [{}], 0)[0]["output"]
+
+    assert (built.shape, built.stride(), built.storage_offset()) == (
+        (2, 4, 8),
+        (32, 8, 1),
+        0,
+    )
+    assert built.dtype == torch.bfloat16 and ops._room(built) == room
 
 
 def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(

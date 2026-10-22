@@ -150,6 +150,20 @@ def test_a_step_law_refuses_a_run_on_other_experts_naming_the_field(
     assert named in str(e.value)
 
 
+def test_a_step_law_fitted_with_bounded_replay_refuses_a_run_without_it(
+    monkeypatch, tmp_path
+):
+    on = deployment(tmp_path, enable_decoder_swa_bounded_replay=True)
+    run = build(tmp_path, "--step-linear", step_linear(tmp_path, on).key.token())
+    off = deployment(tmp_path, enable_decoder_swa_bounded_replay=False)
+
+    with pytest.raises(ValueError, match="fitted under another engine config") as e:
+        install(tmp_path, monkeypatch, run, off)
+    assert "enable_decoder_swa_bounded_replay None in the law and False here" in str(
+        e.value
+    )
+
+
 def test_atom_s_moe_defaults_key_the_fields_an_existing_law_states(tmp_path):
     law = json.loads(LAW.read_text())["engine_config"]
     default = keyed(deployment(tmp_path, moe_backend="standard").config)

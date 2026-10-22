@@ -75,7 +75,7 @@ from atom.compass.clock import (
 )
 from atom.compass.run import ENV as RUN_ENV
 from atom.utils.clock import LPRuntime, Straggler
-from compass_harness import ADDRESS_ENV, fingerprint
+from compass_harness import ADDRESS_ENV, fingerprint, traffic_lp
 
 #: The run file's table keys, as the deployment writes them.
 RUN = {"admission_path": "serving", "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
@@ -655,11 +655,12 @@ def test_a_1p1d_run_file_sends_to_frontend_p_and_reads_from_frontend_d(
     assert unreleased == {("frontend-D->traffic:stream", 0): 1.0}
 
 
-def test_behind_the_router_lp_requests_and_the_stream_cross_it_and_cancels_stay_off(
+def test_behind_the_router_lp_requests_cancels_and_the_stream_cross_it(
     tmp_path, monkeypatch
 ):
     """With a router LP the traffic LP sends to it and reads the stream from it,
-    and a cancel, which the router would refuse, is never stamped."""
+    and aiperf's cancel of a request open at the grace deadline, 2.0, is
+    stamped to it on the request's channel, for the request's worker."""
     pd = {"router_s": 2.0**-12, "kv_write_req_s": 2.0**-10, "router_in_s": 2.0**-14}
     endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
     server = clock_transport.serve(
@@ -671,22 +672,60 @@ def test_behind_the_router_lp_requests_and_the_stream_cross_it_and_cancels_stay_
     )
     monkeypatch.setenv(RUN_ENV, str(run_file))
     monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / "lp"))
+    sent = []
+
+    class Runtime(ScriptedRuntime):
+        def stamp_send(self, ch):
+            sent.append(ch)
+            return super().stamp_send(ch)
+
+    monkeypatch.setattr(
+        traffic_lp,
+        "LPRuntime",
+        lambda *_: Runtime([(2.0, set())], "router->traffic:stream"),
+    )
 
     async def main():
         traffic = TrafficLP.from_env()
+        stamps, reports = addresses(str(tmp_path / "lp"))
+        sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
+        sub.connect(stamps)
+        sub.subscribe(b"")
+        await traffic.subscribed(1)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(reports)
+
+        async def on_return(worker_id, ret):
+            pass
+
+        held = traffic.hold(on_return)
+
+        async def worker():
+            published = [await sub.recv_pyobj() for _ in range(2)]
+            push.send_pyobj((_key(0),))
+            await held("w", SimpleNamespace(credit=_credit(0), error=None))
+            return published
+
+        worker = asyncio.ensure_future(worker())
+        traffic.send(_key(0))
+        while traffic.now() < 2.0:
+            await traffic.wait(2.0)
+        await traffic.cancel()
+        traffic.finish()
         try:
-            return traffic.http, traffic.stream, traffic.cancels
+            await asyncio.wait_for(traffic.done, 5)
         finally:
-            for task in (*traffic._tasks, traffic.done):
-                task.cancel()
-            traffic._pub.close(linger=0)
-            traffic._pull.close(linger=0)
+            push.close(linger=0)
+            sub.close(linger=0)
+        return traffic.http, traffic.stream, await worker
 
     try:
-        got = _run(main())
+        http, stream, published = _run(main())
     finally:
         server.close()
-    assert got == ("traffic->router:http", "router->traffic:stream", False)
+    assert (http, stream) == ("traffic->router:http", "router->traffic:stream")
+    assert sent == [http, http]
+    assert published[1] == (_key(0), 2.0 + ADMIT, 1, "cancel")
 
 
 def test_a_1p1d_hold_settles_the_frontend_d_stream(tmp_path):

@@ -22,7 +22,8 @@ definition and the residual's sources, which loading does not read.
 Its publisher states the readings `conditions` takes. The engine-config reading
 is `keyed`, as JSON: the ladder the runner replays (none under
 ``enforce_eager``), the KV block size and dtype, the quantization, the TP and
-DP widths, DP attention, expert parallelism, TBO, the MoE backend and EPLB when
+DP widths, DP attention, expert parallelism, TBO, the MoE backend, EPLB and
+DeepSeek-V4.1 decoder SWA bounded replay when
 off ATOM's default, the performance environment and, under speculation, its
 method and draft width. Loading refuses, naming what differs:
 
@@ -73,7 +74,7 @@ from atom.compass.runner.overrides import schedulable_ladder
 MEMBER = ("params", Topology().ranks()[0], "json")
 #: Engine fields keyed only off ATOM's default, so keys written before they
 #: were read do not move.
-OFF_DEFAULT = ("moe_backend", "eplb_enable")
+OFF_DEFAULT = ("moe_backend", "eplb_enable", "enable_decoder_swa_bounded_replay")
 
 
 def keyed(config, ladder: bool = True) -> dict:

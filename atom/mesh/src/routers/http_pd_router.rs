@@ -1148,6 +1148,10 @@ impl PDRouter {
         let relayed = crate::compass_router::relay(&mut prefill_body).await;
         // P has completed its work; D's output stream must not keep P loaded.
         drop(prefill_guard);
+        if relayed.as_ref().is_some_and(|turn| turn.cancelled) {
+            drop(decode_guard);
+            return error::bad_request("cancelled", "Cancelled before its relay");
+        }
         drop(relayed);
 
         let mut kv_params = match prefill_body.get("kv_transfer_params").cloned() {
