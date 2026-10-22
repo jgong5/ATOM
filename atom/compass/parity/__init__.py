@@ -45,9 +45,10 @@ digest of its whole prompt as its prefill windows carry it, taken when its final
 chunk is scheduled, so it does not move with chunking. A line records request
 ids and names each request whose final chunk it holds; `read` puts the keys in.
 A named request's response id follows its key if it has one (`carry_response_ids`).
-A decode instance's request arrives with its KV and has no prompt to digest:
-its first step names it, its response id its key. A 1P1D deployment's two
-records join on prefill's request id (`transfers`).
+A request in a batch marking no final chunk (a decode instance's, its KV
+received, or a RapidServe engine's) has no digest: its first step names it,
+its request id its key, so its response id still follows it. A 1P1D
+deployment's two records join on prefill's request id (`transfers`).
 Prefix caching is not covered: the worker never sees a cached prefix, so parity
 runs need caching off or the same cache hits in both runs. Requests of one
 record with one prompt are named in the order their final chunks are scheduled:
@@ -146,8 +147,8 @@ class StepRecord:
         `run_model` under `forward_mode`; without one it is `forward_mode`'s,
         which runs the DP collective itself. Each prefill window is added to its request's
         digest; the line holding a request's final chunk names it under
-        `named`, as does the first line holding a request with no prefill
-        window, under its response id. A dummy batch is fabricated for DP
+        `named`, as does the first line holding a request of a batch marking
+        no final chunk, under its request id. A dummy batch is fabricated for DP
         synchronisation and names no request, so its `batch` is empty; its
         `rows` are what it runs.
 
@@ -174,11 +175,14 @@ class StepRecord:
                 if req_id in self.keys:
                     continue
                 if batch.is_final_chunk is None:
-                    # Its KV arrived from a prefill instance: no prompt to digest.
+                    # No final chunk marked (a decode instance's request, or any
+                    # request of a RapidServe engine): no prompt digest, so the
+                    # key is its request id, the same in another run of the
+                    # workload, unlike its response id.
                     response_id = batch.external_request_ids[i]
                     if response_id is not None:
-                        self.keys[req_id] = response_id
-                        named.append([req_id, response_id, response_id])
+                        self.keys[req_id] = req_id
+                        named.append([req_id, req_id, response_id])
                     continue
                 start = int(batch.num_cached_tokens[i])
                 if start == 0:  # a preempted prefill restarts its prompt

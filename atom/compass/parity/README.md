@@ -11,15 +11,8 @@ which holds the ladder the runner replays; the scheduler's bounds
 A simulated run also writes `dp<r>.cost.jsonl`, a line per step saying what
 its charge was made of (`_group_step_seconds` in
 `atom/compass/runner/overrides.py` says what each line holds).
-
-A record names each request by a key (`__init__.py` says how): a digest of
-its prompt, or on a 1P1D decode instance, whose requests arrive with their KV,
-its response id. `read` gives a step naming requests with response ids those
-under `response_ids` and their request ids under `request_ids`, by key. A decode
-instance's directory also holds `transfers.jsonl`, a line per request
-`{response_id, remote_dp_rank, transfer_id}`: the prefill request its KV came
-from is `transfer_id` on prefill DP rank `remote_dp_rank`, so `transfers`
-joins prefill's `request_ids` to decode's response ids.
+A 1P1D decode instance also writes `transfers.jsonl` (`transfers` in
+`__init__.py` says what it joins).
 
 Compare two records with
 
