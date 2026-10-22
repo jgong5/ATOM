@@ -282,9 +282,10 @@ by its contract's spec and stride; a weight argument built from its contract, ra
 its spec, copy c taking the c-th of as many such tensors as the leaf occurs in the step,
 or as it has cold copies when those are more ([#1902](https://github.com/jgong5/ATOM/issues/1902));
 and metadata, forward context, KV and module tensors from the runner. Before the first
-point the runner makes one sampled-id handoff to the host on its token processor's copy
-stream, as `ModelRunner.postprocess` does after every forward: in a runner that had made
-none, Qwen3.8-27B's GDN decode leaf read 5% under one that had (#1902).
+point a runner that defers its output (`tokenIDProcessor.is_deferred_out`) makes one
+sampled-id handoff to the host on its token processor's copy stream, as
+`ModelRunner.postprocess` does after every forward of such a runner: in a runner that
+had made none, Qwen3.8-27B's GDN decode leaf read 5% under one that had (#1902).
 `_init_weight_params_on_meta` makes every parameter meta as it is registered and leaves
 buffers and other tensor attributes on the device (`02` D10.1), so such a tensor a leaf
 reads through a module reference is the model's own. A module a leaf references, by its
