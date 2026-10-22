@@ -2263,7 +2263,8 @@ own process with the policy code untouched. It is (owner ruling on
   (`PDRouter::dispatch_atom_relay_internal`) and each decode stream event
   (`PDRouter::create_streaming_response`) wait until released, and are handled one at a
   time in (arrival, channel, seq) order. Each sends exactly one message on, stamped at
-  its arrival plus the hop out's lookahead, which keeps every path's total. A request is
+  its arrival plus the hop out's lookahead, which keeps every path's total, except a
+  prefill response read after its request's cancel (below), which sends nothing. A request is
   handled once its pair holds load, a prefill response once prefill's load is dropped,
   and a stream's last event once decode's load is dropped. The router prices no work and
   waits with NER only.
@@ -2272,8 +2273,24 @@ own process with the policy code untouched. It is (owner ruling on
   seeded RNG and a fixed hasher. Without the endpoint nothing changes. `power_of_two` is
   refused by name when it is built: its loads come from each worker's `/get_load`,
   polled on a wall-clock interval (`LoadMonitor`), which no channel carries (#1134).
-- **Unchanged.** Cancels stay off behind the router; a clock error ends the router
-  process.
+- **Cancels** (#1966). aiperf's hang-up at the end of its duration takes the
+  single-server cancel's path (#884), hop by hop. The traffic LP stamps it on
+  `traffic->router:http` as a request whose body names the cancelled request's seq
+  (`carriers.py::cancel_body`). The router LP answers it 204 at its arrival and sends it
+  on to where the request is then, naming the request's seq on that channel: on
+  `router->frontend-P:http` before the request's relay is handled, on
+  `router->frontend-D:relay` after, its stamp in the body's `kv_transfer_params`. A
+  request that has ended, or was never placed, is nowhere, and its cancel sends nothing
+  on. frontend-D's `HttpChannel` reads a cancel on `relay` as frontend-P's does on
+  `http`: the request it names reads `http.disconnect` at the cancel's arrival.
+  No hop hands on its client's socket closing. The router handles each request apart
+  from its client connection, so a hang-up drops only the response forwarding: every
+  message the clock releases for a cancelled request is still read, its stream events
+  are sent on to traffic, and a prefill response read after the cancel is dropped,
+  with no decode request. The clock owes that response no send: an LP's `N` is bounded
+  by its own target and the messages still to reach it, never by a send it has yet to
+  make (`authority.py`), as a frontend's 204 to a cancel already shows.
+- **Unchanged.** A clock error ends the router process.
 - **Periodic tasks.** Under the LP, `PeriodicTask` (cache_aware's tree eviction) starts
   no thread: the task's next deadline is the daemon deadline of each NER, and it runs
   before any message arriving at or after that deadline (#1093).
