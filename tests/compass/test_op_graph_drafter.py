@@ -18,23 +18,30 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+import torch
+from test_artifact_store import CONDITIONS, GATES, stanza
 from test_backend_step_linear import _installed, view
 from test_capture_ir import TREE, _ops, _record
+from test_dp_step_max import runner
 from test_memory_readings import WORKER
-from test_op_graph import MIDDLE, _engine, g
+from test_op_graph import FLAT, GEMM, MIDDLE, _engine, by_name, g
+from test_op_graph_arch import ENGINE
 from test_work import SPEC
 
-from atom.compass.artifacts import ArtifactStore, Kind, Topology
+from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.work import gemm, price
 from atom.compass.capture import population_shapes
+from atom.compass.capture.forward import structure
 from atom.compass.run import _op_graphs
+from atom.compass.runner import projection
 from atom.compass.spec import MachineSpec
 
 CONFIG = pathlib.Path(__file__).with_name("qwen3_5_35b_a3b_fp8_config.json")
+CONFIG_ARCHITECTURES = json.loads(CONFIG.read_text())["architectures"]
 MACHINE = TREE / "scripts" / "compass" / "machines" / "mi308x-hjbog39.json"
 ATTENTION = "aiter.unified_attention_with_output_base.default"
 SAMPLER = "atom.model_ops.rejection_sampler:rejection_sample"
@@ -46,16 +53,26 @@ VERIFY = view((2, 90, True), (2, 9, True), rung=2)
 _CAPTURES: dict = {}
 
 
-def capture(drafts, tmp_path_factory):
-    """`compass trace ops --width 2` under an MTP drafter of `drafts` tokens:
-    the capture's directory and its graphs by structure."""
-    if drafts in _CAPTURES:
-        return _CAPTURES[drafts]
+def capture(drafts, tmp_path_factory, dp=1):
+    """`compass trace ops --width 2` under an MTP drafter of `drafts` tokens,
+    or at DP `dp` `--population` of a record whose every rank verifies 2 rows
+    at rung 2: the capture's directory and its graphs by structure."""
+    if (drafts, dp) in _CAPTURES:
+        return _CAPTURES[drafts, dp]
     root = tmp_path_factory.mktemp(f"mtp{drafts}")
     (root / "model").mkdir()
     (root / "model" / "config.json").write_bytes(CONFIG.read_bytes())
     argv = ["trace", "ops", "--model", str(root / "model"), "--width", "2"]
+    if dp > 1:
+        (root / "record").mkdir()
+        line = {"rows": [[drafts + 1, 90, True]] * 2, "rung": 2}
+        record = _record(root / "record", [line | {"moe_rows": dp * 2 * (drafts + 1)}])
+        steps = root / "record" / "steps"
+        for r in range(1, dp):
+            (steps / f"dp{r}.jsonl").write_bytes((steps / "dp0.jsonl").read_bytes())
+        argv[-2:] = ["--tp", str(dp), "--population", record]
     argv += ["--store", str(root / "store"), "--", "--method", "mtp"]
+    argv += ["--enable-dp-attention"] * (dp > 1)
     argv += ["--num-speculative-tokens", str(drafts)]
     done = subprocess.run(
         [
@@ -79,7 +96,7 @@ def capture(drafts, tmp_path_factory):
         entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
         graph = json.loads(entry.read_member("graph", rank, "json"))
         graphs[graph["structure"]] = graph
-    _CAPTURES[drafts] = root, graphs
+    _CAPTURES[drafts, dp] = root, graphs
     return root, graphs
 
 
@@ -199,3 +216,106 @@ def test_a_population_captures_a_verify_step_at_its_width(tmp_path):
     record = _record(tmp_path, [{"rows": [[2, 90, True]] * 2, "rung": 2}])
 
     assert list(map(str, population_shapes([record]))) == ["decode B=2"]
+
+
+# --- a data-parallel verify step ---------------------------------------------
+
+
+def dp_view(width, rung, dp):
+    """Rank 0's view of a decode of `width` rows, each verifying one draft, at
+    `rung`, every rank of `dp` alike, as `batch_view` builds it from the
+    step's mode."""
+    batch = SimpleNamespace(
+        total_seqs_num_prefill=0,
+        num_scheduled_tokens=[2] * width,
+        context_lens=[90] * width,
+        req_ids=list(range(width)),
+        produces_output=lambda: True,
+    )
+    r = runner(None, dp_size=dp)
+    r.drafter = SimpleNamespace(is_block_drafter=False)
+    counts = torch.tensor([2 * width] * dp)
+    mode = SimpleNamespace(
+        sync=SimpleNamespace(num_tokens_across_dp=counts, ub_tokens_across_dp=None),
+        running_tokens_are_unified=True,
+        running_tokens=2 * rung,
+        running_bs=rung,
+        use_cudagraph=True,
+    )
+    return projection.batch_view(batch, mode, r)
+
+
+def test_a_balanced_dp_verify_step_prices_from_its_population_s_graphs(
+    tmp_path_factory,
+):
+    root, graphs = capture(1, tmp_path_factory, dp=2)
+    [target] = [key for key in graphs if not key.endswith(" draft")]
+    drafter = graphs[f"{target} draft"]
+    config = SimpleNamespace(
+        model=str(root / "model"),
+        hf_config=SimpleNamespace(architectures=CONFIG_ARCHITECTURES),
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=2),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=1),
+        **{**_engine(drafter), "enable_dp_attention": True},
+    )
+    machine = MachineSpec.from_mapping(json.loads(MACHINE.read_text()))
+    lookup = _op_graphs(str(root / "store"), config, "gfx942")
+    step = dp_view(2, 2, dp=2)
+
+    cost = OpGraphBackend(machine, lookup, kv="bf16", dp=2, drafts=1).price(step)
+
+    assert cost.terms[0].provenance.detail.endswith("decode T=2 B=2 G=8")
+    assert cost.target_seconds > 0 and cost.draft_seconds > 0
+    # The drafter's first pass gathers every rank's verified tokens.
+    first = next(op for op in _ops(drafter["region"]) if op["op"].endswith("gatherv"))
+    assert sum(first["args"]["sizes"]) == step.draft_moe_rows == 8
+
+
+def test_a_padded_dp_verify_step_reads_its_drafter_at_the_drafter_s_rows(tmp_path):
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_text("{}")
+    config = SimpleNamespace(
+        model=str(tmp_path / "model"),
+        hf_config=SimpleNamespace(architectures=CONFIG_ARCHITECTURES),
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=8),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=1),
+        **ENGINE,
+    )
+    # 3 rows at rung 4: the target gathers every rank's 8 padded tokens, the
+    # drafter's first pass every rank's 6.
+    stored = {
+        ("decode B=4", False): g(4, 64, 64),
+        ("decode B=4", True): g(4096 * 64, 128, 128),
+        ("decode B=4 G=48", True): g(4096 * 48, 128, 128),
+    }
+    store, rank = ArtifactStore(str(tmp_path / "store")), Topology().ranks()[0]
+    for (shape, draft), region in stored.items():
+        at = structure(config, "decode", True, "gfx950", True, draft)
+        store.publish(
+            Key.of(Kind.OP_GRAPH, structure=at, shape=shape),
+            provenance=stanza("compass trace ops"),
+            topology=Topology(),
+            conditions=CONDITIONS,
+            gates=GATES,
+            members={
+                member_name("graph", rank, "json"): json.dumps(
+                    {"region": region}
+                ).encode()
+            },
+        )
+    lookup = _op_graphs(store.root, config, "gfx950")
+    backend = OpGraphBackend(SPEC, lookup, kv="bf16", dp=8, drafts=1, price_list=FLAT)
+    step = dp_view(3, 4, dp=8)
+
+    assert (step.moe_rows, step.draft_moe_rows) == (64, 48)
+    # The price list holds the target's GEMM at `decode B=4`, no rows named.
+    assert by_name(backend.price(step)) == {
+        f"op.{GEMM}.price_list": pytest.approx(7e-6),
+        f"draft op.{GEMM}": price(gemm(4096 * 48, 128, 128), SPEC),
+    }

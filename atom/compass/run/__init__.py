@@ -1513,12 +1513,14 @@ def _op_graphs(root: str, config, arch: str):
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
     dp = config.parallel_config.data_parallel_size
+    drafter = getattr(config, "speculative_config", None)
+    drafts = drafter.num_speculative_tokens if drafter else 0
 
     @functools.lru_cache(maxsize=64)
     def graph(
         phase: str, tokens: int, seqs: int, output=True, gathered=None, draft=False
     ) -> dict | str | None:
-        shape = str(Shape(phase, tokens, seqs, gathered).at(dp))
+        shape = str(Shape(phase, tokens, seqs, gathered).at(dp, drafts))
         at = structure(config, phase, True, arch, output, draft)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
         if not store.directory_for(key).exists():

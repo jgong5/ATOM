@@ -481,9 +481,11 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   `forward_done_event`. What precedes it is the target's graph, keyed as before: its
   engine config names the drafter's method and width; what follows is the drafter's, the
   same key plus `draft`. Sampling and the rejection sampler are the target's, as in the record.
-- **Priced apart.** The op-level backend prices the drafter's graph at the step's rows
-  and tags each of its terms `draft` (`draft op.<kind>`), so `StepCost.draft_seconds` is
-  the drafter's and `target_seconds` the target's.
+- **Priced apart.** The op-level backend prices the drafter's graph at the step's shape,
+  under DP at the rows the drafter's first pass gathers (`draft_moe_rows`: every rank's
+  verified tokens, unpadded), and tags each of its terms `draft` (`draft op.<kind>`), so
+  `StepCost.draft_seconds` is the drafter's and `target_seconds` the target's. A decode's
+  default G counts each row's drafts, `dp x width x (drafts + 1)` (`Shape.at`).
 - **Refused by name.** A middle chunk under a drafter: ATOM runs its draft-KV pass
   (`compute_draft_kv`) on a real step only, and a prefill shape is traced as a dummy run,
   so no graph holds that pass. A block drafter (DSpark): it writes its draft KV before
@@ -1083,7 +1085,8 @@ state the EP width ATOM built their handle for (`num_ep_ranks`). A capture runs
 one rank, so each exchange's rows are stated, every peer at this rank's shape but for
 its token count: the peers split evenly the rows the shape's MoE gathers, G, less this
 rank's, every peer at this rank's count when G is its default (`capture/peers.py`;
-`07` Phase 1a). A TBO step, two micro-batches interleaved, is refused by name until
+`07` Phase 1a). A drafter's pass all-reduces its own count: its first, the target's
+stream, takes the step's counts; a later one, a row a sequence, this rank's at every peer. A TBO step, two micro-batches interleaved, is refused by name until
 its graphs exist (#1581).
 
 DeepSeek-V4's `v4_attention_with_output` is opened the same way (#1678), its body run as
