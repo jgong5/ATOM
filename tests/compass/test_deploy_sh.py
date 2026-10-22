@@ -43,6 +43,8 @@ while not all(os.path.exists(f"{out}/{side}/run.json") for side in ("prefill", "
     if time.monotonic() > deadline:
         sys.exit(9)
     time.sleep(0.1)
+# A real authority summarises a while after both instances stop.
+time.sleep(2)
 open(out + "/summary.json", "w").write("{}")
 """
 INSTANCE = """\
