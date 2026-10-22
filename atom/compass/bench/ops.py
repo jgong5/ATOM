@@ -78,8 +78,8 @@ a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
 aside, are the point's kernel identity. When `ReplayRule` refuses a batch, its
 leaves refuse; an error in ATOM's preparation fails the run, naming the point.
-The points run in a process of their own on each GPU; one that dies ends
-every rank, keeps the points every rank finished, the point it was measuring
+The points run in a process of their own on each GPU, which dies when its
+device faulted (`_alive`); one that dies ends every rank, keeps the points every rank finished, the point it was measuring
 refuses, and new ones measure the rest; two in a row that die having finished
 no point fail the run.
 
@@ -631,6 +631,7 @@ class Stub:
                 record["footprint_bytes"] = min(n, record.get("copies", n)) * size
             except Exception as error:  # noqa: BLE001 - a refusal names what stopped it
                 record["refused"] = f"{type(error).__name__}: {error}"
+                _alive(self.runner.device)
             copies = record.get("copies", n)
             print(f"{shape}: {op['op']} over {copies} copies {names or ''}", flush=True)
             record |= {"instances": len(inst), "placements": len(self.placed)}
@@ -879,6 +880,18 @@ class Stub:
         return self.built[_spec_of(spec), c % count]
 
 
+def _alive(device) -> None:
+    """Ends this process when `device` faulted: the fault is sticky, so every
+    later call there fails, and a peer rank would wait on this one's next
+    collective until it times out. `_measured` refuses the leaf it died on."""
+    if device.type != "cuda":
+        return
+    try:
+        torch.cuda.synchronize(device)
+    except Exception:  # noqa: BLE001 - any error here is the device's
+        os._exit(1)
+
+
 def _routing(loads) -> dict:
     """The drawn copies' imbalance, recorded and not priced: each copy's
     experts that took a token, and the most tokens one expert took."""
@@ -958,9 +971,17 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
     """The live KV tensor a KV argument is a view of, and its name, picked as
     `_meta` picks among those whose layout past the first dimension's size
     is its own (`_layout`), when any is: the capture's pool sized that one;
-    or why none fits, and None."""
+    else among the last layers, `name.i`, of tensors stacked by layer whose
+    layer has that layout: ATOM passes a layer of DeepSeek-V4's compressor
+    state, and another field's base at this one's slot stride reaches past
+    the pool; or why none fits, and None."""
     want = _layout(spec["shape"], spec["stride"])
     own = {n: t for n, t in live.items() if _layout(t.shape, t.stride()) == want}
+    own = own or {
+        f"{n}.{len(t) - 1}": t[-1]
+        for n, t in live.items()
+        if t.dim() > 2 and len(t) and _layout(t[-1].shape, t[-1].stride()) == want
+    }
     try:
         return _meta(spec, slot, own or live, "KV")
     except ValueError as error:  # the leaf refuses, not the point

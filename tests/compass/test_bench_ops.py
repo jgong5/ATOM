@@ -629,6 +629,70 @@ def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placeme
     assert "ATOM's live KV has no room for kv [500, 4]" in got["y"]["refused"]
 
 
+def test_a_compressor_state_is_a_layer_of_its_own_field_and_every_slot_stays_in_it():
+    # DeepSeek-V4's compressor state: a field per compressor kind, each a
+    # `[layers, slots, rows, dim]` view strided by its plane's slot. The HCA
+    # state sits in the wide plane, the CSA indexer's in the narrow one after
+    # it, the tighter; the capture's pool held fewer slots.
+    from atom.model_ops.attentions.pool_layout.entry_arena import (
+        EntryField,
+        EntryMajorArena,
+    )
+
+    slots, f32 = 8, torch.float32
+    pool = torch.zeros(slots * (4096 + 1024), dtype=torch.uint8)
+    wide, narrow = pool[: slots * 4096], pool[slots * 4096 :]
+    hca = EntryMajorArena(
+        [EntryField("hca", 2, (4, 8), f32)], slots, "cpu", wide, slot_stride=4096
+    )
+    idx = EntryMajorArena(
+        [EntryField("idx", 2, (2, 4), f32)], slots, "cpu", narrow, slot_stride=1024
+    )
+    runner = SimpleNamespace(
+        kv_held={
+            "v4_hca_main_kv_state": hca.view("hca"),
+            "v4_csa_idx_kv_state": idx.view("idx"),
+        }
+    )
+    spec = {"shape": [2, 4, 8], "stride": [1024, 8, 1], "dtype": F32, "role": "kv"}
+
+    name, view = ops._kv(spec, "kv_state", ops._held(runner, {}))
+
+    # the end of the last slot ATOM hands out, at the view's slot stride
+    last = view.storage_offset() + (slots - 1) * view.stride(0) + 4 * 8
+    assert last <= pool.numel() // f32.itemsize
+    assert name == "v4_hca_main_kv_state.1"
+    assert view.storage_offset() == hca.view("hca")[1].storage_offset()
+
+
+@pytest.mark.parametrize("faulted", [False, True])
+def test_a_rank_whose_device_faulted_dies_and_one_that_refused_measures_on(
+    monkeypatch, faulted
+):
+    # A HIP fault is sticky: a rank that refused the leaf and went on would
+    # hold its peers in their next collective until that timed out.
+    def synchronize(device):
+        if faulted:
+            raise RuntimeError("HIP error: an illegal memory access was encountered")
+
+    exits = []
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+    monkeypatch.setattr(ops.os, "_exit", exits.append)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: 1 / 0)
+    runner = _Runner()
+    runner.device = torch.device("cuda", 0)
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+    found = ops.leaves(
+        _graph(_leaf("x", ("q", _t([2, 4], "activation"))), layers=1)["region"]
+    )
+
+    [record] = ops.Stub(runner, 5_000).point(placed, decode(2), 20, found)
+
+    assert record["refused"] == "ZeroDivisionError: division by zero"
+    assert exits == ([1] if faulted else [])
+
+
 def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
     monkeypatch,
 ):
