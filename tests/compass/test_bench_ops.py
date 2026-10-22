@@ -583,17 +583,13 @@ def test_a_leaf_that_occurs_once_takes_a_weight_per_cache_sized_copy(monkeypatch
     placed = SimpleNamespace(
         block_size=16, batch=lambda view, block, slot: (block, slot)
     )
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
     graphs = []
+    monkeypatch.setattr(
+        ops, "_replay", lambda fn, calls: graphs.append(calls) or [1.0] * ops.REPEATS
+    )
 
-    def replay(fn, calls):
-        graphs.append(calls)
-        return [1.0] * ops.REPEATS
-
-    with (
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
-        patch.object(ops, "_replay", side_effect=replay),
-    ):
-        [record] = stub.point(placed, decode(2), 20, found)
+    [record] = stub.point(placed, decode(2), 20, found)
 
     cold = [kwargs for kwargs, _ in graphs[0]]
     assert [op["occurrences"] for op, _ in found.values()] == [1]
