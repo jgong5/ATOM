@@ -20,6 +20,11 @@
 //! goes out as the daemon deadline of each request, and it runs before any
 //! message arriving at or after that deadline. Any clock error ends the
 //! process. Without the endpoint nothing here runs.
+//!
+//! A stamped cancel is answered 204 and goes on to where its request is
+//! ([`ingress`]). A request is handled apart from its client's connection, so
+//! a hang-up drops only the response; a prefill response read after its
+//! request's cancel sends nothing on.
 
 use std::{
     cell::RefCell,
@@ -31,7 +36,13 @@ use std::{
     time::Duration,
 };
 
-use axum::{extract::Request, middleware::Next, response::Response};
+use axum::{
+    body::Body,
+    extract::Request,
+    http::StatusCode,
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 use bytes::Bytes;
 use futures_util::{stream::BoxStream, Stream, StreamExt};
 use memchr::memmem;
@@ -56,6 +67,8 @@ pub struct Turn {
     arrival: f64,
     client: Option<ClockClient>,
     back: Option<oneshot::Sender<ClockClient>>,
+    /// A prefill response read after its request's cancel, which goes no further.
+    pub cancelled: bool,
 }
 
 impl Turn {
@@ -90,6 +103,21 @@ struct Lp {
     arrived: Notify,
     /// Periodic tasks, in registration order.
     timers: parking_lot::Mutex<Vec<Timer>>,
+    /// Each request placed and not yet ended, by its seq on `traffic->router:http`.
+    requests: parking_lot::Mutex<HashMap<u64, Placed>>,
+    client: reqwest::Client,
+}
+
+/// Where a request is: the outbound channel it last went on, the worker's
+/// base URL and its seq there, whether a cancel has come for it, and its
+/// decode's base URL until it goes there.
+#[derive(Default)]
+struct Placed {
+    channel: String,
+    url: String,
+    seq: u64,
+    cancelled: bool,
+    decode: String,
 }
 
 struct Timer {
@@ -101,10 +129,12 @@ struct Timer {
 
 static LP: OnceLock<Lp> = OnceLock::new();
 
-/// The request being handled: its turn until it is placed, then its prefill
-/// stamp and its (prefill, decode) frontends.
+/// The request being handled: its seq on `traffic->router:http`, its turn
+/// until it is placed, then its prefill stamp and its (prefill, decode)
+/// frontends.
 #[derive(Default)]
 struct Handling {
+    seq: u64,
     turn: Option<Turn>,
     stamp: Option<String>,
     pair: Option<(String, String)>,
@@ -170,6 +200,8 @@ impl Lp {
             waiting: Default::default(),
             arrived: Notify::new(),
             timers: Default::default(),
+            requests: Default::default(),
+            client: reqwest::Client::new(),
         }
     }
 
@@ -207,6 +239,7 @@ impl Lp {
                     arrival: message.arrival,
                     client: Some(client),
                     back: Some(back),
+                    cancelled: false,
                 });
                 client = done
                     .await
@@ -262,6 +295,43 @@ impl Lp {
         turn.await
             .unwrap_or_else(|_| fail("the clock loop ended with a message held"))
     }
+
+    /// Handle a cancel, posted to `path`, of the request with seq `seq` on
+    /// `traffic->router:http`: it goes on to where that request is, if anywhere.
+    fn cancel(&self, mut turn: Turn, seq: u64, path: &str) -> Response {
+        if let Some(at) = self.requests.lock().get_mut(&seq) {
+            at.cancelled = true;
+            // On a relay the stamp rides in the body, elsewhere in `tracestate`.
+            let stamp = entry(turn.send(&at.channel));
+            let body = match kind(&at.channel) {
+                "relay" => format!(
+                    r#"{{"compass_cancel": {}, "kv_transfer_params": {{"compass": "{stamp}"}}}}"#,
+                    at.seq
+                ),
+                _ => format!(r#"{{"compass_cancel": {}}}"#, at.seq),
+            };
+            let post = (self.client.post(format!("{}{path}", at.url)))
+                .header("content-type", "application/json")
+                .header("tracestate", format!("compass={stamp}"))
+                .body(body);
+            let to = at.channel.clone();
+            tokio::spawn(async move {
+                if let Err(error) = post.send().await {
+                    fail(format!("a cancel on {to} was not delivered: {error}"));
+                }
+            });
+        }
+        StatusCode::NO_CONTENT.into_response()
+    }
+}
+
+/// The seq a cancel's body `{"compass_cancel": <seq>}` names; None for any other body.
+fn cancel_seq(body: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(body).ok()?;
+    let seq = text
+        .strip_prefix(r#"{"compass_cancel": "#)?
+        .strip_suffix('}')?;
+    seq.parse().ok()
 }
 
 /// The (arrival, seq) of a stamp written `a:<arrival>;s:<seq>` or
@@ -276,7 +346,9 @@ fn stamp(text: &str) -> (f64, u64) {
 }
 
 /// Ingress layer: a stamped request waits until it is released, and is
-/// handled once the router has placed it (`placed`).
+/// handled once the router has placed it (`placed`); a cancel,
+/// `{"compass_cancel": <its request's seq>}`, at once (`Lp::cancel`). It runs
+/// as a task of its own, which the client hanging up does not end.
 pub async fn ingress(request: Request, next: Next) -> Response {
     let header = request.headers().get("tracestate");
     let entry = header
@@ -285,14 +357,29 @@ pub async fn ingress(request: Request, next: Next) -> Response {
     let Some((lp, seq)) = LP.get().zip(entry.map(|e| stamp(e).1)) else {
         return next.run(request).await;
     };
-    let turn = lp.hold("traffic->router:http", seq).await;
-    let handling = Handling {
-        turn: Some(turn),
-        ..Default::default()
-    };
-    REQUEST
-        .scope(RefCell::new(handling), next.run(request))
+    let (parts, body) = request.into_parts();
+    // A body cut off by a hang-up is read as empty, so it is never placed.
+    let body = axum::body::to_bytes(body, usize::MAX)
         .await
+        .unwrap_or_default();
+    let handled = tokio::spawn(async move {
+        let turn = lp.hold("traffic->router:http", seq).await;
+        if let Some(cancelled) = cancel_seq(&body) {
+            return lp.cancel(turn, cancelled, parts.uri.path());
+        }
+        let handling = Handling {
+            seq,
+            turn: Some(turn),
+            ..Default::default()
+        };
+        let request = Request::from_parts(parts, Body::from(body));
+        REQUEST
+            .scope(RefCell::new(handling), next.run(request))
+            .await
+    });
+    handled
+        .await
+        .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()))
 }
 
 /// The request being handled holds the load of the workers at base URLs
@@ -307,8 +394,19 @@ pub fn placed(prefill: &str, decode: &str) {
             return;
         };
         let p = lp.frontend(Some(prefill), "http");
-        handling.stamp = Some(entry(turn.send(&format!("router->{p}:http"))));
+        let channel = format!("router->{p}:http");
+        let sent = turn.send(&channel);
+        handling.stamp = Some(entry(sent));
         handling.pair = Some((p, lp.frontend(Some(decode), "relay")));
+        let (url, decode) = (prefill.to_owned(), decode.to_owned());
+        let at = Placed {
+            channel,
+            url,
+            seq: sent.1,
+            decode,
+            ..Default::default()
+        };
+        lp.requests.lock().insert(handling.seq, at);
     });
 }
 
@@ -357,21 +455,36 @@ pub fn periodic<F: Fn() + Send + 'static>(
 
 /// Hold a prefill response until it is released and restamp its relay entry
 /// for the decode the request was placed on; it is handled when the returned
-/// turn drops.
+/// turn drops. After its request's cancel it sends nothing on, and the turn
+/// says so (`Turn::cancelled`).
 pub async fn relay(body: &mut Value) -> Option<Turn> {
     let lp = LP.get()?;
     let entry = body.get_mut("kv_transfer_params")?.get_mut("compass")?;
     let seq = stamp(entry.as_str().unwrap_or_default()).1;
-    let pair = REQUEST.try_with(|h| h.borrow().pair.clone()).ok().flatten();
+    let (request, pair) =
+        (REQUEST.try_with(|h| (Some(h.borrow().seq), h.borrow().pair.clone()))).unwrap_or_default();
     let (p, d) = pair.unwrap_or_else(|| (lp.frontend(None, "http"), lp.frontend(None, "relay")));
     let mut turn = lp.hold(&format!("{p}->router:relay"), seq).await;
-    *entry = Value::String(self::entry(turn.send(&format!("router->{d}:relay"))));
+    let mut requests = lp.requests.lock();
+    let at = request.and_then(|r| requests.get_mut(&r));
+    turn.cancelled = at.as_ref().is_some_and(|at| at.cancelled);
+    if turn.cancelled {
+        return Some(turn);
+    }
+    let channel = format!("router->{d}:relay");
+    let sent = turn.send(&channel);
+    *entry = Value::String(self::entry(sent));
+    if let Some(at) = at {
+        (at.channel, at.url, at.seq) = (channel, std::mem::take(&mut at.decode), sent.1);
+    }
     Some(turn)
 }
 
 /// The decode stream, each event held until it is released and restamped for
 /// traffic. The terminal event drops `guard`, the decode load, before it
-/// counts as handled. Without the clock: the stream as is, and the guard.
+/// counts as handled. A task of its own reads it to its end, so a client
+/// that hangs up loses only the forwarding. Without the clock: the stream
+/// as is, and the guard.
 pub fn stream<S>(
     upstream: S,
     guard: WorkerLoadGuard,
@@ -385,7 +498,8 @@ where
     let Some(lp) = LP.get() else {
         return (upstream.boxed(), Some(guard));
     };
-    let pair = REQUEST.try_with(|h| h.borrow().pair.clone()).ok().flatten();
+    let (request, pair) =
+        (REQUEST.try_with(|h| (Some(h.borrow().seq), h.borrow().pair.clone()))).unwrap_or_default();
     let decode = pair.map_or_else(|| lp.frontend(None, "relay"), |(_, d)| d);
     let from = format!("{decode}->router:stream");
     let events = futures_util::stream::unfold(
@@ -396,7 +510,7 @@ where
                 loop {
                     if let Some(end) = memmem::find(&buf, b"\n\n") {
                         let event: Vec<u8> = buf.drain(..end + 2).collect();
-                        let event = lp.restamp(event, &mut guard, &from).await;
+                        let event = lp.restamp(event, &mut guard, &from, request).await;
                         return Some((Ok(Bytes::from(event)), (upstream, buf, guard)));
                     }
                     match upstream.next().await {
@@ -412,15 +526,26 @@ where
             }
         },
     );
-    (events.boxed(), None)
+    let (forward, forwarded) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut events = events.boxed();
+        while let Some(event) = events.next().await {
+            let _ = forward.send(event);
+        }
+    });
+    let forwarded = tokio_stream::wrappers::UnboundedReceiverStream::new(forwarded);
+    (forwarded.boxed(), None)
 }
 
 impl Lp {
+    /// Hold one event of the stream from `from` until it is released, and
+    /// send it on to traffic; the terminal event ends `request`.
     async fn restamp(
         &self,
         event: Vec<u8>,
         guard: &mut Option<WorkerLoadGuard>,
         from: &str,
+        request: Option<u64>,
     ) -> Vec<u8> {
         let line = event.split(|b| *b == b'\n').next().unwrap_or_default();
         let Some(text) = line.strip_prefix(b": compass ") else {
@@ -433,6 +558,9 @@ impl Lp {
         out.extend_from_slice(&event[line.len()..]);
         if memmem::find(&out, b"data: [DONE]").is_some() {
             guard.take();
+            if let Some(request) = request {
+                self.requests.lock().remove(&request);
+            }
         }
         out
     }

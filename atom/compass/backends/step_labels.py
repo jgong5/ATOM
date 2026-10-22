@@ -15,7 +15,9 @@ decode step whose device start precedes its host launch end is launch-exposed
 and cut; a prefill step is never cut, so a host bubble inside it stays in its
 label. On an MTP record, one with `d_target_ns`, the device label is the
 target's, `d_target_ns` with no gap, and the draft label is the rest of
-`d_busy_ns`. The exit of each wait for the previous output's token copy (`t_recv_ns`)
+`d_busy_ns`. On a prefill step that produces output, the draft label's
+`propose` pass, `d_propose_ns`, is also its propose label. The exit of each
+wait for the previous output's token copy (`t_recv_ns`)
 bounds the host clock's lead over the device's (that forward had finished by
 then); the tightest of the last `ANCHORS` bounds is the lead. The copy itself
 lands on its own stream after the exit event the bound reads, by 14 to 29 us
@@ -86,6 +88,8 @@ class Sample:
 
     `device_s` is its device label, None when cut, and `cut` names why (`CUTS`).
     `draft_s` is its draft label, None when cut or on a step with no draft.
+    `propose_s` is its propose label, the part of `draft_s` that is the
+    `propose` pass, on a prefill step that produces output; None elsewhere.
     `host` holds the segments it has, in seconds: no `W_post` on a middle chunk,
     no `E` on the record's first forward or after an idle engine (`idle`).
     `provenance` holds `source`, `run` (the run's digest), `requests` (the
@@ -102,6 +106,7 @@ class Sample:
     idle: bool
     provenance: dict
     draft_s: float | None = None
+    propose_s: float | None = None
 
 
 def digest(record) -> str:
@@ -211,10 +216,12 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
             cut = "unsplit"
         gap = 0 if view.prefill else s.get("d_gap_ns", 0)
         device = None if cut else (gap + s["d_busy_ns"]) * 1e-9
-        draft = None
+        draft = propose = None
         if "d_target_ns" in s:  # an MTP record: the target alone, no gap
             device = None if cut else s["d_target_ns"] * 1e-9
             draft = (s["d_busy_ns"] - s["d_target_ns"]) * 1e-9
+            if view.prefill and view.produces_output:
+                propose = s.get("d_propose_ns")
         enter, (l0, l1) = s["t_enter_ns"], s["t_launch_ns"]
         g0, g1 = s.get("t_gate_ns", (l0, l0))
         r0, r1 = s.get("t_recv_ns", (l1, l1))
@@ -250,6 +257,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
                 idle,
                 provenance,
                 None if cut else draft,
+                None if cut or propose is None else propose * 1e-9,
             )
         )
         gap_ns = s.get("d_gap_ns")

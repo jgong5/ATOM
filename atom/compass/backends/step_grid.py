@@ -39,7 +39,8 @@ Also refused: a step mixing prefill and decode rows, a decode row computing
 more than one token, a count that is not an int, a prefill step that does not
 say whether it produces output, and under a replay bundle a decode step that
 replays no graph, being wider than the widest rung or eager, and a step with
-image tokens.
+image tokens. A DP dummy forward (`BatchView.dp_dummy`) that replays no graph
+is, under a replay bundle, `eager_dp_dummy`: 0 s, not refused.
 
 The answer is the lookup times the residual's factor for the batch's ordered
 rows (`step_grid_residual.py`), which the residual may refuse, and which
@@ -87,7 +88,7 @@ from typing import TYPE_CHECKING
 
 from atom.compass.backends import provenance
 from atom.compass.backends.base import CostBackend, Granularity
-from atom.compass.backends.cost import CostTerm, StepCost
+from atom.compass.backends.cost import CostTerm, StepCost, eager_dp_dummy
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import (
@@ -466,6 +467,9 @@ class StepGridBackend(CostBackend):
         view, rows = batch_view, batch_view.requests
         if view.image_tokens:
             raise _refused(view, IMAGES)
+        eager = not view.prefill and view.capture_rung is None
+        if eager and view.dp_dummy and self.grid.graph_mode != "eager":
+            return eager_dp_dummy(SOURCE)
         cells, at, value, on_node, cell, beyond = self.grid.value(view)
         homogeneous = len({(r.query_tokens, r.context_tokens) for r in rows}) == 1
         looked_up = "measured" if on_node and homogeneous else "interpolated"

@@ -168,6 +168,39 @@ def test_a_run_file_makes_the_client_simulated(tmp_path, simulated):
     }
 
 
+#: The nightly's client arguments and aiperf timeouts client.sh has no default for.
+NIGHTLY = (
+    "--trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75"
+    " --warmup-requests-per-lane 10 --warmup-grace-period 1800"
+    " --trace-idle-gap-cap-seconds 300"
+)
+TIMEOUTS = {
+    "AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT": "300",
+    "AIPERF_HTTP_TCP_USER_TIMEOUT": "900000",
+    "AIPERF_DATASET_CONFIGURATION_TIMEOUT": "1800",
+    "AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT": "1800",
+}
+
+
+@pytest.mark.parametrize(
+    "seed", ["", " --random-seed 42", " --random-seed=42", "\n--random-seed 42"]
+)
+def test_extra_arguments_follow_the_clients_own_and_their_seed_replaces_its(
+    tmp_path, seed
+):
+    out, env = _setup(tmp_path, SIM)
+    extra = {"AIPERF_EXTRA_ARGS": NIGHTLY + seed}
+    done = _client(out, *GOOD, env=env | TIMEOUTS | extra)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+    argv, aiperf_env, _ = json.loads((tmp_path / "seen.json").read_text())
+    assert argv[-len((NIGHTLY + seed).split()) :] == (NIGHTLY + seed).split()
+    line = " ".join(argv)
+    assert line.count("--random-seed") == 1
+    assert ("--random-seed 20260707" in line) == (not seed)
+    assert aiperf_env.items() >= TIMEOUTS.items()
+
+
 def test_a_failed_export_names_its_step(tmp_path):
     out, env = _setup(tmp_path, SIM, ids=("a", "a"))
     done = _client(out, *GOOD, env=env)

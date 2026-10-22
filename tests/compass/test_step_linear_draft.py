@@ -2,6 +2,7 @@
 """A step linear law fitted on an MTP record prices each forward's draft apart,
 as terms tagged `draft`, and a speculative run charges them."""
 
+import dataclasses
 import json
 
 import pytest
@@ -13,6 +14,7 @@ from test_validate_cost import _record as _rank_record
 
 from atom.compass.backends import (
     BatchView,
+    CostRefused,
     CostTerm,
     RequestShape,
     StepCost,
@@ -25,6 +27,11 @@ from atom.compass.validate.cost import cost_accuracy
 
 #: Each forward's draft, as a share of its target.
 SHARE = 0.1
+
+
+def _output(rows, rung=None):
+    """`_view` on a step that produces output, which a draft law's prefill reads."""
+    return dataclasses.replace(_view(rows, rung), produces_output=True)
 
 
 def _mtp_record(path, steps):
@@ -45,7 +52,7 @@ def test_an_mtp_record_fits_a_draft_law_that_prices_each_forward_apart(tmp_path)
 
     backend = StepLinearBackend(StepLinearLaw(law))
     for rows, rung, seconds in steps[:-1]:
-        cost = backend.price(_view(rows, rung))
+        cost = backend.price(_output(rows, rung))
         assert cost.target_seconds == pytest.approx(seconds, rel=1e-5)
         assert cost.draft_seconds == pytest.approx(SHARE * seconds, rel=1e-5)
         drafts = [t.name for t in cost.terms if t.draft]
@@ -80,7 +87,7 @@ def test_a_speculative_run_charges_the_law_s_draft_and_refuses_a_law_without_one
 ):
     steps = _steps(3)
     law = _fit([_mtp_record(tmp_path / "dp0.jsonl", steps)])
-    priced = StepLinearBackend(StepLinearLaw(law)).price(_view([(8, 8, False)]))
+    priced = StepLinearBackend(StepLinearLaw(law)).price(_output([(8, 8, False)]))
     assert priced.draft_seconds > 0
     tagged = _speculative(runner(StepLinearBackend(StepLinearLaw(law))))
     assert tagged.forward(prefill(8)).predicted_s == pytest.approx(priced.seconds)
@@ -148,3 +155,66 @@ def test_a_group_step_prices_as_its_rank_of_dearest_target_not_of_dearest_step(
         s = report["validated"][kind]
         assert s["steps"] == 10
         assert s["on_totals"] == pytest.approx(0.0, abs=1e-9)
+
+
+#: A final chunk's `propose` pass, and the tail its draft-KV pass writes for
+#: the requests that finish: seconds per step and per sequence, each.
+PROPOSE, TAIL = (5e-4, 4e-5), (6e-5, 2e-5)
+
+
+def test_a_final_chunk_s_propose_pass_and_tail_are_fitted_apart_and_a_middle_chunk_prices_neither(
+    tmp_path,
+):
+    """A prefill step that produces output writes a draft-KV tail and runs
+    `propose` after its draft-KV pass; a middle chunk runs the pass alone."""
+    steps, plan = _steps(3), []
+    for i, (rows, _, s) in enumerate(steps):
+        final = not rows[0][2] and i % 4 != 0
+        propose = PROPOSE[0] + PROPOSE[1] * len(rows) if final else 0
+        tail = TAIL[0] + TAIL[1] * len(rows) if final else 0
+        plan.append((i % 4 != 0, s, propose, tail))
+    path = tmp_path / "dp0.jsonl"
+    _record(
+        path,
+        [
+            (r, g, s * (1 + SHARE) + p + t)
+            for (r, g, _), (_, s, p, t) in zip(steps, plan)
+        ],
+    )
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    for line, (output, s, propose, _) in zip(lines, plan):
+        line.update(produces_output=output, d_target_ns=round(s * 1e9))
+        if propose:
+            line["d_propose_ns"] = round(propose * 1e9)
+    # A final chunk whose draft is all `propose` has no draft-KV label to fit.
+    lines[2]["d_target_ns"] = lines[2]["d_busy_ns"] - lines[2]["d_propose_ns"]
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    law = _fit([path])
+    propose = law["draft"]["propose"]["coefficients"]
+    assert (propose["step"], propose["seqs"]) == pytest.approx(PROPOSE, rel=1e-4)
+    tail = law["draft"]["prefill"]["coefficients"]
+    assert (tail["out"], tail["seqs"]) == pytest.approx(TAIL, rel=1e-4)
+
+    backend = StepLinearBackend(StepLinearLaw(law))
+    rows = (RequestShape(512, 512, False), RequestShape(256, 4096, False))
+    middle, final = (
+        backend.price(BatchView(rows, produces_output=output))
+        for output in (False, True)
+    )
+    assert final.target_seconds == middle.target_seconds
+    draft_kv = SHARE * middle.target_seconds
+    assert middle.draft_seconds == pytest.approx(draft_kv, rel=1e-4)
+    assert not [t for t in middle.terms if "propose" in t.name]
+    assert [
+        t.seconds
+        for t in middle.terms
+        if t.name in ("draft.prefill.seqs", "draft.prefill.out")
+    ] == [0, 0]
+    assert final.draft_seconds == pytest.approx(
+        draft_kv + TAIL[0] + 2 * TAIL[1] + PROPOSE[0] + 2 * PROPOSE[1], rel=1e-4
+    )
+    with pytest.raises(CostRefused, match="whether it produces output"):
+        backend.price(BatchView(rows))
+    del law["draft"]["propose"]  # the tail alone depends on it too
+    with pytest.raises(CostRefused, match="whether it produces output"):
+        StepLinearBackend(StepLinearLaw(law)).price(BatchView(rows))

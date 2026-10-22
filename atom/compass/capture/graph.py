@@ -228,7 +228,7 @@ def _arg(value):
             "dtype": value.dtype,
             "stride": list(value.stride),
             "role": value.role.value,
-        }
+        } | ({"is_shuffled": True} if value.shuffled else {})
     if isinstance(value, ir.ContextRef):
         kind = "module" if isinstance(value, ir.ModuleRef) else "context"
         return {kind: value.key}

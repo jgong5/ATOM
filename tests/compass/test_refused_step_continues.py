@@ -13,10 +13,11 @@ import math
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from conftest import MockConfig
-from test_backend_step_linear import backend, law
+from test_backend_step_linear import TRIANGLE, backend, law
 from test_dp_slice import _deployment
 from test_dp_step_max import BLOCK, dp2, runner  # noqa: F401  the dp2 fixture
 from test_run_graph_pool import _reserved
@@ -35,6 +36,16 @@ from atom.utils.clock import LPRuntime
 
 MAX_TOKENS = 4
 REFUSED = "cost:step-linear: no decode vector for rung eager"
+# A DP dummy that replays no graph is priced, not refused, so a dummy refused
+# replays one, at a rung the law has no vector for.
+NO_RUNG = "cost:step-linear: no decode vector for rung 1"
+ONE = {"1": TRIANGLE}
+
+
+def replaying(r):
+    """`r` with a one-row graph, which a group of two dummies replays."""
+    r.capture_sizes_np, r.enforce_eager = np.array([1], dtype=np.int32), False
+    return r
 
 
 def no_eager_rung():
@@ -177,14 +188,14 @@ def test_a_refused_ranks_cost_line_charges_nothing_and_its_dummy_leaves_at_once(
     dp2, tmp_path, monkeypatch  # noqa: F811
 ):
     ranks = [
-        recording(runner(no_eager_rung(), dp_size=2, dp_rank=0), tmp_path, monkeypatch),
-        recording(runner(backend(), dp_size=2, dp_rank=1), tmp_path, monkeypatch),
+        recording(replaying(runner(no_eager_rung(), 2, 0)), tmp_path, monkeypatch),
+        recording(replaying(runner(backend(**ONE), 2, 1)), tmp_path, monkeypatch),
     ]
 
     _, priced = dp2(ranks[0].dummy_execution, ranks[1].dummy_execution)
 
     [refused], [line] = cost_lines(tmp_path, 0), cost_lines(tmp_path, 1)
-    assert [refused[k] for k in ("refused", "device_s", "charge_s")] == [REFUSED, 0, 0]
+    assert [refused[k] for k in ("refused", "device_s", "charge_s")] == [NO_RUNG, 0, 0]
     assert refused["group_s"] == 0 and line["group_s"] == priced.predicted_s > 0
     assert line["charge_s"] == line["device_s"] == priced.predicted_s
 
@@ -238,15 +249,15 @@ def test_an_aborted_step_0_rerun_leaves_its_cost_table_the_version_line_alone(
 
 def test_a_refused_rank_still_joins_the_group_targets(dp2):  # noqa: F811
     ranks = [
-        runner(no_eager_rung(), dp_size=2, dp_rank=0),
-        runner(backend(), dp_size=2, dp_rank=1),
+        replaying(runner(no_eager_rung(), dp_size=2, dp_rank=0)),
+        replaying(runner(backend(**ONE), dp_size=2, dp_rank=1)),
     ]
 
     refused, priced = dp2(ranks[0].dummy_execution, ranks[1].dummy_execution)
 
     assert priced.predicted_s > 0
     assert refused.group_targets == priced.group_targets == (0, priced.predicted_s)
-    assert ranks[0].refused_commands() == (REFUSED,)
+    assert ranks[0].refused_commands() == (NO_RUNG,)
     assert ranks[1].refused_commands() == ()
 
 

@@ -225,15 +225,17 @@ one symbolic graph per structure. Nothing is allocated on a GPU and no kernel ru
 is what makes this phase schedulable anywhere, and what makes it the one phase that may
 also run lazily inside a simulated run (doc `02`).
 
-Under DP a capture runs one rank. A prefill shape also carries G, the rows the step's
-MoE gathers over the DP group, its default `dp x T`; a capture gives the peers G less
-this rank's T, split evenly, and a record's steps give each prefill its line's
-`moe_rows`. Revised 2026-10-20 by the owner's ruling on
+Under DP a capture runs one rank. A shape also carries G, the rows the step's MoE
+gathers over the DP group, its default `dp x T`; a capture gives the peers G less this
+rank's T, split evenly, and a record's steps give each shape its line's `moe_rows`. A
+decode gathers other than its rung's default only beside a prefilling peer, which turns
+ATOM's MoE to the variable-length gather, so at G a capture's first peer prefills.
+Revised 2026-10-20 by the owner's ruling on
 [#1731](https://github.com/jgong5/ATOM/issues/1731#issuecomment-6284509620): a
 data-parallel graph is keyed by its gathered rows, and the op-level backend reads a DP
 step, and each two-batch-overlap micro-batch, at (T, B, G), refused only when no graph is
-captured there. A decode shape carries no G: a balanced DP decode gathers its rung's
-default.
+captured there; a decode's G since
+[#1802](https://github.com/jgong5/ATOM/issues/1802), 2026-10-22.
 
 | | |
 |---|---|
@@ -279,8 +281,13 @@ warmup. The op bench (D39) builds the runner with its parameters on the meta dev
 Each placement of a planned point goes through `ModelRunner.prepare_model`, which builds
 the metadata and forward context. The bench then calls each leaf with activations random
 by its contract's spec and stride; a weight argument built from its contract, random at
-its spec, copy c taking the c-th of as many such tensors as the leaf has instances; and
-metadata, forward context, KV and module tensors from the runner.
+its spec, copy c taking the c-th of as many such tensors as the leaf occurs in the step,
+or as it has cold copies when those are more ([#1902](https://github.com/jgong5/ATOM/issues/1902));
+and metadata, forward context, KV and module tensors from the runner. Before the first
+point a runner that defers its output (`tokenIDProcessor.is_deferred_out`) makes one
+sampled-id handoff to the host on its token processor's copy stream, as
+`ModelRunner.postprocess` does after every forward of such a runner: in a runner that
+had made none, Qwen3.8-27B's GDN decode leaf read 5% under one that had (#1902).
 `_init_weight_params_on_meta` makes every parameter meta as it is registered and leaves
 buffers and other tensor attributes on the device (`02` D10.1), so such a tensor a leaf
 reads through a module reference is the model's own. A module a leaf references, by its
@@ -331,6 +338,19 @@ as a diagnostic and prices nothing. A graph under K calls has no copy floor and 
 graph: its 10 ms of calls pass the last-level cache many times over, so warm over cold
 reads about 1. The card's PTL state is read and keyed as
 [#1434](https://github.com/jgong5/ATOM/issues/1434) rules.
+
+**Each release cleared before the next capture
+([ruling on #1932](https://github.com/jgong5/ATOM/issues/1932)).** The driver clears VRAM
+a process returns in the background, about 31 GiB/s on MI308X, and `torch.cuda.graph`
+returns the caching allocator's free memory before each capture: the previous leaf's
+weights, up to 21 GiB for Qwen3.8-27B. A memory-bound leaf timed during that clear read up
+to 1.20 of the same leaf timed after it ([#1947](https://github.com/jgong5/ATOM/issues/1947)).
+So before each capture, and after the runner frees the hold that sized its KV pool, the
+bench returns that memory itself and waits until the card's VRAM in use
+(`mem_info_vram_used` in the card's PCI sysfs directory) falls by what it returned, at
+most 3 s (`ops.py::_release`). Each point records the seconds waited since the point before
+it and how many waits ended at the cap, which leaves a clear possibly still running while
+it was timed.
 
 **Points, planned from the steps of record directories (D37).** Per leaf: every decode rung; prefill rows on
 a ladder of chunk remainders, a kind that depends on context also over the same ladder of

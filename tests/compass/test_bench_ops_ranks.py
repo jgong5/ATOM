@@ -16,6 +16,7 @@ import time
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 import torch
@@ -504,3 +505,148 @@ def test_fit_ops_prices_a_collective_between_two_message_sizes():
     at = {tuple(c): (ns, k) for c, ns, k in family["points"]}
     one = 8 * 8 * 4  # one row gathered from each of eight ranks, float32
     assert fit.interpolate(at, (2 * one,), ["bytes"]) == (20.0, ["ag"])
+
+
+class _AtomRunner(_Runner):
+    """ATOM's `ModelRunner` as `_runner` builds it, each config it was built
+    on kept in `built`."""
+
+    built: ClassVar[list] = []
+    tokenID_processor = SimpleNamespace(is_deferred_out=False)
+
+    def __init__(self, rank, config):
+        super().__init__()
+        self.config = config
+        _AtomRunner.built.append(config)
+
+    def get_num_blocks(self):
+        return {"num_kvcache_blocks": 64}
+
+    def allocate_kv_cache(self, blocks):
+        self.kv_cache = torch.empty(blocks)
+
+    def exit(self):
+        pass
+
+
+def _atom_runner(monkeypatch):
+    """`_AtomRunner` in place of ATOM's, whose module imports need a driver."""
+    engine = SimpleNamespace(ModelRunner=_AtomRunner, RapidServeModelRunner=None)
+    monkeypatch.setitem(sys.modules, "atom.model_engine.model_runner", engine)
+    monkeypatch.setattr(_AtomRunner, "built", [])
+
+
+def _dpa_config(tp, dp_attention=True):
+    config = _config(tp, dp_attention=dp_attention)
+    config.compilation_config = SimpleNamespace(level=0, static_forward_context={})
+    config.enforce_eager, config.model, config.dp_logical_size = True, "m", 0
+    return config
+
+
+def _layout(config):
+    """The key's parallel layout, read off `config`."""
+    pc = config.parallel_config
+    return {
+        "tp": config.tensor_parallel_size,
+        "dp": pc.data_parallel_size,
+        "pp": 1,
+        "pcp": 1,
+        "decode_context_parallel_size": 1,
+        "enable_expert_parallel": False,
+        "enable_dp_attention": config.enable_dp_attention,
+    }
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["alone", "launched"])
+def test_one_dp_rank_alone_is_built_as_atom_s_simulated_dp_attention(
+    managed, monkeypatch
+):
+    _atom_runner(monkeypatch)
+    config = _dpa_config(2)
+    ranks.layout(config)
+    config.parallel_config._managed_distributed_store = managed
+
+    runner = ops._runner(config, 0)
+
+    [built] = _AtomRunner.built
+    pc = built.parallel_config
+    got = built.tensor_parallel_size, pc.data_parallel_size, built.dp_logical_size
+    assert got == ((1, 2, 0) if managed else (1, 1, 2))
+    assert pc.data_parallel_size_local == got[1]
+    assert built.num_kvcache_blocks == 64
+    assert list(runner.kv_held) == ["kv_cache"]  # `trace ops` reads it as KV
+    assert ops.Stub(runner, 10_000).alone == got[2]
+    assert config.parallel_config.data_parallel_size == 2  # the layout's own
+
+
+def _dpa_main(argv, bench, tmp_path, monkeypatch, config):  # noqa: F811
+    """`ops.main` over `argv` and ATOM's arguments for `config` on GPU 0, a
+    gather and a negation measured in this process on `_AtomRunner`."""
+    _, root, _, run = bench
+    _atom_runner(monkeypatch)
+    monkeypatch.setattr("atom.compass.bench.measure.atom_config", lambda a: config)
+    monkeypatch.setattr("atom.compass.run.memory.key_fields", _layout)
+    monkeypatch.setattr("atom.compass.drive.gpu.hip_visible", lambda g: "0")
+    monkeypatch.setattr(
+        "atom.compass.drive.gpu.quiet", lambda *a: contextlib.nullcontext()
+    )
+    monkeypatch.setattr("atom.compass.drive.identity.identity", lambda *a: run)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+
+    def rule(c):  # the runner's own config, DP 1 with its KV pool sized
+        assert c is _AtomRunner.built[-1]
+        return placed
+
+    monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", rule)
+    x = ("self", _t([2, 8], "activation"))
+    graph = _graph(_gather(2), _leaf(NEG, x), layers=1)
+    monkeypatch.setattr(ops, "graph", lambda *a: graph)
+    monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
+    monkeypatch.setattr(ops, "_replay", lambda fn, calls: [1.0] * ops.REPEATS)
+    argv += ["--width", "2", "--context", "20", "--llc-mib", "1", "--gpu", "0"]
+    argv += ["--store", root, "--out", str(tmp_path / "out")]
+    tp = str(config.tensor_parallel_size)
+    atom = ["--model", "m", "-tp", tp, "--enforce-eager", "--level", "0"]
+    atom += ["--enable-dp-attention"] if config.enable_dp_attention else []
+    ops.main([*argv, "--", *atom])
+
+
+def test_one_gpu_at_dp_attention_measures_a_rank_s_leaves_and_refuses_collectives(
+    bench, tmp_path, monkeypatch  # noqa: F811
+):
+    config = _dpa_config(2)
+
+    with pytest.raises(ValueError, match="1 points refused") as refused:
+        _dpa_main([], bench, tmp_path, monkeypatch, config)
+
+    [built] = _AtomRunner.built
+    widths = [
+        (c.tensor_parallel_size, c.parallel_config.data_parallel_size)
+        for c in (built, config)
+    ]
+    assert widths == [(1, 1), (1, 2)]
+    lines = (tmp_path / "out" / "ops.jsonl").read_text().splitlines()
+    got = {r["op"]: r for r in map(json.loads, lines)}
+    why = "ValueError: a collective over the layout's 2 ranks, measured across them"
+    assert got[GATHER]["refused"].startswith(why)
+    assert GATHER in str(refused.value)
+    assert "refused" not in got[NEG] and got[NEG]["cold_ns"] == 1.0
+    # keyed by the deployed layout, two DP ranks of TP 1, not the runner's
+    store, _, _, run = bench
+    point = decode(2), 20, got[NEG]["leaf"]
+    assert store.directory_for(ops.keys(config, run)(*point)).exists()
+    assert not store.directory_for(ops.keys(built, run)(*point)).exists()
+
+
+def test_one_gpu_refuses_a_tp_layout_wider_than_one_rank(
+    bench, tmp_path, monkeypatch  # noqa: F811
+):
+    with pytest.raises(ValueError, match="names 1 GPUs and ATOM's arguments resolve 2"):
+        _dpa_main([], bench, tmp_path, monkeypatch, _dpa_config(2, False))
+
+    assert _AtomRunner.built == []
