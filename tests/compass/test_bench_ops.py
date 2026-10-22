@@ -9,6 +9,7 @@ context, as ATOM's runner does, and whose forward raises.
 import contextlib
 import dataclasses
 import functools
+import gc
 import json
 import os
 import pathlib
@@ -176,6 +177,7 @@ class _Runner:
     device = torch.device("cpu")
 
     def __init__(self, contexts=()):
+        self.pool_plan, self.kv_held = SimpleNamespace(entries={}), {}
         self.model = torch.nn.Sequential(
             *(torch.nn.Linear(3, 3, device="meta") for _ in range(2))
         )
@@ -225,7 +227,6 @@ def test_a_point_places_its_batch_for_its_context_keys_and_refuses_by_name(
                 ("layer", ir.ContextRef(KEY)),
                 key=KEY,
             ),
-            _leaf("aten.add.Tensor", ("self", _t([2, 3], "kv"))),
             _leaf(
                 "aten.add_.Tensor",
                 ("self", _t([2, 8], "metadata", dtype="torch.int32")),
@@ -244,7 +245,6 @@ def test_a_point_places_its_batch_for_its_context_keys_and_refuses_by_name(
     assert runner.staged == [s for b in runner.batches for s in ("begin", b, "finish")]
     why = {r["op"]: r["refused"] for r in got}
     assert "'nowhere'" in why["aten.nowhere.default"]
-    assert "a kv tensor argument [2, 3]" in why["aten.add.Tensor"]
     [meta] = [r for r in got if r["op"] == "aten.add_.Tensor"]
     assert meta["metadata"] == {"self": "block_tables"}
     assert {r["placements"] for r in got} == {5}
@@ -267,6 +267,33 @@ def test_each_placement_keeps_its_own_forward_context_and_metadata():
         assert set(snap.attn_metadata.block_tables.flatten().tolist()) == {4 * p}
         assert set(view.flatten().tolist()) == {4 * p}
         assert snap.context.positions.tolist() == [2 * p] * 2
+
+
+def test_leaves_share_a_metadata_view_s_clone_and_placements_share_it_unchanged():
+    runner = _Runner()
+    runner.forward_vars["scratch"] = torch.zeros(6)
+    stub = ops.Stub(runner, 10_000)
+    tables = _t([2, 8], "metadata", dtype="torch.int32")
+    scratch = ("out", _t([6], "metadata"))
+    stub.leaves = ops.leaves(
+        _graph(
+            _leaf("aten.add_.Tensor", ("self", tables), scratch),
+            _leaf("aten.mul_.Tensor", ("self", tables), scratch),
+            layers=1,
+        )["region"]
+    )
+
+    for p in range(2):
+        stub._prepare((4 * p, 2 * p))
+
+    def views(p, path):
+        return [v for (_, at), (_, v) in stub.placed[p][1].items() if at == path]
+
+    # both leaves read one clone at a placement; the block tables changed
+    # between placements, the scratch did not
+    (a0, b0), (a1, b1) = views(0, "self"), views(1, "self")
+    assert a0 is b0 and a1 is b1 and a0 is not a1
+    assert len({id(v) for p in (0, 1) for v in views(p, "out")}) == 1
 
 
 def _measuring(monkeypatch):
@@ -469,6 +496,66 @@ def test_a_context_module_with_no_kv_layer_is_sized_by_its_own_tensors(monkeypat
     assert "refused" not in record
     assert (record["cold_ns"], record["footprint_bytes"]) == (1.0, 10 * 1056)
     assert record["placements"] == 1
+
+
+def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placements(
+    monkeypatch,
+):
+    # DeepSeek-V4: the pools are runner attributes, each layer's view of the
+    # plane from its base row to the end, the state slots a strided view; the
+    # capture's pool was sized otherwise.
+    plane, state = torch.zeros(100, 4), torch.zeros(6, 2, 4)
+    runner = _Runner()
+    runner.pool_plan = SimpleNamespace(entries={"state": 6})
+    runner.kv_held = {
+        "v4_unified_kv": [plane, plane[2:]],
+        "v4_state": state,
+        "num_kv_heads": 1,
+    }
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    kv = ("kv", _t([60, 1, 1, 4], "kv", stride=[4, 4, 4, 1]))
+    found = ops.leaves(
+        _graph(
+            _leaf(
+                "x", ("q", _t([2, 4], "activation")), kv, ("st", _t([5, 2, 4], "kv"))
+            ),
+            _leaf("y", ("kv", _t([500, 4], "kv"))),
+            layers=1,
+        )["region"]
+    )
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    graphs = []
+
+    def replay(fn, calls):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        got = {
+            r["op"]: r
+            for r in ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+        }
+
+    # 32 bytes of q, and per state slot of the two rows 16 of kv and 32 of
+    # state: 128 a call, 16 copies past twice 1000 bytes, each its own
+    # placement, of which 6 slots hold 3 of two rows.
+    record = got["x"]
+    assert record["metadata"] == {"kv": "v4_unified_kv.1", "st": "v4_state"}
+    assert (record["copies"], record["placements"]) == (16, 3)
+    assert runner.batches == [(4 * p, 2 * p) for p in range(3)]
+    for c, (kwargs, snap) in enumerate(graphs[0][:16]):
+        assert kwargs["kv"].untyped_storage().data_ptr() == plane.data_ptr()
+        assert kwargs["kv"].storage_offset() == 8
+        assert kwargs["kv"].shape == (60, 1, 1, 4)
+        assert kwargs["st"].data_ptr() == state.data_ptr()
+        assert set(snap.attn_metadata.block_tables.flatten().tolist()) == {4 * (c % 3)}
+    assert "ATOM's live KV has no room for kv [500, 4]" in got["y"]["refused"]
 
 
 def test_a_call_cycles_a_weight_per_occurrence_on_the_cold_copies_inputs():
@@ -879,6 +966,104 @@ def test_a_replay_prices_each_timed_replay_per_call_each_under_its_context(
     assert seen == [(i, f"snap{i}") for i in range(4)]
     timed = range(ops.WARMUPS, ops.WARMUPS + ops.REPEATS)
     assert times == [(i + 1) * 1e6 / 4 for i in timed]
+
+
+def test_a_capture_that_fails_refuses_its_leaf_and_the_next_draws_its_activations(
+    monkeypatch,
+):
+    # HIP's capture end refuses a graph a call invalidated and leaves its
+    # stream current and still capturing, and the generator in capture: a
+    # draw then raises, and so does the next capture on that stream. A graph
+    # a garbage collection frees in a capture would end the process.
+    world = {"stream": "main", "capturing": set(), "generator": "free"}
+    collecting = []
+    randn = torch.randn
+
+    def draw(*args, **kwargs):
+        if world["generator"] != "free":
+            raise RuntimeError("Offset increment outside graph capture")
+        return randn(*args, **kwargs)
+
+    class Capture:
+        capture_stream = "capture"
+
+        def __init__(self, graph, capture_error_mode):
+            restore = lambda *_: world.update(stream=self.found)
+            self.stream_ctx = SimpleNamespace(__exit__=restore)
+
+        def __enter__(self):
+            if "capture" in world["capturing"]:
+                raise RuntimeError("Cannot register the state during capturing")
+            self.found = world["stream"]
+            collecting.append(gc.isenabled())
+            world.update(stream="capture", generator="capturing")
+            world["capturing"].add("capture")
+
+        def __exit__(self, *exc):
+            if world.pop("invalid", False):
+                raise RuntimeError("operation failed due to a previous error")
+            world["capturing"].discard("capture")
+            world["generator"] = "free"
+            self.stream_ctx.__exit__()
+
+    @contextlib.contextmanager
+    def stream(s):
+        found, world["stream"] = world["stream"], s
+        yield
+        world["stream"] = found
+
+    def function(name):
+        def call(**kwargs):
+            if name == "aten.neg.default" and world["stream"] == "capture":
+                world["invalid"] = True
+
+        return call
+
+    generator = SimpleNamespace(
+        clone_state=lambda: "fresh",
+        graphsafe_set_state=lambda s: world.update(generator=s == "fresh" and "free"),
+    )
+    event = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
+    event.elapsed_time = lambda end: 1.0
+    for name, value in {
+        "CUDAGraph": lambda: SimpleNamespace(replay=lambda: None),
+        "graph": Capture,
+        "Event": lambda enable_timing: event,
+        "current_stream": lambda: world["stream"],
+        "stream": stream,
+        "is_current_stream_capturing": lambda: world["stream"] in world["capturing"],
+        "default_generators": (generator,),
+        "current_device": lambda: 0,
+    }.items():
+        monkeypatch.setattr(torch.cuda, name, value)
+    monkeypatch.setattr(torch, "randn", draw)
+    monkeypatch.setattr(ops, "_end_capture", world["capturing"].discard, raising=False)
+    monkeypatch.setattr(ops, "_function", function)
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
+    monkeypatch.setattr(ops.time, "sleep", lambda s: None)
+    time = ops.Stub._time
+    _, [_, point] = _measuring(monkeypatch)
+    monkeypatch.setattr(ops.Stub, "_time", time)
+
+    neg, abs_ = ops.measure(None, [point], 10_000)
+
+    assert "previous error" in neg["refused"]
+    assert "refused" not in abs_ and abs_["cold_ns"] > 0
+    assert world == {"stream": "main", "capturing": set(), "generator": "free"}
+    assert collecting == [False] * 3 and gc.isenabled()
+
+
+def test_a_device_argument_is_the_rank_s_own_device():
+    # The capture ran on device 0: on another rank a call there would leave
+    # the rank's device, and its capture.
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    args = {"size": [1, 2], "dtype": "torch.float32", "device": "cuda:0"}
+    op = {"op": "aten.empty.memory_format", "args": args}
+
+    kwargs, _ = stub._copy(op, "sig", [{}], 0)
+
+    assert kwargs == {**args, "dtype": torch.float32, "device": _Runner.device}
 
 
 def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(

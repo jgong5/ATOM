@@ -213,6 +213,52 @@ def test_a_population_s_decode_at_its_default_names_no_rows(tmp_path):
     assert list(map(str, shapes)) == ["decode B=2"] * 4
 
 
+@pytest.mark.parametrize("tbo", [False, True], ids=["whole", "tbo"])
+def test_a_population_names_a_split_step_s_micro_batches(tbo, tmp_path):
+    # Rank 0 clears the 8192-token bar: each rank cuts at its midpoint.
+    ranks = [([[9000, 9000, False]], 9100), ([[100, 100, False]], 9100)]
+    record = _record(tmp_path, ranks)
+
+    shapes = sorted(map(str, population_shapes([record], tbo)))
+
+    if tbo:
+        # Two micro-batches a rank, each gathering both ranks' rows of it.
+        first = ["prefill T=4500 B=1 G=4550"] * 2
+        assert shapes == first + ["prefill T=50 B=1 G=4550"] * 2
+    else:
+        assert shapes == ["prefill T=100 B=1 G=9100", "prefill T=9000 B=1 G=9100"]
+
+
+def test_a_population_s_micro_batch_is_traced_as_one_forward(
+    monkeypatch, tmp_path_factory
+):
+    # Each rank's 1024 tokens split 512 and 512, at the bar a 512-token step
+    # would split again.
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "512")
+    ranks = [([[1024, 1024, False]], DP * 1024)] * DP
+    record = _record(tmp_path_factory.mktemp("record"), ranks)
+    graphs = capture(tmp_path_factory, f"--population {record}{DPA_TP8} --enable-tbo")
+
+    assert list(graphs) == ["prefill T=512 B=1"]
+    graph, _ = graphs["prefill T=512 B=1"]
+    assert '"enable_tbo":true' in graph["structure"]
+
+
+def test_a_tbo_population_splits_a_prefill_and_names_a_decode_s_rows(tmp_path):
+    # Step 1 splits as above; at step 2 rank 0 decodes 2 rows, rank 1 3.
+    ranks = [([[9000, 9000, False]], 9100), ([[100, 100, False]], 9100)]
+    record = _record(tmp_path, ranks)
+    for r, rows in enumerate([[[1, 9, True]] * 2, [[1, 9, True]] * 3]):
+        line = {"step": 2, "is_dummy_run": False, "rung": None, "rows": rows}
+        with open(tmp_path / "steps" / f"dp{r}.jsonl", "a") as f:
+            f.write(json.dumps(dict(line, moe_rows=5)) + "\n")
+
+    shapes = sorted(map(str, population_shapes([record], tbo=True)))
+
+    halves = ["prefill T=4500 B=1 G=4550"] * 2 + ["prefill T=50 B=1 G=4550"] * 2
+    assert shapes == ["decode B=2 G=5", "decode B=3 G=5"] + halves
+
+
 def test_a_prefill_gathers_at_least_its_own_rows():
     with pytest.raises(ValueError, match="the gather holds this rank's"):
         prefill_shape(7, 1, 6)

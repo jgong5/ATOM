@@ -10,7 +10,11 @@ A shape is a decode width (`--width`), a prefill of T tokens over B sequences
 (`--population`): a decode step at its CUDA-graph rung when it ran at one, else
 at its width, and any other step as a prefill of its query tokens over its
 rows, and under DP the rows the step's MoE gathered over the group, its line's
-`moe_rows`. Each is traced at that concrete shape (`forward`), decoder layers folded
+`moe_rows`. Under `--enable-tbo` a step its DP group split is its two
+micro-batches, each a prefill at its own tokens and the group's rows of it,
+by the split `validate bound` rebuilds from every rank's line; a population's
+prefill is traced as one forward, as it ran, where ATOM would split a step of
+its tokens. Each is traced at that concrete shape (`forward`), decoder layers folded
 into `Repeat` and forked streams into `Par` (`graph`).
 
 An `op_graph` is keyed by structure (`forward.structure`: the model's
@@ -76,14 +80,14 @@ def main(argv: list[str]) -> None:
 
     store = a.ArtifactStore(args.store)
     shapes = [decode(w) for w in args.width] + [prefill(*s) for s in args.prefill]
-    shapes += population_shapes(args.population)
-    if not shapes:
+    if not shapes and not args.population:
         p.error("name a shape: --width, --prefill or --population")
-    shapes = list(dict.fromkeys(shapes))
     command = " ".join(["compass", "trace", "ops", *argv])
     with tempfile.TemporaryDirectory(prefix="compass-capture-") as tmpdir:
         began = time.perf_counter()  # the first shape's seconds include the build
-        captured = capture(args.model, args.tp, shapes, tmpdir, atom_args, args.arch)
+        captured = capture(
+            args.model, args.tp, shapes, tmpdir, atom_args, args.arch, args.population
+        )
         for graph, model, declared in captured:
             seconds = time.perf_counter() - began
             key = publish(store, graph, model, declared, args.tp, atom_args, command)
@@ -92,19 +96,27 @@ def main(argv: list[str]) -> None:
             began = time.perf_counter()
 
 
-def population_shapes(names):
+def population_shapes(names, tbo=False):
     """The shape of each step the record directories `names` hold, DP's dummy
-    runs aside."""
-    return [shape for shape, _ in population_steps(names)]
+    runs aside; under two-batch overlap (`tbo`) a split step's two
+    micro-batches' (`population_steps`)."""
+    return [shape for shape, _ in population_steps(names, tbo)]
 
 
-def population_steps(names):
+def population_steps(names, tbo=False):
     """Each step the record directories `names` hold, DP's dummy runs aside,
     as its shape, the one the op-level backend prices it at
     (`op_graph.step_shape`), with the rows its DP group's MoE
     gathered (`moe_rows`), and its step-record line. A decode step verifies
-    as many drafts in each row as its shortest row does."""
+    as many drafts in each row as its shortest row does. Under two-batch
+    overlap (`tbo`, ATOM's `enable_tbo`) a DP step the group split, by the
+    rule `validate bound` agrees over every rank's line at that step
+    (`bound._split`), is its two micro-batches (`step_roofline.micro_batches`),
+    each a prefill at its own tokens and the group's rows of it."""
+    from atom.compass.backends import BatchView, RequestShape
     from atom.compass.backends.op_graph import step_shape
+    from atom.compass.backends.step_roofline import micro_batches
+    from atom.compass.validate.bound import _split
 
     from .forward import decode, prefill
 
@@ -112,15 +124,26 @@ def population_steps(names):
         path = pathlib.Path(name)
         if not (path / "run.json").is_file():
             raise ValueError(f"{name} is not a record directory: it has no run.json")
-        texts = [p.read_text() for p in (path / "steps").glob("dp*[0-9].jsonl")]
-        dp = len(texts)
-        for line in (json.loads(t) for text in texts for t in text.splitlines()):
+        paths = sorted((path / "steps").glob("dp*[0-9].jsonl"))
+        ranks = [[json.loads(t) for t in p.read_text().splitlines()] for p in paths]
+        dp, splits = len(ranks), {}
+        if tbo and ranks:
+            at = [{s["step"]: s for s in lines} for lines in ranks]
+            for step in set.intersection(*map(set, at)):
+                splits[step] = _split([r[step] for r in at])
+        for rank, line in ((r, s) for r, lines in enumerate(ranks) for s in lines):
             if line["is_dummy_run"]:
                 continue
             rows = [(row[0], row[2]) for row in line["rows"]]
+            dp_step = line.get("moe_rows") is not None
+            split = splits.get(line["step"]) if dp_step else None
             try:
                 drafts = min(q for q, _ in rows) - 1
                 phase, tokens, seqs = step_shape(rows, line["rung"], drafts)
+                if split:
+                    held = [RequestShape(q, c, bool(d)) for q, c, d in line["rows"]]
+                    view = BatchView(tuple(held), tbo_tokens=split, dp_rank=rank)
+                    halves = micro_batches(view)
             except ValueError as exc:
                 raise ValueError(f"{name} step {line['step']} {exc}") from None
             if phase == "decode":
@@ -128,8 +151,13 @@ def population_steps(names):
                 g = line.get("moe_rows")
                 g = None if g == dp * tokens * (drafts + 1) else g
                 yield decode(tokens, g), line
-            else:
+            elif not split:
                 yield prefill(tokens, seqs, line.get("moe_rows")).at(dp), line
+            else:
+                for half in halves:
+                    rows = [(r.query_tokens, r.decode) for r in half.requests]
+                    _, tokens, seqs = step_shape(rows, None)
+                    yield prefill(tokens, seqs, half.moe_rows).at(dp), line
 
 
 def publish(store, graph, model, declared, tp, atom_args, command):

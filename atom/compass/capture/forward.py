@@ -975,7 +975,9 @@ def _config(model, tp, atom_args):
     return config
 
 
-def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942"):
+def capture(
+    model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942", population=()
+):
     """Trace one step of `model` at TP `tp` at each of `shapes`, in this process,
     under ATOM's engine arguments `atom_args` on a declared `arch`.
 
@@ -984,19 +986,27 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
     shape, the middle chunk's and then the final one's. Under a drafter a step
     that samples is two graphs, its target's and then its drafter's, cut where
     ATOM records `forward_done_event`; a decode step verifies the drafter's
-    tokens in each row.
+    tokens in each row. The steps of the record directories `population` are
+    shapes too (`population_shapes`), under two-batch overlap a split one's
+    two micro-batches; each of their prefills runs as one forward, as it ran,
+    this rank answering that it cannot split it.
     """
     declared = driverless.install(tmpdir, arch)
 
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+    from atom.compass.capture import population_shapes
     from atom.compass.run import _file_digest
     from atom.config import set_current_atom_config
 
     config = _config(model, tp, atom_args)
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     ep = int(config.enable_expert_parallel)
-    shapes = list(dict.fromkeys(s.at(dp) for s in shapes))
+    ran = population_shapes(population, config.enable_tbo)
+    unsplit = {s.at(dp) for s in ran if s.phase == "prefill"}
+    shapes = list(dict.fromkeys(s.at(dp) for s in [*shapes, *ran]))
+    if not shapes:
+        raise ValueError(f"{', '.join(population)} hold no step to trace")
     if dp == 1 and (gathering := [s for s in shapes if s.gathered is not None]):
         raise ValueError(f"{gathering[0]} gathers a DP group's rows on one rank")
     declared["group"] = driverless.group(tp, dp)
@@ -1069,8 +1079,15 @@ def capture(model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942
             for shape in shapes
             for output in ((False, True) if shape.phase == "prefill" else (True,))
         ]
+        # A population's prefill ran as one forward: this rank cannot split it.
+        own = runner._local_tbo_eligibility
+
+        def unsplittable(batch):
+            return (False, False, 0, 0)
+
         for shape, output in variants:
             recorder.shape = shape
+            runner._local_tbo_eligibility = unsplittable if shape in unsplit else own
             traces = []
             for context in CONTEXTS if shape.phase == "decode" else CONTEXTS[:1]:
                 recorder.creating = ir.Role.METADATA
