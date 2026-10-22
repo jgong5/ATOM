@@ -316,7 +316,8 @@ def test_a_shape_the_rule_refuses_refuses_its_leaves_and_the_next_is_measured(
 
 def test_measure_times_a_point_atom_prepared_and_runs_no_forward(monkeypatch):
     # ATOM's runner and its model both raise on a forward; a GEMM over two
-    # layers is timed on random weights, one a layer, on what ATOM prepared.
+    # layers is timed on random weights, one a layer, on what ATOM prepared:
+    # its 60 bytes a call pass twice a 30-byte cache in 2 copies.
     monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
     runner = _Runner()
     runner.exit = lambda: None
@@ -338,7 +339,7 @@ def test_measure_times_a_point_atom_prepared_and_runs_no_forward(monkeypatch):
     )
     found = ops.leaves(_graph(mm, layers=2)["region"])
 
-    [record] = ops.measure(None, [(decode(2), 20, found)], 10_000)
+    [record] = ops.measure(None, [(decode(2), 20, found)], 30)
 
     assert "refused" not in record and record["cold_ns"] == 1.0
     assert runner.staged == [s for b in runner.batches for s in ("begin", b, "finish")]
@@ -542,6 +543,40 @@ def test_a_copy_past_the_cold_ones_takes_its_own_cold_copy_s_inputs_and_is_logge
     assert len({id(c["mat2"]) for c in cold[:4]}) == 4
     assert all(c["mat2"] is cold[i % 4]["mat2"] for i, c in enumerate(cold))
     assert record["copies"] == 4 and "over 4 copies" in capsys.readouterr().out
+
+
+def test_a_leaf_that_occurs_once_takes_a_weight_per_cache_sized_copy(monkeypatch):
+    # A [2, 3] input and a [3, 3] weight are 60 bytes a call: 3 copies pass
+    # twice a 60-byte cache. The leaf occurs once in the step, and each copy
+    # still takes a weight of its own, as it takes an input of its own.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    stub = ops.Stub(_Runner(), 60)
+    mm = _leaf(
+        "aten.mm.default",
+        ("self", _t([2, 3], "activation")),
+        ("mat2", _t([3, 3], "weight")),
+    )
+    found = ops.leaves(_graph(mm, layers=1)["region"])
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    graphs = []
+
+    def replay(fn, calls):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        [record] = stub.point(placed, decode(2), 20, found)
+
+    cold = [kwargs for kwargs, _ in graphs[0]]
+    assert [op["occurrences"] for op, _ in found.values()] == [1]
+    assert len({id(c["mat2"]) for c in cold[:3]}) == 3
+    assert all(c["mat2"] is cold[i % 3]["mat2"] for i, c in enumerate(cold))
+    assert record["copies"] == 3
 
 
 def test_copy_c_rotates_weights_and_instances_and_clones_past_the_first_round():

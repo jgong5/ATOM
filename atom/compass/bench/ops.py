@@ -47,7 +47,7 @@ last-level cache, raised for a context key to its I instances (at most K),
 then, up to the leaf's occurrences when it takes a weight (at most K), copy
 c mod N with the c-th weights on that copy's other arguments.
 Copy c < N takes fresh activations below M and copy c mod M's from there,
-weight c mod the leaf's occurrences, and
+weight c mod the more of M and the leaf's occurrences, and
 instance c mod I at placement (c div I) mod P, its metadata and module
 tensors cloned past the first round: a placement is the point's batch on KV
 blocks and state slots of its own, for which ATOM prepares the forward context
@@ -624,7 +624,9 @@ class Stub:
             if isinstance(value, dict) and self._routed(value):
                 return self._route(value, c)
             if isinstance(value, dict) and value.get("role") == "weight":
-                return self._weight(value, c, op["occurrences"])
+                # each cache-sized copy takes a weight of its own, as it does activations
+                count = max(op["occurrences"], self.cold_copies.get(sig, 1))
+                return self._weight(value, c, count)
             if isinstance(value, dict) and value.get("role") == "activation" and like:
                 return old
             if _ref(value):
