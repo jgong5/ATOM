@@ -16,6 +16,11 @@
 #   MODEL, TRACES    as cctraces_sim.sh takes them
 #   HARNESS_PYTHON   the Python with agentx-harness, and with compass-harness
 #                    when the server is simulated and only then
+#   AIPERF_EXTRA_ARGS  more aiperf arguments, after client.sh's own, as
+#                    cctraces_sim.sh takes them (default none); a --random-seed
+#                    there replaces client.sh's, and aiperf refuses any other
+#                    option given twice. aiperf reads its AIPERF_* settings,
+#                    its timeouts among them, from client.sh's environment
 #
 # A simulated server's client paces aiperf on the server's clock through this
 # tree's compass-harness; a real one's pins aiperf's benchmark id as
@@ -92,6 +97,8 @@ awk -v d="$OUT/client/traces" -v first="$first" -v last="$last" '
     NR > last {exit}' "$TRACES" || fail "traces: cannot read $TRACES"
 n=$(find "$OUT/client/traces" -type f | wc -l)
 ((n == last - first + 1)) || fail "traces: $TRACES holds $n of traces $first to $last"
+read -ra extra <<<"${AIPERF_EXTRA_ARGS-}"
+[[ " ${extra[*]} " =~ \ --random-seed[\ =] ]] && seed=() || seed=(--random-seed 20260707)
 
 # Each request carries X-Session-ID, as the nightly's agentic cell sends it: a
 # dp_sticky router keys off it, and a server alone ignores it.
@@ -101,9 +108,9 @@ n=$(find "$OUT/client/traces" -type f | wc -l)
     --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" --export-level raw \
     --endpoint-type chat --custom-dataset-type weka_trace \
     --concurrency "$c" --benchmark-duration "$duration" \
-    --random-seed 20260707 --scenario inferencex-agentx-mvp --unsafe-override \
+    "${seed[@]}" --scenario inferencex-agentx-mvp --unsafe-override \
     --streaming --use-server-token-count --extra-inputs ignore_eos:true \
-    --no-server-metrics --no-gpu-telemetry --ui none) \
+    --no-server-metrics --no-gpu-telemetry --ui none "${extra[@]}") \
     >"$OUT/client/aiperf.log" 2>&1 || fail "aiperf: exited $?; see $OUT/client/aiperf.log"
 (cd / && python3 -m atom.compass.parity.client_run "$OUT/artifacts") ||
     fail "export: atom.compass.parity.client_run exited $? on $OUT/artifacts"

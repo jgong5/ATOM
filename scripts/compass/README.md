@@ -719,6 +719,7 @@ image's aiperf. Both sides run the scenario's own warmup, as `calib_capture.sh`
 does: aiperf starts each trajectory at a sampled point and first sends, for
 each session active there, its last request before that point, so the cold
 first forward and the prefix cache's fill fall outside the graded window.
+A cell that runs the nightly's client arguments passes them in `AIPERF_EXTRA_ARGS`.
 The grace period after the duration stays aiperf's finite default:
 `--benchmark-grace-period inf` can hang aiperf's agentic replay after the cutoff,
 waiting on a credit the server no longer holds (upstream, in agentx-harness's
