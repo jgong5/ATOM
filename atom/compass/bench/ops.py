@@ -1091,10 +1091,13 @@ def _text(spec: dict) -> str:
 
 def _random(spec, device) -> torch.Tensor:
     """A tensor of `spec`'s shape, dtype and stride, random over its span when
-    floating, else zero: an integer one may index a dimension of one."""
+    floating, else zero: an integer one may index a dimension of one. Packed
+    fp4, which no cast reaches, takes random bytes: every e2m1 code is finite."""
     dtype = _dtype(spec["dtype"])
     n = _span(spec["shape"], spec["stride"])
-    if dtype.is_floating_point:
+    if dtype == torch.float4_e2m1fn_x2:
+        flat = torch.randint(256, (n,), dtype=torch.uint8, device=device).view(dtype)
+    elif dtype.is_floating_point:
         flat = torch.randn(n, device=device).mul_(0.1).to(dtype)
     else:
         flat = torch.zeros(n, device=device, dtype=dtype)
