@@ -371,7 +371,9 @@ def _runner(config, rank: int):
     """ATOM's runner at TP `rank` of `config`'s DP rank, its parameters built on
     the meta device and no warmup run, its KV pool allocated at the fewest
     blocks a rank has room for, sized by ATOM with the parameters' bytes held
-    on the device and then freed for the weights each leaf builds."""
+    on the device and then freed for the weights each leaf builds; and one
+    sampled-id handoff to the host made on ATOM's copy stream, as ATOM's
+    postprocess makes one after every forward."""
     from torch.distributed import TCPStore
 
     from atom.compass.bench.ranks import agreed, cpu_group
@@ -404,6 +406,13 @@ def _runner(config, rank: int):
     torch.cuda.empty_cache()  # the pool takes the room the hold had
     config.num_kvcache_blocks = agreed(blocks, cpu_group())
     runner.allocate_kv_cache(config.num_kvcache_blocks)
+    # with no handoff made, a Qwen3.8-27B GDN decode leaf read 5% under a
+    # runner that had made one
+    ids, done = runner.tokenID_processor, torch.cuda.Event()
+    done.record()
+    zero = torch.zeros(1, dtype=torch.int32, device=runner.device)
+    ids.send_to_cpu_async(zero, ids.token_ids_cpu, done)
+    ids.recv_async_output(ids.token_ids_cpu)
     return runner
 
 
