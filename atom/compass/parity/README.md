@@ -11,6 +11,9 @@ which holds the ladder the runner replays; the scheduler's bounds
 A simulated run also writes `dp<r>.cost.jsonl`, a line per step saying what
 its charge was made of (`_group_step_seconds` in
 `atom/compass/runner/overrides.py` says what each line holds).
+A 1P1D decode instance also writes `transfers.jsonl` (`transfers` in
+`__init__.py` says what it joins).
+
 Compare two records with
 
 ```
