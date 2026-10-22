@@ -45,6 +45,9 @@ digest of its whole prompt as its prefill windows carry it, taken when its final
 chunk is scheduled, so it does not move with chunking. A line records request
 ids and names each request whose final chunk it holds; `read` puts the keys in.
 A named request's response id follows its key if it has one (`carry_response_ids`).
+A decode instance's request arrives with its KV and has no prompt to digest:
+its first step names it, its response id its key. A 1P1D deployment's two
+records join on prefill's request id (`transfers`).
 Prefix caching is not covered: the worker never sees a cached prefix, so parity
 runs need caching off or the same cache hits in both runs. Requests of one
 record with one prompt are named in the order their final chunks are scheduled:
@@ -73,6 +76,9 @@ ENV = "ATOM_COMPASS_PARITY_RECORD"
 #: The file in a real run's record directory holding when its workload was sent
 #: and when the server admitted each request.
 ARRIVALS = "arrivals.json"
+#: The file in a decode instance's record directory joining each request's
+#: response id to the prefill request its KV came from (`carry_response_ids`).
+TRANSFERS = "transfers.jsonl"
 RUNNER = "atom.compass.parity.runner.RecordingModelRunner"
 #: The recording runner of a real RapidServe run.
 RAPID = "atom.compass.parity.runner.RecordingRapidServeModelRunner"
@@ -140,8 +146,10 @@ class StepRecord:
         `run_model` under `forward_mode`; without one it is `forward_mode`'s,
         which runs the DP collective itself. Each prefill window is added to its request's
         digest; the line holding a request's final chunk names it under
-        `named`. A dummy batch is fabricated for DP synchronisation and names
-        no request, so its `batch` is empty; its `rows` are what it runs.
+        `named`, as does the first line holding a request with no prefill
+        window, under its response id. A dummy batch is fabricated for DP
+        synchronisation and names no request, so its `batch` is empty; its
+        `rows` are what it runs.
 
         The line is built from the batch as handed in, since a real forward
         rewrites batch fields in place, and written after it returns, with `t_enter_ns`
@@ -163,7 +171,14 @@ class StepRecord:
             for i, req_id in enumerate(batch.req_ids):
                 num = int(batch.num_scheduled_tokens[i])
                 rows.append([req_id, num, int(batch.context_lens[i])])
-                if batch.is_final_chunk is None or req_id in self.keys:
+                if req_id in self.keys:
+                    continue
+                if batch.is_final_chunk is None:
+                    # Its KV arrived from a prefill instance: no prompt to digest.
+                    response_id = batch.external_request_ids[i]
+                    if response_id is not None:
+                        self.keys[req_id] = response_id
+                        named.append([req_id, response_id, response_id])
                     continue
                 start = int(batch.num_cached_tokens[i])
                 if start == 0:  # a preempted prefill restarts its prompt
@@ -300,15 +315,31 @@ def _record(runner):
 def carry_response_ids() -> None:
     """Set a one-sequence request's `external_request_id` to its response id,
     the `request_id` of the API server function calling `add_request`, read
-    off its frame. A sequence with an id keeps it; a fan-out's get none."""
+    off its frame. A sequence with an id keeps it; a fan-out's get none.
+
+    A sequence whose `kv_transfer_params` carry a `transfer_id`, a decode
+    instance's request, also gets a line ``{response_id, remote_dp_rank,
+    transfer_id}`` in `TRANSFERS` of the record directory, which this replaces."""
     from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 
+    path = pathlib.Path(os.environ[ENV]) / TRANSFERS
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
     for cls in (CoreManager, DisaggCoreManager):
 
         def add_request(self, seqs, add=cls.add_request):
             if len(seqs) == 1 and seqs[0].external_request_id is None:
                 caller = sys._getframe(1).f_locals
                 seqs[0].external_request_id = caller.get("request_id")
+            params = (seqs[0].kv_transfer_params or {}) if len(seqs) == 1 else {}
+            if params.get("transfer_id") is not None:
+                line = {
+                    "response_id": seqs[0].external_request_id,
+                    "remote_dp_rank": params.get("remote_dp_rank", 0),
+                    "transfer_id": params["transfer_id"],
+                }
+                with path.open("a") as f:
+                    f.write(json.dumps(line) + "\n")
             return add(self, seqs)
 
         cls.add_request = add_request
@@ -518,7 +549,8 @@ def read(directory, stage: int = 0) -> dict[int, list[dict]]:
     first step. With `ARRIVALS`, the worker-clock times a workload was sent,
     the steps entered before the first send are the engine's start, not the
     workload's: they are left out and the rest renumbered from 0. A step
-    naming requests with response ids holds them by key in `response_ids`.
+    naming requests with response ids holds them by key in `response_ids`,
+    and their request ids by key in `request_ids`.
     A real rank's ``dp<rank>.pulls.jsonl`` (`clock.PullStamps`) gives each
     step the first ``t_pull_ns`` and ``t_put_ns`` at or after its
     ``t_exit_ns`` and before the next step's ``t_enter_ns``, where there is one.
@@ -538,6 +570,7 @@ def read(directory, stage: int = 0) -> dict[int, list[dict]]:
                 keys[req_id] = key
                 if response_id:
                     step.setdefault("response_ids", {})[key] = response_id[0]
+                    step.setdefault("request_ids", {})[key] = req_id
         if start is not None:
             steps = [s for s in steps if s["t_enter_ns"] >= start]
             for i, step in enumerate(steps):
@@ -547,6 +580,18 @@ def read(directory, stage: int = 0) -> dict[int, list[dict]]:
                 row[0] = keys.get(row[0], row[0])
         record[int(path.stem[len(prefix) + 2 :])] = steps
     return record
+
+
+def transfers(directory) -> dict[tuple[int, int], str]:
+    """`TRANSFERS` in `directory` as {(prefill DP rank, prefill request id):
+    decode response id}; empty without it."""
+    path = pathlib.Path(directory) / TRANSFERS
+    if not path.exists():
+        return {}
+    return {
+        (t["remote_dp_rank"], t["transfer_id"]): t["response_id"]
+        for t in read_jsonl(path)
+    }
 
 
 def _request_ranks(name: str, record: dict[int, list[dict]]) -> dict[str, int]:
@@ -569,8 +614,9 @@ def compare(real, simulated) -> dict:
     A rank's entry is None where its steps all agree, else the step index and
     both steps, None for a record that has already ended. A record with no
     steps is refused: two runs that scheduled nothing agree, and that means
-    nothing. Steps are compared and reported without timestamps or response ids. Under
-    `steps`, each rank's count of step pairs compared and of identical ones.
+    nothing. Steps are compared and reported without timestamps or request
+    or response ids. Under `steps`, each rank's count of step pairs compared
+    and of identical ones.
     """
     records = {"real": read(real), "simulated": read(simulated)}
     for name, record in records.items():
@@ -578,7 +624,7 @@ def compare(real, simulated) -> dict:
             raise ValueError(f"the {name} record has no steps to compare.")
         for steps in record.values():
             for step in steps:
-                for key in (*TIMESTAMPS, "response_ids"):
+                for key in (*TIMESTAMPS, "request_ids", "response_ids"):
                     step.pop(key, None)
     first, counts = {}, {}
     for rank in sorted(records["real"].keys() | records["simulated"].keys()):
