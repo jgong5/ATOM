@@ -44,6 +44,10 @@ A law fitted on an MTP record holds a draft law of its own form under `draft`.
 Its terms, named `draft.<kind>.<feature>`, are tagged `draft` and priced from the
 same features, on a step that produces no output too: there the draft is the
 pass that fills the drafter's KV over the chunk.
+A draft law may also hold a `propose` vector over `[1, seqs]`, seqs the step's
+requests: on a prefill step that produces output it adds the drafter's
+`propose` pass, which a middle chunk does not run, and a prefill step that does
+not say whether it produces output is refused.
 
 The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
 
@@ -51,7 +55,8 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
      "machine_spec": "sha256:<hex>",
      "prefill": VECTOR,
      "decode": {"eager": VECTOR, "1": VECTOR, "2": VECTOR, ...},
-     "draft": {"provenance": ..., "prefill": VECTOR, "decode": {...}}}
+     "draft": {"provenance": ..., "prefill": VECTOR, "decode": {...},
+               "propose": VECTOR}}   # `propose` optional
 
     VECTOR = {"coefficients": {<feature>: seconds, ...},
               "hull": HULL,
@@ -90,6 +95,7 @@ PREFILL = ("step", "tokens", "query_square", "query_cached")
 HISTORY = PREFILL + ("history",)
 DECODE = ("step", "context", "graph_padding")
 ROWMOD = DECODE + ("rowmod",)
+PROPOSE = ("step", "seqs")
 EAGER = "eager"
 SOURCE = "step-linear"
 EXTRAPOLATED = "step-linear-extrapolated"
@@ -157,6 +163,9 @@ class StepLinearLaw:
             for rung, spec in law["decode"].items()
         }
         self.draft = StepLinearLaw(law["draft"]) if "draft" in law else None
+        self.propose = law.get("propose") and _Vector(
+            "propose", PROPOSE, law["propose"]
+        )
 
 
 class StepLinearBackend(CostBackend):
@@ -222,6 +231,21 @@ class StepLinearBackend(CostBackend):
             counts = (1, sum_context(decode), batch_view.graph_padding)
             if vector.rowmod:
                 counts += (rowmod([r.context_tokens for r in decode], vector.rowmod),)
+        terms = self._priced(law, vector, kind, counts, what)
+        if prefill and law.propose is not None:
+            if batch_view.produces_output is None:
+                raise self._refuse(
+                    batch_view,
+                    "a prefill step that does not say whether it produces output, "
+                    f"which decides its {what}propose pass",
+                )
+            if batch_view.produces_output:
+                seqs = (1, len(batch_view.requests))
+                terms += self._priced(law, law.propose, "propose", seqs, what)
+        return terms
+
+    def _priced(self, law, vector: _Vector, kind: str, counts: tuple, what: str):
+        """`vector`'s terms for a step of features `counts`."""
         detail, source = law.fitted_on, SOURCE
         if not vector.hull.contains(counts[1:]):
             source = EXTRAPOLATED

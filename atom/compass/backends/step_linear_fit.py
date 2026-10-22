@@ -64,7 +64,10 @@ out and named under `unfitted`; `StepLinearBackend` refuses its steps.
 
 On an MTP record a step also carries a draft label (`step_labels`). `fit` fits
 the steps that carry one on their draft labels the same way, and writes that law
-under the law's `draft`; it holds no `held_out`.
+under the law's `draft`; it holds no `held_out`. A step with a propose label
+(`step_labels`) is fitted there on its draft label less that label, the
+draft-KV pass a middle chunk runs too, and left out when nothing remains; the
+propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`.
 
 Forms (`FORMS`): `base`, the features `StepLinearLaw` always prices; `history`,
 prefill plus `Sum (N_KV - N_Q)`, the KV a short chunk reads on a deep history;
@@ -110,6 +113,7 @@ from atom.compass.backends.step_linear import (
     EAGER,
     HISTORY,
     PREFILL,
+    PROPOSE,
     ROWMOD,
     rowmod,
 )
@@ -551,13 +555,30 @@ def fit(samples, options=None, seed: int = 0) -> tuple[dict, dict]:
         "held_out": {},
     }
     drafts = [
-        dataclasses.replace(s, device_s=s.draft_s, draft_s=None)
+        dataclasses.replace(
+            s, device_s=s.draft_s - (s.propose_s or 0.0), draft_s=None, propose_s=None
+        )
         for s in samples
-        if s.draft_s is not None
+        if s.draft_s is not None and s.draft_s > (s.propose_s or 0.0)
     ]
     if drafts:
         law["draft"] = fit(drafts, options, seed)[0]
+        if proposes := [s for s in samples if s.propose_s is not None]:
+            law["draft"]["propose"] = _propose(proposes)
     return law, report
+
+
+def _propose(samples) -> dict:
+    """The draft law's `propose` vector over `samples`' propose labels, on
+    `PROPOSE`, solved and hulled as a step vector is."""
+    x = np.array([(1, len(s.view.requests)) for s in samples], dtype=np.float64)
+    s = _solve(x, np.array([s.propose_s for s in samples]), list(PROPOSE))
+    fitted = {k: s[k] for k in ("condition", "centre", "mad", "zero")}
+    return {
+        "coefficients": dict(zip(PROPOSE, map(float, s["coef"]))),
+        "hull": _hull(x[s["keep"]][:, 1:], PROPOSE[1:]),
+        "fit": {"samples": int(s["keep"].sum()), **fitted},
+    }
 
 
 def token_band(tokens: int) -> str:

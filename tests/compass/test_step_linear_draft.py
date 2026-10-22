@@ -13,6 +13,7 @@ from test_validate_cost import _record as _rank_record
 
 from atom.compass.backends import (
     BatchView,
+    CostRefused,
     CostTerm,
     RequestShape,
     StepCost,
@@ -148,3 +149,48 @@ def test_a_group_step_prices_as_its_rank_of_dearest_target_not_of_dearest_step(
         s = report["validated"][kind]
         assert s["steps"] == 10
         assert s["on_totals"] == pytest.approx(0.0, abs=1e-9)
+
+
+#: A final chunk's `propose` pass: seconds per step and per sequence.
+PROPOSE = (5e-4, 4e-5)
+
+
+def test_a_final_chunk_s_propose_pass_is_fitted_apart_and_a_middle_chunk_prices_none(
+    tmp_path,
+):
+    """A prefill step that produces output runs `propose` after its draft-KV
+    pass; a middle chunk runs the draft-KV pass alone."""
+    steps, plan = _steps(3), []
+    for i, (rows, _, s) in enumerate(steps):
+        prefill, output = not rows[0][2], i % 4 != 0
+        propose = PROPOSE[0] + PROPOSE[1] * len(rows) if prefill and output else 0
+        plan.append((output, s, propose))
+    path = tmp_path / "dp0.jsonl"
+    _record(
+        path, [(r, g, s * (1 + SHARE) + p) for (r, g, _), (_, s, p) in zip(steps, plan)]
+    )
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    for line, (output, s, propose) in zip(lines, plan):
+        line.update(produces_output=output, d_target_ns=round(s * 1e9))
+        if propose:
+            line["d_propose_ns"] = round(propose * 1e9)
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    law = _fit([path])
+    propose = law["draft"]["propose"]["coefficients"]
+    assert (propose["step"], propose["seqs"]) == pytest.approx(PROPOSE, rel=1e-4)
+
+    backend = StepLinearBackend(StepLinearLaw(law))
+    rows = (RequestShape(512, 512, False), RequestShape(256, 4096, False))
+    middle, final = (
+        backend.price(BatchView(rows, produces_output=output))
+        for output in (False, True)
+    )
+    assert final.target_seconds == middle.target_seconds
+    draft_kv = SHARE * middle.target_seconds
+    assert middle.draft_seconds == pytest.approx(draft_kv, rel=1e-4)
+    assert not [t for t in middle.terms if "propose" in t.name]
+    assert final.draft_seconds == pytest.approx(
+        draft_kv + PROPOSE[0] + 2 * PROPOSE[1], rel=1e-4
+    )
+    with pytest.raises(CostRefused, match="whether it produces output"):
+        backend.price(BatchView(rows))
