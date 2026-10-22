@@ -18,7 +18,9 @@ window is `d_busy_ns`, from an event recorded at the launch's entry to one
 recorded at the forward's exit (`d_target_ns` to one recorded just after
 `postprocess` records `forward_done_event`, less the drafter's `compute_draft_kv`
 pass before it, or on a forward that samples nothing, to the start of its first
-drafter pass, that one or `propose_draft_token_ids`), and `d_gap_ns`, from the previous forward's
+drafter pass, that one or `propose_draft_token_ids`); `d_draft_kv_ns` and
+`d_propose_ns` time those two drafter passes, each between device events at its
+entry and exit, on a forward that runs it; and `d_gap_ns`, from the previous forward's
 exit event to this launch's entry event, absent on the first line; summed in
 order they lay every forward on one device timeline. A later pipeline stage's
 receive of its input is `t_pp_recv_ns`, its device part `d_recv_ns`; an idle
@@ -91,6 +93,8 @@ TIMESTAMPS = (
     "d_gap_ns",
     "d_target_ns",
     "d_recv_ns",
+    "d_draft_kv_ns",
+    "d_propose_ns",
     "t_pull_ns",
     "t_put_ns",
 )
@@ -395,7 +399,7 @@ class StepRecording:
             )
             draft_kv = self.drafter.compute_draft_kv
             self.drafter.compute_draft_kv = functools.partial(
-                self._draft_pass, "draft_kv_end", draft_kv
+                self._draft_pass, "d_draft_kv_ns", draft_kv
             )
         self._recording = True
 
@@ -439,22 +443,21 @@ class StepRecording:
             self._stamps["target_event"] = self.device_event()
         return call(*args)
 
-    def _draft_pass(self, end, call, *args, **kwargs):
-        """`call`, a drafter pass. The first one's start ends the target of a
-        forward that samples nothing; with `end`, a device event where it ends
-        is kept under that name."""
+    def _draft_pass(self, key, call, *args, **kwargs):
+        """`call`, a drafter pass, between two device events kept under `key`,
+        the line field that times it. The first pass's start also ends the
+        target of a forward that samples nothing."""
         if getattr(self, "_parity_record", None) is None:
             return call(*args, **kwargs)
-        if "draft_event" not in self._stamps:
-            self._stamps["draft_event"] = self.device_event()
+        start = self.device_event()
+        self._stamps.setdefault("draft_event", start)
         reply = call(*args, **kwargs)
-        if end:
-            self._stamps[end] = self.device_event()
+        self._stamps[key] = [start, self.device_event()]
         return reply
 
     def propose_draft_token_ids(self, *args, **kwargs):
         call = super().propose_draft_token_ids
-        return self._draft_pass(None, call, *args, **kwargs)
+        return self._draft_pass("d_propose_ns", call, *args, **kwargs)
 
     def _gate_staging_reuse(self):
         return self._stamped("t_gate_ns", super()._gate_staging_reuse)
@@ -475,15 +478,19 @@ class StepRecording:
         names = {"d_target_ns": "target_event", "d_recv_ns": "recv_event"}
         marks = {k: [stamps.pop(e)] for k, e in names.items() if e in stamps}
         first = stamps.pop("draft_event", None)
-        kv_end = stamps.pop("draft_kv_end", None)
-        if "d_target_ns" in marks and kv_end is not None:
+        passes = {
+            k: stamps.pop(k) for k in ("d_draft_kv_ns", "d_propose_ns") if k in stamps
+        }
+        if "d_target_ns" in marks and "d_draft_kv_ns" in passes:
             # It sampled after its draft-KV pass, the first drafter pass a
             # forward runs, and that pass is not the target's work.
-            marks["d_target_ns"] += [first, kv_end]
+            marks["d_target_ns"] += passes["d_draft_kv_ns"]
         elif first is not None:
             marks.setdefault("d_target_ns", [first])
         window = None
         if launch is not None:
+            for key, (start, end) in passes.items():
+                marks[key] = [end, launch, start]
             done, previous = self.device_event(), self._last_exit
             self._last_exit = done
             window = functools.partial(_window, previous, launch, done, marks)
