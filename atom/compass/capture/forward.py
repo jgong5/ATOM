@@ -561,7 +561,8 @@ class _Recorder(TorchDispatchMode):
         if isinstance(value, torch.Tensor):
             role = self.roles.get(_storage(value), ir.Role.METADATA)
             shape, stride = tuple(value.shape), value.stride()
-            return ir.Tensor(shape, str(value.dtype), stride, role)
+            shuffled = bool(getattr(value, "is_shuffled", False))
+            return ir.Tensor(shape, str(value.dtype), stride, role, shuffled)
         if isinstance(value, torch.nn.Module) and id(value) in self.modules:
             return ir.ModuleRef(self._layered(self.modules[id(value)]))
         if isinstance(value, str) and value in self.contexts:

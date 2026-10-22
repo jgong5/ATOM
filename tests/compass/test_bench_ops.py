@@ -609,6 +609,23 @@ def test_a_packed_fp4_activation_and_weight_are_built_at_their_shape_and_stride(
         assert t.view(torch.uint8).unique().numel() > 1
 
 
+def test_a_weight_captured_preshuffled_is_built_marked_and_only_that_one():
+    # aiter's fused_moe_ picks its kernel by its weights' `is_shuffled`, which
+    # no shape or dtype shows: a leaf built without it runs another kernel.
+    moe = _leaf(
+        "aiter.fused_moe_",
+        ("w1", ir.Tensor((4, 3), F32, (3, 1), "weight", shuffled=True)),
+        ("w2", _t([3, 4], "weight")),
+    )
+    [(op, _)] = ops.leaves(_graph(moe)["region"]).values()
+    stub = ops.Stub(_Runner(), 1)
+
+    copies = [stub._weight(op["args"]["w1"], c, 2) for c in (0, 1)]
+
+    assert all(t.is_shuffled is True for t in copies)
+    assert not hasattr(stub._weight(op["args"]["w2"], 0, 2), "is_shuffled")
+
+
 def test_a_call_that_fills_a_graph_alone_cycles_no_second_weight():
     # The leaf occurs twice, but one call fills `GRAPH_NS`: the graph holds
     # one call, so one copy, and no warm graph.
