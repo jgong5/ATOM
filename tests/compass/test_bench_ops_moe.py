@@ -124,6 +124,28 @@ def test_the_draw_is_seeded_by_the_copy_and_the_seed():
     assert ids(0) != ids(1)
 
 
+def test_a_leaf_after_another_under_the_model_s_default_dtype_draws_as_alone():
+    # ATOM's runner leaves the model's dtype as torch's default; a draw at
+    # bfloat16 ties within a row, so its top-k ids depend on how ties break.
+    moe = {"op": MOE["op"], "args": {"topk_ids": _spec([256, 6])}}
+
+    def ids(stub):
+        return [c["topk_ids"].tolist() for c in _timed(stub, moe, 3)[1]]
+
+    alone = ids(_stub((256, 6)))
+    stub = _stub((256, 6))
+    default = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        other = {"op": MOE["op"], "args": {"topk_ids": _spec([64, 6])}}
+        assert _timed(stub, other, 2)[0]["routing"]  # another leaf draws first
+        after = ids(stub)
+    finally:
+        torch.set_default_dtype(default)
+
+    assert after == alone
+
+
 def test_a_dense_model_draws_nothing():
     record, [copy] = _timed(_stub(), MOE, 1)
 

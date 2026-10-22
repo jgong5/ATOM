@@ -6,6 +6,7 @@ stub runs beside a stand-in runner whose input preparation sets ATOM's forward
 context, as ATOM's runner does, and whose forward raises.
 """
 
+import collections
 import contextlib
 import dataclasses
 import functools
@@ -559,6 +560,57 @@ def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placeme
     assert "ATOM's live KV has no room for kv [500, 4]" in got["y"]["refused"]
 
 
+def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
+    monkeypatch,
+):
+    # aiter's workspace is a NamedTuple, one per device: this runner's is at
+    # index 1, another's at 0. A live buffer of o_acc's own spec and one with
+    # room for cnt would take them by `_meta`'s rules. The module stands in for
+    # hca_persist, whose package needs aiter's JIT to import.
+    work = collections.namedtuple("Workspace", "o_acc cnt")
+    other = work(torch.randn(4, 2, 3), torch.arange(5, dtype=torch.int32))
+    workspace = work(torch.randn(4, 2, 3), torch.arange(7, 12, dtype=torch.int32))
+    hca = SimpleNamespace(_workspaces={0: other, 1: workspace})
+    monkeypatch.setitem(sys.modules, "atom.model_ops.v4_kernels.hca_persist", hca)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    runner = _Runner()
+    runner.device = torch.device("cpu", 1)
+    runner.forward_vars["partials"] = torch.zeros(4, 2, 3)
+    cnt = ("cnt", _t([5], "metadata", dtype="torch.int32"))
+    found = ops.leaves(
+        _graph(
+            _leaf(ops.HCA_DECODE, ("o_acc", _t([4, 2, 3], "metadata")), cnt),
+            # another operator's slot of a field's name keeps the live pick
+            _leaf("aten.add_.Tensor", cnt),
+            _leaf(ops.HCA_DECODE, ("cnt", _t([9], "metadata", dtype="torch.int32"))),
+            layers=1,
+        )["region"]
+    )
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    graphs = []
+
+    def replay(fn, calls):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        got = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+
+    asm, add, wide = got
+    assert asm["metadata"] == {"o_acc": "o_acc", "cnt": "cnt"}
+    assert add["metadata"] == {"cnt": "block_tables"}
+    assert "ATOM's live HCA workspace has no room for cnt" in wide["refused"]
+    for kwargs, _ in graphs[0]:
+        assert torch.equal(kwargs["o_acc"], workspace.o_acc)
+        assert torch.equal(kwargs["cnt"], workspace.cnt)
+
+
 def test_a_call_cycles_a_weight_per_occurrence_on_the_cold_copies_inputs():
     # One copy already passes twice a 1-byte cache. The leaf occurs twice in
     # the step: copy 1 is copy 0 with a second weight, so a weight count past
@@ -607,6 +659,23 @@ def test_a_packed_fp4_activation_and_weight_are_built_at_their_shape_and_stride(
         assert t.dtype == torch.float4_e2m1fn_x2
         assert (t.shape, t.stride()) == ((2, 3), (4, 1))
         assert t.view(torch.uint8).unique().numel() > 1
+
+
+def test_a_weight_captured_preshuffled_is_built_marked_and_only_that_one():
+    # aiter's fused_moe_ picks its kernel by its weights' `is_shuffled`, which
+    # no shape or dtype shows: a leaf built without it runs another kernel.
+    moe = _leaf(
+        "aiter.fused_moe_",
+        ("w1", ir.Tensor((4, 3), F32, (3, 1), "weight", shuffled=True)),
+        ("w2", _t([3, 4], "weight")),
+    )
+    [(op, _)] = ops.leaves(_graph(moe)["region"]).values()
+    stub = ops.Stub(_Runner(), 1)
+
+    copies = [stub._weight(op["args"]["w1"], c, 2) for c in (0, 1)]
+
+    assert all(t.is_shuffled is True for t in copies)
+    assert not hasattr(stub._weight(op["args"]["w2"], 0, 2), "is_shuffled")
 
 
 def test_a_call_that_fills_a_graph_alone_cycles_no_second_weight():
@@ -886,6 +955,52 @@ def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
 
     replays = range(ops.WARMUPS + ops.REPEATS)
     assert slept == [(i + 1) * ops.REST / 1e3 for i in replays]
+
+
+def test_a_capture_waits_for_the_driver_to_clear_a_release_and_a_capped_wait_is_recorded(
+    monkeypatch,
+):
+    # Each capture returns 8 GiB the allocator held. The cold graph's clear
+    # lands at the card's third reading after its release, and its wait ends
+    # there; the warm graph's never lands, and its wait ends at the cap.
+    gib = 1 << 30
+    readings = [20 * gib, 20 * gib, 20 * gib, 12 * gib, 20 * gib]
+    read, captured = [], []
+    monkeypatch.setattr(ops, "CLEAR_S", 0.05)
+    monkeypatch.setattr(ops, "_waited", ops.Counter())
+    monkeypatch.setattr(
+        ops, "_vram_used", lambda: read.append(1) or readings[min(len(read), 5) - 1]
+    )
+    monkeypatch.setattr(torch.cuda, "memory_reserved", iter([8 * gib, 0] * 2).__next__)
+
+    @contextlib.contextmanager
+    def graph(g, capture_error_mode=None):
+        captured.append(len(read))
+        yield
+
+    def event(enable_timing):
+        return SimpleNamespace(
+            record=lambda: None, synchronize=lambda: None, elapsed_time=lambda e: 1.0
+        )
+
+    monkeypatch.setattr(torch.cuda, "graph", graph)
+    monkeypatch.setattr(
+        torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=lambda: None)
+    )
+    monkeypatch.setattr(torch.cuda, "Event", event)
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+    ):
+        record = stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], 8)
+
+    assert captured[0] == 4  # the cold graph captured once the 12 GiB reading came
+    assert len(read) > 6  # the warm graph's wait read until the cap
+    assert record["release_capped"] == 1
+    assert ops.CLEAR_S <= record["release_wait_s"] < ops.CLEAR_S + 1
+    assert not ops._waited  # taken by the point
 
 
 def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(

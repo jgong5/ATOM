@@ -18,7 +18,7 @@ has no `exclusive` value (D19).
 [bench, band and capture ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252):**
 capture is concrete, one graph per decode width and prefill (T, B) that `trace ops` is
 given or that a record directory's steps hold (D17, D18, D19); each leaf carries a contract, its arguments by schema
-slot with each tensor's stride and role, and a raw Triton or FlyDSL launch lifts to its
+slot with each tensor's stride, role and preshuffled mark, and a raw Triton or FlyDSL launch lifts to its
 innermost ATOM function (D20).
 
 **Revised 2026-10-19 by #1401's capture of DeepSeek-V4-Pro:** capture runs ATOM's two MoE
@@ -486,14 +486,23 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   verified tokens, unpadded), and tags each of its terms `draft` (`draft op.<kind>`), so
   `StepCost.draft_seconds` is the drafter's and `target_seconds` the target's. A decode's
   default G counts each row's drafts, `dp x width x (drafts + 1)` (`Shape.at`).
-- **Refused by name.** A middle chunk under a drafter: ATOM runs its draft-KV pass
-  (`compute_draft_kv`) on a real step only, and a prefill shape is traced as a dummy run,
-  so no graph holds that pass. A block drafter (DSpark): it writes its draft KV before
+- **A middle chunk is cut where its draft-KV pass starts.** ATOM runs that pass
+  (`compute_draft_kv`) after every target forward of a real step, a middle chunk's included,
+  and a middle chunk records no `forward_done_event`. Under a drafter a prefill shape is
+  therefore traced as a real step's batch, each row stating its next token as ATOM's
+  scheduler does, and the middle chunk is cut where the pass starts, as the parity record
+  stamps `d_target_ns` there ([#1585](https://github.com/jgong5/ATOM/pull/1585),
+  [#1874](https://github.com/jgong5/ATOM/issues/1874)). A GDN prefill under ReplaySSM counts
+  its live state slots with a boolean index, a size no fake tensor holds; the host-staged
+  slot indices bind it.
+- **Refused by name.** A block drafter (DSpark): it writes its draft KV before
   `forward_done_event` on a step that samples ([#1607](https://github.com/jgong5/ATOM/pull/1607)),
   so one cut does not part its target from its draft. The drafter of a DP decode padded
   to its rung: its first pass runs the rows' tokens unpadded, and a graph at the rung
   traces the rung's, so it would price high
-  ([#1961](https://github.com/jgong5/ATOM/issues/1961)).
+  ([#1961](https://github.com/jgong5/ATOM/issues/1961)). A DP middle chunk: under DP
+  ATOM runs the drafter's passes for their collectives (`propose(align_only=True)`) in
+  place of the draft-KV pass, and records neither cut, so its one graph holds both.
 
 The drafter's roofline is not its measured time. On #1208's MTP1 record
 (Qwen3.5-35B-A3B-FP8, TP1, MI308X) the drafter's roofline is 0.39 of the measured draft at
@@ -575,8 +584,9 @@ Graph   := (applicability, Region)
 Region  := Seq[Node] | Repeat(body: Region, count: int) | Par([Region], join: JoinPolicy)
 Node    := Op(name, kind, args: {slot: Arg}, out_shapes: [Shape],
               stream_id, context_ref, stated: {name: Value})
-Arg     := Tensor(shape, dtype, stride, role) | Value | ModuleRef(path)
+Arg     := Tensor(shape, dtype, stride, role, shuffled) | Value | ModuleRef(path)
 role    := activation | weight | KV | metadata
+shuffled := bool, ATOM's `is_shuffled` mark on a preshuffled weight
 ```
 
 ### `Repeat` — the efficiency property
@@ -900,9 +910,14 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
 2026-10-18. Capture records, for each leaf, what `measure ops` needs to call it again
 (`07` D38, Phase 1b):
 
-- **Arguments by schema slot.** Each tensor carries its shape, dtype, stride and role.
-  The stride is part of the call: qk-norm's q and k are strided views of the qkv output,
-  and contiguous stand-ins read it 2.1% to 4.8% low.
+- **Arguments by schema slot.** Each tensor carries its shape, dtype, stride, role and
+  preshuffled mark. The stride is part of the call: qk-norm's q and k are strided views
+  of the qkv output, and contiguous stand-ins read it 2.1% to 4.8% low. The mark is too
+  ([#1953](https://github.com/jgong5/ATOM/issues/1953)): ATOM sets `is_shuffled` on a
+  weight it preshuffled after loading, and aiter's `fused_moe_` picks its kernel by that
+  mark on `w1` and `w2`, which no shape or dtype shows. A replay without it calls a
+  different kernel, which D20's contract forbids; unmarked mxfp4 MoE weights reach CK
+  stage kernels that refuse the shape.
 - **Role by provenance.** `activation`, `weight`, `KV` or `metadata`, read from where the
   tensor's storage came from rather than from the argument's name, so an ambient tensor
   passed under another name, such as `kv_indptr_convert`, still reads metadata.
@@ -1447,7 +1462,7 @@ Deferred to future work by decision on 2026-09-18.
 | D18 | Capture with `TorchDispatchMode` + `FakeTensorMode`, on FakeTensor rather than bare meta, at concrete shapes: one graph per decode width and prefill (T, B) that `trace ops` is given or that a record directory's steps hold. The symbolic route A and its four disciplines (the fourth: the engine's host arithmetic asks a symbol for a number, so a symbolic capture keeps the conversion, logs it with its line, and asserts that log against a stated set) are recorded, not built. Under a drafter a step that samples is two graphs, the target's and the drafter's, cut at `forward_done_event` | 2026-09-18, fourth discipline 2026-09-22; concrete 2026-10-18 (#1489); drafter 2026-10-21 (#1270) |
 | D18.1 | `torch.export` recorded as an unverified alternative; rejected now on decomposition fidelity and on capturing a model call rather than an engine step | 2026-09-18 |
 | D19 | Hierarchical, concrete, stream-annotated IR: `Seq` / `Repeat` / `Par`, a node's arguments its leaf contract. No branches in the IR — applicability is a discrete key and the captured shape, matched by equality | 2026-09-18; revised 2026-10-18 (#531); concrete 2026-10-18 (#1489) |
-| D20 | Opaque leaves are priced, not decomposed. Each carries a stated parameter extractor and a contract: arguments by schema slot, each tensor's stride and role by provenance (activation, weight, KV, metadata), non-tensor arguments and module references kept, a runner attribute as `runner.<attr>`, any other object in pickle's reduce shape or refused by its type. A raw Triton (`JITFunction.run`, a warmup aside) or FlyDSL (`JitFunction.__call__`, `CompiledFunction.__call__`) launch lifts to the first function its `module:qualname` names, past the languages' frames, closures and generic launchers; a direct `CompiledKernel.run` is refused. Nested launching calls and custom ops fold into the outermost; arguments come from call entry in a traced step that follows two untraced steps of its shape; each contract must replay to the same kernels and operators outside torch's, and a launch outside a found function, a raise after a launch or a call open at the step's end is refused. An `op_graph` is keyed by the step law's engine config less its ladder, the performance environment in it, and a miss names each differing field; keying on a kernel-selecting environment variable is a workaround for an ATOM design that should take the choice as an argument. Capture runs the two MoE wrappers' bodies; their DP and MORI exchanges are declared nodes named for the function ATOM calls, and a TBO step is refused. | 2026-09-18; contract 2026-10-18 (#1489); MoE exchanges 2026-10-19 (#1401); lift rule and key 2026-10-20 (#1811); two untraced steps 2026-10-21 (#1812) |
+| D20 | Opaque leaves are priced, not decomposed. Each carries a stated parameter extractor and a contract: arguments by schema slot, each tensor's stride, role by provenance (activation, weight, KV, metadata) and preshuffled mark, non-tensor arguments and module references kept, a runner attribute as `runner.<attr>`, any other object in pickle's reduce shape or refused by its type. A raw Triton (`JITFunction.run`, a warmup aside) or FlyDSL (`JitFunction.__call__`, `CompiledFunction.__call__`) launch lifts to the first function its `module:qualname` names, past the languages' frames, closures and generic launchers; a direct `CompiledKernel.run` is refused. Nested launching calls and custom ops fold into the outermost; arguments come from call entry in a traced step that follows two untraced steps of its shape; each contract must replay to the same kernels and operators outside torch's, and a launch outside a found function, a raise after a launch or a call open at the step's end is refused. An `op_graph` is keyed by the step law's engine config less its ladder, the performance environment in it, and a miss names each differing field; keying on a kernel-selecting environment variable is a workaround for an ATOM design that should take the choice as an argument. Capture runs the two MoE wrappers' bodies; their DP and MORI exchanges are declared nodes named for the function ATOM calls, and a TBO step is refused. | 2026-09-18; contract 2026-10-18 (#1489); MoE exchanges 2026-10-19 (#1401); lift rule and key 2026-10-20 (#1811); two untraced steps 2026-10-21 (#1812); preshuffled mark 2026-10-22 (#1953) |
 | D21 | Stated nodes over chased coverage, their terms declared; refuse and record `unpriced` reasons; a failed forward writes no graph. The MoE exchanges are the first stated nodes | 2026-09-18; revised 2026-10-14 (#952); MoE exchanges 2026-10-19 (#1401) |
 | D22 | Liveness stays observational under fake tensors; internal scratch of an opaque leaf is a stated per-leaf constant. Revised: until capture lands the activation term is a coefficient measured on a real run, scratch inside it, and the walk replaces it after | 2026-09-18; revised 2026-10-10 |
 | D23 | Trace eager, price with the regime constant of the real step. The inductor fusion gap (~4.8% decode) is a documented **TODO**, not a decision. | 2026-09-18 |

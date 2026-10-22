@@ -162,6 +162,23 @@ def test_each_layer_runs_its_shared_expert_beside_the_moe_on_every_rank_s_rows(
         assert _rows(exchanged[0]) == (tokens, DP * tokens)
 
 
+def test_the_moe_leaf_holds_its_weights_as_atom_marked_them_preshuffled(
+    tmp_path_factory,
+):
+    # aiter's fused_moe_ picks its kernel by `is_shuffled` on w1 and w2, which
+    # ATOM sets after loading; a replay needs the mark as well as the shape.
+    graph, _ = capture(tmp_path_factory, SHAPES + DPA_TP8)["decode B=2"]
+
+    moes = [
+        op for op in _ops(graph["region"]) if op["op"] == "aiter.fused_moe_.default"
+    ]
+
+    assert len(moes) == LAYERS
+    for op in moes:
+        marks = [op["args"][w].get("is_shuffled") for w in ("w1", "w2")]
+        assert marks == [True, True]
+
+
 def test_a_dp_decode_at_width_1_gathers_one_row_from_each_rank(tmp_path_factory):
     graph, _ = capture(tmp_path_factory, SHAPES + DPA_TP8)["decode B=1"]
 
