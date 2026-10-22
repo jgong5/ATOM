@@ -24,7 +24,8 @@ head or its sampler runs. Each point reaches the runner as a batch
 metadata and forward context, and a `Stub` calls each leaf from its contract:
 an activation is random at its shape, dtype and stride, except a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
-experts' ids ATOM fuses into them (`_route`); a weight is random at its
+experts' ids ATOM fuses into them (`_route`), and the `NM_OUTPUT` slot at
+one KV split, a view at the start of twice its span; a weight is random at its
 shape, dtype and stride, one tensor per occurrence of the leaf in the step;
 a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
@@ -214,6 +215,10 @@ V4_METADATA = {
     (_QKN, "batch_id_per_token"): "batch_id_per_q_token",
 }
 V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
+#: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
+#: at one KV split writes its BF16 `output` at the FP32 split stride, twice
+#: the span, and past an exact buffer kills the process (aiter defect, #1977).
+NM_OUTPUT = (_NM, "output")
 #: The seed of a copy's drawn expert ids, with the copy's index.
 SEED = 0
 #: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
@@ -779,6 +784,12 @@ class Stub:
                 return (_module_copy(held) if fresh else held) if module else key
             if isinstance(value, dict) and "affine" in value:
                 return ir.Affine(*value["affine"]).at(self.context)
+            if (op["op"], path) == NM_OUTPUT and op["args"].get("num_kv_splits") == 1:
+                # the captured view at the start of the kernel's write extent
+                n = _span(value["shape"], value["stride"])
+                device = self.runner.device
+                whole = _random({**value, "shape": [2 * n], "stride": [1]}, device)
+                return whole.as_strided(value["shape"], value["stride"])
             if isinstance(value, dict):
                 return self._tensor(value, meta.get((sig, path)), fresh)
             if isinstance(value, str) and value.startswith("torch."):
