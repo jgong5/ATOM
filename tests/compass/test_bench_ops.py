@@ -546,18 +546,59 @@ def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placeme
 
     # 32 bytes of q, and per state slot of the two rows 16 of kv and 32 of
     # state: 128 a call, 16 copies past twice 1000 bytes, each its own
-    # placement, of which 6 slots hold 3 of two rows.
+    # placement, which the pool's 64 blocks hold; 6 slots hold 3 of two rows,
+    # and the placements past them take those slots again.
     record = got["x"]
     assert record["metadata"] == {"kv": "v4_unified_kv.1", "st": "v4_state"}
-    assert (record["copies"], record["placements"]) == (16, 3)
-    assert runner.batches == [(4 * p, 2 * p) for p in range(3)]
+    assert (record["copies"], record["placements"]) == (16, 16)
+    assert runner.batches == [(4 * p, 2 * p % 6) for p in range(16)]
     for c, (kwargs, snap) in enumerate(graphs[0][:16]):
         assert kwargs["kv"].untyped_storage().data_ptr() == plane.data_ptr()
         assert kwargs["kv"].storage_offset() == 8
         assert kwargs["kv"].shape == (60, 1, 1, 4)
         assert kwargs["st"].data_ptr() == state.data_ptr()
-        assert set(snap.attn_metadata.block_tables.flatten().tolist()) == {4 * (c % 3)}
+        assert set(snap.attn_metadata.block_tables.flatten().tolist()) == {4 * c}
     assert "ATOM's live KV has no room for kv [500, 4]" in got["y"]["refused"]
+
+
+def test_a_plane_argument_is_sized_by_the_rows_of_the_batch_s_blocks(monkeypatch):
+    # DeepSeek-V4's decode attention states its layer's window and compress
+    # ratio and reads a plane indexed by rows, beside a model's state slots;
+    # a leaf stating the ratio alone writes a row per state slot.
+    runner = _Runner()
+    runner.pool_plan = SimpleNamespace(entries={"state": 6})
+    runner.config.kv_cache_block_size = 16
+    runner.kv_held = {"v4_unified_kv": [torch.zeros(100, 4)]}
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    leaf = _leaf(
+        "aiter.decode", ("q", _t([2, 4], "activation")), ("kv", _t([60, 4], "kv"))
+    )
+    found = ops.leaves(
+        _graph(
+            dataclasses.replace(
+                leaf, stated=(("window_size", 8), ("compress_ratio", 4))
+            ),
+            dataclasses.replace(
+                leaf, name="aiter.write", stated=(("compress_ratio", 4),)
+            ),
+            layers=1,
+        )["region"]
+    )
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    got = {
+        r["op"]: r for r in ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+    }
+
+    # Two rows of 20 tokens hold 4 blocks of 16, 16 rows at ratio 4: 256 bytes
+    # of kv and 32 of q a call, 7 copies past twice 1000 bytes. Per slot, 32
+    # of kv: 32 copies, each its own placement, of which the pool holds 16;
+    # 6 slots hold 3 of two rows, the rest take them again.
+    assert got["aiter.decode"]["footprint_bytes"] == 7 * 288
+    assert got["aiter.write"]["footprint_bytes"] == 32 * 64
+    assert got["aiter.decode"]["placements"] == 16
+    assert runner.batches == [(4 * p, 2 * p % 6) for p in range(16)]
 
 
 def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
