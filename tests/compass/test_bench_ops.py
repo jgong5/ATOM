@@ -1141,6 +1141,41 @@ def test_a_state_only_leaf_counts_each_slot_its_copies_read_once(
     assert {slot for _, slot in runner.batches} == {0, 2, 4, 6}
 
 
+def test_a_kv_leaf_past_its_cold_copies_counts_each_copy_s_activations_once(
+    monkeypatch,
+):
+    # update_compressor_states in 10 layers: 32 bytes of kv and two states of
+    # 128 a call, 7 copies past twice 1000. The 10 layers take 10 copies on one
+    # placement, and copies 7 to 9 read copies 0 to 2's kv.
+    runner = _Runner()
+    runner.pool_plan = SimpleNamespace(entries={"state": 8})
+    runner.kv_held = _state((16,))
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    state = _t([8, 16], "kv", stride=[64, 1])
+    args = ("kv", _t([2, 4], "activation")), ("kv_state", state), ("score", state)
+    leaf = _leaf("v4.states", *args, ("layer", ir.ContextRef(KEY)), key=KEY)
+    found = ops.leaves(_graph(leaf, layers=10)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+    graphs = []
+
+    def replay(fn, calls):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        [record] = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+
+    kvs = [kwargs["kv"] for kwargs, _ in graphs[0][:10]]
+    assert len({id(kv) for kv in kvs}) == 7
+    assert all(kv is kvs[c % 7] for c, kv in enumerate(kvs))
+    assert (record["copies"], record["placements"]) == (10, 1)
+    assert record["footprint_bytes"] == 7 * 32 + 256
+
+
 def test_a_block_view_beside_state_slots_counts_once_a_placement(monkeypatch):
     # DeepSeek-V4's decode compressor: it writes its row to a view of the
     # plane's blocks and reads its state, beside 6 state slots. A placement
