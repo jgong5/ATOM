@@ -241,8 +241,7 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     """
     draft_moe_rows = moe_tokens = dp_rank = draft_bs = None
     drafter = getattr(runner, "drafter", None)
-    eagle = drafter is not None and not drafter.is_block_drafter
-    if eagle and getattr(drafter, "step", None) is not None:
+    if getattr(drafter, "step", None) is not None:  # `EagleProposer`'s pass
         draft_bs = int(mode.running_bs)
     if mode.sync is not None:
         dp_rank = runner.config.parallel_config.data_parallel_rank
@@ -251,7 +250,7 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
             moe_rows = _data_parallel_size(runner) * mode.running_tokens
         else:
             moe_rows = gathered
-        if eagle:
+        if drafter is not None and not drafter.is_block_drafter:
             draft_moe_rows = gathered
     elif _data_parallel_size(runner) > 1:
         raise RunnerRefusal(
