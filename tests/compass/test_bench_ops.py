@@ -847,6 +847,42 @@ def test_a_compressor_state_is_a_layer_of_its_own_field_and_every_slot_stays_in_
     assert view.storage_offset() == hca.view("hca")[1].storage_offset()
 
 
+def test_a_v4_compressor_s_kv_cache_is_its_layer_s_block_view_and_no_other():
+    # DeepSeek-V4's main compressors write their layer's rows of every block
+    # of the plane, a view strided by a block's rows of every layer that no
+    # runner attribute holds: 4 a block in a CSA layer, 2 in an HCA one. A
+    # layer's view of the plane from its base row to the end is the tighter.
+    plane = torch.zeros(8 * 10, 4)
+    blocks = plane.view(8, 10, 4)
+
+    def layer(base, rows):
+        compressor = torch.nn.Module()
+        compressor.kv_cache, compressor.kv_cache_rope = (
+            blocks[:, base : base + rows],
+            None,
+        )
+        return torch.nn.ModuleDict(
+            {"attn": torch.nn.ModuleDict({"compressor": compressor})}
+        )
+
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([layer(0, 4), layer(4, 2), layer(6, 4)])
+    runner = SimpleNamespace(
+        model=model, kv_held={"v4_unified_kv": [plane, plane[30:]]}
+    )
+    held = ops._held(runner, {})
+
+    def bound(rows):
+        spec = {"shape": [6, rows, 4], "stride": [40, 4, 1], "dtype": F32, "role": "kv"}
+        return ops._kv(spec, "kv_cache", held)
+
+    (hca, hca_view), (csa, csa_view), (other, none) = bound(2), bound(4), bound(3)
+    assert (hca, hca_view.storage_offset()) == ("layers.1.attn.compressor.kv_cache", 16)
+    assert (csa, csa_view.storage_offset()) == ("layers.2.attn.compressor.kv_cache", 24)
+    assert none is None
+    assert other.startswith("ATOM's KV holds no tensor laid out as kv_cache [6, 3, 4]")
+
+
 @pytest.mark.parametrize("faulted", [False, True])
 def test_a_rank_whose_device_faulted_dies_and_one_that_refused_measures_on(
     monkeypatch, tmp_path, faulted
