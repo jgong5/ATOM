@@ -12,8 +12,8 @@ at its width, and any other step as a prefill of its query tokens over its
 rows, and under DP the rows the step's MoE gathered over the group, its line's
 `moe_rows`; under a drafter a decode's drafter also at its rows padded to the
 batch its later passes ran at, `draft_bs`, else to that rung, and the rows its
-first pass gathered, `draft_moe_rows`, and a sampling prefill's drafter at its
-`draft_bs` where that differs from its rows. Under
+first pass gathered, `draft_moe_rows`, and a sampling prefill's or DP middle
+chunk's drafter at its `draft_bs` where that differs from its rows. Under
 `--enable-tbo` a step its DP group split is its two
 micro-batches, each a prefill at its own tokens and the group's rows of it,
 by the split `validate bound` rebuilds from every rank's line; a population's
@@ -119,7 +119,7 @@ def population_steps(names, tbo=False, drafters=False):
     each a prefill at its own tokens and the group's rows of it. With
     `drafters`, a drafter's shape follows it where they differ: a decode's
     at its rows padded to `draft_bs`, else to its rung, a sampling prefill's
-    with `draft_bs` as its `width`."""
+    or a DP middle chunk's with `draft_bs` as its `width`."""
     from atom.compass.backends import BatchView, RequestShape
     from atom.compass.backends.op_graph import step_shape
     from atom.compass.backends.step_roofline import micro_batches
@@ -163,7 +163,7 @@ def population_steps(names, tbo=False, drafters=False):
             elif not split:
                 yield prefill(tokens, seqs, line.get("moe_rows")).at(dp), line
                 draft = prefill(tokens, seqs, line.get("draft_moe_rows"), width)
-                if drafters and line.get("produces_output") and draft.width:
+                if drafters and (line.get("produces_output") or dp > 1) and draft.width:
                     yield draft.at(dp), line
             else:
                 for half in halves:

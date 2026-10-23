@@ -516,7 +516,10 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   an all-middle-chunk batch and runs the drafter's propose for its collectives
   (`propose_draft_token_ids(..., align_only=True)`), all `mtp_k` passes; the cut is where
   that starts, as the parity record stamps `d_propose_ns` there
-  ([#1991](https://github.com/jgong5/ATOM/issues/1991)). A GDN prefill under ReplaySSM counts
+  ([#1991](https://github.com/jgong5/ATOM/issues/1991)). Its passes 2+ run at
+  `running_bs`, so its drafter is keyed `W=<draft_bs>` as a sampling prefill's is, and
+  `--population` captures that width's middle chunk too, drafter half alone
+  ([#2053](https://github.com/jgong5/ATOM/issues/2053)). A GDN prefill under ReplaySSM counts
   its live state slots with a boolean index, a size no fake tensor holds; the host-staged
   slot indices bind it.
 - **Refused by name.** A block drafter (DSpark): it writes its draft KV before

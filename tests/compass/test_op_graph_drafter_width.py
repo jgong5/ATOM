@@ -34,11 +34,12 @@ LADDER = [1, 2, 4, 8]
 DECODE = [(3, 90, True)] * 3
 
 
-def settled(monkeypatch, rows, peers=(), eager=False, step=True):
+def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True):
     """Rank 0's view of a step of `rows`, each ``(query, context, decode)``,
     under an MTP2 drafter beside DP `peers`, each ``(seqs, tokens,
     prefilling)``: its mode `ForwardMode.decide`'s on `LADDER`, or on ATOM's
-    eager one, `[0]`; `step` that the drafter declares a draft graph."""
+    eager one, `[0]`; `step` that the drafter declares a draft graph, `output`
+    that the step samples."""
     queries = [q for q, _, _ in rows]
     prefill = sum(not d for _, _, d in rows)
     batch = SimpleNamespace(
@@ -49,7 +50,7 @@ def settled(monkeypatch, rows, peers=(), eager=False, step=True):
         num_scheduled_tokens=queries,
         context_lens=[c for _, c, _ in rows],
         req_ids=list(range(len(rows))),
-        produces_output=lambda: True,
+        produces_output=lambda: output,
         is_dummy_run=False,
     )
 
@@ -115,6 +116,34 @@ def test_a_drafter_s_later_passes_read_its_graph_at_the_step_s_running_bs(
     assert cost.draft_seconds == price(gemm(1000 * width, 64, 64), SPEC)
 
 
+@pytest.mark.parametrize(
+    "peers,drafter,width",
+    [
+        ([(4, 12, True)], ("prefill", 9, 3, False, 21, 4), 4),
+        ((), ("prefill", 9, 3, False, None), 3),
+    ],
+    ids=["dp", "one-rank"],
+)
+def test_a_middle_chunk_s_drafter_runs_its_later_passes_at_running_bs_under_dp(
+    monkeypatch, peers, drafter, width
+):
+    asked = []
+
+    def graph(*at, draft=False, width=None):
+        asked.append((*at, width) if draft else at)
+        return g(1000 * (width or at[2]), 64, 64) if draft else g(4, 8, 8)
+
+    # Under DP ATOM runs the drafter's propose for its collectives; on one rank
+    # only its draft-KV pass, the first pass's work.
+    view = settled(monkeypatch, [(3, 3, False)] * 3, peers, output=False)
+    backend = OpGraphBackend(SPEC, graph, kv="bf16", dp=1 + len(peers), drafts=2)
+    cost = backend.price(view)
+
+    assert view.draft_bs == 4
+    assert asked[-1] == drafter
+    assert cost.draft_seconds == price(gemm(1000 * width, 64, 64), SPEC)
+
+
 def test_a_population_names_a_drafter_s_shape_at_the_batch_its_later_passes_ran(
     tmp_path,
 ):
@@ -124,7 +153,7 @@ def test_a_population_names_a_drafter_s_shape_at_the_batch_its_later_passes_ran(
         [
             {"rows": [[3, 90, True]] * 3, "draft_bs": 4},
             prefill | {"draft_bs": 4},
-            # A middle chunk runs no later pass; a batch at its rows pads none.
+            # One rank's middle chunk runs no later pass; a batch at its rows pads none.
             prefill | {"produces_output": False, "draft_bs": 4},
             prefill | {"draft_bs": 3},
         ],
@@ -211,6 +240,46 @@ def test_a_prefill_s_drafter_is_captured_with_its_later_pass_at_its_width(tmp_pa
         embedded = [
             op["args"]["x"]["shape"][0]
             for op in _ops(graphs[True, True, shape]["region"])
+            if op["op"] == "aiter.masked_embedding.default"
+        ]
+        assert embedded == [192, width]
+
+
+def test_a_dp_middle_chunk_s_drafter_is_captured_with_its_later_pass_at_its_width(
+    tmp_path,
+):
+    from test_capture_v4_pro import trace
+
+    # DeepSeek-V4-Pro under MTP2 at DPA DP2: three middle chunks of 64 tokens
+    # on each rank, which ATOM pads to a batch of 4 for the drafter's later pass.
+    (tmp_path / "record").mkdir()
+    line = {"rows": [[64, 64, False]] * 3, "produces_output": False}
+    line |= {"moe_rows": 384, "draft_moe_rows": 384}
+    record = _record(tmp_path / "record", [line | {"draft_bs": 4}, line])
+    idle = json.dumps({"step": 0, "is_dummy_run": True})
+    (tmp_path / "record" / "steps" / "dp1.jsonl").write_text(idle + "\n")
+    (tmp_path / "trace").mkdir()
+    argv = "--population {} --tp 2 -- --kv_cache_dtype fp8 --enable-dp-attention "
+    argv += "--method mtp --num-speculative-tokens 2"
+    done = trace(tmp_path / "trace", argv.format(record))
+
+    tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
+    assert tokens, done.stderr[-4000:]
+    store = ArtifactStore(str(tmp_path / "trace" / "store"))
+    rank, graphs = Topology().ranks()[0], {}
+    for token in tokens:
+        entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
+        graph = json.loads(entry.read_member("graph", rank, "json"))
+        output = not graph["structure"].endswith(("no output", "no output draft"))
+        graphs[graph["structure"].endswith(" draft"), output, graph["shape"]] = graph
+    rows, wide = "prefill T=192 B=3", "prefill T=192 B=3 W=4"
+    assert {(True, False, wide), (False, False, rows)} <= set(graphs)
+    assert (False, False, wide) not in graphs
+    # Its first pass embeds the chunks' tokens, its second a row a sequence.
+    for shape, width in ((rows, 3), (wide, 4)):
+        embedded = [
+            op["args"]["x"]["shape"][0]
+            for op in _ops(graphs[True, False, shape]["region"])
             if op["op"] == "aiter.masked_embedding.default"
         ]
         assert embedded == [192, width]
