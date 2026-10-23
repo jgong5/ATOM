@@ -69,7 +69,7 @@ from atom.compass.backends import (
 from atom.compass.backends.cost import GROUPS
 from atom.compass.backends.cost import group as method_group
 from atom.compass.backends.json_file import read_json, read_jsonl
-from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band, _features
+from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band
 from atom.compass.drive import aiter_jit
 
 WITHIN = 0.10
@@ -143,8 +143,8 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
 
     The ranks' records (`dp0.jsonl` up) are joined as `step_linear_fit` joins
     them: a step is its ranks' lines of one step index, measured as the
-    smallest rank label and priced and banded as its costliest rank's batch, a
-    term validated only if every rank's is; a step the law refuses is banded as
+    smallest rank label and priced, banded and validated as the rank
+    `step_linear_fit.priced_rank` picks; a step the law refuses is banded as
     its rank of most tokens. Its draft is measured and priced the same way. A
     rank that ran the step as a dummy forward is priced 0 s: the step is
     measured, priced and banded by the ranks that ran a forward. A step some
@@ -165,26 +165,8 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
             f"{record} holds rank records of {lines} lines; one run's ranks "
             "differ by at most the step a stopped run leaves on some"
         )
-    run = [
-        [s for s in step_labels.label(r)[0] if steps is None or s.step in steps]
-        for r in ranks
-    ]
-    dummies = [{s["step"] for s in x if s["is_dummy_run"]} for x in records]
-    got = [_features(rank, "base", len(run)) for rank in run]
-    cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
-    rows = [{r[3]: r for r in mine} for mine, _ in got]
-    joined = []
-    if len(run) > 1:
-        cut["ranks"] = 0
-    for step in sorted(set().union(*rows)):
-        # A rank's dummy forward joins its step priced 0 s, so adds no row.
-        group = {i: rank[step] for i, rank in enumerate(rows) if step in rank}
-        ran = len(group) + sum(step in d for d in dummies)
-        if ran < len(rows) or len({r[0] for r in group.values()}) > 1:
-            cut["ranks"] += 1
-            continue
-        label = min(r[2] for r in group.values())
-        joined.append({i: (*r[:2], label, *r[3:]) for i, r in group.items()})
+    run = [step_labels.label(r)[0] for r in ranks]
+    joined, cut, _ = step_linear_fit._groups(run, "base", steps=steps)
     views = [{s.step: s.view for s in rank} for rank in run]
     drafts = [{s.step: s.draft_s for s in rank} for rank in run]
     law = backend if isinstance(backend, Mapping) else None
@@ -207,10 +189,12 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
             why = "; ".join(f"{d.source}: {d.reason}" for d in refused.declined)
             r["reasons"][why] += 1
             continue
+        top = step_linear_fit.priced_rank(
+            {i: (c.target_seconds, group[i][1]) for i, c in costs.items()}
+        )
         terms = [t for c in costs.values() for t in c.terms if not t.draft]
-        validated = all(map(_validated, terms))
+        validated = all(_validated(t) for t in costs[top].terms if not t.draft)
         extrapolated += any(t.provenance.extrapolated for t in terms)
-        top = max(costs, key=lambda i: costs[i].target_seconds)
         band, price = _band(key, group[top][1]), costs[top].target_seconds
         labels = [drafts[i][step] for i in group]
         draft = None
