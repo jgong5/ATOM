@@ -130,6 +130,14 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
     assert mi455.origin("host.ipc.zmq_roundtrip_s")["origin"] == "assumed"
     for unread in ("host.ipc.zmq_roundtrip_s", "device.compute.bf16_flops"):
         assert unread not in doc["assumed"]
+    # Each assumed ratio read, every cell priced again at 0.8 and 1.2 of it.
+    assert set(doc["band"]) == {
+        p for p in doc["assumed"] if p == project.CURVE or "derate" in p
+    }
+    for level in ("step", "op"):
+        base = doc["cells"][str(prefill)][level]["tokens_per_s"]
+        slower = doc["band"]["device.compute.derate.bf16"]["0.8"]["tokens_per_s"]
+        assert slower[level][str(prefill)] < base
 
 
 def test_main_refuses_cells_of_two_models_and_a_run_with_no_cell(monkeypatch):
@@ -141,3 +149,54 @@ def test_main_refuses_cells_of_two_models_and_a_run_with_no_cell(monkeypatch):
         project.main([*argv, "--", "a", "--", "b"])
     with pytest.raises(SystemExit):
         project.main(argv)
+
+
+def test_a_ratio_times_its_factor_is_capped_at_the_datasheet_and_says_so():
+    mi455 = spec(MI455)
+    link = "interconnect.intra_node.derate"
+    for factor, capped in ((1.2, False), (1.3, True)):
+        p, cap = project.scaled(mi455, link, factor)
+        assert (p.value(link), cap) == (min(mi455.value(link) * factor, 1.0), capped)
+        assert p.values | {link: None} == mi455.values | {link: None}
+
+    top = mi455.value(project.BANDWIDTH)
+    p, cap = project.scaled(mi455, project.CURVE, 1.3)
+    assert cap and p.value(project.CURVE) == [
+        [size, min(rate * 1.3, top)] for size, rate in mi455.value(project.CURVE)
+    ]
+    assert not project.scaled(mi455, project.CURVE, 1.2)[1]
+
+
+def test_the_band_ranks_the_cells_again_at_each_ratio_one_at_a_time(monkeypatch):
+    bf16, link = "device.compute.derate.bf16", "interconnect.intra_node.derate"
+    mi455 = spec(MI455)
+    machine = MachineSpec(mi455.values | {link: 0.9}, mi455.tokenizers)
+
+    def rates(jobs):
+        """Each cell's tokens a second, read off the spec it was priced on."""
+        out = []
+        for job in jobs:
+            s = MachineSpec.from_mapping(job[2])
+            rate = {"a": s.value(bf16), "b": 0.6, "c": s.value(link) / 2}[job[4]]
+            levels = {"step": {"tokens_per_s": rate}, "op": {"tokens_per_s": 1}}
+            out.append({"levels": levels})
+        return out
+
+    monkeypatch.setattr(project, "_each", rates)
+    jobs = [("m", 1, machine.echo(), "s", r, []) for r in "abc"]
+    base = project._ranked({j[4]: (None, c) for j, c in zip(jobs, rates(jobs))})
+    assert base["step"]["order"] == ["a", "b", "c"]
+    floor = "device.kernel_floor_s"
+    assumed = {p: machine.value(p) for p in (bf16, link, floor)}
+
+    band = project.band(machine, assumed, jobs, base)
+
+    # The kernel floor is a carried value, not a ratio: no datasheet peak.
+    assert set(band) == {bf16, link}
+    slow = band[bf16]["0.8"]
+    assert slow["ranking"]["step"]["top_1"] == ["b"]
+    assert slow["order_holds"] == {"step": False, "op": True}
+    assert slow["tokens_per_s"]["step"]["a"] == pytest.approx(0.8 * assumed[bf16])
+    assert band[bf16]["1.2"]["order_holds"]["step"]
+    assert [band[link][f]["capped"] for f in ("0.8", "1.2")] == [False, True]
+    assert band[link]["1.2"]["tokens_per_s"]["step"]["c"] == 0.5
