@@ -84,10 +84,12 @@ TORCH_NAMESPACES = ("aten", "prim", "prims", "_c10d_functional", "c10d")
 H2D = "atom/utils/h2d.py"
 #: Operators that ask a fake tensor where it is and run nothing on a device.
 UNDISPATCHED = ("profiler.", "prim.device")
-#: DeepSeek-V4's decode attention leaves: the fp8 KV cache's, the bf16 one's and the
-#: persistent kernel; and its indexer's score and top-k.
+#: DeepSeek-V4's decode attention leaves: the fp8 KV cache's, its asm kernel where
+#: that launches alone (a drafter's later pass), the bf16 one's and the persistent
+#: kernel; and its indexer's score and top-k.
 V4_DECODES = (
     "aiter.mla:mla_decode_fwd_v4_nm",
+    "aiter.mla_decode_v4_asm.default",
     "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton",
     "aiter.mla_decode_v4_ps_asm.default",
 )
