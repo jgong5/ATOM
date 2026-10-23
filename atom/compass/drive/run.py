@@ -237,19 +237,8 @@ def _ep_width(atom_args, machine) -> int:
 
 def _built_ep_width(atom_args, arch: str) -> int:
     from atom.compass.validate.bound import _build
-    from atom.model_engine.arg_utils import EngineArgs
-    from atom.utils.arg_parser import FlexibleArgumentParser
 
-    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(add_help=False))
-    engine, server = parser.parse_known_args(atom_args)
-    # The build parses ATOM's engine arguments only: drop the server's.
-    left, kept = iter(server), []
-    drop = next(left, None)
-    for arg in atom_args:
-        if arg == drop:
-            drop = next(left, None)
-        else:
-            kept.append(arg)
+    engine, kept = runfile._engine_args(atom_args), runfile.engine_only(atom_args)
     with tempfile.TemporaryDirectory(prefix="compass-run-ep-") as tmpdir:
         _, tree = _build(engine.model, engine.tensor_parallel_size, kept, arch, tmpdir)
     return compass_run.ep_width(tree)
