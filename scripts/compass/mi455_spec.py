@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mi308x_spec as base
 
 from atom.compass.spec import Fragment, MachineSpec, merge, validate
+from atom.compass.validate.project import CARRIED
 
 NAME = "mi455"
 MACHINES = Path(__file__).resolve().parent / "machines"
@@ -56,16 +57,6 @@ DATASHEET = {
         "inter_node": {"link_bandwidth_bytes_per_s": 3.0e11},
     },
 }
-
-#: What MI455 takes from MI355X as it stands, no datasheet stating it.
-CARRIED = (
-    "host.",
-    "device.kernel_floor_s",
-    "device.software_pinned_to.",
-    "interconnect.intra_node.link_latency_s",
-    "interconnect.inter_node.link_latency_s",
-    "interconnect.router_relay_s",
-)
 
 
 def fragment(source: str, body: dict, origin: str, notes: str, date=DATE) -> Fragment:

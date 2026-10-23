@@ -495,6 +495,17 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   rung, and publishes the drafter's half alone, as the target ran at the rung
   ([#1961](https://github.com/jgong5/ATOM/issues/1961)). Its default G is every rank's
   rows' tokens.
+- **Later passes at `running_bs` on every step.** `ForwardMode.decide` sets `running_bs`
+  on every step, replayed or not: the ladder's rung of the group's widest batch, or that
+  batch itself off the ladder and under `enforce_eager`. So a sampling prefill, a decode
+  beside a prefilling DP peer and an eager DP decode run their drafter's later passes
+  past their rows too. The step's view states that batch as `draft_bs` (the record line
+  too) for a drafter that declares a draft graph. A decode's drafter is then keyed
+  `decode T=<rows> B=<draft_bs>`, a sampling prefill's `prefill T=<tokens> B=<rows>
+  W=<draft_bs>`; `--population` captures each, setting `running_bs` at the cut, and
+  publishes the drafter's half alone ([#1982](https://github.com/jgong5/ATOM/issues/1982)).
+  A target padded without a replay, a sampling prefill's LM head or an eager DP decode,
+  is still traced at its rows ([#2033](https://github.com/jgong5/ATOM/issues/2033)).
 - **A middle chunk is cut where its draft-KV pass starts.** ATOM runs that pass
   (`compute_draft_kv`) after every target forward of a real step, a middle chunk's included,
   and a middle chunk records no `forward_done_event`. Under a drafter a prefill shape is
@@ -505,7 +516,10 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   an all-middle-chunk batch and runs the drafter's propose for its collectives
   (`propose_draft_token_ids(..., align_only=True)`), all `mtp_k` passes; the cut is where
   that starts, as the parity record stamps `d_propose_ns` there
-  ([#1991](https://github.com/jgong5/ATOM/issues/1991)). A GDN prefill under ReplaySSM counts
+  ([#1991](https://github.com/jgong5/ATOM/issues/1991)). Its passes 2+ run at
+  `running_bs`, so its drafter is keyed `W=<draft_bs>` as a sampling prefill's is, and
+  `--population` captures that width's middle chunk too, drafter half alone
+  ([#2053](https://github.com/jgong5/ATOM/issues/2053)). A GDN prefill under ReplaySSM counts
   its live state slots with a boolean index, a size no fake tensor holds; the host-staged
   slot indices bind it.
 - **Refused by name.** A block drafter (DSpark): it writes its draft KV before
@@ -957,12 +971,17 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   op's `stated` field, by name; a call does not take it, and `bench.ops.signature`
   includes it. Owner's [ruling on #1689](https://github.com/jgong5/ATOM/issues/1689#issuecomment-6292555659):
   only DeepSeek-V4's decode attention leaves (`capture.forward.V4_DECODES`: the fp8 KV
-  cache's, the bf16 one's and the persistent kernel) state their layer's `window_size`,
+  cache's, its asm kernel where that launches alone, as in a drafter's later pass, the
+  bf16 one's and the persistent kernel) state their layer's `window_size`,
   `compress_ratio` and `index_topk` (null for a layer with no indexer), and its
   indexer's score and top-k states its `compress_ratio`, read in the opened
   attention's body from the layer `layer_name` names. Their index lists are sized for
   the deployment's longest row, so the entries a row reads follow from these and its
-  context, not from the lists.
+  context, not from the lists. The fused QK-norm and RoPE,
+  `aiter._fused_qk_norm_rope_group_quant_kernel.default`, states its layer's
+  `compress_ratio` too ([ruling on #1973](https://github.com/jgong5/ATOM/issues/1973#issuecomment-6358962981)):
+  at decode it writes each token's window row to the destination rows of that ratio's
+  class, which `bench.ops.V4_METADATA` binds to `v4_swa_dest_{dense,csa,hca}`.
 
 Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers
 and DeepSeek-V4's attention aside, below), so its ambient reads stay

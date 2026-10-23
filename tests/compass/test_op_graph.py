@@ -29,18 +29,20 @@ from test_op_graph_arch import ENGINE
 from test_op_work import leaf, t
 from test_work import SPEC
 
+from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactRefusal
-from atom.compass.backends import BatchView, CostRefused, Method, RequestShape
+from atom.compass.backends import BatchView, CostRefused, Method, RequestShape, op_graph
 from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import NONE, OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.provenance import Refusal
-from atom.compass.backends.step_roofline import overlap
+from atom.compass.backends.step_roofline import micro_batches, overlap
 from atom.compass.backends.work import attention, gemm, price
 from atom.compass.bench.ops import leaves, signature
 from atom.compass.capture.peers import MORI
 from atom.compass.fit import ops as fit_ops
 from atom.compass.run import _op_graphs
+from atom.compass.runner.overrides import PricedSteps
 from atom.compass.spec import MachineSpec
 
 GEMM = "aiter.gemm_a16w16.default"
@@ -222,6 +224,14 @@ def test_a_spec_field_a_leaf_reads_and_the_spec_lacks_refuses_naming_it():
         backend(g(2, 8, 8), lacking).price(DECODE)
 
 
+def test_a_leaf_refused_on_one_step_is_refused_on_the_next():
+    lacking = SimpleNamespace(values={}, value=SPEC.value, origin=SPEC.origin)
+    ops = backend(g(2, 8, 8), lacking)
+    for step in (DECODE, DECODE):
+        with pytest.raises(CostRefused, match=f"{GEMM} reads device.kernel_floor_s,"):
+            ops.price(step)
+
+
 def test_a_collective_wider_than_the_scale_up_domain_refuses_naming_it():
     reduce = leaf("aiter.all_reduce_.default", [[2, 64]], tensor=t([2, 64]))
 
@@ -261,6 +271,63 @@ def test_a_term_is_declared_iff_a_field_its_winning_bound_reads_is_stated(
         assert term.provenance.method is Method.DECLARED
         assert [p for p in MEMORY + COMPUTE if p in note] == list(reads)
         assert note.endswith(NONE)
+
+
+def test_a_step_works_each_distinct_leaf_once_and_keeps_what_reads_no_step(
+    monkeypatch,
+):
+    """Equal leaves share one work a step; a GEMM leaf, which reads
+    nothing of the step, keeps its work across steps; attention, which reads
+    the step's rows, is worked again at each step's."""
+    worked = []
+
+    def counted(op, *args):
+        worked.append(op["op"])
+        return work(op, *args)
+
+    monkeypatch.setattr(op_graph, "work", counted)
+    attn = leaf(ATTENTION, [[2, 6144]], q=t([2, 24, 256]), k=t([2, 4, 256]))
+    region = {"seq": [g(2, 64, 64), attn, g(2, 64, 64), copy.deepcopy(attn)]}
+    steps = [DECODE, view((1, 9_000, True), (1, 30, True), rung=2)]
+    ops = backend(region)
+    costs = [ops.price(step) for step in steps]
+
+    assert worked == [GEMM, ATTENTION, ATTENTION]
+    assert costs == [backend(region).price(step) for step in steps]
+    assert costs[0] != costs[1]
+
+
+def test_leaves_that_differ_only_in_what_they_state_price_apart():
+    def indexer(ratio):
+        op = leaf(
+            "aiter.indexer_score_topk.default",
+            [[2, 2048]],
+            q_quant=t([2, 64, 128], "torch.float8_e4m3fn"),
+            weights=t([2, 64]),
+            topk=2048,
+        )
+        return op | {"stated": {"compress_ratio": ratio}}
+
+    a, b = indexer(4), indexer(128)
+    step = view((1, 900_000, True), (1, 300_000, True), rung=2)
+    both = by_name(backend({"seq": [a, b]}, kv="fp8").price(step))
+    alone = [by_name(backend(x, kv="fp8").price(step)) for x in (a, b)]
+
+    assert alone[0] != alone[1]
+    assert both == {k: fold_seconds([alone[0][k], alone[1][k]]) for k in both}
+
+
+def test_a_leaf_in_and_out_of_a_resource_bound_par_prices_each_way():
+    big = g(2, 4096, 4096)
+    params = listed(
+        *[pt(g(b, 4096, 4096), f"decode B={b}", 1e3, c) for b in (2, 4) for c in (1, 9)]
+    )
+    pooled = {"par": [g(2, 4096, 4096), g(2, 4096, 4096)], "join": "resource_bound"}
+    cost = backend({"seq": [big, pooled]}, price_list=params).price(DECODE)
+    alone = backend(big, price_list=params).price(DECODE)
+
+    summed = gemm(2, 4096, 4096) + gemm(2, 4096, 4096)
+    assert by_name(cost) == by_name(alone) | {"par.resource_bound": price(summed, SPEC)}
 
 
 # --- two-batch overlap -------------------------------------------------------------
@@ -422,6 +489,18 @@ def test_an_exchange_two_pars_deep_is_refused():
 
     with pytest.raises(CostRefused, match="runs an MoE exchange beside a second"):
         OpGraphBackend(SECOND, lambda *at: nested, kv="bf16").price(SPLIT)
+
+
+def test_each_micro_batch_s_attention_prices_at_its_own_rows():
+    split = replace(
+        SPLIT, requests=(RequestShape(4, 40_000, False), RequestShape(3, 90_000, False))
+    )
+    attn = leaf(ATTENTION, [[4, 6144]], q=t([4, 24, 256]), k=t([4, 4, 256]))
+    cost = OpGraphBackend(SPEC, lambda *at: attn, kv="bf16").price(split)
+    each = [price(work(attn, h, 1, "bf16"), SPEC) for h in micro_batches(split)]
+
+    assert each[0] != each[1]
+    assert by_name(cost) == {"op.tbo": pytest.approx(sum(each))}
 
 
 def test_a_split_step_s_note_names_the_stated_fields_of_every_price():
@@ -673,6 +752,18 @@ def test_a_decode_step_prices_at_its_longest_row_s_context(rows, priced, method)
     assert cost.terms[0].provenance.method is method
 
 
+def test_one_backend_prices_each_step_at_its_own_bound():
+    ops = backend(g(2, 64, 64), price_list=BANDED)
+    steps = [
+        view(*rows, rung=2)
+        for rows in ([(1, 1500, True)] * 2, [(1, 1000, True), (1, 3000, True)])
+    ]
+
+    assert [by_name(ops.price(s)) for s in steps] == [
+        by_name(backend(g(2, 64, 64), price_list=BANDED).price(s)) for s in steps
+    ]
+
+
 ATTN = leaf(ATTENTION, [[64, 6144]], q=t([64, 24, 256]), k=t([64, 4, 256]))
 # A prefill of 64 tokens over two rows, each past 0, 1024 or 2048 cached tokens.
 CACHED = listed(
@@ -899,3 +990,130 @@ def test_a_run_file_price_list_from_another_tree_is_refused_at_load(
 def test_a_run_file_price_list_without_op_graph_is_refused(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="names a price_list and no op_graph"):
         _installed(monkeypatch, tmp_path, step_linear=law(), price_list={})
+
+
+# --- a shape no graph holds, traced in the run -----------------------------------
+
+
+def _reader(graph, model) -> SimpleNamespace:
+    """A run's config of the 27B at `model`, keyed as the capture keyed `graph`."""
+    hf = SimpleNamespace(architectures=json.loads(CONFIG.read_text())["architectures"])
+    return SimpleNamespace(
+        model=str(model),
+        hf_config=hf,
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+        **_engine(graph),
+    )
+
+
+def _counts() -> dict:
+    return {"lazy_traces": 0, "lazy_trace_wall_seconds": 0}
+
+
+def test_a_shape_no_graph_holds_is_traced_in_the_run_as_trace_ops_traces_it(
+    tmp_path_factory, tmp_path
+):
+    (graph, _), *_ = capture(1, PREFILLS, tmp_path_factory).values()
+    stores = tmp_path_factory.getbasetemp().glob("tp1*/store")
+    model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
+    config, lazy = _reader(graph, model), _counts()
+    offline = next(
+        lookup
+        for lookup in (_op_graphs(str(s), config, "gfx942") for s in stores)
+        if lookup("prefill", 512, 2)
+    )
+    lookup = _op_graphs(str(tmp_path), config, "gfx942", ["--model", str(model)], lazy)
+    chunk = (RequestShape(256, 256, False),) * 2
+    for output in (True, False):
+        view = BatchView(chunk, produces_output=output)
+        OpGraphBackend(SPEC, lookup, kv="bf16").price(view)
+
+    # Both chunks of the shape came from one trace, the graphs trace ops publishes.
+    assert [lookup("prefill", 512, 2, o) for o in (True, False)] == [
+        offline("prefill", 512, 2, o) for o in (True, False)
+    ]
+    assert lazy["lazy_traces"] == 1 and lazy["lazy_trace_wall_seconds"] > 0
+
+
+def _lazily(tmp_path_factory, root, *atom_args, **engine):
+    """The run's lookup of the 27B under `engine`'s config fields into the
+    store at `root`, tracing a missing shape from the server's `atom_args`, and
+    its counts."""
+    (graph, _), *_ = capture(1, PREFILLS, tmp_path_factory).values()
+    model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
+    config, lazy = _reader(graph, model), _counts()
+    vars(config).update(engine)
+    args = ["--model", str(model), *atom_args]
+    return _op_graphs(str(root), config, "gfx942", args, lazy), lazy
+
+
+def test_a_prefill_two_batch_overlap_would_split_is_traced_lazily_as_one_forward(
+    tmp_path_factory, tmp_path, monkeypatch
+):
+    # ATOM splits a prefill under --enable-tbo from this many tokens on.
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "256")
+    lookup, lazy = _lazily(tmp_path_factory, tmp_path, "--enable-tbo", enable_tbo=True)
+
+    assert isinstance(lookup("prefill", 512, 2), dict)
+    assert lazy["lazy_traces"] == 1
+
+
+def test_a_lazy_trace_reads_atom_s_arguments_in_either_spelling_as_its_server_does(
+    tmp_path_factory, tmp_path
+):
+    args = "--kv-cache-dtype", "fp8"
+    lookup, lazy = _lazily(tmp_path_factory, tmp_path, *args, kv_cache_dtype="fp8")
+
+    assert isinstance(lookup("decode", 2, 2), dict)
+    assert lazy["lazy_traces"] == 1
+
+
+def test_a_lazy_trace_that_fails_ends_the_run_naming_the_shape(tmp_path):
+    (tmp_path / "model").mkdir()  # holds no config.json, so no capture builds it
+    (tmp_path / "read").mkdir()
+    (tmp_path / "read" / "config.json").write_text("{}")
+    config = SimpleNamespace(
+        model=str(tmp_path / "read"),
+        hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+        **ENGINE,
+    )
+    lazy = _counts()
+    args = ["--model", str(tmp_path / "model")]
+    lookup = _op_graphs(str(tmp_path / "store"), config, "gfx942", args, lazy)
+    rows = BatchView((RequestShape(100, 100, False),) * 3, produces_output=True)
+
+    with pytest.raises(RuntimeError, match="a lazy trace of prefill T=300 B=3 failed"):
+        OpGraphBackend(SPEC, lookup, kv="bf16").price(rows)
+    assert lazy["lazy_traces"] == 0
+
+
+def test_a_run_file_op_graph_traces_from_the_server_s_arguments(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(
+        compass_run, "_op_graphs", lambda *a: seen.append(a[3:]) or (lambda *s: None)
+    )
+    _installed(monkeypatch, tmp_path, op_graph=True, atom_args=["--model", "m"])
+
+    assert seen == [(["--model", "m"], _counts())]
+
+
+def test_the_run_summary_totals_each_engine_s_lazy_traces(monkeypatch, tmp_path):
+    run = {"admission_path": "serving", "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+    run.update(bound_s=100.0, client_runs=None, out_dir=str(tmp_path))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    authority = compass_run._RecordingAuthority(run)
+    worker = SimpleNamespace(compass_lazy={**_counts(), "lazy_traces": 2})
+    worker.compass_lazy["lazy_trace_wall_seconds"] = 9.5
+    compass_run._hand_in(run, "engine", [], priced=PricedSteps.priced_steps(worker))
+    compass_run._hand_in(run, "frontend", [])
+    compass_run._write_summary(run, authority, ended=True)
+
+    cost = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())["cost"]
+    assert (cost["lazy_traces"], cost["lazy_trace_wall_seconds"]) == (2, 9.5)

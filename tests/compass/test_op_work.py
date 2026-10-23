@@ -185,6 +185,18 @@ def test_a_broadcast_dimension_is_read_once():
     assert work(op, ONE, 1, "bf16").bytes == 4 * 4 + 4 * 248320 * 2 + 248320 * 4 + 4 * 4
 
 
+def test_the_lm_head_pick_reads_its_logits_and_writes_a_packed_fp32_pair_a_row():
+    op = leaf(
+        "aiter.lm_head_argmax_pack.default",
+        [[3, 2]],
+        logits=t([3, 16160]),
+        vocab_start_idx=16160,
+    )
+
+    # The shard's bf16 logits read once; each row's value and index in fp32.
+    assert work(op, ONE, 8, "bf16") == Work({}, 3 * 16160 * 2 + 3 * 2 * 4)
+
+
 def test_an_in_place_leaf_writes_what_it_reads():
     q, k = t([2, 24, 256], stride=[14336, 256, 1]), t(
         [2, 4, 256], stride=[14336, 256, 1]

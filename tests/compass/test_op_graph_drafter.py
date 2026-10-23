@@ -349,9 +349,10 @@ def test_a_dp_drafter_beside_a_prefilling_peer_gathers_the_step_s_rows(
     assert sum(first["args"]["sizes"]) == 20
 
 
-def _lookup(tmp_path, dp, stored):
+def _lookup(tmp_path, dp, stored, *lazily):
     """`_op_graphs` at DP `dp` under MTP1 over a store of `stored`'s regions,
-    each keyed by its phase, shape and whether it is the drafter's."""
+    each keyed by its phase, shape and whether it is the drafter's; `lazily`,
+    its ATOM arguments and lazy counts."""
     (tmp_path / "model").mkdir()
     (tmp_path / "model" / "config.json").write_text("{}")
     config = SimpleNamespace(
@@ -379,7 +380,7 @@ def _lookup(tmp_path, dp, stored):
                 ).encode()
             },
         )
-    return _op_graphs(store.root, config, "gfx950")
+    return _op_graphs(store.root, config, "gfx950", *lazily)
 
 
 def test_a_dp_verify_step_reads_its_drafter_at_its_rows_padded_too(tmp_path):

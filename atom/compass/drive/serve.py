@@ -7,7 +7,9 @@ unless it joins one its run file names. One without a run file is real, on the
 GPUs the command names, which `gpu.quiet` checks before the server starts and
 after it stops. ATOM's arguments pass verbatim; the driver assigns the host,
 127.0.0.1 unless the command names another, its ports and the run file, and
-refuses them, and the clock endpoint flag, among ATOM's arguments. Each start
+refuses them, and the clock endpoint flag, among ATOM's arguments; an op graph
+run's file also holds ATOM's arguments, from which its engines trace a shape
+the store lacks (`run.ATOM_ARGS`). Each start
 takes a free `ATOM_DP_MASTER_PORT`: the port keys ATOM's compiled-graph cache,
 and the first start that loads that cache autotunes every graph's kernels
 again, whose configs stay loaded and read in `non_torch`.
@@ -41,7 +43,7 @@ import atom
 from atom.compass import parity
 from atom.compass.drive.gpu import KFD, hip_visible, quiet
 from atom.compass.drive.identity import identity
-from atom.compass.run import CLOCK_ENV, ENV, _write_whole
+from atom.compass.run import ATOM_ARGS, CLOCK_ENV, ENV, OP_GRAPH, _write_whole
 
 SERVER = (sys.executable, "-m", "atom.entrypoints.openai.api_server")
 HOST = "127.0.0.1"
@@ -130,6 +132,8 @@ def serve(
         env["HIP_VISIBLE_DEVICES"] = hip_visible(gpus)
     else:
         run_file = out / RUN_FILE
+        if run.get(OP_GRAPH):
+            run = {**run, ATOM_ARGS: list(atom_args)}
         if joined:
             argv += ["--compass-clock-endpoint", run["clock_endpoint"]]
         else:
