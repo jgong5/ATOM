@@ -6,7 +6,14 @@ import dataclasses
 import json
 
 import pytest
-from test_backend_step_linear_fit import _fit, _record, _steps, _view
+from test_backend_step_linear_fit import (
+    HOST,
+    _fit,
+    _record,
+    _steps,
+    _timed_record,
+    _view,
+)
 from test_dp_step_max import prefill, runner
 from test_speculative_step import _speculative
 from test_validate_cost import LAW, _two_ranks
@@ -21,8 +28,14 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
-from atom.compass.backends.step_labels import label
-from atom.compass.backends.step_linear_fit import fit, label_records, mark_held_out
+from atom.compass.backends.step_labels import digest, label
+from atom.compass.backends.step_linear_fit import (
+    fit,
+    fit_host,
+    label_records,
+    mark_held_out,
+)
+from atom.compass.parity import recurrence
 from atom.compass.validate.cost import cost_accuracy
 
 #: Each forward's draft, as a share of its target.
@@ -218,3 +231,61 @@ def test_a_final_chunk_s_propose_pass_and_tail_are_fitted_apart_and_a_middle_chu
     del law["draft"]["propose"]  # the tail alone depends on it too
     with pytest.raises(CostRefused, match="whether it produces output"):
         StepLinearBackend(StepLinearLaw(law)).price(BatchView(rows))
+
+
+def _proposing(path, outlier=None):
+    """`_mtp_record` of `_steps(3)` whose prefill steps each run `propose`,
+    `outlier`'s at three times its price, and whose first is a middle chunk."""
+    _mtp_record(path, _steps(3))
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    prefill = [line for line in lines if not line["rows"][0][2]]
+    for i, line in enumerate(prefill):
+        seconds = PROPOSE[0] + PROPOSE[1] * len(line["rows"])
+        line["d_propose_ns"] = round(seconds * (3 if i == outlier else 1) * 1e9)
+        line["d_busy_ns"] += line["d_propose_ns"]
+    prefill[0]["produces_output"] = False
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    return path, prefill
+
+
+def test_a_middle_chunk_s_propose_pass_is_no_propose_label_and_the_fit_states_its_drops(
+    tmp_path,
+):
+    """Under DP lockstep a middle chunk runs `propose` too; it is the draft-KV
+    pass's label, not a propose label."""
+    path, prefill = _proposing(tmp_path / "dp0.jsonl", outlier=5)
+    middle = next(s for s in label(path)[0] if s.step == prefill[0]["step"])
+    assert middle.propose_s is None
+    line = prefill[0]
+    assert middle.draft_s == pytest.approx(
+        (line["d_busy_ns"] - line["d_target_ns"]) * 1e-9
+    )
+    fitted = _fit([path])["draft"]["propose"]["fit"]
+    assert (fitted["samples"], fitted["dropped"]) == (len(prefill) - 2, 1)
+
+
+def test_the_steps_either_law_names_warm_are_the_run_s_warm_steps(tmp_path):
+    """A cold target at step 0 and a cold draft at step 9, each 40 times its price."""
+    path = _mtp_record(tmp_path / "dp0.jsonl", _steps(3))
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    lines[0]["d_busy_ns"] += 39 * lines[0]["d_target_ns"]
+    lines[0]["d_target_ns"] *= 40
+    lines[9]["d_busy_ns"] += 39 * (lines[9]["d_busy_ns"] - lines[9]["d_target_ns"])
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    law = _fit([path])
+    assert recurrence.warm_steps(law, digest(path)) == {0, 9}
+    assert recurrence.warm_steps(law, "another run") == set()
+
+
+def test_host_laws_fit_an_mtp_decode_whose_tokens_are_its_rows_times_a_width(tmp_path):
+    """Each decode row computes the token and its drafts, 6 tokens a row."""
+    steps = [
+        ([(6 if d else q, n, d) for q, n, d in rows], rung, s)
+        for rows, rung, s in _steps(14, n=400)
+    ]
+    record, _ = _timed_record(tmp_path / "dp0.jsonl", steps)
+    host, report = fit_host(label_records([record])[0])
+    assert report["unfitted"] == {}
+    for segment, c in HOST["decode"].items():
+        got = host["laws"]["decode"][segment]
+        assert got == pytest.approx(c, rel=1e-4, abs=1e-12), segment

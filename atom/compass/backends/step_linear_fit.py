@@ -40,10 +40,11 @@ priced and banded as its costliest rank.
 Records with a host key (`dp0.key.json`, from the real runner) also give the
 host laws as a run file's `host` entry: `key`, and `laws[kind][segment]`,
 seconds on `(1, tokens, seqs)`, fitted on the samples' host labels. They take
-the step linear law's solver, MAD drops and hulls; `seqs` equal to `tokens` on
-every sample gets zero. Two keys refuse. The law and the host key state the
-`--machine-spec` digest, which a run's spec must match, and the host key's `engine` is the
-law's `engine_config`. A segment outside `HOST_SEGMENTS` is
+the step linear law's solver, MAD drops and hulls; `seqs` in a fixed
+proportion to `tokens` on every sample (equal, or a decode under MTP, where
+each row computes its drafts too) gets zero. Two keys refuse. The law and the
+host key state the `--machine-spec` digest, which a run's spec must match, and
+the host key's `engine` is the law's `engine_config`. A segment outside `HOST_SEGMENTS` is
 fitted for a kind whose samples carry it: `W_inputs`, on an MTP record, and
 `W_recv`, on a later pipeline stage's.
 
@@ -54,7 +55,8 @@ The dropped steps that lead a record's steps of one vector, each slower than
 the law, are its warm steps (shape compiles and first touches), and so is a
 dropped step anywhere that ran more than `WARM_FACTOR` times its price, such as
 the first short chunk on a deep history: counted with their seconds apart from
-the dropped ones, never charged. A feature with no variance gets coefficient
+the dropped ones, never charged, and listed per run under `warm_steps`, in the
+order the law's `runs` names the runs. A feature with no variance gets coefficient
 zero and is named. Each vector reports its samples,
 warm and dropped counts, the centre and scaled MAD of its relative residuals,
 the condition number of its column-scaled design and
@@ -235,7 +237,7 @@ def fit_host(samples) -> tuple[dict, dict]:
         for segment in HOST_SEGMENTS[: 3 if kind == "middle" else 4] + tuple(extra):
             members = [r for r in rows if r[:2] == (kind, segment) and r[3] > 0]
             x = np.array([r[2] for r in members], dtype=np.float64).reshape(-1, 3)
-            width = 2 if np.array_equal(x[:, 1], x[:, 2]) else 3
+            width = 2 if np.linalg.matrix_rank(x[:, 1:]) < 2 else 3
             if width == 2:
                 x[:, 2] = 0.0
             try:
@@ -467,6 +469,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         f"({', '.join(runs)})",
         "form": form,
         "cut": cut,
+        "runs": list(runs),
         "warm_steps": [[] for _ in runs],
         "unfitted": {},
         "decode": {},
@@ -589,7 +592,11 @@ def _propose(samples) -> dict:
     return {
         "coefficients": dict(zip(PROPOSE, map(float, s["coef"]))),
         "hull": _hull(x[s["keep"]][:, 1:], PROPOSE[1:]),
-        "fit": {"samples": int(s["keep"].sum()), **fitted},
+        "fit": {
+            "samples": int(s["keep"].sum()),
+            "dropped": int((~s["keep"]).sum()),
+            **fitted,
+        },
     }
 
 

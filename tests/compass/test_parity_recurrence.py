@@ -11,6 +11,8 @@ import json
 
 import pytest
 
+from atom.compass.backends.step_labels import label
+from atom.compass.backends.step_linear import DECODE, PREFILL
 from atom.compass.parity import recurrence
 
 MS = 1_000_000
@@ -235,3 +237,99 @@ def test_an_mtp_record_the_wait_rules_wrote_passes_and_charged_without_mtp_fails
     assert not report["pass"]
     [(step, _, err, *_)] = report["failures"]
     assert (step, err) == (1, pytest.approx(-5))
+
+
+def _law(prefill_s=0.01, decode=True, out_ms=0.0):
+    """A law pricing `record()`'s forwards as it ran: 10 ms of device work
+    each and 1 ms per host segment, `out_ms` of `E_out` after each exit
+    when set; every vector's hull holds every step."""
+
+    def vector(names, seconds):
+        coefficients = {n: seconds * (n == "step") for n in names}
+        return {"coefficients": coefficients, "hull": {"facets": [[0] * len(names)]}}
+
+    host = {g: [1e-3, 0, 0] for g in ("E", "W_pre", "W_launch", "W_post")}
+    if out_ms:
+        host["E_out"] = [out_ms * 1e-3, 0, 0]
+    return {
+        "provenance": "the wait rules",
+        "prefill": vector(PREFILL, prefill_s),
+        "decode": {"eager": vector(DECODE, 0.01)} if decode else {},
+        "host": {"laws": dict.fromkeys(("decode", "prefill", "middle"), host)},
+    }
+
+
+def _labelled(tmp_path, steps):
+    path = tmp_path / "dp0.jsonl"
+    lines = (s | {"rung": None, "named": []} for s in steps)
+    path.write_text("".join(json.dumps(s) + "\n" for s in lines))
+    return label(path)[0]
+
+
+def test_a_law_that_prices_each_forward_as_it_ran_reproduces_its_period(tmp_path):
+    steps = record()
+    report = recurrence.priced(steps, _labelled(tmp_path, steps), _law())
+    assert set(report["kinds"]) == {"idle", "middle", "prefill", "decode"}
+    for n, p10, p50, p90, r1, ok in report["kinds"].values():
+        assert (p10, p90) == pytest.approx((0, 0), abs=1e-9) and ok
+    assert report["pass"] and report["refused"] == {}
+    # A prefill vector 20% dear moves the output prefill's period and the
+    # decode that receives its tokens.
+    report = recurrence.priced(steps, _labelled(tmp_path, steps), _law(0.012))
+    assert not report["kinds"]["prefill"][-1] and not report["pass"]
+    assert {r[0] for r in report["failures"]} >= {2, 3}
+
+
+def test_an_idle_forward_keeps_its_measured_wait_and_the_engine_runs_e_out(tmp_path):
+    """Step 3 serves a new request 100 ms after step 2's input pull; every
+    forward's exit is followed by 0.5 ms to its pull and 0.5 ms to the entry."""
+    steps = record()[:3] + [
+        line(
+            3,
+            [[1, 1, True]],
+            True,
+            114.5,
+            (114.5,) * 2,
+            (115.5, 116.5),
+            (116.5,) * 2,
+            117.5,
+        ),
+        line(
+            4,
+            [[1, 2, True]],
+            True,
+            118.5,
+            (118.5,) * 2,
+            (119.5, 120.5),
+            (120.5, 125.5),
+            126.5,
+        ),
+    ]
+    for s in steps:
+        s["t_pull_ns"] = s["t_exit_ns"] + MS // 2
+    for s in steps[3:]:
+        s["batch"][0][0] = 8
+    law = _law(out_ms=0.5)
+    law["host"]["laws"]["decode"]["E"] = [5e-4, 0, 0]  # one mapping serves every kind
+    report = recurrence.priced(steps, _labelled(tmp_path, steps), law)
+    assert report["kinds"]["idle"][0] == 2
+    for n, p10, p50, p90, r1, ok in report["kinds"].values():
+        assert (p10, p90) == pytest.approx((0, 0), abs=1e-9) and ok
+
+
+def test_warm_and_refused_forwards_are_charged_and_not_graded(tmp_path):
+    steps = record()
+    report = recurrence.priced(
+        steps, _labelled(tmp_path, steps), _law(decode=False), warm={2}
+    )
+    assert report["refused"] == {"decode": 2}
+    assert set(report["kinds"]) == {"idle", "middle"}
+
+
+def test_the_script_grades_a_record_on_a_law_and_names_its_refusals(tmp_path, capsys):
+    steps = record()
+    _labelled(tmp_path, steps)
+    law = tmp_path / "law.json"
+    law.write_text(json.dumps(_law(decode=False)))
+    assert recurrence.main(str(tmp_path), law=str(law)) == 1
+    assert "decode: 2 steps the law refuses" in capsys.readouterr().out
