@@ -573,6 +573,7 @@ EXTRACTORS = {
     "aiter.indexer_score_topk.default": _indexer,
     "aiter.pa_sparse_prefill_fp8_opus.default": _v4_prefill,
     "aiter.mla_decode_v4_ps_asm.default": _v4_decode("Q", "qrope", "sink", "output"),
+    "aiter.mla_decode_v4_asm.default": _v4_decode("Q", "qrope", "sink", "output"),
     "aiter.mla:mla_decode_fwd_v4_nm": _v4_decode("q", "qrope", "sink", "output"),
     f"{V4}paged_decode:_sparse_attn_v4_paged_decode_triton": _v4_decode(
         "q", "attn_sink"
@@ -639,6 +640,11 @@ EXTRACTORS = {
     "atom.model_ops.layernorm:fused_qk_norm": _in_place("q", "k"),
     "atom.model_ops.triton_mrope:try_mrope_qk_fused": _in_place("q", "k"),
     "aiter.ops.flydsl.topk.topk_per_row_argmax:topk_per_row_argmax": _in_place(),
+    # The pick over a vocabulary shard's logits, which the LM head's GEMM, a
+    # leaf of its own, wrote: each row's best value and index packed in fp32.
+    "aiter.lm_head_argmax_pack.default": lambda op, view, tp, kv: _boundary(
+        op, outs=["torch.float32"]
+    ),
     "atom.model_ops.decode_input_ids:fill_deferred_decode_ids": _in_place(),
     "atom.utils.block_convert:kv_indices_generate_triton": _kv_indices,
 }

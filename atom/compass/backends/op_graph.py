@@ -263,7 +263,8 @@ class OpGraphBackend(CostBackend):
 
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
-        with `draft`, its drafter's, a decode's at its rows, at `draft_moe_rows`."""
+        with `draft`, its drafter's, a decode's at its rows, at `draft_moe_rows`,
+        its later passes at `draft_bs`."""
         if view.image_tokens:
             reason = IMAGES
         else:
@@ -274,14 +275,19 @@ class OpGraphBackend(CostBackend):
             except ValueError as exc:
                 reason = f"a step that {exc}"
             else:
-                if draft and shape[0] == "decode":
-                    shape = ("decode", len(rows), shape[2])
                 output = any(d for _, d in rows) or view.produces_output
+                width = draft and self.padded and view.draft_bs
+                if draft and shape[0] == "decode":
+                    shape = ("decode", len(rows), width or shape[2])
+                    width = None
                 none = "" if output else " that produces no output"
                 gathered = view.draft_moe_rows if draft else view.moe_rows
                 g = () if gathered is None else (gathered,)
                 drafted = {"draft": True} if draft else {}
-                at = "".join(f" G={n}" for n in g)
+                if output and width and width != shape[2]:
+                    drafted["width"] = width
+                at = f" W={width}" * ("width" in drafted)
+                at += "".join(f" G={n}" for n in g)
                 if output is None:
                     reason = (
                         "a prefill step whose view does not say whether it "
@@ -299,7 +305,8 @@ class OpGraphBackend(CostBackend):
                             *shape,
                             "".join(f" gathering {n} rows" for n in g),
                             none,
-                            " for its drafter" * draft,
+                            " for its drafter" * draft
+                            + f", its later passes at {width}" * ("width" in drafted),
                             region or "",
                         )
                     )
