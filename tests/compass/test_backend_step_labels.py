@@ -367,6 +367,13 @@ def test_a_dp2_record_rebuilds_each_step_s_group_counts(tmp_path, monkeypatch):
     for rank, views in enumerate(GROUP):
         assert [s.view for s in label(tmp_path / f"dp{rank}.jsonl")[0]] == views
 
+    # A new record keeps its counts on a step another rank's record lacks.
+    path = tmp_path / "dp1.jsonl"
+    full = path.read_text()
+    path.write_text(full.splitlines(keepends=True)[0])
+    assert [s.view for s in label(tmp_path / "dp0.jsonl")[0]] == GROUP[0]
+    path.write_text(full)
+
     # An older record states neither count: `moe_tokens` is rebuilt from every
     # rank's line at the step, the split is lost.
     for path in tmp_path.glob("dp*.jsonl"):
