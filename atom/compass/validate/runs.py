@@ -8,7 +8,10 @@ export in `artifacts/profile_export_aiperf.json`. SIMULATED is the cell at its
 backend, and REAL two or more real runs of it, spaced in time.
 
 A directory `cctraces_sim.sh` wrote is graded as below when it holds
-`artifacts/client_run.json`, whole when it does not. SIMULATED is refused
+`artifacts/client_run.json`, whole when it does not. When a real run is graded
+whole, so is every run of its cell: one `record` or `run` wrote, below, on
+every step, its warmup's included, refused for the reasons below but its
+warmup's, and when steps of a request it did not send follow its own. SIMULATED is refused
 when its run.json, the run file it ran, skips host segments, has no host laws,
 or turns the step roofline on with no step grid; a real run's server never
 reads the run file it was handed. It is also refused when an engine's hand-in
@@ -244,7 +247,7 @@ def _named_by_prefill(export, prefill, decode) -> dict:
     return export | {k: renamed(export.get(k)) for k in ("requests", "warmup")}
 
 
-def _client_run(cell, run, client) -> tuple[list[dict], list[str], dict]:
+def _client_run(cell, run, client, whole=False) -> tuple:
     """The steps of the client run `cell` grades, the traces its client was
     given, and its warmup: how many requests its export, in `client`, names as
     the warmup's, and how many steps hold only those; refuses, naming every
@@ -267,14 +270,23 @@ def _client_run(cell, run, client) -> tuple[list[dict], list[str], dict]:
     first = mine.index(True)
     before = warm[:first]
     why = [] if all(before) else ["steps of requests it did not send precede its own"]
-    if not warmup_names:
+    if whole:  # its warmup's steps are graded too, and so would a later client run's be
+        after = zip(split[first:], mine[first:], warm[first:])
+        if later := [s["step"] for s, m, w in after if not (m or w)]:
+            why.append(
+                f"steps of requests it did not send follow its own, {len(later)} "
+                f"from step {later[0]}, and it is graded whole"
+            )
+        warmup = (export.get("warmup") or {}).values()
+        traces = sorted({*traces, *(r["trace"] for r in warmup)})
+    elif not warmup_names:
         why.append("its export names no warmup, so its first steps may be cold")
     elif not any(names & warmup_names for names in held[:first]):
         why.append(
             "no step before its own first holds its warmup, so its first steps may be cold"
         )
     late = [s["step"] for s, n in zip(split[first:], held[first:]) if n & warmup_names]
-    if late:
+    if late and not whole:
         why.append(
             "steps from its own first on hold a request of its warmup, "
             f"{len(late)} from step {late[0]}, so its warmup has not ended when it starts"
@@ -291,6 +303,8 @@ def _client_run(cell, run, client) -> tuple[list[dict], list[str], dict]:
         why += _not_graded(run, traces)
     if why:
         raise ValueError(f"{cell} is not graded: " + "; ".join(why))
+    if whole:
+        return steps, None, None
     warmup = {"requests": len(warmup_names), "steps": sum(warm)}
     return [s for s, m in zip(steps, mine) if m], export["traces"], warmup
 
@@ -332,17 +346,22 @@ def _not_graded(run, traces) -> list[str]:
     return why
 
 
-def graded(cell, client=None) -> tuple[list[dict], list[str] | None, dict | None]:
+def graded(cell, client=None, whole=False) -> tuple:
     """The steps `cell` grades, every DP rank's; the traces its client was
     given, and its warmup, as `_client_run` gives them, both None where it is
-    graded whole. `client` holds the client's export, `cell` itself unless
-    `cell` is a deployment's side."""
+    graded whole, as it is when `whole`. `client` holds the client's export,
+    `cell` itself unless `cell` is a deployment's side."""
     client = client or cell
     path = Path(cell) / "run.json"
     run = read_json(path) if path.exists() else {}
     if "format_version" in run or (Path(client) / CLIENT_RUN).is_file():
-        return _client_run(cell, run, client)
+        return _client_run(cell, run, client, whole)
     return _steps(cell), None, None
+
+
+def graded_whole(real) -> bool:
+    """Whether a cell of the `real` runs grades every run whole: when one is."""
+    return any(graded(side, r)[1] is None for r in real for side in sides(r))
 
 
 def _refuse_by_run_file(cell) -> None:
@@ -368,11 +387,11 @@ def _refuse_by_run_file(cell) -> None:
         raise ValueError(f"{cell} is not graded: " + "; ".join(why))
 
 
-def _read(cell) -> dict:
+def _read(cell, whole) -> dict:
     export = read_json(Path(cell) / EXPORT)
     out = {"end to end": _end_to_end(export), "sides": {}}
     for side in sides(cell):
-        steps, traces, _warmup = graded(side, cell)
+        steps, traces, _warmup = graded(side, cell, whole)
         out["sides"]["" if side == Path(cell) else f" {side.name}"] = {
             "counts": _counts(steps, export),
             "distributions": _distributions(steps),
@@ -418,8 +437,9 @@ def grade(real_cells, simulated_cell) -> dict:
         names = [str(c) for c in real_cells]
         raise ValueError(f"{names}: a real spread needs two or more real runs")
     _refuse_by_run_file(simulated_cell)
-    real = [_read(c) for c in real_cells]
-    simulated = _read(simulated_cell)
+    whole = graded_whole(real_cells)
+    real = [_read(c, whole) for c in real_cells]
+    simulated = _read(simulated_cell, whole)
     given = {str(c): r["traces"] for c, r in zip(real_cells, real)}
     given[str(simulated_cell)] = simulated["traces"]
     if len({json.dumps(t) for t in given.values()}) > 1:
