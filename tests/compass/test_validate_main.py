@@ -808,3 +808,27 @@ def test_an_op_graph_cell_grades_with_its_method_shares_term_gaps_and_warm_over_
     rows = _graded(capsys, cell)
     assert rows["cost real0", "fallback prefill tokens 0-512"][0] == value
     assert ("cost real0", "refused prefill tokens 0-512") not in rows
+
+
+def test_cost_rows_gate_every_graded_step_and_print_the_breakdown_not_gated(
+    capsys, tmp_path
+):
+    # A held-out hull to context 10000 leaves decode steps 2 to 9 unvalidated.
+    _rows(capsys, tmp_path)
+    law = json.loads(json.dumps(LAW))
+    law["decode"]["1"]["held_out"]["hull"]["facets"] = [[-1, 100], [1, -10000]]
+    sim = tmp_path / "c4" / "step_linear" / "run.json"
+    sim.write_text(json.dumps(json.loads(sim.read_text()) | {"step_linear": law}))
+
+    main([str(tmp_path / "c4")])
+    out = capsys.readouterr().out.splitlines()
+    rows = {tuple(r.split(" | ")[1:3]): r.split(" | ")[3:] for r in out[1:]}
+
+    for metric, steps, verdict in (
+        ("graded", 10, "-"),
+        ("validated", 2, "not gated"),
+        ("unvalidated", 8, "not gated"),
+    ):
+        value, gated = rows["cost real1", f"decode {metric}"]
+        assert value.startswith(f"{steps} steps") and gated == verdict
+        assert rows["cost real1", f"decode rung 1 {metric}"][1] == verdict

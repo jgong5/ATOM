@@ -1129,7 +1129,7 @@ Client runs), and carried in the run artifact:
 | wall seconds vs simulated seconds | the speed result (`08`), and the only place the ≥5x target is measured |
 | lazy traces: count and wall seconds | `02` — they consume real time inside a simulated run and must not silently degrade the speed result |
 | causality detector state | straggler count (must be 0), stall diagnostics printed, clock-lint status |
-| refusals: count and distinct reasons; predicted seconds by method (`seconds_by_method`), each with its step count and share; `coverage_report` | `08` D50.1: any refusal makes the run a coverage report; analytical and declared seconds are reported, not gated |
+| refusals: count and distinct reasons; predicted seconds by method (`seconds_by_method`), each with its step count and share; `coverage_report` | `08` D50.1: any refusal makes the run a coverage report, no share of seconds by method does; analytical and declared seconds are reported, not gated, and unvalidated ones are graded by cost accuracy (`08` D47) |
 
 ### Rules
 

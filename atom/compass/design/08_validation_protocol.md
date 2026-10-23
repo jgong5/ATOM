@@ -32,6 +32,13 @@ fallback share, its composed-over-measured gap and warm-over-cold reported besid
 stage 2 runs at 1, 4 and 16 clients; 64 and 256 were dropped on a real-side limit, not on a
 simulated error (D50).
 
+**Revised 2026-10-23 by the owner's
+[ruling on #2011](https://github.com/jgong5/ATOM/issues/2011#issuecomment-6365512377):**
+cost accuracy grades every answered step with no declared term, at every backend, under
+#627's 5% gate; validated and unvalidated steps are also reported beside it, not gated (D47).
+This replaces #627's [ruling 3](https://github.com/jgong5/ATOM/issues/627#issuecomment-6096543740) exemption from that gate only:
+extrapolation still neither refuses nor aborts a cell (D50.1).
+
 **Scope.** What counts as evidence: which results are reported, how each is measured, what
 tolerance applies and where that tolerance comes from, and what invalidates a run.
 Acceptance is paired simulated and real execution of cc-traces proper, so every rule here
@@ -380,6 +387,19 @@ excluding step 0** — a single cold-start error of **−6.75 s** almost exactly
 So cost accuracy must be reported **with outliers held out**, and the cold start priced or
 excluded deliberately rather than left to cancel a real bias.
 
+### What is graded
+
+**The owner's [ruling on #2011](https://github.com/jgong5/ATOM/issues/2011#issuecomment-6365512377), 2026-10-23.** The graded figures
+hold every answered step whose priced rank has no declared term, at every backend: a step
+linear law step outside its held-out hull, a step-grid step outside its residual's held-out hull and
+an op-graph step with an unvalidated leaf are graded with the validated ones, and #627's 5%
+gate applies to all of them. It replaces #627's [ruling 3](https://github.com/jgong5/ATOM/issues/627#issuecomment-6096543740) exemption of
+out-of-hull steps from that gate. Beside the graded figures, not gated, are the same three
+numbers over the validated steps and over the unvalidated ones. A step with a declared term
+is reported apart and enters no graded figure; a draft is grouped by its draft terms the
+same way. A real run measures every step, so none is left out, and no validated share
+refuses or makes a coverage report (D50.1).
+
 ---
 
 ## D48. Memory: per term, never as a sum
@@ -443,7 +463,7 @@ Each of these voided real percentages before.
    family**. Both are doc `09` D58/D59 — the geometry of coverage and the choice of a
    functional form are fitting questions and are argued there, with the measurements.
    Named here because a validation run applies both: a step outside the hull is priced
-   `estimated`, unvalidated, and reported apart (D50.1), not refused, and a law whose family was
+   `estimated`, unvalidated, graded with the rest and also reported apart (D47), not refused, and a law whose family was
    chosen by LOO alone is not admissible evidence. An op-level leaf is not extrapolated:
    with no same-kernel bracket it is priced by its analytical law, counted in D50.3's
    fallback share (`09` D60; revised 2026-10-18, #1489).
@@ -500,7 +520,7 @@ the terms of [#952](https://github.com/jgong5/ATOM/issues/952)). Concretely:
 3. **Any refusal, of any source, makes the run a coverage report** (`coverage_report` in
    the run summary, `01` D3.5), not acceptance evidence. It names exactly what to
    measure next. There is no threshold. No answered step invalidates a run, whatever its
-   method or share.
+   method or share, and no validated share does: an unvalidated step is graded (D47).
 4. **`compass run --on-refusal abort` exists** (`13` D80) for the case where a refusal is a
    bug being chased. It stops the run at the first refusal, and the run summary is still
    written. It is not the default.
@@ -676,7 +696,8 @@ sits.
 
 **Owner's ruling on [#1489](https://github.com/jgong5/ATOM/issues/1489), 2026-10-18.**
 **Graded by this protocol as the step-level backends are, on the same real runs:** D44's
-three results inside D45's tolerance, D47's cost accuracy on the real runs' own steps, and
+three results inside D45's tolerance, D47's cost accuracy on the real runs' own steps (an
+op-graph step with an unvalidated leaf graded with the rest), and
 D50's cells. Qwen3.8-27B TP1 on MI308X is graded on
 [#974](https://github.com/jgong5/ATOM/issues/974)'s real runs, then DeepSeek-V4-Pro's four
 nightly configurations on MI355X and the DPA two at EP8, with D50's ranking gate. A refused
@@ -761,10 +782,10 @@ claims there are not.
 | D44 | Three separable results — cost accuracy, schedule agreement, end-to-end — reported side by side. Aggregate latency is never the judgement. | 2026-09-18 |
 | D45 | Noise-floor first: the real-vs-real spread is the tolerance. A metric is admissible if stable; sensitivity, tested against the ×0.97 counterfactual, is deferred until a need appears. | 2026-09-18; revised 2026-10-16 (#1025) |
 | D46 | Three metric families ordered by robustness, as an extensible registry: counting invariants (exact; prefill tokens over the requests both runs issued, within the real spread), distributional (weighted most), event timing (most diagnostic). Policy agreement is a regression guard, not a discriminator. | 2026-09-18; revised 2026-10-13 (#897) |
-| D47 | Cost accuracy on the real run's own step sequence; report totals, held-out-worst, and median per step together. | 2026-09-18 |
+| D47 | Cost accuracy on the real run's own step sequence; report totals, held-out-worst, and median per step together. Graded: every answered step with no declared term, at every backend, under #627's 5% gate; validated and unvalidated steps reported beside, not gated; declared steps apart. | 2026-09-18; revised 2026-10-23 (#2011) |
 | D48 | Memory per term, never as a sum. The gate is whether the top-1 configuration choice survives, not the byte error. | 2026-09-18 |
-| D49 | Seven hygiene refusals, each with a prior incident behind it. An op-level leaf is not extrapolated: with no same-kernel bracket it falls to its analytical law. | 2026-09-18; op-level leaf 2026-10-18 (#1489) |
-| D50.1 | A step is refused only when some term is still unanswered after method fallback, its reasons listed per term; a fall-through and an answer of any method are not refusals, and the priced seconds are reported by method (analytical, declared, measured, estimated, unvalidated) with their steps and share of predicted seconds. A refused step costs 0 s and the run continues; `--on-refusal abort` stops at the first, and the summary is written either way. Any refusal, of any source, makes the run a coverage report: no refused-seconds fraction, no threshold, and no answered step invalidates a run, whatever its method or share. | 2026-09-19; revised 2026-10-11 (#765, and again to drop the analytical cap); 2026-10-14 (#952) |
+| D49 | Seven hygiene refusals, each with a prior incident behind it. An op-level leaf is not extrapolated: with no same-kernel bracket it falls to its analytical law. An out-of-hull step is graded and also reported apart. | 2026-09-18; op-level leaf 2026-10-18 (#1489); out-of-hull graded 2026-10-23 (#2011) |
+| D50.1 | A step is refused only when some term is still unanswered after method fallback, its reasons listed per term; a fall-through and an answer of any method are not refusals, and the priced seconds are reported by method (analytical, declared, measured, estimated, unvalidated) with their steps and share of predicted seconds. A refused step costs 0 s and the run continues; `--on-refusal abort` stops at the first, and the summary is written either way. Any refusal, of any source, makes the run a coverage report: no refused-seconds fraction, no threshold, and no answered step invalidates a run, whatever its method or share. No validated share refuses or makes a coverage report. | 2026-09-19; revised 2026-10-11 (#765, and again to drop the analytical cap); 2026-10-14 (#952); 2026-10-23 (#2011) |
 | D50 | Everything registered and hashed before evaluation; the case set never shrinks, though the owner dropped stage 2's 64 and 256, whose aiperf warmup cannot finish within a capture's window (#1590). One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The cells are stage 2's Qwen3.8-27B TP1 on MI308X and M2's four nightly P/D configurations of DeepSeek-V4-Pro on MI355X at their concurrencies, then the DPA two at EP8. M2's ranking gate: the same best configuration as hardware at each concurrency, and rank correlation across all cells, per end-to-end metric, each inside its real-vs-real spread, with Spearman's ρ also at least 0.9. DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01, 2026-10-09, 2026-10-10, 2026-10-20 |
 | D50.2 | The MI455 projection is sound, not graded: on every measured step, at both granularities, the analytical price at attainable peaks probed on the device, composed by the IR's own joins, is at most the measured time, with measured over analytical per op kind and phase reported beside it; every MI455 input is sourced or marked assumed, its peaks the datasheet times MI355X's probed ratios; the method's error, MI308X to MI355X on Qwen3.8-27B, and the configuration ranking are reported, not gated. Replaces the bound first stated at the spec's peaks with derates at 1, and the method that carried implementation efficiencies onto the target. | 2026-10-09; revised 2026-10-17 (#1392) |
 | D50.3 | The op-level empirical backend is graded by this protocol as the step-level backends are, on the same real runs: Qwen3.8-27B TP1 on MI308X on #974's runs, then M2's cells with the ranking gate. Faster than real is gated; 5× is reported. Reported, not gated: the analytical fallback's share of priced seconds, the per-step composed-over-measured gap per phase and op kind, the step-level backend's table beside it, and warm-over-cold. | 2026-10-18 (#1489) |
