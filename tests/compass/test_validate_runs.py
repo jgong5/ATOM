@@ -628,6 +628,42 @@ def test_a_client_run_whose_warmup_runs_on_past_its_first_own_step_is_refused(
         grade(cells[:3], cells[3])
 
 
+def test_a_client_run_naming_no_warmup_grades_whole_beside_a_whole_real_run(tmp_path):
+    *real, simulated = _four(tmp_path)
+    report = grade(real, simulated)
+    # r2 stays as `cctraces_sim.sh` wrote it, so every run is graded whole.
+    for cell in real[:2]:
+        _recorded(cell, warmup=None)
+    _recorded(simulated, warmup=None, **GRADED)
+
+    assert grade(real, simulated) == report
+
+
+def test_a_run_graded_whole_whose_backend_was_fitted_on_its_warmup_is_refused(
+    tmp_path,
+):
+    *real, simulated = _four(tmp_path)
+    for cell in real[:2]:
+        _recorded(cell)
+    inputs = [{"run": "fit.jsonl", "traces": ["trace-kw"]}]
+    leaked = {"digest": "sha256:0", "provenance": {"inputs": inputs}}
+    _recorded(simulated, **(GRADED | {"provenance": leaked}))
+
+    fitted = r"its backend was fitted on traces it served: \['trace-kw'\]"
+    with pytest.raises(ValueError, match=f"sim is not graded: {fitted}$"):
+        grade(real, simulated)
+
+
+def test_a_client_run_whose_warmup_runs_on_past_its_first_own_step_grades_whole(
+    tmp_path,
+):
+    *real, simulated = _four(tmp_path, LONG, {6: "kw", 7: "ka", 8: "kb"})
+    for cell in (*real[:2], simulated):
+        _recorded(cell, warmup={"kw"})
+
+    assert grade(real, simulated)["counts"]["decode steps"]["verdict"] == "exact"
+
+
 def test_the_steps_of_a_later_client_run_are_not_graded(tmp_path):
     *real, simulated = (_recorded(c) for c in _four(tmp_path))
     report = grade(real, simulated)
