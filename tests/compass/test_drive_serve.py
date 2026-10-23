@@ -371,3 +371,39 @@ def test_each_start_takes_a_free_dp_master_port_over_the_callers(planted, monkey
         serve.serve(
             [*ARGS, "--data-parallel-master-port", "29500"], planted / "o", (7,)
         )
+
+
+def test_each_port_a_server_is_handed_is_below_the_ephemeral_range(
+    planted, monkeypatch
+):
+    """A rank binds port 0 while the model loads, and the kernel hands it one
+    from its ephemeral range, so a port drawn there can be taken first."""
+    monkeypatch.setenv("PLANTED_EXIT", "late:0")
+    (planted / "range").write_text("20000\t60999\n")
+    monkeypatch.setattr(serve, "PORT_RANGE", planted / "range")
+    popen, env = subprocess.Popen, {}
+
+    def spy(argv, **kwargs):
+        if argv[:2] == list(serve.SERVER):
+            env.update(kwargs["env"])
+        return popen(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    out = planted / "out"
+    serve.serve(ARGS, out, run={})
+    argv = _seen(planted)["argv"]
+    ports = [argv[argv.index(flag) + 1] for flag in ("--server-port", "--port")]
+    clock = json.loads((out / serve.RUN_FILE).read_text())["clock_endpoint"]
+    ports += [clock.rsplit(":", 1)[1], env["ATOM_DP_MASTER_PORT"]]
+    assert all(10000 <= int(p) < 20000 for p in ports), ports
+
+
+def test_a_range_with_no_room_below_it_refuses_before_the_server_starts(
+    planted, monkeypatch
+):
+    monkeypatch.setenv("PLANTED_EXIT", "early:0")
+    (planted / "range").write_text("10003\t60999\n")
+    monkeypatch.setattr(serve, "PORT_RANGE", planted / "range")
+    with pytest.raises(serve.ServeError, match="fewer than 4 free ports .* 10003 "):
+        serve.serve(ARGS, planted / "out", (7,))
+    assert not (planted / "argv.json").exists()
