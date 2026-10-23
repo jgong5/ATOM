@@ -40,6 +40,9 @@ and a middle chunk has none. With an MTP status wait,
 pipeline stage, `W_recv` runs from the launch to the receive of its input.
 Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
 pull after the previous exit, and `E_out` from the exit to the pull after it.
+`label_run` labels a run's DP ranks together: there `E` runs from the latest
+pull, else exit, over the ranks before the same forward, where the group's
+`_sync_dp_state` releases each of them.
 
 `write_table` writes a record's labels beside it, `dp<r>.cost.jsonl`, for
 people: a first line `{"version": TABLE_VERSION}`, then per step `step`,
@@ -171,16 +174,55 @@ def _shared(step, other) -> bool:
     return bool({r[0] for r in step["batch"]} & {r[0] for r in other["batch"]})
 
 
+def _read(record) -> list[dict]:
+    path = Path(record)
+    lines = read_jsonl(path)
+    if (pulls := path.with_suffix(".pulls.jsonl")).exists():
+        join_stamps(lines, pulls)
+    return lines
+
+
+def _pull(step: dict) -> int:
+    return step.get("t_pull_ns", step["t_exit_ns"])
+
+
 def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
     """The record's samples, in step order, and its table's rows.
 
     `run` names the run in each sample's provenance, the record's `digest` by
     default.
     """
+    lines = _read(record)
+    return _label(record, lines, run, [_pull(s) for s in lines])
+
+
+def label_run(records, run: str | None = None) -> list[tuple[list[Sample], list[dict]]]:
+    """`label` of each of `records`, one run's DP ranks, with each `E` from the
+    latest pull over the ranks before the same forward. A rank that ran only
+    DP's dummy forwards gives no sample and no row. Ranks whose line counts
+    differ by more than the forward a stopped server leaves on some refuse."""
+    ranks = [_read(r) for r in records]
+    counts = {Path(r).name: len(x) for r, x in zip(records, ranks) if x}
+    if counts and max(counts.values()) - min(counts.values()) > 1:
+        raise ValueError(
+            f"the run's rank records hold {counts} lines, so their forwards "
+            "do not pair up"
+        )
+    n = max(map(len, ranks), default=0)
+    starts = [max(_pull(x[i]) for x in ranks if i < len(x)) for i in range(n)]
+    return [
+        (
+            ([], [])
+            if x and all(s["is_dummy_run"] for s in x)
+            else _label(r, x, run, starts)
+        )
+        for r, x in zip(records, ranks)
+    ]
+
+
+def _label(record, lines, run, starts) -> tuple[list[Sample], list[dict]]:
+    """`label` of `record`'s `lines`, each `E` from `starts` at the line before."""
     path = Path(record)
-    lines = read_jsonl(path)
-    if (pulls := path.with_suffix(".pulls.jsonl")).exists():
-        join_stamps(lines, pulls)
     steps = [s for s in lines if not s["is_dummy_run"]]
     if not steps or "t_enter_ns" not in steps[0]:
         raise ValueError(
@@ -197,7 +239,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
     config = read_json(key) if key.exists() else None
     run = run or digest(record)
     samples, table, prev = [], [], None
-    for s in lines:
+    for i, s in enumerate(lines):
         if s["is_dummy_run"]:
             prev = s
             continue
@@ -238,7 +280,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
             host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]
         idle = prev is not None and not _shared(s, prev)
         if prev is not None and not idle:
-            host["E"] = enter - prev.get("t_pull_ns", prev["t_exit_ns"])
+            host["E"] = enter - starts[i - 1]
         host = {k: v * 1e-9 for k, v in host.items()}
         provenance = {
             "source": "record",

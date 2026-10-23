@@ -200,9 +200,9 @@ def label_records(records, dp: int = 1) -> tuple[list, dict]:
     for i in range(0, len(records), dp):
         run = records[i : i + dp]
         name = ", ".join(map(step_labels.digest, run))
-        for record in run:
-            got, tables[record] = step_labels.label(record, name)
+        for record, (got, table) in zip(run, step_labels.label_run(run, name)):
             samples += got
+            tables[record] = table
     return samples, tables
 
 

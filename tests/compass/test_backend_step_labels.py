@@ -8,6 +8,7 @@ planted device, through a real runner's stamps, and as
 """
 
 import json
+import re
 
 import pytest
 from test_backend_step_linear_fit import (
@@ -33,6 +34,7 @@ from atom.compass.backends.step_labels import (
 )
 from atom.compass.backends.step_linear_fit import (
     fit,
+    fit_host,
     label_records,
     main,
     mark_held_out,
@@ -265,12 +267,16 @@ def test_host_laws_fitted_under_a_stated_engine_load_at_that_engine(
     assert r.compass_host.laws == law["host"]["laws"]
 
 
-def pulled(record):
-    """Write `record`'s pull stamps beside it, a put and then a pull a third of
-    the way from each line's exit to the next line's entry; returns the pulls."""
+def pulled(record, parts=(3,)):
+    """Write `record`'s pull stamps beside it, a put and then a pull at
+    1 / `parts[n % len(parts)]` of the way from line n's exit to the next
+    line's entry; returns the pulls."""
     lines = [json.loads(x) for x in record.read_text().splitlines()]
     ends = [s["t_enter_ns"] for s in lines[1:]] + [lines[-1]["t_exit_ns"] + 9]
-    pulls = [s["t_exit_ns"] + (e - s["t_exit_ns"]) // 3 for s, e in zip(lines, ends)]
+    pulls = [
+        s["t_exit_ns"] + (e - s["t_exit_ns"]) // parts[n % len(parts)]
+        for n, (s, e) in enumerate(zip(lines, ends))
+    ]
     stamps = [x for p in pulls for x in ({"t_put_ns": p - 1}, {"t_pull_ns": p})]
     path = record.with_suffix(".pulls.jsonl")
     path.write_text("".join(json.dumps(x) + "\n" for x in stamps))
@@ -298,3 +304,72 @@ def test_a_record_with_pull_stamps_labels_E_out_and_E_from_the_pull(tmp_path):
             )
         others = {k: v for k, v in s.host.items() if k not in ("E", "E_out")}
         assert others == {k: v for k, v in u.host.items() if k != "E"}
+
+
+def _pair(steps, parts):
+    """Two DP ranks' records of the same forwards in `steps`, rank r pulling as
+    `pulled(record, parts[r])` does; returns the records and their pulls."""
+    from test_drive_record import ENGINE
+
+    steps.mkdir(exist_ok=True)
+    records, pulls = [], []
+    for rank in (0, 1):
+        path = _timed_record(steps / f"dp{rank}.jsonl", _steps(19))[0]
+        lines = [json.loads(x) | {"dp_rank": rank} for x in path.open()]
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+        path.with_suffix(".engine.json").write_text(json.dumps(ENGINE))
+        pulls.append(pulled(path, parts[rank]))
+        records.append(path)
+    return records, pulls
+
+
+def test_a_dp_pair_s_cost_lines_start_E_at_the_group_s_latest_pull(tmp_path):
+    from atom.compass.drive.record import write_engine_and_costs
+
+    # Rank 1 pulls after rank 0 after even lines and before it after odd ones.
+    records, pulls = _pair(tmp_path / "steps", ((3,), (2, 6)))
+    (tmp_path / "run.json").write_text("{}")
+    write_engine_and_costs(tmp_path)
+
+    lines = [json.loads(x) for x in records[0].open()]
+    latest = set()
+    for rank, record in enumerate(records):
+        _, *table = map(json.loads, record.with_suffix(".cost.jsonl").open())
+        assert [row["step"] for row in table] == list(range(len(lines)))
+        for n, row in enumerate(table):
+            own = (pulls[rank][n] - lines[n]["t_exit_ns"]) * 1e-9
+            assert row["E_out"] == pytest.approx(own, rel=1e-12)
+            if n:
+                start = max(p[n - 1] for p in pulls)
+                latest.add(pulls[1][n - 1] == start)
+                gap = (lines[n]["t_enter_ns"] - start) * 1e-9
+                assert row["E"] == pytest.approx(gap, rel=1e-12)
+    assert latest == {True, False}
+
+
+def test_a_dp_pair_fits_the_E_law_of_its_later_pulling_rank(tmp_path):
+    records = _pair(tmp_path, ((3,), (2,)))[0]
+
+    pair = fit_host(label_records(records, 2)[0])[0]["laws"]
+    alone = [fit_host(label_records([r])[0])[0]["laws"] for r in records]
+    assert set(pair) == {"decode", "prefill", "middle"}
+    for kind, laws in pair.items():
+        assert laws["E"] == pytest.approx(alone[1][kind]["E"], rel=1e-9)
+        assert laws["E"] != pytest.approx(alone[0][kind]["E"], rel=1e-3)
+        assert laws["E_out"] != pytest.approx(alone[1][kind]["E_out"], rel=1e-3)
+
+
+@pytest.mark.parametrize("short", [1, 2])
+def test_ranks_one_forward_apart_are_labelled_and_further_apart_refuse(tmp_path, short):
+    record = _timed_record(tmp_path / "dp0.jsonl", _steps(19))[0]
+    lines = record.read_text().splitlines(keepends=True)
+    (tmp_path / "dp1.jsonl").write_text("".join(lines[:-short]))
+    records = [record, tmp_path / "dp1.jsonl"]
+
+    if short == 1:
+        assert len(label_records(records, 2)[0]) == 2 * len(lines) - 1
+        return
+    counts = {"dp0.jsonl": len(lines), "dp1.jsonl": len(lines) - 2}
+    refusal = f"hold {counts} lines, so their forwards do not pair up"
+    with pytest.raises(ValueError, match=re.escape(refusal)):
+        label_records(records, 2)
