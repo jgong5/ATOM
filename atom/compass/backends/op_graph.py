@@ -102,6 +102,9 @@ DRAFT = "draft "
 #: The leaves a backend keeps; past it, it forgets them all and every price
 #: it kept across steps.
 KEPT = 1 << 16
+#: A reference argument's keys: a context key or a module path, whose value a
+#: leaf's work does not read.
+REFS = ({"context"}, {"module"})
 
 
 class _Watched:
@@ -206,9 +209,9 @@ class OpGraphBackend(CostBackend):
         self.drafts = drafts
         self.name = machine.values.get("name", "")
         self._stated_as: dict[str, str] = {}
-        # By leaf object: the leaf, its content as text, and its price at a
-        # bound when its work read nothing of the step; by view, bound and
-        # content: one step's prices.
+        # By leaf object: the leaf, what its work reads as text, and its price
+        # at a bound when its work read nothing of the step; by view, bound
+        # and that text: one step's prices.
         self._kept: dict[int, list] = {}
         self._step: dict[tuple, tuple] = {}
         self.resolver = price_list and Resolver([price_list, _Roofline(self)])
@@ -435,14 +438,19 @@ class OpGraphBackend(CostBackend):
         return [(name, *unit, summed, comm, ((), ()))] if unit else []
 
     def _leaf(self, leaf: dict, view: BatchView, refused: list, bound):
-        """`_price_leaf`, once a step for each leaf content, and once for good
-        for a leaf object whose work read nothing of the step's view and
-        nothing refused."""
+        """`_price_leaf`, once a step for each operator, arguments, outputs and
+        stated fields, all a leaf's work reads of it, and once for good for a
+        leaf object whose work read nothing of the step and nothing refused."""
         kept = self._kept.get(id(leaf))
         if kept is None or kept[0] is not leaf:
             if len(self._kept) >= KEPT:
                 self._kept.clear()
-            text = json.dumps(leaf, sort_keys=True, default=repr)
+            args = {
+                s: sorted(v) if isinstance(v, dict) and v.keys() in REFS else v
+                for s, v in leaf.get("args", {}).items()
+            }
+            what = [leaf["op"], args, leaf.get("out"), leaf.get("stated")]
+            text = json.dumps(what, sort_keys=True, default=repr)
             kept = self._kept[id(leaf)] = [leaf, text, None]
         if kept[2] and kept[2][0] == bound:
             return kept[2][1]
