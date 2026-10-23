@@ -263,10 +263,10 @@ def test_a_term_is_declared_iff_a_field_its_winning_bound_reads_is_stated(
         assert note.endswith(NONE)
 
 
-def test_a_step_works_each_signature_once_and_keeps_what_reads_no_step(
+def test_a_step_works_each_distinct_leaf_once_and_keeps_what_reads_no_step(
     monkeypatch,
 ):
-    """Leaves of one signature share one work a step; a GEMM, which reads
+    """Equal leaves share one work a step; a GEMM leaf, which reads
     nothing of the step, keeps its work across steps; attention, which reads
     the step's rows, is worked again at each step's."""
     worked = []
@@ -287,7 +287,7 @@ def test_a_step_works_each_signature_once_and_keeps_what_reads_no_step(
     assert costs[0] != costs[1]
 
 
-def test_a_signature_in_and_out_of_a_resource_bound_par_prices_each_way():
+def test_a_leaf_in_and_out_of_a_resource_bound_par_prices_each_way():
     big = g(2, 4096, 4096)
     params = listed(
         *[pt(g(b, 4096, 4096), f"decode B={b}", 1e3, c) for b in (2, 4) for c in (1, 9)]
