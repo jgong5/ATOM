@@ -402,7 +402,9 @@ predicted; if not, that is the finding and the recipe grows.
 real engine, reads the readings below on every rank once the KV cache is allocated and
 the graphs are captured, publishes one `memory_readings` entry (D41), and exits (`13`
 D80); `record` takes none. The entry is keyed by the model, the digest of `--machine`,
-the parallel layout and the engine config, its KV offload connector included
+the parallel layout and the engine config, its KV offload connector and resolved
+`index_cache_dtype` included (any `kv_transfer_config` resolves DeepSeek-V4's
+indexer to fp8, so a PD start reads a plain fp8-indexer start's entry)
 (`atom/compass/run/memory.py::key_fields`), and
 records the stack the start ran on, which a run's spec must pin. A run reads its rank's
 member and refuses when there is no entry, so the readings leave the machine spec (doc
