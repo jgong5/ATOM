@@ -12,6 +12,8 @@ from test_backend_step_labels import pulled
 from test_fit_samples import edit
 from test_fit_steps import (  # noqa: F401
     DIGEST,
+    ENGINE,
+    HOST,
     clients,
     fit,
     member,
@@ -113,3 +115,26 @@ def test_records_with_pull_stamps_give_every_kind_an_E_out_law_a_run_prices(
     kind, x = forward_shape(batch)
     out_s = np.dot(host["laws"][kind][OUT_SEGMENT], x)
     assert r.forward(batch).out_s == pytest.approx(out_s) and out_s > 0
+
+
+def test_a_dp_pair_s_host_laws_start_E_at_the_group_s_latest_pull(tmp_path):
+    key = {**HOST, "engine": {**ENGINE, "data_parallel_size": 2}}
+    a = record(tmp_path / "a", 19, key=key)
+    steps = a / "steps"
+    for suffix in (".key.json", ".engine.json"):
+        (steps / f"dp1{suffix}").write_text((steps / f"dp0{suffix}").read_text())
+    rank0 = [json.loads(x) for x in (steps / "dp0.jsonl").open()]
+    rank1 = "".join(json.dumps(x | {"dp_rank": 1}) + "\n" for x in rank0)
+    (steps / "dp1.jsonl").write_text(rank1)
+    # The same forwards on both ranks; rank 1 always pulls after rank 0.
+    paths = [steps / "dp0.jsonl", steps / "dp1.jsonl"]
+    for path, parts in zip(paths, ((3,), (2,))):
+        pulled(path, parts)
+    fit(tmp_path, "fit host", a, *clients(a))
+
+    laws = member(tmp_path / "store", host_laws_key(key), "params")["laws"]
+    alone = [fit_host(label_records([p])[0])[0]["laws"] for p in paths]
+    assert set(laws) == {"decode", "prefill", "middle"}
+    for kind, law in laws.items():
+        assert law["E"] == pytest.approx(alone[1][kind]["E"], rel=1e-9)
+        assert law["E"] != pytest.approx(alone[0][kind]["E"], rel=1e-3)
