@@ -495,6 +495,17 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   rung, and publishes the drafter's half alone, as the target ran at the rung
   ([#1961](https://github.com/jgong5/ATOM/issues/1961)). Its default G is every rank's
   rows' tokens.
+- **Later passes at `running_bs` on every step.** `ForwardMode.decide` sets `running_bs`
+  on every step, replayed or not: the ladder's rung of the group's widest batch, or that
+  batch itself off the ladder and under `enforce_eager`. So a sampling prefill, a decode
+  beside a prefilling DP peer and an eager DP decode run their drafter's later passes
+  past their rows too. The step's view states that batch as `draft_bs` (the record line
+  too) for a drafter that declares a draft graph. A decode's drafter is then keyed
+  `decode T=<rows> B=<draft_bs>`, a sampling prefill's `prefill T=<tokens> B=<rows>
+  W=<draft_bs>`; `--population` captures each, setting `running_bs` at the cut, and
+  publishes the drafter's half alone ([#1982](https://github.com/jgong5/ATOM/issues/1982)).
+  A target padded without a replay, a sampling prefill's LM head or an eager DP decode,
+  is still traced at its rows ([#2033](https://github.com/jgong5/ATOM/issues/2033)).
 - **A middle chunk is cut where its draft-KV pass starts.** ATOM runs that pass
   (`compute_draft_kv`) after every target forward of a real step, a middle chunk's included,
   and a middle chunk records no `forward_done_event`. Under a drafter a prefill shape is
