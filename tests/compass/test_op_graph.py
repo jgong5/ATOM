@@ -949,6 +949,39 @@ def test_a_shape_no_graph_holds_is_traced_in_the_run_as_trace_ops_traces_it(
     assert lazy["lazy_traces"] == 1 and lazy["lazy_trace_wall_seconds"] > 0
 
 
+def _lazily(tmp_path_factory, root, *atom_args, **engine):
+    """The run's lookup of the 27B under `engine`'s config fields into the
+    store at `root`, tracing a missing shape from the server's `atom_args`, and
+    its counts."""
+    (graph, _), *_ = capture(1, PREFILLS, tmp_path_factory).values()
+    model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
+    config, lazy = _reader(graph, model), _counts()
+    vars(config).update(engine)
+    args = ["--model", str(model), *atom_args]
+    return _op_graphs(str(root), config, "gfx942", args, lazy), lazy
+
+
+def test_a_prefill_two_batch_overlap_would_split_is_traced_lazily_as_one_forward(
+    tmp_path_factory, tmp_path, monkeypatch
+):
+    # ATOM splits a prefill under --enable-tbo from this many tokens on.
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "256")
+    lookup, lazy = _lazily(tmp_path_factory, tmp_path, "--enable-tbo", enable_tbo=True)
+
+    assert isinstance(lookup("prefill", 512, 2), dict)
+    assert lazy["lazy_traces"] == 1
+
+
+def test_a_lazy_trace_reads_atom_s_arguments_in_either_spelling_as_its_server_does(
+    tmp_path_factory, tmp_path
+):
+    args = "--kv-cache-dtype", "fp8"
+    lookup, lazy = _lazily(tmp_path_factory, tmp_path, *args, kv_cache_dtype="fp8")
+
+    assert isinstance(lookup("decode", 2, 2), dict)
+    assert lazy["lazy_traces"] == 1
+
+
 def test_a_lazy_trace_that_fails_ends_the_run_naming_the_shape(tmp_path):
     (tmp_path / "model").mkdir()  # holds no config.json, so no capture builds it
     (tmp_path / "read").mkdir()

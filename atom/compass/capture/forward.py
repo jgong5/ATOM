@@ -1019,13 +1019,13 @@ def _config(model, tp, atom_args):
     Under `--enable-dp-attention` each TP rank is a DP rank of TP 1, as
     `CoreManager` rewrites it.
     """
-    import argparse
     import dataclasses
 
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
 
-    parser = EngineArgs.add_cli_args(argparse.ArgumentParser(prog="trace ops --"))
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog="trace ops --"))
     forced = ["--enforce-eager", "--level", "0", "--load_dummy", "empty"]
     args = parser.parse_args(["--model", model, "-tp", str(tp), *atom_args, *forced])
     engine = EngineArgs.from_cli_args(args)
