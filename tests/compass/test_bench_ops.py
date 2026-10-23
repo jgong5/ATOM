@@ -1004,6 +1004,11 @@ def test_a_plane_argument_is_sized_by_the_rows_of_the_batch_s_blocks(monkeypatch
                 name="aiter.sparse",
                 stated=(("window_size", 8), ("compress_ratio", 4), ("index_topk", 3)),
             ),
+            dataclasses.replace(
+                leaf,
+                name="aiter.top1",
+                stated=(("window_size", 8), ("compress_ratio", 4), ("index_topk", 1)),
+            ),
             layers=1,
         )["region"]
     )
@@ -1018,10 +1023,12 @@ def test_a_plane_argument_is_sized_by_the_rows_of_the_batch_s_blocks(monkeypatch
     # of kv: 32 copies, each its own placement, of which the pool holds 16;
     # 7 slots hold 3 of two rows, read once, the rest take the first 6 again.
     # Past 4 x 3 tokens a request reads 3 of its 5 rows: 96 bytes of kv, 16
-    # copies.
+    # copies. At top-k 1, 32 of kv: 32 copies on the 16 placements, each read
+    # once.
     assert got["aiter.decode"]["footprint_bytes"] == 7 * 288
     assert got["aiter.write"]["footprint_bytes"] == 32 * 32 + 3 * 32
     assert got["aiter.sparse"]["footprint_bytes"] == 16 * 128
+    assert got["aiter.top1"]["footprint_bytes"] == 32 * 32 + 16 * 32
     assert got["aiter.decode"]["placements"] == 16
     assert runner.batches == [(4 * p, 2 * p % 6) for p in range(16)]
 
