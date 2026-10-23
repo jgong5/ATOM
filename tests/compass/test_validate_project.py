@@ -60,6 +60,9 @@ def test_a_projected_device_keeps_its_peaks_at_the_others_probed_ratios():
     # MI308X probed no FP4 rate, so a price that reads one is refused.
     with pytest.raises(SpecRefusal, match="fp4_flops"):
         p.value("device.compute.fp4_flops")
+    # MI455's spec is the same method applied to MI355X.
+    mi455 = project.projected(spec(MI455), mi355x).values
+    assert mi455 | {"name": None} == spec(MI455).values | {"name": None}
 
 
 def test_bound_ratios_from_prices_records_at_the_projected_spec(monkeypatch, tmp_path):
@@ -121,6 +124,9 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
     read = ("device.arch", "device.kernel_floor_s", "device.compute.derate.bf16")
     assert {p: mi455.value(p) for p in read}.items() <= doc["assumed"].items()
     assert project.CURVE in doc["assumed"]
+    # The assumed gfx1250 device the graphs were traced at: 256 CUs, B0.
+    declared = {"capture.compute_units": 256, "capture.revision": 1}
+    assert declared.items() <= doc["assumed"].items()
     assert mi455.origin("host.ipc.zmq_roundtrip_s")["origin"] == "assumed"
     for unread in ("host.ipc.zmq_roundtrip_s", "device.compute.bf16_flops"):
         assert unread not in doc["assumed"]

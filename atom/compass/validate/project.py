@@ -15,7 +15,8 @@ The `projection` published in S states, per cell and granularity, the steps
 priced and refused by reason, the projected seconds per phase, and the tokens
 a second over the steps priced; per granularity, the cells ranked by those
 tokens a second, its first (top-1) and first three (top-3); and each field of
-SPEC whose origin is `assumed` that a price read, with its value.
+SPEC whose origin is `assumed` that a price read, with its value, and for an
+assumed arch the compute units and stepping its op_graphs were traced at.
 
 `projected` is the method that makes SPEC for a device that never ran, applied
 to one that did, for `validate bound --ratios-from`.
@@ -143,8 +144,17 @@ def _each(jobs: list) -> list:
 
 def projection(machine: MachineSpec, cells: dict) -> dict:
     """The document of `cells`, each a record to its ATOM arguments and its
-    `cell` result, priced on `machine`."""
+    `cell` result, priced on `machine`. An assumed arch also names the compute
+    units and stepping its op_graphs were traced at, which chose their kernels."""
+    from atom.compass.capture.driverless import DEVICES, REVISIONS
+
     read = sorted(set().union(*(c["read"] for _, c in cells.values())))
+    assumed = {
+        p: machine.value(p) for p in read if machine.origin(p)["origin"] == "assumed"
+    }
+    if arch := assumed.get("device.arch"):
+        assumed["capture.compute_units"] = DEVICES[arch][0]
+        assumed["capture.revision"] = REVISIONS.get(arch, 0)
     ranking = {}
     for level in ("step", "op"):
         rates = {r: c["levels"][level]["tokens_per_s"] for r, (_, c) in cells.items()}
@@ -152,11 +162,7 @@ def projection(machine: MachineSpec, cells: dict) -> dict:
         ranking[level] = {"order": order, "top_1": order[:1], "top_3": order[:3]}
     return {
         "machine": {"name": machine.values["name"], "digest": machine.digest()},
-        "assumed": {
-            p: machine.value(p)
-            for p in read
-            if machine.origin(p)["origin"] == "assumed"
-        },
+        "assumed": assumed,
         "cells": {
             r: {"atom_args": a, "engine": c["engine"], **c["levels"]}
             for r, (a, c) in cells.items()
