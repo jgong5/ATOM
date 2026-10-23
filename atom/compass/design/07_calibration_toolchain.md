@@ -333,7 +333,7 @@ the ranks start together ([ruling on #1927](https://github.com/jgong5/ATOM/issue
 so no call reads what the replay before it left there either. A write of the buffer leaves
 the cache dirty: after one, a replay on MI355X read about 40 to 100 µs longer at any
 length, +19% on a 0.5 ms graph and +1.7% on GEMMs already past twice the cache
-([#2038](https://github.com/jgong5/ATOM/pull/2038)). Without it a leaf whose
+([#2038](https://github.com/jgong5/ATOM/pull/2038)). Without the eviction a leaf whose
 `CALLS` copies stay under twice the cache read warm: `indexer_score_topk` at
 DeepSeek-V4-Pro decode B=16 on MI355X, 90 MB of copies, read `warm_over_cold` 0.939
 ([#1927](https://github.com/jgong5/ATOM/issues/1927#issuecomment-6353682488)). The
