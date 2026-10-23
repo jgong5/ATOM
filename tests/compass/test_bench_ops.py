@@ -680,6 +680,41 @@ def test_v4_qk_norm_takes_the_dest_rows_of_its_stated_ratio():
     }
 
 
+def test_v4_bf16_qk_norm_takes_the_dest_rows_of_its_stated_ratio_and_atom_s_seq_ids():
+    # The bf16 cache's leaf: bound by size, both slots were `top_ks`. No HCA
+    # buffer is live, so the ratio-128 leaf's rows refuse by that buffer's name.
+    qkn = "aiter.ops.flydsl.kernels.qk_norm_rope_quant:flydsl_qk_norm_rope_quant"
+    runner = _Runner()
+    runner.forward_vars |= {
+        "top_ks": torch.zeros(8, dtype=torch.int32),
+        "batch_id_per_q_token": torch.zeros(16, dtype=torch.int32),
+        "v4_swa_dest_dense": torch.zeros(16, dtype=torch.int32),
+        "v4_swa_dest_csa": torch.zeros(32, dtype=torch.int32),
+    }
+    row = _t([8], "metadata", dtype="torch.int32")
+    slots = [("swa_dest_rows", row), ("batch_id_per_token", row)]
+    leaves = [
+        dataclasses.replace(_leaf(qkn, *slots), stated=(("compress_ratio", r),))
+        for r in (0, 4, 128)
+    ]
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(*leaves, layers=1)["region"])
+
+    stub._prepare((0, 0))
+
+    [(_, views)] = stub.placed
+    got = {
+        (stub.leaves[s][0]["stated"]["compress_ratio"], p): n
+        for (s, p), (n, _) in views.items()
+    }
+    assert got == {
+        (0, "swa_dest_rows"): "v4_swa_dest_dense",
+        (4, "swa_dest_rows"): "v4_swa_dest_csa",
+        (128, "swa_dest_rows"): "ATOM passes swa_dest_rows v4_swa_dest_hca: not live",
+        **{(r, "batch_id_per_token"): "batch_id_per_q_token" for r in (0, 4, 128)},
+    }
+
+
 def test_v4_index_leaves_write_the_indptrs_atom_passes_and_a_decode_its_split_plan(
     monkeypatch,
 ):

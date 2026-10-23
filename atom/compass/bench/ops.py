@@ -220,6 +220,7 @@ _CSA = "aiter.ops.flydsl.kernels.fused_compress_attn:flydsl_fused_compress_attn"
 _HCA = "aiter.ops.flydsl.kernels.fused_compress_attn_hca:flydsl_hca_compress_attn"
 _STATE = "atom.model_ops.v4_kernels.state_writes:update_compressor_states"
 _QKN = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
+_QKN_BF16 = "aiter.ops.flydsl.kernels.qk_norm_rope_quant:flydsl_qk_norm_rope_quant"
 _BF16 = "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
 _DESTS = {0: "dense", 4: "csa", 128: "hca"}
 V4_METADATA = {
@@ -245,6 +246,8 @@ V4_METADATA = {
     (_STATE, "write_plan"): "v4_write_plan_{ratio}",
     (_QKN, "batch_id_per_token"): "batch_id_per_q_token",
     (_QKN, "swa_dest_row"): "v4_swa_dest_{dest}",
+    (_QKN_BF16, "batch_id_per_token"): "batch_id_per_q_token",
+    (_QKN_BF16, "swa_dest_rows"): "v4_swa_dest_{dest}",
 }
 V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
