@@ -831,6 +831,33 @@ def test_a_plane_argument_is_sized_by_the_rows_of_the_batch_s_blocks(monkeypatch
     assert runner.batches == [(4 * p, 2 * p % 6) for p in range(16)]
 
 
+@pytest.mark.parametrize(
+    "entries, footprint", [({"state": 7}, 21 * 96), ({}, 13 * 160)]
+)
+def test_a_strided_kv_argument_is_sized_by_its_entry_s_span(
+    monkeypatch, entries, footprint
+):
+    # DeepSeek-V4's compressor views: an entry of 2 rows of 4 floats, strided
+    # by 16 rows, as a state slot is by the whole slot and a block by every
+    # layer's rows.
+    runner = _Runner()
+    runner.pool_plan = SimpleNamespace(entries=entries)
+    runner.kv_held = {"v4_pool": torch.zeros(1000)}
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    kv = ("kv", _t([8, 2, 4], "kv", stride=[64, 4, 1]))
+    leaf = _leaf("aiter.compress", ("q", _t([2, 4], "activation")), kv)
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    [record] = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+
+    # 32 bytes of q and 32 of kv an entry: per state slot of the two rows 96 a
+    # call, 21 copies past twice 1000 bytes; with no state, per block of the 4
+    # the rows hold, 160 a call and 13 copies.
+    assert record["footprint_bytes"] == footprint
+
+
 def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
     monkeypatch,
 ):
