@@ -95,6 +95,7 @@ def test_a_two_node_record_starts_decode_through_its_prefix_and_stops_it_there(
     _until(d / "server.json", script)
 
     model = ["--model", str(tmp_path)]
+    ports = []
     for side, role, own, atom in (
         ("prefill", "kv_producer", [], [*model, "-tp", "2", "--enable-dp-attention"]),
         ("decode", "kv_consumer", ["--host", "127.0.0.1"], model),
@@ -105,11 +106,10 @@ def test_a_two_node_record_starts_decode_through_its_prefix_and_stops_it_there(
         assert seen[-2] == "--kv-transfer-config"
         kv = json.loads(seen.pop())
         assert kv.pop("kv_role") == role and kv.pop("kv_connector") == "mooncake"
-        # Only the prefill binds ports from its handshake port; the decode's
-        # Mooncake listeners take ports the kernel hands out.
-        if side == "prefill":
-            kv.pop("handshake_port")
+        ports.append(kv.pop("handshake_port"))
         assert not kv
+    # The nightly's 1P1D launch: the decode's is the prefill's plus its ranks.
+    assert ports[1] == ports[0] + 2
     assert _on(tmp_path) == [f"node-b bash {d}/decode.sh"]
     router = json.loads((tmp_path / "router.json").read_text())
     assert router["argv"][-1] == "--dp-aware"
@@ -362,7 +362,8 @@ def test_every_port_the_deployment_holds_free_is_one_no_bind_to_port_0_takes(
     ends = [
         int(router[router.index(f) + 1]) + 1 for f in ("--port", "--prometheus-port")
     ]
-    for side, ranks in (("prefill", 2),):
+    # The decode's handshake port, the prefill's block's end, binds nothing.
+    for side, ranks in (("prefill", 2), ("decode", 0)):
         kv = json.loads(json.loads((d / f"{side}.argv.json").read_text())[-1])
         ends.append(kv["handshake_port"] + ranks)
     ephemeral = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()[0]

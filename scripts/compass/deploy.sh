@@ -16,9 +16,8 @@
 #                  --on PREFIX (below)
 #   <ATOM args>    each instance's ATOM arguments; the script adds its
 #                  --kv-transfer-config, the simulated connector and the
-#                  write-request address, or, real, Mooncake and, to the
-#                  prefill, a handshake port free here, and refuses one among
-#                  them
+#                  write-request address, or, real, Mooncake and a handshake
+#                  port, the prefill's free here, and refuses one among them
 #   <router args>  `atomesh launch` arguments, as given; the script adds the
 #                  router's host and ports, --pd-disaggregation and each
 #                  instance's URL; run with --dp-aware runs the router as LP
@@ -111,8 +110,9 @@ ROUTER_LP=
 # metrics', and each side's KV block. Simulated, both sides share one block of
 # write requests, one per prefill and decode rank pair, and the authority
 # takes one more, as the run file states; real, the prefill's Mooncake write
-# listeners take one per rank from its handshake port, and the decode's
-# listeners ports the kernel hands out.
+# listeners take one per rank from its handshake port. The decode's handshake
+# port, the prefill's plus its ranks as the nightly's 1P1D launch gives it, is
+# not held: its listeners bind ports the kernel hands out.
 ports=$(python3 - "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
 import argparse, json, random, socket, sys
 from pathlib import Path
@@ -140,7 +140,9 @@ def block(n):
 router, prometheus = block(1), block(1)
 if not run_file:
     engine = runfile._engine_args(prefill)
-    print(router, prometheus, block(engine.data_parallel_size * engine.tensor_parallel_size * engine.pipeline_parallel_size))
+    ranks = engine.data_parallel_size * engine.tensor_parallel_size * engine.pipeline_parallel_size
+    base = block(ranks)
+    print(router, prometheus, base, base + ranks)
     sys.exit()
 parser = argparse.ArgumentParser(prog="deploy.sh run")
 runfile.add_arguments(parser)
@@ -197,7 +199,7 @@ instance() { # SIDE KV_ROLE KV_PORT: write the instance's command, OUT/SIDE.sh, 
     local kv="{\"kv_role\":\"$2\",\"kv_connector\":\"compass\",\"compass_kv_write_req\":\"tcp://127.0.0.1:$3\"}"
     if [[ $cmd == record ]]; then
         command=("$cmd" "${flags[@]}")
-        kv="{\"kv_role\":\"$2\",\"kv_connector\":\"mooncake\"${3:+,\"handshake_port\":$3}}"
+        kv="{\"kv_role\":\"$2\",\"kv_connector\":\"mooncake\",\"handshake_port\":$3}"
     fi
     [[ $1 == prefill ]] || prefix=("${on[@]}")
     command+=("${own[@]}" --out "$OUT/$1" -- "${atom[@]}" --kv-transfer-config "$kv")
