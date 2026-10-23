@@ -1919,6 +1919,27 @@ def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
     assert ops._dependent(records) == {"aiter.attn": False}
 
 
+def test_the_barriers_all_reduce_ends_before_a_calls_kernels_are_profiled(
+    monkeypatch,
+):
+    # The barrier's all-reduce runs on NCCL's stream; a profile started while
+    # it is still on the device records its kernel among the call's.
+    order = []
+
+    @contextlib.contextmanager
+    def profile(activities):
+        order.append("profile")
+        yield SimpleNamespace(events=list)
+
+    monkeypatch.setattr("torch.profiler.profile", profile)
+    monkeypatch.setattr(ops, "_together", lambda: order.append("all-reduce"))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: order.append("wait"))
+
+    ops._kernels(lambda: order.append("call"), {})
+
+    assert order == ["all-reduce", "wait", "profile", "call", "wait"]
+
+
 def test_a_batch_takes_the_blocks_and_slots_it_is_placed_at(rule):  # noqa: F811
     line = _line([[1, 40, True], [1, 17, True]])
 

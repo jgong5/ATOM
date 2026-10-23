@@ -1241,10 +1241,12 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
     """The kernels one call of `fn` launches, in order, and their device time
     in ns: its device activity except memory copies, which the profiler
     records at some calls of a leaf and misses at others; started on every
-    rank together (`_together`)."""
+    rank together (`_together`), once the device has finished that all-reduce,
+    which would otherwise join the call's kernels."""
     from torch.profiler import ProfilerActivity, profile
 
     _together()
+    torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         fn(**kwargs)
         torch.cuda.synchronize()
