@@ -22,10 +22,6 @@ the work ATOM queues after `forward_done_event` on a step that samples, else
 from its first draft pass on: its prices are terms named ``draft op.<kind>``,
 each tagged draft. Sampling is the target's. A decode's drafter is read at its
 rows run at the step's width: its first pass runs the rows' tokens unpadded.
-Its later passes, a row a sequence, run at `draft_bs` where the view states
-it and the backend prices padding: a decode's drafter is read at that width,
-a sampling prefill's at its rows with `width=draft_bs` (``W=``) where the two
-differ.
 
 Each leaf is one pricing unit, `max(t0, F / peak, M / BW(M), t_comm)` over its
 work (`op_work.work`): its own tensors at the captured shape, the state it

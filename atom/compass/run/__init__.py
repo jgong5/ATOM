@@ -1519,13 +1519,7 @@ def _op_graphs(root: str, config, arch: str):
 
     @functools.lru_cache(maxsize=64)
     def graph(
-        phase: str,
-        tokens: int,
-        seqs: int,
-        output=True,
-        gathered=None,
-        draft=False,
-        width=None,
+        phase, tokens, seqs, output=True, gathered=None, draft=False, width=None
     ) -> dict | str | None:
         shape = str(Shape(phase, tokens, seqs, gathered, width).at(dp, drafts))
         at = structure(config, phase, True, arch, output, draft)
