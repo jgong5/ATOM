@@ -16,7 +16,7 @@ graph pads to. Each price is compared with the step's device busy time,
 A data-parallel step (one with `moe_rows`) is read off every rank's line at
 that step: its `moe_tokens` is the group's scheduled tokens, a dummy rank's
 one, and under `--enable-tbo` its two-batch-overlap split is the one ATOM's
-prefill rule agrees over those lines (`_split`).
+prefill rule agrees over those lines (`step_labels.group_split`).
 
 Gate: a step priced above its measured time is a violation, named by its
 costliest term, an op kind (`op.<kind>`) or a module kind (`roofline.<kind>`).
@@ -57,7 +57,7 @@ import numpy as np
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.shape import sum_tokens
-from atom.compass.backends.step_labels import group_tokens
+from atom.compass.backends.step_labels import group_split, group_tokens
 
 SOURCE = "validate-bound"
 PHASES = ("decode", "prefill", "mixed")
@@ -89,7 +89,7 @@ def steps(record, tbo=False, mtp=False):
         whole = None not in lines
         # num_tokens_across_dp: every rank's scheduled tokens, a dummy's one.
         group = group_tokens(lines)
-        split = _split(lines) if tbo and whole else None
+        split = group_split(lines) if tbo and whole else None
         for path, s in zip(paths, lines):
             if s is None or s["is_dummy_run"]:
                 continue
@@ -112,30 +112,6 @@ def steps(record, tbo=False, mtp=False):
                 moe_tokens=group if dp else None,
             )
             yield name, view, s.get("d_target_ns", s["d_busy_ns"]) * 1e-9
-
-
-def _split(lines):
-    """The two-batch-overlap split ATOM agrees over a DP group's step `lines`,
-    per micro-batch each rank's tokens, or None: each rank's prefill answer
-    (`local_tbo_precompute`), then `sync_dp_metadata`'s OR of the min-token
-    bar, AND of can-split and uniform prefill. A decoding rank, a dummy run
-    among them, cannot split."""
-    from atom.utils import envs
-    from atom.utils.tbo import ubatching
-
-    rule = (
-        ubatching._precompute_prefill_token_split
-        if envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
-        else ubatching._precompute_prefill_req_split
-    )
-    local, bar = [], envs.ATOM_TBO_PREFILL_MIN_TOKENS
-    for s in lines:
-        prefill = [q for q, _, d in s["rows"] if not d]
-        if not prefill:
-            return None
-        local.append(rule(np.array(prefill), len(prefill), bar))
-    meets, can, first, second = zip(*local)
-    return (first, second) if any(meets) and all(can) else None
 
 
 def _phase(view: BatchView) -> str:

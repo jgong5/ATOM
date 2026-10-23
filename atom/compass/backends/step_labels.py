@@ -11,7 +11,8 @@ run.json names `BUILDS`, aiter JIT modules its server built while it served;
 
 A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
 `dp_rank`. An older record's lines state neither count: `group_tokens`
-rebuilds `moe_tokens` from every rank's line, and no step is split.
+rebuilds `moe_tokens` from every rank's line, and, when its host key's engine
+states `enable_tbo`, `group_split` rebuilds `tbo_tokens` from the same lines.
 
 A step's device label is its device busy time, `d_busy_ns`, plus for a decode
 step the device work queued since the previous forward's exit, `d_gap_ns`. A
@@ -124,6 +125,32 @@ def group_tokens(lines) -> int | None:
     `num_tokens_across_dp` summed over every rank's line at that step, a dummy
     rank's one row. None when a rank's line is missing."""
     return None if None in lines else sum(q for s in lines for q, _, _ in s["rows"])
+
+
+def group_split(lines):
+    """The two-batch-overlap split ATOM agrees over a DP group's step `lines`,
+    per micro-batch each rank's tokens, or None: each rank's prefill answer
+    (`local_tbo_precompute`), then `sync_dp_metadata`'s OR of the min-token
+    bar, AND of can-split and uniform prefill. A decoding rank, a dummy run
+    among them, cannot split."""
+    import numpy as np
+
+    from atom.utils import envs
+    from atom.utils.tbo import ubatching
+
+    rule = (
+        ubatching._precompute_prefill_token_split
+        if envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
+        else ubatching._precompute_prefill_req_split
+    )
+    local, bar = [], envs.ATOM_TBO_PREFILL_MIN_TOKENS
+    for s in lines:
+        prefill = [q for q, _, d in s["rows"] if not d]
+        if not prefill:
+            return None
+        local.append(rule(np.array(prefill), len(prefill), bar))
+    meets, can, first, second = zip(*local)
+    return (first, second) if any(meets) and all(can) else None
 
 
 def digest(record) -> str:
@@ -252,6 +279,7 @@ def _label(record, lines, run, starts) -> tuple[list[Sample], list[dict]]:
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
     config = read_json(key) if key.exists() else None
+    tbo = (config or {}).get("engine", {}).get("enable_tbo")
     run = run or digest(record)
     samples, table, prev, ranks = [], [], None, None
     for i, s in enumerate(lines):
@@ -259,12 +287,15 @@ def _label(record, lines, run, starts) -> tuple[list[Sample], list[dict]]:
             prev = s
             continue
         dp, tokens = "moe_rows" in s, s.get("moe_tokens")
+        split = s.get("tbo_tokens")
         if dp and tokens is None:
             if ranks is None:
                 peers = path.parent.glob(path.name.split("dp")[0] + "dp*[0-9].jsonl")
                 ranks = [{t["step"]: t for t in read_jsonl(p)} for p in sorted(peers)]
-            tokens = group_tokens([r.get(s["step"]) for r in ranks])
-        split = s.get("tbo_tokens")
+            group = [r.get(s["step"]) for r in ranks]
+            tokens = group_tokens(group)
+            if tokens is not None and tbo:
+                split = group_split(group)
         view = BatchView(
             tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
             capture_rung=s["rung"],

@@ -24,7 +24,9 @@ under another engine config refuses it. At its `data_parallel_size` N above 1
 (EP off) the records come in runs of
 N, each run's `dp0.jsonl` to `dp<N-1>.jsonl`. A step is its ranks' lines
 joined on step index, labelled with the smallest rank label (the others wait
-for the last rank to enter), and a prefill row adds the line's `moe_rows`. A
+for the last rank to enter), and a prefill row adds the line's `moe_rows` and,
+when some prefill step of the samples the group split for two-batch overlap,
+`serial_moe_rows` (`StepLinearLaw`). A
 rank that ran the step as a dummy forward adds no row. A step that some rank
 lacks otherwise or cut, or whose ranks' rows fall to different vectors, is
 counted under `ranks` and not fitted. The law reports each step's rank label
@@ -145,13 +147,14 @@ def _rung_key(rung: int | None) -> str:
 
 
 def _features(
-    samples, form: str, dp: int, draft: bool = False
+    samples, form: str, dp: int, draft: bool = False, serial: bool = False
 ) -> tuple[list[tuple], dict]:
     """One rank's fittable samples as (vector, features, seconds, step, context),
     and how many were cut, per reason.
 
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
-    order, plus `history` for that form, above `dp` 1 `moe_rows` on prefill, and
+    order, plus `history` for that form, above `dp` 1 `moe_rows` on prefill and
+    under `serial` `serial_moe_rows`, and
     under `draft` `seqs` and `out` on prefill, as `StepLinearBackend` counts them;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill.
     """
@@ -174,6 +177,8 @@ def _features(
                             "a data-parallel law prices prefill from"
                         )
                     counts += (view.moe_rows,)
+                    if serial:
+                        counts += (0 if view.tbo_tokens else view.moe_rows,)
                 if draft:
                     output = bool(view.produces_output)
                     counts += (len(r) if output else 0, int(output))
@@ -384,15 +389,15 @@ def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
 
 
 def _groups(
-    run, form: str, draft: bool = False, steps=None
+    run, form: str, draft: bool = False, steps=None, serial: bool = False
 ) -> tuple[list[dict[int, tuple]], dict, list[float]]:
     """One run's steps, each {rank: its `_features` row} labelled with the
     smallest rank label, a rank that ran the step as a dummy forward holding
     none; what was cut; and each step's rank label spread. With `steps`, only
-    the steps numbered in it."""
+    the steps numbered in it; `serial` as `_features` reads it."""
     dummies = [rank[0].dummies for rank in run]
     run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
-    got = [_features(rank, form, len(run), draft) for rank in run]
+    got = [_features(rank, form, len(run), draft, serial) for rank in run]
     cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
     if len(run) == 1:
         return [{0: r} for r in got[0][0]], cut, []
@@ -445,6 +450,14 @@ def _slowest(groups, prefill: list[str]) -> tuple[list[tuple], dict]:
     return rows, report
 
 
+def _serial(samples, options) -> bool:
+    """Whether the prefill vector adds `serial_moe_rows`: as `options` states,
+    else when the group split some data-parallel prefill step of `samples`;
+    with none split the column would repeat `moe_rows`."""
+    split = any(s.view.prefill and s.view.tbo_tokens for s in samples)
+    return (options or {}).get("serial", _options(options)[1] > 1 and split)
+
+
 def _options(options) -> tuple[str, int]:
     options = {"form": "base", "dp": 1, **(options or {})}
     if options["form"] not in FORMS:
@@ -462,15 +475,17 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     from scipy.spatial import QhullError
 
     form, dp = _options(options)
+    serial = _serial(samples, options)
     runs = _runs(samples, dp)
     groups, cut, spread = [], {"warm": 0, "warm_s": 0.0}, []
     for i, run in enumerate(runs.values()):
-        got, c, s = _groups(run, form, draft)
+        got, c, s = _groups(run, form, draft, serial=serial)
         groups += [[(i, *r) for r in g.values()] for g in got]
         spread += s
         for k, v in c.items():
             cut[k] = cut.get(k, 0) + v
     prefill = list(HISTORY if form == "history" else PREFILL) + ["moe_rows"] * (dp > 1)
+    prefill += ["serial_moe_rows"] * serial
     prefill += ["seqs", "out"] * draft
     rows, alternation = _slowest(groups, prefill)
     law = {
@@ -629,13 +644,14 @@ def _held_out(samples, options, seed, warm=None):
     by the law fitted on the other runs: (run, vector, band, that rank's (counts,
     context), relative error), the error nan where that law has no vector."""
     form, dp = _options(options)
+    options = {**(options or {}), "serial": _serial(samples, options)}
     runs = _runs(samples, dp)
     if warm is None:
         warm = fit(samples, options, seed)[0]["warm_steps"]
     for i, (run, ranks) in enumerate(runs.items()):
         others = [s for s in samples if s.provenance["run"] != run]
         law = fit(others, options, seed)[0]
-        for group in _groups(ranks, form)[0]:
+        for group in _groups(ranks, form, serial=options["serial"])[0]:
             key, _, seconds, step, _ = next(iter(group.values()))
             if step in warm[i]:
                 continue
