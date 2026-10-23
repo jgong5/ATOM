@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Cost accuracy: a law, or a step grid, priced on a real run's own step sequence.
+"""Cost accuracy: a law, a step grid or an op graph, priced on a real run's own step sequence.
 
     python -m atom.compass.validate.cost RECORD LAW
 
@@ -12,7 +12,7 @@ run it grades, its warmup left out, with the backend the simulated run priced wi
 
 Each step is labelled as the fit labels it, by its device time
 (`step_labels.label`, which also says which steps carry no label and refuses a
-record without device windows), and priced by `StepLinearBackend` or `StepGridBackend`. The
+record without device windows), and priced by `StepLinearBackend`, `StepGridBackend` or `OpGraphBackend`. The
 error of a step is `priced / real - 1`, its target price over its target label on
 an MTP record. A step that also carries a draft label is graded again under kind
 `draft`, its draft price over that label, validated only if it has draft terms and
@@ -34,8 +34,18 @@ on, as the fit names them; of that vector's errors here if the law records no
 `fit.mad`, as the grid never does. A step the backend declines is counted with
 its real seconds and its reasons, the most frequent named: under `fallback` for
 the grid, since its run prices the step by the step roofline below it, and under
-`refused` for a law, since a run grading takes has nothing below the law. A step
-it extrapolated, past its support domain, is counted too.
+`refused` for a law, since a run grading takes has nothing below the law, or
+under `fallback` when the run's file composes the step roofline below it. A step
+it extrapolated, past its support domain, is counted too. An answer of any
+method but an estimated one outside its hull is validated, as the run summary
+groups seconds: an op graph's analytical and measured leaves are, its
+interpolated ones (estimated, not validated) are not.
+
+Per kind the report also gives the priced seconds of those steps by method
+(`backends.cost.GROUPS`), and per cost term, an op graph's op kind its
+``op.<kind>`` and ``op.<kind>.price_list`` terms together, the term's seconds
+over the measured ones: on totals, and the p10, p50 and p90 per step. Summed
+over the terms, they are the composed step over the measured one.
 """
 
 from __future__ import annotations
@@ -56,8 +66,10 @@ from atom.compass.backends import (
     step_labels,
     step_linear_fit,
 )
+from atom.compass.backends.cost import GROUPS
+from atom.compass.backends.cost import group as method_group
 from atom.compass.backends.json_file import read_json, read_jsonl
-from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band, _features
+from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band
 from atom.compass.drive import aiter_jit
 
 WITHIN = 0.10
@@ -122,16 +134,17 @@ def _summary(steps: list[tuple]) -> dict:
     }
 
 
-def cost_accuracy(record, backend, steps=None) -> dict:
+def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
     """The report for `backend`, a `CostBackend` or a law mapping
     `StepLinearLaw` reads, on the record directory `record`: on its steps whose
     numbers are in `steps`, every step when None. Its ``backend`` names the
-    law's provenance, or the backend's `describe()` line.
+    law's provenance, or the backend's `describe()` line. With `fallback` a
+    step the backend declines is a fallback's, as a step grid's always is.
 
     The ranks' records (`dp0.jsonl` up) are joined as `step_linear_fit` joins
     them: a step is its ranks' lines of one step index, measured as the
-    smallest rank label and priced and banded as its costliest rank's batch, a
-    term validated only if every rank's is; a step the law refuses is banded as
+    smallest rank label and priced, banded and validated as the rank
+    `step_linear_fit.priced_rank` picks; a step the law refuses is banded as
     its rank of most tokens. Its draft is measured and priced the same way. A
     rank that ran the step as a dummy forward is priced 0 s: the step is
     measured, priced and banded by the ranks that ran a forward. A step some
@@ -152,26 +165,8 @@ def cost_accuracy(record, backend, steps=None) -> dict:
             f"{record} holds rank records of {lines} lines; one run's ranks "
             "differ by at most the step a stopped run leaves on some"
         )
-    run = [
-        [s for s in step_labels.label(r)[0] if steps is None or s.step in steps]
-        for r in ranks
-    ]
-    dummies = [{s["step"] for s in x if s["is_dummy_run"]} for x in records]
-    got = [_features(rank, "base", len(run)) for rank in run]
-    cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
-    rows = [{r[3]: r for r in mine} for mine, _ in got]
-    joined = []
-    if len(run) > 1:
-        cut["ranks"] = 0
-    for step in sorted(set().union(*rows)):
-        # A rank's dummy forward joins its step priced 0 s, so adds no row.
-        group = {i: rank[step] for i, rank in enumerate(rows) if step in rank}
-        ran = len(group) + sum(step in d for d in dummies)
-        if ran < len(rows) or len({r[0] for r in group.values()}) > 1:
-            cut["ranks"] += 1
-            continue
-        label = min(r[2] for r in group.values())
-        joined.append({i: (*r[:2], label, *r[3:]) for i, r in group.items()})
+    run = [step_labels.label(r)[0] for r in ranks]
+    joined, cut, _ = step_linear_fit._groups(run, "base", steps=steps)
     views = [{s.step: s.view for s in rank} for rank in run]
     drafts = [{s.step: s.draft_s for s in rank} for rank in run]
     law = backend if isinstance(backend, Mapping) else None
@@ -194,19 +189,22 @@ def cost_accuracy(record, backend, steps=None) -> dict:
             why = "; ".join(f"{d.source}: {d.reason}" for d in refused.declined)
             r["reasons"][why] += 1
             continue
+        top = step_linear_fit.priced_rank(
+            {i: (c.target_seconds, group[i][1]) for i, c in costs.items()}
+        )
         terms = [t for c in costs.values() for t in c.terms if not t.draft]
-        validated = all(t.provenance.validated for t in terms)
+        validated = all(_validated(t) for t in costs[top].terms if not t.draft)
         extrapolated += any(t.provenance.extrapolated for t in terms)
-        top = max(costs, key=lambda i: costs[i].target_seconds)
         band, price = _band(key, group[top][1]), costs[top].target_seconds
         labels = [drafts[i][step] for i in group]
         draft = None
         if None not in labels:
-            mine = [t.provenance.validated for t in costs[top].terms if t.draft]
+            mine = [_validated(t) for t in costs[top].terms if t.draft]
             draft = (min(labels), costs[top].draft_seconds, bool(mine) and all(mine))
-        priced.append((key, band, step, seconds, price, validated, draft))
+        priced.append((key, band, step, seconds, price, validated, draft, costs[top]))
     leading = _leading_slow(priced, law)
-    for key, band, step, seconds, price, validated, draft in priced:
+    parts: dict[str, list] = {}
+    for key, band, step, seconds, price, validated, draft, cost in priced:
         if step in leading or seconds > WARM_FACTOR * price:
             warm.append(
                 {
@@ -220,6 +218,7 @@ def cost_accuracy(record, backend, steps=None) -> dict:
         group = "validated" if validated else "unvalidated"
         kind = "prefill" if key == "prefill" else "decode"
         groups[group].setdefault(kind, []).append((band, step, seconds, price))
+        parts.setdefault(kind, []).append((seconds, cost))
         if draft is not None:
             group = "validated" if draft[2] else "unvalidated"
             groups[group].setdefault("draft", []).append((band, step, *draft[:2]))
@@ -230,10 +229,38 @@ def cost_accuracy(record, backend, steps=None) -> dict:
             kind: _summary(rows) for kind, rows in sorted(kinds.items(), reverse=True)
         }
     report["warm"] = warm
-    grid = isinstance(backend, StepGridBackend)
+    grid = isinstance(backend, StepGridBackend) or fallback
     report["fallback"], report["refused"] = (declined, {}) if grid else ({}, declined)
     report["extrapolated"] = extrapolated
+    report["methods"], report["terms"] = {}, {}
+    for kind, priced_steps in sorted(parts.items(), reverse=True):
+        real, methods, terms = np.array([s for s, _ in priced_steps]), Counter(), {}
+        for i, (_, cost) in enumerate(priced_steps):
+            for t in cost.terms:
+                if not t.draft:
+                    methods[
+                        method_group(t.provenance.method, t.provenance.validated)
+                    ] += t.seconds
+                    name = t.name.removeprefix("op.").removesuffix(".price_list")
+                    terms.setdefault(name, np.zeros(len(priced_steps)))[i] += t.seconds
+        report["methods"][kind] = {g: methods[g] for g in GROUPS if g in methods}
+        report["terms"][kind] = {
+            name: {
+                "on_totals": float(s.sum() / real.sum()),
+                **dict(
+                    zip(("p10", "p50", "p90"), np.percentile(s / real, (10, 50, 90)))
+                ),
+            }
+            for name, s in sorted(terms.items())
+        }
     return report
+
+
+def _validated(term) -> bool:
+    """Whether `term` is graded with the validated steps: any answer but an
+    estimated one outside its hull, which the run summary counts as unvalidated."""
+    p = term.provenance
+    return method_group(p.method, p.validated) != "unvalidated"
 
 
 def declined_text(r: dict) -> str:

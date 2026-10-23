@@ -20,7 +20,8 @@ Under a drafter of `drafts` tokens a decode step verifies `drafts` and one in
 each row, and a step also reads its drafter's graph, `graph(..., draft=True)`,
 the work ATOM queues after `forward_done_event` on a step that samples, else
 from its draft-KV pass on: its prices are terms named ``draft op.<kind>``,
-each tagged draft. Sampling is the target's.
+each tagged draft. Sampling is the target's. A decode's drafter is read at its
+rows run at the step's width: its first pass runs the rows' tokens unpadded.
 
 Each leaf is one pricing unit, `max(t0, F / peak, M / BW(M), t_comm)` over its
 work (`op_work.work`): its own tensors at the captured shape, the state it
@@ -64,7 +65,8 @@ this rank, whose micro-batches' graphs exchange a different number of times
 or run an exchange beside a second stream (the dual-stream MoE, which ATOM
 turns off under overlap), or that runs under a drafter, whose draft pass no
 graph places on the overlapped streams; a decode step whose rows do not each
-verify the drafter's tokens and one; a prefill step whose view
+verify the drafter's tokens and one; a DP middle chunk under a drafter, whose
+drafter's passes no cut parts from the target's; a prefill step whose view
 does not say whether it produces output; a shape with no graph, a
 data-parallel step's naming the rows it gathers; and, each reason once, a leaf
 whose kind has no extractor, whose price reads a spec field the spec lacks, or
@@ -147,6 +149,15 @@ def step_shape(
     return "decode", width, width
 
 
+def gathered_off_default(
+    phase: str, tokens: int, gathered: int | None, dp: int, drafts: int = 0
+) -> int | None:
+    """`gathered`, a DP step's MoE rows, or None at their default: `dp` ranks
+    at `tokens`, a decode's rows each verifying `drafts` and one."""
+    rows = tokens * (drafts + 1 if phase == "decode" else 1)
+    return None if gathered == dp * rows else gathered
+
+
 class OpGraphBackend(CostBackend):
     """A step as its shape's graph, one roofline per leaf, composed by its joins."""
 
@@ -188,7 +199,7 @@ class OpGraphBackend(CostBackend):
             bound = self.resolver and self._bound(batch_view)
             priced = self._priced(region, batch_view, refused, bound)
             if self.drafts:
-                _, region = self._region(batch_view, draft=True)
+                drafted_at, region = self._region(batch_view, draft=True)
                 priced += [
                     (DRAFT + p[0], *p[1:])
                     for p in self._priced(region, batch_view, refused, bound)
@@ -213,7 +224,10 @@ class OpGraphBackend(CostBackend):
             source, (methods, why) = SOURCE, how[name]
             if name.endswith(".price_list"):
                 method, source = combine(methods), LISTED
-            detail = f"{len(values)} prices of the graph at {at}"
+            drafted = name.startswith(DRAFT)
+            detail = (
+                f"{len(values)} prices of the graph at {drafted_at if drafted else at}"
+            )
             if name.startswith(TBO):
                 detail = f"two micro-batches overlapped, from the graphs at {at}"
             provenance = Provenance(
@@ -223,7 +237,6 @@ class OpGraphBackend(CostBackend):
                 tuple(dict.fromkeys(why)),
                 note=note and note + NONE,
             )
-            drafted = name.startswith(DRAFT)
             terms.append(CostTerm(name, fold_seconds(values), provenance, drafted))
         return StepCost(terms)
 
@@ -234,20 +247,21 @@ class OpGraphBackend(CostBackend):
 
     def _bound(self, view: BatchView) -> tuple:
         """What a price list reads of a step: its phase, its T and B, the rows
-        its MoE gathers, None at every rank's T (`dp` x T, as `Shape.at`
-        drops them), and its rows' context and max context (`band`), the
+        its MoE gathers, None at their default (`gathered_off_default`),
+        and its rows' context and max context (`band`), the
         context a decode's max, a prefill's mean cached tokens."""
         rung = view.capture_rung if self.padded else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
-        g = None if view.moe_rows == self.dp * t else view.moe_rows
+        g = gathered_off_default(phase, t, view.moe_rows, self.dp, self.drafts)
         rows = [(r.query_tokens, r.context_tokens) for r in view.requests]
         mean, top = band(rows, phase == "decode")
         return (phase, t, b, g, top if phase == "decode" else mean, top)
 
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
-        with `draft`, its drafter's."""
+        with `draft`, its drafter's, a decode's at its rows, at `draft_moe_rows`,
+        refused for a DP middle chunk."""
         if view.image_tokens:
             reason = IMAGES
         else:
@@ -258,9 +272,12 @@ class OpGraphBackend(CostBackend):
             except ValueError as exc:
                 reason = f"a step that {exc}"
             else:
+                if draft and shape[0] == "decode":
+                    shape = ("decode", len(rows), shape[2])
                 output = any(d for _, d in rows) or view.produces_output
                 none = "" if output else " that produces no output"
-                g = () if view.moe_rows is None else (view.moe_rows,)
+                gathered = view.draft_moe_rows if draft else view.moe_rows
+                g = () if gathered is None else (gathered,)
                 drafted = {"draft": True} if draft else {}
                 at = "".join(f" G={n}" for n in g)
                 if output is None:
@@ -268,6 +285,13 @@ class OpGraphBackend(CostBackend):
                         "a prefill step whose view does not say whether it "
                         "produces output, so whether it runs the LM head and the "
                         "sampler"
+                    )
+                elif draft and not output and self.dp > 1:
+                    reason = (
+                        "a DP middle chunk under a drafter: ATOM runs the "
+                        "drafter's passes for their DP collectives in place of its "
+                        "draft-KV pass (`propose(align_only=True)`), and no cut "
+                        "parts them from the target's"
                     )
                 elif isinstance(
                     region := self.graph(*shape, output, *g, **drafted), dict

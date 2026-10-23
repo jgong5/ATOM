@@ -28,6 +28,7 @@ import argparse
 import http.client
 import json
 import os
+import random
 import signal
 import socket
 import subprocess
@@ -67,6 +68,17 @@ POLL_S = 0.5
 #: ATOM_SHUTDOWN_TIMEOUT_S for its engines, and they as long for their workers.
 STOP_GRACE_S = 60
 TREE = Path(atom.__file__).resolve().parents[1]
+PORT_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
+#: Where a server's ports are drawn, and where `deploy.sh` draws a deployment's:
+#: apart, and each clear of the 15000 to 17000 Mooncake's transfer engine draws
+#: each rank's RPC port from (rpc_min_port, rpc_max_port).
+SERVE_PORTS, DEPLOY_PORTS = range(10000, 15000), range(17001, 65536)
+
+
+def below_ephemeral(ports: range) -> range:
+    """`ports` below the kernel's ephemeral range: a bind to port 0, as ATOM's
+    own ranks make while they load, or an outgoing connection never takes one."""
+    return range(ports.start, min(ports.stop, int(PORT_RANGE.read_text().split()[0])))
 
 
 class ServeError(ValueError):
@@ -102,7 +114,7 @@ def serve(
     if out.exists() and any(out.iterdir()):
         raise ServeError(f"{out} holds an earlier run's files; one run per directory")
     out.mkdir(parents=True, exist_ok=True)
-    server_port, engine_port, clock_port, dp_port = _free_ports(4, host)
+    server_port, engine_port, clock_port, dp_port = _free_ports(4)
     argv = [*SERVER, *KEEP_ALIVE, *atom_args, "--host", host]
     argv += ["--server-port", str(server_port), "--port", str(engine_port)]
     ready = {"url": f"http://{host}:{server_port}"}
@@ -189,15 +201,25 @@ def _refuse(atom_args) -> None:
             raise ServeError(f"{arg} profiles the server, and only a profiled pass may")
 
 
-def _free_ports(n: int, host: str = HOST) -> list[int]:
-    """`n` free ports on `host`, bound together so no two are the same."""
-    socks = [socket.socket() for _ in range(n)]
+def _free_ports(n: int) -> list[int]:
+    """`n` free ports from `SERVE_PORTS`, bound together on every address so no
+    two are the same."""
+    held, ports = [], below_ephemeral(SERVE_PORTS)
     try:
-        for s in socks:
-            s.bind((host, 0))
-        return [s.getsockname()[1] for s in socks]
+        for port in random.sample(ports, len(ports)):
+            held.append(socket.socket())
+            try:
+                held[-1].bind(("", port))
+            except OSError:
+                held.pop().close()
+            if len(held) == n:
+                return [s.getsockname()[1] for s in held]
+        raise ServeError(
+            f"fewer than {n} free ports from {ports.start} up to {ports.stop} "
+            f"({SERVE_PORTS.stop}, or the ephemeral range's low bound in {PORT_RANGE})"
+        )
     finally:
-        for s in socks:
+        for s in held:
             s.close()
 
 

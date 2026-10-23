@@ -17,7 +17,7 @@
 #   <ATOM args>    each instance's ATOM arguments; the script adds its
 #                  --kv-transfer-config, the simulated connector and the
 #                  write-request address, or, real, Mooncake and a handshake
-#                  port free here, and refuses one among them
+#                  port, the prefill's free here, and refuses one among them
 #   <router args>  `atomesh launch` arguments, as given; the script adds the
 #                  router's host and ports, --pd-disaggregation and each
 #                  instance's URL; run with --dp-aware runs the router as LP
@@ -109,27 +109,26 @@ ROUTER_LP=
 # The ports, all held together so no two are the same: the router's and its
 # metrics', and each side's KV block. Simulated, both sides share one block of
 # write requests, one per prefill and decode rank pair, and the authority
-# takes one more, as the run file states; real, each side's Mooncake side
-# channels take one per rank from its handshake port.
+# takes one more, as the run file states; real, the prefill's Mooncake write
+# listeners take one per rank from its handshake port. The decode's handshake
+# port, the prefill's plus its ranks as the nightly's 1P1D launch gives it, is
+# not held: its listeners bind ports the kernel hands out.
 ports=$(python3 - "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
 import argparse, json, random, socket, sys
 from pathlib import Path
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactRefusal
-from atom.compass.drive import runfile
+from atom.compass.drive import runfile, serve
 from atom.compass.spec import SpecRefusal
 
 run_file, kv_link, router_lp, n, *words = sys.argv[1:]
 flags, words = words[: int(n)], words[int(n) :]
 k = int(words[0])
 prefill, decode = words[1 : 1 + k], words[1 + k :]
-held = []
-# Below the kernel's ephemeral range: a bind to port 0, as ATOM's own ranks
-# make while they load, or an outgoing connection never hands one out.
-ephemeral = int(Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()[0])
+held, room = [], serve.below_ephemeral(serve.DEPLOY_PORTS)
 def block(n):
-    while True:
-        base = random.randrange(10000, ephemeral - n)
+    bases = range(room.start, room.stop - n + 1)
+    for base in random.sample(bases, len(bases)):
         try:
             for p in range(base, base + n):
                 held.append(socket.socket())
@@ -137,12 +136,13 @@ def block(n):
             return base
         except OSError:
             continue
+    sys.exit(f"deploy: no {n} free ports in a row from {room.start} below {room.stop}, where {serve.PORT_RANGE} starts")
 router, prometheus = block(1), block(1)
 if not run_file:
-    def ranks(atom_args):
-        engine = runfile._engine_args(atom_args)
-        return engine.data_parallel_size * engine.tensor_parallel_size * engine.pipeline_parallel_size
-    print(router, prometheus, block(ranks(prefill)), block(ranks(decode)), "-")
+    engine = runfile._engine_args(prefill)
+    ranks = engine.data_parallel_size * engine.tensor_parallel_size * engine.pipeline_parallel_size
+    base = block(ranks)
+    print(router, prometheus, base, base + ranks)
     sys.exit()
 parser = argparse.ArgumentParser(prog="deploy.sh run")
 runfile.add_arguments(parser)

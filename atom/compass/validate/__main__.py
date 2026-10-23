@@ -5,7 +5,9 @@ A CELL holds runs of one workload: `step_linear/` (at its run file's step linear
 of several the one fitted under the engine config each real run states) or `step_grid/`
 (at its run file's bundle, which `run.step_grid.read` reads by key with no check against
 this process, refused unless its digest is the one the run summary records)
-and two or more `real*/`. `cctraces_sim.sh` writes each run.json as the run file with
+or `op_graph/` (`compass run --op-graph`'s, at the `OpGraphBackend` its run file
+and price list give under the ATOM arguments its command line served, built as
+`compass run` builds it) and two or more `real*/`. `cctraces_sim.sh` writes each run.json as the run file with
 the `workload` every run must share; `record` and `run` write their own, the run file
 as `run_file`. `validate.runs` decides which client run is graded, and whether one is,
 in a run `record` or `run` wrote and in a `cctraces_sim.sh` run holding
@@ -15,7 +17,10 @@ its export names as such and how many steps hold only those; `validate.cost` on 
 steps graded (with the steps it leaves out, declines with their most frequent
 reasons, or extrapolates) and `memory.check` per real run; and the simulated run's refusals by source, its steps
 extrapolated and priced by a fallback, shares and speed, from its first client run's
-summary when it has one. Any refusal makes a
+summary when it has one. An `op_graph/` cell's cost rows also give, per phase,
+the priced seconds by method and each op kind's seconds over the measured ones,
+and the cell `measure ops`'s warm time over its cold one per op kind, over the
+points its store holds at the price list's key. Any refusal makes a
 `cctraces_sim.sh` cell a coverage report; the shares grade nothing, and neither do the
 counts but preemptions and prefill tokens.
 
@@ -34,6 +39,8 @@ import sys
 from pathlib import Path
 from statistics import median
 
+from atom.compass.artifacts import ArtifactStore, Key, Kind
+from atom.compass.artifacts.store import ENTRY_FILE
 from atom.compass.backends.cost import GROUPS
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.step_linear_fit import TOKEN_BANDS, token_band
@@ -42,6 +49,8 @@ from atom.compass.run import (
     CLIENT_DIR,
     ENGINE,
     LP_FILE,
+    OP_GRAPH,
+    PRICE_LIST,
     STEP_GRID,
     STEP_LINEAR,
     SUMMARY_FILE,
@@ -100,10 +109,17 @@ def _warmup(name: str, warmup: dict | None):
         yield f"warmup {name}", "warmup", value, "not graded"
 
 
-def _cost(name: str, run: Path, backend, steps: list[dict]):
+def _cost(name: str, run: Path, backend, steps: list[dict], fallback, op=False):
     numbers = {s["step"] for s in steps}
-    report = cost.cost_accuracy(run / "steps", backend, numbers)
+    report = cost.cost_accuracy(run / "steps", backend, numbers, fallback)
     where = f"cost {name}"
+    for kind, methods in report["methods"].items() if op else ():
+        total = sum(methods.values())
+        shares = ", ".join(f"{g} {s / total:.1%}" for g, s in methods.items())
+        yield where, f"{kind} by method", f"{total:.2f} s priced: {shares}", "not gated"
+        for term, t in report["terms"][kind].items():
+            value = f"on totals {t['on_totals']:.3f}; per step p10 {t['p10']:.3f} p50 {t['p50']:.3f} p90 {t['p90']:.3f}"
+            yield where, f"{kind} {term} over measured", value, "not gated"
     for group, (hull, gated) in HULL.items():
         for kind, s in report[group].items():
             held = "-" if s["held_out"] is None else f"{s['held_out']:+.2%}"
@@ -178,6 +194,47 @@ def _law(run_file: dict, real: Path) -> dict:
     return laws[0]
 
 
+def _op_graph(side: Path):
+    """The `OpGraphBackend` a `compass run --op-graph` server at `side`
+    priced with: its run file under the ATOM arguments its command line served."""
+    from atom.compass import run as compass_run
+    from atom.compass.drive import run as drive_run
+
+    run = read_json(side / "run.json")
+    argv = run.get("argv", [])
+    if "--" not in argv:
+        raise ValueError(
+            f"{side}'s run.json names no ATOM arguments after -- in its argv; "
+            "an op graph is read under the ones its server ran"
+        )
+    atom_args = argv[argv.index("--") + 1 :]
+    config = drive_run._config(atom_args)
+    machine = compass_run._machine(run["run_file"])
+    ep = drive_run._ep_width(atom_args, machine) if config.enable_expert_parallel else 1
+    return compass_run.op_graph(run["run_file"], config, machine, ep)
+
+
+def _warm_over_cold(run_file: dict):
+    """`measure ops`'s warm time over its cold one per op kind, over the
+    points the store holds at the key of the run file's price list."""
+    store, fields, by = ArtifactStore(run_file["store"]), run_file.get(PRICE_LIST), {}
+    folder = store.root / Kind.OP_MEASUREMENT.value
+    for path in sorted(folder.glob(f"[!.]*/{ENTRY_FILE}")) if fields else ():
+        key = read_json(path)["key"]
+        if {k: v for k, v in key.items() if k != "point"} == fields:
+            entry = store.read(Key.of(Kind.OP_MEASUREMENT, **key))
+            point = json.loads(
+                entry.read_member("point", entry.topology.ranks()[0], "json")
+            )
+            by.setdefault(point["op"], []).append(point.get("warm_over_cold"))
+    for op, ratios in sorted(by.items()):
+        r = [x for x in ratios if x is not None]
+        value = f"{len(r)} of {len(ratios)} points timed warm"
+        if r:
+            value += f"; min {min(r):.3f}, median {median(r):.3f}, max {max(r):.3f}"
+        yield "warm over cold", op, value, "not gated"
+
+
 def _grid(sim: Path, run: dict, summary: dict):
     """The backend of the bundle the run file of `run`, `sim`'s run.json, names,
     read with the digest `summary`, its run summary, records for it."""
@@ -197,11 +254,13 @@ def rows(cell) -> list[tuple]:
     real = sorted(r for r in cell.glob("real*") if r.is_dir())
     if (cell / "law").is_dir():
         raise ValueError(f"{cell} holds law/, a run directory now named step_linear/")
-    simulated = [cell / k for k in (STEP_LINEAR, STEP_GRID) if (cell / k).is_dir()]
+    simulated = [
+        cell / k for k in (STEP_LINEAR, STEP_GRID, OP_GRAPH) if (cell / k).is_dir()
+    ]
     if len(simulated) != 1:
         raise ValueError(
-            f"{cell} holds {[s.name for s in simulated]} of step_linear/ and "
-            "step_grid/; a cell holds one simulated run"
+            f"{cell} holds {[s.name for s in simulated]} of step_linear/, "
+            "step_grid/ and op_graph/; a cell holds one simulated run"
         )
     if len(real) < 2:
         raise ValueError(
@@ -230,17 +289,22 @@ def rows(cell) -> list[tuple]:
     verdict = "coverage report" if summary["coverage_report"] else "graded"
     out = [("cell", "verdict", f"{len(real)} real runs", verdict)]
     out += _runs(real, sim)
+    run_file = run[sim.name].get("run_file", run[sim.name])
     grid = _grid(sim, run[STEP_GRID], summary) if sim.name == STEP_GRID else None
+    op = sim.name == OP_GRAPH
+    # Each side of a deployment served under its own ATOM arguments.
+    graphs = {s.relative_to(sim): _op_graph(s) for s in runs.sides(sim)} if op else {}
+    fallback = run_file.get("step_roofline", False)
     # A deployment's runs per side, each at its law and against its engine's hand-in.
     for r in real:
         for side in runs.sides(r):
             name = " ".join(side.relative_to(cell).parts)
-            backend = grid or _law(
-                run[STEP_LINEAR].get("run_file", run[STEP_LINEAR]), side
-            )
+            backend = grid or graphs.get(side.relative_to(r)) or _law(run_file, side)
             steps, _traces, warmup = runs.graded(side, r)
-            out += [*_warmup(name, warmup), *_cost(name, side, backend, steps)]
+            out += _warmup(name, warmup)
+            out += _cost(name, side, backend, steps, fallback, op)
             out += _memory(name, sim, HAND_IN.get(side.name, ENGINE.name), side)
+    out += _warm_over_cold(run_file) if op else ()
     for side in runs.sides(sim):
         name = " ".join(side.relative_to(cell).parts)
         out += _warmup(name, runs.graded(side, sim)[2])

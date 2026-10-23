@@ -481,9 +481,20 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   `forward_done_event`. What precedes it is the target's graph, keyed as before: its
   engine config names the drafter's method and width; what follows is the drafter's, the
   same key plus `draft`. Sampling and the rejection sampler are the target's, as in the record.
-- **Priced apart.** The op-level backend prices the drafter's graph at the step's rows
-  and tags each of its terms `draft` (`draft op.<kind>`), so `StepCost.draft_seconds` is
-  the drafter's and `target_seconds` the target's.
+- **Priced apart.** The op-level backend prices the drafter's graph at the step's shape,
+  under DP at the rows the drafter's first pass gathers (`draft_moe_rows`: every rank's
+  verified tokens, unpadded), and tags each of its terms `draft` (`draft op.<kind>`), so
+  `StepCost.draft_seconds` is the drafter's and `target_seconds` the target's. A decode's
+  default G counts each row's drafts, `dp x width x (drafts + 1)` (`Shape.at`).
+- **A padded decode's drafter at its rows.** A decode of fewer rows than its rung replays
+  the target at the rung, but `EagleProposer.propose` runs the drafter's first pass
+  eagerly on the target's real tokens, the rows' `drafts + 1` each, and its later passes,
+  a row a sequence, at the rung (`running_bs`) when it declares a draft graph, at the
+  rows otherwise (MRoPE, one draft). The drafter's graph is keyed by both, `decode T=<rows>
+  B=<rung>`: `--population` captures it from the rows' batch, its later passes at the
+  rung, and publishes the drafter's half alone, as the target ran at the rung
+  ([#1961](https://github.com/jgong5/ATOM/issues/1961)). Its default G is every rank's
+  rows' tokens.
 - **A middle chunk is cut where its draft-KV pass starts.** ATOM runs that pass
   (`compute_draft_kv`) after every target forward of a real step, a middle chunk's included,
   and a middle chunk records no `forward_done_event`. Under a drafter a prefill shape is
@@ -495,7 +506,9 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   slot indices bind it.
 - **Refused by name.** A block drafter (DSpark): it writes its draft KV before
   `forward_done_event` on a step that samples ([#1607](https://github.com/jgong5/ATOM/pull/1607)),
-  so one cut does not part its target from its draft.
+  so one cut does not part its target from its draft. A DP middle chunk: under DP
+  ATOM runs the drafter's passes for their collectives (`propose(align_only=True)`) in
+  place of the draft-KV pass, and records neither cut, so its one graph holds both.
 
 The drafter's roofline is not its measured time. On #1208's MTP1 record
 (Qwen3.5-35B-A3B-FP8, TP1, MI308X) the drafter's roofline is 0.39 of the measured draft at
@@ -1097,7 +1110,9 @@ state the EP width ATOM built their handle for (`num_ep_ranks`). A capture runs
 one rank, so each exchange's rows are stated, every peer at this rank's shape but for
 its token count: the peers split evenly the rows the shape's MoE gathers, G, less this
 rank's, every peer at this rank's count when G is its default (`capture/peers.py`;
-`07` Phase 1a). A TBO step, two micro-batches interleaved, is refused by name until
+`07` Phase 1a). A drafter's pass all-reduces its own count: its first, the target's
+stream, takes the step's counts; a later one, a row a sequence, this rank's at every
+peer, MORI's dispatch included. A TBO step, two micro-batches interleaved, is refused by name until
 its graphs exist (#1581).
 
 DeepSeek-V4's `v4_attention_with_output` is opened the same way (#1678), its body run as
