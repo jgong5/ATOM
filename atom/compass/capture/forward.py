@@ -39,7 +39,9 @@ ATOM runs the drafter's propose in its place, cut where that starts. A block
 drafter writes its draft KV before `forward_done_event` and is refused.
 A decode of fewer rows than its width ran padded to that rung: its rows run
 the drafter's first pass, which takes the target's tokens unpadded, and the
-step continues at the rung past the cut; only its drafter's graph is kept.
+step continues at the rung past the cut; only its drafter's graph is kept. A
+prefill whose drafter's later passes pad past its rows (`Shape.width`) samples
+and continues at that width past the cut; only its drafter's graph is kept.
 """
 
 import contextlib
@@ -84,10 +86,12 @@ TORCH_NAMESPACES = ("aten", "prim", "prims", "_c10d_functional", "c10d")
 H2D = "atom/utils/h2d.py"
 #: Operators that ask a fake tensor where it is and run nothing on a device.
 UNDISPATCHED = ("profiler.", "prim.device")
-#: DeepSeek-V4's decode attention leaves: the fp8 KV cache's, the bf16 one's and the
-#: persistent kernel; and its indexer's score and top-k.
+#: DeepSeek-V4's decode attention leaves: the fp8 KV cache's, its asm kernel where
+#: that launches alone (a drafter's later pass), the bf16 one's and the persistent
+#: kernel; and its indexer's score and top-k.
 V4_DECODES = (
     "aiter.mla:mla_decode_fwd_v4_nm",
+    "aiter.mla_decode_v4_asm.default",
     "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton",
     "aiter.mla_decode_v4_ps_asm.default",
 )
@@ -103,18 +107,22 @@ _IS_ATOM: dict = {}
 
 class Shape(NamedTuple):
     """A step's shape: `tokens` query tokens over `seqs` sequences, a decode's
-    `tokens` its rows, fewer than `seqs` padded to a rung of `seqs`; and under DP
-    `gathered`, the rows the group's MoE gathers, None at every rank's `tokens`."""
+    `tokens` its rows, fewer than `seqs` padded to a rung of `seqs`; under DP
+    `gathered`, the rows the group's MoE gathers, None at every rank's `tokens`;
+    and a prefill's `width`, the batch its drafter's later passes pad to, None
+    at its `seqs`."""
 
     phase: str  # "decode" or "prefill"
     tokens: int
     seqs: int
     gathered: int | None = None
+    width: int | None = None
 
     def __str__(self) -> str:
         text = f"{self.phase} T={self.tokens} B={self.seqs}"
         if self.phase == "decode" and self.tokens == self.seqs:
             text = f"decode B={self.seqs}"
+        text += f" W={self.width}" * bool(self.width)
         return text if self.gathered is None else f"{text} G={self.gathered}"
 
     def at(self, dp: int, drafts: int = 0) -> "Shape":
@@ -130,13 +138,16 @@ def decode(width: int, gathered: int | None = None, rows: int | None = None) -> 
     return _gathering(Shape("decode", rows or width, width, gathered))
 
 
-def prefill(tokens: int, seqs: int, gathered: int | None = None) -> Shape:
+def prefill(
+    tokens: int, seqs: int, gathered: int | None = None, width: int | None = None
+) -> Shape:
     if not 1 <= seqs <= tokens:
         raise ValueError(
             f"a prefill of {tokens} tokens over {seqs} sequences: each sequence "
             "takes at least one token"
         )
-    return _gathering(Shape("prefill", tokens, seqs, gathered))
+    width = None if width == seqs else width
+    return _gathering(Shape("prefill", tokens, seqs, gathered, width))
 
 
 def _gathering(shape: Shape) -> Shape:
@@ -375,13 +386,15 @@ class _Recorder(TorchDispatchMode):
 
     def cut(self):
         """ATOM records `forward_done_event`: the target's work ends here, and
-        what follows is the drafter's, a padded decode's later passes at its rung."""
+        what follows is the drafter's, its later passes at the shape's width: a
+        decode's `seqs`, a prefill's `width`."""
         if self.on:
             self.items.append((None, CUT))
-        if self.shape.phase == "decode":
+        width = self.shape.seqs if self.shape.phase == "decode" else self.shape.width
+        if width:
             from atom.utils.forward_context import get_forward_context
 
-            get_forward_context().context.running_bs = self.shape.seqs
+            get_forward_context().context.running_bs = width
 
     @contextlib.contextmanager
     def quiet(self):
@@ -1161,11 +1174,13 @@ def capture(
         with fake_mode, recorder:
             runner.allocate_kv_cache(max(KV_BLOCKS, blocks))
         # A prefill is traced as a middle chunk, which samples nothing, then as
-        # a final one; a decode step always samples.
+        # a final one; a decode step always samples, as does a prefill whose
+        # drafter's later passes pad.
         variants = [
             (shape, output)
             for shape in shapes
             for output in ((False, True) if shape.phase == "prefill" else (True,))
+            if output or not shape.width
         ]
         # A population's prefill ran as one forward: this rank cannot split it.
         own = runner._local_tbo_eligibility
@@ -1200,8 +1215,8 @@ def capture(
             for draft, part in enumerate(
                 (items[: cut[0]], items[cut[0] + 1 :]) if cut else (items,)
             ):
-                if shape.tokens < shape.seqs and not draft:
-                    continue  # its target ran at its rung, not its rows
+                if (shape.tokens < shape.seqs or shape.width) and not draft:
+                    continue  # its target ran at its rung, or at its rows
                 key = structure(config, shape.phase, output=output, draft=bool(draft))
                 crossing, traced = [], Traced(key, str(shape))
                 graph = build(part, traced, crossing)

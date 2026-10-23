@@ -1519,7 +1519,8 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
     store at `root` holds at a shape, of a step that produces output or one
     that does not, or of its drafter's part (`draft`), or when it holds none
     `forward.missed`'s text, None for no text; under DP, at the rows the
-    step's MoE gathers.
+    step's MoE gathers; a prefill's drafter at the `width` its later passes
+    pad to.
 
     With ATOM's arguments `atom_args`, a shape the store holds no graph at is
     first traced once, as `compass trace ops` traces a record's step from
@@ -1537,9 +1538,9 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
 
     @functools.lru_cache(maxsize=64)
     def graph(
-        phase: str, tokens: int, seqs: int, output=True, gathered=None, draft=False
+        phase, tokens, seqs, output=True, gathered=None, draft=False, width=None
     ) -> dict | str | None:
-        shape = Shape(phase, tokens, seqs, gathered).at(dp, drafts)
+        shape = Shape(phase, tokens, seqs, gathered, width).at(dp, drafts)
         at = structure(config, phase, True, arch, output, draft)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
         missing = not store.directory_for(key).exists()

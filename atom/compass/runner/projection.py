@@ -235,9 +235,14 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     variable-length gather carries each rank's own count. An MTP drafter's
     first pass runs each rank's target token stream unpadded, so its gather is
     always the variable-length one (`EagleProposer.propose`); a block drafter
-    pads its passes to the group and is left out.
+    pads its passes to the group and is left out. Its later passes run at
+    `running_bs`, on any step, when it declares a draft graph, else at the
+    rows (`draft_bs`).
     """
-    draft_moe_rows = moe_tokens = dp_rank = None
+    draft_moe_rows = moe_tokens = dp_rank = draft_bs = None
+    drafter = getattr(runner, "drafter", None)
+    if getattr(drafter, "step", None) is not None:  # `EagleProposer`'s pass
+        draft_bs = int(mode.running_bs)
     if mode.sync is not None:
         dp_rank = runner.config.parallel_config.data_parallel_rank
         gathered = moe_tokens = int(mode.sync.num_tokens_across_dp.sum())
@@ -245,7 +250,6 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
             moe_rows = _data_parallel_size(runner) * mode.running_tokens
         else:
             moe_rows = gathered
-        drafter = getattr(runner, "drafter", None)
         if drafter is not None and not drafter.is_block_drafter:
             draft_moe_rows = gathered
     elif _data_parallel_size(runner) > 1:
@@ -265,6 +269,7 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
         capture_rung=_rung(mode),
         moe_rows=moe_rows,
         draft_moe_rows=draft_moe_rows,
+        draft_bs=draft_bs,
         produces_output=batch.produces_output(),
         tbo_tokens=None if mode.sync is None else mode.sync.ub_tokens_across_dp,
         image_tokens=image_tokens(batch, runner),
