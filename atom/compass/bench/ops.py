@@ -30,7 +30,9 @@ shape, dtype and stride, one tensor per occurrence of the leaf in the step;
 a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
-HCA decode workspace an `HCA_DECODE` slot names; an integer the capture
+HCA decode workspace an `HCA_DECODE` slot names, or of the buffer
+`V4_METADATA` names for a DeepSeek-V4 slot, refused when it is not live; an
+integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names, its module's meta parameters
 moved to the device and filled as `--load_dummy xavier` fills them (`_fill`),
@@ -47,10 +49,11 @@ A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, a KV
-argument's as many entries of its first dimension as the batch's state slots,
-or its blocks when the model keeps no per-request state, or, of a decode
-attention leaf that states its layer's window and compress ratio, the plane
-rows the batch's blocks hold at that ratio, the tensors
+argument's as many entries of its first dimension, each the span of the
+others, as the batch's state slots, or its blocks when the model keeps no
+per-request state, or, of a decode attention leaf that states its layer's
+window and compress ratio, the plane rows the batch's blocks hold at that
+ratio, the tensors
 of each module it names and, for a leaf that names a context key, the KV and
 per-request state its layer holds for the batch. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
@@ -80,10 +83,10 @@ a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
 aside, are the point's kernel identity. When `ReplayRule` refuses a batch, its
 leaves refuse; an error in ATOM's preparation fails the run, naming the point.
-The points run in a process of their own on each GPU; one that dies ends
-every rank, keeps the points every rank finished, the point it was measuring
-refuses, and new ones measure the rest; two in a row that die having finished
-no point fail the run.
+The points run in a process of their own on each GPU, which dies when its
+device faulted (`_alive`); one that dies ends every rank, keeps the points
+every rank finished, the point it was measuring refuses, and new ones measure
+the rest; two in a row that die having finished no point fail the run.
 
 DIR gets run.json, the run's identity, and ops.jsonl, one line per point. S
 gets each measured point as an `op_measurement`, keyed by the model, the
@@ -157,7 +160,7 @@ from atom.compass.drive.gpu import add_gpu_flag
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads or what a capture waits for change.
-PROTOCOL = 9
+PROTOCOL = 10
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -193,10 +196,43 @@ TOKEN_IDS = {("aten.embedding.default", "indices")}
 #: The operator whose metadata slots are named as the fields of DeepSeek-V4's
 #: HCA decode workspace: aiter defines its schema and the workspace together.
 HCA_DECODE = "aiter.mla_decode_v4_ps_asm.default"
+#: DeepSeek-V4's metadata arguments, by operator and slot, and the live buffer
+#: ATOM passes each, at the compress ratio the leaf takes or states (`{ratio}`)
+#: and that ratio's attention kind (`{kind}`): `_meta`'s rules bind them to a
+#: tighter buffer of their dtype. A leaf whose buffer is not live refuses.
+#: A decode's `split_indptr` is its split plan's, `split_plan_<kind>.1`. The
+#: paged-decode index leaves write their indptrs into the clone that the
+#: leaves timed after them at a placement read.
+_NM = "aiter.mla:mla_decode_fwd_v4_nm"
+_INDICES = "atom.model_ops.v4_kernels.paged_decode_indices"
+_CSA = "aiter.ops.flydsl.kernels.fused_compress_attn:flydsl_fused_compress_attn"
+_HCA = "aiter.ops.flydsl.kernels.fused_compress_attn_hca:flydsl_hca_compress_attn"
+_STATE = "atom.model_ops.v4_kernels.state_writes:update_compressor_states"
+_QKN = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
+_BF16 = "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
+V4_METADATA = {
+    (_NM, "kv_indptr"): "kv_indptr_{kind}",
+    (_NM, "split_indptr"): "split_plan_{kind}.1",
+    **{
+        (f"{_INDICES}:{fn}", f"{kind}_indptr"): f"kv_indptr_{kind}"
+        for fn in ("build_v4_paged_decode_indptr", "write_v4_paged_decode_indices")
+        for kind in ("swa", "csa", "hca")
+    },
+    (HCA_DECODE, "kv_indptr"): "kv_indptr_{kind}",
+    (_BF16, "kv_indptr"): "kv_indptr_{kind}",
+    (_CSA, "state_slot_mapping"): "state_slot_in",
+    (_CSA, "plan_gpu"): "v4_compress_plan_{ratio}",
+    (_HCA, "state_slot_mapping"): "state_slot_in",
+    (_HCA, "plan_gpu"): "v4_compress_plan_{ratio}",
+    (_STATE, "state_slot_mapping"): "state_slot_out",
+    (_STATE, "write_plan"): "v4_write_plan_{ratio}",
+    (_QKN, "batch_id_per_token"): "batch_id_per_q_token",
+}
+V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
 #: the span, and past an exact buffer kills the process (aiter defect, #1977).
-NM_OUTPUT = ("aiter.mla:mla_decode_fwd_v4_nm", "output")
+NM_OUTPUT = (_NM, "output")
 #: The seed of a copy's drawn expert ids, with the copy's index.
 SEED = 0
 #: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
@@ -532,8 +568,16 @@ class Stub:
         hca = sys.modules.get("atom.model_ops.v4_kernels.hca_persist")
         work = getattr(hca, "_workspaces", {}).get(self.runner.device.index)
         work = work._asdict() if work is not None else {}
+        # a decode split plan, `(splits, split_indptr)`: only a slot
+        # `V4_METADATA` names takes it, so `_meta`'s rules never offer it
+        named = live | {
+            f"{k}.1": v[1]
+            for k, v in vars(fc.attn_metadata).items()
+            if k.startswith("split_plan_") and v
+        }
         meta = dict(self.kv)
         for sig, (op, _) in self.leaves.items():
+            ratio = op["args"].get("ratio", op.get("stated", {}).get("compress_ratio"))
             for path, spec in _specs(op["args"]):
                 if spec["role"] == "metadata":
                     token = (op["op"], path) in TOKEN_IDS
@@ -541,7 +585,12 @@ class Stub:
                     what, field = "metadata", path.split(".")[0]
                     if op["op"] == HCA_DECODE and field in work:
                         pool, what = {field: work[field]}, "HCA workspace"
+                    if wanted := V4_METADATA.get((op["op"], field)):
+                        what = wanted.format(ratio=ratio, kind=V4_KINDS.get(ratio))
+                        pool = {what: named[what]} if what in named else {}
                     try:
+                        if not pool:
+                            raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
                         # leaves share a view's clone: DeepSeek-V4's decode
                         # leaves view 2.7 GB of it at a placement
@@ -612,6 +661,7 @@ class Stub:
                 record["footprint_bytes"] = min(n, record.get("copies", n)) * size
             except Exception as error:  # noqa: BLE001 - a refusal names what stopped it
                 record["refused"] = f"{type(error).__name__}: {error}"
+                _alive(self.runner.device)
             copies = record.get("copies", n)
             print(f"{shape}: {op['op']} over {copies} copies {names or ''}", flush=True)
             record |= {"instances": len(inst), "placements": len(self.placed)}
@@ -624,10 +674,13 @@ class Stub:
         keys and KV arguments take."""
         need, size = 1, 0
         for _, s in _specs(op["args"]):
-            nbytes = _span(s["shape"], s["stride"]) * _dtype(s["dtype"]).itemsize
+            itemsize = _dtype(s["dtype"]).itemsize
+            nbytes = _span(s["shape"], s["stride"]) * itemsize
             if s["role"] == "kv":
                 # ponytail: its first dim taken as blocks or state slots, or as
-                # plane rows when the leaf states its layer's attention geometry
+                # plane rows when the leaf states its layer's attention geometry;
+                # beside state slots a block view is one block a request, the
+                # one a decode compressor writes its row to
                 unit = rows if self.slots else blocks
                 stated = op.get("stated", {})
                 if "window_size" in stated and (ratio := stated["compress_ratio"]):
@@ -637,7 +690,10 @@ class Stub:
                     # of which a request reads at most its indexer's top-k
                     if top := stated.get("index_topk"):
                         unit = min(unit, rows * top)
-                nbytes, need = nbytes // max(s["shape"][0], 1) * unit, None
+                # an entry is the span of its trailing dims: a view may be
+                # strided by a whole state slot or by every layer's block
+                entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
+                nbytes, need = entry * unit, None
             size += nbytes
         for key in instances[0].values():
             module = self.contexts.get(key)
@@ -874,6 +930,18 @@ class Stub:
         return self.built[_spec_of(spec), c % count]
 
 
+def _alive(device) -> None:
+    """Ends this process when `device` faulted: the fault is sticky, so every
+    later call there fails, and a peer rank would wait on this one's next
+    collective until it times out. `_measured` refuses the leaf it died on."""
+    if device.type != "cuda":
+        return
+    try:
+        torch.cuda.synchronize(device)
+    except Exception:  # noqa: BLE001 - any error here is the device's
+        os._exit(1)
+
+
 def _routing(loads) -> dict:
     """The drawn copies' imbalance, recorded and not priced: each copy's
     experts that took a token, and the most tokens one expert took."""
@@ -953,9 +1021,17 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
     """The live KV tensor a KV argument is a view of, and its name, picked as
     `_meta` picks among those whose layout past the first dimension's size
     is its own (`_layout`), when any is: the capture's pool sized that one;
-    or why none fits, and None."""
+    else among the last layers, `name.i`, of tensors stacked by layer whose
+    layer has that layout: ATOM passes a layer of DeepSeek-V4's compressor
+    state, and another field's base at this one's slot stride reaches past
+    the pool; or why none fits, and None."""
     want = _layout(spec["shape"], spec["stride"])
     own = {n: t for n, t in live.items() if _layout(t.shape, t.stride()) == want}
+    own = own or {
+        f"{n}.{len(t) - 1}": t[-1]
+        for n, t in live.items()
+        if t.dim() > 2 and len(t) and _layout(t[-1].shape, t[-1].stride()) == want
+    }
     try:
         return _meta(spec, slot, own or live, "KV")
     except ValueError as error:  # the leaf refuses, not the point
