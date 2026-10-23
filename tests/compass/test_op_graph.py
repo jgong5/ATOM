@@ -30,7 +30,7 @@ from test_op_work import leaf, t
 from test_work import SPEC
 
 from atom.compass.artifacts import ArtifactRefusal
-from atom.compass.backends import BatchView, CostRefused, Method, RequestShape
+from atom.compass.backends import BatchView, CostRefused, Method, RequestShape, op_graph
 from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import NONE, OpGraphBackend
 from atom.compass.backends.op_work import work
@@ -261,6 +261,43 @@ def test_a_term_is_declared_iff_a_field_its_winning_bound_reads_is_stated(
         assert term.provenance.method is Method.DECLARED
         assert [p for p in MEMORY + COMPUTE if p in note] == list(reads)
         assert note.endswith(NONE)
+
+
+def test_a_step_works_each_signature_once_and_keeps_what_reads_no_step(
+    monkeypatch,
+):
+    """Leaves of one signature share one work a step; a GEMM, which reads
+    nothing of the step, keeps its work across steps; attention, which reads
+    the step's rows, is worked again at each step's."""
+    worked = []
+
+    def counted(op, *args):
+        worked.append(op["op"])
+        return work(op, *args)
+
+    monkeypatch.setattr(op_graph, "work", counted)
+    attn = leaf(ATTENTION, [[2, 6144]], q=t([2, 24, 256]), k=t([2, 4, 256]))
+    region = {"seq": [g(2, 64, 64), attn, g(2, 64, 64), copy.deepcopy(attn)]}
+    steps = [DECODE, view((1, 9_000, True), (1, 30, True), rung=2)]
+    ops = backend(region)
+    costs = [ops.price(step) for step in steps]
+
+    assert worked == [GEMM, ATTENTION, ATTENTION]
+    assert costs == [backend(region).price(step) for step in steps]
+    assert costs[0] != costs[1]
+
+
+def test_a_signature_in_and_out_of_a_resource_bound_par_prices_each_way():
+    big = g(2, 4096, 4096)
+    params = listed(
+        *[pt(g(b, 4096, 4096), f"decode B={b}", 1e3, c) for b in (2, 4) for c in (1, 9)]
+    )
+    pooled = {"par": [g(2, 4096, 4096), g(2, 4096, 4096)], "join": "resource_bound"}
+    cost = backend({"seq": [big, pooled]}, price_list=params).price(DECODE)
+    alone = backend(big, price_list=params).price(DECODE)
+
+    summed = gemm(2, 4096, 4096) + gemm(2, 4096, 4096)
+    assert by_name(cost) == by_name(alone) | {"par.resource_bound": price(summed, SPEC)}
 
 
 # --- two-batch overlap -------------------------------------------------------------
