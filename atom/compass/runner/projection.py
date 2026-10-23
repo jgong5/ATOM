@@ -238,11 +238,20 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     pads its passes to the group and is left out. Its later passes run at
     `running_bs`, on any step, when it declares a draft graph, else at the
     rows (`draft_bs`).
+
+    A target that replays no graph pads to it too (`target_bs`): an eager
+    decode every rank decodes in, its inputs; a sampling prefill, its LM head.
     """
-    draft_moe_rows = moe_tokens = dp_rank = draft_bs = None
+    draft_moe_rows = moe_tokens = dp_rank = draft_bs = target_bs = None
     drafter = getattr(runner, "drafter", None)
     if getattr(drafter, "step", None) is not None:  # `EagleProposer`'s pass
         draft_bs = int(mode.running_bs)
+    prefill = batch.total_seqs_num_prefill
+    if not mode.use_cudagraph and (
+        batch.produces_output() if prefill else mode.running_tokens_are_unified
+    ):
+        wider = mode.running_bs > len(batch.num_scheduled_tokens)
+        target_bs = mode.running_bs if wider else None
     if mode.sync is not None:
         dp_rank = runner.config.parallel_config.data_parallel_rank
         gathered = moe_tokens = int(mode.sync.num_tokens_across_dp.sum())
@@ -260,7 +269,6 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
         )
     else:
         moe_rows = None
-    prefill = batch.total_seqs_num_prefill
     rows = zip(batch.num_scheduled_tokens, batch.context_lens)
     return BatchView(
         tuple(
@@ -270,6 +278,7 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
         moe_rows=moe_rows,
         draft_moe_rows=draft_moe_rows,
         draft_bs=draft_bs,
+        target_bs=target_bs,
         produces_output=batch.produces_output(),
         tbo_tokens=None if mode.sync is None else mode.sync.ub_tokens_across_dp,
         image_tokens=image_tokens(batch, runner),
