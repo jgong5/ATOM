@@ -30,6 +30,7 @@ from atom.compass.backends.step_labels import (
     TABLE_VERSION,
     digest,
     label,
+    label_run,
     write_table,
 )
 from atom.compass.backends.step_linear_fit import (
@@ -345,6 +346,21 @@ def test_a_dp_pair_s_cost_lines_start_E_at_the_group_s_latest_pull(tmp_path):
                 gap = (lines[n]["t_enter_ns"] - start) * 1e-9
                 assert row["E"] == pytest.approx(gap, rel=1e-12)
     assert latest == {True, False}
+
+
+def test_a_dummy_only_rank_s_later_pull_starts_its_peer_s_E(tmp_path):
+    records, pulls = _pair(tmp_path, ((3,), (2,)))
+    lines = [json.loads(x) | {"is_dummy_run": True} for x in records[1].open()]
+    records[1].write_text("".join(json.dumps(x) + "\n" for x in lines))
+
+    (samples, _), dummy = label_run(records)
+    assert dummy == ([], [])
+    timed = [s for s in samples if "E" in s.host]
+    assert timed
+    for s in timed:
+        start = pulls[1][s.step - 1]
+        assert start > pulls[0][s.step - 1]
+        assert s.host["E"] == (lines[s.step]["t_enter_ns"] - start) * 1e-9
 
 
 def test_a_dp_pair_fits_the_E_law_of_its_later_pulling_rank(tmp_path):
