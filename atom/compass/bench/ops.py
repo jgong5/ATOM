@@ -55,9 +55,9 @@ argument's as many entries of its first dimension, each the span of the
 others, as the batch's state slots, or its blocks when the model keeps no
 per-request state, or, of a decode attention leaf that states its layer's
 window and compress ratio, the plane rows the batch's blocks hold at that
-ratio, the tensors
-of each module it names and, for a leaf that names a context key, the KV and
-per-request state its layer holds for the batch. One graph runs the leaf K
+ratio, a RoPE table's (`TABLES`) as many rows as the point's tokens, the
+tensors of each module it names and, for a leaf that names a context key, the
+KV and per-request state its layer holds for the batch. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
 kernels of one eager call of copy 0, the fewer, at least one, cycling over its
 copies: N built ones: M, the least count whose bytes pass `COLD` times the
@@ -162,7 +162,7 @@ from atom.compass.drive.gpu import add_gpu_flag
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads or what a capture waits for change.
-PROTOCOL = 11
+PROTOCOL = 12
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -195,6 +195,10 @@ _waited: Counter = Counter()
 #: the model's forward; `_meta`'s name rule binds an embedding's `indices` to
 #: another index buffer.
 TOKEN_IDS = {("aten.embedding.default", "indices")}
+#: Weight slots a leaf reads a row a token of: RoPE's cos and sin tables,
+#: indexed by each token's position (or by each compressed position, at most
+#: one a token), never read whole.
+TABLES = {"cos_cache", "sin_cache"}
 #: The operator whose metadata slots are named as the fields of DeepSeek-V4's
 #: HCA decode workspace: aiter defines its schema and the workspace together.
 HCA_DECODE = "aiter.mla_decode_v4_ps_asm.default"
@@ -668,7 +672,8 @@ class Stub:
         room = [pool // blocks]
         room += [t.k_cache.shape[0] // len(rows) for t in kv.values() if _stateful(t)]
         plans = {
-            s: self._plan(op, i, kv, blocks, len(rows)) for s, (op, i) in found.items()
+            s: self._plan(op, i, kv, blocks, len(rows), shape.tokens)
+            for s, (op, i) in found.items()
         }
         need = max(p for _, _, p in plans.values())
         self.leaves, self.placed, self.context, self.clones = found, [], context, {}
@@ -711,13 +716,16 @@ class Stub:
         self.placed = []
         return got
 
-    def _plan(self, op, instances, kv, blocks, rows):
+    def _plan(self, op, instances, kv, blocks, rows, tokens=None):
         """A leaf's copies, its bytes per call, and the placements its context
-        keys and KV arguments take."""
+        keys and KV arguments take; `tokens` defaults to `rows`, a decode's."""
         need, size = 1, 0
-        for _, s in _specs(op["args"]):
+        for slot, s in _specs(op["args"]):
             itemsize = _dtype(s["dtype"]).itemsize
             nbytes = _span(s["shape"], s["stride"]) * itemsize
+            if s["role"] == "weight" and slot in TABLES:
+                entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
+                nbytes = entry * min(tokens or rows, s["shape"][0])
             if s["role"] == "kv":
                 # ponytail: its first dim taken as blocks or state slots, or as
                 # plane rows when the leaf states its layer's attention geometry;
