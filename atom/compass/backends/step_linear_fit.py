@@ -25,7 +25,8 @@ under another engine config refuses it. At its `data_parallel_size` N above 1
 N, each run's `dp0.jsonl` to `dp<N-1>.jsonl`. A step is its ranks' lines
 joined on step index, labelled with the smallest rank label (the others wait
 for the last rank to enter), and a prefill row adds the line's `moe_rows`. A
-step that some rank cut, or whose ranks' rows fall to different vectors, is
+rank that ran the step as a dummy forward adds no row. A step that some rank
+lacks otherwise or cut, or whose ranks' rows fall to different vectors, is
 counted under `ranks` and not fitted. The law reports each step's rank label
 spread, `max / min - 1`, as its p50 and p90 under `spread`. The group's step
 is the max over its ranks, so each vector is fitted by alternating max-affine
@@ -383,24 +384,29 @@ def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
 
 
 def _groups(
-    run, form: str, draft: bool = False
-) -> tuple[list[list[tuple]], dict, list[float]]:
-    """One run's steps, each its ranks' `_features` rows labelled with the smallest
-    rank label; what was cut; and each step's rank label spread."""
+    run, form: str, draft: bool = False, steps=None
+) -> tuple[list[dict[int, tuple]], dict, list[float]]:
+    """One run's steps, each {rank: its `_features` row} labelled with the
+    smallest rank label, a rank that ran the step as a dummy forward holding
+    none; what was cut; and each step's rank label spread. With `steps`, only
+    the steps numbered in it."""
+    dummies = [rank[0].dummies for rank in run]
+    run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
     got = [_features(rank, form, len(run), draft) for rank in run]
     cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
     if len(run) == 1:
-        return [[r] for r in got[0][0]], cut, []
+        return [{0: r} for r in got[0][0]], cut, []
     ranks = [{r[3]: r for r in rows} for rows, _ in got]
     groups, spread, cut["ranks"] = [], [], 0
     for step in sorted(set().union(*ranks)):
-        group = [rank.get(step) for rank in ranks]
-        if None in group or len({r[0] for r in group}) > 1:
+        group = {i: rank[step] for i, rank in enumerate(ranks) if step in rank}
+        ran = len(group) + sum(step in d for d in dummies)
+        if ran < len(ranks) or len({r[0] for r in group.values()}) > 1:
             cut["ranks"] += 1
             continue
-        labels = [r[2] for r in group]
+        labels = [r[2] for r in group.values()]
         spread.append(max(labels) / min(labels) - 1.0)
-        groups.append([(*r[:2], min(labels), *r[3:]) for r in group])
+        groups.append({i: (*r[:2], min(labels), *r[3:]) for i, r in group.items()})
     return groups, cut, spread
 
 
@@ -411,10 +417,15 @@ def _slowest(groups, prefill: list[str]) -> tuple[list[tuple], dict]:
     for key in sorted({g[0][1] for g in groups if len(g) > 1}):
         names = prefill if key == "prefill" else list(DECODE)
         at = [j for j, g in enumerate(groups) if g[0][1] == key]
-        x = np.array([[r[2] for r in groups[j]] for j in at], dtype=np.float64)
+        width = max(len(groups[j]) for j in at)
+        # A dummy rank's missing row is a zero row, which prices 0, so is never a
+        # step's highest, and is left out of the fit on every rank's row.
+        pad = [(0,) * len(names)]
+        x = [[r[2] for r in groups[j]] + pad * (width - len(groups[j])) for j in at]
+        x = np.array(x, dtype=np.float64)
+        real = x[:, :, 0] > 0  # a row's first feature, the step, is 1
         y = np.array([groups[j][0][3] for j in at])
-        flat = x.reshape(-1, x.shape[2])
-        coef = _solve(flat, np.repeat(y, x.shape[1]), names)["coef"]
+        coef = _solve(x[real], np.repeat(y, real.sum(axis=1)), names)["coef"]
         error = (x @ coef).max(axis=1) / y - 1.0
         centre = float(np.median(error))
         mad = float(1.4826 * np.median(np.abs(error - centre)))
@@ -455,7 +466,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     groups, cut, spread = [], {"warm": 0, "warm_s": 0.0}, []
     for i, run in enumerate(runs.values()):
         got, c, s = _groups(run, form, draft)
-        groups += [[(i, *r) for r in g] for g in got]
+        groups += [[(i, *r) for r in g.values()] for g in got]
         spread += s
         for k, v in c.items():
             cut[k] = cut.get(k, 0) + v
@@ -606,6 +617,13 @@ def _band(key: str, counts) -> str:
     return f"prefill tokens {token_band(counts[1])}"
 
 
+def priced_rank(ranks: dict):
+    """The rank a DP step is priced and banded as, of `ranks`, {rank: (price,
+    features)}: its costliest, a tie going to the rank of larger features, which a
+    law blind to them prices the same and the step still waits for."""
+    return max(ranks, key=ranks.get)
+
+
 def _held_out(samples, options, seed, warm=None):
     """Each step of each run, warm steps left out, priced as its costliest rank
     by the law fitted on the other runs: (run, vector, band, that rank's (counts,
@@ -618,11 +636,11 @@ def _held_out(samples, options, seed, warm=None):
         others = [s for s in samples if s.provenance["run"] != run]
         law = fit(others, options, seed)[0]
         for group in _groups(ranks, form)[0]:
-            key, _, seconds, step, _ = group[0]
+            key, _, seconds, step, _ = next(iter(group.values()))
             if step in warm[i]:
                 continue
             vector = law["decode"].get(key) if key != "prefill" else law.get(key)
-            mine = [(r[1], r[4]) for r in group]
+            mine = [(r[1], r[4]) for r in group.values()]
             price, error = [c[1] for c, _ in mine], float("nan")
             if vector is not None:
                 c = list(vector["coefficients"].values())
@@ -630,9 +648,7 @@ def _held_out(samples, options, seed, warm=None):
                     float(np.dot(c, x + _rowmod_count(vector, n))) for x, n in mine
                 ]
                 error = max(price) / seconds - 1.0
-            # A tie goes to the rank of larger features, which a law blind to them
-            # prices the same and the step still waits for.
-            top = max(zip(price, mine), key=lambda p: (p[0], p[1][0]))[1]
+            top = mine[priced_rank({j: (p, mine[j][0]) for j, p in enumerate(price)})]
             yield run, key, _band(key, top[0]), top, error
 
 

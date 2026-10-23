@@ -31,6 +31,7 @@ from atom.compass.bench import ops
 from atom.compass.capture import driverless
 from atom.compass.capture.forward import decode, prefill
 from atom.compass.capture.graph import Traced, build, to_json
+from atom.compass.ir.nodes import Reduced
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
 from atom.utils import block_convert
@@ -461,6 +462,66 @@ def test_an_embedding_reads_the_token_ids_atom_prepared():
     assert [name for name, _ in views.values()] == ["input_ids"]
 
 
+def test_a_v4_placement_s_csa_top_k_names_rows_of_its_own_blocks():
+    # Decode rows at positions 1023, 511 and 15 see 256, 128 and 4 compressed
+    # rows at ratio 4, 64 to a block: 4, 2 and 1 blocks. Each slice is the
+    # top-k section, 8 ids or as many as the row sees, then a window of 4 the
+    # builder wrote.
+    class Csa(torch.nn.Module):
+        # ATOM's CSA layer, whose package needs aiter's JIT to import: its fill
+        # writes each token's top-k ids at the head of its slice as rows of
+        # the blocks they fall in, as `csa_translate_pack` does
+        indexer, compress_ratio = SimpleNamespace(index_topk=8), 4
+
+        def _fill_csa_paged_compress(self, md, topk, positions, tokens):
+            for t in range(tokens):
+                start = int(md.kv_indptr_csa[t])
+                k = int(md.kv_indptr_csa[t + 1]) - start - min(int(positions[t]) + 1, 4)
+                ids = topk[t, :k].long()
+                blocks = md.block_tables[md.batch_id_per_q_token[t], ids // 64]
+                rows = blocks * md.envelope_rows + ids % 64
+                md.kv_indices_csa[start : start + k] = rows
+
+    i32 = functools.partial(torch.tensor, dtype=torch.int32)
+    runner, envelope = _Runner(), 100
+    runner.model.append(Csa())
+
+    def prepare_model(batch):
+        b = batch[0]
+        tables = i32([[b, b + 1, b + 2, b + 3], [b + 4, b + 5, 0, 0], [b + 6, 0, 0, 0]])
+        meta = fctx.AttentionMetaData(block_tables=tables, state=fctx.AttnState.DECODE)
+        vars(meta).update(
+            kv_indptr_csa=i32([0, 12, 24, 32]),
+            kv_indices_csa=torch.full((32,), -1, dtype=torch.int32),
+            batch_id_per_q_token=i32([0, 1, 2]),
+            envelope_rows=envelope,
+        )
+        context = fctx.Context(positions=torch.tensor([1023, 511, 15]))
+        fctx._forward_context = fctx.ForwardContext(attn_metadata=meta, context=context)
+        return torch.zeros(3, dtype=torch.int32), None, None, None, True, False
+
+    runner.prepare_model = prepare_model
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = {}
+
+    for p in range(2):
+        stub._prepare((8 * p, 0))
+
+    sections = []
+    for p, (snap, _) in enumerate(stub.placed):
+        ids = snap.attn_metadata.kv_indices_csa.long()
+        rows = [ids[:8], ids[12:20], ids[24:28]]
+        assert (
+            ids[8:12].eq(-1).all() and ids[20:24].eq(-1).all() and ids[28:].eq(-1).all()
+        )
+        for got, blocks in zip(rows[:2], ([0, 1, 2, 3], [4, 5])):
+            assert set((got // envelope).tolist()) == {8 * p + b for b in blocks}
+            assert (got % envelope < 64).all() and len(set(got.tolist())) == 8
+        assert rows[2].tolist() == [(8 * p + 6) * envelope + i for i in range(4)]
+        sections.append(ids)
+    assert not torch.equal(*sections)
+
+
 def test_a_v4_metadata_slot_is_a_view_of_the_buffer_atom_passes_or_refuses():
     # Each buffer ATOM passes is wider than one of its dtype `_meta`'s rules
     # take: one of the slot's own spec, or a tighter one its name also holds.
@@ -533,6 +594,41 @@ def test_a_v4_metadata_slot_is_a_view_of_the_buffer_atom_passes_or_refuses():
         (state, "state_slot_mapping"): "state_slot_out",
         (state, "write_plan"): "v4_write_plan_128",
         (qkn, "batch_id_per_token"): "batch_id_per_q_token",
+    }
+
+
+def test_v4_index_writer_takes_atom_s_state_slots_and_dest_rows_by_ratio():
+    # Bound by size, the state slots were `context_lens` and every destination
+    # row `top_ks`. The dict's items are out of ratio order, so an item binds
+    # by its key, not its place; no HCA buffer is live, so its item refuses.
+    write = (
+        "atom.model_ops.v4_kernels.paged_decode_indices:write_v4_paged_decode_indices"
+    )
+    rows = _t([8], "metadata", dtype="torch.int32")
+    runner = _Runner()
+    runner.forward_vars |= {
+        "context_lens": torch.zeros(3, dtype=torch.int32),
+        "top_ks": torch.zeros(8, dtype=torch.int32),
+        "v4_meta_state_slot_out": torch.zeros(16, dtype=torch.int32),
+        "v4_swa_dest_dense": torch.zeros(16, dtype=torch.int32),
+        "v4_swa_dest_csa": torch.zeros(32, dtype=torch.int32),
+    }
+    leaf = _leaf(
+        write,
+        ("state_slot_per_seq", _t([3], "metadata", dtype="torch.int32")),
+        ("dest_rows", Reduced("builtins:dict", ((128, rows), (0, rows), (4, rows)))),
+    )
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(leaf, layers=1)["region"])
+
+    stub._prepare((0, 0))
+
+    [(_, views)] = stub.placed
+    assert {p: n for (_, p), (n, _) in views.items()} == {
+        "state_slot_per_seq": "v4_meta_state_slot_out",
+        "dest_rows.0.1": "ATOM passes dest_rows.0.1 v4_swa_dest_hca: not live",
+        "dest_rows.1.1": "v4_swa_dest_dense",
+        "dest_rows.2.1": "v4_swa_dest_csa",
     }
 
 

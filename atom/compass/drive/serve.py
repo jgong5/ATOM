@@ -71,6 +71,16 @@ POLL_S = 0.5
 STOP_GRACE_S = 60
 TREE = Path(atom.__file__).resolve().parents[1]
 PORT_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
+#: Where a server's ports are drawn, and where `deploy.sh` draws a deployment's:
+#: apart, and each clear of the 15000 to 17000 Mooncake's transfer engine draws
+#: each rank's RPC port from (rpc_min_port, rpc_max_port).
+SERVE_PORTS, DEPLOY_PORTS = range(10000, 15000), range(17001, 65536)
+
+
+def below_ephemeral(ports: range) -> range:
+    """`ports` below the kernel's ephemeral range: a bind to port 0, as ATOM's
+    own ranks make while they load, or an outgoing connection never takes one."""
+    return range(ports.start, min(ports.stop, int(PORT_RANGE.read_text().split()[0])))
 
 
 class ServeError(ValueError):
@@ -196,11 +206,9 @@ def _refuse(atom_args) -> None:
 
 
 def _free_ports(n: int) -> list[int]:
-    """`n` free ports, bound together on every address so no two are the same,
-    from 10000 up to the kernel's ephemeral range: a bind to port 0, as ATOM's
-    own ranks make while they load, or an outgoing connection never takes one."""
-    low = int(PORT_RANGE.read_text().split()[0])
-    held, ports = [], range(10000, low)
+    """`n` free ports from `SERVE_PORTS`, bound together on every address so no
+    two are the same."""
+    held, ports = [], below_ephemeral(SERVE_PORTS)
     try:
         for port in random.sample(ports, len(ports)):
             held.append(socket.socket())
@@ -211,8 +219,8 @@ def _free_ports(n: int) -> list[int]:
             if len(held) == n:
                 return [s.getsockname()[1] for s in held]
         raise ServeError(
-            f"fewer than {n} free ports from 10000 up to the ephemeral range's "
-            f"low bound {low} ({PORT_RANGE})"
+            f"fewer than {n} free ports from {ports.start} up to {ports.stop} "
+            f"({SERVE_PORTS.stop}, or the ephemeral range's low bound in {PORT_RANGE})"
         )
     finally:
         for s in held:

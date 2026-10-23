@@ -21,7 +21,9 @@ rank each of the layout the arguments resolve (`ranks`), its parameters on the
 meta device and with no warmup (`_runner`): no forward of the model, its LM
 head or its sampler runs. Each point reaches the runner as a batch
 (`ReplayRule`) that `ModelRunner.prepare_model` prepares, so ATOM builds its
-metadata and forward context, and a `Stub` calls each leaf from its contract:
+metadata and forward context; for DeepSeek-V4, the CSA top-k section its
+forward writes is written from ids spread over each token's compressed rows
+(`Stub._top_k`). A `Stub` calls each leaf from its contract:
 an activation is random at its shape, dtype and stride, except a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
 experts' ids ATOM fuses into them (`_route`), and the `NM_OUTPUT` slot at
@@ -160,7 +162,7 @@ from atom.compass.drive.gpu import add_gpu_flag
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads or what a capture waits for change.
-PROTOCOL = 10
+PROTOCOL = 11
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -196,15 +198,17 @@ TOKEN_IDS = {("aten.embedding.default", "indices")}
 #: The operator whose metadata slots are named as the fields of DeepSeek-V4's
 #: HCA decode workspace: aiter defines its schema and the workspace together.
 HCA_DECODE = "aiter.mla_decode_v4_ps_asm.default"
-#: DeepSeek-V4's metadata arguments, by operator and slot, and the live buffer
-#: ATOM passes each, at the compress ratio the leaf takes or states (`{ratio}`)
-#: and that ratio's attention kind (`{kind}`): `_meta`'s rules bind them to a
-#: tighter buffer of their dtype. A leaf whose buffer is not live refuses.
+#: DeepSeek-V4's metadata arguments, by operator and slot, a dict argument's
+#: item by its key (`slot.<key>`), and the live buffer ATOM passes each, at the
+#: compress ratio the leaf takes or states (`{ratio}`) and that ratio's
+#: attention kind (`{kind}`): `_meta`'s rules bind them to a tighter buffer of
+#: their dtype. A leaf whose buffer is not live refuses.
 #: A decode's `split_indptr` is its split plan's, `split_plan_<kind>.1`. The
 #: paged-decode index leaves write their indptrs into the clone that the
 #: leaves timed after them at a placement read.
 _NM = "aiter.mla:mla_decode_fwd_v4_nm"
 _INDICES = "atom.model_ops.v4_kernels.paged_decode_indices"
+_WRITE = f"{_INDICES}:write_v4_paged_decode_indices"
 _CSA = "aiter.ops.flydsl.kernels.fused_compress_attn:flydsl_fused_compress_attn"
 _HCA = "aiter.ops.flydsl.kernels.fused_compress_attn_hca:flydsl_hca_compress_attn"
 _STATE = "atom.model_ops.v4_kernels.state_writes:update_compressor_states"
@@ -213,6 +217,11 @@ _BF16 = "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_tri
 V4_METADATA = {
     (_NM, "kv_indptr"): "kv_indptr_{kind}",
     (_NM, "split_indptr"): "split_plan_{kind}.1",
+    (_WRITE, "state_slot_per_seq"): "v4_meta_state_slot_out",
+    **{
+        (_WRITE, f"dest_rows.{ratio}"): f"v4_swa_dest_{kind}"
+        for ratio, kind in ((0, "dense"), (4, "csa"), (128, "hca"))
+    },
     **{
         (f"{_INDICES}:{fn}", f"{kind}_indptr"): f"kv_indptr_{kind}"
         for fn in ("build_v4_paged_decode_indptr", "write_v4_paged_decode_indices")
@@ -542,6 +551,17 @@ class Stub:
         )
         self.shared = self.topk.get("topk_ids")
         self.loads = []
+        # a DeepSeek-V4 CSA layer: its forward writes the top-k section of the
+        # CSA index buffer, and `_prepare` runs none
+        self.csa = next(
+            (
+                m
+                for m in self.modules.values()
+                if getattr(m, "indexer", None) is not None
+                and hasattr(m, "_fill_csa_paged_compress")
+            ),
+            None,
+        )
 
     def _prepare(self, batch) -> None:
         """`batch` prepared by ATOM's runner as its forward prepares one, no
@@ -553,6 +573,8 @@ class Stub:
         input_ids = self.runner.prepare_model(batch)[0]
         self.runner._mark_staging_h2d_enqueued()
         fc, live = get_forward_context(), {"input_ids": input_ids, **self.topk}
+        if self.csa is not None:
+            self._top_k(fc, len(input_ids))
         for name, buffer in self.runner.forward_vars.items():
             live[name] = getattr(buffer, "gpu", buffer)
         for owner in (fc.attn_metadata, fc.context):
@@ -585,7 +607,7 @@ class Stub:
                     what, field = "metadata", path.split(".")[0]
                     if op["op"] == HCA_DECODE and field in work:
                         pool, what = {field: work[field]}, "HCA workspace"
-                    if wanted := V4_METADATA.get((op["op"], field)):
+                    if wanted := V4_METADATA.get((op["op"], _keyed(op["args"], path))):
                         what = wanted.format(ratio=ratio, kind=V4_KINDS.get(ratio))
                         pool = {what: named[what]} if what in named else {}
                     try:
@@ -605,6 +627,26 @@ class Stub:
         snap.attn_metadata = _deep(fc.attn_metadata, memo, self.clones)
         snap.context = _deep(fc.context, memo, self.clones)
         self.placed.append((snap, meta))
+
+    def _top_k(self, fc, tokens) -> None:
+        """The CSA top-k section of the placement's index buffer written as
+        ATOM's forward writes it, from top-k ids over the compressed rows each
+        of its `tokens` sees: every row when it sees no more than top-k, else
+        one drawn from each of top-k equal runs of them, seeded by `SEED` and
+        the placement."""
+        # ponytail: spread over the rows, ascending; the indexer picks where
+        # its scores fall, which no placement has
+        positions, k = fc.context.positions[:tokens], self.csa.indexer.index_topk
+        seen = (positions.long() + 1) // self.csa.compress_ratio
+        run = torch.arange(k, device=positions.device)
+        lo, hi = run * seen[:, None] // k, (run + 1) * seen[:, None] // k
+        seed = torch.Generator(positions.device)
+        seed.manual_seed(SEED * CALLS + len(self.placed))
+        draw = torch.rand(lo.shape, generator=seed, device=positions.device)
+        ids = torch.where(seen[:, None] > k, lo + (draw * (hi - lo)).long(), run)
+        self.csa._fill_csa_paged_compress(
+            fc.attn_metadata, ids.int(), fc.context.positions, tokens
+        )
 
     def point(self, rule, shape, context, found) -> list[dict]:
         """Each leaf of `found` timed at `shape` on `point_rows`, or every leaf
@@ -976,6 +1018,16 @@ def point_rows(shape, context, pool: int, block_size: int) -> list[list]:
 def _specs(args):
     """Each tensor argument in `args`, by its slot path."""
     return [(p, v) for p, v in _values(args) if isinstance(v, dict) and "role" in v]
+
+
+def _keyed(args, path) -> str:
+    """A slot path's argument, a dict argument's item `slot.i.1` named by its
+    key, `slot.<key>`."""
+    slot, *rest = path.split(".")
+    value = args.get(slot)
+    if rest and isinstance(value, dict) and value.get("object") == "builtins:dict":
+        return f"{slot}.{value['state'][int(rest[0])][0]}"
+    return slot
 
 
 def _values(args, path=""):

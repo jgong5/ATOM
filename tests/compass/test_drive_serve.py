@@ -407,3 +407,17 @@ def test_a_range_with_no_room_below_it_refuses_before_the_server_starts(
     with pytest.raises(serve.ServeError, match="fewer than 4 free ports .* 10003 "):
         serve.serve(ARGS, planted / "out", (7,))
     assert not (planted / "argv.json").exists()
+
+
+def test_no_port_a_server_draws_is_in_deploy_sh_s_range_or_mooncake_s(
+    tmp_path, monkeypatch
+):
+    """Mooncake's transfer engine draws each rank's RPC port from 15000 to
+    17000 while the model loads, before the server binds its port."""
+    (tmp_path / "range").write_text("60000\t60999\n")
+    monkeypatch.setattr(serve, "PORT_RANGE", tmp_path / "range")
+    mooncake, deploy = range(15000, 17001), serve.below_ephemeral(serve.DEPLOY_PORTS)
+
+    drawn = [p for _ in range(250) for p in serve._free_ports(4)]
+
+    assert not [p for p in drawn if p in mooncake or p in deploy]

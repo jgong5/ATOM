@@ -281,11 +281,33 @@ def test_a_group_step_prices_as_its_slowest_rank_against_the_group_s_time(tmp_pa
     assert total == pytest.approx(slowest, rel=1e-9)
     assert all(total > sum(_price(rows) for rows, _ in s) for s in ranks)
 
-    # Rank 1's step 10 lies outside the held-out hull, though rank 0 prices it.
+
+def test_a_group_step_is_validated_by_the_rank_it_is_priced_as(tmp_path):
+    # Step 10's cheaper rank 1 lies below the held-out hull; rank 0 prices it.
+    ranks = _two_ranks()
     ranks[1][10] = ([(1, 50, True)], 1)
     for r, steps in enumerate(ranks):
-        _record(tmp_path / "outside", steps, rank=r, group=ranks)
-    report = cost_accuracy(tmp_path / "outside", LAW)
+        _record(tmp_path / "cheaper", steps, rank=r, group=ranks)
+    report = cost_accuracy(tmp_path / "cheaper", LAW)
+    assert report["unvalidated"] == {}
+    assert report["validated"]["decode"]["steps"] == 10
+
+    # Now rank 1 prices step 10, above the hull.
+    ranks[1][10] = ([(1, 200_000, True)], 1)
+    for r, steps in enumerate(ranks):
+        _record(tmp_path / "costlier", steps, rank=r, group=ranks)
+    report = cost_accuracy(tmp_path / "costlier", LAW)
+    assert report["unvalidated"]["decode"]["steps"] == 1
+
+    # A law blind to padding prices both ranks of step 10 the same; the step
+    # is validated as rank 1, of more padding, outside the hull at padding 0.
+    law = json.loads(json.dumps(LAW))
+    law["decode"]["2"] = law["decode"]["1"]
+    ranks[0][10] = ([(1, 3000, True), (1, 3000, True)], 2)
+    ranks[1][10] = ([(1, 1000, True), (1, 5000, True)], 2)
+    for r, steps in enumerate(ranks):
+        _record(tmp_path / "tie", steps, rank=r, group=ranks)
+    report = cost_accuracy(tmp_path / "tie", law)
     assert report["unvalidated"]["decode"]["steps"] == 1
 
 
@@ -324,6 +346,12 @@ def test_a_peer_s_dummy_forward_is_priced_0_s_and_its_step_graded(tmp_path):
         assert s["real_s"] == pytest.approx(s["priced_s"], rel=1e-6)
     prefill = sum(_price(rows) for rows, _ in steps[:10])
     assert report["validated"]["prefill"]["priced_s"] == pytest.approx(prefill)
+
+    # Rank 1 ran dummies, and its last step was in flight: that step is cut.
+    stopped = [ranks[0], ranks[1][:-1]]
+    for r, s in enumerate(stopped):
+        _record(tmp_path / "stopped", s, rank=r, group=stopped)
+    assert cost_accuracy(tmp_path / "stopped", LAW)["cut"]["ranks"] == 1
 
 
 def test_a_group_step_is_banded_by_its_costliest_rank_not_rank_0(tmp_path):
