@@ -27,7 +27,8 @@ Each leaf is one pricing unit, `max(t0, F / peak, M / BW(M), t_comm)` over its
 work (`op_work.work`): its own tensors at the captured shape, the state it
 reads at the step's rows, attention's context in `kv`, the run's KV cache
 format, the routed experts over the run's `ep` ranks. A leaf that launches
-no kernel costs nothing. Regions compose by the
+no kernel costs nothing. A step prices each distinct leaf once, and a leaf
+whose work reads nothing of the step keeps its price. Regions compose by the
 IR's joins: a `Seq` adds its items in order, a `Repeat` re-emits its body's
 prices once per instance, a `max` `Par` emits its longest branch's prices, and a
 `resource_bound` `Par` one roofline over its branches' summed work. The price
@@ -74,6 +75,7 @@ whose collective leaves the scale-up domain.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 
@@ -96,6 +98,23 @@ TBO = "op.tbo"
 NONE = "; no successor: the analytical law is the last op-level source"
 #: The prefix of a drafter's terms.
 DRAFT = "draft "
+#: The leaves a backend keeps; past it, it forgets them all and every price
+#: it kept across steps.
+KEPT = 1 << 16
+#: A reference argument's keys: a context key or a module path, whose value a
+#: leaf's work does not read.
+REFS = ({"context"}, {"module"})
+
+
+class _Watched:
+    """A step's view that notes whether a leaf's work read anything of it."""
+
+    def __init__(self, view: BatchView) -> None:
+        self.view, self.read = view, False
+
+    def __getattr__(self, name: str):
+        self.read = True
+        return getattr(self.view, name)
 
 
 class _Roofline(CostSource):
@@ -185,6 +204,11 @@ class OpGraphBackend(CostBackend):
         self.drafts = drafts
         self.name = machine.values.get("name", "")
         self._stated_as: dict[str, str] = {}
+        # By leaf object: the leaf, what its work reads as text, and its price
+        # at a bound when its work read nothing of the step; by view, bound
+        # and that text: one step's prices.
+        self._kept: dict[int, list] = {}
+        self._step: dict[tuple, tuple] = {}
         self.resolver = price_list and Resolver([price_list, _Roofline(self)])
 
     @property
@@ -193,6 +217,7 @@ class OpGraphBackend(CostBackend):
 
     def price(self, batch_view: BatchView) -> StepCost:
         refused: list[Refusal] = []
+        self._step = {}
         if batch_view.tbo_tokens is None or batch_view.image_tokens:
             at, region = self._region(batch_view)
             bound = self.resolver and self._bound(batch_view)
@@ -407,6 +432,34 @@ class OpGraphBackend(CostBackend):
         return [(name, *unit, summed, comm, ((), ()))] if unit else []
 
     def _leaf(self, leaf: dict, view: BatchView, refused: list, bound):
+        """`_price_leaf`, once a step for each operator, arguments, outputs and
+        stated fields, all a leaf's work reads of it, and once for good for a
+        leaf object whose work read nothing of the step and nothing refused."""
+        kept = self._kept.get(id(leaf))
+        if kept is None:
+            if len(self._kept) >= KEPT:
+                self._kept.clear()
+            args = {
+                s: sorted(v) if isinstance(v, dict) and v.keys() in REFS else v
+                for s, v in leaf.get("args", {}).items()
+            }
+            what = [leaf["op"], args, leaf.get("out"), leaf.get("stated")]
+            text = json.dumps(what, sort_keys=True, default=repr)
+            kept = self._kept[id(leaf)] = [leaf, text, None]
+        if kept[2] and kept[2][0] == bound:
+            return kept[2][1]
+        # A step's refusals are named once, so a repeat need not add its own.
+        key = (id(view), bound, kept[1])
+        if key not in self._step:
+            n, watched = len(refused), _Watched(view)
+            got = self._price_leaf(leaf, watched, refused, bound)
+            self._step[key] = (view, got, not (watched.read or refused[n:]))
+        _, got, free = self._step[key]
+        if free:
+            kept[2] = (bound, got)
+        return got
+
+    def _price_leaf(self, leaf: dict, view, refused: list, bound):
         """One leaf's ``(term, seconds, stated, work, (methods, declined))`` as
         `_priced` lists it; None when it launches no kernel or refuses."""
         try:
