@@ -40,8 +40,9 @@ drafter writes its draft KV before `forward_done_event` and is refused.
 A decode of fewer rows than its width ran padded to that rung: its rows run
 the drafter's first pass, which takes the target's tokens unpadded, and the
 step continues at the rung past the cut; only its drafter's graph is kept. A
-prefill whose drafter's later passes pad past its rows (`Shape.width`) samples
-and continues at that width past the cut; only its drafter's graph is kept.
+prefill whose drafter's later passes pad past its rows (`Shape.width`) samples,
+or under DP is a middle chunk too, and continues at that width past the cut;
+only its drafter's graph is kept.
 """
 
 import contextlib
@@ -1175,12 +1176,12 @@ def capture(
             runner.allocate_kv_cache(max(KV_BLOCKS, blocks))
         # A prefill is traced as a middle chunk, which samples nothing, then as
         # a final one; a decode step always samples, as does a prefill whose
-        # drafter's later passes pad.
+        # drafter's later passes pad, except a DP middle chunk's.
         variants = [
             (shape, output)
             for shape in shapes
             for output in ((False, True) if shape.phase == "prefill" else (True,))
-            if output or not shape.width
+            if output or not shape.width or dp > 1
         ]
         # A population's prefill ran as one forward: this rank cannot split it.
         own = runner._local_tbo_eligibility

@@ -20,6 +20,7 @@ import pytest
 
 from atom.compass.clock import LpId, RefusalTally, single_engine_table
 from atom.compass.spec.tokenizers import Backend, table
+from atom.metrics.exporter import AtomMetricsExporter
 from atom.model_engine import llm_engine
 from atom.sampling_params import SamplingParams
 from atom.utils import clock
@@ -272,3 +273,33 @@ def test_an_unregistered_job_refuses_by_name_and_counts(loop, fn):
     record = RefusalTally.of(ex.refusals, steps=1).record()
     assert record["by_source"] == [["executor", 1]]
     assert record["reasons"] == [[f"executor:{fn.__qualname__}", 1]]
+
+
+def test_a_metrics_scrape_renders_on_the_station_at_its_arrival(loop):
+    # ATOM's `/metrics` handler renders through `asyncio.to_thread`.
+    ex, release = _executor(loop, width=1)
+    exporter = AtomMetricsExporter()
+
+    async def scrape():
+        await asyncio.sleep(0.5)
+        body = await exporter.render_async()
+        return body, loop.time()
+
+    try:
+        body, served = loop.run_until_complete(scrape())
+    finally:
+        release()
+    assert b"atom:metrics_last_refresh_timestamp_seconds" in body
+    assert served == pytest.approx(0.5)
+    assert ex.refusals == [] and len(ex.station.jobs) == 1
+
+
+def test_a_job_handed_to_a_thread_refuses_under_its_own_name(loop):
+    ex, release = _executor(loop, width=1)
+    try:
+        with pytest.raises(Refused) as refused:
+            loop.run_until_complete(asyncio.to_thread(_unregistered))
+    finally:
+        release()
+    assert refused.value.args[0] == ("executor", "_unregistered")
+    assert ex.refusals == ["executor:_unregistered"]
