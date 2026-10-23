@@ -278,8 +278,8 @@ def test_a_dp_middle_chunk_s_drafter_is_captured_with_its_later_pass_at_its_widt
     # Its first pass embeds the chunks' tokens, its second a row a sequence.
     for shape, width in ((rows, 3), (wide, 4)):
         embedded = [
-            op["args"]["x"]["shape"][0]
+            op["args"]["indices"]["shape"][0]
             for op in _ops(graphs[True, False, shape]["region"])
-            if op["op"] == "aiter.masked_embedding.default"
+            if op["op"] == "aten.embedding.default"
         ]
         assert embedded == [192, width]
