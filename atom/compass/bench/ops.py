@@ -21,7 +21,9 @@ rank each of the layout the arguments resolve (`ranks`), its parameters on the
 meta device and with no warmup (`_runner`): no forward of the model, its LM
 head or its sampler runs. Each point reaches the runner as a batch
 (`ReplayRule`) that `ModelRunner.prepare_model` prepares, so ATOM builds its
-metadata and forward context, and a `Stub` calls each leaf from its contract:
+metadata and forward context; for DeepSeek-V4, the CSA top-k section its
+forward writes is written from ids spread over each token's compressed rows
+(`Stub._top_k`). A `Stub` calls each leaf from its contract:
 an activation is random at its shape, dtype and stride, except a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
 experts' ids ATOM fuses into them (`_route`), and the `NM_OUTPUT` slot at
@@ -160,7 +162,7 @@ from atom.compass.drive.gpu import add_gpu_flag
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads or what a capture waits for change.
-PROTOCOL = 10
+PROTOCOL = 11
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -542,6 +544,17 @@ class Stub:
         )
         self.shared = self.topk.get("topk_ids")
         self.loads = []
+        # a DeepSeek-V4 CSA layer: its forward writes the top-k section of the
+        # CSA index buffer, and `_prepare` runs none
+        self.csa = next(
+            (
+                m
+                for m in self.modules.values()
+                if getattr(m, "indexer", None) is not None
+                and hasattr(m, "_fill_csa_paged_compress")
+            ),
+            None,
+        )
 
     def _prepare(self, batch) -> None:
         """`batch` prepared by ATOM's runner as its forward prepares one, no
@@ -553,6 +566,8 @@ class Stub:
         input_ids = self.runner.prepare_model(batch)[0]
         self.runner._mark_staging_h2d_enqueued()
         fc, live = get_forward_context(), {"input_ids": input_ids, **self.topk}
+        if self.csa is not None:
+            self._top_k(fc, len(input_ids))
         for name, buffer in self.runner.forward_vars.items():
             live[name] = getattr(buffer, "gpu", buffer)
         for owner in (fc.attn_metadata, fc.context):
@@ -605,6 +620,26 @@ class Stub:
         snap.attn_metadata = _deep(fc.attn_metadata, memo, self.clones)
         snap.context = _deep(fc.context, memo, self.clones)
         self.placed.append((snap, meta))
+
+    def _top_k(self, fc, tokens) -> None:
+        """The CSA top-k section of the placement's index buffer written as
+        ATOM's forward writes it, from top-k ids over the compressed rows each
+        of its `tokens` sees: every row when it sees no more than top-k, else
+        one drawn from each of top-k equal runs of them, seeded by `SEED` and
+        the placement."""
+        # ponytail: spread over the rows, ascending; the indexer picks where
+        # its scores fall, which no placement has
+        positions, k = fc.context.positions[:tokens], self.csa.indexer.index_topk
+        seen = (positions.long() + 1) // self.csa.compress_ratio
+        run = torch.arange(k, device=positions.device)
+        lo, hi = run * seen[:, None] // k, (run + 1) * seen[:, None] // k
+        seed = torch.Generator(positions.device)
+        seed.manual_seed(SEED * CALLS + len(self.placed))
+        draw = torch.rand(lo.shape, generator=seed, device=positions.device)
+        ids = torch.where(seen[:, None] > k, lo + (draw * (hi - lo)).long(), run)
+        self.csa._fill_csa_paged_compress(
+            fc.attn_metadata, ids.int(), fc.context.positions, tokens
+        )
 
     def point(self, rule, shape, context, found) -> list[dict]:
         """Each leaf of `found` timed at `shape` on `point_rows`, or every leaf
