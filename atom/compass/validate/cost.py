@@ -56,8 +56,8 @@ from atom.compass.backends import (
     step_labels,
     step_linear_fit,
 )
-from atom.compass.backends.json_file import read_json
-from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band, _groups
+from atom.compass.backends.json_file import read_json, read_jsonl
+from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band, _features
 from atom.compass.drive import aiter_jit
 
 WITHIN = 0.10
@@ -132,7 +132,10 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     them: a step is its ranks' lines of one step index, measured as the
     smallest rank label and priced and banded as its costliest rank's batch, a
     term validated only if every rank's is; a step the law refuses is banded as
-    its rank of most tokens. Its draft is measured and priced the same way. A step some rank lacks or cut, or whose
+    its rank of most tokens. Its draft is measured and priced the same way. A
+    rank that ran the step as a dummy forward is priced 0 s: the step is
+    measured, priced and banded by the ranks that ran a forward. A step some
+    rank lacks otherwise or cut, or whose
     ranks fall to different vectors, is counted under `cut.ranks`. Ranks whose
     records differ in length by more than the one step a stopped run leaves on
     some ranks only are refused.
@@ -142,7 +145,8 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     if run.is_file() and (built := aiter_jit.refusal(read_json(run))):
         raise ValueError(f"{record} is not costed: {built}")
     ranks = sorted(Path(record).glob("dp*[0-9].jsonl"))
-    lines = {r.name: len(r.read_text().splitlines()) for r in ranks}
+    records = [read_jsonl(r) for r in ranks]
+    lines = {r.name: len(x) for r, x in zip(ranks, records)}
     if not ranks or max(lines.values()) - min(lines.values()) > 1:
         raise ValueError(
             f"{record} holds rank records of {lines} lines; one run's ranks "
@@ -152,7 +156,22 @@ def cost_accuracy(record, backend, steps=None) -> dict:
         [s for s in step_labels.label(r)[0] if steps is None or s.step in steps]
         for r in ranks
     ]
-    joined, cut, _ = _groups(run, "base")
+    dummies = [{s["step"] for s in x if s["is_dummy_run"]} for x in records]
+    got = [_features(rank, "base", len(run)) for rank in run]
+    cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
+    rows = [{r[3]: r for r in mine} for mine, _ in got]
+    joined = []
+    if len(run) > 1:
+        cut["ranks"] = 0
+    for step in sorted(set().union(*rows)):
+        # A rank's dummy forward joins its step priced 0 s, so adds no row.
+        group = {i: rank[step] for i, rank in enumerate(rows) if step in rank}
+        ran = len(group) + sum(step in d for d in dummies)
+        if ran < len(rows) or len({r[0] for r in group.values()}) > 1:
+            cut["ranks"] += 1
+            continue
+        label = min(r[2] for r in group.values())
+        joined.append({i: (*r[:2], label, *r[3:]) for i, r in group.items()})
     views = [{s.step: s.view for s in rank} for rank in run]
     drafts = [{s.step: s.draft_s for s in rank} for rank in run]
     law = backend if isinstance(backend, Mapping) else None
@@ -162,11 +181,11 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     declined: dict[str, dict] = {}
     warm, priced, extrapolated = [], [], 0
     for group in joined:
-        key, _, seconds, step, _ = group[0]
+        key, _, seconds, step, _ = next(iter(group.values()))
         try:
-            costs = [backend.price(views[i][step]) for i in range(len(group))]
+            costs = {i: backend.price(views[i][step]) for i in group}
         except CostRefused as refused:
-            band = _band(key, max((r[1] for r in group), key=lambda c: c[1]))
+            band = _band(key, max((r[1] for r in group.values()), key=lambda c: c[1]))
             r = declined.setdefault(
                 band, {"steps": 0, "real_s": 0.0, "reasons": Counter()}
             )
@@ -175,12 +194,12 @@ def cost_accuracy(record, backend, steps=None) -> dict:
             why = "; ".join(f"{d.source}: {d.reason}" for d in refused.declined)
             r["reasons"][why] += 1
             continue
-        terms = [t for c in costs for t in c.terms if not t.draft]
+        terms = [t for c in costs.values() for t in c.terms if not t.draft]
         validated = all(t.provenance.validated for t in terms)
         extrapolated += any(t.provenance.extrapolated for t in terms)
-        top = max(range(len(costs)), key=lambda i: costs[i].target_seconds)
+        top = max(costs, key=lambda i: costs[i].target_seconds)
         band, price = _band(key, group[top][1]), costs[top].target_seconds
-        labels = [d[step] for d in drafts]
+        labels = [drafts[i][step] for i in group]
         draft = None
         if None not in labels:
             mine = [t.provenance.validated for t in costs[top].terms if t.draft]

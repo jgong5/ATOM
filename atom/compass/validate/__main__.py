@@ -18,6 +18,13 @@ extrapolated and priced by a fallback, shares and speed, from its first client r
 summary when it has one. Any refusal makes a
 `cctraces_sim.sh` cell a coverage report; the shares grade nothing, and neither do the
 counts but preemptions and prefill tokens.
+
+A run `deploy.sh` wrote, a deployment, holds `prefill/` and `decode/` with its client's
+export beside them: its warmup, cost and memory rows are per side (`cost real0 prefill`),
+each side costed at the law fitted under its engine config and checked against its
+engine's hand-in, `lp-engine-P.json` or `lp-engine-D.json`, at DP width above 1
+each rank's (`lp-engine-P.dp0.json`, a row per rank); `validate.runs` grades its
+schedule per side, its end to end once.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ from atom.compass.backends.step_linear_fit import TOKEN_BANDS, token_band
 from atom.compass.memory.check import MemoryRefusal, parts
 from atom.compass.run import (
     CLIENT_DIR,
+    ENGINE,
     LP_FILE,
     STEP_GRID,
     STEP_LINEAR,
@@ -47,6 +55,8 @@ from atom.compass.validate import cost, runs
 BANDS = [token_band(edge) for edge in (0, *TOKEN_BANDS)]
 HULL = {"validated": ("validated", "-"), "unvalidated": ("unvalidated", "not gated")}
 GATED_COUNTS = {"preemptions", "prefill tokens"}
+#: A deployment side's engine LP, whose hand-in its memory is checked against.
+HAND_IN = {"prefill": "engine-P", "decode": "engine-D"}
 
 
 def _ttft(run: Path) -> dict[str, float]:
@@ -63,7 +73,7 @@ def _ttft(run: Path) -> dict[str, float]:
 def _graded(family: str, name: str, g: dict) -> tuple:
     result = " ".join(f"{r:.4g}" for r in g["result"])
     value, verdict = f"spread {g['spread']:.4g}; result {result}", g["verdict"]
-    if family == "counts" and name not in GATED_COUNTS:
+    if family.split()[0] == "counts" and name not in GATED_COUNTS:
         verdict += ", not gated"
     return family, name, value, verdict
 
@@ -84,16 +94,16 @@ def _runs(real: list[Path], sim: Path):
             yield _graded("end to end", name, g)
 
 
-def _warmup(run: Path, warmup: dict | None):
+def _warmup(name: str, warmup: dict | None):
     if warmup is not None:  # None: a run graded whole
         value = f"requests {warmup['requests']}, steps {warmup['steps']}"
-        yield f"warmup {run.name}", "warmup", value, "not graded"
+        yield f"warmup {name}", "warmup", value, "not graded"
 
 
-def _cost(run: Path, backend, steps: list[dict]):
+def _cost(name: str, run: Path, backend, steps: list[dict]):
     numbers = {s["step"] for s in steps}
     report = cost.cost_accuracy(run / "steps", backend, numbers)
-    where = f"cost {run.name}"
+    where = f"cost {name}"
     for group, (hull, gated) in HULL.items():
         for kind, s in report[group].items():
             held = "-" if s["held_out"] is None else f"{s['held_out']:+.2%}"
@@ -113,12 +123,18 @@ def _cost(run: Path, backend, steps: list[dict]):
     yield where, "extrapolated", f"{report['extrapolated']} steps", "-"
 
 
-def _memory(sim: Path, real: Path):
-    where = f"memory {real.name}"
+def _memory(name: str, sim: Path, engine: str, real: Path):
+    """`real`'s memory against `engine`'s hand-in in `sim`, per rank at DP width
+    above 1, where each rank hands in as `<engine>.dp<r>`."""
+    ranks = sorted(sim.glob(LP_FILE.format(f"{engine}.dp*")))
+    for hand_in in ranks or [sim / LP_FILE.format(engine)]:
+        rank = f" {hand_in.stem.rsplit('.', 1)[1]}" if ranks else ""
+        yield from _checked(f"memory {name}{rank}", hand_in, real, len(ranks) or 1)
+
+
+def _checked(where: str, hand_in: Path, real: Path, ranks: int):
     try:
-        comparison, *_, graph = parts(
-            sim / LP_FILE.format("engine"), real / "server.log"
-        )
+        comparison, *_, graph = parts(hand_in, real / "server.log", ranks)
     except MemoryRefusal as e:
         yield where, "memory", e.what, "refused"
         return
@@ -215,12 +231,20 @@ def rows(cell) -> list[tuple]:
     out = [("cell", "verdict", f"{len(real)} real runs", verdict)]
     out += _runs(real, sim)
     grid = _grid(sim, run[STEP_GRID], summary) if sim.name == STEP_GRID else None
+    # A deployment's runs per side, each at its law and against its engine's hand-in.
     for r in real:
-        backend = grid or _law(run[STEP_LINEAR].get("run_file", run[STEP_LINEAR]), r)
-        steps, _traces, warmup = runs.graded(r)
-        out += [*_warmup(r, warmup), *_cost(r, backend, steps)]
-        out += _memory(sim, r)
-    out += [*_warmup(sim, runs.graded(sim)[2]), *_summary(sim, summary)]
+        for side in runs.sides(r):
+            name = " ".join(side.relative_to(cell).parts)
+            backend = grid or _law(
+                run[STEP_LINEAR].get("run_file", run[STEP_LINEAR]), side
+            )
+            steps, _traces, warmup = runs.graded(side, r)
+            out += [*_warmup(name, warmup), *_cost(name, side, backend, steps)]
+            out += _memory(name, sim, HAND_IN.get(side.name, ENGINE.name), side)
+    for side in runs.sides(sim):
+        name = " ".join(side.relative_to(cell).parts)
+        out += _warmup(name, runs.graded(side, sim)[2])
+    out += _summary(sim, summary)
     return out
 
 

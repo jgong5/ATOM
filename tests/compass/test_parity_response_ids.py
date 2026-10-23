@@ -9,23 +9,25 @@ simulated runner from the sequences the engine core received.
 """
 
 import asyncio
+import itertools
 import json
 import pickle
 import queue
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from test_parity_record import BLOCK, _config, _key, _prompt, _Runner
 
 from atom.compass import run
-from atom.compass.parity import ENV, compare, read
+from atom.compass.parity import ENV, TRANSFERS, compare, read, transfers
 from atom.compass.parity.served import served
 from atom.compass.validate.runs import _requests
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import CompletionRequest
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
-from atom.model_engine.scheduler import Scheduler
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.scheduler import ScheduledBatch, Scheduler
+from atom.model_engine.sequence import Sequence, SequenceType
 
 SAMPLING = {"temperature": 0.0, "top_p": 1.0}
 
@@ -36,8 +38,9 @@ def engine(monkeypatch):
     for cls in (CoreManager, DisaggCoreManager):  # ATOM's back after the test
         monkeypatch.setattr(cls, "add_request", cls.add_request)
 
-    def preprocess(tokens, sampling_params, stream_callback=None, **_kwargs):
-        seq = Sequence(list(tokens), BLOCK, sampling_params)
+    def preprocess(tokens, sampling_params, stream_callback=None, **kwargs):
+        params = kwargs.get("kv_transfer_params")
+        seq = Sequence(list(tokens), BLOCK, sampling_params, kv_transfer_params=params)
         stream_callback(
             SimpleNamespace(output_tokens=[5], finished=True, finish_reason="length")
         )
@@ -180,7 +183,183 @@ def test_a_record_written_before_response_ids_reads_as_it_did(tmp_path):
     assert [s["batch"] for s in old] == [[["k1", 8, 8]], [["k1", 1, 9]]]
     assert "response_ids" not in old[0] and "response_ids" not in old[1]
     assert new[0].pop("response_ids") == {"k1": "cmpl-a"}
+    assert new[0].pop("request_ids") == {"k1": 1}
     assert new == old
     assert compare(tmp_path / "old", tmp_path / "new")["first_divergence"] == {0: None}
     steps = [json.loads(x) for x in (tmp_path / "new" / "dp0.jsonl").open()]
     assert _requests(steps) == {(8, 0): 8}
+
+
+def _complete_decode(tokens, transfer_id, remote_dp_rank) -> str:
+    """Send one completion request as the router sends decode its half; its response `id`."""
+    params = {"transfer_id": transfer_id, "remote_dp_rank": remote_dp_rank}
+    request = CompletionRequest(
+        model="m",
+        prompt_token_ids=tokens,
+        max_tokens=3,
+        ignore_eos=True,
+        kv_transfer_params=params,
+        **SAMPLING,
+    )
+    response = asyncio.run(api_server.completions(request, None))
+    return json.loads(response.body)["id"]
+
+
+def _two_sides(engine, monkeypatch, tmp_path, n=4):
+    """A planted 1P1D deployment's records: prefill's driven by ATOM's scheduler,
+    decode's by decode batches of the sequences its API server received, each
+    request handed `transfer_id`, its prefill sequence's id, as ATOM's connector
+    hands it. Returns prefill's and decode's response ids, by prompt."""
+    added = {cls: cls.add_request for cls in (CoreManager, DisaggCoreManager)}
+    _frontend(monkeypatch, tmp_path / "prefill")
+    prefill_ids = [_complete(_prompt(i)) for i in range(n)]
+    received = [seq for seqs in engine.sent for seq in seqs]
+    config = _config()
+    scheduler, runner = Scheduler(config), _Runner(config)
+    for seq in received:
+        scheduler.add(seq)
+    while scheduler.has_unfinished_requests():
+        scheduled = scheduler.schedule()
+        if scheduled is None or scheduled[0] is None or not scheduled[0].req_ids:
+            continue
+        batch, seqs = scheduled
+        scheduler.postprocess(
+            list(seqs.values()),
+            runner.forward(batch),
+            stream_output_queue=queue.Queue(),
+            batch=batch,
+        )
+
+    for cls, add in added.items():  # each side is its own server process
+        monkeypatch.setattr(cls, "add_request", add)
+    (tmp_path / "decode").mkdir()
+    (tmp_path / "decode" / TRANSFERS).write_text('{"stale": 1}\n')
+    engine.sent.clear()
+    _frontend(monkeypatch, tmp_path / "decode")
+    # The prefill rank is 1 here, so the join is keyed by the rank as well.
+    decode_ids = [_complete_decode(_prompt(i), s.id, 1) for i, s in enumerate(received)]
+    seqs = {s.id: s for sent in engine.sent for s in sent}
+    for seq in seqs.values():
+        seq.type = SequenceType.DECODE
+    runner = _Runner(_config())
+    for _ in range(2):
+        runner.forward(
+            ScheduledBatch(
+                seqs=seqs,
+                num_scheduled_tokens=np.ones(n, dtype=np.int32),
+                total_tokens_num=n,
+                total_tokens_num_decode=n,
+                total_seqs_num=n,
+                total_seqs_num_decode=n,
+            )
+        )
+    return received, prefill_ids, list(seqs), decode_ids
+
+
+def test_a_decode_instance_names_each_request_at_its_first_step_with_its_response_id(
+    engine, monkeypatch, tmp_path
+):
+    _, _, decode_seqs, decode_ids = _two_sides(engine, monkeypatch, tmp_path)
+    first, second = read(tmp_path / "decode")[0]
+
+    assert first["response_ids"] == dict(zip(decode_seqs, decode_ids))
+    assert first["request_ids"] == {i: i for i in decode_seqs}
+    assert [row[0] for row in second["batch"]] == decode_seqs
+    assert "response_ids" not in second and "request_ids" not in second
+    export = {rid: {"trace": "t", "sampling": SAMPLING} for rid in decode_ids}
+    assert [s["client_run"] for s in served(tmp_path / "decode", [export])[0]] == [0, 0]
+
+
+def test_a_decode_instance_writes_each_request_s_transfer_and_prefill_none(
+    engine, monkeypatch, tmp_path
+):
+    received, _, _, decode_ids = _two_sides(engine, monkeypatch, tmp_path)
+
+    joined = {(1, s.id): rid for s, rid in zip(received, decode_ids)}
+    assert transfers(tmp_path / "decode") == joined
+    assert transfers(tmp_path / "prefill") == {}
+    assert not (tmp_path / "prefill" / TRANSFERS).exists()
+
+
+def test_a_transfer_without_a_prefill_rank_is_on_prefill_rank_0(
+    engine, monkeypatch, tmp_path
+):
+    _frontend(monkeypatch, tmp_path)
+    request = CompletionRequest(
+        model="m",
+        prompt_token_ids=_prompt(0),
+        max_tokens=3,
+        kv_transfer_params={"transfer_id": 7},
+        **SAMPLING,
+    )
+    rid = json.loads(asyncio.run(api_server.completions(request, None)).body)["id"]
+
+    assert transfers(tmp_path) == {(0, 7): rid}
+
+
+def test_every_prefill_request_joins_the_decode_request_that_names_it(
+    engine, monkeypatch, tmp_path
+):
+    received, prefill_ids, decode_seqs, decode_ids = _two_sides(
+        engine, monkeypatch, tmp_path
+    )
+    prefill = read(tmp_path / "prefill")[0]
+    decode = read(tmp_path / "decode")[0]
+    joined = transfers(tmp_path / "decode")
+
+    by_key = {k: v for s in prefill for k, v in s.get("request_ids", {}).items()}
+    assert by_key == {_key(_prompt(i)): s.id for i, s in enumerate(received)}
+    named = {k: v for s in prefill for k, v in s.get("response_ids", {}).items()}
+    assert named == {_key(_prompt(i)): rid for i, rid in enumerate(prefill_ids)}
+    decode_key = {v: k for s in decode for k, v in s.get("response_ids", {}).items()}
+    assert {k: decode_key[joined[(1, i)]] for k, i in by_key.items()} == {
+        _key(_prompt(i)): seq for i, seq in enumerate(decode_seqs)
+    }
+    assert {r[0] for s in decode for r in s["batch"]} == set(decode_seqs)
+    assert set(decode_key) == set(decode_ids)
+
+
+@pytest.mark.parametrize("batches", ["rapidserve-prefill", "decode"])
+def test_two_runs_of_a_workload_with_no_final_chunk_marked_compare_identical(
+    engine, monkeypatch, tmp_path, batches
+):
+    added = {cls: cls.add_request for cls in (CoreManager, DisaggCoreManager)}
+
+    def record(directory, n=3):
+        """One server process's record: a fresh sequence counter, n requests,
+        then RapidServe's PrefillScheduler batch or two decode batches."""
+        monkeypatch.setattr(Sequence, "counter", itertools.count())
+        for cls, add in added.items():
+            monkeypatch.setattr(cls, "add_request", add)
+        engine.sent.clear()
+        _frontend(monkeypatch, directory)
+        for i in range(n):
+            if batches == "decode":
+                _complete_decode(_prompt(i), i, 0)
+            else:
+                _complete(_prompt(i))
+        seqs = {s.id: s for sent in engine.sent for s in sent}
+        prefill = batches == "rapidserve-prefill"
+        lens = [s.num_tokens if prefill else 1 for s in seqs.values()]
+        for s in seqs.values():
+            s.type = SequenceType.PREFILL if prefill else SequenceType.DECODE
+        kind = "prefill" if prefill else "decode"
+        runner = _Runner(_config())
+        for _ in range(1 if prefill else 2):
+            runner.forward(
+                ScheduledBatch(
+                    seqs=seqs,
+                    num_scheduled_tokens=np.array(lens, dtype=np.int32),
+                    total_tokens_num=sum(lens),
+                    total_seqs_num=n,
+                    **{f"total_tokens_num_{kind}": sum(lens)},
+                    **{f"total_seqs_num_{kind}": n},
+                )
+            )
+
+    record(tmp_path / "real")
+    record(tmp_path / "sim")
+    report = compare(tmp_path / "real", tmp_path / "sim")
+
+    assert report["first_divergence"] == {0: None}
+    assert report["steps"][0]["identical"] == (1 if batches != "decode" else 2)

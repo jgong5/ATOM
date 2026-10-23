@@ -60,6 +60,7 @@ def _steps():
 def _record(directory, steps, stretch=None, idle_after=(), rank=0, group=None):
     """Write `steps` as rank `rank`'s record. A step in `idle_after` shares no request with the next.
     With `group`, every rank's steps, a step runs for the most any rank's batch costs.
+    A step whose rows are None is a dummy forward, as ATOM records one.
     """
     directory.mkdir(exist_ok=True)
     stretch = stretch or {}
@@ -67,18 +68,19 @@ def _record(directory, steps, stretch=None, idle_after=(), rank=0, group=None):
     for i, (rows, rung) in enumerate(steps):
         if i - 1 in idle_after:
             owner += 1
-        at = [g[i][0] for g in group or [steps] if i < len(g)]
+        at = [g[i][0] for g in group or [steps] if i < len(g) and g[i][0]]
+        dummy = rows is None
         busy = round(max(map(_price, at)) * stretch.get(i, 1.0) * 1e9)
         lines.append(
             {
                 "step": i,
                 "dp_rank": rank,
                 "moe_rows": sum(q for r in at for q, _, _ in r),
-                "is_dummy_run": False,
+                "is_dummy_run": dummy,
                 "produces_output": True,
-                "batch": [[owner, q, n] for q, n, _ in rows],
+                "batch": [] if dummy else [[owner, q, n] for q, n, _ in rows],
                 "named": [],
-                "rows": [list(r) for r in rows],
+                "rows": [[1, 1, True]] if dummy else [list(r) for r in rows],
                 "rung": rung,
                 "t_enter_ns": t,
                 "t_launch_ns": [t, t],
@@ -303,6 +305,25 @@ def test_ranks_differing_by_more_than_a_trailing_step_refuse_naming_their_length
         _record(tmp_path / "apart", steps, rank=r, group=apart)
     with pytest.raises(ValueError, match=r"'dp0.jsonl': 20, 'dp1.jsonl': 18"):
         cost_accuracy(tmp_path / "apart", LAW)
+
+
+def test_a_peer_s_dummy_forward_is_priced_0_s_and_its_step_graded(tmp_path):
+    # Rank 1 runs dummies beside rank 0's prefill chunks (eager, no rung) and
+    # its first five decode steps (replaying rung 1), then decodes beside it.
+    steps = _steps()
+    ranks = [steps, [(None, None)] * 10 + [(None, 1)] * 5 + steps[15:]]
+    for r, s in enumerate(ranks):
+        _record(tmp_path / "steps", s, rank=r, group=ranks)
+    report = cost_accuracy(tmp_path / "steps", LAW)
+
+    assert report["cut"] == {"exposed": 0, "mixed": 0, "unsplit": 0, "ranks": 0}
+    assert report["unvalidated"] == {} and report["refused"] == {}
+    for kind in ("prefill", "decode"):
+        s = report["validated"][kind]
+        assert s["steps"] == 10
+        assert s["real_s"] == pytest.approx(s["priced_s"], rel=1e-6)
+    prefill = sum(_price(rows) for rows, _ in steps[:10])
+    assert report["validated"]["prefill"]["priced_s"] == pytest.approx(prefill)
 
 
 def test_a_group_step_is_banded_by_its_costliest_rank_not_rank_0(tmp_path):
