@@ -16,6 +16,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from test_fit_ops import measured  # noqa: F401, a fixture
 from test_memory_check import GIB, _log
@@ -782,9 +783,16 @@ def test_an_op_graph_cell_grades_with_its_method_shares_term_gaps_and_warm_over_
         assert gated == "not gated"
         assert rows[where, "prefill by method"][0].endswith(": analytical 100.0%")
         # One op kind, its listed and roofline terms together: the composed step.
-        on_totals = rows[where, f"decode {GEMM} over measured"][0].split(";")[0]
+        on_totals, per_step = rows[where, f"decode {GEMM} over measured"][0].split(";")
         error = float(rows[where, "decode validated"][0].split()[10].rstrip("%,"))
         assert float(on_totals.split()[-1]) == pytest.approx(1 + error / 100, abs=1e-3)
+        # Each decode step's composed seconds over its own measured ones.
+        real_s = [0.02 + 1e-7 * (2000 + 5000 * i) for i in range(10)]
+        ratios = [(0.02 + analytical) / s for s in real_s]
+        expected = np.percentile(ratios, (10, 50, 90))
+        assert [float(x) for x in per_step.split()[3::2]] == pytest.approx(
+            expected, abs=1e-3
+        )
         assert rows[where, "decode validated"][0].startswith("10 steps")
         reason = "op-graph: no op_graph holds a prefill step of 190 tokens over 1 sequences gathering 190 rows; compass trace ops captures one"
         value = rows[where, "refused prefill tokens 0-512"][0]
@@ -794,3 +802,9 @@ def test_an_op_graph_cell_grades_with_its_method_shares_term_gaps_and_warm_over_
         "not gated",
     ]
     assert rows["warm over cold", ATTENTION][0] == "0 of 1 points timed warm"
+    # A run file that composes the step roofline below the graph falls back.
+    run["run_file"]["step_roofline"] = True
+    (sim / "run.json").write_text(json.dumps(run))
+    rows = _graded(capsys, cell)
+    assert rows["cost real0", "fallback prefill tokens 0-512"][0] == value
+    assert ("cost real0", "refused prefill tokens 0-512") not in rows
