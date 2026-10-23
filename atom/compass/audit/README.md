@@ -71,9 +71,8 @@ waits that close a run (K9). Reading the whole tree brought in the rest of
 `atom/utils/`, `atom/metrics/`, `atom/spec_decode/`, `atom/rollout/`,
 `atom/config.py` and Compass's parity tools, among them the parity traffic LP's
 wait for its own reader thread (K6). The `/metrics` render the frontend hands
-to `asyncio.to_thread` is K1, a job on the frontend's executor station that a
-simulated run refuses at the hand-off, since no service time is modelled for
-it. Narrowing the offload exclusion to the backends a simulated run refuses
+to `asyncio.to_thread` is K1, a job on the frontend's executor station charged
+no service time. Narrowing the offload exclusion to the backends a simulated run refuses
 brought in `lmcache_mp` and the chunked offload scheduler it builds on: the
 LOOKUP sent ahead of admission (K4), a blocking lookup's poll loop (K3), the
 step loop's looks at a reply the client's own thread delivers (K6), and the
