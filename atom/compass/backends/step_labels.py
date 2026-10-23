@@ -95,6 +95,8 @@ class Sample:
     `provenance` holds `source`, `run` (the run's digest), `requests` (the
     request ids the step served) and `config` (the host key the record states,
     or None).
+    `dummies` holds the steps its rank ran as a DP dummy forward, which give no
+    sample: the same set on each of the rank's samples.
     """
 
     step: int
@@ -107,6 +109,7 @@ class Sample:
     provenance: dict
     draft_s: float | None = None
     propose_s: float | None = None
+    dummies: frozenset = frozenset()
 
 
 def digest(record) -> str:
@@ -182,6 +185,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
     if (pulls := path.with_suffix(".pulls.jsonl")).exists():
         join_stamps(lines, pulls)
     steps = [s for s in lines if not s["is_dummy_run"]]
+    dummies = frozenset(s["step"] for s in lines if s["is_dummy_run"])
     if not steps or "t_enter_ns" not in steps[0]:
         raise ValueError(
             f"{record} has no timed steps; a fit needs a real run's record"
@@ -258,6 +262,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
                 provenance,
                 None if cut else draft,
                 None if cut or propose is None else propose * 1e-9,
+                dummies,
             )
         )
         gap_ns = s.get("d_gap_ns")
