@@ -86,7 +86,7 @@ def _priced_here(monkeypatch):
         speculative_config=None,
         parallel_config=SimpleNamespace(data_parallel_size=1),
     )
-    tree = SimpleNamespace(modules=lambda: [])
+    tree = SimpleNamespace(modules=list)
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
     monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree: STACK)
     monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: graph)
