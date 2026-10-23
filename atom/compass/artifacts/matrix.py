@@ -79,6 +79,7 @@ class Row(enum.Enum):
     HOST_LAWS = "host_laws"
     STEP_GRID_BUNDLE = "step grid bundle"
     SHAPE_POPULATION = "shape_population"
+    PROJECTION = "projection"
 
     @property
     def field(self) -> str:
@@ -213,6 +214,16 @@ MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
         Axis.HOST_CPU: INDEPENDENT,
         Axis.ENGINE_CONFIG: DEPENDS,
     },
+    Row.PROJECTION: {
+        Axis.SOFTWARE_STACK: Cell(False, "analytical: no kernel timed"),
+        Axis.TORCH: Cell(True, "op_graph capture"),
+        Axis.ATOM_SRC: DEPENDS,
+        Axis.MODEL: DEPENDS,
+        Axis.DEVICE: Cell(False, "the spec priced is in the key"),
+        Axis.PTL: INDEPENDENT,
+        Axis.HOST_CPU: INDEPENDENT,
+        Axis.ENGINE_CONFIG: DEPENDS,
+    },
 }
 
 #: Which rows decide a kind's validity. `machine_spec` is its capacity and
@@ -229,6 +240,7 @@ ROWS_OF: Mapping[Kind, tuple[Row, ...]] = {
     Kind.HOST_LAWS: (Row.HOST_LAWS,),
     Kind.STEP_GRID_BUNDLE: (Row.STEP_GRID_BUNDLE,),
     Kind.SHAPE_POPULATION: (Row.SHAPE_POPULATION,),
+    Kind.PROJECTION: (Row.PROJECTION,),
 }
 
 
