@@ -43,7 +43,7 @@ import os
 from pathlib import Path
 
 from atom.compass.backends.step_grid_plan import TARGET
-from atom.compass.backends.step_labels import label, write_table
+from atom.compass.backends.step_labels import label_run, write_table
 from atom.compass.cli import OPS
 from atom.compass.drive import aiter_jit, serve
 from atom.compass.drive.gpu import add_gpu_flag
@@ -101,11 +101,8 @@ def write_engine_and_costs(out) -> None:
     records = sorted(
         (out / serve.STEPS).glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:])
     )
-    for record in records:
-        # A DP rank no request reached ran only the dummy forwards DP needs.
-        lines = [json.loads(line) for line in record.read_text().splitlines()]
-        idle = all(line["is_dummy_run"] for line in lines)
-        write_table(record, [] if idle else label(record)[1])
+    for record, (_, table) in zip(records, label_run(records)):
+        write_table(record, table)
     engines = {}
     for record in records:
         engine = json.loads(record.with_suffix(".engine.json").read_text())

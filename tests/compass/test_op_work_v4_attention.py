@@ -289,3 +289,25 @@ def test_a_gfx1250_kernel_prices_as_its_gfx950_sibling(kind, sibling, args):
     )
 
     assert gfx1250 == gfx950
+
+
+def test_the_asm_kernel_launched_alone_reads_what_its_wrapper_reads():
+    nm = decode(window_size=4, compress_ratio=4, index_topk=16)
+    args = nm["args"]
+    asm = leaf(
+        "aiter.mla_decode_v4_asm.default",
+        [],
+        Q=args["q"],
+        qrope=args["qrope"],
+        KV=args["kv_buffer"],
+        kvrope=args["kvrope"],
+        kv_indptr=args["kv_indptr"],
+        kv_page_indices=args["kv_page_indices"],
+        sink=args["sink"],
+        output=args["output"],
+        num_kv_splits=1,
+    ) | {"stated": nm["stated"]}
+
+    # At the rows' own pass and at a drafter's later pass alike.
+    for view in (rows((1, 9), (1, 300)), rows((3, 9), (3, 300))):
+        assert work(asm, view, 1, "fp8") == work(nm, view, 1, "fp8")

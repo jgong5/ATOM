@@ -15,7 +15,8 @@ in a run `record` or `run` wrote and in a `cctraces_sim.sh` run holding
 uncached prompt tokens graded alike; per such run, its warmup: how many requests
 its export names as such and how many steps hold only those; `validate.cost` on the
 steps graded (with the steps it leaves out, declines with their most frequent
-reasons, or extrapolates) and `memory.check` per real run; and the simulated run's refusals by source, its steps
+reasons, or extrapolates), its graded rows gated and its validated, unvalidated
+and declared rows not, and `memory.check` per real run; and the simulated run's refusals by source, its steps
 extrapolated and priced by a fallback, shares and speed, from its first client run's
 summary when it has one. An `op_graph/` cell's cost rows also give, per phase,
 the priced seconds by method and each op kind's seconds over the measured ones,
@@ -62,7 +63,13 @@ from atom.compass.run.step_grid import keyed_of, read
 from atom.compass.validate import cost, runs
 
 BANDS = [token_band(edge) for edge in (0, *TOKEN_BANDS)]
-HULL = {"validated": ("validated", "-"), "unvalidated": ("unvalidated", "not gated")}
+#: Cost rows' verdict per report group: the graded ones carry the gate.
+GATED = {
+    "graded": "-",
+    "validated": "not gated",
+    "unvalidated": "not gated",
+    "declared": "not gated",
+}
 GATED_COUNTS = {"preemptions", "prefill tokens"}
 #: A deployment side's engine LP, whose hand-in its memory is checked against.
 HAND_IN = {"prefill": "engine-P", "decode": "engine-D"}
@@ -120,7 +127,7 @@ def _cost(name: str, run: Path, backend, steps: list[dict], fallback, op=False):
         for term, t in report["terms"][kind].items():
             value = f"on totals {t['on_totals']:.3f}; per step p10 {t['p10']:.3f} p50 {t['p50']:.3f} p90 {t['p90']:.3f}"
             yield where, f"{kind} {term} over measured", value, "not gated"
-    for group, (hull, gated) in HULL.items():
+    for group, gated in GATED.items():
         for kind, s in report[group].items():
             held = "-" if s["held_out"] is None else f"{s['held_out']:+.2%}"
             value = (
@@ -128,10 +135,10 @@ def _cost(name: str, run: Path, backend, steps: list[dict], fallback, op=False):
                 f" on totals {s['on_totals']:+.2%}, holding out step {s['held_out_step']} {held},"
                 f" median {s['median']:+.2%}"
             )
-            yield where, f"{kind} {hull}", value, gated
+            yield where, f"{kind} {group}", value, gated
             for band, b in s["bands"].items():
                 value = f"{b['steps']} steps; p10 {b['p10']:+.1%} p50 {b['p50']:+.1%} p90 {b['p90']:+.1%}"
-                yield where, f"{band} {hull}", f"{value}; within 10% {b['within_10pct']:.1%}", gated
+                yield where, f"{band} {group}", f"{value}; within 10% {b['within_10pct']:.1%}", gated
     yield where, "left out", f"not labelled {json.dumps(report['cut'])}; warm steps, real s { {w['step']: round(w['real_s'], 2) for w in report['warm']} }", "-"
     for kind in ("fallback", "refused"):
         for band, r in report[kind].items():

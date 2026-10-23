@@ -27,13 +27,14 @@ from test_parity_record import _unpriced  # noqa: F401  an autouse fixture
 
 from atom.compass import cli, ir
 from atom.compass.artifacts import ArtifactStore, Kind, machine_spec_digest
-from atom.compass.bench import ops
+from atom.compass.bench import measure, ops
 from atom.compass.capture import driverless
 from atom.compass.capture.forward import decode, prefill
 from atom.compass.capture.graph import Traced, build, to_json
 from atom.compass.ir.nodes import Reduced
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
+from atom.config import Config
 from atom.utils import block_convert
 from atom.utils import forward_context as fctx
 
@@ -632,6 +633,38 @@ def test_v4_index_writer_takes_atom_s_state_slots_and_dest_rows_by_ratio():
     }
 
 
+def test_v4_qk_norm_takes_the_dest_rows_of_its_stated_ratio():
+    # Bound by size, every ratio's destination rows were `top_ks`. No HCA
+    # buffer is live, so the ratio-128 leaf refuses by that buffer's name.
+    qkn = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
+    runner = _Runner()
+    runner.forward_vars |= {
+        "top_ks": torch.zeros(8, dtype=torch.int32),
+        "v4_swa_dest_dense": torch.zeros(16, dtype=torch.int32),
+        "v4_swa_dest_csa": torch.zeros(32, dtype=torch.int32),
+    }
+    rows = ("swa_dest_row", _t([8], "metadata", dtype="torch.int32"))
+    leaves = [
+        dataclasses.replace(_leaf(qkn, rows), stated=(("compress_ratio", r),))
+        for r in (0, 4, 128)
+    ]
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(*leaves, layers=1)["region"])
+
+    stub._prepare((0, 0))
+
+    [(_, views)] = stub.placed
+    got = {
+        stub.leaves[s][0]["stated"]["compress_ratio"]: n
+        for (s, _), (n, _) in views.items()
+    }
+    assert got == {
+        0: "v4_swa_dest_dense",
+        4: "v4_swa_dest_csa",
+        128: "ATOM passes swa_dest_row v4_swa_dest_hca: not live",
+    }
+
+
 def test_v4_index_leaves_write_the_indptrs_atom_passes_and_a_decode_its_split_plan(
     monkeypatch,
 ):
@@ -721,10 +754,10 @@ def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
 
     # 4 blocks of 256 bytes is past twice a 50-byte cache, and both layers still
     # cycle.
-    assert stub._plan(attn, pairs, kv, 4, 2) == (2, 1024, 1)
+    assert stub._plan(attn, pairs, kv, 4, 2) == (2, 1024, 1, [0, 0])
     # A Linear(3, 3) holds 12 floats, 48 bytes: 3 copies pass twice 50, on one
     # placement.
-    assert stub._plan(rope, [{"rope": "0"}], kv, 4, 2) == (3, 48, 1)
+    assert stub._plan(rope, [{"rope": "0"}], kv, 4, 2) == (3, 48, 1, [0, 0])
 
 
 def test_a_context_module_with_no_kv_layer_is_sized_by_its_own_tensors(monkeypatch):
@@ -971,6 +1004,11 @@ def test_a_plane_argument_is_sized_by_the_rows_of_the_batch_s_blocks(monkeypatch
                 name="aiter.sparse",
                 stated=(("window_size", 8), ("compress_ratio", 4), ("index_topk", 3)),
             ),
+            dataclasses.replace(
+                leaf,
+                name="aiter.top1",
+                stated=(("window_size", 8), ("compress_ratio", 4), ("index_topk", 1)),
+            ),
             layers=1,
         )["region"]
     )
@@ -983,17 +1021,20 @@ def test_a_plane_argument_is_sized_by_the_rows_of_the_batch_s_blocks(monkeypatch
     # Two rows of 20 tokens hold 4 blocks of 16, 16 rows at ratio 4: 256 bytes
     # of kv and 32 of q a call, 7 copies past twice 1000 bytes. Per slot, 32
     # of kv: 32 copies, each its own placement, of which the pool holds 16;
-    # 7 slots hold 3 of two rows, the rest take the first 6 again. Past 4 x 3
-    # tokens a request reads 3 of its 5 rows: 96 bytes of kv, 16 copies.
+    # 7 slots hold 3 of two rows, read once, the rest take the first 6 again.
+    # Past 4 x 3 tokens a request reads 3 of its 5 rows: 96 bytes of kv, 16
+    # copies. At top-k 1, 32 of kv: 32 copies on the 16 placements, each read
+    # once.
     assert got["aiter.decode"]["footprint_bytes"] == 7 * 288
-    assert got["aiter.write"]["footprint_bytes"] == 32 * 64
+    assert got["aiter.write"]["footprint_bytes"] == 32 * 32 + 3 * 32
     assert got["aiter.sparse"]["footprint_bytes"] == 16 * 128
+    assert got["aiter.top1"]["footprint_bytes"] == 32 * 32 + 16 * 32
     assert got["aiter.decode"]["placements"] == 16
     assert runner.batches == [(4 * p, 2 * p % 6) for p in range(16)]
 
 
 @pytest.mark.parametrize(
-    "entries, footprint", [({"state": 7}, 21 * 96), ({}, 13 * 160)]
+    "entries, footprint", [({"state": 7}, 21 * 32 + 3 * 64), ({}, 13 * 160)]
 )
 def test_a_strided_kv_argument_is_sized_by_its_entry_s_span(
     monkeypatch, entries, footprint
@@ -1014,8 +1055,62 @@ def test_a_strided_kv_argument_is_sized_by_its_entry_s_span(
     [record] = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
 
     # 32 bytes of q and 32 of kv an entry: per state slot of the two rows 96 a
-    # call, 21 copies past twice 1000 bytes; with no state, per block of the 4
+    # call, 21 copies past twice 1000 bytes on 16 placements, whose kv is the
+    # 3 slot pairs 7 slots hold, read once; with no state, per block of the 4
     # the rows hold, 160 a call and 13 copies.
+    assert record["footprint_bytes"] == footprint
+
+
+@pytest.mark.parametrize(
+    "layers, timed, footprint",
+    [(1, {}, 7 * 32 + 4 * 256), (2, {"copies": 3}, 3 * 32 + 2 * 256)],
+)
+def test_a_state_only_leaf_counts_each_slot_its_copies_read_once(
+    monkeypatch, layers, timed, footprint
+):
+    # DeepSeek-V4's update_compressor_states reads its batch's state slots
+    # alone: placements past the slots take them again, and a layer's copy at
+    # a placement reads the slots another layer's copy there does.
+    runner = _Runner()
+    runner.pool_plan = SimpleNamespace(entries={"state": 8})
+    runner.kv_held = {"state": torch.zeros(8, 16)}
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0, **timed})
+    state = _t([8, 16], "kv")
+    args = ("kv", _t([2, 4], "activation")), ("kv_state", state), ("score", state)
+    leaf = _leaf("v4.states", *args, ("layer", ir.ContextRef(KEY)), key=KEY)
+    found = ops.leaves(_graph(leaf, layers=layers)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    [record] = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+
+    # 32 bytes of kv and two states of 128 a call: 7 copies pass twice 1000.
+    # One layer's take 7 placements on 4 slot pairs; two layers' 3 timed
+    # copies take 2 of their 4 placements.
+    assert record["footprint_bytes"] == footprint
+    assert {slot for _, slot in runner.batches} == {0, 2, 4, 6}
+
+
+@pytest.mark.parametrize(
+    "shape, footprint", [(decode(2), 7 * 288), (prefill(6, 2), 3 * 800)]
+)
+def test_a_rope_table_adds_a_row_a_token_not_its_span(monkeypatch, shape, footprint):
+    # DeepSeek-V4's compressor: cos and sin tables of 1000 positions, a row
+    # of 32 bf16 at each, read one row at a token's position.
+    runner = _Runner()
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    table = _t([1000, 1, 1, 32], "weight", [32, 32, 32, 1], "torch.bfloat16")
+    q = ("q", _t([2, 4], "activation"))
+    leaf = _leaf("aiter.compress", q, ("cos_cache", table), ("sin_cache", table))
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    [record] = ops.Stub(runner, 1000).point(placed, shape, 20, found)
+
+    # 32 bytes of q and 64 a token from each table: 2 decode tokens make 288 a
+    # call, 7 copies past twice 1000 bytes; 6 prefill tokens 800 and 3 copies.
+    # By span, the tables' 128000 bytes would make one copy.
     assert record["footprint_bytes"] == footprint
 
 
@@ -1091,7 +1186,7 @@ def test_a_call_cycles_a_weight_per_occurrence_on_the_cold_copies_inputs():
         patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
-        n, _, _ = stub._plan(gemm, [{}], {}, 4, 2)
+        n, *_ = stub._plan(gemm, [{}], {}, 4, 2)
         record = stub._time(gemm, "sig", [{}], n)
 
     (first, snap), (second, snap1) = graphs[0][:2]
@@ -1866,3 +1961,34 @@ def test_the_capture_child_starts_with_every_gpu_hidden_below_hip(monkeypatch):
     ops._capture(config, [decode(4)], "store")
 
     assert started["ROCR_VISIBLE_DEVICES"] == ""
+
+
+def test_atom_s_arguments_read_alike_in_either_spelling(
+    monkeypatch, tmp_path, model_dir  # noqa: F811
+):
+    # ATOM's server accepts either spelling of each long flag; so do the benches.
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+    started = []
+    monkeypatch.setattr(ops, "_child", lambda fn, argv: started.append(argv))
+    monkeypatch.setattr("atom.compass.capture.forward.device_arch", lambda: "gfx942")
+    configs = []
+    shape = ["--width", "4", "--context", "9", "--gpu", "0", "--llc-mib", "256"]
+    shape += ["--store", str(tmp_path), "--out", str(tmp_path / "o")]
+    for kv, tp in [
+        ("--kv-cache-dtype", "--tensor_parallel_size"),
+        ("--kv_cache_dtype", "--tensor-parallel-size"),
+    ]:
+        atom_args = ["--model", str(model_dir), kv, "fp8", tp, "2"]
+        configs.append(measure.atom_config(atom_args))
+        ops._capture(configs[-1], [decode(4)], "store", atom_args=atom_args)
+        with pytest.raises(ValueError, match="arguments resolve 2 ranks"):
+            ops.main([*shape, "--", *atom_args])
+
+    assert vars(configs[0]) == vars(configs[1])
+    assert (configs[0].kv_cache_dtype, configs[0].tensor_parallel_size) == ("fp8", 2)
+    first, second = (argv[: argv.index("--")] for argv in started)
+    assert first == second and first[first.index("--tp") + 1] == "2"
