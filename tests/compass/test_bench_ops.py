@@ -632,6 +632,38 @@ def test_v4_index_writer_takes_atom_s_state_slots_and_dest_rows_by_ratio():
     }
 
 
+def test_v4_qk_norm_takes_the_dest_rows_of_its_stated_ratio():
+    # Bound by size, every ratio's destination rows were `top_ks`. No HCA
+    # buffer is live, so the ratio-128 leaf refuses by that buffer's name.
+    qkn = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
+    runner = _Runner()
+    runner.forward_vars |= {
+        "top_ks": torch.zeros(8, dtype=torch.int32),
+        "v4_swa_dest_dense": torch.zeros(16, dtype=torch.int32),
+        "v4_swa_dest_csa": torch.zeros(32, dtype=torch.int32),
+    }
+    rows = ("swa_dest_row", _t([8], "metadata", dtype="torch.int32"))
+    leaves = [
+        dataclasses.replace(_leaf(qkn, rows), stated=(("compress_ratio", r),))
+        for r in (0, 4, 128)
+    ]
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(*leaves, layers=1)["region"])
+
+    stub._prepare((0, 0))
+
+    [(_, views)] = stub.placed
+    got = {
+        stub.leaves[s][0]["stated"]["compress_ratio"]: n
+        for (s, _), (n, _) in views.items()
+    }
+    assert got == {
+        0: "v4_swa_dest_dense",
+        4: "v4_swa_dest_csa",
+        128: "ATOM passes swa_dest_row v4_swa_dest_hca: not live",
+    }
+
+
 def test_v4_index_leaves_write_the_indptrs_atom_passes_and_a_decode_its_split_plan(
     monkeypatch,
 ):

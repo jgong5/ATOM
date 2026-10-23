@@ -205,9 +205,10 @@ TABLES = {"cos_cache", "sin_cache", "cos", "sin"}
 HCA_DECODE = "aiter.mla_decode_v4_ps_asm.default"
 #: DeepSeek-V4's metadata arguments, by operator and slot, a dict argument's
 #: item by its key (`slot.<key>`), and the live buffer ATOM passes each, at the
-#: compress ratio the leaf takes or states (`{ratio}`) and that ratio's
-#: attention kind (`{kind}`): `_meta`'s rules bind them to a tighter buffer of
-#: their dtype. A leaf whose buffer is not live refuses.
+#: compress ratio the leaf takes or states (`{ratio}`), that ratio's
+#: attention kind (`{kind}`) and its destination rows' class (`{dest}`):
+#: `_meta`'s rules bind them to a tighter buffer of their dtype. A leaf whose
+#: buffer is not live refuses.
 #: A decode's `split_indptr` is its split plan's, `split_plan_<kind>.1`. The
 #: paged-decode index leaves write their indptrs into the clone that the
 #: leaves timed after them at a placement read.
@@ -219,13 +220,14 @@ _HCA = "aiter.ops.flydsl.kernels.fused_compress_attn_hca:flydsl_hca_compress_att
 _STATE = "atom.model_ops.v4_kernels.state_writes:update_compressor_states"
 _QKN = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
 _BF16 = "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
+_DESTS = {0: "dense", 4: "csa", 128: "hca"}
 V4_METADATA = {
     (_NM, "kv_indptr"): "kv_indptr_{kind}",
     (_NM, "split_indptr"): "split_plan_{kind}.1",
     (_WRITE, "state_slot_per_seq"): "v4_meta_state_slot_out",
     **{
-        (_WRITE, f"dest_rows.{ratio}"): f"v4_swa_dest_{kind}"
-        for ratio, kind in ((0, "dense"), (4, "csa"), (128, "hca"))
+        (_WRITE, f"dest_rows.{ratio}"): f"v4_swa_dest_{dest}"
+        for ratio, dest in _DESTS.items()
     },
     **{
         (f"{_INDICES}:{fn}", f"{kind}_indptr"): f"kv_indptr_{kind}"
@@ -241,6 +243,7 @@ V4_METADATA = {
     (_STATE, "state_slot_mapping"): "state_slot_out",
     (_STATE, "write_plan"): "v4_write_plan_{ratio}",
     (_QKN, "batch_id_per_token"): "batch_id_per_q_token",
+    (_QKN, "swa_dest_row"): "v4_swa_dest_{dest}",
 }
 V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
@@ -613,7 +616,11 @@ class Stub:
                     if op["op"] == HCA_DECODE and field in work:
                         pool, what = {field: work[field]}, "HCA workspace"
                     if wanted := V4_METADATA.get((op["op"], _keyed(op["args"], path))):
-                        what = wanted.format(ratio=ratio, kind=V4_KINDS.get(ratio))
+                        what = wanted.format(
+                            ratio=ratio,
+                            kind=V4_KINDS.get(ratio),
+                            dest=_DESTS.get(ratio),
+                        )
                         pool = {what: named[what]} if what in named else {}
                     try:
                         if not pool:
