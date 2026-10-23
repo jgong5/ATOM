@@ -352,26 +352,18 @@ def graded(cell, client=None, whole=False) -> tuple:
     graded whole, as it is when `whole`. `client` holds the client's export,
     `cell` itself unless `cell` is a deployment's side."""
     client = client or cell
-    if _whole(cell, client):
-        return _steps(cell), None, None
-    return _client_run(cell, _run(cell), client, whole)
-
-
-def _run(cell) -> dict:
     path = Path(cell) / "run.json"
-    return read_json(path) if path.exists() else {}
-
-
-def _whole(cell, client) -> bool:
-    """Whether `graded` grades `cell` whole whatever its cell: when `cctraces_sim.sh`
-    wrote it, and `client` holds no client run."""
-    client_run = (Path(client) / CLIENT_RUN).is_file()
-    return "format_version" not in _run(cell) and not client_run
+    run = read_json(path) if path.exists() else {}
+    if "format_version" in run or (Path(client) / CLIENT_RUN).is_file():
+        return _client_run(cell, run, client, whole)
+    return _steps(cell), None, None
 
 
 def graded_whole(real) -> bool:
-    """Whether a cell of the `real` runs grades every run whole: when one is."""
-    return any(_whole(side, r) for r in real for side in sides(r))
+    """Whether a cell of the `real` runs grades every run whole: when one holds
+    no client run. A run.json with a `format_version` and no client run is
+    refused when graded, either way."""
+    return not all((Path(r) / CLIENT_RUN).is_file() for r in real)
 
 
 def _refuse_by_run_file(cell) -> None:
