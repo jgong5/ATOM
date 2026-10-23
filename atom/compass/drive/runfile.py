@@ -229,3 +229,20 @@ def _engine_args(atom_args):
     parser = FlexibleArgumentParser(add_help=False)
     EngineArgs.add_cli_args(parser)
     return parser.parse_known_args(atom_args)[0]
+
+
+def engine_only(atom_args) -> list[str]:
+    """ATOM's arguments `atom_args` less the server's, which a build that
+    parses ATOM's engine arguments alone refuses."""
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(add_help=False))
+    left, kept = iter(parser.parse_known_args(atom_args)[1]), []
+    drop = next(left, None)
+    for arg in atom_args:
+        if arg == drop:
+            drop = next(left, None)
+        else:
+            kept.append(arg)
+    return kept

@@ -94,6 +94,8 @@ V4_DECODES = (
     "aiter.mla_decode_v4_ps_asm.default",
 )
 V4_INDEXER = "aiter.indexer_score_topk.default"
+#: DeepSeek-V4's fused QK-norm and RoPE, which writes a decode's window rows.
+V4_QKN = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
 #: Where a drafter's step ends its target's work: ATOM records `forward_done_event`.
 CUT = "forward_done_event"
 
@@ -863,8 +865,8 @@ def _v4_attention(v4, recorder):
 
     The decode leaves (`V4_DECODES`) state the layer's `window_size`,
     `compress_ratio` and `index_topk` (None when it has no indexer), and the
-    indexer's its `compress_ratio`, none of which they are passed: read off
-    the layer `layer_name` names.
+    indexer's and the fused QK-norm (`V4_QKN`) its `compress_ratio`, none of
+    which they are passed: read off the layer `layer_name` names.
     """
     from atom.utils.forward_context import get_forward_context
 
@@ -873,7 +875,10 @@ def _v4_attention(v4, recorder):
         top = layer.indexer and layer.indexer.index_topk
         ratio = (("compress_ratio", layer.compress_ratio),)
         geometry = (("window_size", layer.window_size), *ratio, ("index_topk", top))
-        stated = {**dict.fromkeys(V4_DECODES, geometry), V4_INDEXER: ratio}
+        stated = {
+            **dict.fromkeys(V4_DECODES, geometry),
+            **dict.fromkeys((V4_INDEXER, V4_QKN), ratio),
+        }
         with (
             patch.object(recorder, "stated", stated),
             patch.object(get_forward_context().context, "is_dummy_run", False),
@@ -1050,13 +1055,13 @@ def _config(model, tp, atom_args):
     Under `--enable-dp-attention` each TP rank is a DP rank of TP 1, as
     `CoreManager` rewrites it.
     """
-    import argparse
     import dataclasses
 
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
 
-    parser = EngineArgs.add_cli_args(argparse.ArgumentParser(prog="trace ops --"))
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog="trace ops --"))
     forced = ["--enforce-eager", "--level", "0", "--load_dummy", "empty"]
     args = parser.parse_args(["--model", model, "-tp", str(tp), *atom_args, *forced])
     engine = EngineArgs.from_cli_args(args)
@@ -1072,7 +1077,14 @@ def _config(model, tp, atom_args):
 
 
 def capture(
-    model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942", population=()
+    model: str,
+    tp: int,
+    shapes,
+    tmpdir: str,
+    atom_args=(),
+    arch="gfx942",
+    population=(),
+    whole=False,
 ):
     """Trace one step of `model` at TP `tp` at each of `shapes`, in this process,
     under ATOM's engine arguments `atom_args` on a declared `arch`.
@@ -1085,7 +1097,7 @@ def capture(
     record directories `population` are shapes too (`population_shapes`),
     under two-batch overlap a split one's two micro-batches; each of their
     prefills runs as one forward, as it ran, this rank answering that it
-    cannot split it.
+    cannot split it; with `whole`, each prefill of `shapes` too.
     """
     declared = driverless.install(tmpdir, arch)
 
@@ -1099,7 +1111,7 @@ def capture(
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     ep = int(config.enable_expert_parallel)
     ran = population_shapes(population, config.enable_tbo)
-    unsplit = {s for s in ran if s.phase == "prefill"}
+    unsplit = {s for s in ([*ran, *shapes] if whole else ran) if s.phase == "prefill"}
     shapes = list(dict.fromkeys([*shapes, *ran]))
     if not shapes:
         raise ValueError(f"{', '.join(population)} hold no step to trace")

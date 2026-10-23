@@ -55,9 +55,9 @@ argument's as many entries of its first dimension, each the span of the
 others, as the batch's state slots, or its blocks when the model keeps no
 per-request state, or, of a decode attention leaf that states its layer's
 window and compress ratio, the plane rows the batch's blocks hold at that
-ratio, the tensors
-of each module it names, of one whose first dimension is the pool's blocks
-the batch's blocks, and, for a leaf that names a context key, the KV and
+ratio, a RoPE table's (`TABLES`) as many rows as the point's tokens, the
+tensors of each module it names, of one whose first dimension is the pool's
+blocks the batch's blocks, and, for a leaf that names a context key, the KV and
 per-request state its layer holds for the batch. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
 kernels of one eager call of copy 0, the fewer, at least one, cycling over its
@@ -159,11 +159,12 @@ from atom.compass.artifacts import (
     roots_for,
 )
 from atom.compass.drive.gpu import add_gpu_flag
+from atom.utils.arg_parser import FlexibleArgumentParser
 
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads or what a capture waits for change.
-PROTOCOL = 12
+PROTOCOL = 13
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -196,14 +197,19 @@ _waited: Counter = Counter()
 #: the model's forward; `_meta`'s name rule binds an embedding's `indices` to
 #: another index buffer.
 TOKEN_IDS = {("aten.embedding.default", "indices")}
+#: Weight slots a leaf reads a row a token of: RoPE's cos and sin tables,
+#: indexed by each token's position (or by each compressed position, at most
+#: one a token), never read whole.
+TABLES = {"cos_cache", "sin_cache", "cos", "sin"}
 #: The operator whose metadata slots are named as the fields of DeepSeek-V4's
 #: HCA decode workspace: aiter defines its schema and the workspace together.
 HCA_DECODE = "aiter.mla_decode_v4_ps_asm.default"
 #: DeepSeek-V4's metadata arguments, by operator and slot, a dict argument's
 #: item by its key (`slot.<key>`), and the live buffer ATOM passes each, at the
-#: compress ratio the leaf takes or states (`{ratio}`) and that ratio's
-#: attention kind (`{kind}`): `_meta`'s rules bind them to a tighter buffer of
-#: their dtype. A leaf whose buffer is not live refuses.
+#: compress ratio the leaf takes or states (`{ratio}`), that ratio's
+#: attention kind (`{kind}`) and its destination rows' class (`{dest}`):
+#: `_meta`'s rules bind them to a tighter buffer of their dtype. A leaf whose
+#: buffer is not live refuses.
 #: A decode's `split_indptr` is its split plan's, `split_plan_<kind>.1`. The
 #: paged-decode index leaves write their indptrs into the clone that the
 #: leaves timed after them at a placement read.
@@ -215,13 +221,14 @@ _HCA = "aiter.ops.flydsl.kernels.fused_compress_attn_hca:flydsl_hca_compress_att
 _STATE = "atom.model_ops.v4_kernels.state_writes:update_compressor_states"
 _QKN = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
 _BF16 = "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
+_DESTS = {0: "dense", 4: "csa", 128: "hca"}
 V4_METADATA = {
     (_NM, "kv_indptr"): "kv_indptr_{kind}",
     (_NM, "split_indptr"): "split_plan_{kind}.1",
     (_WRITE, "state_slot_per_seq"): "v4_meta_state_slot_out",
     **{
-        (_WRITE, f"dest_rows.{ratio}"): f"v4_swa_dest_{kind}"
-        for ratio, kind in ((0, "dense"), (4, "csa"), (128, "hca"))
+        (_WRITE, f"dest_rows.{ratio}"): f"v4_swa_dest_{dest}"
+        for ratio, dest in _DESTS.items()
     },
     **{
         (f"{_INDICES}:{fn}", f"{kind}_indptr"): f"kv_indptr_{kind}"
@@ -237,6 +244,7 @@ V4_METADATA = {
     (_STATE, "state_slot_mapping"): "state_slot_out",
     (_STATE, "write_plan"): "v4_write_plan_{ratio}",
     (_QKN, "batch_id_per_token"): "batch_id_per_q_token",
+    (_QKN, "swa_dest_row"): "v4_swa_dest_{dest}",
 }
 V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
@@ -272,7 +280,7 @@ def main(argv: list[str]) -> None:
         raise ValueError("--plan places every point; name no --width or --prefill")
     if args.context is None and any(s.phase == "decode" for s in shapes):
         raise ValueError("a decode shape needs --context, each row's tokens")
-    engine = EngineArgs.add_cli_args(argparse.ArgumentParser(prog=f"{PROG} --"))
+    engine = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
     engine = engine.parse_args(argv[cut + 1 :])
     world = engine.tensor_parallel_size * engine.data_parallel_size
     # DP attention makes each TP rank a DP rank, and one GPU can run one alone
@@ -609,7 +617,11 @@ class Stub:
                     if op["op"] == HCA_DECODE and field in work:
                         pool, what = {field: work[field]}, "HCA workspace"
                     if wanted := V4_METADATA.get((op["op"], _keyed(op["args"], path))):
-                        what = wanted.format(ratio=ratio, kind=V4_KINDS.get(ratio))
+                        what = wanted.format(
+                            ratio=ratio,
+                            kind=V4_KINDS.get(ratio),
+                            dest=_DESTS.get(ratio),
+                        )
                         pool = {what: named[what]} if what in named else {}
                     try:
                         if not pool:
@@ -669,7 +681,8 @@ class Stub:
         room = [pool // blocks]
         room += [t.k_cache.shape[0] // len(rows) for t in kv.values() if _stateful(t)]
         plans = {
-            s: self._plan(op, i, kv, blocks, len(rows)) for s, (op, i) in found.items()
+            s: self._plan(op, i, kv, blocks, len(rows), shape.tokens)
+            for s, (op, i) in found.items()
         }
         need = max(p for _, _, p in plans.values())
         self.leaves, self.placed, self.context, self.clones = found, [], context, {}
@@ -712,13 +725,16 @@ class Stub:
         self.placed = []
         return got
 
-    def _plan(self, op, instances, kv, blocks, rows):
+    def _plan(self, op, instances, kv, blocks, rows, tokens=None):
         """A leaf's copies, its bytes per call, and the placements its context
-        keys and KV arguments take."""
+        keys and KV arguments take; `tokens` defaults to `rows`, a decode's."""
         need, size = 1, 0
-        for _, s in _specs(op["args"]):
+        for slot, s in _specs(op["args"]):
             itemsize = _dtype(s["dtype"]).itemsize
             nbytes = _span(s["shape"], s["stride"]) * itemsize
+            if s["role"] == "weight" and slot in TABLES:
+                entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
+                nbytes = entry * min(tokens or rows, s["shape"][0])
             if s["role"] == "kv":
                 # ponytail: its first dim taken as blocks or state slots, or as
                 # plane rows when the leaf states its layer's attention geometry;
@@ -2029,7 +2045,7 @@ def _capture(config, shapes, root, arch=None, atom_args=()) -> None:
     from atom.compass.capture.forward import device_arch
     from atom.model_engine.arg_utils import EngineArgs
 
-    engine = EngineArgs.add_cli_args(argparse.ArgumentParser()).parse_args(atom_args)
+    engine = EngineArgs.add_cli_args(FlexibleArgumentParser()).parse_args(atom_args)
     argv = ["--model", config.model, "--tp", str(engine.tensor_parallel_size)]
     argv += ["--arch", arch or device_arch()]
     for s in shapes:

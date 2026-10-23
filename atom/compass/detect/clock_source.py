@@ -85,8 +85,8 @@ CLOCK_READS = (
 #: does not collect the exemption.
 DEFAULT_ALLOW_LIST: dict[str, str] = {
     "atom/compass/run/__init__.py": (
-        "the run summary's wall seconds, from the run's start to its finish: "
-        "the speed result, which no simulated time reads"
+        "the run summary's wall seconds, from the run's start to its finish, "
+        "and each lazy trace's: the speed result, which no simulated time reads"
     ),
     "atom/compass/parity/runner.py": (
         "a real runner's step timestamps; a simulated run runs its own runner "
@@ -118,8 +118,8 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
     ),
     "atom/compass/capture/__init__.py": (
         "when trace ops published each graph, for the entry's provenance, and how "
-        "long each shape took; a capture runs no device and never inside a "
-        "simulated run"
+        "long each shape took; a capture runs no device, and in a simulated run "
+        "only in a process of its own, whose clock no simulated time reads"
     ),
     "atom/compass/drive/measure_memory.py": (
         "when measure memory published its entry, for the entry's provenance; it "
