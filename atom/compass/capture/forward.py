@@ -1041,7 +1041,14 @@ def _config(model, tp, atom_args):
 
 
 def capture(
-    model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942", population=()
+    model: str,
+    tp: int,
+    shapes,
+    tmpdir: str,
+    atom_args=(),
+    arch="gfx942",
+    population=(),
+    whole=False,
 ):
     """Trace one step of `model` at TP `tp` at each of `shapes`, in this process,
     under ATOM's engine arguments `atom_args` on a declared `arch`.
@@ -1054,7 +1061,7 @@ def capture(
     record directories `population` are shapes too (`population_shapes`),
     under two-batch overlap a split one's two micro-batches; each of their
     prefills runs as one forward, as it ran, this rank answering that it
-    cannot split it.
+    cannot split it; with `whole`, each prefill of `shapes` too.
     """
     declared = driverless.install(tmpdir, arch)
 
@@ -1068,7 +1075,8 @@ def capture(
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     ep = int(config.enable_expert_parallel)
     ran = population_shapes(population, config.enable_tbo)
-    unsplit = {s.at(dp) for s in ran if s.phase == "prefill"}
+    unsplit = [*ran, *shapes] if whole else ran
+    unsplit = {s.at(dp) for s in unsplit if s.phase == "prefill"}
     shapes = list(dict.fromkeys(s.at(dp) for s in [*shapes, *ran]))
     if not shapes:
         raise ValueError(f"{', '.join(population)} hold no step to trace")
