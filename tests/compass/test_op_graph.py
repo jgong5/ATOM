@@ -27,17 +27,25 @@ from test_capture_ir import CONFIG, WIDTH_2, _ops, capture
 from test_memory_readings import DOCUMENT, WORKER
 from test_op_graph_arch import ENGINE
 from test_op_work import leaf, t
+from test_op_work_v4_attention import FP8, POOL, decode
 from test_work import SPEC
 
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactRefusal
-from atom.compass.backends import BatchView, CostRefused, Method, RequestShape, op_graph
+from atom.compass.backends import (
+    BatchView,
+    CostRefused,
+    Method,
+    RequestShape,
+    op_graph,
+    op_work,
+)
 from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import NONE, OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.step_roofline import micro_batches, overlap
-from atom.compass.backends.work import attention, gemm, price
+from atom.compass.backends.work import Work, attention, gemm, price
 from atom.compass.bench.ops import leaves, signature
 from atom.compass.capture.peers import MORI
 from atom.compass.fit import ops as fit_ops
@@ -328,6 +336,86 @@ def test_a_leaf_in_and_out_of_a_resource_bound_par_prices_each_way():
 
     summed = gemm(2, 4096, 4096) + gemm(2, 4096, 4096)
     assert by_name(cost) == by_name(alone) | {"par.resource_bound": price(summed, SPEC)}
+
+
+def alone(region, steps, **kwargs):
+    """Each step's prices as each leaf of `region`'s sequence priced alone
+    gives them, folded."""
+    each = [
+        [by_name(backend(x, **kwargs).price(s)) for x in region["seq"]] for s in steps
+    ]
+    return [{k: fold_seconds(a[k] for a in s) for k in s[0]} for s in each]
+
+
+def test_layers_that_differ_only_in_what_no_extractor_reads_work_once_a_step(
+    monkeypatch,
+):
+    """V4 decode attention layers whose KV pools differ in rows are worked once
+    a step for each compression ratio."""
+    worked = []
+
+    def counted(op, *args):
+        worked.append(op["stated"]["compress_ratio"])
+        return work(op, *args)
+
+    monkeypatch.setattr(op_graph, "work", counted)
+    layers = [
+        decode(window_size=4, compress_ratio=r, index_topk=16) for r in (4, 128) * 3
+    ]
+    for rows, layer in enumerate(layers):
+        layer["args"]["kv_buffer"] = t([POOL + rows, 1, 1, 16], FP8, role="kv")
+    steps = [DECODE, view((1, 9_000, True), (1, 30, True), rung=2)]
+    ops = backend({"seq": layers}, kv="fp8")
+    costs = [by_name(ops.price(s)) for s in steps]
+
+    assert worked == [4, 128, 4, 128]
+    assert costs == alone({"seq": layers}, steps, kv="fp8")
+
+
+def test_a_part_of_a_leaf_read_only_on_some_leaves_keys_each_leaf(monkeypatch):
+    kind = "aiter.reads_b_when_a.default"
+
+    def extract(op, view, tp, kv):
+        return Work({}, op["args"]["b"] if op["args"]["a"] else 1)
+
+    monkeypatch.setitem(op_work.EXTRACTORS, kind, extract)
+    region = {
+        "seq": [leaf(kind, [[1]], a=a, b=b) for a, b in ((0, 5), (1, 5e9), (1, 9e9))]
+    }
+    assert [by_name(backend(region).price(DECODE))] == alone(region, [DECODE])
+
+
+def test_a_graph_s_price_is_kept_only_for_its_leaves_prices_and_work_in_a_par():
+    """Attention at the kernel floor at either step's rows, its bytes summed
+    with a memory-bound GEMM's."""
+    attn = leaf(ATTENTION, [[2, 6144]], q=t([2, 24, 256]), k=t([2, 4, 256]))
+    pooled = {"par": [attn, g(2, 8192, 8192)], "join": "resource_bound"}
+    steps = [
+        view((1, 9, True), (1, 3, True), rung=2),
+        view((1, 20, True), (1, 9, True), rung=2),
+    ]
+    ops = backend(pooled)
+    costs = [by_name(ops.price(s)) for s in steps + steps]
+
+    assert len({str(by_name(backend(attn).price(s))) for s in steps}) == 1
+    assert costs == [by_name(backend(pooled).price(s)) for s in steps + steps]
+    assert costs[0] != costs[1]
+
+
+def test_a_leaf_refused_at_a_kept_graph_s_next_step_refuses_it(monkeypatch):
+    kind = "aiter.refuses_long_rows.default"
+
+    def extract(op, view, tp, kv):
+        if max(r.context_tokens for r in view.requests) > 1_000:
+            raise op_work._Unpriced("a row past 1000")
+        return Work()
+
+    monkeypatch.setitem(op_work.EXTRACTORS, kind, extract)
+    ops = backend({"seq": [g(2, 64, 64), leaf(kind, [[1]])]})
+    ops.price(DECODE)
+
+    with pytest.raises(CostRefused, match="a row past 1000"):
+        ops.price(view((1, 9_000, True), (1, 30, True), rung=2))
 
 
 # --- two-batch overlap -------------------------------------------------------------
