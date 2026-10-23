@@ -671,9 +671,9 @@ class Stub:
         plans = {
             s: self._plan(op, i, kv, blocks, len(rows)) for s, (op, i) in found.items()
         }
-        need = max(p for _, _, p in plans.values())
+        need = max(p for _, _, p, _ in plans.values())
         self.leaves, self.placed, self.context, self.clones = found, [], context, {}
-        self.cold_copies = {s: self._cold(size) for s, (_, size, _) in plans.items()}
+        self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
         for p in range(max(min(need, *room), 1)):
             slot = p * len(rows)
             if self.slots >= len(rows):  # past the state slots, take them again
@@ -694,14 +694,24 @@ class Stub:
                 raise
         got = []
         for sig, (op, inst) in found.items():
-            n, size, _ = plans[sig]
+            n, size, _, (by_block, by_slot) = plans[sig]
             names = {p: m[0] for (s, p), m in self.placed[0][1].items() if s == sig}
             record = {"shape": str(shape), "context": context, "op": op["op"]}
             record |= {"leaf": sig, "metadata": names, "rows": rows}
             record |= {"exchange": ex} if (ex := exchange(op)) else {}
             try:
                 record |= self._time(op, sig, inst, n)
-                record["footprint_bytes"] = min(n, record.get("copies", n)) * size
+                # a KV argument is one view every copy reads at its placement:
+                # its bytes count once a placement, a slot's once however many
+                # placements wrap onto it
+                built = min(n, record.get("copies", n))
+                at = min(len(self.placed), -(-built // len(inst)))
+                wrap = self.slots // len(rows) if self.slots >= len(rows) else at
+                record["footprint_bytes"] = (
+                    built * (size - by_block - by_slot)
+                    + at * by_block
+                    + min(at, wrap) * by_slot
+                )
             except Exception as error:  # noqa: BLE001 - a refusal names what stopped it
                 record["refused"] = f"{type(error).__name__}: {error}"
                 _alive(self.runner.device)
@@ -713,9 +723,10 @@ class Stub:
         return got
 
     def _plan(self, op, instances, kv, blocks, rows):
-        """A leaf's copies, its bytes per call, and the placements its context
-        keys and KV arguments take."""
-        need, size = 1, 0
+        """A leaf's copies, its bytes per call, the placements its context
+        keys and KV arguments take, and its KV arguments' bytes per call read
+        by blocks and by state slots."""
+        need, size, shared = 1, 0, [0, 0]
         for _, s in _specs(op["args"]):
             itemsize = _dtype(s["dtype"]).itemsize
             nbytes = _span(s["shape"], s["stride"]) * itemsize
@@ -723,13 +734,14 @@ class Stub:
                 # ponytail: its first dim taken as blocks or state slots, or as
                 # plane rows when the leaf states its layer's attention geometry;
                 # beside state slots a block view is one block a request, the
-                # one a decode compressor writes its row to
-                unit = rows if self.slots else blocks
+                # one a decode compressor writes its row to, and read as a slot
+                unit, slotted = (rows, 1) if self.slots else (blocks, 0)
                 stated = op.get("stated", {})
                 if "window_size" in stated and (ratio := stated["compress_ratio"]):
                     # the rows the batch's blocks hold at its layer: a row
                     # per `ratio` tokens; its window rows are left out
                     unit = blocks * self.runner.config.kv_cache_block_size // ratio
+                    slotted = 0
                     # of which a request reads at most its indexer's top-k
                     if top := stated.get("index_topk"):
                         unit = min(unit, rows * top)
@@ -737,6 +749,7 @@ class Stub:
                 # strided by a whole state slot or by every layer's block
                 entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
                 nbytes, need = entry * unit, None
+                shared[slotted] += nbytes
             size += nbytes
         for key in instances[0].values():
             module = self.contexts.get(key)
@@ -759,7 +772,7 @@ class Stub:
         n = self._cold(size)
         if need is None:  # cycle over every instance's state, which is held anyway
             n = min(CALLS, max(n, len(instances)))
-        return n, size, need or -(-n // len(instances))
+        return n, size, need or -(-n // len(instances)), shared
 
     def _cold(self, size) -> int:
         """Copies of `size` bytes a call whose bytes pass `COLD` times the cache."""

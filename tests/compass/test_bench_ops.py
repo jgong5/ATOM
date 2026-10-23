@@ -721,10 +721,10 @@ def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
 
     # 4 blocks of 256 bytes is past twice a 50-byte cache, and both layers still
     # cycle.
-    assert stub._plan(attn, pairs, kv, 4, 2) == (2, 1024, 1)
+    assert stub._plan(attn, pairs, kv, 4, 2) == (2, 1024, 1, [0, 0])
     # A Linear(3, 3) holds 12 floats, 48 bytes: 3 copies pass twice 50, on one
     # placement.
-    assert stub._plan(rope, [{"rope": "0"}], kv, 4, 2) == (3, 48, 1)
+    assert stub._plan(rope, [{"rope": "0"}], kv, 4, 2) == (3, 48, 1, [0, 0])
 
 
 def test_a_context_module_with_no_kv_layer_is_sized_by_its_own_tensors(monkeypatch):
@@ -983,17 +983,18 @@ def test_a_plane_argument_is_sized_by_the_rows_of_the_batch_s_blocks(monkeypatch
     # Two rows of 20 tokens hold 4 blocks of 16, 16 rows at ratio 4: 256 bytes
     # of kv and 32 of q a call, 7 copies past twice 1000 bytes. Per slot, 32
     # of kv: 32 copies, each its own placement, of which the pool holds 16;
-    # 7 slots hold 3 of two rows, the rest take the first 6 again. Past 4 x 3
-    # tokens a request reads 3 of its 5 rows: 96 bytes of kv, 16 copies.
+    # 7 slots hold 3 of two rows, read once, the rest take the first 6 again.
+    # Past 4 x 3 tokens a request reads 3 of its 5 rows: 96 bytes of kv, 16
+    # copies.
     assert got["aiter.decode"]["footprint_bytes"] == 7 * 288
-    assert got["aiter.write"]["footprint_bytes"] == 32 * 64
+    assert got["aiter.write"]["footprint_bytes"] == 32 * 32 + 3 * 32
     assert got["aiter.sparse"]["footprint_bytes"] == 16 * 128
     assert got["aiter.decode"]["placements"] == 16
     assert runner.batches == [(4 * p, 2 * p % 6) for p in range(16)]
 
 
 @pytest.mark.parametrize(
-    "entries, footprint", [({"state": 7}, 21 * 96), ({}, 13 * 160)]
+    "entries, footprint", [({"state": 7}, 21 * 32 + 3 * 64), ({}, 13 * 160)]
 )
 def test_a_strided_kv_argument_is_sized_by_its_entry_s_span(
     monkeypatch, entries, footprint
@@ -1014,9 +1015,40 @@ def test_a_strided_kv_argument_is_sized_by_its_entry_s_span(
     [record] = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
 
     # 32 bytes of q and 32 of kv an entry: per state slot of the two rows 96 a
-    # call, 21 copies past twice 1000 bytes; with no state, per block of the 4
+    # call, 21 copies past twice 1000 bytes on 16 placements, whose kv is the
+    # 3 slot pairs 7 slots hold, read once; with no state, per block of the 4
     # the rows hold, 160 a call and 13 copies.
     assert record["footprint_bytes"] == footprint
+
+
+@pytest.mark.parametrize(
+    "layers, timed, footprint",
+    [(1, {}, 7 * 32 + 4 * 256), (2, {"copies": 3}, 3 * 32 + 2 * 256)],
+)
+def test_a_state_only_leaf_counts_each_slot_its_copies_read_once(
+    monkeypatch, layers, timed, footprint
+):
+    # DeepSeek-V4's update_compressor_states reads its batch's state slots
+    # alone: placements past the slots take them again, and a layer's copy at
+    # a placement reads the slots another layer's copy there does.
+    runner = _Runner()
+    runner.pool_plan = SimpleNamespace(entries={"state": 8})
+    runner.kv_held = {"state": torch.zeros(8, 16)}
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0, **timed})
+    state = _t([8, 16], "kv")
+    args = ("kv", _t([2, 4], "activation")), ("kv_state", state), ("score", state)
+    leaf = _leaf("v4.states", *args, ("layer", ir.ContextRef(KEY)), key=KEY)
+    found = ops.leaves(_graph(leaf, layers=layers)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    [record] = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+
+    # 32 bytes of kv and two states of 128 a call: 7 copies pass twice 1000.
+    # One layer's take 7 placements on 4 slot pairs; two layers' 3 timed
+    # copies take 2 of their 4 placements.
+    assert record["footprint_bytes"] == footprint
+    assert {slot for _, slot in runner.batches} == {0, 2, 4, 6}
 
 
 def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
@@ -1091,7 +1123,7 @@ def test_a_call_cycles_a_weight_per_occurrence_on_the_cold_copies_inputs():
         patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
-        n, _, _ = stub._plan(gemm, [{}], {}, 4, 2)
+        n, *_ = stub._plan(gemm, [{}], {}, 4, 2)
         record = stub._time(gemm, "sig", [{}], n)
 
     (first, snap), (second, snap1) = graphs[0][:2]
