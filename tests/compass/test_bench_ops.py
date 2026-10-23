@@ -656,11 +656,12 @@ def test_a_context_module_with_no_kv_layer_is_sized_by_its_own_tensors(monkeypat
 
 def test_a_context_module_s_pool_view_is_sized_by_the_batch_s_blocks(monkeypatch):
     # DeepSeek-V4's Indexer as ATOM binds it: a view of the pool a block a row,
-    # FP4 data and scales, beside a tensor of its own; no layer_num.
+    # FP4 data and scales, beside tensors of its own, one 0-dim; no layer_num.
     def indexer():
         module = torch.nn.Module()
         module.register_buffer("kv_cache", torch.zeros(64, 16, 4))
         module.register_buffer("own", torch.zeros(3))
+        module.register_buffer("scale", torch.zeros(()))
         module.kv_scale = torch.zeros(64, 16)
         return module
 
@@ -675,9 +676,9 @@ def test_a_context_module_s_pool_view_is_sized_by_the_batch_s_blocks(monkeypatch
     [record] = ops.Stub(runner, 5_000).point(placed, decode(2), 20, found)
 
     # Two rows of 20 tokens read 4 of the pool's 64 blocks, 320 bytes each,
-    # beside 32 of q and 12 of its own: 1324 a call, 8 copies past twice 5000,
+    # beside 32 of q and 16 of its own: 1328 a call, 8 copies past twice 5000,
     # cycling the two layers over 4 placements of the batch.
-    assert record["footprint_bytes"] == 8 * 1324
+    assert record["footprint_bytes"] == 8 * 1328
     assert record["placements"] == 4
     assert runner.batches == [(4 * p, 2 * p) for p in range(4)]
 
