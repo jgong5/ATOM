@@ -512,7 +512,9 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   too); the target is keyed `decode B=<rows> W=<target_bs>`, its default G the group's
   padded gather, or `prefill T=<tokens> B=<rows> W=<target_bs>`. A capture runs each
   shape on a ladder of its one width (`W`, else `B`), so `decide` settles `running_bs`
-  as the real step did, for the target and the drafter's later passes alike
+  as the real step did, for the target and the drafter's later passes alike. It
+  publishes a target at `W` only from the step that samples (a DP middle chunk's is read
+  at its rows), and a decode's drafter only from its own shape
   ([#2033](https://github.com/jgong5/ATOM/issues/2033)).
 - **A middle chunk is cut where its draft-KV pass starts.** ATOM runs that pass
   (`compute_draft_kv`) after every target forward of a real step, a middle chunk's included,

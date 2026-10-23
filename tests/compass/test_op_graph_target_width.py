@@ -122,3 +122,31 @@ def test_a_capture_runs_a_padded_target_at_its_width_and_samples_its_rows(tmp_pa
     # Each samples its 3 rows.
     for shape in graphs:
         assert rows(shape, ARGMAX, "scores") == [3]
+
+
+def test_a_capture_keeps_an_eager_decode_s_drafter_only_from_its_own_shape(tmp_path):
+    from test_capture_v4_pro import trace
+
+    # DeepSeek-V4-Pro under MTP2 at DPA DP2: rank 0 decodes 3 rows eagerly,
+    # padded to 4, and its drafter's later passes run at 4.
+    (tmp_path / "record").mkdir()
+    line = {"rows": [[3, 90, True]] * 3, "moe_rows": 24, "draft_moe_rows": 8}
+    record = _record(tmp_path / "record", [line | {"target_bs": 4, "draft_bs": 4}])
+    idle = json.dumps({"step": 0, "is_dummy_run": True})
+    (tmp_path / "record" / "steps" / "dp1.jsonl").write_text(idle + "\n")
+    (tmp_path / "trace").mkdir()
+    argv = "--population {} --tp 2 -- --kv_cache_dtype fp8 --enable-dp-attention "
+    argv += "--method mtp --num-speculative-tokens 2"
+    done = trace(tmp_path / "trace", argv.format(record))
+
+    tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
+    assert tokens, done.stderr[-4000:]
+    store = ArtifactStore(str(tmp_path / "trace" / "store"))
+    rank, graphs = Topology().ranks()[0], set()
+    for token in tokens:
+        entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
+        graph = json.loads(entry.read_member("graph", rank, "json"))
+        graphs.add((graph["structure"].endswith(" draft"), graph["shape"]))
+    # The target at its width; its drafter only at its rows on the batch of 4,
+    # where the run reads it.
+    assert graphs == {(False, "decode B=3 W=4"), (True, "decode T=3 B=4 G=8")}

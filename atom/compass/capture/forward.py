@@ -45,7 +45,7 @@ rows, as `ForwardMode.decide` settles it from a ladder of that one width: a
 decode's model runs at it from its inputs, a prefill's LM head and its
 drafter's later passes at it, and each samples its rows. Under a drafter in DP
 a middle chunk runs those later passes at it too: only its drafter's graph is
-kept."""
+kept. A decode's drafter is kept from its own shape, at its rows."""
 
 import contextlib
 import copyreg
@@ -1178,7 +1178,7 @@ def capture(
             (shape, output)
             for shape in shapes
             for output in ((False, True) if shape.phase == "prefill" else (True,))
-            if output or not shape.width or dp > 1
+            if output or not shape.width or dp > 1 and drafts
         ]
         # A population's prefill ran as one forward: this rank cannot split it.
         own = runner._local_tbo_eligibility
@@ -1216,8 +1216,14 @@ def capture(
             for draft, part in enumerate(
                 (items[: cut[0]], items[cut[0] + 1 :]) if cut else (items,)
             ):
-                if shape.tokens < shape.seqs and not draft:
-                    continue  # its target ran at its rung
+                if draft:
+                    # A decode's drafter is read from its own shape, at its rows.
+                    skip = shape.phase == "decode" and shape.width
+                else:
+                    # Its target ran at its rung; a middle chunk's is read at its rows.
+                    skip = shape.tokens < shape.seqs or shape.width and not output
+                if skip:
+                    continue
                 key = structure(config, shape.phase, output=output, draft=bool(draft))
                 crossing, traced = [], Traced(key, str(shape))
                 graph = build(part, traced, crossing)
