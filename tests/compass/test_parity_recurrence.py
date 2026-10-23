@@ -333,3 +333,11 @@ def test_the_script_grades_a_record_on_a_law_and_names_its_refusals(tmp_path, ca
     law.write_text(json.dumps(_law(decode=False)))
     assert recurrence.main(str(tmp_path), law=str(law)) == 1
     assert "decode: 2 steps the law refuses" in capsys.readouterr().out
+
+
+def test_a_forward_past_warm_factor_times_its_charge_is_not_graded(tmp_path):
+    """Step 4 stalls 100 ms before its exit, as a first touch does."""
+    steps = record()
+    steps[4]["t_exit_ns"] += 100 * MS
+    report = recurrence.priced(steps, _labelled(tmp_path, steps), _law())
+    assert report["kinds"]["decode"][0] == 1 and report["kinds"]["decode"][-1]
