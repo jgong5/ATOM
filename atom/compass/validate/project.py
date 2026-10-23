@@ -172,7 +172,7 @@ def publish(store: str, document: dict, cells: dict, machine, command: str):
 
     from atom.compass.run import host_cpu
 
-    (model,) = {c["model"] for _, c in cells.values()}
+    model = next(iter(cells.values()))[1]["model"]
     roots = roots_for({"atom": "atom", "aiter": "aiter"})
     atom = next(r for r in roots if r.name == "atom")
     engines = json.dumps([c["engine"] for _, c in cells.values()], sort_keys=True)
