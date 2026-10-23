@@ -16,6 +16,8 @@ from atom.compass.backends import (
     BatchView,
     CostRefused,
     CostTerm,
+    Method,
+    Provenance,
     RequestShape,
     StepCost,
     StepLinearBackend,
@@ -126,6 +128,51 @@ def test_cost_accuracy_grades_the_draft_apart_and_unvalidated(tmp_path):
     report = cost_accuracy(tmp_path / "steps", law)
     assert "draft" not in report["validated"]
     assert report["unvalidated"]["draft"]["on_totals"] == -1.0
+
+
+def _drafted(tmp_path):
+    """A record of drafts and the draft law fitted on two others."""
+    records = [_mtp_record(tmp_path / f"dp0-{s}.jsonl", _steps(s)) for s in (3, 4)]
+    samples = label_records(records)[0]
+    law, report = fit(samples)
+    mark_held_out(law, report, samples)
+    (tmp_path / "steps").mkdir()
+    _mtp_record(tmp_path / "steps" / "dp0.jsonl", _steps(5))
+    return tmp_path / "steps", law
+
+
+def test_cost_accuracy_grades_an_unvalidated_draft(tmp_path):
+    report = cost_accuracy(*_drafted(tmp_path))
+    assert report["graded"]["draft"]["steps"] > 0
+    assert report["graded"]["draft"] == report["unvalidated"]["draft"]
+
+
+class _DeclaredDraft:
+    """A law's prices with each draft term declared."""
+
+    def __init__(self, law):
+        self.law = StepLinearBackend(StepLinearLaw(law))
+
+    def price(self, view):
+        cost = self.law.price(view)
+        said = Provenance(Method.DECLARED, note="stated")
+        terms = [
+            dataclasses.replace(t, provenance=said) if t.draft else t
+            for t in cost.terms
+        ]
+        return StepCost(terms, cost.treatments)
+
+    def describe(self):
+        return "planted, with a declared draft"
+
+
+def test_a_draft_with_a_declared_term_is_reported_apart_only(tmp_path):
+    record, law = _drafted(tmp_path)
+    report = cost_accuracy(record, _DeclaredDraft(law))
+    assert list(report["declared"]) == ["draft"]
+    assert report["declared"]["draft"]["steps"] > 0
+    assert all("draft" not in report[g] for g in ("graded", "validated", "unvalidated"))
+    assert set(report["graded"]) == {"prefill", "decode"}
 
 
 class _DraftDearestWhenCheapest:

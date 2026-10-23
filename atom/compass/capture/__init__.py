@@ -10,8 +10,10 @@ A shape is a decode width (`--width`), a prefill of T tokens over B sequences
 (`--population`): a decode step at its CUDA-graph rung when it ran at one, else
 at its width, and any other step as a prefill of its query tokens over its
 rows, and under DP the rows the step's MoE gathered over the group, its line's
-`moe_rows`; under a drafter a decode's drafter also at its rows padded to that
-rung and the rows its first pass gathered, `draft_moe_rows`. Under
+`moe_rows`; under a drafter a decode's drafter also at its rows padded to the
+batch its later passes ran at, `draft_bs`, else to that rung, and the rows its
+first pass gathered, `draft_moe_rows`, and a sampling prefill's or DP middle
+chunk's drafter at its `draft_bs` where that differs from its rows. Under
 `--enable-tbo` a step its DP group split is its two
 micro-batches, each a prefill at its own tokens and the group's rows of it,
 by the split `validate bound` rebuilds from every rank's line; a population's
@@ -101,7 +103,7 @@ def main(argv: list[str]) -> None:
 def population_shapes(names, tbo=False):
     """The shape of each step the record directories `names` hold, DP's dummy
     runs aside; under two-batch overlap (`tbo`) a split step's two
-    micro-batches' (`population_steps`); each decode's drafter's too."""
+    micro-batches' (`population_steps`); each drafter's too."""
     return [shape for shape, _ in population_steps(names, tbo, drafters=True)]
 
 
@@ -115,7 +117,9 @@ def population_steps(names, tbo=False, drafters=False):
     rule `validate bound` agrees over every rank's line at that step
     (`bound._split`), is its two micro-batches (`step_roofline.micro_batches`),
     each a prefill at its own tokens and the group's rows of it. With
-    `drafters`, a decode's drafter's shape follows it where they differ."""
+    `drafters`, a drafter's shape follows it where they differ: a decode's
+    at its rows padded to `draft_bs`, else to its rung, a sampling prefill's
+    or a DP middle chunk's with `draft_bs` as its `width`."""
     from atom.compass.backends import BatchView, RequestShape
     from atom.compass.backends.op_graph import step_shape
     from atom.compass.backends.step_roofline import micro_batches
@@ -149,14 +153,18 @@ def population_steps(names, tbo=False, drafters=False):
                     halves = micro_batches(view)
             except ValueError as exc:
                 raise ValueError(f"{name} step {line['step']} {exc}") from None
+            width = line.get("draft_bs")
             if phase == "decode":
                 target = decode(tokens, line.get("moe_rows")).at(dp, drafts)
                 yield target, line
-                draft = decode(tokens, line.get("draft_moe_rows"), len(rows))
+                draft = decode(width or tokens, line.get("draft_moe_rows"), len(rows))
                 if drafters and drafts and (draft := draft.at(dp, drafts)) != target:
                     yield draft, line
             elif not split:
                 yield prefill(tokens, seqs, line.get("moe_rows")).at(dp), line
+                draft = prefill(tokens, seqs, line.get("draft_moe_rows"), width)
+                if drafters and (line.get("produces_output") or dp > 1) and draft.width:
+                    yield draft.at(dp), line
             else:
                 for half in halves:
                     rows = [(r.query_tokens, r.decode) for r in half.requests]

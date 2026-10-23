@@ -376,7 +376,7 @@ def test_the_attention_body_runs_as_a_real_step_then_the_batch_is_dummy_again(
     def stated(ratio, top):
         geometry = {"window_size": 64, "compress_ratio": ratio, "index_topk": top}
         ratio = {"compress_ratio": ratio}
-        decodes = (DECODE, BF16_DECODE, PS_DECODE)
+        decodes = (DECODE, "aiter.mla_decode_v4_asm.default", BF16_DECODE, PS_DECODE)
         qkns = dict.fromkeys((QKN, QKN_BF16), ratio)
         return {**dict.fromkeys(decodes, geometry), INDEXER: ratio, **qkns}
 

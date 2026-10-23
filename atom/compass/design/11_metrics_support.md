@@ -90,7 +90,10 @@ Compass's own, so it adds no LP. It adds no channel either, because `/metrics` i
 HTTP endpoint: in a single deployment the request rides `traffic->frontend:http` and the
 response `frontend->traffic:stream` (`01` D3, the channel table). The frontend serves it
 at its arrival time from the exporter's current snapshot, so it sees the lag of the push
-and the refresh, from the same sources as on a real system. Each sample carries its
+and the refresh, from the same sources as on a real system. ATOM renders it on the API
+server's thread pool (`AtomMetricsExporter.render_async`); in a simulated run that render
+is an uncharged job on the tokenizer station (`SERVICE_JOBS`, `atom/utils/compass_loop.py`),
+so a scrape waits past its arrival only while tokenization holds every thread. Each sample carries its
 simulated scrape time, and `atom:metrics_last_refresh_timestamp_seconds`
 (`_AtomMetricsCollector.collect`) exports `_last_refresh`, so a staleness check compares
 two simulated instants. The scrape timer is a daemon deadline, granted only once it is at
