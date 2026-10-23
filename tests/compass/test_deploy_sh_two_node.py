@@ -95,7 +95,7 @@ def test_a_two_node_record_starts_decode_through_its_prefix_and_stops_it_there(
     _until(d / "server.json", script)
 
     model = ["--model", str(tmp_path)]
-    ports = set()
+    ports = []
     for side, role, own, atom in (
         ("prefill", "kv_producer", [], [*model, "-tp", "2", "--enable-dp-attention"]),
         ("decode", "kv_consumer", ["--host", "127.0.0.1"], model),
@@ -106,9 +106,10 @@ def test_a_two_node_record_starts_decode_through_its_prefix_and_stops_it_there(
         assert seen[-2] == "--kv-transfer-config"
         kv = json.loads(seen.pop())
         assert kv.pop("kv_role") == role and kv.pop("kv_connector") == "mooncake"
-        ports.add(kv.pop("handshake_port"))
+        ports.append(kv.pop("handshake_port"))
         assert not kv
-    assert len(ports) == 2
+    # The nightly's 1P1D launch: the decode's is the prefill's plus its ranks.
+    assert ports[1] == ports[0] + 2
     assert _on(tmp_path) == [f"node-b bash {d}/decode.sh"]
     router = json.loads((tmp_path / "router.json").read_text())
     assert router["argv"][-1] == "--dp-aware"
@@ -361,8 +362,63 @@ def test_every_port_the_deployment_holds_free_is_one_no_bind_to_port_0_takes(
     ends = [
         int(router[router.index(f) + 1]) + 1 for f in ("--port", "--prometheus-port")
     ]
-    for side, ranks in (("prefill", 2), ("decode", 1)):
+    # The decode's handshake port, the prefill's block's end, binds nothing.
+    for side, ranks in (("prefill", 2), ("decode", 0)):
         kv = json.loads(json.loads((d / f"{side}.argv.json").read_text())[-1])
         ends.append(kv["handshake_port"] + ranks)
     ephemeral = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()[0]
     assert max(ends) <= int(ephemeral), ends
+
+
+@pytest.fixture
+def port_range(tmp_path, planted):  # noqa: F811
+    """A file that stands in for `ip_local_port_range` in the ports script."""
+    bindir, path = tmp_path / "bin", tmp_path / "ip_local_port_range"
+    (bindir / "python3").rename(bindir / "python3-planted")
+    code = "import sys; from atom.compass.drive import serve; "
+    code += "serve.PORT_RANGE = serve.Path(sys.argv.pop(1)); exec(sys.stdin.read())"
+    (bindir / "python3").write_text(
+        '#!/bin/sh\nreal="$(dirname "$0")/python3-planted"\n'
+        '[ "$1" = - ] || exec "$real" "$@"\nshift\n'
+        f'exec "$real" -c \'{code}\' {path} "$@"\n'
+    )
+    (bindir / "python3").chmod(0o755)
+    return path
+
+
+def test_a_block_with_no_room_below_the_ephemeral_range_exits_1_naming_both(
+    tmp_path, planted, on, port_range  # noqa: F811
+):
+    env, _ = planted
+    port_range.write_text("17004\t60999\n")
+    words = _record(tmp_path, on)
+    words[words.index("-tp") + 1] = "4"
+
+    done = _run(words, env, tmp_path)
+
+    assert done.returncode == 1, done.stderr
+    assert "deploy: no 4 free ports in a row from 17001 below 17004" in done.stderr
+    assert "Traceback" not in done.stderr
+    assert not (tmp_path / "d" / "prefill.sh").exists()
+
+
+def test_every_port_the_deployment_draws_is_above_mooncake_s_rpc_ports(
+    tmp_path, planted, on, port_range  # noqa: F811
+):
+    """Mooncake draws each rank's RPC port from 15000 to 17000, and each
+    instance's server its ports below 15000."""
+    env, _ = planted
+    port_range.write_text("17101\t60999\n")
+    d = tmp_path / "d"
+    script = subprocess.Popen(
+        _record(tmp_path, on), env=env, cwd=tmp_path, stdout=subprocess.PIPE
+    )
+    _until(d / "server.json", script)
+    script.send_signal(signal.SIGTERM)
+    script.communicate(timeout=60)
+
+    router = json.loads((tmp_path / "router.json").read_text())["argv"]
+    ports = [int(router[router.index(f) + 1]) for f in ("--port", "--prometheus-port")]
+    kv = json.loads(json.loads((d / "prefill.argv.json").read_text())[-1])
+    ports += [kv["handshake_port"], kv["handshake_port"] + 1]
+    assert all(17000 < p < 17101 for p in ports), ports
