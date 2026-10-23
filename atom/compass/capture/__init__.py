@@ -112,14 +112,14 @@ def population_steps(names, tbo=False, drafters=False):
     gathered (`moe_rows`), and its step-record line. A decode step verifies
     as many drafts in each row as its shortest row does. Under two-batch
     overlap (`tbo`, ATOM's `enable_tbo`) a DP step the group split, by the
-    rule `validate bound` agrees over every rank's line at that step
-    (`bound._split`), is its two micro-batches (`step_roofline.micro_batches`),
-    each a prefill at its own tokens and the group's rows of it. With
+    rule ATOM agrees over every rank's line at that step
+    (`step_labels.group_split`), is its two micro-batches
+    (`step_roofline.micro_batches`), each a prefill at its own tokens and the group's rows of it. With
     `drafters`, a decode's drafter's shape follows it where they differ."""
     from atom.compass.backends import BatchView, RequestShape
     from atom.compass.backends.op_graph import step_shape
+    from atom.compass.backends.step_labels import group_split
     from atom.compass.backends.step_roofline import micro_batches
-    from atom.compass.validate.bound import _split
 
     from .forward import decode, prefill
 
@@ -133,7 +133,7 @@ def population_steps(names, tbo=False, drafters=False):
         if tbo and ranks:
             at = [{s["step"]: s for s in lines} for lines in ranks]
             for step in set.intersection(*map(set, at)):
-                splits[step] = _split([r[step] for r in at])
+                splits[step] = group_split([r[step] for r in at])
         for rank, line in ((r, s) for r, lines in enumerate(ranks) for s in lines):
             if line["is_dummy_run"]:
                 continue
