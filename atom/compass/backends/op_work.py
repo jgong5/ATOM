@@ -579,6 +579,14 @@ EXTRACTORS = {
     ),
     FLYDSL + "fused_compress_attn:flydsl_fused_compress_attn": COMPRESS,
     FLYDSL + "fused_compress_attn_hca:flydsl_hca_compress_attn": COMPRESS,
+    # gfx1250's kernels for the same work, at the same arguments.
+    "aiter.batched_gemm_a8w8_mxscale_bpreshuffle.default": _batched_gemm,
+    "aiter.mla_sparse_prefill_fp8_asm.default": _v4_prefill,
+    FLYDSL + "fused_compress_attn_gfx1250:flydsl_fused_compress_attn_gfx1250": COMPRESS,
+    FLYDSL
+    + "fused_compress_attn_hca_gfx1250:flydsl_hca_compress_attn_gfx1250": COMPRESS,
+    "aiter._build_tiles_raw.default": _launch,
+    "aiter._build_sched_raw.default": _launch,
     # The kernel reads only the kv and score rows write_plan names, at most
     # (1 + overlap) * ratio per sequence, so neither is counted.
     f"{V4}state_writes:update_compressor_states": _only("ape", "state_slot_mapping"),
