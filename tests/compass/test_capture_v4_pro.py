@@ -41,6 +41,7 @@ DECODE = "aiter.mla:mla_decode_fwd_v4_nm"
 PS_DECODE = "aiter.mla_decode_v4_ps_asm.default"
 INDEXER = "aiter.indexer_score_topk.default"
 QKN = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
+QKN_BF16 = "aiter.ops.flydsl.kernels.qk_norm_rope_quant:flydsl_qk_norm_rope_quant"
 #: The bf16 KV cache's decode leaf, a Triton launch lifted to its function.
 BF16_DECODE = (
     "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
@@ -282,6 +283,22 @@ def test_the_decode_indexer_and_qk_norm_leaves_alone_state_their_layer_s_geometr
         assert stated == [{"compress_ratio": ratio}]
 
 
+def test_the_bf16_cache_s_qk_norm_states_its_ratio_beside_the_rows_it_writes(
+    tmp_path_factory,
+):
+    config = json.loads(CONFIG.read_text())
+    graphs = capture(
+        tmp_path_factory, "--width 2 -- --kv_cache_dtype bf16 --enable-dp-attention"
+    )
+
+    layers = _decoder(graphs["decode B=2"][0])
+    for layer, ratio in zip(layers, config["compress_ratios"], strict=False):
+        [qkn] = [op for op in layer if op["op"] == QKN_BF16]
+        assert qkn["stated"] == {"compress_ratio": ratio}
+        for slot in ("swa_dest_rows", "batch_id_per_token"):
+            assert qkn["args"][slot]["role"] == "metadata"
+
+
 def test_tp8_without_dp_attention_reduces_in_each_layer_and_declares_nothing(
     tmp_path_factory,
 ):
@@ -360,6 +377,7 @@ def test_the_attention_body_runs_as_a_real_step_then_the_batch_is_dummy_again(
         geometry = {"window_size": 64, "compress_ratio": ratio, "index_topk": top}
         ratio = {"compress_ratio": ratio}
         decodes = (DECODE, BF16_DECODE, PS_DECODE)
-        return {**dict.fromkeys(decodes, geometry), INDEXER: ratio, QKN: ratio}
+        qkns = dict.fromkeys((QKN, QKN_BF16), ratio)
+        return {**dict.fromkeys(decodes, geometry), INDEXER: ratio, **qkns}
 
     assert seen == [(False, stated(4, 512)), (False, stated(128, None))]

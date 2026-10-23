@@ -962,9 +962,12 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   indexer's score and top-k states its `compress_ratio`, read in the opened
   attention's body from the layer `layer_name` names. Their index lists are sized for
   the deployment's longest row, so the entries a row reads follow from these and its
-  context, not from the lists. The fused QK-norm and RoPE,
-  `aiter._fused_qk_norm_rope_group_quant_kernel.default`, states its layer's
-  `compress_ratio` too ([ruling on #1973](https://github.com/jgong5/ATOM/issues/1973#issuecomment-6358962981)):
+  context, not from the lists. The fused QK-norm and RoPE
+  (`capture.forward.V4_QKNS`: the fp8 KV cache's
+  `aiter._fused_qk_norm_rope_group_quant_kernel.default` and the bf16 one's
+  `aiter.ops.flydsl.kernels.qk_norm_rope_quant:flydsl_qk_norm_rope_quant`) states its
+  layer's `compress_ratio` too ([ruling on #1973](https://github.com/jgong5/ATOM/issues/1973#issuecomment-6358962981),
+  extended to the bf16 leaf by [#2031](https://github.com/jgong5/ATOM/issues/2031)):
   at decode it writes each token's window row to the destination rows of that ratio's
   class, which `bench.ops.V4_METADATA` binds to `v4_swa_dest_{dense,csa,hca}`.
 
