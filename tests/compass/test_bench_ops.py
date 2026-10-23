@@ -31,6 +31,7 @@ from atom.compass.bench import ops
 from atom.compass.capture import driverless
 from atom.compass.capture.forward import decode, prefill
 from atom.compass.capture.graph import Traced, build, to_json
+from atom.compass.ir.nodes import Reduced
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
 from atom.utils import block_convert
@@ -533,6 +534,41 @@ def test_a_v4_metadata_slot_is_a_view_of_the_buffer_atom_passes_or_refuses():
         (state, "state_slot_mapping"): "state_slot_out",
         (state, "write_plan"): "v4_write_plan_128",
         (qkn, "batch_id_per_token"): "batch_id_per_q_token",
+    }
+
+
+def test_v4_index_writer_takes_atom_s_state_slots_and_dest_rows_by_ratio():
+    # Bound by size, the state slots were `context_lens` and every destination
+    # row `top_ks`. The dict's items are out of ratio order, so an item binds
+    # by its key, not its place; no HCA buffer is live, so its item refuses.
+    write = (
+        "atom.model_ops.v4_kernels.paged_decode_indices:write_v4_paged_decode_indices"
+    )
+    rows = _t([8], "metadata", dtype="torch.int32")
+    runner = _Runner()
+    runner.forward_vars |= {
+        "context_lens": torch.zeros(3, dtype=torch.int32),
+        "top_ks": torch.zeros(8, dtype=torch.int32),
+        "v4_meta_state_slot_out": torch.zeros(16, dtype=torch.int32),
+        "v4_swa_dest_dense": torch.zeros(16, dtype=torch.int32),
+        "v4_swa_dest_csa": torch.zeros(32, dtype=torch.int32),
+    }
+    leaf = _leaf(
+        write,
+        ("state_slot_per_seq", _t([3], "metadata", dtype="torch.int32")),
+        ("dest_rows", Reduced("builtins:dict", ((128, rows), (0, rows), (4, rows)))),
+    )
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(leaf, layers=1)["region"])
+
+    stub._prepare((0, 0))
+
+    [(_, views)] = stub.placed
+    assert {p: n for (_, p), (n, _) in views.items()} == {
+        "state_slot_per_seq": "v4_meta_state_slot_out",
+        "dest_rows.0.1": "ATOM passes dest_rows.0.1 v4_swa_dest_hca: not live",
+        "dest_rows.1.1": "v4_swa_dest_dense",
+        "dest_rows.2.1": "v4_swa_dest_csa",
     }
 
 

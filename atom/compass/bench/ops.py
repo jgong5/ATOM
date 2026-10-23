@@ -196,15 +196,17 @@ TOKEN_IDS = {("aten.embedding.default", "indices")}
 #: The operator whose metadata slots are named as the fields of DeepSeek-V4's
 #: HCA decode workspace: aiter defines its schema and the workspace together.
 HCA_DECODE = "aiter.mla_decode_v4_ps_asm.default"
-#: DeepSeek-V4's metadata arguments, by operator and slot, and the live buffer
-#: ATOM passes each, at the compress ratio the leaf takes or states (`{ratio}`)
-#: and that ratio's attention kind (`{kind}`): `_meta`'s rules bind them to a
-#: tighter buffer of their dtype. A leaf whose buffer is not live refuses.
+#: DeepSeek-V4's metadata arguments, by operator and slot, a dict argument's
+#: item by its key (`slot.<key>`), and the live buffer ATOM passes each, at the
+#: compress ratio the leaf takes or states (`{ratio}`) and that ratio's
+#: attention kind (`{kind}`): `_meta`'s rules bind them to a tighter buffer of
+#: their dtype. A leaf whose buffer is not live refuses.
 #: A decode's `split_indptr` is its split plan's, `split_plan_<kind>.1`. The
 #: paged-decode index leaves write their indptrs into the clone that the
 #: leaves timed after them at a placement read.
 _NM = "aiter.mla:mla_decode_fwd_v4_nm"
 _INDICES = "atom.model_ops.v4_kernels.paged_decode_indices"
+_WRITE = f"{_INDICES}:write_v4_paged_decode_indices"
 _CSA = "aiter.ops.flydsl.kernels.fused_compress_attn:flydsl_fused_compress_attn"
 _HCA = "aiter.ops.flydsl.kernels.fused_compress_attn_hca:flydsl_hca_compress_attn"
 _STATE = "atom.model_ops.v4_kernels.state_writes:update_compressor_states"
@@ -213,6 +215,11 @@ _BF16 = "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_tri
 V4_METADATA = {
     (_NM, "kv_indptr"): "kv_indptr_{kind}",
     (_NM, "split_indptr"): "split_plan_{kind}.1",
+    (_WRITE, "state_slot_per_seq"): "v4_meta_state_slot_out",
+    **{
+        (_WRITE, f"dest_rows.{ratio}"): f"v4_swa_dest_{kind}"
+        for ratio, kind in ((0, "dense"), (4, "csa"), (128, "hca"))
+    },
     **{
         (f"{_INDICES}:{fn}", f"{kind}_indptr"): f"kv_indptr_{kind}"
         for fn in ("build_v4_paged_decode_indptr", "write_v4_paged_decode_indices")
@@ -585,7 +592,7 @@ class Stub:
                     what, field = "metadata", path.split(".")[0]
                     if op["op"] == HCA_DECODE and field in work:
                         pool, what = {field: work[field]}, "HCA workspace"
-                    if wanted := V4_METADATA.get((op["op"], field)):
+                    if wanted := V4_METADATA.get((op["op"], _keyed(op["args"], path))):
                         what = wanted.format(ratio=ratio, kind=V4_KINDS.get(ratio))
                         pool = {what: named[what]} if what in named else {}
                     try:
@@ -976,6 +983,16 @@ def point_rows(shape, context, pool: int, block_size: int) -> list[list]:
 def _specs(args):
     """Each tensor argument in `args`, by its slot path."""
     return [(p, v) for p, v in _values(args) if isinstance(v, dict) and "role" in v]
+
+
+def _keyed(args, path) -> str:
+    """A slot path's argument, a dict argument's item `slot.i.1` named by its
+    key, `slot.<key>`."""
+    slot, *rest = path.split(".")
+    value = args.get(slot)
+    if rest and isinstance(value, dict) and value.get("object") == "builtins:dict":
+        return f"{slot}.{value['state'][int(rest[0])][0]}"
+    return slot
 
 
 def _values(args, path=""):
