@@ -723,6 +723,24 @@ def test_a_prefill_prices_linearly_in_its_rows_cached_tokens(rows, params, answe
         assert cost.refusals == (Refusal("price-list", answer),)
 
 
+@pytest.mark.parametrize(
+    "rows,validated",
+    [
+        ([(32, 32 + 512, False)] * 2, True),
+        ([(32, 32, False), (32, 1056, False)], False),
+    ],
+    ids=["uniform", "uneven"],
+)
+def test_a_prefill_whose_rows_cached_tokens_differ_is_not_validated(rows, validated):
+    # both means are 512, inside the held-out 1024's bracket 0 to 2048
+    final = replace(view(*rows), produces_output=True)
+    (term,) = backend(ATTN, price_list=CACHED).price(final).terms
+
+    assert term.seconds == pytest.approx(1.5e-5)
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is validated
+
+
 def test_a_resource_bound_par_prices_its_leaves_work_not_their_listed_prices():
     big = g(2, 4096, 4096)
     params = listed(
@@ -838,10 +856,55 @@ def test_a_query_on_two_dimensions_is_validated_only_when_both_lines_are(
     assert term.provenance.validated is validated
 
 
-@pytest.mark.parametrize("bs,validated", [((1, 8, 64), True), ((1, 64), False)])
-def test_a_term_of_measured_and_validated_leaves_is_validated(bs, validated):
-    # N = 64 is measured at B = 32; N = 128 is estimated between its points
-    params = listed(*flat(64, 1, 32, 64), *flat(128, *bs))
+@pytest.mark.parametrize(
+    "points,step",
+    [
+        (
+            # B = 1, 4, 8 launch one kernel and 64, 512 another: the held-out
+            # B = 4's bracket 1 to 8 is on B = 300's line, not around it
+            [
+                pt(g(b, 64, 64), f"decode B={b}", b * 1e3, c, kernel)
+                for b, kernel in ((1, "a"), (4, "a"), (8, "a"), (64, "b"), (512, "b"))
+                for c in (100, 1000)
+            ],
+            view(*[(1, 90, True)] * 300),
+        ),
+        (
+            # the held-out B = 8's bracket 1 to 64 is at context 3000, while
+            # context 1000 holds B = 8 and 64 only
+            [
+                pt(g(b, 64, 64), f"decode B={b}", b * 1e4 + c * 10, c)
+                for b, c in ((8, 1000), (64, 1000), (1, 3000), (8, 3000), (64, 3000))
+            ],
+            view(*[(1, 1000, True)] * 32),
+        ),
+    ],
+    ids=["another-kernel-band", "a-sibling-line"],
+)
+def test_a_bracket_not_around_the_query_on_its_own_line_does_not_validate_it(
+    points, step
+):
+    listing = backend(g(2, 64, 64), padded=False, price_list=listed(*points))
+    (term,) = listing.price(step).terms
+
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is False
+
+
+@pytest.mark.parametrize(
+    "bs_64,bs_128,validated",
+    [
+        ((1, 32, 64), (1, 8, 64), True),
+        ((1, 32, 64), (1, 64), False),
+        ((1, 8, 64), (1, 64), False),
+    ],
+    ids=["measured-and-validated", "measured-and-not", "validated-and-not"],
+)
+def test_a_term_is_validated_only_when_every_estimated_leaf_is(
+    bs_64, bs_128, validated
+):
+    # at B = 32, N = 64 is measured or validated; N = 128 is validated or not
+    params = listed(*flat(64, *bs_64), *flat(128, *bs_128))
     pair = {"seq": [g(2, 64, 64), g(2, 128, 64)]}
     (term,) = backend(pair, padded=False, price_list=params).price(THIRTY_TWO).terms
 

@@ -477,9 +477,9 @@ class PriceList(CostSource):
         ]
 
     def _validated(self, name: str, at: tuple) -> bool:
-        """Whether `at` interpolates along some line, and every line it
-        interpolates along holds a bracket around it: a line through `at`'s
-        neighbours in the other dimensions that holds no point at `at`."""
+        """Whether every line `at` interpolates along holds a bracket around
+        it: a line through `at`'s neighbours in the other dimensions that
+        holds no point at `at`."""
         f, (points, axes) = self.params["families"][name], self._table(name)
         near, held = self._near(at, axes), f.get("brackets", ())
         lines = [
@@ -488,7 +488,7 @@ class PriceList(CostSource):
             for rest in itertools.product(*near[:i], *near[i + 1 :])
             if (*rest[:i], x, *rest[i:]) not in points
         ]
-        return bool(lines) and all(
+        return all(
             any(
                 d == f["dims"][i] and r == rest and lo < at[i] < hi
                 for d, r, lo, hi in held
