@@ -41,7 +41,8 @@ under `fallback` when the run's file composes the step roofline below it. A step
 it extrapolated, past its support domain, is counted too. An answer of any
 method but an estimated one outside its hull is validated, as the run summary
 groups seconds: an op graph's analytical and measured leaves are, its
-interpolated ones (estimated, not validated) are not.
+interpolated ones only inside a held-out bracket on each line they interpolate
+along, and are unvalidated otherwise.
 
 Per kind the report also gives the priced seconds of those steps by method
 (`backends.cost.GROUPS`), and per cost term, an op graph's op kind its
