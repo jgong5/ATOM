@@ -29,8 +29,8 @@ reads at the step's rows, attention's context in `kv`, the run's KV cache
 format, the routed experts over the run's `ep` ranks. A leaf that launches
 no kernel costs nothing. A step prices once the leaves of a kind that agree on
 every part of a leaf the kind's work has read, a leaf whose work reads nothing
-of the step keeps its price, and a graph keeps its price for each set of
-prices of its leaves that read the step. Regions compose by the
+of the step keeps its price, and with no price list a graph keeps its price
+for each set of prices of its leaves that read the step. Regions compose by the
 IR's joins: a `Seq` adds its items in order, a `Repeat` re-emits its body's
 prices once per instance, a `max` `Par` emits its longest branch's prices, and a
 `resource_bound` `Par` one roofline over its branches' summed work. The price
@@ -103,6 +103,9 @@ DRAFT = "draft "
 #: The leaves a backend keeps; past it, it forgets them all and every price
 #: it kept across steps.
 KEPT = 1 << 16
+#: The prices a graph keeps by its step-reading leaves' prices; past it, it
+#: forgets them.
+COMPOSED = 1 << 12
 #: A reference argument's keys: a context key or a module path, whose value a
 #: leaf's work does not read.
 REFS = ({"context"}, {"module"})
@@ -295,19 +298,21 @@ class OpGraphBackend(CostBackend):
             drafted_at, drafted = (
                 self._region(batch_view, draft=True) if self.drafts else (None, None)
             )
-            graph = (at, id(region), drafted_at, id(drafted), bound)
+            # A price list's bound reads each step's context, so its steps
+            # compose afresh.
+            graph = None if bound else (at, id(region), drafted_at, id(drafted))
             if graph in self._graphs:
                 # The other leaves' prices read nothing of a step.
                 missed: list[Refusal] = []
                 got = [
-                    (*p[:2], self._leaf(p[0], batch_view, missed, bound))
+                    (*p[:2], self._leaf(p[0], batch_view, missed, None))
                     for p in self._graphs[graph][1]
                 ]
                 if missed:
                     self._step = {}
                 elif (cost := self._graphs[graph][2].get(_same(got))) is not None:
                     return cost
-            self._live = []
+            self._live = [] if graph else None
             priced = self._priced(region, batch_view, refused, bound)
             if self.drafts:
                 priced += [
@@ -352,7 +357,7 @@ class OpGraphBackend(CostBackend):
         cost = StepCost(terms)
         if graph is not None:
             composed = self._graphs.get(graph, (0, 0, {}))[2]
-            if len(composed) >= KEPT:
+            if len(composed) >= COMPOSED:
                 composed.clear()
             composed[_same(live)] = cost
             self._graphs[graph] = ((region, drafted), live, composed)
