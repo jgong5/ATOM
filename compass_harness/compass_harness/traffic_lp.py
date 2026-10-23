@@ -20,7 +20,8 @@ waits for it.
 When aiperf cancels the requests in flight at its grace deadline, the traffic
 LP closes them at that time (`cancel`): each one's cancel is a stamped request
 of its own, which its worker sends and the frontend answers by hanging the
-cancelled request up at the cancel's arrival.
+cancelled request up at the cancel's arrival. Behind a PD router the router LP
+answers it and hands it on to the frontend that holds the request.
 
 A request that errors mid-stream never reports the events after its last read.
 When released events stay unreported for ``DIAG_S`` wall seconds while an
@@ -63,9 +64,8 @@ class TrafficLP:
         prefix: str,
         http: str = HTTP,
         stream: str = STREAM,
-        cancels: bool = True,
     ) -> None:
-        self.rt, self.http, self.stream, self.cancels = rt, http, stream, cancels
+        self.rt, self.http, self.stream = rt, http, stream
         stamps, reports = addresses(prefix)
         ctx = zmq.asyncio.Context.instance()
         self._pub = ctx.socket(zmq.XPUB)
@@ -114,10 +114,6 @@ class TrafficLP:
             os.environ[ADDRESS_ENV],
             http.name,
             stream.name,
-            # ponytail: behind a PD router a cancel would reach frontend-P, not
-            # the frontend-D that streams, and the router refuses its body, so
-            # aiperf's hang-up stays unstamped.
-            http.target == stream.source != compass_run.ROUTER,
         )
 
     # ---- the clock ClockPacedLoopScheduler paces on ----
@@ -160,8 +156,6 @@ class TrafficLP:
         once every one is written. The hold passes each closed request's return
         before the next clock call; its stream events still to come are dropped.
         """
-        if not self.cancels:
-            return
         fut = asyncio.get_running_loop().create_future()
         self._caught_up.append(fut)
         self._changed.set()

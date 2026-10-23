@@ -9,13 +9,19 @@ prices them; neither reads a step's stamps. Neither takes a record whose
 run.json names `BUILDS`, aiter JIT modules its server built while it served;
 `refusal` says why.
 
+A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
+`dp_rank`. An older record's lines state neither count: `group_tokens`
+rebuilds `moe_tokens` from every rank's line, and no step is split.
+
 A step's device label is its device busy time, `d_busy_ns`, plus for a decode
 step the device work queued since the previous forward's exit, `d_gap_ns`. A
 decode step whose device start precedes its host launch end is launch-exposed
 and cut; a prefill step is never cut, so a host bubble inside it stays in its
 label. On an MTP record, one with `d_target_ns`, the device label is the
 target's, `d_target_ns` with no gap, and the draft label is the rest of
-`d_busy_ns`. The exit of each wait for the previous output's token copy (`t_recv_ns`)
+`d_busy_ns`. On a prefill step that produces output, the draft label's
+`propose` pass, `d_propose_ns`, is also its propose label. The exit of each
+wait for the previous output's token copy (`t_recv_ns`)
 bounds the host clock's lead over the device's (that forward had finished by
 then); the tightest of the last `ANCHORS` bounds is the lead. The copy itself
 lands on its own stream after the exit event the bound reads, by 14 to 29 us
@@ -86,11 +92,15 @@ class Sample:
 
     `device_s` is its device label, None when cut, and `cut` names why (`CUTS`).
     `draft_s` is its draft label, None when cut or on a step with no draft.
+    `propose_s` is its propose label, the part of `draft_s` that is the
+    `propose` pass, on a prefill step that produces output; None elsewhere.
     `host` holds the segments it has, in seconds: no `W_post` on a middle chunk,
     no `E` on the record's first forward or after an idle engine (`idle`).
     `provenance` holds `source`, `run` (the run's digest), `requests` (the
     request ids the step served) and `config` (the host key the record states,
     or None).
+    `dummies` holds the steps its rank ran as a DP dummy forward, which give no
+    sample: the same set on each of the rank's samples.
     """
 
     step: int
@@ -102,6 +112,15 @@ class Sample:
     idle: bool
     provenance: dict
     draft_s: float | None = None
+    propose_s: float | None = None
+    dummies: frozenset = frozenset()
+
+
+def group_tokens(lines) -> int | None:
+    """The real tokens among a data-parallel step's `moe_rows`: ATOM's
+    `num_tokens_across_dp` summed over every rank's line at that step, a dummy
+    rank's one row. None when a rank's line is missing."""
+    return None if None in lines else sum(q for s in lines for q, _, _ in s["rows"])
 
 
 def digest(record) -> str:
@@ -177,6 +196,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
     if (pulls := path.with_suffix(".pulls.jsonl")).exists():
         join_stamps(lines, pulls)
     steps = [s for s in lines if not s["is_dummy_run"]]
+    dummies = frozenset(s["step"] for s in lines if s["is_dummy_run"])
     if not steps or "t_enter_ns" not in steps[0]:
         raise ValueError(
             f"{record} has no timed steps; a fit needs a real run's record"
@@ -191,16 +211,26 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
     key = path.with_suffix(".key.json")
     config = read_json(key) if key.exists() else None
     run = run or digest(record)
-    samples, table, prev = [], [], None
+    samples, table, prev, ranks = [], [], None, None
     for s in lines:
         if s["is_dummy_run"]:
             prev = s
             continue
+        dp, tokens = "moe_rows" in s, s.get("moe_tokens")
+        if dp and tokens is None:
+            if ranks is None:
+                peers = path.parent.glob(path.name.split("dp")[0] + "dp*[0-9].jsonl")
+                ranks = [{t["step"]: t for t in read_jsonl(p)} for p in sorted(peers)]
+            tokens = group_tokens([r.get(s["step"]) for r in ranks])
+        split = s.get("tbo_tokens")
         view = BatchView(
             tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
             capture_rung=s["rung"],
             moe_rows=s.get("moe_rows"),
             produces_output=s["produces_output"],
+            tbo_tokens=None if split is None else tuple(map(tuple, split)),
+            moe_tokens=tokens,
+            dp_rank=s["dp_rank"] if dp else None,
         )
         cut = None
         if view.prefill and view.decode:
@@ -211,10 +241,12 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
             cut = "unsplit"
         gap = 0 if view.prefill else s.get("d_gap_ns", 0)
         device = None if cut else (gap + s["d_busy_ns"]) * 1e-9
-        draft = None
+        draft = propose = None
         if "d_target_ns" in s:  # an MTP record: the target alone, no gap
             device = None if cut else s["d_target_ns"] * 1e-9
             draft = (s["d_busy_ns"] - s["d_target_ns"]) * 1e-9
+            if view.prefill and view.produces_output:
+                propose = s.get("d_propose_ns")
         enter, (l0, l1) = s["t_enter_ns"], s["t_launch_ns"]
         g0, g1 = s.get("t_gate_ns", (l0, l0))
         r0, r1 = s.get("t_recv_ns", (l1, l1))
@@ -250,6 +282,8 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
                 idle,
                 provenance,
                 None if cut else draft,
+                None if cut or propose is None else propose * 1e-9,
+                dummies,
             )
         )
         gap_ns = s.get("d_gap_ns")

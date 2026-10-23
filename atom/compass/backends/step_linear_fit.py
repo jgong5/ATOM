@@ -25,7 +25,8 @@ under another engine config refuses it. At its `data_parallel_size` N above 1
 N, each run's `dp0.jsonl` to `dp<N-1>.jsonl`. A step is its ranks' lines
 joined on step index, labelled with the smallest rank label (the others wait
 for the last rank to enter), and a prefill row adds the line's `moe_rows`. A
-step that some rank cut, or whose ranks' rows fall to different vectors, is
+rank that ran the step as a dummy forward adds no row. A step that some rank
+lacks otherwise or cut, or whose ranks' rows fall to different vectors, is
 counted under `ranks` and not fitted. The law reports each step's rank label
 spread, `max / min - 1`, as its p50 and p90 under `spread`. The group's step
 is the max over its ranks, so each vector is fitted by alternating max-affine
@@ -64,7 +65,11 @@ out and named under `unfitted`; `StepLinearBackend` refuses its steps.
 
 On an MTP record a step also carries a draft label (`step_labels`). `fit` fits
 the steps that carry one on their draft labels the same way, and writes that law
-under the law's `draft`; it holds no `held_out`.
+under the law's `draft`; it holds no `held_out`. A step with a propose label
+(`step_labels`) is fitted there on its draft label less that label, the
+draft-KV pass a middle chunk runs too, and left out when nothing remains; the
+propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`.
+The draft law's prefill vector adds `seqs` and `out` (`StepLinearLaw`).
 
 Forms (`FORMS`): `base`, the features `StepLinearLaw` always prices; `history`,
 prefill plus `Sum (N_KV - N_Q)`, the KV a short chunk reads on a deep history;
@@ -81,9 +86,10 @@ With two or more runs it also prints, per form, the error on each run of a
 law fitted on the others, warm steps left out: per kind and rung, or prefill
 token band, the p10, p50 and p90 of `predicted / measured - 1`; and the same
 per host law. The law's own form's errors are written into it: under each
-vector's `held_out`, the convex hull of every rank's steps they were measured on and
-their percentiles per band, which `StepLinearLaw` reads to mark a term
-validated. A vector whose held-out steps span no hull gets none.
+vector's `held_out`, the convex hull of the rows they were priced by, each
+step's costliest rank's, and their percentiles per band, which `StepLinearLaw`
+reads to mark a term validated. A cheaper rank's row is not hulled: no error was
+measured at it. A vector whose held-out steps span no hull gets none.
 """
 
 from __future__ import annotations
@@ -110,6 +116,7 @@ from atom.compass.backends.step_linear import (
     EAGER,
     HISTORY,
     PREFILL,
+    PROPOSE,
     ROWMOD,
     rowmod,
 )
@@ -137,12 +144,15 @@ def _rung_key(rung: int | None) -> str:
     return EAGER if rung is None else str(rung)
 
 
-def _features(samples, form: str, dp: int) -> tuple[list[tuple], dict]:
+def _features(
+    samples, form: str, dp: int, draft: bool = False
+) -> tuple[list[tuple], dict]:
     """One rank's fittable samples as (vector, features, seconds, step, context),
     and how many were cut, per reason.
 
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
-    order, plus `history` for that form and, above `dp` 1, `moe_rows` on prefill;
+    order, plus `history` for that form, above `dp` 1 `moe_rows` on prefill, and
+    under `draft` `seqs` and `out` on prefill, as `StepLinearBackend` counts them;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill.
     """
     cut, rows = dict.fromkeys(CUTS, 0), []
@@ -164,6 +174,9 @@ def _features(samples, form: str, dp: int) -> tuple[list[tuple], dict]:
                             "a data-parallel law prices prefill from"
                         )
                     counts += (view.moe_rows,)
+                if draft:
+                    output = bool(view.produces_output)
+                    counts += (len(r) if output else 0, int(output))
             else:
                 key = _rung_key(view.capture_rung)
                 counts = (1, sum_context(view.decode), view.graph_padding)
@@ -370,23 +383,30 @@ def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
     return {"equal": equal, "facets": facets}
 
 
-def _groups(run, form: str) -> tuple[list[list[tuple]], dict, list[float]]:
-    """One run's steps, each its ranks' `_features` rows labelled with the smallest
-    rank label; what was cut; and each step's rank label spread."""
-    got = [_features(rank, form, len(run)) for rank in run]
+def _groups(
+    run, form: str, draft: bool = False, steps=None
+) -> tuple[list[dict[int, tuple]], dict, list[float]]:
+    """One run's steps, each {rank: its `_features` row} labelled with the
+    smallest rank label, a rank that ran the step as a dummy forward holding
+    none; what was cut; and each step's rank label spread. With `steps`, only
+    the steps numbered in it."""
+    dummies = [rank[0].dummies for rank in run]
+    run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
+    got = [_features(rank, form, len(run), draft) for rank in run]
     cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
     if len(run) == 1:
-        return [[r] for r in got[0][0]], cut, []
+        return [{0: r} for r in got[0][0]], cut, []
     ranks = [{r[3]: r for r in rows} for rows, _ in got]
     groups, spread, cut["ranks"] = [], [], 0
     for step in sorted(set().union(*ranks)):
-        group = [rank.get(step) for rank in ranks]
-        if None in group or len({r[0] for r in group}) > 1:
+        group = {i: rank[step] for i, rank in enumerate(ranks) if step in rank}
+        ran = len(group) + sum(step in d for d in dummies)
+        if ran < len(ranks) or len({r[0] for r in group.values()}) > 1:
             cut["ranks"] += 1
             continue
-        labels = [r[2] for r in group]
+        labels = [r[2] for r in group.values()]
         spread.append(max(labels) / min(labels) - 1.0)
-        groups.append([(*r[:2], min(labels), *r[3:]) for r in group])
+        groups.append({i: (*r[:2], min(labels), *r[3:]) for i, r in group.items()})
     return groups, cut, spread
 
 
@@ -397,10 +417,15 @@ def _slowest(groups, prefill: list[str]) -> tuple[list[tuple], dict]:
     for key in sorted({g[0][1] for g in groups if len(g) > 1}):
         names = prefill if key == "prefill" else list(DECODE)
         at = [j for j, g in enumerate(groups) if g[0][1] == key]
-        x = np.array([[r[2] for r in groups[j]] for j in at], dtype=np.float64)
+        width = max(len(groups[j]) for j in at)
+        # A dummy rank's missing row is a zero row, which prices 0, so is never a
+        # step's highest, and is left out of the fit on every rank's row.
+        pad = [(0,) * len(names)]
+        x = [[r[2] for r in groups[j]] + pad * (width - len(groups[j])) for j in at]
+        x = np.array(x, dtype=np.float64)
+        real = x[:, :, 0] > 0  # a row's first feature, the step, is 1
         y = np.array([groups[j][0][3] for j in at])
-        flat = x.reshape(-1, x.shape[2])
-        coef = _solve(flat, np.repeat(y, x.shape[1]), names)["coef"]
+        coef = _solve(x[real], np.repeat(y, real.sum(axis=1)), names)["coef"]
         error = (x @ coef).max(axis=1) / y - 1.0
         centre = float(np.median(error))
         mad = float(1.4826 * np.median(np.abs(error - centre)))
@@ -427,11 +452,12 @@ def _options(options) -> tuple[str, int]:
     return options["form"], options["dp"]
 
 
-def fit(samples, options=None, seed: int = 0) -> tuple[dict, dict]:
+def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict, dict]:
     """The law over `samples`, as the mapping `StepLinearLaw` reads, and its report.
 
     `options` takes `form` (`base` by default) and `dp`, the ranks each run
-    holds (1 by default); `seed` fixes the `rowmod` shuffles.
+    holds (1 by default); `seed` fixes the `rowmod` shuffles; `draft` adds
+    `seqs` and `out` to the prefill vector.
     """
     from scipy.spatial import QhullError
 
@@ -439,12 +465,13 @@ def fit(samples, options=None, seed: int = 0) -> tuple[dict, dict]:
     runs = _runs(samples, dp)
     groups, cut, spread = [], {"warm": 0, "warm_s": 0.0}, []
     for i, run in enumerate(runs.values()):
-        got, c, s = _groups(run, form)
-        groups += [[(i, *r) for r in g] for g in got]
+        got, c, s = _groups(run, form, draft)
+        groups += [[(i, *r) for r in g.values()] for g in got]
         spread += s
         for k, v in c.items():
             cut[k] = cut.get(k, 0) + v
     prefill = list(HISTORY if form == "history" else PREFILL) + ["moe_rows"] * (dp > 1)
+    prefill += ["seqs", "out"] * draft
     rows, alternation = _slowest(groups, prefill)
     law = {
         "provenance": f"step_linear_fit {form} on {len(runs) * dp} real records "
@@ -551,13 +578,30 @@ def fit(samples, options=None, seed: int = 0) -> tuple[dict, dict]:
         "held_out": {},
     }
     drafts = [
-        dataclasses.replace(s, device_s=s.draft_s, draft_s=None)
+        dataclasses.replace(
+            s, device_s=s.draft_s - (s.propose_s or 0.0), draft_s=None, propose_s=None
+        )
         for s in samples
-        if s.draft_s is not None
+        if s.draft_s is not None and s.draft_s > (s.propose_s or 0.0)
     ]
     if drafts:
-        law["draft"] = fit(drafts, options, seed)[0]
+        law["draft"] = fit(drafts, options, seed, draft=True)[0]
+        if proposes := [s for s in samples if s.propose_s is not None]:
+            law["draft"]["propose"] = _propose(proposes)
     return law, report
+
+
+def _propose(samples) -> dict:
+    """The draft law's `propose` vector over `samples`' propose labels, on
+    `PROPOSE`, solved and hulled as a step vector is."""
+    x = np.array([(1, len(s.view.requests)) for s in samples], dtype=np.float64)
+    s = _solve(x, np.array([s.propose_s for s in samples]), list(PROPOSE))
+    fitted = {k: s[k] for k in ("condition", "centre", "mad", "zero")}
+    return {
+        "coefficients": dict(zip(PROPOSE, map(float, s["coef"]))),
+        "hull": _hull(x[s["keep"]][:, 1:], PROPOSE[1:]),
+        "fit": {"samples": int(s["keep"].sum()), **fitted},
+    }
 
 
 def token_band(tokens: int) -> str:
@@ -573,9 +617,16 @@ def _band(key: str, counts) -> str:
     return f"prefill tokens {token_band(counts[1])}"
 
 
+def priced_rank(ranks: dict):
+    """The rank a DP step is priced and banded as, of `ranks`, {rank: (price,
+    features)}: its costliest, a tie going to the rank of larger features, which a
+    law blind to them prices the same and the step still waits for."""
+    return max(ranks, key=ranks.get)
+
+
 def _held_out(samples, options, seed, warm=None):
     """Each step of each run, warm steps left out, priced as its costliest rank
-    by the law fitted on the other runs: (run, vector, band, each rank's (counts,
+    by the law fitted on the other runs: (run, vector, band, that rank's (counts,
     context), relative error), the error nan where that law has no vector."""
     form, dp = _options(options)
     runs = _runs(samples, dp)
@@ -585,11 +636,11 @@ def _held_out(samples, options, seed, warm=None):
         others = [s for s in samples if s.provenance["run"] != run]
         law = fit(others, options, seed)[0]
         for group in _groups(ranks, form)[0]:
-            key, _, seconds, step, _ = group[0]
+            key, _, seconds, step, _ = next(iter(group.values()))
             if step in warm[i]:
                 continue
             vector = law["decode"].get(key) if key != "prefill" else law.get(key)
-            mine = [(r[1], r[4]) for r in group]
+            mine = [(r[1], r[4]) for r in group.values()]
             price, error = [c[1] for c, _ in mine], float("nan")
             if vector is not None:
                 c = list(vector["coefficients"].values())
@@ -597,8 +648,8 @@ def _held_out(samples, options, seed, warm=None):
                     float(np.dot(c, x + _rowmod_count(vector, n))) for x, n in mine
                 ]
                 error = max(price) / seconds - 1.0
-            top = mine[int(np.argmax(price))][0]
-            yield run, key, _band(key, top), mine, error
+            top = mine[priced_rank({j: (p, mine[j][0]) for j, p in enumerate(price)})]
+            yield run, key, _band(key, top[0]), top, error
 
 
 def _rowmod_count(vector: dict, context) -> tuple:
@@ -626,8 +677,8 @@ def _bands(rows) -> dict:
 
 def mark_held_out(law: dict, report: dict, samples, options=None, seed: int = 0):
     """Write the held-out errors: under each of `law`'s vectors, as `held_out`,
-    the hull of every rank's step `_held_out` priced, their errors per band; under
-    `report`'s `held_out`, each run's errors per band."""
+    the hull of the rank rows `_held_out` priced its steps by, their errors per
+    band; under `report`'s `held_out`, each run's errors per band."""
     from scipy.spatial import QhullError
 
     rows = [
@@ -641,7 +692,7 @@ def mark_held_out(law: dict, report: dict, samples, options=None, seed: int = 0)
         mine = [r for r in rows if r[1] == key]
         if vector is None or not mine:
             continue
-        points = [c + _rowmod_count(vector, x) for r in mine for c, x in r[3]]
+        points = [r[3][0] + _rowmod_count(vector, r[3][1]) for r in mine]
         try:
             hull = _hull(
                 np.array(points, dtype=np.float64)[:, 1:],

@@ -59,8 +59,9 @@ def _key(tokens):
     return hashlib.blake2b(data, digest_size=8).hexdigest()
 
 
-def _config(dp_rank=0, pipeline_parallel_size=1, budget=BUDGET, blocks=4096):
+def _config(dp_rank=0, pipeline_parallel_size=1, budget=BUDGET, blocks=4096, **extra):
     return MockConfig(
+        **extra,
         max_num_seqs=8,
         num_kvcache_blocks=blocks,
         kv_cache_block_size=BLOCK,
@@ -111,15 +112,19 @@ def _drive(
     budget=BUDGET,
     blocks=4096,
     delayer=False,
+    per_req_cache=False,
+    **extra,
 ):
     """Run each DP rank's requests to completion; return its batches and sequences.
 
-    `delayer` installs ATOM's `PrefillDelayer` at its defaults, as its DP engine does.
+    `delayer` installs ATOM's `PrefillDelayer` at its defaults, as its DP engine does;
+    `per_req_cache` gives each sequence per-request state, as V4.1's attention does,
+    and `extra` sets the scheduler's config.
     """
     monkeypatch.setenv(ENV, str(directory))
     built = {}
     for dp_rank, requests in ranks.items():
-        config = _config(dp_rank, budget=budget, blocks=blocks)
+        config = _config(dp_rank, budget=budget, blocks=blocks, **extra)
         scheduler, runner = Scheduler(config), _Runner(config)
         if delayer:
             scheduler.set_prefill_delayer(PrefillDelayer(1, None, budget))
@@ -128,6 +133,7 @@ def _drive(
                 prompt(i),
                 BLOCK,
                 sampling_params=SamplingParams(max_tokens=3, ignore_eos=True),
+                has_per_req_cache=per_req_cache,
             )
             for i in requests
         ]
@@ -353,6 +359,35 @@ def test_a_window_that_does_not_continue_the_last_is_refused(tmp_path, monkeypat
     runner.forward(batches[0])
     with pytest.raises(ValueError, match="starts at token 128, not at 64"):
         runner.forward(batches[2])
+
+
+@pytest.mark.parametrize(
+    "threshold, starts",
+    # 8 rows are left after the last full chunk, under the 16 a final forward
+    # needs, so it starts on the block grid at 176, below where the last ended.
+    [(0, [0, 64, 128, 176]), (48, [0, 48, 96, 144, 176])],
+)
+def test_a_final_chunk_backed_off_below_the_last_end_keeps_its_whole_prompt_key(
+    tmp_path, monkeypatch, threshold, starts
+):
+    built = _drive(
+        tmp_path,
+        monkeypatch,
+        {0: [0]},
+        per_req_cache=True,
+        pool_entries={"state": 8},
+        min_final_prefill_rows=16,
+        long_prefill_token_threshold=threshold,
+    )
+    batches = [b for b in built[0][0] if b.num_scheduled_tokens[0] > 1]
+    assert [int(b.num_cached_tokens[0]) for b in batches] == starts
+    steps = read(tmp_path)[0]
+    assert {row[0] for step in steps for row in step["batch"]} == {_key(_prompt(0))}
+    # The back-off continues the chunk it follows, not any earlier one.
+    runner = _Runner(_config())
+    runner.forward(batches[0])
+    with pytest.raises(ValueError, match="starts at token 176, not at"):
+        runner.forward(batches[-1])
 
 
 @pytest.mark.parametrize(
@@ -643,9 +678,10 @@ def test_a_dp2_real_runner_records_moe_rows_from_its_forwards_one_collective(
     assert len(batches[0]) == len(batches[1])
     assert list(calls.values()) == [len(batches[0])] * 2
     for rank in (0, 1):
-        moe_rows = []
+        moe_rows, moe_tokens = [], []
         for step in real[rank]:
             moe_rows.append(step.pop("moe_rows"))
+            moe_tokens.append(step.pop("moe_tokens"))
             for key in TIMESTAMPS:
                 step.pop(key, None)
         assert real[rank] == simulated[rank]
@@ -654,6 +690,10 @@ def test_a_dp2_real_runner_records_moe_rows_from_its_forwards_one_collective(
         assert moe_rows == [
             2 * step["rung"] if step["rung"] else sum(b.total_tokens_num for b in pair)
             for step, pair in zip(simulated[rank], zip(*batches))
+        ]
+        # The real tokens among them: the group's scheduled tokens.
+        assert moe_tokens == [
+            sum(b.total_tokens_num for b in pair) for pair in zip(*batches)
         ]
 
 

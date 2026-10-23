@@ -3,14 +3,16 @@
 
 """A simulated run's non-KV memory against a real run's, one term at a time.
 
-    python -m atom.compass.memory.check PREDICTED SERVER_LOG
+    python -m atom.compass.memory.check PREDICTED... SERVER_LOG
 
 PREDICTED is an engine's ``lp-<engine>.json`` in a simulated run's ``out_dir``,
 whose memory section holds the readings its KV pool was sized from, the warmup shape, and
-what the graph pool really costs. SERVER_LOG is the log of one real ATOM
-server with the same deployment.
+what the graph pool really costs; at DP width N, the N ranks' ``lp-<engine>.dp<r>.json``,
+each checked in turn. SERVER_LOG is the log of one real ATOM server with the
+same deployment, at N ranks a line per rank. Those lines name no rank, so they
+are read only when every rank logs the same values.
 
-A real server logs each reading once, in its ``Memory budget`` line, so the
+A real server logs each reading once a rank, in its ``Memory budget`` line, so the
 terms compared are ``peak_torch`` and ``non_torch``. Each predicted reading
 enters as one term, whose method combines its own terms' methods, and its
 terms are printed under the table, each with its method. The
@@ -83,13 +85,19 @@ def record(readings: DeviceReadings, *, tokens: int, memory) -> dict:
     }
 
 
-def _one(pattern: re.Pattern, text: str, log: Path) -> tuple[str, ...]:
+def _one(pattern: re.Pattern, text: str, log: Path, ranks: int) -> tuple[str, ...]:
     found = pattern.findall(text)
-    if len(found) != 1:
+    if len(found) != ranks:
         raise MemoryRefusal(
             f"{log} has {len(found)} lines matching {pattern.pattern!r}, and "
-            "one rank of one real server logs one",
-            "pass the log of a real server at one rank",
+            f"each of the {ranks} ranks of one real server logs one",
+            "pass the log of a real server at as many ranks as hand-ins",
+        )
+    if len(set(found)) > 1:
+        raise MemoryRefusal(
+            f"{log}'s ranks log {sorted(set(found))} on lines matching "
+            f"{pattern.pattern!r}, which name no rank to pair with a hand-in",
+            "compare a log whose ranks log the same values",
         )
     return found[0] if isinstance(found[0], tuple) else (found[0],)
 
@@ -98,8 +106,9 @@ def _gib(text: str) -> int:
     return round(float(text) * (1 << 30))
 
 
-def recorded(log: Path) -> tuple[Recorded, Term | None]:
-    """The real server's two readings, and the pool its capture reserved.
+def recorded(log: Path, ranks: int = 1) -> tuple[Recorded, Term | None]:
+    """The real server's two readings, which each of its `ranks` DP ranks logs,
+    and the pool its capture reserved.
 
     ATOM logs GiB to two places, so each recorded term is good to 5 MiB.
     The run is named by the log's path and its record by the log's digest.
@@ -107,8 +116,8 @@ def recorded(log: Path) -> tuple[Recorded, Term | None]:
     """
     data = log.read_bytes()
     text = data.decode(errors="replace")
-    peak_torch, non_torch = _one(_BUDGET, text, log)
-    (tokens,) = _one(_WARMUP, text, log)
+    peak_torch, non_torch = _one(_BUDGET, text, log, ranks)
+    (tokens,) = _one(_WARMUP, text, log, ranks)
     run = Recorded(
         run=str(log),
         shape=Shape(int(tokens), PHASE),
@@ -133,7 +142,7 @@ def recorded(log: Path) -> tuple[Recorded, Term | None]:
     return run, pool
 
 
-def parts(predicted_file: Path, log: Path) -> list:
+def parts(predicted_file: Path, log: Path, ranks: int = 1) -> list:
     """The per-term comparison, the predicted readings, and the graph pool's."""
     if not (saved := read_json(predicted_file).get("memory")):
         what = f"{predicted_file} has no memory section"
@@ -145,7 +154,7 @@ def parts(predicted_file: Path, log: Path) -> list:
         tuple(readings[name].as_term() for name in COMPARED),
         at_shape=SHAPED,
     )
-    run, pool = recorded(log)
+    run, pool = recorded(log, ranks)
     out = [compare(predicted, run)]
     out += [readings[name] for name in COMPARED]
     if pool is None or saved["predicts"] is None:
@@ -161,9 +170,9 @@ def parts(predicted_file: Path, log: Path) -> list:
     return out
 
 
-def check(predicted_file: Path, log: Path) -> str:
+def check(predicted_file: Path, log: Path, ranks: int = 1) -> str:
     """The per-term table, the predicted readings' own terms, and the graph pool."""
-    out = parts(predicted_file, log)
+    out = parts(predicted_file, log, ranks)
     return "\n".join(p if isinstance(p, str) else p.table() for p in out)
 
 
@@ -172,10 +181,13 @@ def main(argv: list[str] | None = None) -> None:
         prog="python -m atom.compass.memory.check",
         description="A simulated run's non-KV memory against a real run's, per term.",
     )
-    parser.add_argument("predicted", type=Path, help="a simulated engine's hand-in")
+    parser.add_argument(
+        "predicted", type=Path, nargs="+", help="a simulated engine's hand-in per rank"
+    )
     parser.add_argument("log", type=Path, help="the real server's log")
     args = parser.parse_args(argv)
-    print(check(args.predicted, args.log))
+    for hand_in in args.predicted:
+        print(check(hand_in, args.log, len(args.predicted)))
 
 
 if __name__ == "__main__":

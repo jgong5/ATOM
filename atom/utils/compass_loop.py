@@ -564,16 +564,16 @@ class HttpChannel:
     count as handled once their body has been received. The app gets the
     received body messages again from its ``receive``.
 
-    A stamped request on the ``http`` channel whose body is a cancel
+    A stamped request whose body is a cancel
     (`atom.compass.carriers.cancel_seq`) goes to no app: it is answered 204,
     and the request it names, if the app is still serving it, reads
     ``http.disconnect`` from its ``receive`` then. That is the only hang-up a
-    stamped ``http`` request reads; its socket closing is never handed on.
+    stamped request reads; its socket closing is never handed on.
 
-    An LP whose requests come in on a ``relay`` channel reads each one's stamp
-    from its body's ``kv_transfer_params`` instead. An LP that sends on one
-    stamps a send on it for each JSON response whose ``kv_transfer_params`` is an
-    object, and writes the stamp there.
+    An LP whose requests come in on a ``relay`` channel reads each one's stamp,
+    a cancel's too, from its body's ``kv_transfer_params`` instead. An LP that
+    sends on one stamps a send on it for each JSON response whose
+    ``kv_transfer_params`` is an object, and writes the stamp there.
 
     Taking in a stamped request other than a cancel costs the event loop
     ``fixed_s + body bytes x per_byte_s`` (`atom.compass.run.http_intake`),
@@ -630,7 +630,7 @@ class HttpChannel:
                 body = [await receive()]
                 while body[-1].get("more_body"):
                     body.append(await receive())
-                cancelled = None if relay_in else cancel_seq(body[0].get("body", b""))
+                cancelled = cancel_seq(body[0].get("body", b""))
                 if self.intake is not None and cancelled is None:
                     # The clock may not pass a station job's completion before
                     # the job is placed; the intake is charged once every open
@@ -644,14 +644,13 @@ class HttpChannel:
                     self.intake_end = loop.time()
                 with rt.lock:
                     rt.count_done_locked(ch, seq)
-            if relay_in is None:
-                if cancelled is not None:
-                    if (hangup := self.hangups.get(cancelled)) is not None:
-                        hangup.set()
-                    await send({"type": "http.response.start", "status": 204})
-                    await send({"type": "http.response.body", "body": b""})
-                    return
-                hangup = self.hangups[seq] = asyncio.Event()
+            if cancelled is not None:
+                if (hangup := self.hangups.get(cancelled)) is not None:
+                    hangup.set()
+                await send({"type": "http.response.start", "status": 204})
+                await send({"type": "http.response.body", "body": b""})
+                return
+            hangup = self.hangups[seq] = asyncio.Event()
             inner = receive
 
             async def receive():

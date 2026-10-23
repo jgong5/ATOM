@@ -56,8 +56,8 @@ from atom.compass.backends import (
     step_labels,
     step_linear_fit,
 )
-from atom.compass.backends.json_file import read_json
-from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band, _groups
+from atom.compass.backends.json_file import read_json, read_jsonl
+from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band
 from atom.compass.drive import aiter_jit
 
 WITHIN = 0.10
@@ -130,9 +130,12 @@ def cost_accuracy(record, backend, steps=None) -> dict:
 
     The ranks' records (`dp0.jsonl` up) are joined as `step_linear_fit` joins
     them: a step is its ranks' lines of one step index, measured as the
-    smallest rank label and priced and banded as its costliest rank's batch, a
-    term validated only if every rank's is; a step the law refuses is banded as
-    its rank of most tokens. Its draft is measured and priced the same way. A step some rank lacks or cut, or whose
+    smallest rank label and priced, banded and validated as the rank
+    `step_linear_fit.priced_rank` picks; a step the law refuses is banded as
+    its rank of most tokens. Its draft is measured and priced the same way. A
+    rank that ran the step as a dummy forward is priced 0 s: the step is
+    measured, priced and banded by the ranks that ran a forward. A step some
+    rank lacks otherwise or cut, or whose
     ranks fall to different vectors, is counted under `cut.ranks`. Ranks whose
     records differ in length by more than the one step a stopped run leaves on
     some ranks only are refused.
@@ -142,17 +145,15 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     if run.is_file() and (built := aiter_jit.refusal(read_json(run))):
         raise ValueError(f"{record} is not costed: {built}")
     ranks = sorted(Path(record).glob("dp*[0-9].jsonl"))
-    lines = {r.name: len(r.read_text().splitlines()) for r in ranks}
+    records = [read_jsonl(r) for r in ranks]
+    lines = {r.name: len(x) for r, x in zip(ranks, records)}
     if not ranks or max(lines.values()) - min(lines.values()) > 1:
         raise ValueError(
             f"{record} holds rank records of {lines} lines; one run's ranks "
             "differ by at most the step a stopped run leaves on some"
         )
-    run = [
-        [s for s in step_labels.label(r)[0] if steps is None or s.step in steps]
-        for r in ranks
-    ]
-    joined, cut, _ = _groups(run, "base")
+    run = [step_labels.label(r)[0] for r in ranks]
+    joined, cut, _ = step_linear_fit._groups(run, "base", steps=steps)
     views = [{s.step: s.view for s in rank} for rank in run]
     drafts = [{s.step: s.draft_s for s in rank} for rank in run]
     law = backend if isinstance(backend, Mapping) else None
@@ -162,11 +163,11 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     declined: dict[str, dict] = {}
     warm, priced, extrapolated = [], [], 0
     for group in joined:
-        key, _, seconds, step, _ = group[0]
+        key, _, seconds, step, _ = next(iter(group.values()))
         try:
-            costs = [backend.price(views[i][step]) for i in range(len(group))]
+            costs = {i: backend.price(views[i][step]) for i in group}
         except CostRefused as refused:
-            band = _band(key, max((r[1] for r in group), key=lambda c: c[1]))
+            band = _band(key, max((r[1] for r in group.values()), key=lambda c: c[1]))
             r = declined.setdefault(
                 band, {"steps": 0, "real_s": 0.0, "reasons": Counter()}
             )
@@ -175,12 +176,14 @@ def cost_accuracy(record, backend, steps=None) -> dict:
             why = "; ".join(f"{d.source}: {d.reason}" for d in refused.declined)
             r["reasons"][why] += 1
             continue
-        terms = [t for c in costs for t in c.terms if not t.draft]
-        validated = all(t.provenance.validated for t in terms)
+        top = step_linear_fit.priced_rank(
+            {i: (c.target_seconds, group[i][1]) for i, c in costs.items()}
+        )
+        terms = [t for c in costs.values() for t in c.terms if not t.draft]
+        validated = all(t.provenance.validated for t in costs[top].terms if not t.draft)
         extrapolated += any(t.provenance.extrapolated for t in terms)
-        top = max(range(len(costs)), key=lambda i: costs[i].target_seconds)
         band, price = _band(key, group[top][1]), costs[top].target_seconds
-        labels = [d[step] for d in drafts]
+        labels = [drafts[i][step] for i in group]
         draft = None
         if None not in labels:
             mine = [t.provenance.validated for t in costs[top].terms if t.draft]

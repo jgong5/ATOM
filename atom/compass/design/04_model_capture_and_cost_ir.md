@@ -1032,7 +1032,8 @@ model's architecture, the device arch, the config.json digest, the engine config
 step law is keyed by less its ladder (`run.step_grid.keyed`, `09` D54), the TP width and
 the DP and EP widths when set, the phase, the mode, and whether the step produces
 output. That engine config holds the KV block size and dtype, the quantization's hash,
-the parallel layout, TBO, speculation when it is on, `moe_backend` and `eplb_enable` when
+the parallel layout, TBO, speculation when it is on, `moe_backend`, `eplb_enable` and
+`enable_decoder_swa_bounded_replay` when
 they are off ATOM's default, and the performance environment
 (`atom.benchmarks.results.metadata.PERFORMANCE_KEYS`) less the client's `AIPERF_*`
 variables and the device selection; ATOM's Triton expert and GEMM switches

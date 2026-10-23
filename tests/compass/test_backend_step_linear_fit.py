@@ -990,7 +990,7 @@ def test_the_command_refuses_a_record_whose_server_built_an_aiter_module(
     assert (tmp_path / "law.json").exists()
 
 
-def test_a_dp_law_is_held_out_run_by_run_and_validates_every_rank_inside(
+def test_a_dp_law_is_held_out_run_by_run_and_validates_each_steps_costliest_rank(
     tmp_path, monkeypatch
 ):
     import test_step_linear_dp as dp
@@ -1012,10 +1012,67 @@ def test_a_dp_law_is_held_out_run_by_run_and_validates_every_rank_inside(
     prefill = written["prefill"]["held_out"]["bands"]
     assert sum(b["steps"] for b in prefill.values()) == 120
     backend = StepLinearBackend(StepLinearLaw(written), 2)
-    views = [v for groups in runs.values() for vs, _ in groups for v in vs]
+    # Rank `i % 2` is step i's costliest by construction.
+    views = [vs[i % 2] for groups in runs.values() for i, (vs, _) in enumerate(groups)]
     assert all(
         {t.provenance.validated for t in backend.price(v).terms} == {True}
         for v in views
     )
     far = BatchView((RequestShape(1, 10**6, True),) * 4, capture_rung=4)
     assert not any(t.provenance.validated for t in backend.price(far).terms)
+    # The cheaper ranks' rows reach this shape; no step's costliest rank does.
+    cheap = BatchView((RequestShape(1, 10_000, True),) * 3, capture_rung=4)
+    assert not any(t.provenance.validated for t in backend.price(cheap).terms)
+
+
+def test_a_dp_law_blind_to_context_hulls_each_step_by_its_rank_of_most_context(
+    tmp_path, monkeypatch
+):
+    import test_step_linear_dp as dp
+
+    monkeypatch.setattr(dp, "DP", 2)
+
+    def step(context):
+        return BatchView((RequestShape(1, context, True),) * 2, capture_rung=2)
+
+    records = []
+    for seed in (0, 1):
+        rng = np.random.default_rng(seed)
+        # Every step costs the same; the rank of most context alternates.
+        span = [(60_000, 80_000), (1, 20_000)]
+        groups = [
+            ([step(int(rng.integers(*span[r != i % 2]))) for r in range(2)], 0.03)
+            for i in range(120)
+        ]
+        (tmp_path / str(seed)).mkdir()
+        records += dp._records(tmp_path / str(seed), groups)
+    for path in records:
+        _engine_file(path, {"data_parallel_size": 2, "enable_dp_attention": True})
+    main([*map(str, records), "--out", str(tmp_path / "law.json"), *SPEC])
+    written = json.loads((tmp_path / "law.json").read_text())
+
+    assert written["decode"]["2"]["coefficients"]["context"] == 0.0
+    backend = StepLinearBackend(StepLinearLaw(written), 2)
+    for context, validated in ((70_000, True), (10_000, False)):
+        terms = backend.price(step(context)).terms
+        assert {t.provenance.validated for t in terms} == {validated}
+
+
+def test_a_dp_step_a_peer_ran_as_a_dummy_is_fitted_on_the_ranks_that_ran_it(tmp_path):
+    import test_step_linear_dp as dp
+
+    groups = dp._groups(0, n=120)
+    records = dp._records(tmp_path, groups)
+    # Rank 2 runs a dummy on every third step it is not the slowest on.
+    dummied = [i for i in range(0, 120, 3) if i % dp.DP != 2]
+    lines = [json.loads(line) for line in records[2].read_text().splitlines()]
+    for i in dummied:
+        lines[i].update(is_dummy_run=True, batch=[], rows=[[1, 1, True]])
+    records[2].write_text("".join(json.dumps(line) + "\n" for line in lines))
+    law_ = _fit(records, dp=dp.DP)
+
+    assert law_["cut"]["ranks"] == 0
+    fitted = [law_["prefill"], law_["decode"]["4"]]
+    assert sum(v["fit"]["samples"] for v in fitted) == 120
+    assert fitted[0]["coefficients"] == pytest.approx(dp.PREFILL, rel=1e-6)
+    assert fitted[1]["coefficients"] == pytest.approx(dp.DECODE, rel=1e-6)

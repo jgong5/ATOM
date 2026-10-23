@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import inspect
 import math
+from dataclasses import replace
 
 import torch
 from torch.utils._pytree import tree_leaves
@@ -138,13 +139,23 @@ def _gemm(a="A", b="B", out="otype", extra=("bias",)):
     return extract
 
 
-def _attention(op, view, tp, kv) -> Work:
-    """Causal attention over the view's rows: Q read and O written, each row's
-    K and V over its context read once in the KV cache's format `kv`, the new
-    tokens' among them. F and M take heads times head dim only, so each side
-    counts as one head of its width."""
-    q, k = op["args"]["q"], op["args"]["k"]
+def _pass(view, q) -> tuple:
+    """The view's rows as the pass whose Q is `q` runs them: a Q of fewer
+    tokens than the rows query is a drafter's later pass, one query token a
+    row, as ATOM's `EagleProposer.propose` runs every pass after its first."""
     rows = view.requests
+    if q["shape"][0] < sum(r.query_tokens for r in rows):
+        return tuple(replace(r, query_tokens=1) for r in rows)
+    return rows
+
+
+def _attention(op, view, tp, kv) -> Work:
+    """Causal attention over the pass's rows (`_pass`): Q read and O written,
+    each row's K and V over its context read once in the KV cache's format
+    `kv`, the new tokens' among them. F and M take heads times head dim only,
+    so each side counts as one head of its width."""
+    q, k = op["args"]["q"], op["args"]["k"]
+    rows = _pass(view, q)
     return attention(
         [r.query_tokens for r in rows],
         [r.context_tokens for r in rows],
@@ -437,7 +448,7 @@ def _v4_decode(q, *slots, out=None):
         geometry = _stated(op, "window_size", "compress_ratio", "index_topk")
         x = op["args"][q]
         _, heads, dim = x["shape"]
-        fmt, rows = _fmt(x["dtype"]), view.requests
+        fmt, rows = _fmt(x["dtype"]), _pass(view, x)
         work = _sparse_products(rows, heads, dim, fmt, kv, *geometry)
         return boundary(op, view, tp, kv) + work
 
@@ -455,7 +466,7 @@ def _indexer(op, view, tp, kv) -> Work:
     fmt = "fp4" if op["args"].get("q_scale") else _fmt(q["dtype"])
     _, heads, packed = q["shape"]
     dim = int(packed * _size(q["dtype"]) / ELEMENT_BYTES[fmt])
-    return _boundary(op) + _index_scores(view.requests, ratio, heads, dim, fmt)
+    return _boundary(op) + _index_scores(_pass(view, q), ratio, heads, dim, fmt)
 
 
 def _shape(value):

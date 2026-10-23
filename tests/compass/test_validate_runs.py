@@ -15,6 +15,7 @@ import collections
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -26,7 +27,15 @@ from test_stop_between_client_runs import CLIENT_RUN as UNREFUSED
 from atom.compass import run as compass_run
 from atom.compass.drive import aiter_jit, serve
 from atom.compass.drive import run as drive_run
-from atom.compass.validate.runs import ASSUMED, CLIENT_RUN, _requests, grade, main
+from atom.compass.parity import TRANSFERS
+from atom.compass.validate.runs import (
+    ASSUMED,
+    CLIENT_RUN,
+    SIDES,
+    _requests,
+    grade,
+    main,
+)
 
 EXPORT = {
     "request_count": {"unit": "requests", "avg": 3.0},
@@ -220,6 +229,33 @@ def test_requests_keys_by_the_final_chunks_context_not_a_later_decode_row():
         {"named": [], "batch": [[1, 1, 101]], "rows": [[1, 101, True]]},
     ]
     assert _requests(steps) == collections.Counter({(100, 0): 100})
+
+
+def test_requests_of_one_id_on_two_dp_ranks_are_two_requests():
+    """Each DP rank numbers its own requests, so request 1 on rank 0 and
+    request 1 on rank 1 are two prompts of 100 tokens, not one of 200."""
+    steps = [
+        {
+            "dp_rank": rank,
+            "named": [[1, f"k{rank}"]],
+            "batch": [[1, 100, 100]],
+            "rows": [[100, 100, False]],
+        }
+        for rank in (0, 1)
+    ]
+    assert _requests(steps) == collections.Counter({(100, 0): 100, (100, 1): 100})
+
+
+def test_a_distribution_no_run_samples_is_left_out(tmp_path):
+    """A schedule of decode steps alone, as a deployment's decode side runs,
+    has no prefill step's cached fraction in any run."""
+    decode = [[(7, 1, 101, True)], [(7, 1, 102, True)]]
+    real = [_cell(tmp_path / f"r{i}", decode, {}) for i in range(2)]
+    report = grade(real, _cell(tmp_path / "sim", decode, {}))
+
+    distributions = report["distributions"]
+    assert set(distributions) == {"batch width", "scheduled tokens", "context tokens"}
+    assert {g["verdict"] for g in distributions.values()} == {"inside the real spread"}
 
 
 #: A simulated run's run.json entries that grading reads, as `run` writes
@@ -840,4 +876,137 @@ def test_a_real_cctraces_sim_cell_whose_server_began_an_aiter_build_is_refused(
     aiter_jit.main([str(real[2] / "run.json"), str(since)])
     named = re.escape("aiter ran a JIT build of ['mha'] while its server served")
     with pytest.raises(ValueError, match=f"r2 is not graded: {named}, so a step"):
+        grade(real, simulated)
+
+
+#: Requests rank 1 of a deployment's side holds, under rank 0's request ids.
+RANK1 = {"ka": "kc", "kb": "kd"}
+
+
+def _deployed(cell, late=None, **run):
+    """`cell` as `deploy.sh` lays out a deployment: prefill/ and decode/ each
+    `_recorded`'s steps, with `run`'s entries in its run.json, on DP rank 0
+    and again on rank 1 as requests `kc` and `kd`, the ranks stepping
+    together; on side `late` rank 1 runs its warmup's step after its first own
+    one. The client's export, naming all four, is beside them;
+    their requests are named as `_named_as_deployed` names them."""
+    for side in SIDES:
+        _recorded(_cell(cell / side, _schedule(), {7: "ka", 8: "kb"}), **run)
+        steps = cell / side / "steps"
+        lines = [json.loads(x) for x in (steps / "dp0.jsonl").read_text().splitlines()]
+        rank1 = json.loads(json.dumps(lines))
+        if side == late:
+            rank1[:2] = rank1[1::-1]
+        for line in rank1:
+            line["dp_rank"] = 1
+            line["named"] = [
+                [r, RANK1.get(k, k), f"id-{RANK1.get(k, k)}"]
+                for r, k, _ in line["named"]
+            ]
+        for rank, rank_lines in enumerate((lines, rank1)):
+            for i, line in enumerate(rank_lines):
+                line["step"] = i
+            text = "".join(json.dumps(x) + "\n" for x in rank_lines)
+            (steps / f"dp{rank}.jsonl").write_text(text)
+        export = json.loads((cell / side / CLIENT_RUN).read_text())
+        for k in RANK1.values():
+            export["requests"][f"id-{k}"] = {"trace": f"trace-{k}", "sampling": {}}
+        shutil.rmtree(cell / "artifacts", ignore_errors=True)
+        (cell / side / "artifacts").rename(cell / "artifacts")
+        (cell / CLIENT_RUN).write_text(json.dumps(export))
+    (cell / "run.json").write_text(json.dumps({"kv_link": "inter_node"}))
+    _named_as_deployed(cell)
+    return cell
+
+
+def _named_as_deployed(cell):
+    """Name the requests of deployment `cell`, each side's record named as
+    one server's, as a deployment's two records name them: prefill by its own
+    response ids, `p-<id>`, which the export does not name; decode, its
+    request ids 100 above prefill's, at its first step by its request id, and
+    each joined in `transfers.jsonl` to its prefill DP rank and request id."""
+    for path in sorted((cell / "prefill" / "steps").glob("dp*[0-9].jsonl")):
+        lines = [json.loads(x) for x in path.read_text().splitlines()]
+        for line in lines:
+            line["named"] = [[r, k, f"p-{i}"] for r, k, i in line["named"]]
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    sent = []
+    for path in sorted((cell / "decode" / "steps").glob("dp*[0-9].jsonl")):
+        lines = [json.loads(x) for x in path.read_text().splitlines()]
+        ids = {r: i for line in lines for r, _k, i in line["named"]}
+        seen = set()
+        for line in lines:
+            first = [r for r, *_ in line["batch"] if r in ids and r not in seen]
+            seen.update(first)
+            line["named"] = [[r + 100, r + 100, ids[r]] for r in first]
+            line["batch"] = [[r + 100, *rest] for r, *rest in line["batch"]]
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+        sent += [
+            {"response_id": i, "remote_dp_rank": int(path.stem[2:]), "transfer_id": r}
+            for r, i in ids.items()
+        ]
+    text = "".join(json.dumps(x) + "\n" for x in sent)
+    (cell / "decode" / "steps" / TRANSFERS).write_text(text)
+
+
+def test_a_deployment_is_graded_per_side_over_every_dp_rank(tmp_path):
+    real = [_deployed(tmp_path / f"r{i}") for i in range(3)]
+    simulated = _deployed(tmp_path / "sim", **GRADED)
+    report = grade(real, simulated)
+
+    assert set(report) == {
+        *(f"{family} {side}" for family in ("counts", "distributions", "one run") for side in SIDES),
+        "end to end",
+    }  # fmt: skip
+    for side in SIDES:
+        counts = report[f"counts {side}"]
+        # `test_counts_match_across_runs_whose_request_ids_differ`'s, once per rank.
+        assert {k: g["simulated"] for k, g in counts.items()} == {
+            "prefill steps": 6,
+            "decode steps": 6,
+            "prefill tokens": 906,
+            "decode tokens": 10,
+            "preemptions": 2,
+            "prefill streaks": 4,
+            "requests completed": 3.0,
+        }
+        assert {g["verdict"] for g in counts.values()} == {"exact"}
+    assert report["end to end"]["ttft mean"]["verdict"] == "inside the real spread"
+
+
+def test_a_deployment_side_whose_warmup_runs_on_past_its_first_own_step_on_any_rank_is_refused(
+    tmp_path,
+):
+    real = [
+        _deployed(tmp_path / f"r{i}", late="decode" if i == 1 else None)
+        for i in range(3)
+    ]
+    simulated = _deployed(tmp_path / "sim", **GRADED)
+
+    late = "1 from step 1, so its warmup has not ended when it starts"
+    with pytest.raises(
+        ValueError, match=f"r1/decode is not graded: steps from .*{late}$"
+    ):
+        grade(real, simulated)
+
+
+def test_a_deployment_side_whose_server_built_an_aiter_module_is_refused_naming_it(
+    tmp_path,
+):
+    real = [_deployed(tmp_path / f"r{i}") for i in range(3)]
+    simulated = _deployed(tmp_path / "sim", **GRADED)
+    builds = ["mha_varlen_fwd_bf16"]
+    run = {"format_version": 2, aiter_jit.BUILDS: builds}
+    (real[1] / "decode" / "run.json").write_text(json.dumps(run))
+
+    named = re.escape(f"aiter ran a JIT build of {builds} while its server served")
+    with pytest.raises(ValueError, match=f"r1/decode is not graded: {named}"):
+        grade(real, simulated)
+
+
+def test_deployments_and_single_servers_are_not_one_cell(tmp_path):
+    real = [_deployed(tmp_path / f"r{i}") for i in range(2)]
+    simulated = _recorded(_cell(tmp_path / "sim", _schedule(), {7: "ka", 8: "kb"}))
+
+    with pytest.raises(ValueError, match="the runs' servers wrote different sides"):
         grade(real, simulated)
