@@ -1494,15 +1494,14 @@ def op_graph(run: dict, config, machine, ep: int = 1, lazy: dict | None = None):
     """The `OpGraphBackend` the run file `run` names for `config` on
     `machine` at EP width `ep`, with its price list when it names one; with
     `lazy`, a shape no graph holds is traced from the run file's `ATOM_ARGS`
-    (`_op_graphs`), counted in `lazy`."""
+    when it holds them (`_op_graphs`), counted in `lazy`."""
     from atom.compass.backends.op_graph import OpGraphBackend
 
     drafter = getattr(config, "speculative_config", None)
-    atom_args = run.get(ATOM_ARGS) if lazy is not None else None
-    arch = machine.value("device.arch")
+    lazily = (run[ATOM_ARGS], lazy) if lazy is not None and ATOM_ARGS in run else ()
     return OpGraphBackend(
         machine,
-        _op_graphs(run["store"], config, arch, atom_args, lazy),
+        _op_graphs(run["store"], config, machine.value("device.arch"), *lazily),
         tp=config.tensor_parallel_size,
         ep=ep,
         dp=config.parallel_config.data_parallel_size,

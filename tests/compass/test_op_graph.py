@@ -951,8 +951,10 @@ def test_a_shape_no_graph_holds_is_traced_in_the_run_as_trace_ops_traces_it(
 
 def test_a_lazy_trace_that_fails_ends_the_run_naming_the_shape(tmp_path):
     (tmp_path / "model").mkdir()  # holds no config.json, so no capture builds it
+    (tmp_path / "read").mkdir()
+    (tmp_path / "read" / "config.json").write_text("{}")
     config = SimpleNamespace(
-        model=str(tmp_path / "model"),
+        model=str(tmp_path / "read"),
         hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
         tensor_parallel_size=1,
         parallel_config=SimpleNamespace(data_parallel_size=1),
