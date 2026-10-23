@@ -651,9 +651,11 @@ width 8 a step is fitted when every rank ran it, a dummy forward included;
 each decode rung a law fits carries a held-out hull, except the decode
 side's rung 2, so its steps price unvalidated. Their host laws (`host`, with
 `compass fit host`'s report as `host_fit`) were refitted on the same cells by
-`compass fit host` at ATOM 8d161363f. Those records stamp the engine's input
-pulls, so every kind carries `E_out`, `E` runs from the pull and `W_launch`
-ends at the token read. Their host keys carry the `atom`
+`compass fit host` for #1893, with `E` labelled by `step_labels.label_run`.
+Those records stamp the engine's input
+pulls, so every kind carries `E_out`, `E` runs from the latest pull over the
+eight ranks before the same forward and `W_launch` ends at the token read.
+Their host keys carry the `atom`
 digest of the tree they were last re-keyed at; `provenance` names the
 capture tree's.
 
