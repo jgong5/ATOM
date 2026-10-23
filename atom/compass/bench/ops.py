@@ -198,7 +198,7 @@ TOKEN_IDS = {("aten.embedding.default", "indices")}
 #: Weight slots a leaf reads a row a token of: RoPE's cos and sin tables,
 #: indexed by each token's position (or by each compressed position, at most
 #: one a token), never read whole.
-TABLES = {"cos_cache", "sin_cache"}
+TABLES = {"cos_cache", "sin_cache", "cos", "sin"}
 #: The operator whose metadata slots are named as the fields of DeepSeek-V4's
 #: HCA decode workspace: aiter defines its schema and the workspace together.
 HCA_DECODE = "aiter.mla_decode_v4_ps_asm.default"
