@@ -57,6 +57,7 @@ import numpy as np
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.shape import sum_tokens
+from atom.compass.backends.step_labels import group_tokens
 
 SOURCE = "validate-bound"
 PHASES = ("decode", "prefill", "mixed")
@@ -87,7 +88,7 @@ def steps(record, tbo=False, mtp=False):
         lines = [r.get(step) for r in ranks]
         whole = None not in lines
         # num_tokens_across_dp: every rank's scheduled tokens, a dummy's one.
-        group = sum(q for s in lines if s for q, _, _ in s["rows"])
+        group = group_tokens(lines)
         split = _split(lines) if tbo and whole else None
         for path, s in zip(paths, lines):
             if s is None or s["is_dummy_run"]:

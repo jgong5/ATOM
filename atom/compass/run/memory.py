@@ -6,9 +6,9 @@ The run file's ``store`` is the artifact store's root. The key is the
 machine spec's digest and `key_fields`, read off the resolved ATOM config: the
 served config.json's digest, the parallel layout, and as sorted JSON the
 engine config the readings move with, `step_grid.keyed`'s fields and the
-scheduler bounds, any KV offload connector and RapidServe. `compass measure memory`
-publishes one member per rank, ``readings.<rank>.json``, holding
-`ENTRY_FIELDS`; each rank reads its own. A configuration with no entry
+scheduler bounds, the resolved `index_cache_dtype`, any KV offload connector
+and RapidServe. `compass measure memory` publishes one member per rank,
+``readings.<rank>.json``, holding `ENTRY_FIELDS`; each rank reads its own. A configuration with no entry
 refuses, naming its key and the fields the nearest entry differs in, and so
 does an entry `ArtifactStore.load` refuses under `conditions`.
 """
@@ -64,6 +64,9 @@ def key_fields(config) -> dict:
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
     engine = keyed(config) | {name: getattr(config, name) for name in BOUNDS}
+    # Any kv_transfer_config resolves DeepSeek-V4's indexer to fp8, which sizes
+    # its KV blocks and buffers apart from the fp4 one a plain start resolves.
+    engine["index_cache_dtype"] = getattr(config, "index_cache_dtype", None)
     leaves = KVConnectorFactory.leaf_connectors(config) or ()
     offload = [n for n, _ in leaves if KVConnectorFactory.is_offload_backend(n)]
     if offload:
