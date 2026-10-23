@@ -240,6 +240,57 @@ def test_a_bf16_cache_s_decode_reads_the_same_entries_at_its_width():
     )
 
 
+FLYDSL = "aiter.ops.flydsl.kernels."
+GROUPED = {
+    "x": t([3, 2, 64], FP8),
+    "wo_a": t([2, 8, 64], FP8, role="weight"),
+    "x_scale": t([3, 2, 2], U8),
+    "w_scale": t([2, 1, 2], U8, role="weight"),
+}
+SPARSE = {
+    "q_nope": t([3, 2, 16], FP8),
+    "kv_indices_prefix": t([5], I32, role="metadata"),
+    "kv_indices_extend": t([6], I32, role="metadata"),
+}
+COMPRESSOR = {s: t([3, 16]) for s in ("kv_in", "score_in", "ape", "rms_weight")}
+SCHEDULE = FLYDSL + "mqa_logits.pa_mqa_logits_fp4_prefill:compute_prefill_schedule"
+
+
+@pytest.mark.parametrize(
+    "kind, sibling, args",
+    [
+        (
+            "aiter.batched_gemm_a8w8_mxscale_bpreshuffle.default",
+            "aiter.batched_gemm_a8w8_mxscale.default",
+            GROUPED,
+        ),
+        (
+            "aiter.mla_sparse_prefill_fp8_asm.default",
+            "aiter.pa_sparse_prefill_fp8_opus.default",
+            SPARSE,
+        ),
+        (
+            FLYDSL + "fused_compress_attn_gfx1250:flydsl_fused_compress_attn_gfx1250",
+            FLYDSL + "fused_compress_attn:flydsl_fused_compress_attn",
+            COMPRESSOR,
+        ),
+        (
+            FLYDSL + "fused_compress_attn_hca_gfx1250:flydsl_hca_compress_attn_gfx1250",
+            FLYDSL + "fused_compress_attn_hca:flydsl_hca_compress_attn",
+            COMPRESSOR,
+        ),
+        ("aiter._build_tiles_raw.default", SCHEDULE, {}),
+        ("aiter._build_sched_raw.default", SCHEDULE, {}),
+    ],
+)
+def test_a_gfx1250_kernel_prices_as_its_gfx950_sibling(kind, sibling, args):
+    gfx1250, gfx950 = (
+        work(leaf(k, [[3, 2, 16]], **args), ONE, 1, "fp8") for k in (kind, sibling)
+    )
+
+    assert gfx1250 == gfx950
+
+
 def test_the_asm_kernel_launched_alone_reads_what_its_wrapper_reads():
     nm = decode(window_size=4, compress_ratio=4, index_topk=16)
     args = nm["args"]

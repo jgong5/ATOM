@@ -19,6 +19,13 @@ import torch
 DEVICES = {
     "gfx942": (80, (9, 4), 192 << 30),  # MI308X
     "gfx950": (256, (9, 5), 288 << 30),  # MI355X
+    # MI455X, assumed: AMD counts 256 work-group processors and 432 GB of HBM4.
+    "gfx1250": (256, (12, 5), 432 << 30),
+}
+#: The stepping `rocminfo` states, where not the first: aiter runs no shipped
+#: asm kernel on gfx1250 A0, revision 0.
+REVISIONS = {
+    "gfx1250": 1,
 }
 
 
@@ -199,7 +206,7 @@ def _declare_arch(tmpdir: str, arch: str) -> None:
     rocminfo.parent.mkdir(parents=True, exist_ok=True)
     rocminfo.write_text(
         f"#!/bin/sh\necho 'Agent 1\n  Name: {arch}\n  Device Type: GPU\n"
-        f"  Compute Unit: {DEVICES[arch][0]}\n  ASIC Revision: 0'\n"
+        f"  Compute Unit: {DEVICES[arch][0]}\n  ASIC Revision: {REVISIONS.get(arch, 0)}'\n"
     )
     rocminfo.chmod(0o755)
     os.environ["PATH"] = f"{rocminfo.parent}:{os.environ.get('PATH', '')}"
