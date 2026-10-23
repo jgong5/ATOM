@@ -43,7 +43,9 @@ step continues at the rung past the cut; only its drafter's graph is kept. A
 shape's `width` is the batch a step that replays no graph pads to past its
 rows, as `ForwardMode.decide` settles it from a ladder of that one width: a
 decode's model runs at it from its inputs, a prefill's LM head and its
-drafter's later passes at it, and each samples its rows."""
+drafter's later passes at it, and each samples its rows. Under a drafter in DP
+a middle chunk runs those later passes at it too: only its drafter's graph is
+kept."""
 
 import contextlib
 import copyreg
@@ -1171,12 +1173,12 @@ def capture(
             runner.allocate_kv_cache(max(KV_BLOCKS, blocks))
         # A prefill is traced as a middle chunk, which samples nothing, then as
         # a final one; a decode step always samples, as does a prefill whose
-        # LM head pads.
+        # LM head pads, except a DP middle chunk's drafter at its later passes.
         variants = [
             (shape, output)
             for shape in shapes
             for output in ((False, True) if shape.phase == "prefill" else (True,))
-            if output or not shape.width
+            if output or not shape.width or dp > 1
         ]
         # A population's prefill ran as one forward: this rank cannot split it.
         own = runner._local_tbo_eligibility

@@ -150,15 +150,29 @@ class Station:
             return self.final < len(self.jobs)
 
 
-#: Service jobs by function name: a request's tokenization, and a chat
-#: request's media preparation (`atom.compass.run` prices its images).
-SERVICE_JOBS = frozenset({"do_preprocess", "_prepare_multimodal_inputs"})
+#: Service jobs by function name: a request's tokenization, a chat request's
+#: media preparation (`atom.compass.run` prices its images), and a `/metrics`
+#: scrape's render, which charges nothing.
+SERVICE_JOBS = frozenset(
+    {"do_preprocess", "_prepare_multimodal_inputs", "AtomMetricsExporter.render"}
+)
+
+
+def job_name(fn) -> str:
+    """`fn`'s qualified name, or that of the function `asyncio.to_thread` runs
+    when `fn` is its ``partial(Context.run, func, ...)``."""
+    if (
+        isinstance(fn, partial)
+        and getattr(fn.func, "__qualname__", "") == "Context.run"
+    ):
+        fn = fn.args[0]
+    return getattr(fn, "__qualname__", repr(fn))
 
 
 def classify(fn) -> str:
     """``service``, ``wait`` or ``refuse``: the job registry, by qualified name."""
-    name = getattr(fn, "__qualname__", "")
-    if name.rpartition(".")[2] in SERVICE_JOBS:
+    name = job_name(fn)
+    if name in SERVICE_JOBS or name.rpartition(".")[2] in SERVICE_JOBS:
         return "service"
     if name == "Queue.get":
         return "wait"
@@ -199,7 +213,7 @@ class SimExecutor(ThreadPoolExecutor):
     def submit(self, fn, /, *args, **kwargs) -> Future:
         kind = "wait" if self.station is None else classify(fn)
         if kind == "refuse":
-            name = getattr(fn, "__qualname__", repr(fn))
+            name = job_name(fn)
             self.refusals.append(f"executor:{name}")
             raise Refused(("executor", name))
         if kind == "wait":

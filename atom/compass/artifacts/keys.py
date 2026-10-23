@@ -67,6 +67,7 @@ class Kind(enum.Enum):
     STEP_LINEAR_LAW = "step_linear_law"
     HOST_LAWS = "host_laws"
     STEP_GRID_BUNDLE = "step_grid_bundle"
+    PROJECTION = "projection"
 
     def __str__(self) -> str:
         return self.value
@@ -120,6 +121,9 @@ KEY_FIELDS: Mapping[Kind, tuple[str, ...]] = {
         "grid",
         "source_root",
     ),
+    # `spec` is the whole machine spec's digest, which moves with any value it
+    # prices by; `cells` the digest of each cell's step records and engine.
+    Kind.PROJECTION: ("model", "spec", "source_root", "cells"),
 }
 
 #: The incident each kind's refusal quotes, where there is one to quote.

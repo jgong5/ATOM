@@ -3992,7 +3992,7 @@
    "peer": "thread",
    "why": "a /metrics scrape renders the Prometheus registry on the frontend loop's default executor and awaits the render",
    "mechanism": "K1",
-   "mechanism_why": "a job on the frontend LP's default-executor station, which prices tokenization only; no service time is modelled for a render, so a simulated run refuses it at the hand-off and the run summary names it"
+   "mechanism_why": "a job on the frontend LP's default-executor station, charged no service time: a scrape is answered at its arrival unless tokenization holds every thread"
   },
   {
    "id": "atom/metrics/gpu.py::GPUForwardMetrics.poll::end.query()::event_poll#0",
