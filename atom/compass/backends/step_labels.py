@@ -12,7 +12,8 @@ run.json names `BUILDS`, aiter JIT modules its server built while it served;
 A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
 `dp_rank`. An older record's lines state neither count: `group_tokens`
 rebuilds `moe_tokens` from every rank's line, and, when its host key's engine
-states `enable_tbo`, `group_split` rebuilds `tbo_tokens` from the same lines.
+states `enable_tbo`, the caller's `split_rule`, ATOM's two-batch-overlap split
+over those lines, rebuilds `tbo_tokens`; with no rule such a line refuses.
 
 A step's device label is its device busy time, `d_busy_ns`, plus for a decode
 step the device work queued since the previous forward's exit, `d_gap_ns`. A
@@ -127,32 +128,6 @@ def group_tokens(lines) -> int | None:
     return None if None in lines else sum(q for s in lines for q, _, _ in s["rows"])
 
 
-def group_split(lines):
-    """The two-batch-overlap split ATOM agrees over a DP group's step `lines`,
-    per micro-batch each rank's tokens, or None: each rank's prefill answer
-    (`local_tbo_precompute`), then `sync_dp_metadata`'s OR of the min-token
-    bar, AND of can-split and uniform prefill. A decoding rank, a dummy run
-    among them, cannot split."""
-    import numpy as np
-
-    from atom.utils import envs
-    from atom.utils.tbo import ubatching
-
-    rule = (
-        ubatching._precompute_prefill_token_split
-        if envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
-        else ubatching._precompute_prefill_req_split
-    )
-    local, bar = [], envs.ATOM_TBO_PREFILL_MIN_TOKENS
-    for s in lines:
-        prefill = [q for q, _, d in s["rows"] if not d]
-        if not prefill:
-            return None
-        local.append(rule(np.array(prefill), len(prefill), bar))
-    meets, can, first, second = zip(*local)
-    return (first, second) if any(meets) and all(can) else None
-
-
 def digest(record) -> str:
     """The record's file name and the head of its bytes' SHA-256."""
     path = Path(record)
@@ -227,17 +202,21 @@ def _pull(step: dict) -> int:
     return step.get("t_pull_ns", step["t_exit_ns"])
 
 
-def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
+def label(
+    record, run: str | None = None, split_rule=None
+) -> tuple[list[Sample], list[dict]]:
     """The record's samples, in step order, and its table's rows.
 
     `run` names the run in each sample's provenance, the record's `digest` by
-    default.
+    default; `split_rule` rebuilds an older record's split, as above.
     """
     lines = _read(record)
-    return _label(record, lines, run, [_pull(s) for s in lines])
+    return _label(record, lines, run, [_pull(s) for s in lines], split_rule)
 
 
-def label_run(records, run: str | None = None) -> list[tuple[list[Sample], list[dict]]]:
+def label_run(
+    records, run: str | None = None, split_rule=None
+) -> list[tuple[list[Sample], list[dict]]]:
     """`label` of each of `records`, one run's DP ranks, with each `E` from the
     latest pull over the ranks before the same forward. A rank that ran only
     DP's dummy forwards gives no sample and no row. Ranks whose line counts
@@ -255,13 +234,13 @@ def label_run(records, run: str | None = None) -> list[tuple[list[Sample], list[
         (
             ([], [])
             if x and all(s["is_dummy_run"] for s in x)
-            else _label(r, x, run, starts)
+            else _label(r, x, run, starts, split_rule)
         )
         for r, x in zip(records, ranks)
     ]
 
 
-def _label(record, lines, run, starts) -> tuple[list[Sample], list[dict]]:
+def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[dict]]:
     """`label` of `record`'s `lines`, each `E` from `starts` at the line before."""
     path = Path(record)
     steps = [s for s in lines if not s["is_dummy_run"]]
@@ -295,7 +274,13 @@ def _label(record, lines, run, starts) -> tuple[list[Sample], list[dict]]:
             group = [r.get(s["step"]) for r in ranks]
             tokens = group_tokens(group)
             if tokens is not None and tbo:
-                split = group_split(group)
+                if split_rule is None:
+                    raise ValueError(
+                        f"{record} step {s['step']} states no two-batch-overlap "
+                        "split under enable_tbo, and no split rule was given to "
+                        "rebuild it"
+                    )
+                split = split_rule(group)
         view = BatchView(
             tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
             capture_rung=s["rung"],
