@@ -651,7 +651,8 @@ width 8 only steps every rank ran are fitted, and only the cells at 64 and
 above supply decode steps; each decode rung a law fits has such steps in two or more
 cells, so each carries a held-out hull. Their host laws (`host`, with
 `compass fit host`'s report as `host_fit`) were refitted on the same cells by
-`compass fit host` at ATOM 553f219c3. Those records stamp the engine's input
+`compass fit host` for #1893, with `E` labelled by `step_labels.label_run`.
+Those records stamp the engine's input
 pulls, so every kind carries `E_out`, `E` runs from the latest pull over the
 eight ranks before the same forward and `W_launch` ends at the token read.
 Their host keys carry the `atom`
