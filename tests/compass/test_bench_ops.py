@@ -27,13 +27,14 @@ from test_parity_record import _unpriced  # noqa: F401  an autouse fixture
 
 from atom.compass import cli, ir
 from atom.compass.artifacts import ArtifactStore, Kind, machine_spec_digest
-from atom.compass.bench import ops
+from atom.compass.bench import measure, ops
 from atom.compass.capture import driverless
 from atom.compass.capture.forward import decode, prefill
 from atom.compass.capture.graph import Traced, build, to_json
 from atom.compass.ir.nodes import Reduced
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
+from atom.config import Config
 from atom.utils import block_convert
 from atom.utils import forward_context as fctx
 
@@ -632,6 +633,38 @@ def test_v4_index_writer_takes_atom_s_state_slots_and_dest_rows_by_ratio():
     }
 
 
+def test_v4_qk_norm_takes_the_dest_rows_of_its_stated_ratio():
+    # Bound by size, every ratio's destination rows were `top_ks`. No HCA
+    # buffer is live, so the ratio-128 leaf refuses by that buffer's name.
+    qkn = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
+    runner = _Runner()
+    runner.forward_vars |= {
+        "top_ks": torch.zeros(8, dtype=torch.int32),
+        "v4_swa_dest_dense": torch.zeros(16, dtype=torch.int32),
+        "v4_swa_dest_csa": torch.zeros(32, dtype=torch.int32),
+    }
+    rows = ("swa_dest_row", _t([8], "metadata", dtype="torch.int32"))
+    leaves = [
+        dataclasses.replace(_leaf(qkn, rows), stated=(("compress_ratio", r),))
+        for r in (0, 4, 128)
+    ]
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(*leaves, layers=1)["region"])
+
+    stub._prepare((0, 0))
+
+    [(_, views)] = stub.placed
+    got = {
+        stub.leaves[s][0]["stated"]["compress_ratio"]: n
+        for (s, _), (n, _) in views.items()
+    }
+    assert got == {
+        0: "v4_swa_dest_dense",
+        4: "v4_swa_dest_csa",
+        128: "ATOM passes swa_dest_row v4_swa_dest_hca: not live",
+    }
+
+
 def test_v4_index_leaves_write_the_indptrs_atom_passes_and_a_decode_its_split_plan(
     monkeypatch,
 ):
@@ -1049,6 +1082,29 @@ def test_a_state_only_leaf_counts_each_slot_its_copies_read_once(
     # copies take 2 of their 4 placements.
     assert record["footprint_bytes"] == footprint
     assert {slot for _, slot in runner.batches} == {0, 2, 4, 6}
+
+
+@pytest.mark.parametrize(
+    "shape, footprint", [(decode(2), 7 * 288), (prefill(6, 2), 3 * 800)]
+)
+def test_a_rope_table_adds_a_row_a_token_not_its_span(monkeypatch, shape, footprint):
+    # DeepSeek-V4's compressor: cos and sin tables of 1000 positions, a row
+    # of 32 bf16 at each, read one row at a token's position.
+    runner = _Runner()
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    table = _t([1000, 1, 1, 32], "weight", [32, 32, 32, 1], "torch.bfloat16")
+    q = ("q", _t([2, 4], "activation"))
+    leaf = _leaf("aiter.compress", q, ("cos_cache", table), ("sin_cache", table))
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    [record] = ops.Stub(runner, 1000).point(placed, shape, 20, found)
+
+    # 32 bytes of q and 64 a token from each table: 2 decode tokens make 288 a
+    # call, 7 copies past twice 1000 bytes; 6 prefill tokens 800 and 3 copies.
+    # By span, the tables' 128000 bytes would make one copy.
+    assert record["footprint_bytes"] == footprint
 
 
 def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
@@ -1898,3 +1954,34 @@ def test_the_capture_child_starts_with_every_gpu_hidden_below_hip(monkeypatch):
     ops._capture(config, [decode(4)], "store")
 
     assert started["ROCR_VISIBLE_DEVICES"] == ""
+
+
+def test_atom_s_arguments_read_alike_in_either_spelling(
+    monkeypatch, tmp_path, model_dir  # noqa: F811
+):
+    # ATOM's server accepts either spelling of each long flag; so do the benches.
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+    started = []
+    monkeypatch.setattr(ops, "_child", lambda fn, argv: started.append(argv))
+    monkeypatch.setattr("atom.compass.capture.forward.device_arch", lambda: "gfx942")
+    configs = []
+    shape = ["--width", "4", "--context", "9", "--gpu", "0", "--llc-mib", "256"]
+    shape += ["--store", str(tmp_path), "--out", str(tmp_path / "o")]
+    for kv, tp in [
+        ("--kv-cache-dtype", "--tensor_parallel_size"),
+        ("--kv_cache_dtype", "--tensor-parallel-size"),
+    ]:
+        atom_args = ["--model", str(model_dir), kv, "fp8", tp, "2"]
+        configs.append(measure.atom_config(atom_args))
+        ops._capture(configs[-1], [decode(4)], "store", atom_args=atom_args)
+        with pytest.raises(ValueError, match="arguments resolve 2 ranks"):
+            ops.main([*shape, "--", *atom_args])
+
+    assert vars(configs[0]) == vars(configs[1])
+    assert (configs[0].kv_cache_dtype, configs[0].tensor_parallel_size) == ("fp8", 2)
+    first, second = (argv[: argv.index("--")] for argv in started)
+    assert first == second and first[first.index("--tp") + 1] == "2"

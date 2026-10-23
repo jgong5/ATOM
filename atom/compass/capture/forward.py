@@ -34,7 +34,8 @@ batch so the rejection sampler runs, and a step that samples is cut where ATOM
 records `forward_done_event`: the target's work before it, the drafter's after
 it (its passes, the shared embedding and LM head among them), each its own
 graph. A middle chunk, which samples nothing, is a real step's batch too, so
-ATOM runs its draft-KV pass, and is cut where that pass starts. A block
+ATOM runs its draft-KV pass, and is cut where that pass starts; under DP
+ATOM runs the drafter's propose in its place, cut where that starts. A block
 drafter writes its draft KV before `forward_done_event` and is refused.
 A decode of fewer rows than its width ran padded to that rung: its rows run
 the drafter's first pass, which takes the target's tokens unpadded, and the
@@ -91,6 +92,8 @@ V4_DECODES = (
     "aiter.mla_decode_v4_ps_asm.default",
 )
 V4_INDEXER = "aiter.indexer_score_topk.default"
+#: DeepSeek-V4's fused QK-norm and RoPE, which writes a decode's window rows.
+V4_QKN = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
 #: Where a drafter's step ends its target's work: ATOM records `forward_done_event`.
 CUT = "forward_done_event"
 
@@ -851,8 +854,8 @@ def _v4_attention(v4, recorder):
 
     The decode leaves (`V4_DECODES`) state the layer's `window_size`,
     `compress_ratio` and `index_topk` (None when it has no indexer), and the
-    indexer's its `compress_ratio`, none of which they are passed: read off
-    the layer `layer_name` names.
+    indexer's and the fused QK-norm (`V4_QKN`) its `compress_ratio`, none of
+    which they are passed: read off the layer `layer_name` names.
     """
     from atom.utils.forward_context import get_forward_context
 
@@ -861,7 +864,10 @@ def _v4_attention(v4, recorder):
         top = layer.indexer and layer.indexer.index_topk
         ratio = (("compress_ratio", layer.compress_ratio),)
         geometry = (("window_size", layer.window_size), *ratio, ("index_topk", top))
-        stated = {**dict.fromkeys(V4_DECODES, geometry), V4_INDEXER: ratio}
+        stated = {
+            **dict.fromkeys(V4_DECODES, geometry),
+            **dict.fromkeys((V4_INDEXER, V4_QKN), ratio),
+        }
         with (
             patch.object(recorder, "stated", stated),
             patch.object(get_forward_context().context, "is_dummy_run", False),
@@ -903,8 +909,9 @@ def _drafter(runner, recorder):
     """The width of `runner`'s drafter and its models, none without one. Its
     step is cut where its target's work ends, as the parity record stamps it:
     at `forward_done_event` on a step that samples, else where the drafter's
-    draft-KV pass starts. A block drafter writes its draft KV before
-    `forward_done_event` on a step that samples, and is refused."""
+    draft-KV pass starts, under DP its propose. A block drafter writes its
+    draft KV before `forward_done_event` on a step that samples, and is
+    refused."""
     drafter = getattr(runner, "drafter", None)
     if drafter is None:
         return 0, []
@@ -916,13 +923,20 @@ def _drafter(runner, recorder):
         )
     done, draft_kv = runner.forward_done_event, drafter.compute_draft_kv
     done.record = lambda *a: (recorder.cut(), driverless.Event.record(done, *a))
+    propose = runner.propose_draft_token_ids
 
     def compute_draft_kv(*args, **kwargs):
         if not recorder.output:
             recorder.cut()
         return draft_kv(*args, **kwargs)
 
+    def propose_draft_token_ids(*args, **kwargs):
+        if not recorder.output:
+            recorder.cut()
+        return propose(*args, **kwargs)
+
     drafter.compute_draft_kv = compute_draft_kv
+    runner.propose_draft_token_ids = propose_draft_token_ids
     return drafter.mtp_k, [drafter.model]
 
 
@@ -1030,13 +1044,13 @@ def _config(model, tp, atom_args):
     Under `--enable-dp-attention` each TP rank is a DP rank of TP 1, as
     `CoreManager` rewrites it.
     """
-    import argparse
     import dataclasses
 
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
 
-    parser = EngineArgs.add_cli_args(argparse.ArgumentParser(prog="trace ops --"))
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog="trace ops --"))
     forced = ["--enforce-eager", "--level", "0", "--load_dummy", "empty"]
     args = parser.parse_args(["--model", model, "-tp", str(tp), *atom_args, *forced])
     engine = EngineArgs.from_cli_args(args)
@@ -1052,7 +1066,14 @@ def _config(model, tp, atom_args):
 
 
 def capture(
-    model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942", population=()
+    model: str,
+    tp: int,
+    shapes,
+    tmpdir: str,
+    atom_args=(),
+    arch="gfx942",
+    population=(),
+    whole=False,
 ):
     """Trace one step of `model` at TP `tp` at each of `shapes`, in this process,
     under ATOM's engine arguments `atom_args` on a declared `arch`.
@@ -1065,7 +1086,7 @@ def capture(
     record directories `population` are shapes too (`population_shapes`),
     under two-batch overlap a split one's two micro-batches; each of their
     prefills runs as one forward, as it ran, this rank answering that it
-    cannot split it.
+    cannot split it; with `whole`, each prefill of `shapes` too.
     """
     declared = driverless.install(tmpdir, arch)
 
@@ -1079,7 +1100,7 @@ def capture(
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     ep = int(config.enable_expert_parallel)
     ran = population_shapes(population, config.enable_tbo)
-    unsplit = {s for s in ran if s.phase == "prefill"}
+    unsplit = {s for s in ([*ran, *shapes] if whole else ran) if s.phase == "prefill"}
     shapes = list(dict.fromkeys([*shapes, *ran]))
     if not shapes:
         raise ValueError(f"{', '.join(population)} hold no step to trace")

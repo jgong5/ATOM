@@ -19,7 +19,7 @@ is a final chunk.
 Under a drafter of `drafts` tokens a decode step verifies `drafts` and one in
 each row, and a step also reads its drafter's graph, `graph(..., draft=True)`,
 the work ATOM queues after `forward_done_event` on a step that samples, else
-from its draft-KV pass on: its prices are terms named ``draft op.<kind>``,
+from its first draft pass on: its prices are terms named ``draft op.<kind>``,
 each tagged draft. Sampling is the target's. A decode's drafter is read at its
 rows run at the step's width: its first pass runs the rows' tokens unpadded.
 
@@ -65,8 +65,7 @@ this rank, whose micro-batches' graphs exchange a different number of times
 or run an exchange beside a second stream (the dual-stream MoE, which ATOM
 turns off under overlap), or that runs under a drafter, whose draft pass no
 graph places on the overlapped streams; a decode step whose rows do not each
-verify the drafter's tokens and one; a DP middle chunk under a drafter, whose
-drafter's passes no cut parts from the target's; a prefill step whose view
+verify the drafter's tokens and one; a prefill step whose view
 does not say whether it produces output; a shape with no graph, a
 data-parallel step's naming the rows it gathers; and, each reason once, a leaf
 whose kind has no extractor, whose price reads a spec field the spec lacks, or
@@ -260,8 +259,7 @@ class OpGraphBackend(CostBackend):
 
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
-        with `draft`, its drafter's, a decode's at its rows, at `draft_moe_rows`,
-        refused for a DP middle chunk."""
+        with `draft`, its drafter's, a decode's at its rows, at `draft_moe_rows`."""
         if view.image_tokens:
             reason = IMAGES
         else:
@@ -285,13 +283,6 @@ class OpGraphBackend(CostBackend):
                         "a prefill step whose view does not say whether it "
                         "produces output, so whether it runs the LM head and the "
                         "sampler"
-                    )
-                elif draft and not output and self.dp > 1:
-                    reason = (
-                        "a DP middle chunk under a drafter: ATOM runs the "
-                        "drafter's passes for their DP collectives in place of its "
-                        "draft-KV pass (`propose(align_only=True)`), and no cut "
-                        "parts them from the target's"
                     )
                 elif isinstance(
                     region := self.graph(*shape, output, *g, **drafted), dict
