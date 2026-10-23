@@ -206,3 +206,30 @@ def test_the_band_ranks_the_cells_again_at_each_ratio_one_at_a_time(monkeypatch)
     # At 0.8 the third and fourth cells change places; the top-1 holds.
     low = band[link]["0.8"]
     assert low["ranking"]["step"]["top_1"] == ["a"] and not low["order_holds"]["step"]
+
+
+def test_no_process_prices_two_cells_whatever_the_pool_width(monkeypatch):
+    """A build declares one engine per process, so a worker takes one cell
+    and exits; the pool is as wide as the CPUs this process may use."""
+    seen = []
+
+    class Pool:
+        def __init__(self, width, maxtasksperchild):
+            seen.append((width, maxtasksperchild))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+        def starmap(self, fn, jobs, chunksize=None):
+            seen.append(chunksize)
+            return [fn] * len(jobs)
+
+    spawn = SimpleNamespace(Pool=Pool)
+    monkeypatch.setattr(project.multiprocessing, "get_context", lambda how: spawn)
+    monkeypatch.setattr(project.os, "sched_getaffinity", lambda pid: range(8))
+
+    assert project._each([()] * 40) == [project.cell] * 40
+    assert seen == [(8, 1), 1]

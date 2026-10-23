@@ -144,7 +144,7 @@ def _each(jobs: list) -> list:
     spawn = multiprocessing.get_context("spawn")
     width = max(1, min(len(jobs), len(os.sched_getaffinity(0))))
     with spawn.Pool(width, maxtasksperchild=1) as pool:
-        return pool.starmap(cell, jobs)
+        return pool.starmap(cell, jobs, chunksize=1)
 
 
 def _ranked(cells: dict) -> dict:
