@@ -80,8 +80,9 @@ Before each capture, and once the runner sized its KV pool, the memory the
 bench freed goes back to the driver, and the bench waits, at most `CLEAR_S`,
 until the card's VRAM in use falls by it (`_release`); a point records the
 seconds waited since the last point and how many waits the cap ended.
-Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
-idle `REST` times a replay's device time after each replay;
+Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the cold
+one each time after a write of `COLD` times the last-level cache outside the
+timing, the host idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
 aside, are the point's kernel identity. When `ReplayRule` refuses a batch, its
@@ -532,7 +533,7 @@ class Stub:
         self.runner, self.llc, self.journal = runner, llc, journal
         # written before each cold replay, so no call reads what the last left
         # in the cache: under twice the cache, 256 copies alone leave a leaf warm
-        self.flush = torch.empty(COLD * llc, dtype=torch.uint8, device=runner.device)
+        self.flush = None
         self.alone = getattr(runner.config, "dp_logical_size", 0)
         self.slots = runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
         self.built, self.leaves, self.placed = {}, {}, []
@@ -789,6 +790,10 @@ class Stub:
             )
         fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
         self.loads, self.built = [], {}
+        if self.flush is None:
+            self.flush = torch.empty(
+                COLD * self.llc, dtype=torch.uint8, device=self.runner.device
+            )
         with refused_together():
             calls = [self._copy(op, sig, instances, 0)]
         # one weight can read a few percent off another of its spec: cycle one

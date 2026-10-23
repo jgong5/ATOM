@@ -1423,36 +1423,36 @@ def test_each_cold_replay_follows_one_eviction_of_cold_caches_and_a_warm_one_non
 ):
     # 256 copies under twice the cache leave a leaf warm unless the cache is
     # written over before each replay; the warm graph is the leaf on one copy.
+    # A replay marks the buffer; each event reads whether it was written since.
     seen = []
-    monkeypatch.setattr(
-        torch.cuda,
-        "CUDAGraph",
-        lambda: SimpleNamespace(replay=lambda: seen.append("replay")),
-    )
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+
+    def replay():
+        stub.flush.fill_(1)
+        seen.append("replay")
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=replay))
     monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: contextlib.nullcontext())
     monkeypatch.setattr(
         torch.cuda,
         "Event",
         lambda enable_timing: SimpleNamespace(
-            record=lambda: seen.append("event"),
+            record=lambda: seen.append("written" if stub.flush.max() == 0 else "kept"),
             synchronize=lambda: None,
             elapsed_time=lambda end: 1.0,
         ),
     )
-    stub = ops.Stub(_Runner(), 10_000)
-    stub.placed = [(fctx.ForwardContext(), {})]
-    assert stub.flush.nbytes == ops.COLD * 10_000
-    nbytes = stub.flush.nbytes
-    stub.flush = SimpleNamespace(zero_=lambda: seen.append(nbytes))
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
         patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
     ):
         stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], 8)
 
+    assert stub.flush.nbytes == ops.COLD * 10_000
     replays = ops.WARMUPS + ops.REPEATS
-    cold = [nbytes, "event", "replay", "event"] * replays
-    assert seen == cold + ["event", "replay", "event"] * replays
+    cold = ["written", "replay", "kept"] * replays
+    assert seen == cold + ["kept", "replay", "kept"] * replays
 
 
 def test_a_capture_waits_for_the_driver_to_clear_a_release_and_a_capped_wait_is_recorded(
