@@ -35,7 +35,7 @@ from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import NONE, OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.provenance import Refusal
-from atom.compass.backends.step_roofline import overlap
+from atom.compass.backends.step_roofline import micro_batches, overlap
 from atom.compass.backends.work import attention, gemm, price
 from atom.compass.bench.ops import leaves, signature
 from atom.compass.capture.peers import MORI
@@ -222,6 +222,14 @@ def test_a_spec_field_a_leaf_reads_and_the_spec_lacks_refuses_naming_it():
         backend(g(2, 8, 8), lacking).price(DECODE)
 
 
+def test_a_leaf_refused_on_one_step_is_refused_on_the_next():
+    lacking = SimpleNamespace(values={}, value=SPEC.value, origin=SPEC.origin)
+    ops = backend(g(2, 8, 8), lacking)
+    for step in (DECODE, DECODE):
+        with pytest.raises(CostRefused, match=f"{GEMM} reads device.kernel_floor_s,"):
+            ops.price(step)
+
+
 def test_a_collective_wider_than_the_scale_up_domain_refuses_naming_it():
     reduce = leaf("aiter.all_reduce_.default", [[2, 64]], tensor=t([2, 64]))
 
@@ -285,6 +293,26 @@ def test_a_step_works_each_distinct_leaf_once_and_keeps_what_reads_no_step(
     assert worked == [GEMM, ATTENTION, ATTENTION]
     assert costs == [backend(region).price(step) for step in steps]
     assert costs[0] != costs[1]
+
+
+def test_leaves_that_differ_only_in_what_they_state_price_apart():
+    def indexer(ratio):
+        op = leaf(
+            "aiter.indexer_score_topk.default",
+            [[2, 2048]],
+            q_quant=t([2, 64, 128], "torch.float8_e4m3fn"),
+            weights=t([2, 64]),
+            topk=2048,
+        )
+        return op | {"stated": {"compress_ratio": ratio}}
+
+    a, b = indexer(4), indexer(128)
+    step = view((1, 900_000, True), (1, 300_000, True), rung=2)
+    both = by_name(backend({"seq": [a, b]}, kv="fp8").price(step))
+    alone = [by_name(backend(x, kv="fp8").price(step)) for x in (a, b)]
+
+    assert alone[0] != alone[1]
+    assert both == {k: fold_seconds([alone[0][k], alone[1][k]]) for k in both}
 
 
 def test_a_leaf_in_and_out_of_a_resource_bound_par_prices_each_way():
@@ -459,6 +487,18 @@ def test_an_exchange_two_pars_deep_is_refused():
 
     with pytest.raises(CostRefused, match="runs an MoE exchange beside a second"):
         OpGraphBackend(SECOND, lambda *at: nested, kv="bf16").price(SPLIT)
+
+
+def test_each_micro_batch_s_attention_prices_at_its_own_rows():
+    split = replace(
+        SPLIT, requests=(RequestShape(4, 40_000, False), RequestShape(3, 90_000, False))
+    )
+    attn = leaf(ATTENTION, [[4, 6144]], q=t([4, 24, 256]), k=t([4, 4, 256]))
+    cost = OpGraphBackend(SPEC, lambda *at: attn, kv="bf16").price(split)
+    each = [price(work(attn, h, 1, "bf16"), SPEC) for h in micro_batches(split)]
+
+    assert each[0] != each[1]
+    assert by_name(cost) == {"op.tbo": pytest.approx(sum(each))}
 
 
 def test_a_split_step_s_note_names_the_stated_fields_of_every_price():
@@ -708,6 +748,18 @@ def test_a_decode_step_prices_at_its_longest_row_s_context(rows, priced, method)
 
     assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(priced)}
     assert cost.terms[0].provenance.method is method
+
+
+def test_one_backend_prices_each_step_at_its_own_bound():
+    ops = backend(g(2, 64, 64), price_list=BANDED)
+    steps = [
+        view(*rows, rung=2)
+        for rows in ([(1, 1500, True)] * 2, [(1, 1000, True), (1, 3000, True)])
+    ]
+
+    assert [by_name(ops.price(s)) for s in steps] == [
+        by_name(backend(g(2, 64, 64), price_list=BANDED).price(s)) for s in steps
+    ]
 
 
 ATTN = leaf(ATTENTION, [[64, 6144]], q=t([64, 24, 256]), k=t([64, 4, 256]))

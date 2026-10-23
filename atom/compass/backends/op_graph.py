@@ -117,10 +117,6 @@ class _Watched:
         self.read = True
         return getattr(self.view, name)
 
-    def __repr__(self) -> str:
-        self.read = True
-        return repr(self.view)
-
 
 class _Roofline(CostSource):
     """A leaf's roofline, as `OpGraphBackend._unit` prices it."""
@@ -442,7 +438,7 @@ class OpGraphBackend(CostBackend):
         stated fields, all a leaf's work reads of it, and once for good for a
         leaf object whose work read nothing of the step and nothing refused."""
         kept = self._kept.get(id(leaf))
-        if kept is None or kept[0] is not leaf:
+        if kept is None:
             if len(self._kept) >= KEPT:
                 self._kept.clear()
             args = {
