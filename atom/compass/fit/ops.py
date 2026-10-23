@@ -46,7 +46,9 @@ query is the point itself. A point that launched other kernels than the
 neighbours it is priced from is a hidden band: no check of the neighbours'
 kernels can see it. A line holding a hidden band or an error over `LIMIT` does not
 interpolate: its family lists it under `declined` with its reason, for the
-price list's reader to answer only its measured points along it. Per phase
+price list's reader to answer only its measured points along it. A line that
+interpolates lists under `brackets` the neighbours each of its held-out
+points was priced from, and an answer between them is validated. Per phase
 and operator the report gives the median and largest error on the lines that
 interpolate.
 
@@ -309,11 +311,13 @@ def held_out(params) -> list[dict]:
     collective's `row_bytes` away); a hidden band is a point whose kernels are
     not the ones its neighbours launched. Each family gets its
     `declined` lines, [dimension, the other coordinates, reason]: those
-    holding a hidden band or an error over `LIMIT`."""
+    holding a hidden band or an error over `LIMIT`; and its `brackets`,
+    [dimension, the other coordinates, low, high], the neighbours each point
+    of a line that interpolates was priced from."""
     rows = []
     for name, f in params["families"].items():
         points = {tuple(c): (ns, k) for c, ns, k in f["points"]}
-        mine, why = [], {}
+        mine, why, brackets = [], {}, []
         for c, (ns, own) in points.items():
             for i, dim in enumerate(f["dims"]):
                 rest = c[:i] + c[i + 1 :]
@@ -337,6 +341,9 @@ def held_out(params) -> list[dict]:
                         "error": priced / ns - 1 if ns else None,
                         "hidden_band": kernels != own,
                     }
+                    lo = max(x for x in xs if x < c[i])
+                    hi = min(x for x in xs if x > c[i])
+                    brackets.append([dim, list(rest), lo, hi])
                 except Declined as e:
                     row["declined"] = str(e)
                 bad = row.get("hidden_band") and "launched other kernels than"
@@ -349,6 +356,7 @@ def held_out(params) -> list[dict]:
                 mine.append((row, (dim, rest)))
         rows += [row | {"line_declined": line in why} for row, line in mine]
         f["declined"] = [[d, list(r), "; ".join(w)] for (d, r), w in why.items()]
+        f["brackets"] = [b for b in brackets if (b[0], tuple(b[1])) not in why]
     return rows
 
 
@@ -379,7 +387,10 @@ class PriceList(CostSource):
     at the step's count of each of its dimensions, ``context`` the bound's:
     a decode step's rows' max, a prefill's rows' mean cached tokens. It also
     declines along a line the fit declined, and prefill rows whose cached
-    tokens from that mean to their max cross into another kernel."""
+    tokens from that mean to their max cross into another kernel. An answer
+    between points is validated when every line it interpolates along holds
+    a bracket (`held_out`) around it; one whose rows' cached tokens differ
+    was held out on no line, and is not."""
 
     name = LISTED
 
@@ -406,7 +417,9 @@ class PriceList(CostSource):
         if isinstance(got, str):
             return self.refuse(f"{kind}: {got}")
         method = Method.MEASURED if got[1] else Method.ESTIMATED
-        return CostTerm(f"op.{kind}", got[0] * 1e-9, Provenance(method))
+        return CostTerm(
+            f"op.{kind}", got[0] * 1e-9, Provenance(method, validated=got[2])
+        )
 
     def _family(self, shape: str, sig: str) -> str | None:
         """The family of a leaf of signature `sig` at `shape`, or None."""
@@ -415,8 +428,9 @@ class PriceList(CostSource):
         name = None if free is None else family(shape, sig, free)
         return name if name in self.params["families"] else None
 
-    def _lookup(self, name: str, at: tuple, top) -> tuple[float, bool] | str:
-        """The ns at `at`, and whether it is a measured point; or why not."""
+    def _lookup(self, name: str, at: tuple, top) -> tuple[float, bool, bool] | str:
+        """The ns at `at`, whether it is a measured point and whether it is a
+        validated estimate; or why not."""
 
         points, axes = self._table(name)
         ends = [at]
@@ -436,7 +450,9 @@ class PriceList(CostSource):
                 f"its rows' cached tokens from {at[-1]} to {top} cross from "
                 f"{first[0]} to {first[1]}"
             )
-        return got[0][0], at in points and top is None
+        measured = at in points and top is None
+        validated = not measured and top is None and self._validated(name, at)
+        return got[0][0], measured, validated
 
     def _table(self, name: str) -> tuple[dict, list]:
         """A family's points by coordinates, and each dimension's values."""
@@ -444,14 +460,11 @@ class PriceList(CostSource):
         points = {tuple(c): (ns, k) for c, ns, k in f["points"]}
         return points, [sorted({c[i] for c in points}) for i in range(len(f["dims"]))]
 
-    def _at(self, name: str, at: tuple):
-        """`interpolate` at `at`, declining along a line the fit
-        declined: one along a dimension `at` lies between two values of,
-        whose other coordinates are `at`'s, or a value bracketing it."""
-
-        f, (points, axes) = self.params["families"][name], self._table(name)
-        dims = f["dims"]
-        near = [
+    @staticmethod
+    def _near(at: tuple, axes: list) -> list[set]:
+        """Per dimension, `at`'s value when measured, else the values either
+        side of it."""
+        return [
             (
                 {x}
                 if x in vs
@@ -462,6 +475,35 @@ class PriceList(CostSource):
             )
             for x, vs in zip(at, axes)
         ]
+
+    def _validated(self, name: str, at: tuple) -> bool:
+        """Whether `at` interpolates along some line, and every line it
+        interpolates along holds a bracket around it: a line through `at`'s
+        neighbours in the other dimensions that holds no point at `at`."""
+        f, (points, axes) = self.params["families"][name], self._table(name)
+        near, held = self._near(at, axes), f.get("brackets", ())
+        lines = [
+            (i, list(rest))
+            for i, x in enumerate(at)
+            for rest in itertools.product(*near[:i], *near[i + 1 :])
+            if (*rest[:i], x, *rest[i:]) not in points
+        ]
+        return bool(lines) and all(
+            any(
+                d == f["dims"][i] and r == rest and lo < at[i] < hi
+                for d, r, lo, hi in held
+            )
+            for i, rest in lines
+        )
+
+    def _at(self, name: str, at: tuple):
+        """`interpolate` at `at`, declining along a line the fit
+        declined: one along a dimension `at` lies between two values of,
+        whose other coordinates are `at`'s, or a value bracketing it."""
+
+        f, (points, axes) = self.params["families"][name], self._table(name)
+        dims = f["dims"]
+        near = self._near(at, axes)
         for dim, rest, why in f.get("declined", ()):
             i = dims.index(dim)
             others = [near[j] for j in range(len(dims)) if j != i]

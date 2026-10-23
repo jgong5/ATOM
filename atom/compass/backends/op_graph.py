@@ -56,7 +56,7 @@ neither from a datasheet nor probed, and `analytical` otherwise; it carries
 each reason the price list declined one of its leaves. A price list's prices
 are ``op.<kind>.price_list``, and ``op.tbo.price_list`` when it priced every
 leaf of both micro-batches, `measured` when each sat on a measured point and
-`estimated` otherwise.
+`estimated` otherwise, validated when each of its estimated leaves is.
 
 Refused: a step with image tokens, since no graph holds the vision encoder; a
 two-batch-overlap step on MoRI's split send and receive (`split_send_recv`),
@@ -210,19 +210,22 @@ class OpGraphBackend(CostBackend):
         seconds: dict[str, list[float]] = {}
         stated: dict[str, list[str]] = {}
         how: dict[str, tuple[list, list]] = {}
-        for name, s, notes, _, _, (methods, declined) in priced:
+        for name, s, notes, _, _, (origins, declined) in priced:
             seconds.setdefault(name, []).append(s)
             stated.setdefault(name, []).extend(notes)
             got = how.setdefault(name, ([], []))
-            got[0].extend(methods)
+            got[0].extend(origins)
             got[1].extend(declined)
         terms = []
         for name, values in seconds.items():
             note = "; ".join(dict.fromkeys(stated[name]))
             method = Method.DECLARED if note else Method.ANALYTICAL
-            source, (methods, why) = SOURCE, how[name]
+            source, (origins, why), validated = SOURCE, how[name], False
             if name.endswith(".price_list"):
-                method, source = combine(methods), LISTED
+                method, source = combine(p.method for p in origins), LISTED
+                validated = method is Method.ESTIMATED and all(
+                    p.validated for p in origins if p.method is Method.ESTIMATED
+                )
             drafted = name.startswith(DRAFT)
             detail = (
                 f"{len(values)} prices of the graph at {drafted_at if drafted else at}"
@@ -235,6 +238,7 @@ class OpGraphBackend(CostBackend):
                 source,
                 tuple(dict.fromkeys(why)),
                 note=note and note + NONE,
+                validated=validated,
             )
             terms.append(CostTerm(name, fold_seconds(values), provenance, drafted))
         return StepCost(terms)
@@ -319,7 +323,7 @@ class OpGraphBackend(CostBackend):
             halves = micro_batches(view)
         except ValueError as exc:
             raise CostRefused(view, [Refusal(SOURCE, str(exc))]) from None
-        at, runs, notes, methods, why = [], [], [], [], []
+        at, runs, notes, origins, why = [], [], [], [], []
         listed = bool(self.resolver)
         for k, half in enumerate(halves):
             output = k == 1 and view.produces_output
@@ -339,7 +343,7 @@ class OpGraphBackend(CostBackend):
                     )
                     raise CostRefused(view, [Refusal(SOURCE, reason)])
                 notes += stated
-                methods += how[0]
+                origins += how[0]
                 why += how[1]
                 listed = listed and name.endswith(".price_list")
                 if comm != (len(run) % 2 == 0):
@@ -354,17 +358,17 @@ class OpGraphBackend(CostBackend):
             )
             raise CostRefused(view, [Refusal(SOURCE, reason)])
         name = TBO + ".price_list" if listed else TBO
-        price = (name, overlap([zip(*runs)]), notes, Work(), False, (methods, why))
+        price = (name, overlap([zip(*runs)]), notes, Work(), False, (origins, why))
         return " and ".join(at), [price]
 
     def _priced(self, region: dict, view: BatchView, refused: list, bound) -> list:
         """`region`'s prices in run order, each ``(term, seconds, stated, work,
-        comm, (methods, declined))``, `work` what it adds to an enclosing
+        comm, (origins, declined))``, `work` what it adds to an enclosing
         resource_bound, `comm` that it rides the comm stream under two-batch
         overlap, None when it joins an MoE exchange to work on another stream,
-        `methods` the price list's and `declined` its reasons for a roofline;
-        what refuses goes to `refused`. With a `bound`, a leaf resolves through
-        the price list first."""
+        `origins` the price list's provenances and `declined` its reasons for a
+        roofline; what refuses goes to `refused`. With a `bound`, a leaf
+        resolves through the price list first."""
         if "op" in region:
             leaf = self._leaf(region, view, refused, bound)
             comm = region["op"].startswith(MOE_EXCHANGES) and any(
@@ -400,7 +404,7 @@ class OpGraphBackend(CostBackend):
         return [(name, *unit, summed, comm, ((), ()))] if unit else []
 
     def _leaf(self, leaf: dict, view: BatchView, refused: list, bound):
-        """One leaf's ``(term, seconds, stated, work, (methods, declined))`` as
+        """One leaf's ``(term, seconds, stated, work, (origins, declined))`` as
         `_priced` lists it; None when it launches no kernel or refuses."""
         try:
             w = work(leaf, view, self.tp, self.kv, self.ep)
@@ -419,7 +423,7 @@ class OpGraphBackend(CostBackend):
             term, listed = got.term, got.source == LISTED
             notes = term.provenance.note.split("; ") if term.provenance.note else []
             name = f"{term.name}.price_list" if listed else term.name
-            how = ((term.provenance.method,) if listed else (), got.declined)
+            how = ((term.provenance,) if listed else (), got.declined)
             return name, term.seconds, notes, Work(), how
         if isinstance(w, tuple):
             refused.extend(w)

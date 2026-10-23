@@ -779,6 +779,93 @@ def test_a_split_step_the_list_prices_in_part_is_a_roofline_carrying_why(
     )
 
 
+def flat(n, *bs):
+    """Decode points of a GEMM into `n` outputs, B microseconds at B, flat in
+    context, so its family runs over B alone."""
+    return [
+        pt(g(b, n, 64), f"decode B={b}", b * 1e3, c) for b in bs for c in (100, 1000)
+    ]
+
+
+THIRTY_TWO = view(*[(1, 90, True)] * 32)
+
+
+@pytest.mark.parametrize(
+    "params,validated",
+    [
+        (listed(*flat(64, 1, 64)), False),
+        (listed(*flat(64, 1, 8, 64)), True),
+        (fit_ops.PriceList(fit_ops.fit(flat(64, 1, 8, 64))), False),
+    ],
+    ids=["B=1,64", "B=1,8,64", "no-brackets"],
+)
+def test_b_32_is_validated_only_inside_a_held_out_bracket(params, validated):
+    # on 1, 8, 64 the held-out B = 8 was priced from 1 and 64, around 32
+    listing = backend(g(2, 64, 64), padded=False, price_list=params)
+    (term,) = listing.price(THIRTY_TWO).terms
+
+    assert term.seconds == pytest.approx(32e-6)
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is validated
+
+
+@pytest.mark.parametrize(
+    "bs,contexts,context,validated",
+    [
+        ((1, 8, 64), (1000, 2000, 3000), 1500, True),
+        ((1, 8, 64), (1000, 3000), 1500, False),
+        ((1, 64), (1000, 2000, 3000), 1500, False),
+        ((1, 8, 64), (1000, 3000), 1000, True),
+    ],
+    ids=["both-bracketed", "context-not", "b-not", "along-b-only"],
+)
+def test_a_query_on_two_dimensions_is_validated_only_when_both_lines_are(
+    bs, contexts, context, validated
+):
+    params = listed(
+        *[
+            pt(g(b, 64, 64), f"decode B={b}", b * 1e4 + c * 10, c)
+            for b in bs
+            for c in contexts
+        ]
+    )
+    step = view(*[(1, context, True)] * 32)
+    (term,) = backend(g(2, 64, 64), padded=False, price_list=params).price(step).terms
+
+    assert term.seconds == pytest.approx((32e4 + context * 10) * 1e-9)
+    assert term.provenance.validated is validated
+
+
+@pytest.mark.parametrize("bs,validated", [((1, 8, 64), True), ((1, 64), False)])
+def test_a_term_of_measured_and_validated_leaves_is_validated(bs, validated):
+    # N = 64 is measured at B = 32; N = 128 is estimated between its points
+    params = listed(*flat(64, 1, 32, 64), *flat(128, *bs))
+    pair = {"seq": [g(2, 64, 64), g(2, 128, 64)]}
+    (term,) = backend(pair, padded=False, price_list=params).price(THIRTY_TWO).terms
+
+    assert term.seconds == pytest.approx(64e-6)
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is validated
+
+
+@pytest.mark.parametrize("ts,validated", [((2, 4, 5, 8), True), ((2, 4), False)])
+def test_a_split_step_of_measured_and_validated_leaves_is_validated(ts, validated):
+    # T = 4 is measured; T = 3 lies inside 2 to 5, which priced T = 4 held out
+    params = listed(
+        *[pt(g(t, 8, 8), f"prefill T={t} B=1", t * 1e9, c) for t in ts for c in (0, 8)]
+    )
+
+    def graph(phase, tokens, seqs, output, gathered):
+        return {"seq": [g(tokens, 8, 8)]}
+
+    cost = OpGraphBackend(SECOND, graph, kv="bf16", dp=2, price_list=params)
+    (term,) = cost.price(SPLIT).terms
+
+    assert term.name == "op.tbo.price_list"
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is validated
+
+
 # An MoE GEMM over the rows a DP-2 group gathers, at T = 4 and two stated G;
 # flat in cached tokens, so its family runs over G alone.
 GATHERED = listed(
