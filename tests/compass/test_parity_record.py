@@ -678,9 +678,10 @@ def test_a_dp2_real_runner_records_moe_rows_from_its_forwards_one_collective(
     assert len(batches[0]) == len(batches[1])
     assert list(calls.values()) == [len(batches[0])] * 2
     for rank in (0, 1):
-        moe_rows = []
+        moe_rows, moe_tokens = [], []
         for step in real[rank]:
             moe_rows.append(step.pop("moe_rows"))
+            moe_tokens.append(step.pop("moe_tokens"))
             for key in TIMESTAMPS:
                 step.pop(key, None)
         assert real[rank] == simulated[rank]
@@ -689,6 +690,10 @@ def test_a_dp2_real_runner_records_moe_rows_from_its_forwards_one_collective(
         assert moe_rows == [
             2 * step["rung"] if step["rung"] else sum(b.total_tokens_num for b in pair)
             for step, pair in zip(simulated[rank], zip(*batches))
+        ]
+        # The real tokens among them: the group's scheduled tokens.
+        assert moe_tokens == [
+            sum(b.total_tokens_num for b in pair) for pair in zip(*batches)
         ]
 
 

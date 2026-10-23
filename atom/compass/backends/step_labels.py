@@ -9,6 +9,10 @@ prices them; neither reads a step's stamps. Neither takes a record whose
 run.json names `BUILDS`, aiter JIT modules its server built while it served;
 `refusal` says why.
 
+A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
+`dp_rank`. An older record's lines state neither count: `group_tokens`
+rebuilds `moe_tokens` from every rank's line, and no step is split.
+
 A step's device label is its device busy time, `d_busy_ns`, plus for a decode
 step the device work queued since the previous forward's exit, `d_gap_ns`. A
 decode step whose device start precedes its host launch end is launch-exposed
@@ -95,6 +99,8 @@ class Sample:
     `provenance` holds `source`, `run` (the run's digest), `requests` (the
     request ids the step served) and `config` (the host key the record states,
     or None).
+    `dummies` holds the steps its rank ran as a DP dummy forward, which give no
+    sample: the same set on each of the rank's samples.
     """
 
     step: int
@@ -107,6 +113,14 @@ class Sample:
     provenance: dict
     draft_s: float | None = None
     propose_s: float | None = None
+    dummies: frozenset = frozenset()
+
+
+def group_tokens(lines) -> int | None:
+    """The real tokens among a data-parallel step's `moe_rows`: ATOM's
+    `num_tokens_across_dp` summed over every rank's line at that step, a dummy
+    rank's one row. None when a rank's line is missing."""
+    return None if None in lines else sum(q for s in lines for q, _, _ in s["rows"])
 
 
 def digest(record) -> str:
@@ -182,6 +196,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
     if (pulls := path.with_suffix(".pulls.jsonl")).exists():
         join_stamps(lines, pulls)
     steps = [s for s in lines if not s["is_dummy_run"]]
+    dummies = frozenset(s["step"] for s in lines if s["is_dummy_run"])
     if not steps or "t_enter_ns" not in steps[0]:
         raise ValueError(
             f"{record} has no timed steps; a fit needs a real run's record"
@@ -196,16 +211,26 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
     key = path.with_suffix(".key.json")
     config = read_json(key) if key.exists() else None
     run = run or digest(record)
-    samples, table, prev = [], [], None
+    samples, table, prev, ranks = [], [], None, None
     for s in lines:
         if s["is_dummy_run"]:
             prev = s
             continue
+        dp, tokens = "moe_rows" in s, s.get("moe_tokens")
+        if dp and tokens is None:
+            if ranks is None:
+                peers = path.parent.glob(path.name.split("dp")[0] + "dp*[0-9].jsonl")
+                ranks = [{t["step"]: t for t in read_jsonl(p)} for p in sorted(peers)]
+            tokens = group_tokens([r.get(s["step"]) for r in ranks])
+        split = s.get("tbo_tokens")
         view = BatchView(
             tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
             capture_rung=s["rung"],
             moe_rows=s.get("moe_rows"),
             produces_output=s["produces_output"],
+            tbo_tokens=None if split is None else tuple(map(tuple, split)),
+            moe_tokens=tokens,
+            dp_rank=s["dp_rank"] if dp else None,
         )
         cut = None
         if view.prefill and view.decode:
@@ -258,6 +283,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
                 provenance,
                 None if cut else draft,
                 None if cut or propose is None else propose * 1e-9,
+                dummies,
             )
         )
         gap_ns = s.get("d_gap_ns")

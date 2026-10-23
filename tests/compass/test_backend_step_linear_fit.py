@@ -1056,3 +1056,23 @@ def test_a_dp_law_blind_to_context_hulls_each_step_by_its_rank_of_most_context(
     for context, validated in ((70_000, True), (10_000, False)):
         terms = backend.price(step(context)).terms
         assert {t.provenance.validated for t in terms} == {validated}
+
+
+def test_a_dp_step_a_peer_ran_as_a_dummy_is_fitted_on_the_ranks_that_ran_it(tmp_path):
+    import test_step_linear_dp as dp
+
+    groups = dp._groups(0, n=120)
+    records = dp._records(tmp_path, groups)
+    # Rank 2 runs a dummy on every third step it is not the slowest on.
+    dummied = [i for i in range(0, 120, 3) if i % dp.DP != 2]
+    lines = [json.loads(line) for line in records[2].read_text().splitlines()]
+    for i in dummied:
+        lines[i].update(is_dummy_run=True, batch=[], rows=[[1, 1, True]])
+    records[2].write_text("".join(json.dumps(line) + "\n" for line in lines))
+    law_ = _fit(records, dp=dp.DP)
+
+    assert law_["cut"]["ranks"] == 0
+    fitted = [law_["prefill"], law_["decode"]["4"]]
+    assert sum(v["fit"]["samples"] for v in fitted) == 120
+    assert fitted[0]["coefficients"] == pytest.approx(dp.PREFILL, rel=1e-6)
+    assert fitted[1]["coefficients"] == pytest.approx(dp.DECODE, rel=1e-6)
