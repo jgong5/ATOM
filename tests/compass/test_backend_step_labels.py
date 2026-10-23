@@ -7,8 +7,12 @@ planted device, through a real runner's stamps, and as
 `test_backend_step_linear_fit.py` plants them, from a known law.
 """
 
+import dataclasses
+import itertools
 import json
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from test_backend_step_linear_fit import (
     GAP_NS,
@@ -24,7 +28,12 @@ from test_parity_device_window import BUSY, GAP, _recorded
 from test_parity_record import _config, _drive
 
 from atom.compass.artifacts import machine_spec_digest
-from atom.compass.backends import StepLinearBackend, StepLinearLaw
+from atom.compass.backends import (
+    BatchView,
+    RequestShape,
+    StepLinearBackend,
+    StepLinearLaw,
+)
 from atom.compass.backends.step_labels import (
     TABLE_VERSION,
     digest,
@@ -37,7 +46,8 @@ from atom.compass.backends.step_linear_fit import (
     main,
     mark_held_out,
 )
-from atom.compass.parity import ENV
+from atom.compass.parity import ENV, StepRecord
+from atom.compass.runner import projection
 from atom.compass.spec import MachineSpec
 
 KEY = {"host_cpu": "planted cpu", "atom": "0" * 64, "model": None, "engine": {}}
@@ -298,3 +308,85 @@ def test_a_record_with_pull_stamps_labels_E_out_and_E_from_the_pull(tmp_path):
             )
         others = {k: v for k, v in s.host.items() if k not in ("E", "E_out")}
         assert others == {k: v for k, v in u.host.items() if k != "E"}
+
+
+def _dp_view(rows, rank, **group):
+    rows = tuple(RequestShape(q, c, d) for q, c, d in rows)
+    return BatchView(rows, produces_output=True, dp_rank=rank, **group)
+
+
+#: Each rank's views of a DP2 group's steps: a decode graph at rung 4 whose
+#: gather pads the group's 4 real rows to 8, then a prefill step split in two.
+GROUP = [
+    [
+        _dp_view(decode, rank, capture_rung=4, moe_rows=8, moe_tokens=4),
+        _dp_view(
+            prefill,
+            rank,
+            moe_rows=900,
+            moe_tokens=900,
+            tbo_tokens=((300, 200), (200, 200)),
+        ),
+    ]
+    for rank, decode, prefill in (
+        (0, [(1, 9, True)] * 3, [(300, 300, False), (200, 200, False)]),
+        (1, [(1, 7, True)], [(400, 400, False)]),
+    )
+]
+
+
+def _dp2_record(directory, monkeypatch):
+    """`GROUP`, recorded on each rank by `StepRecord`."""
+    monkeypatch.setattr(projection, "batch_view", lambda batch, mode, run: batch.view)
+    clock = itertools.count()
+    for rank, views in enumerate(GROUP):
+        record = StepRecord(directory, rank)
+        for view in views:
+            t = [next(clock)] * 2
+            stamps = {"forward_mode": "settled", "t_launch_ns": t, "t_recv_ns": t}
+            runner = SimpleNamespace(
+                step_clock_ns=lambda: next(clock),
+                step_stamps=lambda stamps=stamps: (stamps, lambda _: {"d_busy_ns": 1}),
+            )
+            rows = view.requests
+            batch = SimpleNamespace(
+                view=view,
+                is_dummy_run=False,
+                req_ids=list(range(len(rows))),
+                num_scheduled_tokens=np.array([r.query_tokens for r in rows]),
+                context_lens=np.array([r.context_tokens for r in rows]),
+                is_final_chunk=None,
+                external_request_ids=[None] * len(rows),
+                produces_output=lambda: True,
+            )
+            record.add(batch, runner, lambda batch: None)
+
+
+def test_a_dp2_record_rebuilds_each_step_s_group_counts(tmp_path, monkeypatch):
+    _dp2_record(tmp_path, monkeypatch)
+    for rank, views in enumerate(GROUP):
+        assert [s.view for s in label(tmp_path / f"dp{rank}.jsonl")[0]] == views
+
+    # A new record keeps its counts on a step another rank's record lacks.
+    path = tmp_path / "dp1.jsonl"
+    full = path.read_text()
+    path.write_text(full.splitlines(keepends=True)[0])
+    assert [s.view for s in label(tmp_path / "dp0.jsonl")[0]] == GROUP[0]
+    path.write_text(full)
+
+    # An older record states neither count: `moe_tokens` is rebuilt from every
+    # rank's line at the step, the split is lost.
+    for path in tmp_path.glob("dp*.jsonl"):
+        lines = [json.loads(x) for x in path.read_text().splitlines()]
+        for s in lines:
+            del s["moe_tokens"]
+            s.pop("tbo_tokens", None)
+        path.write_text("".join(json.dumps(s) + "\n" for s in lines))
+    for rank, views in enumerate(GROUP):
+        got = [s.view for s in label(tmp_path / f"dp{rank}.jsonl")[0]]
+        assert got == [dataclasses.replace(v, tbo_tokens=None) for v in views]
+
+    # A step some rank's record lacks has no group count.
+    path = tmp_path / "dp1.jsonl"
+    path.write_text(path.read_text().splitlines(keepends=True)[0])
+    assert [s.view.moe_tokens for s in label(tmp_path / "dp0.jsonl")[0]] == [4, None]
