@@ -750,6 +750,35 @@ def test_a_context_module_with_no_kv_layer_is_sized_by_its_own_tensors(monkeypat
     assert record["placements"] == 1
 
 
+def test_a_context_module_s_pool_view_is_sized_by_the_batch_s_blocks(monkeypatch):
+    # DeepSeek-V4's Indexer as ATOM binds it: a view of the pool a block a row,
+    # FP4 data and scales, beside tensors of its own, one 0-dim; no layer_num.
+    def indexer():
+        module = torch.nn.Module()
+        module.register_buffer("kv_cache", torch.zeros(64, 16, 4))
+        module.register_buffer("own", torch.zeros(3))
+        module.register_buffer("scale", torch.zeros(()))
+        module.kv_scale = torch.zeros(64, 16)
+        return module
+
+    runner = _Runner({KEY.format(L=i): indexer() for i in (0, 1)})
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+    q = ("q", _t([2, 4], "activation"))
+    leaf = _leaf("aiter.indexer", q, ("layer", ir.ContextRef(KEY)), key=KEY)
+    found = ops.leaves(_graph(leaf, layers=2)["region"])
+
+    [record] = ops.Stub(runner, 5_000).point(placed, decode(2), 20, found)
+
+    # Two rows of 20 tokens read 4 of the pool's 64 blocks, 320 bytes each,
+    # beside 32 of q and 16 of its own: 1328 a call, 8 copies past twice 5000,
+    # cycling the two layers over 4 placements of the batch.
+    assert record["footprint_bytes"] == 8 * 1328
+    assert record["placements"] == 4
+    assert runner.batches == [(4 * p, 2 * p) for p in range(4)]
+
+
 def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placements(
     monkeypatch,
 ):
