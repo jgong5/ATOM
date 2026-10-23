@@ -177,15 +177,18 @@ def test_the_band_ranks_the_cells_again_at_each_ratio_one_at_a_time(monkeypatch)
         out = []
         for job in jobs:
             s = MachineSpec.from_mapping(job[2])
-            rate = {"a": s.value(bf16), "b": 0.6, "c": s.value(link) / 2}[job[4]]
-            levels = {"step": {"tokens_per_s": rate}, "op": {"tokens_per_s": 1}}
+            by_cell = {"a": s.value(bf16), "b": 0.6, "c": s.value(link) / 2, "d": 0.42}
+            levels = {
+                "step": {"tokens_per_s": by_cell[job[4]]},
+                "op": {"tokens_per_s": 1},
+            }
             out.append({"levels": levels})
         return out
 
     monkeypatch.setattr(project, "_each", rates)
-    jobs = [("m", 1, machine.echo(), "s", r, []) for r in "abc"]
+    jobs = [("m", 1, machine.echo(), "s", r, []) for r in "abcd"]
     base = project._ranked({j[4]: (None, c) for j, c in zip(jobs, rates(jobs))})
-    assert base["step"]["order"] == ["a", "b", "c"]
+    assert base["step"]["order"] == ["a", "b", "c", "d"]
     floor = "device.kernel_floor_s"
     assumed = {p: machine.value(p) for p in (bf16, link, floor)}
 
@@ -200,3 +203,6 @@ def test_the_band_ranks_the_cells_again_at_each_ratio_one_at_a_time(monkeypatch)
     assert band[bf16]["1.2"]["order_holds"]["step"]
     assert [band[link][f]["capped"] for f in ("0.8", "1.2")] == [False, True]
     assert band[link]["1.2"]["tokens_per_s"]["step"]["c"] == 0.5
+    # At 0.8 the third and fourth cells change places; the top-1 holds.
+    low = band[link]["0.8"]
+    assert low["ranking"]["step"]["top_1"] == ["a"] and not low["order_holds"]["step"]
