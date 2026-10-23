@@ -122,6 +122,14 @@ def test_v4_pro_s_index_writing_leaves_rebuild_their_arguments_and_launch(
     runner.forward_vars["indices"] = torch.zeros(1 << 23, dtype=torch.int32)
     for kind in ("swa", "csa", "hca"):  # the decode indptrs ATOM passes
         runner.forward_vars[f"kv_indptr_{kind}"] = torch.zeros(9, dtype=torch.int32)
+    # and its state slots and destination rows
+    for name in (
+        "meta_state_slot_out",
+        "swa_dest_dense",
+        "swa_dest_csa",
+        "swa_dest_hca",
+    ):
+        runner.forward_vars[f"v4_{name}"] = torch.zeros(1 << 16, dtype=torch.int32)
     runner.positions = torch.zeros(1 << 14, dtype=torch.int64)
     placed = SimpleNamespace(block_size=16, batch=lambda view, block, slot: (1, slot))
 
