@@ -380,9 +380,7 @@ def _lookup(tmp_path, dp, stored):
     return _op_graphs(store.root, config, "gfx950")
 
 
-def test_a_dp_verify_step_reads_its_drafter_at_its_rows_and_refuses_it_padded(
-    tmp_path,
-):
+def test_a_dp_verify_step_reads_its_drafter_at_its_rows_padded_too(tmp_path):
     # Rung 4 on 8 ranks: the target gathers every rank's 8 padded tokens, the
     # drafter's first pass every rank's own.
     lookup = _lookup(
@@ -393,6 +391,7 @@ def test_a_dp_verify_step_reads_its_drafter_at_its_rows_and_refuses_it_padded(
             ("decode", "decode B=4", True): g(4096 * 64, 128, 128),
             ("decode", "decode B=4 G=50", True): g(4096 * 50, 128, 128),
             ("decode", "decode B=4 G=48", True): g(4096 * 48, 128, 128),
+            ("decode", "decode T=3 B=4", True): g(4096 * 47, 128, 128),
         },
     )
     backend = OpGraphBackend(SPEC, lookup, kv="bf16", dp=8, drafts=1, price_list=FLAT)
@@ -405,15 +404,12 @@ def test_a_dp_verify_step_reads_its_drafter_at_its_rows_and_refuses_it_padded(
         f"op.{GEMM}.price_list": pytest.approx(7e-6),
         f"draft op.{GEMM}": price(gemm(4096 * 50, 128, 128), SPEC),
     }
-    # Padded, it runs 6 tokens where `decode B=4 G=48`'s drafter traces 8.
+    # Padded, its drafter is its 3 rows' at rung 4, every rank's 6 tokens its
+    # default G; `decode B=4 G=48`'s first pass would trace 8.
     assert (padded.moe_rows, padded.draft_moe_rows) == (64, 48)
-    named = (
-        "a DP decode under a drafter padded from 3 rows to its rung of 4: its "
-        "drafter's first pass runs the rows' 6 tokens unpadded, and a graph at "
-        "the rung traces 8 (#1961)"
-    )
-    with pytest.raises(CostRefused, match=re.escape(named)):
-        backend.price(padded)
+    cost = backend.price(padded)
+    assert by_name(cost)[f"draft op.{GEMM}"] == price(gemm(4096 * 47, 128, 128), SPEC)
+    assert cost.terms[-1].provenance.detail.endswith("decode T=3 B=4 G=48")
 
 
 def test_a_dp_prefill_under_a_drafter_reads_its_graphs_at_their_default(tmp_path):
@@ -444,3 +440,145 @@ def test_a_dp_middle_chunk_s_drafter_is_refused_by_name():
     step = replace(MIDDLE, moe_rows=18, draft_moe_rows=18)
     with pytest.raises(CostRefused, match="a DP middle chunk under a drafter"):
         OpGraphBackend(SPEC, graph, kv="bf16", dp=2, drafts=1).price(step)
+
+
+# --- a decode padded to its rung ----------------------------------------------
+
+
+def test_a_population_names_a_padded_decode_s_drafter_at_its_rows(tmp_path):
+    drafted = {"rows": [[2, 90, True]] * 3, "rung": 4}
+    record = _record(tmp_path, [drafted, drafted | {"rows": [[1, 90, True]] * 3}])
+
+    # Without a drafter, no step after the cut to read at its rows.
+    shapes = ["decode B=4", "decode T=3 B=4", "decode B=4"]
+    assert list(map(str, population_shapes([record]))) == shapes
+
+
+def _population(tmp_path_factory, line, drafts):
+    """`compass trace ops --population` of a record of one step, `line`, under
+    an MTP drafter of `drafts` tokens: the capture's directory and its graphs
+    by whether each is the drafter's and its shape."""
+    root = tmp_path_factory.mktemp(f"padded{drafts}")
+    (root / "model").mkdir()
+    (root / "model" / "config.json").write_bytes(CONFIG.read_bytes())
+    (root / "record").mkdir()
+    argv = ["trace", "ops", "--model", str(root / "model"), "--population"]
+    argv += [_record(root / "record", [line]), "--store", str(root / "store")]
+    argv += ["--", "--method", "mtp", "--num-speculative-tokens", str(drafts)]
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from atom.compass.cli import main; main(sys.argv[1:])",
+            *argv,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=1800,
+        cwd=TREE,
+        env={**os.environ, "PYTHONPATH": str(TREE)},
+    )
+    tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
+    assert tokens, f"rc {done.returncode}\n{done.stderr[-4000:]}"
+    store, rank = ArtifactStore(str(root / "store")), Topology().ranks()[0]
+    graphs = {}
+    for token in tokens:
+        entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
+        graph = json.loads(entry.read_member("graph", rank, "json"))
+        graphs[graph["structure"].endswith(" draft"), graph["shape"]] = graph
+    return root, graphs
+
+
+def verify_view(width, rung):
+    """One rank's view of a decode of `width` rows, each verifying one draft,
+    replaying `rung`, as `batch_view` builds it from the step's mode."""
+    batch = SimpleNamespace(
+        total_seqs_num_prefill=0,
+        num_scheduled_tokens=[2] * width,
+        context_lens=[90] * width,
+        req_ids=list(range(width)),
+        produces_output=lambda: True,
+    )
+    r = runner(None)
+    r.drafter = SimpleNamespace(is_block_drafter=False)
+    mode = SimpleNamespace(
+        sync=None, running_bs=rung, running_tokens=2 * rung, use_cudagraph=True
+    )
+    return projection.batch_view(batch, mode, r)
+
+
+def test_a_decode_padded_to_its_rung_prices_its_drafter_at_its_rows(
+    tmp_path_factory,
+):
+    line = {"rows": [[2, 90, True]] * 3, "rung": 4}
+    root, graphs = _population(tmp_path_factory, line, 1)
+    # The padded step's target ran at its rung: only its drafter is read at its rows.
+    assert set(graphs) == {(False, "decode B=4"), (True, "decode B=4")} | {
+        (True, "decode T=3 B=4")
+    }
+    # Its first pass runs the rows' 6 tokens; the rung's traces 8.
+    for shape, tokens in (("decode T=3 B=4", 6), ("decode B=4", 8)):
+        ops = _ops(graphs[True, shape]["region"])
+        assert {op["args"]["q"]["shape"][0] for op in ops if op["op"] == ATTENTION} == {
+            tokens
+        }
+
+    config = SimpleNamespace(
+        model=str(root / "model"),
+        hf_config=SimpleNamespace(architectures=CONFIG_ARCHITECTURES),
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=1),
+        **_engine(graphs[True, "decode B=4"]),
+    )
+    machine = MachineSpec.from_mapping(json.loads(MACHINE.read_text()))
+    lookup = _op_graphs(str(root / "store"), config, "gfx942")
+    backend = OpGraphBackend(machine, lookup, kv="bf16", drafts=1)
+    padded, full = backend.price(verify_view(3, 4)), backend.price(verify_view(4, 4))
+
+    assert padded.terms[-1].provenance.detail.endswith("decode T=3 B=4")
+    assert padded.target_seconds == full.target_seconds
+    # The rung's drafter, which this step read before, prices more than runs.
+    assert 0 < padded.draft_seconds < full.draft_seconds
+
+
+def test_a_padded_drafter_s_later_pass_runs_and_dispatches_at_the_rung(tmp_path):
+    from test_capture_v4_pro import DPA_TP8, EP8, MORI, trace
+
+    # DeepSeek-V4-Pro under MTP2 on 8 ranks, EP8: rank 0 verifies 3 rows at
+    # rung 4, every peer 4, so the drafter's first pass gathers 9 + 7 x 12 rows.
+    (tmp_path / "record").mkdir()
+    line = {"rows": [[3, 90, True]] * 3, "rung": 4, "moe_rows": 96}
+    record = _record(tmp_path / "record", [line | {"draft_moe_rows": 93}])
+    for r in range(1, 8):
+        idle = {"step": 0, "is_dummy_run": True}
+        (tmp_path / "record" / "steps" / f"dp{r}.jsonl").write_text(json.dumps(idle))
+    argv = (
+        f"--population {record}{DPA_TP8}{EP8} --method mtp --num-speculative-tokens 2"
+    )
+    (tmp_path / "trace").mkdir()
+    done = trace(tmp_path / "trace", argv)
+
+    tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
+    store, rank = (
+        ArtifactStore(str(tmp_path / "trace" / "store")),
+        Topology().ranks()[0],
+    )
+    graphs = {}
+    for token in tokens:
+        entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
+        graph = json.loads(entry.read_member("graph", rank, "json"))
+        graphs[graph["shape"]] = graph
+    drafter = graphs["decode T=3 B=4 G=93"]
+    assert drafter["structure"].endswith(" draft"), done.stderr[-4000:]
+    # Its first pass sends its 9 tokens; its second, padded to the rung, 4 rows
+    # from every rank, though the step's G is the first pass's.
+    dispatched = [
+        (op["args"]["input"]["shape"][0], op["out"][0][0])
+        for op in _ops(drafter["region"])
+        if op["op"] == f"{MORI}.dispatch"
+    ]
+    assert dispatched == [(9, 93), (4, 32)]

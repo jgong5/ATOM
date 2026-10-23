@@ -20,7 +20,8 @@ Under a drafter of `drafts` tokens a decode step verifies `drafts` and one in
 each row, and a step also reads its drafter's graph, `graph(..., draft=True)`,
 the work ATOM queues after `forward_done_event` on a step that samples, else
 from its draft-KV pass on: its prices are terms named ``draft op.<kind>``,
-each tagged draft. Sampling is the target's.
+each tagged draft. Sampling is the target's. A decode's drafter is read at its
+rows run at the step's width: its first pass runs the rows' tokens unpadded.
 
 Each leaf is one pricing unit, `max(t0, F / peak, M / BW(M), t_comm)` over its
 work (`op_work.work`): its own tensors at the captured shape, the state it
@@ -64,13 +65,12 @@ this rank, whose micro-batches' graphs exchange a different number of times
 or run an exchange beside a second stream (the dual-stream MoE, which ATOM
 turns off under overlap), or that runs under a drafter, whose draft pass no
 graph places on the overlapped streams; a decode step whose rows do not each
-verify the drafter's tokens and one, or a DP decode padded to its rung,
-whose drafter's first pass runs fewer tokens than its graph traces; a DP
-middle chunk under a drafter, whose drafter's passes no cut parts from the
-target's; a prefill step whose view does not say whether it produces output;
-a shape with no graph, a data-parallel step's naming the rows it gathers; and,
-each reason once, a leaf whose kind has no extractor, whose price reads a spec
-field the spec lacks, or whose collective leaves the scale-up domain.
+verify the drafter's tokens and one; a DP middle chunk under a drafter, whose
+drafter's passes no cut parts from the target's; a prefill step whose view
+does not say whether it produces output; a shape with no graph, a
+data-parallel step's naming the rows it gathers; and, each reason once, a leaf
+whose kind has no extractor, whose price reads a spec field the spec lacks, or
+whose collective leaves the scale-up domain.
 """
 
 from __future__ import annotations
@@ -199,7 +199,7 @@ class OpGraphBackend(CostBackend):
             bound = self.resolver and self._bound(batch_view)
             priced = self._priced(region, batch_view, refused, bound)
             if self.drafts:
-                _, region = self._region(batch_view, draft=True)
+                drafted_at, region = self._region(batch_view, draft=True)
                 priced += [
                     (DRAFT + p[0], *p[1:])
                     for p in self._priced(region, batch_view, refused, bound)
@@ -224,7 +224,10 @@ class OpGraphBackend(CostBackend):
             source, (methods, why) = SOURCE, how[name]
             if name.endswith(".price_list"):
                 method, source = combine(methods), LISTED
-            detail = f"{len(values)} prices of the graph at {at}"
+            drafted = name.startswith(DRAFT)
+            detail = (
+                f"{len(values)} prices of the graph at {drafted_at if drafted else at}"
+            )
             if name.startswith(TBO):
                 detail = f"two micro-batches overlapped, from the graphs at {at}"
             provenance = Provenance(
@@ -234,7 +237,6 @@ class OpGraphBackend(CostBackend):
                 tuple(dict.fromkeys(why)),
                 note=note and note + NONE,
             )
-            drafted = name.startswith(DRAFT)
             terms.append(CostTerm(name, fold_seconds(values), provenance, drafted))
         return StepCost(terms)
 
@@ -258,8 +260,8 @@ class OpGraphBackend(CostBackend):
 
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
-        with `draft`, its drafter's at `draft_moe_rows`, refused for a DP
-        decode padded to its rung and a DP middle chunk."""
+        with `draft`, its drafter's, a decode's at its rows, at `draft_moe_rows`,
+        refused for a DP middle chunk."""
         if view.image_tokens:
             reason = IMAGES
         else:
@@ -270,6 +272,8 @@ class OpGraphBackend(CostBackend):
             except ValueError as exc:
                 reason = f"a step that {exc}"
             else:
+                if draft and shape[0] == "decode":
+                    shape = ("decode", len(rows), shape[2])
                 output = any(d for _, d in rows) or view.produces_output
                 none = "" if output else " that produces no output"
                 gathered = view.draft_moe_rows if draft else view.moe_rows
@@ -288,14 +292,6 @@ class OpGraphBackend(CostBackend):
                         "drafter's passes for their DP collectives in place of its "
                         "draft-KV pass (`propose(align_only=True)`), and no cut "
                         "parts them from the target's"
-                    )
-                elif draft and g and shape[2] != len(rows):
-                    reason = (
-                        f"a DP decode under a drafter padded from {len(rows)} rows "
-                        f"to its rung of {shape[2]}: its drafter's first pass runs "
-                        f"the rows' {sum(q for q, _ in rows)} tokens unpadded, and a "
-                        f"graph at the rung traces {shape[1] * (self.drafts + 1)} "
-                        "(#1961)"
                     )
                 elif isinstance(
                     region := self.graph(*shape, output, *g, **drafted), dict

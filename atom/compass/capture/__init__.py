@@ -10,7 +10,9 @@ A shape is a decode width (`--width`), a prefill of T tokens over B sequences
 (`--population`): a decode step at its CUDA-graph rung when it ran at one, else
 at its width, and any other step as a prefill of its query tokens over its
 rows, and under DP the rows the step's MoE gathered over the group, its line's
-`moe_rows`. Under `--enable-tbo` a step its DP group split is its two
+`moe_rows`; under a drafter a decode's drafter also at its rows padded to that
+rung and the rows its first pass gathered, `draft_moe_rows`. Under
+`--enable-tbo` a step its DP group split is its two
 micro-batches, each a prefill at its own tokens and the group's rows of it,
 by the split `validate bound` rebuilds from every rank's line; a population's
 prefill is traced as one forward, as it ran, where ATOM would split a step of
@@ -99,11 +101,11 @@ def main(argv: list[str]) -> None:
 def population_shapes(names, tbo=False):
     """The shape of each step the record directories `names` hold, DP's dummy
     runs aside; under two-batch overlap (`tbo`) a split step's two
-    micro-batches' (`population_steps`)."""
-    return [shape for shape, _ in population_steps(names, tbo)]
+    micro-batches' (`population_steps`); each decode's drafter's too."""
+    return [shape for shape, _ in population_steps(names, tbo, drafters=True)]
 
 
-def population_steps(names, tbo=False):
+def population_steps(names, tbo=False, drafters=False):
     """Each step the record directories `names` hold, DP's dummy runs aside,
     as its shape, the one the op-level backend prices it at
     (`op_graph.step_shape`), with the rows its DP group's MoE
@@ -112,7 +114,8 @@ def population_steps(names, tbo=False):
     overlap (`tbo`, ATOM's `enable_tbo`) a DP step the group split, by the
     rule `validate bound` agrees over every rank's line at that step
     (`bound._split`), is its two micro-batches (`step_roofline.micro_batches`),
-    each a prefill at its own tokens and the group's rows of it."""
+    each a prefill at its own tokens and the group's rows of it. With
+    `drafters`, a decode's drafter's shape follows it where they differ."""
     from atom.compass.backends import BatchView, RequestShape
     from atom.compass.backends.op_graph import step_shape
     from atom.compass.backends.step_roofline import micro_batches
@@ -147,7 +150,11 @@ def population_steps(names, tbo=False):
             except ValueError as exc:
                 raise ValueError(f"{name} step {line['step']} {exc}") from None
             if phase == "decode":
-                yield decode(tokens, line.get("moe_rows")).at(dp, drafts), line
+                target = decode(tokens, line.get("moe_rows")).at(dp, drafts)
+                yield target, line
+                draft = decode(tokens, line.get("draft_moe_rows"), len(rows))
+                if drafters and drafts and (draft := draft.at(dp, drafts)) != target:
+                    yield draft, line
             elif not split:
                 yield prefill(tokens, seqs, line.get("moe_rows")).at(dp), line
             else:
