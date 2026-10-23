@@ -9,7 +9,10 @@ A capture runs one rank, rank 0. Where ATOM reads its peers, two rules answer:
   rank's count has a prefilling peer, or each schedules this rank's count when
   the shape states none. The step's one DP all-gather (`sync_dp_metadata`), the
   per-rank counts built from it and the sizes read off them (`DPMetadata.make`,
-  `get_sizes_across_dp`) run on the host with these rows.
+  `get_sizes_across_dp`) run on the host with these rows. A drafter's pass
+  all-reduces its own count (`DPMetadata.num_tokens_across_dp`): its first
+  pass, the target's stream, takes the step's counts; a later one, a row a
+  sequence, this rank's at every peer.
 * What the DP group gathers for the MoE, or MORI dispatches to this rank, is
   every rank's rows: the shape's gathered rows, by default the group's width
   times this rank's; for MORI, the height ATOM trims its buffer to, `T_moe`.
@@ -74,6 +77,8 @@ def patches(recorder):
         with unset_fake_temporarily():
             return fn(*args, **kwargs)
 
+    counts = {}
+
     def peers(gathered, local, group=None, async_op=False):
         for slot in gathered:
             slot.copy_(local)
@@ -82,6 +87,11 @@ def patches(recorder):
             for k, slot in enumerate(gathered[1:]):
                 slot[0] = each + (k < extra)
             gathered[1][2] = 1  # is_prefill
+        counts.clear()
+        counts[int(local[0])] = [int(slot[0]) for slot in gathered]
+
+    def num_tokens_across_dp(rows, dp_size, dp_rank):
+        return torch.tensor(counts.get(rows, [rows] * dp_size), dtype=torch.int32)
 
     def sync_dp_metadata(**kwargs):
         gather, dist.all_gather = dist.all_gather, peers
@@ -116,6 +126,7 @@ def patches(recorder):
         (ubatching, "sync_dp_metadata", sync_dp_metadata),
         (DPMetadata, "make", staticmethod(lambda *a, **k: on_host(make, *a, **k))),
         (DPMetadata, "get_sizes_across_dp", lambda self: on_host(sizes, self)),
+        (DPMetadata, "num_tokens_across_dp", staticmethod(num_tokens_across_dp)),
         *(
             (moe, f.__name__, _declared(recorder, f"{moe.__name__}:{f.__name__}", f))
             for f in gathers

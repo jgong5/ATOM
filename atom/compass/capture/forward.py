@@ -60,6 +60,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 import atom
 from atom.compass import ir
+from atom.compass.backends.op_graph import gathered_off_default
 from atom.compass.ir.nodes import Reduced
 
 from . import driverless, peers
@@ -108,11 +109,11 @@ class Shape(NamedTuple):
         text = text if self.phase == "prefill" else f"decode B={self.seqs}"
         return text if self.gathered is None else f"{text} G={self.gathered}"
 
-    def at(self, dp: int) -> "Shape":
-        """This shape in a DP group of `dp`: `gathered` only off `dp x tokens`."""
-        return (
-            self._replace(gathered=None) if self.gathered == dp * self.tokens else self
-        )
+    def at(self, dp: int, drafts: int = 0) -> "Shape":
+        """This shape in a DP group of `dp` under a drafter of `drafts`:
+        `gathered` only off its default (`gathered_off_default`)."""
+        g = gathered_off_default(self.phase, self.tokens, self.gathered, dp, drafts)
+        return self._replace(gathered=g)
 
 
 def decode(width: int, gathered: int | None = None) -> Shape:
@@ -1068,8 +1069,8 @@ def capture(
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     ep = int(config.enable_expert_parallel)
     ran = population_shapes(population, config.enable_tbo)
-    unsplit = {s.at(dp) for s in ran if s.phase == "prefill"}
-    shapes = list(dict.fromkeys(s.at(dp) for s in [*shapes, *ran]))
+    unsplit = {s for s in ran if s.phase == "prefill"}
+    shapes = list(dict.fromkeys([*shapes, *ran]))
     if not shapes:
         raise ValueError(f"{', '.join(population)} hold no step to trace")
     if dp == 1 and (gathering := [s for s in shapes if s.gathered is not None]):
