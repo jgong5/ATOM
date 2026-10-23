@@ -955,7 +955,8 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   op's `stated` field, by name; a call does not take it, and `bench.ops.signature`
   includes it. Owner's [ruling on #1689](https://github.com/jgong5/ATOM/issues/1689#issuecomment-6292555659):
   only DeepSeek-V4's decode attention leaves (`capture.forward.V4_DECODES`: the fp8 KV
-  cache's, the bf16 one's and the persistent kernel) state their layer's `window_size`,
+  cache's, its asm kernel where that launches alone, as in a drafter's later pass, the
+  bf16 one's and the persistent kernel) state their layer's `window_size`,
   `compress_ratio` and `index_topk` (null for a layer with no indexer), and its
   indexer's score and top-k states its `compress_ratio`, read in the opened
   attention's body from the layer `layer_name` names. Their index lists are sized for
