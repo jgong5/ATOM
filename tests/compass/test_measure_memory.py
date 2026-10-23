@@ -493,11 +493,25 @@ def test_readings_taken_without_the_offload_connector_refuse_a_run_that_offloads
     assert memory.load(tmp_path / "store", r.config, MACHINE, 0).values == READINGS[2]
 
 
-def test_a_pd_connector_reads_the_readings_measured_without_one(tmp_path):
-    r = deployment(tmp_path)
-    measured = memory.load(tmp_path / "store", r.config, MACHINE, 0).values
-    r.config.kv_transfer_config = {"kv_connector": "moriio", "kv_role": "kv_producer"}
-    assert memory.load(tmp_path / "store", r.config, MACHINE, 0).values == measured
+def test_a_pd_decode_reads_a_plain_fp8_indexer_entry_and_refuses_the_fp4_one(
+    tmp_path,
+):
+    """DeepSeek-V4 resolves its indexer to fp4 on gfx950 without a
+    kv_transfer_config and to fp8 under any, as `atom/config.py` does; the
+    connector itself is not keyed."""
+    r, store = deployment(tmp_path, index_cache_dtype="fp4"), tmp_path / "store"
+    pd = {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
+    r.config.kv_transfer_config, r.config.index_cache_dtype = pd, "fp8"
+
+    with pytest.raises(ArtifactRefusal) as refused:
+        memory.load(store, r.config, MACHINE, 0)
+    assert '"index_cache_dtype": "fp8"' in str(refused.value)
+    assert "the nearest entry differs in engine_config" in str(refused.value)
+
+    r.config.kv_transfer_config = {}
+    publish_readings(store, r.config, readings=READINGS[2])
+    r.config.kv_transfer_config = pd
+    assert memory.load(store, r.config, MACHINE, 0).values == READINGS[2]
 
 
 @pytest.mark.parametrize("moved", ["enable_tbo", "ladder", "env"])
