@@ -1380,6 +1380,10 @@ stage and per DP rank, with a TP group modelled on its rank 0.
   recurrence's first term.
   Under host laws that carry `E_out` (below), it runs from the engine's input pull
   to the entry, `E_in`, and `postprocess()` and the output put fall in `E_out`.
+  Under DP it runs from the latest input pull over the group before the same
+  forward, where `_sync_dp_state` releases every member, so a member's wait for that
+  pull is the group round's, not `E`
+  ([#1893](https://github.com/jgong5/ATOM/issues/1893)).
 - `W_pre`: prepare (`ModelRunner.prepare_model`), which waits only at its two ends;
   under MTP, an output forward's prepare up to R1's wait.
 - `W_inputs`: under MTP, an output forward's prepare after R1's wait: the input ids,

@@ -29,6 +29,7 @@ from test_op_graph_arch import ENGINE
 from test_op_work import leaf, t
 from test_work import SPEC
 
+from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactRefusal
 from atom.compass.backends import BatchView, CostRefused, Method, RequestShape
 from atom.compass.backends.cost import fold_seconds
@@ -41,6 +42,7 @@ from atom.compass.bench.ops import leaves, signature
 from atom.compass.capture.peers import MORI
 from atom.compass.fit import ops as fit_ops
 from atom.compass.run import _op_graphs
+from atom.compass.runner.overrides import PricedSteps
 from atom.compass.spec import MachineSpec
 
 GEMM = "aiter.gemm_a16w16.default"
@@ -986,3 +988,130 @@ def test_a_run_file_price_list_from_another_tree_is_refused_at_load(
 def test_a_run_file_price_list_without_op_graph_is_refused(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="names a price_list and no op_graph"):
         _installed(monkeypatch, tmp_path, step_linear=law(), price_list={})
+
+
+# --- a shape no graph holds, traced in the run -----------------------------------
+
+
+def _reader(graph, model) -> SimpleNamespace:
+    """A run's config of the 27B at `model`, keyed as the capture keyed `graph`."""
+    hf = SimpleNamespace(architectures=json.loads(CONFIG.read_text())["architectures"])
+    return SimpleNamespace(
+        model=str(model),
+        hf_config=hf,
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+        **_engine(graph),
+    )
+
+
+def _counts() -> dict:
+    return {"lazy_traces": 0, "lazy_trace_wall_seconds": 0}
+
+
+def test_a_shape_no_graph_holds_is_traced_in_the_run_as_trace_ops_traces_it(
+    tmp_path_factory, tmp_path
+):
+    (graph, _), *_ = capture(1, PREFILLS, tmp_path_factory).values()
+    stores = tmp_path_factory.getbasetemp().glob("tp1*/store")
+    model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
+    config, lazy = _reader(graph, model), _counts()
+    offline = next(
+        lookup
+        for lookup in (_op_graphs(str(s), config, "gfx942") for s in stores)
+        if lookup("prefill", 512, 2)
+    )
+    lookup = _op_graphs(str(tmp_path), config, "gfx942", ["--model", str(model)], lazy)
+    chunk = (RequestShape(256, 256, False),) * 2
+    for output in (True, False):
+        view = BatchView(chunk, produces_output=output)
+        OpGraphBackend(SPEC, lookup, kv="bf16").price(view)
+
+    # Both chunks of the shape came from one trace, the graphs trace ops publishes.
+    assert [lookup("prefill", 512, 2, o) for o in (True, False)] == [
+        offline("prefill", 512, 2, o) for o in (True, False)
+    ]
+    assert lazy["lazy_traces"] == 1 and lazy["lazy_trace_wall_seconds"] > 0
+
+
+def _lazily(tmp_path_factory, root, *atom_args, **engine):
+    """The run's lookup of the 27B under `engine`'s config fields into the
+    store at `root`, tracing a missing shape from the server's `atom_args`, and
+    its counts."""
+    (graph, _), *_ = capture(1, PREFILLS, tmp_path_factory).values()
+    model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
+    config, lazy = _reader(graph, model), _counts()
+    vars(config).update(engine)
+    args = ["--model", str(model), *atom_args]
+    return _op_graphs(str(root), config, "gfx942", args, lazy), lazy
+
+
+def test_a_prefill_two_batch_overlap_would_split_is_traced_lazily_as_one_forward(
+    tmp_path_factory, tmp_path, monkeypatch
+):
+    # ATOM splits a prefill under --enable-tbo from this many tokens on.
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "256")
+    lookup, lazy = _lazily(tmp_path_factory, tmp_path, "--enable-tbo", enable_tbo=True)
+
+    assert isinstance(lookup("prefill", 512, 2), dict)
+    assert lazy["lazy_traces"] == 1
+
+
+def test_a_lazy_trace_reads_atom_s_arguments_in_either_spelling_as_its_server_does(
+    tmp_path_factory, tmp_path
+):
+    args = "--kv-cache-dtype", "fp8"
+    lookup, lazy = _lazily(tmp_path_factory, tmp_path, *args, kv_cache_dtype="fp8")
+
+    assert isinstance(lookup("decode", 2, 2), dict)
+    assert lazy["lazy_traces"] == 1
+
+
+def test_a_lazy_trace_that_fails_ends_the_run_naming_the_shape(tmp_path):
+    (tmp_path / "model").mkdir()  # holds no config.json, so no capture builds it
+    (tmp_path / "read").mkdir()
+    (tmp_path / "read" / "config.json").write_text("{}")
+    config = SimpleNamespace(
+        model=str(tmp_path / "read"),
+        hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+        **ENGINE,
+    )
+    lazy = _counts()
+    args = ["--model", str(tmp_path / "model")]
+    lookup = _op_graphs(str(tmp_path / "store"), config, "gfx942", args, lazy)
+    rows = BatchView((RequestShape(100, 100, False),) * 3, produces_output=True)
+
+    with pytest.raises(RuntimeError, match="a lazy trace of prefill T=300 B=3 failed"):
+        OpGraphBackend(SPEC, lookup, kv="bf16").price(rows)
+    assert lazy["lazy_traces"] == 0
+
+
+def test_a_run_file_op_graph_traces_from_the_server_s_arguments(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(
+        compass_run, "_op_graphs", lambda *a: seen.append(a[3:]) or (lambda *s: None)
+    )
+    _installed(monkeypatch, tmp_path, op_graph=True, atom_args=["--model", "m"])
+
+    assert seen == [(["--model", "m"], _counts())]
+
+
+def test_the_run_summary_totals_each_engine_s_lazy_traces(monkeypatch, tmp_path):
+    run = {"admission_path": "serving", "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+    run.update(bound_s=100.0, client_runs=None, out_dir=str(tmp_path))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    authority = compass_run._RecordingAuthority(run)
+    worker = SimpleNamespace(compass_lazy={**_counts(), "lazy_traces": 2})
+    worker.compass_lazy["lazy_trace_wall_seconds"] = 9.5
+    compass_run._hand_in(run, "engine", [], priced=PricedSteps.priced_steps(worker))
+    compass_run._hand_in(run, "frontend", [])
+    compass_run._write_summary(run, authority, ended=True)
+
+    cost = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())["cost"]
+    assert (cost["lazy_traces"], cost["lazy_trace_wall_seconds"]) == (2, 9.5)
