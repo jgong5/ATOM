@@ -1019,6 +1019,29 @@ def test_a_strided_kv_argument_is_sized_by_its_entry_s_span(
     assert record["footprint_bytes"] == footprint
 
 
+@pytest.mark.parametrize(
+    "shape, footprint", [(decode(2), 7 * 288), (prefill(6, 2), 3 * 800)]
+)
+def test_a_rope_table_adds_a_row_a_token_not_its_span(monkeypatch, shape, footprint):
+    # DeepSeek-V4's compressor: cos and sin tables of 1000 positions, a row
+    # of 32 bf16 at each, read one row at a token's position.
+    runner = _Runner()
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    table = _t([1000, 1, 1, 32], "weight", [32, 32, 32, 1], "torch.bfloat16")
+    q = ("q", _t([2, 4], "activation"))
+    leaf = _leaf("aiter.compress", q, ("cos_cache", table), ("sin_cache", table))
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    [record] = ops.Stub(runner, 1000).point(placed, shape, 20, found)
+
+    # 32 bytes of q and 64 a token from each table: 2 decode tokens make 288 a
+    # call, 7 copies past twice 1000 bytes; 6 prefill tokens 800 and 3 copies.
+    # By span, the tables' 128000 bytes would make one copy.
+    assert record["footprint_bytes"] == footprint
+
+
 def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
     monkeypatch,
 ):
