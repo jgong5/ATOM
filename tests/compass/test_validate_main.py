@@ -541,6 +541,88 @@ def test_runs_record_and_run_wrote_at_another_concurrency_are_not_one_cell(
         main([str(tmp_path / "c4")])
 
 
+#: A workload as `cctraces_sim.sh` and `client.sh` state it.
+WORKLOAD = {"aiperf_args": ["--concurrency", "4"], "traces_sha256": ["d0", "d1"]}
+
+
+def _mixed(capsys, tmp_path, law=()):
+    """Cell c4 of `cctraces_sim.sh` real runs and a simulated run `run` wrote,
+    which `client.sh` drove, every run given `WORKLOAD`."""
+    _rows(capsys, tmp_path, law=law)
+    cell, sim = tmp_path / "c4", tmp_path / "sim"
+    for d in cell.glob("real*"):
+        run = json.loads((d / "run.json").read_text())
+        (d / "run.json").write_text(json.dumps(run | {"workload": WORKLOAD}))
+    sim.mkdir()
+    shutil.move(cell / "step_linear", sim)
+    _as_recorded(sim)
+    shutil.move(sim / "step_linear", cell)
+    (cell / "step_linear" / "artifacts/workload.json").write_text(json.dumps(WORKLOAD))
+    return cell
+
+
+def test_a_run_written_run_grades_whole_beside_cctraces_sim_s_real_runs(
+    capsys, tmp_path
+):
+    cell = _mixed(capsys, tmp_path)
+    rows = _graded(capsys, cell)
+
+    # As the run would grade, written by cctraces_sim.sh: its warmup's step too.
+    sim = cell / "step_linear"
+    (sim / CLIENT_RUN).unlink()
+    run = {"workload": WORKLOAD, "step_linear": LAW, "host": {"laws": {}}}
+    (sim / "run.json").write_text(json.dumps(run))
+    assert rows == _graded(capsys, cell)
+    assert rows["counts", "prefill steps"][0].startswith("spread 0; result 1 1 1")
+    assert not [k for k in rows if k[0].startswith("warmup ")]
+
+
+@pytest.mark.parametrize(
+    "field, value, named",
+    [
+        ("aiperf_args", ["--concurrency", "16"], r"\['--concurrency', '16'\]"),
+        (
+            "traces_sha256",
+            ["d0", "d9"],
+            "'real0': 1, 'real1': 1, 'real2': 1, 'step_linear': 1",
+        ),
+    ],
+)
+def test_a_run_written_run_given_another_workload_refuses_naming_it(
+    capsys, tmp_path, field, value, named
+):
+    cell = _mixed(capsys, tmp_path)
+    stated = WORKLOAD | {field: value}
+    (cell / "step_linear/artifacts/workload.json").write_text(json.dumps(stated))
+
+    with pytest.raises(
+        ValueError, match=f"ran different workloads: {{'{field}': .*{named}"
+    ):
+        main([str(cell)])
+
+
+def test_a_run_written_run_graded_whole_still_refuses_as_it_would_apart(
+    capsys, tmp_path
+):
+    cell = _mixed(capsys, tmp_path, law=[("clock", 1)])
+    with pytest.raises(ValueError, match="step_linear is not graded: it refused 1"):
+        main([str(cell)])
+
+
+def test_a_run_written_run_that_served_a_later_client_run_does_not_grade_whole(
+    capsys, tmp_path
+):
+    cell = _mixed(capsys, tmp_path)
+    path = cell / "step_linear/steps/dp0.jsonl"
+    lines = path.read_text().splitlines()
+    later = json.loads(lines[-1]) | {"step": 99, "batch": [[99, 1, 1]], "named": []}
+    path.write_text("\n".join([*lines, json.dumps(later)]) + "\n")
+
+    later = "steps of requests it did not send follow its own, 1 from step 99"
+    with pytest.raises(ValueError, match=f"step_linear is not graded: {later}"):
+        main([str(cell)])
+
+
 def _warmed(capsys, cell, slow):
     """A cell `record` and `run` wrote, request 0 every run's warmup: two steps
     of its own before request 1's, `slow` times their price in every real run."""

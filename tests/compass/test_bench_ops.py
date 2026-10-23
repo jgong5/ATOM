@@ -171,6 +171,21 @@ def test_a_module_copy_holds_tensors_of_its_own():
     assert sum(t.numel() for t in ops._own(module)) == 4 + 2 + 3 + 4
 
 
+def _state(shape, slots=8):
+    """DeepSeek-V4's per-request state as ATOM binds it on its runner: a field
+    of an arena a request's state an entry, `[layers, slots, *shape]`, a slot
+    strided by its whole entry, 256 bytes here."""
+    from atom.model_ops.attentions.pool_layout.entry_arena import (
+        EntryField,
+        EntryMajorArena,
+        SplitEntryMajorArena,
+    )
+
+    field = EntryField("st", 1, shape, torch.float32)
+    arena = SplitEntryMajorArena([EntryMajorArena([field], slots, "cpu")])
+    return {"v4_state_arena": arena, "v4_state": arena.view("st")}
+
+
 class _Runner:
     """ATOM's runner as the stub sees it: a model whose parameters are on the
     meta device, its persistent buffers, an input preparation that writes a
@@ -1054,14 +1069,14 @@ def test_a_plane_argument_is_sized_by_the_rows_of_the_batch_s_blocks(monkeypatch
     }
 
     # Two rows of 20 tokens hold 4 blocks of 16, 16 rows at ratio 4: 256 bytes
-    # of kv and 32 of q a call, 7 copies past twice 1000 bytes. Per slot, 32
-    # of kv: 32 copies, each its own placement, of which the pool holds 16;
-    # 7 slots hold 3 of two rows, read once, the rest take the first 6 again.
+    # of kv and 32 of q a call, 7 copies past twice 1000 bytes. A block a
+    # request, 32 of kv: 32 copies on the 16 placements the pool holds, a
+    # block view read once at each, whatever the 7 slots hold.
     # Past 4 x 3 tokens a request reads 3 of its 5 rows: 96 bytes of kv, 16
     # copies. At top-k 1, 32 of kv: 32 copies on the 16 placements, each read
     # once.
     assert got["aiter.decode"]["footprint_bytes"] == 7 * 288
-    assert got["aiter.write"]["footprint_bytes"] == 32 * 32 + 3 * 32
+    assert got["aiter.write"]["footprint_bytes"] == 32 * 32 + 16 * 32
     assert got["aiter.sparse"]["footprint_bytes"] == 16 * 128
     assert got["aiter.top1"]["footprint_bytes"] == 32 * 32 + 16 * 32
     assert got["aiter.decode"]["placements"] == 16
@@ -1079,7 +1094,7 @@ def test_a_strided_kv_argument_is_sized_by_its_entry_s_span(
     # layer's rows.
     runner = _Runner()
     runner.pool_plan = SimpleNamespace(entries=entries)
-    runner.kv_held = {"v4_pool": torch.zeros(1000)}
+    runner.kv_held = _state((2, 4))
     monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
     monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
     kv = ("kv", _t([8, 2, 4], "kv", stride=[64, 4, 1]))
@@ -1108,10 +1123,10 @@ def test_a_state_only_leaf_counts_each_slot_its_copies_read_once(
     # a placement reads the slots another layer's copy there does.
     runner = _Runner()
     runner.pool_plan = SimpleNamespace(entries={"state": 8})
-    runner.kv_held = {"state": torch.zeros(8, 16)}
+    runner.kv_held = _state((16,))
     monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
     monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0, **timed})
-    state = _t([8, 16], "kv")
+    state = _t([8, 16], "kv", stride=[64, 1])
     args = ("kv", _t([2, 4], "activation")), ("kv_state", state), ("score", state)
     leaf = _leaf("v4.states", *args, ("layer", ir.ContextRef(KEY)), key=KEY)
     found = ops.leaves(_graph(leaf, layers=layers)["region"])
@@ -1124,6 +1139,30 @@ def test_a_state_only_leaf_counts_each_slot_its_copies_read_once(
     # copies take 2 of their 4 placements.
     assert record["footprint_bytes"] == footprint
     assert {slot for _, slot in runner.batches} == {0, 2, 4, 6}
+
+
+def test_a_block_view_beside_state_slots_counts_once_a_placement(monkeypatch):
+    # DeepSeek-V4's decode compressor: it writes its row to a view of the
+    # plane's blocks and reads its state, beside 6 state slots. A placement
+    # puts the batch on blocks of its own, and on slots past the 3 pairs the
+    # slots hold only the first pairs again.
+    runner = _Runner()
+    runner.pool_plan = SimpleNamespace(entries={"state": 6})
+    runner.kv_held = {"v4_unified_kv": [torch.zeros(100, 4)], **_state((16,), 6)}
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    kv, st = _t([60, 4], "kv"), _t([6, 16], "kv", stride=[64, 1])
+    leaf = _leaf("v4.compress", ("q", _t([2, 4], "activation")), ("kv", kv), ("st", st))
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    [record] = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+
+    # 32 bytes of q, 32 of kv and 128 of state a call: 11 copies pass twice
+    # 1000, each its own placement. The kv counts at all 11, the state at 3.
+    assert record["metadata"] == {"kv": "v4_unified_kv.0", "st": "v4_state.0"}
+    assert record["placements"] == 11
+    assert record["footprint_bytes"] == 11 * 32 + 11 * 32 + 3 * 128
 
 
 @pytest.mark.parametrize(

@@ -542,7 +542,7 @@ class Stub:
         self.alone = getattr(runner.config, "dp_logical_size", 0)
         self.slots = runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
         self.built, self.leaves, self.placed = {}, {}, []
-        self.cold_copies, self.clones, self.kv = {}, {}, {}
+        self.cold_copies, self.clones, self.kv, self.state = {}, {}, {}, set()
         self.modules = dict(runner.model.named_modules())
         self.contexts = runner.config.compilation_config.static_forward_context
         self.moe = sorted(
@@ -675,6 +675,7 @@ class Stub:
         blocks = sum(-(-row[1] // rule.block_size) for row in rows)
         kv = _forward_kv_cache_context.kv_cache_data
         held = _held(self.runner, kv)
+        self.state = _state(self.runner, held)
         self.kv = {
             (s, path): _kv(spec, path, held)
             for s, (op, _) in found.items()
@@ -684,7 +685,7 @@ class Stub:
         room = [pool // blocks]
         room += [t.k_cache.shape[0] // len(rows) for t in kv.values() if _stateful(t)]
         plans = {
-            s: self._plan(op, i, kv, blocks, len(rows), shape.tokens)
+            s: self._plan(op, i, kv, blocks, len(rows), shape.tokens, s)
             for s, (op, i) in found.items()
         }
         need = max(p for _, _, p, _ in plans.values())
@@ -738,7 +739,7 @@ class Stub:
         self.placed = []
         return got
 
-    def _plan(self, op, instances, kv, blocks, rows, tokens=None):
+    def _plan(self, op, instances, kv, blocks, rows, tokens=None, sig=None):
         """A leaf's copies, its bytes per call, the placements its context
         keys and KV arguments take, and its KV arguments' bytes per call read
         by blocks and by state slots; `tokens` defaults to `rows`, a
@@ -754,8 +755,9 @@ class Stub:
                 # ponytail: its first dim taken as blocks or state slots, or as
                 # plane rows when the leaf states its layer's attention geometry;
                 # beside state slots a block view is one block a request, the
-                # one a decode compressor writes its row to, and read as a slot
-                unit, slotted = (rows, 1) if self.slots else (blocks, 0)
+                # one a decode compressor writes its row to
+                unit = rows if self.slots else blocks
+                slotted = int(self.kv.get((sig, slot), ("",))[0] in self.state)
                 stated = op.get("stated", {})
                 if "window_size" in stated and (ratio := stated["compress_ratio"]):
                     # the rows the batch's blocks hold at its layer: a row
@@ -1167,6 +1169,26 @@ def _held(runner, registry) -> dict[str, torch.Tensor]:
         else:
             named.append((name, value))
     return {name: t for name, t in named if torch.is_tensor(t)}
+
+
+def _state(runner, held) -> set[str]:
+    """The names of the `held` tensors that hold per-request state, each also
+    as `_kv` names its last layer: the fields of an arena of a request's state
+    an entry that the runner holds (DeepSeek-V4's compressor state). A KV
+    registry entry of it caps a point's placements at its slots instead."""
+    from atom.model_ops.attentions.pool_layout.entry_arena import SplitEntryMajorArena
+
+    state = []
+    for arena in runner.kv_held.values():
+        if isinstance(arena, SplitEntryMajorArena):
+            state += [p.view(f.name) for p in arena.arenas for f in p.fields]
+    at = {(t.data_ptr(), t.shape, t.stride()) for t in state}
+    return {
+        n
+        for name, t in held.items()
+        if (t.data_ptr(), t.shape, t.stride()) in at
+        for n in (name, f"{name}.{len(t) - 1}")
+    }
 
 
 def _function(name: str):
