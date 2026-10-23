@@ -960,7 +960,11 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   indexer's score and top-k states its `compress_ratio`, read in the opened
   attention's body from the layer `layer_name` names. Their index lists are sized for
   the deployment's longest row, so the entries a row reads follow from these and its
-  context, not from the lists.
+  context, not from the lists. The fused QK-norm and RoPE,
+  `aiter._fused_qk_norm_rope_group_quant_kernel.default`, states its layer's
+  `compress_ratio` too ([ruling on #1973](https://github.com/jgong5/ATOM/issues/1973#issuecomment-6358962981)):
+  at decode it writes each token's window row to the destination rows of that ratio's
+  class, which `bench.ops.V4_METADATA` binds to `v4_swa_dest_{dense,csa,hca}`.
 
 Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers
 and DeepSeek-V4's attention aside, below), so its ambient reads stay

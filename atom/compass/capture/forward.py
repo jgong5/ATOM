@@ -91,6 +91,8 @@ V4_DECODES = (
     "aiter.mla_decode_v4_ps_asm.default",
 )
 V4_INDEXER = "aiter.indexer_score_topk.default"
+#: DeepSeek-V4's fused QK-norm and RoPE, which writes a decode's window rows.
+V4_QKN = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
 #: Where a drafter's step ends its target's work: ATOM records `forward_done_event`.
 CUT = "forward_done_event"
 
@@ -851,8 +853,8 @@ def _v4_attention(v4, recorder):
 
     The decode leaves (`V4_DECODES`) state the layer's `window_size`,
     `compress_ratio` and `index_topk` (None when it has no indexer), and the
-    indexer's its `compress_ratio`, none of which they are passed: read off
-    the layer `layer_name` names.
+    indexer's and the fused QK-norm (`V4_QKN`) its `compress_ratio`, none of
+    which they are passed: read off the layer `layer_name` names.
     """
     from atom.utils.forward_context import get_forward_context
 
@@ -861,7 +863,10 @@ def _v4_attention(v4, recorder):
         top = layer.indexer and layer.indexer.index_topk
         ratio = (("compress_ratio", layer.compress_ratio),)
         geometry = (("window_size", layer.window_size), *ratio, ("index_topk", top))
-        stated = {**dict.fromkeys(V4_DECODES, geometry), V4_INDEXER: ratio}
+        stated = {
+            **dict.fromkeys(V4_DECODES, geometry),
+            **dict.fromkeys((V4_INDEXER, V4_QKN), ratio),
+        }
         with (
             patch.object(recorder, "stated", stated),
             patch.object(get_forward_context().context, "is_dummy_run", False),
