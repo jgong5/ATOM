@@ -461,6 +461,160 @@ def test_an_embedding_reads_the_token_ids_atom_prepared():
     assert [name for name, _ in views.values()] == ["input_ids"]
 
 
+def test_a_v4_metadata_slot_is_a_view_of_the_buffer_atom_passes_or_refuses():
+    # Each buffer ATOM passes is wider than one of its dtype `_meta`'s rules
+    # take: one of the slot's own spec, or a tighter one its name also holds.
+    # No HCA indptr is live, so the persistent decode's refuses past a decoy.
+    nm, ps = "aiter.mla:mla_decode_fwd_v4_nm", "aiter.mla_decode_v4_ps_asm.default"
+    csa = "aiter.ops.flydsl.kernels.fused_compress_attn:flydsl_fused_compress_attn"
+    state = "atom.model_ops.v4_kernels.state_writes:update_compressor_states"
+    qkn = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
+    hca = "aiter.ops.flydsl.kernels.fused_compress_attn_hca:flydsl_hca_compress_attn"
+    bf16 = "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
+
+    def i32(*shape):
+        return torch.zeros(shape, dtype=torch.int32)
+
+    def meta(slot, *shape):
+        return slot, _t(list(shape), "metadata", dtype="torch.int32")
+
+    runner = _Runner()
+    runner.forward_vars |= {
+        "context_lens": i32(3),
+        "top_ks": i32(4, 4),
+        "v4_compress_plan_4": i32(8, 4),
+        "v4_compress_plan_128": i32(8, 4),
+        "v4_write_plan_4": i32(4, 4),
+        "v4_write_plan_128": i32(8, 4),
+    }
+    v4 = {
+        "kv_indptr_swa": i32(5),
+        "kv_indptr_csa": i32(9),
+        "state_slot_in": i32(8),
+        "state_slot_out": i32(8),
+        "batch_id_per_q_token": i32(8),
+    }
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):
+        prepared = prepare(batch)
+        vars(fctx.get_forward_context().attn_metadata).update(v4)
+        return prepared
+
+    runner.prepare_model = prepare_model
+    slots = meta("state_slot_mapping", 3)
+    leaves = [
+        dataclasses.replace(
+            _leaf(name, meta("kv_indptr", 5)), stated=(("compress_ratio", r),)
+        )
+        for name, r in ((nm, 4), (ps, 128), (bf16, 4))
+    ]
+    leaves += [
+        _leaf(csa, ("ratio", 4), slots, meta("plan_gpu", 4, 4)),
+        _leaf(hca, ("ratio", 128), slots, meta("plan_gpu", 4, 4)),
+        _leaf(state, ("ratio", 128), slots, meta("write_plan", 4, 4)),
+        _leaf(qkn, meta("batch_id_per_token", 3)),
+    ]
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(*leaves, layers=1)["region"])
+
+    stub._prepare((0, 0))
+
+    [(_, views)] = stub.placed
+    got = {(stub.leaves[s][0]["op"], p): n for (s, p), (n, _) in views.items()}
+    assert got == {
+        (nm, "kv_indptr"): "kv_indptr_csa",
+        (ps, "kv_indptr"): "ATOM passes kv_indptr kv_indptr_hca: not live",
+        (bf16, "kv_indptr"): "kv_indptr_csa",
+        (csa, "state_slot_mapping"): "state_slot_in",
+        (csa, "plan_gpu"): "v4_compress_plan_4",
+        (hca, "state_slot_mapping"): "state_slot_in",
+        (hca, "plan_gpu"): "v4_compress_plan_128",
+        (state, "state_slot_mapping"): "state_slot_out",
+        (state, "write_plan"): "v4_write_plan_128",
+        (qkn, "batch_id_per_token"): "batch_id_per_q_token",
+    }
+
+
+def test_v4_index_leaves_write_the_indptrs_atom_passes_and_a_decode_its_split_plan(
+    monkeypatch,
+):
+    # The leaves of a placement share a metadata view's clone, and ATOM's
+    # index builder writes its three indptrs. Bound by size, all three were
+    # `cu_seqlens_q`, which the CSA decode then read as its split plan.
+    indices = "atom.model_ops.v4_kernels.paged_decode_indices"
+    build, write = (
+        f"{indices}:build_v4_paged_decode_indptr",
+        f"{indices}:write_v4_paged_decode_indices",
+    )
+    nm = "aiter.mla:mla_decode_fwd_v4_nm"
+    cu = "atom.model_ops.decode_input_ids:fill_deferred_decode_ids"
+    indptr = _t([3], "metadata", dtype="torch.int32")
+    v4 = {
+        "cu_seqlens_q": torch.arange(3, dtype=torch.int32),
+        **{
+            f"kv_indptr_{k}": torch.zeros(9, dtype=torch.int32)
+            for k in ("swa", "csa", "hca")
+        },
+        # aiter's uniform plan of 5 splits a row, a row of ATOM's table
+        "split_plan_csa": (
+            5,
+            (torch.arange(1, 17)[:, None] * torch.arange(9)).int()[4],
+        ),
+    }
+    runner, read = _Runner(), {}
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):
+        prepared = prepare(batch)
+        vars(fctx.get_forward_context().attn_metadata).update(v4)
+        return prepared
+
+    def written(swa_indptr, csa_indptr, hca_indptr):
+        for t, per_row in ((swa_indptr, 2), (csa_indptr, 6), (hca_indptr, 3)):
+            t.copy_(torch.arange(3) * per_row)
+
+    calls = {
+        build: written,
+        write: lambda csa_indptr: read.update(write=csa_indptr.tolist()),
+        nm: lambda kv_indptr, split_indptr: read.update(
+            nm=kv_indptr.tolist(), split=split_indptr.tolist()
+        ),
+        cu: lambda cu: read.update(cu=cu.tolist()),
+    }
+
+    def time(self, op, sig, instances, n):
+        calls[op["op"]](**self._copy(op, sig, instances, 0)[0])
+        return {"cold_ns": 1.0}
+
+    runner.prepare_model = prepare_model
+    monkeypatch.setattr(ops.Stub, "_time", time)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    found = ops.leaves(
+        _graph(
+            _leaf(build, *((f"{k}_indptr", indptr) for k in ("swa", "csa", "hca"))),
+            _leaf(write, ("csa_indptr", indptr)),
+            dataclasses.replace(
+                _leaf(nm, ("kv_indptr", indptr), ("split_indptr", indptr)),
+                stated=(("compress_ratio", 4),),
+            ),
+            _leaf(cu, ("cu", indptr)),
+            layers=1,
+        )["region"]
+    )
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    got = ops.Stub(runner, 5_000).point(placed, decode(2), 20, found)
+
+    assert [r for r in got if "refused" in r] == []
+    assert read == {
+        "write": [0, 6, 12],
+        "nm": [0, 6, 12],
+        "split": [0, 5, 10],
+        "cu": [0, 1, 2],
+    }
+
+
 def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
     layers = {f"model.layers.{i}.attn": SimpleNamespace(layer_num=i) for i in (0, 1)}
     kv = {f"layer_{i}": SimpleNamespace(k_cache=torch.zeros(64, 16, 4)) for i in (0, 1)}
@@ -559,6 +713,74 @@ def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placeme
         assert kwargs["st"].data_ptr() == state.data_ptr()
         assert set(snap.attn_metadata.block_tables.flatten().tolist()) == {4 * c}
     assert "ATOM's live KV has no room for kv [500, 4]" in got["y"]["refused"]
+
+
+def test_a_compressor_state_is_a_layer_of_its_own_field_and_every_slot_stays_in_it():
+    # DeepSeek-V4's compressor state: a field per compressor kind, each a
+    # `[layers, slots, rows, dim]` view strided by its plane's slot. The HCA
+    # state sits in the wide plane, the CSA indexer's in the narrow one after
+    # it, the tighter; the capture's pool held fewer slots.
+    from atom.model_ops.attentions.pool_layout.entry_arena import (
+        EntryField,
+        EntryMajorArena,
+    )
+
+    slots, f32 = 8, torch.float32
+    pool = torch.zeros(slots * (4096 + 1024), dtype=torch.uint8)
+    wide, narrow = pool[: slots * 4096], pool[slots * 4096 :]
+    hca = EntryMajorArena(
+        [EntryField("hca", 2, (4, 8), f32)], slots, "cpu", wide, slot_stride=4096
+    )
+    idx = EntryMajorArena(
+        [EntryField("idx", 2, (2, 4), f32)], slots, "cpu", narrow, slot_stride=1024
+    )
+    runner = SimpleNamespace(
+        kv_held={
+            "v4_hca_main_kv_state": hca.view("hca"),
+            "v4_csa_idx_kv_state": idx.view("idx"),
+        }
+    )
+    spec = {"shape": [2, 4, 8], "stride": [1024, 8, 1], "dtype": F32, "role": "kv"}
+
+    name, view = ops._kv(spec, "kv_state", ops._held(runner, {}))
+
+    # the end of the last slot ATOM hands out, at the view's slot stride
+    last = view.storage_offset() + (slots - 1) * view.stride(0) + 4 * 8
+    assert last <= pool.numel() // f32.itemsize
+    assert name == "v4_hca_main_kv_state.1"
+    assert view.storage_offset() == hca.view("hca")[1].storage_offset()
+
+
+@pytest.mark.parametrize("faulted", [False, True])
+def test_a_rank_whose_device_faulted_dies_and_one_that_refused_measures_on(
+    monkeypatch, tmp_path, faulted
+):
+    # A HIP fault is sticky: a rank that refused the leaf and went on would
+    # hold its peers in their next collective until that timed out. One that
+    # journaled the leaf first would have the next leaf refused in its place.
+    def synchronize(device):
+        if faulted:
+            raise RuntimeError("HIP error: an illegal memory access was encountered")
+
+    exits, journal = [], tmp_path / "points.jsonl"
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+    monkeypatch.setattr(
+        ops.os, "_exit", lambda code: exits.append((code, journal.exists()))
+    )
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: 1 / 0)
+    runner = _Runner()
+    runner.device = torch.device("cuda", 0)
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+    found = ops.leaves(
+        _graph(_leaf("x", ("q", _t([2, 4], "activation"))), layers=1)["region"]
+    )
+
+    [record] = ops.Stub(runner, 5_000, journal).point(placed, decode(2), 20, found)
+
+    assert record["refused"] == "ZeroDivisionError: division by zero"
+    # the journal holds no record of the leaf when the rank ends
+    assert exits == ([(1, False)] if faulted else [])
 
 
 def test_a_plane_argument_is_sized_by_the_rows_of_the_batch_s_blocks(monkeypatch):
