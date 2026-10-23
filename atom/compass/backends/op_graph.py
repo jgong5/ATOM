@@ -305,7 +305,8 @@ class OpGraphBackend(CostBackend):
                 gathered = view.draft_moe_rows if draft else view.moe_rows
                 g = () if gathered is None else (gathered,)
                 drafted = {"draft": True} if draft else {}
-                if output and width and width != shape[2]:
+                # A DP middle chunk runs its drafter's propose too.
+                if (output or self.dp > 1) and width and width != shape[2]:
                     drafted["width"] = width
                 at = f" W={width}" * ("width" in drafted)
                 at += "".join(f" G={n}" for n in g)
