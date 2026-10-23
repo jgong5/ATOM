@@ -159,6 +159,7 @@ from atom.compass.artifacts import (
     roots_for,
 )
 from atom.compass.drive.gpu import add_gpu_flag
+from atom.utils.arg_parser import FlexibleArgumentParser
 
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
@@ -279,7 +280,7 @@ def main(argv: list[str]) -> None:
         raise ValueError("--plan places every point; name no --width or --prefill")
     if args.context is None and any(s.phase == "decode" for s in shapes):
         raise ValueError("a decode shape needs --context, each row's tokens")
-    engine = EngineArgs.add_cli_args(argparse.ArgumentParser(prog=f"{PROG} --"))
+    engine = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
     engine = engine.parse_args(argv[cut + 1 :])
     world = engine.tensor_parallel_size * engine.data_parallel_size
     # DP attention makes each TP rank a DP rank, and one GPU can run one alone
@@ -2044,7 +2045,7 @@ def _capture(config, shapes, root, arch=None, atom_args=()) -> None:
     from atom.compass.capture.forward import device_arch
     from atom.model_engine.arg_utils import EngineArgs
 
-    engine = EngineArgs.add_cli_args(argparse.ArgumentParser()).parse_args(atom_args)
+    engine = EngineArgs.add_cli_args(FlexibleArgumentParser()).parse_args(atom_args)
     argv = ["--model", config.model, "--tp", str(engine.tensor_parallel_size)]
     argv += ["--arch", arch or device_arch()]
     for s in shapes:

@@ -27,13 +27,14 @@ from test_parity_record import _unpriced  # noqa: F401  an autouse fixture
 
 from atom.compass import cli, ir
 from atom.compass.artifacts import ArtifactStore, Kind, machine_spec_digest
-from atom.compass.bench import ops
+from atom.compass.bench import measure, ops
 from atom.compass.capture import driverless
 from atom.compass.capture.forward import decode, prefill
 from atom.compass.capture.graph import Traced, build, to_json
 from atom.compass.ir.nodes import Reduced
 from atom.compass.spec import MachineSpec
 from atom.compass.spec.fields import PINNED
+from atom.config import Config
 from atom.utils import block_convert
 from atom.utils import forward_context as fctx
 
@@ -1921,3 +1922,34 @@ def test_the_capture_child_starts_with_every_gpu_hidden_below_hip(monkeypatch):
     ops._capture(config, [decode(4)], "store")
 
     assert started["ROCR_VISIBLE_DEVICES"] == ""
+
+
+def test_atom_s_arguments_read_alike_in_either_spelling(
+    monkeypatch, tmp_path, model_dir  # noqa: F811
+):
+    # ATOM's server accepts either spelling of each long flag; so do the benches.
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+    started = []
+    monkeypatch.setattr(ops, "_child", lambda fn, argv: started.append(argv))
+    monkeypatch.setattr("atom.compass.capture.forward.device_arch", lambda: "gfx942")
+    configs = []
+    shape = ["--width", "4", "--context", "9", "--gpu", "0", "--llc-mib", "256"]
+    shape += ["--store", str(tmp_path), "--out", str(tmp_path / "o")]
+    for kv, tp in [
+        ("--kv-cache-dtype", "--tensor_parallel_size"),
+        ("--kv_cache_dtype", "--tensor-parallel-size"),
+    ]:
+        atom_args = ["--model", str(model_dir), kv, "fp8", tp, "2"]
+        configs.append(measure.atom_config(atom_args))
+        ops._capture(configs[-1], [decode(4)], "store", atom_args=atom_args)
+        with pytest.raises(ValueError, match="arguments resolve 2 ranks"):
+            ops.main([*shape, "--", *atom_args])
+
+    assert vars(configs[0]) == vars(configs[1])
+    assert (configs[0].kv_cache_dtype, configs[0].tensor_parallel_size) == ("fp8", 2)
+    first, second = (argv[: argv.index("--")] for argv in started)
+    assert first == second and first[first.index("--tp") + 1] == "2"
