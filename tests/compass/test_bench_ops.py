@@ -359,7 +359,7 @@ def test_measure_times_a_point_atom_prepared_and_runs_no_forward(monkeypatch):
     monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
     timed = []
     monkeypatch.setattr(
-        ops, "_replay", lambda fn, calls: timed.append(calls) or [1.0] * ops.REPEATS
+        ops, "_replay", lambda fn, calls, *_: timed.append(calls) or [1.0] * ops.REPEATS
     )
     mm = _leaf(
         "aten.mm.default",
@@ -809,7 +809,7 @@ def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placeme
     )
     graphs = []
 
-    def replay(fn, calls):
+    def replay(fn, calls, flush=None):
         graphs.append(calls)
         return [1.0] * ops.REPEATS
 
@@ -1050,7 +1050,7 @@ def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
     )
     graphs = []
 
-    def replay(fn, calls):
+    def replay(fn, calls, flush=None):
         graphs.append(calls)
         return [1.0] * ops.REPEATS
 
@@ -1082,7 +1082,7 @@ def test_a_call_cycles_a_weight_per_occurrence_on_the_cold_copies_inputs():
     gemm = {"op": "x", "args": {"x": x, "w": [w]}, "occurrences": 2}
     graphs = []
 
-    def replay(fn, calls):
+    def replay(fn, calls, flush=None):
         graphs.append(calls)
         return [1.0] * ops.REPEATS
 
@@ -1147,7 +1147,7 @@ def test_a_call_that_fills_a_graph_alone_cycles_no_second_weight():
     gemm = {"op": "x", "args": {"x": x, "w": [w]}, "occurrences": 2}
     graphs = []
 
-    def replay(fn, calls):
+    def replay(fn, calls, flush=None):
         graphs.append(len(calls))
         return [1.0] * ops.REPEATS
 
@@ -1182,7 +1182,7 @@ def test_a_copy_past_the_cold_ones_takes_its_own_cold_copy_s_inputs_and_is_logge
     )
     graphs = []
 
-    def replay(fn, calls):
+    def replay(fn, calls, flush=None):
         graphs.append(calls)
         return [1.0] * ops.REPEATS
 
@@ -1218,7 +1218,9 @@ def test_a_leaf_that_occurs_once_takes_a_weight_per_cache_sized_copy(monkeypatch
     monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
     graphs = []
     monkeypatch.setattr(
-        ops, "_replay", lambda fn, calls: graphs.append(calls) or [1.0] * ops.REPEATS
+        ops,
+        "_replay",
+        lambda fn, calls, *_: graphs.append(calls) or [1.0] * ops.REPEATS,
     )
 
     [record] = stub.point(placed, decode(2), 20, found)
@@ -1337,7 +1339,7 @@ def test_every_cold_and_warm_graph_holds_calls_calls_at_any_copies(copies):
     stub.placed = [(fctx.ForwardContext(), {})]
     graphs = []
 
-    def replay(fn, calls):
+    def replay(fn, calls, flush=None):
         graphs.append(len(calls))
         return [1.0] * ops.REPEATS
 
@@ -1368,7 +1370,7 @@ def test_a_long_call_fills_a_graph_to_graph_ns_and_has_no_warm_graph(
     stub.placed = [(fctx.ForwardContext(), {})]
     graphs = []
 
-    def replay(fn, cycle):
+    def replay(fn, cycle, flush=None):
         graphs.append(len(cycle))
         return [1.0] * ops.REPEATS
 
@@ -1414,6 +1416,43 @@ def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
 
     replays = range(ops.WARMUPS + ops.REPEATS)
     assert slept == [(i + 1) * ops.REST / 1e3 for i in replays]
+
+
+def test_each_cold_replay_follows_one_eviction_of_cold_caches_and_a_warm_one_none(
+    monkeypatch,
+):
+    # 256 copies under twice the cache leave a leaf warm unless the cache is
+    # written over before each replay; the warm graph is the leaf on one copy.
+    seen = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "CUDAGraph",
+        lambda: SimpleNamespace(replay=lambda: seen.append("replay")),
+    )
+    monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(
+        torch.cuda,
+        "Event",
+        lambda enable_timing: SimpleNamespace(
+            record=lambda: seen.append("event"),
+            synchronize=lambda: None,
+            elapsed_time=lambda end: 1.0,
+        ),
+    )
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    assert stub.flush.nbytes == ops.COLD * 10_000
+    nbytes = stub.flush.nbytes
+    stub.flush = SimpleNamespace(zero_=lambda: seen.append(nbytes))
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+    ):
+        stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], 8)
+
+    replays = ops.WARMUPS + ops.REPEATS
+    cold = [nbytes, "event", "replay", "event"] * replays
+    assert seen == cold + ["event", "replay", "event"] * replays
 
 
 def test_a_capture_waits_for_the_driver_to_clear_a_release_and_a_capped_wait_is_recorded(
@@ -1482,7 +1521,7 @@ def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(
     )
     graphs = []
 
-    def replay(fn, calls):
+    def replay(fn, calls, flush=None):
         graphs.append(calls)
         return [1.0] * ops.REPEATS
 

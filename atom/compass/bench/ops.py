@@ -162,8 +162,9 @@ from atom.compass.drive.gpu import add_gpu_flag
 
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
-#: copies a graph reads or what a capture waits for change.
-PROTOCOL = 12
+#: copies a graph reads, what a capture waits for or what a replay follows
+#: change.
+PROTOCOL = 14
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -174,8 +175,9 @@ CALLS = 256
 #: at least one, so a capped graph holds at least 5 ms: a replay's fixed cost,
 #: about 19 us on MI308X, is under 0.4% of it.
 GRAPH_NS = 10_000_000
-#: Times over the last-level cache the copies' bytes pass: just past it, part of
-#: them stays there, and an MI308X GEMM read up to 7% fast.
+#: Times over the last-level cache the copies' bytes pass, and the bytes written
+#: before each cold replay: just past it, part of them stays there, and an
+#: MI308X GEMM read up to 7% fast.
 COLD = 2
 #: Host idle after each replay, as a share of its device time. Replayed back to
 #: back on an MI308X, the lm_head GEMM ran at a 1100 MHz memory and 1550 MHz
@@ -528,6 +530,9 @@ class Stub:
         from atom.model_engine.kv_block import STATE_SLOT_CLASS
 
         self.runner, self.llc, self.journal = runner, llc, journal
+        # written before each cold replay, so no call reads what the last left
+        # in the cache: under twice the cache, 256 copies alone leave a leaf warm
+        self.flush = torch.empty(COLD * llc, dtype=torch.uint8, device=runner.device)
         self.alone = getattr(runner.config, "dp_logical_size", 0)
         self.slots = runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
         self.built, self.leaves, self.placed = {}, {}, []
@@ -770,8 +775,9 @@ class Stub:
         `GRAPH_NS`, cold over at most `n` copies, past the first `m` its point
         sized to the cache (`cold_copies`) each on copy `c mod m`'s
         activations, then copy `c mod n` with the c-th weight up to the
-        leaf's occurrences when it takes one, at most K; and, when K is `CALLS`,
-        warm over one; with its kernels. Every rank's graph holds the most K
+        leaf's occurrences when it takes one, at most K, each replay after one
+        write of `flush`; and, when K is `CALLS`, warm over one, with no write;
+        with its kernels. Every rank's graph holds the most K
         any rank's call gives, and a leaf any rank refuses, every rank does."""
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
@@ -810,7 +816,7 @@ class Stub:
                     calls.append(self._reweigh(op, sig, calls[c % n], c))
             n = len(calls)
             cycle = [calls[i % n] for i in range(k)]
-            cold = _replay(fn, cycle)
+            cold = _replay(fn, cycle, self.flush)
             warm = _replay(fn, calls[:1] * k) if n > 1 and k == CALLS else None
         finally:
             forward_context._forward_context = forward_context.ForwardContext()
@@ -1204,9 +1210,10 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
     return [e.name for e in device], ns
 
 
-def _replay(fn, calls) -> list[float]:
+def _replay(fn, calls, flush=None) -> list[float]:
     """Each timed replay of one graph of `calls`, in ns per call, each started
-    on every rank together (`_together`), the capture refused on every rank
+    on every rank together (`_together`) after one write of `flush` when
+    given, outside the timed events, the capture refused on every rank
     when any rank's refused, and nothing it left read by a later one
     (`_contained`), captured once the memory earlier leaves freed is cleared
     (`_release`). Over several ranks, a decode step's graph is captured as
@@ -1234,6 +1241,8 @@ def _replay(fn, calls) -> list[float]:
     start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
     times = []
     for i in range(WARMUPS + REPEATS):
+        if flush is not None:
+            flush.zero_()
         _together()
         start.record()
         graph.replay()
