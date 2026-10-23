@@ -750,6 +750,35 @@ def test_a_context_module_with_no_kv_layer_is_sized_by_its_own_tensors(monkeypat
     assert record["placements"] == 1
 
 
+def test_a_context_module_s_pool_view_is_sized_by_the_batch_s_blocks(monkeypatch):
+    # DeepSeek-V4's Indexer as ATOM binds it: a view of the pool a block a row,
+    # FP4 data and scales, beside tensors of its own, one 0-dim; no layer_num.
+    def indexer():
+        module = torch.nn.Module()
+        module.register_buffer("kv_cache", torch.zeros(64, 16, 4))
+        module.register_buffer("own", torch.zeros(3))
+        module.register_buffer("scale", torch.zeros(()))
+        module.kv_scale = torch.zeros(64, 16)
+        return module
+
+    runner = _Runner({KEY.format(L=i): indexer() for i in (0, 1)})
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+    q = ("q", _t([2, 4], "activation"))
+    leaf = _leaf("aiter.indexer", q, ("layer", ir.ContextRef(KEY)), key=KEY)
+    found = ops.leaves(_graph(leaf, layers=2)["region"])
+
+    [record] = ops.Stub(runner, 5_000).point(placed, decode(2), 20, found)
+
+    # Two rows of 20 tokens read 4 of the pool's 64 blocks, 320 bytes each,
+    # beside 32 of q and 16 of its own: 1328 a call, 8 copies past twice 5000,
+    # cycling the two layers over 4 placements of the batch.
+    assert record["footprint_bytes"] == 8 * 1328
+    assert record["placements"] == 4
+    assert runner.batches == [(4 * p, 2 * p) for p in range(4)]
+
+
 def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placements(
     monkeypatch,
 ):
@@ -845,6 +874,42 @@ def test_a_compressor_state_is_a_layer_of_its_own_field_and_every_slot_stays_in_
     assert last <= pool.numel() // f32.itemsize
     assert name == "v4_hca_main_kv_state.1"
     assert view.storage_offset() == hca.view("hca")[1].storage_offset()
+
+
+def test_a_v4_compressor_s_kv_cache_is_its_layer_s_block_view_and_no_other():
+    # DeepSeek-V4's main compressors write their layer's rows of every block
+    # of the plane, a view strided by a block's rows of every layer that no
+    # runner attribute holds: 4 a block in a CSA layer, 2 in an HCA one. A
+    # layer's view of the plane from its base row to the end is the tighter.
+    plane = torch.zeros(8 * 10, 4)
+    blocks = plane.view(8, 10, 4)
+
+    def layer(base, rows):
+        compressor = torch.nn.Module()
+        compressor.kv_cache, compressor.kv_cache_rope = (
+            blocks[:, base : base + rows],
+            None,
+        )
+        return torch.nn.ModuleDict(
+            {"attn": torch.nn.ModuleDict({"compressor": compressor})}
+        )
+
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([layer(0, 4), layer(4, 2), layer(6, 4)])
+    runner = SimpleNamespace(
+        model=model, kv_held={"v4_unified_kv": [plane, plane[30:]]}
+    )
+    held = ops._held(runner, {})
+
+    def bound(rows):
+        spec = {"shape": [6, rows, 4], "stride": [40, 4, 1], "dtype": F32, "role": "kv"}
+        return ops._kv(spec, "kv_cache", held)
+
+    (hca, hca_view), (csa, csa_view), (other, none) = bound(2), bound(4), bound(3)
+    assert (hca, hca_view.storage_offset()) == ("layers.1.attn.compressor.kv_cache", 16)
+    assert (csa, csa_view.storage_offset()) == ("layers.2.attn.compressor.kv_cache", 24)
+    assert none is None
+    assert other.startswith("ATOM's KV holds no tensor laid out as kv_cache [6, 3, 4]")
 
 
 @pytest.mark.parametrize("faulted", [False, True])

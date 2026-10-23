@@ -39,8 +39,8 @@ found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names, its module's meta parameters
 moved to the device and filled as `--load_dummy xavier` fills them (`_fill`),
 and a runner attribute this runner's own; a KV tensor is a view of a tensor
-ATOM's KV allocation bound (`_kv`), whose name the point records, the same on
-every copy; an object is rebuilt from its class
+ATOM's KV allocation bound of its layout (`_kv`), refused when none is, whose
+name the point records, the same on every copy; an object is rebuilt from its class
 and state as the capture's replay rebuilds one, its tensors built as any other
 argument's, its activations fresh on every copy. A leaf whose operator cannot
 run so refuses by name. On one GPU at a
@@ -56,8 +56,9 @@ others, as the batch's state slots, or its blocks when the model keeps no
 per-request state, or, of a decode attention leaf that states its layer's
 window and compress ratio, the plane rows the batch's blocks hold at that
 ratio, a RoPE table's (`TABLES`) as many rows as the point's tokens, the
-tensors of each module it names and, for a leaf that names a context key, the
-KV and per-request state its layer holds for the batch. One graph runs the leaf K
+tensors of each module it names, of one whose first dimension is the pool's
+blocks the batch's blocks, and, for a leaf that names a context key, the KV and
+per-request state its layer holds for the batch. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
 kernels of one eager call of copy 0, the fewer, at least one, cycling over its
 copies: N built ones: M, the least count whose bytes pass `COLD` times the
@@ -162,7 +163,7 @@ from atom.compass.drive.gpu import add_gpu_flag
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads or what a capture waits for change.
-PROTOCOL = 12
+PROTOCOL = 13
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -754,7 +755,15 @@ class Stub:
                 size += sum(t.nbytes // t.shape[0] * unit for t in _fields(held))
                 need = None
             elif (module := self.modules.get(key, module)) is not None:
-                size += sum(t.nbytes for t in _own(module))
+                pool = self.runner.config.num_kvcache_blocks
+                for t in _own(module):
+                    # ponytail: a first dim of the pool's blocks is a view of
+                    # the KV pool (DeepSeek-V4's Indexer), read at the batch's
+                    if t.dim() and t.shape[0] == pool:
+                        size += t.nbytes // pool * blocks
+                        need = None
+                    else:
+                        size += t.nbytes
         n = self._cold(size)
         if need is None:  # cycle over every instance's state, which is held anyway
             n = min(CALLS, max(n, len(instances)))
@@ -1084,7 +1093,8 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
     else among the last layers, `name.i`, of tensors stacked by layer whose
     layer has that layout: ATOM passes a layer of DeepSeek-V4's compressor
     state, and another field's base at this one's slot stride reaches past
-    the pool; or why none fits, and None."""
+    the pool; or why none fits, and None: a tensor of another layout is
+    another buffer than the one ATOM passes."""
     want = _layout(spec["shape"], spec["stride"])
     own = {n: t for n, t in live.items() if _layout(t.shape, t.stride()) == want}
     own = own or {
@@ -1092,8 +1102,10 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
         for n, t in live.items()
         if t.dim() > 2 and len(t) and _layout(t[-1].shape, t[-1].stride()) == want
     }
+    if not own:
+        return f"ATOM's KV holds no tensor laid out as {slot} {_text(spec)}", None
     try:
-        return _meta(spec, slot, own or live, "KV")
+        return _meta(spec, slot, own, "KV")
     except ValueError as error:  # the leaf refuses, not the point
         return str(error), None
 
@@ -1107,13 +1119,23 @@ def _layout(shape, stride) -> list:
 
 def _held(runner, registry) -> dict[str, torch.Tensor]:
     """Each tensor ATOM's KV allocation bound, by name: the runner attributes
-    it set (`kv_held`), a list's items as `name.i`, and each field of a KV
-    `registry` entry as `layer_<n>.field`."""
+    it set (`kv_held`), a list's items as `name.i`, each field of a KV
+    `registry` entry as `layer_<n>.field`, and the block views of the KV
+    planes it bound on DeepSeek-V4's attention compressors, which no runner
+    attribute holds, as `<module>.kv_cache` and `<module>.kv_cache_rope`; an
+    indexer's compressor writes a layer of a pool the runner holds."""
     named = [
         (f"{key}.{field}", t)
         for key, entry in (registry or {}).items()
         for field, t in vars(entry).items()
     ]
+    model = getattr(runner, "model", None)
+    for path, module in model.named_modules() if model is not None else ():
+        if path.endswith("attn.compressor"):
+            named += [
+                (f"{path}.{a}", getattr(module, a, None))
+                for a in ("kv_cache", "kv_cache_rope")
+            ]
     for name, value in runner.kv_held.items():
         if isinstance(value, (list, tuple)):
             named += [(f"{name}.{i}", t) for i, t in enumerate(value)]
