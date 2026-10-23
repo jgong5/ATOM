@@ -1039,13 +1039,13 @@ def _config(model, tp, atom_args):
     Under `--enable-dp-attention` each TP rank is a DP rank of TP 1, as
     `CoreManager` rewrites it.
     """
-    import argparse
     import dataclasses
 
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
 
-    parser = EngineArgs.add_cli_args(argparse.ArgumentParser(prog="trace ops --"))
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog="trace ops --"))
     forced = ["--enforce-eager", "--level", "0", "--load_dummy", "empty"]
     args = parser.parse_args(["--model", model, "-tp", str(tp), *atom_args, *forced])
     engine = EngineArgs.from_cli_args(args)
@@ -1061,7 +1061,14 @@ def _config(model, tp, atom_args):
 
 
 def capture(
-    model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942", population=()
+    model: str,
+    tp: int,
+    shapes,
+    tmpdir: str,
+    atom_args=(),
+    arch="gfx942",
+    population=(),
+    whole=False,
 ):
     """Trace one step of `model` at TP `tp` at each of `shapes`, in this process,
     under ATOM's engine arguments `atom_args` on a declared `arch`.
@@ -1074,7 +1081,7 @@ def capture(
     record directories `population` are shapes too (`population_shapes`),
     under two-batch overlap a split one's two micro-batches; each of their
     prefills runs as one forward, as it ran, this rank answering that it
-    cannot split it.
+    cannot split it; with `whole`, each prefill of `shapes` too.
     """
     declared = driverless.install(tmpdir, arch)
 
@@ -1088,7 +1095,7 @@ def capture(
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     ep = int(config.enable_expert_parallel)
     ran = population_shapes(population, config.enable_tbo)
-    unsplit = {s for s in ran if s.phase == "prefill"}
+    unsplit = {s for s in ([*ran, *shapes] if whole else ran) if s.phase == "prefill"}
     shapes = list(dict.fromkeys([*shapes, *ran]))
     if not shapes:
         raise ValueError(f"{', '.join(population)} hold no step to trace")
