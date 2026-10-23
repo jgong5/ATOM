@@ -81,7 +81,7 @@ bench freed goes back to the driver, and the bench waits, at most `CLEAR_S`,
 until the card's VRAM in use falls by it (`_release`); a point records the
 seconds waited since the last point and how many waits the cap ended.
 Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the cold
-one each time after a write of `COLD` times the last-level cache outside the
+one each time after a read of `COLD` times the last-level cache outside the
 timing, the host idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
@@ -176,7 +176,7 @@ CALLS = 256
 #: at least one, so a capped graph holds at least 5 ms: a replay's fixed cost,
 #: about 19 us on MI308X, is under 0.4% of it.
 GRAPH_NS = 10_000_000
-#: Times over the last-level cache the copies' bytes pass, and the bytes written
+#: Times over the last-level cache the copies' bytes pass, and the bytes read
 #: before each cold replay: just past it, part of them stays there, and an
 #: MI308X GEMM read up to 7% fast.
 COLD = 2
@@ -531,7 +531,7 @@ class Stub:
         from atom.model_engine.kv_block import STATE_SLOT_CLASS
 
         self.runner, self.llc, self.journal = runner, llc, journal
-        # written before each cold replay, so no call reads what the last left
+        # read before each cold replay, so no call reads what the last left
         # in the cache: under twice the cache, 256 copies alone leave a leaf warm
         self.flush = None
         self.alone = getattr(runner.config, "dp_logical_size", 0)
@@ -777,7 +777,7 @@ class Stub:
         sized to the cache (`cold_copies`) each on copy `c mod m`'s
         activations, then copy `c mod n` with the c-th weight up to the
         leaf's occurrences when it takes one, at most K, each replay after one
-        write of `flush`; and, when K is `CALLS`, warm over one, with no write;
+        read of `flush`; and, when K is `CALLS`, warm over one, with no read;
         with its kernels. Every rank's graph holds the most K
         any rank's call gives, and a leaf any rank refuses, every rank does."""
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
@@ -1217,7 +1217,7 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
 
 def _replay(fn, calls, flush=None) -> list[float]:
     """Each timed replay of one graph of `calls`, in ns per call, each started
-    on every rank together (`_together`) after one write of `flush` when
+    on every rank together (`_together`) after one read of `flush` when
     given, outside the timed events, the capture refused on every rank
     when any rank's refused, and nothing it left read by a later one
     (`_contained`), captured once the memory earlier leaves freed is cleared
@@ -1247,7 +1247,9 @@ def _replay(fn, calls, flush=None) -> list[float]:
     times = []
     for i in range(WARMUPS + REPEATS):
         if flush is not None:
-            flush.zero_()
+            # read, not written: after a write, which leaves the cache dirty,
+            # an MI355X replay read about 40 to 100 us longer at any length
+            flush.max()
         _together()
         start.record()
         graph.replay()

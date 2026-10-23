@@ -1418,27 +1418,34 @@ def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
     assert slept == [(i + 1) * ops.REST / 1e3 for i in replays]
 
 
-def test_each_cold_replay_follows_one_eviction_of_cold_caches_and_a_warm_one_none(
+def test_each_cold_replay_follows_one_read_of_cold_caches_and_a_warm_one_none(
     monkeypatch,
 ):
     # 256 copies under twice the cache leave a leaf warm unless the cache is
-    # written over before each replay; the warm graph is the leaf on one copy.
-    # A replay marks the buffer; each event reads whether it was written since.
+    # read over before each replay, before the ranks start together; a write
+    # would leave it dirty. The warm graph is the leaf on one copy.
     seen = []
     stub = ops.Stub(_Runner(), 10_000)
     stub.placed = [(fctx.ForwardContext(), {})]
+    top = torch.Tensor.max
 
-    def replay():
-        stub.flush.fill_(1)
-        seen.append("replay")
+    def read(t, *args, **kwargs):
+        seen.append("read" if t is stub.flush else "other")
+        return top(t, *args, **kwargs)
 
-    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=replay))
+    monkeypatch.setattr(torch.Tensor, "max", read)
+    monkeypatch.setattr(ops, "_together", lambda: seen.append("together"))
+    monkeypatch.setattr(
+        torch.cuda,
+        "CUDAGraph",
+        lambda: SimpleNamespace(replay=lambda: seen.append("replay")),
+    )
     monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: contextlib.nullcontext())
     monkeypatch.setattr(
         torch.cuda,
         "Event",
         lambda enable_timing: SimpleNamespace(
-            record=lambda: seen.append("written" if stub.flush.max() == 0 else "kept"),
+            record=lambda: seen.append("event"),
             synchronize=lambda: None,
             elapsed_time=lambda end: 1.0,
         ),
@@ -1450,9 +1457,10 @@ def test_each_cold_replay_follows_one_eviction_of_cold_caches_and_a_warm_one_non
         stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], 8)
 
     assert stub.flush.nbytes == ops.COLD * 10_000
+    assert stub.flush._version == 0  # never written
     replays = ops.WARMUPS + ops.REPEATS
-    cold = ["written", "replay", "kept"] * replays
-    assert seen == cold + ["kept", "replay", "kept"] * replays
+    warm = ["together", "event", "replay", "event"]
+    assert seen == (["read"] + warm) * replays + warm * replays
 
 
 def test_a_capture_waits_for_the_driver_to_clear_a_release_and_a_capped_wait_is_recorded(
