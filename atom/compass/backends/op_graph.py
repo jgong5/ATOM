@@ -49,8 +49,11 @@ stream. Both micro-batches' segments go on the two streams in ATOM's order
 With a `price_list`, a source named `LISTED` (`fit.ops.PriceList` in a run),
 each leaf outside a `resource_bound` `Par` resolves through a `Resolver`: the
 price list, asked ``(leaf, bound, work)`` with `bound` the step's or
-micro-batch's (`_bound`), then its roofline. A `resource_bound` `Par` prices
-its branches' summed work, so its leaves take no price of their own.
+micro-batch's (`_bound`), then its roofline. A target padded past its rows
+without a replay asks at the rows each leaf ran, as its shapes lead
+(`_ran_at`): a decode's model at its width, its sampler at its rows; a
+prefill's LM head at its width, the rest at its rows. A `resource_bound` `Par`
+prices its branches' summed work, so its leaves take no price of their own.
 
 Terms. One per op kind, ``op.<kind>``, and ``par.resource_bound``, each
 the fold of its prices in run order. A term is `declared`, its note naming
@@ -83,7 +86,7 @@ from dataclasses import replace
 
 from atom.compass.backends.base import CostBackend, Granularity
 from atom.compass.backends.cost import CostTerm, StepCost, fold_seconds
-from atom.compass.backends.op_work import work
+from atom.compass.backends.op_work import _tensors, work
 from atom.compass.backends.provenance import Method, Provenance, Refusal, combine
 from atom.compass.backends.resolver import CostRefused, CostSource, Resolver
 from atom.compass.backends.shape import IMAGES, BatchView
@@ -178,6 +181,20 @@ def gathered_off_default(
     return None if gathered == dp * rows else gathered
 
 
+def _ran_at(leaf: dict, bound: tuple) -> tuple:
+    """`bound` at the rows `leaf` ran: a padded target's (`_bound`) at its
+    width, but at its rows where an activation, metadata or output of the leaf
+    leads with their counts, or in a prefill none leads with that width."""
+    if len(bound) != 3:
+        return bound
+    rows, wide, counts = bound
+    args, roles = _tensors(list(leaf["args"].values())), ("activation", "metadata")
+    leads = {a["shape"][0] for a in args if a["shape"] and a["role"] in roles}
+    leads |= {s[0] for s in leaf["out"] if s}
+    narrow = leads & counts or rows[0] == "prefill" and wide[2] not in leads
+    return rows if narrow else wide
+
+
 class OpGraphBackend(CostBackend):
     """A step as its shape's graph, one roofline per leaf, composed by its joins."""
 
@@ -226,6 +243,9 @@ class OpGraphBackend(CostBackend):
             priced = self._priced(region, batch_view, refused, bound)
             if self.drafts:
                 drafted_at, region = self._region(batch_view, draft=True)
+                # Its drafter's bound stays at its rows.
+                rows = replace(batch_view, target_bs=None)
+                bound = self.resolver and self._bound(rows)
                 priced += [
                     (DRAFT + p[0], *p[1:])
                     for p in self._priced(region, batch_view, refused, bound)
@@ -279,14 +299,24 @@ class OpGraphBackend(CostBackend):
         """What a price list reads of a step: its phase, its T and B, the rows
         its MoE gathers, None at their default (`gathered_off_default`),
         and its rows' context and max context (`band`), the
-        context a decode's max, a prefill's mean cached tokens."""
+        context a decode's max, a prefill's mean cached tokens. A target padded
+        past its rows without a replay (`target_bs`) is that bound, its G at the
+        width's default, beside it at that width, and the counts a leaf at its
+        rows leads with: a decode's tokens of one to all of a row's, a
+        prefill's tokens and rows."""
         rung = view.capture_rung if self.padded else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
-        g = gathered_off_default(phase, t, view.moe_rows, self.dp, self.drafts)
+        width, decode = self.padded and view.target_bs, phase == "decode"
+        ran = decode and width or t
+        g = gathered_off_default(phase, ran, view.moe_rows, self.dp, self.drafts)
         rows = [(r.query_tokens, r.context_tokens) for r in view.requests]
-        mean, top = band(rows, phase == "decode")
-        return (phase, t, b, g, top if phase == "decode" else mean, top)
+        mean, top = band(rows, decode)
+        bound = (phase, t, b, g, top if decode else mean, top)
+        if not width:
+            return bound
+        counts = {b * k for k in range(1, self.drafts + 2)} if decode else {t, b}
+        return bound, (phase, ran, width, *bound[3:]), frozenset(counts)
 
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
@@ -481,7 +511,7 @@ class OpGraphBackend(CostBackend):
             return None
         if bound:
             try:
-                got = self.resolver.resolve((leaf, bound, w))
+                got = self.resolver.resolve((leaf, _ran_at(leaf, bound), w))
             except CostRefused as exc:
                 refused.extend(exc.declined)
                 return None
