@@ -119,7 +119,7 @@ def _record(path, steps, stretch=None):
                 "t_launch_ns": [t, t],
                 "t_recv_ns": [t, t],
                 "d_busy_ns": busy,
-                "t_exit_ns": t + busy,
+                "t_exit_ns": t,
             }
         )
         t += busy
@@ -383,7 +383,7 @@ GAP_NS = 40_000
 SAMPLE_NS = 20_000
 
 
-def _timed_record(path, steps, idle_after=(), key=KEY, gap=0):
+def _timed_record(path, steps, idle_after=(), key=KEY, gap=0, scale=None):
     """`steps` as a real record with device windows and host stamps.
 
     Each forward runs the host laws' segments and its price on the device, by
@@ -391,7 +391,8 @@ def _timed_record(path, steps, idle_after=(), key=KEY, gap=0):
     waits for it, which stretches the window. An output forward launches its
     sampler for `SAMPLE_NS` after the model, then waits for its token read.
     Every fourth step's prefill is a middle chunk, and `gap` ns of device work
-    runs between forwards. Returns the record and its launch-exposed steps.
+    runs between forwards; `scale` multiplies a step's host segment, keyed
+    `(step, segment)`. Returns the record and its launch-exposed steps.
     """
     t, device_end, output_end, owner, lines, exposed = 0, None, None, 0, [], []
     for i, (rows, rung, seconds) in enumerate(steps):
@@ -403,6 +404,7 @@ def _timed_record(path, steps, idle_after=(), key=KEY, gap=0):
         kind = "decode" if not prefill else "prefill" if output else "middle"
         x = (1, sum(r[0] for r in rows), len(rows))
         ns = {k: round(float(np.dot(c, x)) * 1e9) for k, c in HOST[kind].items()}
+        ns = {k: round(v * (scale or {}).get((i, k), 1)) for k, v in ns.items()}
         enter = t + ns["E"]
         g0 = enter + ns["W_pre"] // 2
         g1 = g0 + 1000
@@ -472,6 +474,46 @@ def test_device_busy_time_and_host_laws_are_recovered_from_a_timed_record(tmp_pa
     assert report["unfitted"] == {}
     assert report["decode.E"]["zero"] == ["seqs"]
     assert set(host["laws"]["middle"]) == {"E", "W_pre", "W_launch"}
+    for kind, segments in HOST.items():
+        for segment, c in segments.items():
+            got = host["laws"][kind][segment]
+            assert got == pytest.approx(c, rel=1e-4, abs=1e-12), f"{kind}.{segment}"
+
+
+def test_a_prefill_whose_exit_ran_under_the_paced_share_after_its_host_record_is_cut(
+    tmp_path,
+):
+    """Output prefill 2's exit event runs 7% of its label after the host records
+    it, prefill 6's 9%: the host paced 2, the device 6."""
+    record, _ = _timed_record(tmp_path / "dp0.jsonl", _steps(14, n=40))
+    lines = [json.loads(x) for x in record.read_text().splitlines()]
+    end = lines[0]["t_launch_ns"][0]  # the first forward's device start
+    for s in lines:
+        end += s.get("d_gap_ns", 0) + s["d_busy_ns"]
+        share = {2: 0.07, 6: 0.09}.get(s["step"])
+        if share:
+            s["t_exit_ns"] = end - round(share * s["d_busy_ns"])
+    record.write_text("".join(json.dumps(s) + "\n" for s in lines))
+
+    cut = {s.step: s.cut for s in label(record)[0]}
+    assert cut[2] == "paced" and cut[6] is None
+    assert [n for n, c in cut.items() if c] == [2]
+
+
+def test_a_launch_a_first_use_compile_stalls_is_named_and_left_out_with_the_next(
+    tmp_path,
+):
+    """Ten output prefills' launches run 20 times their law, a compile, and the
+    decode after each enters 0.9% late, inside the MAD floor, as its period
+    takes up the stall. Decode 251's launch runs 6 times its law, decode 151's
+    3 times: a decode's launch counts as a compile only past `WARM_FACTOR`."""
+    jit = list(range(102, 142, 4))
+    scale = {(n, "W_launch"): 20 for n in jit} | {(n + 1, "E"): 1.009 for n in jit}
+    scale |= {(151, "W_launch"): 3, (251, "W_launch"): 6}
+    record, _ = _timed_record(tmp_path / "dp0.jsonl", _steps(14, n=400), scale=scale)
+
+    host, report = fit_host(label_records([record])[0])
+    assert list(report["jit_steps"].values()) == [sorted(jit + [251])]
     for kind, segments in HOST.items():
         for segment, c in segments.items():
             got = host["laws"][kind][segment]

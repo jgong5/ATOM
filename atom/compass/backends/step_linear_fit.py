@@ -47,7 +47,10 @@ each row computes its drafts too) gets zero. Two keys refuse. The law and the
 host key state the `--machine-spec` digest, which a run's spec must match, and
 the host key's `engine` is the law's `engine_config`. A segment outside `HOST_SEGMENTS` is
 fitted for a kind whose samples carry it: `W_inputs`, on an MTP record, and
-`W_recv`, on a later pipeline stage's.
+`W_recv`, on a later pipeline stage's. A forward whose `W_launch` its kind's
+solve drops above the law paid a first-use JIT compile (`_jit`): it and the
+forward after it, whose period takes up the stall, are left out of every host
+law; the report lists the JIT forwards per run under `jit_steps`.
 
 Each equation is divided by its own label and the coefficients are bound to be
 non-negative. Steps whose relative residual is more than `MAD_K` scaled MADs
@@ -71,7 +74,8 @@ under the law's `draft`; it holds no `held_out`. A step with a propose label
 (`step_labels`) is fitted there on its draft label less that label, the
 draft-KV pass a middle chunk runs too, and left out when nothing remains; the
 propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`.
-The draft law's prefill vector adds `seqs` and `out` (`StepLinearLaw`).
+On an MTP record both prefill vectors, the target's and the draft's, add
+`seqs` and `out` (`StepLinearLaw`).
 
 Forms (`FORMS`): `base`, the features `StepLinearLaw` always prices; `history`,
 prefill plus `Sum (N_KV - N_Q)`, the KV a short chunk reads on a deep history;
@@ -154,7 +158,8 @@ def _features(
 
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
     order, plus `history` for that form, above `dp` 1 `moe_rows` on prefill, and
-    under `draft` `seqs` and `out` on prefill, as `StepLinearBackend` counts them;
+    under `draft` or on a step with a draft label `seqs` and `out` on prefill, as
+    `StepLinearBackend` counts them;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill.
     """
     cut, rows = dict.fromkeys(CUTS, 0), []
@@ -176,7 +181,7 @@ def _features(
                             "a data-parallel law prices prefill from"
                         )
                     counts += (view.moe_rows,)
-                if draft:
+                if draft or s.draft_s is not None:
                     output = bool(view.produces_output)
                     counts += (len(r) if output else 0, int(output))
             else:
@@ -230,9 +235,16 @@ def fit_host(samples) -> tuple[dict, dict]:
             f"the records carry {len(keys)} host keys ({' / '.join(keys)}); "
             "host laws are fitted under one"
         )
-    rows = _host_rows(samples)
+    jit = _jit(samples)
+    after = {(run, rank, n + 1) for run, rank, n in jit}
+    rows = _host_rows(
+        s for s in samples if (s.provenance["run"], s.rank, s.step) not in jit | after
+    )
     host = {"key": json.loads(keys[0]), "laws": {}}
     report = {"cut": {"idle": sum(s.idle for s in samples)}, "unfitted": {}}
+    report["jit_steps"] = {}
+    for run, _, n in sorted(jit):
+        report["jit_steps"].setdefault(run, []).append(n)
     for kind in HOST_KINDS:
         extra = sorted({r[1] for r in rows if r[0] == kind} - set(HOST_SEGMENTS))
         for segment in HOST_SEGMENTS[: 3 if kind == "middle" else 4] + tuple(extra):
@@ -257,6 +269,37 @@ def fit_host(samples) -> tuple[dict, dict]:
                 **{k: s[k] for k in ("condition", "centre", "mad", "zero")},
             }
     return host, report
+
+
+def _jit(samples) -> set[tuple]:
+    """(run, rank, step) of each forward whose `W_launch` the fit of its kind
+    drops above its law, a first-use JIT compile; on a decode, whose launch
+    of a millisecond or so drops on host noise, only past `WARM_FACTOR` times
+    its price."""
+    jit = set()
+    for kind in HOST_KINDS:
+        members = [
+            s
+            for s in samples
+            if host_kind(s.view) == kind and s.host.get("W_launch", 0) > 0
+        ]
+        if len(members) <= len(HOST_FEATURES):
+            continue
+        x = np.array(
+            [(1, sum_tokens(m.view.requests), len(m.view.requests)) for m in members],
+            dtype=np.float64,
+        )
+        if np.linalg.matrix_rank(x[:, 1:]) < 2:
+            x[:, 2] = 0.0
+        y = np.array([m.host["W_launch"] for m in members])
+        solved = _solve(x, y, list(HOST_FEATURES))
+        floor = 1 / WARM_FACTOR - 1 if kind == "decode" else 0.0
+        jit |= {
+            (m.provenance["run"], m.rank, m.step)
+            for m, keep, r in zip(members, solved["keep"], solved["residual"])
+            if not keep and r < floor
+        }
+    return jit
 
 
 def _solve(x: np.ndarray, y: np.ndarray, names: list[str]) -> dict:
@@ -458,8 +501,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     """The law over `samples`, as the mapping `StepLinearLaw` reads, and its report.
 
     `options` takes `form` (`base` by default) and `dp`, the ranks each run
-    holds (1 by default); `seed` fixes the `rowmod` shuffles; `draft` adds
-    `seqs` and `out` to the prefill vector.
+    holds (1 by default); `seed` fixes the `rowmod` shuffles; `draft`, or a
+    sample with a draft label, adds `seqs` and `out` to the prefill vector.
     """
     from scipy.spatial import QhullError
 
@@ -473,7 +516,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         for k, v in c.items():
             cut[k] = cut.get(k, 0) + v
     prefill = list(HISTORY if form == "history" else PREFILL) + ["moe_rows"] * (dp > 1)
-    prefill += ["seqs", "out"] * draft
+    prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
     rows, alternation = _slowest(groups, prefill)
     law = {
         "provenance": f"step_linear_fit {form} on {len(runs) * dp} real records "

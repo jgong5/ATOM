@@ -11,6 +11,7 @@ import json
 
 import pytest
 
+from atom.compass.backends import step_labels
 from atom.compass.backends.step_labels import label
 from atom.compass.backends.step_linear import DECODE, PREFILL
 from atom.compass.parity import recurrence
@@ -333,6 +334,47 @@ def test_the_script_grades_a_record_on_a_law_and_names_its_refusals(tmp_path, ca
     law.write_text(json.dumps(_law(decode=False)))
     assert recurrence.main(str(tmp_path), law=str(law)) == 1
     assert "decode: 2 steps the law refuses" in capsys.readouterr().out
+
+
+def _compiled(stall_ms=5):
+    """`record()` with the output prefill's launch `stall_ms` longer, a
+    first-use compile, and every later stamp as late."""
+    steps, stall = record(), stall_ms * MS
+    steps[2]["t_launch_ns"][1] += stall
+    later = [(steps[2], ("t_recv_ns", "t_exit_ns"))] + [
+        (s, ("t_enter_ns", "t_gate_ns", "t_launch_ns", "t_recv_ns", "t_exit_ns"))
+        for s in steps[3:]
+    ]
+    for s, keys in later:
+        for k in keys:
+            s[k] = [t + stall for t in s[k]] if isinstance(s[k], list) else s[k] + stall
+    return steps
+
+
+def test_a_jit_forward_and_the_one_after_it_are_charged_and_reported_not_graded(
+    tmp_path,
+):
+    steps = _compiled()
+    samples = _labelled(tmp_path, steps)
+    report = recurrence.priced(steps, samples, _law(), jit={2})
+    assert set(report["kinds"]) == {"idle", "middle", "decode"}
+    assert report["kinds"]["decode"][0] == 1
+    assert all(k[-1] for k in report["kinds"].values())
+    assert report["jit"] == (1, pytest.approx(5e-3, rel=1e-9))
+    # Graded, the compile fails the output prefill.
+    assert not recurrence.priced(steps, samples, _law())["kinds"]["prefill"][-1]
+
+
+def test_the_script_reports_the_jit_forwards_the_law_s_host_fit_names(tmp_path, capsys):
+    steps = _compiled()
+    _labelled(tmp_path, steps)
+    run = step_labels.digest(tmp_path / "dp0.jsonl")
+    law = tmp_path / "law.json"
+    law.write_text(json.dumps(_law() | {"host_fit": {"jit_steps": {run: [2]}}}))
+    recurrence.main(str(tmp_path), law=str(law))
+    assert "jit: 1 forwards and the one after each not graded, 0.005 s" in (
+        capsys.readouterr().out
+    )
 
 
 def test_a_forward_past_warm_factor_times_its_charge_is_not_graded(tmp_path):

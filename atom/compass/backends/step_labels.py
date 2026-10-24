@@ -16,9 +16,15 @@ rebuilds `moe_tokens` from every rank's line, and no step is split.
 A step's device label is its device busy time, `d_busy_ns`, plus for a decode
 step the device work queued since the previous forward's exit, `d_gap_ns`. A
 decode step whose device start precedes its host launch end is launch-exposed
-and cut; a prefill step is never cut, so a host bubble inside it stays in its
-label. On an MTP record, one with `d_target_ns`, the device label is the
-target's, `d_target_ns` with no gap, and the draft label is the rest of
+and cut. A prefill step is cut as host-paced when its exit event ran less than
+`PACED_SHARE` of its device label after the host recorded it: the device had
+caught up with the host's launch, so the window holds device idle between
+launches and only bounds the device time. A device event runs no earlier than
+the host records it, so the largest launch record less its device start, over
+the record, is the host clock's lead there. A host bubble in a prefill whose
+device stays behind the host stays in its label. On an MTP record, one with
+`d_target_ns`, the device label is the target's, `d_target_ns` with no gap,
+and the draft label is the rest of
 `d_busy_ns`. On a prefill step that produces output, the draft label's
 `propose` pass, `d_propose_ns`, is also its propose label. The exit of each
 wait for the previous output's token copy (`t_recv_ns`)
@@ -69,8 +75,13 @@ from atom.compass.backends.shape import BatchView, RequestShape
 
 #: Token copy wait exits whose tightest bound is a step's host clock lead.
 ANCHORS = 32
-#: Why a device label is cut: a launch-exposed decode, mixed rows, no MTP target end.
-CUTS = ("exposed", "mixed", "unsplit")
+#: Why a device label is cut: a launch-exposed decode, mixed rows, no MTP target
+#: end, a host-paced prefill.
+CUTS = ("exposed", "mixed", "unsplit", "paced")
+#: A prefill's exit event running less than this share of its device label after
+#: its host record makes it host-paced: between the two clusters the DSpark TP2
+#: records show, host-paced output prefills at 0 to 4.3%, device-paced at 11% up.
+PACED_SHARE = 0.08
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
 TABLE_VERSION = 1
 #: run.json's entry naming the aiter JIT modules its server built while it
@@ -139,8 +150,9 @@ def host_kind(view: BatchView) -> str:
     return "prefill" if view.prefill else "decode"
 
 
-def _launch_exposed(lines) -> set[int]:
-    """The steps whose device start precedes their host launch end."""
+def _host_cut(lines) -> tuple[set[int], set[int]]:
+    """The steps whose device start precedes their host launch end, and the
+    prefill steps the host paced."""
     device, output_end, timed = 0, None, []
     for s in lines:
         if "d_busy_ns" not in s:
@@ -165,7 +177,15 @@ def _launch_exposed(lines) -> set[int]:
             recent.append(bound)
         if start + min(recent, default=first) < s["t_launch_ns"][1]:
             exposed.add(s["step"])
-    return exposed
+    lead = max(s["t_launch_ns"][0] - start for s, start, _ in timed)
+    paced = {
+        s["step"]
+        for s, start, _ in timed
+        if not all(r[2] for r in s["rows"])
+        and start + s["d_busy_ns"] + lead - s["t_exit_ns"]
+        < PACED_SHARE * s.get("d_target_ns", s["d_busy_ns"])
+    }
+    return exposed, paced
 
 
 def join_stamps(steps: list[dict], path) -> None:
@@ -248,7 +268,7 @@ def _label(record, lines, run, starts) -> tuple[list[Sample], list[dict]]:
             f"{record} has no device windows (`d_busy_ns`); a fit labels a step "
             "by its device time"
         )
-    exposed = _launch_exposed(lines)
+    exposed, paced = _host_cut(lines)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
     config = read_json(key) if key.exists() else None
@@ -279,6 +299,8 @@ def _label(record, lines, run, starts) -> tuple[list[Sample], list[dict]]:
             cut = "mixed"
         elif not view.prefill and s["step"] in exposed:
             cut = "exposed"
+        elif view.prefill and s["step"] in paced:
+            cut = "paced"
         elif mtp and "d_target_ns" not in s:
             cut = "unsplit"
         gap = 0 if view.prefill else s.get("d_gap_ns", 0)
