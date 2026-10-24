@@ -810,6 +810,27 @@ def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
     assert stub._plan(rope, [{"rope": "0"}], kv, 4, 2) == (3, 48, 1, [0, 0])
 
 
+@pytest.mark.parametrize("tokens", [1, 16, 256])
+def test_a_named_module_s_rope_tables_add_a_row_a_token_not_their_span(tokens):
+    # Qwen's mrope leaf names its rotary module: cos and sin tables of 1000
+    # positions, 32 bf16 a row, read at each token's position, beside a buffer
+    # it reads whole.
+    rope = torch.nn.Module()
+    for name in ("cos_cache", "sin_cache"):
+        rope.register_buffer(name, torch.zeros(1000, 1, 1, 32, dtype=torch.bfloat16))
+    rope.register_buffer("other", torch.zeros(3))
+    runner = _Runner()
+    runner.model.append(rope)
+    op = {"op": "x", "args": {"rotary_emb": {"module": None}}}
+
+    _, size, _, _ = ops.Stub(runner, 50)._plan(
+        op, [{"rotary_emb": "2"}], {}, 4, 2, tokens
+    )
+
+    # 64 bytes a token from each table and 12 of the other; by span, 128012.
+    assert size == 2 * 64 * tokens + 12
+
+
 def test_a_context_module_with_no_kv_layer_is_sized_by_its_own_tensors(monkeypatch):
     # DeepSeek-V4's Indexer: bound by its layer name, its pool on itself, no
     # layer_num and no entry in ATOM's KV registry.
@@ -1139,6 +1160,41 @@ def test_a_state_only_leaf_counts_each_slot_its_copies_read_once(
     # copies take 2 of their 4 placements.
     assert record["footprint_bytes"] == footprint
     assert {slot for _, slot in runner.batches} == {0, 2, 4, 6}
+
+
+def test_a_kv_leaf_past_its_cold_copies_counts_each_copy_s_activations_once(
+    monkeypatch,
+):
+    # update_compressor_states in 10 layers: 32 bytes of kv and two states of
+    # 128 a call, 7 copies past twice 1000. The 10 layers take 10 copies on one
+    # placement, and copies 7 to 9 read copies 0 to 2's kv.
+    runner = _Runner()
+    runner.pool_plan = SimpleNamespace(entries={"state": 8})
+    runner.kv_held = _state((16,))
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    state = _t([8, 16], "kv", stride=[64, 1])
+    args = ("kv", _t([2, 4], "activation")), ("kv_state", state), ("score", state)
+    leaf = _leaf("v4.states", *args, ("layer", ir.ContextRef(KEY)), key=KEY)
+    found = ops.leaves(_graph(leaf, layers=10)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+    graphs = []
+
+    def replay(fn, calls):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        [record] = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+
+    kvs = [kwargs["kv"] for kwargs, _ in graphs[0][:10]]
+    assert len({id(kv) for kv in kvs}) == 7
+    assert all(kv is kvs[c % 7] for c, kv in enumerate(kvs))
+    assert (record["copies"], record["placements"]) == (10, 1)
+    assert record["footprint_bytes"] == 7 * 32 + 256
 
 
 def test_a_block_view_beside_state_slots_counts_once_a_placement(monkeypatch):

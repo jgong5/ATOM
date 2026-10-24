@@ -17,6 +17,8 @@ a second over the steps priced; per granularity, the cells ranked by those
 tokens a second, its first (top-1) and first three (top-3); and each field of
 SPEC whose origin is `assumed` that a price read, with its value, and for an
 assumed arch the compute units and stepping its op_graphs were traced at.
+Its `band` re-prices every cell at 0.8 and 1.2 times each carried ratio a price
+read, one at a time (`band`), and ranks the cells again.
 
 `projected` is the method that makes SPEC for a device that never ran, applied
 to one that did, for `validate bound --ratios-from`.
@@ -27,6 +29,7 @@ import datetime
 import hashlib
 import json
 import multiprocessing
+import os
 from pathlib import Path
 
 from atom.compass.artifacts import (
@@ -106,14 +109,14 @@ class Reads:
         return getattr(self.spec, name)
 
 
-def cell(model: str, tp: int, machine: str, store: str, record: str, atom_args):
-    """One cell priced at both granularities on the spec at `machine`: its
-    report per granularity, the model's and engine's identity, its step
+def cell(model: str, tp: int, machine: dict, store: str, record: str, atom_args):
+    """One cell priced at both granularities on the spec document `machine`:
+    its report per granularity, the model's and engine's identity, its step
     records' digest and the spec fields its prices read."""
     from atom.compass.run import _file_digest
     from atom.compass.run.step_grid import keyed
 
-    spec = Reads(MachineSpec.from_mapping(json.loads(Path(machine).read_text())))
+    spec = Reads(MachineSpec.from_mapping(machine))
     config, _, priced = bound.backends(model, tp, atom_args, spec, store, [record])
     report = bound.gate(
         [record], priced, config.enable_tbo, config.speculative_config is not None
@@ -136,10 +139,68 @@ def cell(model: str, tp: int, machine: str, store: str, record: str, atom_args):
 
 
 def _each(jobs: list) -> list:
-    """`cell` of each job, each in a process of its own."""
+    """`cell` of each job, each in a process of its own, as many at once as
+    this process may use CPUs."""
     spawn = multiprocessing.get_context("spawn")
-    with spawn.Pool(len(jobs), maxtasksperchild=1) as pool:
-        return pool.starmap(cell, jobs)
+    width = max(1, min(len(jobs), len(os.sched_getaffinity(0))))
+    with spawn.Pool(width, maxtasksperchild=1) as pool:
+        return pool.starmap(cell, jobs, chunksize=1)
+
+
+def _ranked(cells: dict) -> dict:
+    """Per granularity, the cells by tokens a second, fastest first, and
+    their first (top-1) and first three (top-3)."""
+    ranking = {}
+    for level in ("step", "op"):
+        rates = {r: c["levels"][level]["tokens_per_s"] for r, (_, c) in cells.items()}
+        order = sorted((r for r, t in rates.items() if t), key=lambda r: -rates[r])
+        ranking[level] = {"order": order, "top_1": order[:1], "top_3": order[:3]}
+    return ranking
+
+
+def scaled(machine: MachineSpec, path: str, factor: float):
+    """`machine` with the ratio at `path` times `factor`, capped at 1, the
+    datasheet; for the bandwidth curve, each point's rate over the datasheet
+    bandwidth. Also whether the cap applied."""
+    values = dict(machine.values)
+    if path == CURVE:
+        top = machine.value(BANDWIDTH)
+        curve = [[size, rate * factor] for size, rate in machine.value(CURVE)]
+        capped = any(rate > top for _, rate in curve)
+        values[CURVE] = [[size, min(rate, top)] for size, rate in curve]
+    else:
+        capped = machine.value(path) * factor > 1
+        values[path] = min(machine.value(path) * factor, 1.0)
+    return MachineSpec(values, machine.tokenizers), capped
+
+
+def band(machine: MachineSpec, assumed: dict, jobs: list, base: dict) -> dict:
+    """Each carried ratio a price read (an assumed derate, or the bandwidth
+    curve over the datasheet bandwidth) at 0.8 and 1.2 times its value, the
+    others held: per factor, whether the cap applied, the cells ranked, and
+    per granularity whether the order of `base`, the ranking at the carried
+    values, holds. A carried value no datasheet states a peak for, as the
+    kernel floor or a link latency, is no ratio."""
+    ratios = [p for p in assumed if p == CURVE or "derate" in p.split(".")]
+    specs = [(p, f, *scaled(machine, p, f)) for p in ratios for f in (0.8, 1.2)]
+    results = iter(
+        _each([(*j[:2], s.echo(), *j[3:]) for _, _, s, _ in specs for j in jobs])
+    )
+    out = {}
+    for path, factor, _, capped in specs:
+        cells = {j[4]: (None, next(results)) for j in jobs}
+        ranking = _ranked(cells)
+        holds = {k: ranking[k]["order"] == base[k]["order"] for k in ranking}
+        out.setdefault(path, {})[str(factor)] = {
+            "capped": capped,
+            "ranking": ranking,
+            "order_holds": holds,
+            "tokens_per_s": {
+                k: {r: c["levels"][k]["tokens_per_s"] for r, (_, c) in cells.items()}
+                for k in ranking
+            },
+        }
+    return out
 
 
 def projection(machine: MachineSpec, cells: dict) -> dict:
@@ -155,11 +216,6 @@ def projection(machine: MachineSpec, cells: dict) -> dict:
     if arch := assumed.get("device.arch"):
         assumed["capture.compute_units"] = DEVICES[arch][0]
         assumed["capture.revision"] = REVISIONS.get(arch, 0)
-    ranking = {}
-    for level in ("step", "op"):
-        rates = {r: c["levels"][level]["tokens_per_s"] for r, (_, c) in cells.items()}
-        order = sorted((r for r, t in rates.items() if t), key=lambda r: -rates[r])
-        ranking[level] = {"order": order, "top_1": order[:1], "top_3": order[:3]}
     return {
         "machine": {"name": machine.values["name"], "digest": machine.digest()},
         "assumed": assumed,
@@ -167,7 +223,7 @@ def projection(machine: MachineSpec, cells: dict) -> dict:
             r: {"atom_args": a, "engine": c["engine"], **c["levels"]}
             for r, (a, c) in cells.items()
         },
-        "ranking": ranking,
+        "ranking": _ranked(cells),
     }
 
 
@@ -232,6 +288,23 @@ def text(document: dict) -> str:
                 f"refused, {rate} tokens/s; {phases}"
             )
             out += [f"    refused {n} steps: {why}" for why, n in r["refused"].items()]
+    for path, factors in document["band"].items():
+        for factor, b in factors.items():
+            cap = ", capped at 1" if b["capped"] else ""
+            out.append(f"{path} x{factor}{cap}:")
+            for level, k in b["ranking"].items():
+                holds = "holds" if b["order_holds"][level] else "changes"
+                out.append(
+                    f"  {level} level: top-1 {k['top_1']}, top-3 {k['top_3']}; "
+                    f"the order {holds}"
+                )
+    for level, k in document["ranking"].items():
+        moved = [
+            p
+            for p, factors in document["band"].items()
+            if any(b["ranking"][level]["top_1"] != k["top_1"] for b in factors.values())
+        ]
+        out.append(f"{level} level: top-1 changed at 0.8 or 1.2 of {moved or 'none'}")
     return "\n".join(out)
 
 
@@ -250,15 +323,15 @@ def main(argv: list[str]) -> None:
     groups = [argv[i + 1 : j] for i, j in zip(cuts, [*cuts[1:], len(argv)])]
     if not groups or not all(groups):
         p.error("name each cell after its own --: -- RECORD [ATOM args]")
-    jobs = [
-        (args.model, args.tp, args.machine, args.store, g[0], g[1:]) for g in groups
-    ]
+    echo = json.loads(Path(args.machine).read_text())
+    jobs = [(args.model, args.tp, echo, args.store, g[0], g[1:]) for g in groups]
     results = _each(jobs)
     cells = {g[0]: (g[1:], c) for g, c in zip(groups, results)}
     if len({c["model"] for _, c in cells.values()}) > 1:
         raise ValueError("the cells ran different models; a projection ranks one")
-    machine = MachineSpec.from_mapping(json.loads(Path(args.machine).read_text()))
+    machine = MachineSpec.from_mapping(echo)
     document = projection(machine, cells)
+    document["band"] = band(machine, document["assumed"], jobs, document["ranking"])
     print(text(document))
     key = publish(args.store, document, cells, machine, " ".join([PROG, *argv]))
     print(f"published {key} as {key.token()}")

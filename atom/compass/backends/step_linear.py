@@ -13,6 +13,9 @@ A prefill vector may add `history`, Sum (N_KV - N_Q): the KV a chunk reads
 on its cached history, which a short chunk on a deep history pays apart from
 its attention arithmetic, and then `moe_rows`, the rows the data-parallel
 group's MoE gather carries (`BatchView.moe_rows`), which every rank's MoE runs on.
+After `moe_rows` it may add `serial_moe_rows`: `moe_rows` on a step the group did
+not split for two-batch overlap (`BatchView.tbo_tokens` None), else 0, the MoE
+rows no second micro-batch overlaps.
 
 A law prices one rank's step; the runner takes the group's step as the max
 over its ranks. Its parallel layout is its `engine_config`'s, which a run
@@ -159,7 +162,7 @@ class StepLinearLaw:
             prefill = law["prefill"]
             extra = [
                 f
-                for f in ("history", "moe_rows", "seqs", "out")
+                for f in ("history", "moe_rows", "serial_moe_rows", "seqs", "out")
                 if f in prefill["coefficients"]
             ]
             self.prefill = _Vector("prefill", PREFILL + tuple(extra), prefill)
@@ -232,6 +235,8 @@ class StepLinearBackend(CostBackend):
                 if batch_view.moe_rows is None:
                     raise self._refuse(batch_view, "no MoE gather rows on this step")
                 counts += (batch_view.moe_rows,)
+            if "serial_moe_rows" in vector.features:
+                counts += (0 if batch_view.tbo_tokens else batch_view.moe_rows,)
             output = batch_view.produces_output
             by_output = {
                 "seqs": len(prefill) if output else 0,
