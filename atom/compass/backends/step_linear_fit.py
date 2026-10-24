@@ -240,7 +240,7 @@ def fit_host(samples) -> tuple[dict, dict]:
             "host laws are fitted under one"
         )
     jit = _jit(samples)
-    after = {(run, rank, n + 1) for run, rank, n in jit}
+    after = {(run, rank, n + 1) for run, rank, n in sorted(jit)}
     rows = _host_rows(
         s for s in samples if (s.provenance["run"], s.rank, s.step) not in jit | after
     )
