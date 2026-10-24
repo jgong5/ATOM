@@ -1245,30 +1245,36 @@ def test_a_rope_table_adds_a_row_a_token_not_its_span(monkeypatch, shape, footpr
 
 
 @pytest.mark.parametrize(
-    "name, table, ids, role",
+    "name, table, ids, role, n, copies, footprint",
     [
-        ("aten.embedding.default", "weight", "indices", "metadata"),
+        ("aten.embedding.default", "weight", "indices", "metadata", 2, 51, 51 * 40),
         (
             "atom.model_ops.triton_hash_topk:hash_topk_triton",
             "tid2eid",
             "ids",
             "activation",
+            16,
+            7,
+            7 * 320,
         ),
     ],
 )
 def test_a_gathered_table_s_copies_read_disjoint_rows_of_one_table(
-    monkeypatch, name, table, ids, role
+    monkeypatch, name, table, ids, role, n, copies, footprint
 ):
-    # A 1000-row table of 16 bytes a row, read at a decode's 2 token ids: 32
-    # bytes of rows and 8 of ids a call, 51 copies past twice 1000 bytes. By
-    # span, the table's 16000 bytes made one copy, every call the same rows.
+    # A 1000-row table of 16 bytes a row, read at a decode of 2 rows: the
+    # embedding by its 2 token ids, 32 bytes of rows and 8 of ids a call, 51
+    # copies past twice 1000 bytes; the hash router by 8 ids a row, 256 and
+    # 64, 7 copies. By span, the table's 16000 bytes made one copy, every call
+    # the same rows. The leaf occurs 64 times, more than its copies: the table
+    # stays one weight, not one an occurrence.
     monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
     leaf = _leaf(
         name,
         (table, _t([1000, 4], "weight")),
-        (ids, _t([2], role, dtype="torch.int32")),
+        (ids, _t([n], role, dtype="torch.int32")),
     )
-    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    found = ops.leaves(_graph(leaf, layers=64)["region"])
     placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
     graphs = []
 
@@ -1283,11 +1289,13 @@ def test_a_gathered_table_s_copies_read_disjoint_rows_of_one_table(
     ):
         [record] = ops.Stub(_Runner(), 1000).point(placed, decode(2), 20, found)
 
+    assert record.get("refused") is None
     cold = graphs[0]
-    read = torch.cat([c[ids] for c in cold[:51]])
-    assert (record["copies"], record["footprint_bytes"]) == (51, 51 * 40)
+    read = torch.cat([c[ids] for c in cold[:copies]])
+    assert (record["copies"], record["footprint_bytes"]) == (copies, footprint)
     assert len({id(c[table]) for c in cold}) == 1
-    assert read.unique().numel() == 102 and 0 <= read.min() <= read.max() < 1000
+    assert read.unique().numel() == copies * n
+    assert 0 <= read.min() <= read.max() < 1000
 
 
 def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
