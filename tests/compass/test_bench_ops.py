@@ -1975,6 +1975,30 @@ def test_the_barriers_all_reduce_ends_before_a_calls_kernels_are_profiled(
     assert order == ["all-reduce", "wait", "profile", "call", "wait"]
 
 
+@pytest.mark.parametrize(
+    "profiles, got",
+    [
+        ([["nccl"], ["bmm"], ["bmm"]], ["bmm"]),  # all-reduce kept, call dropped
+        ([[], ["bmm"], ["bmm"]], ["bmm"]),  # the call's kernel dropped
+        ([[], []], []),  # a view launches none
+        ([["a"], ["b"], ["a"], ["b"]], None),
+    ],
+)
+def test_a_calls_kernels_are_what_two_profiles_in_a_row_name(
+    profiles, got, monkeypatch
+):
+    # ROCm's profiler, under load, can drop a call's kernel from its profile and
+    # keep the barrier's all-reduce in its place
+    left = iter(profiles)
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (next(left), 1.0))
+
+    if got is None:
+        with pytest.raises(ValueError, match="no two profiles in a row of 4"):
+            ops._identity(None, {})
+    else:
+        assert ops._identity(None, {}) == (got, 1.0)
+
+
 def test_a_batch_takes_the_blocks_and_slots_it_is_placed_at(rule):  # noqa: F811
     line = _line([[1, 40, True], [1, 17, True]])
 
