@@ -4351,6 +4351,54 @@
    "mechanism_why": "the server is stopping; serve refuses a run file and a clock, in ATOM's arguments and in the environment, so its server is a real one and the command is no LP, and the bound only decides when SIGTERM gives way to SIGKILL"
   },
   {
+   "id": "atom/compass/drive/record.py::main::busy.reduce(args.out)::collective#0",
+   "file": "atom/compass/drive/record.py",
+   "symbol": "main",
+   "call": "busy.reduce",
+   "expr": "busy.reduce(args.out)",
+   "shape": "collective",
+   "peer": "none",
+   "why": "the record command reduces a trace run's kernel traces to its busy lines once its server has stopped; nothing is sent",
+   "mechanism": "K9",
+   "mechanism_why": "file arithmetic in the measuring command after its server stopped, which cannot park"
+  },
+  {
+   "id": "atom/compass/drive/serve.py::serve::server.poll()::poll#2",
+   "file": "atom/compass/drive/serve.py",
+   "symbol": "serve",
+   "call": "server.poll",
+   "expr": "server.poll()",
+   "shape": "poll",
+   "peer": "process",
+   "why": "the serve command asks whether its server has exited, while it waits for /health to answer and then while the server serves",
+   "mechanism": "K9",
+   "mechanism_why": "a process poll returns at once and cannot park; serve refuses a run file and a clock, in ATOM's arguments and in the environment, so its server is a real one and the command is no LP"
+  },
+  {
+   "id": "atom/compass/parity/busy.py::events::while True::spin_loop#0",
+   "file": "atom/compass/parity/busy.py",
+   "symbol": "events",
+   "call": "while True",
+   "expr": "while True",
+   "shape": "spin_loop",
+   "peer": "none",
+   "why": "a trace reader's loop over one file's events; it consumes its input and returns, and parks on nothing",
+   "mechanism": "K9",
+   "mechanism_why": "a loop over a file in a measuring command, which cannot park"
+  },
+  {
+   "id": "atom/compass/parity/busy.py::main::reduce(p.parse_args(argv).out)::collective#0",
+   "file": "atom/compass/parity/busy.py",
+   "symbol": "main",
+   "call": "reduce",
+   "expr": "reduce(p.parse_args(argv).out)",
+   "shape": "collective",
+   "peer": "none",
+   "why": "the busy command reduces a trace run's kernel traces to its busy lines; nothing is sent",
+   "mechanism": "K9",
+   "mechanism_why": "file arithmetic in a measuring command, which cannot park"
+  },
+  {
    "id": "atom/compass/capture/driverless.py::group.broadcast::functional.broadcast(tensor, src, group or dist.group.WORLD)::collective#0",
    "file": "atom/compass/capture/driverless.py",
    "symbol": "group.broadcast",
