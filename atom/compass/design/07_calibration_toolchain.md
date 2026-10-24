@@ -375,6 +375,15 @@ neighbours, is [`09` D60](09_fitting_and_law_selection.md#d60-cost-is-piecewise-
 Full-engine steps, TP1. Produces the step-level backends' measurements and the real runs
 the host laws are fitted on.
 
+**The trace run** ([#2072](https://github.com/jgong5/ATOM/issues/2072)): a second run of
+a record's recipe and client, `compass record --trace`, under ATOM's kineto profiler on
+every TP rank without Python stacks, from before the first request to the server's stop.
+`atom/compass/parity/busy.py` reduces its traces to each forward's busy time per pass,
+which labels prefill (`09` D54); its decodes and host segments are profiled and label
+nothing. The recorder marks where a forward's target ends and each drafter pass runs with
+profiler ranges, opened only while the profiler runs. Every trace run carries `09`'s
+profiler check.
+
 **Revised 2026-10-18 by the owner's ruling on
 [#1489](https://github.com/jgong5/ATOM/issues/1489):** Phase 1c produces nothing the
 op-level backend reads. That backend has no region terms and no residual correction: it
@@ -622,6 +631,8 @@ each server in steps 2, 3 and 6 serves the client runs a client started apart se
        -> memory_readings for this configuration
  2.  compass record ... -- <ATOM args>                     [GPU, a server]
        -> step records, split per client run; run.json with the engine's bounds
+     compass record --trace ... -- <ATOM args>             [GPU, a server, the same client]
+       -> a trace run: the record's prefill passes' busy time (D38, Phase 1c)
  3.  compass trace steps <backend> --machine M ... -- <ATOM args>   [CPU, a server]
        -> shape_population, keyed by the backend that priced it
  4.  compass measure steps <records> --grid <populations> ...       [GPU]

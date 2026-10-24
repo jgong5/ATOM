@@ -41,6 +41,7 @@ from pathlib import Path
 
 import atom
 from atom.compass import parity
+from atom.compass.backends.step_labels import TRACE
 from atom.compass.drive.gpu import KFD, hip_visible, quiet
 from atom.compass.drive.identity import identity
 from atom.compass.run import ATOM_ARGS, CLOCK_ENV, ENV, OP_GRAPH, _write_whole
@@ -58,8 +59,17 @@ OWNED = (
     "--compass-clock-endpoint",
     "--data-parallel-master-port",
 )
-#: ATOM's profiler: only a profiled pass may time ops, and no command runs one yet.
+#: ATOM's profiler, which the driver points at `TRACE` for a trace run alone.
 PROFILER = "--torch-profiler-dir"
+#: A trace run's profiler: kernels and ranges, no Python stacks, shapes or
+#: memory; and the seconds its stop, which writes every rank's trace, may take.
+TRACE_STOP_S = 3600
+TRACE_ENV = {
+    "ATOM_PROFILER_WITH_STACK": "0",
+    "ATOM_PROFILER_RECORD_SHAPES": "0",
+    "ATOM_PROFILER_PROFILE_MEMORY": "0",
+    "ATOM_PROFILER_TIMEOUT": str(TRACE_STOP_S),
+}
 #: As `cctraces_sim.sh` sets it, so a pooling client's idle connection is not
 #: closed under it; before ATOM's arguments, so one there wins.
 KEEP_ALIVE = ("--timeout-keep-alive", "1000000")
@@ -89,7 +99,14 @@ class ServeError(ValueError):
 
 
 def serve(
-    atom_args, out, gpus=(), run=None, extra_env=None, host=HOST, joined=False
+    atom_args,
+    out,
+    gpus=(),
+    run=None,
+    extra_env=None,
+    host=HOST,
+    joined=False,
+    trace=False,
 ) -> None:
     """Serve one instance from ATOM's arguments `atom_args`, writing to the
     directory `out`, until SIGINT or SIGTERM or the server's exit.
@@ -99,7 +116,9 @@ def serve(
     here, or, `joined`, kept: the server joins the authority its
     ``clock_endpoint`` names, which reads the hand-ins in its ``out_dir``. The
     server binds `host`, which its URL names. `extra_env` maps variables the
-    server's environment holds over the command's. Raises `ServeError` when
+    server's environment holds over the command's. A real server under `trace`
+    runs ATOM's profiler on every rank into `out`'s `TRACE` directory, started
+    before `READY_FILE` is written and stopped before the server is. Raises `ServeError` when
     the server exits before ``/health`` answers, or on its own with a non-zero
     status, and `GpuRefusal` from the GPU checks. Once the server has stopped,
     writes run.json from the engine file, and raises `ServeError` when no step
@@ -111,6 +130,10 @@ def serve(
         raise ServeError(
             "a server is real, on the GPUs it names, or simulated, from a run "
             f"file, exactly one; got gpus={gpus} and a run file: {run is not None}"
+        )
+    if trace and run is not None:
+        raise ServeError(
+            "a trace run profiles a real server, and this one is simulated"
         )
     out = Path(out)
     if out.exists() and any(out.iterdir()):
@@ -128,6 +151,9 @@ def serve(
     )
     env[parity.ENV] = str(out / STEPS)
     env["ATOM_DP_MASTER_PORT"] = str(dp_port)
+    if trace:
+        argv += [PROFILER, str(out / TRACE)]
+        env.update(TRACE_ENV)
     if run is None:
         env["HIP_VISIBLE_DEVICES"] = hip_visible(gpus)
     else:
@@ -161,10 +187,14 @@ def serve(
                     )
                 time.sleep(POLL_S)
             if not stopped:
+                if trace:
+                    _post(host, server_port, "/start_profile", STOP_GRACE_S)
                 ready["pid"] = server.pid
                 _write_whole(out / READY_FILE, json.dumps(ready))
             while not stopped and server.poll() is None:
                 time.sleep(POLL_S)
+            if trace and "pid" in ready and server.poll() is None:
+                _post(host, server_port, "/stop_profile", TRACE_STOP_S)
         finally:
             _stop(server.pid, kfd)
             server.wait()
@@ -202,7 +232,7 @@ def _refuse(atom_args) -> None:
         if any(f.startswith(flag) for f in OWNED):
             raise ServeError(f"{arg} is among ATOM's arguments; the driver owns it")
         if PROFILER.startswith(flag):
-            raise ServeError(f"{arg} profiles the server, and only a profiled pass may")
+            raise ServeError(f"{arg} profiles the server, which only a trace run does")
 
 
 def _free_ports(n: int) -> list[int]:
@@ -225,6 +255,18 @@ def _free_ports(n: int) -> list[int]:
     finally:
         for s in held:
             s.close()
+
+
+def _post(host: str, port: int, path: str, timeout: float) -> None:
+    """POST `path` to the server; a reply other than 200 raises `ServeError`."""
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.request("POST", path)
+        reply = conn.getresponse()
+        if reply.status != 200:
+            raise ServeError(f"{path} answered {reply.status}: {reply.read()[:300]!r}")
+    finally:
+        conn.close()
 
 
 def _answers(host: str, port: int) -> bool:

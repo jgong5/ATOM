@@ -12,6 +12,9 @@ A record refuses, before any table is written, when the run.json beside the
 `steps` directory its path resolves into names aiter JIT builds
 (`step_labels.refusal`).
 A step whose device label is cut is counted under its reason and not fitted.
+Prefill labels come from trace runs alone (`step_labels`); given none, the
+prefill vector is left out and named under `unfitted`. A trace run gives no
+decode or host label, so its record fits only prefill.
 `fit` and `fit_host` take the labelled samples, grouped into runs by their
 provenance's `run`, and each returns its laws and a report. `fit`'s report
 holds the runs it was fitted on, each vector's fit figures and hull, and, once
@@ -562,7 +565,11 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             r for r in rows if r[1] == key or (key is None and r[1] != "prefill")
         ]
         if not members:
-            law["unfitted"][key] = f"0 steps for {len(names)} coefficients"
+            law["unfitted"][key] = (
+                "no prefill step carries a trace run's busy time"
+                if key == "prefill"
+                else f"0 steps for {len(names)} coefficients"
+            )
             continue
         counts = np.array([r[2] for r in members], dtype=np.float64)
         x = counts

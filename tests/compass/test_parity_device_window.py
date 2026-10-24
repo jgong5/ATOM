@@ -220,7 +220,8 @@ def test_with_a_drafter_each_line_splits_its_device_window_at_the_target(
             stamps += [*step["t_draft_recv_ns"], step["t_exit_ns"]]
             assert stamps == sorted(stamps)
     # No step of the record is left without its target end.
-    assert {s.cut for s in label(tmp_path / "real" / "dp0.jsonl")[0]} <= {None, "mixed"}
+    cuts = {s.cut for s in label(tmp_path / "real" / "dp0.jsonl")[0]}
+    assert cuts <= {None, "mixed", "untraced"}
     # The drafter's timings are not part of a step's decision.
     first = compare(tmp_path / "real", tmp_path / "simulated")["first_divergence"]
     assert first == {0: None}

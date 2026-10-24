@@ -15,21 +15,10 @@ rebuilds `moe_tokens` from every rank's line, and, when its host key's engine
 states `enable_tbo`, the caller's `split_rule`, ATOM's two-batch-overlap split
 over those lines, rebuilds `tbo_tokens`; with no rule such a line refuses.
 
-A step's device label is its device busy time, `d_busy_ns`, plus for a decode
-step the device work queued since the previous forward's exit, `d_gap_ns`. A
-decode step whose device start precedes its host launch end is launch-exposed
-and cut. A prefill step is cut as host-paced when its exit event ran less than
-`PACED_SHARE` of its device label after the host recorded it: the device had
-caught up with the host's launch, so the window holds device idle between
-launches and only bounds the device time. A device event runs no earlier than
-the host records it, so the largest launch record less its device start, over
-the record, is the host clock's lead there. A host bubble in a prefill whose
-device stays behind the host stays in its label. On an MTP record, one with
-`d_target_ns`, the device label is the target's, `d_target_ns` with no gap,
-and the draft label is the rest of
-`d_busy_ns`. On a prefill step that produces output, the draft label's
-`propose` pass, `d_propose_ns`, is also its propose label. The exit of each
-wait for the previous output's token copy (`t_recv_ns`)
+A decode step's device label is its device busy time, `d_busy_ns`, plus the
+device work queued since the previous forward's exit, `d_gap_ns`. A decode step
+whose device start precedes its host launch end is launch-exposed and cut. The
+exit of each wait for the previous output's token copy (`t_recv_ns`)
 bounds the host clock's lead over the device's (that forward had finished by
 then); the tightest of the last `ANCHORS` bounds is the lead. The copy itself
 lands on its own stream after the exit event the bound reads, by 14 to 29 us
@@ -37,10 +26,22 @@ measured on one host (median 17 us), so each bound carries that much more lead
 than the clocks actually have; on the step linear law's records the gap never
 moves a decode step across the launch-exposed cut, so it is left in the bound
 rather than corrected by a host-specific number with no record or law of its
-own to carry it. A record without device windows is refused. A step mixing
-prefill and decode rows is cut.
-A step of an MTP record without `d_target_ns` is cut as `unsplit`: its device
-label would hold a draft the law prices again.
+own to carry it. On an MTP record, one with `d_target_ns`, the device label is
+the target's, `d_target_ns` with no gap, and the draft label is the rest of
+`d_busy_ns`.
+
+A prefill step's labels are a trace run's busy time per pass (`parity.busy`),
+which a trace run's record joins from `dp<r>.busy.jsonl` beside it: the device
+label `b_target_ns`, the draft label `b_draft_ns`, and on a step that produces
+output the propose label, the draft's `propose` pass, `b_propose_ns`. A window
+holds the device's idle between launches the host paced, so a prefill step
+without busy time is cut as `untraced`. A trace run, one whose run directory
+holds `TRACE`, ran under a profiler: its decode steps are cut as `traced` and
+its steps carry no host labels.
+
+A record without device windows is refused. A step mixing prefill and decode
+rows is cut. A step of an MTP record without `d_target_ns` is cut as
+`unsplit`: its device label would hold a draft the law prices again.
 
 A step's host labels are its segments: `E` from the previous forward's exit,
 cut as idle when the two batches share no request; `W_pre` to the launch, less
@@ -78,12 +79,10 @@ from atom.compass.backends.shape import BatchView, RequestShape
 #: Token copy wait exits whose tightest bound is a step's host clock lead.
 ANCHORS = 32
 #: Why a device label is cut: a launch-exposed decode, mixed rows, no MTP target
-#: end, a host-paced prefill.
-CUTS = ("exposed", "mixed", "unsplit", "paced")
-#: A prefill's exit event running less than this share of its device label after
-#: its host record makes it host-paced: between the two clusters the DSpark TP2
-#: records show, host-paced output prefills at 0 to 4.3%, device-paced at 11% up.
-PACED_SHARE = 0.08
+#: end, a prefill with no traced busy time, a trace run's decode.
+CUTS = ("exposed", "mixed", "unsplit", "untraced", "traced")
+#: The directory beside a trace run's `steps` its traces are in (`parity.busy`).
+TRACE = "trace"
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
 TABLE_VERSION = 1
 #: run.json's entry naming the aiter JIT modules its server built while it
@@ -152,9 +151,8 @@ def host_kind(view: BatchView) -> str:
     return "prefill" if view.prefill else "decode"
 
 
-def _host_cut(lines) -> tuple[set[int], set[int]]:
-    """The steps whose device start precedes their host launch end, and the
-    prefill steps the host paced."""
+def _exposed(lines) -> set[int]:
+    """The steps whose device start precedes their host launch end."""
     device, output_end, timed = 0, None, []
     for s in lines:
         if "d_busy_ns" not in s:
@@ -179,15 +177,7 @@ def _host_cut(lines) -> tuple[set[int], set[int]]:
             recent.append(bound)
         if start + min(recent, default=first) < s["t_launch_ns"][1]:
             exposed.add(s["step"])
-    lead = max(s["t_launch_ns"][0] - start for s, start, _ in timed)
-    paced = {
-        s["step"]
-        for s, start, _ in timed
-        if not all(r[2] for r in s["rows"])
-        and start + s["d_busy_ns"] + lead - s["t_exit_ns"]
-        < PACED_SHARE * s.get("d_target_ns", s["d_busy_ns"])
-    }
-    return exposed, paced
+    return exposed
 
 
 def join_stamps(steps: list[dict], path) -> None:
@@ -215,7 +205,21 @@ def _read(record) -> list[dict]:
     lines = read_jsonl(path)
     if (pulls := path.with_suffix(".pulls.jsonl")).exists():
         join_stamps(lines, pulls)
+    if (busy := path.with_suffix(".busy.jsonl")).exists():
+        got = {b.pop("step"): b for b in read_jsonl(busy)}
+        for s in lines:
+            s.update(got.get(s["step"], {}))
+    elif _traced(path):
+        raise ValueError(
+            f"{record} is a trace run's record with no {busy.name}; write it "
+            "with `python -m atom.compass.parity.busy`"
+        )
     return lines
+
+
+def _traced(record: Path) -> bool:
+    """Whether `record` is a trace run's: its run directory holds `TRACE`."""
+    return (record.parent.parent / TRACE).is_dir()
 
 
 def _pull(step: dict) -> int:
@@ -274,7 +278,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             f"{record} has no device windows (`d_busy_ns`); a fit labels a step "
             "by its device time"
         )
-    exposed, paced = _host_cut(lines)
+    exposed, traced = _exposed(lines), _traced(path)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
     config = read_json(key) if key.exists() else None
@@ -315,8 +319,10 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             cut = "mixed"
         elif not view.prefill and s["step"] in exposed:
             cut = "exposed"
-        elif view.prefill and s["step"] in paced:
-            cut = "paced"
+        elif not view.prefill and traced:
+            cut = "traced"
+        elif view.prefill and "b_target_ns" not in s:
+            cut = "untraced"
         elif mtp and "d_target_ns" not in s:
             cut = "unsplit"
         gap = 0 if view.prefill else s.get("d_gap_ns", 0)
@@ -325,8 +331,10 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
         if "d_target_ns" in s:  # an MTP record: the target alone, no gap
             device = None if cut else s["d_target_ns"] * 1e-9
             draft = (s["d_busy_ns"] - s["d_target_ns"]) * 1e-9
-            if view.prefill and view.produces_output:
-                propose = s.get("d_propose_ns")
+        if view.prefill and not cut:  # a trace run's busy time
+            device, draft = s["b_target_ns"] * 1e-9, s.get("b_draft_ns")
+            draft = None if draft is None else draft * 1e-9
+            propose = s.get("b_propose_ns") if view.produces_output else None
         enter, (l0, l1) = s["t_enter_ns"], s["t_launch_ns"]
         g0, g1 = s.get("t_gate_ns", (l0, l0))
         r0, r1 = s.get("t_recv_ns", (l1, l1))
@@ -344,7 +352,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
         idle = prev is not None and not _shared(s, prev)
         if prev is not None and not idle:
             host["E"] = enter - starts[i - 1]
-        host = {k: v * 1e-9 for k, v in host.items()}
+        host = {} if traced else {k: v * 1e-9 for k, v in host.items()}
         provenance = {
             "source": "record",
             "run": run,

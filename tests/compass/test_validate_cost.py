@@ -10,6 +10,7 @@ import json
 import re
 
 import pytest
+from test_backend_step_linear_fit import traced
 from test_op_graph import g
 from test_work import SPEC
 
@@ -103,7 +104,7 @@ def _record(directory, steps, stretch=None, idle_after=(), rank=0, group=None):
         )
         t += busy
     (directory / f"dp{rank}.jsonl").write_text(
-        "".join(json.dumps(x) + "\n" for x in lines)
+        "".join(json.dumps(traced(x)) + "\n" for x in lines)
     )
     return directory
 
@@ -113,7 +114,13 @@ def test_the_step_that_moves_the_total_is_held_out_and_the_spread_reported(tmp_p
     record = _record(tmp_path / "steps", _steps(), stretch={4: 0.2})
     report = cost_accuracy(record, LAW)
 
-    assert report["cut"] == {"exposed": 0, "mixed": 0, "unsplit": 0, "paced": 0}
+    assert report["cut"] == {
+        "exposed": 0,
+        "mixed": 0,
+        "unsplit": 0,
+        "untraced": 0,
+        "traced": 0,
+    }
     assert report["unvalidated"] == {} and report["refused"] == {}
     prefill = report["validated"]["prefill"]
     assert prefill["steps"] == 10
@@ -144,7 +151,13 @@ def test_unvalidated_and_refused_steps_are_reported_apart(tmp_path):
     record = _record(tmp_path / "steps", steps, stretch={3: 2.0})
     report = cost_accuracy(record, LAW)
 
-    assert report["cut"] == {"exposed": 0, "mixed": 0, "unsplit": 0, "paced": 0}
+    assert report["cut"] == {
+        "exposed": 0,
+        "mixed": 0,
+        "unsplit": 0,
+        "untraced": 0,
+        "traced": 0,
+    }
     (unvalidated,) = report["unvalidated"].values()
     assert unvalidated["steps"] == 1
     assert unvalidated["real_s"] == pytest.approx(2 * _price(wide[0]), rel=1e-9)
@@ -284,7 +297,8 @@ def test_a_group_step_prices_as_its_slowest_rank_against_the_group_s_time(tmp_pa
         "exposed": 0,
         "mixed": 0,
         "unsplit": 0,
-        "paced": 0,
+        "untraced": 0,
+        "traced": 0,
         "ranks": 0,
     }
     assert report["warm"] == [] and report["refused"] == {}
@@ -360,7 +374,8 @@ def test_a_peer_s_dummy_forward_is_priced_0_s_and_its_step_graded(tmp_path):
         "exposed": 0,
         "mixed": 0,
         "unsplit": 0,
-        "paced": 0,
+        "untraced": 0,
+        "traced": 0,
         "ranks": 0,
     }
     assert report["unvalidated"] == {} and report["refused"] == {}

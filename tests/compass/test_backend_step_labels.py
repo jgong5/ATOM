@@ -23,6 +23,7 @@ from test_backend_step_linear_fit import (
     _steps,
     _timed_record,
     _view,
+    busy_file,
 )
 from test_memory_readings import DOCUMENT, META_8B
 from test_parity_device_window import BUSY, GAP, _recorded
@@ -67,6 +68,7 @@ def _stamped(tmp_path, monkeypatch):
         runner.forward(batch)
     device.tick = BUSY // 3
     runner.exit()
+    busy_file(tmp_path / "real" / "dp0.jsonl")
     return tmp_path / "real" / "dp0.jsonl"
 
 
