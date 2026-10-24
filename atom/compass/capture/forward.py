@@ -40,10 +40,12 @@ drafter writes its draft KV before `forward_done_event` and is refused.
 A decode of fewer rows than its width ran padded to that rung: its rows run
 the drafter's first pass, which takes the target's tokens unpadded, and the
 step continues at the rung past the cut; only its drafter's graph is kept. A
-prefill whose drafter's later passes pad past its rows (`Shape.width`) samples,
-or under DP is a middle chunk too, and continues at that width past the cut;
-only its drafter's graph is kept.
-"""
+shape's `width` is the batch a step that replays no graph pads to past its
+rows, as `ForwardMode.decide` settles it from a ladder of that one width: a
+decode's model runs at it from its inputs, a prefill's LM head and its
+drafter's later passes at it, and each samples its rows. Under a drafter in DP
+a middle chunk runs those later passes at it too: only its drafter's graph is
+kept. A decode's drafter is kept from its own shape, at its rows."""
 
 import contextlib
 import copyreg
@@ -114,8 +116,8 @@ class Shape(NamedTuple):
     """A step's shape: `tokens` query tokens over `seqs` sequences, a decode's
     `tokens` its rows, fewer than `seqs` padded to a rung of `seqs`; under DP
     `gathered`, the rows the group's MoE gathers, None at every rank's `tokens`;
-    and a prefill's `width`, the batch its drafter's later passes pad to, None
-    at its `seqs`."""
+    and `width`, the batch a step that replays no graph pads to past its
+    rows, None at its rows."""
 
     phase: str  # "decode" or "prefill"
     tokens: int
@@ -133,7 +135,8 @@ class Shape(NamedTuple):
     def at(self, dp: int, drafts: int = 0) -> "Shape":
         """This shape in a DP group of `dp` under a drafter of `drafts`:
         `gathered` only off its default (`gathered_off_default`)."""
-        g = gathered_off_default(self.phase, self.tokens, self.gathered, dp, drafts)
+        padded = self.phase == "decode" and self.width or self.tokens
+        g = gathered_off_default(self.phase, padded, self.gathered, dp, drafts)
         return self._replace(gathered=g)
 
 
@@ -391,15 +394,9 @@ class _Recorder(TorchDispatchMode):
 
     def cut(self):
         """ATOM records `forward_done_event`: the target's work ends here, and
-        what follows is the drafter's, its later passes at the shape's width: a
-        decode's `seqs`, a prefill's `width`."""
+        what follows is the drafter's."""
         if self.on:
             self.items.append((None, CUT))
-        width = self.shape.seqs if self.shape.phase == "decode" else self.shape.width
-        if width:
-            from atom.utils.forward_context import get_forward_context
-
-            get_forward_context().context.running_bs = width
 
     @contextlib.contextmanager
     def quiet(self):
@@ -1180,12 +1177,12 @@ def capture(
             runner.allocate_kv_cache(max(KV_BLOCKS, blocks))
         # A prefill is traced as a middle chunk, which samples nothing, then as
         # a final one; a decode step always samples, as does a prefill whose
-        # drafter's later passes pad, except a DP middle chunk's.
+        # LM head pads, except a DP middle chunk's drafter at its later passes.
         variants = [
             (shape, output)
             for shape in shapes
             for output in ((False, True) if shape.phase == "prefill" else (True,))
-            if output or not shape.width or dp > 1
+            if output or not shape.width or dp > 1 and drafts
         ]
         # A population's prefill ran as one forward: this rank cannot split it.
         own = runner._local_tbo_eligibility
@@ -1195,6 +1192,9 @@ def capture(
 
         for shape, output in variants:
             recorder.shape, recorder.output = shape, output
+            # `decide` pads the step to the one width the ladder holds.
+            ladder = [shape.width or shape.seqs]
+            runner.capture_sizes_np = numpy.array(ladder, dtype=numpy.int32)
             runner._local_tbo_eligibility = unsplittable if shape in unsplit else own
             traces = []
             for context in CONTEXTS if shape.phase == "decode" else CONTEXTS[:1]:
@@ -1220,8 +1220,14 @@ def capture(
             for draft, part in enumerate(
                 (items[: cut[0]], items[cut[0] + 1 :]) if cut else (items,)
             ):
-                if (shape.tokens < shape.seqs or shape.width) and not draft:
-                    continue  # its target ran at its rung, or at its rows
+                if draft:
+                    # A decode's drafter is read from its own shape, at its rows.
+                    skip = shape.phase == "decode" and shape.width
+                else:
+                    # Its target ran at its rung; a middle chunk's is read at its rows.
+                    skip = shape.tokens < shape.seqs or shape.width and not output
+                if skip:
+                    continue
                 key = structure(config, shape.phase, output=output, draft=bool(draft))
                 crossing, traced = [], Traced(key, str(shape))
                 graph = build(part, traced, crossing)
