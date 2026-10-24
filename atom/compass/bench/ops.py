@@ -177,9 +177,8 @@ CALLS = 256
 #: at least one, so a capped graph holds at least 5 ms: a replay's fixed cost,
 #: about 19 us on MI308X, is under 0.4% of it.
 GRAPH_NS = 10_000_000
-#: Profiles of one call taken at most until two in a row name the same kernels.
-#: On an MI355X under load, ROCm's profiler dropped a call's kernel in 6 of
-#: 2064 profiles and in one of them kept the barrier's all-reduce instead.
+#: Profiles of one call taken at most until two in a row name the same kernels:
+#: a profile can drop a call's kernel or keep a kernel launched before it.
 PROFILES = 4
 #: Times over the last-level cache the copies' bytes pass: just past it, part of
 #: them stays there, and an MI308X GEMM read up to 7% fast.
@@ -1278,8 +1277,8 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
     """The kernels one call of `fn` launches, in order, and their device time
     in ns: its device activity except memory copies, which the profiler
     records at some calls of a leaf and misses at others; started on every
-    rank together (`_together`), once the device has finished that all-reduce,
-    which would otherwise join the call's kernels."""
+    rank together (`_together`), once the device has finished `_together`'s
+    all-reduce, which would otherwise join the call's kernels."""
     from torch.profiler import ProfilerActivity, profile
 
     _together()
