@@ -22,6 +22,8 @@ the work ATOM queues after `forward_done_event` on a step that samples, else
 from its first draft pass on: its prices are terms named ``draft op.<kind>``,
 each tagged draft. Sampling is the target's. A decode's drafter is read at its
 rows run at the step's width: its first pass runs the rows' tokens unpadded.
+A target that replays no graph yet pads past its rows (`target_bs`) is read
+at that width, `W=`: an eager decode's model, a sampling prefill's LM head.
 
 Each leaf is one pricing unit, `max(t0, F / peak, M / BW(M), t_comm)` over its
 work (`op_work.work`): its own tensors at the captured shape, the state it
@@ -289,7 +291,8 @@ class OpGraphBackend(CostBackend):
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
         with `draft`, its drafter's, a decode's at its rows, at `draft_moe_rows`,
-        its later passes at `draft_bs`."""
+        its later passes at `draft_bs`; else a target that pads past its rows
+        without a replay at `target_bs`."""
         if view.image_tokens:
             reason = IMAGES
         else:
@@ -301,7 +304,7 @@ class OpGraphBackend(CostBackend):
                 reason = f"a step that {exc}"
             else:
                 output = any(d for _, d in rows) or view.produces_output
-                width = draft and self.padded and view.draft_bs
+                width = self.padded and (view.draft_bs if draft else view.target_bs)
                 if draft and shape[0] == "decode":
                     shape = ("decode", len(rows), width or shape[2])
                     width = None
@@ -332,7 +335,8 @@ class OpGraphBackend(CostBackend):
                             "".join(f" gathering {n} rows" for n in g),
                             none,
                             " for its drafter" * draft
-                            + f", its later passes at {width}" * ("width" in drafted),
+                            + f", {'its later passes at' if draft else 'padded to'} {width}"
+                            * ("width" in drafted),
                             region or "",
                         )
                     )

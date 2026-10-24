@@ -502,10 +502,20 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   past their rows too. The step's view states that batch as `draft_bs` (the record line
   too) for a drafter that declares a draft graph. A decode's drafter is then keyed
   `decode T=<rows> B=<draft_bs>`, a sampling prefill's `prefill T=<tokens> B=<rows>
-  W=<draft_bs>`; `--population` captures each, setting `running_bs` at the cut, and
-  publishes the drafter's half alone ([#1982](https://github.com/jgong5/ATOM/issues/1982)).
-  A target padded without a replay, a sampling prefill's LM head or an eager DP decode,
-  is still traced at its rows ([#2033](https://github.com/jgong5/ATOM/issues/2033)).
+  W=<draft_bs>`; `--population` captures each and publishes the drafter's half alone
+  ([#1982](https://github.com/jgong5/ATOM/issues/1982)).
+- **A target padded without a replay is read at its width.** Two targets run at
+  `running_bs` with no graph: a decode every rank of whose DP group decodes, which
+  `ModelRunner._padded_decode_inputs` widens to `running_tokens` while its sampler keeps the
+  rows, and a sampling prefill, whose LM head reads `cu_seqlens_q`
+  padded to `running_bs + 1`. The view states that batch as `target_bs` (the record line
+  too); the target is keyed `decode B=<rows> W=<target_bs>`, its default G the group's
+  padded gather, or `prefill T=<tokens> B=<rows> W=<target_bs>`. A capture runs each
+  shape on a ladder of its one width (`W`, else `B`), so `decide` settles `running_bs`
+  as the real step did, for the target and the drafter's later passes alike. It
+  publishes a target at `W` only from the step that samples (a DP middle chunk's is read
+  at its rows), and a decode's drafter only from its own shape
+  ([#2033](https://github.com/jgong5/ATOM/issues/2033)).
 - **A middle chunk is cut where its draft-KV pass starts.** ATOM runs that pass
   (`compute_draft_kv`) after every target forward of a real step, a middle chunk's included,
   and a middle chunk records no `forward_done_event`. Under a drafter a prefill shape is
