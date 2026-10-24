@@ -330,10 +330,16 @@ call (`ops.py::CALLS`), so a call reads data no call of the same replay brought 
 cache. Before each replay of the cold graph, warmups included, the bench reads a device
 buffer of twice the last-level cache (`ops.py::COLD`), outside the timed events and before
 the ranks start together ([ruling on #1927](https://github.com/jgong5/ATOM/issues/1927#issuecomment-6355887860)),
-so no call reads what the replay before it left there either. A write of the buffer leaves
-the cache dirty: after one, a replay on MI355X read about 40 to 100 µs longer at any
-length, +19% on a 0.5 ms graph and +1.7% on GEMMs already past twice the cache
-([#2038](https://github.com/jgong5/ATOM/pull/2038)). Without the eviction a leaf whose
+so no call reads what the replay before it left there either. The buffer is read, not
+written, so the timed replay writes none of it back
+([ruling on #2019](https://github.com/jgong5/ATOM/issues/2019#issuecomment-6368138779)).
+Read or written, it also evicts the graph's kernel arguments, which a replayed graph keeps
+in a device-memory pool that stays in L2 or the MALL between replays: on MI355X each
+kernel then waits about 0.3 µs longer for its arguments, about 80 µs on a replay of 256
+calls, +19% on a 0.5 ms graph and about +1% on GEMMs already past twice the cache; on
+MI308X the read leaves them cached
+([root cause](https://github.com/jgong5/ATOM/issues/2019#issuecomment-6378825038)).
+Without the eviction a leaf whose
 `CALLS` copies stay under twice the cache read warm: `indexer_score_topk` at
 DeepSeek-V4-Pro decode B=16 on MI355X, 90 MB of copies, read `warm_over_cold` 0.939
 ([#1927](https://github.com/jgong5/ATOM/issues/1927#issuecomment-6353682488)). The

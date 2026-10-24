@@ -1317,8 +1317,10 @@ def _replay(fn, calls, flush=None) -> list[float]:
     times = []
     for i in range(WARMUPS + REPEATS):
         if flush is not None:
-            # read, not written: after a write, which leaves the cache dirty,
-            # an MI355X replay read about 40 to 100 us longer at any length
+            # read, not written, so the replay writes back no line of it; either
+            # way it pushes the graph's kernel arguments, cached between
+            # replays, out to HBM, and on MI355X each kernel then waits about
+            # 0.3 us longer for them
             flush.max()
         _together()
         start.record()
