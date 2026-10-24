@@ -4514,7 +4514,19 @@
    "expr": "torch.cuda.synchronize()",
    "shape": "device_sync",
    "peer": "none",
-   "why": "the op bench waits for one profiled call of a leaf to finish before it reads the kernels the call launched",
+   "why": "the op bench waits for the device before one profiled call of a leaf, so the profile holds no earlier kernel, and after it, before it reads the kernels the call launched",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
+   "id": "atom/compass/bench/ops.py::_kernels::torch.cuda.synchronize()::device_sync#1",
+   "file": "atom/compass/bench/ops.py",
+   "symbol": "_kernels",
+   "call": "torch.cuda.synchronize",
+   "expr": "torch.cuda.synchronize()",
+   "shape": "device_sync",
+   "peer": "none",
+   "why": "the op bench waits for the device before one profiled call of a leaf, so the profile holds no earlier kernel, and after it, before it reads the kernels the call launched",
    "mechanism": "K9",
    "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
   },
