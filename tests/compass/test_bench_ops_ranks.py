@@ -209,7 +209,8 @@ def _measuring_rank(config, todo, refuse, rank):
     if (me, refuse) == (1, "call"):
         ops._function = lambda name: no if name == NEG else function(name)
     torch.cuda.graph = lambda *a, **k: contextlib.nullcontext(graph())
-    return ops.measure(config, todo[me], 10_000, rank)
+    records = ops.measure(config, todo[me], 10_000, rank)
+    return (records, len(profiles)) if refuse == "profile" else records
 
 
 def _leaves(records):
@@ -258,9 +259,11 @@ def test_a_rank_whose_first_profile_names_no_kernel_profiles_as_often_as_the_oth
     by_rank = ranks.launch(_measuring_rank, config, todo, "profile")
 
     got = [
-        [(r["op"], r.get("refused"), r.get("kernels")) for r in rs] for rs in by_rank
+        ([(r["op"], r.get("refused"), r.get("kernels")) for r in rs], n)
+        for rs, n in by_rank
     ]
-    assert got == [[(NEG, None, ["k"]), (ABS, None, ["k"])]] * 2
+    # NEG: rank 1's empty profile, then two that agree; ABS: two that agree
+    assert got == [([(NEG, None, ["k"]), (ABS, None, ["k"])], 3 + 2)] * 2
 
 
 def test_a_rank_raising_before_its_first_cross_rank_call_ends_the_others():
