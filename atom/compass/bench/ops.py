@@ -784,7 +784,7 @@ class Stub:
                 need = None
             elif (module := self.modules.get(key, module)) is not None:
                 pool = self.runner.config.num_kvcache_blocks
-                tables = {id(getattr(module, name, None)) for name in TABLES}
+                tables = {id(getattr(module, name, None)) for name in sorted(TABLES)}
                 for t in _own(module):
                     if id(t) in tables:  # a RoPE table, a row a token
                         size += t.nbytes // t.shape[0] * min(tokens or rows, len(t))
