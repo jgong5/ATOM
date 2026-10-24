@@ -174,7 +174,7 @@ def test_the_run_s_lookup_reads_a_prefill_s_drafter_at_its_width(monkeypatch, tm
         tmp_path,
         1,
         {
-            ("prefill", "prefill T=9 B=3", False): g(9, 64, 64),
+            ("prefill", "prefill T=9 B=3 W=4", False): g(9, 64, 64),
             ("prefill", "prefill T=9 B=3", True): g(3000, 64, 64),
             ("prefill", "prefill T=9 B=3 W=4", True): g(4000, 64, 64),
         },
@@ -195,7 +195,7 @@ def test_a_run_traces_a_prefill_s_drafter_no_graph_holds_at_its_width(
     traced, lazy = [], {"lazy_traces": 0, "lazy_trace_wall_seconds": 0}
     monkeypatch.setattr(ops, "_child", lambda *a: traced.append(a[-1]))
     stored = {
-        ("prefill", "prefill T=9 B=3", False): g(9, 64, 64),
+        ("prefill", "prefill T=9 B=3 W=4", False): g(9, 64, 64),
         ("prefill", "prefill T=9 B=3", True): g(3000, 64, 64),
     }
     lookup = _lookup(tmp_path, 1, stored, ["--model", "m"], lazy)
@@ -230,11 +230,11 @@ def test_a_prefill_s_drafter_is_captured_with_its_later_pass_at_its_width(tmp_pa
         graph = json.loads(entry.read_member("graph", rank, "json"))
         output = not graph["structure"].endswith(("no output", "no output draft"))
         graphs[graph["structure"].endswith(" draft"), output, graph["shape"]] = graph
-    # At its width only the drafter's graph of the step that samples.
+    # At its width the target and drafter of the step that samples.
     rows, wide = "prefill T=192 B=3", "prefill T=192 B=3 W=4"
     assert set(graphs) == {
         (draft, output, rows) for draft in (False, True) for output in (False, True)
-    } | {(True, True, wide)}
+    } | {(False, True, wide), (True, True, wide)}
     # Its first pass embeds the prompts' tokens, its second a row a sequence.
     for shape, width in ((rows, 3), (wide, 4)):
         embedded = [

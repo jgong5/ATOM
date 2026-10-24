@@ -971,6 +971,24 @@ def test_a_prefill_prices_linearly_in_its_rows_cached_tokens(rows, params, answe
         assert cost.refusals == (Refusal("price-list", answer),)
 
 
+@pytest.mark.parametrize(
+    "rows,validated",
+    [
+        ([(32, 32 + 512, False)] * 2, True),
+        ([(32, 32, False), (32, 1056, False)], False),
+    ],
+    ids=["uniform", "uneven"],
+)
+def test_a_prefill_whose_rows_cached_tokens_differ_is_not_validated(rows, validated):
+    # both means are 512, inside the held-out 1024's bracket 0 to 2048
+    final = replace(view(*rows), produces_output=True)
+    (term,) = backend(ATTN, price_list=CACHED).price(final).terms
+
+    assert term.seconds == pytest.approx(1.5e-5)
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is validated
+
+
 def test_a_resource_bound_par_prices_its_leaves_work_not_their_listed_prices():
     big = g(2, 4096, 4096)
     params = listed(
@@ -1027,6 +1045,138 @@ def test_a_split_step_the_list_prices_in_part_is_a_roofline_carrying_why(
     assert cost.refusals == (
         Refusal("price-list", f"{GEMM}: no point of its signature was measured"),
     )
+
+
+def flat(n, *bs):
+    """Decode points of a GEMM into `n` outputs, B microseconds at B, flat in
+    context, so its family runs over B alone."""
+    return [
+        pt(g(b, n, 64), f"decode B={b}", b * 1e3, c) for b in bs for c in (100, 1000)
+    ]
+
+
+THIRTY_TWO = view(*[(1, 90, True)] * 32)
+
+
+@pytest.mark.parametrize(
+    "params,validated",
+    [
+        (listed(*flat(64, 1, 64)), False),
+        (listed(*flat(64, 1, 8, 64)), True),
+        (fit_ops.PriceList(fit_ops.fit(flat(64, 1, 8, 64))), False),
+    ],
+    ids=["B=1,64", "B=1,8,64", "no-brackets"],
+)
+def test_b_32_is_validated_only_inside_a_held_out_bracket(params, validated):
+    # on 1, 8, 64 the held-out B = 8 was priced from 1 and 64, around 32
+    listing = backend(g(2, 64, 64), padded=False, price_list=params)
+    (term,) = listing.price(THIRTY_TWO).terms
+
+    assert term.seconds == pytest.approx(32e-6)
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is validated
+
+
+@pytest.mark.parametrize(
+    "bs,contexts,context,validated",
+    [
+        ((1, 8, 64), (1000, 2000, 3000), 1500, True),
+        ((1, 8, 64), (1000, 3000), 1500, False),
+        ((1, 64), (1000, 2000, 3000), 1500, False),
+        ((1, 8, 64), (1000, 3000), 1000, True),
+    ],
+    ids=["both-bracketed", "context-not", "b-not", "along-b-only"],
+)
+def test_a_query_on_two_dimensions_is_validated_only_when_both_lines_are(
+    bs, contexts, context, validated
+):
+    params = listed(
+        *[
+            pt(g(b, 64, 64), f"decode B={b}", b * 1e4 + c * 10, c)
+            for b in bs
+            for c in contexts
+        ]
+    )
+    step = view(*[(1, context, True)] * 32)
+    (term,) = backend(g(2, 64, 64), padded=False, price_list=params).price(step).terms
+
+    assert term.seconds == pytest.approx((32e4 + context * 10) * 1e-9)
+    assert term.provenance.validated is validated
+
+
+@pytest.mark.parametrize(
+    "points,step",
+    [
+        (
+            # B = 1, 4, 8 launch one kernel and 64, 512 another: the held-out
+            # B = 4's bracket 1 to 8 is on B = 300's line, not around it
+            [
+                pt(g(b, 64, 64), f"decode B={b}", b * 1e3, c, kernel)
+                for b, kernel in ((1, "a"), (4, "a"), (8, "a"), (64, "b"), (512, "b"))
+                for c in (100, 1000)
+            ],
+            view(*[(1, 90, True)] * 300),
+        ),
+        (
+            # the held-out B = 8's bracket 1 to 64 is at context 3000, while
+            # context 1000 holds B = 8 and 64 only
+            [
+                pt(g(b, 64, 64), f"decode B={b}", b * 1e4 + c * 10, c)
+                for b, c in ((8, 1000), (64, 1000), (1, 3000), (8, 3000), (64, 3000))
+            ],
+            view(*[(1, 1000, True)] * 32),
+        ),
+    ],
+    ids=["another-kernel-band", "a-sibling-line"],
+)
+def test_a_bracket_not_around_the_query_on_its_own_line_does_not_validate_it(
+    points, step
+):
+    listing = backend(g(2, 64, 64), padded=False, price_list=listed(*points))
+    (term,) = listing.price(step).terms
+
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is False
+
+
+@pytest.mark.parametrize(
+    "bs_64,bs_128,validated",
+    [
+        ((1, 32, 64), (1, 8, 64), True),
+        ((1, 32, 64), (1, 64), False),
+        ((1, 8, 64), (1, 64), False),
+    ],
+    ids=["measured-and-validated", "measured-and-not", "validated-and-not"],
+)
+def test_a_term_is_validated_only_when_every_estimated_leaf_is(
+    bs_64, bs_128, validated
+):
+    # at B = 32, N = 64 is measured or validated; N = 128 is validated or not
+    params = listed(*flat(64, *bs_64), *flat(128, *bs_128))
+    pair = {"seq": [g(2, 64, 64), g(2, 128, 64)]}
+    (term,) = backend(pair, padded=False, price_list=params).price(THIRTY_TWO).terms
+
+    assert term.seconds == pytest.approx(64e-6)
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is validated
+
+
+@pytest.mark.parametrize("ts,validated", [((2, 4, 5, 8), True), ((2, 4), False)])
+def test_a_split_step_of_measured_and_validated_leaves_is_validated(ts, validated):
+    # T = 4 is measured; T = 3 lies inside 2 to 5, which priced T = 4 held out
+    params = listed(
+        *[pt(g(t, 8, 8), f"prefill T={t} B=1", t * 1e9, c) for t in ts for c in (0, 8)]
+    )
+
+    def graph(phase, tokens, seqs, output, gathered):
+        return {"seq": [g(tokens, 8, 8)]}
+
+    cost = OpGraphBackend(SECOND, graph, kv="bf16", dp=2, price_list=params)
+    (term,) = cost.price(SPLIT).terms
+
+    assert term.name == "op.tbo.price_list"
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is validated
 
 
 # An MoE GEMM over the rows a DP-2 group gathers, at T = 4 and two stated G;

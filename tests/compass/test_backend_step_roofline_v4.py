@@ -319,7 +319,7 @@ def test_a_rank_s_view_names_its_own_slot_of_the_split():
         num_tokens_across_dp=torch.tensor([7, 7]), ub_tokens_across_dp=((4, 3), (3, 4))
     )
     mode = SimpleNamespace(
-        sync=sync, running_tokens_are_unified=False, use_cudagraph=False
+        sync=sync, running_tokens_are_unified=False, use_cudagraph=False, running_bs=1
     )
     view = projection.batch_view(prefill(7), mode, r)
 
