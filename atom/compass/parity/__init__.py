@@ -495,9 +495,10 @@ class StepRecording:
     def _draft_pass(self, key, call, *args, **kwargs):
         """`call`, a drafter pass, between two device events kept under `key`,
         the line field that times it. The first pass's start also ends the
-        target of a forward that samples nothing."""
+        target of a forward that samples nothing. Every rank opens its range."""
         if getattr(self, "_parity_record", None) is None:
-            return call(*args, **kwargs)
+            with _traced(MARK + key):
+                return call(*args, **kwargs)
         start = self.device_event()
         self._stamps.setdefault("draft_event", start)
         with _traced(MARK + key):

@@ -21,26 +21,31 @@ from atom.compass.parity import ENV, MARK, TARGET_DONE, busy
 from atom.compass.parity.busy import PROPOSE
 
 #: One MTP output prefill, in us. The target: K1, K2 queued 2 after K1 and
-#: counted whole, the collective K3, which rank 1 starts at 50, and K4 queued 1
-#: after it, and the sampler launched after the draft-KV pass's DK. The draft: DK,
-#: then the propose pass's D1, its launch 45 late, and D2 queued 1 after D1. The queued gaps are 2, 1 and 1, so
-#: every gap whose kernel was not queued counts 1.
+#: counted whole, the collective K3, queued on rank 0 before K2 ends but
+#: started at 50 by rank 1, whose launch returns at 46, and K4 queued 1 after
+#: it, and the sampler launched after the draft-KV pass's DK. The draft: DK,
+#: then the propose pass's D1, its launch 45 late, and D2 queued 1 after D1.
+#: The queued gaps are 2, 1 and 1, so every gap whose kernel was not queued
+#: counts 1.
 KERNELS = [
     ("k1", 10, 20, 1),
     ("k2", 22, 30, 3),
-    ("cross_device_reduce_1stage", 40, 60, 35),
+    ("cross_device_reduce_1stage", 40, 60, 25),
     ("k4", 61, 70, 37),
     ("dk", 72, 75, 81),
     ("sample", 76, 78, 92),
     ("d1", 120, 125, 111),
     ("d2", 126, 130, 113),
 ]
-MARKS = [("d_draft_kv_ns", 80, 90), (TARGET_DONE, 100, 101), ("d_propose_ns", 110, 200)]
+#: Where the recorder's ranges open, each planted on a rank only where its real
+#: recorder opens it (`_opened`).
+MARKS = {MARK + "d_draft_kv_ns": (80, 90), TARGET_DONE: (100, 101), PROPOSE: (110, 200)}
 
 
-def _trace(path, kernels, tokens=100):
+def _trace(path, kernels, tokens=100, marks=MARKS):
     """A kineto trace of one forward running `kernels`, (name, start, end,
-    launch), each launch call 1 us long; written over many lines."""
+    launch), each launch call 1 us long, and opening `marks`; written over many
+    lines."""
     events = [
         {
             "cat": "user_annotation",
@@ -51,8 +56,8 @@ def _trace(path, kernels, tokens=100):
         {"cat": "user_annotation", "name": "ATOM::run_model", "ts": 0, "dur": 95},
         {"cat": "cpu_op", "name": "aten::mm", "ts": 5, "dur": 1},
     ]
-    for name, a, b in MARKS:
-        name = name if name == TARGET_DONE else "compass::" + name
+    for name in marks:
+        a, b = MARKS[name]
         events.append({"cat": "user_annotation", "name": name, "ts": a, "dur": b - a})
     for corr, (name, start, end, launch) in enumerate(kernels):
         args = {"correlation": corr}
@@ -83,9 +88,10 @@ def _trace(path, kernels, tokens=100):
         )
 
 
-def _run(tmp_path, ranks=("rank_0", "rank_1"), tokens=100):
+def _run(tmp_path, ranks=("rank_0", "rank_1"), tokens=100, marks=(MARKS, MARKS)):
     """A trace run's directory: its record's one line and each rank's trace,
-    rank 1's K1 starting 5 us earlier and its collective at 50."""
+    opening its `marks`, rank 1's K1 starting 5 us earlier and its collective
+    at 50."""
     steps = tmp_path / "steps"
     steps.mkdir()
     line = {"step": 7, "rows": [[100, 100, False]], "d_target_ns": 1, "d_propose_ns": 1}
@@ -93,7 +99,8 @@ def _run(tmp_path, ranks=("rank_0", "rank_1"), tokens=100):
     late = {"k1": (5, 20, 1), "cross_device_reduce_1stage": (50, 60, 45)}
     for r, name in enumerate(ranks):
         kernels = [(k, *late[k]) if r and k in late else (k, *x) for k, *x in KERNELS]
-        _trace(tmp_path / "trace" / name / "m_ts_1.pt.trace.json.gz", kernels, tokens)
+        trace = tmp_path / "trace" / name / "m_ts_1.pt.trace.json.gz"
+        _trace(trace, kernels, tokens, marks[r])
     return tmp_path
 
 
@@ -101,10 +108,12 @@ def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
     tmp_path, monkeypatch
 ):
     """The named result. Rank 0's target: union 39, gaps 2 + 1 + 1 + 1, the
-    collective from rank 1's start; rank 1's 5 more. The draft: DK, D1 and D2,
-    their union 12 and gaps 1 + 1 + 1; the propose pass D1 and D2."""
+    collective from rank 1's start and its gap capped; rank 1's 5 more. The
+    draft: DK, D1 and D2, their union 12 and gaps 1 + 1 + 1; the propose pass D1
+    and D2. Each rank opens the ranges its real recorder opens."""
+    marks = [set(_opened(tmp_path / f"r{r}", monkeypatch, r)[2]) for r in (0, 1)]
     monkeypatch.setattr(busy, "CHUNK", 64)  # a decode straddles every read
-    path = busy.reduce(_run(tmp_path))
+    path = busy.reduce(_run(tmp_path, marks=marks))
 
     assert path == tmp_path / "steps" / "dp0.busy.jsonl"
     got = [json.loads(x) for x in path.read_text().splitlines()]
@@ -123,6 +132,20 @@ def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
 def test_a_dp_trace_or_one_that_misses_the_record_refuses(tmp_path, ranks, tokens, why):
     with pytest.raises(ValueError, match=why):
         busy.reduce(_run(tmp_path, ranks, tokens))
+
+
+def _opened(tmp_path, monkeypatch, rank):
+    """TP rank `rank`'s recorded DSpark runner, the forwards it ran under a
+    profiler, and the recorder's ranges they opened."""
+    batches = _drive(tmp_path / "simulated", monkeypatch, {0: [0, 1]})[0][0]
+    recorded, device = _recorded(batches[-1], drafter="dspark")
+    device.tick = 10**12
+    monkeypatch.setenv(ENV, str(tmp_path / "real"))
+    runner = recorded(rank, _config())
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as p:
+        for b in batches:
+            runner.forward(b)
+    return runner, batches, [e.name for e in p.events() if e.name.startswith(MARK)]
 
 
 #: The planted server: answers ``/health`` and logs each POST with whether the
@@ -181,18 +204,12 @@ def test_a_trace_run_profiles_from_before_its_ready_file_to_its_stop(
     assert seen["argv"][at + 1] == str(out / "trace") and seen["stack"] == "0"
 
 
+@pytest.mark.parametrize("rank", [0, 1])
 def test_only_a_profiled_forward_marks_its_target_end_and_each_drafter_pass(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, rank
 ):
-    batches = _drive(tmp_path / "simulated", monkeypatch, {0: [0, 1]})[0][0]
-    recorded, device = _recorded(batches[-1], drafter="dspark")
-    device.tick = 10**12
-    monkeypatch.setenv(ENV, str(tmp_path / "real"))
-    runner = recorded(0, _config())
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as p:
-        for b in batches:
-            runner.forward(b)
-    names = [e.name for e in p.events() if e.name.startswith(MARK)]
+    """On every TP rank, though only rank 0 records."""
+    runner, batches, names = _opened(tmp_path, monkeypatch, rank)
     outputs = sum(b.produces_output() for b in batches)
     assert names.count(TARGET_DONE) == names.count(PROPOSE) == outputs > 0
     assert names.count(MARK + "d_draft_kv_ns") == len(batches)

@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Each forward's device busy time per pass, reduced from a trace run's traces.
 
-    python -m atom.compass.parity.busy OUT
-
 A trace run is `compass record --trace`: its server ran under ATOM's kineto
 profiler on every TP rank, without Python stacks, from before the first
 request to its stop, and each rank wrote ``OUT/trace/rank_<r>/`` one gzipped
@@ -25,19 +23,17 @@ launch call had returned when the gap opened, so the device idled on its own,
 else capped at the rank's median such queued gap, since the device then waited
 for the host's launch. A TP collective's kernel on one rank includes its wait
 for the peers: the n-th collective kernel (`COLLECTIVE`) of a forward counts on
-every rank from its latest rank's start. A pass's busy time is its largest over
-the ranks.
+every rank from its latest rank's start, and as queued once its latest
+rank's launch call returned. A pass's busy time is its largest over the ranks.
 
 A trace directory not named ``rank_<r>``, a DP or a pipeline run's, refuses:
 per-rank busy time under DP is not reduced.
 """
 
-import argparse
 import gzip
 import json
 import re
 import statistics
-import sys
 from bisect import bisect_right
 from pathlib import Path
 
@@ -132,7 +128,7 @@ def forwards(path) -> list[dict]:
 
 def _align(ranks: list[list[dict]]) -> None:
     """Start each forward's n-th collective kernel on every rank no earlier
-    than its latest rank's start."""
+    than its latest rank's start, queued at its latest launch return."""
     for fs in zip(*ranks):
         calls = [
             [j for j, k in enumerate(f["kernels"]) if COLLECTIVE.search(k[5])]
@@ -144,10 +140,10 @@ def _align(ranks: list[list[dict]]) -> None:
                 f"{[len(c) for c in calls]} collective kernels"
             )
         for n in range(len(calls[0])):
-            last = max(f["kernels"][c[n]][0] for f, c in zip(fs, calls))
-            for f, c in zip(fs, calls):
-                k = f["kernels"][c[n]]
-                f["kernels"][c[n]] = (min(max(k[0], last), k[1]), *k[1:])
+            ks = [f["kernels"][c[n]] for f, c in zip(fs, calls)]
+            last, queued = max(k[0] for k in ks), max(k[2] for k in ks)
+            for f, c, k in zip(fs, calls, ks):
+                f["kernels"][c[n]] = (min(max(k[0], last), k[1]), k[1], queued, *k[3:])
         for f in fs:
             f["kernels"].sort()
 
@@ -220,17 +216,3 @@ def reduce(out) -> Path:
     path = (out / RECORD).with_suffix(".busy.jsonl")
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))
     return path
-
-
-def main(argv=None) -> None:
-    p = argparse.ArgumentParser(
-        prog="python -m atom.compass.parity.busy", description=__doc__.split("\n\n")[0]
-    )
-    p.add_argument(
-        "out", help="a trace run's directory, `compass record --trace --out`"
-    )
-    print(reduce(p.parse_args(argv).out))
-
-
-if __name__ == "__main__":
-    main(sys.argv[1:])
