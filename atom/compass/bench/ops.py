@@ -111,8 +111,9 @@ cached tokens, that launched different kernels or, at a decode width, either
 side of a point off the line through theirs, or whose cold times differ where
 the leaf's kind steps under one kernel between two adjacent contexts at some
 width (`_densify`), until they are adjacent; a collective's message bytes bend
-as a decode width does. DIR gets each round's ops.jsonl in `round<n>`, and
-every point held in plan.jsonl.
+as a decode width does. DIR gets each round's ops.jsonl in `round<n>`, a run
+resumed into DIR numbering on from the last round there, and after each round
+every point held, a measured one with its store token, in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
 covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
@@ -1605,7 +1606,9 @@ CONTEXT_FLOOR_NS = 1000
 
 def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -> None:
     """Measure the points the steps of `--plan`'s record directories call for,
-    round by round, and write every point held to plan.jsonl in `out`."""
+    round by round, numbered on from the last round `out` holds, and after
+    each round write every point held, a measured one with its store token, to
+    plan.jsonl in `out`."""
     from atom.compass.capture import population_steps
     from atom.compass.capture.forward import decode
     from atom.compass.runner.overrides import schedulable_ladder
@@ -1618,6 +1621,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         raise ValueError("the --plan records hold no decode step to read contexts of")
     rungs = [decode(r) for r in schedulable_ladder(config)]
     graphs, done, tried = {}, {}, set()
+    # a run resumed into `out` keeps the rounds an earlier one wrote there
+    rounds = [int(d.name[5:]) for d in out.glob("round*") if d.name[5:].isdigit()]
+    first = max(rounds, default=-1) + 1
 
     def measure_round(want, n):
         dependent = _dependent(done.values())
@@ -1640,12 +1646,17 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                 else:
                     found[sig] = op, instances
             todo += [(shape, context, found)] if found else []
-        print(f"round {n}: {sum(len(f) for *_, f in todo)} points to measure")
+        print(f"round {first + n}: {sum(len(f) for *_, f in todo)} points to measure")
         gpus = len(run["device"])
         results = _measured(config, todo, args.llc_mib << 20, gpus)
-        (out / f"round{n}").mkdir(exist_ok=True)
-        publish(store, key, config, run, command, results, out / f"round{n}")
+        (into := out / f"round{first + n}").mkdir()
+        publish(store, key, config, run, command, results, into)
         done.update(((r["shape"], r["context"], r["leaf"]), r) for r in results)
+        with (out / "plan.jsonl").open("w") as lines:
+            for r in done.values():
+                if "refused" not in r:  # a refused point is not in the store
+                    r = r | {"token": key(r["shape"], r["context"], r["leaf"]).token()}
+                lines.write(json.dumps(r) + "\n")
 
     measure_round(
         {(s, c): None for s in rungs for c in (min(contexts), max(contexts))}, 0
@@ -1699,9 +1710,6 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         want = want or _densify(
             _families(done.values(), _dependent(done.values())), tried
         )
-    (out / "plan.jsonl").write_text(
-        "".join(json.dumps(r) + "\n" for r in done.values())
-    )
     kinds = Counter(r["op"] for r in done.values() if "refused" not in r)
     print(json.dumps({"points per leaf kind": dict(kinds.most_common())}, indent=1))
     print(f"{sum(kinds.values())} of {len(done)} points measured in {n} rounds")
