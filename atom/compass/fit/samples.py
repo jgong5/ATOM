@@ -5,7 +5,8 @@ configuration.
 A record directory is `record`'s output: `run.json`, holding the run's
 identity in format `FORMAT_VERSION`, and the step record in `steps/`, with the
 client runs its server served (`parity.served`). Its ranks are labelled
-together by `step_labels.label_run`, and a sample's provenance gains the
+together by `step_labels.label_run` under ATOM's two-batch-overlap split rule
+(`validate.bound._split`), and a sample's provenance gains the
 `traces` its step served.
 A DP rank no request reached writes a line per dummy forward it runs, and gives
 no sample; its file still counts in the run's digest. An empty
@@ -46,6 +47,7 @@ from atom.compass.drive import aiter_jit
 from atom.compass.parity import ARRIVALS
 from atom.compass.parity.served import served
 from atom.compass.run.step_grid import keyed_of
+from atom.compass.validate.bound import _split
 
 #: The run.json format this reads.
 FORMAT_VERSION = 2
@@ -113,7 +115,7 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
     traces = {(s["dp_rank"], s["step"]): s["traces"] for s in _steps(record)}
     files = sorted(steps.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
     name, samples = ", ".join(map(digest, files)), []
-    for got, _ in label_run(files, name):
+    for got, _ in label_run(files, name, _split):
         for s in got:
             traced = {**s.provenance, "traces": traces[s.rank, s.step]}
             samples.append(dataclasses.replace(s, provenance=traced))
