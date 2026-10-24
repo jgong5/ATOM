@@ -300,3 +300,97 @@ def test_a_padded_decode_prices_its_model_at_its_width_and_its_sampler_at_its_ro
         f"op.{GEMM}.price_list": pytest.approx(7e-6),
         f"op.{ARGMAX}.price_list": pytest.approx(1e-6),
     }
+
+
+class AskedG(Asked):
+    """`Asked`, with each leaf's G too."""
+
+    def price(self, request):
+        got = super().price(request)
+        self.asked[-1] += (request[1][3],)
+        return got
+
+
+@pytest.mark.parametrize(
+    "options,view,graph,asked",
+    [
+        # V4-Pro MTP2 at DP2: its first pass's MoE gathers 8, every rank's later
+        # passes 4 rows each.
+        (
+            {"dp": 2},
+            {"moe_rows": 24, "target_bs": 4, "draft_moe_rows": 8},
+            [g(9, 64, 64), g(8, 32, 64), argmax(3), g(4, 64, 64)],
+            [(GEMM, 9, 3, 3, 8), (GEMM, 8, 3, 3, 8)]
+            + [(ARGMAX, 3, 3, 3, 8), (GEMM, 4, 4, 4, 8)],
+        ),
+        # At DP4: its first pass gathers its default, its later passes 16; a
+        # leaf over twice the width is no later pass's.
+        (
+            {"dp": 4},
+            {"moe_rows": 48, "draft_moe_rows": 36},
+            [g(9, 64, 64), g(36, 32, 64), g(4, 64, 64), g(16, 32, 64), g(8, 64, 64)],
+            [(GEMM, 9, 3, 3, None), (GEMM, 36, 3, 3, None), (GEMM, 4, 4, 4, 16)]
+            + [(GEMM, 16, 4, 4, 16), (GEMM, 8, 3, 3, None)],
+        ),
+        # Replayed at rung 4: its first pass at its rows.
+        (
+            {},
+            {"capture_rung": 4},
+            [g(9, 64, 64), g(4, 64, 64)],
+            [(GEMM, 9, 3, 3, None), (GEMM, 4, 4, 4, None)],
+        ),
+    ],
+    ids=["mtp-dp2", "dp4", "replayed"],
+)
+def test_a_drafter_asks_its_price_list_at_the_rows_and_g_each_pass_ran(
+    options, view, graph, asked
+):
+    step = BatchView(tuple(RequestShape(*row) for row in DECODE), draft_bs=4, **view)
+    listing = AskedG()
+    graphs = {False: {"seq": []}, True: {"seq": graph}}
+    backend = OpGraphBackend(
+        SPEC,
+        lambda *_, draft=False, **__: graphs[draft],
+        kv="bf16",
+        drafts=2,
+        price_list=listing,
+        **options,
+    )
+    backend.price(step)
+
+    assert listing.asked == asked
+
+
+# The drafter's later-pass GEMM measured at B=3 and 4, its MoE gathering 8.
+GATHERED = listed(
+    *[
+        pt(g(b, 64, 64), f"decode B={b} G=8", ns, c)
+        for b, ns in ((3, 5e3), (4, 7e3))
+        for c in (100, 1000)
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "dp,gathered,params",
+    [(1, {}, RUNGS), (2, {"moe_rows": 24, "draft_moe_rows": 8}, GATHERED)],
+    ids=["one-rank", "dp2"],
+)
+def test_a_drafter_prices_its_later_passes_at_draft_bs(dp, gathered, params):
+    # MTP2 over 3 rows; its later passes run 4.
+    step = BatchView(
+        tuple(RequestShape(*row) for row in DECODE), draft_bs=4, **gathered
+    )
+    graphs = {False: {"seq": []}, True: {"seq": [g(4, 64, 64)]}}
+    backend = OpGraphBackend(
+        SPEC,
+        lambda *_, draft=False, **__: graphs[draft],
+        kv="bf16",
+        dp=dp,
+        drafts=2,
+        price_list=params,
+    )
+    cost = backend.price(step)
+
+    assert not cost.refusals
+    assert by_name(cost) == {f"draft op.{GEMM}.price_list": pytest.approx(7e-6)}
