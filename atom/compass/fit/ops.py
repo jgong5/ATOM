@@ -3,8 +3,12 @@
 
     compass fit ops DIR... --store S --out D
 
-Each DIR is a `measure ops --out` directory; each point its ops.jsonl lists as
-measured is read back from S, where `measure ops` published it. Every point
+Each DIR is a `measure ops --out` directory; each point its ops.jsonl, or with
+`--plan` each round's, lists as measured is read back from S, where `measure
+ops` published it. A `--plan` run resumed into a DIR keeps the rounds earlier
+runs wrote there, so DIR lists every run's points. A point a `--plan` run
+found already in S is in no round's ops.jsonl: pass the directory that
+measured it too. Every point
 must name one `price_list` key, its model, parallel layout, machine-spec
 digest and source root, and one torch; the price list is published at that key
 under the readings the points ran under.
@@ -103,15 +107,17 @@ def main(argv: list[str]) -> None:
 
 
 def read(store, dirs) -> tuple[list[dict], dict, dict]:
-    """The measured points the ops.jsonl of `dirs` list, as `store` holds them,
-    their configuration, and the `price_list` key fields they name."""
+    """The measured points the ops.jsonl of `dirs` list, a `--plan` run's in
+    each round<n>, as `store` holds them, their configuration, and the
+    `price_list` key fields they name."""
     points, named, config = {}, {}, None
     for d in dirs:
         run = json.loads((d / "run.json").read_text())
         engine = json.loads((d / "engine.json").read_text())
         config = {**run_fields(run), "engine_config": engine}
         config |= {k: run[k] for k in ("stack", "host_key", "ptl")}
-        for line in (d / "ops.jsonl").read_text().splitlines():
+        lines = sorted(d.glob("round*/ops.jsonl")) or [d / "ops.jsonl"]
+        for line in itertools.chain(*(f.read_text().splitlines() for f in lines)):
             record = json.loads(line)
             if "refused" in record:
                 continue

@@ -810,6 +810,27 @@ def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
     assert stub._plan(rope, [{"rope": "0"}], kv, 4, 2) == (3, 48, 1, [0, 0])
 
 
+@pytest.mark.parametrize("tokens", [1, 16, 256])
+def test_a_named_module_s_rope_tables_add_a_row_a_token_not_their_span(tokens):
+    # Qwen's mrope leaf names its rotary module: cos and sin tables of 1000
+    # positions, 32 bf16 a row, read at each token's position, beside a buffer
+    # it reads whole.
+    rope = torch.nn.Module()
+    for name in ("cos_cache", "sin_cache"):
+        rope.register_buffer(name, torch.zeros(1000, 1, 1, 32, dtype=torch.bfloat16))
+    rope.register_buffer("other", torch.zeros(3))
+    runner = _Runner()
+    runner.model.append(rope)
+    op = {"op": "x", "args": {"rotary_emb": {"module": None}}}
+
+    _, size, _, _ = ops.Stub(runner, 50)._plan(
+        op, [{"rotary_emb": "2"}], {}, 4, 2, tokens
+    )
+
+    # 64 bytes a token from each table and 12 of the other; by span, 128012.
+    assert size == 2 * 64 * tokens + 12
+
+
 def test_a_context_module_with_no_kv_layer_is_sized_by_its_own_tensors(monkeypatch):
     # DeepSeek-V4's Indexer: bound by its layer name, its pool on itself, no
     # layer_num and no entry in ATOM's KV registry.

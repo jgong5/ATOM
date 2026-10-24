@@ -11,8 +11,8 @@ step with a law; `python -m atom.compass.validate` prices only those of the clie
 run it grades, its warmup left out, with the backend the simulated run priced with.
 
 Each step is labelled as the fit labels it, by its device time
-(`step_labels.label`, which also says which steps carry no label and refuses a
-record without device windows), and priced by `StepLinearBackend`, `StepGridBackend` or `OpGraphBackend`. The
+(`step_labels.label` under ATOM's split rule, `bound._split`, which also says
+which steps carry no label and refuses a record without device windows), and priced by `StepLinearBackend`, `StepGridBackend` or `OpGraphBackend`. The
 error of a step is `priced / real - 1`, its target price over its target label on
 an MTP record. A step that also carries a draft label is graded again under kind
 `draft`, its draft price over that label, validated only if it has draft terms and
@@ -75,6 +75,7 @@ from atom.compass.backends.cost import group as method_group
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band
 from atom.compass.drive import aiter_jit
+from atom.compass.validate.bound import _split
 
 WITHIN = 0.10
 REASONS = 3  # a declined band names this many of its most frequent reasons
@@ -175,7 +176,7 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
             f"{record} holds rank records of {lines} lines; one run's ranks "
             "differ by at most the step a stopped run leaves on some"
         )
-    run = [step_labels.label(r)[0] for r in ranks]
+    run = [step_labels.label(r, split_rule=_split)[0] for r in ranks]
     joined, cut, _ = step_linear_fit._groups(run, "base", steps=steps)
     views = [{s.step: s.view for s in rank} for rank in run]
     drafts = [{s.step: s.draft_s for s in rank} for rank in run]
