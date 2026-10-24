@@ -177,42 +177,82 @@ class Asked(CostSource):
         return self.refuse("asked")
 
 
+def mixed(rows, width=4):
+    """A mul of `rows` rows broadcast across `width`."""
+    return leaf(MUL, [[width, rows, 64]], self=t([rows, 64]), other=t([width, 1, 64]))
+
+
 @pytest.mark.parametrize(
-    "rows,drafts,graph,asked",
+    "rows,options,graph,asked",
     [
         (
             [(1, 90, True)] * 3,
-            0,
-            [g(4, 64, 64), argmax(3)],
+            {},
+            [g(4, 3, 64), argmax(3)],
             [(GEMM, 4, 4, 4), (ARGMAX, 3, 3, 3)],
         ),
         # Its drafter's at its rows, whatever its leaves lead with.
         (
             DECODE,
-            2,
+            {"drafts": 2},
             [g(12, 64, 64), argmax(6), argmax(9)],
             [(GEMM, 12, 4, 4), (ARGMAX, 6, 3, 3), (ARGMAX, 9, 3, 3)]
             + [(GEMM, 12, 3, 3), (ARGMAX, 6, 3, 3), (ARGMAX, 9, 3, 3)],
         ),
+        # At DP2: its model at the width's tokens, an MoE over the width's gathered.
+        (
+            DECODE,
+            {"drafts": 2, "dp": 2},
+            [g(12, 64, 64), g(24, 32, 64), mixed(9, 12), argmax(9)],
+            [(GEMM, 12, 4, 4), (GEMM, 24, 4, 4), (MUL, 9, 3, 3), (ARGMAX, 9, 3, 3)]
+            + [(GEMM, 12, 3, 3), (GEMM, 24, 3, 3), (MUL, 9, 3, 3), (ARGMAX, 9, 3, 3)],
+        ),
         # Its model at its rows, an MoE GEMM over 24 gathered rows among it.
         (
             [(3, 3, False)] * 3,
-            0,
-            [g(9, 64, 64), g(24, 32, 64), g(4, 128, 64), argmax(3)],
-            [(GEMM, 9, 9, 3), (GEMM, 24, 9, 3), (GEMM, 4, 9, 4), (ARGMAX, 3, 9, 3)],
+            {},
+            [g(9, 64, 64), g(24, 32, 64), g(4, 128, 64), mixed(3), mixed(9), argmax(3)],
+            [(GEMM, 9, 9, 3), (GEMM, 24, 9, 3), (GEMM, 4, 9, 4)]
+            + [(MUL, 3, 9, 3), (MUL, 9, 9, 3), (ARGMAX, 3, 9, 3)],
         ),
         # Leaves that lead with no count of its rows or its width, at its rows.
         (
             [(1, 90, True)] * 3,
-            0,
-            [leaf(MUL, [s], self=t(s), other=t(s)) for s in ([1, 3, 64], [64, 3], [])],
+            {},
+            [leaf(MUL, [s], self=t(s), other=t(s)) for s in ([1, 3, 64], [64, 4], [])],
             [(MUL, 1, 3, 3), (MUL, 64, 3, 3), (MUL, None, 3, 3)],
         ),
+        # Leaves over its rows and its width, at its rows.
+        (
+            [(1, 90, True)] * 3,
+            {},
+            [
+                mixed(3),
+                leaf(
+                    MUL,
+                    [[3, 4, 64]],
+                    self=t([3, 1, 64], role="weight"),
+                    other=t([4, 64]),
+                ),
+                leaf(MUL, [[4, 3]], self=t([4, 3]), other=t([3], role="metadata")),
+            ],
+            [(MUL, 3, 3, 3), (MUL, 3, 3, 3), (MUL, 4, 3, 3)],
+        ),
+        # Unpadded, at its rows.
+        ([(1, 90, True)] * 3, {"padded": False}, [g(4, 64, 64)], [(GEMM, 4, 3, 3)]),
     ],
-    ids=["eager-decode", "eager-mtp-decode", "sampling-prefill", "unrecognised"],
+    ids=[
+        "eager-decode",
+        "eager-mtp-decode",
+        "mtp-dp2",
+        "sampling-prefill",
+        "unrecognised",
+        "mixed",
+        "real-rows",
+    ],
 )
 def test_a_padded_target_asks_its_price_list_at_the_rows_each_leaf_ran(
-    rows, drafts, graph, asked
+    rows, options, graph, asked
 ):
     step = BatchView(
         tuple(RequestShape(*row) for row in rows), produces_output=True, target_bs=4
@@ -222,8 +262,8 @@ def test_a_padded_target_asks_its_price_list_at_the_rows_each_leaf_ran(
         SPEC,
         lambda *_, **__: {"seq": graph},
         kv="bf16",
-        drafts=drafts,
         price_list=listing,
+        **options,
     )
     backend.price(step)
 
