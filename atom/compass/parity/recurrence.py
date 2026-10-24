@@ -21,6 +21,14 @@ carriers when one is given:
 the model's dtype size. The carriers price whole tensors with no all-gather,
 so a record whose `.engine.json` states TP above 1 is refused there.
 
+With a law file, as `step_linear_fit` writes it with host laws, each forward is
+charged on priced inputs in place of measured ones (`priced`), and graded the
+same way, the steps the law names warm on this record left out, and those
+its host fit names as paying a first-use JIT compile, each with the forward
+after it, reported apart:
+
+    python -m atom.compass.parity.recurrence RECORD_DIR --law LAW_JSON
+
 Per kind (decode, output prefill, middle chunk, and idle: sharing no request
 with the forward before), p10 and p90 of charge over measured exit-to-exit
 period, less one, in percent, lie within `STEP_BAND`, the run total within
@@ -41,8 +49,20 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from atom.compass.parity import read
-from atom.compass.runner.overrides import FORWARD_KINDS, HostDeviceRecurrence
+from atom.compass.backends import (
+    CostRefused,
+    StepLinearBackend,
+    StepLinearLaw,
+    step_labels,
+)
+from atom.compass.backends.shape import sum_tokens
+from atom.compass.backends.step_linear_fit import WARM_FACTOR
+from atom.compass.parity import ARRIVALS, read
+from atom.compass.runner.overrides import (
+    FORWARD_KINDS,
+    HostDeviceRecurrence,
+    forward_shape,
+)
 from atom.compass.runner.pp_send import carrier_models, recv_done
 from atom.compass.spec import MachineSpec
 
@@ -215,6 +235,12 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
         )
         now, prev = now + charge, s
         yield [origin + round(t * 1e9) if t > -math.inf else t for t in times]
+    yield _report(steps, rows, now, flush)
+
+
+def _report(steps, rows, now, flush=None) -> dict:
+    """The gate's report on `rows`, one per graded step, and the run's
+    predicted span `now`."""
     kinds = {}
     for k in KINDS:
         if err := [r[2] for r in rows if r[1] == k]:
@@ -225,7 +251,7 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
             kinds[k] = (len(err), p10, p50, p90, np.median(r1) if r1 else None, ok)
     span = (steps[-1]["t_exit_ns"] - steps[0]["t_enter_ns"]) * 1e-9
     total = 100 * (now / span - 1)
-    yield {
+    return {
         "kinds": kinds,
         "total": total,
         "pass": abs(total) <= TOTAL_BAND and all(v[-1] for v in kinds.values()),
@@ -234,8 +260,86 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
     }
 
 
-def main(record: str, machine=None, row_bytes=None) -> int:
-    """Print the gate per DP rank and pipeline stage of `record`; 1 if any fails."""
+def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
+    """`check`'s report with each forward priced in place of measured: its
+    device time, target then draft, by `law`'s step linear law
+    (`StepLinearBackend` on its `step_labels` sample's view, from `samples`),
+    and its host segments by the law's host laws, `law["host"]["laws"]`,
+    graded against the same measured period. After each forward the engine
+    runs its `E_out` before the next call. An idle forward's `E`, the first's
+    too, stays measured from the last pull or exit: it holds the wait for an
+    arrival, which no law prices. Steps in `warm` are charged and not graded,
+    as is a forward whose period ran more than `WARM_FACTOR` times its charge,
+    a one-off first touch the laws do not price; so are steps the law
+    refuses, charged 0 s of device time as a run charges them and counted per
+    kind under the report's `refused`. Steps in `jit` paid a first-use JIT
+    compile: each and the forward after it, whose period takes up the stall,
+    are charged and not graded, and the report's `jit` holds their count and
+    the measured time their charges leave out, in seconds."""
+    backend = StepLinearBackend(StepLinearLaw(law))
+    hosts, views = law["host"]["laws"], {s.step: s.view for s in samples}
+    mtp = any("d_target_ns" in s for s in steps)
+    clock, exit_, out_s, prev, rows, refused = [0.0], 0.0, 0.0, None, [], {}
+    apart, uncharged = {*jit, *(n + 1 for n in jit)}, 0.0
+    rec = HostDeviceRecurrence({}, (), lambda: clock[0], mtp=mtp)
+    for s in steps:
+        if (view := views.get(s["step"])) is None:
+            raise ValueError(f"step {s['step']} has no labelled sample to price")
+        kind, rec.laws = _kind(s, prev), hosts
+        last = prev["t_exit_ns"] if prev else s["t_enter_ns"]
+        if kind == "idle":
+            pull = prev.get("t_pull_ns", last) if prev else last
+            e = [(s["t_enter_ns"] - pull) * 1e-9, 0, 0]
+            rec.laws = {k: {**v, "E": e} for k, v in hosts.items()}
+        batch = SimpleNamespace(
+            total_tokens_num=sum_tokens(view.requests),
+            total_seqs_num=len(view.requests),
+            total_seqs_num_prefill=len(view.prefill),
+            produces_output=lambda out=s["produces_output"]: out,
+        )
+        clock[0] = exit_ + out_s
+        queued = rec.ends[1] - rec.prepare_end(clock[0], *forward_shape(batch))[0]
+        graded = s["step"] not in {*warm, *apart}
+        try:
+            cost = backend.price(view)
+            device = cost.target_seconds, cost.draft_seconds
+        except CostRefused:  # a run charges it 0 s of device time
+            device, graded = (0.0, 0.0), False
+            refused[kind] = refused.get(kind, 0) + 1
+        charge = out_s + rec.charge(batch, *device)
+        period = (s["t_exit_ns"] - last) * 1e-9
+        if s["step"] in apart:
+            uncharged += period - charge
+        if graded and period <= WARM_FACTOR * charge:
+            res, queued = (charge - period) * 1e3, max(queued, 0.0) * 1e3
+            rows.append(
+                (s["step"], kind, 100 * (charge / period - 1), res, queued, None)
+            )
+        exit_, out_s, prev = exit_ + charge, rec.out_s or 0.0, s
+    n = sum(s["step"] in jit for s in steps)
+    return _report(steps, rows, exit_) | {"refused": refused, "jit": (n, uncharged)}
+
+
+def jit_steps(law: dict, run: str) -> set[int]:
+    """The steps `law`'s host fit names as paying a first-use JIT compile on
+    `run`, a run it was fitted on; none on another."""
+    return set(law.get("host_fit", {}).get("jit_steps", {}).get(run, ()))
+
+
+def warm_steps(law: dict, run: str) -> set[int]:
+    """The steps `law` and its draft law name warm on `run`, a run they were
+    fitted on (`step_linear_fit`); none on another."""
+    return {
+        n
+        for fitted in (law, law.get("draft", {}))
+        if run in fitted.get("runs", ())
+        for n in fitted["warm_steps"][fitted["runs"].index(run)]
+    }
+
+
+def main(record: str, machine=None, row_bytes=None, law=None) -> int:
+    """Print the gate per DP rank and pipeline stage of `record`, or with the
+    law file `law` its `priced` grade per DP rank; 1 if any fails."""
     carriers = None
     if machine:
         spec = MachineSpec.from_mapping(json.loads(Path(machine).read_text()))
@@ -253,10 +357,23 @@ def main(record: str, machine=None, row_bytes=None) -> int:
             f"{record} ran at TP {tp}: each stage sends shards its receiver "
             "all-gathers, and the gate prices whole tensors with no all-gather"
         )
-    for rank, steps in stages[0].items():
-        reports = (
-            pipeline([d[rank] for d in stages], carriers) if pp > 1 else [check(steps)]
+    if law is not None and (pp > 1 or (Path(record) / ARRIVALS).exists()):
+        raise ValueError(
+            f"{record} is a pipeline's or renumbers its steps from the first "
+            "send; a law grades one stage's steps as the record numbers them"
         )
+    paths = [Path(record) / f"dp{rank}.jsonl" for rank in stages[0]]
+    run = ", ".join(map(step_labels.digest, paths)) if law else None
+    law = law and json.loads(Path(law).read_text())
+    for path, (rank, steps) in zip(paths, stages[0].items()):
+        if law:
+            samples = step_labels.label(path)[0]
+            warm, jit = warm_steps(law, run), jit_steps(law, run)
+            reports = [priced(steps, samples, law, warm, jit)]
+        elif pp > 1:
+            reports = pipeline([d[rank] for d in stages], carriers)
+        else:
+            reports = [check(steps)]
         runs += [(i, rank, report) for i, report in enumerate(reports)]
     for i, rank, report in runs:
         ok &= report["pass"]
@@ -270,6 +387,13 @@ def main(record: str, machine=None, row_bytes=None) -> int:
             )
         gate = "pass" if abs(report["total"]) <= TOTAL_BAND else "FAIL"
         print(f"    total {report['total']:+.3f}% {gate}")
+        for k, n in report.get("refused", {}).items():
+            print(f"    {k}: {n} steps the law refuses, charged 0 s of device time")
+        if "jit" in report:
+            n, s = report["jit"]
+            print(
+                f"    jit: {n} forwards and the one after each not graded, {s:.3f} s uncharged"
+            )
         if report["flush"] is not None and not report["flush"][1]:
             print("    flush: the record stamps no flush")
         elif report["flush"] is not None:
@@ -296,4 +420,7 @@ def main(record: str, machine=None, row_bytes=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(*sys.argv[1:]) if len(sys.argv) in (2, 4) else __doc__)
+    args = sys.argv[1:]
+    if len(args) == 3 and args[1] == "--law":
+        sys.exit(main(args[0], law=args[2]))
+    sys.exit(main(*args) if len(args) in (1, 3) else __doc__)
