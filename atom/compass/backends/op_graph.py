@@ -110,13 +110,13 @@ COMPOSED = 1 << 12
 #: leaf's work does not read.
 REFS = ({"context"}, {"module"})
 #: What a price list reads of a leaf, as `_Seen` paths.
-LISTED_READS = {("op",), ("args",), ("out",), ("stated",)}
+LISTED_READS = {("args",), ("out",), ("stated",)}
 
 
 class _Seen(Mapping):
     """A leaf, or its `args` or `stated`, that adds each path its reader
     looks up to `reads`: a key, present or not, or the path and None when it
-    walks every key."""
+    walks every key or takes `args` or `stated`, whose presence it reads."""
 
     def __init__(self, data: dict, reads: set, at: tuple = ()) -> None:
         self.data, self.reads, self.at = data, reads, at
@@ -124,6 +124,7 @@ class _Seen(Mapping):
     def __getitem__(self, key):
         path = self.at + (key,)
         if path in (("args",), ("stated",)) and isinstance(self.data.get(key), dict):
+            self.reads.add(path + (None,))
             return _Seen(self.data[key], self.reads, path)
         self.reads.add(path)
         return self.data[key]
@@ -156,15 +157,16 @@ def _at(leaf: dict, path: tuple) -> list:
 
 
 def _same(priced: list) -> tuple:
-    """A key that two lists of ``(leaf, in a Par, price)`` share only when
-    they hold the same leaf objects in order, each at a price of the same
-    value, its work too in a `Par`, the only join that reads it."""
+    """A key that two lists of a graph's ``(leaf, in a Par, price)`` share
+    only when each leaf is at a price of the same value, its work too in a
+    `Par`, the only join that reads it. The share index stays: a step can
+    share leaves another step prices apart, so equal values can sit on other
+    leaves."""
     first: dict[tuple, tuple] = {}
     for _, par, p in priced:
         value = p if par or p is None else p[:3] + p[4:]
         first.setdefault((id(p), par), (len(first), value))
     return (
-        tuple((id(leaf), par) for leaf, par, _ in priced),
         tuple(first[id(p), par][0] for _, par, p in priced),
         repr([value for _, value in first.values()]),
     )

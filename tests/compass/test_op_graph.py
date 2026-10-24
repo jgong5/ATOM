@@ -385,6 +385,46 @@ def test_a_part_of_a_leaf_read_only_on_some_leaves_keys_each_leaf(monkeypatch):
     assert [by_name(backend(region).price(DECODE))] == alone(region, [DECODE])
 
 
+def test_a_leaf_with_stated_fields_and_one_without_price_apart(monkeypatch):
+    kind = "aiter.reads_whether_stated.default"
+
+    def extract(op, view, tp, kv):
+        return Work({}, 1e9 if "stated" in op else 2e9)
+
+    monkeypatch.setitem(op_work.EXTRACTORS, kind, extract)
+    region = {"seq": [leaf(kind, [[1]]) | {"stated": {"k": 1}}, leaf(kind, [[1]])]}
+    assert [by_name(backend(region).price(DECODE))] == alone(region, [DECODE])
+
+
+@pytest.mark.parametrize("walk", [len, lambda op: sum(1 for _ in op)])
+def test_leaves_whose_work_walks_their_keys_price_apart_by_each_key(monkeypatch, walk):
+    kind = "aiter.walks_its_keys.default"
+    monkeypatch.setitem(
+        op_work.EXTRACTORS, kind, lambda op, *_: Work({}, walk(op) * 1e9)
+    )
+    region = {"seq": [leaf(kind, [[1]]), leaf(kind, [[1]]) | {"stated": {"k": 1}}]}
+    assert [by_name(backend(region).price(DECODE))] == alone(region, [DECODE])
+
+
+def test_a_graph_s_price_kept_for_leaves_shared_otherwise_is_not_reused(monkeypatch):
+    """The `x` 2 leaf reads `y` first at the first step, so its last leaf
+    shares with the first only at the second, at the same values elsewhere."""
+    kind = "aiter.reads_y_when_x_2.default"
+
+    def extract(op, view, tp, kv):
+        long = max(r.context_tokens for r in view.requests) > 1_000
+        if op["args"]["x"] == 2 and op["args"]["y"] == 0:
+            return Work({}, 1e9 if long else 3e9)
+        return Work({}, op["args"]["x"] * 1e9)
+
+    monkeypatch.setitem(op_work.EXTRACTORS, kind, extract)
+    xy = ((1, 0), (3, 0), (3, 1), (2, 0), (1, 0))
+    region = {"seq": [leaf(kind, [[1]], x=x, y=y) for x, y in xy]}
+    steps = [DECODE, view((1, 9_000, True), (1, 30, True), rung=2)]
+    ops = backend(region)
+    assert [by_name(ops.price(s)) for s in steps] == alone(region, steps)
+
+
 def test_a_graph_s_price_is_kept_only_for_its_leaves_prices_and_work_in_a_par():
     """Attention at the kernel floor at either step's rows, its bytes summed
     with a memory-bound GEMM's."""
@@ -850,6 +890,26 @@ def test_one_backend_prices_each_step_at_its_own_bound():
     assert [by_name(ops.price(s)) for s in steps] == [
         by_name(backend(g(2, 64, 64), price_list=BANDED).price(s)) for s in steps
     ]
+
+
+def test_leaves_whose_work_skips_what_they_state_take_the_list_s_price_apart():
+    a, b = (g(2, 64, 64) | {"stated": {"x": x}} for x in (1, 2))
+    params = listed(*[pt(a, "decode B=2", 5e5, c) for c in (100, 1000)])
+    one = [by_name(backend(x, price_list=params).price(DECODE)) for x in (a, b)]
+    both = by_name(backend({"seq": [a, b]}, price_list=params).price(DECODE))
+
+    assert one[0] != one[1]
+    assert sorted(both) == sorted(one[0] | one[1])
+
+
+def test_a_leaf_the_list_holds_at_other_outputs_refuses_beside_one_it_holds():
+    kind = "aiter.no_extractor_listed.default"
+    a, b = (leaf(kind, [[2, n]], x=t([2, 64])) for n in (64, 128))
+    params = listed(*[pt(a, "decode B=2", 5e5, c) for c in (100, 1000)])
+    backend(a, price_list=params).price(DECODE)
+
+    with pytest.raises(CostRefused):
+        backend({"seq": [a, b]}, price_list=params).price(DECODE)
 
 
 ATTN = leaf(ATTENTION, [[64, 6144]], q=t([64, 24, 256]), k=t([64, 4, 256]))
