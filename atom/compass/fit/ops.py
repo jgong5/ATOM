@@ -5,8 +5,10 @@
 
 Each DIR is a `measure ops --out` directory; each point its ops.jsonl, or with
 `--plan` each round's, lists as measured is read back from S, where `measure
-ops` published it. A point a `--plan` run found already in S is in no round's
-ops.jsonl: pass the directory that measured it too. Every point
+ops` published it. A `--plan` run resumed into a DIR keeps the rounds earlier
+runs wrote there, so DIR lists every run's points. A point a `--plan` run
+found already in S is in no round's ops.jsonl: pass the directory that
+measured it too. Every point
 must name one `price_list` key, its model, parallel layout, machine-spec
 digest and source root, and one torch; the price list is published at that key
 under the readings the points ran under.

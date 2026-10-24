@@ -22,11 +22,12 @@ from test_artifact_store import CONDITIONS, GATES, stanza
 from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
 from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 
-from atom.compass import capture, ir
+from atom.compass import capture, cli, ir
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.bench import ops
 from atom.compass.capture import forward
 from atom.compass.capture.forward import decode, structure
+from atom.compass.fit import ops as fit_ops
 from atom.compass.run import memory, step_grid
 from atom.compass.runner.overrides import schedulable_ladder
 from atom.compass.spec import MachineSpec
@@ -953,7 +954,7 @@ def test_a_child_that_dies_costs_the_plan_only_the_point_it_was_measuring(
         for d in dead
     ]
     assert [r for r in records if "refused" not in r] == [
-        r for r in whole if r not in dead
+        r for r in whole if {k: r[k] for k in r if k != "token"} not in dead
     ]
     monkeypatch.setattr(ops, "_child", _bench)
     again = _plan(bench, tmp_path, population)  # the next plan retries them
@@ -970,6 +971,46 @@ def test_a_child_that_dies_at_startup_every_time_fails_the_plan(
     with pytest.raises(BrokenProcessPool):
         _plan(bench, tmp_path, population)
     assert len(dead) == 2
+
+
+def test_a_plan_resumed_into_its_out_keeps_both_runs_points_for_fit_ops(
+    bench, tmp_path, monkeypatch
+):
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[1, 12000, True]], 1),
+        ([[150, 150, False]], None),
+    )
+    store, root, key, run = bench
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "run.json").write_text(json.dumps(run))
+    (out / "engine.json").write_text(json.dumps({"level": 0}))
+    publish = ops.publish
+
+    def stopped_after_round1(*args):
+        publish(*args)
+        if args[-1].name == "round1":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(ops, "publish", stopped_after_round1)
+    with pytest.raises(KeyboardInterrupt):
+        _plan(bench, tmp_path, population)
+    first = (out / "plan.jsonl").read_text()  # written after each round
+    monkeypatch.setattr(ops, "publish", publish)
+    records = _plan(bench, tmp_path, population)
+
+    tokens = {r["token"] for r in records if "refused" not in r}
+    assert {json.loads(x)["token"] for x in first.splitlines()} < tokens
+    assert (out / "round0" / "ops.jsonl").read_text()  # the first run's, kept
+    got = fit_ops.read(store, [out])[0]
+    assert {key(p["shape"], p["context"], p["leaf"]).token() for p in got} == tokens
+    fit = tmp_path / "fit"
+    cli.main(["fit", "ops", str(out), "--store", root, "--out", str(fit)])
+    assert json.loads((fit / "price_list.json").read_text())["report"]["points"] == len(
+        tokens
+    )
 
 
 def test_measure_journals_each_record_as_it_finishes_it(tmp_path, monkeypatch):
