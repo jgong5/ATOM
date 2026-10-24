@@ -902,6 +902,17 @@ def test_leaves_whose_work_skips_what_they_state_take_the_list_s_price_apart():
     assert sorted(both) == sorted(one[0] | one[1])
 
 
+def test_leaves_whose_work_skips_an_argument_take_the_list_s_price_apart():
+    a, b = g(2, 64, 64), g(2, 64, 64)
+    a["args"]["x"], b["args"]["x"] = 1, 2
+    params = listed(*[pt(a, "decode B=2", 5e5, c) for c in (100, 1000)])
+    one = [by_name(backend(x, price_list=params).price(DECODE)) for x in (a, b)]
+    both = by_name(backend({"seq": [a, b]}, price_list=params).price(DECODE))
+
+    assert one[0] != one[1]
+    assert sorted(both) == sorted(one[0] | one[1])
+
+
 def test_a_leaf_the_list_holds_at_other_outputs_refuses_beside_one_it_holds():
     kind = "aiter.no_extractor_listed.default"
     a, b = (leaf(kind, [[2, n]], x=t([2, 64])) for n in (64, 128))
