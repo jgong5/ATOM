@@ -336,3 +336,19 @@ def test_host_laws_fit_an_mtp_decode_whose_tokens_are_its_rows_times_a_width(tmp
     for segment, c in HOST["decode"].items():
         got = host["laws"]["decode"][segment]
         assert got == pytest.approx(c, rel=1e-4, abs=1e-12), segment
+
+
+def test_an_mtp_record_s_target_prefill_vector_fits_seqs_and_out(tmp_path):
+    """A prefill that produces output runs 2e-3 s more on its target and 3e-4 s
+    more a sequence; every fourth step's is a middle chunk."""
+    steps = [
+        (rows, rung, s + (3e-4 * len(rows) + 2e-3) * (i % 4 > 0 and not rows[0][2]))
+        for i, (rows, rung, s) in enumerate(_steps(3))
+    ]
+    path = _mtp_record(tmp_path / "dp0.jsonl", steps)
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    for i, line in enumerate(lines):
+        line["produces_output"] = bool(i % 4)
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    target = _fit([path])["prefill"]["coefficients"]
+    assert (target["seqs"], target["out"]) == pytest.approx((3e-4, 2e-3), rel=1e-4)

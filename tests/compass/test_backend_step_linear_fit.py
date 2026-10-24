@@ -484,13 +484,19 @@ def test_a_prefill_whose_exit_ran_under_the_paced_share_after_its_host_record_is
     tmp_path,
 ):
     """Output prefill 2's exit event runs 7% of its label after the host records
-    it, prefill 6's 9%: the host paced 2, the device 6."""
+    it, prefill 6's 9%: the host paced 2, the device 6. On this MTP record
+    prefill 10's runs 6% of its window, 12% of its target label: the device
+    paced it. The host clock reads 1000 s ahead of the device's."""
     record, _ = _timed_record(tmp_path / "dp0.jsonl", _steps(14, n=40))
     lines = [json.loads(x) for x in record.read_text().splitlines()]
+    for s in lines:
+        for k in [k for k in s if k.startswith("t_")]:
+            s[k] = np.add(s[k], 10**12).tolist()
+        s["d_target_ns"] = s["d_busy_ns"] // (2 if s["step"] == 10 else 1)
     end = lines[0]["t_launch_ns"][0]  # the first forward's device start
     for s in lines:
         end += s.get("d_gap_ns", 0) + s["d_busy_ns"]
-        share = {2: 0.07, 6: 0.09}.get(s["step"])
+        share = {2: 0.07, 6: 0.09, 10: 0.06}.get(s["step"])
         if share:
             s["t_exit_ns"] = end - round(share * s["d_busy_ns"])
     record.write_text("".join(json.dumps(s) + "\n" for s in lines))
@@ -503,13 +509,14 @@ def test_a_prefill_whose_exit_ran_under_the_paced_share_after_its_host_record_is
 def test_a_launch_a_first_use_compile_stalls_is_named_and_left_out_with_the_next(
     tmp_path,
 ):
-    """Ten output prefills' launches run 20 times their law, a compile, and the
-    decode after each enters 0.9% late, inside the MAD floor, as its period
-    takes up the stall. Decode 251's launch runs 6 times its law, decode 151's
-    3 times: a decode's launch counts as a compile only past `WARM_FACTOR`."""
+    """Ten output prefills' launches stall on a compile, each 20 times its law
+    but 106's twice, and the decode after each enters 0.9% late, inside the MAD floor,
+    as its period takes up the stall. Decode 251's launch runs 6 times its law,
+    decode 151's 3 times: a decode's launch counts as a compile only past
+    `WARM_FACTOR`, a prefill's whenever the fit drops it above its law."""
     jit = list(range(102, 142, 4))
     scale = {(n, "W_launch"): 20 for n in jit} | {(n + 1, "E"): 1.009 for n in jit}
-    scale |= {(151, "W_launch"): 3, (251, "W_launch"): 6}
+    scale |= {(106, "W_launch"): 2, (151, "W_launch"): 3, (251, "W_launch"): 6}
     record, _ = _timed_record(tmp_path / "dp0.jsonl", _steps(14, n=400), scale=scale)
 
     host, report = fit_host(label_records([record])[0])
