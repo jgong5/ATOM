@@ -1179,7 +1179,7 @@ def test_a_kv_leaf_past_its_cold_copies_counts_each_copy_s_activations_once(
     placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
     graphs = []
 
-    def replay(fn, calls):
+    def replay(fn, calls, flush=None):
         graphs.append(calls)
         return [1.0] * ops.REPEATS
 
