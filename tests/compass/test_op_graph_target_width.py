@@ -302,6 +302,9 @@ def test_a_padded_decode_prices_its_model_at_its_width_and_its_sampler_at_its_ro
     }
 
 
+FOUR = (RequestShape(3, 90, True),) * 4
+
+
 class AskedG(Asked):
     """`Asked`, with each leaf's G too."""
 
@@ -314,14 +317,47 @@ class AskedG(Asked):
 @pytest.mark.parametrize(
     "options,view,graph,asked",
     [
-        # V4-Pro MTP2 at DP2: its first pass's MoE gathers 8, every rank's later
-        # passes 4 rows each.
+        # V4-Pro MTP2 at DP2 beside a peer's 4 rows: its first pass's MoE gathers
+        # 9 + 12, every rank's later passes 4 rows each.
         (
             {"dp": 2},
-            {"moe_rows": 24, "target_bs": 4, "draft_moe_rows": 8},
-            [g(9, 64, 64), g(8, 32, 64), argmax(3), g(4, 64, 64)],
-            [(GEMM, 9, 3, 3, 8), (GEMM, 8, 3, 3, 8)]
-            + [(ARGMAX, 3, 3, 3, 8), (GEMM, 4, 4, 4, 8)],
+            {"moe_rows": 24, "target_bs": 4, "draft_moe_rows": 21},
+            [g(9, 64, 64), g(21, 32, 64), argmax(3), g(4, 64, 64), g(8, 32, 64)],
+            [(GEMM, 9, 3, 3, 21), (GEMM, 21, 3, 3, 21), (ARGMAX, 3, 3, 3, 21)]
+            + [(GEMM, 4, 4, 4, 8), (GEMM, 8, 4, 4, 8)],
+        ),
+        # At DP2 over 4 rows beside a peer's 6: its later passes' MoE gathers 12,
+        # a first-pass count too, asked at the rows and the smaller G.
+        (
+            {"dp": 2},
+            {"requests": FOUR, "draft_moe_rows": 30, "draft_bs": 6},
+            [g(12, 64, 64), g(30, 32, 64), g(6, 64, 64), g(12, 32, 64)],
+            [(GEMM, 12, 4, 4, 12), (GEMM, 30, 4, 4, 30), (GEMM, 6, 6, 6, 12)]
+            + [(GEMM, 12, 4, 4, 12)],
+        ),
+        # At DP2 over 4 rows, its `draft_bs`: a later pass's 4 at its G.
+        (
+            {"dp": 2},
+            {"requests": FOUR, "draft_moe_rows": 24},
+            [g(12, 64, 64), g(24, 32, 64), g(4, 64, 64), g(8, 32, 64)],
+            [(GEMM, 12, 4, 4, None), (GEMM, 24, 4, 4, None), (GEMM, 4, 4, 4, 8)]
+            + [(GEMM, 8, 4, 4, 8)],
+        ),
+        # At DP8 beside peers' 5 and 1 rows: a count of both sides at
+        # `draft_moe_rows`, below every rank's `draft_bs`.
+        (
+            {"dp": 8},
+            {"draft_moe_rows": 42, "draft_bs": 6},
+            [g(6, 64, 64), g(48, 32, 64)],
+            [(GEMM, 6, 3, 3, 42), (GEMM, 48, 6, 6, 48)],
+        ),
+        # At DP2 over 2 rows beside a peer's 6: a count of both sides at the
+        # rows' default G.
+        (
+            {"dp": 2},
+            {"requests": FOUR[:2], "draft_moe_rows": 24, "draft_bs": 6},
+            [g(6, 64, 64)],
+            [(GEMM, 6, 2, 2, None)],
         ),
         # At DP4: its first pass gathers its default, its later passes 16; a
         # leaf over twice the width is no later pass's.
@@ -340,12 +376,21 @@ class AskedG(Asked):
             [(GEMM, 9, 3, 3, None), (GEMM, 4, 4, 4, None)],
         ),
     ],
-    ids=["mtp-dp2", "dp4", "replayed"],
+    ids=[
+        "mtp-dp2",
+        "both",
+        "draft-bs-rows",
+        "both-low-g",
+        "both-default-g",
+        "dp4",
+        "replayed",
+    ],
 )
 def test_a_drafter_asks_its_price_list_at_the_rows_and_g_each_pass_ran(
     options, view, graph, asked
 ):
-    step = BatchView(tuple(RequestShape(*row) for row in DECODE), draft_bs=4, **view)
+    rows = tuple(RequestShape(*row) for row in DECODE)
+    step = BatchView(**{"requests": rows, "draft_bs": 4, **view})
     listing = AskedG()
     graphs = {False: {"seq": []}, True: {"seq": graph}}
     backend = OpGraphBackend(
@@ -373,7 +418,7 @@ GATHERED = listed(
 
 @pytest.mark.parametrize(
     "dp,gathered,params",
-    [(1, {}, RUNGS), (2, {"moe_rows": 24, "draft_moe_rows": 8}, GATHERED)],
+    [(1, {}, RUNGS), (2, {"moe_rows": 24, "draft_moe_rows": 21}, GATHERED)],
     ids=["one-rank", "dp2"],
 )
 def test_a_drafter_prices_its_later_passes_at_draft_bs(dp, gathered, params):

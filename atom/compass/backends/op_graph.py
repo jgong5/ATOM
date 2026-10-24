@@ -251,14 +251,15 @@ def gathered_off_default(
 def _ran_at(leaf: dict, bound: tuple) -> tuple:
     """`bound` at the rows `leaf` ran: a padded target's (`_bound`) at its
     width where an activation, metadata or output of the leaf leads with the
-    width's counts and none with the rows', else at its rows."""
-    if len(bound) != 3:
+    width's counts and none with the rows', at both (`_bound`) where it leads
+    with both's, else at its rows."""
+    if len(bound) != 4:
         return bound
-    rows, wide, (counts, wides) = bound
+    rows, wide, both, (counts, wides) = bound
     args = _tensors(list(leaf["args"].values()))
     shapes = [a["shape"] for a in args if a["role"] in ("activation", "metadata")]
     leads = {n for s in shapes + leaf["out"] for n in s[:1]}
-    return wide if leads & wides and not leads & counts else rows
+    return (both if leads & counts else wide) if leads & wides else rows
 
 
 class OpGraphBackend(CostBackend):
@@ -401,7 +402,9 @@ class OpGraphBackend(CostBackend):
         With `draft`, its drafter's: its first pass at its rows, unpadded, G
         `draft_moe_rows` off its rows' default; its later passes at `draft_bs`,
         G every rank's `draft_bs`; the first pass's gathered a rows' count, the
-        later passes' a width's."""
+        later passes' a width's. A leaf with both counts is asked at its rows'
+        T and B and the smaller G: on a drafter its rows carry the first
+        pass's G, above a later pass's."""
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
@@ -421,12 +424,15 @@ class OpGraphBackend(CostBackend):
             k = range(1, self.drafts + 2)
             counts = {b * j for j in k}
             wides = {width * j for j in k} | {self.dp * width * k[-1]}
-        wide = (phase, ran, width, *bound[3:])
+        wide, both = (phase, ran, width, *bound[3:]), bound
         if draft:
             padded = self.dp * width
             counts, wides = counts | {gathered}, {width, padded}
             wide = (phase, ran, width, gathered and padded, *bound[4:])
-        return bound, wide, (frozenset(counts), frozenset(wides))
+            low = gathered and min(gathered, padded)
+            g = gathered_off_default(phase, t, low, self.dp, self.drafts)
+            both = (phase, t, b, g, *bound[4:])
+        return bound, wide, both, (frozenset(counts), frozenset(wides))
 
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
