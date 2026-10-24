@@ -85,7 +85,7 @@ from dataclasses import replace
 
 from atom.compass.backends.base import CostBackend, Granularity
 from atom.compass.backends.cost import CostTerm, StepCost, fold_seconds
-from atom.compass.backends.op_work import work
+from atom.compass.backends.op_work import _tensors, work
 from atom.compass.backends.provenance import Method, Provenance, Refusal, combine
 from atom.compass.backends.resolver import CostRefused, CostSource, Resolver
 from atom.compass.backends.shape import IMAGES, BatchView
@@ -248,6 +248,19 @@ def gathered_off_default(
     return None if gathered == dp * rows else gathered
 
 
+def _ran_at(leaf: dict, bound: tuple) -> tuple:
+    """`bound` at the rows `leaf` ran: a padded target's (`_bound`) at its
+    width where an activation, metadata or output of the leaf leads with the
+    width's counts and none with the rows', else at its rows."""
+    if len(bound) != 3:
+        return bound
+    rows, wide, (counts, wides) = bound
+    args = _tensors(list(leaf["args"].values()))
+    shapes = [a["shape"] for a in args if a["role"] in ("activation", "metadata")]
+    leads = {n for s in shapes + leaf["out"] for n in s[:1]}
+    return wide if leads & wides and not leads & counts else rows
+
+
 class OpGraphBackend(CostBackend):
     """A step as its shape's graph, one roofline per leaf, composed by its joins."""
 
@@ -319,6 +332,8 @@ class OpGraphBackend(CostBackend):
             self._live = [] if graph else None
             priced = self._priced(region, batch_view, refused, bound)
             if self.drafts:
+                rows = replace(batch_view, target_bs=None)  # its drafter's at its rows
+                bound = self.resolver and self._bound(rows)
                 priced += [
                     (DRAFT + p[0], *p[1:])
                     for p in self._priced(drafted, batch_view, refused, bound)
@@ -380,14 +395,29 @@ class OpGraphBackend(CostBackend):
         """What a price list reads of a step: its phase, its T and B, the rows
         its MoE gathers, None at their default (`gathered_off_default`),
         and its rows' context and max context (`band`), the
-        context a decode's max, a prefill's mean cached tokens."""
+        context a decode's max, a prefill's mean cached tokens. A padded target
+        (`target_bs`) adds it at that width, G at its default there, and the
+        counts a leaf leads with at its rows and at that width: a decode's
+        tokens, its MoE's gathered at the width; a prefill's, its width."""
         rung = view.capture_rung if self.padded else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
-        g = gathered_off_default(phase, t, view.moe_rows, self.dp, self.drafts)
+        width = self.padded and view.target_bs
+        ran = phase == "decode" and width or t
+        g = gathered_off_default(phase, ran, view.moe_rows, self.dp, self.drafts)
         rows = [(r.query_tokens, r.context_tokens) for r in view.requests]
         mean, top = band(rows, phase == "decode")
-        return (phase, t, b, g, top if phase == "decode" else mean, top)
+        bound = (phase, t, b, g, top if phase == "decode" else mean, top)
+        if not width:
+            return bound
+        if ran == t:
+            counts, wides = {t, b}, {width}
+        else:
+            k = range(1, self.drafts + 2)
+            counts = {b * j for j in k}
+            wides = {width * j for j in k} | {self.dp * width * k[-1]}
+        wide = (phase, ran, width, *bound[3:])
+        return bound, wide, (frozenset(counts), frozenset(wides))
 
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
@@ -597,7 +627,7 @@ class OpGraphBackend(CostBackend):
             return None
         if bound:
             try:
-                got = self.resolver.resolve((leaf, bound, w))
+                got = self.resolver.resolve((leaf, _ran_at(leaf, bound), w))
             except CostRefused as exc:
                 refused.extend(exc.declined)
                 return None
