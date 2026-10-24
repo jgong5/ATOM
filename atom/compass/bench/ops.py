@@ -720,12 +720,22 @@ class Stub:
                 record |= self._time(op, sig, inst, n)
                 # a KV argument is one view every copy reads at its placement:
                 # its bytes count once a placement, a slot's once however many
-                # placements wrap onto it
+                # placements wrap onto it; a copy past the cold ones reads copy
+                # `c mod m`'s activations
                 built = min(n, record.get("copies", n))
                 at = min(len(self.placed), -(-built // len(inst)))
                 wrap = self.slots // len(rows) if self.slots >= len(rows) else at
+                # ponytail: routed expert ids and an object's activations are
+                # drawn a copy each yet count once a cold copy here; split them
+                # out when a leaf with more instances than cold copies holds one
+                acts = sum(
+                    _span(s["shape"], s["stride"]) * _dtype(s["dtype"]).itemsize
+                    for _, s in _specs(op["args"])
+                    if s["role"] == "activation"
+                )
                 record["footprint_bytes"] = (
-                    built * (size - by_block - by_slot)
+                    built * (size - by_block - by_slot - acts)
+                    + min(built, self.cold_copies[sig]) * acts
                     + at * by_block
                     + min(at, wrap) * by_slot
                 )
