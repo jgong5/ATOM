@@ -108,7 +108,7 @@ def view(batch, counts, split=None, unified=False, rung=None):
         sync=sync,
         running_tokens_are_unified=unified,
         running_tokens=rung,
-        running_bs=rung,
+        running_bs=rung or 1,
         use_cudagraph=rung is not None,
     )
     return projection.batch_view(batch, mode, r)

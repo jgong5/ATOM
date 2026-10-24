@@ -10,7 +10,19 @@ import json
 import re
 
 import pytest
+from test_op_graph import g
+from test_work import SPEC
 
+from atom.compass.backends import (
+    CostTerm,
+    Method,
+    Provenance,
+    StepGrid,
+    StepGridBackend,
+)
+from atom.compass.backends.op_graph import LISTED, OpGraphBackend
+from atom.compass.backends.resolver import CostSource
+from atom.compass.backends.step_grid_residual import Residual
 from atom.compass.drive.aiter_jit import BUILDS
 from atom.compass.validate.cost import cost_accuracy, main
 
@@ -281,11 +293,33 @@ def test_a_group_step_prices_as_its_slowest_rank_against_the_group_s_time(tmp_pa
     assert total == pytest.approx(slowest, rel=1e-9)
     assert all(total > sum(_price(rows) for rows, _ in s) for s in ranks)
 
-    # Rank 1's step 10 lies outside the held-out hull, though rank 0 prices it.
+
+def test_a_group_step_is_validated_by_the_rank_it_is_priced_as(tmp_path):
+    # Step 10's cheaper rank 1 lies below the held-out hull; rank 0 prices it.
+    ranks = _two_ranks()
     ranks[1][10] = ([(1, 50, True)], 1)
     for r, steps in enumerate(ranks):
-        _record(tmp_path / "outside", steps, rank=r, group=ranks)
-    report = cost_accuracy(tmp_path / "outside", LAW)
+        _record(tmp_path / "cheaper", steps, rank=r, group=ranks)
+    report = cost_accuracy(tmp_path / "cheaper", LAW)
+    assert report["unvalidated"] == {}
+    assert report["validated"]["decode"]["steps"] == 10
+
+    # Now rank 1 prices step 10, above the hull.
+    ranks[1][10] = ([(1, 200_000, True)], 1)
+    for r, steps in enumerate(ranks):
+        _record(tmp_path / "costlier", steps, rank=r, group=ranks)
+    report = cost_accuracy(tmp_path / "costlier", LAW)
+    assert report["unvalidated"]["decode"]["steps"] == 1
+
+    # A law blind to padding prices both ranks of step 10 the same; the step
+    # is validated as rank 1, of more padding, outside the hull at padding 0.
+    law = json.loads(json.dumps(LAW))
+    law["decode"]["2"] = law["decode"]["1"]
+    ranks[0][10] = ([(1, 3000, True), (1, 3000, True)], 2)
+    ranks[1][10] = ([(1, 1000, True), (1, 5000, True)], 2)
+    for r, steps in enumerate(ranks):
+        _record(tmp_path / "tie", steps, rank=r, group=ranks)
+    report = cost_accuracy(tmp_path / "tie", law)
     assert report["unvalidated"]["decode"]["steps"] == 1
 
 
@@ -324,6 +358,12 @@ def test_a_peer_s_dummy_forward_is_priced_0_s_and_its_step_graded(tmp_path):
         assert s["real_s"] == pytest.approx(s["priced_s"], rel=1e-6)
     prefill = sum(_price(rows) for rows, _ in steps[:10])
     assert report["validated"]["prefill"]["priced_s"] == pytest.approx(prefill)
+
+    # Rank 1 ran dummies, and its last step was in flight: that step is cut.
+    stopped = [ranks[0], ranks[1][:-1]]
+    for r, s in enumerate(stopped):
+        _record(tmp_path / "stopped", s, rank=r, group=stopped)
+    assert cost_accuracy(tmp_path / "stopped", LAW)["cut"]["ranks"] == 1
 
 
 def test_a_group_step_is_banded_by_its_costliest_rank_not_rank_0(tmp_path):
@@ -389,3 +429,91 @@ def test_the_command_refuses_the_record_named_from_inside_it_or_by_a_link(
     named = f"{spelling} is not costed: aiter ran a JIT build of ['mha_varlen_fwd']"
     with pytest.raises(ValueError, match=re.escape(named)):
         main([spelling, str(law)])
+
+
+# Decode step i reads N_KV = 2000 + 5000 i: a hull to 10000 leaves steps 2 to 9 past it.
+PAST = 10000
+
+
+class _Listed(CostSource):
+    """A price list answering a decode GEMM at its step's price, by the method
+    `method` gives for the step's context."""
+
+    name = LISTED
+
+    def __init__(self, method):
+        self.method = method
+
+    def price(self, request):
+        context = request[1][-2]
+        how = self.method(context)
+        said = Provenance(how, note="stated" if how is Method.DECLARED else "")
+        return CostTerm(f"op.{request[0]['op']}", 0.02 + 1e-7 * context, said)
+
+
+def _op_graph(method):
+    """One GEMM per decode step, listed by `method`; no prefill graph."""
+    graph = lambda phase, *_: g(1, 64, 64) if phase == "decode" else None
+    return OpGraphBackend(SPEC, graph, kv="bf16", price_list=_Listed(method))
+
+
+def _past_hull(kind):
+    """`kind`'s backend, validated on decode steps to context `PAST` only."""
+    if kind == "step-linear":
+        law = json.loads(json.dumps(LAW))
+        vector = law["decode"]["1"]
+        vector["hull"]["facets"] = [[-1, 100], [1, -PAST]]
+        vector["held_out"]["hull"]["facets"] = [[-1, 100], [1, -PAST]]
+        return law
+    if kind == "step-grid":
+        from test_validate_step_grid import _bundle  # it imports this module
+
+        member = _bundle(_steps())
+        hull = {"facets": [[0, 1, 0, -PAST / 2**20]]}
+        member["residual"]["kinds"]["decode"]["hull"] = hull
+        grid, residual = StepGrid(member["grid"]), Residual(member["residual"])
+        return StepGridBackend(grid, residual, "b")
+    return _op_graph(lambda c: Method.MEASURED if c < PAST else Method.ESTIMATED)
+
+
+@pytest.mark.parametrize("kind", ["step-linear", "step-grid", "op-graph"])
+def test_an_unvalidated_step_moves_the_graded_error_at_every_backend(tmp_path, kind):
+    # The last decode step, past the hull, ran at twice its price.
+    steps = _steps()
+    report = cost_accuracy(
+        _record(tmp_path / "steps", steps, {19: 2.0}), _past_hull(kind)
+    )
+
+    validated, graded = report["validated"]["decode"], report["graded"]["decode"]
+    assert (validated["steps"], report["unvalidated"]["decode"]["steps"]) == (2, 8)
+    assert validated["on_totals"] == pytest.approx(0.0, abs=1e-9)
+    priced = sum(_price(rows) for rows, _ in steps[10:])
+    real = priced + _price(steps[19][0])
+    assert graded["steps"] == 10
+    assert graded["on_totals"] == pytest.approx(priced / real - 1, rel=1e-6)
+    assert report["declared"] == {}
+
+
+def test_a_step_with_a_declared_term_enters_no_graded_figure(tmp_path):
+    stated = _op_graph(lambda c: Method.MEASURED if c < PAST else Method.DECLARED)
+    report = cost_accuracy(_record(tmp_path / "steps", _steps(), {19: 2.0}), stated)
+
+    graded = report["graded"]["decode"]
+    assert graded["steps"] == 2
+    assert graded["on_totals"] == pytest.approx(0.0, abs=1e-9)
+    assert report["declared"]["decode"]["steps"] == 8
+    assert report["validated"]["decode"]["steps"] == 2
+    assert report["unvalidated"] == {}
+
+
+def test_one_validated_and_one_out_of_hull_step_grade_together(tmp_path):
+    # A prefill chunk inside the hull at its price, one past it at twice its price.
+    inside, wide = ([(500, 500, False)], None), ([(5000, 5000, False)], None)
+    record = _record(tmp_path / "steps", [inside, wide], {1: 2.0})
+    report = cost_accuracy(record, LAW)
+
+    assert report["validated"]["prefill"]["on_totals"] == pytest.approx(0.0, abs=1e-9)
+    a, b = _price(inside[0]), _price(wide[0])
+    graded = report["graded"]["prefill"]
+    assert graded["steps"] == 2
+    assert graded["on_totals"] == pytest.approx((a + b) / (a + 2 * b) - 1, rel=1e-6)

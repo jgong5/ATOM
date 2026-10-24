@@ -3992,7 +3992,7 @@
    "peer": "thread",
    "why": "a /metrics scrape renders the Prometheus registry on the frontend loop's default executor and awaits the render",
    "mechanism": "K1",
-   "mechanism_why": "a job on the frontend LP's default-executor station, which prices tokenization only; no service time is modelled for a render, so a simulated run refuses it at the hand-off and the run summary names it"
+   "mechanism_why": "a job on the frontend LP's default-executor station, charged no service time: a scrape is answered at its arrival unless tokenization holds every thread"
   },
   {
    "id": "atom/metrics/gpu.py::GPUForwardMetrics.poll::end.query()::event_poll#0",
@@ -4515,6 +4515,18 @@
    "shape": "device_sync",
    "peer": "none",
    "why": "the op bench waits for one profiled call of a leaf to finish before it reads the kernels the call launched",
+   "mechanism": "K9",
+   "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
+  },
+  {
+   "id": "atom/compass/bench/ops.py::_alive::torch.cuda.synchronize(device)::device_sync#0",
+   "file": "atom/compass/bench/ops.py",
+   "symbol": "_alive",
+   "call": "torch.cuda.synchronize",
+   "expr": "torch.cuda.synchronize(device)",
+   "shape": "device_sync",
+   "peer": "none",
+   "why": "the op bench checks after a leaf refused that its device still runs, and ends the measuring process when the device faulted",
    "mechanism": "K9",
    "mechanism_why": "the op bench times leaves on a real device for the measure ops command, and no simulated run starts one"
   },

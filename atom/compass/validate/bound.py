@@ -2,8 +2,8 @@
 """`compass validate bound`: the analytical price, at most the measured device
 time on every measured step, at step and at op level.
 
-    compass validate bound --model M [--tp N] --machine SPEC --store S
-        [--ops DIR] RECORD... [-- ATOM args]
+    compass validate bound --model M [--tp N] --machine SPEC [--ratios-from SPEC]
+        --store S [--ops DIR] RECORD... [-- ATOM args]
 
 A RECORD is a real run's directory, its step record in `steps/`. Each forward
 there that is not a DP dummy run is priced at step level by the step roofline,
@@ -12,6 +12,9 @@ configure, and at op level by `OpGraphBackend`, over the `op_graph`s `compass
 trace ops` published in S for the spec's arch; both price the rows a replayed
 graph pads to. Each price is compared with the step's device busy time,
 `d_busy_ns`, or on an MTP record the target's, `d_target_ns`.
+With `--ratios-from`, the prices are --machine's datasheet peaks at the other
+spec's probed ratios (`project.projected`): run on a device's own records,
+the report is the error of projecting it from the other.
 
 A data-parallel step (one with `moe_rows`) is read off every rank's line at
 that step: its `moe_tokens` is the group's scheduled tokens, a dummy rank's
@@ -57,6 +60,7 @@ import numpy as np
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.shape import sum_tokens
+from atom.compass.backends.step_labels import group_tokens
 
 SOURCE = "validate-bound"
 PHASES = ("decode", "prefill", "mixed")
@@ -87,7 +91,7 @@ def steps(record, tbo=False, mtp=False):
         lines = [r.get(step) for r in ranks]
         whole = None not in lines
         # num_tokens_across_dp: every rank's scheduled tokens, a dummy's one.
-        group = sum(q for s in lines if s for q, _, _ in s["rows"])
+        group = group_tokens(lines)
         split = _split(lines) if tbo and whole else None
         for path, s in zip(paths, lines):
             if s is None or s["is_dummy_run"]:
@@ -150,7 +154,7 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
     report = {}
     for level, backend in backends.items():
         violations, refused, rates, unpriced = [], Counter(), {}, 0
-        ratios = {p: [] for p in PHASES}
+        seconds = {p: [] for p in PHASES}  # (measured, priced) per step
         for record in records:
             tokens = measured_s = priced_s = 0.0
             for name, view, measured in steps(record, tbo, mtp):
@@ -163,7 +167,7 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
                     unpriced += 1
                     continue
                 priced = cost.seconds
-                ratios[_phase(view)].append(measured / priced)
+                seconds[_phase(view)].append((measured, priced))
                 tokens += sum_tokens(view.requests)
                 measured_s, priced_s = measured_s + measured, priced_s + priced
                 if priced > measured:
@@ -180,7 +184,7 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
                     )
             if priced_s:
                 rates[str(record)] = (tokens / measured_s, tokens / priced_s)
-        steps_priced = sum(map(len, ratios.values()))
+        steps_priced = sum(map(len, seconds.values()))
         verdict = "fail" if violations else "coverage report" if refused else "pass"
         report[level] = {
             "verdict": verdict,
@@ -189,18 +193,22 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
             "violations": violations,
             "refused": dict(refused.most_common()),
             "measured_over_analytical": {
-                p: dict(
-                    zip(
-                        ("min", "p10", "median", "p90", "max"),
-                        np.percentile(r, (0, 10, 50, 90, 100)),
-                    )
-                )
-                for p, r in ratios.items()
-                if r
+                p: _spread([m / a for m, a in s]) for p, s in seconds.items() if s
+            },
+            "analytical_s": {
+                p: {"total": sum(a for _, a in s), **_spread([a for _, a in s])}
+                for p, s in seconds.items()
+                if s
             },
             "ranking": _ranking(rates),
         }
     return report
+
+
+def _spread(values) -> dict:
+    """The min, p10, median, p90 and max of `values`."""
+    points = np.percentile(values, (0, 10, 50, 90, 100))
+    return dict(zip(("min", "p10", "median", "p90", "max"), points))
 
 
 def _ranking(rates: dict) -> dict | None:
@@ -261,12 +269,7 @@ def ops(out, machine, tp: int, kv: str, ep: int = 1) -> dict:
             f"{kind} {phase}": {
                 "points": len(r),
                 "above": sum(x < 1 for x in r),
-                **dict(
-                    zip(
-                        ("min", "p10", "median", "p90", "max"),
-                        np.percentile(r, (0, 10, 50, 90, 100)),
-                    )
-                ),
+                **_spread(r),
             }
             for (kind, phase), r in sorted(ratios.items())
         },
@@ -370,6 +373,63 @@ def _build(model: str, tp: int, atom_args, arch: str, tmpdir: str):
     return config, tree
 
 
+def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=None):
+    """ATOM's config for its arguments, the EP width its MoE resolves and the
+    step- and op-level backends pricing `records` on `machine`, the op_graphs
+    `store` holds for its arch. Refused: a record, or the `measure ops` run
+    `ops`, that ran under another engine; two-batch overlap no line splits."""
+    from atom.compass.backends.op_graph import OpGraphBackend
+    from atom.compass.backends.step_roofline import StepRooflineBackend
+    from atom.compass.run import _op_graphs, ep_width
+    from atom.compass.run.modules import walk
+
+    arch = machine.value("device.arch")
+    with tempfile.TemporaryDirectory(prefix="compass-bound-") as tmpdir:
+        config, tree = _build(model, tp, atom_args, arch, tmpdir)
+    dp = config.parallel_config.data_parallel_size
+    if config.enable_tbo_decode or config.enable_tbo and dp == 1:
+        raise ValueError(
+            "two-batch overlap of decode steps or on one rank: no step line "
+            "states its split, and only a data-parallel group's prefill split "
+            "is rebuilt from the group's lines"
+        )
+    engines = []
+    for record in records:
+        for path in sorted(Path(record, "steps").glob("dp*[0-9].jsonl")):
+            engine = path.with_suffix(".engine.json")
+            if engine.exists():
+                ran = json.loads(engine.read_text())
+            else:
+                ran = json.loads(path.with_suffix(".key.json").read_text())["engine"]
+            engines.append((path.parent, ran))
+    if ops:
+        engines.append((ops, json.loads(Path(ops, "engine.json").read_text())))
+    for where, ran in engines:
+        if differ := [k for k in PRICED if ran.get(k) != getattr(config, k)]:
+            raise ValueError(
+                f"{where} ran under another engine than ATOM's arguments resolve: "
+                + "; ".join(
+                    f"{k} {ran.get(k)!r} there, {getattr(config, k)!r} here"
+                    for k in differ
+                )
+            )
+    ep = ep_width(tree)
+    return (
+        config,
+        ep,
+        {
+            "step": StepRooflineBackend(machine, walk(tree)),
+            "op": OpGraphBackend(
+                machine,
+                _op_graphs(store, config, arch),
+                tp=config.tensor_parallel_size,
+                ep=ep,
+                kv=config.kv_cache_dtype,
+            ),
+        },
+    )
+
+
 def main(argv: list[str]) -> None:
     cut = argv.index("--") if "--" in argv else len(argv)
     p = argparse.ArgumentParser(prog="compass validate bound", description=__doc__)
@@ -379,6 +439,11 @@ def main(argv: list[str]) -> None:
     p.add_argument("--model", required=True, help="a model name or directory")
     p.add_argument("--tp", type=int, default=1, help="tensor-parallel width")
     p.add_argument("--machine", required=True, help="the machine spec")
+    p.add_argument(
+        "--ratios-from",
+        metavar="SPEC",
+        help="price on --machine's datasheet peaks at this spec's probed ratios",
+    )
     p.add_argument(
         "--store", required=True, help="the artifact store holding the op_graphs"
     )
@@ -390,58 +455,27 @@ def main(argv: list[str]) -> None:
     )
     args = p.parse_args(argv[:cut])
 
-    from atom.compass.backends.op_graph import OpGraphBackend
-    from atom.compass.backends.step_roofline import StepRooflineBackend
-    from atom.compass.run import _op_graphs, ep_width
-    from atom.compass.run.modules import walk
     from atom.compass.spec import MachineSpec
 
-    machine = MachineSpec.from_mapping(json.loads(Path(args.machine).read_text()))
-    arch = machine.value("device.arch")
-    with tempfile.TemporaryDirectory(prefix="compass-bound-") as tmpdir:
-        config, tree = _build(args.model, args.tp, argv[cut + 1 :], arch, tmpdir)
-    ep = ep_width(tree)
-    dp = config.parallel_config.data_parallel_size
-    if config.enable_tbo_decode or config.enable_tbo and dp == 1:
-        raise ValueError(
-            "two-batch overlap of decode steps or on one rank: no step line "
-            "states its split, and only a data-parallel group's prefill split "
-            "is rebuilt from the group's lines"
-        )
-    engines = []
-    for record in args.records:
-        for path in sorted(Path(record, "steps").glob("dp*[0-9].jsonl")):
-            engine = path.with_suffix(".engine.json")
-            if engine.exists():
-                ran = json.loads(engine.read_text())
-            else:
-                ran = json.loads(path.with_suffix(".key.json").read_text())["engine"]
-            engines.append((path.parent, ran))
-    if args.ops:
-        engines.append(
-            (args.ops, json.loads(Path(args.ops, "engine.json").read_text()))
-        )
-    for where, ran in engines:
-        if differ := [k for k in PRICED if ran.get(k) != getattr(config, k)]:
-            raise ValueError(
-                f"{where} ran under another engine than ATOM's arguments resolve: "
-                + "; ".join(
-                    f"{k} {ran.get(k)!r} there, {getattr(config, k)!r} here"
-                    for k in differ
-                )
-            )
-    backends = {
-        "step": StepRooflineBackend(machine, walk(tree)),
-        "op": OpGraphBackend(
-            machine,
-            _op_graphs(args.store, config, arch),
-            tp=config.tensor_parallel_size,
-            ep=ep,
-            kv=config.kv_cache_dtype,
-        ),
-    }
+    from .project import projected
+
+    def spec(path):
+        return MachineSpec.from_mapping(json.loads(Path(path).read_text()))
+
+    machine = spec(args.machine)
+    if args.ratios_from:
+        machine = projected(machine, spec(args.ratios_from))
+    config, ep, priced = backends(
+        args.model,
+        args.tp,
+        argv[cut + 1 :],
+        machine,
+        args.store,
+        args.records,
+        args.ops,
+    )
     mtp = config.speculative_config is not None
-    report = gate(args.records, backends, config.enable_tbo, mtp)
+    report = gate(args.records, priced, config.enable_tbo, mtp)
     print(text(report))
     if args.ops:
         print(

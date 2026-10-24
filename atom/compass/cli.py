@@ -51,6 +51,10 @@ COMMANDS = {
         "atom.compass.validate.bound",
         "real runs' steps priced analytically at step and op level, none above measured",
     ),
+    "validate project": (
+        "atom.compass.validate.project",
+        "real runs' steps priced analytically on another device, published as a projection",
+    ),
 }
 OPS = "the op-level half of the toolchain is not built yet"
 MACHINE = (

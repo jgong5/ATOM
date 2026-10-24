@@ -69,7 +69,11 @@ bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 holds at its shape and output, the run's TP and EP widths and KV cache format; capture traces
 eager forwards, so a graph-mode run reads the eager graphs too; with
 ``price_list``, the fields of a `price_list` key ``store`` holds, loaded
-under this run's readings, it prices each leaf from it first),
+under this run's readings, it prices each leaf from it first; with
+``atom_args``, ATOM's arguments the server was started with, which `compass
+run` writes, a shape the store holds no graph at is traced first, in a
+process of its own, and published there, and a trace that fails ends the
+run, naming the shape),
 ``step_roofline`` (optional, ``true`` or ``false``: with ``true`` a
 `StepRooflineBackend` prices the steps the backend refuses, through
 `StepFallbackBackend`, as it always does under ``step_grid``, from the
@@ -106,7 +110,8 @@ engine's are the worker's refused commands and the engine's refused clock
 calls, a frontend's its executor's refused jobs and its refused clock calls.
 An engine's also holds what its worker's steps cost, for the summary's
 predicted seconds and their shares by method (`backends.cost.GROUPS`), and
-its counts of steps extrapolated and of steps a fallback priced.
+its counts of steps extrapolated and of steps a fallback priced, and of its
+lazy traces with their wall seconds, which the summary's cost half totals.
 It holds the memory the worker predicts too, for
 ``python -m atom.compass.memory.check``, with the assumption a
 `memory_readings` member it read states, which `compass run` records, and
@@ -282,6 +287,8 @@ COMPASS_ONLY = {
 #: The run-file key of each backend a flag names (`atom.compass.drive.runfile`).
 STEP_STUB, STEP_LINEAR, STEP_GRID = "step_stub", "step_linear", "step_grid"
 OP_GRAPH, PRICE_LIST = "op_graph", "price_list"
+#: The run-file key of ATOM's arguments an op graph run's server was started with.
+ATOM_ARGS = "atom_args"
 #: The run-file key of the frontend's seconds to prepare one image of a chat request.
 IMAGE_PREPROCESS = "image_preprocess_s"
 #: Run-file keys that were renamed, to their names now.
@@ -1387,11 +1394,13 @@ def runner(model_runner, tree) -> None:
                 f"the run file's op_graph is {run[OP_GRAPH]!r}; it is true, which "
                 "prices each step from the op_graph the store holds at its shape"
             )
+        model_runner.compass_lazy = {"lazy_traces": 0, "lazy_trace_wall_seconds": 0}
         backend = op_graph(
             run,
             config,
             machine,
             ep=ep_width(tree),
+            lazy=model_runner.compass_lazy,
         )
     elif PRICE_LIST in run:
         raise ValueError(
@@ -1481,15 +1490,18 @@ def ep_width(tree) -> int:
     return moe[0].moe_parallel_config.ep_size if moe else 1
 
 
-def op_graph(run: dict, config, machine, ep: int = 1):
+def op_graph(run: dict, config, machine, ep: int = 1, lazy: dict | None = None):
     """The `OpGraphBackend` the run file `run` names for `config` on
-    `machine` at EP width `ep`, with its price list when it names one."""
+    `machine` at EP width `ep`, with its price list when it names one; with
+    `lazy`, a shape no graph holds is traced from the run file's `ATOM_ARGS`
+    when it holds them (`_op_graphs`), counted in `lazy`."""
     from atom.compass.backends.op_graph import OpGraphBackend
 
     drafter = getattr(config, "speculative_config", None)
+    lazily = (run[ATOM_ARGS], lazy) if lazy is not None and ATOM_ARGS in run else ()
     return OpGraphBackend(
         machine,
-        _op_graphs(run["store"], config, machine.value("device.arch")),
+        _op_graphs(run["store"], config, machine.value("device.arch"), *lazily),
         tp=config.tensor_parallel_size,
         ep=ep,
         dp=config.parallel_config.data_parallel_size,
@@ -1502,30 +1514,81 @@ def op_graph(run: dict, config, machine, ep: int = 1):
     )
 
 
-def _op_graphs(root: str, config, arch: str):
+def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
     that does not, or of its drafter's part (`draft`), or when it holds none
     `forward.missed`'s text, None for no text; under DP, at the rows the
-    step's MoE gathers."""
+    step's MoE gathers; a prefill's drafter at the `width` its later passes
+    pad to.
+
+    With ATOM's arguments `atom_args`, a shape the store holds no graph at is
+    first traced once, as `compass trace ops` traces a record's step from
+    them, in a process of its own (a process runs one capture), its count and wall
+    seconds added to `lazy`'s ``lazy_traces`` and ``lazy_trace_wall_seconds``;
+    a trace that fails raises, naming the shape."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
     from atom.compass.capture.forward import Shape, missed, structure
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
     dp = config.parallel_config.data_parallel_size
+    drafter = getattr(config, "speculative_config", None)
+    drafts = drafter.num_speculative_tokens if drafter else 0
+    traced = set()
 
     @functools.lru_cache(maxsize=64)
     def graph(
-        phase: str, tokens: int, seqs: int, output=True, gathered=None, draft=False
+        phase, tokens, seqs, output=True, gathered=None, draft=False, width=None
     ) -> dict | str | None:
-        shape = str(Shape(phase, tokens, seqs, gathered).at(dp))
+        shape = Shape(phase, tokens, seqs, gathered, width).at(dp, drafts)
         at = structure(config, phase, True, arch, output, draft)
-        key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
-        if not store.directory_for(key).exists():
+        key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
+        missing = not store.directory_for(key).exists()
+        if missing and atom_args is not None and shape not in traced:
+            from atom.compass.bench.ops import _child
+
+            traced.add(shape)
+            began = time.monotonic()
+            try:
+                _child(_trace, root, atom_args, arch, shape)
+            # An argument parser's error exits.
+            except (Exception, SystemExit) as failed:
+                why = f"{type(failed).__name__}: {failed}"
+                raise RuntimeError(f"a lazy trace of {shape} failed: {why}") from failed
+            lazy["lazy_traces"] += 1
+            lazy["lazy_trace_wall_seconds"] += time.monotonic() - began
+            missing = not store.directory_for(key).exists()
+        if missing:
             return missed(store, key) or None
         return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
 
     return graph
+
+
+def _trace(root: str, atom_args, arch: str, shape) -> None:
+    """Trace `shape` as `compass trace ops` traces a record's step, a prefill
+    as one forward, from ATOM's arguments `atom_args` less the server's, on a
+    declared `arch`, and publish each graph in the store at `root`, one another
+    engine of the run published first aside."""
+    import tempfile
+
+    from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, Rule
+    from atom.compass.capture import publish
+    from atom.compass.capture.forward import capture
+    from atom.compass.drive.runfile import _engine_args, engine_only
+
+    engine, kept = _engine_args(atom_args), engine_only(atom_args)
+    store, tp = ArtifactStore(root), engine.tensor_parallel_size
+    command = f"compass run: a lazy trace of {shape}"
+    with tempfile.TemporaryDirectory(prefix="compass-capture-") as tmpdir:
+        for graph, model, declared in capture(
+            engine.model, tp, [shape], tmpdir, kept, arch, whole=True
+        ):
+            try:
+                publish(store, graph, model, declared, tp, kept, command)
+            except ArtifactRefusal as refused:
+                if refused.rule is not Rule.IMMUTABLE:
+                    raise
 
 
 def _price_list(run: dict, config, machine):
@@ -1976,7 +2039,8 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
 
     seconds = total("seconds")
     tally = RefusalTally.of(reasons, total("steps"))
-    summary = RunSummary.of(record, wall, refusals=tally).as_record()
+    lazy = total("lazy_traces"), total("lazy_trace_wall_seconds")
+    summary = RunSummary.of(record, wall, *lazy, refusals=tally).as_record()
     schedule = summary["schedule"]
     schedule["predicted_seconds"] = seconds
     # How the seconds were obtained: reported, never gated.

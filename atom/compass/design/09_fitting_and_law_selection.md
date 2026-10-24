@@ -173,6 +173,8 @@ further law, `W_inputs`, is fitted from it to the launch
 On a record that stamps the engine's input pulls (`dp<r>.pulls.jsonl`), every kind also
 fits `E_out`, from a forward's exit to the pull after it, and `E` runs from that pull to
 the next entry ([#1480](https://github.com/jgong5/ATOM/issues/1480)).
+Under DP, `E` runs from the latest pull over the group before the same forward, as `01`
+D4 places it ([#1893](https://github.com/jgong5/ATOM/issues/1893)).
 They use the step linear law's solver: D53's relative error and MAD drops, D57's report, D58's hull. An
 `E` sample whose gap spans an idle engine is cut as idle and counted apart.
 
@@ -284,8 +286,11 @@ This cost **three** iterations to abandon:
 box.** The k-NN oracle already computes the distance. The guard decides the answer's
 source and validation, not whether a step is answered: a step outside the hull is priced
 by the same law, `estimated` and unvalidated, its `source` naming the extrapolation, and
-reported apart, not refused (`08` D50.1; #627's
-[ruling 3](https://github.com/jgong5/ATOM/issues/627#issuecomment-6096543740)).
+not refused (`08` D50.1; #627's
+[ruling 3](https://github.com/jgong5/ATOM/issues/627#issuecomment-6096543740)). Cost accuracy
+grades it with the validated steps and also reports it apart (`08` D47, the owner's
+[ruling on #2011](https://github.com/jgong5/ATOM/issues/2011#issuecomment-6365512377), which
+ends ruling 3's exemption from the 5% gate).
 
 **The step linear law's support domain** (#952, `backends/step_linear.py`). A discrete
 value it has no vector for refuses: a prefill step when the law has no prefill vector, a
@@ -420,6 +425,16 @@ which a step can hold between two points' rows, so there one apart stays one byt
 padded pair (`all_gather_with_padding`, `reduce_scatter_with_unpadding`) pads every rank
 to the same rows, so its neighbours stay one row's bytes apart.
 
+Revised 2026-10-23 by the
+[Ruling on #2011](https://github.com/jgong5/ATOM/issues/2011#issuecomment-6365512377):
+an interpolated leaf is `estimated` and validated when, on every line it interpolates
+along, a held-out point was priced from neighbours that bracket it. `fit ops` records each
+such bracket on a line that interpolates; a declined line records none, and a line of two
+points holds no held-out point, so it validates nothing. A prefill whose rows' cached
+tokens differ is priced at their mean, which no held-out point tested, and stays
+unvalidated. An `op.<kind>.price_list` term is validated when each of its estimated
+leaves is.
+
 ---
 
 ## D61. Assumed treatments
@@ -543,9 +558,9 @@ choice that must be visible.
 | D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61). | 2026-09-18; revised 2026-10-14 (#941) |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |
-| D58 | Refuse rather than fall back on a step kind with no samples. The extrapolation guard is a convex hull or k-NN distance, never a per-feature bounding box; an out-of-hull step is priced `estimated` and unvalidated, its source naming the extrapolation, and reported apart, not refused. The step linear law refuses a discrete value it has no vector for, extrapolates outside its fitted hull, and is validated only inside the hull of its held-out steps. | 2026-09-18; revised 2026-10-11 (#765) and 2026-10-14 (#952) |
+| D58 | Refuse rather than fall back on a step kind with no samples. The extrapolation guard is a convex hull or k-NN distance, never a per-feature bounding box; an out-of-hull step is priced `estimated` and unvalidated, its source naming the extrapolation, not refused, and graded by cost accuracy as well as reported apart. The step linear law refuses a discrete value it has no vector for, extrapolates outside its fitted hull, and is validated only inside the hull of its held-out steps. | 2026-09-18; revised 2026-10-11 (#765), 2026-10-14 (#952) and 2026-10-23 (#2011) |
 | D59 | A family is validated on independently gathered data, never by LOO. Rank at least three candidates and report all held-out errors. A law that fits one axis is tested on a second before it ships. | 2026-09-18 |
-| D60 | Laws are piecewise over dispatch bands read from recorded kernel identity. A query with no same-band bracket refuses. At the op level `measure ops` records each point's kernels and `fit ops` interpolates only between same-kernel neighbours, and along no line holding a hidden band or a held-out error over 5%, holding out no point whose neighbours are one coordinate away on each side, one row's bytes for a collective whose ranks move the same rows (one byte for `all_gatherv`, `reduce_scatterv` and MORI); a declined leaf falls to its analytical law, counted. | 2026-09-18; op level 2026-10-18 (#1489); declined lines 2026-10-19 (#1493); adjacent neighbours 2026-10-20 (#1746), a collective's 2026-10-22 (#1908) |
+| D60 | Laws are piecewise over dispatch bands read from recorded kernel identity. A query with no same-band bracket refuses. At the op level `measure ops` records each point's kernels and `fit ops` interpolates only between same-kernel neighbours, and along no line holding a hidden band or a held-out error over 5%, holding out no point whose neighbours are one coordinate away on each side, one row's bytes for a collective whose ranks move the same rows (one byte for `all_gatherv`, `reduce_scatterv` and MORI); a declined leaf falls to its analytical law, counted. An interpolated leaf is validated inside a held-out bracket on each line it interpolates along. | 2026-09-18; op level 2026-10-18 (#1489); declined lines 2026-10-19 (#1493); adjacent neighbours 2026-10-20 (#1746), a collective's 2026-10-22 (#1908); validated brackets 2026-10-23 (#2011) |
 | D61 | Treatments are stated and the calibration population matched; an assumed treatment is a property of the query, recorded in the run summary. Decode row order, worth 1.77× at a fixed multiset, is a decode feature, `rowmod(k)` in scheduled order, adopted per rung by a four-condition rule. Uniform routing of the MoE segment under DP and EP is an assumed treatment, at every granularity. | 2026-09-18; revised 2026-10-01, 2026-10-14 (#941, #952) |
 | D62 | Leading warmth is measured and reported, never charged. Error is reported stratified by the axes the law is linear in. | 2026-09-18 |
 

@@ -397,3 +397,24 @@ def test_points_at_one_coordinate_that_launched_other_kernels_refuse():
 
     with pytest.raises(ValueError, match=r"launched \['k'\] and other kernels at"):
         ops.fit(points)
+
+
+@pytest.mark.parametrize(
+    "ns,brackets",
+    [
+        ({1: 1e3, 64: 64e3}, []),
+        ({1: 1e3, 8: 8e3, 64: 64e3}, [["B", [1024], 1, 64]]),
+        (
+            {1: 1e3, 8: 8e3, 16: 16e3, 64: 64e3},
+            [["B", [1024], 1, 16], ["B", [1024], 8, 64]],
+        ),
+        ({1: 1e3, 8: 4e3, 64: 64e3}, []),
+    ],
+    ids=["two-points", "one-held-out", "two-held-out", "declined"],
+)
+def test_a_line_that_interpolates_records_each_held_out_point_s_bracket(ns, brackets):
+    params = ops.fit([_point(b, t) for b, t in ns.items()])
+    ops.held_out(params)
+    (f,) = params["families"].values()
+
+    assert f["brackets"] == brackets

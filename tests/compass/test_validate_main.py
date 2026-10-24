@@ -14,17 +14,28 @@ import runpy
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
+from test_fit_ops import measured  # noqa: F401, a fixture
 from test_memory_check import GIB, _log
+from test_memory_readings import DOCUMENT
+from test_op_graph import ATTENTION, GEMM, listed, pt
+from test_op_graph import g as gemm_leaf
 from test_validate_cost import LAW, _record, _steps
 from test_validate_runs import ARGUMENTS, EXPORT, _named_as_deployed
+from test_work import SPEC
 
 from atom.compass import parity
+from atom.compass import run as compass_run
 from atom.compass.backends import json_file, step_labels
 from atom.compass.backends.cost import GROUPS
+from atom.compass.backends.op_graph import OpGraphBackend
+from atom.compass.backends.work import gemm, price
+from atom.compass.drive import run as drive_run
 from atom.compass.memory.check import parts
-from atom.compass.run import LP_FILE
+from atom.compass.run import LP_FILE, OP_GRAPH, PRICE_LIST
 from atom.compass.validate.__main__ import main
 from atom.compass.validate.runs import CLIENT_RUN, SIDES
 
@@ -530,6 +541,88 @@ def test_runs_record_and_run_wrote_at_another_concurrency_are_not_one_cell(
         main([str(tmp_path / "c4")])
 
 
+#: A workload as `cctraces_sim.sh` and `client.sh` state it.
+WORKLOAD = {"aiperf_args": ["--concurrency", "4"], "traces_sha256": ["d0", "d1"]}
+
+
+def _mixed(capsys, tmp_path, law=()):
+    """Cell c4 of `cctraces_sim.sh` real runs and a simulated run `run` wrote,
+    which `client.sh` drove, every run given `WORKLOAD`."""
+    _rows(capsys, tmp_path, law=law)
+    cell, sim = tmp_path / "c4", tmp_path / "sim"
+    for d in cell.glob("real*"):
+        run = json.loads((d / "run.json").read_text())
+        (d / "run.json").write_text(json.dumps(run | {"workload": WORKLOAD}))
+    sim.mkdir()
+    shutil.move(cell / "step_linear", sim)
+    _as_recorded(sim)
+    shutil.move(sim / "step_linear", cell)
+    (cell / "step_linear" / "artifacts/workload.json").write_text(json.dumps(WORKLOAD))
+    return cell
+
+
+def test_a_run_written_run_grades_whole_beside_cctraces_sim_s_real_runs(
+    capsys, tmp_path
+):
+    cell = _mixed(capsys, tmp_path)
+    rows = _graded(capsys, cell)
+
+    # As the run would grade, written by cctraces_sim.sh: its warmup's step too.
+    sim = cell / "step_linear"
+    (sim / CLIENT_RUN).unlink()
+    run = {"workload": WORKLOAD, "step_linear": LAW, "host": {"laws": {}}}
+    (sim / "run.json").write_text(json.dumps(run))
+    assert rows == _graded(capsys, cell)
+    assert rows["counts", "prefill steps"][0].startswith("spread 0; result 1 1 1")
+    assert not [k for k in rows if k[0].startswith("warmup ")]
+
+
+@pytest.mark.parametrize(
+    "field, value, named",
+    [
+        ("aiperf_args", ["--concurrency", "16"], r"\['--concurrency', '16'\]"),
+        (
+            "traces_sha256",
+            ["d0", "d9"],
+            "'real0': 1, 'real1': 1, 'real2': 1, 'step_linear': 1",
+        ),
+    ],
+)
+def test_a_run_written_run_given_another_workload_refuses_naming_it(
+    capsys, tmp_path, field, value, named
+):
+    cell = _mixed(capsys, tmp_path)
+    stated = WORKLOAD | {field: value}
+    (cell / "step_linear/artifacts/workload.json").write_text(json.dumps(stated))
+
+    with pytest.raises(
+        ValueError, match=f"ran different workloads: {{'{field}': .*{named}"
+    ):
+        main([str(cell)])
+
+
+def test_a_run_written_run_graded_whole_still_refuses_as_it_would_apart(
+    capsys, tmp_path
+):
+    cell = _mixed(capsys, tmp_path, law=[("clock", 1)])
+    with pytest.raises(ValueError, match="step_linear is not graded: it refused 1"):
+        main([str(cell)])
+
+
+def test_a_run_written_run_that_served_a_later_client_run_does_not_grade_whole(
+    capsys, tmp_path
+):
+    cell = _mixed(capsys, tmp_path)
+    path = cell / "step_linear/steps/dp0.jsonl"
+    lines = path.read_text().splitlines()
+    later = json.loads(lines[-1]) | {"step": 99, "batch": [[99, 1, 1]], "named": []}
+    path.write_text("\n".join([*lines, json.dumps(later)]) + "\n")
+
+    later = "steps of requests it did not send follow its own, 1 from step 99"
+    with pytest.raises(ValueError, match=f"step_linear is not graded: {later}"):
+        main([str(cell)])
+
+
 def _warmed(capsys, cell, slow):
     """A cell `record` and `run` wrote, request 0 every run's warmup: two steps
     of its own before request 1's, `slow` times their price in every real run."""
@@ -698,3 +791,126 @@ def test_a_deployment_at_two_dp_ranks_checks_each_ranks_memory(capsys, tmp_path)
         expected |= {(result + r, metric): value for r in ranks}
     assert rows == expected
     assert rows["memory real1 decode dp1", "non_torch"][1] == "fail"
+
+
+def test_an_op_graph_cell_grades_with_its_method_shares_term_gaps_and_warm_over_cold(
+    capsys, tmp_path, monkeypatch, measured  # noqa: F811
+):
+    cell = tmp_path / "c4"
+    _rows(capsys, tmp_path)
+    _as_recorded(cell)
+    sim = (cell / "step_linear").rename(cell / OP_GRAPH)
+    # Two GEMM points timed warm, an attention point not; a point measured
+    # under another source root is another price list's.
+    points = [(GEMM, 0.5), (GEMM, 0.7), (ATTENTION, None)]
+    records = [
+        {"shape": "decode B=1", "context": i, "leaf": "x", "op": op}
+        | {"warm_over_cold": w}
+        for i, (op, w) in enumerate(points)
+    ]
+    _, key = measured("ops", records)
+    measured("other", [records[0] | {"warm_over_cold": 9.0}], root="b" * 40)
+    fields = {k: v for k, v in key("s", 0, "x").values.items() if k != "point"}
+    run = json.loads((sim / "run.json").read_text())
+    run["argv"] = ["-c", "run", "--op-graph", "--out", str(sim), "--", "--model", "m"]
+    run["run_file"] = {
+        OP_GRAPH: True,
+        PRICE_LIST: fields,
+        "store": str(tmp_path / "store"),
+        "machine": DOCUMENT,
+        "host": {"laws": {}},
+    }
+    (sim / "run.json").write_text(json.dumps(run))
+    # Decode's small GEMM is listed at its measured 20 ms, a large one is its
+    # roofline, about 30 ms; prefill of 190 tokens has no graph.
+    large = gemm_leaf(4096, 4096, 4096)
+    count = int(0.03 / price(gemm(4096, 4096, 4096), SPEC)) + 1
+    region = {
+        "seq": [
+            gemm_leaf(1, 64, 64),
+            {"repeat": large, "count": count, "index": "l0", "start": 0, "step": 1},
+        ]
+    }
+    prices = listed(
+        *[pt(gemm_leaf(1, 64, 64), "decode B=1", 20e6, c) for c in (100, 1000)]
+    )
+    built = []
+
+    def op_graph(run_file, config, machine, ep):
+        built.append((run_file, config.atom_args, ep))
+        return OpGraphBackend(
+            SPEC,
+            lambda phase, tokens, *_: None if tokens == 190 else region,
+            kv="bf16",
+            price_list=prices,
+        )
+
+    monkeypatch.setattr(
+        drive_run,
+        "_config",
+        lambda args: SimpleNamespace(atom_args=args, enable_expert_parallel=False),
+    )
+    monkeypatch.setattr(compass_run, "op_graph", op_graph)
+
+    rows = _graded(capsys, cell)
+
+    assert built == [(run["run_file"], ["--model", "m"], 1)]
+    assert rows["cell", "verdict"] == ["3 real runs", "graded"]
+    analytical = price(gemm(4096, 4096, 4096), SPEC) * count
+    for real in ("real0", "real1", "real2"):
+        where = f"cost {real}"
+        decode, gated = rows[where, "decode by method"]
+        share = 0.02 / (0.02 + analytical)
+        assert decode.endswith(f"analytical {1 - share:.1%}, measured {share:.1%}")
+        assert gated == "not gated"
+        assert rows[where, "prefill by method"][0].endswith(": analytical 100.0%")
+        # One op kind, its listed and roofline terms together: the composed step.
+        on_totals, per_step = rows[where, f"decode {GEMM} over measured"][0].split(";")
+        error = float(rows[where, "decode validated"][0].split()[10].rstrip("%,"))
+        assert float(on_totals.split()[-1]) == pytest.approx(1 + error / 100, abs=1e-3)
+        # Each decode step's composed seconds over its own measured ones.
+        real_s = [0.02 + 1e-7 * (2000 + 5000 * i) for i in range(10)]
+        ratios = [(0.02 + analytical) / s for s in real_s]
+        expected = np.percentile(ratios, (10, 50, 90))
+        assert [float(x) for x in per_step.split()[3::2]] == pytest.approx(
+            expected, abs=1e-3
+        )
+        assert rows[where, "decode validated"][0].startswith("10 steps")
+        reason = "op-graph: no op_graph holds a prefill step of 190 tokens over 1 sequences gathering 190 rows; compass trace ops captures one"
+        value = rows[where, "refused prefill tokens 0-512"][0]
+        assert value.startswith("1 steps") and value.endswith(json.dumps({reason: 1}))
+    assert rows["warm over cold", GEMM] == [
+        "2 of 2 points timed warm; min 0.500, median 0.600, max 0.700",
+        "not gated",
+    ]
+    assert rows["warm over cold", ATTENTION][0] == "0 of 1 points timed warm"
+    # A run file that composes the step roofline below the graph falls back.
+    run["run_file"]["step_roofline"] = True
+    (sim / "run.json").write_text(json.dumps(run))
+    rows = _graded(capsys, cell)
+    assert rows["cost real0", "fallback prefill tokens 0-512"][0] == value
+    assert ("cost real0", "refused prefill tokens 0-512") not in rows
+
+
+def test_cost_rows_gate_every_graded_step_and_print_the_breakdown_not_gated(
+    capsys, tmp_path
+):
+    # A held-out hull to context 10000 leaves decode steps 2 to 9 unvalidated.
+    _rows(capsys, tmp_path)
+    law = json.loads(json.dumps(LAW))
+    law["decode"]["1"]["held_out"]["hull"]["facets"] = [[-1, 100], [1, -10000]]
+    sim = tmp_path / "c4" / "step_linear" / "run.json"
+    sim.write_text(json.dumps(json.loads(sim.read_text()) | {"step_linear": law}))
+
+    main([str(tmp_path / "c4")])
+    out = capsys.readouterr().out.splitlines()
+    rows = {tuple(r.split(" | ")[1:3]): r.split(" | ")[3:] for r in out[1:]}
+
+    for metric, steps, verdict in (
+        ("graded", 10, "-"),
+        ("validated", 2, "not gated"),
+        ("unvalidated", 8, "not gated"),
+    ):
+        value, gated = rows["cost real1", f"decode {metric}"]
+        assert value.startswith(f"{steps} steps") and gated == verdict
+        assert rows["cost real1", f"decode rung 1 {metric}"][1] == verdict

@@ -402,7 +402,9 @@ predicted; if not, that is the finding and the recipe grows.
 real engine, reads the readings below on every rank once the KV cache is allocated and
 the graphs are captured, publishes one `memory_readings` entry (D41), and exits (`13`
 D80); `record` takes none. The entry is keyed by the model, the digest of `--machine`,
-the parallel layout and the engine config, its KV offload connector included
+the parallel layout and the engine config, its KV offload connector and resolved
+`index_cache_dtype` included (any `kv_transfer_config` resolves DeepSeek-V4's
+indexer to fp8, so a PD start reads a plain fp8-indexer start's entry)
 (`atom/compass/run/memory.py::key_fields`), and
 records the stack the start ran on, which a run's spec must pin. A run reads its rank's
 member and refuses when there is no entry, so the readings leave the machine spec (doc
@@ -828,6 +830,7 @@ only, and an `op_graph` is keyed by its shape.
 | `step_linear_law` | `fit steps --backend step-linear` | (model, machine-spec digest, engine config, source-root digest, form) |
 | `host_laws` | `fit host` | (host CPU, ATOM source, model, engine config, machine-spec digest), as the run reads its host key |
 | step grid bundle (`step_grid_bundle`) | `fit steps --backend step-grid` | `17` D101 |
+| `projection` | `validate project`, real runs' steps priced on a device none of them ran on | (model, the whole machine spec's digest, source-root digest, the cells' step records and engines) |
 
 The **parallel layout** of an `op_measurement`, `price_list` and `memory_readings` key is
 `dp`, `pp`, `pcp`, `tp`, `enable_expert_parallel`, `enable_dp_attention` and
@@ -1004,6 +1007,7 @@ mismatch **refuses** (warn only under an explicit flag).
 | `step_measurement`, `step_linear_law` | X | X | X | X | X | X | - | X |
 | step grid bundle (`17` D101) | X | X | X | X | X | X | - | X |
 | `host_laws` | - | - | **X** | **X** | - | - | **X** | **X** |
+| `projection` | - *(analytical)* | X *(op_graph capture)* | X | X | - *(the spec is in its key)* | - | - | X |
 | `memory_readings` | **X** | X | X | X | **X** | X | - | **X** |
 | `machine_spec`: capacity | - | - | - | - | **X** | - | - | - |
 | `machine_spec`: tokenizer terms | - | - | - | **X** *(tokenizer)* | - | - | - *(T53)* | - |

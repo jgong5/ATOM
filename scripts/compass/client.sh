@@ -29,7 +29,9 @@
 # warmup. OUT/client/ holds the traces aiperf is given, each a file
 # named by its line in TRACES, aiperf's dataset and its log; OUT/artifacts/
 # aiperf's artifacts at --export-level raw and the client run's export,
-# client_run.json (atom/compass/parity/client_run.py). One client run per OUT:
+# client_run.json (atom/compass/parity/client_run.py), and its workload,
+# workload.json, as cctraces_sim.sh writes it into run.json, so
+# `python -m atom.compass.validate` grades the two in one cell. One client run per OUT:
 # an OUT/client/ there refuses. The server keeps serving unless --stop. Exits 2
 # on bad arguments, 90 to 99 as _lib.sh's tree checks refuse, else 1 naming the
 # step that failed.
@@ -100,21 +102,35 @@ n=$(find "$OUT/client/traces" -type f | wc -l)
 ((n == last - first + 1)) || fail "traces: $TRACES holds $n of traces $first to $last"
 read -rd '' -a extra <<<"${AIPERF_EXTRA_ARGS-}" || :
 [[ " ${extra[*]} " =~ \ --random-seed[\ =] ]] && seed=() || seed=(--random-seed 20260707)
+# What aiperf sends: all but paths, the URL and the export level, as cctraces_sim.sh
+# hashes them into its run.json's workload.
+args=(--endpoint-type chat --custom-dataset-type weka_trace
+    --concurrency "$c" --benchmark-duration "$duration"
+    "${seed[@]}" --scenario inferencex-agentx-mvp --unsafe-override
+    --streaming --use-server-token-count --extra-inputs ignore_eos:true
+    --no-server-metrics --no-gpu-telemetry --ui none "${extra[@]}")
 
 # Each request carries X-Session-ID, as the nightly's agentic cell sends it: a
 # dp_sticky router keys off it, and a server alone ignores it.
 (cd "$OUT/client" && AIPERF_DATASET_MMAP_BASE_PATH=$OUT/client AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true \
     exec "$HARNESS_PYTHON" "${aiperf[@]}" \
     profile --url "${url#http://}" --model "$MODEL" --tokenizer "$MODEL" \
-    --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" --export-level raw \
-    --endpoint-type chat --custom-dataset-type weka_trace \
-    --concurrency "$c" --benchmark-duration "$duration" \
-    "${seed[@]}" --scenario inferencex-agentx-mvp --unsafe-override \
-    --streaming --use-server-token-count --extra-inputs ignore_eos:true \
-    --no-server-metrics --no-gpu-telemetry --ui none "${extra[@]}") \
+    --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" --export-level raw "${args[@]}") \
     >"$OUT/client/aiperf.log" 2>&1 || fail "aiperf: exited $?; see $OUT/client/aiperf.log"
 (cd / && python3 -m atom.compass.parity.client_run "$OUT/artifacts") ||
     fail "export: atom.compass.parity.client_run exited $? on $OUT/artifacts"
+python3 - "$OUT" "$TRACES" "${args[@]}" <<'EOF' || fail "workload: cannot write $OUT/artifacts/workload.json"
+import hashlib, json, sys
+from pathlib import Path
+
+out, traces, *args = sys.argv[1:]
+sha256 = lambda p: hashlib.file_digest(open(p, "rb"), "sha256").hexdigest()
+export = json.loads(Path(out, "artifacts/profile_export_aiperf.json").read_text())
+given = sorted(Path(out, "client/traces").iterdir())
+workload = {"dataset_sha256": sha256(traces), "traces_sha256": [*map(sha256, given)]}
+workload |= {"aiperf_args": args, "benchmark_id": export["benchmark_id"]}
+Path(out, "artifacts/workload.json").write_text(json.dumps(workload))
+EOF
 
 ((stop)) || exit 0
 # The command that started the server is its parent.

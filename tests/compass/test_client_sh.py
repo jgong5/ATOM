@@ -278,3 +278,37 @@ def test_stop_refuses_a_parent_that_is_no_compass_command_or_writes_no_run(
     assert done.returncode == 1, done.stdout + done.stderr
     last = done.stderr.splitlines()[-1]
     assert fnmatchcase(last, "client: " + STOP_REFUSALS[parent]), done.stderr
+
+
+#: An API server that says it is ready and leaves, and any other Python as is.
+PYTHON3 = f"""#!/bin/sh
+[ "$2" = atom.entrypoints.openai.api_server ] && echo "Uvicorn running" && exit
+exec {sys.executable} "$@"
+"""
+
+
+@pytest.mark.parametrize("extra", ["", NIGHTLY])
+def test_its_workload_is_the_one_cctraces_sim_writes_for_the_same_cell(tmp_path, extra):
+    out, env = _setup(tmp_path, SIM)
+    env["AIPERF_EXTRA_ARGS"] = extra
+    done = _client(out, *GOOD, env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    argv = json.loads((tmp_path / "seen.json").read_text())[0]
+    workload = json.loads((out / "artifacts" / "workload.json").read_text())
+    assert workload["aiperf_args"] == argv[argv.index("raw") + 1 :]
+
+    # cctraces_sim.sh hashes the workload into run.json before its server starts.
+    (tmp_path / "bin" / "python3").write_text(PYTHON3)
+    (tmp_path / "bin" / "python3").chmod(0o755)
+    (tmp_path / "run_file.json").write_text("{}")
+    cell = {"FIRST_SESSION": "1", "SESSIONS": "2", "CONCURRENCY": "3", "WAIT_S": "5"}
+    subprocess.run(
+        ["bash", TREE / "scripts/compass/cctraces_sim.sh", "run_file.json", "cell"],
+        cwd=tmp_path,
+        env=env | cell,
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    run = json.loads((tmp_path / "cell" / "run.json").read_text())
+    assert workload == run["workload"]
