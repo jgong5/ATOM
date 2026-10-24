@@ -22,8 +22,8 @@ from atom.compass.parity.busy import PROPOSE
 
 #: One MTP output prefill, in us. The target: K1, K2 queued 2 after K1 and
 #: counted whole, the collective K3, which rank 1 starts at 50, and K4 queued 1
-#: after it. The draft: the draft-KV pass's DK, then the propose pass's D1, its
-#: launch 45 late, and D2 queued 1 after D1. The queued gaps are 2, 1 and 1, so
+#: after it, and the sampler launched after the draft-KV pass's DK. The draft: DK,
+#: then the propose pass's D1, its launch 45 late, and D2 queued 1 after D1. The queued gaps are 2, 1 and 1, so
 #: every gap whose kernel was not queued counts 1.
 KERNELS = [
     ("k1", 10, 20, 1),
@@ -31,6 +31,7 @@ KERNELS = [
     ("cross_device_reduce_1stage", 40, 60, 35),
     ("k4", 61, 70, 37),
     ("dk", 72, 75, 81),
+    ("sample", 76, 78, 92),
     ("d1", 120, 125, 111),
     ("d2", 126, 130, 113),
 ]
@@ -99,7 +100,7 @@ def _run(tmp_path, ranks=("rank_0", "rank_1"), tokens=100):
 def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
     tmp_path, monkeypatch
 ):
-    """The named result. Rank 0's target: union 37, gaps 2 + 1 + 1, the
+    """The named result. Rank 0's target: union 39, gaps 2 + 1 + 1 + 1, the
     collective from rank 1's start; rank 1's 5 more. The draft: DK, D1 and D2,
     their union 12 and gaps 1 + 1 + 1; the propose pass D1 and D2."""
     monkeypatch.setattr(busy, "CHUNK", 64)  # a decode straddles every read
@@ -108,7 +109,7 @@ def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
     assert path == tmp_path / "steps" / "dp0.busy.jsonl"
     got = [json.loads(x) for x in path.read_text().splitlines()]
     assert got == [
-        {"step": 7, "b_target_ns": 46000, "b_draft_ns": 15000, "b_propose_ns": 11000}
+        {"step": 7, "b_target_ns": 49000, "b_draft_ns": 15000, "b_propose_ns": 11000}
     ]
 
 
