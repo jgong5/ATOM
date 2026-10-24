@@ -12,7 +12,7 @@ import re
 
 import pytest
 from test_capture_ir import _ops, _record
-from test_op_graph import GEMM, by_name, g, listed, pt
+from test_op_graph import by_name, g, listed, pt
 from test_op_graph_drafter_width import DECODE, settled
 from test_op_work import leaf, t
 from test_work import SPEC
@@ -193,11 +193,12 @@ class Asked(CostSource):
             [(GEMM, 12, 4, 4), (ARGMAX, 6, 3, 3), (ARGMAX, 9, 3, 3)]
             + [(GEMM, 12, 3, 3), (ARGMAX, 6, 3, 3), (ARGMAX, 9, 3, 3)],
         ),
+        # Its model at its rows, an MoE GEMM over 24 gathered rows among it.
         (
             [(3, 3, False)] * 3,
             0,
-            [g(9, 64, 64), g(4, 128, 64), argmax(3)],
-            [(GEMM, 9, 9, 3), (GEMM, 4, 9, 4), (ARGMAX, 3, 9, 3)],
+            [g(9, 64, 64), g(24, 32, 64), g(4, 128, 64), argmax(3)],
+            [(GEMM, 9, 9, 3), (GEMM, 24, 9, 3), (GEMM, 4, 9, 4), (ARGMAX, 3, 9, 3)],
         ),
     ],
     ids=["eager-decode", "eager-mtp-decode", "sampling-prefill"],
@@ -239,9 +240,7 @@ def test_a_padded_decode_prices_its_model_at_its_width_and_its_sampler_at_its_ro
 ):
     # Rank 0 decodes 3 rows eagerly, padded to 4; at DP2 its MoE gathers 4 from
     # each rank, the default at its width.
-    step = BatchView(
-        (RequestShape(1, 90, True),) * 3, moe_rows=moe_rows, target_bs=4
-    )
+    step = BatchView((RequestShape(1, 90, True),) * 3, moe_rows=moe_rows, target_bs=4)
     graph = {"seq": [g(4, 64, 64), argmax(3)]}
     backend = OpGraphBackend(
         SPEC, lambda *_, **__: graph, kv="bf16", dp=dp, price_list=RUNGS
