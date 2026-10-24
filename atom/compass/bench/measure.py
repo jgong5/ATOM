@@ -87,6 +87,7 @@ from atom.compass.fit.samples import MEMBER, run_fields
 from atom.compass.parity.served import served
 from atom.compass.run import _write_whole
 from atom.compass.run.step_grid import BOUNDS, keyed, keyed_of
+from atom.utils.arg_parser import FlexibleArgumentParser
 
 PROG = "compass measure steps"
 #: What of a step-record line is the batch it measures; a planned line may also
@@ -294,7 +295,7 @@ def atom_config(atom_args):
     from atom.model_engine.arg_utils import EngineArgs
     from atom.model_engine.llm_engine import _load_tokenizer
 
-    parser = EngineArgs.add_cli_args(argparse.ArgumentParser(prog=f"{PROG} --"))
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
     engine_args = EngineArgs.from_cli_args(parser.parse_args(atom_args))
     names = {f.name for f in dataclasses.fields(Config)}
     kwargs = engine_args._get_engine_kwargs().items()

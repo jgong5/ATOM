@@ -1129,7 +1129,7 @@ Client runs), and carried in the run artifact:
 | wall seconds vs simulated seconds | the speed result (`08`), and the only place the ≥5x target is measured |
 | lazy traces: count and wall seconds | `02` — they consume real time inside a simulated run and must not silently degrade the speed result |
 | causality detector state | straggler count (must be 0), stall diagnostics printed, clock-lint status |
-| refusals: count and distinct reasons; predicted seconds by method (`seconds_by_method`), each with its step count and share; `coverage_report` | `08` D50.1: any refusal makes the run a coverage report; analytical and declared seconds are reported, not gated |
+| refusals: count and distinct reasons; predicted seconds by method (`seconds_by_method`), each with its step count and share; `coverage_report` | `08` D50.1: any refusal makes the run a coverage report, no share of seconds by method does; analytical and declared seconds are reported, not gated, and unvalidated ones are graded by cost accuracy (`08` D47) |
 
 ### Rules
 
@@ -1380,6 +1380,10 @@ stage and per DP rank, with a TP group modelled on its rank 0.
   recurrence's first term.
   Under host laws that carry `E_out` (below), it runs from the engine's input pull
   to the entry, `E_in`, and `postprocess()` and the output put fall in `E_out`.
+  Under DP it runs from the latest input pull over the group before the same
+  forward, where `_sync_dp_state` releases every member, so a member's wait for that
+  pull is the group round's, not `E`
+  ([#1893](https://github.com/jgong5/ATOM/issues/1893)).
 - `W_pre`: prepare (`ModelRunner.prepare_model`), which waits only at its two ends;
   under MTP, an output forward's prepare up to R1's wait.
 - `W_inputs`: under MTP, an output forward's prepare after R1's wait: the input ids,

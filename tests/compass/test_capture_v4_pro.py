@@ -40,6 +40,8 @@ V4 = "atom.model_ops.v4_kernels."
 DECODE = "aiter.mla:mla_decode_fwd_v4_nm"
 PS_DECODE = "aiter.mla_decode_v4_ps_asm.default"
 INDEXER = "aiter.indexer_score_topk.default"
+QKN = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
+QKN_BF16 = "aiter.ops.flydsl.kernels.qk_norm_rope_quant:flydsl_qk_norm_rope_quant"
 #: The bf16 KV cache's decode leaf, a Triton launch lifted to its function.
 BF16_DECODE = (
     "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
@@ -253,7 +255,7 @@ def test_the_attention_s_leaves_are_the_functions_that_launch_its_kernels(
             assert op["args"]["split_indptr"]["shape"] == [2 + 1]
 
 
-def test_the_decode_and_indexer_leaves_alone_state_their_layer_s_geometry(
+def test_the_decode_indexer_and_qk_norm_leaves_alone_state_their_layer_s_geometry(
     tmp_path_factory,
 ):
     config = json.loads(CONFIG.read_text())
@@ -261,7 +263,7 @@ def test_the_decode_and_indexer_leaves_alone_state_their_layer_s_geometry(
 
     for graph, _ in graphs.values():
         stating = {op["op"] for op in _ops(graph["region"]) if "stated" in op}
-        assert stating <= {DECODE, PS_DECODE, INDEXER}
+        assert stating <= {DECODE, PS_DECODE, INDEXER, QKN}
     layers = _decoder(graphs["decode B=2"][0])
     for layer, ratio in zip(layers, config["compress_ratios"], strict=False):
         top = config["index_topk"] if ratio == 4 else None
@@ -270,9 +272,31 @@ def test_the_decode_and_indexer_leaves_alone_state_their_layer_s_geometry(
         stated = {op["op"]: op["stated"] for op in layer if "stated" in op}
         assert stated.keys() & {DECODE, PS_DECODE}
         assert stated == {
-            **{kind: geometry for kind in stated.keys() - {INDEXER}},
+            **{kind: geometry for kind in stated.keys() - {INDEXER, QKN}},
+            QKN: {"compress_ratio": ratio},
             **({INDEXER: {"compress_ratio": 4}} if ratio == 4 else {}),
         }
+    # A prefill writes no window rows here, and states its ratio all the same.
+    prefill = _decoder(graphs["prefill T=512 B=2"][0])
+    for layer, ratio in zip(prefill, config["compress_ratios"], strict=False):
+        stated = [op["stated"] for op in layer if op["op"] == QKN]
+        assert stated == [{"compress_ratio": ratio}]
+
+
+def test_the_bf16_cache_s_qk_norm_states_its_ratio_beside_the_rows_it_writes(
+    tmp_path_factory,
+):
+    config = json.loads(CONFIG.read_text())
+    graphs = capture(
+        tmp_path_factory, "--width 2 -- --kv_cache_dtype bf16 --enable-dp-attention"
+    )
+
+    layers = _decoder(graphs["decode B=2"][0])
+    for layer, ratio in zip(layers, config["compress_ratios"], strict=False):
+        [qkn] = [op for op in layer if op["op"] == QKN_BF16]
+        assert qkn["stated"] == {"compress_ratio": ratio}
+        for slot in ("swa_dest_rows", "batch_id_per_token"):
+            assert qkn["args"][slot]["role"] == "metadata"
 
 
 def test_tp8_without_dp_attention_reduces_in_each_layer_and_declares_nothing(
@@ -352,7 +376,8 @@ def test_the_attention_body_runs_as_a_real_step_then_the_batch_is_dummy_again(
     def stated(ratio, top):
         geometry = {"window_size": 64, "compress_ratio": ratio, "index_topk": top}
         ratio = {"compress_ratio": ratio}
-        decodes = (DECODE, BF16_DECODE, PS_DECODE)
-        return {**dict.fromkeys(decodes, geometry), INDEXER: ratio}
+        decodes = (DECODE, "aiter.mla_decode_v4_asm.default", BF16_DECODE, PS_DECODE)
+        qkns = dict.fromkeys((QKN, QKN_BF16), ratio)
+        return {**dict.fromkeys(decodes, geometry), INDEXER: ratio, **qkns}
 
     assert seen == [(False, stated(4, 512)), (False, stated(128, None))]

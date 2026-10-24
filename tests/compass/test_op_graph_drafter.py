@@ -59,8 +59,8 @@ _CAPTURES: dict = {}
 
 def capture(drafts, tmp_path_factory, shape=("--width", "2"), dp=1):
     """`compass trace ops` at `shape` under an MTP drafter of `drafts` tokens,
-    or at DP `dp` `--population` of a record whose every rank verifies 2 rows
-    at rung 2, then beside a peer prefilling 16 tokens: the capture's directory
+    or at DP `dp` (`shape` naming `--tp`) or its `--population` of a record whose
+    every rank verifies 2 rows at rung 2, then beside a peer prefilling 16 tokens: the capture's directory
     and its graphs by structure, the first shape's."""
     if (drafts, shape, dp) in _CAPTURES:
         return _CAPTURES[drafts, shape, dp]
@@ -68,7 +68,7 @@ def capture(drafts, tmp_path_factory, shape=("--width", "2"), dp=1):
     (root / "model").mkdir()
     (root / "model" / "config.json").write_bytes(CONFIG.read_bytes())
     argv = ["trace", "ops", "--model", str(root / "model"), *shape]
-    if dp > 1:
+    if dp > 1 and "--tp" not in shape:
         (root / "record").mkdir()
         line = {"rows": [[drafts + 1, 90, True]] * 2, "rung": 2}
         local = 2 * (drafts + 1)
@@ -131,23 +131,25 @@ def test_a_verify_step_is_cut_at_forward_done_event_into_target_and_drafter(
     assert [op["args"]["weight"]["shape"][0] for op in tables] == [vocab] * drafts
 
 
-def _priced(root, drafter, batch, ep=1):
-    """`batch` priced as a run prices it from the capture at `root`, and its
-    drafter's graph `drafter` priced at it over each EP width, as draft terms."""
+def _priced(root, drafter, batch, ep=1, dp=1):
+    """`batch` priced as a run prices it from the capture at `root` at DP `dp`,
+    and its drafter's graph `drafter` priced at it over each EP width, as draft
+    terms."""
     text = json.loads(CONFIG.read_text())
     config = SimpleNamespace(
         model=str(root / "model"),
         hf_config=SimpleNamespace(architectures=text["architectures"]),
         tensor_parallel_size=1,
-        parallel_config=SimpleNamespace(data_parallel_size=1),
+        parallel_config=SimpleNamespace(data_parallel_size=dp),
         enable_expert_parallel=False,
         enforce_eager=True,
         speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=1),
-        **_engine(drafter),
+        **{**_engine(drafter), "enable_dp_attention": dp > 1},
     )
     machine = MachineSpec.from_mapping(json.loads(MACHINE.read_text()))
     lookup = _op_graphs(str(root / "store"), config, "gfx942")
-    cost = OpGraphBackend(machine, lookup, kv="bf16", ep=ep, drafts=1).price(batch)
+    backend = OpGraphBackend(machine, lookup, kv="bf16", ep=ep, dp=dp, drafts=1)
+    cost = backend.price(batch)
 
     def drafted(width):
         flat: dict = {}
@@ -347,9 +349,10 @@ def test_a_dp_drafter_beside_a_prefilling_peer_gathers_the_step_s_rows(
     assert sum(first["args"]["sizes"]) == 20
 
 
-def _lookup(tmp_path, dp, stored):
+def _lookup(tmp_path, dp, stored, *lazily):
     """`_op_graphs` at DP `dp` under MTP1 over a store of `stored`'s regions,
-    each keyed by its phase, shape and whether it is the drafter's."""
+    each keyed by its phase, shape and whether it is the drafter's; `lazily`,
+    its ATOM arguments and lazy counts."""
     (tmp_path / "model").mkdir()
     (tmp_path / "model" / "config.json").write_text("{}")
     config = SimpleNamespace(
@@ -377,7 +380,7 @@ def _lookup(tmp_path, dp, stored):
                 ).encode()
             },
         )
-    return _op_graphs(store.root, config, "gfx950")
+    return _op_graphs(store.root, config, "gfx950", *lazily)
 
 
 def test_a_dp_verify_step_reads_its_drafter_at_its_rows_padded_too(tmp_path):
@@ -432,14 +435,52 @@ def test_a_dp_prefill_under_a_drafter_reads_its_graphs_at_their_default(tmp_path
     )
 
 
-def test_a_dp_middle_chunk_s_drafter_is_refused_by_name():
-    # Under DP its drafter's passes run inside the target's graph.
-    def graph(*at, draft=False):
-        return g(9, 128, 128) if draft else g(9, 64, 64)
+def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
+    tmp_path_factory,
+):
+    root, graphs = capture(1, tmp_path_factory, (*PREFILL, "--tp", "2"), dp=2)
+    [middle] = [key for key in graphs if key.endswith(" no output")]
+    final = middle.removesuffix(" no output")
+    assert set(graphs) == {middle, f"{middle} draft", final, f"{final} draft"}
+    ours, theirs, done = (
+        _ops(graphs[key]["region"]) for key in (middle, f"{middle} draft", final)
+    )
+    # Under DP ATOM runs the drafter's propose in place of its draft-KV pass:
+    # one pass over the chunk's tokens, and the draft it drops.
+    queries = [op["args"]["q"]["shape"][0] for op in theirs if op["op"] == ATTENTION]
+    assert queries == [64]
+    assert ARGMAX in {op["op"] for op in theirs}
+    # The target holds no drafter pass: its attention is the final chunk's.
+    attended = [sum(op["op"] == ATTENTION for op in ops) for ops in (ours, done)]
+    assert attended[0] == attended[1]
 
-    step = replace(MIDDLE, moe_rows=18, draft_moe_rows=18)
-    with pytest.raises(CostRefused, match="a DP middle chunk under a drafter"):
-        OpGraphBackend(SPEC, graph, kv="bf16", dp=2, drafts=1).price(step)
+    batch = SimpleNamespace(
+        total_seqs_num_prefill=1,
+        num_scheduled_tokens=[64],
+        context_lens=[64],
+        req_ids=[0],
+        produces_output=lambda: False,
+        is_dummy_run=False,
+    )
+    r = runner(None, dp_size=2)
+    r.drafter = SimpleNamespace(is_block_drafter=False)
+    mode = SimpleNamespace(
+        sync=SimpleNamespace(
+            num_tokens_across_dp=torch.tensor([64, 64]), ub_tokens_across_dp=None
+        ),
+        running_tokens_are_unified=False,
+        running_tokens=64,
+        running_bs=1,
+        use_cudagraph=False,
+    )
+    step = projection.batch_view(batch, mode, r)
+    cost, drafted = _priced(root, graphs[f"{middle} draft"], step, dp=2)
+
+    assert cost.terms[-1].provenance.detail.endswith(
+        "prefill T=64 B=1 G=128 that produces no output"
+    )
+    assert cost.target_seconds > 0
+    assert {t.name: t.seconds for t in cost.terms if t.draft} == drafted(1)
 
 
 # --- a decode padded to its rung ----------------------------------------------

@@ -19,15 +19,20 @@ is a final chunk.
 Under a drafter of `drafts` tokens a decode step verifies `drafts` and one in
 each row, and a step also reads its drafter's graph, `graph(..., draft=True)`,
 the work ATOM queues after `forward_done_event` on a step that samples, else
-from its draft-KV pass on: its prices are terms named ``draft op.<kind>``,
+from its first draft pass on: its prices are terms named ``draft op.<kind>``,
 each tagged draft. Sampling is the target's. A decode's drafter is read at its
 rows run at the step's width: its first pass runs the rows' tokens unpadded.
+A target that replays no graph yet pads past its rows (`target_bs`) is read
+at that width, `W=`: an eager decode's model, a sampling prefill's LM head.
 
 Each leaf is one pricing unit, `max(t0, F / peak, M / BW(M), t_comm)` over its
 work (`op_work.work`): its own tensors at the captured shape, the state it
 reads at the step's rows, attention's context in `kv`, the run's KV cache
 format, the routed experts over the run's `ep` ranks. A leaf that launches
-no kernel costs nothing. Regions compose by the
+no kernel costs nothing. A step prices once the leaves of a kind that agree on
+every part of a leaf the kind's work has read, a leaf whose work reads nothing
+of the step keeps its price, and with no price list a graph keeps its price
+for each set of prices of its leaves that read the step. Regions compose by the
 IR's joins: a `Seq` adds its items in order, a `Repeat` re-emits its body's
 prices once per instance, a `max` `Par` emits its longest branch's prices, and a
 `resource_bound` `Par` one roofline over its branches' summed work. The price
@@ -56,7 +61,7 @@ neither from a datasheet nor probed, and `analytical` otherwise; it carries
 each reason the price list declined one of its leaves. A price list's prices
 are ``op.<kind>.price_list``, and ``op.tbo.price_list`` when it priced every
 leaf of both micro-batches, `measured` when each sat on a measured point and
-`estimated` otherwise.
+`estimated` otherwise, validated when each of its estimated leaves is.
 
 Refused: a step with image tokens, since no graph holds the vision encoder; a
 two-batch-overlap step on MoRI's split send and receive (`split_send_recv`),
@@ -65,8 +70,7 @@ this rank, whose micro-batches' graphs exchange a different number of times
 or run an exchange beside a second stream (the dual-stream MoE, which ATOM
 turns off under overlap), or that runs under a drafter, whose draft pass no
 graph places on the overlapped streams; a decode step whose rows do not each
-verify the drafter's tokens and one; a DP middle chunk under a drafter, whose
-drafter's passes no cut parts from the target's; a prefill step whose view
+verify the drafter's tokens and one; a prefill step whose view
 does not say whether it produces output; a shape with no graph, a
 data-parallel step's naming the rows it gathers; and, each reason once, a leaf
 whose kind has no extractor, whose price reads a spec field the spec lacks, or
@@ -75,7 +79,8 @@ whose collective leaves the scale-up domain.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import json
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 
 from atom.compass.backends.base import CostBackend, Granularity
@@ -97,6 +102,91 @@ TBO = "op.tbo"
 NONE = "; no successor: the analytical law is the last op-level source"
 #: The prefix of a drafter's terms.
 DRAFT = "draft "
+#: The leaves a backend keeps; past it, it forgets them all and every price
+#: it kept across steps.
+KEPT = 1 << 16
+#: The prices a graph keeps by its step-reading leaves' prices; past it, it
+#: forgets them.
+COMPOSED = 1 << 12
+#: A reference argument's keys: a context key or a module path, whose value a
+#: leaf's work does not read.
+REFS = ({"context"}, {"module"})
+#: What a price list reads of a leaf, as `_Seen` paths.
+LISTED_READS = {("args",), ("out",), ("stated",)}
+
+
+class _Seen(Mapping):
+    """A leaf, or its `args` or `stated`, that adds each path its reader
+    looks up to `reads`: a key, present or not, or the path and None when it
+    walks every key or takes `args` or `stated`, whose presence it reads."""
+
+    def __init__(self, data: dict, reads: set, at: tuple = ()) -> None:
+        self.data, self.reads, self.at = data, reads, at
+
+    def __getitem__(self, key):
+        path = self.at + (key,)
+        if path in (("args",), ("stated",)) and isinstance(self.data.get(key), dict):
+            self.reads.add(path + (None,))
+            return _Seen(self.data[key], self.reads, path)
+        self.reads.add(path)
+        return self.data[key]
+
+    def __iter__(self):
+        self.reads.add(self.at + (None,))
+        return iter(self.data)
+
+    def __len__(self) -> int:
+        self.reads.add(self.at + (None,))
+        return len(self.data)
+
+
+def _at(leaf: dict, path: tuple) -> list:
+    """What a `_Seen` read of `path` in `leaf` returned: ``[1, value]``, the
+    keys under it for a walk, a reference argument by its keys; or ``[0,
+    depth]`` where the path ends."""
+    value = leaf
+    for depth, key in enumerate(path):
+        if key is None:
+            return [1, sorted(value)]
+        if not isinstance(value, dict) or key not in value:
+            return [0, depth]
+        value = value[key]
+    if path == ("args",):
+        value = {s: _ref(v) for s, v in value.items()}
+    elif path[:1] == ("args",):
+        value = _ref(value)
+    return [1, value]
+
+
+def _same(priced: list) -> tuple:
+    """A key that two lists of a graph's ``(leaf, in a Par, price)`` share
+    only when each leaf is at a price of the same value, its work too in a
+    `Par`, the only join that reads it. The share index stays: a step can
+    share leaves another step prices apart, so equal values can sit on other
+    leaves."""
+    first: dict[tuple, tuple] = {}
+    for _, par, p in priced:
+        value = p if par or p is None else p[:3] + p[4:]
+        first.setdefault((id(p), par), (len(first), value))
+    return (
+        tuple(first[id(p), par][0] for _, par, p in priced),
+        repr([value for _, value in first.values()]),
+    )
+
+
+def _ref(value):
+    return sorted(value) if isinstance(value, dict) and value.keys() in REFS else value
+
+
+class _Watched:
+    """A step's view that notes whether a leaf's work read anything of it."""
+
+    def __init__(self, view: BatchView) -> None:
+        self.view, self.read = view, False
+
+    def __getattr__(self, name: str):
+        self.read = True
+        return getattr(self.view, name)
 
 
 class _Roofline(CostSource):
@@ -186,6 +276,17 @@ class OpGraphBackend(CostBackend):
         self.drafts = drafts
         self.name = machine.values.get("name", "")
         self._stated_as: dict[str, str] = {}
+        # By leaf object: the leaf, the text of what its price reads of it, and
+        # its price at a bound when its work read nothing of the step; by view,
+        # bound and that text: one step's prices. By op kind: every path its
+        # work has read of a leaf. By graph: the leaves whose prices read the
+        # step, and the composed price by their prices.
+        self._kept: dict[int, list] = {}
+        self._step: dict[tuple, tuple] = {}
+        self._reads: dict[str, set] = {}
+        self._graphs: dict[tuple, tuple] = {}
+        self._live: list | None = None
+        self._pars = 0
         self.resolver = price_list and Resolver([price_list, _Roofline(self)])
 
     @property
@@ -194,16 +295,35 @@ class OpGraphBackend(CostBackend):
 
     def price(self, batch_view: BatchView) -> StepCost:
         refused: list[Refusal] = []
+        self._step, self._live, self._pars, graph = {}, None, 0, None
         if batch_view.tbo_tokens is None or batch_view.image_tokens:
             at, region = self._region(batch_view)
             bound = self.resolver and self._bound(batch_view)
+            drafted_at, drafted = (
+                self._region(batch_view, draft=True) if self.drafts else (None, None)
+            )
+            # A price list's bound reads each step's context, so its steps
+            # compose afresh.
+            graph = None if bound else (at, id(region), drafted_at, id(drafted))
+            if graph in self._graphs:
+                # The other leaves' prices read nothing of a step.
+                missed: list[Refusal] = []
+                got = [
+                    (*p[:2], self._leaf(p[0], batch_view, missed, None))
+                    for p in self._graphs[graph][1]
+                ]
+                if missed:
+                    self._step = {}
+                elif (cost := self._graphs[graph][2].get(_same(got))) is not None:
+                    return cost
+            self._live = [] if graph else None
             priced = self._priced(region, batch_view, refused, bound)
             if self.drafts:
-                drafted_at, region = self._region(batch_view, draft=True)
                 priced += [
                     (DRAFT + p[0], *p[1:])
-                    for p in self._priced(region, batch_view, refused, bound)
+                    for p in self._priced(drafted, batch_view, refused, bound)
                 ]
+            live, self._live = self._live, None
         else:
             at, priced = self._overlapped(batch_view, refused)
         if refused:
@@ -211,19 +331,22 @@ class OpGraphBackend(CostBackend):
         seconds: dict[str, list[float]] = {}
         stated: dict[str, list[str]] = {}
         how: dict[str, tuple[list, list]] = {}
-        for name, s, notes, _, _, (methods, declined) in priced:
+        for name, s, notes, _, _, (origins, declined) in priced:
             seconds.setdefault(name, []).append(s)
             stated.setdefault(name, []).extend(notes)
             got = how.setdefault(name, ([], []))
-            got[0].extend(methods)
+            got[0].extend(origins)
             got[1].extend(declined)
         terms = []
         for name, values in seconds.items():
             note = "; ".join(dict.fromkeys(stated[name]))
             method = Method.DECLARED if note else Method.ANALYTICAL
-            source, (methods, why) = SOURCE, how[name]
+            source, (origins, why), validated = SOURCE, how[name], False
             if name.endswith(".price_list"):
-                method, source = combine(methods), LISTED
+                method, source = combine(p.method for p in origins), LISTED
+                validated = method is Method.ESTIMATED and all(
+                    p.validated for p in origins if p.method is Method.ESTIMATED
+                )
             drafted = name.startswith(DRAFT)
             detail = (
                 f"{len(values)} prices of the graph at {drafted_at if drafted else at}"
@@ -236,9 +359,17 @@ class OpGraphBackend(CostBackend):
                 source,
                 tuple(dict.fromkeys(why)),
                 note=note and note + NONE,
+                validated=validated,
             )
             terms.append(CostTerm(name, fold_seconds(values), provenance, drafted))
-        return StepCost(terms)
+        cost = StepCost(terms)
+        if graph is not None:
+            composed = self._graphs.get(graph, (0, 0, {}))[2]
+            if len(composed) >= COMPOSED:
+                composed.clear()
+            composed[_same(live)] = cost
+            self._graphs[graph] = ((region, drafted), live, composed)
+        return cost
 
     def describe(self) -> str:
         rows = "the rows a graph pads to" if self.padded else "real rows"
@@ -261,7 +392,8 @@ class OpGraphBackend(CostBackend):
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
         with `draft`, its drafter's, a decode's at its rows, at `draft_moe_rows`,
-        refused for a DP middle chunk."""
+        its later passes at `draft_bs`; else a target that pads past its rows
+        without a replay at `target_bs`."""
         if view.image_tokens:
             reason = IMAGES
         else:
@@ -272,26 +404,25 @@ class OpGraphBackend(CostBackend):
             except ValueError as exc:
                 reason = f"a step that {exc}"
             else:
-                if draft and shape[0] == "decode":
-                    shape = ("decode", len(rows), shape[2])
                 output = any(d for _, d in rows) or view.produces_output
+                width = self.padded and (view.draft_bs if draft else view.target_bs)
+                if draft and shape[0] == "decode":
+                    shape = ("decode", len(rows), width or shape[2])
+                    width = None
                 none = "" if output else " that produces no output"
                 gathered = view.draft_moe_rows if draft else view.moe_rows
                 g = () if gathered is None else (gathered,)
                 drafted = {"draft": True} if draft else {}
-                at = "".join(f" G={n}" for n in g)
+                # A DP middle chunk runs its drafter's propose too.
+                if (output or self.dp > 1) and width and width != shape[2]:
+                    drafted["width"] = width
+                at = f" W={width}" * ("width" in drafted)
+                at += "".join(f" G={n}" for n in g)
                 if output is None:
                     reason = (
                         "a prefill step whose view does not say whether it "
                         "produces output, so whether it runs the LM head and the "
                         "sampler"
-                    )
-                elif draft and not output and self.dp > 1:
-                    reason = (
-                        "a DP middle chunk under a drafter: ATOM runs the "
-                        "drafter's passes for their DP collectives in place of its "
-                        "draft-KV pass (`propose(align_only=True)`), and no cut "
-                        "parts them from the target's"
                     )
                 elif isinstance(
                     region := self.graph(*shape, output, *g, **drafted), dict
@@ -304,7 +435,9 @@ class OpGraphBackend(CostBackend):
                             *shape,
                             "".join(f" gathering {n} rows" for n in g),
                             none,
-                            " for its drafter" * draft,
+                            " for its drafter" * draft
+                            + f", {'its later passes at' if draft else 'padded to'} {width}"
+                            * ("width" in drafted),
                             region or "",
                         )
                     )
@@ -328,7 +461,7 @@ class OpGraphBackend(CostBackend):
             halves = micro_batches(view)
         except ValueError as exc:
             raise CostRefused(view, [Refusal(SOURCE, str(exc))]) from None
-        at, runs, notes, methods, why = [], [], [], [], []
+        at, runs, notes, origins, why = [], [], [], [], []
         listed = bool(self.resolver)
         for k, half in enumerate(halves):
             output = k == 1 and view.produces_output
@@ -348,7 +481,7 @@ class OpGraphBackend(CostBackend):
                     )
                     raise CostRefused(view, [Refusal(SOURCE, reason)])
                 notes += stated
-                methods += how[0]
+                origins += how[0]
                 why += how[1]
                 listed = listed and name.endswith(".price_list")
                 if comm != (len(run) % 2 == 0):
@@ -363,17 +496,17 @@ class OpGraphBackend(CostBackend):
             )
             raise CostRefused(view, [Refusal(SOURCE, reason)])
         name = TBO + ".price_list" if listed else TBO
-        price = (name, overlap([zip(*runs)]), notes, Work(), False, (methods, why))
+        price = (name, overlap([zip(*runs)]), notes, Work(), False, (origins, why))
         return " and ".join(at), [price]
 
     def _priced(self, region: dict, view: BatchView, refused: list, bound) -> list:
         """`region`'s prices in run order, each ``(term, seconds, stated, work,
-        comm, (methods, declined))``, `work` what it adds to an enclosing
+        comm, (origins, declined))``, `work` what it adds to an enclosing
         resource_bound, `comm` that it rides the comm stream under two-batch
         overlap, None when it joins an MoE exchange to work on another stream,
-        `methods` the price list's and `declined` its reasons for a roofline;
-        what refuses goes to `refused`. With a `bound`, a leaf resolves through
-        the price list first."""
+        `origins` the price list's provenances and `declined` its reasons for a
+        roofline; what refuses goes to `refused`. With a `bound`, a leaf
+        resolves through the price list first."""
         if "op" in region:
             leaf = self._leaf(region, view, refused, bound)
             comm = region["op"].startswith(MOE_EXCHANGES) and any(
@@ -389,10 +522,12 @@ class OpGraphBackend(CostBackend):
                 p for i in region["seq"] for p in self._priced(i, view, refused, bound)
             ]
         pooled = region["join"] == "resource_bound"
+        self._pars += 1
         branches = [
             self._priced(b, view, refused, None if pooled else bound)
             for b in region["par"]
         ]
+        self._pars -= 1
         summed = sum((p[3] for b in branches for p in b), Work())
         comm = None if any(p[4] is not False for b in branches for p in b) else False
         if region["join"] == "max":
@@ -409,10 +544,51 @@ class OpGraphBackend(CostBackend):
         return [(name, *unit, summed, comm, ((), ()))] if unit else []
 
     def _leaf(self, leaf: dict, view: BatchView, refused: list, bound):
-        """One leaf's ``(term, seconds, stated, work, (methods, declined))`` as
+        """`_price_leaf`, once a step for each value of every path its op
+        kind's work has read of a leaf, and with a price list of the leaf's
+        operator, arguments, outputs and stated fields; and once for good for a
+        leaf object whose work read nothing of the step and nothing refused."""
+        kept = self._kept.get(id(leaf))
+        if kept is None:
+            if len(self._kept) >= KEPT:
+                self._kept.clear()
+                self._graphs.clear()
+            kept = self._kept[id(leaf)] = [leaf, None, None]
+        if kept[2] and kept[2][0] == bound:
+            return kept[2][1]
+        # A step's refusals are named once, so a repeat need not add its own.
+        key = (id(view), bound, self._text(kept, bound))
+        if key not in self._step:
+            n, watched = len(refused), _Watched(view)
+            got = self._price_leaf(leaf, watched, refused, bound)
+            self._step[key] = (view, got, not (watched.read or refused[n:]))
+            # Kept too by every path the work has read by now, its own among
+            # them, which a path read anew changes.
+            self._step[id(view), bound, self._text(kept, bound)] = self._step[key]
+        _, got, free = self._step[key]
+        if free:
+            kept[2] = (bound, got)
+        elif self._live is not None:
+            self._live.append((leaf, self._pars > 0, got))
+        return got
+
+    def _text(self, kept: list, bound) -> str:
+        """The text of what a leaf's price reads of it: every path its kind's
+        work has read of a leaf, and with a price list all the list reads."""
+        leaf, paths = kept[0], self._reads.setdefault(kept[0]["op"], set())
+        at = (len(paths), bool(bound))
+        if kept[1] is None or kept[1][0] != at:
+            read = sorted(paths | LISTED_READS if bound else paths, key=repr)
+            what = [leaf["op"], [[p, _at(leaf, p)] for p in read]]
+            kept[1] = (at, json.dumps(what, sort_keys=True, default=repr))
+        return kept[1][1]
+
+    def _price_leaf(self, leaf: dict, view, refused: list, bound):
+        """One leaf's ``(term, seconds, stated, work, (origins, declined))`` as
         `_priced` lists it; None when it launches no kernel or refuses."""
         try:
-            w = work(leaf, view, self.tp, self.kv, self.ep)
+            seen = _Seen(leaf, self._reads.setdefault(leaf["op"], set()))
+            w = work(seen, view, self.tp, self.kv, self.ep)
         except CostRefused as exc:
             w = tuple(exc.declined)
         except ValueError as exc:
@@ -428,7 +604,7 @@ class OpGraphBackend(CostBackend):
             term, listed = got.term, got.source == LISTED
             notes = term.provenance.note.split("; ") if term.provenance.note else []
             name = f"{term.name}.price_list" if listed else term.name
-            how = ((term.provenance.method,) if listed else (), got.declined)
+            how = ((term.provenance,) if listed else (), got.declined)
             return name, term.seconds, notes, Work(), how
         if isinstance(w, tuple):
             refused.extend(w)

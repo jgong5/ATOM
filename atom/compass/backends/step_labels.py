@@ -11,7 +11,9 @@ run.json names `BUILDS`, aiter JIT modules its server built while it served;
 
 A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
 `dp_rank`. An older record's lines state neither count: `group_tokens`
-rebuilds `moe_tokens` from every rank's line, and no step is split.
+rebuilds `moe_tokens` from every rank's line, and, when its host key's engine
+states `enable_tbo`, the caller's `split_rule`, ATOM's two-batch-overlap split
+over those lines, rebuilds `tbo_tokens`; with no rule such a line refuses.
 
 A step's device label is its device busy time, `d_busy_ns`, plus for a decode
 step the device work queued since the previous forward's exit, `d_gap_ns`. A
@@ -44,6 +46,9 @@ and a middle chunk has none. With an MTP status wait,
 pipeline stage, `W_recv` runs from the launch to the receive of its input.
 Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
 pull after the previous exit, and `E_out` from the exit to the pull after it.
+`label_run` labels a run's DP ranks together: there `E` runs from the latest
+pull, else exit, over the ranks before the same forward, where the group's
+`_sync_dp_state` releases each of them.
 
 `write_table` writes a record's labels beside it, `dp<r>.cost.jsonl`, for
 people: a first line `{"version": TABLE_VERSION}`, then per step `step`,
@@ -185,16 +190,59 @@ def _shared(step, other) -> bool:
     return bool({r[0] for r in step["batch"]} & {r[0] for r in other["batch"]})
 
 
-def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
-    """The record's samples, in step order, and its table's rows.
-
-    `run` names the run in each sample's provenance, the record's `digest` by
-    default.
-    """
+def _read(record) -> list[dict]:
     path = Path(record)
     lines = read_jsonl(path)
     if (pulls := path.with_suffix(".pulls.jsonl")).exists():
         join_stamps(lines, pulls)
+    return lines
+
+
+def _pull(step: dict) -> int:
+    return step.get("t_pull_ns", step["t_exit_ns"])
+
+
+def label(
+    record, run: str | None = None, split_rule=None
+) -> tuple[list[Sample], list[dict]]:
+    """The record's samples, in step order, and its table's rows.
+
+    `run` names the run in each sample's provenance, the record's `digest` by
+    default; `split_rule` rebuilds an older record's split, as above.
+    """
+    lines = _read(record)
+    return _label(record, lines, run, [_pull(s) for s in lines], split_rule)
+
+
+def label_run(
+    records, run: str | None = None, split_rule=None
+) -> list[tuple[list[Sample], list[dict]]]:
+    """`label` of each of `records`, one run's DP ranks, with each `E` from the
+    latest pull over the ranks before the same forward. A rank that ran only
+    DP's dummy forwards gives no sample and no row. Ranks whose line counts
+    differ by more than the forward a stopped server leaves on some refuse."""
+    ranks = [_read(r) for r in records]
+    counts = {Path(r).name: len(x) for r, x in zip(records, ranks) if x}
+    if counts and max(counts.values()) - min(counts.values()) > 1:
+        raise ValueError(
+            f"the run's rank records hold {counts} lines, so their forwards "
+            "do not pair up"
+        )
+    n = max(map(len, ranks), default=0)
+    starts = [max(_pull(x[i]) for x in ranks if i < len(x)) for i in range(n)]
+    return [
+        (
+            ([], [])
+            if x and all(s["is_dummy_run"] for s in x)
+            else _label(r, x, run, starts, split_rule)
+        )
+        for r, x in zip(records, ranks)
+    ]
+
+
+def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[dict]]:
+    """`label` of `record`'s `lines`, each `E` from `starts` at the line before."""
+    path = Path(record)
     steps = [s for s in lines if not s["is_dummy_run"]]
     dummies = frozenset(s["step"] for s in lines if s["is_dummy_run"])
     if not steps or "t_enter_ns" not in steps[0]:
@@ -210,19 +258,29 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
     config = read_json(key) if key.exists() else None
+    tbo = (config or {}).get("engine", {}).get("enable_tbo")
     run = run or digest(record)
     samples, table, prev, ranks = [], [], None, None
-    for s in lines:
+    for i, s in enumerate(lines):
         if s["is_dummy_run"]:
             prev = s
             continue
         dp, tokens = "moe_rows" in s, s.get("moe_tokens")
+        split = s.get("tbo_tokens")
         if dp and tokens is None:
             if ranks is None:
                 peers = path.parent.glob(path.name.split("dp")[0] + "dp*[0-9].jsonl")
                 ranks = [{t["step"]: t for t in read_jsonl(p)} for p in sorted(peers)]
-            tokens = group_tokens([r.get(s["step"]) for r in ranks])
-        split = s.get("tbo_tokens")
+            group = [r.get(s["step"]) for r in ranks]
+            tokens = group_tokens(group)
+            if tokens is not None and tbo:
+                if split_rule is None:
+                    raise ValueError(
+                        f"{record} step {s['step']} states no two-batch-overlap "
+                        "split under enable_tbo, and no split rule was given to "
+                        "rebuild it"
+                    )
+                split = split_rule(group)
         view = BatchView(
             tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
             capture_rung=s["rung"],
@@ -263,7 +321,7 @@ def label(record, run: str | None = None) -> tuple[list[Sample], list[dict]]:
             host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]
         idle = prev is not None and not _shared(s, prev)
         if prev is not None and not idle:
-            host["E"] = enter - prev.get("t_pull_ns", prev["t_exit_ns"])
+            host["E"] = enter - starts[i - 1]
         host = {k: v * 1e-9 for k, v in host.items()}
         provenance = {
             "source": "record",

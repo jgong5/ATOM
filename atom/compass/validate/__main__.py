@@ -9,13 +9,16 @@ or `op_graph/` (`compass run --op-graph`'s, at the `OpGraphBackend` its run file
 and price list give under the ATOM arguments its command line served, built as
 `compass run` builds it) and two or more `real*/`. `cctraces_sim.sh` writes each run.json as the run file with
 the `workload` every run must share; `record` and `run` write their own, the run file
-as `run_file`. `validate.runs` decides which client run is graded, and whether one is,
-in a run `record` or `run` wrote and in a `cctraces_sim.sh` run holding
-`artifacts/client_run.json`. Rows: `validate.runs`' grades, TTFT p50 per band of
+as `run_file`, and `client.sh` the workload in `artifacts/workload.json`; a refusal
+names each field the runs do not share. `validate.runs` decides which client run is
+graded, and whether one is, in a run `record` or `run` wrote and in a `cctraces_sim.sh`
+run holding `artifacts/client_run.json`, and grades every run whole when a real run
+holds none. Rows: `validate.runs`' grades, TTFT p50 per band of
 uncached prompt tokens graded alike; per such run, its warmup: how many requests
 its export names as such and how many steps hold only those; `validate.cost` on the
 steps graded (with the steps it leaves out, declines with their most frequent
-reasons, or extrapolates) and `memory.check` per real run; and the simulated run's refusals by source, its steps
+reasons, or extrapolates), its graded rows gated and its validated, unvalidated
+and declared rows not, and `memory.check` per real run; and the simulated run's refusals by source, its steps
 extrapolated and priced by a fallback, shares and speed, from its first client run's
 summary when it has one. An `op_graph/` cell's cost rows also give, per phase,
 the priced seconds by method and each op kind's seconds over the measured ones,
@@ -62,10 +65,18 @@ from atom.compass.run.step_grid import keyed_of, read
 from atom.compass.validate import cost, runs
 
 BANDS = [token_band(edge) for edge in (0, *TOKEN_BANDS)]
-HULL = {"validated": ("validated", "-"), "unvalidated": ("unvalidated", "not gated")}
+#: Cost rows' verdict per report group: the graded ones carry the gate.
+GATED = {
+    "graded": "-",
+    "validated": "not gated",
+    "unvalidated": "not gated",
+    "declared": "not gated",
+}
 GATED_COUNTS = {"preemptions", "prefill tokens"}
 #: A deployment side's engine LP, whose hand-in its memory is checked against.
 HAND_IN = {"prefill": "engine-P", "decode": "engine-D"}
+#: Where `client.sh` states the workload of the client run it drove.
+WORKLOAD = "artifacts/workload.json"
 
 
 def _ttft(run: Path) -> dict[str, float]:
@@ -120,7 +131,7 @@ def _cost(name: str, run: Path, backend, steps: list[dict], fallback, op=False):
         for term, t in report["terms"][kind].items():
             value = f"on totals {t['on_totals']:.3f}; per step p10 {t['p10']:.3f} p50 {t['p50']:.3f} p90 {t['p90']:.3f}"
             yield where, f"{kind} {term} over measured", value, "not gated"
-    for group, (hull, gated) in HULL.items():
+    for group, gated in GATED.items():
         for kind, s in report[group].items():
             held = "-" if s["held_out"] is None else f"{s['held_out']:+.2%}"
             value = (
@@ -128,10 +139,10 @@ def _cost(name: str, run: Path, backend, steps: list[dict], fallback, op=False):
                 f" on totals {s['on_totals']:+.2%}, holding out step {s['held_out_step']} {held},"
                 f" median {s['median']:+.2%}"
             )
-            yield where, f"{kind} {hull}", value, gated
+            yield where, f"{kind} {group}", value, gated
             for band, b in s["bands"].items():
                 value = f"{b['steps']} steps; p10 {b['p10']:+.1%} p50 {b['p50']:+.1%} p90 {b['p90']:+.1%}"
-                yield where, f"{band} {hull}", f"{value}; within 10% {b['within_10pct']:.1%}", gated
+                yield where, f"{band} {group}", f"{value}; within 10% {b['within_10pct']:.1%}", gated
     yield where, "left out", f"not labelled {json.dumps(report['cut'])}; warm steps, real s { {w['step']: round(w['real_s'], 2) for w in report['warm']} }", "-"
     for kind in ("fallback", "refused"):
         for band, r in report[kind].items():
@@ -248,6 +259,29 @@ def _grid(sim: Path, run: dict, summary: dict):
     return read(run.get("run_file", run)[STEP_GRID], *digests)
 
 
+def _odd_workloads(cell: Path, run: dict) -> dict:
+    """Each workload field the runs of `cell`, `run` their run.json by name,
+    do not all share, with each run's value, its trace digests as how many are
+    not every run's. A run states its workload in its run.json, or in
+    `artifacts/workload.json` as `client.sh` writes it."""
+    path = {n: cell / n / WORKLOAD for n in run}
+    stated = {
+        n: f.get("workload") or (read_json(path[n]) if path[n].is_file() else {})
+        for n, f in run.items()
+    }
+    odd = {}
+    for k in sorted({k for w in stated.values() for k in w}):
+        v = {n: w.get(k) for n, w in stated.items()}
+        if len({json.dumps(x, sort_keys=True) for x in v.values()}) > 1:
+            odd[k] = v
+    if digests := odd.get("traces_sha256"):
+        every = set.intersection(*(set(d or ()) for d in digests.values()))
+        odd["traces_sha256"] = {
+            n: len(set(d or ()) - every) for n, d in digests.items()
+        }
+    return odd
+
+
 def rows(cell) -> list[tuple]:
     """The cell's rows, (result, metric, value, verdict), its verdict first."""
     cell = Path(cell)
@@ -283,8 +317,8 @@ def rows(cell) -> list[tuple]:
     run = {r.name: read_json(r / "run.json") for r in (*real, sim)}
     for name, f in run.items():
         refuse_renamed_keys(f, cell / name / "run.json")
-    if len({json.dumps(f.get("workload"), sort_keys=True) for f in run.values()}) != 1:
-        raise ValueError(f"{cell}'s runs {sorted(run)} ran different workloads")
+    if odd := _odd_workloads(cell, run):
+        raise ValueError(f"{cell}'s runs {sorted(run)} ran different workloads: {odd}")
     summary = read_json(summary_file)
     verdict = "coverage report" if summary["coverage_report"] else "graded"
     out = [("cell", "verdict", f"{len(real)} real runs", verdict)]
@@ -295,19 +329,20 @@ def rows(cell) -> list[tuple]:
     # Each side of a deployment served under its own ATOM arguments.
     graphs = {s.relative_to(sim): _op_graph(s) for s in runs.sides(sim)} if op else {}
     fallback = run_file.get("step_roofline", False)
+    whole = runs.graded_whole(real)
     # A deployment's runs per side, each at its law and against its engine's hand-in.
     for r in real:
         for side in runs.sides(r):
             name = " ".join(side.relative_to(cell).parts)
             backend = grid or graphs.get(side.relative_to(r)) or _law(run_file, side)
-            steps, _traces, warmup = runs.graded(side, r)
+            steps, _traces, warmup = runs.graded(side, r, whole)
             out += _warmup(name, warmup)
             out += _cost(name, side, backend, steps, fallback, op)
             out += _memory(name, sim, HAND_IN.get(side.name, ENGINE.name), side)
     out += _warm_over_cold(run_file) if op else ()
     for side in runs.sides(sim):
         name = " ".join(side.relative_to(cell).parts)
-        out += _warmup(name, runs.graded(side, sim)[2])
+        out += _warmup(name, runs.graded(side, sim, whole)[2])
     out += _summary(sim, summary)
     return out
 

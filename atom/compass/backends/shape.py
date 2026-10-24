@@ -196,7 +196,13 @@ class BatchView:
     gather carries, which the MoE segment is priced from. It is None on one
     rank. `draft_moe_rows` is the rows the same gather carries on an MTP
     draft's first pass, which runs each rank's own token count; None on one
-    rank or with no such drafter. `moe_tokens` is the real tokens among
+    rank or with no such drafter. `draft_bs` is the batch an MTP drafter's
+    later passes run at, a row a sequence, padded past the rows: the step's
+    `running_bs`, for a drafter that declares a draft graph; None for one
+    that runs them at the rows, or with none. `target_bs` is the step's
+    `running_bs` where a target that replays no graph pads past its rows: an
+    eager decode every DP rank decodes in, its model; a sampling prefill, its
+    LM head; else None. `moe_tokens` is the real tokens among
     `moe_rows`: a padded gather fills the rest with pad rows that all carry
     token 0 at position 0. None on one rank. `produces_output` says whether
     the step samples, which a pure middle prefill chunk does not; None when
@@ -220,6 +226,8 @@ class BatchView:
     capture_rung: int | None = None
     moe_rows: int | None = None
     draft_moe_rows: int | None = None
+    draft_bs: int | None = None
+    target_bs: int | None = None
     produces_output: bool | None = None
     tbo_tokens: tuple[tuple[int, ...], ...] | None = None
     image_tokens: int = 0

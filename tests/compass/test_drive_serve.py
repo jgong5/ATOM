@@ -181,6 +181,14 @@ def test_a_simulated_server_gets_its_run_file_and_clock_and_no_gpu_check(
     assert json.loads((out / serve.RUN_JSON).read_text())["args"][3] == "()"
 
 
+def test_an_op_graph_run_file_holds_atom_s_arguments(planted, monkeypatch):
+    monkeypatch.setenv("PLANTED_EXIT", "late:0")
+    out = planted / "out"
+    serve.serve(ARGS, out, run={"bound_s": 1.0, "op_graph": True})
+
+    assert json.loads((out / serve.RUN_FILE).read_text())["atom_args"] == ARGS
+
+
 @pytest.mark.parametrize("kind", [{"gpus": (7,), "run": {}}, {}])
 def test_a_server_is_real_or_simulated_exactly_one(planted, monkeypatch, kind):
     monkeypatch.setenv("PLANTED_EXIT", "early:0")

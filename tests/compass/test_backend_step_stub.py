@@ -170,6 +170,8 @@ class TestPerRequestSums:
             "capture_rung",
             "moe_rows",
             "draft_moe_rows",
+            "draft_bs",
+            "target_bs",
             "produces_output",
             "tbo_tokens",
             "image_tokens",

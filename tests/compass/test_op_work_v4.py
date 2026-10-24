@@ -10,15 +10,20 @@ every leaf prices too, the experts at bf16 at EP off, fp8 at EP8, and fp4
 under `ATOM_USE_TRITON_MOE_A4W4`.
 """
 
+import json
+import re
 from dataclasses import replace
 from math import comb
 
 import pytest
 import test_capture_v4_pro
+from test_capture_ir import _ops
 from test_capture_v4_pro import DPA_TP8, EP8, SHAPES, capture
 from test_op_work import BF16, I32, ONE, _view, leaf, rows, t
 from test_work import machine
 
+from atom.compass.artifacts import ArtifactStore, Kind, Topology
+from atom.compass.backends import BatchView, RequestShape
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.resolver import CostRefused
@@ -414,3 +419,35 @@ def test_v4_pro_s_triton_experts_price_at_the_format_their_kernels_run(
         for n in (width, 1)
     ]
     assert seconds[0].seconds < seconds[1].seconds if ep else seconds[0].seconds > 0
+
+
+def test_a_v4_pro_mtp2_drafter_prices_its_pick_and_its_later_passes(tmp_path):
+    # DeepSeek-V4-Pro at TP8 under MTP2: the drafter of a 64-token prefill
+    # picks each pass's token from the vocabulary shards, and attends its
+    # later passes through the decode kernel alone.
+    argv = "--prefill 64 1 -- --kv_cache_dtype fp8 --method mtp"
+    done = test_capture_v4_pro.trace(tmp_path, argv + " --num-speculative-tokens 2")
+    store = ArtifactStore(str(tmp_path / "store"))
+    rank = next(iter(Topology().ranks()))
+    graphs = {}
+    for token in re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE):
+        entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
+        graph = json.loads(entry.read_member("graph", rank, "json"))
+        structure = graph["structure"]
+        graphs[structure.endswith(" draft"), " no output" not in structure] = graph
+    drafter = graphs.get((True, True))
+    assert drafter, done.stderr[-4000:]
+    pick, asm = "aiter.lm_head_argmax_pack.default", "aiter.mla_decode_v4_asm.default"
+    later = [op for op in _ops(drafter["region"]) if op["op"] == asm]
+    assert later and all("stated" in op for op in later)
+    assert pick in {op["op"] for op in _ops(drafter["region"])}
+
+    backend = OpGraphBackend(
+        SPEC,
+        lambda *shape, draft=False: graphs.get((draft, shape[3]), {}).get("region"),
+        tp=8,
+        kv="fp8",
+        drafts=2,
+    )
+    view = BatchView((RequestShape(64, 64, False),), produces_output=True)
+    assert backend.price(view).draft_seconds > 0

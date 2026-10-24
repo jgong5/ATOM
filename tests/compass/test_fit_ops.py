@@ -63,18 +63,22 @@ def _run(ptl="disabled", root="a" * 40):
 
 @pytest.fixture
 def measured(tmp_path, monkeypatch):
-    """A `measure ops --out` directory of `records`, published to the store."""
+    """A `measure ops --out` directory of `records`, published to the store;
+    with `plan`, a `--plan` one, `records` a list of rounds each in round<n>."""
     monkeypatch.setattr("atom.compass.run.memory.key_fields", lambda c: LAYOUT)
     monkeypatch.setattr("atom.compass.run.step_grid.keyed", lambda c: {"level": 0})
 
-    def make(name, records, **run):
+    def make(name, records, plan=False, **run):
         run, out = _run(**run), tmp_path / name
         out.mkdir()
         (out / "run.json").write_text(json.dumps(run))
         (out / "engine.json").write_text(json.dumps({"level": 0}))
         store = ArtifactStore(str(tmp_path / "store"))
         key = bench.keys(None, run)
-        bench.publish(store, key, None, run, "compass measure ops", records, out)
+        for n, got in enumerate(records if plan else [records]):
+            at = out / f"round{n}" if plan else out
+            at.mkdir(exist_ok=True)
+            bench.publish(store, key, None, run, "compass measure ops", got, at)
         return out, key
 
     return make
@@ -166,6 +170,23 @@ def test_fit_ops_publishes_its_points_key_and_their_held_out_error(measured, tmp
     assert f["declined"] == [
         ["B", [1024], "B = 12 launched other kernels than its neighbours"]
     ]
+
+
+def test_fit_ops_reads_a_plan_run_s_rounds_as_one_directory(measured, tmp_path):
+    # 4 is held out between 2 and 8, each measured in another round
+    rounds = [[_point(2, 10.0), _point(8, 16.0)], [_point(4, 12.5)]]
+    rounds += [[_point(4, 1.0, n=512) | {"refused": "no"}]]
+    d, key = measured("plan", rounds, plan=True)
+
+    got = _fit(tmp_path / "fit", tmp_path / "store", d)
+
+    fields = key("decode B=2", 1024, _leaf(2, 128)).values
+    assert got["key"] == {k: v for k, v in fields.items() if k != "point"}
+    (f,) = got["params"]["families"].values()
+    assert f["points"] == [
+        [[b, 1024], ns, ["k"]] for b, ns in ((2, 10.0), (8, 16.0), (4, 12.5))
+    ]
+    assert f["brackets"] == [["B", [1024], 2, 8]]
 
 
 def test_a_line_holding_an_error_over_5pct_either_way_is_declined_with_its_reason():
@@ -397,3 +418,24 @@ def test_points_at_one_coordinate_that_launched_other_kernels_refuse():
 
     with pytest.raises(ValueError, match=r"launched \['k'\] and other kernels at"):
         ops.fit(points)
+
+
+@pytest.mark.parametrize(
+    "ns,brackets",
+    [
+        ({1: 1e3, 64: 64e3}, []),
+        ({1: 1e3, 8: 8e3, 64: 64e3}, [["B", [1024], 1, 64]]),
+        (
+            {1: 1e3, 8: 8e3, 16: 16e3, 64: 64e3},
+            [["B", [1024], 1, 16], ["B", [1024], 8, 64]],
+        ),
+        ({1: 1e3, 8: 4e3, 64: 64e3}, []),
+    ],
+    ids=["two-points", "one-held-out", "two-held-out", "declined"],
+)
+def test_a_line_that_interpolates_records_each_held_out_point_s_bracket(ns, brackets):
+    params = ops.fit([_point(b, t) for b, t in ns.items()])
+    ops.held_out(params)
+    (f,) = params["families"].values()
+
+    assert f["brackets"] == brackets

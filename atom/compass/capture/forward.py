@@ -34,12 +34,18 @@ batch so the rejection sampler runs, and a step that samples is cut where ATOM
 records `forward_done_event`: the target's work before it, the drafter's after
 it (its passes, the shared embedding and LM head among them), each its own
 graph. A middle chunk, which samples nothing, is a real step's batch too, so
-ATOM runs its draft-KV pass, and is cut where that pass starts. A block
+ATOM runs its draft-KV pass, and is cut where that pass starts; under DP
+ATOM runs the drafter's propose in its place, cut where that starts. A block
 drafter writes its draft KV before `forward_done_event` and is refused.
 A decode of fewer rows than its width ran padded to that rung: its rows run
 the drafter's first pass, which takes the target's tokens unpadded, and the
-step continues at the rung past the cut; only its drafter's graph is kept.
-"""
+step continues at the rung past the cut; only its drafter's graph is kept. A
+shape's `width` is the batch a step that replays no graph pads to past its
+rows, as `ForwardMode.decide` settles it from a ladder of that one width: a
+decode's model runs at it from its inputs, a prefill's LM head and its
+drafter's later passes at it, and each samples its rows. Under a drafter in DP
+a middle chunk runs those later passes at it too: only its drafter's graph is
+kept. A decode's drafter is kept from its own shape, at its rows."""
 
 import contextlib
 import copyreg
@@ -83,14 +89,22 @@ TORCH_NAMESPACES = ("aten", "prim", "prims", "_c10d_functional", "c10d")
 H2D = "atom/utils/h2d.py"
 #: Operators that ask a fake tensor where it is and run nothing on a device.
 UNDISPATCHED = ("profiler.", "prim.device")
-#: DeepSeek-V4's decode attention leaves: the fp8 KV cache's, the bf16 one's and the
-#: persistent kernel; and its indexer's score and top-k.
+#: DeepSeek-V4's decode attention leaves: the fp8 KV cache's, its asm kernel where
+#: that launches alone (a drafter's later pass), the bf16 one's and the persistent
+#: kernel; and its indexer's score and top-k.
 V4_DECODES = (
     "aiter.mla:mla_decode_fwd_v4_nm",
+    "aiter.mla_decode_v4_asm.default",
     "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton",
     "aiter.mla_decode_v4_ps_asm.default",
 )
 V4_INDEXER = "aiter.indexer_score_topk.default"
+#: DeepSeek-V4's fused QK-norm and RoPE, the fp8 KV cache's and the bf16 one's,
+#: which write a decode's window rows.
+V4_QKNS = (
+    "aiter._fused_qk_norm_rope_group_quant_kernel.default",
+    "aiter.ops.flydsl.kernels.qk_norm_rope_quant:flydsl_qk_norm_rope_quant",
+)
 #: Where a drafter's step ends its target's work: ATOM records `forward_done_event`.
 CUT = "forward_done_event"
 
@@ -100,24 +114,29 @@ _IS_ATOM: dict = {}
 
 class Shape(NamedTuple):
     """A step's shape: `tokens` query tokens over `seqs` sequences, a decode's
-    `tokens` its rows, fewer than `seqs` padded to a rung of `seqs`; and under DP
-    `gathered`, the rows the group's MoE gathers, None at every rank's `tokens`."""
+    `tokens` its rows, fewer than `seqs` padded to a rung of `seqs`; under DP
+    `gathered`, the rows the group's MoE gathers, None at every rank's `tokens`;
+    and `width`, the batch a step that replays no graph pads to past its
+    rows, None at its rows."""
 
     phase: str  # "decode" or "prefill"
     tokens: int
     seqs: int
     gathered: int | None = None
+    width: int | None = None
 
     def __str__(self) -> str:
         text = f"{self.phase} T={self.tokens} B={self.seqs}"
         if self.phase == "decode" and self.tokens == self.seqs:
             text = f"decode B={self.seqs}"
+        text += f" W={self.width}" * bool(self.width)
         return text if self.gathered is None else f"{text} G={self.gathered}"
 
     def at(self, dp: int, drafts: int = 0) -> "Shape":
         """This shape in a DP group of `dp` under a drafter of `drafts`:
         `gathered` only off its default (`gathered_off_default`)."""
-        g = gathered_off_default(self.phase, self.tokens, self.gathered, dp, drafts)
+        padded = self.phase == "decode" and self.width or self.tokens
+        g = gathered_off_default(self.phase, padded, self.gathered, dp, drafts)
         return self._replace(gathered=g)
 
 
@@ -127,13 +146,16 @@ def decode(width: int, gathered: int | None = None, rows: int | None = None) -> 
     return _gathering(Shape("decode", rows or width, width, gathered))
 
 
-def prefill(tokens: int, seqs: int, gathered: int | None = None) -> Shape:
+def prefill(
+    tokens: int, seqs: int, gathered: int | None = None, width: int | None = None
+) -> Shape:
     if not 1 <= seqs <= tokens:
         raise ValueError(
             f"a prefill of {tokens} tokens over {seqs} sequences: each sequence "
             "takes at least one token"
         )
-    return _gathering(Shape("prefill", tokens, seqs, gathered))
+    width = None if width == seqs else width
+    return _gathering(Shape("prefill", tokens, seqs, gathered, width))
 
 
 def _gathering(shape: Shape) -> Shape:
@@ -372,13 +394,9 @@ class _Recorder(TorchDispatchMode):
 
     def cut(self):
         """ATOM records `forward_done_event`: the target's work ends here, and
-        what follows is the drafter's, a padded decode's later passes at its rung."""
+        what follows is the drafter's."""
         if self.on:
             self.items.append((None, CUT))
-        if self.shape.phase == "decode":
-            from atom.utils.forward_context import get_forward_context
-
-            get_forward_context().context.running_bs = self.shape.seqs
 
     @contextlib.contextmanager
     def quiet(self):
@@ -851,8 +869,8 @@ def _v4_attention(v4, recorder):
 
     The decode leaves (`V4_DECODES`) state the layer's `window_size`,
     `compress_ratio` and `index_topk` (None when it has no indexer), and the
-    indexer's its `compress_ratio`, none of which they are passed: read off
-    the layer `layer_name` names.
+    indexer's and the fused QK-norms (`V4_QKNS`) its `compress_ratio`, none of
+    which they are passed: read off the layer `layer_name` names.
     """
     from atom.utils.forward_context import get_forward_context
 
@@ -861,7 +879,10 @@ def _v4_attention(v4, recorder):
         top = layer.indexer and layer.indexer.index_topk
         ratio = (("compress_ratio", layer.compress_ratio),)
         geometry = (("window_size", layer.window_size), *ratio, ("index_topk", top))
-        stated = {**dict.fromkeys(V4_DECODES, geometry), V4_INDEXER: ratio}
+        stated = {
+            **dict.fromkeys(V4_DECODES, geometry),
+            **dict.fromkeys((V4_INDEXER, *V4_QKNS), ratio),
+        }
         with (
             patch.object(recorder, "stated", stated),
             patch.object(get_forward_context().context, "is_dummy_run", False),
@@ -903,8 +924,9 @@ def _drafter(runner, recorder):
     """The width of `runner`'s drafter and its models, none without one. Its
     step is cut where its target's work ends, as the parity record stamps it:
     at `forward_done_event` on a step that samples, else where the drafter's
-    draft-KV pass starts. A block drafter writes its draft KV before
-    `forward_done_event` on a step that samples, and is refused."""
+    draft-KV pass starts, under DP its propose. A block drafter writes its
+    draft KV before `forward_done_event` on a step that samples, and is
+    refused."""
     drafter = getattr(runner, "drafter", None)
     if drafter is None:
         return 0, []
@@ -916,13 +938,20 @@ def _drafter(runner, recorder):
         )
     done, draft_kv = runner.forward_done_event, drafter.compute_draft_kv
     done.record = lambda *a: (recorder.cut(), driverless.Event.record(done, *a))
+    propose = runner.propose_draft_token_ids
 
     def compute_draft_kv(*args, **kwargs):
         if not recorder.output:
             recorder.cut()
         return draft_kv(*args, **kwargs)
 
+    def propose_draft_token_ids(*args, **kwargs):
+        if not recorder.output:
+            recorder.cut()
+        return propose(*args, **kwargs)
+
     drafter.compute_draft_kv = compute_draft_kv
+    runner.propose_draft_token_ids = propose_draft_token_ids
     return drafter.mtp_k, [drafter.model]
 
 
@@ -1030,13 +1059,13 @@ def _config(model, tp, atom_args):
     Under `--enable-dp-attention` each TP rank is a DP rank of TP 1, as
     `CoreManager` rewrites it.
     """
-    import argparse
     import dataclasses
 
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
 
-    parser = EngineArgs.add_cli_args(argparse.ArgumentParser(prog="trace ops --"))
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog="trace ops --"))
     forced = ["--enforce-eager", "--level", "0", "--load_dummy", "empty"]
     args = parser.parse_args(["--model", model, "-tp", str(tp), *atom_args, *forced])
     engine = EngineArgs.from_cli_args(args)
@@ -1052,7 +1081,14 @@ def _config(model, tp, atom_args):
 
 
 def capture(
-    model: str, tp: int, shapes, tmpdir: str, atom_args=(), arch="gfx942", population=()
+    model: str,
+    tp: int,
+    shapes,
+    tmpdir: str,
+    atom_args=(),
+    arch="gfx942",
+    population=(),
+    whole=False,
 ):
     """Trace one step of `model` at TP `tp` at each of `shapes`, in this process,
     under ATOM's engine arguments `atom_args` on a declared `arch`.
@@ -1065,7 +1101,7 @@ def capture(
     record directories `population` are shapes too (`population_shapes`),
     under two-batch overlap a split one's two micro-batches; each of their
     prefills runs as one forward, as it ran, this rank answering that it
-    cannot split it.
+    cannot split it; with `whole`, each prefill of `shapes` too.
     """
     declared = driverless.install(tmpdir, arch)
 
@@ -1079,7 +1115,7 @@ def capture(
     tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
     ep = int(config.enable_expert_parallel)
     ran = population_shapes(population, config.enable_tbo)
-    unsplit = {s for s in ran if s.phase == "prefill"}
+    unsplit = {s for s in ([*ran, *shapes] if whole else ran) if s.phase == "prefill"}
     shapes = list(dict.fromkeys([*shapes, *ran]))
     if not shapes:
         raise ValueError(f"{', '.join(population)} hold no step to trace")
@@ -1140,11 +1176,13 @@ def capture(
         with fake_mode, recorder:
             runner.allocate_kv_cache(max(KV_BLOCKS, blocks))
         # A prefill is traced as a middle chunk, which samples nothing, then as
-        # a final one; a decode step always samples.
+        # a final one; a decode step always samples, as does a prefill whose
+        # LM head pads, except a DP middle chunk's drafter at its later passes.
         variants = [
             (shape, output)
             for shape in shapes
             for output in ((False, True) if shape.phase == "prefill" else (True,))
+            if output or not shape.width or dp > 1 and drafts
         ]
         # A population's prefill ran as one forward: this rank cannot split it.
         own = runner._local_tbo_eligibility
@@ -1154,6 +1192,9 @@ def capture(
 
         for shape, output in variants:
             recorder.shape, recorder.output = shape, output
+            # `decide` pads the step to the one width the ladder holds.
+            ladder = [shape.width or shape.seqs]
+            runner.capture_sizes_np = numpy.array(ladder, dtype=numpy.int32)
             runner._local_tbo_eligibility = unsplittable if shape in unsplit else own
             traces = []
             for context in CONTEXTS if shape.phase == "decode" else CONTEXTS[:1]:
@@ -1179,8 +1220,14 @@ def capture(
             for draft, part in enumerate(
                 (items[: cut[0]], items[cut[0] + 1 :]) if cut else (items,)
             ):
-                if shape.tokens < shape.seqs and not draft:
-                    continue  # its target ran at its rung, not its rows
+                if draft:
+                    # A decode's drafter is read from its own shape, at its rows.
+                    skip = shape.phase == "decode" and shape.width
+                else:
+                    # Its target ran at its rung; a middle chunk's is read at its rows.
+                    skip = shape.tokens < shape.seqs or shape.width and not output
+                if skip:
+                    continue
                 key = structure(config, shape.phase, output=output, draft=bool(draft))
                 crossing, traced = [], Traced(key, str(shape))
                 graph = build(part, traced, crossing)
