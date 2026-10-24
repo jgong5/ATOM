@@ -150,7 +150,8 @@ def _measuring_rank(config, todo, refuse, rank):
     """One rank of `ops.measure` in a gloo group: ATOM's runner, the device
     and its kernels stand-ins, every cross-rank call on the group; rank 1
     refusing `NEG` at `refuse`: from its copy 0, from its copy 1, its first
-    call or its capture; or raising as it builds its runner."""
+    call or its capture; or raising as it builds its runner; or, at "profile",
+    naming no kernel in its first profile of a call."""
     from atom.compass.bench import replay
 
     pc = config.parallel_config
@@ -169,7 +170,14 @@ def _measuring_rank(config, todo, refuse, rank):
         return runner
 
     ops._runner = build
-    ops._kernels = lambda fn, kwargs: (["k"], 1.0)
+    profiles = []
+
+    def kernels(fn, kwargs):
+        ops._together()
+        profiles.append(1)
+        return ([] if (me, refuse, len(profiles)) == (1, "profile", 1) else ["k"]), 1.0
+
+    ops._kernels = kernels
     ops._together = dist.barrier
     ranks.cpu_group = lambda: dist.group.WORLD
     replay.ReplayRule = lambda config: SimpleNamespace(
@@ -201,7 +209,8 @@ def _measuring_rank(config, todo, refuse, rank):
     if (me, refuse) == (1, "call"):
         ops._function = lambda name: no if name == NEG else function(name)
     torch.cuda.graph = lambda *a, **k: contextlib.nullcontext(graph())
-    return ops.measure(config, todo[me], 10_000, rank)
+    records = ops.measure(config, todo[me], 10_000, rank)
+    return (records, len(profiles)) if refuse == "profile" else records
 
 
 def _leaves(records):
@@ -240,6 +249,21 @@ def test_a_leaf_one_rank_refuses_every_rank_refuses_and_the_next_is_measured(
     lines = [Path(f"{journal}.{r}").read_text().splitlines() for r in (0, 1)]
     assert [_leaves(map(json.loads, r)) for r in lines] == [_leaves(r) for r in by_rank]
     assert not journal.exists()
+
+
+def test_a_rank_whose_first_profile_names_no_kernel_profiles_as_often_as_the_others():
+    config = _config(2)
+    ranks.layout(config)
+    todo = [[(decode(2), 20, _found(NEG, ABS))]] * 2
+
+    by_rank = ranks.launch(_measuring_rank, config, todo, "profile")
+
+    got = [
+        ([(r["op"], r.get("refused"), r.get("kernels")) for r in rs], n)
+        for rs, n in by_rank
+    ]
+    # NEG: rank 1's empty profile, then two that agree; ABS: two that agree
+    assert got == [([(NEG, None, ["k"]), (ABS, None, ["k"])], 3 + 2)] * 2
 
 
 def test_a_rank_raising_before_its_first_cross_rank_call_ends_the_others():

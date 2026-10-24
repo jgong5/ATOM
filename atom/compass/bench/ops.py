@@ -177,6 +177,9 @@ CALLS = 256
 #: at least one, so a capped graph holds at least 5 ms: a replay's fixed cost,
 #: about 19 us on MI308X, is under 0.4% of it.
 GRAPH_NS = 10_000_000
+#: Profiles of one call taken at most until two in a row name the same kernels:
+#: a profile can drop a call's kernel or keep a kernel launched before it.
+PROFILES = 4
 #: Times over the last-level cache the copies' bytes pass: just past it, part of
 #: them stays there, and an MI308X GEMM read up to 7% fast.
 COLD = 2
@@ -843,7 +846,7 @@ class Stub:
             forward_context._forward_context = calls[0][1]
             with refused_together():
                 fn(**calls[0][0])  # compiles and tunes outside the graphs
-            kernels, ns = _kernels(fn, calls[0][0])
+            kernels, ns = _identity(fn, calls[0][0])
             k = min(CALLS, max(int(GRAPH_NS // ns), 1)) if ns else CALLS
             # a collective's call holds its wait on the last rank to arrive,
             # whose own call is the shortest: every graph takes its calls
@@ -1252,14 +1255,34 @@ def _on_coordinator(name: str, fn):
     return call
 
 
+def _identity(fn, kwargs) -> tuple[list[str], float]:
+    """`_kernels` of one call of `fn` once two profiles in a row name the same
+    kernels on every rank, at most `PROFILES`; refused on every rank together
+    when no two do."""
+    from atom.compass.bench.ranks import agreed, cpu_group
+
+    last = None
+    for _ in range(PROFILES):
+        names, ns = _kernels(fn, kwargs)
+        if agreed(int(names == last), cpu_group()):
+            return names, ns
+        last = names
+    raise ValueError(
+        f"no two profiles in a row of {PROFILES} named the same kernels; "
+        f"the last named {names}"
+    )
+
+
 def _kernels(fn, kwargs) -> tuple[list[str], float]:
     """The kernels one call of `fn` launches, in order, and their device time
     in ns: its device activity except memory copies, which the profiler
     records at some calls of a leaf and misses at others; started on every
-    rank together (`_together`)."""
+    rank together (`_together`), once the device has finished `_together`'s
+    all-reduce, which would otherwise join the call's kernels."""
     from torch.profiler import ProfilerActivity, profile
 
     _together()
+    torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         fn(**kwargs)
         torch.cuda.synchronize()
