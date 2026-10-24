@@ -28,6 +28,7 @@ EMBED = "aten.embedding.default"
 MOE = "aiter.fused_moe_.default"
 GEMM = "aiter.gemm_a16w16.default"
 ARGMAX = "aiter.ops.flydsl.topk.topk_per_row_argmax:topk_per_row_argmax"
+MUL = "aten.mul.Tensor"
 #: DeepSeek-V4-Pro's vocabulary, its LM head's rows at TP1.
 VOCAB = 129280
 
@@ -171,7 +172,7 @@ class Asked(CostSource):
 
     def price(self, request):
         op, (_, tokens, seqs, *_), _ = request
-        rows = next(iter(op["args"].values()))["shape"][0]
+        rows = [*next(iter(op["args"].values()))["shape"], None][0]
         self.asked.append((op["op"], rows, tokens, seqs))
         return self.refuse("asked")
 
@@ -200,8 +201,15 @@ class Asked(CostSource):
             [g(9, 64, 64), g(24, 32, 64), g(4, 128, 64), argmax(3)],
             [(GEMM, 9, 9, 3), (GEMM, 24, 9, 3), (GEMM, 4, 9, 4), (ARGMAX, 3, 9, 3)],
         ),
+        # Leaves that lead with no count of its rows or its width, at its rows.
+        (
+            [(1, 90, True)] * 3,
+            0,
+            [leaf(MUL, [s], self=t(s), other=t(s)) for s in ([1, 3, 64], [64, 3], [])],
+            [(MUL, 1, 3, 3), (MUL, 64, 3, 3), (MUL, None, 3, 3)],
+        ),
     ],
-    ids=["eager-decode", "eager-mtp-decode", "sampling-prefill"],
+    ids=["eager-decode", "eager-mtp-decode", "sampling-prefill", "unrecognised"],
 )
 def test_a_padded_target_asks_its_price_list_at_the_rows_each_leaf_ran(
     rows, drafts, graph, asked

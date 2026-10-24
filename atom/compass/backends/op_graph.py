@@ -180,16 +180,15 @@ def gathered_off_default(
 
 def _ran_at(leaf: dict, bound: tuple) -> tuple:
     """`bound` at the rows `leaf` ran: a padded target's (`_bound`) at its
-    width, but at its rows where an activation, metadata or output of the leaf
-    leads with their counts, or in a prefill none leads with that width."""
+    width where an activation, metadata or output of the leaf leads with the
+    width's counts and none with the rows', else at its rows."""
     if len(bound) != 3:
         return bound
-    rows, wide, counts = bound
+    rows, wide, (counts, wides) = bound
     args = _tensors(list(leaf["args"].values()))
     shapes = [a["shape"] for a in args if a["role"] in ("activation", "metadata")]
     leads = {n for s in shapes + leaf["out"] for n in s[:1]}
-    narrow = leads & counts or rows[0] == "prefill" and wide[2] not in leads
-    return rows if narrow else wide
+    return wide if leads & wides and not leads & counts else rows
 
 
 class OpGraphBackend(CostBackend):
@@ -297,7 +296,8 @@ class OpGraphBackend(CostBackend):
         and its rows' context and max context (`band`), the
         context a decode's max, a prefill's mean cached tokens. A padded target
         (`target_bs`) adds it at that width, G at its default there, and the
-        counts a leaf at its rows leads with: a decode's tokens, a prefill's."""
+        counts a leaf leads with at its rows and at that width: a decode's
+        tokens, its MoE's gathered at the width; a prefill's, its width."""
         rung = view.capture_rung if self.padded else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
@@ -309,8 +309,14 @@ class OpGraphBackend(CostBackend):
         bound = (phase, t, b, g, top if phase == "decode" else mean, top)
         if not width:
             return bound
-        counts = {b * k for k in range(1, self.drafts + 2)} if ran != t else {t, b}
-        return bound, (phase, ran, width, *bound[3:]), frozenset(counts)
+        if ran == t:
+            counts, wides = {t, b}, {width}
+        else:
+            k = range(1, self.drafts + 2)
+            counts = {b * j for j in k}
+            wides = {width * j for j in k} | {self.dp * width * k[-1]}
+        wide = (phase, ran, width, *bound[3:])
+        return bound, wide, (frozenset(counts), frozenset(wides))
 
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
