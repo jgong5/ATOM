@@ -23,7 +23,8 @@ client run it served included; `parity.served` splits it per client run.
 `--trace` makes it a trace run, a second run of a record's recipe and client
 that labels its prefill passes: the server runs ATOM's profiler on every rank
 from before the first request to its stop (`serve`), and the record gets its
-busy lines (`parity.busy`) before its cost lines.
+busy lines (`parity.busy`) before its cost lines. A run under DP or pipeline
+stages refuses it before its server starts.
 
 The server's environment holds `AUTOTUNE_CACHE` as the command's does, 1 when
 the command's has none, and run.json's ``env`` states the value. With it on,
@@ -50,7 +51,7 @@ from pathlib import Path
 from atom.compass.backends.step_grid_plan import TARGET
 from atom.compass.backends.step_labels import label_run, write_table
 from atom.compass.cli import OPS
-from atom.compass.drive import aiter_jit, serve
+from atom.compass.drive import aiter_jit, runfile, serve
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.compass.parity import busy
 from atom.compass.run import _write_whole
@@ -76,6 +77,14 @@ def main(argv: list[str]) -> None:
                 f"{arg} is among ATOM's arguments; a record times real weights, "
                 "and MoE routing follows them"
             )
+    if args.trace and (
+        runfile._dp_width(atom_args) > 1
+        or runfile._engine_args(atom_args).pipeline_parallel_size > 1
+    ):
+        raise ValueError(
+            "--trace reduces each TP rank's busy time, and ATOM's arguments run "
+            "DP ranks or pipeline stages"
+        )
     env = {AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1")}
     serve.serve(
         atom_args, args.out, args.gpu, extra_env=env, host=args.host, trace=args.trace

@@ -184,6 +184,26 @@ def test_ops_profiling_dummy_weights_and_owned_flags_refuse_before_a_server_star
     assert not out.exists()
 
 
+@pytest.mark.parametrize(
+    "atoms",
+    [
+        ["-dp", "2"],
+        ["--enable-dp-attention", "-tp", "2"],
+        ["--pipeline-parallel-size=2"],
+    ],
+)
+def test_a_dp_or_pipeline_trace_run_refuses_before_a_server_starts(
+    tmp_path, monkeypatch, atoms
+):
+    monkeypatch.setattr(serve, "SERVER", (sys.executable, "-c", "pass"))
+    out = tmp_path / "out"
+    argv = ["record", "--gpu", "7", "--out", str(out), "--trace", "--", "--model", "m"]
+
+    with pytest.raises(SystemExit, match="^compass record: --trace reduces each TP"):
+        cli.main([*argv, *atoms])
+    assert not out.exists()
+
+
 @pytest.fixture
 def planted_gpu(tmp_path, monkeypatch):
     """The planted server, `rocm-smi` listing GPU 7 free, `rocminfo`, the

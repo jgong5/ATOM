@@ -211,8 +211,8 @@ def _read(record) -> list[dict]:
             s.update(got.get(s["step"], {}))
     elif _traced(path):
         raise ValueError(
-            f"{record} is a trace run's record with no {busy.name}; write it "
-            "with `python -m atom.compass.parity.busy`"
+            f"{record} is a trace run's record with no {busy.name}; its own "
+            "`compass record --trace` writes it"
         )
     return lines
 
