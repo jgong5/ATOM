@@ -193,3 +193,29 @@ def test_asked_about_its_own_device_a_host_start_answers_from_its_readings(
     assert torch.cuda.memory_allocated(cpu) == held
     assert torch.cuda.mem_get_info(0) == ("card", 0)
     assert torch.cuda.memory_allocated() == ("card", None)
+
+
+@pytest.mark.parametrize("index", ["fp8", "fp4"])
+def test_a_host_start_refuses_what_it_holds_only_on_the_fp4_index_plane(
+    started, monkeypatch, index
+):
+    """The fp4 plane sizes V4.1's packed score workspace by the PAGEs left
+    after `memory_allocated`, which a real start reads with the drafter and
+    forward buffers held too; the fp8 plane's workspace ignores the bound."""
+    monkeypatch.setattr(torch.cuda, "mem_get_info", torch.cuda.mem_get_info)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", torch.cuda.memory_allocated)
+    config = _config()
+    config.index_cache_dtype = index
+    runner, _ = started(config)
+    qwen = PretrainedConfig.from_dict(
+        json.loads(CONFIG_JSON.read_text())["text_config"]
+    )
+    spec = MachineSpec.from_mapping(copy.deepcopy(DOCUMENT))
+    install_device_readings(runner, readings_at(spec, qwen, 2))
+    if index == "fp4":
+        with pytest.raises(RunnerRefusal, match="--index-cache-dtype fp4"):
+            torch.cuda.memory_allocated(runner.device)
+        return
+    peak = EXPECTED[2]["peak_torch"]
+    held = peak["weights"] + peak["buffers"] + peak["load residue"]
+    assert torch.cuda.memory_allocated(runner.device) == held
