@@ -465,11 +465,25 @@ def _device_memory(read: Any, runner: Any, answer: Any) -> Any:
     return reading
 
 
-def _resident(readings: DeviceReadings) -> int:
+def _resident(readings: DeviceReadings, config: Any) -> int:
     """What a start holds once its target has loaded: the weights, buffers and
     load residue of `peak_torch`, the allocation `compass measure memory` reads
     after the load. Its `persistent` is read at the KV budget, after the
-    attention builder that asks this has allocated, so none of it is counted."""
+    attention builder that asks this has allocated, so none of it is counted.
+
+    Refused under `--index-cache-dtype fp4`, where DeepSeek-V4.1 sizes its
+    packed score workspace by the PAGEs left after this; on the fp8 plane the
+    answer sizes nothing."""
+    if getattr(config, "index_cache_dtype", None) == "fp4":
+        raise RunnerRefusal(
+            "under --index-cache-dtype fp4 DeepSeek-V4.1 bounds its score "
+            "workspace by the PAGEs `memory_allocated` leaves, and a simulated "
+            "start reads only the weights, buffers and load residue there; a "
+            "real start also holds the drafter, the forward buffers and the "
+            "attention builder's own, which no memory reading separates, so "
+            "the PAGE bound would exceed a real start's. Pass "
+            "--index-cache-dtype fp8, whose workspace does not read it."
+        )
     held = ("weights", "buffers", "load residue")
     return sum(t.nbytes for t in readings.peak_torch.terms if t.name in held)
 
@@ -562,7 +576,7 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
         torch.cuda.mem_get_info, runner, lambda r: (r.free.total, r.total.total)
     )
     torch.cuda.memory_allocated = _device_memory(
-        torch.cuda.memory_allocated, runner, _resident
+        torch.cuda.memory_allocated, runner, lambda r: _resident(r, config)
     )
     os.environ["MASTER_ADDR"] = config.master_addr
     os.environ["MASTER_PORT"] = str(config.port)
