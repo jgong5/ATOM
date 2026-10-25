@@ -776,7 +776,7 @@ receives it itself, at its own receive point.
 | `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | stated IPC delay |
 | `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py::EngineCore.process_output_sockets`) | frontend output thread, `poller.poll()` in `engine_core_mgr.py::CoreManager._create_output_thread` (thread) | stated IPC delay |
 | `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | the router's per-request forward cost (D7) |
-| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline) | stated request latency (D6) |
+| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline); under prefill PP the head's, `engine-P-pp0` (D6) | stated request latency (D6) |
 | PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py::PPStageTransport.send_metadata` / `send_tokens` / `send_kv_status` | the stage loop's own poll and receive (inline) | stated IPC delay: each is one ZMQ message, as on the frontend channels; the head's batch to stage `k` is `meta#pp<k>`. The hidden states between stages are `pp_data` (`15` D91). |
 | `engine-P->engine-D:prefill_done` (RapidServe only, in neither M1 nor M2) | prefill step loop, direct send in `engine_core.py::PrefillEngineCore._process_engine_step` | decode handler thread `DecodeEngineCore._recv_prefill_done`, `sock.recv()` (thread) | stated IPC delay |
 | `engine-D->engine-P:block_assignment` (RapidServe only, in neither M1 nor M2) | decode step loop, direct send in `engine_core.py::DecodeEngineCore._send_block_assignment` | prefill handler thread `PrefillEngineCore._recv_block_assignments`, `sock.recv()` (thread) | stated IPC delay |
@@ -797,9 +797,10 @@ channel once per rank, `#dp0` to `#dp7`):
   `engine-D->frontend-D:output#dp0`;
 - `engine-D->engine-P:kv_write_req`.
 
-Mooncake's write-done message is not a channel: both ends compute its time (D6). With PP,
-Mooncake also has a decode-to-prefill `MSG_RELEASE` channel; the simulated connector
-refuses PP (D6).
+Mooncake's write-done message is not a channel: both ends compute its time (D6). Under
+prefill PP, Mooncake's decode-to-prefill `MSG_RELEASE` is not a channel either: it follows
+only writes both ends already see, so both compute its time too (D6, owner ruling on
+#1385).
 
 **Declaring a lookahead floor on every channel is a design commitment, not a constant to
 tune later.** Zero lookahead is correct under the grant rule above but serializes
@@ -1917,18 +1918,42 @@ two differ the code is right.
   completes (`mooncake_connector.py::MooncakeConnector._record_write_done`). The
   simulated write is one event per request, priced on the whole block table, so ranks
   with unequal shares are not modelled.
-- **The simulated connector refuses PP** (`pp_size > 1`), naming the two reasons below.
-  No milestone pairs PD with PP: M1 and M2 run PP1, and PP comes after v1 (`16` D95). Under
-  PP, Mooncake adds a decode-to-prefill `MSG_RELEASE` channel
-  (`MooncakeConnector._send_release`) that this section does not cover, and the release
-  above never happens: the PP head's
-  `PPEngineCoreProc._poll_kv_transfer_progress` passes worker output to
-  `Scheduler._update_from_kv_xfer_finished` only when it is non-empty, and this
-  connector's workers report nothing, so `process_completions` is never called, prefill
-  never frees and decode never becomes ready. `EngineCore._poll_kv_transfer_progress`
-  passes it on every poll, which is why PP1 works. Lifting the refusal takes both:
-  the `MSG_RELEASE` channel, and a PP head that passes every poll's output on, empty
-  included.
+- **Refused by name under PP:** a decode side above PP 1 (ATOM has none: a producer stage
+  maps its regions onto a consumer holding every layer, `consumer_region_indices`, and a
+  decode head reports `finished_recving` from its own stage only); `lmcache_mp` under PP
+  (ATOM's `mp/deployment.py::_validate_mp_config`); any other connector (`allocate_kv_cache`,
+  above); PP with DP (ATOM's `CoreManager`, and the channel table).
+
+### Prefill pipeline parallelism (owner ruling on #1385)
+
+Only prefill runs PP with Mooncake. Real Mooncake under prefill PP `K`: decode sends a
+`MSG_WRITE_REQUEST` to every stage, and stage `k` writes its own layer window
+(`MooncakeConnector._consumer_region_map`) from its `_send_executor`. Decode's
+`_notification_listener` runs `_complete_recv` at the last stage's `MSG_WRITE_DONE`, which
+reports the receive and sends `MSG_RELEASE` to stage 0 (`_send_release`); stage 0's
+`_record_release` adds the request to `done_sending` after `consumer_tp_size` releases,
+and the head passes it to the scheduler. Stages above 0 add nothing to `done_sending`, and
+`kv_status` and `PPKVAggregator` carry offload completions only.
+
+Simulated:
+
+- Each prefill stage is engine LP `engine-P-pp<k>` with the PP channels (`15` D91). The
+  write request reaches the head only, `engine-D->engine-P-pp0:kv_write_req`: the head is
+  the one stage that receives the release and owns a scheduler, and every stage gets the
+  same write requests in the same order, so one message carries what every stage's write
+  needs. Stages above 0 build an inert connector.
+- Each decode rank and prefill stage pair is one FIFO link, as above, pricing that
+  stage's paged layers (`get_pp_indices`). Both ends feed every stage's link the same
+  arrivals, so both compute each stage's write-done `c_k`.
+- **`MSG_RELEASE` is not a message either.** It follows only writes both ends see: decode
+  is ready at `max_k c_k + L` and sends the release then, so the head is done at
+  `max_k c_k + 2L`, `L` the `kv_write_req` lookahead, and reports `finished_sending` as
+  above. A channel sent from decode's step loop would free prefill's blocks up to a decode
+  step late, as #1179's rejected (b).
+- The PP head passes its workers' non-offload output to
+  `Scheduler._update_from_kv_xfer_finished` on every poll, empty included, as
+  `EngineCore._poll_kv_transfer_progress` does: this connector's workers report nothing,
+  so a head that passed only non-empty output never called `process_completions`.
 
 ---
 

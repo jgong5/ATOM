@@ -153,21 +153,32 @@ def pipeline_timeline(table: str) -> list[str]:
     the forward's own waits for the metadata and the tensors come after.
     """
     lines = table.splitlines()
-    run = json.loads(lines[0].removeprefix(CONFIGURATION_PREFIX))
-    pp, channels = run.get("pipeline_parallel_size", 1), channel_table(run)
+    channels = channel_table(json.loads(lines[0].removeprefix(CONFIGURATION_PREFIX)))
     tars, arrived = defaultdict(list), defaultdict(dict)
     for lp, t0, t1, event, ch, seq, _ in map(str.split, lines[1:]):
         if event == TAR:
             tars[lp].append((float(t0), float(t1)))
         elif event == "release":
             arrived[ch][int(seq)] = float(t1)
-    meta = "engine-pp0->engine-pp1:meta#pp1"
+    lps = [lp.name for lp in channels.registry.ids()]
+    failed = []
+    for head in (lp for lp in lps if lp.endswith("-pp0")):
+        engine = head.removesuffix("-pp0")
+        pp = sum(lp.startswith(f"{engine}-pp") for lp in lps)
+        failed += _pipeline_order(engine, pp, channels, tars, arrived)
+    return failed
+
+
+def _pipeline_order(engine: str, pp: int, channels, tars, arrived) -> list[str]:
+    """`pipeline_timeline`'s checks on the pipeline ``<engine>-pp<k>``."""
+    meta = f"{engine}-pp0->{engine}-pp1:meta#pp1"
     starts = {n: a - channels.lookahead(meta) for n, a in arrived[meta].items()}
     failed = []
     for k in range(pp):
-        lp, data_ch = f"engine-pp{k}", f"engine-pp{k}->engine-pp{k + 1}:pp_data#dp0"
+        lp = f"{engine}-pp{k}"
+        data_ch = f"{engine}-pp{k}->{engine}-pp{k + 1}:pp_data#dp0"
         data = arrived[data_ch]
-        ack = arrived[f"engine-pp{k + 1}->engine-pp{k}:pp_ack#dp0"]
+        ack = arrived[f"{engine}-pp{k + 1}->{engine}-pp{k}:pp_ack#dp0"]
         for n, start in sorted(starts.items()):
             span = (
                 b for a, b in tars[lp] if a < start < b and not math.isclose(a, start)
@@ -182,7 +193,7 @@ def pipeline_timeline(table: str) -> list[str]:
                 sent = data[n] - channels.lookahead(data_ch)
                 if sent < least and not math.isclose(sent, least):
                     failed.append(f"{lp} sent forward {n} at {sent}, before {least}")
-        batch = arrived[f"engine-pp0->engine-pp{k + 1}:meta#pp{k + 1}"]
+        batch = arrived[f"{engine}-pp0->{engine}-pp{k + 1}:meta#pp{k + 1}"]
         starts = {n: max(a, batch.get(n, a)) for n, a in data.items()}
     return failed
 
