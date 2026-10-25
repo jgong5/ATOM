@@ -4,9 +4,10 @@
 with ``atom.compass.parity.client_run``.
 
 Stand-ins on ``PATH``: a ``curl`` the server's ``/health`` answers, and a
-harness Python whose probes answer as one holding this tree's compass-harness
-and whose aiperf saves how it ran to ``$SEEN`` and writes the export and raw
-records ``$SPEC`` holds, its dataset the trace files it was given. Each
+harness Python whose probes answer as one holding this tree's compass-harness,
+its aiperf plugin installed when ``$HARNESS_PLUGIN`` is set, and whose aiperf
+saves how it ran to ``$SEEN`` and writes the export and raw records ``$SPEC``
+holds, its dataset the trace files it was given. Each
 breaks the step ``$BREAK`` names. With ``--stop``, a stand-in compass command
 serves a ``sleep``. Nothing needs a driver, a server or aiperf.
 """
@@ -36,7 +37,7 @@ if "import compass_harness" in a[1]:
     print(tree + "/compass_harness/x.py")
 if "entry_points" in a[1] and brk == "probe":
     sys.exit("no metadata")
-if "entry_points" in a[1] and brk == "plugin":
+if "entry_points" in a[1] and (brk == "plugin" or "HARNESS_PLUGIN" in os.environ):
     print("compass_harness.plugin:Plugin")
 if "profile" not in a:
     sys.exit()
@@ -85,7 +86,8 @@ def _setup(tmp_path, server=None, ids=("a", "b")):
     if server is not None:
         (out / "server.json").write_text(json.dumps(server))
     traces.write_text("".join(f'{{"id": "s{k}"}}\n' for k in range(4)))
-    return out, os.environ | {
+    plugin = {"HARNESS_PLUGIN": "1"} if "run_file" in (server or {}) else {}
+    return out, os.environ | plugin | {
         "PATH": f"{bin_}:{os.environ['PATH']}",
         "MODEL": "/m",
         "TRACES": str(traces),
@@ -276,6 +278,19 @@ def test_each_refusal_exits_1_naming_its_step(tmp_path, step):
     assert done.returncode == 1, done.stdout + done.stderr
     last = done.stderr.splitlines()[-1]
     assert fnmatchcase(last, "client: " + REFUSALS[step]), done.stderr
+
+
+def test_a_simulated_server_refuses_a_harness_python_without_the_plugin(tmp_path):
+    """compass_harness imports from PYTHONPATH alone; without its installed
+    plugin aiperf runs unpaced and the simulated server waits at time 0."""
+    out, env = _setup(tmp_path, SIM)
+    del env["HARNESS_PLUGIN"]
+    done = _client(out, *GOOD, env=env)
+    assert done.returncode == 1, done.stdout + done.stderr
+    last = done.stderr.splitlines()[-1]
+    assert fnmatchcase(last, "client: harness: the server is simulated, and *")
+    assert last.endswith(" has no compass-harness installed"), done.stderr
+    assert not (out / "client").exists() and not (tmp_path / "seen.json").exists()
 
 
 @pytest.mark.parametrize("parent", STOP_REFUSALS)

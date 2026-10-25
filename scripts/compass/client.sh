@@ -79,14 +79,17 @@ unset ATOM_COMPASS_RUN ATOM_COMPASS_CLOCK_ENDPOINT
 harness=$(cd / && "$HARNESS_PYTHON" -c 'import compass_harness; print(compass_harness.__file__)') ||
     fail "harness: $HARNESS_PYTHON cannot import compass_harness"
 [[ $harness == "$ROOT"/* ]] || fail "harness: compass_harness resolved to $harness"
+# Its plugin paces aiperf on a simulated clock: a real server has none, and a
+# simulated one waits at time 0 for an unpaced aiperf. PYTHONPATH imports
+# compass_harness without installing the plugin.
+plugins=$(cd / && "$HARNESS_PYTHON" -c 'from importlib.metadata import entry_points as e
+print(*(p.value for p in e(group="aiperf.plugins")))') ||
+    fail "harness: $HARNESS_PYTHON cannot list aiperf's plugins"
 if [[ -n $run_file ]]; then
+    [[ $plugins == *compass_harness* ]] || fail "harness: the server is simulated, and $HARNESS_PYTHON has no compass-harness installed"
     export ATOM_COMPASS_RUN=$run_file
     aiperf=(-m aiperf)
 else
-    # Its plugin paces aiperf on a simulated clock, which a real server has not got.
-    plugins=$(cd / && "$HARNESS_PYTHON" -c 'from importlib.metadata import entry_points as e
-print(*(p.value for p in e(group="aiperf.plugins")))') ||
-        fail "harness: $HARNESS_PYTHON cannot list aiperf's plugins"
     [[ $plugins != *compass_harness* ]] || fail "harness: the server is real, and $HARNESS_PYTHON has compass-harness installed"
     aiperf=(-c 'import uuid, aiperf.cli_runner as r
 r.uuid4 = lambda: uuid.UUID(int=0)
