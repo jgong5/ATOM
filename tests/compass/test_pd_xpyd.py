@@ -34,17 +34,24 @@ from test_dp_slice import MAX_TOKENS
 from test_kv_remote_prefill import Script, connector
 from test_kv_simulated_connector import PEAKS, geometry, model_for  # noqa: F401
 from test_pd_dp import RouterLpRequests
-from test_pd_slice import NEEDS_A_PD_RUN, PD
+from test_pd_slice import NEEDS_A_PD_RUN, PD, publish_pd_entries
 from test_router_lp_acceptance import (
     WALL_S,
     DelayedTraffic,
     Frontend,
-    U,
     _idle,
     _launch,
     atomesh,  # noqa: F401
 )
-from test_vertical_slice import CONSTANT, MODEL, TREE, _free_port, _retry, _run_file
+from test_vertical_slice import (
+    CONSTANT,
+    DOCUMENT,
+    MODEL,
+    TREE,
+    _free_port,
+    _retry,
+    _run_file,
+)
 
 from atom.compass import run as compass_run
 from atom.compass.clock import LpId, prefill_decode_table
@@ -444,6 +451,7 @@ def run_xpyd(out: Path, seed: str) -> dict:
         ROUTER_POLICY="round_robin",
         **{name: str(port) for name, port in ports.items()},
     )
+    publish_pd_entries(out / "store", DOCUMENT, env)
     log = out / "pd_sim.log"
     with open(log, "w") as f:
         sim = subprocess.Popen(

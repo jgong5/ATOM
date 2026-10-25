@@ -91,6 +91,16 @@ class PdTraffic(Traffic):
     http, stream = "traffic->frontend-P:http", STREAM
 
 
+def publish_pd_entries(store, machine, env) -> None:
+    """`publish_entry` for each side `pd_sim.sh` starts under `env`, its
+    server flags composed as the script composes them."""
+    flags = env.get("SERVER_ARGS", "--enforce-eager --max-model-len 2048").split()
+    for side, role in (("PREFILL", "kv_producer"), ("DECODE", "kv_consumer")):
+        kv = json.dumps({"kv_role": role, "kv_connector": "compass"})
+        argv = ["--model", MODEL, *flags, *env.get(f"{side}_ARGS", "").split()]
+        publish_entry(store, machine, [*argv, "--kv-transfer-config", kv], env)
+
+
 def run_pd(out: Path, seed: str) -> dict:
     """One run under `pd_sim.sh`; its step table and request times."""
     out.mkdir()
@@ -107,12 +117,7 @@ def run_pd(out: Path, seed: str) -> dict:
         DECODE_EXEC=os.environ.get("ATOM_COMPASS_PD_DECODE_EXEC", ""),
         **{name: str(port) for name, port in ports.items()},
     )
-    # Each side as pd_sim.sh starts it, with its default server flags.
-    flags = os.environ.get("SERVER_ARGS", "--enforce-eager --max-model-len 2048")
-    for role in ("kv_producer", "kv_consumer"):
-        kv = json.dumps({"kv_role": role, "kv_connector": "compass"})
-        argv = ["--model", MODEL, *flags.split(), "--kv-transfer-config", kv]
-        publish_entry(out / "store", DOCUMENT, argv, env)
+    publish_pd_entries(out / "store", DOCUMENT, env)
     log = out / "pd_sim.log"
     with open(log, "w") as f:
         sim = subprocess.Popen(
