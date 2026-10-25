@@ -776,11 +776,12 @@ Developer checks, outside the `compass` path:
 
 The step grid reuses steps 1 to 4: the calibration records are its residual's
 targets, and the real runs are its coverage check's inputs and its graded side.
-Its points are planned from shape populations rather than records: the planner
-refuses inputs stating two KV block counts, and two real starts of one
-configuration differ by a few blocks (#1349), while every simulated start takes
-its count from the one `memory_readings` entry. A population may serve any
-traces, the graded ones included, since its shapes are all the plan reads. The
+Its points are planned from the shape populations and step 4's real runs, so
+every cell a real step falls in is measured: a population alone leaves the cells
+of shapes only the real server scheduled unmeasured (#1884). The plan reads
+shapes only, so its inputs may serve any traces, the graded ones included; a
+point's time is the bench's alone. A real start's KV block count moves with
+its free memory, so the plan holds at the smallest count any input states. The
 grid definition is a calibration input; `$G` below holds nodes at powers of two
 and no margin:
 
@@ -794,17 +795,19 @@ and no margin:
    --out $R/pop/<traces>/c<C> -- $ATOM`, with `client.sh $R/pop/<traces>/c<C>
    --traces <traces> --concurrency <C> --stop`, `<traces>` 256-392 and 0-255; its
    stop publishes a `shape_population`, `POP` below.
-7. `compass measure steps --grid POP... --grid-definition $G --client-run POP
-   $R/pop/<traces>/c<C>/artifacts/client_run.json ... --sampling '{"ignore_eos":
-   true}' --gpu G $S --out $R/grid -- $ATOM`. The deep-context prefill corners
-   take most of its hours. Several GPUs each take a subset of the populations
-   into a store of its own, starts a minute apart; copying each store's
-   `step_measurement` entries into one, and this step again over every
-   population, measures what remains.
-8. `compass fit steps --backend step-grid --grid POP... --grid-definition $G
-    $R/cal/c* --client-run ...`, naming every population and record, `$M $S --out
-    $R/fit-grid`; it prints the bundle's token. A second fit of one definition
-    into one store is refused as an overwrite: refit into a fresh store.
+7. `compass measure steps --grid POP... $R/cell/c*/real* --grid-definition $G
+   --client-run POP $R/pop/<traces>/c<C>/artifacts/client_run.json --client-run
+   <real run> <real run>/artifacts/client_run.json ... --sampling '{"ignore_eos":
+   true}' --gpu G $S --out $R/grid -- $ATOM`, naming every population and every
+   real run. The deep-context prefill corners take most of its hours. Several
+   GPUs each take a subset of the inputs into a store of its own, starts a minute
+   apart; copying each store's `step_measurement` entries into one, and this step
+   again over every input, measures what remains.
+8. `compass fit steps --backend step-grid --grid POP... $R/cell/c*/real*
+    --grid-definition $G $R/cal/c* --client-run ...`, naming every population,
+    real run and record, `$M $S --out $R/fit-grid`; it prints the bundle's
+    token. A second fit of one definition into one store is refused as an
+    overwrite: refit into a fresh store.
 9. `compass run --step-grid BUNDLE --host-laws HOST --coverage $R/cell/c<C>/real*
     $M $S --out $R/cell-grid/c<C>/step_grid -- $ATOM`, serving the same client run as
     step 5. The check counts the real steps the bundle covers, extrapolates past
