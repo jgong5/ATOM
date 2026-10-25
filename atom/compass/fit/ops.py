@@ -490,7 +490,8 @@ class PriceList(CostSource):
         `interpolate` brackets it."""
         near: list[set] = []
         for i, x in enumerate(at):
-            vs = {c[i] for c in points if all(c[j] in s for j, s in enumerate(near))}
+            on = (c[i] for c in points if all(c[j] in s for j, s in enumerate(near)))
+            vs = sorted(set(on))
             below = max((v for v in vs if v < x), default=x)
             near.append(
                 {x} if x in vs else {below, min((v for v in vs if v > x), default=x)}
