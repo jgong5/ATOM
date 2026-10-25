@@ -113,11 +113,7 @@ from torch.utils._device import _device_constructors
 
 from atom.compass.backends.base import CostBackend
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
-from atom.compass.runner.step_output import (
-    DeferredTokenStream,
-    filler_token_ids,
-    reports_previous_step,
-)
+from atom.compass.runner.step_output import DeferredTokenStream, filler_token_ids
 
 logger = logging.getLogger(__name__)
 
@@ -1367,12 +1363,11 @@ class NonAllocatingRunner(
                     "rates": spec.synthetic_acceptance_rates,
                     "seed": self.config.parallel_config.data_parallel_rank,
                 }
+            # Whether replies lag a step is ATOM's own processor's answer, read
+            # rather than re-derived: off under PP, and off on a P/D producer
+            # whose model keeps recurrent state.
             stream = DeferredTokenStream(
-                fillers,
-                deferred=reports_previous_step(
-                    _config_field(self, "pipeline_parallel_size")
-                ),
-                **draws,
+                fillers, deferred=self.tokenID_processor.is_deferred_out, **draws
             )
             self._token_stream = stream
         tokens = stream.step(batch)
