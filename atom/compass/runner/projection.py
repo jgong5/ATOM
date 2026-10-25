@@ -239,7 +239,7 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     `running_bs`, on any step, when it declares a draft graph, else at the
     rows (`draft_bs`), where the gather carries each rank's rows (`draft_rows`):
     every rank decoding, its tokens over a row's query, every row's alike; else
-    at least this rank's rows and one each peer, an idle one's dummy.
+    at least the widest rank's rows and one each peer, an idle one's dummy.
 
     A target that replays no graph pads to it too (`target_bs`): an eager
     decode every rank decodes in, its inputs; a sampling prefill, its LM head.
@@ -267,9 +267,7 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
                 draft_rows = (
                     gathered // int(batch.num_scheduled_tokens[0])
                     if mode.running_tokens_are_unified
-                    else len(batch.num_scheduled_tokens)
-                    + _data_parallel_size(runner)
-                    - 1
+                    else mode.sync.max_bs_across_dp + _data_parallel_size(runner) - 1
                 )
     elif _data_parallel_size(runner) > 1:
         raise RunnerRefusal(

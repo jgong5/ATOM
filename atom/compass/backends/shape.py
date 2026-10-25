@@ -202,7 +202,7 @@ class BatchView:
     that runs them at the rows, or with none. `draft_rows` is the rows the
     gather carries on the later passes of an MTP drafter that runs them at
     the rows: every rank's, or, where a rank prefills, a floor on them, the
-    rank's own and one a peer; None on one rank or with no such drafter.
+    widest rank's and one a peer; None on one rank or with no such drafter.
     `target_bs` is the step's
     `running_bs` where a target that replays no graph pads past its rows: an
     eager decode every DP rank decodes in, its model; a sampling prefill, its

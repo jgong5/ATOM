@@ -446,12 +446,20 @@ def test_a_drafter_prices_its_later_passes_at_draft_bs(dp, gathered, params):
     [
         # Every rank decoding: 9 + 12 tokens, 3 a row.
         ([(4, 12, False)], False, 7),
-        # Beside a prefilling peer, its 3 rows and one each peer, of 6.
+        # Beside a prefilling peer, 3 rows and one each peer, of 6.
         ([(2, 40, True), (1, 3, False)], False, 5),
+        # Beside a wider prefilling peer, its 5 rows and one each peer, of 8.
+        ([(5, 40, True)], False, 6),
         ([(4, 12, False)], True, None),
         ((), False, None),
     ],
-    ids=["dp2", "beside-a-prefill", "draft-graph", "one-rank"],
+    ids=[
+        "dp2",
+        "beside-a-prefill",
+        "beside-a-wider-prefill",
+        "draft-graph",
+        "one-rank",
+    ],
 )
 def test_an_eager_drafter_s_later_passes_gather_every_rank_s_rows(
     monkeypatch, peers, step, draft_rows
