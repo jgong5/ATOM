@@ -256,8 +256,45 @@ fi
 
 # pytest's own status, captured directly. Piping it into `tail` discards the
 # exit code and a failing suite reports success.
-python -m pytest tests/ "${IGN[@]}" -q --no-header -p no:cacheprovider "$@" -rf
-RC=$?
+#
+# tests/compass holds most of the suite's time, in model traces that each take
+# one core, so it runs as COMPASS_GATE_SHARDS pytest processes beside the rest
+# of tests/, shard s taking every COMPASS_GATE_SHARDS-th file from s; 0 runs
+# tests/ as one process. A shard's output is printed after the rest's. A
+# process left with no test to run (exit 5) fails the gate only when none ran.
+SHARDS=${COMPASS_GATE_SHARDS:-4}
+[[ $SHARDS =~ ^[0-9]+$ ]] || finish 95 "COMPASS_GATE_SHARDS=$SHARDS is not a count; pytest was not run"
+CF=()
+[ -d tests/compass ] && mapfile -t CF < <(find tests/compass \( -name 'test_*.py' -o -name '*_test.py' \) | sort)
+[ "${#CF[@]}" -gt 0 ] || SHARDS=0
+LOGS=$(mktemp -d) || finish 96 "mktemp failed; nothing was run"
+trap 'rm -rf "${HARNESS:-}" "$LOGS"' EXIT
+PYTEST=(-q --no-header -p no:cacheprovider "$@" -rf)
+MAIN=(tests/ "${IGN[@]}")
+PIDS=()
+for ((s = 0; s < SHARDS; s++)); do
+    OTHERS=()
+    for ((k = 0; k < ${#CF[@]}; k++)); do
+        [ $((k % SHARDS)) -eq "$s" ] || OTHERS+=(--ignore="${CF[k]}")
+    done
+    python -m pytest tests/compass "${IGN[@]}" "${OTHERS[@]}" "${PYTEST[@]}" >"$LOGS/$s" 2>&1 &
+    PIDS+=($!)
+    MAIN=(tests/ "${IGN[@]}" --ignore=tests/compass)
+done
+python -m pytest "${MAIN[@]}" "${PYTEST[@]}"
+CODES=($?)
+for ((s = 0; s < SHARDS; s++)); do
+    wait "${PIDS[s]}"
+    CODES+=($?)
+    printf '\n== tests/compass, shard %s of %s: rc=%s\n' $((s + 1)) "$SHARDS" "${CODES[s + 1]}"
+    cat "$LOGS/$s"
+done
+RC=0
+RAN=
+for c in "${CODES[@]}"; do
+    case $c in 0) RAN=1 ;; 5) ;; *) [ "$RC" -ne 0 ] || RC=$c ;; esac
+done
+[ "$RC" -ne 0 ] || [ -n "$RAN" ] || RC=5
 printf '\npytest: rc=%s\n' "$RC"
 
 if [ "$RC" -ne 0 ]; then
