@@ -33,7 +33,9 @@ draft-KV pass, `d_draft_kv_ns`, runs before `forward_done_event`: its device
 label holds it, as its draft-KV label too, and its draft label does not. The exit of each
 wait for the previous output's token copy (`t_recv_ns`)
 bounds the host clock's lead over the device's (that forward had finished by
-then); the tightest of the last `ANCHORS` bounds is the lead. The copy itself
+then), as does the exit of a forward's read of its own tokens (`t_read_ns`)
+over its device start, its target's end under MTP; the tightest of the last
+`ANCHORS` bounds is the lead. The copy itself
 lands on its own stream after the exit event the bound reads, by 14 to 29 us
 measured on one host (median 17 us), so each bound carries that much more lead
 than the clocks actually have; on the step linear law's records the gap never
@@ -198,13 +200,16 @@ def _host_cut(lines) -> tuple[set[int], set[int]]:
         bound = None
         if "t_recv_ns" in s and output_end is not None:
             bound = s["t_recv_ns"][1] - output_end
+        if "t_read_ns" in s:  # its own tokens: read after its target ran
+            bound = s["t_read_ns"][1] - start - s.get("d_target_ns", 0)
         if s["produces_output"]:
             output_end = start + s["d_busy_ns"]
         timed.append((s, start, bound))
     bounds = [b for _, _, b in timed if b is not None]
     if not bounds:
         raise ValueError(
-            "no token copy wait exit (`t_recv_ns`) ties the record's host and device clocks"
+            "no token read exit (`t_recv_ns` or `t_read_ns`) ties the record's "
+            "host and device clocks"
         )
     # Steps before the first anchor read the first ones.
     first, recent, exposed = min(bounds[:ANCHORS]), deque(maxlen=ANCHORS), set()
