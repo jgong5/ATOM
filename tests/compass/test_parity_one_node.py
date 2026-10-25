@@ -9,6 +9,7 @@ compare, so these run with no GPU and no model; the rest of the script runs as w
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -161,6 +162,23 @@ def test_dp_two_trees_stops_an_authority_still_up_after_wait_s(tmp_path):
     r, _, _ = _parity(tmp_path, CONFIG="dp-two-trees", AUTHORITY_S="60", WAIT_S="5")
     assert r.returncode == 1
     assert r.stderr == "parity_one_node: the authority is still up\n"
+
+
+def test_dp_two_trees_stops_a_real_worker_tree_whose_setsid_runs_late(
+    tmp_path, monkeypatch
+):
+    # Real tree 1 is still in the script's own process group when rank 0 listens.
+    late = tmp_path / "late"
+    late.mkdir()
+    (late / "setsid").write_text(
+        "#!/bin/bash\n"
+        'case "$*" in *--compass-run*) ;; *"--data-parallel-rank 1"*) sleep 3 ;; esac\n'
+        f'exec {shutil.which("setsid")} "$@"\n'
+    )
+    (late / "setsid").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{late}:{os.environ['PATH']}")
+    r, _, _ = _parity(tmp_path, CONFIG="dp-two-trees", WAIT_S="10")
+    assert r.returncode == 0, r.stderr
 
 
 def test_dsv4_dpa8_runs_the_nightly_prefill_server_at_eight_ranks(tmp_path):

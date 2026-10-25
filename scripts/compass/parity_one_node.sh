@@ -146,8 +146,9 @@ fi
 servers=() authority= lmcache=
 trap 'kill -KILL -- ${servers[*]/#/-} ${authority:+-$authority} ${lmcache:+-$lmcache} 2>/dev/null || true' EXIT
 # serve SIDE [FLAGS...]: an API server per tree recording to OUT/SIDE/record,
-# each in its own process group; returns once rank 0's listens. Tree k above 0
-# logs to server<k>.log.
+# each in its own process group; returns once rank 0's listens and every tree
+# leads its group or is gone, since a tree is stopped by its group. Tree k above
+# 0 logs to server<k>.log.
 serve() {
     local side=$1 deadline=$((SECONDS + WAIT_S)) master base k log port devices dp pid
     shift
@@ -185,12 +186,19 @@ print(p)')
             >"$log" 2>&1 &
         servers+=($!)
     done
-    until grep -qs "Uvicorn running" "$OUT/$side/server.log"; do
+    until grep -qs "Uvicorn running" "$OUT/$side/server.log" && grouped; do
         for pid in "${servers[@]}"; do
             kill -0 "$pid" 2>/dev/null || { echo "parity_one_node: a $side server exited" >&2; exit 1; }
         done
         ((SECONDS < deadline)) || { echo "parity_one_node: no $side server after $WAIT_S s" >&2; exit 1; }
         sleep 1
+    done
+}
+# grouped: every server leads its own process group (its setsid has run) or is gone.
+grouped() {
+    local pid
+    for pid in "${servers[@]}"; do
+        kill -0 -- "-$pid" 2>/dev/null || ! kill -0 "$pid" 2>/dev/null || return 1
     done
 }
 # leave SIDE: wait up to WAIT_S for every server, and the authority, to exit.
