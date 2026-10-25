@@ -123,8 +123,9 @@ every point held, a measured one with its store token, in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
 covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
-a step only when `fit ops`' price list of those points prices each leaf, and
-prints the count by phase and why each leaf kind left the rest out.
+a step only when `fit ops`' price list of those points prices each leaf but a
+collective, and prints the count by phase and why each leaf kind left the rest
+out.
 """
 
 import argparse
@@ -1820,9 +1821,9 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     decode leaf of a kind that depends on context over its rows' lowest to
     highest context (`_rows`), any other decode leaf at its width, a prefill
     leaf at its tokens, and one of a kind that depends on context over its
-    rows' cached tokens too (`_bracket_cached`); and `fit ops`' price list of
-    `records` prices it at the step, as `compass run --coverage` asks it. The
-    graphs are `arch`'s."""
+    rows' cached tokens too (`_bracket_cached`); and, but for a collective,
+    which it does not price, `fit ops`' price list of `records` prices it at
+    the step, as `compass run --coverage` asks it. The graphs are `arch`'s."""
     from atom.compass.backends.op_graph import band
     from atom.compass.backends.provenance import Refusal
     from atom.compass.capture import population_steps
@@ -1866,7 +1867,8 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 why = _bracket(*axes[fam], *_rows(line, shape.seqs)) if moves else ""
             else:
                 why = _bracket(*axes[fam], tokens, tokens)
-            if not why and isinstance(got := listed.price((op, bound, None)), Refusal):
+            listing = not why and not _exchanged(fam)
+            if listing and isinstance(got := listed.price((op, bound, None)), Refusal):
                 why = re.sub(r"\d+", "#", got.reason.split(": ")[1])
             if why:
                 whys[name] = why
