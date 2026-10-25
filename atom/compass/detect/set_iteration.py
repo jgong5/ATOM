@@ -52,11 +52,11 @@ returning one.
 **What it recognises as a read in order.** `for` and `async for`, a
 comprehension or generator expression, tuple and starred unpacking, `yield
 from`; `list`, `tuple`, `iter`, `reversed`, `enumerate`, `zip`, `sum`, `join`,
-`map`, `filter` and `fromkeys`; `str`, `repr`, `format` and an f-string or `%`
-interpolation, because a set's `repr` lists its members in iteration order;
-`pop`, which takes a member out in hash order; and `min` or `max` given a `key`,
-because ties there are resolved first-wins and first is whichever member the set
-handed over first.
+`map`, `filter` and `fromkeys`; `str`, `repr`, `format`, `print`, a logging
+call's arguments and an f-string or `%` interpolation, because a set's `repr`
+lists its members in iteration order; `pop`, which takes a member out in hash
+order; and `min` or `max` given a `key`, because ties there are resolved
+first-wins and first is whichever member the set handed over first.
 
 **What it does not find. This list is what has been tried, not an enumeration
 of what Python allows.** It is short on both sides of the two recognitions.
@@ -64,12 +64,16 @@ of what Python allows.** It is short on both sides of the two recognitions.
 A set it does not recognise: one returned by a call this module does not itself
 annotate, or by one defined in another module; one arriving in an unannotated
 parameter; one pulled out of a list, a dict or a tuple; any subclass of `set`;
-one read through the class rather than through `self`, as `Step.members`; and a
-name that is also bound, anywhere in the same scope, to something the pass
-cannot see as a set -- by an assignment, an unpacking, a parameter, a `for` or
-comprehension target, a `with ... as` or an import.
+one read through the class rather than through `self`, as `Step.members`; one
+bound under `global` or `nonlocal`, which is written down in the scope holding
+the statement rather than the one it names; one bound by a paired unpacking, as
+`a, b = set(x), set(y)`, or only by `s |= ...`; and a name that is also bound,
+anywhere in the same scope, to something the pass cannot see as a set -- by an
+assignment, an unpacking, a parameter, a `for` or comprehension target, a
+`with ... as` or an import.
 
-A read it does not recognise: `itertools.chain`, `functools.reduce`,
+A read it does not recognise: `out.extend(s)`, `collections.deque`, `Counter`,
+`itertools.islice`, `np.fromiter`, `itertools.chain`, `functools.reduce`,
 `heapq.nsmallest` and every other call not named above -- the list is the forms
 this code is written in, not the forms that exist. `sorted(s, key=...)` belongs
 on this side for a reason of its own rather than by omission: its ties keep the
@@ -132,7 +136,10 @@ VIEW_CALLS = ("keys", "items")
 #: terms arrive in is the order the rounding happens in. `fromkeys` is here
 #: because a dict built from a set holds the set's order and looks ordered
 #: afterwards, and `str`, `repr` and `format` are here because a set's `repr`
-#: lists its members in the order it holds them.
+#: lists its members in the order it holds them. `print` and the logging calls
+#: are `str` over each argument, the logging ones when the record is formatted,
+#: so `log.info("%s", s)` is `"%s" % s` written later; like `join`, they are
+#: matched on the call's last name.
 ORDERED_READS = (
     "list",
     "tuple",
@@ -148,6 +155,14 @@ ORDERED_READS = (
     "str",
     "repr",
     "format",
+    "print",
+    "debug",
+    "info",
+    "warning",
+    "error",
+    "exception",
+    "critical",
+    "log",
 )
 
 #: Calls that read in order only when a `key` is given, and only in the form
@@ -176,6 +191,12 @@ _KEPT = (
     ("atom/config.py", "init_with_cudagraph_sizes", "torch.compile sizes, " + _STARTUP, 1),
     ("atom/entrypoints/atomesh/atom_standalone_service.py", "close",
      "fails every pending future at shutdown, in any order", 1),
+    ("atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py", "get_finished",
+     "log text", 3),
+    ("atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py", "_complete_recv",
+     "log text", 1),
+    ("atom/kv_transfer/disaggregation/moriio/moriio_connector.py", "get_finished",
+     "log text", 1),
     ("atom/kv_transfer/disaggregation/pp_kv_aggregator.py", "ingest", _INTO_A_SET, 9),
     ("atom/kv_transfer/disaggregation/types.py", "__repr__", "log text", 7),
     ("atom/kv_transfer/offload/_offload_common.py", "process_completions", _REPLACED_TRANSFER, 4),
