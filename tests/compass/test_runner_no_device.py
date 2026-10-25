@@ -169,7 +169,8 @@ def test_asked_about_its_own_device_a_host_start_answers_from_its_readings(
 ):
     """DeepSeek-V4.1's attention builder bounds its pages by `mem_get_info` and
     `memory_allocated` of the runner's device, the host after this start: the
-    two answer from the installed readings, and of a card as before."""
+    two answer from the installed readings, what a real start holds once its
+    target loads and before the builder allocates, and of a card as before."""
 
     def card(device=None):
         return "card", device
@@ -188,7 +189,7 @@ def test_asked_about_its_own_device_a_host_start_answers_from_its_readings(
     expected, peak = EXPECTED[2], EXPECTED[2]["peak_torch"]
     free = sum(expected["free"].values())
     assert torch.cuda.mem_get_info(cpu) == (free, expected["total"]["capacity"])
-    held = peak["weights"] + peak["buffers"] + peak["persistent"]
+    held = peak["weights"] + peak["buffers"] + peak["load residue"]
     assert torch.cuda.memory_allocated(cpu) == held
     assert torch.cuda.mem_get_info(0) == ("card", 0)
     assert torch.cuda.memory_allocated() == ("card", None)

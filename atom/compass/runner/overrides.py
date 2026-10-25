@@ -463,9 +463,11 @@ def _device_memory(read: Any, runner: Any, answer: Any) -> Any:
 
 
 def _resident(readings: DeviceReadings) -> int:
-    """What a start holds once its model is built: the weights, buffers and
-    persistent forward buffers of `peak_torch`."""
-    held = ("weights", "buffers", "persistent")
+    """What a start holds once its target has loaded: the weights, buffers and
+    load residue of `peak_torch`, the allocation `compass measure memory` reads
+    after the load. Its `persistent` is read at the KV budget, after the
+    attention builder that asks this has allocated, so none of it is counted."""
+    held = ("weights", "buffers", "load residue")
     return sum(t.nbytes for t in readings.peak_torch.terms if t.name in held)
 
 
@@ -477,27 +479,36 @@ def simulated_arch():
     experts would take a Triton layout an MI355X start does not, and refuse on
     the meta device. Each probe bound by name in a loaded module is swapped,
     the probes' own module among them, so a module imported inside the block
-    binds the swapped one; all are put back on the way out. Without a run file
-    nothing is swapped, nor without aiter loaded, as where there is no driver.
+    binds the swapped one. On the way out every module holding the swapped one
+    gets the probe back, one imported inside the block too: a test process
+    builds many runners and runs other tests on the host's arch after. Without
+    a run file nothing is swapped, nor without aiter loaded, as where there is
+    no driver.
     """
     from atom.compass import run
     from atom.compass.spec.machine import MachineSpec
 
     spec = run.spec()
-    swapped = []
+    real = {}
+
+    def simulated():
+        return arch
+
     if spec is not None:
         arch = MachineSpec.from_mapping(spec["machine"]).value("device.arch")
         for module in list(sys.modules.values()):
             for n in ("get_gfx", "get_gfx_runtime"):
                 probe = getattr(module, "__dict__", {}).get(n)
                 if getattr(probe, "__module__", None) == "aiter.jit.utils.chip_info":
-                    swapped.append((module, n, probe))
-                    setattr(module, n, lambda: arch)
+                    real.setdefault(n, probe)
+                    setattr(module, n, simulated)
     try:
         yield
     finally:
-        for module, n, probe in swapped:
-            setattr(module, n, probe)
+        for module in list(sys.modules.values()):
+            for n, probe in real.items():
+                if getattr(module, "__dict__", {}).get(n) is simulated:
+                    setattr(module, n, probe)
 
 
 def start_on_host(runner: Any, rank: int, config: Any) -> None:
@@ -680,7 +691,7 @@ def drafts_on_meta() -> None:
     def on_meta(build):
         @wraps(build)
         def built(self, model_class):
-            with FactoriesOnMeta(), simulated_arch():
+            with FactoriesOnMeta():
                 return build(self, model_class)
 
         return built
@@ -950,9 +961,9 @@ class NonAllocatingRunner(
         rank's GPU and then fills it from disk. Here it is built on the meta
         device, shapes and no bytes, a factory function's tensor on a named
         device included, because ATOM sizes the KV pool by walking its attention
-        modules; the load is skipped, so no checkpoint is read. The tree, and
-        a drafter's, is built for the simulated device's arch
-        (`simulated_arch`), not the host's.
+        modules; the load is skipped, so no checkpoint is read. The tree is
+        built for the simulated device's arch (`simulated_arch`), not the
+        host's.
 
         Under a speculative config the base goes on to build the drafter and
         load it from the checkpoint; `drafts_on_meta` makes that build meta and
