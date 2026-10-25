@@ -432,7 +432,9 @@ pub fn cancellable(loads: [WorkerLoadGuard; 2]) -> [Load; 2] {
 }
 
 /// Request header `name`'s `value` as it goes to a worker: a `tracestate`
-/// with its `compass` entry restamped for the prefill the request was placed on.
+/// with its `compass` entry restamped for the prefill the request was placed on
+/// and moved first. The other entries keep their order; empty ones are
+/// dropped, and so are entries from the end past W3C Trace Context's limit of 32.
 pub fn header(name: &str, value: &str) -> String {
     let stamp = (name == "tracestate")
         .then(|| {
@@ -445,13 +447,13 @@ pub fn header(name: &str, value: &str) -> String {
     let Some(stamp) = stamp else {
         return value.to_owned();
     };
-    let entries = value
+    let others = value
         .split(',')
-        .map(|e| match e.trim().starts_with("compass=") {
-            true => format!("compass={stamp}"),
-            false => e.to_owned(),
-        });
-    entries.collect::<Vec<_>>().join(",")
+        .map(str::trim)
+        .filter(|e| !e.is_empty() && !e.starts_with("compass="));
+    let restamped = format!("compass={stamp}");
+    let entries = std::iter::once(restamped.as_str()).chain(others);
+    entries.take(32).collect::<Vec<_>>().join(",")
 }
 
 /// Run `task` every `interval_secs` of the LP clock, from now, until `stopped`
@@ -587,7 +589,23 @@ impl Lp {
 
 #[cfg(test)]
 mod tests {
-    use super::stamp;
+    use super::{header, stamp, Handling, REQUEST};
+    use std::cell::RefCell;
+
+    #[test]
+    fn restamped_entry_goes_first_within_32_entries() {
+        let placed = Handling {
+            stamp: Some("a:2.0;s:1".into()),
+            ..Default::default()
+        };
+        let others: Vec<String> = (0..40).map(|i| format!("k{i}=v")).collect();
+        let value = format!("k=v, ,compass=a:1.0;s:0,{}", others.join(","));
+        let sent = REQUEST.sync_scope(RefCell::new(placed), || header("tracestate", &value));
+        let sent: Vec<&str> = sent.split(',').collect();
+        assert_eq!(sent.len(), 32);
+        assert_eq!(sent[..3], ["compass=a:2.0;s:1", "k=v", "k0=v"]);
+        assert_eq!(sent[31], "k29=v");
+    }
 
     #[test]
     fn reads_both_stamp_spellings() {
