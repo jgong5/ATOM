@@ -37,6 +37,8 @@ import pytest
 import torch
 from test_drive_gpu import SHOWHW
 from test_memory_readings import DOCUMENT
+from test_pd_slice import publish_pd_entries
+from test_vertical_slice import publish_entry
 
 from atom.compass import run as compass_run
 from atom.compass.backends.step_stub import Coefficients
@@ -53,10 +55,16 @@ pytestmark = pytest.mark.skipif(
 
 TREE = Path(__file__).resolve().parents[2]
 SCRIPT = TREE / "scripts/compass/cctraces_sim.sh"
+#: What the script runs its servers with where the environment sets neither.
+DEFAULTS = {
+    "SERVER_ARGS": "--enforce-eager --max-model-len 262144",
+    "AITER_LOG_LEVEL": "WARNING",
+}
 
 
 def _template(path: Path, **extra) -> Path:
-    """A run file whose declared tokenizer also covers the model's architecture."""
+    """A run file whose declared tokenizer also covers the model's architecture,
+    and whose store holds the entry of each server the script starts for it."""
     machine = copy.deepcopy(DOCUMENT)
     arch = json.loads((Path(MODEL) / "config.json").read_text())["architectures"][0]
     machine["host"]["tokenizers"][0]["applies_to"].append(arch)
@@ -67,9 +75,16 @@ def _template(path: Path, **extra) -> Path:
         "stream_s": 2.0**-12,
         "step_stub": dataclasses.asdict(Coefficients()),
         "machine": machine,
+        "store": str(path.parent / "store"),
         **extra,
     }
     path.write_text(json.dumps(run))
+    env = DEFAULTS | dict(os.environ)
+    if "kv_write_req_s" in run:
+        publish_pd_entries(run["store"], machine, env)
+    else:
+        argv = ["--model", MODEL, *env["SERVER_ARGS"].split()]
+        publish_entry(run["store"], machine, argv, env)
     return path
 
 
