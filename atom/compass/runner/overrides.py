@@ -470,22 +470,19 @@ def simulated_arch():
     the meta device. Each probe bound by name in a loaded module is swapped,
     the probes' own module among them, so a module imported inside the block
     binds the swapped one; all are put back on the way out. Without a run file
-    nothing is swapped.
+    nothing is swapped, nor without aiter loaded, as where there is no driver.
     """
-    from aiter.jit.utils import chip_info
-
     from atom.compass import run
     from atom.compass.spec.machine import MachineSpec
 
     spec = run.spec()
-    names = ("get_gfx", "get_gfx_runtime")
-    probes = {getattr(chip_info, n) for n in names}
     swapped = []
     if spec is not None:
         arch = MachineSpec.from_mapping(spec["machine"]).value("device.arch")
         for module in list(sys.modules.values()):
-            for n in names:
-                if (probe := getattr(module, "__dict__", {}).get(n)) in probes:
+            for n in ("get_gfx", "get_gfx_runtime"):
+                probe = getattr(module, "__dict__", {}).get(n)
+                if getattr(probe, "__module__", None) == "aiter.jit.utils.chip_info":
                     swapped.append((module, n, probe))
                     setattr(module, n, lambda: arch)
     try:
@@ -688,6 +685,20 @@ def drafts_on_meta() -> None:
         for name in ("load_model", "arm_aux_capture"):
             if name in vars(cls):
                 setattr(cls, name, lambda self, target: None)
+
+
+def engram_tables_unread() -> None:
+    """Make an engram input preparer read no checkpoint, for the life of the
+    worker process.
+
+    DeepSeek-V4.1's attention builder builds one off the checkpoint's engram
+    hash tables, as it does unless `--load_dummy` is set; here it builds none,
+    as under that flag. The preparer feeds a forward's engram inputs from host
+    tables, and no forward runs.
+    """
+    from atom.model_ops.engram.device.runtime import EngramInputPreparer
+
+    EngramInputPreparer.from_checkpoint = classmethod(lambda cls, *a: None)
 
 
 class UnbuiltModel(torch.nn.Module):
@@ -961,6 +972,7 @@ class NonAllocatingRunner(
                     "pipeline parallel + speculative decode"
                 )
             drafts_on_meta()
+        engram_tables_unread()
         with FactoriesOnMeta(), simulated_arch():
             self.model.tree = model_class(self.config)
             process_weights_after_loading(self.model.tree)
