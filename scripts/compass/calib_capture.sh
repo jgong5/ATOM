@@ -10,6 +10,11 @@
 # CELLS="1 4 16": at 64 and 256 its warmup cannot finish within STEPS_S, so the
 # owner dropped them for that model and machine as not a sustainable
 # configuration (https://github.com/jgong5/ATOM/issues/1590#issuecomment-6281930268).
+# It then captures, into another OUT_DIR, CELLS="4 8 10 12" with
+# AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0":
+# cells that start every trajectory at its first turn, so their decode steps
+# run at the batch sizes and shorter contexts the graded cells do and the
+# sampled starts miss, 8 sequences included.
 #
 # Usage: calib_capture.sh RUN_FILE OUT_DIR
 #   RUN_FILE, MODEL, TRACES, HARNESS_PYTHON  as cctraces_sim.sh takes them

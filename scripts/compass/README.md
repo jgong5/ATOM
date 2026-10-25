@@ -618,16 +618,14 @@ Given two or more records, the command also prints each form's error on every
 record under a law fitted on the others, per decode rung and prefill token band.
 
 `scripts/compass/laws/qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json` is the
-`history` form, labelled by device time, fitted on
-records captured on hjbog-srdc-39 at ce625ddd9 (ROCm/ATOM 661ef7661) in the
-nightly-20261013 image, in this order: concurrency 1, 4, 16, 64 and 256 as
-`calib_capture.sh` captures them, then first-turn cells at concurrency 64 and
-256, which decode at rungs 16 and up, and at 8 and 14, which give it its rung-8
-vector. A first-turn cell runs with `AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0
---trajectory-start-max-ratio 0"`, which starts every trajectory at its first
-turn. Its `engine_config` also states the fields those records predate, as
-their `server.log` engine arguments and the capture's environment give them: DP
-width 1, no DP attention, expert parallelism or TBO, and `AITER_LOG_LEVEL=WARNING`.
+`history` form, labelled by device time, fitted by `compass fit steps` on
+records captured on one card of hjbog-srdc-39 at 731debf47 (ROCm/ATOM 661ef7661)
+in the nightly-20261013 image, in this order, by the cells `calib_capture.sh`'s
+header names for this model: concurrency 1, 4 and 16, then first-turn cells
+at 4, 8, 10 and 12. The cells were chosen by decode rung: each rung the graded
+runs decode at, 1 to 8, has steps in two or more cells
+([#1024](https://github.com/jgong5/ATOM/issues/1024)); it has no decode vector above rung 16, since
+this model is not captured or graded at concurrency 64 or 256.
 Its host laws (`host`, with `compass fit host`'s report as `host_fit`) are fitted
 apart, by `compass fit host`, on calibration cells at concurrency 1, 4 and 16
 over traces 256 to 392, each a `compass record` server and one `client.sh` run
