@@ -1314,7 +1314,8 @@ def _group_step_seconds(
     refusals the summary reads. With `compass_abort` set it raises instead,
     which ends the worker. Under a speculative config, a step whose price tags
     no `draft` term is refused the same way, since the drafter runs after
-    every target forward. A forward `compass_host` refuses takes the same path,
+    every target forward, unless it is priced under the `eager DP dummy`
+    treatment, whose 0 s the group's max already covers. A forward `compass_host` refuses takes the same path,
     charged with each segment it named at 0; a step both refuse has one reason.
 
     On the rank that keeps the parity record, each step also appends its cost
@@ -1344,7 +1345,7 @@ def _group_step_seconds(
             f"layers, but {type(backend).__name__} prices a whole step; charging "
             "each stage the whole model would count it once per stage"
         )
-    from atom.compass.backends.cost import ProvenanceMix, fold_seconds
+    from atom.compass.backends.cost import EAGER_DP_DUMMY, ProvenanceMix, fold_seconds
     from atom.compass.backends.resolver import CostRefused, Refusal
 
     if mode is None:
@@ -1354,7 +1355,8 @@ def _group_step_seconds(
     terms, refused = (), None
     try:
         cost = backend.price(batch_view(batch, mode, runner))
-        if spec and not any(t.draft for t in cost.terms):
+        drafts = any(t.draft for t in cost.terms)
+        if spec and not drafts and EAGER_DP_DUMMY not in cost.treatments:
             name = type(backend).__name__
             raise CostRefused(batch, [Refusal(name, "prices no draft")])
     except CostRefused as refusal:
