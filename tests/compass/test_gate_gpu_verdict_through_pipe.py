@@ -92,9 +92,9 @@ CASES = {
         {"scripts/compass/gpu_gate_known_failures.txt": ""},
         "",
     ),
-    "compass-count": (
-        93,
-        "pass count has no source",
+    "compass-failure": (
+        1,
+        "first tests/compass/test_c.py::test_c; 2 more",
         {"tests/compass/test_c.py": "def test_c():\n    assert False\n"},
         "",
     ),
