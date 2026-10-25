@@ -45,7 +45,7 @@ class RecordedRun(SyntheticRun):
         self.clock.timeline = self
         self.hand_over_by_set = hand_over_by_set
 
-    def record(self, lp, time_from, time_to, kind, recovered):
+    def record(self, lp, time_from, time_to, kind, recovered, *_):
         """The authority's timeline hook: one step row per reply."""
         detail = "recovered" if recovered else ""
         self.step_table.record(lp, time_from, time_to, kind, detail=detail)

@@ -268,7 +268,7 @@ AUTHORITY_FILE = "authority_endpoint.txt"
 HAND_IN_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
-SUMMARY_SCHEMA_VERSION = 8
+SUMMARY_SCHEMA_VERSION = 9
 #: Compass source the host-law key leaves out, by path under the package: all
 #: of it (None), or the top-level names (def, class or assigned) only a simulated
 #: run reaches, with the comments above each and the module docstring.
@@ -799,7 +799,7 @@ class _RecordingAuthority(ClockAuthority):
             client_runs=math.inf if count is None else count,
         )
 
-    def record(self, lp, time_from, time_to, kind, recovered) -> None:
+    def record(self, lp, time_from, time_to, kind, recovered, *_) -> None:
         self._clock_before[lp] = time_from
         self.steps.record(lp, time_from, time_to, kind, detail="recovered" * recovered)
 
@@ -1752,11 +1752,14 @@ def _hand_in(
     run: dict, lp: str, reasons: list, client_run: int | None = None, **sections
 ) -> None:
     """Write `lp`'s refusals, and its other sections, for the summary's writer:
-    at the end of client run `client_run`, or None for the finish."""
+    at the end of client run `client_run`, or None for the finish. When its
+    runtime printed stall diagnostics, ``diagnostics`` counts them."""
     out = Path(run["out_dir"])
     if client_run is not None:
         out = out / CLIENT_DIR.format(client_run)
         out.mkdir(exist_ok=True)
+    if diagnostics := getattr(clock.installed(), "diagnostics", 0):
+        sections = {"diagnostics": diagnostics, **sections}
     _write_whole(
         out / LP_FILE.format(lp), json.dumps({"refusals": reasons, **sections})
     )
@@ -2034,7 +2037,14 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     seconds = total("seconds")
     tally = RefusalTally.of(reasons, total("steps"))
     lazy = total("lazy_traces"), total("lazy_trace_wall_seconds")
-    summary = RunSummary.of(record, wall, *lazy, refusals=tally).as_record()
+    # The authority's stalls in `record`, and each LP's beyond those in `since`.
+    diagnostics = record.diagnostics + sum(
+        h.get("diagnostics", 0) for h in hand_ins.values()
+    )
+    diagnostics -= sum(h.get("diagnostics", 0) for h in since.values())
+    summary = RunSummary.of(
+        record, wall, *lazy, diagnostics=diagnostics, refusals=tally
+    ).as_record()
     schedule = summary["schedule"]
     schedule["predicted_seconds"] = seconds
     # How the seconds were obtained: reported, never gated.

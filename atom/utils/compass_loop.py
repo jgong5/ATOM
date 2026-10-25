@@ -132,6 +132,8 @@ class Station:
                     self.final,
                     self.diag_s,
                 )
+                if (rt := clock.installed()) is not None:
+                    rt.diagnostics += 1
                 self.cv.wait_for(lambda: self.final >= k)
             s = self.jobs[k][3]
             return max(self.jobs[k][0], self.free[0]) if s is None else s
@@ -534,6 +536,7 @@ class CompassSelector(selectors.DefaultSelector):
                         rt.diag_s,
                         what,
                     )
+                    rt.diagnostics += 1
                     self.stall = (what, None)
                 continue
             self.stall = None

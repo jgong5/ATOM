@@ -164,6 +164,8 @@ class LPRuntime:
         # caller such as an output thread or an HTTP handler may log and drop
         # the exception.
         self.refusals: list[str] = []
+        # One-shot stall diagnostics printed in this process, for the run summary.
+        self.diagnostics = 0
         # Whether the owner holds work a bounded poll must not idle past: then
         # the poll's bound is an essential deadline, else a daemon one.
         self.holds_work = lambda: False
@@ -339,6 +341,7 @@ class LPRuntime:
                             self.diag_s,
                         )
                         reported = True
+                        self.diagnostics += 1
             self.now = G
             late = [(a, ch, s) for (ch, s), a in self.unreleased.items() if a < G]
             if late:
