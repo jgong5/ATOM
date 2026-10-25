@@ -56,6 +56,9 @@ requests: on a prefill step that produces output it adds the drafter's
 output and 0 on one that does not: the draft-KV pass projects and writes a tail
 only for requests that finish their prompts. Under either, a prefill step that
 does not say whether it produces output is refused.
+A draft law may also hold a `draft_kv` vector over `[1, seqs]`: on a decode
+step it adds the drafter's draft-KV pass, which runs before
+`forward_done_event`, so its terms are not tagged `draft`.
 
 The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
 
@@ -64,7 +67,7 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
      "prefill": VECTOR,
      "decode": {"eager": VECTOR, "1": VECTOR, "2": VECTOR, ...},
      "draft": {"provenance": ..., "prefill": VECTOR, "decode": {...},
-               "propose": VECTOR}}   # `propose` optional
+               "propose": VECTOR, "draft_kv": VECTOR}}   # both optional
 
     VECTOR = {"coefficients": {<feature>: seconds, ...},
               "hull": HULL,
@@ -82,6 +85,7 @@ above, as `a . x + c <= 0` inside: the rows of qhull's `ConvexHull.equations`.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Mapping
 
@@ -178,6 +182,9 @@ class StepLinearLaw:
         self.propose = law.get("propose") and _Vector(
             "propose", PROPOSE, law["propose"]
         )
+        self.draft_kv = law.get("draft_kv") and _Vector(
+            "draft_kv", PROPOSE, law["draft_kv"]
+        )
 
 
 class StepLinearBackend(CostBackend):
@@ -262,9 +269,12 @@ class StepLinearBackend(CostBackend):
             if vector.rowmod:
                 counts += (rowmod([r.context_tokens for r in decode], vector.rowmod),)
         terms = self._priced(law, vector, kind, counts, what)
+        seqs = (1, len(batch_view.requests))
         if prefill and law.propose is not None and batch_view.produces_output:
-            seqs = (1, len(batch_view.requests))
             terms += self._priced(law, law.propose, "propose", seqs, what)
+        if decode and law.draft_kv is not None:
+            kv = self._priced(law, law.draft_kv, "draft_kv", seqs, what)
+            terms += [dataclasses.replace(t, draft=False) for t in kv]
         return terms
 
     def _priced(self, law, vector: _Vector, kind: str, counts: tuple, what: str):

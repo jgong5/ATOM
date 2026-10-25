@@ -386,13 +386,14 @@ def _check_host(path, host: dict) -> None:
     from atom.compass.runner.overrides import (
         FORWARD_KINDS,
         HOST_SEGMENTS,
+        MTP_COPY,
         MTP_SEGMENT,
         OUT_SEGMENT,
         PP_RECV_SEGMENT,
     )
 
     laws = host.get("laws", {})
-    segments = (*HOST_SEGMENTS, MTP_SEGMENT, PP_RECV_SEGMENT, OUT_SEGMENT)
+    segments = (*HOST_SEGMENTS, MTP_SEGMENT, MTP_COPY, PP_RECV_SEGMENT, OUT_SEGMENT)
     if (
         set(host) - {"laws", "skip", "key"}
         or set(host.get("skip", ())) - set(segments)
