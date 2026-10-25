@@ -65,7 +65,12 @@ DONE = "data: [DONE]"
 
 
 def expected_timeline(
-    record, prefill_s: float, decode_s: float, tars, sync: bool = False
+    record,
+    prefill_s: float,
+    decode_s: float,
+    tars,
+    sync: bool = False,
+    draft_s: float = 0.0,
 ) -> list:
     """One engine LP's TAR rows, ``(from, to)``, under a constant step stub.
 
@@ -84,6 +89,11 @@ def expected_timeline(
     forward returns at the group's device end, as one that synchronizes its
     stream before it returns does.
 
+    With `draft_s`, a speculative engine's: each forward's device work runs
+    `draft_s` of draft after its target, and an output forward enters no
+    earlier than the previous output forward's target ends, the group's
+    latest above DP width one.
+
     Raises ValueError when the ranks hold different step counts, or a step
     starts after the TAR rows end.
     """
@@ -91,28 +101,33 @@ def expected_timeline(
     counts = {r: len(record[r]) for r in ranks}
     if len(set(counts.values())) > 1:
         raise ValueError(f"the record's ranks hold {counts} steps")
-    # Per rank: device end of forwards n-2 and n-1, and of the last output one.
+    # Per rank: device end of forwards n-2 and n-1, and of the last output one,
+    # its target's under a drafter.
     device = {r: (-math.inf, -math.inf, -math.inf) for r in ranks}
     want, i = [], 0
     for k in range(len(record[ranks[0]])):
         if i >= len(tars):
             raise ValueError(f"record step {k} has no TAR row")
         now = tars[i][0]
-        returns, ends = set(), {}
+        returns, ends, targets = set(), {}, {}
         for r in ranks:
             step = record[r][k]
             rows = [row[-1] for row in step["rows"]]
             busy = prefill_s * (not all(rows)) + decode_s * any(rows)
             two_back, last, output = device[r]
             host = max(now, two_back)
-            ends[r] = max(last, host) + busy
+            if draft_s and step["produces_output"]:
+                host = max(host, output)
+            targets[r] = max(last, host) + busy
+            ends[r] = targets[r] + draft_s
             returns.add((max(host, output) if step["produces_output"] else host) - now)
         end = max(ends.values())
+        mark = max(targets.values()) if draft_s else end
         if sync:
             returns = {end - now}
         for r in ranks:
             _, last, output = device[r]
-            device[r] = (last, end, end if record[r][k]["produces_output"] else output)
+            device[r] = (last, end, mark if record[r][k]["produces_output"] else output)
         start = now
         for t in sorted(returns):
             want.append((start, now + t))
@@ -189,14 +204,26 @@ def pipeline_timeline(table: str) -> list[str]:
     the forward's own waits for the metadata and the tensors come after.
     """
     run, tars, arrived = _rows(table)
-    pp, channels = run.get("pipeline_parallel_size", 1), channel_table(run)
-    meta = "engine-pp0->engine-pp1:meta#pp1"
+    channels = channel_table(run)
+    lps = [lp.name for lp in channels.registry.ids()]
+    failed = []
+    for head in (lp for lp in lps if lp.endswith("-pp0")):
+        engine = head.removesuffix("-pp0")
+        pp = sum(lp.startswith(f"{engine}-pp") for lp in lps)
+        failed += _pipeline_order(engine, pp, channels, tars, arrived)
+    return failed
+
+
+def _pipeline_order(engine: str, pp: int, channels, tars, arrived) -> list[str]:
+    """`pipeline_timeline`'s checks on the pipeline ``<engine>-pp<k>``."""
+    meta = f"{engine}-pp0->{engine}-pp1:meta#pp1"
     starts = {n: a - channels.lookahead(meta) for n, a in arrived[meta].items()}
     failed = []
     for k in range(pp):
-        lp, data_ch = f"engine-pp{k}", f"engine-pp{k}->engine-pp{k + 1}:pp_data#dp0"
+        lp = f"{engine}-pp{k}"
+        data_ch = f"{engine}-pp{k}->{engine}-pp{k + 1}:pp_data#dp0"
         data = arrived[data_ch]
-        ack = arrived[f"engine-pp{k + 1}->engine-pp{k}:pp_ack#dp0"]
+        ack = arrived[f"{engine}-pp{k + 1}->{engine}-pp{k}:pp_ack#dp0"]
         for n, start in sorted(starts.items()):
             span = (
                 b for a, b in tars[lp] if a < start < b and not math.isclose(a, start)
@@ -211,7 +238,7 @@ def pipeline_timeline(table: str) -> list[str]:
                 sent = data[n] - channels.lookahead(data_ch)
                 if sent < least and not math.isclose(sent, least):
                     failed.append(f"{lp} sent forward {n} at {sent}, before {least}")
-        batch = arrived[f"engine-pp0->engine-pp{k + 1}:meta#pp{k + 1}"]
+        batch = arrived[f"{engine}-pp0->{engine}-pp{k + 1}:meta#pp{k + 1}"]
         starts = {n: max(a, batch.get(n, a)) for n, a in data.items()}
     return failed
 
@@ -410,7 +437,7 @@ def _timeline(table: str, lp: str, record) -> list[str]:
     sync = run.get(RAPIDSERVE, False) and lp == "engine-P"
     try:
         want = expected_timeline(
-            record, stub.prefill_step, stub.decode_step, tars, sync
+            record, stub.prefill_step, stub.decode_step, tars, sync, stub.draft_step
         )
     except ValueError as e:
         return [f"{lp}: {e}"]

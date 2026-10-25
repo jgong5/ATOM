@@ -196,7 +196,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                                                docs 01, 15          |
   +=====================================================================+
   |  L0  ARTIFACTS        machine_spec   op_graph      price_list       |
-  |                       op_measurement memory_readings coverage_hull  |
+  |                       op_measurement memory_readings                |
   |                       shape_population  step_measurement            |
   |                       step_linear_law  host_laws  step grid bundle  |
   |                       keys . digests . fingerprints . invalidation  |
@@ -287,7 +287,7 @@ This is what makes "no GPU at simulation time" work.
    |                                |<------|  cost model -> seconds    |
    |  machine_spec   price_list     |  JIT  |  memory model -> blocks   |
    |  op_graph                      | trace |                           |
-   |  memory_readings coverage_hull |       |  -> simulated run         |
+   |  memory_readings               |       |  -> simulated run         |
    +--------------------------------+       +---------------------------+
 ```
 

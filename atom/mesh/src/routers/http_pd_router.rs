@@ -1060,7 +1060,7 @@ impl PDRouter {
         let prefill = placement.prefill.clone();
         let decode = placement.decode.clone();
         let [prefill_guard, decode_guard] = match placement.take_load() {
-            Ok(guards) => guards,
+            Ok(guards) => crate::compass_router::cancellable(guards),
             Err(response) => return response,
         };
 
@@ -1289,7 +1289,7 @@ impl PDRouter {
         &self,
         res: WorkerResponse,
         context: &PDRequestContext<'_>,
-        decode_guard: WorkerLoadGuard,
+        decode_guard: impl Send + Unpin + 'static,
         decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
@@ -1528,7 +1528,7 @@ impl PDRouter {
         return_logprob: bool,
         decode_url: Option<String>,
         headers: Option<HeaderMap>,
-        decode_guard: WorkerLoadGuard,
+        decode_guard: impl Send + Unpin + 'static,
     ) -> Response {
         let (stream, decode_guard) = crate::compass_router::stream(stream, decode_guard);
         // Poll the upstream only when the downstream asks for data. Dropping the

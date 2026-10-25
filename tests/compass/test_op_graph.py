@@ -70,7 +70,7 @@ def backend(region, machine=SPEC, kv="bf16", **kwargs):
 
 
 def by_name(cost):
-    return {term.name: term.seconds for term in cost.terms}
+    return {t.name: t.seconds for t in (*cost.terms, *cost.draft_terms)}
 
 
 def test_a_step_is_one_roofline_per_leaf_composed_by_the_graph_s_joins():

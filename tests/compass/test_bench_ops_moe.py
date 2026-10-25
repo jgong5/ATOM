@@ -54,7 +54,7 @@ def _timed(stub, op, n):
     cycled over."""
     graphs = []
 
-    def replay(fn, calls):
+    def replay(fn, calls, flush=None):
         graphs.append(calls)
         return [1.0] * ops.REPEATS
 

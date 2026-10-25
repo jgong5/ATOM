@@ -286,20 +286,31 @@ def _sampling(text: str) -> dict:
     return sampling
 
 
-def atom_config(atom_args):
-    """ATOM's `Config` for its arguments, as `LLMEngine` resolves one, with the
-    tokenizer's ids and the end-of-sequence id apart from the stop ids."""
+def atom_config(atom_args, server: bool = False):
+    """ATOM's `Config` for its arguments, as `LLMEngine` resolves one and
+    `CoreManager` rewrites it under DP attention, each TP rank a DP rank of TP 1.
+    With `server`, `atom_args` are a server's, whose own flags pass unread, and
+    no tokenizer loads; otherwise any flag the engine does not define refuses,
+    and the config gets the tokenizer's ids and the end-of-sequence id apart
+    from the stop ids."""
     import dataclasses
 
+    from atom.compass.bench.ranks import layout
+    from atom.compass.drive.runfile import _engine_args
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
     from atom.model_engine.llm_engine import _load_tokenizer
 
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
-    engine_args = EngineArgs.from_cli_args(parser.parse_args(atom_args))
+    parsed = _engine_args(atom_args) if server else parser.parse_args(atom_args)
+    engine_args = EngineArgs.from_cli_args(parsed)
     names = {f.name for f in dataclasses.fields(Config)}
     kwargs = engine_args._get_engine_kwargs().items()
     config = Config(engine_args.model, **{k: v for k, v in kwargs if k in names})
+    if config.enable_dp_attention:
+        layout(config)
+    if server:
+        return config
     tokenizer = _load_tokenizer(config.model, config.trust_remote_code)
     config.bos_token_id = tokenizer.bos_token_id
     config.eos_token_id = tokenizer.eos_token_id

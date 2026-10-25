@@ -34,6 +34,13 @@ prefill deployment the relayed ``remote_engine_id`` names (`engine_id`), at
 the rank its ``dp_rank`` names, and a prefill rank refuses a write request
 for another rank.
 
+Above prefill pipeline width one, the transfer model bound is a tuple, one
+per prefill stage, each pricing that stage's layers on a `Link` of its own
+per rank pair, and ``c`` is the latest stage's write-done. The write request
+reaches the head stage only, which reports at ``c + 2 x notify``: decode is
+ready at ``c + notify`` and sends Mooncake's release, which both ends time
+as they time write-done. Stages above the head build an inert connector.
+
 The worker half reports nothing. The engine still builds and polls it.
 """
 
@@ -62,7 +69,9 @@ WRITE_REQ_KEY = "compass_kv_write_req"
 
 def engine_id(lp: str) -> str:
     """The engine id a producer that is engine LP `lp` gives: one label, with
-    the deployment's index when it is one of several (``engine-P1``)."""
+    the deployment's index when it is one of several (``engine-P1``), on any
+    of its pipeline stages (``engine-P1-pp0``)."""
+    lp = lp.partition("-pp")[0]
     index = lp.removeprefix("engine-P") if lp.startswith("engine-P") else ""
     return f"{SIMULATED_ENGINE_ID}-p{index}" if index else SIMULATED_ENGINE_ID
 
@@ -79,15 +88,22 @@ def _is_producer(kv_config: dict) -> bool:
     return kv_config.get("kv_role", "kv_producer") == "kv_producer"
 
 
-def _bound_transfer(kv_config: dict) -> TransferModel:
+def _bound_transfer(kv_config: dict) -> tuple[TransferModel, ...]:
+    """The bound transfer model of each prefill stage."""
     model = kv_config.get(TRANSFER_KEY)
-    if not isinstance(model, TransferModel):
+    models = (model,) if isinstance(model, TransferModel) else model
+    if not (
+        isinstance(models, tuple)
+        and models
+        and all(isinstance(m, TransferModel) for m in models)
+    ):
         raise UnboundSeam(
             f"kv_transfer_config[{TRANSFER_KEY!r}] holds {model!r}, where this "
-            "connector needs a TransferModel priced from the machine spec's "
-            "interconnect and the KV geometry of the model being simulated"
+            "connector needs a TransferModel, or one per prefill stage, priced "
+            "from the machine spec's interconnect and the KV geometry of the "
+            "model being simulated"
         )
-    return model
+    return models
 
 
 class SimulatedKVConnector(KVConnectorBase):
@@ -124,20 +140,29 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         self._tp_size = whole_number("tp_size", config.tensor_parallel_size)
         self._dp_rank = whole_number("dp_rank", parallel.data_parallel_rank)
         self._pp_size = whole_number("pp_size", config.pipeline_parallel_size)
-        if self._pp_size > 1:
-            raise ValueError(
-                f"pipeline_parallel_size is {self._pp_size}, which this connector "
-                "refuses: a PP head passes worker KV output to the scheduler only "
-                "when it is non-empty, so process_completions never runs there, "
-                "and Mooncake's MSG_RELEASE channel is not modelled"
-            )
         self._block_size = config.kv_cache_block_size
         self._dcp_size = config.decode_context_parallel_size
         self._hash_block_size = self._block_size * self._dcp_size
         self._transfer = _bound_transfer(kv_config)
+        if self.is_producer and len(self._transfer) != self._pp_size:
+            raise ValueError(
+                f"the bound transfer models price {len(self._transfer)} prefill "
+                f"stages, and this deployment runs {self._pp_size}"
+            )
         self._rt = clock.installed()
         if self._rt is None:
             raise UnboundSeam("no LP runtime is installed to time transfers on")
+        self._ready: dict = {}  # prefill: request -> r
+        self._due: dict = {}  # request -> when its transfer is done
+        # Each pair's links, one per prefill stage, by the rank at the other end.
+        self._links = collections.defaultdict(lambda: [Link(m) for m in self._transfer])
+        self._snapshot: list = []  # done at the last poll, reported at the next
+        # Mooncake's send claim: a producer keeps a request's blocks from the
+        # pool from `request_finished` until its write is reported done.
+        self._awaiting_send: set[str] = set()
+        self._socks: dict[tuple[str, int], clock.WrappedSocket] = {}
+        if getattr(parallel, "pipeline_parallel_rank", 0):
+            return  # Mooncake reports a send on the head stage only.
         address = kv_config.get(WRITE_REQ_KEY)
         if not isinstance(address, str):
             raise UnboundSeam(
@@ -153,7 +178,6 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         )
         # This rank's end of each pair, by the engine LP and the rank at the
         # other end; the k-th pair's address is the configured one's port plus k.
-        self._socks: dict[tuple[str, int], clock.WrappedSocket] = {}
         for k, channel in enumerate(pairs):
             ends = table.channel(channel).source, table.channel(channel).target
             if me not in ends:
@@ -182,14 +206,11 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         self._peers = {engine_id(peer): peer for peer, _ in self._socks}
         # The write request's latency, and the write-done notice's.
         self._latency_s = table.lookahead(pairs[0])
-        self._ready: dict = {}  # prefill: request -> r
-        self._due: dict = {}  # request -> when its transfer is done
-        # Each pair's link, by the rank at the other end.
-        self._links = collections.defaultdict(lambda: Link(self._transfer))
-        self._snapshot: list = []  # done at the last poll, reported at the next
-        # Mooncake's send claim: a producer keeps a request's blocks from the
-        # pool from `request_finished` until its write is reported done.
-        self._awaiting_send: set[str] = set()
+
+    def _written(self, pair, a: float, blocks: int) -> float:
+        """When the last prefill stage's write of `blocks`, arriving at `a` on
+        rank pair `pair`, is done."""
+        return max(link.start(a, blocks) for link in self._links[pair])
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
         """Claim a remote-filled prompt whole, so the engine parks it."""
@@ -220,6 +241,12 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                 "would wait for a transfer it is itself supposed to serve"
             )
         params["do_remote_prefill"] = False
+        stages = params.get("remote_pp_size", 1)
+        if stages != len(self._transfer):
+            raise ValueError(
+                f"request {seq.id!r} was prefilled over {stages} pipeline stages, "
+                f"and this connector prices {len(self._transfer)}"
+            )
         computed = 0
         if params.get("hash_block_size") == self._hash_block_size > 0 and not (
             seq.has_per_req_cache
@@ -237,7 +264,7 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         )
         key = peer, params["dp_rank"] if self._wide else 0
         self._socks[key].send(pickle.dumps((params["transfer_id"], blocks, a, key[1])))
-        self._due[seq.id] = self._links[key].start(a, blocks) + self._latency_s
+        self._due[seq.id] = self._written(key, a, blocks) + self._latency_s
 
     def request_finished(self, seq) -> None:
         """Record prefill's data-ready time, once, and attach the relayed blob.
@@ -292,7 +319,9 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                     f"its prefill finished (at {r}); the router sends a request "
                     "to decode only after prefill has returned"
                 )
-            self._due[req_id] = self._links[other].start(a, blocks)
+            # Above one stage, decode's write-done notice and its release back.
+            release = 2 * self._latency_s if len(self._transfer) > 1 else 0.0
+            self._due[req_id] = self._written(other, a, blocks) + release
             logger.info(
                 "compass: KV transfer %s, %d blocks, from %r to %r simulated s",
                 req_id,

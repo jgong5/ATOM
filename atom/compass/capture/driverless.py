@@ -176,6 +176,9 @@ def install(tmpdir: str, arch: str) -> dict:
         "ATOM_H2D_BACKEND": "direct",
         # aiter's CU count, which it would otherwise ask rocminfo for.
         "CU_NUM": str(DEVICES[arch][0]),
+        # `group` names GPUs to HIP, which then holds memory on the first at
+        # its first device query; ROCm's own mask, below HIP's, hides them all.
+        "ROCR_VISIBLE_DEVICES": "",
     }
     os.environ.update(flags)
     _declare_arch(tmpdir, arch)

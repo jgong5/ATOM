@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -344,6 +345,79 @@ def test_a_member_that_stays_fails_the_after_check_naming_it(
         f"GPU 5 has PID {p} on it" for p in (tmp_path / "members").read_text().split()
     ]
     assert str(refused.value) == f"{', '.join(on)} after the run, so it fails"
+
+
+def _state(pid) -> str | None:
+    """`pid`'s state letter in /proc, or None once it is reaped."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return None
+
+
+def _until(done, timeout_s=30):
+    for _ in range(int(timeout_s / 0.05)):
+        if done():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"{done} did not hold in {timeout_s} s")
+
+
+@pytest.mark.parametrize(
+    "signals",
+    [(signal.SIGINT, signal.SIGINT), (signal.SIGTERM,)],
+    ids=["a second SIGINT during the stop", "SIGTERM"],
+)
+def test_a_signal_to_the_command_leaves_no_member_of_the_engine_alive(
+    tmp_path, monkeypatch, signals
+):
+    """`main` runs in a forked child, so a signal that ends it ends no test.
+    The engine's group is `GROUP` whose leader stays up and whose members
+    ignore SIGTERM. The first signal lands once both members are up, each next
+    one once the leader has exited, that is, inside the group's stop."""
+    kill = os.killpg
+    _, argv = a_start(tmp_path, monkeypatch, STACK)
+    monkeypatch.setattr(os, "killpg", kill)
+    monkeypatch.setattr(serve, "STOP_GRACE_S", 1)
+    members, leader, ended = (tmp_path / n for n in ("members", "leader", "ended"))
+    group = [sys.executable, "-c", GROUP + "import time\ntime.sleep(600)\n"]
+
+    def popen(command, **kwargs):
+        engine = subprocess.Popen([*group, str(members), "stays"], **kwargs)
+        leader.write_text(str(engine.pid))
+        return engine
+
+    monkeypatch.setattr(measure_memory.subprocess, "Popen", popen)
+    child = os.fork()
+    if child == 0:
+        try:
+            measure_memory.main(argv)
+            ended.write_text("published")
+        except (ValueError, KeyboardInterrupt) as e:
+            ended.write_text(repr(e))
+        finally:
+            os._exit(0)
+    try:
+        _until(lambda: leader.exists() and members.exists() and members.read_text())
+        for i, sig in enumerate(signals):
+            if i:
+                _until(lambda: _state(leader.read_text()) in (None, "Z"))
+            os.kill(child, sig)
+        status = os.waitpid(child, 0)[1]
+        left = [p for p in members.read_text().split() if _state(p) not in (None, "Z")]
+    finally:
+        with contextlib.suppress(ProcessLookupError, ChildProcessError):
+            os.kill(child, signal.SIGKILL)
+            os.waitpid(child, 0)
+        with contextlib.suppress(ProcessLookupError, FileNotFoundError, ValueError):
+            kill(int(leader.read_text()), signal.SIGKILL)
+
+    assert left == []
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert ended.read_text() == repr(
+        ValueError(f"{signals[0].name} stopped the command; nothing is published")
+    )
+    assert not (tmp_path / "s").exists()
 
 
 def starts_autotuning(monkeypatch, r, out, autotuned, field="autotuned_kernels"):

@@ -17,6 +17,13 @@
 #                    rapidserve: -tp 1 --enable-rapidserve, eager at compile
 #                    level 0; each engine records, and is compared, in its own
 #                    prefill/ and decode/.
+#                    dp-two-trees: tp2 as two process trees standing in for two
+#                    nodes, each --data-parallel-size 2 --data-parallel-size-local 1
+#                    at --data-parallel-rank 0 and 1, so four DP ranks in all; tree
+#                    k on GPUs 2k and 2k+1 of HIP_VISIBLE_DEVICES (default 0,1,2,3),
+#                    the traffic to rank 0's server, the simulated trees on an
+#                    authority of their own. Memory is measured on one tree at
+#                    --data-parallel-size 2 on all four GPUs.
 #                    pp2: -pp 2 at -tp 1, eager at compile level 0, on two GPUs;
 #                    each stage is replayed from its own record and compared in
 #                    compare-pp<k>.json: the head's batches are the scheduler's
@@ -76,12 +83,12 @@ compass_env "$ROOT"
 compass_require_tree "$ROOT" || exit $?
 OUT=${1:?usage: parity_one_node.sh OUT_DIR}
 MODEL=${MODEL:?MODEL names the model directory}
-DPA=--enable-dp-attention SIDES=. PP=1
+DPA=--enable-dp-attention SIDES=. PP=1 PPA=
 case ${CONFIG:=tp2} in
-tp2 | tp2-plain)
+tp2 | tp2-plain | dp-two-trees)
     TP=2 ARGS="--enforce-eager --max-model-len 8192 --no-enable_prefix_caching"
     MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
-    [[ $CONFIG == tp2 ]] || DPA=
+    [[ $CONFIG == tp2-plain ]] && DPA=
     ;;
 dsv4-dpa8)
     TP=8 ARGS="--trust-remote-code --no-enable_prefix_caching --kv_cache_dtype fp8
@@ -95,13 +102,21 @@ rapidserve)
     MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
     ;;
 pp2)
-    TP=1 DPA= PP=2 ARGS="--enforce-eager --level 0 --max-model-len 8192 --no-enable_prefix_caching"
+    TP=1 DPA= PP=2 PPA="-pp 2" ARGS="--enforce-eager --level 0 --max-model-len 8192 --no-enable_prefix_caching"
     MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog39.json}
     ;;
-*) echo "parity_one_node: CONFIG is tp2, tp2-plain, dsv4-dpa8, rapidserve or pp2, not $CONFIG" >&2; exit 2 ;;
+*) echo "parity_one_node: CONFIG is tp2, tp2-plain, dp-two-trees, dsv4-dpa8, rapidserve or pp2, not $CONFIG" >&2; exit 2 ;;
 esac
-SERVER_ARGS=${SERVER_ARGS:-$ARGS} PPA=
-((PP == 1)) || PPA="-pp $PP"
+TREES=1 MEASURE_DP=
+if [[ $CONFIG == dp-two-trees ]]; then
+    TREES=2 MEASURE_DP="--data-parallel-size 2"
+    IFS=, read -ra CARDS <<<"${HIP_VISIBLE_DEVICES:=0,1,2,3}"
+    ((${#CARDS[@]} == 4)) || {
+        echo "parity_one_node: dp-two-trees runs on four GPUs, not $HIP_VISIBLE_DEVICES" >&2
+        exit 2
+    }
+fi
+SERVER_ARGS=${SERVER_ARGS:-$ARGS}
 WAIT_S=${WAIT_S:-1800}
 ALONE=${ALONE:-0} GAP=0.05
 [[ $ALONE == 1 ]] && GAP=0.25
@@ -127,36 +142,69 @@ if [[ -z ${STORE:-} ]]; then
         --gpu "$gpus" --machine "$MACHINE" \
         ${LM_FLAGS:+--beside "lmcache server $LM_FLAGS"} \
         --store "$STORE" --out "$OUT/memory" -- --model "$MODEL" -tp "$TP" \
-        $PPA $DPA $SERVER_ARGS
+        $PPA $DPA $MEASURE_DP $SERVER_ARGS
 fi
 
-server= lmcache=
-trap 'kill -KILL -- ${server:+-$server} ${lmcache:+-$lmcache} 2>/dev/null || true' EXIT
-# serve SIDE [FLAGS...]: an API server recording to OUT/SIDE/record, in its own
-# process group; returns once it listens.
+servers=() authority= lmcache=
+trap 'kill -KILL -- ${servers[*]/#/-} ${authority:+-$authority} ${lmcache:+-$lmcache} 2>/dev/null || true' EXIT
+# serve SIDE [FLAGS...]: an API server per tree recording to OUT/SIDE/record,
+# each in its own process group; returns once rank 0's listens. Tree k above 0
+# logs to server<k>.log.
 serve() {
-    local side=$1 deadline=$((SECONDS + WAIT_S))
+    local side=$1 deadline=$((SECONDS + WAIT_S)) master base k log port devices dp pid
     shift
-    PORT=$(compass_free_port)
-    # shellcheck disable=SC2086 # SERVER_ARGS is a word list
-    ATOM_DP_MASTER_PORT=$(compass_free_port) ATOM_COMPASS_PARITY_RECORD=$OUT/$side/record setsid \
-        python3 -m atom.entrypoints.openai.api_server --model "$MODEL" --host 127.0.0.1 \
-        --server-port "$PORT" --port "$(compass_free_port)" -tp "$TP" $PPA $DPA \
-        $SERVER_ARGS "$@" \
-        >"$OUT/$side/server.log" 2>&1 &
-    server=$!
+    PORT=$(compass_free_port) servers=()
+    # The DP master port, the engine sockets across trees 100 above it (3 for
+    # each of four ranks) and the base port 112 above it: all free, and below
+    # the ephemeral range, so no connection's source port takes one of them
+    # before its server binds it.
+    master=$(python3 -c 'import random, socket
+low = int(open("/proc/sys/net/ipv4/ip_local_port_range").read().split()[0])
+def free(p):
+    with socket.socket() as s:
+        try:
+            s.bind(("", p))
+        except OSError:
+            return False
+    return True
+while not all(map(free, range(p := random.randrange(low // 2, low - 113), p + 113))):
+    pass
+print(p)')
+    base=$((master + 112))
+    for ((k = 0; k < TREES; k++)); do
+        log=$OUT/$side/server.log port=$PORT devices=() dp=()
+        if ((TREES > 1)); then
+            ((k == 0)) || log=$OUT/$side/server$k.log port=$(compass_free_port)
+            devices=(HIP_VISIBLE_DEVICES="${CARDS[2 * k]},${CARDS[2 * k + 1]}")
+            dp=(--data-parallel-size "$TREES" --data-parallel-size-local 1
+                --data-parallel-rank "$k" --data-parallel-base-port "$base")
+        fi
+        # shellcheck disable=SC2086 # SERVER_ARGS is a word list
+        env ATOM_DP_MASTER_PORT="$master" ATOM_COMPASS_PARITY_RECORD="$OUT/$side/record" \
+            "${devices[@]}" setsid python3 -m atom.entrypoints.openai.api_server \
+            --model "$MODEL" --host 127.0.0.1 --server-port "$port" \
+            --port "$(compass_free_port)" -tp "$TP" $PPA $DPA "${dp[@]}" $SERVER_ARGS "$@" \
+            >"$log" 2>&1 &
+        servers+=($!)
+    done
     until grep -qs "Uvicorn running" "$OUT/$side/server.log"; do
-        kill -0 $server 2>/dev/null || { echo "parity_one_node: the $side server exited" >&2; exit 1; }
+        for pid in "${servers[@]}"; do
+            kill -0 "$pid" 2>/dev/null || { echo "parity_one_node: a $side server exited" >&2; exit 1; }
+        done
         ((SECONDS < deadline)) || { echo "parity_one_node: no $side server after $WAIT_S s" >&2; exit 1; }
         sleep 1
     done
 }
-# leave SIDE: wait up to WAIT_S for the server to exit.
+# leave SIDE: wait up to WAIT_S for every server, and the authority, to exit.
 leave() {
-    local deadline=$((SECONDS + WAIT_S))
-    while kill -0 $server 2>/dev/null; do
-        ((SECONDS < deadline)) || { echo "parity_one_node: the $1 server is still up" >&2; exit 1; }
-        sleep 1
+    local deadline=$((SECONDS + WAIT_S)) pid what
+    for pid in "${servers[@]}" $authority; do
+        what="a $1 server"
+        [[ $pid == "$authority" ]] && what="the authority"
+        while kill -0 "$pid" 2>/dev/null; do
+            ((SECONDS < deadline)) || { echo "parity_one_node: $what is still up" >&2; exit 1; }
+            sleep 1
+        done
     done
 }
 
@@ -171,7 +219,7 @@ python3 -m atom.compass.parity.traffic "$PORT" "$MODEL" "$OUT/real/record" \
     "${FAMILIES:-1}" \
     >"$OUT/real/traffic.log" 2>&1
 # The record's last lines are written as the workers exit.
-kill -TERM -- -$server
+kill -TERM -- "${servers[@]/#/-}"
 leave real
 if [[ -n $lmcache ]]; then
     kill -KILL -- -$lmcache
@@ -184,8 +232,8 @@ for side in $SIDES; do
     cp "$OUT/real/record/arrivals.json" "$OUT/real/record/$side"
 done
 
-RUN=$OUT/sim/run.json
-python3 - "$RUN" "$OUT" "$MACHINE" "$MODEL" "$STORE" "$(compass_free_port)" "${DPA:+$TP}" \
+RUN=$OUT/sim/run.json CLOCK_PORT=$(compass_free_port)
+python3 - "$RUN" "$OUT" "$MACHINE" "$MODEL" "$STORE" "$CLOCK_PORT" "${DPA:+$((TP * TREES))}" \
     "$LM_FLAGS" "${IMAGE_S:-0.01}" "$TP" "$SIDES" "$PP" <<'EOF'
 import json, re, sys
 from pathlib import Path
@@ -221,12 +269,27 @@ if lmcache:
     spec["lmcache"]["state_bytes"] = int(image[0]) if image else 0
 Path(run).write_text(json.dumps(spec))
 EOF
-serve sim --compass-run "$RUN"
+CLOCK=()
+if ((TREES > 1)); then
+    # The trees share one authority, started on its own.
+    CLOCK=(--compass-clock-endpoint "tcp://127.0.0.1:$CLOCK_PORT")
+    setsid python3 -m atom.compass.run --compass-run "$RUN" "${CLOCK[@]}" \
+        >"$OUT/sim/authority.log" 2>&1 &
+    authority=$!
+    until (exec 3<>"/dev/tcp/127.0.0.1/$CLOCK_PORT") 2>/dev/null; do
+        kill -0 $authority 2>/dev/null || { echo "parity_one_node: the authority exited" >&2; exit 1; }
+        sleep 0.2
+    done
+fi
+serve sim --compass-run "$RUN" "${CLOCK[@]}"
 ATOM_COMPASS_RUN=$RUN python3 -m atom.compass.parity.traffic "$PORT" "$MODEL" \
     "$OUT/real/record" >"$OUT/sim/traffic.log" 2>&1 || sim_rc=$?
 leave sim
-wait $server || sim_rc=${sim_rc:-$?}
-refused=$(grep -ohm1 "replay: .* has [0-9]* steps, and this is step [0-9]*" "$OUT/sim/server.log" || true)
+for pid in "${servers[@]}" $authority; do
+    wait "$pid" || sim_rc=${sim_rc:-$?}
+done
+refused=$(grep -ohm1 "replay: .* has [0-9]* steps, and this is step [0-9]*" \
+    "$OUT"/sim/server*.log | head -1 || true)
 if [[ -n $refused ]]; then
     echo "parity_one_node: the simulated run ended at the $refused"
 elif [[ -n ${sim_rc:-} ]]; then
@@ -261,6 +324,11 @@ for path in sorted(Path(out).glob("compare*.json")):
         label = f"{engine} " if engine else ""
         print(f"parity_one_node: {label}dp{rank} compared={n['compared']} "
               f"identical={n['identical']} first_divergence={first and first['step']}")
+    if placed := report.get("request_dp_rank"):
+        real, sim = placed["real"], placed["simulated"]
+        moved = sorted(k for k in real.keys() | sim.keys() if real.get(k) != sim.get(k))
+        print(f"parity_one_node: {label}{len(moved)} of {len(real)} requests on "
+              f"another DP rank simulated: {moved}")
 decisions = []  # per record: request key -> its offload loads and saves, in order
 for side in ("real", "sim"):
     mine = {}
