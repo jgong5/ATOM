@@ -48,7 +48,6 @@ from test_vertical_slice import (
     DOCUMENT,
     MODEL,
     TREE,
-    _free_port,
     _retry,
     _run_file,
 )
@@ -56,7 +55,7 @@ from test_vertical_slice import (
 from atom.compass import run as compass_run
 from atom.compass.clock import LpId, prefill_decode_table
 from atom.compass.detect.scenario import check_run
-from atom.compass.drive.serve import _free_ports
+from atom.compass.drive.serve import DEPLOY_PORTS, _free_ports, below_ephemeral
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.utils.clock import LPRuntime
 
@@ -419,13 +418,16 @@ OFFSETS = {
 
 
 def _free_block(n: int) -> int:
-    """The first of `n` consecutive ports nothing listens on."""
+    """The first of `n` consecutive ports nothing listens on, below the
+    ephemeral range, so no outgoing connection or bind to port 0 takes one
+    before its server binds it."""
+    room = below_ephemeral(DEPLOY_PORTS)
     while True:
-        base, free = _free_port(), True
+        base, free = random.randrange(room.start, room.stop - n + 1), True
         for p in range(base, base + n):
             with socket.socket() as s:
                 free = free and s.connect_ex(("127.0.0.1", p)) != 0
-        if free and base + n < 65536:
+        if free:
             return base
 
 
