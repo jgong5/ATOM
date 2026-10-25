@@ -5,7 +5,8 @@
 
 Each argument is a run directory: its step record in `steps/` and aiperf's
 export in `artifacts/profile_export_aiperf.json`. SIMULATED is the cell at its
-backend, and REAL two or more real runs of it, spaced in time.
+backend, and REAL two or more real runs of it, spaced in time. A run with no
+export yet, one still recording, is refused by name.
 
 A directory `cctraces_sim.sh` wrote is graded as below when it holds
 `artifacts/client_run.json`, whole when it does not. When a real run is graded
@@ -451,6 +452,11 @@ def grade(real_cells, simulated_cell) -> dict:
     if len(real_cells) < 2:
         names = [str(c) for c in real_cells]
         raise ValueError(f"{names}: a real spread needs two or more real runs")
+    cells = (*real_cells, simulated_cell)
+    if bare := [str(c) for c in cells if not (Path(c) / EXPORT).is_file()]:
+        raise ValueError(
+            f"{bare} hold no {EXPORT}; a run still recording is not graded"
+        )
     _refuse_by_run_file(simulated_cell)
     whole = graded_whole(real_cells)
     real = [_read(c, whole) for c in real_cells]
