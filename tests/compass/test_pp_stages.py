@@ -13,10 +13,12 @@ The run test needs a driver and `ATOM_COMPASS_SLICE_MODEL`, as in
 """
 
 import json
+import pickle
 import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 from test_dp_slice import (  # noqa: F401
     DP_MACHINE,
     MAX_TOKENS,
@@ -24,7 +26,7 @@ from test_dp_slice import (  # noqa: F401
     device_classes_put_back,
     run_dp_slice,
 )
-from test_vertical_slice import CONSTANT, NEEDS_A_RUN, _run_file
+from test_vertical_slice import CONSTANT, MODEL, NEEDS_A_RUN, _run_file
 
 from atom.compass import run as compass_run
 from atom.compass.clock import LpId, single_engine_table
@@ -54,12 +56,35 @@ def pipeline(request, tmp_path_factory):
     ]
 
 
+def _model_sends():
+    """The slice model's layer count, and a stage's send of a `tokens`-row
+    forward as the runner sizes it: the size and the pickled metadata on gloo,
+    `hidden_states` and `residual` on RCCL."""
+    from atom.config import get_hf_config
+    from atom.distributed import pp_comm
+
+    hf = get_hf_config(MODEL)
+    dtype = getattr(hf, "dtype", None) or torch.bfloat16
+
+    def parts(tokens):
+        x = torch.empty(tokens, hf.hidden_size, dtype=dtype, device="meta")
+        meta, tensors = pp_comm._split_tensor_dict({"hidden_states": x, "residual": x})
+        rccl = [("rccl", t.nbytes) for t in tensors]
+        return [("gloo", 8), ("gloo", len(pickle.dumps(meta))), *rccl]
+
+    return hf.num_hidden_layers, parts
+
+
 @NEEDS_A_RUN
 def test_a_pipeline_meets_the_run_properties_and_uses_every_stage_channel(pipeline):
     pp, runs = pipeline
     print(f"\n{runs[0]['table']}")
     failed = check_run(
-        [r["out"] for r in runs], MAX_TOKENS, [line for _, line in runs[0]["events"]]
+        [r["out"] for r in runs],
+        MAX_TOKENS,
+        [line for _, line in runs[0]["events"]],
+        {"engine": runs[0]["out"] / "parity"},
+        _model_sends(),
     )
     assert not failed, "\n".join(failed)
     rows = [line.split() for line in runs[0]["table"].splitlines()[1:]]

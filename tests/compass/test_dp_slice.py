@@ -124,7 +124,7 @@ def run_dp_slice(
     """One run in its own process tree: its step table, summary, parity record.
 
     `width` is the server's parallelism flags, `dp` the DP ranks and `pp` the
-    pipeline stages they start; a pipeline keeps no parity record."""
+    pipeline stages they start; the parity record holds every stage's."""
     out.mkdir()
     clock_port, port = _free_ports(2)
     run_file = _run_file(
@@ -140,9 +140,8 @@ def run_dp_slice(
         PYTHONHASHSEED=seed,
         PYTHONPATH=str(TREE),
         AITER_LOG_LEVEL="WARNING",
+        ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
     )
-    if pp == 1:
-        env["ATOM_COMPASS_PARITY_RECORD"] = str(out / "parity")
     args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
     args += width
     args += ["--enforce-eager", "--max-model-len", "2048"]
@@ -173,7 +172,7 @@ def run_dp_slice(
         "table": (out / compass_run.STEP_TABLE_FILE).read_text(),
         "summary": json.loads((out / compass_run.SUMMARY_FILE).read_text()),
         "events": traffic.events,
-        "parity": read(out / "parity") if pp == 1 else None,
+        "parity": read(out / "parity"),
     }
 
 
