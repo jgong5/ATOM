@@ -144,22 +144,24 @@ trap 'kill -KILL -- ${servers[*]/#/-} ${authority:+-$authority} ${lmcache:+-$lmc
 serve() {
     local side=$1 deadline=$((SECONDS + WAIT_S)) master base k log port devices dp pid
     shift
-    PORT=$(compass_free_port) base=$(compass_free_port) servers=()
-    # A DP master port whose engine sockets across trees, 100 above it and 3 for
-    # each of four ranks, are free too.
-    master=$(python3 -c 'import socket
+    PORT=$(compass_free_port) servers=()
+    # The DP master port, the engine sockets across trees 100 above it (3 for
+    # each of four ranks) and the base port 112 above it: all free, and below
+    # the ephemeral range, so no connection's source port takes one of them
+    # before its server binds it.
+    master=$(python3 -c 'import random, socket
+low = int(open("/proc/sys/net/ipv4/ip_local_port_range").read().split()[0])
 def free(p):
     with socket.socket() as s:
         try:
-            s.bind(("127.0.0.1", p))
+            s.bind(("", p))
         except OSError:
             return False
     return True
-while True:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]
-    if p + 112 < 65536 and all(map(free, range(p + 100, p + 112))):
-        print(p); break')
+while not all(map(free, range(p := random.randrange(low // 2, low - 113), p + 113))):
+    pass
+print(p)')
+    base=$((master + 112))
     for ((k = 0; k < TREES; k++)); do
         log=$OUT/$side/server.log port=$PORT devices=() dp=()
         if ((TREES > 1)); then

@@ -140,6 +140,9 @@ def test_dp_two_trees_runs_two_rank_pairs_on_their_own_gpus_and_one_authority(
     env = [e.split() for e in (tmp_path / "servers.log.env").read_text().splitlines()]
     assert [e[0] for e in env] == ["4,5", "6,7"] * 2
     assert env[0][1] == env[1][1] != env[2][1] == env[3][1]
+    # Below the ephemeral range, with the base port and engine sockets above it.
+    low = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()[0]
+    assert int(env[2][1]) + 112 == int(trees[0][6]) < int(low)  # the simulated side
     assert json.loads(run.read_text())["data_parallel_size"] == 4
 
 
