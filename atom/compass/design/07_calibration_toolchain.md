@@ -339,6 +339,11 @@ kernel then waits about 0.3 µs longer for its arguments, about 80 µs on a repl
 calls, +19% on a 0.5 ms graph and about +1% on GEMMs already past twice the cache; on
 MI308X the read leaves them cached
 ([root cause](https://github.com/jgong5/ATOM/issues/2019#issuecomment-6378825038)).
+ATOM's own decode step leaves them cold as well: DeepSeek-V4-Pro on eight MI355X moved
++16.4, -1.3 and -6.9 µs at B = 1, 16 and 128 with the same read before each step, inside
+its repeat spread, against 0.72 to 0.79 ms had they stayed cached
+([(d)](https://github.com/jgong5/ATOM/pull/2038#issuecomment-6398675137)), so a cold price
+includes the wait.
 Without the eviction a leaf whose
 `CALLS` copies stay under twice the cache read warm: `indexer_score_topk` at
 DeepSeek-V4-Pro decode B=16 on MI355X, 90 MB of copies, read `warm_over_cold` 0.939
