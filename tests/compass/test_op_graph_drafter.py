@@ -167,11 +167,11 @@ def test_a_run_prices_a_verify_step_s_drafter_from_its_own_graph(ep, tmp_path_fa
     [drafter] = [graph for key, graph in graphs.items() if key.endswith(" draft")]
     cost, drafted = _priced(root, drafter, VERIFY, ep)
 
-    assert {t.name: t.seconds for t in cost.terms if t.draft} == drafted(ep)
+    assert {t.name: t.seconds for t in cost.draft_terms} == drafted(ep)
     # The drafter's experts run over the target's EP ranks, as ATOM builds them.
     moe = f"draft op.{MOE}"
     assert (drafted(ep)[moe] == drafted(1)[moe]) == (ep == 1)
-    assert f"op.{SAMPLER}" in {t.name for t in cost.terms if not t.draft}
+    assert f"op.{SAMPLER}" in {t.name for t in cost.terms}
 
 
 def test_a_middle_chunk_is_cut_where_its_draft_kv_pass_starts(tmp_path_factory):
@@ -202,7 +202,7 @@ def test_a_run_prices_a_middle_chunk_s_draft_kv_pass_from_its_own_graph(
     ]
     cost, drafted = _priced(root, drafter, CHUNK)
 
-    assert {t.name: t.seconds for t in cost.terms if t.draft} == drafted(1)
+    assert {t.name: t.seconds for t in cost.draft_terms} == drafted(1)
 
 
 def test_a_block_drafter_is_refused_by_name_before_any_step():
@@ -478,11 +478,11 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
     step = projection.batch_view(batch, mode, r)
     cost, drafted = _priced(root, graphs[f"{middle} draft"], step, dp=2)
 
-    assert cost.terms[-1].provenance.detail.endswith(
+    assert cost.draft_terms[-1].provenance.detail.endswith(
         "prefill T=64 B=1 G=128 that produces no output"
     )
     assert cost.target_seconds > 0
-    assert {t.name: t.seconds for t in cost.terms if t.draft} == drafted(1)
+    assert {t.name: t.seconds for t in cost.draft_terms} == drafted(1)
 
 
 # --- a decode padded to its rung ----------------------------------------------

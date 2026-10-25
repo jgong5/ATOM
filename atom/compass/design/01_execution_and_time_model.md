@@ -1490,7 +1490,7 @@ it waits for tokens, a later stage once `recv_metadata`'s 100 ms poll times out 
 #1450, #1457). The record stamps each idle `flush_pp_send` that settles a send, and the
 gate names, per sending stage, the steps where the two disagree (#1532).
 A simulated run prices a speculative step with `D_target` and `D_draft` from the cost
-backend, its terms tagged `draft` making the latter, and R1 holds its launch with MTP
+backend, its `draft_terms` making the latter, and R1 holds its launch with MTP
 ([#1090](https://github.com/jgong5/ATOM/issues/1090)). Under DP, each forward's
 `target_end` joins the device end's `all_reduce(MAX)` under MTP, and each rank writes the
 group's latest back as its output end. Its accepted drafts are `14` D83's draw.

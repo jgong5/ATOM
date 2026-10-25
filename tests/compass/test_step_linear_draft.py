@@ -70,7 +70,7 @@ def test_an_mtp_record_fits_a_draft_law_that_prices_each_forward_apart(tmp_path)
         cost = backend.price(_output(rows, rung))
         assert cost.target_seconds == pytest.approx(seconds, rel=1e-5)
         assert cost.draft_seconds == pytest.approx(SHARE * seconds, rel=1e-5)
-        drafts = [t.name for t in cost.terms if t.draft]
+        drafts = [t.name for t in cost.draft_terms]
         assert drafts and all(n.startswith("draft.") for n in drafts)
 
     # A middle chunk's draft is its draft-KV pass, priced by the draft vector.
@@ -169,11 +169,8 @@ class _DeclaredDraft:
     def price(self, view):
         cost = self.law.price(view)
         said = Provenance(Method.DECLARED, note="stated")
-        terms = [
-            dataclasses.replace(t, provenance=said) if t.draft else t
-            for t in cost.terms
-        ]
-        return StepCost(terms, cost.treatments)
+        drafts = [dataclasses.replace(t, provenance=said) for t in cost.draft_terms]
+        return StepCost(cost.terms, cost.treatments, drafts)
 
     def describe(self):
         return "planted, with a declared draft"
@@ -197,8 +194,8 @@ class _DraftDearestWhenCheapest:
     def price(self, view):
         cost = self.law.price(view)
         made = cost.terms[0].provenance
-        draft = CostTerm("draft", 1.0 / cost.target_seconds, made, draft=True)
-        return StepCost([*cost.terms, draft], cost.treatments)
+        draft = CostTerm("draft", 1.0 / cost.target_seconds, made)
+        return StepCost(cost.terms, cost.treatments, [*cost.draft_terms, draft])
 
     def describe(self):
         return "planted, with a draft"

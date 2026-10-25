@@ -73,9 +73,6 @@ class CostTerm:
     `attention.decode` under `attention` -- rather than nesting, because the
     consumers of a breakdown want to group and sum, not to walk a tree.
 
-    `draft` tags a speculative drafter's device work, which runs after the
-    target's; every other term is the target's.
-
     `by_bound` is a roofline term's seconds by the part of its prices that set
     them (`work.parts`), summing to `seconds`; empty when no roofline part
     sets them, as for a measured price or an overlapped step.
@@ -84,7 +81,6 @@ class CostTerm:
     name: str
     seconds: float
     provenance: Provenance
-    draft: bool = False
     by_bound: Mapping[str, float] = field(default_factory=dict, hash=False)
 
     def __post_init__(self) -> None:
@@ -136,6 +132,11 @@ def _checked(terms: Sequence[CostTerm]) -> tuple[CostTerm, ...]:
     return terms
 
 
+def _every(cost: StepCost) -> tuple[CostTerm, ...]:
+    """`cost.terms`, never empty, then `cost.draft_terms`, checked."""
+    return _checked(cost.terms) and _checked((*cost.terms, *cost.draft_terms))
+
+
 @dataclass(frozen=True)
 class StepCost:
     """What one step costs, and what that cost is made of.
@@ -147,16 +148,25 @@ class StepCost:
     `treatments` names each assumed treatment the step was priced under: a
     factor that moves cost and that no feature of the query carries. It
     belongs to the query, so no term's method changes with it.
+
+    `terms` are the target's device work; `draft_terms` a speculative
+    drafter's, which runs after the target's. A name is used once across both.
     """
 
     terms: tuple[CostTerm, ...]
     treatments: tuple[str, ...]
+    draft_terms: tuple[CostTerm, ...]
 
     def __init__(
-        self, terms: Sequence[CostTerm], treatments: Sequence[str] = ()
+        self,
+        terms: Sequence[CostTerm],
+        treatments: Sequence[str] = (),
+        draft_terms: Sequence[CostTerm] = (),
     ) -> None:
-        object.__setattr__(self, "terms", _checked(terms))
+        object.__setattr__(self, "terms", tuple(terms))
         object.__setattr__(self, "treatments", tuple(treatments))
+        object.__setattr__(self, "draft_terms", tuple(draft_terms))
+        _every(self)
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         """Refuse a subclass that shadows anything this class reports.
@@ -187,27 +197,27 @@ class StepCost:
     @property
     def seconds(self) -> float:
         """The total, folded from the terms in their stored order."""
-        return fold_seconds(term.seconds for term in _checked(self.terms))
+        return fold_seconds(term.seconds for term in _every(self))
 
     @property
     def target_seconds(self) -> float:
-        """The fold of the terms not tagged `draft`."""
-        return fold_seconds(t.seconds for t in _checked(self.terms) if not t.draft)
+        """The fold of `terms`."""
+        return fold_seconds(t.seconds for t in _checked(self.terms))
 
     @property
     def draft_seconds(self) -> float:
-        """The fold of the terms tagged `draft`."""
-        return fold_seconds(t.seconds for t in _checked(self.terms) if t.draft)
+        """The fold of `draft_terms`."""
+        return fold_seconds(t.seconds for t in _every(self)[len(self.terms) :])
 
     @property
     def refusals(self) -> tuple[Refusal, ...]:
         """Every refusal behind this step, term order then chain order."""
-        return tuple(r for term in self.terms for r in term.refusals)
+        return tuple(r for term in _every(self) for r in term.refusals)
 
     @property
     def fell_back(self) -> bool:
         """Whether a fallback priced some term after a source declined it."""
-        return any(t.provenance.is_refused for t in self.terms)
+        return any(t.provenance.is_refused for t in _every(self))
 
     @property
     def fallback_seconds(self) -> float:
@@ -216,7 +226,7 @@ class StepCost:
         Reported alongside the count because they answer different questions:
         a run can fall back on 2% of its steps and 40% of its time.
         """
-        return fold_seconds(t.seconds for t in self.terms if t.provenance.is_refused)
+        return fold_seconds(t.seconds for t in _every(self) if t.provenance.is_refused)
 
     def seconds_by_method(self) -> Mapping[tuple[Method, bool], float]:
         """Seconds grouped by (method, validated), terms in stored order.
@@ -230,16 +240,14 @@ class StepCost:
         re-folds to the total, and is what a reader checks a total against.
         """
         grouped: dict[tuple[Method, bool], list[float]] = {}
-        for term in self.terms:
+        for term in _every(self):
             key = (term.provenance.method, term.provenance.validated)
             grouped.setdefault(key, []).append(term.seconds)
         return {key: fold_seconds(vals) for key, vals in grouped.items()}
 
     def rows(self) -> tuple[tuple[str, float, str], ...]:
         """The breakdown as an artifact writes it: name, seconds, provenance."""
-        return tuple(
-            (t.name, t.seconds, str(t.provenance)) for t in _checked(self.terms)
-        )
+        return tuple((t.name, t.seconds, str(t.provenance)) for t in _every(self))
 
 
 #: The treatment of a DP dummy forward that replays no graph, priced 0 s.
@@ -294,7 +302,7 @@ class ProvenanceMix:
         self.steps += 1
         self.treatments.update(step.treatments)
         self.seconds = fold_step(self.seconds, step.seconds)
-        self.extrapolated_steps += any(t.provenance.extrapolated for t in step.terms)
+        self.extrapolated_steps += any(t.provenance.extrapolated for t in _every(step))
         if step.fell_back:
             self.fallback_steps += 1
             self.fallback_seconds = fold_step(
