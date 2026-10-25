@@ -1524,7 +1524,13 @@ cost error. T97 records settling the thresholds.
 
 **Accepted approximations**, each added back only if that check shows its error: TP ranks
 are symmetric; PP send backpressure; the MTP plus DP draft barrier; the overlaps of the
-copy stream, staging and `prep_stream`. One more follows from #815's ruling 2, which
+copy stream, staging and `prep_stream`; the device work an MTP decode's prepare queues
+ahead of its launch (metadata uploads, the SWA cursor probe, index and input-id fills), so
+a launch that finds the device busy starts its device early by that work: busy-launch
+decodes measure -0.27% (#1608) and -0.16% (the third DSpark record) at p50 at `fffff70db`,
+and the work is added back if a later record's busy-launch decodes miss the band (owner
+ruling on [#2092](https://github.com/jgong5/ATOM/issues/2092#issuecomment-6397638783),
+2026-10-25). One more follows from #815's ruling 2, which
 makes `E` the recurrence's first term: `E` is charged inside forward `n`'s TAR, but
 `scheduler.postprocess()` and `schedule()` run before the forward is called, at `now`, so
 their clock reads (the first-token stamps, the waiting-prefill age, the arrivals a
