@@ -16,6 +16,10 @@ from pathlib import Path
 import pytest
 from test_drive_gpu import GPU45, SHOWHW
 
+from atom.compass.artifacts import machine_spec_key
+from atom.compass.runner.pp_send import carrier_models
+from atom.compass.spec import MachineSpec
+
 ROOT = Path(__file__).resolve().parents[2]
 STUB = """#!/bin/bash
 case "$1 $2" in
@@ -235,7 +239,7 @@ def test_rapidserve_measures_a_rapidserve_engine_and_compares_each_engine(tmp_pa
 def test_pp2_runs_two_stages_on_two_gpus_and_compares_each_stage(tmp_path):
     r, servers, run = _parity(tmp_path, CONFIG="pp2", STORE=None)
     assert r.returncode == 0, r.stderr
-    machine = ROOT / "scripts/compass/machines/mi308x-hjbog39.json"
+    machine = ROOT / "scripts/compass/machines/mi308x-hjbog18.json"
     assert f" measure memory --gpu 0,1 --machine {machine} " in servers[0]
     assert len(servers) == 3
     for line in servers:
@@ -243,6 +247,10 @@ def test_pp2_runs_two_stages_on_two_gpus_and_compares_each_stage(tmp_path):
     spec = json.loads(run.read_text())
     assert spec["pipeline_parallel_size"] == 2 and spec["data_parallel_size"] == 1
     assert spec["machine"]["name"] == json.loads(machine.read_text())["name"]
+    # Node 18's cards read PTL enabled, and a stage send is priced on each carrier.
+    stated = MachineSpec.from_mapping(spec["machine"])
+    assert machine_spec_key(stated).values["ptl"] == "enabled"
+    assert set(carrier_models(stated)) == {"rccl", "gloo"}
     compares = (tmp_path / "servers.log.compare").read_text().splitlines()
     assert [c.rsplit(" --stage ", 1)[1] for c in compares] == ["0", "1"]
     assert r.stdout.splitlines()[-2:] == [
