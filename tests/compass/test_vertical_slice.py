@@ -14,6 +14,7 @@ also skip without `ATOM_COMPASS_SLICE_MODEL`, a model directory holding a
 config and a tokenizer; no weight is read.
 """
 
+import argparse
 import dataclasses
 import http.client
 import json
@@ -26,10 +27,11 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
-from test_memory_readings import DOCUMENT, META_8B, TOKENIZER
+from test_memory_readings import DOCUMENT, META_8B, TOKENIZER, publish_readings
 
 from atom.compass import run as compass_run
 from atom.compass.backends.step_stub import Coefficients
@@ -219,6 +221,27 @@ def _run_file(out: Path, **overrides) -> Path:
     return out / "run.json"
 
 
+def publish_entry(store, machine, argv, env) -> None:
+    """Publish in `store` the `memory_readings` entry of the configuration
+    ATOM's server resolves from its flags `argv` in the environment `env` on
+    `machine`, as `compass measure memory` leaves it, so that a run reading
+    `store` starts."""
+    from atom.config import Config
+    from atom.model_engine.arg_utils import EngineArgs
+
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    EngineArgs.add_cli_args(parser)
+    # The server's own flags, such as its port, are not the engine's.
+    args, _ = parser.parse_known_args(argv)
+    kwargs = EngineArgs.from_cli_args(args)._get_engine_kwargs()
+    names = {f.name for f in dataclasses.fields(Config)}
+    # The key holds the config as the server resolves it, and its performance
+    # environment.
+    with mock.patch.dict(os.environ, env, clear=True):
+        config = Config(args.model, **{k: v for k, v in kwargs.items() if k in names})
+        publish_readings(store, config, document=machine)
+
+
 def run_slice(out: Path, seed: str) -> dict:
     """One run in its own process tree; its step table, summary and request times."""
     out.mkdir()
@@ -232,24 +255,13 @@ def run_slice(out: Path, seed: str) -> dict:
         AITER_LOG_LEVEL="WARNING",
         ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
     )
+    args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
+    args += ["--enforce-eager", "--max-model-len", "2048"]
+    publish_entry(out / "store", DOCUMENT, args, env)
     with open(out / "server.log", "w") as log:
         server = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "atom.entrypoints.openai.api_server",
-                "--model",
-                MODEL,
-                "--host",
-                "127.0.0.1",
-                "--server-port",
-                str(port),
-                "--enforce-eager",
-                "--max-model-len",
-                "2048",
-                "--compass-run",
-                str(run_file),
-            ],
+            [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
+            + ["--compass-run", str(run_file)],
             cwd=TREE,
             env=env,
             stdout=log,

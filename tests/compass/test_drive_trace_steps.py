@@ -317,7 +317,7 @@ MODEL = os.environ.get("ATOM_COMPASS_SLICE_MODEL")
     reason="needs a driver and ATOM_COMPASS_SLICE_MODEL",
 )
 def test_a_simulated_server_serves_a_client_and_publishes_its_steps(tmp_path):
-    from test_vertical_slice import Traffic
+    from test_vertical_slice import Traffic, publish_entry
 
     machine = copy.deepcopy(DOCUMENT)
     applies = machine["host"]["tokenizers"][0]["applies_to"]
@@ -328,6 +328,7 @@ def test_a_simulated_server_serves_a_client_and_publishes_its_steps(tmp_path):
     argv = ["trace", "steps", "--step-stub", str(stub(tmp_path, 1))]
     argv += ["--machine", str(tmp_path / "machine.json"), "--store", str(store)]
     argv += ["--out", str(out), "--", "--model", MODEL, "--enforce-eager"]
+    publish_entry(store, machine, ["--model", MODEL, "--enforce-eager"], os.environ)
     driver = subprocess.Popen(
         [sys.executable, "-c", "from atom.compass.cli import main; main()", *argv],
         env=dict(os.environ, PYTHONPATH=str(TREE)),

@@ -24,12 +24,14 @@ from pathlib import Path
 
 import pytest
 from test_vertical_slice import (
+    DOCUMENT,
     MODEL,
     NEEDS_A_RUN,
     TREE,
     WALL_S,
     Traffic,
     _run_file,
+    publish_entry,
 )
 
 from atom.compass import run as compass_run
@@ -64,24 +66,13 @@ def serve(out: Path, prompts) -> list[dict]:
         AITER_LOG_LEVEL="WARNING",
         ATOM_DETOKENIZER_DELTA_REUSE="off",
     )
+    args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
+    args += ["--enforce-eager", "--max-model-len", "2048"]
+    publish_entry(out / "store", DOCUMENT, args, env)
     with open(out / "server.log", "w") as log:
         server = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "atom.entrypoints.openai.api_server",
-                "--model",
-                MODEL,
-                "--host",
-                "127.0.0.1",
-                "--server-port",
-                str(port),
-                "--enforce-eager",
-                "--max-model-len",
-                "2048",
-                "--compass-run",
-                str(run_file),
-            ],
+            [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
+            + ["--compass-run", str(run_file)],
             cwd=TREE,
             env=env,
             stdout=log,

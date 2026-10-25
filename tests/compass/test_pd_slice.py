@@ -39,6 +39,7 @@ from conftest import atom_config_double
 from starlette.responses import JSONResponse
 from test_vertical_slice import (
     CONSTANT,
+    DOCUMENT,
     MAX_TOKENS,
     MODEL,
     TREE,
@@ -46,6 +47,7 @@ from test_vertical_slice import (
     Traffic,
     _free_port,
     _run_file,
+    publish_entry,
 )
 
 from atom.compass import clock_transport
@@ -105,6 +107,12 @@ def run_pd(out: Path, seed: str) -> dict:
         DECODE_EXEC=os.environ.get("ATOM_COMPASS_PD_DECODE_EXEC", ""),
         **{name: str(port) for name, port in ports.items()},
     )
+    # Each side as pd_sim.sh starts it, with its default server flags.
+    flags = os.environ.get("SERVER_ARGS", "--enforce-eager --max-model-len 2048")
+    for role in ("kv_producer", "kv_consumer"):
+        kv = json.dumps({"kv_role": role, "kv_connector": "compass"})
+        argv = ["--model", MODEL, *flags.split(), "--kv-transfer-config", kv]
+        publish_entry(out / "store", DOCUMENT, argv, env)
     log = out / "pd_sim.log"
     with open(log, "w") as f:
         sim = subprocess.Popen(
