@@ -186,7 +186,13 @@ print(p)')
             >"$log" 2>&1 &
         servers+=($!)
     done
-    until grep -qs "Uvicorn running" "$OUT/$side/server.log" && grouped; do
+    # A tree that exits before its group exists (a simulated tree listens and
+    # exits) counts as grouped; the loop below judges exits.
+    until grouped; do
+        ((SECONDS < deadline)) || { echo "parity_one_node: no $side server after $WAIT_S s" >&2; exit 1; }
+        sleep 0.1
+    done
+    until grep -qs "Uvicorn running" "$OUT/$side/server.log"; do
         for pid in "${servers[@]}"; do
             kill -0 "$pid" 2>/dev/null || { echo "parity_one_node: a $side server exited" >&2; exit 1; }
         done

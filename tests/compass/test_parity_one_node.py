@@ -164,15 +164,24 @@ def test_dp_two_trees_stops_an_authority_still_up_after_wait_s(tmp_path):
     assert r.stderr == "parity_one_node: the authority is still up\n"
 
 
-def test_dp_two_trees_stops_a_real_worker_tree_whose_setsid_runs_late(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "late_case",
+    [
+        '*--compass-run*) ;; *"--data-parallel-rank 1"*) sleep 3 ;;',
+        '*"--data-parallel-rank 1"*--compass-run*) sleep 3 ;;',
+    ],
+    ids=["real", "sim"],
+)
+def test_dp_two_trees_waits_for_a_worker_tree_whose_setsid_runs_late(
+    tmp_path, monkeypatch, late_case
 ):
-    # Real tree 1 is still in the script's own process group when rank 0 listens.
+    # Tree 1 is still in the script's own process group when rank 0 listens;
+    # simulated rank 0 has exited by the time tree 1 leads its group.
     late = tmp_path / "late"
     late.mkdir()
     (late / "setsid").write_text(
         "#!/bin/bash\n"
-        'case "$*" in *--compass-run*) ;; *"--data-parallel-rank 1"*) sleep 3 ;; esac\n'
+        f'case "$*" in {late_case} esac\n'
         f'exec {shutil.which("setsid")} "$@"\n'
     )
     (late / "setsid").chmod(0o755)
