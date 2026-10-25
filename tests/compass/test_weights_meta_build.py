@@ -191,7 +191,8 @@ def test_a_meta_build_sees_the_simulated_arch_and_reads_no_engram_table(
 ):
     """On a gfx942 host the run file's MI355X is what the build sees, through a
     probe a module bound at import and one it imports while it builds; the
-    host's after. A loaded engram preparer reads no checkpoint."""
+    host's after, in a module imported during the build too. A loaded engram
+    preparer reads no checkpoint."""
     chip = types.ModuleType(CHIP_INFO)
     chip.get_gfx = _probe("get_gfx", "gfx942")
     chip.get_gfx_runtime = _probe("get_gfx_runtime", "gfx942")
@@ -207,14 +208,18 @@ def test_a_meta_build_sees_the_simulated_arch_and_reads_no_engram_table(
     monkeypatch.setitem(sys.modules, CHIP_INFO, chip)
     monkeypatch.setitem(sys.modules, bound.__name__, bound)
     monkeypatch.setitem(sys.modules, "atom.model_ops.engram.device.runtime", engram)
-    seen = []
+    seen, late = [], types.ModuleType("imported_while_building")
 
     class ArchProbing(TiedPacked):
         def __init__(self, config):
             super().__init__(config)
+            late.get_gfx = sys.modules[CHIP_INFO].get_gfx
+            monkeypatch.setitem(sys.modules, late.__name__, late)
             seen.append((bound.get_gfx(), sys.modules[CHIP_INFO].get_gfx_runtime()))
 
     _built(monkeypatch, tmp_path, ArchProbing)
     assert seen == [("gfx950", "gfx950")]
-    assert (bound.get_gfx(), chip.get_gfx_runtime()) == ("gfx942", "gfx942")
+    assert (bound.get_gfx(), late.get_gfx(), chip.get_gfx_runtime()) == (
+        ("gfx942",) * 3
+    )
     assert Preparer.from_checkpoint("checkpoint", None, 1, "cpu") is None
