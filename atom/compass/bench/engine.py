@@ -17,8 +17,7 @@ the window's result (`window.py`). `exit()` stops the workers and returns
 once they and every process they had started have exited, or after
 `serve.STOP_GRACE_S`, so a GPU check after it does not find the bench's own
 processes still exiting. Data parallelism above one, expert
-parallelism, pipeline parallelism and prefill or decode context parallelism
-above one refuse.
+parallelism and pipeline parallelism refuse.
 
 The manager leaves SIGINT ignored in the process that starts it, as an engine
 core's process wants; the bench's is the command's, so the bench restores
@@ -73,15 +72,10 @@ class Bench:
         dp = config.parallel_config.data_parallel_size * (
             config.tensor_parallel_size if config.enable_dp_attention else 1
         )
-        pcp = config.prefill_context_parallel_size
-        dcp = config.decode_context_parallel_size
         for refused, what in (
             (dp > 1, f"{dp} data-parallel ranks"),
             (config.enable_expert_parallel, "expert parallelism"),
             (config.pipeline_parallel_size > 1, "pipeline parallelism"),
-            # A step grid bundle states no context-parallel width.
-            (pcp > 1, f"prefill_context_parallel_size {pcp}"),
-            (dcp > 1, f"decode_context_parallel_size {dcp}"),
         ):
             if refused:
                 raise ValueError(f"the bench does not measure under {what}")
@@ -100,7 +94,7 @@ class Bench:
             # Not `exit`: from the monitor thread, it would race the command's
             # own call, which then skips the wait the after-check needs.
             lambda: None,
-            config.tp_world_size,
+            config.tp_world_size * config.prefill_context_parallel_size,
             RUNNER,
             config,
         )
