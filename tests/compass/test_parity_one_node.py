@@ -22,6 +22,10 @@ case "$1 $2" in
 "-m atom.entrypoints.openai.api_server")
     echo "$* GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES-} ATOM_NUMA_BIND=${ATOM_NUMA_BIND-}" >> "$STUB_LOG"
     echo "${HIP_VISIBLE_DEVICES-} ${ATOM_DP_MASTER_PORT-}" >> "$STUB_LOG.env"
+    if [ -n "${TREE1_EXITS-}" ]; then
+        case "$*" in *"--data-parallel-rank 1"*) exit 1 ;; esac
+        exec sleep 60
+    fi
     echo "Uvicorn running"
     case "$*" in *--compass-run*) exit 0 ;; esac
     exec sleep 60 ;;
@@ -137,6 +141,12 @@ def test_dp_two_trees_runs_two_rank_pairs_on_their_own_gpus_and_one_authority(
     assert [e[0] for e in env] == ["4,5", "6,7"] * 2
     assert env[0][1] == env[1][1] != env[2][1] == env[3][1]
     assert json.loads(run.read_text())["data_parallel_size"] == 4
+
+
+def test_dp_two_trees_stops_once_the_worker_tree_exits(tmp_path):
+    r, _, _ = _parity(tmp_path, CONFIG="dp-two-trees", TREE1_EXITS="1")
+    assert r.returncode == 1
+    assert r.stderr == "parity_one_node: a real server exited\n"
 
 
 def test_dsv4_dpa8_runs_the_nightly_prefill_server_at_eight_ranks(tmp_path):

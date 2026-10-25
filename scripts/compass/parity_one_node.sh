@@ -142,10 +142,24 @@ trap 'kill -KILL -- ${servers[*]/#/-} ${authority:+-$authority} ${lmcache:+-$lmc
 # each in its own process group; returns once rank 0's listens. Tree k above 0
 # logs to server<k>.log.
 serve() {
-    local side=$1 deadline=$((SECONDS + WAIT_S)) master base k log port devices dp
+    local side=$1 deadline=$((SECONDS + WAIT_S)) master base k log port devices dp pid
     shift
-    PORT=$(compass_free_port) master=$(compass_free_port) base=$(compass_free_port)
-    servers=()
+    PORT=$(compass_free_port) base=$(compass_free_port) servers=()
+    # A DP master port whose engine sockets across trees, 100 above it and 3 for
+    # each of four ranks, are free too.
+    master=$(python3 -c 'import socket
+def free(p):
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", p))
+        except OSError:
+            return False
+    return True
+while True:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]
+    if p + 112 < 65536 and all(map(free, range(p + 100, p + 112))):
+        print(p); break')
     for ((k = 0; k < TREES; k++)); do
         log=$OUT/$side/server.log port=$PORT devices=() dp=()
         if ((TREES > 1)); then
@@ -163,7 +177,9 @@ serve() {
         servers+=($!)
     done
     until grep -qs "Uvicorn running" "$OUT/$side/server.log"; do
-        kill -0 "${servers[@]}" 2>/dev/null || { echo "parity_one_node: a $side server exited" >&2; exit 1; }
+        for pid in "${servers[@]}"; do
+            kill -0 "$pid" 2>/dev/null || { echo "parity_one_node: a $side server exited" >&2; exit 1; }
+        done
         ((SECONDS < deadline)) || { echo "parity_one_node: no $side server after $WAIT_S s" >&2; exit 1; }
         sleep 1
     done
