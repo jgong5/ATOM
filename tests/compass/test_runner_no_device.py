@@ -7,19 +7,25 @@ driver; what it is checked against is ATOM's own `CpuGpuBuffer` and torch's own
 """
 
 import ast
+import copy
+import json
 import pathlib
 import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
+from test_memory_readings import CONFIG_JSON, DOCUMENT, EXPECTED, readings_at
+from transformers import PretrainedConfig
 
 from atom.compass.runner.overrides import (
     HostEvent,
     HostStream,
     RunnerRefusal,
+    install_device_readings,
     start_on_host,
 )
+from atom.compass.spec import MachineSpec
 from atom.utils import CpuGpuBuffer
 from atom.utils.h2d import PublicationOwner
 
@@ -156,3 +162,34 @@ def test_atoms_init_builds_streams_and_buffers_only_after_the_replaced_setup():
     setup = first("self._setup_device_and_distributed(")
     for later in ("tokenIDProcessor(", "torch.cuda.Stream(", "allocate_forward_vars("):
         assert setup < first(later), later
+
+
+def test_asked_about_its_own_device_a_host_start_answers_from_its_readings(
+    started, monkeypatch
+):
+    """DeepSeek-V4.1's attention builder bounds its pages by `mem_get_info` and
+    `memory_allocated` of the runner's device, the host after this start: the
+    two answer from the installed readings, what a real start holds once its
+    target loads and before the builder allocates, and of a card as before."""
+
+    def card(device=None):
+        return "card", device
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", card)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", card)
+    runner, _ = started(_config())
+    cpu = torch.device("cpu")
+    with pytest.raises(RunnerRefusal, match="install_device_readings"):
+        torch.cuda.mem_get_info(cpu)
+    qwen = PretrainedConfig.from_dict(
+        json.loads(CONFIG_JSON.read_text())["text_config"]
+    )
+    spec = MachineSpec.from_mapping(copy.deepcopy(DOCUMENT))
+    install_device_readings(runner, readings_at(spec, qwen, 2))
+    expected, peak = EXPECTED[2], EXPECTED[2]["peak_torch"]
+    free = sum(expected["free"].values())
+    assert torch.cuda.mem_get_info(cpu) == (free, expected["total"]["capacity"])
+    held = peak["weights"] + peak["buffers"] + peak["load residue"]
+    assert torch.cuda.memory_allocated(cpu) == held
+    assert torch.cuda.mem_get_info(0) == ("card", 0)
+    assert torch.cuda.memory_allocated() == ("card", None)
