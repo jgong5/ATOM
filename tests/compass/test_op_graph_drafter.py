@@ -412,7 +412,7 @@ def test_a_dp_verify_step_reads_its_drafter_at_its_rows_padded_too(tmp_path):
     assert (padded.moe_rows, padded.draft_moe_rows) == (64, 48)
     cost = backend.price(padded)
     assert by_name(cost)[f"draft op.{GEMM}"] == price(gemm(4096 * 47, 128, 128), SPEC)
-    assert cost.terms[-1].provenance.detail.endswith("decode T=3 B=4 G=48")
+    assert cost.draft_terms[-1].provenance.detail.endswith("decode T=3 B=4 G=48")
 
 
 def test_a_dp_prefill_under_a_drafter_reads_its_graphs_at_their_default(tmp_path):
@@ -582,7 +582,7 @@ def test_a_decode_padded_to_its_rung_prices_its_drafter_at_its_rows(
     backend = OpGraphBackend(machine, lookup, kv="bf16", drafts=1)
     padded, full = backend.price(verify_view(3, 4)), backend.price(verify_view(4, 4))
 
-    assert padded.terms[-1].provenance.detail.endswith("decode T=3 B=4")
+    assert padded.draft_terms[-1].provenance.detail.endswith("decode T=3 B=4")
     assert padded.target_seconds == full.target_seconds
     # The rung's drafter, which this step read before, prices more than runs.
     assert 0 < padded.draft_seconds < full.draft_seconds

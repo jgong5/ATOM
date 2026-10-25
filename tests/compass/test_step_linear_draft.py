@@ -261,10 +261,10 @@ def test_a_final_chunk_s_propose_pass_and_tail_are_fitted_apart_and_a_middle_chu
     assert final.target_seconds == pytest.approx(middle.target_seconds, rel=1e-6)
     draft_kv = SHARE * middle.target_seconds
     assert middle.draft_seconds == pytest.approx(draft_kv, rel=1e-4)
-    assert not [t for t in middle.terms if "propose" in t.name]
+    assert not [t for t in middle.draft_terms if "propose" in t.name]
     assert [
         t.seconds
-        for t in middle.terms
+        for t in middle.draft_terms
         if t.name in ("draft.prefill.seqs", "draft.prefill.out")
     ] == [0, 0]
     assert final.draft_seconds == pytest.approx(
