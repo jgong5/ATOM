@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
-"""`compass validate project`: real runs' steps priced on a device none of them
-ran on, at step and op level, published as a `projection`.
+"""`compass project`: real runs' steps priced on a device none of them ran on,
+at step and op level, published as a `projection`.
 
-    compass validate project --model M [--tp N] --machine SPEC --store S
-        -- RECORD [ATOM args] [-- RECORD [ATOM args] ...]
+    compass project --model M [--tp N] --machine SPEC --store S RECORD...
+        [-- RECORD [ATOM args] ...]
 
 A cell is a real run's directory, its step record in `steps/`, and the ATOM
-arguments it ran under. Its steps are priced as `validate bound` prices them,
+arguments it ran under: after `--` in the command line its run.json holds,
+less the server's and `--model`, as `--model` names the model here; for a
+record whose run.json names none, those in its own `-- RECORD` group. Its
+steps are priced as `validate.bound` prices them,
 on SPEC, the op_graphs S holds for SPEC's arch; nothing is compared with the
 measured time, which is another device's. Each cell is priced in a process of
 its own, since a build declares one engine per process.
@@ -21,7 +24,7 @@ Its `band` re-prices every cell at 0.8 and 1.2 times each carried ratio a price
 read, one at a time (`band`), and ranks the cells again.
 
 `projected` is the method that makes SPEC for a device that never ran, applied
-to one that did, for `validate bound --ratios-from`.
+to one that did, for `validate.bound --ratios-from`.
 """
 
 import argparse
@@ -49,7 +52,7 @@ from atom.compass.spec import MachineSpec
 
 from . import bound
 
-PROG = "compass validate project"
+PROG = "compass project"
 #: What a projected device takes from the probed one as it stands, no
 #: datasheet stating it.
 CARRIED = (
@@ -308,9 +311,32 @@ def text(document: dict) -> str:
     return "\n".join(out)
 
 
+def recorded(record: str) -> list[str]:
+    """ATOM's arguments after `--` in the command line `record`'s run.json
+    holds, less the server's and `--model`; refused when it names none."""
+    from atom.compass.drive.runfile import engine_only
+
+    run = Path(record, "run.json")
+    argv = json.loads(run.read_text()).get("argv", []) if run.exists() else []
+    if "--" not in argv:
+        raise ValueError(
+            f"{run} names no ATOM arguments after -- in its argv; "
+            f"name the record as -- {record} [ATOM args]"
+        )
+    model = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    model.add_argument("--model")
+    return model.parse_known_args(engine_only(argv[argv.index("--") + 1 :]))[1]
+
+
 def main(argv: list[str]) -> None:
     cuts = [i for i, word in enumerate(argv) if word == "--"]
     p = argparse.ArgumentParser(prog=PROG, description=__doc__)
+    p.add_argument(
+        "records",
+        nargs="*",
+        metavar="RECORD",
+        help="a real run's directory, whose run.json names its ATOM arguments",
+    )
     p.add_argument("--model", required=True, help="a model name or directory")
     p.add_argument("--tp", type=int, default=1, help="tensor-parallel width")
     p.add_argument("--machine", required=True, help="the machine spec priced on")
@@ -321,8 +347,9 @@ def main(argv: list[str]) -> None:
     )
     args = p.parse_args(argv[: cuts[0] if cuts else len(argv)])
     groups = [argv[i + 1 : j] for i, j in zip(cuts, [*cuts[1:], len(argv)])]
-    if not groups or not all(groups):
-        p.error("name each cell after its own --: -- RECORD [ATOM args]")
+    if not all(groups) or not (args.records or groups):
+        p.error("name each cell: RECORD, or -- RECORD [ATOM args]")
+    groups = [[r, *recorded(r)] for r in args.records] + groups
     echo = json.loads(Path(args.machine).read_text())
     jobs = [(args.model, args.tp, echo, args.store, g[0], g[1:]) for g in groups]
     results = _each(jobs)

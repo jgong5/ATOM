@@ -126,7 +126,7 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
         "starts a real engine and never runs inside a simulated run"
     ),
     "atom/compass/validate/project.py": (
-        "when validate project published its projection, for the entry's "
+        "when compass project published its projection, for the entry's "
         "provenance; it prices recorded steps offline and never runs inside a "
         "simulated run"
     ),

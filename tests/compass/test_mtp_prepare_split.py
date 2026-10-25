@@ -20,6 +20,7 @@ from atom.compass.parity import recurrence
 from atom.compass.runner.overrides import (
     FORWARD_KINDS,
     HOST_SEGMENTS,
+    MTP_COPY,
     MTP_SEGMENT,
     HostDeviceRecurrence,
 )
@@ -51,7 +52,7 @@ def test_under_mtp_the_prepare_after_the_status_wait_is_charged_after_it():
     """The second forward's wait releases at the first one's target end (12), so
     half a second of its prepare after the wait moves its launch and exit by
     that much."""
-    laws = {"W_pre": [0.5, 0, 0], MTP_SEGMENT: [0.5, 0, 0]}
+    laws = {"W_pre": [0.5, 0, 0], MTP_SEGMENT: [0.5, 0, 0], MTP_COPY: [0, 0, 0]}
     assert _three_decodes(laws, True) == pytest.approx([4, 14.5, 28.5])
 
 
@@ -61,6 +62,11 @@ def test_under_mtp_a_law_without_the_segment_is_refused_and_without_mtp_charges_
     ):
         _three_decodes({}, True)
     assert _three_decodes({}, False) == pytest.approx([4, 13, 27])
+
+
+def test_under_mtp_a_law_without_the_status_copy_is_refused_by_name():
+    with pytest.raises(CostRefused, match=re.escape(f"no law for decode.{MTP_COPY}")):
+        _three_decodes({MTP_SEGMENT: [0, 0, 0]}, True)
 
 
 def test_a_skipped_mtp_segment_is_charged_0_and_listed_skipped(

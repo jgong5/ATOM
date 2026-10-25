@@ -132,7 +132,9 @@ def _write_raw(
     config is `config` naming `dataset`, by default a directory of trace
     `trace-0`, and whose benchmark id is `benchmark_id`."""
     artifacts.mkdir(parents=True, exist_ok=True)
-    (artifacts / RAW).write_text("".join(json.dumps(r) + "\n" for r in records))
+    (artifacts / RAW).write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
+    )
     dataset = dataset or weka(artifacts / "traces", "trace-0")
     config = {"input_config": config | {"datasets": [dataset]}}
     config["benchmark_id"] = benchmark_id
@@ -263,6 +265,25 @@ def test_the_trace_is_the_conversation_and_the_parameters_are_what_shape_no_prom
         "sessions": {},
         "arguments": ARGUMENTS,
     }
+
+
+def test_a_record_holding_a_unicode_line_separator_is_read_whole(tmp_path):
+    # aiperf's orjson writes U+2028, U+2029 and U+0085 unescaped, as a served
+    # output can hold them.
+    text = json.dumps({"id": "a", "text": "x\u2028y\u2029z\x85"}, ensure_ascii=False)
+    records = [raw([sse(("data", text))]), raw([sse(("data", '{"id": "b"}'))])]
+    _write_raw(tmp_path, records)
+
+    assert set(write(tmp_path)[1]["requests"]) == {"a", "b"}
+
+
+def test_a_raw_line_led_by_a_nul_byte_is_not_json(tmp_path):
+    # json.loads on bytes would read it as UTF-16, the number 1.
+    _write_raw(tmp_path, [])
+    (tmp_path / RAW).write_bytes(b"\x001\n")
+
+    with pytest.raises(json.JSONDecodeError):
+        write(tmp_path)
 
 
 def test_a_request_no_response_named_is_listed_by_its_request_id_phase_and_trace(

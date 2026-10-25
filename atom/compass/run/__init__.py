@@ -383,25 +383,18 @@ def spec() -> dict | None:
 
 def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time."""
-    from atom.compass.runner.overrides import (
-        FORWARD_KINDS,
-        HOST_SEGMENTS,
-        MTP_SEGMENT,
-        OUT_SEGMENT,
-        PP_RECV_SEGMENT,
-    )
+    from atom.compass.runner.overrides import FORWARD_KINDS, SEGMENTS
 
     laws = host.get("laws", {})
-    segments = (*HOST_SEGMENTS, MTP_SEGMENT, PP_RECV_SEGMENT, OUT_SEGMENT)
     if (
         set(host) - {"laws", "skip", "key"}
-        or set(host.get("skip", ())) - set(segments)
+        or set(host.get("skip", ())) - set(SEGMENTS)
         or set(laws) - set(FORWARD_KINDS)
-        or {s for v in laws.values() for s in v} - set(segments)
+        or {s for v in laws.values() for s in v} - set(SEGMENTS)
         or {len(c) for v in laws.values() for c in v.values()} - {3}
     ):
         raise ValueError(
-            f"{path}: host is {host!r}; it takes skip, a list of {segments}, "
+            f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
             "and key, the host key the laws were fitted under"
         )
@@ -1284,7 +1277,10 @@ def runner(model_runner, tree) -> None:
         # This engine's record: prefill/, or prefill1/ for engine-P1.
         name = _engine_name(config, run) or ""
         side = {"P": "prefill", "D": "decode"}.get(name[:1], "") + name[1:]
-        replay = ReplayHost(Path(run["replay"]) / side, dp_rank)
+        pp = getattr(config, "pipeline_parallel_size", 1)
+        # A later pipeline stage replays its own record.
+        stage = (config.parallel_config.pipeline_parallel_rank,) if pp > 1 else ()
+        replay = ReplayHost(Path(run["replay"]) / side, dp_rank, *stage)
     if STEP_LINEAR in run:
         if tp != 1:
             raise ValueError(
