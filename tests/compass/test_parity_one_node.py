@@ -34,6 +34,7 @@ case "$1 $2" in
     mkdir -p "$5" && echo '{"sent_ns": [0], "admitted_ns": [2000000]}' > "$5/arrivals.json"
     exit 0 ;;
 "-m atom.compass.parity")
+    echo "$*" >> "$STUB_LOG.compare"
     echo '{"steps": {"0": {"compared": 3, "identical": 3}}, "first_divergence": {"0": null}}'
     exit 0 ;;
 "-c from atom.compass.cli import main; main()")
@@ -275,4 +276,23 @@ def test_rapidserve_measures_a_rapidserve_engine_and_compares_each_engine(tmp_pa
     assert r.stdout.splitlines()[-2:] == [
         f"parity_one_node: {e} dp0 compared=3 identical=3 first_divergence=None"
         for e in ("decode", "prefill")
+    ]
+
+
+def test_pp2_runs_two_stages_on_two_gpus_and_compares_each_stage(tmp_path):
+    r, servers, run = _parity(tmp_path, CONFIG="pp2", STORE=None)
+    assert r.returncode == 0, r.stderr
+    machine = ROOT / "scripts/compass/machines/mi308x-hjbog39.json"
+    assert f" measure memory --gpu 0,1 --machine {machine} " in servers[0]
+    assert len(servers) == 3
+    for line in servers:
+        assert " -tp 1 -pp 2 --enforce-eager --level 0 --max-model-len 8192 " in line
+    spec = json.loads(run.read_text())
+    assert spec["pipeline_parallel_size"] == 2 and spec["data_parallel_size"] == 1
+    assert spec["machine"]["name"] == json.loads(machine.read_text())["name"]
+    compares = (tmp_path / "servers.log.compare").read_text().splitlines()
+    assert [c.rsplit(" --stage ", 1)[1] for c in compares] == ["0", "1"]
+    assert r.stdout.splitlines()[-2:] == [
+        f"parity_one_node: pp{k} dp0 compared=3 identical=3 first_divergence=None"
+        for k in (0, 1)
     ]
