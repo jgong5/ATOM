@@ -265,13 +265,14 @@ HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")  # in the order the host ru
 #: The part of prepare after the MTP status wait; an output forward runs it under MTP.
 MTP_SEGMENT = "W_inputs"
 #: Under MTP, from the previous output forward's target end to its MTP status
-#: wait's return: the status copy's latency, which holds R1's release; a law
-#: without it charges none.
+#: wait's return: the status copy's latency, which holds R1's release.
 MTP_COPY = "L_mtp"
 #: The part of `W_launch` a later pipeline stage runs before it receives its input.
 PP_RECV_SEGMENT = "W_recv"
 #: The engine loop from a forward's exit to its next input pull: the charge's `out_s`.
 OUT_SEGMENT = "E_out"
+#: Every segment a law may price.
+SEGMENTS = (*HOST_SEGMENTS, MTP_SEGMENT, MTP_COPY, PP_RECV_SEGMENT, OUT_SEGMENT)
 FORWARD_KINDS = ("decode", "prefill", "middle")
 #: The format of a simulated run's `dp<r>.cost.jsonl`, its first line.
 COST_TABLE_VERSION = 1
@@ -335,12 +336,15 @@ class HostDeviceRecurrence:
         is refused, naming each ``<kind>.<segment>``, the state as it was;
         without `refuse` that segment is 0. A segment in `skip` needs none, a
         middle chunk runs no `W_post`, and only an output forward under `mtp`
-        runs `MTP_SEGMENT`; a stage after the first runs `PP_RECV_SEGMENT`. Once
-        any kind's law has `OUT_SEGMENT` every kind runs it, as `out_s`, else None."""
+        runs `MTP_SEGMENT`, and on a single stage `MTP_COPY`; a stage after the
+        first runs `PP_RECV_SEGMENT`. Once any kind's law has `OUT_SEGMENT`
+        every kind runs it, as `out_s`, else None."""
         kind, x = forward_shape(batch)
         law = self.laws.get(kind, {})
         ran = HOST_SEGMENTS[: 3 if kind == "middle" else 4]
-        ran += (MTP_SEGMENT,) if self.mtp and kind != "middle" else ()
+        mtp = self.mtp and kind != "middle"
+        ran += (MTP_SEGMENT,) if mtp else ()
+        ran += (MTP_COPY,) if mtp and self.last is None else ()
         ran += (PP_RECV_SEGMENT,) if self.recv else ()
         out = any(OUT_SEGMENT in v for v in self.laws.values())
         ran += (OUT_SEGMENT,) if out else ()
@@ -369,13 +373,7 @@ class HostDeviceRecurrence:
         law = self.laws.get(kind, {})
         seg = {
             s: float(np.dot(law.get(s, (0, 0, 0)), x)) * (s not in self.skip)
-            for s in (
-                *HOST_SEGMENTS,
-                MTP_SEGMENT,
-                MTP_COPY,
-                PP_RECV_SEGMENT,
-                OUT_SEGMENT,
-            )
+            for s in SEGMENTS
         }
         host = max(called + seg["E"], self.ends[0]) + seg["W_pre"]
         if self.mtp and kind != "middle":  # output_end stays -inf on a PP stage
