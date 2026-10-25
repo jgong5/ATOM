@@ -803,8 +803,8 @@ def orphans(leaves, monkeypatch):
 
 
 def test_the_after_check_waits_for_the_child_of_a_bench_worker_that_died(run, orphans):
-    """The named result: the child exits 10 s after its worker died, later
-    than the after-check would run unwaited."""
+    """The child exits 10 s after its worker died, later than the after-check
+    would run unwaited."""
     with pytest.raises(SystemExit) as refused:
         run(*orphans("10"))
 
