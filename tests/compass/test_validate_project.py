@@ -153,8 +153,9 @@ def test_main_reads_a_records_atom_arguments_from_its_run_json(monkeypatch, tmp_
     (bare / "run.json").write_text(json.dumps({"argv": ["compass", "record"]}))
     argv = ["--model", "m", "--machine", str(MI455), "--store", str(tmp_path / "s")]
 
-    with pytest.raises(ValueError, match=f"name the record as -- {bare} "):
+    with pytest.raises(ValueError) as refused:
         project.main([*argv, str(served), str(bare)])
+    assert str(refused.value).endswith(f"name the record as -- {bare} [ATOM args]")
     project.main([*argv, str(served), "--", str(bare), "--kv_cache_dtype", "bf16"])
 
     assert built[:2] == [["--enable-tbo"], ["--kv_cache_dtype", "bf16"]]

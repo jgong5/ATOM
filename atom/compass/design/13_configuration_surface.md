@@ -212,7 +212,7 @@ compass fit host       RECORD... --client-run RECORD EXPORT... --machine M \
 compass fit ops        MEASURED... --out D --store S
 compass run            <backend> --machine M  --out D --store S -- <ATOM args>
 compass run            --join RUN_FILE        --out D -- <ATOM args>
-compass project        --model M [--tp N] --machine M --store S RECORD... \
+compass project        --model MODEL [--tp N] --machine M --store S RECORD... \
                        [-- RECORD <ATOM args>]...
 
 <backend>   one of --step-linear KEY, --step-stub FILE, --step-grid KEY, --op-graph; --step-linear
