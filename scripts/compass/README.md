@@ -781,9 +781,9 @@ every cell a real step falls in is measured: a population alone leaves the cells
 of shapes only the real server scheduled unmeasured (#1884). The plan reads
 shapes only, so its inputs may serve any traces, the graded ones included; a
 point's time is the bench's alone. A real start's KV block count moves with
-its free memory, so the plan holds at the smallest count any input states. The
-grid definition is a calibration input; `$G` below holds nodes at powers of two
-and no margin:
+its free memory, so the grid is planned for the smallest count any input
+states. The grid definition is a calibration input; `$G` below holds nodes at
+powers of two and no margin:
 
 ```json
 {"prefill": {"B": [1, 2, 4, ..., 256], "T": [1, 2, 4, ..., 16384],
