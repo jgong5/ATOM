@@ -106,15 +106,19 @@ for (`record`'s or `trace steps`' output), capturing each `op_graph` S lacks:
 every leaf at every rung of ATOM's decode ladder at the steps' lowest and
 highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
-and each prefill family (`_family`) over a ladder of their token counts, chunk
-remainders among them, one of a kind that depends on context at each at the
-most cached tokens of steps of its rows, and over a ladder of them once those
-points and the fresh ones show the kind still does; then the point halfway
-between two neighbours of a family, or of a prefill leaf's token count over
-cached tokens, that launched different kernels or, at a decode width, either
-side of a point off the line through theirs, or whose cold times differ where
-the leaf's kind steps under one kernel between two adjacent contexts at some
-width (`_densify`), until they are adjacent; a collective's message bytes bend
+at a rung of more than one row also on rows as ragged as the steps'
+(`_means`): the first at the context, the rest sharing a mean, each of a
+ladder of the steps' rows' means in permille of their max and the least the
+rows hold; and each prefill family (`_family`) over a ladder of their token
+counts, chunk remainders among them, one of a kind that depends on context at
+each at the most cached tokens of steps of its rows, and over a ladder of them
+once those points and the fresh ones show the kind still does; then the point
+halfway between two neighbours of a family, or of a prefill leaf's token
+count over cached tokens, that launched different kernels or, at a decode
+width on rows alike, either side of a point off the line through theirs, or
+whose cold times differ where the leaf's kind steps under one kernel between
+two adjacent contexts at some width (`_densify`), until they are adjacent; a
+collective's message bytes bend
 as a decode width does. DIR gets each round's ops.jsonl in `round<n>`, a run
 resumed into DIR numbering on from the last round there, and after each round
 every point held, a measured one with its store token, in plan.jsonl.
@@ -164,6 +168,7 @@ from atom.compass.artifacts import (
     member_name,
     roots_for,
 )
+from atom.compass.backends.op_graph import PERMILLE
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.utils.arg_parser import FlexibleArgumentParser
 
@@ -684,8 +689,20 @@ class Stub:
         refused when `rule` refuses the batch."""
         from atom.utils.forward_context import _forward_kv_cache_context
 
+        def refuse(why):
+            return _journal(
+                self.journal,
+                [
+                    {"shape": str(shape), "context": context, "op": op["op"]}
+                    | {"leaf": sig, "refused": why}
+                    for sig, (op, _) in found.items()
+                ],
+            )
+
         pool = self.runner.config.num_kvcache_blocks
         rows = point_rows(shape, context, pool, rule.block_size)
+        if rows is None:
+            return refuse(f"its rows need more than the pool's {pool} KV blocks")
         view = {"rows": rows, "produces_output": True}
         blocks = sum(-(-row[1] // rule.block_size) for row in rows)
         kv = _forward_kv_cache_context.kv_cache_data
@@ -704,7 +721,8 @@ class Stub:
             for s, (op, i) in found.items()
         }
         need = max(p for _, _, p, _ in plans.values())
-        self.leaves, self.placed, self.context, self.clones = found, [], context, {}
+        self.leaves, self.placed, self.clones = found, [], {}
+        self.context = _split(context)[0]
         self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
         for p in range(max(min(need, *room), 1)):
             slot = p * len(rows)
@@ -713,12 +731,7 @@ class Stub:
             try:
                 batch = rule.batch(view, p * blocks, slot)
             except ValueError as error:  # the rule refuses, before any preparation
-                refused = [
-                    {"shape": str(shape), "context": context, "op": op["op"]}
-                    | {"leaf": sig, "refused": f"ValueError: {error}"}
-                    for sig, (op, _) in found.items()
-                ]
-                return _journal(self.journal, refused)
+                return refuse(f"ValueError: {error}")
             try:
                 self._prepare(batch)
             except Exception as error:
@@ -1087,24 +1100,40 @@ def _routing(loads) -> dict:
     }
 
 
-def point_rows(shape, context, pool: int, block_size: int) -> list[list]:
+def point_rows(shape, context, pool: int, block_size: int) -> list[list] | None:
     """A point's rows, `[query, context, decodes]` each, longest first: a decode
     row holds `context` tokens; a prefill row its query tokens, the capture's
     split, past `context` cached ones. When they need more than the `pool`'s
     KV blocks, the first keeps its context and each other shares what it
-    leaves, as the rows of a ragged step do."""
+    leaves, as the rows of a ragged step do. A ragged decode point's rows
+    (`_split`) are its first row's context and, past it, rows of at least a
+    token each that hold its mean; None when they need more than the pool."""
     decode = shape.phase == "decode"
+    context, mean = _split(context)
     per, extra = divmod(shape.tokens, shape.seqs)
     past = context - 1 if decode else context or 0
     rows = [
         [q, q + past, decode] for q in (per + (i < extra) for i in range(shape.seqs))
     ]
+    if mean:
+        share = (mean * context * len(rows) // PERMILLE - context) // (len(rows) - 1)
+        for row in rows[1:]:
+            row[1] = max(share, 1)
     blocks = [-(-row[1] // block_size) for row in rows]
+    if sum(blocks) > pool and mean:
+        return None
     if sum(blocks) > pool and len(rows) > 1:
         share = (pool - blocks[0]) // (len(rows) - 1) * block_size
         for row in rows[1:]:
             row[1] = min(row[1], max(share, row[0]))
     return rows
+
+
+def _split(context) -> tuple:
+    """A point's context and its rows' mean context in permille of it, None
+    when its rows hold it alike: a ragged decode point's context is the
+    pair."""
+    return tuple(context) if isinstance(context, (tuple, list)) else (context, None)
 
 
 def _specs(args):
@@ -1672,6 +1701,8 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     ]
     if not contexts:
         raise ValueError("the --plan records hold no decode step to read contexts of")
+    means = {_mean(line, s.seqs) for s, line in steps if s.phase == "decode"}
+    means = _ladder(means - {PERMILLE}) if means - {PERMILLE} else []
     rungs = [decode(r) for r in schedulable_ladder(config)]
     graphs, done, tried = {}, {}, set()
     # a run resumed into `out` keeps the rounds an earlier one wrote there
@@ -1704,7 +1735,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         results = _measured(config, todo, args.llc_mib << 20, gpus)
         (into := out / f"round{first + n}").mkdir()
         publish(store, key, config, run, command, results, into)
-        done.update(((r["shape"], r["context"], r["leaf"]), r) for r in results)
+        done.update((_point(r), r) for r in results)
         with (out / "plan.jsonl").open("w") as lines:
             for r in done.values():
                 if "refused" not in r:  # a refused point is not in the store
@@ -1719,7 +1750,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         for sig, (op, _) in graphs[shape].items():
             if dependent.get(op["op"], True) and not exchange(op):
                 for c in _ladder(contexts):
-                    want[shape, c].add(_family(shape, c, op["op"], sig, dependent)[0])
+                    for at in [c, *((c, m) for m in _means(means, shape.seqs))]:
+                        fam = _family(shape, at, op["op"], sig, dependent)[0]
+                        want[shape, at].add(fam)
     prefills, cached = set(), defaultdict(list)
     for s, line in steps:
         if s.phase == "prefill":
@@ -1879,6 +1912,28 @@ def _rows(line, rung: int) -> tuple[int, int]:
     return max(lo, 1), max(contexts)
 
 
+def _mean(line, rung: int) -> int:
+    """A decode step's rows' mean context over its rung, a pad row holding
+    none, in `PERMILLE` of their max."""
+    contexts = [row[1] for row in line["rows"]]
+    return round(PERMILLE * sum(contexts) / (rung * max(contexts)))
+
+
+def _means(means: list, rung: int) -> list:
+    """The means, in `PERMILLE` of the max, a rung's ragged points take: the
+    least its rows hold, a token past the first each, and each of `means`
+    past it; none at one row or with no mean."""
+    least = round(PERMILLE / rung)
+    return [least, *(m for m in means if m > least)] if means and rung > 1 else []
+
+
+def _point(record) -> tuple:
+    """A point record's shape, context and leaf, hashable."""
+    context = record["context"]
+    context = tuple(context) if isinstance(context, list) else context
+    return record["shape"], context, record["leaf"]
+
+
 def _cached(line) -> tuple[int, int]:
     """A step's rows' mean and max cached tokens."""
     cached = [row[1] - row[0] for row in line["rows"]]
@@ -1958,15 +2013,17 @@ def _exchanged(fam: str) -> bool:
 
 def _family(shape, context, op: str, sig: str, dependent: dict):
     """The family a leaf's point belongs to, and where on its axis: a decode
-    leaf at its width over context; a prefill leaf over its tokens, at its rows
-    unless its kind's prefill points show it does not move with them, and at
-    its rows and cached tokens when its kind depends on context, as its
-    prefill points read it, else its decode points, else by default; a
-    collective over its message bytes (`exchange`)."""
+    leaf at its width, and its rows' mean when they are ragged, over context;
+    a prefill leaf over its tokens, at its rows unless its kind's prefill
+    points show it does not move with them, and at its rows and cached tokens
+    when its kind depends on context, as its prefill points read it, else its
+    decode points, else by default; a collective over its message bytes
+    (`exchange`)."""
     if op.startswith(COLLECTIVES):
         return tuple(exchange(json.loads(sig)))
     if shape.phase == "decode":
-        return json.dumps([str(shape), sig]), context
+        context, mean = _split(context)
+        return json.dumps([str(shape), sig] + ([mean] if mean else [])), context
     leaf = _abstract(json.loads(sig), shape.tokens)
     if not dependent.get(("prefill", op), dependent.get(op, True)):
         rows = shape.seqs if dependent.get(("rows", op), True) else None
@@ -2058,7 +2115,7 @@ def _densify(families, tried: set) -> dict:
     """The point halfway between each two neighbours of a family, or of a
     prefill leaf's token count over cached tokens (`_cut`), more than one
     apart, unless `tried`, that launched different kernels or, in a decode
-    family, lie either side of a point `_bent` off the line through theirs or
+    family on rows alike, lie either side of a point `_bent` off the line through theirs or
     are `_apart` where the leaf's kind steps: some decode family of the kind
     holds two adjacent contexts of one kernel that are `_apart`; between two
     points of a collective's family, the step of the rows halfway, a decode
@@ -2083,13 +2140,15 @@ def _densify(families, tried: set) -> dict:
     for fam, points in [*families.items(), *across.items()]:
         points = sorted(points, key=lambda p: p[0])
         decoding = points[0][2]["shape"].startswith("decode")
+        # a ragged decode line is halved only where its kernels switch
+        ragged = decoding and json.loads(fam)[2:]
         if isinstance(fam, str) and _exchanged(fam):
             sizes = [[*g] for _, g in itertools.groupby(points, key=lambda p: p[0])]
             mean = (statistics.mean(p[2]["cold_ns"] for p in g) for g in sizes)
             at = ((*g[0][:2], {"cold_ns": ns}) for g, ns in zip(sizes, mean))
             bent = _bent([*at]) if len(sizes) > 2 else ()  # no line under three
         else:
-            bent = _bent(points, steps) if decoding else ()
+            bent = _bent(points, steps) if decoding and not ragged else ()
         for (a, ka, record), (b, kb, other) in itertools.pairwise(points):
             mid = (a + b) // 2
             if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
@@ -2105,7 +2164,7 @@ def _densify(families, tried: set) -> dict:
                 step = decode(rows) if far.phase == "decode" else prefill(rows, 1)
                 want[step, other["context"]].add(fam)
             elif shape.phase == "decode":
-                want[shape, mid].add(fam)
+                want[shape, (mid, *ragged) if ragged else mid].add(fam)
             else:
                 want[prefill(mid, shape.seqs), record["context"]].add(fam)
     return want
@@ -2207,7 +2266,7 @@ def _measured(config, todo, llc: int, gpus: int = 1) -> list[dict]:
                 if not new and empty:
                     raise
                 got, empty = got + new, not new
-            done = {(r["shape"], r["context"], r["leaf"]) for r in got}
+            done = {_point(r) for r in got}
             todo = [
                 (s, c, {k: v for k, v in found.items() if (str(s), c, k) not in done})
                 for s, c, found in todo

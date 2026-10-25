@@ -68,8 +68,9 @@ def _bench(fn, config, todo, llc):
             if shape.phase == "prefill":
                 n = shape.tokens
                 kernel = "p" if op["op"] == "aiter.attn" else f"gemm{int(n >= 100)}"
-            elif op["op"] == "aiter.attn":
-                n, kernel = context, f"attn{int(context >= 5000)}"
+            elif op["op"] == "aiter.attn":  # by its longest row, ragged or not
+                n = ops._split(context)[0]
+                kernel = f"attn{int(n >= 5000)}"
             else:
                 n, kernel = 1, "gemm"
             got.append(
@@ -145,6 +146,8 @@ def test_a_plan_densifies_each_leaf_to_adjacent_points_where_its_kernel_switches
     assert ops._dependent(records) == {"aiter.attn": True, "aiter.gemm": False}
     at = {}
     for r in records:
+        if isinstance(r["context"], list):  # a ragged decode point
+            continue
         at.setdefault((r["op"], r["shape"].split()[0]), set()).add(
             r["context"] if r["shape"].startswith("decode") else r["shape"]
         )
@@ -434,13 +437,51 @@ def test_a_tp2_plan_reads_back_every_point_it_holds(bench, tmp_path, monkeypatch
     assert _bench.calls == calls
 
 
+def test_a_planned_decode_point_holds_the_rows_of_the_ragged_step_it_stands_for(
+    bench, tmp_path
+):
+    # Rows of 1000 and 4000 at rung 2: their mean is 625 permille of their max.
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 4000, True]], 2),
+        ([[1, 12000, True]], 1),
+    )
+
+    records = _plan(bench, tmp_path, population)
+
+    ragged = {}
+    for r in records:
+        if isinstance(r["context"], list):
+            assert r["op"] == "aiter.attn"  # only a kind that moves with context
+            ragged.setdefault(r["shape"], set()).add(tuple(r["context"]))
+    # Each context of the ladder at the step's mean and the least the rows hold,
+    # halved where the kernel switches; a single row is never ragged.
+    assert ragged.keys() == {"decode B=2", "decode B=4"}
+    for shape, least in (("decode B=2", 500), ("decode B=4", 250)):
+        ladder = {(c, m) for c in (2500, 4000, 12000) for m in (least, 625)}
+        assert ladder | {(4999, 625), (5000, 625)} <= ragged[shape]
+    # The point at the step's own context holds the step's rows.
+    [point] = [
+        r for r in records if r["shape"] == "decode B=2" and r["context"] == [4000, 625]
+    ]
+    rows = ops.point_rows(decode(2), point["context"], 1 << 20, 16)
+    assert rows == [[1, 4000, True], [1, 1000, True]]
+
+    calls = _bench.calls
+    assert _plan(bench, tmp_path, population) == records
+    assert _bench.calls == calls  # every ragged point is read back from the store
+
+
 def test_a_plan_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_path):
     # One row at rung 2: the lowest context is 3000 over two rows.
     population = _records(tmp_path / "plan", ([[1, 3000, True]], 2))
 
     records = _plan(bench, tmp_path, population)
 
-    assert {r["context"] for r in records} == {1500, 3000}
+    assert {r["context"] for r in records if not isinstance(r["context"], list)} == {
+        1500,
+        3000,
+    }
 
 
 def test_coverage_keeps_a_leaf_s_reason_whichever_leaf_of_its_op_comes_later(
@@ -531,7 +572,7 @@ def test_a_plan_halves_decode_attention_until_no_point_bends_off_its_neighbours(
         got = _bench(fn, config, todo, llc)
         for r in got:
             if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
-                r["cold_ns"] += 2e3 * max(r["context"] - 3500, 0)
+                r["cold_ns"] += 2e3 * max(ops._split(r["context"])[0] - 3500, 0)
         return got
 
     monkeypatch.setattr(ops, "_child", steeper)
@@ -545,6 +586,8 @@ def test_a_plan_halves_decode_attention_until_no_point_bends_off_its_neighbours(
 
     by = {}
     for r in records:
+        if isinstance(r["context"], list):  # a ragged line keeps to the ladder
+            continue
         if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
             by.setdefault(r["shape"], []).append(
                 (r["context"], r["kernels"], r["cold_ns"])
@@ -570,7 +613,7 @@ def test_a_plan_finds_a_step_its_points_hold_on_a_line_where_the_kind_steps_else
         for r in got:
             if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
                 high = 1500e3 if r["shape"] == "decode B=1" else 150e3
-                r["cold_ns"] += high * (r["context"] > 2500)
+                r["cold_ns"] += high * (ops._split(r["context"])[0] > 2500)
         return got
 
     monkeypatch.setattr(ops, "_child", stepped)
@@ -584,6 +627,8 @@ def test_a_plan_finds_a_step_its_points_hold_on_a_line_where_the_kind_steps_else
 
     at = {}
     for r in records:
+        if isinstance(r["context"], list):  # a ragged line keeps to the ladder
+            continue
         if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
             at.setdefault(r["shape"], set()).add(r["context"])
     assert len(at) > 1

@@ -20,6 +20,7 @@ from test_work import SPEC
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 from atom.compass.backends import BatchView, RequestShape
 from atom.compass.backends.op_graph import LISTED, OpGraphBackend
+from atom.compass.backends.provenance import Method
 from atom.compass.backends.resolver import CostSource
 from atom.compass.backends.work import gemm, price
 from atom.compass.capture import population_shapes
@@ -300,3 +301,35 @@ def test_a_padded_decode_prices_its_model_at_its_width_and_its_sampler_at_its_ro
         f"op.{GEMM}.price_list": pytest.approx(7e-6),
         f"op.{ARGMAX}.price_list": pytest.approx(1e-6),
     }
+
+
+@pytest.mark.parametrize(
+    "rows,priced,method",
+    [
+        ([(1, 4000, True)] * 2, 40e-6, Method.MEASURED),
+        ([(1, 4000, True), (1, 1000, True)], 25e-6, Method.MEASURED),
+        ([(1, 4000, True), (1, 2500, True)], 32.5e-6, Method.ESTIMATED),
+        ([(1, 4000, True)], 20e-6, Method.MEASURED),  # a pad row holds none
+    ],
+    ids=["alike", "its-mean-measured", "between-two-means", "padded"],
+)
+def test_a_decode_step_prices_at_its_rows_mean_as_well_as_their_max(
+    rows, priced, method
+):
+    # A decode leaf at B = 2 over context, on rows alike and on rows whose mean
+    # is 625 or 500 permille of their max: ragged rows cost less, linearly in
+    # the mean.
+    ragged = listed(
+        *[
+            pt(g(2, 64, 64), "decode B=2", ns, c if m == 1000 else [c, m])
+            for c, at in ((1000, (5e3, 6.25e3, 10e3)), (4000, (20e3, 25e3, 40e3)))
+            for m, ns in zip((500, 625, 1000), at)
+        ]
+    )
+    step = BatchView(tuple(RequestShape(*row) for row in rows), capture_rung=2)
+    graph = g(2, 64, 64)
+    backend = OpGraphBackend(SPEC, lambda *_: graph, kv="bf16", price_list=ragged)
+    cost = backend.price(step)
+
+    assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(priced)}
+    assert cost.terms[0].provenance.method is method

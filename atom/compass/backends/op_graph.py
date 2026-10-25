@@ -94,6 +94,8 @@ from atom.compass.backends.work import Work, bounds
 
 SOURCE = "op-graph"
 LISTED = "price-list"
+#: A decode step's rows' mean context is read in these parts of their max.
+PERMILLE = 1000
 #: The leaves a captured MoE layer exchanges its DP or EP group's rows by:
 #: ATOM's gathers and scatters, and MORI's dispatch and combine.
 MOE_EXCHANGES = ("atom.model_ops.moe:", "mori.ops.dispatch_combine:")
@@ -394,8 +396,9 @@ class OpGraphBackend(CostBackend):
     def _bound(self, view: BatchView) -> tuple:
         """What a price list reads of a step: its phase, its T and B, the rows
         its MoE gathers, None at their default (`gathered_off_default`),
-        and its rows' context and max context (`band`), the
-        context a decode's max, a prefill's mean cached tokens. A padded target
+        and two of its rows' contexts (`band`): a decode's max and its mean
+        over its B, a pad row holding none; a prefill's mean and max cached
+        tokens. A padded target
         (`target_bs`) adds it at that width, G at its default there, and the
         counts a leaf leads with at its rows and at that width: a decode's
         tokens, its MoE's gathered at the width; a prefill's, its width."""
@@ -407,7 +410,9 @@ class OpGraphBackend(CostBackend):
         g = gathered_off_default(phase, ran, view.moe_rows, self.dp, self.drafts)
         rows = [(r.query_tokens, r.context_tokens) for r in view.requests]
         mean, top = band(rows, phase == "decode")
-        bound = (phase, t, b, g, top if phase == "decode" else mean, top)
+        bound = (phase, t, b, g, mean, top)
+        if phase == "decode":  # its max, then its mean over B: a pad row holds none
+            bound = (phase, t, b, g, top, sum(c for _, c in rows) / b)
         if not width:
             return bound
         if ran == t:
@@ -417,6 +422,8 @@ class OpGraphBackend(CostBackend):
             counts = {b * j for j in k}
             wides = {width * j for j in k} | {self.dp * width * k[-1]}
         wide = (phase, ran, width, *bound[3:])
+        if phase == "decode":
+            wide = (*wide[:5], wide[5] * b / width)
         return bound, wide, (frozenset(counts), frozenset(wides))
 
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
