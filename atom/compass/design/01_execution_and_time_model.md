@@ -2304,7 +2304,10 @@ own process with the policy code untouched. It is (owner ruling on
   `router->frontend-P:http` before the request's relay is handled, on
   `router->frontend-D:relay` after, its stamp in the body's `kv_transfer_params`. A
   request that has ended, or was never placed, is nowhere, and its cancel sends nothing
-  on. frontend-D's `HttpChannel` reads a cancel on `relay` as frontend-P's does on
+  on. The cancel ends its request: the loads it still holds drop in the cancel's turn,
+  as a client hang-up drops them in a router outside a run, so neither a prefill's 499
+  to the cancel, which carries no stamp, nor a decode stream ended with no `[DONE]`
+  drops one outside a handled turn (#1988). frontend-D's `HttpChannel` reads a cancel on `relay` as frontend-P's does on
   `http`: the request it names reads `http.disconnect` at the cancel's arrival.
   No hop hands on its client's socket closing. The router handles each request apart
   from its client connection, so a hang-up drops only the response forwarding: every
