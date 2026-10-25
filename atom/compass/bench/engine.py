@@ -153,8 +153,9 @@ class Bench:
         # Left to the garbage collector at interpreter exit, the broadcast
         # queue's ZMQ context never terminates and the process never exits.
         self.runner_mgr.rpc_broadcast_mq.close()
-        deadline = time.monotonic() + serve.STOP_GRACE_S
-        while any(map(_running, started)) and time.monotonic() < deadline:
+        for _ in range(int(serve.STOP_GRACE_S / serve.POLL_S)):
+            if not any(map(_running, started)):
+                return
             time.sleep(serve.POLL_S)
 
 
