@@ -819,7 +819,8 @@ The op-level backend reuses steps 1 to 3 and step 6's populations, and is graded
 the same real runs as step 5: step 4's, or `REAL=1 cctraces_sim.sh` runs of traces 0 to
 255 at the same concurrency and seed, which `client.sh` sends the same requests as.
 Its graphs, points and price list are keyed by the environment as well as ATOM's
-arguments, `AITER_LOG_LEVEL` among the variables, so trace, measure and run in one.
+arguments, `AITER_LOG_LEVEL` among the variables, so trace, measure, run and grade in
+one: grading in another refuses every real step's graph.
 
 10. `compass trace ops --model <Qwen3.8-27B> --population $R/pop/<traces>/c<C>...
     --population <real run>... $S -- --max-model-len 262144`, naming every population
