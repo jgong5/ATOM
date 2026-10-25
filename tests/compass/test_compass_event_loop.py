@@ -272,6 +272,71 @@ def test_a_request_released_before_it_is_read_is_handed_over_at_its_arrival(run)
     assert run.conn.grants[-1] == INF
 
 
+def test_an_unstamped_generation_request_in_the_run_is_refused_naming_its_endpoint(
+    run,
+):
+    """While a stamped completion is released and unread, an unstamped one and
+    an unstamped ``/health`` arrive. The completion is answered 400 by name and
+    reaches no app; ``/health`` and the stamped completion are served."""
+    stamps, served, got = queue.Queue(), [], {}
+
+    async def app(scope, receive, send):
+        served.append(scope["path"])
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            HttpChannel(app, api_server._tracestate_stamp),
+            host="127.0.0.1",
+            port=0,
+            loop="atom.utils.compass_loop:CompassEventLoop",
+            lifespan="off",
+            log_level="warning",
+        )
+    )
+    traffic = _traffic(run, stamps, before_ner=lambda: None)
+    arrival, seq = stamps.get(timeout=10)
+
+    def released():
+        with run.rt.lock:
+            return run.rt.is_released(HTTP, seq)
+
+    def ask(method, path, headers):
+        port = server.servers[0].sockets[0].getsockname()[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            conn.request(
+                method, path, body=b"{}" if method == "POST" else None, headers=headers
+            )
+            response = conn.getresponse()
+            return response.status, response.read()
+        finally:
+            conn.close()
+
+    def client():
+        _until(lambda: server.started and released())
+        got["unstamped"] = ask("POST", "/v1/completions", {})
+        got["health"] = ask("GET", "/health", {})
+        stamp = carriers.tracestate_with(None, arrival, seq)
+        got["stamped"] = ask("POST", "/v1/completions", {"tracestate": stamp})
+
+    thread = threading.Thread(target=client, name="client", daemon=True)
+    thread.start()
+    try:
+        server.run()  # the finish ends it once the stamped request is served
+    finally:
+        thread.join(10)
+        traffic.join(10)
+    assert served == ["/health", "/v1/completions"]
+    assert run.rt.refusals == ["http:unstamped POST /v1/completions"]
+    assert got["health"] == got["stamped"] == (200, b"ok")
+    status, body = got["unstamped"]
+    message = json.loads(body)["error"]["message"]
+    assert status == 400 and "POST /v1/completions carries no Compass stamp" in message
+    assert "traffic LP" in message
+
+
 def test_the_finish_shuts_uvicorn_down_with_no_error_and_no_join_warning(
     run, caplog, monkeypatch
 ):
