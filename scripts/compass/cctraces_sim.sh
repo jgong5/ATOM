@@ -287,11 +287,13 @@ if sys.argv[4] == "1":
     )
     sys.exit(rc)
 summary = json.loads((out / "summary.json").read_text())
-# Prefill logs one line per KV transfer, with its simulated seconds.
+# Prefill logs one line per KV transfer, with the simulated times its write
+# request arrived and its write finished.
 prefill = out / "prefill.log"
 kv = ""
 if prefill.exists():
-    t = [float(s) for s in re.findall(r"KV transfer .*, (\S+) simulated s", prefill.read_text())]
+    found = re.findall(r"KV transfer .*, from (\S+) to (\S+) simulated s", prefill.read_text())
+    t = [float(end) - float(start) for start, end in found]
     kv = f" kv_transfers={len(t)} kv_transfer_mean_s={sum(t) / len(t) if t else 0:.6g}"
 print(
     f"cctraces_sim: rc={rc} requests={avg('request_count'):.0f} "
