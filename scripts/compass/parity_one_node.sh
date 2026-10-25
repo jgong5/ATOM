@@ -39,8 +39,8 @@
 #   LONG_TOKENS      output tokens request 0 asks for, to keep one request (and
 #                    under LMCACHE its server session) alive for long (default
 #                    0: its usual count)
-#   MACHINE          machine spec (tp2's and tp2-plain's default scripts/compass/machines/mi308x-hjbog18.json,
-#                    pp2's mi308x-hjbog39.json, the MI308X spec that states PP carriers)
+#   MACHINE          machine spec (default scripts/compass/machines/mi308x-hjbog18.json,
+#                    node 18's, PP carriers included; dsv4-dpa8 has no default)
 #   STORE            artifact store holding the simulated configuration's memory
 #                    readings, taken by `compass measure memory`. Unset, the
 #                    script takes them first into OUT_DIR/store: `compass measure
@@ -87,7 +87,6 @@ DPA=--enable-dp-attention SIDES=. PP=1 PPA=
 case ${CONFIG:=tp2} in
 tp2 | tp2-plain | dp-two-trees)
     TP=2 ARGS="--enforce-eager --max-model-len 8192 --no-enable_prefix_caching"
-    MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
     [[ $CONFIG == tp2-plain ]] && DPA=
     ;;
 dsv4-dpa8)
@@ -99,14 +98,13 @@ dsv4-dpa8)
 rapidserve)
     TP=1 DPA= ARGS="--enforce-eager --level 0 --max-model-len 8192 --no-enable_prefix_caching"
     ARGS+=" --enable-rapidserve" SIDES="prefill decode"
-    MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
     ;;
 pp2)
     TP=1 DPA= PP=2 PPA="-pp 2" ARGS="--enforce-eager --level 0 --max-model-len 8192 --no-enable_prefix_caching"
-    MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog39.json}
     ;;
 *) echo "parity_one_node: CONFIG is tp2, tp2-plain, dp-two-trees, dsv4-dpa8, rapidserve or pp2, not $CONFIG" >&2; exit 2 ;;
 esac
+MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
 TREES=1 MEASURE_DP=
 if [[ $CONFIG == dp-two-trees ]]; then
     TREES=2 MEASURE_DP="--data-parallel-size 2"
