@@ -49,9 +49,11 @@ from atom.compass.artifacts import (
 from atom.compass.backends.step_grid_plan import plan
 from atom.compass.bench import measure, window
 from atom.compass.drive import gpu, serve
+from atom.compass.drive import run as drive_run
 from atom.compass.fit.samples import load
 from atom.compass.parity import read
 from atom.compass.parity.served import served
+from atom.config import Config
 
 
 class Bench:
@@ -777,3 +779,23 @@ def test_a_bench_workers_child_that_stays_fails_the_after_check_naming_it(
     assert str(refused.value) == (
         f"compass measure steps: GPU 7 has PID {pid} on it after the run, so it fails"
     )
+
+
+def test_run_and_measure_steps_lay_out_dp_attention_alike(
+    monkeypatch, model_dir  # noqa: F811
+):
+    # A step grid bundle is keyed by the config measure steps builds and loaded
+    # under the one compass run builds, from a server's arguments.
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+    atom_args = ["--model", str(model_dir), "-tp", "2", "--enable-dp-attention"]
+    served = drive_run._config([*atom_args, "--timeout-keep-alive", "5"])
+    measured = measure.atom_config(atom_args)
+    for config in (served, measured):
+        pc = config.parallel_config
+        assert (config.tensor_parallel_size, pc.data_parallel_size) == (1, 2)
+    with pytest.raises(SystemExit):
+        measure.atom_config([*atom_args, "--timeout-keep-alive", "5"])
