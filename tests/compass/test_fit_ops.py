@@ -466,3 +466,43 @@ def test_a_point_over_5pct_off_declines_only_the_two_gaps_beside_it(b, priced):
     else:
         assert got.seconds == pytest.approx(priced)
         assert got.provenance.validated is (b != 16)  # inside 2 to 16, 16 to 30
+
+
+GATHER = "_c10d_functional.all_gather_into_tensor.default"
+
+
+def _gathered(rows):
+    """An all-gather of `rows` rows from each of eight ranks, 1024 bytes a row."""
+    x = {"shape": [rows, 64], "stride": [64, 1], "dtype": BF16, "role": "activation"}
+    return {"op": GATHER, "args": {"x": x}, "out": [[8 * rows, 64]]}
+
+
+@pytest.mark.parametrize(
+    "rows, at, priced",
+    [
+        (2, ("decode", None, 2, None, 1024, 1024), 2e-6),
+        (3, ("prefill", 3, 1, None, 0, 0), 3e-6),
+        (
+            8,
+            ("decode", None, 8, None, 1024, 1024),
+            f"{GATHER}: bytes = 8192 is outside the measured 1024 to 4096",
+        ),
+    ],
+)
+def test_a_price_list_prices_a_collective_between_two_measured_sizes(rows, at, priced):
+    # measured at decode widths 1 and 4: 1024 and 4096 bytes, one kernel
+    points = [
+        {"shape": f"decode B={b}", "context": 1024, "op": GATHER, "cold_ns": ns}
+        | {"leaf": bench.signature(_gathered(b)), "kernels": ["ag"]}
+        | {"exchange": bench.exchange(_gathered(b))}
+        for b, ns in ((1, 1e3), (4, 4e3))
+    ]
+    params = ops.fit(points)
+    ops.held_out(params)
+
+    got = ops.PriceList(params).price((_gathered(rows), at, 0))
+
+    if isinstance(priced, str):
+        assert got.reason == priced
+    else:
+        assert got.seconds == pytest.approx(priced)
