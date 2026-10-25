@@ -555,6 +555,24 @@ def test_an_eager_drafter_s_later_passes_gather_every_rank_s_rows(
     assert view.draft_rows == draft_rows
 
 
+@pytest.mark.parametrize(
+    "rows,peer,drafts,draft_rows",
+    [
+        # Three rows verifying one draft beside a peer's three: no later pass.
+        ([(2, 90, True)] * 3, (3, 6, False), 1, None),
+        # MTP2 beside a peer's four: its later passes gather 3 + 4 rows.
+        (DECODE, (4, 12, False), 2, 7),
+    ],
+    ids=["mtp1", "mtp2"],
+)
+def test_an_eager_dp_drafter_gathers_later_pass_rows_only_when_it_has_later_passes(
+    monkeypatch, rows, peer, drafts, draft_rows
+):
+    view = settled(monkeypatch, rows, [peer], eager=True, step=False, drafts=drafts)
+
+    assert view.draft_rows == draft_rows
+
+
 def test_an_eager_dp_drafter_asks_its_later_passes_at_the_g_they_gathered(
     monkeypatch,
 ):
@@ -593,7 +611,7 @@ def test_an_eager_dp_mtp1_drafter_asks_its_one_pass_at_its_own_g(monkeypatch):
     # MTP1 at DP2 with no draft graph, 3 rows beside a peer's 3: its one pass's
     # MoE gathers 6 + 6, its default; it has no later pass at `draft_rows`.
     rows = [(2, 90, True)] * 3
-    view = settled(monkeypatch, rows, [(3, 6, False)], eager=True, step=False)
+    view = settled(monkeypatch, rows, [(3, 6, False)], eager=True, step=False, drafts=1)
     drafted = [g(6, 64, 64), g(12, 32, 64), argmax(3), g(3, 64, 64)]
     graphs = {False: {"seq": []}, True: {"seq": drafted}}
     listing = AskedG()

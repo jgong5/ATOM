@@ -34,9 +34,9 @@ LADDER = [1, 2, 4, 8]
 DECODE = [(3, 90, True)] * 3
 
 
-def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True):
+def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True, drafts=2):
     """Rank 0's view of a step of `rows`, each ``(query, context, decode)``,
-    under an MTP2 drafter beside DP `peers`, each ``(seqs, tokens,
+    under an MTP`drafts` drafter beside DP `peers`, each ``(seqs, tokens,
     prefilling)``: its mode `ForwardMode.decide`'s on `LADDER`, or on ATOM's
     eager one, `[0]`; `step` that the drafter declares a draft graph, `output`
     that the step samples."""
@@ -81,7 +81,8 @@ def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True):
         max_seqlen_q=3,
     )
     r = runner(None, dp_size=1 + len(peers))
-    r.drafter = SimpleNamespace(is_block_drafter=False, step=object() if step else None)
+    step = object() if step else None
+    r.drafter = SimpleNamespace(is_block_drafter=False, step=step, mtp_k=drafts)
     return projection.batch_view(batch, mode, r)
 
 
