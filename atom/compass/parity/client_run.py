@@ -14,12 +14,13 @@ server sent it, the id the step record names it by; its trace is its
 ``conversation_id`` up to any ``::``, which aiperf's trace loader appends to
 name the conversations it derives from one trace; and its request parameters
 are its payload less the prompt, the model, the output length and the stream's
-framing. A record whose payload aiperf left out
-(``AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true``) takes the endpoint's ``extra``
-inputs, all aiperf adds to a weka trace request's payload. A request that got
-no response id, cancelled or failed before its first chunk, is listed under
-``unnamed`` by its ``x_request_id``, phase and trace, so a reader knows which
-requests aiperf sent the export cannot name.
+framing. A request that got no response id, cancelled or failed before its
+first chunk, is listed under ``unnamed`` by its ``x_request_id``, phase and
+trace, so a reader knows which requests aiperf sent the export cannot name.
+A record whose payload aiperf left out
+(``AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true``) takes its request parameters from
+the endpoint's ``extra`` inputs, all aiperf adds to a weka trace request's
+payload.
 ``traces`` names every trace aiperf was given: the ``id`` of each weka trace
 its input config's dataset holds, a file or each
 ``*.json`` of a directory, as aiperf's weka trace loader reads them. Which of
