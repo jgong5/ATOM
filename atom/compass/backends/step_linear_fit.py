@@ -256,7 +256,7 @@ def fit_host(samples) -> tuple[dict, dict]:
         for segment in HOST_SEGMENTS[: 3 if kind == "middle" else 4] + tuple(extra):
             members = [r for r in rows if r[:2] == (kind, segment) and r[3] > 0]
             x = np.array([r[2] for r in members], dtype=np.float64).reshape(-1, 3)
-            width = 2 if np.linalg.matrix_rank(x[:, 1:]) < 2 else 3
+            width = 3 if len(x) and np.linalg.matrix_rank(x[:, 1:]) == 2 else 2
             if width == 2:
                 x[:, 2] = 0.0
             try:
