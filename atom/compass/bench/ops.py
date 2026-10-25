@@ -106,20 +106,19 @@ for (`record`'s or `trace steps`' output), capturing each `op_graph` S lacks:
 every leaf at every rung of ATOM's decode ladder at the steps' lowest and
 highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
-at a rung of more than one row also on rows as ragged as the steps'
-(`_means`): the first at the context, the rest sharing a mean, each of a
-ladder of the steps' rows' means in permille of their max and the least the
-rows hold; and each prefill family (`_family`) over a ladder of their token
-counts, chunk remainders among them, one of a kind that depends on context at
-each at the most cached tokens of steps of its rows, and over a ladder of them
-once those points and the fresh ones show the kind still does; then the point
-halfway between two neighbours of a family, or of a prefill leaf's token
-count over cached tokens, that launched different kernels or, at a decode
-width on rows alike, either side of a point off the line through theirs, or
-whose cold times differ where the leaf's kind steps under one kernel between
-two adjacent contexts at some width (`_densify`), until they are adjacent; a
-collective's message bytes bend
-as a decode width does. DIR gets each round's ops.jsonl in `round<n>`, a run
+and, when some step's rows are ragged, at a rung of more than one row on
+ragged rows too (`_means`): the first at the context, the rest sharing a mean,
+each sixteenth of it from the least the rows hold; and each prefill family
+(`_family`) over a ladder of their token counts, chunk remainders among them,
+one of a kind that depends on context at each at the most cached tokens of
+steps of its rows, and over a ladder of them once those points and the fresh
+ones show the kind still does; then the point halfway between two neighbours
+of a family, or of a prefill leaf's token count over cached tokens, that
+launched different kernels or, at a decode width, either side of a point off
+the line through theirs, or, on rows alike, whose cold times differ where the
+leaf's kind steps under one kernel between two adjacent contexts at some width
+(`_densify`), until they are adjacent; a collective's message bytes bend as a
+decode width does. DIR gets each round's ops.jsonl in `round<n>`, a run
 resumed into DIR numbering on from the last round there, and after each round
 every point held, a measured one with its store token, in plan.jsonl.
 
@@ -1668,6 +1667,10 @@ def publish(store, key, config, run: dict, command: str, results, out: Path):
 
 #: A ladder keeps a value only this many times the last it kept, and the largest.
 LADDER_STEP = 1.25
+#: A ragged decode point's rows' mean is a whole number of these parts of their
+#: max: at 16 a 5% held-out error spans a knee whose slope changes by up to
+#: 2.7 ns per permille at 2.1 ms, MI308X decode attention at 6 rows and 212k.
+GRID = 16
 #: The spread of a leaf's cold times across contexts, or a prefill leaf's
 #: across rows, over the largest, past which its kind depends on them; a
 #: repeat's spread stays within 4%.
@@ -1701,8 +1704,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     ]
     if not contexts:
         raise ValueError("the --plan records hold no decode step to read contexts of")
-    means = {_mean(line, s.seqs) for s, line in steps if s.phase == "decode"}
-    means = _ladder(means - {PERMILLE}) if means - {PERMILLE} else []
+    ragged = any(
+        _mean(line, s.seqs) < PERMILLE for s, line in steps if s.phase == "decode"
+    )
     rungs = [decode(r) for r in schedulable_ladder(config)]
     graphs, done, tried = {}, {}, set()
     # a run resumed into `out` keeps the rounds an earlier one wrote there
@@ -1750,7 +1754,8 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         for sig, (op, _) in graphs[shape].items():
             if dependent.get(op["op"], True) and not exchange(op):
                 for c in _ladder(contexts):
-                    for at in [c, *((c, m) for m in _means(means, shape.seqs))]:
+                    means = _means(shape.seqs) if ragged else []
+                    for at in [c, *((c, m) for m in means)]:
                         fam = _family(shape, at, op["op"], sig, dependent)[0]
                         want[shape, at].add(fam)
     prefills, cached = set(), defaultdict(list)
@@ -1919,12 +1924,13 @@ def _mean(line, rung: int) -> int:
     return round(PERMILLE * sum(contexts) / (rung * max(contexts)))
 
 
-def _means(means: list, rung: int) -> list:
+def _means(rung: int) -> list:
     """The means, in `PERMILLE` of the max, a rung's ragged points take: the
-    least its rows hold, a token past the first each, and each of `means`
-    past it; none at one row or with no mean."""
+    least its rows hold, a token past the first each, and each `GRID`th of
+    the max past it; none at one row."""
     least = round(PERMILLE / rung)
-    return [least, *(m for m in means if m > least)] if means and rung > 1 else []
+    grid = (round(PERMILLE * k / GRID) for k in range(1, GRID))
+    return [least, *(m for m in grid if m > least)] if rung > 1 else []
 
 
 def _point(record) -> tuple:
@@ -2115,9 +2121,10 @@ def _densify(families, tried: set) -> dict:
     """The point halfway between each two neighbours of a family, or of a
     prefill leaf's token count over cached tokens (`_cut`), more than one
     apart, unless `tried`, that launched different kernels or, in a decode
-    family on rows alike, lie either side of a point `_bent` off the line through theirs or
-    are `_apart` where the leaf's kind steps: some decode family of the kind
-    holds two adjacent contexts of one kernel that are `_apart`; between two
+    family, lie either side of a point `_bent` off the line through theirs or,
+    on rows alike, are `_apart` where the leaf's kind steps: some decode family
+    of the kind holds two adjacent contexts of one kernel that are `_apart`;
+    between two
     points of a collective's family, the step of the rows halfway, a decode
     when the farther is one, else a prefill of one sequence. A collective's
     family is `_bent` too, each message size at the mean of its readings, as
@@ -2140,7 +2147,7 @@ def _densify(families, tried: set) -> dict:
     for fam, points in [*families.items(), *across.items()]:
         points = sorted(points, key=lambda p: p[0])
         decoding = points[0][2]["shape"].startswith("decode")
-        # a ragged decode line is halved only where its kernels switch
+        # a ragged decode line is halved where it bends, not where its kind steps
         ragged = decoding and json.loads(fam)[2:]
         if isinstance(fam, str) and _exchanged(fam):
             sizes = [[*g] for _, g in itertools.groupby(points, key=lambda p: p[0])]
@@ -2148,7 +2155,7 @@ def _densify(families, tried: set) -> dict:
             at = ((*g[0][:2], {"cold_ns": ns}) for g, ns in zip(sizes, mean))
             bent = _bent([*at]) if len(sizes) > 2 else ()  # no line under three
         else:
-            bent = _bent(points, steps) if decoding and not ragged else ()
+            bent = _bent(points, () if ragged else steps) if decoding else ()
         for (a, ka, record), (b, kb, other) in itertools.pairwise(points):
             mid = (a + b) // 2
             if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
