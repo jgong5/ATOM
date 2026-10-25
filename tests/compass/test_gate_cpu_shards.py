@@ -4,19 +4,27 @@ beside the rest of tests/: every file once, its failures still fail the gate.
 
 Each case runs the real script over the throwaway tree of
 ``test_gate_cpu_verdict_through_pipe.py`` plus a tests/compass whose tests
-record the process that ran them. The stamped diff touches a GPU trigger, so a
+record the process that ran them. `test_c0.py` plants a module that
+`test_c3.py` and the root `test_ok.py` import, as tests/compass's aiter stub
+leaves engine modules imported for the files collected after it. The stamped diff touches a GPU trigger, so a
 green run exits 98 after pytest. Nothing needs a driver.
 """
 
 import pytest
 from test_gate_cpu_verdict_through_pipe import _run, _tree
 
-TEST = """import os, pathlib
+TEST = """import os, pathlib, sys
+{head}
 def test_{name}():
     (pathlib.Path({ran!r}) / ("{name}." + str(os.getpid()))).touch()
     assert {ok}
 """
 COMPASS = ["test_c0", "test_c1", "test_c2", "test_c3", "deep/test_c4"]
+HEADS = {
+    "c0": "sys.modules['planted'] = sys",
+    "c3": "import planted",
+    "ok": "import planted",
+}
 
 
 def _gate(tmp_path, shards, failing=(), excluded=()):
@@ -28,7 +36,8 @@ def _gate(tmp_path, shards, failing=(), excluded=()):
     tests |= {f"compass/{name}.py": name for name in COMPASS + list(excluded)}
     for path, name in tests.items():
         name = name.split("/")[-1].removeprefix("test_")
-        test = TEST.format(name=name, ok=name not in failing, ran=str(ran))
+        head = HEADS.get(name, "")
+        test = TEST.format(name=name, head=head, ok=name not in failing, ran=str(ran))
         (root / "tests" / path).write_text(test)
     (root / "scripts" / "compass" / "cpu_gate_exclude.txt").write_text(
         "".join(f"tests/compass/{name}.py\n" for name in excluded)

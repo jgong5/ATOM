@@ -260,11 +260,11 @@ fi
 # tests/compass holds most of the suite's time, in model traces that each take
 # one core, so it runs as COMPASS_GATE_SHARDS pytest processes beside the rest
 # of tests/, shard s taking every COMPASS_GATE_SHARDS-th file from s; 0 runs
-# tests/ as one process. The rest still collects tests/compass and deselects
-# it, because root test files import engine modules that tests/compass first
-# imported under its aiter stub, and without them they reach rocminfo while
-# collecting. A shard's output is printed after the rest's. A process left
-# with no test to run (exit 5) fails the gate only when none ran.
+# tests/ as one process. Every process collects all of tests/ and deselects
+# what it does not run, because test files collect only after earlier files
+# have imported engine modules under an aiter stub; alone, they reach rocminfo.
+# A shard's output is printed after the rest's. A process left with no test to
+# run (exit 5) fails the gate only when none ran.
 SHARDS=${COMPASS_GATE_SHARDS:-4}
 [[ $SHARDS =~ ^[0-9]+$ ]] || finish 95 "COMPASS_GATE_SHARDS=$SHARDS is not a count; pytest was not run"
 CF=()
@@ -272,19 +272,24 @@ CF=()
 [ "${#CF[@]}" -gt 0 ] || SHARDS=0
 LOGS=$(mktemp -d) || finish 96 "mktemp failed; nothing was run"
 trap 'rm -rf "${HARNESS:-}" "$LOGS"' EXIT
-PYTEST=(-q --no-header -p no:cacheprovider "$@" -rf)
-MAIN=(tests/ "${IGN[@]}")
+PYTEST=(tests/ "${IGN[@]}" -q --no-header -p no:cacheprovider "$@" -rf)
+REST=()
+for e in tests/*; do
+    [ -d "$e" ] && e=$e/
+    [ "$e" = tests/compass/ ] || REST+=(--deselect="$e")
+done
 PIDS=()
 for ((s = 0; s < SHARDS; s++)); do
     OTHERS=()
     for ((k = 0; k < ${#CF[@]}; k++)); do
-        [ $((k % SHARDS)) -eq "$s" ] || OTHERS+=(--ignore="${CF[k]}")
+        [ $((k % SHARDS)) -eq "$s" ] || OTHERS+=(--deselect="${CF[k]}")
     done
-    python -m pytest tests/compass "${IGN[@]}" "${OTHERS[@]}" "${PYTEST[@]}" >"$LOGS/$s" 2>&1 &
+    python -m pytest "${PYTEST[@]}" "${REST[@]}" "${OTHERS[@]}" >"$LOGS/$s" 2>&1 &
     PIDS+=($!)
-    MAIN=(tests/ "${IGN[@]}" --deselect=tests/compass/)
 done
-python -m pytest "${MAIN[@]}" "${PYTEST[@]}"
+DROP=()
+[ "$SHARDS" -eq 0 ] || DROP=(--deselect=tests/compass/)
+python -m pytest "${PYTEST[@]}" "${DROP[@]}"
 CODES=($?)
 for ((s = 0; s < SHARDS; s++)); do
     wait "${PIDS[s]}"
