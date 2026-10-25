@@ -164,6 +164,23 @@ def test_main_reads_a_records_atom_arguments_from_its_run_json(monkeypatch, tmp_
     assert built[:2] == [["--enable-tbo"], ["--kv_cache_dtype", "bf16"]]
 
 
+@pytest.mark.parametrize(
+    "draft", [["--draft-model", "/there/draft"], ["--draft_model=/there/draft"]]
+)
+def test_a_record_naming_a_draft_model_is_refused_naming_the_dash_form(tmp_path, draft):
+    """A draft model's path is the host's that ran the record, as `--model` is."""
+    line = ["compass", "record", "--", "--model", "/there/target"]
+    line += ["--method", "eagle3", *draft, "--num-speculative-tokens", "3"]
+    (tmp_path / "run.json").write_text(json.dumps({"argv": line}))
+
+    with pytest.raises(ValueError) as refused:
+        project.recorded(str(tmp_path))
+    assert str(refused.value) == (
+        f"{tmp_path / 'run.json'} names --draft-model, a path on the host that "
+        f"ran it; name the record as -- {tmp_path} [ATOM args]"
+    )
+
+
 def test_main_refuses_cells_of_two_models_and_a_run_with_no_cell(monkeypatch):
     two = [{"model": "sha256:a"}, {"model": "sha256:b"}]
     monkeypatch.setattr(project, "_each", lambda jobs: two)
