@@ -15,6 +15,7 @@ import os
 import queue
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from test_parity_record import _config, _key, _prompt, _Runner
@@ -431,6 +432,29 @@ def test_a_dataset_not_of_weka_traces_at_a_path_refuses(tmp_path, entry):
     _write_raw(tmp_path, [raw([sse(("data", '{"id": "a"}'))], "t0")], dataset)
 
     with pytest.raises(ValueError, match="dataset main is not weka traces at a path"):
+        write(tmp_path)
+    assert not (tmp_path / NAME).exists()
+
+
+def test_a_relative_dataset_path_refuses_by_name(tmp_path, monkeypatch):
+    # Traces where the path reads from here, which need not be where aiperf ran.
+    monkeypatch.chdir(tmp_path)
+    dataset = weka(Path("traces"), "t0")
+    _write_raw(tmp_path / "run", [raw([sse(("data", '{"id": "a"}'))], "t0")], dataset)
+
+    with pytest.raises(ValueError, match="dataset main path traces is not absolute"):
+        write(tmp_path / "run")
+    assert not (tmp_path / "run" / NAME).exists()
+
+
+def test_a_second_dataset_refuses_by_name(tmp_path):
+    dataset = weka(tmp_path / "traces", "t0")
+    _write_raw(tmp_path, [raw([sse(("data", '{"id": "a"}'))], "t0")], dataset)
+    export = json.loads((tmp_path / AIPERF).read_text())
+    export["input_config"]["datasets"].append(dataset | {"name": "second"})
+    (tmp_path / AIPERF).write_text(json.dumps(export))
+
+    with pytest.raises(ValueError, match=r"datasets \['main', 'second'\], not one"):
         write(tmp_path)
     assert not (tmp_path / NAME).exists()
 
