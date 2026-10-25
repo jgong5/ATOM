@@ -194,6 +194,7 @@ else
     # Its own process group, so a real server's workers stop with it. A free
     # DP master port, as `compass record` gives one: the port keys ATOM's
     # compiled-graph cache, and the first start that loads it autotunes again.
+    # No later start loads it, so the server's stop removes it, as there.
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
     ATOM_DP_MASTER_PORT=$(compass_free_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
         python3 "${main[@]}" \
@@ -244,6 +245,7 @@ while kill -0 $server 2>/dev/null && ((SECONDS < deadline)); do sleep 1; done
 kill -0 $server 2>/dev/null && { echo "cctraces_sim: the deployment is still up $WAIT_S s after aiperf" >&2; exit 1; }
 wait $server || rc=$((rc || REAL ? rc : $?))
 ((REAL)) && { kill -KILL -- -$server 2>/dev/null || true; gpu_processes after; }
+[[ $MODE == 1p1d ]] || python3 -c 'import sys; from atom.compass.drive import serve; serve.drop_compiled(sys.argv[1])' "$OUT/server.log"
 ((REAL)) && { python3 -m atom.compass.drive.aiter_jit "$OUT/run.json" "$serving_ns" || rc=$((rc ? rc : 1)); }
 # The raw records keep each response's chunks, so the export names each request
 # by its response id; once it is written, they are compressed. A run that

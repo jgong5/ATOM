@@ -60,6 +60,7 @@ from atom.compass.memory import ModelTerms, device_readings, reserves
 from atom.compass.memory.readings import MemoryReadings
 from atom.compass.run import memory
 from atom.compass.spec import MachineSpec, SpecRefusal
+from atom.utils import backends
 
 MACHINE = MachineSpec.from_mapping(copy.deepcopy(DOCUMENT))
 #: One TP2 rank's readings beside `READINGS[2]`: a rank need not read as another.
@@ -155,6 +156,29 @@ def test_the_engine_starts_on_the_hip_device_of_its_rocm_smi_gpu(tmp_path, monke
     _, argv = a_start(tmp_path, monkeypatch, STACK)
     measure_memory.main(argv)
     assert (tmp_path / "hip").read_text() == "2"
+
+
+def test_the_stop_removes_the_compiled_graph_cache_directory_the_start_used(
+    tmp_path, monkeypatch
+):
+    _, argv = a_start(tmp_path, monkeypatch, STACK)
+    root = tmp_path / "home/.cache/atom"
+    monkeypatch.setattr(backends, "VLLM_CACHE_ROOT", str(root))
+    used = root / "torch_compile_cache/0123456789/rank_0/backbone"
+    other = root / "torch_compile_cache/9876543210"
+    other.mkdir(parents=True)
+    engine = measure_memory.subprocess.Popen
+
+    def compiling(*args, stdout, **kwargs):
+        used.mkdir(parents=True)
+        stdout.write(f"Using cache directory: {used} for vLLM's torch.compile\n")
+        stdout.flush()
+        return engine(*args, stdout=stdout, **kwargs)
+
+    monkeypatch.setattr(measure_memory.subprocess, "Popen", compiling)
+    measure_memory.main(argv)
+
+    assert not used.parents[1].exists() and other.exists()
 
 
 def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypatch):

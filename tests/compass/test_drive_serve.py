@@ -25,6 +25,7 @@ from atom.compass.drive import gpu as drive_gpu
 from atom.compass.drive import serve
 from atom.compass.drive.gpu import GpuRefusal
 from atom.compass.run import ENV
+from atom.utils import backends
 
 TREE = Path(__file__).resolve().parents[2]
 PLANTED = """\
@@ -43,6 +44,9 @@ child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
 with open(d + "/child", "w") as f:
     f.write(str(child.pid))
 print("planted server up", flush=True)
+for used in filter(None, os.environ.get("PLANTED_CACHE", "").split(":")):
+    os.makedirs(used)
+    print(f"Using cache directory: {used} for vLLM's torch.compile", flush=True)
 if when == "early":
     sys.exit(int(rc))
 time.sleep(float(os.environ.get("PLANTED_DELAY", "0")))
@@ -146,6 +150,25 @@ def test_a_server_runs_atom_arguments_verbatim_on_its_gpus_between_the_checks(
         "args": [str(engine), "m", str(sys.argv), "(6, 7)"],
         "group running": False,
     }
+
+
+def test_the_stop_removes_the_compiled_graph_cache_directory_its_ranks_used(
+    planted, monkeypatch
+):
+    root = planted / "home/.cache/atom"
+    monkeypatch.setattr(backends, "VLLM_CACHE_ROOT", str(root))
+    mine = root / "torch_compile_cache/0123456789"
+    other = root / "torch_compile_cache/9876543210"
+    other.mkdir(parents=True)
+    configured = planted / "configured/rank_0/backbone"
+    used = [mine / "rank_0/backbone", mine / "rank_1/backbone", configured]
+    monkeypatch.setenv("PLANTED_CACHE", ":".join(map(str, used)))
+    monkeypatch.setenv("PLANTED_EXIT", "late:0")
+
+    serve.serve(ARGS, planted / "out", (7,))
+
+    assert not mine.exists()
+    assert other.exists() and configured.exists()
 
 
 def test_a_simulated_server_gets_its_run_file_and_clock_and_no_gpu_check(
