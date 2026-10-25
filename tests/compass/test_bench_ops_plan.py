@@ -454,12 +454,13 @@ def test_a_planned_decode_point_holds_the_rows_of_the_ragged_step_it_stands_for(
         if isinstance(r["context"], list):
             assert r["op"] == "aiter.attn"  # only a kind that moves with context
             ragged.setdefault(r["shape"], set()).add(tuple(r["context"]))
-    # Each context of the ladder at each sixteenth of the max from the least
-    # the rows hold, the step's own 625 among them, halved where the kernel
+    # Each context of the ladder at each `GRID`th of the max from the least the
+    # rows hold, the step's own 625 among them, halved where the kernel
     # switches; a single row is never ragged.
     assert ragged.keys() == {"decode B=2", "decode B=4"}
     for shape, least in (("decode B=2", 500), ("decode B=4", 250)):
-        means = {least} | {round(k * 62.5) for k in range(1, 16) if k * 62.5 > least}
+        grid = (round(1000 * k / ops.GRID) for k in range(1, ops.GRID))
+        means = {least} | {m for m in grid if m > least}
         assert {m for _, m in ragged[shape]} == means
         ladder = {(c, m) for c in (2500, 4000, 12000) for m in means}
         assert ladder | {(4999, 625), (5000, 625)} <= ragged[shape]

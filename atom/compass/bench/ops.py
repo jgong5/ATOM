@@ -108,7 +108,7 @@ highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
 and, when some step's rows are ragged, at a rung of more than one row on
 ragged rows too (`_means`): the first at the context, the rest sharing a mean,
-each sixteenth of it from the least the rows hold; and each prefill family
+each `GRID`th of it from the least the rows hold; and each prefill family
 (`_family`) over a ladder of their token counts, chunk remainders among them,
 one of a kind that depends on context at each at the most cached tokens of
 steps of its rows, and over a ladder of them once those points and the fresh
@@ -1668,9 +1668,9 @@ def publish(store, key, config, run: dict, command: str, results, out: Path):
 #: A ladder keeps a value only this many times the last it kept, and the largest.
 LADDER_STEP = 1.25
 #: A ragged decode point's rows' mean is a whole number of these parts of their
-#: max: at 16 a 5% held-out error spans a knee whose slope changes by up to
-#: 2.7 ns per permille at 2.1 ms, MI308X decode attention at 6 rows and 212k.
-GRID = 16
+#: max. At 16, MI308X decode attention at 6 rows and 212k tokens read 5.5% off
+#: its neighbours at a mean of 438 permille, past `fit ops`'s 5%.
+GRID = 32
 #: The spread of a leaf's cold times across contexts, or a prefill leaf's
 #: across rows, over the largest, past which its kind depends on them; a
 #: repeat's spread stays within 4%.
