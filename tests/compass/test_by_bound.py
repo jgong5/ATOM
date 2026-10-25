@@ -81,6 +81,15 @@ def test_a_step_level_module_s_kernel_takes_its_largest_bound_beside_its_collect
     assert term.by_bound == {"memory": pytest.approx(8 * one)}
 
 
+def test_a_leaf_a_price_list_leaves_to_the_roofline_keeps_its_parts():
+    listed = by_bound(backend(REGION, MACHINE, tp=2, price_list=FLAT).price(DECODE))
+    plain = by_bound(backend(REGION, MACHINE, tp=2).price(DECODE))
+
+    assert listed[f"op.{GEMM}.price_list"] == {}
+    assert listed[f"op.{REDUCE}"] == plain[f"op.{REDUCE}"]
+    assert set(plain[f"op.{REDUCE}"]) == {"comm.latency", "comm.transfer"}
+
+
 def test_a_listed_price_and_an_overlapped_step_hold_no_part():
     listed = backend(g(2, 64, 64), price_list=FLAT).price(DECODE)
     tbo = OpGraphBackend(SECOND, lambda *shape: layers(), kv="bf16").price(SPLIT)
