@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""`compass validate bound`: the analytical price, at most the measured device
-time on every measured step, at step and at op level.
+"""`python -m atom.compass.validate.bound`: the analytical price, at most the
+measured device time on every measured step, at step and at op level.
 
-    compass validate bound --model M [--tp N] --machine SPEC [--ratios-from SPEC]
-        --store S [--ops DIR] RECORD... [-- ATOM args]
+    python -m atom.compass.validate.bound --model M [--tp N] --machine SPEC
+        [--ratios-from SPEC] --store S [--ops DIR] RECORD... [-- ATOM args]
 
 A RECORD is a real run's directory, its step record in `steps/`. Each forward
 there that is not a DP dummy run is priced at step level by the step roofline,
@@ -62,6 +62,7 @@ from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.shape import sum_tokens
 from atom.compass.backends.step_labels import group_tokens
 
+PROG = "python -m atom.compass.validate.bound"
 SOURCE = "validate-bound"
 PHASES = ("decode", "prefill", "mixed")
 #: The engine fields a record must state as ATOM's arguments resolve them.
@@ -432,7 +433,7 @@ def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=N
 
 def main(argv: list[str]) -> None:
     cut = argv.index("--") if "--" in argv else len(argv)
-    p = argparse.ArgumentParser(prog="compass validate bound", description=__doc__)
+    p = argparse.ArgumentParser(prog=PROG, description=__doc__)
     p.add_argument(
         "records", nargs="+", metavar="RECORD", help="a real run's directory"
     )
@@ -491,3 +492,11 @@ def main(argv: list[str]) -> None:
         )
     if any(r["violations"] for r in report.values()):
         raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    import sys
+
+    from atom.compass.cli import refusing
+
+    refusing(PROG, main, sys.argv[1:])

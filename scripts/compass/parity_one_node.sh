@@ -17,6 +17,10 @@
 #                    rapidserve: -tp 1 --enable-rapidserve, eager at compile
 #                    level 0; each engine records, and is compared, in its own
 #                    prefill/ and decode/.
+#                    pp2: -pp 2 at -tp 1, eager at compile level 0, on two GPUs;
+#                    each stage is replayed from its own record and compared in
+#                    compare-pp<k>.json: the head's batches are the scheduler's
+#                    decisions, a later stage's the batches the head sent it.
 #   MODEL            model directory with its weights (required)
 #   REQUESTS         requests in the workload (default 64)
 #   GAP_S            seconds between sends, each also waiting for the server to
@@ -28,7 +32,8 @@
 #   LONG_TOKENS      output tokens request 0 asks for, to keep one request (and
 #                    under LMCACHE its server session) alive for long (default
 #                    0: its usual count)
-#   MACHINE          machine spec (tp2's and tp2-plain's default scripts/compass/machines/mi308x-hjbog18.json)
+#   MACHINE          machine spec (tp2's and tp2-plain's default scripts/compass/machines/mi308x-hjbog18.json,
+#                    pp2's mi308x-hjbog39.json, the MI308X spec that states PP carriers)
 #   STORE            artifact store holding the simulated configuration's memory
 #                    readings, taken by `compass measure memory`. Unset, the
 #                    script takes them first into OUT_DIR/store: `compass measure
@@ -71,7 +76,7 @@ compass_env "$ROOT"
 compass_require_tree "$ROOT" || exit $?
 OUT=${1:?usage: parity_one_node.sh OUT_DIR}
 MODEL=${MODEL:?MODEL names the model directory}
-DPA=--enable-dp-attention SIDES=.
+DPA=--enable-dp-attention SIDES=. PP=1
 case ${CONFIG:=tp2} in
 tp2 | tp2-plain)
     TP=2 ARGS="--enforce-eager --max-model-len 8192 --no-enable_prefix_caching"
@@ -89,9 +94,14 @@ rapidserve)
     ARGS+=" --enable-rapidserve" SIDES="prefill decode"
     MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
     ;;
-*) echo "parity_one_node: CONFIG is tp2, tp2-plain, dsv4-dpa8 or rapidserve, not $CONFIG" >&2; exit 2 ;;
+pp2)
+    TP=1 DPA= PP=2 ARGS="--enforce-eager --level 0 --max-model-len 8192 --no-enable_prefix_caching"
+    MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog39.json}
+    ;;
+*) echo "parity_one_node: CONFIG is tp2, tp2-plain, dsv4-dpa8, rapidserve or pp2, not $CONFIG" >&2; exit 2 ;;
 esac
-SERVER_ARGS=${SERVER_ARGS:-$ARGS}
+SERVER_ARGS=${SERVER_ARGS:-$ARGS} PPA=
+((PP == 1)) || PPA="-pp $PP"
 WAIT_S=${WAIT_S:-1800}
 ALONE=${ALONE:-0} GAP=0.05
 [[ $ALONE == 1 ]] && GAP=0.25
@@ -110,14 +120,14 @@ fi
 if [[ -z ${STORE:-} ]]; then
     STORE=$OUT/store
     # measure memory takes rocm-smi's indexes of the real run's HIP devices.
-    gpus=$(compass_gpus smi "${HIP_VISIBLE_DEVICES:-$(seq -s, 0 $((TP - 1)))}")
+    gpus=$(compass_gpus smi "${HIP_VISIBLE_DEVICES:-$(seq -s, 0 $((TP * PP - 1)))}")
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
     ATOM_DP_MASTER_PORT=$(compass_free_port) python3 -c \
         "from atom.compass.cli import main; main()" measure memory \
         --gpu "$gpus" --machine "$MACHINE" \
         ${LM_FLAGS:+--beside "lmcache server $LM_FLAGS"} \
         --store "$STORE" --out "$OUT/memory" -- --model "$MODEL" -tp "$TP" \
-        $DPA $SERVER_ARGS
+        $PPA $DPA $SERVER_ARGS
 fi
 
 server= lmcache=
@@ -131,7 +141,7 @@ serve() {
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
     ATOM_DP_MASTER_PORT=$(compass_free_port) ATOM_COMPASS_PARITY_RECORD=$OUT/$side/record setsid \
         python3 -m atom.entrypoints.openai.api_server --model "$MODEL" --host 127.0.0.1 \
-        --server-port "$PORT" --port "$(compass_free_port)" -tp "$TP" $DPA \
+        --server-port "$PORT" --port "$(compass_free_port)" -tp "$TP" $PPA $DPA \
         $SERVER_ARGS "$@" \
         >"$OUT/$side/server.log" 2>&1 &
     server=$!
@@ -176,11 +186,11 @@ done
 
 RUN=$OUT/sim/run.json
 python3 - "$RUN" "$OUT" "$MACHINE" "$MODEL" "$STORE" "$(compass_free_port)" "${DPA:+$TP}" \
-    "$LM_FLAGS" "${IMAGE_S:-0.01}" "$TP" "$SIDES" <<'EOF'
+    "$LM_FLAGS" "${IMAGE_S:-0.01}" "$TP" "$SIDES" "$PP" <<'EOF'
 import json, re, sys
 from pathlib import Path
 
-run, out, machine, model, store, port, width, lmcache, image_s, tp, sides = sys.argv[1:]
+run, out, machine, model, store, port, width, lmcache, image_s, tp, sides, pp = sys.argv[1:]
 machine = json.loads(Path(machine).read_text())
 # ponytail: a spec that measured no tokenizer for the model prices it as its
 # first entry; only arrival latency reads it. Measure the model's own to drop this.
@@ -193,7 +203,7 @@ spec = {
     "admission_path": "serving", "ipc_s": 2.0**-14, "stream_s": 2.0**-12,
     "replay": f"{out}/real/record", "step_stub": {}, "machine": machine, "store": store,
     "data_parallel_size": int(width or 1), "out_dir": f"{out}/sim",
-    "image_preprocess_s": float(image_s),
+    "image_preprocess_s": float(image_s), "pipeline_parallel_size": int(pp),
 }
 if sides != ".":
     spec["rapidserve"] = True
@@ -224,11 +234,15 @@ elif [[ -n ${sim_rc:-} ]]; then
     exit 1
 fi
 
-# compare.json, or for each RapidServe engine compare-<engine>.json.
+# compare.json, or for each RapidServe engine compare-<engine>.json, or for
+# each pipeline stage compare-pp<k>.json.
 for side in $SIDES; do
-    to=$OUT/compare.json
-    [[ $side == . ]] || to=$OUT/compare-$side.json
-    python3 -m atom.compass.parity "$OUT/real/record/$side" "$OUT/sim/record/$side" >"$to"
+    for ((k = 0; k < PP; k++)); do
+        name=${side#.}
+        ((PP == 1)) || name=pp$k
+        python3 -m atom.compass.parity "$OUT/real/record/$side" "$OUT/sim/record/$side" \
+            --stage $k >"$OUT/compare${name:+-$name}.json"
+    done
 done
 python3 - "$OUT" <<'EOF'
 import json, statistics, sys
