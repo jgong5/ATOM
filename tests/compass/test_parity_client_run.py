@@ -132,7 +132,9 @@ def _write_raw(
     config is `config` naming `dataset`, by default a directory of trace
     `trace-0`, and whose benchmark id is `benchmark_id`."""
     artifacts.mkdir(parents=True, exist_ok=True)
-    (artifacts / RAW).write_text("".join(json.dumps(r) + "\n" for r in records))
+    (artifacts / RAW).write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
+    )
     dataset = dataset or weka(artifacts / "traces", "trace-0")
     config = {"input_config": config | {"datasets": [dataset]}}
     config["benchmark_id"] = benchmark_id
@@ -268,12 +270,9 @@ def test_the_trace_is_the_conversation_and_the_parameters_are_what_shape_no_prom
 def test_a_record_holding_a_unicode_line_separator_is_read_whole(tmp_path):
     # aiperf's orjson writes U+2028, U+2029 and U+0085 unescaped, as a served
     # output can hold them.
-    text = json.dumps({"id": "a", "text": "x y z\x85"}, ensure_ascii=False)
-    _write_raw(tmp_path, [])
+    text = json.dumps({"id": "a", "text": "x\u2028y\u2029z\x85"}, ensure_ascii=False)
     records = [raw([sse(("data", text))]), raw([sse(("data", '{"id": "b"}'))])]
-    (tmp_path / RAW).write_text(
-        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
-    )
+    _write_raw(tmp_path, records)
 
     assert set(write(tmp_path)[1]["requests"]) == {"a", "b"}
 

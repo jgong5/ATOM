@@ -117,8 +117,8 @@ def write(artifacts) -> tuple[Path, dict, int]:
     """Write `artifacts`' export; its path, the export, and how many requests
     got no response id."""
     artifacts, named, unnamed = Path(artifacts), {PROFILING: {}, WARMUP: {}}, []
-    # Bytes, so lines end at a newline only: aiperf writes a string's U+2028
-    # unescaped, at which str.splitlines would cut the record.
+    # Bytes, so lines end at \n or \r only, which JSON escapes inside strings:
+    # aiperf writes a string's U+2028 unescaped, where str.splitlines would cut.
     for line in (artifacts / RAW).read_bytes().splitlines():
         record = json.loads(line)
         meta = record["metadata"]

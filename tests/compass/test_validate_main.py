@@ -396,6 +396,14 @@ def test_the_readers_it_reaches_refuse_a_malformed_file_naming_it(tmp_path, read
         reader(path)
 
 
+def test_a_jsonl_string_holding_a_unicode_line_separator_is_read_whole(tmp_path):
+    # aiperf's orjson writes U+2028, U+2029 and U+0085 inside a string unescaped.
+    path = tmp_path / "profile_export.jsonl"
+    path.write_text('{"error": "x\u2028y\u2029z\x85"}\n{}\n')
+
+    assert json_file.read_jsonl(path) == [{"error": "x\u2028y\u2029z\x85"}, {}]
+
+
 @pytest.mark.parametrize(
     "command, runs",
     [

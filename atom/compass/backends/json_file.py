@@ -12,7 +12,9 @@ def read_json(path):
 
 def read_jsonl(path) -> list:
     """The JSON document on each line of the file at `path`."""
-    lines = _text(path).splitlines()
+    # Bytes end a line at \n or \r only, which JSON escapes inside strings;
+    # str.splitlines would also cut a string holding a raw U+2028.
+    lines = _text(path).encode().splitlines()
     return [_parsed(text, path, n) for n, text in enumerate(lines)]
 
 
@@ -24,7 +26,7 @@ def _text(path) -> str:
         raise ValueError(f"{path} is not JSON: {error}") from error
 
 
-def _parsed(text: str, path, before: int = 0):
+def _parsed(text: str | bytes, path, before: int = 0):
     """`text`, the file at `path` after its first `before` lines, parsed."""
     try:
         return json.loads(text)
