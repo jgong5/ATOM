@@ -12,9 +12,10 @@
 # configuration (https://github.com/jgong5/ATOM/issues/1590#issuecomment-6281930268).
 # It then captures, into another OUT_DIR, CELLS="4 8 10 12" with
 # AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0":
-# cells that start every trajectory at its first turn, so their decode steps
-# run at the batch sizes and shorter contexts the graded cells do and the
-# sampled starts miss, 8 sequences included.
+# cells that start every trajectory at its first turn, so they decode at batch
+# sizes the sampled starts miss, 8 sequences included. Within STEPS_S they
+# reach about 170k tokens of context, so their 8-sequence steps run at shorter
+# contexts than the graded c=16 runs' (207k to 217k).
 #
 # Usage: calib_capture.sh RUN_FILE OUT_DIR
 #   RUN_FILE, MODEL, TRACES, HARNESS_PYTHON  as cctraces_sim.sh takes them
