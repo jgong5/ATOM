@@ -196,7 +196,7 @@ def drop_compiled(log) -> None:
 
     root = Path(VLLM_CACHE_ROOT, "torch_compile_cache")
     text = Path(log).read_text("utf-8", "replace")
-    for used in {Path(p) for p in CACHE_LINE.findall(text)}:
+    for used in map(Path, CACHE_LINE.findall(text)):
         if used.is_relative_to(root) and used != root:
             shutil.rmtree(root / used.relative_to(root).parts[0], ignore_errors=True)
 
