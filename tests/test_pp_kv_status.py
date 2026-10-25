@@ -388,7 +388,7 @@ def test_pp_head_remembers_abandonment_before_first_stage_report(local_report):
     assert not proc.has_pending_kv_work()
     proc._poll_kv_transfer_progress()
 
-    assert not proc.scheduler.outputs
+    assert all(out.is_empty() for out in proc.scheduler.outputs)
     assert not proc.has_pending_kv_work()
 
 

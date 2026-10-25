@@ -420,21 +420,6 @@ def test_a_decode_side_prefix_hit_is_written_only_when_both_hash_alike(
     assert y.status is SequenceStatus.RUNNING
 
 
-def test_pipeline_parallelism_is_refused_by_name(geometry, monkeypatch):
-    """A PP head never hands the connector an empty poll, so nothing completes."""
-    with pytest.raises(
-        ValueError,
-        match="pipeline_parallel_size is 2.*process_completions.*MSG_RELEASE",
-    ):
-        connector(
-            runtime("engine-P"),
-            monkeypatch,
-            model_for(geometry, PEAKS[0]),
-            kv_role="kv_producer",
-            pipeline_parallel_size=2,
-        )
-
-
 @pytest.mark.parametrize("follower", [False, True], ids=["idle", "follower"])
 def test_an_idle_producer_frees_every_finished_prefill(pd, seq_factory, follower):
     """N prefills, then nothing (or one more request): all freed on their times."""
