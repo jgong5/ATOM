@@ -117,7 +117,7 @@ def read(store, dirs) -> tuple[list[dict], dict, dict]:
     for d in dirs:
         run = json.loads((d / "run.json").read_text())
         engine = json.loads((d / "engine.json").read_text())
-        config = {**run_fields(run), "engine_config": engine}
+        config = {**run_fields(run, d / "run.json"), "engine_config": engine}
         config |= {k: run[k] for k in ("stack", "host_key", "ptl")}
         lines = sorted(d.glob("round*/ops.jsonl")) or [d / "ops.jsonl"]
         for line in itertools.chain(*(f.read_text().splitlines() for f in lines)):

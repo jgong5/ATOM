@@ -1403,6 +1403,48 @@ def test_a_lazy_trace_that_fails_ends_the_run_naming_the_shape(tmp_path):
     assert lazy["lazy_traces"] == 0
 
 
+def test_a_dirty_tree_s_lazy_trace_answers_its_run_and_publishes_nothing(
+    monkeypatch, tmp_path
+):
+    from test_artifact_store import AITER_ROOT, ATOM_ROOT
+
+    from atom.compass import artifacts
+    from atom.compass.bench import ops
+    from atom.compass.capture import forward
+    from atom.compass.capture.graph import Traced, to_json
+    from atom.compass.ir import Graph, Op
+
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_text("{}")
+    config = SimpleNamespace(
+        model=str(tmp_path / "model"),
+        hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+        **ENGINE,
+    )
+    at = forward.structure(config, "decode", True, "gfx942", True, False)
+    traced = []
+
+    def capture(model, tp, shapes, *_, **__):
+        leaf = Op("aiter.leaf", "opaque_leaf", (("n", 2),), ())
+        traced.append(Graph(Traced(at, str(shapes[0])), leaf))
+        return [(traced[-1], model, {})]
+
+    dirty = (replace(ATOM_ROOT, dirty=3), AITER_ROOT)
+    monkeypatch.setattr(artifacts, "roots_for", lambda modules: dirty)
+    monkeypatch.setattr(forward, "capture", capture)
+    monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
+    lazy, store = _counts(), tmp_path / "store"
+    lookup = _op_graphs(str(store), config, "gfx942", ["--model", config.model], lazy)
+
+    assert lookup("decode", 2, 2) == json.loads(to_json(traced[0]))["region"]
+    assert lazy["lazy_traces"] == 1
+    assert not store.exists()
+
+
 def test_a_run_file_op_graph_traces_from_the_server_s_arguments(monkeypatch, tmp_path):
     seen = []
     monkeypatch.setattr(
