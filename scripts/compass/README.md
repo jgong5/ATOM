@@ -812,3 +812,42 @@ and no margin:
     takes only a run that ran it.
     Link `$R/cell/c<C>/real*` into `$R/cell-grid/c<C>`: grading refuses a cell holding
     both `step_linear/` and `step_grid/`.
+
+### The same cell under the op-level backend
+
+The op-level backend reuses steps 1 to 3 and step 6's populations, and is graded on
+the same real runs as step 5: step 4's, or `REAL=1 cctraces_sim.sh` runs of traces 0 to
+255 at the same concurrency and seed, which `client.sh` sends the same requests as.
+Its graphs, points and price list are keyed by the environment as well as ATOM's
+arguments, `AITER_LOG_LEVEL` among the variables, so trace, measure, run and grade in
+one: grading in another refuses every real step's graph.
+
+10. `compass trace ops --model <Qwen3.8-27B> --population $R/pop/<traces>/c<C>...
+    --population <real run>... $S -- --max-model-len 262144`, naming every population
+    of step 6 and every real run graded: an `op_graph` per shape their steps hold,
+    traced with no device. `run` traces a shape no graph holds itself, a model build
+    each, which its wall time pays; `run --coverage` and grading trace none, and
+    leave a real step whose shape no graph holds out of their counts.
+11. `compass measure ops --plan $R/pop/256-392/c<C>... --llc-mib 256 --gpu G $S --out
+    $R/ops -- $ATOM --enforce-eager --level 0`: the op bench's planner over the
+    calibration traces' populations, in rounds, on one card. The bench runs eager and
+    refuses a compiled level; neither flag enters a graph's or a point's key.
+    The plan stops when a round finds nothing left to measure, hours in on this
+    cell; run it under `timeout`, and run a stopped one again into the same `--out`,
+    which keeps the rounds already there.
+    `compass measure ops --coverage <real run>... $S --out $R/ops -- <the same
+    arguments>` prints how the plan's points cover the real steps, by phase, and
+    why each leaf kind left steps out.
+12. `compass fit ops $S --out $R/fit-ops $R/ops` publishes the `price_list`, naming
+    every `--out` that measured a point.
+13. `compass run --op-graph --host-laws HOST --coverage <real run>... $M $S --out
+    $R/cell-ops/c<C>/op_graph -- $ATOM`, serving the same client run as step 5. The
+    check counts the real steps whose every leaf the price list prices; a leaf it
+    declines is priced by its analytical law, not refused. Link the real runs into
+    `$R/cell-ops/c<C>` and grade with `python -m atom.compass.validate
+    $R/cell-ops/c<C>`, whose cost rows add, per phase, the priced seconds by method,
+    each op kind's composed seconds over the measured ones, and warm over cold per
+    kind. Beside `cctraces_sim.sh` real runs, which grading takes whole, the `run`
+    cell is graded whole too, with the request aiperf cancelled at its cutoff: the
+    server steps it alone until `client.sh --stop` stops the server, and grading
+    takes those steps only from an export that `--stop` marked `server_stopped`.
