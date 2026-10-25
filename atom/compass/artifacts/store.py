@@ -223,6 +223,10 @@ class ArtifactStore:
         it after the campaign that produced it had already run; and the flag
         that decided a gate is not available to be asked once the worker that
         read it has exited.
+
+        A source root with uncommitted files refuses: a dirty tree may run but
+        not publish. A root whose count is not known, a stamped snapshot's,
+        publishes.
         """
         if not isinstance(key, Key):
             refuse_not_a_key(key)
@@ -231,6 +235,14 @@ class ArtifactStore:
                 Rule.PROVENANCE,
                 f"{provenance!r} is not a provenance stanza",
                 "name what produced this entry and out of which trees",
+            )
+        dirty = [f"{r.name} ({r.dirty})" for r in provenance.source_roots if r.dirty]
+        if dirty:
+            raise ArtifactRefusal(
+                Rule.PROVENANCE,
+                f"source roots with uncommitted files: {', '.join(dirty)}",
+                "commit them and produce the entry again: a checkout is keyed "
+                "by its HEAD, so this entry would answer for code that never ran",
             )
         if not isinstance(topology, Topology):
             raise ArtifactRefusal(

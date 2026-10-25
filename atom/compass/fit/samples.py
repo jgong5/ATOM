@@ -11,7 +11,8 @@ together by `step_labels.label_run` under ATOM's two-batch-overlap split rule
 A DP rank no request reached writes a line per dummy forward it runs, and gives
 no sample; its file still counts in the run's digest. An empty
 rank file lost its lines, and refuses.
-A record whose run.json names `aiter_jit_builds` refuses, naming them.
+A record whose run.json names `aiter_jit_builds` refuses, naming them, and so
+does one whose `source` counts uncommitted files.
 
 A step measurement is a `step_measurement` entry `measure steps` published,
 read by key; its member `MEMBER` holds the batch view as a step-record line
@@ -99,6 +100,7 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
         )
     if built := aiter_jit.refusal(run):
         raise ValueError(f"{directory} is not fitted: {built}")
+    fields = run_fields(run, directory)
     steps = directory / "steps"
     if (steps / ARRIVALS).exists():
         # `parity.read` then drops the engine's start and renumbers the rest.
@@ -122,7 +124,7 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
     engine = json.loads((steps / "dp0.engine.json").read_text())
     host = run["host_key"]
     return samples, {
-        **run_fields(run),
+        **fields,
         "engine_config": keyed_of(engine),
         "stack": run["stack"],
         "ptl": run.get("ptl", UNRECORDED),
@@ -131,8 +133,15 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
     }
 
 
-def run_fields(run: dict) -> dict:
-    """The `model`, `device` and `source_root` a run.json's identity states."""
+def run_fields(run: dict, record="run.json") -> dict:
+    """The `model`, `device` and `source_root` a run.json's identity states.
+    A run on a tree with uncommitted files refuses, naming `record`: its
+    source root names the tree's HEAD, which is not the code that ran."""
+    if dirty := run["source"].get("dirty"):
+        raise ValueError(
+            f"{record} ran with {dirty} uncommitted files in its source tree; "
+            "commit them and run again"
+        )
     return {
         "model": run["host_key"]["model"],
         "device": ", ".join(
