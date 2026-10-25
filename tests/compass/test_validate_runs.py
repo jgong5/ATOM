@@ -27,7 +27,7 @@ from test_stop_between_client_runs import CLIENT_RUN as UNREFUSED
 from atom.compass import run as compass_run
 from atom.compass.drive import aiter_jit, serve
 from atom.compass.drive import run as drive_run
-from atom.compass.parity import TRANSFERS
+from atom.compass.parity import ARRIVALS, TRANSFERS
 from atom.compass.validate.runs import (
     ASSUMED,
     CLIENT_RUN,
@@ -397,6 +397,42 @@ def test_a_simulated_run_grading_does_not_take_is_refused_naming_why(
         grade(real, simulated)
 
 
+def test_a_simulated_directory_run_did_not_write_is_refused(tmp_path):
+    """`record` and `trace steps` write a run.json with no run file: a run of
+    no backend, which no simulated-run refusal would read."""
+    *real, simulated = (_recorded(c) for c in _four(tmp_path))
+
+    unrun = "its run.json holds no run_file, so no `run` wrote it"
+    with pytest.raises(ValueError, match=f"sim is not graded: {unrun}$"):
+        grade(real, simulated)
+
+
+def test_a_real_directory_run_wrote_is_refused(tmp_path):
+    *real, simulated = (_recorded(c) for c in _four(tmp_path))
+    _recorded(simulated, **GRADED)
+    _recorded(real[1], **GRADED)
+
+    ran = "its run.json holds a run_file, so `run` wrote it"
+    with pytest.raises(ValueError, match=f"r1 is not graded: {ran}$"):
+        grade(real, simulated)
+
+
+def test_a_record_holding_arrivals_is_refused(tmp_path):
+    """`parity.read` leaves out the engine's start, the steps before the first
+    arrival, and renumbers the rest, so its steps no longer pair with the
+    record's lines."""
+    *real, simulated = (_recorded(c) for c in _four(tmp_path))
+    _recorded(simulated, **GRADED)
+    path = real[1] / "steps" / "dp0.jsonl"
+    lines = [json.loads(x) | {"t_enter_ns": 1} for x in path.read_text().splitlines()]
+    start = lines[0] | {"batch": [], "named": [], "rows": [], "t_enter_ns": 0}
+    path.write_text("".join(json.dumps(x) + "\n" for x in [start, *lines]))
+    (path.parent / ARRIVALS).write_text(json.dumps({"sent_ns": [1]}))
+
+    with pytest.raises(ValueError, match=f"r1 is not graded: its {ARRIVALS} renum"):
+        grade(real, simulated)
+
+
 HOST = {"host": {"laws": {}}}
 NO_HOST = "its run file has no host laws, so it prices no host time"
 ROOFLINE = "the step roofline was on"
@@ -525,12 +561,14 @@ WARMED = [[(6, 30, 30, False)], [(6, 1, 31, True)]] + _schedule()
 
 def test_a_client_run_s_warmup_steps_precede_its_own_and_are_not_graded(tmp_path):
     *real, simulated = (_recorded(c) for c in _four(tmp_path / "one_step"))
+    _recorded(simulated, **GRADED)
     report = grade(real, simulated)
     keys = {6: "kw", 7: "ka", 8: "kb"}
     *real, simulated = (
         _recorded(c, sent={"ka", "kb"}, warmup={"kw"})
         for c in _four(tmp_path / "two_steps", WARMED, keys)
     )
+    _recorded(simulated, sent={"ka", "kb"}, warmup={"kw"}, **GRADED)
 
     assert grade(real, simulated) == report
 
@@ -658,8 +696,9 @@ def test_a_client_run_whose_warmup_runs_on_past_its_first_own_step_grades_whole(
     tmp_path,
 ):
     *real, simulated = _four(tmp_path, LONG, {6: "kw", 7: "ka", 8: "kb"})
-    for cell in (*real[:2], simulated):
+    for cell in real[:2]:
         _recorded(cell, warmup={"kw"})
+    _recorded(simulated, warmup={"kw"}, **GRADED)
 
     assert grade(real, simulated)["counts"]["decode steps"]["verdict"] == "exact"
 
@@ -693,6 +732,7 @@ def test_a_run_graded_whole_takes_steps_after_its_own_only_once_its_server_stopp
 
 def test_the_steps_of_a_later_client_run_are_not_graded(tmp_path):
     *real, simulated = (_recorded(c) for c in _four(tmp_path))
+    _recorded(simulated, **GRADED)
     report = grade(real, simulated)
     later = _schedule() + [[(9, 30, 30, False)], [(9, 1, 31, True)]]
     _cell(tmp_path / "later", later, {7: "ka", 8: "kb", 9: "kc"})
@@ -703,6 +743,7 @@ def test_the_steps_of_a_later_client_run_are_not_graded(tmp_path):
 
 def test_runs_given_different_traces_are_not_one_cell(tmp_path):
     *real, simulated = (_recorded(c) for c in _four(tmp_path))
+    _recorded(simulated, **GRADED)
     _recorded(real[2], given=["trace-other", *GIVEN[1:]])
 
     beyond = f"'{real[2]}': ['trace-other'], '{simulated}': ['trace-ka']}}"
@@ -715,6 +756,7 @@ def test_runs_given_the_same_traces_pair_though_their_finished_requests_differ(
     tmp_path,
 ):
     *real, simulated = (_recorded(c) for c in _four(tmp_path))
+    _recorded(simulated, **GRADED)
     report = grade(real, simulated)
     # Request `kb` was in flight at every real run's cutoff, and aiperf
     # records nothing of it: only the simulated run's export names it.
@@ -747,6 +789,7 @@ def test_runs_given_the_same_traces_and_other_arguments_are_not_one_cell(
     tmp_path, other
 ):
     *real, simulated = (_recorded(c) for c in _four(tmp_path))
+    _recorded(simulated, **GRADED)
     # None: the export names no such argument.
     args = {k: v for k, v in (ARGUMENTS | other).items() if v is not None}
     _recorded(real[1], args=args)
@@ -775,6 +818,7 @@ def test_a_client_run_whose_export_lists_unnamed_requests_is_refused_naming_them
     tmp_path,
 ):
     *real, simulated = (_recorded(c) for c in _four(tmp_path))
+    _recorded(simulated, **GRADED)
     report = grade(real, simulated)
 
     def unnamed(ids):
@@ -1069,7 +1113,8 @@ def test_a_deployment_side_whose_server_built_an_aiter_module_is_refused_naming_
 
 def test_deployments_and_single_servers_are_not_one_cell(tmp_path):
     real = [_deployed(tmp_path / f"r{i}") for i in range(2)]
-    simulated = _recorded(_cell(tmp_path / "sim", _schedule(), {7: "ka", 8: "kb"}))
+    sim = _cell(tmp_path / "sim", _schedule(), {7: "ka", 8: "kb"})
+    simulated = _recorded(sim, **GRADED)
 
     with pytest.raises(ValueError, match="the runs' servers wrote different sides"):
         grade(real, simulated)
