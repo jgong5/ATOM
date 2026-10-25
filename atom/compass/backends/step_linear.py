@@ -58,7 +58,9 @@ only for requests that finish their prompts. Under either, a prefill step that
 does not say whether it produces output is refused.
 A draft law may also hold a `draft_kv` vector over `[1, seqs]`: on a decode
 step it adds the drafter's draft-KV pass, which runs before
-`forward_done_event`, so its terms are not tagged `draft`.
+`forward_done_event`, so its terms are not tagged `draft`. A draft law with
+`output_prefill_kv` true prices that pass on a prefill step that produces
+output by its prefill vector, whose terms there are not tagged `draft` either.
 
 The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
 
@@ -67,7 +69,8 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
      "prefill": VECTOR,
      "decode": {"eager": VECTOR, "1": VECTOR, "2": VECTOR, ...},
      "draft": {"provenance": ..., "prefill": VECTOR, "decode": {...},
-               "propose": VECTOR, "draft_kv": VECTOR}}   # both optional
+               "propose": VECTOR, "draft_kv": VECTOR,
+               "output_prefill_kv": true}}   # all three optional
 
     VECTOR = {"coefficients": {<feature>: seconds, ...},
               "hull": HULL,
@@ -185,6 +188,7 @@ class StepLinearLaw:
         self.draft_kv = law.get("draft_kv") and _Vector(
             "draft_kv", PROPOSE, law["draft_kv"]
         )
+        self.output_prefill_kv = bool(law.get("output_prefill_kv"))
 
 
 class StepLinearBackend(CostBackend):
@@ -269,6 +273,8 @@ class StepLinearBackend(CostBackend):
             if vector.rowmod:
                 counts += (rowmod([r.context_tokens for r in decode], vector.rowmod),)
         terms = self._priced(law, vector, kind, counts, what)
+        if prefill and law.output_prefill_kv and batch_view.produces_output:
+            terms = [dataclasses.replace(t, draft=False) for t in terms]
         seqs = (1, len(batch_view.requests))
         if prefill and law.propose is not None and batch_view.produces_output:
             terms += self._priced(law, law.propose, "propose", seqs, what)
