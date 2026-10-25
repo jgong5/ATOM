@@ -7,11 +7,13 @@ in a law's labels and fit, and in the runner's recurrence."""
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from test_backend_step_linear_fit import _fit, _steps
 from test_parity_recurrence import MS, line
 from test_step_linear_draft import _mtp_record, _output
 
+from atom.compass import run as compass_run
 from atom.compass.backends import StepLinearBackend, StepLinearLaw
 from atom.compass.backends.step_labels import label, mtp_copy
 from atom.compass.backends.step_linear_fit import fit_host, label_records
@@ -70,7 +72,20 @@ def test_the_gate_releases_r1_after_the_draft_kv_pass_and_the_status_copy():
     assert report["pass"] and report["total"] == pytest.approx(0, abs=1e-9)
 
 
-def test_a_law_labels_and_fits_the_status_copy_where_the_wait_began_first(tmp_path):
+def test_a_law_labels_and_fits_the_status_copy_where_the_wait_began_first(
+    tmp_path, monkeypatch
+):
+    """The record has decodes only, so the fit meets kinds no forward ran; it
+    asks no rank of their empty designs, which numpy 2.3 refuses and 2.4
+    answers; `strict` refuses on either."""
+    rank = np.linalg.matrix_rank
+
+    def strict(x, *args):
+        if not x.size:
+            raise ValueError("an empty design has no rank")
+        return rank(x, *args)
+
+    monkeypatch.setattr(np.linalg, "matrix_rank", strict)
     path = tmp_path / "dp0.jsonl"
     lines = (s | {"rung": None, "named": []} for s in _waited(late={5}))
     path.write_text("".join(json.dumps(s) + "\n" for s in lines))
@@ -130,3 +145,11 @@ def test_a_decode_s_draft_kv_pass_fits_the_draft_law_and_prices_as_target(tmp_pa
         pass_s = KV_LAW[0] + KV_LAW[1] * len(rows) if kv else 0
         assert cost.target_seconds == pytest.approx(seconds + pass_s, rel=1e-4)
         assert cost.draft_seconds == pytest.approx(0.1 * seconds, rel=1e-4)
+
+
+def test_a_run_file_whose_host_laws_carry_the_status_copy_loads(tmp_path, monkeypatch):
+    seg = {s: [1, 0, 0] for s in (*HOST_SEGMENTS, MTP_SEGMENT, MTP_COPY)}
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"bound_s": 1.0, "host": {"laws": {"decode": seg}}}))
+    monkeypatch.setenv(compass_run.ENV, str(path))
+    assert compass_run.spec()["host"]["laws"]["decode"][MTP_COPY] == [1, 0, 0]
