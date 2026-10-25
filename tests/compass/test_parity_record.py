@@ -92,16 +92,11 @@ class _Runner(NonAllocatingRunner):
         self._token_stream = DeferredTokenStream([0])
 
 
-#: The pricing step, kept before `_unpriced` stubs it for the module.
+#: The pricing step, kept before `unpriced` stubs it for the module.
 GROUP_STEP_SECONDS = overrides._group_step_seconds
 
-
-@pytest.fixture(scope="module", autouse=True)
-def _unpriced():
-    """Reporting is under test here, not the price: `test_dp_step_max.py` prices."""
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(overrides, "_group_step_seconds", lambda *_: 0.0)
-        yield
+# Reporting is under test here, not the price: `test_dp_step_max.py` prices.
+pytestmark = pytest.mark.usefixtures("unpriced")
 
 
 def _drive(

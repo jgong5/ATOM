@@ -184,27 +184,27 @@ class Owner:
         self.either = Held() if lock else None
 
     def step(self):
-        with self.{name}:
+        with {item}:
             clock.idle(self)
 """
 
 
-def _with_line(name):
-    return 1 + SEEDED.format(name=name).splitlines().index(f"        with self.{name}:")
+def _with_line(item):
+    return 1 + SEEDED.format(item=item).splitlines().index(f"        with {item}:")
 
 
-@pytest.mark.parametrize("name", ["passed", "made", "either"])
-def test_a_with_item_bound_to_no_lock_constructor_is_refused(name):
-    _, inside, refused = check("seeded.py", SEEDED.format(name=name))
+@pytest.mark.parametrize("item", ["self.passed", "self.made", "self.either", "make()"])
+def test_a_with_item_bound_to_no_lock_constructor_is_refused(item):
+    _, inside, refused = check("seeded.py", SEEDED.format(item=item))
     assert inside == []
     assert refused == [
-        f"seeded.py:{_with_line(name)}: cannot classify with item self.{name}"
+        f"seeded.py:{_with_line(item)}: cannot classify with item {item}"
     ]
 
 
 def test_a_lock_imported_under_another_name_is_read_as_a_lock():
-    line = _with_line("held")
-    _, inside, refused = check("seeded.py", SEEDED.format(name="held"))
+    line = _with_line("self.held")
+    _, inside, refused = check("seeded.py", SEEDED.format(item="self.held"))
     assert inside == [
         f"seeded.py:{line + 1}: clock.idle inside with self.held (line {line})"
     ]

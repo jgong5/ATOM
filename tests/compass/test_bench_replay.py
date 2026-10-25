@@ -11,20 +11,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
-from test_parity_record import (  # noqa: F401  _unpriced is an autouse fixture
-    BLOCK,
-    PROMPT,
-    _config,
-    _drive,
-    _prompt,
-    _Runner,
-    _unpriced,
-)
+from test_parity_record import BLOCK, PROMPT, _config, _drive, _prompt, _Runner
 
 from atom.compass.bench import replay
 from atom.compass.parity import ENV, read
 from atom.compass.runner.step_output import DeferredTokenStream, filler_token_ids
 from atom.model_engine.llm_engine import _load_tokenizer
+
+pytestmark = pytest.mark.usefixtures("unpriced")
 
 
 @pytest.fixture
