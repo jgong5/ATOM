@@ -130,9 +130,12 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
     assert mi455.origin("host.ipc.zmq_roundtrip_s")["origin"] == "assumed"
     for unread in ("host.ipc.zmq_roundtrip_s", "device.compute.bf16_flops"):
         assert unread not in doc["assumed"]
-    # Each assumed ratio read, every cell priced again at 0.8 and 1.2 of it.
+    # Each assumed ratio and the kernel floor read, every cell priced again at
+    # 0.8 and 1.2 of it.
     assert set(doc["band"]) == {
-        p for p in doc["assumed"] if p == project.CURVE or "derate" in p
+        p
+        for p in doc["assumed"]
+        if p in (project.CURVE, project.FLOOR) or "derate" in p
     }
     for level in ("step", "op"):
         base = doc["cells"][str(prefill)][level]["tokens_per_s"]
@@ -215,8 +218,8 @@ def test_the_band_ranks_the_cells_again_at_each_ratio_one_at_a_time(monkeypatch)
 
     band = project.band(machine, assumed, jobs, base)
 
-    # The kernel floor is a carried value, not a ratio: no datasheet peak.
-    assert set(band) == {bf16, link}
+    # The kernel floor too, a carried value with no datasheet peak.
+    assert set(band) == {bf16, link, floor}
     slow = band[bf16]["0.8"]
     assert slow["ranking"]["step"]["top_1"] == ["b"]
     assert slow["order_holds"] == {"step": False, "op": True}
@@ -254,3 +257,38 @@ def test_no_process_prices_two_cells_whatever_the_pool_width(monkeypatch):
 
     assert project._each([()] * 40) == [project.cell] * 40
     assert seen == [(8, 1), 1]
+
+
+def test_the_floor_and_each_link_latency_read_are_banded_uncapped(monkeypatch):
+    floor, hop = project.FLOOR, "interconnect.intra_node.link_latency_s"
+    mi455 = spec(MI455)
+    priced = []
+
+    def rates(jobs):
+        """One cell, its tokens a second falling with the latency."""
+        out = []
+        for job in jobs:
+            s = MachineSpec.from_mapping(job[2])
+            priced.append((s.value(floor), s.value(hop)))
+            rate = {"tokens_per_s": 1 / s.value(hop)}
+            out.append({"levels": {"step": rate, "op": rate}})
+        return out
+
+    monkeypatch.setattr(project, "_each", rates)
+    jobs = [("m", 1, mi455.echo(), "s", "a", [])]
+    base = project._ranked({"a": (None, rates(jobs)[0])})
+    priced.clear()
+    assumed = {p: mi455.value(p) for p in (floor, hop, "device.arch")}
+
+    band = project.band(mi455, assumed, jobs, base)
+
+    assert {p: list(at) for p, at in band.items()} == {
+        floor: ["0.8", "1.2"],
+        hop: ["0.8", "1.2", "2", "4"],
+    }
+    assert not any(b["capped"] for at in band.values() for b in at.values())
+    t0, alpha = assumed[floor], assumed[hop]
+    assert priced == [(k * t0, alpha) for k in (0.8, 1.2)] + [
+        (t0, k * alpha) for k in (0.8, 1.2, 2, 4)
+    ]
+    assert band[hop]["4"]["tokens_per_s"]["step"]["a"] == pytest.approx(1 / (4 * alpha))
