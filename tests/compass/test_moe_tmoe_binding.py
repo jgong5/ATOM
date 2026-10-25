@@ -109,7 +109,7 @@ def group(monkeypatch):
         r = runner(None, dp_size=DP, dp_rank=rank)
         r.capture_sizes_np = np.array(ladder, dtype=np.int32)
         r.enforce_eager = False
-        r.drafter = SimpleNamespace(is_block_drafter=False)
+        r.drafter = SimpleNamespace(is_block_drafter=False, mtp_k=1)
         config = SimpleNamespace(
             parallel_config=r.config.parallel_config,
             compilation_config=SimpleNamespace(static_forward_context={}),
