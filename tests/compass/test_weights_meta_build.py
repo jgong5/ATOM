@@ -8,6 +8,8 @@ buffers term those of its buffer storages.
 """
 
 import json
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -169,3 +171,50 @@ def test_a_hook_that_cannot_run_on_meta_refuses_the_start_by_name(
 ):
     with pytest.raises(RunnerRefusal, match="OnDevice.process_weights_after_loading"):
         _built(monkeypatch, tmp_path, OnDevice)
+
+
+CHIP_INFO = "aiter.jit.utils.chip_info"
+
+
+def _probe(name, arch):
+    """An aiter arch probe that answers `arch`."""
+
+    def probe():
+        return arch
+
+    probe.__name__, probe.__module__ = name, CHIP_INFO
+    return probe
+
+
+def test_a_meta_build_sees_the_simulated_arch_and_reads_no_engram_table(
+    monkeypatch, tmp_path
+):
+    """On a gfx942 host the run file's MI355X is what the build sees, through a
+    probe a module bound at import and one it imports while it builds; the
+    host's after. A loaded engram preparer reads no checkpoint."""
+    chip = types.ModuleType(CHIP_INFO)
+    chip.get_gfx = _probe("get_gfx", "gfx942")
+    chip.get_gfx_runtime = _probe("get_gfx_runtime", "gfx942")
+    bound = types.ModuleType("bound_at_import")
+    bound.get_gfx = chip.get_gfx
+
+    class Preparer:
+        @classmethod
+        def from_checkpoint(cls, *args):
+            raise AssertionError("read the checkpoint")
+
+    engram = SimpleNamespace(EngramInputPreparer=Preparer)
+    monkeypatch.setitem(sys.modules, CHIP_INFO, chip)
+    monkeypatch.setitem(sys.modules, bound.__name__, bound)
+    monkeypatch.setitem(sys.modules, "atom.model_ops.engram.device.runtime", engram)
+    seen = []
+
+    class ArchProbing(TiedPacked):
+        def __init__(self, config):
+            super().__init__(config)
+            seen.append((bound.get_gfx(), sys.modules[CHIP_INFO].get_gfx_runtime()))
+
+    _built(monkeypatch, tmp_path, ArchProbing)
+    assert seen == [("gfx950", "gfx950")]
+    assert (bound.get_gfx(), chip.get_gfx_runtime()) == ("gfx942", "gfx942")
+    assert Preparer.from_checkpoint("checkpoint", None, 1, "cpu") is None
