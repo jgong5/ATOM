@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -552,16 +553,22 @@ def test_a_one_deployment_run_loads_a_stored_prefix_back(tmp_path, monkeypatch):
     # The readings are keyed by the performance environment the server runs in.
     monkeypatch.setenv("AITER_LOG_LEVEL", "WARNING")
     machine = _machine(tmp_path)
-    gpu = os.environ.get("HIP_VISIBLE_DEVICES", "0")
-    cli.main(
-        ["measure", "memory", "--gpu", gpu, "--machine", str(machine)]
-        + ["--store", str(tmp_path / "store"), "--out", str(tmp_path / "measure")]
-        + ["--", *ATOM_ARGS]
-    )
     port, server_port = _free_port(), _free_port()
     flags = ["--host", "127.0.0.1", "--port", str(server_port), "--chunk-size", "256"]
     flags += ["--l1-size-gb", "1", "--eviction-policy", "LRU"]
     flags += ["--eviction-trigger-watermark", "0"]  # every tick evicts
+    extra = {"lmcache.mp.host": "tcp://127.0.0.1", "lmcache.mp.port": server_port}
+    # And by the offload connector: the readings are taken offloading to a real
+    # lmcache server beside the engine.
+    monkeypatch.setenv("ATOM_KV_OFFLOAD", "lmcache_mp")
+    monkeypatch.setenv("ATOM_KV_OFFLOAD_EXTRA_CONFIG", json.dumps(extra))
+    gpu = os.environ.get("HIP_VISIBLE_DEVICES", "0")
+    cli.main(
+        ["measure", "memory", "--gpu", gpu, "--machine", str(machine)]
+        + ["--beside", shlex.join(["lmcache", "server", *flags])]
+        + ["--store", str(tmp_path / "store"), "--out", str(tmp_path / "measure")]
+        + ["--", *ATOM_ARGS]
+    )
     run_file = _run_file(
         tmp_path,
         step_stub=CONSTANT,
@@ -570,13 +577,9 @@ def test_a_one_deployment_run_loads_a_stored_prefix_back(tmp_path, monkeypatch):
         machine=json.loads(machine.read_text()),
         lmcache={"server": flags, "lookup_s": list(LOOKUP_S), "request_s": REQUEST_S},
     )
-    extra = {"lmcache.mp.host": "tcp://127.0.0.1", "lmcache.mp.port": server_port}
     env = dict(
         os.environ,
         PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        ATOM_KV_OFFLOAD="lmcache_mp",
-        ATOM_KV_OFFLOAD_EXTRA_CONFIG=json.dumps(extra),
         OFFLOAD_MIN_LOAD_TOKENS="256",
         OFFLOAD_MIN_SAVE_TOKENS="256",
     )
