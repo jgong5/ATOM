@@ -31,6 +31,7 @@ from test_vertical_slice import (
     TREE,
     WALL_S,
     _run_file,
+    publish_entry,
 )
 
 from atom.compass import run as compass_run
@@ -109,6 +110,7 @@ def run_two_trees(out: Path, seed: str) -> dict:
         *("--data-parallel-base-port", str(base_port)),
         *compass,
     ]
+    publish_entry(out / "store", MACHINE, common, env)
     procs = []
 
     def start(name, *args):

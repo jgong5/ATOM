@@ -184,8 +184,8 @@ def _memory_seconds(nbytes: float, machine) -> float:
     return lo + (nbytes - sizes[i - 1]) * (hi - lo) / (sizes[i] - sizes[i - 1])
 
 
-def _comm_seconds(c: Collective, machine) -> float:
-    """One hop plus the bytes over the rank's scale-up links: a fully connected
+def _comm_seconds(c: Collective, machine) -> tuple[float, float]:
+    """One hop, and the bytes over the rank's scale-up links: a fully connected
     group spreads them over its `N-1` links."""
     domain = machine.value("interconnect.intra_node.domain_devices")
     if c.ranks > domain:
@@ -200,11 +200,17 @@ def _comm_seconds(c: Collective, machine) -> float:
         lanes = c.ranks - 1
     rate = machine.value(f"{link}.link_bandwidth_bytes_per_s")
     rate *= machine.value(f"{link}.derate") * lanes
-    return machine.value(f"{link}.link_latency_s") + c.bytes / rate
+    return machine.value(f"{link}.link_latency_s"), c.bytes / rate
 
 
-def bounds(work: Work, machine) -> dict[str, float]:
-    """Each term of the price, by name."""
+#: A price's parts: the kernel's bounds, then its collectives' hops and bytes.
+KERNEL = ("floor", "compute", "memory")
+COMM = ("comm.latency", "comm.transfer")
+
+
+def parts(work: Work, machine) -> dict[str, float]:
+    """Each part of the price, by name (`KERNEL`, `COMM`)."""
+    hops = [_comm_seconds(c, machine) for c in work.comm]
     compute = sum(
         f
         / (
@@ -217,8 +223,28 @@ def bounds(work: Work, machine) -> dict[str, float]:
         "floor": machine.value("device.kernel_floor_s"),
         "compute": compute,
         "memory": _memory_seconds(work.bytes, machine),
-        "comm": sum(_comm_seconds(c, machine) for c in work.comm),
+        "comm.latency": sum(h for h, _ in hops),
+        "comm.transfer": sum(t for _, t in hops),
     }
+
+
+def _bounds(p: dict[str, float]) -> dict[str, float]:
+    return {k: p[k] for k in KERNEL} | {"comm": p[COMM[0]] + p[COMM[1]]}
+
+
+def bounds(work: Work, machine) -> dict[str, float]:
+    """Each term of the price, by name: the kernel's bounds, and `comm`, its
+    collectives' parts summed."""
+    return _bounds(parts(work, machine))
+
+
+def binding(work: Work, machine) -> dict[str, float]:
+    """The price by the part that set it: its largest bound's seconds, a
+    `comm` bound's as its collectives' parts."""
+    p = parts(work, machine)
+    b = _bounds(p)
+    won = max(b, key=b.get)
+    return {k: p[k] for k in COMM} if won == "comm" else {won: b[won]}
 
 
 def price(work: Work, machine) -> float:

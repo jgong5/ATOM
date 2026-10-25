@@ -51,8 +51,8 @@ proportion to `tokens` on every sample (equal, or a decode under MTP, where
 each row computes its drafts too) gets zero. Two keys refuse. The law and the
 host key state the `--machine-spec` digest, which a run's spec must match, and
 the host key's `engine` is the law's `engine_config`. A segment outside `HOST_SEGMENTS` is
-fitted for a kind whose samples carry it: `W_inputs`, on an MTP record, and
-`W_recv`, on a later pipeline stage's. A forward whose `W_launch` its kind's
+fitted for a kind whose samples carry it: `W_inputs` and `L_mtp`, on an MTP
+record, and `W_recv`, on a later pipeline stage's. A forward whose `W_launch` its kind's
 solve drops above the law paid a first-use JIT compile (`_jit`): it and the
 forward after it, whose period takes up the stall, are left out of every host
 law; the report lists the JIT forwards per run under `jit_steps`.
@@ -79,6 +79,8 @@ under the law's `draft`; it holds no `held_out`. A step with a propose label
 (`step_labels`) is fitted there on its draft label less that label, the
 draft-KV pass a middle chunk runs too, and left out when nothing remains; the
 propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`.
+A decode's draft-KV label fits the draft law's `draft_kv` vector alike, and
+the target's vectors fit its device label less that label.
 On an MTP record both prefill vectors, the target's and the draft's, add
 `seqs` and `out` (`StepLinearLaw`).
 
@@ -257,7 +259,7 @@ def fit_host(samples) -> tuple[dict, dict]:
         for segment in HOST_SEGMENTS[: 3 if kind == "middle" else 4] + tuple(extra):
             members = [r for r in rows if r[:2] == (kind, segment) and r[3] > 0]
             x = np.array([r[2] for r in members], dtype=np.float64).reshape(-1, 3)
-            width = 2 if np.linalg.matrix_rank(x[:, 1:]) < 2 else 3
+            width = 3 if len(x) and np.linalg.matrix_rank(x[:, 1:]) == 2 else 2
             if width == 2:
                 x[:, 2] = 0.0
             try:
@@ -523,6 +525,15 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
 
     form, dp = _options(options)
     serial = _serial(samples, options)
+    kvs = [s for s in samples if s.draft_kv_s is not None]
+    samples = [
+        (
+            s
+            if s.draft_kv_s is None
+            else dataclasses.replace(s, device_s=s.device_s - s.draft_kv_s)
+        )
+        for s in samples
+    ]
     runs = _runs(samples, dp)
     groups, cut, spread = [], {"warm": 0, "warm_s": 0.0}, []
     for i, run in enumerate(runs.values()):
@@ -646,7 +657,11 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     }
     drafts = [
         dataclasses.replace(
-            s, device_s=s.draft_s - (s.propose_s or 0.0), draft_s=None, propose_s=None
+            s,
+            device_s=s.draft_s - (s.propose_s or 0.0),
+            draft_s=None,
+            propose_s=None,
+            draft_kv_s=None,
         )
         for s in samples
         if s.draft_s is not None and s.draft_s > (s.propose_s or 0.0)
@@ -655,14 +670,16 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         law["draft"] = fit(drafts, options, seed, draft=True)[0]
         if proposes := [s for s in samples if s.propose_s is not None]:
             law["draft"]["propose"] = _propose(proposes)
+        if kvs:
+            law["draft"]["draft_kv"] = _propose(kvs, "draft_kv_s")
     return law, report
 
 
-def _propose(samples) -> dict:
-    """The draft law's `propose` vector over `samples`' propose labels, on
-    `PROPOSE`, solved and hulled as a step vector is."""
+def _propose(samples, label: str = "propose_s") -> dict:
+    """The draft law's `propose` vector over `samples`' propose labels, or
+    another `label`, on `PROPOSE`, solved and hulled as a step vector is."""
     x = np.array([(1, len(s.view.requests)) for s in samples], dtype=np.float64)
-    s = _solve(x, np.array([s.propose_s for s in samples]), list(PROPOSE))
+    s = _solve(x, np.array([getattr(s, label) for s in samples]), list(PROPOSE))
     fitted = {k: s[k] for k in ("condition", "centre", "mad", "zero")}
     return {
         "coefficients": dict(zip(PROPOSE, map(float, s["coef"]))),

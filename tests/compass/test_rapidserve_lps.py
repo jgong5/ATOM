@@ -10,16 +10,13 @@ The run tests need a driver and `ATOM_COMPASS_SLICE_MODEL`, as in
 `test_vertical_slice`; the rest run anywhere.
 """
 
-import argparse
-import dataclasses
 import pickle
 from types import SimpleNamespace
 
 import pytest
 import test_dp_slice
 from test_dp_slice import MAX_TOKENS, run_dp_slice
-from test_memory_readings import publish_readings
-from test_vertical_slice import MODEL, NEEDS_A_RUN, _run_file
+from test_vertical_slice import NEEDS_A_RUN, _run_file
 
 from atom import config as config_module
 from atom.compass import parity
@@ -250,20 +247,7 @@ def test_the_constant_stub_timeline_ends_each_synchronized_forward_at_its_device
 
 
 def _rapidserve_run_file(out, **overrides):
-    """The slice's run file with ``rapidserve``, and the memory readings of the
-    server's configuration planted in its store."""
-    from atom.config import Config
-    from atom.model_engine.arg_utils import EngineArgs
-
-    parser = argparse.ArgumentParser()
-    EngineArgs.add_cli_args(parser)
-    args = parser.parse_args(
-        ["--model", MODEL, *FLAGS, "--enforce-eager", "--max-model-len", "2048"]
-    )
-    kwargs = EngineArgs.from_cli_args(args)._get_engine_kwargs()
-    names = {f.name for f in dataclasses.fields(Config)}
-    config = Config(MODEL, **{k: v for k, v in kwargs.items() if k in names})
-    publish_readings(out / "store", config, document=overrides["machine"])
+    """The slice's run file with ``rapidserve``."""
     return _run_file(out, rapidserve=True, **overrides)
 
 
@@ -272,8 +256,6 @@ def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("rapidserve")
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(test_dp_slice, "_run_file", _rapidserve_run_file)
-        # The server sets it, and the readings are keyed by it.
-        mp.setenv("AITER_LOG_LEVEL", "WARNING")
         return [run_dp_slice(root / s, s, FLAGS, dp=1) for s in ("1", "2")]
 
 

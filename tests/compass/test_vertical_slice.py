@@ -26,10 +26,11 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
-from test_memory_readings import DOCUMENT, META_8B, TOKENIZER
+from test_memory_readings import DOCUMENT, META_8B, TOKENIZER, publish_readings
 
 from atom.compass import run as compass_run
 from atom.compass.backends.step_stub import Coefficients
@@ -38,6 +39,7 @@ from atom.compass.clock import LpId
 from atom.compass.clock_transport import connect
 from atom.compass.detect.determinism import CONFIGURATION_PREFIX
 from atom.compass.detect.scenario import check_run
+from atom.compass.drive import run as drive_run
 from atom.compass.drive.serve import _free_ports
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
@@ -219,6 +221,17 @@ def _run_file(out: Path, **overrides) -> Path:
     return out / "run.json"
 
 
+def publish_entry(store, machine, argv, env) -> None:
+    """Publish in `store` the `memory_readings` entry of the configuration
+    ATOM's server resolves from its flags `argv` in the environment `env` on
+    `machine`, as `compass measure memory` leaves it, so that a run reading
+    `store` starts."""
+    # The key holds the config as the server resolves it, and its performance
+    # environment.
+    with mock.patch.dict(os.environ, env, clear=True):
+        publish_readings(store, drive_run._config(argv), document=machine)
+
+
 def run_slice(out: Path, seed: str) -> dict:
     """One run in its own process tree; its step table, summary and request times."""
     out.mkdir()
@@ -232,24 +245,13 @@ def run_slice(out: Path, seed: str) -> dict:
         AITER_LOG_LEVEL="WARNING",
         ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
     )
+    args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
+    args += ["--enforce-eager", "--max-model-len", "2048"]
+    publish_entry(out / "store", DOCUMENT, args, env)
     with open(out / "server.log", "w") as log:
         server = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "atom.entrypoints.openai.api_server",
-                "--model",
-                MODEL,
-                "--host",
-                "127.0.0.1",
-                "--server-port",
-                str(port),
-                "--enforce-eager",
-                "--max-model-len",
-                "2048",
-                "--compass-run",
-                str(run_file),
-            ],
+            [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
+            + ["--compass-run", str(run_file)],
             cwd=TREE,
             env=env,
             stdout=log,
@@ -369,3 +371,31 @@ def test_a_deployment_the_slice_does_not_run_is_refused(
     with pytest.raises(ValueError, match=refusal):
         compass_run.frontend(config)
     assert clock.installed() is None
+
+
+def test_an_entry_is_published_for_the_config_the_server_resolves(
+    monkeypatch, tmp_path
+):
+    """The server reads either spelling of a flag and lays out a DP-attention
+    deployment as `CoreManager` does; the entry `publish_entry` publishes for
+    it is keyed alike."""
+    from atom.config import Config
+
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+    published = []
+    monkeypatch.setitem(
+        publish_entry.__globals__,
+        "publish_readings",
+        lambda store, config, document: published.append(config),
+    )
+    argv = ["--model", "m", "--max_model_len", "2048", "-tp", "2"]
+    publish_entry(tmp_path, DOCUMENT, [*argv, "--enable-dp-attention"], {})
+    [config] = published
+    pc = config.parallel_config
+    assert config.max_model_len == 2048
+    assert (config.tensor_parallel_size, pc.data_parallel_size) == (1, 2)
+    assert pc.data_parallel_size_local == 2

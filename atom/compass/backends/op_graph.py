@@ -62,6 +62,8 @@ each reason the price list declined one of its leaves. A price list's prices
 are ``op.<kind>.price_list``, and ``op.tbo.price_list`` when it priced every
 leaf of both micro-batches, `measured` when each sat on a measured point and
 `estimated` otherwise, validated when each of its estimated leaves is.
+A roofline term's `by_bound` is each price's seconds under its largest bound
+(`work.binding`); a price list's term and ``op.tbo`` leave it empty.
 
 Refused: a step with image tokens, since no graph holds the vision encoder; a
 two-batch-overlap step on MoRI's split send and receive (`split_send_recv`),
@@ -84,13 +86,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 
 from atom.compass.backends.base import CostBackend, Granularity
-from atom.compass.backends.cost import CostTerm, StepCost, fold_seconds
+from atom.compass.backends.cost import CostTerm, StepCost, fold_parts, fold_seconds
 from atom.compass.backends.op_work import _tensors, work
 from atom.compass.backends.provenance import Method, Provenance, Refusal, combine
 from atom.compass.backends.resolver import CostRefused, CostSource, Resolver
 from atom.compass.backends.shape import IMAGES, BatchView
 from atom.compass.backends.step_roofline import _reads, micro_batches, overlap
-from atom.compass.backends.work import Work, bounds
+from atom.compass.backends.work import Work, binding
 
 SOURCE = "op-graph"
 LISTED = "price-list"
@@ -207,7 +209,9 @@ class _Roofline(CostSource):
             raise CostRefused(request, refused)
         note = "; ".join(unit[1])
         method = Method.DECLARED if note else Method.ANALYTICAL
-        return CostTerm(f"op.{kind}", unit[0], Provenance(method, note=note))
+        return CostTerm(
+            f"op.{kind}", unit[0], Provenance(method, note=note), by_bound=unit[2]
+        )
 
 
 def band(rows, decode: bool) -> tuple[int, int]:
@@ -251,14 +255,15 @@ def gathered_off_default(
 def _ran_at(leaf: dict, bound: tuple) -> tuple:
     """`bound` at the rows `leaf` ran: a padded target's (`_bound`) at its
     width where an activation, metadata or output of the leaf leads with the
-    width's counts and none with the rows', else at its rows."""
-    if len(bound) != 3:
+    width's counts and none with the rows', at both (`_bound`) where it leads
+    with both's, else at its rows."""
+    if len(bound) != 4:
         return bound
-    rows, wide, (counts, wides) = bound
+    rows, wide, both, (counts, wides) = bound
     args = _tensors(list(leaf["args"].values()))
     shapes = [a["shape"] for a in args if a["role"] in ("activation", "metadata")]
     leads = {n for s in shapes + leaf["out"] for n in s[:1]}
-    return wide if leads & wides and not leads & counts else rows
+    return (both if leads & counts else wide) if leads & wides else rows
 
 
 class OpGraphBackend(CostBackend):
@@ -332,8 +337,7 @@ class OpGraphBackend(CostBackend):
             self._live = [] if graph else None
             priced = self._priced(region, batch_view, refused, bound)
             if self.drafts:
-                rows = replace(batch_view, target_bs=None)  # its drafter's at its rows
-                bound = self.resolver and self._bound(rows)
+                bound = self.resolver and self._bound(batch_view, draft=True)
                 priced += [
                     (DRAFT + p[0], *p[1:])
                     for p in self._priced(drafted, batch_view, refused, bound)
@@ -344,10 +348,12 @@ class OpGraphBackend(CostBackend):
         if refused:
             raise CostRefused(batch_view, list(dict.fromkeys(refused)))
         seconds: dict[str, list[float]] = {}
+        parts: dict[str, list[dict]] = {}
         stated: dict[str, list[str]] = {}
         how: dict[str, tuple[list, list]] = {}
-        for name, s, notes, _, _, (origins, declined) in priced:
+        for name, s, notes, _, _, (origins, declined), by in priced:
             seconds.setdefault(name, []).append(s)
+            parts.setdefault(name, []).append(by)
             stated.setdefault(name, []).extend(notes)
             got = how.setdefault(name, ([], []))
             got[0].extend(origins)
@@ -376,7 +382,8 @@ class OpGraphBackend(CostBackend):
                 note=note and note + NONE,
                 validated=validated,
             )
-            terms.append(CostTerm(name, fold_seconds(values), provenance, drafted))
+            by = fold_parts(parts[name])
+            terms.append(CostTerm(name, fold_seconds(values), provenance, drafted, by))
         cost = StepCost(terms)
         if graph is not None:
             composed = self._graphs.get(graph, (0, 0, {}))[2]
@@ -391,20 +398,32 @@ class OpGraphBackend(CostBackend):
         first = "a price list, then " if self.resolver else ""
         return f"op graph at TP {self.tp}, {first}one roofline per leaf, at {rows}"
 
-    def _bound(self, view: BatchView) -> tuple:
+    def _bound(self, view: BatchView, draft: bool = False) -> tuple:
         """What a price list reads of a step: its phase, its T and B, the rows
         its MoE gathers, None at their default (`gathered_off_default`),
         and its rows' context and max context (`band`), the
         context a decode's max, a prefill's mean cached tokens. A padded target
         (`target_bs`) adds it at that width, G at its default there, and the
         counts a leaf leads with at its rows and at that width: a decode's
-        tokens, its MoE's gathered at the width; a prefill's, its width."""
-        rung = view.capture_rung if self.padded else None
+        tokens, its MoE's gathered at the width; a prefill's, its width.
+        With `draft`, its drafter's: its first pass at its rows, unpadded, G
+        `draft_moe_rows` off its rows' default; its later passes at `draft_bs`,
+        G every rank's `draft_bs`; the first pass's gathered a rows' count, the
+        later passes' a width's. An eager DP drafter with later passes runs
+        them at its rows, G `draft_rows`, a capture's MoE gathering this rank's
+        rows at every peer. A leaf with both counts is asked at its rows'
+        T and B and the smaller G: on a drafter its rows carry the first
+        pass's G, above a later pass's."""
+        rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
-        width = self.padded and view.target_bs
+        width = self.padded and (view.draft_bs if draft else view.target_bs)
+        if draft and self.drafts > 1 and view.draft_rows:
+            width = b
         ran = phase == "decode" and width or t
-        g = gathered_off_default(phase, ran, view.moe_rows, self.dp, self.drafts)
+        gathered = view.draft_moe_rows if draft else view.moe_rows
+        at = t if draft else ran
+        g = gathered_off_default(phase, at, gathered, self.dp, self.drafts)
         rows = [(r.query_tokens, r.context_tokens) for r in view.requests]
         mean, top = band(rows, phase == "decode")
         bound = (phase, t, b, g, top if phase == "decode" else mean, top)
@@ -416,8 +435,16 @@ class OpGraphBackend(CostBackend):
             k = range(1, self.drafts + 2)
             counts = {b * j for j in k}
             wides = {width * j for j in k} | {self.dp * width * k[-1]}
-        wide = (phase, ran, width, *bound[3:])
-        return bound, wide, (frozenset(counts), frozenset(wides))
+        wide, both = (phase, ran, width, *bound[3:]), bound
+        if draft:
+            padded = self.dp * width
+            later = view.draft_rows or padded
+            counts, wides = counts | {gathered}, {width, padded, later}
+            wide = (phase, ran, width, gathered and later, *bound[4:])
+            low = gathered and min(gathered, later)
+            g = gathered_off_default(phase, t, low, self.dp, self.drafts)
+            both = (phase, t, b, g, *bound[4:])
+        return bound, wide, both, (frozenset(counts), frozenset(wides))
 
     def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
@@ -500,7 +527,7 @@ class OpGraphBackend(CostBackend):
             at.append(shape)
             bound = self.resolver and self._bound(half)
             run = [0.0]
-            for name, seconds, stated, _, comm, how in self._priced(
+            for name, seconds, stated, _, comm, how, _ in self._priced(
                 region, half, refused, bound
             ):
                 if comm is None:
@@ -526,7 +553,7 @@ class OpGraphBackend(CostBackend):
             )
             raise CostRefused(view, [Refusal(SOURCE, reason)])
         name = TBO + ".price_list" if listed else TBO
-        price = (name, overlap([zip(*runs)]), notes, Work(), False, (origins, why))
+        price = (name, overlap([zip(*runs)]), notes, Work(), False, (origins, why), {})
         return " and ".join(at), [price]
 
     def _priced(self, region: dict, view: BatchView, refused: list, bound) -> list:
@@ -543,7 +570,7 @@ class OpGraphBackend(CostBackend):
                 isinstance(a, dict) and a.get("role") == "activation"
                 for a in region["args"].values()
             )
-            return [(*leaf[:4], comm, leaf[4])] if leaf else []
+            return [(*leaf[:4], comm, *leaf[4:])] if leaf else []
         if "repeat" in region:
             body = self._priced(region["repeat"], view, refused, bound)
             return body * region["count"]
@@ -566,12 +593,12 @@ class OpGraphBackend(CostBackend):
             # The longest branch's prices stay under their own terms; the
             # first carries every branch's work for an enclosing resource_bound.
             return [
-                (*p[:3], summed if i == 0 else Work(), comm, p[5])
+                (*p[:3], summed if i == 0 else Work(), comm, *p[5:])
                 for i, p in enumerate(longest)
             ]
         name = f"par.{region['join']}"
         unit = self._unit(name, summed, refused)
-        return [(name, *unit, summed, comm, ((), ()))] if unit else []
+        return [(name, *unit[:2], summed, comm, ((), ()), unit[2])] if unit else []
 
     def _leaf(self, leaf: dict, view: BatchView, refused: list, bound):
         """`_price_leaf`, once a step for each value of every path its op
@@ -635,16 +662,17 @@ class OpGraphBackend(CostBackend):
             notes = term.provenance.note.split("; ") if term.provenance.note else []
             name = f"{term.name}.price_list" if listed else term.name
             how = ((term.provenance,) if listed else (), got.declined)
-            return name, term.seconds, notes, Work(), how
+            return name, term.seconds, notes, Work(), how, term.by_bound
         if isinstance(w, tuple):
             refused.extend(w)
             return None
         unit = self._unit(leaf["op"], w, refused)
-        return unit and (f"op.{leaf['op']}", *unit, w, ((), ()))
+        return unit and (f"op.{leaf['op']}", *unit[:2], w, ((), ()), unit[2])
 
     def _unit(self, what: str, w: Work, refused: list):
-        """One pricing unit's seconds and the stated spec fields its largest
-        bound read; None, with its refusal, when it cannot be priced."""
+        """One pricing unit's seconds, the stated spec fields its largest
+        bound read and its seconds by that bound (`work.binding`); None, with
+        its refusal, when it cannot be priced."""
         reads = _reads(w)
         values = self.machine.values
         missing = [p for ps in reads.values() for p in ps if p not in values]
@@ -656,12 +684,13 @@ class OpGraphBackend(CostBackend):
             refused.append(Refusal(SOURCE, reason))
             return None
         try:
-            b = bounds(w, self.machine)
+            by = binding(w, self.machine)
         except ValueError as exc:
             refused.append(Refusal(SOURCE, f"{what}: {exc}"))
             return None
-        won = max(b, key=b.get)
-        return b[won], [s for p in reads[won] if (s := self._stated(p))]
+        won = "comm" if "comm.latency" in by else next(iter(by))
+        notes = [s for p in reads[won] if (s := self._stated(p))]
+        return fold_seconds(by.values()), notes, by
 
     def _stated(self, path: str) -> str:
         """`path` and its origin when it is neither a datasheet's nor probed."""

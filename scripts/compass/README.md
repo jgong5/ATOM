@@ -27,7 +27,7 @@ about an hour.
 | `compass` | either | The `compass` console script, run from this tree, for an image whose ATOM install has none. The stage-2 cell below runs it. |
 | `pd_sim.sh` | GPU container | A simulated 1P1D run: the standalone clock authority (`python -m atom.compass.run`), a prefill and a decode API server on the simulated KV connector, and `atomesh` in PD mode between them. `tests/compass/test_pd_slice.py` drives one request through it. Its variables are in its header. |
 | `deploy.sh` | GPU container; with `--on`, one per node | A prefill-decode deployment with `atomesh` between its instances: simulated, one `compass run` per instance, joined to the clock authority the script starts, or real, one `compass record` per instance. `--on` starts the decode instance on another node through a command prefix (`ssh <host>`, `srun -w <host> ...`). Simulated with `--dp-aware` among the router's arguments, the router is the run's router LP, and `ATOMESH` must name an `atomesh` built from the tree being run (`cargo build --release` in `atom/mesh`); one built from other router source, as the containers' `/usr/local/bin/atomesh` is, is refused. A client drives it through `OUT/server.json` as it drives one server. Its usage is in its header. |
-| `parity_one_node.sh` | GPU container, two devices (eight for `CONFIG=dsv4-dpa8`) | The scheduling-parity test: one workload (`python -m atom.compass.parity.traffic`) on a real `-tp 2 --enable-dp-attention` server (`CONFIG=tp2-plain`: `-tp 2` alone; `CONFIG=dsv4-dpa8`: DeepSeek-V4-Pro's nightly `-tp 8 --enable-dp-attention --enable-tbo` server) with the step record on, then on a simulated one whose steps each end when the real one's did (`atom/compass/parity/replay.py`; `step_stub` prices their device time into the cost record only), and `python -m atom.compass.parity` over the two records. With `STORE` unset it first runs `compass measure memory` on the real run's GPUs, flags and environment into `OUT_DIR/store`, under `LMCACHE=1` with an lmcache server of its own beside it, and the simulated run reads that store. The last lines are the real run's admission (send to response headers: minimum, median, maximum) and, per DP rank, the steps compared, the steps identical and the first divergence. Its variables are in its header. |
+| `parity_one_node.sh` | GPU container, two devices (eight for `CONFIG=dsv4-dpa8`) | The scheduling-parity test: one workload (`python -m atom.compass.parity.traffic`) on a real `-tp 2 --enable-dp-attention` server (`CONFIG=tp2-plain`: `-tp 2` alone; `CONFIG=dsv4-dpa8`: DeepSeek-V4-Pro's nightly `-tp 8 --enable-dp-attention --enable-tbo` server; `CONFIG=pp2`: `-tp 1 -pp 2`, each stage replayed from and compared on its own record) with the step record on, then on a simulated one whose steps each end when the real one's did (`atom/compass/parity/replay.py`; `step_stub` prices their device time into the cost record only), and `python -m atom.compass.parity` over the two records. With `STORE` unset it first runs `compass measure memory` on the real run's GPUs, flags and environment into `OUT_DIR/store`, under `LMCACHE=1` with an lmcache server of its own beside it, and the simulated run reads that store. The last lines are the real run's admission (send to response headers: minimum, median, maximum) and, per DP rank, the steps compared, the steps identical and the first divergence. Its variables are in its header. |
 | `PYTHONPATH=$T python -m atom.compass.detect.scenario` | either | The acceptance checks every simulated deployment's runs are held to, over the out_dirs of one run file run under different `PYTHONHASHSEED`: each run reached its finish with no refusal, the step tables are byte-identical, and each channel's messages were released to their receiver once each and none behind its clock. With `--record LP=DIR`, an engine LP's TAR rows must equal the timeline a constant step stub implies, computed from the parity record in `DIR` (`pd_sim.sh` writes one per side when `ATOM_COMPASS_PARITY_RECORD` is set). Prints each failure and exits 1. The vertical, DP, PD and PD-DP slices in `tests/compass/` hold their runs to it, with the traffic's outputs too. |
 | `mi308x_spec.py` | GPU container, node 18 or hjbog-srdc-39; any container with `atom` under `--sweep-from` | `python3 scripts/compass/mi308x_spec.py`: rebuild `machines/mi308x-hjbog18.json`, the node-18 MI308X machine spec, by sweeping Qwen3.8-27B's tokenizer on this host and merging it with the device, capacity and stack of one real engine start and the HTTP intake terms `http_intake.py` fitted over one real burst (`INTAKE`), on node 18 the idle intake over lone requests (`IDLE`), each recorded in the script; with `COMPASS_MACHINE=mi308x-hjbog39`, the same for hjbog-srdc-39 into `machines/mi308x-hjbog39.json`, with the PP carriers `pp_carriers.py` fitted there (`PP`, which names the fit's commit and its record's sha256), and on node 18 the attainable peaks `probe_device.py` read (`PEAKS`, which names the probe's commit and its record's sha256). `--sweep-from DOC` takes the sweep a written document carries instead. Prints `validate`'s verdict and `explain`'s fields grouped by origin; on either host a value no probe fills reads `assumed`. |
 | `pp_carriers.py` | GPU container, two devices of one node | `HIP_VISIBLE_DEVICES=a,b torchrun --nproc-per-node 2 scripts/compass/pp_carriers.py OUT`: send one message per size between the two devices over RCCL and gloo, the receive posted first and late, and fit each carrier's eager threshold, overhead, latency, per-byte time and rendezvous fixed part, and how late a gloo sender blocked before the receive is posted goes on (`wake_s`, `wake_rise_s`). Writes OUT, a JSON record of the fit, its error spread, every sample and the script's text. `python3 scripts/compass/pp_carriers.py OUT RECORD...` fits several such records' samples pooled and names each record's sha256 in place of the samples: one probe's wake moves from run to run. `mi308x_spec.py`'s `PP` states a fit and cites its record. Check the two devices are idle before and after. |
@@ -700,6 +700,12 @@ memory against that side's hand-in (`lp-engine-P.json`, `lp-engine-D.json`); end
 end once, from the deployment's export. The export names decode's response ids, so
 prefill's side is split through decode's `transfers.jsonl` (`parity.transfers`).
 
+## The analytical bound — `python -m atom.compass.validate.bound`
+
+`PYTHONPATH=$T python -m atom.compass.validate.bound ... RECORD...` exits 1 when a real
+record's step is priced above its measured device time; `compass project` prices real
+records on another device. Each module's docstring states its arguments and report.
+
 ## The stage-2 cell through the `compass` CLI, from an empty store
 
 Qwen3.8-27B TP1 on MI308X, priced by a step linear law `compass fit steps` fits on
@@ -776,13 +782,14 @@ Developer checks, outside the `compass` path:
 
 The step grid reuses steps 1 to 4: the calibration records are its residual's
 targets, and the real runs are its coverage check's inputs and its graded side.
-Its points are planned from shape populations rather than records: the planner
-refuses inputs stating two KV block counts, and two real starts of one
-configuration differ by a few blocks (#1349), while every simulated start takes
-its count from the one `memory_readings` entry. A population may serve any
-traces, the graded ones included, since its shapes are all the plan reads. The
-grid definition is a calibration input; `$G` below holds nodes at powers of two
-and no margin:
+Its points are planned from the shape populations and step 4's real runs, so
+every cell a real step falls in is measured: a population alone leaves the cells
+of shapes only the real server scheduled unmeasured (#1884). The plan reads
+shapes only, so its inputs may serve any traces, the graded ones included; a
+point's time is the bench's alone. A real start's KV block count moves with
+its free memory, so the grid is planned for the smallest count any input
+states. The grid definition is a calibration input; `$G` below holds nodes at
+powers of two and no margin:
 
 ```json
 {"prefill": {"B": [1, 2, 4, ..., 256], "T": [1, 2, 4, ..., 16384],
@@ -794,17 +801,19 @@ and no margin:
    --out $R/pop/<traces>/c<C> -- $ATOM`, with `client.sh $R/pop/<traces>/c<C>
    --traces <traces> --concurrency <C> --stop`, `<traces>` 256-392 and 0-255; its
    stop publishes a `shape_population`, `POP` below.
-7. `compass measure steps --grid POP... --grid-definition $G --client-run POP
-   $R/pop/<traces>/c<C>/artifacts/client_run.json ... --sampling '{"ignore_eos":
-   true}' --gpu G $S --out $R/grid -- $ATOM`. The deep-context prefill corners
-   take most of its hours. Several GPUs each take a subset of the populations
-   into a store of its own, starts a minute apart; copying each store's
-   `step_measurement` entries into one, and this step again over every
-   population, measures what remains.
-8. `compass fit steps --backend step-grid --grid POP... --grid-definition $G
-    $R/cal/c* --client-run ...`, naming every population and record, `$M $S --out
-    $R/fit-grid`; it prints the bundle's token. A second fit of one definition
-    into one store is refused as an overwrite: refit into a fresh store.
+7. `compass measure steps --grid POP... $R/cell/c*/real* --grid-definition $G
+   --client-run POP $R/pop/<traces>/c<C>/artifacts/client_run.json --client-run
+   <real run> <real run>/artifacts/client_run.json ... --sampling '{"ignore_eos":
+   true}' --gpu G $S --out $R/grid -- $ATOM`, naming every population and every
+   real run. The deep-context prefill corners take most of its hours. Several
+   GPUs each take a subset of the inputs into a store of its own, starts a minute
+   apart; copying each store's `step_measurement` entries into one, and this step
+   again over every input, measures what remains.
+8. `compass fit steps --backend step-grid --grid POP... $R/cell/c*/real*
+    --grid-definition $G $R/cal/c* --client-run ...`, naming every population,
+    real run and record, `$M $S --out $R/fit-grid`; it prints the bundle's
+    token. A second fit of one definition into one store is refused as an
+    overwrite: refit into a fresh store.
 9. `compass run --step-grid BUNDLE --host-laws HOST --coverage $R/cell/c<C>/real*
     $M $S --out $R/cell-grid/c<C>/step_grid -- $ATOM`, serving the same client run as
     step 5. The check counts the real steps the bundle covers, extrapolates past
@@ -812,3 +821,42 @@ and no margin:
     takes only a run that ran it.
     Link `$R/cell/c<C>/real*` into `$R/cell-grid/c<C>`: grading refuses a cell holding
     both `step_linear/` and `step_grid/`.
+
+### The same cell under the op-level backend
+
+The op-level backend reuses steps 1 to 3 and step 6's populations, and is graded on
+the same real runs as step 5: step 4's, or `REAL=1 cctraces_sim.sh` runs of traces 0 to
+255 at the same concurrency and seed, which `client.sh` sends the same requests as.
+Its graphs, points and price list are keyed by the environment as well as ATOM's
+arguments, `AITER_LOG_LEVEL` among the variables, so trace, measure, run and grade in
+one: grading in another refuses every real step's graph.
+
+10. `compass trace ops --model <Qwen3.8-27B> --population $R/pop/<traces>/c<C>...
+    --population <real run>... $S -- --max-model-len 262144`, naming every population
+    of step 6 and every real run graded: an `op_graph` per shape their steps hold,
+    traced with no device. `run` traces a shape no graph holds itself, a model build
+    each, which its wall time pays; `run --coverage` and grading trace none, and
+    leave a real step whose shape no graph holds out of their counts.
+11. `compass measure ops --plan $R/pop/256-392/c<C>... --llc-mib 256 --gpu G $S --out
+    $R/ops -- $ATOM --enforce-eager --level 0`: the op bench's planner over the
+    calibration traces' populations, in rounds, on one card. The bench runs eager and
+    refuses a compiled level; neither flag enters a graph's or a point's key.
+    The plan stops when a round finds nothing left to measure, hours in on this
+    cell; run it under `timeout`, and run a stopped one again into the same `--out`,
+    which keeps the rounds already there.
+    `compass measure ops --coverage <real run>... $S --out $R/ops -- <the same
+    arguments>` prints how the plan's points cover the real steps, by phase, and
+    why each leaf kind left steps out.
+12. `compass fit ops $S --out $R/fit-ops $R/ops` publishes the `price_list`, naming
+    every `--out` that measured a point.
+13. `compass run --op-graph --host-laws HOST --coverage <real run>... $M $S --out
+    $R/cell-ops/c<C>/op_graph -- $ATOM`, serving the same client run as step 5. The
+    check counts the real steps whose every leaf the price list prices; a leaf it
+    declines is priced by its analytical law, not refused. Link the real runs into
+    `$R/cell-ops/c<C>` and grade with `python -m atom.compass.validate
+    $R/cell-ops/c<C>`, whose cost rows add, per phase, the priced seconds by method,
+    each op kind's composed seconds over the measured ones, and warm over cold per
+    kind. Beside `cctraces_sim.sh` real runs, which grading takes whole, the `run`
+    cell is graded whole too, with the request aiperf cancelled at its cutoff: the
+    server steps it alone until `client.sh --stop` stops the server, and grading
+    takes those steps only from an export that `--stop` marked `server_stopped`.

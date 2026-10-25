@@ -8,8 +8,10 @@ time, plus `d_gap_ns` on a decode, and its line's host segments: `E` from the pr
 `W_pre` to the launch less the staging gate's and MTP status waits, `W_launch` to the
 recv wait (the sampler's launch included), and `W_post` from the recv wait to the exit
 less the draft copy wait; with
-`d_target_ns`, under MTP, the rest of `d_busy_ns` is draft, `W_inputs` is the part of
-`W_pre` after the MTP status wait, and no `d_gap_ns` is fed. Each forward is called at the
+`d_target_ns`, under MTP, the target runs to `forward_done_event`, with
+`d_draft_kv_ns` on an output forward, the rest of `d_busy_ns` is draft, `W_inputs` is the part of
+`W_pre` after the MTP status wait, `L_mtp` is `step_labels.mtp_copy`'s time,
+and no `d_gap_ns` is fed. Each forward is called at the
 exit predicted for the one before, so only the waits and device times move it.
 A pipeline record is gated step by step, each stage charged with the predicted
 times of the others (`pipeline`), its sends priced on a machine spec's PP
@@ -60,6 +62,7 @@ from atom.compass.backends.step_linear_fit import WARM_FACTOR
 from atom.compass.parity import ARRIVALS, read
 from atom.compass.runner.overrides import (
     FORWARD_KINDS,
+    MTP_COPY,
     HostDeviceRecurrence,
     forward_shape,
 )
@@ -157,6 +160,7 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
     flush = None if downstream is None else ([], [])  # steps inferred, stamped
     origin = steps[0]["t_enter_ns"]
     mtp = any("d_target_ns" in s for s in steps)
+    copy = step_labels.mtp_copy(steps) if mtp else {}
     rec = HostDeviceRecurrence({}, (), lambda: now, stage, mtp=mtp)
     for n, s in enumerate(steps):
         if "d_busy_ns" not in s:
@@ -200,13 +204,15 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
         launch = r0 - l0 - (p1 - p0)
         law = {"E": e, "W_pre": pre - (l0 - m1), "W_launch": launch, "W_post": post}
         law |= {"W_inputs": l0 - m1, "W_recv": p0 - l0}
+        law[MTP_COPY] = copy.get(s["step"], (0,))[0]
         law = {g: (v * 1e-9, 0, 0) for g, v in law.items()}
         rec.laws = {k: law for k in FORWARD_KINDS}
         queued = rec.ends[1] - max(entry + pre * 1e-9, sent)
         # Under MTP, the wait for the previous output's MTP status sits inside
-        # W_pre: released where it starts or where that output's target ends.
+        # W_pre: released where it starts or once that output's target ends
+        # and its status copy is in.
         head = (m0 - s["t_enter_ns"] - (g1 - g0)) * 1e-9
-        due = max(entry + head, rec.output_end)
+        due = max(entry + head, rec.output_end + law[MTP_COPY][0])
         batch = SimpleNamespace(total_tokens_num=0, total_seqs_num=0)
         batch.compass_pp_host = (called, sent)
         batch.total_seqs_num_prefill = sum(not d for *_, d in s["rows"])
@@ -220,6 +226,8 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
             gap = 0
         busy = s["d_busy_ns"]
         target = s.get("d_target_ns", busy)
+        if "d_target_ns" in s and s["produces_output"]:
+            target += s.get("d_draft_kv_ns", 0)  # it precedes forward_done_event
         own = gap + target - s.get("d_recv_ns", 0)  # the receive is a wait, not work
         charge = rec.charge(batch, own * 1e-9, (busy - target) * 1e-9)
         times = (now + charge - post * 1e-9, rec.ends[-1], called, now + charge, done)
