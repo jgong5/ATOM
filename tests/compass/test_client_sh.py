@@ -223,6 +223,24 @@ def test_stop_stops_the_command_once_the_export_is_written(tmp_path):
     assert (out / "run.json").exists() and (out / "artifacts" / NAME).exists()
 
 
+@pytest.mark.parametrize("writes_run", [True, False])
+def test_stop_sets_the_exports_server_stopped_only_once_the_command_wrote_its_run(
+    tmp_path, writes_run
+):
+    out, env = _setup(tmp_path)
+    no_run = COMMAND.replace('(out / "run.json").write_text("{}")', "pass")
+    (tmp_path / "compass_command.py").write_text(COMMAND if writes_run else no_run)
+    command = subprocess.Popen([sys.executable, tmp_path / "compass_command.py", out])
+    while not (out / "server.json").exists():
+        assert command.poll() is None
+        time.sleep(0.1)
+    done = _client(out, *GOOD, "--stop", env=env)
+    assert command.wait(timeout=10) == 0
+    assert done.returncode == (0 if writes_run else 1), done.stdout + done.stderr
+    export = json.loads((out / "artifacts" / NAME).read_text())
+    assert export.get("server_stopped") is (True if writes_run else None)
+
+
 #: The step `$BREAK` breaks, and the refusal it gets.
 REFUSALS = {
     "health": "server: http://h:1/health does not answer",

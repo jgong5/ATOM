@@ -114,6 +114,39 @@ def test_a_deprecated_command_refuses_naming_where_its_work_went(words, named):
         cli.main([*words.split(), "--out", "d"])
 
 
+@pytest.mark.parametrize("words", ["validate", "validate bound", "validate project"])
+def test_validate_refuses_naming_both_python_m_checks_and_compass_project(words):
+    with pytest.raises(SystemExit) as refused:
+        cli.main([*words.split(), "--model", "m"])
+
+    assert refused.value.code == (
+        "compass validate: deprecated: grading is python -m atom.compass.validate, "
+        "the analytical bound check python -m atom.compass.validate.bound, and a "
+        "projection compass project"
+    )
+
+
+def test_project_is_a_command_and_the_bound_check_runs_by_python_m(
+    monkeypatch, tmp_path
+):
+    from atom.compass.validate import project
+
+    got = []
+    monkeypatch.setattr(project, "main", got.append)
+    cli.main(["project", "--model", "m", "rec"])
+    assert got == [["--model", "m", "rec"]]
+
+    spec = tmp_path / "spec.json"
+    bound = ["-m", "atom.compass.validate.bound", "--model", "m", "--machine", spec]
+    argv = [sys.executable, *map(str, bound), "--store", "s", "rec"]
+    done = subprocess.run(argv, capture_output=True, text=True, check=False)
+    assert done.returncode == 1 and "Traceback" not in done.stderr
+    assert done.stderr.splitlines()[-1] == (
+        "python -m atom.compass.validate.bound: "
+        f"[Errno 2] No such file or directory: '{spec}'"
+    )
+
+
 @pytest.mark.parametrize("argv", [[], ["fit"], ["measure", "everything"]])
 def test_no_command_refuses_with_the_usage(argv):
     with pytest.raises(SystemExit, match="usage: compass <command>"):

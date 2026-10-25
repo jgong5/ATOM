@@ -139,10 +139,10 @@ and the device gap, from the previous forward's exit event to this forward's ent
 Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-6116328961),
 2026-10-12, sets it per step kind:
 
-| step kind | label | launch-exposed cut |
+| step kind | label | cut |
 |---|---|---|
-| decode | device gap + busy window | kept |
-| output prefill, middle chunk | busy window | none |
+| decode | device gap + busy window | launch-exposed |
+| output prefill, middle chunk | busy window | host-paced |
 
 - **Decode.** The gap is device work between forwards that no other term carries; leaving
   it out charged decode about 0.29% short on #824's c=1 record (#841). A forward whose
@@ -150,10 +150,20 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   launch event that finds the device idle completes on enqueue, so the cut also keeps
   device idle out of the gap.
 - **Prefill and middle chunks.** No gap: after an idle engine the gap holds the idle time.
-  No cut: under an eager launch the device starts the first kernel while the host still
+  No launch-exposed cut: under an eager launch the device starts the first kernel while the host still
   launches the rest, so device start precedes launch end on every eager forward, and the
   cut would leave prefill unpriced.
-- **Accepted approximation.** A host bubble inside a prefill forward stays in its device
+- **Host-paced prefill.** A prefill forward whose exit event ran less than 8% of its label
+  after the host recorded it is cut as host-paced and counted apart: the device had caught
+  up with the host's launch, so its window holds device idle between launches and only
+  bounds its device time. A device event runs no earlier than the host records it, so the
+  largest launch record less its device start, over the record, places device times on the
+  host clock. On the DSpark TP2 records the share falls in two clusters, host-paced output
+  prefills at 0 to 4.3% and device-paced forwards from 11%; a traced run's kernel busy time
+  confirms the split ([#1983](https://github.com/jgong5/ATOM/issues/1983)). The 8% share is
+  interim: [#2072](https://github.com/jgong5/ATOM/issues/2072) labels every prefill pass
+  with traced busy time instead.
+- **Accepted approximation.** A host bubble inside a device-paced prefill forward stays in its device
   time. Same-host parity absorbs it through `01` D4's `end = max(target_end,
   launch_end)`; skipping a host segment or pricing another host does not.
 
@@ -177,6 +187,14 @@ Under DP, `E` runs from the latest pull over the group before the same forward, 
 D4 places it ([#1893](https://github.com/jgong5/ATOM/issues/1893)).
 They use the step linear law's solver: D53's relative error and MAD drops, D57's report, D58's hull. An
 `E` sample whose gap spans an idle engine is cut as idle and counted apart.
+A forward whose `W_launch` its kind's fit drops above the law paid a first-use JIT
+compile, on a decode only past five times its price, since a decode's launch
+of a millisecond or so drops on host noise. It and the forward after it, whose period
+takes up the stall, are left out of every host law, and the fit lists them per run. The
+recurrence's priced grade charges both and grades neither, and reports their count and
+the time their charges leave out: a compile is cold-start cost, measured and reported as
+D62 treats leading warmth, never charged
+([#1983](https://github.com/jgong5/ATOM/issues/1983)).
 
 - **Key:** the host CPU, the `atom` source digest, the model, the engine config and the
   machine-spec digest (`07` D41). A mismatch refuses. There is no transfer mode: the MI455 projection prices no host floor
@@ -554,7 +572,7 @@ choice that must be visible.
 | # | Decision | Date |
 |---|---|---|
 | D53 | Fit relative error, not absolute seconds. MAD outlier test on the same relative residuals. | 2026-09-18 |
-| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by alternating max-affine regression. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes cut and no prefill cut; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), are fitted beside it, keyed by host CPU, `atom` digest, model and engine config, with no transfer. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973) |
+| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by alternating max-affine regression. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes and host-paced prefills cut; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), are fitted beside it, keyed by host CPU, `atom` digest, model and engine config, with no transfer. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); host-paced prefill cut 2026-10-24 (#1983) |
 | D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61). | 2026-09-18; revised 2026-10-14 (#941) |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |

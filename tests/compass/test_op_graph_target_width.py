@@ -12,12 +12,15 @@ import re
 
 import pytest
 from test_capture_ir import _ops, _record
-from test_op_graph import g
+from test_op_graph import by_name, g, listed, pt
 from test_op_graph_drafter_width import DECODE, settled
+from test_op_work import leaf, t
 from test_work import SPEC
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
-from atom.compass.backends.op_graph import OpGraphBackend
+from atom.compass.backends import BatchView, RequestShape
+from atom.compass.backends.op_graph import LISTED, OpGraphBackend
+from atom.compass.backends.resolver import CostSource
 from atom.compass.backends.work import gemm, price
 from atom.compass.capture import population_shapes
 
@@ -25,6 +28,7 @@ EMBED = "aten.embedding.default"
 MOE = "aiter.fused_moe_.default"
 GEMM = "aiter.gemm_a16w16.default"
 ARGMAX = "aiter.ops.flydsl.topk.topk_per_row_argmax:topk_per_row_argmax"
+MUL = "aten.mul.Tensor"
 #: DeepSeek-V4-Pro's vocabulary, its LM head's rows at TP1.
 VOCAB = 129280
 
@@ -150,3 +154,288 @@ def test_a_capture_keeps_an_eager_decode_s_drafter_only_from_its_own_shape(tmp_p
     # The target at its width; its drafter only at its rows on the batch of 4,
     # where the run reads it.
     assert graphs == {(False, "decode B=3 W=4"), (True, "decode T=3 B=4 G=8")}
+
+
+def argmax(rows):
+    """A sampler leaf over `rows` rows of a vocabulary of 64."""
+    return leaf(ARGMAX, (), scores=t([rows, 64]), indices=t([rows, 1]))
+
+
+class Asked(CostSource):
+    """A price list that notes each leaf's op, leading rows and T and B, and
+    declines."""
+
+    name = LISTED
+
+    def __init__(self):
+        self.asked = []
+
+    def price(self, request):
+        op, (_, tokens, seqs, *_), _ = request
+        rows = [*next(iter(op["args"].values()))["shape"], None][0]
+        self.asked.append((op["op"], rows, tokens, seqs))
+        return self.refuse("asked")
+
+
+def mixed(rows, width=4):
+    """A mul of `rows` rows broadcast across `width`."""
+    return leaf(MUL, [[width, rows, 64]], self=t([rows, 64]), other=t([width, 1, 64]))
+
+
+@pytest.mark.parametrize(
+    "rows,options,graph,asked",
+    [
+        (
+            [(1, 90, True)] * 3,
+            {},
+            [g(4, 3, 64), argmax(3)],
+            [(GEMM, 4, 4, 4), (ARGMAX, 3, 3, 3)],
+        ),
+        # Its drafter's at its rows, whatever its leaves lead with.
+        (
+            DECODE,
+            {"drafts": 2},
+            [g(12, 64, 64), argmax(6), argmax(9)],
+            [(GEMM, 12, 4, 4), (ARGMAX, 6, 3, 3), (ARGMAX, 9, 3, 3)]
+            + [(GEMM, 12, 3, 3), (ARGMAX, 6, 3, 3), (ARGMAX, 9, 3, 3)],
+        ),
+        # At DP2: its model at the width's tokens, an MoE over the width's gathered.
+        (
+            DECODE,
+            {"drafts": 2, "dp": 2},
+            [g(12, 64, 64), g(24, 32, 64), mixed(9, 12), argmax(9)],
+            [(GEMM, 12, 4, 4), (GEMM, 24, 4, 4), (MUL, 9, 3, 3), (ARGMAX, 9, 3, 3)]
+            + [(GEMM, 12, 3, 3), (GEMM, 24, 3, 3), (MUL, 9, 3, 3), (ARGMAX, 9, 3, 3)],
+        ),
+        # Its model at its rows, an MoE GEMM over 24 gathered rows among it.
+        (
+            [(3, 3, False)] * 3,
+            {},
+            [g(9, 64, 64), g(24, 32, 64), g(4, 128, 64), mixed(3), mixed(9), argmax(3)],
+            [(GEMM, 9, 9, 3), (GEMM, 24, 9, 3), (GEMM, 4, 9, 4)]
+            + [(MUL, 3, 9, 3), (MUL, 9, 9, 3), (ARGMAX, 3, 9, 3)],
+        ),
+        # Leaves that lead with no count of its rows or its width, at its rows.
+        (
+            [(1, 90, True)] * 3,
+            {},
+            [leaf(MUL, [s], self=t(s), other=t(s)) for s in ([1, 3, 64], [64, 4], [])],
+            [(MUL, 1, 3, 3), (MUL, 64, 3, 3), (MUL, None, 3, 3)],
+        ),
+        # Leaves over its rows and its width, at its rows.
+        (
+            [(1, 90, True)] * 3,
+            {},
+            [
+                mixed(3),
+                leaf(
+                    MUL,
+                    [[3, 4, 64]],
+                    self=t([3, 1, 64], role="weight"),
+                    other=t([4, 64]),
+                ),
+                leaf(MUL, [[4, 3]], self=t([4, 3]), other=t([3], role="metadata")),
+            ],
+            [(MUL, 3, 3, 3), (MUL, 3, 3, 3), (MUL, 4, 3, 3)],
+        ),
+        # Unpadded, at its rows.
+        ([(1, 90, True)] * 3, {"padded": False}, [g(4, 64, 64)], [(GEMM, 4, 3, 3)]),
+    ],
+    ids=[
+        "eager-decode",
+        "eager-mtp-decode",
+        "mtp-dp2",
+        "sampling-prefill",
+        "unrecognised",
+        "mixed",
+        "real-rows",
+    ],
+)
+def test_a_padded_target_asks_its_price_list_at_the_rows_each_leaf_ran(
+    rows, options, graph, asked
+):
+    step = BatchView(
+        tuple(RequestShape(*row) for row in rows), produces_output=True, target_bs=4
+    )
+    listing = Asked()
+    backend = OpGraphBackend(
+        SPEC,
+        lambda *_, **__: {"seq": graph},
+        kv="bf16",
+        price_list=listing,
+        **options,
+    )
+    backend.price(step)
+
+    assert listing.asked == asked
+
+
+# Each leaf measured on the graphs at rungs 3 and 4, where it runs the rung's
+# rows; flat in context.
+RUNGS = listed(
+    *[
+        pt(op, f"decode B={b}", ns, c)
+        for b, ns, sampled in ((3, 5e3, 1e3), (4, 7e3, 2e3))
+        for op, ns in ((g(b, 64, 64), ns), (argmax(b), sampled))
+        for c in (100, 1000)
+    ]
+)
+
+
+@pytest.mark.parametrize("dp,moe_rows", [(1, None), (2, 8)], ids=["one-rank", "dp2"])
+def test_a_padded_decode_prices_its_model_at_its_width_and_its_sampler_at_its_rows(
+    dp, moe_rows
+):
+    # Rank 0 decodes 3 rows eagerly, padded to 4; at DP2 its MoE gathers 4 from
+    # each rank, the default at its width.
+    step = BatchView((RequestShape(1, 90, True),) * 3, moe_rows=moe_rows, target_bs=4)
+    graph = {"seq": [g(4, 64, 64), argmax(3)]}
+    backend = OpGraphBackend(
+        SPEC, lambda *_, **__: graph, kv="bf16", dp=dp, price_list=RUNGS
+    )
+    cost = backend.price(step)
+
+    assert not cost.refusals
+    assert by_name(cost) == {
+        f"op.{GEMM}.price_list": pytest.approx(7e-6),
+        f"op.{ARGMAX}.price_list": pytest.approx(1e-6),
+    }
+
+
+FOUR = (RequestShape(3, 90, True),) * 4
+
+
+class AskedG(Asked):
+    """`Asked`, with each leaf's G too."""
+
+    def price(self, request):
+        got = super().price(request)
+        self.asked[-1] += (request[1][3],)
+        return got
+
+
+@pytest.mark.parametrize(
+    "options,view,graph,asked",
+    [
+        # V4-Pro MTP2 at DP2 beside a peer's 4 rows: its first pass's MoE gathers
+        # 9 + 12, every rank's later passes 4 rows each.
+        (
+            {"dp": 2},
+            {"moe_rows": 24, "target_bs": 4, "draft_moe_rows": 21},
+            [g(9, 64, 64), g(21, 32, 64), argmax(3), g(4, 64, 64), g(8, 32, 64)],
+            [(GEMM, 9, 3, 3, 21), (GEMM, 21, 3, 3, 21), (ARGMAX, 3, 3, 3, 21)]
+            + [(GEMM, 4, 4, 4, 8), (GEMM, 8, 4, 4, 8)],
+        ),
+        # At DP2 over 4 rows beside a peer's 6: its later passes' MoE gathers 12,
+        # a first-pass count too, asked at the rows and the smaller G.
+        (
+            {"dp": 2},
+            {"requests": FOUR, "draft_moe_rows": 30, "draft_bs": 6},
+            [g(12, 64, 64), g(30, 32, 64), g(6, 64, 64), g(12, 32, 64)],
+            [(GEMM, 12, 4, 4, 12), (GEMM, 30, 4, 4, 30), (GEMM, 6, 6, 6, 12)]
+            + [(GEMM, 12, 4, 4, 12)],
+        ),
+        # At DP2 over 4 rows, its `draft_bs`: a later pass's 4 at its G.
+        (
+            {"dp": 2},
+            {"requests": FOUR, "draft_moe_rows": 24},
+            [g(12, 64, 64), g(24, 32, 64), g(4, 64, 64), g(8, 32, 64)],
+            [(GEMM, 12, 4, 4, None), (GEMM, 24, 4, 4, None), (GEMM, 4, 4, 4, 8)]
+            + [(GEMM, 8, 4, 4, 8)],
+        ),
+        # At DP8 beside peers' 5 and 1 rows: a count of both sides at
+        # `draft_moe_rows`, below every rank's `draft_bs`.
+        (
+            {"dp": 8},
+            {"draft_moe_rows": 42, "draft_bs": 6},
+            [g(6, 64, 64), g(48, 32, 64)],
+            [(GEMM, 6, 3, 3, 42), (GEMM, 48, 6, 6, 48)],
+        ),
+        # At DP2 over 2 rows beside a peer's 6: a count of both sides at the
+        # rows' default G.
+        (
+            {"dp": 2},
+            {"requests": FOUR[:2], "draft_moe_rows": 24, "draft_bs": 6},
+            [g(6, 64, 64)],
+            [(GEMM, 6, 2, 2, None)],
+        ),
+        # At DP4: its first pass gathers its default, its later passes 16; a
+        # leaf over twice the width is no later pass's.
+        (
+            {"dp": 4},
+            {"moe_rows": 48, "draft_moe_rows": 36},
+            [g(9, 64, 64), g(36, 32, 64), g(4, 64, 64), g(16, 32, 64), g(8, 64, 64)],
+            [(GEMM, 9, 3, 3, None), (GEMM, 36, 3, 3, None), (GEMM, 4, 4, 4, 16)]
+            + [(GEMM, 16, 4, 4, 16), (GEMM, 8, 3, 3, None)],
+        ),
+        # Replayed at rung 4: its first pass at its rows.
+        (
+            {},
+            {"capture_rung": 4},
+            [g(9, 64, 64), g(4, 64, 64)],
+            [(GEMM, 9, 3, 3, None), (GEMM, 4, 4, 4, None)],
+        ),
+    ],
+    ids=[
+        "mtp-dp2",
+        "both",
+        "draft-bs-rows",
+        "both-low-g",
+        "both-default-g",
+        "dp4",
+        "replayed",
+    ],
+)
+def test_a_drafter_asks_its_price_list_at_the_rows_and_g_each_pass_ran(
+    options, view, graph, asked
+):
+    rows = tuple(RequestShape(*row) for row in DECODE)
+    step = BatchView(**{"requests": rows, "draft_bs": 4, **view})
+    listing = AskedG()
+    graphs = {False: {"seq": []}, True: {"seq": graph}}
+    backend = OpGraphBackend(
+        SPEC,
+        lambda *_, draft=False, **__: graphs[draft],
+        kv="bf16",
+        drafts=2,
+        price_list=listing,
+        **options,
+    )
+    backend.price(step)
+
+    assert listing.asked == asked
+
+
+# The drafter's later-pass GEMM measured at B=3 and 4, its MoE gathering 8.
+GATHERED = listed(
+    *[
+        pt(g(b, 64, 64), f"decode B={b} G=8", ns, c)
+        for b, ns in ((3, 5e3), (4, 7e3))
+        for c in (100, 1000)
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "dp,gathered,params",
+    [(1, {}, RUNGS), (2, {"moe_rows": 24, "draft_moe_rows": 21}, GATHERED)],
+    ids=["one-rank", "dp2"],
+)
+def test_a_drafter_prices_its_later_passes_at_draft_bs(dp, gathered, params):
+    # MTP2 over 3 rows; its later passes run 4.
+    step = BatchView(
+        tuple(RequestShape(*row) for row in DECODE), draft_bs=4, **gathered
+    )
+    graphs = {False: {"seq": []}, True: {"seq": [g(4, 64, 64)]}}
+    backend = OpGraphBackend(
+        SPEC,
+        lambda *_, draft=False, **__: graphs[draft],
+        kv="bf16",
+        dp=dp,
+        drafts=2,
+        price_list=params,
+    )
+    cost = backend.price(step)
+
+    assert not cost.refusals
+    assert by_name(cost) == {f"draft op.{GEMM}.price_list": pytest.approx(7e-6)}

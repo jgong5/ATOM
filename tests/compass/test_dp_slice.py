@@ -33,6 +33,7 @@ from test_vertical_slice import (
     Traffic,
     UnansweredRequests,
     _run_file,
+    publish_entry,
 )
 
 from atom.compass import run as compass_run
@@ -145,6 +146,7 @@ def run_dp_slice(
     args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
     args += width
     args += ["--enforce-eager", "--max-model-len", "2048"]
+    publish_entry(out / "store", machine, args, env)
     with open(out / "server.log", "w") as log:
         server = subprocess.Popen(
             [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]

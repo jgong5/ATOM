@@ -56,7 +56,8 @@ others, as the batch's state slots, or its blocks when the model keeps no
 per-request state, or, of a decode attention leaf that states its layer's
 window and compress ratio, the plane rows the batch's blocks hold at that
 ratio, a RoPE table's (`TABLES`), a weight or a tensor of a module it names,
-as many rows as the point's tokens, the other tensors of each module it names,
+as many rows as the point's tokens, a table a leaf gathers by token ids
+(`GATHERED`) as many rows as its ids, the other tensors of each module it names,
 of one whose first dimension is the pool's blocks the batch's blocks, and, for
 a leaf that names a context key, the KV and
 per-request state its layer holds for the batch. One graph runs the leaf K
@@ -64,10 +65,13 @@ times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
 kernels of one eager call of copy 0, the fewer, at least one, cycling over its
 copies: N built ones: M, the least count whose bytes pass `COLD` times the
 last-level cache, raised for a context key to its I instances (at most K),
-then, up to the leaf's occurrences when it takes a weight (at most K), copy
+then, up to the leaf's occurrences when it takes a weight other than a
+gathered table (at most K), copy
 c mod N with the c-th weights on that copy's other arguments.
 Copy c < N takes fresh activations below M and copy c mod M's from there,
-weight c mod the more of M and the leaf's occurrences, and
+weight c mod the more of M and the leaf's occurrences, a gathered table's one
+weight, its ids rows c n to (c + 1) n of one seeded permutation of the table's
+rows, n the ids' count, and
 instance c mod I at placement (c div I) mod P, its metadata and module
 tensors cloned past the first round: a placement is the point's batch on KV
 blocks and state slots of its own, as many as the pool and a KV registry
@@ -179,6 +183,9 @@ CALLS = 256
 #: at least one, so a capped graph holds at least 5 ms: a replay's fixed cost,
 #: about 19 us on MI308X, is under 0.4% of it.
 GRAPH_NS = 10_000_000
+#: Profiles of one call taken at most until two in a row name the same kernels:
+#: a profile can drop a call's kernel or keep a kernel launched before it.
+PROFILES = 4
 #: Times over the last-level cache the copies' bytes pass, and the bytes read
 #: before each cold replay: just past it, part of them stays there, and an
 #: MI308X GEMM read up to 7% fast.
@@ -206,6 +213,12 @@ TOKEN_IDS = {("aten.embedding.default", "indices")}
 #: RoPE's cos and sin tables, indexed by each token's position (or by each
 #: compressed position, at most one a token), never read whole.
 TABLES = {"cos_cache", "sin_cache", "cos", "sin"}
+#: A weight slot a leaf reads a row a token id of, and the slot of the ids, by
+#: operator: the embedding and DeepSeek-V4's hash routing table.
+GATHERED = {
+    "aten.embedding.default": ("weight", "indices"),
+    "atom.model_ops.triton_hash_topk:hash_topk_triton": ("tid2eid", "ids"),
+}
 #: The operator whose metadata slots are named as the fields of DeepSeek-V4's
 #: HCA decode workspace: aiter defines its schema and the workspace together.
 HCA_DECODE = "aiter.mla_decode_v4_ps_asm.default"
@@ -763,12 +776,16 @@ class Stub:
         by blocks and by state slots; `tokens` defaults to `rows`, a
         decode's."""
         need, size, shared = 1, 0, [0, 0]
+        table, ids = GATHERED.get(op["op"], (None, None))
         for slot, s in _specs(op["args"]):
             itemsize = _dtype(s["dtype"]).itemsize
             nbytes = _span(s["shape"], s["stride"]) * itemsize
-            if s["role"] == "weight" and slot in TABLES:
+            if s["role"] == "weight" and (slot in TABLES or slot == table):
+                read = tokens or rows
+                if slot == table:  # a row an id
+                    read = torch.Size(op["args"][ids]["shape"]).numel()
                 entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
-                nbytes = entry * min(tokens or rows, s["shape"][0])
+                nbytes = entry * min(read, s["shape"][0])
             if s["role"] == "kv":
                 # ponytail: its first dim taken as blocks or state slots, or as
                 # plane rows when the leaf states its layer's attention geometry;
@@ -847,14 +864,18 @@ class Stub:
         with refused_together():
             calls = [self._copy(op, sig, instances, 0)]
         # one weight can read a few percent off another of its spec: cycle one
-        # per occurrence of the leaf, on the n copies' other arguments
-        weighs = any(s["role"] == "weight" for _, s in _specs(op["args"]))
+        # per occurrence of the leaf, on the n copies' other arguments; a
+        # gathered table is one, its copies reading rows of their own
+        table = GATHERED.get(op["op"], ("",))[0]
+        weighs = any(
+            s["role"] == "weight" and p != table for p, s in _specs(op["args"])
+        )
         held = [op["occurrences"]] if weighs else []
         try:
             forward_context._forward_context = calls[0][1]
             with refused_together():
                 fn(**calls[0][0])  # compiles and tunes outside the graphs
-            kernels, ns = _kernels(fn, calls[0][0])
+            kernels, ns = _identity(fn, calls[0][0])
             k = min(CALLS, max(int(GRAPH_NS // ns), 1)) if ns else CALLS
             # a collective's call holds its wait on the last rank to arrive,
             # whose own call is the shortest: every graph takes its calls
@@ -901,18 +922,30 @@ class Stub:
         p = c // len(instances) % len(self.placed)
         snap, meta = self.placed[p]
         fresh = c >= len(self.placed) * len(instances)
+        table, ids = GATHERED.get(op["op"], (None, None))
 
         def build(path, value, old):
             if isinstance(value, list):
                 return [
                     build(f"{path}.{i}", v, old and old[i]) for i, v in enumerate(value)
                 ]
+            if path == ids:  # copy c's own rows of the one table
+                out = self._tensor(value, meta.get((sig, path)), True)
+                n, rows = out.numel(), op["args"][table]["shape"][0]
+                if "rows" not in self.built:
+                    seed = torch.Generator(out.device).manual_seed(SEED)
+                    self.built["rows"] = torch.randperm(
+                        rows, generator=seed, device=out.device
+                    )
+                at = torch.arange(c * n, (c + 1) * n, device=out.device) % rows
+                return out.copy_(self.built["rows"][at].view(out.shape))
             if isinstance(value, dict) and self._routed(value, sig, path):
                 return self._route(value, c)
             if isinstance(value, dict) and value.get("role") == "weight":
-                # each cache-sized copy takes a weight of its own, as it does activations
+                # each cache-sized copy takes a weight of its own, as it does
+                # activations; a gathered table's copies share one
                 count = max(op["occurrences"], self.cold_copies.get(sig, 1))
-                return self._weight(value, c, count)
+                return self._weight(value, c, 1 if path == table else count)
             if isinstance(value, dict) and "object" in value:
                 return rebuild_object(
                     value["object"], build(path, value["state"], None)
@@ -1263,14 +1296,34 @@ def _on_coordinator(name: str, fn):
     return call
 
 
+def _identity(fn, kwargs) -> tuple[list[str], float]:
+    """`_kernels` of one call of `fn` once two profiles in a row name the same
+    kernels on every rank, at most `PROFILES`; refused on every rank together
+    when no two do."""
+    from atom.compass.bench.ranks import agreed, cpu_group
+
+    last = None
+    for _ in range(PROFILES):
+        names, ns = _kernels(fn, kwargs)
+        if agreed(int(names == last), cpu_group()):
+            return names, ns
+        last = names
+    raise ValueError(
+        f"no two profiles in a row of {PROFILES} named the same kernels; "
+        f"the last named {names}"
+    )
+
+
 def _kernels(fn, kwargs) -> tuple[list[str], float]:
     """The kernels one call of `fn` launches, in order, and their device time
     in ns: its device activity except memory copies, which the profiler
     records at some calls of a leaf and misses at others; started on every
-    rank together (`_together`)."""
+    rank together (`_together`), once the device has finished `_together`'s
+    all-reduce, which would otherwise join the call's kernels."""
     from torch.profiler import ProfilerActivity, profile
 
     _together()
+    torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         fn(**kwargs)
         torch.cuda.synchronize()

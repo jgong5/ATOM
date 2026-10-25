@@ -664,6 +664,33 @@ def test_a_client_run_whose_warmup_runs_on_past_its_first_own_step_grades_whole(
     assert grade(real, simulated)["counts"]["decode steps"]["verdict"] == "exact"
 
 
+@pytest.mark.parametrize("stopped", [True, False])
+def test_a_run_graded_whole_takes_steps_after_its_own_only_once_its_server_stopped(
+    tmp_path, stopped
+):
+    """Request 9 runs on after the client run's own and its export does not
+    name it: aiperf cancelled it at its cutoff when `client.sh --stop` stopped
+    the server after the client run, else a later client run may have sent it."""
+    *real, _ = _four(tmp_path)
+    # r2 stays as `cctraces_sim.sh` wrote it, so every run is graded whole.
+    for cell in real[:2]:
+        _recorded(cell)
+    late = _schedule() + [[(9, 30, 30, False)], [(9, 1, 31, True)]]
+    simulated = _cell(tmp_path / "late", late, {7: "ka", 8: "kb", 9: "kc"})
+    _recorded(simulated, sent={"ka", "kb"}, **GRADED)
+    path = simulated / CLIENT_RUN
+    export = json.loads(path.read_text()) | {"server_stopped": stopped}
+    path.write_text(json.dumps(export))
+
+    if stopped:
+        decode = grade(real, simulated)["counts"]["decode steps"]
+        assert [decode["simulated"] - r for r in decode["real"]] == [1, 1, 1]
+    else:
+        later = "steps of requests it did not send follow its own, 2 from step 6"
+        with pytest.raises(ValueError, match=f"late is not graded: {later}, and it"):
+            grade(real, simulated)
+
+
 def test_the_steps_of_a_later_client_run_are_not_graded(tmp_path):
     *real, simulated = (_recorded(c) for c in _four(tmp_path))
     report = grade(real, simulated)

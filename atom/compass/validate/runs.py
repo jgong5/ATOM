@@ -11,7 +11,10 @@ A directory `cctraces_sim.sh` wrote is graded as below when it holds
 `artifacts/client_run.json`, whole when it does not. When a real run is graded
 whole, so is every run of its cell: one `record` or `run` wrote, below, on
 every step, its warmup's included, refused for the reasons below but its
-warmup's, and when steps of a request it did not send follow its own. SIMULATED is refused
+warmup's, and when steps of a request its export does not name follow its own,
+unless the export states `server_stopped`, as `client.sh --stop` sets it once
+it stopped the server: those steps are then of requests aiperf cancelled at
+its cutoff, since no later client run reached the server. SIMULATED is refused
 when its run.json, the run file it ran, skips host segments, has no host laws,
 or turns the step roofline on with no step grid; a real run's server never
 reads the run file it was handed. It is also refused when an engine's hand-in
@@ -272,7 +275,10 @@ def _client_run(cell, run, client, whole=False) -> tuple:
     why = [] if all(before) else ["steps of requests it did not send precede its own"]
     if whole:  # its warmup's steps are graded too, and so would a later client run's be
         after = zip(split[first:], mine[first:], warm[first:])
-        if later := [s["step"] for s, m, w in after if not (m or w)]:
+        later = [s["step"] for s, m, w in after if not (m or w)]
+        # A server stopped after it served no later one: those steps are of its
+        # requests aiperf cancelled at its cutoff and recorded nothing of.
+        if later and not export.get("server_stopped"):
             why.append(
                 f"steps of requests it did not send follow its own, {len(later)} "
                 f"from step {later[0]}, and it is graded whole"

@@ -11,8 +11,9 @@
 #   --concurrency C  aiperf --concurrency
 #   --duration S     aiperf --benchmark-duration, seconds on the server's clock
 #                    (default 1800)
-#   --stop           then SIGTERM the command that started the server, and wait
-#                    WAIT_S (default 600) for it to write OUT/run.json and leave
+#   --stop           then SIGTERM the command that started the server, wait
+#                    WAIT_S (default 600) for it to write OUT/run.json and leave,
+#                    and set the export's server_stopped
 #   MODEL, TRACES    as cctraces_sim.sh takes them
 #   HARNESS_PYTHON   the Python with agentx-harness, and with compass-harness
 #                    when the server is simulated and only then
@@ -146,4 +147,14 @@ while stat=$(cat "/proc/$command/stat" 2>/dev/null) && [[ ${stat##*\) } != Z* ]]
     sleep 1
 done
 [[ -s $OUT/run.json ]] || fail "stop: the command left without writing $OUT/run.json"
+# No later client run reached the server: whole grading takes the steps after
+# this one's own, of requests aiperf cancelled at its cutoff and recorded nothing of.
+python3 - "$OUT/artifacts/client_run.json" <<'EOF' || fail "stop: cannot mark $OUT/artifacts/client_run.json"
+import json, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+export = json.loads(path.read_text()) | {"server_stopped": True}
+path.write_text(json.dumps(export, sort_keys=True))
+EOF
 echo "client: stopped the server; $OUT/run.json written"

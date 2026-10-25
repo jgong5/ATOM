@@ -30,7 +30,7 @@ from test_dp_slice import DP_MACHINE, MAX_TOKENS, Requests
 from test_kv_remote_prefill import Script, connector
 from test_kv_simulated_connector import PEAKS, geometry, model_for  # noqa: F401
 from test_multinode_dp import _bound
-from test_pd_slice import NEEDS_A_PD_RUN, PD, PORTS, PdTraffic
+from test_pd_slice import NEEDS_A_PD_RUN, PD, PORTS, PdTraffic, publish_pd_entries
 from test_vertical_slice import CONSTANT, MODEL, TREE, WALL_S, _run_file
 
 from atom.compass import run as compass_run
@@ -102,6 +102,7 @@ def run_pd_dp(out: Path, seed: str, form: str, sides=None) -> dict:
         **cell,
         **{name: str(port) for name, port in ports.items()},
     )
+    publish_pd_entries(out / "store", DP_MACHINE, env)
     log = out / "pd_sim.log"
     with open(log, "w") as f:
         sim = subprocess.Popen(
