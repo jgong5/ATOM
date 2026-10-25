@@ -478,6 +478,6 @@ def test_a_later_pipeline_stage_replays_and_compares_its_own_record(
     (sim / "pp1.dp0.jsonl").write_text("".join(stage.splitlines(True)[:-1]))
     n = len(read(directory)[0])
     assert compare(directory, sim)["steps"] == {0: {"compared": n, "identical": n}}
-    assert compare(directory, sim, 1)["steps"] == {
-        0: {"compared": n, "identical": n - 1}
-    }
+    argv = ["-m", "atom.compass.parity", str(directory), str(sim), "--stage", "1"]
+    out = subprocess.run([sys.executable, *argv], capture_output=True, check=True)
+    assert json.loads(out.stdout)["steps"] == {"0": {"compared": n, "identical": n - 1}}
