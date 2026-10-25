@@ -702,11 +702,14 @@ def engram_tables_unread() -> None:
     DeepSeek-V4.1's attention builder builds one off the checkpoint's engram
     hash tables, as it does unless `--load_dummy` is set; here it builds none,
     as under that flag. The preparer feeds a forward's engram inputs from host
-    tables, and no forward runs.
+    tables, and no forward runs. Its module is loaded with that backend, which
+    ATOM imports before the model is built; where it is not loaded, as for any
+    other model, nothing is patched and nothing reaches Triton.
     """
-    from atom.model_ops.engram.device.runtime import EngramInputPreparer
-
-    EngramInputPreparer.from_checkpoint = classmethod(lambda cls, *a: None)
+    runtime = sys.modules.get("atom.model_ops.engram.device.runtime")
+    if runtime is not None:
+        prepare = runtime.EngramInputPreparer
+        prepare.from_checkpoint = classmethod(lambda cls, *a: None)
 
 
 class UnbuiltModel(torch.nn.Module):
