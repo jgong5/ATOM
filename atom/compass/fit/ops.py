@@ -26,8 +26,10 @@ decode's B always, the rows its MoE gathers, ``G``, when the shape states them
 for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
 a prefill's B and the context: a decode point's ``context``, its longest
-row's, or a prefill point's rows' mean cached tokens (`band`); and a
-prefill's B for a kind its rows move (``("rows", op)``). A collective's
+row's, after its rows' mean context in `PERMILLE` of it (``mean``) where some
+point of the family has ragged rows, or a prefill point's rows' mean cached
+tokens (`band`); and a prefill's B for a kind its rows move (``("rows",
+op)``). A collective's
 points name their family themselves, `measure ops`'s `exchange`, and its one
 dimension is their message bytes; one apart along it is one row's bytes
 (``row_bytes``, a decode's B or a prefill's T being its rows), when every point
@@ -61,6 +63,7 @@ interpolate.
 """
 
 import argparse
+import bisect
 import functools
 import itertools
 import json
@@ -70,7 +73,7 @@ from pathlib import Path
 
 from atom.compass.artifacts import ArtifactStore, Key, Kind
 from atom.compass.backends.cost import CostTerm
-from atom.compass.backends.op_graph import LISTED, band
+from atom.compass.backends.op_graph import LISTED, PERMILLE, band
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostSource
 from atom.compass.fit import publish
@@ -187,8 +190,10 @@ def _context(p) -> int:
     """A point's context: a decode point's ``context``, its longest row's; a
     prefill point's rows' mean cached tokens (`band`), else its ``context``,
     none when it states none."""
+    from atom.compass.bench.ops import _split
+
     if p["shape"].startswith("decode"):
-        return p["context"]
+        return _split(p["context"])[0]
     return band(p["rows"], False)[0] if "rows" in p else p["context"] or 0
 
 
@@ -201,7 +206,7 @@ def fit(points) -> dict:
     dispatch and combine), so a step may hold between two points' rows;
     ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad
     every rank to the same rows and keep it."""
-    from atom.compass.bench.ops import DP_GROUP, _dependent
+    from atom.compass.bench.ops import DP_GROUP, _dependent, _split
     from atom.compass.capture.peers import MORI
 
     dependent = _dependent(points)
@@ -256,6 +261,9 @@ def fit(points) -> dict:
                 if "B" not in dims and dependent.get(("rows", p["op"]), False):
                     dims.append("B")
             dims += ["G"] if "G" in at_p else []
+            if moves and "T" not in at_p:  # a decode point, read at its mean too
+                dims.append("mean")
+                at_p["mean"] = _split(p["context"])[1] or PERMILLE
             dims += ["context"] if moves else []
             f = families.setdefault(
                 family(p["shape"], p["leaf"], free_of[skel]),
@@ -264,6 +272,11 @@ def fit(points) -> dict:
             got = f["points"].setdefault(tuple(at_p[d] for d in dims), [])
             got.append((p["cold_ns"], p["kernels"]))
     for name, f in families.items():
+        if "mean" in f["dims"]:  # rows measured alike only: read by max alone
+            i = f["dims"].index("mean")
+            if {c[i] for c in f["points"]} == {PERMILLE}:
+                f["dims"].pop(i)
+                f["points"] = {c[:i] + c[i + 1 :]: v for c, v in f["points"].items()}
         merged = []
         for c, got in f["points"].items():
             if any(k != got[0][1] for _, k in got):
@@ -391,7 +404,9 @@ def summary(rows) -> dict:
 class PriceList(CostSource):
     """`compass fit ops`'s params as a leaf's first source: its family queried
     at the step's count of each of its dimensions, ``context`` the bound's:
-    a decode step's rows' max, a prefill's rows' mean cached tokens. It also
+    a decode step's rows' max, a prefill's rows' mean cached tokens; ``mean``
+    a decode step's rows' mean context over its B in `PERMILLE` of their max,
+    where the family was measured on ragged rows. It also
     declines along a line the fit declined, and prefill rows whose cached
     tokens from that mean to their max cross into another kernel. An answer
     between points is validated when every line it interpolates along holds
@@ -407,18 +422,22 @@ class PriceList(CostSource):
         self._family = functools.lru_cache(maxsize=1 << 14)(self._family)
         self._lookup = functools.lru_cache(maxsize=1 << 14)(self._lookup)
         self._table = functools.cache(self._table)
+        self._index = functools.cache(self._index)
 
     def price(self, request: tuple) -> CostTerm | Refusal:
         from atom.compass.bench.ops import signature
 
-        (leaf, (phase, *counts, top), _), kind = request, request[0]["op"]
+        (leaf, (phase, *counts, last), _), kind = request, request[0]["op"]
         at = dict(zip(("T", "B", "G", "context"), counts))
         shape = phase if at["G"] is None else f"{phase} G={at['G']}"
         name = self._family(shape, signature(leaf))
         if name is None:
             return self.refuse(f"{kind}: no point of its signature was measured")
-        dims = self.params["families"][name]["dims"]
-        top = top if dims[-1:] == ["context"] and top != at["context"] else None
+        dims, top = self.params["families"][name]["dims"], None
+        if phase == "decode":
+            at["mean"] = PERMILLE * last / at["context"]
+        elif dims[-1:] == ["context"] and last != at["context"]:
+            top = last
         got = self._lookup(name, tuple(at[d] for d in dims), top)
         if isinstance(got, str):
             return self.refuse(f"{kind}: {got}")
@@ -466,28 +485,36 @@ class PriceList(CostSource):
         points = {tuple(c): (ns, k) for c, ns, k in f["points"]}
         return points, [sorted({c[i] for c in points}) for i in range(len(f["dims"]))]
 
-    @staticmethod
-    def _near(at: tuple, axes: list) -> list[set]:
+    def _index(self, name: str) -> dict:
+        """Per leading coordinates of a family's points, the values its next
+        dimension takes there, in order."""
+        index: dict = {}
+        for c in self._table(name)[0]:
+            for i in range(len(c)):
+                index.setdefault(c[:i], set()).add(c[i])
+        return {lead: sorted(vs) for lead, vs in index.items()}
+
+    def _near(self, name: str, at: tuple) -> list[set]:
         """Per dimension, `at`'s value when measured, else the values either
-        side of it."""
-        return [
-            (
-                {x}
-                if x in vs
-                else {
-                    max((v for v in vs if v < x), default=x),
-                    min((v for v in vs if v > x), default=x),
-                }
-            )
-            for x, vs in zip(at, axes)
-        ]
+        side of it, among the points the earlier dimensions' values hold, as
+        `interpolate` brackets it."""
+        index, near = self._index(name), []
+        for x in at:
+            leads = itertools.product(*map(sorted, near))
+            vs = sorted({v for lead in leads for v in index.get(lead, ())})
+            i = bisect.bisect_left(vs, x)
+            if i < len(vs) and vs[i] == x:
+                near.append({x})
+            else:
+                near.append({vs[i - 1] if i else x, vs[i] if i < len(vs) else x})
+        return near
 
     def _validated(self, name: str, at: tuple) -> bool:
         """Whether every line `at` interpolates along holds a bracket around
         it: a line through `at`'s neighbours in the other dimensions that
         holds no point at `at`."""
-        f, (points, axes) = self.params["families"][name], self._table(name)
-        near, held = self._near(at, axes), f.get("brackets", ())
+        f, (points, _) = self.params["families"][name], self._table(name)
+        near, held = self._near(name, at), f.get("brackets", ())
         lines = [
             (i, list(rest))
             for i, x in enumerate(at)
@@ -509,7 +536,7 @@ class PriceList(CostSource):
 
         f, (points, axes) = self.params["families"][name], self._table(name)
         dims = f["dims"]
-        near = self._near(at, axes)
+        near = self._near(name, at)
         for dim, rest, why in f.get("declined", ()):
             i = dims.index(dim)
             others = [near[j] for j in range(len(dims)) if j != i]

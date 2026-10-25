@@ -1490,7 +1490,7 @@ it waits for tokens, a later stage once `recv_metadata`'s 100 ms poll times out 
 #1450, #1457). The record stamps each idle `flush_pp_send` that settles a send, and the
 gate names, per sending stage, the steps where the two disagree (#1532).
 A simulated run prices a speculative step with `D_target` and `D_draft` from the cost
-backend, its terms tagged `draft` making the latter, and R1 holds its launch with MTP
+backend, its `draft_terms` making the latter, and R1 holds its launch with MTP
 ([#1090](https://github.com/jgong5/ATOM/issues/1090)). Under DP, each forward's
 `target_end` joins the device end's `all_reduce(MAX)` under MTP, and each rank writes the
 group's latest back as its output end. Its accepted drafts are `14` D83's draw.
@@ -1524,7 +1524,13 @@ cost error. T97 records settling the thresholds.
 
 **Accepted approximations**, each added back only if that check shows its error: TP ranks
 are symmetric; PP send backpressure; the MTP plus DP draft barrier; the overlaps of the
-copy stream, staging and `prep_stream`. One more follows from #815's ruling 2, which
+copy stream, staging and `prep_stream`; the device work an MTP decode's prepare queues
+ahead of its launch (metadata uploads, the SWA cursor probe, index and input-id fills), so
+a launch that finds the device busy starts its device early by that work: busy-launch
+decodes measure -0.27% (#1608) and -0.16% (the third DSpark record) at p50 at `fffff70db`,
+and the work is added back if a later record's busy-launch decodes miss the band (owner
+ruling on [#2092](https://github.com/jgong5/ATOM/issues/2092#issuecomment-6397638783),
+2026-10-25). One more follows from #815's ruling 2, which
 makes `E` the recurrence's first term: `E` is charged inside forward `n`'s TAR, but
 `scheduler.postprocess()` and `schedule()` run before the forward is called, at `now`, so
 their clock reads (the first-token stamps, the waiting-prefill age, the arrivals a

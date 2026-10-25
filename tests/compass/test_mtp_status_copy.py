@@ -141,7 +141,7 @@ def test_a_decode_s_draft_kv_pass_fits_the_draft_law_and_prices_as_target(tmp_pa
     for rows, rung, seconds in steps[:-1]:
         cost = backend.price(_output(rows, rung))
         kv = [t for t in cost.terms if t.name.startswith("draft.draft_kv.")]
-        assert bool(kv) == rows[0][2] and not any(t.draft for t in kv)
+        assert bool(kv) == rows[0][2]
         pass_s = KV_LAW[0] + KV_LAW[1] * len(rows) if kv else 0
         assert cost.target_seconds == pytest.approx(seconds + pass_s, rel=1e-4)
         assert cost.draft_seconds == pytest.approx(0.1 * seconds, rel=1e-4)

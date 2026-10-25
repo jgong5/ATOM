@@ -91,7 +91,7 @@ def test_a_stub_with_a_draft_intercept_prices_a_draft_and_stays_constant():
     cost = StepStubBackend(Coefficients(**STUB)).price(view)
     assert (cost.target_seconds, cost.draft_seconds) == (STUB["decode_step"], DRAFT_S)
     assert Coefficients(**STUB).shape_blind
-    assert not any(t.draft for t in StepStubBackend().price(view).terms)
+    assert not StepStubBackend().price(view).draft_terms
 
 
 def test_the_recurrence_charges_each_draft_as_the_timeline_expects():

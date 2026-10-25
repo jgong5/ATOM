@@ -261,9 +261,10 @@ def op_coverage(backend, steps) -> dict:
             produces_output=line["produces_output"],
         )
         try:
+            cost = backend.price(view)
             terms = [
                 (t.name.removeprefix("op."), t.refusals)
-                for t in backend.price(view).terms
+                for t in (*cost.terms, *cost.draft_terms)
             ]
         except CostRefused as refused:
             terms = [("step refused", refused.declined)]
