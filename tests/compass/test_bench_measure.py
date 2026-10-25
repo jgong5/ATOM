@@ -781,6 +781,53 @@ def test_a_bench_workers_child_that_stays_fails_the_after_check_naming_it(
     )
 
 
+class Orphans(Leaves):
+    """A `Leaves` that dies in `bench_step`, sending its child first the SIGTERM
+    a compile pool's workers take from their parent's death, and exits at once."""
+
+    exit = test_bench_engine.Runner.exit
+
+    def __init__(self, rank, config):
+        super().__init__(rank, config)
+        self.child = int(Path(config.child).read_text())
+
+    def bench_step(self, batch):
+        os.kill(self.child, signal.SIGTERM)
+        raise RuntimeError("HIP out of memory")
+
+
+@pytest.fixture
+def orphans(leaves, monkeypatch):
+    monkeypatch.setattr(test_bench_engine.engine, "RUNNER", f"{__name__}.Orphans")
+    return leaves
+
+
+def test_the_after_check_waits_for_the_child_of_a_bench_worker_that_died(run, orphans):
+    """The child exits 10 s after its worker died, later than the after-check
+    would run unwaited."""
+    with pytest.raises(SystemExit) as refused:
+        run(*orphans("10"))
+
+    assert str(refused.value) == (
+        "compass measure steps: a bench worker died, so bench_step got no reply"
+    )
+    assert (run.tmp / "out" / "gpu_after.txt").read_text() == FREE
+
+
+def test_the_child_of_a_bench_worker_that_died_fails_the_after_check_if_it_stays(
+    run, orphans, monkeypatch
+):
+    monkeypatch.setattr(serve, "STOP_GRACE_S", 1)
+
+    with pytest.raises(SystemExit) as refused:
+        run(*orphans("stays"))
+
+    pid = (run.tmp / "child").read_text()
+    assert str(refused.value) == (
+        f"compass measure steps: GPU 7 has PID {pid} on it after the run, so it fails"
+    )
+
+
 def test_run_and_measure_steps_lay_out_dp_attention_alike(
     monkeypatch, model_dir  # noqa: F811
 ):
