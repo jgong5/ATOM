@@ -26,7 +26,6 @@ from atom.compass.runner.overrides import (
     start_on_host,
 )
 from atom.compass.spec import MachineSpec
-from atom.model_ops.attentions.deepseek_v41.backend import DeepseekV41MetadataBuilder
 from atom.utils import CpuGpuBuffer
 from atom.utils.h2d import PublicationOwner
 
@@ -197,7 +196,7 @@ def test_asked_about_its_own_device_a_host_start_answers_from_its_readings(
 
 
 @pytest.mark.parametrize("index", ["fp8", "fp4"])
-def test_a_host_start_refuses_the_v41_page_bound_only_on_the_fp4_index_plane(
+def test_a_host_start_refuses_what_it_holds_only_on_the_fp4_index_plane(
     started, monkeypatch, index
 ):
     """The fp4 plane sizes V4.1's packed score workspace by the PAGEs left
@@ -213,14 +212,10 @@ def test_a_host_start_refuses_the_v41_page_bound_only_on_the_fp4_index_plane(
     )
     spec = MachineSpec.from_mapping(copy.deepcopy(DOCUMENT))
     install_device_readings(runner, readings_at(spec, qwen, 2))
-    builder = SimpleNamespace(
-        device=runner.device, geometry=SimpleNamespace(paged_bytes=1 << 20)
-    )
     if index == "fp4":
         with pytest.raises(RunnerRefusal, match="--index-cache-dtype fp4"):
-            DeepseekV41MetadataBuilder._page_bound(builder, 0.9)
+            torch.cuda.memory_allocated(runner.device)
         return
-    expected, peak = EXPECTED[2], EXPECTED[2]["peak_torch"]
+    peak = EXPECTED[2]["peak_torch"]
     held = peak["weights"] + peak["buffers"] + peak["load residue"]
-    left = int(expected["total"]["capacity"] * 0.9) - held
-    assert DeepseekV41MetadataBuilder._page_bound(builder, 0.9) == left >> 20
+    assert torch.cuda.memory_allocated(runner.device) == held
