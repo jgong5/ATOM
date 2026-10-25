@@ -239,6 +239,10 @@ def publish_entry(store, machine, argv, env) -> None:
     # environment.
     with mock.patch.dict(os.environ, env, clear=True):
         config = Config(args.model, **{k: v for k, v in kwargs.items() if k in names})
+        if config.enable_dp_attention:
+            # As `CoreManager` starts it: every TP rank its own DP rank.
+            config.parallel_config.data_parallel_size *= config.tensor_parallel_size
+            config.tensor_parallel_size = 1
         publish_readings(store, config, document=machine)
 
 
