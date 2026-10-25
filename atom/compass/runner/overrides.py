@@ -1407,8 +1407,8 @@ def _group_step_seconds(
     A step no cost source answers costs 0 s on this rank and still counts as
     a priced step; its reason, ``cost:`` and what each source said, joins the
     refusals the summary reads. With `compass_abort` set it raises instead,
-    which ends the worker. Under a speculative config, a step whose price tags
-    no `draft` term is refused the same way, since the drafter runs after
+    which ends the worker. Under a speculative config, a step whose price holds
+    no `draft_terms` is refused the same way, since the drafter runs after
     every target forward. A forward `compass_host` refuses takes the same path,
     charged with each segment it named at 0; a step both refuse has one reason.
 
@@ -1449,7 +1449,7 @@ def _group_step_seconds(
     terms, refused = (), None
     try:
         cost = backend.price(batch_view(batch, mode, runner))
-        if spec and not any(t.draft for t in cost.terms):
+        if spec and not cost.draft_terms:
             name = type(backend).__name__
             raise CostRefused(batch, [Refusal(name, "prices no draft")])
     except CostRefused as refusal:
@@ -1461,7 +1461,8 @@ def _group_step_seconds(
         device_s = draft_s = 0.0
     else:
         mix.record(cost)
-        device_s, draft_s, terms = cost.target_seconds, cost.draft_seconds, cost.terms
+        device_s, draft_s = cost.target_seconds, cost.draft_seconds
+        terms = (*cost.terms, *cost.draft_terms)
     host = getattr(runner, "compass_host", None)
     group = dp_group() if mode.sync is not None else None
     charge = getattr(host, "charge", None)

@@ -184,7 +184,7 @@ def test_the_run_s_lookup_reads_a_prefill_s_drafter_at_its_width(monkeypatch, tm
 
     cost = OpGraphBackend(SPEC, lookup, kv="bf16", drafts=1).price(view)
 
-    assert cost.terms[-1].provenance.detail.endswith("prefill T=9 B=3 W=4")
+    assert cost.draft_terms[-1].provenance.detail.endswith("prefill T=9 B=3 W=4")
     assert cost.draft_seconds == price(gemm(4000, 64, 64), SPEC)
 
 
