@@ -50,7 +50,6 @@ member an engine read states, empty when every one was measured.
 """
 
 import argparse
-import dataclasses
 import json
 import re
 import tempfile
@@ -325,19 +324,10 @@ def _steps(name: str, store, here: dict) -> list:
 
 
 def _config(atom_args):
-    """ATOM's `Config` for its arguments, as `LLMEngine` builds one and
-    `CoreManager` rewrites it under DP attention: each TP rank a DP rank of TP 1."""
-    from atom.compass.bench.ranks import layout
-    from atom.config import Config
-    from atom.model_engine.arg_utils import EngineArgs
+    """ATOM's `Config` for a server's arguments, as the server runs it."""
+    from atom.compass.bench.measure import atom_config
 
-    engine = EngineArgs.from_cli_args(runfile._engine_args(atom_args))
-    names = {f.name for f in dataclasses.fields(Config)}
-    kwargs = engine._get_engine_kwargs().items()
-    config = Config(engine.model, **{k: v for k, v in kwargs if k in names})
-    if config.enable_dp_attention:
-        layout(config)
-    return config
+    return atom_config(atom_args, server=True)
 
 
 def write_grading(out, report, side=None) -> None:
