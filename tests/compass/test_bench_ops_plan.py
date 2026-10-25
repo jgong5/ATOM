@@ -1171,3 +1171,59 @@ def test_coverage_traces_a_dpa_tp8_graph_and_reads_it_at_tp1_dp8(tmp_path, monke
         "decode": {"steps": 1, "covered": 0},
         "prefill": {"steps": 1, "covered": 0},
     }
+
+
+def _kinked_bench(fn, config, todo, llc):
+    """`_bench` with the prefill GEMM five times steeper past 150 tokens, one
+    kernel either side."""
+    got = _bench(fn, config, todo, llc)
+    for r in got:
+        if r["op"] == "aiter.gemm" and r["shape"].startswith("prefill"):
+            r["cold_ns"] += 4e3 * max(ops._shape(r["shape"]).tokens - 150, 0)
+    return got
+
+
+def test_a_plan_measures_inside_a_prefill_bracket_the_fit_declines_until_none_does(
+    bench, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ops, "_child", _kinked_bench)
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[40, 40, False]], None),
+        ([[150, 150, False]], None),
+        ([[400, 400, False]], None),
+    )
+    graded = _records(tmp_path / "graded", ([[200, 200, False]], None))
+    store, root, _, _ = bench
+
+    def gemm(records):
+        return {
+            ops._shape(r["shape"]).tokens
+            for r in records
+            if r["op"] == "aiter.gemm" and r["shape"].startswith("prefill")
+        }
+
+    def declined(records):
+        params = fit_ops.fit(records)
+        fit_ops.held_out(params)
+        return [d for f in params["families"].values() for d in f["declined"]]
+
+    # Without the fit's check the plan stops at 122, 150 and 400, and the fit
+    # declines the line: 150 reads +67% off the line from 122 to 400.
+    (tmp_path / "unchecked").mkdir()
+    with monkeypatch.context() as m:
+        m.setattr(ops, "_unsettled", lambda *args: iter(()), raising=False)
+        unchecked = _plan(bench, tmp_path / "unchecked", population)
+    assert not any(150 < t < 400 for t in gemm(unchecked))
+    assert [d[0] for d in declined(unchecked)] == ["T"]
+    report = ops.coverage(store, root, CONFIG, [graded], unchecked, "gfx942")
+    assert report["by phase"] == {"prefill": {"steps": 1, "covered": 0}}
+    assert report["left out, by leaf kind"] == {"aiter.gemm": {"the fit declined T": 1}}
+
+    records = _plan(bench, tmp_path, population)
+
+    assert any(150 < t < 400 for t in gemm(records)) and len(gemm(records)) < 25
+    assert declined(records) == []
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
+    assert report["by phase"] == {"prefill": {"steps": 1, "covered": 1}}

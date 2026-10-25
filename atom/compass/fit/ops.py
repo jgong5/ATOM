@@ -366,6 +366,37 @@ def held_out(params) -> list[dict]:
     return rows
 
 
+def unsettled(points) -> list[tuple[dict, str, int]]:
+    """Where `held_out` declines a prefill line along T or context: for each
+    of its points that reads over `LIMIT` off its neighbours or is a hidden
+    band, and each neighbour more than one away, the point at the lower end
+    of that gap, the dimension and the value halfway along it."""
+    params, ends = fit(points), {}
+    for p in points:
+        if p["shape"].startswith("prefill") and "exchange" not in p:
+            free = params["free"][skeleton(p["shape"], p["leaf"])]
+            name = family(p["shape"], p["leaf"], free)
+            at = shape_counts(p["shape"]) | {"context": _context(p)}
+            ends[name, tuple(at[d] for d in params["families"][name]["dims"])] = p
+    out = []
+    for name, f in params["families"].items():
+        if not json.loads(name)[0].startswith("prefill"):
+            continue
+        for row in held_out({"families": {name: f}}):
+            off = row.get("hidden_band") or abs(row.get("error") or 0) > LIMIT
+            if not off or row["dim"] not in ("T", "context"):
+                continue
+            i, c = f["dims"].index(row["dim"]), row["at"]
+            rest = c[:i] + c[i + 1 :]
+            xs = sorted(x[i] for x, *_ in f["points"] if x[:i] + x[i + 1 :] == rest)
+            j = xs.index(c[i])
+            for a, b in ((xs[j - 1], c[i]), (c[i], xs[j + 1])):
+                if b - a > 1:
+                    low = tuple(c[:i] + [a] + c[i + 1 :])
+                    out.append((ends[name, low], row["dim"], (a + b) // 2))
+    return out
+
+
 def summary(rows) -> dict:
     """Per phase and operator: points held out, how many were declined between
     kernels or sit on a declined line, and the median and largest absolute
