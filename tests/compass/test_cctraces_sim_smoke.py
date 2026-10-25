@@ -9,7 +9,8 @@ the workload the script hashed into the run file.
 
 Skips without a driver (the engine core and the TP1 worker import aiter), and
 without ``ATOM_COMPASS_SLICE_MODEL`` (a model directory holding a config and a
-tokenizer), ``ATOM_COMPASS_CCTRACES`` (a cc-traces ``traces.jsonl``) and
+tokenizer, whose context holds the replayed session's turns, as Qwen3.8-27B's
+does and Qwen3-0.6B's does not), ``ATOM_COMPASS_CCTRACES`` (a cc-traces ``traces.jsonl``) and
 ``COMPASS_HARNESS_PYTHON`` (a Python with agentx-harness 56a0cf70 and
 compass-harness installed).
 
@@ -131,11 +132,19 @@ def test_both_runs_answer_every_request_and_refuse_nothing(cells):
         assert fields["coverage_report"] == "False", result
 
 
-def test_the_step_records_are_byte_identical_and_carry_no_timestamps(cells):
+def _steps(cell: Path) -> list:
+    """The cell's step record, each request named without the response id its
+    server drew at random."""
+    steps = [json.loads(line) for line in (cell / "steps/dp0.jsonl").open()]
+    for step in steps:
+        step["named"] = [named[:2] for named in step["named"]]
+    return steps
+
+
+def test_the_step_records_agree_but_for_response_ids_and_carry_no_timestamps(cells):
     (left, _), (right, _) = cells
-    record = (left / "steps/dp0.jsonl").read_bytes()
-    assert record == (right / "steps/dp0.jsonl").read_bytes()
-    steps = [json.loads(line) for line in record.splitlines()]
+    steps = _steps(left)
+    assert steps == _steps(right)
     assert steps and all("rows" in s and "t_enter_ns" not in s for s in steps)
 
 
