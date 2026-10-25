@@ -152,11 +152,11 @@ def test_the_pipeline_check_reads_a_prefill_pipeline(tmp_path):
 
 
 def _pd_pp(geometry, monkeypatch, pp: int):  # noqa: F811
-    """A prefill head of `pp` stages, the first stage's write the largest, and a
+    """A prefill head of `pp` stages, the last stage's write the largest, and a
     decode engine, on one write-request pair."""
     base = model_for(geometry, PEAKS[0])
     models = tuple(
-        dataclasses.replace(base, bytes_per_block=base.bytes_per_block * (pp - k))
+        dataclasses.replace(base, bytes_per_block=base.bytes_per_block * (k + 1))
         for k in range(pp)
     )
     address = f"inproc://kv-pp{pp}-{id(models)}"
@@ -201,7 +201,7 @@ def test_decode_is_ready_after_the_latest_stage_write_and_the_head_frees_after_t
     assert x.kv_transfer_params_output["remote_pp_size"] == pp
     (y,) = admitted(pd, [x], seq_factory, SEND)
     a = SEND + L
-    c = a + pd.models[0].duration_s(len(y.block_table))
+    c = a + pd.models[-1].duration_s(len(y.block_table))
 
     engine_step(pd.p, pd.rt_p, a, (0, a))
     parked = lambda: x.id in pd.p.deferred_free_blocks
