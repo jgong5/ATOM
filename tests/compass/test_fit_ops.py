@@ -159,7 +159,8 @@ def test_fit_ops_publishes_its_points_key_and_their_held_out_error(measured, tmp
     fields = key("decode B=2", 1024, _leaf(2, 128)).values
     assert got["key"] == {k: v for k, v in fields.items() if k != "point"}
     assert got["report"]["by_op"] == {
-        "decode aiter.gemm": {"held_out": 4, "declined": 2, "on_declined_lines": 4}
+        "decode aiter.gemm": {"held_out": 4, "declined": 2, "declining": 1}
+        | {"median_error": pytest.approx(0.04), "max_error": pytest.approx(0.04)}
     }
     declined = [r["declined"] for r in got["report"]["held_out"] if "declined" in r]
     assert declined == [
@@ -168,7 +169,7 @@ def test_fit_ops_publishes_its_points_key_and_their_held_out_error(measured, tmp
     ]
     (f,) = got["params"]["families"].values()
     assert f["declined"] == [
-        ["B", [1024], "B = 12 launched other kernels than its neighbours"]
+        ["B", [1024], 8, 16, "B = 12 launched other kernels than its neighbours"]
     ]
 
 
@@ -189,7 +190,7 @@ def test_fit_ops_reads_a_plan_run_s_rounds_as_one_directory(measured, tmp_path):
     assert f["brackets"] == [["B", [1024], 2, 8]]
 
 
-def test_a_line_holding_an_error_over_5pct_either_way_is_declined_with_its_reason():
+def test_a_point_off_by_over_5pct_either_way_declines_its_gaps_with_its_reason():
     # held out along B, B = 4 reads -4% at context 1024 and -20% at 2048;
     # along context at B = 2, context 2048 reads +25%
     points = [_point(2, 10e3), _point(4, 12.5e3), _point(8, 16e3)]
@@ -202,8 +203,8 @@ def test_a_line_holding_an_error_over_5pct_either_way_is_declined_with_its_reaso
     (f,) = params["families"].values()
 
     assert f["declined"] == [
-        ["context", [2], "context = 2048 reads +25.0% off its neighbours"],
-        ["B", [2048], "B = 4 reads -20.0% off its neighbours"],
+        ["context", [2], 1024, 3072, "context = 2048 reads +25.0% off its neighbours"],
+        ["B", [2048], 2, 8, "B = 4 reads -20.0% off its neighbours"],
     ]
     assert ops.summary(rows)["decode aiter.gemm"]["max_error"] == pytest.approx(0.04)
 
@@ -229,7 +230,7 @@ def test_fit_ops_holds_out_no_point_between_neighbours_one_apart(
     got = _fit(tmp_path / "fit", tmp_path / "store", d)
 
     (f,) = got["params"]["families"].values()
-    assert [why.split(" off")[0] for _, _, why in f["declined"]] == declined
+    assert [why.split(" off")[0] for *_, why in f["declined"]] == declined
     held = [r["at"] for r in got["report"]["held_out"]]
     assert held == ([[2, 512]] if declined else [])
 
@@ -277,7 +278,7 @@ def test_fit_ops_holds_out_no_collective_point_between_neighbours_one_row_apart(
     got = _fit(tmp_path / "fit", tmp_path / "store", d)
 
     (f,) = got["params"]["families"].values()
-    assert [why.split(" off")[0] for _, _, why in f["declined"]] == declined
+    assert [why.split(" off")[0] for *_, why in f["declined"]] == declined
 
 
 @pytest.mark.parametrize(
@@ -441,66 +442,27 @@ def test_a_line_that_interpolates_records_each_held_out_point_s_bracket(ns, brac
     assert f["brackets"] == brackets
 
 
-BENT = ((64, 64e3), (128, 96e3), (256, 256e3))
+DECLINED = (
+    "aiter.gemm: the fit declined B at context = 1024: "
+    "B = 16 reads -6.5% off its neighbours"
+)
 
 
 @pytest.mark.parametrize(
-    "points, asked",
-    [
-        # on one line: nothing to measure
-        ([_prefill(t, 1, t * 1e3) for t in (64, 128, 256)], []),
-        # T = 128 reads +33% off its neighbours: halfway to each
-        (
-            [_prefill(t, 1, ns) for t, ns in BENT],
-            [
-                ("prefill T=64 B=1", None, "T", 96),
-                ("prefill T=128 B=1", None, "T", 192),
-            ],
-        ),
-        # its lower neighbour one away: only the gap above
-        (
-            [_prefill(t, 1, ns) for t, ns in ((127, 127e3), (128, 96e3), (256, 256e3))],
-            [("prefill T=128 B=1", None, "T", 192)],
-        ),
-        # 1000 cached tokens read -33% off their neighbours
-        (
-            [_prefill(64, 1, ns, context=c) for c, ns in ((0, 1e5), (1000, 3e5))]
-            + [_prefill(64, 1, 3e5, context=2000)],
-            [
-                ("prefill T=64 B=1", 0, "context", 500),
-                ("prefill T=64 B=1", 1000, "context", 1500),
-            ],
-        ),
-        # bent fresh, straight at 1000 cached tokens: the halfway T at each
-        # cached count both ends hold, none at 2000, which only T = 64 holds
-        (
-            [
-                _prefill(t, 1, ns + c * 1e2, context=c)
-                for t, ns in BENT
-                for c in (0, 1000)
-                if c == 0 or t != 128
-            ]
-            + [
-                _prefill(128, 1, 228e3, context=1000),
-                _prefill(64, 1, 264e3, context=2000),
-            ],
-            [
-                ("prefill T=64 B=1", 0, "T", 96),
-                ("prefill T=64 B=1", 1000, "T", 96),
-                ("prefill T=128 B=1", 0, "T", 192),
-                ("prefill T=128 B=1", 1000, "T", 192),
-            ],
-        ),
-        # a decode line bent as much: the plan's own check halves it
-        ([_point(b, ns) for b, ns in ((2, 2e3), (4, 3e3), (8, 8e3))], []),
-    ],
-    ids=["line", "bent", "one-away", "cached", "grid", "decode"],
+    "b, priced",
+    [(3, 3e-6), (10, DECLINED), (16, 17.12e-6), (20, DECLINED), (29, 29e-6)],
 )
-def test_a_prefill_line_the_fit_declines_asks_for_the_point_halfway_to_each_neighbour(
-    points, asked
-):
-    got = [
-        (p["shape"], p["context"], dim, mid) for p, dim, mid in ops.unsettled(points)
-    ]
+def test_a_point_over_5pct_off_declines_only_the_two_gaps_beside_it(b, priced):
+    # B = 16 reads -6.5% off its neighbours 4 and 28, which read within 5%
+    points = [(2, 2e3), (4, 4e3), (16, 17.12e3), (28, 28e3), (30, 30e3)]
+    params = ops.fit([_point(*p) for p in points])
+    ops.held_out(params)
+    leaf = json.loads(_leaf(b, 128))
 
-    assert got == asked
+    got = ops.PriceList(params).price((leaf, ("decode", None, b, None, 1024, 1024), 0))
+
+    if isinstance(priced, str):
+        assert got.reason == priced
+    else:
+        assert got.seconds == pytest.approx(priced)
+        assert got.provenance.validated is (b != 16)  # inside 2 to 16, 16 to 30

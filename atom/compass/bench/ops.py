@@ -114,10 +114,8 @@ between two neighbours of a family, or of a prefill leaf's token count over
 cached tokens, that launched different kernels or, at a decode width, either
 side of a point off the line through theirs, or whose cold times differ where
 the leaf's kind steps under one kernel between two adjacent contexts at some
-width (`_densify`), or of a prefill line `fit ops`' held-out check declines
-along T or cached tokens either side of a point it reads off (`_unsettled`),
-until they are adjacent; a collective's message bytes bend as a decode width
-does. DIR gets each round's ops.jsonl in `round<n>`, a run
+width (`_densify`), until they are adjacent; a collective's message bytes bend
+as a decode width does. DIR gets each round's ops.jsonl in `round<n>`, a run
 resumed into DIR numbering on from the last round there, and after each round
 every point held, a measured one with its store token, in plan.jsonl.
 
@@ -1764,12 +1762,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         measure_round(want, n)
         n += 1
         want = cached_ladder(top_only=False) if n == 2 else {}
-        if not want:
-            dependent = _dependent(done.values())
-            want = _densify(_families(done.values(), dependent), tried)
-            top = config.max_model_len
-            for point, fams in _unsettled(done.values(), dependent, tried, top):
-                want[point] |= fams
+        want = want or _densify(
+            _families(done.values(), _dependent(done.values())), tried
+        )
     kinds = Counter(r["op"] for r in done.values() if "refused" not in r)
     print(json.dumps({"points per leaf kind": dict(kinds.most_common())}, indent=1))
     print(f"{sum(kinds.values())} of {len(done)} points measured in {n} rounds")
@@ -2128,25 +2123,6 @@ def _densify(families, tried: set) -> dict:
             else:
                 want[prefill(mid, shape.seqs), record["context"]].add(fam)
     return want
-
-
-def _unsettled(records, dependent, tried: set, max_len: int):
-    """The points `fit ops` asks for where its held-out check declines a
-    prefill line along T or cached tokens (`fit.ops.unsettled`): a prefill of
-    the gap's lower point's rows at the T or the cached tokens halfway, unless
-    `tried` or its first row would pass `max_len` tokens."""
-    from atom.compass.capture.forward import prefill
-    from atom.compass.fit.ops import unsettled
-
-    for p, dim, mid in unsettled([r for r in records if "refused" not in r]):
-        shape = _shape(p["shape"])
-        tokens, context = (mid, p["context"]) if dim == "T" else (shape.tokens, mid)
-        fam = _family(shape, context, p["op"], p["leaf"], dependent)[0]
-        at = prefill(tokens, shape.seqs), context
-        if (fam, *at) in tried or (context or 0) + -(-tokens // shape.seqs) > max_len:
-            continue
-        tried.add((fam, *at))
-        yield at, {fam}
 
 
 def _bent(points, steps=()) -> set:

@@ -431,7 +431,10 @@ and it is reported rather than hidden. Revised 2026-10-19 by the
 a line whose held-out points show a hidden band (a point that launched other kernels
 than the neighbours it is priced from) or an error over 5% does not interpolate. Its
 measured points still answer; every other query along it goes to the analytical law,
-and the price list names each such line with its reason. Revised 2026-10-20 by the
+and the price list names each such line with its reason. Revised 2026-10-25 by the
+[Ruling on #2107](https://github.com/jgong5/ATOM/pull/2107#issuecomment-6397946907):
+such a point declines only the two gaps beside it, between its neighbours on that line;
+the line's other gaps interpolate. Revised 2026-10-20 by the
 [ruling on #1746](https://github.com/jgong5/ATOM/pull/1746#issuecomment-6293302382):
 a point whose neighbours lie one coordinate below and one above it is not held out,
 because every query between those neighbours is that measured point; decode attention
@@ -447,7 +450,7 @@ Revised 2026-10-23 by the
 [Ruling on #2011](https://github.com/jgong5/ATOM/issues/2011#issuecomment-6365512377):
 an interpolated leaf is `estimated` and validated when, on every line it interpolates
 along, a held-out point was priced from neighbours that bracket it. `fit ops` records each
-such bracket on a line that interpolates; a declined line records none, and a line of two
+such bracket except one of a point that declines its gaps, and a line of two
 points holds no held-out point, so it validates nothing. A prefill whose rows' cached
 tokens differ is priced at their mean, which no held-out point tested, and stays
 unvalidated. An `op.<kind>.price_list` term is validated when each of its estimated
@@ -578,7 +581,7 @@ choice that must be visible.
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |
 | D58 | Refuse rather than fall back on a step kind with no samples. The extrapolation guard is a convex hull or k-NN distance, never a per-feature bounding box; an out-of-hull step is priced `estimated` and unvalidated, its source naming the extrapolation, not refused, and graded by cost accuracy as well as reported apart. The step linear law refuses a discrete value it has no vector for, extrapolates outside its fitted hull, and is validated only inside the hull of its held-out steps. | 2026-09-18; revised 2026-10-11 (#765), 2026-10-14 (#952) and 2026-10-23 (#2011) |
 | D59 | A family is validated on independently gathered data, never by LOO. Rank at least three candidates and report all held-out errors. A law that fits one axis is tested on a second before it ships. | 2026-09-18 |
-| D60 | Laws are piecewise over dispatch bands read from recorded kernel identity. A query with no same-band bracket refuses. At the op level `measure ops` records each point's kernels and `fit ops` interpolates only between same-kernel neighbours, and along no line holding a hidden band or a held-out error over 5%, holding out no point whose neighbours are one coordinate away on each side, one row's bytes for a collective whose ranks move the same rows (one byte for `all_gatherv`, `reduce_scatterv` and MORI); a declined leaf falls to its analytical law, counted. An interpolated leaf is validated inside a held-out bracket on each line it interpolates along. | 2026-09-18; op level 2026-10-18 (#1489); declined lines 2026-10-19 (#1493); adjacent neighbours 2026-10-20 (#1746), a collective's 2026-10-22 (#1908); validated brackets 2026-10-23 (#2011) |
+| D60 | Laws are piecewise over dispatch bands read from recorded kernel identity. A query with no same-band bracket refuses. At the op level `measure ops` records each point's kernels and `fit ops` interpolates only between same-kernel neighbours, and across neither gap beside a hidden band or a point with a held-out error over 5%, holding out no point whose neighbours are one coordinate away on each side, one row's bytes for a collective whose ranks move the same rows (one byte for `all_gatherv`, `reduce_scatterv` and MORI); a declined leaf falls to its analytical law, counted. An interpolated leaf is validated inside a held-out bracket on each line it interpolates along. | 2026-09-18; op level 2026-10-18 (#1489); declined lines 2026-10-19 (#1493), per gap 2026-10-25 (#2107); adjacent neighbours 2026-10-20 (#1746), a collective's 2026-10-22 (#1908); validated brackets 2026-10-23 (#2011) |
 | D61 | Treatments are stated and the calibration population matched; an assumed treatment is a property of the query, recorded in the run summary. Decode row order, worth 1.77× at a fixed multiset, is a decode feature, `rowmod(k)` in scheduled order, adopted per rung by a four-condition rule. Uniform routing of the MoE segment under DP and EP is an assumed treatment, at every granularity. | 2026-09-18; revised 2026-10-01, 2026-10-14 (#941, #952) |
 | D62 | Leading warmth is measured and reported, never charged. Error is reported stratified by the axes the law is linear in. | 2026-09-18 |
 

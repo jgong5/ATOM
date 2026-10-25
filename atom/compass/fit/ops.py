@@ -48,13 +48,13 @@ measured neighbour on both sides, not both one away, the price the other
 points of that line give it and its error; between neighbours one away, every
 query is the point itself. A point that launched other kernels than the
 neighbours it is priced from is a hidden band: no check of the neighbours'
-kernels can see it. A line holding a hidden band or an error over `LIMIT` does not
-interpolate: its family lists it under `declined` with its reason, for the
-price list's reader to answer only its measured points along it. A line that
-interpolates lists under `brackets` the neighbours each of its held-out
-points was priced from, and an answer between them is validated. Per phase
-and operator the report gives the median and largest error on the lines that
-interpolate.
+kernels can see it. A hidden band or a point that reads over `LIMIT` off its
+neighbours declines the two gaps beside it: its family lists the neighbours
+under `declined` with its reason, for the price list's reader to answer only
+the point between them; the line's other gaps interpolate. Every other
+held-out point lists under `brackets` the neighbours it was priced from, and
+an answer between them is validated. Per phase and operator the report gives
+the median and largest error of the points that decline nothing.
 
 `PriceList` is that reader: a run's first source for each leaf of an
 `op_graph` (`backends.op_graph`).
@@ -79,7 +79,7 @@ from atom.compass.fit.samples import run_fields
 PROG = "compass fit ops"
 #: What a masked integer reads as in a family's signature.
 MASK = "#"
-#: The largest held-out error a line that interpolates may hold.
+#: The largest held-out error a point may read and its gaps interpolate.
 LIMIT = 0.05
 
 
@@ -315,15 +315,15 @@ def held_out(params) -> list[dict]:
     """Each point priced along each dimension by the other points of its line,
     where it has a neighbour on both sides and they are not both one away (a
     collective's `row_bytes` away); a hidden band is a point whose kernels are
-    not the ones its neighbours launched. Each family gets its
-    `declined` lines, [dimension, the other coordinates, reason]: those
-    holding a hidden band or an error over `LIMIT`; and its `brackets`,
-    [dimension, the other coordinates, low, high], the neighbours each point
-    of a line that interpolates was priced from."""
+    not the ones its neighbours launched. Each family gets its `declined`
+    gaps, [dimension, the other coordinates, low, high, reason]: the
+    neighbours of a hidden band or of a point with an error over `LIMIT`; and
+    its `brackets`, [dimension, the other coordinates, low, high], the
+    neighbours each other point was priced from."""
     rows = []
     for name, f in params["families"].items():
         points = {tuple(c): (ns, k) for c, ns, k in f["points"]}
-        mine, why, brackets = [], {}, []
+        f["declined"], f["brackets"] = [], []
         for c, (ns, own) in points.items():
             for i, dim in enumerate(f["dims"]):
                 rest = c[:i] + c[i + 1 :]
@@ -342,70 +342,31 @@ def held_out(params) -> list[dict]:
                 row |= {"at": list(c), "measured_ns": ns}
                 try:
                     priced, kernels = interpolate(line, (c[i],), [dim])
-                    row |= {
-                        "priced_ns": priced,
-                        "error": priced / ns - 1 if ns else None,
-                        "hidden_band": kernels != own,
-                    }
-                    lo = max(x for x in xs if x < c[i])
-                    hi = min(x for x in xs if x > c[i])
-                    brackets.append([dim, list(rest), lo, hi])
                 except Declined as e:
-                    row["declined"] = str(e)
-                bad = row.get("hidden_band") and "launched other kernels than"
-                if not bad and abs(row.get("error") or 0) > LIMIT:
+                    rows.append(row | {"declined": str(e), "declines": False})
+                    continue
+                row |= {
+                    "priced_ns": priced,
+                    "error": priced / ns - 1 if ns else None,
+                    "hidden_band": kernels != own,
+                }
+                gap = [dim, list(rest), max(x for x in xs if x < c[i])]
+                gap.append(min(x for x in xs if x > c[i]))
+                bad = row["hidden_band"] and "launched other kernels than"
+                if not bad and abs(row["error"] or 0) > LIMIT:
                     bad = f"reads {row['error']:+.1%} off"
                 if bad:
-                    why.setdefault((dim, rest), []).append(
-                        f"{dim} = {c[i]} {bad} its neighbours"
-                    )
-                mine.append((row, (dim, rest)))
-        rows += [row | {"line_declined": line in why} for row, line in mine]
-        f["declined"] = [[d, list(r), "; ".join(w)] for (d, r), w in why.items()]
-        f["brackets"] = [b for b in brackets if (b[0], tuple(b[1])) not in why]
+                    f["declined"].append([*gap, f"{dim} = {c[i]} {bad} its neighbours"])
+                else:
+                    f["brackets"].append(gap)
+                rows.append(row | {"declines": bool(bad)})
     return rows
-
-
-def unsettled(points) -> list[tuple[dict, str, int]]:
-    """Where `held_out` declines a prefill line along T or context: for each
-    of its points that reads over `LIMIT` off its neighbours or is a hidden
-    band, and each neighbour more than one away, the dimension, the value
-    halfway along that gap, and each point at the gap's lower end that a query
-    there interpolates from: those sharing the line's coordinates before the
-    dimension and holding a point at the upper end too, so a value measured
-    halfway keeps the grid past it whole."""
-    params, at = fit(points), {}
-    for p in points:
-        if p["shape"].startswith("prefill") and "exchange" not in p:
-            free = params["free"][skeleton(p["shape"], p["leaf"])]
-            name = family(p["shape"], p["leaf"], free)
-            counts = shape_counts(p["shape"]) | {"context": _context(p)}
-            dims = params["families"][name]["dims"]
-            at.setdefault(name, {})[tuple(counts[d] for d in dims)] = p
-    out = []
-    for name, held in at.items():
-        f = params["families"][name]
-        for row in held_out({"families": {name: f}}):
-            off = row.get("hidden_band") or abs(row.get("error") or 0) > LIMIT
-            if not off or row["dim"] not in ("T", "context"):
-                continue
-            i, c = f["dims"].index(row["dim"]), tuple(row["at"])
-            xs = sorted(x[i] for x in held if x[:i] + x[i + 1 :] == c[:i] + c[i + 1 :])
-            j = xs.index(c[i])
-            for a, b in ((xs[j - 1], c[i]), (c[i], xs[j + 1])):
-                out += [
-                    (p, row["dim"], (a + b) // 2)
-                    for x, p in held.items()
-                    if b - a > 1 and x[:i] == c[:i] and x[i] == a
-                    if (*x[:i], b, *x[i + 1 :]) in held
-                ]
-    return out
 
 
 def summary(rows) -> dict:
     """Per phase and operator: points held out, how many were declined between
-    kernels or sit on a declined line, and the median and largest absolute
-    error on the lines that interpolate."""
+    kernels or decline the gaps beside them, and the median and largest
+    absolute error of the rest."""
     by: dict[str, list] = {}
     for r in rows:
         by.setdefault(f"{r['phase']} {r['op']}", []).append(r)
@@ -414,10 +375,10 @@ def summary(rows) -> dict:
         kept = [
             abs(r["error"])
             for r in rs
-            if r.get("error") is not None and not r["line_declined"]
+            if r.get("error") is not None and not r["declines"]
         ]
         out[name] = {"held_out": len(rs), "declined": sum("declined" in r for r in rs)}
-        out[name] |= {"on_declined_lines": sum(r["line_declined"] for r in rs)}
+        out[name] |= {"declining": sum(r["declines"] for r in rs)}
         if kept:
             out[name] |= {"median_error": statistics.median(kept)}
             out[name] |= {"max_error": max(kept)}
@@ -428,7 +389,7 @@ class PriceList(CostSource):
     """`compass fit ops`'s params as a leaf's first source: its family queried
     at the step's count of each of its dimensions, ``context`` the bound's:
     a decode step's rows' max, a prefill's rows' mean cached tokens. It also
-    declines along a line the fit declined, and prefill rows whose cached
+    declines inside a gap the fit declined, and prefill rows whose cached
     tokens from that mean to their max cross into another kernel. An answer
     between points is validated when every line it interpolates along holds
     a bracket (`held_out`) around it; one whose rows' cached tokens differ
@@ -539,17 +500,17 @@ class PriceList(CostSource):
         )
 
     def _at(self, name: str, at: tuple):
-        """`interpolate` at `at`, declining along a line the fit
-        declined: one along a dimension `at` lies between two values of,
-        whose other coordinates are `at`'s, or a value bracketing it."""
+        """`interpolate` at `at`, declining inside a gap the fit declined:
+        one along a dimension `at` lies inside off its measured values, whose
+        other coordinates are `at`'s, or a value bracketing it."""
 
         f, (points, axes) = self.params["families"][name], self._table(name)
         dims = f["dims"]
         near = self._near(at, axes)
-        for dim, rest, why in f.get("declined", ()):
+        for dim, rest, lo, hi, why in f.get("declined", ()):
             i = dims.index(dim)
             others = [near[j] for j in range(len(dims)) if j != i]
-            between = axes[i][0] < at[i] < axes[i][-1] and at[i] not in axes[i]
+            between = lo < at[i] < hi and at[i] not in axes[i]
             if between and all(r in o for r, o in zip(rest, others)):
                 where = "".join(
                     f" at {d} = {r}" for d, r in zip(dims[:i] + dims[i + 1 :], rest)
