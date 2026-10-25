@@ -28,7 +28,7 @@
 #                    each stage is replayed from its own record and compared in
 #                    compare-pp<k>.json: the head's batches are the scheduler's
 #                    decisions, a later stage's the batches the head sent it.
-#   MODEL           model directory with its weights (required)
+#   MODEL            model directory with its weights (required)
 #   REQUESTS         requests in the workload (default 64)
 #   GAP_S            seconds between sends, each also waiting for the server to
 #                    admit the one before; 0 sends them back to back (default
@@ -196,12 +196,14 @@ print(p)')
         sleep 1
     done
 }
-# leave SIDE: wait up to WAIT_S for every server to exit.
+# leave SIDE: wait up to WAIT_S for every server, and the authority, to exit.
 leave() {
-    local deadline=$((SECONDS + WAIT_S)) pid
-    for pid in "${servers[@]}"; do
+    local deadline=$((SECONDS + WAIT_S)) pid what
+    for pid in "${servers[@]}" $authority; do
+        what="a $1 server"
+        [[ $pid == "$authority" ]] && what="the authority"
         while kill -0 "$pid" 2>/dev/null; do
-            ((SECONDS < deadline)) || { echo "parity_one_node: a $1 server is still up" >&2; exit 1; }
+            ((SECONDS < deadline)) || { echo "parity_one_node: $what is still up" >&2; exit 1; }
             sleep 1
         done
     done

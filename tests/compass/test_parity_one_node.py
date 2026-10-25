@@ -43,8 +43,9 @@ case "$1 $2" in
     exit "${MEASURE_RC:-0}" ;;
 "-m atom.compass.run")
     echo "$*" >> "$STUB_LOG"
-    exec "$REAL_PYTHON" -c 'import socket, sys
-socket.create_server(("127.0.0.1", int(sys.argv[1].rpartition(":")[2]))).accept()' "$6" ;;
+    "$REAL_PYTHON" -c 'import socket, sys
+socket.create_server(("127.0.0.1", int(sys.argv[1].rpartition(":")[2]))).accept()' "$6"
+    exec sleep "${AUTHORITY_S:-0}" ;;
 esac
 exec "$REAL_PYTHON" "$@"
 """
@@ -74,8 +75,7 @@ def _parity(tmp_path, showhw=SHOWHW, **env):
         REAL_PYTHON=sys.executable,
         STUB_LOG=str(tmp_path / "servers.log"),
         MODEL=str(model),
-        WAIT_S="30",
-        **{"STORE": str(tmp_path / "store")} | env,
+        **{"STORE": str(tmp_path / "store"), "WAIT_S": "30"} | env,
     )
     env = {k: v for k, v in env.items() if v is not None}
     r = subprocess.run(
@@ -151,6 +151,12 @@ def test_dp_two_trees_stops_once_the_worker_tree_exits(tmp_path):
     r, _, _ = _parity(tmp_path, CONFIG="dp-two-trees", TREE1_EXITS="1")
     assert r.returncode == 1
     assert r.stderr == "parity_one_node: a real server exited\n"
+
+
+def test_dp_two_trees_stops_an_authority_still_up_after_wait_s(tmp_path):
+    r, _, _ = _parity(tmp_path, CONFIG="dp-two-trees", AUTHORITY_S="60", WAIT_S="5")
+    assert r.returncode == 1
+    assert r.stderr == "parity_one_node: the authority is still up\n"
 
 
 def test_dsv4_dpa8_runs_the_nightly_prefill_server_at_eight_ranks(tmp_path):
