@@ -133,8 +133,8 @@ def _checked(terms: Sequence[CostTerm]) -> tuple[CostTerm, ...]:
 
 
 def _every(cost: StepCost) -> tuple[CostTerm, ...]:
-    """`cost.terms`, never empty, then `cost.draft_terms`, checked."""
-    return _checked(cost.terms) and _checked((*cost.terms, *cost.draft_terms))
+    """`cost.terms` then `cost.draft_terms`, checked."""
+    return _checked((*cost.terms, *cost.draft_terms))
 
 
 @dataclass(frozen=True)
@@ -202,7 +202,7 @@ class StepCost:
     @property
     def target_seconds(self) -> float:
         """The fold of `terms`."""
-        return fold_seconds(t.seconds for t in _checked(self.terms))
+        return fold_seconds(t.seconds for t in _every(self)[: len(self.terms)])
 
     @property
     def draft_seconds(self) -> float:
