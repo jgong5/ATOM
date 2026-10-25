@@ -260,8 +260,11 @@ fi
 # tests/compass holds most of the suite's time, in model traces that each take
 # one core, so it runs as COMPASS_GATE_SHARDS pytest processes beside the rest
 # of tests/, shard s taking every COMPASS_GATE_SHARDS-th file from s; 0 runs
-# tests/ as one process. A shard's output is printed after the rest's. A
-# process left with no test to run (exit 5) fails the gate only when none ran.
+# tests/ as one process. The rest still collects tests/compass and deselects
+# it, because root test files import engine modules that tests/compass first
+# imported under its aiter stub, and without them they reach rocminfo while
+# collecting. A shard's output is printed after the rest's. A process left
+# with no test to run (exit 5) fails the gate only when none ran.
 SHARDS=${COMPASS_GATE_SHARDS:-4}
 [[ $SHARDS =~ ^[0-9]+$ ]] || finish 95 "COMPASS_GATE_SHARDS=$SHARDS is not a count; pytest was not run"
 CF=()
@@ -279,7 +282,7 @@ for ((s = 0; s < SHARDS; s++)); do
     done
     python -m pytest tests/compass "${IGN[@]}" "${OTHERS[@]}" "${PYTEST[@]}" >"$LOGS/$s" 2>&1 &
     PIDS+=($!)
-    MAIN=(tests/ "${IGN[@]}" --ignore=tests/compass)
+    MAIN=(tests/ "${IGN[@]}" --deselect=tests/compass/)
 done
 python -m pytest "${MAIN[@]}" "${PYTEST[@]}"
 CODES=($?)
