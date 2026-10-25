@@ -167,11 +167,11 @@ def test_a_run_prices_a_verify_step_s_drafter_from_its_own_graph(ep, tmp_path_fa
     [drafter] = [graph for key, graph in graphs.items() if key.endswith(" draft")]
     cost, drafted = _priced(root, drafter, VERIFY, ep)
 
-    assert {t.name: t.seconds for t in cost.terms if t.draft} == drafted(ep)
+    assert {t.name: t.seconds for t in cost.draft_terms} == drafted(ep)
     # The drafter's experts run over the target's EP ranks, as ATOM builds them.
     moe = f"draft op.{MOE}"
     assert (drafted(ep)[moe] == drafted(1)[moe]) == (ep == 1)
-    assert f"op.{SAMPLER}" in {t.name for t in cost.terms if not t.draft}
+    assert f"op.{SAMPLER}" in {t.name for t in cost.terms}
 
 
 def test_a_middle_chunk_is_cut_where_its_draft_kv_pass_starts(tmp_path_factory):
@@ -202,7 +202,7 @@ def test_a_run_prices_a_middle_chunk_s_draft_kv_pass_from_its_own_graph(
     ]
     cost, drafted = _priced(root, drafter, CHUNK)
 
-    assert {t.name: t.seconds for t in cost.terms if t.draft} == drafted(1)
+    assert {t.name: t.seconds for t in cost.draft_terms} == drafted(1)
 
 
 def test_a_block_drafter_is_refused_by_name_before_any_step():
@@ -294,7 +294,7 @@ def dp_view(width, rung, dp, counts=None):
         is_dummy_run=False,
     )
     r = runner(None, dp_size=dp)
-    r.drafter = SimpleNamespace(is_block_drafter=False)
+    r.drafter = SimpleNamespace(is_block_drafter=False, mtp_k=1)
     counts = torch.tensor(counts or [2 * width] * dp)
     mode = SimpleNamespace(
         sync=SimpleNamespace(num_tokens_across_dp=counts, ub_tokens_across_dp=None),
@@ -412,7 +412,7 @@ def test_a_dp_verify_step_reads_its_drafter_at_its_rows_padded_too(tmp_path):
     assert (padded.moe_rows, padded.draft_moe_rows) == (64, 48)
     cost = backend.price(padded)
     assert by_name(cost)[f"draft op.{GEMM}"] == price(gemm(4096 * 47, 128, 128), SPEC)
-    assert cost.terms[-1].provenance.detail.endswith("decode T=3 B=4 G=48")
+    assert cost.draft_terms[-1].provenance.detail.endswith("decode T=3 B=4 G=48")
 
 
 def test_a_dp_prefill_under_a_drafter_reads_its_graphs_at_their_default(tmp_path):
@@ -463,10 +463,12 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
         is_dummy_run=False,
     )
     r = runner(None, dp_size=2)
-    r.drafter = SimpleNamespace(is_block_drafter=False)
+    r.drafter = SimpleNamespace(is_block_drafter=False, mtp_k=1)
     mode = SimpleNamespace(
         sync=SimpleNamespace(
-            num_tokens_across_dp=torch.tensor([64, 64]), ub_tokens_across_dp=None
+            num_tokens_across_dp=torch.tensor([64, 64]),
+            max_bs_across_dp=1,
+            ub_tokens_across_dp=None,
         ),
         running_tokens_are_unified=False,
         running_tokens=64,
@@ -476,11 +478,11 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
     step = projection.batch_view(batch, mode, r)
     cost, drafted = _priced(root, graphs[f"{middle} draft"], step, dp=2)
 
-    assert cost.terms[-1].provenance.detail.endswith(
+    assert cost.draft_terms[-1].provenance.detail.endswith(
         "prefill T=64 B=1 G=128 that produces no output"
     )
     assert cost.target_seconds > 0
-    assert {t.name: t.seconds for t in cost.terms if t.draft} == drafted(1)
+    assert {t.name: t.seconds for t in cost.draft_terms} == drafted(1)
 
 
 # --- a decode padded to its rung ----------------------------------------------
@@ -580,7 +582,7 @@ def test_a_decode_padded_to_its_rung_prices_its_drafter_at_its_rows(
     backend = OpGraphBackend(machine, lookup, kv="bf16", drafts=1)
     padded, full = backend.price(verify_view(3, 4)), backend.price(verify_view(4, 4))
 
-    assert padded.terms[-1].provenance.detail.endswith("decode T=3 B=4")
+    assert padded.draft_terms[-1].provenance.detail.endswith("decode T=3 B=4")
     assert padded.target_seconds == full.target_seconds
     # The rung's drafter, which this step read before, prices more than runs.
     assert 0 < padded.draft_seconds < full.draft_seconds

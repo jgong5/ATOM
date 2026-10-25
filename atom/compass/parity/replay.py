@@ -30,8 +30,7 @@ class ReplayHost:
     stage replays its own record, `stage` as `read` takes it."""
 
     def __init__(self, directory, dp_rank: int, stage: int = 0) -> None:
-        name = f"pp{stage}.dp{dp_rank}" if stage else f"dp{dp_rank}"
-        self.path = Path(directory) / f"{name}.jsonl"
+        self.source = f"{directory} stage {stage} dp{dp_rank}"
         origin = min(json.loads((Path(directory) / ARRIVALS).read_text())["sent_ns"])
         steps = read(directory, stage)[dp_rank]
         self.ends = [(s["t_exit_ns"] - origin) / 1e9 for s in steps]
@@ -48,7 +47,7 @@ class ReplayHost:
         that step's."""
         i, self.step = self.step, self.step + 1
         if i >= len(self.ends):
-            why = f"{self.path} has {len(self.ends)} steps, and this is step {i}"
+            why = f"{self.source} has {len(self.ends)} steps, and this is step {i}"
             raise RunnerRefusal(f"{SOURCE}: {why}")
         self.out_s = self.outs[i]
         return max(0.0, self.ends[i] - self.now())

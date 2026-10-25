@@ -203,15 +203,15 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
         top = step_linear_fit.priced_rank(
             {i: (c.target_seconds, group[i][1]) for i, c in costs.items()}
         )
-        terms = [t for c in costs.values() for t in c.terms if not t.draft]
+        terms = [t for c in costs.values() for t in c.terms]
         extrapolated += any(t.provenance.extrapolated for t in terms)
         band, price = _band(key, group[top][1]), costs[top].target_seconds
         labels = [drafts[i][step] for i in group]
         draft = None
         if None not in labels:
-            mine = [t for t in costs[top].terms if t.draft]
+            mine = costs[top].draft_terms
             draft = (min(labels), costs[top].draft_seconds, _group(mine))
-        target = _group([t for t in costs[top].terms if not t.draft])
+        target = _group(costs[top].terms)
         priced.append((key, band, step, seconds, price, target, draft, costs[top]))
     leading = _leading_slow(priced, law)
     parts: dict[str, list] = {}
@@ -248,12 +248,11 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
         real, methods, terms = np.array([s for s, _ in priced_steps]), Counter(), {}
         for i, (_, cost) in enumerate(priced_steps):
             for t in cost.terms:
-                if not t.draft:
-                    methods[
-                        method_group(t.provenance.method, t.provenance.validated)
-                    ] += t.seconds
-                    name = t.name.removeprefix("op.").removesuffix(".price_list")
-                    terms.setdefault(name, np.zeros(len(priced_steps)))[i] += t.seconds
+                methods[
+                    method_group(t.provenance.method, t.provenance.validated)
+                ] += t.seconds
+                name = t.name.removeprefix("op.").removesuffix(".price_list")
+                terms.setdefault(name, np.zeros(len(priced_steps)))[i] += t.seconds
         report["methods"][kind] = {g: methods[g] for g in GROUPS if g in methods}
         report["terms"][kind] = {
             name: {

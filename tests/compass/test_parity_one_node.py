@@ -25,6 +25,11 @@ STUB = """#!/bin/bash
 case "$1 $2" in
 "-m atom.entrypoints.openai.api_server")
     echo "$* GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES-} ATOM_NUMA_BIND=${ATOM_NUMA_BIND-}" >> "$STUB_LOG"
+    echo "${HIP_VISIBLE_DEVICES-} ${ATOM_DP_MASTER_PORT-}" >> "$STUB_LOG.env"
+    if [ -n "${TREE1_EXITS-}" ]; then
+        case "$*" in *"--data-parallel-rank 1"*) exit 1 ;; esac
+        exec sleep 60
+    fi
     echo "Uvicorn running"
     case "$*" in *--compass-run*) exit 0 ;; esac
     exec sleep 60 ;;
@@ -40,6 +45,11 @@ case "$1 $2" in
     echo "${*//$'\\n'/ } GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES-} ATOM_NUMA_BIND=${ATOM_NUMA_BIND-}" >> "$STUB_LOG"
     echo "${ATOM_KV_OFFLOAD-}" > "$STUB_LOG.offload"
     exit "${MEASURE_RC:-0}" ;;
+"-m atom.compass.run")
+    echo "$*" >> "$STUB_LOG"
+    "$REAL_PYTHON" -c 'import socket, sys
+socket.create_server(("127.0.0.1", int(sys.argv[1].rpartition(":")[2]))).accept()' "$6"
+    exec sleep "${AUTHORITY_S:-0}" ;;
 esac
 exec "$REAL_PYTHON" "$@"
 """
@@ -69,8 +79,7 @@ def _parity(tmp_path, showhw=SHOWHW, **env):
         REAL_PYTHON=sys.executable,
         STUB_LOG=str(tmp_path / "servers.log"),
         MODEL=str(model),
-        WAIT_S="30",
-        **{"STORE": str(tmp_path / "store")} | env,
+        **{"STORE": str(tmp_path / "store"), "WAIT_S": "30"} | env,
     )
     env = {k: v for k, v in env.items() if v is not None}
     r = subprocess.run(
@@ -108,6 +117,50 @@ def test_tp2_plain_drops_dp_attention_everywhere(tmp_path):
         assert " -tp 2 --enforce-eager " in line
         assert "--enable-dp-attention" not in line
     assert json.loads(run.read_text())["data_parallel_size"] == 1
+
+
+def test_dp_two_trees_runs_two_rank_pairs_on_their_own_gpus_and_one_authority(
+    tmp_path,
+):
+    r, servers, run = _parity(
+        tmp_path, CONFIG="dp-two-trees", STORE=None, HIP_VISIBLE_DEVICES="4,5,6,7"
+    )
+    assert r.returncode == 0, r.stderr
+    measure, *real, authority, sim0, sim1 = servers
+    assert " measure memory --gpu 4,5,6,7 " in measure
+    assert " -tp 2 --enable-dp-attention --data-parallel-size 2 --enforce-eager" in (
+        measure
+    )
+    endpoint = json.loads(run.read_text())["clock_endpoint"]
+    flags = f"--compass-run {run} --compass-clock-endpoint {endpoint}"
+    assert authority == f"-m atom.compass.run {flags}"
+    for side in (real, [sim0, sim1]):
+        trees = [line.split(" --data-parallel-size ", 1)[1].split() for line in side]
+        for k, tree in enumerate(trees):
+            dp = ["2", "--data-parallel-size-local", "1", "--data-parallel-rank"]
+            assert tree[:6] == [*dp, str(k), "--data-parallel-base-port"]
+        assert trees[0][6] == trees[1][6]
+    assert all(f" {flags} " in line for line in (sim0, sim1))
+    # Each tree on its own GPU pair; a side's trees share one DP master port.
+    env = [e.split() for e in (tmp_path / "servers.log.env").read_text().splitlines()]
+    assert [e[0] for e in env] == ["4,5", "6,7"] * 2
+    assert env[0][1] == env[1][1] != env[2][1] == env[3][1]
+    # Below the ephemeral range, with the base port and engine sockets above it.
+    low = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()[0]
+    assert int(env[2][1]) + 112 == int(trees[0][6]) < int(low)  # the simulated side
+    assert json.loads(run.read_text())["data_parallel_size"] == 4
+
+
+def test_dp_two_trees_stops_once_the_worker_tree_exits(tmp_path):
+    r, _, _ = _parity(tmp_path, CONFIG="dp-two-trees", TREE1_EXITS="1")
+    assert r.returncode == 1
+    assert r.stderr == "parity_one_node: a real server exited\n"
+
+
+def test_dp_two_trees_stops_an_authority_still_up_after_wait_s(tmp_path):
+    r, _, _ = _parity(tmp_path, CONFIG="dp-two-trees", AUTHORITY_S="60", WAIT_S="5")
+    assert r.returncode == 1
+    assert r.stderr == "parity_one_node: the authority is still up\n"
 
 
 def test_dsv4_dpa8_runs_the_nightly_prefill_server_at_eight_ranks(tmp_path):

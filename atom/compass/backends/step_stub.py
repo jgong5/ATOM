@@ -29,7 +29,9 @@ The form, declared rather than derived:
 
 plus one term per collective the deployment's widths make possible. A step
 carrying both kinds of work is priced as both and pays both intercepts, because
-a step that did both launched both.
+a step that did both launched both. A `draft_step` above 0 adds one
+drafter term (`draft_terms`) to every step, the speculative drafter's device work after
+the target's; at 0 there is none, and a speculative run refuses each step.
 
 A tensor-parallel all-reduce runs once per layer this worker holds, so its
 count is the depth of the worker's span and not the number of layers in it that
@@ -157,6 +159,7 @@ class Coefficients:
     decode_context: float = 4.0e-9
     decode_padding: float = 1.0e-9
     collective_token_layer: float = 1.0e-9
+    draft_step: float = 0.0
 
     def __post_init__(self) -> None:
         for spec in fields(self):
@@ -166,7 +169,7 @@ class Coefficients:
 
     @property
     def shape_blind(self) -> bool:
-        """True when only the two intercepts are non-zero: constant pricing."""
+        """True when only the intercepts are non-zero: constant pricing."""
         shaped = [f.name for f in fields(self) if f.name not in _INTERCEPTS]
         return not any(getattr(self, name) for name in shaped)
 
@@ -187,7 +190,7 @@ class Coefficients:
         return cls(**blind)
 
 
-_INTERCEPTS = ("prefill_step", "decode_step")
+_INTERCEPTS = ("prefill_step", "decode_step", "draft_step")
 
 
 class StepStubBackend(CostBackend):
@@ -380,6 +383,7 @@ class StepStubBackend(CostBackend):
                 ),
             ]
         terms = [self._term(*row) for row in counted]
+        drafts = [self._term("draft.step", 1, c.draft_step)] if c.draft_step else []
         collectives = self.parallelism.collectives()
         if collectives:
             # The constructor refuses a candidate collective with no depth
@@ -402,7 +406,7 @@ class StepStubBackend(CostBackend):
                         qualifier,
                     )
                 )
-        return StepCost(terms)
+        return StepCost(terms, draft_terms=drafts)
 
     def all_gather_s(self, rows: int) -> float:
         """One TP all-gather of a `rows`-row tensor, as a pipeline stage runs on

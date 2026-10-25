@@ -21,9 +21,11 @@ One record spans the server's lifetime, every
 client run it served included; `parity.served` splits it per client run.
 
 The server's environment holds `AUTOTUNE_CACHE` as the command's does, 1 when
-the command's has none, and run.json's ``env`` states the value. With it on,
-Triton loads an autotuned kernel's choice for a shape an earlier server of the
-same ``TRITON_CACHE_DIR`` tuned; a shape the cache lacks still tunes on its
+the command's has none, and ``TRITON_CACHE_DIR`` as the command's does, or the
+directory Triton resolves when it has none; run.json's ``env`` states both.
+Naming the directory keeps Inductor from putting its own there mid-run. With
+the switch on, Triton loads an autotuned kernel's choice for a shape an earlier
+server of the same directory tuned; a shape the cache lacks still tunes on its
 first launch, inside the record.
 
 run.json's ``aiter_jit_builds`` names each aiter JIT module built, or begun,
@@ -41,6 +43,8 @@ import argparse
 import json
 import os
 from pathlib import Path
+
+from triton import knobs
 
 from atom.compass.backends.step_grid_plan import TARGET
 from atom.compass.backends.step_labels import label_run, write_table
@@ -70,7 +74,10 @@ def main(argv: list[str]) -> None:
                 f"{arg} is among ATOM's arguments; a record times real weights, "
                 "and MoE routing follows them"
             )
-    env = {AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1")}
+    env = {
+        AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1"),
+        "TRITON_CACHE_DIR": knobs.cache.dir,
+    }
     serve.serve(atom_args, args.out, args.gpu, extra_env=env, host=args.host)
     run_json = Path(args.out) / serve.RUN_JSON
     # serve writes server.json when /health first answers, so its mtime is

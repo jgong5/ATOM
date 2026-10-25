@@ -18,7 +18,7 @@ about an hour.
 
 | Script | Where | What |
 |---|---|---|
-| `gate_cpu.sh` | CPU container | The CPU gate, run per task: every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, no driver **as a batch**: run alone, a file in it can still reach `rocminfo` (`tests/test_postprocess_width.py` did, through `atom.model_engine.model_runner`'s `from aiter import …`, measured on node 18 at `bdd244c57` while it was in the gate). **Must be green.** Also exits 98 when the diff is in the blind spot below and the GPU gate has not run on *this* tree. Refuses a caller-supplied `-r`. |
+| `gate_cpu.sh` | CPU container | The CPU gate, run per task: every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, no driver **as a batch**: run alone, a file in it can still reach `rocminfo` (`tests/test_postprocess_width.py` did, through `atom.model_engine.model_runner`'s `from aiter import …`, measured on node 18 at `bdd244c57` while it was in the gate). `tests/compass` runs as `COMPASS_GATE_SHARDS` (default 4) pytest processes beside the rest of `tests/`, each printing its own summary, and shard k writing a caller's `--junitxml` or `--basetemp` path with `.shard<k>` appended; `0` runs one process. **Must be green.** Also exits 98 when the diff is in the blind spot below and the GPU gate has not run on *this* tree. Refuses a caller-supplied `-r`. |
 | `gate_gpu.sh` | GPU container | The GPU gate, run per wave — and per task for a blind-spot diff. Superset (`--ignore=tests/plugin`), judged as a **delta** against pure upstream `661ef7661` on the nightly 20261013 image (the `BASE_*` constants), with torch, HIP, ROCm and AITER recorded and compared. The failing node-ids are on file in `gpu_gate_known_failures.txt` and compared **by name**. Calls `preflight.sh` itself, before and after. |
 | `preflight.sh` | GPU container | `rocminfo` reachability, compute use and VRAM use (checks 1–3), plus a D-state census (check 0), and a list of bookable devices. Run **before and after**. The census states its own scope: in a container it can only see this PID namespace, and says so rather than reporting a clear node. Also worth running for a CPU-only task that imports ATOM's model layer: `import aiter` runs `rocminfo`, and so does any module that imports aiter at load time (`atom.model_engine.model_runner`, `atom.model_ops.linear`), so on a wedged node that import hangs. A bare `import atom` and `atom.compass` run no `rocminfo` and load no torch; `atom.config`, `atom.model_engine.llm_engine` and `atom.entrypoints.openai_server` load torch but run no `rocminfo`. Measured on node 18, 2026-09-23. |
 | `regen_cpu_gate_exclude.sh` | CPU container | Regenerate the **GENERATED** section of the exclusion list by iterating `--collect-only` to a fixed point (three passes at `83daf636d`: 37 errors, 1, clean). Preserves the MANUAL section verbatim. |
@@ -618,16 +618,14 @@ Given two or more records, the command also prints each form's error on every
 record under a law fitted on the others, per decode rung and prefill token band.
 
 `scripts/compass/laws/qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json` is the
-`history` form, labelled by device time, fitted on
-records captured on hjbog-srdc-39 at ce625ddd9 (ROCm/ATOM 661ef7661) in the
-nightly-20261013 image, in this order: concurrency 1, 4, 16, 64 and 256 as
-`calib_capture.sh` captures them, then first-turn cells at concurrency 64 and
-256, which decode at rungs 16 and up, and at 8 and 14, which give it its rung-8
-vector. A first-turn cell runs with `AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0
---trajectory-start-max-ratio 0"`, which starts every trajectory at its first
-turn. Its `engine_config` also states the fields those records predate, as
-their `server.log` engine arguments and the capture's environment give them: DP
-width 1, no DP attention, expert parallelism or TBO, and `AITER_LOG_LEVEL=WARNING`.
+`history` form, labelled by device time, fitted by `compass fit steps` on
+records captured on one card of hjbog-srdc-39 at 731debf47 (ROCm/ATOM 661ef7661)
+in the nightly-20261013 image, in this order, by the cells `calib_capture.sh`'s
+header names for this model: concurrency 1, 4 and 16, then first-turn cells
+at 4, 8, 10 and 12. The cells were chosen by decode rung: each rung the graded
+runs decode at, 1 to 8, has steps in two or more cells
+([#1024](https://github.com/jgong5/ATOM/issues/1024)); it has no decode vector above rung 16, since
+this model is not captured or graded at concurrency 64 or 256.
 Its host laws (`host`, with `compass fit host`'s report as `host_fit`) are fitted
 apart, by `compass fit host`, on calibration cells at concurrency 1, 4 and 16
 over traces 256 to 392, each a `compass record` server and one `client.sh` run
@@ -723,7 +721,8 @@ runs with `PYTHONPATH=$T`, both from `/` so every path is absolute. Below, `$ATO
 `--model <Qwen3.8-27B> --max-model-len 262144`, `$M` is `--machine` and this node's spec
 ([QUICKSTART.md](QUICKSTART.md#environment) says which), `$R` is a directory under `/data`
 or `/tmp` and `$S` is `--store $R/store`, empty at the start. The raw export keeps
-every prompt, about 100 KB to 760 KB a request on this cell.
+no prompt: aiperf leaves each request's payload out of it, and the client
+gzips it once the client run's export is written.
 
 **A client run.** No command starts one: once `OUT/server.json` exists,
 `$T/scripts/compass/client.sh OUT --traces A-B --concurrency C --stop`, `client.sh`

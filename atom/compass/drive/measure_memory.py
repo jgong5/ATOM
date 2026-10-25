@@ -20,7 +20,8 @@ measured on another card or stack is keyed by that spec.
 holds `memory.ENTRY_FIELDS`, its `record` the digest of the engine's log.
 `--beside` names a command the start runs first in the engine's session, such
 as the lmcache server an offload connector reaches, so the GPU checks hold it
-to the engine's rule.
+to the engine's rule. SIGINT or SIGTERM to the command stops the engine's
+group as `serve` stops a server's, and publishes nothing.
 
 Each start takes a free `ATOM_DP_MASTER_PORT`, which keys ATOM's compiled-graph
 cache, as a parity run's server does. A start in which inductor autotuned a
@@ -40,6 +41,7 @@ import hashlib
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -148,7 +150,13 @@ def main(argv: list[str], again: bool = False) -> None:
     if args.beside:
         env[BESIDE_ENV] = args.beside
     code = f"import sys; from {__name__} import start; start(sys.argv[1:])"
-    with quiet(args.gpu, out), (out / LOG).open("w") as log:
+    # SIGINT and SIGTERM end the wait, never the stop: the engine runs in its
+    # own session, so a command that ends first leaves it running.
+    with (
+        serve._stop_signals() as stopped,
+        quiet(args.gpu, out),
+        (out / LOG).open("w") as log,
+    ):
         engine = subprocess.Popen(
             [sys.executable, "-c", code, *atom_args],
             stdout=log,
@@ -156,15 +164,25 @@ def main(argv: list[str], again: bool = False) -> None:
             env=env,
             start_new_session=True,
         )
+        exited = f"no exit in {START_TIMEOUT_S} s"
         try:
-            exited = engine.wait(START_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            exited = f"no exit in {START_TIMEOUT_S} s"
+            for _ in range(int(START_TIMEOUT_S / serve.POLL_S)):
+                if stopped:
+                    break
+                try:
+                    exited = engine.wait(serve.POLL_S)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
         finally:
             # A member of the engine's process group can outlive its leader:
             # the after-check reads the GPUs once every member has exited.
             serve._stop(engine.pid)
             engine.wait()
+    if stopped:
+        raise ValueError(
+            f"{signal.Signals(stopped[0]).name} stopped the command; nothing is published"
+        )
     if exited != 0:
         raise ValueError(f"the engine did not start ({exited}); see {out / LOG}")
     if missed := _cold(out):

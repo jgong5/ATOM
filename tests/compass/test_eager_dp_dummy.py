@@ -4,6 +4,8 @@
 vector and by a replay step grid, where each refused it before. A real eager
 decode step and a dummy forward on one rank are still refused, an eager bundle
 prices the dummy from its grid, and the run summary counts the treatment by step.
+Under a speculative config the dummy needs no draft term; any other step without
+one is still refused.
 """
 
 import pytest
@@ -11,6 +13,7 @@ from test_backend_step_grid import ON_NODE, eager, replay
 from test_backend_step_linear import law
 from test_dp_step_max import dp2, prefill, runner  # noqa: F401  the dp2 fixture
 from test_run_treatments import dp_summary
+from test_speculative_step import _speculative
 
 from atom.compass.backends import (
     BatchView,
@@ -96,3 +99,18 @@ def test_a_dummy_forward_on_one_rank_still_refuses():
     assert r.refused_commands() == (
         "cost:step-linear: no decode vector for rung eager",
     )
+
+
+def test_under_a_speculative_config_the_dummy_is_0_s_and_a_draftless_step_refuses(
+    monkeypatch, tmp_path, dp2  # noqa: F811
+):
+    ranks = [_speculative(runner(no_eager(2), dp_size=2, dp_rank=r)) for r in range(2)]
+    dp2(lambda: ranks[0].forward(prefill(40)), lambda: ranks[1].dummy_execution())
+
+    out = dp_summary(monkeypatch, tmp_path, ranks)
+
+    assert out["schedule"]["treatments"] == {EAGER_DP_DUMMY: 1}
+    assert [r.refused_commands() for r in ranks] == [
+        ("cost:StepLinearBackend: prices no draft",),
+        (),
+    ]
