@@ -39,6 +39,7 @@ from conftest import atom_config_double
 from starlette.responses import JSONResponse
 from test_vertical_slice import (
     CONSTANT,
+    DOCUMENT,
     MAX_TOKENS,
     MODEL,
     TREE,
@@ -46,6 +47,7 @@ from test_vertical_slice import (
     Traffic,
     _free_port,
     _run_file,
+    publish_entry,
 )
 
 from atom.compass import clock_transport
@@ -89,6 +91,16 @@ class PdTraffic(Traffic):
     http, stream = "traffic->frontend-P:http", STREAM
 
 
+def publish_pd_entries(store, machine, env) -> None:
+    """`publish_entry` for each side `pd_sim.sh` starts under `env`, its
+    server flags composed as the script composes them."""
+    flags = env.get("SERVER_ARGS", "--enforce-eager --max-model-len 2048").split()
+    for side, role in (("PREFILL", "kv_producer"), ("DECODE", "kv_consumer")):
+        kv = json.dumps({"kv_role": role, "kv_connector": "compass"})
+        argv = ["--model", MODEL, *flags, *env.get(f"{side}_ARGS", "").split()]
+        publish_entry(store, machine, [*argv, "--kv-transfer-config", kv], env)
+
+
 def run_pd(out: Path, seed: str) -> dict:
     """One run under `pd_sim.sh`; its step table and request times."""
     out.mkdir()
@@ -105,6 +117,7 @@ def run_pd(out: Path, seed: str) -> dict:
         DECODE_EXEC=os.environ.get("ATOM_COMPASS_PD_DECODE_EXEC", ""),
         **{name: str(port) for name, port in ports.items()},
     )
+    publish_pd_entries(out / "store", DOCUMENT, env)
     log = out / "pd_sim.log"
     with open(log, "w") as f:
         sim = subprocess.Popen(

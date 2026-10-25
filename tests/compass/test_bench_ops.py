@@ -2122,6 +2122,36 @@ def test_a_point_runs_and_records_the_rows_the_pool_holds(monkeypatch):
     assert record["rows"] == views[0]
 
 
+def test_a_ragged_point_runs_its_rows_at_their_longest_or_refuses_past_the_pool(
+    monkeypatch,
+):
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    seen = []
+
+    def call(stub, op, sig, instances, n):
+        seen.append(stub._copy(op, sig, instances, 0)[0]["max_ctx_len"])
+        return {}
+
+    monkeypatch.setattr(ops.Stub, "_time", call)
+    runner, views = _Runner(), []
+    placed = SimpleNamespace(
+        block_size=16,
+        batch=lambda view, block, slot: views.append(view["rows"]) or (block, slot),
+    )
+    stub = ops.Stub(runner, 10_000)
+    x = [("self", _t([2, 3], "activation")), ("max_ctx_len", ir.Affine(1, 0))]
+    found = ops.leaves(_graph(_leaf("aten.neg.default", *x), layers=1)["region"])
+
+    # Rows of 600 and 300 tokens, their mean 750 permille of 600: 57 blocks.
+    [record] = stub.point(placed, decode(2), (600, 750), found)
+    # Rows of 600 and 480, at 900 permille, would take 68 of the pool's 64.
+    [refused] = stub.point(placed, decode(2), (600, 900), found)
+
+    assert views == [[[1, 600, True], [1, 300, True]]] == [record["rows"]]
+    assert seen == [600]  # an integer affine in context takes the longest row's
+    assert refused["refused"] == "its rows need more than the pool's 64 KV blocks"
+
+
 @pytest.mark.parametrize(
     "argv, refusal",
     [

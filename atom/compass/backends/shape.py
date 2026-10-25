@@ -199,7 +199,11 @@ class BatchView:
     rank or with no such drafter. `draft_bs` is the batch an MTP drafter's
     later passes run at, a row a sequence, padded past the rows: the step's
     `running_bs`, for a drafter that declares a draft graph; None for one
-    that runs them at the rows, or with none. `target_bs` is the step's
+    that runs them at the rows, or with none. `draft_rows` is the rows the
+    gather carries on the later passes of an MTP drafter that runs them at
+    the rows: every rank's, or, where a rank prefills, a floor on them, the
+    widest rank's and one a peer; None on one rank or with no such drafter.
+    `target_bs` is the step's
     `running_bs` where a target that replays no graph pads past its rows: an
     eager decode every DP rank decodes in, its model; a sampling prefill, its
     LM head; else None. `moe_tokens` is the real tokens among
@@ -234,6 +238,7 @@ class BatchView:
     moe_tokens: int | None = None
     dp_rank: int | None = None
     dp_dummy: bool = False
+    draft_rows: int | None = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)

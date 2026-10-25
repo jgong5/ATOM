@@ -264,10 +264,15 @@ def install_cost_backend(runner: Any, backend: CostBackend) -> None:
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")  # in the order the host runs them
 #: The part of prepare after the MTP status wait; an output forward runs it under MTP.
 MTP_SEGMENT = "W_inputs"
+#: Under MTP, from the previous output forward's target end to its MTP status
+#: wait's return: the status copy's latency, which holds R1's release.
+MTP_COPY = "L_mtp"
 #: The part of `W_launch` a later pipeline stage runs before it receives its input.
 PP_RECV_SEGMENT = "W_recv"
 #: The engine loop from a forward's exit to its next input pull: the charge's `out_s`.
 OUT_SEGMENT = "E_out"
+#: Every segment a law may price.
+SEGMENTS = (*HOST_SEGMENTS, MTP_SEGMENT, MTP_COPY, PP_RECV_SEGMENT, OUT_SEGMENT)
 FORWARD_KINDS = ("decode", "prefill", "middle")
 #: The format of a simulated run's `dp<r>.cost.jsonl`, its first line.
 COST_TABLE_VERSION = 1
@@ -289,8 +294,8 @@ class HostDeviceRecurrence:
     output forward's, or on the last stage for its own, and on any other stage
     for nothing. With `mtp`, a forward's device work is its target's and then
     its draft's, and a single-stage output forward waits before launch, for
-    the previous output forward's target; `MTP_SEGMENT` runs after that wait,
-    before the launch. With `sync`, every forward leaves no earlier than its
+    the previous output forward's target and then `MTP_COPY`; `MTP_SEGMENT`
+    runs after that wait, before the launch. With `sync`, every forward leaves no earlier than its
     own device end, as one that synchronizes its stream before it returns
     does. `ends[-1]` is the last forward's device end. `laws[kind][segment]` are coefficients on `(1,
     tokens, seqs)`; `charge` says what an absent one costs. `now` reads the engine LP's clock.
@@ -331,12 +336,15 @@ class HostDeviceRecurrence:
         is refused, naming each ``<kind>.<segment>``, the state as it was;
         without `refuse` that segment is 0. A segment in `skip` needs none, a
         middle chunk runs no `W_post`, and only an output forward under `mtp`
-        runs `MTP_SEGMENT`; a stage after the first runs `PP_RECV_SEGMENT`. Once
-        any kind's law has `OUT_SEGMENT` every kind runs it, as `out_s`, else None."""
+        runs `MTP_SEGMENT`, and on a single stage `MTP_COPY`; a stage after the
+        first runs `PP_RECV_SEGMENT`. Once any kind's law has `OUT_SEGMENT`
+        every kind runs it, as `out_s`, else None."""
         kind, x = forward_shape(batch)
         law = self.laws.get(kind, {})
         ran = HOST_SEGMENTS[: 3 if kind == "middle" else 4]
-        ran += (MTP_SEGMENT,) if self.mtp and kind != "middle" else ()
+        mtp = self.mtp and kind != "middle"
+        ran += (MTP_SEGMENT,) if mtp else ()
+        ran += (MTP_COPY,) if mtp and self.last is None else ()
         ran += (PP_RECV_SEGMENT,) if self.recv else ()
         out = any(OUT_SEGMENT in v for v in self.laws.values())
         ran += (OUT_SEGMENT,) if out else ()
@@ -365,11 +373,11 @@ class HostDeviceRecurrence:
         law = self.laws.get(kind, {})
         seg = {
             s: float(np.dot(law.get(s, (0, 0, 0)), x)) * (s not in self.skip)
-            for s in (*HOST_SEGMENTS, MTP_SEGMENT, PP_RECV_SEGMENT, OUT_SEGMENT)
+            for s in SEGMENTS
         }
         host = max(called + seg["E"], self.ends[0]) + seg["W_pre"]
         if self.mtp and kind != "middle":  # output_end stays -inf on a PP stage
-            host = max(host, self.output_end)
+            host = max(host, self.output_end + seg[MTP_COPY])
         return host + seg[MTP_SEGMENT], seg
 
     def release(self, end: float, target_end: float) -> float:
