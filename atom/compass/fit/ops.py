@@ -63,6 +63,7 @@ interpolate.
 """
 
 import argparse
+import bisect
 import functools
 import itertools
 import json
@@ -421,6 +422,7 @@ class PriceList(CostSource):
         self._family = functools.lru_cache(maxsize=1 << 14)(self._family)
         self._lookup = functools.lru_cache(maxsize=1 << 14)(self._lookup)
         self._table = functools.cache(self._table)
+        self._index = functools.cache(self._index)
 
     def price(self, request: tuple) -> CostTerm | Refusal:
         from atom.compass.bench.ops import signature
@@ -483,19 +485,28 @@ class PriceList(CostSource):
         points = {tuple(c): (ns, k) for c, ns, k in f["points"]}
         return points, [sorted({c[i] for c in points}) for i in range(len(f["dims"]))]
 
-    @staticmethod
-    def _near(at: tuple, points) -> list[set]:
+    def _index(self, name: str) -> dict:
+        """Per leading coordinates of a family's points, the values its next
+        dimension takes there, in order."""
+        index: dict = {}
+        for c in self._table(name)[0]:
+            for i in range(len(c)):
+                index.setdefault(c[:i], set()).add(c[i])
+        return {lead: sorted(vs) for lead, vs in index.items()}
+
+    def _near(self, name: str, at: tuple) -> list[set]:
         """Per dimension, `at`'s value when measured, else the values either
         side of it, among the points the earlier dimensions' values hold, as
         `interpolate` brackets it."""
-        near: list[set] = []
-        for i, x in enumerate(at):
-            on = (c[i] for c in points if all(c[j] in s for j, s in enumerate(near)))
-            vs = sorted(set(on))
-            below = max((v for v in vs if v < x), default=x)
-            near.append(
-                {x} if x in vs else {below, min((v for v in vs if v > x), default=x)}
-            )
+        index, near = self._index(name), []
+        for x in at:
+            leads = itertools.product(*map(sorted, near))
+            vs = sorted({v for lead in leads for v in index.get(lead, ())})
+            i = bisect.bisect_left(vs, x)
+            if i < len(vs) and vs[i] == x:
+                near.append({x})
+            else:
+                near.append({vs[i - 1] if i else x, vs[i] if i < len(vs) else x})
         return near
 
     def _validated(self, name: str, at: tuple) -> bool:
@@ -503,7 +514,7 @@ class PriceList(CostSource):
         it: a line through `at`'s neighbours in the other dimensions that
         holds no point at `at`."""
         f, (points, _) = self.params["families"][name], self._table(name)
-        near, held = self._near(at, points), f.get("brackets", ())
+        near, held = self._near(name, at), f.get("brackets", ())
         lines = [
             (i, list(rest))
             for i, x in enumerate(at)
@@ -525,7 +536,7 @@ class PriceList(CostSource):
 
         f, (points, axes) = self.params["families"][name], self._table(name)
         dims = f["dims"]
-        near = self._near(at, points)
+        near = self._near(name, at)
         for dim, rest, why in f.get("declined", ()):
             i = dims.index(dim)
             others = [near[j] for j in range(len(dims)) if j != i]
