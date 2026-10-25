@@ -44,8 +44,15 @@ DRIVER = (
     "import pytest\n"
     + RECORD
     + "\n\ndef test_slice():\n    # reads ATOM_COMPASS_SLICE_MODEL\n    _record('compass')\n"
-    + "\n\n@pytest.mark.skip(reason='needs ATOM_COMPASS_SLICE_MODEL, "
-    "ATOM_COMPASS_CCTRACES')\ndef test_cctraces():\n    pass\n"
+)
+# Records which compass_harness the harness Python imports.
+SMOKE = (
+    "import subprocess\n" + RECORD + "\n\ndef test_cctraces():\n"
+    "    where = subprocess.run(\n"
+    "        [os.environ['COMPASS_HARNESS_PYTHON'], '-c',\n"
+    "         'import compass_harness; print(compass_harness.WHERE)'],\n"
+    "        cwd='/', capture_output=True, text=True).stdout.strip()\n"
+    "    _record(f'cctraces {where}')\n"
 )
 # Refuses a router whose path does not end in `atomesh`, as router_binary refuses
 # one built at another commit, by raising with its reason.
@@ -56,7 +63,7 @@ ROUTER = (
 )
 
 
-def _tree(tmp_path, driver=DRIVER):
+def _tree(tmp_path, driver=DRIVER, smoke=SMOKE):
     root = tmp_path / "ATOM"
     shutil.copytree(REPO / "scripts" / "compass", root / "scripts" / "compass")
     main = _suite(EXPECT - 1, RECORD + "\n\ndef test_main():\n    _record('main')\n")
@@ -69,17 +76,22 @@ def _tree(tmp_path, driver=DRIVER):
         "torch/__init__.py": "__version__ = 1\nclass version:\n    hip = 1\n",
         "tests/test_suite.py": main,
         "tests/compass/test_d.py": driver,
+        "tests/compass/test_cctraces_sim_smoke.py": smoke,
+        "compass_harness/compass_harness/__init__.py": "WHERE = 'tree'\n",
     }
     for rel, text in files.items():
+        if text is None:
+            continue
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
     (root / "scripts" / "compass" / "preflight.sh").chmod(0o755)
     hub = tmp_path / "hf" / "hub"
-    for name in ("Qwen3-0.6B", "Qwen3.5-9B"):
+    for name in ("Qwen3-0.6B", "Qwen3.5-9B", "Qwen3.8-27B"):
         (hub / f"models--Qwen--{name}" / "snapshots" / "abc").mkdir(parents=True)
     (tmp_path / "bin").mkdir()
     (tmp_path / "bin" / "atomesh").write_text("")
+    (tmp_path / "traces.jsonl").write_text("{}\n")
     return root
 
 
@@ -93,6 +105,8 @@ def _run(tmp_path, root, **env_over):
     env["GIT_CEILING_DIRECTORIES"] = str(tmp_path)
     env["HF_HOME"] = str(tmp_path / "hf")
     env["ATOMESH"] = str(tmp_path / "bin" / "atomesh")
+    env["ATOM_COMPASS_CCTRACES"] = str(tmp_path / "traces.jsonl")
+    env["COMPASS_HARNESS_PYTHON"] = env["COMPASS_AIPERF_PYTHON"] = sys.executable
     env["HIP_VISIBLE_DEVICES"] = "4,5,6,7"
     env["RUNS"] = str(root / "runs.txt")
     env.update(env_over)
@@ -113,9 +127,16 @@ def test_driver_run_tests_run_once_on_every_card_with_their_inputs(tmp_path):
     out, verdict = _run(tmp_path, root)
     assert out.returncode == 0, out.stdout[-3000:]
     assert verdict == "GATE_GPU_RC=0 PASSED"
-    snap = f"{tmp_path}/hf/hub/models--Qwen--Qwen3-0.6B/snapshots/abc/"
+    hub = f"{tmp_path}/hf/hub/models--Qwen--"
+    snap, big = f"{hub}Qwen3-0.6B/snapshots/abc/", f"{hub}Qwen3.8-27B/snapshots/abc/"
     runs = (root / "runs.txt").read_text().splitlines()
-    assert sorted(runs) == sorted([f"compass 4,5,6,7 {snap}", f"main 4 {snap}"])
+    assert sorted(runs) == sorted(
+        [
+            f"compass 4,5,6,7 {snap}",
+            f"cctraces tree 4,5,6,7 {big}",
+            f"main 4 {snap}",
+        ]
+    )
 
 
 @pytest.mark.parametrize(
@@ -123,6 +144,22 @@ def test_driver_run_tests_run_once_on_every_card_with_their_inputs(tmp_path):
     [
         ({"HF_HOME": "/nonexistent"}, "ATOM_COMPASS_SLICE_MODEL, a Qwen3-0.6B"),
         ({"ATOM_COMPASS_IMAGE_MODEL": "/nonexistent"}, "ATOM_COMPASS_IMAGE_MODEL"),
+        (
+            {"ATOM_COMPASS_CCTRACES_MODEL": "/nonexistent"},
+            "ATOM_COMPASS_CCTRACES_MODEL, a Qwen3.8-27B",
+        ),
+        (
+            {"ATOM_COMPASS_CCTRACES": "/nonexistent"},
+            "ATOM_COMPASS_CCTRACES /nonexistent",
+        ),
+        (
+            {"COMPASS_HARNESS_PYTHON": "/nonexistent"},
+            "COMPASS_HARNESS_PYTHON /nonexistent",
+        ),
+        (
+            {"COMPASS_AIPERF_PYTHON": "/nonexistent"},
+            "COMPASS_AIPERF_PYTHON /nonexistent",
+        ),
         (
             {"ATOM_COMPASS_SLICE_MACHINE": "/nonexistent.json"},
             "ATOM_COMPASS_SLICE_MACHINE",
@@ -146,16 +183,47 @@ def test_a_missing_input_refuses_by_name_before_any_test(tmp_path, env, named):
     assert not (root / "runs.txt").exists()
 
 
-def test_a_driver_run_skip_fails_by_name(tmp_path):
-    skipped = DRIVER.replace(
-        "def test_slice",
-        "@pytest.mark.skip(reason='needs ATOMESH, atomesh')\ndef test_slice",
+@pytest.mark.parametrize(
+    "which, reason, where",
+    [
+        ("driver", "needs ATOMESH, atomesh", "test_d.py"),
+        ("smoke", "needs COMPASS_AIPERF_PYTHON", "test_cctraces_sim_smoke.py"),
+    ],
+)
+def test_a_driver_run_skip_fails_by_name(tmp_path, which, reason, where):
+    files = {"driver": DRIVER, "smoke": SMOKE}
+    files[which] = files[which].replace(
+        "def test_",
+        f"import pytest\n\n\n@pytest.mark.skip(reason='{reason}')\ndef test_",
     )
-    root = _tree(tmp_path, skipped)
+    root = _tree(tmp_path, **files)
     out, verdict = _run(tmp_path, root)
     assert out.returncode == 1, out.stdout[-3000:]
     assert (
-        "-- 1 driver-run skip line(s), first SKIPPED [1] tests/compass/test_d.py"
+        f"-- 1 driver-run skip line(s), first SKIPPED [1] tests/compass/{where}"
         in verdict
     )
-    assert "needs ATOMESH, atomesh" in verdict
+    assert reason in verdict
+
+
+# A tests/compass run that collected nothing (pytest rc 5) completed and passes
+# none; one interrupted by a collection error (rc 2) did not complete. rc 1, tests
+# failed, is the pipe test's `compass-failure` case.
+@pytest.mark.parametrize(
+    "driver, rc, verdict_is",
+    [
+        ("# ATOM_COMPASS_SLICE_MODEL\n", 0, "GATE_GPU_RC=0 PASSED"),
+        (
+            "# ATOM_COMPASS_SLICE_MODEL\nimport no_such_module\n",
+            1,
+            "GATE_GPU_RC=1 NOT PASSED -- pytest rc=2 over tests/compass; the run did not complete",
+        ),
+    ],
+)
+def test_which_tests_compass_exit_codes_are_a_completed_run(
+    tmp_path, driver, rc, verdict_is
+):
+    root = _tree(tmp_path, driver, smoke=None)
+    out, verdict = _run(tmp_path, root)
+    assert out.returncode == rc, out.stdout[-3000:]
+    assert verdict == verdict_is

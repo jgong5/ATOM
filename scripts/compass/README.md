@@ -503,6 +503,10 @@ runs:
 |---|---|
 | `ATOM_COMPASS_SLICE_MODEL` | the Qwen3-0.6B snapshot in the Hugging Face cache (`$HF_HOME`, else `~/.cache/huggingface`) |
 | `ATOM_COMPASS_IMAGE_MODEL` | the Qwen3.5-9B snapshot there |
+| `ATOM_COMPASS_CCTRACES_MODEL` | the Qwen3.8-27B snapshot there: the cc-traces smoke runs alone with it as its slice model, since its first turn is longer than Qwen3-0.6B's context |
+| `ATOM_COMPASS_CCTRACES` | `/root/cells/cc-traces-256k/traces.jsonl` |
+| `COMPASS_HARNESS_PYTHON` | `/root/cells/venv/bin/python`, agentx-harness with compass-harness installed; the smoke runs with this tree's `compass_harness` first on `PYTHONPATH` |
+| `COMPASS_AIPERF_PYTHON` | `/opt/venv/bin/python`, agentx-harness without compass-harness |
 | `ATOM_COMPASS_SLICE_MACHINE` | `machines/mi308x-hjbog18.json` (node 18's cards run with PTL on, which the hjbog39 spec refuses) |
 | `ATOMESH` | `atom/mesh/target/release/atomesh` in the tree; its directory goes first on `PATH` |
 | cards | four in `HIP_VISIBLE_DEVICES` (the multi-node DP test runs two trees of TP2) |
@@ -514,9 +518,8 @@ atomesh` in `atom/mesh`) in a git checkout of the snapshot's commit; a cargo bui
 in the snapshot itself names no commit and is refused.
 
 After the run, a `SKIPPED` line under `tests/compass/` whose reason names the slice
-or image model or `atomesh` is a finding by its file and line: that test did not
-run. The cc-traces smoke's skip is not, since it also needs a trace set and a
-harness Python, which the gate does not stage. The tests that cargo-build
+or image model, `ATOM_COMPASS_CCTRACES`, `COMPASS_AIPERF_PYTHON` or `atomesh` is a
+finding by its file and line: that test did not run. The tests that cargo-build
 atomesh run offline (`CARGO_NET_OFFLINE=true` unless set), from the container's
 crate cache, as in `gate_cpu.sh`; where cargo cannot resolve its crates they
 skip, and the gate names them.

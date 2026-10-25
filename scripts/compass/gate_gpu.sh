@@ -186,10 +186,19 @@ fi
 # model, every input is set here, by default to node 18's, and a missing one
 # refuses the run by name.
 GPUS=$HIP_VISIBLE_DEVICES
+SMOKE=
 if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
     hf_snapshot() { ls -d "${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--$1/snapshots/"*/ 2>/dev/null | head -1; }
     export ATOM_COMPASS_SLICE_MODEL=${ATOM_COMPASS_SLICE_MODEL:-$(hf_snapshot Qwen3-0.6B)}
     export ATOM_COMPASS_IMAGE_MODEL=${ATOM_COMPASS_IMAGE_MODEL:-$(hf_snapshot Qwen3.5-9B)}
+    # The cc-traces smoke replays turns longer than the slice model's context, so
+    # it runs alone, with this model as its slice model.
+    SMOKE=tests/compass/test_cctraces_sim_smoke.py
+    export ATOM_COMPASS_CCTRACES_MODEL=${ATOM_COMPASS_CCTRACES_MODEL:-$(hf_snapshot Qwen3.8-27B)}
+    export ATOM_COMPASS_CCTRACES=${ATOM_COMPASS_CCTRACES:-/root/cells/cc-traces-256k/traces.jsonl}
+    # agentx-harness with compass-harness installed, and without it.
+    export COMPASS_HARNESS_PYTHON=${COMPASS_HARNESS_PYTHON:-/root/cells/venv/bin/python}
+    export COMPASS_AIPERF_PYTHON=${COMPASS_AIPERF_PYTHON:-/opt/venv/bin/python}
     # The cards' PTL state is part of the machine's key; node 18's run with it on.
     export ATOM_COMPASS_SLICE_MACHINE=${ATOM_COMPASS_SLICE_MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
     # The router-LP forms refuse a router not built at this tree's commit, so a
@@ -200,6 +209,10 @@ if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
     MISSING=
     [ -d "$ATOM_COMPASS_SLICE_MODEL" ] || MISSING+="ATOM_COMPASS_SLICE_MODEL, a Qwen3-0.6B directory; "
     [ -d "$ATOM_COMPASS_IMAGE_MODEL" ] || MISSING+="ATOM_COMPASS_IMAGE_MODEL, a Qwen3.5-9B directory; "
+    [ -d "$ATOM_COMPASS_CCTRACES_MODEL" ] || MISSING+="ATOM_COMPASS_CCTRACES_MODEL, a Qwen3.8-27B directory; "
+    [ -r "$ATOM_COMPASS_CCTRACES" ] || MISSING+="ATOM_COMPASS_CCTRACES $ATOM_COMPASS_CCTRACES; "
+    [ -x "$COMPASS_HARNESS_PYTHON" ] || MISSING+="COMPASS_HARNESS_PYTHON $COMPASS_HARNESS_PYTHON; "
+    [ -x "$COMPASS_AIPERF_PYTHON" ] || MISSING+="COMPASS_AIPERF_PYTHON $COMPASS_AIPERF_PYTHON; "
     [ -r "$ATOM_COMPASS_SLICE_MACHINE" ] || MISSING+="ATOM_COMPASS_SLICE_MACHINE $ATOM_COMPASS_SLICE_MACHINE; "
     ROUTER=$(python -c 'import sys; from atom.compass.run import router_binary; router_binary(sys.argv[1])' \
         "$ATOMESH" 2>&1) || MISSING+="ATOMESH, ${ROUTER##*$'\n'}; "
@@ -208,7 +221,17 @@ if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
     [ -z "$MISSING" ] || finish 92 "the driver-run tests lack ${MISSING%; }; nothing was run"
     printf 'driver-run: slice %s\n            image %s\n            machine %s\n            router %s\n' \
         "$ATOM_COMPASS_SLICE_MODEL" "$ATOM_COMPASS_IMAGE_MODEL" "$ATOM_COMPASS_SLICE_MACHINE" "$ATOMESH"
+    printf 'cc-traces:  model %s\n            traces %s\n            harness %s\n            aiperf %s\n' \
+        "$ATOM_COMPASS_CCTRACES_MODEL" "$ATOM_COMPASS_CCTRACES" "$COMPASS_HARNESS_PYTHON" "$COMPASS_AIPERF_PYTHON"
 fi
+
+# Sets SUMMARY, PASSED, FAILED and ERRORS from the pytest summary line ending a log.
+counts() {
+    SUMMARY=$(tail -20 "$1" | grep -E '[0-9]+ (passed|failed|error)' | tail -1)
+    PASSED=$(grep -oE '[0-9]+ passed' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
+    FAILED=$(grep -oE '[0-9]+ failed' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
+    ERRORS=$(grep -oE '[0-9]+ errors?' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
+}
 
 # tests/compass runs once, on every card named, and the rest of the suite on the
 # first card alone, as the baseline was measured: an upstream test that needs
@@ -217,21 +240,32 @@ fi
 # The tests that cargo-build atomesh skip unless cargo resolves its crates; the
 # gate has no network, so they come from the container's cache.
 export CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE:-true}
+ARGS=("$@")
 COUT=$(mktemp)
 COMPASS_N=0 C_FAILED=0 C_ERRORS=0
-if [ -d "$ROOT/tests/compass" ]; then
-    printf '===== tests/compass on HIP_VISIBLE_DEVICES=%s =====\n' "$GPUS"
-    python -m pytest tests/compass -q --no-header -p no:cacheprovider "$@" -rfEs 2>&1 | tee "$COUT"
-    CRC=${PIPESTATUS[0]}
+compass_tests() {
+    printf '===== %s on HIP_VISIBLE_DEVICES=%s =====\n' "$1" "$GPUS"
+    local log rc
+    log=$(mktemp)
+    python -m pytest "$@" -q --no-header -p no:cacheprovider "${ARGS[@]}" -rfEs 2>&1 | tee "$log"
+    rc=${PIPESTATUS[0]}
+    cat "$log" >>"$COUT"
+    counts "$log"
+    rm -f "$log"
     # rc 5 is "no tests collected": a directory holding nothing runnable passes none.
-    case "$CRC" in
+    case "$rc" in
     0 | 1 | 5) ;;
-    *) rm -f "$COUT"; finish 1 "pytest rc=$CRC over tests/compass; the run did not complete" ;;
+    *) rm -f "$COUT"; finish 1 "pytest rc=$rc over $1; the run did not complete" ;;
     esac
-    C_SUMMARY=$(tail -20 "$COUT" | grep -E '[0-9]+ (passed|failed|error)' | tail -1)
-    COMPASS_N=$(printf '%s' "$C_SUMMARY" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || echo 0)
-    C_FAILED=$(printf '%s' "$C_SUMMARY" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo 0)
-    C_ERRORS=$(printf '%s' "$C_SUMMARY" | grep -oE '[0-9]+ errors?' | grep -oE '[0-9]+' || echo 0)
+    COMPASS_N=$((COMPASS_N + PASSED)) C_FAILED=$((C_FAILED + FAILED)) C_ERRORS=$((C_ERRORS + ERRORS))
+}
+if [ -f "$SMOKE" ]; then
+    compass_tests tests/compass --ignore="$SMOKE"
+    # The tree's compass-harness ahead of the one the harness Python has installed.
+    PYTHONPATH=$ROOT/compass_harness:$PYTHONPATH ATOM_COMPASS_SLICE_MODEL=$ATOM_COMPASS_CCTRACES_MODEL \
+        compass_tests "$SMOKE"
+elif [ -d "$ROOT/tests/compass" ]; then
+    compass_tests tests/compass
 else
     printf 'tests/compass: absent on this tree, so it contributes no tests.\n'
 fi
@@ -245,10 +279,7 @@ OUT=$(mktemp)
 HIP_VISIBLE_DEVICES=${GPUS%%,*} python -m pytest tests/ --ignore=tests/plugin --ignore=tests/compass \
     -q --no-header -p no:cacheprovider "$@" -rfE 2>&1 | tee "$OUT"
 PYRC=${PIPESTATUS[0]}
-SUMMARY=$(tail -20 "$OUT" | grep -E '[0-9]+ (passed|failed|error)' | tail -1)
-PASSED=$(printf '%s' "$SUMMARY" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || echo 0)
-FAILED=$(printf '%s' "$SUMMARY" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo 0)
-ERRORS=$(printf '%s' "$SUMMARY" | grep -oE '[0-9]+ errors?' | grep -oE '[0-9]+' || echo 0)
+counts "$OUT"
 
 # A summary line that parses to 0/0/0, or no summary line at all, means the run
 # did not get far enough to produce one -- a collection error, an OOM, a killed
@@ -279,10 +310,8 @@ esac
 PASSED=$((PASSED + COMPASS_N)) FAILED=$((FAILED + C_FAILED)) ERRORS=$((ERRORS + C_ERRORS))
 printf '\nGATE_GPU passed=%s failed=%s errors=%s pytest_rc=%s (baseline %s/%s/0, expected %s passed)\n' \
     "$PASSED" "$FAILED" "$ERRORS" "$PYRC" "$BASE_PASSED" "$BASE_FAILED" "$EXPECT_PASSED"
-# A driver-run test that skipped did not run, whatever the counts say. The
-# cc-traces smoke also needs a trace set and a harness Python, which this gate
-# does not stage.
-SKIPS=$(grep -E '^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE)_MODEL|atomesh)' "$COUT" | grep -v ATOM_COMPASS_CCTRACES)
+# A driver-run test that skipped did not run, whatever the counts say.
+SKIPS=$(grep -E '^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE)_MODEL|ATOM_COMPASS_CCTRACES|COMPASS_AIPERF_PYTHON|atomesh)' "$COUT")
 cat "$COUT" >>"$OUT"
 rm -f "$COUT"
 
