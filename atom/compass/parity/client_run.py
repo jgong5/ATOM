@@ -14,7 +14,9 @@ server sent it, the id the step record names it by; its trace is its
 ``conversation_id`` up to any ``::``, which aiperf's trace loader appends to
 name the conversations it derives from one trace; and its request parameters
 are its payload less the prompt, the model, the output length and the stream's
-framing. A request that got no response id, cancelled or failed before its
+framing. A record whose payload aiperf left out
+(``AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true``) takes the endpoint's ``extra``
+inputs, all aiperf adds to a weka trace request's payload. A request that got no response id, cancelled or failed before its
 first chunk, is listed under ``unnamed`` by its ``x_request_id``, phase and
 trace, so a reader knows which requests aiperf sent the export cannot name.
 ``traces`` names every trace aiperf was given: the ``id`` of each weka trace
@@ -117,9 +119,11 @@ def write(artifacts) -> tuple[Path, dict, int]:
     """Write `artifacts`' export; its path, the export, and how many requests
     got no response id."""
     artifacts, named, unnamed = Path(artifacts), {PROFILING: {}, WARMUP: {}}, []
-    # Bytes, so lines end at \n or \r only, which JSON escapes inside strings:
-    # aiperf writes a string's U+2028 unescaped, where str.splitlines would cut.
-    for line in (artifacts / RAW).read_bytes().splitlines():
+    args = arguments(artifacts)
+    # A line at a time, in bytes, so lines end at \n only, which JSON escapes
+    # inside strings: aiperf writes a string's U+2028 unescaped, where
+    # str.splitlines would cut.
+    for line in open(artifacts / RAW, "rb"):
         record = json.loads(line.decode())
         meta = record["metadata"]
         if meta["benchmark_phase"] not in named:
@@ -145,11 +149,10 @@ def write(artifacts) -> tuple[Path, dict, int]:
             continue
         if rid in named[PROFILING] or rid in named[WARMUP]:
             raise ValueError(f"two requests got response id {rid}")
+        payload = record.get("payload") or args["endpoint.extra"] or {}
         named[meta["benchmark_phase"]][rid] = {
             "trace": trace,
-            "sampling": {
-                k: v for k, v in record["payload"].items() if k not in NOT_SAMPLING
-            },
+            "sampling": {k: v for k, v in payload.items() if k not in NOT_SAMPLING},
         }
     traces = given(artifacts)
     export = {
@@ -158,7 +161,7 @@ def write(artifacts) -> tuple[Path, dict, int]:
         "unnamed": unnamed,
         "traces": sorted(traces),
         "sessions": {t: s for t, s in traces.items() if s is not None},
-        "arguments": arguments(artifacts),
+        "arguments": args,
     }
     path = artifacts / NAME
     path.write_text(json.dumps(export, sort_keys=True))

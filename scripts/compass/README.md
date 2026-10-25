@@ -723,7 +723,8 @@ runs with `PYTHONPATH=$T`, both from `/` so every path is absolute. Below, `$ATO
 `--model <Qwen3.8-27B> --max-model-len 262144`, `$M` is `--machine` and this node's spec
 ([QUICKSTART.md](QUICKSTART.md#environment) says which), `$R` is a directory under `/data`
 or `/tmp` and `$S` is `--store $R/store`, empty at the start. The raw export keeps
-every prompt, about 100 KB to 760 KB a request on this cell.
+no prompt: aiperf leaves each request's payload out of it, and the client
+gzips it once the client run's export is written.
 
 **A client run.** No command starts one: once `OUT/server.json` exists,
 `$T/scripts/compass/client.sh OUT --traces A-B --concurrency C --stop`, `client.sh`

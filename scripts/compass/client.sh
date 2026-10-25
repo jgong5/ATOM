@@ -29,7 +29,8 @@
 # compass-harness does, so both send the same prompts, after the scenario's own
 # warmup. OUT/client/ holds the traces aiperf is given, each a file
 # named by its line in TRACES, aiperf's dataset and its log; OUT/artifacts/
-# aiperf's artifacts at --export-level raw and the client run's export,
+# aiperf's artifacts at --export-level raw, its raw records with no payload
+# and gzipped (profile_export_raw.jsonl.gz), and the client run's export,
 # client_run.json (atom/compass/parity/client_run.py), and its workload,
 # workload.json, as cctraces_sim.sh writes it into run.json, so
 # `python -m atom.compass.validate` grades the two in one cell. One client run per OUT:
@@ -112,14 +113,17 @@ args=(--endpoint-type chat --custom-dataset-type weka_trace
     --no-server-metrics --no-gpu-telemetry --ui none "${extra[@]}")
 
 # Each request carries X-Session-ID, as the nightly's agentic cell sends it: a
-# dp_sticky router keys off it, and a server alone ignores it.
+# dp_sticky router keys off it, and a server alone ignores it. The raw records
+# leave out each request's payload, its prompt, and are compressed once the
+# export is written.
 (cd "$OUT/client" && AIPERF_DATASET_MMAP_BASE_PATH=$OUT/client AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true \
-    exec "$HARNESS_PYTHON" "${aiperf[@]}" \
+    AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true exec "$HARNESS_PYTHON" "${aiperf[@]}" \
     profile --url "${url#http://}" --model "$MODEL" --tokenizer "$MODEL" \
     --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" --export-level raw "${args[@]}") \
     >"$OUT/client/aiperf.log" 2>&1 || fail "aiperf: exited $?; see $OUT/client/aiperf.log"
 (cd / && python3 -m atom.compass.parity.client_run "$OUT/artifacts") ||
     fail "export: atom.compass.parity.client_run exited $? on $OUT/artifacts"
+gzip "$OUT/artifacts/profile_export_raw.jsonl" || fail "export: cannot compress $OUT/artifacts/profile_export_raw.jsonl"
 python3 - "$OUT" "$TRACES" "${args[@]}" <<'EOF' || fail "workload: cannot write $OUT/artifacts/workload.json"
 import hashlib, json, sys
 from pathlib import Path
