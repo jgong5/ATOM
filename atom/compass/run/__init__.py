@@ -383,25 +383,18 @@ def spec() -> dict | None:
 
 def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time."""
-    from atom.compass.runner.overrides import (
-        FORWARD_KINDS,
-        HOST_SEGMENTS,
-        MTP_SEGMENT,
-        OUT_SEGMENT,
-        PP_RECV_SEGMENT,
-    )
+    from atom.compass.runner.overrides import FORWARD_KINDS, SEGMENTS
 
     laws = host.get("laws", {})
-    segments = (*HOST_SEGMENTS, MTP_SEGMENT, PP_RECV_SEGMENT, OUT_SEGMENT)
     if (
         set(host) - {"laws", "skip", "key"}
-        or set(host.get("skip", ())) - set(segments)
+        or set(host.get("skip", ())) - set(SEGMENTS)
         or set(laws) - set(FORWARD_KINDS)
-        or {s for v in laws.values() for s in v} - set(segments)
+        or {s for v in laws.values() for s in v} - set(SEGMENTS)
         or {len(c) for v in laws.values() for c in v.values()} - {3}
     ):
         raise ValueError(
-            f"{path}: host is {host!r}; it takes skip, a list of {segments}, "
+            f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
             "and key, the host key the laws were fitted under"
         )
