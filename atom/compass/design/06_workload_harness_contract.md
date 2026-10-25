@@ -851,7 +851,7 @@ sites below, which do not go through `LoopScheduler` either (T74).
    plot and `submission_valid`. Roughly 15,000 lines of metrics code for free.
 
    **The carriers** (revised 2026-09-28, #443; `01` D8). The arrival time goes in the
-   **`compass` entry of the W3C `tracestate` header**, appended after any existing entries
+   **`compass` entry of the W3C `tracestate` header**, added before any existing entries
    (for example `tracestate: compass=a:12.345;s:17`), not in a body field: atomesh
    re-serializes a chat request through a typed struct with no catch-all, so an unknown
    top-level field is dropped, while `tracestate` is on the header allow-list it forwards
