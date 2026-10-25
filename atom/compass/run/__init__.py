@@ -1285,8 +1285,9 @@ def runner(model_runner, tree) -> None:
         name = _engine_name(config, run) or ""
         side = {"P": "prefill", "D": "decode"}.get(name[:1], "") + name[1:]
         pp = getattr(config, "pipeline_parallel_size", 1)
-        stage = config.parallel_config.pipeline_parallel_rank if pp > 1 else 0
-        replay = ReplayHost(Path(run["replay"]) / side, dp_rank, stage)
+        # A later pipeline stage replays its own record.
+        stage = (config.parallel_config.pipeline_parallel_rank,) if pp > 1 else ()
+        replay = ReplayHost(Path(run["replay"]) / side, dp_rank, *stage)
     if STEP_LINEAR in run:
         if tp != 1:
             raise ValueError(
