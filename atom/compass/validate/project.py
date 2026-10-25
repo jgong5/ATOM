@@ -8,7 +8,8 @@ at step and op level, published as a `projection`.
 A cell is a real run's directory, its step record in `steps/`, and the ATOM
 arguments it ran under: after `--` in the command line its run.json holds,
 less the server's and `--model`, as `--model` names the model here; for a
-record whose run.json names none, those in its own `-- RECORD` group. Its
+record whose run.json names none, or a `--draft-model`, those in its own
+`-- RECORD` group. Its
 steps are priced as `validate.bound` prices them,
 on SPEC, the op_graphs S holds for SPEC's arch; nothing is compared with the
 measured time, which is another device's. Each cell is priced in a process of
@@ -334,19 +335,22 @@ def text(document: dict) -> str:
 
 def recorded(record: str) -> list[str]:
     """ATOM's arguments after `--` in the command line `record`'s run.json
-    holds, less the server's and `--model`; refused when it names none."""
+    holds, less the server's and `--model`; refused when it names none, or a
+    `--draft-model`, another path on the host that ran it."""
     from atom.compass.drive.runfile import engine_only
 
     run = Path(record, "run.json")
     argv = json.loads(run.read_text()).get("argv", []) if run.exists() else []
-    if "--" not in argv:
-        raise ValueError(
-            f"{run} names no ATOM arguments after -- in its argv; "
-            f"name the record as -- {record} [ATOM args]"
-        )
-    model = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    model.add_argument("--model")
-    return model.parse_known_args(engine_only(argv[argv.index("--") + 1 :]))[1]
+    why = "names no ATOM arguments after -- in its argv"
+    if "--" in argv:
+        paths = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+        paths.add_argument("--model")
+        paths.add_argument("--draft-model", "--draft_model")
+        named, rest = paths.parse_known_args(engine_only(argv[argv.index("--") + 1 :]))
+        if named.draft_model is None:
+            return rest
+        why = "names --draft-model, a path on the host that ran it"
+    raise ValueError(f"{run} {why}; name the record as -- {record} [ATOM args]")
 
 
 def main(argv: list[str]) -> None:
