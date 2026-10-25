@@ -369,31 +369,36 @@ def held_out(params) -> list[dict]:
 def unsettled(points) -> list[tuple[dict, str, int]]:
     """Where `held_out` declines a prefill line along T or context: for each
     of its points that reads over `LIMIT` off its neighbours or is a hidden
-    band, and each neighbour more than one away, the point at the lower end
-    of that gap, the dimension and the value halfway along it."""
-    params, ends = fit(points), {}
+    band, and each neighbour more than one away, the dimension, the value
+    halfway along that gap, and each point at the gap's lower end that a query
+    there interpolates from: those sharing the line's coordinates before the
+    dimension and holding a point at the upper end too, so a value measured
+    halfway keeps the grid past it whole."""
+    params, at = fit(points), {}
     for p in points:
         if p["shape"].startswith("prefill") and "exchange" not in p:
             free = params["free"][skeleton(p["shape"], p["leaf"])]
             name = family(p["shape"], p["leaf"], free)
-            at = shape_counts(p["shape"]) | {"context": _context(p)}
-            ends[name, tuple(at[d] for d in params["families"][name]["dims"])] = p
+            counts = shape_counts(p["shape"]) | {"context": _context(p)}
+            dims = params["families"][name]["dims"]
+            at.setdefault(name, {})[tuple(counts[d] for d in dims)] = p
     out = []
-    for name, f in params["families"].items():
-        if not json.loads(name)[0].startswith("prefill"):
-            continue
+    for name, held in at.items():
+        f = params["families"][name]
         for row in held_out({"families": {name: f}}):
             off = row.get("hidden_band") or abs(row.get("error") or 0) > LIMIT
             if not off or row["dim"] not in ("T", "context"):
                 continue
-            i, c = f["dims"].index(row["dim"]), row["at"]
-            rest = c[:i] + c[i + 1 :]
-            xs = sorted(x[i] for x, *_ in f["points"] if x[:i] + x[i + 1 :] == rest)
+            i, c = f["dims"].index(row["dim"]), tuple(row["at"])
+            xs = sorted(x[i] for x in held if x[:i] + x[i + 1 :] == c[:i] + c[i + 1 :])
             j = xs.index(c[i])
             for a, b in ((xs[j - 1], c[i]), (c[i], xs[j + 1])):
-                if b - a > 1:
-                    low = tuple(c[:i] + [a] + c[i + 1 :])
-                    out.append((ends[name, low], row["dim"], (a + b) // 2))
+                out += [
+                    (p, row["dim"], (a + b) // 2)
+                    for x, p in held.items()
+                    if b - a > 1 and x[:i] == c[:i] and x[i] == a
+                    if (*x[:i], b, *x[i + 1 :]) in held
+                ]
     return out
 
 

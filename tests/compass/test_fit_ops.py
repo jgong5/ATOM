@@ -441,6 +441,9 @@ def test_a_line_that_interpolates_records_each_held_out_point_s_bracket(ns, brac
     assert f["brackets"] == brackets
 
 
+BENT = ((64, 64e3), (128, 96e3), (256, 256e3))
+
+
 @pytest.mark.parametrize(
     "points, asked",
     [
@@ -448,31 +451,56 @@ def test_a_line_that_interpolates_records_each_held_out_point_s_bracket(ns, brac
         ([_prefill(t, 1, t * 1e3) for t in (64, 128, 256)], []),
         # T = 128 reads +33% off its neighbours: halfway to each
         (
-            [_prefill(t, 1, ns) for t, ns in ((64, 64e3), (128, 96e3), (256, 256e3))],
-            [("prefill T=64 B=1", "T", 96), ("prefill T=128 B=1", "T", 192)],
+            [_prefill(t, 1, ns) for t, ns in BENT],
+            [
+                ("prefill T=64 B=1", None, "T", 96),
+                ("prefill T=128 B=1", None, "T", 192),
+            ],
         ),
         # its lower neighbour one away: only the gap above
         (
             [_prefill(t, 1, ns) for t, ns in ((127, 127e3), (128, 96e3), (256, 256e3))],
-            [("prefill T=128 B=1", "T", 192)],
+            [("prefill T=128 B=1", None, "T", 192)],
         ),
         # 1000 cached tokens read -33% off their neighbours
         (
             [_prefill(64, 1, ns, context=c) for c, ns in ((0, 1e5), (1000, 3e5))]
             + [_prefill(64, 1, 3e5, context=2000)],
             [
-                ("prefill T=64 B=1", "context", 500),
-                ("prefill T=64 B=1", "context", 1500),
+                ("prefill T=64 B=1", 0, "context", 500),
+                ("prefill T=64 B=1", 1000, "context", 1500),
+            ],
+        ),
+        # bent fresh, straight at 1000 cached tokens: the halfway T at each
+        # cached count both ends hold, none at 2000, which only T = 64 holds
+        (
+            [
+                _prefill(t, 1, ns + c * 1e2, context=c)
+                for t, ns in BENT
+                for c in (0, 1000)
+                if c == 0 or t != 128
+            ]
+            + [
+                _prefill(128, 1, 228e3, context=1000),
+                _prefill(64, 1, 264e3, context=2000),
+            ],
+            [
+                ("prefill T=64 B=1", 0, "T", 96),
+                ("prefill T=64 B=1", 1000, "T", 96),
+                ("prefill T=128 B=1", 0, "T", 192),
+                ("prefill T=128 B=1", 1000, "T", 192),
             ],
         ),
         # a decode line bent as much: the plan's own check halves it
         ([_point(b, ns) for b, ns in ((2, 2e3), (4, 3e3), (8, 8e3))], []),
     ],
-    ids=["line", "bent", "one-away", "cached", "decode"],
+    ids=["line", "bent", "one-away", "cached", "grid", "decode"],
 )
 def test_a_prefill_line_the_fit_declines_asks_for_the_point_halfway_to_each_neighbour(
     points, asked
 ):
-    got = [(p["shape"], dim, mid) for p, dim, mid in ops.unsettled(points)]
+    got = [
+        (p["shape"], p["context"], dim, mid) for p, dim, mid in ops.unsettled(points)
+    ]
 
     assert got == asked
