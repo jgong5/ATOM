@@ -298,6 +298,9 @@ def test_records_stripped_of_their_payload_export_as_whole_ones_do(tmp_path, ext
     whole, stripped = exports
     assert stripped == whole
     assert whole["requests"]["a"]["sampling"] == (extra or {})
+
+
+def test_a_record_holding_a_unicode_line_separator_is_read_whole(tmp_path):
     # aiperf's orjson writes U+2028, U+2029 and U+0085 unescaped, as a served
     # output can hold them.
     text = json.dumps({"id": "a", "text": "x\u2028y\u2029z\x85"}, ensure_ascii=False)
