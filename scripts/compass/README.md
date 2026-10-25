@@ -700,6 +700,12 @@ memory against that side's hand-in (`lp-engine-P.json`, `lp-engine-D.json`); end
 end once, from the deployment's export. The export names decode's response ids, so
 prefill's side is split through decode's `transfers.jsonl` (`parity.transfers`).
 
+## The analytical bound — `python -m atom.compass.validate.bound`
+
+`PYTHONPATH=$T python -m atom.compass.validate.bound ... RECORD...` exits 1 when a real
+record's step is priced above its measured device time; `compass project` prices real
+records on another device. Each module's docstring states its arguments and report.
+
 ## The stage-2 cell through the `compass` CLI, from an empty store
 
 Qwen3.8-27B TP1 on MI308X, priced by a step linear law `compass fit steps` fits on

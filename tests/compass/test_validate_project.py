@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""`compass validate project`: real runs' steps priced on a device none of them
+"""`compass project`: real runs' steps priced on a device none of them
 ran on, published as a projection that ranks the cells and names each assumed
-spec field a price read; and `validate bound --ratios-from`, a device that ran
+spec field a price read; and `validate.bound --ratios-from`, a device that ran
 priced at another's probed ratios, the method's error on its own records.
 """
 
@@ -138,6 +138,26 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
         base = doc["cells"][str(prefill)][level]["tokens_per_s"]
         slower = doc["band"]["device.compute.derate.bf16"]["0.8"]["tokens_per_s"]
         assert slower[level][str(prefill)] < base
+
+
+def test_main_reads_a_records_atom_arguments_from_its_run_json(monkeypatch, tmp_path):
+    """Less the server's and `--model`; a record whose run.json names none is
+    refused alone and priced under its own `--` group."""
+    _priced_here(monkeypatch)
+    build, built = bound._build, []
+    monkeypatch.setattr(bound, "_build", lambda *a: built.append(a[2]) or build(*a))
+    served, bare = (ran(tmp_path / n, LINES[i : i + 1]) for i, n in enumerate("ab"))
+    line = ["compass", "record", "--out", str(served), "--", "--model", "/there"]
+    line += ["--enable-tbo", "--tool-call-parser", "qwen3"]
+    (served / "run.json").write_text(json.dumps({"argv": line}))
+    (bare / "run.json").write_text(json.dumps({"argv": ["compass", "record"]}))
+    argv = ["--model", "m", "--machine", str(MI455), "--store", str(tmp_path / "s")]
+
+    with pytest.raises(ValueError, match=f"name the record as -- {bare} "):
+        project.main([*argv, str(served), str(bare)])
+    project.main([*argv, str(served), "--", str(bare), "--kv_cache_dtype", "bf16"])
+
+    assert built[:2] == [["--enable-tbo"], ["--kv_cache_dtype", "bf16"]]
 
 
 def test_main_refuses_cells_of_two_models_and_a_run_with_no_cell(monkeypatch):
