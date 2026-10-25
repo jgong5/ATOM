@@ -265,6 +265,19 @@ def test_the_trace_is_the_conversation_and_the_parameters_are_what_shape_no_prom
     }
 
 
+def test_a_record_holding_a_unicode_line_separator_is_read_whole(tmp_path):
+    # aiperf's orjson writes U+2028, U+2029 and U+0085 unescaped, as a served
+    # output can hold them.
+    text = json.dumps({"id": "a", "text": "x y z\x85"}, ensure_ascii=False)
+    _write_raw(tmp_path, [])
+    records = [raw([sse(("data", text))]), raw([sse(("data", '{"id": "b"}'))])]
+    (tmp_path / RAW).write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
+    )
+
+    assert set(write(tmp_path)[1]["requests"]) == {"a", "b"}
+
+
 def test_a_request_no_response_named_is_listed_by_its_request_id_phase_and_trace(
     tmp_path,
 ):
