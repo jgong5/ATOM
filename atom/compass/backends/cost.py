@@ -34,7 +34,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 
@@ -56,6 +56,15 @@ def fold_step(total: float, value: float) -> float:
     return fold_seconds((total, value))
 
 
+def fold_parts(parts: Iterable[Mapping[str, float]]) -> dict[str, float]:
+    """Seconds by name, each name's folded in the order given."""
+    grouped: dict[str, list[float]] = {}
+    for p in parts:
+        for name, seconds in p.items():
+            grouped.setdefault(name, []).append(seconds)
+    return {name: fold_seconds(s) for name, s in grouped.items()}
+
+
 @dataclass(frozen=True)
 class CostTerm:
     """One labelled part of a step's cost.
@@ -66,12 +75,17 @@ class CostTerm:
 
     `draft` tags a speculative drafter's device work, which runs after the
     target's; every other term is the target's.
+
+    `by_bound` is a roofline term's seconds by the part of its prices that set
+    them (`work.parts`), summing to `seconds`; empty when no roofline part
+    sets them, as for a measured price or an overlapped step.
     """
 
     name: str
     seconds: float
     provenance: Provenance
     draft: bool = False
+    by_bound: Mapping[str, float] = field(default_factory=dict, hash=False)
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -89,6 +103,12 @@ class CostTerm:
                 f"{self.name}: a refusal was priced at {self.seconds} s. Something "
                 "declined and the stand-in charged nothing, which removes the step "
                 "from the schedule while still reporting it as priced."
+            )
+        parts = fold_seconds(self.by_bound.values())
+        if self.by_bound and not math.isclose(parts, self.seconds, rel_tol=1e-9):
+            raise ValueError(
+                f"{self.name}: its parts {dict(self.by_bound)} sum to {parts} s, "
+                f"not its {self.seconds} s"
             )
 
     @property

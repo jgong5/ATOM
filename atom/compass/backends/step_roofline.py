@@ -32,7 +32,10 @@ term. Modules outside the layers run once over the whole step.
 Terms. One per module kind, `roofline.<kind>`. A term is `declared`, its
 note naming each input, when a spec field one of its modules read for the
 bound that won, or for its collective, is neither from a datasheet nor
-probed, and `analytical` otherwise.
+probed, and `analytical` otherwise. Its `by_bound` holds each module's kernel
+seconds under its largest bound and its collectives' as `comm.latency` and
+`comm.transfer`, a fused module's under the largest of all (`work.binding`);
+``roofline.tbo``'s is empty.
 
 Refused: a step with image tokens, since nothing here prices the vision
 encoder that fills them; any step, while the walk found a module it could not
@@ -60,12 +63,14 @@ from math import comb
 import numpy as np
 
 from atom.compass.backends.base import CostBackend, Granularity
-from atom.compass.backends.cost import CostTerm, StepCost, fold_seconds
+from atom.compass.backends.cost import CostTerm, StepCost, fold_parts, fold_seconds
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import IMAGES, BatchView, RequestShape, sum_tokens
 from atom.compass.backends.work import (
+    COMM,
     ELEMENT_BYTES,
+    KERNEL,
     Work,
     _wider,
     activated_experts,
@@ -73,12 +78,13 @@ from atom.compass.backends.work import (
     allgather,
     allreduce,
     attention,
+    binding,
     bounds,
     elementwise,
     gemm,
     grouped_gemm,
     max_rank_load,
-    price,
+    parts,
     reduce_scatter,
 )
 
@@ -371,17 +377,17 @@ class StepRooflineBackend(CostBackend):
 
     def _unit(self, m: Module, view: BatchView, tokens: int, sampled: int):
         """`m`'s seconds as (exchange before, the rest, exchange after) with
-        the notes of the inputs that decided them, a refusal's text, or None
-        if `m` runs nothing on this step."""
+        the notes of the inputs that decided them and its seconds by bound,
+        a refusal's text, or None if `m` runs nothing on this step."""
         if m.kind == "moe" and m.dims[6] > 1 and view.moe_rows is None:
             return f"a MoE over {m.dims[6]} data-parallel ranks, and no moe_rows"
         if m.kind == "moe":
-            parts = _moe(m, view, tokens)
+            pieces = _moe(m, view, tokens)
         else:
-            parts = (Work(), _work(m, view, tokens, sampled), Work())
-            if parts[1] is None:
+            pieces = (Work(), _work(m, view, tokens, sampled), Work())
+            if pieces[1] is None:
                 return None
-        work = sum(parts, Work())
+        work = sum(pieces, Work())
         reads = _reads(work)
         missing = [
             p for ps in reads.values() for p in ps if p not in self.machine.values
@@ -396,14 +402,16 @@ class StepRooflineBackend(CostBackend):
                 f"a {m.kind} collective over {m.ranks} ranks leaves the "
                 f"scale-up domain of {self.domain} devices"
             )
-        b = bounds(work, self.machine)
-        kernel = max(("floor", "compute", "memory"), key=b.get)
-        won = [kernel, "comm"] if b["comm"] else [kernel]
-        notes = [s for w in won for p in reads[w] if (s := self._stated(p))]
+        p = parts(work, self.machine)
+        kernel = max(KERNEL, key=p.get)
+        won = [kernel, "comm"] if p[COMM[0]] + p[COMM[1]] else [kernel]
+        notes = [s for w in won for f in reads[w] if (s := self._stated(f))]
         if m.fused:
-            return (0.0, price(work, self.machine), 0.0), notes
-        comm = [bounds(w, self.machine)["comm"] if w.comm else 0.0 for w in parts]
-        return (comm[0], b[kernel] + comm[1], comm[2]), notes
+            by = binding(work, self.machine)
+            return (0.0, fold_seconds(by.values()), 0.0), notes, by
+        comm = [bounds(w, self.machine)["comm"] if w.comm else 0.0 for w in pieces]
+        by = {kernel: p[kernel]} | {k: p[k] for k in COMM if p[k]}
+        return (comm[0], p[kernel] + comm[1], comm[2]), notes, by
 
     def _overlapped(self, view: BatchView, refuse, priced, stated) -> str:
         """Price the layers of a split step as two micro-batches on two
@@ -463,6 +471,7 @@ class StepRooflineBackend(CostBackend):
         if batch_view.produces_output is not False:
             sampled = len(batch_view.prefill) + sum_tokens(decode)
         priced: dict[str, list[float]] = {}
+        by: dict[str, list[dict]] = {}
         stated: dict[str, list[str]] = {}
         split = batch_view.tbo_tokens is not None
         for m, count in (self.outside if split else self.shapes).items():
@@ -471,6 +480,9 @@ class StepRooflineBackend(CostBackend):
                 refuse.append(unit)
             elif unit:
                 priced.setdefault(m.kind, []).append(sum(unit[0]) * count)
+                by.setdefault(m.kind, []).append(
+                    {k: s * count for k, s in unit[2].items()}
+                )
                 stated.setdefault(m.kind, []).extend(unit[1])
         if split:
             split = self._overlapped(batch_view, refuse, priced, stated)
@@ -487,7 +499,12 @@ class StepRooflineBackend(CostBackend):
                 detail = f"the layers' two micro-batches of {split} tokens overlapped"
             provenance = Provenance(method, detail, SOURCE, note=note and note + none)
             terms.append(
-                CostTerm(f"roofline.{kind}", fold_seconds(seconds), provenance)
+                CostTerm(
+                    f"roofline.{kind}",
+                    fold_seconds(seconds),
+                    provenance,
+                    by_bound=fold_parts(by.get(kind, ())),
+                )
             )
         return StepCost(terms)
 

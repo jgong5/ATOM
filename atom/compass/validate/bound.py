@@ -27,7 +27,9 @@ Any violation fails the gate and exits with status 1. With none, any refusal
 makes the result a coverage report, its reasons counted by step.
 
 Reported, not gated: per granularity and phase (decode, prefill, mixed), the
-distribution of measured over analytical; and the records ranked by tokens a
+distribution of measured over analytical; the analytical seconds by the
+roofline part that set them (`CostTerm.by_bound`), and those of a term no part
+set, an overlapped step's, `unattributed`; and the records ranked by tokens a
 second over the steps priced at that granularity, analytical against
 measured: whether measured's fastest is analytical's fastest (top-1), or
 among its first three (top-3).
@@ -58,12 +60,17 @@ from pathlib import Path
 import numpy as np
 
 from atom.compass.backends import BatchView, CostRefused, RequestShape
+from atom.compass.backends.cost import fold_parts
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.shape import sum_tokens
 from atom.compass.backends.step_labels import group_tokens
+from atom.compass.backends.work import COMM, KERNEL
 
 SOURCE = "validate-bound"
 PHASES = ("decode", "prefill", "mixed")
+#: Priced seconds by the roofline part that set them, and those no part set.
+UNATTRIBUTED = "unattributed"
+BY_BOUND = (*KERNEL, *COMM, UNATTRIBUTED)
 #: The engine fields a record must state as ATOM's arguments resolve them.
 PRICED = ("tensor_parallel_size", "kv_cache_dtype")
 PARTIAL = (
@@ -155,6 +162,7 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
     for level, backend in backends.items():
         violations, refused, rates, unpriced = [], Counter(), {}, 0
         seconds = {p: [] for p in PHASES}  # (measured, priced) per step
+        parts = {p: [] for p in PHASES}  # each term's seconds by bound
         for record in records:
             tokens = measured_s = priced_s = 0.0
             for name, view, measured in steps(record, tbo, mtp):
@@ -168,6 +176,9 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
                     continue
                 priced = cost.seconds
                 seconds[_phase(view)].append((measured, priced))
+                parts[_phase(view)] += [
+                    t.by_bound or {UNATTRIBUTED: t.seconds} for t in cost.terms
+                ]
                 tokens += sum_tokens(view.requests)
                 measured_s, priced_s = measured_s + measured, priced_s + priced
                 if priced > measured:
@@ -198,6 +209,11 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
             "analytical_s": {
                 p: {"total": sum(a for _, a in s), **_spread([a for _, a in s])}
                 for p, s in seconds.items()
+                if s
+            },
+            "by_bound": {
+                p: dict.fromkeys(BY_BOUND, 0.0) | fold_parts(s)
+                for p, s in parts.items()
                 if s
             },
             "ranking": _ranking(rates),
