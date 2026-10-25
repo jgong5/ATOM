@@ -62,7 +62,6 @@ class Kind(enum.Enum):
     OP_MEASUREMENT = "op_measurement"
     PRICE_LIST = "price_list"
     MEMORY_READINGS = "memory_readings"
-    COVERAGE_HULL = "coverage_hull"
     STEP_MEASUREMENT = "step_measurement"
     STEP_LINEAR_LAW = "step_linear_law"
     HOST_LAWS = "host_laws"
@@ -91,7 +90,6 @@ KEY_FIELDS: Mapping[Kind, tuple[str, ...]] = {
     Kind.PRICE_LIST: ("model", *LAYOUT, "machine_spec", "source_root"),
     # The engine config as `run.memory.key_fields` reads it, as sorted JSON.
     Kind.MEMORY_READINGS: ("model", "machine_spec", *LAYOUT, "engine_config"),
-    Kind.COVERAGE_HULL: ("price_list",),
     # `view` is the digest of the batch view the step was measured as.
     Kind.STEP_MEASUREMENT: (
         "model",
@@ -132,9 +130,6 @@ WHY: Mapping[Kind, str] = {
         "a bare or merged price file states no width and silently prices nothing"
     ),
     Kind.OP_GRAPH: "an op_graph holds one shape: a decode width or a prefill (T, B)",
-    Kind.COVERAGE_HULL: (
-        "a hull is keyed by the digest of the price list it was built from"
-    ),
 }
 
 #: Suffixes that make a string a file name rather than a value.
