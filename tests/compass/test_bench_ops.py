@@ -295,8 +295,8 @@ def test_leaves_share_a_metadata_view_s_clone_and_placements_share_it_unchanged(
     scratch = ("out", _t([6], "metadata"))
     stub.leaves = ops.leaves(
         _graph(
-            _leaf("aten.add_.Tensor", ("self", tables), scratch),
-            _leaf("aten.mul_.Tensor", ("self", tables), scratch),
+            _leaf("aten.add.Tensor", ("self", tables), scratch),
+            _leaf("aten.mul.Tensor", ("self", tables), scratch),
             layers=1,
         )["region"]
     )
@@ -312,6 +312,60 @@ def test_leaves_share_a_metadata_view_s_clone_and_placements_share_it_unchanged(
     (a0, b0), (a1, b1) = views(0, "self"), views(1, "self")
     assert a0 is b0 and a1 is b1 and a0 is not a1
     assert len({id(v) for p in (0, 1) for v in views(p, "out")}) == 1
+
+
+def test_a_leaf_timed_after_a_copy_into_its_metadata_reads_the_prepared_values(
+    monkeypatch,
+):
+    # ATOM's metadata upload: a `copy_` whose destination binds by shape to
+    # `cu_seqlens_q` and whose source to `decode_src`, timed before the
+    # attention leaf that reads `cu_seqlens_q` from the forward context
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    cu = torch.tensor([0, 4, 9], dtype=torch.int32)
+    meta = functools.partial(fctx.AttentionMetaData, cu_seqlens_q=cu)
+    monkeypatch.setattr(fctx, "AttentionMetaData", meta)
+    runner = _Runner()
+    runner.forward_vars["decode_src"] = torch.zeros(16, dtype=torch.int32)
+    seen = []
+
+    def attention(**kwargs):
+        seen.append(fctx.get_forward_context().attn_metadata.cu_seqlens_q.tolist())
+
+    def function(name):
+        return torch.ops.aten.copy_.default if name.startswith("aten.") else attention
+
+    upload = [(s, _t([3], "metadata", dtype="torch.int32")) for s in ("self", "src")]
+    found = ops.leaves(
+        _graph(
+            _leaf("aten.copy_.default", *upload),
+            _leaf("attention", ("q", _t([2, 4], "activation"))),
+            layers=1,
+        )["region"]
+    )
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    monkeypatch.setattr(torch.cuda, "graph", lambda g, **_: contextlib.nullcontext())
+    monkeypatch.setattr(
+        torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=lambda: None)
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "Event",
+        lambda enable_timing: SimpleNamespace(
+            record=lambda: None, synchronize=lambda: None, elapsed_time=lambda e: 1.0
+        ),
+    )
+    stub = ops.Stub(runner, 5_000)
+    with (
+        patch.object(ops, "_function", side_effect=function),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+    ):
+        upload, timed = stub.point(placed, decode(2), 20, found)
+
+    assert upload["metadata"] == {"self": "cu_seqlens_q", "src": "decode_src"}
+    assert "refused" not in timed and seen
+    assert {tuple(s) for s in seen} == {(0, 4, 9)}
 
 
 def _measuring(monkeypatch):
