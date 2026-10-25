@@ -36,12 +36,12 @@ earliest daemon timer (`DAEMON_TIMERS`) as ``t_daemon``. While a released
 request is unread or a station job is open it only waits on its sockets, and
 warns once, naming what it waits for, if no socket event ends that wait within
 ``diag_s`` wall seconds. Its select returns nothing only once ``time()`` has
-reached the caller's timeout. The ``+inf`` grant ends the run: from then on
-``time()`` runs on from the run's last LP time at wall rate. A uvicorn server
-on the loop is asked to exit, as a signal would ask it, and shuts down with
-nothing pending; with none, the loop cancels its timers and stops. Over a
-clock connection with a socket, it waits for the grant and its own sockets at
-once, so HTTP that reaches a frontend already in its run without a stamp, such
+reached the caller's timeout, or once it ends `SimExecutor.placed`'s wait. The
+``+inf`` grant ends the run: from then on ``time()`` runs on from the run's last
+LP time at wall rate. A uvicorn server on the loop is asked to exit, as a signal
+would ask it, and shuts down with nothing pending; with none, the loop cancels
+its timers and stops. Over a clock connection with a socket, it waits for the
+grant and its own sockets at once, so HTTP that reaches a frontend already in its run without a stamp, such
 as atomesh's worker registration at startup, is served while the grant is out.
 A timer such a request sets earlier than the time asked for fires at the grant;
 a daemon one, such as uvicorn's keep-alive timeout, keeps the run alive no more
@@ -195,14 +195,12 @@ class SimExecutor(ThreadPoolExecutor):
         self.placing: asyncio.Future | None = None  # `placed`'s wait
 
     async def placed(self) -> None:
-        """On the loop: until every service job submitted so far is placed, and
-        then until the callbacks due by the LP clock now have run."""
-        while self.station is not None and self.station.unresolved():
-            self.placing = self.loop.create_future()
-            await self.placing
-        due = self.loop.create_future()
-        self.loop.call_at(self.loop.time(), due.set_result, None)
-        await due
+        """On the loop: until the loop is idle at the LP clock now, every service
+        job submitted by then placed and nothing else due by now left to run, so
+        whatever else runs at this instant has run, however its awaits fell
+        against the wall (`CompassSelector.select` ends the wait)."""
+        self.placing = self.loop.create_future()
+        await self.placing
 
     def shutdown(self, wait=True, *, cancel_futures=False):
         self.serial.shutdown(wait, cancel_futures=cancel_futures)
@@ -251,10 +249,16 @@ class SimExecutor(ThreadPoolExecutor):
             done = self.settle.pop(j)
             if done is not None:
                 self.loop.call_at(self.station.completion(j), done)
-        if self.placing is not None and not self.station.unresolved():
-            if not self.placing.done():
-                self.placing.set_result(None)
-            self.placing = None
+
+    def idle(self) -> bool:
+        """The loop is idle at the LP clock now: end `placed`'s wait, if there
+        is one and every service job is placed; returns whether it ended one."""
+        if self.placing is None or self.station.unresolved():
+            return False
+        placing, self.placing = self.placing, None
+        if not placing.done():
+            placing.set_result(None)
+        return True
 
 
 def charge(d: float) -> None:
@@ -509,6 +513,9 @@ class CompassSelector(selectors.DefaultSelector):
             ready = super().select(0)
             if ready or loop.time() >= deadline:
                 return ready
+            # A positive timeout: nothing is ready or due, the loop is idle now.
+            if loop.executor.idle():
+                return ready
             if rt.inline_pending() or station.unresolved():
                 # The LP clock stands still here: only an fd event ends the wait.
                 unread = loop.unread()
@@ -594,11 +601,11 @@ class HttpChannel:
 
     Taking in a stamped request other than a cancel costs the event loop
     ``fixed_s + body bytes x per_byte_s`` (`atom.compass.run.http_intake`),
-    charged on the loop once its body is read, every open tokenizer station job
-    is placed and the callbacks due by then have run (`SimExecutor.placed`), so
-    a burst reaches the app one request at a time. A request that arrives once
-    the last intake has ended is charged ``idle_s`` in place of ``fixed_s``. A
-    run file with no machine spec charges nothing.
+    charged on the loop once its body is read and the loop is idle at that
+    instant, every tokenizer station job placed and all else due by then run
+    (`SimExecutor.placed`), so a burst reaches the app one request at a time.
+    A request that arrives once the last intake has ended is charged ``idle_s``
+    in place of ``fixed_s``. A run file with no machine spec charges nothing.
     """
 
     def __init__(self, app, stamp) -> None:
@@ -650,8 +657,8 @@ class HttpChannel:
                 cancelled = cancel_seq(body[0].get("body", b""))
                 if self.intake is not None and cancelled is None:
                     # The clock may not pass a station job's completion before
-                    # the job is placed; the intake is charged once every open
-                    # one is, and those due by now have run.
+                    # the job is placed, nor this instant before the requests
+                    # handed on before this one have gone as far as they can.
                     await loop.executor.placed()
                     fixed, per_byte, idle = self.intake
                     if arrival >= self.intake_end:

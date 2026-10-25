@@ -12,6 +12,7 @@ breaks the step ``$BREAK`` names. With ``--stop``, a stand-in compass command
 serves a ``sleep``. Nothing needs a driver, a server or aiperf.
 """
 
+import gzip
 import json
 import os
 import signal
@@ -24,7 +25,7 @@ from pathlib import Path
 import pytest
 from test_parity_client_run import ARGUMENTS, CONFIG, PARAMETERS, raw, sse
 
-from atom.compass.parity.client_run import NAME
+from atom.compass.parity.client_run import NAME, RAW
 
 TREE = Path(__file__).resolve().parents[2]
 SCRIPT = TREE / "scripts/compass/client.sh"
@@ -345,3 +346,32 @@ def test_its_workload_is_the_one_cctraces_sim_writes_for_the_same_cell(tmp_path,
     )
     run = json.loads((tmp_path / "cell" / "run.json").read_text())
     assert workload == run["workload"]
+
+
+def test_both_clients_strip_payloads_and_gzip_the_raw_records_once_exported(tmp_path):
+    out, env = _setup(tmp_path, SIM)
+    done = _client(out, *GOOD, env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    seen = [json.loads((tmp_path / "seen.json").read_text())[1]]
+    (tmp_path / "bin" / "python3").write_text(PYTHON3)
+    (tmp_path / "bin" / "python3").chmod(0o755)
+    (tmp_path / "run_file.json").write_text("{}")
+    cell = {"FIRST_SESSION": "1", "SESSIONS": "2", "CONCURRENCY": "3", "WAIT_S": "5"}
+    done = subprocess.run(
+        ["bash", TREE / "scripts/compass/cctraces_sim.sh", "run_file.json", "cell"],
+        cwd=tmp_path,
+        env=env | cell,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    seen.append(json.loads((tmp_path / "seen.json").read_text())[1])
+
+    spec = json.loads((tmp_path / "spec.json").read_text())
+    for aiperf_env, art in zip(seen, (out / "artifacts", tmp_path / "cell/artifacts")):
+        assert aiperf_env["AIPERF_RECORD_STRIP_PAYLOAD_BYTES"] == "true"
+        assert (art / NAME).exists(), done.stdout + done.stderr
+        assert not (art / RAW).exists()
+        with gzip.open(art / (RAW + ".gz"), "rt") as f:
+            assert [json.loads(line) for line in f] == spec["raw"]

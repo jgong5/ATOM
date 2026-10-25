@@ -847,7 +847,6 @@ only, and an `op_graph` is keyed by its shape.
 | `op_measurement` | Phase 1b, `measure ops` | (model, parallel layout, machine-spec digest, source-root digest, the point's digest) |
 | `price_list` | Phase 1b, `fit ops` | **(model, parallel layout, machine-spec digest, source-root digest)** — a tuple, never a path |
 | `memory_readings` | Phase 2, `measure memory`; published with every reading assumed for a device never measured | (model, machine-spec digest, parallel layout, engine config) |
-| `coverage_hull` | derived | the price list it was built from |
 | `step_measurement` | Phase 1c, `measure steps` | (model, device, engine config, source-root digest, sampling, step kind, the batch's digest) |
 | `step_linear_law` | `fit steps --backend step-linear` | (model, machine-spec digest, engine config, source-root digest, form) |
 | `host_laws` | `fit host` | (host CPU, ATOM source, model, engine config, machine-spec digest), as the run reads its host key |
