@@ -81,12 +81,18 @@ def response_id(responses) -> str | None:
 
 def given(artifacts) -> dict:
     """The traces of the one dataset aiperf was given, as its export names it,
-    each to its file's name when that is a number, else None."""
+    each to its file's name when that is a number, else None. aiperf records
+    the path as typed, so only an absolute one names the traces it read."""
     config = json.loads((Path(artifacts) / AIPERF).read_text())["input_config"]
+    if len(config["datasets"]) != 1:
+        names = [d.get("name") for d in config["datasets"]]
+        raise ValueError(f"aiperf was given datasets {names}, not one")
     (d,) = config["datasets"]
     if d.get("format") != "weka_trace" or not d.get("path"):
         raise ValueError(f"aiperf's dataset {d['name']} is not weka traces at a path")
     path = Path(d["path"])
+    if not path.is_absolute():
+        raise ValueError(f"aiperf's dataset {d['name']} path {path} is not absolute")
     files = path.glob("*.json") if path.is_dir() else [path]
     return {
         json.loads(f.read_text())["id"]: int(f.stem) if f.stem.isdigit() else None
@@ -130,6 +136,7 @@ def write(artifacts) -> tuple[Path, dict, int]:
     """Write `artifacts`' export; its path, the export, and how many requests
     got no response id."""
     artifacts, named, unnamed = Path(artifacts), {PROFILING: {}, WARMUP: {}}, []
+    traces = given(artifacts)
     args = arguments(artifacts)
     for record in records(artifacts / RAW):
         meta = record["metadata"]
@@ -161,7 +168,6 @@ def write(artifacts) -> tuple[Path, dict, int]:
             "trace": trace,
             "sampling": {k: v for k, v in payload.items() if k not in NOT_SAMPLING},
         }
-    traces = given(artifacts)
     export = {
         "requests": named[PROFILING],
         "warmup": named[WARMUP],
