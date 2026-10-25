@@ -502,6 +502,10 @@ def test_the_strip_variable_the_clients_set_is_aiperf_s_own():
     code += "print(E.RECORD.STRIP_PAYLOAD_BYTES)"
     env = os.environ | {"AIPERF_RECORD_STRIP_PAYLOAD_BYTES": "true"}
     done = subprocess.run(
-        [sys.executable, "-c", code], env=env, capture_output=True, text=True
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert done.stdout.split()[-1:] == ["True"], done.stdout + done.stderr

@@ -115,16 +115,21 @@ def arguments(artifacts) -> dict:
     }
 
 
+def records(path):
+    """Each raw record at `path`, read a line at a time, in bytes, so lines end
+    at \\n only, which JSON escapes inside strings: aiperf writes a string's
+    U+2028 unescaped, where str.splitlines would cut."""
+    with open(path, "rb") as lines:
+        for line in lines:
+            yield json.loads(line.decode())
+
+
 def write(artifacts) -> tuple[Path, dict, int]:
     """Write `artifacts`' export; its path, the export, and how many requests
     got no response id."""
     artifacts, named, unnamed = Path(artifacts), {PROFILING: {}, WARMUP: {}}, []
     args = arguments(artifacts)
-    # A line at a time, in bytes, so lines end at \n only, which JSON escapes
-    # inside strings: aiperf writes a string's U+2028 unescaped, where
-    # str.splitlines would cut.
-    for line in open(artifacts / RAW, "rb"):
-        record = json.loads(line.decode())
+    for record in records(artifacts / RAW):
         meta = record["metadata"]
         if meta["benchmark_phase"] not in named:
             raise ValueError(
