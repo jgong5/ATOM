@@ -83,7 +83,7 @@ compass_env "$ROOT"
 compass_require_tree "$ROOT" || exit $?
 OUT=${1:?usage: parity_one_node.sh OUT_DIR}
 MODEL=${MODEL:?MODEL names the model directory}
-DPA=--enable-dp-attention SIDES=. PP=1
+DPA=--enable-dp-attention SIDES=. PP=1 PPA=
 case ${CONFIG:=tp2} in
 tp2 | tp2-plain | dp-two-trees)
     TP=2 ARGS="--enforce-eager --max-model-len 8192 --no-enable_prefix_caching"
@@ -102,7 +102,7 @@ rapidserve)
     MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
     ;;
 pp2)
-    TP=1 DPA= PP=2 ARGS="--enforce-eager --level 0 --max-model-len 8192 --no-enable_prefix_caching"
+    TP=1 DPA= PP=2 PPA="-pp 2" ARGS="--enforce-eager --level 0 --max-model-len 8192 --no-enable_prefix_caching"
     MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog39.json}
     ;;
 *) echo "parity_one_node: CONFIG is tp2, tp2-plain, dp-two-trees, dsv4-dpa8, rapidserve or pp2, not $CONFIG" >&2; exit 2 ;;
@@ -116,8 +116,7 @@ if [[ $CONFIG == dp-two-trees ]]; then
         exit 2
     }
 fi
-SERVER_ARGS=${SERVER_ARGS:-$ARGS} PPA=
-((PP == 1)) || PPA="-pp $PP"
+SERVER_ARGS=${SERVER_ARGS:-$ARGS}
 WAIT_S=${WAIT_S:-1800}
 ALONE=${ALONE:-0} GAP=0.05
 [[ $ALONE == 1 ]] && GAP=0.25
