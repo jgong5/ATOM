@@ -277,6 +277,15 @@ def test_a_record_holding_a_unicode_line_separator_is_read_whole(tmp_path):
     assert set(write(tmp_path)[1]["requests"]) == {"a", "b"}
 
 
+def test_a_raw_line_led_by_a_nul_byte_is_not_json(tmp_path):
+    # json.loads on bytes would read it as UTF-16, the number 1.
+    _write_raw(tmp_path, [])
+    (tmp_path / RAW).write_bytes(b"\x001\n")
+
+    with pytest.raises(json.JSONDecodeError):
+        write(tmp_path)
+
+
 def test_a_request_no_response_named_is_listed_by_its_request_id_phase_and_trace(
     tmp_path,
 ):

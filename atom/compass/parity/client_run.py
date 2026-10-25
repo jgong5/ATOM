@@ -120,7 +120,7 @@ def write(artifacts) -> tuple[Path, dict, int]:
     # Bytes, so lines end at \n or \r only, which JSON escapes inside strings:
     # aiperf writes a string's U+2028 unescaped, where str.splitlines would cut.
     for line in (artifacts / RAW).read_bytes().splitlines():
-        record = json.loads(line)
+        record = json.loads(line.decode())
         meta = record["metadata"]
         if meta["benchmark_phase"] not in named:
             raise ValueError(

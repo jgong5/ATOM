@@ -404,6 +404,17 @@ def test_a_jsonl_string_holding_a_unicode_line_separator_is_read_whole(tmp_path)
     assert json_file.read_jsonl(path) == [{"error": "x\u2028y\u2029z\x85"}, {}]
 
 
+@pytest.mark.parametrize("line", [b"\x001", b"\x00" * 6])
+def test_a_jsonl_line_led_by_a_nul_byte_refuses_naming_its_path(tmp_path, line):
+    # json.loads on bytes would read a NUL-led line as UTF-16 or UTF-32.
+    path = tmp_path / "profile_export.jsonl"
+    path.write_bytes(b'{"a": 1}\n' + line + b"\n")
+
+    named = f"^{re.escape(str(path))} is not JSON: .*: line 2 "
+    with pytest.raises(ValueError, match=named):
+        json_file.read_jsonl(path)
+
+
 @pytest.mark.parametrize(
     "command, runs",
     [
