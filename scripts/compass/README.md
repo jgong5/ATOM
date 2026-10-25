@@ -19,7 +19,7 @@ about an hour.
 | Script | Where | What |
 |---|---|---|
 | `gate_cpu.sh` | CPU container | The CPU gate, run per task: every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, no driver **as a batch**: run alone, a file in it can still reach `rocminfo` (`tests/test_postprocess_width.py` did, through `atom.model_engine.model_runner`'s `from aiter import …`, measured on node 18 at `bdd244c57` while it was in the gate). **Must be green.** Also exits 98 when the diff is in the blind spot below and the GPU gate has not run on *this* tree. Refuses a caller-supplied `-r`. |
-| `gate_gpu.sh` | GPU container | The GPU gate, run per wave — and per task for a blind-spot diff. Superset (`--ignore=tests/plugin`), judged as a **delta** against pure upstream `661ef7661` on the nightly 20261013 image (the `BASE_*` constants), with torch, HIP, ROCm and AITER recorded and compared. The failing node-ids are on file in `gpu_gate_known_failures.txt` and compared **by name**. Calls `preflight.sh` itself, before and after. |
+| `gate_gpu.sh` | GPU container | The GPU gate, run per wave — and per task for a blind-spot diff. Superset (`--ignore=tests/plugin`), judged as a **delta** against pure upstream `661ef7661` on the nightly 20261013 image (the `BASE_*` constants), with torch, HIP, ROCm and AITER recorded and compared. The failing node-ids are on file in `gpu_gate_known_failures.txt` and compared **by name**. Calls `preflight.sh` itself, before and after. Runs the driver-run tests once, with the inputs it sets (see "The driver-run tests and their inputs" below). |
 | `preflight.sh` | GPU container | `rocminfo` reachability, compute use and VRAM use (checks 1–3), plus a D-state census (check 0), and a list of bookable devices. Run **before and after**. The census states its own scope: in a container it can only see this PID namespace, and says so rather than reporting a clear node. Also worth running for a CPU-only task that imports ATOM's model layer: `import aiter` runs `rocminfo`, and so does any module that imports aiter at load time (`atom.model_engine.model_runner`, `atom.model_ops.linear`), so on a wedged node that import hangs. A bare `import atom` and `atom.compass` run no `rocminfo` and load no torch; `atom.config`, `atom.model_engine.llm_engine` and `atom.entrypoints.openai_server` load torch but run no `rocminfo`. Measured on node 18, 2026-09-23. |
 | `regen_cpu_gate_exclude.sh` | CPU container | Regenerate the **GENERATED** section of the exclusion list by iterating `--collect-only` to a fixed point (three passes at `83daf636d`: 37 errors, 1, clean). Preserves the MANUAL section verbatim. |
 | `regen_gpu_gate_triggers.sh` | CPU container | Re-derive `gpu_gate_triggers.txt` from the exclusion list and the tree. Run after **any** change to `cpu_gate_exclude.txt` — the two files are derived from the same tree and are wrong separately. Writes the whole file, **header counts included**; nothing in it is maintained by hand. |
@@ -470,33 +470,57 @@ shape of a measurement. The refusal names the omission instead.
 ## What the GPU gate expects, and on a tree that carries no Compass tests
 
 `gate_gpu.sh` judges an **equality**, not a floor: `BASE_PASSED` plus whatever
-`tests/compass/` contributes on the tree in front of it, minus what it contributed
+`tests/compass/` passes on the tree in front of it, minus what it contributed
 at the baseline (`BASE_COMPASS_TESTS`). A floor would be loosened by exactly the
 tests each task adds, so a task adding 30 tests while silently losing a 20-test file
 would still clear it.
 
+It runs pytest twice, over disjoint sets: `tests/compass/` on every card
+`HIP_VISIBLE_DEVICES` names, then the rest of `tests/` on the first of them alone,
+as the baseline was measured (an upstream test that needs two cards skips there).
+The surplus is the first run's pass count, so no test runs twice; the failing and
+erroring node-ids of both runs are judged together against the known-failures list.
+
 | this tree's `tests/compass/` | expected passes |
 |---|---|
-| absent | `BASE_PASSED + 0 - BASE_COMPASS_TESTS` — the figure a tree without this phase's tests measures, worked out beside the call in `gate_gpu.sh` |
-| present, N passing | `BASE_PASSED + N - BASE_COMPASS_TESTS` |
-| present, unreadable | **93** — a surplus with no source is not a measurement |
+| absent | `BASE_PASSED + 0 - BASE_COMPASS_TESTS` — the figure a tree without this phase's tests measures |
+| present, N passing | `BASE_PASSED + N - BASE_COMPASS_TESTS`; a failing Compass test is a failure the baseline does not name |
 
-The absent case is a tree without this phase's tests, as the integration branch
-was until `4c16792d9` added the directory. Deriving the surplus with
-`pytest tests/compass --collect-only` made that case exit 4 (`file or directory not
-found`), left the count empty and refused with `GATE_GPU_RC=93` before running a
-test — reproduced on `4da2f3a2d` and on PR #9's branch, so it was a property of the
-script and not of any change. An absent directory and an unreadable one are told
-apart by asking the filesystem, not by parsing pytest's error text.
+Both sides of the arithmetic are **pass** counts, so a Compass test that skips or
+xfails is accounted for, with one exception below.
 
-Both sides of the arithmetic are **pass** counts. The tree side used to be a
-*collected* count, which is the same number only while `tests/compass/` holds no
-skip and no xfail; the first Compass test to skip on a GPU host would have made a
-green tree read `unaccounted -1` and blamed tests outside `tests/compass/`. Counting
-passes costs one pytest run over a CPU-only directory and removes the condition.
-`compass_compass_pass_count` in `_lib.sh` holds the derivation, and
-`tests/compass/test_gate_gpu_surplus.py` covers each of its branches with a stubbed
-`python`, so the absent-directory path is tested without a driver.
+### The driver-run tests and their inputs
+
+The driver-run tests start ATOM's own servers on the simulated clock (the
+vertical slice and every scenario test built on it). Each skips without its
+inputs, and a skip is not a failure, so a gate that does not set them passes
+without running them. On a tree whose `tests/compass/` reads
+`ATOM_COMPASS_SLICE_MODEL`, `gate_gpu.sh` sets each input, keeps one the caller
+set, and refuses with **92**, naming every one that is missing, before any test
+runs:
+
+| input | default |
+|---|---|
+| `ATOM_COMPASS_SLICE_MODEL` | the Qwen3-0.6B snapshot in the Hugging Face cache (`$HF_HOME`, else `~/.cache/huggingface`) |
+| `ATOM_COMPASS_IMAGE_MODEL` | the Qwen3.5-9B snapshot there |
+| `ATOM_COMPASS_SLICE_MACHINE` | `machines/mi308x-hjbog18.json` (node 18's cards run with PTL on, which the hjbog39 spec refuses) |
+| `ATOMESH` | `atom/mesh/target/release/atomesh` in the tree; its directory goes first on `PATH` |
+| cards | four in `HIP_VISIBLE_DEVICES` (the multi-node DP test runs two trees of TP2) |
+
+The router has to pass `router_binary` (`atom/compass/run`): built clean, at a
+commit, from this tree's `atom/mesh`. A snapshot has no history, so on a
+`snapshot.sh` tree that means a router built (`cargo build --release --bin
+atomesh` in `atom/mesh`) in a git checkout of the snapshot's commit; a cargo build
+in the snapshot itself names no commit and is refused.
+
+After the run, a `SKIPPED` line under `tests/compass/` whose reason names the slice
+or image model or `atomesh` is a finding by its file and line: that test did not
+run. The cc-traces smoke's skip is not, since it also needs a trace set and a
+harness Python, which the gate does not stage.
+
+On node 18 (`xiaobizh_n18_next13`), `tests/attentions/deepseek_v41/test_tbo.py`
+hangs; a run that passes `--ignore` for it reads that file's passes short of
+`BASE_PASSED`.
 
 ## Why the gates refuse a caller-supplied `-r`
 
