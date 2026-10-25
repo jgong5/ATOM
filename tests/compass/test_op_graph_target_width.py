@@ -501,3 +501,29 @@ def test_an_eager_dp_drafter_asks_its_later_passes_at_the_g_they_gathered(
         (GEMM, 6, 3, 3, 7),
         (GEMM, 7, 3, 3, 7),
     ]
+
+
+def test_an_eager_dp_mtp1_drafter_asks_its_one_pass_at_its_own_g(monkeypatch):
+    # MTP1 at DP2 with no draft graph, 3 rows beside a peer's 3: its one pass's
+    # MoE gathers 6 + 6, its default; it has no later pass at `draft_rows`.
+    rows = [(2, 90, True)] * 3
+    view = settled(monkeypatch, rows, [(3, 6, False)], eager=True, step=False)
+    drafted = [g(6, 64, 64), g(12, 32, 64), argmax(3), g(3, 64, 64)]
+    graphs = {False: {"seq": []}, True: {"seq": drafted}}
+    listing = AskedG()
+    backend = OpGraphBackend(
+        SPEC,
+        lambda *_, draft=False, **__: graphs[draft],
+        kv="bf16",
+        dp=2,
+        drafts=1,
+        price_list=listing,
+    )
+    backend.price(view)
+
+    assert listing.asked == [
+        (GEMM, 6, 3, 3, None),
+        (GEMM, 12, 3, 3, None),
+        (ARGMAX, 3, 3, 3, None),
+        (GEMM, 3, 3, 3, None),
+    ]

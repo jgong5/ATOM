@@ -402,16 +402,16 @@ class OpGraphBackend(CostBackend):
         With `draft`, its drafter's: its first pass at its rows, unpadded, G
         `draft_moe_rows` off its rows' default; its later passes at `draft_bs`,
         G every rank's `draft_bs`; the first pass's gathered a rows' count, the
-        later passes' a width's. An eager DP drafter runs its later passes at
-        its rows, G `draft_rows`, a capture's MoE gathering this rank's rows at
-        every peer. A leaf with both counts is asked at its rows'
+        later passes' a width's. An eager DP drafter with later passes runs
+        them at its rows, G `draft_rows`, a capture's MoE gathering this rank's
+        rows at every peer. A leaf with both counts is asked at its rows'
         T and B and the smaller G: on a drafter its rows carry the first
         pass's G, above a later pass's."""
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
         width = self.padded and (view.draft_bs if draft else view.target_bs)
-        if draft and view.draft_rows:
+        if draft and self.drafts > 1 and view.draft_rows:
             width = b
         ran = phase == "decode" and width or t
         gathered = view.draft_moe_rows if draft else view.moe_rows
