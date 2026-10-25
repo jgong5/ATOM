@@ -147,7 +147,7 @@ def test_a_replay_reads_the_record_of_its_own_deployment(
     class Read(Exception):
         pass
 
-    def host(directory, dp_rank):
+    def host(directory, dp_rank, stage):
         raise Read(directory, dp_rank)
 
     monkeypatch.setattr("atom.compass.parity.replay.ReplayHost", host)
@@ -156,7 +156,7 @@ def test_a_replay_reads_the_record_of_its_own_deployment(
         kv["compass_instance"] = index
     config = SimpleNamespace(
         tensor_parallel_size=1,
-        parallel_config=SimpleNamespace(data_parallel_rank=1),
+        parallel_config=SimpleNamespace(data_parallel_rank=1, pipeline_parallel_rank=0),
         kv_transfer_config=kv,
     )
     with pytest.raises(Read) as read:
