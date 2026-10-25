@@ -200,6 +200,9 @@ def test_an_output_prefill_s_draft_kv_pass_prices_as_target_and_a_middle_chunk_s
     assert law["draft"]["draft_kv"]["coefficients"] == pytest.approx(
         dict(zip(("step", "seqs"), KV_LAW)), rel=1e-4
     )
+    fitted = law["draft"]["draft_kv"]["fit"]
+    decodes = sum(not s.view.prefill for s in samples.values())
+    assert (fitted["samples"], fitted["dropped"]) == (decodes, 0)
     backend = StepLinearBackend(StepLinearLaw(law))
     for (rows, rung, s), (out, kv, draft, _) in zip(steps[:-1], plan):
         if rows[0][2]:
