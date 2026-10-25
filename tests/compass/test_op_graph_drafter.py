@@ -466,7 +466,9 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
     r.drafter = SimpleNamespace(is_block_drafter=False)
     mode = SimpleNamespace(
         sync=SimpleNamespace(
-            num_tokens_across_dp=torch.tensor([64, 64]), ub_tokens_across_dp=None
+            num_tokens_across_dp=torch.tensor([64, 64]),
+            max_bs_across_dp=1,
+            ub_tokens_across_dp=None,
         ),
         running_tokens_are_unified=False,
         running_tokens=64,

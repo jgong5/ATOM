@@ -438,11 +438,21 @@ D50.1).
 [#1392](https://github.com/jgong5/ATOM/issues/1392).** Analytical laws are the only route to
 a device never measured, and the route has one stated weakness.
 
+**Revised 2026-10-25 by the owner's ruling on
+[#2073](https://github.com/jgong5/ATOM/issues/2073#issuecomment-6383236661):** values no
+datasheet states are carried as they stand and banded too, and each cell reports its
+seconds by the roofline part that set them.
+
 **Peaks are attainable peaks probed on the device** (D64). A device with no hardware, as
 MI455 in M2, takes **its datasheet times the ratio probed on MI355X**, per peak. The ratio
 is observed on another device, so the field is assumed and every term that reads it is
 declared (`05` D25, rule 5). The ratio is a property of the probe on the silicon and the
 vendor library, not of ATOM's kernels: no implementation efficiency enters it (D68).
+
+**Values no datasheet states**, the kernel floor `t0` and the link latencies, are carried
+from MI355X as they stand, with no ratio behind them: assumed, so every term that reads
+them is declared. MI455X's switched UALoE fabric replaces the xGMI hop the latency was
+probed on, so a carried latency may be off by more than a ratio.
 
 > **A projection onto an unmeasured device is as good as its carried ratios, and nothing in
 > the procedure validates them there: its terms are declared.**
@@ -453,6 +463,13 @@ Mitigations, none of which removes the caveat:
    carried ratios, and recomputed at ±20% of each, capped at 1, the datasheet
    ([#1466](https://github.com/jgong5/ATOM/issues/1466)). A ranking that survives that band is
    more trustworthy than one that doesn't.
+   The kernel floor is recomputed at 0.8 and 1.2 times, and each link latency a price
+   reads at 0.8, 1.2, 2 and 4 times, uncapped: no datasheet bounds them
+   ([#2073](https://github.com/jgong5/ATOM/issues/2073)). Each cell also reports its priced
+   seconds by the roofline part that set them, `floor`, `compute`, `memory`,
+   `comm.latency` and `comm.transfer`, so the floor's and the link latency's shares are
+   read off it; an overlapped step's seconds are no sum of parts and are reported
+   unattributed.
 2. **Rank, don't predict.** Configuration ranking is reported beside the projection
    (D67.1). A ratio error that applies uniformly across configurations may leave the
    ranking intact while moving every absolute number.
@@ -491,7 +508,7 @@ claimed. That is what the empirical op-level backend exists for.
 | D67.1 | The gate is the bound: on every measured step, at both granularities, analytical is at most measured. Reported, not gated: configuration ranking (top-1, top-3) over the four P/D cells, measured over analytical per op kind and per phase, and the MI308X-to-MI355X method error. Memory goals: ≤5% on weights and on KV capacity/block count (the empirical gate for KV, tighter than it for weights), ≤25% each other non-KV memory term, no false "fits". The step and end-to-end latency goals and ranking as the primary gate, first stated here, are withdrawn. | 2026-09-19; revised 2026-10-14 (#952) and 2026-10-17 (#1392) |
 | D67 | Analytical memory is the existing memory model with the activation coefficient derived rather than walked. Weights and KV exact; scratch stays a stated constant, and `non_torch` and load residue come from a `memory_readings` entry, marked assumed for a device never run. Revised: the coefficient is measured on one real run per model and width, with the scratch inside it rather than a stated constant; no geometry form stands in for it (T34, 2026-10-16, #965). Each term carries a method, and a declared one cannot pass its gate. | 2026-09-19; revised 2026-10-10, 2026-10-14 (#937) and 2026-10-14 (#952) |
 | D68 | Implementation efficiency, measured over analytical, is a diagnostic reported per op kind and per phase as a distribution, with no threshold yet; it is never a projection input. The analytical method is on M2's critical path for the MI455 projection of DeepSeek-V4-Pro's families (`16` D95). An op-level backend answers an unpriced leaf by its analytical law, and as an empirical backend's fallback the method answers its own price, reported apart; no law moves ahead of a measurement. Replaces the efficiency first stated here as a calibration self-check, carried declared to another device. | 2026-09-19; revised 2026-10-10, 2026-10-14 (#952) and 2026-10-17 (#1392) |
-| D69 | Peaks are probed on the device; a device with no hardware takes its datasheet times the ratio probed on MI355X, so its terms are declared. Report each carried ratio with a ±20% sensitivity band; prefer ranking claims to absolute ones; measure the method from MI308X to MI355X. Replaces the assumed derate first stated here. | 2026-09-19; revised 2026-10-17 (#1392) |
+| D69 | Peaks are probed on the device; a device with no hardware takes its datasheet times the ratio probed on MI355X, so its terms are declared. Report each carried ratio with a ±20% sensitivity band; carry the kernel floor and link latencies as they stand, banded at ±20% and the latencies also at 2 and 4 times, uncapped, each cell's seconds reported by roofline part; prefer ranking claims to absolute ones; measure the method from MI308X to MI355X. Replaces the assumed derate first stated here. | 2026-09-19; revised 2026-10-17 (#1392) and 2026-10-25 (#2073) |
 | D70 | Expected accuracy is stated in advance, per use: below the measured time on a measured device, declared on MI455. Single-digit latency error is not a target for the analytical method. | 2026-09-19; revised 2026-10-17 (#1392) |
 
 ---

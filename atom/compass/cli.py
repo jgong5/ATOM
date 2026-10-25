@@ -47,11 +47,7 @@ COMMANDS = {
     ),
     "fit host": ("atom.compass.fit.host", "the host laws, fitted on real runs"),
     "run": ("atom.compass.drive.run", "a simulated serve"),
-    "validate bound": (
-        "atom.compass.validate.bound",
-        "real runs' steps priced analytically at step and op level, none above measured",
-    ),
-    "validate project": (
+    "project": (
         "atom.compass.validate.project",
         "real runs' steps priced analytically on another device, published as a projection",
     ),
@@ -68,7 +64,11 @@ REFUSED = {
         "deprecated: compass measure steps --grid plans the step grid's points, "
         "and compass run --coverage checks a run's coverage before it starts"
     ),
-    "validate": "deprecated: grading is python -m atom.compass.validate",
+    "validate": (
+        "deprecated: grading is python -m atom.compass.validate, the analytical "
+        "bound check python -m atom.compass.validate.bound, and a projection "
+        "compass project"
+    ),
     "explain": "deprecated: " + MACHINE,
     "probe": "deprecated: " + MACHINE,
     "spec": "deprecated: " + MACHINE,
@@ -97,9 +97,14 @@ def main(argv=None) -> None:
         if module != missing.name and not module.startswith(f"{missing.name}."):
             raise
         raise SystemExit(f"compass {name}: not built yet") from missing
+    refusing(f"compass {name}", command.main, argv[len(name.split()) :])
+
+
+def refusing(prog: str, main, argv: list[str]) -> None:
+    """`main(argv)`, a refusal it raises exiting with `prog` and its message."""
     try:
-        command.main(argv[len(name.split()) :])
+        main(argv)
     except json.JSONDecodeError:  # it names no file, so it keeps its traceback
         raise
     except (ValueError, OSError, ArtifactRefusal, GpuRefusal, SpecRefusal) as refused:
-        raise SystemExit(f"compass {name}: {refused}") from refused
+        raise SystemExit(f"{prog}: {refused}") from refused

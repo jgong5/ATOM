@@ -20,6 +20,7 @@ from test_work import SPEC
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 from atom.compass.backends import BatchView, RequestShape
 from atom.compass.backends.op_graph import LISTED, OpGraphBackend
+from atom.compass.backends.provenance import Method, Refusal
 from atom.compass.backends.resolver import CostSource
 from atom.compass.backends.work import gemm, price
 from atom.compass.capture import population_shapes
@@ -302,6 +303,91 @@ def test_a_padded_decode_prices_its_model_at_its_width_and_its_sampler_at_its_ro
     }
 
 
+@pytest.mark.parametrize(
+    "rows,priced,method",
+    [
+        ([(1, 4000, True)] * 2, 40e-6, Method.MEASURED),
+        ([(1, 4000, True), (1, 1000, True)], 25e-6, Method.MEASURED),
+        ([(1, 4000, True), (1, 2500, True)], 32.5e-6, Method.ESTIMATED),
+        ([(1, 4000, True)], 20e-6, Method.MEASURED),  # a pad row holds none
+    ],
+    ids=["alike", "its-mean-measured", "between-two-means", "padded"],
+)
+def test_a_decode_step_prices_at_its_rows_mean_as_well_as_their_max(
+    rows, priced, method
+):
+    # A decode leaf at B = 2 over context, on rows alike and on rows whose mean
+    # is 625 or 500 permille of their max: ragged rows cost less, linearly in
+    # the mean.
+    ragged = listed(
+        *[
+            pt(g(2, 64, 64), "decode B=2", ns, c if m == 1000 else [c, m])
+            for c, at in ((1000, (5e3, 6.25e3, 10e3)), (4000, (20e3, 25e3, 40e3)))
+            for m, ns in zip((500, 625, 1000), at)
+        ]
+    )
+    step = BatchView(tuple(RequestShape(*row) for row in rows), capture_rung=2)
+    graph = g(2, 64, 64)
+    backend = OpGraphBackend(SPEC, lambda *_: graph, kv="bf16", price_list=ragged)
+    cost = backend.price(step)
+
+    assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(priced)}
+    assert cost.terms[0].provenance.method is method
+
+
+def test_a_padded_decode_reads_its_rows_mean_over_the_width_it_ran_at():
+    # Two rows of 4000 and 1000 tokens, padded to four: the GEMM leads with
+    # the width, so it reads the rows' 5000 tokens over four rows, 312.5
+    # permille of the max, not 625 over two.
+    lines = listed(
+        *[
+            pt(g(4, 64, 64), "decode B=4", ns * c / 4000, c if m == 1000 else [c, m])
+            for c in (1000, 4000)
+            for m, ns in ((250, 10e3), (625, 25e3), (1000, 40e3))
+        ]
+    )
+    step = BatchView(
+        (RequestShape(1, 4000, True), RequestShape(1, 1000, True)), target_bs=4
+    )
+    graph = g(4, 64, 64)
+    backend = OpGraphBackend(SPEC, lambda *_, **__: graph, kv="bf16", price_list=lines)
+
+    assert by_name(backend.price(step)) == {
+        f"op.{GEMM}.price_list": pytest.approx(12.5e-6)
+    }
+
+
+def test_a_mean_line_the_fit_declined_refuses_the_steps_bracketed_by_it():
+    # Means 500, 625 and 1000 at contexts 1000 and 4000, and 1000 at 2000 too;
+    # at 4000 its neighbours' line prices the 625 point 16.7% low, so the fit
+    # declines that mean line. A step at 2000 interpolates between the lines'
+    # 1000 and 4000 points, so it is bracketed by the declined line.
+    lines = listed(
+        *[
+            pt(g(2, 64, 64), "decode B=2", ns, c if m == 1000 else [c, m])
+            for c, at in (
+                (1000, ((500, 500), (625, 625), (1000, 1000))),
+                (2000, ((1000, 2000),)),
+                (4000, ((500, 2000), (625, 3000), (1000, 4000))),
+            )
+            for m, ns in at
+        ]
+    )
+    step = BatchView(
+        (RequestShape(1, 2000, True), RequestShape(1, 240, True)), capture_rung=2
+    )
+    graph = g(2, 64, 64)
+    backend = OpGraphBackend(SPEC, lambda *_, **__: graph, kv="bf16", price_list=lines)
+
+    assert backend.price(step).refusals == (
+        Refusal(
+            LISTED,
+            f"{GEMM}: the fit declined mean at B = 2 at context = 4000: mean = 625 "
+            "reads -16.7% off its neighbours",
+        ),
+    )
+
+
 FOUR = (RequestShape(3, 90, True),) * 4
 
 
@@ -439,3 +525,91 @@ def test_a_drafter_prices_its_later_passes_at_draft_bs(dp, gathered, params):
 
     assert not cost.refusals
     assert by_name(cost) == {f"draft op.{GEMM}.price_list": pytest.approx(7e-6)}
+
+
+@pytest.mark.parametrize(
+    "peers,step,draft_rows",
+    [
+        # Every rank decoding: 9 + 12 tokens, 3 a row.
+        ([(4, 12, False)], False, 7),
+        # Beside a prefilling peer, 3 rows and one each peer, of 6.
+        ([(2, 40, True), (1, 3, False)], False, 5),
+        # Beside a wider prefilling peer, its 5 rows and one each peer, of 8.
+        ([(5, 40, True)], False, 6),
+        ([(4, 12, False)], True, None),
+        ((), False, None),
+    ],
+    ids=[
+        "dp2",
+        "beside-a-prefill",
+        "beside-a-wider-prefill",
+        "draft-graph",
+        "one-rank",
+    ],
+)
+def test_an_eager_drafter_s_later_passes_gather_every_rank_s_rows(
+    monkeypatch, peers, step, draft_rows
+):
+    view = settled(monkeypatch, DECODE, peers, eager=True, step=step)
+
+    assert view.draft_rows == draft_rows
+
+
+def test_an_eager_dp_drafter_asks_its_later_passes_at_the_g_they_gathered(
+    monkeypatch,
+):
+    # V4-Pro MTP2 at DP2 with no draft graph, 3 rows beside a peer's 4: its
+    # first pass's MoE gathers 9 + 12, its later passes' 3 + 4, which a capture
+    # states as this rank's 3 at each rank.
+    view = settled(monkeypatch, DECODE, [(4, 12, False)], eager=True, step=False)
+    drafted = [g(9, 64, 64), g(21, 32, 64), argmax(3), g(3, 64, 64)]
+    graphs = {
+        False: {"seq": [g(4, 64, 64)]},
+        True: {"seq": drafted + [g(6, 32, 64), g(7, 32, 64)]},
+    }
+    listing = AskedG()
+    backend = OpGraphBackend(
+        SPEC,
+        lambda *_, draft=False, **__: graphs[draft],
+        kv="bf16",
+        dp=2,
+        drafts=2,
+        price_list=listing,
+    )
+    backend.price(view)
+
+    assert listing.asked == [
+        (GEMM, 4, 4, 4, None),
+        (GEMM, 9, 3, 3, 21),
+        (GEMM, 21, 3, 3, 21),
+        (ARGMAX, 3, 3, 3, 7),
+        (GEMM, 3, 3, 3, 7),
+        (GEMM, 6, 3, 3, 7),
+        (GEMM, 7, 3, 3, 7),
+    ]
+
+
+def test_an_eager_dp_mtp1_drafter_asks_its_one_pass_at_its_own_g(monkeypatch):
+    # MTP1 at DP2 with no draft graph, 3 rows beside a peer's 3: its one pass's
+    # MoE gathers 6 + 6, its default; it has no later pass at `draft_rows`.
+    rows = [(2, 90, True)] * 3
+    view = settled(monkeypatch, rows, [(3, 6, False)], eager=True, step=False)
+    drafted = [g(6, 64, 64), g(12, 32, 64), argmax(3), g(3, 64, 64)]
+    graphs = {False: {"seq": []}, True: {"seq": drafted}}
+    listing = AskedG()
+    backend = OpGraphBackend(
+        SPEC,
+        lambda *_, draft=False, **__: graphs[draft],
+        kv="bf16",
+        dp=2,
+        drafts=1,
+        price_list=listing,
+    )
+    backend.price(view)
+
+    assert listing.asked == [
+        (GEMM, 6, 3, 3, None),
+        (GEMM, 12, 3, 3, None),
+        (ARGMAX, 3, 3, 3, None),
+        (GEMM, 3, 3, 3, None),
+    ]
