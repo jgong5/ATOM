@@ -1431,7 +1431,7 @@ def test_a_dirty_tree_s_lazy_trace_answers_its_run_and_publishes_nothing(
     def capture(model, tp, shapes, *_, **__):
         leaf = Op("aiter.leaf", "opaque_leaf", (("n", 2),), ())
         traced.append(Graph(Traced(at, str(shapes[0])), leaf))
-        return [(traced[-1], model, {})]
+        return [(traced[-1], model, {"arch": "gfx942"})]
 
     dirty = (replace(ATOM_ROOT, dirty=3), AITER_ROOT)
     monkeypatch.setattr(artifacts, "roots_for", lambda modules: dirty)
