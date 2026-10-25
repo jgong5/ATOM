@@ -446,7 +446,7 @@ def test_a_drafter_prices_its_later_passes_at_draft_bs(dp, gathered, params):
     [
         # Every rank decoding: 9 + 12 tokens, 3 a row.
         ([(4, 12, False)], False, 7),
-        # Beside a prefilling peer, 3 rows and one each peer, of 6.
+        # Beside a prefilling peer, its 3 rows and one each peer, of 6.
         ([(2, 40, True), (1, 3, False)], False, 5),
         ([(4, 12, False)], True, None),
         ((), False, None),
