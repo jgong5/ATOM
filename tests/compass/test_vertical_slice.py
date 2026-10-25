@@ -14,7 +14,6 @@ also skip without `ATOM_COMPASS_SLICE_MODEL`, a model directory holding a
 config and a tokenizer; no weight is read.
 """
 
-import argparse
 import dataclasses
 import http.client
 import json
@@ -40,6 +39,7 @@ from atom.compass.clock import LpId
 from atom.compass.clock_transport import connect
 from atom.compass.detect.determinism import CONFIGURATION_PREFIX
 from atom.compass.detect.scenario import check_run
+from atom.compass.drive import run as drive_run
 from atom.compass.drive.serve import _free_ports
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
@@ -226,24 +226,10 @@ def publish_entry(store, machine, argv, env) -> None:
     ATOM's server resolves from its flags `argv` in the environment `env` on
     `machine`, as `compass measure memory` leaves it, so that a run reading
     `store` starts."""
-    from atom.config import Config
-    from atom.model_engine.arg_utils import EngineArgs
-
-    parser = argparse.ArgumentParser(allow_abbrev=False)
-    EngineArgs.add_cli_args(parser)
-    # The server's own flags, such as its port, are not the engine's.
-    args, _ = parser.parse_known_args(argv)
-    kwargs = EngineArgs.from_cli_args(args)._get_engine_kwargs()
-    names = {f.name for f in dataclasses.fields(Config)}
     # The key holds the config as the server resolves it, and its performance
     # environment.
     with mock.patch.dict(os.environ, env, clear=True):
-        config = Config(args.model, **{k: v for k, v in kwargs.items() if k in names})
-        if config.enable_dp_attention:
-            # As `CoreManager` starts it: every TP rank its own DP rank.
-            config.parallel_config.data_parallel_size *= config.tensor_parallel_size
-            config.tensor_parallel_size = 1
-        publish_readings(store, config, document=machine)
+        publish_readings(store, drive_run._config(argv), document=machine)
 
 
 def run_slice(out: Path, seed: str) -> dict:
@@ -385,3 +371,31 @@ def test_a_deployment_the_slice_does_not_run_is_refused(
     with pytest.raises(ValueError, match=refusal):
         compass_run.frontend(config)
     assert clock.installed() is None
+
+
+def test_an_entry_is_published_for_the_config_the_server_resolves(
+    monkeypatch, tmp_path
+):
+    """The server reads either spelling of a flag and lays out a DP-attention
+    deployment as `CoreManager` does; the entry `publish_entry` publishes for
+    it is keyed alike."""
+    from atom.config import Config
+
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+    published = []
+    monkeypatch.setitem(
+        publish_entry.__globals__,
+        "publish_readings",
+        lambda store, config, document: published.append(config),
+    )
+    argv = ["--model", "m", "--max_model_len", "2048", "-tp", "2"]
+    publish_entry(tmp_path, DOCUMENT, [*argv, "--enable-dp-attention"], {})
+    [config] = published
+    pc = config.parallel_config
+    assert config.max_model_len == 2048
+    assert (config.tensor_parallel_size, pc.data_parallel_size) == (1, 2)
+    assert pc.data_parallel_size_local == 2
