@@ -132,11 +132,12 @@ class _Spawn:
         return self.context.Process(target=_worker, **kwargs)
 
 
-def _config(tp=1, eager=False, dp=1, dp_attention=False, ep=False, pp=1):
+def _config(tp=1, eager=False, dp=1, dp_attention=False, ep=False, pp=1, pcp=1, dcp=1):
     return SimpleNamespace(
         tp_world_size=tp,
         tensor_parallel_size=tp,
-        prefill_context_parallel_size=1,
+        prefill_context_parallel_size=pcp,
+        decode_context_parallel_size=dcp,
         parallel_config=SimpleNamespace(
             data_parallel_size=dp,
             data_parallel_rank=0,
@@ -308,6 +309,8 @@ def test_a_stop_from_the_keyboard_reaches_the_process_that_started_the_bench(
         ({"tp": 2, "dp_attention": True}, "2 data-parallel ranks"),
         ({"ep": True}, "expert parallelism"),
         ({"pp": 2}, "pipeline parallelism"),
+        ({"pcp": 2}, "prefill_context_parallel_size 2"),
+        ({"tp": 2, "dcp": 2}, "decode_context_parallel_size 2"),
     ],
 )
 def test_a_parallelism_the_bench_does_not_build_refuses_before_any_worker_starts(
