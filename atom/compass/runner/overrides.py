@@ -295,7 +295,10 @@ class HostDeviceRecurrence:
     for nothing. With `mtp`, a forward's device work is its target's and then
     its draft's, and a single-stage output forward waits before launch, for
     the previous output forward's target and then `MTP_COPY`; `MTP_SEGMENT`
-    runs after that wait, before the launch. With `sync`, every forward leaves no earlier than its
+    runs after that wait, before the launch. The device work an MTP
+    forward's prepare queues ahead of its launch is not charged: its device
+    starts at the later of `ends[-1]` and the prepare end, early by that work
+    when the device is still busy. With `sync`, every forward leaves no earlier than its
     own device end, as one that synchronizes its stream before it returns
     does. `ends[-1]` is the last forward's device end. `laws[kind][segment]` are coefficients on `(1,
     tokens, seqs)`; `charge` says what an absent one costs. `now` reads the engine LP's clock.

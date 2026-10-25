@@ -133,7 +133,11 @@ def pipeline(stages: list[list[dict]], carriers=None) -> list[dict]:
 
 
 def check(steps: list[dict]) -> dict:
-    """One DP rank's steps charged on their measured inputs: the gate's report."""
+    """One DP rank's steps charged on their measured inputs: the gate's report.
+
+    Under MTP a decode is fed no `d_gap_ns`: the device work its prepare
+    queues ahead of its launch is not charged, so a launch that finds the
+    device busy starts its device early by that work."""
     *_, report = _charged(steps, None, None, None)
     return report
 
