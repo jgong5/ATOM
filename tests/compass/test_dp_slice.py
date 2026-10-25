@@ -67,10 +67,11 @@ DP_MACHINE["interconnect"]["intra_node"]["pp"] = {
     }
     for carrier in ("rccl", "gloo")
 }
-#: And gloo's wake, about a picosecond: a blocked stage goes on as it completes.
+#: And gloo's wake, 2**-12 s once the pair idled well past 2**-6 s: long
+#: enough that a stage's TAR rows show it.
 DP_MACHINE["interconnect"]["intra_node"]["pp"]["gloo"] |= {
-    "wake_s": 2.0**-40,
-    "wake_rise_s": 1.0,
+    "wake_s": 2.0**-12,
+    "wake_rise_s": 2.0**-6,
 }
 #: The run test's machine: an HTTP intake of about a picosecond, so the four
 #: requests reach the engine together and each rank batches two.

@@ -15,6 +15,7 @@ The run test needs a driver and `ATOM_COMPASS_SLICE_MODEL`, as in
 import copy
 import dataclasses
 import json
+import math
 import pickle
 import sys
 from types import SimpleNamespace
@@ -231,8 +232,10 @@ def test_the_pipeline_check_holds_a_stage_to_the_release_of_its_input():
 
 
 #: A machine whose every PP part is rendezvous, `T` for 8 bytes once its
-#: receive is posted, `L` ahead on ``pp_data``; a blocked host wakes in 2**-40 s.
+#: receive is posted, `L` ahead on ``pp_data``. A host blocked on an ack goes on
+#: `WAKE` x (1 - exp(-idle / `RISE`)) after it, idle the pair's since the last.
 L, T = 2.0**-10, 2.0**-8 + 2.0**-17
+WAKE, RISE = 2.0**-12, 2.0**-6
 ROUND = copy.deepcopy(DP_MACHINE)
 ROUND["interconnect"]["intra_node"]["pp"] = {
     c: {
@@ -245,8 +248,8 @@ ROUND["interconnect"]["intra_node"]["pp"] = {
     for c in ("rccl", "gloo")
 }
 ROUND["interconnect"]["intra_node"]["pp"]["gloo"] |= {
-    "wake_s": 2.0**-40,
-    "wake_rise_s": 1.0,
+    "wake_s": WAKE,
+    "wake_rise_s": RISE,
 }
 #: One request's prefill, then its decode: half the stub's 2**-3 s and 2**-4 s
 #: on each stage, with ``meta`` and ``tokens`` 2**-6 s ahead.
@@ -258,24 +261,32 @@ P, D, IPC6 = 2.0**-4, 2.0**-5, 2.0**-6
 META1, TOKENS = "engine-pp0->engine-pp1:meta#pp1", "engine-pp1->engine-pp0:tokens"
 #: The last stage posts each receive at its batch's ``meta``; its tensors leave
 #: at the head's device end; it ends its device work and sends the tokens. The
-#: head flushes its send on the ack, wakes, and starts forward 1 on the tokens.
+#: head flushes its send on the ack, wakes, and starts forward 1 on the tokens;
+#: its first wake is the whole `WAKE`, no send having completed before.
 TOK0 = 1 + P + T + P + IPC6
 TOK1 = TOK0 + D + T + D + IPC6
+ACK1 = TOK0 + IPC6 + T
+
+
+def _woken(idle):
+    return WAKE * -math.expm1(-idle / RISE)
+
+
 ROWS = [
     ("engine-pp0", 1.0, 1.0, "TAR"),
     ("engine-pp1", 0.0, 1 + L, "release", DATA, 0),
     ("engine-pp1", 1 + L, 1 + IPC6, "release", META1, 0),
     ("engine-pp0", 1.0, 1 + IPC6 + T, "release", ACK, 0),
-    ("engine-pp0", 1 + IPC6 + T, 1 + IPC6 + T, "TAR"),
+    ("engine-pp0", 1 + IPC6 + T, 1 + IPC6 + T + WAKE, "TAR"),
     ("engine-pp1", 1 + IPC6, 1 + P + T + P, "TAR"),
     ("engine-pp0", 1 + IPC6 + T, TOK0, "release", TOKENS, 0),
     ("engine-pp0", TOK0, TOK0, "TAR"),
     ("engine-pp1", 1 + P + T + P, TOK0 + L, "release", DATA, 1),
     ("engine-pp1", TOK0 + L, TOK0 + IPC6, "release", META1, 1),
-    ("engine-pp0", TOK0, TOK0 + IPC6 + T, "release", ACK, 1),
-    ("engine-pp0", TOK0 + IPC6 + T, TOK0 + IPC6 + T, "TAR"),
+    ("engine-pp0", TOK0, ACK1, "release", ACK, 1),
+    ("engine-pp0", ACK1, ACK1 + _woken(ACK1 - (1 + IPC6 + T)), "TAR"),
     ("engine-pp1", TOK0 + IPC6, TOK1 - IPC6, "TAR"),
-    ("engine-pp0", TOK0 + IPC6 + T, TOK1, "release", TOKENS, 1),
+    ("engine-pp0", ACK1, TOK1, "release", TOKENS, 1),
 ]
 
 
@@ -313,9 +324,15 @@ def test_each_stages_rows_are_computed_from_its_forwards_and_the_carriers():
         f"engine-pp0: TAR row 2 is {early[1:3]}; the pipeline implies {(TOK0, TOK0)}"
     ]
     # Forward 1's tokens a decode stub late.
-    late = ("engine-pp0", TOK0 + IPC6 + T, TOK1 + 2 * D, "release", TOKENS, 1)
+    late = ("engine-pp0", ACK1, TOK1 + 2 * D, "release", TOKENS, 1)
     assert _computed(13, late) == [
-        f"{TOKENS} seq 1 arrives at {TOK1 + 2 * D}; the pipeline implies {TOK1}"
+        f"{TOKENS} seq 1 is {(TOK1 + 2 * D,)}; the pipeline implies {(TOK1,)}"
+    ]
+    # The head's second wake over its block on ack 1, not the pair's idle
+    # since ack 0.
+    block = ("engine-pp0", ACK1, ACK1 + _woken(ACK1 - TOK0), "TAR")
+    assert _computed(11, block) == [
+        f"engine-pp0: TAR row 3 is {block[1:3]}; the pipeline implies {ROWS[11][1:3]}"
     ]
 
 

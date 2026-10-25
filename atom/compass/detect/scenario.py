@@ -152,6 +152,28 @@ def _run_properties(table: str, summary: dict) -> list[str]:
     return failed
 
 
+def _rows(table: str):
+    """A step table's run file, its TAR rows by LP, its release ends by channel
+    and seq."""
+    lines = table.splitlines()
+    run = json.loads(lines[0].removeprefix(CONFIGURATION_PREFIX))
+    tars, arrived = defaultdict(list), defaultdict(dict)
+    for lp, t0, t1, event, ch, seq, _ in map(str.split, lines[1:]):
+        if event == TAR:
+            tars[lp].append((float(t0), float(t1)))
+        elif event == "release":
+            arrived[ch][int(seq)] = float(t1)
+    return run, tars, arrived
+
+
+def _first_diff(row: str, want, got, model="the pipeline") -> list[str]:
+    """The first of `got`'s `row`s that `want` does not match, as a line."""
+    for i, (w, g) in enumerate(zip_longest(want, got)):
+        if w is None or g is None or not all(map(math.isclose, w, g)):
+            return [f"{row} {i} is {g}; {model} implies {w}"]
+    return []
+
+
 def pipeline_timeline(table: str) -> list[str]:
     """Each stage's forward n against the stage before's send n, one failure
     a line; none at pipeline width one. It checks order on the step table's
@@ -166,15 +188,8 @@ def pipeline_timeline(table: str) -> list[str]:
     released, or, when that falls inside one of its TARs, at that TAR's end;
     the forward's own waits for the metadata and the tensors come after.
     """
-    lines = table.splitlines()
-    run = json.loads(lines[0].removeprefix(CONFIGURATION_PREFIX))
+    run, tars, arrived = _rows(table)
     pp, channels = run.get("pipeline_parallel_size", 1), channel_table(run)
-    tars, arrived = defaultdict(list), defaultdict(dict)
-    for lp, t0, t1, event, ch, seq, _ in map(str.split, lines[1:]):
-        if event == TAR:
-            tars[lp].append((float(t0), float(t1)))
-        elif event == "release":
-            arrived[ch][int(seq)] = float(t1)
     meta = "engine-pp0->engine-pp1:meta#pp1"
     starts = {n: a - channels.lookahead(meta) for n, a in arrived[meta].items()}
     failed = []
@@ -229,8 +244,7 @@ def stage_timelines(table: str, engine: str, stages, layers: int, parts) -> list
     """
     from atom.models.utils import get_pp_indices
 
-    lines = table.splitlines()
-    run = json.loads(lines[0].removeprefix(CONFIGURATION_PREFIX))
+    run, got, arrived = _rows(table)
     stub, channels = Coefficients(**run.get("step_stub", {})), channel_table(run)
     pp, lp = len(stages), [f"{engine}-pp{k}" for k in range(len(stages))]
     if not stub.shape_blind or any(h.get("laws") for h in entries(run, "host")):
@@ -239,12 +253,6 @@ def stage_timelines(table: str, engine: str, stages, layers: int, parts) -> list
         ]
     if len({len(s) for s in stages}) > 1:
         return [f"{engine}: the stages hold {[len(s) for s in stages]} steps"]
-    got, arrived = defaultdict(list), defaultdict(dict)
-    for name, t0, t1, event, ch, seq, _ in map(str.split, lines[1:]):
-        if event == TAR:
-            got[name].append((float(t0), float(t1)))
-        elif event == "release":
-            arrived[ch][int(seq)] = float(t1)
     spec = MachineSpec.from_mapping(run["machine"])
     models, wake = carrier_models(spec), gloo_wake(spec)
     tars, rel, sent, acks = defaultdict(list), defaultdict(dict), {}, {}
@@ -372,21 +380,12 @@ def stage_timelines(table: str, engine: str, stages, layers: int, parts) -> list
                     s.now = max(s.now, t)
     except ValueError as e:
         return [f"{engine}: {e}"]
-    failed = []
-    for name in lp:
-        for i, (w, g) in enumerate(zip_longest(tars[name], got[name])):
-            if w is None or g is None or not all(map(math.isclose, w, g)):
-                failed.append(f"{name}: TAR row {i} is {g}; the pipeline implies {w}")
-                break
+    failed = [
+        f for name in lp for f in _first_diff(f"{name}: TAR row", tars[name], got[name])
+    ]
     for name, want in rel.items():
-        for n, (w, g) in enumerate(
-            zip_longest(*(map(d.get, sorted(d)) for d in (want, arrived[name])))
-        ):
-            if w is None or g is None or not math.isclose(w, g):
-                failed.append(
-                    f"{name} seq {n} arrives at {g}; the pipeline implies {w}"
-                )
-                break
+        ends = ([(d[n],) for n in sorted(d)] for d in (want, arrived[name]))
+        failed += _first_diff(f"{name} seq", *ends)
     return failed
 
 
@@ -401,18 +400,12 @@ def _outputs(sent, taken) -> list[str]:
 
 
 def _timeline(table: str, lp: str, record) -> list[str]:
-    lines = table.splitlines()
-    run = json.loads(lines[0].removeprefix(CONFIGURATION_PREFIX))
-    stub = Coefficients(**run.get("step_stub", {}))
+    run, tars, _ = _rows(table)
+    stub, tars = Coefficients(**run.get("step_stub", {})), tars[lp]
     if not stub.shape_blind or any(h.get("laws") for h in entries(run, "host")):
         return [
             f"{lp}: a timeline is computed for a constant step stub with no host laws"
         ]
-    tars = [
-        (float(f[1]), float(f[2]))
-        for f in map(str.split, lines[1:])
-        if f[0] == lp and f[3] == TAR
-    ]
     # RapidServe's prefill_forward synchronizes its stream before it returns.
     sync = run.get(RAPIDSERVE, False) and lp == "engine-P"
     try:
@@ -421,10 +414,7 @@ def _timeline(table: str, lp: str, record) -> list[str]:
         )
     except ValueError as e:
         return [f"{lp}: {e}"]
-    for i, (w, got) in enumerate(zip_longest(want, tars)):
-        if w is None or got is None or not all(map(math.isclose, w, got)):
-            return [f"{lp}: TAR row {i} is {got}; the constant stub implies {w}"]
-    return []
+    return _first_diff(f"{lp}: TAR row", want, tars, "the constant stub")
 
 
 def check_run(out_dirs, sent=None, taken=(), records=None, pipeline=None) -> list[str]:
