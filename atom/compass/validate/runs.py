@@ -232,7 +232,7 @@ def _end_to_end(export) -> dict:
     return {name: export[k][stat] for name, (k, stat) in END_TO_END.items()}
 
 
-def _named_by_prefill(export, prefill, decode) -> dict:
+def named_by_prefill(export, prefill, decode) -> dict:
     """`export`, whose names are decode's response ids, with each request
     renamed by the response id `prefill`'s record names it by: its prefill DP
     rank and request id join the decode response id in `decode`'s
@@ -262,7 +262,7 @@ def _client_run(cell, run, client, whole=False, simulated=False) -> tuple:
     steps = _steps(cell)
     export = read_json(Path(client) / CLIENT_RUN)
     if Path(cell) == Path(client) / SIDES[0]:
-        export = _named_by_prefill(export, cell, Path(client) / SIDES[1])
+        export = named_by_prefill(export, cell, Path(client) / SIDES[1])
     warmup_names = set(export.get("warmup") or ())
     record = served(Path(cell) / "steps", [export["requests"]])
     split = [s for rank in record.values() for s in rank if not s["is_dummy_run"]]

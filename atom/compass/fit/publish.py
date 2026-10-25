@@ -6,7 +6,10 @@ by their exports (`--client-run RECORD EXPORT`, in the order they ran), and a
 fit taking replayed batches reads step measurements too, each named by the
 token `Key.token` prints; it loads their samples under one configuration
 (`samples.load`). A record no `--client-run` names refuses: its steps would
-name no trace they served. `--machine M` names the spec of the platform the
+name no trace they served. A deployment's export names decode's response ids,
+so a RECORD that is its `prefill/`, `decode/` beside it, has its export's
+requests renamed as prefill's record names them, as grading renames them.
+`--machine M` names the spec of the platform the
 inputs ran on: records whose device, software stack, PTL state or torch is not
 the one it states refuse, naming each and both values. `--ptl` states the PTL
 state of records that carry none, and refuses for records that carry one; the
@@ -42,9 +45,11 @@ from atom.compass.artifacts import (
     roots_for,
 )
 from atom.compass.artifacts.keys import platform_key
+from atom.compass.backends.json_file import read_json
 from atom.compass.fit.samples import UNRECORDED, load
 from atom.compass.run.step_grid import readings as run_readings
 from atom.compass.spec import MachineSpec
+from atom.compass.validate.runs import SIDES, named_by_prefill
 
 #: The rank a fit whose key states no layout writes at.
 RANK = Topology().ranks()[0]
@@ -98,6 +103,9 @@ def inputs(args, sources) -> tuple[list, dict]:
     for record, export in args.client_run:
         if Path(record) not in runs:
             raise ValueError(f"--client-run names {record}, which is not a RECORD")
+        decode = Path(record).parent / SIDES[1]
+        if Path(record).name == SIDES[0] and decode.is_dir():
+            export = named_by_prefill(read_json(export), record, decode)["requests"]
         runs[Path(record)].append(export)
     unnamed = [str(d) for d, exports in runs.items() if not exports]
     if unnamed:
