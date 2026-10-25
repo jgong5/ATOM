@@ -626,8 +626,9 @@ def _request_ranks(name: str, record: dict[int, list[dict]]) -> dict[str, int]:
     return ranks
 
 
-def compare(real, simulated) -> dict:
-    """Two record directories: per DP rank, the first step whose decision differs.
+def compare(real, simulated, stage: int = 0) -> dict:
+    """Two record directories: per DP rank of pipeline `stage`, the first step
+    whose decision differs.
 
     A rank's entry is None where its steps all agree, else the step index and
     both steps, None for a record that has already ended. A record with no
@@ -636,7 +637,7 @@ def compare(real, simulated) -> dict:
     or response ids. Under `steps`, each rank's count of step pairs compared
     and of identical ones.
     """
-    records = {"real": read(real), "simulated": read(simulated)}
+    records = {"real": read(real, stage), "simulated": read(simulated, stage)}
     for name, record in records.items():
         if not any(record.values()):
             raise ValueError(f"the {name} record has no steps to compare.")

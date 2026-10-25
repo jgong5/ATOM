@@ -178,6 +178,7 @@ class TestPerRequestSums:
             "moe_tokens",
             "dp_rank",
             "dp_dummy",
+            "draft_rows",
         ]
         assert [f.name for f in fields(RequestShape)] == [
             "query_tokens",

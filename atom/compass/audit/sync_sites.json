@@ -4435,6 +4435,18 @@
    "mechanism_why": "the bench measures real forwards on a real runner for a measuring command, and no simulated run starts one, so nothing prices this call"
   },
   {
+   "id": "atom/compass/bench/engine.py::Bench.exit::time.sleep(serve.POLL_S)::sleep#0",
+   "file": "atom/compass/bench/engine.py",
+   "symbol": "Bench.exit",
+   "call": "time.sleep",
+   "expr": "time.sleep(serve.POLL_S)",
+   "shape": "sleep",
+   "peer": "process",
+   "why": "the bench's stop waits in half seconds, up to a wall bound, for its workers and every process they started to exit, so the measuring command's after-run GPU check does not find them still exiting",
+   "mechanism": "K9",
+   "mechanism_why": "the bench is stopping; it measures real forwards on a real runner for a measuring command, and no simulated run starts one"
+  },
+  {
    "id": "atom/compass/bench/runner.py::BenchModelRunner.__init__::end.synchronize()::device_sync#0",
    "file": "atom/compass/bench/runner.py",
    "symbol": "BenchModelRunner.__init__",
@@ -4898,14 +4910,14 @@
    "mechanism_why": "starting a process cannot park; in the measuring command, which is no LP, around a real engine start it makes; a GPU command serves no simulated run, so the bound stays real"
   },
   {
-   "id": "atom/compass/drive/measure_memory.py::main::engine.wait(START_TIMEOUT_S)::event_wait#0",
+   "id": "atom/compass/drive/measure_memory.py::main::engine.wait(serve.POLL_S)::event_wait#0",
    "file": "atom/compass/drive/measure_memory.py",
    "symbol": "main",
    "call": "engine.wait",
-   "expr": "engine.wait(START_TIMEOUT_S)",
+   "expr": "engine.wait(serve.POLL_S)",
    "shape": "event_wait",
    "peer": "process",
-   "why": "compass measure memory waits for the engine it started to start and stop, up to a wall bound past which it kills the engine's session and refuses",
+   "why": "compass measure memory waits for the engine it started to start and stop, one poll interval at a time so a SIGINT or SIGTERM to the command ends the wait, up to a wall bound past which it kills the engine's session and refuses",
    "mechanism": "K9",
    "mechanism_why": "in the measuring command, which is no LP, around a real engine start it makes; a GPU command serves no simulated run, so the bound stays real"
   },

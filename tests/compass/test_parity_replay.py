@@ -17,6 +17,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from test_dp_slice import DP_MACHINE
 from test_memory_readings import META_8B
 from test_parity_record import BLOCK, _config, _prompt, _Runner
 from test_pd_slice import PD
@@ -231,7 +232,7 @@ def test_a_step_past_the_end_of_the_real_record_ends_the_run_by_name(
     directory, _ = real
     path = directory / "dp0.jsonl"
     path.write_text("".join(path.read_text().splitlines(keepends=True)[:3]))
-    why = f"replay: {path} has 2 steps, and this is step 2"
+    why = f"replay: {directory} stage 0 dp0 has 2 steps, and this is step 2"
     with pytest.raises(RunnerRefusal, match=f"^{re.escape(why)}$"):
         _run(tmp_path / "sim", monkeypatch, replay=directory)
 
@@ -292,7 +293,9 @@ def test_a_worker_that_replays_past_its_record_names_why_in_the_engine_hand_in(
         raise SystemExit()
 
     hand_in = tmp_path / compass_run.LP_FILE.format(compass_run.ENGINE.name)
-    why = RunnerRefusal(f"replay: {path} has 2 steps, and this is step 2")
+    why = RunnerRefusal(
+        f"replay: {directory} stage 0 dp0 has 2 steps, and this is step 2"
+    )
     assert json.loads(hand_in.read_text())["refusals"] == [
         f"ended:engine raised SystemExit(); rank 0 raised {why!r}"
     ]
@@ -439,3 +442,44 @@ def test_each_side_of_a_prefill_decode_run_replays_its_own_record(
     charged = [r.forward(decode(B37)).predicted_s for _ in "ab"]
     ends = [(ENTER * n + EXIT - SENT[0]) / 1e9 for n in (1, 2)]
     assert charged == pytest.approx([t - engine.now for t in ends])
+
+
+def test_a_later_pipeline_stage_replays_and_compares_its_own_record(
+    real, tmp_path, monkeypatch
+):
+    directory, _ = real
+    # Stage 1's record: the head's steps, each returning LAG later on its worker.
+    lag = 3_000_000
+    steps = [json.loads(s) for s in (directory / "dp0.jsonl").read_text().splitlines()]
+    for step in steps:
+        step["t_exit_ns"] += lag
+    stage = "".join(json.dumps(s) + "\n" for s in steps)
+    (directory / "pp1.dp0.jsonl").write_text(stage)
+    monkeypatch.delenv(ENV)
+    r = deployment(tmp_path, pipeline_parallel_size=2)
+    r.config.parallel_config.pipeline_parallel_rank = 1
+    pp = {"pipeline_parallel_size": 2, "machine": DP_MACHINE}
+    run = json.loads(_run_file(tmp_path, **pp).read_text())
+    (tmp_path / "run.json").write_text(json.dumps(run | {"replay": str(directory)}))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    monkeypatch.setenv(compass_run.NOW_ENV, str(tmp_path / "now.bin"))
+    engine = compass_run._PublishedClock(
+        LpId("engine-pp1"), compass_run.channel_table(run), None
+    )
+    compass_run.runner(r, META_8B)
+    engine.now = 0.002
+    charged = [r.forward(decode(B37)).predicted_s for _ in "ab"]
+    ends = [(ENTER * n + EXIT + lag - SENT[0]) / 1e9 for n in (1, 2)]
+    assert charged == pytest.approx([t - engine.now for t in ends])
+    # A simulated stage 1 one step short parts from the real one at its end;
+    # the head's records are the same.
+    sim = tmp_path / "sim"
+    sim.mkdir()
+    for name in ("dp0.jsonl", ARRIVALS):
+        (sim / name).write_text((directory / name).read_text())
+    (sim / "pp1.dp0.jsonl").write_text("".join(stage.splitlines(True)[:-1]))
+    n = len(read(directory)[0])
+    assert compare(directory, sim)["steps"] == {0: {"compared": n, "identical": n}}
+    argv = ["-m", "atom.compass.parity", str(directory), str(sim), "--stage", "1"]
+    out = subprocess.run([sys.executable, *argv], capture_output=True, check=True)
+    assert json.loads(out.stdout)["steps"] == {"0": {"compared": n, "identical": n - 1}}

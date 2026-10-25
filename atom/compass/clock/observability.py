@@ -5,8 +5,10 @@ a run summary.
 **The timeline.** One record per reply the Clock Authority issues, in issue
 order: which LP, from which clock to which, the kind of request it answers
 (``TAR`` or ``NER``; a reply to ``+inf`` finishes the run), and whether the
-recovery branch issued it. It is off unless a run hands the authority a
-`TimelineLog`; with none, a reply costs one ``is not None`` test.
+recovery branch issued it. Off the line, each record also keeps the
+``(channel, seq, arrival)`` messages the reply released and those its request
+logged as sent. It is off unless a run hands the authority a `TimelineLog`;
+with none, a reply costs one ``is not None`` test.
 
 **The dump.** `lp_table_dump` renders `ClockAuthority.lp_table()` as text: each
 LP's state, clock, target and ``N``, the messages registered for it and not yet
@@ -18,7 +20,9 @@ function of the simulated schedule alone, so two runs of one configuration give
 it byte for byte whatever order the LPs' requests arrived in. `cost_record` is
 what the run cost to produce, and names what its numbers move with. Every value
 is a number, a string, ``None`` or a list of those, and none is infinite or NaN,
-so the record survives strict JSON.
+so the record survives strict JSON. The schedule half says how the run ended:
+``end_workload``, or what the first ``ended:`` refusal names, such as the
+detector an LP raised.
 
 Nothing here reads a clock or opens a file or a socket: the caller supplies the
 sink and the wall seconds.
@@ -55,13 +59,16 @@ def _finite_seconds(value: float, what: str) -> float:
 
 @dataclass(frozen=True, slots=True)
 class TimelineRecord:
-    """One reply: five columns, the last ``recovery`` or ``-``."""
+    """One reply: five columns, the last ``recovery`` or ``-``. `released` and
+    `sent` are not printed."""
 
     lp: LpId
     time_from: float
     time_to: float
     kind: str
     recovered: bool
+    released: tuple[tuple[str, int, float], ...] = ()
+    sent: tuple[tuple[str, int, float], ...] = ()
 
     def __str__(self) -> str:
         return (
@@ -90,9 +97,16 @@ class TimelineLog:
         self._sink = sink
 
     def record(
-        self, lp: LpId, time_from: float, time_to: float, kind: str, recovered: bool
+        self,
+        lp: LpId,
+        time_from: float,
+        time_to: float,
+        kind: str,
+        recovered: bool,
+        released=(),
+        sent=(),
     ):
-        entry = TimelineRecord(lp, time_from, time_to, kind, recovered)
+        entry = TimelineRecord(lp, time_from, time_to, kind, recovered, released, sent)
         if self._records is not None:
             self._records.append(entry)
         if self._sink is not None:
@@ -211,6 +225,7 @@ class RunSummary:
     diagnostics: int = 0
     detectors: DetectorState = field(default_factory=DetectorState)
     refusals: RefusalTally = field(default_factory=RefusalTally)
+    ended_by: str | None = "end_workload"
 
     @classmethod
     def of(
@@ -228,10 +243,20 @@ class RunSummary:
         A finished run reports each LP's clock before the finish granted it
         ``+inf``; a run that has not finished, such as one a detector stopped,
         reports each LP's clock as it stands.
+
+        `ended_by` is the detail of the first ``ended:`` refusal; with none,
+        ``end_workload`` once the run has finished and ``None`` before.
         """
         clocks = authority.final_clocks
+        ended_by = "end_workload"
         if clocks is None:
             clocks = tuple((row.lp, row.now) for row in authority.lp_table())
+            ended_by = None
+        refusals = refusals if refusals is not None else RefusalTally()
+        for reason, _ in refusals.reasons:
+            if reason.startswith("ended:"):
+                ended_by = reason.partition(":")[2]
+                break
         return cls(
             tuple((str(lp), now) for lp, now in clocks),
             tuple(authority.grants.items()),
@@ -240,7 +265,8 @@ class RunSummary:
             _finite_seconds(lazy_trace_wall_seconds, "lazy_trace_wall_seconds"),
             diagnostics,
             detectors if detectors is not None else DetectorState(),
-            refusals if refusals is not None else RefusalTally(),
+            refusals,
+            ended_by,
         )
 
     @property
@@ -272,6 +298,7 @@ class RunSummary:
             "grants_total": sum(count for _, count in self.grants),
             "stragglers": self.detectors.stragglers,
             "clock_lint": self.detectors.clock_lint,
+            "ended_by": self.ended_by,
             "refusals": self.refusals.record(),
         }
 

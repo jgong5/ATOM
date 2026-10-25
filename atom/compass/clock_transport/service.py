@@ -30,13 +30,20 @@ and the serve side decodes them onto the queue, so the in-process carrier here
 moves the same bytes a socket would; a socket's end reaches it as a ``None``
 request. An LP waits for its reply on its own slot and under no lock shared with
 another connection, so one parked LP holds up no other.
+
+Once every LP has sent a request, a wait of `diag_s` wall seconds with none
+arriving is a stall the authority cannot see: the loop logs the LP table once,
+counts it in the authority's `diagnostics` and keeps waiting. It logs again only
+after a request arrives and a new stall begins, never after the run has ended.
 """
 
+import logging
 import math
 import queue
 import threading
 
-from atom.compass.clock import ClockAbort, LpId
+from atom.compass.clock import ClockAbort, LpId, lp_table_dump
+from atom.utils.clock import DIAG_S
 
 from .wire import (
     BIND,
@@ -49,6 +56,8 @@ from .wire import (
     encode,
 )
 
+logger = logging.getLogger("atom")
+
 IN_PROCESS_SCHEME = "inproc"
 DEFAULT_ENDPOINT = f"{IN_PROCESS_SCHEME}:clock"
 
@@ -59,9 +68,10 @@ _SERVED: dict[str, "_Server"] = {}
 class _Server:
     """The serve side of one endpoint. It takes in frames and closes."""
 
-    def __init__(self, authority, endpoint: str) -> None:
+    def __init__(self, authority, endpoint: str, diag_s: float = DIAG_S) -> None:
         self.endpoint = endpoint
         self._authority = authority
+        self._diag_s = diag_s
         self._lps = [row.lp for row in authority.lp_table()]
         self._slots = {}
         self._requests = queue.Queue()
@@ -120,9 +130,22 @@ class _Server:
 
     def _loop(self) -> None:
         ended = None  # the refusal frame that ended the run, once one has
-        while (item := self._requests.get()) is not None:
+        unasked = set(self._lps)  # LPs yet to send a request
+        quiet = True  # no stall diagnostic is due
+        while True:
+            try:
+                item = self._requests.get(timeout=self._diag_s)
+            except queue.Empty:
+                if not quiet and ended is None and self._authority.final_clocks is None:
+                    self._stalled()
+                quiet = True
+                continue
+            if item is None:
+                return
             address, request, slot = item
             lp, member = address if isinstance(address, tuple) else (address, None)
+            unasked.discard(lp)
+            quiet = bool(unasked)
             replies, resigned = [(address, ended)], []
             if request is None:
                 replies = []
@@ -156,6 +179,21 @@ class _Server:
                 self._slots[i].put(frame)
             for i in resigned:
                 del self._slots[i]
+
+    def _stalled(self) -> None:
+        """Log the LP table for a stall, once; reading it never ends the run."""
+        self._authority.diagnostics += 1
+        try:
+            table = lp_table_dump(self._authority)
+        except Exception as unread:  # noqa: BLE001 - a diagnostic never aborts
+            table = f"no LP table: {unread!r}"
+        logger.warning(
+            "the clock authority at %s has had no request for %s wall seconds; "
+            "still waiting. The LP table:\n%s",
+            self.endpoint,
+            self._diag_s,
+            table,
+        )
 
     def _ending(self, fault: Exception | str) -> bytes:
         """The refusal frame that ends the run on `fault`, an exception or a
@@ -214,14 +252,17 @@ class _Connection:
         """Nothing to release: the reply slot is the LP's, not the connection's."""
 
 
-def serve(authority, endpoint: str = DEFAULT_ENDPOINT) -> _Server:
-    """Serve `authority` at `endpoint`. `close()` on the result stops it."""
+def serve(
+    authority, endpoint: str = DEFAULT_ENDPOINT, diag_s: float = DIAG_S
+) -> _Server:
+    """Serve `authority` at `endpoint`, logging a stall after `diag_s` wall
+    seconds. `close()` on the result stops it."""
     if endpoint in _SERVED:
         raise ValueError(
             f"{endpoint} is already served in this process; two authorities at "
             "one endpoint would grant time from two states"
         )
-    _SERVED[endpoint] = _Server(authority, endpoint)
+    _SERVED[endpoint] = _Server(authority, endpoint, diag_s)
     return _SERVED[endpoint]
 
 

@@ -24,14 +24,15 @@
 //! A stamped cancel is answered 204 and goes on to where its request is
 //! ([`ingress`]). A request is handled apart from its client's connection, so
 //! a hang-up drops only the response; a prefill response read after its
-//! request's cancel sends nothing on.
+//! request's cancel sends nothing on. The cancel drops the loads its request
+//! still holds, as a hang-up drops them in a router outside a run.
 
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, OnceLock,
+        Arc, OnceLock, Weak,
     },
     time::Duration,
 };
@@ -109,16 +110,19 @@ struct Lp {
 }
 
 /// Where a request is: the outbound channel it last went on, the worker's
-/// base URL and its seq there, whether a cancel has come for it, and its
-/// decode's base URL until it goes there.
+/// base URL and its seq there, its decode's base URL until it goes there, and
+/// the loads it holds ([`cancellable`]).
 #[derive(Default)]
 struct Placed {
     channel: String,
     url: String,
     seq: u64,
-    cancelled: bool,
     decode: String,
+    loads: Vec<Weak<parking_lot::Mutex<Option<WorkerLoadGuard>>>>,
 }
+
+/// A load a request holds, which its cancel drops if it is still held then.
+pub type Load = Arc<parking_lot::Mutex<Option<WorkerLoadGuard>>>;
 
 struct Timer {
     due: f64,
@@ -297,10 +301,14 @@ impl Lp {
     }
 
     /// Handle a cancel, posted to `path`, of the request with seq `seq` on
-    /// `traffic->router:http`: it goes on to where that request is, if anywhere.
+    /// `traffic->router:http`: it goes on to where that request is, if anywhere,
+    /// and that request ends, dropping the loads it still holds.
     fn cancel(&self, mut turn: Turn, seq: u64, path: &str) -> Response {
-        if let Some(at) = self.requests.lock().get_mut(&seq) {
-            at.cancelled = true;
+        let placed = self.requests.lock().remove(&seq);
+        if let Some(at) = placed {
+            for load in at.loads.iter().filter_map(Weak::upgrade) {
+                load.lock().take();
+            }
             // On a relay the stamp rides in the body, elsewhere in `tracestate`.
             let stamp = entry(turn.send(&at.channel));
             let body = match kind(&at.channel) {
@@ -410,6 +418,19 @@ pub fn placed(prefill: &str, decode: &str) {
     });
 }
 
+/// The request being handled holds `loads`, as [`Load`]s that its cancel drops
+/// if they are still held then.
+pub fn cancellable(loads: [WorkerLoadGuard; 2]) -> [Load; 2] {
+    let loads = loads.map(|guard| Arc::new(parking_lot::Mutex::new(Some(guard))));
+    let seq = REQUEST.try_with(|h| h.borrow().seq);
+    if let (Some(lp), Ok(seq)) = (LP.get(), seq) {
+        if let Some(at) = lp.requests.lock().get_mut(&seq) {
+            at.loads = loads.iter().map(Arc::downgrade).collect();
+        }
+    }
+    loads
+}
+
 /// Request header `name`'s `value` as it goes to a worker: a `tracestate`
 /// with its `compass` entry restamped for the prefill the request was placed on.
 pub fn header(name: &str, value: &str) -> String {
@@ -467,7 +488,7 @@ pub async fn relay(body: &mut Value) -> Option<Turn> {
     let mut turn = lp.hold(&format!("{p}->router:relay"), seq).await;
     let mut requests = lp.requests.lock();
     let at = request.and_then(|r| requests.get_mut(&r));
-    turn.cancelled = at.as_ref().is_some_and(|at| at.cancelled);
+    turn.cancelled = request.is_some() && at.is_none();
     if turn.cancelled {
         return Some(turn);
     }
@@ -485,15 +506,13 @@ pub async fn relay(body: &mut Value) -> Option<Turn> {
 /// counts as handled. A task of its own reads it to its end, so a client
 /// that hangs up loses only the forwarding. Without the clock: the stream
 /// as is, and the guard.
-pub fn stream<S>(
+pub fn stream<S, G>(
     upstream: S,
-    guard: WorkerLoadGuard,
-) -> (
-    BoxStream<'static, Result<Bytes, reqwest::Error>>,
-    Option<WorkerLoadGuard>,
-)
+    guard: G,
+) -> (BoxStream<'static, Result<Bytes, reqwest::Error>>, Option<G>)
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    G: Send + 'static,
 {
     let Some(lp) = LP.get() else {
         return (upstream.boxed(), Some(guard));
@@ -540,10 +559,10 @@ where
 impl Lp {
     /// Hold one event of the stream from `from` until it is released, and
     /// send it on to traffic; the terminal event ends `request`.
-    async fn restamp(
+    async fn restamp<G>(
         &self,
         event: Vec<u8>,
-        guard: &mut Option<WorkerLoadGuard>,
+        guard: &mut Option<G>,
         from: &str,
         request: Option<u64>,
     ) -> Vec<u8> {
