@@ -214,6 +214,9 @@ fi
 # first card alone, as the baseline was measured: an upstream test that needs
 # two cards skips there. The surplus over the baseline is what tests/compass
 # passes on this tree; an absent tests/compass contributes none.
+# The tests that cargo-build atomesh skip unless cargo resolves its crates; the
+# gate has no network, so they come from the container's cache.
+export CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE:-true}
 COUT=$(mktemp)
 COMPASS_N=0 C_FAILED=0 C_ERRORS=0
 if [ -d "$ROOT/tests/compass" ]; then

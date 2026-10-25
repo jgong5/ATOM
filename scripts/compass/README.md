@@ -516,7 +516,10 @@ in the snapshot itself names no commit and is refused.
 After the run, a `SKIPPED` line under `tests/compass/` whose reason names the slice
 or image model or `atomesh` is a finding by its file and line: that test did not
 run. The cc-traces smoke's skip is not, since it also needs a trace set and a
-harness Python, which the gate does not stage.
+harness Python, which the gate does not stage. The tests that cargo-build
+atomesh run offline (`CARGO_NET_OFFLINE=true` unless set), from the container's
+crate cache, as in `gate_cpu.sh`; where cargo cannot resolve its crates they
+skip, and the gate names them.
 
 On node 18 (`xiaobizh_n18_next13`), `tests/attentions/deepseek_v41/test_tbo.py`
 hangs; a run that passes `--ignore` for it reads that file's passes short of
