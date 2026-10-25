@@ -8,7 +8,8 @@ given. Three rules govern what it hands over instead, and each fails quietly
 rather than loudly when a replacement gets it wrong.
 
 **Tokens are one step late.** `tokenIDProcessor.is_deferred_out` is true
-whenever the pipeline is a single stage, which is the ordinary case. The real
+whenever the pipeline is a single stage, which is the ordinary case, except on
+a P/D producer whose model keeps recurrent state. The real
 runner starts an asynchronous copy of this step's sampled ids to the host and
 reports the copy the *previous* step started, so the reply carries the previous
 batch's request ids and the previous batch's tokens with the deferred flag set.
@@ -92,18 +93,6 @@ def filler_token_ids(
         and (text := tokenizer.decode([token_id], skip_special_tokens=True)).isascii()
         and text.isalnum()
     ]
-
-
-def reports_previous_step(pipeline_parallel_size: Any) -> bool:
-    """Do this runner's replies carry the previous step's tokens?
-
-    The condition ATOM's token processor resolves from, and the same number the
-    scheduler reads in the other direction: with more than one stage it
-    advances chunked-prefill progress at schedule time instead of after the
-    forward, and a stage reports the step it just ran. So the two arrangements
-    never both apply, and one number selects between them.
-    """
-    return int(pipeline_parallel_size or 1) == 1
 
 
 class DeferredTokenStream:

@@ -25,11 +25,6 @@ The host CPU invalidates `host_laws`, which time the host, and nothing that
 holds device time. A `shape_population`'s pricing backend is in its key rather
 than its row: another backend addresses another entry instead of invalidating
 this one.
-
-**`coverage_hull` has no row at all.** It appears in the artifact key table
-and nowhere in this one. Guessing a row for it is the failure this package
-exists to prevent -- an artifact answering under conditions nobody checked --
-so `rows_for` refuses and names what is missing.
 """
 
 import enum
@@ -227,8 +222,7 @@ MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
 }
 
 #: Which rows decide a kind's validity. `machine_spec` is its capacity and
-#: tokenizer-terms rows; `coverage_hull`
-#: is none, and that is a gap in the matrix rather than a default taken here.
+#: tokenizer-terms rows.
 ROWS_OF: Mapping[Kind, tuple[Row, ...]] = {
     Kind.OP_GRAPH: (Row.OP_GRAPH,),
     Kind.PRICE_LIST: (Row.PRICE_LIST,),
@@ -258,7 +252,7 @@ def rows_for(kind: Kind) -> tuple[Row, ...]:
             f"the invalidation matrix states no dependency row for {kind}",
             "the artifact key table and the matrix do not hold the same "
             f"artifacts: {kind} is in the first and not the second. Add a row "
-            "to the matrix, or say there why the kind needs none (#174); a row "
+            "to the matrix, or say there why the kind needs none; a row "
             "guessed here would answer under conditions nobody checked",
         )
     return rows

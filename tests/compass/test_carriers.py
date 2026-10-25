@@ -63,10 +63,26 @@ class TestTracestate:
     def test_round_trip(self, arrival):
         assert tracestate_stamp(tracestate_with(None, arrival, 17)) == (arrival, 17)
 
-    def test_other_vendors_keep_their_order(self):
+    def test_the_entry_goes_first_and_other_vendors_keep_their_order(self):
         header = tracestate_with(VENDORS, 1.5, 3)
-        assert header == VENDORS + ",compass=a:1.5;s:3"
+        assert header == "compass=a:1.5;s:3,rojo=00f067aa0ba902b7,congo=t61rcWkgMzE"
         assert tracestate_stamp(header) == (1.5, 3)
+
+    def test_31_other_entries_are_all_kept_behind_it(self):
+        others = [f"v{i}=x" for i in range(31)]
+        header = tracestate_with(",".join(others), 1.5, 3)
+        assert header.split(",") == ["compass=a:1.5;s:3", *others]
+
+    def test_past_32_entries_the_last_is_dropped_and_the_stamp_kept(self):
+        others = [f"v{i}=x" for i in range(32)]
+        header = tracestate_with(",".join(others), 1.5, 3)
+        assert header.split(",") == ["compass=a:1.5;s:3", *others[:31]]
+        assert tracestate_stamp(header) == (1.5, 3)
+
+    @pytest.mark.parametrize("header", ["", " ", " , ", "rojo=1,,", ",rojo=1"])
+    def test_empty_members_are_dropped(self, header):
+        expected = "compass=a:1.5;s:3" + (",rojo=1" if "rojo" in header else "")
+        assert tracestate_with(header, 1.5, 3) == expected
 
     def test_a_space_after_the_comma_is_allowed(self):
         assert tracestate_stamp("rojo=1, compass=a:1.5;s:3") == (1.5, 3)

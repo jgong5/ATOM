@@ -2,8 +2,8 @@
 """The three carriers of a simulated timestamp across HTTP: request, relay and stream.
 
 A request carries its ``(arrival, seq)`` as a ``compass`` entry of the W3C
-``tracestate`` header, ``compass=a:<arrival>;s:<seq>``, written after any
-entries already there. A streamed response carries one comment line before
+``tracestate`` header, ``compass=a:<arrival>;s:<seq>``, written before any
+entries already there, as W3C Trace Context adds a new entry. A streamed response carries one comment line before
 each SSE event, ``: compass a=<arrival> s=<seq>``; SSE clients skip lines that
 start with a colon. Both pass a router that forwards headers and the stream
 unchanged. A prefill response the router relays to decode carries its stamp as
@@ -26,6 +26,7 @@ from atom.utils.clock import channel_of
 _NUM = r"(inf|\d[\d.e+-]*)"
 _ENTRY = re.compile(rf"a:{_NUM};s:(\d+)")
 _COMMENT = re.compile(rf": compass a={_NUM} s=(\d+)")
+_MAX_ENTRIES = 32
 
 
 def _parse(pattern: re.Pattern, text: str, what: str) -> tuple[float, int]:
@@ -55,11 +56,15 @@ def tracestate_stamp(header: str | None) -> tuple[float, int] | None:
 
 
 def tracestate_with(header: str | None, arrival: float, seq: int) -> str:
-    """`header` with the ``compass`` entry for ``(arrival, seq)`` after its entries."""
+    """`header` with the ``compass`` entry for ``(arrival, seq)`` first.
+
+    The other entries keep their order; empty ones are dropped, and so are
+    entries from the end past W3C Trace Context's limit of 32.
+    """
     if tracestate_stamp(header) is not None:
         raise ValueError(f"tracestate {header!r} already has a compass entry")
-    entry = f"compass=a:{arrival!r};s:{seq}"
-    return f"{header},{entry}" if header and header.strip() else entry
+    others = [e.strip() for e in (header or "").split(",") if e.strip()]
+    return ",".join([f"compass=a:{arrival!r};s:{seq}", *others][:_MAX_ENTRIES])
 
 
 def stamp_events(text: str, rt) -> str:

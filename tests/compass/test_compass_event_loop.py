@@ -1038,6 +1038,42 @@ def test_a_tokenizer_result_due_when_an_intake_starts_runs_before_its_charge(
     )
 
 
+@pytest.mark.parametrize("delay_s", [0.0, 0.1], ids=["fast", "slow"])
+@pytest.mark.parametrize("hops", [0, 1, 2, 4])
+def test_a_burst_tokenizer_results_do_not_depend_on_loop_turns_or_thread_speed(
+    run, monkeypatch, tmp_path, hops, delay_s
+):
+    # Each intake costs 2 ms and each tokenizer job 1 ms. Each handler yields
+    # to the loop `hops` times before it submits its job, as a web framework's
+    # awaits do, and job 0's real thread takes `delay_s` wall seconds. Neither
+    # moves a result: each job is submitted when its own intake ends and placed
+    # before the next intake is charged, so job 0's result runs when request
+    # 1's intake ends, at 4 ms, job 1's when request 2's ends, at 6 ms, and
+    # job 2's at its completion, 7 ms.
+    _intake_run_file(monkeypatch, tmp_path, (2e-3, 1e-9))  # empty bodies
+    entry = SimpleNamespace(encode_fixed_s=1e-3, encode_tokens_per_s=1.0, derate=1.0)
+    encode, done = wrap_encode(list, entry), []
+
+    async def app(scope, receive, send):
+        seq = api_server._tracestate_stamp(scope)[1]
+        for _ in range(hops):
+            await asyncio.sleep(0)
+
+        def do_preprocess():
+            time.sleep(delay_s if seq == 0 else 0)
+            encode()
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, do_preprocess)
+        done.append((seq, loop.time()))
+
+    arrival = _burst(run, monkeypatch, 3, app)
+    print(f"\n  tokenizer results at {done}")
+    assert [t for _, t in sorted(done)] == pytest.approx(
+        [arrival + 4e-3, arrival + 6e-3, arrival + 7e-3]
+    )
+
+
 @pytest.mark.parametrize("tick", [None, 0.1, 9.0, 20.0], ids=lambda t: f"tick{t}")
 @pytest.mark.parametrize("probes", [0, 1, 2], ids=lambda n: f"{n}probes")
 def test_tokenizer_results_due_at_one_instant_resume_in_submission_order(

@@ -106,13 +106,15 @@ class LpRow:
 @dataclass(frozen=True, slots=True)
 class ClientRun:
     """One ended client run: its client's clock at binding, the latest LP clock
-    at its end, and each LP's clock and finite grants by name at its end."""
+    at its end, each LP's clock and finite grants by name at its end, and the
+    stall diagnostics printed during it."""
 
     index: int
     start: float
     end: float
     final_clocks: tuple[tuple[LpId, float], ...]
     grants: dict = field(repr=False)
+    diagnostics: int = 0
 
 
 class ClockAbort(Exception):
@@ -144,8 +146,10 @@ class ClockAuthority:
     """Every LP's clock and state, and the rule that grants them time.
 
     `timeline`, when given, receives one ``record(lp, from, to, kind,
-    recovered)`` call per reply, in issue order. `grants` counts each LP's
-    finite grants by name. `final_clocks` is every LP's clock just before the run
+    recovered, released, sent)`` call per reply, in issue order: ``released``
+    the ``(channel, seq, arrival)`` messages the reply released, ``sent`` those
+    logged by the requests it answers. `grants` counts each LP's finite grants
+    by name; `diagnostics`, the stall diagnostics its serve loop printed. `final_clocks` is every LP's clock just before the run
     finished, and ``None`` until it has. `members` maps an LP to
     ``{member: names of the channels into or out of it that the member owns}``;
     an LP not in it is its own single caller. `bound_s` is the simulated-time
@@ -194,7 +198,10 @@ class ClockAuthority:
             for i in self._ids
         }
         self.timeline = timeline
+        self._sent = {i: [] for i in self._ids}  # logged since its last reply
         self.grants = {i.name: 0 for i in self._ids}
+        self.diagnostics = 0
+        self._diagnosed = 0  # `diagnostics` at the open client run's start
         self.final_clocks = None
         self._client = client and self._lp[channels.registry.require(client)]
         self._client_runs = client_runs
@@ -291,6 +298,8 @@ class ClockAuthority:
             self._refuse_unjoinable(lp, member, kind, t)
         for name, seq, arrival in log:
             self._register(lp, name, seq, arrival, member)
+        if self.timeline is not None:
+            self._sent[lp] += map(tuple, log)
         if members:
             joined, parked = self._round[lp], self._parked[lp]
             joined[member] = _STANDING if kind == PARK else (kind, t, daemon)
@@ -500,7 +509,8 @@ class ClockAuthority:
             for seq, _ in released[name]:
                 del pending[seq]
         if self.timeline is not None:
-            self.timeline.record(i, self._now[i], g, self._state[i], recovered)
+            got = tuple((c, seq, a) for c, r in released.items() for seq, a in r)
+            self._record(i, g, self._state[i], recovered, got)
         self.grants[i.name] += 1
         # g is N[i], so N[i] is unchanged: a running LP's N is its clock.
         self._now[i], self._state[i], self._target[i] = g, RUNNING, None
@@ -511,10 +521,11 @@ class ClockAuthority:
         unless it is the last, the client resigns and every other LP is told."""
         end, k = max(self._now.values()), len(self.ended)
         clocks, grants = tuple(self._now.items()), dict(self.grants)
-        self.ended.append(ClientRun(k, self._start, end, clocks, grants))
+        diagnostics = self.diagnostics - self._diagnosed
+        self.ended.append(ClientRun(k, self._start, end, clocks, grants, diagnostics))
         if self._client is None or k + 1 == self._client_runs:
             return self._finish()
-        self._start = end
+        self._start, self._diagnosed = end, self.diagnostics
         replies = []
         for i in self._ids:
             none = {name: [] for name in self._into[i]}
@@ -524,7 +535,7 @@ class ClockAuthority:
                 replies.append((i, self._now[i], none, k))
                 continue
             if self.timeline is not None:
-                self.timeline.record(i, self._now[i], math.inf, NER, False)
+                self._record(i, math.inf, NER)
             self._now[i] = self._nv[i] = end
             replies.append((i, math.inf, none))
         return replies
@@ -533,7 +544,12 @@ class ClockAuthority:
         self.final_clocks = tuple(self._now.items())
         for i in self._ids:
             if self.timeline is not None:
-                self.timeline.record(i, self._now[i], math.inf, self._state[i], False)
+                self._record(i, math.inf, self._state[i])
             self._now[i], self._state[i], self._target[i] = math.inf, RUNNING, None
             self._nv[i] = math.inf
         return [(i, math.inf, {name: [] for name in self._into[i]}) for i in self._ids]
+
+    def _record(self, i: LpId, g: float, kind: str, recovered=False, released=()):
+        """Hand the timeline `i`'s reply, with what it sent since its last one."""
+        sent, self._sent[i] = tuple(self._sent[i]), []
+        self.timeline.record(i, self._now[i], g, kind, recovered, released, sent)

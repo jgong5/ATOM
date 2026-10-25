@@ -19,8 +19,8 @@ is a final chunk.
 Under a drafter of `drafts` tokens a decode step verifies `drafts` and one in
 each row, and a step also reads its drafter's graph, `graph(..., draft=True)`,
 the work ATOM queues after `forward_done_event` on a step that samples, else
-from its first draft pass on: its prices are terms named ``draft op.<kind>``,
-each tagged draft. Sampling is the target's. A decode's drafter is read at its
+from its first draft pass on: its prices are its `draft_terms`, named
+``draft op.<kind>``. Sampling is the target's. A decode's drafter is read at its
 rows run at the step's width: its first pass runs the rows' tokens unpadded.
 A target that replays no graph yet pads past its rows (`target_bs`) is read
 at that width, `W=`: an eager decode's model, a sampling prefill's LM head.
@@ -360,7 +360,7 @@ class OpGraphBackend(CostBackend):
             got = how.setdefault(name, ([], []))
             got[0].extend(origins)
             got[1].extend(declined)
-        terms = []
+        terms: dict[bool, list[CostTerm]] = {False: [], True: []}
         for name, values in seconds.items():
             note = "; ".join(dict.fromkeys(stated[name]))
             method = Method.DECLARED if note else Method.ANALYTICAL
@@ -385,8 +385,8 @@ class OpGraphBackend(CostBackend):
                 validated=validated,
             )
             by = fold_parts(parts[name])
-            terms.append(CostTerm(name, fold_seconds(values), provenance, drafted, by))
-        cost = StepCost(terms)
+            terms[drafted].append(CostTerm(name, fold_seconds(values), provenance, by))
+        cost = StepCost(terms[False], draft_terms=terms[True])
         if graph is not None:
             composed = self._graphs.get(graph, (0, 0, {}))[2]
             if len(composed) >= COMPOSED:

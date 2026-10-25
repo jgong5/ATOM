@@ -232,7 +232,7 @@ def test_a_step_past_the_end_of_the_real_record_ends_the_run_by_name(
     directory, _ = real
     path = directory / "dp0.jsonl"
     path.write_text("".join(path.read_text().splitlines(keepends=True)[:3]))
-    why = f"replay: {path} has 2 steps, and this is step 2"
+    why = f"replay: {directory} stage 0 dp0 has 2 steps, and this is step 2"
     with pytest.raises(RunnerRefusal, match=f"^{re.escape(why)}$"):
         _run(tmp_path / "sim", monkeypatch, replay=directory)
 
@@ -293,7 +293,9 @@ def test_a_worker_that_replays_past_its_record_names_why_in_the_engine_hand_in(
         raise SystemExit()
 
     hand_in = tmp_path / compass_run.LP_FILE.format(compass_run.ENGINE.name)
-    why = RunnerRefusal(f"replay: {path} has 2 steps, and this is step 2")
+    why = RunnerRefusal(
+        f"replay: {directory} stage 0 dp0 has 2 steps, and this is step 2"
+    )
     assert json.loads(hand_in.read_text())["refusals"] == [
         f"ended:engine raised SystemExit(); rank 0 raised {why!r}"
     ]

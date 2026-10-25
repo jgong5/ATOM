@@ -12,11 +12,16 @@ The run test needs a driver and `ATOM_COMPASS_SLICE_MODEL`, as in
 `test_vertical_slice`; the rest run anywhere.
 """
 
+import copy
+import dataclasses
 import json
+import math
+import pickle
 import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 from test_dp_slice import (  # noqa: F401
     DP_MACHINE,
     MAX_TOKENS,
@@ -24,12 +29,13 @@ from test_dp_slice import (  # noqa: F401
     device_classes_put_back,
     run_dp_slice,
 )
-from test_vertical_slice import CONSTANT, NEEDS_A_RUN, _run_file
+from test_vertical_slice import CONSTANT, MODEL, NEEDS_A_RUN, _run_file
 
 from atom.compass import run as compass_run
+from atom.compass.backends.step_stub import Coefficients
 from atom.compass.clock import LpId, single_engine_table
 from atom.compass.detect.determinism import StepTable
-from atom.compass.detect.scenario import check_run, pipeline_timeline
+from atom.compass.detect.scenario import check_run, pipeline_timeline, stage_timelines
 from atom.compass.runner import pp_send
 from atom.compass.runner.overrides import start_on_host
 from atom.compass.spec import MachineSpec, SpecRefusal
@@ -54,13 +60,34 @@ def pipeline(request, tmp_path_factory):
     ]
 
 
+def _model_sends():
+    """The slice model's layer count, and a stage's send of a `tokens`-row
+    forward as the runner sizes it: the size and the pickled metadata on gloo,
+    `hidden_states` and `residual` on RCCL."""
+    from atom.config import get_hf_config
+    from atom.distributed import pp_comm
+
+    hf = get_hf_config(MODEL)
+    dtype = getattr(hf, "dtype", None) or torch.bfloat16
+
+    def parts(tokens):
+        x = torch.empty(tokens, hf.hidden_size, dtype=dtype, device="meta")
+        meta, tensors = pp_comm._split_tensor_dict({"hidden_states": x, "residual": x})
+        rccl = [("rccl", t.nbytes) for t in tensors]
+        return [("gloo", 8), ("gloo", len(pickle.dumps(meta))), *rccl]
+
+    return hf.num_hidden_layers, parts
+
+
 @NEEDS_A_RUN
 def test_a_pipeline_meets_the_run_properties_and_uses_every_stage_channel(pipeline):
     pp, runs = pipeline
     print(f"\n{runs[0]['table']}")
-    failed = check_run(
-        [r["out"] for r in runs], MAX_TOKENS, [line for _, line in runs[0]["events"]]
-    )
+    sends, out = _model_sends(), [r["out"] for r in runs]
+    taken = [line for _, line in runs[0]["events"]]
+    failed = check_run(out, MAX_TOKENS, taken, {"engine": out[0] / "parity"}, sends)
+    # Each seed's stages against its own record.
+    failed += check_run(out[1:], records={"engine": out[1] / "parity"}, pipeline=sends)
     assert not failed, "\n".join(failed)
     rows = [line.split() for line in runs[0]["table"].splitlines()[1:]]
     released = {r[4] for r in rows if r[3] == "release"}
@@ -202,6 +229,111 @@ def test_the_pipeline_check_holds_a_stage_to_the_release_of_its_input():
     at_batch = ("engine-pp1", 1.0 + IPC, 1.8, "TAR")
     failed = pipeline_timeline(_two_stage_table(sent_early, ACKED, at_batch))
     assert failed == [sent_before]
+
+
+#: A machine whose every PP part is rendezvous, `T` for 8 bytes once its
+#: receive is posted, `L` ahead on ``pp_data``. A host blocked on an ack goes on
+#: `WAKE` x (1 - exp(-idle / `RISE`)) after it, idle the pair's since the last.
+L, T = 2.0**-10, 2.0**-8 + 2.0**-17
+WAKE, RISE = 2.0**-12, 2.0**-6
+ROUND = copy.deepcopy(DP_MACHINE)
+ROUND["interconnect"]["intra_node"]["pp"] = {
+    c: {
+        "eager_threshold_bytes": 0,
+        "latency_s": L,
+        "overhead_s": 2.0**-20,
+        "per_byte_s": 2.0**-20,
+        "rendezvous_fixed_s": 2.0**-8,
+    }
+    for c in ("rccl", "gloo")
+}
+ROUND["interconnect"]["intra_node"]["pp"]["gloo"] |= {
+    "wake_s": WAKE,
+    "wake_rise_s": RISE,
+}
+#: One request's prefill, then its decode: half the stub's 2**-3 s and 2**-4 s
+#: on each stage, with ``meta`` and ``tokens`` 2**-6 s ahead.
+STEPS = [
+    {"batch": [["r", 4, 4]], "rows": [[4, 4, False]], "produces_output": True},
+    {"batch": [["r", 1, 5]], "rows": [[1, 5, True]], "produces_output": True},
+]
+P, D, IPC6 = 2.0**-4, 2.0**-5, 2.0**-6
+META1, TOKENS = "engine-pp0->engine-pp1:meta#pp1", "engine-pp1->engine-pp0:tokens"
+#: The last stage posts each receive at its batch's ``meta``; its tensors leave
+#: at the head's device end; it ends its device work and sends the tokens. The
+#: head flushes its send on the ack, wakes, and starts forward 1 on the tokens;
+#: its first wake is the whole `WAKE`, no send having completed before.
+TOK0 = 1 + P + T + P + IPC6
+TOK1 = TOK0 + D + T + D + IPC6
+ACK1 = TOK0 + IPC6 + T
+
+
+def _woken(idle):
+    return WAKE * -math.expm1(-idle / RISE)
+
+
+ROWS = [
+    ("engine-pp0", 1.0, 1.0, "TAR"),
+    ("engine-pp1", 0.0, 1 + L, "release", DATA, 0),
+    ("engine-pp1", 1 + L, 1 + IPC6, "release", META1, 0),
+    ("engine-pp0", 1.0, 1 + IPC6 + T, "release", ACK, 0),
+    ("engine-pp0", 1 + IPC6 + T, 1 + IPC6 + T + WAKE, "TAR"),
+    ("engine-pp1", 1 + IPC6, 1 + P + T + P, "TAR"),
+    ("engine-pp0", 1 + IPC6 + T, TOK0, "release", TOKENS, 0),
+    ("engine-pp0", TOK0, TOK0, "TAR"),
+    ("engine-pp1", 1 + P + T + P, TOK0 + L, "release", DATA, 1),
+    ("engine-pp1", TOK0 + L, TOK0 + IPC6, "release", META1, 1),
+    ("engine-pp0", TOK0, ACK1, "release", ACK, 1),
+    ("engine-pp0", ACK1, ACK1 + _woken(ACK1 - (1 + IPC6 + T)), "TAR"),
+    ("engine-pp1", TOK0 + IPC6, TOK1 - IPC6, "TAR"),
+    ("engine-pp0", ACK1, TOK1, "release", TOKENS, 1),
+]
+
+
+def _computed(i=None, row=None) -> list[str]:
+    """`stage_timelines` on `ROWS`, with `row` in place of row `i`; each stage
+    runs one layer of two."""
+    run = {
+        "admission_path": "serving",
+        "ipc_s": IPC6,
+        "stream_s": IPC6,
+        "pipeline_parallel_size": 2,
+        "machine": ROUND,
+        "step_stub": dataclasses.asdict(Coefficients.constant(2 * P, 2 * D)),
+    }
+    table = StepTable(json.dumps(run))
+    for k, r in enumerate(ROWS):
+        table.record(*(row if k == i else r))
+    return stage_timelines(
+        table.text(), "engine", [STEPS, STEPS], 2, lambda _: [("gloo", 8), ("rccl", 8)]
+    )
+
+
+def test_each_stages_rows_are_computed_from_its_forwards_and_the_carriers():
+    assert _computed() == []
+    implied = f"the pipeline implies {ROWS[5][1:3]}"
+    # The send priced 0 s: the last stage's prefill ends at the head's device end.
+    free = ("engine-pp1", 1 + IPC6, 1 + P + P, "TAR")
+    assert _computed(5, free) == [f"engine-pp1: TAR row 0 is {free[1:3]}; {implied}"]
+    # The last stage running the whole model's prefill.
+    whole = ("engine-pp1", 1 + IPC6, 1 + P + T + 2 * P, "TAR")
+    assert _computed(5, whole) == [f"engine-pp1: TAR row 0 is {whole[1:3]}; {implied}"]
+    # The head's forward 1 launched with forward 0's tokens still in flight.
+    early = ("engine-pp0", TOK0 - D, TOK0 - D, "TAR")
+    assert _computed(7, early) == [
+        f"engine-pp0: TAR row 2 is {early[1:3]}; the pipeline implies {(TOK0, TOK0)}"
+    ]
+    # Forward 1's tokens a decode stub late.
+    late = ("engine-pp0", ACK1, TOK1 + 2 * D, "release", TOKENS, 1)
+    assert _computed(13, late) == [
+        f"{TOKENS} seq 1 is {(TOK1 + 2 * D,)}; the pipeline implies {(TOK1,)}"
+    ]
+    # The head's second wake over its block on ack 1, not the pair's idle
+    # since ack 0.
+    block = ("engine-pp0", ACK1, ACK1 + _woken(ACK1 - TOK0), "TAR")
+    assert _computed(11, block) == [
+        f"engine-pp0: TAR row 3 is {block[1:3]}; the pipeline implies {ROWS[11][1:3]}"
+    ]
 
 
 def test_a_run_file_stating_a_pipeline_the_deployment_does_not_run_is_refused(

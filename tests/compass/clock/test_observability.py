@@ -2,8 +2,11 @@
 """`atom.compass.clock.observability` over the Clock Authority's real replies.
 
 * **The timeline**: off by default, the same replies on and off, no log call
-  when off, one record per reply in issue order, and the recovery marker on
-  exactly the replies the recovery branch issued.
+  when off, one record per reply in issue order, the recovery marker on
+  exactly the replies the recovery branch issued, and every released message
+  and every logged send in exactly one record.
+* **The stall diagnostic**: the serve loop logs one LP table per stall, counts
+  it, keeps waiting and aborts nothing; each runtime counts its own.
 * **The dump** renders `lp_table()` and nothing else, with the binding term
   marked, and no term marked when none is finite.
 * **The summary**: the schedule half is identical under every submit order, a
@@ -12,8 +15,12 @@
 """
 
 import json
+import logging
 import math
 import re
+import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,6 +37,8 @@ from atom.compass.clock import (
     lp_table_dump,
     single_engine_table,
 )
+from atom.compass.clock_transport import connect, service
+from atom.utils.compass_loop import Station
 from tests.compass.clock.test_grant_rule import (
     PICKS,
     SEEDS,
@@ -39,6 +48,7 @@ from tests.compass.clock.test_grant_rule import (
     _table,
     _two_way,
 )
+from tests.compass.clock.test_lp_runtime import ENGINE, REQ, _receiver, _runtime
 
 A, B, C = LpId("a"), LpId("b"), LpId("c")
 INF = math.inf
@@ -192,6 +202,145 @@ def test_the_finish_records_one_reply_per_lp_from_the_clock_it_finished_at():
     assert [row.now for row in ca.lp_table()] == [INF, INF, INF]
 
 
+def test_every_released_message_and_every_logged_send_is_in_exactly_one_record():
+    for seed in SEEDS:
+        replies, _, ca = _drive(seed, PICKS["shuffled"], cls=_Logged, shuffle=3)
+        records = ca.timeline.records()
+        released = sorted(m for r in records for m in r.released)
+        sent = sorted(m for r in records for m in r.sent)
+        got = sorted(m for rs in replies.values() for _, ms in rs for m in ms)
+        assert released == got == sent, seed
+        assert len(dict.fromkeys(released)) == len(released), seed
+        assert released, seed
+        for r in records:
+            assert all(ca._channels.channel(c).target == r.lp for c, *_ in r.released)
+            assert all(ca._channels.channel(c).source == r.lp for c, *_ in r.sent)
+
+
+def test_a_reply_lists_what_it_released_and_what_its_request_sent():
+    ca = ClockAuthority(_two_way(0.0), TimelineLog())
+    ca.on_request(A, TAR, 10.3, [])
+    ca.on_request(B, TAR, 10.3, [])
+    ca.on_request(A, NER, INF, [("a->b:m", 0, 10.3)])
+    ca.on_request(B, NER, INF, [])
+    message = ("a->b:m", 0, 10.3)
+    assert [(str(r.lp), r.released, r.sent) for r in ca.timeline.records()] == [
+        ("a", (), ()),
+        ("b", (message,), ()),
+        ("a", (), (message,)),
+        ("b", (), ()),
+    ]
+
+
+# --- the stall diagnostic ----------------------------------------------------
+
+DIAG_S = 0.05
+
+
+def _recv(conn):
+    """`conn.recv()`, failing rather than hanging when no reply comes."""
+    box = []
+    reader = threading.Thread(target=lambda: box.append(conn.recv()), daemon=True)
+    reader.start()
+    reader.join(10.0)
+    assert box, "no reply within 10 s"
+    return box[0]
+
+
+def _until(predicate):
+    for _ in range(1000):
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("not within 10 s")
+
+
+def _stalls(caplog):
+    return [r.getMessage() for r in caplog.records if "no request for" in r.message]
+
+
+def test_a_stall_of_three_diag_s_periods_is_one_diagnostic_and_no_abort(caplog):
+    ca = ClockAuthority(_two_way(0.5))
+    server = service.serve(ca, "inproc:stall", DIAG_S)
+    try:
+        a, b = connect(A, "inproc:stall"), connect(B, "inproc:stall")
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            a.send((NER, INF, [], INF))
+            b.send((TAR, 1.0, [], INF))
+            assert _recv(b)[0] == 1.0
+            # b now runs outside the authority and sends nothing; a waits on it.
+            _until(lambda: ca.diagnostics)
+            time.sleep(3 * DIAG_S)
+            stalled = ca.diagnostics
+            b.send((NER, INF, [], INF))
+            ends = [_recv(a)[0], _recv(b)[0]]
+    finally:
+        server.close()
+    aborts = 0  # a ClockAbort would have raised at `_recv`
+    assert (stalled, aborts) == (1, 0)
+    assert ends == [INF, INF] and ca.final_clocks is not None
+    (dump,) = _stalls(caplog)
+    assert "a NER now 0.0s target inf" in dump and "b running now 1.0s" in dump
+
+
+def test_a_stall_is_logged_again_only_after_a_request_and_never_before_all_ask(
+    caplog,
+):
+    ca = ClockAuthority(_two_way(0.5))
+    server = service.serve(ca, "inproc:rearm", DIAG_S)
+    try:
+        a, b = connect(A, "inproc:rearm"), connect(B, "inproc:rearm")
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            a.send((NER, INF, [], INF))
+            time.sleep(3 * DIAG_S)  # b has not asked yet: still starting
+            before_all_ask = ca.diagnostics
+            b.send((TAR, 1.0, [], INF))
+            _recv(b)
+            _until(lambda: ca.diagnostics == 1)
+            b.send((TAR, 2.0, [], INF))
+            _recv(b)
+            _until(lambda: ca.diagnostics == 2)
+            b.send((NER, INF, [], INF))
+            assert [_recv(a)[0], _recv(b)[0]] == [INF, INF]
+            time.sleep(3 * DIAG_S)  # finished: nothing is waiting
+    finally:
+        server.close()
+    assert (before_all_ask, ca.diagnostics, len(_stalls(caplog))) == (0, 2, 2)
+
+
+def test_a_client_run_counts_the_stalls_printed_during_it():
+    table = single_engine_table(admission_path="serving", ipc_s=1.0e-4, stream_s=2.0e-3)
+    engine, frontend, traffic = table.registry.ids()
+    ca = ClockAuthority(table, client=traffic, client_runs=2)
+    for stalls in (2, 1):
+        ca.on_request(engine, NER, INF, [])
+        ca.on_request(frontend, NER, INF, [])
+        ca.diagnostics += stalls
+        ca.on_request(traffic, NER, INF, [])
+    assert [run.diagnostics for run in ca.ended] == [2, 1]
+    assert ca.diagnostics == 3 and ca.final_clocks is not None
+
+
+def test_a_runtime_counts_its_unhandled_release_diagnostic():
+    rt, call = _runtime(ENGINE, (10.2, {REQ: [(0, 10.1)]}), diag_s=DIAG_S)
+    _receiver(rt, REQ, 1, [], hold=lambda: time.sleep(6 * DIAG_S))
+    call(rt.advance_to, 10.2)
+    assert rt.diagnostics == 1
+
+
+def test_a_station_wait_counts_its_diagnostic_in_the_installed_runtime(monkeypatch):
+    rt = SimpleNamespace(diagnostics=0)
+    monkeypatch.setattr("atom.utils.clock._installed", rt)
+    st = Station(1, diag_s=DIAG_S)
+    first, second = st.enqueue(0.0), st.enqueue(0.0)
+    st.finish(second)
+    late = threading.Timer(6 * DIAG_S, st.finish, (first,))
+    late.start()
+    st.start_of(second)
+    late.join()
+    assert rt.diagnostics == 1
+
+
 # --- the dump ----------------------------------------------------------------
 
 
@@ -336,6 +485,19 @@ def test_the_by_value_fields_land_in_their_halves():
     assert (cost["lazy_traces"], cost["lazy_trace_wall_seconds"]) == (7, 1.5)
     assert cost["diagnostics"] == 2
     assert (schedule["stragglers"], schedule["clock_lint"]) == (0, "passed")
+
+
+def test_a_clean_run_ended_by_end_workload_and_a_raise_by_what_raised():
+    _, _, ca = _drive(5, PICKS["name order"])
+    assert RunSummary.of(ca, 0.1).schedule_record()["ended_by"] == "end_workload"
+    raised = "engine raised Straggler('frontend->engine:request seq 3 arrives at 1.5')"
+    tally = RefusalTally.of(["cost:no price", f"ended:{raised}"], steps=4)
+    assert RunSummary.of(ca, 0.1, refusals=tally).schedule_record()["ended_by"] == (
+        raised
+    )
+    running = ClockAuthority(_two_way(0.5))
+    running.on_request(A, TAR, 0.4, [])
+    assert RunSummary.of(running, 0.1).ended_by is None
 
 
 def test_refusals_tally_under_their_source_and_the_fractions_count_cost_only():

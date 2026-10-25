@@ -30,7 +30,7 @@ The form, declared rather than derived:
 plus one term per collective the deployment's widths make possible. A step
 carrying both kinds of work is priced as both and pays both intercepts, because
 a step that did both launched both. A `draft_step` above 0 adds one
-term tagged `draft` to every step, the speculative drafter's device work after
+drafter term (`draft_terms`) to every step, the speculative drafter's device work after
 the target's; at 0 there is none, and a speculative run refuses each step.
 
 A tensor-parallel all-reduce runs once per layer this worker holds, so its
@@ -76,7 +76,6 @@ be read back as one that did.
 
 from __future__ import annotations
 
-import dataclasses
 import math
 from dataclasses import dataclass, fields
 
@@ -384,9 +383,7 @@ class StepStubBackend(CostBackend):
                 ),
             ]
         terms = [self._term(*row) for row in counted]
-        if c.draft_step:
-            draft = self._term("draft.step", 1, c.draft_step)
-            terms.append(dataclasses.replace(draft, draft=True))
+        drafts = [self._term("draft.step", 1, c.draft_step)] if c.draft_step else []
         collectives = self.parallelism.collectives()
         if collectives:
             # The constructor refuses a candidate collective with no depth
@@ -409,7 +406,7 @@ class StepStubBackend(CostBackend):
                         qualifier,
                     )
                 )
-        return StepCost(terms)
+        return StepCost(terms, draft_terms=drafts)
 
     def all_gather_s(self, rows: int) -> float:
         """One TP all-gather of a `rows`-row tensor, as a pipeline stage runs on

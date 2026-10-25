@@ -239,7 +239,8 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     `running_bs`, on any step, when it declares a draft graph, else at the
     rows (`draft_bs`), where the gather carries each rank's rows (`draft_rows`):
     every rank decoding, its tokens over a row's query, every row's alike; else
-    at least the widest rank's rows and one each peer, an idle one's dummy.
+    at least the widest rank's rows and one each peer, an idle one's dummy. A
+    drafter of one draft (`mtp_k`) has no later passes.
 
     A target that replays no graph pads to it too (`target_bs`): an eager
     decode every rank decodes in, its inputs; a sampling prefill, its LM head.
@@ -263,7 +264,7 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
             moe_rows = gathered
         if drafter is not None and not drafter.is_block_drafter:
             draft_moe_rows = gathered
-            if draft_bs is None:
+            if draft_bs is None and drafter.mtp_k > 1:
                 draft_rows = (
                     gathered // int(batch.num_scheduled_tokens[0])
                     if mode.running_tokens_are_unified

@@ -310,14 +310,16 @@ class PPEngineCoreProc(EngineCore):
 
         # Mooncake's send already has PP-wide completion semantics. Report it
         # independently of saves: the scheduler owns the joint release barrier,
-        # including suffix saves that have not been dispatched yet.
+        # including suffix saves that have not been dispatched yet. Every poll's,
+        # empty included, as `EngineCore._poll_kv_transfer_progress` passes it:
+        # a connector's `process_completions` may have work its workers did not
+        # report.
         non_offload = KVConnectorOutput(
             finished_sending=kvoutput.finished_sending,
             finished_recving=kvoutput.finished_recving,
             failed_recving=kvoutput.failed_recving,
         )
-        if not non_offload.is_empty():
-            self.scheduler._update_from_kv_xfer_finished(non_offload)
+        self.scheduler._update_from_kv_xfer_finished(non_offload)
 
         # Offload fields go through PP aggregator.
         has_offload = (

@@ -631,7 +631,7 @@ def _dpa_main(argv, bench, tmp_path, monkeypatch, config):  # noqa: F811
     monkeypatch.setattr(ops, "graph", lambda *a: graph)
     monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
     monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
-    monkeypatch.setattr(ops, "_replay", lambda fn, calls: [1.0] * ops.REPEATS)
+    monkeypatch.setattr(ops, "_replay", lambda fn, calls, *_: [1.0] * ops.REPEATS)
     argv += ["--width", "2", "--context", "20", "--llc-mib", "1", "--gpu", "0"]
     argv += ["--store", root, "--out", str(tmp_path / "out")]
     tp = str(config.tensor_parallel_size)

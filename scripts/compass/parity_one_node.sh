@@ -28,7 +28,7 @@
 #                    each stage is replayed from its own record and compared in
 #                    compare-pp<k>.json: the head's batches are the scheduler's
 #                    decisions, a later stage's the batches the head sent it.
-#   MODEL           model directory with its weights (required)
+#   MODEL            model directory with its weights (required)
 #   REQUESTS         requests in the workload (default 64)
 #   GAP_S            seconds between sends, each also waiting for the server to
 #                    admit the one before; 0 sends them back to back (default
@@ -39,8 +39,8 @@
 #   LONG_TOKENS      output tokens request 0 asks for, to keep one request (and
 #                    under LMCACHE its server session) alive for long (default
 #                    0: its usual count)
-#   MACHINE          machine spec (tp2's and tp2-plain's default scripts/compass/machines/mi308x-hjbog18.json,
-#                    pp2's mi308x-hjbog39.json, the MI308X spec that states PP carriers)
+#   MACHINE          machine spec (default scripts/compass/machines/mi308x-hjbog18.json,
+#                    node 18's, PP carriers included; dsv4-dpa8 has no default)
 #   STORE            artifact store holding the simulated configuration's memory
 #                    readings, taken by `compass measure memory`. Unset, the
 #                    script takes them first into OUT_DIR/store: `compass measure
@@ -83,11 +83,10 @@ compass_env "$ROOT"
 compass_require_tree "$ROOT" || exit $?
 OUT=${1:?usage: parity_one_node.sh OUT_DIR}
 MODEL=${MODEL:?MODEL names the model directory}
-DPA=--enable-dp-attention SIDES=. PP=1
+DPA=--enable-dp-attention SIDES=. PP=1 PPA=
 case ${CONFIG:=tp2} in
 tp2 | tp2-plain | dp-two-trees)
     TP=2 ARGS="--enforce-eager --max-model-len 8192 --no-enable_prefix_caching"
-    MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
     [[ $CONFIG == tp2-plain ]] && DPA=
     ;;
 dsv4-dpa8)
@@ -99,14 +98,13 @@ dsv4-dpa8)
 rapidserve)
     TP=1 DPA= ARGS="--enforce-eager --level 0 --max-model-len 8192 --no-enable_prefix_caching"
     ARGS+=" --enable-rapidserve" SIDES="prefill decode"
-    MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
     ;;
 pp2)
-    TP=1 DPA= PP=2 ARGS="--enforce-eager --level 0 --max-model-len 8192 --no-enable_prefix_caching"
-    MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog39.json}
+    TP=1 DPA= PP=2 PPA="-pp 2" ARGS="--enforce-eager --level 0 --max-model-len 8192 --no-enable_prefix_caching"
     ;;
 *) echo "parity_one_node: CONFIG is tp2, tp2-plain, dp-two-trees, dsv4-dpa8, rapidserve or pp2, not $CONFIG" >&2; exit 2 ;;
 esac
+MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
 TREES=1 MEASURE_DP=
 if [[ $CONFIG == dp-two-trees ]]; then
     TREES=2 MEASURE_DP="--data-parallel-size 2"
@@ -116,8 +114,7 @@ if [[ $CONFIG == dp-two-trees ]]; then
         exit 2
     }
 fi
-SERVER_ARGS=${SERVER_ARGS:-$ARGS} PPA=
-((PP == 1)) || PPA="-pp $PP"
+SERVER_ARGS=${SERVER_ARGS:-$ARGS}
 WAIT_S=${WAIT_S:-1800}
 ALONE=${ALONE:-0} GAP=0.05
 [[ $ALONE == 1 ]] && GAP=0.25
@@ -196,12 +193,14 @@ print(p)')
         sleep 1
     done
 }
-# leave SIDE: wait up to WAIT_S for every server to exit.
+# leave SIDE: wait up to WAIT_S for every server, and the authority, to exit.
 leave() {
-    local deadline=$((SECONDS + WAIT_S)) pid
-    for pid in "${servers[@]}"; do
+    local deadline=$((SECONDS + WAIT_S)) pid what
+    for pid in "${servers[@]}" $authority; do
+        what="a $1 server"
+        [[ $pid == "$authority" ]] && what="the authority"
         while kill -0 "$pid" 2>/dev/null; do
-            ((SECONDS < deadline)) || { echo "parity_one_node: a $1 server is still up" >&2; exit 1; }
+            ((SECONDS < deadline)) || { echo "parity_one_node: $what is still up" >&2; exit 1; }
             sleep 1
         done
     done
