@@ -173,6 +173,9 @@ class LPRuntime:
 
     def end_run(self) -> None:
         self.in_run = False
+        with self.lock:  # a frame held for the run's end is ready now
+            for w in self.wakes.values():
+                w.set()
 
     # ---- clock owner ----
 
@@ -390,6 +393,16 @@ class LPRuntime:
         """Caller holds `lock`."""
         return seq in self.released[ch]
 
+    def holds_unstamped(self) -> bool:
+        """Caller holds `lock`. In the run, a frame sent outside it, a sender's
+        shutdown, waits until no frame a thread channel brought is unhandled:
+        the grant that ends the run releases any still held back."""
+        return self.in_run and any(
+            self.arrived[ch] - self.handled[ch]
+            for ch in self.arrived
+            if self.table.recv_mode(ch) is ReceiveMode.THREAD
+        )
+
     def handed_over(self, ch: str, seq: int) -> None:
         with self.lock:
             self.taken_by[threading.current_thread()] = (ch, seq)
@@ -421,7 +434,8 @@ class WrappedSocket:
 
     The header is its own frame: first, or after the identity frame on a ROUTER.
     Frames read are held back until the runtime releases them, then handed over
-    in ``(arrival, seq)`` order; frames sent outside the run pass straight through.
+    in ``(arrival, seq)`` order; frames sent outside the run pass straight through,
+    in the run only once `LPRuntime.holds_unstamped` lets them.
     A socket that several LPs send to receives each of `more`'s channels too.
     """
 
@@ -469,8 +483,11 @@ class WrappedSocket:
 
     def _first_ready(self) -> int | None:
         with self.rt.lock:
+            held = self.rt.holds_unstamped()
             for k, (ch, arrival, seq, _) in enumerate(self.buf):
-                if arrival is None or self.rt.is_released(ch, seq):
+                if (arrival is None and not held) or (
+                    arrival is not None and self.rt.is_released(ch, seq)
+                ):
                     return k
         return None
 
