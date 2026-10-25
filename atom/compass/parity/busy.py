@@ -45,8 +45,11 @@ RECORD = "steps/dp0.jsonl"
 GPU = ("kernel", "gpu_memcpy", "gpu_memset")
 RUNTIME = ("cuda_runtime", "cuda_driver")
 #: A kernel whose name matches is a TP collective: aiter's custom all-reduce
-#: and all-gather, and RCCL's.
-COLLECTIVE = re.compile(r"cross_device_reduce|allgather|all_gather|all_?reduce|nccl")
+#: and all-gather, RCCL's, and the mono runner's step-begin peer fence, which
+#: holds each rank until every rank has launched it.
+COLLECTIVE = re.compile(
+    r"cross_device_reduce|allgather|all_gather|all_?reduce|nccl|mono_step_begin"
+)
 PROPOSE = MARK + "d_propose_ns"
 #: Characters read from a trace at a time.
 CHUNK = 1 << 24
