@@ -638,6 +638,21 @@ def test_a_plan_finds_a_step_its_points_hold_on_a_line_where_the_kind_steps_else
     assert len(at) > 1
     for shape, contexts in at.items():
         assert {2500, 2501} <= contexts, shape
+    # A ragged line is halved where it bends, not where only its kind steps.
+    ragged = {r["context"][0] for r in records if isinstance(r["context"], list)}
+    assert ragged and 2501 not in ragged
+
+
+def test_a_plan_over_rows_alike_measures_no_ragged_point(bench, tmp_path):
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 3000, True], [1, 3000, True]], 2),
+        ([[1, 12000, True]], 1),
+    )
+
+    records = _plan(bench, tmp_path, population)
+
+    assert not [r for r in records if isinstance(r["context"], list)]
 
 
 @pytest.mark.parametrize(
