@@ -1928,7 +1928,10 @@ fails, `num_computed_blocks = 0`, a full transfer, so a blob carrying only the t
 never takes the incremental path. The simulated consumer applies the page rule in
 `atom/compass/kv/connector.py::SimulatedKVConnectorScheduler._pages_line_up` and the
 other two checks in its `update_state_after_alloc`, then prices the consumer blocks left.
-It does not model `src_block_skip_factor`.
+It does not model `src_block_skip_factor`, and needs no term for it: the factor only picks
+which producer blocks fill the consumer's, and the blocks left are Mooncake's
+`dst_block_ids`, priced at decode's own `TransferModel.bytes_per_block`
+(`tests/compass/test_kv_mooncake_per_req_cache.py::test_an_unsharded_producer_into_dcp2_is_priced_on_mooncakes_slices`).
 
 `tests/compass/test_kv_blob_site.py` holds the one-site claim above. Nothing re-checks
 the field sets: they describe the connectors' code as read at `faab717bc`, and where the
