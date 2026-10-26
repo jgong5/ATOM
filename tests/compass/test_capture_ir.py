@@ -481,3 +481,14 @@ def test_tp2_leaves_its_stand_ins_copies_out_and_says_so(tmp_path_factory):
         left_out[op["why"]].append(op["op"])
     assert set(left_out) == {"h2d", "host", "stand-in", "step-crossing"}
     assert left_out["stand-in"].count("aten.copy_.default") == 2
+
+
+def test_one_function_in_two_files_has_two_sites():
+    source = "import sys\n\ndef embed():\n    return sys._getframe()\n"
+    sites = []
+    for name in ("one.py", "two.py"):
+        scope = {}
+        exec(compile(source, name, "exec"), scope)  # noqa: S102
+        sites.append(forward._where(scope["embed"]()))
+
+    assert sites == ["one.py:4 in embed", "two.py:4 in embed"]
