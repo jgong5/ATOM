@@ -81,9 +81,10 @@ run, naming the shape),
 modules `run.modules.walk` reads off the meta build), ``padding`` (optional:
 ``none`` prices a replayed graph's real rows in place of the rows it pads to,
 which ``executed``, the default, prices),
-``on_refusal`` (optional: ``mark``, the default, prices each term no cost source
-answers at 0 s, hands in its ``cost:`` reason and continues; ``abort`` ends
-the run there, which still writes the summary),
+``on_refusal`` (optional: ``mark``, the default, charges a step the cost
+backend refuses no device time, its answered terms included, and a segment the
+host laws refuse 0 s, hands in its ``cost:`` reason and continues; ``abort``
+ends the run there, which still writes the summary),
 ``client_runs`` (optional: how many client runs the server serves, one traffic
 LP after another, 1 when absent and ``null`` for no limit; each ends when no
 essential work is left, and the last one's end finishes the run),
