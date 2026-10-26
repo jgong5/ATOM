@@ -321,6 +321,14 @@ FORMS_THAT_STAY_QUIET = {
     "dict-pop": "def f(d, k):\n    return d.pop(k)\n",
     "str-of-list": "def f(rows):\n    xs = list(rows)\n    return str(xs)\n",
     "log-of-a-count": 'def f(s: set[str], log):\n    log.info("ready=%d", len(s))\n',
+    "class-name-nested-in-a-class": (
+        "class O:\n"
+        "    class A:\n"
+        "        members = {1, 2}\n"
+        "\n"
+        "        def g(self):\n"
+        "            return list(A.members)\n"
+    ),
     "class-name-rebound": (
         "class A:\n    members = {1, 2}\n\n\nA.members = sorted(A.members)\n\n\n"
         "def f():\n    return list(A.members)\n"

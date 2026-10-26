@@ -65,8 +65,9 @@ of what Python allows.** It is short on both sides of the two recognitions.
 A set it does not recognise: one returned by a call this module does not itself
 annotate, or by one defined in another module; one arriving in an unannotated
 parameter; one pulled out of a list, a dict or a tuple; any subclass of `set`;
-one read through `cls`, `type(self)` or an outer class, as `Outer.Inner.members`;
-one bound under `global` or `nonlocal`, which is written down in the scope holding
+one read through `cls` or `type(self)`; one read through the name of a class
+nested in another class, of a class from another module, or of a subclass, as
+`B.members` for `class B(A)`; one bound under `global` or `nonlocal`, which is written down in the scope holding
 the statement rather than the one it names; one bound by a paired unpacking, as
 `a, b = set(x), set(y)`, or only by `s |= ...`; and a name that is also bound,
 anywhere in the same scope, to something the pass cannot see as a set -- by an
@@ -573,11 +574,14 @@ def _owner(scope, name: str):
     """Where a name is written down. `self.x` belongs to its class, not its method.
 
     `A.x` read inside `A` belongs where `A` itself is bound, which is where it
-    is read from outside `A` as well.
+    is read from outside `A` as well. A class bound in another class's body is
+    not visible from its own methods, so it is left where it is.
     """
     head, _, _ = name.partition(".")
     if head != name and ("class", head) in scope:
-        return scope[: scope.index(("class", head))]
+        index = scope.index(("class", head))
+        if not index or scope[index - 1][0] != "class":
+            return scope[:index]
     if not name.startswith("self."):
         return scope
     for depth in range(len(scope), 0, -1):
