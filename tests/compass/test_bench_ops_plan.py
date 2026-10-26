@@ -656,6 +656,54 @@ def test_a_plan_over_rows_alike_measures_no_ragged_point(bench, tmp_path):
 
 
 @pytest.mark.parametrize(
+    "rows, cut",
+    [
+        ([[1, 1000, True], [1, 4000, True]], None),
+        ([[1, 3000, True], [1, 3000, True]], [[1, 600, True], [1, 416, True]]),
+    ],
+    ids=["planned-ragged", "planned-uniform"],
+)
+def test_a_uniform_decode_point_past_the_pool_refuses_only_in_a_plan_over_ragged_rows(
+    bench, tmp_path, monkeypatch, rows, cut
+):
+    monkeypatch.delenv(ops.RAGGED, raising=False)
+    seen = set()
+
+    def child(fn, config, todo, llc):
+        seen.add(os.environ.get(ops.RAGGED))
+        return _bench(fn, config, todo, llc)
+
+    monkeypatch.setattr(ops, "_child", child)
+    _plan(bench, tmp_path, _records(tmp_path / "plan", (rows, 2)))
+    # each measuring process times a point under the environment the plan gave it
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    x = ("self", _t([2, 3], "activation"))
+    neg, gather = (
+        ops.leaves(_graph(_leaf(name, x), layers=1)["region"])
+        for name in (
+            "aten.neg.default",
+            "_c10d_functional.all_gather_into_tensor.default",
+        )
+    )
+    [env] = seen
+    with patch.dict(os.environ, {ops.RAGGED: env} if env else {}):
+        # 38 blocks a row at 600 tokens, 64 in the pool
+        [record] = ops.Stub(_Runner(), 10_000).point(placed, decode(2), 600, neg)
+        [collective] = ops.Stub(_Runner(), 10_000).point(placed, decode(2), 600, gather)
+
+    if cut:
+        assert record["rows"] == cut
+    else:
+        assert record["refused"] == "its rows need more than the pool's 64 KV blocks"
+    # a collective's family is over its message bytes: the pool cuts it either way
+    assert collective["rows"] == [[1, 600, True], [1, 416, True]]
+
+
+@pytest.mark.parametrize(
     "points, rows",
     [
         # one token count at three row counts, its time growing with them
