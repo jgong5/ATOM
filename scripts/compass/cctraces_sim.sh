@@ -174,7 +174,11 @@ fi
 if [[ $MODE == 1p1d ]]; then
     # pd_sim.sh takes the authority's port from its own variable; the run file
     # names the same one for the traffic LP.
-    export MODEL SERVER_ARGS WAIT_S CLOCK_PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT
+    # Each side's DP master port is free too, or a second run on this host
+    # network finds pd_sim.sh's default taken.
+    PREFILL_DP_PORT=$(compass_free_port) DECODE_DP_PORT=$(compass_free_port)
+    export MODEL SERVER_ARGS WAIT_S CLOCK_PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT \
+        PREFILL_DP_PORT DECODE_DP_PORT
     # An agentic cell, as the real one is launched: under DP attention its
     # router is the --dp-aware router LP, which draws from the cell's seed, and
     # its dp_sticky keys off X-Session-ID, which the real cell's aiperf sends.
