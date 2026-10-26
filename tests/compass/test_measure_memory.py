@@ -201,16 +201,21 @@ def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(
-    "gpus, cards",
+    "gpus, asked, cards",
     [
-        ("5", [dict(MI355X, name="MI308X", arch="gfx942")]),
-        ("4,5", [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")]),
+        ("5", (5,), [dict(MI355X, name="MI308X", arch="gfx942")]),
+        (
+            "4,5",
+            (4, 5),
+            [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")],
+        ),
     ],
 )
 def test_a_start_on_another_device_than_the_spec_states_refuses_naming_both(
-    tmp_path, monkeypatch, gpus, cards
+    tmp_path, monkeypatch, gpus, asked, cards
 ):
-    monkeypatch.setattr(measure_memory, "_device", lambda gpus: cards)
+    # Only the GPUs `--gpu` names have cards; asking about any others raises.
+    monkeypatch.setattr(measure_memory, "_device", {asked: cards}.__getitem__)
     machine = tmp_path / "machine.json"
     machine.write_text(json.dumps(DOCUMENT))
     flags = ["--gpu", gpus, "--machine", str(machine), "--store", str(tmp_path / "s")]
@@ -807,7 +812,7 @@ def test_the_mi308x_entry_gives_the_readings_its_spec_gave():
     spec = MachineSpec.from_mapping(json.loads(path.read_text()))
     entry = MemoryReadings.from_member(MI308X_READINGS, "memory_readings mi308x")
     model = ModelTerms.from_tree(
-        meta_tree(54_713_457_120), activations=entry.activations(16_384)
+        meta_tree(54_713_457_120), activations=entry.activations()
     )
     readings = device_readings(
         spec,

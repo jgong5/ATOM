@@ -17,6 +17,14 @@ counts too, and the modules a start builds, before ``/health`` answers, do
 not. A module another server of the same aiter tree built meanwhile counts as
 well, since this server may have waited on it.
 
+So does each kernel compiled the same way: `compile_hsaco`'s, in
+``build/<gfx arch>``, FlyDSL's, in its own directory under
+``FLYDSL_RUNTIME_CACHE_DIR``, the package's ``jit/flydsl_cache`` unless set,
+and Triton's and Inductor's, in their cache directories; each named by its
+file, FlyDSL's by its directory. ATOM's compile cache, ``~/.cache/atom``, is
+left out: each start derives a directory of its own there, points Triton and
+Inductor into it, and the stop removes it, so every process pays its compiles.
+
     python -m atom.compass.drive.aiter_jit RUN_JSON SINCE_NS
 
 adds the entry to RUN_JSON for the paths written at or after SINCE_NS, wall
@@ -27,13 +35,17 @@ import importlib.util
 import json
 import os
 import sys
+from contextlib import suppress
 from pathlib import Path
+
+from torch._inductor.runtime.cache_dir_utils import default_cache_dir
+from triton import knobs
 
 from atom.compass.backends.step_labels import BUILDS, refusal  # noqa: F401
 from atom.compass.run import _write_whole
 
 
-def _roots() -> list[Path]:
+def _roots() -> dict[Path, object]:
     try:
         spec = importlib.util.find_spec("aiter")
     except ValueError:  # an `aiter` in sys.modules with no spec, as a stub is
@@ -44,26 +56,42 @@ def _roots() -> list[Path]:
         for k in ("AITER_JIT_DIR", "AITER_ROOT_DIR")
         if os.environ.get(k)
     ]
-    return sorted({Path.home() / ".aiter", *env, *package})
+    flydsl = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR")
+    flydsl = [flydsl] if flydsl else [p / "flydsl_cache" for p in package]
+    inductor = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or default_cache_dir()
+    kernels = (knobs.cache.dir, inductor)
+    return (
+        {p: _module for p in (Path.home() / ".aiter", *env, *package)}
+        | {Path(p): lambda parts: parts[0] if len(parts) > 1 else None for p in flydsl}
+        | {Path(p): lambda parts: _file(parts[-1]) for p in kernels}
+    )
+
+
+def _file(name: str) -> str:
+    return name.split(".")[0].removeprefix("__grp__")
 
 
 def _module(parts: tuple[str, ...]) -> str | None:
     """The module whose build directory holds the path `parts` names under a
     root: the directory after its first ``build``, when the path is inside it."""
     i = parts.index("build") if "build" in parts else len(parts)
+    if len(parts) > i + 2 and parts[i + 1].startswith("gfx"):  # compile_hsaco's
+        return _file(parts[i + 2])
     return parts[i + 1] if len(parts) > i + 2 else None
 
 
 def builds_since(since_ns: int) -> dict:
-    """run.json's entry naming each aiter JIT module a path of whose build
-    directory was written at or after `since_ns`, wall clock nanoseconds; {}
-    when none was."""
-    built = {
-        _module(path.relative_to(root).parts)
-        for root in _roots()
-        for path in root.rglob("*")
-        if path.lstat().st_mtime_ns >= since_ns
-    } - {None}
+    """run.json's entry naming each aiter JIT module or compiled kernel with a
+    file written at or after `since_ns`, wall clock nanoseconds; {} when none
+    was."""
+    built = set()
+    for root, name in _roots().items():
+        for top, _, files in os.walk(root):
+            for path in (Path(top, f) for f in files):
+                with suppress(FileNotFoundError):  # a temporary since renamed
+                    if path.lstat().st_mtime_ns >= since_ns:
+                        built.add(name(path.relative_to(root).parts))
+    built.discard(None)
     return {BUILDS: sorted(built)} if built else {}
 
 

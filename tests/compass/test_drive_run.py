@@ -247,6 +247,19 @@ def test_a_prefill_or_a_decode_instance_refuses_before_its_server_starts(
     assert not (tmp_path / "out").exists()
 
 
+def test_run_and_trace_steps_refuse_a_decode_instance_with_one_message(tmp_path):
+    kv = json.dumps({"kv_connector": "compass", "kv_role": "kv_consumer"})
+    atom = ["--kv-transfer-config", kv]
+    argv = flags(tmp_path, "--step-stub", stub(tmp_path), atom=atom)
+
+    with pytest.raises(ValueError) as ran:
+        drive_run.main(argv)
+    with pytest.raises(ValueError) as traced:
+        trace_steps.main(argv)
+    assert str(traced.value) == str(ran.value)
+    assert "makes this a decode instance" in str(ran.value)
+
+
 def test_run_json_records_the_summarys_refusals_the_roofline_and_the_backend(
     tmp_path, monkeypatch
 ):

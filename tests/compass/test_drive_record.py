@@ -356,3 +356,49 @@ def test_a_record_names_each_aiter_module_its_server_built_while_it_served(
 
     run = json.loads((out / "run.json").read_text())
     assert run[aiter_jit.BUILDS] == ["mha_x", "mha_y", "pa_x"]
+
+
+@pytest.mark.skipif(GIT is None, reason="needs git")
+@pytest.mark.parametrize(
+    "written, names",
+    [
+        (
+            "inductor/triton/0/K3/triton_poi_fused_add_0.hsaco",
+            ["triton_poi_fused_add_0"],
+        ),
+        ("triton/K4/__grp___pa_decode.json", ["_pa_decode"]),
+        (
+            "home/.cache/atom/torch_compile_cache/c/rank_0/triton_cache/K5/_fwd.hsaco",
+            [],
+        ),
+        ("site/aiter/jit/flydsl_cache/launch_gemm1_c5/01b8.pkl", ["launch_gemm1_c5"]),
+        ("aiter_root/build/gfx942/pa_decode_16_1.hsaco", ["pa_decode_16_1"]),
+    ],
+    ids=["inductor", "triton", "atom", "flydsl", "hsaco"],
+)
+def test_a_record_names_each_compile_its_server_ran_while_it_served(
+    tmp_path, planted_gpu, monkeypatch, written, names
+):
+    """In Inductor's cache, Triton's, FlyDSL's under the installed aiter's JIT
+    directory, and `compile_hsaco`'s under ``AITER_ROOT_DIR``'s build
+    directory, named by its kernel or file; the record is refused naming it.
+    Not one in ATOM's compile cache, a directory every start derives afresh."""
+    _aiter(tmp_path, monkeypatch)
+    for var, root in (
+        ("AITER_ROOT_DIR", "aiter_root"),
+        ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+        ("TRITON_CACHE_DIR", "triton"),
+    ):
+        monkeypatch.setenv(var, str(tmp_path / root))
+    monkeypatch.delenv("FLYDSL_RUNTIME_CACHE_DIR", raising=False)
+    monkeypatch.setenv("PLANTED_START", str(tmp_path / "start" / "inert"))
+    monkeypatch.setenv("PLANTED_BUILT", str(tmp_path / written))
+    server = tmp_path / "server.py"
+    server.write_text(BUILDS + server.read_text() + SERVING)
+    out = tmp_path / "out"
+    cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
+
+    run = json.loads((out / "run.json").read_text())
+    assert run.get(aiter_jit.BUILDS, []) == names
+    if names:
+        assert f"JIT build of {names}" in aiter_jit.refusal(run)

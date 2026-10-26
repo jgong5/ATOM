@@ -191,6 +191,10 @@ if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
     hf_snapshot() { ls -d "${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--$1/snapshots/"*/ 2>/dev/null | head -1; }
     export ATOM_COMPASS_SLICE_MODEL=${ATOM_COMPASS_SLICE_MODEL:-$(hf_snapshot Qwen3-0.6B)}
     export ATOM_COMPASS_IMAGE_MODEL=${ATOM_COMPASS_IMAGE_MODEL:-$(hf_snapshot Qwen3.5-9B)}
+    # The speculative runs read a config and a tokenizer, no weights: MTP1 from
+    # Qwen3.5-0.8B, DSpark from DeepSeek-V4.1-Flash's config with V4-Flash's tokenizer.
+    export ATOM_COMPASS_MTP_MODEL=${ATOM_COMPASS_MTP_MODEL:-$(hf_snapshot Qwen3.5-0.8B)}
+    export ATOM_COMPASS_DSPARK_MODEL=${ATOM_COMPASS_DSPARK_MODEL:-/root/cells/deepseek-v41-flash-dspark}
     # The cc-traces smoke replays turns longer than the slice model's context, so
     # it runs alone, with this model as its slice model.
     SMOKE=tests/compass/test_cctraces_sim_smoke.py
@@ -209,6 +213,8 @@ if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
     MISSING=
     [ -d "$ATOM_COMPASS_SLICE_MODEL" ] || MISSING+="ATOM_COMPASS_SLICE_MODEL, a Qwen3-0.6B directory; "
     [ -d "$ATOM_COMPASS_IMAGE_MODEL" ] || MISSING+="ATOM_COMPASS_IMAGE_MODEL, a Qwen3.5-9B directory; "
+    [ -d "$ATOM_COMPASS_MTP_MODEL" ] || MISSING+="ATOM_COMPASS_MTP_MODEL, a Qwen3.5-0.8B directory; "
+    [ -d "$ATOM_COMPASS_DSPARK_MODEL" ] || MISSING+="ATOM_COMPASS_DSPARK_MODEL $ATOM_COMPASS_DSPARK_MODEL; "
     [ -d "$ATOM_COMPASS_CCTRACES_MODEL" ] || MISSING+="ATOM_COMPASS_CCTRACES_MODEL, a Qwen3.8-27B directory; "
     [ -r "$ATOM_COMPASS_CCTRACES" ] || MISSING+="ATOM_COMPASS_CCTRACES $ATOM_COMPASS_CCTRACES; "
     [ -x "$COMPASS_HARNESS_PYTHON" ] || MISSING+="COMPASS_HARNESS_PYTHON $COMPASS_HARNESS_PYTHON; "
@@ -221,6 +227,7 @@ if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
     [ -z "$MISSING" ] || finish 92 "the driver-run tests lack ${MISSING%; }; nothing was run"
     printf 'driver-run: slice %s\n            image %s\n            machine %s\n            router %s\n' \
         "$ATOM_COMPASS_SLICE_MODEL" "$ATOM_COMPASS_IMAGE_MODEL" "$ATOM_COMPASS_SLICE_MACHINE" "$ATOMESH"
+    printf 'spec:       mtp %s\n            dspark %s\n' "$ATOM_COMPASS_MTP_MODEL" "$ATOM_COMPASS_DSPARK_MODEL"
     printf 'cc-traces:  model %s\n            traces %s\n            harness %s\n            aiperf %s\n' \
         "$ATOM_COMPASS_CCTRACES_MODEL" "$ATOM_COMPASS_CCTRACES" "$COMPASS_HARNESS_PYTHON" "$COMPASS_AIPERF_PYTHON"
 fi
@@ -311,7 +318,7 @@ PASSED=$((PASSED + COMPASS_N)) FAILED=$((FAILED + C_FAILED)) ERRORS=$((ERRORS + 
 printf '\nGATE_GPU passed=%s failed=%s errors=%s pytest_rc=%s (baseline %s/%s/0, expected %s passed)\n' \
     "$PASSED" "$FAILED" "$ERRORS" "$PYRC" "$BASE_PASSED" "$BASE_FAILED" "$EXPECT_PASSED"
 # A driver-run test that skipped did not run, whatever the counts say.
-SKIPS=$(grep -E '^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE)_MODEL|ATOM_COMPASS_CCTRACES|COMPASS_AIPERF_PYTHON|atomesh)' "$COUT")
+SKIPS=$(grep -E '^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK)_MODEL|ATOM_COMPASS_CCTRACES|COMPASS_AIPERF_PYTHON|atomesh)' "$COUT")
 cat "$COUT" >>"$OUT"
 rm -f "$COUT"
 

@@ -141,6 +141,21 @@ def test_a_step_a_later_source_answered_is_not_refused_and_its_answer_is_apart(
     assert out["coverage_report"] is False
 
 
+def test_the_summary_counts_each_reason_a_fallback_step_was_declined_for_by_steps(
+    monkeypatch, tmp_path
+):
+    backend = AnalyticalBelow(STAGE1, tokens=40)
+    # Every term of a declined step carries the chain; a step counts once.
+    assert len(backend.price(BatchView((RequestShape(40, 40, False),))).terms) > 1
+    out = summary(monkeypatch, tmp_path, backend, 8, 40, 64)
+
+    assert out["schedule"]["fallback_steps"] == 2
+    assert out["schedule"]["fallback_reasons"] == {
+        "price_list: no entry for this shape": 2,
+        "nearest_key: outside the measured range": 2,
+    }
+
+
 @pytest.mark.parametrize(
     "where,reason",
     [
@@ -202,7 +217,7 @@ def test_a_stub_run_reports_all_its_seconds_declared(monkeypatch, tmp_path):
     assert schedule["seconds_by_method"] == by_method(
         declared={"steps": 2, "fraction_of_predicted_seconds": pytest.approx(1.0)}
     )
-    assert out["schema_version"] == compass_run.SUMMARY_SCHEMA_VERSION == 9
+    assert out["schema_version"] == compass_run.SUMMARY_SCHEMA_VERSION == 10
     assert schedule["refusals"]["count"] == 0
     assert schedule["refusals"]["fraction_of_steps"] == 0.0
     assert out["coverage_report"] is False

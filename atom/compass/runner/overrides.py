@@ -829,6 +829,7 @@ class PricedSteps:
             "extrapolated_steps": mix.extrapolated_steps,
             # A priced step that carries refusals fell through to a later source.
             "fallback_steps": mix.fallback_steps,
+            "fallback_reasons": {f"{s}: {r}": n for (s, r), n in mix.reasons().items()},
             **{f"{g}_steps": steps.get(g, 0) for g in GROUPS},
             **{f"{g}_seconds": seconds.get(g, 0.0) for g in GROUPS},
             "treatments": dict(mix.treatments),

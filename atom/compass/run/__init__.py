@@ -275,7 +275,7 @@ AUTHORITY_FILE = "authority_endpoint.txt"
 HAND_IN_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
-SUMMARY_SCHEMA_VERSION = 9
+SUMMARY_SCHEMA_VERSION = 10
 #: Compass source the host-law key leaves out, by path under the package: all
 #: of it (None), or the top-level names (def, class or assigned) only a simulated
 #: run reaches, with the comments above each and the module docstring.
@@ -1411,7 +1411,7 @@ def runner(model_runner, tree) -> None:
     # the DP and PCP widths, all in the readings' key, so the tokens the
     # reading warmed up with are the ones this deployment's warmup runs.
     warmup = measured.values["warmup_tokens"]
-    model = ModelTerms.from_tree(tree, activations=measured.activations(warmup))
+    model = ModelTerms.from_tree(tree, activations=measured.activations())
     fallback = run.get("step_roofline", False)
     if not isinstance(fallback, bool):
         raise TypeError(
@@ -2092,6 +2092,10 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     def total(key):
         return sum(p.get(key, 0) for p in priced) - sum(p.get(key, 0) for p in before)
 
+    def counted(key):
+        c = sum((Counter(p.get(key, {})) for p in priced), Counter())
+        return c - sum((Counter(p.get(key, {})) for p in before), Counter())
+
     seconds = total("seconds")
     tally = RefusalTally.of(reasons, total("steps"))
     lazy = total("lazy_traces"), total("lazy_trace_wall_seconds")
@@ -2119,9 +2123,9 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     for key in ("extrapolated_steps", "fallback_steps"):
         schedule[key] = total(key)
     # Each assumed treatment the steps were priced under, with its step count.
-    treatments = sum((Counter(p.get("treatments", {})) for p in priced), Counter())
-    treatments -= sum((Counter(p.get("treatments", {})) for p in before), Counter())
-    schedule["treatments"] = dict(sorted(treatments.items()))
+    schedule["treatments"] = dict(sorted(counted("treatments").items()))
+    # Each reason a source declined a step a fallback then priced, with its steps.
+    schedule["fallback_reasons"] = dict(counted("fallback_reasons").most_common())
     # An engine whose workers died, or that never handed in, priced steps no
     # one counted: they are absent, not 0.
     if any(
@@ -2131,6 +2135,7 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     ):
         schedule.update(predicted_seconds=None, seconds_by_method=None, treatments=None)
         schedule.update(extrapolated_steps=None, fallback_steps=None)
+        schedule["fallback_reasons"] = None
         schedule["refusals"].update(steps=None, fraction_of_steps=None)
     summary["configuration"] = configuration(run)
     summary["schema_version"] = SUMMARY_SCHEMA_VERSION
