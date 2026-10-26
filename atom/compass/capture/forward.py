@@ -3,10 +3,11 @@
 
 ATOM's `ModelRunner` runs its own step through the model's own classes under
 `TorchDispatchMode` over `FakeTensorMode` at one concrete shape: a decode
-width, or a prefill of T tokens over B sequences. One runner steps through every shape of a capture, as it steps through a run.
-A decode shape is traced twice, its rows holding each of `CONTEXTS` tokens: an
-integer argument that differs between the two is affine in the context
-(`ir.Affine`), or the shape is refused by operator and slot.
+width, or a prefill of T tokens over B sequences. One runner steps through
+every shape of a capture, as it steps through a run. A decode shape is traced
+twice, its rows holding each of `CONTEXTS` tokens: an integer argument that
+differs between the two is affine in the context (`ir.Affine`), or the shape
+is refused by operator and slot.
 
 Each leaf carries its contract: its arguments by schema slot, a tensor as its
 shape, dtype, stride, role and the `is_shuffled` mark ATOM sets on a
@@ -255,14 +256,16 @@ def _atom_frames():
 
 
 def _where(frame) -> str:
-    return _site(frame.f_code, frame.f_lineno)
+    code = frame.f_code
+    return _site(code.co_filename, code.co_qualname, frame.f_lineno)
 
 
+# Keyed on strings: equal code objects from two files compare and hash equal.
 @functools.cache
-def _site(code, line) -> str:
-    path = pathlib.Path(code.co_filename)
+def _site(filename, qualname, line) -> str:
+    path = pathlib.Path(filename)
     path = path.relative_to(_ROOT) if path.is_relative_to(_ROOT) else path
-    return f"{path}:{line} in {code.co_qualname}"
+    return f"{path}:{line} in {qualname}"
 
 
 def _storage(tensor) -> StorageWeakRef:
