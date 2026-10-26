@@ -925,8 +925,11 @@ def _build_runner(config, fake_mode):
             return DeviceMemoryReadings(total, total, 0, 0)
 
     # A fake tensor has no address: the alias check sees each buffer empty.
+    # Built in the inference mode its steps run in, so their views of its
+    # weights and buffers keep the keys of what they view.
     with fake_mode, patch.object(h2d, "_range", lambda t: (0, 0)):
-        return _CapturedRunner(0, config)
+        with torch.inference_mode():
+            return _CapturedRunner(0, config)
 
 
 def _drafter(runner, recorder):
@@ -1178,11 +1181,11 @@ def capture(
         blocks = max(
             _batch(s, block_size, max(CONTEXTS), True, drafts)[1] for s in shapes
         )
-        with fake_mode:
+        with fake_mode, torch.inference_mode():
             runner.get_num_blocks()  # sizes the pools, as `EngineCore` does
         # A warmup copy whose bytes nobody reads, like `_maybe_warmup`.
         runner.attn_metadata_builder.warmup_per_req_cache = lambda: None
-        with fake_mode, recorder:
+        with fake_mode, recorder, torch.inference_mode():
             runner.allocate_kv_cache(max(KV_BLOCKS, blocks))
         # The runner, its drafter and its KV pool live to the end: no
         # collection need walk them again.
