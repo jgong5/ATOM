@@ -46,7 +46,9 @@
 #
 # It runs its own tree, as the gates do, compass-harness included. OUT_DIR gets
 # run.json (RUN_FILE plus a `workload` entry hashing the traces, the dataset
-# and the aiperf arguments), the server and aiperf logs, aiperf's artifacts at
+# and the aiperf arguments, and for a TP1 cell `argv`, its server's ATOM
+# arguments after `--`, which grading builds the step roofline from), the
+# server and aiperf logs, aiperf's artifacts at
 # --export-level raw, its raw records with no payload and gzipped
 # (profile_export_raw.jsonl.gz), the client run's export in artifacts/client_run.json
 # (atom/compass/parity/client_run.py), and the step table and run summary.
@@ -113,8 +115,8 @@ args=(--endpoint-type chat --custom-dataset-type weka_trace
 args+=($AIPERF_EXTRA_ARGS)
 
 read -r MODE CLOCK_PORT PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT < <(
-python3 - "$RUN_FILE" "$OUT" "$TRACES" "$BENCHMARK_ID" "${args[@]}" <<'EOF'
-import hashlib, json, socket, sys
+MODEL=$MODEL SERVER_ARGS=$SERVER_ARGS python3 - "$RUN_FILE" "$OUT" "$TRACES" "$BENCHMARK_ID" "${args[@]}" <<'EOF'
+import hashlib, json, os, socket, sys
 from pathlib import Path
 
 run_file, out, traces, benchmark_id, *args = sys.argv[1:]
@@ -152,6 +154,8 @@ run["clock_endpoint"] = f"tcp://127.0.0.1:{ports[0]}"
 # declares more, or none (null, as `compass run` keeps one), leaves the server
 # up after aiperf.
 run["client_runs"] = 1
+if "kv_write_req_s" not in run:
+    run["argv"] = ["--", "--model", os.environ["MODEL"], *os.environ["SERVER_ARGS"].split()]
 run["workload"] = {
     "dataset_sha256": sha256(traces),
     "traces_sha256": [sha256(p) for p in sorted((out / "traces").iterdir())],

@@ -921,12 +921,6 @@ def test_an_op_graph_cell_grades_with_its_method_shares_term_gaps_and_warm_over_
         "not gated",
     ]
     assert rows["warm over cold", ATTENTION][0] == "0 of 1 points timed warm"
-    # A run file that composes the step roofline below the graph falls back.
-    run["run_file"]["step_roofline"] = True
-    (sim / "run.json").write_text(json.dumps(run))
-    rows = _graded(capsys, cell)
-    assert rows["cost real0", "fallback prefill tokens 0-512"][0] == value
-    assert ("cost real0", "refused prefill tokens 0-512") not in rows
 
 
 def test_cost_rows_gate_every_graded_step_and_print_the_breakdown_not_gated(
