@@ -24,13 +24,13 @@ from test_vertical_slice import _run_file
 
 from atom.compass import clock_transport
 from atom.compass import run as compass_run
-from atom.compass.audit import sync_scan
 from atom.compass.backends.step_stub import Coefficients, StepStubBackend
 from atom.compass.clock import NER, ClockAuthority, LpId, single_engine_table
 from atom.compass.runner.overrides import HostDeviceRecurrence
 from atom.utils import clock
 from atom.utils.clock import LPRuntime, WrappedSocket
 from atom.utils.distributed import utils
+from tests.compass import sync_scan
 
 TABLE = single_engine_table(
     admission_path="serving", ipc_s=2.0**-14, stream_s=2.0**-12, dp=2
