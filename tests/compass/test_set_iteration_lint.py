@@ -256,6 +256,21 @@ FORMS_THAT_FIRE = {
     "print": "def f(s: set[str]):\n    print(s)\n",
     "log-deferred-%s": 'def f(s: set[str], log):\n    log.info("ready=%s", s)\n',
     "log-level": 'def f(s: set[str], log):\n    log.log(10, "ready=%s", s)\n',
+    "list.extend": "def f(s: set[str], out):\n    out.extend(s)\n",
+    "deque": "import collections\n\n\ndef f(s: set[str]):\n    return collections.deque(s)\n",
+    "Counter": "from collections import Counter\n\n\ndef f(s: set[str]):\n    return Counter(s)\n",
+    "islice": "import itertools\n\n\ndef f(s: set[str]):\n    return itertools.islice(s, 2)\n",
+    "np.fromiter": "import numpy as np\n\n\ndef f(s: set[int]):\n    return np.fromiter(s, int)\n",
+    "class-name-outside": (
+        "class A:\n    members = {1, 2}\n\n\ndef f():\n    for x in A.members:\n        yield x\n"
+    ),
+    "class-name-inside": (
+        "class A:\n"
+        "    members: set[str] = set()\n"
+        "\n"
+        "    def g(self):\n"
+        "        return list(A.members)\n"
+    ),
     "max-key": "def f(s: set[str], cost):\n    return max(s, key=cost)\n",
     "min-key": "def f(s: set[str], cost):\n    return min(s, key=cost)\n",
     "set-literal": "def f():\n    for x in {1, 2}:\n        yield x\n",
@@ -306,6 +321,10 @@ FORMS_THAT_STAY_QUIET = {
     "dict-pop": "def f(d, k):\n    return d.pop(k)\n",
     "str-of-list": "def f(rows):\n    xs = list(rows)\n    return str(xs)\n",
     "log-of-a-count": 'def f(s: set[str], log):\n    log.info("ready=%d", len(s))\n',
+    "class-name-rebound": (
+        "class A:\n    members = {1, 2}\n\n\nA.members = sorted(A.members)\n\n\n"
+        "def f():\n    return list(A.members)\n"
+    ),
     "rebound": (
         "def f(names):\n"
         "    s = set(names)\n"
