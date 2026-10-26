@@ -137,7 +137,12 @@ def inputs(args, sources) -> tuple[list, dict]:
             "the records ran on another platform than --machine states: "
             + "; ".join(differ)
         )
-    here = spec_readings(spec, config)
+    here = run_readings(
+        spec,
+        atom_src=Reading(*config["source_root"].split("-", 1)),
+        model=config["model"],
+        engine_config=json.dumps(config["engine_config"], sort_keys=True),
+    )
     for key in measurements:
         store.load(key, conditions=here, gates=GateState.of())
     return samples, {
@@ -173,17 +178,6 @@ def conditions(config) -> Conditions:
         atom_src=Reading(*config["source_root"].split("-", 1)),
         model=config["model"],
         host_cpu=config["host_key"]["host_cpu"],
-        engine_config=json.dumps(config["engine_config"], sort_keys=True),
-    )
-
-
-def spec_readings(spec, config) -> Conditions:
-    """The readings a run on `spec` takes, with the source root, model and
-    engine `config`, the inputs' configuration, states."""
-    return run_readings(
-        spec,
-        atom_src=Reading(*config["source_root"].split("-", 1)),
-        model=config["model"],
         engine_config=json.dumps(config["engine_config"], sort_keys=True),
     )
 
