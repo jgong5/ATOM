@@ -60,6 +60,11 @@ probed number carries the p10 and p90 its probe measured, beside its subject in
 `provenance.origins`, and a spec that states one without them is refused by name before it
 is written (D25 rule 5, [#1518](https://github.com/jgong5/ATOM/issues/1518)).
 
+**Revised 2026-10-25 by the owner's ruling on
+[#2138](https://github.com/jgong5/ATOM/issues/2138):** MI455's spec is probed on an MI455
+node, a probed value replacing an assumed one and a value not probed staying assumed; the
+derates carried from MI355X belong to the frozen stage-3c projection (D25, rule 5).
+
 **Scope.** The single input artifact that tells Compass what machine it is simulating,
 its schema, and the tools that fill it in. A project requirement is that compute, memory
 size, bandwidth and interconnect are **configured and not read from a device runtime**, so
@@ -277,9 +282,10 @@ Mooncake's KV transfer between the prefill and the decode node (`01` D6).
    that states a method in place of an origin. The origin is not the method: the term that reads a field
    decides that (`02` D11, #952), so a datasheet value used as a parameter is analytical,
    a probed one used as the answer is measured, and an assumed one makes the term
-   declared. A derate for a device never run is assumed: MI455's are the ratios probed on
-   MI355X (`10` D69, #1392). `08` D50.2 says
-   how the projection reports its assumed fields.
+   declared. A derate for a device never run is assumed, as the frozen stage-3c
+   projection took MI455's from the ratios probed on MI355X (`10` D69, #1392). Since
+   stage 4, MI455's fields are probed on the device and a value not probed stays assumed
+   (#2138). `08` D50.2 says how the projection reports its assumed fields.
 
 ### `host.tokenizer` is keyed by tokenizer identity, not by model
 
@@ -436,8 +442,9 @@ a single term.
   at 141 GB of neighbour, one ran 64% slow. **Any probe run needs the machine checked
   before and after, not only before.**
 - With no card of the target type, the peaks are its datasheet times the ratios probed on
-  a card that was run, assumed, as MI455 takes MI355X's (`10` D69, #1392). For the memory readings nothing yet
-  decides it: the answer is "assume it and accept the error", an entry marked assumed
+  a card that was run, assumed, as the frozen MI455 projection took MI355X's (`10` D69,
+  #1392); MI455 itself is probed on the device since stage 4 (`16` *Stage 4*). For the
+  memory readings nothing yet decides it: the answer is "assume it and accept the error", an entry marked assumed
   (`07` D38), which is honest but unguided.
 
 ---
@@ -447,6 +454,6 @@ a single term.
 | # | Decision | Date |
 |---|---|---|
 | D24 | The spec describes the machine; ATOM's config describes the deployment. Thread-pool width becomes an ATOM config option, not a Compass one. | 2026-09-18 |
-| D25 | Four-section schema: `provenance`, `host`, `device`, `interconnect`. Mandatory derates, no memory readings (`measure memory`'s entries, 2026-10-14), activations included (2026-10-16), `software_pinned_to` checked, torch included, as the target's stack, whole spec echoed into every artifact. Revised for the MI455 projection: an optional dense `fp4_flops`, `intra_node.domain_devices` for a scale-up fabric wider than a node, and every field given an origin, `datasheet`, `probed` or `assumed`, `provenance.origin` and per field `provenance.origins` with a probe's subject, kept across a save. Revised: a `host.http_intake` pair, the event loop's charge per HTTP request taken in, required once every committed spec stated it. An optional `host.http_intake.idle_s`, a lone request's intake. An optional per-link `link_setup_s`, charged once on a rank pair's first KV write. Revised for the attainable-peak roofline: a `derate` is attainable over datasheet, probed, one per compute format; an optional `memory.bandwidth_curve` and an optional `kernel_floor_s`; a device never run carries a probed device's derates, assumed. A probed number carries its measured p10 and p90 beside its subject, and a spec stating one without them is refused by name before it is written. | 2026-09-18; revised 2026-10-10; torch 2026-10-13 (#851); origin 2026-10-14 (#952); intake 2026-10-16 (#1103), required 2026-10-18 (#1230); idle intake 2026-10-20 (#1775); link setup 2026-10-16 (#1172); activations and the transfer origin dropped 2026-10-16 (#1226); attainable peaks 2026-10-17 (#1392); `host.admission_fixed_s` dropped 2026-10-17 (#1000); bands 2026-10-18 (#1482, #1518) |
+| D25 | Four-section schema: `provenance`, `host`, `device`, `interconnect`. Mandatory derates, no memory readings (`measure memory`'s entries, 2026-10-14), activations included (2026-10-16), `software_pinned_to` checked, torch included, as the target's stack, whole spec echoed into every artifact. Revised for the MI455 projection: an optional dense `fp4_flops`, `intra_node.domain_devices` for a scale-up fabric wider than a node, and every field given an origin, `datasheet`, `probed` or `assumed`, `provenance.origin` and per field `provenance.origins` with a probe's subject, kept across a save. Revised: a `host.http_intake` pair, the event loop's charge per HTTP request taken in, required once every committed spec stated it. An optional `host.http_intake.idle_s`, a lone request's intake. An optional per-link `link_setup_s`, charged once on a rank pair's first KV write. Revised for the attainable-peak roofline: a `derate` is attainable over datasheet, probed, one per compute format; an optional `memory.bandwidth_curve` and an optional `kernel_floor_s`; a device never run carries a probed device's derates, assumed; MI455's are probed on the device, and the carried ones belong to the frozen projection. A probed number carries its measured p10 and p90 beside its subject, and a spec stating one without them is refused by name before it is written. | 2026-09-18; revised 2026-10-10; torch 2026-10-13 (#851); origin 2026-10-14 (#952); intake 2026-10-16 (#1103), required 2026-10-18 (#1230); idle intake 2026-10-20 (#1775); link setup 2026-10-16 (#1172); activations and the transfer origin dropped 2026-10-16 (#1226); attainable peaks 2026-10-17 (#1392); `host.admission_fixed_s` dropped 2026-10-17 (#1000); bands 2026-10-18 (#1482, #1518); MI455 probed 2026-10-25 (#2138) |
 | D26 | Probes emit fragments; `merge` / `validate` / `explain` combine and check them. Four hardware probe classes plus a datasheet path; the transfer path dropped 2026-10-14 (#937). Every hardware probe implements the contamination refusals. All are the `spec` package's functions, run by per-machine scripts, with no `compass` command. Machine specs are developers', one per supported machine, passed by `--machine`; an engine start's memory readings are `measure memory`'s, not the spec's. Revised: class 1 probes the per-format GEMM rate, the bandwidth curve and the kernel floor; class 2 the link latency and bandwidth. Revised: the bandwidth curve is the per-size maximum of a read-only, a write-only and a copy sweep. | 2026-09-18; revised 2026-10-13 and 2026-10-14 (#851); 2026-10-17 (#1392); 2026-10-19 (#1575) |
 | D25.1 | Runtime-constant fields renamed to say what they are; ATOM's own term recorded as a mapping column. `host.tokenizer` becomes `host.tokenizers[]`, keyed by tokenizer identity (id + backend + fingerprint) with `applies_to` model architectures. | 2026-09-19 |
