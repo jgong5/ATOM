@@ -34,7 +34,8 @@ planned point named as one refuses, and a ragged one (`measure steps
 --ragged`) fits the decode lookup's alpha, not the residual. `step_grid_fit.bundle` fits the bundle,
 keyed by the grid definition's digest; `--seed` fixes its held-out split. The
 report's provenance names each target run with every trace it served, and the
-plan with the `--grid` inputs it read and the traces their lines served.
+plan with the `--grid` inputs it read and the traces their lines served; the
+plan states it was not profiled, as the measurements at its points were not.
 
 A `--grid` input is read with the client runs a `--client-run` names for it,
 and one no `--client-run` names refuses, as `measure steps` refuses to plan
@@ -115,6 +116,7 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
             "run": measure._digest(planned),
             "inputs": sorted({source for source, *_ in read.values()}),
             "traces": sorted({t for _, x in steps for t in x["traces"]}),
+            "profiled": False,
         }
     ]
     fields = {"device": config["device"], "grid": measure._digest(definition)}
