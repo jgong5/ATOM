@@ -29,16 +29,19 @@ that records none; for the grid, outside its residual's held-out hull). A step
 with a declared term is reported apart, in no graded figure; a draft is
 grouped by its draft terms alike. A step that ran more
 than `step_linear_fit.WARM_FACTOR` times its price is warm, a one-off first touch the
-law does not model: it is named with its seconds and enters no figure. So are
-the steps that lead a vector's priced steps, each slower than its price by more
-than `step_linear_fit.MAD_K` scaled MADs of the errors the law's vector was fitted
-on, as the fit names them; of that vector's errors here if the law records no
-`fit.mad`, as the grid never does. A step the backend declines is counted with
-its real seconds and its reasons, the most frequent named: under `fallback` for
-the grid, since its run prices the step by the step roofline below it, and under
-`refused` for a law, since a run grading takes has nothing below the law, or
-under `fallback` when the run's file composes the step roofline below it. A step
-it extrapolated, past its support domain, is counted too. An answer of any
+law does not model: it is named with its seconds and enters no figure. So are,
+under a law or an op graph, the steps that lead a vector's priced steps, each
+slower than its price by more than `step_linear_fit.MAD_K` scaled MADs of the
+errors the law's vector was fitted on, as the fit names them; of that vector's
+errors here if the law records no `fit.mad` or the backend is an op graph. A step
+grid has no such rule: its bundle's points are measured after the bench warm-up
+and its fit names no warm step, so only a step above that factor is warm. A step
+the backend declines is counted with its real seconds and its reasons, the most
+frequent named: under `fallback` for the grid, since its run prices the step by
+the step roofline below it, and under `refused` for a law, since a run grading
+takes has nothing below the law, or under `fallback` when the run's file
+composes the step roofline below it. A step it extrapolated, past its support
+domain, is counted too. An answer of any
 method but an estimated one outside its hull is validated, as the run summary
 groups seconds: an op graph's analytical and measured leaves are, its
 interpolated ones only inside a held-out bracket on each line they interpolate
@@ -74,6 +77,7 @@ from atom.compass.backends.cost import GROUPS
 from atom.compass.backends.cost import group as method_group
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band
+from atom.compass.backends.step_roofline import StepFallbackBackend
 from atom.compass.drive import aiter_jit
 from atom.compass.validate.bound import _split
 
@@ -87,10 +91,16 @@ GRADED = {
 }
 
 
+def _is_grid(backend) -> bool:
+    """Whether `backend` is a step grid, bare or the first one a fallback asks."""
+    first = backend.first if isinstance(backend, StepFallbackBackend) else backend
+    return isinstance(first, StepGridBackend)
+
+
 def _leading_slow(priced: list[tuple], law: dict | None) -> set[int]:
     """Steps leading their vector's (vector, band, step, seconds, price) rows, each
     slow by the scatter `law` fitted the vector on, or by the scatter here where
-    `law` records none or is None, as for a step grid."""
+    `law` records none or is None, as for an op graph."""
     out = set()
     for key in sorted({p[0] for p in priced}):
         mine = [p for p in priced if p[0] == key]
@@ -183,6 +193,7 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
     law = backend if isinstance(backend, Mapping) else None
     if law is not None:
         backend = StepLinearBackend(StepLinearLaw(law))
+    grid = _is_grid(backend)
     groups = {g: {} for g in ("graded", "validated", "unvalidated", "declared")}
     declined: dict[str, dict] = {}
     warm, priced, extrapolated = [], [], 0
@@ -213,7 +224,7 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
             draft = (min(labels), costs[top].draft_seconds, _group(mine))
         target = _group(costs[top].terms)
         priced.append((key, band, step, seconds, price, target, draft, costs[top]))
-    leading = _leading_slow(priced, law)
+    leading = set() if grid else _leading_slow(priced, law)
     parts: dict[str, list] = {}
     for key, band, step, seconds, price, target, draft, cost in priced:
         if step in leading or seconds > WARM_FACTOR * price:
@@ -240,8 +251,9 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
             kind: _summary(rows) for kind, rows in sorted(kinds.items(), reverse=True)
         }
     report["warm"] = warm
-    grid = isinstance(backend, StepGridBackend) or fallback
-    report["fallback"], report["refused"] = (declined, {}) if grid else ({}, declined)
+    report["fallback"], report["refused"] = (
+        (declined, {}) if grid or fallback else ({}, declined)
+    )
     report["extrapolated"] = extrapolated
     report["methods"], report["terms"] = {}, {}
     for kind, priced_steps in sorted(parts.items(), reverse=True):
