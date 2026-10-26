@@ -224,6 +224,22 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
     def build_connector_meta(self) -> ConnectorMetadata:
         return ConnectorMetadata()
 
+    def _pages_line_up(self, params) -> bool:
+        """Mooncake's rule for skipping decode's cached prefix: the producer
+        has this side's block size and runs DCP 1 or this side's DCP. A blob
+        without both fields lines up when its ``hash_block_size`` is this
+        side's block size or its hash block size."""
+        block_size, dcp_size = params.get("block_size"), params.get("dcp_size")
+        if block_size is not None and dcp_size is not None:
+            return int(block_size) == self._block_size and int(dcp_size) in (
+                1,
+                self._dcp_size,
+            )
+        return params.get("hash_block_size") in (
+            self._block_size,
+            self._hash_block_size,
+        )
+
     def update_state_after_alloc(self, seq) -> None:
         """Decode: send the write request and clear the flag, as Mooncake does.
 
@@ -248,8 +264,10 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                 f"and this connector prices {len(self._transfer)}"
             )
         computed = 0
-        if params.get("hash_block_size") == self._hash_block_size > 0 and not (
-            seq.has_per_req_cache
+        if (
+            self._pages_line_up(params)
+            and self._hash_block_size > 0
+            and not seq.has_per_req_cache
         ):
             computed = seq.num_cached_tokens // self._hash_block_size
         blocks = len(seq.block_table) - computed
