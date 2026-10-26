@@ -33,19 +33,19 @@ pool included, becomes a triple of its view, the lookup and its label, and
 `step_grid_residual.fit` fits the residual on the triples. A target the grid
 refuses is named in the report with the grid's reason; one with no device
 label is counted by why it was cut. A fit with no target the grid answers
-refuses.
+refuses. The targets are taken records first, as they come, then replays in
+their views' order, which the store's order does not move.
 
 The bundle is the member `run/step_grid.py` loads: the grid, the residual, the
 plan's bounds, the definition, and the sources its triples came from. The
 report is the residual's by kind, each kind's selected member also broken down
-by source: the triples its MAD pass kept and dropped and those held out, the
-median and scaled MAD of its relative residuals over those kept and dropped,
-as the member's are, and the median absolute one over those held out, a band
-it holds no factor for counting as a factor of 0, as the fit counts it. It
-counts the triples whose lookup is extrapolated past the KV pool, and gives
-per rung each alpha form's terms and errors, the views the grid does not read,
-how many it reads at their longest row past the KV pool, the cells' p50
-without and with alpha, and whether the rung keeps it.
+by source: the triples kept, dropped and held out, the median and scaled MAD of its
+relative residuals over those fitted, and the median absolute one over those
+held out, a band it holds no factor for counting as a factor of 0, as the fit
+counts it. It counts the triples whose lookup is extrapolated past the KV
+pool, and gives per rung each alpha form's terms and errors, the views the
+grid does not read, how many it reads at their longest row past the KV pool,
+the cells' p50 without and with alpha, and whether the rung keeps it.
 """
 
 import copy
@@ -94,6 +94,9 @@ def bundle(definition, planned, points, targets, seed: int) -> tuple[dict, dict]
     targets = [s for s in targets if s.provenance["source"] != "ragged"]
     terms, alphas = _alpha(StepGrid(grid), views, seed)
     labelled = [s for s in targets if s.device_s is not None]
+    labelled.sort(
+        key=lambda s: repr(s.view) if s.provenance["source"] == "replay" else ""
+    )
     kept = _kept(grid, terms, labelled, seed, alphas)
     grid = _alpha_grid(grid, {r: terms[r] for r in kept})
     lookup = StepGrid(grid)

@@ -136,16 +136,19 @@ def run(tmp_path):
     return r, here, configuration
 
 
-def record(tmp_path, run, lines, name="a", trace="trace-300", session=300, blocks=1024):
+def record(
+    tmp_path, run, lines, name="a", trace="trace-300", session=300, blocks=1024, slow=0
+):
     """`tmp_path/name`, a real run's record of `lines`, each timed at its lookup
-    times `factor`, on a pool of `blocks` KV blocks, with the export
-    `client.json` of the client run sending it from `trace`, which the export
-    gives `session`."""
+    times `factor`, the first `slow` at 3 times that, on a pool of `blocks` KV
+    blocks, with the export `client.json` of the client run sending it from
+    `trace`, which the export gives `session`."""
     r, _, configuration = run
     directory = tmp_path / name
     path = directory / "steps" / "dp0.jsonl"
     path.parent.mkdir(parents=True)
-    _record(path, [(x["rows"], x["rung"], time(x) * factor(x)) for x in lines])
+    timed = [time(x) * factor(x) * (3 if i < slow else 1) for i, x in enumerate(lines)]
+    _record(path, [(x["rows"], x["rung"], t) for x, t in zip(lines, timed)])
     written, sent = [json.loads(x) for x in path.read_text().splitlines()], {}
     for line, x in zip(written, lines):
         line |= {"produces_output": x["produces_output"]}
@@ -395,12 +398,6 @@ def test_the_residual_is_fitted_on_records_replays_or_both_and_reported_by_sourc
     assert (planned["source"], planned["traces"]) == ("plan", ["trace-300"])
 
 
-#: How many replayed decode targets a test times at 3 times their factor: more
-#: than a decode fit over 40 triples holds out, so it fits and drops one at
-#: least whatever order the store lists the triples in.
-SLOW = 11
-
-
 def replayed(tmp_path, run, lines, slow=0):
     """The tokens of `lines` replayed, each timed at its lookup times `factor`,
     the first `slow` at 3 times that."""
@@ -415,24 +412,35 @@ def replayed(tmp_path, run, lines, slow=0):
 def test_planted_outliers_are_dropped_in_their_own_source_of_the_by_source_report(
     tmp_path, run
 ):
-    """A record's targets at their factor and replays of which `SLOW` decode
-    ones are at 3 times it. The decode member drops replays alone, no prefill
-    member drops any, and the sources' kept, dropped and held-out counts add up
-    to the member's."""
+    """One target per source at 3 times its factor, the only one of its kind
+    there: a record's decode step among replayed ones, and a replayed prefill
+    chunk producing output among the record's. The selected member drops each
+    one it fits, which at seed 0 is both, in its own source, and nothing else;
+    the sources' kept, dropped and held-out counts add up to the member's."""
     g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
     for line in nodes():
         measured(tmp_path, run, line)
-    a = record(tmp_path, run, mixed(seed=3))
-    replays = replayed(tmp_path, run, mixed(), SLOW)
+    lines, replays = mixed(seed=3), mixed()
+    a = record(tmp_path, run, lines[:1] + lines[20:], slow=1)
+    replays = replayed(tmp_path, run, replays[20:21] + replays[:20], slow=1)
 
     copy = fitted(tmp_path, a, *replays, *clients(g), *clients(a), grid="grid")
 
-    for k, report in copy["report"]["kinds"].items():
+    slow = {("decode", "record"), ("prefill_output", "replay")}
+    kinds = copy["report"]["kinds"]
+    assert slow <= {(k, s) for k, report in kinds.items() for s in report["sources"]}
+    for k, report in kinds.items():
         (selected,) = copy["params"]["residual"]["kinds"][k]["selected"]
         member, sources = report["members"][selected], report["sources"]
-        assert list(sources) == ["record", "replay"]
-        assert [s["dropped"] for s in sources.values()] == [0, member["dropped"]]
-        assert bool(member["dropped"]) == (k == "decode")
+        for s, counts in sources.items():
+            if (k, s) in slow:
+                assert (counts["kept"], counts["dropped"] + counts["held_out"]) == (
+                    0,
+                    1,
+                )
+            else:
+                assert counts["dropped"] == 0
+        assert sum(s["dropped"] for s in sources.values()) == member["dropped"]
         assert sum(s["kept"] for s in sources.values()) == member["samples"]
         assert sum(s["held_out"] for s in sources.values()) == len(report["held_out"])
 
@@ -440,13 +448,13 @@ def test_planted_outliers_are_dropped_in_their_own_source_of_the_by_source_repor
 def test_a_one_source_fit_reports_its_source_at_the_members_centre_and_mad(
     tmp_path, run
 ):
-    """Replays alone, `SLOW` decode ones at 3 times their factor: per kind, the
-    source's counts, centre and MAD are the selected member's, the dropped
-    triples included in both."""
+    """Replays alone, one decode one at 3 times its factor, which seed 0 fits
+    and drops: per kind, the source's counts, centre and MAD are the selected
+    member's, the dropped triples included in both."""
     g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
     for line in nodes():
         measured(tmp_path, run, line)
-    replays = replayed(tmp_path, run, mixed() + mixed(seed=3), SLOW)
+    replays = replayed(tmp_path, run, mixed() + mixed(seed=3), slow=1)
 
     copy = fitted(tmp_path, *replays, *clients(g), grid="grid")
 
@@ -454,7 +462,7 @@ def test_a_one_source_fit_reports_its_source_at_the_members_centre_and_mad(
         (selected,) = copy["params"]["residual"]["kinds"][k]["selected"]
         member, (source,) = report["members"][selected], report["sources"].values()
         assert source["kept"] == member["samples"]
-        assert source["dropped"] == member["dropped"] >= (k == "decode")
+        assert source["dropped"] == member["dropped"]
         for spread in ("centre", "mad"):
             assert source[spread] == pytest.approx(member[spread], rel=1e-6, abs=1e-12)
 
