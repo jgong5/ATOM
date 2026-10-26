@@ -243,6 +243,10 @@ def test_records_under_two_stacks_refuse_naming_the_component_and_both_values(
             "--grid-definition is read by step-grid, not step-linear",
         ),
         (
+            ["--backend", "step-linear", "--grid=g"],
+            "--grid is read by step-grid, not step-linear",
+        ),
+        (
             ["--backend", "step-linear", "0f1e2d3c4b5a"],
             "0f1e2d3c4b5a is not a record directory",
         ),

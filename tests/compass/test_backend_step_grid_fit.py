@@ -47,6 +47,7 @@ from atom.compass.backends import (
     RequestShape,
     step_grid_fit,
     step_grid_plan,
+    step_linear_fit,
 )
 from atom.compass.backends.step_grid import (
     StepGridBackend,
@@ -110,11 +111,13 @@ def view(line) -> BatchView:
 
 
 def time(line) -> float:
-    """The planted measurement at a node, and so the lookup anywhere."""
+    """The planted measurement at a node, and so the lookup anywhere; a prefill
+    chunk with no output takes 0.5 ms less than one with output."""
     b, n_q, c = map(float, equivalent_shape(view(line).requests))
     if line["rows"][0][2]:
         return 2e-3 + 1e-5 * b + 1e-7 * c + 1e-9 * b * c
-    return 1e-3 + 1e-5 * b + 2e-6 * b * n_q + 1e-6 * c + 1e-9 * b * n_q * c
+    head = 1e-3 if line["produces_output"] else 5e-4
+    return head + 1e-5 * b + 2e-6 * b * n_q + 1e-6 * c + 1e-9 * b * n_q * c
 
 
 def factor(line) -> float:
@@ -473,6 +476,40 @@ def test_a_one_source_fit_reports_its_source_at_the_members_centre_and_mad(
         assert source["dropped"] == member["dropped"]
         for spread in ("centre", "mad"):
             assert source[spread] == pytest.approx(member[spread], rel=1e-6, abs=1e-12)
+
+
+def test_a_held_out_target_outside_the_band_members_bands_reports_an_error_of_1(
+    tmp_path, run, monkeypatch
+):
+    """Token bands split at 32 and 128. A record's one-row chunks with output,
+    timed at 1.25 times their lookup below 128 tokens and 1.5 times above, so
+    the band member is selected; and a replayed chunk of 20 tokens, the only one
+    in its band, which seed 0 holds out. The member holds no factor for that
+    band, so the replay's source reports its held-out error as a factor of 0."""
+    monkeypatch.setattr(step_linear_fit, "TOKEN_BANDS", (32, 128))
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    rng = np.random.default_rng(5)
+    qs, cs = rng.choice(np.arange(33, 256), 24, replace=False), rng.integers(1, 401, 24)
+    lines = [batch([(int(q), int(q + c), False)]) for q, c in zip(qs, cs)]
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "factor",
+        lambda x: 1.25 if x["rows"][0][0] < 128 else 1.5,
+    )
+    a = record(tmp_path, run, lines)
+    lone = batch([(20, 20, False)])
+    replay = measured(tmp_path, run, lone, "replay", time(lone) * 1.25)
+
+    copy = fitted(tmp_path, a, replay, *clients(g), *clients(a), grid="grid")
+
+    (k,) = copy["report"]["kinds"]
+    residual = copy["params"]["residual"]["kinds"][k]
+    assert k == "prefill_output" and residual["selected"] == {"band": 1.0}
+    assert "prefill tokens 0-32" not in residual["members"]["band"]["values"]
+    source = copy["report"]["kinds"][k]["sources"]["replay"]
+    assert (source["held_out"], source["held_out_error"]) == (1, 1.0)
 
 
 def test_a_fit_takes_replays_in_their_views_order_not_the_stores(
