@@ -94,10 +94,10 @@ or flat in their varying axes). The report gives, per kind, the held-out
 triples' indices, the selected member's dropped ones and, per member, the
 kept and dropped counts, the centre and scaled MAD of the relative residuals
 of those kept and dropped, the condition number of the column-scaled design,
-the zeroed features or bands and the held-out error. A fit holding a triple of no kind, or whose lookup or measured
-time is not positive and finite, is refused; so is one where a kind's triples
-hold out none or leave no more than one per coefficient, or its kept views span
-no hull, naming the kind.
+the zeroed features or bands and the held-out error. A fit holding a triple of
+no kind, or whose lookup or measured time is not positive and finite, is
+refused; so is one where a kind's triples hold out none or leave no more than
+one per coefficient, or its kept views span no hull, naming the kind.
 """
 
 from __future__ import annotations

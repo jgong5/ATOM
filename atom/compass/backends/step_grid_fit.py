@@ -42,9 +42,10 @@ by source: the triples its MAD pass kept and dropped and those held out, the
 median and scaled MAD of its relative residuals over those kept and dropped,
 as the member's are, and the median absolute one over those held out, a band
 it holds no factor for counting as a factor of 0, as the fit counts it. It
-counts the triples whose lookup is extrapolated past the KV pool, and gives per rung each alpha form's terms and errors, the views the
-grid does not read, how many it reads at their longest row past the KV pool,
-the cells' p50 without and with alpha, and whether the rung keeps it.
+counts the triples whose lookup is extrapolated past the KV pool, and gives
+per rung each alpha form's terms and errors, the views the grid does not read,
+how many it reads at their longest row past the KV pool, the cells' p50
+without and with alpha, and whether the rung keeps it.
 """
 
 import copy
