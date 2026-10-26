@@ -28,9 +28,10 @@ device stays behind the host stays in its label. On an MTP record, one with
 `d_target_ns`, the device label is the target's, `d_target_ns` with no gap,
 and the draft label is the rest of
 `d_busy_ns`. On a prefill step that produces output, the draft label's
-`propose` pass, `d_propose_ns`, is also its propose label. A decode's
-draft-KV pass, `d_draft_kv_ns`, runs before `forward_done_event`: its device
-label holds it, as its draft-KV label too, and its draft label does not. The exit of each
+`propose` pass, `d_propose_ns`, is also its propose label. An output
+forward's draft-KV pass, `d_draft_kv_ns`, runs before `forward_done_event`:
+its device label holds it, as its draft-KV label too, and its draft label
+does not; a middle chunk's stays in its draft label. The exit of each
 wait for the previous output's token copy (`t_recv_ns`)
 bounds the host clock's lead over the device's (that forward had finished by
 then); the tightest of the last `ANCHORS` bounds is the lead. The copy itself
@@ -115,7 +116,7 @@ class Sample:
     `propose_s` is its propose label, the part of `draft_s` that is the
     `propose` pass, on a prefill step that produces output; None elsewhere.
     `draft_kv_s` is its draft-KV label, the part of `device_s` that is the
-    drafter's draft-KV pass, on a decode step; None elsewhere.
+    drafter's draft-KV pass, on a step that produces output; None elsewhere.
     `host` holds the segments it has, in seconds: no `W_post` on a middle chunk,
     no `E` on the record's first forward or after an idle engine (`idle`).
     `provenance` holds `source`, `run` (the run's digest), `requests` (the
@@ -358,7 +359,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
         draft = propose = draft_kv = None
         if "d_target_ns" in s:  # an MTP record: the target alone, no gap
             target = s["d_target_ns"]
-            if not view.prefill:
+            if view.produces_output:  # the pass precedes forward_done_event
                 draft_kv = s.get("d_draft_kv_ns")
                 target += draft_kv or 0
             device = None if cut else target * 1e-9

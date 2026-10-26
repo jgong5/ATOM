@@ -76,8 +76,11 @@ under the law's `draft`; it holds no `held_out`. A step with a propose label
 (`step_labels`) is fitted there on its draft label less that label, the
 draft-KV pass a middle chunk runs too, and left out when nothing remains; the
 propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`.
-A decode's draft-KV label fits the draft law's `draft_kv` vector alike, and
-the target's vectors fit its device label less that label.
+A decode's draft-KV label fits the draft law's `draft_kv` vector alike. An
+output prefill's fits the draft law's prefill vector in place of its draft
+label, which, all after `forward_done_event`, fits the `propose` vector, and
+sets the draft law's `output_prefill_kv`. The target's vectors fit the device
+label less the draft-KV label.
 On an MTP record both prefill vectors, the target's and the draft's, add
 `seqs` and `out` (`StepLinearLaw`).
 
@@ -523,7 +526,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
 
     form, dp = _options(options)
     serial = _serial(samples, options)
-    kvs = [s for s in samples if s.draft_kv_s is not None]
+    kvs = [s for s in samples if s.draft_kv_s is not None and not s.view.prefill]
     samples = [
         (
             s
@@ -652,21 +655,35 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     drafts = [
         dataclasses.replace(
             s,
-            device_s=s.draft_s - (s.propose_s or 0.0),
+            device_s=_draft_kv(s),
             draft_s=None,
             propose_s=None,
             draft_kv_s=None,
         )
         for s in samples
-        if s.draft_s is not None and s.draft_s > (s.propose_s or 0.0)
+        if s.draft_s is not None and _draft_kv(s) > 0
     ]
     if drafts:
         law["draft"] = fit(drafts, options, seed, draft=True)[0]
-        if proposes := [s for s in samples if s.propose_s is not None]:
+        if proposes := [
+            s if s.draft_kv_s is None else dataclasses.replace(s, propose_s=s.draft_s)
+            for s in samples
+            if s.propose_s is not None
+        ]:
             law["draft"]["propose"] = _propose(proposes)
         if kvs:
             law["draft"]["draft_kv"] = _propose(kvs, "draft_kv_s")
+        if any(s.view.prefill and s.draft_kv_s is not None for s in samples):
+            law["draft"]["output_prefill_kv"] = True
     return law, report
+
+
+def _draft_kv(s) -> float:
+    """The draft prefill vector's label of `s`: an output prefill's draft-KV
+    label, else its draft label less any propose label."""
+    if s.view.prefill and s.draft_kv_s is not None:
+        return s.draft_kv_s
+    return s.draft_s - (s.propose_s or 0.0)
 
 
 def _propose(samples, label: str = "propose_s") -> dict:
