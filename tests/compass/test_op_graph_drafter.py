@@ -22,7 +22,7 @@ import pytest
 import torch
 from test_artifact_store import CONDITIONS, GATES, stanza
 from test_backend_step_linear import _installed, view
-from test_capture_ir import TREE, _ops, _record
+from test_capture_ir import MAIN, TREE, _ops, _record
 from test_dp_step_max import runner
 from test_memory_readings import WORKER
 from test_op_graph import FLAT, GEMM, MIDDLE, _engine, by_name, g
@@ -85,7 +85,7 @@ def capture(drafts, tmp_path_factory, shape=("--width", "2"), dp=1):
         [
             sys.executable,
             "-c",
-            "import sys; from atom.compass.cli import main; main(sys.argv[1:])",
+            MAIN,
             *argv,
         ],
         capture_output=True,
@@ -512,7 +512,7 @@ def _population(tmp_path_factory, line, drafts):
         [
             sys.executable,
             "-c",
-            "import sys; from atom.compass.cli import main; main(sys.argv[1:])",
+            MAIN,
             *argv,
         ],
         capture_output=True,

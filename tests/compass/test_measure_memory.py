@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 import pytest
 from test_artifact_invalidation import BASE, STANZA
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_drive_gpu import FREE, _plant
 from test_memory_readings import (
     CONFIG_JSON,
@@ -201,16 +202,21 @@ def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(
-    "gpus, cards",
+    "gpus, asked, cards",
     [
-        ("5", [dict(MI355X, name="MI308X", arch="gfx942")]),
-        ("4,5", [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")]),
+        ("5", (5,), [dict(MI355X, name="MI308X", arch="gfx942")]),
+        (
+            "4,5",
+            (4, 5),
+            [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")],
+        ),
     ],
 )
 def test_a_start_on_another_device_than_the_spec_states_refuses_naming_both(
-    tmp_path, monkeypatch, gpus, cards
+    tmp_path, monkeypatch, gpus, asked, cards
 ):
-    monkeypatch.setattr(measure_memory, "_device", lambda gpus: cards)
+    # Only the GPUs `--gpu` names have cards; asking about any others raises.
+    monkeypatch.setattr(measure_memory, "_device", {asked: cards}.__getitem__)
     machine = tmp_path / "machine.json"
     machine.write_text(json.dumps(DOCUMENT))
     flags = ["--gpu", gpus, "--machine", str(machine), "--store", str(tmp_path / "s")]

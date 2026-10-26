@@ -87,8 +87,9 @@ def _tree(tmp_path, driver=DRIVER, smoke=SMOKE):
         path.write_text(text)
     (root / "scripts" / "compass" / "preflight.sh").chmod(0o755)
     hub = tmp_path / "hf" / "hub"
-    for name in ("Qwen3-0.6B", "Qwen3.5-9B", "Qwen3.8-27B"):
+    for name in ("Qwen3-0.6B", "Qwen3.5-9B", "Qwen3.5-0.8B", "Qwen3.8-27B"):
         (hub / f"models--Qwen--{name}" / "snapshots" / "abc").mkdir(parents=True)
+    (tmp_path / "dspark").mkdir()
     (tmp_path / "bin").mkdir()
     (tmp_path / "bin" / "atomesh").write_text("")
     (tmp_path / "traces.jsonl").write_text("{}\n")
@@ -106,6 +107,7 @@ def _run(tmp_path, root, **env_over):
     env["HF_HOME"] = str(tmp_path / "hf")
     env["ATOMESH"] = str(tmp_path / "bin" / "atomesh")
     env["ATOM_COMPASS_CCTRACES"] = str(tmp_path / "traces.jsonl")
+    env["ATOM_COMPASS_DSPARK_MODEL"] = str(tmp_path / "dspark")
     env["COMPASS_HARNESS_PYTHON"] = env["COMPASS_AIPERF_PYTHON"] = sys.executable
     env["HIP_VISIBLE_DEVICES"] = "4,5,6,7"
     env["RUNS"] = str(root / "runs.txt")
@@ -139,11 +141,28 @@ def test_driver_run_tests_run_once_on_every_card_with_their_inputs(tmp_path):
     )
 
 
+def test_the_speculative_models_reach_the_tests(tmp_path):
+    spec = "' '.join(os.environ[f'ATOM_COMPASS_{m}_MODEL'] for m in ('MTP', 'DSPARK'))"
+    root = _tree(tmp_path, DRIVER.replace("'compass'", spec))
+    out, verdict = _run(tmp_path, root)
+    assert verdict == "GATE_GPU_RC=0 PASSED", out.stdout[-3000:]
+    mtp = f"{tmp_path}/hf/hub/models--Qwen--Qwen3.5-0.8B/snapshots/abc/"
+    assert f"{mtp} {tmp_path}/dspark 4,5,6,7 " in (root / "runs.txt").read_text()
+
+
 @pytest.mark.parametrize(
     "env, named",
     [
         ({"HF_HOME": "/nonexistent"}, "ATOM_COMPASS_SLICE_MODEL, a Qwen3-0.6B"),
         ({"ATOM_COMPASS_IMAGE_MODEL": "/nonexistent"}, "ATOM_COMPASS_IMAGE_MODEL"),
+        (
+            {"ATOM_COMPASS_MTP_MODEL": "/nonexistent"},
+            "ATOM_COMPASS_MTP_MODEL, a Qwen3.5-0.8B",
+        ),
+        (
+            {"ATOM_COMPASS_DSPARK_MODEL": "/nonexistent"},
+            "ATOM_COMPASS_DSPARK_MODEL /nonexistent",
+        ),
         (
             {"ATOM_COMPASS_CCTRACES_MODEL": "/nonexistent"},
             "ATOM_COMPASS_CCTRACES_MODEL, a Qwen3.8-27B",
@@ -188,6 +207,8 @@ def test_a_missing_input_refuses_by_name_before_any_test(tmp_path, env, named):
     [
         ("driver", "needs ATOMESH, atomesh", "test_d.py"),
         ("smoke", "needs COMPASS_AIPERF_PYTHON", "test_cctraces_sim_smoke.py"),
+        ("driver", "needs ATOM_COMPASS_MTP_MODEL naming a model", "test_d.py"),
+        ("driver", "needs ATOM_COMPASS_DSPARK_MODEL naming a model", "test_d.py"),
     ],
 )
 def test_a_driver_run_skip_fails_by_name(tmp_path, which, reason, where):

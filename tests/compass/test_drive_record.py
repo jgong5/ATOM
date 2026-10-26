@@ -127,15 +127,6 @@ def test_dp_ranks_resolving_different_engines_refuse_the_entry(tmp_path, monkeyp
     with pytest.raises(ValueError, match=refusal):
         record.write_engine_and_costs(out)
     assert "engine" not in json.loads((out / "run.json").read_text())
-
-
-def test_dp_ranks_resolving_different_engines_keep_their_cost_lines(
-    tmp_path, monkeypatch
-):
-    out = _two_ranks(tmp_path, monkeypatch, 4000, max_num_seqs=4)
-
-    with pytest.raises(ValueError, match="resolved different engines"):
-        record.write_engine_and_costs(out)
     for r in (0, 1):
         rows = label(out / f"steps/dp{r}.jsonl")[1]
         assert rows

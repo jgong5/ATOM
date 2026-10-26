@@ -451,6 +451,7 @@ def _dp2_record(directory, monkeypatch):
                 produces_output=lambda: True,
             )
             record.add(batch, runner, lambda batch: None)
+        record.write()
 
 
 def test_a_dp2_record_rebuilds_each_step_s_group_counts(tmp_path, monkeypatch):

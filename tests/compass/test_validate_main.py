@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_fit_ops import measured  # noqa: F401, a fixture
 from test_memory_check import GIB, _log
 from test_memory_readings import DOCUMENT
@@ -558,6 +559,32 @@ def test_runs_record_and_run_wrote_at_another_concurrency_are_not_one_cell(
     concurrency = r"\{'phases.profiling.concurrency': \{.*real1': 16, .*\}\}$"
     with pytest.raises(ValueError, match=f"given different arguments: {concurrency}"):
         main([str(tmp_path / "c4")])
+
+
+@pytest.mark.parametrize("finishing", ["real1", "step_linear"])
+def test_a_cctraces_sim_run_still_finishing_refuses_naming_it(
+    capsys, tmp_path, finishing
+):
+    """`cctraces_sim.sh` writes its client run's export after aiperf's,
+    once its server has left."""
+    _rows(capsys, tmp_path)
+    cell = tmp_path / "c4"
+    stated = {d: (d / "run.json").read_text() for d in cell.iterdir()}
+    _as_recorded(cell)
+    for d, run in stated.items():
+        (d / "run.json").write_text(run)
+    assert _graded(capsys, cell)["cell", "verdict"] == ["3 real runs", "graded"]
+    (cell / finishing / CLIENT_RUN).unlink()
+
+    validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
+    done = subprocess.run(validate, capture_output=True, text=True, check=False)
+
+    held = sorted(str(d) for d in cell.iterdir() if d.name != finishing)
+    refusal = (
+        f"['{cell / finishing}'] hold no {CLIENT_RUN} and {held} do; "
+        "a cctraces_sim.sh run still finishing is not graded\n"
+    )
+    assert (done.returncode, done.stderr) == (1, refusal)
 
 
 #: A workload as `cctraces_sim.sh` and `client.sh` state it.
