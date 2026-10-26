@@ -59,7 +59,7 @@
 # table or summary; it saves rocm-smi's process listing before and after it in
 # gpu_before.txt and gpu_after.txt, and its result names the processes on its
 # GPUs (HIP_VISIBLE_DEVICES, default 0, as rocm-smi indexes them), with their
-# VRAM bytes; its run.json names in `aiter_jit_builds` each aiter JIT module
+# VRAM bytes; its run.json names in `aiter_jit_builds` each JIT module or kernel
 # built, or begun, while its server served, which grading, the fits and
 # `validate.cost` refuse (atom/compass/drive/aiter_jit.py).
 # It keeps Triton's autotune results in TRITON_CACHE_DIR, the caller's or the

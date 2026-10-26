@@ -28,7 +28,7 @@ the switch on, Triton loads an autotuned kernel's choice for a shape an earlier
 server of the same directory tuned; a shape the cache lacks still tunes on its
 first launch, inside the record.
 
-run.json's ``aiter_jit_builds`` names each aiter JIT module built, or begun,
+run.json's ``aiter_jit_builds`` names each aiter JIT module or kernel built, or begun,
 since serve wrote ``server.json``, when ``/health`` first answered
 (`aiter_jit`): a step may have waited on its build, so grading, `compass fit
 steps`, `compass fit host`, `step_linear_fit` and `validate.cost` refuse the
