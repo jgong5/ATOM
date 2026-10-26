@@ -11,7 +11,9 @@ over the modules `run.modules.walk` reads off the meta build ATOM's arguments
 configure, and at op level by `OpGraphBackend`, over the `op_graph`s `compass
 trace ops` published in S for the spec's arch; both price the rows a replayed
 graph pads to. Each price is compared with the step's device busy time,
-`d_busy_ns`, or on an MTP record the target's, `d_target_ns`.
+`d_busy_ns`, or on an MTP record the target's, `d_target_ns`, against the
+target's price alone: a drafter's price, which the op level adds, is reported
+apart.
 With `--ratios-from`, the prices are --machine's datasheet peaks at the other
 spec's probed ratios (`project.projected`): run on a device's own records,
 the report is the error of projecting it from the other.
@@ -32,7 +34,7 @@ roofline part that set them (`CostTerm.by_bound`), and those of a term no part
 set, an overlapped step's, `unattributed`; and the records ranked by tokens a
 second over the steps priced at that granularity, analytical against
 measured: whether measured's fastest is analytical's fastest (top-1), or
-among its first three (top-3).
+among its first three (top-3); and per phase the drafter's analytical seconds.
 
 Per op kind (`--ops`, a `measure ops --plan` run's `--out`): each point its
 plan.jsonl holds measured, its cold time over the analytical price of the same
@@ -164,6 +166,7 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
         violations, refused, rates, unpriced = [], Counter(), {}, 0
         seconds = {p: [] for p in PHASES}  # (measured, priced) per step
         parts = {p: [] for p in PHASES}  # each term's seconds by bound
+        drafts = Counter()  # the drafter's seconds by phase
         for record in records:
             tokens = measured_s = priced_s = 0.0
             for name, view, measured in steps(record, tbo, mtp):
@@ -175,8 +178,10 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
                     refused.update(str(r) for r in dict.fromkeys(e.declined))
                     unpriced += 1
                     continue
-                priced = cost.seconds
+                priced = cost.target_seconds
                 seconds[_phase(view)].append((measured, priced))
+                if cost.draft_terms:
+                    drafts[_phase(view)] += cost.draft_seconds
                 parts[_phase(view)] += [
                     t.by_bound or {UNATTRIBUTED: t.seconds} for t in cost.terms
                 ]
@@ -218,6 +223,7 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
                 if s
             },
             "ranking": _ranking(rates),
+            "draft_s": dict(drafts),
         }
     return report
 
@@ -345,6 +351,8 @@ def text(report: dict) -> str:
         out.append("  measured over analytical: phase | min | p10 | median | p90 | max")
         for phase, q in r["measured_over_analytical"].items():
             out.append(f"  {phase} | " + " | ".join(f"{x:.3f}" for x in q.values()))
+        for phase, s in r["draft_s"].items():
+            out.append(f"  drafter, not compared: {phase} {s * 1e3:.3f} ms analytical")
         if (k := r["ranking"]) is not None:
             out.append(
                 f"  ranking: top-1 {k['top_1']}, top-3 {k['top_3']}; measured fastest {k['measured_fastest']}"
@@ -392,12 +400,12 @@ def _build(model: str, tp: int, atom_args, arch: str, tmpdir: str):
 
 def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=None):
     """ATOM's config for its arguments, the EP width its MoE resolves and the
-    step- and op-level backends pricing `records` on `machine`, the op_graphs
-    `store` holds for its arch. Refused: a record, or the `measure ops` run
+    step- and op-level backends pricing `records` on `machine`, the op level
+    as a simulated run's (`run.op_graph`) over the op_graphs `store` holds for
+    its arch. Refused: a record, or the `measure ops` run
     `ops`, that ran under another engine; two-batch overlap no line splits."""
-    from atom.compass.backends.op_graph import OpGraphBackend
     from atom.compass.backends.step_roofline import StepRooflineBackend
-    from atom.compass.run import _op_graphs, ep_width
+    from atom.compass.run import ep_width, op_graph
     from atom.compass.run.modules import walk
 
     arch = machine.value("device.arch")
@@ -436,13 +444,7 @@ def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=N
         ep,
         {
             "step": StepRooflineBackend(machine, walk(tree)),
-            "op": OpGraphBackend(
-                machine,
-                _op_graphs(store, config, arch),
-                tp=config.tensor_parallel_size,
-                ep=ep,
-                kv=config.kv_cache_dtype,
-            ),
+            "op": op_graph({"store": store}, config, machine, ep),
         },
     )
 
