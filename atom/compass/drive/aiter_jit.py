@@ -11,7 +11,7 @@ tree; the step that meets it waits on the build, about a minute for
 ``~/.aiter``, which holds ``jit`` when the package's is read-only, and
 ``AITER_ROOT_DIR``, ``~/.aiter`` unless set, where its templated modules
 build. The roots are found from the installed aiter, which is not imported. A
-module counts, named by its directory, when a file inside that directory was
+module counts, named by its directory, when a path inside that directory was
 written at or after serving began, so a build the server's stop cut short
 counts too, and the modules a start builds, before ``/health`` answers, do
 not. A module another server of the same aiter tree built meanwhile counts as
@@ -49,29 +49,31 @@ def _roots() -> dict[Path, object]:
     except ValueError:  # an `aiter` in sys.modules with no spec, as a stub is
         spec = None
     package = [Path(p, "jit") for p in (spec and spec.submodule_search_locations) or ()]
-    env = [os.environ.get(k) for k in ("AITER_JIT_DIR", "AITER_ROOT_DIR")]
+    env = [
+        Path(os.environ[k])
+        for k in ("AITER_JIT_DIR", "AITER_ROOT_DIR")
+        if os.environ.get(k)
+    ]
     flydsl = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR")
     flydsl = [flydsl] if flydsl else [p / "flydsl_cache" for p in package]
     inductor = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or default_cache_dir()
     kernels = (knobs.cache.dir, inductor, Path.home() / ".cache" / "atom")
     return (
-        {Path(p): _module for p in (Path.home() / ".aiter", *env, *package) if p}
+        {p: _module for p in (Path.home() / ".aiter", *env, *package)}
         | {Path(p): lambda parts: parts[0] if len(parts) > 1 else None for p in flydsl}
         | {Path(p): lambda parts: _file(parts[-1]) for p in kernels}
     )
 
 
 def _file(name: str) -> str:
-    """A compiled kernel's name, from the name of one of its files."""
     return name.split(".")[0].removeprefix("__grp__")
 
 
 def _module(parts: tuple[str, ...]) -> str | None:
     """The module whose build directory holds the path `parts` names under a
-    root: the directory after its first ``build``, when the path is inside it,
-    or the kernel `compile_hsaco` wrote there."""
+    root: the directory after its first ``build``, when the path is inside it."""
     i = parts.index("build") if "build" in parts else len(parts)
-    if len(parts) > i + 2 and parts[i + 1].startswith("gfx"):
+    if len(parts) > i + 2 and parts[i + 1].startswith("gfx"):  # compile_hsaco's
         return _file(parts[i + 2])
     return parts[i + 1] if len(parts) > i + 2 else None
 
