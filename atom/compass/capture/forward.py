@@ -927,9 +927,12 @@ def _build_runner(config, fake_mode):
     # A fake tensor has no address: the alias check sees each buffer empty.
     # Built in the inference mode its steps run in, so their views of its
     # weights and buffers keep the keys of what they view.
-    with fake_mode, patch.object(h2d, "_range", lambda t: (0, 0)):
-        with torch.inference_mode():
-            return _CapturedRunner(0, config)
+    with (
+        fake_mode,
+        patch.object(h2d, "_range", lambda t: (0, 0)),
+        torch.inference_mode(),
+    ):
+        return _CapturedRunner(0, config)
 
 
 def _drafter(runner, recorder):
