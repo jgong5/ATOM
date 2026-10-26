@@ -191,14 +191,13 @@ class _Server:
                 self._slots[i].put(frame)
             for i in resigned:
                 del self._slots[i]
+                left.discard(i)
 
     def _client_done(self, lp) -> bool:
         """`lp` is the client and waits with N at ``+inf``: until a message for
         it arrives, it sends nothing. False when the LP table cannot be read."""
-        if lp != self._authority.client:
-            return False
         try:
-            return any(
+            return lp == self._authority.client and any(
                 r.lp == lp and r.n == math.inf for r in self._authority.lp_table()
             )
         except Exception:  # noqa: BLE001 - its close then ends the run, named
