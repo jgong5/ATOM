@@ -585,8 +585,8 @@ receive (Q3).
 `f4e7c7509` (`v0.1.21.dev0-49-gf4e7c7509`) in node 18's `xiaobizh_n18` and
 `xiaobizh_n18_cpu`, where every aiter line quoted below is byte-identical at the same
 numbers. Two aiter versions are in circulation on this project and they agree here; that
-they agree is a reading, not a guarantee, and no artifact key currently records which one
-answered — **T86**.
+they agree is a reading, not a guarantee. An entry does not answer across them: the
+machine-spec key pins aiter's commit (T86, closed by the owner's [ruling on #168](https://github.com/jgong5/ATOM/issues/168#issuecomment-6399062318)).
 
 **ATOM does not construct the EP group — aiter does.** No ATOM file assigns `_EP`, and
 every use site imports `get_ep_group` from `aiter.dist.parallel_state` (`moe.py::FusedMoEMethodBase._maybe_make_prepare_finalize`,

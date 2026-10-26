@@ -15,6 +15,7 @@ Nothing here touches a driver, a device or a network:
 are exercised without the CPU gate depending on the tree it was staged from.
 """
 
+import dataclasses
 import json
 import pathlib
 import sys
@@ -879,3 +880,35 @@ def test_two_source_roots_may_not_share_a_name():
             (ATOM_ROOT, ATOM_ROOT, AITER_ROOT),
         )
     assert "share a name" in str(refused.value)
+
+
+def _publish_from(store: ArtifactStore, atom: SourceRoot):
+    topology = Topology(tp=2)
+    return store.publish(
+        price_key(2),
+        provenance=Provenance(
+            "phase 1b", "2026-09-22T11:00:00+00:00", (atom, AITER_ROOT)
+        ),
+        conditions=CONDITIONS,
+        gates=GATES,
+        topology=topology,
+        members=members_for(topology, "prices", "json"),
+    )
+
+
+def test_a_dirty_source_root_does_not_publish(tmp_path):
+    """A checkout is keyed by its HEAD, which is not what ran with files uncommitted."""
+    store = ArtifactStore(tmp_path)
+    with pytest.raises(ArtifactRefusal) as refused:
+        _publish_from(store, dataclasses.replace(ATOM_ROOT, dirty=2))
+    assert refused.value.rule is Rule.PROVENANCE
+    assert "uncommitted files: atom (2)" in str(refused.value)
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_stamped_root_of_unknown_dirtiness_publishes(tmp_path):
+    stamped = dataclasses.replace(ATOM_ROOT, revision_kind="commit", dirty=None)
+    assert (
+        _publish_from(ArtifactStore(tmp_path), stamped).provenance.source_roots[0]
+        == stamped
+    )

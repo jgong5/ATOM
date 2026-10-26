@@ -182,6 +182,17 @@ def test_a_record_serving_two_sets_of_request_parameters_refuses(tmp_path, monke
         load({a: runs})
 
 
+def test_a_record_run_on_a_dirty_tree_refuses_naming_it(tmp_path, monkeypatch):
+    a = record(tmp_path, monkeypatch, source={**SOURCE, "dirty": 1})
+
+    with pytest.raises(ValueError) as refused:
+        load({a: RUNS})
+    assert str(refused.value) == (
+        f"{a} ran with 1 uncommitted files in its source tree; "
+        "commit them and run again"
+    )
+
+
 def test_each_sample_copies_its_input_s_provenance_and_the_traces_it_served(
     tmp_path, monkeypatch
 ):
