@@ -20,7 +20,9 @@ requests under `--sampling` alone, and it states the engine ATOM's arguments
 resolve, `keyed`'s fields, at data-parallel width 1, the bench's.
 
 The bench measures at tensor parallel 1: above it, a point charges the ranks'
-preload skew (#1188), so a deployment of more ranks refuses.
+preload skew (#1188), so a deployment of more ranks refuses. A prefill or
+decode context-parallel width above 1 refuses too: a bundle states no such
+width.
 
 A batch is a line's view: its `rows`, `rung` and `produces_output`, and the
 KV blocks its rows share where a planned line states them (`shared`). The
@@ -109,6 +111,12 @@ def main(argv: list[str]) -> None:
             "charges the ranks' preload skew (#1188), so measure steps measures "
             "at tensor parallel 1 until that is fixed"
         )
+    for name in ("prefill_context_parallel_size", "decode_context_parallel_size"):
+        if (width := getattr(config, name)) > 1:
+            raise ValueError(
+                f"{name} {width}: a step grid bundle states no context-parallel "
+                "width, so measure steps measures at width 1"
+            )
     engine = keyed(config)
     store, out = ArtifactStore(args.store), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

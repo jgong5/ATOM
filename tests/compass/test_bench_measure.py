@@ -91,7 +91,7 @@ def run(tmp_path, monkeypatch, model_dir):  # noqa: F811
     `input`, their requests sent under `sampling`, trace i at session i;
     run.json's identity is `run.identity`."""
     rec = record(tmp_path, monkeypatch)
-    config = _config()
+    config = _config(prefill_context_parallel_size=1)
     config.model, config.trust_remote_code = str(model_dir), False
     config.hf_config = SimpleNamespace(model_type="llama")
     monkeypatch.setattr(measure, "atom_config", lambda atom_args: config)
@@ -575,6 +575,21 @@ def test_a_deployment_above_tensor_parallel_1_refuses_naming_the_skew_issue(run)
     run.config.tensor_parallel_size = 2
     with pytest.raises(SystemExit, match=r"tensor parallel size 2: .*\(#1188\)"):
         run(str(run.record), "--sample", "all", *run.named(run.record))
+    assert Bench.started == []
+
+
+@pytest.mark.parametrize(
+    "name", ["prefill_context_parallel_size", "decode_context_parallel_size"]
+)
+def test_a_context_parallel_width_refuses_over_a_store_that_holds_every_point(
+    run, name
+):
+    named = run.named(run.record)
+    run(str(run.record), "--sample", "all", *named)
+    Bench.started.clear()
+    setattr(run.config, name, 2)
+    with pytest.raises(SystemExit, match=rf"{name} 2: .*no context-parallel width"):
+        run(str(run.record), "--sample", "all", *named)
     assert Bench.started == []
 
 

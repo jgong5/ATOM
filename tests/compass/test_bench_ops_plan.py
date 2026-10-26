@@ -1235,3 +1235,41 @@ def test_coverage_traces_a_dpa_tp8_graph_and_reads_it_at_tp1_dp8(tmp_path, monke
         "decode": {"steps": 1, "covered": 0},
         "prefill": {"steps": 1, "covered": 0},
     }
+
+
+def _kinked_bench(fn, config, todo, llc):
+    """`_bench` with the prefill GEMM five times steeper past 150 tokens, one
+    kernel either side."""
+    got = _bench(fn, config, todo, llc)
+    for r in got:
+        if r["op"] == "aiter.gemm" and r["shape"].startswith("prefill"):
+            r["cold_ns"] += 4e3 * max(ops._shape(r["shape"]).tokens - 150, 0)
+    return got
+
+
+def test_coverage_leaves_out_a_step_inside_a_gap_the_fit_declines(
+    bench, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ops, "_child", _kinked_bench)
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[40, 40, False]], None),
+        ([[150, 150, False]], None),
+        ([[400, 400, False]], None),
+    )
+    records = _plan(bench, tmp_path, population)
+    params = fit_ops.fit(records)
+    fit_ops.held_out(params)
+    # T = 150 reads +67% off 122 and 400, its neighbours along the GEMM's T
+    graded = _records(
+        tmp_path / "graded", ([[120, 120, False]], None), ([[200, 200, False]], None)
+    )
+    store, root, _, _ = bench
+
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
+
+    assert report["by phase"] == {"prefill": {"steps": 2, "covered": 1}}
+    assert report["left out, by leaf kind"] == {"aiter.gemm": {"the fit declined T": 1}}
+    gaps = [d[2:4] for f in params["families"].values() for d in f["declined"]]
+    assert gaps == [[122, 400]]
