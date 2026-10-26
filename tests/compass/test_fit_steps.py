@@ -33,6 +33,7 @@ from atom.compass.backends import StepLinearLaw, step_linear_fit
 from atom.compass.backends.step_labels import digest
 from atom.compass.drive.aiter_jit import BUILDS
 from atom.compass.fit import publish
+from atom.compass.parity import TRANSFERS
 from atom.compass.run.step_grid import BOUNDS
 from atom.compass.spec import MachineSpec
 
@@ -264,6 +265,32 @@ def test_a_record_no_client_run_names_refuses_naming_it(tmp_path):
     with pytest.raises(SystemExit, match=re.escape(f"{a} is named by no --client-run")):
         fit(tmp_path, "fit steps", *LINEAR, a)
     assert not (tmp_path / "store").exists()
+
+
+def test_a_deployment_s_prefill_side_fits_from_the_deployment_s_export(tmp_path):
+    # Prefill's record names each request `p-<key>`; the export, beside
+    # prefill/ and decode/, names it `d-<key>`, as decode's response id that
+    # decode's transfers join to prefill's DP rank and request id.
+    p = record(tmp_path / "cell/prefill", 19)
+    path = p / "steps/dp0.jsonl"
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    for line in lines:
+        line["named"] = [[r, k, f"p-{k}"] for r, k in line["named"]]
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    sent = json.loads((p / "client.json").read_text())["requests"]
+    export = tmp_path / "cell/client_run.json"
+    export.write_text(json.dumps({"requests": {f"d-{k}": v for k, v in sent.items()}}))
+    joined = [
+        {"response_id": f"d-{k}", "remote_dp_rank": 0, "transfer_id": int(k[1:])}
+        for k in sent
+    ]
+    decode = tmp_path / "cell/decode/steps"
+    decode.mkdir(parents=True)
+    (decode / TRANSFERS).write_text("".join(json.dumps(t) + "\n" for t in joined))
+    fit(tmp_path, "fit steps", *LINEAR, p, "--client-run", p, export)
+
+    report = member(tmp_path / "store", law_key(), "report")
+    assert report["provenance"] == served(HOST, {p: "trace"})
 
 
 @pytest.mark.parametrize(
