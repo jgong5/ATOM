@@ -63,7 +63,8 @@ mkdir -p "$OUT" && OUT=$(realpath "$OUT")
 # Every path is absolute from here, and nothing resolves `atom` from $PWD.
 cd / || exit 1
 start=$SECONDS
-# A failed step stops whatever server is still up before the script exits.
+# Any exit, a failed step's or a SIGTERM's, stops what is still running: each
+# step and client run runs in the background, as a job this trap reaches.
 trap 'kill -TERM $(jobs -p) 2>/dev/null; wait' EXIT
 fail() { echo "smoke_cell: step $1 failed: $2" >&2; exit 1; }
 say() { echo "smoke_cell: $1 $(date -u +%FT%TZ)"; }
@@ -81,7 +82,8 @@ step() {
     local name=$1
     shift
     say "$name"
-    "$@" >"$OUT/$name.log" 2>&1 || fail "$name" "exit $?; see $OUT/$name.log"
+    "$@" >"$OUT/$name.log" 2>&1 &
+    wait $! || fail "$name" "exit $?; see $OUT/$name.log"
 }
 
 # serve NAME DIR A-B PYTHON COMMAND...: one compass server writing to DIR, one
@@ -99,8 +101,8 @@ serve() {
         sleep 1
     done
     HARNESS_PYTHON=$python "$ROOT/scripts/compass/client.sh" "$dir" --traces "$traces" \
-        --concurrency 1 --duration "$DURATION_S" --stop >"$OUT/$name.client.log" 2>&1 ||
-        fail "$name" "client.sh exit $?; see $OUT/$name.client.log"
+        --concurrency 1 --duration "$DURATION_S" --stop >"$OUT/$name.client.log" 2>&1 &
+    wait $! || fail "$name" "client.sh exit $?; see $OUT/$name.client.log"
     wait $pid || fail "$name" "its server exit $?; see $OUT/$name.log"
 }
 
