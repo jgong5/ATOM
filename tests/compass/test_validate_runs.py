@@ -194,6 +194,19 @@ def test_the_command_refuses_a_malformed_run_json_naming_it(tmp_path):
     assert (done.returncode, done.stderr) == (1, refusal)
 
 
+def test_the_command_refuses_a_run_still_recording_naming_it(tmp_path):
+    cells = [_cell(tmp_path / c, _schedule(), {}) for c in ("sim", "real0", "real1")]
+    for cell in cells[::2]:  # their aiperf exports not yet written
+        (cell / "artifacts" / "profile_export_aiperf.json").unlink()
+    runs = [sys.executable, "-m", "atom.compass.validate.runs", *map(str, cells)]
+    done = subprocess.run(runs, capture_output=True, text=True, check=False)
+
+    export = "artifacts/profile_export_aiperf.json"
+    bare = [str(cells[2]), str(cells[0])]
+    refusal = f"{bare} hold no {export}; a run still recording is not graded\n"
+    assert (done.returncode, done.stderr) == (1, refusal)
+
+
 def test_prefill_tokens_grade_the_requests_both_runs_issued(tmp_path):
     def run(name, ids, hit=0, extra=False):
         """Requests of 100 and 50 prompt tokens, `hit` of the second cached;
