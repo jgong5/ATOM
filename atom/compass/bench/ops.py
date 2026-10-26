@@ -125,7 +125,9 @@ every point held, a measured one with its store token, in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
 covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
-and prints the count by phase and why each leaf kind left the rest out.
+a step only when `fit ops`' price list of those points prices each leaf but a
+collective, and prints the count by phase and why each leaf kind left the rest
+out.
 """
 
 import argparse
@@ -1870,11 +1872,18 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     decode leaf of a kind that depends on context over its rows' lowest to
     highest context (`_rows`), any other decode leaf at its width, a prefill
     leaf at its tokens, and one of a kind that depends on context over its
-    rows' cached tokens too (`_bracket_cached`). The graphs are `arch`'s."""
+    rows' cached tokens too (`_bracket_cached`); and, but for a collective,
+    which it does not price, `fit ops`' price list of `records` prices it at
+    the step, as `compass run --coverage` asks it. The graphs are `arch`'s."""
+    from atom.compass.backends.op_graph import band
+    from atom.compass.backends.provenance import Refusal
     from atom.compass.capture import population_steps
+    from atom.compass.fit.ops import PriceList, fit, held_out
 
     steps = list(population_steps(names))
     dependent = _dependent(records)
+    held_out(params := fit([r for r in records if "refused" not in r]))
+    listed = PriceList(params)
     axes, cuts = {}, defaultdict(dict)
     for fam, points in _families(records, dependent).items():
         axes[fam] = [p[0] for p in points], [p[1] for p in points]
@@ -1884,14 +1893,18 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     _load(store, config, root, {s for s, _ in steps}, graphs, arch, atom_args)
     families = {
         s: [
-            (op["op"], *_family(s, None, op["op"], sig, dependent))
+            (op["op"], *_family(s, None, op["op"], sig, dependent), op)
             for sig, (op, _) in g.items()
         ]
         for s, g in graphs.items()
     }
     for shape, line in steps:
-        whys = {}
-        for name, fam, tokens in families[shape]:
+        whys, decoding = {}, shape.phase == "decode"
+        mean, top = band(line["rows"], decoding)
+        bound = (*shape[:4], mean, top)
+        if decoding:  # its max, then its mean over B, as `OpGraphBackend` asks
+            bound = (*shape[:4], top, sum(r[1] for r in line["rows"]) / shape.seqs)
+        for name, fam, tokens, op in families[shape]:
             moves = dependent.get(name, True)
             cut = _cut(fam)
             if cut and cut[0] in cuts:
@@ -1907,6 +1920,9 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 why = _bracket(*axes[fam], *_rows(line, shape.seqs)) if moves else ""
             else:
                 why = _bracket(*axes[fam], tokens, tokens)
+            listing = not why and not _exchanged(fam)
+            if listing and isinstance(got := listed.price((op, bound, None)), Refusal):
+                why = re.sub(r"\d+", "#", got.reason.split(": ")[1])
             if why:
                 whys[name] = why
         report[shape.phase].update(steps=1, covered=not whys)
