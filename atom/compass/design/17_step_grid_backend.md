@@ -48,6 +48,13 @@ the owner's ruling (a) on #1465:** a decode corner past the KV pool unshared is 
 with its rows sharing prefix blocks in a pool the target's size (D98), so the extrapolation
 past the pool (D99) reads only a corner left unmeasured.
 
+**Revised 2026-10-26 by [#2152](https://github.com/jgong5/ATOM/issues/2152), under the
+owner's [stage-4 ruling on #2138](https://github.com/jgong5/ATOM/issues/2138):** the
+step grid prices the two MI455 cells, DP-attention with EP8 and TBO, and MTP. A DP rank
+prices its own batch and the group takes `15` D90's `max` (D97); decode is measured at the
+group's rung, prefill gains the group's MoE rows as a fourth axis, a split TBO step reads
+grids of its own, and a drafter's passes are a second value of every point (D98 to D100).
+
 **Depends on:** `02` (the backend interface, the forward's interval, the method
 vocabulary), `07` (the two granularities, the bench, artifact identity and invalidation), `08` (stage 2's
 protocol and the refusal rule), `09` (the hull and law
@@ -58,7 +65,8 @@ of measured whole-forward times, looked up for each batch, plus a residual, fitt
 real-run step times, bench replays or both, that carries what the grid's coordinates
 cannot see. It is a candidate backend for
 [#627](https://github.com/jgong5/ATOM/issues/627)'s stage 2 and gets one
-non-graded evaluation on DeepSeek-V4-Pro. It does not cover the op level; the step linear law of `09`
+non-graded evaluation on DeepSeek-V4-Pro, and one on the two MI455 cells of
+[#2138](https://github.com/jgong5/ATOM/issues/2138)'s stage 4. It does not cover the op level; the step linear law of `09`
 D54, which stage 2 prices with ([#738](https://github.com/jgong5/ATOM/issues/738)) and
 whose DP-attention form is [#529](https://github.com/jgong5/ATOM/issues/529)'s in stage 3;
 or KV transfer (`01` D6).
@@ -125,7 +133,7 @@ all reported, and the chosen form is tested on a second axis. That data comes fr
 256 to 392, never from the traces grading holds out.
 
 Stage 2 has no MTP. MTP is M2's, on DeepSeek-V4-Pro only (`14`, *Milestone placement*);
-the step grid refuses a speculative step (D97).
+the step grid prices it on the stage-4 cells (D97, D98).
 
 ### What it is not
 
@@ -140,13 +148,19 @@ the step grid refuses a speculative step (D97).
 
 ### One term per step
 
-The whole batch is one `StepCost` with a single term: the forward's device busy time over
+The whole batch is one `StepCost` with a single term, two under a drafter (below): the forward's device busy time over
 its interval (D98), with no launch gaps (`02` D11, owner ruling on #815, 2026-10-11). It
 covers compute, logits, sampling, the in-forward TP collectives and their overlap. The term
 is not multiplied by TP, and no collective terms are added beside it, because the
 measurement already contains them. The lookup's value, the residual and each member's
 output are diagnostics in the provenance detail, never terms, so no term is negative. The
 term is in seconds; a bundle's unit is converted once, at that boundary.
+
+**Under a drafter, two terms.** The target's is the forward's device time up to the event
+the step record's `d_target_ns` ends at, `forward_done_event` less the drafter's passes
+before it; the drafter's is the rest of the interval, priced as the step's draft terms, as
+the step linear law's draft law is. Each is its own value of the same cell, corrected by
+its own residual (D99, D100), so neither is derived from the other.
 
 ### The runner prices, the engine charges
 
@@ -157,11 +171,14 @@ term is in seconds; a bundle's unit is converted once, at that boundary.
   charges nothing. The backend never touches the clock and never sleeps.
 - **The label is the group's step.** A step measurement of a TP group is the group's
   step, which `01` charges to its slowest rank (`15` D90), so a step is priced once, never
-  per rank.
-- **DP and PP.** Under DP the `15` D90 `max` exchange is the rule, but every bundle this
-  topic plans is measured at DP 1, so a DP run mismatches the key and refuses (D101);
-  DP-attention's step linear law stays #529's. A PP stage refuses to price: `15` D91 prices each
-  stage, and a whole-step label cannot price a stage.
+  per TP rank.
+- **DP and PP.** Under DP-attention each rank prices its own batch with its side's
+  bundle, and the group's step is `15` D90's `max` over ranks, as for the step linear
+  law; a point already holds the rank's share of the MoE segment beside its own local
+  segment (D98). The DP width, DP-attention, EP and TBO are keyed (D101), so a run at
+  another layout refuses by key. Plain DP without DP-attention still refuses: no cell
+  runs it. A PP stage refuses to price: `15` D91 prices each stage, and a whole-step
+  label cannot price a stage.
 - **Only executed batches are priced**, intermediate prefill chunks included: a chunk that
   samples nothing still costs forward time (`02` D10). A forward's device time is atomic:
   no op-level or pipeline overlap. Overlap across forwards, a host running ahead of the
@@ -178,8 +195,9 @@ term is in seconds; a bundle's unit is converted once, at that boundary.
   the tokens whose KV existed before it. A `BatchView` row carries the visible context,
   cached plus query, so cached context is `context_tokens - query_tokens`.
 - **Phases.** Every row prefill: the prefill grid, single-token prefill included. Every
-  row decode with `N_Q = 1`: the decode grid. A mix refuses. A decode row with `N_Q > 1`
-  (speculative decoding) refuses: the decode grid has no `N_Q` axis.
+  row decode: the decode grid, at the engine's decode width, `N_Q = 1`, or under MTP the
+  `K + 1` tokens a verify step computes per row (D98). A mix refuses, and so does a decode
+  row of another `N_Q`: the decode grid has no `N_Q` axis.
 - **Validated at the boundary, never coerced.** An empty batch, a non-integer or negative
   count, or an unknown phase refuses.
 - **The backend imports nothing from ATOM** (`02` D11). What reads ATOM's configuration
@@ -310,6 +328,54 @@ c = 196608 is past a top node of 183616). #740's records hold neither: 262144 is
 multiple of 16384, and a cc-traces replay reuses no prefix. The coverage check counts
 these steps apart, on a run with prefix caching, for T98's trigger.
 
+### Under DP-attention, EP, MTP and TBO
+
+Each side of a 1P1D cell is its own bundle, planned from that side's records, every DP
+rank's steps read.
+
+- **The bench runs the whole group.** Under DP-attention it starts every DP rank as
+  ATOM's `CoreManager` lays them out and hands each rank its own batch. The window's value
+  is the slowest rank's (`bench/window.py`), so a point is the group's step for the
+  batches it ran. Under EP it runs MORI as the engine does.
+- **Decode, every rank decoding.** The group replays the rung `max_bs_across_dp`
+  reaches, and its MoE rows are that rung's padded height, `dp × running_bs × N_Q`
+  (`15` D90), whatever each rank holds. So decode keeps `(rung, B, c)`: a point runs the
+  same batch on every rank, and a rank reads its own rows at the group's rung. A rank
+  can hold fewer rows than the rung's previous rung, so under DP every rung's B nodes
+  start at 1.
+- **Prefill, some rank prefilling.** Each rank runs its own rows through the variable
+  gather, the group's MoE rows `M` being their sum (`15` D90). Prefill gains a fourth
+  axis, `M`, placed from the records' `moe_rows`, with top node `dp ×
+  max_num_batched_tokens`. A point runs its `(B, T, c)` batch on one rank and spreads the
+  other `M - T` rows over the peers as evenly as whole rows allow, as one-token rows with
+  no cached context; a peer left with none runs ATOM's DP dummy. Where the peers' share
+  outweighs the measured rank's own work, the point's value includes waiting for them.
+  The `max` over ranks still prices the group's step: among real peers sharing those
+  rows, one carries at least the even share. A corner whose `M` is below `T` plus one
+  row per peer is no batch the group runs, and is reported, not measured.
+- **A decode rank in a step a peer prefills** runs eager through the variable gather.
+  Neither stage-4 cell has one: the prefill side only prefills, the decode side only
+  decodes. Such a step declines to the roofline (D102), counted by the coverage check.
+- **EP8 adds no axis**: the rows dispatched are the rung's height or `M`. Routing is the
+  replayed rows' own, from `bench/replay.py`'s filler tokens, neither the workload's nor
+  uniform. Every step names it as a treatment, as the step linear law names uniform
+  routing, and the residual's real-run steps carry the difference (D100); a bundle
+  fitted on bench replays alone carries none of it, and its fit report says so.
+- **MTP.** A decode row computes `K + 1` tokens, `14` D85's verify step, `K` the bundle's
+  draft width (D101), so decode's `N_Q` is `K + 1`, or 1 on a P/D producer, which keeps
+  its drafter and never speculates. The ladder is the one the engine captured under
+  speculation, over `running_bs`. A replayed decode row carries `K` filler drafts, which
+  the target rejects, so a drafter pass whose work depends on acceptance runs at none
+  accepted; the drafter's residual carries the difference. Each repeat keeps two values,
+  the target's and the drafter's (D97), split where the step record splits them, and
+  each takes the point's statistic over the repeats.
+- **TBO, on prefill.** Whether a step is split is the group's answer, which ATOM reduces
+  over the ranks' local answers (`local_tbo_precompute`), and the step's `tbo_tokens`
+  states it. Each prefill grid has a split twin: the bench sets a point's group answer
+  to its grid's, and ATOM splits each rank's rows by its own rule; a corner ATOM cannot
+  split is reported, not measured. A split decode step (`enable_tbo_decode`) still
+  refuses: neither cell runs one.
+
 ### Scope and timing
 
 The interval is `02` D10's: the whole `ModelRunner.forward()`, sampling included. It is
@@ -346,6 +412,13 @@ G read at B rows of the mean and of the longest row's cached context, α in [0, 
 rows' length statistics, fitted on bench-measured ragged batches and kept on a rung only
 where #941's gate admits it: two or more calibration cells of 100 steps there, none of
 whose held-out p50 worsens with it; on any other rung it is G(mean).
+
+Under DP-attention a rank reads its own rows (D98): decode at the group's rung, prefill at
+`(B, T, c, M)`, `M` the step's `moe_rows`, and a split step in the split twin of its grid.
+Under a drafter one lookup reads both values at the same coordinates. A DP dummy that
+replays its rung's graph is read as the one row it is, at `B = 1`; one that replays none
+is `eager_dp_dummy`, 0 s, as for the step linear law: its peers run the same gather with
+rows of their own, so it never sets the `max`.
 
 ### Decision
 
@@ -442,13 +515,16 @@ By the owner's ruling on
   samples are disjoint populations, and decode outnumbers prefill by far in a stage-2
   record (#1035): a pooled fit would be set by decode, while TTFT rests on prefill. Each
   kind has its own features, hull and family ranking. A bundle may hold any of the kinds;
-  a step of a kind it does not hold refuses.
+  a step of a kind it does not hold refuses. A TBO split twin is a kind of its own, and
+  under a drafter each kind's drafter value has its own residual, its target the step
+  record's drafter time, the rest of `d_busy_ns` past `d_target_ns` (D97, D98).
 - **Features in `14` D85's form**: on prefill, tokens, `Σ N_Q²` and `Σ N_Q·N_KV` over
   requests, the aggregates `ScheduledBatch` carries. Decode drops `Σ N_Q²`, which on a
   decode step (`N_Q = 1`) is its token count, so a decode fit's views would span no hull
   with it. Plus row order on every kind and raggedness on prefill, `07` D39's two hazards,
   which the grid cannot see; decode drops raggedness, which its lookup reads through α
-  (D99, #1793). Model, dtype and width select and check the bundle (D101); they never
+  (D99, #1793). Under DP-attention prefill adds `M`, the step's `moe_rows`, as the step
+  linear law does. Model, dtype and width select and check the bundle (D101); they never
   enter a feature. The lookup stays split by graph mode (D98): eager and replay are two
   measurements, not two forms.
 - **Past the hull.** Each kind's residual answers past its own fitted hull (`09` D58) by
@@ -527,7 +603,8 @@ a simulated run needs no device, and its host's stack is not the one measured.
 ### Keyed conditions and derived values
 
 - **Keyed conditions refuse on mismatch**: the key, D43's row, the graph mode, the
-  ladder, block size, KV dtype, quantization, TP width, the chunk sizes a recipe reads,
+  ladder, block size, KV dtype, quantization, TP width, the DP width, DP-attention, EP,
+  TBO, under speculation its method and draft width, the chunk sizes a recipe reads,
   and the stated scope (D98).
 - **Derived values**, such as a chunk width computed from keyed conditions, are not
   stated separately and go into the provenance.
@@ -648,7 +725,9 @@ After stage 2, the step grid gets one evaluation on DeepSeek-V4-Pro (`16` W4.13)
   seconds, `08` D49 item 1), and the op-level backend where it is available, reported per `08` D47:
   on totals, with the largest contributor held out, and as the median per step.
 - **Not a stage-3 backend**, and outside M2's ranking gate (`08` D50). No DP-attention,
-  MTP, TBO or EP8 rows; #529 keeps DP-attention's step linear law.
+  MTP, TBO or EP8 rows; #529 keeps DP-attention's step linear law. Stage 4's two MI455
+  cells, priced under D97 to D100's rules for those, are evaluated apart
+  ([#2153](https://github.com/jgong5/ATOM/issues/2153)).
 
 ---
 
@@ -682,15 +761,15 @@ After stage 2, the step grid gets one evaluation on DeepSeek-V4-Pro (`16` W4.13)
 | # | Decision | Date |
 |---|---|---|
 | D96 | The step grid (`StepGridBackend`, `step_grid`) is a step-level `CostBackend`: grid lookup plus a residual. A candidate for #627's stage 2, graded by stage 2's protocol after `09` D59's validation, a use beyond `07` D36 by ruling; which backend passes stage 2 is #627's ruling, which chose `09` D54's law and keeps the step grid off the stage-2 path for now, so its evaluation runs off that critical path. Grading reads #743's registered real runs, or the step grid's own named apart; the residual, validation and grid comparisons use traces 256 to 392, grading traces 0 to 255. Not a stage-3 backend; Kimi-K3 and DCP after v1. | 2026-10-10 (#696); #627's rulings applied 2026-10-11 (#626); named 2026-10-14 (#952) |
-| D97 | One term per step, the forward's device busy time over its whole interval, priced once per logical forward by the backend; the runner composes it with the host laws by `01` D4's recurrence and the engine charges the result. Rows in order; mixed phases and speculative decode refuse; a DP run refuses by key and a PP stage refuses. The backend imports nothing from ATOM. | 2026-10-10 (#696); revised 2026-10-11 (#815) |
-| D98 | A synthetic homogeneous grid, departing from `07` D39 for the baseline only. Its definition (a node list per axis and the planning margin) is a calibration input recorded in the bundle's identity; a cell is the box between adjacent nodes; warm-up, repeats and statistic are fixed in code; measurements are stored per point. Nodes are placed from shapes, and only the cells the planned shapes fall in, plus the margin, are measured; the planner adds boundary nodes from the bounds the bundle records, and a corner past a limit or at a non-integer `N_Q` is reported, never measured, a decode corner past the KV pool unshared measured with its rows sharing the fewest leading blocks that fit it. Decode in replay on the target's own ladder, per rung at `B = R`, `B = previous rung + 1` and each `B` between them that shapes reach past `c_max(R)`, over c nodes per rung that add each B node's KV limit `c_max(B)` and `max_model_len - 1`; prefill eager on `(B, T, c)`, `T = B·N_Q`, by whether a chunk produces output, with the token budget a T node, `max_num_seqs` B's top node and `max_model_len - max_num_batched_tokens` c's. `02` D10's interval, `07` D42's timing, `07` D39's bench window, a point left with no counted repeat refusing its cell; a bundle states that value kind, and a narrower stated scope or another value kind refuses. The planner and coverage check are the step grid's own, beside the backend, and the planner runs inside `measure steps`. | 2026-10-10 (#696); grid definition 2026-10-11 (#626); device time 2026-10-11 (#815); boundary nodes and prefill on `(B, T, c)` 2026-10-13 (#830); bench window and planner 2026-10-13 and 2026-10-14 (#851); shared prefix blocks past the KV pool 2026-10-21 (#1465, #1470) |
-| D99 | An answer from a complete cell, by exact hit or interpolation, or from a decode cell past the KV pool the bundle records, extrapolated from its measured boundary nodes; otherwise the grid declines, naming the missing corners. No clamp, recovery or other fallback. A pre-run coverage check, which `compass run --coverage` calls on `record` directories and `shape_population` entries, counts the steps extrapolated and those declined to the roofline and refuses neither; deterministic lookups. Its one term is `estimated`, unvalidated outside the residual's held-out region (#962) and when extrapolated, the distance named in `source`; a discrete value the bundle lacks declines. A decode rung holding α reads a ragged batch between its mean and longest row. | 2026-10-10 (#696); prefill coordinates `(B, T, c)` 2026-10-13 (#830); `run --coverage` 2026-10-13 (#851); method 2026-10-14 (#952); KV pool and coverage 2026-10-18 (#1465, #1464); α 2026-10-21 (#1793) |
-| D100 | The residual is in the first version, one per grid kind (decode, prefill with output, prefill without), each with its own features, hull and family ranking, fitted on traces 256 to 392 in `14` D85's form plus order and raggedness, decode without `Σ N_Q²` or raggedness, graded on traces 0 to 255, extrapolating past its kind's hull by the same members. Its targets are real-run step times labelled as the step linear law labels them, replayed bench measurements, or both, pooled with no source term; the grid stays bench points only; the fit report breaks counts, residual centre and spread, and held-out error down by source, and the bundle records its sources; grid definitions compared on traces 256 to 392 only, each one tried recorded. Members are bundle data; each output checked. Recipes are fixed functions with injected geometry and hardware constants, versioned only when a function changes; optional recipes, DCP's first. | 2026-10-10 (#696); grid comparison 2026-10-11 (#626); targets 2026-10-13 (#882); per grid kind 2026-10-16 (#1035); past the hull 2026-10-18 (#1464); decode without raggedness 2026-10-21 (#1793) |
-| D101 | A bundle is a `07` D41 key plus a digest, immutable, with a row in `07` D43 invalidated by every column. Keyed conditions refuse; derived values go to provenance; #626's asserted and record-only grades are dropped. Conditions come from the resolved ATOM config; the stack, torch included, is checked against the target's as the machine spec records it. At startup, unmeasured rungs and bounds beyond the planned grid refuse. | 2026-10-10 (#696); target stack 2026-10-13 (#851) |
+| D97 | One term per step, the forward's device busy time over its whole interval, priced once per logical forward by the backend; the runner composes it with the host laws by `01` D4's recurrence and the engine charges the result. Rows in order; mixed phases, and a decode row of another `N_Q` than the engine's decode width, refuse. Under a drafter the step's second term is the drafter's, the rest of the interval past the target's. Under DP-attention each rank prices its own batch and the group takes `15` D90's `max`; plain DP and a PP stage refuse. The backend imports nothing from ATOM. | 2026-10-10 (#696); revised 2026-10-11 (#815); DP-attention and MTP 2026-10-26 (#2152) |
+| D98 | A synthetic homogeneous grid, departing from `07` D39 for the baseline only. Its definition (a node list per axis and the planning margin) is a calibration input recorded in the bundle's identity; a cell is the box between adjacent nodes; warm-up, repeats and statistic are fixed in code; measurements are stored per point. Nodes are placed from shapes, and only the cells the planned shapes fall in, plus the margin, are measured; the planner adds boundary nodes from the bounds the bundle records, and a corner past a limit or at a non-integer `N_Q` is reported, never measured, a decode corner past the KV pool unshared measured with its rows sharing the fewest leading blocks that fit it. Decode in replay on the target's own ladder, per rung at `B = R`, `B = previous rung + 1` and each `B` between them that shapes reach past `c_max(R)`, over c nodes per rung that add each B node's KV limit `c_max(B)` and `max_model_len - 1`; prefill eager on `(B, T, c)`, `T = B·N_Q`, by whether a chunk produces output, with the token budget a T node, `max_num_seqs` B's top node and `max_model_len - max_num_batched_tokens` c's. `02` D10's interval, `07` D42's timing, `07` D39's bench window, a point left with no counted repeat refusing its cell; a bundle states that value kind, and a narrower stated scope or another value kind refuses. The planner and coverage check are the step grid's own, beside the backend, and the planner runs inside `measure steps`. Under DP-attention the bench runs the whole group, each rank its own batch: decode points run one batch on every rank, B nodes from 1 on every rung; prefill adds the group's MoE rows `M`, the peers carrying `M - T` as evenly spread one-token rows. EP adds no axis, its routing the replayed rows' own, named as a treatment. Under MTP decode's `N_Q` is `K + 1`, 1 on a P/D producer, on the ladder captured under speculation, a replayed row carrying `K` filler drafts, and every point keeps a target and a drafter value. Each prefill grid has a TBO split twin, the bench setting the group's split answer. A decode rank in a step a peer prefills declines to the roofline. | 2026-10-10 (#696); grid definition 2026-10-11 (#626); device time 2026-10-11 (#815); boundary nodes and prefill on `(B, T, c)` 2026-10-13 (#830); bench window and planner 2026-10-13 and 2026-10-14 (#851); shared prefix blocks past the KV pool 2026-10-21 (#1465, #1470); DP-attention, EP, MTP and TBO 2026-10-26 (#2152) |
+| D99 | An answer from a complete cell, by exact hit or interpolation, or from a decode cell past the KV pool the bundle records, extrapolated from its measured boundary nodes; otherwise the grid declines, naming the missing corners. No clamp, recovery or other fallback. A pre-run coverage check, which `compass run --coverage` calls on `record` directories and `shape_population` entries, counts the steps extrapolated and those declined to the roofline and refuses neither; deterministic lookups. Its one term is `estimated`, unvalidated outside the residual's held-out region (#962) and when extrapolated, the distance named in `source`; a discrete value the bundle lacks declines. A decode rung holding α reads a ragged batch between its mean and longest row. Under DP-attention a rank reads its own rows, decode at the group's rung and prefill at `(B, T, c, M)`, a split step in its grid's split twin; a DP dummy that replays a graph reads its one row, an eager one is 0 s. | 2026-10-10 (#696); prefill coordinates `(B, T, c)` 2026-10-13 (#830); `run --coverage` 2026-10-13 (#851); method 2026-10-14 (#952); KV pool and coverage 2026-10-18 (#1465, #1464); α 2026-10-21 (#1793); DP-attention and TBO 2026-10-26 (#2152) |
+| D100 | The residual is in the first version, one per grid kind (decode, prefill with output, prefill without), each with its own features, hull and family ranking, fitted on traces 256 to 392 in `14` D85's form plus order and raggedness, decode without `Σ N_Q²` or raggedness, graded on traces 0 to 255, extrapolating past its kind's hull by the same members. Its targets are real-run step times labelled as the step linear law labels them, replayed bench measurements, or both, pooled with no source term; the grid stays bench points only; the fit report breaks counts, residual centre and spread, and held-out error down by source, and the bundle records its sources; grid definitions compared on traces 256 to 392 only, each one tried recorded. Members are bundle data; each output checked. Recipes are fixed functions with injected geometry and hardware constants, versioned only when a function changes; optional recipes, DCP's first. A TBO split twin is a kind of its own, a drafter value has its own residual per kind, and under DP-attention prefill adds `M`. | 2026-10-10 (#696); grid comparison 2026-10-11 (#626); targets 2026-10-13 (#882); per grid kind 2026-10-16 (#1035); past the hull 2026-10-18 (#1464); decode without raggedness 2026-10-21 (#1793); TBO, drafter and `M` 2026-10-26 (#2152) |
+| D101 | A bundle is a `07` D41 key plus a digest, immutable, with a row in `07` D43 invalidated by every column. Keyed conditions refuse; derived values go to provenance; #626's asserted and record-only grades are dropped. Conditions come from the resolved ATOM config; the stack, torch included, is checked against the target's as the machine spec records it. At startup, unmeasured rungs and bounds beyond the planned grid refuse. The DP width, DP-attention, EP, TBO and the speculative method and draft width are keyed. | 2026-10-10 (#696); target stack 2026-10-13 (#851); parallel layout and speculation 2026-10-26 (#2152) |
 | D102 | Refusal follows `08` D50.1 as ruled on #765, with no departure: when the step grid cannot answer a step, the step falls back along method inside the step level, to the step roofline every step grid run composes below the grid with `StepFallbackBackend`, counted apart, and is refused only when the roofline refuses too; a refused step costs 0 s and the run continues under `13` D80's default `mark`; any refusal makes the run a coverage report. A run with extrapolated or roofline-priced steps is graded, the counts beside its table. Like the step linear law under #627's ruling 3, the step grid extrapolates past its residual's hull and the KV pool. | 2026-10-10 (#696); ruling 3 contrast 2026-10-11 (#626); revised 2026-10-11 (#765), 2026-10-14 (#952) and 2026-10-18 (#1464, #1465) |
 | D103 | Selected by `compass run`'s `--step-grid KEY`, exclusive with `--step-linear` and `--step-stub`, which the tool writes as the run file's `step_grid` key, read as the code reads every backend; the run file is the tool's internal transport (T96 closed). The bundle is found by its key in the artifact store. | 2026-10-10 (#696); revised 2026-10-11 (#626); flags 2026-10-13 (#851); named 2026-10-14 (#952) |
 | D104 | The run record lives inside `01` D3.5's outputs with no `off` level, written incrementally and flushed before the run ends, per step from each `price()` return. The scheduler's CPU segments are inside `01` D4's `E`, priced by the host laws for every backend: no `measured` mode, and no CPU-segment modes of its own; `host.skip` is the what-if. | 2026-10-10 (#696); revised 2026-10-11 (#815) |
-| D105 | One non-graded evaluation on DeepSeek-V4-Pro's nightly TP cell on MI355X, against W4.3's step tables and the op-level backend, reported per `08` D47; not a stage-3 backend. | 2026-10-10 (#696) |
+| D105 | One non-graded evaluation on DeepSeek-V4-Pro's nightly TP cell on MI355X, against W4.3's step tables and the op-level backend, reported per `08` D47; not a stage-3 backend. Stage 4's MI455 cells are evaluated apart, by #2153. | 2026-10-10 (#696); stage 4 2026-10-26 (#2152) |
 
 ---
 
