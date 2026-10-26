@@ -121,7 +121,10 @@ launched different kernels or, at a decode width, either side of a point off
 the line through theirs, or, on rows alike, whose cold times differ where the
 leaf's kind steps under one kernel between two adjacent contexts at some width
 (`_densify`), until they are adjacent; a collective's message bytes bend as a
-decode width does. DIR gets each round's ops.jsonl in `round<n>`, a run
+decode width does; and then, at the rows of each prefill family of a kind that
+depends on context, each token count its leaf's families at other rows hold
+between its own least and most, at each of its cached-token counts
+(`_filled`), densifying again after. DIR gets each round's ops.jsonl in `round<n>`, a run
 resumed into DIR numbering on from the last round there, and after each round
 every point held, a measured one with its store token, in plan.jsonl.
 
@@ -1859,9 +1862,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         measure_round(want, n)
         n += 1
         want = cached_ladder(top_only=False) if n == 2 else {}
-        want = want or _densify(
-            _families(done.values(), _dependent(done.values())), tried
-        )
+        families = _families(done.values(), _dependent(done.values()))
+        want = want or _densify(families, tried)
+        want = want or _filled(families, tried, config.max_model_len)
     kinds = Counter(r["op"] for r in done.values() if "refused" not in r)
     print(json.dumps({"points per leaf kind": dict(kinds.most_common())}, indent=1))
     print(f"{sum(kinds.values())} of {len(done)} points measured in {n} rounds")
@@ -2248,6 +2251,41 @@ def _densify(families, tried: set) -> dict:
                 want[shape, (mid, *ragged) if ragged else mid].add(fam)
             else:
                 want[prefill(mid, shape.seqs), record["context"]].add(fam)
+    return want
+
+
+def _filled(families, tried: set, max_model_len: int) -> dict:
+    """The points of each prefill family over cached tokens (`_cut`) at its
+    rows that its leaf's families at any rows hold the token count of, between
+    its own least and most, at each cached-token count its own points hold
+    that its first row has room for under `max_model_len`, unless `tried`.
+    `fit ops` reads such a leaf over T, then its rows: a step's rows are
+    bracketed only where the token counts either side of it hold them."""
+    from atom.compass.capture.forward import prefill
+    from atom.compass.fit.ops import skeleton
+
+    held, skeletons, axis = defaultdict(set), {}, defaultdict(set)
+    for fam, points in families.items():
+        if cut := _cut(fam):
+            for tokens, _, record in points:
+                held[cut[0]].add((tokens, cut[1]))
+                skeletons[cut[0]] = skeleton(record["shape"], record["leaf"])
+                axis[skeletons[cut[0]]].add(tokens)
+    want = defaultdict(set)
+    for base, at in held.items():
+        rows, tokens = json.loads(base)[1], [t for t, _ in at]
+        for t in sorted(axis[skeletons[base]]):
+            for c in sorted({c for _, c in at}):
+                fam = json.dumps([*json.loads(base), c], sort_keys=True)
+                if (
+                    not min(tokens) < t < max(tokens)
+                    or (t, c) in at
+                    or (fam, t) in tried
+                    or c > max_model_len - -(-t // rows)
+                ):
+                    continue
+                tried.add((fam, t))
+                want[prefill(t, rows), c or None].add(fam)
     return want
 
 
