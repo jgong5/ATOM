@@ -34,14 +34,14 @@ under a law or an op graph, the steps that lead a vector's priced steps, each
 slower than its price by more than `step_linear_fit.MAD_K` scaled MADs of the
 errors the law's vector was fitted on, as the fit names them; of that vector's
 errors here if the law records no `fit.mad` or the backend is an op graph. A step
-grid has no such rule: its bundle's points are measured after the bench warm-up
-and its fit names no warm step, so only a step above that factor is warm. A step
-the backend declines is counted with its real seconds and its reasons, the most
-frequent named: under `fallback` for the grid, since its run prices the step by
-the step roofline below it, and under `refused` for a law, since a run grading
-takes has nothing below the law, or under `fallback` when the run's file
-composes the step roofline below it. A step it extrapolated, past its support
-domain, is counted too. An answer of any
+grid, bare or below a fallback, has no such rule: its bundle's points are measured
+after the bench warm-up and its fit names no warm step, so only a step above that
+factor is warm. A step the backend declines is counted
+under `refused` with its real seconds and its reasons, the most frequent named.
+A step whose priced rank a fallback answered after a source declined it
+(`StepCost.refusals`), as the step roofline below a step grid answers, is
+graded by its terms and also counted under `fallback`, with what declined it.
+A step it extrapolated, past its support domain, is counted too. An answer of any
 method but an estimated one outside its hull is validated, as the run summary
 groups seconds: an op graph's analytical and measured leaves are, its
 interpolated ones only inside a held-out bracket on each line they interpolate
@@ -155,12 +155,11 @@ def _summary(steps: list[tuple]) -> dict:
     }
 
 
-def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
+def cost_accuracy(record, backend, steps=None) -> dict:
     """The report for `backend`, a `CostBackend` or a law mapping
     `StepLinearLaw` reads, on the record directory `record`: on its steps whose
     numbers are in `steps`, every step when None. Its ``backend`` names the
-    law's provenance, or the backend's `describe()` line. With `fallback` a
-    step the backend declines is a fallback's, as a step grid's always is.
+    law's provenance, or the backend's `describe()` line.
 
     The ranks' records (`dp0.jsonl` up) are joined as `step_linear_fit` joins
     them: a step is its ranks' lines of one step index, measured as the
@@ -196,6 +195,7 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
     grid = _is_grid(backend)
     groups = {g: {} for g in ("graded", "validated", "unvalidated", "declared")}
     declined: dict[str, dict] = {}
+    fell: dict[str, dict] = {}
     warm, priced, extrapolated = [], [], 0
     for group in joined:
         key, _, seconds, step, _ = next(iter(group.values()))
@@ -203,13 +203,7 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
             costs = {i: backend.price(views[i][step]) for i in group}
         except CostRefused as refused:
             band = _band(key, max((r[1] for r in group.values()), key=lambda c: c[1]))
-            r = declined.setdefault(
-                band, {"steps": 0, "real_s": 0.0, "reasons": Counter()}
-            )
-            r["steps"] += 1
-            r["real_s"] += seconds
-            why = "; ".join(f"{d.source}: {d.reason}" for d in refused.declined)
-            r["reasons"][why] += 1
+            _count(declined, band, seconds, refused.declined)
             continue
         top = step_linear_fit.priced_rank(
             {i: (c.target_seconds, group[i][1]) for i, c in costs.items()}
@@ -217,6 +211,9 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
         terms = [t for c in costs.values() for t in c.terms]
         extrapolated += any(t.provenance.extrapolated for t in terms)
         band, price = _band(key, group[top][1]), costs[top].target_seconds
+        # Each term of a fallback's answer carries what declined the step.
+        if costs[top].refusals:
+            _count(fell, band, seconds, dict.fromkeys(costs[top].refusals))
         labels = [drafts[i][step] for i in group]
         draft = None
         if None not in labels:
@@ -251,9 +248,7 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
             kind: _summary(rows) for kind, rows in sorted(kinds.items(), reverse=True)
         }
     report["warm"] = warm
-    report["fallback"], report["refused"] = (
-        (declined, {}) if grid or fallback else ({}, declined)
-    )
+    report["fallback"], report["refused"] = fell, declined
     report["extrapolated"] = extrapolated
     report["methods"], report["terms"] = {}, {}
     for kind, priced_steps in sorted(parts.items(), reverse=True):
@@ -276,6 +271,14 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
             for name, s in sorted(terms.items())
         }
     return report
+
+
+def _count(into: dict, band: str, seconds: float, refusals) -> None:
+    """Count a step of `seconds` in `band` of `into`, with its `refusals`."""
+    r = into.setdefault(band, {"steps": 0, "real_s": 0.0, "reasons": Counter()})
+    r["steps"] += 1
+    r["real_s"] += seconds
+    r["reasons"]["; ".join(f"{d.source}: {d.reason}" for d in refusals)] += 1
 
 
 def _validated(term) -> bool:
