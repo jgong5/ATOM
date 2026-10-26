@@ -8,15 +8,20 @@ It runs from a copy in a stub tree: `atom.compass.cli` logs each command, a
 store token; FAIL, matched against a command's words, makes it refuse.
 `atom.compass.validate` prints a verdict row and a warmup row per run;
 `client.sh` logs its arguments and its Python, and exits 1 without stopping its
-server when CLIENT_FAIL is in its OUT. `rocm-smi` prints a GPU's use and VRAM.
+server when CLIENT_FAIL is in its OUT. A command whose words hold HANG, or
+`client.sh` when HANG is client.sh, writes its pid to `$LOG.hung` and sleeps.
+`rocm-smi` prints a GPU's use and VRAM.
 """
 
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
+from subprocess import PIPE
 
 import pytest
 
@@ -30,6 +35,10 @@ def main():
     open(os.environ["LOG"], "a").write(words + "\\n")
     if os.environ.get("FAIL") and os.environ["FAIL"] in words:
         sys.exit("refused")
+    if os.environ.get("HANG") and os.environ["HANG"] in words:
+        Path(os.environ["LOG"] + ".t").write_text(str(os.getpid()))
+        os.rename(os.environ["LOG"] + ".t", os.environ["LOG"] + ".hung")
+        time.sleep(600)
     out = Path(argv[argv.index("--out") + 1])
     out.mkdir(parents=True)
     if argv[0] in ("record", "run"):
@@ -50,6 +59,7 @@ for run in ("real1", "real2", "step_linear"):
 CLIENT = """#!/bin/bash
 echo "client $* $HARNESS_PYTHON" >> "$LOG"
 [[ -n ${CLIENT_FAIL-} && $1 == *$CLIENT_FAIL* ]] && exit 1
+[[ ${HANG-} == client.sh ]] && echo $$ >"$LOG.t" && mv "$LOG.t" "$LOG.hung" && exec sleep 600
 mkdir -p "$1/artifacts" && touch "$1/artifacts/client_run.json"
 pid=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["pid"])' "$1/server.json")
 kill -TERM $pid && while kill -0 $pid 2>/dev/null; do sleep 0.1; done
@@ -92,15 +102,20 @@ def _smoke(tmp_path, use="0", stamp=True, **env):
         )
         | env
     )
-    r = subprocess.run(
-        ["bash", str(scripts / "smoke_cell.sh"), str(tmp_path / "m"), "o"],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
+    cmd = ["bash", str(scripts / "smoke_cell.sh"), str(tmp_path / "m"), "o"]
+    p = subprocess.Popen(
+        cmd, cwd=tmp_path, env=env, stdout=PIPE, stderr=PIPE, text=True
     )
+    if env.get("HANG"):
+        deadline = time.monotonic() + 60
+        while not (tmp_path / "log.hung").exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        p.terminate()
+    try:
+        out, err = p.communicate(timeout=120)
+    finally:
+        p.kill()
+    r = subprocess.CompletedProcess(cmd, p.returncode, out, err)
     log = tmp_path / "log"
     return r, log.read_text().splitlines() if log.exists() else [], tmp_path / "o"
 
@@ -210,3 +225,13 @@ def test_a_server_that_exits_non_zero_names_its_step(tmp_path):
     assert r.returncode == 1
     assert "smoke_cell: step real2 failed: its server exit 3" in r.stderr
     assert len(log) == 11
+
+
+@pytest.mark.parametrize("hang", ["measure memory", "fit host", "client.sh"])
+def test_sigterm_during_a_step_leaves_none_of_it_running(tmp_path, hang):
+    r, _, _ = _smoke(tmp_path, HANG=hang)
+    pid = int((tmp_path / "log.hung").read_text())
+    alive = _alive(pid)
+    alive and os.kill(pid, signal.SIGKILL)
+    assert r.returncode == -signal.SIGTERM, r.stderr
+    assert not alive

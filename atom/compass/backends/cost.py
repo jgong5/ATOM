@@ -313,8 +313,7 @@ class ProvenanceMix:
                 self._method_seconds.get(key, 0.0), seconds
             )
             self._method_steps[key] = self._method_steps.get(key, 0) + 1
-        for refusal in step.refusals:
-            key = (refusal.source, refusal.reason)
+        for key in dict.fromkeys((r.source, r.reason) for r in step.refusals):
             self._reasons[key] = self._reasons.get(key, 0) + 1
 
     @property
@@ -349,5 +348,5 @@ class ProvenanceMix:
         return dict(self._method_steps)
 
     def reasons(self) -> Mapping[tuple[str, str], int]:
-        """Distinct (source, reason) pairs with the number of terms each hit."""
+        """Distinct (source, reason) pairs with the number of steps each hit."""
         return dict(self._reasons)

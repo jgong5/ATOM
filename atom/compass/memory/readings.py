@@ -220,18 +220,14 @@ class MemoryReadings:
             name, self.values[field], Method.MEASURED, f"{self.source} {field}"
         )
 
-    def activations(self, warmup_tokens: int) -> Term:
-        """The activations at `warmup_tokens`: the reading at its own warmup
-        tokens, or the coefficient times these, an estimate."""
-        nbytes, tokens = self.values["activation_bytes"], self.values["warmup_tokens"]
+    def activations(self) -> Term:
+        """The activations: the reading at the entry's own warmup tokens,
+        which are the deployment's, since the entry is keyed by what sizes
+        the warmup. Nothing rescales it to another token count."""
+        tokens = self.values["warmup_tokens"]
         source = f"{self.source} activation_bytes over {tokens} warmup tokens"
-        if warmup_tokens == tokens:
-            return self._term("activations", nbytes, Method.MEASURED, source)
         return self._term(
-            "activations",
-            round(nbytes * warmup_tokens / tokens),
-            Method.ESTIMATED,
-            f"{source}, x {warmup_tokens} warmup tokens",
+            "activations", self.values["activation_bytes"], Method.MEASURED, source
         )
 
 

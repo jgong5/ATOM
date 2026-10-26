@@ -807,7 +807,7 @@ def test_the_mi308x_entry_gives_the_readings_its_spec_gave():
     spec = MachineSpec.from_mapping(json.loads(path.read_text()))
     entry = MemoryReadings.from_member(MI308X_READINGS, "memory_readings mi308x")
     model = ModelTerms.from_tree(
-        meta_tree(54_713_457_120), activations=entry.activations(16_384)
+        meta_tree(54_713_457_120), activations=entry.activations()
     )
     readings = device_readings(
         spec,
