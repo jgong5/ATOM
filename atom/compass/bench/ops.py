@@ -15,7 +15,7 @@ step's rows each hold `--context` tokens, and a prefill's rows, split as the
 capture split them, follow `--context` cached tokens each, none when it is not
 given. Rows the KV pool cannot hold at once are ragged (`point_rows`), and the
 point records its rows; under `--plan` over ragged decode steps a decode point
-the pool cannot hold refuses instead (`RAGGED`).
+the pool cannot hold refuses instead, past the first round (`RAGGED`).
 
 ATOM's runner is built from ATOM's arguments on each GPU `--gpu` names, one
 rank each of the layout the arguments resolve (`ranks`), its parameters on the
@@ -286,10 +286,10 @@ RANK = Topology().ranks()[0]
 #: The variable naming the file a measuring process appends each point's
 #: record to as it finishes it.
 JOURNAL = "COMPASS_OPS_JOURNAL"
-#: The variable `--plan` sets for its measuring processes when some step's
-#: decode rows are ragged: there a uniform decode point the KV pool cannot hold
-#: refuses, as a ragged one does, unless every leaf it times is a collective. A
-#: cut point's rows hold a mean its context does not name.
+#: The variable `--plan` sets for its measuring processes past its first round
+#: when some step's decode rows are ragged: there a uniform decode point the KV
+#: pool cannot hold refuses, as a ragged one does, unless every leaf it times is
+#: a collective. A cut point's rows hold a mean its context does not name.
 RAGGED = "COMPASS_OPS_RAGGED"
 
 
@@ -1795,7 +1795,8 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             todo += [(shape, context, found)] if found else []
         print(f"round {first + n}: {sum(len(f) for *_, f in todo)} points to measure")
         gpus = len(run["device"])
-        with patch.dict(os.environ, {RAGGED: "1"} if ragged else {}):
+        # round 0 cuts: `_dependent` reads its points for which kinds move
+        with patch.dict(os.environ, {RAGGED: "1"} if ragged and n else {}):
             results = _measured(config, todo, args.llc_mib << 20, gpus)
         (into := out / f"round{first + n}").mkdir()
         publish(store, key, config, run, command, results, into)

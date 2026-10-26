@@ -26,7 +26,7 @@ from atom.compass import capture, cli, ir
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.bench import ops
 from atom.compass.capture import forward
-from atom.compass.capture.forward import decode, structure
+from atom.compass.capture.forward import decode, prefill, structure
 from atom.compass.fit import ops as fit_ops
 from atom.compass.run import memory, step_grid
 from atom.compass.runner.overrides import schedulable_ladder
@@ -663,14 +663,14 @@ def test_a_plan_over_rows_alike_measures_no_ragged_point(bench, tmp_path):
     ],
     ids=["planned-ragged", "planned-uniform"],
 )
-def test_a_uniform_decode_point_past_the_pool_refuses_only_in_a_plan_over_ragged_rows(
+def test_a_uniform_decode_point_past_the_pool_refuses_only_past_round_0_of_a_plan_over_ragged_rows(
     bench, tmp_path, monkeypatch, rows, cut
 ):
     monkeypatch.delenv(ops.RAGGED, raising=False)
-    seen = set()
+    envs = []
 
     def child(fn, config, todo, llc):
-        seen.add(os.environ.get(ops.RAGGED))
+        envs.append(os.environ.get(ops.RAGGED))
         return _bench(fn, config, todo, llc)
 
     monkeypatch.setattr(ops, "_child", child)
@@ -689,18 +689,35 @@ def test_a_uniform_decode_point_past_the_pool_refuses_only_in_a_plan_over_ragged
             "_c10d_functional.all_gather_into_tensor.default",
         )
     )
-    [env] = seen
-    with patch.dict(os.environ, {ops.RAGGED: env} if env else {}):
-        # 38 blocks a row at 600 tokens, 64 in the pool
-        [record] = ops.Stub(_Runner(), 10_000).point(placed, decode(2), 600, neg)
-        [collective] = ops.Stub(_Runner(), 10_000).point(placed, decode(2), 600, gather)
+
+    def point(env, found):
+        with patch.dict(os.environ, {ops.RAGGED: env} if env else {}):
+            # 38 blocks a row at 600 tokens, 64 in the pool
+            return ops.Stub(_Runner(), 10_000).point(placed, decode(2), 600, found)
+
+    pooled = [[1, 600, True], [1, 416, True]]
+    # Round 0, whose points `_dependent` reads for the kinds that move with
+    # context, cuts its points in either plan.
+    [first] = point(envs[0], neg)
+    assert first["rows"] == pooled
+    env = envs[-1]  # a plan over rows alike measures one round
+    assert set(envs[1:]) <= {env}
+    [record] = point(env, neg)
+    [collective] = point(env, gather)
+    mixed = point(env, neg | gather)
 
     if cut:
         assert record["rows"] == cut
+        assert [r["rows"] for r in mixed] == [cut, cut]
     else:
         assert record["refused"] == "its rows need more than the pool's 64 KV blocks"
+        # one leaf that is not a collective refuses the point
+        assert all("refused" in r for r in mixed) and len(mixed) == 2
     # a collective's family is over its message bytes: the pool cuts it either way
-    assert collective["rows"] == [[1, 600, True], [1, 416, True]]
+    assert collective["rows"] == pooled
+    # a prefill point past the pool is cut in either plan: 4 blocks a row, 4 in it
+    rows = ops.point_rows(prefill(51, 2), 30, 4, 16, uncut=bool(env))
+    assert rows == [[26, 56, False], [25, 25, False]]
 
 
 @pytest.mark.parametrize(
