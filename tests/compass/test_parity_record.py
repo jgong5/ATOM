@@ -6,6 +6,7 @@ engine's order -- schedule, forward, postprocess -- one scheduler per DP rank,
 with every prompt distinct unless a test says otherwise.
 """
 
+import gc
 import hashlib
 import json
 import pathlib
@@ -592,6 +593,9 @@ def test_the_mixin_records_from_the_first_forward_after_construction(
         def forward(self, batch):
             return "ran"
 
+        def exit(self):
+            pass
+
     class _Recorded(StepRecording, _Base):
         step_clock_ns = staticmethod(time.monotonic_ns)
 
@@ -599,6 +603,7 @@ def test_the_mixin_records_from_the_first_forward_after_construction(
     runner = _Recorded(0, _config())
     assert not (tmp_path / "out").exists()
     assert runner.forward(batches[0]) == "ran"
+    runner.exit()
     assert [s["step"] for s in read(tmp_path / "out")[0]] == [0]
 
 
@@ -618,12 +623,15 @@ def test_a_real_runner_records_the_batch_it_was_handed_and_times_its_forward(
             self.inside = []
 
         def forward(self, batch):
-            # The line is written once this returns, not before.
-            assert len(record.read_text().splitlines()) == len(self.inside)
+            # Nothing is written before the runner exits.
+            assert record.read_text() == ""
             self.inside.append(time.monotonic_ns())
             batch.num_scheduled_tokens[:] = 0
             batch.context_lens[:] = 0
             return "ran"
+
+        def exit(self):
+            pass
 
     class _Recorded(StepRecording, _Base):
         step_clock_ns = staticmethod(time.monotonic_ns)
@@ -631,6 +639,13 @@ def test_a_real_runner_records_the_batch_it_was_handed_and_times_its_forward(
     monkeypatch.setenv(ENV, str(tmp_path / "real"))
     runner = _Recorded(0, _config())
     assert [runner.forward(b) for b in batches] == ["ran"] * len(batches)
+    # Held lines cost later full collections nothing: one untracks a line's
+    # innermost tuples, the next the rest of it.
+    gc.collect()
+    gc.collect()
+    held = runner._parity_record.lines
+    assert len(held) == len(batches) and not any(map(gc.is_tracked, held))
+    runner.exit()
     real, simulated = read(tmp_path / "real")[0], read(tmp_path / "simulated")[0]
     for step, inside in zip(real, runner.inside, strict=True):
         assert step.pop("t_enter_ns") <= inside <= step.pop("t_exit_ns")
@@ -680,6 +695,9 @@ def test_a_dp2_real_runner_records_moe_rows_from_its_forwards_one_collective(
         def run_model(self):
             return "ran"
 
+        def exit(self):
+            pass
+
     class _Recorded(StepRecording, _Base):
         step_clock_ns = staticmethod(time.monotonic_ns)
 
@@ -695,6 +713,8 @@ def test_a_dp2_real_runner_records_moe_rows_from_its_forwards_one_collective(
             for r, bs in zip(runners, batches)
         )
     )
+    for runner in runners:
+        runner.exit()
 
     real = read(tmp_path / "real")
     assert len(batches[0]) == len(batches[1])
@@ -790,13 +810,15 @@ def test_a_real_run_asked_to_record_refuses_a_runner_that_cannot(tmp_path, monke
         run.frontend(SimpleNamespace(runner_qualname="x.RapidServeModelRunner"))
 
 
-def test_a_recorded_step_neither_opens_nor_closes_the_record_file(
-    tmp_path, monkeypatch
-):
-    """The file is opened once, with the record: on an NFS home an open costs
-    about 0.25 ms and a close that flushes about 0.73, which every step's `E`
-    would carry. Each line is one write, in the step order and bytes it had."""
-    calls, path_open = [], pathlib.Path.open
+def test_no_file_call_or_json_encoding_runs_between_two_forwards(tmp_path, monkeypatch):
+    """`E` is all of the worker's time between forwards, so the lines are
+    encoded and written at `write`, the runner's exit: on an NFS home an open
+    costs about 0.25 ms and a close that flushes about 0.73. The file holds the
+    step order and bytes it had."""
+    calls, path_open, dumps = [], pathlib.Path.open, json.dumps
+    monkeypatch.setattr(
+        json, "dumps", lambda *a, **k: calls.append("dumps") or dumps(*a, **k)
+    )
 
     class _File:
         def __init__(self, f):
@@ -835,13 +857,17 @@ def test_a_recorded_step_neither_opens_nor_closes_the_record_file(
     record = StepRecord(tmp_path, 0)
     for _ in range(3):
         record.add(batch, runner, lambda batch: None)
+    record.write()
 
-    assert calls == ["open"] + ["stamp", "stamp", "write"] * 3
+    # Emptied at the start; then only the forwards' stamps until the exit.
+    start = ["open", "write", "close"]
+    end = ["dumps"] * 3 + ["open", "write", "close"]
+    assert calls == start + ["stamp", "stamp"] * 3 + end
     monkeypatch.undo()
     line = '"is_dummy_run": true, "produces_output": true, "batch": [], "named": []'
     assert record.path.read_text() == "".join(
-        f'{{"step": {n}, "dp_rank": 0, {line}, "t_enter_ns": {3 * n + 2}, '
-        f'"t_exit_ns": {3 * n + 3}, "rows": [[1, 9, true]], "rung": null, '
+        f'{{"step": {n}, "dp_rank": 0, {line}, "t_enter_ns": {2 * n + 4}, '
+        f'"t_exit_ns": {2 * n + 5}, "rows": [[1, 9, true]], "rung": null, '
         '"d_busy_ns": 5}\n'
         for n in range(3)
     )

@@ -161,7 +161,9 @@ def test_each_line_carries_its_host_stamps_and_device_window(tmp_path, monkeypat
     assert [runner.forward(b) for b in batches] == ["ran"] * len(batches)
 
     # Each line waits for its exit event; the last one's has not completed.
-    assert len(record.read_text().splitlines()) == len(batches) - 1
+    # None is written before the exit.
+    assert len(runner._parity_record.lines) == len(batches) - 1
+    assert record.read_text() == ""
     device.tick = BUSY // 3
     runner.exit()
     assert runner.exited
