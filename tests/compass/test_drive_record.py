@@ -364,7 +364,7 @@ def test_a_record_names_each_aiter_module_its_server_built_while_it_served(
     [
         ("inductor/triton/0/K3/triton_poi_fused_add_0.hsaco", "triton_poi_fused_add_0"),
         ("triton/K4/__grp___pa_decode.json", "_pa_decode"),
-        ("home/.cache/atom/c/rank_0/triton_cache/K5/_fwd.hsaco", "_fwd"),
+        ("home/.cache/atom/c/rank_0/triton_cache/K5/_fwd.autotune.json", "_fwd"),
         ("site/aiter/jit/flydsl_cache/launch_gemm1_c5/01b8.pkl", "launch_gemm1_c5"),
         ("aiter_root/build/gfx942/pa_decode_16_1.hsaco", "pa_decode_16_1"),
     ],

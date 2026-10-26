@@ -61,7 +61,7 @@ def _flydsl(parts: tuple[str, ...]) -> str | None:
 
 
 def _kernel(parts: tuple[str, ...]) -> str:
-    return Path(parts[-1]).stem.removeprefix("__grp__")
+    return parts[-1].split(".")[0].removeprefix("__grp__")
 
 
 def _roots() -> dict[Path, object]:
