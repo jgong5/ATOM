@@ -503,6 +503,8 @@ runs:
 |---|---|
 | `ATOM_COMPASS_SLICE_MODEL` | the Qwen3-0.6B snapshot in the Hugging Face cache (`$HF_HOME`, else `~/.cache/huggingface`) |
 | `ATOM_COMPASS_IMAGE_MODEL` | the Qwen3.5-9B snapshot there |
+| `ATOM_COMPASS_MTP_MODEL` | the Qwen3.5-0.8B snapshot there, for `test_spec_scenario.py`'s MTP1 run |
+| `ATOM_COMPASS_DSPARK_MODEL` | `/root/cells/deepseek-v41-flash-dspark`, for its DSpark run: `tests/models/deepseek_v41/fixtures/config.json` as `config.json` beside DeepSeek-V4-Flash's `tokenizer.json` and `tokenizer_config.json`. Both speculative runs read a config and a tokenizer, never a weight |
 | `ATOM_COMPASS_CCTRACES_MODEL` | the Qwen3.8-27B snapshot there: the cc-traces smoke runs alone with it as its slice model, since its first turn is longer than Qwen3-0.6B's context |
 | `ATOM_COMPASS_CCTRACES` | `/root/cells/cc-traces-256k/traces.jsonl` |
 | `COMPASS_HARNESS_PYTHON` | `/root/cells/venv/bin/python`, agentx-harness with compass-harness installed; the smoke runs with this tree's `compass_harness` first on `PYTHONPATH` |
@@ -517,8 +519,8 @@ commit, from this tree's `atom/mesh`. A snapshot has no history, so on a
 atomesh` in `atom/mesh`) in a git checkout of the snapshot's commit; a cargo build
 in the snapshot itself names no commit and is refused.
 
-After the run, a `SKIPPED` line under `tests/compass/` whose reason names the slice
-or image model, `ATOM_COMPASS_CCTRACES`, `COMPASS_AIPERF_PYTHON` or `atomesh` is a
+After the run, a `SKIPPED` line under `tests/compass/` whose reason names the slice,
+image, MTP or DSpark model, `ATOM_COMPASS_CCTRACES`, `COMPASS_AIPERF_PYTHON` or `atomesh` is a
 finding by its file and line: that test did not run. The tests that cargo-build
 atomesh run offline (`CARGO_NET_OFFLINE=true` unless set), from the container's
 crate cache, as in `gate_cpu.sh`; where cargo cannot resolve its crates they
