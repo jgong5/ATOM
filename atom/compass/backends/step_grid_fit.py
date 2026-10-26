@@ -38,10 +38,10 @@ refuses.
 The bundle is the member `run/step_grid.py` loads: the grid, the residual, the
 plan's bounds, the definition, and the sources its triples came from. The
 report is the residual's by kind, each kind's selected member also broken down
-by source: the triples fitted and held out, the median and scaled MAD of its
-relative residuals over those fitted, and the median absolute one over those
-held out, a band it holds no factor for counting as a factor of 0, as the fit
-counts it. It counts the triples whose lookup is extrapolated past the KV
+by source: the triples its MAD pass kept and dropped and those held out, the
+median and scaled MAD of its relative residuals over those kept, and the
+median absolute one over those held out, a band it holds no factor for
+counting as a factor of 0, as the fit counts it. It counts the triples whose lookup is extrapolated past the KV
 pool, and gives per rung each alpha form's terms and errors, the views the
 grid does not read, how many it reads at their longest row past the KV pool,
 the cells' p50 without and with alpha, and whether the rung keeps it.
@@ -119,7 +119,7 @@ def bundle(definition, planned, points, targets, seed: int) -> tuple[dict, dict]
     residual, kinds = fit(triples, seed)
     fitted = Residual(residual).kinds
     for k, report in kinds.items():
-        held, by = set(report["held_out"]), {}
+        held, kept, by = set(report["held_out"]), set(report["kept"]), {}
         for i, (view, looked_up, measured) in enumerate(triples):
             if kind(view) != k:
                 continue
@@ -128,8 +128,9 @@ def bundle(definition, planned, points, targets, seed: int) -> tuple[dict, dict]
                 factor = sum(w * m(view, x) for _, w, m in fitted[k].members)
             except LookupError:
                 factor = 0.0
-            errors = by.setdefault(sources[i], ([], []))
-            errors[i in held].append(factor * looked_up / measured - 1.0)
+            part = 2 if i in held else 0 if i in kept else 1
+            errors = by.setdefault(sources[i], ([], [], []))
+            errors[part].append(factor * looked_up / measured - 1.0)
         report["sources"] = {source: _spread(*e) for source, e in sorted(by.items())}
     out = {"grid": grid, "residual": residual, "bounds": planned["bounds"]}
     out |= {"definition": definition, "sources": sorted(set(sources))}
@@ -252,16 +253,15 @@ def _p50s(grid: dict, terms: dict, decode, cells, rungs, seed: int) -> dict:
     return out
 
 
-def _spread(fitted: list, held: list) -> dict:
-    centre = statistics.median(fitted) if fitted else None
+def _spread(kept: list, dropped: list, held: list) -> dict:
+    centre = statistics.median(kept) if kept else None
     return {
-        "fitted": len(fitted),
+        "kept": len(kept),
+        "dropped": len(dropped),
         "held_out": len(held),
         "centre": centre,
         "mad": (
-            1.4826 * statistics.median(abs(e - centre) for e in fitted)
-            if fitted
-            else None
+            1.4826 * statistics.median(abs(e - centre) for e in kept) if kept else None
         ),
         "held_out_error": statistics.median(map(abs, held)) if held else None,
     }

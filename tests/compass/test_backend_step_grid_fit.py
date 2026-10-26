@@ -136,16 +136,26 @@ def run(tmp_path):
     return r, here, configuration
 
 
-def record(tmp_path, run, lines, name="a", trace="trace-300", session=300, blocks=1024):
+def record(
+    tmp_path,
+    run,
+    lines,
+    name="a",
+    trace="trace-300",
+    session=300,
+    blocks=1024,
+    slow=None,
+):
     """`tmp_path/name`, a real run's record of `lines`, each timed at its lookup
-    times `factor`, on a pool of `blocks` KV blocks, with the export
-    `client.json` of the client run sending it from `trace`, which the export
-    gives `session`."""
+    times `factor`, line `slow` at 3 times that, on a pool of `blocks` KV
+    blocks, with the export `client.json` of the client run sending it from
+    `trace`, which the export gives `session`."""
     r, _, configuration = run
     directory = tmp_path / name
     path = directory / "steps" / "dp0.jsonl"
     path.parent.mkdir(parents=True)
-    _record(path, [(x["rows"], x["rung"], time(x) * factor(x)) for x in lines])
+    times = [time(x) * factor(x) * (3 if i == slow else 1) for i, x in enumerate(lines)]
+    _record(path, [(x["rows"], x["rung"], t) for x, t in zip(lines, times)])
     written, sent = [json.loads(x) for x in path.read_text().splitlines()], {}
     for line, x in zip(written, lines):
         line |= {"produces_output": x["produces_output"]}
@@ -378,7 +388,10 @@ def test_the_residual_is_fitted_on_records_replays_or_both_and_reported_by_sourc
 
     assert copy["params"]["sources"] == sources
     for report in copy["report"]["kinds"].values():
-        counts = [(s["fitted"], s["held_out"]) for s in report["sources"].values()]
+        counts = [
+            (s["kept"] + s["dropped"], s["held_out"])
+            for s in report["sources"].values()
+        ]
         assert list(report["sources"]) == sources
         held = len(report["held_out"])
         assert (
@@ -390,6 +403,35 @@ def test_the_residual_is_fitted_on_records_replays_or_both_and_reported_by_sourc
     *runs, planned = copy["report"]["provenance"]
     assert sorted({r["source"] for r in runs}) == sources
     assert (planned["source"], planned["traces"]) == ("plan", ["trace-300"])
+
+
+def test_a_planted_outlier_is_dropped_in_its_own_source_of_the_by_source_report(
+    tmp_path, run
+):
+    """One decode target of each source, both among the triples the seed leaves
+    to fit, is timed at 3 times the others' factor. The decode member's MAD pass
+    drops each in its own source, and the sources' kept, dropped and held-out
+    counts add up to the member's."""
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    a = record(tmp_path, run, mixed(seed=3), slow=0)
+    replays = [
+        measured(tmp_path, run, x, "replay", time(x) * factor(x) * (3 if i == 2 else 1))
+        for i, x in enumerate(mixed())
+    ]
+
+    copy = fitted(tmp_path, a, *replays, *clients(g), *clients(a), grid="grid")
+
+    for k, report in copy["report"]["kinds"].items():
+        (selected,) = copy["params"]["residual"]["kinds"][k]["selected"]
+        member, sources = report["members"][selected], report["sources"]
+        assert list(sources) == ["record", "replay"]
+        assert [s["dropped"] for s in sources.values()] == [int(k == "decode")] * 2
+        assert sum(s["kept"] for s in sources.values()) == member["samples"]
+        assert sum(s["dropped"] for s in sources.values()) == member["dropped"]
+        assert sum(s["held_out"] for s in sources.values()) == len(report["held_out"])
+        assert all(abs(s["centre"]) < 1e-3 for s in sources.values())
 
 
 def test_a_grid_input_no_client_run_names_refuses_naming_it(tmp_path, run):
