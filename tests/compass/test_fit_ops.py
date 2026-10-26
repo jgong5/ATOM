@@ -514,8 +514,10 @@ def test_a_price_list_prices_a_collective_between_two_measured_sizes(rows, at, p
         (3000, 57.5e-6),
         (
             6400,
-            "aiter.gemm: at B = 4, at mean = 1000, context = 8000 is outside the "
-            "measured 1024 to 1024",
+            (
+                "aiter.gemm: at B = 4, at mean = 1000, context = 8000 is outside "
+                "the measured 1024 to 1024"
+            ),
         ),
     ],
 )
