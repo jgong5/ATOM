@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_fit_samples import edit
 from test_fit_steps import (  # noqa: F401
     clients,

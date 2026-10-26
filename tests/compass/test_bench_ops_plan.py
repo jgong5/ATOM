@@ -18,7 +18,12 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from test_artifact_store import CONDITIONS, GATES, stanza
+from test_artifact_store import (
+    CONDITIONS,
+    GATES,
+    clean_checkout,  # noqa: F401  autouse
+    stanza,
+)
 from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
 from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 

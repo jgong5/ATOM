@@ -20,7 +20,7 @@ import sys
 import types
 
 import pytest
-from test_capture_ir import _decoder, _ops
+from test_capture_ir import MAIN, _decoder, _ops
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 
@@ -67,7 +67,7 @@ def trace(root, argv):
         [
             sys.executable,
             "-c",
-            "import sys; from atom.compass.cli import main; main(sys.argv[1:])",
+            MAIN,
             *command,
         ],
         capture_output=True,

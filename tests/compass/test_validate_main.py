@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_fit_ops import measured  # noqa: F401, a fixture
 from test_memory_check import GIB, _log
 from test_memory_readings import DOCUMENT

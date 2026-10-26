@@ -9,6 +9,7 @@ import json
 import pathlib
 
 import pytest
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 
 from atom.compass import cli, run
 from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, GateState, Key, Kind

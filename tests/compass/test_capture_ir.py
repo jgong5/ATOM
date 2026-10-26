@@ -25,6 +25,17 @@ from atom.compass.capture import forward, population_shapes
 from atom.compass.capture.graph import Fork, Join, Traced, build
 
 TREE = pathlib.Path(__file__).resolve().parents[2]
+#: The console script's `main` in a fresh interpreter, publishing under this
+#: checkout's source roots counted clean, as the `clean_checkout` fixture in
+#: test_artifact_store.py does in-process, by wrapping the same two resolvers.
+MAIN = (
+    "import dataclasses, sys; from atom.compass.artifacts import provenance as p; "
+    "c = lambda f: lambda *a, **k: (lambda r: dataclasses.replace(r, dirty=0) "
+    "if r.dirty else r)(f(*a, **k)); "
+    "p.git_tree_root, p.git_described_root = "
+    "c(p.git_tree_root), c(p.git_described_root); "
+    "from atom.compass.cli import main; main(sys.argv[1:])"
+)
 CONFIG = pathlib.Path(__file__).with_name("qwen3_5_27b_config.json")
 LAYER_TYPES = json.loads(CONFIG.read_text())["text_config"]["layer_types"]
 ATTENTION = {
@@ -186,7 +197,7 @@ def capture(tp, shapes, tmp_path_factory):
         [
             sys.executable,
             "-c",
-            "import sys; from atom.compass.cli import main; main(sys.argv[1:])",
+            MAIN,
             *argv,
         ],
         capture_output=True,
