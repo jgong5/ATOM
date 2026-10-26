@@ -224,27 +224,9 @@ end (TTFT, TPOT, throughput), and cost (each real run's own steps priced by the
 law, `08` D47). Memory rows are per term (`08` D48); warmup rows state each
 run's warmup (`06` D27); summary rows give the refusals, the extrapolated and
 fallback steps, each method's share of the seconds (the design README,
-principles 6 and 7) and the speed. Counts and distributions cover only the
-graded window, the steps after the warmup, so they differ from a step record's
-line count. QUICKSTART's step 6 says what the value means and defines `within
-target`, `inside the real spread`, `outside` and `ungradeable`. The other
-verdicts (`atom/compass/validate/__main__.py` and `runs.py` make them):
-
-- `exact`: a count the simulated run shares with every real run.
-- `not gated`, alone or after a count's verdict (`exact, not gated`): a row
-  reported and not graded: counts other than preemptions and prefill tokens,
-  cost on unvalidated steps, the summary's step counts and shares.
-- `not graded`: a warmup row; those requests and steps are kept out of the
-  graded window.
-- `pass` (or `fail`): a memory term against its gate.
-- `meets <N>x` (or `below <N>x`): simulated seconds per wall second against
-  the speed target.
-- `none`: the simulated run refused no step (`coverage report` when it did).
-- `-`: a row stated, not judged: cost on validated steps, cost's steps left
-  out, declined or extrapolated, a band with no request, the graph pool.
-
-Show one row of each family from their table. An `outside` row is a result,
-not a failure.
+principles 6 and 7) and the speed. QUICKSTART's step 6 says what each value
+means, which steps each family covers, and what every verdict says; explain
+the developer's rows from it. Show one row of each family from their table.
 
 ## Reading a failure
 
