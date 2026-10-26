@@ -434,6 +434,33 @@ def test_a_planted_outlier_is_dropped_in_its_own_source_of_the_by_source_report(
         assert all(abs(s["centre"]) < 1e-3 for s in sources.values())
 
 
+def test_a_one_source_fit_reports_its_source_at_the_members_centre_and_mad(
+    tmp_path, run
+):
+    """Replays alone, timed at their factor with 5% noise and one decode target
+    at 3 times it: per kind, the source's counts, centre and MAD are the
+    selected member's, the dropped triple included in both."""
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    noise = 1 + 0.05 * np.random.default_rng(4).standard_normal(len(mixed()))
+    noise[2] = 3
+    replays = [
+        measured(tmp_path, run, x, "replay", time(x) * factor(x) * n)
+        for x, n in zip(mixed(), noise)
+    ]
+
+    copy = fitted(tmp_path, *replays, *clients(g), grid="grid")
+
+    for k, report in copy["report"]["kinds"].items():
+        (selected,) = copy["params"]["residual"]["kinds"][k]["selected"]
+        member, (source,) = report["members"][selected], report["sources"].values()
+        assert source["kept"] == member["samples"]
+        assert source["dropped"] == member["dropped"] >= (k == "decode")
+        assert source["centre"] == pytest.approx(member["centre"], rel=1e-9)
+        assert source["mad"] == pytest.approx(member["mad"], rel=1e-9)
+
+
 def test_a_grid_input_no_client_run_names_refuses_naming_it(tmp_path, run):
     """As `measure steps` refuses to plan over it, with or without `--sessions`."""
     g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
