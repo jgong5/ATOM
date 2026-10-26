@@ -360,23 +360,29 @@ def test_a_record_names_each_aiter_module_its_server_built_while_it_served(
 
 @pytest.mark.skipif(GIT is None, reason="needs git")
 @pytest.mark.parametrize(
-    "written, name",
+    "written, names",
     [
-        ("inductor/triton/0/K3/triton_poi_fused_add_0.hsaco", "triton_poi_fused_add_0"),
-        ("triton/K4/__grp___pa_decode.json", "_pa_decode"),
-        ("home/.cache/atom/c/rank_0/triton_cache/K5/_fwd.autotune.json", "_fwd"),
-        ("site/aiter/jit/flydsl_cache/launch_gemm1_c5/01b8.pkl", "launch_gemm1_c5"),
-        ("aiter_root/build/gfx942/pa_decode_16_1.hsaco", "pa_decode_16_1"),
+        (
+            "inductor/triton/0/K3/triton_poi_fused_add_0.hsaco",
+            ["triton_poi_fused_add_0"],
+        ),
+        ("triton/K4/__grp___pa_decode.json", ["_pa_decode"]),
+        (
+            "home/.cache/atom/torch_compile_cache/c/rank_0/triton_cache/K5/_fwd.hsaco",
+            [],
+        ),
+        ("site/aiter/jit/flydsl_cache/launch_gemm1_c5/01b8.pkl", ["launch_gemm1_c5"]),
+        ("aiter_root/build/gfx942/pa_decode_16_1.hsaco", ["pa_decode_16_1"]),
     ],
     ids=["inductor", "triton", "atom", "flydsl", "hsaco"],
 )
 def test_a_record_names_each_compile_its_server_ran_while_it_served(
-    tmp_path, planted_gpu, monkeypatch, written, name
+    tmp_path, planted_gpu, monkeypatch, written, names
 ):
-    """In Inductor's cache, Triton's, ATOM's compile cache, FlyDSL's under the
-    installed aiter's JIT directory, and `compile_hsaco`'s under
-    ``AITER_ROOT_DIR``'s build directory, named by its kernel or file; the
-    record is refused naming it."""
+    """In Inductor's cache, Triton's, FlyDSL's under the installed aiter's JIT
+    directory, and `compile_hsaco`'s under ``AITER_ROOT_DIR``'s build
+    directory, named by its kernel or file; the record is refused naming it.
+    Not one in ATOM's compile cache, a directory every start derives afresh."""
     _aiter(tmp_path, monkeypatch)
     for var, root in (
         ("AITER_ROOT_DIR", "aiter_root"),
@@ -393,5 +399,6 @@ def test_a_record_names_each_compile_its_server_ran_while_it_served(
     cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
 
     run = json.loads((out / "run.json").read_text())
-    assert run[aiter_jit.BUILDS] == [name]
-    assert f"JIT build of {[name]}" in aiter_jit.refusal(run)
+    assert run.get(aiter_jit.BUILDS, []) == names
+    if names:
+        assert f"JIT build of {names}" in aiter_jit.refusal(run)

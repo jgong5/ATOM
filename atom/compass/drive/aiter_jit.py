@@ -20,8 +20,10 @@ well, since this server may have waited on it.
 So does each kernel compiled the same way: `compile_hsaco`'s, in
 ``build/<gfx arch>``, FlyDSL's, in its own directory under
 ``FLYDSL_RUNTIME_CACHE_DIR``, the package's ``jit/flydsl_cache`` unless set,
-and Triton's and Inductor's, in their cache directories and ATOM's compile
-cache, ``~/.cache/atom``; each named by its file, FlyDSL's by its directory.
+and Triton's and Inductor's, in their cache directories; each named by its
+file, FlyDSL's by its directory. ATOM's compile cache, ``~/.cache/atom``, is
+left out: each start derives a directory of its own there, points Triton and
+Inductor into it, and the stop removes it, so every process pays its compiles.
 
     python -m atom.compass.drive.aiter_jit RUN_JSON SINCE_NS
 
@@ -57,7 +59,7 @@ def _roots() -> dict[Path, object]:
     flydsl = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR")
     flydsl = [flydsl] if flydsl else [p / "flydsl_cache" for p in package]
     inductor = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or default_cache_dir()
-    kernels = (knobs.cache.dir, inductor, Path.home() / ".cache" / "atom")
+    kernels = (knobs.cache.dir, inductor)
     return (
         {p: _module for p in (Path.home() / ".aiter", *env, *package)}
         | {Path(p): lambda parts: parts[0] if len(parts) > 1 else None for p in flydsl}
