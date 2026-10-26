@@ -7,7 +7,7 @@ import pytest
 
 import atom.compass
 import atom.utils.clock
-from atom.compass.detect.clock_source import DEFAULT_ALLOW_LIST, ClockSourceLint
+from tests.compass.clock_source import DEFAULT_ALLOW_LIST, ClockSourceLint
 
 #: A cost backend that charges the time its own arithmetic took.
 SIMULATED_PATH_WITH_A_REAL_READ = '''# SPDX-License-Identifier: MIT

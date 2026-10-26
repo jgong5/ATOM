@@ -619,4 +619,4 @@ def load_inventory(path: str | os.PathLike | None = None) -> dict:
 
 def repo_root_from_here() -> Path:
     """The checkout this module was imported from."""
-    return Path(__file__).resolve().parents[3]
+    return Path(__file__).resolve().parents[2]

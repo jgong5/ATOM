@@ -17,8 +17,8 @@ That claim is enforced, not asserted: every `.py` file under this package, at
 any depth, is held to a standard-library allowlist and to building
 no `set`. Tooling that has to read the tree, parse source, or talk to anything
 therefore does not belong here even when it is about time -- put it beside the
-package, not inside it. The build-time audit of ATOM's blocking calls sits in
-`atom/compass/audit/` for exactly this reason.
+package, not inside it. The audit of ATOM's blocking calls sits in
+`tests/compass/sync_scan.py` for exactly this reason.
 """
 
 from .authority import (

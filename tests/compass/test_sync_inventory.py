@@ -3,7 +3,7 @@
 
 A simulated run substitutes predicted durations for real work, so it has to
 know every call that parks a thread on the real clock. The list of them is in
-`atom/compass/audit/sync_sites.json`; deciding what each one is was a reading
+`tests/compass/sync_sites.json`; deciding what each one is was a reading
 job and cannot be re-derived. What *can* be re-derived is the set of call sites
 that exist, and these tests assert the two agree -- so a blocking call added to
 ATOM later fails here instead of quietly widening the blind spot.
@@ -38,7 +38,7 @@ from collections import Counter
 
 import pytest
 
-from atom.compass.audit import sync_scan
+from tests.compass import sync_scan
 
 TREE = sync_scan.repo_root_from_here()
 INVENTORY = sync_scan.load_inventory()

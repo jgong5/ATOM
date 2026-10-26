@@ -13,12 +13,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from atom.compass.audit import sync_scan
 from atom.kv_transfer.offload import chunked_scheduler
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import transfer
 from atom.utils import clock, envs
+from tests.compass import sync_scan
 
 
 class _LP:

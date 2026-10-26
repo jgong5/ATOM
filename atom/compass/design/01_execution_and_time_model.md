@@ -1184,7 +1184,7 @@ undecided**.
 | K9 | Outside the model | outside the simulation window, inside replaced code, cannot park, or a timing only a log line reads | startup and shutdown, the replaced runner and RDMA backends, collectives inside the real forward, text scanners, the step-loop timings that only feed a log line |
 
 Each site's mechanism is the `mechanism` field #476 adds to its row in
-`atom/compass/audit/sync_sites.json`, produced by the scanner beside it. A row's
+`tests/compass/sync_sites.json`, produced by the scanner beside it. A row's
 first classification (#53) maps naturally to A→K1, B→K5, C1→K8, C2→K7, ignore→K9; the
 rules below say where a site moved off that map.
 
@@ -1575,7 +1575,7 @@ loop.
 
 - ~~The counts above are estimates from a synchronization inventory, not from a completed
   pass over the code. The first implementation task should be to produce the exact
-  classified list and check it in.~~ **Done, 2026-09-21.** `atom/compass/audit/`.
+  classified list and check it in.~~ **Done, 2026-09-21.** `tests/compass/sync_scan.py` and `sync_sites.json`.
 - ~~The literal `time.sleep(2)` in `DecodeEngineCore._post_model_load_hook` ... it must
   be *checked*, not assumed.~~ **Checked, 2026-09-21, and both halves hold.** It is
   reached only from that hook, and `DecodeEngineCore` is constructed only by
@@ -1659,7 +1659,7 @@ The pacing timers are local next events the clock owner hands to
   time. `11` D72 carries the observer and the reasons.
 - uvicorn's server tick, a 0.1 s `asyncio.sleep` in `Server.main_loop`, and its
   keep-alive timeout are daemon deadlines too. They are uvicorn's code, not ATOM's, so the
-  sync inventory (`atom/compass/audit/sync_sites.json`) has no row for them; the frontend
+  sync inventory (`tests/compass/sync_sites.json`) has no row for them; the frontend
   declares them with the refresh loop in `DAEMON_TIMERS` (`atom/utils/compass_loop.py`).
 
 ### Must read the LP clock — these three change scheduling (K2)
@@ -1687,7 +1687,7 @@ The only requirement is that these stay on the *same* clock as each other:
 is not, so virtualizing only the former makes the two halves of shutdown disagree.
 
 The control-command reply deadline stays real too (K8, ruling on #964, 2026-10-14; its
-reads are in `_KEPT_REAL`, `atom/compass/detect/clock_source.py`): a control command is
+reads are in `_KEPT_REAL`, `tests/compass/clock_source.py`): a control command is
 out-of-band and produces no simulated event (#886), and the LP clock moves only while
 its owner takes a grant, so a deadline on it would never expire while the owner waits.
 
