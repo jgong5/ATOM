@@ -42,6 +42,7 @@ from atom.compass.backends.step_grid import coordinates
 from atom.compass.backends.step_grid_fit import VALUE
 from atom.compass.backends.step_grid_residual import Residual
 from atom.compass.backends.step_roofline import (
+    Module,
     StepFallbackBackend,
     StepRooflineBackend,
 )
@@ -296,10 +297,10 @@ def test_a_step_the_grid_declines_in_a_cell_naming_no_atom_arguments_refuses_it(
         main([str(tmp_path / "c4")])
 
 
-def _below(member):
-    """The grid of `member` with the step roofline of `STACK` below it."""
+def _below(member, modules=STACK):
+    """The grid of `member` with the step roofline of `modules` below it."""
     grid = StepGridBackend(StepGrid(member["grid"]), Residual(member["residual"]), "b")
-    roofline = StepRooflineBackend(MachineSpec.from_mapping(_spec()), STACK)
+    roofline = StepRooflineBackend(MachineSpec.from_mapping(_spec()), modules)
     return StepFallbackBackend(grid, roofline)
 
 
@@ -325,13 +326,15 @@ def test_a_step_the_roofline_answers_is_a_fallback_and_one_none_answers_refused(
     tmp_path,
 ):
     """A run prices a step the grid declines by the step roofline below it; a
-    bare grid or a law has nothing below it."""
+    bare grid or a law has nothing below it. The roofline answers with a term per
+    module kind, each carrying the grid's decline, which the row names once."""
     member = _bundle(_steps(), missing={15})
     grid = StepGridBackend(StepGrid(member["grid"]), Residual(member["residual"]), "b")
     record = _record(tmp_path / "steps", _steps())
 
     by_grid = cost_accuracy(record, grid)
-    below = cost_accuracy(record, _below(member))
+    two_kinds = STACK + [Module("norm", "norm", (4096,))]
+    below = cost_accuracy(record, _below(member, two_kinds))
     by_law = cost_accuracy(record, {**LAW, "decode": {}})
 
     assert by_grid["backend"] == grid.describe()
