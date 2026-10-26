@@ -485,7 +485,7 @@ def test_a_held_out_target_outside_the_band_members_bands_reports_an_error_of_1(
     timed at 1.25 times their lookup below 128 tokens and 1.5 times above, so
     the band member is selected; and a replayed chunk of 20 tokens, the only one
     in its band, which seed 0 holds out. The member holds no factor for that
-    band, so the replay's source reports its held-out error as a factor of 0."""
+    band, so it prices the replay at a factor of 0, a held-out error of 1."""
     monkeypatch.setattr(step_linear_fit, "TOKEN_BANDS", (32, 128))
     g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
     for line in nodes():
