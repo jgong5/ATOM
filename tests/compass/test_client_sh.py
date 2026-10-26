@@ -8,7 +8,8 @@ harness Python whose probes answer as one holding this tree's compass-harness,
 its aiperf plugin installed when ``$HARNESS_PLUGIN`` is set, and whose aiperf
 saves how it ran to ``$SEEN`` and writes the export and raw records ``$SPEC``
 holds, its dataset the trace files it was given. Each
-breaks the step ``$BREAK`` names. With ``--stop``, a stand-in compass command
+breaks the step ``$BREAK`` names; ``hang`` makes aiperf write its pid to
+``$SEEN`` and sleep. With ``--stop``, a stand-in compass command
 serves a ``sleep``. Nothing needs a driver, a server or aiperf.
 """
 
@@ -24,13 +25,14 @@ from pathlib import Path
 
 import pytest
 from test_parity_client_run import ARGUMENTS, CONFIG, PARAMETERS, raw, sse
+from test_smoke_cell import _alive
 
 from atom.compass.parity.client_run import NAME, RAW
 
 TREE = Path(__file__).resolve().parents[2]
 SCRIPT = TREE / "scripts/compass/client.sh"
 HARNESS = r"""
-import json, os, sys
+import json, os, sys, time
 from pathlib import Path
 a, brk = sys.argv[1:], os.environ.get("BREAK")
 if "import compass_harness" in a[1]:
@@ -44,6 +46,10 @@ if "profile" not in a:
     sys.exit()
 if brk == "aiperf":
     sys.exit(3)
+if brk == "hang":
+    Path(os.environ["SEEN"] + ".t").write_text(str(os.getpid()))
+    os.rename(os.environ["SEEN"] + ".t", os.environ["SEEN"])
+    time.sleep(600)
 Path(os.environ["SEEN"]).write_text(json.dumps([a, dict(os.environ), os.getcwd()]))
 spec = json.loads(Path(os.environ["SPEC"]).read_text())
 art = Path(a[a.index("--artifact-dir") + 1])
@@ -375,3 +381,29 @@ def test_both_clients_strip_payloads_and_gzip_the_raw_records_once_exported(tmp_
         assert not (art / RAW).exists()
         with gzip.open(art / (RAW + ".gz"), "rt") as f:
             assert [json.loads(line) for line in f] == spec["raw"]
+
+
+def test_sigterm_during_aiperf_leaves_it_not_running(tmp_path):
+    out, env = _setup(tmp_path, SIM)
+    seen = tmp_path / "seen.json"
+    p = subprocess.Popen(
+        ["bash", SCRIPT, out, *GOOD],
+        cwd="/",
+        env=env | {"BREAK": "hang"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not seen.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        p.terminate()
+        _, err = p.communicate(timeout=60)
+    finally:
+        p.kill()
+    pid = int(seen.read_text())
+    alive = _alive(pid)
+    alive and os.kill(pid, signal.SIGKILL)
+    assert p.returncode == -signal.SIGTERM, err
+    assert not alive
