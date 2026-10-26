@@ -96,7 +96,9 @@ def record(readings: DeviceReadings, *, tokens: int, memory) -> dict:
     }
 
 
-def _one(pattern: re.Pattern, text: str, log: Path, ranks: int) -> tuple[str, ...]:
+def _one(pattern: re.Pattern, text: str, log: Path, ranks: int, blocks=None) -> tuple:
+    """Each rank's values on its line matching `pattern`; where ranks differ, those
+    on the lines that log `blocks`, the rank's KV block count, which must agree."""
     found = pattern.findall(text)
     if len(found) != ranks:
         raise MemoryRefusal(
@@ -104,6 +106,20 @@ def _one(pattern: re.Pattern, text: str, log: Path, ranks: int) -> tuple[str, ..
             f"each of the {ranks} ranks of one real server logs one",
             "pass the log of a real server at as many ranks as hand-ins",
         )
+    if len(set(found)) > 1 and blocks:
+        count = f"num_kvcache_blocks={blocks}"
+        found = re.findall(rf"{pattern.pattern}.*\b{count}\b", text)
+        if not found:
+            raise MemoryRefusal(
+                f"no line of {log} logs {count}, the rank's",
+                "compare the log of the server whose ranks recorded these steps",
+            )
+        if len(set(found)) > 1:
+            raise MemoryRefusal(
+                f"the lines of {log} that log {count}, the rank's, carry "
+                f"{sorted(set(found))}",
+                "compare the log of one server start",
+            )
     if len(set(found)) > 1:
         raise MemoryRefusal(
             f"{log}'s ranks log {sorted(set(found))} on lines matching "
@@ -136,7 +152,7 @@ def _stored(out: Path) -> tuple[Term, ...]:
     return footprint_terms(held[0], source=f"{STORAGE} in {out / READINGS}")
 
 
-def recorded(log: Path, ranks: int = 1) -> tuple[Recorded, Term | None]:
+def recorded(log: Path, ranks: int = 1, blocks=None) -> tuple[Recorded, Term | None]:
     """The real server's two readings, which each of its `ranks` DP ranks logs,
     and the pool its capture reserved; for a `compass measure memory` ``--out``,
     its engine's, and its ranks' storage bytes besides.
@@ -150,7 +166,7 @@ def recorded(log: Path, ranks: int = 1) -> tuple[Recorded, Term | None]:
         stored, log = _stored(log), log / LOG
     data = log.read_bytes()
     text = data.decode(errors="replace")
-    peak_torch, non_torch = _one(_BUDGET, text, log, ranks)
+    peak_torch, non_torch = _one(_BUDGET, text, log, ranks, blocks)
     (tokens,) = _one(_WARMUP, text, log, ranks)
     run = Recorded(
         run=str(log),
@@ -177,13 +193,13 @@ def recorded(log: Path, ranks: int = 1) -> tuple[Recorded, Term | None]:
     return run, pool
 
 
-def parts(predicted_file: Path, log: Path, ranks: int = 1) -> list:
+def parts(predicted_file: Path, log: Path, ranks: int = 1, blocks=None) -> list:
     """The per-term comparison, the predicted readings, and the graph pool's."""
     if not (saved := read_json(predicted_file).get("memory")):
         what = f"{predicted_file} has no memory section"
         raise MemoryRefusal(what, "pass an engine's hand-in, lp-engine*.json")
     readings = {name: _reading(name, rows) for name, rows in saved["readings"].items()}
-    run, pool = recorded(log, ranks)
+    run, pool = recorded(log, ranks, blocks)
     # The terms of `peak_torch` the run records alone: its storages.
     stored = run.by_name().keys() - set(COMPARED)
     alone = tuple(t for t in readings["peak_torch"].terms if t.name in stored)
@@ -204,7 +220,13 @@ def parts(predicted_file: Path, log: Path, ranks: int = 1) -> list:
     else:
         reserves = readings[graph_pool.RESERVES]
         predicts = _reading(graph_pool.PREDICTS, saved["predicts"])
-        out.append(compare_graph_pool(pool, reserves=reserves, predicts=predicts))
+        if pool.nbytes:  # a pool logged as 0.00GB is under 5 MiB: no share of it
+            out.append(compare_graph_pool(pool, reserves=reserves, predicts=predicts))
+        else:
+            out.append(
+                "graph pool not compared: the real run's capture reserved 0.00GB; "
+                f"reserves() {reserves.total:,} B, predicts() {predicts.total:,} B"
+            )
     return out
 
 

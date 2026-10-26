@@ -156,12 +156,16 @@ def _memory(name: str, sim: Path, engine: str, real: Path):
     ranks = sorted(sim.glob(LP_FILE.format(f"{engine}.dp*")))
     for hand_in in ranks or [sim / LP_FILE.format(engine)]:
         rank = f" {hand_in.stem.rsplit('.', 1)[1]}" if ranks else ""
-        yield from _checked(f"memory {name}{rank}", hand_in, real, len(ranks) or 1)
+        # The real rank's KV block count names its lines in the server log.
+        record = real / f"steps/{rank.strip()}.engine.json"
+        blocks = ranks and record.exists() and read_json(record)["num_kvcache_blocks"]
+        n = len(ranks) or 1
+        yield from _checked(f"memory {name}{rank}", hand_in, real, n, blocks)
 
 
-def _checked(where: str, hand_in: Path, real: Path, ranks: int):
+def _checked(where: str, hand_in: Path, real: Path, ranks: int, blocks=None):
     try:
-        comparison, *_, graph = parts(hand_in, real / "server.log", ranks)
+        comparison, *_, graph = parts(hand_in, real / "server.log", ranks, blocks)
     except MemoryRefusal as e:
         yield where, "memory", e.what, "refused"
         return
