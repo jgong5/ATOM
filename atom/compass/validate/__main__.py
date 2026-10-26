@@ -342,7 +342,7 @@ def rows(cell) -> list[tuple]:
     out += _warm_over_cold(run_file) if op else ()
     for side in runs.sides(sim):
         name = " ".join(side.relative_to(cell).parts)
-        out += _warmup(name, runs.graded(side, sim, whole)[2])
+        out += _warmup(name, runs.graded(side, sim, whole, simulated=True)[2])
     out += _summary(sim, summary)
     return out
 

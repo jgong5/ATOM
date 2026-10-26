@@ -11,11 +11,10 @@ resident), activations compared at the wrong shape (**-0.015 GB**), and
 **-0.084 GB** of a resident term nobody had noticed existed. The largest of the
 three was **25% of its own term**, and the sum said 13.8%.
 
-So this module compares term by term, and the aggregate is available only as a
-`SummedCheck`, which cannot be constructed without the comparison it summarises
-and renders the per-term table underneath itself. That is the rule against
-reporting an aggregate without its decomposition, made structural rather than
-remembered, the same way `terms.Reading` makes it structural for a reading.
+So this module compares term by term and offers no aggregate at all. That is
+the rule against reporting an aggregate without its decomposition, made
+structural rather than remembered, the same way `terms.Reading` makes it
+structural for a reading.
 
 **It costs no GPU time.** Every hardware run already prints its own breakdown;
 a `Recorded` is that printout, handed in as input data. Nothing here runs a
@@ -76,7 +75,7 @@ from dataclasses import dataclass
 
 from atom.compass.backends.provenance import Method
 from atom.compass.memory import graph_pool
-from atom.compass.memory.readings import DeviceReadings, MemoryRefusal
+from atom.compass.memory.readings import MemoryRefusal
 from atom.compass.memory.terms import Reading, Term
 
 #: The acceptance gate on each non-KV term, as a fraction of the recorded term.
@@ -219,31 +218,6 @@ class Predicted:
                 f"at {self.shape} and predicts no such term"
             )
 
-    @classmethod
-    def from_readings(
-        cls, readings: DeviceReadings, *, shape: Shape, at_shape: frozenset[str]
-    ) -> Predicted:
-        """The footprint terms of a `DeviceReadings`: `peak_torch` and `non_torch`.
-
-        Three of the five readings are deliberately not here. `total` is the
-        card and `free` is the box that is left after the footprint, so neither
-        is a footprint term; folding either in would compare the card against
-        itself. `cudagraph_overhead` is one of **two** numbers that disagree by
-        4-19x, and a single row for it would pick one -- `compare_graph_pool`
-        takes both, and `compare` refuses a term carrying either name.
-
-        `at_shape` is required rather than defaulted to this package's own
-        shape-dependent term. A caller that adds a term to `ModelTerms` has to
-        say whether it moves with the shape, and a default here would answer
-        for them.
-        """
-        return cls(
-            label=f"{readings.spec_digest} at TP{readings.tp_width}",
-            shape=shape,
-            terms=tuple(readings.peak_torch.terms) + tuple(readings.non_torch.terms),
-            at_shape=at_shape,
-        )
-
     def by_name(self) -> dict[str, Term]:
         return _named(self.terms, f"prediction {self.label!r}")
 
@@ -316,11 +290,9 @@ class TermComparison:
 class Comparison:
     """Every non-KV term of one prediction against one run, and nothing summed.
 
-    There is no `total` here and no `__int__`. The aggregate is `summed`, which
-    returns an object that cannot be built without this one and prints this
-    table underneath itself: the rule is that an overall figure may be
-    emitted only beside the decomposition that produced it, and a call that
-    could return the figure alone is the defect rather than the convenience.
+    There is no `total` here and no `__int__`: a call that could return an
+    overall figure without its decomposition is the defect rather than the
+    convenience.
     """
 
     label: str
@@ -336,37 +308,6 @@ class Comparison:
 
     def not_discharged(self) -> tuple[TermComparison, ...]:
         return tuple(t for t in self.compared if t.verdict is Verdict.NOT_DISCHARGED)
-
-    def _largest(self, key) -> TermComparison:
-        if not self.compared:
-            raise MemoryRefusal(
-                f"{self.run} and {self.label} share no comparable term, so "
-                "there is no largest error",
-                "check the refusals: every term of this comparison is in them",
-            )
-        return max(self.compared, key=key)
-
-    def worst(self) -> TermComparison:
-        """The term furthest outside its gate, ranked in the gate's own unit.
-
-        The gate is a fraction of the recorded term, so that is what "worst"
-        is ranked by. The two orderings genuinely disagree -- a term the run
-        records and nothing predicted is 100% of itself and is usually not the
-        largest number of bytes -- and handing a reader the second-worst term
-        by the unit they are being held to is the wrong end of the finding.
-        `largest_by_bytes` is the other ordering, named for what it is.
-        """
-        return self._largest(lambda t: abs(t.relative))
-
-    def largest_by_bytes(self) -> TermComparison:
-        """The term whose error is the most bytes, which is not the same term.
-
-        This is the ordering the historical incident is stated in: the largest
-        single error was 25% of its term. That is a claim about bytes, and it
-        is history rather than a contract, so it is a separate accessor with
-        the unit in its name.
-        """
-        return self._largest(lambda t: abs(t.delta_bytes))
 
     def table(self) -> str:
         """The per-term table, then every refusal by name. Never a total."""
@@ -400,83 +341,6 @@ class Comparison:
         for refusal in self.refused:
             lines.append(f"  ! {refusal}")
         return "\n".join(lines)
-
-    def summed(self, *, band: float) -> SummedCheck:
-        """The instrument the per-term rule rejects, kept so it can be shown wrong.
-
-        `band` has no default because no band for a sum exists. Both bands in
-        use -- the 10% a non-KV memory term carries, and the 25% allowed one on
-        a device nobody has measured -- are **per term**, and
-        choosing one of those two for a sum is the substitution that produced
-        the +13.8%. Naming it at the call site is the moment a caller has to
-        notice that.
-        """
-        return SummedCheck(comparison=self, band=band)
-
-    def __str__(self) -> str:
-        return self.table()
-
-
-@dataclass(frozen=True, slots=True)
-class SummedCheck:
-    """One aggregate, and the table it came from, which it cannot be printed without.
-
-    This is the instrument that read +13.8% over three errors, two of which
-    cancelled. It is here so that the two can be run on one breakdown and the
-    difference shown, which is a stronger argument for the rule than restating
-    the rule. It holds its `Comparison` rather than a pair of totals, so there
-    is no way to obtain the figure without also holding the decomposition.
-    """
-
-    comparison: Comparison
-    band: float
-
-    def __post_init__(self) -> None:
-        if not 0 < self.band < 10:
-            raise ValueError(f"a band is a fraction of the recorded sum: {self.band}")
-
-    @property
-    def folded(self) -> tuple[TermComparison, ...]:
-        return self.comparison.compared
-
-    @property
-    def predicted_total(self) -> int:
-        return sum(t.predicted_bytes for t in self.folded)
-
-    @property
-    def recorded_total(self) -> int:
-        return sum(t.recorded.nbytes for t in self.folded)
-
-    @property
-    def delta_bytes(self) -> int:
-        return self.predicted_total - self.recorded_total
-
-    @property
-    def relative(self) -> float:
-        if self.recorded_total == 0:
-            raise MemoryRefusal(
-                "the recorded terms sum to zero bytes",
-                "a relative error against nothing is not a figure; read the table",
-            )
-        return self.delta_bytes / self.recorded_total
-
-    @property
-    def passed(self) -> bool:
-        return abs(self.relative) <= self.band
-
-    def table(self) -> str:
-        """The aggregate, and underneath it the terms it folded."""
-        verdict = "passes" if self.passed else "fails"
-        refused = len(self.comparison.refused)
-        aggregate = (
-            f"summed check: {self.relative:+.1%} against a {self.band:.0%} "
-            f"band -- {verdict}"
-        )
-        folded = (
-            f"  folded {len(self.folded)} terms, {refused} refused and so not "
-            "folded; a sum names none of them"
-        )
-        return f"{aggregate}\n{folded}\n{self.comparison.table()}"
 
     def __str__(self) -> str:
         return self.table()

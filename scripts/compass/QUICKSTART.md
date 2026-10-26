@@ -102,8 +102,9 @@ container, entered with `docker exec -it ${USER}_compass_gpu bash`.
   node 18 the model repo is `/data/xingjche/compass/inputs/models--Qwen--Qwen3.8-27B`,
   mounted at `/models/qwen38`, and the traces directory
   `/data/xingjche/compass/inputs/cc-traces-weka-062126-256k`, mounted at `/cc`.
-- **Disk.** A run takes about 400 MB, since the raw export keeps every prompt; the
-  full cell about 8 GB, the smoke cell 180 MB. A client of 256 traces maps about
+- **Disk.** At most about 400 MB a run, 8 GB the full cell and 180 MB the smoke
+  cell, measured when the raw export kept every prompt; it now keeps none and is
+  gzipped once the client run's export is written. A client of 256 traces maps about
   1.4 GB more in its `OUT/client` while it runs. The container's `/root/.cache`
   tmpfs grows by about 1 GB in the smoke cell and 3.5 GB on the full path, 2.3 GB
   of it aiperf's dataset maps, and `/root/.aiter`, where aiter builds its
@@ -367,11 +368,11 @@ law's accuracy.
 | `serve: OUT exists; leave a finished run out, rm -rf a stopped one` | a loop taken again over a run it already took | leave a finished concurrency out of the loop; `rm -rf` a stopped or short run's `--out` |
 | `Triton cache error`, or `failed to map segment from shared object` | a `--tmpfs` without `exec` | the container as Environment starts it |
 | grading, a fit or `validate.cost` refuses a record: `aiter ran a JIT build of [...] while its server served` | the container met that kernel variant for the first time inside the record | take the record again, since the container now holds the build; warm a fresh container first (step 0) |
-| verdict `coverage report`, `no decode vector for rung N` | no calibration step decoded N requests at once (a rung is the batch's captured-graph size). Concurrency alone does not reach N, since each lane replays from its own sampled start: for Qwen3.8-27B TP1 on one MI308X, calibration at c=16 (traces 256 to 392) decoded at most 7 at once, the graded cell (traces 0 to 255) up to 8 ([#1840](https://github.com/jgong5/ATOM/issues/1840)) | add a calibration record that starts every trajectory at its first turn, at concurrency N, to step 4's records: `calib_capture.sh` with `CELLS=N AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"` (`cctraces_sim.sh`'s header); such records at c=8 and c=14 added rung 8 |
+| verdict `coverage report`, `no decode vector for rung N` | no calibration step decoded N requests at once (a rung is the batch's captured-graph size). Concurrency alone does not reach N, since each lane replays from its own sampled start: for Qwen3.8-27B TP1 on one MI308X, calibration at c=16 (traces 256 to 392) decoded at most 7 at once, the graded cell (traces 0 to 255) up to 8 ([#1840](https://github.com/jgong5/ATOM/issues/1840)) | add a calibration record that starts every trajectory at its first turn, at concurrency N, to step 4's records: `calib_capture.sh` with `CELLS=N AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"` (`cctraces_sim.sh`'s header); such records at c=8, 10 and 12 give the shipped law its rung 8 |
 | grading refuses a run: `its export names no warmup` | no session was in flight at any lane's sampled start, so aiperf sent no warmup request: `artifacts/client_run.json` has an empty `warmup` and `client/aiperf.log` says `nothing to warm`. `client.sh` pins aiperf's seed, so the same traces and concurrency draw the same starts | no run of this cell is graded, since its first steps may be cold, and a fresh run repeats the draw; a higher concurrency adds lanes, each keeping its start; another trace range draws other starts |
 | grading refuses a run: warmup | its warmup overlapped its graded steps | a fresh server and client run |
 | grading refuses a run: fitted on the traces it grades | calibration and cell traces overlap | calibration 256 to 392, cell 0 to 255 |
-| disk full | raw exports keep every prompt, and caches with no tmpfs fill the container's layer | the data directory where Disk puts it, and the container's tmpfs mounts (Environment) |
+| disk full | caches with no tmpfs fill the container's layer | the data directory where Disk puts it, and the container's tmpfs mounts (Environment) |
 
 ## Appendix: the step grid
 

@@ -12,6 +12,7 @@ runner both load it.
 
 import itertools
 import json
+from types import SimpleNamespace
 
 import pytest
 from conftest import MockConfig
@@ -90,6 +91,9 @@ def _stops(tokenizer):
 
 
 class _Runner(NonAllocatingRunner):
+    # What ATOM's processor sets for a single stage that is no P/D producer.
+    tokenID_processor = SimpleNamespace(is_deferred_out=True)
+
     def __init__(self, config, stream=None):
         self.config = config
         install_cost_backend(self, StepStubBackend())

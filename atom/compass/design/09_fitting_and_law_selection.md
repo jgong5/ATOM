@@ -172,12 +172,12 @@ host and device clocks to each other. With MTP the label splits at
 `forward_done_event` into target and draft
 ([#829](https://github.com/jgong5/ATOM/issues/829)). A decode's draft-KV pass runs
 before that event, so its target label holds it; the draft law's `draft_kv` vector
-prices it on `[1, seqs]`, untagged as draft, and the target's vectors fit the rest
+prices it on `[1, seqs]` among the target's terms, and the target's vectors fit the rest
 ([#2080](https://github.com/jgong5/ATOM/issues/2080)). An output prefill's pass runs
 before it too: its target label holds it, and the draft law's prefill vector, which
-prices a middle chunk's pass as draft, prices it untagged, as the draft law's
-`output_prefill_kv` states; the output prefill's draft label, all after the event,
-fits the `propose` vector ([#2100](https://github.com/jgong5/ATOM/issues/2100)).
+prices a middle chunk's pass as draft, prices it among the target's terms, as the
+draft law's `output_prefill_kv` states; the output prefill's draft label, all after
+the event, fits the `propose` vector ([#2100](https://github.com/jgong5/ATOM/issues/2100)).
 
 **Host laws** price the host segments of `01` D4: `E`, `W_pre`, `W_launch` and
 `W_post`, each linear in `(1, tokens, seqs)`, fitted separately for decode, output

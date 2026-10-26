@@ -11,7 +11,11 @@ chunk, in the fields aiperf's `RawRecordInfo` writes.
 
 import asyncio
 import json
+import os
 import queue
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from test_parity_record import _config, _key, _prompt, _Runner
@@ -267,6 +271,36 @@ def test_the_trace_is_the_conversation_and_the_parameters_are_what_shape_no_prom
     }
 
 
+@pytest.mark.parametrize("extra", [{"ignore_eos": True}, None])
+def test_records_stripped_of_their_payload_export_as_whole_ones_do(tmp_path, extra):
+    # What aiperf's chat endpoint sends for a weka trace request.
+    payload = {
+        "messages": [{"role": "user", "content": "x" * 1000}],
+        "model": "m",
+        "stream": True,
+        "max_completion_tokens": 7,
+        "stream_options": {"include_usage": True},
+        **(extra or {}),
+    }
+    config = CONFIG | {"endpoint": CONFIG["endpoint"] | {"extra": extra}}
+    records = [
+        raw([sse(("data", '{"id": "a"}'))], "t0", payload),
+        raw([sse(("data", '{"id": "b"}'))], "t1", payload, phase="warmup"),
+    ]
+    exports = []
+    for name, strip in (("whole", False), ("stripped", True)):
+        planted = [
+            {k: v for k, v in r.items() if not (strip and k == "payload")}
+            for r in records
+        ]
+        _write_raw(tmp_path / name, planted, config=config)
+        exports.append(write(tmp_path / name)[1])
+
+    whole, stripped = exports
+    assert stripped == whole
+    assert whole["requests"]["a"]["sampling"] == (extra or {})
+
+
 def test_a_record_holding_a_unicode_line_separator_is_read_whole(tmp_path):
     # aiperf's orjson writes U+2028, U+2029 and U+0085 unescaped, as a served
     # output can hold them.
@@ -402,6 +436,29 @@ def test_a_dataset_not_of_weka_traces_at_a_path_refuses(tmp_path, entry):
     assert not (tmp_path / NAME).exists()
 
 
+def test_a_relative_dataset_path_refuses_by_name(tmp_path, monkeypatch):
+    # Traces where the path reads from here, which need not be where aiperf ran.
+    monkeypatch.chdir(tmp_path)
+    dataset = weka(Path("traces"), "t0")
+    _write_raw(tmp_path / "run", [raw([sse(("data", '{"id": "a"}'))], "t0")], dataset)
+
+    with pytest.raises(ValueError, match="dataset main path traces is not absolute"):
+        write(tmp_path / "run")
+    assert not (tmp_path / "run" / NAME).exists()
+
+
+def test_a_second_dataset_refuses_by_name(tmp_path):
+    dataset = weka(tmp_path / "traces", "t0")
+    _write_raw(tmp_path, [raw([sse(("data", '{"id": "a"}'))], "t0")], dataset)
+    export = json.loads((tmp_path / AIPERF).read_text())
+    export["input_config"]["datasets"].append(dataset | {"name": "second"})
+    (tmp_path / AIPERF).write_text(json.dumps(export))
+
+    with pytest.raises(ValueError, match=r"datasets \['main', 'second'\], not one"):
+        write(tmp_path)
+    assert not (tmp_path / NAME).exists()
+
+
 @pytest.mark.parametrize(
     "records, match",
     [
@@ -464,3 +521,18 @@ def test_the_planted_config_is_aiperf_s_own(tmp_path):
         mode="json", exclude_unset=True, exclude_none=True
     )
     assert dumped == planted
+
+
+def test_the_strip_variable_the_clients_set_is_aiperf_s_own():
+    pytest.importorskip("aiperf.common.environment")
+    code = "from aiperf.common.environment import Environment as E\n"
+    code += "print(E.RECORD.STRIP_PAYLOAD_BYTES)"
+    env = os.environ | {"AIPERF_RECORD_STRIP_PAYLOAD_BYTES": "true"}
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.stdout.split()[-1:] == ["True"], done.stdout + done.stderr

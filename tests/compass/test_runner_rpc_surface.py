@@ -225,9 +225,9 @@ def _call_sites():
 SITES, NON_LITERAL, FROM_COMPASS = _call_sites()
 BASE = _methods(_classes(ATOM_RUNNER)["ModelRunner"])
 RAPID = _methods(_classes(ATOM_RUNNER)["RapidServeModelRunner"])
-MIXIN = _methods(
-    _classes(REPO / "atom/compass/runner/overrides.py")["NonAllocatingRunner"]
-)
+# Every class the mixin inherits, not only its own body: the refusals live on a
+# base. Read from the class itself, since the overrides import with no driver.
+MIXIN = {n for c in NonAllocatingRunner.__mro__ if c is not object for n in vars(c)}
 EXTENSION_CLASSES = {
     name
     for rel in ROLLOUT

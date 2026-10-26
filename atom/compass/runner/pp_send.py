@@ -142,9 +142,11 @@ class StageSends:
 
     def __init__(self, rt, call, rank: int, pp: int, models, wake=(0.0, 1.0)) -> None:
         self.rt, self.call, self.models, self.wake = rt, call, models, wake
+        # The pipeline's LPs are this one's name with its stage's index swapped.
+        engine = rt.me.name.rpartition("-pp")[0]
 
         def ch(a, b, kind):
-            return f"engine-pp{a}->engine-pp{b}:{kind}#dp0"
+            return f"{engine}-pp{a}->{engine}-pp{b}:{kind}#dp0"
 
         self.data_in = rank > 0 and ch(rank - 1, rank, "pp_data")
         self.ack_out = rank > 0 and ch(rank, rank - 1, "pp_ack")

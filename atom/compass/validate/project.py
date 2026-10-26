@@ -8,7 +8,8 @@ at step and op level, published as a `projection`.
 A cell is a real run's directory, its step record in `steps/`, and the ATOM
 arguments it ran under: after `--` in the command line its run.json holds,
 less the server's and `--model`, as `--model` names the model here; for a
-record whose run.json names none, those in its own `-- RECORD` group. Its
+record whose run.json names none, or a `--draft-model`, those in its own
+`-- RECORD` group. Its
 steps are priced as `validate.bound` prices them,
 on SPEC, the op_graphs S holds for SPEC's arch; nothing is compared with the
 measured time, which is another device's. Each cell is priced in a process of
@@ -20,8 +21,10 @@ a second over the steps priced; per granularity, the cells ranked by those
 tokens a second, its first (top-1) and first three (top-3); and each field of
 SPEC whose origin is `assumed` that a price read, with its value, and for an
 assumed arch the compute units and stepping its op_graphs were traced at.
-Its `band` re-prices every cell at 0.8 and 1.2 times each carried ratio a price
-read, one at a time (`band`), and ranks the cells again.
+Each cell also states its projected seconds per phase by the roofline part that
+set them (`bound.gate`). Its `band` re-prices every cell at each carried value
+a price read times each of its factors, one at a time (`band`), and ranks the
+cells again.
 
 `projected` is the method that makes SPEC for a device that never ran, applied
 to one that did, for `validate.bound --ratios-from`.
@@ -48,6 +51,7 @@ from atom.compass.artifacts import (
     member_name,
     roots_for,
 )
+from atom.compass.backends.cost import fold_parts, fold_seconds
 from atom.compass.spec import MachineSpec
 
 from . import bound
@@ -64,6 +68,7 @@ CARRIED = (
     "interconnect.router_relay_s",
 )
 CURVE = "device.memory.bandwidth_curve"
+FLOOR = "device.kernel_floor_s"
 BANDWIDTH = "device.memory.bandwidth_bytes_per_s"
 
 
@@ -130,7 +135,7 @@ def cell(model: str, tp: int, machine: dict, store: str, record: str, atom_args)
     levels = {}
     for level, r in report.items():
         rate = r["ranking"] and r["ranking"]["tokens_per_s"][record]["analytical"]
-        held = ("steps", "steps_refused", "refused", "analytical_s")
+        held = ("steps", "steps_refused", "refused", "analytical_s", "by_bound")
         levels[level] = {k: r[k] for k in held} | {"tokens_per_s": rate}
     return {
         "model": _file_digest(config.model, "config.json"),
@@ -161,31 +166,41 @@ def _ranked(cells: dict) -> dict:
     return ranking
 
 
+def factors(path: str) -> tuple[float, ...]:
+    """The factors `band` re-prices the carried value at `path` at: a ratio (an
+    assumed derate, or the bandwidth curve over the datasheet bandwidth) and
+    the kernel floor at 0.8 and 1.2, a link latency also at 2 and 4, since a
+    switched fabric may sit further from the hop it was probed on; none for
+    another field."""
+    if path in (CURVE, FLOOR) or "derate" in path.split("."):
+        return (0.8, 1.2)
+    return (0.8, 1.2, 2, 4) if path.endswith(".link_latency_s") else ()
+
+
 def scaled(machine: MachineSpec, path: str, factor: float):
-    """`machine` with the ratio at `path` times `factor`, capped at 1, the
-    datasheet; for the bandwidth curve, each point's rate over the datasheet
-    bandwidth. Also whether the cap applied."""
+    """`machine` with the value at `path` times `factor`, a ratio capped at 1,
+    the datasheet; for the bandwidth curve, each point's rate over the
+    datasheet bandwidth. Also whether the cap applied."""
     values = dict(machine.values)
     if path == CURVE:
         top = machine.value(BANDWIDTH)
         curve = [[size, rate * factor] for size, rate in machine.value(CURVE)]
         capped = any(rate > top for _, rate in curve)
         values[CURVE] = [[size, min(rate, top)] for size, rate in curve]
-    else:
+    elif "derate" in path.split("."):
         capped = machine.value(path) * factor > 1
         values[path] = min(machine.value(path) * factor, 1.0)
+    else:
+        capped, values[path] = False, machine.value(path) * factor
     return MachineSpec(values, machine.tokenizers), capped
 
 
 def band(machine: MachineSpec, assumed: dict, jobs: list, base: dict) -> dict:
-    """Each carried ratio a price read (an assumed derate, or the bandwidth
-    curve over the datasheet bandwidth) at 0.8 and 1.2 times its value, the
-    others held: per factor, whether the cap applied, the cells ranked, and
-    per granularity whether the order of `base`, the ranking at the carried
-    values, holds. A carried value no datasheet states a peak for, as the
-    kernel floor or a link latency, is no ratio."""
-    ratios = [p for p in assumed if p == CURVE or "derate" in p.split(".")]
-    specs = [(p, f, *scaled(machine, p, f)) for p in ratios for f in (0.8, 1.2)]
+    """Each carried value a price read at each of its `factors`, the others
+    held: per factor, whether the cap applied, the cells ranked, and per
+    granularity whether the order of `base`, the ranking at the carried
+    values, holds."""
+    specs = [(p, f, *scaled(machine, p, f)) for p in assumed for f in factors(p)]
     results = iter(
         _each([(*j[:2], s.echo(), *j[3:]) for _, _, s, _ in specs for j in jobs])
     )
@@ -291,8 +306,14 @@ def text(document: dict) -> str:
                 f"refused, {rate} tokens/s; {phases}"
             )
             out += [f"    refused {n} steps: {why}" for why, n in r["refused"].items()]
-    for path, factors in document["band"].items():
-        for factor, b in factors.items():
+            parts = fold_parts(r["by_bound"].values())
+            whole = fold_seconds(parts.values())
+            shares = ", ".join(
+                f"{k} {s / whole:.1%}" for k, s in parts.items() if whole
+            )
+            out.append(f"    seconds by bound: {shares or '-'}")
+    for path, at in document["band"].items():
+        for factor, b in at.items():
             cap = ", capped at 1" if b["capped"] else ""
             out.append(f"{path} x{factor}{cap}:")
             for level, k in b["ranking"].items():
@@ -303,29 +324,33 @@ def text(document: dict) -> str:
                 )
     for level, k in document["ranking"].items():
         moved = [
-            p
-            for p, factors in document["band"].items()
-            if any(b["ranking"][level]["top_1"] != k["top_1"] for b in factors.values())
+            f"{p} x{f}"
+            for p, at in document["band"].items()
+            for f, b in at.items()
+            if b["ranking"][level]["top_1"] != k["top_1"]
         ]
-        out.append(f"{level} level: top-1 changed at 0.8 or 1.2 of {moved or 'none'}")
+        out.append(f"{level} level: top-1 changed at {', '.join(moved) or 'none'}")
     return "\n".join(out)
 
 
 def recorded(record: str) -> list[str]:
     """ATOM's arguments after `--` in the command line `record`'s run.json
-    holds, less the server's and `--model`; refused when it names none."""
+    holds, less the server's and `--model`; refused when it names none, or a
+    `--draft-model`, another path on the host that ran it."""
     from atom.compass.drive.runfile import engine_only
 
     run = Path(record, "run.json")
     argv = json.loads(run.read_text()).get("argv", []) if run.exists() else []
-    if "--" not in argv:
-        raise ValueError(
-            f"{run} names no ATOM arguments after -- in its argv; "
-            f"name the record as -- {record} [ATOM args]"
-        )
-    model = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    model.add_argument("--model")
-    return model.parse_known_args(engine_only(argv[argv.index("--") + 1 :]))[1]
+    why = "names no ATOM arguments after -- in its argv"
+    if "--" in argv:
+        paths = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+        paths.add_argument("--model")
+        paths.add_argument("--draft-model", "--draft_model")
+        named, rest = paths.parse_known_args(engine_only(argv[argv.index("--") + 1 :]))
+        if named.draft_model is None:
+            return rest
+        why = "names --draft-model, a path on the host that ran it"
+    raise ValueError(f"{run} {why}; name the record as -- {record} [ATOM args]")
 
 
 def main(argv: list[str]) -> None:

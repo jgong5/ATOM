@@ -47,7 +47,8 @@
 # It runs its own tree, as the gates do, compass-harness included. OUT_DIR gets
 # run.json (RUN_FILE plus a `workload` entry hashing the traces, the dataset
 # and the aiperf arguments), the server and aiperf logs, aiperf's artifacts at
-# --export-level raw, the client run's export in artifacts/client_run.json
+# --export-level raw, its raw records with no payload and gzipped
+# (profile_export_raw.jsonl.gz), the client run's export in artifacts/client_run.json
 # (atom/compass/parity/client_run.py), and the step table and run summary.
 # The last line is the cell's result, with the KV transfer count and mean
 # simulated seconds for a 1P1D cell. It exits non-zero when aiperf or the
@@ -193,6 +194,7 @@ else
     # Its own process group, so a real server's workers stop with it. A free
     # DP master port, as `compass record` gives one: the port keys ATOM's
     # compiled-graph cache, and the first start that loads it autotunes again.
+    # No later start loads it, so the server's stop removes it, as there.
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
     ATOM_DP_MASTER_PORT=$(compass_free_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
         python3 "${main[@]}" \
@@ -219,8 +221,9 @@ aiperf=(-m aiperf)
 r.uuid4 = lambda: uuid.UUID(int=0)
 from aiperf.cli import app
 app()')
-# Its own process group, so stopping it stops its workers too.
-(cd "$OUT" && ATOM_COMPASS_RUN=$OUT/run.json AIPERF_DATASET_MMAP_BASE_PATH=$OUT \
+# Its own process group, so stopping it stops its workers too. Its raw records
+# leave out each request's payload, its prompt.
+(cd "$OUT" && ATOM_COMPASS_RUN=$OUT/run.json AIPERF_DATASET_MMAP_BASE_PATH=$OUT AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true \
     exec setsid "$HARNESS_PYTHON" "${aiperf[@]}" profile --url "127.0.0.1:$PORT" --model "$MODEL" \
     --tokenizer "$MODEL" --input-file "$OUT/traces" --artifact-dir "$OUT/artifacts" \
     --export-level raw "${args[@]}") >"$OUT/aiperf.log" 2>&1 &
@@ -242,11 +245,14 @@ while kill -0 $server 2>/dev/null && ((SECONDS < deadline)); do sleep 1; done
 kill -0 $server 2>/dev/null && { echo "cctraces_sim: the deployment is still up $WAIT_S s after aiperf" >&2; exit 1; }
 wait $server || rc=$((rc || REAL ? rc : $?))
 ((REAL)) && { kill -KILL -- -$server 2>/dev/null || true; gpu_processes after; }
+[[ $MODE == 1p1d ]] || python3 -c 'import sys; from atom.compass.drive import serve; serve.drop_compiled(sys.argv[1])' "$OUT/server.log"
 ((REAL)) && { python3 -m atom.compass.drive.aiter_jit "$OUT/run.json" "$serving_ns" || rc=$((rc ? rc : 1)); }
 # The raw records keep each response's chunks, so the export names each request
-# by its response id. A run that failed before aiperf wrote any has none.
+# by its response id; once it is written, they are compressed. A run that
+# failed before aiperf wrote any has none.
 if [[ -e $OUT/artifacts/profile_export_raw.jsonl ]]; then
-    python3 -m atom.compass.parity.client_run "$OUT/artifacts" || rc=$((rc ? rc : 1))
+    { python3 -m atom.compass.parity.client_run "$OUT/artifacts" &&
+        gzip "$OUT/artifacts/profile_export_raw.jsonl"; } || rc=$((rc ? rc : 1))
 fi
 
 python3 - "$OUT" "$BENCHMARK_ID" "$rc" "$REAL" "$gpu" <<'EOF'
@@ -283,11 +289,13 @@ if sys.argv[4] == "1":
     )
     sys.exit(rc)
 summary = json.loads((out / "summary.json").read_text())
-# Prefill logs one line per KV transfer, with its simulated seconds.
+# Prefill logs one line per KV transfer, with the simulated times its write
+# request arrived and its write finished.
 prefill = out / "prefill.log"
 kv = ""
 if prefill.exists():
-    t = [float(s) for s in re.findall(r"KV transfer .*, (\S+) simulated s", prefill.read_text())]
+    found = re.findall(r"KV transfer .*, from (\S+) to (\S+) simulated s", prefill.read_text())
+    t = [float(end) - float(start) for start, end in found]
     kv = f" kv_transfers={len(t)} kv_transfer_mean_s={sum(t) / len(t) if t else 0:.6g}"
 print(
     f"cctraces_sim: rc={rc} requests={avg('request_count'):.0f} "
