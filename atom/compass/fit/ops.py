@@ -27,8 +27,8 @@ for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
 a prefill's B and the context: a decode point's ``context``, its longest
 row's, after its rows' mean context in `PERMILLE` of it (``mean``) where some
-point of the family has ragged rows, a family that leaves out each point
-measured uniform whose rows the KV pool cut, or a prefill point's rows' mean cached
+point of the family has ragged rows, leaving out each uniform point whose rows
+the KV pool cut, or a prefill point's rows' mean cached
 tokens (`band`); and a prefill's B for a kind its rows move (``("rows",
 op)``). A collective's
 points name their family themselves, `measure ops`'s `exchange`, and its one
