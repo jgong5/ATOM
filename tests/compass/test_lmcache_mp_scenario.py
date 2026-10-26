@@ -28,6 +28,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import pytest
+from test_lmcache_lp import lmcache_port  # noqa: F401  the lmcache_port fixture
 from test_lmcache_mp_engine import _machine
 from test_parity_record import _config as _parity_config
 from test_parity_record import _key
@@ -130,13 +131,13 @@ def _measure(out: Path, machine: Path, width: list, port: int) -> None:
 
 
 def run_scenario(
-    root: Path, seed: str, dp: int, lmcache_port: int, ports: list[int]
+    root: Path, seed: str, dp: int, server_port: int, ports: list[int]
 ) -> dict:
     """One run in its own process tree, reading the readings in ``root/store``,
     its clock and server on `ports`."""
     out = root / f"seed{seed}"
     out.mkdir()
-    (clock_port, port), flags = ports, _server(lmcache_port)
+    (clock_port, port), flags = ports, _server(server_port)
     machine = json.loads((root / "machine.json").read_text())
     run_file = _run_file(
         out,
@@ -150,7 +151,7 @@ def run_scenario(
     )
     env = dict(
         os.environ,
-        **_offload(lmcache_port),
+        **_offload(server_port),
         PYTHONHASHSEED=seed,
         PYTHONPATH=str(TREE),
         AITER_LOG_LEVEL="WARNING",
@@ -191,7 +192,7 @@ def run_scenario(
 
 
 @pytest.fixture(scope="module", params=[1, 2], ids=["dp1", "dp2"])
-def runs(request, tmp_path_factory):
+def runs(request, tmp_path_factory, lmcache_port):  # noqa: F811
     dp = request.param
     root = tmp_path_factory.mktemp(f"lmcache_dp{dp}")
     machine = _machine(root)
@@ -201,9 +202,8 @@ def runs(request, tmp_path_factory):
         "latency_s": COPY_S,
     }
     machine.write_text(json.dumps(spec))
-    # The run file names the lmcache port, so both runs share it; each run's
-    # clock and server ports are drawn with it.
-    lmcache_port, *ports = _free_ports(5)
+    # The run file names the lmcache port, so both runs share it.
+    ports = _free_ports(4)
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("AITER_LOG_LEVEL", "WARNING")  # the readings are keyed by it
         for name, value in _offload(lmcache_port).items():
