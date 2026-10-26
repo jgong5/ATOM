@@ -1907,11 +1907,27 @@ The push shape is the pull shape plus four: `remote_swa_block_ids`, `remote_pp_s
 fields of one, and the simulated connector, standing in for `mooncake`, emits the
 seventeen.
 
-One of the four is load-bearing rather than descriptive. The push consumer compares
-the producer's `hash_block_size` against its own and falls back to a full transfer —
-`num_computed_blocks = 0` — whenever it is absent or differs
-(`mooncake_connector.py::MooncakeConnectorScheduler.update_state_after_alloc`), so a blob carrying only the thirteen can never
-take the incremental path.
+One of the four, `hash_block_size`, is load-bearing rather than descriptive, and so are
+`block_size` and `dcp_size`, which both blobs carry in the current code though the table's
+read predates them. The push consumer skips its cached prefix only when every check in
+`mooncake_connector.py::MooncakeConnectorScheduler.update_state_after_alloc` holds:
+
+- the producer's pages line up with its own
+  (`MooncakeConnectorScheduler._remote_page_geometry`). With `block_size` and `dcp_size`
+  both present, the producer's `block_size` equals the consumer's and its `dcp_size` is 1
+  or the consumer's. Without them, the producer's `hash_block_size` equals the consumer's
+  `block_size` (an unsharded producer) or the consumer's `hash_block_size` (symmetric DCP);
+- the request keeps no per-request cache (`seq.has_per_req_cache` is false), since a
+  block delta does not carry state such as an SWA ring slot;
+- the consumer's `hash_block_size` is positive.
+
+It then sets `num_computed_blocks = seq.num_cached_tokens // hash_block_size` and
+`src_block_skip_factor` to the consumer's `dcp_size` over the producer's. When any check
+fails, `num_computed_blocks = 0`, a full transfer, so a blob carrying only the thirteen
+never takes the incremental path. The simulated consumer applies the page rule in
+`atom/compass/kv/connector.py::SimulatedKVConnectorScheduler._pages_line_up` and the
+other two checks in its `update_state_after_alloc`, then prices the consumer blocks left.
+It does not model `src_block_skip_factor`.
 
 `tests/compass/test_kv_blob_site.py` holds the one-site claim above. Nothing re-checks
 the field sets: they describe the connectors' code as read at `92f1fdafe`, and where the
