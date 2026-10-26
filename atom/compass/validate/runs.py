@@ -5,7 +5,8 @@
 
 Each argument is a run directory: its step record in `steps/` and aiperf's
 export in `artifacts/profile_export_aiperf.json`. SIMULATED is the cell at its
-backend, and REAL two or more real runs of it, spaced in time.
+backend, and REAL two or more real runs of it, spaced in time. A run with no
+export yet, one still recording, is refused by name.
 
 A directory `cctraces_sim.sh` wrote is graded as below when it holds
 `artifacts/client_run.json`, whole when it does not. When a real run is graded
@@ -232,7 +233,7 @@ def _end_to_end(export) -> dict:
     return {name: export[k][stat] for name, (k, stat) in END_TO_END.items()}
 
 
-def _named_by_prefill(export, prefill, decode) -> dict:
+def named_by_prefill(export, prefill, decode) -> dict:
     """`export`, whose names are decode's response ids, with each request
     renamed by the response id `prefill`'s record names it by: its prefill DP
     rank and request id join the decode response id in `decode`'s
@@ -262,7 +263,7 @@ def _client_run(cell, run, client, whole=False, simulated=False) -> tuple:
     steps = _steps(cell)
     export = read_json(Path(client) / CLIENT_RUN)
     if Path(cell) == Path(client) / SIDES[0]:
-        export = _named_by_prefill(export, cell, Path(client) / SIDES[1])
+        export = named_by_prefill(export, cell, Path(client) / SIDES[1])
     warmup_names = set(export.get("warmup") or ())
     record = served(Path(cell) / "steps", [export["requests"]])
     split = [s for rank in record.values() for s in rank if not s["is_dummy_run"]]
@@ -451,6 +452,11 @@ def grade(real_cells, simulated_cell) -> dict:
     if len(real_cells) < 2:
         names = [str(c) for c in real_cells]
         raise ValueError(f"{names}: a real spread needs two or more real runs")
+    cells = (*real_cells, simulated_cell)
+    if bare := [str(c) for c in cells if not (Path(c) / EXPORT).is_file()]:
+        raise ValueError(
+            f"{bare} hold no {EXPORT}; a run still recording is not graded"
+        )
     _refuse_by_run_file(simulated_cell)
     whole = graded_whole(real_cells)
     real = [_read(c, whole) for c in real_cells]

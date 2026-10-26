@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 from test_parity_record import GRAPHABLE, LADDER, _config, _drive
 
+from atom.compass.backends import step_labels
 from atom.compass.clock import LpId, single_engine_table
 from atom.compass.parity import ENV, StepRecording, read, recurrence
 from atom.compass.runner import pp_send
@@ -613,6 +614,17 @@ def test_a_runner_off_a_pipeline_leaves_its_token_read_unstamped(tmp_path, monke
     steps = read(real)[0]
     assert len(steps) == len(batches)
     assert not any({"t_recv_ns", "t_pp_recv_ns"} & step.keys() for step in steps)
+
+
+def test_a_producer_off_a_pipeline_labels_on_its_own_token_read(tmp_path, monkeypatch):
+    """That producer's record stamps each output forward's own token read, and
+    the read ties its host and device clocks, so its steps label."""
+    batches, real = _record_last_stage(tmp_path, monkeypatch, 1)
+    steps = read(real)[0]
+    for step, batch in zip(steps, batches):
+        assert ("t_read_ns" in step) == batch.produces_output()
+    samples, _ = step_labels.label(real / "dp0.jsonl")
+    assert [s.step for s in samples] == [s["step"] for s in steps]
 
 
 def test_a_single_stage_token_read_is_released_at_the_device_end():

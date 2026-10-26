@@ -57,6 +57,10 @@ class UnansweredRequests(RuntimeError):
     """Requests that never had their final response."""
 
 
+class SendAfterCancel(RuntimeError):
+    """A request sent after `TrafficLP.cancel` closed others."""
+
+
 class TrafficLP:
     def __init__(
         self,
@@ -142,7 +146,23 @@ class TrafficLP:
     # ---- the router's side ----
 
     def send(self, key: tuple) -> None:
-        """Stamp one request on the HTTP channel and publish the stamp."""
+        """Stamp one request on the HTTP channel and publish the stamp.
+
+        A send after `cancel` closed a request is refused and fails the run: the
+        closed request's worker stopped reading, so a stream seq released for it
+        later is never reported and the hold would wait for it forever.
+        """
+        if self.cancelled:
+            refused = SendAfterCancel(
+                f"request {key} sent after a cancel closed requests "
+                f"{sorted(self.cancelled)}: their stream seqs released later on "
+                f"{self.stream} are never reported, so the hold would wait forever"
+            )
+            failed = asyncio.get_running_loop().create_future()
+            failed.set_exception(refused)
+            self._tasks.append(failed)  # the hold raises it, failing `done`
+            self._changed.set()
+            raise refused
         arrival, seq = self.rt.stamp_send(self.http)
         self.open[key] = None
         self._pub.send_pyobj((key, arrival, seq))

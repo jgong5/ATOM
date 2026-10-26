@@ -26,8 +26,8 @@ import pytest
 
 import atom.compass
 import atom.utils.clock
-from atom.compass.detect.clock_source import CORE_ROOTS
-from atom.compass.detect.set_iteration import CORE_SET_ALLOW_LIST, SetIterationLint
+from tests.compass.clock_source import CORE_ROOTS
+from tests.compass.set_iteration import CORE_SET_ALLOW_LIST, SetIterationLint
 
 #: The tree the rule applies to.
 SIMULATED_PATH = os.path.dirname(atom.compass.__file__)

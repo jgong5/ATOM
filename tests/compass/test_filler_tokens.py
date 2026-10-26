@@ -76,12 +76,8 @@ def tokenizer(model_dir):
     return _load_tokenizer(str(model_dir))
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _unpriced():
-    """Reporting is under test here, not the price."""
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(overrides, "_group_step_seconds", lambda *_: 0.0)
-        yield
+# Reporting is under test here, not the price.
+pytestmark = pytest.mark.usefixtures("unpriced")
 
 
 def _stops(tokenizer):

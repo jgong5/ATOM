@@ -15,8 +15,9 @@ thing it was measured against has moved.
   too -- so a width-2 read cannot answer from a width-1 neighbour.
 * **Provenance names every executed source root** (`provenance`). ATOM's by the
   tree `git archive` would ship, aiter's by `git describe --tags --always
-  --dirty`, the call the GPU gate makes on aiter's checkout. **Only the recording
-  half**: the version is recorded, and what a bump *means* is left open.
+  --dirty`, the call the GPU gate makes on aiter's checkout. A root with
+  uncommitted files may run but not publish (`store`); an aiter bump refuses
+  through the machine-spec key, which pins aiter's commit.
 * **A handed-off entry is immutable** (`store`). **The physical form is a
   directory convention** -- no index, no manifest -- and publishing is a rename
   onto a name that must not exist, so an overwrite is impossible rather than
@@ -34,10 +35,6 @@ thing it was measured against has moved.
 * **Resolution names its answer** (`resolution`). A step's ledger says which
   artifacts answered it and which key missed, because `incomplete: N/2570`
   states a count and not which of two stages declined.
-
-**Not decided here**: whether an aiter bump invalidates an artifact or only
-warns (filed as #168) -- while that is open the default stands and a bump
-refuses; and whether a dirty source root may publish (also #168).
 """
 
 from .fingerprints import (

@@ -62,6 +62,7 @@ import asyncio
 import collections
 import heapq
 import itertools
+import json
 import logging
 import math
 import select
@@ -578,11 +579,19 @@ class CompassSelector(selectors.DefaultSelector):
         return True
 
 
+#: The API server's endpoints that hand a request to the engine.
+GENERATION_PATHS = frozenset(
+    ("/v1/completions", "/v1/chat/completions", "/v1/messages", "/v1/responses")
+)
+
+
 class HttpChannel:
     """ASGI middleware: the frontend's inline receive of HTTP requests.
 
     `stamp(scope)` is a request's ``(arrival, seq)`` read from its carrier, or
-    ``None`` for one sent outside the run, which passes straight through. A
+    ``None`` for one sent outside the run, which passes straight through, except
+    to a `GENERATION_PATHS` endpoint during the run: that one is answered 400,
+    naming it, and is a run-summary reason ``http:unstamped <method> <path>``. A
     stamped request waits until it is released and every released request has
     been read; released requests are handed on in ``(arrival, seq)`` order and
     count as handled once their body has been received. The app gets the
@@ -630,6 +639,14 @@ class HttpChannel:
             got = relay_stamp(body)
         else:
             got = self.stamp(scope) if scope["type"] == "http" else None
+        if (
+            got is None
+            and rt is not None
+            and rt.in_run
+            and scope["type"] == "http"
+            and scope["path"] in GENERATION_PATHS
+        ):
+            return await _refuse_unstamped(rt, scope["method"], scope["path"], send)
         if got is not None:
             loop = asyncio.get_running_loop()
             if not isinstance(loop, CompassEventLoop):
@@ -690,6 +707,26 @@ class HttpChannel:
         finally:
             if hangup is not None:
                 del self.hangups[seq]
+
+
+async def _refuse_unstamped(rt, method: str, path: str, send) -> None:
+    """Answer an unstamped generation request 400 and record why for the run summary."""
+    why = f"unstamped {method} {path}"
+    rt.refusals.append(f"http:{why}")
+    message = (
+        f"{rt.me}: {method} {path} carries no Compass stamp during a simulated "
+        "run, so no time can be given to it; send it through the run's traffic "
+        "LP (aiperf with compass_harness), which stamps every request"
+    )
+    body = json.dumps({"error": {"type": "invalid_request_error", "message": message}})
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 400,
+            "headers": [(b"content-type", b"application/json")],
+        }
+    )
+    await send({"type": "http.response.body", "body": body.encode()})
 
 
 def _relay(channels) -> str | None:

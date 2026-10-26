@@ -194,7 +194,7 @@ def test_a_run_traces_a_prefill_s_drafter_no_graph_holds_at_its_width(
     from atom.compass.bench import ops
 
     traced, lazy = [], {"lazy_traces": 0, "lazy_trace_wall_seconds": 0}
-    monkeypatch.setattr(ops, "_child", lambda *a: traced.append(a[-1]))
+    monkeypatch.setattr(ops, "_child", lambda *a: traced.append(a[-1]) or {})
     stored = {
         ("prefill", "prefill T=9 B=3 W=4", False): g(9, 64, 64),
         ("prefill", "prefill T=9 B=3", True): g(3000, 64, 64),

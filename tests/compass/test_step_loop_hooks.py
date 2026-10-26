@@ -381,10 +381,18 @@ def test_an_engine_leaving_before_the_finish_is_refused_unless_it_raised(
         if loop_raises:
             raise ValueError("the loop's own error")
 
+    workers = SimpleNamespace(
+        keep_monitoring=True, call_func=lambda name: None, procs=[]
+    )
+
+    def init(self, *args):  # what the real `exit` reads, with no worker process
+        self.still_running, self.label, self.runner_mgr = True, "engine", workers
+        self.output_queue = queue.Queue()
+        self.output_thread = SimpleNamespace(join=lambda timeout: None)
+
     monkeypatch.setattr(EngineCore, "_setup_engine_process", lambda name: None)
-    monkeypatch.setattr(EngineCore, "__init__", lambda self, *args: None)
+    monkeypatch.setattr(EngineCore, "__init__", init)
     monkeypatch.setattr(EngineCore, "busy_loop", busy_loop)
-    monkeypatch.setattr(EngineCore, "exit", lambda self: None)
     clock.install(LPRuntime(LpId("engine"), TABLE, conn=None))
     clock.installed().now = 3.0
     config = SimpleNamespace(
@@ -395,3 +403,4 @@ def test_an_engine_leaving_before_the_finish_is_refused_unless_it_raised(
     )
     with pytest.raises(error, match=match):
         EngineCore.run_engine(config, "in", "out")
+    assert workers.keep_monitoring is False  # the real `exit` ran to its end

@@ -57,6 +57,7 @@ from atom.compass.artifacts import (
 from atom.compass.drive import gpu, measure_memory, serve
 from atom.compass.drive.gpu import GpuRefusal
 from atom.compass.memory import ModelTerms, device_readings, reserves
+from atom.compass.memory.check import STORAGE
 from atom.compass.memory.readings import MemoryReadings
 from atom.compass.run import memory
 from atom.compass.spec import MachineSpec, SpecRefusal
@@ -543,7 +544,7 @@ def test_the_reading_runner_writes_its_starts_fx_graph_cache_misses(
     runner = reading_runner(monkeypatch, object).MemoryReadingModelRunner()
     runner.config, runner.rank = tp2(tmp_path).config, 0
     runner._read = dict.fromkeys(
-        ["total", "non_torch", "loaded", "weights", "current", "peak"], 0
+        ["total", "non_torch", "loaded", "weights", "parameters", "current", "peak"], 0
     ) | {"warmup_tokens": 0, "num_kvcache_blocks": 1}
     monkeypatch.setenv(measure_memory.OUT_ENV, str(tmp_path))
     monkeypatch.setitem(counters["inductor"], "fxgraph_cache_miss", 40)
@@ -552,6 +553,40 @@ def test_the_reading_runner_writes_its_starts_fx_graph_cache_misses(
 
     (written,) = tmp_path.glob("readings.*.json")
     assert json.loads(written.read_text())["fxgraph_cache_misses"] == 40
+
+
+def test_the_reading_runner_writes_its_parameter_and_buffer_storages_apart(
+    tmp_path, monkeypatch
+):
+    def storage(ptr, nbytes, cuda=True):
+        held = SimpleNamespace(data_ptr=lambda: ptr, nbytes=lambda: nbytes)
+        return SimpleNamespace(is_cuda=cuda, untyped_storage=lambda: held)
+
+    class ModelRunner:
+        def _build_and_load_model(self, model_class):
+            # A tied head is the embedding's storage, and so is a buffer
+            # that shares it; a host buffer holds no device bytes.
+            embedding = storage(1, 100)
+            self.model = SimpleNamespace(
+                parameters=lambda: [embedding, storage(2, 50), embedding],
+                buffers=lambda: [embedding, storage(3, 7), storage(4, 9, cuda=False)],
+            )
+
+    module = reading_runner(monkeypatch, ModelRunner)
+    monkeypatch.setattr(module, "_allocated", {"current": 1_000}.get)
+    runner = module.MemoryReadingModelRunner()
+    runner.config, runner.rank = tp2(tmp_path).config, 0
+    runner._build_and_load_model(None)
+    runner._read |= dict.fromkeys(["total", "non_torch", "current", "peak"], 1_000)
+    runner._read |= {"warmup_tokens": 0, "num_kvcache_blocks": 1}
+    monkeypatch.setenv(measure_memory.OUT_ENV, str(tmp_path))
+
+    runner._write(None)
+
+    (written,) = tmp_path.glob("readings.*.json")
+    held = json.loads(written.read_text())
+    assert held[STORAGE] == {"weights": 150, "buffers": 7}
+    assert held["readings"]["allocator_retained_after_load_bytes"] == 1_000 - 157
 
 
 def test_the_reading_runner_warms_up_once_as_a_serving_start_does(monkeypatch):

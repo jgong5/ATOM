@@ -152,7 +152,9 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
 #: scripts, and `diffusion` and `plugin` are never run by a simulation.
 NOT_CORE = ("compass", "mesh", "benchmarks", "examples", "diffusion", "plugin")
 
-_ATOM = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ATOM = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "atom"
+)
 
 #: ATOM's core: every module and package under `atom/` outside `NOT_CORE`, read
 #: off the tree so a new package is gated the day it lands. Paths are relative

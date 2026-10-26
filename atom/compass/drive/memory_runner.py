@@ -14,6 +14,7 @@ from torch._dynamo.utils import compilation_time_metrics, counters
 
 from atom.compass.artifacts import member_name
 from atom.compass.drive.measure_memory import OUT_ENV
+from atom.compass.memory.check import STORAGE
 from atom.compass.parity import key_memory_formats_by_name
 from atom.compass.run import memory
 from atom.compass.run.step_grid import BOUNDS, keyed
@@ -45,9 +46,11 @@ class MemoryReadingModelRunner(ModelRunner):
     bytes once the weights load, less their storages; allocated bytes where
     the KV budget reads the device, less those; the warmup's peak above them
     over its tokens; the budget's
-    `non_torch` and total; the reserved bytes graph capture adds; and the
+    `non_torch` and total; the reserved bytes graph capture adds; the
     kernels inductor autotuned and the graphs it missed, which
-    `compass measure memory` starts again for."""
+    `compass measure memory` starts again for; and beside the readings, as
+    `check.STORAGE`, the bytes of the parameter storages and of the buffer
+    storages no parameter holds."""
 
     def _build_and_load_model(self, model_class):
         super()._build_and_load_model(model_class)
@@ -55,6 +58,7 @@ class MemoryReadingModelRunner(ModelRunner):
         self._read = {
             "loaded": _allocated("current"),
             "weights": _storage_bytes([*model.parameters(), *model.buffers()]),
+            "parameters": _storage_bytes(model.parameters()),
         }
 
     def _maybe_warmup(self):
@@ -122,7 +126,13 @@ class MemoryReadingModelRunner(ModelRunner):
                     "key": memory.key_fields(config),
                     "engine": engine,
                     "readings": readings,
-                    "autotuned_kernels": len(compilation_time_metrics.get(AUTOTUNE, ())),
+                    STORAGE: {
+                        "weights": read["parameters"],
+                        "buffers": read["weights"] - read["parameters"],
+                    },
+                    "autotuned_kernels": len(
+                        compilation_time_metrics.get(AUTOTUNE, ())
+                    ),
                     "fxgraph_cache_misses": counters["inductor"]["fxgraph_cache_miss"],
                 }
             )

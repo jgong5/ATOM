@@ -59,6 +59,7 @@ from compass_harness.scheduler import ClockPacedLoopScheduler
 from compass_harness.traffic_lp import (
     HTTP,
     STREAM,
+    SendAfterCancel,
     TrafficLP,
     UnansweredRequests,
 )
@@ -929,11 +930,11 @@ class StragglerRuntime(ScriptedRuntime):
 def test_a_cancelled_request_s_report_read_after_its_seq_is_dropped(tmp_path):
     """Credits 0 and 1 are cancelled at 2.0 and their returns passed. The grant
     at 3.0 releases credit 0's stream seq 1 with no request open, so the hold
-    drops it; its report (arrival 2.5) is read after that. Credit 5, sent next,
-    still has its return passed and the run finishes."""
+    drops it; its report (arrival 2.5) is read after that and the run
+    finishes."""
 
     async def main():
-        rt = StragglerRuntime([(1.0, {0}), (3.0, {1}), (4.0, {2})])
+        rt = StragglerRuntime([(1.0, {0}), (3.0, {1})])
         traffic = TrafficLP(rt, str(tmp_path / "lp"))
         stamps, reports = addresses(str(tmp_path / "lp"))
         sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
@@ -969,9 +970,6 @@ def test_a_cancelled_request_s_report_read_after_its_seq_is_dropped(tmp_path):
             await traffic.wait(3.0)
         push.send_pyobj((_key(0), 1, 2.5, False))
         await asyncio.sleep(0.1)
-        traffic.send(_key(5))
-        push.send_pyobj((_key(5), 2, 3.5, True))
-        await held("w", SimpleNamespace(credit=_credit(5), error=None))
         traffic.finish()
         try:
             await asyncio.wait_for(traffic.done, 5)
@@ -980,7 +978,63 @@ def test_a_cancelled_request_s_report_read_after_its_seq_is_dropped(tmp_path):
             sub.close(linger=0)
         return passed
 
-    assert _run(main()) == [0, 1, 5]
+    assert _run(main()) == [0, 1]
+
+
+def test_a_send_after_a_cancel_fails_the_run_by_name(tmp_path, monkeypatch):
+    """Credit 0 is cancelled at 2.0, the grace deadline of a phase before the
+    last, and aiperf then sends credit 5. Credit 0's worker stopped reading, so
+    the grant at 3.0 releases its stream seq 0 and no one reports it: the send
+    is refused and the run fails naming both, instead of holding for seq 0."""
+    monkeypatch.setattr("compass_harness.traffic_lp.DIAG_S", 0.05)
+
+    async def main():
+        rt = ScriptedRuntime([(3.0, {0})])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        stamps, reports = addresses(str(tmp_path / "lp"))
+        sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
+        sub.connect(stamps)
+        sub.subscribe(b"")
+        await traffic.subscribed(1)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(reports)
+
+        async def on_return(worker_id, ret):
+            pass
+
+        held = traffic.hold(on_return)
+
+        async def worker():
+            _, (key, *_) = [await sub.recv_pyobj() for _ in range(2)]
+            push.send_pyobj((key,))
+            await held("w", SimpleNamespace(credit=_credit(0), error=None))
+
+        worker = asyncio.ensure_future(worker())
+        traffic.send(_key(0))
+        while traffic.now() < 2.0:
+            await traffic.wait(2.0)
+        await traffic.cancel()
+        await worker
+        refused = None
+        try:
+            traffic.send(_key(5))
+        except SendAfterCancel as e:
+            refused = e
+        try:
+            with pytest.raises(SendAfterCancel) as failed:
+                await asyncio.wait_for(traffic.done, 2)
+        finally:
+            push.close(linger=0)
+            sub.close(linger=0)
+        return refused, failed.value
+
+    refused, failed = _run(main())
+    assert failed is refused
+    assert str(refused) == (
+        f"request {_key(5)} sent after a cancel closed requests [{_key(0)}]: their "
+        f"stream seqs released later on {STREAM} are never reported, so the hold "
+        "would wait forever"
+    )
 
 
 def test_a_report_the_reader_rejects_fails_the_run(tmp_path):

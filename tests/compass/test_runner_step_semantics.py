@@ -66,12 +66,8 @@ class _Runner(NonAllocatingRunner):
         self._token_stream = DeferredTokenStream([0]) if stream is None else stream
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _unpriced():
-    """Reporting is under test here, not the price: `test_dp_step_max.py` prices."""
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(overrides, "_group_step_seconds", lambda *_: 0.0)
-        yield
+# Reporting is under test here, not the price: `test_dp_step_max.py` prices.
+pytestmark = pytest.mark.usefixtures("unpriced")
 
 
 class _PerStep(DeferredTokenStream):

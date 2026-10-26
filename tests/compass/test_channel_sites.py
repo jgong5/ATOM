@@ -21,13 +21,13 @@ import pytest
 import zmq
 from aiter_stub import stubbed_aiter
 
-from atom.compass.audit import sync_scan
 from atom.compass.clock import LpId, single_engine_table
 from atom.distributed.pp_transport import PPStageTransport
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import get_exit_sequence
 from atom.utils import clock, get_open_zmq_ipc_path, make_zmq_socket, zmq_shim
 from atom.utils.clock import LPRuntime, WrappedPoller, WrappedSocket
+from tests.compass import sync_scan
 from tests.compass.clock.test_lp_runtime import FakeConn, _owner
 
 with stubbed_aiter():
