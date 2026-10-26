@@ -287,6 +287,19 @@ FORMS_THAT_FIRE = {
     "or-empty": "def f(s: set[str]):\n    for x in s or ():\n        yield x\n",
     "walrus": "def f(n):\n    if s := set(n):\n        for x in s:\n            yield x\n",
     "augmented": "def f(n, t):\n    s = set(n)\n    s |= t\n    for x in s:\n        yield x\n",
+    "augmented-only": (
+        "class C:\n"
+        "    def add(self, b):\n"
+        "        self.seen |= set(b)\n"
+        "\n"
+        "    def g(self):\n"
+        "        return list(self.seen)\n"
+    ),
+    "paired-unpacking": "def f(x, y):\n    a, b = set(x), set(y)\n    return list(a)\n",
+    "global": (
+        "def g(n):\n    global ready\n    ready = set(n)\n\n\n"
+        "def f():\n    return list(ready)\n"
+    ),
     "typing-Set": "from typing import Set\n\n\ndef f(r: Set[str]):\n    return [x for x in r]\n",
     "string-annotation": 'def f(r: "set[str]"):\n    return [x for x in r]\n',
     "sorted-generator": "def f(s: set[str], ids):\n    return sorted(ids.take(x) for x in s)\n",
@@ -328,6 +341,25 @@ FORMS_THAT_STAY_QUIET = {
         "\n"
         "        def g(self):\n"
         "            return list(A.members)\n"
+    ),
+    "set-display-unpacking": "def f(a: set[str], b: set[str]):\n    return {*a, *b}\n",
+    "global-rebound": (
+        "ready = set()\n\n\ndef g():\n    global ready\n    ready = sorted(ready)\n\n\n"
+        "def f():\n    return list(ready)\n"
+    ),
+    "nonlocal-rebound": (
+        "def f(n):\n"
+        "    ready = set(n)\n"
+        "\n"
+        "    def g():\n"
+        "        def h():\n"
+        "            nonlocal ready\n"
+        "            ready = sorted(ready)\n"
+        "\n"
+        "        h()\n"
+        "\n"
+        "    g()\n"
+        "    return list(ready)\n"
     ),
     "class-name-rebound": (
         "class A:\n    members = {1, 2}\n\n\nA.members = sorted(A.members)\n\n\n"
