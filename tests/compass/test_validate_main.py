@@ -713,6 +713,24 @@ def test_the_steps_extrapolated_or_priced_by_a_fallback_are_stated_and_graded(
     assert rows["summary step_linear", "fallback steps"] == ["2 of 20", "not gated"]
 
 
+def test_the_fallback_row_lists_each_reason_with_its_steps(capsys, tmp_path):
+    _rows(capsys, tmp_path)
+    law = tmp_path / "c4" / "step_linear"
+    summary = json.loads((law / "summary.json").read_text())
+    reasons = {"step-grid: no measurement at B=2": 2, "step-grid: B is below": 1}
+    summary["schedule"].update(fallback_steps=3, fallback_reasons=reasons)
+    (law / "summary.json").write_text(json.dumps(summary))
+
+    main([str(tmp_path / "c4")])
+    out = capsys.readouterr().out.splitlines()
+    rows = {tuple(r.split(" | ")[1:3]): r.split(" | ")[3:] for r in out[1:]}
+
+    assert rows["summary step_linear", "fallback steps"] == [
+        f"3 of 20; reasons {json.dumps(reasons)}",
+        "not gated",
+    ]
+
+
 def test_a_refused_cost_row_names_its_reasons(capsys, tmp_path):
     # A law with no decode vector refuses each real run's ten decode steps.
     _rows(capsys, tmp_path)

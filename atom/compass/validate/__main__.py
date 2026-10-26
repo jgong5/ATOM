@@ -19,7 +19,7 @@ its export names as such and how many steps hold only those; `validate.cost` on 
 steps graded (with the steps it leaves out, declines with their most frequent
 reasons, or extrapolates), its graded rows gated and its validated, unvalidated
 and declared rows not, and `memory.check` per real run; and the simulated run's refusals by source, its steps
-extrapolated and priced by a fallback, shares and speed, from its first client run's
+extrapolated and priced by a fallback (with each reason and its steps), shares and speed, from its first client run's
 summary when it has one. An `op_graph/` cell's cost rows also give, per phase,
 the priced seconds by method and each op kind's seconds over the measured ones,
 and the cell `measure ops`'s warm time over its cold one per op kind, over the
@@ -185,7 +185,10 @@ def _summary(run: Path, summary: dict):
     )
     yield where, "refusals", f"{n['count']} {json.dumps(dict(n['by_source']))}; {cost}", verdict
     for k in ("extrapolated", "fallback"):
-        yield where, f"{k} steps", f"{schedule.get(f'{k}_steps')} of {n['steps']}", "not gated"
+        value = f"{schedule.get(f'{k}_steps')} of {n['steps']}"
+        if k == "fallback" and schedule.get("fallback_reasons"):
+            value += f"; reasons {json.dumps(schedule['fallback_reasons'])}"
+        yield where, f"{k} steps", value, "not gated"
     by_method = schedule["seconds_by_method"] or {}
     for g in GROUPS:
         yield where, g, json.dumps(by_method.get(g)), "not gated"
