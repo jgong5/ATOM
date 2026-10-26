@@ -185,6 +185,7 @@ def served(key, traced) -> list[dict]:
             "run": run,
             "config": key,
             "traces": [f"{named[run]}.{k}" for k in range(3)],
+            "profiled": False,
         }
         for run in sorted(named)
     ]

@@ -204,7 +204,8 @@ def test_each_sample_copies_its_input_s_provenance_and_the_traces_it_served(
     labelled = label(path)[0]
     assert [s.step for s in samples] == [s.step for s in labelled]
     for s, plain in zip(samples, labelled):
-        assert s.provenance == {**plain.provenance, "traces": split[s.step]}
+        traced = {"traces": split[s.step], "profiled": False}
+        assert s.provenance == {**plain.provenance, **traced}
         assert dataclasses.replace(s, provenance=plain.provenance) == plain
     assert {t for s in samples for t in s.provenance["traces"]} == {
         f"trace-{i}" for i in range(4)
@@ -241,6 +242,7 @@ def test_a_measurement_loads_beside_records_of_its_configuration_only(
         "requests": [],
         "config": None,
         "traces": ["trace-9"],
+        "profiled": False,
     }
 
 
