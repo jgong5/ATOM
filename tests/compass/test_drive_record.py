@@ -401,4 +401,4 @@ def test_a_record_names_each_compile_its_server_ran_while_it_served(
     run = json.loads((out / "run.json").read_text())
     assert run.get(aiter_jit.BUILDS, []) == names
     if names:
-        assert f"JIT build of {names}" in aiter_jit.refusal(run)
+        assert f"JIT compile of {names}" in aiter_jit.refusal(run)

@@ -419,7 +419,7 @@ def test_the_command_refuses_a_record_whose_server_built_an_aiter_module(
     assert "holding out step 4 " in capsys.readouterr().out
 
     (tmp_path / "run.json").write_text(json.dumps({BUILDS: ["mha_varlen_fwd"]}))
-    named = f"{record} is not costed: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    named = f"{record} is not costed: its server ran a JIT compile of ['mha_varlen_fwd'] while"
     with pytest.raises(ValueError, match=re.escape(named)):
         main([str(record), str(law)])
 
@@ -438,7 +438,9 @@ def test_the_command_refuses_the_record_named_from_inside_it_or_by_a_link(
     law.write_text(json.dumps(LAW))
     monkeypatch.chdir(record)
 
-    named = f"{spelling} is not costed: aiter ran a JIT build of ['mha_varlen_fwd']"
+    named = (
+        f"{spelling} is not costed: its server ran a JIT compile of ['mha_varlen_fwd']"
+    )
     with pytest.raises(ValueError, match=re.escape(named)):
         main([spelling, str(law)])
 

@@ -968,7 +968,7 @@ def test_a_record_whose_server_built_an_aiter_module_is_refused_naming_it(tmp_pa
     builds = ["mha_varlen_fwd_bf16_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale"]
     _recorded(real[1], **{aiter_jit.BUILDS: builds})
 
-    named = re.escape(f"aiter ran a JIT build of {builds} while its server served")
+    named = re.escape(f"its server ran a JIT compile of {builds} while it served")
     with pytest.raises(ValueError, match=f"r1 is not graded: {named}, so a step"):
         grade(real, simulated)
 
@@ -994,7 +994,7 @@ def test_a_real_cctraces_sim_cell_whose_server_began_an_aiter_build_is_refused(
     (jit / "build" / "mha" / "blob.staging").mkdir(parents=True)
     (jit / "build" / "mha" / "blob.staging" / "kernel.cpp").write_text("")
     aiter_jit.main([str(real[2] / "run.json"), str(since)])
-    named = re.escape("aiter ran a JIT build of ['mha'] while its server served")
+    named = re.escape("its server ran a JIT compile of ['mha'] while it served")
     with pytest.raises(ValueError, match=f"r2 is not graded: {named}, so a step"):
         grade(real, simulated)
 
@@ -1119,7 +1119,7 @@ def test_a_deployment_side_whose_server_built_an_aiter_module_is_refused_naming_
     run = {"format_version": 2, aiter_jit.BUILDS: builds}
     (real[1] / "decode" / "run.json").write_text(json.dumps(run))
 
-    named = re.escape(f"aiter ran a JIT build of {builds} while its server served")
+    named = re.escape(f"its server ran a JIT compile of {builds} while it served")
     with pytest.raises(ValueError, match=f"r1/decode is not graded: {named}"):
         grade(real, simulated)
 
