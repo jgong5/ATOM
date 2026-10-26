@@ -72,7 +72,8 @@ eager forwards, so a graph-mode run reads the eager graphs too; with
 under this run's readings, it prices each leaf from it first; with
 ``atom_args``, ATOM's arguments the server was started with, which `compass
 run` writes, a shape the store holds no graph at is traced first, in a
-process of its own, and published there, and a trace that fails ends the
+process of its own, and published there, or from a tree with uncommitted
+files kept for this run alone, unpublished, and a trace that fails ends the
 run, naming the shape),
 ``step_roofline`` (optional, ``true`` or ``false``: with ``true`` a
 `StepRooflineBackend` prices the steps the backend refuses, through
@@ -1562,13 +1563,13 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
     return graph
 
 
-def _trace(root: str, atom_args, arch: str, shape) -> None:
+def _trace(root: str, atom_args, arch: str, shape) -> dict:
     """Trace `shape` as `compass trace ops` traces a record's step, a prefill
     as one forward, from ATOM's arguments `atom_args` less the server's, on a
     declared `arch`, and publish each graph in the store at `root`, one another
     engine of the run published first aside. From a tree with uncommitted
     files, which may run but not publish, return each graph's region by its
-    structure and shape instead."""
+    structure and shape instead; else return an empty dict."""
     import tempfile
 
     from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, Rule, roots_for
