@@ -1410,7 +1410,7 @@ def runner(model_runner, tree) -> None:
     # the DP and PCP widths, all in the readings' key, so the tokens the
     # reading warmed up with are the ones this deployment's warmup runs.
     warmup = measured.values["warmup_tokens"]
-    model = ModelTerms.from_tree(tree, activations=measured.activations(warmup))
+    model = ModelTerms.from_tree(tree, activations=measured.activations())
     fallback = run.get("step_roofline", False)
     if not isinstance(fallback, bool):
         raise TypeError(
