@@ -8,6 +8,7 @@ with every prompt distinct unless a test says otherwise.
 
 import hashlib
 import json
+import pathlib
 import queue
 import runpy
 import shutil
@@ -23,11 +24,13 @@ from test_dp_step_max import dp2  # noqa: F401  the dp2 fixture
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run
+from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_stub import StepStubBackend
 from atom.compass.parity import (
     ENV,
     RUNNER,
     TIMESTAMPS,
+    StepRecord,
     StepRecording,
     compare,
     read,
@@ -761,3 +764,60 @@ def test_a_real_run_asked_to_record_refuses_a_runner_that_cannot(tmp_path, monke
     _keep_add_request(monkeypatch)
     with pytest.raises(ValueError, match="only .* has a recording runner"):
         run.frontend(SimpleNamespace(runner_qualname="x.RapidServeModelRunner"))
+
+
+def test_a_recorded_step_neither_opens_nor_closes_the_record_file(
+    tmp_path, monkeypatch
+):
+    """The file is opened once, with the record: on an NFS home an open costs
+    about 0.25 ms and a close that flushes about 0.73, which every step's `E`
+    would carry. Each line is one write, in the step order and bytes it had."""
+    calls, path_open = [], pathlib.Path.open
+
+    class _File:
+        def __init__(self, f):
+            self.f = f
+            calls.append("open")
+
+        def write(self, text):
+            calls.append("write")
+            return self.f.write(text)
+
+        def close(self):
+            calls.append("close")
+            self.f.close()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+
+    monkeypatch.setattr(
+        pathlib.Path, "open", lambda p, *a, **k: _File(path_open(p, *a, **k))
+    )
+    view = BatchView((RequestShape(1, 9, True),))
+    monkeypatch.setattr(projection, "batch_view", lambda batch, mode, run: view)
+    runner = SimpleNamespace(
+        step_clock_ns=lambda: calls.append("stamp") or len(calls),
+        step_stamps=lambda: ({"forward_mode": "m"}, lambda wait: {"d_busy_ns": 5}),
+    )
+    batch = SimpleNamespace(
+        is_dummy_run=True,
+        num_scheduled_tokens=np.array([1]),
+        context_lens=np.array([9]),
+        produces_output=lambda: True,
+    )
+    record = StepRecord(tmp_path, 0)
+    for _ in range(3):
+        record.add(batch, runner, lambda batch: None)
+
+    assert calls == ["open"] + ["stamp", "stamp", "write"] * 3
+    monkeypatch.undo()
+    line = '"is_dummy_run": true, "produces_output": true, "batch": [], "named": []'
+    assert record.path.read_text() == "".join(
+        f'{{"step": {n}, "dp_rank": 0, {line}, "t_enter_ns": {3 * n + 2}, '
+        f'"t_exit_ns": {3 * n + 3}, "rows": [[1, 9, true]], "rung": null, '
+        '"d_busy_ns": 5}\n'
+        for n in range(3)
+    )

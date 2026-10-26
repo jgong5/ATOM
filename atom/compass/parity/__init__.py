@@ -114,7 +114,9 @@ class StepRecord:
         name = f"pp{stage}.dp{dp_rank}" if stage else f"dp{dp_rank}"
         self.path = pathlib.Path(directory) / f"{name}.jsonl"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text("")
+        # Open for the run: a per-step open and close would land in the next
+        # step's `E`. Each line is one write, so a killed run keeps it.
+        self.file = self.path.open("w", buffering=1)
         self.dp_rank = dp_rank
         self.step = 0
         self.keys: dict[int, str] = {}  # request id -> key
@@ -259,16 +261,15 @@ class StepRecord:
 
         A line stops the writing while its window is open, unless `wait`.
         """
-        with self.path.open("a") as f:
-            while self.pending:
-                line, window = self.pending[0]
-                if window is not None:
-                    fields = window(wait)
-                    if fields is None:
-                        return
-                    line.update(fields)
-                f.write(json.dumps(line) + "\n")
-                self.pending.popleft()
+        while self.pending:
+            line, window = self.pending[0]
+            if window is not None:
+                fields = window(wait)
+                if fields is None:
+                    return
+                line.update(fields)
+            self.file.write(json.dumps(line) + "\n")
+            self.pending.popleft()
 
 
 def record_step(runner, batch, forward=None):
