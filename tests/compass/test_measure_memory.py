@@ -60,7 +60,6 @@ from atom.compass.memory import ModelTerms, device_readings, reserves
 from atom.compass.memory.readings import MemoryReadings
 from atom.compass.run import memory
 from atom.compass.spec import MachineSpec, SpecRefusal
-from atom.utils import backends
 
 MACHINE = MachineSpec.from_mapping(copy.deepcopy(DOCUMENT))
 #: One TP2 rank's readings beside `READINGS[2]`: a rank need not read as another.
@@ -163,7 +162,7 @@ def test_the_stop_removes_the_compiled_graph_cache_directory_the_start_used(
 ):
     _, argv = a_start(tmp_path, monkeypatch, STACK)
     root = tmp_path / "home/.cache/atom"
-    monkeypatch.setattr(backends, "VLLM_CACHE_ROOT", str(root))
+    monkeypatch.setattr(serve, "CACHE_ROOT", str(root))
     used = root / "torch_compile_cache/0123456789/rank_0/backbone"
     other = root / "torch_compile_cache/9876543210"
     other.mkdir(parents=True)
