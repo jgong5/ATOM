@@ -49,6 +49,9 @@ from .test_clock_transport import (
 REPO = pathlib.Path(__file__).resolve().parents[3]
 INF = math.inf
 LOCAL = "tcp://127.0.0.1:0"
+#: How long a child interpreter may take to import the clock and print its
+#: endpoint. A loaded gate host can take longer than the replies' `WAIT_S`.
+START_S = 120.0
 
 THREE_LP = {"admission_path": "serving", "ipc_s": IPC_S, "stream_s": STREAM_S}
 FIVE_LP = {**THREE_LP, "router_s": 0.003, "kv_write_req_s": 0.004}
@@ -182,7 +185,7 @@ def test_a_standalone_clock_runs_in_a_process_of_its_own():
         text=True,
     ) as child:
         try:
-            endpoint = _result(_later(child.stdout.readline)).strip()
+            endpoint = _result(_later(child.stdout.readline), START_S).strip()
             assert endpoint.startswith("tcp://127.0.0.1:")
             standalone = _replies(endpoint, table, PREFILL_DECODE_SCRIPTS)
         finally:
