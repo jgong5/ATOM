@@ -70,7 +70,7 @@ if [ "$SCOPE" = host ] &&
 fi
 CENSUS=$(
     for f in "$PROCFS"/[0-9]*/stat; do
-        IFS= read -r line <"$f" 2>/dev/null || continue
+        IFS= read -r line 2>/dev/null <"$f" || continue
         printf '%s\n' "$line"
     done |
         awk '{ sub(/^[0-9]+ \(.*\) /, ""); t++; if ($1 == "D") d++ }
@@ -104,6 +104,10 @@ else
     fi
 fi
 
+# Sampled before rocminfo, whose own device init reads as 1% use on every GPU.
+USE=$(rocm-smi --showuse 2>&1)
+MEM=$(rocm-smi --showmemuse 2>&1)
+
 printf '\n=== 1. rocminfo (25 s) ===\n'
 if timeout 25 rocminfo >/dev/null 2>&1; then
     printf 'rocminfo: OK\n'
@@ -113,8 +117,6 @@ else
     RC=1
 fi
 
-USE=$(rocm-smi --showuse 2>&1)
-MEM=$(rocm-smi --showmemuse 2>&1)
 printf '\n=== 2. compute ===\n%s\n' "$(printf '%s\n' "$USE" | grep -E '^GPU\[')"
 printf '\n=== 3. VRAM ===\n%s\n' "$(printf '%s\n' "$MEM" | grep -E '^GPU\[.*VRAM%')"
 
@@ -126,7 +128,7 @@ FREE=
 for i in $(printf '%s\n' "$USE" | grep -oE '^GPU\[[0-9]+\]' | grep -oE '[0-9]+' | sort -un); do
     u=$(printf '%s\n' "$USE" | grep -E "^GPU\[$i\].*use" | grep -oE '[0-9]+$' | tail -1)
     m=$(printf '%s\n' "$MEM" | grep -E "^GPU\[$i\].*VRAM%" | grep -oE '[0-9]+$' | tail -1)
-    if [ "${u:-100}" -le 5 ] && [ "${m:-100}" -le 5 ]; then FREE="$FREE $i"; fi
+    if [ "${u:-100}" -eq 0 ] && [ "${m:-100}" -eq 0 ]; then FREE="$FREE $i"; fi
 done
 if [ -n "$FREE" ]; then
     printf 'idle and empty:%s\n' "$FREE"
