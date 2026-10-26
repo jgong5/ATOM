@@ -317,6 +317,60 @@ def test_a_covered_run_starts_and_records_its_check_over_a_record_and_a_populati
     assert handed["step_grid"]["grid"] == KEY["grid"]
 
 
+def beside_an_idle_rank(directory, idle):
+    """Move `directory`'s record, served by DP rank 0, to rank ``1 - idle``,
+    and write rank `idle` as a DP rank no request reached: at each served step,
+    the dummy forward it runs to keep step with its group."""
+    steps = directory / serve.STEPS
+    lines = [json.loads(x) for x in (steps / "dp0.jsonl").open()]
+    engine = (steps / "dp0.engine.json").read_text()
+    dummy = {"is_dummy_run": True, "batch": [], "named": []}
+    for rank in (0, 1):
+        own = {"dp_rank": rank, **(dummy if rank == idle else {})}
+        written = "".join(json.dumps(line | own) + "\n" for line in lines)
+        (steps / f"dp{rank}.jsonl").write_text(written)
+        (steps / f"dp{rank}.engine.json").write_text(engine)
+
+
+def test_coverage_counts_each_dp_rank_s_served_steps_by_name_and_no_dummy_run(
+    tmp_path, monkeypatch
+):
+    # Two DP ranks in each input, one idle: the record's rank 1 and the
+    # population's rank 0.
+    monkeypatch.setattr(
+        trace_steps, "roots_for", lambda modules: (ATOM_ROOT, AITER_ROOT)
+    )
+    directory = recorded(tmp_path, monkeypatch, MIXED)
+    served = recorded(tmp_path, monkeypatch, SHORT)
+    planned = plan(directory / serve.STEPS, served / serve.STEPS)
+    points = located(tmp_path, planned)
+    member = measured(planned, points, drop=("decode", points["decode"][0]))
+    token, backend = bundle(tmp_path, monkeypatch, member)
+    beside_an_idle_rank(directory, idle=1)
+    beside_an_idle_rank(served, idle=0)
+    run = build(tmp_path, "--step-stub", stub(tmp_path)) | {"data_parallel_size": 2}
+    population = trace_steps.publish(served, run, "compass trace steps").token()
+    (tmp_path / "authority").mkdir()
+    summary = tmp_path / "authority" / compass_run.SUMMARY_FILE
+    summary.write_text(json.dumps({"schedule": {"refusals": RefusalTally().record()}}))
+    plant(tmp_path, monkeypatch, directory / serve.STEPS, summary)
+
+    inputs = [str(directory), population]
+    drive_run.main(flags(tmp_path, "--step-grid", token, "--coverage", *inputs))
+
+    named = [
+        (f"{name} dp{rank} step {line['step']}", line)
+        for name, record, rank in ((inputs[0], directory, 0), (population, served, 1))
+        for line in map(json.loads, (record / serve.STEPS / f"dp{rank}.jsonl").open())
+    ]
+    declined = refusing(backend, named)
+    assert 0 < len(declined) < len(named)
+    coverage = json.loads((tmp_path / "out" / serve.RUN_JSON).read_text())["coverage"]
+    assert coverage["steps"] == len(named)
+    assert [d["step"] for d in coverage["declined"]] == declined
+    assert coverage["covered"] == len(named) - len(declined)
+
+
 #: The planted server, which also hands in the engine's memory as
 #: `PLANTED_HAND_IN` holds it.
 HANDING_IN = (
