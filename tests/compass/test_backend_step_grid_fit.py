@@ -57,6 +57,7 @@ from atom.compass.backends.step_grid_residual import Residual, order, raggedness
 from atom.compass.backends.step_labels import digest
 from atom.compass.bench import window
 from atom.compass.bench.measure import measurement_key, view_of
+from atom.compass.fit import publish
 from atom.compass.fit.samples import MEMBER
 from atom.compass.run import step_grid
 from atom.compass.spec import MachineSpec
@@ -136,16 +137,19 @@ def run(tmp_path):
     return r, here, configuration
 
 
-def record(tmp_path, run, lines, name="a", trace="trace-300", session=300, blocks=1024):
+def record(
+    tmp_path, run, lines, name="a", trace="trace-300", session=300, blocks=1024, slow=0
+):
     """`tmp_path/name`, a real run's record of `lines`, each timed at its lookup
-    times `factor`, on a pool of `blocks` KV blocks, with the export
-    `client.json` of the client run sending it from `trace`, which the export
-    gives `session`."""
+    times `factor`, the first `slow` at 3 times that, on a pool of `blocks` KV
+    blocks, with the export `client.json` of the client run sending it from
+    `trace`, which the export gives `session`."""
     r, _, configuration = run
     directory = tmp_path / name
     path = directory / "steps" / "dp0.jsonl"
     path.parent.mkdir(parents=True)
-    _record(path, [(x["rows"], x["rung"], time(x) * factor(x)) for x in lines])
+    timed = [time(x) * factor(x) * (3 if i < slow else 1) for i, x in enumerate(lines)]
+    _record(path, [(x["rows"], x["rung"], t) for x, t in zip(lines, timed)])
     written, sent = [json.loads(x) for x in path.read_text().splitlines()], {}
     for line, x in zip(written, lines):
         line |= {"produces_output": x["produces_output"]}
@@ -378,7 +382,10 @@ def test_the_residual_is_fitted_on_records_replays_or_both_and_reported_by_sourc
 
     assert copy["params"]["sources"] == sources
     for report in copy["report"]["kinds"].values():
-        counts = [(s["fitted"], s["held_out"]) for s in report["sources"].values()]
+        counts = [
+            (s["kept"] + s["dropped"], s["held_out"])
+            for s in report["sources"].values()
+        ]
         assert list(report["sources"]) == sources
         held = len(report["held_out"])
         assert (
@@ -390,6 +397,109 @@ def test_the_residual_is_fitted_on_records_replays_or_both_and_reported_by_sourc
     *runs, planned = copy["report"]["provenance"]
     assert sorted({r["source"] for r in runs}) == sources
     assert (planned["source"], planned["traces"]) == ("plan", ["trace-300"])
+
+
+def replayed(tmp_path, run, lines, slow=0):
+    """The tokens of `lines` replayed, each timed at its lookup times `factor`,
+    the first `slow` at 3 times that."""
+    return [
+        measured(
+            tmp_path, run, x, "replay", time(x) * factor(x) * (3 if i < slow else 1)
+        )
+        for i, x in enumerate(lines)
+    ]
+
+
+def test_planted_outliers_are_dropped_in_their_own_source_of_the_by_source_report(
+    tmp_path, run
+):
+    """One target per source at 3 times its factor, the only one of its kind
+    there: a record's decode step among replayed ones, and a replayed prefill
+    chunk producing output among the record's. The selected member drops each
+    one it fits, which at seed 0 is both, in its own source, and nothing else;
+    the sources' kept, dropped and held-out counts add up to the member's."""
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    lines, replays = mixed(seed=3), mixed()
+    a = record(tmp_path, run, lines[:1] + lines[20:], slow=1)
+    replays = replayed(tmp_path, run, replays[20:21] + replays[:20], slow=1)
+
+    copy = fitted(tmp_path, a, *replays, *clients(g), *clients(a), grid="grid")
+
+    slow = {("decode", "record"), ("prefill_output", "replay")}
+    kinds = copy["report"]["kinds"]
+    assert slow <= {(k, s) for k, report in kinds.items() for s in report["sources"]}
+    for k, report in kinds.items():
+        (selected,) = copy["params"]["residual"]["kinds"][k]["selected"]
+        member, sources = report["members"][selected], report["sources"]
+        for s, counts in sources.items():
+            if (k, s) in slow:
+                assert (counts["kept"], counts["dropped"] + counts["held_out"]) == (
+                    0,
+                    1,
+                )
+            else:
+                assert counts["dropped"] == 0
+        assert sum(s["dropped"] for s in sources.values()) == member["dropped"]
+        assert sum(s["kept"] for s in sources.values()) == member["samples"]
+        assert sum(s["held_out"] for s in sources.values()) == len(report["held_out"])
+
+
+def test_a_one_source_fit_reports_its_source_at_the_members_centre_and_mad(
+    tmp_path, run
+):
+    """Replays alone, each off its factor by up to 2%, so no member fits them
+    exactly, and one decode one at 3 times it, which seed 0 fits and drops: per
+    kind, the source's counts, centre and MAD are the selected member's, the
+    dropped triples included in both."""
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    lines = mixed() + mixed(seed=3)
+    off = np.random.default_rng(4).uniform(0.98, 1.02, len(lines))
+    off[0] *= 3
+    replays = [
+        measured(tmp_path, run, x, "replay", time(x) * factor(x) * o)
+        for x, o in zip(lines, off)
+    ]
+
+    copy = fitted(tmp_path, *replays, *clients(g), grid="grid")
+
+    for k, report in copy["report"]["kinds"].items():
+        (selected,) = copy["params"]["residual"]["kinds"][k]["selected"]
+        member, (source,) = report["members"][selected], report["sources"].values()
+        assert source["kept"] == member["samples"]
+        assert source["dropped"] == member["dropped"]
+        for spread in ("centre", "mad"):
+            assert source[spread] == pytest.approx(member[spread], rel=1e-6, abs=1e-12)
+
+
+def test_a_fit_takes_replays_in_their_views_order_not_the_stores(
+    tmp_path, run, monkeypatch
+):
+    """Replays alone, fitted in two stores, as one lists them and as the other's
+    are reversed: the same residual and report by kind."""
+
+    def fit_replays(directory):
+        directory.mkdir()
+        g = record(directory, run, nodes() + mixed(seed=2), name="grid")
+        for line in nodes():
+            measured(directory, run, line)
+        replays = replayed(directory, run, mixed())
+        return fitted(directory, *replays, *clients(g), grid="grid")
+
+    listed, load = fit_replays(tmp_path / "listed"), publish.load
+
+    def reversed_load(*args):
+        samples, config = load(*args)
+        return samples[::-1], config
+
+    monkeypatch.setattr(publish, "load", reversed_load)
+    again = fit_replays(tmp_path / "reversed")
+
+    assert again["params"]["residual"] == listed["params"]["residual"]
+    assert again["report"]["kinds"] == listed["report"]["kinds"]
 
 
 def test_every_provenance_entry_states_that_its_input_was_not_profiled(tmp_path, run):
