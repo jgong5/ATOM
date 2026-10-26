@@ -167,7 +167,7 @@ def test_an_output_prefill_s_draft_kv_pass_prices_as_target_and_a_middle_chunk_s
     """A prefill's draft-KV pass is `SHARE` of its target, plus `TAIL` on an
     output prefill, which then runs its propose pass of `AFTER` and `REST`;
     every fourth prefill is a middle chunk; a decode runs `KV_LAW`'s pass, then
-    a draft of `SHARE`. The law prices an output prefill's pass untagged and
+    a draft of `SHARE`. The law prices an output prefill's pass as target and
     the draft after it apart; a middle chunk's pass stays draft."""
     steps, plan = _steps(3), []
     for i, (rows, _, s) in enumerate(steps):
