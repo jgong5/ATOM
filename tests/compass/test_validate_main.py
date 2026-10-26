@@ -560,6 +560,32 @@ def test_runs_record_and_run_wrote_at_another_concurrency_are_not_one_cell(
         main([str(tmp_path / "c4")])
 
 
+@pytest.mark.parametrize("finishing", ["real1", "step_linear"])
+def test_a_cctraces_sim_run_still_finishing_refuses_naming_it(
+    capsys, tmp_path, finishing
+):
+    """`cctraces_sim.sh` writes its client run's export after aiperf's,
+    once its server has left."""
+    _rows(capsys, tmp_path)
+    cell = tmp_path / "c4"
+    stated = {d: (d / "run.json").read_text() for d in cell.iterdir()}
+    _as_recorded(cell)
+    for d, run in stated.items():
+        (d / "run.json").write_text(run)
+    assert _graded(capsys, cell)["cell", "verdict"] == ["3 real runs", "graded"]
+    (cell / finishing / CLIENT_RUN).unlink()
+
+    validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
+    done = subprocess.run(validate, capture_output=True, text=True, check=False)
+
+    held = sorted(str(d) for d in cell.iterdir() if d.name != finishing)
+    refusal = (
+        f"['{cell / finishing}'] hold no {CLIENT_RUN} and {held} do; "
+        "a cctraces_sim.sh run still finishing is not graded\n"
+    )
+    assert (done.returncode, done.stderr) == (1, refusal)
+
+
 #: A workload as `cctraces_sim.sh` and `client.sh` state it.
 WORKLOAD = {"aiperf_args": ["--concurrency", "4"], "traces_sha256": ["d0", "d1"]}
 
