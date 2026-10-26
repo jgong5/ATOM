@@ -198,9 +198,9 @@ Under DP, `E` runs from the latest pull over the group before the same forward, 
 D4 places it ([#1893](https://github.com/jgong5/ATOM/issues/1893)).
 They use the step linear law's solver: D53's relative error and MAD drops, D57's report, D58's hull. An
 `E` sample whose gap spans an idle engine is cut as idle and counted apart.
-An output prefill or middle chunk whose launch ends after its device ran a fifth of its
-label, placed on the host clock by the lead, waited on the device inside the launch: it
-gives no `W_launch` sample, since the recurrence's `end = max(start + D, launch_end)`
+An output prefill or middle chunk the host did not pace whose launch ends after its device
+ran a fifth of its label, placed on the host clock by the lead, waited on the device inside
+the launch: it gives no `W_launch` sample, since the recurrence's `end = max(start + D, launch_end)`
 charges that wait as `D`. On the DeepSeek-V4-Pro DPA8 MI355X records, pooling such launches
 priced a c=1 middle chunk's launch at 1.83 s against 0.13 s measured
 ([#2256](https://github.com/jgong5/ATOM/issues/2256)).

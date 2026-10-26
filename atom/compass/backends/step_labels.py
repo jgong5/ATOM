@@ -51,10 +51,10 @@ A step's host labels are its segments: `E` from the previous forward's exit,
 cut as idle when the two batches share no request; `W_pre` to the launch, less
 the staging gate's wait; `W_launch` from the launch to the token copy wait,
 the sampler's launch included, or to the launch's end on a forward with no
-such wait, and none on a prefill whose launch ends after its device ran
-`HELD_SHARE` of its device label, placed by the lead: that launch waited on
-the device; `W_post` from that wait's end to the exit, less the draft copy wait,
-and a middle chunk has none. With an MTP status wait,
+such wait, and none on a prefill the host did not pace whose launch ends
+after its device ran `HELD_SHARE` of its device label, placed by the lead:
+that launch waited on the device; `W_post` from that wait's end to the exit,
+less the draft copy wait, and a middle chunk has none. With an MTP status wait,
 `W_pre` ends at it and `W_inputs` runs from it to the launch. On a later
 pipeline stage, `W_recv` runs from the launch to the receive of its input.
 Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
@@ -202,8 +202,8 @@ def mtp_copy(lines) -> dict[int, tuple[int, bool]]:
 
 def _host_cut(lines) -> tuple[set[int], set[int], set[int]]:
     """The steps whose device start precedes their host launch end, the
-    prefill steps the host paced, and the prefill steps whose launch the
-    device held."""
+    prefill steps the host paced, and the other prefill steps whose launch
+    the device held."""
     (lines_timed, lead), output_end, timed = _timed(lines), None, []
     for s, start in lines_timed:
         bound = None
@@ -238,6 +238,7 @@ def _host_cut(lines) -> tuple[set[int], set[int], set[int]]:
         s["step"]
         for s, start, _ in timed
         if not all(r[2] for r in s["rows"])
+        and s["step"] not in paced
         and s["t_launch_ns"][1] - start - lead
         > HELD_SHARE * s.get("d_target_ns", s["d_busy_ns"])
     }

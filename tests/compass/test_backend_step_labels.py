@@ -489,18 +489,35 @@ def test_a_prefill_launch_the_device_held_gives_no_W_launch_label(tmp_path):
     so the device runs about half its label before the launch ends: the launch
     waited on the device and gives no `W_launch`. The middle chunks before it,
     the output prefills and the decodes keep theirs, and the middle chunk's
-    `W_launch` law is fitted on the launches the host ran alone."""
-    steps, held = _steps(14, n=80), list(range(40, 80, 4))
+    `W_launch` law is fitted on the launches the host ran alone. A decode and
+    an output prefill whose launches outlast all the device work queued before
+    them keep theirs too: the decode is launch-exposed, the output prefill
+    host-paced. The host clock's lead places the device: the labels are the
+    same with every host stamp a constant later."""
+    steps, held, long = _steps(14, n=80), list(range(40, 80, 4)), (39, 42)
     scale = {}
-    for n in held:
+    for n in (*held, *long):
         rows = steps[n][0]
         x = (1, sum(r[0] for r in rows), len(rows))
-        launch = float(np.dot(HOST["middle"]["W_launch"], x))
-        scale[(n, "W_launch")] = 2 * steps[n][2] / launch
+        kind = "decode" if n % 2 else "middle" if n % 4 == 0 else "prefill"
+        launch = float(np.dot(HOST[kind]["W_launch"], x))
+        work = sum(p for _, _, p in steps[: n + 1]) if n in long else steps[n][2]
+        scale[(n, "W_launch")] = 2 * work / launch
     record = _timed_record(tmp_path / "dp0.jsonl", steps, scale=scale)[0]
     samples, table = label(record)
 
     assert [s.step for s in samples if "W_launch" not in s.host] == held
     assert [row["step"] for row in table if row["W_launch"] is None] == held
+    assert [samples[n].cut for n in long] == ["exposed", "paced"]
     got = fit_host(samples)[0]["laws"]["middle"]["W_launch"]
     assert got == pytest.approx(HOST["middle"]["W_launch"], rel=1e-4, abs=1e-12)
+
+    later = tmp_path / "later" / "dp0.jsonl"
+    later.parent.mkdir()
+    lines = [json.loads(line) for line in record.read_text().splitlines()]
+    for line in lines:
+        for k in [k for k in line if k.startswith("t_")]:
+            v = line[k]
+            line[k] = [t + 10**12 for t in v] if isinstance(v, list) else v + 10**12
+    later.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    assert label(later)[1] == table
