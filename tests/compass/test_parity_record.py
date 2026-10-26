@@ -23,12 +23,14 @@ from test_dp_step_max import dp2  # noqa: F401  the dp2 fixture
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run
+from atom.compass.backends import step_linear_fit
 from atom.compass.backends.step_stub import StepStubBackend
 from atom.compass.parity import (
     ENV,
     RUNNER,
     TIMESTAMPS,
     StepRecording,
+    _record,
     compare,
     read,
 )
@@ -546,6 +548,28 @@ def test_a_real_record_states_the_engine_its_runner_resolved(tmp_path, monkeypat
     assert runner.forward(batches[0]) == "ran"
     path = tmp_path / "real" / "dp0.engine.json"
     assert json.loads(path.read_text()) == _engine(300)
+
+
+def test_a_context_parallel_record_states_its_width_and_the_step_linear_fit_refuses_it(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(ENV, str(tmp_path / "steps"))
+    runner = SimpleNamespace(rank=0, config=_config(prefill_context_parallel_size=2))
+    record = _record(runner).path
+    engine = json.loads(record.with_suffix(".engine.json").read_text())
+    assert engine["prefill_context_parallel_size"] == 2
+    assert "decode_context_parallel_size" not in engine
+    with pytest.raises(ValueError) as refused:
+        step_linear_fit.main(
+            [str(record), "--out", str(tmp_path / "law.json")]
+            + ["--machine-spec", "sha256:" + "0" * 64]
+        )
+    assert str(refused.value) == (
+        "the records' engine config states prefill_context_parallel_size 2, and "
+        "a step linear law states no context-parallel width, so a run at width 1 "
+        "would price with it"
+    )
+    assert not (tmp_path / "law.json").exists()
 
 
 def test_the_mixin_records_from_the_first_forward_after_construction(

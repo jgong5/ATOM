@@ -308,6 +308,7 @@ def _record(runner):
         record = None
         if directory and runner.rank == 0:
             directory = record_dir(directory, runner.config)
+            from atom.compass.backends.step_linear_fit import CONTEXT_PARALLEL
             from atom.compass.run.step_grid import BOUNDS, keyed
 
             pc = runner.config.parallel_config
@@ -319,6 +320,9 @@ def _record(runner):
                 name: getattr(runner.config, name)
                 for name in (*BOUNDS, "num_kvcache_blocks")
             }
+            for name in CONTEXT_PARALLEL:
+                if (width := getattr(runner.config, name, 1)) > 1:
+                    engine[name] = width
             record.path.with_suffix(".engine.json").write_text(json.dumps(engine))
             key = getattr(runner, "host_key", None)
             if key is not None:
