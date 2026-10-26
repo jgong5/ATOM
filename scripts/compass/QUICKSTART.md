@@ -212,12 +212,14 @@ rm -rf $R/warm   # a restarted container's earlier warm-up, which serve would re
 D=600 serve $R/warm 0-7 1 $REAL_PY record --gpu $G
 ```
 
-A server builds an aiter kernel the first time it meets a variant its image did
-not prebuild, such as `mha_varlen_fwd`'s for a prefill step of one new token a
-row, about 60 s inside the run, and the container keeps it for every later
-server. A record whose server built one names it in run.json's
+A server compiles a kernel the first time it meets a variant its image did not
+prebuild: an aiter module, such as `mha_varlen_fwd`'s for a prefill step of one
+new token a row, about 60 s inside the run, or a Triton, Inductor, FlyDSL or
+`compile_hsaco` kernel outside ATOM's own compile cache
+(`atom.compass.drive.aiter_jit`). The container keeps each for every later
+server. A record whose server compiled one names it in run.json's
 `aiter_jit_builds`, and grading, the fits and `validate.cost` refuse that
-record. This record takes those builds; nothing reads it. `smoke_cell.sh`
+record. This record takes those compiles; nothing reads it. `smoke_cell.sh`
 serves the same record before its calibration, so a container it ran in is
 warm. A restarted container takes this step again (Environment), over the
 `warm/` it took before. Success: `serve` returns 0.
@@ -315,8 +317,7 @@ so real runs that schedule them alike read `spread 0`. `within target` and
 
 - `exact`: a count every real run shares with the simulated run.
 - `not gated`, alone or after a count's verdict (all but `preemptions` and
-  `prefill tokens`): reported, not gated, as cost on validated, unvalidated and
-  declared steps and the summary's step counts and shares.
+  `prefill tokens`): reported, not gated.
 - `-`: cost on graded steps, which the protocol's cost gate reads; and rows with
   nothing to judge: steps cost left out, declined or extrapolated, a TTFT band
   with no request, the graph pool.
@@ -325,7 +326,7 @@ so real runs that schedule them alike read `spread 0`. `within target` and
   `fail` against its gate; `not discharged`, within it but predicted from a
   declared input or that same run; `refused`, the two sides not comparable.
 - The summary's `refusals`: `none`, or `coverage report` when the simulated run
-  refused a step. Its `speed`, simulated over wall seconds against the target
+  refused a step or was stopped early. Its `speed`, simulated over wall seconds against the target
   N: `meets <N>x`, `below <N>x`, or `no result for <N>x` with no wall time.
 
 The protocol is [08_validation_protocol.md](../../atom/compass/design/08_validation_protocol.md).
@@ -388,7 +389,7 @@ law's accuracy.
 | `kill: %%: no such job` | `serve` already stopped that server, when its client run failed or ended | nothing to stop; run `jobs` first |
 | `serve: OUT exists; leave a finished run out, rm -rf a stopped one` | a loop taken again over a run it already took | leave a finished concurrency out of the loop; `rm -rf` a stopped or short run's `--out` |
 | `Triton cache error`, or `failed to map segment from shared object` | a `--tmpfs` without `exec` | the container as Environment starts it |
-| grading, a fit or `validate.cost` refuses a record: `aiter ran a JIT build of [...] while its server served` | the container met that kernel variant for the first time inside the record | take the record again, since the container now holds the build; warm a fresh container first (step 0) |
+| grading, a fit or `validate.cost` refuses a record: `aiter ran a JIT build of [...] while its server served` | the server compiled a kernel the container had not met, aiter's, Triton's, Inductor's, FlyDSL's or `compile_hsaco`'s, inside the record | take the record again, since the container now holds the build; warm a fresh container first (step 0) |
 | verdict `coverage report`, `no decode vector for rung N` | no calibration step decoded N requests at once (a rung is the batch's captured-graph size). Concurrency alone does not reach N, since each lane replays from its own sampled start: for Qwen3.8-27B TP1 on one MI308X, calibration at c=16 (traces 256 to 392) decoded at most 7 at once, the graded cell (traces 0 to 255) up to 8 ([#1840](https://github.com/jgong5/ATOM/issues/1840)) | add a calibration record that starts every trajectory at its first turn, at concurrency N, to step 4's records: `calib_capture.sh` with `CELLS=N AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"` (`cctraces_sim.sh`'s header); such records at c=8, 10 and 12 give the shipped law its rung 8 |
 | grading refuses a run: `its export names no warmup` | no session was in flight at any lane's sampled start, so aiperf sent no warmup request: `artifacts/client_run.json` has an empty `warmup` and `client/aiperf.log` says `nothing to warm`. `client.sh` pins aiperf's seed, so the same traces and concurrency draw the same starts | no run of this cell is graded, since its first steps may be cold, and a fresh run repeats the draw; a higher concurrency adds lanes, each keeping its start; another trace range draws other starts |
 | grading refuses a run: warmup | its warmup overlapped its graded steps | a fresh server and client run |
