@@ -214,8 +214,21 @@ def driverless_mode(shape_env):
     """
     from torch._subclasses.fake_tensor import FakeTensorMode
 
+    to, host = torch.ops.aten.to.dtype_layout, torch.device("cpu")
+
     class _DriverlessFakeTensorMode(FakeTensorMode):
         avoid_device_init = property(lambda self: True)
+
+        def _dispatch_impl(self, func, types, args, kwargs):
+            # Under inference mode no autograd kernel decomposes `aten.to`
+            # first, so `torch.tensor` under a device default hands the mode
+            # its host constant's move whole, which the mode would run on the
+            # device as constant propagation. Its decomposition is the
+            # `_to_copy` the mode keeps off the device.
+            if func is to and kwargs.get("device", host).type != "cpu":
+                with self:
+                    return func.decompose(*args, **kwargs)
+            return super()._dispatch_impl(func, types, args, kwargs)
 
         def _validate_cache_key(self, func, args, kwargs):
             if str(func) in CACHED and not func._schema.is_mutable:

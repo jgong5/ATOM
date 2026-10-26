@@ -38,6 +38,7 @@ from test_lmcache_lp import (
     _bound_port,
     _config,
     _run,
+    lmcache_port,  # noqa: F401  the lmcache_port fixture
 )
 from test_memory_readings import DOCUMENT
 from test_vertical_slice import (
@@ -543,7 +544,9 @@ def _machine(out: Path) -> Path:
 
 
 @NEEDS_A_RUN
-def test_a_one_deployment_run_loads_a_stored_prefix_back(tmp_path, monkeypatch):
+def test_a_one_deployment_run_loads_a_stored_prefix_back(
+    tmp_path, monkeypatch, lmcache_port  # noqa: F811
+):
     """Three client runs of one prompt on a deployment that offloads to LP
     lmcache, its memory readings measured first on the GPU
     ``HIP_VISIBLE_DEVICES`` names: the first stores the prompt's chunks, the
@@ -555,7 +558,7 @@ def test_a_one_deployment_run_loads_a_stored_prefix_back(tmp_path, monkeypatch):
     # The readings are keyed by the performance environment the server runs in.
     monkeypatch.setenv("AITER_LOG_LEVEL", "WARNING")
     machine = _machine(tmp_path)
-    port, server_port = _free_port(), _free_port()
+    port, server_port = _free_port(), lmcache_port
     flags = ["--host", "127.0.0.1", "--port", str(server_port), "--chunk-size", "256"]
     flags += ["--l1-size-gb", "1", "--eviction-policy", "LRU"]
     flags += ["--eviction-trigger-watermark", "0"]  # every tick evicts

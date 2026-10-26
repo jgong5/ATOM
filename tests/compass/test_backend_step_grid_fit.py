@@ -502,6 +502,22 @@ def test_a_fit_takes_replays_in_their_views_order_not_the_stores(
     assert again["report"]["kinds"] == listed["report"]["kinds"]
 
 
+def test_every_provenance_entry_states_that_its_input_was_not_profiled(tmp_path, run):
+    """A record target, a replay target and the plan, which validation reads
+    to refuse a backend fitted on profiled inputs."""
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    a = record(tmp_path, run, mixed(seed=3))
+    replays = [measured(tmp_path, run, x, "replay", time(x)) for x in mixed()]
+
+    copy = fitted(tmp_path, a, *replays, *clients(g), *clients(a), grid="grid")
+
+    entries = copy["report"]["provenance"]
+    assert {e["source"] for e in entries} == {"record", "replay", "plan"}
+    assert [e["profiled"] for e in entries] == [False] * len(entries)
+
+
 def test_a_grid_input_no_client_run_names_refuses_naming_it(tmp_path, run):
     """As `measure steps` refuses to plan over it, with or without `--sessions`."""
     g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
