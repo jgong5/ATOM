@@ -226,7 +226,7 @@ def live_readings(spec, qwen, tp_width=1):
         tp_width=tp_width,
         model=ModelTerms.from_tree(
             meta_tree(PARAMETERS * element_bytes(qwen.dtype) // tp_width),
-            activations=measured(tp_width).activations(WARMUP_TOKENS),
+            activations=measured(tp_width).activations(),
         ),
         cudagraph_overhead=reserved(qwen, total_bytes),
     )
@@ -798,7 +798,7 @@ def _hand_in(tmp_path, qwen, record):
     spec = MachineSpec.from_mapping(document)
     entry = measured(1, record=record, activation_bytes=WARMUP_TOKENS * 180_480)
     model = ModelTerms.from_tree(
-        meta_tree(PARAMETERS * 2), activations=entry.activations(WARMUP_TOKENS)
+        meta_tree(PARAMETERS * 2), activations=entry.activations()
     )
     readings = device_readings(
         spec,

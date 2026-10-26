@@ -1184,7 +1184,7 @@ undecided**.
 | K9 | Outside the model | outside the simulation window, inside replaced code, cannot park, or a timing only a log line reads | startup and shutdown, the replaced runner and RDMA backends, collectives inside the real forward, text scanners, the step-loop timings that only feed a log line |
 
 Each site's mechanism is the `mechanism` field #476 adds to its row in
-`atom/compass/audit/sync_sites.json`, produced by the scanner beside it. A row's
+`tests/compass/sync_sites.json`, produced by the scanner beside it. A row's
 first classification (#53) maps naturally to A→K1, B→K5, C1→K8, C2→K7, ignore→K9; the
 rules below say where a site moved off that map.
 
@@ -1575,7 +1575,7 @@ loop.
 
 - ~~The counts above are estimates from a synchronization inventory, not from a completed
   pass over the code. The first implementation task should be to produce the exact
-  classified list and check it in.~~ **Done, 2026-09-21.** `atom/compass/audit/`.
+  classified list and check it in.~~ **Done, 2026-09-21.** `tests/compass/sync_scan.py` and `sync_sites.json`.
 - ~~The literal `time.sleep(2)` in `DecodeEngineCore._post_model_load_hook` ... it must
   be *checked*, not assumed.~~ **Checked, 2026-09-21, and both halves hold.** It is
   reached only from that hook, and `DecodeEngineCore` is constructed only by
@@ -1659,7 +1659,7 @@ The pacing timers are local next events the clock owner hands to
   time. `11` D72 carries the observer and the reasons.
 - uvicorn's server tick, a 0.1 s `asyncio.sleep` in `Server.main_loop`, and its
   keep-alive timeout are daemon deadlines too. They are uvicorn's code, not ATOM's, so the
-  sync inventory (`atom/compass/audit/sync_sites.json`) has no row for them; the frontend
+  sync inventory (`tests/compass/sync_sites.json`) has no row for them; the frontend
   declares them with the refresh loop in `DAEMON_TIMERS` (`atom/utils/compass_loop.py`).
 
 ### Must read the LP clock — these three change scheduling (K2)
@@ -1687,7 +1687,7 @@ The only requirement is that these stay on the *same* clock as each other:
 is not, so virtualizing only the former makes the two halves of shutdown disagree.
 
 The control-command reply deadline stays real too (K8, ruling on #964, 2026-10-14; its
-reads are in `_KEPT_REAL`, `atom/compass/detect/clock_source.py`): a control command is
+reads are in `_KEPT_REAL`, `tests/compass/clock_source.py`): a control command is
 out-of-band and produces no simulated event (#886), and the LP clock moves only while
 its owner takes a grant, so a deadline on it would never expire while the owner waits.
 
@@ -1907,11 +1907,28 @@ The push shape is the pull shape plus four: `remote_swa_block_ids`, `remote_pp_s
 fields of one, and the simulated connector, standing in for `mooncake`, emits the
 seventeen.
 
-One of the four is load-bearing rather than descriptive. The push consumer compares
-the producer's `hash_block_size` against its own and falls back to a full transfer —
-`num_computed_blocks = 0` — whenever it is absent or differs
-(`mooncake_connector.py::MooncakeConnectorScheduler.update_state_after_alloc`), so a blob carrying only the thirteen can never
-take the incremental path.
+One of the four, `hash_block_size`, is load-bearing rather than descriptive, and so are
+`block_size` and `dcp_size`, which Mooncake's blob and the simulated connector's carry in
+the current code though the table's read predates them. The push consumer skips its
+cached prefix only when every check in
+`mooncake_connector.py::MooncakeConnectorScheduler.update_state_after_alloc` holds:
+
+- the producer's pages line up with its own
+  (`MooncakeConnectorScheduler._remote_page_geometry`). With `block_size` and `dcp_size`
+  both present, the producer's `block_size` equals the consumer's and its `dcp_size` is 1
+  or the consumer's. Without them, the producer's `hash_block_size` equals the consumer's
+  `block_size` (an unsharded producer) or the consumer's `hash_block_size` (symmetric DCP);
+- the request keeps no per-request cache (`seq.has_per_req_cache` is false), since a
+  block delta does not carry state such as an SWA ring slot;
+- the consumer's `hash_block_size` is positive.
+
+It then sets `num_computed_blocks = seq.num_cached_tokens // hash_block_size` and
+`src_block_skip_factor` to the consumer's `dcp_size` over the producer's. When any check
+fails, `num_computed_blocks = 0`, a full transfer, so a blob carrying only the thirteen
+never takes the incremental path. The simulated consumer applies the page rule in
+`atom/compass/kv/connector.py::SimulatedKVConnectorScheduler._pages_line_up` and the
+other two checks in its `update_state_after_alloc`, then prices the consumer blocks left.
+It does not model `src_block_skip_factor`.
 
 `tests/compass/test_kv_blob_site.py` holds the one-site claim above. Nothing re-checks
 the field sets: they describe the connectors' code as read at `92f1fdafe`, and where the

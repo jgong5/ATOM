@@ -339,6 +339,14 @@ def test_records_predating_the_data_parallel_width_refuse_naming_it(tmp_path):
         fit(tmp_path, "fit steps", *LINEAR, a, *clients(a))
 
 
+def test_a_prefill_context_parallel_record_refuses_naming_its_width(tmp_path):
+    engine = {**ENGINE, "prefill_context_parallel_size": 2}
+    a = record(tmp_path / "a", 19, key={**HOST, "engine": engine})
+    with pytest.raises(SystemExit, match="states prefill_context_parallel_size 2"):
+        fit(tmp_path, "fit steps", *LINEAR, a, *clients(a))
+    assert not (tmp_path / "store").exists()
+
+
 def test_a_record_whose_server_built_an_aiter_module_refuses_naming_it(tmp_path):
     a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
     edit(b / "run.json", lambda r: r.update({BUILDS: ["mha_varlen_fwd"]}))

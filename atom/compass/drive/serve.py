@@ -80,6 +80,9 @@ PORT_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
 SERVE_PORTS, DEPLOY_PORTS = range(10000, 15000), range(17001, 65536)
 #: The line each rank logs naming its graph's directory in the compiled-graph cache.
 CACHE_LINE = re.compile(r"Using cache directory: (\S+) for vLLM's torch\.compile")
+#: ATOM's `atom.utils.backends.VLLM_CACHE_ROOT`, stated here because importing
+#: that module opens a HIP context on every GPU the calling process can see.
+CACHE_ROOT = os.path.expanduser("~/.cache/atom")
 
 
 def below_ephemeral(ports: range) -> range:
@@ -192,9 +195,7 @@ def drop_compiled(log) -> None:
     """Remove each directory ATOM derived in its compiled-graph cache that the
     stopped server's log `log` names. A directory configured outside the cache
     root stays."""
-    from atom.utils.backends import VLLM_CACHE_ROOT
-
-    root = Path(VLLM_CACHE_ROOT, "torch_compile_cache")
+    root = Path(CACHE_ROOT, "torch_compile_cache")
     text = Path(log).read_text("utf-8", "replace")
     for used in map(Path, CACHE_LINE.findall(text)):
         if used.is_relative_to(root) and used != root:

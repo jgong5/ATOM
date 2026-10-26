@@ -42,6 +42,7 @@ from atom.utils.compass_loop import (
     CompassSelector,
     HttpChannel,
     Station,
+    wrap_decode,
     wrap_encode,
 )
 
@@ -1174,3 +1175,57 @@ def test_tokenizer_results_due_at_one_instant_resume_in_submission_order(
     loop.run_forever()
     loop.close()
     assert resumed == sorted(range(len(tokens)), key=lambda k: (tokens[k], k))
+
+
+@pytest.mark.parametrize("delay_s", [0.0, 0.3], ids=["fast", "slow"])
+def test_an_on_loop_tokenizer_call_places_open_encode_jobs_first(run, caplog, delay_s):
+    # An encode job charged 1 ms, whose real thread takes `delay_s` wall
+    # seconds; a decode on the loop thread at 0 charged 5 ms; a 3 ms timer
+    # whose callback decodes 5 ms more. The job completes inside the first
+    # decode, so its result runs when that decode ends, at 5 ms, before the
+    # timer's decode, however long its thread took. The slow thread outlasts
+    # diag_s, so the wait warns once.
+    _idle_traffic(run)
+    loop = CompassEventLoop()
+    loop.executor.station = Station(1, diag_s=0.1)
+    encode = wrap_encode(
+        list, SimpleNamespace(encode_fixed_s=1e-3, encode_tokens_per_s=1.0, derate=1.0)
+    )
+    decode = wrap_decode(
+        lambda ids: "",
+        SimpleNamespace(decode_fixed_s=5e-3, decode_tokens_per_s=1.0, derate=1.0),
+    )
+    seen = {}
+
+    async def request():
+        def do_preprocess():
+            time.sleep(delay_s)
+            encode()
+
+        await loop.run_in_executor(None, do_preprocess)
+        seen["result"] = loop.time()
+
+    async def on_loop():
+        time.sleep(0.05)  # noqa: ASYNC251 - wall only: a fast thread is done by now
+        await asyncio.sleep(0)
+        decode([])
+        seen["decode"] = loop.time()
+
+    async def at_3ms():
+        await asyncio.sleep(3e-3)
+        for _ in range(3):  # past the callbacks that hand a result to its coroutine
+            await asyncio.sleep(0)
+        decode([])
+        seen["timer"] = loop.time()
+
+    async def go():
+        await asyncio.gather(request(), on_loop(), at_3ms())
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        loop.run_until_complete(go())
+    loop.run_forever()
+    loop.close()
+    print(f"\n  {delay_s} s thread: {seen}")
+    assert seen == pytest.approx({"result": 5e-3, "decode": 5e-3, "timer": 10e-3})
+    warned = [r for r in caplog.records if "event-loop charge waits" in r.getMessage()]
+    assert len(warned) == (delay_s > 0.1)

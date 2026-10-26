@@ -7,8 +7,8 @@ import shutil
 import pytest
 
 import atom
-from atom.compass.detect import rust_router
-from atom.compass.detect.rust_router import ALLOW_LIST, check, hits
+from tests.compass import rust_router
+from tests.compass.rust_router import ALLOW_LIST, check, hits
 
 MESH_SRC = os.path.join(os.path.dirname(atom.__file__), "mesh", "src")
 

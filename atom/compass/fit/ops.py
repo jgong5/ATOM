@@ -117,7 +117,7 @@ def read(store, dirs) -> tuple[list[dict], dict, dict]:
     for d in dirs:
         run = json.loads((d / "run.json").read_text())
         engine = json.loads((d / "engine.json").read_text())
-        config = {**run_fields(run), "engine_config": engine}
+        config = {**run_fields(run, d / "run.json"), "engine_config": engine}
         config |= {k: run[k] for k in ("stack", "host_key", "ptl")}
         lines = sorted(d.glob("round*/ops.jsonl")) or [d / "ops.jsonl"]
         for line in itertools.chain(*(f.read_text().splitlines() for f in lines)):
@@ -403,7 +403,8 @@ class PriceList(CostSource):
     at the step's count of each of its dimensions, ``context`` the bound's:
     a decode step's rows' max, a prefill's rows' mean cached tokens; ``mean``
     a decode step's rows' mean context over its B in `PERMILLE` of their max,
-    where the family was measured on ragged rows. It also
+    where the family was measured on ragged rows; a collective's family
+    (`bench.ops.exchange`) at its message bytes. It also
     declines inside a gap the fit declined, and prefill rows whose cached
     tokens from that mean to their max cross into another kernel. An answer
     between points is validated when every line it interpolates along holds
@@ -422,12 +423,16 @@ class PriceList(CostSource):
         self._index = functools.cache(self._index)
 
     def price(self, request: tuple) -> CostTerm | Refusal:
-        from atom.compass.bench.ops import signature
+        from atom.compass.bench.ops import exchange, signature
 
         (leaf, (phase, *counts, last), _), kind = request, request[0]["op"]
         at = dict(zip(("T", "B", "G", "context"), counts))
         shape = phase if at["G"] is None else f"{phase} G={at['G']}"
-        name = self._family(shape, signature(leaf))
+        if ex := exchange(leaf):  # a collective: its family over its message bytes
+            name, at["bytes"] = ex
+            name = name if name in self.params["families"] else None
+        else:
+            name = self._family(shape, signature(leaf))
         if name is None:
             return self.refuse(f"{kind}: no point of its signature was measured")
         dims, top = self.params["families"][name]["dims"], None

@@ -4,14 +4,15 @@
 and then the status copy's latency, `L_mtp`: on the gate's measured inputs,
 in a law's labels and fit, and in the runner's recurrence."""
 
+import dataclasses
 import json
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from test_backend_step_linear_fit import _fit, _steps
+from test_backend_step_linear_fit import _fit, _record, _steps, _view
 from test_parity_recurrence import MS, line
-from test_step_linear_draft import _mtp_record, _output
+from test_step_linear_draft import SHARE, _mtp_record, _output
 
 from atom.compass import run as compass_run
 from atom.compass.backends import StepLinearBackend, StepLinearLaw
@@ -153,3 +154,60 @@ def test_a_run_file_whose_host_laws_carry_the_status_copy_loads(tmp_path, monkey
     path.write_text(json.dumps({"bound_s": 1.0, "host": {"laws": {"decode": seg}}}))
     monkeypatch.setenv(compass_run.ENV, str(path))
     assert compass_run.spec()["host"]["laws"]["decode"][MTP_COPY] == [1, 0, 0]
+
+
+#: An output prefill's draft-KV tail, and the draft it runs after the event:
+#: seconds per step and per sequence, each; plus `REST` after its propose pass.
+TAIL, AFTER, REST = (6e-5, 2e-5), (5e-4, 4e-5), 1e-5
+
+
+def test_an_output_prefill_s_draft_kv_pass_prices_as_target_and_a_middle_chunk_s_as_draft(
+    tmp_path,
+):
+    """A prefill's draft-KV pass is `SHARE` of its target, plus `TAIL` on an
+    output prefill, which then runs its propose pass of `AFTER` and `REST`;
+    every fourth prefill is a middle chunk; a decode runs `KV_LAW`'s pass, then
+    a draft of `SHARE`. The law prices an output prefill's pass as target and
+    the draft after it apart; a middle chunk's pass stays draft."""
+    steps, plan = _steps(3), []
+    for i, (rows, _, s) in enumerate(steps):
+        n, out = len(rows), i % 8 != 0
+        if rows[0][2]:
+            plan.append((True, KV_LAW[0] + KV_LAW[1] * n, SHARE * s, 0))
+        else:
+            tail = (TAIL[0] + TAIL[1] * n) * out
+            propose = (AFTER[0] + AFTER[1] * n) * out
+            plan.append((out, SHARE * s + tail, (propose + REST) * out, propose))
+    path = tmp_path / "dp0.jsonl"
+    _record(path, [(r, g, s + kv + d) for (r, g, s), (_, kv, d, _) in zip(steps, plan)])
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    for x, (_, _, s), (out, kv, _, propose) in zip(lines, steps, plan):
+        x.update(produces_output=out, d_target_ns=round(s * 1e9))
+        x["d_draft_kv_ns"] = round(kv * 1e9)
+        if propose:
+            x["d_propose_ns"] = round(propose * 1e9)
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+
+    samples = {s.step: s for s in label(path)[0]}
+    for i in (2, 8):  # an output prefill, a middle chunk
+        (_, _, s), (out, kv, draft, _) = steps[i], plan[i]
+        got = samples[i]
+        assert got.device_s == pytest.approx(s + kv * out)
+        assert got.draft_s == pytest.approx(draft if out else kv)
+        assert got.draft_kv_s == (pytest.approx(kv) if out else None)
+
+    law = _fit([path])
+    assert law["draft"]["draft_kv"]["coefficients"] == pytest.approx(
+        dict(zip(("step", "seqs"), KV_LAW)), rel=1e-4
+    )
+    fitted = law["draft"]["draft_kv"]["fit"]
+    decodes = sum(not s.view.prefill for s in samples.values())
+    assert (fitted["samples"], fitted["dropped"]) == (decodes, 0)
+    backend = StepLinearBackend(StepLinearLaw(law))
+    for (rows, rung, s), (out, kv, draft, _) in zip(steps[:-1], plan):
+        if rows[0][2]:
+            continue
+        view = dataclasses.replace(_view(rows, rung), produces_output=out)
+        cost = backend.price(view)
+        assert cost.target_seconds == pytest.approx(s + kv * out, rel=1e-4)
+        assert cost.draft_seconds == pytest.approx(draft if out else kv, rel=1e-4)

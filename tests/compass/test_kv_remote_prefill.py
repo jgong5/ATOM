@@ -380,15 +380,28 @@ HBS = 4
 
 
 @pytest.mark.parametrize(
-    "blob_hbs, priced",
-    [(HBS, 1), (4 * HBS, len(PROMPT) // HBS)],
-    ids=["matching", "different"],
+    "dcp, blob_fields, reused",
+    [
+        (1, {"hash_block_size": HBS}, True),
+        (1, {"hash_block_size": 4 * HBS}, False),
+        (2, {"block_size": HBS, "dcp_size": 1, "hash_block_size": HBS}, True),
+        (2, {"block_size": 2 * HBS, "dcp_size": 1, "hash_block_size": 2 * HBS}, False),
+        (2, {"hash_block_size": HBS}, True),
+    ],
+    ids=[
+        "matching",
+        "different",
+        "dcp1-into-dcp2",
+        "dcp1-into-dcp2-other-block-size",
+        "dcp1-into-dcp2-hash-only",
+    ],
 )
-def test_a_decode_side_prefix_hit_is_written_only_when_both_hash_alike(
-    pd, monkeypatch, seq_factory, blob_hbs, priced
+def test_a_decode_side_prefix_hit_is_written_only_when_the_pages_line_up(
+    pd, monkeypatch, seq_factory, dcp, blob_fields, reused
 ):
-    """Mooncake's rule: the blocks decode already caches are not written,
-    unless prefill hashed its blocks at another size."""
+    """Mooncake's rule: the blocks decode already caches are not written when
+    prefill's pages line up with decode's, as an unsharded producer's do with
+    a DCP consumer's at one block size; otherwise all are."""
     half = connector(
         pd.rt_d,
         monkeypatch,
@@ -396,21 +409,28 @@ def test_a_decode_side_prefix_hit_is_written_only_when_both_hash_alike(
         kv_role="kv_consumer",
         address=pd.address,
         kv_cache_block_size=HBS,
+        decode_context_parallel_size=dcp,
     )
-    pd.d = scheduler_with(half, enable_prefix_caching=True)
+    pd.d = scheduler_with(
+        half, enable_prefix_caching=True, decode_context_parallel_size=dcp
+    )
     warm = seq_factory(PROMPT)
     pd.d.block_manager.allocate(warm)
     pd.d.block_manager.hash_blocks(warm, warm.num_tokens)
     pd.d.block_manager.deallocate(warm)
 
-    blob = {"do_remote_prefill": True, "transfer_id": 0, "hash_block_size": blob_hbs}
+    blob = {"do_remote_prefill": True, "transfer_id": 0, **blob_fields}
     (y,) = admitted(
         pd, [SimpleNamespace(kv_transfer_params_output=blob)], seq_factory, SEND
     )
     assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
-    assert y.num_cached_tokens == len(PROMPT) - HBS, "no decode-side hit"
+    assert y.num_cached_tokens == len(PROMPT) - HBS * dcp, "no decode-side hit"
+
+    priced = 1 if reused else len(y.block_table)
 
     ready = SEND + L + pd.model.duration_s(priced) + L
+    # Two polls before `ready`: the second reports what the first saw.
+    engine_step(pd.d, pd.rt_d, ready - 2 * TICK)
     engine_step(pd.d, pd.rt_d, ready - TICK)
     pd.d.schedule()
     assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS, "ready early"

@@ -20,7 +20,7 @@ from test_run_graph_pool import _installed
 from test_vertical_slice import _run_file
 
 from atom.compass import run as compass_run
-from atom.compass.memory import MemoryRefusal
+from atom.compass.memory import MemoryRefusal, check
 from atom.compass.memory.check import main
 from atom.compass.runner.overrides import NonAllocatingRunner
 from atom.utils import clock
@@ -210,3 +210,61 @@ def test_the_authority_removes_an_earlier_runs_hand_in(tmp_path):
     stale.write_text("{}")
     compass_run._RecordingAuthority(json.loads(_run_file(tmp_path).read_text()))
     assert not stale.exists()
+
+
+def _measured(tmp_path, *storages, **log):
+    """A `compass measure memory` ``--out``: its engine's log, and a file per
+    rank holding `storages` beside its readings, None for none."""
+    out = tmp_path / "measured"
+    (out / check.READINGS).mkdir(parents=True)
+    _log(out / check.LOG, **log)
+    for rank, held in enumerate(storages):
+        written = {"readings": {}} | ({} if held is None else {check.STORAGE: held})
+        (out / check.READINGS / f"readings.dp{rank}.json").write_text(
+            json.dumps(written)
+        )
+    return out
+
+
+def _term(saved, name) -> int:
+    (row,) = [row for row in saved["readings"]["peak_torch"] if row["name"] == name]
+    return row["nbytes"]
+
+
+@pytest.mark.parametrize("factor,verdict", [(1.0, "pass"), (1.2, "fail")])
+def test_a_measured_start_grades_weights_and_buffers_one_row_each(
+    monkeypatch, tmp_path, capsys, factor, verdict
+):
+    saved = _memory(monkeypatch, tmp_path, eager=True)
+    stored = {
+        "weights": round(_term(saved, "weights") * factor),
+        "buffers": _term(saved, "buffers"),
+    }
+    real = {
+        "peak": _total(saved, "peak_torch"),
+        "non_torch": _total(saved, "non_torch"),
+    }
+
+    main([*_ranks(tmp_path), str(_measured(tmp_path, stored, stored, **real, ranks=2))])
+
+    out = capsys.readouterr().out
+    lines = [line for line in reversed(out.splitlines()) if line.startswith("  ")]
+    rows = {line.split()[0]: line for line in lines}
+    assert rows["weights"].split()[1] == "analytical"
+    assert rows["weights"].endswith(verdict)
+    assert rows["buffers"].endswith("pass")
+    assert rows["peak_torch"].endswith("pass")
+
+
+@pytest.mark.parametrize(
+    "second,refused",
+    [(None, "2 rank files and 1 hold"), ({"weights": 1, "buffers": 1}, "name no rank")],
+)
+def test_a_measured_start_with_a_rank_holding_no_storages_or_others_is_refused(
+    monkeypatch, tmp_path, second, refused
+):
+    _memory(monkeypatch, tmp_path, eager=True)
+    first = {"weights": GIB, "buffers": GIB}
+    out = _measured(tmp_path, first, second, peak=GIB, non_torch=GIB, ranks=2)
+    with pytest.raises(MemoryRefusal, match=refused):
+        main([*_ranks(tmp_path), str(out)])
