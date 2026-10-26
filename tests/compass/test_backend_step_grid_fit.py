@@ -57,6 +57,7 @@ from atom.compass.backends.step_grid_residual import Residual, order, raggedness
 from atom.compass.backends.step_labels import digest
 from atom.compass.bench import window
 from atom.compass.bench.measure import measurement_key, view_of
+from atom.compass.fit import publish
 from atom.compass.fit.samples import MEMBER
 from atom.compass.run import step_grid
 from atom.compass.spec import MachineSpec
@@ -465,6 +466,33 @@ def test_a_one_source_fit_reports_its_source_at_the_members_centre_and_mad(
         assert source["dropped"] == member["dropped"]
         for spread in ("centre", "mad"):
             assert source[spread] == pytest.approx(member[spread], rel=1e-6, abs=1e-12)
+
+
+def test_a_fit_takes_replays_in_their_views_order_not_the_stores(
+    tmp_path, run, monkeypatch
+):
+    """Replays alone, fitted in two stores, as one lists them and as the other's
+    are reversed: the same residual and report by kind."""
+
+    def fit_replays(directory):
+        directory.mkdir()
+        g = record(directory, run, nodes() + mixed(seed=2), name="grid")
+        for line in nodes():
+            measured(directory, run, line)
+        replays = replayed(directory, run, mixed())
+        return fitted(directory, *replays, *clients(g), grid="grid")
+
+    listed, load = fit_replays(tmp_path / "listed"), publish.load
+
+    def reversed_load(*args):
+        samples, config = load(*args)
+        return samples[::-1], config
+
+    monkeypatch.setattr(publish, "load", reversed_load)
+    again = fit_replays(tmp_path / "reversed")
+
+    assert again["params"]["residual"] == listed["params"]["residual"]
+    assert again["report"]["kinds"] == listed["report"]["kinds"]
 
 
 def test_a_grid_input_no_client_run_names_refuses_naming_it(tmp_path, run):
