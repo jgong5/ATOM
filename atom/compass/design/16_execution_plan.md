@@ -348,7 +348,7 @@ what keeps the headline example, and one currently changes no path:
   branch suppress a trigger. **This is the part that keeps
   `atom/model_engine/model_runner.py`** — the module Compass's runner seam replaces.
   `tests/test_mla_index_cache.py` imports `ModelRunner` at
-  `tests/test_mla_index_cache.py::test_model_runner_local_total_layers_adds_mtp_only_on_drafter_stage`, indented four spaces inside a test function, so that
+  `tests/test_mla_index_cache.py::test_pp_shared_indexer_uses_the_producer_buffer_width`, indented four spaces inside a test function, so that
   import is never credited whatever the file collects. Measured at `236abfd9a` in
   `xiaobizh_n18_cpu`: crediting coverage at any indentation drops the set 30 → 29, losing
   `topK.py`; doing that *and* crediting non-collecting files drops it 30 → 27, losing
