@@ -98,3 +98,13 @@ def test_a_seed_is_composed_across_its_rungs_row_range_keeping_its_sum():
         assert view["rung"] == 32
         assert abs(sum(c for _, c, _ in view["rows"]) - total) <= len(view["rows"])
     assert composed(SEED, LADDER) == composed(SEED)
+
+
+def test_a_ladder_whose_first_rung_is_above_1_composes_no_view_of_one_row():
+    """Rung 4 of a ladder [4, 8] replays 1 to 4 rows, and a view of one row has
+    no longest row beyond its mean: the fewest rows composed is 2."""
+    seed = {**SEED, "rows": SEED["rows"][:3], "rung": 4}
+
+    views = composed(seed, [4, 8])
+
+    assert {len(v["rows"]) for v in views} == {2, 3, 4}

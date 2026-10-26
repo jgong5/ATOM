@@ -6,9 +6,9 @@ decode view, `seed`, and gives the ragged views that keep its rung and its
 summed context: at each `RATIOS` value r, B rows whose longest context is
 about r times their mean, for B the seed's row count, then the fewest and the
 most rows its rung replays on the decode `ladder`, one more than the rung
-below it and the rung itself, so the views' mean context spans the rung's row
-range; a rung `ladder` lacks, or one replaying one row count, composes at the
-seed's alone. At the seed's B their equivalent homogeneous shape, and the
+below it, at least 2, and the rung itself, so the views' mean context spans
+the rung's row range; a rung `ladder` lacks, or one replaying one row count,
+composes at the seed's alone. At the seed's B their equivalent homogeneous shape, and the
 step grid's lookup at it, are the seed's. The longest row is the context
 of `contexts` nearest r times the mean; each other row is drawn uniformly from
 `contexts` within `SPREADS` times the others' mean either side of it, and the
@@ -82,7 +82,7 @@ def compose(
     counts = [b]
     if rung in ladder:
         below = [0, *ladder][ladder.index(rung)]
-        counts += [n for n in (below + 1, rung) if n not in counts]
+        counts += [n for n in (max(below + 1, 2), rung) if n not in counts]
     for b, ratio in itertools.product(counts, RATIOS):
         for spread in SPREADS[: 1 if ratio == 1.0 else None]:
             got = _rows(b, total, ratio, spread, contexts, rng, max_len)
