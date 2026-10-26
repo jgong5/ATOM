@@ -9,9 +9,8 @@ PREDICTED is an engine's ``lp-<engine>.json`` in a simulated run's ``out_dir``,
 whose memory section holds the readings its KV pool was sized from, the warmup shape, and
 what the graph pool really costs; at DP width N, the N ranks' ``lp-<engine>.dp<r>.json``,
 each checked in turn. SERVER_LOG is the log of one real ATOM server with the
-same deployment, at N ranks a line per rank. Those lines name no rank, so here
-they are read only when every rank logs the same values; `validate` pairs a
-rank with the lines logging its KV block count. MEASURED is the ``--out``
+same deployment, at N ranks a line per rank. Those lines name no rank, so they
+are read only when every rank logs the same values. MEASURED is the ``--out``
 of a `compass measure memory` start of that deployment: its engine's log is
 read as SERVER_LOG is.
 
@@ -97,12 +96,9 @@ def record(readings: DeviceReadings, *, tokens: int, memory) -> dict:
     }
 
 
-def _one(
-    pattern: re.Pattern, text: str, log: Path, ranks: int, blocks: int | None = None
-) -> tuple[str, ...]:
-    """The values each rank logs on its line matching `pattern`. When ranks
-    log different values, the rank is the one whose KV pool holds `blocks`:
-    its lines are those logging that count, and every one must agree."""
+def _one(pattern: re.Pattern, text: str, log: Path, ranks: int, blocks=None) -> tuple:
+    """Each rank's values on its line matching `pattern`; where ranks differ, those
+    on the lines that log `blocks`, the rank's KV block count, which must agree."""
     found = pattern.findall(text)
     if len(found) != ranks:
         raise MemoryRefusal(
@@ -110,21 +106,18 @@ def _one(
             f"each of the {ranks} ranks of one real server logs one",
             "pass the log of a real server at as many ranks as hand-ins",
         )
-    at = ""
-    if len(set(found)) > 1 and blocks is not None:
-        at = f"num_kvcache_blocks={blocks}"
-        found = re.findall(rf"{pattern.pattern}.*\b{at}\b", text)
+    if len(set(found)) > 1 and blocks:
+        count = f"num_kvcache_blocks={blocks}"
+        found = re.findall(rf"{pattern.pattern}.*\b{count}\b", text)
         if not found:
             raise MemoryRefusal(
-                f"no line of {log} matching {pattern.pattern!r} logs {at}, "
-                "the rank's",
+                f"no line of {log} logs {count}, the rank's",
                 "compare the log of the server whose ranks recorded these steps",
             )
-        at = f" at {at}"
     if len(set(found)) > 1:
         raise MemoryRefusal(
             f"{log}'s ranks log {sorted(set(found))} on lines matching "
-            f"{pattern.pattern!r}{at}, which name no rank to pair with a hand-in",
+            f"{pattern.pattern!r}, which name no rank to pair with a hand-in",
             "compare a log whose ranks log the same values",
         )
     return found[0] if isinstance(found[0], tuple) else (found[0],)
@@ -153,11 +146,8 @@ def _stored(out: Path) -> tuple[Term, ...]:
     return footprint_terms(held[0], source=f"{STORAGE} in {out / READINGS}")
 
 
-def recorded(
-    log: Path, ranks: int = 1, blocks: int | None = None
-) -> tuple[Recorded, Term | None]:
-    """The real server's two readings, which each of its `ranks` DP ranks logs
-    (of a rank whose KV pool holds `blocks`, as `_one` pairs them),
+def recorded(log: Path, ranks: int = 1, blocks=None) -> tuple[Recorded, Term | None]:
+    """The real server's two readings, which each of its `ranks` DP ranks logs,
     and the pool its capture reserved; for a `compass measure memory` ``--out``,
     its engine's, and its ranks' storage bytes besides.
 
@@ -197,9 +187,7 @@ def recorded(
     return run, pool
 
 
-def parts(
-    predicted_file: Path, log: Path, ranks: int = 1, blocks: int | None = None
-) -> list:
+def parts(predicted_file: Path, log: Path, ranks: int = 1, blocks=None) -> list:
     """The per-term comparison, the predicted readings, and the graph pool's."""
     if not (saved := read_json(predicted_file).get("memory")):
         what = f"{predicted_file} has no memory section"
@@ -226,14 +214,13 @@ def parts(
     else:
         reserves = readings[graph_pool.RESERVES]
         predicts = _reading(graph_pool.PREDICTS, saved["predicts"])
-        compared = compare_graph_pool(pool, reserves=reserves, predicts=predicts)
-        # A pool logged as 0.00GB is under 5 MiB, which nothing is a share of.
-        out.append(
-            compared
-            if pool.nbytes
-            else "graph pool not compared: the real run's capture reserved "
-            f"0.00GB; reserves() {reserves.total:,} B, predicts() {predicts.total:,} B"
-        )
+        if pool.nbytes:  # a pool logged as 0.00GB is under 5 MiB: no share of it
+            out.append(compare_graph_pool(pool, reserves=reserves, predicts=predicts))
+        else:
+            out.append(
+                "graph pool not compared: the real run's capture reserved 0.00GB; "
+                f"reserves() {reserves.total:,} B, predicts() {predicts.total:,} B"
+            )
     return out
 
 
