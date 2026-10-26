@@ -12,7 +12,9 @@ so recording adds no DP collective. Its line also carries `t_enter_ns` and `t_ex
 monotonic clock around its forward, and is written once the forward returns.
 Inside the forward it carries `[enter, exit]` on that clock around the staging
 gate (`t_gate_ns`), the launch (`t_launch_ns`) and the wait for the previous
-output's token copy (`t_recv_ns`, only on a forward that reaches it), and with
+output's token copy (`t_recv_ns`, only on a forward that reaches it; off a
+pipeline, a runner that does not defer its output reads its own tokens under
+`t_read_ns` instead), and with
 a drafter its MTP status (`t_mtp_ns`) and draft copy (`t_draft_recv_ns`). Its device
 window is `d_busy_ns`, from an event recorded at the launch's entry to one
 recorded at the forward's exit (`d_target_ns` to one recorded just after
@@ -92,6 +94,7 @@ TIMESTAMPS = (
     "t_gate_ns",
     "t_launch_ns",
     "t_recv_ns",
+    "t_read_ns",
     "t_mtp_ns",
     "t_draft_recv_ns",
     "t_pp_recv_ns",
@@ -418,12 +421,13 @@ class StepRecording:
                 self._stamped, "t_recv_ns", recv
             )
         pp = getattr(getattr(self, "config", None), "pipeline_parallel_size", 1) > 1
-        if pp and not getattr(processor, "is_deferred_out", True):
-            # A stage reads this forward's tokens off the device: the wait is
-            # the call. Off a pipeline the gate releases that wait itself.
+        if not getattr(processor, "is_deferred_out", True):
+            # The forward reads its own tokens off the device: the wait is the
+            # call. Off a pipeline the gate releases that wait itself, so it
+            # stays in `W_post` and its stamp only ties the clocks.
             sampled = processor.prepare_sampled_ids
             processor.prepare_sampled_ids = functools.partial(
-                self._stamped, "t_recv_ns", sampled
+                self._stamped, "t_recv_ns" if pp else "t_read_ns", sampled
             )
         if pp:
             from aiter.dist.parallel_state import get_pp_group
