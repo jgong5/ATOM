@@ -368,6 +368,35 @@ def test_a_leaf_timed_after_a_copy_into_its_metadata_reads_the_prepared_values(
     assert {tuple(s) for s in seen} == {(0, 4, 9)}
 
 
+def test_an_operator_s_leaves_share_what_it_writes_across_placements():
+    # as DeepSeek-V4's decode leaves share ATOM's HCA workspace; another
+    # operator's writes and the readers' views are cloned apart
+    runner = _Runner()
+    runner.forward_vars["scratch"] = torch.zeros(6)
+    stub = ops.Stub(runner, 10_000)
+    scratch = ("self", _t([6], "metadata"))
+    stub.leaves = ops.leaves(
+        _graph(
+            _leaf("aten.add_.Tensor", scratch, ("other", _t([6], "activation"))),
+            _leaf("aten.add_.Tensor", scratch, ("other", _t([1], "activation"))),
+            _leaf("aten.fill_.Scalar", scratch),
+            _leaf("aten.add.Tensor", scratch),
+            layers=1,
+        )["region"]
+    )
+
+    for p in range(2):
+        stub._prepare((4 * p, 2 * p))
+
+    by_op = collections.defaultdict(set)
+    for _, views in stub.placed:
+        for (sig, _), (_, view) in views.items():
+            by_op[stub.leaves[sig][0]["op"]].add(id(view))
+    assert len(stub.leaves) == 4 and len(by_op["aten.add_.Tensor"]) == 1
+    assert len(set.union(*by_op.values())) == 3
+    assert ops._writes("aten.select.int") == set()  # a view writes nothing
+
+
 def _measuring(monkeypatch):
     """A stand-in runner `measure` builds, a rule that refuses a batch of two
     rows, and two points of two leaves each: two rows, then four. A leaf times

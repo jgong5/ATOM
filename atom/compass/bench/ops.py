@@ -78,8 +78,8 @@ blocks and state slots of its own, as many as the pool and a KV registry
 entry of per-request state hold, past what the state slots hold on the first
 placements' slots again, for which ATOM prepares the forward context
 again, it and the metadata views cloned once each, and only where they differ
-from the last placement's, but a view the leaf's operator writes (`_writes`),
-cloned for that leaf alone. A KV argument
+from the last placement's; a view an operator writes (`_writes`) has clones
+apart, which only that operator's leaves share. A KV argument
 places a leaf's copies as a context key does. A second graph runs
 copy 0 K times, warm; with one copy, or K under `CALLS`, there is none.
 Before each capture, and once the runner sized its KV pool, the memory the
@@ -569,6 +569,7 @@ class Stub:
         self.slots = runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
         self.built, self.leaves, self.placed = {}, {}, []
         self.cold_copies, self.clones, self.kv, self.state = {}, {}, {}, set()
+        self.written = {}
         self.modules = dict(runner.model.named_modules())
         self.contexts = runner.config.compilation_config.static_forward_context
         self.moe = sorted(
@@ -658,12 +659,15 @@ class Stub:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
                         # leaves share a view's clone: DeepSeek-V4's decode
-                        # leaves view 2.7 GB of it at a placement; one the
-                        # leaf writes is its own, or a leaf timed after it
-                        # reads what it wrote (a `copy_` bound by shape)
-                        shared = field not in writes
-                        clone = _deep(view, {}, self.clones) if shared else _clone(view)
-                        meta[sig, path] = name, clone
+                        # leaves view 2.7 GB of it at a placement. What an
+                        # operator writes is cloned apart, or a leaf timed
+                        # after it reads what it wrote (a `copy_` bound by
+                        # shape); its leaves share that clone, as ATOM's
+                        # layers share the HCA decode workspace
+                        clones = self.clones
+                        if field in writes:
+                            clones = self.written.setdefault(op["op"], {})
+                        meta[sig, path] = name, _deep(view, {}, clones)
                     except ValueError as error:  # the leaf refuses, not the step
                         meta[sig, path] = str(error), None
         # one clone across placements of what none changed: a leaf may cache
@@ -733,6 +737,7 @@ class Stub:
         }
         need = max(p for _, _, p, _ in plans.values())
         self.leaves, self.placed, self.clones = found, [], {}
+        self.written = {}
         self.context = _split(context)[0]
         self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
         for p in range(max(min(need, *room), 1)):
@@ -1160,9 +1165,11 @@ def _specs(args):
 def _writes(name: str) -> set[str]:
     """The slots the operator `name` writes, as its schema marks them: an
     in-place operator's or an `out` argument; none for a lifted function."""
-    # ponytail: a lifted function states no writes; ATOM's lifted metadata
-    # writers seen so far (`kv_indices_generate_triton`) rewrite what ATOM's
-    # preparation wrote, so sharing their clone changes no value
+    # ponytail: a lifted function states no writes, so its clones are shared:
+    # ATOM's lifted metadata writers (`kv_indices_generate_triton`,
+    # `fill_deferred_decode_ids`, DeepSeek-V4's index builders) write what
+    # ATOM's forward writes from the prepared metadata, which later leaves
+    # read; one that writes other values needs its writes named here
     target = torch.ops
     for attr in [] if ":" in name else name.split("."):
         target = getattr(target, attr, None)
