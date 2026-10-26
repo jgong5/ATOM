@@ -46,8 +46,11 @@
 #
 # It runs its own tree, as the gates do, compass-harness included. OUT_DIR gets
 # run.json (RUN_FILE plus a `workload` entry hashing the traces, the dataset
-# and the aiperf arguments), the server and aiperf logs, aiperf's artifacts at
-# --export-level raw, the client run's export in artifacts/client_run.json
+# and the aiperf arguments, and for a TP1 cell `argv`, its server's ATOM
+# arguments after `--`, which grading builds the step roofline from), the
+# server and aiperf logs, aiperf's artifacts at
+# --export-level raw, its raw records with no payload and gzipped
+# (profile_export_raw.jsonl.gz), the client run's export in artifacts/client_run.json
 # (atom/compass/parity/client_run.py), and the step table and run summary.
 # The last line is the cell's result, with the KV transfer count and mean
 # simulated seconds for a 1P1D cell. It exits non-zero when aiperf or the
@@ -58,12 +61,14 @@
 # table or summary; it saves rocm-smi's process listing before and after it in
 # gpu_before.txt and gpu_after.txt, and its result names the processes on its
 # GPUs (HIP_VISIBLE_DEVICES, default 0, as rocm-smi indexes them), with their
-# VRAM bytes; its run.json names in `aiter_jit_builds` each aiter JIT module
+# VRAM bytes; its run.json names in `aiter_jit_builds` each JIT module or kernel
 # built, or begun, while its server served, which grading, the fits and
 # `validate.cost` refuse (atom/compass/drive/aiter_jit.py).
-# It keeps Triton's autotune results in TRITON_CACHE_DIR (Triton's default
-# ~/.triton/cache), so a kernel tuned by one real run of that directory loads
-# its choice in the next instead of tuning inside it.
+# It keeps Triton's autotune results in TRITON_CACHE_DIR, the caller's or the
+# directory Triton resolves (~/.triton/cache by default), as `compass record`
+# does, and its run.json's `env` states both variables, so a kernel tuned by a
+# record or real run of that directory loads its choice in the next instead of
+# tuning inside it. Unset, Inductor would set its own directory mid-run.
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -78,7 +83,10 @@ TRACES=${TRACES:?TRACES names a cc-traces traces.jsonl}
 HARNESS_PYTHON=${HARNESS_PYTHON:?HARNESS_PYTHON names the Python with agentx-harness}
 SESSIONS=${SESSIONS:-2}
 REAL=${REAL:-0}
-((REAL)) && export TRITON_CACHE_AUTOTUNING=1
+if ((REAL)); then
+    TRITON_CACHE_DIR=$(python3 -c 'from triton import knobs; print(knobs.cache.dir)')
+    export TRITON_CACHE_AUTOTUNING=1 TRITON_CACHE_DIR
+fi
 SERVER_ARGS=${SERVER_ARGS:---enforce-eager --max-model-len 262144}
 AIPERF_EXTRA_ARGS=${AIPERF_EXTRA_ARGS:-}
 WAIT_S=${WAIT_S:-600}
@@ -112,8 +120,8 @@ args=(--endpoint-type chat --custom-dataset-type weka_trace
 args+=($AIPERF_EXTRA_ARGS)
 
 read -r MODE CLOCK_PORT PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT < <(
-python3 - "$RUN_FILE" "$OUT" "$TRACES" "$BENCHMARK_ID" "${args[@]}" <<'EOF'
-import hashlib, json, socket, sys
+MODEL=$MODEL SERVER_ARGS=$SERVER_ARGS REAL=$REAL python3 - "$RUN_FILE" "$OUT" "$TRACES" "$BENCHMARK_ID" "${args[@]}" <<'EOF'
+import hashlib, json, os, socket, sys
 from pathlib import Path
 
 run_file, out, traces, benchmark_id, *args = sys.argv[1:]
@@ -151,12 +159,16 @@ run["clock_endpoint"] = f"tcp://127.0.0.1:{ports[0]}"
 # declares more, or none (null, as `compass run` keeps one), leaves the server
 # up after aiperf.
 run["client_runs"] = 1
+if "kv_write_req_s" not in run:
+    run["argv"] = ["--", "--model", os.environ["MODEL"], *os.environ["SERVER_ARGS"].split()]
 run["workload"] = {
     "dataset_sha256": sha256(traces),
     "traces_sha256": [sha256(p) for p in sorted((out / "traces").iterdir())],
     "aiperf_args": args,
     "benchmark_id": benchmark_id,
 }
+if int(os.environ["REAL"]):
+    run["env"] = {k: os.environ[k] for k in ("TRITON_CACHE_AUTOTUNING", "TRITON_CACHE_DIR")}
 (out / "run.json").write_text(json.dumps(run))
 print("1p1d" if "kv_write_req_s" in run else "tp1", *ports)
 EOF
@@ -173,7 +185,11 @@ fi
 if [[ $MODE == 1p1d ]]; then
     # pd_sim.sh takes the authority's port from its own variable; the run file
     # names the same one for the traffic LP.
-    export MODEL SERVER_ARGS WAIT_S CLOCK_PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT
+    # Each side's DP master port is free too, or a second run on this host
+    # network finds pd_sim.sh's default taken.
+    PREFILL_DP_PORT=$(compass_free_port) DECODE_DP_PORT=$(compass_free_port)
+    export MODEL SERVER_ARGS WAIT_S CLOCK_PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT \
+        PREFILL_DP_PORT DECODE_DP_PORT
     # An agentic cell, as the real one is launched: under DP attention its
     # router is the --dp-aware router LP, which draws from the cell's seed, and
     # its dp_sticky keys off X-Session-ID, which the real cell's aiperf sends.
@@ -193,6 +209,7 @@ else
     # Its own process group, so a real server's workers stop with it. A free
     # DP master port, as `compass record` gives one: the port keys ATOM's
     # compiled-graph cache, and the first start that loads it autotunes again.
+    # No later start loads it, so the server's stop removes it, as there.
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
     ATOM_DP_MASTER_PORT=$(compass_free_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
         python3 "${main[@]}" \
@@ -219,8 +236,9 @@ aiperf=(-m aiperf)
 r.uuid4 = lambda: uuid.UUID(int=0)
 from aiperf.cli import app
 app()')
-# Its own process group, so stopping it stops its workers too.
-(cd "$OUT" && ATOM_COMPASS_RUN=$OUT/run.json AIPERF_DATASET_MMAP_BASE_PATH=$OUT \
+# Its own process group, so stopping it stops its workers too. Its raw records
+# leave out each request's payload, its prompt.
+(cd "$OUT" && ATOM_COMPASS_RUN=$OUT/run.json AIPERF_DATASET_MMAP_BASE_PATH=$OUT AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true \
     exec setsid "$HARNESS_PYTHON" "${aiperf[@]}" profile --url "127.0.0.1:$PORT" --model "$MODEL" \
     --tokenizer "$MODEL" --input-file "$OUT/traces" --artifact-dir "$OUT/artifacts" \
     --export-level raw "${args[@]}") >"$OUT/aiperf.log" 2>&1 &
@@ -242,11 +260,14 @@ while kill -0 $server 2>/dev/null && ((SECONDS < deadline)); do sleep 1; done
 kill -0 $server 2>/dev/null && { echo "cctraces_sim: the deployment is still up $WAIT_S s after aiperf" >&2; exit 1; }
 wait $server || rc=$((rc || REAL ? rc : $?))
 ((REAL)) && { kill -KILL -- -$server 2>/dev/null || true; gpu_processes after; }
+[[ $MODE == 1p1d ]] || python3 -c 'import sys; from atom.compass.drive import serve; serve.drop_compiled(sys.argv[1])' "$OUT/server.log"
 ((REAL)) && { python3 -m atom.compass.drive.aiter_jit "$OUT/run.json" "$serving_ns" || rc=$((rc ? rc : 1)); }
 # The raw records keep each response's chunks, so the export names each request
-# by its response id. A run that failed before aiperf wrote any has none.
+# by its response id; once it is written, they are compressed. A run that
+# failed before aiperf wrote any has none.
 if [[ -e $OUT/artifacts/profile_export_raw.jsonl ]]; then
-    python3 -m atom.compass.parity.client_run "$OUT/artifacts" || rc=$((rc ? rc : 1))
+    { python3 -m atom.compass.parity.client_run "$OUT/artifacts" &&
+        gzip "$OUT/artifacts/profile_export_raw.jsonl"; } || rc=$((rc ? rc : 1))
 fi
 
 python3 - "$OUT" "$BENCHMARK_ID" "$rc" "$REAL" "$gpu" <<'EOF'
@@ -283,11 +304,13 @@ if sys.argv[4] == "1":
     )
     sys.exit(rc)
 summary = json.loads((out / "summary.json").read_text())
-# Prefill logs one line per KV transfer, with its simulated seconds.
+# Prefill logs one line per KV transfer, with the simulated times its write
+# request arrived and its write finished.
 prefill = out / "prefill.log"
 kv = ""
 if prefill.exists():
-    t = [float(s) for s in re.findall(r"KV transfer .*, (\S+) simulated s", prefill.read_text())]
+    found = re.findall(r"KV transfer .*, from (\S+) to (\S+) simulated s", prefill.read_text())
+    t = [float(end) - float(start) for start, end in found]
     kv = f" kv_transfers={len(t)} kv_transfer_mean_s={sum(t) / len(t) if t else 0:.6g}"
 print(
     f"cctraces_sim: rc={rc} requests={avg('request_count'):.0f} "

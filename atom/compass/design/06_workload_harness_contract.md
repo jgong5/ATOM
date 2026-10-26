@@ -464,12 +464,15 @@ rule as the forward pass.
 |---|---|---|---|
 | encode | default `ThreadPoolExecutor` | the executor's actual width, **minus the wait jobs resident when the run starts** | `encode_fixed_s + tokens / encode_tokens_per_s` |
 | decode | engine output thread, per stream per step | **1**, one station per output thread | `2 x (decode_fixed_s + window / decode_tokens_per_s)` |
-| encode or decode on the loop thread | the API server's event loop: the final `decode` of a non-streaming completion in `generate_async`, `generate_async_multimodal` and `generate_async_fanout`, and the `encode` and `decode` calls in `anthropic_messages` | **1**, the loop itself | the same terms per call, over the tokens it encodes or decodes |
+| encode or decode on the loop thread | the API server's event loop: the final `decode` of a non-streaming completion (`delivered_text`) in `generate_async`, `generate_async_multimodal` and `generate_async_fanout`, the reasoning-channel `decode` of a token-id prompt in `chat_completions`, and the `encode` and `decode` calls in `anthropic_messages` and `responses_create` | **1**, the loop itself | the same terms per call, over the tokens it encodes or decodes |
 
 A loop-thread call is not a station job. The event loop is the frontend LP's clock owner,
 so the call prices itself as an event cost (`01` K1): it advances the LP clock by its
-service time, and nothing else on the loop runs until it ends. Outside the simulation
-window it is charged nothing.
+service time, and nothing else on the loop runs until it ends. Before it moves the clock it
+places every open encode job, waiting in wall time for the job's thread, so a job that
+completes inside the call hands its result on when the call ends, as on a real loop,
+whatever wall time its thread took ([#1231](https://github.com/jgong5/ATOM/issues/1231)).
+Outside the simulation window it is charged nothing.
 
 Terms come from `host.tokenizers[]` in the machine spec (doc 05 D25), populated by the
 `spec` package's class-0 tokenizer probe (doc 05 D26).
@@ -851,7 +854,7 @@ sites below, which do not go through `LoopScheduler` either (T74).
    plot and `submission_valid`. Roughly 15,000 lines of metrics code for free.
 
    **The carriers** (revised 2026-09-28, #443; `01` D8). The arrival time goes in the
-   **`compass` entry of the W3C `tracestate` header**, appended after any existing entries
+   **`compass` entry of the W3C `tracestate` header**, added before any existing entries
    (for example `tracestate: compass=a:12.345;s:17`), not in a body field: atomesh
    re-serializes a chat request through a typed struct with no catch-all, so an unknown
    top-level field is dropped, while `tracestate` is on the header allow-list it forwards
@@ -1003,7 +1006,7 @@ requires genuine fan-out in every root is not constructible without reusing sess
 | D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes on that path. Revised: three carriers, `tracestate` on the request, a `kv_transfer_params` field on the forward and SSE comment lines on the stream; still zero Atomesh changes. | 2026-09-18; revised 2026-09-28 |
 | D31 | Filler token is non-EOS, decodes to complete standalone ASCII, and is derived from the request id. | 2026-09-18 |
 | D32 | The decode->prefill cache chain is already broken by the harness for real servers too; guard only against false hits. `theoretical_prefix_cache_hit` is the oracle. | 2026-09-18 |
-| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. Revised: both are resource stations; encode width excludes the wait jobs resident when the run starts, pool jobs are classified by a registry and unregistered ones refused, and a clock read inside a job is its start plus accumulated service time. A tokenizer call on the event loop thread (the final `decode` of a non-streaming completion, the calls in `anthropic_messages`) is no station job: it advances the frontend LP clock by its service time on the loop. Revised: taking in an HTTP request charges the loop `fixed + body bytes x per_byte` from `host.http_intake`, so a burst reaches the pool one request at a time. Revised: a request that arrives once the last intake has ended is charged `idle_s` in place of `fixed`. | 2026-09-18; revised 2026-09-28, 2026-10-03, 2026-10-16 (#1103) and 2026-10-20 (#1775) |
+| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. Revised: both are resource stations; encode width excludes the wait jobs resident when the run starts, pool jobs are classified by a registry and unregistered ones refused, and a clock read inside a job is its start plus accumulated service time. A tokenizer call on the event loop thread (the final `decode` of a non-streaming completion, the calls in `anthropic_messages`) is no station job: it advances the frontend LP clock by its service time on the loop. Revised: it does so only once every open encode job is placed. Revised: taking in an HTTP request charges the loop `fixed + body bytes x per_byte` from `host.http_intake`, so a burst reaches the pool one request at a time. Revised: a request that arrives once the last intake has ended is charged `idle_s` in place of `fixed`. | 2026-09-18; revised 2026-09-28, 2026-10-03, 2026-10-16 (#1103), 2026-10-20 (#1775) and 2026-10-26 (#1231) |
 | D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. Revised: arrival rides the `compass` entry of `tracestate`, output times ride SSE comment lines, and the `/metrics` scrape is paced on simulated time. Revised 2026-10-02 (#533, #534): the scrape is a daemon deadline, and the run ends when no essential work is left. | 2026-09-18; revised 2026-09-28 and 2026-10-02 |
 | D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists; the rebind itself is deferred by a `sys.meta_path` hook, because the bootstrap runs while `aiperf.plugin.plugins` is still importing and cannot import `aiperf`; an inline attempt does not raise to the operator, it de-registers the whole plugin and logs one `WARNING` (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
 | D35 | Declare what the harness reproduces and what it cannot; cancellation is not available from this corpus. | 2026-09-18 |

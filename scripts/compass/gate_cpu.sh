@@ -256,8 +256,69 @@ fi
 
 # pytest's own status, captured directly. Piping it into `tail` discards the
 # exit code and a failing suite reports success.
-python -m pytest tests/ "${IGN[@]}" -q --no-header -p no:cacheprovider "$@" -rf
-RC=$?
+#
+# tests/compass holds most of the suite's time, in model traces that each take
+# one core, so it runs as COMPASS_GATE_SHARDS pytest processes beside the rest
+# of tests/, shard s taking every COMPASS_GATE_SHARDS-th file from s; 0 runs
+# tests/ as one process. Every process collects all of tests/ and deselects
+# what it does not run, because test files collect only after earlier files
+# have imported engine modules under an aiter stub; alone, they reach rocminfo.
+# A shard's output is printed after the rest's. A process left with no test to
+# run (exit 5) fails the gate only when none ran. A caller's --junitxml or
+# --basetemp path is the first process's; shard k writes <path>.shard<k>, since
+# a shared one is overwritten or cleared by every process.
+SHARDS=${COMPASS_GATE_SHARDS:-4}
+[[ $SHARDS =~ ^[0-9]+$ ]] || finish 95 "COMPASS_GATE_SHARDS=$SHARDS is not a count; pytest was not run"
+CF=()
+[ -d tests/compass ] && mapfile -t CF < <(find tests/compass \( -name 'test_*.py' -o -name '*_test.py' \) | sort)
+[ "${#CF[@]}" -gt 0 ] || SHARDS=0
+LOGS=$(mktemp -d) || finish 96 "mktemp failed; nothing was run"
+trap 'rm -rf "${HARNESS:-}" "$LOGS"' EXIT
+PYTEST=(tests/ "${IGN[@]}" -q --no-header -p no:cacheprovider)
+ARGS=("$@")
+own() {
+    local a prev=
+    OWN=()
+    for a in "${ARGS[@]}"; do
+        case $prev in --junitxml | --junit-xml | --basetemp) a=$a$1 ;; esac
+        case $a in --junitxml=* | --junit-xml=* | --basetemp=*) a=$a$1 ;; esac
+        prev=$a
+        OWN+=("$a")
+    done
+    OWN+=(-rf)
+}
+REST=()
+for e in tests/*; do
+    [ -d "$e" ] && e=$e/
+    [ "$e" = tests/compass/ ] || REST+=(--deselect="$e")
+done
+PIDS=()
+for ((s = 0; s < SHARDS; s++)); do
+    OTHERS=()
+    for ((k = 0; k < ${#CF[@]}; k++)); do
+        [ $((k % SHARDS)) -eq "$s" ] || OTHERS+=(--deselect="${CF[k]}")
+    done
+    own ".shard$((s + 1))"
+    python -m pytest "${PYTEST[@]}" "${OWN[@]}" "${REST[@]}" "${OTHERS[@]}" >"$LOGS/$s" 2>&1 &
+    PIDS+=($!)
+done
+DROP=()
+[ "$SHARDS" -eq 0 ] || DROP=(--deselect=tests/compass/)
+own ""
+python -m pytest "${PYTEST[@]}" "${OWN[@]}" "${DROP[@]}"
+CODES=($?)
+for ((s = 0; s < SHARDS; s++)); do
+    wait "${PIDS[s]}"
+    CODES+=($?)
+    printf '\n== tests/compass, shard %s of %s: rc=%s\n' $((s + 1)) "$SHARDS" "${CODES[s + 1]}"
+    cat "$LOGS/$s"
+done
+RC=0
+RAN=
+for c in "${CODES[@]}"; do
+    case $c in 0) RAN=1 ;; 5) ;; *) [ "$RC" -ne 0 ] || RC=$c ;; esac
+done
+[ "$RC" -ne 0 ] || [ -n "$RAN" ] || RC=5
 printf '\npytest: rc=%s\n' "$RC"
 
 if [ "$RC" -ne 0 ]; then

@@ -72,7 +72,8 @@ eager forwards, so a graph-mode run reads the eager graphs too; with
 under this run's readings, it prices each leaf from it first; with
 ``atom_args``, ATOM's arguments the server was started with, which `compass
 run` writes, a shape the store holds no graph at is traced first, in a
-process of its own, and published there, and a trace that fails ends the
+process of its own, and published there, or from a tree with uncommitted
+files kept for this run alone, unpublished, and a trace that fails ends the
 run, naming the shape),
 ``step_roofline`` (optional, ``true`` or ``false``: with ``true`` a
 `StepRooflineBackend` prices the steps the backend refuses, through
@@ -146,7 +147,11 @@ deployment's own ``kv_transfer_config``. Above DP width one each DP rank is a
 member of its side's engine LP, and ATOM's DP dispatch on each side picks the
 rank a request runs on. Optional ``prefill_data_parallel_size`` and
 ``decode_data_parallel_size``, ``data_parallel_size`` when absent, give each
-side its own DP width, and only such a run may name them. Optional ``prefill_instances`` and ``decode_instances``,
+side its own DP width, and only such a run may name them. Its optional
+``prefill_pipeline_parallel_size``, 1 when absent, is the prefill side's
+pipeline width, in place of ``pipeline_parallel_size``; above one, prefill
+stage ``k`` is the engine LP ``engine-P-pp<k>``, and the decode side runs one
+stage. Optional ``prefill_instances`` and ``decode_instances``,
 1 when absent, run that many deployments of a side, each naming its index in
 its ``kv_transfer_config`` as ``compass_instance``; above one, its LPs carry
 the index (``engine-P1``), and the router is the ``router`` LP, which chooses
@@ -239,6 +244,8 @@ ROUTER, LMCACHE = LpId("router"), LpId("lmcache")
 INSTANCES = {"P": "prefill_instances", "D": "decode_instances"}
 #: Run-file keys for each prefill-decode side's DP width.
 DP_WIDTHS = {"P": "prefill_data_parallel_size", "D": "decode_data_parallel_size"}
+#: The run-file key of a prefill-decode run's prefill pipeline width.
+PREFILL_PP = "prefill_pipeline_parallel_size"
 #: The kv_transfer_config key a deployment names its index among them by.
 INSTANCE_KEY = "compass_instance"
 #: The run-file key of each side's worker order in the router, a per-run outcome.
@@ -268,7 +275,7 @@ AUTHORITY_FILE = "authority_endpoint.txt"
 HAND_IN_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
-SUMMARY_SCHEMA_VERSION = 8
+SUMMARY_SCHEMA_VERSION = 10
 #: Compass source the host-law key leaves out, by path under the package: all
 #: of it (None), or the top-level names (def, class or assigned) only a simulated
 #: run reaches, with the comments above each and the module docstring.
@@ -383,25 +390,18 @@ def spec() -> dict | None:
 
 def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time."""
-    from atom.compass.runner.overrides import (
-        FORWARD_KINDS,
-        HOST_SEGMENTS,
-        MTP_SEGMENT,
-        OUT_SEGMENT,
-        PP_RECV_SEGMENT,
-    )
+    from atom.compass.runner.overrides import FORWARD_KINDS, SEGMENTS
 
     laws = host.get("laws", {})
-    segments = (*HOST_SEGMENTS, MTP_SEGMENT, PP_RECV_SEGMENT, OUT_SEGMENT)
     if (
         set(host) - {"laws", "skip", "key"}
-        or set(host.get("skip", ())) - set(segments)
+        or set(host.get("skip", ())) - set(SEGMENTS)
         or set(laws) - set(FORWARD_KINDS)
-        or {s for v in laws.values() for s in v} - set(segments)
+        or {s for v in laws.values() for s in v} - set(SEGMENTS)
         or {len(c) for v in laws.values() for c in v.values()} - {3}
     ):
         raise ValueError(
-            f"{path}: host is {host!r}; it takes skip, a list of {segments}, "
+            f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
             "and key, the host key the laws were fitted under"
         )
@@ -441,12 +441,29 @@ def _widths(run: dict) -> int | tuple[int, int]:
     return _dp(run)
 
 
-def _pp(run: dict) -> int:
-    return run.get("pipeline_parallel_size", 1)
+def _pp(run: dict, side: str | None = None) -> int:
+    """The pipeline width of `side`'s deployments, ``P`` or ``D``, else the
+    run's. A prefill-decode run states its prefill side's as `PREFILL_PP`, and
+    its decode side runs one stage."""
+    pd = "kv_write_req_s" in run
+    if (named := "pipeline_parallel_size" if pd else PREFILL_PP) in run:
+        raise ValueError(
+            f"the run file names {named}: a prefill-decode run states its prefill "
+            f"side's pipeline width as {PREFILL_PP}, and any other run its own as "
+            "pipeline_parallel_size"
+        )
+    if not pd:
+        return run.get("pipeline_parallel_size", 1)
+    return run.get(PREFILL_PP, 1) if side == "P" else 1
 
 
 def channel_table(run: dict):
     table = _engines_table(run)
+    if "lmcache" in run and _pp(run, "P") > 1:
+        raise ValueError(
+            "the run file has an lmcache entry and a pipeline above one stage: "
+            "ATOM's lmcache_mp does not run under PP"
+        )
     if "lmcache" in run:
         pd = "kv_write_req_s" in run
         add_lmcache(
@@ -461,6 +478,11 @@ def channel_table(run: dict):
 
 def _engines_table(run: dict):
     common = {k: run[k] for k in ("admission_path", "ipc_s", "stream_s")}
+    pp, links = _pp(run, "P"), ()
+    if pp > 1:
+        from atom.compass.runner.pp_send import carrier_models, lookaheads
+
+        links = lookaheads(carrier_models(_machine(run)))
     if "kv_write_req_s" in run:
         return prefill_decode_table(
             **common,
@@ -470,16 +492,13 @@ def _engines_table(run: dict):
             router_in_s=run.get("router_in_s"),
             prefill=run.get(INSTANCES["P"], 1),
             decode=run.get(INSTANCES["D"], 1),
+            prefill_pp=pp,
+            pp_links=links,
         )
-    links = ()
-    if _pp(run) > 1:
-        from atom.compass.runner.pp_send import carrier_models, lookaheads
-
-        links = lookaheads(carrier_models(_machine(run)))
     return single_engine_table(
         **common,
         dp=_widths(run),
-        pp=_pp(run),
+        pp=pp,
         pp_links=links,
         rapidserve=run.get(RAPIDSERVE, False),
     )
@@ -567,19 +586,27 @@ def _engine_name(config, run: dict) -> str | None:
 
 def _bind_transfer(config, run: dict) -> None:
     """Price the simulated connector's transfers from the machine spec and the
-    KV block this deployment's workers hold."""
+    KV block this deployment's workers hold: one model per prefill stage, each
+    on the layers that stage writes."""
     from atom.compass.backends import KvGeometry, Parallelism
     from atom.compass.kv import TRANSFER_KEY, Scope, TransferModel
+    from atom.models.utils import get_pp_indices
 
-    _pd_kv(config)[TRANSFER_KEY] = TransferModel.from_spec(
-        _machine(run),
-        KvGeometry.from_hf_config(
-            config.hf_config,
-            block_size=config.kv_cache_block_size,
-            parallelism=Parallelism(tp_size=config.tensor_parallel_size),
-            kv_dtype=config.kv_cache_dtype,
-        ),
-        Scope(run["kv_link"]),
+    hf, pp = config.hf_config, _pp(run, "P")
+    depth = getattr(hf, "text_config", hf).num_hidden_layers
+    _pd_kv(config)[TRANSFER_KEY] = tuple(
+        TransferModel.from_spec(
+            _machine(run),
+            KvGeometry.from_hf_config(
+                hf,
+                block_size=config.kv_cache_block_size,
+                parallelism=Parallelism(tp_size=config.tensor_parallel_size),
+                layer_range=get_pp_indices(depth, k, pp),
+                kv_dtype=config.kv_cache_dtype,
+            ),
+            Scope(run["kv_link"]),
+        )
+        for k in range(pp)
     )
 
 
@@ -806,7 +833,7 @@ class _RecordingAuthority(ClockAuthority):
             client_runs=math.inf if count is None else count,
         )
 
-    def record(self, lp, time_from, time_to, kind, recovered) -> None:
+    def record(self, lp, time_from, time_to, kind, recovered, *_) -> None:
         self._clock_before[lp] = time_from
         self.steps.record(lp, time_from, time_to, kind, detail="recovered" * recovered)
 
@@ -959,11 +986,19 @@ def frontend(config):
             "memory that prefill reads on wall time, off the clock; run RapidServe "
             "without it"
         )
-    if config.pipeline_parallel_size != _pp(run):
+    side, pp = _pd_side(config), config.pipeline_parallel_size
+    if side == "D" and pp > 1:
         raise ValueError(
-            f"the deployment runs {config.pipeline_parallel_size} pipeline stages "
-            f"and the run file's pipeline_parallel_size is {_pp(run)}; the "
-            "channel table every LP reads would declare the wrong stages"
+            f"a decode side of {pp} pipeline stages: ATOM's decode head reports "
+            "finished_recving from its own stage only, so ATOM runs no pipelined "
+            "decode side"
+        )
+    if pp != _pp(run, side):
+        key = PREFILL_PP if side == "P" else "pipeline_parallel_size"
+        raise ValueError(
+            f"the deployment runs {pp} pipeline stages and the run file's {key} "
+            f"is {_pp(run, side)}; the channel table every LP reads would declare "
+            "the wrong stages"
         )
     atom_runner, ours = ATOM_RUNNER, COMPASS_RUNNER_QUALNAME
     if rapid:
@@ -973,7 +1008,7 @@ def frontend(config):
             f"runner {config.runner_qualname!r} is named, and a simulated run "
             f"prices its steps with {ours}"
         )
-    side, standalone = _pd_side(config), CLOCK_ENV in os.environ
+    standalone = CLOCK_ENV in os.environ
     if side is not None and not standalone:
         raise ValueError(
             "this API server would co-host the clock authority, and a "
@@ -1126,7 +1161,8 @@ def engine(config):
 
     At DP width above one, the process joins the engine LP as the member of its
     DP rank, and its host collectives first join the group rounds it owes. A
-    pipeline stage is the engine LP ``engine-pp<stage>``.
+    pipeline stage is the engine LP ``engine-pp<stage>``, or a prefill side's
+    ``engine-P-pp<stage>``.
 
     A real run recording its steps (`parity.ENV`) outside a pipeline stamps the
     engine's input pulls and output puts into ``dp<rank>.pulls.jsonl`` beside
@@ -1150,10 +1186,10 @@ def engine(config):
 
     lp, side = ENGINE, _pd_side(config)
     pc = config.parallel_config
-    if getattr(config, "pipeline_parallel_size", 1) > 1:
-        lp = LpId(f"{ENGINE.name}-pp{pc.pipeline_parallel_rank}")
     if (name := _engine_name(config, run)) is not None:
         lp = LpId(f"{ENGINE.name}-{name}")
+    if getattr(config, "pipeline_parallel_size", 1) > 1:
+        lp = LpId(f"{lp.name}-pp{pc.pipeline_parallel_rank}")
     if side is not None:
         _bind_transfer(config, run)
     if "lmcache" in run:
@@ -1281,10 +1317,11 @@ def runner(model_runner, tree) -> None:
         from atom.compass.parity.replay import ReplayHost
 
         dp_rank = config.parallel_config.data_parallel_rank
+        stage = config.parallel_config.pipeline_parallel_rank
         # This engine's record: prefill/, or prefill1/ for engine-P1.
         name = _engine_name(config, run) or ""
         side = {"P": "prefill", "D": "decode"}.get(name[:1], "") + name[1:]
-        replay = ReplayHost(Path(run["replay"]) / side, dp_rank)
+        replay = ReplayHost(Path(run["replay"]) / side, dp_rank, stage)
     if STEP_LINEAR in run:
         if tp != 1:
             raise ValueError(
@@ -1374,7 +1411,7 @@ def runner(model_runner, tree) -> None:
     # the DP and PCP widths, all in the readings' key, so the tokens the
     # reading warmed up with are the ones this deployment's warmup runs.
     warmup = measured.values["warmup_tokens"]
-    model = ModelTerms.from_tree(tree, activations=measured.activations(warmup))
+    model = ModelTerms.from_tree(tree, activations=measured.activations())
     fallback = run.get("step_roofline", False)
     if not isinstance(fallback, bool):
         raise TypeError(
@@ -1526,7 +1563,8 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
     first traced once, as `compass trace ops` traces a record's step from
     them, in a process of its own (a process runs one capture), its count and wall
     seconds added to `lazy`'s ``lazy_traces`` and ``lazy_trace_wall_seconds``;
-    a trace that fails raises, naming the shape."""
+    a trace that fails raises, naming the shape. A trace from a tree with
+    uncommitted files answers this lookup alone and is not published."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
     from atom.compass.capture.forward import Shape, missed, structure
 
@@ -1534,7 +1572,7 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
     dp = config.parallel_config.data_parallel_size
     drafter = getattr(config, "speculative_config", None)
     drafts = drafter.num_speculative_tokens if drafter else 0
-    traced = set()
+    traced, unpublished = set(), {}
 
     @functools.lru_cache(maxsize=64)
     def graph(
@@ -1550,7 +1588,7 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
             traced.add(shape)
             began = time.monotonic()
             try:
-                _child(_trace, root, atom_args, arch, shape)
+                unpublished.update(_child(_trace, root, atom_args, arch, shape))
             # An argument parser's error exits.
             except (Exception, SystemExit) as failed:
                 why = f"{type(failed).__name__}: {failed}"
@@ -1558,6 +1596,8 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
             lazy["lazy_traces"] += 1
             lazy["lazy_trace_wall_seconds"] += time.monotonic() - began
             missing = not store.directory_for(key).exists()
+        if (at, str(shape)) in unpublished:
+            return unpublished[at, str(shape)]
         if missing:
             return missed(store, key) or None
         return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
@@ -1565,30 +1605,42 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
     return graph
 
 
-def _trace(root: str, atom_args, arch: str, shape) -> None:
+def _trace(root: str, atom_args, arch: str, shape) -> dict:
     """Trace `shape` as `compass trace ops` traces a record's step, a prefill
     as one forward, from ATOM's arguments `atom_args` less the server's, on a
     declared `arch`, and publish each graph in the store at `root`, one another
-    engine of the run published first aside."""
+    engine of the run published first aside. From a tree with uncommitted
+    files, which may run but not publish, return each graph's region by its
+    structure and shape instead; else return an empty dict."""
     import tempfile
 
-    from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, Rule
+    from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, Rule, roots_for
     from atom.compass.capture import publish
     from atom.compass.capture.forward import capture
+    from atom.compass.capture.graph import to_json
     from atom.compass.drive.runfile import _engine_args, engine_only
 
     engine, kept = _engine_args(atom_args), engine_only(atom_args)
     store, tp = ArtifactStore(root), engine.tensor_parallel_size
     command = f"compass run: a lazy trace of {shape}"
+    dirty = any(r.dirty for r in roots_for({"atom": "atom", "aiter": "aiter"}))
+    unpublished = {}
     with tempfile.TemporaryDirectory(prefix="compass-capture-") as tmpdir:
         for graph, model, declared in capture(
             engine.model, tp, [shape], tmpdir, kept, arch, whole=True
         ):
+            if dirty:
+                at = graph.applicability
+                unpublished[at.structure, at.shape] = json.loads(to_json(graph))[
+                    "region"
+                ]
+                continue
             try:
                 publish(store, graph, model, declared, tp, kept, command)
             except ArtifactRefusal as refused:
                 if refused.rule is not Rule.IMMUTABLE:
                     raise
+    return unpublished
 
 
 def _price_list(run: dict, config, machine):
@@ -1758,11 +1810,14 @@ def _hand_in(
     run: dict, lp: str, reasons: list, client_run: int | None = None, **sections
 ) -> None:
     """Write `lp`'s refusals, and its other sections, for the summary's writer:
-    at the end of client run `client_run`, or None for the finish."""
+    at the end of client run `client_run`, or None for the finish. When its
+    runtime printed stall diagnostics, ``diagnostics`` counts them."""
     out = Path(run["out_dir"])
     if client_run is not None:
         out = out / CLIENT_DIR.format(client_run)
         out.mkdir(exist_ok=True)
+    if diagnostics := getattr(clock.installed(), "diagnostics", 0):
+        sections = {"diagnostics": diagnostics, **sections}
     _write_whole(
         out / LP_FILE.format(lp), json.dumps({"refusals": reasons, **sections})
     )
@@ -2037,10 +2092,21 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     def total(key):
         return sum(p.get(key, 0) for p in priced) - sum(p.get(key, 0) for p in before)
 
+    def counted(key):
+        c = sum((Counter(p.get(key, {})) for p in priced), Counter())
+        return c - sum((Counter(p.get(key, {})) for p in before), Counter())
+
     seconds = total("seconds")
     tally = RefusalTally.of(reasons, total("steps"))
     lazy = total("lazy_traces"), total("lazy_trace_wall_seconds")
-    summary = RunSummary.of(record, wall, *lazy, refusals=tally).as_record()
+    # The authority's stalls in `record`, and each LP's beyond those in `since`.
+    diagnostics = record.diagnostics + sum(
+        h.get("diagnostics", 0) for h in hand_ins.values()
+    )
+    diagnostics -= sum(h.get("diagnostics", 0) for h in since.values())
+    summary = RunSummary.of(
+        record, wall, *lazy, diagnostics=diagnostics, refusals=tally
+    ).as_record()
     schedule = summary["schedule"]
     schedule["predicted_seconds"] = seconds
     # How the seconds were obtained: reported, never gated.
@@ -2057,9 +2123,9 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     for key in ("extrapolated_steps", "fallback_steps"):
         schedule[key] = total(key)
     # Each assumed treatment the steps were priced under, with its step count.
-    treatments = sum((Counter(p.get("treatments", {})) for p in priced), Counter())
-    treatments -= sum((Counter(p.get("treatments", {})) for p in before), Counter())
-    schedule["treatments"] = dict(sorted(treatments.items()))
+    schedule["treatments"] = dict(sorted(counted("treatments").items()))
+    # Each reason a source declined a step a fallback then priced, with its steps.
+    schedule["fallback_reasons"] = dict(counted("fallback_reasons").most_common())
     # An engine whose workers died, or that never handed in, priced steps no
     # one counted: they are absent, not 0.
     if any(
@@ -2069,6 +2135,7 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     ):
         schedule.update(predicted_seconds=None, seconds_by_method=None, treatments=None)
         schedule.update(extrapolated_steps=None, fallback_steps=None)
+        schedule["fallback_reasons"] = None
         schedule["refusals"].update(steps=None, fraction_of_steps=None)
     summary["configuration"] = configuration(run)
     summary["schema_version"] = SUMMARY_SCHEMA_VERSION

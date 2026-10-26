@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """``scripts/compass/cctraces_sim.sh`` keeps every other port it picks out of
 the write-request ports from KV_WRITE_REQ_PORT, one per prefill and decode DP
-rank pair.
+rank pair, and hands a 1P1D cell's pd_sim.sh a free DP master port per side.
 
 The script runs end to end with the stand-ins of
 ``test_cctraces_sim_no_export``, and its port pick gets planted ports first:
@@ -12,6 +12,7 @@ needs a driver or aiperf.
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -126,3 +127,48 @@ def test_no_other_port_lands_in_the_write_request_block(tmp_path, widths, block)
     assert ports == planted[:4] + planted[5:], (planted, kv_port, ports)
     taken = range(kv_port, kv_port + block)
     assert not [p for p in ports if p in taken], (planted, kv_port, ports)
+
+
+def test_a_1p1d_cell_hands_pd_sim_a_free_dp_master_port_for_each_side(tmp_path):
+    """pd_sim.sh's fixed defaults collide when two cells share a host network."""
+    seen = tmp_path / "seen"
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    bash = shutil.which("bash")
+    (bin_ / "bash").write_text(
+        "#!/bin/sh\n"
+        'case "$1" in */pd_sim.sh)\n'
+        f'    echo "$PREFILL_DP_PORT $DECODE_DP_PORT" >{seen}; exit 1;;\n'
+        "esac\n"
+        f'exec {bash} "$@"\n'
+    )
+    (bin_ / "harness-python").write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = -c ] && exec echo "${PYTHONPATH%%:*}/compass_harness/x.py"\n'
+        "exit 3\n"
+    )
+    for f in bin_.iterdir():
+        f.chmod(0o755)
+    traces = tmp_path / "traces.jsonl"
+    traces.write_text('{"id": 0}\n')
+    run_file = tmp_path / "run.json"
+    run_file.write_text(json.dumps({"kv_write_req_s": 2.0**-10}))
+    done = subprocess.run(
+        [bash, str(SCRIPT), str(run_file), str(tmp_path / "cell")],
+        cwd="/",
+        env=dict(
+            os.environ,
+            PATH=f"{bin_}:{os.environ['PATH']}",
+            MODEL=str(tmp_path),
+            TRACES=str(traces),
+            HARNESS_PYTHON=str(bin_ / "harness-python"),
+            WAIT_S="30",
+        ),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert seen.exists(), done.stdout + done.stderr
+    ports = seen.read_text().split()
+    assert len(set(ports)) == 2, (ports, done.stderr)

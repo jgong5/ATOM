@@ -18,7 +18,12 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from test_artifact_store import CONDITIONS, GATES, stanza
+from test_artifact_store import (
+    CONDITIONS,
+    GATES,
+    clean_checkout,  # noqa: F401  autouse
+    stanza,
+)
 from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
 from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 
@@ -26,7 +31,7 @@ from atom.compass import capture, cli, ir
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.bench import ops
 from atom.compass.capture import forward
-from atom.compass.capture.forward import decode, structure
+from atom.compass.capture.forward import decode, prefill, structure
 from atom.compass.fit import ops as fit_ops
 from atom.compass.run import memory, step_grid
 from atom.compass.runner.overrides import schedulable_ladder
@@ -68,8 +73,9 @@ def _bench(fn, config, todo, llc):
             if shape.phase == "prefill":
                 n = shape.tokens
                 kernel = "p" if op["op"] == "aiter.attn" else f"gemm{int(n >= 100)}"
-            elif op["op"] == "aiter.attn":
-                n, kernel = context, f"attn{int(context >= 5000)}"
+            elif op["op"] == "aiter.attn":  # by its longest row, ragged or not
+                n = ops._split(context)[0]
+                kernel = f"attn{int(n >= 5000)}"
             else:
                 n, kernel = 1, "gemm"
             got.append(
@@ -145,6 +151,8 @@ def test_a_plan_densifies_each_leaf_to_adjacent_points_where_its_kernel_switches
     assert ops._dependent(records) == {"aiter.attn": True, "aiter.gemm": False}
     at = {}
     for r in records:
+        if isinstance(r["context"], list):  # a ragged decode point
+            continue
         at.setdefault((r["op"], r["shape"].split()[0]), set()).add(
             r["context"] if r["shape"].startswith("decode") else r["shape"]
         )
@@ -434,13 +442,55 @@ def test_a_tp2_plan_reads_back_every_point_it_holds(bench, tmp_path, monkeypatch
     assert _bench.calls == calls
 
 
+def test_a_planned_decode_point_holds_the_rows_of_the_ragged_step_it_stands_for(
+    bench, tmp_path
+):
+    # Rows of 1000 and 4000 at rung 2: their mean is 625 permille of their max.
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 4000, True]], 2),
+        ([[1, 12000, True]], 1),
+    )
+
+    records = _plan(bench, tmp_path, population)
+
+    ragged = {}
+    for r in records:
+        if isinstance(r["context"], list):
+            assert r["op"] == "aiter.attn"  # only a kind that moves with context
+            ragged.setdefault(r["shape"], set()).add(tuple(r["context"]))
+    # Each context of the ladder at each `GRID`th of the max from the least the
+    # rows hold, the step's own 625 among them, halved where the kernel
+    # switches; a single row is never ragged.
+    assert ragged.keys() == {"decode B=2", "decode B=4"}
+    for shape, least in (("decode B=2", 500), ("decode B=4", 250)):
+        grid = (round(1000 * k / ops.GRID) for k in range(1, ops.GRID))
+        means = {least} | {m for m in grid if m > least}
+        assert {m for _, m in ragged[shape]} == means
+        ladder = {(c, m) for c in (2500, 4000, 12000) for m in means}
+        assert ladder | {(4999, 625), (5000, 625)} <= ragged[shape]
+    # The point at the step's own context holds the step's rows.
+    [point] = [
+        r for r in records if r["shape"] == "decode B=2" and r["context"] == [4000, 625]
+    ]
+    rows = ops.point_rows(decode(2), point["context"], 1 << 20, 16)
+    assert rows == [[1, 4000, True], [1, 1000, True]]
+
+    calls = _bench.calls
+    assert _plan(bench, tmp_path, population) == records
+    assert _bench.calls == calls  # every ragged point is read back from the store
+
+
 def test_a_plan_reads_a_padded_step_s_lowest_context_over_its_rung(bench, tmp_path):
     # One row at rung 2: the lowest context is 3000 over two rows.
     population = _records(tmp_path / "plan", ([[1, 3000, True]], 2))
 
     records = _plan(bench, tmp_path, population)
 
-    assert {r["context"] for r in records} == {1500, 3000}
+    assert {r["context"] for r in records if not isinstance(r["context"], list)} == {
+        1500,
+        3000,
+    }
 
 
 def test_coverage_keeps_a_leaf_s_reason_whichever_leaf_of_its_op_comes_later(
@@ -531,7 +581,7 @@ def test_a_plan_halves_decode_attention_until_no_point_bends_off_its_neighbours(
         got = _bench(fn, config, todo, llc)
         for r in got:
             if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
-                r["cold_ns"] += 2e3 * max(r["context"] - 3500, 0)
+                r["cold_ns"] += 2e3 * max(ops._split(r["context"])[0] - 3500, 0)
         return got
 
     monkeypatch.setattr(ops, "_child", steeper)
@@ -545,6 +595,8 @@ def test_a_plan_halves_decode_attention_until_no_point_bends_off_its_neighbours(
 
     by = {}
     for r in records:
+        if isinstance(r["context"], list):  # a ragged line keeps to the ladder
+            continue
         if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
             by.setdefault(r["shape"], []).append(
                 (r["context"], r["kernels"], r["cold_ns"])
@@ -570,7 +622,7 @@ def test_a_plan_finds_a_step_its_points_hold_on_a_line_where_the_kind_steps_else
         for r in got:
             if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
                 high = 1500e3 if r["shape"] == "decode B=1" else 150e3
-                r["cold_ns"] += high * (r["context"] > 2500)
+                r["cold_ns"] += high * (ops._split(r["context"])[0] > 2500)
         return got
 
     monkeypatch.setattr(ops, "_child", stepped)
@@ -584,11 +636,93 @@ def test_a_plan_finds_a_step_its_points_hold_on_a_line_where_the_kind_steps_else
 
     at = {}
     for r in records:
+        if isinstance(r["context"], list):  # a ragged line keeps to the ladder
+            continue
         if r["op"] == "aiter.attn" and r["shape"].startswith("decode"):
             at.setdefault(r["shape"], set()).add(r["context"])
     assert len(at) > 1
     for shape, contexts in at.items():
         assert {2500, 2501} <= contexts, shape
+    # A ragged line is halved where it bends, not where only its kind steps.
+    ragged = {r["context"][0] for r in records if isinstance(r["context"], list)}
+    assert ragged and 2501 not in ragged
+
+
+def test_a_plan_over_rows_alike_measures_no_ragged_point(bench, tmp_path):
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 3000, True], [1, 3000, True]], 2),
+        ([[1, 12000, True]], 1),
+    )
+
+    records = _plan(bench, tmp_path, population)
+
+    assert not [r for r in records if isinstance(r["context"], list)]
+
+
+@pytest.mark.parametrize(
+    "rows, cut",
+    [
+        ([[1, 1000, True], [1, 4000, True]], None),
+        ([[1, 3000, True], [1, 3000, True]], [[1, 600, True], [1, 416, True]]),
+    ],
+    ids=["planned-ragged", "planned-uniform"],
+)
+def test_a_uniform_decode_point_past_the_pool_refuses_only_past_round_0_of_a_plan_over_ragged_rows(
+    bench, tmp_path, monkeypatch, rows, cut
+):
+    monkeypatch.delenv(ops.RAGGED, raising=False)
+    envs = []
+
+    def child(fn, config, todo, llc):
+        envs.append(os.environ.get(ops.RAGGED))
+        return _bench(fn, config, todo, llc)
+
+    monkeypatch.setattr(ops, "_child", child)
+    _plan(bench, tmp_path, _records(tmp_path / "plan", (rows, 2)))
+    # each measuring process times a point under the environment the plan gave it
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    x = ("self", _t([2, 3], "activation"))
+    neg, gather = (
+        ops.leaves(_graph(_leaf(name, x), layers=1)["region"])
+        for name in (
+            "aten.neg.default",
+            "_c10d_functional.all_gather_into_tensor.default",
+        )
+    )
+
+    def point(env, found):
+        with patch.dict(os.environ, {ops.RAGGED: env} if env else {}):
+            # 38 blocks a row at 600 tokens, 64 in the pool
+            return ops.Stub(_Runner(), 10_000).point(placed, decode(2), 600, found)
+
+    pooled = [[1, 600, True], [1, 416, True]]
+    # Round 0, whose points `_dependent` reads for the kinds that move with
+    # context, cuts its points in either plan.
+    [first] = point(envs[0], neg)
+    assert first["rows"] == pooled
+    env = envs[-1]  # a plan over rows alike measures one round
+    assert set(envs[1:]) <= {env}
+    [record] = point(env, neg)
+    [collective] = point(env, gather)
+    mixed = point(env, neg | gather)
+
+    if cut:
+        assert record["rows"] == cut
+        assert [r["rows"] for r in mixed] == [cut, cut]
+    else:
+        assert record["refused"] == "its rows need more than the pool's 64 KV blocks"
+        # one leaf that is not a collective refuses the point
+        assert all("refused" in r for r in mixed) and len(mixed) == 2
+    # a collective's family is over its message bytes: the pool cuts it either way
+    assert collective["rows"] == pooled
+    # a prefill point past the pool is cut in either plan: 4 blocks a row, 4 in it
+    rows = ops.point_rows(prefill(51, 2), 30, 4, 16, uncut=bool(env))
+    assert rows == [[26, 56, False], [25, 25, False]]
 
 
 @pytest.mark.parametrize(
@@ -1171,3 +1305,41 @@ def test_coverage_traces_a_dpa_tp8_graph_and_reads_it_at_tp1_dp8(tmp_path, monke
         "decode": {"steps": 1, "covered": 0},
         "prefill": {"steps": 1, "covered": 0},
     }
+
+
+def _kinked_bench(fn, config, todo, llc):
+    """`_bench` with the prefill GEMM five times steeper past 150 tokens, one
+    kernel either side."""
+    got = _bench(fn, config, todo, llc)
+    for r in got:
+        if r["op"] == "aiter.gemm" and r["shape"].startswith("prefill"):
+            r["cold_ns"] += 4e3 * max(ops._shape(r["shape"]).tokens - 150, 0)
+    return got
+
+
+def test_coverage_leaves_out_a_step_inside_a_gap_the_fit_declines(
+    bench, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ops, "_child", _kinked_bench)
+    population = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[40, 40, False]], None),
+        ([[150, 150, False]], None),
+        ([[400, 400, False]], None),
+    )
+    records = _plan(bench, tmp_path, population)
+    params = fit_ops.fit(records)
+    fit_ops.held_out(params)
+    # T = 150 reads +67% off 122 and 400, its neighbours along the GEMM's T
+    graded = _records(
+        tmp_path / "graded", ([[120, 120, False]], None), ([[200, 200, False]], None)
+    )
+    store, root, _, _ = bench
+
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
+
+    assert report["by phase"] == {"prefill": {"steps": 2, "covered": 1}}
+    assert report["left out, by leaf kind"] == {"aiter.gemm": {"the fit declined T": 1}}
+    gaps = [d[2:4] for f in params["families"].values() for d in f["declined"]]
+    assert gaps == [[122, 400]]

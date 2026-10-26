@@ -1008,6 +1008,23 @@ def test_the_command_refuses_records_without_one_engine_config_naming_the_field(
     assert not (tmp_path / "law.json").exists()
 
 
+@pytest.mark.parametrize("stated", [False, True], ids=["beside", "--engine"])
+def test_the_command_refuses_a_record_at_decode_context_parallel_width_by_name(
+    tmp_path, stated
+):
+    record = _record(tmp_path / "dp0.jsonl", _steps(6))
+    _engine_file(record, ENGINE | {"decode_context_parallel_size": 2})
+    (tmp_path / "engine.json").write_text(json.dumps(ENGINE))
+    engine = ["--engine", str(tmp_path / "engine.json")] if stated else []
+    where = str(record.with_suffix(".engine.json")) if stated else "the records'"
+    with pytest.raises(ValueError, match=re.escape(where)) as refused:
+        main([str(record), "--out", str(tmp_path / "law.json"), *SPEC, *engine])
+    assert "states decode_context_parallel_size 2, and a step linear law" in str(
+        refused.value
+    )
+    assert not (tmp_path / "law.json").exists()
+
+
 @pytest.mark.parametrize(
     "spelling",
     ["{out}/steps/dp0.jsonl", "dp0.jsonl", "{tmp}/elsewhere/link/dp0.jsonl"],

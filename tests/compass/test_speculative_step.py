@@ -116,7 +116,7 @@ class _Drafting(StepStubBackend):
     def price(self, batch_view):
         cost = super().price(batch_view)
         made = cost.terms[0].provenance
-        return StepCost([*cost.terms, CostTerm("draft", self.draft, made, draft=True)])
+        return StepCost(cost.terms, draft_terms=[CostTerm("draft", self.draft, made)])
 
 
 def _exits(draft, tagged, inputs=1.0):

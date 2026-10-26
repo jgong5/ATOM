@@ -136,7 +136,7 @@ Tasks are cut so each touches one module plus its tests.
 ```
 atom/compass/
   clock/      CA core, grant rule, channel table and path distances, LP registry, both transports
-  detect/     straggler check, stall diagnostic, CI clock-source lint
+  detect/     straggler check, stall diagnostic (the CI clock-source lint lives in tests/compass/)
   runner/     CompassModelRunner - the seam, RPC surface, forward semantics
   backends/   CostBackend interface, StepCost, provenance and method; the step-level and op-level backends
   memory/     device-reading substitution, per-term model
@@ -200,7 +200,7 @@ on anything else, and each ends in an escalation, not a decision.
 | ID | Task | Module | Effort | Hardware |
 |---|---|---|---|---|
 | **P0b.1** | Trace DeepSeek-V4-Pro under `FakeTensorMode` with `--load_dummy empty` at the nightly shape (TP8 with DP-attention, MTP on), with expert parallelism off as the nightly runs it and at EP8. Name every operator with no fake or meta implementation — the FP4 MoE, the CSA indexer, mHC, MORI dispatch/combine at EP8, the MTP draft path are the expected ones — and whether each needs a shape rule only or more. **Answered on #501** | spike → `capture/` | ~200 LOC | CPU container; a clean node only if model construction reaches the driver |
-| **P0b.2** | DP-attention in the fake-model run, expert parallelism off and at EP8: which per-step exchanges the DP group makes (metadata sync, dummy batches for idle ranks, the variable-size gather of the peers' tokens with EP off, the MORI all-to-all at EP8), and whether each is already a classified site in `atom/compass/audit/sync_sites.json` | reading + one CPU run | ~50 LOC | — |
+| **P0b.2** | DP-attention in the fake-model run, expert parallelism off and at EP8: which per-step exchanges the DP group makes (metadata sync, dummy batches for idle ranks, the variable-size gather of the peers' tokens with EP off, the MORI all-to-all at EP8), and whether each is already a classified site in `tests/compass/sync_sites.json` | reading + one CPU run | ~50 LOC | — |
 | **P0b.3** | What the real side needs recorded: per-request timings and the exact launch configuration. The nightly P/D runs of `recipes/mesh/DeepSeek-V4.md` define the configurations, not ground truth: the owner ruled on #503 that the paired runs are re-run on the dedicated MI355X pair. What is left is reading what a run records from the upstream workflow (`.github/workflows/atomesh-benchmark.yaml`) and its bench scripts, so W4.3 records the same | reading | ~0 | — |
 | **P0b.4** | The MI455 inputs: which fields of the `05` machine spec the analytical laws need for DeepSeek-V4-Pro's operator families (matrix-core rate per precision including FP4 and FP8, HBM and LDS bandwidth, the in-node fabric), and for each one a source or an "assumed" mark | reading + owner input | ~0 | — |
 

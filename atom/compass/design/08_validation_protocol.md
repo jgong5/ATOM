@@ -753,6 +753,7 @@ Fail closed. Each of these has a prior incident behind it.
 | an **artifact fingerprint mismatch** | doc 07 D43 |
 | a **gate state** in the artifact disagreeing with the stated configuration | *"a dead gate is worse than no gate"* — a `PRICE_KERNELS` gate read `WORLD_SIZE`, which the engine never sets, so it was false in every worker and the proof was in the artifact: breakdowns present for 164 of 237 entries |
 | **saturation** where scheduling fidelity is being claimed | see below |
+| a real record whose `run.json` names **`aiter_jit_builds`**: grading, the fits and `validate.cost` refuse the whole record | a step may have waited on the compile: about 60 s for an aiter module build, 53.6 s and 56.4 s for a fresh container's first two prefills under Inductor ([#1319](https://github.com/jgong5/ATOM/issues/1319)) |
 | any **refusal**, of any source | the run is a coverage report (D50.1); name every reason |
 
 ### Saturation deserves its own note

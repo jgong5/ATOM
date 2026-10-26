@@ -26,8 +26,8 @@ import pytest
 
 import atom.compass
 import atom.utils.clock
-from atom.compass.detect.clock_source import CORE_ROOTS
-from atom.compass.detect.set_iteration import CORE_SET_ALLOW_LIST, SetIterationLint
+from tests.compass.clock_source import CORE_ROOTS
+from tests.compass.set_iteration import CORE_SET_ALLOW_LIST, SetIterationLint
 
 #: The tree the rule applies to.
 SIMULATED_PATH = os.path.dirname(atom.compass.__file__)
@@ -253,6 +253,9 @@ FORMS_THAT_FIRE = {
     "str": "def f(s: set[str]):\n    return str(s)\n",
     "f-string": 'def f(s: set[str]):\n    return f"{s}"\n',
     "percent": 'def f(s: set[str]):\n    return "%s" % (s,)\n',
+    "print": "def f(s: set[str]):\n    print(s)\n",
+    "log-deferred-%s": 'def f(s: set[str], log):\n    log.info("ready=%s", s)\n',
+    "log-level": 'def f(s: set[str], log):\n    log.log(10, "ready=%s", s)\n',
     "max-key": "def f(s: set[str], cost):\n    return max(s, key=cost)\n",
     "min-key": "def f(s: set[str], cost):\n    return min(s, key=cost)\n",
     "set-literal": "def f():\n    for x in {1, 2}:\n        yield x\n",
@@ -302,6 +305,7 @@ FORMS_THAT_STAY_QUIET = {
     "list-pop": "def f(rows):\n    xs = list(rows)\n    return xs.pop()\n",
     "dict-pop": "def f(d, k):\n    return d.pop(k)\n",
     "str-of-list": "def f(rows):\n    xs = list(rows)\n    return str(xs)\n",
+    "log-of-a-count": 'def f(s: set[str], log):\n    log.info("ready=%d", len(s))\n',
     "rebound": (
         "def f(names):\n"
         "    s = set(names)\n"

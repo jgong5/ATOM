@@ -141,6 +141,21 @@ def test_a_step_a_later_source_answered_is_not_refused_and_its_answer_is_apart(
     assert out["coverage_report"] is False
 
 
+def test_the_summary_counts_each_reason_a_fallback_step_was_declined_for_by_steps(
+    monkeypatch, tmp_path
+):
+    backend = AnalyticalBelow(STAGE1, tokens=40)
+    # Every term of a declined step carries the chain; a step counts once.
+    assert len(backend.price(BatchView((RequestShape(40, 40, False),))).terms) > 1
+    out = summary(monkeypatch, tmp_path, backend, 8, 40, 64)
+
+    assert out["schedule"]["fallback_steps"] == 2
+    assert out["schedule"]["fallback_reasons"] == {
+        "price_list: no entry for this shape": 2,
+        "nearest_key: outside the measured range": 2,
+    }
+
+
 @pytest.mark.parametrize(
     "where,reason",
     [
@@ -202,7 +217,7 @@ def test_a_stub_run_reports_all_its_seconds_declared(monkeypatch, tmp_path):
     assert schedule["seconds_by_method"] == by_method(
         declared={"steps": 2, "fraction_of_predicted_seconds": pytest.approx(1.0)}
     )
-    assert out["schema_version"] == compass_run.SUMMARY_SCHEMA_VERSION == 8
+    assert out["schema_version"] == compass_run.SUMMARY_SCHEMA_VERSION == 10
     assert schedule["refusals"]["count"] == 0
     assert schedule["refusals"]["fraction_of_steps"] == 0.0
     assert out["coverage_report"] is False
@@ -227,3 +242,31 @@ def test_each_server_lp_hands_in_one_file_with_a_section_per_kind(
     assert sorted(engine) == ["memory", "priced", "refusals"]
     assert engine["priced"]["steps"] == 1
     assert frontend == {"refusals": ["executor:j"]}
+
+
+def test_the_summary_counts_every_stall_diagnostic_and_says_how_the_run_ended(
+    monkeypatch, tmp_path
+):
+    run = {
+        "admission_path": "serving",
+        "ipc_s": 0.001,
+        "stream_s": 0.002,
+        "bound_s": 10.0,
+        "clock_endpoint": "inproc:unused",
+        "out_dir": str(tmp_path),
+    }
+    (tmp_path / "run.json").write_text(json.dumps(run))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    authority = compass_run._RecordingAuthority(run)
+    for row in authority.lp_table():
+        authority.on_request(row.lp, "NER", math.inf, [])
+    authority.diagnostics = 1  # what its serve loop counted
+    for lp, printed in (("engine", 2), ("frontend", 0)):
+        monkeypatch.setattr(clock, "_installed", SimpleNamespace(diagnostics=printed))
+        compass_run._hand_in(run, lp, [])
+    hand_ins = compass_run._read_hand_ins(run, tmp_path, wait=False)
+    out = compass_run._summary(run, authority, authority, 1.0, hand_ins, {})
+
+    assert hand_ins["frontend"] == {"refusals": []}
+    assert out["cost"]["diagnostics"] == 1 + 2
+    assert out["schedule"]["ended_by"] == "end_workload"

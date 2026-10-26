@@ -15,6 +15,7 @@ Nothing here touches a driver, a device or a network:
 are exercised without the CPU gate depending on the tree it was staged from.
 """
 
+import dataclasses
 import json
 import pathlib
 import sys
@@ -40,6 +41,7 @@ from atom.compass.artifacts import (
     git_tree_root,
     member_name,
     module_root,
+    provenance,
     roots_for,
 )
 
@@ -82,6 +84,29 @@ GATES = GateState.of(Gate("PRICE_KERNELS", "off", "COMPASS_PRICE_KERNELS"))
 def stanza(produced_by: str = "compass calibrate phase-1b") -> Provenance:
     """A complete stanza: both executed source roots, ATOM's and aiter's."""
     return Provenance(produced_by, "2026-09-22T11:00:00+00:00", (ATOM_ROOT, AITER_ROOT))
+
+
+def _clean(root: SourceRoot) -> SourceRoot:
+    return dataclasses.replace(root, dirty=0) if root.dirty else root
+
+
+@pytest.fixture(autouse=True)
+def clean_checkout(monkeypatch):
+    """This checkout's source roots counted clean wherever a command reads
+    them, so a module importing this fixture publishes and fits on a checkout
+    with uncommitted files; a test that plants its own `roots_for` still wins.
+    `roots_for` looks both resolvers up in `provenance` at call time, so
+    every module's binding of it reads the wrapped pair."""
+    tree, described = provenance.git_tree_root, provenance.git_described_root
+    for target, resolve in (
+        ("artifacts.provenance.git_tree_root", tree),
+        ("artifacts.provenance.git_described_root", described),
+        ("drive.identity.git_tree_root", tree),
+    ):
+        monkeypatch.setattr(
+            f"atom.compass.{target}",
+            lambda *a, _resolve=resolve, **k: _clean(_resolve(*a, **k)),
+        )
 
 
 #: The layout a key states when a test names only its TP width.
@@ -879,3 +904,35 @@ def test_two_source_roots_may_not_share_a_name():
             (ATOM_ROOT, ATOM_ROOT, AITER_ROOT),
         )
     assert "share a name" in str(refused.value)
+
+
+def _publish_from(store: ArtifactStore, atom: SourceRoot):
+    topology = Topology(tp=2)
+    return store.publish(
+        price_key(2),
+        provenance=Provenance(
+            "phase 1b", "2026-09-22T11:00:00+00:00", (atom, AITER_ROOT)
+        ),
+        conditions=CONDITIONS,
+        gates=GATES,
+        topology=topology,
+        members=members_for(topology, "prices", "json"),
+    )
+
+
+def test_a_dirty_source_root_does_not_publish(tmp_path):
+    """A checkout is keyed by its HEAD, which is not what ran with files uncommitted."""
+    store = ArtifactStore(tmp_path)
+    with pytest.raises(ArtifactRefusal) as refused:
+        _publish_from(store, dataclasses.replace(ATOM_ROOT, dirty=2))
+    assert refused.value.rule is Rule.PROVENANCE
+    assert "uncommitted files: atom (2)" in str(refused.value)
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_stamped_root_of_unknown_dirtiness_publishes(tmp_path):
+    stamped = dataclasses.replace(ATOM_ROOT, revision_kind="commit", dirty=None)
+    assert (
+        _publish_from(ArtifactStore(tmp_path), stamped).provenance.source_roots[0]
+        == stamped
+    )

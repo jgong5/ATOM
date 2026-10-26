@@ -113,7 +113,7 @@ async fn releases_are_handled_one_at_a_time_in_order_and_restamped() {
     go.send(()).unwrap();
     assert_eq!(
         request.await.unwrap(),
-        "rojo=00f067aa0ba902b7,compass=a:0.625;s:0 at 0.5"
+        "compass=a:0.625;s:0,rojo=00f067aa0ba902b7 at 0.5"
     );
 
     let (body, turn) = relay.await.unwrap();

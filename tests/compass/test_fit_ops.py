@@ -9,6 +9,7 @@ import json
 import pathlib
 
 import pytest
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 
 from atom.compass import cli, run
 from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, GateState, Key, Kind
@@ -159,7 +160,8 @@ def test_fit_ops_publishes_its_points_key_and_their_held_out_error(measured, tmp
     fields = key("decode B=2", 1024, _leaf(2, 128)).values
     assert got["key"] == {k: v for k, v in fields.items() if k != "point"}
     assert got["report"]["by_op"] == {
-        "decode aiter.gemm": {"held_out": 4, "declined": 2, "on_declined_lines": 4}
+        "decode aiter.gemm": {"held_out": 4, "declined": 2, "declining": 1}
+        | {"median_error": pytest.approx(0.04), "max_error": pytest.approx(0.04)}
     }
     declined = [r["declined"] for r in got["report"]["held_out"] if "declined" in r]
     assert declined == [
@@ -168,7 +170,7 @@ def test_fit_ops_publishes_its_points_key_and_their_held_out_error(measured, tmp
     ]
     (f,) = got["params"]["families"].values()
     assert f["declined"] == [
-        ["B", [1024], "B = 12 launched other kernels than its neighbours"]
+        ["B", [1024], 8, 16, "B = 12 launched other kernels than its neighbours"]
     ]
 
 
@@ -189,7 +191,7 @@ def test_fit_ops_reads_a_plan_run_s_rounds_as_one_directory(measured, tmp_path):
     assert f["brackets"] == [["B", [1024], 2, 8]]
 
 
-def test_a_line_holding_an_error_over_5pct_either_way_is_declined_with_its_reason():
+def test_a_point_off_by_over_5pct_either_way_declines_its_gaps_with_its_reason():
     # held out along B, B = 4 reads -4% at context 1024 and -20% at 2048;
     # along context at B = 2, context 2048 reads +25%
     points = [_point(2, 10e3), _point(4, 12.5e3), _point(8, 16e3)]
@@ -202,8 +204,8 @@ def test_a_line_holding_an_error_over_5pct_either_way_is_declined_with_its_reaso
     (f,) = params["families"].values()
 
     assert f["declined"] == [
-        ["context", [2], "context = 2048 reads +25.0% off its neighbours"],
-        ["B", [2048], "B = 4 reads -20.0% off its neighbours"],
+        ["context", [2], 1024, 3072, "context = 2048 reads +25.0% off its neighbours"],
+        ["B", [2048], 2, 8, "B = 4 reads -20.0% off its neighbours"],
     ]
     assert ops.summary(rows)["decode aiter.gemm"]["max_error"] == pytest.approx(0.04)
 
@@ -229,7 +231,7 @@ def test_fit_ops_holds_out_no_point_between_neighbours_one_apart(
     got = _fit(tmp_path / "fit", tmp_path / "store", d)
 
     (f,) = got["params"]["families"].values()
-    assert [why.split(" off")[0] for _, _, why in f["declined"]] == declined
+    assert [why.split(" off")[0] for *_, why in f["declined"]] == declined
     held = [r["at"] for r in got["report"]["held_out"]]
     assert held == ([[2, 512]] if declined else [])
 
@@ -277,7 +279,7 @@ def test_fit_ops_holds_out_no_collective_point_between_neighbours_one_row_apart(
     got = _fit(tmp_path / "fit", tmp_path / "store", d)
 
     (f,) = got["params"]["families"].values()
-    assert [why.split(" off")[0] for _, _, why in f["declined"]] == declined
+    assert [why.split(" off")[0] for *_, why in f["declined"]] == declined
 
 
 @pytest.mark.parametrize(
@@ -439,3 +441,108 @@ def test_a_line_that_interpolates_records_each_held_out_point_s_bracket(ns, brac
     (f,) = params["families"].values()
 
     assert f["brackets"] == brackets
+
+
+DECLINED = (
+    "aiter.gemm: the fit declined B at context = 1024: "
+    "B = 16 reads -6.5% off its neighbours"
+)
+
+
+@pytest.mark.parametrize(
+    "b, priced",
+    [(3, 3e-6), (10, DECLINED), (16, 17.12e-6), (20, DECLINED), (29, 29e-6)],
+)
+def test_a_point_over_5pct_off_declines_only_the_two_gaps_beside_it(b, priced):
+    # B = 16 reads -6.5% off its neighbours 4 and 28, which read within 5%
+    points = [(2, 2e3), (4, 4e3), (16, 17.12e3), (28, 28e3), (30, 30e3)]
+    params = ops.fit([_point(*p) for p in points])
+    ops.held_out(params)
+    leaf = json.loads(_leaf(b, 128))
+
+    got = ops.PriceList(params).price((leaf, ("decode", None, b, None, 1024, 1024), 0))
+
+    if isinstance(priced, str):
+        assert got.reason == priced
+    else:
+        assert got.seconds == pytest.approx(priced)
+        assert got.provenance.validated is (b != 16)  # inside 2 to 16, 16 to 30
+
+
+GATHER = "_c10d_functional.all_gather_into_tensor.default"
+
+
+def _gathered(rows):
+    """An all-gather of `rows` rows from each of eight ranks, 1024 bytes a row."""
+    x = {"shape": [rows, 64], "stride": [64, 1], "dtype": BF16, "role": "activation"}
+    return {"op": GATHER, "args": {"x": x}, "out": [[8 * rows, 64]]}
+
+
+@pytest.mark.parametrize(
+    "rows, at, priced",
+    [
+        (2, ("decode", None, 2, None, 1024, 1024), 2e-6),
+        (3, ("prefill", 3, 1, None, 0, 0), 3e-6),
+        (
+            8,
+            ("decode", None, 8, None, 1024, 1024),
+            f"{GATHER}: bytes = 8192 is outside the measured 1024 to 4096",
+        ),
+    ],
+)
+def test_a_price_list_prices_a_collective_between_two_measured_sizes(rows, at, priced):
+    # measured at decode widths 1 and 4: 1024 and 4096 bytes, one kernel
+    points = [
+        {"shape": f"decode B={b}", "context": 1024, "op": GATHER, "cold_ns": ns}
+        | {"leaf": bench.signature(_gathered(b)), "kernels": ["ag"]}
+        | {"exchange": bench.exchange(_gathered(b))}
+        for b, ns in ((1, 1e3), (4, 4e3))
+    ]
+    params = ops.fit(points)
+    ops.held_out(params)
+
+    got = ops.PriceList(params).price((_gathered(rows), at, 0))
+
+    if isinstance(priced, str):
+        assert got.reason == priced
+    else:
+        assert got.seconds == pytest.approx(priced)
+
+
+@pytest.mark.parametrize(
+    "mean, priced",
+    [
+        (3000, 57.5e-6),
+        (
+            6400,
+            (
+                "aiter.gemm: at B = 4, at mean = 1000, context = 8000 is outside "
+                "the measured 1024 to 1024"
+            ),
+        ),
+    ],
+)
+def test_a_family_with_ragged_points_leaves_out_a_uniform_point_the_pool_cut(
+    mean, priced
+):
+    # At 8000 tokens the pool cut the uniform point's other three rows to 4000:
+    # its rows hold a mean of 625 permille, not the 1000 its context names.
+    cut = _point(4, 82.5e3, context=8000)
+    cut["rows"] = [[1, 8000, True]] + [[1, 4000, True]] * 3
+    ragged = [_point(4, 20e3 + 100 * m, context=[8000, m]) for m in (250, 500)]
+    params = ops.fit([_point(4, 10e3), *ragged, cut])
+    ops.held_out(params)
+    (f,) = params["families"].values()
+    leaf = json.loads(_leaf(4, 128))
+
+    got = ops.PriceList(params).price((leaf, ("decode", None, 4, None, 8000, mean), 0))
+
+    assert sorted(c for c, *_ in f["points"]) == [
+        [4, 250, 8000],
+        [4, 500, 8000],
+        [4, 1000, 1024],
+    ]
+    if isinstance(priced, str):
+        assert got.reason == priced
+    else:
+        assert got.seconds == pytest.approx(priced)

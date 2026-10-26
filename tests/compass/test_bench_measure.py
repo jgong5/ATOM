@@ -7,7 +7,9 @@ two client runs, and that record's lines published as a `shape_population`.
 The bench is a fake in `Bench`'s place, on the record's engine, whose result
 is the batch's token count in microseconds; run.json's identity is the
 record's, so a measurement states the record's configuration; the GPU checks
-pass and the provenance names planted trees.
+pass and the provenance names planted trees. The after-run GPU check's tests
+run the real bench on `test_bench_engine.py`'s workers, between the real
+checks.
 """
 
 import copy
@@ -16,12 +18,19 @@ import json
 import os
 import re
 import shutil
-from contextlib import nullcontext
+import signal
+import subprocess
+import sys
+import time
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import test_bench_engine
 from test_artifact_store import AITER_ROOT, ATOM_ROOT, CONDITIONS, stanza
+from test_bench_engine import manager  # noqa: F401  the manager fixture
+from test_drive_gpu import FREE, _plant
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
 from test_fit_samples import RUNS, record
 from test_parity_record import _config
@@ -39,9 +48,12 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.step_grid_plan import plan
 from atom.compass.bench import measure, window
+from atom.compass.drive import gpu, serve
+from atom.compass.drive import run as drive_run
 from atom.compass.fit.samples import load
 from atom.compass.parity import read
 from atom.compass.parity.served import served
+from atom.config import Config
 
 
 class Bench:
@@ -79,7 +91,7 @@ def run(tmp_path, monkeypatch, model_dir):  # noqa: F811
     `input`, their requests sent under `sampling`, trace i at session i;
     run.json's identity is `run.identity`."""
     rec = record(tmp_path, monkeypatch)
-    config = _config()
+    config = _config(prefill_context_parallel_size=1)
     config.model, config.trust_remote_code = str(model_dir), False
     config.hf_config = SimpleNamespace(model_type="llama")
     monkeypatch.setattr(measure, "atom_config", lambda atom_args: config)
@@ -566,6 +578,21 @@ def test_a_deployment_above_tensor_parallel_1_refuses_naming_the_skew_issue(run)
     assert Bench.started == []
 
 
+@pytest.mark.parametrize(
+    "name", ["prefill_context_parallel_size", "decode_context_parallel_size"]
+)
+def test_a_context_parallel_width_refuses_over_a_store_that_holds_every_point(
+    run, name
+):
+    named = run.named(run.record)
+    run(str(run.record), "--sample", "all", *named)
+    Bench.started.clear()
+    setattr(run.config, name, 2)
+    with pytest.raises(SystemExit, match=rf"{name} 2: .*no context-parallel width"):
+        run(str(run.record), "--sample", "all", *named)
+    assert Bench.started == []
+
+
 def test_a_line_a_dummy_run_wrote_is_not_measured(run):
     steps = run.record / "steps/dp0.jsonl"
     dummy = {**json.loads(steps.read_text().splitlines()[-1]), "is_dummy_run": True}
@@ -681,3 +708,171 @@ def test_ragged_without_a_replayed_input_refuses(run):
     with pytest.raises(SystemExit, match="--ragged composes from no replayed input"):
         run(*args, *run.named(rec))
     assert Bench.started == []
+
+
+#: A bench worker's child, up once it prints a line. SIGTERM, standing in for
+#: the SIGKILL no CPU process outlives, ends it argv[1] seconds later, or never
+#: when argv[1] is "stays".
+CHILD = """\
+import signal, sys, time
+s = sys.argv[1]
+ends = lambda *a: (time.sleep(float(s)), sys.exit())
+signal.signal(signal.SIGTERM, signal.SIG_IGN if s == "stays" else ends)
+print(flush=True)
+time.sleep(600)
+"""
+
+
+class Leaves(test_bench_engine.Runner):
+    """A worker that starts `CHILD`, writing its PID to `config.child`, and
+    whose exit outlasts the manager's grace, so the manager kills its tree."""
+
+    bench_step = Bench.measure
+
+    def __init__(self, rank, config):
+        super().__init__(rank, config)
+        child = subprocess.Popen(
+            [sys.executable, "-c", CHILD, config.child_exit_s], stdout=subprocess.PIPE
+        )
+        child.stdout.readline()
+        Path(config.child).write_text(str(child.pid))
+
+    def exit(self):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(60)
+
+
+@pytest.fixture
+def leaves(run, manager, monkeypatch):  # noqa: F811
+    """`leaves(exit_s)`: `run`'s arguments for a measure on the real bench, its
+    one worker `Leaves` with a child that takes `exit_s` to exit, between the
+    real GPU checks. The planted rocm-smi lists the child on GPU 7 until it has
+    exited, and the manager's SIGKILL reaches the child as SIGTERM."""
+    child, kill = run.tmp / "child", os.kill
+    config = test_bench_engine._config(eager=True)
+    config.child = str(child)
+    blocks = test_bench_engine.BLOCKS
+    engine = test_bench_engine.engine
+    monkeypatch.setattr(engine, "RUNNER", f"{__name__}.Leaves")
+    monkeypatch.setenv("ATOM_SHUTDOWN_TIMEOUT_S", "1")
+    monkeypatch.setattr(measure, "start_bench", lambda *_: engine.Bench(config, blocks))
+    monkeypatch.setattr(measure, "quiet", gpu.quiet)
+    _plant(run.tmp, monkeypatch, FREE)
+    smi = run.tmp / "bin" / "rocm-smi"
+    listed = (
+        f"p=$(cat {child} 2>/dev/null)\n"
+        "s=$(sed 's/.*) //' /proc/$p/stat 2>/dev/null | cut -d' ' -f1)\n"
+        '[ -n "$s" ] && [ "$s" != Z ] && '
+        "printf 'PID %s is using 1 DRM device(s):\\n7\\n' $p\n"
+    )
+    smi.write_text(
+        smi.read_text().replace("*--showpids*)\n", "*--showpids*)\n" + listed)
+    )
+
+    def sent(pid, sig):
+        ours = (
+            sig == signal.SIGKILL and child.exists() and str(pid) == child.read_text()
+        )
+        kill(pid, signal.SIGTERM if ours else sig)
+
+    monkeypatch.setattr(os, "kill", sent)
+
+    def start(exit_s: str) -> list[str]:
+        config.child_exit_s = exit_s
+        rec = str(run.record)
+        return [rec, "--sample", "1", "--seed", "0", *run.named(rec)]
+
+    yield start
+    with suppress(FileNotFoundError, ProcessLookupError):
+        kill(int(child.read_text()), signal.SIGKILL)
+
+
+def test_the_after_check_waits_for_a_bench_workers_child_that_outlives_its_kill(
+    run, leaves
+):
+    """The named result: the child exits 3 s after the manager's kill."""
+    store = run(*leaves("3"))
+
+    assert (run.tmp / "out" / "gpu_after.txt").read_text() == FREE
+    assert entries(store)
+
+
+def test_a_bench_workers_child_that_stays_fails_the_after_check_naming_it(
+    run, leaves, monkeypatch
+):
+    monkeypatch.setattr(serve, "STOP_GRACE_S", 1)
+
+    with pytest.raises(SystemExit) as refused:
+        run(*leaves("stays"))
+
+    pid = (run.tmp / "child").read_text()
+    assert str(refused.value) == (
+        f"compass measure steps: GPU 7 has PID {pid} on it after the run, so it fails"
+    )
+
+
+class Orphans(Leaves):
+    """A `Leaves` that dies in `bench_step`, sending its child first the SIGTERM
+    a compile pool's workers take from their parent's death, and exits at once."""
+
+    exit = test_bench_engine.Runner.exit
+
+    def __init__(self, rank, config):
+        super().__init__(rank, config)
+        self.child = int(Path(config.child).read_text())
+
+    def bench_step(self, batch):
+        os.kill(self.child, signal.SIGTERM)
+        raise RuntimeError("HIP out of memory")
+
+
+@pytest.fixture
+def orphans(leaves, monkeypatch):
+    monkeypatch.setattr(test_bench_engine.engine, "RUNNER", f"{__name__}.Orphans")
+    return leaves
+
+
+def test_the_after_check_waits_for_the_child_of_a_bench_worker_that_died(run, orphans):
+    """The child exits 10 s after its worker died, later than the after-check
+    would run unwaited."""
+    with pytest.raises(SystemExit) as refused:
+        run(*orphans("10"))
+
+    assert str(refused.value) == (
+        "compass measure steps: a bench worker died, so bench_step got no reply"
+    )
+    assert (run.tmp / "out" / "gpu_after.txt").read_text() == FREE
+
+
+def test_the_child_of_a_bench_worker_that_died_fails_the_after_check_if_it_stays(
+    run, orphans, monkeypatch
+):
+    monkeypatch.setattr(serve, "STOP_GRACE_S", 1)
+
+    with pytest.raises(SystemExit) as refused:
+        run(*orphans("stays"))
+
+    pid = (run.tmp / "child").read_text()
+    assert str(refused.value) == (
+        f"compass measure steps: GPU 7 has PID {pid} on it after the run, so it fails"
+    )
+
+
+def test_run_and_measure_steps_lay_out_dp_attention_alike(
+    monkeypatch, model_dir  # noqa: F811
+):
+    # A step grid bundle is keyed by the config measure steps builds and loaded
+    # under the one compass run builds, from a server's arguments.
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+    atom_args = ["--model", str(model_dir), "-tp", "2", "--enable-dp-attention"]
+    served = drive_run._config([*atom_args, "--timeout-keep-alive", "5"])
+    measured = measure.atom_config(atom_args)
+    for config in (served, measured):
+        pc = config.parallel_config
+        assert (config.tensor_parallel_size, pc.data_parallel_size) == (1, 2)
+    with pytest.raises(SystemExit):
+        measure.atom_config([*atom_args, "--timeout-keep-alive", "5"])

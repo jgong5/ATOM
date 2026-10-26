@@ -206,6 +206,55 @@ def test_preflight_exports_the_hip_devices_of_the_free_rocm_smi_gpus(
     assert "idle and empty: 0 1\nexport HIP_VISIBLE_DEVICES=1,3\n" in flight.stdout
 
 
+def _preflight(tmp_path, monkeypatch, use, vram, rocminfo=""):
+    """Run preflight.sh with `rocm-smi --showuse` / `--showmemuse` reading
+    `use` / `vram` percent on GPUs 0..n-1, and `rocminfo` running `rocminfo`."""
+    _plant(tmp_path, monkeypatch, FREE)
+    bindir = tmp_path / "bin"
+    for name, label, pct in (("use", "GPU use (%)", use), ("mem", "VRAM%", vram)):
+        rows = "".join(f"GPU[{i}]\t\t: {label}: {p}\n" for i, p in enumerate(pct))
+        (bindir / name).write_text(rows)
+    smi = (bindir / "rocm-smi").read_text()
+    smi = smi.replace(
+        "*--showhw*)",
+        f"*--showuse*) cat {bindir}/use;;\n*--showmemuse*) cat {bindir}/mem;;\n"
+        "*--showhw*)",
+    )
+    (bindir / "rocm-smi").write_text(smi)
+    (bindir / "rocminfo").write_text(f"#!/bin/sh\n{rocminfo}\n")
+    return subprocess.run(
+        ["bash", str(PREFLIGHT)], capture_output=True, text=True, check=True
+    )
+
+
+def test_preflight_books_only_gpus_at_zero_use_and_zero_vram(tmp_path, monkeypatch):
+    flight = _preflight(tmp_path, monkeypatch, use=(0, 0, 3), vram=(0, 3, 0))
+    assert "idle and empty: 0\nexport HIP_VISIBLE_DEVICES=0\n" in flight.stdout
+
+
+def test_preflight_reads_use_before_rocminfo_wakes_the_gpus(tmp_path, monkeypatch):
+    wake = f"sed -i 's/: 0$/: 1/' {tmp_path}/bin/use"
+    flight = _preflight(tmp_path, monkeypatch, (0, 0), (0, 0), rocminfo=wake)
+    assert "GPU[1]\t\t: GPU use (%): 0\n" in flight.stdout
+    assert "idle and empty: 0 1\n" in flight.stdout
+
+
+def test_a_process_exiting_mid_census_prints_nothing(tmp_path, monkeypatch):
+    # The first census read kills a process the glob already listed and waits
+    # (up to 5 s) for its /proc entry to go.
+    env = tmp_path / "env.sh"
+    env.write_text(
+        "unset BASH_ENV; sleep 60 & victim=$!\n"
+        'read() { if [ -n "$victim" ]; then kill $victim; n=0\n'
+        "  while [ -e /proc/$victim ] && [ $((n += 1)) -le 500 ]; do sleep 0.01; done\n"
+        '  victim=; fi; builtin read "$@"; }\n'
+    )
+    monkeypatch.setenv("BASH_ENV", str(env))
+    flight = _preflight(tmp_path, monkeypatch, (0,), (0,))
+    assert "processes visible: " in flight.stdout
+    assert "No such file" not in flight.stderr, flight.stderr
+
+
 def _kfd(tmp_path, monkeypatch, gpu, vram, table=TEN):
     """A KFD tree of two CPU nodes and ten GPU nodes, in which PID 3362894,
     on no DRM device in LISTING, holds `vram` bytes of the `gpu`-th GPU node

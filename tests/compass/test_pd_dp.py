@@ -73,12 +73,13 @@ def run_pd_dp(out: Path, seed: str, form: str, sides=None) -> dict:
             for side, n in (("PREFILL", p), ("DECODE", d))
         }
     out.mkdir()
-    # The write requests take p * d ports from KV_WRITE_REQ_PORT, which may
-    # reach another drawn port or one another process holds: draw all of
-    # them again then.
-    kv = "KV_WRITE_REQ_PORT"
+    # Each side's DP master port too, or a second run on this host network
+    # finds pd_sim.sh's default taken. The write requests take p * d ports
+    # from KV_WRITE_REQ_PORT, which may reach another drawn port or one
+    # another process holds: draw all of them again then.
+    kv, names = "KV_WRITE_REQ_PORT", (*PORTS, "PREFILL_DP_PORT", "DECODE_DP_PORT")
     while True:
-        ports = dict(zip(PORTS, _free_ports(len(PORTS))))
+        ports = dict(zip(names, _free_ports(len(names))))
         block = range(ports[kv], ports[kv] + p * d)
         others = {port for n, port in ports.items() if n != kv}
         if not others & set(block) and all(map(_bound, block)):

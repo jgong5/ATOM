@@ -30,7 +30,6 @@ import hashlib
 import json
 from collections import Counter
 from pathlib import Path
-from types import SimpleNamespace
 
 from atom.compass import run as compass_run
 from atom.compass.artifacts import (
@@ -58,16 +57,7 @@ def main(argv: list[str]) -> None:
     cut = argv.index("--") if "--" in argv else len(argv)
     args = _parser().parse_args(argv[:cut])
     atom_args = argv[cut + 1 :]
-    transfer = runfile._engine_args(atom_args).kv_transfer_config
-    side = compass_run._pd_side(
-        SimpleNamespace(kv_transfer_config=json.loads(transfer))
-    )
-    if side is not None:
-        raise ValueError(
-            f"--kv-transfer-config {transfer} makes this a "
-            f"{'prefill' if side == 'P' else 'decode'} instance, which shares a "
-            "clock with its peer; trace steps starts one aggregated instance"
-        )
+    runfile.pd_side(atom_args, refuse=True)
     run = runfile.build(args, atom_args)
     serve.serve(atom_args, args.out, run=run)
     key = publish(args.out, run, " ".join([*PROG.split(), *argv]))

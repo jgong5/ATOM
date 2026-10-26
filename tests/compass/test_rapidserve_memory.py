@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 import test_measure_memory
 import torch
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_measure_memory import MACHINE, a_start, started
 from test_memory_readings import READINGS, STACK, publish_readings
 from test_rapidserve_runner_config import _config
@@ -118,7 +119,7 @@ def test_decode_writes_its_readings_beside_prefills(tmp_path, monkeypatch, decod
     runner.rank, runner.config = 0, deployment(tmp_path).config
     vars(runner.config).update(enable_rapidserve=True, disagg_is_decode=decode)
     runner._read = dict.fromkeys(
-        ["total", "non_torch", "loaded", "weights", "current", "peak"], 0
+        ["total", "non_torch", "loaded", "weights", "parameters", "current", "peak"], 0
     ) | {"warmup_tokens": 0, "num_kvcache_blocks": 1}
     out = tmp_path / "out"
     out.mkdir()

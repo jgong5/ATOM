@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_fit_ops import measured  # noqa: F401, a fixture
 from test_memory_check import GIB, _log
 from test_memory_readings import DOCUMENT
@@ -396,6 +397,25 @@ def test_the_readers_it_reaches_refuse_a_malformed_file_naming_it(tmp_path, read
         reader(path)
 
 
+def test_a_jsonl_string_holding_a_unicode_line_separator_is_read_whole(tmp_path):
+    # aiperf's orjson writes U+2028, U+2029 and U+0085 inside a string unescaped.
+    path = tmp_path / "profile_export.jsonl"
+    path.write_text('{"error": "x\u2028y\u2029z\x85"}\n{}\n')
+
+    assert json_file.read_jsonl(path) == [{"error": "x\u2028y\u2029z\x85"}, {}]
+
+
+@pytest.mark.parametrize("line", [b"\x001", b"\x00" * 6])
+def test_a_jsonl_line_led_by_a_nul_byte_refuses_naming_its_path(tmp_path, line):
+    # json.loads on bytes would read a NUL-led line as UTF-16 or UTF-32.
+    path = tmp_path / "profile_export.jsonl"
+    path.write_bytes(b'{"a": 1}\n' + line + b"\n")
+
+    named = f"^{re.escape(str(path))} is not JSON: .*: line 2 "
+    with pytest.raises(ValueError, match=named):
+        json_file.read_jsonl(path)
+
+
 @pytest.mark.parametrize(
     "command, runs",
     [
@@ -539,6 +559,32 @@ def test_runs_record_and_run_wrote_at_another_concurrency_are_not_one_cell(
     concurrency = r"\{'phases.profiling.concurrency': \{.*real1': 16, .*\}\}$"
     with pytest.raises(ValueError, match=f"given different arguments: {concurrency}"):
         main([str(tmp_path / "c4")])
+
+
+@pytest.mark.parametrize("finishing", ["real1", "step_linear"])
+def test_a_cctraces_sim_run_still_finishing_refuses_naming_it(
+    capsys, tmp_path, finishing
+):
+    """`cctraces_sim.sh` writes its client run's export after aiperf's,
+    once its server has left."""
+    _rows(capsys, tmp_path)
+    cell = tmp_path / "c4"
+    stated = {d: (d / "run.json").read_text() for d in cell.iterdir()}
+    _as_recorded(cell)
+    for d, run in stated.items():
+        (d / "run.json").write_text(run)
+    assert _graded(capsys, cell)["cell", "verdict"] == ["3 real runs", "graded"]
+    (cell / finishing / CLIENT_RUN).unlink()
+
+    validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
+    done = subprocess.run(validate, capture_output=True, text=True, check=False)
+
+    held = sorted(str(d) for d in cell.iterdir() if d.name != finishing)
+    refusal = (
+        f"['{cell / finishing}'] hold no {CLIENT_RUN} and {held} do; "
+        "a cctraces_sim.sh run still finishing is not graded\n"
+    )
+    assert (done.returncode, done.stderr) == (1, refusal)
 
 
 #: A workload as `cctraces_sim.sh` and `client.sh` state it.
@@ -692,6 +738,24 @@ def test_the_steps_extrapolated_or_priced_by_a_fallback_are_stated_and_graded(
     assert rows["cell", "verdict"] == ["3 real runs", "graded"]
     assert rows["summary step_linear", "extrapolated steps"] == ["3 of 20", "not gated"]
     assert rows["summary step_linear", "fallback steps"] == ["2 of 20", "not gated"]
+
+
+def test_the_fallback_row_lists_each_reason_with_its_steps(capsys, tmp_path):
+    _rows(capsys, tmp_path)
+    law = tmp_path / "c4" / "step_linear"
+    summary = json.loads((law / "summary.json").read_text())
+    reasons = {"step-grid: no measurement at B=2": 2, "step-grid: B is below": 1}
+    summary["schedule"].update(fallback_steps=3, fallback_reasons=reasons)
+    (law / "summary.json").write_text(json.dumps(summary))
+
+    main([str(tmp_path / "c4")])
+    out = capsys.readouterr().out.splitlines()
+    rows = {tuple(r.split(" | ")[1:3]): r.split(" | ")[3:] for r in out[1:]}
+
+    assert rows["summary step_linear", "fallback steps"] == [
+        f"3 of 20; reasons {json.dumps(reasons)}",
+        "not gated",
+    ]
 
 
 def test_a_refused_cost_row_names_its_reasons(capsys, tmp_path):
@@ -884,12 +948,6 @@ def test_an_op_graph_cell_grades_with_its_method_shares_term_gaps_and_warm_over_
         "not gated",
     ]
     assert rows["warm over cold", ATTENTION][0] == "0 of 1 points timed warm"
-    # A run file that composes the step roofline below the graph falls back.
-    run["run_file"]["step_roofline"] = True
-    (sim / "run.json").write_text(json.dumps(run))
-    rows = _graded(capsys, cell)
-    assert rows["cost real0", "fallback prefill tokens 0-512"][0] == value
-    assert ("cost real0", "refused prefill tokens 0-512") not in rows
 
 
 def test_cost_rows_gate_every_graded_step_and_print_the_breakdown_not_gated(

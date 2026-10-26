@@ -9,9 +9,11 @@ under that file's deployment read in another ATOM tree, and its run summary
 records the bundle's digest. The bundle's grid measures each real step
 at the planted law's price on that step's own node, its residual's factor is
 one, and its held-out hull holds every step, so the grid prices each real step
-as the law does.
+as the law does. A step the grid declines is priced by the step roofline below
+it, on planted modules in place of the meta build of the run's ATOM arguments.
 """
 
+import copy
 import hashlib
 import json
 import re
@@ -19,9 +21,13 @@ import re
 import pytest
 from test_artifact_invalidation import moved
 from test_backend_step_grid import fitted, linear, point
+from test_backend_step_roofline import ROOFLINE, STACK
+from test_cctraces_sim_compass_run import (
+    test_a_compass_run_run_file_ends_the_cell_with_its_result_line as cctraces_cell,
+)
 from test_memory_readings import DOCUMENT
 from test_run_step_grid import BOUNDS, deployment, publish, readings
-from test_validate_cost import LAW, _record, _steps
+from test_validate_cost import LAW, _price, _record, _steps
 from test_validate_main import _as_recorded, _graded, _rows
 
 from atom.compass.artifacts import ArtifactRefusal, Axis
@@ -35,14 +41,58 @@ from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_grid import coordinates
 from atom.compass.backends.step_grid_fit import VALUE
 from atom.compass.backends.step_grid_residual import Residual
+from atom.compass.backends.step_roofline import (
+    Module,
+    StepFallbackBackend,
+    StepRooflineBackend,
+)
 from atom.compass.drive import run as drive_run
 from atom.compass.run import step_grid
+from atom.compass.spec import MachineSpec
+from atom.compass.validate import __main__ as validate_main
 from atom.compass.validate.__main__ import main
 from atom.compass.validate.cost import cost_accuracy, declined_text
 
 ATOM_ARGS = ["--model", "planted", "--max-model-len", "2048"]
 # The grid's reason for a decode step at context c + 1 whose node holds no point.
 NO_POINT = "step-grid: the decode rung 1 cell has no measurement at B=1, c={0}"
+#: The fields the roofline reads for a GEMM.
+READ = (
+    "device.kernel_floor_s",
+    "device.memory.bandwidth_curve",
+    "device.compute.bf16_flops",
+    "device.compute.derate.bf16",
+)
+#: Decode step 15, which reads N_KV = 27000.
+STEP_15 = BatchView(
+    (RequestShape(1, 27000, True),), capture_rung=1, produces_output=True
+)
+
+
+def _spec(assumed=()):
+    """A spec whose every field is a datasheet's but `assumed`, at a bandwidth
+    that prices `STACK` on step 15 within `WARM_FACTOR` of its real seconds."""
+    document = copy.deepcopy(ROOFLINE)
+    document["device"]["memory"]["bandwidth_curve"] = [[1, 1e10], [2**40, 1e10]]
+    document["provenance"]["origin"] = "mixed" if assumed else "datasheet"
+    if assumed:
+        document["provenance"]["origins"] = {
+            p: {"origin": "assumed" if p in assumed else "datasheet"} for p in READ
+        }
+    return document
+
+
+def _planted(monkeypatch) -> list:
+    """Plant `STACK` as the modules of every meta build grading asks for, and
+    return the ATOM arguments each build is asked for."""
+    asked = []
+
+    def planted(args, machine):
+        asked.append(args)
+        return STACK
+
+    monkeypatch.setattr(validate_main, "_modules", planted, raising=False)
+    return asked
 
 
 def _box(n):
@@ -97,16 +147,26 @@ def _bundle(steps, missing=()):
     return {"grid": grid, "residual": residual, "bounds": BOUNDS}
 
 
-def _as_grid(tmp_path, monkeypatch, missing=(), digest=None, parallel=None, **key):
+def _as_grid(
+    tmp_path,
+    monkeypatch,
+    missing=(),
+    digest=None,
+    parallel=None,
+    machine=DOCUMENT,
+    argv=None,
+    **key,
+):
     """`tmp_path`'s cell with its simulated run moved to `step_grid/` over
     `_bundle`, published under the deployment's readings in another ATOM tree,
     and with `parallel` its entry also restates that key field, which this
     tree's keys no longer have, as one published before they dropped it does:
     a `compass run --step-grid` directory whose ATOM arguments resolve to the
-    deployment, or a `cctraces_sim.sh` one, whose run.json is the run file. Its
-    run file names the bundle at `key`'s fields over the entry's, and its
-    summary records `digest`, the bundle's when None. The configs a grading
-    resolves are returned."""
+    deployment, or a `cctraces_sim.sh` one, whose run.json is the run file,
+    with `argv` its argv when given. Its run file names the bundle at `key`'s
+    fields over the entry's and `machine` as its spec, and its summary records
+    `digest`, the bundle's when None. The configs a grading resolves are
+    returned."""
     r = deployment(tmp_path)
     there = moved(readings(r), Axis.ATOM_SRC)
     entry = publish(tmp_path, r, member=_bundle(_steps(), missing), conditions=there)
@@ -125,10 +185,11 @@ def _as_grid(tmp_path, monkeypatch, missing=(), digest=None, parallel=None, **ke
     grid = {"step_grid": {"store": str(tmp_path / "store"), **document["key"], **key}}
     if "format_version" in run:
         run["argv"] = ["-c", "run", "--step-grid", "planted", "--", *ATOM_ARGS]
-        run["run_file"] = grid | {"host": {"laws": {}}, "machine": DOCUMENT}
+        run["run_file"] = grid | {"host": {"laws": {}}, "machine": machine}
         run["coverage"] = {"inputs": ["planted"], "uncovered": []}
     else:
         run = {"workload": run["workload"], "host": run["host"], **grid}
+        run |= {"machine": machine} | ({"argv": argv} if argv else {})
     (sim / "run.json").write_text(json.dumps(run))
     summary = json.loads((sim / "summary.json").read_text())
     digest = digest or f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
@@ -160,21 +221,87 @@ def test_a_step_grid_cell_grades_every_row_the_step_linear_cell_does(
     assert rows["summary step_grid", "refusals"][1] == "none"
 
 
-def test_a_real_step_the_grid_declines_is_counted_apart_as_a_fallback(
-    capsys, tmp_path, monkeypatch
+def _decode_row(real_s, priced_s) -> str:
+    """A decode cost row's figures over the steps of `real_s` and `priced_s`."""
+    real, priced = sum(real_s), sum(priced_s)
+    return (
+        f"{len(real_s)} steps, real {real:.2f} s, priced {priced:.2f} s;"
+        f" on totals {priced / real - 1:+.2%}"
+    )
+
+
+@pytest.mark.parametrize("assumed", [False, True], ids=["analytical", "declared"])
+def test_a_real_step_the_grid_declines_is_priced_by_the_roofline_below_it(
+    capsys, tmp_path, monkeypatch, assumed
 ):
+    """Graded at the roofline's price, or apart when the bandwidth it read is
+    assumed, and counted as a fallback with the grid's reason either way."""
     _rows(capsys, tmp_path)
     _as_recorded(tmp_path / "c4")
     # Decode step 15's node holds no point: the grid refuses that step alone.
-    _as_grid(tmp_path, monkeypatch, missing={15})
+    stated = ("device.memory.bandwidth_curve",) if assumed else ()
+    _as_grid(tmp_path, monkeypatch, missing={15}, machine=_spec(stated))
+    asked = _planted(monkeypatch)
 
     rows = _graded(capsys, tmp_path / "c4")
+    decode = [_price(r) for r, rung in _steps() if rung]
+    roofline = StepRooflineBackend(MachineSpec.from_mapping(_spec(stated)), STACK)
+    roofline = roofline.price(STEP_15).seconds
     for real in ("real0", "real1", "real2"):
         value = rows[f"cost {real}", "fallback decode rung 1"][0]
         steps, value = value.split(", ", 1)
         assert steps == "1 steps" and value.startswith("real ")
         assert value.endswith(f'; reasons {{"{NO_POINT.format(26999)}": 1}}')
-        assert rows[f"cost {real}", "decode validated"][0].startswith("9 steps")
+        assert (f"cost {real}", "refused decode rung 1") not in rows
+        graded = rows[f"cost {real}", "decode graded"][0]
+        if assumed:
+            assert graded.startswith("9 steps")
+            assert rows[f"cost {real}", "decode declared"][0].startswith(
+                _decode_row([decode[5]], [roofline])
+            )
+        else:
+            priced = decode[:5] + [roofline] + decode[6:]
+            assert graded.startswith(_decode_row(decode, priced))
+            assert (f"cost {real}", "decode declared") not in rows
+    # Built once for the cell, from the ATOM arguments its run served.
+    assert asked == [ATOM_ARGS]
+
+
+def test_a_cctraces_sim_cell_prices_a_declined_step_from_its_run_jsons_argv(
+    capsys, tmp_path, monkeypatch
+):
+    script = tmp_path / "script"
+    script.mkdir()
+    monkeypatch.setenv("SERVER_ARGS", "--max-model-len  2048")
+    cctraces_cell(script)
+    argv = json.loads((script / "cell" / "run.json").read_text())["argv"]
+    assert argv == ["--", "--model", str(script), "--max-model-len", "2048"]
+    _rows(capsys, tmp_path)
+    _as_grid(tmp_path, monkeypatch, missing={15}, machine=_spec(), argv=argv)
+    asked = _planted(monkeypatch)
+
+    rows = _graded(capsys, tmp_path / "c4")
+
+    assert rows["cost real0", "decode graded"][0].startswith("10 steps")
+    assert asked == [argv[1:]]
+
+
+def test_a_step_the_grid_declines_in_a_cell_naming_no_atom_arguments_refuses_it(
+    capsys, tmp_path, monkeypatch
+):
+    _rows(capsys, tmp_path)
+    _as_grid(tmp_path, monkeypatch, missing={15}, machine=_spec())
+
+    named = "run.json names no ATOM arguments after -- in its argv; the step roofline"
+    with pytest.raises(ValueError, match=named):
+        main([str(tmp_path / "c4")])
+
+
+def _below(member, modules=STACK):
+    """The grid of `member` with the step roofline of `modules` below it."""
+    grid = StepGridBackend(StepGrid(member["grid"]), Residual(member["residual"]), "b")
+    roofline = StepRooflineBackend(MachineSpec.from_mapping(_spec()), modules)
+    return StepFallbackBackend(grid, roofline)
 
 
 def test_a_fallback_row_names_its_most_frequent_reasons_and_counts_the_rest(tmp_path):
@@ -183,10 +310,9 @@ def test_a_fallback_row_names_its_most_frequent_reasons_and_counts_the_rest(tmp_
     frequent first."""
     steps = _steps()
     member = _bundle(steps, missing={12, 13, 14, 15})
-    grid = StepGridBackend(StepGrid(member["grid"]), Residual(member["residual"]), "b")
     record = _record(tmp_path / "steps", steps + [steps[15]] * 2)
 
-    (row,) = cost_accuracy(record, grid)["fallback"].values()
+    (row,) = cost_accuracy(record, _below(member))["fallback"].values()
 
     assert row["steps"] == 6
     reasons = {
@@ -196,22 +322,27 @@ def test_a_fallback_row_names_its_most_frequent_reasons_and_counts_the_rest(tmp_
     assert declined_text(row).endswith(f"; reasons {json.dumps(reasons)} and 1 more")
 
 
-def test_a_step_the_grid_declines_is_a_fallback_and_one_a_law_declines_refused(
+def test_a_step_the_roofline_answers_is_a_fallback_and_one_none_answers_refused(
     tmp_path,
 ):
     """A run prices a step the grid declines by the step roofline below it; a
-    graded run has nothing below a law."""
+    bare grid or a law has nothing below it. The roofline answers with a term per
+    module kind, each carrying the grid's decline, which the row names once."""
     member = _bundle(_steps(), missing={15})
     grid = StepGridBackend(StepGrid(member["grid"]), Residual(member["residual"]), "b")
     record = _record(tmp_path / "steps", _steps())
 
     by_grid = cost_accuracy(record, grid)
+    two_kinds = STACK + [Module("norm", "norm", (4096,))]
+    below = cost_accuracy(record, _below(member, two_kinds))
     by_law = cost_accuracy(record, {**LAW, "decode": {}})
 
     assert by_grid["backend"] == grid.describe()
     assert by_law["backend"] == "planted"
-    assert by_grid["refused"] == by_law["fallback"] == {}
-    assert by_grid["fallback"]["decode rung 1"]["steps"] == 1
+    assert by_grid["fallback"] == below["refused"] == by_law["fallback"] == {}
+    assert by_grid["refused"] == below["fallback"]
+    assert below["fallback"]["decode rung 1"]["steps"] == 1
+    assert below["graded"]["decode"]["steps"] == 10
     assert by_law["refused"]["decode rung 1"]["steps"] == 10
 
 
@@ -342,6 +473,10 @@ def test_a_real_step_past_the_residuals_hull_is_priced_unvalidated_and_counted(
         _record(tmp_path / "steps", _steps()), StepGridBackend(grid, residual, "b")
     )
 
-    assert (report["extrapolated"], report["fallback"]) == (8, {})
+    assert (report["extrapolated"], report["fallback"], report["refused"]) == (
+        8,
+        {},
+        {},
+    )
     assert report["unvalidated"]["decode"]["steps"] == 8
     assert report["validated"]["decode"]["steps"] == 2

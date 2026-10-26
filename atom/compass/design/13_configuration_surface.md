@@ -175,11 +175,13 @@ acceptance run** (`07` D42).
 One entry with subcommands: the `compass` console script, whose module is
 `atom/compass/cli.py`, registered in `pyproject.toml`. A verb with two halves takes `steps`
 or `ops`: the steps half is the step-level backends', built for stage 2 (`16` S2.7); the ops
-half is the op-level backend's, built by stage 3d (`16` Stage 3d). Each command runs one
-of `07` D38's phases or fits what a phase measured.
+half is the op-level backend's, built by stage 3d (`16` Stage 3d). Each command but
+`project` runs one of `07` D38's phases or fits what a phase measured; `project` prices
+real runs' steps on a device none of them ran on (`08` D50.2).
 
 **Users reach Compass only through these commands.** What developers use to check its
 quality stays outside the CLI: grading (`python -m atom.compass.validate`, `08`), the
+analytical bound check (`python -m atom.compass.validate.bound`, `08` D50.2), the
 per-term memory check (`python -m atom.compass.memory.check`, `03` D16), and the machine
 specs, which developers maintain, one per supported machine (`scripts/compass/machines/`),
 with the `spec` package and per-machine scripts (`05` D26). A user passes one by
@@ -210,6 +212,8 @@ compass fit host       RECORD... --client-run RECORD EXPORT... --machine M \
 compass fit ops        MEASURED... --out D --store S
 compass run            <backend> --machine M  --out D --store S -- <ATOM args>
 compass run            --join RUN_FILE        --out D -- <ATOM args>
+compass project        --model MODEL [--tp N] --machine M --store S RECORD... \
+                       [-- RECORD <ATOM args>]...
 
 <backend>   one of --step-linear KEY, --step-stub FILE, --step-grid KEY, --op-graph; --step-linear
             repeats, one KEY per engine config, as --host-laws does (#973 ruling)
@@ -234,6 +238,7 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
 | `fit host` | from real runs | none | the machine spec; `record` directories only, each with the exports of the client runs its server served | `--store`: `host_laws`, with its report |
 | `fit ops` | from 1b's measurements | none | `measure ops` `--out` directories, whose `op_measurement` entries it reads from `--store` | `--store`: a `price_list`, interpolating only between same-kernel neighbours |
 | `run` | a simulated serve | none | a backend, the machine spec, the configuration's `memory_readings`, ATOM's arguments; the requests clients send | `--out`: the step record with its cost lines, the step table, the run summary, `run.json` with the run file and what grading reads (below), logs |
+| `project` | none: real runs' steps priced on another device (`08` D50.2) | none | the machine spec; record directories, each under the ATOM arguments after `--` in its `run.json`'s command line, less the server's and `--model`, or, for a `run.json` naming none, those in its own `-- RECORD` group; the `op_graph`s `--store` holds for the spec's arch | `--store`: one `projection`, keyed as `07` D41 states |
 
 **Shared by every command:**
 
@@ -348,7 +353,10 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
 
 - **`record`** runs at any TP and DP width, one record per DP rank. `run.json`'s `engine`
   entry holds the engine's bounds: the KV block count, block size and ladder,
-  `max_num_seqs`, `max_num_batched_tokens` and `max_model_len`. `record` takes no memory
+  `max_num_seqs`, `max_num_batched_tokens` and `max_model_len`. Its `aiter_jit_builds`
+  names each JIT compile, aiter's, FlyDSL's, Triton's or Inductor's, outside ATOM's
+  per-start compile cache, that the server ran or began after `/health` first answered
+  (`atom/compass/drive/aiter_jit.py`), and is absent when there was none. `record` takes no memory
   readings; `measure memory` does. `--host` binds an address other than 127.0.0.1, one a
   router on another node reaches. Steps are timed unprofiled; op times come only from a
   separate profiled pass (`--profile-ops`, ops half), which splits a step and never prices
@@ -399,7 +407,7 @@ was built, and an entry asked for one refuses, naming where its work went.
 | Deprecated | Where its work went |
 |---|---|
 | `compass plan` | Nowhere as one command (`07` D37). The step grid's planning and coverage check sit beside its backend (`17` D98, D99): `measure steps --grid` runs the planner over a `shape_population`, and `run --coverage` calls the check before the run starts |
-| `compass validate` | Grading stays `python -m atom.compass.validate` (`08`), outside the CLI, and decides whether a run is gradeable from what `run.json` records |
+| `compass validate` | Grading stays `python -m atom.compass.validate` (`08`), outside the CLI, and decides whether a run is gradeable from what `run.json` records; the analytical bound check is `python -m atom.compass.validate.bound` (`08` D50.2), and a projection `compass project` |
 | `compass explain`, `compass probe`, `compass spec` | Machine specs are developers', one per supported machine, maintained with the `spec` package (`05` D26) and per-machine scripts such as `scripts/compass/mi308x_spec.py`; a user passes one by `--machine` |
 | `compass measure collectives` | `measure ops` (`07` D40) |
 | `compass discover` | renamed `trace steps` |

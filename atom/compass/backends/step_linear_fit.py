@@ -48,8 +48,8 @@ proportion to `tokens` on every sample (equal, or a decode under MTP, where
 each row computes its drafts too) gets zero. Two keys refuse. The law and the
 host key state the `--machine-spec` digest, which a run's spec must match, and
 the host key's `engine` is the law's `engine_config`. A segment outside `HOST_SEGMENTS` is
-fitted for a kind whose samples carry it: `W_inputs`, on an MTP record, and
-`W_recv`, on a later pipeline stage's. A forward whose `W_launch` its kind's
+fitted for a kind whose samples carry it: `W_inputs` and `L_mtp`, on an MTP
+record, and `W_recv`, on a later pipeline stage's. A forward whose `W_launch` its kind's
 solve drops above the law paid a first-use JIT compile (`_jit`): it and the
 forward after it, whose period takes up the stall, are left out of every host
 law; the report lists the JIT forwards per run under `jit_steps`.
@@ -76,6 +76,11 @@ under the law's `draft`; it holds no `held_out`. A step with a propose label
 (`step_labels`) is fitted there on its draft label less that label, the
 draft-KV pass a middle chunk runs too, and left out when nothing remains; the
 propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`.
+A decode's draft-KV label fits the draft law's `draft_kv` vector alike. An
+output prefill's fits the draft law's prefill vector in place of its draft
+label, which, all after `forward_done_event`, fits the `propose` vector, and
+sets the draft law's `output_prefill_kv`. The target's vectors fit the device
+label less the draft-KV label.
 On an MTP record both prefill vectors, the target's and the draft's, add
 `seqs` and `out` (`StepLinearLaw`).
 
@@ -130,6 +135,7 @@ from atom.compass.backends.step_linear import (
 )
 
 FORMS = ("base", "history", "shared")
+CONTEXT_PARALLEL = ("prefill_context_parallel_size", "decode_context_parallel_size")
 MAD_K = 3.5
 #: A relative residual this small is never an outlier, however tight the rest.
 MAD_FLOOR = 0.01
@@ -254,7 +260,7 @@ def fit_host(samples) -> tuple[dict, dict]:
         for segment in HOST_SEGMENTS[: 3 if kind == "middle" else 4] + tuple(extra):
             members = [r for r in rows if r[:2] == (kind, segment) and r[3] > 0]
             x = np.array([r[2] for r in members], dtype=np.float64).reshape(-1, 3)
-            width = 2 if np.linalg.matrix_rank(x[:, 1:]) < 2 else 3
+            width = 3 if len(x) and np.linalg.matrix_rank(x[:, 1:]) == 2 else 2
             if width == 2:
                 x[:, 2] = 0.0
             try:
@@ -520,6 +526,15 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
 
     form, dp = _options(options)
     serial = _serial(samples, options)
+    kvs = [s for s in samples if s.draft_kv_s is not None and not s.view.prefill]
+    samples = [
+        (
+            s
+            if s.draft_kv_s is None
+            else dataclasses.replace(s, device_s=s.device_s - s.draft_kv_s)
+        )
+        for s in samples
+    ]
     runs = _runs(samples, dp)
     groups, cut, spread = [], {"warm": 0, "warm_s": 0.0}, []
     for i, run in enumerate(runs.values()):
@@ -639,23 +654,43 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     }
     drafts = [
         dataclasses.replace(
-            s, device_s=s.draft_s - (s.propose_s or 0.0), draft_s=None, propose_s=None
+            s,
+            device_s=_draft_kv(s),
+            draft_s=None,
+            propose_s=None,
+            draft_kv_s=None,
         )
         for s in samples
-        if s.draft_s is not None and s.draft_s > (s.propose_s or 0.0)
+        if s.draft_s is not None and _draft_kv(s) > 0
     ]
     if drafts:
         law["draft"] = fit(drafts, options, seed, draft=True)[0]
-        if proposes := [s for s in samples if s.propose_s is not None]:
+        if proposes := [
+            s if s.draft_kv_s is None else dataclasses.replace(s, propose_s=s.draft_s)
+            for s in samples
+            if s.propose_s is not None
+        ]:
             law["draft"]["propose"] = _propose(proposes)
+        if kvs:
+            law["draft"]["draft_kv"] = _propose(kvs, "draft_kv_s")
+        if any(s.view.prefill and s.draft_kv_s is not None for s in samples):
+            law["draft"]["output_prefill_kv"] = True
     return law, report
 
 
-def _propose(samples) -> dict:
-    """The draft law's `propose` vector over `samples`' propose labels, on
-    `PROPOSE`, solved and hulled as a step vector is."""
+def _draft_kv(s) -> float:
+    """The draft prefill vector's label of `s`: an output prefill's draft-KV
+    label, else its draft label less any propose label."""
+    if s.view.prefill and s.draft_kv_s is not None:
+        return s.draft_kv_s
+    return s.draft_s - (s.propose_s or 0.0)
+
+
+def _propose(samples, label: str = "propose_s") -> dict:
+    """The draft law's `propose` vector over `samples`' propose labels, or
+    another `label`, on `PROPOSE`, solved and hulled as a step vector is."""
     x = np.array([(1, len(s.view.requests)) for s in samples], dtype=np.float64)
-    s = _solve(x, np.array([s.propose_s for s in samples]), list(PROPOSE))
+    s = _solve(x, np.array([getattr(s, label) for s in samples]), list(PROPOSE))
     fitted = {k: s[k] for k in ("condition", "centre", "mad", "zero")}
     return {
         "coefficients": dict(zip(PROPOSE, map(float, s["coef"]))),
@@ -815,8 +850,20 @@ def engine_config(records) -> dict:
     return held[0]
 
 
+def refuse_context_parallel(engine: dict, where: str) -> None:
+    """Refuse an engine config that states a context-parallel width: a step
+    linear law states none, so a run at width 1 would price with it."""
+    if widths := [f"{k} {engine[k]}" for k in CONTEXT_PARALLEL if k in engine]:
+        raise ValueError(
+            f"{where} states {' and '.join(widths)}, and a step linear law states "
+            "no context-parallel width, so a run at width 1 would price with it"
+        )
+
+
 def join_width(engine: dict) -> int:
-    """The ranks a run's records join at: `engine`'s `data_parallel_size`."""
+    """The ranks a run's records join at: `engine`'s `data_parallel_size`.
+    An engine config stating a context-parallel width refuses."""
+    refuse_context_parallel(engine, "the records' engine config")
     if "data_parallel_size" not in engine:
         raise ValueError(
             "the records' engine config states no data_parallel_size, the ranks "
@@ -857,6 +904,7 @@ def main(argv=None) -> None:
         engine = keyed_of(json.loads(Path(args.engine).read_text()))
         for own in (Path(r).with_suffix(".engine.json") for r in args.records):
             held = keyed_of(json.loads(own.read_text())) if own.exists() else {}
+            refuse_context_parallel(held, str(own))
             if differ := [k for k, v in held.items() if engine.get(k, v) != v]:
                 raise ValueError(f"{own} contradicts {args.engine} in {differ}")
     else:

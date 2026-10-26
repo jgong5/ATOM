@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""`compass validate bound`: the analytical price, at most the measured device
-time on every measured step, at step and at op level.
+"""`python -m atom.compass.validate.bound`: the analytical price, at most the
+measured device time on every measured step, at step and at op level.
 
-    compass validate bound --model M [--tp N] --machine SPEC [--ratios-from SPEC]
-        --store S [--ops DIR] RECORD... [-- ATOM args]
+    python -m atom.compass.validate.bound --model M [--tp N] --machine SPEC
+        [--ratios-from SPEC] --store S [--ops DIR] RECORD... [-- ATOM args]
 
 A RECORD is a real run's directory, its step record in `steps/`. Each forward
 there that is not a DP dummy run is priced at step level by the step roofline,
@@ -27,7 +27,9 @@ Any violation fails the gate and exits with status 1. With none, any refusal
 makes the result a coverage report, its reasons counted by step.
 
 Reported, not gated: per granularity and phase (decode, prefill, mixed), the
-distribution of measured over analytical; and the records ranked by tokens a
+distribution of measured over analytical; the analytical seconds by the
+roofline part that set them (`CostTerm.by_bound`), and those of a term no part
+set, an overlapped step's, `unattributed`; and the records ranked by tokens a
 second over the steps priced at that granularity, analytical against
 measured: whether measured's fastest is analytical's fastest (top-1), or
 among its first three (top-3).
@@ -58,12 +60,18 @@ from pathlib import Path
 import numpy as np
 
 from atom.compass.backends import BatchView, CostRefused, RequestShape
+from atom.compass.backends.cost import fold_parts
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.shape import sum_tokens
 from atom.compass.backends.step_labels import group_tokens
+from atom.compass.backends.work import COMM, KERNEL
 
+PROG = "python -m atom.compass.validate.bound"
 SOURCE = "validate-bound"
 PHASES = ("decode", "prefill", "mixed")
+#: Priced seconds by the roofline part that set them, and those no part set.
+UNATTRIBUTED = "unattributed"
+BY_BOUND = (*KERNEL, *COMM, UNATTRIBUTED)
 #: The engine fields a record must state as ATOM's arguments resolve them.
 PRICED = ("tensor_parallel_size", "kv_cache_dtype")
 PARTIAL = (
@@ -155,6 +163,7 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
     for level, backend in backends.items():
         violations, refused, rates, unpriced = [], Counter(), {}, 0
         seconds = {p: [] for p in PHASES}  # (measured, priced) per step
+        parts = {p: [] for p in PHASES}  # each term's seconds by bound
         for record in records:
             tokens = measured_s = priced_s = 0.0
             for name, view, measured in steps(record, tbo, mtp):
@@ -168,6 +177,9 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
                     continue
                 priced = cost.seconds
                 seconds[_phase(view)].append((measured, priced))
+                parts[_phase(view)] += [
+                    t.by_bound or {UNATTRIBUTED: t.seconds} for t in cost.terms
+                ]
                 tokens += sum_tokens(view.requests)
                 measured_s, priced_s = measured_s + measured, priced_s + priced
                 if priced > measured:
@@ -198,6 +210,11 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
             "analytical_s": {
                 p: {"total": sum(a for _, a in s), **_spread([a for _, a in s])}
                 for p, s in seconds.items()
+                if s
+            },
+            "by_bound": {
+                p: dict.fromkeys(BY_BOUND, 0.0) | fold_parts(s)
+                for p, s in parts.items()
                 if s
             },
             "ranking": _ranking(rates),
@@ -373,6 +390,19 @@ def _build(model: str, tp: int, atom_args, arch: str, tmpdir: str):
     return config, tree
 
 
+def walked(atom_args, arch: str) -> list:
+    """The modules `run.modules.walk` reads off the model a server's ATOM
+    arguments `atom_args` build, `arch` declared. It declares a device
+    process-wide, so it runs in a process of its own."""
+    from atom.compass.drive import runfile
+    from atom.compass.run.modules import walk
+
+    engine, kept = runfile._engine_args(atom_args), runfile.engine_only(atom_args)
+    with tempfile.TemporaryDirectory(prefix="compass-walk-") as tmpdir:
+        _, tree = _build(engine.model, engine.tensor_parallel_size, kept, arch, tmpdir)
+    return walk(tree)
+
+
 def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=None):
     """ATOM's config for its arguments, the EP width its MoE resolves and the
     step- and op-level backends pricing `records` on `machine`, the op_graphs
@@ -432,7 +462,7 @@ def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=N
 
 def main(argv: list[str]) -> None:
     cut = argv.index("--") if "--" in argv else len(argv)
-    p = argparse.ArgumentParser(prog="compass validate bound", description=__doc__)
+    p = argparse.ArgumentParser(prog=PROG, description=__doc__)
     p.add_argument(
         "records", nargs="+", metavar="RECORD", help="a real run's directory"
     )
@@ -491,3 +521,11 @@ def main(argv: list[str]) -> None:
         )
     if any(r["violations"] for r in report.values()):
         raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    import sys
+
+    from atom.compass.cli import refusing
+
+    refusing(PROG, main, sys.argv[1:])

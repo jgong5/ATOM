@@ -138,8 +138,10 @@ def planted(tmp_path):
         (bindir / tool).chmod(0o755)
     (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     (tmp_path / "stub.json").write_text(json.dumps(dataclasses.asdict(Coefficients())))
+    # The router stub records every ATOM_COMPASS_* it inherits, so none come
+    # from the caller (the GPU gate sets the slice model's).
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if not k.startswith("ATOM_COMPASS_")},
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "ATOMESH": str(bindir / "atomesh"),
         "PLANTED_ROUTER": str(tmp_path / "router.json"),

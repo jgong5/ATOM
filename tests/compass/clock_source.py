@@ -53,16 +53,26 @@ import os
 from collections import Counter
 from dataclasses import dataclass
 
-#: The calls that return real seconds. An asyncio timer is not one: it runs on
-#: the event loop's clock, which a simulated run replaces. The `_ns` forms are
-#: the same machine clocks in different units, and a number divided by a
+#: The calls that return real seconds: the wall, monotonic and performance
+#: clocks, the process and thread CPU clocks, and `datetime.datetime`'s current
+#: time however it is asked for. CPU seconds are real seconds too: a step
+#: charged its own CPU time has machine time in it all the same. The `_ns` forms
+#: are the same machine clocks in different units, and a number divided by a
 #: billion after the fact is not distinguishable from one taken in seconds, so
 #: they are listed beside them rather than under them.
+#:
+#: **What is left out, and why.** An asyncio timer, `loop.time()` included, runs
+#: on the event loop's clock, which a simulated run replaces. `time.sleep` waits
+#: and reads nothing. `time.localtime`, `time.gmtime`, `time.ctime`,
+#: `time.strftime` and `datetime.date.today` read the machine clock and hand
+#: back a calendar date or a string, which no record adds up as seconds without
+#: a conversion call a reviewer sees. `os.times` and `resource.getrusage` read
+#: CPU seconds and have not been tried.
 #:
 #: **Every entry is the fully qualified name, because the comparison is exact.**
 #: A tail match would hand the whole list to any receiver whose attribute
 #: happens to be spelled the same -- `self.time.monotonic()`, `row.datetime.now()`,
-#: a `time` imported from somewhere that is not the standard library. The two
+#: a `time` imported from somewhere that is not the standard library. The
 #: `datetime` entries are written out to `datetime.datetime` for the same
 #: reason; `from datetime import datetime` resolves to exactly that, so the
 #: short spelling costs nothing and the long one cannot be reached by accident.
@@ -75,8 +85,13 @@ CLOCK_READS = (
     "time.perf_counter_ns",
     "time.clock_gettime",
     "time.clock_gettime_ns",
+    "time.process_time",
+    "time.process_time_ns",
+    "time.thread_time",
+    "time.thread_time_ns",
     "datetime.datetime.now",
     "datetime.datetime.utcnow",
+    "datetime.datetime.today",
 )
 
 #: Files whose real-clock reads are deliberate, and why. A path matches on whole
@@ -126,7 +141,7 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
         "starts a real engine and never runs inside a simulated run"
     ),
     "atom/compass/validate/project.py": (
-        "when validate project published its projection, for the entry's "
+        "when compass project published its projection, for the entry's "
         "provenance; it prices recorded steps offline and never runs inside a "
         "simulated run"
     ),
@@ -137,7 +152,9 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
 #: scripts, and `diffusion` and `plugin` are never run by a simulation.
 NOT_CORE = ("compass", "mesh", "benchmarks", "examples", "diffusion", "plugin")
 
-_ATOM = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ATOM = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "atom"
+)
 
 #: ATOM's core: every module and package under `atom/` outside `NOT_CORE`, read
 #: off the tree so a new package is gated the day it lands. Paths are relative
@@ -505,17 +522,19 @@ def _origins(tree) -> dict[str, str]:
     `self` -- so that the call it enables resolves the same way an import does.
     The first binding a name gets is the one kept: a name assigned twice says
     two things, and the check is not an interpreter.
+
+    A relative import keeps its leading dots, so a sibling module that happens
+    to be called `time` resolves to `.time` and never to the standard library.
     """
     origins: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 origins.setdefault(alias.asname or alias.name.split(".")[0], alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module:
+        elif isinstance(node, ast.ImportFrom):
+            package = "." * node.level + (f"{node.module}." if node.module else "")
             for alias in node.names:
-                origins.setdefault(
-                    alias.asname or alias.name, f"{node.module}.{alias.name}"
-                )
+                origins.setdefault(alias.asname or alias.name, package + alias.name)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             source = _dotted(node.value)
             if source is None:

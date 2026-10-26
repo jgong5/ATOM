@@ -26,12 +26,13 @@ SOURCE = "replay"
 class ReplayHost:
     """One DP rank's real steps, in order, as the runner's host in place of
     `HostDeviceRecurrence`: `charge` makes step i end when real step i's
-    forward returned, whatever the cost backend priced it at."""
+    forward returned, whatever the cost backend priced it at. A pipeline
+    stage replays its own record, `stage` as `read` takes it."""
 
-    def __init__(self, directory, dp_rank: int) -> None:
-        self.path = Path(directory) / f"dp{dp_rank}.jsonl"
+    def __init__(self, directory, dp_rank: int, stage: int = 0) -> None:
+        self.source = f"{directory} stage {stage} dp{dp_rank}"
         origin = min(json.loads((Path(directory) / ARRIVALS).read_text())["sent_ns"])
-        steps = read(directory)[dp_rank]
+        steps = read(directory, stage)[dp_rank]
         self.ends = [(s["t_exit_ns"] - origin) / 1e9 for s in steps]
         self.outs = [
             (s["t_pull_ns"] - s["t_exit_ns"]) / 1e9 if "t_pull_ns" in s else None
@@ -46,7 +47,7 @@ class ReplayHost:
         that step's."""
         i, self.step = self.step, self.step + 1
         if i >= len(self.ends):
-            why = f"{self.path} has {len(self.ends)} steps, and this is step {i}"
+            why = f"{self.source} has {len(self.ends)} steps, and this is step {i}"
             raise RunnerRefusal(f"{SOURCE}: {why}")
         self.out_s = self.outs[i]
         return max(0.0, self.ends[i] - self.now())

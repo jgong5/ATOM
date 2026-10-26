@@ -5,7 +5,10 @@
 
 Each argument is a run directory: its step record in `steps/` and aiperf's
 export in `artifacts/profile_export_aiperf.json`. SIMULATED is the cell at its
-backend, and REAL two or more real runs of it, spaced in time.
+backend, and REAL two or more real runs of it, spaced in time. A run with no
+export yet, one still recording, is refused by name, and so is a run
+`cctraces_sim.sh` wrote with no `artifacts/client_run.json` yet, one still
+finishing, when another such run holds one.
 
 A directory `cctraces_sim.sh` wrote is graded as below when it holds
 `artifacts/client_run.json`, whole when it does not. When a real run is graded
@@ -37,7 +40,8 @@ arguments; when its export lists `unnamed` requests, naming each by its
 `x_request_id`, since no step can be matched to them; and when its run.json
 names `aiter_jit_builds`, the aiter JIT modules its server built or began while
 it served, since a step may have waited on a build (`compass record` and a real
-`cctraces_sim.sh` cell write it). A simulated run, whose run.json holds
+`cctraces_sim.sh` cell write it), or its steps hold `arrivals.json`. A real run is
+refused when its run.json holds `run_file`. A simulated run, refused without
 `run_file`, is also refused when it skips host segments, or its run file has no
 host laws and so prices no host time; when the step roofline was on in a run of
 another backend than the step grid, which always prices below it; when its
@@ -108,7 +112,7 @@ from scipy.stats import ks_2samp
 
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.drive import aiter_jit
-from atom.compass.parity import read, transfers
+from atom.compass.parity import ARRIVALS, read, transfers
 from atom.compass.parity.served import served
 from atom.compass.run import (
     CLIENT_DIR,
@@ -231,7 +235,7 @@ def _end_to_end(export) -> dict:
     return {name: export[k][stat] for name, (k, stat) in END_TO_END.items()}
 
 
-def _named_by_prefill(export, prefill, decode) -> dict:
+def named_by_prefill(export, prefill, decode) -> dict:
     """`export`, whose names are decode's response ids, with each request
     renamed by the response id `prefill`'s record names it by: its prefill DP
     rank and request id join the decode response id in `decode`'s
@@ -250,16 +254,18 @@ def _named_by_prefill(export, prefill, decode) -> dict:
     return export | {k: renamed(export.get(k)) for k in ("requests", "warmup")}
 
 
-def _client_run(cell, run, client, whole=False) -> tuple:
+def _client_run(cell, run, client, whole=False, simulated=False) -> tuple:
     """The steps of the client run `cell` grades, the traces its client was
     given, and its warmup: how many requests its export, in `client`, names as
     the warmup's, and how many steps hold only those; refuses, naming every
     reason, a run grading does not take. Its DP ranks step together, so their
     steps are taken in step order, every rank's step k one."""
+    if (Path(cell) / "steps" / ARRIVALS).exists():
+        raise ValueError(f"{cell} is not graded: its {ARRIVALS} renumbers its steps")
     steps = _steps(cell)
     export = read_json(Path(client) / CLIENT_RUN)
     if Path(cell) == Path(client) / SIDES[0]:
-        export = _named_by_prefill(export, cell, Path(client) / SIDES[1])
+        export = named_by_prefill(export, cell, Path(client) / SIDES[1])
     warmup_names = set(export.get("warmup") or ())
     record = served(Path(cell) / "steps", [export["requests"]])
     split = [s for rank in record.values() for s in rank if not s["is_dummy_run"]]
@@ -305,8 +311,12 @@ def _client_run(cell, run, client, whole=False) -> tuple:
         why.append(f"its export lists requests no step can be matched to: {unnamed}")
     if built := aiter_jit.refusal(run):
         why.append(built)
-    if "run_file" in run:
+    if simulated and "run_file" in run:
         why += _not_graded(run, traces)
+    elif simulated and "format_version" in run:
+        why.append("its run.json holds no run_file, so no `run` wrote it")
+    elif "run_file" in run:
+        why.append("its run.json holds a run_file, so `run` wrote it")
     if why:
         raise ValueError(f"{cell} is not graded: " + "; ".join(why))
     if whole:
@@ -352,7 +362,7 @@ def _not_graded(run, traces) -> list[str]:
     return why
 
 
-def graded(cell, client=None, whole=False) -> tuple:
+def graded(cell, client=None, whole=False, simulated=False) -> tuple:
     """The steps `cell` grades, every DP rank's; the traces its client was
     given, and its warmup, as `_client_run` gives them, both None where it is
     graded whole, as it is when `whole`. `client` holds the client's export,
@@ -361,7 +371,7 @@ def graded(cell, client=None, whole=False) -> tuple:
     path = Path(cell) / "run.json"
     run = read_json(path) if path.exists() else {}
     if "format_version" in run or (Path(client) / CLIENT_RUN).is_file():
-        return _client_run(cell, run, client, whole)
+        return _client_run(cell, run, client, whole, simulated)
     return _steps(cell), None, None
 
 
@@ -395,11 +405,11 @@ def _refuse_by_run_file(cell) -> None:
         raise ValueError(f"{cell} is not graded: " + "; ".join(why))
 
 
-def _read(cell, whole) -> dict:
+def _read(cell, whole, simulated=False) -> dict:
     export = read_json(Path(cell) / EXPORT)
     out = {"end to end": _end_to_end(export), "sides": {}}
     for side in sides(cell):
-        steps, traces, _warmup = graded(side, cell, whole)
+        steps, traces, _warmup = graded(side, cell, whole, simulated)
         out["sides"]["" if side == Path(cell) else f" {side.name}"] = {
             "counts": _counts(steps, export),
             "distributions": _distributions(steps),
@@ -444,12 +454,32 @@ def grade(real_cells, simulated_cell) -> dict:
     if len(real_cells) < 2:
         names = [str(c) for c in real_cells]
         raise ValueError(f"{names}: a real spread needs two or more real runs")
+    cells = (*real_cells, simulated_cell)
+    if bare := [str(c) for c in cells if not (Path(c) / EXPORT).is_file()]:
+        raise ValueError(
+            f"{bare} hold no {EXPORT}; a run still recording is not graded"
+        )
+    # A `cctraces_sim.sh` run, its run.json with no `format_version`, writes
+    # its client run's export after aiperf's, once its server has left.
+    held = {}
+    for c in map(Path, cells):
+        path = c / "run.json"
+        if not path.is_file() or "format_version" not in read_json(path):
+            held[str(c)] = (c / CLIENT_RUN).is_file()
+    done = [c for c, h in held.items() if h]
+    if done and (finishing := [c for c, h in held.items() if not h]):
+        raise ValueError(
+            f"{finishing} hold no {CLIENT_RUN} and {done} do; "
+            "a cctraces_sim.sh run still finishing is not graded"
+        )
     _refuse_by_run_file(simulated_cell)
     whole = graded_whole(real_cells)
     real = [_read(c, whole) for c in real_cells]
-    simulated = _read(simulated_cell, whole)
-    given = {str(c): r["traces"] for c, r in zip(real_cells, real)}
-    given[str(simulated_cell)] = simulated["traces"]
+    simulated = _read(simulated_cell, whole, simulated=True)
+    given = {
+        str(c): r["traces"]
+        for c, r in zip((*real_cells, simulated_cell), (*real, simulated))
+    }
     if len({json.dumps(t) for t in given.values()}) > 1:
         every = set.intersection(*(set(t or ()) for t in given.values()))
         odd = {c: sorted(set(t or ()) - every) for c, t in given.items()}

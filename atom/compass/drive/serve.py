@@ -12,7 +12,8 @@ run's file also holds ATOM's arguments, from which its engines trace a shape
 the store lacks (`run.ATOM_ARGS`). Each start
 takes a free `ATOM_DP_MASTER_PORT`: the port keys ATOM's compiled-graph cache,
 and the first start that loads that cache autotunes every graph's kernels
-again, whose configs stay loaded and read in `non_torch`.
+again, whose configs stay loaded and read in `non_torch`. No later start loads
+the directory, so the server's stop removes it (`drop_compiled`).
 
 The server runs this driver's tree in its own process group, so its engine
 processes stop with it, and writes ``<out>/server.log`` and its step record in
@@ -31,6 +32,8 @@ import http.client
 import json
 import os
 import random
+import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -75,6 +78,11 @@ PORT_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
 #: apart, and each clear of the 15000 to 17000 Mooncake's transfer engine draws
 #: each rank's RPC port from (rpc_min_port, rpc_max_port).
 SERVE_PORTS, DEPLOY_PORTS = range(10000, 15000), range(17001, 65536)
+#: The line each rank logs naming its graph's directory in the compiled-graph cache.
+CACHE_LINE = re.compile(r"Using cache directory: (\S+) for vLLM's torch\.compile")
+#: ATOM's `atom.utils.backends.VLLM_CACHE_ROOT`, stated here because importing
+#: that module opens a HIP context on every GPU the calling process can see.
+CACHE_ROOT = os.path.expanduser("~/.cache/atom")
 
 
 def below_ephemeral(ports: range) -> range:
@@ -168,6 +176,7 @@ def serve(
         finally:
             _stop(server.pid, kfd)
             server.wait()
+            drop_compiled(out / LOG_FILE)
     if not stopped and server.returncode:
         raise ServeError(f"the server exited {server.returncode}; see {out / LOG_FILE}")
     # Any rank's: every DP rank resolves one engine configuration.
@@ -180,6 +189,17 @@ def serve(
     _write_whole(
         out / RUN_JSON, json.dumps(identity(engines[0], model, sys.argv, gpus))
     )
+
+
+def drop_compiled(log) -> None:
+    """Remove each directory ATOM derived in its compiled-graph cache that the
+    stopped server's log `log` names. A directory configured outside the cache
+    root stays."""
+    root = Path(CACHE_ROOT, "torch_compile_cache")
+    text = Path(log).read_text("utf-8", "replace")
+    for used in map(Path, CACHE_LINE.findall(text)):
+        if used.is_relative_to(root) and used != root:
+            shutil.rmtree(root / used.relative_to(root).parts[0], ignore_errors=True)
 
 
 def _model(atom_args) -> str:

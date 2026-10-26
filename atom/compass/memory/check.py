@@ -3,19 +3,24 @@
 
 """A simulated run's non-KV memory against a real run's, one term at a time.
 
-    python -m atom.compass.memory.check PREDICTED... SERVER_LOG
+    python -m atom.compass.memory.check PREDICTED... SERVER_LOG|MEASURED
 
 PREDICTED is an engine's ``lp-<engine>.json`` in a simulated run's ``out_dir``,
 whose memory section holds the readings its KV pool was sized from, the warmup shape, and
 what the graph pool really costs; at DP width N, the N ranks' ``lp-<engine>.dp<r>.json``,
 each checked in turn. SERVER_LOG is the log of one real ATOM server with the
 same deployment, at N ranks a line per rank. Those lines name no rank, so they
-are read only when every rank logs the same values.
+are read only when every rank logs the same values. MEASURED is the ``--out``
+of a `compass measure memory` start of that deployment: its engine's log is
+read as SERVER_LOG is.
 
 A real server logs each reading once a rank, in its ``Memory budget`` line, so the
 terms compared are ``peak_torch`` and ``non_torch``. Each predicted reading
 enters as one term, whose method combines its own terms' methods, and its
-terms are printed under the table, each with its method. The
+terms are printed under the table, each with its method. Under MEASURED, the
+``weights`` and ``buffers`` terms of ``peak_torch`` are compared too, one row
+each, against the parameter and buffer storage bytes each rank's file holds
+beside its readings, which every rank must hold alike. The
 graph pool is compared apart, both of its numbers against the pool the
 real server's capture reserved.
 """
@@ -48,6 +53,12 @@ PHASE = "warmup"
 #: The readings compared as footprint terms; the activations are in the first.
 COMPARED = ("peak_torch", "non_torch")
 SHAPED = frozenset({"peak_torch"})
+#: A `compass measure memory` start's engine log and the directory of its
+#: ranks' files, in its ``--out``.
+LOG, READINGS = "engine.log", "readings"
+#: Where a rank's file holds the storage bytes of its loaded model, by the
+#: `peak_torch` term each is compared with.
+STORAGE = "storage_bytes"
 
 _BUDGET = re.compile(r"Memory budget: .*\bpeak_torch=([\d.]+)GB, non_torch=([\d.]+)GB")
 _WARMUP = re.compile(r"warmup_model [\d.]+ seconds with \d+ reqs (\d+) tokens")
@@ -85,7 +96,9 @@ def record(readings: DeviceReadings, *, tokens: int, memory) -> dict:
     }
 
 
-def _one(pattern: re.Pattern, text: str, log: Path, ranks: int) -> tuple[str, ...]:
+def _one(pattern: re.Pattern, text: str, log: Path, ranks: int, blocks=None) -> tuple:
+    """Each rank's values on its line matching `pattern`; where ranks differ, those
+    on the lines that log `blocks`, the rank's KV block count, which must agree."""
     found = pattern.findall(text)
     if len(found) != ranks:
         raise MemoryRefusal(
@@ -93,6 +106,20 @@ def _one(pattern: re.Pattern, text: str, log: Path, ranks: int) -> tuple[str, ..
             f"each of the {ranks} ranks of one real server logs one",
             "pass the log of a real server at as many ranks as hand-ins",
         )
+    if len(set(found)) > 1 and blocks:
+        count = f"num_kvcache_blocks={blocks}"
+        found = re.findall(rf"{pattern.pattern}.*\b{count}\b", text)
+        if not found:
+            raise MemoryRefusal(
+                f"no line of {log} logs {count}, the rank's",
+                "compare the log of the server whose ranks recorded these steps",
+            )
+        if len(set(found)) > 1:
+            raise MemoryRefusal(
+                f"the lines of {log} that log {count}, the rank's, carry "
+                f"{sorted(set(found))}",
+                "compare the log of one server start",
+            )
     if len(set(found)) > 1:
         raise MemoryRefusal(
             f"{log}'s ranks log {sorted(set(found))} on lines matching "
@@ -106,17 +133,40 @@ def _gib(text: str) -> int:
     return round(float(text) * (1 << 30))
 
 
-def recorded(log: Path, ranks: int = 1) -> tuple[Recorded, Term | None]:
+def _stored(out: Path) -> tuple[Term, ...]:
+    """The storage bytes the ranks of the start in `out` hold, as terms."""
+    files = sorted((out / READINGS).glob("*.json"))
+    held = [read_json(f).get(STORAGE) for f in files]
+    if not held or None in held:
+        raise MemoryRefusal(
+            f"{out / READINGS} holds {len(files)} rank files and "
+            f"{len(held) - held.count(None)} hold {STORAGE}",
+            "start compass measure memory again on a tree whose runner writes them",
+        )
+    if any(h != held[0] for h in held):
+        raise MemoryRefusal(
+            f"{out}'s ranks hold {STORAGE} {held}, which name no rank to pair "
+            "with a hand-in",
+            "compare a start whose ranks hold the same storages",
+        )
+    return footprint_terms(held[0], source=f"{STORAGE} in {out / READINGS}")
+
+
+def recorded(log: Path, ranks: int = 1, blocks=None) -> tuple[Recorded, Term | None]:
     """The real server's two readings, which each of its `ranks` DP ranks logs,
-    and the pool its capture reserved.
+    and the pool its capture reserved; for a `compass measure memory` ``--out``,
+    its engine's, and its ranks' storage bytes besides.
 
     ATOM logs GiB to two places, so each recorded term is good to 5 MiB.
     The run is named by the log's path and its record by the log's digest.
     The pool is None when the server captured no graph.
     """
+    stored = ()
+    if log.is_dir():
+        stored, log = _stored(log), log / LOG
     data = log.read_bytes()
     text = data.decode(errors="replace")
-    peak_torch, non_torch = _one(_BUDGET, text, log, ranks)
+    peak_torch, non_torch = _one(_BUDGET, text, log, ranks, blocks)
     (tokens,) = _one(_WARMUP, text, log, ranks)
     run = Recorded(
         run=str(log),
@@ -126,7 +176,8 @@ def recorded(log: Path, ranks: int = 1) -> tuple[Recorded, Term | None]:
         terms=footprint_terms(
             {"peak_torch": _gib(peak_torch), "non_torch": _gib(non_torch)},
             source="the Memory budget line",
-        ),
+        )
+        + stored,
         at_shape=SHAPED,
         record="sha256:" + hashlib.sha256(data).hexdigest(),
     )
@@ -142,19 +193,22 @@ def recorded(log: Path, ranks: int = 1) -> tuple[Recorded, Term | None]:
     return run, pool
 
 
-def parts(predicted_file: Path, log: Path, ranks: int = 1) -> list:
+def parts(predicted_file: Path, log: Path, ranks: int = 1, blocks=None) -> list:
     """The per-term comparison, the predicted readings, and the graph pool's."""
     if not (saved := read_json(predicted_file).get("memory")):
         what = f"{predicted_file} has no memory section"
         raise MemoryRefusal(what, "pass an engine's hand-in, lp-engine*.json")
     readings = {name: _reading(name, rows) for name, rows in saved["readings"].items()}
+    run, pool = recorded(log, ranks, blocks)
+    # The terms of `peak_torch` the run records alone: its storages.
+    stored = run.by_name().keys() - set(COMPARED)
+    alone = tuple(t for t in readings["peak_torch"].terms if t.name in stored)
     predicted = Predicted(
         saved["label"],
         Shape(saved["tokens"], PHASE),
-        tuple(readings[name].as_term() for name in COMPARED),
+        tuple(readings[name].as_term() for name in COMPARED) + alone,
         at_shape=SHAPED,
     )
-    run, pool = recorded(log, ranks)
     out = [compare(predicted, run)]
     out += [readings[name] for name in COMPARED]
     if pool is None or saved["predicts"] is None:
@@ -166,7 +220,13 @@ def parts(predicted_file: Path, log: Path, ranks: int = 1) -> list:
     else:
         reserves = readings[graph_pool.RESERVES]
         predicts = _reading(graph_pool.PREDICTS, saved["predicts"])
-        out.append(compare_graph_pool(pool, reserves=reserves, predicts=predicts))
+        if pool.nbytes:  # a pool logged as 0.00GB is under 5 MiB: no share of it
+            out.append(compare_graph_pool(pool, reserves=reserves, predicts=predicts))
+        else:
+            out.append(
+                "graph pool not compared: the real run's capture reserved 0.00GB; "
+                f"reserves() {reserves.total:,} B, predicts() {predicts.total:,} B"
+            )
     return out
 
 
@@ -184,7 +244,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "predicted", type=Path, nargs="+", help="a simulated engine's hand-in per rank"
     )
-    parser.add_argument("log", type=Path, help="the real server's log")
+    parser.add_argument(
+        "log", type=Path, help="the real server's log, or a measure memory --out"
+    )
     args = parser.parse_args(argv)
     for hand_in in args.predicted:
         print(check(hand_in, args.log, len(args.predicted)))

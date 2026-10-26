@@ -157,6 +157,7 @@ class Resolver:
                 answer.name,
                 answer.seconds,
                 answer.provenance.resolved(source.name, declined),
+                by_bound=answer.by_bound,
             )
             return Resolution(stamped, source.name, tuple(declined))
         raise CostRefused(request, declined)

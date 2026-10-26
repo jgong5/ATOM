@@ -10,11 +10,6 @@ import pytest
 from prometheus_client import CollectorRegistry
 
 import atom
-from atom.compass.detect.clock_source import (
-    CORE_ALLOW_LIST,
-    CORE_ROOTS,
-    ClockSourceLint,
-)
 from atom.entrypoints.atomesh.atom_standalone_service import SingleRequestState
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import ModelCard
@@ -34,6 +29,11 @@ from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.scheduler import PrefillScheduler, Scheduler
 from atom.utils import clock
+from tests.compass.clock_source import (
+    CORE_ALLOW_LIST,
+    CORE_ROOTS,
+    ClockSourceLint,
+)
 
 REPO = os.path.dirname(os.path.dirname(atom.__file__))
 

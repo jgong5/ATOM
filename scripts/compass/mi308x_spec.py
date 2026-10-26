@@ -10,11 +10,11 @@ not the ones the device fragment recorded there. The device fragment is what
 ATOM's own `ModelRunner` read at one engine start (Qwen3.8-27B, TP1, CUDA
 graphs and prefix caching on, `--max-model-len 262144`): the device, its
 capacity and the stack; every field no probe fills is assumed, on either host.
-One real burst on each host adds the HTTP intake terms (`INTAKE`), and on
-node 18 `probe_device.py`'s readings (`PEAKS`) the compute and memory derates,
-the bandwidth curve, the kernel floor and the intra-node link's latency and
-derate; there 64 lone requests add the idle intake (`IDLE`). An engine start's
-memory readings are `compass measure memory`'s,
+One real burst on each host adds the HTTP intake terms (`INTAKE`), two of each
+host's GPUs the PP send carriers (`PP`), and on node 18 `probe_device.py`'s
+readings (`PEAKS`) the compute and memory derates, the bandwidth curve, the
+kernel floor and the intra-node link's latency and derate; there 64 lone
+requests add the idle intake (`IDLE`). An engine start's memory readings are `compass measure memory`'s,
 not the spec's. One fragment per probe or origin. Writes the merged document to `--out` when
 `validate` passes, then prints `explain`'s rows for the host, device and
 interconnect blocks, grouped by origin.
@@ -135,10 +135,10 @@ IDLE = {
     ),
 }.get(NAME)
 
-#: A pipeline stage's send, per carrier, fitted on hjbog-srdc-39 GPUs 4 and 5
-#: by `scripts/compass/pp_carriers.py`, pooled at commit f61652a37 over six of
-#: its probe records, and each field's p10 and p90 over those records. The
-#: record is that fit, its records' digests and source.
+#: A pipeline stage's send, per carrier, fitted by `scripts/compass/pp_carriers.py`
+#: pooled at the commit named over six of its probe records, on hjbog-srdc-39
+#: GPUs 4 and 5 and on node 18 GPUs 5 and 7, and each field's p10 and p90 over
+#: those records. The record is that fit, its records' digests and source.
 PP = {
     "mi308x-hjbog39": (
         "2026-10-18",
@@ -180,6 +180,47 @@ PP = {
             },
         },
         "877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
+    ),
+    "mi308x-hjbog18": (
+        "2026-10-25",
+        "b34b1efc9",
+        {
+            "rccl": {
+                "eager_threshold_bytes": 33554432,
+                "latency_s": 1.4969846233725548e-06,
+                "overhead_s": 3.679665958749012e-05,
+                "per_byte_s": 2.018084813031166e-11,
+                "rendezvous_fixed_s": 5.652430790143266e-05,
+            },
+            "gloo": {
+                "eager_threshold_bytes": 0,
+                "latency_s": 1.3623037375509739e-05,
+                "overhead_s": 1.8165249842257383e-05,
+                "per_byte_s": 1.4061146314651374e-10,
+                "rendezvous_fixed_s": 3.126177778056401e-05,
+                "wake_s": 0.00017452681981453718,
+                "wake_rise_s": 0.33165023854607084,
+            },
+        },
+        {
+            "rccl": {
+                "eager_threshold_bytes": (33554432, 33554432),
+                "latency_s": (1.4362740330398083e-06, 2.7121277526021004e-06),
+                "overhead_s": (3.659631463934752e-05, 3.704766132555374e-05),
+                "per_byte_s": (2.0116823335541898e-11, 2.0304158660508042e-11),
+                "rendezvous_fixed_s": (5.4971626264820153e-05, 5.828955304669413e-05),
+            },
+            "gloo": {
+                "eager_threshold_bytes": (0, 0),
+                "latency_s": (9.14878910407424e-06, 1.679931301623583e-05),
+                "overhead_s": (1.6526597717457957e-05, 2.294824547585645e-05),
+                "per_byte_s": (1.3341168692029255e-10, 2.005936577021969e-10),
+                "rendezvous_fixed_s": (2.6582559555506392e-05, 3.501254155033535e-05),
+                "wake_s": (0.0001574667544242473, 0.00019429585724565536),
+                "wake_rise_s": (0.2724507284033313, 0.4541393049634419),
+            },
+        },
+        "0b6af34873ca57a9b4f143935066388a274d92688e07b2d094b0584eded73a13",
     ),
 }.get(NAME)
 

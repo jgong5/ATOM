@@ -21,6 +21,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_backend_step_linear import _installed, law, view
 from test_backend_step_roofline import COMPUTE, MEMORY, ROOFLINE, _spec
 from test_capture_ir import CONFIG, WIDTH_2, _ops, capture
@@ -70,7 +71,7 @@ def backend(region, machine=SPEC, kv="bf16", **kwargs):
 
 
 def by_name(cost):
-    return {term.name: term.seconds for term in cost.terms}
+    return {t.name: t.seconds for t in (*cost.terms, *cost.draft_terms)}
 
 
 def test_a_step_is_one_roofline_per_leaf_composed_by_the_graph_s_joins():
@@ -1401,6 +1402,48 @@ def test_a_lazy_trace_that_fails_ends_the_run_naming_the_shape(tmp_path):
     with pytest.raises(RuntimeError, match="a lazy trace of prefill T=300 B=3 failed"):
         OpGraphBackend(SPEC, lookup, kv="bf16").price(rows)
     assert lazy["lazy_traces"] == 0
+
+
+def test_a_dirty_tree_s_lazy_trace_answers_its_run_and_publishes_nothing(
+    monkeypatch, tmp_path
+):
+    from test_artifact_store import AITER_ROOT, ATOM_ROOT
+
+    from atom.compass import artifacts
+    from atom.compass.bench import ops
+    from atom.compass.capture import forward
+    from atom.compass.capture.graph import Traced, to_json
+    from atom.compass.ir import Graph, Op
+
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_text("{}")
+    config = SimpleNamespace(
+        model=str(tmp_path / "model"),
+        hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+        **ENGINE,
+    )
+    at = forward.structure(config, "decode", True, "gfx942", True, False)
+    traced = []
+
+    def capture(model, tp, shapes, *_, **__):
+        leaf = Op("aiter.leaf", "opaque_leaf", (("n", 2),), ())
+        traced.append(Graph(Traced(at, str(shapes[0])), leaf))
+        return [(traced[-1], model, {"arch": "gfx942"})]
+
+    dirty = (replace(ATOM_ROOT, dirty=3), AITER_ROOT)
+    monkeypatch.setattr(artifacts, "roots_for", lambda modules: dirty)
+    monkeypatch.setattr(forward, "capture", capture)
+    monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
+    lazy, store = _counts(), tmp_path / "store"
+    lookup = _op_graphs(str(store), config, "gfx942", ["--model", config.model], lazy)
+
+    assert lookup("decode", 2, 2) == json.loads(to_json(traced[0]))["region"]
+    assert lazy["lazy_traces"] == 1
+    assert not store.exists()
 
 
 def test_a_run_file_op_graph_traces_from_the_server_s_arguments(monkeypatch, tmp_path):

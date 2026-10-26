@@ -20,7 +20,9 @@ requests under `--sampling` alone, and it states the engine ATOM's arguments
 resolve, `keyed`'s fields, at data-parallel width 1, the bench's.
 
 The bench measures at tensor parallel 1: above it, a point charges the ranks'
-preload skew (#1188), so a deployment of more ranks refuses.
+preload skew (#1188), so a deployment of more ranks refuses. A prefill or
+decode context-parallel width above 1 refuses too: a bundle states no such
+width.
 
 A batch is a line's view: its `rows`, `rung` and `produces_output`, and the
 KV blocks its rows share where a planned line states them (`shared`). The
@@ -109,6 +111,12 @@ def main(argv: list[str]) -> None:
             "charges the ranks' preload skew (#1188), so measure steps measures "
             "at tensor parallel 1 until that is fixed"
         )
+    for name in ("prefill_context_parallel_size", "decode_context_parallel_size"):
+        if (width := getattr(config, name)) > 1:
+            raise ValueError(
+                f"{name} {width}: a step grid bundle states no context-parallel "
+                "width, so measure steps measures at width 1"
+            )
     engine = keyed(config)
     store, out = ArtifactStore(args.store), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -286,20 +294,31 @@ def _sampling(text: str) -> dict:
     return sampling
 
 
-def atom_config(atom_args):
-    """ATOM's `Config` for its arguments, as `LLMEngine` resolves one, with the
-    tokenizer's ids and the end-of-sequence id apart from the stop ids."""
+def atom_config(atom_args, server: bool = False):
+    """ATOM's `Config` for its arguments, as `LLMEngine` resolves one and
+    `CoreManager` rewrites it under DP attention, each TP rank a DP rank of TP 1.
+    With `server`, `atom_args` are a server's, whose own flags pass unread, and
+    no tokenizer loads; otherwise any flag the engine does not define refuses,
+    and the config gets the tokenizer's ids and the end-of-sequence id apart
+    from the stop ids."""
     import dataclasses
 
+    from atom.compass.bench.ranks import layout
+    from atom.compass.drive.runfile import _engine_args
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
     from atom.model_engine.llm_engine import _load_tokenizer
 
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
-    engine_args = EngineArgs.from_cli_args(parser.parse_args(atom_args))
+    parsed = _engine_args(atom_args) if server else parser.parse_args(atom_args)
+    engine_args = EngineArgs.from_cli_args(parsed)
     names = {f.name for f in dataclasses.fields(Config)}
     kwargs = engine_args._get_engine_kwargs().items()
     config = Config(engine_args.model, **{k: v for k, v in kwargs if k in names})
+    if config.enable_dp_attention:
+        layout(config)
+    if server:
+        return config
     tokenizer = _load_tokenizer(config.model, config.trust_remote_code)
     config.bos_token_id = tokenizer.bos_token_id
     config.eos_token_id = tokenizer.eos_token_id

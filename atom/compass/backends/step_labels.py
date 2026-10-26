@@ -28,10 +28,15 @@ device stays behind the host stays in its label. On an MTP record, one with
 `d_target_ns`, the device label is the target's, `d_target_ns` with no gap,
 and the draft label is the rest of
 `d_busy_ns`. On a prefill step that produces output, the draft label's
-`propose` pass, `d_propose_ns`, is also its propose label. The exit of each
+`propose` pass, `d_propose_ns`, is also its propose label. An output
+forward's draft-KV pass, `d_draft_kv_ns`, runs before `forward_done_event`:
+its device label holds it, as its draft-KV label too, and its draft label
+does not; a middle chunk's stays in its draft label. The exit of each
 wait for the previous output's token copy (`t_recv_ns`)
 bounds the host clock's lead over the device's (that forward had finished by
-then); the tightest of the last `ANCHORS` bounds is the lead. The copy itself
+then), as does the exit of a forward's read of its own tokens (`t_read_ns`)
+over its device start, its target's end under MTP; the tightest of the last
+`ANCHORS` bounds is the lead. The copy itself
 lands on its own stream after the exit event the bound reads, by 14 to 29 us
 measured on one host (median 17 us), so each bound carries that much more lead
 than the clocks actually have; on the step linear law's records the gap never
@@ -52,6 +57,8 @@ and a middle chunk has none. With an MTP status wait,
 pipeline stage, `W_recv` runs from the launch to the receive of its input.
 Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
 pull after the previous exit, and `E_out` from the exit to the pull after it.
+`L_mtp` is `mtp_copy`'s time on a forward whose MTP status wait began before
+the event it waits for.
 `label_run` labels a run's DP ranks together: there `E` runs from the latest
 pull, else exit, over the ranks before the same forward, where the group's
 `_sync_dp_state` releases each of them.
@@ -110,6 +117,8 @@ class Sample:
     `draft_s` is its draft label, None when cut or on a step with no draft.
     `propose_s` is its propose label, the part of `draft_s` that is the
     `propose` pass, on a prefill step that produces output; None elsewhere.
+    `draft_kv_s` is its draft-KV label, the part of `device_s` that is the
+    drafter's draft-KV pass, on a step that produces output; None elsewhere.
     `host` holds the segments it has, in seconds: no `W_post` on a middle chunk,
     no `E` on the record's first forward or after an idle engine (`idle`).
     `provenance` holds `source`, `run` (the run's digest), `requests` (the
@@ -130,6 +139,7 @@ class Sample:
     draft_s: float | None = None
     propose_s: float | None = None
     dummies: frozenset = frozenset()
+    draft_kv_s: float | None = None
 
 
 def group_tokens(lines) -> int | None:
@@ -152,25 +162,55 @@ def host_kind(view: BatchView) -> str:
     return "prefill" if view.prefill else "decode"
 
 
+def _timed(lines) -> tuple[list[tuple[dict, int]], int]:
+    """Each line with a device window and its device start, gaps and busy
+    times summed; and the host clock's lead over that device clock."""
+    device, timed = 0, []
+    for s in lines:
+        if "d_busy_ns" in s:
+            start = device + s.get("d_gap_ns", 0)
+            device = start + s["d_busy_ns"]
+            timed.append((s, start))
+    return timed, max(s["t_launch_ns"][0] - start for s, start in timed)
+
+
+def mtp_copy(lines) -> dict[int, tuple[int, bool]]:
+    """Per forward with an MTP status wait after an output forward that marks
+    its target: the nanoseconds from that forward's `forward_done_event`, after
+    its target and draft-KV pass, to the wait's return, and whether the wait
+    began before the event. The lead places the event no later than it ran, so
+    the time is an upper bound."""
+    timed, lead = _timed(lines)
+    copy, done = {}, None
+    for s, start in timed:
+        if "t_mtp_ns" in s and done is not None:
+            m0, m1 = s["t_mtp_ns"]
+            copy[s["step"]] = (m1 - done - lead, m0 < done + lead)
+        if s["produces_output"]:
+            done = None
+            if "d_target_ns" in s:
+                done = start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0)
+    return copy
+
+
 def _host_cut(lines) -> tuple[set[int], set[int]]:
     """The steps whose device start precedes their host launch end, and the
     prefill steps the host paced."""
-    device, output_end, timed = 0, None, []
-    for s in lines:
-        if "d_busy_ns" not in s:
-            continue
-        start = device + s.get("d_gap_ns", 0)
-        device = start + s["d_busy_ns"]
+    (lines_timed, lead), output_end, timed = _timed(lines), None, []
+    for s, start in lines_timed:
         bound = None
         if "t_recv_ns" in s and output_end is not None:
             bound = s["t_recv_ns"][1] - output_end
+        if "t_read_ns" in s:  # its own tokens: read after its target ran
+            bound = s["t_read_ns"][1] - start - s.get("d_target_ns", 0)
         if s["produces_output"]:
-            output_end = device
+            output_end = start + s["d_busy_ns"]
         timed.append((s, start, bound))
     bounds = [b for _, _, b in timed if b is not None]
     if not bounds:
         raise ValueError(
-            "no token copy wait exit (`t_recv_ns`) ties the record's host and device clocks"
+            "no token read exit (`t_recv_ns` or `t_read_ns`) ties the record's "
+            "host and device clocks"
         )
     # Steps before the first anchor read the first ones.
     first, recent, exposed = min(bounds[:ANCHORS]), deque(maxlen=ANCHORS), set()
@@ -179,7 +219,6 @@ def _host_cut(lines) -> tuple[set[int], set[int]]:
             recent.append(bound)
         if start + min(recent, default=first) < s["t_launch_ns"][1]:
             exposed.add(s["step"])
-    lead = max(s["t_launch_ns"][0] - start for s, start, _ in timed)
     paced = {
         s["step"]
         for s, start, _ in timed
@@ -275,6 +314,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             "by its device time"
         )
     exposed, paced = _host_cut(lines)
+    copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
     config = read_json(key) if key.exists() else None
@@ -321,10 +361,14 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             cut = "unsplit"
         gap = 0 if view.prefill else s.get("d_gap_ns", 0)
         device = None if cut else (gap + s["d_busy_ns"]) * 1e-9
-        draft = propose = None
+        draft = propose = draft_kv = None
         if "d_target_ns" in s:  # an MTP record: the target alone, no gap
-            device = None if cut else s["d_target_ns"] * 1e-9
-            draft = (s["d_busy_ns"] - s["d_target_ns"]) * 1e-9
+            target = s["d_target_ns"]
+            if view.produces_output:  # the pass precedes forward_done_event
+                draft_kv = s.get("d_draft_kv_ns")
+                target += draft_kv or 0
+            device = None if cut else target * 1e-9
+            draft = (s["d_busy_ns"] - target) * 1e-9
             if view.prefill and view.produces_output:
                 propose = s.get("d_propose_ns")
         enter, (l0, l1) = s["t_enter_ns"], s["t_launch_ns"]
@@ -341,6 +385,8 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             host["W_post"] = s["t_exit_ns"] - r1 - (d1 - d0)
         if "t_pull_ns" in s:
             host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]
+        if copy.get(s["step"], (0, False))[1]:
+            host["L_mtp"] = copy[s["step"]][0]
         idle = prev is not None and not _shared(s, prev)
         if prev is not None and not idle:
             host["E"] = enter - starts[i - 1]
@@ -364,6 +410,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
                 None if cut else draft,
                 None if cut or propose is None else propose * 1e-9,
                 dummies,
+                None if cut or draft_kv is None else draft_kv * 1e-9,
             )
         )
         gap_ns = s.get("d_gap_ns")
