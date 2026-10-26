@@ -65,7 +65,8 @@ of what Python allows.** It is short on both sides of the two recognitions.
 A set it does not recognise: one returned by a call this module does not itself
 annotate, or by one defined in another module; one arriving in an unannotated
 parameter; one pulled out of a list, a dict or a tuple; any subclass of `set`;
-one read through `cls` or `type(self)`; one bound under `global` or `nonlocal`, which is written down in the scope holding
+one read through `cls`, `type(self)` or an outer class, as `Outer.Inner.members`;
+one bound under `global` or `nonlocal`, which is written down in the scope holding
 the statement rather than the one it names; one bound by a paired unpacking, as
 `a, b = set(x), set(y)`, or only by `s |= ...`; and a name that is also bound,
 anywhere in the same scope, to something the pass cannot see as a set -- by an
