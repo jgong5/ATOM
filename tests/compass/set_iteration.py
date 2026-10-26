@@ -44,7 +44,7 @@ they are listed separately below.
 applied to one of those, or to a `dict` view; a name or attribute assigned one
 of them, in the scope that assigned it and the scopes inside that one; a
 parameter or variable annotated as a set; a class or dataclass field annotated
-as a set and read through `self`; such a field of a class defined in any module
+as a set and read through `self` or the class's name; such a field of a class defined in any module
 scanned with this one, read through a parameter annotated with that class; a
 `set_or_none or ()`; and a call to a function this module itself annotates as
 returning one.
@@ -52,7 +52,8 @@ returning one.
 **What it recognises as a read in order.** `for` and `async for`, a
 comprehension or generator expression, tuple and starred unpacking, `yield
 from`; `list`, `tuple`, `iter`, `reversed`, `enumerate`, `zip`, `sum`, `join`,
-`map`, `filter` and `fromkeys`; `str`, `repr`, `format`, `print`, a logging
+`map`, `filter`, `fromkeys`, `extend`, `deque`, `Counter`, `islice` and
+`fromiter`; `str`, `repr`, `format`, `print`, a logging
 call's arguments and an f-string or `%` interpolation, because a set's `repr`
 lists its members in iteration order; `pop`, which takes a member out in hash
 order; and `min` or `max` given a `key`, because ties there are resolved
@@ -64,16 +65,16 @@ of what Python allows.** It is short on both sides of the two recognitions.
 A set it does not recognise: one returned by a call this module does not itself
 annotate, or by one defined in another module; one arriving in an unannotated
 parameter; one pulled out of a list, a dict or a tuple; any subclass of `set`;
-one read through the class rather than through `self`, as `Step.members`; one
-bound under `global` or `nonlocal`, which is written down in the scope holding
+one read through `cls` or `type(self)`; one read through the name of a class
+nested in another class, of a class from another module, or of a subclass, as
+`B.members` for `class B(A)`; one bound under `global` or `nonlocal`, which is written down in the scope holding
 the statement rather than the one it names; one bound by a paired unpacking, as
 `a, b = set(x), set(y)`, or only by `s |= ...`; and a name that is also bound,
 anywhere in the same scope, to something the pass cannot see as a set -- by an
 assignment, an unpacking, a parameter, a `for` or comprehension target, a
 `with ... as` or an import.
 
-A read it does not recognise: `out.extend(s)`, `collections.deque`, `Counter`,
-`itertools.islice`, `np.fromiter`, `itertools.chain`, `functools.reduce`,
+A read it does not recognise: `itertools.chain`, `functools.reduce`,
 `heapq.nsmallest` and every other call not named above -- the list is the forms
 this code is written in, not the forms that exist. `sorted(s, key=...)` belongs
 on this side for a reason of its own rather than by omission: its ties keep the
@@ -139,7 +140,11 @@ VIEW_CALLS = ("keys", "items")
 #: lists its members in the order it holds them. `print` and the logging calls
 #: are `str` over each argument, the logging ones when the record is formatted,
 #: so `log.info("%s", s)` is `"%s" % s` written later; like `join`, they are
-#: matched on the call's last name.
+#: matched on the call's last name. `extend`, `deque`, `fromiter` and `islice`
+#: carry the set's order into a list, a deque, an array or a prefix, and
+#: `Counter` into a dict, as `fromkeys` does. They are matched on the last name
+#: too: the argument still has to be a set, so a receiver with its own `extend`
+#: is reported only when it is handed one.
 ORDERED_READS = (
     "list",
     "tuple",
@@ -163,6 +168,11 @@ ORDERED_READS = (
     "exception",
     "critical",
     "log",
+    "extend",
+    "deque",
+    "Counter",
+    "islice",
+    "fromiter",
 )
 
 #: Calls that read in order only when a `key` is given, and only in the form
@@ -213,7 +223,7 @@ _KEPT = (
     ("atom/kv_transfer/offload/hybrid/kimi_k3/state_tier.py", "drain", _REPLACED_TRANSFER, 1),
     ("atom/kv_transfer/offload/mp/scheduler.py", "_enforce_transfer_deadlines",
      _REPLACED_TRANSFER, 1),
-    ("atom/model_engine/async_proc.py", "AsyncIOProcManager", _INTO_A_SET, 1),
+    ("atom/model_engine/async_proc.py", "AsyncIOProcManager", _INTO_A_SET, 2),
     ("atom/model_engine/block_manager.py", "deallocate_partial", _INTS, 1),
     ("atom/model_engine/capabilities.py", "from_workers", _ONE, 1),
     ("atom/model_engine/block_pool.py", "free", "rebuilds a heap, which pops by block id", 1),
@@ -561,7 +571,17 @@ class _Names:
 
 
 def _owner(scope, name: str):
-    """Where a name is written down. `self.x` belongs to its class, not its method."""
+    """Where a name is written down. `self.x` belongs to its class, not its method.
+
+    `A.x` read inside `A` belongs where `A` itself is bound, which is where it
+    is read from outside `A` as well. A class bound in another class's body is
+    not visible from its own methods, so it is left where it is.
+    """
+    head, _, _ = name.partition(".")
+    if head != name and ("class", head) in scope:
+        index = scope.index(("class", head))
+        if not index or scope[index - 1][0] != "class":
+            return scope[:index]
     if not name.startswith("self."):
         return scope
     for depth in range(len(scope), 0, -1):
@@ -588,12 +608,13 @@ def _declared(scope, name):
 
     A name bound in a class body is also reachable as `self.<name>` from every
     method of that class, and an annotation-only field -- which is every field
-    of a frozen dataclass -- is reachable no other way.
+    of a frozen dataclass -- is reachable no other way. It is reachable as
+    `<Class>.<name>` from anywhere the class is.
     """
     if name is None:
         return ()
     if scope and scope[-1][0] == "class" and "." not in name:
-        return (name, f"self.{name}")
+        return (name, f"self.{name}", f"{scope[-1][1]}.{name}")
     return (name,)
 
 
