@@ -21,6 +21,7 @@ from typing import ClassVar
 import pytest
 import torch
 import torch.distributed as dist
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_bench_ops import _graph, _leaf, _Runner, _t
 from test_bench_ops_plan import CONFIG, _records, bench  # noqa: F401  the fixture
 

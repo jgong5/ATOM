@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 import pytest
 from test_artifact_invalidation import BASE, STANZA
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_drive_gpu import FREE, _plant
 from test_memory_readings import (
     CONFIG_JSON,
