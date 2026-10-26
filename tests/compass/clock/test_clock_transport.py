@@ -431,6 +431,50 @@ def test_a_connection_closed_mid_run_ends_it_for_every_pending_call(
         assert e.value.table == ca.lp_table()
 
 
+def _client_leaves(served, monkeypatch, target):
+    """Client `a` and `b`, a channel each way; `a` asks NER(`target`) and closes
+    its connection. The authority, and `b`'s connection once the loop has the close."""
+    closed, queued = service._Server._closed, threading.Event()
+
+    def signalled(self, *args):
+        closed(self, *args)
+        queued.set()
+
+    monkeypatch.setattr(service._Server, "_closed", signalled)
+    table = _table()
+    table.declare("b->a:m", B, A, 0.5, "inline")
+    ca = ClockAuthority(table, client=A)
+    endpoint = served(ca, "tcp://127.0.0.1:0").endpoint
+    a, b = connect(A, endpoint), connect(B, endpoint)
+    _result(_later(a.send, (NER, target, [], INF)))
+    a.close()
+    assert queued.wait(WAIT_S)
+    return ca, b
+
+
+def test_a_client_closing_while_it_waits_for_nothing_lets_the_others_finish(
+    served, monkeypatch
+):
+    ca, b = _client_leaves(served, monkeypatch, INF)
+    assert _ask(b, (TAR, 1.0, [], INF)) == (1.0, {AB: []})
+    assert _ask(b, (NER, INF, [], INF)) == (INF, {AB: []})
+    assert dict(ca.final_clocks) == {A: 0.0, B: 1.0}
+
+
+def test_a_message_for_a_client_that_closed_waiting_for_nothing_ends_the_run(
+    served, monkeypatch
+):
+    _, b = _client_leaves(served, monkeypatch, INF)
+    with pytest.raises(ClockAbort, match="^a closed its connection while it waited"):
+        _ask(b, (TAR, 1.0, [("b->a:m", 0, 0.5)], INF))
+
+
+def test_a_client_closing_with_a_target_ahead_ends_the_run(served, monkeypatch):
+    _, b = _client_leaves(served, monkeypatch, 5.0)
+    with pytest.raises(ClockAbort, match="^a closed its connection, so the run ends"):
+        _ask(b, (TAR, 1.0, [], INF))
+
+
 def test_a_log_behind_its_receiver_is_refused(served):
     endpoint = served(ClockAuthority(_table())).endpoint
     a, b = connect(A, endpoint), connect(B, endpoint)

@@ -23,7 +23,8 @@ exception from the authority, or while framing a reply, ends the run the same
 way, as a `ClockAbort` that names it; its table is empty when the LP table
 cannot be read or framed. So does the end of a bound socket connection, as a
 `ClockAbort` naming its address: no finish can come without it. A resigned
-client's connection is no longer bound, and its end ends nothing.
+client's connection is no longer bound, and its end ends nothing; nor does the
+client's while its N is ``+inf``, unless a finite grant to it follows.
 
 Frames and closes reach the loop: a carrier hands the serve side encoded frames
 and the serve side decodes them onto the queue, so the in-process carrier here
@@ -131,6 +132,7 @@ class _Server:
     def _loop(self) -> None:
         ended = None  # the refusal frame that ended the run, once one has
         unasked = set(self._lps)  # LPs yet to send a request
+        left = set()  # a client whose connection closed while it waited for nothing
         quiet = True  # no stall diagnostic is due
         while True:
             try:
@@ -150,6 +152,9 @@ class _Server:
             if request is None:
                 replies = []
                 if ended is None and self._slots.get(address) is slot:
+                    if self._client_done(lp):
+                        left.add(address)
+                        continue
                     name = f"{lp} member {member}" if member else f"{lp}"
                     ended = self._ending(
                         f"{name} closed its connection, so the run ends here"
@@ -168,6 +173,13 @@ class _Server:
                         # Outside the refusing branch: a grant that cannot be
                         # framed ends the run, and no other grant goes out.
                         replies = [(i, encode((GRANT, *reply))) for i, *reply in grants]
+                        if any(i in left and g < math.inf for i, g, *_ in grants):
+                            raise ClockAbort(
+                                f"{self._authority.client} closed its connection while "
+                                "it waited for nothing, and is granted time, so the "
+                                "run ends here",
+                                self._authority.lp_table(),
+                            )
                         # A client run ended: its client, granted +inf, resigned.
                         if any(len(reply) > 3 for reply in grants):
                             resigned = [i for i, g, *_ in grants if g == math.inf]
@@ -179,6 +191,18 @@ class _Server:
                 self._slots[i].put(frame)
             for i in resigned:
                 del self._slots[i]
+
+    def _client_done(self, lp) -> bool:
+        """`lp` is the client and waits with N at ``+inf``: until a message for
+        it arrives, it sends nothing. False when the LP table cannot be read."""
+        if lp != self._authority.client:
+            return False
+        try:
+            return any(
+                r.lp == lp and r.n == math.inf for r in self._authority.lp_table()
+            )
+        except Exception:  # noqa: BLE001 - its close then ends the run, named
+            return False
 
     def _stalled(self) -> None:
         """Log the LP table for a stall, once; reading it never ends the run."""

@@ -203,7 +203,7 @@ class ClockAuthority:
         self.diagnostics = 0
         self._diagnosed = 0  # `diagnostics` at the open client run's start
         self.final_clocks = None
-        self._client = client and self._lp[channels.registry.require(client)]
+        self.client = client and self._lp[channels.registry.require(client)]
         self._client_runs = client_runs
         self.ended: list[ClientRun] = []
         self._start = 0.0  # the open client run's start
@@ -523,14 +523,14 @@ class ClockAuthority:
         clocks, grants = tuple(self._now.items()), dict(self.grants)
         diagnostics = self.diagnostics - self._diagnosed
         self.ended.append(ClientRun(k, self._start, end, clocks, grants, diagnostics))
-        if self._client is None or k + 1 == self._client_runs:
+        if self.client is None or k + 1 == self._client_runs:
             return self._finish()
         self._start, self._diagnosed = end, self.diagnostics
         replies = []
         for i in self._ids:
             none = {name: [] for name in self._into[i]}
             self._state[i], self._target[i] = RUNNING, None
-            if i is not self._client:
+            if i is not self.client:
                 self._nv[i] = self._now[i]
                 replies.append((i, self._now[i], none, k))
                 continue
