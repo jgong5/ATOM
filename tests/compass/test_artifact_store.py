@@ -94,24 +94,19 @@ def _clean(root: SourceRoot) -> SourceRoot:
 def clean_checkout(monkeypatch):
     """This checkout's source roots counted clean wherever a command reads
     them, so a module importing this fixture publishes and fits on a checkout
-    with uncommitted files; a test that plants its own roots still wins."""
-    for module in (
-        "artifacts",
-        "bench.measure",
-        "bench.ops",
-        "drive.measure_memory",
-        "drive.trace_steps",
-        "fit.publish",
-        "validate.project",
+    with uncommitted files; a test that plants its own `roots_for` still wins.
+    `roots_for` looks both resolvers up in `provenance` at call time, so
+    every module's binding of it reads the wrapped pair."""
+    tree, described = provenance.git_tree_root, provenance.git_described_root
+    for target, resolve in (
+        ("artifacts.provenance.git_tree_root", tree),
+        ("artifacts.provenance.git_described_root", described),
+        ("drive.identity.git_tree_root", tree),
     ):
         monkeypatch.setattr(
-            f"atom.compass.{module}.roots_for",
-            lambda *a, **k: tuple(map(_clean, provenance.roots_for(*a, **k))),
+            f"atom.compass.{target}",
+            lambda *a, _resolve=resolve, **k: _clean(_resolve(*a, **k)),
         )
-    monkeypatch.setattr(
-        "atom.compass.drive.identity.git_tree_root",
-        lambda *a, **k: _clean(provenance.git_tree_root(*a, **k)),
-    )
 
 
 #: The layout a key states when a test names only its TP width.
