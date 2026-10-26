@@ -39,13 +39,14 @@ their views' order, which the store's order does not move.
 The bundle is the member `run/step_grid.py` loads: the grid, the residual, the
 plan's bounds, the definition, and the sources its triples came from. The
 report is the residual's by kind, each kind's selected member also broken down
-by source: the triples kept, dropped and held out, the median and scaled MAD of its
-relative residuals over those fitted, and the median absolute one over those
-held out, a band it holds no factor for counting as a factor of 0, as the fit
-counts it. It counts the triples whose lookup is extrapolated past the KV
-pool, and gives per rung each alpha form's terms and errors, the views the
-grid does not read, how many it reads at their longest row past the KV pool,
-the cells' p50 without and with alpha, and whether the rung keeps it.
+by source: the triples its MAD pass kept and dropped and those held out, the
+median and scaled MAD of its relative residuals over those kept and dropped,
+as the member's are, and the median absolute one over those held out, a band
+it holds no factor for counting as a factor of 0, as the fit counts it. It
+counts the triples whose lookup is extrapolated past the KV pool, and gives
+per rung each alpha form's terms and errors, the views the grid does not read,
+how many it reads at their longest row past the KV pool, the cells' p50
+without and with alpha, and whether the rung keeps it.
 """
 
 import copy
