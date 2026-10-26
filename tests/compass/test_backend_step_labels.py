@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 from test_backend_step_linear_fit import (
     GAP_NS,
+    HOST,
     SPEC,
     _record,
     _rowmod_steps,
@@ -481,3 +482,25 @@ def test_a_dp2_record_rebuilds_each_step_s_group_counts(tmp_path, monkeypatch):
     path = tmp_path / "dp1.jsonl"
     path.write_text(path.read_text().splitlines(keepends=True)[0])
     assert [s.view.moe_tokens for s in label(tmp_path / "dp0.jsonl")[0]] == [4, None]
+
+
+def test_a_prefill_launch_the_device_held_gives_no_W_launch_label(tmp_path):
+    """From step 40 on, each middle chunk's launch runs twice its device price,
+    so the device runs about half its label before the launch ends: the launch
+    waited on the device and gives no `W_launch`. The middle chunks before it,
+    the output prefills and the decodes keep theirs, and the middle chunk's
+    `W_launch` law is fitted on the launches the host ran alone."""
+    steps, held = _steps(14, n=80), list(range(40, 80, 4))
+    scale = {}
+    for n in held:
+        rows = steps[n][0]
+        x = (1, sum(r[0] for r in rows), len(rows))
+        launch = float(np.dot(HOST["middle"]["W_launch"], x))
+        scale[(n, "W_launch")] = 2 * steps[n][2] / launch
+    record = _timed_record(tmp_path / "dp0.jsonl", steps, scale=scale)[0]
+    samples, table = label(record)
+
+    assert [s.step for s in samples if "W_launch" not in s.host] == held
+    assert [row["step"] for row in table if row["W_launch"] is None] == held
+    got = fit_host(samples)[0]["laws"]["middle"]["W_launch"]
+    assert got == pytest.approx(HOST["middle"]["W_launch"], rel=1e-4, abs=1e-12)
