@@ -9,8 +9,9 @@ PREDICTED is an engine's ``lp-<engine>.json`` in a simulated run's ``out_dir``,
 whose memory section holds the readings its KV pool was sized from, the warmup shape, and
 what the graph pool really costs; at DP width N, the N ranks' ``lp-<engine>.dp<r>.json``,
 each checked in turn. SERVER_LOG is the log of one real ATOM server with the
-same deployment, at N ranks a line per rank. Those lines name no rank, so they
-are read only when every rank logs the same values. MEASURED is the ``--out``
+same deployment, at N ranks a line per rank. Those lines name no rank, so here
+they are read only when every rank logs the same values; `validate` pairs a
+rank with the lines logging its KV block count. MEASURED is the ``--out``
 of a `compass measure memory` start of that deployment: its engine's log is
 read as SERVER_LOG is.
 
@@ -96,7 +97,12 @@ def record(readings: DeviceReadings, *, tokens: int, memory) -> dict:
     }
 
 
-def _one(pattern: re.Pattern, text: str, log: Path, ranks: int) -> tuple[str, ...]:
+def _one(
+    pattern: re.Pattern, text: str, log: Path, ranks: int, blocks: int | None = None
+) -> tuple[str, ...]:
+    """The values each rank logs on its line matching `pattern`. When ranks
+    log different values, the rank is the one whose KV pool holds `blocks`:
+    its lines are those logging that count, and every one must agree."""
     found = pattern.findall(text)
     if len(found) != ranks:
         raise MemoryRefusal(
@@ -104,10 +110,21 @@ def _one(pattern: re.Pattern, text: str, log: Path, ranks: int) -> tuple[str, ..
             f"each of the {ranks} ranks of one real server logs one",
             "pass the log of a real server at as many ranks as hand-ins",
         )
+    at = ""
+    if len(set(found)) > 1 and blocks is not None:
+        at = f"num_kvcache_blocks={blocks}"
+        found = re.findall(rf"{pattern.pattern}.*\b{at}\b", text)
+        if not found:
+            raise MemoryRefusal(
+                f"no line of {log} matching {pattern.pattern!r} logs {at}, "
+                "the rank's",
+                "compare the log of the server whose ranks recorded these steps",
+            )
+        at = f" at {at}"
     if len(set(found)) > 1:
         raise MemoryRefusal(
             f"{log}'s ranks log {sorted(set(found))} on lines matching "
-            f"{pattern.pattern!r}, which name no rank to pair with a hand-in",
+            f"{pattern.pattern!r}{at}, which name no rank to pair with a hand-in",
             "compare a log whose ranks log the same values",
         )
     return found[0] if isinstance(found[0], tuple) else (found[0],)
@@ -136,8 +153,11 @@ def _stored(out: Path) -> tuple[Term, ...]:
     return footprint_terms(held[0], source=f"{STORAGE} in {out / READINGS}")
 
 
-def recorded(log: Path, ranks: int = 1) -> tuple[Recorded, Term | None]:
-    """The real server's two readings, which each of its `ranks` DP ranks logs,
+def recorded(
+    log: Path, ranks: int = 1, blocks: int | None = None
+) -> tuple[Recorded, Term | None]:
+    """The real server's two readings, which each of its `ranks` DP ranks logs
+    (of a rank whose KV pool holds `blocks`, as `_one` pairs them),
     and the pool its capture reserved; for a `compass measure memory` ``--out``,
     its engine's, and its ranks' storage bytes besides.
 
@@ -150,7 +170,7 @@ def recorded(log: Path, ranks: int = 1) -> tuple[Recorded, Term | None]:
         stored, log = _stored(log), log / LOG
     data = log.read_bytes()
     text = data.decode(errors="replace")
-    peak_torch, non_torch = _one(_BUDGET, text, log, ranks)
+    peak_torch, non_torch = _one(_BUDGET, text, log, ranks, blocks)
     (tokens,) = _one(_WARMUP, text, log, ranks)
     run = Recorded(
         run=str(log),
@@ -177,13 +197,15 @@ def recorded(log: Path, ranks: int = 1) -> tuple[Recorded, Term | None]:
     return run, pool
 
 
-def parts(predicted_file: Path, log: Path, ranks: int = 1) -> list:
+def parts(
+    predicted_file: Path, log: Path, ranks: int = 1, blocks: int | None = None
+) -> list:
     """The per-term comparison, the predicted readings, and the graph pool's."""
     if not (saved := read_json(predicted_file).get("memory")):
         what = f"{predicted_file} has no memory section"
         raise MemoryRefusal(what, "pass an engine's hand-in, lp-engine*.json")
     readings = {name: _reading(name, rows) for name, rows in saved["readings"].items()}
-    run, pool = recorded(log, ranks)
+    run, pool = recorded(log, ranks, blocks)
     # The terms of `peak_torch` the run records alone: its storages.
     stored = run.by_name().keys() - set(COMPARED)
     alone = tuple(t for t in readings["peak_torch"].terms if t.name in stored)
