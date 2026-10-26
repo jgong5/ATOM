@@ -35,6 +35,7 @@ from test_lmcache_lp import (
     OFFLOAD,
     REQUEST_S,
     TOKENS,
+    _bound_port,
     _config,
     _run,
 )
@@ -127,8 +128,7 @@ class Engine:
             "Popen",
             lambda *a, **k: started.append((a, real(*a, **k))) or started[-1][1],
         )
-        port = run["lmcache"]["server"][-1]
-        kv = _kv(port)
+        kv = _kv(0)  # the port the server binds, set once it has bound one
         if pd:
             write = {WRITE_REQ_KEY: f"inproc://kv-write-req-{os.getpid()}"}
             kv = {"kv_connector": "multi", "connectors": [COMPASS | write, kv]}
@@ -136,6 +136,8 @@ class Engine:
         compass_run._launch_lmcache(self.config, run, compass_run._pd_side(self.config))
         (argv, *_), self.proc = started[0]
         self.chunk_bytes = int(argv[-1])
+        lm = kv["connectors"][-1] if pd else kv
+        lm["kv_connector_extra_config"]["lmcache.mp.port"] = _bound_port(self.proc)
         me = "engine-P" if pd else "engine"
         self.idle = [
             connect(lp, self.served.endpoint)
