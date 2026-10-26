@@ -59,6 +59,19 @@ def _bound_port(proc) -> int:
     raise AssertionError("LP lmcache bound no port in 120 s")
 
 
+@pytest.fixture(scope="module")
+def lmcache_port():
+    """A port on 127.0.0.1 for an lmcache server that must know its port before
+    it starts, held until the module's tests end. The holding socket sets
+    SO_REUSEADDR and never listens, so a server's ZMQ listener, which sets it
+    too, binds the port beside it; a plain bind elsewhere, as a port draw
+    makes, fails on it, and a bind to port 0 never returns it."""
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", 0))
+        yield s.getsockname()[1]
+
+
 def _run(tmp_path, **entry):
     machine = copy.deepcopy(DOCUMENT)
     machine["interconnect"]["host_link"] = {
