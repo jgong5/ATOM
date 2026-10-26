@@ -62,6 +62,7 @@ from atom.compass.artifacts import (
 from atom.compass.drive import serve
 from atom.compass.drive.gpu import add_gpu_flag, hip_visible, quiet
 from atom.compass.drive.identity import _device, _ptl, _stack, identity
+from atom.compass.memory.check import LOG, READINGS
 from atom.compass.run import CLOCK_ENV, ENV, _write_whole, memory
 from atom.compass.spec import MachineSpec, across_ranks
 from atom.compass.spec.fields import PINNED
@@ -78,7 +79,6 @@ RAPIDSERVE_RUNNER = (
 #: ATOM's dummy weights flag; its parser reads `_` in a flag as `-`.
 LOAD_DUMMY = "--load-dummy"
 START_TIMEOUT_S = 3600
-LOG, READINGS = "engine.log", "readings"
 #: Where in `READINGS` a RapidServe decode engine writes its readings.
 DECODE = "decode"
 
