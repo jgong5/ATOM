@@ -136,7 +136,7 @@ Tasks are cut so each touches one module plus its tests.
 ```
 atom/compass/
   clock/      CA core, grant rule, channel table and path distances, LP registry, both transports
-  detect/     straggler check, stall diagnostic, CI clock-source lint
+  detect/     straggler check, stall diagnostic (the CI clock-source lint lives in tests/compass/)
   runner/     CompassModelRunner - the seam, RPC surface, forward semantics
   backends/   CostBackend interface, StepCost, provenance and method; the step-level and op-level backends
   memory/     device-reading substitution, per-term model
