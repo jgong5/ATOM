@@ -449,13 +449,20 @@ def test_planted_outliers_are_dropped_in_their_own_source_of_the_by_source_repor
 def test_a_one_source_fit_reports_its_source_at_the_members_centre_and_mad(
     tmp_path, run
 ):
-    """Replays alone, one decode one at 3 times its factor, which seed 0 fits
-    and drops: per kind, the source's counts, centre and MAD are the selected
-    member's, the dropped triples included in both."""
+    """Replays alone, each off its factor by up to 2%, so no member fits them
+    exactly, and one decode one at 3 times it, which seed 0 fits and drops: per
+    kind, the source's counts, centre and MAD are the selected member's, the
+    dropped triples included in both."""
     g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
     for line in nodes():
         measured(tmp_path, run, line)
-    replays = replayed(tmp_path, run, mixed() + mixed(seed=3), slow=1)
+    lines = mixed() + mixed(seed=3)
+    off = np.random.default_rng(4).uniform(0.98, 1.02, len(lines))
+    off[0] *= 3
+    replays = [
+        measured(tmp_path, run, x, "replay", time(x) * factor(x) * o)
+        for x, o in zip(lines, off)
+    ]
 
     copy = fitted(tmp_path, *replays, *clients(g), grid="grid")
 
