@@ -1908,8 +1908,9 @@ fields of one, and the simulated connector, standing in for `mooncake`, emits th
 seventeen.
 
 One of the four, `hash_block_size`, is load-bearing rather than descriptive, and so are
-`block_size` and `dcp_size`, which both blobs carry in the current code though the table's
-read predates them. The push consumer skips its cached prefix only when every check in
+`block_size` and `dcp_size`, which Mooncake's blob and the simulated connector's carry in
+the current code though the table's read predates them. The push consumer skips its
+cached prefix only when every check in
 `mooncake_connector.py::MooncakeConnectorScheduler.update_state_after_alloc` holds:
 
 - the producer's pages line up with its own
