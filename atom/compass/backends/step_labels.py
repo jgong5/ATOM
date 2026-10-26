@@ -6,7 +6,7 @@ A record is a real run's step record (`steps/dp<r>.jsonl`, written with
 that is not a dummy run a `Sample`: its batch view, its device label, its host
 labels and its provenance. `step_linear_fit` fits samples and `validate.cost`
 prices them; neither reads a step's stamps. Neither takes a record whose
-run.json names `BUILDS`, aiter JIT modules its server built while it served;
+run.json names `BUILDS`, the JIT compiles its server ran while it served;
 `refusal` says why.
 
 A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
