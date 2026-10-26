@@ -212,14 +212,12 @@ rm -rf $R/warm   # a restarted container's earlier warm-up, which serve would re
 D=600 serve $R/warm 0-7 1 $REAL_PY record --gpu $G
 ```
 
-A server compiles a kernel the first time it meets a variant its image did not
-prebuild: an aiter module, such as `mha_varlen_fwd`'s for a prefill step of one
-new token a row, about 60 s inside the run, or a Triton, Inductor, FlyDSL or
-`compile_hsaco` kernel outside ATOM's own compile cache
-(`atom.compass.drive.aiter_jit`). The container keeps each for every later
-server. A record whose server compiled one names it in run.json's
+A server builds an aiter, FlyDSL or `compile_hsaco` kernel, or a Triton or Inductor one outside ATOM's compile cache, the first time it meets a variant its image did
+not prebuild, such as `mha_varlen_fwd`'s for a prefill step of one new token a
+row, about 60 s inside the run, and the container keeps it for every later
+server. A record whose server built one names it in run.json's
 `aiter_jit_builds`, and grading, the fits and `validate.cost` refuse that
-record. This record takes those compiles; nothing reads it. `smoke_cell.sh`
+record. This record takes those builds; nothing reads it. `smoke_cell.sh`
 serves the same record before its calibration, so a container it ran in is
 warm. A restarted container takes this step again (Environment), over the
 `warm/` it took before. Success: `serve` returns 0.
