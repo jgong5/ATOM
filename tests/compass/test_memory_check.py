@@ -138,6 +138,20 @@ def test_each_reading_is_one_row_with_its_own_verdict(
     assert rows["reserves()"].split()[-2] == f"{saved['reserved']:,}"
 
 
+def test_a_real_pool_logged_as_zero_is_not_compared_and_both_numbers_are_shown(
+    monkeypatch, tmp_path, capsys
+):
+    saved = _memory(monkeypatch, tmp_path, eager=False, readings=CAPTURED)
+    peak, non_torch = _total(saved, "peak_torch"), _total(saved, "non_torch")
+    log = _log(tmp_path / "real.log", peak=peak, non_torch=non_torch, pool=0)
+    rows = _check(capsys, tmp_path, log)
+    assert rows["non_torch"].endswith("pass")
+    assert (
+        "graph pool not compared: the real run's capture reserved 0.00GB; "
+        f"reserves() {saved['reserved']:,} B, predicts() {POOL:,} B"
+    ) in rows["out"]
+
+
 def test_a_real_run_at_another_warmup_shape_refuses_peak_torch_only(
     monkeypatch, tmp_path, capsys
 ):

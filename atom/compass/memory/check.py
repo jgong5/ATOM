@@ -226,7 +226,14 @@ def parts(
     else:
         reserves = readings[graph_pool.RESERVES]
         predicts = _reading(graph_pool.PREDICTS, saved["predicts"])
-        out.append(compare_graph_pool(pool, reserves=reserves, predicts=predicts))
+        compared = compare_graph_pool(pool, reserves=reserves, predicts=predicts)
+        # A pool logged as 0.00GB is under 5 MiB, which nothing is a share of.
+        out.append(
+            compared
+            if pool.nbytes
+            else "graph pool not compared: the real run's capture reserved "
+            f"0.00GB; reserves() {reserves.total:,} B, predicts() {predicts.total:,} B"
+        )
     return out
 
 
