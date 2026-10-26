@@ -55,7 +55,6 @@ import re
 import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
-from types import SimpleNamespace
 
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactStore, Kind
@@ -84,13 +83,10 @@ NUMBER = r"(?<![\w.])\d+(?:\.\d+)?"
 def main(argv: list[str]) -> None:
     cut = argv.index("--") if "--" in argv else len(argv)
     atom_args = argv[cut + 1 :]
-    transfer = runfile._engine_args(atom_args).kv_transfer_config
-    side = compass_run._pd_side(
-        SimpleNamespace(kv_transfer_config=json.loads(transfer))
-    )
     joining = argparse.ArgumentParser(prog=PROG, add_help=False)
     joining.add_argument("--join")
     if joining.parse_known_args(argv[:cut])[0].join:
+        side = runfile.pd_side(atom_args)
         join(_joining_parser().parse_args(argv[:cut]), atom_args, side)
         return
     args = _parser().parse_args(argv[:cut])
@@ -100,13 +96,7 @@ def main(argv: list[str]) -> None:
             f"--coverage: --{key.replace('_', '-')} has no coverage check; only "
             "--step-grid's and --op-graph's steps are checked"
         )
-    if side is not None:
-        raise ValueError(
-            f"--kv-transfer-config {transfer} makes this a "
-            f"{'prefill' if side == 'P' else 'decode'} instance, which shares a "
-            "clock with its peer: join its deployment's authority with --join, as "
-            "scripts/compass/deploy.sh does"
-        )
+    runfile.pd_side(atom_args, refuse=True)
     run = runfile.build(args, atom_args)
     if record := args.acceptance_record:
         rates = measured(record, atom_args, run["data_parallel_size"])
