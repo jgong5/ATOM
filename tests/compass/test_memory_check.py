@@ -255,7 +255,7 @@ def test_a_dp_log_whose_ranks_disagree_pairs_each_rank_by_its_kv_blocks(
         (
             [100, 200, 200],
             [(100, 1.0), (200, 1.0), (200, 2.0)],
-            "which name no rank to pair with a hand-in",
+            "that log num_kvcache_blocks=200, the rank's, carry [(",
         ),
         (
             [100, 200, 300],

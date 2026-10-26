@@ -114,6 +114,12 @@ def _one(pattern: re.Pattern, text: str, log: Path, ranks: int, blocks=None) -> 
                 f"no line of {log} logs {count}, the rank's",
                 "compare the log of the server whose ranks recorded these steps",
             )
+        if len(set(found)) > 1:
+            raise MemoryRefusal(
+                f"the lines of {log} that log {count}, the rank's, carry "
+                f"{sorted(set(found))}",
+                "compare the log of one server start",
+            )
     if len(set(found)) > 1:
         raise MemoryRefusal(
             f"{log}'s ranks log {sorted(set(found))} on lines matching "
