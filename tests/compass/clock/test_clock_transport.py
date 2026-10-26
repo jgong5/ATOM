@@ -94,8 +94,8 @@ def _later(fn, *args):
     return box
 
 
-def _result(box):
-    ok, value = box.get(timeout=WAIT_S)
+def _result(box, timeout=WAIT_S):
+    ok, value = box.get(timeout=timeout)
     if not ok:
         raise value
     return value
