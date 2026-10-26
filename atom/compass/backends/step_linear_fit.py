@@ -132,6 +132,7 @@ from atom.compass.backends.step_linear import (
 )
 
 FORMS = ("base", "history", "shared")
+CONTEXT_PARALLEL = ("prefill_context_parallel_size", "decode_context_parallel_size")
 MAD_K = 3.5
 #: A relative residual this small is never an outlier, however tight the rest.
 MAD_FLOOR = 0.01
@@ -832,8 +833,20 @@ def engine_config(records) -> dict:
     return held[0]
 
 
+def refuse_context_parallel(engine: dict, where: str) -> None:
+    """Refuse an engine config that states a context-parallel width: a step
+    linear law states none, so a run at width 1 would price with it."""
+    if widths := [f"{k} {engine[k]}" for k in CONTEXT_PARALLEL if k in engine]:
+        raise ValueError(
+            f"{where} states {' and '.join(widths)}, and a step linear law states "
+            "no context-parallel width, so a run at width 1 would price with it"
+        )
+
+
 def join_width(engine: dict) -> int:
-    """The ranks a run's records join at: `engine`'s `data_parallel_size`."""
+    """The ranks a run's records join at: `engine`'s `data_parallel_size`.
+    An engine config stating a context-parallel width refuses."""
+    refuse_context_parallel(engine, "the records' engine config")
     if "data_parallel_size" not in engine:
         raise ValueError(
             "the records' engine config states no data_parallel_size, the ranks "
@@ -874,6 +887,7 @@ def main(argv=None) -> None:
         engine = keyed_of(json.loads(Path(args.engine).read_text()))
         for own in (Path(r).with_suffix(".engine.json") for r in args.records):
             held = keyed_of(json.loads(own.read_text())) if own.exists() else {}
+            refuse_context_parallel(held, str(own))
             if differ := [k for k, v in held.items() if engine.get(k, v) != v]:
                 raise ValueError(f"{own} contradicts {args.engine} in {differ}")
     else:
