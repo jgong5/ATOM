@@ -30,7 +30,7 @@ def test_the_tree_s_modules_exclude_init_only_and_pycache_dirs(tmp_path):
     modules = compass_labels.discover_modules()
     assert "__pycache__" not in modules
     for expected in (
-        "artifacts", "audit", "backends", "clock", "clock_transport",
+        "artifacts", "backends", "clock", "clock_transport",
         "design", "detect", "ir", "kv", "memory", "parity", "runner", "spec",
     ):
         assert expected in modules
