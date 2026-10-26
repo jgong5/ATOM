@@ -23,7 +23,6 @@ import pytest
 import torch
 from test_bench_replay import _line, rule  # noqa: F401  the rule fixture
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
-from test_parity_record import _unpriced  # noqa: F401  an autouse fixture
 
 from atom.compass import cli, ir
 from atom.compass.artifacts import ArtifactStore, Kind, machine_spec_digest
@@ -37,6 +36,8 @@ from atom.compass.spec.fields import PINNED
 from atom.config import Config
 from atom.utils import block_convert
 from atom.utils import forward_context as fctx
+
+pytestmark = pytest.mark.usefixtures("unpriced")
 
 F32 = "torch.float32"
 KEY = "model.layers.{L}.attn"

@@ -156,6 +156,18 @@ def scheduler(mock_config):
     return Scheduler(mock_config)
 
 
+@pytest.fixture(scope="module")
+def unpriced():
+    """A Compass step priced at zero, for modules whose subject is not the price.
+
+    Apply with `pytestmark = pytest.mark.usefixtures("unpriced")`."""
+    from atom.compass.runner import overrides
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(overrides, "_group_step_seconds", lambda *_: 0.0)
+        yield
+
+
 @pytest.fixture(autouse=True)
 def reset_sequence_counter():
     """Reset Sequence.counter before each test for predictable IDs."""
