@@ -507,3 +507,42 @@ def test_a_price_list_prices_a_collective_between_two_measured_sizes(rows, at, p
         assert got.reason == priced
     else:
         assert got.seconds == pytest.approx(priced)
+
+
+@pytest.mark.parametrize(
+    "mean, priced",
+    [
+        (3000, 57.5e-6),
+        (
+            6400,
+            (
+                "aiter.gemm: at B = 4, at mean = 1000, context = 8000 is outside "
+                "the measured 1024 to 1024"
+            ),
+        ),
+    ],
+)
+def test_a_family_with_ragged_points_leaves_out_a_uniform_point_the_pool_cut(
+    mean, priced
+):
+    # At 8000 tokens the pool cut the uniform point's other three rows to 4000:
+    # its rows hold a mean of 625 permille, not the 1000 its context names.
+    cut = _point(4, 82.5e3, context=8000)
+    cut["rows"] = [[1, 8000, True]] + [[1, 4000, True]] * 3
+    ragged = [_point(4, 20e3 + 100 * m, context=[8000, m]) for m in (250, 500)]
+    params = ops.fit([_point(4, 10e3), *ragged, cut])
+    ops.held_out(params)
+    (f,) = params["families"].values()
+    leaf = json.loads(_leaf(4, 128))
+
+    got = ops.PriceList(params).price((leaf, ("decode", None, 4, None, 8000, mean), 0))
+
+    assert sorted(c for c, *_ in f["points"]) == [
+        [4, 250, 8000],
+        [4, 500, 8000],
+        [4, 1000, 1024],
+    ]
+    if isinstance(priced, str):
+        assert got.reason == priced
+    else:
+        assert got.seconds == pytest.approx(priced)
