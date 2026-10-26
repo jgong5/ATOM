@@ -38,7 +38,7 @@ step from its own first on, its own or not, holds such a request, since its
 warmup has then not ended when it starts; when its export lacks traces or
 arguments; when its export lists `unnamed` requests, naming each by its
 `x_request_id`, since no step can be matched to them; and when its run.json
-names `aiter_jit_builds`, the aiter JIT modules its server built or began while
+names `aiter_jit_builds`, the JIT compiles its server ran or began while
 it served, since a step may have waited on a build (`compass record` and a real
 `cctraces_sim.sh` cell write it), or its steps hold `arrivals.json`. A real run is
 refused when its run.json holds `run_file`. A simulated run, refused without

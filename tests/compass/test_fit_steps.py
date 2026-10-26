@@ -351,7 +351,9 @@ def test_a_record_whose_server_built_an_aiter_module_refuses_naming_it(tmp_path)
     a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
     edit(b / "run.json", lambda r: r.update({BUILDS: ["mha_varlen_fwd"]}))
 
-    named = f"{b} is not fitted: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    named = (
+        f"{b} is not fitted: its server ran a JIT compile of ['mha_varlen_fwd'] while"
+    )
     with pytest.raises(SystemExit, match=re.escape(named)):
         fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
     assert not (tmp_path / "store").exists()

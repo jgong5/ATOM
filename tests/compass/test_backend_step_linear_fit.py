@@ -1045,7 +1045,7 @@ def test_the_command_refuses_a_record_whose_server_built_an_aiter_module(
     args = [record, "--out", str(tmp_path / "law.json"), *SPEC]
 
     (tmp_path / "out/run.json").write_text(json.dumps({BUILDS: ["mha_varlen_fwd"]}))
-    named = f"{record} is not fitted: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    named = f"{record} is not fitted: its server ran a JIT compile of ['mha_varlen_fwd'] while"
     with pytest.raises(ValueError, match=re.escape(named)):
         main(args)
     assert not (steps / "dp0.cost.jsonl").exists()

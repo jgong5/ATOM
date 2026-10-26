@@ -6,7 +6,7 @@ A record is a real run's step record (`steps/dp<r>.jsonl`, written with
 that is not a dummy run a `Sample`: its batch view, its device label, its host
 labels and its provenance. `step_linear_fit` fits samples and `validate.cost`
 prices them; neither reads a step's stamps. Neither takes a record whose
-run.json names `BUILDS`, aiter JIT modules its server built while it served;
+run.json names `BUILDS`, the JIT compiles its server ran while it served;
 `refusal` says why.
 
 A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
@@ -93,8 +93,8 @@ CUTS = ("exposed", "mixed", "unsplit", "paced")
 PACED_SHARE = 0.08
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
 TABLE_VERSION = 1
-#: run.json's entry naming the aiter JIT modules its server built while it
-#: served (`atom.compass.drive.aiter_jit`); a server that built none has none.
+#: run.json's entry naming the JIT modules and kernels its server compiled while
+#: it served (`atom.compass.drive.aiter_jit`); a server that compiled none has none.
 BUILDS = "aiter_jit_builds"
 
 
@@ -103,7 +103,7 @@ def refusal(run: dict) -> str | None:
     `run`, naming the modules of its `BUILDS`; None when it names none."""
     if builds := run.get(BUILDS):
         return (
-            f"aiter ran a JIT build of {builds} while its server served, "
+            f"its server ran a JIT compile of {builds} while it served, "
             "so a step may have waited on it"
         )
     return None
