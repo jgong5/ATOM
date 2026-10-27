@@ -76,16 +76,18 @@ for k in 1 2; do
     case "$RC" in 0 | 1) ;; *) refuse 1 "run $k: pytest rc=$RC, so the run did not complete" ;; esac
     [ -n "$SUMMARY" ] || refuse 1 "run $k printed no pytest summary line"
     [ "$ERRORS" -eq 0 ] || refuse 1 "run $k: $ERRORS error(s), and the gate holds its baseline to none"
-    grep '^FAILED ' "$WORK/$k.log" | sed -e 's/^FAILED //' -e 's/ - .*$//' | LC_ALL=C sort -u >"$WORK/$k.failed"
+    # In the order the run failed them, which a re-run keeps; compared sorted.
+    grep '^FAILED ' "$WORK/$k.log" | sed -e 's/^FAILED //' -e 's/ - .*$//' | awk '!seen[$0]++' >"$WORK/$k.failed"
+    LC_ALL=C sort "$WORK/$k.failed" >"$WORK/$k.sorted"
     NAMED=$(grep -c . "$WORK/$k.failed")
     [ "$NAMED" -eq "$FAILED" ] || refuse 1 "run $k: the summary says $FAILED failed but $NAMED FAILED line(s) name them"
     P[$k]=$PASSED
 done
 
-if [ "${P[1]}" -ne "${P[2]}" ] || ! cmp -s "$WORK/1.failed" "$WORK/2.failed"; then
+if [ "${P[1]}" -ne "${P[2]}" ] || ! cmp -s "$WORK/1.sorted" "$WORK/2.sorted"; then
     printf 'the two runs disagree: %s passed, then %s\n' "${P[1]}" "${P[2]}" >&2
-    LC_ALL=C comm -23 "$WORK/1.failed" "$WORK/2.failed" | sed 's/^/  failed in run 1 only: /' >&2
-    LC_ALL=C comm -13 "$WORK/1.failed" "$WORK/2.failed" | sed 's/^/  failed in run 2 only: /' >&2
+    LC_ALL=C comm -23 "$WORK/1.sorted" "$WORK/2.sorted" | sed 's/^/  failed in run 1 only: /' >&2
+    LC_ALL=C comm -13 "$WORK/1.sorted" "$WORK/2.sorted" | sed 's/^/  failed in run 2 only: /' >&2
     refuse 97 "the two runs disagree, so neither is a baseline"
 fi
 
@@ -107,12 +109,12 @@ EOF
 {
     cat <<EOF
 # SPDX-License-Identifier: MIT
-# The failing node-ids at gpu_gate_baseline.env's BASE_COMMIT, verbatim, that
-# both of regen_gpu_gate_baseline.sh's runs failed; it writes this file whole.
-# gate_gpu.sh judges failures by NAME and not only by count: a same-sized set
-# of *different* failures is a regression the counts cannot see. Blank lines
-# and # comments are ignored. The count here and BASE_FAILED are two statements
-# of one fact; gate_gpu.sh refuses to run if they disagree.
+# The failing node-ids at gpu_gate_baseline.env's BASE_COMMIT, verbatim and in
+# run order, that both of regen_gpu_gate_baseline.sh's runs failed; it writes
+# this file whole. gate_gpu.sh judges failures by NAME and not only by count: a
+# same-sized set of *different* failures is a regression the counts cannot see.
+# Blank lines and # comments are ignored. The count here and BASE_FAILED are two
+# statements of one fact; gate_gpu.sh refuses to run if they disagree.
 EOF
     cat "$WORK/1.failed"
 } >"$DIR/gpu_gate_known_failures.txt.tmp"

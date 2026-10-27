@@ -68,33 +68,31 @@ printf 'verdict: the last line of stdout; if this run is piped, $? is the pipe'"
 
 # The baseline is a pair AND the tree and toolchain it was measured on. A bare
 # pair cannot distinguish a regression from drift: after a torch bump, 4728/7
-# has no reading. regen_gpu_gate_baseline.sh measures all seven and writes them
-# to gpu_gate_baseline.env, beside the failures by name; changing either file is
-# a reviewed edit.
-#   BASE_PASSED, BASE_FAILED  the pair, over tests/ outside tests/plugin
-#   BASE_COMMIT               the commit measured
-#   BASE_TORCH                torch.__version__
-#   BASE_ROCM                 torch.version.hip: the HIP runtime, not the ROCm release
-#   BASE_AITER                aiter has no __version__, so `git describe --tags
-#                             --always --dirty` in the checkout it imports from
-#   BASE_COMPASS_TESTS        how many of BASE_PASSED came from tests/compass/;
-#                             the regenerated baseline runs none of them
+# has no reading. regen_gpu_gate_baseline.sh measures these seven constants and
+# writes them to gpu_gate_baseline.env; changing that file is a reviewed edit.
 #
-# Most known failures are AITER kernels or the gfx950-only formats they test, so
-# AITER is the likeliest single cause of a change that moves them -- a bump used
-# to pass the drift check in silence because only torch and HIP were compared.
+# BASE_ROCM is compared against torch.version.hip below, so it carries the HIP
+# runtime version, not the ROCm release.
 #
-# The pass count is checked for EQUALITY against BASE_PASSED adjusted by what
-# tests/compass/ contributes on this tree, so a surplus is accounted for rather
-# than absorbed. Every Compass task adds tests there; a task that adds tests
-# anywhere else makes this an explicit mismatch, which is the point.
+# AITER has no __version__; BASE_AITER is `git describe --tags --always` in the
+# source checkout aiter imports from. Most known failures are AITER kernels or the
+# gfx950-only formats they test, so AITER is the likeliest single cause of a
+# change that moves them -- a bump used to pass the drift check in silence
+# because only torch and HIP were compared.
 #
-# Both sides are PASS counts. BASE_COMPASS_TESTS was a pass count all along; the
-# tree side used to be a COLLECTED count, so the first Compass test to skip or
-# xfail on a GPU host would have made a legitimately green tree read
-# `unaccounted -1` and blamed tests outside tests/compass/. The tree side is now
-# the passes of the tests/compass run below, so the two are the same quantity by
-# construction rather than while a condition happens to hold.
+# BASE_COMPASS_TESTS is how many of BASE_PASSED came from tests/compass/ at
+# BASE_COMMIT; the regenerated baseline runs none of them. The pass count
+# is checked for EQUALITY against BASE_PASSED adjusted by what tests/compass/
+# contributes on this tree, so a surplus is accounted for rather than absorbed.
+# Every Compass task adds tests there; a task that adds tests anywhere else makes
+# this an explicit mismatch, which is the point.
+#
+# Both sides are PASS counts. This one was a pass count all along; the tree side
+# used to be a COLLECTED count, so the first Compass test to skip or xfail on a
+# GPU host would have made a legitimately green tree read `unaccounted -1` and
+# blamed tests outside tests/compass/. The tree side is now the passes of the
+# tests/compass run below, so the two are the same quantity by construction
+# rather than while a condition happens to hold.
 BASELINE=$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_baseline.env
 [ -r "$BASELINE" ] || {
     printf 'FATAL: %s is missing; the gate has no baseline.\n' "$BASELINE" >&2
