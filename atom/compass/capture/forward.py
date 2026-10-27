@@ -987,14 +987,16 @@ def _weights(model):
                 yield value
 
 
-def _batch(shape, block_size, context=1, output=True, drafts=0):
+def _batch(shape, block_size, context=1, output=True, drafts=0, stateful=False):
     """`shape.seqs` sequences of `shape.tokens` new tokens between them, the
     first `tokens % seqs` one longer, each in blocks of its own; and the
     blocks they take. A decode sequence holds `context` tokens, and under a
     drafter of `drafts` tokens verifies that many more, as ATOM's scheduler
     schedules it. Unless `output`, every prefill sequence is a middle chunk,
     so the step samples nothing. Under a drafter a prefill row states its next
-    token, -1 where the step samples it, as ATOM's scheduler states it."""
+    token, -1 where the step samples it, as ATOM's scheduler states it. A
+    `stateful` model's sequence holds a state slot of its own, as ATOM's block
+    manager gives one to a model with per-request cache."""
     from atom.model_engine import sequence
     from atom.model_engine.scheduler import ScheduledBatch
 
@@ -1013,6 +1015,8 @@ def _batch(shape, block_size, context=1, output=True, drafts=0):
         seq.num_cached_tokens = held - count
         taken = -(-held // block_size)
         seq.block_table = sequence.new_block_table(list(range(blocks, blocks + taken)))
+        if stateful:  # its own committed state slot, as the block manager gives it
+            seq.has_per_req_cache, seq.state_slots = True, [index]
         seqs[seq.id], blocks = seq, blocks + taken
     batch = ScheduledBatch(
         seqs=seqs,
@@ -1189,6 +1193,10 @@ def capture(
         weights = map(_storage, (w for m in models for w in _weights(m)))
         recorder.roles = dict.fromkeys(weights, ir.Role.WEIGHT)
         recorder.creating = ir.Role.KV
+        from atom.model_engine.llm_engine import InputOutputProcessor
+
+        per_req = InputOutputProcessor._per_req_cache_model_types()
+        stateful = config.hf_config.model_type in per_req
         blocks = max(
             _batch(s, block_size, max(CONTEXTS), True, drafts)[1] for s in shapes
         )
@@ -1226,7 +1234,7 @@ def capture(
             traces = []
             for context in CONTEXTS if shape.phase == "decode" else CONTEXTS[:1]:
                 recorder.creating = ir.Role.METADATA
-                batch = (shape, block_size, context, output, drafts)
+                batch = (shape, block_size, context, output, drafts, stateful)
                 with fake_mode, recorder:
                     # A runner's first step takes its own path (a decode
                     # fills no deferred ids), so the traced step follows two
