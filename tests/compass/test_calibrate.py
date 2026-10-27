@@ -185,14 +185,12 @@ def test_a_failed_step_is_named_and_ends_the_run(tmp_path, fail, step, ran):
     assert len(log) == ran
 
 
-def test_a_record_taken_again_takes_the_fits_again(tmp_path):
+def test_a_record_left_after_a_fit_refuses_and_records_nothing(tmp_path):
     _calibrate(tmp_path, "1")
     shutil.rmtree(tmp_path / "o" / "cal1-c1")
     r, log = _calibrate(tmp_path, "1")
-    assert r.returncode == 0, r.stderr
-    assert [line[:8] for line in log] == [
-        "record -",
-        "client /",
-        "fit step",
-        "fit host",
-    ]
+    assert r.returncode == 1
+    law = tmp_path / "o" / "fit_steps" / "step_linear_law.json"
+    assert f"step cal1-c1 failed: {law} was fitted without it" in r.stderr
+    assert "calibrate into a new OUT" in r.stderr
+    assert log == []

@@ -40,7 +40,9 @@
 # `server_stopped`, measure memory's or a fit's readable copy. A step stopped
 # before its output exists is taken again, its directory removed first. A fit
 # that refuses a record, such as one whose server built a JIT kernel, names it:
-# remove that record's directory and run again. It prints
+# remove that record's directory and run again. A record left to take once a fit
+# has published refuses, before it serves: the fit's key names no record, so the
+# store refuses that fit again, and the calibration needs a new OUT. It prints
 # the tokens, the law's held-out errors per band, the `compass run` line that
 # prices by the law, and the wall time. It exits 2 on bad arguments or inputs,
 # 90 to 99 as _lib.sh's tree checks refuse, else 1 naming the step that failed.
@@ -134,10 +136,12 @@ k=0 dirs=() runs=()
 for r; do
     read -r c scenario <<<"$r"
     name=cal$((++k))-c$c
-    # A record taken after the fits leaves them to be taken again: the store
-    # then refuses their entries' overwrite rather than keep a stale law.
-    todo "$name" "${STOPPED[@]}" && serve "$name" "$CAL" "$c" "$DURATION_S" "$scenario" &&
-        rm -rf "$OUT/fit_steps" "$OUT/fit_host"
+    if todo "$name" "${STOPPED[@]}"; then
+        for f in fit_steps/step_linear_law.json fit_host/host_laws.json; do
+            [[ -e $OUT/$f ]] && fail "$name" "$OUT/$f was fitted without it, and the store refuses a second fit of its key; calibrate into a new OUT"
+        done
+        serve "$name" "$CAL" "$c" "$DURATION_S" "$scenario"
+    fi
     dirs+=("$OUT/$name") runs+=(--client-run "$OUT/$name" "$OUT/$name/artifacts/client_run.json")
 done
 todo fit_steps step_linear_law.json && step fit_steps python3 -c "$CLI" fit steps \
