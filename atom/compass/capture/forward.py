@@ -719,13 +719,15 @@ def _patches(recorder):
       runs it, which would open every shard, or download them for a hub name.
     * A step ATOM splits into two micro-batches (`--enable-tbo`) is refused by
       name before its threads start: one graph cannot hold the two.
-    * The step's DP exchange (`sync_dp_metadata`) runs on the host: `decide`
-      runs it on a group of one too, and reads its packed rows back as numpy.
+    * The step's DP exchange (`sync_dp_metadata`) runs on the host, outside
+      the fake mode and the recorder: `decide` runs it on a group of one too,
+      and reads its packed rows back as numpy.
     """
     import flydsl
     import triton
     from flydsl.compiler import jit_function as fly
     from torch._subclasses.fake_tensor import unset_fake_temporarily
+    from torch.utils._python_dispatch import _disable_current_modes
     from triton.compiler.compiler import CompiledKernel
     from triton.runtime.jit import JITFunction
 
@@ -814,7 +816,8 @@ def _patches(recorder):
             return conv1d(*args, **kwargs)
 
     def host_sync(**kwargs):
-        with unset_fake_temporarily():
+        # Outside every mode: host arithmetic, not the step's device work.
+        with _disable_current_modes():
             return sync(**kwargs)
 
     def replayssm(builder, md, num_reqs, is_prefill):
