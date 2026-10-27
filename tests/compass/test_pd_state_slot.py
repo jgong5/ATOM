@@ -129,7 +129,8 @@ def test_a_transfer_moves_the_slot_atoms_regions_carry_beside_its_blocks(
     link = run["machine"]["interconnect"]["intra_node"]
     block, slot = built[model]["page_units"], built[model]["slot_units"]
     assert (transfer.bytes_per_block, transfer.slot_bytes) == (block, slot)
-    assert transfer.duration_s(BLOCKS) == pytest.approx(
+    # A write of the prompt's blocks on this connector's own rank pair.
+    assert half._written(next(iter(half._socks)), 0.0, BLOCKS) == pytest.approx(
         link["link_latency_s"]
         + (BLOCKS * block + slot)
         / (link["link_bandwidth_bytes_per_s"] * link["derate"])
