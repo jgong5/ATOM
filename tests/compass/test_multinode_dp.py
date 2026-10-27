@@ -184,19 +184,20 @@ def _node(rank: int):
 
 @pytest.fixture
 def standalone(monkeypatch, tmp_path):
-    """A two-rank run file whose clock endpoint each node names."""
-    run = _run_file(tmp_path, data_parallel_size=2)
-    endpoint = json.loads(run.read_text())["clock_endpoint"]
-    monkeypatch.setenv(compass_run.ENV, str(run))
-    monkeypatch.setenv(compass_run.CLOCK_ENV, endpoint)
-    monkeypatch.setattr(clock, "_installed", None)
-    monkeypatch.setattr(compass_run, "_authority", None)
-    monkeypatch.setattr(
-        CoreManager,
-        "broadcast_utility_command_sync",
-        CoreManager.broadcast_utility_command_sync,
-    )
-    return endpoint
+    """A two-rank run file whose clock endpoint, on a held port, each node names."""
+    with held_ports(1) as [port]:
+        endpoint = f"tcp://127.0.0.1:{port}"
+        run = _run_file(tmp_path, clock_endpoint=endpoint, data_parallel_size=2)
+        monkeypatch.setenv(compass_run.ENV, str(run))
+        monkeypatch.setenv(compass_run.CLOCK_ENV, endpoint)
+        monkeypatch.setattr(clock, "_installed", None)
+        monkeypatch.setattr(compass_run, "_authority", None)
+        monkeypatch.setattr(
+            CoreManager,
+            "broadcast_utility_command_sync",
+            CoreManager.broadcast_utility_command_sync,
+        )
+        yield endpoint
 
 
 def test_each_node_joins_the_authority_and_only_the_coordinator_is_a_frontend(
