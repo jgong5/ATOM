@@ -241,6 +241,36 @@ A change to atomesh's `Cargo.toml` that needs a crate the cache lacks makes the
 probe fail, and so the gate exit 96, until `cargo fetch` runs in that tree's
 `atom/mesh` in the container, with the network.
 
+## The MI455 image, and what stops a TP4 start in it
+
+The gate image ships no gfx1250 kernels. MI455 work runs under
+`rocm/fw-bringup-mlperf:gfx1250-atom-20261026-dsv41` (`sha256:fd7450fde2da`),
+whose aiter is a git checkout (`/app/aiter`) and which carries `rocm-smi`, the
+two things `compass measure memory` reads for the stack and the device. Its
+entrypoint is `/bin/bash`, so the command is `-c`; a tree runs as in the gate,
+a `snapshot.sh` tarball extracted inside and run from `/` with `PYTHONPATH=$T`:
+
+```
+docker run -d --name <user>_mi455 --network host --device /dev/kfd --device /dev/dri \
+  --group-add video --ipc host -v <parent>:<parent> -v <models>:<models> \
+  rocm/fw-bringup-mlperf:gfx1250-atom-20261026-dsv41 -c 'sleep infinity'
+```
+
+DeepSeek-V4.1-Flash's gfx1250 flags are in
+[its recipe](../../recipes/DeepSeek-V4.1-Flash.md#gfx1250-mi455x). Two things stop
+`ec341a05a` serving it at TP4 in this image on an A0 node (ctheliosp-rck-g02-j07-04,
+four cards, 250 GB of host memory, 2026-10-27):
+
+- **Every process translates its own GPU code.** On a gfx1250 A0 card ROCr
+  rewrites each B0 code object a process loads for A0, in that process, and keeps
+  nothing for the next; `HSA_HOTSWAP_VERBOSE=1` logs `installed eager gfx1250
+  B0-to-A0 hook` there. A rank's first RCCL communicator, alone on the node, took
+  285 s and 70 GB of host memory at peak, and kept 54 GB. Four ranks took the
+  host's available memory from 203 GB to 4 GB in `ncclCommInitRank`, so watch
+  `MemAvailable` while more than one such process starts.
+- **Its aiter lacks `ROCm/aiter#6833`:** `fused_dual_rmsnorm_mxfp8_quant` takes
+  no `amax_floor`, which V4.1's `DualRMSNormMXFP8` passes.
+
 ## A red CPU gate that may not be your diff — one flaky test in ATOM's suite
 
 `tests/entrypoints/test_stream_marker_properties.py::TestTheRegionIsNotCopiedPerChunk`
