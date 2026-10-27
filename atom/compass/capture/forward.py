@@ -921,8 +921,16 @@ def _build_runner(config, fake_mode):
     shard opened, under `_patches`), and the declared device's memory is all
     free.
     """
+    from aiter.ops import attention
+
     from atom.model_engine.model_runner import DeviceMemoryReadings, ModelRunner
     from atom.utils import h2d
+
+    # aiter sizes MLA's metadata for the arch its C++ planner reads off the
+    # device through HIP; the declared device answers, for every later step too.
+    attention._mla_cpp_gpu_arch = lambda index: (
+        torch.cuda.get_device_properties(index).gcnArchName
+    )
 
     class _CapturedRunner(ModelRunner):
         def _setup_device_and_distributed(self, rank, config):

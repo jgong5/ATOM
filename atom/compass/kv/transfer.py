@@ -5,9 +5,10 @@ One transfer is priced as `latency + bytes / bandwidth`, and the three terms
 come from three different places on purpose.
 
 **The bytes are exact.** A transfer moves a whole number of paged blocks, and
-what one block costs is the geometry the engine was built with, not a
-measurement -- so the byte count carries no error at all and nothing here
-re-derives a KV layout.
+what one block costs is the entry of the paged class the engine's runner
+planned its pool with, not a measurement -- so the byte count carries no error
+at all and nothing here re-derives a KV layout. A model whose transfer also
+carries the request's state slot moves one planned slot beside its blocks.
 
 **The bandwidth is a spec peak, and it is spent at the derate the spec
 declares.** A datasheet number spent as an achievable one would make every
@@ -33,9 +34,10 @@ of the same blocks cost the same here, which is a claim about the fabric being
 symmetric that this model cannot check.
 
 Writes on one `Link` move one at a time, in arrival order. A link's first
-write that moves blocks also pays the link's one-off setup, when the spec
-declares one; a zero-block write makes no transfer call and pays none. Writes on
-different links do not contend, even where real ones would share a NIC.
+write that moves bytes also pays the link's one-off setup, when the spec
+declares one; a write that moves no block and no slot makes no transfer call
+and pays none. Writes on different links do not contend, even where real ones
+would share a NIC.
 
 Nothing in this module imports the engine or a tensor library. Reaching it
 through the package around it is not the same import: `atom.compass.kv` loads
@@ -71,12 +73,15 @@ class TransferModel:
     `bandwidth_bytes_per_s` is what a transfer actually reaches, not what the
     link is rated at -- `from_spec` applies the derate before it gets here, so
     a model built by hand in a test states an achievable number too.
+    `slot_bytes` is the request's state slot, which every transfer moves beside
+    its blocks; 0 for a model whose transfer carries none.
     """
 
     latency_s: float
     bandwidth_bytes_per_s: float
     bytes_per_block: int
     setup_s: float = 0.0
+    slot_bytes: int = 0
 
     def __post_init__(self) -> None:
         if self.latency_s < 0:
@@ -92,10 +97,15 @@ class TransferModel:
             raise ValueError(
                 f"bytes_per_block must be at least 1, got {self.bytes_per_block}"
             )
+        if self.slot_bytes < 0:
+            raise ValueError(f"slot_bytes must not be negative, got {self.slot_bytes}")
 
     @classmethod
-    def from_spec(cls, spec, geometry, scope: Scope) -> TransferModel:
-        """Price a block of *geometry* on the *scope* link of *spec*.
+    def from_spec(
+        cls, spec, bytes_per_block: int, scope: Scope, slot_bytes: int = 0
+    ) -> TransferModel:
+        """Price a block of *bytes_per_block*, and a state slot of
+        *slot_bytes* per transfer, on the *scope* link of *spec*.
 
         The spec refuses a link it does not carry, and refuses a peak
         bandwidth whose derate is missing; both refusals travel out of here
@@ -107,16 +117,22 @@ class TransferModel:
         return cls(
             latency_s=spec.value(f"{link}.link_latency_s"),
             bandwidth_bytes_per_s=peak * derate,
-            bytes_per_block=geometry.bytes_per_block,
+            bytes_per_block=bytes_per_block,
             setup_s=spec.values.get(f"{link}.link_setup_s", 0.0),
+            slot_bytes=slot_bytes,
         )
+
+    def bytes_moved(self, blocks: int) -> int:
+        """The bytes a write of *blocks* moves: its blocks and the state slot."""
+        return blocks * self.bytes_per_block + self.slot_bytes
 
     def duration_s(self, blocks: int) -> float:
         """How long *blocks* take on this link.
 
         Zero blocks is a real case -- a consumer whose prefix cache already
         holds the whole prompt still has a transfer to complete -- and it
-        costs the latency, because the two ends still have to say so.
+        costs the latency, because the two ends still have to say so, and
+        the state slot, which no prefix cache holds.
         """
         if blocks < 0:
             raise ValueError(
@@ -125,10 +141,7 @@ class TransferModel:
                 "allocation, which would price a transfer that finishes "
                 "before it starts"
             )
-        return (
-            self.latency_s
-            + (blocks * self.bytes_per_block) / self.bandwidth_bytes_per_s
-        )
+        return self.latency_s + self.bytes_moved(blocks) / self.bandwidth_bytes_per_s
 
     def release_at(self, issue_time_s: float, blocks: int) -> float:
         """The time this transfer may be reported finished, and not before."""
@@ -143,14 +156,15 @@ class Link:
     after its last byte. Its completion is fixed when it arrives, so two
     holders fed the same arrivals in the same order compute the same times. A
     write alone on the link completes at `a + duration_s(blocks)`, and the
-    link's first write with blocks starts `setup_s` after it would otherwise.
+    link's first write that moves bytes starts `setup_s` after it would
+    otherwise.
     """
 
     def __init__(self, model: TransferModel) -> None:
         self._model = model
         self._last = -math.inf  # the latest arrival
         self._free = -math.inf  # when the link has moved every byte so far
-        self._set_up = False  # whether a write with blocks has paid setup_s
+        self._set_up = False  # whether a write that moves bytes has paid setup_s
 
     def start(self, a: float, blocks: int) -> float:
         """A write of `blocks` arrives at `a`; when it completes."""
@@ -161,11 +175,10 @@ class Link:
             )
         self._last = a
         start = max(a, self._free)
-        if blocks > 0 and not self._set_up:
+        moved = self._model.bytes_moved(blocks)
+        if moved > 0 and not self._set_up:
             self._set_up = True
             start += self._model.setup_s
         done = start + self._model.duration_s(blocks)
-        self._free = start + blocks * self._model.bytes_per_block / (
-            self._model.bandwidth_bytes_per_s
-        )
+        self._free = start + moved / self._model.bandwidth_bytes_per_s
         return done

@@ -21,8 +21,10 @@ and every idle drain tick, one call after the first whose clock reached their
 time: the engine's KV aggregation keeps one poll in flight, so a real poll
 returns what the workers had seen at the previous one. ``c`` is when the
 write completes on its rank pair's `Link`, which moves the pair's writes one
-at a time, each priced by the `TransferModel` bound at
-``kv_transfer_config[TRANSFER_KEY]``. Both ends feed it the same writes in the
+at a time, each its blocks and, as Mooncake moves a DeepSeek-V4 request's, its
+state slot, priced by the `TransferModel` bound at
+``kv_transfer_config[TRANSFER_KEY]``, or returned, as the connector is built, by
+a callable bound there. Both ends feed it the same writes in the
 same order, so write-done is not a message: both already know its time. The write
 request travels over the zmq address at ``kv_transfer_config[WRITE_REQ_KEY]``,
 which prefill binds and decode connects to.
@@ -60,7 +62,8 @@ from atom.kv_transfer.disaggregation.types import ConnectorMetadata
 
 logger = logging.getLogger(__name__)
 
-#: Where the harness binds the priced transfer model.
+#: Where the harness binds the priced transfer model, or a callable that
+#: returns it once the engine's runner has planned its pool.
 TRANSFER_KEY = "compass_transfer"
 
 #: The zmq address the write requests travel over.
@@ -89,8 +92,11 @@ def _is_producer(kv_config: dict) -> bool:
 
 
 def _bound_transfer(kv_config: dict) -> tuple[TransferModel, ...]:
-    """The bound transfer model of each prefill stage."""
+    """The bound transfer model of each prefill stage, from a callable bound
+    in its place called now."""
     model = kv_config.get(TRANSFER_KEY)
+    if callable(model):
+        model = model()
     models = (model,) if isinstance(model, TransferModel) else model
     if not (
         isinstance(models, tuple)
@@ -100,8 +106,8 @@ def _bound_transfer(kv_config: dict) -> tuple[TransferModel, ...]:
         raise UnboundSeam(
             f"kv_transfer_config[{TRANSFER_KEY!r}] holds {model!r}, where this "
             "connector needs a TransferModel, or one per prefill stage, priced "
-            "from the machine spec's interconnect and the KV geometry of the "
-            "model being simulated"
+            "from the machine spec's interconnect and the paged KV block the "
+            "engine's runner planned"
         )
     return models
 

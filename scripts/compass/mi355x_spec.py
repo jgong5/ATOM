@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""The mi355-gpu-45 MI355X machine spec, from a tokenizer swept here and one real start.
+"""The mi355-gpu-45 MI355X machine spec, from the tokenizers swept here and one real start.
 
-    python3 scripts/compass/mi355x_spec.py [--sweep-from DOC] [--out PATH]
+    python3 scripts/compass/mi355x_spec.py [--model M ...] [--sweep-from DOC] [--out PATH]
 
 The device fragment is one DeepSeek-V4-Pro start at the nightly DPA-TP8 prefill
 side's arguments (`FLAGS`): the device, its capacity and the stack. One real
@@ -10,7 +10,8 @@ burst at the same arguments adds the HTTP intake terms (`INTAKE`), and
 bandwidth curve, the kernel floor and the intra-node link's latency and derate.
 The peaks are the datasheet's; the rest is assumed. An engine start's memory
 readings are `compass measure memory`'s, not the spec's.
-`--sweep-from` takes the tokenizer sweep from a document this script wrote.
+`--model` and `--sweep-from` work as `mi308x_spec.py`'s do; with neither the
+script sweeps DeepSeek-V4-Pro's tokenizer.
 """
 
 import argparse
@@ -176,10 +177,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     out = Path(__file__).resolve().parent / "machines" / f"{NAME}.json"
     parser.add_argument("--out", type=Path, default=out)
+    parser.add_argument("--model", action="append", help="repeats; default " + MODEL)
     parser.add_argument("--sweep-from", type=Path, help="a document to reuse")
     args = parser.parse_args(argv)
-    sweep = saved(args.sweep_from) if args.sweep_from else swept(MODEL)
-    merged = merge([sweep, *device_fragments()])
+    sweeps = [saved(args.sweep_from)] if args.sweep_from else []
+    if args.model or not sweeps:
+        sweeps += swept(args.model or [MODEL])
+    merged = merge([*sweeps, *device_fragments()])
     verdict = validate(merged.document)
     print(verdict)
     if not verdict.ok:

@@ -19,101 +19,31 @@
 tests/attentions/deepseek_v41/test_cache.py
 tests/attentions/deepseek_v41/test_metadata.py
 tests/attentions/deepseek_v41/test_tbo.py
-tests/model_ops/test_balance_router_logits.py
 tests/model_ops/test_blockscale_dispatch.py
-tests/model_ops/test_dp_gather_routed_rows.py
 tests/model_ops/test_fused_rmsnorm_mxfp8.py
 tests/model_ops/test_glm5_kpool_kernels.py
-tests/model_ops/test_indexer_cp_parity.py
-tests/model_ops/test_indexer_rows.py
-tests/model_ops/test_kimi_k3_activations.py
-tests/model_ops/test_mori_protocol_selection.py
 tests/model_ops/test_qsa_quantized_cache.py
-tests/model_ops/test_qsa_stacked_scorer.py
-tests/model_ops/test_rccl_prepare_finalize.py
-tests/model_ops/test_shared_expert_dispatch.py
-tests/model_ops/test_triton_dynamic_shapes.py
 tests/model_ops/test_triton_mla_decode.py
 tests/model_ops/test_v4_fused_decode.py
-tests/model_ops/test_v4_hca_persist_gpu.py
 tests/models/deepseek_v41/test_attention.py
 tests/models/deepseek_v41/test_attention_streams.py
 tests/models/deepseek_v41/test_dspark_integration.py
 tests/models/deepseek_v41/test_moe_quant_config.py
 tests/models/deepseek_v41/test_normalization.py
-tests/models/deepseek_v41/test_projections.py
-tests/models/deepseek_v41/test_rotary.py
 tests/models/deepseek_v41/test_sparse_attention.py
 tests/models/deepseek_v41/test_speculative_state.py
-tests/models/glm52/test_fused_indexer_dispatch.py
-tests/models/glm52/test_fused_indexer_weights.py
-tests/models/glm52/test_mono_layout_refusal.py
-tests/models/glm52/test_mono_prepare_refusals.py
-tests/models/glm52/test_mono_runner.py
 tests/models/test_glm_moe_router_dtype.py
-tests/models/test_kimi_k3_mono_aux_taps.py
-tests/models/test_kimi_k3_mono_state_pools.py
-tests/test_cudagraph_capture_bounds.py
-tests/test_dcp_merge_ops.py
-tests/test_dcp_sparse_filter.py
-tests/test_dcp_topk.py
 tests/test_deepseek_v41_mono_build_key.py
 tests/test_deepseek_v41_mono_contract.py
 tests/test_deepseek_v41_mono_dispatch.py
 tests/test_deepseek_v41_mono_tp_widths.py
-tests/test_deepseek_v4_wo_a_dequant.py
-tests/test_dp_sharded_argmax.py
 tests/test_dspark.py
-tests/test_dspark_markov_sample.py
-tests/test_dspark_swa_fp8_2buff.py
-tests/test_dummy_weight_init.py
-tests/test_eplb_metadata.py
-tests/test_eplb_module_a.py
-tests/test_eplb_module_b.py
-tests/test_eplb_module_c.py
-tests/test_eplb_module_d.py
-tests/test_eplb_module_e.py
-tests/test_eplb_unplaced_layer.py
-tests/test_fp4_indexer_kv_transfer_gate.py
-tests/test_gdn_draft_kv_slots.py
-tests/test_gdn_num_accepted_tokens.py
-tests/test_gdn_state_relocation.py
-tests/test_gdn_stateless_row_indices.py
-tests/test_glm5_next_kpool_state.py
-tests/test_iq2r_moe_method.py
-tests/test_kda_checkpoint_slot_copy.py
-tests/test_kda_layout_id.py
-tests/test_lm_head_argmax.py
-tests/test_lm_head_argmax_out.py
-tests/test_mega_mxfp4_method.py
 tests/test_merge_attn_states.py
-tests/test_minimax_m31_shared_fusion.py
-tests/test_minimax_m3_index_topk.py
-tests/test_minimax_m3_mono_build_key.py
-tests/test_minimax_m3_mono_contract.py
-tests/test_minimax_m3_mono_dispatch.py
-tests/test_minimax_m3_sparse_pa_floor.py
 tests/test_mla_chunk_workspace_width.py
-tests/test_mla_flydsl_gather_dispatch.py
-tests/test_mla_index_cache.py
-tests/test_model_runner_decode_padding.py
-tests/test_moe_online_quant_batch.py
-tests/test_mori_dispatch_trim_bound.py
-tests/test_mtp_draft_warmup_workplan.py
-tests/test_mxfp4_moe_has_bias.py
-tests/test_nvfp4_loading.py
-tests/test_output_transfer_runner.py
-tests/test_paged_attention_dispatch.py
-tests/test_postprocess_width.py
+tests/test_mxfp4_triton_moe_decode.py
 tests/test_qwen4_exp_mtp.py
 tests/test_qwen4_exp_quantization.py
-tests/test_sampler_greedy_rows.py
-tests/test_sampler_scalar_filters.py
-tests/test_spec_deferred_status_queue.py
-tests/test_speculative_sampling.py
-tests/test_v4_checkpoint_slot_copy.py
 tests/test_v4_hca_persist_dispatch.py
-tests/test_v4_opus_plan_metadata.py
 tests/test_v4_prefill_asm_decode_dispatch.py
 # END GENERATED
 # BEGIN MANUAL
@@ -142,33 +72,28 @@ tests/models/deepseek_v41/test_linear.py
 tests/models/deepseek_v41/test_moe_streams.py
 # fails at setup or call in aiter chip_info, `No gfx arch found in rocminfo output.` (no driver); new-image CPU container, 12849025b
 tests/models/deepseek_v41/test_weights.py
+# fails without a driver on nightly 20261026: `torch.finfo() requires a
+# floating point input type`, aiter's fp8 dtype unresolved; pure upstream e893780f4 + f6a0c132 fails the same, ca8a54916
+tests/models/glm52/test_fused_indexer_weights.py
 # fails without a driver on nightly 20261026: Triton's arch probe finds `0 active
 # drivers` and aiter's fallback raises `No module named 'jax'`; pure upstream
 # e893780f4 + f6a0c132 fails the same, 3d5ad18d6
 tests/models/glm52/test_indexer_cp_switch.py
-# passes alone, fails in this gate: aiter's import raises `KeyError:
-# 'module_aiter_core'` (or `'aiter'`) once the Compass test modules that
-# import ATOM under an aiter stand-in have been collected, and pure upstream,
-# collecting none of them, passes it; nightly 20261026 CPU container, 3d5ad18d6
-tests/models/test_kimi_k3_mono_layouts.py
-# passes alone, fails in this gate: aiter's import raises `KeyError:
-# 'module_aiter_core'` (or `'aiter'`) once the Compass test modules that
-# import ATOM under an aiter stand-in have been collected, and pure upstream,
-# collecting none of them, passes it; nightly 20261026 CPU container, 3d5ad18d6
-tests/models/test_kimi_k3_mono_max_rows.py
-# passes alone, fails in this gate: aiter's import raises `KeyError:
-# 'module_aiter_core'` (or `'aiter'`) once the Compass test modules that
-# import ATOM under an aiter stand-in have been collected, and pure upstream,
-# collecting none of them, passes it; nightly 20261026 CPU container, 3d5ad18d6
+# fails without a driver on nightly 20261026: `HIP error: no ROCm-capable
+# device is detected`; pure upstream e893780f4 + f6a0c132 errors collecting it
+# on `0 active drivers`, ca8a54916
+tests/models/glm52/test_mono_prepare_refusals.py
+# test_forward_pre_o_is_forward_without_o_proj fails without a driver on nightly
+# 20261026: importing atom.models.kimi_k3.model raises `torch.finfo() requires a
+# floating point input type`, aiter's fp8 dtype unresolved; pure upstream
+# e893780f4 + f6a0c132 fails it there on `0 active drivers`, 4259f1b93
 tests/models/test_kimi_k3_mono_mla_k2.py
-# passes alone, fails in this gate: aiter's import raises `KeyError:
-# 'module_aiter_core'` (or `'aiter'`) once the Compass test modules that
-# import ATOM under an aiter stand-in have been collected, and pure upstream,
-# collecting none of them, passes it; nightly 20261026 CPU container, 3d5ad18d6
-tests/models/test_kimi_k3_mono_plan.py
 # test_agentic_dispatch_replay_preserves_profile fails: build_agentic_benchmark_matrix
 # runs `git rev-parse HEAD`, and the gate's git-archive snapshot has no .git; 12849025b
 tests/test_benchmark_catalog.py
+# fails without a driver on nightly 20261026: Triton's arch probe finds `0 active
+# drivers` and aiter's fallback raises `No module named 'jax'`; pure upstream e893780f4 + f6a0c132 fails the same, ca8a54916
+tests/test_deepseek_v4_wo_a_dequant.py
 # fails without a driver on nightly 20261026: Triton's arch probe finds `0 active
 # drivers` and aiter's fallback raises `No module named 'jax'`; pure upstream
 # e893780f4 + f6a0c132 fails the same, 3d5ad18d6
@@ -177,21 +102,24 @@ tests/test_gdn_page_checkpoint.py
 # drivers` and aiter's fallback raises `No module named 'jax'`; pure upstream
 # e893780f4 + f6a0c132 fails the same, 3d5ad18d6
 tests/test_glm5_next_mtp_routing.py
-# passes alone, fails in this gate: the unstrided case with dynamo `KeyError: aiter`
-# (the aiter.utility namespace package, as for test_sparse_indexer_side_effect_op.py);
-# new-image CPU container, nightly 20261013, b5452da1a
-tests/test_graph_marker.py
-# passes alone, fails in this gate: one test with dynamo `KeyError: aiter` (the
-# aiter.utility namespace package, as for test_sparse_indexer_side_effect_op.py),
-# the other re-registering `vllm::all_reduce`; new-image CPU container, 2026-10-13
+# fails on nightly 20261026's aiter: `No module named
+# 'aiter.ops.triton.fused_fp8_quant'`; pure upstream e893780f4 + f6a0c132 fails the same, ca8a54916
+tests/test_iq2r_moe_method.py
+# passes in this gate, but importing lmcache loads prometheus_client before
+# tests/test_scheduler_metrics.py sets PROMETHEUS_MULTIPROC_DIR, and 7 tests
+# there fail; pure upstream e893780f4 + f6a0c132 fails the same 7, 880467c94
 tests/test_lmcache_offload_disk_integration.py
+# fails without a driver on nightly 20261026: the layer's weight_loader finds
+# `'FusedMoE' object has no attribute 'quant_method'`; pure upstream e893780f4 + f6a0c132 fails the same, ca8a54916
+tests/test_minimax_m31_shared_fusion.py
+# fails without a driver on nightly 20261026: `torch.finfo() requires a
+# floating point input type`, aiter's fp8 dtype unresolved; pure upstream e893780f4 + f6a0c132 fails the same, ca8a54916
+tests/test_mla_flydsl_gather_dispatch.py
 # fails at setup or call in aiter chip_info, `No gfx arch found in rocminfo output.` (no driver); nightly 20261013 CPU container, b5452da1a
 tests/test_mla_kv_shuffled.py
+# test_batch_one_asks_for_the_ceiling fails without a driver on nightly
+# 20261026: `No HIP GPUs are available`; pure upstream e893780f4 + f6a0c132 fails the same, ca8a54916
+tests/test_paged_attention_dispatch.py
 # fails at setup or call in aiter chip_info, `No gfx arch found in rocminfo output.` (no driver); new-image CPU container, 12849025b
 tests/test_sparse_indexer_fp4.py
-# passes alone, fails in this gate with dynamo `KeyError: aiter`: with no driver
-# aiter's import fails and leaves the namespace package aiter.utility in
-# sys.modules without aiter, and torch's first custom-op registration under
-# torch.compile walks sys.modules through inspect.getmodule; 25740469b
-tests/test_sparse_indexer_side_effect_op.py
 # END MANUAL

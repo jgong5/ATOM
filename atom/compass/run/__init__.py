@@ -145,9 +145,13 @@ Its ``router`` entry, `router_binary`'s record of the binary that ran it, is
 per-run and goes to the summary as it is. A deployment
 whose ``kv_connector`` is ``compass`` is its prefill (``kv_producer``) or
 decode side: `engine(config)` makes it the ``engine-P`` or ``engine-D`` LP and
-binds the connector's transfer model. The write-request address comes with the
-deployment's own ``kv_transfer_config``. Above DP width one each DP rank is a
-member of its side's engine LP, and ATOM's DP dispatch on each side picks the
+binds the connector's transfer model, which prices a block at the paged KV
+entry each engine's runner planned, and each transfer's state slot at the slot
+it planned, when the model's transfer carries one (`_planned_transfer`);
+deployments that plan different blocks or slots are refused before the run
+starts. The write-request
+address comes with the deployment's own ``kv_transfer_config``. Above DP
+width one each DP rank is a member of its side's engine LP, and ATOM's DP dispatch on each side picks the
 rank a request runs on. Optional ``prefill_data_parallel_size`` and
 ``decode_data_parallel_size``, ``data_parallel_size`` when absent, give each
 side its own DP width, and only such a run may name them. Its optional
@@ -276,6 +280,8 @@ ACCEPTANCE_RECORD = "acceptance_record"
 AUTHORITY_FILE = "authority_endpoint.txt"
 #: Wall seconds the summary's writer waits for the server LPs' refusals.
 HAND_IN_WAIT_S = 300.0
+#: Wall seconds a prefill-decode engine waits for every engine's planned block.
+PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
 SUMMARY_SCHEMA_VERSION = 10
@@ -588,28 +594,83 @@ def _engine_name(config, run: dict) -> str | None:
 
 
 def _bind_transfer(config, run: dict) -> None:
-    """Price the simulated connector's transfers from the machine spec and the
-    KV block this deployment's workers hold: one model per prefill stage, each
-    on the layers that stage writes."""
-    from atom.compass.backends import KvGeometry, Parallelism
-    from atom.compass.kv import TRANSFER_KEY, Scope, TransferModel
-    from atom.models.utils import get_pp_indices
+    """Have the simulated connector price its transfers from the machine spec
+    and the paged KV blocks and state slots the run's engines planned, read as
+    it is built (`_planned_transfer`): after this engine's runner has planned
+    its pool."""
+    from atom.compass.kv import TRANSFER_KEY
 
-    hf, pp = config.hf_config, _pp(run, "P")
-    depth = getattr(hf, "text_config", hf).num_hidden_layers
-    _pd_kv(config)[TRANSFER_KEY] = tuple(
+    _pd_kv(config)[TRANSFER_KEY] = _planned_transfer
+
+
+def publish_transfer(
+    path: Path, block_bytes: int, tp: int, slot_bytes: int = 0
+) -> None:
+    """Write one paged KV block's bytes, and the state slot a transfer moves
+    beside a request's blocks, as a runner at TP `tp` planned them, where
+    `_planned_transfer` reads them."""
+    planned = {"block_bytes": int(block_bytes), "tp": tp, "slot_bytes": int(slot_bytes)}
+    _write_whole(path, json.dumps(planned))
+
+
+def _planned_transfer() -> tuple:
+    """One transfer model per prefill stage, each pricing the block and the
+    state slot that stage's runner planned, once every engine of the
+    prefill-decode run, each member and stage, has published them
+    (`publish_transfer`).
+
+    Refused unless every deployment plans one block and one slot, each summed
+    over its stages, and every prefill deployment splits them alike: both ends
+    of a write price it, each from its own copy."""
+    from atom.compass.kv import Scope, TransferModel
+
+    run = spec()
+    if not _block_file(Path(os.environ[NOW_ENV])).exists():
+        raise RuntimeError("this engine's runner published no planned KV block")
+    out = Path(run["out_dir"])
+    files = {
+        n: _block_file(out / NOW_FILE.format(n))
+        for n in _hand_ins(run)
+        if n.startswith(f"{ENGINE.name}-")
+    }
+    deadline = time.monotonic() + PLANNED_BLOCK_WAIT_S
+    while missing := [n for n, f in files.items() if not f.exists()]:
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"{', '.join(missing)} published no planned KV block in "
+                f"{PLANNED_BLOCK_WAIT_S} wall seconds"
+            )
+        time.sleep(0.1)
+    # Each deployment member's stages: engine-P1-pp0.dp2 is stage 0 of
+    # engine-P1.dp2.
+    planned: dict = {}
+    for n, f in files.items():
+        lp, dot, member = n.partition(".")
+        deployment, _, stage = lp.partition("-pp")
+        stages = planned.setdefault(deployment + dot + member, {})
+        stages[int(stage or 0)] = json.loads(f.read_text())
+    prefill = [u for u in planned if u.startswith(f"{ENGINE.name}-P")]
+    for key, what in (("block_bytes", "KV block"), ("slot_bytes", "state slot")):
+        sizes = {u: [s[k][key] for k in sorted(s)] for u, s in planned.items()}
+        first = sizes[prefill[0]]
+        for u, b in sizes.items():
+            if b != first if u in prefill else sum(b) != sum(first):
+                (a, x), (c, y) = (
+                    (f"{v} at TP {planned[v][0]['tp']}", " + ".join(map(str, sizes[v])))
+                    for v in (u, prefill[0])
+                )
+                raise ValueError(
+                    f"{a} plans a {what} of {x} B and {c} one of {y} B: both ends "
+                    f"of a transfer price one {what.split()[-1]}, so every "
+                    "deployment must plan it"
+                )
+    machine, scope = _machine(run), Scope(run["kv_link"])
+    stages = planned[prefill[0]]
+    return tuple(
         TransferModel.from_spec(
-            _machine(run),
-            KvGeometry.from_hf_config(
-                hf,
-                block_size=config.kv_cache_block_size,
-                parallelism=Parallelism(tp_size=config.tensor_parallel_size),
-                layer_range=get_pp_indices(depth, k, pp),
-                kv_dtype=config.kv_cache_dtype,
-            ),
-            Scope(run["kv_link"]),
+            machine, stages[k]["block_bytes"], scope, stages[k]["slot_bytes"]
         )
-        for k in range(pp)
+        for k in sorted(stages)
     )
 
 
@@ -640,8 +701,8 @@ def _lmcache_stations(run: dict, chunk_bytes: int) -> dict:
 def _launch_lmcache(config, run: dict, side: str | None) -> None:
     """Start LP `lmcache`, the stand-in lmcache server, in a process of its own
     when this deployment offloads KV to one; refuse a deployment and a run file
-    that disagree on whether one runs or on its writer ranks, or a decode side
-    that would start it."""
+    that disagree on whether one runs or on its writer ranks, a decode side
+    that would start it, or a model whose chunk `KvGeometry` cannot size."""
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
     from atom.kv_transfer.offload.mp.deployment import _tp_replication_factor
 
@@ -820,6 +881,7 @@ class _RecordingAuthority(ClockAuthority):
             STEP_TABLE_FILE,
             SUMMARY_FILE,
             "now-{}.raised",
+            "now-{}.kv_block",
         ):
             for f in out.glob(name.format("*")):
                 f.unlink()
@@ -1466,6 +1528,8 @@ def runner(model_runner, tree) -> None:
     if NOW_ENV in os.environ:
         now = Path(os.environ[NOW_ENV])
         model_runner.compass_raised_file = _raised_file(now, model_runner.rank)
+        if _pd_side(config) is not None and model_runner.rank == 0:
+            model_runner.compass_block_file = _block_file(now)
         slot = np.memmap(now, np.float64, "r", shape=(1,))
         host = run.get("host", {})
         ours = host.get("laws") and {**host_key(config), "machine_spec": platform}
@@ -1892,6 +1956,12 @@ def _acceptance(scheduler, run: dict) -> dict:
         "rates": spec.synthetic_acceptance_rates,
         "distribution": dict(scheduler.engine_stats.distribution),
     }
+
+
+def _block_file(now: Path) -> Path:
+    """Where the engine whose clock file is `now` publishes its planned KV block
+    and the state slot a transfer moves (`publish_transfer`)."""
+    return now.with_suffix(".kv_block")
 
 
 def _raised_file(now: Path, rank) -> Path:

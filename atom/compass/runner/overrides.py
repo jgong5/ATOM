@@ -641,14 +641,28 @@ class FactoriesOnMeta(TorchFunctionMode):
     GPU -- would still allocate there and bring up a device context. The
     functions are the ones `torch.device` itself redirects, `torch.zeros` and
     `torch.tensor` among them; a `*_like` or `Tensor.new_*` call keeps the
-    device it names.
+    device it names. A meta tensor's `Tensor.to` the GPU stays on meta, as a
+    factory naming the GPU does: ATOM's MLA attention copies its KV scale
+    there that way. A copy to the host still fails, since it needs the data.
     """
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         if func in _device_constructors():
             kwargs["device"] = "meta"
+        elif func is torch.Tensor.to and args[0].is_meta:
+            args = (args[0], *("meta" if _gpu(a) else a for a in args[1:]))
+            if _gpu(kwargs.get("device")):
+                kwargs["device"] = "meta"
         return func(*args, **kwargs)
+
+
+def _gpu(arg: Any) -> bool:
+    """Whether an argument of `Tensor.to` names a GPU: a device index, or a
+    device or its name of the GPU's type."""
+    if type(arg) is int:
+        return True
+    return isinstance(arg, (str, torch.device)) and torch.device(arg).type == "cuda"
 
 
 def process_weights_after_loading(tree: torch.nn.Module) -> None:
@@ -762,6 +776,36 @@ class UnbuiltModel(torch.nn.Module):
             "forward pass costs instead of running one, so there are no weights "
             "to call."
         )
+
+
+def publish_planned_transfer(runner: Any) -> None:
+    """Publish one entry of the paged class `get_num_blocks` planned, the state
+    slot a transfer moves beside a request's blocks (`_transferred_slot_bytes`),
+    and the runner's TP width, at the file `compass_block_file` names, which
+    `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
+    prices a transfer at them."""
+    if path := getattr(runner, "compass_block_file", None):
+        from atom.compass import run
+
+        plan = runner.pool_plan
+        tp = runner.config.tensor_parallel_size
+        slot = _transferred_slot_bytes(runner)
+        run.publish_transfer(path, plan.entry_bytes[plan.paged_class], tp, slot)
+
+
+def _transferred_slot_bytes(runner: Any) -> int:
+    """One entry of the per-request slot class `get_num_blocks` planned, when
+    the runner's attention builder publishes that whole slot as a transfer
+    region, as DeepSeek-V4's does (`get_kv_transfer_tensors`); 0 for every
+    other builder. A Qwen GDN hybrid plans a slot its regions do not carry."""
+    from atom.model_engine.kv_block import STATE_SLOT_CLASS
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+
+    if isinstance(runner.attn_metadata_builder, DeepseekV4AttentionMetadataBuilder):
+        return runner.pool_plan.entry_bytes[STATE_SLOT_CLASS]
+    return 0
 
 
 def _refused(method: str):
@@ -1147,7 +1191,9 @@ class NonAllocatingRunner(
         it is a coefficient somebody wrote down rather than a measurement of
         the card being modelled; `kv_pool_sizing` keeps the count beside the
         readings, so which terms those were is recoverable from the runner and
-        not only from a log line somebody kept.
+        not only from a log line somebody kept. On a prefill-decode run the
+        planned block and transferred state slot are published as well
+        (`publish_planned_transfer`).
 
         The decode process of intra-GPU prefill/decode disaggregation is
         refused rather than sized. ATOM's own runner for that answers a block
@@ -1176,6 +1222,7 @@ class NonAllocatingRunner(
             readings=readings,
         )
         logger.info("%s", self.kv_pool_sizing.table())
+        publish_planned_transfer(self)
         return reply
 
     def allocate_kv_cache(self, num_kvcache_blocks: int) -> bool:
