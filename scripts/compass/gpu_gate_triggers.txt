@@ -40,18 +40,18 @@
 #
 # A trailing / matches the whole subtree.
 #
-# Measured at e0a1265d9a2f17211c35947c29bd76878a804b26 over this tree:
-#   tests/        796 files  = 72 in tests/plugin/ + 55 excluded + 669 CPU gate
-#   CPU gate      604 files collect >=1 test, 65 collect none
+# Measured at d13710cd7a2ae243f72b195f84f47fc08ac7c159 over this tree:
+#   tests/        796 files  = 72 in tests/plugin/ + 53 excluded + 671 CPU gate
+#   CPU gate      606 files collect >=1 test, 65 collect none
 #   imports      1085 indented `import atom.*` lines in non-plugin test files
-#   collected  16023 tests by --collect-only. A run of the same set reports
-#              the same 16023 outcomes. Its "skipped" total is LARGER than any
+#   collected  16013 tests by --collect-only. A run of the same set reports
+#              the same 16013 outcomes. Its "skipped" total is LARGER than any
 #              skip count here, because a module-level skip in one of the 65
 #              files that collect nothing is counted as skipped without ever
 #              becoming a collected test. This file states the set; gate_cpu.sh
 #              prints the run, and is the only source for its outcome counts.
-#   candidates    138 paths named by an excluded test, any indentation
-#   covered       383 paths named at module level by a live CPU-gate file
+#   candidates    139 paths named by an excluded test, any indentation
+#   covered       385 paths named at module level by a live CPU-gate file
 #   triggers       87 paths below
 atom/model_loader/loader.py
 atom/model_ops/attention_gdn.py
@@ -124,6 +124,8 @@ atom/models/glm52/mono/kernels/op.py
 atom/models/glm52/mono/kernels/tp4_op.py
 atom/models/glm52/mono/weights.py
 atom/models/glm5_next_mtp.py
+atom/models/kimi_k3/model.py
+atom/models/kimi_k3/mono/weights.py
 atom/models/kimi_k3_dspark.py
 atom/models/minimax_m3/dspark.py
 atom/models/qwen4_exp.py
@@ -137,6 +139,4 @@ atom/spec_decode/dspark_proposer.py
 atom/spec_decode/eagle_proposer.py
 atom/utils/custom_register.py
 atom/utils/decorators.py
-atom/utils/graph_marker.py
-atom/utils/graph_marker_instrumentation.py
 atom/utils/tbo/ubatch_wrapper.py
