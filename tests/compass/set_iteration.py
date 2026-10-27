@@ -308,7 +308,9 @@ class SetIterationLint:
         # `{*a, *b}` is `a | b` written another way: the members go into a set,
         # so the order they came out in does not survive.
         displays = (node for node in ast.walk(tree) if isinstance(node, ast.Set))
-        into_a_set = {id(e) for d in displays for e in d.elts if isinstance(e, ast.Starred)}
+        into_a_set = {
+            id(e) for d in displays for e in d.elts if isinstance(e, ast.Starred)
+        }
         found = {}
         for node, scope in _scoped(tree):
             if id(node) in into_a_set:

@@ -300,6 +300,11 @@ FORMS_THAT_FIRE = {
         "def g(n):\n    global ready\n    ready = set(n)\n\n\n"
         "def f():\n    return list(ready)\n"
     ),
+    "global-at-module-level": "global x\nx = set()\nlist(x)\n",
+    "global-past-an-enclosing-binding": (
+        "x = set()\n\n\n"
+        "def f():\n    x = None\n\n    def g():\n        global x\n        return list(x)\n"
+    ),
     "typing-Set": "from typing import Set\n\n\ndef f(r: Set[str]):\n    return [x for x in r]\n",
     "string-annotation": 'def f(r: "set[str]"):\n    return [x for x in r]\n',
     "sorted-generator": "def f(s: set[str], ids):\n    return sorted(ids.take(x) for x in s)\n",
@@ -343,6 +348,15 @@ FORMS_THAT_STAY_QUIET = {
         "            return list(A.members)\n"
     ),
     "set-display-unpacking": "def f(a: set[str], b: set[str]):\n    return {*a, *b}\n",
+    "augmented-by-a-non-set": (
+        "class C:\n    def add(self, b):\n        self.seen |= b\n        return list(self.seen)\n"
+    ),
+    "augmented-add": (
+        "class C:\n"
+        "    def add(self, b):\n"
+        "        self.seen += set(b)\n"
+        "        return list(self.seen)\n"
+    ),
     "global-rebound": (
         "ready = set()\n\n\ndef g():\n    global ready\n    ready = sorted(ready)\n\n\n"
         "def f():\n    return list(ready)\n"
