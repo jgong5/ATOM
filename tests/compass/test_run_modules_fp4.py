@@ -82,8 +82,9 @@ def test_an_fp4_up_projection_is_walked_from_its_whole_latent():
     v3["quantization_config"] = FP4_DENSE["quantization_config"]
     (up,) = [m for m in _build("tp8", v3) if m.kind == "mla_up"]
 
-    # 16 heads at TP8, no-rope and value widths of 128, from the 512 latent.
-    assert (up.dims, up.fmt) == ((16, 128, 128, 512), "fp4")
+    # 16 heads at TP8, no-rope and value widths of 128, from the 512 latent,
+    # which its prefill product reads at fp4.
+    assert (up.dims, up.fmt, up.act) == ((16, 128, 128, 512), "fp4", "fp4")
 
 
 @BOUND
