@@ -16,7 +16,9 @@ module's own per-rank parameter shapes and attributes:
   GEMM and its all-gather.
 - `RMSNorm`, `GemmaRMSNorm`, `RMSNormGated`: one pass over the weight's
   width; an `RMSNorm` built with `fused_allreduce` joins its all-reduce
-  inside the norm.
+  inside the norm, and so do the norms MiniMax-M3's decoder reduces the
+  sub-layer before them in: a decoder layer's two, but the first layer's
+  input norm, and the model's final norm.
 - `aiter`'s `RotaryEmbedding`: one pass over `rotary_dim`, once for every
   module that holds it.
 - `Attention` (not MLA), `LinearAttention`: attention over the step's rows,
@@ -57,7 +59,8 @@ DeepSeek-V4's modules, each priced and then gone into:
   data-parallel group's gather and reduce-scatter, MoRI's dispatch and
   combine under expert parallelism, at the formats MoRI sends, or the
   tensor-parallel all-reduce on one data-parallel rank unless its block
-  leaves that to the next norm (`reduce_results`). Shared experts the
+  leaves that to the next norm (`reduce_results`), as MiniMax-M3's always
+  does. Shared experts the
   kernel runs with them (`num_fused_shared_experts`) take every row. An
   expert-parallel MoE over a data-parallel group whose exchange is not MoRI's
   (`--all2all-backend rccl` or `none`, `ATOM_DISABLE_MORI_EP`), one under
@@ -141,6 +144,7 @@ SILENT = ("torch.nn.modules.activation", "transformers.activations")
 VISION = "atom.models.qwen3_5_vl.Qwen3VisionTransformer"
 #: A pipeline stage's stand-in for a layer another stage runs.
 PP_MISSING = "atom.models.utils.PPMissingLayer"
+M3 = "atom.models.minimax_m3.model."
 #: V4's rotary tables, read inside the attention and compressor kernels.
 V4_ROPE = V4 + "_V4RoPE"
 V41 = "atom.models.deepseek_v41."
@@ -279,6 +283,26 @@ def _inside(module, parent) -> bool:
     return any(module is getattr(parent, h, None) for h in held)
 
 
+def _m3_reduces(module, name, parent) -> bool:
+    """Whether `module` is a MiniMax-M3 norm that all-reduces the sub-layer
+    output before it: a decoder layer's two, but the first layer's input
+    norm, and the model's final norm."""
+    if _is(parent, M3 + "MiniMaxM3Model"):
+        return module is parent.norm
+    if not _is(parent, M3 + "MiniMaxM3DecoderLayer"):
+        return False
+    if module is parent.input_layernorm:
+        return LAYER.search(name).group(1) != "0"
+    return module is parent.post_attention_layernorm
+
+
+def _tp_width() -> int:
+    """The TP group's width."""
+    from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+
+    return get_tensor_model_parallel_world_size()
+
+
 def _is(module, *names: str) -> bool:
     """Whether `module`'s class is, or derives from, a class of `names`."""
     return any(
@@ -350,9 +374,9 @@ def _classify(module, name, parent):
     if _is(module, *NORMS):
         if parent is not None and _is(parent, V4 + "Block"):
             return NOTHING
-        fused = getattr(module, "fused_allreduce", False) and module.tp_size > 1
-        ranks = module.tp_size if fused else 1
-        return Module(name, "norm", (weight.shape[0],), ranks=ranks, fused=fused)
+        tp = module.tp_size if getattr(module, "fused_allreduce", False) else 1
+        tp = _tp_width() if _m3_reduces(module, name, parent) else tp
+        return Module(name, "norm", (weight.shape[0],), ranks=tp, fused=tp > 1)
     if _is(module, "aiter.rotary_embedding.RotaryEmbedding"):
         return Module(name, "rotary", (module.rotary_dim,))
     if _is(module, OPS + "paged_attention.Attention"):
@@ -489,11 +513,8 @@ def _moe(module, name, parent):
 
     method, w13 = module.quant_method, module.w13_weight
     act = getattr(getattr(method, "act_quant", None), "value", None)
-    fmt, attention_tp = FORMATS.get(w13.dtype), getattr(parent, "tp_size", None)
-    if attention_tp is None:
-        from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
-
-        attention_tp = get_tensor_model_parallel_world_size()
+    fmt = FORMATS.get(w13.dtype)
+    attention_tp = getattr(parent, "tp_size", None) or _tp_width()
     inter = w13.shape[1] // 2
     tp, ep = (getattr(method, f, False) for f in ("use_triton", "use_triton_ep"))
     if getattr(method, "use_triton_decode", False):
@@ -528,8 +549,9 @@ def _moe(module, name, parent):
     fused = module._comm_fused_moe is not None
     if not (config.use_ep and dims[6] > 1):
         # A block that does not reduce its output leaves it to the next
-        # norm's fused all-reduce.
-        reduces = dims[6] > 1 or getattr(parent, "reduce_results", True)
+        # norm's fused all-reduce; MiniMax-M3's always does.
+        leaves = _is(parent, M3 + "MiniMaxM3MoE")
+        reduces = dims[6] > 1 or getattr(parent, "reduce_results", not leaves)
         return Module(name, "moe", dims, fmt, ranks if reduces else 1, fused, act=act)
     from atom.model_ops.fused_moe.mori_prepare_finalize import resolve_mori_dispatch
 
