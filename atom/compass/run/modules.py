@@ -30,7 +30,9 @@ module's own per-rank parameter shapes and attributes:
   value widths, the KV at the cache's format. Its up-projection linear
   (`kv_b_proj`) is priced as that projection, not as a GEMM: absorbed into
   two batched GEMMs on a decode step, over each request's context on a
-  prefill one. Sparse MLA, MLA whose KV is sharded over a decode
+  prefill one, gathered out of the cache where the prefill holds cached
+  tokens, the cached ones alone past ATOM's `attn_prefill_chunk_size`.
+  Sparse MLA, MLA whose KV is sharded over a decode
   context-parallel group, and its fp8 forms switched on by
   `ATOM_USE_FLYDSL_FP8_PREFILL_ATTN` and `ATOM_USE_TRITON_MXFP4_BMM`, are
   unclassified.
@@ -362,13 +364,17 @@ def _classify(module, name, parent):
         if getattr(parent, "_wo_a_mxscale", False) and module is parent.wo_a:
             # V4 quantizes the input to the weight's fp8 for its batched GEMM.
             act = FORMATS.get(parent._wo_a_fp8_dtype)
-        if mla := _mla_up_of(module, parent):
+        if attention := _mla_up_of(module, parent):
+            from atom.config import get_current_atom_config
             from atom.utils import envs
 
             if envs.ATOM_USE_TRITON_MXFP4_BMM:
                 return None
+            mla, kv = attention.impl, FORMATS.get(attention.kv_cache_dtype)
             dims = (mla.num_heads, mla.qk_nope_head_dim, mla.v_head_dim)
-            return Module(name, "mla_up", dims + (_in_width(module),), fmt, act=act)
+            dims += (_in_width(module),)
+            chunk = get_current_atom_config().attn_prefill_chunk_size
+            return kv and Module(name, "mla_up", dims, fmt, act=act, kv=kv, chunk=chunk)
         dims = (weight.shape[0], _in_width(module))
         return Module(name, "gemm", dims, fmt, ranks, act=act)
     if _is(module, *NORMS):
@@ -476,11 +482,11 @@ def _mla(impl, name, kv):
 
 
 def _mla_up_of(linear, parent):
-    """The `MLAAttention` impl beside `linear` that up-projects its latent KV
+    """The MLA `Attention` beside `linear` that up-projects its latent KV
     through it, or None."""
     for sibling in parent.children() if parent is not None else ():
         if getattr(getattr(sibling, "mla_modules", None), "kv_b_proj", None) is linear:
-            return sibling.impl
+            return sibling
     return None
 
 
