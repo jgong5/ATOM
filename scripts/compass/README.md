@@ -657,9 +657,10 @@ record under a law fitted on the others, per decode rung and prefill token band.
 records captured on one card of hjbog-srdc-39 at 731debf47 (ROCm/ATOM 661ef7661)
 in the nightly-20261013 image, in this order, by the cells `calib_capture.sh`'s
 header names for this model: concurrency 1, 4 and 16, then first-turn cells
-at 4, 8, 10 and 12. The cells were chosen by decode rung: each rung the graded
+at 4, 8, 10 and 12, then a late-start cell at 1. The cells were chosen by decode rung: each rung the graded
 runs decode at, 1 to 8, has steps in two or more cells
-([#1024](https://github.com/jgong5/ATOM/issues/1024)); it has no decode vector above rung 16, since
+([#1024](https://github.com/jgong5/ATOM/issues/1024)), and rung 1 reaches the graded runs' longest
+contexts ([#2180](https://github.com/jgong5/ATOM/issues/2180)); it has no decode vector above rung 16, since
 this model is not captured or graded at concurrency 64 or 256.
 Its host laws (`host`, with `compass fit host`'s report as `host_fit`) are fitted
 apart, by `compass fit host`, on calibration cells at concurrency 1, 4 and 16
