@@ -83,6 +83,11 @@ tests/models/glm52/test_indexer_cp_switch.py
 # device is detected`; pure upstream e893780f4 + f6a0c132 errors collecting it
 # on `0 active drivers`, ca8a54916
 tests/models/glm52/test_mono_prepare_refusals.py
+# test_forward_pre_o_is_forward_without_o_proj fails without a driver on nightly
+# 20261026: importing atom.models.kimi_k3.model raises `torch.finfo() requires a
+# floating point input type`, aiter's fp8 dtype unresolved; pure upstream
+# e893780f4 + f6a0c132 fails it there on `0 active drivers`, 4259f1b93
+tests/models/test_kimi_k3_mono_mla_k2.py
 # test_agentic_dispatch_replay_preserves_profile fails: build_agentic_benchmark_matrix
 # runs `git rev-parse HEAD`, and the gate's git-archive snapshot has no .git; 12849025b
 tests/test_benchmark_catalog.py
@@ -97,17 +102,9 @@ tests/test_gdn_page_checkpoint.py
 # drivers` and aiter's fallback raises `No module named 'jax'`; pure upstream
 # e893780f4 + f6a0c132 fails the same, 3d5ad18d6
 tests/test_glm5_next_mtp_routing.py
-# passes alone, fails in this gate: the unstrided case with dynamo `KeyError: aiter`
-# (the aiter.utility namespace package, as for test_sparse_indexer_side_effect_op.py);
-# new-image CPU container, nightly 20261013, b5452da1a
-tests/test_graph_marker.py
 # fails on nightly 20261026's aiter: `No module named
 # 'aiter.ops.triton.fused_fp8_quant'`; pure upstream e893780f4 + f6a0c132 fails the same, ca8a54916
 tests/test_iq2r_moe_method.py
-# passes alone, fails in this gate: one test with dynamo `KeyError: aiter` (the
-# aiter.utility namespace package, as for test_sparse_indexer_side_effect_op.py),
-# the other re-registering `vllm::all_reduce`; new-image CPU container, 2026-10-13
-tests/test_lmcache_offload_disk_integration.py
 # fails without a driver on nightly 20261026: the layer's weight_loader finds
 # `'FusedMoE' object has no attribute 'quant_method'`; pure upstream e893780f4 + f6a0c132 fails the same, ca8a54916
 tests/test_minimax_m31_shared_fusion.py
@@ -121,9 +118,4 @@ tests/test_mla_kv_shuffled.py
 tests/test_paged_attention_dispatch.py
 # fails at setup or call in aiter chip_info, `No gfx arch found in rocminfo output.` (no driver); new-image CPU container, 12849025b
 tests/test_sparse_indexer_fp4.py
-# passes alone, fails in this gate with dynamo `KeyError: aiter`: with no driver
-# aiter's import fails and leaves the namespace package aiter.utility in
-# sys.modules without aiter, and torch's first custom-op registration under
-# torch.compile walks sys.modules through inspect.getmodule; 25740469b
-tests/test_sparse_indexer_side_effect_op.py
 # END MANUAL
