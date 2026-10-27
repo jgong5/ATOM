@@ -463,11 +463,13 @@ def _indexer(op, view, tp, kv) -> Work:
     against every compressed entry before it at the ratio the leaf states, as
     the step roofline counts them: one product of the index head width per
     index head, at fp4 when the leaf takes `q_scale`, else at `q_quant`'s
-    format, and each entry read once at that width and format."""
+    format, and each entry read once at that width and format. `q_quant` is
+    rows first and heads by packed width last, a query axis between them or
+    not."""
     (ratio,) = _stated(op, "compress_ratio")
     q = op["args"]["q_quant"]
     fmt = "fp4" if op["args"].get("q_scale") else _fmt(q["dtype"])
-    _, heads, packed = q["shape"]
+    heads, packed = q["shape"][-2:]
     dim = int(packed * _size(q["dtype"]) / ELEMENT_BYTES[fmt])
     return _boundary(op) + _index_scores(_pass(view, q), ratio, heads, dim, fmt)
 

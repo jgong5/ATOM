@@ -201,7 +201,7 @@ def test_a_dp_decode_at_width_1_gathers_one_row_from_each_rank(tmp_path_factory)
         if op["kind"] == "declared"
     }
     assert rows == {
-        (f"{MOE}:all_gather_with_padding", 1, DP),
+        (f"{MOE}:all_gatherv", 1, DP),
         (f"{MOE}:reduce_scatter_with_unpadding", DP, 1),
     }
 

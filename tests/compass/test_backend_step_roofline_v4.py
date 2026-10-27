@@ -338,7 +338,7 @@ from types import SimpleNamespace
 from atom.compass.capture import driverless
 driverless.install(sys.argv[1], "gfx950")
 driverless.group(1, 1)
-from atom.model_ops.fused_moe import mori_prepare_finalize as mori
+from atom.model_ops.fused_moe.routed_rows import resolve_routed_rows_wire
 from atom.compass.run.modules import walk
 
 class Mxfp4MoEMethod:
@@ -359,10 +359,13 @@ for case, (method, backend, off, combine, fp4, v2) in json.loads(sys.argv[2]).it
     os.environ.update(
         ATOM_DISABLE_MORI_EP=off, ATOM_MORI_COMBINE_QUANT=combine, ATOM_MORI_V2=v2
     )
-    mori._FP4_DISPATCH = fp4
     # EP2 over two data-parallel ranks of TP1 attention.
     moe = FusedMoE()
     moe.quant_method, moe._comm_fused_moe = globals()[method](), None
+    # The method's routed-rows wire, as ATOM_MORI_FP4_DISPATCH sets it.
+    moe.quant_method.routed_rows_wire = (
+        resolve_routed_rows_wire(torch.bfloat16, 32, fp4=True) if fp4 else None
+    )
     moe.w13_weight = torch.empty(4, 64, 32, dtype=torch.bfloat16, device="meta")
     moe.global_num_experts, moe.top_k, moe.hidden_size = 8, 2, 32
     moe.moe_config = SimpleNamespace(in_dtype=torch.bfloat16)
