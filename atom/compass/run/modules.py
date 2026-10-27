@@ -37,6 +37,8 @@ module's own per-rank parameter shapes and attributes:
   rotary tables: nothing. ATOM's text stacks call no bare activation module
   (GDN holds one it never calls), the backend refuses a step with images, and
   V4 reads its tables inside the attention and compressor kernels.
+- `PPMissingLayer`, which a pipeline stage holds where another stage runs the
+  layer: nothing.
 
 DeepSeek-V4's modules, each priced and then gone into:
 
@@ -137,6 +139,8 @@ NORMS = tuple(
 #: never call, and the vision tower.
 SILENT = ("torch.nn.modules.activation", "transformers.activations")
 VISION = "atom.models.qwen3_5_vl.Qwen3VisionTransformer"
+#: A pipeline stage's stand-in for a layer another stage runs.
+PP_MISSING = "atom.models.utils.PPMissingLayer"
 #: V4's rotary tables, read inside the attention and compressor kernels.
 V4_ROPE = V4 + "_V4RoPE"
 V41 = "atom.models.deepseek_v41."
@@ -372,7 +376,7 @@ def _classify(module, name, parent):
     if _is(module, OPS + "activation.SiluAndMul"):
         down = [c for c in parent.children() if _is(c, ROW)]
         return len(down) == 1 and Module(name, "act", (_in_width(down[0]),)) or None
-    if _is(module, VISION, V4_ROPE, *V41_SILENT):
+    if _is(module, VISION, V4_ROPE, PP_MISSING, *V41_SILENT):
         return NOTHING
     if type(module).__module__.startswith(SILENT):
         return NOTHING
