@@ -19,7 +19,17 @@ module's own per-rank parameter shapes and attributes:
 - `aiter`'s `RotaryEmbedding`: one pass over `rotary_dim`, once for every
   module that holds it.
 - `Attention` (not MLA), `LinearAttention`: attention over the step's rows,
-  at their own heads and dims; neither is gone into.
+  at their own heads and dims; neither is gone into. An `Attention` with a
+  sliding window is unclassified.
+- `Attention` over MLA: its attention kernels, at the rank's heads, the
+  heads the decode kernel pads them to, and the latent, rope, no-rope and
+  value widths, the KV at the cache's format. Its up-projection linear
+  (`kv_b_proj`) is priced as that projection, not as a GEMM: absorbed into
+  two batched GEMMs on a decode step, over each request's context on a
+  prefill one. Sparse MLA, MLA whose KV is sharded over a decode
+  context-parallel group, and its fp8 forms switched on by
+  `ATOM_USE_FLYDSL_FP8_PREFILL_ATTN` and `ATOM_USE_TRITON_MXFP4_BMM`, are
+  unclassified.
 - `SiluAndMul`: the input width of the one row-parallel linear beside it.
 - a torch or transformers activation module, the vision tower, and V4's
   rotary tables: nothing. ATOM's text stacks call no bare activation module
@@ -42,10 +52,13 @@ DeepSeek-V4's modules, each priced and then gone into:
   its quant method runs them at, and the exchange around them: the
   data-parallel group's gather and reduce-scatter, MoRI's dispatch and
   combine under expert parallelism, at the formats MoRI sends, or the
-  tensor-parallel all-reduce on one data-parallel rank. An expert-parallel
-  MoE over a data-parallel group whose exchange is not MoRI's
-  (`--all2all-backend rccl` or `none`, `ATOM_DISABLE_MORI_EP`), the Mega
-  kernel, and experts picked by phase, are unclassified.
+  tensor-parallel all-reduce on one data-parallel rank unless its block
+  leaves that to the next norm (`reduce_results`). Shared experts the
+  kernel runs with them (`num_fused_shared_experts`) take every row. An
+  expert-parallel MoE over a data-parallel group whose exchange is not MoRI's
+  (`--all2all-backend rccl` or `none`, `ATOM_DISABLE_MORI_EP`), one under
+  expert parallelism that fuses its shared experts, the Mega kernel, and
+  experts picked by phase, are unclassified.
 
 A module of any other class is gone into when it has children. One without,
 or a listed one in a format or layout not priced here, is unclassified: the
@@ -82,6 +95,7 @@ NOTHING, DESCEND = object(), object()
 OPS = "atom.model_ops."
 V4 = "atom.models.deepseek_v4."
 ROW = OPS + "linear.RowParallelLinear"
+FP8_MOE = OPS + "moe.Fp8MoEMethod"
 NORMS = tuple(
     OPS + "layernorm." + n for n in ("RMSNorm", "GemmaRMSNorm", "RMSNormGated")
 )
@@ -168,6 +182,13 @@ def _classify(module, name, parent):
         if getattr(parent, "_wo_a_mxscale", False) and module is parent.wo_a:
             # V4 quantizes the input to the weight's fp8 for its batched GEMM.
             act = FORMATS.get(parent._wo_a_fp8_dtype)
+        if mla := _mla_up_of(module, parent):
+            from atom.utils import envs
+
+            if envs.ATOM_USE_TRITON_MXFP4_BMM:
+                return None
+            dims = (mla.num_heads, mla.qk_nope_head_dim, mla.v_head_dim)
+            return Module(name, "mla_up", dims + (weight.shape[1],), fmt, act=act)
         return Module(name, "gemm", tuple(weight.shape), fmt, ranks, act=act)
     if _is(module, *NORMS):
         if parent is not None and _is(parent, V4 + "Block"):
@@ -179,8 +200,12 @@ def _classify(module, name, parent):
         return Module(name, "rotary", (module.rotary_dim,))
     if _is(module, OPS + "paged_attention.Attention"):
         kv = FORMATS.get(module.kv_cache_dtype)
+        if module.use_mla:
+            return kv and _mla(module.impl, name, kv)
+        if getattr(module.impl, "sliding_window", -1) > 0:
+            return None
         dims = (module.num_heads, module.num_kv_heads, module.head_dim)
-        return kv and not module.use_mla and Module(name, "attention", dims, kv) or None
+        return kv and Module(name, "attention", dims, kv) or None
     if _is(module, OPS + "base_attention.LinearAttention"):
         tp, state = module.impl.tp_size, FORMATS.get(module.A_log.dtype)
         dims = (module.num_v_heads // tp, module.num_k_heads // tp)
@@ -196,12 +221,36 @@ def _classify(module, name, parent):
     return DESCEND if next(module.children(), None) is not None else None
 
 
+def _mla(impl, name, kv):
+    """MLA attention's `Module` from its `MLAAttention` impl, or None where it
+    runs sparse, its KV sharded over a decode context-parallel group, or its
+    prefill attention in fp8."""
+    if impl.is_sparse_mla or impl.dcp_world_size > 1:
+        return None
+    if impl.use_flydsl_fp8_prefill_attn:
+        return None
+    dims = (impl.num_heads, impl.padded_num_heads, impl.kv_lora_rank)
+    dims += (impl.qk_rope_head_dim, impl.qk_nope_head_dim, impl.v_head_dim)
+    return Module(name, "mla_attention", dims, kv)
+
+
+def _mla_up_of(linear, parent):
+    """The `MLAAttention` impl beside `linear` that up-projects its latent KV
+    through it, or None."""
+    for sibling in parent.children() if parent is not None else ():
+        if getattr(getattr(sibling, "mla_modules", None), "kv_b_proj", None) is linear:
+            return sibling.impl
+    return None
+
+
 def _moe(module, name, parent):
     """The routed experts and their exchange, or None if unclassified.
 
     `dims` are (experts, local experts, top k, intermediate per rank, hidden,
     group ranks, data-parallel ranks, MoRI's split send and receive, the bytes
-    of one local expert's weights, scales and biases). The data-parallel
+    of one local expert's weights, scales and biases), then, where the kernel
+    runs shared experts beside the routed ones, how many; the local experts
+    count the routed ones only. The data-parallel
     width is the MoE group's over the attention's TP group, which the parent
     MoE block holds. Under expert parallelism over that group, `wire` is what
     MoRI's dispatch sends, as ATOM resolves it, and what its combine sends
@@ -211,9 +260,11 @@ def _moe(module, name, parent):
     Its Triton experts under expert parallelism, and its fused SiLU ones
     without, run fp8 or, under `ATOM_USE_TRITON_MOE_A4W4`, fp4 ones; its other
     Triton experts run `act_quant`'s. aiter's run fp8 ones when the method
-    asks for them, and otherwise `act_quant`'s, or the weights' format when it
-    has a quant type: the kernel quantizes them to it. A method that picks its
-    experts by phase (`ATOM_USE_TRITON_MOE_DECODE`) is unclassified.
+    asks for them or is the FP8 method, and otherwise `act_quant`'s, or the
+    weights' format when it has a quant type: the kernel quantizes them to it.
+    A method that picks its experts by phase (`ATOM_USE_TRITON_MOE_DECODE`) is
+    unclassified, and so are fused shared experts under expert parallelism,
+    which aiter's top-k table deals out to the group's ranks token by token.
     """
     from atom.utils import envs
 
@@ -232,7 +283,7 @@ def _moe(module, name, parent):
     elif tp:
         a4w4 = envs.ATOM_USE_TRITON_MOE_A4W4 or act == "fp4"
         act = ("fp4" if a4w4 else "fp8") if module.use_fused_silu_gugu else act
-    elif getattr(method, "fp8_activations", False):
+    elif getattr(method, "fp8_activations", False) or _is(method, FP8_MOE):
         act = "fp8"
     elif getattr(getattr(method, "quant_type", None), "value", 0):
         act = act and fmt
@@ -241,14 +292,20 @@ def _moe(module, name, parent):
     if mega or not (act and fmt and attention_tp):
         return None
     config = module.moe_parallel_config
+    shared = getattr(module, "num_fused_shared_experts", 0)
+    if shared and config.use_ep:
+        return None
     ranks = config.ep_size if config.use_ep else config.tp_size
     split = int(config.use_ep and config.low_latency)
-    dims = (module.global_num_experts, w13.shape[0], module.top_k)
+    dims = (module.global_num_experts, w13.shape[0] - shared, module.top_k)
     dims += (inter, module.hidden_size, ranks, ranks // attention_tp, split)
-    dims += (held // w13.shape[0],)
+    dims += (held // w13.shape[0],) + ((shared,) if shared else ())
     fused = module._comm_fused_moe is not None
     if not (config.use_ep and dims[6] > 1):
-        return Module(name, "moe", dims, fmt, ranks, fused, act=act)
+        # A block that does not reduce its output leaves it to the next
+        # norm's fused all-reduce.
+        reduces = dims[6] > 1 or getattr(parent, "reduce_results", True)
+        return Module(name, "moe", dims, fmt, ranks if reduces else 1, fused, act=act)
     from atom.model_ops.fused_moe.routed_rows import resolve_routed_rows_wire
 
     mori = config.requested_all2all_backend in ("auto", "mori") and not (

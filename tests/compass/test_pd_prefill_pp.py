@@ -7,12 +7,17 @@ which prices every stage's write: decode is ready at ``max_k c_k + L`` and
 the head is done at ``max_k c_k + 2L``, after Mooncake's release.
 
 The run tests start `pd_sim.sh` at prefill ``-pp 2`` and at ``-pp 1`` and
-skip as `test_pd_slice`'s do; the rest run anywhere.
+skip as `test_pd_slice`'s do; the rest run anywhere. At ``-pp 2`` the slice
+model runs as `LlamaForCausalLM`, its shape and tokenizer kept: ATOM's Qwen3
+builds every layer on every stage (#2333), so its stages' planned blocks are
+not shares of decode's and the run is refused.
 """
 
+import copy
 import dataclasses
 import json
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -54,6 +59,9 @@ from atom.models.utils import get_pp_indices
 from atom.utils.clock import LPRuntime
 
 KV = "engine-D->engine-P-pp0:kv_write_req"
+#: The run tests' machine: the slice model's tokenizer probed for Llama too.
+PP_MACHINE = copy.deepcopy(DP_MACHINE)
+PP_MACHINE["host"]["tokenizers"][0]["applies_to"].append("LlamaForCausalLM")
 
 
 def _run(tmp_path, pp: int, **more) -> dict:
@@ -226,16 +234,30 @@ def test_a_request_prefilled_at_another_pipeline_width_is_refused_by_name(
 # --- with a driver ------------------------------------------------------------
 
 
+def split_model(out: Path) -> Path:
+    """The slice model as `LlamaForCausalLM`, which ATOM builds by stage, its
+    shape and tokenizer kept and no weights."""
+    model = out / "model"
+    weights = shutil.ignore_patterns("config.json", "*.safetensors")
+    shutil.copytree(MODEL, model, ignore=weights)
+    hf = json.loads((Path(MODEL) / "config.json").read_text())
+    hf |= {"architectures": ["LlamaForCausalLM"], "model_type": "llama"}
+    (model / "config.json").write_text(json.dumps(hf))
+    return model
+
+
 def run_pd_pp(out: Path, seed: str, pp: int) -> dict:
-    """One run under `pd_sim.sh` with a prefill side of `pp` stages."""
+    """One run under `pd_sim.sh` with a prefill side of `pp` stages, above one
+    on `split_model`, served under the slice model's name."""
     out.mkdir()
+    model = split_model(out) if pp > 1 else MODEL
     ports = dict(zip(PORTS, _free_ports(len(PORTS))))
     more = {compass_run.PREFILL_PP: pp} if pp > 1 else {}
     run_file = _run_file(
         out,
         clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
         step_stub=CONSTANT,
-        machine=DP_MACHINE,
+        machine=PP_MACHINE,
         **PD,
         **more,
     )
@@ -244,11 +266,14 @@ def run_pd_pp(out: Path, seed: str, pp: int) -> dict:
         PYTHONHASHSEED=seed,
         PYTHONPATH=str(TREE),
         AITER_LOG_LEVEL="WARNING",
-        MODEL=MODEL,
+        MODEL=str(model),
+        SERVER_ARGS=f"--enforce-eager --max-model-len 2048 --served-model-name {MODEL}",
         PREFILL_ARGS=f"-pp {pp}" if pp > 1 else "",
         **{name: str(port) for name, port in ports.items()},
     )
-    publish_pd_entries(out / "store", DP_MACHINE, env)
+    if pp > 1:  # ATOM's runner sets it for a Llama model, so its key holds it
+        env["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
+    publish_pd_entries(out / "store", PP_MACHINE, env)
     log = out / "pd_sim.log"
     with open(log, "w") as f:
         sim = subprocess.Popen(
@@ -277,7 +302,13 @@ def run_pd_pp(out: Path, seed: str, pp: int) -> dict:
             os.killpg(sim.pid, signal.SIGKILL)
     assert code == 0, f"pd_sim.sh exited {code}:\n{log.read_text()[-4000:]}"
     table = (out / compass_run.STEP_TABLE_FILE).read_text()
-    return {"out": out, "run": run, "table": table, "events": traffic.events}
+    return {
+        "out": out,
+        "run": run,
+        "table": table,
+        "events": traffic.events,
+        "model": model,
+    }
 
 
 @pytest.fixture(scope="module", params=[1, 2], ids=["pp1", "pp2"])
@@ -295,12 +326,13 @@ def test_a_prefill_pipeline_meets_every_scenario_check(pipeline):
     assert not failed, "\n".join(failed)
 
 
-def _write_end(run: dict, a: float, prompt_tokens: int, pp: int) -> list[float]:
+def _write_end(ran: dict, a: float, prompt_tokens: int, pp: int) -> list[float]:
     """Each prefill stage's write-done of a request whose write request arrives
-    at `a`, by hand: its first write on its link, one block per 16 tokens."""
+    at `a` in the run `ran`, by hand: its first write on its link, one block
+    per 16 tokens."""
     from transformers import AutoConfig
 
-    hf = AutoConfig.from_pretrained(MODEL)
+    hf, run = AutoConfig.from_pretrained(ran["model"]), ran["run"]
     blocks, spec, ends = (
         -(-prompt_tokens // 16),
         MachineSpec.from_mapping(run["machine"]),
@@ -311,7 +343,7 @@ def _write_end(run: dict, a: float, prompt_tokens: int, pp: int) -> list[float]:
         block = KvGeometry.from_hf_config(
             hf, block_size=16, layer_range=span, kv_dtype="bf16"
         )
-        m = TransferModel.from_spec(spec, block, Scope(run["kv_link"]))
+        m = TransferModel.from_spec(spec, block.bytes_per_block, Scope(run["kv_link"]))
         moved = blocks * block.bytes_per_block / m.bandwidth_bytes_per_s
         ends.append(a + m.setup_s + m.latency_s + moved)
     return ends
@@ -331,7 +363,7 @@ def test_the_write_ends_where_both_ends_compute_it(pipeline):
     (usage,) = [
         json.loads(e[6:])["usage"] for _, e in runs[0]["events"] if '"usage"' in e
     ]
-    c = max(_write_end(runs[0]["run"], a, usage["prompt_tokens"], pp))
+    c = max(_write_end(runs[0], a, usage["prompt_tokens"], pp))
     ready, done = c + L, c + (2 * L if pp > 1 else 0.0)
 
     def polls(lp, start, until):

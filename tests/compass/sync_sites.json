@@ -222,6 +222,18 @@
    "mechanism_why": "after the finish, so outside the simulated window; the wall bound only turns a missing hand-in into an error naming it"
   },
   {
+   "id": "atom/compass/run/__init__.py::_planned_transfer::time.sleep(0.1)::sleep#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "_planned_transfer",
+   "call": "time.sleep",
+   "expr": "time.sleep(0.1)",
+   "shape": "sleep",
+   "peer": "process",
+   "why": "a prefill-decode engine building its KV connector waits, in tenths of a wall second up to a bound, for every engine's planned KV block file",
+   "mechanism": "K9",
+   "mechanism_why": "at startup, while the engine is built and before its step loop's first clock request, so outside the simulated window; the wall bound only turns a missing block into an error naming the engine"
+  },
+  {
    "id": "atom/compass/runner/overrides.py::_group_step_seconds::torch.distributed.all_gather(rows, mine, group=group)::collective#0",
    "file": "atom/compass/runner/overrides.py",
    "symbol": "_group_step_seconds",
