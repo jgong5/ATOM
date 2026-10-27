@@ -29,7 +29,7 @@ from typing import Any, Iterable, Union
 import torch
 
 # import torch.distributed as dist
-from aiter.dist.parallel_state import get_tp_group
+from aiter.dist.parallel_state import get_pp_group, get_tp_group
 from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import Qwen3Config
@@ -47,7 +47,7 @@ from atom.model_ops.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from atom.models.utils import maybe_prefix
+from atom.models.utils import IntermediateTensors, make_layers, maybe_prefix
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 
@@ -273,16 +273,15 @@ class Qwen3Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             hf_config.vocab_size, hf_config.hidden_size
         )
-        self.layers = nn.ModuleList(
-            [
-                Qwen3DecoderLayer(
-                    config=hf_config,
-                    atom_config=atom_config,
-                    layer_num=layer_num,
-                    prefix=f"{prefix}.layers.{layer_num}",
-                )
-                for layer_num in range(hf_config.num_hidden_layers)
-            ]
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            hf_config.num_hidden_layers,
+            lambda prefix, layer_num: Qwen3DecoderLayer(
+                config=hf_config,
+                atom_config=atom_config,
+                layer_num=layer_num,
+                prefix=prefix,
+            ),
+            prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(hf_config.hidden_size, eps=hf_config.rms_norm_eps)
 
@@ -290,14 +289,22 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
         **model_kwargs: dict[str, Any],
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[int, torch.Tensor]]]:
+    ) -> Union[
+        torch.Tensor, IntermediateTensors, tuple[torch.Tensor, dict[int, torch.Tensor]]
+    ]:
         capture_layer_ids = model_kwargs.pop("capture_hidden_state_layers", None)
 
-        hidden_states = self.embed_tokens(input_ids)
-        residual = None
+        if get_pp_group().is_first_rank:
+            hidden_states = self.embed_tokens(input_ids)
+            residual = None
+        else:
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
         captured: dict[int, torch.Tensor] = {}
-        for i, layer in enumerate(self.layers):
+        layers = self.layers[self.start_layer : self.end_layer]
+        for i, layer in enumerate(layers, self.start_layer):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -307,6 +314,10 @@ class Qwen3Model(nn.Module):
             if capture_layer_ids is not None and i in capture_layer_ids:
                 captured[i] = (hidden_states + residual).detach()
 
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
         if captured:
             return hidden_states, captured
@@ -348,7 +359,10 @@ class Qwen3ForCausalLM(nn.Module):
         **model_kwargs: dict[str, Any],
     ) -> torch.Tensor:
         hidden_states = self.model(
-            input_ids=input_ids, positions=positions, **model_kwargs
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            **model_kwargs,
         )
         return hidden_states
 
