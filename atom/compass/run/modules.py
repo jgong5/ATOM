@@ -464,8 +464,9 @@ def _moe(module, name, parent):
     of one local expert's weights, scales and biases), then, where the kernel
     runs shared experts beside the routed ones, how many; the local experts
     count the routed ones only. The data-parallel
-    width is the MoE group's over the attention's TP group, which the parent
-    MoE block holds. Under expert parallelism over that group, `wire` is what
+    width is the MoE group's over the attention's TP width: the parent MoE
+    block's, or the TP group's where the block holds none (MiniMax-M3's,
+    Mixtral's). Under expert parallelism over that group, `wire` is what
     MoRI's dispatch sends, as ATOM resolves it, and what its combine sends
     back.
 
@@ -475,6 +476,7 @@ def _moe(module, name, parent):
     Triton experts run `act_quant`'s. aiter's run fp8 ones when the method
     asks for them or is the FP8 method, and otherwise `act_quant`'s, or the
     weights' format when it has a quant type: the kernel quantizes them to it.
+    The unquantized method's experts read its weights' format.
     A method that picks its experts by phase (`ATOM_USE_TRITON_MOE_DECODE`) is
     unclassified, and so are fused shared experts under expert parallelism,
     which aiter's top-k table deals out to the group's ranks token by token.
@@ -484,6 +486,10 @@ def _moe(module, name, parent):
     method, w13 = module.quant_method, module.w13_weight
     act = getattr(getattr(method, "act_quant", None), "value", None)
     fmt, attention_tp = FORMATS.get(w13.dtype), getattr(parent, "tp_size", None)
+    if attention_tp is None:
+        from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+
+        attention_tp = get_tensor_model_parallel_world_size()
     inter = w13.shape[1] // 2
     tp, ep = (getattr(method, f, False) for f in ("use_triton", "use_triton_ep"))
     if getattr(method, "use_triton_decode", False):
@@ -500,6 +506,8 @@ def _moe(module, name, parent):
         act = "fp8"
     elif getattr(getattr(method, "quant_type", None), "value", 0):
         act = act and fmt
+    elif _is(method, OPS + "moe.UnquantizedFusedMoEMethod"):
+        act = fmt
     held = sum(t.nbytes for p in HELD if (t := getattr(module, p, None)) is not None)
     mega = _is(method, OPS + "moe.MegaMxfp4MoEMethod")
     if mega or not (act and fmt and attention_tp):
