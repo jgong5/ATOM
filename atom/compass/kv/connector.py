@@ -21,7 +21,8 @@ and every idle drain tick, one call after the first whose clock reached their
 time: the engine's KV aggregation keeps one poll in flight, so a real poll
 returns what the workers had seen at the previous one. ``c`` is when the
 write completes on its rank pair's `Link`, which moves the pair's writes one
-at a time, each priced by the `TransferModel` bound at
+at a time, each its blocks and, as Mooncake moves a DeepSeek-V4 request's, its
+state slot, priced by the `TransferModel` bound at
 ``kv_transfer_config[TRANSFER_KEY]``, or returned, as the connector is built, by
 a callable bound there. Both ends feed it the same writes in the
 same order, so write-done is not a message: both already know its time. The write
