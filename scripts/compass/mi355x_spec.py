@@ -10,9 +10,8 @@ burst at the same arguments adds the HTTP intake terms (`INTAKE`), and
 bandwidth curve, the kernel floor and the intra-node link's latency and derate.
 The peaks are the datasheet's; the rest is assumed. An engine start's memory
 readings are `compass measure memory`'s, not the spec's.
-`--model` repeats, as `mi308x_spec.py`'s does; without it the script sweeps
-DeepSeek-V4-Pro's tokenizer. `--sweep-from` takes the tokenizer sweep from a
-document this script wrote.
+`--model` and `--sweep-from` work as `mi308x_spec.py`'s do; with neither the
+script sweeps DeepSeek-V4-Pro's tokenizer.
 """
 
 import argparse
@@ -181,10 +180,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", action="append", help="repeats; default " + MODEL)
     parser.add_argument("--sweep-from", type=Path, help="a document to reuse")
     args = parser.parse_args(argv)
-    if args.sweep_from:
-        sweeps = [saved(args.sweep_from)]
-    else:
-        sweeps = swept(args.model or [MODEL])
+    sweeps = [saved(args.sweep_from)] if args.sweep_from else []
+    if args.model or not sweeps:
+        sweeps += swept(args.model or [MODEL])
     merged = merge([*sweeps, *device_fragments()])
     verdict = validate(merged.document)
     print(verdict)

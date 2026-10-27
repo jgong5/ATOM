@@ -1176,3 +1176,24 @@ def test_two_tokenizers_claiming_one_architecture_write_no_spec(monkeypatch, tmp
     argv += ["--model", str(tmp_path / "Qwen3-0.6B-retrained"), "--out", str(out)]
     assert script.main(argv) == 1
     assert not out.exists()
+
+
+def test_a_model_added_to_a_written_spec_is_the_only_one_swept(monkeypatch, tmp_path):
+    script, swept = _node18_sweeping(
+        monkeypatch,
+        tmp_path,
+        **{
+            "Qwen3.8-27B": ("Qwen3_5ForConditionalGeneration", "a 248k vocabulary"),
+            "Qwen3-0.6B": ("Qwen3ForCausalLM", "a 151k vocabulary"),
+        },
+    )
+    first, both = tmp_path / "first.json", tmp_path / "both.json"
+    argv = ["--model", str(tmp_path / "Qwen3.8-27B"), "--out", str(first)]
+    assert script.main(argv) == 0
+    swept.clear()
+    argv = ["--sweep-from", str(first), "--model", str(tmp_path / "Qwen3-0.6B")]
+    assert script.main([*argv, "--out", str(both)]) == 0
+    assert swept == ["Qwen3-0.6B"] * script.SWEEPS
+    kept, added = json.loads(both.read_text())["host"]["tokenizers"]
+    assert kept == json.loads(first.read_text())["host"]["tokenizers"][0]
+    assert added["applies_to"] == ["Qwen3ForCausalLM"]

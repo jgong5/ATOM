@@ -20,7 +20,8 @@ requests add the idle intake (`IDLE`). An engine start's memory readings are `co
 not the spec's. One fragment per probe or origin. Writes the merged document to `--out` when
 `validate` passes, then prints `explain`'s rows for the host, device and
 interconnect blocks, grouped by origin.
-`--sweep-from` takes the tokenizer sweep from a document this script wrote.
+`--sweep-from` takes the tokenizer sweeps from a document this script wrote;
+given `--model` as well, it sweeps only those models' tokenizers and adds them.
 """
 
 import argparse
@@ -516,10 +517,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--sweep-from", type=Path, help="a document to reuse")
     args = parser.parse_args(argv)
-    if args.sweep_from:
-        sweeps = [saved(args.sweep_from)]
-    else:
-        sweeps = swept(args.model or [MODEL])
+    sweeps = [saved(args.sweep_from)] if args.sweep_from else []
+    if args.model or not sweeps:
+        sweeps += swept(args.model or [MODEL])
     merged = merge([*sweeps, *device_fragments()])
     verdict = validate(merged.document)
     print(verdict)
