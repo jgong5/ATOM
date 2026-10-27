@@ -21,7 +21,8 @@ module's own per-rank parameter shapes and attributes:
   module that holds it.
 - `Attention` (not MLA), `LinearAttention`: attention over the step's rows,
   at their own heads and dims; neither is gone into. An `Attention` with a
-  sliding window is unclassified.
+  sliding window is unclassified, and so is one whose model plugs in an impl
+  other than ATOM's dense `PagedAttentionImpl` (MiniMax-M3's sparse layers).
 - `Attention` over MLA: its attention kernels, at the rank's heads, the
   heads the decode kernel pads them to, and the latent, rope, no-rope and
   value widths, the KV at the cache's format. Its up-projection linear
@@ -126,6 +127,8 @@ NOTHING, DESCEND = object(), object()
 OPS = "atom.model_ops."
 V4 = "atom.models.deepseek_v4."
 ROW = OPS + "linear.RowParallelLinear"
+#: The impl a non-MLA `Attention` runs unless its model plugs in another.
+DENSE_MHA = OPS + "attention_mha.PagedAttentionImpl"
 FP8_MOE = OPS + "moe.Fp8MoEMethod"
 NORMS = tuple(
     OPS + "layernorm." + n for n in ("RMSNorm", "GemmaRMSNorm", "RMSNormGated")
@@ -352,6 +355,11 @@ def _classify(module, name, parent):
         kv = FORMATS.get(module.kv_cache_dtype)
         if module.use_mla:
             return kv and _mla(module.impl, name, kv)
+        # An impl a model plugs in, even one derived from the dense one (as
+        # MiniMax-M3's sparse attention is), runs a kernel of its own.
+        impl = type(module.impl)
+        if f"{impl.__module__}.{impl.__qualname__}" != DENSE_MHA:
+            return None
         if getattr(module.impl, "sliding_window", -1) > 0:
             return None
         dims = (module.num_heads, module.num_kv_heads, module.head_dim)
