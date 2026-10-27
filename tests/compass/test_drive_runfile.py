@@ -10,13 +10,16 @@ deployment, whose bundle the step grid tests use.
 import argparse
 import dataclasses
 import hashlib
+import http.server
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
+from huggingface_hub import constants
 from test_artifact_invalidation import STANZA
 from test_backend_step_linear import law
-from test_memory_readings import DOCUMENT, META_8B
+from test_memory_readings import CONFIG_JSON, DOCUMENT, META_8B
 from test_op_graph import FLAT
 from test_run_step_grid import (
     KEY,
@@ -520,3 +523,70 @@ def test_a_prefill_decode_op_graph_whose_sides_name_two_price_lists_refuses(
 
     with pytest.raises(ValueError, match="the decode side's .*'tp': 2"):
         runfile.prefill_decode(args, model, [*model, "-tp", "2"], "intra_node")
+
+
+#: A hub id with no local copy of its config.json.
+HUB_ID = "Qwen/Qwen3-0.6B"
+
+
+class Hub(http.server.BaseHTTPRequestHandler):
+    """A hub serving the suite's config.json as every repo's file."""
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("X-Repo-Commit", "0" * 40)
+        self.send_header("ETag", '"config"')
+        self.send_header("Content-Length", str(len(CONFIG_JSON.read_bytes())))
+        self.end_headers()
+
+    def do_GET(self):
+        self.do_HEAD()
+        self.wfile.write(CONFIG_JSON.read_bytes())
+
+
+@pytest.fixture
+def hub(monkeypatch, tmp_path):
+    """An empty hub cache, with `Hub` as the hub."""
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Hub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}"
+    template = url + "/{repo_id}/resolve/{revision}/{filename}"
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
+    monkeypatch.setattr(constants, "ENDPOINT", url)
+    monkeypatch.setattr(constants, "HUGGINGFACE_CO_URL_TEMPLATE", template)
+    yield
+    server.shutdown()
+
+
+def test_a_hub_model_with_no_local_config_json_fetches_it_and_its_law_loads(
+    hub, tmp_path
+):
+    r = deployment(tmp_path)
+    entry = step_linear(tmp_path, r)
+
+    run = build(tmp_path, "--step-linear", entry.key.token(), atom=["--model", HUB_ID])
+
+    assert run["backend"]["digest"] == entry.digest
+
+
+def test_op_graph_names_the_price_list_at_a_hub_model_s_fetched_config_json(
+    hub, tmp_path
+):
+    r = deployment(tmp_path)
+    key = price_list_key(tmp_path)
+    published(tmp_path, r, Kind.PRICE_LIST, key, FLAT.params)
+
+    run = build(tmp_path, "--op-graph", atom=["--model", HUB_ID])
+
+    assert run["price_list"] == key
+
+
+def test_a_hub_model_whose_config_json_cannot_be_fetched_refuses_naming_it(
+    hub, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", True)
+    token = step_linear(tmp_path, deployment(tmp_path)).key.token()
+
+    named = f"--model {HUB_ID}: its config.json is neither local nor fetchable: "
+    with pytest.raises(ValueError, match=named + "We couldn't connect"):
+        build(tmp_path, "--step-linear", token, atom=["--model", HUB_ID])

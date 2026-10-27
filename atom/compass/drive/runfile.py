@@ -182,13 +182,29 @@ def law_readings(key: Key, machine, atom_args):
     ATOM's arguments `atom_args` name, loads the `step_linear_law` at `key`
     under: its engine config as `key` states it, the one the runner then holds
     the resolved config to."""
-    model = run._file_digest(_engine_args(atom_args).model, "config.json")
     return readings(
         machine,
         atom_src=Reading.of_source_root(git_tree_root("atom", module_root("atom"))),
-        model=model,
+        model=_model_digest(_engine_args(atom_args).model),
         engine_config=key.values["engine_config"],
     )
+
+
+def _model_digest(model: str) -> str:
+    """`run._file_digest` of the config.json of the model `model` names, found
+    or fetched as ATOM's loader finds it, so a hub id with no local copy reads
+    the one its server will load; one it cannot find or fetch refuses."""
+    from transformers.utils import cached_file
+
+    try:
+        why = cached_file(model, "config.json") is None and "there is none"
+    except OSError as error:
+        why = error
+    if why:
+        raise ValueError(
+            f"--model {model}: its config.json is neither local nor fetchable: {why}"
+        )
+    return run._file_digest(model, "config.json")
 
 
 def _dp_width(atom_args) -> int:
@@ -224,7 +240,7 @@ def _price_list_key(atom_args, machine) -> Key:
     tree = git_tree_root("atom", module_root("atom"))
     return Key.of(
         Kind.PRICE_LIST,
-        model=run._file_digest(engine.model, "config.json"),
+        model=_model_digest(engine.model),
         dp=engine.data_parallel_size,
         pp=engine.pipeline_parallel_size,
         pcp=engine.prefill_context_parallel_size,
