@@ -81,6 +81,10 @@ def _recorded(warmup, drafter=None):
         def __init__(self, rank, config):
             self.rank, self.config = rank, config
             self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
             self.attn_metadata_builder = GRAPHABLE
             self.tokenID_processor = _Processor()
             if drafter:

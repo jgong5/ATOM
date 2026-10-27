@@ -1215,7 +1215,9 @@ class NonAllocatingRunner(
         leaves behind: the declared `config.capture_sizes` narrowed to what
         the scheduler can produce, ascending. `ForwardMode.decide` reads the
         rung of every step off `capture_sizes_np`, so leaving the
-        construction-time `[0]` would price every decode step as eager. An empty narrowed ladder is refused: ATOM's capture asserts
+        construction-time `[0]` would price every decode step as eager.
+        `tbo_decode_graphs` is set as the base's capture sets it, so a decode
+        the DP group splits replays where a real one does. An empty narrowed ladder is refused: ATOM's capture asserts
         on it, so that deployment never starts. The reply still sends `[]` for the batch sizes, since no
         graph exists; the caller only formats it into a log line.
 
@@ -1233,6 +1235,9 @@ class NonAllocatingRunner(
                 "start this deployment, so there is no ladder to price"
             )
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
+        self.tbo_decode_graphs = (
+            self.config.enable_tbo_decode and not self._tr_hybrid_active()
+        )
         logger.info(
             "no cudagraph captured: there are no weights to trace; steps "
             "dispatch on the ladder %s.",
@@ -1477,7 +1482,9 @@ def _group_step_seconds(
         device_s, draft_s = cost.target_seconds, cost.draft_seconds
         terms = (*cost.terms, *cost.draft_terms)
     host = getattr(runner, "compass_host", None)
-    group = dp_group() if mode.sync is not None else None
+    # `decide` returns the collective's rows for a group of one too.
+    many = mode.sync is not None and len(mode.sync.scheduled_tokens_per_dp_rank) > 1
+    group = dp_group() if many else None
     charge = getattr(host, "charge", None)
     if group is not None and isinstance(host, HostDeviceRecurrence):
 
