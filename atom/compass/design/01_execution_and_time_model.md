@@ -1963,7 +1963,12 @@ two differ the code is right.
   maps its regions onto a consumer holding every layer, `consumer_region_indices`, and a
   decode head reports `finished_recving` from its own stage only); `lmcache_mp` under PP
   (ATOM's `mp/deployment.py::_validate_mp_config`); any other connector (`allocate_kv_cache`,
-  above); PP with DP (ATOM's `CoreManager`, and the channel table).
+  above); PP with DP (ATOM's `CoreManager`, and the channel table); Kimi-K3's KDA state
+  regions above PP 1 (ATOM's `_KimiMLAGDNCommon._with_kda_disagg_regions`, restated by
+  `overrides.py::_refuse_kda_regions_across_stages` as a runner publishes its planned
+  transfer, since no simulated runner builds the regions); DeepSeek-V4 above PP 1 (ATOM's
+  `ModelRunner.get_num_blocks`, which refuses its copied state checkpoints there and which
+  the simulated runner runs).
 
 ### Prefill pipeline parallelism (owner ruling on #1385)
 

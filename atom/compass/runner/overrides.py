@@ -777,12 +777,13 @@ def publish_planned_transfer(runner: Any) -> None:
     the staging row a second write moves after them (`_staging_row_bytes`),
     and the runner's TP width, at the file `compass_block_file` names, which
     `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
-    prices a transfer at them. Refused where ATOM's builder refuses to publish
-    its transfer regions (`_refuse_a_staged_transfer`)."""
+    prices a transfer at them. Refused for a pipeline stage of Kimi's hybrid,
+    whose KDA state regions ATOM's builder refuses to publish there
+    (`_refuse_kda_regions_across_stages`)."""
     if path := getattr(runner, "compass_block_file", None):
         from atom.compass import run
 
-        _refuse_a_staged_transfer(runner)
+        _refuse_kda_regions_across_stages(runner)
         plan = runner.pool_plan
         tp = runner.config.tensor_parallel_size
         slot, after_blocks = _transferred_slot(runner)
@@ -791,7 +792,7 @@ def publish_planned_transfer(runner: Any) -> None:
         run.publish_transfer(path, block, tp, slot, staging, after_blocks)
 
 
-def _refuse_a_staged_transfer(runner: Any) -> None:
+def _refuse_kda_regions_across_stages(runner: Any) -> None:
     """Refuse a transfer from a pipeline stage of Kimi's hybrid with the reason
     ATOM's builder gives as it refuses to publish the KDA state regions there:
     this runner allocates no cache, so the builder is never asked. DeepSeek-V4's
