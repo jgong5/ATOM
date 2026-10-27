@@ -146,6 +146,26 @@ tests/models/deepseek_v41/test_weights.py
 # drivers` and aiter's fallback raises `No module named 'jax'`; pure upstream
 # e893780f4 + f6a0c132 fails the same, 3d5ad18d6
 tests/models/glm52/test_indexer_cp_switch.py
+# passes alone, fails in this gate: aiter's import raises `KeyError:
+# 'module_aiter_core'` (or `'aiter'`) once the Compass test modules that
+# import ATOM under an aiter stand-in have been collected, and pure upstream,
+# collecting none of them, passes it; nightly 20261026 CPU container, 3d5ad18d6
+tests/models/test_kimi_k3_mono_layouts.py
+# passes alone, fails in this gate: aiter's import raises `KeyError:
+# 'module_aiter_core'` (or `'aiter'`) once the Compass test modules that
+# import ATOM under an aiter stand-in have been collected, and pure upstream,
+# collecting none of them, passes it; nightly 20261026 CPU container, 3d5ad18d6
+tests/models/test_kimi_k3_mono_max_rows.py
+# passes alone, fails in this gate: aiter's import raises `KeyError:
+# 'module_aiter_core'` (or `'aiter'`) once the Compass test modules that
+# import ATOM under an aiter stand-in have been collected, and pure upstream,
+# collecting none of them, passes it; nightly 20261026 CPU container, 3d5ad18d6
+tests/models/test_kimi_k3_mono_mla_k2.py
+# passes alone, fails in this gate: aiter's import raises `KeyError:
+# 'module_aiter_core'` (or `'aiter'`) once the Compass test modules that
+# import ATOM under an aiter stand-in have been collected, and pure upstream,
+# collecting none of them, passes it; nightly 20261026 CPU container, 3d5ad18d6
+tests/models/test_kimi_k3_mono_plan.py
 # test_agentic_dispatch_replay_preserves_profile fails: build_agentic_benchmark_matrix
 # runs `git rev-parse HEAD`, and the gate's git-archive snapshot has no .git; 12849025b
 tests/test_benchmark_catalog.py

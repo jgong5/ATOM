@@ -11,7 +11,7 @@
 #
 # THE RULE: an atom module named by an excluded test is a blind spot unless a
 # CPU-gate test that actually runs names it too. Imports are read at any
-# indentation on the excluded side -- 1082 of this tree's `import atom.*`
+# indentation on the excluded side -- 1083 of this tree's `import atom.*`
 # lines are indented -- but coverage is credited only for a module-level import
 # in a CPU-gate file that collects at least one test, because those are the only
 # imports that provably execute. At 236abfd9a the MODULE-LEVEL half carried both
@@ -40,19 +40,19 @@
 #
 # A trailing / matches the whole subtree.
 #
-# Measured at 3d5ad18d67e7c64a1e227e28779adaaa20a88f1b over this tree:
-#   tests/        791 files  = 72 in tests/plugin/ + 118 excluded + 601 CPU gate
-#   CPU gate      549 files collect >=1 test, 52 collect none
-#   imports      1082 indented `import atom.*` lines in non-plugin test files
-#   collected  15003 tests by --collect-only. A run of the same set reports
-#              the same 15003 outcomes. Its "skipped" total is LARGER than any
+# Measured at 36049b011223ca974837b7a2748440f05b51bc4a over this tree:
+#   tests/        791 files  = 72 in tests/plugin/ + 122 excluded + 597 CPU gate
+#   CPU gate      545 files collect >=1 test, 52 collect none
+#   imports      1083 indented `import atom.*` lines in non-plugin test files
+#   collected  14945 tests by --collect-only. A run of the same set reports
+#              the same 14945 outcomes. Its "skipped" total is LARGER than any
 #              skip count here, because a module-level skip in one of the 52
 #              files that collect nothing is counted as skipped without ever
 #              becoming a collected test. This file states the set; gate_cpu.sh
 #              prints the run, and is the only source for its outcome counts.
-#   candidates    191 paths named by an excluded test, any indentation
-#   covered       353 paths named at module level by a live CPU-gate file
-#   triggers      126 paths below
+#   candidates    201 paths named by an excluded test, any indentation
+#   covered       351 paths named at module level by a live CPU-gate file
+#   triggers      135 paths below
 atom/distributed/dcp_utils.py
 atom/distributed/indexer_cp.py
 atom/distributed/pcp_utils.py
@@ -99,6 +99,7 @@ atom/model_ops/engram/tables.py
 atom/model_ops/eplb.py
 atom/model_ops/fp4_mqa_ragged_metadata.py
 atom/model_ops/fused_moe/modular_kernel.py
+atom/model_ops/fused_moe/mori_prepare_finalize.py
 atom/model_ops/fused_moe/rccl_prepare_finalize.py
 atom/model_ops/glm5_next/indexer.py
 atom/model_ops/glm5_next/kpool.py
@@ -114,6 +115,7 @@ atom/model_ops/minimax_m3/indexer_candidate_exchange.py
 atom/model_ops/minimax_m3/indexer_context_parallel.py
 atom/model_ops/minimax_m3/sparse_attn.py
 atom/model_ops/moe.py
+atom/model_ops/quant_v4.py
 atom/model_ops/qwen4_exp/hyperconnection.py
 atom/model_ops/qwen4_exp/ops/ple.py
 atom/model_ops/qwen4_exp/ops/qsa.py
@@ -153,7 +155,14 @@ atom/models/glm52/mono/runner.py
 atom/models/glm52/mono/weights.py
 atom/models/glm5_next_mtp.py
 atom/models/gpt_oss.py
+atom/models/kimi_k3/model.py
+atom/models/kimi_k3/mono/dispatch.py
+atom/models/kimi_k3/mono/kernels/attention/kda.py
+atom/models/kimi_k3/mono/kernels/layer.py
+atom/models/kimi_k3/mono/layouts.py
+atom/models/kimi_k3/mono/plan.py
 atom/models/kimi_k3/mono/runner.py
+atom/models/kimi_k3/mono/weights.py
 atom/models/kimi_k3_dspark.py
 atom/models/minimax_m3/dspark.py
 atom/models/minimax_m3/mono/contract.py
