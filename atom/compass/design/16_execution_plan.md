@@ -402,7 +402,8 @@ the tree. The commits carrying P0.2's measurements are `9c8df1328` and `b963c941
 `947d5b282`; the ones that supersede them are on this branch. P0.1's GPU re-measurement has
 an **in-tree** record, because a plan of record cannot cite one that is not: the five failing
 node-ids verbatim in `scripts/compass/gpu_gate_known_failures.txt`, and the pair, the tree and
-the toolchain as the `BASE_*` constants in `scripts/compass/gate_gpu.sh`. P0.2's own task
+the toolchain as the `BASE_*` constants, now `scripts/compass/gpu_gate_baseline.env`, which
+`scripts/compass/regen_gpu_gate_baseline.sh` rewrites with the list on a new image. P0.2's own task
 record predates that measurement and contains neither `4779` nor `fe9ea043c`; it is a source
 for the superseded 4730 / 5 above and for nothing else.
 
