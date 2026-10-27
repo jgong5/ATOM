@@ -95,10 +95,12 @@ def group(monkeypatch):
     }
     gather = ("pad_for_all_gather", "all_gatherv", "dp_gather_routed_rows")
     routed = REPO / "atom/model_ops/fused_moe/routed_rows.py"
-    for source in _source(REPO / "atom/model_ops/moe.py", gather) + _source(
-        routed, ("_CARRIERS", "gather_rows")
-    ) + _source(
-        REPO / "atom/spec_decode/drafter.py", ("_publish_draft_shape",), "Drafter"
+    for source in (
+        _source(REPO / "atom/model_ops/moe.py", gather)
+        + _source(routed, ("_CARRIERS", "gather_rows"))
+        + _source(
+            REPO / "atom/spec_decode/drafter.py", ("_publish_draft_shape",), "Drafter"
+        )
     ):
         exec(source, atom)  # noqa: S102
 

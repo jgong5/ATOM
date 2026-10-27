@@ -101,6 +101,7 @@ class Scheduler:
     """Runs every waiting request in each step, `STEPS` steps per request."""
 
     prefill_delayer = None
+    dummy_prefill = False
     metrics = SimpleNamespace(record_forward=lambda batch, seqs: None)
 
     def __init__(self):

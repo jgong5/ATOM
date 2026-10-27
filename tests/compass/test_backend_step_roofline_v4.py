@@ -316,7 +316,8 @@ def test_a_rank_s_view_names_its_own_slot_of_the_split():
     r = runner(None, dp_size=2, dp_rank=1)
     r.drafter = None
     sync = SimpleNamespace(
-        scheduled_tokens_per_dp_rank=torch.tensor([7, 7]), ub_tokens_across_dp=((4, 3), (3, 4))
+        scheduled_tokens_per_dp_rank=torch.tensor([7, 7]),
+        ub_tokens_across_dp=((4, 3), (3, 4)),
     )
     mode = SimpleNamespace(
         sync=sync, running_tokens_are_unified=False, use_cudagraph=False, running_bs=1
