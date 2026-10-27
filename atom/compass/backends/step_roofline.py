@@ -144,7 +144,9 @@ class Module:
     `index` the format a `sparse_attention`'s indexer scores at; `replay`
     the rows of each finishing request a replayed prefill runs it on, 0 for
     every row; `draft` a drafter's block width, `CONTEXT` for a drafter's
-    module on the target's rows, 0 for the target's.
+    module on the target's rows, 0 for the target's; `kv` the format of the
+    cache an `mla_up` gathers a prefill's context from, and `chunk` the
+    cached tokens past which it gathers only those, 0 for none.
     An unclassified module's `name` says what it is.
     """
 
@@ -160,6 +162,8 @@ class Module:
     index: str = "fp8"
     replay: int = 0
     draft: int = 0
+    kv: str = "fp8"
+    chunk: int = 0
 
 
 def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
@@ -258,8 +262,12 @@ def _mla_up(m: Module, view: BatchView, decoded: int) -> Work:
 
     A decode step absorbs it into two fp8 batched GEMMs, one weight a head:
     each query's no-rope part into the latent width, and the attention's
-    latent output out to the value width. A prefill step runs the linear, at
-    its formats, over each request's whole context, cached part included.
+    latent output out to the value width. A prefill step with no cached
+    tokens runs the linear, at its formats, over its rows. One with cached
+    tokens gathers rows out of the cache into one product, the latent read
+    at the cache's format `kv`, the product at the wider of that and the
+    weight's, bf16 for an fp4 weight: every request's whole context, or past
+    `chunk` cached tokens those alone, the new rows running the linear.
     """
     heads, nope, v, latent = m.dims
     work = Work()
@@ -267,8 +275,17 @@ def _mla_up(m: Module, view: BatchView, decoded: int) -> Work:
         rows = decoded * heads
         work += grouped_gemm(rows, latent, nope, heads, "fp8", "fp8")
         work += grouped_gemm(rows, v, latent, heads, "fp8", "fp8")
-    if rows := view.prefill:
-        work += gemm(sum_context(rows), heads * (nope + v), latent, m.act, m.fmt)
+    if not (rows := view.prefill):
+        return work
+    width, new = heads * (nope + v), sum_tokens(rows)
+    cached = sum_context(rows) - new
+    linear = new if not cached or 0 < m.chunk < cached else 0
+    if linear:
+        work += gemm(linear, width, latent, m.act, m.fmt)
+    if gathered := cached + new - linear:
+        rate = _wider(m.kv, ACT if m.fmt == "fp4" else m.fmt)
+        moved = gemm(gathered, width, latent, m.kv, m.fmt).bytes
+        work += Work({rate: 2 * gathered * width * latent}, moved)
     return work
 
 
