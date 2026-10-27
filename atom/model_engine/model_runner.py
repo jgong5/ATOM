@@ -1143,7 +1143,8 @@ class ModelRunner:
         # 2. Release CUDA graphs
         if not self.enforce_eager:
             self.graphs = self.graph_pool = None  # type: ignore
-        if isinstance(self.model, UBatchWrapper):
+        # No model when its construction raised.
+        if isinstance(getattr(self, "model", None), UBatchWrapper):
             self.model.tbo_graphs.clear()
         # 3. Release GPU tensors. `kv_cache` is the whole paged pool -- the
         # scales and any indexer cache are regions of it, not attributes.
