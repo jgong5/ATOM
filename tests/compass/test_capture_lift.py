@@ -403,7 +403,6 @@ def test_v4_pro_s_triton_experts_capture_at_the_functions_that_launch_them(
     triton = "aiter.ops.triton.moe."
     assert {
         triton + "moe_op_gemm_a16w4:moe_gemm_a16w4",
-        triton + "moe_routing.routing:sort_tokens_fused",
-        triton + "moe_routing.topk:topk",
+        triton + "moe_routing.routing:ep_sort_routing",
     } <= names
     assert "aiter.fused_moe_.default" not in names

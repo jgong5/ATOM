@@ -112,8 +112,18 @@ def _pars(region):
 
 
 def _rows(op):
-    """The rows an exchange takes in and gives back."""
-    sent = next(v for v in op["args"].values() if isinstance(v, dict) and "shape" in v)
+    """The rows an exchange takes in and gives back; a gather of routed rows
+    sends several tensors, its hidden states first."""
+    sent = next(
+        v[0] if isinstance(v, list) else v
+        for v in op["args"].values()
+        if isinstance(v, dict)
+        and "shape" in v
+        or isinstance(v, list)
+        and v
+        and isinstance(v[0], dict)
+        and "shape" in v[0]
+    )
     return sent["shape"][0], op["out"][0][0]
 
 
