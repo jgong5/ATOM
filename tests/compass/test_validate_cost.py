@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 from test_op_graph import g
+from test_validate_runs import PTL, PTL_NAMED
 from test_work import SPEC
 
 from atom.compass.backends import (
@@ -27,6 +28,7 @@ from atom.compass.backends.resolver import CostSource
 from atom.compass.backends.step_grid_residual import Residual
 from atom.compass.backends.step_roofline import StepFallbackBackend
 from atom.compass.drive.aiter_jit import BUILDS
+from atom.compass.drive.identity import PTL_CHANGES
 from atom.compass.validate.cost import cost_accuracy, main
 
 # Prefill hull: tokens 100-1000, Sum N_Q^2 1e4-1e6, Sum N_Q (N_KV - N_Q) 0-1e7.
@@ -472,6 +474,18 @@ def test_the_command_refuses_a_record_whose_server_built_an_aiter_module(
     (tmp_path / "run.json").write_text(json.dumps({BUILDS: ["mha_varlen_fwd"]}))
     named = f"{record} is not costed: its server ran a JIT compile of ['mha_varlen_fwd'] while"
     with pytest.raises(ValueError, match=re.escape(named)):
+        main([str(record), str(law)])
+
+
+def test_the_command_refuses_a_record_whose_cards_changed_ptl_state(tmp_path):
+    """The named result."""
+    record = _record(tmp_path / "steps", _steps())
+    law = tmp_path / "law.json"
+    law.write_text(json.dumps(LAW))
+    (tmp_path / "run.json").write_text(json.dumps({PTL_CHANGES: PTL}))
+
+    named = f"{record} is not costed: {PTL_NAMED}"
+    with pytest.raises(ValueError, match=re.escape(named) + "$"):
         main([str(record), str(law)])
 
 

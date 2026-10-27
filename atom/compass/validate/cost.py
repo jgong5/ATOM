@@ -78,7 +78,6 @@ from atom.compass.backends.cost import group as method_group
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band
 from atom.compass.backends.step_roofline import StepFallbackBackend
-from atom.compass.drive import aiter_jit
 from atom.compass.validate.bound import _split
 
 WITHIN = 0.10
@@ -172,10 +171,10 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     ranks fall to different vectors, is counted under `cut.ranks`. Ranks whose
     records differ in length by more than the one step a stopped run leaves on
     some ranks only are refused.
-    So is a record whose run.json, beside `record`, names `aiter_jit_builds`.
+    So is a record whose run.json, beside it, names `aiter_jit_builds` or `ptl_changes`.
     """
     run = Path(record).resolve().parent / "run.json"
-    if run.is_file() and (built := aiter_jit.refusal(read_json(run))):
+    if run.is_file() and (built := step_labels.refusal(read_json(run))):
         raise ValueError(f"{record} is not costed: {built}")
     ranks = sorted(Path(record).glob("dp*[0-9].jsonl"))
     records = [read_jsonl(r) for r in ranks]

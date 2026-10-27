@@ -27,6 +27,7 @@ from test_stop_between_client_runs import CLIENT_RUN as UNREFUSED
 from atom.compass import run as compass_run
 from atom.compass.drive import aiter_jit, serve
 from atom.compass.drive import run as drive_run
+from atom.compass.drive.identity import PTL_CHANGES
 from atom.compass.parity import ARRIVALS, TRANSFERS
 from atom.compass.validate.runs import (
     ASSUMED,
@@ -970,6 +971,34 @@ def test_a_record_whose_server_built_an_aiter_module_is_refused_naming_it(tmp_pa
 
     named = re.escape(f"its server ran a JIT compile of {builds} while it served")
     with pytest.raises(ValueError, match=f"r1 is not graded: {named}, so a step"):
+        grade(real, simulated)
+
+
+#: Two changes of a record's cards' PTL state, as `compass record` writes them.
+PTL = [
+    {"at": "2026-10-27T04:20:31Z", "from": "enabled", "to": "disabled"},
+    {"at": "2026-10-27T04:20:49Z", "from": "disabled", "to": "enabled"},
+]
+#: Why grading and `validate.cost` refuse a record whose run.json names `PTL`.
+PTL_NAMED = (
+    "its cards' PTL state changed while it served, enabled to disabled at "
+    "2026-10-27T04:20:31Z, disabled to enabled at 2026-10-27T04:20:49Z"
+)
+
+
+def test_a_record_whose_cards_changed_ptl_state_is_refused_naming_each_change(
+    tmp_path,
+):
+    """The named result; a build as well is named beside it."""
+    *real, simulated = (_recorded(c) for c in _four(tmp_path))
+    _recorded(real[1], **{PTL_CHANGES: PTL})
+    refused = re.escape(f"r1 is not graded: {PTL_NAMED}") + "$"
+    with pytest.raises(ValueError, match=refused):
+        grade(real, simulated)
+
+    _recorded(real[1], **{PTL_CHANGES: PTL, aiter_jit.BUILDS: ["mha"]})
+    both = "of ['mha'] while it served, so a step may have waited on it; " + PTL_NAMED
+    with pytest.raises(ValueError, match=re.escape(both) + "$"):
         grade(real, simulated)
 
 

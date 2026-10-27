@@ -6,8 +6,8 @@ A record is a real run's step record (`steps/dp<r>.jsonl`, written with
 that is not a dummy run a `Sample`: its batch view, its device label, its host
 labels and its provenance. `step_linear_fit` fits samples and `validate.cost`
 prices them; neither reads a step's stamps. Neither takes a record whose
-run.json names `BUILDS`, the JIT compiles its server ran while it served;
-`refusal` says why.
+run.json names `BUILDS`, the JIT compiles its server ran while it served, or
+`PTL_CHANGES`, the changes of its cards' PTL state; `refusal` says why.
 
 A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
 `dp_rank`. An older record's lines state neither count: `group_tokens`
@@ -103,17 +103,25 @@ TABLE_VERSION = 1
 #: run.json's entry naming the JIT modules and kernels its server compiled while
 #: it served (`atom.compass.drive.aiter_jit`); a server that compiled none has none.
 BUILDS = "aiter_jit_builds"
+#: run.json's entry naming each change of its cards' PTL state while its server
+#: served (`atom.compass.drive.identity.ptl_changes`); a run with none has none.
+PTL_CHANGES = "ptl_changes"
 
 
 def refusal(run: dict) -> str | None:
     """Why grading, a fit or `validate.cost` refuses a record whose run.json is
-    `run`, naming the modules of its `BUILDS`; None when it names none."""
+    `run`, naming the modules of its `BUILDS` and each of its `PTL_CHANGES`;
+    None when it names neither."""
+    why = []
     if builds := run.get(BUILDS):
-        return (
+        why.append(
             f"its server ran a JIT compile of {builds} while it served, "
             "so a step may have waited on it"
         )
-    return None
+    if changes := run.get(PTL_CHANGES):
+        named = ", ".join(f"{c['from']} to {c['to']} at {c['at']}" for c in changes)
+        why.append(f"its cards' PTL state changed while it served, {named}")
+    return "; ".join(why) or None
 
 
 @dataclass(frozen=True)

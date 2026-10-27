@@ -23,6 +23,7 @@ import torch
 
 from atom.compass.artifacts.keys import NO_PTL
 from atom.compass.artifacts.provenance import _run, git_tree_root, module_root
+from atom.compass.backends.step_labels import PTL_CHANGES  # noqa: F401
 from atom.compass.drive.gpu import GpuRefusal, smi
 from atom.compass.run import host_key_of
 from atom.compass.run.step_grid import keyed_of
@@ -38,9 +39,6 @@ MODELS = {"0x75a3": "MI355X"}
 AITER_ABBREV = 9
 #: Where a card's PCI device is, by bus; `/sys/class/drm/card<n>/device` links here.
 PCI = "/sys/bus/pci/devices"
-#: run.json's entry naming each change of its cards' PTL state while the
-#: command served (`ptl_changes`); a run whose cards changed none has none.
-PTL_CHANGES = "ptl_changes"
 #: Seconds between the readings `ptl_changes` takes.
 PTL_POLL_S = 1.0
 
