@@ -556,6 +556,7 @@ def hub(monkeypatch, tmp_path):
     monkeypatch.setattr(constants, "HUGGINGFACE_CO_URL_TEMPLATE", template)
     yield
     server.shutdown()
+    server.server_close()
 
 
 def test_a_hub_model_with_no_local_config_json_fetches_it_and_its_law_loads(
