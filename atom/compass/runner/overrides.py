@@ -779,11 +779,14 @@ def publish_planned_transfer(runner: Any) -> None:
     `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
     prices a transfer at them. Refused for a pipeline stage of Kimi's hybrid,
     whose KDA state regions ATOM's builder refuses to publish there
-    (`_refuse_kda_regions_across_stages`)."""
+    (`_refuse_kda_regions_across_stages`), and for an MLA builder whose sparse
+    indexer scores in FP4, whose regions no P/D backend parses
+    (`_refuse_fp4_indexer_regions`)."""
     if path := getattr(runner, "compass_block_file", None):
         from atom.compass import run
 
         _refuse_kda_regions_across_stages(runner)
+        _refuse_fp4_indexer_regions(runner)
         plan = runner.pool_plan
         tp = runner.config.tensor_parallel_size
         slot, after_blocks = _transferred_slot(runner)
@@ -806,6 +809,26 @@ def _refuse_kda_regions_across_stages(runner: Any) -> None:
             f"prefill-decode transfer at pipeline_parallel_size {pp}: the KDA "
             "state regions are keyed by KDA layer index, which "
             "`_consumer_region_map` cannot align across stages"
+        )
+
+
+def _refuse_fp4_indexer_regions(runner: Any) -> None:
+    """Refuse a transfer from an MLA builder whose sparse indexer scores in FP4,
+    with the reason ATOM's builder gives as it refuses to publish its regions to
+    a P/D backend, which the simulated connector stands for: this runner
+    allocates no cache, so the builder is never asked. A run whose only region
+    reader is `lmcache_mp` is no prefill-decode run and publishes nothing here."""
+    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+
+    builder = runner.attn_metadata_builder
+    if isinstance(builder, AiterMLAMetadataBuilder) and builder._indexer_fp4:
+        raise RunnerRefusal(
+            "ATOM's `AiterMLAMetadataBuilder.get_kv_transfer_tensors` refuses a "
+            "prefill-decode transfer under the FP4 sparse indexer "
+            "(--index_cache_dtype fp4): the P/D backends and the "
+            "hybrid/m3/kimi_k3 offload layouts parse one index region per layer "
+            "and cannot place its separate e8m0 scale plane. Pass "
+            "--index_cache_dtype fp8 to use one"
         )
 
 
