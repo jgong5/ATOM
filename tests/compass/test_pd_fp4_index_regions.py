@@ -7,10 +7,10 @@ revision a7e62ac04ecb2c0a54d736dc46601c5606cf10a6) is built driverless on the
 simulated connector's config, once per index cache dtype, each in a process of
 its own, and plans its pool with ATOM's `get_num_blocks`, as a simulated run
 does. Its runner then publishes what its connector prices, or refuses; its fake
-KV cache is allocated by ATOM's own `allocate_kv_cache`, which asks the
-builder for its regions on that config, and the builder is asked again on
-`lmcache_mp`'s. Under fp4 ATOM refuses the simulated connector, which stands
-for a P/D backend, and takes `lmcache_mp`; under fp8 it takes both.
+KV cache is allocated and ATOM's own `get_kv_transfer_tensors` is asked for the
+regions on Mooncake's config, the backend the simulated connector stands for,
+and on `lmcache_mp`'s. Under fp4 ATOM refuses Mooncake and takes `lmcache_mp`;
+under fp8 it takes both.
 """
 
 import json
@@ -31,9 +31,8 @@ CELL = [
     json.dumps({"kv_connector": "compass", "kv_role": "kv_producer"}),
 ]
 #: By index cache dtype, what refuses the transfer: ATOM's builder on the
-#: simulated connector's config (``atom``) and on `lmcache_mp`'s
-#: (``lmcache_mp``), and the simulated runner (``compass``).
-REFUSED = {"fp4": ["atom", "compass"], "fp8": []}
+#: config of the connector named, and the simulated runner (``compass``).
+REFUSED = {"fp4": ["compass", "mooncake"], "fp8": []}
 
 #: After `BUILD`, what refuses the transfer and why.
 REGIONS = BUILD + """
@@ -45,17 +44,15 @@ try:
 except RunnerRefusal as e:
     refused["compass"] = str(e)
 builder = runner.attn_metadata_builder
-builder.warmup_per_req_cache = lambda: None
 with forward._patches(recorder), fake, torch.inference_mode():
-    try:
-        runner.allocate_kv_cache(runner.pool_plan.paged_entries)
-    except NotImplementedError as e:
-        refused["atom"] = str(e)
-    config.kv_transfer_config = {"kv_connector": "lmcache_mp", "kv_role": "kv_both"}
-    try:
-        builder.get_kv_transfer_tensors()
-    except NotImplementedError as e:
-        refused["lmcache_mp"] = str(e)
+    config.kv_transfer_config = {}
+    runner.allocate_kv_cache(runner.pool_plan.paged_entries)
+    for name in ("mooncake", "lmcache_mp"):
+        config.kv_transfer_config = {"kv_connector": name}
+        try:
+            builder.get_kv_transfer_tensors()
+        except NotImplementedError as e:
+            refused[name] = str(e)
 print(json.dumps(refused))
 """
 
@@ -83,4 +80,4 @@ def test_a_transfer_refuses_under_the_fp4_indexer_where_atom_does(built, dtype):
     assert refused["published"].exists() == (not REFUSED[dtype])
     if "compass" in refused:
         assert refused["compass"].startswith("ATOM's `")
-        assert refused["compass"].partition(": ")[2] in refused["atom"]
+        assert refused["compass"].partition(": ")[2] in refused["mooncake"]
