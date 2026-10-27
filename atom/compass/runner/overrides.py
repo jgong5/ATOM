@@ -773,32 +773,35 @@ class UnbuiltModel(torch.nn.Module):
 
 def publish_planned_transfer(runner: Any) -> None:
     """Publish one entry of the paged class `get_num_blocks` planned, the state
-    slot a transfer moves beside a request's blocks (`_transferred_slot_bytes`),
-    the staging row a second write moves after them (`_staging_row_bytes`),
-    and the runner's TP width, at the file `compass_block_file` names, which
-    `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
-    prices a transfer at them."""
+    slot a transfer moves with a request's blocks or after them
+    (`_transferred_slot`), the staging row a second write moves after them
+    (`_staging_row_bytes`), and the runner's TP width, at the file
+    `compass_block_file` names, which `run.runner` gives TP rank 0 of a
+    prefill-decode deployment: its connector prices a transfer at them."""
     if path := getattr(runner, "compass_block_file", None):
         from atom.compass import run
 
         plan = runner.pool_plan
         tp = runner.config.tensor_parallel_size
-        slot = _transferred_slot_bytes(runner)
+        slot, after_blocks = _transferred_slot(runner)
         staging = _staging_row_bytes(runner)
         block = plan.entry_bytes[plan.paged_class]
-        run.publish_transfer(path, block, tp, slot, staging)
+        run.publish_transfer(path, block, tp, slot, staging, after_blocks)
 
 
-def _transferred_slot_bytes(runner: Any) -> int:
-    """The state slot a transfer moves beside a request's blocks, as the
-    runner's attention builder publishes it in its transfer regions
-    (`get_kv_transfer_tensors`, which needs an allocated cache, so the slot is
-    read off the plan): for DeepSeek-V4's builder, one entry of the
-    per-request slot class `get_num_blocks` planned; for Kimi's, one unit of
-    each KDA state region (`state_slot_regions`), the GDN state entry without
-    the kpool tail Kimi's builder plans in it, plus ReplaySSM's int32 cursor;
-    0 for every other builder. A Qwen GDN hybrid plans a slot its regions do
-    not carry."""
+def _transferred_slot(runner: Any) -> tuple[int, bool]:
+    """The state slot a transfer moves, and whether Mooncake writes it after
+    the request's blocks rather than with them, as the runner's attention
+    builder publishes it in its transfer regions (`get_kv_transfer_tensors`,
+    which needs an allocated cache, so the slot is read off the plan).
+
+    DeepSeek-V4's builder publishes one entry of the per-request slot class
+    `get_num_blocks` planned as SWA-ring regions, written with the blocks.
+    Kimi's publishes one unit of each KDA state region (`state_slot_regions`),
+    written after the blocks: the GDN state entry without the kpool tail
+    Kimi's builder plans in it, plus ReplaySSM's int32 cursor. Every other
+    builder publishes none; a Qwen GDN hybrid plans a slot its regions do not
+    carry."""
     from atom.model_engine.kv_block import STATE_SLOT_CLASS
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
@@ -808,11 +811,11 @@ def _transferred_slot_bytes(runner: Any) -> int:
 
     builder = runner.attn_metadata_builder
     if isinstance(builder, DeepseekV4AttentionMetadataBuilder):
-        return runner.pool_plan.entry_bytes[STATE_SLOT_CLASS]
+        return runner.pool_plan.entry_bytes[STATE_SLOT_CLASS], False
     if isinstance(builder, _KimiMLAGDNCommon):
         cursor = torch.int32.itemsize if builder.replayssm else 0
-        return GDNStateMixin.state_spec(builder).entry_bytes + cursor
-    return 0
+        return GDNStateMixin.state_spec(builder).entry_bytes + cursor, True
+    return 0, False
 
 
 def _staging_row_bytes(runner: Any) -> int:

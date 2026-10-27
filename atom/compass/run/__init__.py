@@ -605,16 +605,23 @@ def _bind_transfer(config, run: dict) -> None:
 
 
 def publish_transfer(
-    path: Path, block_bytes: int, tp: int, slot_bytes: int = 0, staging_bytes: int = 0
+    path: Path,
+    block_bytes: int,
+    tp: int,
+    slot_bytes: int = 0,
+    staging_bytes: int = 0,
+    slot_after_blocks: bool = False,
 ) -> None:
-    """Write one paged KV block's bytes, the state slot a transfer moves beside
-    a request's blocks and the staging row it moves in a second write, as a
-    runner at TP `tp` planned them, where `_planned_transfer` reads them."""
+    """Write one paged KV block's bytes, the state slot a transfer moves with
+    a request's blocks, or after them when `slot_after_blocks`, and the
+    staging row it moves in a second write, as a runner at TP `tp` planned
+    them, where `_planned_transfer` reads them."""
     planned = {
         "block_bytes": int(block_bytes),
         "tp": tp,
         "slot_bytes": int(slot_bytes),
         "staging_bytes": int(staging_bytes),
+        "slot_after_blocks": bool(slot_after_blocks),
     }
     _write_whole(path, json.dumps(planned))
 
@@ -678,7 +685,12 @@ def _planned_transfer() -> tuple:
     stages = planned[prefill[0]]
     return tuple(
         TransferModel.from_spec(
-            machine, s["block_bytes"], scope, s["slot_bytes"], s["staging_bytes"]
+            machine,
+            s["block_bytes"],
+            scope,
+            s["slot_bytes"],
+            s["staging_bytes"],
+            s["slot_after_blocks"],
         )
         for _, s in sorted(stages.items())
     )

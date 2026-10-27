@@ -75,10 +75,11 @@ class TransferModel:
     `bandwidth_bytes_per_s` is what a transfer actually reaches, not what the
     link is rated at -- `from_spec` applies the derate before it gets here, so
     a model built by hand in a test states an achievable number too.
-    `slot_bytes` is the request's state slot, which every transfer moves beside
-    its blocks; 0 for a model whose transfer carries none. `staging_bytes` is
-    the staging row a second write moves once the first completes; 0 for a
-    model that stages nothing, whose transfer is one write.
+    `slot_bytes` is the request's state slot, which every transfer moves with
+    its blocks, or in a second write once they complete when
+    `slot_after_blocks`; 0 for a model whose transfer carries none.
+    `staging_bytes` is the staging row the second write moves; 0 for a model
+    that stages nothing.
     """
 
     latency_s: float
@@ -87,6 +88,7 @@ class TransferModel:
     setup_s: float = 0.0
     slot_bytes: int = 0
     staging_bytes: int = 0
+    slot_after_blocks: bool = False
 
     def __post_init__(self) -> None:
         if self.latency_s < 0:
@@ -117,10 +119,12 @@ class TransferModel:
         scope: Scope,
         slot_bytes: int = 0,
         staging_bytes: int = 0,
+        slot_after_blocks: bool = False,
     ) -> TransferModel:
         """Price a block of *bytes_per_block*, and a state slot of
-        *slot_bytes* and a staging row of *staging_bytes* per transfer, on the
-        *scope* link of *spec*.
+        *slot_bytes*, written after the blocks when *slot_after_blocks*, and a
+        staging row of *staging_bytes* per transfer, on the *scope* link of
+        *spec*.
 
         The spec refuses a link it does not carry, and refuses a peak
         bandwidth whose derate is missing; both refusals travel out of here
@@ -136,6 +140,7 @@ class TransferModel:
             setup_s=spec.values.get(f"{link}.link_setup_s", 0.0),
             slot_bytes=slot_bytes,
             staging_bytes=staging_bytes,
+            slot_after_blocks=slot_after_blocks,
         )
 
     def bytes_moved(self, blocks: int) -> int:
@@ -143,11 +148,13 @@ class TransferModel:
         and the staging row."""
         return blocks * self.bytes_per_block + self.slot_bytes + self.staging_bytes
 
-    @property
-    def writes(self) -> int:
-        """The writes one transfer takes, each paying the latency: the blocks
-        and slot, then the staging row when there is one."""
-        return 2 if self.staging_bytes else 1
+    def writes(self, blocks: int) -> int:
+        """The writes a transfer of *blocks* takes, each paying the latency:
+        the blocks, with the slot unless it follows them, then the staging row
+        and a slot that follows the blocks. A write with no bytes is not
+        posted, and a transfer that moves no byte still takes one."""
+        after = self.staging_bytes + (self.slot_bytes if self.slot_after_blocks else 0)
+        return max(1, (self.bytes_moved(blocks) > after) + (after > 0))
 
     def duration_s(self, blocks: int) -> float:
         """How long *blocks* take on this link.
@@ -165,7 +172,7 @@ class TransferModel:
                 "before it starts"
             )
         return (
-            self.writes * self.latency_s
+            self.writes(blocks) * self.latency_s
             + self.bytes_moved(blocks) / self.bandwidth_bytes_per_s
         )
 
@@ -183,8 +190,8 @@ class Link:
     holders fed the same arrivals in the same order compute the same times. A
     write alone on the link completes at `a + duration_s(blocks)`, and the
     link's first write that moves bytes starts `setup_s` after it would
-    otherwise. A transfer whose staging row follows in a second write holds the
-    link until that row has moved, the first write's latency included.
+    otherwise. A transfer whose staging row or slot follows in a second write
+    holds the link until it has moved, the first write's latency included.
     """
 
     def __init__(self, model: TransferModel) -> None:
@@ -207,7 +214,7 @@ class Link:
             self._set_up = True
             start += self._model.setup_s
         done = start + self._model.duration_s(blocks)
-        # A staging write leaves when the first write completes.
-        gap = (self._model.writes - 1) * self._model.latency_s
+        # A second write leaves when the first write completes.
+        gap = (self._model.writes(blocks) - 1) * self._model.latency_s
         self._free = start + gap + moved / self._model.bandwidth_bytes_per_s
         return done
