@@ -63,9 +63,11 @@ DEVICE = {
         "arch": "gfx950",
         "count_per_node": 8,
         "memory": {"capacity_bytes": TOTAL},
+        # Nightly 20261026's stack; the readings below were taken under
+        # nightly-20261013's, whose aiter was 9205e1059, and carry over unmeasured.
         "software_pinned_to": {
             "rocm": "7.2.4",
-            "aiter": "9205e1059",
+            "aiter": "41d4d8d7e",
             "rccl": "2.27.7",
             "torch": "2.10.0+rocm7.2.4.git3d3aa833",
         },
@@ -90,8 +92,8 @@ DATASHEET = {
 }
 
 #: `probe_device.py`'s readings on mi355-gpu-45 cards 0000:75:00.0 and
-#: 0000:05:00.0, neither with a ptl directory, under the stack `DEVICE` pins
-#: (rocm/atom-dev nightly-20261013), at the commit named; the record is its OUT.
+#: 0000:05:00.0, neither with a ptl directory, under rocm/atom-dev
+#: nightly-20261013's stack, at the commit named; the record is its OUT.
 #: FP4 is the faster of hipBLASLt and aiter. Each derate is a reading over
 #: `DATASHEET`'s peak.
 PEAKS = (
