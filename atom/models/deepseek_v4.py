@@ -4737,6 +4737,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def __init__(self, config: Config, prefix: str = "") -> None:
         super().__init__()
+        # The model builds and runs every decoder layer, and the attention
+        # backend sizes its pools over every layer, so a stage cannot hold
+        # only its own share.
+        if config.pipeline_parallel_size > 1:
+            raise ValueError("DeepSeek-V4 does not support pipeline parallelism")
         self.atom_config = config
         self.hf_config = config.hf_config
         self.args = DeepseekV4Args.from_hf_config(self.hf_config)
