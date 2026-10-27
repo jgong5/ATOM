@@ -11,7 +11,7 @@
 #
 # THE RULE: an atom module named by an excluded test is a blind spot unless a
 # CPU-gate test that actually runs names it too. Imports are read at any
-# indentation on the excluded side -- 867 of this tree's `import atom.*`
+# indentation on the excluded side -- 911 of this tree's `import atom.*`
 # lines are indented -- but coverage is credited only for a module-level import
 # in a CPU-gate file that collects at least one test, because those are the only
 # imports that provably execute. At 236abfd9a the MODULE-LEVEL half carried both
@@ -40,24 +40,23 @@
 #
 # A trailing / matches the whole subtree.
 #
-# Measured at 02dcdc34c9263fea80763e2dc9f1e5e7c95fe25b over this tree:
-#   tests/        603 files  = 55 in tests/plugin/ + 96 excluded + 452 CPU gate
-#   CPU gate      403 files collect >=1 test, 49 collect none
-#   imports       867 indented `import atom.*` lines in non-plugin test files
-#   collected  11609 tests by --collect-only. A run of the same set reports
-#              the same 11609 outcomes. Its "skipped" total is LARGER than any
+# Measured at d8a9737591e7b992a419ea413a11a0424b52a084 over this tree:
+#   tests/        700 files  = 55 in tests/plugin/ + 96 excluded + 549 CPU gate
+#   CPU gate      500 files collect >=1 test, 49 collect none
+#   imports       911 indented `import atom.*` lines in non-plugin test files
+#   collected  13446 tests by --collect-only. A run of the same set reports
+#              the same 13446 outcomes. Its "skipped" total is LARGER than any
 #              skip count here, because a module-level skip in one of the 49
 #              files that collect nothing is counted as skipped without ever
 #              becoming a collected test. This file states the set; gate_cpu.sh
 #              prints the run, and is the only source for its outcome counts.
 #   candidates    166 paths named by an excluded test, any indentation
-#   covered       290 paths named at module level by a live CPU-gate file
-#   triggers      117 paths below
+#   covered       327 paths named at module level by a live CPU-gate file
+#   triggers      114 paths below
 atom/distributed/dcp_utils.py
 atom/distributed/indexer_cp.py
 atom/distributed/pcp_utils.py
 atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py
-atom/model_engine/model_runner.py
 atom/model_loader/loader.py
 atom/model_ops/attention_mha.py
 atom/model_ops/attention_mla.py
@@ -98,7 +97,6 @@ atom/model_ops/engram/tables.py
 atom/model_ops/eplb.py
 atom/model_ops/fp4_mqa_ragged_metadata.py
 atom/model_ops/fused_moe/modular_kernel.py
-atom/model_ops/fused_moe/mori_prepare_finalize.py
 atom/model_ops/fused_moe/mori_v2_prepare_finalize.py
 atom/model_ops/fused_moe/rccl_prepare_finalize.py
 atom/model_ops/glm5_next/indexer.py
@@ -162,7 +160,6 @@ atom/spec_decode/drafter.py
 atom/spec_decode/dspark_proposer.py
 atom/spec_decode/eagle_proposer.py
 atom/utils/attn_ffn_piecewise.py
-atom/utils/backends.py
 atom/utils/cuda_graph.py
 atom/utils/custom_register.py
 atom/utils/decorators.py

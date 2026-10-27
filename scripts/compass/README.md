@@ -354,17 +354,17 @@ and is kept as a forward guard:
    incomplete by an unknown amount.
 3. **Skips.** An indented import is not proof that anything executed it. The
    excluded side reads any indentation, but coverage is credited **only for a
-   module-level import**, and that half carries both counter-examples:
+   module-level import**. At `236abfd9a` (measured in `xiaobizh_n18_cpu`) that half
+   carried both counter-examples:
    `tests/model_ops/test_moe_dp_token_capacity.py::test_dpa_capacity_fits_gathered_topk_metadata`
-   imports `topK` inside a test marked `skipif(not torch.cuda.is_available())`, and
-   `tests/test_mla_index_cache.py::test_pp_shared_indexer_uses_the_producer_buffer_width`
-   imports `ModelRunner` **indented four spaces inside that test function** — not at
-   module level, as this file and three others said until
-   2026-09-20. Reading coverage at any indentation drops the set 30 → 29, losing
-   `topK.py`; doing that *and* crediting files that collect nothing drops it 30 → 27,
-   losing `atom/model_engine/model_runner.py` — the module Compass's runner seam
-   replaces — plus `aiter_mla.py` and `topK.py`. Measured at `236abfd9a` in
-   `xiaobizh_n18_cpu`.
+   imported `topK` inside a test marked `skipif(not torch.cuda.is_available())`, and
+   `tests/test_mla_index_cache.py::test_model_runner_local_total_layers_adds_mtp_only_on_drafter_stage`
+   imported `ModelRunner` **indented four spaces inside that test function**, not at
+   module level. Reading coverage at any indentation dropped the set 30 → 29, losing
+   `topK.py`; doing that *and* crediting files that collect nothing dropped it 30 → 27,
+   losing `atom/model_engine/model_runner.py` (the module Compass's runner seam
+   replaces), `aiter_mla.py` and `topK.py`. A later module-level import in a CPU-gate
+   test credits any of them; `gpu_gate_triggers.txt` is the current list.
 4. **Collection.** A file that collects nothing covers nothing, so coverage is
    credited only from a CPU-gate file `--collect-only` shows collecting at least one
    test. At `236abfd9a` that probe removed no path: **30 triggers with it, 30
@@ -372,7 +372,7 @@ and is kept as a forward guard:
    withheld 15 coverage paths, of which the only candidate,
    `atom/model_ops/v4_kernels/state_writes.py`, was absorbed either way by the
    candidate subtree entry `atom/model_ops/v4_kernels/`). It is a forward guard for
-   trees that one does not represent, not the thing that keeps `model_runner.py`, and
+   trees that one does not represent, not what kept `model_runner.py` there, and
    it costs a full `pytest --collect-only` over the CPU gate plus a refusal path
    (exit 97).
 
