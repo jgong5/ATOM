@@ -227,12 +227,15 @@ def _all_to_all(op, view, tp, kv) -> Work:
 def _dp_exchange(op, view, tp, kv) -> Work:
     """The data-parallel group's gather of the MoE's input, or reduce-scatter
     of its output: the larger side holds every rank's rows, the smaller this
-    rank's, and the group is `sizes` long or their ratio wide."""
-    x, out = op["args"]["x"], op["out"][0]
-    rows = sorted((x["shape"][0], out[0]))
+    rank's, and the group is `sizes` long or their ratio wide. A gather of
+    routed rows moves several tensors of one height in the one collective."""
+    xs, out = op["args"]["x"], op["out"][0]
+    xs = xs if isinstance(xs, (list, tuple)) else [xs]
+    rows = sorted((xs[0]["shape"][0], out[0]))
     ranks = len(op["args"].get("sizes") or ()) or rows[1] // rows[0]
-    every = rows[1] * math.prod(x["shape"][1:]) * _size(x["dtype"])
-    collective = allgather if out[0] > x["shape"][0] else reduce_scatter
+    row = sum(math.prod(x["shape"][1:]) * _size(x["dtype"]) for x in xs)
+    every = rows[1] * row
+    collective = allgather if out[0] > xs[0]["shape"][0] else reduce_scatter
     return _boundary(op) + collective(ranks, every)
 
 

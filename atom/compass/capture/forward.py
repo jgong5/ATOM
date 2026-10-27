@@ -719,6 +719,8 @@ def _patches(recorder):
       runs it, which would open every shard, or download them for a hub name.
     * A step ATOM splits into two micro-batches (`--enable-tbo`) is refused by
       name before its threads start: one graph cannot hold the two.
+    * The step's DP exchange (`sync_dp_metadata`) runs on the host: `decide`
+      runs it on a group of one too, and reads its packed rows back as numpy.
     """
     import flydsl
     import triton
@@ -731,6 +733,7 @@ def _patches(recorder):
     from atom.model_ops import module_dispatch_ops, moe
     from atom.model_ops.attentions import gdn_attn
     from atom.utils import CpuGpuBuffer
+    from atom.utils.tbo import ubatching
     from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
     recorder.languages = tuple(
@@ -766,7 +769,7 @@ def _patches(recorder):
     init, zeros, numpy = CpuGpuBuffer.__init__, torch.zeros, torch.Tensor.numpy
     conv1d, tolist = gdn_attn.compute_causal_conv1d_metadata, torch.Tensor.tolist
     attach = gdn_attn.GDNStateMixin._attach_replayssm
-    fake_tolist = FakeTensor.tolist
+    fake_tolist, sync = FakeTensor.tolist, ubatching.sync_dp_metadata
 
     def landed(tensor):
         if not getattr(recorder.runner, "drafter", None):
@@ -810,6 +813,10 @@ def _patches(recorder):
         with unset_fake_temporarily():
             return conv1d(*args, **kwargs)
 
+    def host_sync(**kwargs):
+        with unset_fake_temporarily():
+            return sync(**kwargs)
+
     def replayssm(builder, md, num_reqs, is_prefill):
         staged = builder.non_spec_state_indices_tensor.np[:num_reqs]
         live = int((staged >= 0).sum()) if is_prefill else None
@@ -826,6 +833,7 @@ def _patches(recorder):
         (fly.CompiledFunction, "__call__", compiled_call),
         (CpuGpuBuffer, "__init__", staged_init),
         (gdn_attn, "compute_causal_conv1d_metadata", host_conv1d),
+        (ubatching, "sync_dp_metadata", host_sync),
         (gdn_attn.GDNStateMixin, "_attach_replayssm", replayssm),
         (torch.Tensor, "tolist", host_tolist),
         (FakeTensor, "tolist", host_tolist),

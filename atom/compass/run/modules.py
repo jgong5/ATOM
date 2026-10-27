@@ -249,12 +249,15 @@ def _moe(module, name, parent):
     fused = module._comm_fused_moe is not None
     if not (config.use_ep and dims[6] > 1):
         return Module(name, "moe", dims, fmt, ranks, fused, act=act)
-    from atom.model_ops.fused_moe.mori_prepare_finalize import resolve_mori_dispatch
+    from atom.model_ops.fused_moe.routed_rows import resolve_routed_rows_wire
 
     mori = config.requested_all2all_backend in ("auto", "mori") and not (
         envs.ATOM_DISABLE_MORI_EP or envs.ATOM_MORI_V2
     )
-    sent = resolve_mori_dispatch(module.moe_config.in_dtype, module.hidden_size)
+    # The method's routed-rows wire, as `_maybe_make_prepare_finalize` takes it.
+    sent = getattr(method, "routed_rows_wire", None) or resolve_routed_rows_wire(
+        module.moe_config.in_dtype, module.hidden_size
+    )
     wire = (FORMATS.get(sent.dtype), MORI_COMBINE.get(envs.ATOM_MORI_COMBINE_QUANT))
     if not (mori and all(wire)):
         return None
