@@ -175,6 +175,10 @@ _SAVE_LEASE = (
     "lmcache_mp scheduler overrides it to release nothing, and every other "
     "offload backend is refused"
 )
+_TRACE = (
+    "a request's OpenTelemetry span times, exported only when tracing is "
+    "configured; no simulated result reads them"
+)
 _COMPILE = "torch.compile at startup, before the simulated window"
 _LOAD = "loads or warms up the model at startup, before the simulated window"
 _WORKER_RPC = (
@@ -302,6 +306,14 @@ _KEPT_REAL = (
                 ("record_kv_cache_ready", "monotonic", 1), ("_record_write_ack", "monotonic", 1),
                 ("_report_held_failures", "monotonic", 1), ("start_load_kv", "monotonic", 1),
                 ("_write_listener", "monotonic", 1), ("_write_mla_slot", "monotonic", 1))),
+            ("disaggregation/moriio/moriio_connector.py", (
+                ("_accept_write_request", "monotonic", 1),
+                ("_collect_write_reports", "time", 1), ("_finish_write", "monotonic", 1),
+                ("_forget_finished_writes", "monotonic", 1), ("_hold_failure", "monotonic", 1),
+                ("_issue_ready_reads", "monotonic", 1),
+                ("_report_held_failures", "monotonic", 1), ("_request_write", "time", 1),
+                ("_service_write_requests", "monotonic", 1),
+                ("_service_write_requests", "time", 1), ("start_load_kv", "monotonic", 1))),
             ("offload/mooncake_store/client.py", (
                 ("__init__", "monotonic", 1), ("__init__", "time", 1),
                 ("seconds", "monotonic", 1), ("seconds", "time", 1))),
@@ -321,6 +333,8 @@ _KEPT_REAL = (
         )
         for scope, call, n in scopes
     ),
+    ("atom/model_engine/segment_tokenizer.py", "_encode_cached", "time.perf_counter",
+     "K9", _LOG_ONLY, 2),
     ("atom/model_loader/expert_staging.py", "_ensure_staging", "time.perf_counter",
      "K9", _LOAD, 2),
     ("atom/model_loader/loader.py", "load_model", "time.perf_counter", "K9", _LOAD, 2),
@@ -334,6 +348,9 @@ _KEPT_REAL = (
     ("atom/spec_decode/drafter.py", "warmup_draft_graphs", "time.time", "K9", _LOAD, 2),
     ("atom/model_ops/eplb.py", "_execute_runtime_rebalance", "time.perf_counter",
      "K9", "moves expert weights inside the real forward, which a simulated run replaces", 4),
+    ("atom/observability/tracing.py", "now", "time.perf_counter_ns", "K9", _TRACE, 1),
+    ("atom/observability/tracing.py", "enqueue", "time.perf_counter_ns", "K9", _TRACE, 1),
+    ("atom/observability/tracing.py", "enqueue", "time.time_ns", "K9", _TRACE, 1),
     ("atom/rollout/weight_sync.py", "load_weights_via_ipc", "time.time",
      "K9", "pushes real weights to the GPU, which a simulated run never holds", 2),
     ("atom/utils/__init__.py", "shutdown_all_processes", "time.monotonic",
