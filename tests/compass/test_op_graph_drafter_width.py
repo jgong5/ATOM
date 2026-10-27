@@ -51,6 +51,7 @@ def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True, dr
         context_lens=[c for _, c, _ in rows],
         req_ids=list(range(len(rows))),
         produces_output=lambda: output,
+        final_prefill_requests=lambda: prefill,
         is_dummy_run=False,
     )
 
