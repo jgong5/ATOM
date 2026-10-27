@@ -266,7 +266,7 @@ def test_a_real_recording_stamps_the_first_pull_and_put_after_each_reply(
     )
     with compass_run.engine(config):
         engine = Engine(SimpleNamespace())
-        engine.output_queue = clock.relay_queue(3)
+        engine.output_queue = clock.relay_queue(SimpleNamespace(data_parallel_rank=3))
     enqueue = engine.runner_mgr.enqueue
 
     def step(msg):  # the request's last step is followed by the shutdown

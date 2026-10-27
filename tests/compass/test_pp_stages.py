@@ -151,7 +151,7 @@ def test_a_stage_names_its_channels_by_the_index_its_frontend_gives_it(monkeypat
         disagg_p2d_addr="",
         disagg_d2p_addr="",
     )
-    relay = clock.relay_queue(0)
+    relay = clock.relay_queue(SimpleNamespace(data_parallel_rank=0))
     clock.name_endpoints(0, "in", "ctl", "out", config)
     assert relay.wsock.ch == "engine-pp1->frontend:output#dp1"
     assert [rt.endpoints[a] for a in ("in", "ctl", "out", "m1")] == [
