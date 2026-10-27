@@ -155,8 +155,6 @@ V41_SILENT = (
 )
 #: What the routed experts' kernel reads once for each expert it runs.
 HELD = tuple(f"w{w}_{p}" for w in (13, 2) for p in ("weight", "weight_scale", "bias"))
-#: Linear quant types whose activations stay bf16 into the matrix product.
-UNQUANTIZED_INPUT = ("No", "per_1x32")
 LAYER = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
@@ -326,7 +324,8 @@ def _classify(module, name, parent):
         reduces = _is(module, ROW) and module.reduce_results
         ranks = module.tp_size if reduces else 1
         quant = getattr(getattr(module, "quant_type", None), "name", "No")
-        act = "bf16" if quant in UNQUANTIZED_INPUT else fmt
+        # A quantized linear quantizes its input to its weight's format.
+        act = "bf16" if quant == "No" else fmt
         if getattr(module, "native_a8_group_rows", None) is not None:
             act = "fp8"
         if getattr(parent, "_wo_a_mxscale", False) and module is parent.wo_a:

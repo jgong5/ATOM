@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """MXFP4 models' meta builds: each fp4 linear, and an fp4 MLA up-projection,
 is walked at its unpacked input width, though its weight packs two of it to a
-byte, and one fp4 linear's price is checked against a count by hand.
+byte; each fp4 linear reads its input at fp4, which ATOM quantizes it to before
+the product; and one fp4 linear's price is checked against a count by hand.
 
 The build owns its process because the driverless declarations are
 process-global.
@@ -67,6 +68,14 @@ def test_each_fp4_linear_is_walked_at_its_unpacked_input_width(tp):
     assert [m.dims for m in modules if m.kind == "act"] == [(512 // tp,)] * 2
 
 
+@pytest.mark.parametrize("tp", [1, 2])
+def test_each_fp4_linear_reads_its_input_at_fp4(tp):
+    gemms = [m for m in _fp4(tp) if m.kind == "gemm" and m.fmt == "fp4"]
+
+    assert len(gemms) == 4 * 2
+    assert {m.act for m in gemms} == {"fp4"}
+
+
 def test_an_fp4_up_projection_is_walked_from_its_whole_latent():
     v3 = json.loads(V3.read_text())
     v3.update(num_hidden_layers=1, first_k_dense_replace=1)
@@ -80,13 +89,14 @@ def test_an_fp4_up_projection_is_walked_from_its_whole_latent():
 @BOUND
 def test_one_fp4_linear_by_hand(spec):
     (down,) = [m for m in _fp4(1) if m.name == "model.layers.0.mlp.down_proj"]
-    # 8 prefill tokens from 512 to 256: 2 flops a multiply-add, the bf16
-    # input and output, and the fp4 weight at half a byte an element.
+    # 8 prefill tokens from 512 to 256: 2 flops a multiply-add at the fp4
+    # rate, the fp4 input and weight at half a byte an element, and the bf16
+    # output.
     flops = 2 * 8 * 256 * 512
-    moved = 8 * 512 * 2 + 512 * 256 / 2 + 8 * 256 * 2
+    moved = 8 * 512 / 2 + 512 * 256 / 2 + 8 * 256 * 2
     by_name = _price([down], view((8, 8, False)), spec)
 
-    assert (flops, moved) == (2_097_152, 77_824)
+    assert (flops, moved) == (2_097_152, 71_680)
     assert by_name["roofline.gemm"] == pytest.approx(
-        _module(Work({"bf16": flops}, moved), spec)
+        _module(Work({"fp4": flops}, moved), spec)
     )
