@@ -10,9 +10,11 @@ behind a spin kernel, so no host time is in it.
 - Compute: per format, the median of `REPS` GEMMs ``x @ w.T``, x m by k and
   w n by k, at each of `SHAPES`, BF16 through `torch.matmul`, FP8 through
   `torch._scaled_mm`, and FP4 where SPEC states ``fp4_flops``: MXFP4, two
-  values a byte and a power-of-two scale per 32 along k, through both
+  values a byte and a power-of-two scale per 32 along k, through each of
   `torch._scaled_mm` (hipBLASLt) and `aiter.gemm_a4w4` with w pre-shuffled,
-  as aiter's own tests call it. The best rate over shapes and libraries, over
+  as aiter's own tests call it, that runs on the card; one that raises is
+  named in the record with its error, and with neither the run is refused.
+  The best rate over shapes and libraries, over
   SPEC's ``*_flops``, is the format's derate. Each GEMM follows a spin, so the
   rate is a burst's: with PTL enabled a sustained GEMM slows within a second
   or two.
@@ -34,10 +36,11 @@ behind a spin kernel, so no host time is in it.
   bandwidth is ``intra_node.derate``.
 
 The run is refused unless every card is idle (under `IDLE_BYTES` of VRAM used,
-0% busy) and reads SPEC's ``device.ptl`` from
-``ptl/ptl_enable`` under its sysfs device (`NO_PTL` where it has none). OUT
-is the record: the cards, the stack (ROCm, aiter's commit, RCCL and torch),
-every sample and this file's text; the fragment
+and no other process KFD charges memory of it) and reads SPEC's ``device.ptl``
+from ``ptl/ptl_enable`` under its sysfs device (`NO_PTL` where it has none).
+``gpu_busy_percent`` is no test of idle: a gfx1250 card with no process reads
+100. OUT is the record: the cards, the stack (ROCm, aiter's commit, RCCL and
+torch), the capacity torch reads on card 0, every sample and this file's text; the fragment
 printed names its sha256.
 """
 
@@ -59,6 +62,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from atom.compass.artifacts.keys import NO_PTL
+from atom.compass.drive.gpu import kfd_pid
 from atom.compass.spec import Fragment, MachineSpec, SpecRefusal
 from atom.compass.spec.rules import Rule
 
@@ -73,7 +77,9 @@ GRAPH, ROUNDS, LINK_BYTES = 1000, 1000, 2**30
 REPS = 20
 SPIN = 10**7  # device cycles a sample waits behind, well past its host calls
 IDLE_BYTES = 2**30
-DRM = "/sys/class/drm"
+DRM, KFD = "/sys/class/drm", "/sys/class/kfd/kfd"
+#: The MXFP4 GEMMs timed, each as a failure names it.
+FP4 = ("torch._scaled_mm", "aiter.gemm_a4w4")
 #: Each format's derate, by the spec-peak number it is taken over.
 FORMATS = {"bf16": "bf16_flops", "fp8": "fp8_flops", "fp4": "fp4_flops"}
 #: The fields read with a band, and each one's sample list in the record.
@@ -108,13 +114,18 @@ def _stream(src, dst, n, BLOCK: tl.constexpr, READ: tl.constexpr, WRITE: tl.cons
     tl.store(dst + offs, x, mask=(offs < n) & ((x < 0) | WRITE))
 
 
-def cards(bdfs: list[str], drm: str = DRM) -> list[dict]:
-    """Each card's sysfs reading by PCI address: VRAM used, busy and PTL."""
+def cards(bdfs: list[str], drm: str = DRM, kfd: str = KFD, me=None) -> list[dict]:
+    """Each card's sysfs reading by PCI address: VRAM used, the processes
+    other than `me` (this one's KFD entry by default) that KFD charges its
+    memory to, and PTL."""
+    me = kfd_pid() if me is None else me
     found = {}
     for card in Path(drm).glob("card[0-9]*"):
         device = card / "device"
         if "-" not in card.name and device.exists():
             found[device.resolve().name] = device
+    ids = _gpu_ids(kfd)
+    procs = [p for p in Path(kfd, "proc").glob("*") if p.name != me]
     out = []
     for bdf in bdfs:
         device = found[bdf]
@@ -123,19 +134,42 @@ def cards(bdfs: list[str], drm: str = DRM) -> list[dict]:
             {
                 "bdf": bdf,
                 "vram_used": int((device / "mem_info_vram_used").read_text()),
-                "busy": int((device / "gpu_busy_percent").read_text()),
+                "processes": [
+                    p.name for p in procs if _charged(p / f"vram_{ids[bdf]}")
+                ],
                 "ptl": ptl.read_text().strip() if ptl.exists() else NO_PTL,
             }
         )
     return out
 
 
+def _gpu_ids(kfd: str) -> dict[str, str]:
+    """Each KFD topology node's `gpu_id` by its PCI address."""
+    ids = {}
+    for node in Path(kfd, "topology", "nodes").glob("*"):
+        lines = (node / "properties").read_text().splitlines()
+        props = dict(line.split() for line in lines)
+        loc = int(props["location_id"])
+        bdf = f"{int(props['domain']):04x}:{loc >> 8:02x}:{loc >> 3 & 31:02x}.{loc & 7}"
+        ids[bdf] = (node / "gpu_id").read_text().strip()
+    return ids
+
+
+def _charged(path: Path) -> int:
+    """The bytes a KFD `vram_<gpu_id>` file reads; 0 once its process has exited."""
+    try:
+        return int(path.read_text())
+    except FileNotFoundError:
+        return 0
+
+
 def refuse_unfit(read: list[dict], ptl: str) -> None:
     """Refuse cards that hold other work or disagree with the spec's PTL."""
     wrong = [
-        f"{c['bdf']} (ptl {c['ptl']}, {c['vram_used']} B used, {c['busy']}% busy)"
+        f"{c['bdf']} (ptl {c['ptl']}, {c['vram_used']} B used, "
+        f"processes {c['processes']})"
         for c in read
-        if c["ptl"] != ptl or c["vram_used"] > IDLE_BYTES or c["busy"]
+        if c["ptl"] != ptl or c["vram_used"] > IDLE_BYTES or c["processes"]
     ]
     if wrong:
         raise SpecRefusal(
@@ -181,16 +215,44 @@ def _a4w4(x, w):
     return partial(aiter.gemm_a4w4, x4, w4, sx, sw, bpreshuffle=True)
 
 
+def _running(fp4: dict, failed: dict) -> list:
+    """Each `FP4` library's samples and call, of those in `fp4` whose call
+    runs; one that raises is named in `failed` with its error and not made
+    again. Refuses when none runs."""
+    found = []
+    for name, (samples, make) in fp4.items():
+        if name in failed:
+            continue
+        try:
+            call = make()
+            call()
+        except Exception as error:  # a kernel this card's arch or stepping lacks
+            failed[name] = f"{type(error).__name__}: {error}".splitlines()[0]
+            continue
+        found.append((samples, call))
+    if not found:
+        raise SpecRefusal(
+            Rule.MEASURED,
+            "no MXFP4 GEMM runs on these cards: "
+            + "; ".join(f"{name} {error}" for name, error in failed.items()),
+            "probe where one of them runs, or drop `fp4_flops` from the spec",
+        )
+    return found
+
+
 def probe(torch, formats) -> dict:
     """Every sample, on visible cards 0 and 1, GEMMs in `formats`; FP4 also
-    through aiter, under ``aiter``."""
+    through aiter, under ``aiter``; each FP4 library that failed, under
+    ``failed``; and card 0's capacity as torch reads it."""
     torch.cuda.set_device(0)
+    capacity = torch.cuda.mem_get_info(0)[1]  # the total an engine start reads
     fp8 = torch.float8_e4m3fn
     if torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx942"):
         fp8 = torch.float8_e4m3fnuz
     one = torch.ones((), device="cuda")
     gemm = {f: {} for f in formats}
     aiter = {"fp4": {}} if "fp4" in formats else {}
+    failed: dict[str, str] = {}
     for m, n, k in SHAPES:
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
@@ -199,12 +261,15 @@ def probe(torch, formats) -> dict:
             "bf16": partial(torch.matmul, x, w.T),
             "fp8": partial(scaled, x.to(fp8), w.to(fp8).T, one, one),
         }
-        if "fp4" in formats:
-            (x4, sx), (w4, sw) = _fp4(torch, m, k), _fp4(torch, n, k)
-            calls["fp4"] = partial(scaled, x4, w4.T, sx, sw)
-        timings = [(gemm[f], calls[f]) for f in formats]
+        timings = [(gemm[f], calls[f]) for f in formats if f != "fp4"]
         if aiter:
-            timings.append((aiter["fp4"], _a4w4(x, w)))
+
+            def hipblaslt():
+                (x4, sx), (w4, sw) = _fp4(torch, m, k), _fp4(torch, n, k)
+                return partial(scaled, x4, w4.T, sx, sw)
+
+            libraries = (gemm["fp4"], hipblaslt), (aiter["fp4"], partial(_a4w4, x, w))
+            timings += _running(dict(zip(FP4, libraries)), failed)
         for samples, call in timings:
             samples[f"{m}x{n}x{k}"] = _timed(torch, call)
             time.sleep(1)  # let a PTL card recover before the next burst
@@ -247,6 +312,8 @@ def probe(torch, formats) -> dict:
     return {
         "gemm": gemm,
         "aiter": aiter,
+        "failed": failed,
+        "capacity_bytes": capacity,
         **streams,
         "floor": floor,
         "link": link,
@@ -337,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     from atom.compass.drive.identity import _stack
 
     spec_path, out = (Path(a) for a in (argv or sys.argv[1:]))
+    kfd_pid()  # this process's KFD entry, taken before torch opens a card
     spec = MachineSpec.from_mapping(json.loads(spec_path.read_text()))
     ptl = spec.values.get("device.ptl", NO_PTL)
     props = [torch.cuda.get_device_properties(i) for i in (0, 1)]
@@ -350,6 +418,8 @@ def main(argv: list[str] | None = None) -> int:
         f for f, peak in FORMATS.items() if f"device.compute.{peak}" in spec.values
     ]
     record |= probe(torch, stated)
+    for name, error in record.get("failed", {}).items():
+        print(f"FP4 through {name} failed: {error}", file=sys.stderr)
     record["source"] = Path(__file__).read_text()
     out.write_text(json.dumps(record) + "\n")
     root = git_tree_root("atom", str(ROOT))

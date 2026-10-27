@@ -31,7 +31,7 @@ FORMAT_VERSION = 2
 BRAND = "AMD Instinct "
 #: The model a machine spec names for each PCI device id (rocm-smi's model),
 #: for a card whose series is not the brand and a model.
-MODELS = {"0x75a3": "MI355X"}
+MODELS = {"0x75a3": "MI355X", "0x75c7": "MI455X"}
 #: The hex digits of aiter's commit a machine spec pins; git's own default
 #: follows the checkout's object count, and a shallow clone reads fewer.
 AITER_ABBREV = 9
