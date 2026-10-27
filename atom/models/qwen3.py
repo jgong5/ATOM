@@ -47,7 +47,12 @@ from atom.model_ops.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from atom.models.utils import IntermediateTensors, make_layers, maybe_prefix
+from atom.models.utils import (
+    IntermediateTensors,
+    PPMissingLayer,
+    make_layers,
+    maybe_prefix,
+)
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 
@@ -269,10 +274,15 @@ class Qwen3Model(nn.Module):
     def __init__(self, *, atom_config: Config, prefix: str = "") -> None:
         super().__init__()
         hf_config = atom_config.hf_config
+        pp = get_pp_group()
 
-        self.embed_tokens = VocabParallelEmbedding(
-            hf_config.vocab_size, hf_config.hidden_size
-        )
+        # The first stage embeds the tokens; the last reads a tied head from it.
+        if pp.is_first_rank or (hf_config.tie_word_embeddings and pp.is_last_rank):
+            self.embed_tokens = VocabParallelEmbedding(
+                hf_config.vocab_size, hf_config.hidden_size
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
             hf_config.num_hidden_layers,
             lambda prefix, layer_num: Qwen3DecoderLayer(
@@ -283,7 +293,10 @@ class Qwen3Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-        self.norm = RMSNorm(hf_config.hidden_size, eps=hf_config.rms_norm_eps)
+        if pp.is_last_rank:
+            self.norm = RMSNorm(hf_config.hidden_size, eps=hf_config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
 
     def forward(
         self,
@@ -341,14 +354,17 @@ class Qwen3ForCausalLM(nn.Module):
             atom_config=self.atom_config, prefix=maybe_prefix(prefix, "model")
         )
 
-        self.lm_head = ParallelLMHead(
-            num_embeddings=self.hf_config.vocab_size,
-            embedding_dim=self.hf_config.hidden_size,
-            bias=False,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
-        if self.hf_config.tie_word_embeddings:
-            self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                num_embeddings=self.hf_config.vocab_size,
+                embedding_dim=self.hf_config.hidden_size,
+                bias=False,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+            if self.hf_config.tie_word_embeddings:
+                self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        else:
+            self.lm_head = PPMissingLayer()
 
     def forward(
         self,
