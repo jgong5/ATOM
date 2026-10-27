@@ -10,7 +10,7 @@ store token; FAIL, matched against a command's words, makes it refuse.
 `client.sh` logs its arguments and its Python, and exits 1 without stopping its
 server when CLIENT_FAIL is in its OUT. A command whose words hold HANG, or
 `client.sh` when HANG is client.sh, writes its pid to `$LOG.hung` and sleeps.
-`rocm-smi` prints a GPU's use and VRAM.
+`rocm-smi` logs its arguments and prints a GPU's use and VRAM.
 """
 
 import json
@@ -85,7 +85,8 @@ def _smoke(tmp_path, use="0", stamp=True, **env):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     (bindir / "rocm-smi").write_text(
-        f"#!/bin/sh\nprintf 'GPU[7]\\t\\t: GPU use (%%): {use}\\nGPU[7]\\t\\t: GPU Memory "
+        '#!/bin/sh\necho "rocm-smi $*" >> "$LOG"\n'
+        f"printf 'GPU[7]\\t\\t: GPU use (%%): {use}\\nGPU[7]\\t\\t: GPU Memory "
         "Allocated (VRAM%%): 0\\nGPU[6]\\t\\t: GPU use (%%): 9\\n'\n"
     )
     (bindir / "rocm-smi").chmod(0o755)
@@ -146,11 +147,12 @@ def test_the_path_runs_in_order_and_ends_with_the_cell_s_verdict(tmp_path):
     assert "smoke_cell: graded in 0 min;" in r.stdout
 
 
-def test_a_busy_gpu_runs_nothing(tmp_path):
+def test_a_gpu_rocm_smi_reads_busy_runs_and_rocm_smi_is_never_read(tmp_path):
+    # Another tenant's rocminfo makes every GPU read 1 to 7% use; each compass
+    # command refuses a GPU a process is on by itself.
     r, log, _ = _smoke(tmp_path, use="3")
-    assert r.returncode == 1
-    assert "step gpu failed: rocm-smi GPU 7 is not idle" in r.stderr
-    assert log == []
+    assert r.returncode == 0, r.stderr
+    assert [line for line in log if line.startswith("rocm-smi")] == []
 
 
 @pytest.mark.parametrize(
