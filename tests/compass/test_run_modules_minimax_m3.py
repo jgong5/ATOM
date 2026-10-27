@@ -3,7 +3,8 @@
 attention, and the step roofline refuses its sparse ones by layer name, whose
 top-k kernel reads a few blocks of the cache rather than every token. Its MoE
 layers are priced as their routed experts with the shared one fused beside
-them, though its MoE block holds no TP width.
+them, though its MoE block holds no TP width. Above TP1 each sub-layer's
+output is all-reduced once, inside the next norm.
 
 The build owns its process because the driverless declarations are
 process-global.
@@ -103,9 +104,33 @@ def test_a_moe_layer_prices_its_routed_and_fused_shared_experts(quant, monkeypat
     held = 2 * weights if quant == "bf16" else weights // 2 + weights // 32
     fmt = "bf16" if quant == "bf16" else "fp4"
     # The 128 routed experts, 4 picked a row, and the shared one beside them,
-    # at TP4 on one data-parallel rank, their output all-reduced over the 4.
+    # at TP4 on one data-parallel rank, their output left to the next norm.
     dims = (128, 128, 4, 768, 6144, 4, 1, 0, held, 1)
     assert not [m for m in walked if m.kind == "unclassified"]
     assert not [m for m in walked if "shared_experts" in m.name]
     moe = [(m.layer, m.dims, m.fmt, m.act, m.ranks) for m in walked if m.kind == "moe"]
-    assert moe == [(1, dims, fmt, fmt, 4)]
+    assert moe == [(1, dims, fmt, fmt, 1)]
+
+
+@pytest.mark.parametrize("tp", [1, 4])
+def test_each_sub_layer_is_all_reduced_once_in_the_next_norm(tp, monkeypatch):
+    monkeypatch.setenv("ATOM_MONO_ENABLE", "0")
+    # A dense layer, then an MoE one, both attending densely.
+    sparse = {**M3["sparse_attention_config"], "sparse_attention_freq": [0, 0]}
+    config = {**M3, "moe_layer_freq": [0, 1], "sparse_attention_config": sparse}
+    walked = _build(f"tp{tp}", config)
+
+    # Beside the embedding's all-reduce and the LM head's all-gather, each
+    # layer's attention output is reduced in its post-attention norm, and its
+    # MLP's or MoE's in the next layer's input norm or the final norm; the
+    # first layer's input norm reads the embedding, already reduced.
+    norms = ("layers.0.post_attention_layernorm", "layers.1.input_layernorm")
+    norms += ("layers.1.post_attention_layernorm", "norm")
+    hand = [("model.embed_tokens", "embedding", 4, False)]
+    hand += [(f"model.{n}", "norm", 4, True) for n in norms]
+    hand += [("lm_head", "lm_head", 4, False)]
+    found = [
+        (m.name, m.kind, m.ranks, m.fused) for m in walked if m.ranks > 1 or m.fused
+    ]
+    assert found == (hand if tp > 1 else [])
+    assert [m.ranks for m in walked if m.kind == "moe"] == [1]
