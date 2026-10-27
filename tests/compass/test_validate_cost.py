@@ -175,6 +175,18 @@ def test_the_command_prints_the_report(tmp_path, capsys):
     assert "holding out step 4 " in out and "law planted" in out
 
 
+def test_the_command_prints_a_refused_row_s_reasons(tmp_path, capsys):
+    # A law with no decode vector refuses the record's ten decode steps.
+    record = _record(tmp_path / "steps", _steps())
+    law = tmp_path / "law.json"
+    law.write_text(json.dumps({**LAW, "decode": {}}))
+    main([str(record), str(law)])
+
+    (line,) = [x for x in capsys.readouterr().out.splitlines() if "refused" in x]
+    assert line.startswith("refused decode rung 1: 10 steps, real ")
+    assert line.endswith('; reasons {"step-linear: no decode vector for rung 1": 10}')
+
+
 def test_a_one_off_slow_step_is_named_warm_mid_record_and_enters_no_total(
     tmp_path, capsys
 ):
