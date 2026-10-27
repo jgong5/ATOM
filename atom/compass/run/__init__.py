@@ -146,8 +146,10 @@ per-run and goes to the summary as it is. A deployment
 whose ``kv_connector`` is ``compass`` is its prefill (``kv_producer``) or
 decode side: `engine(config)` makes it the ``engine-P`` or ``engine-D`` LP and
 binds the connector's transfer model, which prices a block at the paged KV
-entry each engine's runner planned (`_planned_transfer`); deployments that
-plan different blocks are refused before the run starts. The write-request
+entry each engine's runner planned, and each transfer's state slot at the slot
+it planned, when the model's transfer carries one (`_planned_transfer`);
+deployments that plan different blocks or slots are refused before the run
+starts. The write-request
 address comes with the deployment's own ``kv_transfer_config``. Above DP
 width one each DP rank is a member of its side's engine LP, and ATOM's DP dispatch on each side picks the
 rank a request runs on. Optional ``prefill_data_parallel_size`` and
@@ -593,27 +595,33 @@ def _engine_name(config, run: dict) -> str | None:
 
 def _bind_transfer(config, run: dict) -> None:
     """Have the simulated connector price its transfers from the machine spec
-    and the paged KV blocks the run's engines planned, read as it is built
-    (`_planned_transfer`): after this engine's runner has planned its pool."""
+    and the paged KV blocks and state slots the run's engines planned, read as
+    it is built (`_planned_transfer`): after this engine's runner has planned
+    its pool."""
     from atom.compass.kv import TRANSFER_KEY
 
     _pd_kv(config)[TRANSFER_KEY] = _planned_transfer
 
 
-def publish_block(path: Path, block_bytes: int, tp: int) -> None:
-    """Write one paged KV block's bytes, as a runner at TP `tp` planned it,
-    where `_planned_transfer` reads it."""
-    _write_whole(path, json.dumps({"block_bytes": int(block_bytes), "tp": tp}))
+def publish_transfer(
+    path: Path, block_bytes: int, tp: int, slot_bytes: int = 0
+) -> None:
+    """Write one paged KV block's bytes, and the state slot a transfer moves
+    beside a request's blocks, as a runner at TP `tp` planned them, where
+    `_planned_transfer` reads them."""
+    planned = {"block_bytes": int(block_bytes), "tp": tp, "slot_bytes": int(slot_bytes)}
+    _write_whole(path, json.dumps(planned))
 
 
 def _planned_transfer() -> tuple:
-    """One transfer model per prefill stage, each pricing the block that
-    stage's runner planned, once every engine of the prefill-decode run, each
-    member and stage, has published one (`publish_block`).
+    """One transfer model per prefill stage, each pricing the block and the
+    state slot that stage's runner planned, once every engine of the
+    prefill-decode run, each member and stage, has published them
+    (`publish_transfer`).
 
-    Refused unless every deployment plans one block, summed over its stages,
-    and every prefill deployment splits it alike: both ends of a write price
-    it, each from its own copy."""
+    Refused unless every deployment plans one block and one slot, each summed
+    over its stages, and every prefill deployment splits them alike: both ends
+    of a write price it, each from its own copy."""
     from atom.compass.kv import Scope, TransferModel
 
     run = spec()
@@ -641,21 +649,29 @@ def _planned_transfer() -> tuple:
         deployment, _, stage = lp.partition("-pp")
         stages = planned.setdefault(deployment + dot + member, {})
         stages[int(stage or 0)] = json.loads(f.read_text())
-    blocks = {u: [s[k]["block_bytes"] for k in sorted(s)] for u, s in planned.items()}
-    prefill = [u for u in blocks if u.startswith(f"{ENGINE.name}-P")]
-    first = blocks[prefill[0]]
-    for u, b in blocks.items():
-        if b != first if u in prefill else sum(b) != sum(first):
-            (a, x), (c, y) = (
-                (f"{v} at TP {planned[v][0]['tp']}", " + ".join(map(str, blocks[v])))
-                for v in (u, prefill[0])
-            )
-            raise ValueError(
-                f"{a} plans a KV block of {x} B and {c} one of {y} B: both ends "
-                "of a transfer price one block, so every deployment must plan it"
-            )
+    prefill = [u for u in planned if u.startswith(f"{ENGINE.name}-P")]
+    for key, what in (("block_bytes", "KV block"), ("slot_bytes", "state slot")):
+        sizes = {u: [s[k][key] for k in sorted(s)] for u, s in planned.items()}
+        first = sizes[prefill[0]]
+        for u, b in sizes.items():
+            if b != first if u in prefill else sum(b) != sum(first):
+                (a, x), (c, y) = (
+                    (f"{v} at TP {planned[v][0]['tp']}", " + ".join(map(str, sizes[v])))
+                    for v in (u, prefill[0])
+                )
+                raise ValueError(
+                    f"{a} plans a {what} of {x} B and {c} one of {y} B: both ends "
+                    f"of a transfer price one {what.split()[-1]}, so every "
+                    "deployment must plan it"
+                )
     machine, scope = _machine(run), Scope(run["kv_link"])
-    return tuple(TransferModel.from_spec(machine, b, scope) for b in first)
+    stages = planned[prefill[0]]
+    return tuple(
+        TransferModel.from_spec(
+            machine, stages[k]["block_bytes"], scope, stages[k]["slot_bytes"]
+        )
+        for k in sorted(stages)
+    )
 
 
 def _lmcache_stations(run: dict, chunk_bytes: int) -> dict:
@@ -1943,7 +1959,8 @@ def _acceptance(scheduler, run: dict) -> dict:
 
 
 def _block_file(now: Path) -> Path:
-    """Where the engine whose clock file is `now` publishes its planned KV block."""
+    """Where the engine whose clock file is `now` publishes its planned KV block
+    and the state slot a transfer moves (`publish_transfer`)."""
     return now.with_suffix(".kv_block")
 
 
