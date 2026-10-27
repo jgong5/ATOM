@@ -34,6 +34,7 @@ from atom.compass.kv.lmcache_server import LMCacheLP
 from atom.compass.spec.rules import SpecRefusal
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
+from tests.compass.held_ports import held_ports
 
 IPC = 2.0**-10
 LOOKUP_S = (2.0**-8, 2.0**-10)  # fixed, per prompt chunk
@@ -61,15 +62,10 @@ def _bound_port(proc) -> int:
 
 @pytest.fixture(scope="module")
 def lmcache_port():
-    """A port on 127.0.0.1 for an lmcache server that must know its port before
-    it starts, held until the module's tests end. The holding socket sets
-    SO_REUSEADDR and never listens, so a server's ZMQ listener, which sets it
-    too, binds the port beside it; a plain bind elsewhere, as a port draw
-    makes, fails on it, and a bind to port 0 never returns it."""
-    with socket.socket() as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("127.0.0.1", 0))
-        yield s.getsockname()[1]
+    """A port for an lmcache server that must know its port before it starts,
+    held until the module's tests end."""
+    with held_ports(1) as [port]:
+        yield port
 
 
 def _run(tmp_path, **entry):
