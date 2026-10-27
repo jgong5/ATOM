@@ -191,6 +191,14 @@ user owns; without it `regen_gpu_gate_triggers.sh` records the tree's commit as
 `UNKNOWN`. Run the gate with `COMPASS_AGENTX_HARNESS` naming the wheel the next
 section builds.
 
+On a host with GPUs, also mount an empty directory over `/sys/class/kfd`
+(`-v <empty dir>:/sys/class/kfd:ro`). Without `/dev/kfd` the container has no
+driver, but torch still counts the host's GPUs from that tree: the tests that
+skip below a GPU count start workers and fail
+(`tests/test_distributed_store.py`), and vLLM's import raises `No HIP GPUs are
+available` (`tests/test_vllm_kda_state_offload.py`). Measured on mi355-gpu-40,
+where `torch.cuda.device_count()` reads 8 without the mount and 0 with it.
+
 ## The compass_harness tests need an agentx-harness wheel
 
 `tests/compass/test_harness_*.py` skip when `compass-harness` or `aiperf` does not
