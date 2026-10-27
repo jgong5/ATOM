@@ -12,7 +12,6 @@ from atom.compass.artifacts import machine_spec_key
 from atom.compass.drive import identity
 from atom.compass.spec import MachineSpec
 
-spec_script = _load("mi455_spec")
 MI455 = SCRIPTS / "machines" / "mi455.json"
 
 
@@ -20,14 +19,20 @@ def _spec(path):
     return MachineSpec.from_mapping(json.loads(path.read_text()))
 
 
+def _script():
+    """`mi455_spec.py`, loaded here: loading it names the machine in the
+    shared `mi308x_spec`, which loading another machine's script renames."""
+    return _load("mi455_spec")
+
+
 def test_the_mi455_spec_rebuilds_byte_for_byte(tmp_path):
     out = tmp_path / "mi455.json"
-    assert spec_script.main(["--sweep-from", str(MI455), "--out", str(out)]) == 0
+    assert _script().main(["--sweep-from", str(MI455), "--out", str(out)]) == 0
     assert out.read_bytes() == MI455.read_bytes()
 
 
 def test_each_device_field_is_probed_or_the_datasheet_and_the_rest_assumed():
-    mi455 = _spec(MI455)
+    mi455, peaks = _spec(MI455), _script().PEAKS
     origins = {label: mi455.origin(label)["origin"] for label in labels(mi455)}
     assert {p for p, o in origins.items() if o == "assumed"} == {
         "host.ipc.zmq_roundtrip_s",
@@ -41,7 +46,7 @@ def test_each_device_field_is_probed_or_the_datasheet_and_the_rest_assumed():
     device = {o for p, o in origins.items() if p.startswith("device.")}
     assert device == {"probed", "datasheet"}
     # The probe's record holds the readings, the device and the stack.
-    record = f"sha256:{spec_script.PEAKS[3]}"
+    record = f"sha256:{peaks[3]}"
     for path in (
         "device.arch",
         "device.memory.capacity_bytes",
@@ -56,7 +61,7 @@ def test_each_device_field_is_probed_or_the_datasheet_and_the_rest_assumed():
         band = mi455.origin(path)
         assert band["record"] == record
         assert band["p10"] <= mi455.value(path) <= band["p90"]
-    found, peak = spec_script.PEAKS[2], mi455.value("device.compute.fp4_flops")
+    found, peak = peaks[2], mi455.value("device.compute.fp4_flops")
     assert mi455.value("device.compute.derate.fp4") == found["fp4"] / peak
     assert origins["host.tokenizers[deepseek-v4.1-flash fast]"] == "probed"
 
