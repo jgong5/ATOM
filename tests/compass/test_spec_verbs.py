@@ -19,14 +19,17 @@ reads them with rather than typed in beside the assertion that checks them.
 """
 
 import copy
+import functools
 import importlib.util
 import json
 import pathlib
+import types
 
 import pytest
 
 from atom.compass import spec as spec_package
 from atom.compass.spec import (
+    Backend,
     Fragment,
     MachineSpec,
     SpecRefusal,
@@ -1069,3 +1072,107 @@ def test_the_mi308x_specs_rebuild_from_their_own_sweeps(monkeypatch, tmp_path, n
     out = tmp_path / "rebuilt.json"
     assert script.main(["--sweep-from", str(document), "--out", str(out)]) == 0
     assert json.loads(out.read_text()) == json.loads(document.read_text())
+
+
+# --- one spec, the tokenizer of each model it is given ------------------------
+
+
+class Loaded:
+    """A fast tokenizer loaded from a model directory, as the server loads one."""
+
+    is_fast = True
+
+    def __init__(self, model):
+        self.name_or_path = str(model)
+
+    def __len__(self):
+        return 151669
+
+
+def _node18_sweeping(monkeypatch, tmp_path, **models):
+    """The node-18 script over a model directory per name in `models`, each
+    holding the architecture and the `tokenizer.json` text given for it; each
+    sweep it runs is recorded by the model it loaded."""
+    from atom.compass.artifacts import provenance
+    from atom.model_engine import llm_engine
+
+    monkeypatch.setenv("COMPASS_MACHINE", "mi308x-hjbog18")
+    script = _node18_script()
+    for name, (architecture, tokenizer) in models.items():
+        (tmp_path / name).mkdir()
+        config = {"architectures": [architecture]}
+        (tmp_path / name / "config.json").write_text(json.dumps(config))
+        (tmp_path / name / "tokenizer.json").write_text(tokenizer)
+    swept = []
+
+    def sweep(tok, *args, **kwargs):
+        swept.append(pathlib.Path(tok.name_or_path).name)
+        rates = ("encode_fixed_s", "encode_tokens_per_s", "decode_fixed_s")
+        return {k: TOKENIZER[k] for k in (*rates, "decode_tokens_per_s")}
+
+    root = types.SimpleNamespace(revision_kind="commit", revision="abc")
+    monkeypatch.setattr(provenance, "git_tree_root", lambda name, at: root)
+    monkeypatch.setattr(llm_engine, "_load_tokenizer", Loaded)
+    monkeypatch.setattr(script, "tokenizer_sweep", sweep)
+    topology = published_topology(tmp_path / "cpu", cores_physical=112, packages=2)
+    probe = functools.partial(script.tokenizer_fragment, processors=topology)
+    monkeypatch.setattr(script, "tokenizer_fragment", probe)
+    return script, swept
+
+
+def test_the_node_18_spec_carries_the_tokenizer_of_each_model_it_is_given(
+    monkeypatch, tmp_path
+):
+    # qwen3-0.6b and qwen3-30b-a3b load one tokenizer.json: it is swept once,
+    # for the first of them, and its entry applies to both architectures.
+    script, swept = _node18_sweeping(
+        monkeypatch,
+        tmp_path,
+        **{
+            "Qwen3.8-27B": ("Qwen3_5ForConditionalGeneration", "a 248k vocabulary"),
+            "Qwen3-0.6B": ("Qwen3ForCausalLM", "a 151k vocabulary"),
+            "Qwen3-30B-A3B": ("Qwen3MoeForCausalLM", "a 151k vocabulary"),
+        },
+    )
+    names = ("Qwen3.8-27B", "Qwen3-0.6B", "Qwen3-30B-A3B")
+    out = tmp_path / "spec.json"
+    argv = [arg for name in names for arg in ("--model", str(tmp_path / name))]
+    assert script.main([*argv, "--out", str(out)]) == 0
+    assert swept == ["Qwen3.8-27B"] * script.SWEEPS + ["Qwen3-0.6B"] * script.SWEEPS
+    spec = MachineSpec.from_mapping(json.loads(out.read_text()))
+    resolved = {
+        architecture: spec.tokenizer_for(architecture, Backend.FAST).key.id
+        for architecture in (
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3ForCausalLM",
+            "Qwen3MoeForCausalLM",
+        )
+    }
+    assert resolved == {
+        "Qwen3_5ForConditionalGeneration": "qwen3.8-27b",
+        "Qwen3ForCausalLM": "qwen3-0.6b",
+        "Qwen3MoeForCausalLM": "qwen3-0.6b",
+    }
+    # Each entry names the model its sweep loaded.
+    found = spec.origin("host.tokenizers[qwen3-0.6b fast]")
+    assert found["model"] == str(tmp_path / "Qwen3-0.6B")
+    # The document rebuilds byte for byte from the sweeps it carries.
+    again = tmp_path / "again.json"
+    assert script.main(["--sweep-from", str(out), "--out", str(again)]) == 0
+    assert again.read_bytes() == out.read_bytes()
+
+
+def test_two_tokenizers_claiming_one_architecture_write_no_spec(monkeypatch, tmp_path):
+    script, _ = _node18_sweeping(
+        monkeypatch,
+        tmp_path,
+        **{
+            "Qwen3-0.6B": ("Qwen3ForCausalLM", "a 151k vocabulary"),
+            "Qwen3-0.6B-retrained": ("Qwen3ForCausalLM", "another vocabulary"),
+        },
+    )
+    out = tmp_path / "spec.json"
+    argv = ["--model", str(tmp_path / "Qwen3-0.6B")]
+    argv += ["--model", str(tmp_path / "Qwen3-0.6B-retrained"), "--out", str(out)]
+    assert script.main(argv) == 1
+    assert not out.exists()
