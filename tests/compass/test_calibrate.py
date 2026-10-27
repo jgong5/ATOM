@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""`calibrate.sh`: the quickstart's calibration in order on one idle GPU, a
-stopped run resumed, and a resume under other inputs refused.
+"""`calibrate.sh`: the quickstart's calibration in order on one GPU, a stopped
+run resumed, and a resume under other inputs refused.
 
 It runs from a copy in a stub tree, as `test_smoke_cell.py` drives
 `smoke_cell.sh`: `atom.compass.cli` logs each command; a `record` writes
@@ -67,12 +67,6 @@ def _tree(tmp_path):
     (tmp_path / "ATOM" / "atom" / "compass" / "cli.py").write_text(CLI)
     for d in ("atom", "atom/compass"):
         (tmp_path / "ATOM" / d / "__init__.py").write_text("")
-    (tmp_path / "bin").mkdir()
-    (tmp_path / "bin" / "rocm-smi").write_text(
-        "#!/bin/sh\nprintf 'GPU[7]\\t\\t: GPU use (%%): 0\\nGPU[7]\\t\\t: GPU Memory "
-        "Allocated (VRAM%%): 0\\nGPU[6]\\t\\t: GPU use (%%): 9\\n'\n"
-    )
-    (tmp_path / "bin" / "rocm-smi").chmod(0o755)
 
 
 def _calibrate(tmp_path, *records, **env):
@@ -81,7 +75,7 @@ def _calibrate(tmp_path, *records, **env):
         _tree(tmp_path)
     log = tmp_path / "log"
     log.unlink(missing_ok=True)
-    path = f"{tmp_path / 'bin'}:{Path(sys.executable).parent}:{os.environ['PATH']}"
+    path = f"{Path(sys.executable).parent}:{os.environ['PATH']}"
     env = {
         **os.environ,
         "PATH": path,
@@ -160,21 +154,22 @@ def test_a_resume_under_other_inputs_runs_nothing(tmp_path):
     assert r.returncode == 2
     assert "was started with other inputs" in r.stderr and "> record 4" in r.stderr
     assert log == []
+    (tmp_path / "o" / "inputs").unlink()
+    r, log = _calibrate(tmp_path, "1")
+    assert r.returncode == 2 and "holds files and no inputs" in r.stderr
+    assert log == []
 
 
 @pytest.mark.parametrize(
-    "records, out, refusal",
+    "records, env, refusal",
     [
-        (["x"], None, "RECORD 'x' does not start with a concurrency"),
-        ([], None, "no OUT or no RECORD"),
-        (["1"], "x", "holds files and no inputs"),
+        (["x"], {}, "RECORD 'x' does not start with a concurrency"),
+        ([], {}, "no OUT or no RECORD"),
+        (["1"], {"GPU": ""}, "GPU is not set"),
     ],
 )
-def test_bad_arguments_run_nothing(tmp_path, records, out, refusal):
-    if out:
-        (tmp_path / "o").mkdir()
-        (tmp_path / "o" / out).touch()
-    r, log = _calibrate(tmp_path, *records)
+def test_bad_arguments_run_nothing(tmp_path, records, env, refusal):
+    r, log = _calibrate(tmp_path, *records, **env)
     assert r.returncode == 2
     assert refusal in r.stderr
     assert log == []

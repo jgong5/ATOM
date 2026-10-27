@@ -20,8 +20,8 @@
 #                   --trajectory-start-max-ratio 0"
 #   MODEL           the model directory: config.json, tokenizer and weights
 #                   (required)
-#   GPU             the one GPU, as rocm-smi and `--gpu` number it (required
-#                   while a GPU step is left); it must read 0% use and 0% VRAM
+#   GPU             the one GPU, as rocm-smi and `--gpu` number it (required);
+#                   each compass command refuses it while a process is on it
 #   MACHINE         the machine spec of this node's GPUs (required)
 #   TRACES          a cc-traces traces.jsonl (required, as client.sh takes it)
 #   AIPERF_PYTHON   the Python with agentx-harness and no compass-harness, for
@@ -38,8 +38,9 @@
 # a run given other inputs refuses. A step whose output exists is skipped: a
 # record's client export once `client.sh --stop` has marked it
 # `server_stopped`, measure memory's or a fit's readable copy. A step stopped
-# before its output exists is taken again, its directory removed first. A fit that refuses a record, such as one whose server built a
-# JIT kernel, names it: remove that record's directory and run again. It prints
+# before its output exists is taken again, its directory removed first. A fit
+# that refuses a record, such as one whose server built a JIT kernel, names it:
+# remove that record's directory and run again. It prints
 # the tokens, the law's held-out errors per band, the `compass run` line that
 # prices by the law, and the wall time. It exits 2 on bad arguments or inputs,
 # 90 to 99 as _lib.sh's tree checks refuse, else 1 naming the step that failed.
@@ -55,7 +56,7 @@ compass_describe "$ROOT"
 OUT=$1
 shift
 for r; do [[ $r =~ ^[1-9][0-9]*( |$) ]] || bad "RECORD '$r' does not start with a concurrency"; done
-for v in MODEL MACHINE TRACES AIPERF_PYTHON; do [[ -n ${!v-} ]] || bad "$v is not set"; done
+for v in MODEL GPU MACHINE TRACES AIPERF_PYTHON; do [[ -n ${!v-} ]] || bad "$v is not set"; done
 MODEL=$(realpath "$MODEL") MACHINE=$(realpath "$MACHINE")
 CAL=${CAL_TRACES:-256-392} DURATION_S=${DURATION_S:-1800} WAIT_S=${WAIT_S:-1800}
 # shellcheck disable=SC2206 # SERVER_ARGS is a word list
@@ -82,16 +83,6 @@ trap 'kill -TERM $(jobs -p) 2>/dev/null; wait' EXIT
 fail() { echo "calibrate: step $1 failed: $2" >&2; exit 1; }
 say() { echo "calibrate: $1 $(date -u +%FT%TZ)"; }
 
-# idle: the compass commands check each start for processes on the GPU; this
-# checks its use and VRAM too, once, before the first GPU step this run takes.
-idled=0
-idle() {
-    ((idled++)) && return
-    [[ ${GPU-} =~ ^[0-9]+$ ]] || fail gpu "GPU names one GPU as rocm-smi numbers it, not '${GPU-}'"
-    busy=$(rocm-smi --showuse --showmemuse | awk -v g="GPU[$GPU]" 'index($0, g) == 1 && /use \(%\)|VRAM%/ && $NF != "0"')
-    [[ -z $busy ]] || fail gpu "rocm-smi GPU $GPU is not idle: $busy"
-}
-
 # todo NAME FILE [TEXT]: whether step NAME is left to take, any directory a
 # stopped take left removed; it is not once OUT/NAME/FILE, its output, holds TEXT.
 todo() {
@@ -117,7 +108,6 @@ step() {
 # SCENARIO, which stops it.
 serve() {
     local name=$1 dir=$OUT/$1 pid deadline
-    idle
     say "$name"
     python3 -c "$CLI" record --gpu "$GPU" --out "$dir" -- "${ATOM_ARGS[@]}" >"$OUT/$name.log" 2>&1 &
     pid=$!
@@ -138,7 +128,7 @@ M=(--machine "$MACHINE" --store "$OUT/store")
 # stopped and written run.json.
 STOPPED=(artifacts/client_run.json '"server_stopped": true')
 todo warm "${STOPPED[@]}" && serve warm 0-7 1 600 ""
-todo memory memory_readings.json && idle &&
+todo memory memory_readings.json &&
     step memory python3 -c "$CLI" measure memory --gpu "$GPU" "${M[@]}" --out "$OUT/memory" -- "${ATOM_ARGS[@]}"
 k=0 dirs=() runs=()
 for r; do
