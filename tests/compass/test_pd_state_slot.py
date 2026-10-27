@@ -12,22 +12,23 @@ DeepSeek-V4-Pro publishes its whole slot; DeepSeek-R1-0528 keeps no state; a
 Qwen3.5 GDN hybrid plans a state slot its regions do not carry.
 """
 
-import concurrent.futures
 import json
-import os
 import pathlib
 import shutil
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import pytest
-from test_pd_planned_block import _connector, publish, served  # noqa: F401
+from test_pd_planned_block import (  # noqa: F401
+    BUILD,
+    _connector,
+    build_each,
+    publish,
+    served,
+)
 
 from atom.compass import run as compass_run
 from atom.compass.kv.transfer import Link, TransferModel
 
-TREE = pathlib.Path(__file__).resolve().parents[2]
 HERE = pathlib.Path(__file__).parent
 CONFIGS = {
     "deepseek-v4-pro": HERE / "deepseek_v4_pro_config.json",
@@ -48,31 +49,13 @@ CELL = [
 #: A 4096-token prompt in DeepSeek-V4's 256-token blocks.
 BLOCKS = 16
 
-PLAN = """
-import json, pathlib, sys, torch
-root, out, *atom_args = sys.argv[1:]
-from atom.compass.capture import driverless
-declared = driverless.install(root, "gfx950")
-from torch.fx.experimental.symbolic_shapes import ShapeEnv
-from atom.compass.capture import forward
-from atom.compass.runner.overrides import publish_paged_block
-from atom.config import set_current_atom_config
-config = forward._config(root + "/model", 8, atom_args)
-parallel = config.parallel_config
-declared["group"] = driverless.group(1, parallel.data_parallel_size)
-set_current_atom_config(config)
-fake = driverless.driverless_mode(ShapeEnv())
-recorder = forward._Recorder(config.compilation_config.static_forward_context, fake)
-driverless.on_wait = recorder.wait
-with forward._patches(recorder):
-    runner = forward._build_runner(config, fake)
-    with fake, torch.inference_mode():
-        runner.get_num_blocks()
-        runner.attn_metadata_builder.warmup_per_req_cache = lambda: None
-        runner.allocate_kv_cache(runner.pool_plan.paged_entries)
-        regions = runner.attn_metadata_builder.get_kv_transfer_tensors()
+PLAN = BUILD + """
+with forward._patches(recorder), fake, torch.inference_mode():
+    runner.attn_metadata_builder.warmup_per_req_cache = lambda: None
+    runner.allocate_kv_cache(runner.pool_plan.paged_entries)
+    regions = runner.attn_metadata_builder.get_kv_transfer_tensors()
 runner.compass_block_file = pathlib.Path(out)
-publish_paged_block(runner)
+publish_planned_transfer(runner)
 print(json.dumps({
     "planned": runner.pool_plan.entry_bytes,
     "page_units": sum(r.unit_bytes for r in regions.block_regions),
@@ -87,27 +70,8 @@ print(json.dumps({
 @pytest.fixture(scope="module")
 def built(tmp_path_factory):
     """By model, what ATOM planned and its regions state, and the file its
-    runner published, each built in a process of its own."""
-    root = tmp_path_factory.mktemp("slot")
-
-    def build(name):
-        (root / name / "model").mkdir(parents=True)
-        shutil.copy(CONFIGS[name], root / name / "model" / "config.json")
-        out = root / name / "now-engine-P.kv_block"
-        done = subprocess.run(
-            [sys.executable, "-c", PLAN, str(root / name), str(out), *CELL],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=900,
-            cwd=TREE,
-            env={**os.environ, "PYTHONPATH": str(TREE)},
-        )
-        assert done.returncode == 0, done.stderr[-4000:]
-        return json.loads(done.stdout.splitlines()[-1]) | {"published": out}
-
-    with concurrent.futures.ThreadPoolExecutor(len(CONFIGS)) as pool:
-        return dict(zip(CONFIGS, pool.map(build, CONFIGS)))
+    runner published."""
+    return build_each(tmp_path_factory.mktemp("slot"), CONFIGS, PLAN, CELL)
 
 
 @pytest.mark.parametrize("model", CONFIGS)
@@ -152,7 +116,7 @@ def test_sides_that_plan_different_slots_refuse_naming_both(
 ):
     served()
     publish(tmp_path, "engine-P", 1000)
-    compass_run.publish_block(tmp_path / "now-engine-D.kv_block", 1000, 1, 300)
+    compass_run.publish_transfer(tmp_path / "now-engine-D.kv_block", 1000, 1, 300)
     with pytest.raises(
         ValueError,
         match="engine-D at TP 1 plans a state slot of 300 B and engine-P at TP 1 "

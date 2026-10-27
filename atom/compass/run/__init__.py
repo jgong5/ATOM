@@ -603,7 +603,9 @@ def _bind_transfer(config, run: dict) -> None:
     _pd_kv(config)[TRANSFER_KEY] = _planned_transfer
 
 
-def publish_block(path: Path, block_bytes: int, tp: int, slot_bytes: int = 0) -> None:
+def publish_transfer(
+    path: Path, block_bytes: int, tp: int, slot_bytes: int = 0
+) -> None:
     """Write one paged KV block's bytes, and the state slot a transfer moves
     beside a request's blocks, as a runner at TP `tp` planned them, where
     `_planned_transfer` reads them."""
@@ -615,7 +617,7 @@ def _planned_transfer() -> tuple:
     """One transfer model per prefill stage, each pricing the block and the
     state slot that stage's runner planned, once every engine of the
     prefill-decode run, each member and stage, has published them
-    (`publish_block`).
+    (`publish_transfer`).
 
     Refused unless every deployment plans one block and one slot, each summed
     over its stages, and every prefill deployment splits them alike: both ends
@@ -1957,7 +1959,8 @@ def _acceptance(scheduler, run: dict) -> dict:
 
 
 def _block_file(now: Path) -> Path:
-    """Where the engine whose clock file is `now` publishes its planned KV block."""
+    """Where the engine whose clock file is `now` publishes its planned KV block
+    and the state slot a transfer moves (`publish_transfer`)."""
     return now.with_suffix(".kv_block")
 
 

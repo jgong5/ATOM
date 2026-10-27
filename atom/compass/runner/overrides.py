@@ -771,7 +771,7 @@ class UnbuiltModel(torch.nn.Module):
         )
 
 
-def publish_paged_block(runner: Any) -> None:
+def publish_planned_transfer(runner: Any) -> None:
     """Publish one entry of the paged class `get_num_blocks` planned, the state
     slot a transfer moves beside a request's blocks (`_transferred_slot_bytes`),
     and the runner's TP width, at the file `compass_block_file` names, which
@@ -783,7 +783,7 @@ def publish_paged_block(runner: Any) -> None:
         plan = runner.pool_plan
         tp = runner.config.tensor_parallel_size
         slot = _transferred_slot_bytes(runner)
-        run.publish_block(path, plan.entry_bytes[plan.paged_class], tp, slot)
+        run.publish_transfer(path, plan.entry_bytes[plan.paged_class], tp, slot)
 
 
 def _transferred_slot_bytes(runner: Any) -> int:
@@ -1172,7 +1172,7 @@ class NonAllocatingRunner(
         readings, so which terms those were is recoverable from the runner and
         not only from a log line somebody kept. On a prefill-decode run the
         planned block and transferred state slot are published as well
-        (`publish_paged_block`).
+        (`publish_planned_transfer`).
 
         The decode process of intra-GPU prefill/decode disaggregation is
         refused rather than sized. ATOM's own runner for that answers a block
@@ -1201,7 +1201,7 @@ class NonAllocatingRunner(
             readings=readings,
         )
         logger.info("%s", self.kv_pool_sizing.table())
-        publish_paged_block(self)
+        publish_planned_transfer(self)
         return reply
 
     def allocate_kv_cache(self, num_kvcache_blocks: int) -> bool:
