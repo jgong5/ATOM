@@ -105,6 +105,10 @@ tests/test_glm5_next_mtp_routing.py
 # fails on nightly 20261026's aiter: `No module named
 # 'aiter.ops.triton.fused_fp8_quant'`; pure upstream e893780f4 + f6a0c132 fails the same, ca8a54916
 tests/test_iq2r_moe_method.py
+# passes in this gate, but importing lmcache loads prometheus_client before
+# tests/test_scheduler_metrics.py sets PROMETHEUS_MULTIPROC_DIR, and 7 tests
+# there fail; pure upstream e893780f4 + f6a0c132 fails the same 7, 880467c94
+tests/test_lmcache_offload_disk_integration.py
 # fails without a driver on nightly 20261026: the layer's weight_loader finds
 # `'FusedMoE' object has no attribute 'quant_method'`; pure upstream e893780f4 + f6a0c132 fails the same, ca8a54916
 tests/test_minimax_m31_shared_fusion.py
