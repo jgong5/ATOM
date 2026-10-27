@@ -494,7 +494,8 @@ def test_the_compass_runner_refuses_a_real_backend_beside_lmcache_mp(monkeypatch
 
 #: The machine the run is priced on and its memory readings measured on: the
 #: spec of the device `ATOM_COMPASS_SLICE_MACHINE` names, with a host link for
-#: the server's copies and the suite's tokenizer entry for Qwen3.
+#: the server's copies and, where the spec probed no Qwen3 tokenizer, the
+#: suite's entry for one.
 MACHINE = Path(
     os.environ.get(
         "ATOM_COMPASS_SLICE_MACHINE",
@@ -537,11 +538,13 @@ def _machine(out: Path) -> Path:
         "bandwidth_bytes_per_s": BANDWIDTH,
         "latency_s": LATENCY_S,
     }
-    machine["host"]["tokenizers"].append(DOCUMENT["host"]["tokenizers"][0])
     origins = machine["provenance"]["origins"]
     for field in ("bandwidth_bytes_per_s", "latency_s"):
         origins[f"interconnect.host_link.{field}"] = {"origin": "assumed"}
-    origins["host.tokenizers[qwen3-151k-bpe fast]"] = {"origin": "assumed"}
+    tokenizers, suite = machine["host"]["tokenizers"], DOCUMENT["host"]["tokenizers"][0]
+    if not any(set(suite["applies_to"]) & set(t["applies_to"]) for t in tokenizers):
+        tokenizers.append(suite)
+        origins["host.tokenizers[qwen3-151k-bpe fast]"] = {"origin": "assumed"}
     (out / "machine.json").write_text(json.dumps(machine))
     return out / "machine.json"
 
