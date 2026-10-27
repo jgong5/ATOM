@@ -42,7 +42,8 @@ module's own per-rank parameter shapes and attributes:
   (GDN holds one it never calls), the backend refuses a step with images, and
   V4 reads its tables inside the attention and compressor kernels.
 - `PPMissingLayer`, which a pipeline stage holds where another stage runs the
-  layer: nothing.
+  layer, and a `VocabParallelEmbedding` on any stage but the first, which a
+  tied last stage holds only to load its LM head from: nothing.
 
 DeepSeek-V4's modules, each priced and then gone into:
 
@@ -305,6 +306,13 @@ def _tp_width() -> int:
     return get_tensor_model_parallel_world_size()
 
 
+def _first_stage() -> bool:
+    """Whether this rank is its pipeline's first stage, the one that embeds."""
+    from aiter.dist.parallel_state import get_pp_group
+
+    return get_pp_group().is_first_rank
+
+
 def _is(module, *names: str) -> bool:
     """Whether `module`'s class is, or derives from, a class of `names`."""
     return any(
@@ -348,6 +356,8 @@ def _classify(module, name, parent):
     if _is(module, OPS + "embed_head.ParallelLMHead"):
         return fmt and Module(name, "lm_head", tuple(weight.shape), fmt, module.tp_size)
     if _is(module, OPS + "embed_head.VocabParallelEmbedding"):
+        if not _first_stage():
+            return NOTHING
         return Module(name, "embedding", (weight.shape[1],), ranks=module.tp_size)
     if _is(module, OPS + "linear.LinearBase", "torch.nn.modules.linear.Linear"):
         if not fmt:

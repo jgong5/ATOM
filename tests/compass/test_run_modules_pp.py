@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 """The step roofline's module walk over each stage of Qwen3-0.6B at `-pp 2`
-leaves nothing unclassified that the whole model's walk does not, and prices
-each stage's own decoder layers.
+leaves nothing unclassified that the whole model's walk does not, prices
+each stage's own decoder layers, and prices the token embedding on the first
+stage alone, though the model ties its LM head to it and the last stage
+holds a copy.
 
 Each runner is built driverless in a process of its own, as
 `test_qwen3_pp_stages` builds one, on a fake pipeline group standing at its
@@ -24,8 +26,9 @@ TREE = pathlib.Path(__file__).resolve().parents[2]
 CONFIG = pathlib.Path(__file__).with_name("qwen3_0_6b_config.json")
 
 #: Builds ATOM's runner for the model under argv's root at pipeline rank argv's
-#: rank, its group fake, and prints the modules the walk leaves unclassified
-#: and the decoder layers of the attentions it prices.
+#: rank, its group fake, and prints the modules the walk leaves unclassified,
+#: the decoder layers of the attentions it prices, and the modules it prices
+#: outside the decoder layers.
 STAGE = """
 import json, sys
 root, rank, *atom_args = sys.argv[1:]
@@ -57,6 +60,7 @@ found = walk(runner.model)
 print(json.dumps({
     "unclassified": [m.name for m in found if m.kind == UNCLASSIFIED],
     "attention": [m.layer for m in found if m.kind == "attention"],
+    "outside": [f"{m.kind} {m.name}" for m in found if m.layer < 0],
 }))
 """
 
@@ -98,3 +102,15 @@ def test_each_stage_prices_the_attention_of_its_own_decoder_layers(walked):
     total = len(walked[1, 0]["attention"])
     spans = [list(range(*get_pp_indices(total, rank, 2))) for rank in (0, 1)]
     assert [walked[2, rank]["attention"] for rank in (0, 1)] == spans
+
+
+def test_only_the_first_stage_prices_the_embedding_a_tied_last_stage_holds(walked):
+    embeds = {
+        stage: [m for m in found["outside"] if m.startswith("embedding ")]
+        for stage, found in walked.items()
+    }
+    assert embeds == {
+        (1, 0): ["embedding model.embed_tokens"],
+        (2, 0): ["embedding model.embed_tokens"],
+        (2, 1): [],
+    }
