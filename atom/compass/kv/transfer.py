@@ -5,9 +5,9 @@ One transfer is priced as `latency + bytes / bandwidth`, and the three terms
 come from three different places on purpose.
 
 **The bytes are exact.** A transfer moves a whole number of paged blocks, and
-what one block costs is the geometry the engine was built with, not a
-measurement -- so the byte count carries no error at all and nothing here
-re-derives a KV layout.
+what one block costs is the entry of the paged class the engine's runner
+planned its pool with, not a measurement -- so the byte count carries no error
+at all and nothing here re-derives a KV layout.
 
 **The bandwidth is a spec peak, and it is spent at the derate the spec
 declares.** A datasheet number spent as an achievable one would make every
@@ -94,8 +94,8 @@ class TransferModel:
             )
 
     @classmethod
-    def from_spec(cls, spec, geometry, scope: Scope) -> TransferModel:
-        """Price a block of *geometry* on the *scope* link of *spec*.
+    def from_spec(cls, spec, bytes_per_block: int, scope: Scope) -> TransferModel:
+        """Price a block of *bytes_per_block* on the *scope* link of *spec*.
 
         The spec refuses a link it does not carry, and refuses a peak
         bandwidth whose derate is missing; both refusals travel out of here
@@ -107,7 +107,7 @@ class TransferModel:
         return cls(
             latency_s=spec.value(f"{link}.link_latency_s"),
             bandwidth_bytes_per_s=peak * derate,
-            bytes_per_block=geometry.bytes_per_block,
+            bytes_per_block=bytes_per_block,
             setup_s=spec.values.get(f"{link}.link_setup_s", 0.0),
         )
 

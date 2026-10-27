@@ -771,6 +771,19 @@ class UnbuiltModel(torch.nn.Module):
         )
 
 
+def publish_paged_block(runner: Any) -> None:
+    """Publish one entry of the paged class `get_num_blocks` planned, and the
+    runner's TP width, at the file `compass_block_file` names, which
+    `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
+    prices a transferred block at it."""
+    if path := getattr(runner, "compass_block_file", None):
+        from atom.compass import run
+
+        plan = runner.pool_plan
+        tp = runner.config.tensor_parallel_size
+        run.publish_block(path, plan.entry_bytes[plan.paged_class], tp)
+
+
 def _refused(method: str):
     """A worker method that answers with its refusal instead of doing its work."""
 
@@ -1140,7 +1153,8 @@ class NonAllocatingRunner(
         it is a coefficient somebody wrote down rather than a measurement of
         the card being modelled; `kv_pool_sizing` keeps the count beside the
         readings, so which terms those were is recoverable from the runner and
-        not only from a log line somebody kept.
+        not only from a log line somebody kept. On a prefill-decode run the
+        planned block is published as well (`publish_paged_block`).
 
         The decode process of intra-GPU prefill/decode disaggregation is
         refused rather than sized. ATOM's own runner for that answers a block
@@ -1169,6 +1183,7 @@ class NonAllocatingRunner(
             readings=readings,
         )
         logger.info("%s", self.kv_pool_sizing.table())
+        publish_paged_block(self)
         return reply
 
     def allocate_kv_cache(self, num_kvcache_blocks: int) -> bool:

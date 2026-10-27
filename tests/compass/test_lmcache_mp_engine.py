@@ -41,6 +41,7 @@ from test_lmcache_lp import (
     lmcache_port,  # noqa: F401  the lmcache_port fixture
 )
 from test_memory_readings import DOCUMENT
+from test_pd_planned_block import publish
 from test_vertical_slice import (
     CONSTANT,
     MODEL,
@@ -133,6 +134,8 @@ class Engine:
         if pd:
             write = {WRITE_REQ_KEY: f"inproc://kv-write-req-{os.getpid()}"}
             kv = {"kv_connector": "multi", "connectors": [COMPASS | write, kv]}
+            for engine in ("engine-P", "engine-D"):
+                publish(run["out_dir"], engine, 1)
         self.config = _config(kv, tensor_parallel_size=tp, kv_cache_block_size=CHUNK)
         compass_run._launch_lmcache(self.config, run, compass_run._pd_side(self.config))
         (argv, *_), self.proc = started[0]
