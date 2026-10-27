@@ -233,3 +233,54 @@ def test_a_phase_is_recorded_in_wall_and_monotonic_time_and_ends_when_it_does():
         phases["warm-up"]["end"]["monotonic"]
         <= phases["measuring"]["start"]["monotonic"]
     )
+
+
+def read_marked(monkeypatch, marker):
+    """`identity._ptl` as it is, touching the file `marker` once it has read."""
+    real = drive._ptl
+
+    def ptl(*args):
+        try:
+            return real(*args)
+        finally:
+            Path(marker).touch()
+
+    monkeypatch.setattr(drive, "_ptl", ptl)
+
+
+@pytest.mark.parametrize("gpus, to", [((7,), "enabled"), ((6, 7), "mixed")])
+def test_a_ptl_watch_names_each_change_from_when_its_file_exists(
+    planted, tmp_path, monkeypatch, gpus, to
+):
+    """A change before the file exists goes unnamed; GPU 7's after it is named,
+    by the reading as the block ends at the latest; cards that disagree read
+    as mixed."""
+    cards = {"card6": {**CARD, "PCI Bus": "0000:0B:00.0"}, "card7": CARD}
+    (tmp_path / "bin" / "cards.json").write_text(json.dumps(cards))
+    pci = tmp_path / "pci"
+    enable = [pci / c["PCI Bus"].lower() / "ptl/ptl_enable" for c in cards.values()]
+    for path in enable:
+        path.parent.mkdir(parents=True)
+        path.write_text("enabled\n")
+    monkeypatch.setattr(drive, "PTL_POLL_S", 0.01)
+    read_marked(monkeypatch, tmp_path / "read")
+    ready = tmp_path / "server.json"
+    with drive.ptl_changes(gpus, ready) as changes:
+        for path in enable:
+            path.write_text("disabled\n")
+        ready.touch()
+        for _ in range(1000):
+            if (tmp_path / "read").exists():
+                break
+            time.sleep(0.01)
+        enable[1].write_text("enabled\n")
+
+    assert [(c["from"], c["to"]) for c in changes] == [("disabled", to)]
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", changes[0]["at"])
+
+
+def test_a_ptl_watch_whose_reading_failed_raises_as_its_block_ends(planted, tmp_path):
+    ready = tmp_path / "server.json"
+    ready.touch()
+    with pytest.raises(KeyError, match="card8"), drive.ptl_changes((8,), ready):
+        pass

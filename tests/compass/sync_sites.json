@@ -4278,6 +4278,55 @@
    "mechanism_why": "in the measuring command, which is no LP, before its run starts or after it stops; a GPU command serves no simulated run, so the bound stays real"
   },
   {
+   "id": "atom/compass/drive/identity.py::ptl_changes::threading.Thread(target=watch, daemon=True)::thread_start#0",
+   "file": "atom/compass/drive/identity.py",
+   "symbol": "ptl_changes",
+   "call": "threading.Thread",
+   "expr": "threading.Thread(target=watch, daemon=True)",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "none",
+   "why": "compass record starts a thread that reads its cards' PTL state while its real server serves",
+   "mechanism": "K9",
+   "mechanism_why": "starting a thread cannot park; in `compass record`, which is no LP: it serves a real server on the GPUs it names and refuses a run file and a clock, so no simulated clock reads this"
+  },
+  {
+   "id": "atom/compass/drive/identity.py::ptl_changes.watch::stop.wait(PTL_POLL_S)::event_wait#0",
+   "file": "atom/compass/drive/identity.py",
+   "symbol": "ptl_changes.watch",
+   "call": "stop.wait",
+   "expr": "stop.wait(PTL_POLL_S)",
+   "shape": "event_wait",
+   "peer": "thread",
+   "why": "the record's PTL watch waits a wall second at a time: for server.json to exist, then between its readings of the cards' PTL state while the server serves, until the record stops",
+   "mechanism": "K9",
+   "mechanism_why": "in `compass record`, which is no LP: it serves a real server on the GPUs it names and refuses a run file and a clock, so no simulated clock reads this"
+  },
+  {
+   "id": "atom/compass/drive/identity.py::ptl_changes.watch::stop.wait(PTL_POLL_S)::event_wait#1",
+   "file": "atom/compass/drive/identity.py",
+   "symbol": "ptl_changes.watch",
+   "call": "stop.wait",
+   "expr": "stop.wait(PTL_POLL_S)",
+   "shape": "event_wait",
+   "peer": "thread",
+   "why": "the record's PTL watch waits a wall second at a time: for server.json to exist, then between its readings of the cards' PTL state while the server serves, until the record stops",
+   "mechanism": "K9",
+   "mechanism_why": "in `compass record`, which is no LP: it serves a real server on the GPUs it names and refuses a run file and a clock, so no simulated clock reads this"
+  },
+  {
+   "id": "atom/compass/drive/identity.py::ptl_changes::thread.join()::join#0",
+   "file": "atom/compass/drive/identity.py",
+   "symbol": "ptl_changes",
+   "call": "thread.join",
+   "expr": "thread.join()",
+   "shape": "join",
+   "peer": "thread",
+   "why": "once its server has stopped, the record waits for its PTL watch to take its last reading and end",
+   "mechanism": "K9",
+   "mechanism_why": "in `compass record`, which is no LP: it serves a real server on the GPUs it names and refuses a run file and a clock, so no simulated clock reads this"
+  },
+  {
    "id": "atom/compass/drive/serve.py::serve::subprocess.Popen( argv, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True, )::thread_start#0",
    "file": "atom/compass/drive/serve.py",
    "symbol": "serve",
