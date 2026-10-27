@@ -78,7 +78,8 @@ run, naming the shape),
 ``step_roofline`` (optional, ``true`` or ``false``: with ``true`` a
 `StepRooflineBackend` prices the steps the backend refuses, through
 `StepFallbackBackend`, as it always does under ``step_grid``, from the
-modules `run.modules.walk` reads off the meta build), ``padding`` (optional:
+modules `run.modules.walk` reads off the meta build and its block drafter's,
+`run.modules.drafter`), ``padding`` (optional:
 ``none`` prices a replayed graph's real rows in place of the rows it pads to,
 which ``executed``, the default, prices),
 ``on_refusal`` (optional: ``mark``, the default, charges a step the cost
@@ -1494,9 +1495,10 @@ def runner(model_runner, tree) -> None:
             "that reads it"
         )
     if fallback or STEP_GRID in run:
-        from atom.compass.run.modules import walk
+        from atom.compass.run.modules import drafter, walk
 
-        roofline = StepRooflineBackend(machine, walk(tree), padded=padding != "none")
+        modules = walk(tree, drafter(config))
+        roofline = StepRooflineBackend(machine, modules, padded=padding != "none")
         backend = StepFallbackBackend(backend, roofline)
     pp = getattr(config, "pipeline_parallel_size", 1)
     if pp > 1 and tp > 1 and not hasattr(backend, "all_gather_s"):

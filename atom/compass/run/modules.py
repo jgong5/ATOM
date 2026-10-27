@@ -60,6 +60,35 @@ DeepSeek-V4's modules, each priced and then gone into:
   expert parallelism that fuses its shared experts, the Mega kernel, and
   experts picked by phase, are unclassified.
 
+DeepSeek-V4.1's, each priced and then gone into, the KV and index caches at
+the formats ATOM's config states:
+
+- a linear with native group-32 weights (`native_a8_group_rows`): its
+  product quantizes its input to fp8, so it reads fp8 activations.
+- `Block`: two hyper-connection mixes, as V4's; its two norms run inside
+  them.
+- `Attention`: its Q and KV norms in one launch, writing Q in fp8; sparse
+  attention over the window and, where its layer compresses, the top k of
+  the compressed KV, which its indexer scores where it has one, at most its
+  candidates where an earlier layer chose them; and where it compresses,
+  the index keys it writes. Its compressor's norm runs inside the pooling,
+  its indexer's key projection and norm in those index keys.
+- the rotary tables, the vision tower and the runtime's compiled stages,
+  which hold the model outside the tree: nothing.
+
+On a prefill that replays its decoder (`replay`), its layers after the first
+decoder layer run on each finishing request's last window of rows, the last
+layer on its last row, and the first decoder layer on that window but for its
+compression.
+
+`walk` also reads a block drafter's model, `drafter` builds it: DSpark's, as
+V4.1 ships it. Its modules carry its block width (`Module.draft`), and the
+pass that writes its KV over the target's rows is marked apart (`CONTEXT`):
+the stages' KV projections, one fp8 product, and the first stage's
+`main_proj` and `main_norm`. `DraftAttention` attends its block and the
+window before it; the block's LM head, the target's, runs on its vocabulary
+shard, and the Markov sampler on that shard, once a position.
+
 A module of any other class is gone into when it has children. One without,
 or a listed one in a format or layout not priced here, is unclassified: the
 first of each class comes back as an `unclassified` module named by class
@@ -72,7 +101,7 @@ import re
 
 import torch
 
-from atom.compass.backends.step_roofline import UNCLASSIFIED, Module
+from atom.compass.backends.step_roofline import CONTEXT, UNCLASSIFIED, Module
 
 #: Weight, KV and state formats a module is priced at, by dtype.
 FORMATS = {
@@ -105,6 +134,23 @@ SILENT = ("torch.nn.modules.activation", "transformers.activations")
 VISION = "atom.models.qwen3_5_vl.Qwen3VisionTransformer"
 #: V4's rotary tables, read inside the attention and compressor kernels.
 V4_ROPE = V4 + "_V4RoPE"
+V41 = "atom.models.deepseek_v41."
+V41_BLOCK, DRAFT_BLOCK = V41 + "model.Block", V41 + "dspark.DraftBlock"
+V41_ATTENTION, V41_INDEXER = V41 + "attention.Attention", V41 + "attention.Indexer"
+DRAFT_ATTENTION = V41 + "dspark.DraftAttention"
+COMPRESSOR = "atom.model_ops.deepseek_v41.compressor.Compressor"
+#: The block drafter whose passes the step roofline lays out.
+DSPARK = V41 + "dspark.DeepseekV41DSpark"
+#: V4.1's rotary tables, read inside its attention and index kernels, its
+#: vision tower, the runtime's compiled stages, and DSpark's Markov tables,
+#: priced at the drafter's root.
+V41_SILENT = (
+    "atom.model_ops.deepseek_v41.rotary.RotaryEmbedding",
+    V41 + "vision.ViT",
+    V41 + "vision.Aligner",
+    V41 + "runtime._Stage",
+    "atom.models.deepseek_v4_dspark.DSparkMarkovHead",
+)
 #: What the routed experts' kernel reads once for each expert it runs.
 HELD = tuple(f"w{w}_{p}" for w in (13, 2) for p in ("weight", "weight_scale", "bias"))
 #: Linear quant types whose activations stay bf16 into the matrix product.
@@ -112,29 +158,118 @@ UNQUANTIZED_INPUT = ("No", "per_1x32")
 LAYER = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
-def walk(tree: torch.nn.Module) -> list[Module]:
-    """The modules of `tree` the step roofline prices, in visiting order."""
+def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
+    """The modules of `tree` the step roofline prices, in visiting order, then
+    those of `drafted`, the model its block drafter runs (`drafter`)."""
     found: list[Module] = []
     seen: set[type] = set()
+    replay = _replay(tree)
 
-    def visit(module, name, parent):
+    def visit(module, name, parent, draft):
         m = _classify(module, name, parent)
         *priced, then = m if isinstance(m, tuple) else (m,)
         if isinstance(then, Module):
             priced, then = [then], NOTHING
         layer = LAYER.search(name)
         layer = int(layer.group(1)) if layer else -1
-        found.extend(dataclasses.replace(p, layer=layer) for p in priced)
+        for p in priced:
+            p = dataclasses.replace(p, layer=layer, draft=p.draft or draft)
+            rows = _replayed(replay, layer, name, p.kind) if not p.draft else 0
+            if p.draft == CONTEXT and replay:
+                rows = replay[2]
+            found.append(dataclasses.replace(p, replay=rows))
         if then is DESCEND:
             for child, sub in module.named_children():
-                visit(sub, f"{name}.{child}" if name else child, module)
+                inner = CONTEXT if _drafts_kv(sub, module) else draft
+                visit(sub, f"{name}.{child}" if name else child, module, inner)
         elif then is None and type(module) not in seen:
             seen.add(type(module))
             where = f"{type(module).__name__} at {name or 'the root'}"
             found.append(Module(where, UNCLASSIFIED))
 
-    visit(tree, "", None)
+    visit(tree, "", None, 0)
+    if drafted is not None:
+        visit(drafted, "drafter", None, drafted.block_size)
     return found
+
+
+def drafter(config):
+    """The model `config`'s drafter runs, built on the meta device as a
+    simulated run builds its target, its post-load hooks run; None without a
+    drafter, or for one whose passes the step roofline does not lay out: any
+    but DeepSeek-V4.1's DSpark, whose weights ship with the target's.
+
+    It registers its layers in a copy of ATOM's forward context: ATOM's own
+    drafter build registers the same names, and refuses one twice."""
+    spec = getattr(config, "speculative_config", None)
+    if spec is None or spec.use_dspark_with_draft():
+        return None
+    from atom.spec_decode.drafter import support_draft_model_arch_dict
+
+    arch = spec.draft_model_hf_config.architectures[0]
+    if support_draft_model_arch_dict.get(arch) != DSPARK:
+        return None
+    import copy
+
+    from atom.compass.runner.overrides import (
+        FactoriesOnMeta,
+        process_weights_after_loading,
+        simulated_arch,
+    )
+    from atom.config import use_custom_atom_config
+    from atom.utils import resolve_obj_by_qualname
+
+    own = copy.copy(config)
+    own.compilation_config = copy.copy(config.compilation_config)
+    own.compilation_config.static_forward_context = {}
+    with use_custom_atom_config(own), FactoriesOnMeta(), simulated_arch():
+        model = resolve_obj_by_qualname(DSPARK)(own)
+        process_weights_after_loading(model)
+    return model
+
+
+def _replay(tree):
+    """The first decoder layer, the last layer and the window of a V4.1
+    `tree` that replays its decoder on a prefill's last rows, else None."""
+    if not (_is(tree, V41 + "runtime.DeepseekV41RuntimeModel") and tree.replay):
+        return None
+    return tree.decoder_start, tree.last_layer, tree.config.sliding_window
+
+
+def _replayed(replay, layer: int, name: str, kind: str) -> int:
+    """`Module.replay` for a module of `layer` named `name`: the decoder's
+    window, the last layer's last row, and every row before the decoder and
+    for the first decoder layer's compression."""
+    if replay is None:
+        return 0
+    start, last, window = replay
+    if layer == last:
+        return 1
+    compresses = ".compressor" in name or kind == "index_keys"
+    return window if layer > start or layer == start and not compresses else 0
+
+
+def _drafts_kv(module, parent) -> bool:
+    """Whether `module` runs in its drafter's pass over the target's rows."""
+    held = ("main_proj", "main_norm") if _is(parent, DRAFT_BLOCK) else ()
+    return any(module is getattr(parent, h, None) for h in held)
+
+
+def _inside(module, parent) -> bool:
+    """Whether `module` runs inside a kernel its V4.1 parent is priced as: a
+    block's norms in its mixes, an attention's Q and KV norms in their one
+    launch, a compressor's norm in its pooling, an indexer's key projection
+    and norm in its index keys."""
+    held = ()
+    if _is(parent, V41_BLOCK):
+        held = ("attn_norm", "ffn_norm")
+    elif _is(parent, V41_ATTENTION):
+        held = ("q_norm", "kv_norm")
+    elif _is(parent, COMPRESSOR):
+        held = ("norm",)
+    elif _is(parent, V41_INDEXER):
+        held = ("wk", "k_norm")
+    return any(module is getattr(parent, h, None) for h in held)
 
 
 def _is(module, *names: str) -> bool:
@@ -146,11 +281,21 @@ def _is(module, *names: str) -> bool:
 
 def _classify(module, name, parent):
     """`module`'s `Module`, `NOTHING`, `DESCEND`, or None if unclassified."""
+    if parent is not None and _inside(module, parent):
+        return NOTHING
     weight = getattr(module, "weight", None)
     fmt = FORMATS.get(getattr(weight, "dtype", None))
     if _is(module, V4 + "Block"):
         mix = Module(name, "mhc", (module.hc_mult, module.attn_norm.weight.shape[0]))
         return mix, mix, DESCEND
+    if _is(module, V41_BLOCK):
+        width = module.attn_norm.weight.shape[0]
+        mix = Module(name, "mhc", (module.hc_attn_fn.shape[1] // width, width))
+        return mix, mix, DESCEND
+    if _is(module, V41_ATTENTION):
+        return (*_csa2(module, name), DESCEND)
+    if _is(module, DSPARK):
+        return (*_dspark(module, name), DESCEND)
     if _is(module, V4 + "DeepseekV4Attention"):
         ix = module.indexer
         dims = (module.n_local_heads, module.head_dim, module.window_size)
@@ -179,6 +324,8 @@ def _classify(module, name, parent):
         ranks = module.tp_size if reduces else 1
         quant = getattr(getattr(module, "quant_type", None), "name", "No")
         act = "bf16" if quant in UNQUANTIZED_INPUT else fmt
+        if getattr(module, "native_a8_group_rows", None) is not None:
+            act = "fp8"
         if getattr(parent, "_wo_a_mxscale", False) and module is parent.wo_a:
             # V4 quantizes the input to the weight's fp8 for its batched GEMM.
             act = FORMATS.get(parent._wo_a_fp8_dtype)
@@ -216,9 +363,57 @@ def _classify(module, name, parent):
         return (
             len(down) == 1 and Module(name, "act", (down[0].weight.shape[1],)) or None
         )
-    if _is(module, VISION, V4_ROPE) or type(module).__module__.startswith(SILENT):
+    if _is(module, VISION, V4_ROPE, *V41_SILENT):
+        return NOTHING
+    if type(module).__module__.startswith(SILENT):
         return NOTHING
     return DESCEND if next(module.children(), None) is not None else None
+
+
+def _csa2(module, name):
+    """V4.1's attention: its Q and KV norms' one launch; a draft's block
+    attention, or the sparse attention of its layer's mode; and where it
+    compresses, the index keys it writes. The caches are at the formats
+    ATOM's config states: the KV pool bf16 or fp4, a draft's window bf16 or
+    beside an fp4 pool fp8, the index plane fp8 or fp4."""
+    from atom.config import get_current_atom_config
+
+    config = get_current_atom_config()
+    hf, spec, ix = config.hf_config, module.spec, module.indexer
+    q, kv = (n.weight.shape[0] for n in (module.q_norm, module.kv_norm))
+    found = [Module(f"{name}.qk_norm", "norm", (q + kv, q))]
+    dims = (module.heads, module.head_dim, hf.sliding_window)
+    fp4 = config.kv_cache_dtype == "fp4"
+    if _is(module, DRAFT_ATTENTION):
+        return found + [Module(name, "block_attention", dims, "fp8" if fp4 else "bf16")]
+    index = "fp4" if config.index_cache_dtype == "fp4" else "fp8"
+    dims += (spec.ratio, hf.index_topk if spec.ratio else 0)
+    dims += (ix.heads, ix.head_dim) if ix else (0, 0)
+    if ix and spec.candidate_source is not None:
+        dims += (ix.topk_blocks * ix.block_size,)
+    pool = "fp4" if fp4 else "bf16"
+    found.append(Module(name, "sparse_attention", dims, pool, index=index))
+    if module.compressor is not None:
+        keys = (ix.head_dim, module.head_dim, spec.ratio)
+        found.append(Module(f"{name}.indexer", "index_keys", keys, index))
+    return found
+
+
+def _dspark(module, name):
+    """DSpark's work outside its blocks: the pass over the target's rows that
+    writes each stage's KV, one fp8 product of the stages' KV projections;
+    the block's LM head, the target's, on this rank's vocabulary shard; and
+    the Markov sampler over that shard."""
+    stages = [block.attn for block in module.mtp]
+    tp, hidden = stages[0].wo_b.tp_size, module.config.hidden_size
+    vocab = -(-module.vocab_size // tp)
+    kv = (sum(a.head_dim for a in stages), hidden)
+    markov = (vocab, module.mtp[-1].markov_head.rank, module.block_size)
+    return (
+        Module(f"{name}.context_kv", "gemm", kv, "fp8", act="fp8", draft=CONTEXT),
+        Module(f"{name}.head", "gemm", (vocab, hidden)),
+        Module(f"{name}.markov", "markov", markov, ranks=tp),
+    )
 
 
 def _mla(impl, name, kv):
