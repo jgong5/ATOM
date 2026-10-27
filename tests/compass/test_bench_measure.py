@@ -685,6 +685,21 @@ def test_ragged_measures_the_views_composed_from_each_drawn_decode_view(run):
         assert member["traces"] == sorted({t for s in split for t in s["traces"]})
 
 
+def test_ragged_composes_across_the_rungs_of_the_ladder_the_record_states(
+    run, monkeypatch
+):
+    rec = str(run.record)
+    ladder = json.loads((run.record / "steps/dp0.engine.json").read_text())["ladder"]
+    given, compose = [], measure.ragged.compose
+    monkeypatch.setattr(
+        measure.ragged, "compose", lambda *a: given.append(a[-1]) or compose(*a)
+    )
+
+    run(rec, "--sample", "2", "--seed", "3", "--ragged", *run.named(rec))
+
+    assert given and all(g == ladder for g in given)
+
+
 def test_ragged_without_a_replayed_input_refuses(run):
     rec = str(run.record)
     definition = run.tmp / "definition.json"

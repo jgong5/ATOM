@@ -379,7 +379,9 @@ def _ragged(points: dict, read: list, seed) -> dict:
     for digest, point in sorted(points.items()):
         if _kind(point["view"]).startswith("decode"):
             rng = random.Random(f"{seed} {digest}")
-            for view in ragged.compose(point["view"], contexts, rng, blocks, size, top):
+            for view in ragged.compose(
+                point["view"], contexts, rng, blocks, size, top, engine["ladder"]
+            ):
                 _add(out, view, "ragged", sources, traces)
     return out
 

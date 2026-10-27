@@ -16,6 +16,7 @@ import itertools
 import json
 import math
 import re
+import statistics
 import sys
 from types import SimpleNamespace
 
@@ -752,3 +753,86 @@ def test_alpha_counts_the_views_it_reads_at_their_longest_row_past_the_kv_pool()
 
     assert report["32"]["views"] == 8 and report["32"]["unread"] == []
     assert report["32"]["past_pool"] == 4
+
+
+def test_alpha_rising_with_the_mean_context_is_fitted_and_priced(
+    tmp_path, run, monkeypatch
+):
+    """The ragged views and the records read alpha = 0.1 + 30 (mean cached
+    context / 2^16): the fit finds the mean's term, the rung keeps it, and the
+    bundle prices ragged batches with it."""
+
+    def by_mean(rows):
+        return 0.1 + 30 * statistics.fmean(r.context_tokens - 1 for r in rows) / 2**16
+
+    monkeypatch.setattr(sys.modules[__name__], "alpha_true", by_mean)
+    g = record(tmp_path, run, nodes(), name="g")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    views = [
+        measured(tmp_path, run, x, "ragged", ragged_time(x))
+        for x in ragged_lines(5, 40)
+    ]
+    monkeypatch.setattr(sys.modules[__name__], "time", ragged_time)
+    cells = [
+        record(tmp_path, run, ragged_lines(s, 120), name=name)
+        for s, name in ((6, "a"), (7, "b"))
+    ]
+
+    copy = fitted(
+        tmp_path,
+        *cells,
+        *views,
+        *clients(g),
+        *[a for c in cells for a in clients(c)],
+        grid="g",
+    )
+
+    report = copy["report"]["alpha"]["8"]
+    terms = report["forms"][report["form"]]["terms"]
+    assert terms == pytest.approx([0.1, 0.0, 0.0, 30.0], abs=1e-6)
+    assert report["kept"] is True
+    backend = loaded(tmp_path, run, copy)
+    for line in ragged_lines(8, 10):
+        priced = backend.price(view(line)).seconds
+        assert priced == pytest.approx(ragged_time(line) * factor(line), rel=1e-5)
+
+
+def test_alpha_forms_are_judged_on_every_view_priced_out_of_fold():
+    """Four views and five folds: each view is priced by the form fitted on the
+    other three, and the constant form's held-out error is the median of those
+    errors, its terms fitted on all four."""
+    w, e = np.array([0.2, 0.4, 0.1, 0.3]), np.array([-0.05, -0.12, -0.01, -0.1])
+    ratio, spread, mean = (
+        [0.5, 1.0, 1.5, 2.0],
+        [0.2, 0.4, 0.3, 0.6],
+        [0.5, 0.6, 0.7, 0.8],
+    )
+    x = np.column_stack([np.ones(4), ratio, spread, mean])
+
+    forms = step_grid_fit._forms(x, w, e, seed=0)
+
+    def constant(views):
+        return -np.dot(w[views], e[views]) / np.dot(w[views], w[views])
+
+    out = [abs(e[i] + w[i] * constant(np.arange(4) != i)) for i in range(4)]
+    assert forms["constant"]["held_out_error"] == pytest.approx(np.median(out))
+    assert forms["constant"]["terms"] == pytest.approx(
+        [constant(np.arange(4)), 0, 0, 0]
+    )
+    # A form of three terms needs four views to fit on, and a fold leaves three.
+    assert set(forms) == {"constant", "ratio", "mean"}
+
+
+def test_a_term_about_the_same_over_a_rungs_views_is_not_fitted():
+    """Views of one seed keep its mean context within a token: no form reads
+    the mean there."""
+    rng = np.random.default_rng(3)
+    ratio = rng.uniform(0.25, 2.0, 30)
+    x = np.column_stack([np.ones(30), ratio, ratio / 3, 0.7 + rng.uniform(0, 1e-5, 30)])
+    w = rng.uniform(0.1, 0.5, 30)
+
+    forms = step_grid_fit._forms(x, w, -w * (0.2 + 0.1 * ratio), seed=0)
+
+    assert set(forms) == {"constant", "ratio", "ratio and spread"}
+    assert forms["ratio"]["terms"] == pytest.approx([0.2, 0.1, 0, 0])
