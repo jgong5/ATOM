@@ -311,7 +311,7 @@ def _write_end(run: dict, a: float, prompt_tokens: int, pp: int) -> list[float]:
         block = KvGeometry.from_hf_config(
             hf, block_size=16, layer_range=span, kv_dtype="bf16"
         )
-        m = TransferModel.from_spec(spec, block, Scope(run["kv_link"]))
+        m = TransferModel.from_spec(spec, block.bytes_per_block, Scope(run["kv_link"]))
         moved = blocks * block.bytes_per_block / m.bandwidth_bytes_per_s
         ends.append(a + m.setup_s + m.latency_s + moved)
     return ends
