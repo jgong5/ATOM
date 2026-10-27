@@ -355,10 +355,11 @@ and is kept as a forward guard:
 3. **Skips.** An indented import is not proof that anything executed it. The
    excluded side reads any indentation, but coverage is credited **only for a
    module-level import**, and that half carries both counter-examples:
-   `tests/model_ops/test_moe_dp_token_capacity.py:39` imports `topK` inside a test
-   marked `skipif(not torch.cuda.is_available())`, and `tests/test_mla_index_cache.py`
-   imports `ModelRunner` at **lines 99–100, indented four spaces inside a test
-   function** — not at module level, as this file and three others said until
+   `tests/model_ops/test_moe_dp_token_capacity.py::test_dpa_capacity_fits_gathered_topk_metadata`
+   imports `topK` inside a test marked `skipif(not torch.cuda.is_available())`, and
+   `tests/test_mla_index_cache.py::test_pp_shared_indexer_uses_the_producer_buffer_width`
+   imports `ModelRunner` **indented four spaces inside that test function** — not at
+   module level, as this file and three others said until
    2026-09-20. Reading coverage at any indentation drops the set 30 → 29, losing
    `topK.py`; doing that *and* crediting files that collect nothing drops it 30 → 27,
    losing `atom/model_engine/model_runner.py` — the module Compass's runner seam
