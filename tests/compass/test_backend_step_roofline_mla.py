@@ -104,11 +104,13 @@ def test_a_fused_shared_expert_takes_every_row_by_hand(spec):
     )
 
 
-def test_a_meta_tensor_moved_to_a_device_stays_on_meta():
+def test_a_meta_tensor_moved_to_the_gpu_stays_on_meta_and_not_to_the_host():
     with FactoriesOnMeta():
         scale = torch.tensor(1.0)
         moved = [scale.to(0), scale.to("cuda", non_blocking=True)]
         moved += [scale.to(device=torch.device("cuda", 0), dtype=torch.float16)]
+        with pytest.raises(NotImplementedError, match="meta tensor"):
+            scale.to("cpu")
 
     assert [(t.device.type, t.dtype) for t in moved] == [
         ("meta", torch.float32),
