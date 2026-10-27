@@ -203,6 +203,13 @@ def _fp4(torch, rows: int, k: int):
     return packed.view(torch.float4_e2m1fn_x2), scales.view(torch.float8_e8m0fnu)
 
 
+def _scaled4(torch, m: int, n: int, k: int):
+    """hipBLASLt's MXFP4 GEMM, through `torch._scaled_mm`, of an m by k and an
+    n by k operand."""
+    (x4, sx), (w4, sw) = _fp4(torch, m, k), _fp4(torch, n, k)
+    return partial(torch._scaled_mm, x4, w4.T, sx, sw, out_dtype=torch.bfloat16)
+
+
 def _a4w4(x, w):
     """aiter's MXFP4 GEMM of bf16 `x` and `w`, quantised per 1x32 with shuffled
     scales and `w` pre-shuffled, as aiter's own tests call it."""
@@ -226,7 +233,7 @@ def _running(fp4: dict, failed: dict) -> list:
         try:
             call = make()
             call()
-        except Exception as error:  # a kernel this card's arch or stepping lacks
+        except Exception as error:  # noqa: BLE001 - named, and the other timed
             failed[name] = f"{type(error).__name__}: {error}".splitlines()[0]
             continue
         found.append((samples, call))
@@ -263,12 +270,8 @@ def probe(torch, formats) -> dict:
         }
         timings = [(gemm[f], calls[f]) for f in formats if f != "fp4"]
         if aiter:
-
-            def hipblaslt():
-                (x4, sx), (w4, sw) = _fp4(torch, m, k), _fp4(torch, n, k)
-                return partial(scaled, x4, w4.T, sx, sw)
-
-            libraries = (gemm["fp4"], hipblaslt), (aiter["fp4"], partial(_a4w4, x, w))
+            makes = partial(_scaled4, torch, m, n, k), partial(_a4w4, x, w)
+            libraries = zip((gemm["fp4"], aiter["fp4"]), makes)
             timings += _running(dict(zip(FP4, libraries)), failed)
         for samples, call in timings:
             samples[f"{m}x{n}x{k}"] = _timed(torch, call)

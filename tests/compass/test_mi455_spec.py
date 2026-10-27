@@ -16,7 +16,8 @@ from test_memory_readings import READINGS, publish_readings, with_readings
 from test_probe_device import SCRIPTS, _load
 from test_spec_origin import labels
 
-from atom.compass.artifacts import ArtifactRefusal, Axis, Reading
+from atom.compass.artifacts import ArtifactRefusal, Axis, Reading, machine_spec_key
+from atom.compass.drive import identity
 from atom.compass.run import memory
 from atom.compass.spec import MachineSpec
 
@@ -133,3 +134,28 @@ def test_an_entry_measure_memory_did_not_take_on_mi355x_is_refused(
     _, _, copy = _copied_run(monkeypatch, tmp_path, READINGS[1])
     with pytest.raises(ValueError, match="is not keyed by mi355x-gpu45.json"):
         readings_script.publish(str(tmp_path / "store"), copy.token(), "test")
+
+
+#: rocm-smi's listing of GPU 0 on the MI455 node, 2026-10-27: the series is no
+#: brand, so the PCI device id names the model.
+MI455_CARD = {
+    "Card Series": "AMD Radeon Graphics",
+    "Card Model": "0x75c7",
+    "Card Vendor": "Advanced Micro Devices, Inc. [AMD/ATI]",
+    "Card SKU": "M4500001",
+    "Subsystem ID": "0x75c1",
+    "Device Rev": "0x00",
+    "Node ID": "2",
+    "GUID": "25919",
+    "GFX Version": "gfx1250",
+}
+
+
+def test_an_mi455_card_is_the_device_its_spec_states(monkeypatch):
+    """What `compass measure memory` compares before it starts an engine."""
+    listing = json.dumps({"card0": MI455_CARD})
+    monkeypatch.setattr(identity, "smi", lambda *args: listing)
+    (card,) = identity._device((0,))
+    assert f"{card['name']} {card['arch']}" == (
+        machine_spec_key(_spec(MI455)).values["device"]
+    )
