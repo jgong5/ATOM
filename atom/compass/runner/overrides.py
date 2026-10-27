@@ -777,16 +777,35 @@ def publish_planned_transfer(runner: Any) -> None:
     the staging row a second write moves after them (`_staging_row_bytes`),
     and the runner's TP width, at the file `compass_block_file` names, which
     `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
-    prices a transfer at them."""
+    prices a transfer at them. Refused where ATOM's builder refuses to publish
+    its transfer regions (`_refuse_a_staged_transfer`)."""
     if path := getattr(runner, "compass_block_file", None):
         from atom.compass import run
 
+        _refuse_a_staged_transfer(runner)
         plan = runner.pool_plan
         tp = runner.config.tensor_parallel_size
         slot, after_blocks = _transferred_slot(runner)
         staging = _staging_row_bytes(runner)
         block = plan.entry_bytes[plan.paged_class]
         run.publish_transfer(path, block, tp, slot, staging, after_blocks)
+
+
+def _refuse_a_staged_transfer(runner: Any) -> None:
+    """Refuse a transfer from a pipeline stage of Kimi's hybrid with the reason
+    ATOM's builder gives as it refuses to publish the KDA state regions there:
+    this runner allocates no cache, so the builder is never asked. DeepSeek-V4's
+    builder refuses a stage too, which ATOM's pool plan has refused already."""
+    from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
+
+    pp = runner.config.pipeline_parallel_size
+    if pp > 1 and isinstance(runner.attn_metadata_builder, _KimiMLAGDNCommon):
+        raise RunnerRefusal(
+            "ATOM's `_KimiMLAGDNCommon._with_kda_disagg_regions` refuses a "
+            f"prefill-decode transfer at pipeline_parallel_size {pp}: the KDA "
+            "state regions are keyed by KDA layer index, which "
+            "`_consumer_region_map` cannot align across stages"
+        )
 
 
 def _transferred_slot(runner: Any) -> tuple[int, bool]:
