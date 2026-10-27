@@ -237,7 +237,9 @@ def test_the_lmcache_station_refuses_a_cache_the_geometry_cannot_size(
     tmp_path, monkeypatch, model, why
 ):
     started = []
-    monkeypatch.setattr(compass_run.subprocess, "Popen", started.append)
+    monkeypatch.setattr(
+        compass_run.subprocess, "Popen", lambda *a, **k: started.append(a)
+    )
     raw = json.loads(CONFIGS[model].read_text())
     config = atom_config_double(
         kv_transfer_config=OFFLOAD
