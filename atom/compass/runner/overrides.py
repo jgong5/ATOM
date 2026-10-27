@@ -1414,15 +1414,16 @@ def _group_step_seconds(
     backend states the `stage_share` it prices; any other backend prices the
     whole step, and every stage would charge the whole model.
 
-    A step no cost source answers costs 0 s on this rank and still counts as
-    a priced step; its reason, ``cost:`` and what each source said, joins the
-    refusals the summary reads. With `compass_abort` set it raises instead,
-    which ends the worker. Under a speculative config, a step whose price holds
-    no `draft_terms` is refused the same way, since the drafter runs after
-    every target forward, unless it is priced under the `eager DP dummy`
-    treatment, whose 0 s the group's max already covers. A forward
-    `compass_host` refuses takes the same path, charged with each segment it
-    named at 0; a step both refuse has one reason.
+    A step the cost backend refuses charges no device time on this rank, its
+    answered terms included, and still counts as a priced step; its reason,
+    ``cost:`` and what each source said, joins the refusals the summary reads.
+    With `compass_abort` set it raises instead, which ends the worker. Under
+    a speculative config, a step whose price holds no `draft_terms` is
+    refused the same way, since the drafter runs after every target forward,
+    unless it is priced under the `eager DP dummy` treatment, whose 0 s the
+    group's max already covers. A forward `compass_host` refuses takes the
+    same path, charged with each segment it named at 0; a step both refuse
+    has one reason.
 
     On the rank that keeps the parity record, each step also appends its cost
     line to `dp<r>.cost.jsonl` beside it: the record's `step`; with a
