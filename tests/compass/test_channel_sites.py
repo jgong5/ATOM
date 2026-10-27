@@ -228,7 +228,7 @@ def test_the_shim_is_pyzmq_until_a_runtime_is_installed(monkeypatch):
         zmq.error,
         zmq.asyncio,
     )
-    assert type(clock.relay_queue(0)) is queue.Queue
+    assert type(clock.relay_queue(SimpleNamespace(data_parallel_rank=0))) is queue.Queue
     monkeypatch.setattr(
         clock, "_installed", LPRuntime(LpId("engine"), _engine_table(), None)
     )
@@ -396,7 +396,9 @@ def test_the_engine_output_thread_sends_each_item_with_its_put_stamp(monkeypatch
     address = f"tcp://127.0.0.1:{pull.bind_to_random_port('tcp://127.0.0.1')}"
     clock.name_endpoints(0, "", "", address)
     engine = EngineCore.__new__(EngineCore)
-    engine.label, engine.output_queue = "engine", clock.relay_queue(0)
+    engine.label, engine.output_queue = "engine", clock.relay_queue(
+        SimpleNamespace(data_parallel_rank=0)
+    )
     thread = threading.Thread(
         target=engine.process_output_sockets, args=(address,), daemon=True
     )
