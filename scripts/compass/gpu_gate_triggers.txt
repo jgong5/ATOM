@@ -40,9 +40,9 @@
 #
 # A trailing / matches the whole subtree.
 #
-# Measured at d13710cd7a2ae243f72b195f84f47fc08ac7c159 over this tree:
-#   tests/        796 files  = 72 in tests/plugin/ + 53 excluded + 671 CPU gate
-#   CPU gate      606 files collect >=1 test, 65 collect none
+# Measured at 1a0d6ec1ee6494b8ff95b645d002fcc7ec36cac4 over this tree:
+#   tests/        796 files  = 72 in tests/plugin/ + 54 excluded + 670 CPU gate
+#   CPU gate      605 files collect >=1 test, 65 collect none
 #   imports      1085 indented `import atom.*` lines in non-plugin test files
 #   collected  16013 tests by --collect-only. A run of the same set reports
 #              the same 16013 outcomes. Its "skipped" total is LARGER than any
@@ -50,7 +50,7 @@
 #              files that collect nothing is counted as skipped without ever
 #              becoming a collected test. This file states the set; gate_cpu.sh
 #              prints the run, and is the only source for its outcome counts.
-#   candidates    139 paths named by an excluded test, any indentation
+#   candidates    141 paths named by an excluded test, any indentation
 #   covered       385 paths named at module level by a live CPU-gate file
 #   triggers       87 paths below
 atom/model_loader/loader.py
