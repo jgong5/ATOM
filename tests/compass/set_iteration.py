@@ -42,16 +42,19 @@ they are listed separately below.
 **What it recognises as a set.** A set literal or comprehension; a `set()` or
 `frozenset()` call; a set operator or the method spelling of the same operator
 applied to one of those, or to a `dict` view; a name or attribute assigned one
-of them, in the scope that assigned it and the scopes inside that one; a
-parameter or variable annotated as a set; a class or dataclass field annotated
-as a set and read through `self` or the class's name; such a field of a class defined in any module
+of them -- directly, by a paired unpacking as `a, b = set(x), set(y)`, or by a
+set operator applied in place with one, as `s |= set(b)` -- in the scope that
+assigned it, or the one its `global` or `nonlocal` names, and the scopes inside
+that one; a parameter or variable annotated as a set; a class or dataclass
+field annotated as a set and read through `self` or the class's name; such a field of a class defined in any module
 scanned with this one, read through a parameter annotated with that class; a
 `set_or_none or ()`; and a call to a function this module itself annotates as
 returning one.
 
 **What it recognises as a read in order.** `for` and `async for`, a
-comprehension or generator expression, tuple and starred unpacking, `yield
-from`; `list`, `tuple`, `iter`, `reversed`, `enumerate`, `zip`, `sum`, `join`,
+comprehension or generator expression, tuple and starred unpacking except a
+star in a set display, which is `a | b` spelled `{*a, *b}`, `yield from`;
+`list`, `tuple`, `iter`, `reversed`, `enumerate`, `zip`, `sum`, `join`,
 `map`, `filter`, `fromkeys`, `extend`, `deque`, `Counter`, `islice` and
 `fromiter`; `str`, `repr`, `format`, `print`, a logging
 call's arguments and an f-string or `%` interpolation, because a set's `repr`
@@ -67,9 +70,7 @@ annotate, or by one defined in another module; one arriving in an unannotated
 parameter; one pulled out of a list, a dict or a tuple; any subclass of `set`;
 one read through `cls` or `type(self)`; one read through the name of a class
 nested in another class, of a class from another module, or of a subclass, as
-`B.members` for `class B(A)`; one bound under `global` or `nonlocal`, which is written down in the scope holding
-the statement rather than the one it names; one bound by a paired unpacking, as
-`a, b = set(x), set(y)`, or only by `s |= ...`; and a name that is also bound,
+`B.members` for `class B(A)`; and a name that is also bound,
 anywhere in the same scope, to something the pass cannot see as a set -- by an
 assignment, an unpacking, a parameter, a `for` or comprehension target, a
 `with ... as` or an import.
@@ -223,7 +224,6 @@ _KEPT = (
     ("atom/kv_transfer/offload/hybrid/kimi_k3/state_tier.py", "drain", _REPLACED_TRANSFER, 1),
     ("atom/kv_transfer/offload/mp/scheduler.py", "_enforce_transfer_deadlines",
      _REPLACED_TRANSFER, 1),
-    ("atom/model_engine/async_proc.py", "AsyncIOProcManager", _INTO_A_SET, 2),
     ("atom/model_engine/block_manager.py", "deallocate_partial", _INTS, 1),
     ("atom/model_engine/capabilities.py", "from_workers", _ONE, 1),
     ("atom/model_engine/block_pool.py", "free", "rebuilds a heap, which pops by block id", 1),
@@ -305,8 +305,16 @@ class SetIterationLint:
         tree = ast.parse(source, filename=path)
         known = _set_valued_names(tree, fields or {})
         enclosing = scopes(tree)
+        # `{*a, *b}` is `a | b` written another way: the members go into a set,
+        # so the order they came out in does not survive.
+        displays = (node for node in ast.walk(tree) if isinstance(node, ast.Set))
+        into_a_set = {
+            id(e) for d in displays for e in d.elts if isinstance(e, ast.Starred)
+        }
         found = {}
         for node, scope in _scoped(tree):
+            if id(node) in into_a_set:
+                continue
             for expression, form in _reads(node):
                 if not _is_set(expression, known, scope):
                     continue
@@ -536,14 +544,22 @@ class _Names:
     the report standing and the check reports its own remedy.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, moved) -> None:
         self.sets: set[tuple[tuple, str]] = set()
         self.others: set[tuple[tuple, str]] = set()
         self.returns: set[tuple[tuple, str]] = set()
+        self.moved = moved
+
+    def _owner(self, scope, name: str):
+        """`_owner`, then on to the scope a `global` or `nonlocal` there names."""
+        scope = _owner(scope, name)
+        while (scope, name) in self.moved:
+            scope = self.moved[scope, name]
+        return scope
 
     def learn(self, scope, name: str, table) -> bool:
         """Write one binding down. True if this is the first time it is seen."""
-        key = (_owner(scope, name), name)
+        key = (self._owner(scope, name), name)
         if key in table:
             return False
         table.add(key)
@@ -560,7 +576,7 @@ class _Names:
     def _look(self, scope, name, yes, no) -> bool:
         if name is None:
             return False
-        start = _owner(scope, name)
+        start = self._owner(scope, name)
         levels = (start,) if name.startswith("self.") else _outward(start)
         for level in levels:
             if (level, name) in no:
@@ -603,6 +619,30 @@ def _outward(scope):
     ]
 
 
+def _moved(tree):
+    """(scope, name) -> the scope a `global` or `nonlocal` statement there names.
+
+    `nonlocal` names the nearest enclosing function that binds the name itself.
+    """
+    bound = set()
+    for node, scope in _scoped(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            bound.add((scope, node.id))
+        elif isinstance(node, ast.arg):
+            bound.add((scope, node.arg))
+    moved = {}
+    for node, scope in _scoped(tree):
+        if isinstance(node, ast.Global) and scope:
+            moved.update(((scope, name), ()) for name in node.names)
+        if isinstance(node, ast.Nonlocal):
+            for name in node.names:
+                for level in _outward(scope)[1:]:
+                    if level and (level, name) in bound:
+                        moved[scope, name] = level
+                        break
+    return moved
+
+
 def _declared(scope, name):
     """The names one binding writes down.
 
@@ -628,7 +668,7 @@ def _set_valued_names(tree, fields) -> _Names:
     The second pass is also where every binder that cannot bind a set lands,
     which is what stops an outer claim reaching a name that shadows it.
     """
-    known = _Names()
+    known = _Names(_moved(tree))
     for node, scope in _scoped(tree):
         if isinstance(node, ast.arg) and _annotates_set(node.annotation):
             known.learn(scope, node.arg, known.sets)
@@ -658,21 +698,24 @@ def _set_valued_names(tree, fields) -> _Names:
 def _binds(node, known, scope):
     """Every name this statement binds, and whether it binds it to a set.
 
-    An assignment, an annotated assignment and a walrus can bind a set. The
+    An assignment, an annotated assignment, a walrus and a set operator
+    applied in place can bind a set; the last never unbinds one, since
+    `s |= t` leaves a set a set. The
     rest cannot bind one this pass can see, and they are here for the other
     half of the same rule: a name bound to
     something unrecognised is not claimed, so a binder that is missing from
     this list lets an outer claim through its own shadow and reports a name at
     a line that is not reading that set. An unannotated parameter, a `for` or
-    comprehension target, a `with ... as`, an import and a tuple or list
-    unpacking are all that shadow. `except ... as` is left out: the name is
-    an exception, and nothing here iterates one.
+    comprehension target, a `with ... as`, an import and an unpacking whose
+    value does not pair with it are all that shadow. `except ... as` is left
+    out: the name is an exception, and nothing here iterates one.
     """
     if isinstance(node, ast.Assign):
-        holds_set = _is_set(node.value, known, scope)
         bound = []
-        for target in node.targets:
+        pairs = [pair for whole in node.targets for pair in _paired(whole, node.value)]
+        for target, value in pairs:
             if isinstance(target, (ast.Name, ast.Attribute)):
+                holds_set = _is_set(value, known, scope)
                 bound.extend(
                     (name, holds_set) for name in _declared(scope, _dotted(target))
                 )
@@ -681,6 +724,12 @@ def _binds(node, known, scope):
                 # the value is says nothing about what the names hold.
                 bound.extend(_shadows(scope, _bound_names(target)))
         return tuple(bound)
+    if (
+        isinstance(node, ast.AugAssign)
+        and isinstance(node.op, SET_OPERATORS)
+        and (_is_set(node.value, known, scope) or _is_view(node.value))
+    ):
+        return tuple((name, True) for name in _declared(scope, _dotted(node.target)))
     if isinstance(node, ast.AnnAssign) and isinstance(
         node.target, (ast.Name, ast.Attribute)
     ):
@@ -707,6 +756,25 @@ def _binds(node, known, scope):
             tuple(alias.asname or alias.name.split(".")[0] for alias in node.names),
         )
     return ()
+
+
+def _paired(target, value):
+    """(target, value) for each part of an assignment that lines up one-for-one.
+
+    `a, b = set(x), set(y)` pairs each name with its own element; a value that
+    does not line up stays whole beside the target that unpacks it.
+    """
+    parts = (ast.Tuple, ast.List)
+    if not (
+        isinstance(target, parts)
+        and isinstance(value, parts)
+        and len(target.elts) == len(value.elts)
+        and not any(isinstance(e, ast.Starred) for e in target.elts + value.elts)
+    ):
+        return ((target, value),)
+    return tuple(
+        pair for t, v in zip(target.elts, value.elts) for pair in _paired(t, v)
+    )
 
 
 def _bound_names(target):
