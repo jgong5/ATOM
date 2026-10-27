@@ -396,3 +396,34 @@ def test_bad_arguments_exit_2_before_anything_starts(tmp_path, planted, case, re
     assert refusal in done.stderr
     assert not (tmp_path / "d" / "authority.argv.json").exists()
     assert not (tmp_path / "d" / "run_file.json").exists()
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        ["--prefill", "http://127.0.0.1:9"],
+        ["--decode=http://127.0.0.1:9"],
+        ["--max-concurrent-requests", "8"],
+        ["--rate-limit-tokens-per-second=100"],
+    ],
+    ids=lambda words: words[0].split("=")[0],
+)
+def test_a_simulated_router_refuses_a_worker_more_or_a_limiter_before_anything_starts(
+    tmp_path, planted, words
+):
+    env, flags = planted
+    flag = words[0].split("=")[0]
+
+    done = subprocess.run(
+        argv(tmp_path, flags, router=[*ROUTER_ARGS, *words]),
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert done.returncode == 2, done.stderr
+    assert f"the router's arguments carry {flag}," in done.stderr
+    assert not (tmp_path / "d").exists()
