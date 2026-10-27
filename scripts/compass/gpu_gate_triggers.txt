@@ -40,19 +40,19 @@
 #
 # A trailing / matches the whole subtree.
 #
-# Measured at 46db5863fc9a8262f3062cab4f79b66dc8c19648 over this tree:
-#   tests/        791 files  = 72 in tests/plugin/ + 113 excluded + 606 CPU gate
-#   CPU gate      554 files collect >=1 test, 52 collect none
+# Measured at 3d5ad18d67e7c64a1e227e28779adaaa20a88f1b over this tree:
+#   tests/        791 files  = 72 in tests/plugin/ + 118 excluded + 601 CPU gate
+#   CPU gate      549 files collect >=1 test, 52 collect none
 #   imports      1082 indented `import atom.*` lines in non-plugin test files
-#   collected  15041 tests by --collect-only. A run of the same set reports
-#              the same 15041 outcomes. Its "skipped" total is LARGER than any
+#   collected  15003 tests by --collect-only. A run of the same set reports
+#              the same 15003 outcomes. Its "skipped" total is LARGER than any
 #              skip count here, because a module-level skip in one of the 52
 #              files that collect nothing is counted as skipped without ever
 #              becoming a collected test. This file states the set; gate_cpu.sh
 #              prints the run, and is the only source for its outcome counts.
-#   candidates    184 paths named by an excluded test, any indentation
-#   covered       354 paths named at module level by a live CPU-gate file
-#   triggers      122 paths below
+#   candidates    191 paths named by an excluded test, any indentation
+#   covered       353 paths named at module level by a live CPU-gate file
+#   triggers      126 paths below
 atom/distributed/dcp_utils.py
 atom/distributed/indexer_cp.py
 atom/distributed/pcp_utils.py
@@ -74,6 +74,7 @@ atom/model_ops/attentions/deepseek_v41/packed_rows.py
 atom/model_ops/attentions/deepseek_v41/score_planner.py
 atom/model_ops/attentions/deepseek_v4_attn.py
 atom/model_ops/attentions/gdn_attn.py
+atom/model_ops/attentions/pool_layout/mha_page_unit_geometry.py
 atom/model_ops/attentions/qwen4_exp_attn.py
 atom/model_ops/attentions/triton_merge_attn_states.py
 atom/model_ops/base_attention.py
@@ -126,6 +127,7 @@ atom/model_ops/triton_fused_qkv_quant.py
 atom/model_ops/triton_gemma_rmsnorm.py
 atom/model_ops/triton_mrope.py
 atom/model_ops/v4_kernels/
+atom/models/deepseek_mtp.py
 atom/models/deepseek_v2.py
 atom/models/deepseek_v4/
 atom/models/deepseek_v41/attention.py
@@ -145,9 +147,11 @@ atom/models/deepseek_v41/runtime.py
 atom/models/deepseek_v4_dspark.py
 atom/models/dspark_draft.py
 atom/models/glm52/mono/dispatch.py
+atom/models/glm52/mono/kernels/op.py
 atom/models/glm52/mono/kernels/tp4_op.py
 atom/models/glm52/mono/runner.py
 atom/models/glm52/mono/weights.py
+atom/models/glm5_next_mtp.py
 atom/models/gpt_oss.py
 atom/models/kimi_k3/mono/runner.py
 atom/models/kimi_k3_dspark.py

@@ -166,6 +166,25 @@ differs between `fe9ea043c` and the integration base `83daf636d` — the only de
 under `atom/` is markdown documentation, which no test imports. Cite the delta;
 do not claim green.
 
+## The CPU gate container
+
+`gate_cpu.sh` and the two list regenerators run in a container on
+`rocm/atom-dev:vllm-v0.31.0-nightly_20261026`, the image of upstream `e893780f4`,
+with no GPU device and the worktree root's parent mounted at its own path:
+
+```
+docker run -d --init --name <user>_gate --network host -v <parent>:<parent> \
+  rocm/atom-dev:vllm-v0.31.0-nightly_20261026 sleep infinity
+docker exec <user>_gate bash -c 'cd /app/ATOM/atom/mesh && cargo fetch --locked'
+docker exec <user>_gate git config --global --add safe.directory '*'
+```
+
+"atomesh's cargo tests run offline" below says why `cargo fetch` runs once. The
+`safe.directory` line lets git, run as the container's root, read a tree another
+user owns; without it `regen_gpu_gate_triggers.sh` records the tree's commit as
+`UNKNOWN`. Run the gate with `COMPASS_AGENTX_HARNESS` naming the wheel the next
+section builds.
+
 ## The compass_harness tests need an agentx-harness wheel
 
 `tests/compass/test_harness_*.py` skip when `compass-harness` or `aiperf` does not
