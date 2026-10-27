@@ -17,8 +17,7 @@ behind a spin kernel, so no host time is in it.
   Every format is also timed through a Triton GEMM (`_gemm`) at the tile of
   `TILES` that ran fastest at the first shape with an output within 1% of
   torch's; a format no tile passes is named in the record. On a card whose
-  stack ships untuned libraries it is the faster: 23x hipBLASLt's BF16 rate
-  on MI455 under rocm/fw-bringup-mlperf:gfx1250-atom-20261026-dsv41.
+  stack ships untuned libraries it is the faster.
   The best rate over shapes and libraries, over
   SPEC's ``*_flops``, is the format's derate. Each GEMM follows a spin, so the
   rate is a burst's: with PTL enabled a sustained GEMM slows within a second
@@ -520,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
     ]
     record |= probe(torch, stated)
     for name, error in record.get("failed", {}).items():
-        print(f"FP4 through {name} failed: {error}", file=sys.stderr)
+        print(f"{name} failed: {error}", file=sys.stderr)
     record["source"] = Path(__file__).read_text()
     out.write_text(json.dumps(record) + "\n")
     root = git_tree_root("atom", str(ROOT))
