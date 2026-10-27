@@ -83,11 +83,14 @@ def test_gdn_chunk_indices_follow_the_host_lengths(monkeypatch):
     monkeypatch.setattr(
         aiter_attention.AiterAttentionMetadataBuilder,
         "prepare_prefill",
-        lambda self, b, rbs: (attn_metadata, None),
+        lambda self, b, rbs, rts: (attn_metadata, None),
     )
     builder = object.__new__(gdn_attn.GDNAttentionMetadataBuilder)
     builder.__dict__.update(
-        model_runner=SimpleNamespace(forward_vars=var),
+        model_runner=SimpleNamespace(
+            forward_vars=var,
+            config=SimpleNamespace(hf_config=SimpleNamespace(linear_conv_kernel_dim=4)),
+        ),
         use_spec_decode=False,
         replayssm=False,
         device="cpu",
@@ -105,7 +108,7 @@ def test_gdn_chunk_indices_follow_the_host_lengths(monkeypatch):
         total_tokens_num=26,
     )
 
-    md, _ = builder.prepare_prefill(batch, 3)
+    md, _ = builder.prepare_prefill(batch, 3, 26)
     cu = md.gdn_metadata.non_spec_query_start_loc
     var["cu_seqlens_q"].np[:4] = 0  # the next step reuses the buffer
     indices = index.prepare_chunk_indices(cu, 16)

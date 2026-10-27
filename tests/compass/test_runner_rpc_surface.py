@@ -141,16 +141,17 @@ def _arity(parent):
     `ast.Return` is the case worth naming, because reading only `ast.Assign`
     scores `return self.runner_mgr.call_func(...)` as a discard when the value
     is in fact the function's result -- `DPEngineCoreProc._execute_dummy_batch`,
-    `dummy_execution`.
+    `dummy_execution`. A keyword argument hands the reply on whole too:
+    `EngineCore.__init__` builds its `Scheduler` with `prefill_token_graphs`.
 
     Any other shape -- a list or starred target, an annotated one, a chained
-    target, an argument to another call -- is scored `None` rather than `1`,
+    target, a positional argument to another call -- is scored `None` rather than `1`,
     which would read an unpack as a use of the whole reply, and
     `test_every_reply_is_taken_in_a_shape_the_arity_reads` names its site.
     """
     if isinstance(parent, ast.Expr):
         return 0
-    if isinstance(parent, ast.Return):
+    if isinstance(parent, (ast.Return, ast.keyword)):
         return 1
     target = parent.targets[0] if isinstance(parent, ast.Assign) else None
     if isinstance(target, ast.Name) and len(parent.targets) == 1:
@@ -254,6 +255,7 @@ class Runner(NonAllocatingRunner):
             capture_sizes=[1, 2, 4],
             max_num_seqs=512,
             max_num_batched_tokens=16384,
+            enable_tbo_decode=False,
         )
 
 
@@ -268,7 +270,7 @@ def test_the_surface_is_every_dispatched_name_a_model_runner_answers():
     `ModelRunner` are exactly this intersection -- no list, no judgement.
     """
     assert set(RPC_SURFACE) == set(SITES) & BASE
-    assert len(RPC_SURFACE) == 14
+    assert len(RPC_SURFACE) == 17
 
 
 def test_both_filters_in_the_derivation_drop_nothing():
@@ -734,9 +736,9 @@ def test_the_pp_reply_is_read_in_the_head_and_not_at_the_last_stages_call():
 
     The `forward` call in `PPEngineCoreProc._downstream_busy_loop` is in the
     **last** stage. Nothing there reads the reply: the two nearby `.req_ids`
-    reads are on `batch`, and `fwd_out` is handed whole to `send_tokens`. The
+    reads are on `batch`, and `fwd_out` is handed whole to `send_completion`. The
     `.req_ids` read is one ZMQ hop later, in the head's `_pp_head_step`, on
-    what `recv_tokens()` returned. So the reply must survive a pickle round
+    what `recv_completion()` returned. So the reply must survive a pickle round
     trip, which reading only the call site would never say.
     """
     tree = ast.parse((ENGINE / "pp_engine_core.py").read_text())
@@ -768,7 +770,7 @@ def test_the_pp_reply_is_read_in_the_head_and_not_at_the_last_stages_call():
     assert "forward" in broadcast
 
     transport = (REPO / "atom/distributed/pp_transport.py").read_text()
-    for fn in ("send_tokens", "recv_tokens"):
+    for fn in ("send_completion", "recv_completion"):
         body = transport.split(f"def {fn}(")[1].split("\n    def ")[0]
         assert "pickle." in body
 
@@ -788,11 +790,15 @@ def test_dummy_execution_is_this_runners_forward_and_refuses_with_it():
         and getattr(n.value.func, "attr", None) == "forward"
         for target in n.targets
     }
-    assert body.body[-1].value.id in replies
-    # Its one site returns the reply to its own caller
-    # (`DPEngineCoreProc._execute_dummy_batch`), which is a read and not a
-    # discard. Scoring it 0 is the modelling error `_arity` exists to avoid,
-    # and this is the site that catches it.
+    last = body.body[-1].value
+    assert (
+        getattr(getattr(last, "func", None), "attr", None) == "forward"
+        or last.id in replies
+    )
+    # Its one site (`DPEngineCoreProc._execute_dummy_batch`) binds the reply
+    # and post-processes it, which is a read and not a discard. Scoring it 0
+    # is the modelling error `_arity` exists to avoid, and this is the site
+    # that catches it.
     assert [s.arity for s in SITES["dummy_execution"]] == [1]
 
 
