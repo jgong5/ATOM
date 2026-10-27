@@ -871,7 +871,9 @@ one: grading in another refuses every real step's graph.
     of step 6 and every real run graded: an `op_graph` per shape their steps hold,
     traced with no device. `run` traces a shape no graph holds itself, a model build
     each, which its wall time pays; `run --coverage` and grading trace none, and
-    leave a real step whose shape no graph holds out of their counts.
+    leave a real step whose shape no graph holds out of their counts. A graph
+    traced from another ATOM tree or torch refuses where `run` reads it, and its
+    shape is not traced again, since its key names neither.
 11. `compass measure ops --plan $R/pop/256-392/c<C>... --llc-mib 256 --gpu G $S --out
     $R/ops -- $ATOM --enforce-eager --level 0`: the op bench's planner over the
     calibration traces' populations, in rounds, on one card. The bench runs eager and

@@ -7,7 +7,8 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
 
 - The backend, exactly one, each flag named by its `run` run-file key:
   ``--step-stub FILE``, the stated `Coefficients`; ``--step-linear KEY``, a
-  `step_linear_law` entry's params with its key's ``engine_config``;
+  `step_linear_law` entry's params with its key's ``engine_config``, the entry
+  loaded through `ArtifactStore.load` under `law_readings`;
   ``--step-grid KEY``, the store's root and a `step_grid_bundle` entry's key;
   ``--op-graph``, ``true``, and as ``price_list`` the fields of the
   `price_list` key this run's model, parallel layout, machine spec and ATOM
@@ -40,14 +41,17 @@ from types import SimpleNamespace
 from atom.compass import run
 from atom.compass.artifacts import (
     ArtifactStore,
+    GateState,
     Key,
     Kind,
+    Reading,
     git_tree_root,
     machine_spec_digest,
     member_name,
     module_root,
 )
 from atom.compass.fit.publish import RANK
+from atom.compass.run.step_grid import readings
 
 #: Each backend flag's store kind; the step stub's coefficients are a file.
 KINDS = {run.STEP_LINEAR: Kind.STEP_LINEAR_LAW, run.STEP_GRID: Kind.STEP_GRID_BUNDLE}
@@ -113,10 +117,12 @@ def build(args, atom_args) -> dict:
         tokens, laws, backends = getattr(args, name), [], []
         for token in [tokens] if isinstance(tokens, str) else tokens:
             key = store.key_from_token(KINDS[name], token)
-            entry = store.read(key)
             if name == run.STEP_GRID:
+                entry = store.read(key)
                 laws.append({"store": str(store.root), **key.values})
             else:
+                conditions = law_readings(key, machine, atom_args)
+                entry = store.load(key, conditions=conditions, gates=GateState.of())
                 engine_config = json.loads(key.values["engine_config"])
                 laws.append(
                     {**_member(entry, "params"), "engine_config": engine_config}
@@ -169,6 +175,20 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
         "kv_write_req_s": KV_WRITE_REQ_S,
         "kv_link": kv_link,
     }
+
+
+def law_readings(key: Key, machine, atom_args):
+    """The readings a run on `machine` from this ATOM tree, serving the model
+    ATOM's arguments `atom_args` name, loads the `step_linear_law` at `key`
+    under: its engine config as `key` states it, the one the runner then holds
+    the resolved config to."""
+    model = run._file_digest(_engine_args(atom_args).model, "config.json")
+    return readings(
+        machine,
+        atom_src=Reading.of_source_root(git_tree_root("atom", module_root("atom"))),
+        model=model,
+        engine_config=key.values["engine_config"],
+    )
 
 
 def _dp_width(atom_args) -> int:

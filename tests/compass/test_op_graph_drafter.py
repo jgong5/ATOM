@@ -20,16 +20,23 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from test_artifact_store import CONDITIONS, GATES, stanza
+from test_artifact_store import stanza
 from test_backend_step_linear import _installed, view
 from test_capture_ir import MAIN, TREE, _ops, _record
 from test_dp_step_max import runner
 from test_memory_readings import WORKER
 from test_op_graph import FLAT, GEMM, MIDDLE, _engine, by_name, g
-from test_op_graph_arch import ENGINE
+from test_op_graph_arch import ENGINE, run_readings
 from test_work import SPEC
 
-from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
+from atom.compass.artifacts import (
+    ArtifactStore,
+    GateState,
+    Key,
+    Kind,
+    Topology,
+    member_name,
+)
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import OpGraphBackend
@@ -372,8 +379,8 @@ def _lookup(tmp_path, dp, stored, *lazily):
             Key.of(Kind.OP_GRAPH, structure=at, shape=shape),
             provenance=stanza("compass trace ops"),
             topology=Topology(),
-            conditions=CONDITIONS,
-            gates=GATES,
+            conditions=run_readings(config.model),
+            gates=GateState.of(),
             members={
                 member_name("graph", rank, "json"): json.dumps(
                     {"region": region}

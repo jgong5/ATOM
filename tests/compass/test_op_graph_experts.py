@@ -17,10 +17,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from test_artifact_store import CONDITIONS, GATES, stanza
+from test_artifact_store import stanza
 from test_backend_step_linear import view
 from test_drive_runfile import build, install, step_linear
-from test_op_graph_arch import ENGINE
+from test_op_graph_arch import ENGINE, run_readings
 from test_run_step_grid import deployment
 from test_work import SPEC
 
@@ -28,6 +28,7 @@ from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass.artifacts import (
     ArtifactRefusal,
     ArtifactStore,
+    GateState,
     Key,
     Kind,
     Topology,
@@ -94,8 +95,8 @@ def store(tmp_path, monkeypatch):
             Key.of(Kind.OP_GRAPH, structure=at, shape="decode B=2"),
             provenance=stanza("compass trace ops"),
             topology=Topology(),
-            conditions=CONDITIONS,
-            gates=GATES,
+            conditions=run_readings(str(tmp_path / "model")),
+            gates=GateState.of(),
             members={
                 member_name("graph", RANK, "json"): json.dumps(
                     {"region": {"op": name}}
