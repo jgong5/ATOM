@@ -422,7 +422,7 @@ def test_a_record_whose_card_flips_ptl_while_it_serves_is_refused_by_both_fits(
     read_marked(monkeypatch, tmp_path / "read")
     server = tmp_path / "server.py"
     server.write_text(server.read_text() + FLIPS)
-    out, export = tmp_path / "record", tmp_path / "client.json"
+    out = tmp_path / "record"
     cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
 
     run = json.loads((out / "run.json").read_text())
@@ -432,11 +432,15 @@ def test_a_record_whose_card_flips_ptl_while_it_serves_is_refused_by_both_fits(
         "disabled",
         "disabled",
     )
-    export.write_text(json.dumps(RUNS[0]))
+    clients = []
+    for k, requests in enumerate(RUNS):
+        export = tmp_path / f"client{k}.json"
+        export.write_text(json.dumps({"requests": requests}))
+        clients += ["--client-run", out, export]
     for command in ("fit steps", "fit host"):
         backend = ["--backend", "step-linear"] if command == "fit steps" else []
         with pytest.raises(SystemExit) as refused:
-            fit(tmp_path, command, *backend, out, "--client-run", out, export)
+            fit(tmp_path, command, *backend, out, *clients)
         assert str(refused.value) == (
             f"compass {command}: {out} is not fitted: its cards' PTL state changed "
             f"while it served, enabled to disabled at {change['at']}"
