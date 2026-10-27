@@ -778,17 +778,34 @@ class UnbuiltModel(torch.nn.Module):
         )
 
 
-def publish_paged_block(runner: Any) -> None:
-    """Publish one entry of the paged class `get_num_blocks` planned, and the
-    runner's TP width, at the file `compass_block_file` names, which
+def publish_planned_transfer(runner: Any) -> None:
+    """Publish one entry of the paged class `get_num_blocks` planned, the state
+    slot a transfer moves beside a request's blocks (`_transferred_slot_bytes`),
+    and the runner's TP width, at the file `compass_block_file` names, which
     `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
-    prices a transferred block at it."""
+    prices a transfer at them."""
     if path := getattr(runner, "compass_block_file", None):
         from atom.compass import run
 
         plan = runner.pool_plan
         tp = runner.config.tensor_parallel_size
-        run.publish_block(path, plan.entry_bytes[plan.paged_class], tp)
+        slot = _transferred_slot_bytes(runner)
+        run.publish_transfer(path, plan.entry_bytes[plan.paged_class], tp, slot)
+
+
+def _transferred_slot_bytes(runner: Any) -> int:
+    """One entry of the per-request slot class `get_num_blocks` planned, when
+    the runner's attention builder publishes that whole slot as a transfer
+    region, as DeepSeek-V4's does (`get_kv_transfer_tensors`); 0 for every
+    other builder. A Qwen GDN hybrid plans a slot its regions do not carry."""
+    from atom.model_engine.kv_block import STATE_SLOT_CLASS
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+
+    if isinstance(runner.attn_metadata_builder, DeepseekV4AttentionMetadataBuilder):
+        return runner.pool_plan.entry_bytes[STATE_SLOT_CLASS]
+    return 0
 
 
 def _refused(method: str):
@@ -1175,7 +1192,8 @@ class NonAllocatingRunner(
         the card being modelled; `kv_pool_sizing` keeps the count beside the
         readings, so which terms those were is recoverable from the runner and
         not only from a log line somebody kept. On a prefill-decode run the
-        planned block is published as well (`publish_paged_block`).
+        planned block and transferred state slot are published as well
+        (`publish_planned_transfer`).
 
         The decode process of intra-GPU prefill/decode disaggregation is
         refused rather than sized. ATOM's own runner for that answers a block
@@ -1204,7 +1222,7 @@ class NonAllocatingRunner(
             readings=readings,
         )
         logger.info("%s", self.kv_pool_sizing.table())
-        publish_paged_block(self)
+        publish_planned_transfer(self)
         return reply
 
     def allocate_kv_cache(self, num_kvcache_blocks: int) -> bool:

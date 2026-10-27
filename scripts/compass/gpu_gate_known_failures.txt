@@ -1,21 +1,10 @@
 # SPDX-License-Identifier: MIT
-# The GPU superset's known-failing node-ids at BASE_COMMIT, verbatim. Read by
-# gate_gpu.sh, which judges failures by NAME and not only by count: a
+# The failing node-ids at gpu_gate_baseline.env's BASE_COMMIT, verbatim and in
+# run order, that both of regen_gpu_gate_baseline.sh's runs failed; it writes
+# this file whole. gate_gpu.sh judges failures by NAME and not only by count: a
 # same-sized set of *different* failures is a regression the counts cannot see.
-#
-# BASE_COMMIT is pure upstream 661ef7661, the ATOM the nightly 20261013 image
-# ships, run on node 18's MI308X (gfx942) with gate_gpu.sh's pytest command;
-# gate_gpu.sh carries the run and toolchain. Two runs on two GPUs failed the
-# same node-ids. None is a Compass change, since the tree carries no Compass
-# code. Most are tests written for gfx950 formats and kernels (OCP FP8, MXFP8,
-# E8M0, NVFP4, Group32 FP8 GEMM); the rest are kernel numerics, a Triton
-# shared-memory limit, test stubs older than upstream's code, state shared
-# between upstream test files, and test_benchmark_catalog's `git rev-parse
-# HEAD` in a snapshot with no .git.
-#
-# Blank lines and # comments are ignored. One node-id per line. The count here
-# and BASE_FAILED in gate_gpu.sh are two statements of one fact; the script
-# refuses to run if they disagree.
+# Blank lines and # comments are ignored. The count here and BASE_FAILED are two
+# statements of one fact; gate_gpu.sh refuses to run if they disagree.
 tests/model_ops/test_fused_rmsnorm_mxfp8.py::test_fused_mxfp8_matches_rmsnorm_then_quantize_fp8[shape0-False]
 tests/model_ops/test_fused_rmsnorm_mxfp8.py::test_fused_mxfp8_matches_rmsnorm_then_quantize_fp8[shape0-True]
 tests/model_ops/test_fused_rmsnorm_mxfp8.py::test_fused_mxfp8_matches_rmsnorm_then_quantize_fp8[shape1-False]
