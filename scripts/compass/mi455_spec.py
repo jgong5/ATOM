@@ -1,19 +1,22 @@
 # SPDX-License-Identifier: MIT
-"""The MI455X machine spec, for a device no engine has run on.
+"""The MI455 machine spec, from probes on one MI455 node.
 
-    python3 scripts/compass/mi455_spec.py [--out PATH]
+    python3 scripts/compass/mi455_spec.py [--model M ...] [--sweep-from DOC] [--out PATH]
 
-MI455X's published numbers (`DATASHEET`) are its peaks. Each attainable value
-is that peak times the ratio mi355-gpu-45 probed (`MI355X`), assumed: every
-derate is MI355X's, and each bandwidth-curve point is MI355X's over its
-datasheet bandwidth, times MI455X's. What no datasheet states, MI355X's value
-carried over is assumed (`CARRIED`): its probed kernel floor and intra-node
-link latency, its host, its stack, and the inter-node link latency and router
-relay it assumes itself. Writes the merged document to `--out` when `validate`
-passes, then prints `explain`'s rows grouped by origin.
+MI455X's published numbers (`DATASHEET`) are its peaks. `probe_device.py`'s
+readings on two cards of the node (`PEAKS`) give each format's derate over
+them, the bandwidth curve, the kernel floor and the intra-node link's latency
+and derate, and its record the device fragment (`DEVICE`): the arch, the
+capacity torch reads and the stack, beside the host's cores. No card has a
+ptl directory. The HTTP intake terms are mi355-gpu-45's, assumed, until a
+burst on MI455 fits them; what no probe fills on any machine (the IPC costs,
+the inter-node link's latency and derate, the router relay) is assumed as on
+mi355-gpu-45. `--model` and `--sweep-from` work as `mi308x_spec.py`'s do; with
+neither the script sweeps DeepSeek-V4.1-Flash's tokenizer.
 """
 
 import argparse
+import copy
 import json
 import sys
 from pathlib import Path
@@ -21,27 +24,26 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mi308x_spec as base
+from mi308x_spec import fragment, saved, swept
 
 from atom.compass.spec import Fragment, MachineSpec, merge, validate
-from atom.compass.validate.project import CARRIED
 
 NAME = "mi455"
+base.NAME = NAME  # the shared fragment and sweep functions name this machine
 MACHINES = Path(__file__).resolve().parent / "machines"
-#: The probed device whose ratios and values MI455 carries.
+#: The machine whose HTTP intake terms MI455 carries until it has its own.
 MI355X = MACHINES / "mi355x-gpu45.json"
-DATE = "2026-10-21"
+MODEL = "/apps/perzhang/models/DeepSeek-V4.1-Flash"
 
 #: AMD's MI455X product page and brochure (07/26), read 2026-10-09: dense
 #: matrix-core peaks, HBM4 bandwidth, the four GPUs of a compute tray and the
 #: 72 its switched UALoE fabric joins, one GPU's scale-up rate and its NICs'
-#: scale-out rate, each per direction. Its 432 GB of HBM4 is binary: MI355X's
-#: 288 GB reads 309220868096 B at a real start, 288 GiB less 16 MiB, and
-#: MI308X's 192 GB reads 192 GiB less 16 MiB.
+#: scale-out rate, each per direction.
 DATASHEET = {
     "device": {
         "name": "MI455X",
         "count_per_node": 4,
-        "memory": {"capacity_bytes": 432 * 2**30, "bandwidth_bytes_per_s": 23.3e12},
+        "memory": {"bandwidth_bytes_per_s": 23.3e12},
         "compute": {
             "bf16_flops": 5.033e15,
             "fp8_flops": 20.133e15,
@@ -58,67 +60,132 @@ DATASHEET = {
     },
 }
 
+#: `probe_device.py`'s readings on cards 0001:04:00.0 and 0002:04:00.0 of the
+#: node, gfx1250 A0 samples of 192 compute units, neither with a ptl
+#: directory, under rocm/fw-bringup-mlperf:gfx1250-atom-20261026-dsv41
+#: (sha256:fd7450fde2da), the stack `DEVICE` pins, at the commit named; the
+#: record is its OUT. Each format's rate is its Triton GEMM's, which ran past
+#: hipBLASLt's in all three; aiter's MXFP4 GEMM did not compile. Each derate is
+#: a reading over `DATASHEET`'s peak, so it also holds the samples' 192 of the
+#: 256 compute units AMD counts for MI455X.
+PEAKS = (
+    "2026-10-27",
+    "dc5e8efa6",
+    {
+        "bf16": 1328645931957327.5,
+        "fp8": 1447678251827510.2,
+        "fp4": 2780799929426501.0,
+        "bandwidth_curve": [
+            [4096, 1530666480.1579611],
+            [8192, 3060989328.727323],
+            [16384, 6121244111.007896],
+            [32768, 12244140021.858593],
+            [65536, 24485718013.116013],
+            [131072, 48974729786.66798],
+            [262144, 104017760859.1218],
+            [524288, 208027305262.93582],
+            [1048576, 474430357731.4853],
+            [2097152, 909953098725.0911],
+            [4194304, 1564486569957.3643],
+            [8388608, 2747429481067.666],
+            [16777216, 5106961425379.4],
+            [33554432, 7379491450234.512],
+            [67108864, 9802761677897.846],
+            [134217728, 12245916103059.629],
+            [268435456, 13789455773461.098],
+            [536870912, 14891726350520.275],
+            [1073741824, 15201029898451.355],
+            [2147483648, 15644687861213.988],
+            [4294967296, 15777066512305.184],
+        ],
+        "link": 629989898092.7966,
+        "device.kernel_floor_s": [
+            1.3443179726600648e-06,
+            1.3400887489318846e-06,
+            1.349955356121063e-06,
+        ],
+        "interconnect.intra_node.link_latency_s": [
+            2.6227587461471556e-06,
+            2.5976027250289913e-06,
+            2.6680062055587767e-06,
+        ],
+    },
+    "d7dfcff22ef49192be8ba8f3a2a4b4fd5e475835fb9edf1ab412863ed1a4aceb",
+)
 
-def fragment(source: str, body: dict, origin: str, notes: str, date=DATE) -> Fragment:
-    stanza = {
-        "authored_by": base.AUTHOR,
-        "date": date,
-        "origin": origin,
-        "notes": notes,
-    }
-    document = {"schema_version": 1, "name": NAME, "provenance": stanza, **body}
-    return Fragment.from_mapping(document, source)
+#: What `PEAKS`'s record read on card 0 (the arch and the total torch reads, as
+#: an engine start reads it) and the stack it ran under; the host is the node's.
+DEVICE = {
+    "host": {"cpu": {"cores_physical": 128, "cores_logical": 256}},
+    "device": {
+        "arch": "gfx1250",
+        "memory": {"capacity_bytes": 309237645312},
+        "software_pinned_to": {
+            "rocm": "10.1.0",
+            "aiter": "99e4450b6",
+            "rccl": "2.30.4",
+            "torch": "2.11.0+rocm10.1.0a20260811-bkc.20260820",
+        },
+    },
+}
+
+#: No probe fills these: mi308x_spec's assumed values less what the datasheet
+#: states and what `PEAKS` fills.
+DECLARED = copy.deepcopy(base.DECLARED)
+for block, groups in DATASHEET.items():
+    for group, values in groups.items():
+        for key in values if isinstance(values, dict) else ():
+            DECLARED[block][group].pop(key, None)
 
 
 def device_fragments() -> list[Fragment]:
-    """The datasheet's peaks, MI355X's ratios on them, and MI355X's values
-    carried over, each fragment's notes saying where its values came from."""
-    mi355x = MachineSpec.from_mapping(json.loads(MI355X.read_text()))
-    peak = DATASHEET["device"]["memory"]["bandwidth_bytes_per_s"]
-    scale = peak / mi355x.value("device.memory.bandwidth_bytes_per_s")
-    ratios = {p: v for p, v in mi355x.values.items() if "derate" in p.split(".")}
-    ratios["device.memory.bandwidth_curve"] = [
-        [size, rate * scale]
-        for size, rate in mi355x.value("device.memory.bandwidth_curve")
-    ]
-    carried = {p: v for p, v in mi355x.values.items() if p.startswith(CARRIED)}
-    sheet = (
-        "MI455X product page and brochure (07/26), read 2026-10-09; its 432 GB "
-        "of HBM4 as GiB, since MI355X's 288 GB reads 288 GiB less 16 MiB at a "
-        "real start and MI308X's 192 GB reads 192 GiB less 16 MiB"
+    """The probe record's device, the datasheet's peaks, the probed peaks, the
+    cards' PTL state, MI355X's intake terms and the assumed rest."""
+    date, root, _, record = PEAKS
+    subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
+    notes = f"probe_device.py's record at {root}"
+    sheet = "MI455X product page and brochure (07/26), read 2026-10-09"
+    datasheet = fragment("datasheet", DATASHEET, "datasheet", sheet, date=date)
+    assumed = fragment(
+        "assumed", DECLARED, "assumed", "no probe fills these", date=date
     )
-    arch = "LLVM's AMDGPUUsage lists gfx1250 for MI455X; AMD has not confirmed it"
-    never_ran = f"MI455X never ran: {MI355X.stem}'s"
+    probed, assumed = base.peaks(PEAKS, datasheet.values, assumed)
+    mi355x = MachineSpec.from_mapping(json.loads(MI355X.read_text()))
+    intake = {
+        "host": {
+            "http_intake": {
+                k: mi355x.value(f"host.http_intake.{k}")
+                for k in ("fixed_s", "per_byte_s")
+            }
+        }
+    }
+    carried = f"{MI355X.stem}'s, until a burst on MI455 fits them"
+    ptl = {"device": {"ptl": "disabled"}}
     return [
-        fragment("datasheet", DATASHEET, "datasheet", sheet, date="2026-10-09"),
-        fragment("arch", {"device.arch": "gfx1250"}, "assumed", arch),
-        fragment(
-            "ratios",
-            ratios,
-            "assumed",
-            f"{never_ran} derates, and its bandwidth curve over its datasheet "
-            "bandwidth times MI455X's",
-        ),
-        fragment(
-            "carried",
-            carried,
-            "assumed",
-            f"{never_ran} values where no datasheet states one: its probed kernel "
-            "floor and intra-node link latency, its host and stack, and the "
-            "inter-node link latency and router relay it assumes",
-        ),
+        fragment("device", DEVICE, "probed", notes, subject, date),
+        datasheet,
+        assumed,
+        fragment("ptl", ptl, "probed", "no card has a ptl directory", date=date),
+        fragment("intake", intake, "assumed", carried, date=date),
+        probed,
     ]
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path, default=MACHINES / f"{NAME}.json")
+    parser.add_argument("--model", action="append", help="repeats; default " + MODEL)
+    parser.add_argument("--sweep-from", type=Path, help="a document to reuse")
     args = parser.parse_args(argv)
-    merged = merge(device_fragments())
+    sweeps = [saved(args.sweep_from)] if args.sweep_from else []
+    if args.model or not sweeps:
+        sweeps += swept(args.model or [MODEL])
+    merged = merge([*sweeps, *device_fragments()])
     verdict = validate(merged.document)
     print(verdict)
     if not verdict.ok:
         return 1
+    base.refuse_unbanded(MachineSpec.from_mapping(merged.document))
     args.out.write_text(json.dumps(merged.document, indent=2) + "\n")
     print(base.report(merged))
     return 0

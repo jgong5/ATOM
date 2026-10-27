@@ -6,6 +6,7 @@ priced at another's probed ratios, the method's error on its own records.
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -20,9 +21,12 @@ from atom.compass.spec import MachineSpec, SpecRefusal
 from atom.compass.validate import bound, project
 
 MACHINES = SCRIPTS / "machines"
-MI308X, MI355X, MI455 = (
-    MACHINES / f"{name}.json" for name in ("mi308x-hjbog18", "mi355x-gpu45", "mi455")
+MI308X, MI355X = (
+    MACHINES / f"{name}.json" for name in ("mi308x-hjbog18", "mi355x-gpu45")
 )
+#: MI455 as it stood before any engine ran on it: MI355X's probed ratios on
+#: MI455X's datasheet, the spec stage 3c projected on.
+MI455 = Path(__file__).parent / "mi455_stage3c.json"
 
 
 def spec(path):
