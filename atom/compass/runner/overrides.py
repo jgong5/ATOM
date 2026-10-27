@@ -790,17 +790,28 @@ def publish_planned_transfer(runner: Any) -> None:
 
 
 def _transferred_slot_bytes(runner: Any) -> int:
-    """One entry of the per-request slot class `get_num_blocks` planned, when
-    the runner's attention builder publishes that whole slot as a transfer
-    region, as DeepSeek-V4's does (`get_kv_transfer_tensors`); 0 for every
-    other builder. A Qwen GDN hybrid plans a slot its regions do not carry."""
+    """The state slot a transfer moves beside a request's blocks, as the
+    runner's attention builder publishes it in its transfer regions
+    (`get_kv_transfer_tensors`, which needs an allocated cache, so the slot is
+    read off the plan): for DeepSeek-V4's builder, one entry of the
+    per-request slot class `get_num_blocks` planned; for Kimi's, one unit of
+    each KDA state region (`state_slot_regions`), the GDN state entry without
+    the kpool tail Kimi's builder plans in it, plus ReplaySSM's int32 cursor;
+    0 for every other builder. A Qwen GDN hybrid plans a slot its regions do
+    not carry."""
     from atom.model_engine.kv_block import STATE_SLOT_CLASS
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
     )
+    from atom.model_ops.attentions.gdn_attn import GDNStateMixin
+    from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
 
-    if isinstance(runner.attn_metadata_builder, DeepseekV4AttentionMetadataBuilder):
+    builder = runner.attn_metadata_builder
+    if isinstance(builder, DeepseekV4AttentionMetadataBuilder):
         return runner.pool_plan.entry_bytes[STATE_SLOT_CLASS]
+    if isinstance(builder, _KimiMLAGDNCommon):
+        cursor = torch.int32.itemsize if builder.replayssm else 0
+        return GDNStateMixin.state_spec(builder).entry_bytes + cursor
     return 0
 
 

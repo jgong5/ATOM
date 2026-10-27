@@ -1827,7 +1827,8 @@ and receives both run on the engine's step loop, and no worker takes part.
   was back at their median (#1172). RDMA is unmeasured. `bytes` is exactly computable from block count x
   per-block bytes — no measurement needed. Mooncake moves a DeepSeek-V4 request's
   state slot beside its blocks, then its compressor state again from a staging row
-  in a second write that pays `latency` again (#2325, #2341). `latency` and `bandwidth` are
+  in a second write that pays `latency` again (#2325, #2341), and a Kimi-K3
+  request's KDA state slot beside its blocks (#2342). `latency` and `bandwidth` are
   configuration (`05`, the `interconnect` link the run file's `kv_link` names),
   satisfying the "interconnect is configurable" requirement directly.
 - **Decode** posts the write request in `update_state_after_alloc` (called from
