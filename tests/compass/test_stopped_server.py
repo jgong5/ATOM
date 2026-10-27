@@ -25,7 +25,6 @@ import os
 import pickle
 import queue
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -47,6 +46,7 @@ from atom.model_engine.sequence import SequenceStatus
 from atom.utils import clock, get_open_zmq_ipc_path, make_zmq_socket, zmq_shim
 from atom.utils.clock import LPRuntime, WrappedSocket
 from atom.utils.compass_loop import CompassEventLoop
+from tests.compass.held_ports import held_ports
 
 with stubbed_aiter():
     from atom.model_engine.engine_core import EngineCore
@@ -172,24 +172,11 @@ def _answers(port: int) -> bool:
 
 
 @contextlib.contextmanager
-def _held_port():
-    """A port on 127.0.0.1, held until leaving by a socket that sets
-    SO_REUSEADDR and never listens. The server's listener, uvicorn's or ZMQ's,
-    sets it too and binds the port beside the holder; a plain bind elsewhere,
-    as a port draw in a parallel gate makes, fails on it, and a bind to port 0
-    never returns it."""
-    with socket.socket() as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("127.0.0.1", 0))
-        yield s.getsockname()[1]
-
-
-@contextlib.contextmanager
 def _serve(tmp_path, script, *argv):
     """`script` as a co-hosting simulated server on ports held for it, in a
     session of its own, once ``/health`` answers: its process, port and log.
     Leaving kills what is left of its process group."""
-    with _held_port() as clock_port, _held_port() as port:
+    with held_ports(2) as (clock_port, port):
         run_file = tmp_path / "run.json"
         run_file.write_text(
             json.dumps(
