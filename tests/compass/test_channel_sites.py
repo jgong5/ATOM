@@ -46,8 +46,8 @@ MGR = ("CoreManager.__init__", "DisaggCoreManager.__init__._connect_proc")
 SITES = {
     "PPStageTransport.send_metadata": (("meta",), ENGINE),
     "PPStageTransport.recv_metadata": (("meta",), ENGINE),
-    "PPStageTransport.send_tokens": (("tokens",), ENGINE),
-    "PPStageTransport.recv_tokens": (("tokens",), ENGINE),
+    "PPStageTransport.send_completion": (("tokens",), ENGINE),
+    "PPStageTransport.recv_completion": (("tokens",), ENGINE),
     "PPStageTransport.send_kv_status": (("kv_status",), ENGINE),
     "PPStageTransport.recv_kv_status": (("kv_status",), ENGINE),
     "EngineCore.process_input_sockets": (("request", "control"), ENGINE),
@@ -283,8 +283,8 @@ def test_pp_stages_talk_through_their_wrapped_sockets(monkeypatch):
     head = _stage(monkeypatch, table, 0, 2, last._ctx)
     head.send_metadata("batch")
     assert last.recv_metadata(timeout_ms=5000) == "batch"
-    last.send_tokens("out")
-    assert head.recv_tokens(timeout_ms=5000) == "out"
+    last.send_completion([7], "out")
+    assert head.recv_completion(timeout_ms=5000) == ((7,), "out")
     last.send_kv_status("kv")
     assert head.recv_kv_status(timeout_ms=5000) == [(1, "kv")]
     socks = (*head._meta_send, head._token_recv, head._kv_status_recv)

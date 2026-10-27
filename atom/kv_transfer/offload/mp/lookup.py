@@ -218,7 +218,7 @@ class _MPLookupClient:
         The clock starts on first sight when `discard` did not start it: a
         `lookup()` timeout orphans a lookup without a timestamp.
         """
-        now = time.monotonic()
+        now = clock.now(time.monotonic)
         return now - self._orphan_since.setdefault(lookup_id, now) > _ORPHAN_TIMEOUT_S
 
     def _requery_orphan_status(self, lookup_id: str) -> bool:
@@ -342,7 +342,7 @@ class _MPLookupClient:
         if lookup_id in self._async:
             # Still in flight: its locks exist only once it answers.
             self._orphans.add(lookup_id)
-            self._orphan_since.setdefault(lookup_id, time.monotonic())
+            self._orphan_since.setdefault(lookup_id, clock.now(time.monotonic))
             return
         if lookup_id in self._async_tokens:
             self._try_release_unconsumed(lookup_id)
