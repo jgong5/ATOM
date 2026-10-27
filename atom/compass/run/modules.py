@@ -61,7 +61,8 @@ DeepSeek-V4's modules, each priced and then gone into:
   experts picked by phase, are unclassified.
 
 DeepSeek-V4.1's, each priced and then gone into, the KV and index caches at
-the formats ATOM's config states:
+the formats ATOM's config states; its attention under a KV cache neither
+bf16 nor fp4 is unclassified:
 
 - a linear with native group-32 weights (`native_a8_group_rows`): its
   product quantizes its input to fp8, so it reads fp8 activations.
@@ -293,7 +294,8 @@ def _classify(module, name, parent):
         mix = Module(name, "mhc", (module.hc_attn_fn.shape[1] // width, width))
         return mix, mix, DESCEND
     if _is(module, V41_ATTENTION):
-        return (*_csa2(module, name), DESCEND)
+        found = _csa2(module, name)
+        return found and (*found, DESCEND)
     if _is(module, DSPARK):
         return (*_dspark(module, name), DESCEND)
     if _is(module, V4 + "DeepseekV4Attention"):
@@ -375,10 +377,13 @@ def _csa2(module, name):
     attention, or the sparse attention of its layer's mode; and where it
     compresses, the index keys it writes. The caches are at the formats
     ATOM's config states: the KV pool bf16 or fp4, a draft's window bf16 or
-    beside an fp4 pool fp8, the index plane fp8 or fp4."""
+    beside an fp4 pool fp8, the index plane fp8 or fp4. None under a KV
+    cache of another format."""
     from atom.config import get_current_atom_config
 
     config = get_current_atom_config()
+    if config.kv_cache_dtype not in ("bf16", "fp4"):
+        return None
     hf, spec, ix = config.hf_config, module.spec, module.indexer
     q, kv = (n.weight.shape[0] for n in (module.q_norm, module.kv_norm))
     found = [Module(f"{name}.qk_norm", "norm", (q + kv, q))]

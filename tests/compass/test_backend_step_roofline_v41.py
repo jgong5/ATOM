@@ -249,7 +249,9 @@ for name, step in steps.items():
     priced[name] = [{t.name: t.seconds for t in terms}
                     for terms in (cost.terms, cost.draft_terms)]
 found = [[m.draft, m.replay, m.kind, m.dims, m.fmt, m.act] for m in modules]
-print(json.dumps({"kept": kept, "modules": found, "priced": priced}))
+config.kv_cache_dtype = "fp8"  # a pool format the walk does not price
+other = [m.name for m in walk(tree, draft) if m.kind == "unclassified"]
+print(json.dumps({"kept": kept, "modules": found, "priced": priced, "fp8": other}))
 """
 
 
@@ -289,6 +291,11 @@ def test_the_v41_flash_tp4_dspark_build_classifies_every_module(built):
 
     assert done["kept"]
     assert not [m for m in found if m[2] == "unclassified"]
+    # Under a KV cache of another format the attention is refused, by name.
+    assert done["fp8"] == [
+        "Attention at layers.0.attn",
+        "DraftAttention at drafter.mtp.0.attn",
+    ]
     # Two mixes a block: the first decoder layer's and the decoder's on the
     # window, the last layer's on its last row.
     assert counted[0, 0, "mhc", (4, 5120)] == 2 * 20
