@@ -372,8 +372,9 @@ def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
     built in a package whose whole import closure `test_kv_budget.py` holds
     free of any tensor library. `capture_sizes` and `capture_sizes_np` are the
     base's own ladder, rebound to a list of ints and a host int32 array as
-    ATOM's capture rebinds them. Anything else appearing here is a tensor this
-    class put on a device, which is the thing it exists not to do.
+    ATOM's capture rebinds them, and `tbo_decode_graphs` the bool its capture
+    sets. Anything else appearing here is a tensor this class put on a device,
+    which is the thing it exists not to do.
     """
     overrides = _classes(PACKAGE / "overrides.py")["NonAllocatingRunner"]
     bound = {n for n, _ in _self_assigned(overrides)}
@@ -383,6 +384,7 @@ def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
         "kv_pool_sizing",
         "capture_sizes",
         "capture_sizes_np",
+        "tbo_decode_graphs",
     }
 
 

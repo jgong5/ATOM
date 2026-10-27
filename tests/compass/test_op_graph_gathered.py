@@ -102,7 +102,7 @@ def view(batch, counts, split=None, unified=False, rung=None):
     r = runner(None, dp_size=DP)
     r.drafter = None
     sync = SimpleNamespace(
-        num_tokens_across_dp=torch.tensor(counts), ub_tokens_across_dp=split
+        scheduled_tokens_per_dp_rank=torch.tensor(counts), ub_tokens_across_dp=split
     )
     mode = SimpleNamespace(
         sync=sync,
