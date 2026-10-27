@@ -191,6 +191,49 @@ def test_fp4_is_timed_through_the_library_that_runs_and_names_the_one_that_faile
     assert found["fp4"] == 2 * 16384 * 8192**2 / 2e-3
 
 
+def test_the_triton_tile_is_the_fastest_within_one_percent_of_torch(monkeypatch):
+    import torch
+
+    expected = torch.ones(4, 4)
+    off, broken, slow, fast = probe.TILES[False][:4]
+    outputs = {off: expected * 1.02, slow: expected, fast: expected * 1.005}
+    seconds = {off: 1e-4, slow: 3e-3, fast: 2e-3}
+
+    launched = {}
+
+    def triton(torch, operands, tile):
+        if tile == broken:
+            raise RuntimeError("no tile of that size on this arch")
+
+        def call():
+            pass
+
+        launched[call] = tile
+        return call, outputs.get(tile, expected * 9)
+
+    monkeypatch.setattr(probe, "_triton", triton)
+    monkeypatch.setattr(
+        probe, "_timed", lambda torch, call, reps: [seconds.get(launched[call], 1)]
+    )
+    failed = {}
+    assert (
+        probe._tile(torch, ("x", "w"), lambda: expected, "triton bf16", failed) == fast
+    )
+    assert failed == {}
+    # MXFP4 with no torch output to check against is not timed, and is named.
+    assert (
+        probe._tile(torch, ("x", "sx", "w", "sw"), None, "triton fp4", failed) is None
+    )
+    assert failed == {"triton fp4": "no torch output to check it against"}
+
+
+def test_a_format_takes_triton_s_rate_where_it_is_faster():
+    triton = {"bf16": {"8192x8192x8192": [1e-4]}, "fp8": {}}
+    found = probe.readings(RECORD | {"triton": triton})
+    assert found["bf16"] == 2 * 8192**3 / 1e-4
+    assert found["fp8"] == probe.readings(RECORD)["fp8"]
+
+
 def test_a_card_on_which_no_fp4_gemm_runs_is_refused_naming_each_error():
     def raising(error):
         def call():
