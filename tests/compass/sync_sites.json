@@ -4920,8 +4920,8 @@
    "shape": "executor_handoff",
    "peer": "thread",
    "why": "starts OpenTelemetry tracing on a worker thread before the server takes requests",
-   "mechanism": "K9",
-   "mechanism_why": "at startup, before the simulated window"
+   "mechanism": "K1",
+   "mechanism_why": "a job on the frontend LP's default-executor station, charged no service time: the frontend's run begins at its loop's first select, before the lifespan starts tracing"
   },
   {
    "id": "atom/entrypoints/openai/api_server.py::lifespan::asyncio.to_thread(shutdown_tracing)::executor_handoff#0",
@@ -4932,8 +4932,8 @@
    "shape": "executor_handoff",
    "peer": "thread",
    "why": "flushes and stops OpenTelemetry tracing on a worker thread as the server leaves",
-   "mechanism": "K9",
-   "mechanism_why": "at shutdown, after the simulated window"
+   "mechanism": "K1",
+   "mechanism_why": "a job on the frontend LP's default-executor station, charged no service time: the station stays open after the finish, when the lifespan flushes tracing"
   },
   {
    "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._enqueue_write_requests::threading.Thread( target=self._write_request_loop, name=\"mooncake-write-request\", daemon=True, )::thread_start#0",
