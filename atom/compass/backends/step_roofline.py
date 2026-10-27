@@ -66,7 +66,13 @@ from atom.compass.backends.base import CostBackend, Granularity
 from atom.compass.backends.cost import CostTerm, StepCost, fold_parts, fold_seconds
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostRefused
-from atom.compass.backends.shape import IMAGES, BatchView, RequestShape, sum_tokens
+from atom.compass.backends.shape import (
+    IMAGES,
+    BatchView,
+    RequestShape,
+    sum_context,
+    sum_tokens,
+)
 from atom.compass.backends.work import (
     COMM,
     ELEMENT_BYTES,
@@ -105,8 +111,10 @@ class Module:
     elements a token), `attention` (heads, KV heads, head dim),
     `linear_attention` (value heads, key heads, key dim, value dim), `mhc`
     (residual copies, width), `sparse_attention` (heads, head dim, window,
-    compression ratio, indexer top k, heads and head dim), `moe` as
-    `run.modules` reads it. `fmt` is its weight, KV or state format, `act` the
+    compression ratio, indexer top k, heads and head dim), `mla_attention`
+    (heads, the decode kernel's padded heads, latent, rope, no-rope and value
+    widths), `mla_up` (heads, no-rope and value widths, latent width), `moe`
+    as `run.modules` reads it. `fmt` is its weight, KV or state format, `act` the
     format its matrix products read activations in; `ranks` the group of the
     collective it joins, 1 for none; `fused` that the collective runs in the
     module's kernel; `layer` the decoder layer it sits in, -1 outside them;
@@ -142,6 +150,10 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
         return Work({ACT: 2 * tokens * mix * copies * width}, moved)
     if m.kind == "sparse_attention":
         return _sparse_attention(m, view.requests)
+    if m.kind == "mla_attention":
+        return _mla_attention(m, view)
+    if m.kind == "mla_up":
+        return _mla_up(m, view, tokens - sum_tokens(view.prefill))
     if m.kind == "lm_head":
         if not sampled:
             return None
@@ -171,6 +183,59 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
     return Work({ACT: 4 * real * vh * dk * dv}, moved)
 
 
+def _pairs(rows) -> int:
+    """The query-key pairs of causal attention over `rows`."""
+    return sum(
+        r.query_tokens * (2 * r.context_tokens - r.query_tokens + 1) // 2 for r in rows
+    )
+
+
+def _mla_attention(m: Module, view: BatchView) -> Work:
+    """MLA's attention kernels, as ATOM runs them.
+
+    Decode rows run one kernel over the latent cache, Q and KV at the cache's
+    format `fmt`: each of the kernel's padded heads scores a key at the latent
+    and rope widths and sums values at the latent width. Q and each request's
+    entries are read once, the latent output written in bf16. Prefill rows
+    run bf16 attention at the rank's heads over the up-projected keys and
+    values of each request's context: QK at the no-rope and rope widths, PV
+    at the value width.
+    """
+    heads, padded, latent, rope, nope, v = m.dims
+    work = Work()
+    if rows := view.decode:
+        q, entry = sum_tokens(rows), latent + rope
+        moved = (q * padded + sum_context(rows)) * entry * ELEMENT_BYTES[m.fmt]
+        moved += q * padded * latent * ELEMENT_BYTES[ACT]
+        work += Work({m.fmt: 2 * padded * (entry + latent) * _pairs(rows)}, moved)
+    if rows := view.prefill:
+        width = nope + rope + v
+        moved = (sum_tokens(rows) + sum_context(rows)) * heads * width
+        work += Work(
+            {ACT: 2 * heads * width * _pairs(rows)}, moved * ELEMENT_BYTES[ACT]
+        )
+    return work
+
+
+def _mla_up(m: Module, view: BatchView, decoded: int) -> Work:
+    """MLA's up-projection of the latent KV, at `decoded` decode rows.
+
+    A decode step absorbs it into two fp8 batched GEMMs, one weight a head:
+    each query's no-rope part into the latent width, and the attention's
+    latent output out to the value width. A prefill step runs the linear, at
+    its formats, over each request's whole context, cached part included.
+    """
+    heads, nope, v, latent = m.dims
+    work = Work()
+    if view.decode:
+        rows = decoded * heads
+        work += grouped_gemm(rows, latent, nope, heads, "fp8", "fp8")
+        work += grouped_gemm(rows, v, latent, heads, "fp8", "fp8")
+    if rows := view.prefill:
+        work += gemm(sum_context(rows), heads * (nope + v), latent, m.act, m.fmt)
+    return work
+
+
 def _moe(m: Module, view: BatchView, tokens: int) -> tuple[Work, Work, Work]:
     """The exchange before the routed experts, the experts, and the exchange
     after, routing uniform and independent.
@@ -179,12 +244,14 @@ def _moe(m: Module, view: BatchView, tokens: int) -> tuple[Work, Work, Work]:
     busiest rank's expected share, in one kernel: it reads each expert a row
     reaches once, weights and scales, and its routes' share of the rows'
     input, output, top-k ids and weights; the gate-up output never leaves it.
-    On one data-parallel rank the output is all-reduced. Over a group, the
+    On one data-parallel rank the output is all-reduced over the module's
+    `ranks`, 1 where its block leaves that to the next norm. Over a group, the
     hidden states and router logits are gathered and the output scattered
     back; under expert parallelism MoRI sends each of this rank's tokens once
     to every rank holding one of its experts, and back.
     """
-    experts, local, k, inter, hidden, ranks, dp, _, held = m.dims
+    experts, local, k, inter, hidden, ranks, dp, _, held = m.dims[:9]
+    shared = m.dims[9] if len(m.dims) > 9 else 0
     rows, act = view.moe_rows if dp > 1 else tokens, ELEMENT_BYTES[ACT]
     real = view.moe_tokens if dp > 1 else sum_tokens(view.requests)
     # Pad rows all carry token 0 at position 0, so they route as one token.
@@ -192,12 +259,15 @@ def _moe(m: Module, view: BatchView, tokens: int) -> tuple[Work, Work, Work]:
     routed, groups = rows * k, activated_experts(experts, k, distinct)
     if local < experts:
         routed, groups = max_rank_load(rows, k, experts, ranks), groups / ranks
-    flops = grouped_gemm(routed, 2 * inter, hidden, groups, m.act, m.fmt)
-    flops += grouped_gemm(routed, hidden, inter, groups, m.act, m.fmt)
-    row = hidden * (ELEMENT_BYTES[m.wire[0]] + act) + 2 * k * ELEMENT_BYTES["fp32"]
+    # Every row also runs through each shared expert the kernel holds.
+    picks, groups = routed + rows * shared, groups + shared
+    flops = grouped_gemm(picks, 2 * inter, hidden, groups, m.act, m.fmt)
+    flops += grouped_gemm(picks, hidden, inter, groups, m.act, m.fmt)
+    ids = 2 * (k + shared) * ELEMENT_BYTES["fp32"]
+    row = hidden * (ELEMENT_BYTES[m.wire[0]] + act) + ids
     work = Work(flops.flops_by_format, groups * held + routed / k * row)
     if dp == 1:
-        return Work(), work, allreduce(ranks, tokens * hidden * act)
+        return Work(), work, allreduce(m.ranks, tokens * hidden * act)
     if local == experts:
         gather = allgather(dp, rows * (hidden + experts) * act)
         return gather, work, reduce_scatter(dp, rows * hidden * act)

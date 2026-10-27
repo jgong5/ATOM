@@ -634,14 +634,24 @@ class FactoriesOnMeta(TorchFunctionMode):
     GPU -- would still allocate there and bring up a device context. The
     functions are the ones `torch.device` itself redirects, `torch.zeros` and
     `torch.tensor` among them; a `*_like` or `Tensor.new_*` call keeps the
-    device it names.
+    device it names. A meta tensor's `Tensor.to` a named device stays on meta:
+    ATOM's MLA attention copies its KV scale to this rank's GPU that way.
     """
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         if func in _device_constructors():
             kwargs["device"] = "meta"
+        elif func is torch.Tensor.to and args[0].is_meta:
+            args = (args[0], *("meta" if _names_device(a) else a for a in args[1:]))
+            if "device" in kwargs:
+                kwargs["device"] = "meta"
         return func(*args, **kwargs)
+
+
+def _names_device(arg: Any) -> bool:
+    """Whether a positional argument of `Tensor.to` names a device."""
+    return isinstance(arg, (str, torch.device)) or type(arg) is int
 
 
 def process_weights_after_loading(tree: torch.nn.Module) -> None:
