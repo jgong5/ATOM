@@ -19,11 +19,11 @@ import http.client
 import json
 import math
 import os
-import socket
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -64,12 +64,6 @@ CONSTANT = dataclasses.asdict(Coefficients.constant(2.0**-9, 2.0**-11))
 
 class UnansweredRequests(AssertionError):
     """The run finished with requests that never had their final response."""
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _retry(what, server, attempt):
@@ -206,8 +200,11 @@ class Traffic:
 
 
 def _run_file(out: Path, **overrides) -> Path:
+    """`out`'s run file with `overrides`. Its default clock endpoint is
+    in-process and takes no port; a run whose authority another process serves
+    names one on a held port."""
     run = {
-        "clock_endpoint": f"tcp://127.0.0.1:{_free_port()}",
+        "clock_endpoint": f"inproc:{uuid.uuid4().hex}",
         "bound_s": 600.0,
         "admission_path": "serving",
         "ipc_s": 2.0**-14,
