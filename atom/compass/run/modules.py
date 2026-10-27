@@ -7,7 +7,8 @@ back one `Module` per module that works on a step, its dims read off the
 module's own per-rank parameter shapes and attributes:
 
 - a linear class (`LinearBase`, `torch.nn.Linear`): a GEMM of its weight,
-  joining an all-reduce over its TP group when it reduces its result. A
+  joining an all-reduce over its TP group when it reduces its result, its
+  input width counting both elements of each byte an fp4 weight packs. A
   weight that is not a matrix is the kernel of a depthwise causal convolution
   (GDN keeps its `conv1d` in a column-parallel linear): one pass over its
   channels.
@@ -310,7 +311,7 @@ def _classify(module, name, parent):
         attn = Module(name, "sparse_attention", dims, "fp8", act=q, index=index)
         return attn, DESCEND
     if _is(module, V4 + "Expert"):
-        return Module(name, "act", (module.w2.weight.shape[1],)), DESCEND
+        return Module(name, "act", (_in_width(module.w2),)), DESCEND
     if _is(module, OPS + "moe.FusedMoE"):
         return _moe(module, name, parent)
     if _is(module, OPS + "embed_head.ParallelLMHead"):
@@ -337,8 +338,9 @@ def _classify(module, name, parent):
             if envs.ATOM_USE_TRITON_MXFP4_BMM:
                 return None
             dims = (mla.num_heads, mla.qk_nope_head_dim, mla.v_head_dim)
-            return Module(name, "mla_up", dims + (weight.shape[1],), fmt, act=act)
-        return Module(name, "gemm", tuple(weight.shape), fmt, ranks, act=act)
+            return Module(name, "mla_up", dims + (_in_width(module),), fmt, act=act)
+        dims = (weight.shape[0], _in_width(module))
+        return Module(name, "gemm", dims, fmt, ranks, act=act)
     if _is(module, *NORMS):
         if parent is not None and _is(parent, V4 + "Block"):
             return NOTHING
@@ -362,14 +364,18 @@ def _classify(module, name, parent):
         return state and Module(name, "linear_attention", dims, state)
     if _is(module, OPS + "activation.SiluAndMul"):
         down = [c for c in parent.children() if _is(c, ROW)]
-        return (
-            len(down) == 1 and Module(name, "act", (down[0].weight.shape[1],)) or None
-        )
+        return len(down) == 1 and Module(name, "act", (_in_width(down[0]),)) or None
     if _is(module, VISION, V4_ROPE, *V41_SILENT):
         return NOTHING
     if type(module).__module__.startswith(SILENT):
         return NOTHING
     return DESCEND if next(module.children(), None) is not None else None
+
+
+def _in_width(linear) -> int:
+    """`linear`'s input width: an fp4 weight packs two of it to a byte."""
+    weight = linear.weight
+    return weight.shape[1] * (2 if weight.dtype == torch.float4_e2m1fn_x2 else 1)
 
 
 def _csa2(module, name):
