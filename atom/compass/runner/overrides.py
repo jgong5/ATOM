@@ -774,6 +774,7 @@ class UnbuiltModel(torch.nn.Module):
 def publish_planned_transfer(runner: Any) -> None:
     """Publish one entry of the paged class `get_num_blocks` planned, the state
     slot a transfer moves beside a request's blocks (`_transferred_slot_bytes`),
+    the staging row a second write moves after them (`_staging_row_bytes`),
     and the runner's TP width, at the file `compass_block_file` names, which
     `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
     prices a transfer at them."""
@@ -783,7 +784,9 @@ def publish_planned_transfer(runner: Any) -> None:
         plan = runner.pool_plan
         tp = runner.config.tensor_parallel_size
         slot = _transferred_slot_bytes(runner)
-        run.publish_transfer(path, plan.entry_bytes[plan.paged_class], tp, slot)
+        staging = _staging_row_bytes(runner)
+        block = plan.entry_bytes[plan.paged_class]
+        run.publish_transfer(path, block, tp, slot, staging)
 
 
 def _transferred_slot_bytes(runner: Any) -> int:
@@ -799,6 +802,28 @@ def _transferred_slot_bytes(runner: Any) -> int:
     if isinstance(runner.attn_metadata_builder, DeepseekV4AttentionMetadataBuilder):
         return runner.pool_plan.entry_bytes[STATE_SLOT_CLASS]
     return 0
+
+
+def _staging_row_bytes(runner: Any) -> int:
+    """One entry of DeepSeek-V4's compressor state, the row its builder stages
+    a request's state through for prefill-decode (`allocate_per_req_cache`)
+    and Mooncake writes after the request's blocks and slot; 0 when the
+    builder stages nothing: another builder, a connector that needs no
+    staging, or an empty staging pool."""
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+        _uses_pd_staging,
+    )
+    from atom.model_ops.attentions.pool_layout.entry_arena import entry_bytes_for
+
+    builder = runner.attn_metadata_builder
+    if not (
+        isinstance(builder, DeepseekV4AttentionMetadataBuilder)
+        and _uses_pd_staging(runner.config.kv_transfer_config)
+        and int(os.environ.get("ATOM_PD_STAGING_POOL", "32")) > 0
+    ):
+        return 0
+    return sum(entry_bytes_for(fields) for fields in builder._arena_planes)
 
 
 def _refused(method: str):
@@ -1171,8 +1196,8 @@ class NonAllocatingRunner(
         the card being modelled; `kv_pool_sizing` keeps the count beside the
         readings, so which terms those were is recoverable from the runner and
         not only from a log line somebody kept. On a prefill-decode run the
-        planned block and transferred state slot are published as well
-        (`publish_planned_transfer`).
+        planned block, transferred state slot and staging row are published as
+        well (`publish_planned_transfer`).
 
         The decode process of intra-GPU prefill/decode disaggregation is
         refused rather than sized. ATOM's own runner for that answers a block

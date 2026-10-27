@@ -1825,7 +1825,9 @@ and receives both run on the engine's step loop, and no worker takes part.
   zero when absent: on node 18 Mooncake TCP every first write of 2 to 7 blocks on a
   pair took 9.0 to 28.1 ms longer than the pair's later writes, and its second write
   was back at their median (#1172). RDMA is unmeasured. `bytes` is exactly computable from block count x
-  per-block bytes — no measurement needed. `latency` and `bandwidth` are
+  per-block bytes — no measurement needed. Mooncake moves a DeepSeek-V4 request's
+  state slot beside its blocks, then its compressor state again from a staging row
+  in a second write that pays `latency` again (#2325, #2341). `latency` and `bandwidth` are
   configuration (`05`, the `interconnect` link the run file's `kv_link` names),
   satisfying the "interconnect is configurable" requirement directly.
 - **Decode** posts the write request in `update_state_after_alloc` (called from
