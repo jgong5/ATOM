@@ -773,11 +773,11 @@ class UnbuiltModel(torch.nn.Module):
 
 def publish_planned_transfer(runner: Any) -> None:
     """Publish one entry of the paged class `get_num_blocks` planned, the state
-    slot a transfer moves with a request's blocks or after them
-    (`_transferred_slot`), the staging row a second write moves after them
-    (`_staging_row_bytes`), and the runner's TP width, at the file
-    `compass_block_file` names, which `run.runner` gives TP rank 0 of a
-    prefill-decode deployment: its connector prices a transfer at them."""
+    slot a transfer moves beside a request's blocks (`_transferred_slot`),
+    the staging row a second write moves after them (`_staging_row_bytes`),
+    and the runner's TP width, at the file `compass_block_file` names, which
+    `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
+    prices a transfer at them."""
     if path := getattr(runner, "compass_block_file", None):
         from atom.compass import run
 
@@ -790,18 +790,12 @@ def publish_planned_transfer(runner: Any) -> None:
 
 
 def _transferred_slot(runner: Any) -> tuple[int, bool]:
-    """The state slot a transfer moves, and whether Mooncake writes it after
-    the request's blocks rather than with them, as the runner's attention
-    builder publishes it in its transfer regions (`get_kv_transfer_tensors`,
-    which needs an allocated cache, so the slot is read off the plan).
-
-    DeepSeek-V4's builder publishes one entry of the per-request slot class
-    `get_num_blocks` planned as SWA-ring regions, written with the blocks.
-    Kimi's publishes one unit of each KDA state region (`state_slot_regions`),
-    written after the blocks: the GDN state entry without the kpool tail
-    Kimi's builder plans in it, plus ReplaySSM's int32 cursor. Every other
-    builder publishes none; a Qwen GDN hybrid plans a slot its regions do not
-    carry."""
+    """The state slot a transfer moves and whether Mooncake writes it after the
+    blocks, read off the plan as the builder's regions carry it: DeepSeek-V4's
+    planned slot entry, with the blocks; one unit of each of Kimi's KDA state
+    regions (`state_slot_regions`), after them, its GDN state entry without the
+    kpool tail plus ReplaySSM's int32 cursor; none for any other builder. A
+    Qwen GDN hybrid plans a slot its regions do not carry."""
     from atom.model_engine.kv_block import STATE_SLOT_CLASS
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,

@@ -612,10 +612,9 @@ def publish_transfer(
     staging_bytes: int = 0,
     slot_after_blocks: bool = False,
 ) -> None:
-    """Write one paged KV block's bytes, the state slot a transfer moves with
-    a request's blocks, or after them when `slot_after_blocks`, and the
-    staging row it moves in a second write, as a runner at TP `tp` planned
-    them, where `_planned_transfer` reads them."""
+    """Write one paged KV block's bytes, the state slot a transfer moves beside
+    a request's blocks, or after them, and the staging row it moves in a second
+    write, as a runner at TP `tp` planned them, where `_planned_transfer` reads them."""
     planned = {
         "block_bytes": int(block_bytes),
         "tp": tp,

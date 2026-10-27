@@ -75,11 +75,10 @@ class TransferModel:
     `bandwidth_bytes_per_s` is what a transfer actually reaches, not what the
     link is rated at -- `from_spec` applies the derate before it gets here, so
     a model built by hand in a test states an achievable number too.
-    `slot_bytes` is the request's state slot, which every transfer moves with
-    its blocks, or in a second write once they complete when
-    `slot_after_blocks`; 0 for a model whose transfer carries none.
-    `staging_bytes` is the staging row the second write moves; 0 for a model
-    that stages nothing.
+    `slot_bytes` is the request's state slot, which every transfer moves beside
+    its blocks, or after them when `slot_after_blocks`; 0 for a model whose
+    transfer carries none. `staging_bytes` is the staging row a second write
+    moves once the first completes; 0 for a model that stages nothing.
     """
 
     latency_s: float
@@ -122,9 +121,8 @@ class TransferModel:
         slot_after_blocks: bool = False,
     ) -> TransferModel:
         """Price a block of *bytes_per_block*, and a state slot of
-        *slot_bytes*, written after the blocks when *slot_after_blocks*, and a
-        staging row of *staging_bytes* per transfer, on the *scope* link of
-        *spec*.
+        *slot_bytes* and a staging row of *staging_bytes* per transfer, on the
+        *scope* link of *spec*.
 
         The spec refuses a link it does not carry, and refuses a peak
         bandwidth whose derate is missing; both refusals travel out of here
