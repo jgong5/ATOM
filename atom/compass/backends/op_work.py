@@ -204,6 +204,12 @@ def _all_reduce(op, view, tp, kv) -> Work:
     return _boundary(op) + allreduce(tp, _bytes(op["args"]["tensor"]))
 
 
+def _fused_all_reduce_norm(op, view, tp, kv) -> Work:
+    """An all-reduce of `inp` fused with the residual add and RMSNorm after
+    it: the all-reduce's bytes, and each tensor read and written once."""
+    return _boundary(op) + allreduce(tp, _bytes(op["args"]["inp"]))
+
+
 def _all_gather(op, view, tp, kv) -> Work:
     gathered = math.prod(op["out"][0]) * _size(op["args"]["input"]["dtype"])
     return _boundary(op) + allgather(op["args"]["group_size"], gathered)
@@ -647,6 +653,7 @@ EXTRACTORS = {
     "aten.embedding.default": _gather("weight"),
     "aten.index.Tensor": _gather("self"),
     "aiter.all_reduce_.default": _all_reduce,
+    "aiter.fused_allreduce_rmsnorm_.default": _fused_all_reduce_norm,
     "_c10d_functional.all_gather_into_tensor.default": _all_gather,
     "_c10d_functional.broadcast.default": _broadcast,
     "_c10d_functional.wait_tensor.default": lambda op, view, tp, kv: None,
