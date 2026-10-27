@@ -285,6 +285,7 @@ def test_the_v41_flash_tp4_dspark_build_classifies_every_module(built):
     owner = (512, 32, 128)
     moe = (384, 96, 6, 2304) if ep else (384, 384, 6, 640)
     draft_moe = (128, 32, 3, 2304) if ep else (128, 128, 3, 640)
+    latents = ("gemm", (1792, 5120), "fp8", "fp8")
 
     assert done["kept"]
     assert not [m for m in found if m[2] == "unclassified"]
@@ -308,19 +309,21 @@ def test_the_v41_flash_tp4_dspark_build_classifies_every_module(built):
     # The compressing layers write index keys from every row, at fp8.
     assert found[0, 0, "index_keys", (128, 512, 2), "fp8", "bf16"] == 3
     assert found[0, 0, "index_keys", (128, 512, 1), "fp8", "bf16"] == 1
+    # The target's, whatever rows they run on.
+    target = collections.Counter()
+    for (draft, _, kind, dims), n in counted.items():
+        if not draft:
+            target[kind, dims] += n
     # The native group-32 linears read fp8: the Q and KV latents' GEMM.
-    assert (
-        sum(
-            n
-            for k, n in found.items()
-            if k[0] == 0 and k[2:] == ("gemm", (1792, 5120), "fp8", "fp8")
-        )
-        == 40
-    )
-    assert counted[0, 0, "norm", (1792, 1280)] == 20
-    assert (
-        sum(n for k, n in counted.items() if k[0] == 0 and k[2:] == ("moe", moe)) == 40
-    )
+    assert sum(n for k, n in found.items() if k[0] == 0 and k[2:] == latents) == 40
+    assert target["moe", moe] == 40
+    # Each layer's Q and KV norms in one launch, and the final norm: the
+    # block's run in its mixes, the compressor's and the indexer's in theirs.
+    assert {k[1]: n for k, n in target.items() if k[0] == "norm"} == {
+        (1792, 1280): 40,
+        (5120,): 1,
+    }
+    assert not target["gemm", (128, 512)]
     # The drafter: three stages over blocks of 5 attending the window, the
     # LM head and the sampler on a quarter of the vocabulary, and its KV pass
     # on the target's rows, on a replayed prefill's window as the decoder.
