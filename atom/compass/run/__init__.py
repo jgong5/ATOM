@@ -278,6 +278,8 @@ ACCEPTANCE_RECORD = "acceptance_record"
 AUTHORITY_FILE = "authority_endpoint.txt"
 #: Wall seconds the summary's writer waits for the server LPs' refusals.
 HAND_IN_WAIT_S = 300.0
+#: Wall seconds a prefill-decode engine waits for every engine's planned block.
+PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
 SUMMARY_SCHEMA_VERSION = 10
@@ -623,12 +625,12 @@ def _planned_transfer() -> tuple:
         for n in _hand_ins(run)
         if n.startswith(f"{ENGINE.name}-")
     }
-    deadline = time.monotonic() + HAND_IN_WAIT_S
+    deadline = time.monotonic() + PLANNED_BLOCK_WAIT_S
     while missing := [n for n, f in files.items() if not f.exists()]:
         if time.monotonic() > deadline:
             raise TimeoutError(
                 f"{', '.join(missing)} published no planned KV block in "
-                f"{HAND_IN_WAIT_S} wall seconds"
+                f"{PLANNED_BLOCK_WAIT_S} wall seconds"
             )
         time.sleep(0.1)
     # Each deployment member's stages: engine-P1-pp0.dp2 is stage 0 of

@@ -215,7 +215,7 @@ def test_an_engine_waits_a_bounded_time_for_the_others_blocks(
     served(decode_instances=2, router_in_s=2.0**-14)
     publish(tmp_path, "engine-P", 1000)
     publish(tmp_path, "engine-D0", 1000)
-    monkeypatch.setattr(compass_run, "HAND_IN_WAIT_S", 0.2)
+    monkeypatch.setattr(compass_run, "PLANNED_BLOCK_WAIT_S", 0.2)
     with pytest.raises(TimeoutError, match="^engine-D1 published no planned KV"):
         _connector("kv_producer")
 

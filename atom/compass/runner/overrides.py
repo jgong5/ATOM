@@ -759,8 +759,9 @@ class UnbuiltModel(torch.nn.Module):
 
 def publish_paged_block(runner: Any) -> None:
     """Publish one entry of the paged class `get_num_blocks` planned, and the
-    runner's TP width, at the file `compass_block_file` names: TP rank 0's of
-    a prefill-decode run, whose connector prices a transferred block at it."""
+    runner's TP width, at the file `compass_block_file` names, which
+    `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
+    prices a transferred block at it."""
     if path := getattr(runner, "compass_block_file", None):
         from atom.compass import run
 
