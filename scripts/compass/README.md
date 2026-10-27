@@ -11,7 +11,9 @@ on, because until 2026-09-20 it was not — see "Which tree a script acts on" be
 
 New to Compass? [QUICKSTART.md](QUICKSTART.md) takes a model from an empty store
 to a simulation graded against real runs, and `smoke_cell.sh` runs that path in
-about an hour.
+about an hour. `calibrate.sh OUT RECORD...` takes its calibration in one command,
+from the warm record to the fits, and resumes a stopped run; its variables are in
+its header.
 
 `$T` below is the tree a command acts on. Run from `/`, not inside another checkout,
 `PYTHONPATH=$T` makes `atom` that tree's; without it, `atom` is the image's `/app/ATOM`.
@@ -796,6 +798,13 @@ for a build.
 3. `compass fit steps --backend step-linear --form history $R/cal/c* --client-run
    $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M $S --out $R/fit` and
    `compass fit host` on the same inputs; each prints its store token.
+   Steps 1 to 3, after a warm record, are `calibrate.sh $R/cal 1 4 16` with
+   `MODEL`, `GPU`, `MACHINE`, `TRACES` and `AIPERF_PYTHON` set, its store
+   `$R/cal/store`; it prints the tokens, the law's held-out errors per band
+   and the `compass run` line of step 5. A RECORD after its concurrency names
+   the client's scenario, such as `"8 --trajectory-start-min-ratio 0
+   --trajectory-start-max-ratio 0"`, the first-turn record that gives the law
+   its decode rung 8.
 4. Real runs: per concurrency, two `compass record --gpu G --out
    $R/cell/c<C>/real<k> -- $ATOM`, each with `client.sh $R/cell/c<C>/real<k>
    --traces 0-255 --concurrency <C> --stop`, at most two GPUs at once.
