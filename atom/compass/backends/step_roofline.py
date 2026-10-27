@@ -22,6 +22,19 @@ rows the data-parallel group's gather carries (`moe_rows`), and under expert
 parallelism on the busiest rank's expected share of them; a graph's pad rows
 route as one token.
 
+A prefill that replays its decoder runs a module with a `replay` on each
+request that finishes its prompt, on its last `replay` rows, which attend
+only each other as their window; on none when the step samples nothing. A view
+does not say which rows finish, so one is counted, the least of every row's:
+a lower bound. A step with decode rows, a split or a data-parallel gather
+replays nothing.
+
+Drafter. A module with a `draft` width is a block drafter's: after the
+target, it runs once for each request that samples, on that many tokens:
+every decode row, or on a prefill one finishing row, counted as above. One
+whose `draft` is `CONTEXT` runs on the target's rows, writing the drafter's
+KV, and replays as the target's modules do.
+
 Two-batch overlap. A step the data-parallel group split (`tbo_tokens`) runs
 this rank's tokens as two micro-batches, cut at the first one's token count,
 a cut request's second part attending the first as history. Each layer's
@@ -35,7 +48,9 @@ bound that won, or for its collective, is neither from a datasheet nor
 probed, and `analytical` otherwise. Its `by_bound` holds each module's kernel
 seconds under its largest bound and its collectives' as `comm.latency` and
 `comm.transfer`, a fused module's under the largest of all (`work.binding`);
-``roofline.tbo``'s is empty.
+``roofline.tbo``'s is empty. A drafter's modules price the step's
+`draft_terms`, ``draft roofline.<kind>``, each at 0 s where it runs nothing,
+so a step under a drafter always states its draft.
 
 Refused: a step with image tokens, since nothing here prices the vision
 encoder that fills them; any step, while the walk found a module it could not
@@ -46,9 +61,9 @@ whose overlap no stream carries.
 
 `StepFallbackBackend` asks a backend first and the roofline only for a step
 that backend refuses, so a law with no vector for a step still prices it. The
-roofline's term carries what the first backend declined, which shows the
-fall-through in the record; the step is answered unless the roofline refuses
-it too. Both backends
+roofline's terms, its draft's too, carry what the first backend declined,
+which shows the fall-through in the record; the step is answered unless the
+roofline refuses it too. Both backends
 are step-level: there is no fallback across granularities, so a first backend
 of another granularity is refused at construction.
 """
@@ -100,6 +115,9 @@ ACT = "bf16"
 #: Kinds whose work is one pass over `dims[0]` elements a token.
 PASSES = ("embedding", "norm", "rotary", "conv")
 UNCLASSIFIED = "unclassified"
+#: The `draft` of a drafter's module that runs on the target's rows.
+CONTEXT = -1
+DRAFT = "draft "
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,19 +125,26 @@ class Module:
     """One module of one rank, as the walk read it off the meta build.
 
     `kind` picks its work; `dims` are its per-rank shapes in that kind's order:
-    `gemm` and `lm_head` (n, k), a pass (elements a token), `act` (output
+    `gemm` and `lm_head` (n, k), a pass (elements a token; a `norm`'s
+    second, those of them it writes in fp8), `act` (output
     elements a token), `attention` (heads, KV heads, head dim),
     `linear_attention` (value heads, key heads, key dim, value dim), `mhc`
     (residual copies, width), `sparse_attention` (heads, head dim, window,
-    compression ratio, indexer top k, heads and head dim), `mla_attention`
+    compression ratio, top k, indexer heads and head dim, then optionally the
+    most compressed entries the indexer scores), `mla_attention`
     (heads, the decode kernel's padded heads, latent, rope, no-rope and value
     widths), `mla_up` (heads, no-rope and value widths, latent width), `moe`
-    as `run.modules` reads it. `fmt` is its weight, KV or state format, `act` the
+    as `run.modules` reads it, `index_keys` (index dim, head dim, compression
+    ratio), `block_attention` (heads, head dim, window), `markov` (vocabulary
+    shard, rank, block width). `fmt` is its weight, KV or state format, `act` the
     format its matrix products read activations in; `ranks` the group of the
     collective it joins, 1 for none; `fused` that the collective runs in the
     module's kernel; `layer` the decoder layer it sits in, -1 outside them;
     `wire` the formats a `moe`'s all-to-all dispatch and combine send;
-    `index` the format a `sparse_attention`'s indexer scores at.
+    `index` the format a `sparse_attention`'s indexer scores at; `replay`
+    the rows of each finishing request a replayed prefill runs it on, 0 for
+    every row; `draft` a drafter's block width, `CONTEXT` for a drafter's
+    module on the target's rows, 0 for the target's.
     An unclassified module's `name` says what it is.
     """
 
@@ -133,6 +158,8 @@ class Module:
     layer: int = -1
     wire: tuple[str, str] = (ACT, ACT)
     index: str = "fp8"
+    replay: int = 0
+    draft: int = 0
 
 
 def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
@@ -150,6 +177,12 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
         return Work({ACT: 2 * tokens * mix * copies * width}, moved)
     if m.kind == "sparse_attention":
         return _sparse_attention(m, view.requests)
+    if m.kind == "index_keys":
+        return _index_keys(m, view.requests)
+    if m.kind == "block_attention":
+        return _block_attention(m, view.requests)
+    if m.kind == "markov":
+        return _markov(m, tokens)
     if m.kind == "mla_attention":
         return _mla_attention(m, view)
     if m.kind == "mla_up":
@@ -163,7 +196,10 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
         # ponytail: one pass over the module's own width; a per-head norm or
         # rotary touches heads times that, left out of this lower bound.
         width = tokens * d[0]
-        return elementwise(width, fmt=m.fmt) + allreduce(m.ranks, width * act)
+        moved = elementwise(width, fmt=m.fmt).bytes
+        if len(d) > 1:  # the part it writes in fp8, for the product it feeds
+            moved -= tokens * d[1] * (ELEMENT_BYTES[m.fmt] - ELEMENT_BYTES["fp8"])
+        return Work({}, moved) + allreduce(m.ranks, width * act)
     if m.kind == "act":
         return elementwise(tokens * d[0], reads=2)
     rows = view.requests
@@ -314,26 +350,83 @@ def _sparse_products(rows, heads, dim, q, kv, window, ratio, top=None) -> Work:
     return Work({_wider(q, kv): 4 * heads * dim * keys}, read * dim * ELEMENT_BYTES[kv])
 
 
-def _index_scores(rows, ratio, heads, dim, fmt) -> Work:
+def _index_scores(rows, ratio, heads, dim, fmt, cap=None) -> Work:
     """V4's indexer over `rows`: each new query scored against every
-    compressed entry before it, one product of `dim` per head at `fmt`, and
-    each request's entries read once at `dim` in `fmt`."""
-    _, _, scored, entries = _sparse_reads(rows, 0, ratio)
+    compressed entry before it, or its last `cap` where V4.1 scores only a
+    candidate set, one product of `dim` per head at `fmt`, and each request's
+    entries read once at `dim` in `fmt`."""
+    if cap:
+        scored, entries, _, _ = _sparse_reads(rows, 0, ratio, cap)
+    else:
+        _, _, scored, entries = _sparse_reads(rows, 0, ratio)
     return Work({fmt: 2 * heads * dim * scored}, entries * dim * ELEMENT_BYTES[fmt])
 
 
 def _sparse_attention(m: Module, rows) -> Work:
     """V4's attention (`_sparse_products`) at Q's format `act` and the KV's
-    `fmt`, at most the indexer's top `k` compressed entries where it has one,
-    which scores every compressed entry at `index`. Q is read at `act`, O
-    written in bf16."""
-    heads, dim, window, ratio, top, index_heads, index_dim = m.dims
-    top = top if index_heads else None
-    work = _sparse_products(rows, heads, dim, m.act, m.fmt, window, ratio, top)
+    `fmt`, at most the top `k` compressed entries where it has a top k, which
+    an indexer scores where it has one, every compressed entry, or at most its
+    `cap`, at `index`. Q is read at `act`, O written in bf16."""
+    heads, dim, window, ratio, top, index_heads, index_dim = m.dims[:7]
+    cap = m.dims[7] if len(m.dims) > 7 else None
+    work = _sparse_products(rows, heads, dim, m.act, m.fmt, window, ratio, top or None)
     if ratio and index_heads:
-        work += _index_scores(rows, ratio, index_heads, index_dim, m.index)
+        work += _index_scores(rows, ratio, index_heads, index_dim, m.index, cap)
     q = sum_tokens(rows) * heads * dim
     return work + Work({}, q * (ELEMENT_BYTES[m.act] + ELEMENT_BYTES[ACT]))
+
+
+def _index_keys(m: Module, rows) -> Work:
+    """V4.1's index keys: each compressed entry the step completes projected
+    from the head dim to the index dim in bf16, and written once at `fmt`.
+    Their norm and rotation are left out of this lower bound."""
+    index_dim, head_dim, ratio = m.dims
+    made = sum(r.context_tokens // ratio - r.cached_tokens // ratio for r in rows)
+    return gemm(made, index_dim, head_dim) + elementwise(
+        made * index_dim, reads=0, fmt=m.fmt
+    )
+
+
+def _block_attention(m: Module, rows) -> Work:
+    """DSpark's draft attention: each request's block of queries attends every
+    key of the block and the last `window` tokens of its context before it.
+    Q, O and the block's keys are bf16, the context is read once at `fmt`."""
+    heads, dim, window = m.dims
+    keys = held = 0
+    for r in rows:
+        context = min(r.cached_tokens, window)
+        keys += r.query_tokens * (context + r.query_tokens)
+        held += context
+    q, act = sum_tokens(rows), ELEMENT_BYTES[ACT]
+    moved = q * (2 * heads + 1) * dim * act + held * dim * ELEMENT_BYTES[m.fmt]
+    return Work({_wider(ACT, m.fmt): 4 * heads * dim * keys}, moved)
+
+
+def _markov(m: Module, tokens: int) -> Work:
+    """DSpark's sampler over this rank's vocabulary shard, once for each of
+    the block's positions: each request's Markov bias, the shard of a
+    (vocabulary, rank) table times its previous token's row, added to the LM
+    head's logits there and reduced to one (max, id) pair the TP group
+    gathers, in fp32."""
+    vocab, rank, width = m.dims
+    rows, act = tokens // width, ELEMENT_BYTES[ACT]
+    moved = (vocab * rank + rows * vocab + rows * rank) * act
+    pick = rows * 2 * ELEMENT_BYTES["fp32"] * m.ranks
+    position = Work({ACT: 2 * rows * vocab * rank}, moved) + allgather(m.ranks, pick)
+    return sum([position] * width, Work())
+
+
+def _finishing(view: BatchView) -> tuple[RequestShape, ...]:
+    """The prefill rows of `view` that finish their prompts, as far as a view
+    says: none when the step samples nothing, else one with the fewest tokens
+    and the shortest context of any row."""
+    if not view.produces_output or not view.prefill:
+        return ()
+    rows = view.prefill
+    least = RequestShape(
+        min(r.query_tokens for r in rows), min(r.context_tokens for r in rows), False
+    )
+    return (least,)
 
 
 def overlap(layers) -> float:
@@ -416,18 +509,17 @@ class StepRooflineBackend(CostBackend):
         self.padded = padded
         modules = tuple(modules)
         self.unclassified = [m.name for m in modules if m.kind == UNCLASSIFIED]
+        classified = [m for m in modules if m.kind != UNCLASSIFIED]
+        target = [m for m in classified if not m.draft]
         # Modules of one shape price alike: count them, price each shape once.
-        self.shapes = Counter(
-            dataclasses.replace(m, name="", layer=-1)
-            for m in modules
-            if m.kind != UNCLASSIFIED
-        )
+        self.shapes = Counter(dataclasses.replace(m, name="", layer=-1) for m in target)
         self.outside = Counter(
-            dataclasses.replace(m, name="")
-            for m in modules
-            if m.kind != UNCLASSIFIED and m.layer < 0
+            dataclasses.replace(m, name="") for m in target if m.layer < 0
         )
-        self.layered = [m for m in modules if m.layer >= 0]
+        self.layered = [m for m in target if m.layer >= 0]
+        self.drafted = Counter(
+            dataclasses.replace(m, name="", layer=-1) for m in classified if m.draft
+        )
         self.count = len(modules)
         self.name = machine.values.get("name", "")
         self.domain = machine.values.get("interconnect.intra_node.domain_devices")
@@ -540,43 +632,82 @@ class StepRooflineBackend(CostBackend):
         sampled = 0
         if batch_view.produces_output is not False:
             sampled = len(batch_view.prefill) + sum_tokens(decode)
-        priced: dict[str, list[float]] = {}
-        by: dict[str, list[dict]] = {}
-        stated: dict[str, list[str]] = {}
+        target: tuple[dict, dict, dict] = ({}, {}, {})
         split = batch_view.tbo_tokens is not None
         for m, count in (self.outside if split else self.shapes).items():
-            unit = self._unit(m, batch_view, tokens, sampled)
-            if isinstance(unit, str):
-                refuse.append(unit)
-            elif unit:
-                priced.setdefault(m.kind, []).append(sum(unit[0]) * count)
-                by.setdefault(m.kind, []).append(
-                    {k: s * count for k, s in unit[2].items()}
-                )
-                stated.setdefault(m.kind, []).extend(unit[1])
+            at = self._at(m, batch_view, tokens)
+            self._add(m, count, at, sampled, refuse, target)
         if split:
-            split = self._overlapped(batch_view, refuse, priced, stated)
+            split = self._overlapped(batch_view, refuse, target[0], target[2])
+        drafts: tuple[dict, dict, dict] = ({}, {}, {})
+        for m, count in self.drafted.items():
+            self._add(m, count, self._at(m, batch_view, tokens), 0, refuse, drafts)
         if refuse:
             reasons = dict.fromkeys(refuse)
             raise CostRefused(batch_view, [Refusal(SOURCE, r) for r in reasons])
+        tbo = {"tbo": f"the layers' two micro-batches of {split} tokens overlapped"}
+        terms = self._terms(target, "", f"at {tokens} tokens", tbo)
+        draft = self._terms(drafts, DRAFT, "of the drafter")
+        return StepCost(terms, draft_terms=draft)
+
+    def _at(self, m: Module, view: BatchView, tokens: int):
+        """The batch `m` runs on in this step and its tokens, or None if it
+        runs on none: a drafter's block, a replayed prefill's finishing rows,
+        or the step's own."""
+        if m.draft > 0:
+            rows = view.decode or _finishing(view)
+            if not rows:
+                return None
+            width = m.draft
+            block = tuple(
+                RequestShape(width, r.context_tokens + width, True) for r in rows
+            )
+            return BatchView(block), width * len(rows)
+        grouped = view.tbo_tokens is not None or view.moe_rows is not None
+        if not m.replay or view.decode or grouped:
+            return view, tokens
+        rows = _finishing(view)
+        if not rows:
+            return None
+        tail = min(rows[0].query_tokens, m.replay)
+        return BatchView((RequestShape(tail, tail, False),)), tail
+
+    def _add(self, m: Module, count: int, at, sampled: int, refuse, sums) -> None:
+        """Add `count` times `m`'s price on `at` (`_at`) to `sums`, its
+        seconds, seconds by bound and notes by kind, or why not to `refuse`. A
+        drafter's kind is added at 0 s where it runs nothing."""
+        priced, by, stated = sums
+        unit = at and self._unit(m, *at, sampled)
+        if isinstance(unit, str):
+            refuse.append(unit)
+            return
+        if m.draft:
+            priced.setdefault(m.kind, [])
+        if unit:
+            priced.setdefault(m.kind, []).append(sum(unit[0]) * count)
+            by.setdefault(m.kind, []).append({k: s * count for k, s in unit[2].items()})
+            stated.setdefault(m.kind, []).extend(unit[1])
+
+    def _terms(self, sums, prefix: str, where: str, details=None) -> list[CostTerm]:
+        """One term a kind of `sums` (`_add`), named `prefix` then
+        ``roofline.<kind>``, its detail the kind's in `details` if any."""
+        priced, by, stated = sums
         none = "; no successor: the roofline is the last step-level source"
         terms = []
         for kind, seconds in priced.items():
-            note = "; ".join(dict.fromkeys(stated[kind]))
+            note = "; ".join(dict.fromkeys(stated.get(kind, ())))
             method = Method.DECLARED if note else Method.ANALYTICAL
-            detail = f"sum over {kind} modules at {tokens} tokens"
-            if kind == "tbo":
-                detail = f"the layers' two micro-batches of {split} tokens overlapped"
+            detail = (details or {}).get(kind) or f"sum over {kind} modules {where}"
             provenance = Provenance(method, detail, SOURCE, note=note and note + none)
             terms.append(
                 CostTerm(
-                    f"roofline.{kind}",
+                    f"{prefix}roofline.{kind}",
                     fold_seconds(seconds),
                     provenance,
                     by_bound=fold_parts(by.get(kind, ())),
                 )
             )
-        return StepCost(terms)
+        return terms
 
     def describe(self) -> str:
         return f"step roofline; {self.count} modules"
@@ -603,17 +734,17 @@ class StepFallbackBackend(CostBackend):
         try:
             return self.first.price(batch_view)
         except CostRefused as refused:
-            return StepCost(
-                [
-                    dataclasses.replace(
-                        t,
-                        provenance=dataclasses.replace(
-                            t.provenance, refusals=refused.declined
-                        ),
-                    )
-                    for t in self.roofline.price(batch_view).terms
-                ]
-            )
+            declined, cost = refused.declined, self.roofline.price(batch_view)
+        fell = [
+            [
+                dataclasses.replace(
+                    t, provenance=dataclasses.replace(t.provenance, refusals=declined)
+                )
+                for t in terms
+            ]
+            for terms in (cost.terms, cost.draft_terms)
+        ]
+        return StepCost(fell[0], draft_terms=fell[1])
 
     def describe(self) -> str:
         return f"{self.first.describe()}; below it, {self.roofline.describe()}"
