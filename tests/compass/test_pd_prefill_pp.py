@@ -271,6 +271,8 @@ def run_pd_pp(out: Path, seed: str, pp: int) -> dict:
         PREFILL_ARGS=f"-pp {pp}" if pp > 1 else "",
         **{name: str(port) for name, port in ports.items()},
     )
+    if pp > 1:  # ATOM's runner sets it for a Llama model, so its key holds it
+        env["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
     publish_pd_entries(out / "store", PP_MACHINE, env)
     log = out / "pd_sim.log"
     with open(log, "w") as f:
