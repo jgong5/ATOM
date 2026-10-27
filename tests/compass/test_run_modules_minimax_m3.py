@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 """MiniMax-M3's meta build: its dense attention layers are priced as dense
 attention, and the step roofline refuses its sparse ones by layer name, whose
-top-k kernel reads a few blocks of the cache rather than every token.
+top-k kernel reads a few blocks of the cache rather than every token. Its MoE
+layers are priced as their routed experts with the shared one fused beside
+them, though its MoE block holds no TP width.
 
 The build owns its process because the driverless declarations are
 process-global.
@@ -69,3 +71,41 @@ def test_a_sparse_attention_layer_refuses_every_step_naming_it(monkeypatch):
     ]
     with pytest.raises(CostRefused, match=r"Attention at model\.layers\.1\.self_attn"):
         StepRooflineBackend(machine, walked).price(view((1, 64, True)))
+
+
+#: The published MXFP4 checkpoint's scheme: fp4 weights and activations, an
+#: e8m0 scale for each 32.
+MXFP4 = {
+    "quant_method": "quark",
+    "global_quant_config": {
+        "weight": {"dtype": "fp4", "qscheme": "per_group", "group_size": 32},
+        "input_tensors": {"dtype": "fp4", "qscheme": "per_group", "is_dynamic": True},
+    },
+}
+
+
+@pytest.mark.parametrize("quant", ["bf16", "mxfp4"])
+def test_a_moe_layer_prices_its_routed_and_fused_shared_experts(quant, monkeypatch):
+    monkeypatch.setenv("ATOM_MONO_ENABLE", "0")
+    # Its published MoE fields, the second layer an MoE one, both attending
+    # densely.
+    sparse = {**M3["sparse_attention_config"], "sparse_attention_freq": [0, 0]}
+    config = {**M3, "moe_layer_freq": [0, 1], "sparse_attention_config": sparse}
+    config.update(n_shared_experts=1, use_routing_bias=True, scoring_func="sigmoid")
+    config.update(routed_scaling_factor=2.0)
+    if quant == "mxfp4":
+        config["quantization_config"] = MXFP4
+    walked = _build("tp4", config)
+
+    # Each expert's gate-up and down weights at 3072 / 4 = 768 a rank: two
+    # bytes each in bf16, or half a byte and an e8m0 scale byte per 32 in fp4.
+    weights = 3 * 768 * 6144
+    held = 2 * weights if quant == "bf16" else weights // 2 + weights // 32
+    fmt = "bf16" if quant == "bf16" else "fp4"
+    # The 128 routed experts, 4 picked a row, and the shared one beside them,
+    # at TP4 on one data-parallel rank, their output all-reduced over the 4.
+    dims = (128, 128, 4, 768, 6144, 4, 1, 0, held, 1)
+    assert not [m for m in walked if m.kind == "unclassified"]
+    assert not [m for m in walked if "shared_experts" in m.name]
+    moe = [(m.layer, m.dims, m.fmt, m.act, m.ranks) for m in walked if m.kind == "moe"]
+    assert moe == [(1, dims, fmt, fmt, 4)]
