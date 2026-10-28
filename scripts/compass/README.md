@@ -769,12 +769,28 @@ reaches 005 through `/shared_nfs` seconds late, so set `PREFIX_S=300`.
 |---|---|---|
 | `ATOM_HOST_IP` | `10.245.151.159` | `10.245.149.94`, also the decode's `--host` |
 | `ATOM_MOONCAKE_IB_DEVICE` | unset | unset |
+| `MC_IB_TC` | `96` | `96` |
+| `MOONCAKE_DISABLE_HIP_DMABUF` | `0` | `0` |
 
 `ATOM_HOST_IP` is each node's `ens3` address, which the router, Mooncake's
 handshake and its notifications reach. With `ATOM_MOONCAKE_IB_DEVICE` unset,
 each GPU N registers with `ionic_N`, which carries RoCE v2 on IPv6 only (GID
-index 1); the image's libibverbs warns that the ionic driver does not support
-the kernel's ABI, and the RDMA writes still complete. The prefill side's own
+index 1). Three things keep the KV on it rather than on Mooncake's TCP fallback
+(`Found 0 HCAs` in `server.log`), whose transfers time out at c=256:
+
+- **The host's ionic provider.** The image's `libionic.so.1.0.54.0` does not
+  support the host kernel's ionic ABI. Create each container with the host's
+  mounted over it: `-v /usr/lib/x86_64-linux-gnu/libionic.so.1.1.2410:/usr/lib/x86_64-linux-gnu/libionic.so.1.0.54.0-149.g3304be71:ro`.
+- **`MC_IB_TC=96`.** On the default traffic class RoCE between the nodes stops
+  with retry-exceeded completions.
+- **dmabuf registration, at `--gpu-memory-utilization 0.75` or below.** With no
+  ionic peer-memory module loaded on the hosts, `ibv_reg_mr` on GPU memory fails
+  (`ret=-202`), so `MOONCAKE_DISABLE_HIP_DMABUF=0` overrides the image's `1`.
+  amdgpu then counts each registered buffer twice against the free memory, as
+  allocated and as pinned, after ATOM has sized its KV cache: at `0.85`
+  DeepSeek-V4-Pro at TP8 runs out of memory right after registration.
+
+The prefill side's own
 variables go in `deploy.sh`'s environment, the decode side's as `-e` words of the
 prefix:
 
