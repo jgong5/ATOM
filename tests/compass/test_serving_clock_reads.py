@@ -242,6 +242,7 @@ class TestASubstitutedReadTakesTheLpClock:
             engine_stats=stats,
             get_request_counts=lambda: counted.append(lp_clock.t) or (0, 0),
             _kv_usage=lambda: None,
+            _dynamic_chunking_counts={},
         )
         lp_clock.t = 17.0
         scheduler._record_throughput(owner, 100)

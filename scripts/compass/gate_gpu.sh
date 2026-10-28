@@ -268,15 +268,28 @@ elif [ -d "$ROOT/tests/compass" ]; then
 else
     printf 'tests/compass: absent on this tree, so it contributes no tests.\n'
 fi
-EXPECT_PASSED=$((BASE_PASSED + COMPASS_N - BASE_COMPASS_TESTS))
-printf 'expected: %s passed = %s baseline + (%s - %s) tests/compass\n' \
-    "$EXPECT_PASSED" "$BASE_PASSED" "$COMPASS_N" "$BASE_COMPASS_TESTS"
+# A file that stalls on one GPU keeps the suite from ever printing a summary.
+# gpu_gate_skip.txt names such files per GPU; on a matching first card each is
+# left out of the suite and its collected tests come off the expectation.
+DEVICE=$(HIP_VISIBLE_DEVICES=${GPUS%%,*} python -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null)
+printf 'device: %s\n' "${DEVICE:-UNKNOWN}"
+SKIP_ARGS=() SKIP_N=0
+while read -r gpu file; do
+    [[ -n $DEVICE && $DEVICE == *"$gpu"* && -e $file ]] || continue
+    n=$(python -m pytest "$file" --collect-only -q -p no:cacheprovider 2>&1 | sed -nE 's/^([0-9]+) tests? collected.*/\1/p')
+    [ -n "$n" ] || finish 1 "cannot count the tests of $file, which gpu_gate_skip.txt leaves out on $gpu"
+    printf 'left out on %s: %s (%s tests)\n' "$gpu" "$file" "$n"
+    SKIP_ARGS+=("--ignore=$file") SKIP_N=$((SKIP_N + n))
+done < <(grep -vE '^[[:space:]]*(#|$)' "$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_skip.txt")
+EXPECT_PASSED=$((BASE_PASSED + COMPASS_N - BASE_COMPASS_TESTS - SKIP_N))
+printf 'expected: %s passed = %s baseline + (%s - %s) tests/compass - %s left out\n' \
+    "$EXPECT_PASSED" "$BASE_PASSED" "$COMPASS_N" "$BASE_COMPASS_TESTS" "$SKIP_N"
 printf '\n'
 
 OUT=$(mktemp)
 # -rfE, after "$@" so it wins even if a -r form slips past the refusal above.
 HIP_VISIBLE_DEVICES=${GPUS%%,*} python -m pytest tests/ --ignore=tests/plugin --ignore=tests/compass \
-    -q --no-header -p no:cacheprovider "$@" -rfE 2>&1 | tee "$OUT"
+    "${SKIP_ARGS[@]}" -q --no-header -p no:cacheprovider "$@" -rfE 2>&1 | tee "$OUT"
 PYRC=${PIPESTATUS[0]}
 compass_pytest_counts "$OUT"
 
@@ -396,6 +409,7 @@ rm -f "$OBS_IDS" "$ERR_IDS" "$KNOWN_IDS"
     fail "$(printf '%s passed, expected %s. The difference decomposes as:
     baseline        %s   at %s
     tests/compass   %s now, %s at the baseline (delta %s)
+    left out        %s
     expected        %s
     observed        %s
     unaccounted     %s
@@ -404,7 +418,7 @@ rm -f "$OBS_IDS" "$ERR_IDS" "$KNOWN_IDS"
   accounted for; if this tree adds tests outside tests/compass/, account for
   them here.' \
         "$PASSED" "$EXPECT_PASSED" "$BASE_PASSED" "$BASE_COMMIT" \
-        "$COMPASS_N" "$BASE_COMPASS_TESTS" "$((COMPASS_N - BASE_COMPASS_TESTS))" \
+        "$COMPASS_N" "$BASE_COMPASS_TESTS" "$((COMPASS_N - BASE_COMPASS_TESTS))" "$SKIP_N" \
         "$EXPECT_PASSED" "$PASSED" "$((PASSED - EXPECT_PASSED))")" \
     "$PASSED passed, expected $EXPECT_PASSED"
 

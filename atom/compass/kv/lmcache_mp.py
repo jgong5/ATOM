@@ -88,8 +88,13 @@ class MultiShell(MultiConnectorScheduler):
             self._connectors = subs
 
 
-#: A native-state rank's checkpoint layout: the units it is given, as named.
-_UNITS_AS_NAMED = SimpleNamespace(validate_unit_ids=tuple)
+def _units_as_named(config) -> SimpleNamespace:
+    """A native-state rank's checkpoint layout: the units it is given, as
+    named, and an image group exactly when ATOM's worker registers one."""
+    from atom.kv_transfer.offload.mp.native_state_worker import stores_state_images
+
+    replay = int(getattr(config, "state_replay_tokens", 0) or 0)
+    return SimpleNamespace(validate_unit_ids=tuple, images=stores_state_images(replay))
 
 
 def _restored(pending) -> bool:
@@ -161,7 +166,8 @@ class LMCacheMPShell:
             rank.chunk_size, rank._is_kv_writer = impl.chunk_size, k % group == 0
             rank._adapter = _Rank(self, f"transfer#dp{dp}.tp{k // group}", k // group)
             if native:
-                rank._native_layout, rank._begin_restore = _UNITS_AS_NAMED, _restored
+                rank._native_layout = _units_as_named(config)
+                rank._begin_restore = _restored
             self._ranks.append(rank)
         self._tp = KVOutputAggregator(world_size=tp)
 

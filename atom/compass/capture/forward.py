@@ -719,11 +719,15 @@ def _patches(recorder):
       runs it, which would open every shard, or download them for a hub name.
     * A step ATOM splits into two micro-batches (`--enable-tbo`) is refused by
       name before its threads start: one graph cannot hold the two.
+    * The step's DP exchange (`sync_dp_metadata`) runs on the host, outside
+      the fake mode and the recorder: `decide` runs it on a group of one too,
+      and reads its packed rows back as numpy.
     """
     import flydsl
     import triton
     from flydsl.compiler import jit_function as fly
     from torch._subclasses.fake_tensor import unset_fake_temporarily
+    from torch.utils._python_dispatch import _disable_current_modes
     from triton.compiler.compiler import CompiledKernel
     from triton.runtime.jit import JITFunction
 
@@ -731,6 +735,7 @@ def _patches(recorder):
     from atom.model_ops import module_dispatch_ops, moe
     from atom.model_ops.attentions import gdn_attn
     from atom.utils import CpuGpuBuffer
+    from atom.utils.tbo import ubatching
     from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
     recorder.languages = tuple(
@@ -766,7 +771,7 @@ def _patches(recorder):
     init, zeros, numpy = CpuGpuBuffer.__init__, torch.zeros, torch.Tensor.numpy
     conv1d, tolist = gdn_attn.compute_causal_conv1d_metadata, torch.Tensor.tolist
     attach = gdn_attn.GDNStateMixin._attach_replayssm
-    fake_tolist = FakeTensor.tolist
+    fake_tolist, sync = FakeTensor.tolist, ubatching.sync_dp_metadata
 
     def landed(tensor):
         if not getattr(recorder.runner, "drafter", None):
@@ -810,6 +815,11 @@ def _patches(recorder):
         with unset_fake_temporarily():
             return conv1d(*args, **kwargs)
 
+    def host_sync(**kwargs):
+        # Outside every mode: host arithmetic, not the step's device work.
+        with _disable_current_modes():
+            return sync(**kwargs)
+
     def replayssm(builder, md, num_reqs, is_prefill):
         staged = builder.non_spec_state_indices_tensor.np[:num_reqs]
         live = int((staged >= 0).sum()) if is_prefill else None
@@ -826,6 +836,7 @@ def _patches(recorder):
         (fly.CompiledFunction, "__call__", compiled_call),
         (CpuGpuBuffer, "__init__", staged_init),
         (gdn_attn, "compute_causal_conv1d_metadata", host_conv1d),
+        (ubatching, "sync_dp_metadata", host_sync),
         (gdn_attn.GDNStateMixin, "_attach_replayssm", replayssm),
         (torch.Tensor, "tolist", host_tolist),
         (FakeTensor, "tolist", host_tolist),
@@ -910,8 +921,16 @@ def _build_runner(config, fake_mode):
     shard opened, under `_patches`), and the declared device's memory is all
     free.
     """
+    from aiter.ops import attention
+
     from atom.model_engine.model_runner import DeviceMemoryReadings, ModelRunner
     from atom.utils import h2d
+
+    # aiter sizes MLA's metadata for the arch its C++ planner reads off the
+    # device through HIP; the declared device answers, for every later step too.
+    attention._mla_cpp_gpu_arch = lambda index: (
+        torch.cuda.get_device_properties(index).gcnArchName
+    )
 
     class _CapturedRunner(ModelRunner):
         def _setup_device_and_distributed(self, rank, config):
@@ -979,14 +998,16 @@ def _weights(model):
                 yield value
 
 
-def _batch(shape, block_size, context=1, output=True, drafts=0):
+def _batch(shape, block_size, context=1, output=True, drafts=0, stateful=False):
     """`shape.seqs` sequences of `shape.tokens` new tokens between them, the
     first `tokens % seqs` one longer, each in blocks of its own; and the
     blocks they take. A decode sequence holds `context` tokens, and under a
     drafter of `drafts` tokens verifies that many more, as ATOM's scheduler
     schedules it. Unless `output`, every prefill sequence is a middle chunk,
     so the step samples nothing. Under a drafter a prefill row states its next
-    token, -1 where the step samples it, as ATOM's scheduler states it."""
+    token, -1 where the step samples it, as ATOM's scheduler states it. A
+    `stateful` model's sequence holds a state slot of its own, as ATOM's block
+    manager gives one to a model with per-request cache."""
     from atom.model_engine import sequence
     from atom.model_engine.scheduler import ScheduledBatch
 
@@ -1005,6 +1026,8 @@ def _batch(shape, block_size, context=1, output=True, drafts=0):
         seq.num_cached_tokens = held - count
         taken = -(-held // block_size)
         seq.block_table = sequence.new_block_table(list(range(blocks, blocks + taken)))
+        if stateful:  # its own committed state slot, as the block manager gives it
+            seq.has_per_req_cache, seq.state_slots = True, [index]
         seqs[seq.id], blocks = seq, blocks + taken
     batch = ScheduledBatch(
         seqs=seqs,
@@ -1181,6 +1204,10 @@ def capture(
         weights = map(_storage, (w for m in models for w in _weights(m)))
         recorder.roles = dict.fromkeys(weights, ir.Role.WEIGHT)
         recorder.creating = ir.Role.KV
+        from atom.model_engine.llm_engine import InputOutputProcessor
+
+        per_req = InputOutputProcessor._per_req_cache_model_types()
+        stateful = config.hf_config.model_type in per_req
         blocks = max(
             _batch(s, block_size, max(CONTEXTS), True, drafts)[1] for s in shapes
         )
@@ -1218,7 +1245,7 @@ def capture(
             traces = []
             for context in CONTEXTS if shape.phase == "decode" else CONTEXTS[:1]:
                 recorder.creating = ir.Role.METADATA
-                batch = (shape, block_size, context, output, drafts)
+                batch = (shape, block_size, context, output, drafts, stateful)
                 with fake_mode, recorder:
                     # A runner's first step takes its own path (a decode
                     # fills no deferred ids), so the traced step follows two

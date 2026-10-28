@@ -156,7 +156,9 @@ KV_BLOCKS = 64
 # What counts as a collective in the inventory. ATOM issues them two ways: as
 # aiter custom operators, which carry a registered fake implementation, and
 # through `c10d`'s own entry points.
-COLLECTIVE_OPS = r"c10d|aiter\.(all_reduce|all_gather|reduce_scatter|gather)"
+COLLECTIVE_OPS = (
+    r"c10d|aiter\.(all_reduce|all_gather|reduce_scatter|gather|fused_allreduce)"
+)
 
 # ATOM's H2D publication, which dispatches every staged copy of a step.
 H2D_PUBLICATION = "atom/utils/h2d.py:"
@@ -175,10 +177,11 @@ TOTAL_MEMORY_BYTES = 192 * (1 << 30)
 # moves when the kinds of work change, which is the thing worth holding.
 
 TP1_DISTINCT_OPS = 36
-TP2_DISTINCT_OPS = 41
+TP2_DISTINCT_OPS = 42
 
 # What the width changes, by name. It swaps the embedding for its
-# vocab-parallel form, adds the collectives, and adds the `movedim` the
+# vocab-parallel form, adds the collectives -- the row-parallel reduces fused
+# into the RMSNorm after them among them -- and adds the `movedim` the
 # non-custom gather uses to rearrange what it gathered. Nothing else.
 TP1_ONLY_OPS = ("aten.embedding.default",)
 TP2_ONLY_OPS = (
@@ -186,6 +189,7 @@ TP2_ONLY_OPS = (
     "_c10d_functional.broadcast.default",
     "_c10d_functional.wait_tensor.default",
     "aiter.all_reduce_.default",
+    "aiter.fused_allreduce_rmsnorm_.default",
     "aiter.masked_embedding.default",
     "aten.movedim.int",
 )
@@ -193,12 +197,10 @@ TP2_ONLY_OPS = (
 # The lines a TP2 decode step issues a collective from. Named, because a
 # collective's operator says what ran and only its call site says which of
 # ATOM's communication paths ran it.
-ROW_PARALLEL = (
-    "atom/model_ops/communication_op.py:58 in tensor_model_parallel_all_reduce"
-)
+ROW_PARALLEL = "atom/model_ops/layernorm.py:944 in _forward_fused_allreduce"
 VOCAB_EMBEDDING = "atom/model_ops/embed_head.py:178 in forward"
 VOCAB_LM_HEAD = "atom/model_ops/embed_head.py:269 in forward"
-SAMPLER = "atom/model_engine/model_runner.py:3367 in postprocess"
+SAMPLER = "atom/model_engine/model_runner.py:3389 in postprocess"
 
 # Where a free symbol stops being free, each as the value it takes and the
 # innermost ATOM frames it takes it through. Three, and in an order: a symbol
@@ -209,7 +211,7 @@ SAMPLER = "atom/model_engine/model_runner.py:3367 in postprocess"
 # site one closed.
 SITE_ONE = (
     "2",
-    ("atom/model_ops/attentions/aiter_attention.py:1199 in prepare_decode",),
+    ("atom/model_ops/attentions/aiter_attention.py:1216 in prepare_decode",),
 )
 # The H2D publication binds each staged buffer in `ModelRunner.__init__` and
 # checks that its host and device sides have one shape. With a symbol on every
@@ -231,9 +233,9 @@ SITE_THREE = (
 # so these say which constructor answered and how often -- the half of the
 # second site's pin that no specialisation site covers, because a repair inside
 # `__init__` changes what it allocates rather than where a symbol is solved.
-# Measured: 22 buffers, each one host allocation and one numpy view.
+# Measured: 23 buffers, each one host allocation and one numpy view.
 BUFFER_INIT = "atom/utils/__init__.py:714"
-BUFFER_COUNT = 22
+BUFFER_COUNT = 23
 
 # The `torch.cuda` names `_declare_cuda` stubs, which are exactly the names a
 # capture reads. Measured by counting every read of a stubbed name over a whole
@@ -381,6 +383,7 @@ OP_FAMILIES = (
         "collective",
         (
             "aiter.all_reduce_",
+            "aiter.fused_allreduce_rmsnorm_",
             "_c10d_functional.all_reduce",
             "_c10d_functional.all_gather_into_tensor",
             "_c10d_functional.broadcast",
@@ -468,8 +471,11 @@ EXPECTED_GUARDS[2] = EXPECTED_GUARDS[1] - {"28*<axis> <= 8192"}
 
 # How many of the step's staged buffers the H2D publication copies to the
 # device. Five from `prepare_decode`'s own list, and the rest from the
-# sampler's and the token processor's staging around it.
-STAGED_COPIES = 10
+# sampler's and the token processor's staging around it. All but one are
+# counted in the step's width, each checked by `_count`; the one left copies a
+# constant three rows.
+STAGED_COPIES = 11
+WIDTH_COUNTED_COPIES = STAGED_COPIES - 1
 
 # Every conversion of the step's width to a number that one traced forward
 # makes, by the ATOM line it happens on. This is the log's declared set: the
@@ -487,23 +493,25 @@ STAGED_COPIES = 10
 # one that only reaches a host value does not, which is why this is asserted
 # rather than left to the digest.
 EXPECTED_HOST_RESOLUTIONS = {
-    "atom/model_ops/attentions/aiter_attention.py:1199 in prepare_decode": 1,
-    "atom/model_ops/attentions/aiter_attention.py:1220 in prepare_decode": 1,
-    "atom/model_ops/attentions/aiter_attention.py:1221 in prepare_decode": 1,
-    "atom/model_ops/attentions/aiter_attention.py:1222 in prepare_decode": 2,
-    "atom/model_ops/attentions/aiter_attention.py:1230 in prepare_decode": 1,
-    "atom/model_ops/attentions/aiter_attention.py:1231 in prepare_decode": 2,
-    "atom/model_ops/attentions/backends.py:618 in prepare_block_tables": 1,
-    "atom/model_ops/attentions/backends.py:632 in _mrope_cpu_view": 1,
-    "atom/model_ops/attentions/backends.py:634 in _mrope_cpu_view": 1,
-    "atom/model_ops/attentions/backends.py:692 in _build_mrope_decode_positions": 1,
-    "atom/model_ops/attentions/backends.py:735 in prepare_cu_seqlens_q": 1,
-    "atom/model_ops/attentions/backends.py:736 in prepare_cu_seqlens_q": 3,
-    "atom/model_engine/model_runner.py:570 in prepare_input_ids": 1,
-    "atom/model_engine/model_runner.py:573 in prepare_input_ids": 1,
-    "atom/model_engine/model_runner.py:2677 in prepare_sample": 1,
-    "atom/model_ops/sampler.py:48 in _apply_greedy_tokens": 2,
-    "atom/utils/h2d.py:51 in _count": STAGED_COPIES,
+    "atom/model_ops/attentions/aiter_attention.py:1216 in prepare_decode": 1,
+    "atom/model_ops/attentions/aiter_attention.py:1239 in prepare_decode": 1,
+    "atom/model_ops/attentions/aiter_attention.py:1240 in prepare_decode": 1,
+    "atom/model_ops/attentions/aiter_attention.py:1241 in prepare_decode": 2,
+    "atom/model_ops/attentions/aiter_attention.py:1249 in prepare_decode": 1,
+    "atom/model_ops/attentions/aiter_attention.py:1250 in prepare_decode": 2,
+    "atom/model_ops/attentions/backends.py:597 in prepare_block_tables": 1,
+    "atom/model_ops/attentions/backends.py:611 in _mrope_cpu_view": 1,
+    "atom/model_ops/attentions/backends.py:613 in _mrope_cpu_view": 1,
+    "atom/model_ops/attentions/backends.py:671 in _build_mrope_decode_positions": 1,
+    "atom/model_ops/attentions/backends.py:714 in prepare_cu_seqlens_q": 1,
+    "atom/model_ops/attentions/backends.py:715 in prepare_cu_seqlens_q": 3,
+    "atom/model_engine/model_runner.py:522 in prepare_input_ids": 3,
+    "atom/model_engine/model_runner.py:608 in _stage_input_ids": 1,
+    "atom/model_engine/model_runner.py:611 in _stage_input_ids": 1,
+    "atom/model_engine/model_runner.py:2698 in prepare_sample": 1,
+    "atom/model_ops/sampler.py:48 in _apply_greedy_tokens": 1,
+    "atom/utils/forward_context.py:318 in decide": 1,
+    "atom/utils/h2d.py:51 in _count": WIDTH_COUNTED_COPIES,
 }
 
 
@@ -792,6 +800,54 @@ def _select_direct_h2d():
     """
     os.environ["ATOM_H2D_BACKEND"] = "direct"
     return "ATOM_H2D_BACKEND=direct"
+
+
+def _sync_on_the_host():
+    """Run the step's DP exchange on the host, and say so.
+
+    `ForwardMode.decide` runs `sync_dp_metadata` on a group of one too, and
+    reads its packed rows back with `.numpy()`, which a fake tensor refuses.
+    Its rows are the step's own counts, host arithmetic and not the step's
+    device work, so it runs outside every mode, the recorder's included, as
+    `atom.compass.capture.forward` runs it.
+
+    On the step-symbol pass a numpy row would make the width a constant before
+    the step begins, so a group of one answers with its own row, the width
+    kept a symbol, as `decide` read it before it took a group of one's widths
+    off the exchange.
+    """
+    import numpy as np
+    from torch.utils._python_dispatch import _disable_current_modes
+
+    from atom.utils.tbo import ubatching
+
+    sync = ubatching.sync_dp_metadata
+
+    def own_row(scheduled_tokens, scheduled_bs, is_prefill, needs_eager, **kwargs):
+        hint = int(scheduled_tokens.node.hint)
+        q = kwargs.get("max_seqlen_q")
+        return ubatching.DPSyncResult(
+            scheduled_tokens_per_dp_rank=np.array([hint], dtype=np.int32),
+            max_bs_across_dp=scheduled_bs,
+            prefill_across_dp=(bool(is_prefill),),
+            any_rank_needs_eager=bool(needs_eager),
+            tbo_collective_active=False,
+            ub_max_tokens_across_dp=None,
+            ub_tokens_across_dp=None,
+            max_seqlen_q_across_dp=q,
+            max_final_requests_across_dp=kwargs.get("final_requests", 0),
+        )
+
+    def on_host(**kwargs):
+        with _disable_current_modes():
+            if kwargs["dp_size"] == 1 and isinstance(
+                kwargs["scheduled_bs"], torch.SymInt
+            ):
+                return own_row(**kwargs)
+            return sync(**kwargs)
+
+    ubatching.sync_dp_metadata = on_host
+    return "ubatching.sync_dp_metadata"
 
 
 def _decline_context_priming():
@@ -1630,7 +1686,7 @@ def _symbolic_bound(runner, fake_mode):
     original = builder.build
     injected = []
 
-    def build(batch, running_bs, running_tokens, max_seqlen_q):
+    def build(batch, running_bs, running_tokens, max_seqlen_q, **kwargs):
         # Outside the mode. A tensor allocated inside it is already fake and
         # *static*, `from_tensor` is then a no-op, and the bound comes back a
         # plain `int` with nothing to say it was meant to be a symbol.
@@ -1638,7 +1694,7 @@ def _symbolic_bound(runner, fake_mode):
             template = torch.zeros(int(running_tokens), dtype=torch.int32)
         bound = fake_mode.from_tensor(template, static_shapes=False).shape[0]
         injected.append({"symbol": str(bound), "hint": int(running_tokens)})
-        return original(batch, running_bs, bound, max_seqlen_q)
+        return original(batch, running_bs, bound, max_seqlen_q, **kwargs)
 
     builder.build = build
     return injected
@@ -1812,6 +1868,7 @@ def _capture(
     declared_init = _decline_initialisers()
     declared_gather = _decline_custom_all_gather()
     declared_h2d = _select_direct_h2d()
+    declared_sync = _sync_on_the_host()
 
     tree_root = pathlib.Path(__file__).resolve().parents[2]
     model_dir = pathlib.Path(tmpdir) / "published-config"
@@ -1923,6 +1980,7 @@ def _capture(
             "transport": declared_transport,
             "config": declared_gather,
             "h2d": declared_h2d,
+            "sync": declared_sync,
         },
         "ops": len(recorder.ops),
         "distinct_ops": recorder.distinct_ops(),
@@ -2097,8 +2155,8 @@ def row_parallel_reduces():
 
     Derived from the published config's geometry rather than read off the
     inventory, so the count has a source that is not the thing it checks. Every
-    weight sharded along its input dimension reduces once per forward through
-    `tensor_model_parallel_all_reduce`: each layer's `mlp.down_proj`, each
+    weight sharded along its input dimension reduces once per forward, fused
+    into the RMSNorm after it (`_forward_fused_allreduce`): each layer's `mlp.down_proj`, each
     full-attention layer's `self_attn.o_proj`, and each linear-attention
     layer's `linear_attn.out_proj`. The vision tower shards none.
 
@@ -2394,7 +2452,10 @@ def test_the_collectives_at_tp2_are_recorded_by_name_and_call_site():
         (entry["op"], entry["call_site"]) for entry in capture(2)["collectives"]
     )
     assert dict(by_site) == {
-        ("aiter.all_reduce_.default", ROW_PARALLEL): row_parallel_reduces(),
+        (
+            "aiter.fused_allreduce_rmsnorm_.default",
+            ROW_PARALLEL,
+        ): row_parallel_reduces(),
         ("aiter.all_reduce_.default", VOCAB_EMBEDDING): 1,
         ("_c10d_functional.all_gather_into_tensor.default", VOCAB_LM_HEAD): 1,
         ("_c10d_functional.wait_tensor.default", VOCAB_LM_HEAD): 1,
@@ -2456,7 +2517,7 @@ def test_the_inventory_is_concrete_at_both_widths():
     """
     for tp in (1, 2):
         record = capture(tp)
-        assert record["shape_entries"] > 10000
+        assert record["shape_entries"] > 8000
         census = record["family_census"]
         by_family = {family: row["shape_entries"] for family, row in census.items()}
         assert set(by_family) == CONCRETE_FAMILIES[tp], tp
@@ -2845,7 +2906,7 @@ def test_the_three_sites_are_where_they_were_and_carry_the_symbol_instead():
         event["frames"][-1] for event in record["host_resolutions"]
     )
     assert resolved_at[SITE_ONE[1][0]] == 1
-    assert resolved_at[SITE_THREE[1][0]] == STAGED_COPIES
+    assert resolved_at[SITE_THREE[1][0]] == WIDTH_COUNTED_COPIES
     # ... and nowhere in the specialisations, which is the whole change.
     assert record["specialisations"] == []
 
@@ -2892,8 +2953,9 @@ def test_the_symbol_is_free_across_the_step_width():
     *group's* width, which this step really does have. The identity above is
     what separates the two readings: the concrete dimensions are the same at
     step width 2 and at step width 8, so a 2 that survives a step eight rows
-    wide is an engine constant and not a width that leaked. At TP1 no 2 appears
-    at all.
+    wide is an engine constant and not a width that leaked. At TP1 a 2 appears
+    too, as the leading dimension of a staged `[2, <axis>]` view, the same at
+    both step widths.
 
     **At TP2 as well as TP1.** TP2 is the width where a capture has most to
     lose, so the comparison that carries the result is run there too rather
@@ -2931,16 +2993,12 @@ def test_the_symbol_is_free_across_the_step_width():
             for value in counts
         }
         assert SECOND_WIDTH not in values, tp
-        if tp == 1:
-            assert DECODE_SEQS not in values, tp
-        else:
-            # At TP2 the constant 2 *is* present, and it is the **group's**
-            # width, not the step's. What says so is the line
-            # above it: `concrete_dims` is identical at step widths 2 and 8, so
-            # a 2 that is still a 2 when the step is eight wide is not the
-            # step. The group width is an engine constant here in the way a
-            # head count is.
-            assert values & {DECODE_SEQS} == {DECODE_SEQS}, tp
+        # The constant 2 *is* present: at TP2 the **group's** width, and at
+        # both widths the leading dimension of a staged `[2, <axis>]` view. What
+        # says neither is the step's is the line above it: `concrete_dims` is
+        # identical at step widths 2 and 8, so a 2 that is still a 2 when the
+        # step is eight wide is not the step.
+        assert values & {DECODE_SEQS} == {DECODE_SEQS}, tp
         assert set(narrow["shape_env_guards"]) == EXPECTED_GUARDS[tp], tp
         assert set(wide["shape_env_guards"]) == EXPECTED_GUARDS[tp], tp
         # The one artifact that is width-dependent, stated rather than omitted.
