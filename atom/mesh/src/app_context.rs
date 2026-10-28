@@ -299,7 +299,7 @@ impl AppContextBuilder {
 
     /// Create HTTP client
     fn with_client(mut self, _config: &RouterConfig, timeout_secs: u64) -> Result<Self, String> {
-        let client = Client::builder()
+        let client = crate::compass_router::worker_client(Client::builder())
             .pool_idle_timeout(Some(Duration::from_secs(50)))
             .pool_max_idle_per_host(500)
             .timeout(Duration::from_secs(timeout_secs))
