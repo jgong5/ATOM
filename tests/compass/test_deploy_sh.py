@@ -165,10 +165,14 @@ def argv(tmp_path, flags, prefill=PREFILL, router=ROUTER_ARGS):
 
 
 def _until(path: Path, script) -> None:
+    router = path.with_name("router.log")
     for _ in range(600):
         if path.exists():
             return
-        assert script.poll() is None, script.communicate()
+        assert script.poll() is None, (
+            script.communicate(),
+            router.read_text() if router.exists() else "no router.log",
+        )
         time.sleep(0.1)
     pytest.fail(f"no {path}")
 
