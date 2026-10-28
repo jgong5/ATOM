@@ -30,7 +30,7 @@ its header.
 | `snapshot.sh` | either | Build the `git archive` tarball a gate runs against (never `rsync`). Stamps `.compass-commit` (so output names its tree, and a `COMPASS_GPU_GATE_DONE` attestation can be checked) and `.compass-changed` (so the blind-spot question is answerable without `.git`). Refuses a dirty tree. |
 | `compass` | either | The `compass` console script, run from this tree, for an image whose ATOM install has none. The stage-2 cell below runs it. |
 | `pd_sim.sh` | GPU container | A simulated 1P1D run: the standalone clock authority (`python -m atom.compass.run`), a prefill and a decode API server on the simulated KV connector, and `atomesh` in PD mode between them. `tests/compass/test_pd_slice.py` drives one request through it. Its variables are in its header. |
-| `deploy.sh` | GPU container; with `--on`, one per node | A prefill-decode deployment with `atomesh` between its instances: simulated, one `compass run` per instance, joined to the clock authority the script starts, or real, one `compass record` per instance. `--on` starts the decode instance on another node through a command prefix (`ssh <host>`, `srun -w <host> ...`). Simulated with `--dp-aware` among the router's arguments, the router is the run's router LP, and `ATOMESH` must name an `atomesh` built from the tree being run (`cargo build --release` in `atom/mesh`); one built from other router source, as the containers' `/usr/local/bin/atomesh` is, is refused. A client drives it through `OUT/server.json` as it drives one server. Its usage is in its header. |
+| `deploy.sh` | GPU container; with `--on`, one per node | A prefill-decode deployment with `atomesh` between its instances: simulated, one `compass run` per instance, joined to the clock authority the script starts, or real, one `compass record` per instance. `--on` starts the decode instance on another node through a command prefix (`ssh <host>`, `srun -w <host> ...`, or `spur exec <job> docker exec ...` as [the 005/013 pair](#a-1p1d-deployment-across-crsuse2-m2m-v3-005-and--013) runs it). Simulated with `--dp-aware` among the router's arguments, the router is the run's router LP, and `ATOMESH` must name an `atomesh` built from the tree being run (`cargo build --release` in `atom/mesh`); one built from other router source, as the containers' `/usr/local/bin/atomesh` is, is refused. A client drives it through `OUT/server.json` as it drives one server. Its usage is in its header. |
 | `parity_one_node.sh` | GPU container, two devices (eight for `CONFIG=dsv4-dpa8`) | The scheduling-parity test: one workload (`python -m atom.compass.parity.traffic`) on a real `-tp 2 --enable-dp-attention` server (`CONFIG=tp2-plain`: `-tp 2` alone; `CONFIG=dsv4-dpa8`: DeepSeek-V4-Pro's nightly `-tp 8 --enable-dp-attention --enable-tbo` server; `CONFIG=pp2`: `-tp 1 -pp 2`, each stage replayed from and compared on its own record) with the step record on, then on a simulated one whose steps each end when the real one's did (`atom/compass/parity/replay.py`; `step_stub` prices their device time into the cost record only), and `python -m atom.compass.parity` over the two records. With `STORE` unset it first runs `compass measure memory` on the real run's GPUs, flags and environment into `OUT_DIR/store`, under `LMCACHE=1` with an lmcache server of its own beside it, and the simulated run reads that store. The last lines are the real run's admission (send to response headers: minimum, median, maximum) and, per DP rank, the steps compared, the steps identical and the first divergence. Its variables are in its header. |
 | `PYTHONPATH=$T python -m atom.compass.detect.scenario` | either | The acceptance checks every simulated deployment's runs are held to, over the out_dirs of one run file run under different `PYTHONHASHSEED`: each run reached its finish with no refusal, the step tables are byte-identical, and each channel's messages were released to their receiver once each and none behind its clock. With `--record LP=DIR`, an engine LP's TAR rows must equal the timeline a constant step stub implies, computed from the parity record in `DIR` (`pd_sim.sh` writes one per side when `ATOM_COMPASS_PARITY_RECORD` is set). Prints each failure and exits 1. The vertical, DP, PD and PD-DP slices in `tests/compass/` hold their runs to it, with the traffic's outputs too. |
 | `mi308x_spec.py` | GPU container, node 18 or hjbog-srdc-39; any container with `atom` under `--sweep-from` | `python3 scripts/compass/mi308x_spec.py`: rebuild `machines/mi308x-hjbog18.json`, the node-18 MI308X machine spec, by sweeping on this host the tokenizer of each `--model` (repeatable, default Qwen3.8-27B; each distinct tokenizer once, its entry applying to the architecture of every model that loads it) and merging them with the device, capacity and stack of one real engine start and the HTTP intake terms `http_intake.py` fitted over one real burst (`INTAKE`), the PP carriers `pp_carriers.py` fitted on two of the host's GPUs (`PP`, which names the fit's commit and its record's sha256), on node 18 the idle intake over lone requests (`IDLE`), each recorded in the script; with `COMPASS_MACHINE=mi308x-hjbog39`, the same for hjbog-srdc-39 into `machines/mi308x-hjbog39.json`, and on node 18 the attainable peaks `probe_device.py` read (`PEAKS`, which names the probe's commit and its record's sha256). `--sweep-from DOC` takes the sweeps a written document carries instead; given `--model` as well, it sweeps only those models' tokenizers and adds them. Prints `validate`'s verdict and `explain`'s fields grouped by origin; on either host a value no probe fills reads `assumed`. |
@@ -739,6 +739,58 @@ over every DP rank of that side, cost at the law fitted under that side's engine
 memory against that side's hand-in (`lp-engine-P.json`, `lp-engine-D.json`); end to
 end once, from the deployment's export. The export names decode's response ids, so
 prefill's side is split through decode's `transfers.jsonl` (`parity.transfers`).
+
+## A 1P1D deployment across crsuse2-m2m-v3-005 and -013
+
+`deploy.sh` runs from a GPU container on 005, which holds the prefill instance
+and the router; the decode instance runs in a GPU container on 013, started through
+`--on`. Both containers run one image, named by digest, with `--device /dev/kfd
+--device /dev/dri --device /dev/infiniband --group-add video --ipc host --network
+host --cap-add IPC_LOCK --ulimit memlock=-1` and `/shared_nfs/xingjche` and the
+model directory mounted at their own paths. Each needs `git config --global --add
+safe.directory '*'`: git runs as root there on a tree another user owns, and
+without it `compass record` and `compass measure memory` refuse the tree as no git
+checkout, and an `atomesh` built there records no commit, which `deploy.sh run`
+refuses.
+
+**The prefix.** `spur exec <job> docker exec -e ... <container>`, where `<job>`
+is 013's hold job (`squeue -u xingjche -o %i,%j`). It runs from inside the 005
+container when that container has `/usr/local/bin/spur`, `/etc/spur/spur.conf`
+and `/run/spur` mounted, and `SPUR_CONTROLLER_ADDR` set as on the host. `spur
+exec` carries no stdin and returns its command's output only when the command
+exits, so `OUT/decode.log` fills once the decode instance has stopped; it
+returns the command's exit status. Neither gap matters to `deploy.sh`: the
+decode's command reads nothing from stdin, and its stop is a second command
+through the same prefix, `kill -TERM <pid>` in the container, whose process ids
+`OUT/decode.pid` holds. A file the decode writes, such as its `server.json`,
+reaches 005 through `/shared_nfs` seconds late, so set `PREFIX_S=300`.
+
+| | 005 (prefill) | 013 (decode) |
+|---|---|---|
+| `ATOM_HOST_IP` | `10.245.151.159` | `10.245.149.94`, also the decode's `--host` |
+| `ATOM_MOONCAKE_IB_DEVICE` | unset | unset |
+
+`ATOM_HOST_IP` is each node's `ens3` address, which the router, Mooncake's
+handshake and its notifications reach. With `ATOM_MOONCAKE_IB_DEVICE` unset,
+each GPU N registers with `ionic_N`, which carries RoCE v2 on IPv6 only (GID
+index 1); the image's libibverbs warns that the ionic driver does not support
+the kernel's ABI, and the RDMA writes still complete. The prefill side's own
+variables go in `deploy.sh`'s environment, the decode side's as `-e` words of the
+prefix:
+
+```
+ATOM_HOST_IP=10.245.151.159 PREFIX_S=300 scripts/compass/deploy.sh OUT record --gpu 0,1,2,3,4,5,6,7 \
+  --prefill -- <prefill ATOM args> \
+  --decode --on "spur exec <job> docker exec -e ATOM_HOST_IP=10.245.149.94 -e <decode env> <container>" \
+    --host 10.245.149.94 -- <decode ATOM args> \
+  --router -- <router args>
+```
+
+A simulated deployment, `deploy.sh run`, runs both instances on 005: each
+reaches the clock authority and the write-request block at this node's
+127.0.0.1, which 013 cannot. A local prefix, such as `env -u GPU_MAX_HW_QUEUES
+-u ATOM_NUMA_BIND`, still starts the decode apart and makes the KV link
+`inter_node`, as the real pair spans.
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
 
