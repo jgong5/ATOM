@@ -580,11 +580,14 @@ def test_a_trace_two_exports_give_two_sessions_refuses_in_either_order(run, give
         run(str(run.record), "--sample", "all", "--sessions", "0:4", *named)
 
 
-def test_a_deployment_above_tensor_parallel_1_refuses_naming_the_skew_issue(run):
+def test_a_deployment_above_tensor_parallel_1_measures_a_record_that_states_it(run):
+    engine = run.record / "steps/dp0.engine.json"
+    stated = json.loads(engine.read_text()) | {"tensor_parallel_size": 2}
+    engine.write_text(json.dumps(stated))
     run.config.tensor_parallel_size = 2
-    with pytest.raises(SystemExit, match=r"tensor parallel size 2: .*\(#1188\)"):
-        run(str(run.record), "--sample", "all", *run.named(run.record))
-    assert Bench.started == []
+    store = run(str(run.record), "--sample", "all", *run.named(run.record))
+    assert Bench.started[0].tensor_parallel_size == 2
+    assert set(by_view(store)) == views(read(run.record / "steps")[0])
 
 
 @pytest.mark.parametrize(

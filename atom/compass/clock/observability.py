@@ -153,23 +153,15 @@ class RefusalTally:
     The sources in use are ``cost`` (the cost model declined to price a step),
     ``command`` (a refused worker control command), ``executor`` (a job the
     simulated executor refused) and ``clock`` (a clock call from a thread other
-    than the clock owner); any other name is tallied the same way. The two
-    fractions count ``cost`` reasons only, since only those are steps.
+    than the clock owner); any other name is tallied the same way. The step
+    fraction counts ``cost`` reasons only, since only those are steps.
     """
 
     steps: int = 0
-    refused_predicted_seconds: float = 0.0
-    predicted_seconds: float = 0.0
     reasons: tuple[tuple[str, int], ...] = ()
 
     @classmethod
-    def of(
-        cls,
-        reasons,
-        steps: int,
-        refused_predicted_seconds: float = 0.0,
-        predicted_seconds: float = 0.0,
-    ) -> "RefusalTally":
+    def of(cls, reasons, steps: int) -> "RefusalTally":
         """Count each reason; sorted, since the order refusals happen in is not
         reproducible between runs."""
         counted: dict[str, int] = {}
@@ -178,12 +170,7 @@ class RefusalTally:
             if not source or not detail:
                 raise ValueError(f"a refusal reason is `source:detail`, got {reason!r}")
             counted[reason] = counted.get(reason, 0) + 1
-        return cls(
-            steps,
-            _finite_seconds(refused_predicted_seconds, "refused_predicted_seconds"),
-            _finite_seconds(predicted_seconds, "predicted_seconds"),
-            tuple(sorted(counted.items())),
-        )
+        return cls(steps, tuple(sorted(counted.items())))
 
     def record(self) -> dict:
         by_source: dict[str, int] = {}
@@ -196,11 +183,6 @@ class RefusalTally:
             "by_source": [[source, n] for source, n in sorted(by_source.items())],
             "steps": self.steps,
             "fraction_of_steps": cost / self.steps if self.steps else 0.0,
-            "fraction_of_predicted_seconds": (
-                self.refused_predicted_seconds / self.predicted_seconds
-                if self.predicted_seconds
-                else 0.0
-            ),
             "reasons": [[reason, count] for reason, count in self.reasons],
         }
 

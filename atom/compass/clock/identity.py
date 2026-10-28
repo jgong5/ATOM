@@ -23,29 +23,48 @@ arrived in, which is a race.
 
 from dataclasses import dataclass
 
+_BY_NAME: dict = {}
 
-@dataclass(frozen=True, order=True)
+
+@dataclass(frozen=True, order=True, init=False)
 class LpId:
     """The name of one logical process.
 
     Frozen so it can key a mapping, ordered so a caller can sort or `min` over
     identities directly and get the same answer in every process.
+
+    A process holds one object per name: constructing, copying or unpickling a
+    name returns that object. Equality is therefore identity, and both it and
+    the hash run in C, which matters because the clock authority looks
+    identities up dozens of times per request.
     """
 
     name: str
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.name, str):
+    __eq__ = object.__eq__
+    __hash__ = object.__hash__
+
+    def __new__(cls, name: str):
+        if not isinstance(name, str):
             raise TypeError(
-                f"a logical process name must be a str, got {type(self.name).__name__}"
+                f"a logical process name must be a str, got {type(name).__name__}"
             )
-        if not self.name:
-            raise ValueError("a logical process name must not be empty")
-        if any(c.isspace() for c in self.name):
-            raise ValueError(
-                f"a logical process name must not contain whitespace, got {self.name!r}; "
-                "names are written verbatim into the timeline record, one field per column"
-            )
+        lp_id = _BY_NAME.get(name)
+        if lp_id is None:
+            if not name:
+                raise ValueError("a logical process name must not be empty")
+            if any(c.isspace() for c in name):
+                raise ValueError(
+                    f"a logical process name must not contain whitespace, got {name!r}; "
+                    "names are written verbatim into the timeline record, one field per column"
+                )
+            lp_id = object.__new__(cls)
+            object.__setattr__(lp_id, "name", str(name))
+            lp_id = _BY_NAME.setdefault(lp_id.name, lp_id)
+        return lp_id
+
+    def __reduce__(self):
+        return LpId, (self.name,)
 
     def __str__(self) -> str:
         return self.name

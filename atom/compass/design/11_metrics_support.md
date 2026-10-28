@@ -356,7 +356,8 @@ forward made the run **33% slower** (TPOT 3.26 → 4.33 ms).
    counting-invariant comparison needs no new instrumentation** — a scrape on each side and
    a diff.
 2. **A histogram's `_count` is itself a counting invariant.** Same workload, same requests,
-   so real and simulated must produce the same number of observations, exactly.
+   so real and simulated observation counts compare directly; like every count but
+   preemptions and prefill tokens (`08` D46), it is reported, not gated.
 3. **`_sum / _count` is a mean** comparable against the real-vs-real noise floor of `08`
    D45, with no new instrumentation.
 

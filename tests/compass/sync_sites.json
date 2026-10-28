@@ -4354,14 +4354,14 @@
    "mechanism_why": "each turn ends with the forward it runs, so it never spins idle; the bench measures real forwards on a real runner for a measuring command, and no simulated run starts one"
   },
   {
-   "id": "atom/compass/bench/window.py::BenchWindow._repeat::dist.all_reduce(values, op=dist.ReduceOp.MAX, group=group)::collective#0",
+   "id": "atom/compass/bench/window.py::BenchWindow._repeat::dist.all_gather(ranks, mine, group=group)::collective#0",
    "file": "atom/compass/bench/window.py",
    "symbol": "BenchWindow._repeat",
-   "call": "dist.all_reduce",
-   "expr": "dist.all_reduce(values, op=dist.ReduceOp.MAX, group=group)",
+   "call": "dist.all_gather",
+   "expr": "dist.all_gather(ranks, mine, group=group)",
    "shape": "collective",
    "peer": "process",
-   "why": "after each forward the bench's workers agree on the repeat over their CPU group: it counts only where it counts on every worker, at the slowest worker's times",
+   "why": "after each forward the bench's workers agree on the repeat over their CPU group: it counts only where it counts on every worker, at the last-opened worker's times",
    "mechanism": "K9",
    "mechanism_why": "the bench measures real forwards on a real runner for a measuring command, and no simulated run starts one"
   },

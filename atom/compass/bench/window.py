@@ -22,9 +22,15 @@ host that stalls now and then only discards the repeats it stalls.
 `WARMUPS` forwards run first, with no preload, and size the first preload: the
 longest the host took to issue one of them. Then `REPEATS` repeats are kept,
 and the statistic is their median. Every worker runs each forward, and the
-workers agree on it: a repeat counts only where it counts on every worker, and
-its times are each the slowest worker's, so the reply of rank 0, the only one
-the runner manager returns, carries the step charged to its slowest rank.
+workers agree on it: a repeat counts only where it counts on every worker, the
+host time sizing the preload is the slowest worker's, and the repeat's times
+are the last-opened worker's, the one whose F to B is shortest. Each worker's
+preload spins a clock it calibrated once, so the preloads end apart, and every
+worker waits at the forward's first collective for the last to open: the
+window of a worker that opened earlier also holds that wait. The last-opened
+worker's holds none, and every collective holds it for the slowest worker, so
+the reply of rank 0, the only one the runner manager returns, carries the
+group's step, charged to its slowest rank.
 """
 
 import copy
@@ -100,9 +106,13 @@ class BenchWindow:
         group = self.bench_group()
         if group is None:
             return forward.values
-        values = torch.tensor(forward.values, dtype=torch.int64)
-        dist.all_reduce(values, op=dist.ReduceOp.MAX, group=group)
-        return values.tolist()
+        mine = torch.tensor(forward.values, dtype=torch.int64)
+        ranks = [torch.empty_like(mine) for _ in range(dist.get_world_size(group))]
+        dist.all_gather(ranks, mine, group=group)
+        ranks = torch.stack(ranks)
+        missed, *_, host = ranks.max(0).values.tolist()
+        _, *times, _ = ranks[ranks[:, 1].argmin()].tolist()
+        return [missed, *times, host]
 
 
 class _Forward:
