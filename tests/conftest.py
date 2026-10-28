@@ -27,6 +27,14 @@ if ATOM_ROOT not in sys.path:
 
 # ── 2. Import atom submodules ──────────────────────────────────────────────
 
+# Compass's GPU checks leave out the process that runs them by the KFD entry
+# its first open of /dev/kfd adds. `atom.utils.region_graph` below opens it
+# (`atom.utils.forward_context` asks torch whether a GPU is available), so the
+# session takes that first open here.
+from atom.compass.drive.gpu import kfd_pid
+
+kfd_pid()
+
 from atom.config import Config
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler

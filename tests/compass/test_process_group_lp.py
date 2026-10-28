@@ -14,7 +14,7 @@ import pytest
 
 import atom.utils.distributed.utils as dist_utils
 from atom.compass.clock import LpId
-from atom.utils import get_open_port
+from tests.compass.held_ports import held_ports
 
 
 @pytest.fixture(autouse=True)
@@ -29,14 +29,21 @@ def short_rendezvous(monkeypatch):
     monkeypatch.setenv("GLOO_SOCKET_IFNAME", "lo")
 
 
-def test_a_group_over_two_lps_is_refused_naming_both(monkeypatch):
+@pytest.fixture
+def port():
+    """The rendezvous port, held until rank 0's store binds it."""
+    with held_ports(1) as [port]:
+        yield port
+
+
+def test_a_group_over_two_lps_is_refused_naming_both(monkeypatch, port):
     monkeypatch.setattr(
         dist_utils, "LP_OF_RANK", {0: LpId("engine-P"), 1: LpId("engine-D")}
     )
 
     with pytest.raises(RuntimeError) as refused:
         dist_utils.stateless_init_torch_distributed_process_group(
-            "127.0.0.1", get_open_port(), 0, 2, backend="gloo"
+            "127.0.0.1", port, 0, 2, backend="gloo"
         )
 
     assert str(refused.value) == (
@@ -45,12 +52,12 @@ def test_a_group_over_two_lps_is_refused_naming_both(monkeypatch):
     )
 
 
-def test_a_rank_missing_from_the_map_is_refused_by_name(monkeypatch):
+def test_a_rank_missing_from_the_map_is_refused_by_name(monkeypatch, port):
     monkeypatch.setattr(dist_utils, "LP_OF_RANK", {0: LpId("engine")})
 
     with pytest.raises(RuntimeError) as refused:
         dist_utils.stateless_init_torch_distributed_process_group(
-            "127.0.0.1", get_open_port(), 0, 3, backend="gloo"
+            "127.0.0.1", port, 0, 3, backend="gloo"
         )
 
     assert str(refused.value) == (
@@ -58,12 +65,10 @@ def test_a_rank_missing_from_the_map_is_refused_by_name(monkeypatch):
     )
 
 
-def test_the_dp2_group_of_one_engine_lp_is_built(monkeypatch):
+def test_the_dp2_group_of_one_engine_lp_is_built(monkeypatch, port):
     monkeypatch.setattr(
         dist_utils, "LP_OF_RANK", {0: LpId("engine"), 1: LpId("engine")}
     )
-    port = get_open_port()
-
     with ThreadPoolExecutor(2) as pool:
         ranks = [
             pool.submit(

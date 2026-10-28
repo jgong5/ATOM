@@ -33,6 +33,9 @@ since serve wrote ``server.json``, when ``/health`` first answered
 (`aiter_jit`): a step may have waited on its build, so grading, `compass fit
 steps`, `compass fit host`, `step_linear_fit` and `validate.cost` refuse the
 record. A server that built none leaves no entry.
+Its ``ptl_changes`` names each change of its cards' PTL state from then until
+the stop (`identity.ptl_changes`), which the fits refuse; ``ptl`` is the
+state at the stop.
 
 `--profile-ops` and `--profile-steps A:B`, the op-level half's profiled pass,
 refuse; so does ATOM's ``--load_dummy``: a record times real weights, and MoE
@@ -51,6 +54,7 @@ from atom.compass.backends.step_labels import label_run, write_table
 from atom.compass.cli import OPS
 from atom.compass.drive import aiter_jit, serve
 from atom.compass.drive.gpu import add_gpu_flag
+from atom.compass.drive.identity import PTL_CHANGES, ptl_changes
 from atom.compass.run import _write_whole
 
 PROG = "compass record"
@@ -78,13 +82,16 @@ def main(argv: list[str]) -> None:
         AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1"),
         "TRITON_CACHE_DIR": knobs.cache.dir,
     }
-    serve.serve(atom_args, args.out, args.gpu, extra_env=env, host=args.host)
-    run_json = Path(args.out) / serve.RUN_JSON
     # serve writes server.json when /health first answers, so its mtime is
     # when serving began; a server that never answered served nothing.
     ready = Path(args.out) / serve.READY_FILE
+    with ptl_changes(args.gpu, ready) as changes:
+        serve.serve(atom_args, args.out, args.gpu, extra_env=env, host=args.host)
+    run_json = Path(args.out) / serve.RUN_JSON
     builds = aiter_jit.builds_since(ready.stat().st_mtime_ns) if ready.exists() else {}
     run = {**json.loads(run_json.read_text()), "env": env, **builds}
+    if changes:
+        run[PTL_CHANGES] = changes
     _write_whole(run_json, json.dumps(run))
     write_engine_and_costs(args.out)
 

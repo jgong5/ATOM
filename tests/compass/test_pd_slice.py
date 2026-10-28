@@ -45,7 +45,6 @@ from test_vertical_slice import (
     TREE,
     WALL_S,
     Traffic,
-    _free_port,
     _run_file,
     publish_entry,
 )
@@ -60,10 +59,10 @@ from atom.compass.clock import (
     single_engine_table,
 )
 from atom.compass.detect.scenario import check_run
-from atom.compass.drive.serve import _free_ports
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
 from atom.utils.compass_loop import HttpChannel
+from tests.compass.held_ports import held_ports
 
 NEEDS_A_PD_RUN = pytest.mark.skipif(
     not (torch.cuda.is_available() and MODEL and shutil.which("atomesh")),
@@ -105,51 +104,54 @@ def publish_pd_entries(store, machine, env) -> None:
 def run_pd(out: Path, seed: str) -> dict:
     """One run under `pd_sim.sh`; its step table and request times."""
     out.mkdir()
-    ports = dict(zip(PORTS, _free_ports(len(PORTS))))
-    endpoint = f"tcp://127.0.0.1:{ports['CLOCK_PORT']}"
-    run_file = _run_file(out, clock_endpoint=endpoint, step_stub=CONSTANT, **PD)
-    env = dict(
-        os.environ,
-        PYTHONHASHSEED=seed,
-        PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
-        MODEL=MODEL,
-        DECODE_EXEC=os.environ.get("ATOM_COMPASS_PD_DECODE_EXEC", ""),
-        **{name: str(port) for name, port in ports.items()},
-    )
-    publish_pd_entries(out / "store", DOCUMENT, env)
-    log = out / "pd_sim.log"
-    with open(log, "w") as f:
-        sim = subprocess.Popen(
-            ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
-            cwd=TREE,
-            env=env,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+    with held_ports(len(PORTS)) as drawn:
+        ports = dict(zip(PORTS, drawn))
+        endpoint = f"tcp://127.0.0.1:{ports['CLOCK_PORT']}"
+        run_file = _run_file(out, clock_endpoint=endpoint, step_stub=CONSTANT, **PD)
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
+            MODEL=MODEL,
+            DECODE_EXEC=os.environ.get("ATOM_COMPASS_PD_DECODE_EXEC", ""),
+            **{name: str(port) for name, port in ports.items()},
         )
-    # A run that hangs ends here, with every process pd_sim.sh started.
-    watchdog = threading.Timer(WALL_S, os.killpg, (sim.pid, signal.SIGKILL))
-    watchdog.start()
-    try:
-        deadline = time.monotonic() + WALL_S
-        while "pd_sim: ready" not in log.read_text():
-            assert sim.poll() is None, f"pd_sim.sh exited:\n{log.read_text()}"
-            assert time.monotonic() < deadline, f"no router in {WALL_S} wall seconds"
-            time.sleep(0.5)
-        traffic = PdTraffic(
-            json.loads(run_file.read_text()),
-            ports["ROUTER_PORT"],
-            sim,
-            scrape_port=ports["PREFILL_PORT"],
-        )
-        traffic.run()
-        code = sim.wait(timeout=120)
-    finally:
-        watchdog.cancel()
-        if sim.poll() is None:
-            os.killpg(sim.pid, signal.SIGKILL)
+        publish_pd_entries(out / "store", DOCUMENT, env)
+        log = out / "pd_sim.log"
+        with open(log, "w") as f:
+            sim = subprocess.Popen(
+                ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        # A run that hangs ends here, with every process pd_sim.sh started.
+        watchdog = threading.Timer(WALL_S, os.killpg, (sim.pid, signal.SIGKILL))
+        watchdog.start()
+        try:
+            deadline = time.monotonic() + WALL_S
+            while "pd_sim: ready" not in log.read_text():
+                assert sim.poll() is None, f"pd_sim.sh exited:\n{log.read_text()}"
+                assert (
+                    time.monotonic() < deadline
+                ), f"no router in {WALL_S} wall seconds"
+                time.sleep(0.5)
+            traffic = PdTraffic(
+                json.loads(run_file.read_text()),
+                ports["ROUTER_PORT"],
+                sim,
+                scrape_port=ports["PREFILL_PORT"],
+            )
+            traffic.run()
+            code = sim.wait(timeout=120)
+        finally:
+            watchdog.cancel()
+            if sim.poll() is None:
+                os.killpg(sim.pid, signal.SIGKILL)
     assert code == 0, f"pd_sim.sh exited {code}:\n{log.read_text()[-4000:]}"
     return {
         "out": out,
@@ -372,20 +374,21 @@ def test_the_standalone_authority_writes_the_step_table_at_the_finish_and_the_su
         (tmp_path / name).write_text('["command:from the last run"]')
     monkeypatch.setenv(compass_run.ENV, str(run))
     monkeypatch.setattr(compass_run, "_authority", None)
-    endpoint = f"tcp://127.0.0.1:{_free_port()}"
-    serving = threading.Thread(
-        target=compass_run.authority, args=(endpoint,), daemon=True
-    )
-    serving.start()
-    deadline, conns = time.monotonic() + 10, []
-    for lp in LPS:
-        while True:
-            try:
-                conns.append(clock_transport.connect(LpId(lp), endpoint))
-                break
-            except ConnectionRefusedError:
-                assert time.monotonic() < deadline, "no authority in 10 seconds"
-                time.sleep(0.05)
+    with held_ports(1) as [port]:
+        endpoint = f"tcp://127.0.0.1:{port}"
+        serving = threading.Thread(
+            target=compass_run.authority, args=(endpoint,), daemon=True
+        )
+        serving.start()
+        deadline, conns = time.monotonic() + 10, []
+        for lp in LPS:
+            while True:
+                try:
+                    conns.append(clock_transport.connect(LpId(lp), endpoint))
+                    break
+                except ConnectionRefusedError:
+                    assert time.monotonic() < deadline, "no authority in 10 seconds"
+                    time.sleep(0.05)
     for conn in conns:
         conn.send((NER, INF, [], INF))
     assert [conn.recv()[0] for conn in conns] == [INF] * len(LPS)
