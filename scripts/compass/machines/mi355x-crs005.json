@@ -17,62 +17,62 @@
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
         "source_root": "commit:b3d336068",
-        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
+        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
       },
       "device.arch": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
         "source_root": "commit:b3d336068",
-        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
+        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
       },
       "device.count_per_node": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
         "source_root": "commit:b3d336068",
-        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
+        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
       },
       "device.memory.capacity_bytes": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
         "source_root": "commit:b3d336068",
-        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
+        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
       },
       "device.software_pinned_to.rocm": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
         "source_root": "commit:b3d336068",
-        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
+        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
       },
       "device.software_pinned_to.aiter": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
         "source_root": "commit:b3d336068",
-        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
+        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
       },
       "device.software_pinned_to.rccl": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
         "source_root": "commit:b3d336068",
-        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
+        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
       },
       "device.software_pinned_to.torch": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
         "source_root": "commit:b3d336068",
-        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
+        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
       },
       "host.http_intake.fixed_s": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "source_root": "commit:b3d336068",
-        "record": "sha256:c5cb629fe2b39e65d54c9568eb4cf95321f06c0a6ad088f2b0962d5cfb08643c",
+        "record": "sha256:60435186b0b1daf45d7e98aa75dc4bc82150a477d5cc38c8bd7271ae19f60d6c",
         "p10": 0.0014128760640065338,
         "p90": 0.001521239612506286
       },
@@ -80,7 +80,7 @@
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "source_root": "commit:b3d336068",
-        "record": "sha256:c5cb629fe2b39e65d54c9568eb4cf95321f06c0a6ad088f2b0962d5cfb08643c",
+        "record": "sha256:60435186b0b1daf45d7e98aa75dc4bc82150a477d5cc38c8bd7271ae19f60d6c",
         "p10": 2.71217303823821e-09,
         "p90": 3.5697033407812384e-09
       },
@@ -225,8 +225,8 @@
       "shm_broadcast_s": 2e-05
     },
     "http_intake": {
-      "fixed_s": 0.0014083168219871818,
-      "per_byte_s": 2.51264761600829e-09
+      "fixed_s": 0.0014311130320839418,
+      "per_byte_s": 3.5102747271578888e-09
     }
   },
   "device": {

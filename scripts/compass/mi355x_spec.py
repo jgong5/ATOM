@@ -48,12 +48,12 @@ DATE, COMMIT = "2026-10-16", "409bedc98"
 TOTAL = 309220868096
 #: The sha256 of the start's server log.
 RECORD = "02618dade3d07bcaac510da11cf8a279a1fe3ef2fce72d41e88a76f2df7c32c6"
-#: On 005, the start is the last `INTAKE` burst's server; its 287.98 GB total
+#: On 005, the start is the `INTAKE` record's server; its 287.98 GB total
 #: is `TOTAL`, the bytes rocm-smi reads on every card of 005 and -013.
 if CRS005:
     MODEL = "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro"
     DATE, COMMIT = "2026-10-28", "b3d336068"
-    RECORD = "b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
+    RECORD = "865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
 SUBJECT = {"model": MODEL, "width": 8, "source_root": f"commit:{COMMIT}"}
 SUBJECT["record"] = f"sha256:{RECORD}"
 
@@ -73,17 +73,18 @@ INTAKE = (
     "2397696f6df3a280660cbc95e7c8db0d61b77fba9986c3d388ccde75f2d5f574",
 )
 #: On 005, three bursts started one after another with no gate or other
-#: deployment on 005 or -013; the record ran last, after c58ca165 and 60435186.
+#: deployment on 005 or -013: c58ca165, the record and c5cb629f; the record is
+#: the median of both terms.
 if CRS005:
     INTAKE = (
         "2026-10-28",
         "b3d336068",
-        {"fixed_s": 0.0014083168219871818, "per_byte_s": 2.51264761600829e-09},
+        {"fixed_s": 0.0014311130320839418, "per_byte_s": 3.5102747271578888e-09},
         {
             "fixed_s": (0.0014128760640065338, 0.001521239612506286),
             "per_byte_s": (2.71217303823821e-09, 3.5697033407812384e-09),
         },
-        "c5cb629fe2b39e65d54c9568eb4cf95321f06c0a6ad088f2b0962d5cfb08643c",
+        "60435186b0b1daf45d7e98aa75dc4bc82150a477d5cc38c8bd7271ae19f60d6c",
     )
 
 #: Each host's core counts as /proc/cpuinfo reads them, aiter's commit in the
