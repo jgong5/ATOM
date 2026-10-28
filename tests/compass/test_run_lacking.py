@@ -19,7 +19,7 @@ from test_drive_run import bundle, op_graph_run, recorded, stub, unstarted
 from test_drive_runfile import LAWS, host_laws, install, published, step_linear
 from test_memory_readings import DOCUMENT
 from test_run_load_invalidation import fitted
-from test_run_step_grid import deployment, host_laws_key, readings
+from test_run_step_grid import SPEC_DIGEST, deployment, host_laws_key, readings
 from test_step_grid_plan import MIXED, SHORT, located, measured, plan
 
 from atom.compass import run as compass_run
@@ -94,6 +94,7 @@ def test_a_stale_law_names_each_axis_and_stale_host_laws_each_field(
     served(monkeypatch, r.config)
     law = fitted(tmp_path, r, moved(readings(r), Axis.ATOM_SRC)).key.token()
     key = {**compass_run.host_key(r.config), "atom": "0" * 64}
+    key["machine_spec"] = SPEC_DIGEST
     params = {"key": key, "laws": LAWS}
     host = published(tmp_path, r, Kind.HOST_LAWS, host_laws_key(r), params)
 
@@ -143,7 +144,7 @@ def test_a_run_that_lacks_nothing_exits_0_and_needs_no_out(
     assert checked(tmp_path, *flags) == 0
 
     out = capsys.readouterr().out
-    assert out == "lacking nothing: the run meets no refusal before it serves\n"
+    assert out == "nothing lacking: the run meets no refusal before it serves\n"
     assert not (tmp_path / "out").exists()
 
 
