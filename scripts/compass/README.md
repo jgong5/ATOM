@@ -845,14 +845,13 @@ powers of two and no margin:
    GPUs each take a subset of the inputs into a store of its own, starts a minute
    apart; copying each store's `step_measurement` entries into one, and this step
    again over every input, measures what remains.
-   Then `compass measure steps $R/cal/c* --sample 6 --seed S --ragged --client-run
+   Then `compass measure steps $R/cal/c* --sample 6 --seed N --ragged --client-run
    $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... --sampling '{"ignore_eos":
    true}' --gpu G $S --out $R/ragged -- $ATOM`, naming every record: it draws six
-   decode steps a rung and measures the ragged views composed from each. Alpha,
-   how far a ragged decode batch's lookup moves from its mean row toward its
-   longest, is fitted on these views alone; without them the bundle holds none.
-   Each view measured prints `measured decode rung <R> <token>: ...`; keep every
-   token, since a rerun prints only the views the store lacked.
+   decode steps a rung and measures the ragged views composed from each. Alpha
+   is fitted on these views alone. Each view measured prints `measured decode
+   rung <R> <token>: ...`; keep every token, since a rerun prints only the views
+   the store lacked.
 8. `compass fit steps --backend step-grid --grid POP... $R/cell/c*/real*
     --grid-definition $G $R/cal/c* RAGGED... --client-run ...`, naming every
     population, real run and record, and as `RAGGED` every token step 7's
