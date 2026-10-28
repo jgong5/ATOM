@@ -630,7 +630,10 @@ mod tests {
             let post = builder.build().unwrap().post(&url).body(vec![b'x'; 64 << 20]);
             tokio::time::timeout(Duration::from_secs(40), post.send())
         };
-        let (plain, lp) = tokio::join!(send(reqwest::Client::builder()), send(held_sends(reqwest::Client::builder())));
+        let (plain, lp) = tokio::join!(
+            send(reqwest::Client::builder()),
+            send(held_sends(reqwest::Client::builder()))
+        );
         eprintln!("reqwest's client: {plain:?}; the router LP's: {lp:?}");
         assert!(matches!(plain, Ok(Err(_))));
         assert!(lp.is_err());
