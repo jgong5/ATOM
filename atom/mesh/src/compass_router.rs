@@ -610,14 +610,18 @@ impl Lp {
 
 #[cfg(test)]
 mod tests {
-    use super::{header, held_sends, stamp, Handling, REQUEST};
-    use std::{cell::RefCell, time::Duration};
+    use super::{header, stamp, Handling, REQUEST};
+    use std::cell::RefCell;
 
     /// A send to a worker that leaves the body unread for 40 wall seconds, as a
     /// frontend holding a request does: reqwest's own client ends it at its
     /// 30 s TCP user timeout, the router LP's goes on waiting.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     #[tokio::test]
     async fn a_held_send_outlasts_30_wall_seconds() {
+        use super::held_sends;
+        use std::time::Duration;
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
         let held = tokio::spawn(async move {
