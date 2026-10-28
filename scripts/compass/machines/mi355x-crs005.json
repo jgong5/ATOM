@@ -173,18 +173,18 @@
       "host.tokenizers[deepseek-v4-pro fast]": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
-        "source_root": "tree:da60c8107bb73adf3f73e4270817b1652aaa8d12",
+        "source_root": "tree:cc8322a5f25ba52eb28315ed061b7eb37296c9a7",
         "p10": {
-          "encode_fixed_s": 5.9462100591878195e-06,
-          "encode_tokens_per_s": 709095.030531297,
-          "decode_fixed_s": 9.13639168980923e-07,
-          "decode_tokens_per_s": 5826091.997703846
+          "encode_fixed_s": 5.681011131296625e-06,
+          "encode_tokens_per_s": 922292.4717718514,
+          "decode_fixed_s": 9.422951418726685e-07,
+          "decode_tokens_per_s": 7281683.996922003
         },
         "p90": {
-          "encode_fixed_s": 7.858966702743386e-06,
-          "encode_tokens_per_s": 792197.1927758444,
-          "decode_fixed_s": 1.0662271611159935e-06,
-          "decode_tokens_per_s": 6629225.053644972
+          "encode_fixed_s": 6.232589089851737e-06,
+          "encode_tokens_per_s": 944412.1376218259,
+          "decode_fixed_s": 1.0044983954628087e-06,
+          "decode_tokens_per_s": 7340732.194450311
         }
       }
     },
@@ -213,10 +213,10 @@
         "applies_to": [
           "DeepseekV4ForCausalLM"
         ],
-        "encode_fixed_s": 6.151411517233099e-06,
-        "encode_tokens_per_s": 747817.886756653,
-        "decode_fixed_s": 9.497430708987762e-07,
-        "decode_tokens_per_s": 6475228.726646361,
+        "encode_fixed_s": 5.952658755239562e-06,
+        "encode_tokens_per_s": 931506.2856534075,
+        "decode_fixed_s": 9.532938990261856e-07,
+        "decode_tokens_per_s": 7326490.326455484,
         "derate": 1.0
       }
     ],
