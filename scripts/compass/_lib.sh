@@ -279,6 +279,13 @@ if not os.fork():
     select.select([os.pidfd_open(int(sys.argv[1]))], [], [])' $$
 }
 
+# The router's bound on each request to a worker, its whole response
+# included, which `--request-timeout-secs` sets (default 1800 s) and the
+# clock cannot reach. A simulated stream lasts as much wall time as the run
+# takes to reach its end, past 1800 s at c=256, so a simulated launch sets
+# the bound to a year.
+COMPASS_SIM_REQUEST_TIMEOUT_S=31536000
+
 # compass_wait_up WHAT PID URL: return once URL answers; exit 1 if PID exits
 # first or WAIT_S seconds pass.
 compass_wait_up() {

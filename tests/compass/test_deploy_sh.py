@@ -431,3 +431,40 @@ def test_a_simulated_router_refuses_a_worker_more_or_a_limiter_before_anything_s
     assert done.returncode == 2, done.stderr
     assert f"the router's arguments carry {flag}," in done.stderr
     assert not (tmp_path / "d").exists()
+
+
+def test_a_simulated_router_bounds_a_request_by_a_year_of_wall_time(tmp_path, planted):
+    # A stream lasts the wall time the run takes to reach its end: at c=256
+    # past the router's default 1800 s, which cut it there.
+    env, flags = planted
+    script = subprocess.Popen(
+        argv(tmp_path, flags), env=env, cwd=tmp_path, stdout=subprocess.PIPE, text=True
+    )
+    _until(tmp_path / "d" / "server.json", script)
+    router = json.loads((tmp_path / "router.json").read_text())["argv"]
+    script.send_signal(signal.SIGTERM)
+    out, _ = script.communicate(timeout=60)
+
+    assert script.returncode == 0, out
+    assert router.count("--request-timeout-secs") == 1
+    bound = int(router[router.index("--request-timeout-secs") + 1])
+    assert bound >= 365 * 24 * 3600
+
+
+@pytest.mark.parametrize("words", [["--request-timeout-secs", "60"], ["--request-timeout-secs=60"]])
+def test_a_simulated_router_refuses_the_caller_s_request_timeout(tmp_path, planted, words):
+    env, flags = planted
+
+    done = subprocess.run(
+        argv(tmp_path, flags, router=[*ROUTER_ARGS, *words]),
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert done.returncode == 2, done.stderr
+    assert "the router's arguments carry --request-timeout-secs," in done.stderr
+    assert not (tmp_path / "d").exists()
