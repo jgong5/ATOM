@@ -36,11 +36,11 @@ Implementation efficiency is a diagnostic, never a projection input (D68), and M
 peaks are its datasheet times the ratios probed on MI355X (D69).
 
 **Revised 2026-10-25 by the owner's ruling on
-[#2138](https://github.com/jgong5/ATOM/issues/2138):** stage 4 runs DeepSeek-V4-Pro on
-MI455, so MI455's peaks are probed on the device and the bound is checked on its own runs;
-the ratios carried from MI355X belong to the frozen stage-3c projection, and the method's
-error is the same MI455 records bounded at the frozen spec and at the probed one (D67.1,
-D69, D70).
+[#2138](https://github.com/jgong5/ATOM/issues/2138), and 2026-10-27 by its rulings there:**
+stage 4 runs DeepSeek-V4.1-Flash on MI455, so MI455's peaks are probed on the device and
+the bound is checked on its own runs; the ratios carried from MI355X belong to the frozen
+stage-3c projection, and the method's error is the same MI455 records bounded at the frozen
+spec and at the probed one (D67.1, D69, D70).
 
 **Scope.** Cost and memory derived from device parameters and model geometry, with **no
 observation of the subject**. Serves three purposes: M2's projection of DeepSeek-V4-Pro
@@ -120,8 +120,8 @@ rate per format (BF16, FP8, FP4); `BW(bytes)`, a bandwidth curve, per size the f
 empty-kernel floor; and the link latency and bandwidth `t_comm` reads (D66). Probed values
 make a term analytical. A device with no hardware takes its datasheet times the ratio
 probed on a device that was run, declared (D69), as the frozen MI455 projection did from
-MI355X; MI455 itself is probed since stage 4. A mixed-format operand pair takes the rate of the wider
-format.
+MI355X; MI455 itself is probed since stage 4. A mixed-format operand pair takes the rate
+of the wider format.
 
 **MoE** work takes the expectation under independent uniform routing: `E(1-(1-k/E)^B)`
 activated experts for `B` rows, each routed to `k` of `E`, and under EP the expected

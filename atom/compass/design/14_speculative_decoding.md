@@ -11,11 +11,15 @@ written against it yet; implementation follows the execution plan in `16`.
 [#952](https://github.com/jgong5/ATOM/issues/952):** acceptance is a stated input carrying
 a method, reported in the run summary and propagated into no cost term (D83, D84, D87).
 
+**Revised 2026-10-27 by the owner's rulings on
+[#2138](https://github.com/jgong5/ATOM/issues/2138):** stage 4 prices DeepSeek-V4.1-Flash's
+DSpark5 on MI455, a second draft path beside V4-Pro's serial MTP (*Milestone placement*).
+
 **Scope.** What speculative decoding — Eagle3, DSpark, and MTP heads — changes for a
 simulator, and why one of those changes is different in kind from everything else in this
-design. The draft path it prices is DeepSeek-V4-Pro's serial MTP, in M2 (D87, *Milestone
-placement*); Eagle3 and DSpark are described because ATOM carries them, and are not on
-M2's path.
+design. The draft paths it prices are DeepSeek-V4-Pro's serial MTP, in M2's MI355X cells,
+and DeepSeek-V4.1-Flash's DSpark5, in stage 4's MI455 cells (D87, *Milestone placement*);
+Eagle3 is described because ATOM carries it, and is not on M2's path.
 
 ---
 
@@ -388,6 +392,23 @@ paired real run, input 1 of D84 (`16` W4.7), and never declared. Input 1 needs T
 transport, so T63 is on M2's path. For MTP1 the curve has one position and the mean
 carries it whole; MTP3 is where its shape matters.
 
+**Stage 4 prices DeepSeek-V4.1-Flash's DSpark5** on MI455 (`16` *Stage 4*), the only
+draft path ATOM serves V4.1 with: `deepseek_v41/config.py::validate_speculative_config`
+refuses any method but DSpark with five draft tokens, a draft checkpoint other than the
+target's, a KV cache other than BF16, and relaxed verification.
+
+| Item | In ATOM | For this topic |
+|---|---|---|
+| draft model | `DeepseekV41DSpark` (`atom/models/deepseek_v41/dspark.py`), its `mtp.*` stages loaded from the target checkpoint | a block drafter, not serial MTP |
+| draft steps | one pass through the draft stages drafts all `K = 5` positions; a Markov head then samples them in turn, and a confidence head scores them | one draft structure per step (D85); its terms are priced apart from the target's, at op level by [#2345](https://github.com/jgong5/ATOM/issues/2345) and at step level by [#2346](https://github.com/jgong5/ATOM/issues/2346) |
+| draft forward | `DraftBlock` and `DraftAttention` subclass V4.1's `Block` and `Attention`, with window-only attention and the draft's own routed-expert count (`dspark_n_routed_experts`) | traced and priced like any structure (D85) |
+| draft weights | the draft stages only: `share_with_target` binds the embedding and LM head to the target's | D86's weight term excludes both |
+| verification | the cells set no confidence schedule (`DSparkConfig.confidence_schedule` is off by default), so every verify step carries the full block, real and simulated (D83) | no truncation to model |
+
+**Each stage-4 cell is an acceptance cell**, as M2's MTP cells are: its per-position rates
+are measured from the paired real run's record, which `compass run --acceptance-record`
+reads, and never declared.
+
 ---
 
 ## Open issues
@@ -399,8 +420,9 @@ carries it whole; MTP3 is where its shape matters.
   different acceptance semantics will compare as one. Recorded as **T59**.
 - **The DSpark hang of `04` T52 was observed in this subsystem** (`dspark_scheduler.py::schedule_prefix_lengths_tensor`,
   while the function was written; the landed function builds that value with `torch.full_like`, which avoids the call that hung).
-  Root-causing it is already a gating task (`16` P0.7). DSpark is not the draft path M2
-  prices, so the hang is not on this topic's path to M2.
+  Root-causing it is already a gating task (`16` P0.7). Stage 4 prices DSpark5
+  (`16` *Stage 4*), so DSpark is on this topic's path to M2; whether the hang gates any of
+  stage 4's work is T52's question.
 - **Whether a draft forward's cost transfers across `K`** is untested. A serial MTP reusing
   one layer `mtp_k` times should be linear in `K`; a real draft stack need not be. One
   measurement at two values of `K` settles it. Recorded as **T60**.

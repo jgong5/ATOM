@@ -40,9 +40,10 @@ and the op-level parts of W4.4, W4.5 and W4.12, and its S3d.12 makes stage 3c's 
 concrete.
 
 **Revised 2026-10-25 by the owner's ruling on
-[#2138](https://github.com/jgong5/ATOM/issues/2138):** *Stage 4* measures DeepSeek-V4-Pro
-on MI455 and grades it in two cells of its own, the last step of v1; stage 3c's projection
-stays frozen as the before side of the method error (D95).
+[#2138](https://github.com/jgong5/ATOM/issues/2138), and 2026-10-27 by its rulings there:**
+*Stage 4* measures DeepSeek-V4.1-Flash on MI455 and grades it in two cells of its own, the
+last step of v1; stage 3c's projection stays frozen as the before side of the method error
+(D95).
 
 **Scope.** How the work is organised, allocated and gated; what happens first; and what
 each stage must produce. It is **detailed through M2**. Work after v1 is listed, not
@@ -59,7 +60,8 @@ The milestones of `README.md` ran from a fake-model M1 through Qwen3.8-27B on MI
 hardware (M2–M4) to Kimi-K3 at TP8 with DP, PP and EP (M5–M7). Priorities changed: the
 focus is now an **MoE model with wide expert parallelism and P/D disaggregation**, with
 **full support on MI355X** and **roofline projection for MI455**. Calibration and pricing
-move onto MI455 once MI455 hardware is available; *Stage 4* does so on two MI455 nodes
+move onto MI455 once MI455 hardware is available; *Stage 4* does so for
+DeepSeek-V4.1-Flash on two 4-card MI455 nodes
 ([#2138](https://github.com/jgong5/ATOM/issues/2138)).
 
 Owner rulings shape the milestones below: Compass work is ordered by the end-to-end
@@ -95,7 +97,7 @@ part of v1, added after that
 - **M2 is v1, #627's stage 3**: DeepSeek-V4-Pro 1P+1D on MI355X, in the nightly
   configurations and then at EP8, each step first with the same
   scheduling decisions as the real engine, then within the acceptance targets; the
-  MI455 roofline projection, stage 3c's; and, last, **stage 4**: DeepSeek-V4-Pro
+  MI455 roofline projection, stage 3c's; and, last, **stage 4**: DeepSeek-V4.1-Flash
   measured on MI455 and graded in two cells, with the analytical bound checked on the
   same runs (*Stage 4*). **Stage 2 is its first gate**: Qwen3.8-27B TP1 on MI308X,
   paired real and simulated cc-traces graded by `08`. Its grading is under *Waves 4–6*.
@@ -111,11 +113,12 @@ part of v1, added after that
   same projection method, run MI308X → MI355X on Qwen3.8-27B (DeepSeek-V4-Pro's FP4
   experts do not run on gfx942), is reported against real MI355X runs to give the method
   an error estimate.
-- **MI455 is measured and graded in stage 4** (#2138). Its own real runs are graded by
-  the step linear backend in two cells, its spec is probed on the device, and the bound
-  is checked on its records; the stage-3c projection stays frozen, and the same MI455
-  records bounded at the frozen spec and at the probed spec give the method's error on
-  DeepSeek-V4-Pro (*Stage 4*).
+- **MI455 is measured and graded in stage 4** (#2138), on DeepSeek-V4.1-Flash rather
+  than V4-Pro, because the stage has two 4-card MI455 nodes. Its own real runs are graded
+  by the step linear backend in two TP4 DSpark5 cells, its spec is probed on the device,
+  and the bound is checked on its records at step and op level; the stage-3c projection
+  stays frozen, and the same MI455 records bounded at the frozen spec and at the probed
+  spec give the method's error (*Stage 4*).
 - **The other milestones are retired, not renumbered.** Each maps as follows, so an older
   citation still resolves:
 
@@ -611,9 +614,9 @@ W5.3's soundness check is S3c.13, at probed peaks rather than the spec's at dera
 and W5.5 are S3c.14, whose projection carries no implementation efficiency (`10` D68).
 
 MI455 hardware arrived during M2. The projection stays frozen as this wave delivered it,
-and MI455's real side, probes, calibration and grading are *Stage 4*'s, in two cells of
-its own rather than a repeat of W4.3–W4.5 and W4.11; S3c.3's probes run on MI455 there, so
-its peaks are probed rather than carried.
+and MI455's real side, probes, calibration and grading are *Stage 4*'s, on
+DeepSeek-V4.1-Flash in two cells of its own rather than a repeat of W4.3–W4.5 and W4.11;
+S3c.3's probes run on MI455 there (S4.4), so its peaks are probed rather than carried.
 
 ### Stage 3d — the empirical op-level price on measured devices
 
@@ -656,55 +659,69 @@ fit is S3d.4's same-kernel interpolation; W4.12, deferred, is S3d.11.
 ### Stage 4 — MI455 measured and graded
 
 The last step of v1, tracked on [#2138](https://github.com/jgong5/ATOM/issues/2138) and
-ruled there on 2026-10-25: DeepSeek-V4-Pro measured on MI455 and graded by the step linear
-backend in two cells, with the analytical bound checked on the same runs. Every issue
-carries `e2e-stage4`, and work is ordered by `Depends on` alone.
+ruled there on 2026-10-25 and 2026-10-27: DeepSeek-V4.1-Flash measured on MI455 and graded
+by the step linear backend in two cells, with the analytical bound checked on the same runs
+at step and op level. Every issue carries `e2e-stage4`, and work is ordered by `Depends on`
+alone.
 
-- **Device.** Two 8-card MI455 nodes, exclusive to this stage. `mi455.json` is rebuilt
-  from probes on the device: a probed value replaces an assumed one, and a value not
-  probed stays assumed (`05` D25). Stage 3c's projection stays frozen at
-  `1dedbac561b6` and `af1ea3021902` as the before side of the method error.
-- **Cells**, aligned with the nightly recipe's flags (`08` D50): 1P+1D on two nodes,
-  DPA-TP8, EP8, MTP1, `--enable-tbo` on prefill; and colocated on one node, TP8, MTP3.
-  Each runs concurrency 1, 4, 16, 64 and 256 on cc-traces 0 to 255, three real rounds;
-  traces 256 to 392 calibrate.
+- **Device and model.** DeepSeek-V4.1-Flash on two 4-card MI455 nodes, one cell to a
+  node, served through S4.2's merged tree. Other users share the nodes, so graded runs go
+  in windows booked with them. `mi455.json` is rebuilt from probes on the device: a probed
+  value replaces an assumed one, and a value not probed stays assumed (`05` D25). Stage
+  3c's projections stay frozen, `1dedbac561b6` (#2036) and `af1ea3021902` (#2070), and the
+  spec they read is the before side of the method error.
+- **Cells**, each TP4 with DSpark5 (`14`): `-tp 4 --kv_cache_dtype bf16
+  --index-cache-dtype fp8 --method dspark --num-speculative-tokens 5 --level 0`. Cell A
+  adds whole-expert EP4, `--enable-expert-parallel`; cell B shards the routed experts
+  across TP. Each runs concurrency 1, 4, 16, 64 and 256 on cc-traces 0 to 255, three real
+  rounds at `--duration 3600` as #975 ran them; traces 256 to 392 calibrate (`08` D50).
 - **Gates.** The step linear backend: each cell's three separable results (`08` D44)
   within the targets of `README.md`. The analytical bound: on every measured MI455 step,
   at step and op level, analytical at the probed peaks is at most measured (`08` D50.2).
   Speed: faster than real; 5× is reported. No ranking gate.
 - **Reported, not gated.** Measured over analytical (`10` D68), and the method error: the
-  same MI455 records bounded at the frozen spec and at the probed spec (`08` D50.2).
-- **Scope.** A new configuration is smoke-tested on MI355X and graded only on MI455.
-  ATOM's bring-up on MI455 is upstream's: merged, not fixed here, and an ATOM defect is
-  filed `atom-issue`.
+  same MI455 records bounded at the frozen spec and at the probed spec (`08` D50.2). The
+  cards are A0 samples, 192 compute units and 288 GiB against the datasheet's 256 and
+  432 GiB ([measured](https://github.com/jgong5/ATOM/issues/2138#issuecomment-6440931928)):
+  a derate probed against the datasheet absorbs the missing units, so the method error
+  includes that gap.
+- **Scope.** A new configuration is smoke-tested on MI355X and graded only on MI455; the
+  MI455 calibration does not wait for the smokes
+  ([ruling](https://github.com/jgong5/ATOM/issues/2145#issuecomment-6442414256)). ATOM's
+  bring-up on MI455 is upstream's: merged, not fixed here, and an ATOM defect is filed
+  `atom-issue`. 1P+1D left the stage, because DeepSeek-V4.1 refuses every KV transfer but
+  `lmcache_mp` ([#2347](https://github.com/jgong5/ATOM/issues/2347)).
 
 | ID | Task | Module | Effort | Depends on |
 |---|---|---|---|---|
-| **S4.1** | The design text ([#2139](https://github.com/jgong5/ATOM/issues/2139)) | design | 100–200 design text | — |
-| **S4.2** | The ROCm/ATOM revision that serves DeepSeek-V4-Pro on MI455, merged and labelled `land as merge`, with the Compass fixes for its reds ([#2140](https://github.com/jgong5/ATOM/issues/2140)) | the merge, `scripts/compass/` | 50–300 | an MI455 nightly image |
-| **S4.3** | The MI455 machine spec from probes on an MI455 node (`05` D26; [#2141](https://github.com/jgong5/ATOM/issues/2141)) | `scripts/compass/`, `drive/` | 150–250, 101 removed | S4.2, GPU queue |
-| **S4.4** | `deploy.sh run` takes `--acceptance-record` for a 1P+1D MTP cell ([#2142](https://github.com/jgong5/ATOM/issues/2142)) | `scripts/compass/`, `drive/` | 10–30 | — |
-| **S4.5** | The 1P+1D DPA-TP8 EP8 MTP1 cell smoked on the MI355X pair ([#2143](https://github.com/jgong5/ATOM/issues/2143)) | `scripts/compass/` | 0–20 | S4.4, #1976, #2100, #2131, #1955, GPU queue |
-| **S4.6** | The colocated TP8 MTP3 cell smoked on one MI355X node ([#2144](https://github.com/jgong5/ATOM/issues/2144)) | `scripts/compass/` | 0–20 | GPU queue |
-| **S4.7** | The 1P+1D cell calibrated on MI455: memory readings, host laws and step linear laws ([#2145](https://github.com/jgong5/ATOM/issues/2145)) | `scripts/compass/laws/` | 0–20, laws generated | S4.2, S4.3, S4.5 |
-| **S4.8** | The colocated cell calibrated on MI455 ([#2146](https://github.com/jgong5/ATOM/issues/2146)) | `scripts/compass/laws/` | 0–20, laws generated | S4.2, S4.3, S4.6 |
-| **S4.9** | The 1P+1D cell on MI455, registered, run and graded (`08` D50; [#2147](https://github.com/jgong5/ATOM/issues/2147)) | `scripts/compass/` | ~10 | S4.7 |
-| **S4.10** | The colocated cell on MI455, registered, run and graded ([#2148](https://github.com/jgong5/ATOM/issues/2148)) | `scripts/compass/` | ~10 | S4.8 |
-| **S4.11** | The bound prices an MTP step's target at op level ([#2149](https://github.com/jgong5/ATOM/issues/2149)) | `validate/` | 30–80 | #2108 |
-| **S4.12** | The MI455 cells' op graphs captured on the card, with the extractors they lack ([#2150](https://github.com/jgong5/ATOM/issues/2150)) | `capture/`, `backends/` | 60–150, plus extractors | S4.2, GPU queue |
-| **S4.13** | The analytical bound and the method error on the MI455 cells (`08` D50.2; [#2151](https://github.com/jgong5/ATOM/issues/2151)) | none, results on the issue | 0, CPU only | S4.9, S4.10, S4.11, S4.12 |
+| **S4.1** | The design text ([#2139](https://github.com/jgong5/ATOM/issues/2139)) | design | 120–240 design text | — |
+| **S4.2** | Upstream `e893780f4` and the head of `ROCm/ATOM#2617`, which serves DeepSeek-V4.1-Flash on gfx1250, merged and labelled `land as merge`, with the Compass fixes for its reds ([#2140](https://github.com/jgong5/ATOM/issues/2140)) | the merge, `scripts/compass/` | 50–300 | — |
+| **S4.3** | The merged tree serves DeepSeek-V4.1-Flash on one MI455 node, in the MI455 image ([#2360](https://github.com/jgong5/ATOM/issues/2360)) | `scripts/compass/` | 0–30 | S4.2, GPU queue |
+| **S4.4** | The MI455 machine spec from probes on an MI455 node (`05` D26; [#2141](https://github.com/jgong5/ATOM/issues/2141)) | `scripts/compass/`, `drive/` | 150–250, 101 removed | S4.2, S4.3, GPU queue |
+| **S4.5** | Cell A smoked on one MI355X node ([#2143](https://github.com/jgong5/ATOM/issues/2143)) | `scripts/compass/` | 0–20 | GPU queue |
+| **S4.6** | Cell B smoked on one MI355X node ([#2144](https://github.com/jgong5/ATOM/issues/2144)) | `scripts/compass/` | 0–20 | GPU queue |
+| **S4.7** | Cell A calibrated on MI455: memory readings, host laws and the step linear law ([#2145](https://github.com/jgong5/ATOM/issues/2145)) | `scripts/compass/laws/` | 0–20, laws generated | S4.2, S4.4, GPU queue |
+| **S4.8** | Cell B calibrated on MI455 ([#2146](https://github.com/jgong5/ATOM/issues/2146)) | `scripts/compass/laws/` | 0–20, laws generated | S4.2, S4.4, GPU queue |
+| **S4.9** | Cell A on MI455, registered, run and graded (`08` D50; [#2147](https://github.com/jgong5/ATOM/issues/2147)) | `scripts/compass/` | ~10 | S4.7, GPU queue |
+| **S4.10** | Cell B on MI455, registered, run and graded ([#2148](https://github.com/jgong5/ATOM/issues/2148)) | `scripts/compass/` | ~10 | S4.8, GPU queue |
+| **S4.11** | DeepSeek-V4.1's op kinds captured as leaves and priced by op extractors ([#2344](https://github.com/jgong5/ATOM/issues/2344)) | `capture/`, `backends/` | 200–300 | — |
+| **S4.12** | The DSpark5 drafter captured at op level, its draft terms apart (`04`; [#2345](https://github.com/jgong5/ATOM/issues/2345)) | `capture/`, `backends/` | 150–250 | S4.11 |
+| **S4.13** | DeepSeek-V4.1's module extractors for the step roofline, the DSpark draft's included ([#2346](https://github.com/jgong5/ATOM/issues/2346)) | `run/`, `backends/` | 150–450 | — |
+| **S4.14** | The bound prices a speculative step's target at op level, its draft terms reported apart ([#2149](https://github.com/jgong5/ATOM/issues/2149)) | `validate/` | 30–80 | #2108, S4.11, S4.12, S4.8 |
+| **S4.15** | The MI455 cells' op graphs captured on the card, with the extractors they lack ([#2150](https://github.com/jgong5/ATOM/issues/2150)) | `capture/`, `backends/` | 60–150, plus extractors | S4.2, S4.3, S4.11, S4.12, GPU queue |
+| **S4.16** | The analytical bound and the method error on the MI455 cells (`08` D50.2; [#2151](https://github.com/jgong5/ATOM/issues/2151)) | none, results on the issue | 0, CPU only | S4.9, S4.10, S4.13, S4.14, S4.15 |
 
-**Exit:** S4.9, S4.10 and S4.13 closed with their named results.
+**Exit:** S4.9, S4.10 and S4.16 closed with their named results.
 
 Not exit criteria, lower priority, run in parallel where resources do not conflict; one
 still open at exit loses `e2e-stage4`:
 
 | ID | Task | Module | Effort | Depends on |
 |---|---|---|---|---|
-| **S4.14** | The step grid under DP-attention, EP8, MTP and TBO: topic `17` amended and its implementation cut into issues ([#2152](https://github.com/jgong5/ATOM/issues/2152)) | design | 100–200 design text | — |
-| **S4.15** | The step grid graded on the MI455 cells ([#2153](https://github.com/jgong5/ATOM/issues/2153)) | `scripts/compass/` | ~10 | S4.14, S4.9, S4.10 |
-| **S4.16** | `measure ops` on MI455 ([#2154](https://github.com/jgong5/ATOM/issues/2154)) | `bench/` | 30–80 | S4.12, GPU queue |
-| **S4.17** | The op-level empirical backend graded on the MI455 cells (`08` D50.3; [#2155](https://github.com/jgong5/ATOM/issues/2155)) | `scripts/compass/` | ~10 | S4.16, S3d.10, S3d.11, S4.9, S4.10 |
+| **S4.17** | The step grid under EP4 and DSpark5: topic `17` amended and its implementation cut into issues ([#2152](https://github.com/jgong5/ATOM/issues/2152)) | design | 100–200 design text | — |
+| **S4.18** | The step grid graded on the MI455 cells ([#2153](https://github.com/jgong5/ATOM/issues/2153)) | `scripts/compass/` | ~10 | S4.17 and the issues it cuts, S4.9, S4.10 |
+| **S4.19** | `measure ops` on MI455 ([#2154](https://github.com/jgong5/ATOM/issues/2154)) | `bench/` | 30–80 | S4.15, GPU queue |
+| **S4.20** | The op-level empirical backend graded on the MI455 cells (`08` D50.3; [#2155](https://github.com/jgong5/ATOM/issues/2155)) | `scripts/compass/` | ~10 | S4.19, S3d.10, S3d.11, S4.9, S4.10 |
 
 ---
 
@@ -729,8 +746,9 @@ Listed so it is not mistaken for an omission; each is re-planned when v1 lands.
 third MI355X node for W4.4, so that calibration does not queue behind the pairs; an MI308X
 node for development, the CPU-and-GPU gates, S3c.3's MI308X probes, stage 2's real side
 (S2.1), and the step grid's measurement (S2.2) while it is idle from stage 2's critical
-path. *Stage 4* adds two 8-card MI455 nodes of its own, exclusive and long term (#2138).
-Until dedicated nodes exist, the shared pools below serve, with the pre-flight gate as written.
+path. *Stage 4* adds two 4-card MI455 nodes, shared with their other users in booked
+windows (#2138). Until dedicated nodes exist, the shared pools below serve, with the
+pre-flight gate as written.
 
 GPU is the scarce resource; almost everything else is CPU-only by design principle 2.
 Only calibration Phases 1b/1c/2, `--measure` runs, the real side of pairings, and the

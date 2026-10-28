@@ -444,8 +444,8 @@ a single term.
 - With no card of the target type, the peaks are its datasheet times the ratios probed on
   a card that was run, assumed, as the frozen MI455 projection took MI355X's (`10` D69,
   #1392); MI455 itself is probed on the device since stage 4 (`16` *Stage 4*). For the
-  memory readings nothing yet decides it: the answer is "assume it and accept the error", an entry marked assumed
-  (`07` D38), which is honest but unguided.
+  memory readings nothing yet decides it: the answer is "assume it and accept the error",
+  an entry marked assumed (`07` D38), which is honest but unguided.
 
 ---
 
