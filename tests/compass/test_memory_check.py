@@ -23,6 +23,7 @@ from atom.compass import run as compass_run
 from atom.compass.memory import MemoryRefusal, check
 from atom.compass.memory.check import main
 from atom.compass.runner.overrides import NonAllocatingRunner
+from atom.compass.validate import __main__ as validate
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
 
@@ -137,6 +138,20 @@ def test_each_reading_is_one_row_with_its_own_verdict(
     assert rows["reserves()"].split()[-2] == f"{saved['reserved']:,}"
 
 
+def test_a_real_pool_logged_as_zero_is_not_compared_and_both_numbers_are_shown(
+    monkeypatch, tmp_path, capsys
+):
+    saved = _memory(monkeypatch, tmp_path, eager=False, readings=CAPTURED)
+    peak, non_torch = _total(saved, "peak_torch"), _total(saved, "non_torch")
+    log = _log(tmp_path / "real.log", peak=peak, non_torch=non_torch, pool=0)
+    rows = _check(capsys, tmp_path, log)
+    assert rows["non_torch"].endswith("pass")
+    assert (
+        "graph pool not compared: the real run's capture reserved 0.00GB; "
+        f"reserves() {saved['reserved']:,} B, predicts() {POOL:,} B"
+    ) in rows["out"]
+
+
 def test_a_real_run_at_another_warmup_shape_refuses_peak_torch_only(
     monkeypatch, tmp_path, capsys
 ):
@@ -195,6 +210,68 @@ def test_a_log_whose_ranks_disagree_is_refused(monkeypatch, tmp_path):
         MemoryRefusal, match="which name no rank to pair with a hand-in"
     ):
         main([*_ranks(tmp_path), str(log)])
+
+
+def _dp_rows(monkeypatch, tmp_path, records, lines) -> dict:
+    """validate's memory rows for DP ranks whose real records hold `records`
+    KV blocks each, against a server log of `lines`, one (blocks, factor on
+    the predicted non_torch) per rank in the order logged."""
+    saved = _memory(monkeypatch, tmp_path, eager=True)
+    engine = tmp_path / compass_run.LP_FILE.format("engine")
+    real = tmp_path / "real"
+    (real / "steps").mkdir(parents=True)
+    for r, blocks in enumerate(records):
+        shutil.copy(engine, engine.with_suffix(f".dp{r}.json"))
+        record = {"num_kvcache_blocks": blocks}
+        (real / "steps" / f"dp{r}.engine.json").write_text(json.dumps(record))
+    peak, non_torch = _total(saved, "peak_torch"), _total(saved, "non_torch")
+    one = tmp_path / "one.log"
+    logged = [
+        _log(one, peak=peak, non_torch=non_torch * f)
+        .read_text()
+        .replace("num_kvcache_blocks=77049", f"num_kvcache_blocks={b}")
+        for b, f in lines
+    ]
+    (real / "server.log").write_text("".join(logged))
+    rows = validate._memory("real", tmp_path, "engine", real)
+    return {(where, name): (value, verdict) for where, name, value, verdict in rows}
+
+
+def test_a_dp_log_whose_ranks_disagree_pairs_each_rank_by_its_kv_blocks(
+    monkeypatch, tmp_path
+):
+    # dp1 and dp2 share a block count and log alike; dp0's line is not first.
+    lines = [(200, 2.0), (100, 1.0), (200, 2.0)]
+    rows = _dp_rows(monkeypatch, tmp_path, [100, 200, 200], lines)
+    assert rows["memory real dp0", "non_torch"][1] == "pass"
+    assert rows["memory real dp1", "non_torch"][1] == "fail"
+    assert rows["memory real dp2", "non_torch"][1] == "fail"
+    assert rows["memory real dp0", "peak_torch"][1] == "pass"
+
+
+@pytest.mark.parametrize(
+    "records,lines,refused",
+    [
+        (
+            [100, 200, 200],
+            [(100, 1.0), (200, 1.0), (200, 2.0)],
+            "that log num_kvcache_blocks=200, the rank's, carry [(",
+        ),
+        (
+            [100, 200, 300],
+            [(100, 1.0), (200, 2.0), (200, 2.0)],
+            "logs num_kvcache_blocks=300, the rank's",
+        ),
+    ],
+    ids=["one-count-two-readings", "count-on-no-line"],
+)
+def test_a_dp_rank_whose_kv_blocks_name_no_one_reading_is_refused(
+    monkeypatch, tmp_path, records, lines, refused
+):
+    rows = _dp_rows(monkeypatch, tmp_path, records, lines)
+    assert rows["memory real dp0", "non_torch"][1] == "pass"
+    value, verdict = rows["memory real dp2", "memory"]
+    assert verdict == "refused" and refused in value
 
 
 def test_a_hand_in_with_no_memory_section_is_refused_by_name(tmp_path):

@@ -90,14 +90,14 @@ lowest median absolute relative error on the held-out triples is selected with
 weight 1, a held-out triple in a band the fit holds no factor for counting as
 an error of 1; the hull is that of its kept views' features, and `held_out`
 that of the held-out views' coordinates, absent when they span none (too few
-or flat in their varying axes). The report gives,
-per kind, the held-out triples' indices and, per member, the kept and dropped
-counts, the centre and scaled MAD of the relative residuals, the condition
-number of the column-scaled design, the zeroed features or bands and the
-held-out error. A fit holding a triple of no kind, or whose lookup or measured
-time is not positive and finite, is refused; so is one where a kind's triples
-hold out none or leave no more than one per coefficient, or its kept views span
-no hull, naming the kind.
+or flat in their varying axes). The report gives, per kind, the held-out
+triples' indices, the selected member's dropped ones and, per member, the
+kept and dropped counts, the centre and scaled MAD of the relative residuals
+of those kept and dropped, the condition number of the column-scaled design,
+the zeroed features or bands and the held-out error. A fit holding a triple of
+no kind, or whose lookup or measured time is not positive and finite, is
+refused; so is one where a kind's triples hold out none or leave no more than
+one per coefficient, or its kept views span no hull, naming the kind.
 """
 
 from __future__ import annotations
@@ -480,6 +480,7 @@ def _fit(
             "held_out_error": float(np.median(error)),
         }
     best = min(members, key=lambda t: report["members"][t]["held_out_error"])
+    report["dropped"] = dev[~solved[best]["keep"]].tolist()
     kept = x[dev[solved[best]["keep"]], 1:]
     try:
         hull = _span(kept, names)
@@ -525,6 +526,7 @@ def fit(
             kinds[k], report[k] = _fit(k, [triples[i] for i in own], seed)
         except ValueError as error:
             raise ValueError(f"the {k} fit: {error}") from error
-        report[k]["held_out"] = [own[i] for i in report[k]["held_out"]]
+        for part in ("held_out", "dropped"):
+            report[k][part] = [own[i] for i in report[k][part]]
     recipe = {"name": RECIPE.name, "version": RECIPE.version, "digest": RECIPE.digest}
     return {"recipe": recipe, "kinds": kinds}, report

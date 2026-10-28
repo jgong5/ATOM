@@ -36,7 +36,8 @@
 # `python -m atom.compass.validate` grades the two in one cell. One client run per OUT:
 # an OUT/client/ there refuses. The server keeps serving unless --stop. Exits 2
 # on bad arguments, 90 to 99 as _lib.sh's tree checks refuse, else 1 naming the
-# step that failed.
+# step that failed. aiperf exiting 1 with the scenario's coverage check as its
+# only exit error is no failure: this prints that check's line and goes on.
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -118,12 +119,24 @@ args=(--endpoint-type chat --custom-dataset-type weka_trace
 # Each request carries X-Session-ID, as the nightly's agentic cell sends it: a
 # dp_sticky router keys off it, and a server alone ignores it. The raw records
 # leave out each request's payload, its prompt, and are compressed once the
-# export is written.
+# export is written. aiperf runs as a job, so that any exit of this script,
+# a SIGTERM's included, stops it.
+trap 'set +e; kill -TERM $(jobs -p) 2>/dev/null; wait' EXIT
 (cd "$OUT/client" && AIPERF_DATASET_MMAP_BASE_PATH=$OUT/client AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true \
     AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true exec "$HARNESS_PYTHON" "${aiperf[@]}" \
     profile --url "${url#http://}" --model "$MODEL" --tokenizer "$MODEL" \
     --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" --export-level raw "${args[@]}") \
-    >"$OUT/client/aiperf.log" 2>&1 || fail "aiperf: exited $?; see $OUT/client/aiperf.log"
+    >"$OUT/client/aiperf.log" 2>&1 &
+# The coverage check wants a first token or a request's end in the duration's
+# last 5%. A request in flight across that window, which aiperf cancels at the
+# cutoff and records nothing of, fails it with the export whole; and every run
+# here is already no valid submission of the scenario (--unsafe-override).
+wait $! || {
+    rc=$? log=$OUT/client/aiperf.log
+    errors=$(sed -n '/AIPerf System Exit Errors/,/╰/s/^│    Error: \([^ ]*\).*/\1/p' "$log" | sort -u)
+    ((rc == 1)) && [[ $errors == ProfileMetricCoverageError ]] || fail "aiperf: exited $rc; see $log"
+    echo "client: aiperf failed its coverage check alone: $(grep -om1 'Profiling metric coverage below .* duration' "$log")"
+}
 (cd / && python3 -m atom.compass.parity.client_run "$OUT/artifacts") ||
     fail "export: atom.compass.parity.client_run exited $? on $OUT/artifacts"
 gzip "$OUT/artifacts/profile_export_raw.jsonl" || fail "export: cannot compress $OUT/artifacts/profile_export_raw.jsonl"

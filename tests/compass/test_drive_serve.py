@@ -25,7 +25,6 @@ from atom.compass.drive import gpu as drive_gpu
 from atom.compass.drive import serve
 from atom.compass.drive.gpu import GpuRefusal
 from atom.compass.run import ENV
-from atom.utils import backends
 
 TREE = Path(__file__).resolve().parents[2]
 PLANTED = """\
@@ -156,7 +155,7 @@ def test_the_stop_removes_the_compiled_graph_cache_directory_its_ranks_used(
     planted, monkeypatch
 ):
     root = planted / "home/.cache/atom"
-    monkeypatch.setattr(backends, "VLLM_CACHE_ROOT", str(root))
+    monkeypatch.setattr(serve, "CACHE_ROOT", str(root))
     mine = root / "torch_compile_cache/0123456789"
     other = root / "torch_compile_cache/9876543210"
     other.mkdir(parents=True)
@@ -169,6 +168,35 @@ def test_the_stop_removes_the_compiled_graph_cache_directory_its_ranks_used(
 
     assert not mine.exists()
     assert other.exists() and configured.exists()
+
+
+#: The stop's cache removal in a process of its own: what it imports, then,
+#: after it, the root ATOM's backends module derives its cache directories from.
+DROP_ALONE = """\
+import sys
+from atom.compass.drive import serve
+loaded = set(sys.modules)
+serve.drop_compiled(sys.argv[1])
+assert set(sys.modules) == loaded, sorted(set(sys.modules) - loaded)
+from atom.utils.backends import VLLM_CACHE_ROOT
+assert serve.CACHE_ROOT == VLLM_CACHE_ROOT, (serve.CACHE_ROOT, VLLM_CACHE_ROOT)
+"""
+
+
+def test_the_stop_imports_no_module_and_removes_under_atom_s_cache_root(tmp_path):
+    """No import, so no HIP context in the calling process, which
+    `HIP_VISIBLE_DEVICES` does not narrow and the other side's GPU check sees."""
+    used = tmp_path / ".cache/atom/torch_compile_cache/0123456789/rank_0/backbone"
+    used.mkdir(parents=True)
+    log = tmp_path / serve.LOG_FILE
+    log.write_text(f"Using cache directory: {used} for vLLM's torch.compile\n")
+    env = dict(os.environ, PYTHONPATH=str(TREE), HOME=str(tmp_path))
+    drop = [sys.executable, "-c", DROP_ALONE, str(log)]
+    done = subprocess.run(
+        drop, env=env, capture_output=True, text=True, timeout=300, check=False
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    assert not used.parents[1].exists()
 
 
 def test_a_simulated_server_gets_its_run_file_and_clock_and_no_gpu_check(
@@ -444,3 +472,73 @@ def test_no_port_a_server_draws_is_in_deploy_sh_s_range_or_mooncake_s(
     drawn = [p for _ in range(250) for p in serve._free_ports(4)]
 
     assert not [p for p in drawn if p in mooncake or p in deploy]
+
+
+#: A planted server whose one worker, on SIGTERM, blocks `BLOCKED_S` before it
+#: writes its step record and exits, as a worker in a Mooncake sync write does.
+#: The server stops it as ATOM's runner manager does: it waits
+#: ATOM_SHUTDOWN_TIMEOUT_S, as ATOM reads it, then kills it.
+RECORDED = """\
+import http.server, os, signal, subprocess, sys, time
+from atom.utils import envs
+d, record = os.environ["PLANTED_DIR"], os.environ["ATOM_COMPASS_PARITY_RECORD"]
+os.makedirs(record)
+open(record + "/dp0.engine.json", "w").close()
+worker = subprocess.Popen([sys.executable, "-c", os.environ["PLANTED_WORKER"], record])
+while not os.path.exists(record + "/dp0.jsonl"):
+    time.sleep(0.05)
+with open(d + "/child", "w") as f:
+    f.write(str(worker.pid))
+
+def stop(*_):
+    try:
+        worker.wait(timeout=envs.ATOM_SHUTDOWN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        worker.kill()
+    os._exit(0)
+
+signal.signal(signal.SIGTERM, stop)
+
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+port = int(sys.argv[sys.argv.index("--server-port") + 1])
+http.server.HTTPServer(("127.0.0.1", port), Health).serve_forever()
+"""
+BLOCKED_S = 7
+WORKER = f"""\
+import signal, sys, time
+steps = sys.argv[1] + "/dp0.jsonl"
+
+def stop(*_):
+    time.sleep({BLOCKED_S})
+    with open(steps, "a") as f:
+        f.write('{{"step": 0}}\\n')
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, stop)
+open(steps, "w").close()
+time.sleep(600)
+"""
+
+
+def test_a_worker_blocked_past_atom_s_default_wait_at_the_stop_keeps_its_record(
+    planted, monkeypatch
+):
+    """The named result: the worker blocks 7 s at SIGTERM, past ATOM's 5 s
+    default wait, and its step record still holds its line after the stop."""
+    monkeypatch.delenv("ATOM_SHUTDOWN_TIMEOUT_S", raising=False)
+    (planted / "recorded.py").write_text(RECORDED)
+    out = planted / "out"
+    env = dict(os.environ, PYTHONPATH=str(TREE), PLANTED_WORKER=WORKER)
+    driver = subprocess.Popen(
+        [sys.executable, "-c", DRIVE, str(planted / "recorded.py"), str(out), *ARGS],
+        env=env,
+    )
+    _ready(out, driver, 600, 0.05)
+    driver.send_signal(signal.SIGTERM)
+    assert driver.wait(timeout=serve.STOP_GRACE_S) == 0
+    lines = (out / serve.STEPS / "dp0.jsonl").read_text().splitlines()
+    assert lines == ['{"step": 0}']

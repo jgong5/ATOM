@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 import test_measure_memory
 import torch
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_measure_memory import MACHINE, a_start, started
 from test_memory_readings import READINGS, STACK, publish_readings
 from test_rapidserve_runner_config import _config

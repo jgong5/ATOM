@@ -25,7 +25,9 @@ handling one released frame is one job, from `LPRuntime.handed_over` to its
 next `LPRuntime.back_at_wait_point`, charged by the `wrap_decode` calls it
 makes. Callbacks it posts with ``call_soon_threadsafe`` run at its completion.
 A `wrap_encode` or `wrap_decode` call on the event loop thread, such as the
-final decode of a non-streaming completion, advances the LP clock instead.
+final decode of a non-streaming completion, advances the LP clock instead, once
+every open service job is placed: a job's result due inside the call runs when
+it ends, whatever wall time the job's thread takes.
 
 `CompassEventLoop` is the frontend's event loop in a simulated run: its
 ``time()`` is the installed `LPRuntime`'s clock, so every timer is on LP time,
@@ -65,6 +67,7 @@ import itertools
 import json
 import logging
 import math
+import queue
 import select
 import selectors
 import signal
@@ -192,6 +195,7 @@ class SimExecutor(ThreadPoolExecutor):
         self.passthrough = 0  # wait jobs in flight
         self.refusals: list[str] = []  # run-summary reasons, ``executor:<name>``
         self.settle: dict[int, partial | None] = {}  # finished, not yet placed
+        self.done = queue.SimpleQueue()  # (k, settle) from the serving thread
         self.serial = ThreadPoolExecutor(1)  # service jobs, in submission order
         self.placing: asyncio.Future | None = None  # `placed`'s wait
 
@@ -240,16 +244,30 @@ class SimExecutor(ThreadPoolExecutor):
                 settle = partial(out.set_exception, e)
             finally:
                 job.cur = None
-        self.loop.call_soon_threadsafe(self._finish, k, settle)
+        self.done.put((k, settle))
+        self.loop.call_soon_threadsafe(self.place)
 
-    def _finish(self, k: int, settle) -> None:
-        # On the loop thread, so a placed job's timer is set before the loop's
-        # next select can see the station resolved and advance the clock.
-        self.settle[k] = settle
-        for j in self.station.finish(k):
-            done = self.settle.pop(j)
-            if done is not None:
-                self.loop.call_at(self.station.completion(j), done)
+    def place(self, wait: bool = False) -> None:
+        """On the loop thread: place the jobs whose threads are done, so a placed
+        job's timer is set before the clock moves; with `wait`, until none is
+        open, warning for a job whose thread takes ``diag_s`` wall seconds."""
+        while (wait and self.station.unresolved()) or not self.done.empty():
+            try:
+                k, settle = self.done.get(timeout=self.station.diag_s if wait else None)
+            except queue.Empty:
+                logger.warning(
+                    "an event-loop charge waits for station job %d, open after "
+                    "%s wall seconds; still waiting",
+                    self.station.final,
+                    self.station.diag_s,
+                )
+                clock.installed().diagnostics += 1
+                k, settle = self.done.get()
+            self.settle[k] = settle
+            for j in self.station.finish(k):
+                done = self.settle.pop(j)
+                if done is not None:
+                    self.loop.call_at(self.station.completion(j), done)
 
     def idle(self) -> bool:
         """The loop is idle at the LP clock now: end `placed`'s wait, if there
@@ -265,13 +283,16 @@ class SimExecutor(ThreadPoolExecutor):
 def charge(d: float) -> None:
     """Charge `d` to this thread's station job; with none open, in the run, the
     caller is the clock owner and advances the LP clock by `d` (`advance_to`
-    refuses any other thread)."""
+    refuses any other thread), on an event loop only once every open service
+    job is placed, so one that completes inside the charge is not late."""
     cur = getattr(job, "cur", None)
     if cur is not None:
         cur[0].charge(cur[1], d)
         return
     rt = clock.installed()
     if rt is not None and rt.in_run:
+        if rt.loop is not None and rt.loop.executor.station is not None:
+            rt.loop.executor.place(wait=True)
         rt.advance_to(rt.now + d)
 
 

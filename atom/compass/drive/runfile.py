@@ -35,6 +35,7 @@ which `scripts/compass/deploy.sh` hands its clock authority and both instances.
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from atom.compass import run
 from atom.compass.artifacts import (
@@ -229,6 +230,19 @@ def _engine_args(atom_args):
     parser = FlexibleArgumentParser(add_help=False)
     EngineArgs.add_cli_args(parser)
     return parser.parse_known_args(atom_args)[0]
+
+
+def pd_side(atom_args, refuse: bool = False) -> str | None:
+    """``P`` or ``D`` for a prefill or a decode instance, else None; `refuse` raises."""
+    transfer = _engine_args(atom_args).kv_transfer_config
+    side = run._pd_side(SimpleNamespace(kv_transfer_config=json.loads(transfer)))
+    if refuse and side is not None:
+        raise ValueError(
+            f"--kv-transfer-config {transfer} makes this a "
+            f"{'prefill' if side == 'P' else 'decode'} instance, which shares a clock "
+            "with its peer: start it with compass run --join, as deploy.sh does"
+        )
+    return side
 
 
 def engine_only(atom_args) -> list[str]:

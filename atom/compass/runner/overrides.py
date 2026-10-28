@@ -634,14 +634,28 @@ class FactoriesOnMeta(TorchFunctionMode):
     GPU -- would still allocate there and bring up a device context. The
     functions are the ones `torch.device` itself redirects, `torch.zeros` and
     `torch.tensor` among them; a `*_like` or `Tensor.new_*` call keeps the
-    device it names.
+    device it names. A meta tensor's `Tensor.to` the GPU stays on meta, as a
+    factory naming the GPU does: ATOM's MLA attention copies its KV scale
+    there that way. A copy to the host still fails, since it needs the data.
     """
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         if func in _device_constructors():
             kwargs["device"] = "meta"
+        elif func is torch.Tensor.to and args[0].is_meta:
+            args = (args[0], *("meta" if _gpu(a) else a for a in args[1:]))
+            if _gpu(kwargs.get("device")):
+                kwargs["device"] = "meta"
         return func(*args, **kwargs)
+
+
+def _gpu(arg: Any) -> bool:
+    """Whether an argument of `Tensor.to` names a GPU: a device index, or a
+    device or its name of the GPU's type."""
+    if type(arg) is int:
+        return True
+    return isinstance(arg, (str, torch.device)) and torch.device(arg).type == "cuda"
 
 
 def process_weights_after_loading(tree: torch.nn.Module) -> None:
@@ -757,6 +771,112 @@ class UnbuiltModel(torch.nn.Module):
         )
 
 
+def publish_planned_transfer(runner: Any) -> None:
+    """Publish one entry of the paged class `get_num_blocks` planned, the state
+    slot a transfer moves beside a request's blocks (`_transferred_slot`),
+    the staging row a second write moves after them (`_staging_row_bytes`),
+    and the runner's TP width, at the file `compass_block_file` names, which
+    `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
+    prices a transfer at them. Refused for a pipeline stage of Kimi's hybrid,
+    whose KDA state regions ATOM's builder refuses to publish there
+    (`_refuse_kda_regions_across_stages`), and for an MLA builder whose sparse
+    indexer scores in FP4, whose regions no P/D backend parses
+    (`_refuse_fp4_indexer_regions`)."""
+    if path := getattr(runner, "compass_block_file", None):
+        from atom.compass import run
+
+        _refuse_kda_regions_across_stages(runner)
+        _refuse_fp4_indexer_regions(runner)
+        plan = runner.pool_plan
+        tp = runner.config.tensor_parallel_size
+        slot, after_blocks = _transferred_slot(runner)
+        staging = _staging_row_bytes(runner)
+        block = plan.entry_bytes[plan.paged_class]
+        run.publish_transfer(path, block, tp, slot, staging, after_blocks)
+
+
+def _refuse_kda_regions_across_stages(runner: Any) -> None:
+    """Refuse a transfer from a pipeline stage of Kimi's hybrid with the reason
+    ATOM's builder gives as it refuses to publish the KDA state regions there:
+    this runner allocates no cache, so the builder is never asked. DeepSeek-V4's
+    builder refuses a stage too, which ATOM's pool plan has refused already."""
+    from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
+
+    pp = runner.config.pipeline_parallel_size
+    if pp > 1 and isinstance(runner.attn_metadata_builder, _KimiMLAGDNCommon):
+        raise RunnerRefusal(
+            "ATOM's `_KimiMLAGDNCommon._with_kda_disagg_regions` refuses a "
+            f"prefill-decode transfer at pipeline_parallel_size {pp}: the KDA "
+            "state regions are keyed by KDA layer index, which "
+            "`_consumer_region_map` cannot align across stages"
+        )
+
+
+def _refuse_fp4_indexer_regions(runner: Any) -> None:
+    """Refuse a transfer from an MLA builder whose sparse indexer scores in FP4,
+    with the reason ATOM's builder gives as it refuses to publish its regions to
+    a P/D backend, which the simulated connector stands for: this runner
+    allocates no cache, so the builder is never asked. A run whose only region
+    reader is `lmcache_mp` is no prefill-decode run and publishes nothing here."""
+    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+
+    builder = runner.attn_metadata_builder
+    if isinstance(builder, AiterMLAMetadataBuilder) and builder._indexer_fp4:
+        raise RunnerRefusal(
+            "ATOM's `AiterMLAMetadataBuilder.get_kv_transfer_tensors` refuses a "
+            "prefill-decode transfer under the FP4 sparse indexer "
+            "(--index_cache_dtype fp4): the P/D backends and the "
+            "hybrid/m3/kimi_k3 offload layouts parse one index region per layer "
+            "and cannot place its separate e8m0 scale plane. Pass "
+            "--index_cache_dtype fp8 to use one"
+        )
+
+
+def _transferred_slot(runner: Any) -> tuple[int, bool]:
+    """The state slot a transfer moves and whether Mooncake writes it after the
+    blocks, read off the plan as the builder's regions carry it: DeepSeek-V4's
+    planned slot entry, with the blocks; one unit of each of Kimi's KDA state
+    regions (`state_slot_regions`), after them, its GDN state entry without the
+    kpool tail plus ReplaySSM's int32 cursor; none for any other builder. A
+    Qwen GDN hybrid plans a slot its regions do not carry."""
+    from atom.model_engine.kv_block import STATE_SLOT_CLASS
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.model_ops.attentions.gdn_attn import GDNStateMixin
+    from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
+
+    builder = runner.attn_metadata_builder
+    if isinstance(builder, DeepseekV4AttentionMetadataBuilder):
+        return runner.pool_plan.entry_bytes[STATE_SLOT_CLASS], False
+    if isinstance(builder, _KimiMLAGDNCommon):
+        cursor = torch.int32.itemsize if builder.replayssm else 0
+        return GDNStateMixin.state_spec(builder).entry_bytes + cursor, True
+    return 0, False
+
+
+def _staging_row_bytes(runner: Any) -> int:
+    """One entry of DeepSeek-V4's compressor state, the row its builder stages
+    a request's state through for prefill-decode (`allocate_per_req_cache`)
+    and Mooncake writes after the request's blocks and slot; 0 when the
+    builder stages nothing: another builder, a connector that needs no
+    staging, or an empty staging pool."""
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+        _uses_pd_staging,
+    )
+    from atom.model_ops.attentions.pool_layout.entry_arena import entry_bytes_for
+
+    builder = runner.attn_metadata_builder
+    if not (
+        isinstance(builder, DeepseekV4AttentionMetadataBuilder)
+        and _uses_pd_staging(runner.config.kv_transfer_config)
+        and int(os.environ.get("ATOM_PD_STAGING_POOL", "32")) > 0
+    ):
+        return 0
+    return sum(entry_bytes_for(fields) for fields in builder._arena_planes)
+
+
 def _refused(method: str):
     """A worker method that answers with its refusal instead of doing its work."""
 
@@ -829,6 +949,7 @@ class PricedSteps:
             "extrapolated_steps": mix.extrapolated_steps,
             # A priced step that carries refusals fell through to a later source.
             "fallback_steps": mix.fallback_steps,
+            "fallback_reasons": {f"{s}: {r}": n for (s, r), n in mix.reasons().items()},
             **{f"{g}_steps": steps.get(g, 0) for g in GROUPS},
             **{f"{g}_seconds": seconds.get(g, 0.0) for g in GROUPS},
             "treatments": dict(mix.treatments),
@@ -1125,7 +1246,9 @@ class NonAllocatingRunner(
         it is a coefficient somebody wrote down rather than a measurement of
         the card being modelled; `kv_pool_sizing` keeps the count beside the
         readings, so which terms those were is recoverable from the runner and
-        not only from a log line somebody kept.
+        not only from a log line somebody kept. On a prefill-decode run the
+        planned block, transferred state slot and staging row are published as
+        well (`publish_planned_transfer`).
 
         The decode process of intra-GPU prefill/decode disaggregation is
         refused rather than sized. ATOM's own runner for that answers a block
@@ -1154,6 +1277,7 @@ class NonAllocatingRunner(
             readings=readings,
         )
         logger.info("%s", self.kv_pool_sizing.table())
+        publish_planned_transfer(self)
         return reply
 
     def allocate_kv_cache(self, num_kvcache_blocks: int) -> bool:
@@ -1413,15 +1537,16 @@ def _group_step_seconds(
     backend states the `stage_share` it prices; any other backend prices the
     whole step, and every stage would charge the whole model.
 
-    A step no cost source answers costs 0 s on this rank and still counts as
-    a priced step; its reason, ``cost:`` and what each source said, joins the
-    refusals the summary reads. With `compass_abort` set it raises instead,
-    which ends the worker. Under a speculative config, a step whose price holds
-    no `draft_terms` is refused the same way, since the drafter runs after
-    every target forward, unless it is priced under the `eager DP dummy`
-    treatment, whose 0 s the group's max already covers. A forward
-    `compass_host` refuses takes the same path, charged with each segment it
-    named at 0; a step both refuse has one reason.
+    A step the cost backend refuses charges no device time on this rank, its
+    answered terms included, and still counts as a priced step; its reason,
+    ``cost:`` and what each source said, joins the refusals the summary reads.
+    With `compass_abort` set it raises instead, which ends the worker. Under
+    a speculative config, a step whose price holds no `draft_terms` is
+    refused the same way, since the drafter runs after every target forward,
+    unless it is priced under the `eager DP dummy` treatment, whose 0 s the
+    group's max already covers. A forward `compass_host` refuses takes the
+    same path, charged with each segment it named at 0; a step both refuse
+    has one reason.
 
     On the rank that keeps the parity record, each step also appends its cost
     line to `dp<r>.cost.jsonl` beside it: the record's `step`; with a

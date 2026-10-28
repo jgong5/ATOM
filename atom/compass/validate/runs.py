@@ -6,7 +6,9 @@
 Each argument is a run directory: its step record in `steps/` and aiperf's
 export in `artifacts/profile_export_aiperf.json`. SIMULATED is the cell at its
 backend, and REAL two or more real runs of it, spaced in time. A run with no
-export yet, one still recording, is refused by name.
+export yet, one still recording, is refused by name, and so is a run
+`cctraces_sim.sh` wrote with no `artifacts/client_run.json` yet, one still
+finishing, when another such run holds one.
 
 A directory `cctraces_sim.sh` wrote is graded as below when it holds
 `artifacts/client_run.json`, whole when it does not. When a real run is graded
@@ -36,7 +38,7 @@ step from its own first on, its own or not, holds such a request, since its
 warmup has then not ended when it starts; when its export lacks traces or
 arguments; when its export lists `unnamed` requests, naming each by its
 `x_request_id`, since no step can be matched to them; and when its run.json
-names `aiter_jit_builds`, the aiter JIT modules its server built or began while
+names `aiter_jit_builds`, the JIT compiles its server ran or began while
 it served, since a step may have waited on a build (`compass record` and a real
 `cctraces_sim.sh` cell write it), or its steps hold `arrivals.json`. A real run is
 refused when its run.json holds `run_file`. A simulated run, refused without
@@ -456,6 +458,19 @@ def grade(real_cells, simulated_cell) -> dict:
     if bare := [str(c) for c in cells if not (Path(c) / EXPORT).is_file()]:
         raise ValueError(
             f"{bare} hold no {EXPORT}; a run still recording is not graded"
+        )
+    # A `cctraces_sim.sh` run, its run.json with no `format_version`, writes
+    # its client run's export after aiperf's, once its server has left.
+    held = {}
+    for c in map(Path, cells):
+        path = c / "run.json"
+        if not path.is_file() or "format_version" not in read_json(path):
+            held[str(c)] = (c / CLIENT_RUN).is_file()
+    done = [c for c, h in held.items() if h]
+    if done and (finishing := [c for c, h in held.items() if not h]):
+        raise ValueError(
+            f"{finishing} hold no {CLIENT_RUN} and {done} do; "
+            "a cctraces_sim.sh run still finishing is not graded"
         )
     _refuse_by_run_file(simulated_cell)
     whole = graded_whole(real_cells)

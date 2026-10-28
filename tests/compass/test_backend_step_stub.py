@@ -36,7 +36,6 @@ from atom.compass.backends import (
     Coefficients,
     CostBackend,
     Granularity,
-    KvGeometry,
     Method,
     Parallelism,
     RequestShape,
@@ -440,26 +439,19 @@ class TestWhatTheOutputSays:
 
 
 class TestCollectives:
-    # One worker, described by two counts: 64 layers run and 16 of them hold a
-    # cache of every past token. A collective is charged on the first and a
-    # block is sized from the second, so each construction below states the
-    # one it needs and neither number stands in for the other.
-    GEOMETRY = KvGeometry(
-        layers=16, kv_heads=4, head_dim=256, element_bytes=2, block_size=64
-    )
+    # One worker, 64 layers deep: a collective is charged on every layer run.
     STACK_LAYERS = 64
 
     def test_a_single_rank_deployment_is_charged_for_no_collective(self):
-        step = StepStubBackend(
-            parallelism=Parallelism(expert_parallel=True), geometry=self.GEOMETRY
-        ).price(BatchView((prefill(128),)))
+        step = StepStubBackend(parallelism=Parallelism(expert_parallel=True)).price(
+            BatchView((prefill(128),))
+        )
         assert not [name for name in named(step) if name.startswith("collective")]
 
     def test_the_charged_collectives_are_the_ones_the_widths_produce(self):
         widths = Parallelism(tp_size=2, dp_size=2, expert_parallel=True)
         step = StepStubBackend(
             parallelism=widths,
-            geometry=self.GEOMETRY,
             stack_layers=self.STACK_LAYERS,
         ).price(BatchView((prefill(128),)))
         charged = [name for name in named(step) if name.startswith("collective")]
@@ -469,20 +461,8 @@ class TestCollectives:
         )
 
     def test_a_collective_with_no_stack_depth_to_price_it_is_refused(self):
-        """And a geometry does not answer it: what it counts is the subset."""
         with pytest.raises(ValueError, match="how many layers"):
             StepStubBackend(parallelism=Parallelism(tp_size=2))
-        with pytest.raises(ValueError, match="how many layers"):
-            StepStubBackend(parallelism=Parallelism(tp_size=2), geometry=self.GEOMETRY)
-
-    def test_a_span_shallower_than_its_paged_layers_is_refused(self):
-        """The two counts crossed: a subset cannot be larger than the set."""
-        with pytest.raises(ValueError, match="have been crossed"):
-            StepStubBackend(
-                parallelism=Parallelism(tp_size=2),
-                geometry=self.GEOMETRY,
-                stack_layers=4,
-            )
 
     @pytest.mark.parametrize("depth", [64.7, "64", 64.0])
     def test_a_depth_that_is_not_a_whole_number_of_layers_is_refused(self, depth):
@@ -496,7 +476,6 @@ class TestCollectives:
         with pytest.raises(TypeError, match="whole number of at least 1"):
             StepStubBackend(
                 parallelism=Parallelism(tp_size=2),
-                geometry=self.GEOMETRY,
                 stack_layers=depth,
             )
 
@@ -522,41 +501,6 @@ class TestCollectives:
         with pytest.raises(ValueError, match="at least one layer"):
             StepStubBackend(parallelism=Parallelism(tp_size=2), stack_layers=False)
 
-    def test_a_collective_is_priced_with_no_geometry_paired_to_it(self):
-        """The geometry is not what a collective is charged on, so it is optional.
-
-        Nothing that computes seconds reads it: the charge is the tokens times
-        the stack depth times a declared coefficient. Refusing for want of it
-        would decline a price this makes identically either way, which is why
-        the refusal above is keyed on the depth alone. The cost of that is the
-        crossed-count check having one count to compare and the record having
-        one to write -- pinned here and in the test below.
-        """
-        step = StepStubBackend(
-            parallelism=Parallelism(tp_size=2), stack_layers=self.STACK_LAYERS
-        ).price(BatchView((prefill(128),)))
-        assert named(step)["collective.tp-all-reduce"] == pytest.approx(
-            128 * self.STACK_LAYERS * Coefficients().collective_token_layer
-        )
-
-    def test_the_record_says_when_no_paged_count_was_stated(self):
-        """One count written where two describe a worker, said rather than implied.
-
-        A lone `on 64 layers` reads as the whole description of the worker,
-        and on a hybrid it is a quarter of one. The line names the count it
-        does not have instead.
-        """
-        paired = StepStubBackend(
-            parallelism=Parallelism(tp_size=2),
-            geometry=self.GEOMETRY,
-            stack_layers=self.STACK_LAYERS,
-        ).describe()
-        alone = StepStubBackend(
-            parallelism=Parallelism(tp_size=2), stack_layers=self.STACK_LAYERS
-        ).describe()
-        assert "on 64 layers, 16 paged" in paired
-        assert "on 64 layers, paged count not stated" in alone
-
     def test_a_charged_collective_says_it_is_a_candidate(self):
         """The widths rule one out conclusively and rule it in conditionally.
 
@@ -568,7 +512,6 @@ class TestCollectives:
         """
         step = StepStubBackend(
             parallelism=Parallelism(tp_size=2, dp_size=2, expert_parallel=True),
-            geometry=self.GEOMETRY,
             stack_layers=self.STACK_LAYERS,
         ).price(BatchView((prefill(128),)))
         for name, _, provenance in step.rows():
@@ -577,13 +520,12 @@ class TestCollectives:
     def test_a_charged_collective_says_which_layer_count_it_used(self):
         """Two counts describe the worker and the seconds carry neither.
 
-        A charge on the paged layers of this geometry and one on its stack are
+        A charge on the paged layers of a hybrid and one on its stack are
         both a number of seconds in a total, so the term states the count it
         multiplied where a reader of the record finds it.
         """
         step = StepStubBackend(
             parallelism=Parallelism(tp_size=2),
-            geometry=self.GEOMETRY,
             stack_layers=self.STACK_LAYERS,
         ).price(BatchView((prefill(128),)))
         for name, _, provenance in step.rows():
@@ -600,7 +542,6 @@ class TestCollectives:
         """
         step = StepStubBackend(
             parallelism=Parallelism(tp_size=2, dp_size=2, expert_parallel=True),
-            geometry=self.GEOMETRY,
             stack_layers=self.STACK_LAYERS,
         ).price(BatchView((prefill(128),)))
         stands_in = {
@@ -639,7 +580,6 @@ class TestCollectives:
         )
         step = StepStubBackend(
             parallelism=Parallelism(tp_size=2),
-            geometry=self.GEOMETRY,
             stack_layers=self.STACK_LAYERS,
         ).price(BatchView((prefill(128),)))
         said = {name: provenance for name, _, provenance in step.rows()}

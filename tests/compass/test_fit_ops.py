@@ -9,6 +9,7 @@ import json
 import pathlib
 
 import pytest
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 
 from atom.compass import cli, run
 from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, GateState, Key, Kind
@@ -466,3 +467,82 @@ def test_a_point_over_5pct_off_declines_only_the_two_gaps_beside_it(b, priced):
     else:
         assert got.seconds == pytest.approx(priced)
         assert got.provenance.validated is (b != 16)  # inside 2 to 16, 16 to 30
+
+
+GATHER = "_c10d_functional.all_gather_into_tensor.default"
+
+
+def _gathered(rows):
+    """An all-gather of `rows` rows from each of eight ranks, 1024 bytes a row."""
+    x = {"shape": [rows, 64], "stride": [64, 1], "dtype": BF16, "role": "activation"}
+    return {"op": GATHER, "args": {"x": x}, "out": [[8 * rows, 64]]}
+
+
+@pytest.mark.parametrize(
+    "rows, at, priced",
+    [
+        (2, ("decode", None, 2, None, 1024, 1024), 2e-6),
+        (3, ("prefill", 3, 1, None, 0, 0), 3e-6),
+        (
+            8,
+            ("decode", None, 8, None, 1024, 1024),
+            f"{GATHER}: bytes = 8192 is outside the measured 1024 to 4096",
+        ),
+    ],
+)
+def test_a_price_list_prices_a_collective_between_two_measured_sizes(rows, at, priced):
+    # measured at decode widths 1 and 4: 1024 and 4096 bytes, one kernel
+    points = [
+        {"shape": f"decode B={b}", "context": 1024, "op": GATHER, "cold_ns": ns}
+        | {"leaf": bench.signature(_gathered(b)), "kernels": ["ag"]}
+        | {"exchange": bench.exchange(_gathered(b))}
+        for b, ns in ((1, 1e3), (4, 4e3))
+    ]
+    params = ops.fit(points)
+    ops.held_out(params)
+
+    got = ops.PriceList(params).price((_gathered(rows), at, 0))
+
+    if isinstance(priced, str):
+        assert got.reason == priced
+    else:
+        assert got.seconds == pytest.approx(priced)
+
+
+@pytest.mark.parametrize(
+    "mean, priced",
+    [
+        (3000, 57.5e-6),
+        (
+            6400,
+            (
+                "aiter.gemm: at B = 4, at mean = 1000, context = 8000 is outside "
+                "the measured 1024 to 1024"
+            ),
+        ),
+    ],
+)
+def test_a_family_with_ragged_points_leaves_out_a_uniform_point_the_pool_cut(
+    mean, priced
+):
+    # At 8000 tokens the pool cut the uniform point's other three rows to 4000:
+    # its rows hold a mean of 625 permille, not the 1000 its context names.
+    cut = _point(4, 82.5e3, context=8000)
+    cut["rows"] = [[1, 8000, True]] + [[1, 4000, True]] * 3
+    ragged = [_point(4, 20e3 + 100 * m, context=[8000, m]) for m in (250, 500)]
+    params = ops.fit([_point(4, 10e3), *ragged, cut])
+    ops.held_out(params)
+    (f,) = params["families"].values()
+    leaf = json.loads(_leaf(4, 128))
+
+    got = ops.PriceList(params).price((leaf, ("decode", None, 4, None, 8000, mean), 0))
+
+    assert sorted(c for c, *_ in f["points"]) == [
+        [4, 250, 8000],
+        [4, 500, 8000],
+        [4, 1000, 1024],
+    ]
+    if isinstance(priced, str):
+        assert got.reason == priced
+    else:
+        assert got.seconds == pytest.approx(priced)

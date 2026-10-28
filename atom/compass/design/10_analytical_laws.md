@@ -300,7 +300,7 @@ carries a method, as cost terms do (#952, `memory/terms.py`):
 | **weights** | A | ask a meta build, dedupe by storage | analytical from the meta build | **exact at every width** — the existence proof |
 | **KV bytes/token** | A | layers × kv_heads/TP × head_dim × 2 × dtype | analytical | arithmetic |
 | **buffers** | A | the same meta build, dedupe by buffer storage ([`03` D16's source table](03_memory_and_kv_model.md#the-source-of-each-term)) | analytical | **exact** against DeepSeek-V4-Pro's real buffer storages at DPA-TP8 (#1166); a rotary formula before it was **4× wrong** on the 27B |
-| **activations** | B | `k_model × tokens`, k read on one real start per configuration (`07` D38) | measured at the entry's warmup tokens, estimated at others; declared from an assumed entry | linear scaling holds — a 3,494-token trace scaled to an independently measured 4,096-token peak at **+0.0% at TP=1/2/4**. `k` is not derivable from geometry within 25% (T34). |
+| **activations** | B | `k_model × tokens`, k read on one real start per configuration (`07` D38) | measured at the entry's own warmup tokens, which are the run's, since the entry is keyed by what sizes the warmup; never rescaled to another count; declared from an assumed entry | linear scaling holds — a 3,494-token trace scaled to an independently measured 4,096-token peak at **+0.0% at TP=1/2/4**. `k` is not derivable from geometry within 25% (T34). |
 | **invisible scratch** | **C** | inside the measured `k` | that of the activations term | kernel-internal. **0.1 KB/token on the 0.6B, 39.6 KB/token on the 27B** — worth the difference between −35.0% and +3.4% held out |
 | **`non_torch`, load residue** | **C** | — | measured where probed at this width; declared if assumed or transferred | no form fits; a `memory_readings` entry, marked assumed for a device never run (`07` D38) |
 | **graph pool** | C | `reserves()` mirrors ATOM; `predicts()` reads a pool line | `reserves()` analytical on the eager branch, combined with the activations term on the whole-graph one; `predicts()` estimated if probed, declared if assumed | measured line at W=1, flat 104 MiB above |
@@ -314,7 +314,7 @@ So an analytical memory model gets weights and KV **exactly**, activations **app
 and needs Class-C constants from a `memory_readings` entry for the rest — which is
 precisely the arrangement doc 03 already describes. Analytical memory is therefore *not* a new
 design; it is the existing memory model (`03` D16) with the activation coefficient
-measured or derived rather than walked.
+measured rather than walked.
 
 **Revised 2026-10-10 and 2026-10-16: the measured coefficient is the source.** `k_model`
 is one real start's `peak - current` after warmup over the warmup tokens, per
@@ -365,7 +365,7 @@ and ranking is no longer the primary gate. The memory goals stand:
 |---|---|---|
 | **Memory: KV capacity, block count** | **≤5%**, same as empirical | Class A — exact from geometry. There is no modelling here to be wrong about; a miss is a bug. |
 | **Memory: weights** | **≤5%**, *tighter* than empirical's ≤10% | Class A — exact from geometry, so a miss is a bug rather than modelling error. Weights is a non-KV memory term, and the acceptance table gates those at ≤10%; the roofline keeps its own goal at that level anyway, because a looser bound on an exact quantity would not catch the bug the row exists to catch. Tighter than the empirical gate, not the same as it. |
-| **Memory: each non-KV term except weights** | **≤25%** | activations are approximate (`k_model` derived from geometry where no run measured it) and invisible scratch is Class C. The spread that sets the number: scratch is 0.1 KB/token on the 0.6B and **39.6 KB/token** on the 27B. |
+| **Memory: each non-KV term except weights** | **≤25%** | activations are read off one real start per configuration, declared where its entry is assumed, with no geometry form (T34), and invisible scratch is Class C. The spread that sets the number: scratch is 0.1 KB/token on the 0.6B and **39.6 KB/token** on the 27B. |
 | **Feasibility (does it fit)** | **no false "fits"** | a configuration the roofline says fits and then OOMs is a hard failure regardless of byte error. One-sided on purpose. |
 
 **On the weights row.** The empirical acceptance table has two memory buckets —

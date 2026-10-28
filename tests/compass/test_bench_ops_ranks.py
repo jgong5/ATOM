@@ -21,6 +21,7 @@ from typing import ClassVar
 import pytest
 import torch
 import torch.distributed as dist
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_bench_ops import _graph, _leaf, _Runner, _t
 from test_bench_ops_plan import CONFIG, _records, bench  # noqa: F401  the fixture
 
@@ -447,6 +448,7 @@ def test_a_collective_is_one_family_over_its_bytes_across_decode_and_prefill(
         graph = _gather_graph(None, None, decode(width))
         [(sig, (op, _))] = ops.leaves(graph["region"]).items()
         point = {"shape": str(decode(width)), "context": 20, "op": GATHER}
+        point |= {"exchange": ops.exchange(op)}
         records.append(point | {"leaf": sig, "kernels": ["ag"], "cold_ns": 1.0})
     graded = _records(
         tmp_path / "graded",
@@ -465,6 +467,38 @@ def test_a_collective_is_one_family_over_its_bytes_across_decode_and_prefill(
     assert report["left out, by leaf kind"] == {
         GATHER: {"outside the measured range": 1}
     }
+
+
+def test_coverage_leaves_out_a_collective_step_in_a_gap_the_fit_declines(
+    bench,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+):
+    # Measured at decode widths 1, 2 and 4 (256, 512 and 1024 bytes), one
+    # kernel: 512 reads 33% off the line from 256 to 1024, so a prefill of 3
+    # tokens (768 bytes) lies in a gap the fit declines; a decode of 2 is 512.
+    monkeypatch.setattr(ops, "graph", _gather_graph)
+    store, root, _, _ = bench
+    records = []
+    for width, ns in ((1, 1.0), (2, 3.0), (4, 4.0)):
+        graph = _gather_graph(None, None, decode(width))
+        [(sig, (op, _))] = ops.leaves(graph["region"]).items()
+        point = {"shape": str(decode(width)), "context": 20, "op": GATHER}
+        point |= {"exchange": ops.exchange(op), "leaf": sig}
+        records.append(point | {"kernels": ["ag"], "cold_ns": ns})
+    graded = _records(
+        tmp_path / "graded",
+        ([[3, 3, False]], None),
+        ([[1, 30, True], [1, 9000, True]], 2),
+    )
+
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
+
+    assert report["by phase"] == {
+        "prefill": {"steps": 1, "covered": 0},
+        "decode": {"steps": 1, "covered": 1},
+    }
+    assert report["left out, by leaf kind"] == {GATHER: {"the fit declined bytes": 1}}
 
 
 def _sig(rows):

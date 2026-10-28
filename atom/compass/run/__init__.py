@@ -78,19 +78,23 @@ run, naming the shape),
 ``step_roofline`` (optional, ``true`` or ``false``: with ``true`` a
 `StepRooflineBackend` prices the steps the backend refuses, through
 `StepFallbackBackend`, as it always does under ``step_grid``, from the
-modules `run.modules.walk` reads off the meta build), ``padding`` (optional:
+modules `run.modules.walk` reads off the meta build and its block drafter's,
+`run.modules.drafter`), ``padding`` (optional:
 ``none`` prices a replayed graph's real rows in place of the rows it pads to,
 which ``executed``, the default, prices),
-``on_refusal`` (optional: ``mark``, the default, prices a step no cost source
-answers at 0 s, hands in its ``cost:`` reason and continues; ``abort`` ends
-the run there, which still writes the summary),
+``on_refusal`` (optional: ``mark``, the default, charges a step the cost
+backend refuses no device time, its answered terms included, and a segment the
+host laws refuse 0 s, hands in its ``cost:`` reason and continues; ``abort``
+ends the run there, which still writes the summary),
 ``client_runs`` (optional: how many client runs the server serves, one traffic
 LP after another, 1 when absent and ``null`` for no limit; each ends when no
 essential work is left, and the last one's end finishes the run),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
-on ``(1, tokens, seqs)``, refused where absent; ``key``, the `host_key` they were
+on ``(1, tokens, seqs)``; with any laws, a forward whose kind has none for a
+segment it runs and ``skip`` does not name is refused, that segment costing 0 s
+(`HostDeviceRecurrence.device_end`); ``key``, the `host_key` they were
 fitted under and the ``machine_spec`` digest of the spec of the platform they
 were fitted on, which a run with laws must match; ``skip``, segments zeroed for
 a what-if run, which the graders refuse; a list of them as ``step_linear``'s),
@@ -142,9 +146,13 @@ Its ``router`` entry, `router_binary`'s record of the binary that ran it, is
 per-run and goes to the summary as it is. A deployment
 whose ``kv_connector`` is ``compass`` is its prefill (``kv_producer``) or
 decode side: `engine(config)` makes it the ``engine-P`` or ``engine-D`` LP and
-binds the connector's transfer model. The write-request address comes with the
-deployment's own ``kv_transfer_config``. Above DP width one each DP rank is a
-member of its side's engine LP, and ATOM's DP dispatch on each side picks the
+binds the connector's transfer model, which prices a block at the paged KV
+entry each engine's runner planned, and each transfer's state slot and staging
+row at the ones it planned, when the model's transfer carries them
+(`_planned_transfer`); deployments that plan different blocks, slots or rows
+are refused before the run starts. The write-request
+address comes with the deployment's own ``kv_transfer_config``. Above DP
+width one each DP rank is a member of its side's engine LP, and ATOM's DP dispatch on each side picks the
 rank a request runs on. Optional ``prefill_data_parallel_size`` and
 ``decode_data_parallel_size``, ``data_parallel_size`` when absent, give each
 side its own DP width, and only such a run may name them. Its optional
@@ -273,9 +281,11 @@ ACCEPTANCE_RECORD = "acceptance_record"
 AUTHORITY_FILE = "authority_endpoint.txt"
 #: Wall seconds the summary's writer waits for the server LPs' refusals.
 HAND_IN_WAIT_S = 300.0
+#: Wall seconds a prefill-decode engine waits for every engine's planned block.
+PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
-SUMMARY_SCHEMA_VERSION = 9
+SUMMARY_SCHEMA_VERSION = 10
 #: Compass source the host-law key leaves out, by path under the package: all
 #: of it (None), or the top-level names (def, class or assigned) only a simulated
 #: run reaches, with the comments above each and the module docstring.
@@ -585,28 +595,103 @@ def _engine_name(config, run: dict) -> str | None:
 
 
 def _bind_transfer(config, run: dict) -> None:
-    """Price the simulated connector's transfers from the machine spec and the
-    KV block this deployment's workers hold: one model per prefill stage, each
-    on the layers that stage writes."""
-    from atom.compass.backends import KvGeometry, Parallelism
-    from atom.compass.kv import TRANSFER_KEY, Scope, TransferModel
-    from atom.models.utils import get_pp_indices
+    """Have the simulated connector price its transfers from the machine spec
+    and the paged KV blocks and state slots the run's engines planned, read as
+    it is built (`_planned_transfer`): after this engine's runner has planned
+    its pool."""
+    from atom.compass.kv import TRANSFER_KEY
 
-    hf, pp = config.hf_config, _pp(run, "P")
-    depth = getattr(hf, "text_config", hf).num_hidden_layers
-    _pd_kv(config)[TRANSFER_KEY] = tuple(
+    _pd_kv(config)[TRANSFER_KEY] = _planned_transfer
+
+
+def publish_transfer(
+    path: Path,
+    block_bytes: int,
+    tp: int,
+    slot_bytes: int = 0,
+    staging_bytes: int = 0,
+    slot_after_blocks: bool = False,
+) -> None:
+    """Write one paged KV block's bytes, the state slot a transfer moves beside
+    a request's blocks, or after them, and the staging row it moves in a second
+    write, as a runner at TP `tp` planned them, where `_planned_transfer` reads them."""
+    planned = {
+        "block_bytes": int(block_bytes),
+        "tp": tp,
+        "slot_bytes": int(slot_bytes),
+        "staging_bytes": int(staging_bytes),
+        "slot_after_blocks": bool(slot_after_blocks),
+    }
+    _write_whole(path, json.dumps(planned))
+
+
+def _planned_transfer() -> tuple:
+    """One transfer model per prefill stage, each pricing the block, the state
+    slot and the staging row that stage's runner planned, once every engine of
+    the prefill-decode run, each member and stage, has published them
+    (`publish_transfer`).
+
+    Refused unless every deployment plans one block, one slot and one row,
+    each summed over its stages, and every prefill deployment splits them
+    alike: both ends of a write price it, each from its own copy."""
+    from atom.compass.kv import Scope, TransferModel
+
+    run = spec()
+    if not _block_file(Path(os.environ[NOW_ENV])).exists():
+        raise RuntimeError("this engine's runner published no planned KV block")
+    out = Path(run["out_dir"])
+    files = {
+        n: _block_file(out / NOW_FILE.format(n))
+        for n in _hand_ins(run)
+        if n.startswith(f"{ENGINE.name}-")
+    }
+    deadline = time.monotonic() + PLANNED_BLOCK_WAIT_S
+    while missing := [n for n, f in files.items() if not f.exists()]:
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"{', '.join(missing)} published no planned KV block in "
+                f"{PLANNED_BLOCK_WAIT_S} wall seconds"
+            )
+        time.sleep(0.1)
+    # Each deployment member's stages: engine-P1-pp0.dp2 is stage 0 of
+    # engine-P1.dp2.
+    planned: dict = {}
+    for n, f in files.items():
+        lp, dot, member = n.partition(".")
+        deployment, _, stage = lp.partition("-pp")
+        stages = planned.setdefault(deployment + dot + member, {})
+        stages[int(stage or 0)] = json.loads(f.read_text())
+    prefill = [u for u in planned if u.startswith(f"{ENGINE.name}-P")]
+    for key, what in (
+        ("block_bytes", "KV block"),
+        ("slot_bytes", "state slot"),
+        ("staging_bytes", "staging row"),
+    ):
+        sizes = {u: [s[k][key] for k in sorted(s)] for u, s in planned.items()}
+        first = sizes[prefill[0]]
+        for u, b in sizes.items():
+            if b != first if u in prefill else sum(b) != sum(first):
+                (a, x), (c, y) = (
+                    (f"{v} at TP {planned[v][0]['tp']}", " + ".join(map(str, sizes[v])))
+                    for v in (u, prefill[0])
+                )
+                raise ValueError(
+                    f"{a} plans a {what} of {x} B and {c} one of {y} B: both ends "
+                    f"of a transfer price one {what.split()[-1]}, so every "
+                    "deployment must plan it"
+                )
+    machine, scope = _machine(run), Scope(run["kv_link"])
+    stages = planned[prefill[0]]
+    return tuple(
         TransferModel.from_spec(
-            _machine(run),
-            KvGeometry.from_hf_config(
-                hf,
-                block_size=config.kv_cache_block_size,
-                parallelism=Parallelism(tp_size=config.tensor_parallel_size),
-                layer_range=get_pp_indices(depth, k, pp),
-                kv_dtype=config.kv_cache_dtype,
-            ),
-            Scope(run["kv_link"]),
+            machine,
+            s["block_bytes"],
+            scope,
+            s["slot_bytes"],
+            s["staging_bytes"],
+            s["slot_after_blocks"],
         )
-        for k in range(pp)
+        for _, s in sorted(stages.items())
     )
 
 
@@ -637,8 +722,8 @@ def _lmcache_stations(run: dict, chunk_bytes: int) -> dict:
 def _launch_lmcache(config, run: dict, side: str | None) -> None:
     """Start LP `lmcache`, the stand-in lmcache server, in a process of its own
     when this deployment offloads KV to one; refuse a deployment and a run file
-    that disagree on whether one runs or on its writer ranks, or a decode side
-    that would start it."""
+    that disagree on whether one runs or on its writer ranks, a decode side
+    that would start it, or a model whose chunk `KvGeometry` cannot size."""
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
     from atom.kv_transfer.offload.mp.deployment import _tp_replication_factor
 
@@ -817,6 +902,7 @@ class _RecordingAuthority(ClockAuthority):
             STEP_TABLE_FILE,
             SUMMARY_FILE,
             "now-{}.raised",
+            "now-{}.kv_block",
         ):
             for f in out.glob(name.format("*")):
                 f.unlink()
@@ -1411,7 +1497,7 @@ def runner(model_runner, tree) -> None:
     # the DP and PCP widths, all in the readings' key, so the tokens the
     # reading warmed up with are the ones this deployment's warmup runs.
     warmup = measured.values["warmup_tokens"]
-    model = ModelTerms.from_tree(tree, activations=measured.activations(warmup))
+    model = ModelTerms.from_tree(tree, activations=measured.activations())
     fallback = run.get("step_roofline", False)
     if not isinstance(fallback, bool):
         raise TypeError(
@@ -1445,9 +1531,10 @@ def runner(model_runner, tree) -> None:
             "that reads it"
         )
     if fallback or STEP_GRID in run:
-        from atom.compass.run.modules import walk
+        from atom.compass.run.modules import drafter, walk
 
-        roofline = StepRooflineBackend(machine, walk(tree), padded=padding != "none")
+        modules = walk(tree, drafter(config))
+        roofline = StepRooflineBackend(machine, modules, padded=padding != "none")
         backend = StepFallbackBackend(backend, roofline)
     pp = getattr(config, "pipeline_parallel_size", 1)
     if pp > 1 and tp > 1 and not hasattr(backend, "all_gather_s"):
@@ -1463,6 +1550,8 @@ def runner(model_runner, tree) -> None:
     if NOW_ENV in os.environ:
         now = Path(os.environ[NOW_ENV])
         model_runner.compass_raised_file = _raised_file(now, model_runner.rank)
+        if _pd_side(config) is not None and model_runner.rank == 0:
+            model_runner.compass_block_file = _block_file(now)
         slot = np.memmap(now, np.float64, "r", shape=(1,))
         host = run.get("host", {})
         ours = host.get("laws") and {**host_key(config), "machine_spec": platform}
@@ -1891,6 +1980,12 @@ def _acceptance(scheduler, run: dict) -> dict:
     }
 
 
+def _block_file(now: Path) -> Path:
+    """Where the engine whose clock file is `now` publishes its planned KV block
+    and the state slot and staging row a transfer moves (`publish_transfer`)."""
+    return now.with_suffix(".kv_block")
+
+
 def _raised_file(now: Path, rank) -> Path:
     """Where worker `rank` of the engine whose clock file is `now` writes what
     it raised; ``*`` globs every rank's."""
@@ -2092,6 +2187,10 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     def total(key):
         return sum(p.get(key, 0) for p in priced) - sum(p.get(key, 0) for p in before)
 
+    def counted(key):
+        c = sum((Counter(p.get(key, {})) for p in priced), Counter())
+        return c - sum((Counter(p.get(key, {})) for p in before), Counter())
+
     seconds = total("seconds")
     tally = RefusalTally.of(reasons, total("steps"))
     lazy = total("lazy_traces"), total("lazy_trace_wall_seconds")
@@ -2119,9 +2218,9 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     for key in ("extrapolated_steps", "fallback_steps"):
         schedule[key] = total(key)
     # Each assumed treatment the steps were priced under, with its step count.
-    treatments = sum((Counter(p.get("treatments", {})) for p in priced), Counter())
-    treatments -= sum((Counter(p.get("treatments", {})) for p in before), Counter())
-    schedule["treatments"] = dict(sorted(treatments.items()))
+    schedule["treatments"] = dict(sorted(counted("treatments").items()))
+    # Each reason a source declined a step a fallback then priced, with its steps.
+    schedule["fallback_reasons"] = dict(counted("fallback_reasons").most_common())
     # An engine whose workers died, or that never handed in, priced steps no
     # one counted: they are absent, not 0.
     if any(
@@ -2131,6 +2230,7 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     ):
         schedule.update(predicted_seconds=None, seconds_by_method=None, treatments=None)
         schedule.update(extrapolated_steps=None, fallback_steps=None)
+        schedule["fallback_reasons"] = None
         schedule["refusals"].update(steps=None, fraction_of_steps=None)
     summary["configuration"] = configuration(run)
     summary["schema_version"] = SUMMARY_SCHEMA_VERSION
