@@ -790,7 +790,10 @@ A simulated deployment, `deploy.sh run`, runs both instances on 005: each
 reaches the clock authority and the write-request block at this node's
 127.0.0.1, which 013 cannot. A local prefix, such as `env -u GPU_MAX_HW_QUEUES
 -u ATOM_NUMA_BIND`, still starts the decode apart and makes the KV link
-`inter_node`, as the real pair spans.
+`inter_node`, as the real pair spans. Its router arguments switch the router's
+wall-clock detectors off, as `deploy.sh`'s header says, `--disable-retries`
+among them: a router LP that retries resends a request under the seq it was
+first sent with, and the frontend refuses it as arrived twice.
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
 
