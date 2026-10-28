@@ -21,7 +21,13 @@
 #   <router args>  `atomesh launch` arguments, as given; the script adds the
 #                  router's host and ports, --pd-disaggregation and each
 #                  instance's URL; run with --dp-aware runs the router as LP
-#                  `router`, refusing an ATOMESH not built from this tree
+#                  `router`, refusing an ATOMESH not built from this tree.
+#                  run refuses --prefill and --decode, a worker more to
+#                  choose, and --max-concurrent-requests and
+#                  --rate-limit-tokens-per-second, a limiter on the wall
+#                  clock; the caller switches the router's wall-clock
+#                  detectors off, as pd_sim.sh does: --disable-health-check
+#                  --disable-circuit-breaker --disable-retries
 #   ATOMESH        the router binary (default atomesh)
 #   SEED           the router LP's seed (default 20260707, client.sh's)
 #   WAIT_S         seconds each instance and the router have to answer, and
@@ -88,6 +94,12 @@ while (($#)); do
 done
 [[ $seen == " prefill decode router" ]] || bad "--prefill --, --decode -- and --router -- come once each, in that order"
 [[ " ${prefill[*]} ${decode[*]} " != *" --kv-transfer-config"* ]] || bad "an instance's ATOM arguments carry --kv-transfer-config, which the script fills"
+[[ $cmd == record ]] || for word in "${router[@]}"; do
+    case ${word%%=*} in
+    --prefill | --decode) bad "the router's arguments carry ${word%%=*}, a worker more for a simulated router to choose" ;;
+    --max-concurrent-requests | --rate-limit-tokens-per-second) bad "the router's arguments carry ${word%%=*}, a limiter a simulated router leaves out" ;;
+    esac
+done
 for path in "$(realpath -m "$OUT")" "$ROOT" "$PWD"; do
     ((${#on[@]} == 0)) || [[ $(printf %q "$path") == "$path" ]] || bad "--on's prefix may parse $path again, which a shell would split or expand"
 done

@@ -55,9 +55,9 @@ from test_vertical_slice import (
 from atom.compass import run as compass_run
 from atom.compass.clock import LpId, prefill_decode_table
 from atom.compass.detect.scenario import check_run
-from atom.compass.drive.serve import DEPLOY_PORTS, _free_ports, below_ephemeral
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.utils.clock import LPRuntime
+from tests.compass.held_ports import held_ports
 
 XPYD = {"prefill_instances": 2, "decode_instances": 2}
 ROUTER_IN_S = 2.0**-14
@@ -254,119 +254,128 @@ class InstanceFrontend(Frontend):
 def run_scripted_xpyd(binary: Path, out: Path, hash_seed: str, delay) -> list:
     """One run in `out`; each request's (prefill, decode) (deployment, rank)."""
     out.mkdir()
-    run_file = _run_file(
-        out,
-        data_parallel_size=2,
-        step_stub=CONSTANT,
-        router_in_s=ROUTER_IN_S,
-        **XPYD,
-        **PD,
-    )
-    run = json.loads(run_file.read_text())
-    table = compass_run.channel_table(run)
-    lookaheads = {
-        c.name: table.lookahead(c.name) for c in table.channels_from(compass_run.ROUTER)
-    }
-    endpoint = run["clock_endpoint"]
-    errors, procs, frontends = [], [], {}
-    try:
-        procs.append(
-            authority := _launch(
-                out,
-                "authority",
-                [sys.executable, "-m", "atom.compass.run", "--compass-run"]
-                + [str(run_file), "--compass-clock-endpoint", endpoint],
-                PYTHONHASHSEED=hash_seed,
-                PYTHONPATH=str(TREE),
-            )
+    with held_ports(3) as (clock_port, router_port, metrics_port):
+        run_file = _run_file(
+            out,
+            clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
+            data_parallel_size=2,
+            step_stub=CONSTANT,
+            router_in_s=ROUTER_IN_S,
+            **XPYD,
+            **PD,
         )
-        host, port = endpoint.removeprefix("tcp://").rsplit(":", 1)
-        _retry(
-            "clock", authority, lambda: socket.create_connection((host, port)).close()
-        )
-        # Deployment k of a side serves on that side's k-th URL in sorted order,
-        # the order the router takes its workers in.
-        for side in "PD":
-            servers = sorted(
-                (ThreadingHTTPServer(("127.0.0.1", 0), None) for _ in range(2)),
-                key=lambda s: f"http://127.0.0.1:{s.server_port}",
+        run = json.loads(run_file.read_text())
+        table = compass_run.channel_table(run)
+        lookaheads = {
+            c.name: table.lookahead(c.name)
+            for c in table.channels_from(compass_run.ROUTER)
+        }
+        endpoint = run["clock_endpoint"]
+        errors, procs, frontends = [], [], {}
+        try:
+            procs.append(
+                authority := _launch(
+                    out,
+                    "authority",
+                    [sys.executable, "-m", "atom.compass.run", "--compass-run"]
+                    + [str(run_file), "--compass-clock-endpoint", endpoint],
+                    PYTHONHASHSEED=hash_seed,
+                    PYTHONPATH=str(TREE),
+                )
             )
-            for k, http in enumerate(servers):
-                lp = f"frontend-{side}{k}"
-                frontends[lp] = InstanceFrontend(run, side, delay, lp, http)
-        idle = [
-            threading.Thread(
-                target=_idle, args=(run, f"engine-{s}{k}", f"dp{r}", errors)
+            host, port = endpoint.removeprefix("tcp://").rsplit(":", 1)
+            _retry(
+                "clock",
+                authority,
+                lambda: socket.create_connection((host, port)).close(),
             )
-            for s in "PD"
-            for k in range(2)
-            for r in range(2)
-        ]
-        for t in idle:
-            t.daemon = True
-            t.start()
-        router_port, metrics_port = _free_ports(2)
-        urls = [
-            arg
-            for lp, f in frontends.items()
-            for arg in ("--prefill" if "-P" in lp else "--decode", f.url)
-        ]
-        procs.append(
-            router := _launch(
-                out,
-                "router",
-                [str(binary), "launch", "--host", "127.0.0.1", "--port"]
-                + [str(router_port), "--pd-disaggregation", *urls]
-                + ["--policy", "dp_sticky", "--dp-aware", "--backend", "atom"]
-                + ["--disable-health-check", "--disable-circuit-breaker"]
-                + ["--disable-retries", "--prometheus-port", str(metrics_port)]
-                + ["--log-level", "info"],
-                ATOM_COMPASS_CLOCK_ENDPOINT=endpoint,
-                ATOM_COMPASS_SEED="20260707",
-                ATOM_COMPASS_ROUTER_LOOKAHEADS=json.dumps(lookaheads),
-                ATOM_COMPASS_ROUTER_WORKERS=json.dumps(
-                    {f.url: lp for lp, f in frontends.items()}
-                ),
+            # Deployment k of a side serves on that side's k-th URL in sorted order,
+            # the order the router takes its workers in.
+            for side in "PD":
+                servers = sorted(
+                    (ThreadingHTTPServer(("127.0.0.1", 0), None) for _ in range(2)),
+                    key=lambda s: f"http://127.0.0.1:{s.server_port}",
+                )
+                for k, http in enumerate(servers):
+                    lp = f"frontend-{side}{k}"
+                    frontends[lp] = InstanceFrontend(run, side, delay, lp, http)
+            idle = [
+                threading.Thread(
+                    target=_idle, args=(run, f"engine-{s}{k}", f"dp{r}", errors)
+                )
+                for s in "PD"
+                for k in range(2)
+                for r in range(2)
+            ]
+            for t in idle:
+                t.daemon = True
+                t.start()
+            urls = [
+                arg
+                for lp, f in frontends.items()
+                for arg in ("--prefill" if "-P" in lp else "--decode", f.url)
+            ]
+            procs.append(
+                router := _launch(
+                    out,
+                    "router",
+                    [str(binary), "launch", "--host", "127.0.0.1", "--port"]
+                    + [str(router_port), "--pd-disaggregation", *urls]
+                    + ["--policy", "dp_sticky", "--dp-aware", "--backend", "atom"]
+                    + ["--disable-health-check", "--disable-circuit-breaker"]
+                    + ["--disable-retries", "--prometheus-port", str(metrics_port)]
+                    + ["--log-level", "info"],
+                    ATOM_COMPASS_CLOCK_ENDPOINT=endpoint,
+                    ATOM_COMPASS_SEED="20260707",
+                    ATOM_COMPASS_ROUTER_LOOKAHEADS=json.dumps(lookaheads),
+                    ATOM_COMPASS_ROUTER_WORKERS=json.dumps(
+                        {f.url: lp for lp, f in frontends.items()}
+                    ),
+                )
             )
-        )
-        deadline = time.monotonic() + WALL_S
-        while True:
-            try:
-                urllib.request.urlopen(f"http://127.0.0.1:{router_port}/v1/models")
-                break
-            except OSError:
-                assert router.poll() is None, (out / "router.log").read_text()
-                assert time.monotonic() < deadline, f"no router in {WALL_S} s"
-                time.sleep(0.5)
-        bodies = [
-            {"model": "m", "prompt": f"request {i}", "max_tokens": n, "stream": True}
-            for i, (_, n) in enumerate(WORKLOAD)
-        ]
-        offsets = [t for t, _ in WORKLOAD]
+            deadline = time.monotonic() + WALL_S
+            while True:
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{router_port}/v1/models")
+                    break
+                except OSError:
+                    assert router.poll() is None, (out / "router.log").read_text()
+                    assert time.monotonic() < deadline, f"no router in {WALL_S} s"
+                    time.sleep(0.5)
+            bodies = [
+                {
+                    "model": "m",
+                    "prompt": f"request {i}",
+                    "max_tokens": n,
+                    "stream": True,
+                }
+                for i, (_, n) in enumerate(WORKLOAD)
+            ]
+            offsets = [t for t, _ in WORKLOAD]
 
-        def drive() -> None:
-            try:
-                DelayedTraffic(run, router_port, bodies, offsets, delay=delay).run()
-            except BaseException as e:  # noqa: BLE001 - the test raises it
-                errors.append(e)
+            def drive() -> None:
+                try:
+                    DelayedTraffic(run, router_port, bodies, offsets, delay=delay).run()
+                except BaseException as e:  # noqa: BLE001 - the test raises it
+                    errors.append(e)
 
-        # A message the router sends to the wrong frontend never arrives, and
-        # the LPs wait for it: one wall deadline bounds them all.
-        lps = [threading.Thread(target=drive, daemon=True)]
-        lps[0].start()
-        lps += [*idle, *(f.owner for f in frontends.values())]
-        deadline = time.monotonic() + WALL_S
-        for t in lps:
-            t.join(max(0.0, deadline - time.monotonic()))
-        stuck = [t.name for t in lps if t.is_alive()]
-        assert not stuck, f"still running after {WALL_S} s: {stuck}"
-        assert authority.wait(WALL_S) == 0, (out / "authority.log").read_text()
-    finally:
-        for p in procs:
-            if p.poll() is None:
-                p.kill()
-        for f in frontends.values():
-            f.http.shutdown()
+            # A message the router sends to the wrong frontend never arrives, and
+            # the LPs wait for it: one wall deadline bounds them all.
+            lps = [threading.Thread(target=drive, daemon=True)]
+            lps[0].start()
+            lps += [*idle, *(f.owner for f in frontends.values())]
+            deadline = time.monotonic() + WALL_S
+            for t in lps:
+                t.join(max(0.0, deadline - time.monotonic()))
+            stuck = [t.name for t in lps if t.is_alive()]
+            assert not stuck, f"still running after {WALL_S} s: {stuck}"
+            assert authority.wait(WALL_S) == 0, (out / "authority.log").read_text()
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+            for f in frontends.values():
+                f.http.shutdown()
     errors += [e for f in frontends.values() for e in f.errors]
     if errors:
         raise errors[0]
@@ -403,7 +412,7 @@ def test_each_request_takes_the_least_load_deployment_and_rank_under_any_delay(
 
 # --- with a driver: pd_sim.sh at 2P2D ------------------------------------------
 
-#: Each port name pd_sim.sh reads, by its offset in a block of free ports; a
+#: Each port name pd_sim.sh reads, by its offset in a block of held ports; a
 #: server k of a side takes its port plus k and its DP port plus 16k.
 OFFSETS = {
     "CLOCK_PORT": 0,
@@ -417,69 +426,55 @@ OFFSETS = {
 }
 
 
-def _free_block(n: int) -> int:
-    """The first of `n` consecutive ports nothing listens on, below the
-    ephemeral range, so no outgoing connection or bind to port 0 takes one
-    before its server binds it."""
-    room = below_ephemeral(DEPLOY_PORTS)
-    while True:
-        base, free = random.randrange(room.start, room.stop - n + 1), True
-        for p in range(base, base + n):
-            with socket.socket() as s:
-                free = free and s.connect_ex(("127.0.0.1", p)) != 0
-        if free:
-            return base
-
-
 def run_xpyd(out: Path, seed: str) -> dict:
     """One 2P2D run under `pd_sim.sh`, round robin on each side."""
     out.mkdir()
-    base = _free_block(32)
-    ports = {name: base + k for name, k in OFFSETS.items()}
-    run_file = _run_file(
-        out,
-        clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
-        step_stub=CONSTANT,
-        **XPYD,
-        **PD,
-    )
-    env = dict(
-        os.environ,
-        PYTHONHASHSEED=seed,
-        PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
-        MODEL=MODEL,
-        ROUTER_POLICY="round_robin",
-        **{name: str(port) for name, port in ports.items()},
-    )
-    publish_pd_entries(out / "store", DOCUMENT, env)
-    log = out / "pd_sim.log"
-    with open(log, "w") as f:
-        sim = subprocess.Popen(
-            ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
-            cwd=TREE,
-            env=env,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+    with held_ports(1, lambda q: range(q[0] + 1, q[0] + 32)) as [base]:
+        ports = {name: base + k for name, k in OFFSETS.items()}
+        run_file = _run_file(
+            out,
+            clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
+            step_stub=CONSTANT,
+            **XPYD,
+            **PD,
         )
-    watchdog = threading.Timer(WALL_S * 2, os.killpg, (sim.pid, signal.SIGKILL))
-    watchdog.start()
-    try:
-        deadline = time.monotonic() + WALL_S * 2
-        while "pd_sim: ready" not in log.read_text():
-            assert sim.poll() is None, f"pd_sim.sh exited:\n{log.read_text()}"
-            assert time.monotonic() < deadline, "no router in time"
-            time.sleep(0.5)
-        run = json.loads(run_file.read_text())
-        traffic = RouterLpRequests(run, ports["ROUTER_PORT"], sim)
-        traffic.run()
-        code = sim.wait(timeout=120)
-    finally:
-        watchdog.cancel()
-        if sim.poll() is None:
-            os.killpg(sim.pid, signal.SIGKILL)
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
+            MODEL=MODEL,
+            ROUTER_POLICY="round_robin",
+            **{name: str(port) for name, port in ports.items()},
+        )
+        publish_pd_entries(out / "store", DOCUMENT, env)
+        log = out / "pd_sim.log"
+        with open(log, "w") as f:
+            sim = subprocess.Popen(
+                ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        watchdog = threading.Timer(WALL_S * 2, os.killpg, (sim.pid, signal.SIGKILL))
+        watchdog.start()
+        try:
+            deadline = time.monotonic() + WALL_S * 2
+            while "pd_sim: ready" not in log.read_text():
+                assert sim.poll() is None, f"pd_sim.sh exited:\n{log.read_text()}"
+                assert time.monotonic() < deadline, "no router in time"
+                time.sleep(0.5)
+            run = json.loads(run_file.read_text())
+            traffic = RouterLpRequests(run, ports["ROUTER_PORT"], sim)
+            traffic.run()
+            code = sim.wait(timeout=120)
+        finally:
+            watchdog.cancel()
+            if sim.poll() is None:
+                os.killpg(sim.pid, signal.SIGKILL)
     assert code == 0, f"pd_sim.sh exited {code}:\n{log.read_text()[-4000:]}"
     return {
         "out": out,

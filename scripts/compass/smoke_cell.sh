@@ -21,7 +21,7 @@
 #   OUT             an absent or empty directory, on a disk with room: the raw
 #                   exports keep every prompt
 #   GPU             the one GPU, as rocm-smi and `--gpu` number it (required);
-#                   it must read 0% use and 0% VRAM
+#                   each compass command refuses it while a process is on it
 #   MACHINE         the machine spec of this node's GPUs (required)
 #   TRACES          a cc-traces traces.jsonl (required, as client.sh takes it)
 #   HARNESS_PYTHON  the Python with agentx-harness and compass-harness, for the
@@ -69,11 +69,7 @@ trap 'kill -TERM $(jobs -p) 2>/dev/null; wait' EXIT
 fail() { echo "smoke_cell: step $1 failed: $2" >&2; exit 1; }
 say() { echo "smoke_cell: $1 $(date -u +%FT%TZ)"; }
 
-# The compass commands check each start for processes on the GPU; this checks
-# its use and VRAM too, once, before the first.
 [[ ${GPU-} =~ ^[0-9]+$ ]] || fail gpu "GPU names one GPU as rocm-smi numbers it, not '${GPU-}'"
-busy=$(rocm-smi --showuse --showmemuse | awk -v g="GPU[$GPU]" 'index($0, g) == 1 && /use \(%\)|VRAM%/ && $NF != "0"')
-[[ -z $busy ]] || fail gpu "rocm-smi GPU $GPU is not idle: $busy"
 compass_head_sha "$ROOT" >/dev/null ||
     fail tree "$ROOT is neither a git checkout nor a snapshot.sh tree, and a fit refuses it"
 

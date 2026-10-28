@@ -78,7 +78,8 @@ run, naming the shape),
 ``step_roofline`` (optional, ``true`` or ``false``: with ``true`` a
 `StepRooflineBackend` prices the steps the backend refuses, through
 `StepFallbackBackend`, as it always does under ``step_grid``, from the
-modules `run.modules.walk` reads off the meta build), ``padding`` (optional:
+modules `run.modules.walk` reads off the meta build and its block drafter's,
+`run.modules.drafter`), ``padding`` (optional:
 ``none`` prices a replayed graph's real rows in place of the rows it pads to,
 which ``executed``, the default, prices),
 ``on_refusal`` (optional: ``mark``, the default, charges a step the cost
@@ -146,10 +147,10 @@ per-run and goes to the summary as it is. A deployment
 whose ``kv_connector`` is ``compass`` is its prefill (``kv_producer``) or
 decode side: `engine(config)` makes it the ``engine-P`` or ``engine-D`` LP and
 binds the connector's transfer model, which prices a block at the paged KV
-entry each engine's runner planned, and each transfer's state slot at the slot
-it planned, when the model's transfer carries one (`_planned_transfer`);
-deployments that plan different blocks or slots are refused before the run
-starts. The write-request
+entry each engine's runner planned, and each transfer's state slot and staging
+row at the ones it planned, when the model's transfer carries them
+(`_planned_transfer`); deployments that plan different blocks, slots or rows
+are refused before the run starts. The write-request
 address comes with the deployment's own ``kv_transfer_config``. Above DP
 width one each DP rank is a member of its side's engine LP, and ATOM's DP dispatch on each side picks the
 rank a request runs on. Optional ``prefill_data_parallel_size`` and
@@ -604,24 +605,35 @@ def _bind_transfer(config, run: dict) -> None:
 
 
 def publish_transfer(
-    path: Path, block_bytes: int, tp: int, slot_bytes: int = 0
+    path: Path,
+    block_bytes: int,
+    tp: int,
+    slot_bytes: int = 0,
+    staging_bytes: int = 0,
+    slot_after_blocks: bool = False,
 ) -> None:
-    """Write one paged KV block's bytes, and the state slot a transfer moves
-    beside a request's blocks, as a runner at TP `tp` planned them, where
-    `_planned_transfer` reads them."""
-    planned = {"block_bytes": int(block_bytes), "tp": tp, "slot_bytes": int(slot_bytes)}
+    """Write one paged KV block's bytes, the state slot a transfer moves beside
+    a request's blocks, or after them, and the staging row it moves in a second
+    write, as a runner at TP `tp` planned them, where `_planned_transfer` reads them."""
+    planned = {
+        "block_bytes": int(block_bytes),
+        "tp": tp,
+        "slot_bytes": int(slot_bytes),
+        "staging_bytes": int(staging_bytes),
+        "slot_after_blocks": bool(slot_after_blocks),
+    }
     _write_whole(path, json.dumps(planned))
 
 
 def _planned_transfer() -> tuple:
-    """One transfer model per prefill stage, each pricing the block and the
-    state slot that stage's runner planned, once every engine of the
-    prefill-decode run, each member and stage, has published them
+    """One transfer model per prefill stage, each pricing the block, the state
+    slot and the staging row that stage's runner planned, once every engine of
+    the prefill-decode run, each member and stage, has published them
     (`publish_transfer`).
 
-    Refused unless every deployment plans one block and one slot, each summed
-    over its stages, and every prefill deployment splits them alike: both ends
-    of a write price it, each from its own copy."""
+    Refused unless every deployment plans one block, one slot and one row,
+    each summed over its stages, and every prefill deployment splits them
+    alike: both ends of a write price it, each from its own copy."""
     from atom.compass.kv import Scope, TransferModel
 
     run = spec()
@@ -650,7 +662,11 @@ def _planned_transfer() -> tuple:
         stages = planned.setdefault(deployment + dot + member, {})
         stages[int(stage or 0)] = json.loads(f.read_text())
     prefill = [u for u in planned if u.startswith(f"{ENGINE.name}-P")]
-    for key, what in (("block_bytes", "KV block"), ("slot_bytes", "state slot")):
+    for key, what in (
+        ("block_bytes", "KV block"),
+        ("slot_bytes", "state slot"),
+        ("staging_bytes", "staging row"),
+    ):
         sizes = {u: [s[k][key] for k in sorted(s)] for u, s in planned.items()}
         first = sizes[prefill[0]]
         for u, b in sizes.items():
@@ -668,9 +684,14 @@ def _planned_transfer() -> tuple:
     stages = planned[prefill[0]]
     return tuple(
         TransferModel.from_spec(
-            machine, stages[k]["block_bytes"], scope, stages[k]["slot_bytes"]
+            machine,
+            s["block_bytes"],
+            scope,
+            s["slot_bytes"],
+            s["staging_bytes"],
+            s["slot_after_blocks"],
         )
-        for k in sorted(stages)
+        for _, s in sorted(stages.items())
     )
 
 
@@ -1510,9 +1531,10 @@ def runner(model_runner, tree) -> None:
             "that reads it"
         )
     if fallback or STEP_GRID in run:
-        from atom.compass.run.modules import walk
+        from atom.compass.run.modules import drafter, walk
 
-        roofline = StepRooflineBackend(machine, walk(tree), padded=padding != "none")
+        modules = walk(tree, drafter(config))
+        roofline = StepRooflineBackend(machine, modules, padded=padding != "none")
         backend = StepFallbackBackend(backend, roofline)
     pp = getattr(config, "pipeline_parallel_size", 1)
     if pp > 1 and tp > 1 and not hasattr(backend, "all_gather_s"):
@@ -1960,7 +1982,7 @@ def _acceptance(scheduler, run: dict) -> dict:
 
 def _block_file(now: Path) -> Path:
     """Where the engine whose clock file is `now` publishes its planned KV block
-    and the state slot a transfer moves (`publish_transfer`)."""
+    and the state slot and staging row a transfer moves (`publish_transfer`)."""
     return now.with_suffix(".kv_block")
 
 

@@ -40,12 +40,12 @@ from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
 from atom.compass.clock import NER, LpId
 from atom.compass.detect.scenario import check_run
-from atom.compass.drive.serve import _free_ports
 from atom.compass.parity import read
 from atom.compass.runner.overrides import start_on_host
 from atom.utils import CpuGpuBuffer, clock
 from atom.utils.clock import LPRuntime
 from atom.utils.distributed import utils
+from tests.compass.held_ports import held_ports
 
 #: One request per entry, by its max_tokens; unequal, so one rank finishes first.
 MAX_TOKENS = (2, 4, 6, 8)
@@ -127,45 +127,45 @@ def run_dp_slice(
     `width` is the server's parallelism flags, `dp` the DP ranks and `pp` the
     pipeline stages they start; the parity record holds every stage's."""
     out.mkdir()
-    clock_port, port = _free_ports(2)
-    run_file = _run_file(
-        out,
-        clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
-        data_parallel_size=dp,
-        pipeline_parallel_size=pp,
-        step_stub=CONSTANT,
-        machine=machine,
-    )
-    env = dict(
-        os.environ,
-        PYTHONHASHSEED=seed,
-        PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
-    )
-    args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
-    args += width
-    args += ["--enforce-eager", "--max-model-len", "2048"]
-    publish_entry(out / "store", machine, args, env)
-    with open(out / "server.log", "w") as log:
-        server = subprocess.Popen(
-            [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
-            + ["--compass-run", str(run_file)],
-            cwd=TREE,
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
+    with held_ports(2) as (clock_port, port):
+        run_file = _run_file(
+            out,
+            clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
+            data_parallel_size=dp,
+            pipeline_parallel_size=pp,
+            step_stub=CONSTANT,
+            machine=machine,
         )
-        watchdog = threading.Timer(WALL_S, server.kill)
-        watchdog.start()
-        try:
-            traffic = Requests(json.loads(run_file.read_text()), port, server)
-            traffic.run()
-            code = server.wait(timeout=120)
-        finally:
-            watchdog.cancel()
-            if server.poll() is None:
-                server.kill()
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
+        )
+        args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
+        args += width
+        args += ["--enforce-eager", "--max-model-len", "2048"]
+        publish_entry(out / "store", machine, args, env)
+        with open(out / "server.log", "w") as log:
+            server = subprocess.Popen(
+                [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
+                + ["--compass-run", str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            watchdog = threading.Timer(WALL_S, server.kill)
+            watchdog.start()
+            try:
+                traffic = Requests(json.loads(run_file.read_text()), port, server)
+                traffic.run()
+                code = server.wait(timeout=120)
+            finally:
+                watchdog.cancel()
+                if server.poll() is None:
+                    server.kill()
     tail = (out / "server.log").read_text()[-4000:]
     assert code == 0, f"the server exited {code} after the finish:\n{tail}"
     return {
