@@ -148,7 +148,9 @@ def test_a_plan_densifies_each_leaf_to_adjacent_points_where_its_kernel_switches
 
     records = _plan(bench, tmp_path, population)
 
-    assert ops._dependent(records) == {"aiter.attn": True, "aiter.gemm": False}
+    rows = ("rows", "aiter.attn")  # read at T = 60, which B = 2 holds
+    dependent = {"aiter.attn": True, "aiter.gemm": False, rows: False}
+    assert ops._dependent(records) == dependent
     at = {}
     for r in records:
         if isinstance(r["context"], list):  # a ragged decode point
@@ -168,9 +170,11 @@ def test_a_plan_densifies_each_leaf_to_adjacent_points_where_its_kernel_switches
     )
     assert tokens[:2] == [40, 60] and tokens[-1] == 150
     assert {99, 100} <= set(tokens) and len(tokens) < 12
-    # Attention depends on context, so its prefill points keep their rows.
+    # Attention depends on context, so its prefill points keep their rows, B = 1
+    # at every T inside its range that B = 2 holds.
     assert at["aiter.attn", "prefill"] == {
         "prefill T=40 B=1",
+        "prefill T=60 B=1",
         "prefill T=150 B=1",
         "prefill T=60 B=2",
     }
@@ -371,6 +375,42 @@ def test_a_plan_places_no_cached_prefill_point_past_max_model_len(
     }
     # At 8100, 150 tokens past 8000 cached is a row past max_model_len.
     assert attn == at_8000
+
+
+def test_a_planned_prefill_attention_leaf_holds_a_step_s_rows_either_side_of_its_t(
+    bench, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ops, "_child", _moving_bench)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[40, 40, False]], None),
+        ([[100, 2100, False]], None),
+        ([[150, 3150, False]], None),
+        ([[30, 1030, False], [30, 3030, False]], None),  # B = 2 at T = 60
+        ([[75, 75, False], [75, 75, False]], None),  # and at T = 150
+    )
+    records = _plan(bench, tmp_path, plan)
+
+    attn = {
+        (ops._shape(r["shape"]).seqs, ops._shape(r["shape"]).tokens, r["context"])
+        for r in records
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill")
+    }
+    # Each B at each T another B holds inside its own range, at its contexts.
+    assert {(1, 60, c) for c in (None, 2000, 3000)} <= attn
+    assert {(2, 100, c) for c in (None, 2000, 3000)} <= attn
+    assert (2, 40, None) not in attn  # below B = 2's least T
+    graded = _records(
+        tmp_path / "graded",
+        ([[50, 1050, False]], None),  # B = 1 between 40 and 60
+        ([[60, 1060, False], [60, 2060, False]], None),  # B = 2 between 100 and 150
+    )
+    store, root, _, _ = bench
+
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
+
+    assert report["by phase"] == {"prefill": {"steps": 2, "covered": 2}}
 
 
 @pytest.mark.parametrize(
