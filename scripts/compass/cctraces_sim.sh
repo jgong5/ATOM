@@ -131,7 +131,7 @@ dp = run.get("data_parallel_size", 1)
 # One write-request port per prefill rank and decode rank pair, as pd_sim.sh binds.
 n = run.get("prefill_data_parallel_size", dp) * run.get("decode_data_parallel_size", dp)
 # Held together, so no two are the same port, and until this script exits, as
-# compass_free_port holds its port, so no other process binds one first.
+# compass_held_port holds its port, so no other process binds one first.
 socks = [socket.socket() for _ in range(6)]
 for s in socks:
     s.bind(("", 0))
@@ -188,9 +188,9 @@ fi
 if [[ $MODE == 1p1d ]]; then
     # pd_sim.sh takes the authority's port from its own variable; the run file
     # names the same one for the traffic LP.
-    # Each side's DP master port is free too, or a second run on this host
+    # Each side's DP master port is held too, or a second run on this host
     # network finds pd_sim.sh's default taken.
-    PREFILL_DP_PORT=$(compass_free_port) DECODE_DP_PORT=$(compass_free_port)
+    PREFILL_DP_PORT=$(compass_held_port) DECODE_DP_PORT=$(compass_held_port)
     export MODEL SERVER_ARGS WAIT_S CLOCK_PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT \
         PREFILL_DP_PORT DECODE_DP_PORT
     # An agentic cell, as the real one is launched: under DP attention its
@@ -209,12 +209,12 @@ else
     main=(-m atom.entrypoints.openai.api_server)
     [[ -z ${HTTP_INTAKE:-} ]] || main=("$ROOT/scripts/compass/http_intake.py" serve "$HTTP_INTAKE")
     # The keep-alive timeout as in pd_sim.sh, aiperf's pool in the router's place.
-    # Its own process group, so a real server's workers stop with it. A free
+    # Its own process group, so a real server's workers stop with it. A held
     # DP master port, as `compass record` gives one: the port keys ATOM's
     # compiled-graph cache, and the first start that loads it autotunes again.
     # No later start loads it, so the server's stop removes it, as there.
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
-    ATOM_DP_MASTER_PORT=$(compass_free_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
+    ATOM_DP_MASTER_PORT=$(compass_held_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
         python3 "${main[@]}" \
         --model "$MODEL" --host 127.0.0.1 --server-port "$PORT" --timeout-keep-alive 1000000 \
         $SERVER_ARGS "${compass[@]}" >"$OUT/server.log" 2>&1 &
