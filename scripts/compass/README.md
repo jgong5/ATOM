@@ -821,7 +821,9 @@ reaches the clock authority and the write-request block at this node's
 `inter_node`, as the real pair spans. Its router arguments switch the router's
 wall-clock detectors off, as `deploy.sh`'s header says, `--disable-retries`
 among them: a router LP that retries resends a request under the seq it was
-first sent with, and the frontend refuses it as arrived twice.
+first sent with, and the frontend refuses it as arrived twice. The script
+sets `--request-timeout-secs` itself: a stream lasts the wall time the run
+takes to finish it, and the router's default 1800 s cut c=256 streams.
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
 
