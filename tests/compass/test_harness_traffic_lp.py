@@ -56,6 +56,7 @@ from aiperf.common.enums import CreditPhase
 from aiperf.credit.sticky_router import StickyCreditRouter
 from compass_harness.router import CompassCreditRouter
 from compass_harness.scheduler import ClockPacedLoopScheduler
+from compass_harness.strategy import ClockPhaseRunner
 from compass_harness.traffic_lp import (
     HTTP,
     STREAM,
@@ -252,6 +253,87 @@ def test_a_dropped_response_is_named_at_the_finish(ca, monkeypatch):
     assert re.search(named, message)
 
 
+class IdleEngine(threading.Thread):
+    """The engine LP with nothing to run: its only clock wait is a daemon
+    deadline every second, as its metrics push is. It records each finite grant."""
+
+    def __init__(self, endpoint) -> None:
+        super().__init__(name="engine", daemon=True)
+        self.endpoint, self.grants = endpoint, []
+
+    def run(self) -> None:
+        rt = LPRuntime(ENGINE, TABLE, clock_transport.connect(ENGINE, self.endpoint))
+        while (g := rt.next_event(INF, rt.now + 1.0)) != INF:
+            self.grants.append(g)
+
+
+async def _wait_for_return(endpoint, prefix, monkeypatch, grace):
+    """Send request 0 and wait for its return as aiperf's phase runner does,
+    with a `grace` deadline; then finish."""
+    traffic = TrafficLP.from_env()
+    monkeypatch.setattr(ClockPacedLoopScheduler, "clock", traffic)
+    returned = asyncio.Event()
+
+    async def on_return(worker_id, ret):
+        returned.set()
+
+    loop = asyncio.get_running_loop()
+    frontend = Frontend(endpoint, prefix, loop, traffic.hold(on_return))
+    frontend.start()
+    await traffic.subscribed(1)
+    traffic.send(_key(0))
+    # The deadline wait reads nothing else of its runner.
+    timed_out = await ClockPhaseRunner._wait_for_event_with_timeout(
+        SimpleNamespace(info=lambda message: None),
+        name="profiling phase credits returned",
+        event=returned,
+        timeout=grace,
+        task_to_cancel=None,
+    )
+    at = traffic.now()
+    traffic.finish()
+    await traffic.done
+    frontend.join(10)
+    return timed_out, at
+
+
+#: Request 0's final event reaches the traffic LP here: the client run's end.
+END = ADMIT + EVENTS[-1] + STREAM_S
+
+
+@pytest.mark.parametrize(
+    ("grace", "timed_out", "at"),
+    [(300.0, False, END), (0.75, True, 0.75)],
+    ids=["withdrawn", "fired"],
+)
+def test_a_grace_deadline_keeps_no_lp_running_past_the_last_request_s_end(
+    grace, timed_out, at, tmp_path, monkeypatch
+):
+    """Request 0 is open while aiperf waits for its return with a grace
+    deadline, and the idle engine ticks every second. At 300 s the return
+    comes first and aiperf withdraws the deadline: every LP is granted
+    ``+inf`` at the request's end, with no tick granted past it. At 0.75 s
+    the deadline falls inside the request and fires there."""
+    authority = ClockAuthority(TABLE)
+    endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
+    server = clock_transport.serve(authority, endpoint)
+    run_file = tmp_path / "run.json"
+    run_file.write_text(json.dumps({"clock_endpoint": endpoint, "bound_s": 1e6, **RUN}))
+    monkeypatch.setenv(RUN_ENV, str(run_file))
+    monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / "lp"))
+    engine = IdleEngine(endpoint)
+    engine.start()
+    prefix = str(tmp_path / "lp")
+    try:
+        waited = _run(_wait_for_return(endpoint, prefix, monkeypatch, grace))
+    finally:
+        engine.join(10)
+        server.close()
+    assert waited == (timed_out, at)
+    assert max(clock for _, clock in authority.final_clocks) == END
+    assert engine.grants == [1.0]
+
+
 def test_a_client_bound_at_a_stop_names_its_open_request(tmp_path):
     """The frontend, the engine and the traffic LP each hold a TCP connection,
     as a deployment's processes do. The frontend takes request 0, then stops
@@ -345,7 +427,8 @@ class ScriptedRuntime:
     """The traffic LP's runtime with its grants scripted instead of asked for.
 
     Each script entry ``(G, seqs)`` is the next grant and the stream seqs it
-    releases; a clock call whose target comes first is granted the target.
+    releases; a clock call whose target or daemon deadline comes first is
+    granted that.
     """
 
     def __init__(self, script, stream=STREAM) -> None:
@@ -360,7 +443,8 @@ class ScriptedRuntime:
     def check_arrival(self, ch, arrival, seq) -> None:
         pass
 
-    def next_event(self, t):
+    def next_event(self, t, t_daemon=INF):
+        t = min(t, t_daemon)
         self.calls.append(t)
         if self.script and self.script[0][0] <= t:
             self.now, seqs = self.script.pop(0)
@@ -768,9 +852,9 @@ def test_a_cancel_closes_the_open_requests_and_drops_their_later_events(tmp_path
     dropped, so the run finishes with nothing open."""
 
     class Runtime(ScriptedRuntime):
-        def next_event(self, t):
+        def next_event(self, t, t_daemon=INF):
             passed_at.append(list(passed))
-            return super().next_event(t)
+            return super().next_event(t, t_daemon)
 
     passed, passed_at = [], []
 

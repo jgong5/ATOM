@@ -15,7 +15,10 @@ still inside aiperf's callback, and every task on the loop is waiting on
 something. It asks for time only while a request is open, a clock wait (a
 pacing timer, a phase deadline, the idle watchdog) is pending or the run is
 finishing; between phases aiperf works on the wall clock and the simulation
-waits for it.
+waits for it. While a request is open it asks for a phase deadline as a
+daemon deadline: the deadline fires once the open requests' work reaches it,
+and when the last one ends first and aiperf withdraws it, it has kept no LP
+running past that end.
 
 When aiperf cancels the requests in flight at its grace deadline, the traffic
 LP closes them at that time (`cancel`): each one's cancel is a stamped request
@@ -87,7 +90,7 @@ class TrafficLP:
         # key -> its return, for aiperf; None once passed
         self._held: dict[tuple, object] = {}
         self._returns: asyncio.Queue = asyncio.Queue()  # passed in order, as upstream
-        self._waiters: list[tuple[float, asyncio.Future]] = []
+        self._waiters: list[tuple[float, asyncio.Future, bool]] = []
         self._passing = False  # a return is inside aiperf's callback
         self._finishing = False
         self._changed = asyncio.Event()
@@ -129,10 +132,13 @@ class TrafficLP:
         """Return at the next grant; the scheduler then reads its timers again."""
         await self.wait(t)
 
-    def wait(self, t: float) -> asyncio.Future:
-        """A clock wait for ``t``, resolved at the next grant or by ``withdraw``."""
+    def wait(self, t: float, phase_deadline: bool = False) -> asyncio.Future:
+        """A clock wait for ``t``, resolved at the next grant or by ``withdraw``.
+
+        A `phase_deadline` is asked for as a daemon deadline while a request is open.
+        """
         fut = asyncio.get_running_loop().create_future()
-        self._waiters.append((t, fut))
+        self._waiters.append((t, fut, phase_deadline))
         self._changed.set()
         return fut
 
@@ -253,14 +259,19 @@ class TrafficLP:
                 self._changed.clear()
                 await self._changed.wait()
                 continue
-            t = min((t for t, _ in self._waiters), default=math.inf)
-            g = self.rt.next_event(t)
+            t, t_daemon = math.inf, math.inf
+            for at, _, phase_deadline in self._waiters:
+                if phase_deadline and self.open:
+                    t_daemon = min(t_daemon, at)
+                else:
+                    t = min(t, at)
+            g = self.rt.next_event(t, t_daemon)
             if g == math.inf:
                 return self._close()
 
     async def _settle(self) -> None:
         """Hold until every released event is reported and aiperf has caught up."""
-        for _, fut in self._waiters:  # wake the scheduler to read its timers again
+        for _, fut, _ in self._waiters:  # wake the scheduler to read its timers again
             fut.set_result(None)
         self._waiters.clear()
         spins = 0
