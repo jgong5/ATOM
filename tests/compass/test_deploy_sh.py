@@ -451,8 +451,12 @@ def test_a_simulated_router_bounds_a_request_by_a_year_of_wall_time(tmp_path, pl
     assert bound >= 365 * 24 * 3600
 
 
-@pytest.mark.parametrize("words", [["--request-timeout-secs", "60"], ["--request-timeout-secs=60"]])
-def test_a_simulated_router_refuses_the_caller_s_request_timeout(tmp_path, planted, words):
+@pytest.mark.parametrize(
+    "words", [["--request-timeout-secs", "60"], ["--request-timeout-secs=60"]]
+)
+def test_a_simulated_router_refuses_the_caller_s_request_timeout(
+    tmp_path, planted, words
+):
     env, flags = planted
 
     done = subprocess.run(
