@@ -262,21 +262,32 @@ compass_pytest_counts() {
     ERRORS=$(grep -oE '[0-9]+ errors?' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
 }
 
-# A free TCP port, held until this script exits, so no other process binds it
+# compass_held_port [N]: the first of N ports in a row (default 1), each one
+# a free TCP port, held until this script exits, so no other process binds it
 # before its server does. Its holder binds it on every address, where another
 # socket's plain bind fails, then sets SO_REUSEADDR and never listens: a server
 # that sets it too binds the port beside the holder, as uvicorn's, libzmq's,
 # socket.create_server's, torch's TCPStore's and the atomesh router's listeners
 # do.
-compass_free_port() {
+compass_held_port() {
     python3 -c 'import os, select, socket, sys
-s = socket.socket()
-s.bind(("", 0))
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-print(s.getsockname()[1], flush=True)
+held = []
+while len(held) < int(sys.argv[2]):
+    port = held[0].getsockname()[1] + len(held) if held else 0
+    held.append(socket.socket())
+    try:
+        held[-1].bind(("", port))
+    except (OSError, OverflowError):
+        if not port:
+            raise
+        while held:  # another socket has one: draw the block again
+            held.pop().close()
+for s in held:
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+print(held[0].getsockname()[1], flush=True)
 if not os.fork():
     os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
-    select.select([os.pidfd_open(int(sys.argv[1]))], [], [])' $$
+    select.select([os.pidfd_open(int(sys.argv[1]))], [], [])' $$ "${1:-1}"
 }
 
 # compass_wait_up WHAT PID URL: return once URL answers; exit 1 if PID exits

@@ -131,18 +131,25 @@ dp = run.get("data_parallel_size", 1)
 # One write-request port per prefill rank and decode rank pair, as pd_sim.sh binds.
 n = run.get("prefill_data_parallel_size", dp) * run.get("decode_data_parallel_size", dp)
 # Held together, so no two are the same port, and until this script exits, as
-# compass_free_port holds its port, so no other process binds one first.
+# compass_held_port holds its port, so no other process binds one first.
 socks = [socket.socket() for _ in range(6)]
 for s in socks:
     s.bind(("", 0))
 ports = [s.getsockname()[1] for s in socks]
-# The write requests take n ports from KV_WRITE_REQ_PORT, the fifth: re-pick
-# it, the others still held, until none of them lies in that block.
-while {*ports[:4], ports[5]} & set(range(ports[4], ports[4] + n)):
-    socks.append(socket.socket())
-    socks[-1].bind(("", 0))
-    ports[4] = socks[-1].getsockname()[1]
-for s in socks:
+# The write requests take n ports from KV_WRITE_REQ_PORT, the fifth: hold the
+# rest of its block too, re-picking it, the others still held, until they bind.
+block = []
+while len(block) < n - 1:
+    block.append(socket.socket())
+    try:
+        block[-1].bind(("", ports[4] + len(block)))
+    except (OSError, OverflowError):
+        while block:
+            block.pop().close()
+        socks.append(socket.socket())
+        socks[-1].bind(("", 0))
+        ports[4] = socks[-1].getsockname()[1]
+for s in socks + block:
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
 
@@ -190,7 +197,7 @@ if [[ $MODE == 1p1d ]]; then
     # names the same one for the traffic LP.
     # Each side's DP master port is free too, or a second run on this host
     # network finds pd_sim.sh's default taken.
-    PREFILL_DP_PORT=$(compass_free_port) DECODE_DP_PORT=$(compass_free_port)
+    PREFILL_DP_PORT=$(compass_held_port) DECODE_DP_PORT=$(compass_held_port)
     export MODEL SERVER_ARGS WAIT_S CLOCK_PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT \
         PREFILL_DP_PORT DECODE_DP_PORT
     # An agentic cell, as the real one is launched: under DP attention its
@@ -214,7 +221,7 @@ else
     # compiled-graph cache, and the first start that loads it autotunes again.
     # No later start loads it, so the server's stop removes it, as there.
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
-    ATOM_DP_MASTER_PORT=$(compass_free_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
+    ATOM_DP_MASTER_PORT=$(compass_held_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
         python3 "${main[@]}" \
         --model "$MODEL" --host 127.0.0.1 --server-port "$PORT" --timeout-keep-alive 1000000 \
         $SERVER_ARGS "${compass[@]}" >"$OUT/server.log" 2>&1 &

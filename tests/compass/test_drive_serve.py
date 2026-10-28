@@ -469,6 +469,9 @@ def test_no_port_a_server_draws_is_in_deploy_sh_s_range_or_mooncake_s(
     monkeypatch.setattr(serve, "PORT_RANGE", tmp_path / "range")
     mooncake, deploy = range(15000, 17001), serve.below_ephemeral(serve.DEPLOY_PORTS)
 
-    drawn = [p for _ in range(250) for p in serve._free_ports(4)]
+    drawn = []
+    for _ in range(250):
+        with serve._held_ports(4) as ports:
+            drawn += ports
 
     assert not [p for p in drawn if p in mooncake or p in deploy]
