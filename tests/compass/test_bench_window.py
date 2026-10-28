@@ -7,16 +7,24 @@ work, then `run_model` queues the model's. The device is one stream in host
 time: a piece of work starts once it is queued and once the work before it has
 ended, an event completes when the stream reaches it, and a poll that finds an
 event pending returns once it is not. The host takes a planted time to issue
-each forward, half before `run_model` and half inside it.
+each forward, half before `run_model` and half inside it. Two ranks run as two
+threads over a gloo group.
 """
 
 import itertools
 import statistics
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from types import SimpleNamespace
 
+import pytest
+
+import atom.utils.distributed.utils as dist_utils
 from atom.compass.bench import window
 from atom.compass.bench.window import BenchWindow
 from atom.compass.parity import StepRecording
+from tests.compass.held_ports import held_ports
 
 MS = 1_000_000
 PREPARE, BUSY = 200_000, 5 * MS  # ns of device work, input preparation and model
@@ -146,3 +154,82 @@ def test_a_host_that_stalls_every_other_forward_is_measured_between_the_stalls()
     assert result["discarded"] == window.REPEATS - 1
     assert result["preload_ns"] == MS * 2**window.DOUBLINGS
     assert result["repeats"] == [[PREPARE + BUSY, PREPARE, BUSY]] * window.REPEATS
+
+
+class Linked(Planted):
+    """Rank `rank` of two: its model's work starts once both ranks have queued
+    theirs, as at a forward's first collective, and its spin clock runs `spin`
+    times as long as a preload asks."""
+
+    def __init__(self, issue, busy, *, rank, group, spin, link):
+        super().__init__(issue, busy)
+        self.rank, self.group, self.spin, self.link = rank, group, spin, link
+
+    def bench_group(self):
+        return self.group
+
+    def preload(self, ns):
+        self.preloads.append(ns)
+        self._queue(round(ns * self.spin))
+
+    def run_model(self, batch):
+        self.host += self.issuing - self.issuing // 2
+        self.link.starts[self.rank] = max(self.free, self.host)
+        self.link.barrier.wait()
+        begin = max(self.link.starts)
+        self.link.barrier.wait()
+        self.free = begin + next(self.busy)
+
+
+class Rank(BenchWindow, StepRecording, Linked):
+    pass
+
+
+@pytest.fixture
+def pair(monkeypatch):
+    """`pair(step)`: `step(rank, group)` on each rank of a two-rank gloo group."""
+    monkeypatch.setattr(
+        dist_utils, "_get_default_timeout", lambda _: timedelta(seconds=5)
+    )
+    monkeypatch.setenv("GLOO_SOCKET_IFNAME", "lo")
+
+    def on_rank(rank, step):
+        group = dist_utils.stateless_init_torch_distributed_process_group(
+            "127.0.0.1", port, rank, 2, backend="gloo"
+        )
+        try:
+            return step(rank, group)
+        finally:
+            dist_utils.stateless_destroy_torch_distributed_process_group(group)
+
+    def run(step):
+        with ThreadPoolExecutor(2) as pool:
+            return [f.result() for f in [pool.submit(on_rank, r, step) for r in (0, 1)]]
+
+    with held_ports(1) as [port]:  # until rank 0's store binds it
+        yield run
+
+
+@pytest.mark.parametrize("spins", [(1.01, 1.04), (1.04, 1.01)])
+def test_above_one_rank_each_kept_repeat_is_the_last_opened_ranks_window(pair, spins):
+    """Rank r's host takes (2 + r) / 2 ms to issue each forward, so the preload
+    is the slower host's 1.5 ms on both. The rank whose clock spins less opens
+    first and waits for the other at the collective, 45 us longer than the
+    step; each kept repeat is the other's window, the planted step."""
+    link = SimpleNamespace(barrier=threading.Barrier(2, timeout=10), starts=[0, 0])
+    busy = [BUSY + 1_000 * n * n for n in range(window.WARMUPS + window.REPEATS)]
+
+    def step(rank, group):
+        issue = itertools.repeat(MS + rank * MS // 2)
+        spin = spins[rank]
+        bench = Rank(issue, iter(busy), rank=rank, group=group, spin=spin, link=link)
+        return bench.bench_step(batch()), bench.preloads
+
+    (result, preloads), other = pair(step)
+
+    assert other == (result, preloads)
+    assert preloads == [3 * MS // 2] * window.REPEATS
+    kept = busy[window.WARMUPS :]
+    assert result["repeats"] == [[PREPARE + b, PREPARE, b] for b in kept]
+    assert result["median_ns"] == statistics.median(PREPARE + b for b in kept)
+    assert result["discarded"] == 0

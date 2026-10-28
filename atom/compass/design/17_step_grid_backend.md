@@ -48,6 +48,9 @@ the owner's ruling (a) on #1465:** a decode corner past the KV pool unshared is 
 with its rows sharing prefix blocks in a pool the target's size (D98), so the extrapolation
 past the pool (D99) reads only a corner left unmeasured.
 
+**Revised 2026-10-28 by [#1188](https://github.com/jgong5/ATOM/issues/1188):** above TP 1
+a point's value is the last-opened rank's window ("Scope and timing", under D98).
+
 **Depends on:** `02` (the backend interface, the forward's interval, the method
 vocabulary), `07` (the two granularities, the bench, artifact identity and invalidation), `08` (stage 2's
 protocol and the refusal rule), `09` (the hull and law
@@ -318,6 +321,15 @@ under the target workload's sampling settings. A point's value is `07` D39's ben
 the device busy time of D97. A point with no repeat that window counts has no value, and
 its cell is incomplete and refuses (D99). A bundle states that value kind beside its
 scope, and a narrower scope or another value kind is refused at load.
+
+Above TP 1 a point's value is the last-opened rank's window, the shortest
+([#1188](https://github.com/jgong5/ATOM/issues/1188)). Each rank's preload spins a clock it
+calibrated once, so the preloads end apart, and a rank that opens earlier waits inside its
+window, at the forward's first collective, for the last to open. That wait is no rank's
+step: charging the longest window put a Qwen3-30B-A3B TP 2 point above the last-opened
+rank's by 0.1% to 3% of its preload, at worst 92%. The last-opened rank's window holds no
+such wait, and every collective holds it for the slowest rank, so it is the group's step
+D97 charges to the slowest rank.
 
 The measurement this rests on (#626 at `1139bbca`): the reference bundle measured
 `run_model` plus logits under a GPU synchronize, which leaves `ModelRunner.postprocess` —

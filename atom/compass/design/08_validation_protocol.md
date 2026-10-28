@@ -81,7 +81,7 @@ that subset is genuinely green.
 | Gate | What runs | Measured result |
 |---|---|---|
 | **CPU gate** — per task, and green is the bar | Every test file outside `tests/plugin/` and `scripts/compass/cpu_gate_exclude.txt`. Driven by `scripts/compass/gate_cpu.sh`; no driver is touched **as a batch**. That is the weaker and correct claim: `test_postprocess_width.py` and `test_v4_checkpoint_slot_copy.py` were both in the gate at `236abfd9a`, and each reached `rocminfo` when run *alone* (`no tests collected, 1 error`, rc=2, each, measured in `xiaobizh_n18_cpu`); inside the gate they module-skipped on the mock an earlier file installs. Driver-freedom here is a property of the batch, not of every file in it. | Green, `GATE_CPU_RC=0`, read at `bdd244c57` in `xiaobizh_n18_cpu`. The counts are not restated here, because they move with every test the gate gains or loses: `gate_cpu.sh` prints them under the `commit:` line of the tree it ran, and `scripts/compass/README.md` says what the gate runs. |
-| **GPU gate**, a superset — per wave, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`. | The commit, its counts and the toolchain it ran under are in `scripts/compass/gpu_gate_baseline.env`, and every failing node-id is on file verbatim in `scripts/compass/gpu_gate_known_failures.txt` and compared by name, so "N failed" is checked against "the *same* N failed". `scripts/compass/regen_gpu_gate_baseline.sh` rewrites both from two runs that pass the same count and fail the same node-ids, so a new image or GPU is re-baselined by one command. |
+| **GPU gate**, a superset — per wave, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`, less any file `scripts/compass/gpu_gate_skip.txt` names for the GPU it runs on (a file that stalls there), whose collected tests come off the expectation. | The commit, its counts and the toolchain it ran under are in `scripts/compass/gpu_gate_baseline.env`, and every failing node-id is on file verbatim in `scripts/compass/gpu_gate_known_failures.txt` and compared by name, so "N failed" is checked against "the *same* N failed". `scripts/compass/regen_gpu_gate_baseline.sh` rewrites both from two runs that pass the same count and fail the same node-ids, so a new image or GPU is re-baselined by one command. |
 
 `test_dp_metadata.py`, `test_dp_sync_layout.py`
 and `test_forward_mode.py` were once excluded and were re-measured CPU-green (`16`); prose
@@ -294,20 +294,37 @@ value) and a **comparator** (value, value → distance). Admission is measured b
 stability test, not asserted. New metrics are expected; the families and the admission
 procedure are the stable part.
 
-### Family 1 — counting invariants. Exact match expected, except total prefill tokens (below); a mismatch is a defect, not noise.
+### Family 1 — counting invariants. Preemptions and prefill tokens grade a cell, each against the real runs' spread; every other count is reported, not gated.
 
 | Metric | Prior observation |
 |---|---|
 | prefill step count | 106 on both sides |
 | decode step count | 4,346 vs 4,333 |
-| total decode tokens | pure workload arithmetic — should be exact |
+| total decode tokens | 1 past a 534 real spread on #742's cell (#774) |
 | total prefill tokens | a cc-traces run issues a turn only after the previous one returns and none after its cutoff, so which turns fall inside moves with end-to-end time; on a hybrid model a prefix hit also stops at a state checkpoint that arrival order decides (#896). Ruled 2026-10-13 (#897). |
-| preemption count | 0 in the runs measured |
-| prefill streak count | identical across four real runs |
+| preemption count | `spread 0; result 0 ...`, `exact`, on every cell graded so far (#1474 at c=4, #1681 at c=1) |
+| prefill streak count | 58 against 59 on every real run of #742's cell (#774) |
 | requests admitted / completed | — |
+
+The graded counts are the set `GATED_COUNTS` holds in `atom/compass/validate/__main__.py`:
+`preemptions` and `prefill tokens`. Each is graded against the real runs' own spread, the
+largest distance between any two real runs (`_grade` in `atom/compass/validate/runs.py`):
+`exact` when the simulated value equals every real run's, `inside the real spread` when its
+distance from each is at most the spread, else `outside`. While the real runs agree, the
+spread is 0 and the grade is an exact match.
+
+A preemption needs the KV pool to run out, and which requests share the pool at a step
+moves with timing, so at a concurrency that fills the pool the real runs may disagree;
+their spread is then the tolerance.
 
 Total prefill tokens is graded over the requests both runs issued, against the real
 runs' own spread; a turn only one run issued is reported, not gated (#897).
+
+Every other count (prefill steps, decode steps, decode tokens, prefill streaks, requests
+completed) is reported with its verdict marked `not gated`, with no relative floor (ruled
+2026-10-11, #743). A discrete count's real spread is often 0, so one merged prefill streak
+or one request crossing the cutoff reads `outside`; TTFT, TPOT, throughput and the step
+distributions still grade the schedule.
 
 ### Family 2 — distributional. The family to weight most.
 
@@ -789,7 +806,7 @@ claims there are not.
 |---|---|---|
 | D44 | Three separable results — cost accuracy, schedule agreement, end-to-end — reported side by side. Aggregate latency is never the judgement. | 2026-09-18 |
 | D45 | Noise-floor first: the real-vs-real spread is the tolerance. A metric is admissible if stable; sensitivity, tested against the ×0.97 counterfactual, is deferred until a need appears. | 2026-09-18; revised 2026-10-16 (#1025) |
-| D46 | Three metric families ordered by robustness, as an extensible registry: counting invariants (exact; prefill tokens over the requests both runs issued, within the real spread), distributional (weighted most), event timing (most diagnostic). Policy agreement is a regression guard, not a discriminator. | 2026-09-18; revised 2026-10-13 (#897) |
+| D46 | Three metric families ordered by robustness, as an extensible registry: counting invariants (preemptions and prefill tokens graded against the real spread, prefill tokens over the requests both runs issued; every other count reported, not gated), distributional (weighted most), event timing (most diagnostic). Policy agreement is a regression guard, not a discriminator. | 2026-09-18; revised 2026-10-11 (#743) and 2026-10-13 (#897) |
 | D47 | Cost accuracy on the real run's own step sequence; report totals, held-out-worst, and median per step together. Graded: every answered step with no declared term, at every backend, under #627's 5% gate; validated and unvalidated steps reported beside, not gated; declared steps apart. | 2026-09-18; revised 2026-10-23 (#2011) |
 | D48 | Memory per term, never as a sum. The gate is whether the top-1 configuration choice survives, not the byte error. | 2026-09-18 |
 | D49 | Seven hygiene refusals, each with a prior incident behind it. An op-level leaf is not extrapolated: with no same-kernel bracket it falls to its analytical law. An out-of-hull step is graded and also reported apart. | 2026-09-18; op-level leaf 2026-10-18 (#1489); out-of-hull graded 2026-10-23 (#2011) |
