@@ -654,6 +654,17 @@ def test_get_num_blocks_refuses_and_the_keys_its_caller_reads_are_named():
         Runner().get_num_blocks()
 
 
+def test_profile_dynamic_chunking_refuses_at_its_one_waiting_site():
+    """The engine waits for the profile and reads it whole; one without a fit
+    turns `--enable-dynamic-chunking` off, which the real run keeps on, so
+    the runner, which times no forward, refuses instead of answering."""
+    assert [(s.waits, s.arity) for s in SITES["profile_dynamic_chunking"]] == [
+        (True, 1)
+    ]
+    with pytest.raises(RunnerRefusal, match="--enable-dynamic-chunking"):
+        Runner().profile_dynamic_chunking()
+
+
 def test_the_fourth_value_is_a_two_key_wire_dict_and_not_an_opaque_object():
     """The tightest constraint on the four, and the one easiest to read past.
 
