@@ -423,9 +423,9 @@ whose held-out p50 worsens with it; on any other rung it is G(mean).
 
 Under a drafter one lookup reads both of a point's values at the same coordinates (D98),
 each by this rule with an α of its own: fitted on that value's part of the ragged
-batches, and kept on a rung only where #941's gate admits it for that value. A drafter
-that reads each row's whole context, as an MTP layer does, thus takes the same rule as
-one that reads a window of it, as V4.1-Flash's does
+batches, and kept on a rung only where #941's gate admits it for that value. The
+drafter's α thus follows its own measurements, whether its attention reads each row's
+whole context or a window of it, as V4.1-Flash's does
 (`model_ops/deepseek_v41/draft_block.py::draft_step`).
 
 ### Decision
