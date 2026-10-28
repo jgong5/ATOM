@@ -7,9 +7,8 @@ the spec, and records from another device, stack or torch refuse at the fit.
 The records are `test_fit_steps.py`'s. The first test's run.json is what
 `drive.identity` writes in compass-next:nightly-20261013 on hjbog-srdc-18's
 MI308X, from a planted `rocm-smi` listing, ROCm version file and RCCL and torch
-versions, and aiter's commit planted as the one the spec pins, nightly
-20261026's, which no planted checkout can have; its law loads under
-`test_run_step_grid.py`'s deployment.
+versions, and aiter's commit planted as that image's, which no planted checkout
+can have; its law loads under `test_run_step_grid.py`'s deployment.
 """
 
 import json
@@ -82,7 +81,7 @@ def compass_next(tmp_path, monkeypatch):
     monkeypatch.setenv("ROCM_PATH", str(tmp_path / "rocm"))
     monkeypatch.setattr(torch.cuda.nccl, "version", lambda: (2, 27, 7))
     monkeypatch.setattr(torch, "__version__", "2.10.0+rocm7.2.4.git3d3aa833")
-    monkeypatch.setattr(drive, "_commit", lambda root: "41d4d8d7e")
+    monkeypatch.setattr(drive, "_commit", lambda root: "9205e1059")
     monkeypatch.setattr(drive, "PCI", str(tmp_path / "pci"))
 
 
@@ -110,7 +109,7 @@ def test_a_law_fitted_from_identity_s_record_loads_under_the_spec_it_ran_on(
     older = step_grid.conditions(r.config, MachineSpec.from_mapping(older))
     with pytest.raises(ArtifactRefusal, match="`ROCm / AITER / RCCL`") as refused:
         ArtifactStore(store).load(law, conditions=older, gates=GateState.of())
-    assert "aiter 41d4d8d7e" in str(refused.value)
+    assert "aiter 9205e1059" in str(refused.value)
     assert "aiter f4e7c7509" in str(refused.value)
 
 

@@ -71,12 +71,11 @@ SWEEPS = 10
 #: The total ATOM's `ModelRunner` read at one engine start on card 7 of node 18,
 #: at commit 0f045543d, and on card 5 of hjbog-srdc-39 at commit ce625ddd9.
 TOTAL = 206141652992
-#: The software stack the spec pins, torch included: nightly 20261026's. Both
-#: hosts' readings were taken under compass-next:nightly-20261013's, whose aiter
-#: was 9205e1059; they carry over to this aiter unmeasured.
+#: The software stack both hosts' readings were taken under, torch included:
+#: compass-next:nightly-20261013's.
 STACK = {
     "rocm": "7.2.4",
-    "aiter": "41d4d8d7e",
+    "aiter": "9205e1059",
     "rccl": "2.27.7",
     "torch": "2.10.0+rocm7.2.4.git3d3aa833",
 }
