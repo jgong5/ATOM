@@ -8,6 +8,9 @@ reach it until it is stopped, with run.json recording what grading reads.
 
     compass run --join RUN_FILE --out D -- <ATOM args>
 
+    compass run <backend> --machine M --store S [--host-laws KEY] ... --check
+        -- <ATOM args>
+
 `runfile` builds the run file from the flags, the backend exactly one with no
 default, and `serve` starts the server simulated from it with the step record
 on. `--out` holds what `serve` writes and what the run writes there: each DP
@@ -33,6 +36,9 @@ reasons. The op graph's is `op_coverage`, over the backend `run.op_graph`
 builds from the run file: a step is covered when its price list prices every
 leaf, and a run file that names no price list refuses. Another backend has no
 check, and refuses `--coverage`.
+
+`--check` starts no server: it lists every input the run lacks and the command
+that makes each, exiting 1 when one is lacking (`lacking`); it takes no `--out`.
 
 `--acceptance-record` names a speculative `compass record` directory: its
 histograms' rates (`measured`) go to ATOM as ``--spec-decode-acceptance-rates``,
@@ -60,7 +66,7 @@ from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactStore, Kind
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.step_grid_plan import BOUNDS, coverage
-from atom.compass.drive import runfile, serve
+from atom.compass.drive import lacking, runfile, serve
 from atom.compass.run import (
     OP_GRAPH,
     PRICE_LIST,
@@ -89,7 +95,8 @@ def main(argv: list[str]) -> None:
         side = runfile.pd_side(atom_args)
         join(_joining_parser().parse_args(argv[:cut]), atom_args, side)
         return
-    args = _parser().parse_args(argv[:cut])
+    parser = _parser()
+    args = parser.parse_args(argv[:cut])
     if args.coverage and not (getattr(args, STEP_GRID) or getattr(args, OP_GRAPH)):
         key = next(k for k in (STEP_STUB, STEP_LINEAR) if getattr(args, k))
         raise ValueError(
@@ -97,6 +104,11 @@ def main(argv: list[str]) -> None:
             "--step-grid's and --op-graph's steps are checked"
         )
     runfile.pd_side(atom_args, refuse=True)
+    if args.check:
+        serve._refuse(atom_args)
+        raise SystemExit(lacking.report(args, atom_args))
+    if not args.out:
+        parser.error("the following arguments are required: --out")
     run = runfile.build(args, atom_args)
     if record := args.acceptance_record:
         rates = measured(record, atom_args, run["data_parallel_size"])
@@ -146,8 +158,11 @@ def _parser() -> argparse.ArgumentParser:
         help="a speculative record directory whose acceptance the run draws from",
     )
     p.add_argument(
-        "--out", required=True, help="an empty directory for the run's files and logs"
+        "--check",
+        action="store_true",
+        help="list every input the run lacks, and start no server",
     )
+    p.add_argument("--out", help="an empty directory for the run's files and logs")
     return p
 
 
@@ -196,17 +211,17 @@ def check(inputs, run: dict, atom_args) -> dict:
     graph's price list the run file `run` names, loaded under the config
     `atom_args` resolve; an input that ran under other `SHAPING` fields
     refuses."""
+    if run.get(OP_GRAPH) and PRICE_LIST not in run:
+        raise ValueError(
+            "--coverage: the store holds no price_list at this run's key, so "
+            "the op graph prices every leaf by its roofline and no step is "
+            "covered; compass fit ops publishes one"
+        )
     store, config = ArtifactStore(run["store"]), _config(atom_args)
     here = step_grid.keyed(config) | {name: getattr(config, name) for name in BOUNDS}
     steps = [s for name in inputs for s in _steps(name, store, here)]
     machine = compass_run._machine(run)
     if run.get(OP_GRAPH):
-        if PRICE_LIST not in run:
-            raise ValueError(
-                "--coverage: the store holds no price_list at this run's key, so "
-                "the op graph prices every leaf by its roofline and no step is "
-                "covered; compass fit ops publishes one"
-            )
         # ATOM's MoE shards no experts without expert parallelism.
         ep = _ep_width(atom_args, machine) if config.enable_expert_parallel else 1
         backend = compass_run.op_graph(run, config, machine, ep)

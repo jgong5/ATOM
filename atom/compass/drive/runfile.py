@@ -114,20 +114,11 @@ def build(args, atom_args) -> dict:
             out["backend"] = _stated({run.OP_GRAPH: True})
     else:
         name = next(k for k in KINDS if getattr(args, k))
-        tokens, laws, backends = getattr(args, name), [], []
-        for token in [tokens] if isinstance(tokens, str) else tokens:
-            key = store.key_from_token(KINDS[name], token)
-            if name == run.STEP_GRID:
-                entry = store.read(key)
-                laws.append({"store": str(store.root), **key.values})
-            else:
-                conditions = law_readings(key, machine, atom_args)
-                entry = store.load(key, conditions=conditions, gates=GateState.of())
-                engine_config = json.loads(key.values["engine_config"])
-                laws.append(
-                    {**_member(entry, "params"), "engine_config": engine_config}
-                )
-            backends.append(_backend(entry))
+        tokens = getattr(args, name)
+        tokens = [tokens] if isinstance(tokens, str) else tokens
+        resolved = [resolve(store, name, t, machine, atom_args) for t in tokens]
+        laws = [law for law, _ in resolved]
+        backends = [_backend(entry) for _, entry in resolved]
         out[name], out["backend"] = laws[0], backends[0]
         if len(laws) > 1:
             digests = " ".join(sorted(b["digest"] for b in backends)).encode()
@@ -142,13 +133,29 @@ def build(args, atom_args) -> dict:
             }
     if args.host_laws:
         hosts = [
-            _member(store.read(store.key_from_token(Kind.HOST_LAWS, k)), "params")
-            for k in args.host_laws
+            resolve(store, "host", k, machine, atom_args)[0] for k in args.host_laws
         ]
         out["host"] = hosts if len(hosts) > 1 else hosts[0]
     if args.padding:
         out["padding"] = args.padding
     return out
+
+
+def resolve(store, name: str, token: str, machine, atom_args) -> tuple:
+    """The run file's `name` value for the entry `token` names in `store`, a
+    key of `KINDS` or ``host``, and that entry: a bundle's key and host laws'
+    params read, a step linear law's params with its key's engine config
+    loaded under `law_readings`."""
+    key = store.key_from_token(KINDS.get(name, Kind.HOST_LAWS), token)
+    if name == run.STEP_LINEAR:
+        conditions = law_readings(key, machine, atom_args)
+        entry = store.load(key, conditions=conditions, gates=GateState.of())
+        engine_config = json.loads(key.values["engine_config"])
+        return {**_member(entry, "params"), "engine_config": engine_config}, entry
+    entry = store.read(key)
+    if name == run.STEP_GRID:
+        return {"store": str(store.root), **key.values}, entry
+    return _member(entry, "params"), entry
 
 
 def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
