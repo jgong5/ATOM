@@ -175,9 +175,11 @@ mod tests {
             }
         }
 
-        // Worker with lowest load (worker3) should be selected most often
-        assert!(selected_counts[2] > selected_counts[1]);
-        assert!(selected_counts[1] > selected_counts[0]);
+        // Every draw holds the most loaded worker (worker1) against a less
+        // loaded one, so it is never chosen and every selection is worker2
+        // or worker3, whatever the RNG draws.
+        assert_eq!(selected_counts[0], 0);
+        assert_eq!(selected_counts[1] + selected_counts[2], 100);
     }
 
     #[tokio::test]

@@ -4,13 +4,13 @@ refuses one not built from the tree's ``atom/mesh``."""
 
 import json
 import os
-import socket
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from atom.compass.run import router_binary
+from tests.compass.held_ports import held_ports
 
 TREE = Path(__file__).resolve().parents[2]
 
@@ -110,12 +110,6 @@ def test_a_snapshot_matches_its_own_commit_only(repo, tmp_path):
         router_binary(binary(tmp_path, a), str(snap / "atom/mesh"))
 
 
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def pd_sim(tmp_path, exe, **cell) -> tuple[int, str]:
     run_file = tmp_path / "out" / "run.json"
     run_file.parent.mkdir()
@@ -124,19 +118,20 @@ def pd_sim(tmp_path, exe, **cell) -> tuple[int, str]:
         os.environ,
         MODEL=str(tmp_path),
         ATOMESH=exe,
-        CLOCK_PORT=str(free_port()),
         WAIT_S="30",
         **cell,
     )
-    done = subprocess.run(
-        ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
-        cwd=TREE,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
+    with held_ports(1) as [clock_port]:
+        env["CLOCK_PORT"] = str(clock_port)
+        done = subprocess.run(
+            ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
+            cwd=TREE,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
     return done.returncode, done.stdout + done.stderr
 
 

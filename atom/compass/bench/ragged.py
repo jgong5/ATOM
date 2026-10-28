@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: MIT
 """Ragged decode batches composed from recorded decode rows, for the bench.
 
-`compose(seed, contexts, rng, blocks, block_size, max_len)` takes a decode
-view, `seed`, and gives the ragged views that keep its rung, its row count B
-and its summed context, so their equivalent homogeneous shape, and the step
-grid's lookup at it, are the seed's: at each `RATIOS` value r, B rows whose
-longest context is about r times their mean. The longest row is the context
+`compose(seed, contexts, rng, blocks, block_size, max_len, ladder)` takes a
+decode view, `seed`, and gives the ragged views that keep its rung and its
+summed context: at each `RATIOS` value r, B rows whose longest context is
+about r times their mean, for B the seed's row count, then the fewest and the
+most rows its rung replays on the decode `ladder`, one more than the rung
+below it, at least 2, and the rung itself, so the views' mean context spans
+the rung's row range; a rung `ladder` lacks, or one replaying one row count,
+composes at the seed's alone. At the seed's B their equivalent homogeneous shape, and the
+step grid's lookup at it, are the seed's. The longest row is the context
 of `contexts` nearest r times the mean; each other row is drawn uniformly from
 `contexts` within `SPREADS` times the others' mean either side of it, and the
 last one is the context that brings the sum back to the seed's, within one
@@ -18,6 +22,7 @@ draws give no view. The rows are shuffled, so the longest lands anywhere.
 """
 
 import bisect
+import itertools
 import math
 
 #: The longest row's context over the mean, the views of one seed sweep.
@@ -64,15 +69,21 @@ def _rows(b: int, total: int, ratio: float, spread: float, contexts, rng, top):
     return None
 
 
-def compose(seed: dict, contexts: list, rng, blocks: int, block_size: int, max_len):
+def compose(
+    seed: dict, contexts: list, rng, blocks: int, block_size: int, max_len, ladder=()
+):
     """The ragged views of the decode view `seed` (`rows`, `rung`,
     `produces_output`), over the sorted decode-row contexts `contexts`."""
-    rows = seed["rows"]
+    rows, rung = seed["rows"], seed["rung"]
     b, total = len(rows), sum(context for _, context, _ in rows)
     out = []
     if b < 2:
         return out
-    for ratio in RATIOS:
+    counts = [b]
+    if rung in ladder:
+        below = [0, *ladder][ladder.index(rung)]
+        counts += [n for n in (max(below + 1, 2), rung) if n not in counts]
+    for b, ratio in itertools.product(counts, RATIOS):
         for spread in SPREADS[: 1 if ratio == 1.0 else None]:
             got = _rows(b, total, ratio, spread, contexts, rng, max_len)
             if got is None or sum(math.ceil(c / block_size) for c in got) > blocks:

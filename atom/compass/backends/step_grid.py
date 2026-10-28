@@ -19,9 +19,10 @@ and the lookup there, G(mean), keeps the attention work but not how it is
 spread over the rows. On a rung whose grid holds `alpha`, a decode batch's
 lookup is G(mean) + alpha (G(longest) - G(mean)), G read at B rows of the
 mean and of the longest row's cached context, so between the two, with
-alpha = clip(intercept + ratio . (longest / mean - 1) + spread . sd / mean,
-0, 1) over the rows' cached contexts (`length_statistics`). On any other
-rung, or for a batch whose rows read one context, the lookup is G(mean).
+alpha = clip(intercept + ratio . (longest / mean - 1) + spread . sd / mean
++ mean . mean / 2^16, 0, 1) over the rows' cached contexts
+(`alpha_features`). On any other rung, or for a batch whose rows read one
+context, the lookup is G(mean).
 
 A cell is the box between adjacent nodes on every axis; a coordinate on a node
 reads that node alone, so an exact hit needs one point. The answer is the
@@ -62,10 +63,11 @@ The grid is a mapping, as a bundle holds it:
      "decode": {"nodes": {"B": NODES, "c": NODES}, "points": [POINT, ...],
                 "pool": {"block_size": n, "blocks": n},       # optional
                 "alpha": {"<rung>": {"intercept": a, "ratio": b,
-                                     "spread": d}, ...}}}     # optional
+                                     "spread": d, "mean": m}, ...}}}  # optional
 
 A grid without `pool` extrapolates no decode corner; one without `alpha` reads
-every decode batch at G(mean).
+every decode batch at G(mean). An alpha without `mean`, fitted before that
+term, reads it as 0.
 
     replay: NODES = {"<rung>": [...], ...}, a POINT at [rung, B, c]
     eager:  NODES = [...],                  a POINT at [B, c]
@@ -105,7 +107,9 @@ if TYPE_CHECKING:
 
 SOURCE = "step-grid"
 #: A decode rung's alpha terms, as the grid holds them.
-ALPHA = ("intercept", "ratio", "spread")
+ALPHA = ("intercept", "ratio", "spread", "mean")
+#: The tokens alpha's `mean` term reads the mean cached context in.
+MEAN_UNIT = 2**16
 EXTRAPOLATED = f"{SOURCE}{provenance.EXTRAPOLATED}"
 UNITS = {"s": Fraction(1), "ms": Fraction(1, 10**3), "us": Fraction(1, 10**6)}
 
@@ -143,13 +147,24 @@ def length_statistics(rows: Sequence[RequestShape]) -> tuple[float, float]:
     return max(cached) / mean - 1.0, statistics.pstdev(cached) / mean
 
 
+def alpha_features(rows: Sequence[RequestShape]) -> tuple[float, ...] | None:
+    """What `ALPHA`'s terms multiply, in its order: 1, `length_statistics`, and
+    the mean cached context over `MEAN_UNIT`; None when every row reads one
+    context."""
+    ratio, spread = length_statistics(rows)
+    if not ratio:
+        return None
+    mean = statistics.fmean(row.context_tokens - row.query_tokens for row in rows)
+    return 1.0, ratio, spread, mean / MEAN_UNIT
+
+
 def alpha_of(terms: Sequence[float], rows: Sequence[RequestShape]) -> float:
     """The alpha a rung's `terms` give a decode batch of `rows`, 0 when its rows
     read one context."""
-    ratio, spread = length_statistics(rows)
-    if not ratio:
+    x = alpha_features(rows)
+    if x is None:
         return 0.0
-    return min(1.0, max(0.0, terms[0] + terms[1] * ratio + terms[2] * spread))
+    return min(1.0, max(0.0, sum(t * v for t, v in zip(terms, x))))
 
 
 def _refused(view: BatchView, reason: str) -> CostRefused:
@@ -350,7 +365,7 @@ class StepGrid:
             for rung, nodes in b_nodes.items()
         }
         for rung, alpha in decode.get("alpha", {}).items():
-            terms = tuple(float(alpha[k]) for k in ALPHA)
+            terms = tuple(float({"mean": 0, **alpha}[k]) for k in ALPHA)
             if int(rung) not in self.decode or not all(map(math.isfinite, terms)):
                 raise ValueError(
                     f"alpha {alpha} is for rung {rung}, which has no decode grid, "

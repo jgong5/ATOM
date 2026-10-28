@@ -2,12 +2,12 @@
 """Steps of a model, traced with no device into `ir.Graph`s, one per `Shape`.
 
 ATOM's `ModelRunner` runs its own step through the model's own classes under
-`TorchDispatchMode` over `FakeTensorMode`, the Python dispatcher on, at one
-concrete shape: a decode width, or a prefill of T tokens over B sequences. One
-runner steps through every shape of a capture, as it steps through a run.
-A decode shape is traced twice, its rows holding each of `CONTEXTS` tokens: an
-integer argument that differs between the two is affine in the context
-(`ir.Affine`), or the shape is refused by operator and slot.
+`TorchDispatchMode` over `FakeTensorMode` at one concrete shape: a decode
+width, or a prefill of T tokens over B sequences. One runner steps through
+every shape of a capture, as it steps through a run. A decode shape is traced
+twice, its rows holding each of `CONTEXTS` tokens: an integer argument that
+differs between the two is affine in the context (`ir.Affine`), or the shape
+is refused by operator and slot.
 
 Each leaf carries its contract: its arguments by schema slot, a tensor as its
 shape, dtype, stride, role and the `is_shuffled` mark ATOM sets on a
@@ -51,6 +51,8 @@ import contextlib
 import copyreg
 import dataclasses
 import enum
+import functools
+import gc
 import importlib
 import inspect
 import json
@@ -254,9 +256,16 @@ def _atom_frames():
 
 
 def _where(frame) -> str:
-    path = pathlib.Path(frame.f_code.co_filename)
+    code = frame.f_code
+    return _site(code.co_filename, code.co_qualname, frame.f_lineno)
+
+
+# Keyed on strings: equal code objects from two files compare and hash equal.
+@functools.cache
+def _site(filename, qualname, line) -> str:
+    path = pathlib.Path(filename)
     path = path.relative_to(_ROOT) if path.is_relative_to(_ROOT) else path
-    return f"{path}:{frame.f_lineno} in {frame.f_code.co_qualname}"
+    return f"{path}:{line} in {qualname}"
 
 
 def _storage(tensor) -> StorageWeakRef:
@@ -916,7 +925,13 @@ def _build_runner(config, fake_mode):
             return DeviceMemoryReadings(total, total, 0, 0)
 
     # A fake tensor has no address: the alias check sees each buffer empty.
-    with fake_mode, patch.object(h2d, "_range", lambda t: (0, 0)):
+    # Built in the inference mode its steps run in, so their views of its
+    # weights and buffers keep the keys of what they view.
+    with (
+        fake_mode,
+        patch.object(h2d, "_range", lambda t: (0, 0)),
+        torch.inference_mode(),
+    ):
         return _CapturedRunner(0, config)
 
 
@@ -1169,12 +1184,16 @@ def capture(
         blocks = max(
             _batch(s, block_size, max(CONTEXTS), True, drafts)[1] for s in shapes
         )
-        with fake_mode:
+        with fake_mode, torch.inference_mode():
             runner.get_num_blocks()  # sizes the pools, as `EngineCore` does
         # A warmup copy whose bytes nobody reads, like `_maybe_warmup`.
         runner.attn_metadata_builder.warmup_per_req_cache = lambda: None
-        with fake_mode, recorder:
+        with fake_mode, recorder, torch.inference_mode():
             runner.allocate_kv_cache(max(KV_BLOCKS, blocks))
+        # The runner, its drafter and its KV pool live to the end: no
+        # collection need walk them again.
+        gc.collect()
+        gc.freeze()
         # A prefill is traced as a middle chunk, which samples nothing, then as
         # a final one; a decode step always samples, as does a prefill whose
         # LM head pads, except a DP middle chunk's drafter at its later passes.
@@ -1200,7 +1219,7 @@ def capture(
             for context in CONTEXTS if shape.phase == "decode" else CONTEXTS[:1]:
                 recorder.creating = ir.Role.METADATA
                 batch = (shape, block_size, context, output, drafts)
-                with fake_mode, torch._C._EnablePythonDispatcher(), recorder:
+                with fake_mode, recorder:
                     # A runner's first step takes its own path (a decode
                     # fills no deferred ids), so the traced step follows two
                     # of its own shape, which find its launching functions:

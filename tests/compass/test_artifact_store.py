@@ -41,6 +41,7 @@ from atom.compass.artifacts import (
     git_tree_root,
     member_name,
     module_root,
+    provenance,
     roots_for,
 )
 
@@ -83,6 +84,29 @@ GATES = GateState.of(Gate("PRICE_KERNELS", "off", "COMPASS_PRICE_KERNELS"))
 def stanza(produced_by: str = "compass calibrate phase-1b") -> Provenance:
     """A complete stanza: both executed source roots, ATOM's and aiter's."""
     return Provenance(produced_by, "2026-09-22T11:00:00+00:00", (ATOM_ROOT, AITER_ROOT))
+
+
+def _clean(root: SourceRoot) -> SourceRoot:
+    return dataclasses.replace(root, dirty=0) if root.dirty else root
+
+
+@pytest.fixture(autouse=True)
+def clean_checkout(monkeypatch):
+    """This checkout's source roots counted clean wherever a command reads
+    them, so a module importing this fixture publishes and fits on a checkout
+    with uncommitted files; a test that plants its own `roots_for` still wins.
+    `roots_for` looks both resolvers up in `provenance` at call time, so
+    every module's binding of it reads the wrapped pair."""
+    tree, described = provenance.git_tree_root, provenance.git_described_root
+    for target, resolve in (
+        ("artifacts.provenance.git_tree_root", tree),
+        ("artifacts.provenance.git_described_root", described),
+        ("drive.identity.git_tree_root", tree),
+    ):
+        monkeypatch.setattr(
+            f"atom.compass.{target}",
+            lambda *a, _resolve=resolve, **k: _clean(_resolve(*a, **k)),
+        )
 
 
 #: The layout a key states when a test names only its TP width.

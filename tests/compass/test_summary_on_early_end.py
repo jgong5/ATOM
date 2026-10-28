@@ -12,6 +12,7 @@ it stands, the exception named, and the run marked a coverage report.
 import json
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 from aiter_stub import stubbed_aiter
@@ -77,9 +78,10 @@ def test_an_engine_that_raises_mid_run_leaves_a_summary_naming_it(
         from atom.model_engine import engine_core
 
     class RaisingEngine:
-        """One step, then the loop raises or returns. It has no workers to ask."""
+        """One step, then the loop raises or returns. Its workers say nothing."""
 
         _setup_engine_process = staticmethod(lambda name: None)
+        runner_mgr = SimpleNamespace(call_func=lambda name, wait_out: {})
 
         def __init__(self, *args) -> None:
             pass

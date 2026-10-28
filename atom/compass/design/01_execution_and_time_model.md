@@ -1825,7 +1825,10 @@ and receives both run on the engine's step loop, and no worker takes part.
   zero when absent: on node 18 Mooncake TCP every first write of 2 to 7 blocks on a
   pair took 9.0 to 28.1 ms longer than the pair's later writes, and its second write
   was back at their median (#1172). RDMA is unmeasured. `bytes` is exactly computable from block count x
-  per-block bytes — no measurement needed. `latency` and `bandwidth` are
+  per-block bytes — no measurement needed. Mooncake posts a transfer as two writes,
+  each paying `latency`: the blocks, with a DeepSeek-V4 request's state slot, then a
+  Kimi-K3 request's KDA state slot, or DeepSeek-V4's compressor state again from a
+  staging row; a write with no bytes is not posted (#2325, #2341, #2342). `latency` and `bandwidth` are
   configuration (`05`, the `interconnect` link the run file's `kv_link` names),
   satisfying the "interconnect is configurable" requirement directly.
 - **Decode** posts the write request in `update_state_after_alloc` (called from
@@ -1879,10 +1882,10 @@ and receives both run on the engine's step loop, and no worker takes part.
 - It must still emit the `kv_transfer_params` blob that Atomesh relays, so
   `AtomAdapter` works unmodified. The router hard-errors if it is absent
   (`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`). The two backends emit
-  **different shapes** — thirteen fields and seventeen — and Mooncake's is the
-  seventeen; see *The blob, per backend* below. The relay timestamp (D7) is a field
+  **different shapes** — thirteen fields and twenty — and Mooncake's is the
+  twenty; see *The blob, per backend* below. The relay timestamp (D7) is a field
   frontend-P adds to `kv_transfer_params` after the connector has emitted it, so the
-  connector's blob stays the seventeen.
+  connector's blob stays the twenty.
 - The consumer side must still return `(len(prompt), True)` from
   `get_num_new_matched_tokens` when `do_remote_prefill` is set, i.e. park the request
   (`mooncake_connector.py::MooncakeConnectorScheduler.get_num_new_matched_tokens`), so
@@ -1895,26 +1898,46 @@ and receives both run on the engine's step loop, and no worker takes part.
 
 Each connector assigns `seq.kv_transfer_params_output` exactly once, so there is no
 second site either row below could be describing. Each row's field set is the key
-list of that one dict literal, walked out of the AST at `92f1fdafe`.
+list of that one dict literal, walked out of the AST at `faab717bc`.
 
 | Backend | Assignment | Keys | Field set, in source order |
 |---|---|---|---|
 | `moriio` (pull, the default) | `moriio_connector.py::MoRIIOConnectorScheduler.request_finished` | 13 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `transfer_id`, `first_token_id`, `draft_token_ids`, `prefix_cache_hit_tokens` |
-| `mooncake` (push) | `mooncake_connector.py::MooncakeConnectorScheduler.request_finished` | 17 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_swa_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `remote_pp_size`, `hash_block_size`, `transfer_id`, `first_token_id`, `draft_token_ids`, `local_slot_index`, `prefix_cache_hit_tokens` |
+| `mooncake` (push) | `mooncake_connector.py::MooncakeConnectorScheduler.request_finished` | 20 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_swa_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `remote_pp_size`, `hash_block_size`, `block_size`, `dcp_size`, `transfer_id`, `first_token_id`, `draft_token_ids`, `local_slot_index`, `remote_slot_index`, `prefix_cache_hit_tokens` |
 
-The push shape is the pull shape plus four: `remote_swa_block_ids`, `remote_pp_size`,
-`hash_block_size`, `local_slot_index`. They are a second backend's blob, not optional
-fields of one, and the simulated connector, standing in for `mooncake`, emits the
-seventeen.
+The push shape is the pull shape plus seven: `remote_swa_block_ids`, `remote_pp_size`,
+`hash_block_size`, `block_size`, `dcp_size`, `local_slot_index`, `remote_slot_index`.
+They are a second backend's blob, not optional fields of one, and the simulated
+connector, standing in for `mooncake`, emits the twenty
+(`atom/compass/kv/handoff.py::transfer_params`).
 
-One of the four is load-bearing rather than descriptive. The push consumer compares
-the producer's `hash_block_size` against its own and falls back to a full transfer —
-`num_computed_blocks = 0` — whenever it is absent or differs
-(`mooncake_connector.py::MooncakeConnectorScheduler.update_state_after_alloc`), so a blob carrying only the thirteen can never
-take the incremental path.
+Three of the seven, `hash_block_size`, `block_size` and `dcp_size`, are load-bearing
+rather than descriptive. The push consumer skips its cached prefix only when every check
+in `mooncake_connector.py::MooncakeConnectorScheduler.update_state_after_alloc` holds:
+
+- the producer's pages line up with the consumer's
+  (`MooncakeConnectorScheduler._remote_page_geometry`). With `block_size` and `dcp_size`
+  both present, the producer's `block_size` equals the consumer's and its `dcp_size` is 1
+  or the consumer's. Otherwise (either field missing), the producer's `hash_block_size`
+  equals the consumer's `block_size` (an unsharded producer) or the consumer's
+  `hash_block_size` (symmetric DCP);
+- the request keeps no per-request cache (`seq.has_per_req_cache` is false), since a
+  block delta does not carry state such as an SWA ring slot;
+- the consumer's `hash_block_size` is positive.
+
+It then sets `num_computed_blocks = seq.num_cached_tokens // hash_block_size` and
+`src_block_skip_factor` to the consumer's `dcp_size` over the producer's. When any check
+fails, `num_computed_blocks = 0`, a full transfer, so a blob carrying only the thirteen
+never takes the incremental path. The simulated consumer applies the page rule in
+`atom/compass/kv/connector.py::SimulatedKVConnectorScheduler._pages_line_up` and the
+other two checks in its `update_state_after_alloc`, then prices the consumer blocks left.
+It does not model `src_block_skip_factor`, and needs no term for it: the factor only picks
+which producer blocks fill the consumer's, and the blocks left are Mooncake's
+`dst_block_ids`, priced at decode's own `TransferModel.bytes_per_block`
+(`tests/compass/test_kv_mooncake_per_req_cache.py::test_an_unsharded_producer_into_dcp2_is_priced_on_mooncakes_slices`).
 
 `tests/compass/test_kv_blob_site.py` holds the one-site claim above. Nothing re-checks
-the field sets: they describe the connectors' code as read at `92f1fdafe`, and where the
+the field sets: they describe the connectors' code as read at `faab717bc`, and where the
 two differ the code is right.
 
 ### Pros
@@ -1940,7 +1963,12 @@ two differ the code is right.
   maps its regions onto a consumer holding every layer, `consumer_region_indices`, and a
   decode head reports `finished_recving` from its own stage only); `lmcache_mp` under PP
   (ATOM's `mp/deployment.py::_validate_mp_config`); any other connector (`allocate_kv_cache`,
-  above); PP with DP (ATOM's `CoreManager`, and the channel table).
+  above); PP with DP (ATOM's `CoreManager`, and the channel table); Kimi-K3's KDA state
+  regions above PP 1 (ATOM's `_KimiMLAGDNCommon._with_kda_disagg_regions`, restated by
+  `overrides.py::_refuse_kda_regions_across_stages` as a runner publishes its planned
+  transfer, since no simulated runner builds the regions); DeepSeek-V4 above PP 1 (ATOM's
+  `ModelRunner.get_num_blocks`, which refuses its copied state checkpoints there and which
+  the simulated runner runs).
 
 ### Prefill pipeline parallelism (owner ruling on #1385)
 

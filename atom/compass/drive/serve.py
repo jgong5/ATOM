@@ -72,6 +72,12 @@ POLL_S = 0.5
 #: Seconds the group has to leave after SIGTERM. ATOM's server waits
 #: ATOM_SHUTDOWN_TIMEOUT_S for its engines, and they as long for their workers.
 STOP_GRACE_S = 60
+#: ATOM_SHUTDOWN_TIMEOUT_S for a server this driver starts: a worker writes its
+#: step record at its exit, and one blocked in a Mooncake sync write at SIGTERM
+#: exits only once the write returns, within Mooncake's default 30 s timeout
+#: (`mooncake_connector._mc_transfer_timeout_s`). Less than `STOP_GRACE_S`, so
+#: ATOM's own kill of a worker still comes before the group's SIGKILL.
+SHUTDOWN_TIMEOUT_S = 45
 TREE = Path(atom.__file__).resolve().parents[1]
 PORT_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
 #: Where a server's ports are drawn, and where `deploy.sh` draws a deployment's:
@@ -80,6 +86,9 @@ PORT_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
 SERVE_PORTS, DEPLOY_PORTS = range(10000, 15000), range(17001, 65536)
 #: The line each rank logs naming its graph's directory in the compiled-graph cache.
 CACHE_LINE = re.compile(r"Using cache directory: (\S+) for vLLM's torch\.compile")
+#: ATOM's `atom.utils.backends.VLLM_CACHE_ROOT`, stated here because importing
+#: that module opens a HIP context on every GPU the calling process can see.
+CACHE_ROOT = os.path.expanduser("~/.cache/atom")
 
 
 def below_ephemeral(ports: range) -> range:
@@ -133,6 +142,7 @@ def serve(
     )
     env[parity.ENV] = str(out / STEPS)
     env["ATOM_DP_MASTER_PORT"] = str(dp_port)
+    env["ATOM_SHUTDOWN_TIMEOUT_S"] = str(SHUTDOWN_TIMEOUT_S)
     if run is None:
         env["HIP_VISIBLE_DEVICES"] = hip_visible(gpus)
     else:
@@ -192,9 +202,7 @@ def drop_compiled(log) -> None:
     """Remove each directory ATOM derived in its compiled-graph cache that the
     stopped server's log `log` names. A directory configured outside the cache
     root stays."""
-    from atom.utils.backends import VLLM_CACHE_ROOT
-
-    root = Path(VLLM_CACHE_ROOT, "torch_compile_cache")
+    root = Path(CACHE_ROOT, "torch_compile_cache")
     text = Path(log).read_text("utf-8", "replace")
     for used in map(Path, CACHE_LINE.findall(text)):
         if used.is_relative_to(root) and used != root:

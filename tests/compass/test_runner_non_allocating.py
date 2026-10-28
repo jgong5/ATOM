@@ -59,7 +59,6 @@ ENGINE_READS = {
     "overrides.py": {"atom.compass.backends.base"},
     "projection.py": {
         "atom.compass.backends.shape",
-        "atom.model_engine.sequence",
         "atom.utils.forward_context",
     },
 }
@@ -591,8 +590,8 @@ def test_only_the_binding_module_reaches_the_engine(path):
     The modules that read named modules outside the exemption are listed in
     `ENGINE_READS` by the exact set. `model_runner` binds ATOM's runner.
     `overrides` reads the cost backend's base class, from a package whose own
-    test keeps it free of the engine. `projection` reads a scheduled batch, a
-    sequence's kind and the dispatch rule; none of those reaches
+    test keeps it free of the engine. `projection` reads a scheduled batch and
+    the dispatch rule; neither reaches
     `atom.model_engine.model_runner`, and
     `test_every_other_module_imports_here` runs the import to measure it.
     """

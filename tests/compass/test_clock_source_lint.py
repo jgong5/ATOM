@@ -88,6 +88,26 @@ CLOCK_READS_THAT_FIRE = {
         "from datetime import datetime\n\n\ndef f():\n    return datetime.utcnow()\n",
         "engine.py:5  datetime.datetime.utcnow  in f",
     ),
+    "process-time": (
+        "import time\n\n\ndef f():\n    return time.process_time()\n",
+        "engine.py:5  time.process_time  in f",
+    ),
+    "process-time-ns": (
+        "import time\n\n\ndef f():\n    return time.process_time_ns()\n",
+        "engine.py:5  time.process_time_ns  in f",
+    ),
+    "thread-time": (
+        "from time import thread_time\n\n\ndef f():\n    return thread_time()\n",
+        "engine.py:5  time.thread_time  in f",
+    ),
+    "thread-time-ns": (
+        "import time\n\n\ndef f():\n    return time.thread_time_ns()\n",
+        "engine.py:5  time.thread_time_ns  in f",
+    ),
+    "today": (
+        "from datetime import datetime\n\n\ndef f():\n    return datetime.today()\n",
+        "engine.py:5  datetime.datetime.today  in f",
+    ),
     "innermost-scope": (
         "import time\n\n\nclass A:\n    def g(self):\n        return time.time()\n",
         "engine.py:6  time.time  in g",
@@ -101,6 +121,8 @@ CLOCK_READS_THAT_ARE_NOT = {
     "row-attribute": "def f(row):\n    return row.datetime.now()\n",
     "imported-namespace": "import mock\n\n\ndef f():\n    return mock.time.time()\n",
     "another-package": "from mypkg import time\n\n\ndef f():\n    return time.monotonic()\n",
+    "relative-module": "from . import time\n\n\ndef f():\n    return time.monotonic()\n",
+    "relative-name": "from .time import monotonic\n\n\ndef f():\n    return monotonic()\n",
 }
 
 

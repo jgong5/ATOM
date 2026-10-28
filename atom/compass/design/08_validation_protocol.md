@@ -81,7 +81,7 @@ that subset is genuinely green.
 | Gate | What runs | Measured result |
 |---|---|---|
 | **CPU gate** — per task, and green is the bar | Every test file outside `tests/plugin/` and `scripts/compass/cpu_gate_exclude.txt`. Driven by `scripts/compass/gate_cpu.sh`; no driver is touched **as a batch**. That is the weaker and correct claim: `test_postprocess_width.py` and `test_v4_checkpoint_slot_copy.py` were both in the gate at `236abfd9a`, and each reached `rocminfo` when run *alone* (`no tests collected, 1 error`, rc=2, each, measured in `xiaobizh_n18_cpu`); inside the gate they module-skipped on the mock an earlier file installs. Driver-freedom here is a property of the batch, not of every file in it. | Green, `GATE_CPU_RC=0`, read at `bdd244c57` in `xiaobizh_n18_cpu`. The counts are not restated here, because they move with every test the gate gains or loses: `gate_cpu.sh` prints them under the `commit:` line of the tree it ran, and `scripts/compass/README.md` says what the gate runs. |
-| **GPU gate**, a superset — per wave, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`. | Pure upstream `661ef7661`, the ATOM the nightly 20261013 image ships, on node 18's MI308X: the run, its toolchain and its counts are the `BASE_*` constants in `scripts/compass/gate_gpu.sh`, and every failing node-id is on file verbatim in `scripts/compass/gpu_gate_known_failures.txt` and compared by name, so "N failed" is checked against "the *same* N failed". Until the upstream merge the baseline was `fe9ea043c` on node 18, whose five failures (four bf16-ULP `allclose` cases in `tests/test_fused_compress_ragged.py` and the bitwise `tests/test_dcp_merge_ops.py::test_row_view_matches_output_slicing_bitwise`) are still in the list. |
+| **GPU gate**, a superset — per wave, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`. | The commit, its counts and the toolchain it ran under are in `scripts/compass/gpu_gate_baseline.env`, and every failing node-id is on file verbatim in `scripts/compass/gpu_gate_known_failures.txt` and compared by name, so "N failed" is checked against "the *same* N failed". `scripts/compass/regen_gpu_gate_baseline.sh` rewrites both from two runs that pass the same count and fail the same node-ids, so a new image or GPU is re-baselined by one command. The upstream merge set the baseline to pure upstream `661ef7661`, the ATOM the nightly 20261013 image ships, on node 18's MI308X; before it the baseline was `fe9ea043c` on node 18, whose five failures (four bf16-ULP `allclose` cases in `tests/test_fused_compress_ragged.py` and the bitwise `tests/test_dcp_merge_ops.py::test_row_view_matches_output_slicing_bitwise`) the merge's list kept. |
 
 `test_dp_metadata.py`, `test_dp_sync_layout.py`
 and `test_forward_mode.py` were once excluded and were re-measured CPU-green (`16`); prose
@@ -490,31 +490,37 @@ The answer changes what a result *is*, so it belongs here rather than in any one
 | Bring-up usability | **poor** — one unforeseen shape kills a 300 s run | good | good |
 | Diagnostic value | names one refusal | **names all of them, with counts** | names all of them |
 | Risk of a partial result being read as complete | none | **real** | real |
-| Schedule fidelity | n/a | a refused step costs 0 s, so the schedule after it is not the real one | same |
+| Schedule fidelity | n/a | a refused step charges less than it ran, so the schedule after it is not the real one | same |
 
 ### Decision
 
-**A step is refused only when some term is still unanswered after method fallback. A
-refused step costs 0 s and the run continues, and any refusal makes the run a coverage
+**A step is refused only when some term is still unanswered after method fallback. Each
+unanswered term costs 0 s, a step the cost backend refuses charges no device time, its
+answered terms included, and the run continues; any refusal makes the run a coverage
 report** (owner ruling on
 [#765](https://github.com/jgong5/ATOM/pull/765#issuecomment-6104630073), 2026-10-11, in
-the terms of [#952](https://github.com/jgong5/ATOM/issues/952)). Concretely:
+the terms of [#952](https://github.com/jgong5/ATOM/issues/952); its cost under host laws,
+owner ruling on [#2294](https://github.com/jgong5/ATOM/pull/2294#issuecomment-6430137755),
+2026-10-26). Concretely:
 
 1. **Refused means some term is still unanswered after method fallback**, and the
    reasons are listed per term. A source that declines while a later one answers is a
    fall-through, not a refusal, and the term carries the provenance of the source that
    answered, every declined one listed before it. An answer of any method is not a
    refusal either: `analytical` (the analytical fallback, where the run has one),
-   `declared`, or `estimated` and unvalidated (outside the hull, `09` D58). A refused step
-   costs 0 s and the run continues; it is not skipped, since
-   ATOM's scheduler has already applied the batch, and the clock simply does not advance
-   for it.
+   `declared`, or `estimated` and unvalidated (outside the hull, `09` D58). Each
+   unanswered term costs 0 s. A step the cost backend refuses charges no device time, its
+   answered terms included, and still charges the host segments it has laws for; a
+   forward the host laws refuse keeps its device time and charges each segment it lacks
+   at 0 s. The run continues, and the step is not skipped, since ATOM's scheduler has
+   already applied the batch.
 2. **The run artifact carries the refused count and the distinct reasons with counts,
    and reports the priced seconds by method apart from them**: analytical, declared,
    measured, estimated and unvalidated, each with its step count and share of predicted
    seconds (`seconds_by_method` in the run summary, grouped as
    `backends/cost.py::GROUPS`). Declared and analytical seconds are reported and not
-   gated. Refusals carry no seconds: a refused step has none. Each assumed treatment
+   gated. Refusals carry no seconds: an unanswered term has none, and a step the cost
+   backend refuses adds none for its answered terms either. Each assumed treatment
    the steps were priced under (`09` D61) is listed with its step count (`treatments`
    in the run summary); it is a property of the query and changes no term's method.
 3. **Any refusal, of any source, makes the run a coverage report** (`coverage_report` in
@@ -530,8 +536,9 @@ toolchain is built so that a refusal tells you what to measure (`07` D37). Abort
 that one refusal per run instead of a complete list, which turns a single coverage gap
 into as many iterations as there are gaps.
 
-**Why any refusal makes a coverage report, with no threshold.** A refused step costs
-0 s, so a run with refusals understates its time by an amount nothing measured; a
+**Why any refusal makes a coverage report, with no threshold.** A refused step charges
+less than it ran, each unanswered term 0 s and, when the cost backend refuses, no device
+time at all, so a run with refusals understates its time by an amount nothing measured; a
 threshold on refused seconds would gate on a number that is zero by construction.
 Steps answered by any method are priced, so their shares of seconds are real, and each
 method is reported apart so none reads as measured. At step level the roofline answers
@@ -753,6 +760,7 @@ Fail closed. Each of these has a prior incident behind it.
 | an **artifact fingerprint mismatch** | doc 07 D43 |
 | a **gate state** in the artifact disagreeing with the stated configuration | *"a dead gate is worse than no gate"* — a `PRICE_KERNELS` gate read `WORLD_SIZE`, which the engine never sets, so it was false in every worker and the proof was in the artifact: breakdowns present for 164 of 237 entries |
 | **saturation** where scheduling fidelity is being claimed | see below |
+| a real record whose `run.json` names **`aiter_jit_builds`**: grading, the fits and `validate.cost` refuse the whole record | a step may have waited on the compile: about 60 s for an aiter module build, 53.6 s and 56.4 s for a fresh container's first two prefills under Inductor ([#1319](https://github.com/jgong5/ATOM/issues/1319)) |
 | any **refusal**, of any source | the run is a coverage report (D50.1); name every reason |
 
 ### Saturation deserves its own note
@@ -785,7 +793,7 @@ claims there are not.
 | D47 | Cost accuracy on the real run's own step sequence; report totals, held-out-worst, and median per step together. Graded: every answered step with no declared term, at every backend, under #627's 5% gate; validated and unvalidated steps reported beside, not gated; declared steps apart. | 2026-09-18; revised 2026-10-23 (#2011) |
 | D48 | Memory per term, never as a sum. The gate is whether the top-1 configuration choice survives, not the byte error. | 2026-09-18 |
 | D49 | Seven hygiene refusals, each with a prior incident behind it. An op-level leaf is not extrapolated: with no same-kernel bracket it falls to its analytical law. An out-of-hull step is graded and also reported apart. | 2026-09-18; op-level leaf 2026-10-18 (#1489); out-of-hull graded 2026-10-23 (#2011) |
-| D50.1 | A step is refused only when some term is still unanswered after method fallback, its reasons listed per term; a fall-through and an answer of any method are not refusals, and the priced seconds are reported by method (analytical, declared, measured, estimated, unvalidated) with their steps and share of predicted seconds. A refused step costs 0 s and the run continues; `--on-refusal abort` stops at the first, and the summary is written either way. Any refusal, of any source, makes the run a coverage report: no refused-seconds fraction, no threshold, and no answered step invalidates a run, whatever its method or share. No validated share refuses or makes a coverage report. | 2026-09-19; revised 2026-10-11 (#765, and again to drop the analytical cap); 2026-10-14 (#952); 2026-10-23 (#2011) |
+| D50.1 | A step is refused only when some term is still unanswered after method fallback, its reasons listed per term; a fall-through and an answer of any method are not refusals, and the priced seconds are reported by method (analytical, declared, measured, estimated, unvalidated) with their steps and share of predicted seconds. Each unanswered term costs 0 s, and a step the cost backend refuses charges no device time, its answered terms included; the run continues, `--on-refusal abort` stops at the first, and the summary is written either way. Any refusal, of any source, makes the run a coverage report: no refused-seconds fraction, no threshold, and no answered step invalidates a run, whatever its method or share. No validated share refuses or makes a coverage report. | 2026-09-19; revised 2026-10-11 (#765, and again to drop the analytical cap); 2026-10-14 (#952); 2026-10-23 (#2011); 2026-10-26 (#2294) |
 | D50 | Everything registered and hashed before evaluation; the case set never shrinks, though the owner dropped stage 2's 64 and 256, whose aiperf warmup cannot finish within a capture's window (#1590). One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The cells are stage 2's Qwen3.8-27B TP1 on MI308X and M2's four nightly P/D configurations of DeepSeek-V4-Pro on MI355X at their concurrencies, then the DPA two at EP8. M2's ranking gate: the same best configuration as hardware at each concurrency, and rank correlation across all cells, per end-to-end metric, each inside its real-vs-real spread, with Spearman's ρ also at least 0.9. DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01, 2026-10-09, 2026-10-10, 2026-10-20 |
 | D50.2 | The MI455 projection is sound, not graded: on every measured step, at both granularities, the analytical price at attainable peaks probed on the device, composed by the IR's own joins, is at most the measured time, with measured over analytical per op kind and phase reported beside it; every MI455 input is sourced or marked assumed, its peaks the datasheet times MI355X's probed ratios; the method's error, MI308X to MI355X on Qwen3.8-27B, and the configuration ranking are reported, not gated. Replaces the bound first stated at the spec's peaks with derates at 1, and the method that carried implementation efficiencies onto the target. | 2026-10-09; revised 2026-10-17 (#1392) |
 | D50.3 | The op-level empirical backend is graded by this protocol as the step-level backends are, on the same real runs: Qwen3.8-27B TP1 on MI308X on #974's runs, then M2's cells with the ranking gate. Faster than real is gated; 5× is reported. Reported, not gated: the analytical fallback's share of priced seconds, the per-step composed-over-measured gap per phase and op kind, the step-level backend's table beside it, and warm-over-cold. | 2026-10-18 (#1489) |
