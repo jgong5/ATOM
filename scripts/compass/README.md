@@ -257,17 +257,16 @@ docker run -d --name <user>_mi455 --network host --device /dev/kfd --device /dev
 ```
 
 DeepSeek-V4.1-Flash's gfx1250 flags are in
-[its recipe](../../recipes/DeepSeek-V4.1-Flash.md#gfx1250-mi455x). Two things stop
-`ec341a05a` serving it at TP4 in this image on an A0 node (ctheliosp-rck-g02-j07-04,
-four cards, 250 GB of host memory, 2026-10-27):
+[its recipe](../../recipes/DeepSeek-V4.1-Flash.md#gfx1250-mi455x). What stops
+`ec341a05a` serving it at TP4 in this image on an A0 node, with the measurements
+in [#2359](https://github.com/jgong5/ATOM/issues/2359):
 
 - **Every process translates its own GPU code.** On a gfx1250 A0 card ROCr
   rewrites each B0 code object a process loads for A0, in that process, and keeps
   nothing for the next; `HSA_HOTSWAP_VERBOSE=1` logs `installed eager gfx1250
-  B0-to-A0 hook` there. A rank's first RCCL communicator, alone on the node, took
-  285 s and 70 GB of host memory at peak, and kept 54 GB. Four ranks took the
-  host's available memory from 203 GB to 4 GB in `ncclCommInitRank`, so watch
-  `MemAvailable` while more than one such process starts.
+  B0-to-A0 hook` there. Each rank holds its translations in host memory, which a
+  TP4 start's four ranks exhaust in `ncclCommInitRank`, before the weights load;
+  watch `MemAvailable` while more than one such process starts.
 - **Its aiter lacks `ROCm/aiter#6833`:** `fused_dual_rmsnorm_mxfp8_quant` takes
   no `amax_floor`, which V4.1's `DualRMSNormMXFP8` passes.
 
