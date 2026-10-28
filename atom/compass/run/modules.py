@@ -165,7 +165,7 @@ V41_SILENT = (
     V41 + "vision.ViT",
     V41 + "vision.Aligner",
     V41 + "runtime._Stage",
-    "atom.models.deepseek_v4_dspark.DSparkMarkovHead",
+    "atom.models.dspark_draft.DSparkMarkovHead",
 )
 #: What the routed experts' kernel reads once for each expert it runs.
 HELD = tuple(f"w{w}_{p}" for w in (13, 2) for p in ("weight", "weight_scale", "bias"))
