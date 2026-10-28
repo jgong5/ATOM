@@ -344,7 +344,9 @@ graded as a candidate for #627's stage 2 (`17` D96, `07` D36).
 
 The analytical method has its own gate, stated in advance: on every measured step, at both
 granularities, it prices **at most the measured time**; configuration ranking and the
-method's error are reported, not gated (`10` D67.1, #1392).
+method's error are reported, not gated (`10` D67.1, #1392). Stage 4 checks it on MI455's own
+runs at peaks probed there, and reports the method's error as the same MI455 records
+bounded at the frozen projection's spec and at the probed one (`16` *Stage 4*, `08` D50.2).
 
 Final proof is **paired simulated and real execution of cc-traces proper**.
 
@@ -353,7 +355,7 @@ Final proof is **paired simulated and real execution of cc-traces proper**.
 | # | Milestone |
 |---|---|
 | **M1** | **[#627](https://github.com/jgong5/ATOM/issues/627) stages 1 and 1b: cc-traces end to end on a GPU-free simulated run** (`16` D95). Stage 1 drives cc-traces through agentx-harness at TP1; stage 1b adds atomesh at 1P+1D; each run ends by the finish. Built on the discrete-event foundation, fake models covering prefill, decode and KV need, and the test harness |
-| **M2 — v1** | **#627 stage 3: DeepSeek-V4-Pro 1P+1D on MI355X within the targets above**, first in the nightly configurations with expert parallelism off, then at EP8 — each step first the same scheduling decisions as the real engine, then the separable results of `08` D44 and the configuration-ranking gate; **the MI455 roofline projection**, held to the soundness checks of `16` D95. **First gate, #627 stage 2:** Qwen3.8-27B TP1 on MI308X, paired real and simulated cc-traces graded by `08` |
+| **M2 — v1** | **#627 stage 3: DeepSeek-V4-Pro 1P+1D on MI355X within the targets above**, first in the nightly configurations with expert parallelism off, then at EP8 — each step first the same scheduling decisions as the real engine, then the separable results of `08` D44 and the configuration-ranking gate; **the MI455 roofline projection** of stage 3c, held to the soundness checks of `16` D95 and then frozen; last, **stage 4: DeepSeek-V4.1-Flash measured on MI455 and graded by the step linear backend in two TP4 DSpark5 cells**, with the analytical bound checked on the same runs (`16` *Stage 4*, [#2138](https://github.com/jgong5/ATOM/issues/2138)). **First gate, #627 stage 2:** Qwen3.8-27B TP1 on MI308X, paired real and simulated cc-traces graded by `08` |
 | ~~M3–M7~~ | Retired by `16` D95, which maps each one to where its scope went. PP, EP beyond one node, and further models come after v1 |
 
 Sequencing, dependencies and parallelisable work are in the execution plan (`16`). `00_initial_prompt.md` is the original seed and is
