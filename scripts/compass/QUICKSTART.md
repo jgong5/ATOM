@@ -201,9 +201,10 @@ refuses a run whose warmup is missing or overlaps its graded steps.
 The scenario also wants a first token or a request's end in the duration's last
 5%, and aiperf exits 1 when none falls there. At low concurrency one long request
 can span that window, and aiperf cancels it at the cutoff and records nothing of
-it: step 2's c=1 record does on node 18. Such a run is complete. `client.sh`
-prints `client: aiperf failed its coverage check alone: ...` and writes the
-export; any other aiperf failure fails the client run.
+it, as step 2's c=1 record did once on node 18
+([#2330](https://github.com/jgong5/ATOM/issues/2330)). Such a run is complete.
+`client.sh` prints `client: aiperf failed its coverage check alone: ...` and
+writes the export; any other aiperf failure fails the client run.
 
 ## The path
 
