@@ -962,7 +962,8 @@ Developer checks, outside the `compass` path:
 ### The same cell under the step grid
 
 The step grid reuses steps 1 to 4: the calibration records are its residual's
-targets, and the real runs are its coverage check's inputs and its graded side.
+targets and, through the ragged views step 7 composes from them, alpha's; the
+real runs are its coverage check's inputs and its graded side.
 Its points are planned from the shape populations and step 4's real runs, so
 every cell a real step falls in is measured: a population alone leaves the cells
 of shapes only the real server scheduled unmeasured (#1884). The plan reads
@@ -990,11 +991,20 @@ powers of two and no margin:
    GPUs each take a subset of the inputs into a store of its own, starts a minute
    apart; copying each store's `step_measurement` entries into one, and this step
    again over every input, measures what remains.
+   Then `compass measure steps $R/cal/c* --sample 6 --seed N --ragged --client-run
+   $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... --sampling '{"ignore_eos":
+   true}' --gpu G $S --out $R/ragged -- $ATOM`, naming every record: it draws six
+   decode steps a rung and measures the ragged views composed from each. Alpha
+   is fitted on these views alone. Each view measured prints `measured decode
+   rung <R> <token>: ...`; keep every token, since a rerun prints only the views
+   the store lacked.
 8. `compass fit steps --backend step-grid --grid POP... $R/cell/c*/real*
-    --grid-definition $G $R/cal/c* --client-run ...`, naming every population,
-    real run and record, `$M $S --out $R/fit-grid`; it prints the bundle's
-    token. A second fit of one definition into one store is refused as an
-    overwrite: refit into a fresh store.
+    --grid-definition $G $R/cal/c* RAGGED... --client-run ...`, naming every
+    population, real run and record, and as `RAGGED` every token step 7's
+    `--ragged` run printed, `$M $S --out $R/fit-grid`; it prints the bundle's
+    token, and its report's `alpha` states per rung whether alpha was kept. A
+    second fit of one definition into one store is refused as an overwrite:
+    refit into a fresh store.
 9. `compass run --step-grid BUNDLE --host-laws HOST --coverage $R/cell/c<C>/real*
     $M $S --out $R/cell-grid/c<C>/step_grid -- $ATOM`, serving the same client run as
     step 5. The check counts the real steps the bundle covers, extrapolates past
