@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""A GPU command's checks before and after its run: `preflight.sh` runs for
-real, with `rocm-smi` and `rocminfo` planted first on PATH, so these need no
-GPU. The planted `rocm-smi` prints its N-th process listing on its N-th call
-and the last one after that."""
+"""A GPU command's checks before and after its run, with `rocm-smi` and
+`rocminfo` planted first on PATH, so these need no GPU. The planted `rocm-smi`
+prints its N-th process listing on its N-th call and the last one after that.
+`quiet` runs a planted `preflight.sh` that only exits with a given code; the
+`preflight.sh` tests run the real one, whose census reads this container's
+load, so they assert on its output, not its exit."""
 
 import argparse
 import os
@@ -80,7 +82,7 @@ TEN = "".join(f"{g}    {g + 2}     0x74a2  gfx942\n" for g in range(10))
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 
 
-def _plant(tmp_path, monkeypatch, *listings, rocminfo_rc=0):
+def _plant(tmp_path, monkeypatch, *listings, preflight_rc=0):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     for i, text in enumerate(listings):
@@ -95,10 +97,13 @@ case "$*" in *--showhw*) cat {bindir}/showhw;;
     cat "$f";;
 esac
 """)
-    (bindir / "rocminfo").write_text(f"#!/bin/sh\nexit {rocminfo_rc}\n")
+    (bindir / "rocminfo").write_text("#!/bin/sh\n")
     for tool in ("rocm-smi", "rocminfo"):
         (bindir / tool).chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    flight = tmp_path / "preflight.sh"
+    flight.write_text(f"echo PREFLIGHT_RC={preflight_rc}\nexit {preflight_rc}\n")
+    monkeypatch.setattr(drive_gpu, "PREFLIGHT", flight)
     out = tmp_path / "out"
     out.mkdir()
     return out
@@ -145,7 +150,7 @@ def test_the_stop_is_checked_however_the_run_ends(tmp_path, monkeypatch):
 
 
 def test_a_failed_preflight_refuses_before_any_listing(tmp_path, monkeypatch):
-    out = _plant(tmp_path, monkeypatch, FREE, rocminfo_rc=1)
+    out = _plant(tmp_path, monkeypatch, FREE, preflight_rc=1)
     failed = "^preflight.sh failed before the run"
     with pytest.raises(GpuRefusal, match=failed), quiet((7,), out):
         pytest.fail("the run started")
@@ -201,7 +206,7 @@ def test_preflight_exports_the_hip_devices_of_the_free_rocm_smi_gpus(
     )
     (bindir / "rocm-smi").write_text(smi)
     flight = subprocess.run(
-        ["bash", str(PREFLIGHT)], capture_output=True, text=True, check=True
+        ["bash", str(PREFLIGHT)], capture_output=True, text=True, check=False
     )
     assert "idle and empty: 0 1\nexport HIP_VISIBLE_DEVICES=1,3\n" in flight.stdout
 
@@ -223,13 +228,19 @@ def _preflight(tmp_path, monkeypatch, use, vram, rocminfo=""):
     (bindir / "rocm-smi").write_text(smi)
     (bindir / "rocminfo").write_text(f"#!/bin/sh\n{rocminfo}\n")
     return subprocess.run(
-        ["bash", str(PREFLIGHT)], capture_output=True, text=True, check=True
+        ["bash", str(PREFLIGHT)], capture_output=True, text=True, check=False
     )
 
 
 def test_preflight_books_only_gpus_at_zero_use_and_zero_vram(tmp_path, monkeypatch):
     flight = _preflight(tmp_path, monkeypatch, use=(0, 0, 3), vram=(0, 3, 0))
     assert "idle and empty: 0\nexport HIP_VISIBLE_DEVICES=0\n" in flight.stdout
+
+
+def test_a_failing_rocminfo_fails_preflight(tmp_path, monkeypatch):
+    flight = _preflight(tmp_path, monkeypatch, (0,), (0,), rocminfo="exit 1")
+    assert "rocminfo did not return in 25 s (exit 1)" in flight.stderr
+    assert flight.stdout.endswith("\nPREFLIGHT_RC=1\n")
 
 
 def test_preflight_reads_use_before_rocminfo_wakes_the_gpus(tmp_path, monkeypatch):
