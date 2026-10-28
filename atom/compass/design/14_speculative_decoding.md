@@ -395,7 +395,7 @@ carries it whole; MTP3 is where its shape matters.
 **Stage 4 prices DeepSeek-V4.1-Flash's DSpark5** on MI455 (`16` *Stage 4*), the only
 draft path ATOM serves V4.1 with: `deepseek_v41/config.py::validate_speculative_config`
 refuses any method but DSpark with five draft tokens, a draft checkpoint other than the
-target's, a KV cache other than BF16, and relaxed verification.
+target's, and relaxed verification.
 
 | Item | In ATOM | For this topic |
 |---|---|---|

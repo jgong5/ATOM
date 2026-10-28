@@ -36,11 +36,14 @@ Implementation efficiency is a diagnostic, never a projection input (D68), and M
 peaks are its datasheet times the ratios probed on MI355X (D69).
 
 **Revised 2026-10-25 by the owner's ruling on
-[#2138](https://github.com/jgong5/ATOM/issues/2138), and 2026-10-27 by its rulings there:**
-stage 4 runs DeepSeek-V4.1-Flash on MI455, so MI455's peaks are probed on the device and
-the bound is checked on its own runs; the ratios carried from MI355X belong to the frozen
-stage-3c projection, and the method's error is the same MI455 records bounded at the frozen
-spec and at the probed one (D67.1, D69, D70).
+[#2138](https://github.com/jgong5/ATOM/issues/2138), 2026-10-27 by its rulings there, and
+2026-10-28 by the
+[ruling on #2141](https://github.com/jgong5/ATOM/issues/2141#issuecomment-6467960187):**
+stage 4 runs DeepSeek-V4.1-Flash on MI455's A0 sample cards, so A0's peaks are probed there
+and the bound is checked on A0's own runs; the B0 performance machines keep the ratios
+carried from MI355X, as the frozen stage-3c projection took them, until a B0 node is
+probed, and the method's error is the same A0 records bounded at the frozen spec and at
+A0's probed one (D67.1, D69, D70).
 
 **Scope.** Cost and memory derived from device parameters and model geometry, with **no
 observation of the subject**. Serves three purposes: M2's projection of DeepSeek-V4-Pro
@@ -120,8 +123,8 @@ rate per format (BF16, FP8, FP4); `BW(bytes)`, a bandwidth curve, per size the f
 empty-kernel floor; and the link latency and bandwidth `t_comm` reads (D66). Probed values
 make a term analytical. A device with no hardware takes its datasheet times the ratio
 probed on a device that was run, declared (D69), as the frozen MI455 projection did from
-MI355X; MI455 itself is probed since stage 4. A mixed-format operand pair takes the rate
-of the wider format.
+MI355X and MI455's B0 spec does until a B0 node is probed; MI455's A0 samples are probed
+since stage 4. A mixed-format operand pair takes the rate of the wider format.
 
 **MoE** work takes the expectation under independent uniform routing: `E(1-(1-k/E)^B)`
 activated experts for `B` rows, each routed to `k` of `E`, and under EP the expected
@@ -456,24 +459,27 @@ datasheet states are carried as they stand and banded too, and each cell reports
 seconds by the roofline part that set them.
 
 **Revised 2026-10-25 by the owner's ruling on
-[#2138](https://github.com/jgong5/ATOM/issues/2138):** MI455's peaks are probed on the
-device; the ratios carried from MI355X belong to the frozen stage-3c projection, and the
-method is measured on MI455's own records.
+[#2138](https://github.com/jgong5/ATOM/issues/2138), and 2026-10-28 by the
+[ruling on #2141](https://github.com/jgong5/ATOM/issues/2141#issuecomment-6467960187):**
+the MI455 A0 sample node's peaks are probed there; the ratios carried from MI355X stay in
+the frozen stage-3c projection and in the MI455 B0 performance machines' spec until a B0
+node is probed, and the method is measured on A0's own records.
 
 **Peaks are attainable peaks probed on the device** (D64). A device with no hardware takes
 **its datasheet times the ratio probed on a device that was run**, per peak, as the frozen
 stage-3c projection took MI455's from MI355X before MI455 ran. The ratio is observed on
 another device, so the field is assumed and every term that reads it is declared (`05`
 D25, rule 5). The ratio is a property of the probe on the silicon and the vendor library,
-not of ATOM's kernels: no implementation efficiency enters it (D68). Since stage 4, MI455's
-peaks are probed on an MI455 node (`05` D26), and only the frozen projection reads the
-carried ratios.
+not of ATOM's kernels: no implementation efficiency enters it (D68). Since stage 4, MI455
+has two specs: the A0 samples' peaks are probed on their node (`05` D26), and the B0
+performance machines' carry MI355X's ratios as the frozen projection did, until a B0 node
+is probed ([#2438](https://github.com/jgong5/ATOM/issues/2438)).
 
 **Values no datasheet states**, the kernel floor `t0` and the link latencies, are carried
 from the probed device as they stand, with no ratio behind them: assumed, so every term
-that reads them is declared. In the frozen projection they came from MI355X, and MI455X's
-switched UALoE fabric replaces the xGMI hop the latency was probed on, so a carried latency
-may be off by more than a ratio.
+that reads them is declared. In the frozen projection, and in MI455's B0 spec until a B0
+node is probed, they come from MI355X, and MI455X's switched UALoE fabric replaces the xGMI
+hop the latency was probed on, so a carried latency may be off by more than a ratio.
 
 > **A projection onto an unmeasured device is as good as its carried ratios, and nothing in
 > the procedure validates them there: its terms are declared.**
@@ -527,11 +533,11 @@ claimed. That is what the empirical op-level backend exists for.
 | D64 | One pricing unit costs `max(t0, F/peak_c, M/BW(M), t_comm)` at attainable peaks probed on the device: one rate per format, the wider format's for a mixed pair, a bandwidth curve, an empty-kernel floor and link alpha-beta. Work comes from the contract only; MoE in expectation under uniform routing, the EP width reaching MoE extractors from the backend as `tp` does; graph padding as executed. Op level: the captured IR, an extractor registry by op kind, refused by name without one, composed by the IR's joins. Step level: module extractors over the meta build, one `max` and one `t0` per module, summed; refused by name for an unclassified module. Every analytical law prices device time only; the host floor's `max` lives in `01` D4's recurrence, with the launch time from the measured `W_launch` law. The step roofline's method counts the inputs it reads; it has no host bound; the run-file key `step_roofline` turns it on. Replaces the derated leaf model first stated here. | 2026-09-19; revised 2026-10-11 (#815), 2026-10-15 (#1011), 2026-10-15 (#1047), 2026-10-17 (#1392) and 2026-10-20 (#1811) |
 | D65 | An analytical law is a smooth bound and says so: the known discontinuities are where the measured time sits furthest above it, shown by the measured-over-analytical report. A pricing unit has one price; the band first required here is withdrawn. | 2026-09-19; revised 2026-10-14 (#952) and 2026-10-17 (#1392) |
 | D66 | A collective takes an algorithm-free alpha-beta lower bound: one hop of link latency plus the minimum bytes any algorithm must send, over the link bandwidth. The spec names no algorithm (T36 withdrawn). Textbook ring/log models are refuted on this fabric as predictions. Replaces the two-regime form first stated here. | 2026-09-19; revised 2026-10-17 (#1392) |
-| D67.1 | The gate is the bound: on every measured step, at both granularities, analytical is at most measured. Reported, not gated: configuration ranking (top-1, top-3) over the four P/D cells, measured over analytical per op kind and per phase, and the method error: MI308X to MI355X, and on MI455 the same records bounded at the frozen spec and at the probed spec. Memory goals: ≤5% on weights and on KV capacity/block count (the empirical gate for KV, tighter than it for weights), ≤25% each other non-KV memory term, no false "fits". The step and end-to-end latency goals and ranking as the primary gate, first stated here, are withdrawn. | 2026-09-19; revised 2026-10-14 (#952), 2026-10-17 (#1392) and 2026-10-25 (#2138) |
+| D67.1 | The gate is the bound: on every measured step, at both granularities, analytical is at most measured. Reported, not gated: configuration ranking (top-1, top-3) over the four P/D cells, measured over analytical per op kind and per phase, and the method error: MI308X to MI355X, and on MI455 the same A0 records bounded at the frozen spec and at A0's probed spec. Memory goals: ≤5% on weights and on KV capacity/block count (the empirical gate for KV, tighter than it for weights), ≤25% each other non-KV memory term, no false "fits". The step and end-to-end latency goals and ranking as the primary gate, first stated here, are withdrawn. | 2026-09-19; revised 2026-10-14 (#952), 2026-10-17 (#1392), 2026-10-25 (#2138) and 2026-10-28 (#2141) |
 | D67 | Analytical memory is the existing memory model with the activation coefficient derived rather than walked. Weights and KV exact; scratch stays a stated constant, and `non_torch` and load residue come from a `memory_readings` entry, marked assumed for a device never run. Revised: the coefficient is measured on one real run per model and width, with the scratch inside it rather than a stated constant; no geometry form stands in for it (T34, 2026-10-16, #965). Each term carries a method, and a declared one cannot pass its gate. | 2026-09-19; revised 2026-10-10, 2026-10-14 (#937) and 2026-10-14 (#952) |
 | D68 | Implementation efficiency, measured over analytical, is a diagnostic reported per op kind and per phase as a distribution, with no threshold yet; it is never a projection input. The analytical method is on M2's critical path for the MI455 projection of DeepSeek-V4-Pro's families (`16` D95). An op-level backend answers an unpriced leaf by its analytical law, and as an empirical backend's fallback the method answers its own price, reported apart; no law moves ahead of a measurement. Replaces the efficiency first stated here as a calibration self-check, carried declared to another device. | 2026-09-19; revised 2026-10-10, 2026-10-14 (#952) and 2026-10-17 (#1392) |
-| D69 | Peaks are probed on the device; a device with no hardware takes its datasheet times the ratio probed on a device that was run, so its terms are declared, as the frozen stage-3c projection took MI355X's for MI455; since stage 4, MI455's peaks are probed on the device. Report each carried ratio with a ±20% sensitivity band; carry the kernel floor and link latencies as they stand, banded at ±20% and the latencies also at 2 and 4 times, uncapped, each cell's seconds reported by roofline part; prefer ranking claims to absolute ones; measure the method from MI308X to MI355X, and on MI455 from the frozen spec to the probed one. Replaces the assumed derate first stated here. | 2026-09-19; revised 2026-10-17 (#1392), 2026-10-25 (#2073) and 2026-10-25 (#2138) |
-| D70 | Expected accuracy is stated in advance, per use: below the measured time on a measured device, MI455 included since stage 4; declared in the frozen MI455 projection. Single-digit latency error is not a target for the analytical method. | 2026-09-19; revised 2026-10-17 (#1392) and 2026-10-25 (#2138) |
+| D69 | Peaks are probed on the device; a device with no hardware takes its datasheet times the ratio probed on a device that was run, so its terms are declared, as the frozen stage-3c projection took MI355X's for MI455 and MI455's B0 spec takes them until a B0 node is probed; since stage 4, MI455's A0 samples are probed on their node, and what they measure keys to A0. Report each carried ratio with a ±20% sensitivity band; carry the kernel floor and link latencies as they stand, banded at ±20% and the latencies also at 2 and 4 times, uncapped, each cell's seconds reported by roofline part; prefer ranking claims to absolute ones; measure the method from MI308X to MI355X, and on MI455 from the frozen spec to A0's probed one. Replaces the assumed derate first stated here. | 2026-09-19; revised 2026-10-17 (#1392), 2026-10-25 (#2073), 2026-10-25 (#2138) and 2026-10-28 (#2141) |
+| D70 | Expected accuracy is stated in advance, per use: below the measured time on a measured device, MI455's A0 samples included since stage 4; declared in the frozen MI455 projection, and on MI455 B0 until a B0 node is probed. Single-digit latency error is not a target for the analytical method. | 2026-09-19; revised 2026-10-17 (#1392), 2026-10-25 (#2138) and 2026-10-28 (#2141) |
 
 ---
 

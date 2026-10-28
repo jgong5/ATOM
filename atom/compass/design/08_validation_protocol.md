@@ -40,10 +40,12 @@ This replaces #627's [ruling 3](https://github.com/jgong5/ATOM/issues/627#issuec
 extrapolation still neither refuses nor aborts a cell (D50.1).
 
 **Revised 2026-10-25 by the owner's ruling on
-[#2138](https://github.com/jgong5/ATOM/issues/2138), and 2026-10-27 by its rulings there:**
-stage 4 grades DeepSeek-V4.1-Flash on MI455 in two cells of its own, with no ranking gate
-(D50); the bound is checked on MI455's own records at its probed spec, and the method's
-error compares the frozen projection's spec with the probed one on those records (D50.2).
+[#2138](https://github.com/jgong5/ATOM/issues/2138), 2026-10-27 by its rulings there, and
+2026-10-28 by the
+[ruling on #2141](https://github.com/jgong5/ATOM/issues/2141#issuecomment-6467960187):**
+stage 4 grades DeepSeek-V4.1-Flash on MI455's A0 sample cards in two cells of its own, with
+no ranking gate (D50); the bound is checked on their records at A0's probed spec, and the
+method's error compares the frozen projection's spec with A0's on those records (D50.2).
 
 **Scope.** What counts as evidence: which results are reported, how each is measured, what
 tolerance applies and where that tolerance comes from, and what invalidates a run.
@@ -671,9 +673,10 @@ projection stays frozen as stage 3c delivered it.
 ### Decision
 
 **Revised 2026-10-17 by the owner's ruling on
-[#1392](https://github.com/jgong5/ATOM/issues/1392), and 2026-10-25 and 2026-10-27 by the
-owner's rulings on [#2138](https://github.com/jgong5/ATOM/issues/2138).** **The projection
-is held to the checks below instead of an error bar.** A projection that fails item 1 or
+[#1392](https://github.com/jgong5/ATOM/issues/1392), 2026-10-25 and 2026-10-27 by the
+owner's rulings on [#2138](https://github.com/jgong5/ATOM/issues/2138), and 2026-10-28 by
+the ruling on [#2141](https://github.com/jgong5/ATOM/issues/2141).** **The projection is
+held to the checks below instead of an error bar.** A projection that fails item 1 or
 2, or ships without item 3's measurement, is not M2's result.
 
 1. **On every measured step, at both granularities, analytical is at most measured.** The
@@ -688,16 +691,19 @@ is held to the checks below instead of an error bar.** A projection that fails i
    report of `10` D68.
 2. **Every MI455 input is sourced or marked assumed.** A machine-spec field's origin is
    recorded per field across save, `MachineSpec.origin()` (`05` D26); which fields
-   are assumed is rule 5 of `05` D25's schema rules. MI455's attainable peaks are probed on
-   an MI455 node, and a value not probed stays assumed
-   ([#2141](https://github.com/jgong5/ATOM/issues/2141)). The frozen projection's peaks are
-   MI455's datasheet times the ratios probed on MI355X, assumed (`10` D69). A projection
-   artifact lists the assumed fields it reads, and a term that reads one is declared. A
-   field no fragment supplies is refused (principle 6).
+   are assumed is rule 5 of `05` D25's schema rules. MI455 has two specs
+   ([#2141](https://github.com/jgong5/ATOM/issues/2141)): the A0 sample node's attainable
+   peaks are probed there, a value not probed staying assumed; the B0 performance
+   machines' are MI455X's datasheet times the ratios probed on MI355X, assumed, as the
+   frozen projection's are (`10` D69), until a B0 node is probed
+   ([#2438](https://github.com/jgong5/ATOM/issues/2438)). What the A0 node measures keys
+   to A0, never to B0. A projection artifact lists the assumed fields it reads, and a term
+   that reads one is declared. A field no fragment supplies is refused (principle 6).
 3. **The method's error is measured where both sides exist.** On MI455, the same stage-4
    records are bounded by item 1 twice, at the frozen projection's spec and at the spec
-   probed on MI455, and measured over analytical is reported at each, per cell and level,
-   not gated: the difference is the error of the carried peaks on MI455 itself, taken on
+   probed on the A0 node, and measured over analytical is reported at each, per cell and
+   level, not gated: the difference is the error of the carried peaks on MI455's A0
+   samples, A0's missing compute units included (`16` *Stage 4*), taken on
    DeepSeek-V4.1-Flash, the model stage 4 runs, rather than the V4-Pro the projection
    priced. Before MI455 ran, the same method, an MI355X spec carried from MI308X's probed ratios as
    MI455's was carried from MI355X's, projected Qwen3.8-27B onto MI355X and was reported
@@ -817,7 +823,7 @@ claims there are not.
 | D49 | Seven hygiene refusals, each with a prior incident behind it. An op-level leaf is not extrapolated: with no same-kernel bracket it falls to its analytical law. An out-of-hull step is graded and also reported apart. | 2026-09-18; op-level leaf 2026-10-18 (#1489); out-of-hull graded 2026-10-23 (#2011) |
 | D50.1 | A step is refused only when some term is still unanswered after method fallback, its reasons listed per term; a fall-through and an answer of any method are not refusals, and the priced seconds are reported by method (analytical, declared, measured, estimated, unvalidated) with their steps and share of predicted seconds. Each unanswered term costs 0 s, and a step the cost backend refuses charges no device time, its answered terms included; the run continues, `--on-refusal abort` stops at the first, and the summary is written either way. Any refusal, of any source, makes the run a coverage report: no refused-seconds fraction, no threshold, and no answered step invalidates a run, whatever its method or share. No validated share refuses or makes a coverage report. | 2026-09-19; revised 2026-10-11 (#765, and again to drop the analytical cap); 2026-10-14 (#952); 2026-10-23 (#2011); 2026-10-26 (#2294) |
 | D50 | Everything registered and hashed before evaluation; the case set never shrinks, though the owner dropped stage 2's 64 and 256, whose aiperf warmup cannot finish within a capture's window (#1590). One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The cells are stage 2's Qwen3.8-27B TP1 on MI308X and M2's four nightly P/D configurations of DeepSeek-V4-Pro on MI355X at their concurrencies, then the DPA two at EP8; stage 4's two DeepSeek-V4.1-Flash TP4 DSpark5 cells on MI455, with and without EP4, graded with no ranking gate. M2's ranking gate: the same best configuration as hardware at each concurrency, and rank correlation across all cells, per end-to-end metric, each inside its real-vs-real spread, with Spearman's ρ also at least 0.9. DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01, 2026-10-09, 2026-10-10, 2026-10-20, 2026-10-25 and 2026-10-27 (#2138) |
-| D50.2 | The MI455 projection is sound, not graded: on every measured step, at both granularities, the analytical price at attainable peaks probed on the device, composed by the IR's own joins, is at most the measured time, with measured over analytical per op kind and phase reported beside it; every MI455 input is sourced or marked assumed, its peaks probed on the device since stage 4 and, in the frozen projection, the datasheet times MI355X's probed ratios; the method's error, the same MI455 records bounded at the frozen spec and at the probed spec, and before them MI308X to MI355X on Qwen3.8-27B, and the configuration ranking are reported, not gated. Replaces the bound first stated at the spec's peaks with derates at 1, and the method that carried implementation efficiencies onto the target. | 2026-10-09; revised 2026-10-17 (#1392), 2026-10-25 and 2026-10-27 (#2138) |
+| D50.2 | The MI455 projection is sound, not graded: on every measured step, at both granularities, the analytical price at attainable peaks probed on the device, composed by the IR's own joins, is at most the measured time, with measured over analytical per op kind and phase reported beside it; every MI455 input is sourced or marked assumed: the A0 samples' peaks probed on their node since stage 4, the frozen projection's the datasheet times MI355X's probed ratios, and the B0 machines' too until a B0 node is probed; the method's error, the same A0 records bounded at the frozen spec and at A0's probed spec, and before them MI308X to MI355X on Qwen3.8-27B, and the configuration ranking are reported, not gated. Replaces the bound first stated at the spec's peaks with derates at 1, and the method that carried implementation efficiencies onto the target. | 2026-10-09; revised 2026-10-17 (#1392), 2026-10-25 and 2026-10-27 (#2138), 2026-10-28 (#2141) |
 | D50.3 | The op-level empirical backend is graded by this protocol as the step-level backends are, on the same real runs: Qwen3.8-27B TP1 on MI308X on #974's runs, then M2's cells with the ranking gate. Faster than real is gated; 5× is reported. Reported, not gated: the analytical fallback's share of priced seconds, the per-step composed-over-measured gap per phase and op kind, the step-level backend's table beside it, and warm-over-cold. | 2026-10-18 (#1489) |
 | D51 | Measure a saturated cell early. Account cold costs once; report the simulator's own per-step CPU cost alongside the ratio. | 2026-09-18 |
 | D52 | Fail-closed invalidation conditions; any refusal is one, an answered step is not, whatever its method or share (D50.1). Scheduling claims require slack; throughput claims at saturation are fine. | 2026-09-18; revised 2026-10-11 twice |
