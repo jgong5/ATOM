@@ -1026,6 +1026,12 @@ def _mi355x_spec(monkeypatch, name):
     return script, MachineSpec.from_mapping(json.loads(document.read_text()))
 
 
+@pytest.mark.parametrize("name", ["mi355x-crs013", "mi308x-hjbog18"])
+def test_the_mi355x_spec_refuses_a_machine_it_has_no_tables_for(monkeypatch, name):
+    with pytest.raises(SystemExit, match=f"COMPASS_MACHINE={name}: "):
+        _mi355x_spec(monkeypatch, name)
+
+
 @pytest.mark.parametrize("name", MI355X)
 def test_the_checked_in_mi355x_spec_holds_its_start(monkeypatch, name):
     script, spec = _mi355x_spec(monkeypatch, name)

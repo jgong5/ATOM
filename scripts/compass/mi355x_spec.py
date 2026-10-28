@@ -26,8 +26,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-#: mi308x_spec.py reads the same variable for its own hosts at import.
-NAME = os.environ.pop("COMPASS_MACHINE", "mi355x-gpu45")
+#: The machines this script has tables for. mi308x_spec.py reads the same
+#: variable for its own hosts at import.
+MACHINES = ("mi355x-gpu45", "mi355x-crs005")
+NAME = os.environ.pop("COMPASS_MACHINE", MACHINES[0])
+if NAME not in MACHINES:
+    raise SystemExit(f"COMPASS_MACHINE={NAME}: this script builds only {MACHINES}")
 CRS005 = NAME == "mi355x-crs005"
 
 import mi308x_spec as base
