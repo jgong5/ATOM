@@ -262,13 +262,12 @@ compass_pytest_counts() {
     ERRORS=$(grep -oE '[0-9]+ errors?' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
 }
 
-# A free TCP port, held until this script exits, so no other process binds it
-# before its server does. Its holder binds it on every address, where another
-# socket's plain bind fails, then sets SO_REUSEADDR and never listens: a server
-# that sets it too binds the port beside the holder, as uvicorn's, libzmq's,
-# socket.create_server's, torch's TCPStore's and the atomesh router's listeners
-# do.
-compass_free_port() {
+# A TCP port held until this script exits, so no other process binds it before
+# its server does. Its holder binds it on every address, where another socket's
+# plain bind fails, then sets SO_REUSEADDR and never listens: only a listener
+# that sets it too binds the port, beside the holder, as uvicorn's, libzmq's,
+# socket.create_server's, torch's TCPStore's and the atomesh router's do.
+compass_held_port() {
     python3 -c 'import os, select, socket, sys
 s = socket.socket()
 s.bind(("", 0))
