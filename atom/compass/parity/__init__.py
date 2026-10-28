@@ -114,9 +114,11 @@ TIMESTAMPS = (
 )
 #: Profiler ranges a trace run (`busy`) splits a forward's kernels at: the target
 #: ends where `TARGET_DONE` opens, and each drafter pass is the range named `MARK`
-#: and its line field.
+#: and its line field; a rank that paused its profiler for a drafter pass opens
+#: the empty range `PAUSED` as the pause starts.
 MARK = "compass::"
 TARGET_DONE = MARK + "target_done"
+PAUSED = MARK + "paused"
 
 
 class StepRecord:
@@ -536,7 +538,7 @@ class StepRecording:
 
     def _drafter_traced(self, name: str):
         """`_traced(name)` on TP rank 0 or with no ATOM profiler; on another
-        rank, ATOM's profiler paused while the pass runs."""
+        rank, ATOM's profiler paused while the pass runs (`_paused`)."""
         profiler = getattr(self, "profiler", None)
         if getattr(self, "rank", 0) == 0 or profiler is None:
             return _traced(name)
@@ -592,7 +594,10 @@ class StepRecording:
 
 @contextlib.contextmanager
 def _paused(profiler):
-    """`profiler` collecting nothing inside the block."""
+    """`profiler` collecting nothing inside the block, its start marked by the
+    empty range `PAUSED`."""
+    with _traced(PAUSED):
+        pass
     activities = list(profiler.activities)
     profiler.toggle_collection_dynamic(False, activities)
     try:

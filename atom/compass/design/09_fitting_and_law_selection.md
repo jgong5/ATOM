@@ -164,7 +164,8 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   one of them: whole where that kernel was already queued when the gap opened, else capped
   at the trace's median such queued gap. A TP collective counts from its last rank's start;
   a target pass's busy time is its largest over the ranks. Drafter passes are traced on rank
-  0 alone, every other rank's profiler paused for them, and labelled from rank 0
+  0 alone, every other rank's profiler paused for them, and labelled from rank 0; a paused
+  rank counts no gap across the paused pass, which holds that pass's device time
   ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6438763733)): with both
   ranks profiled the draft-KV concatenation ran 6% long. A traced kernel shorter than about
   4.7 us runs to that floor, so drafter labels stay 5 to 11% over unprofiled time until

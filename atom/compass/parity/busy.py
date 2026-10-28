@@ -25,9 +25,11 @@ else capped at the rank's median such queued gap, since the device then waited
 for the host's launch. A TP collective's kernel on one rank includes its wait
 for the peers: the n-th target collective kernel (`COLLECTIVE`) of a forward
 counts on every rank from its latest rank's start, and as queued once its
-latest rank's launch call returned. The target's busy time is its largest over
-the ranks; the draft's and each drafter pass's are rank 0's, the one rank that
-profiled them.
+latest rank's launch call returned. A rank that paused its profiler for a
+drafter pass holds none of its kernels, so the gap before the first kernel
+launched after its `PAUSED` range opened holds that pass's device time and
+counts nothing. The target's busy time is its largest over the ranks; the
+draft's and each drafter pass's are rank 0's, the one rank that profiled them.
 
 A trace directory not named ``rank_<r>``, a DP or a pipeline run's, refuses:
 per-rank busy time under DP is not reduced.
@@ -42,7 +44,7 @@ from pathlib import Path
 
 from atom.compass.backends.json_file import read_jsonl
 from atom.compass.backends.step_labels import TRACE
-from atom.compass.parity import MARK, TARGET_DONE
+from atom.compass.parity import MARK, PAUSED, TARGET_DONE
 
 RECORD = "steps/dp0.jsonl"
 GPU = ("kernel", "gpu_memcpy", "gpu_memset")
@@ -87,8 +89,9 @@ def events(path):
 
 def forwards(path) -> list[dict]:
     """One rank's forwards: each its ``tokens`` and its ``kernels``, each
-    (start, end, launch return, pass, its drafter pass's line field or None),
-    in start order."""
+    (start, end, launch return, pass, its drafter pass's line field or None,
+    name, whether it is the first launched after a `PAUSED` range), in start
+    order."""
     ranges, runs, marks, launches, kernels = [], [], [], {}, []
     for e in events(path):
         cat, ts = e.get("cat"), e.get("ts")
@@ -110,13 +113,14 @@ def forwards(path) -> list[dict]:
     for f0, f1, name in ranges:
         mine = [m for m in marks if f0 <= m[0] <= f1]
         done = [m[0] for m in mine if m[2] == TARGET_DONE]
-        drafts = [m for m in mine if m[2] != TARGET_DONE]
+        drafts = [m for m in mine if m[2] not in (TARGET_DONE, PAUSED)]
         out.append(
             {
                 "tokens": int(re.search(r"tokens=(\d+)", name).group(1)),
                 "run": min((t for t in runs if f0 <= t <= f1), default=f0),
                 "end": min(done or [m[0] for m in drafts] or [f1 + 1]),
                 "drafts": drafts,
+                "pauses": [m[0] for m in mine if m[2] == PAUSED],
                 "kernels": [],
             }
         )
@@ -129,9 +133,13 @@ def forwards(path) -> list[dict]:
         inside = [m[2] for m in f["drafts"] if m[0] <= launch <= m[1]]
         part = "target" if launch < f["end"] and not inside else "draft"
         key = next((m[len(MARK) :] for m in inside), None)
-        f["kernels"].append((start, stop, queued, part, key, name))
+        f["kernels"].append((launch, start, stop, queued, part, key, name))
     for f in out:
-        f["kernels"].sort()
+        resumed = {
+            min((k for k in f["kernels"] if k[0] > p), default=None)
+            for p in f.pop("pauses")
+        }
+        f["kernels"] = sorted((*k[1:], k in resumed) for k in f["kernels"])
     return out
 
 
@@ -163,10 +171,11 @@ def _align(ranks: list[list[dict]]) -> None:
 
 def _walk(kernels):
     """Per kernel in start order: its passes, the union it adds, and the gap
-    before it with whether it was queued when the gap opened."""
+    before it, none after a paused pass, with whether it was queued when the
+    gap opened."""
     end = None
-    for start, stop, queued, part, key, _ in kernels:
-        gap = start - end if end is not None and start > end else 0.0
+    for start, stop, queued, part, key, _, resumed in kernels:
+        gap = start - end if end is not None and start > end and not resumed else 0.0
         was = end is not None and queued is not None and queued <= end
         add = stop - max(start, end) if end is not None else stop - start
         end = stop if end is None else max(end, stop)

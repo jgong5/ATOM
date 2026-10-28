@@ -17,7 +17,7 @@ from test_parity_device_window import _recorded
 from test_parity_record import _config, _drive
 
 from atom.compass.drive import serve
-from atom.compass.parity import ENV, MARK, TARGET_DONE, busy
+from atom.compass.parity import ENV, MARK, PAUSED, TARGET_DONE, busy
 
 #: One MTP output prefill, in us. The target: K1, K2 queued 2 after K1 and
 #: counted whole, the collective K3, queued on rank 0 before K2 ends but
@@ -47,7 +47,8 @@ def _trace(path, kernels, tokens=100, marks=MARKS):
     """A kineto trace of one forward running `kernels`, (name, start, end,
     launch), each launch call 1 us long, and opening `marks`; a drafter pass
     whose range it does not open ran with the profiler paused, so it holds none
-    of the kernels launched there. Written over many lines."""
+    of the kernels launched there and opens `PAUSED` where the pass starts.
+    Written over many lines."""
     paused = [MARKS[m] for m in MARKS if m != TARGET_DONE and m not in marks]
     kernels = [k for k in kernels if not any(a <= k[3] <= b for a, b in paused)]
     events = [
@@ -60,9 +61,11 @@ def _trace(path, kernels, tokens=100, marks=MARKS):
         {"cat": "user_annotation", "name": "ATOM::run_model", "ts": 0, "dur": 95},
         {"cat": "cpu_op", "name": "aten::mm", "ts": 5, "dur": 1},
     ]
-    for name in marks:
+    for name in set(marks) - {PAUSED}:
         a, b = MARKS[name]
         events.append({"cat": "user_annotation", "name": name, "ts": a, "dur": b - a})
+    for a, _ in paused:
+        events.append({"cat": "user_annotation", "name": PAUSED, "ts": a, "dur": 0})
     for corr, (name, start, end, launch) in enumerate(kernels):
         args = {"correlation": corr}
         events.append(
@@ -127,10 +130,10 @@ def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
 ):
     """The named result. Rank 0's target: union 39, gaps 2 + 1 + 1 + 1, the
     collective (an all-reduce, or the mono runner's peer fence) from rank 1's
-    start and its gap capped, 44; rank 1's 50, its K1 5 longer, no DK before
-    the sampler and a cap of 1.5, its queued gaps 2 and 1. The draft: DK, D1 and D2, their
-    union 12 and gaps 1 + 1 + 1; the draft-KV pass DK, the propose pass D1 and
-    D2. Each rank opens the ranges its real recorder opens under ATOM's
+    start and its gap capped, 44; rank 1's 48.5, its K1 5 longer and no gap
+    before the sampler, launched after its paused draft-KV pass, its queued
+    gaps 2 and 1. The draft: DK, D1 and D2, their union 12 and gaps 1 + 1 + 1;
+    the draft-KV pass DK, the propose pass D1 and D2. Each rank opens the ranges its real recorder opens under ATOM's
     profiler: rank 1 pauses it for the drafter's passes, so the draft's
     collective is on rank 0 alone and aligns with none."""
     marks = [set(_opened(tmp_path / f"r{r}", monkeypatch, r)[2]) for r in (0, 1)]
@@ -142,7 +145,7 @@ def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
     assert got == [
         {
             "step": 7,
-            "b_target_ns": 50000,
+            "b_target_ns": 48500,
             "b_draft_ns": 15000,
             "b_propose_ns": 11000,
             "b_draft_kv_ns": 4000,
@@ -163,6 +166,43 @@ def test_the_drafter_s_passes_are_rank_0_s_though_another_rank_traced_them(tmp_p
         11000,
         4000,
     )
+
+
+#: `KERNELS` device-paced: each launched before the one ahead of it ends, K4
+#: running to 95, so the sampler is queued when the draft-KV pass's DK ends.
+PACED = [
+    ("k1", 10, 20, 1),
+    ("k2", 22, 30, 3),
+    ("cross_device_reduce_1stage", 40, 60, 25),
+    ("k4", 61, 95, 37),
+    ("dk", 96, 99, 81),
+    ("sample", 100, 102, 92),
+    ("d1", 120, 125, 111),
+    ("allgather_naive", 126, 130, 113),
+]
+
+
+def test_a_paused_rank_counts_no_gap_across_the_paused_pass(tmp_path):
+    """Device-paced, both ranks alike, rank 1 paused for the drafter: its gap
+    from K4 to the sampler is DK's device time, so it counts nothing, rank 1's
+    target 87. The target is rank 0's 88 (union 75, queued gaps 2, 10, 1 and
+    1 whole), the draft-KV pass DK and its gap, 4: 92 in all, as on the
+    device."""
+    steps = tmp_path / "steps"
+    steps.mkdir()
+    line = {"step": 7, "rows": [[100, 100, False]], "d_target_ns": 1}
+    line.update(d_draft_kv_ns=1, d_propose_ns=1)
+    (steps / "dp0.jsonl").write_text(json.dumps(line) + "\n")
+    for r, marks in enumerate((MARKS, {TARGET_DONE, PAUSED})):
+        _trace(
+            tmp_path / "trace" / f"rank_{r}" / "m.pt.trace.json.gz", PACED, 100, marks
+        )
+    ranks = [busy.forwards(p) for p in sorted(tmp_path.glob("trace/*/*.gz"))]
+    busy._align(ranks)
+    assert [busy.busy(fs)[0]["target"] for fs in ranks] == [88000, 87000]
+
+    got = json.loads(busy.reduce(tmp_path).read_text())
+    assert (got["b_target_ns"], got["b_draft_kv_ns"]) == (88000, 4000)
 
 
 @pytest.mark.parametrize(
@@ -260,6 +300,7 @@ def test_only_a_profiled_forward_marks_its_target_end_and_each_drafter_pass(
     assert names.count(TARGET_DONE) == outputs > 0
     assert names.count(PROPOSE) == (0 if rank else outputs)
     assert names.count(MARK + "d_draft_kv_ns") == (0 if rank else len(batches))
+    assert names.count(PAUSED) == (outputs + len(batches) if rank else 0)
 
     def opened(name):
         raise AssertionError(f"{name} opened with no profiler running")

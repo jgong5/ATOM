@@ -406,7 +406,8 @@ every rank but 0 paused for each drafter pass, so the drafter is traced on rank 
 which labels prefill (`09` D54); its decodes and host segments are profiled and label
 nothing. The recorder marks where a forward's target ends and, on rank 0, where each
 drafter pass runs with profiler ranges, opened only while the profiler runs; on every
-other rank it pauses the profiler for the pass. Every trace run carries `09`'s
+other rank it pauses the profiler for the pass, marking where the pause starts. Every
+trace run carries `09`'s
 profiler check.
 
 **Revised 2026-10-18 by the owner's ruling on
