@@ -16,73 +16,73 @@
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:194520ab83874f58ca11dc7c707b9a9b2a59d2db95c96e8fa7750e077106a043"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
       },
       "device.arch": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:194520ab83874f58ca11dc7c707b9a9b2a59d2db95c96e8fa7750e077106a043"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
       },
       "device.count_per_node": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:194520ab83874f58ca11dc7c707b9a9b2a59d2db95c96e8fa7750e077106a043"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
       },
       "device.memory.capacity_bytes": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:194520ab83874f58ca11dc7c707b9a9b2a59d2db95c96e8fa7750e077106a043"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
       },
       "device.software_pinned_to.rocm": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:194520ab83874f58ca11dc7c707b9a9b2a59d2db95c96e8fa7750e077106a043"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
       },
       "device.software_pinned_to.aiter": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:194520ab83874f58ca11dc7c707b9a9b2a59d2db95c96e8fa7750e077106a043"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
       },
       "device.software_pinned_to.rccl": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:194520ab83874f58ca11dc7c707b9a9b2a59d2db95c96e8fa7750e077106a043"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
       },
       "device.software_pinned_to.torch": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:194520ab83874f58ca11dc7c707b9a9b2a59d2db95c96e8fa7750e077106a043"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:b9288bd04238d4be81978e43e444c9fb31c645ced8422df612925b643322fee4"
       },
       "host.http_intake.fixed_s": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:f05b601cfe7a4cb3dd25e00f2c20804b162f9f3a9999cae41d65cf0d771b08e8",
-        "p10": 0.0014726489628366544,
-        "p90": 0.0016168815487359184
+        "source_root": "commit:b3d336068",
+        "record": "sha256:c5cb629fe2b39e65d54c9568eb4cf95321f06c0a6ad088f2b0962d5cfb08643c",
+        "p10": 0.0014128760640065338,
+        "p90": 0.001521239612506286
       },
       "host.http_intake.per_byte_s": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:f05b601cfe7a4cb3dd25e00f2c20804b162f9f3a9999cae41d65cf0d771b08e8",
-        "p10": 2.4018001341410337e-09,
-        "p90": 3.101533713093003e-09
+        "source_root": "commit:b3d336068",
+        "record": "sha256:c5cb629fe2b39e65d54c9568eb4cf95321f06c0a6ad088f2b0962d5cfb08643c",
+        "p10": 2.71217303823821e-09,
+        "p90": 3.5697033407812384e-09
       },
       "device.memory.bandwidth_bytes_per_s": {
         "origin": "datasheet"
@@ -128,47 +128,47 @@
       },
       "device.memory.bandwidth_curve": {
         "origin": "probed",
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:54b667a79e67c6c0fb2dccfe9c1160795e72e646254c4c8cfb0dab929469c979"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8"
       },
       "device.kernel_floor_s": {
         "origin": "probed",
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:54b667a79e67c6c0fb2dccfe9c1160795e72e646254c4c8cfb0dab929469c979",
-        "p10": 1.5445649027824403e-06,
-        "p90": 1.5469960689544677e-06
+        "source_root": "commit:b3d336068",
+        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8",
+        "p10": 1.5546149611473082e-06,
+        "p90": 1.5565140008926393e-06
       },
       "interconnect.intra_node.link_latency_s": {
         "origin": "probed",
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:54b667a79e67c6c0fb2dccfe9c1160795e72e646254c4c8cfb0dab929469c979",
-        "p10": 8.010325133800506e-07,
-        "p90": 8.201204836368562e-07
+        "source_root": "commit:b3d336068",
+        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8",
+        "p10": 8.018480122089386e-07,
+        "p90": 8.218535602092743e-07
       },
       "device.memory.derate": {
         "origin": "probed",
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:54b667a79e67c6c0fb2dccfe9c1160795e72e646254c4c8cfb0dab929469c979"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8"
       },
       "device.compute.derate.bf16": {
         "origin": "probed",
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:54b667a79e67c6c0fb2dccfe9c1160795e72e646254c4c8cfb0dab929469c979"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8"
       },
       "device.compute.derate.fp8": {
         "origin": "probed",
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:54b667a79e67c6c0fb2dccfe9c1160795e72e646254c4c8cfb0dab929469c979"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8"
       },
       "device.compute.derate.fp4": {
         "origin": "probed",
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:54b667a79e67c6c0fb2dccfe9c1160795e72e646254c4c8cfb0dab929469c979"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8"
       },
       "interconnect.intra_node.derate": {
         "origin": "probed",
-        "source_root": "commit:e4d868e7c",
-        "record": "sha256:54b667a79e67c6c0fb2dccfe9c1160795e72e646254c4c8cfb0dab929469c979"
+        "source_root": "commit:b3d336068",
+        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8"
       },
       "host.tokenizers[deepseek-v4-pro fast]": {
         "origin": "probed",
@@ -197,7 +197,7 @@
       "ptl",
       "peaks"
     ],
-    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at e4d868e7c | one real c=256 first-turn cc-traces burst at e4d868e7c | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples"
+    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at b3d336068 | one real c=256 first-turn cc-traces burst at b3d336068 | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples"
   },
   "host": {
     "cpu": {
@@ -225,8 +225,8 @@
       "shm_broadcast_s": 2e-05
     },
     "http_intake": {
-      "fixed_s": 0.001519417945122962,
-      "per_byte_s": 2.7286225828078513e-09
+      "fixed_s": 0.0014083168219871818,
+      "per_byte_s": 2.51264761600829e-09
     }
   },
   "device": {
@@ -240,102 +240,102 @@
       "bandwidth_curve": [
         [
           4096,
-          2471999917.6953015
+          2413813410.100116
         ],
         [
           8192,
-          4945851918.396276
+          4823419983.541849
         ],
         [
           16384,
-          9892184763.436323
+          9641730481.55563
         ],
         [
           32768,
-          19247690700.251415
+          19173337233.690044
         ],
         [
           65536,
-          36885138136.18265
+          36575081937.163506
         ],
         [
           131072,
-          73843420948.24696
+          73131371239.01624
         ],
         [
           262144,
-          147675237955.21048
+          146076910277.64084
         ],
         [
           524288,
-          283169471891.8801
+          280998663743.7066
         ],
         [
           1048576,
-          561769392795.2751
+          557954112642.1067
         ],
         [
           2097152,
-          1073293417417.833
+          1069853776606.5919
         ],
         [
           4194304,
-          1907122950230.7644
+          1890921880709.587
         ],
         [
           8388608,
-          3044272193465.3496
+          3041811103890.011
         ],
         [
           16777216,
-          4087521606156.239
+          4090162662216.4897
         ],
         [
           33554432,
-          5134029398103.868
+          5139918483843.753
         ],
         [
           67108864,
-          5839143252388.048
+          5858565557039.681
         ],
         [
           134217728,
-          6031685489911.714
+          6063862790040.402
         ],
         [
           268435456,
-          6133849303070.915
+          6155113267810.816
         ],
         [
           536870912,
-          6252795806159.282
+          6277461842993.828
         ],
         [
           1073741824,
-          6451932108645.527
+          6403441199249.063
         ],
         [
           2147483648,
-          6504106771819.718
+          6483478211391.745
         ],
         [
           4294967296,
-          6504106771819.718
+          6526631423666.336
         ]
       ],
-      "derate": 0.8130133464774647
+      "derate": 0.815828927958292
     },
     "compute": {
       "bf16_flops": 2516600000000000.0,
       "fp8_flops": 5033200000000000.0,
       "fp4_flops": 1.00663e+16,
       "derate": {
-        "bf16": 0.6499298103573933,
-        "fp8": 0.6718521849049403,
-        "fp4": 0.5612766085072203
+        "bf16": 0.6489207063596362,
+        "fp8": 0.6720787536999386,
+        "fp4": 0.5612035987465552
       }
     },
-    "kernel_floor_s": 1.5456565022468566e-06,
+    "kernel_floor_s": 1.55571848154068e-06,
     "software_pinned_to": {
       "rocm": "7.2.4",
       "aiter": "948dd267f",
@@ -348,8 +348,8 @@
       "topology": "fully_connected",
       "domain_devices": 8,
       "link_bandwidth_bytes_per_s": 76800000000.0,
-      "link_latency_s": 8.108285069465638e-07,
-      "derate": 0.7925336892573455
+      "link_latency_s": 8.134097456932069e-07,
+      "derate": 0.7925272197140891
     },
     "inter_node": {
       "link_bandwidth_bytes_per_s": 50000000000.0,
