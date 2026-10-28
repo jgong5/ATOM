@@ -14,6 +14,7 @@ import pytest
 from conftest import atom_config_double
 from test_kv_simulated_connector import CONFIG_JSON
 from test_memory_readings import DOCUMENT
+from test_pd_planned_block import publish
 from transformers import PretrainedConfig
 
 from atom.compass import run as compass_run
@@ -81,14 +82,17 @@ def test_a_bootstrapped_engine_builds_its_connector_priced_from_the_run_file(
     run_file, hf, role, lp
 ):
     config = _config(hf, role)
+    block = KvGeometry.from_hf_config(hf, block_size=BLOCK_SIZE).bytes_per_block
+    for engine in ("engine-P", "engine-D"):
+        publish(run_file["out_dir"], engine, block)
     with compass_run.engine(config):
         half = KVConnectorFactory.create_connector(config, role="scheduler")
     assert isinstance(half, SimulatedKVConnectorScheduler)
     assert clock.installed().me == LpId(lp)
     assert dist_utils.LP_OF_RANK == {0: LpId(lp)}
     link = DOCUMENT["interconnect"]["inter_node"]
-    block = KvGeometry.from_hf_config(hf, block_size=BLOCK_SIZE).bytes_per_block
-    assert half._transfer.duration_s(BLOCKS) == pytest.approx(
+    (model,) = half._transfer
+    assert model.duration_s(BLOCKS) == pytest.approx(
         link["link_latency_s"]
         + BLOCKS * block / (link["link_bandwidth_bytes_per_s"] * link["derate"])
     )

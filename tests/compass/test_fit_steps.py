@@ -33,6 +33,7 @@ from atom.compass.backends import StepLinearLaw, step_linear_fit
 from atom.compass.backends.step_labels import digest
 from atom.compass.drive.aiter_jit import BUILDS
 from atom.compass.fit import publish
+from atom.compass.parity import TRANSFERS
 from atom.compass.run.step_grid import BOUNDS
 from atom.compass.spec import MachineSpec
 
@@ -184,6 +185,7 @@ def served(key, traced) -> list[dict]:
             "run": run,
             "config": key,
             "traces": [f"{named[run]}.{k}" for k in range(3)],
+            "profiled": False,
         }
         for run in sorted(named)
     ]
@@ -241,6 +243,10 @@ def test_records_under_two_stacks_refuse_naming_the_component_and_both_values(
             "--grid-definition is read by step-grid, not step-linear",
         ),
         (
+            ["--backend", "step-linear", "--grid=g"],
+            "--grid is read by step-grid, not step-linear",
+        ),
+        (
             ["--backend", "step-linear", "0f1e2d3c4b5a"],
             "0f1e2d3c4b5a is not a record directory",
         ),
@@ -264,6 +270,32 @@ def test_a_record_no_client_run_names_refuses_naming_it(tmp_path):
     with pytest.raises(SystemExit, match=re.escape(f"{a} is named by no --client-run")):
         fit(tmp_path, "fit steps", *LINEAR, a)
     assert not (tmp_path / "store").exists()
+
+
+def test_a_deployment_s_prefill_side_fits_from_the_deployment_s_export(tmp_path):
+    # Prefill's record names each request `p-<key>`; the export, beside
+    # prefill/ and decode/, names it `d-<key>`, as decode's response id that
+    # decode's transfers join to prefill's DP rank and request id.
+    p = record(tmp_path / "cell/prefill", 19)
+    path = p / "steps/dp0.jsonl"
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    for line in lines:
+        line["named"] = [[r, k, f"p-{k}"] for r, k in line["named"]]
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    sent = json.loads((p / "client.json").read_text())["requests"]
+    export = tmp_path / "cell/client_run.json"
+    export.write_text(json.dumps({"requests": {f"d-{k}": v for k, v in sent.items()}}))
+    joined = [
+        {"response_id": f"d-{k}", "remote_dp_rank": 0, "transfer_id": int(k[1:])}
+        for k in sent
+    ]
+    decode = tmp_path / "cell/decode/steps"
+    decode.mkdir(parents=True)
+    (decode / TRANSFERS).write_text("".join(json.dumps(t) + "\n" for t in joined))
+    fit(tmp_path, "fit steps", *LINEAR, p, "--client-run", p, export)
+
+    report = member(tmp_path / "store", law_key(), "report")
+    assert report["provenance"] == served(HOST, {p: "trace"})
 
 
 @pytest.mark.parametrize(
@@ -312,11 +344,21 @@ def test_records_predating_the_data_parallel_width_refuse_naming_it(tmp_path):
         fit(tmp_path, "fit steps", *LINEAR, a, *clients(a))
 
 
+def test_a_prefill_context_parallel_record_refuses_naming_its_width(tmp_path):
+    engine = {**ENGINE, "prefill_context_parallel_size": 2}
+    a = record(tmp_path / "a", 19, key={**HOST, "engine": engine})
+    with pytest.raises(SystemExit, match="states prefill_context_parallel_size 2"):
+        fit(tmp_path, "fit steps", *LINEAR, a, *clients(a))
+    assert not (tmp_path / "store").exists()
+
+
 def test_a_record_whose_server_built_an_aiter_module_refuses_naming_it(tmp_path):
     a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
     edit(b / "run.json", lambda r: r.update({BUILDS: ["mha_varlen_fwd"]}))
 
-    named = f"{b} is not fitted: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    named = (
+        f"{b} is not fitted: its server ran a JIT compile of ['mha_varlen_fwd'] while"
+    )
     with pytest.raises(SystemExit, match=re.escape(named)):
         fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
     assert not (tmp_path / "store").exists()

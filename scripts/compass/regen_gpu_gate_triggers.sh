@@ -45,13 +45,15 @@
 #      whether its enclosing test ran. Two paths turn on that, both measured at
 #      236abfd9a in xiaobizh_n18_cpu:
 #        - atom/model_ops/topK.py. Its only excluded-side reference is
-#          `test_moe_dp_token_capacity.py:39`, indented under
+#          `tests/model_ops/test_moe_dp_token_capacity.py::
+#          test_dpa_capacity_fits_gathered_topk_metadata`, indented under
 #          `skipif(not torch.cuda.is_available())` and skipped in the CPU
 #          container. Read coverage at any indentation and the set goes 30 -> 29,
 #          losing exactly this path.
-#        - atom/model_engine/model_runner.py. `tests/test_mla_index_cache.py`
-#          imports ModelRunner at LINES 99-100, indented four spaces inside a
-#          test function -- NOT at module level, whatever earlier drafts of this
+#        - atom/model_engine/model_runner.py. `tests/test_mla_index_cache.py::
+#          test_model_runner_local_total_layers_adds_mtp_only_on_drafter_stage`
+#          imports ModelRunner indented four spaces inside the test
+#          -- NOT at module level, whatever earlier drafts of this
 #          comment said. The indentation is what leaves it uncredited; what the
 #          file collects does not enter into it. Read coverage at any
 #          indentation AND credit non-collecting files and the set goes 30 -> 27,
@@ -234,8 +236,9 @@ N_IND=$(xargs -r grep -hcE '^[[:space:]]+(from|import)[[:space:]]+atom\.' <"$D/a
 
 # The header is generated, counts and all. Every count in its `Measured at`
 # block, and the indented-import figure, comes from this run over this tree; the
-# template's other figures and line citations name the commit they were measured
-# at. The previous file carried its counts by hand, and by hand they went stale:
+# template's other figures and test citations name the commit they were
+# measured at. The previous file carried its counts by hand, and by hand they
+# went stale:
 # a header shipped crediting its counts to a commit at which tests/compass/ did
 # not yet exist.
 TMP=$OUT.tmp
@@ -258,11 +261,14 @@ TMP=$OUT.tmp
 # lines are indented -- but coverage is credited only for a module-level import
 # in a CPU-gate file that collects at least one test, because those are the only
 # imports that provably execute. At 236abfd9a the MODULE-LEVEL half carried both
-# measured counter-examples: test_moe_dp_token_capacity.py:39 imports topK
-# inside a test marked skipif(not torch.cuda.is_available()), and
-# tests/test_mla_index_cache.py:99-100 imports ModelRunner indented inside a
-# test function rather than at module level. Crediting either would delete a
-# real trigger -- topK.py and atom/model_engine/model_runner.py respectively.
+# measured counter-examples: tests/model_ops/test_moe_dp_token_capacity.py::
+# test_dpa_capacity_fits_gathered_topk_metadata, marked
+# skipif(not torch.cuda.is_available()), imports topK inside it, and
+# tests/test_mla_index_cache.py::
+# test_model_runner_local_total_layers_adds_mtp_only_on_drafter_stage imports
+# ModelRunner inside it rather than at module level. Crediting either would
+# delete a real trigger -- topK.py and atom/model_engine/model_runner.py
+# respectively.
 # The COLLECTS-A-TEST half removed no path at 236abfd9a: 30 triggers with it,
 # 30 without, difference empty. It is kept as a forward guard. The full
 # derivation, with that 2x2, is in the script's header comment.

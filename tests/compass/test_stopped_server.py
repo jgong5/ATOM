@@ -12,7 +12,8 @@ process of its own leaves its loop and hands in what its steps cost, whether
 the signal reaches the server alone or its process group, whose SIGTERM would
 have ATOM's handler stop the engine's workers. An engine whose input thread
 has read a request the authority has not released leaves the same way: the
-stop's ``+inf`` grant releases it.
+stop's ``+inf`` grant releases it, and the input thread takes it even when the
+server's SHUTDOWN reached it first.
 """
 
 import asyncio
@@ -21,6 +22,8 @@ import http.client
 import json
 import math
 import os
+import pickle
+import queue
 import signal
 import subprocess
 import sys
@@ -32,15 +35,22 @@ from types import SimpleNamespace
 
 import pytest
 import zmq
+from aiter_stub import stubbed_aiter
 
 from atom.compass import clock_transport
 from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
 from atom.compass.clock import LpId, single_engine_table
-from atom.compass.drive.serve import _free_ports
-from atom.utils import clock
+from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.sequence import SequenceStatus
+from atom.utils import clock, get_open_zmq_ipc_path, make_zmq_socket, zmq_shim
 from atom.utils.clock import LPRuntime, WrappedSocket
 from atom.utils.compass_loop import CompassEventLoop
+from tests.compass.held_ports import held_ports
+
+with stubbed_aiter():
+    from atom.model_engine.engine_core import EngineCore
+    from atom.model_engine.engine_core_mgr import CoreManager
 
 TREE = Path(__file__).resolve().parents[2]
 TABLE = single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002)
@@ -163,45 +173,45 @@ def _answers(port: int) -> bool:
 
 @contextlib.contextmanager
 def _serve(tmp_path, script, *argv):
-    """`script` as a co-hosting simulated server on a free port, in a session
-    of its own, once ``/health`` answers: its process, port and log. Leaving
-    kills what is left of its process group."""
-    run_file = tmp_path / "run.json"
-    clock_port, port = _free_ports(2)
-    run_file.write_text(
-        json.dumps(
-            {
-                "clock_endpoint": f"tcp://127.0.0.1:{clock_port}",
-                "bound_s": 100.0,
-                "admission_path": "serving",
-                "ipc_s": 2.0**-10,
-                "stream_s": 2.0**-9,
-                "out_dir": str(tmp_path),
-            }
+    """`script` as a co-hosting simulated server on ports held for it, in a
+    session of its own, once ``/health`` answers: its process, port and log.
+    Leaving kills what is left of its process group."""
+    with held_ports(2) as (clock_port, port):
+        run_file = tmp_path / "run.json"
+        run_file.write_text(
+            json.dumps(
+                {
+                    "clock_endpoint": f"tcp://127.0.0.1:{clock_port}",
+                    "bound_s": 100.0,
+                    "admission_path": "serving",
+                    "ipc_s": 2.0**-10,
+                    "stream_s": 2.0**-9,
+                    "out_dir": str(tmp_path),
+                }
+            )
         )
-    )
-    env = dict(os.environ, PYTHONPATH=str(TREE), **{compass_run.ENV: str(run_file)})
-    log = tmp_path / "server.log"
-    with log.open("w") as sink:
-        server = subprocess.Popen(
-            [sys.executable, "-c", script, str(port), *argv],
-            cwd=TREE,
-            env=env,
-            stdout=sink,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    try:
-        deadline = time.monotonic() + 120
-        while not _answers(port):
-            assert server.poll() is None, log.read_text()
-            assert time.monotonic() < deadline, "no answer in 120 wall seconds"
-            time.sleep(0.2)
-        yield server, port, log
-    finally:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(server.pid, signal.SIGKILL)
-        server.wait()
+        env = dict(os.environ, PYTHONPATH=str(TREE), **{compass_run.ENV: str(run_file)})
+        log = tmp_path / "server.log"
+        with log.open("w") as sink:
+            server = subprocess.Popen(
+                [sys.executable, "-c", script, str(port), *argv],
+                cwd=TREE,
+                env=env,
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        try:
+            deadline = time.monotonic() + 120
+            while not _answers(port):
+                assert server.poll() is None, log.read_text()
+                assert time.monotonic() < deadline, "no answer in 120 wall seconds"
+                time.sleep(0.2)
+            yield server, port, log
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(server.pid, signal.SIGKILL)
+            server.wait()
 
 
 @SIGNALS
@@ -329,3 +339,82 @@ def test_an_engine_stopped_holding_a_read_request_hands_in_no_straggler(
         t.join(10)
     server.close()
     ctx.destroy(linger=0)
+
+
+def test_an_engine_whose_input_thread_reads_shutdown_first_takes_the_released_request(
+    monkeypatch, tmp_path
+):
+    """The stop releases request 0 at the engine's ``+inf`` grant, and the
+    server's SHUTDOWN, sent after the stop, reaches ATOM's input thread before
+    the engine, busy in wall time, takes that grant. The input thread still
+    takes the request first, then leaves on SHUTDOWN, and the engine hands in."""
+    endpoint, request = f"inproc:{uuid.uuid4().hex}", "frontend->engine:request#dp0"
+    run = {"clock_endpoint": endpoint, "bound_s": 100.0, "out_dir": str(tmp_path)}
+    run |= {"admission_path": "serving", "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
+    (tmp_path / "run.json").write_text(json.dumps(run))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    monkeypatch.setattr(compass_run, "_member", None)
+    server = clock_transport.serve(compass_run._RecordingAuthority(run), endpoint)
+    ctx = zmq_shim._Context()
+    conn = clock_transport.connect(compass_run.FRONTEND, endpoint)
+    frontend = compass_run._StoppingClock(compass_run.FRONTEND, TABLE, conn)
+    addrs = [get_open_zmq_ipc_path() for _ in range(2)]
+    monkeypatch.setattr(clock, "_installed", frontend)
+    clock.name_endpoints(0, *addrs, "")
+    mgr = CoreManager.__new__(CoreManager)
+    mgr.input_sockets, mgr.control_sockets = (
+        [make_zmq_socket(ctx, a, zmq.ROUTER, bind=True)] for a in addrs
+    )
+    mgr._control_send_lock = threading.Lock()
+
+    said = {"refused_commands": [], "priced_steps": {}, "predicted_memory": {}}
+    workers = SimpleNamespace(call_func=lambda name, wait_out: said[name])
+
+    # The loop runs on a thread here, so a hang fails the test instead of
+    # holding it; only the main thread may set a signal handler.
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: signal.SIG_DFL)
+
+    def engine_loop():
+        with compass_run.engine_loop(SimpleNamespace(runner_mgr=workers)):
+            while not clock.idle(lambda: math.inf):
+                pass
+
+    owner = threading.Thread(target=engine_loop, daemon=True)
+    connection = clock_transport.connect(compass_run.ENGINE, endpoint)
+    rt = LPRuntime(compass_run.ENGINE, TABLE, connection, owner=owner)
+    monkeypatch.setattr(clock, "_installed", rt)
+    clock.name_endpoints(0, *addrs, "")
+    engine = EngineCore.__new__(EngineCore)
+    engine.label, engine.input_queue = "engine", queue.Queue()
+    reader = threading.Thread(
+        target=engine.process_input_sockets, args=addrs, daemon=True
+    )
+    reader.start()
+    assert mgr.input_sockets[0].raw.poll(5000) and mgr.control_sockets[0].raw.poll(5000)
+    mgr.engine_core_identities = [mgr.input_sockets[0].recv_multipart()[0]]
+    mgr.control_identities = [mgr.control_sockets[0].recv_multipart()[0]]
+    frontend.start_run()
+    rt.start_run()
+    add = (EngineCoreRequestType.ADD, [SimpleNamespace(id=7)])
+    mgr._send_request(0, pickle.dumps(add))
+    deadline = time.monotonic() + 10
+    while 0 not in rt.arrived[request]:
+        assert time.monotonic() < deadline, "request 0 not read in 10 wall seconds"
+        time.sleep(0.01)
+    frontend.end_run()  # the stop, as the frontend's event loop makes it
+    mgr._send_control(0, pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+    reader.join(1)  # SHUTDOWN reaches the input thread before the engine asks
+    owner.start()
+    owner.join(10)
+    reader.join(10)
+    try:
+        assert not owner.is_alive(), "the engine never took the released request"
+        assert not reader.is_alive()
+        taken = [engine.input_queue.get_nowait()[0] for _ in range(2)]
+        assert taken[0].id == 7
+        assert taken[1].status == SequenceStatus.EXIT_ENGINE
+        hand_in = tmp_path / compass_run.LP_FILE.format("engine")
+        assert json.loads(hand_in.read_text())["refusals"] == []
+    finally:
+        server.close()
+        ctx.destroy(linger=0)

@@ -196,7 +196,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                                                docs 01, 15          |
   +=====================================================================+
   |  L0  ARTIFACTS        machine_spec   op_graph      price_list       |
-  |                       op_measurement memory_readings coverage_hull  |
+  |                       op_measurement memory_readings                |
   |                       shape_population  step_measurement            |
   |                       step_linear_law  host_laws  step grid bundle  |
   |                       keys . digests . fingerprints . invalidation  |
@@ -287,7 +287,7 @@ This is what makes "no GPU at simulation time" work.
    |                                |<------|  cost model -> seconds    |
    |  machine_spec   price_list     |  JIT  |  memory model -> blocks   |
    |  op_graph                      | trace |                           |
-   |  memory_readings coverage_hull |       |  -> simulated run         |
+   |  memory_readings               |       |  -> simulated run         |
    +--------------------------------+       +---------------------------+
 ```
 
@@ -485,7 +485,7 @@ The documents use these precisely; a reader will bounce off without them.
 | **logical process (LP)** | the unit the Clock Authority coordinates. *Not* an OS process — a TP group is one LP, a DP group is one LP, because both already have a hardware barrier. |
 | **structure** | a distinct operator list, independent of shape: the discrete part of a graph's applicability key (`04` D19). Prefill has two (chunked, unchunked). Graphs are captured per shape, one per decode width and prefill (T, B) (`04` D18). |
 | **treatment** | a factor that moves cost and is invisible to every feature in the model. Uniform MoE routing under DP is one. Decode **row order** is one to the op-level IR. The step linear law prices it with `rowmod(k)` (`09` D61); the step grid's residual reads it (`17` D100). |
-| **refusal** | a declined answer with a named reason. Refusals are results, not errors, and are preferred to guesses everywhere. A **refused step** is one with some term still unanswered after method fallback, its reasons listed per term: it costs 0 s, the run continues, and any refusal makes the run a coverage report (`08` D50.1). A source that declines while a later one answers is a fall-through, and an answer of any method, unvalidated included, is reported by its method; neither is a refusal. |
+| **refusal** | a declined answer with a named reason. Refusals are results, not errors, and are preferred to guesses everywhere. A **refused step** is one with some term still unanswered after method fallback, its reasons listed per term: each unanswered term costs 0 s, and a step the cost backend refuses charges no device time, its answered terms included; the run continues, and any refusal makes the run a coverage report (`08` D50.1). A source that declines while a later one answers is a fall-through, and an answer of any method, unvalidated included, is reported by its method; neither is a refusal. |
 | **step grid** | the step-level backend of `17`, run-file key `step_grid`: a grid of step measurements looked up per batch, plus a residual, fitted on real-run step times, bench replays or both, for what the grid's coordinates cannot see (row order, raggedness). |
 | **complete cell** | a cell of the step grid whose every corner was measured. The step grid interpolates only inside one; it extrapolates a decode cell past the KV pool, and anywhere else declines to the step roofline (`17` D99, D102). |
 | **recipe** | the step grid's feature functions and the constants frozen with them. Configuration supplies geometry and hardware values, a fit supplies coefficients, and a recipe's version changes only when a function does. |
@@ -551,7 +551,7 @@ The documents use these precisely; a reader will bounce off without them.
 | Doc | Title | What it settles |
 |---|---|---|
 | [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced stamp each direction, audited for minimality: a `tracestate` entry in, an SSE comment line per event out. The timeline rides carriers Atomesh already forwards, so it needs no change. Tokenizer cost is a queue, not a constant. |
-| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two gates: a CPU gate over every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free **as a batch** and held to green, and a GPU gate, a superset judged as a **delta** against pure upstream `661ef7661` on the nightly 20261013 image (`gate_gpu.sh`'s `BASE_*` constants, every failing node-id on file in `gpu_gate_known_failures.txt`). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible if stable; sensitivity is deferred. |
+| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two gates: a CPU gate over every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free **as a batch** and held to green, and a GPU gate, a superset judged as a **delta** against a recorded baseline (`gpu_gate_baseline.env`, every failing node-id on file in `gpu_gate_known_failures.txt`, both rewritten by `regen_gpu_gate_baseline.sh`). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible if stable; sensitivity is deferred. |
 | [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. The metrics push and refresh are daemon timers on simulated time. |
 
 ### Part V — Cross-cutting

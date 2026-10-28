@@ -42,6 +42,7 @@ from atom.utils.compass_loop import (
     CompassSelector,
     HttpChannel,
     Station,
+    wrap_decode,
     wrap_encode,
 )
 
@@ -270,6 +271,71 @@ def test_a_request_released_before_it_is_read_is_handed_over_at_its_arrival(run)
     # The server tick and the keep-alive timeout never move the clock.
     assert max(g for g in run.conn.grants if g < INF) == arrival
     assert run.conn.grants[-1] == INF
+
+
+def test_an_unstamped_generation_request_in_the_run_is_refused_naming_its_endpoint(
+    run,
+):
+    """While a stamped completion is released and unread, an unstamped one and
+    an unstamped ``/health`` arrive. The completion is answered 400 by name and
+    reaches no app; ``/health`` and the stamped completion are served."""
+    stamps, served, got = queue.Queue(), [], {}
+
+    async def app(scope, receive, send):
+        served.append(scope["path"])
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            HttpChannel(app, api_server._tracestate_stamp),
+            host="127.0.0.1",
+            port=0,
+            loop="atom.utils.compass_loop:CompassEventLoop",
+            lifespan="off",
+            log_level="warning",
+        )
+    )
+    traffic = _traffic(run, stamps, before_ner=lambda: None)
+    arrival, seq = stamps.get(timeout=10)
+
+    def released():
+        with run.rt.lock:
+            return run.rt.is_released(HTTP, seq)
+
+    def ask(method, path, headers):
+        port = server.servers[0].sockets[0].getsockname()[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            conn.request(
+                method, path, body=b"{}" if method == "POST" else None, headers=headers
+            )
+            response = conn.getresponse()
+            return response.status, response.read()
+        finally:
+            conn.close()
+
+    def client():
+        _until(lambda: server.started and released())
+        got["unstamped"] = ask("POST", "/v1/completions", {})
+        got["health"] = ask("GET", "/health", {})
+        stamp = carriers.tracestate_with(None, arrival, seq)
+        got["stamped"] = ask("POST", "/v1/completions", {"tracestate": stamp})
+
+    thread = threading.Thread(target=client, name="client", daemon=True)
+    thread.start()
+    try:
+        server.run()  # the finish ends it once the stamped request is served
+    finally:
+        thread.join(10)
+        traffic.join(10)
+    assert served == ["/health", "/v1/completions"]
+    assert run.rt.refusals == ["http:unstamped POST /v1/completions"]
+    assert got["health"] == got["stamped"] == (200, b"ok")
+    status, body = got["unstamped"]
+    message = json.loads(body)["error"]["message"]
+    assert status == 400 and "POST /v1/completions carries no Compass stamp" in message
+    assert "traffic LP" in message
 
 
 def test_the_finish_shuts_uvicorn_down_with_no_error_and_no_join_warning(
@@ -1038,6 +1104,42 @@ def test_a_tokenizer_result_due_when_an_intake_starts_runs_before_its_charge(
     )
 
 
+@pytest.mark.parametrize("delay_s", [0.0, 0.1], ids=["fast", "slow"])
+@pytest.mark.parametrize("hops", [0, 1, 2, 4])
+def test_a_burst_tokenizer_results_do_not_depend_on_loop_turns_or_thread_speed(
+    run, monkeypatch, tmp_path, hops, delay_s
+):
+    # Each intake costs 2 ms and each tokenizer job 1 ms. Each handler yields
+    # to the loop `hops` times before it submits its job, as a web framework's
+    # awaits do, and job 0's real thread takes `delay_s` wall seconds. Neither
+    # moves a result: each job is submitted when its own intake ends and placed
+    # before the next intake is charged, so job 0's result runs when request
+    # 1's intake ends, at 4 ms, job 1's when request 2's ends, at 6 ms, and
+    # job 2's at its completion, 7 ms.
+    _intake_run_file(monkeypatch, tmp_path, (2e-3, 1e-9))  # empty bodies
+    entry = SimpleNamespace(encode_fixed_s=1e-3, encode_tokens_per_s=1.0, derate=1.0)
+    encode, done = wrap_encode(list, entry), []
+
+    async def app(scope, receive, send):
+        seq = api_server._tracestate_stamp(scope)[1]
+        for _ in range(hops):
+            await asyncio.sleep(0)
+
+        def do_preprocess():
+            time.sleep(delay_s if seq == 0 else 0)
+            encode()
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, do_preprocess)
+        done.append((seq, loop.time()))
+
+    arrival = _burst(run, monkeypatch, 3, app)
+    print(f"\n  tokenizer results at {done}")
+    assert [t for _, t in sorted(done)] == pytest.approx(
+        [arrival + 4e-3, arrival + 6e-3, arrival + 7e-3]
+    )
+
+
 @pytest.mark.parametrize("tick", [None, 0.1, 9.0, 20.0], ids=lambda t: f"tick{t}")
 @pytest.mark.parametrize("probes", [0, 1, 2], ids=lambda n: f"{n}probes")
 def test_tokenizer_results_due_at_one_instant_resume_in_submission_order(
@@ -1073,3 +1175,57 @@ def test_tokenizer_results_due_at_one_instant_resume_in_submission_order(
     loop.run_forever()
     loop.close()
     assert resumed == sorted(range(len(tokens)), key=lambda k: (tokens[k], k))
+
+
+@pytest.mark.parametrize("delay_s", [0.0, 0.3], ids=["fast", "slow"])
+def test_an_on_loop_tokenizer_call_places_open_encode_jobs_first(run, caplog, delay_s):
+    # An encode job charged 1 ms, whose real thread takes `delay_s` wall
+    # seconds; a decode on the loop thread at 0 charged 5 ms; a 3 ms timer
+    # whose callback decodes 5 ms more. The job completes inside the first
+    # decode, so its result runs when that decode ends, at 5 ms, before the
+    # timer's decode, however long its thread took. The slow thread outlasts
+    # diag_s, so the wait warns once.
+    _idle_traffic(run)
+    loop = CompassEventLoop()
+    loop.executor.station = Station(1, diag_s=0.1)
+    encode = wrap_encode(
+        list, SimpleNamespace(encode_fixed_s=1e-3, encode_tokens_per_s=1.0, derate=1.0)
+    )
+    decode = wrap_decode(
+        lambda ids: "",
+        SimpleNamespace(decode_fixed_s=5e-3, decode_tokens_per_s=1.0, derate=1.0),
+    )
+    seen = {}
+
+    async def request():
+        def do_preprocess():
+            time.sleep(delay_s)
+            encode()
+
+        await loop.run_in_executor(None, do_preprocess)
+        seen["result"] = loop.time()
+
+    async def on_loop():
+        time.sleep(0.05)  # noqa: ASYNC251 - wall only: a fast thread is done by now
+        await asyncio.sleep(0)
+        decode([])
+        seen["decode"] = loop.time()
+
+    async def at_3ms():
+        await asyncio.sleep(3e-3)
+        for _ in range(3):  # past the callbacks that hand a result to its coroutine
+            await asyncio.sleep(0)
+        decode([])
+        seen["timer"] = loop.time()
+
+    async def go():
+        await asyncio.gather(request(), on_loop(), at_3ms())
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        loop.run_until_complete(go())
+    loop.run_forever()
+    loop.close()
+    print(f"\n  {delay_s} s thread: {seen}")
+    assert seen == pytest.approx({"result": 5e-3, "decode": 5e-3, "timer": 10e-3})
+    warned = [r for r in caplog.records if "event-loop charge waits" in r.getMessage()]
+    assert len(warned) == (delay_s > 0.1)

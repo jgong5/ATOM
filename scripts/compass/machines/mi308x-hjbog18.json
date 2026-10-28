@@ -3,7 +3,7 @@
   "name": "mi308x-hjbog18",
   "provenance": {
     "authored_by": "compass agent for jgong5",
-    "date": "2026-10-20",
+    "date": "2026-10-27",
     "origin": "mixed",
     "origins": {
       "host.cpu.cores_physical": {
@@ -131,6 +131,90 @@
         "p10": 0.0007076265928628138,
         "p90": 0.0010018610641255089
       },
+      "interconnect.intra_node.pp.rccl.eager_threshold_bytes": {
+        "origin": "probed",
+        "source_root": "commit:b34b1efc9",
+        "record": "sha256:0b6af34873ca57a9b4f143935066388a274d92688e07b2d094b0584eded73a13",
+        "p10": 33554432,
+        "p90": 33554432
+      },
+      "interconnect.intra_node.pp.rccl.latency_s": {
+        "origin": "probed",
+        "source_root": "commit:b34b1efc9",
+        "record": "sha256:0b6af34873ca57a9b4f143935066388a274d92688e07b2d094b0584eded73a13",
+        "p10": 1.4362740330398083e-06,
+        "p90": 2.7121277526021004e-06
+      },
+      "interconnect.intra_node.pp.rccl.overhead_s": {
+        "origin": "probed",
+        "source_root": "commit:b34b1efc9",
+        "record": "sha256:0b6af34873ca57a9b4f143935066388a274d92688e07b2d094b0584eded73a13",
+        "p10": 3.659631463934752e-05,
+        "p90": 3.704766132555374e-05
+      },
+      "interconnect.intra_node.pp.rccl.per_byte_s": {
+        "origin": "probed",
+        "source_root": "commit:b34b1efc9",
+        "record": "sha256:0b6af34873ca57a9b4f143935066388a274d92688e07b2d094b0584eded73a13",
+        "p10": 2.0116823335541898e-11,
+        "p90": 2.0304158660508042e-11
+      },
+      "interconnect.intra_node.pp.rccl.rendezvous_fixed_s": {
+        "origin": "probed",
+        "source_root": "commit:b34b1efc9",
+        "record": "sha256:0b6af34873ca57a9b4f143935066388a274d92688e07b2d094b0584eded73a13",
+        "p10": 5.4971626264820153e-05,
+        "p90": 5.828955304669413e-05
+      },
+      "interconnect.intra_node.pp.gloo.eager_threshold_bytes": {
+        "origin": "probed",
+        "source_root": "commit:b34b1efc9",
+        "record": "sha256:0b6af34873ca57a9b4f143935066388a274d92688e07b2d094b0584eded73a13",
+        "p10": 0,
+        "p90": 0
+      },
+      "interconnect.intra_node.pp.gloo.latency_s": {
+        "origin": "probed",
+        "source_root": "commit:b34b1efc9",
+        "record": "sha256:0b6af34873ca57a9b4f143935066388a274d92688e07b2d094b0584eded73a13",
+        "p10": 9.14878910407424e-06,
+        "p90": 1.679931301623583e-05
+      },
+      "interconnect.intra_node.pp.gloo.overhead_s": {
+        "origin": "probed",
+        "source_root": "commit:b34b1efc9",
+        "record": "sha256:0b6af34873ca57a9b4f143935066388a274d92688e07b2d094b0584eded73a13",
+        "p10": 1.6526597717457957e-05,
+        "p90": 2.294824547585645e-05
+      },
+      "interconnect.intra_node.pp.gloo.per_byte_s": {
+        "origin": "probed",
+        "source_root": "commit:b34b1efc9",
+        "record": "sha256:0b6af34873ca57a9b4f143935066388a274d92688e07b2d094b0584eded73a13",
+        "p10": 1.3341168692029255e-10,
+        "p90": 2.005936577021969e-10
+      },
+      "interconnect.intra_node.pp.gloo.rendezvous_fixed_s": {
+        "origin": "probed",
+        "source_root": "commit:b34b1efc9",
+        "record": "sha256:0b6af34873ca57a9b4f143935066388a274d92688e07b2d094b0584eded73a13",
+        "p10": 2.6582559555506392e-05,
+        "p90": 3.501254155033535e-05
+      },
+      "interconnect.intra_node.pp.gloo.wake_s": {
+        "origin": "probed",
+        "source_root": "commit:b34b1efc9",
+        "record": "sha256:0b6af34873ca57a9b4f143935066388a274d92688e07b2d094b0584eded73a13",
+        "p10": 0.0001574667544242473,
+        "p90": 0.00019429585724565536
+      },
+      "interconnect.intra_node.pp.gloo.wake_rise_s": {
+        "origin": "probed",
+        "source_root": "commit:b34b1efc9",
+        "record": "sha256:0b6af34873ca57a9b4f143935066388a274d92688e07b2d094b0584eded73a13",
+        "p10": 0.2724507284033313,
+        "p90": 0.4541393049634419
+      },
       "device.memory.bandwidth_curve": {
         "origin": "probed",
         "source_root": "commit:8c6fdc90b",
@@ -186,6 +270,23 @@
           "decode_fixed_s": 1.9340936708995337e-06,
           "decode_tokens_per_s": 4214493.0078329975
         }
+      },
+      "host.tokenizers[qwen3-0.6b fast]": {
+        "origin": "probed",
+        "model": "Qwen/Qwen3-0.6B",
+        "source_root": "commit:b77bf26488eb4575bf14336fe90dcf726eea59b5",
+        "p10": {
+          "encode_fixed_s": 1.4820614299433245e-05,
+          "encode_tokens_per_s": 512558.3010221457,
+          "decode_fixed_s": 2.202056857319637e-06,
+          "decode_tokens_per_s": 2852747.8111874303
+        },
+        "p90": {
+          "encode_fixed_s": 1.591785651179596e-05,
+          "encode_tokens_per_s": 527919.3835395373,
+          "decode_fixed_s": 2.27880140187805e-06,
+          "decode_tokens_per_s": 2880310.3514559
+        }
       }
     },
     "fragments": [
@@ -195,9 +296,10 @@
       "ptl",
       "intake",
       "idle",
+      "pp",
       "peaks"
     ],
-    "notes": "one Qwen3.8-27B TP1 start at 0f045543d | no probe fills these | ptl_enable | one real c=256 first-turn cc-traces burst at 19c5ab09e | http_intake.py idle over 64 lone requests at dee1854db | probe_device.py: GEMM, read, write, copy, graph and link samples"
+    "notes": "one Qwen3.8-27B TP1 start at 0f045543d | no probe fills these | ptl_enable | one real c=256 first-turn cc-traces burst at 19c5ab09e | http_intake.py idle over 64 lone requests at dee1854db | pp_carriers.py on two GPUs at b34b1efc9 | probe_device.py: GEMM, read, write, copy, graph and link samples"
   },
   "host": {
     "cpu": {
@@ -217,6 +319,20 @@
         "encode_tokens_per_s": 636817.1671289918,
         "decode_fixed_s": 1.8340489314873881e-06,
         "decode_tokens_per_s": 4156658.937770821,
+        "derate": 1.0
+      },
+      {
+        "id": "qwen3-0.6b",
+        "backend": "fast",
+        "vocab_size": 151669,
+        "fingerprint": "sha256:aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        "applies_to": [
+          "Qwen3ForCausalLM"
+        ],
+        "encode_fixed_s": 1.5276093569196534e-05,
+        "encode_tokens_per_s": 522881.8833086043,
+        "decode_fixed_s": 2.221973115389149e-06,
+        "decode_tokens_per_s": 2862934.7592104906,
         "derate": 1.0
       }
     ],
@@ -348,6 +464,24 @@
       "domain_devices": 8,
       "link_bandwidth_bytes_per_s": 64000000000.0,
       "link_latency_s": 9.736769795417785e-07,
+      "pp": {
+        "rccl": {
+          "eager_threshold_bytes": 33554432,
+          "latency_s": 1.4969846233725548e-06,
+          "overhead_s": 3.679665958749012e-05,
+          "per_byte_s": 2.018084813031166e-11,
+          "rendezvous_fixed_s": 5.652430790143266e-05
+        },
+        "gloo": {
+          "eager_threshold_bytes": 0,
+          "latency_s": 1.3623037375509739e-05,
+          "overhead_s": 1.8165249842257383e-05,
+          "per_byte_s": 1.4061146314651374e-10,
+          "rendezvous_fixed_s": 3.126177778056401e-05,
+          "wake_s": 0.00017452681981453718,
+          "wake_rise_s": 0.33165023854607084
+        }
+      },
       "derate": 0.7943823280877411
     },
     "inter_node": {

@@ -14,7 +14,8 @@ its instances grouped (`leaves`), at the shape and `--context`: a decode
 step's rows each hold `--context` tokens, and a prefill's rows, split as the
 capture split them, follow `--context` cached tokens each, none when it is not
 given. Rows the KV pool cannot hold at once are ragged (`point_rows`), and the
-point records its rows.
+point records its rows; under `--plan` over ragged decode steps a decode point
+the pool cannot hold refuses instead, past the first round (`RAGGED`).
 
 ATOM's runner is built from ATOM's arguments on each GPU `--gpu` names, one
 rank each of the layout the arguments resolve (`ranks`), its parameters on the
@@ -78,15 +79,17 @@ blocks and state slots of its own, as many as the pool and a KV registry
 entry of per-request state hold, past what the state slots hold on the first
 placements' slots again, for which ATOM prepares the forward context
 again, it and the metadata views cloned once each, and only where they differ
-from the last placement's. A KV argument
+from the last placement's; a view an operator writes (`_writes`) has clones
+apart, which only that operator's leaves share. A KV argument
 places a leaf's copies as a context key does. A second graph runs
 copy 0 K times, warm; with one copy, or K under `CALLS`, there is none.
 Before each capture, and once the runner sized its KV pool, the memory the
 bench freed goes back to the driver, and the bench waits, at most `CLEAR_S`,
 until the card's VRAM in use falls by it (`_release`); a point records the
 seconds waited since the last point and how many waits the cap ended.
-Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the host
-idle `REST` times a replay's device time after each replay;
+Each graph is replayed `WARMUPS` times, then `REPEATS` times timed, the cold
+one each time after a read of `COLD` times the last-level cache outside the
+timing, the host idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
 aside, are the point's kernel identity. When `ReplayRule` refuses a batch, its
@@ -106,22 +109,26 @@ for (`record`'s or `trace steps`' output), capturing each `op_graph` S lacks:
 every leaf at every rung of ATOM's decode ladder at the steps' lowest and
 highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
-and each prefill family (`_family`) over a ladder of their token counts, chunk
-remainders among them, one of a kind that depends on context at each at the
-most cached tokens of steps of its rows, and over a ladder of them once those
-points and the fresh ones show the kind still does; then the point halfway
-between two neighbours of a family, or of a prefill leaf's token count over
-cached tokens, that launched different kernels or, at a decode width, either
-side of a point off the line through theirs, or whose cold times differ where
-the leaf's kind steps under one kernel between two adjacent contexts at some
-width (`_densify`), until they are adjacent; a collective's message bytes bend
-as a decode width does. DIR gets each round's ops.jsonl in `round<n>`, a run
+and, when some step's rows are ragged, at a rung of more than one row on
+ragged rows too (`_means`): the first at the context, the rest sharing a mean,
+each `GRID`th of it from the least the rows hold; and each prefill family
+(`_family`) over a ladder of their token counts, chunk remainders among them,
+one of a kind that depends on context at each at the most cached tokens of
+steps of its rows, and over a ladder of them once those points and the fresh
+ones show the kind still does; then the point halfway between two neighbours
+of a family, or of a prefill leaf's token count over cached tokens, that
+launched different kernels or, at a decode width, either side of a point off
+the line through theirs, or, on rows alike, whose cold times differ where the
+leaf's kind steps under one kernel between two adjacent contexts at some width
+(`_densify`), until they are adjacent; a collective's message bytes bend as a
+decode width does. DIR gets each round's ops.jsonl in `round<n>`, a run
 resumed into DIR numbering on from the last round there, and after each round
 every point held, a measured one with its store token, in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
 covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
-and prints the count by phase and why each leaf kind left the rest out.
+a step only when `fit ops`' price list of those points prices each leaf, and
+prints the count by phase and why each leaf kind left the rest out.
 """
 
 import argparse
@@ -164,13 +171,15 @@ from atom.compass.artifacts import (
     member_name,
     roots_for,
 )
+from atom.compass.backends.op_graph import PERMILLE
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
-#: copies a graph reads or what a capture waits for change.
-PROTOCOL = 15
+#: copies a graph reads, what a capture waits for or what a replay follows
+#: change.
+PROTOCOL = 17
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -184,8 +193,9 @@ GRAPH_NS = 10_000_000
 #: Profiles of one call taken at most until two in a row name the same kernels:
 #: a profile can drop a call's kernel or keep a kernel launched before it.
 PROFILES = 4
-#: Times over the last-level cache the copies' bytes pass: just past it, part of
-#: them stays there, and an MI308X GEMM read up to 7% fast.
+#: Times over the last-level cache the copies' bytes pass, and the bytes read
+#: before each cold replay: just past it, part of them stays there, and an
+#: MI308X GEMM read up to 7% fast.
 COLD = 2
 #: Host idle after each replay, as a share of its device time. Replayed back to
 #: back on an MI308X, the lm_head GEMM ran at a 1100 MHz memory and 1550 MHz
@@ -276,6 +286,11 @@ RANK = Topology().ranks()[0]
 #: The variable naming the file a measuring process appends each point's
 #: record to as it finishes it.
 JOURNAL = "COMPASS_OPS_JOURNAL"
+#: The variable `--plan` sets for its measuring processes past its first round
+#: when some step's decode rows are ragged: there a uniform decode point the KV
+#: pool cannot hold refuses, as a ragged one does, unless every leaf it times is
+#: a collective. A cut point's rows hold a mean its context does not name.
+RAGGED = "COMPASS_OPS_RAGGED"
 
 
 def main(argv: list[str]) -> None:
@@ -554,10 +569,14 @@ class Stub:
         from atom.model_engine.kv_block import STATE_SLOT_CLASS
 
         self.runner, self.llc, self.journal = runner, llc, journal
+        # read before each cold replay, so no call reads what the last left
+        # in the cache: under twice the cache, 256 copies alone leave a leaf warm
+        self.flush = None
         self.alone = getattr(runner.config, "dp_logical_size", 0)
         self.slots = runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
         self.built, self.leaves, self.placed = {}, {}, []
         self.cold_copies, self.clones, self.kv, self.state = {}, {}, {}, set()
+        self.written = {}
         self.modules = dict(runner.model.named_modules())
         self.contexts = runner.config.compilation_config.static_forward_context
         self.moe = sorted(
@@ -627,6 +646,7 @@ class Stub:
         meta = dict(self.kv)
         for sig, (op, _) in self.leaves.items():
             ratio = op["args"].get("ratio", op.get("stated", {}).get("compress_ratio"))
+            writes = _writes(op["op"])
             for path, spec in _specs(op["args"]):
                 if spec["role"] == "metadata":
                     token = (op["op"], path) in TOKEN_IDS
@@ -646,8 +666,15 @@ class Stub:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
                         # leaves share a view's clone: DeepSeek-V4's decode
-                        # leaves view 2.7 GB of it at a placement
-                        meta[sig, path] = name, _deep(view, {}, self.clones)
+                        # leaves view 2.7 GB of it at a placement. What an
+                        # operator writes is cloned apart, or a leaf timed
+                        # after it reads what it wrote (a `copy_` bound by
+                        # shape); its leaves share that clone, as ATOM's
+                        # layers share the HCA decode workspace
+                        clones = self.clones
+                        if field in writes:
+                            clones = self.written.setdefault(op["op"], {})
+                        meta[sig, path] = name, _deep(view, {}, clones)
                     except ValueError as error:  # the leaf refuses, not the step
                         meta[sig, path] = str(error), None
         # one clone across placements of what none changed: a leaf may cache
@@ -684,8 +711,23 @@ class Stub:
         refused when `rule` refuses the batch."""
         from atom.utils.forward_context import _forward_kv_cache_context
 
+        def refuse(why):
+            return _journal(
+                self.journal,
+                [
+                    {"shape": str(shape), "context": context, "op": op["op"]}
+                    | {"leaf": sig, "refused": why}
+                    for sig, (op, _) in found.items()
+                ],
+            )
+
         pool = self.runner.config.num_kvcache_blocks
-        rows = point_rows(shape, context, pool, rule.block_size)
+        uncut = os.environ.get(RAGGED) and not all(
+            exchange(o) for o, _ in found.values()
+        )
+        rows = point_rows(shape, context, pool, rule.block_size, bool(uncut))
+        if rows is None:
+            return refuse(f"its rows need more than the pool's {pool} KV blocks")
         view = {"rows": rows, "produces_output": True}
         blocks = sum(-(-row[1] // rule.block_size) for row in rows)
         kv = _forward_kv_cache_context.kv_cache_data
@@ -704,7 +746,9 @@ class Stub:
             for s, (op, i) in found.items()
         }
         need = max(p for _, _, p, _ in plans.values())
-        self.leaves, self.placed, self.context, self.clones = found, [], context, {}
+        self.leaves, self.placed, self.clones = found, [], {}
+        self.written = {}
+        self.context = _split(context)[0]
         self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
         for p in range(max(min(need, *room), 1)):
             slot = p * len(rows)
@@ -713,12 +757,7 @@ class Stub:
             try:
                 batch = rule.batch(view, p * blocks, slot)
             except ValueError as error:  # the rule refuses, before any preparation
-                refused = [
-                    {"shape": str(shape), "context": context, "op": op["op"]}
-                    | {"leaf": sig, "refused": f"ValueError: {error}"}
-                    for sig, (op, _) in found.items()
-                ]
-                return _journal(self.journal, refused)
+                return refuse(f"ValueError: {error}")
             try:
                 self._prepare(batch)
             except Exception as error:
@@ -837,8 +876,9 @@ class Stub:
         `GRAPH_NS`, cold over at most `n` copies, past the first `m` its point
         sized to the cache (`cold_copies`) each on copy `c mod m`'s
         activations, then copy `c mod n` with the c-th weight up to the
-        leaf's occurrences when it takes one, at most K; and, when K is `CALLS`,
-        warm over one; with its kernels. Every rank's graph holds the most K
+        leaf's occurrences when it takes one, at most K, each replay after one
+        read of `flush`; and, when K is `CALLS`, warm over one, with no read;
+        with its kernels. Every rank's graph holds the most K
         any rank's call gives, and a leaf any rank refuses, every rank does."""
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
@@ -850,6 +890,10 @@ class Stub:
             )
         fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
         self.loads, self.built = [], {}
+        if self.flush is None:
+            self.flush = torch.empty(
+                COLD * self.llc, dtype=torch.uint8, device=self.runner.device
+            )
         with refused_together():
             calls = [self._copy(op, sig, instances, 0)]
         # one weight can read a few percent off another of its spec: cycle one
@@ -881,7 +925,7 @@ class Stub:
                     calls.append(self._reweigh(op, sig, calls[c % n], c))
             n = len(calls)
             cycle = [calls[i % n] for i in range(k)]
-            cold = _replay(fn, cycle)
+            cold = _replay(fn, cycle, self.flush)
             warm = _replay(fn, calls[:1] * k) if n > 1 and k == CALLS else None
         finally:
             forward_context._forward_context = forward_context.ForwardContext()
@@ -1087,19 +1131,31 @@ def _routing(loads) -> dict:
     }
 
 
-def point_rows(shape, context, pool: int, block_size: int) -> list[list]:
+def point_rows(
+    shape, context, pool: int, block_size: int, uncut: bool = False
+) -> list[list] | None:
     """A point's rows, `[query, context, decodes]` each, longest first: a decode
     row holds `context` tokens; a prefill row its query tokens, the capture's
     split, past `context` cached ones. When they need more than the `pool`'s
     KV blocks, the first keeps its context and each other shares what it
-    leaves, as the rows of a ragged step do."""
+    leaves, as the rows of a ragged step do. A ragged decode point's rows
+    (`_split`) are its first row's context and, past it, rows of at least a
+    token each that hold its mean; None when they need more than the pool, as
+    a decode point's are when `uncut`."""
     decode = shape.phase == "decode"
+    context, mean = _split(context)
     per, extra = divmod(shape.tokens, shape.seqs)
     past = context - 1 if decode else context or 0
     rows = [
         [q, q + past, decode] for q in (per + (i < extra) for i in range(shape.seqs))
     ]
+    if mean:
+        share = (mean * context * len(rows) // PERMILLE - context) // (len(rows) - 1)
+        for row in rows[1:]:
+            row[1] = max(share, 1)
     blocks = [-(-row[1] // block_size) for row in rows]
+    if sum(blocks) > pool and (mean or uncut and decode):
+        return None
     if sum(blocks) > pool and len(rows) > 1:
         share = (pool - blocks[0]) // (len(rows) - 1) * block_size
         for row in rows[1:]:
@@ -1107,9 +1163,33 @@ def point_rows(shape, context, pool: int, block_size: int) -> list[list]:
     return rows
 
 
+def _split(context) -> tuple:
+    """A point's context and its rows' mean context in permille of it, None
+    when its rows hold it alike: a ragged decode point's context is the
+    pair."""
+    return tuple(context) if isinstance(context, (tuple, list)) else (context, None)
+
+
 def _specs(args):
     """Each tensor argument in `args`, by its slot path."""
     return [(p, v) for p, v in _values(args) if isinstance(v, dict) and "role" in v]
+
+
+def _writes(name: str) -> set[str]:
+    """The slots the operator `name` writes, as its schema marks them: an
+    in-place operator's or an `out` argument; none for a lifted function."""
+    # ponytail: a lifted function states no writes, so its clones are shared:
+    # ATOM's lifted metadata writers (`kv_indices_generate_triton`,
+    # `fill_deferred_decode_ids`, DeepSeek-V4's index builders) write what
+    # ATOM's forward writes from the prepared metadata, which later leaves
+    # read; one that writes other values needs its writes named here
+    target = torch.ops
+    for attr in [] if ":" in name else name.split("."):
+        target = getattr(target, attr, None)
+    if not isinstance(target, torch._ops.OpOverload):
+        return set()
+    args = target._schema.arguments
+    return {a.name for a in args if a.alias_info and a.alias_info.is_write}
 
 
 def _keyed(args, path) -> str:
@@ -1327,9 +1407,10 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
     return [e.name for e in device], ns
 
 
-def _replay(fn, calls) -> list[float]:
+def _replay(fn, calls, flush=None) -> list[float]:
     """Each timed replay of one graph of `calls`, in ns per call, each started
-    on every rank together (`_together`), the capture refused on every rank
+    on every rank together (`_together`) after one read of `flush` when
+    given, outside the timed events, the capture refused on every rank
     when any rank's refused, and nothing it left read by a later one
     (`_contained`), captured once the memory earlier leaves freed is cleared
     (`_release`). Over several ranks, a decode step's graph is captured as
@@ -1357,6 +1438,12 @@ def _replay(fn, calls) -> list[float]:
     start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
     times = []
     for i in range(WARMUPS + REPEATS):
+        if flush is not None:
+            # read, not written, so the replay writes back no line of it; either
+            # way it pushes the graph's kernel arguments, cached between
+            # replays, out to HBM, and on MI355X each kernel then waits about
+            # 0.3 us longer for them
+            flush.max()
         _together()
         start.record()
         graph.replay()
@@ -1639,6 +1726,10 @@ def publish(store, key, config, run: dict, command: str, results, out: Path):
 
 #: A ladder keeps a value only this many times the last it kept, and the largest.
 LADDER_STEP = 1.25
+#: A ragged decode point's rows' mean is a whole number of these parts of their
+#: max. At 16, MI308X decode attention at 6 rows and 212k tokens read 5.5% off
+#: its neighbours at a mean of 438 permille, past `fit ops`'s 5%.
+GRID = 32
 #: The spread of a leaf's cold times across contexts, or a prefill leaf's
 #: across rows, over the largest, past which its kind depends on them; a
 #: repeat's spread stays within 4%.
@@ -1672,6 +1763,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     ]
     if not contexts:
         raise ValueError("the --plan records hold no decode step to read contexts of")
+    ragged = any(
+        _mean(line, s.seqs) < PERMILLE for s, line in steps if s.phase == "decode"
+    )
     rungs = [decode(r) for r in schedulable_ladder(config)]
     graphs, done, tried = {}, {}, set()
     # a run resumed into `out` keeps the rounds an earlier one wrote there
@@ -1701,10 +1795,12 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             todo += [(shape, context, found)] if found else []
         print(f"round {first + n}: {sum(len(f) for *_, f in todo)} points to measure")
         gpus = len(run["device"])
-        results = _measured(config, todo, args.llc_mib << 20, gpus)
+        # round 0 cuts: `_dependent` reads its points for which kinds move
+        with patch.dict(os.environ, {RAGGED: "1"} if ragged and n else {}):
+            results = _measured(config, todo, args.llc_mib << 20, gpus)
         (into := out / f"round{first + n}").mkdir()
         publish(store, key, config, run, command, results, into)
-        done.update(((r["shape"], r["context"], r["leaf"]), r) for r in results)
+        done.update((_point(r), r) for r in results)
         with (out / "plan.jsonl").open("w") as lines:
             for r in done.values():
                 if "refused" not in r:  # a refused point is not in the store
@@ -1719,7 +1815,10 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         for sig, (op, _) in graphs[shape].items():
             if dependent.get(op["op"], True) and not exchange(op):
                 for c in _ladder(contexts):
-                    want[shape, c].add(_family(shape, c, op["op"], sig, dependent)[0])
+                    means = _means(shape.seqs) if ragged else []
+                    for at in [c, *((c, m) for m in means)]:
+                        fam = _family(shape, at, op["op"], sig, dependent)[0]
+                        want[shape, at].add(fam)
     prefills, cached = set(), defaultdict(list)
     for s, line in steps:
         if s.phase == "prefill":
@@ -1814,11 +1913,18 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     decode leaf of a kind that depends on context over its rows' lowest to
     highest context (`_rows`), any other decode leaf at its width, a prefill
     leaf at its tokens, and one of a kind that depends on context over its
-    rows' cached tokens too (`_bracket_cached`). The graphs are `arch`'s."""
+    rows' cached tokens too (`_bracket_cached`); and `fit ops`' price list of
+    `records` prices it at the step, as `compass run --coverage` asks it. The
+    graphs are `arch`'s."""
+    from atom.compass.backends.op_graph import band
+    from atom.compass.backends.provenance import Refusal
     from atom.compass.capture import population_steps
+    from atom.compass.fit.ops import PriceList, fit, held_out
 
     steps = list(population_steps(names))
     dependent = _dependent(records)
+    held_out(params := fit([r for r in records if "refused" not in r]))
+    listed = PriceList(params)
     axes, cuts = {}, defaultdict(dict)
     for fam, points in _families(records, dependent).items():
         axes[fam] = [p[0] for p in points], [p[1] for p in points]
@@ -1828,14 +1934,18 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     _load(store, config, root, {s for s, _ in steps}, graphs, arch, atom_args)
     families = {
         s: [
-            (op["op"], *_family(s, None, op["op"], sig, dependent))
+            (op["op"], *_family(s, None, op["op"], sig, dependent), op)
             for sig, (op, _) in g.items()
         ]
         for s, g in graphs.items()
     }
     for shape, line in steps:
-        whys = {}
-        for name, fam, tokens in families[shape]:
+        whys, decoding = {}, shape.phase == "decode"
+        mean, top = band(line["rows"], decoding)
+        bound = (*shape[:4], mean, top)
+        if decoding:  # its max, then its mean over B, as `OpGraphBackend` asks
+            bound = (*shape[:4], top, sum(r[1] for r in line["rows"]) / shape.seqs)
+        for name, fam, tokens, op in families[shape]:
             moves = dependent.get(name, True)
             cut = _cut(fam)
             if cut and cut[0] in cuts:
@@ -1851,6 +1961,8 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 why = _bracket(*axes[fam], *_rows(line, shape.seqs)) if moves else ""
             else:
                 why = _bracket(*axes[fam], tokens, tokens)
+            if not why and isinstance(got := listed.price((op, bound, None)), Refusal):
+                why = re.sub(r"\d+", "#", got.reason.split(": ")[1])
             if why:
                 whys[name] = why
         report[shape.phase].update(steps=1, covered=not whys)
@@ -1877,6 +1989,29 @@ def _rows(line, rung: int) -> tuple[int, int]:
     ks = [1 << i for i in range(rung.bit_length())]
     lo = min(rowmod(contexts, k) // -(-rung // k) for k in ks)
     return max(lo, 1), max(contexts)
+
+
+def _mean(line, rung: int) -> int:
+    """A decode step's rows' mean context over its rung, a pad row holding
+    none, in `PERMILLE` of their max."""
+    contexts = [row[1] for row in line["rows"]]
+    return round(PERMILLE * sum(contexts) / (rung * max(contexts)))
+
+
+def _means(rung: int) -> list:
+    """The means, in `PERMILLE` of the max, a rung's ragged points take: the
+    least its rows hold, a token past the first each, and each `GRID`th of
+    the max past it; none at one row."""
+    least = round(PERMILLE / rung)
+    grid = (round(PERMILLE * k / GRID) for k in range(1, GRID))
+    return [least, *(m for m in grid if m > least)] if rung > 1 else []
+
+
+def _point(record) -> tuple:
+    """A point record's shape, context and leaf, hashable."""
+    context = record["context"]
+    context = tuple(context) if isinstance(context, list) else context
+    return record["shape"], context, record["leaf"]
 
 
 def _cached(line) -> tuple[int, int]:
@@ -1958,15 +2093,17 @@ def _exchanged(fam: str) -> bool:
 
 def _family(shape, context, op: str, sig: str, dependent: dict):
     """The family a leaf's point belongs to, and where on its axis: a decode
-    leaf at its width over context; a prefill leaf over its tokens, at its rows
-    unless its kind's prefill points show it does not move with them, and at
-    its rows and cached tokens when its kind depends on context, as its
-    prefill points read it, else its decode points, else by default; a
-    collective over its message bytes (`exchange`)."""
+    leaf at its width, and its rows' mean when they are ragged, over context;
+    a prefill leaf over its tokens, at its rows unless its kind's prefill
+    points show it does not move with them, and at its rows and cached tokens
+    when its kind depends on context, as its prefill points read it, else its
+    decode points, else by default; a collective over its message bytes
+    (`exchange`)."""
     if op.startswith(COLLECTIVES):
         return tuple(exchange(json.loads(sig)))
     if shape.phase == "decode":
-        return json.dumps([str(shape), sig]), context
+        context, mean = _split(context)
+        return json.dumps([str(shape), sig] + ([mean] if mean else [])), context
     leaf = _abstract(json.loads(sig), shape.tokens)
     if not dependent.get(("prefill", op), dependent.get(op, True)):
         rows = shape.seqs if dependent.get(("rows", op), True) else None
@@ -2058,9 +2195,10 @@ def _densify(families, tried: set) -> dict:
     """The point halfway between each two neighbours of a family, or of a
     prefill leaf's token count over cached tokens (`_cut`), more than one
     apart, unless `tried`, that launched different kernels or, in a decode
-    family, lie either side of a point `_bent` off the line through theirs or
-    are `_apart` where the leaf's kind steps: some decode family of the kind
-    holds two adjacent contexts of one kernel that are `_apart`; between two
+    family, lie either side of a point `_bent` off the line through theirs or,
+    on rows alike, are `_apart` where the leaf's kind steps: some decode family
+    of the kind holds two adjacent contexts of one kernel that are `_apart`;
+    between two
     points of a collective's family, the step of the rows halfway, a decode
     when the farther is one, else a prefill of one sequence. A collective's
     family is `_bent` too, each message size at the mean of its readings, as
@@ -2083,13 +2221,15 @@ def _densify(families, tried: set) -> dict:
     for fam, points in [*families.items(), *across.items()]:
         points = sorted(points, key=lambda p: p[0])
         decoding = points[0][2]["shape"].startswith("decode")
+        # a ragged decode line is halved where it bends, not where its kind steps
+        ragged = decoding and json.loads(fam)[2:]
         if isinstance(fam, str) and _exchanged(fam):
             sizes = [[*g] for _, g in itertools.groupby(points, key=lambda p: p[0])]
             mean = (statistics.mean(p[2]["cold_ns"] for p in g) for g in sizes)
             at = ((*g[0][:2], {"cold_ns": ns}) for g, ns in zip(sizes, mean))
             bent = _bent([*at]) if len(sizes) > 2 else ()  # no line under three
         else:
-            bent = _bent(points, steps) if decoding else ()
+            bent = _bent(points, () if ragged else steps) if decoding else ()
         for (a, ka, record), (b, kb, other) in itertools.pairwise(points):
             mid = (a + b) // 2
             if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
@@ -2105,7 +2245,7 @@ def _densify(families, tried: set) -> dict:
                 step = decode(rows) if far.phase == "decode" else prefill(rows, 1)
                 want[step, other["context"]].add(fam)
             elif shape.phase == "decode":
-                want[shape, mid].add(fam)
+                want[shape, (mid, *ragged) if ragged else mid].add(fam)
             else:
                 want[prefill(mid, shape.seqs), record["context"]].add(fam)
     return want
@@ -2207,7 +2347,7 @@ def _measured(config, todo, llc: int, gpus: int = 1) -> list[dict]:
                 if not new and empty:
                     raise
                 got, empty = got + new, not new
-            done = {(r["shape"], r["context"], r["leaf"]) for r in got}
+            done = {_point(r) for r in got}
             todo = [
                 (s, c, {k: v for k, v in found.items() if (str(s), c, k) not in done})
                 for s, c, found in todo

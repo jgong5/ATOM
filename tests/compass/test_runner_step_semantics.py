@@ -40,10 +40,7 @@ from atom.compass.runner.overrides import (
     RunnerRefusal,
     install_cost_backend,
 )
-from atom.compass.runner.step_output import (
-    DeferredTokenStream,
-    reports_previous_step,
-)
+from atom.compass.runner.step_output import DeferredTokenStream
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
@@ -69,12 +66,8 @@ class _Runner(NonAllocatingRunner):
         self._token_stream = DeferredTokenStream([0]) if stream is None else stream
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _unpriced():
-    """Reporting is under test here, not the price: `test_dp_step_max.py` prices."""
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(overrides, "_group_step_seconds", lambda *_: 0.0)
-        yield
+# Reporting is under test here, not the price: `test_dp_step_max.py` prices.
+pytestmark = pytest.mark.usefixtures("unpriced")
 
 
 class _PerStep(DeferredTokenStream):
@@ -354,14 +347,35 @@ def test_reporting_a_stop_id_lets_the_run_decide_the_length_it_predicts(run):
 
 
 def test_a_pipeline_stage_reports_the_step_it_ran(run):
-    assert reports_previous_step(1) is True
-    assert reports_previous_step(2) is False
     staged = DeferredTokenStream([0], deferred=False)
     decode = run.batches[-1]
     reply = staged.step(decode)
     assert reply["req_ids"] == list(decode.req_ids)
     assert reply["is_deferred_out"] is False
     assert staged.prev_batch is None
+
+
+@pytest.mark.parametrize("deferred", [True, False])
+def test_a_single_stage_defers_exactly_when_atoms_token_processor_does(
+    run, monkeypatch, deferred
+):
+    """ATOM's `tokenIDProcessor` clears `is_deferred_out` under PP and on a P/D
+    producer whose model keeps recurrent state (a GDN hybrid), and the stream
+    the first predicted step builds takes that answer. So a single-stage
+    producer of such a model reports the decode it ran, not the one before."""
+    from atom.model_engine import llm_engine
+
+    monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *_: None)
+    monkeypatch.setattr(overrides, "filler_token_ids", lambda *_: [0])
+    config = MockConfig(pipeline_parallel_size=1, model="m", trust_remote_code=False)
+    runner = _Runner(config)
+    runner._token_stream = None
+    runner.tokenID_processor = types.SimpleNamespace(is_deferred_out=deferred)
+    decode = run.batches[-1]
+    reply = runner.forward(decode)
+    assert runner._token_stream.deferred is deferred
+    assert reply.is_deferred_out is deferred
+    assert reply.req_ids == ([] if deferred else list(decode.req_ids))
 
 
 def test_forward_keeps_inference_mode_and_drops_the_expert_load_monitor():

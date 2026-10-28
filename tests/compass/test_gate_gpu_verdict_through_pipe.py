@@ -25,7 +25,8 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 GATE = "scripts/compass/gate_gpu.sh"
 BASH = shutil.which("bash")
-BASE = dict(re.findall(r"^(BASE_\w+)=(\S+)$", (REPO / GATE).read_text(), re.MULTILINE))
+BASELINE = REPO / "scripts" / "compass" / "gpu_gate_baseline.env"
+BASE = dict(re.findall(r"^(BASE_\w+)=(\S+)$", BASELINE.read_text(), re.MULTILINE))
 KNOWN = [
     f"tests/test_suite.py::test_known[{i}]" for i in range(int(BASE["BASE_FAILED"]))
 ]
@@ -92,9 +93,9 @@ CASES = {
         {"scripts/compass/gpu_gate_known_failures.txt": ""},
         "",
     ),
-    "compass-count": (
-        93,
-        "pass count has no source",
+    "compass-failure": (
+        1,
+        "first tests/compass/test_c.py::test_c; 2 more",
         {"tests/compass/test_c.py": "def test_c():\n    assert False\n"},
         "",
     ),

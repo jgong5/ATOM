@@ -776,7 +776,7 @@ receives it itself, at its own receive point.
 | `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | stated IPC delay |
 | `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py::EngineCore.process_output_sockets`) | frontend output thread, `poller.poll()` in `engine_core_mgr.py::CoreManager._create_output_thread` (thread) | stated IPC delay |
 | `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | the router's per-request forward cost (D7) |
-| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline) | stated request latency (D6) |
+| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline); under prefill PP the head's, `engine-P-pp0` (D6) | stated request latency (D6) |
 | PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py::PPStageTransport.send_metadata` / `send_tokens` / `send_kv_status` | the stage loop's own poll and receive (inline) | stated IPC delay: each is one ZMQ message, as on the frontend channels; the head's batch to stage `k` is `meta#pp<k>`. The hidden states between stages are `pp_data` (`15` D91). |
 | `engine-P->engine-D:prefill_done` (RapidServe only, in neither M1 nor M2) | prefill step loop, direct send in `engine_core.py::PrefillEngineCore._process_engine_step` | decode handler thread `DecodeEngineCore._recv_prefill_done`, `sock.recv()` (thread) | stated IPC delay |
 | `engine-D->engine-P:block_assignment` (RapidServe only, in neither M1 nor M2) | decode step loop, direct send in `engine_core.py::DecodeEngineCore._send_block_assignment` | prefill handler thread `PrefillEngineCore._recv_block_assignments`, `sock.recv()` (thread) | stated IPC delay |
@@ -797,9 +797,10 @@ channel once per rank, `#dp0` to `#dp7`):
   `engine-D->frontend-D:output#dp0`;
 - `engine-D->engine-P:kv_write_req`.
 
-Mooncake's write-done message is not a channel: both ends compute its time (D6). With PP,
-Mooncake also has a decode-to-prefill `MSG_RELEASE` channel; the simulated connector
-refuses PP (D6).
+Mooncake's write-done message is not a channel: both ends compute its time (D6). Under
+prefill PP, Mooncake's decode-to-prefill `MSG_RELEASE` is not a channel either: it follows
+only writes both ends already see, so both compute its time too (D6, owner ruling on
+#1385).
 
 **Declaring a lookahead floor on every channel is a design commitment, not a constant to
 tune later.** Zero lookahead is correct under the grant rule above but serializes
@@ -1183,7 +1184,7 @@ undecided**.
 | K9 | Outside the model | outside the simulation window, inside replaced code, cannot park, or a timing only a log line reads | startup and shutdown, the replaced runner and RDMA backends, collectives inside the real forward, text scanners, the step-loop timings that only feed a log line |
 
 Each site's mechanism is the `mechanism` field #476 adds to its row in
-`atom/compass/audit/sync_sites.json`, produced by the scanner beside it. A row's
+`tests/compass/sync_sites.json`, produced by the scanner beside it. A row's
 first classification (#53) maps naturally to A→K1, B→K5, C1→K8, C2→K7, ignore→K9; the
 rules below say where a site moved off that map.
 
@@ -1490,7 +1491,7 @@ it waits for tokens, a later stage once `recv_metadata`'s 100 ms poll times out 
 #1450, #1457). The record stamps each idle `flush_pp_send` that settles a send, and the
 gate names, per sending stage, the steps where the two disagree (#1532).
 A simulated run prices a speculative step with `D_target` and `D_draft` from the cost
-backend, its terms tagged `draft` making the latter, and R1 holds its launch with MTP
+backend, its `draft_terms` making the latter, and R1 holds its launch with MTP
 ([#1090](https://github.com/jgong5/ATOM/issues/1090)). Under DP, each forward's
 `target_end` joins the device end's `all_reduce(MAX)` under MTP, and each rank writes the
 group's latest back as its output end. Its accepted drafts are `14` D83's draw.
@@ -1524,7 +1525,13 @@ cost error. T97 records settling the thresholds.
 
 **Accepted approximations**, each added back only if that check shows its error: TP ranks
 are symmetric; PP send backpressure; the MTP plus DP draft barrier; the overlaps of the
-copy stream, staging and `prep_stream`. One more follows from #815's ruling 2, which
+copy stream, staging and `prep_stream`; the device work an MTP decode's prepare queues
+ahead of its launch (metadata uploads, the SWA cursor probe, index and input-id fills), so
+a launch that finds the device busy starts its device early by that work: busy-launch
+decodes measure -0.27% (#1608) and -0.16% (the third DSpark record) at p50 at `fffff70db`,
+and the work is added back if a later record's busy-launch decodes miss the band (owner
+ruling on [#2092](https://github.com/jgong5/ATOM/issues/2092#issuecomment-6397638783),
+2026-10-25). One more follows from #815's ruling 2, which
 makes `E` the recurrence's first term: `E` is charged inside forward `n`'s TAR, but
 `scheduler.postprocess()` and `schedule()` run before the forward is called, at `now`, so
 their clock reads (the first-token stamps, the waiting-prefill age, the arrivals a
@@ -1568,7 +1575,7 @@ loop.
 
 - ~~The counts above are estimates from a synchronization inventory, not from a completed
   pass over the code. The first implementation task should be to produce the exact
-  classified list and check it in.~~ **Done, 2026-09-21.** `atom/compass/audit/`.
+  classified list and check it in.~~ **Done, 2026-09-21.** `tests/compass/sync_scan.py` and `sync_sites.json`.
 - ~~The literal `time.sleep(2)` in `DecodeEngineCore._post_model_load_hook` ... it must
   be *checked*, not assumed.~~ **Checked, 2026-09-21, and both halves hold.** It is
   reached only from that hook, and `DecodeEngineCore` is constructed only by
@@ -1652,7 +1659,7 @@ The pacing timers are local next events the clock owner hands to
   time. `11` D72 carries the observer and the reasons.
 - uvicorn's server tick, a 0.1 s `asyncio.sleep` in `Server.main_loop`, and its
   keep-alive timeout are daemon deadlines too. They are uvicorn's code, not ATOM's, so the
-  sync inventory (`atom/compass/audit/sync_sites.json`) has no row for them; the frontend
+  sync inventory (`tests/compass/sync_sites.json`) has no row for them; the frontend
   declares them with the refresh loop in `DAEMON_TIMERS` (`atom/utils/compass_loop.py`).
 
 ### Must read the LP clock — these three change scheduling (K2)
@@ -1680,7 +1687,7 @@ The only requirement is that these stay on the *same* clock as each other:
 is not, so virtualizing only the former makes the two halves of shutdown disagree.
 
 The control-command reply deadline stays real too (K8, ruling on #964, 2026-10-14; its
-reads are in `_KEPT_REAL`, `atom/compass/detect/clock_source.py`): a control command is
+reads are in `_KEPT_REAL`, `tests/compass/clock_source.py`): a control command is
 out-of-band and produces no simulated event (#886), and the LP clock moves only while
 its owner takes a grant, so a deadline on it would never expire while the owner waits.
 
@@ -1818,7 +1825,10 @@ and receives both run on the engine's step loop, and no worker takes part.
   zero when absent: on node 18 Mooncake TCP every first write of 2 to 7 blocks on a
   pair took 9.0 to 28.1 ms longer than the pair's later writes, and its second write
   was back at their median (#1172). RDMA is unmeasured. `bytes` is exactly computable from block count x
-  per-block bytes — no measurement needed. `latency` and `bandwidth` are
+  per-block bytes — no measurement needed. Mooncake posts a transfer as two writes,
+  each paying `latency`: the blocks, with a DeepSeek-V4 request's state slot, then a
+  Kimi-K3 request's KDA state slot, or DeepSeek-V4's compressor state again from a
+  staging row; a write with no bytes is not posted (#2325, #2341, #2342). `latency` and `bandwidth` are
   configuration (`05`, the `interconnect` link the run file's `kv_link` names),
   satisfying the "interconnect is configurable" requirement directly.
 - **Decode** posts the write request in `update_state_after_alloc` (called from
@@ -1872,10 +1882,10 @@ and receives both run on the engine's step loop, and no worker takes part.
 - It must still emit the `kv_transfer_params` blob that Atomesh relays, so
   `AtomAdapter` works unmodified. The router hard-errors if it is absent
   (`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`). The two backends emit
-  **different shapes** — thirteen fields and seventeen — and Mooncake's is the
-  seventeen; see *The blob, per backend* below. The relay timestamp (D7) is a field
+  **different shapes** — thirteen fields and twenty — and Mooncake's is the
+  twenty; see *The blob, per backend* below. The relay timestamp (D7) is a field
   frontend-P adds to `kv_transfer_params` after the connector has emitted it, so the
-  connector's blob stays the seventeen.
+  connector's blob stays the twenty.
 - The consumer side must still return `(len(prompt), True)` from
   `get_num_new_matched_tokens` when `do_remote_prefill` is set, i.e. park the request
   (`mooncake_connector.py::MooncakeConnectorScheduler.get_num_new_matched_tokens`), so
@@ -1888,26 +1898,46 @@ and receives both run on the engine's step loop, and no worker takes part.
 
 Each connector assigns `seq.kv_transfer_params_output` exactly once, so there is no
 second site either row below could be describing. Each row's field set is the key
-list of that one dict literal, walked out of the AST at `92f1fdafe`.
+list of that one dict literal, walked out of the AST at `faab717bc`.
 
 | Backend | Assignment | Keys | Field set, in source order |
 |---|---|---|---|
 | `moriio` (pull, the default) | `moriio_connector.py::MoRIIOConnectorScheduler.request_finished` | 13 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `transfer_id`, `first_token_id`, `draft_token_ids`, `prefix_cache_hit_tokens` |
-| `mooncake` (push) | `mooncake_connector.py::MooncakeConnectorScheduler.request_finished` | 17 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_swa_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `remote_pp_size`, `hash_block_size`, `transfer_id`, `first_token_id`, `draft_token_ids`, `local_slot_index`, `prefix_cache_hit_tokens` |
+| `mooncake` (push) | `mooncake_connector.py::MooncakeConnectorScheduler.request_finished` | 20 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_swa_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `remote_pp_size`, `hash_block_size`, `block_size`, `dcp_size`, `transfer_id`, `first_token_id`, `draft_token_ids`, `local_slot_index`, `remote_slot_index`, `prefix_cache_hit_tokens` |
 
-The push shape is the pull shape plus four: `remote_swa_block_ids`, `remote_pp_size`,
-`hash_block_size`, `local_slot_index`. They are a second backend's blob, not optional
-fields of one, and the simulated connector, standing in for `mooncake`, emits the
-seventeen.
+The push shape is the pull shape plus seven: `remote_swa_block_ids`, `remote_pp_size`,
+`hash_block_size`, `block_size`, `dcp_size`, `local_slot_index`, `remote_slot_index`.
+They are a second backend's blob, not optional fields of one, and the simulated
+connector, standing in for `mooncake`, emits the twenty
+(`atom/compass/kv/handoff.py::transfer_params`).
 
-One of the four is load-bearing rather than descriptive. The push consumer compares
-the producer's `hash_block_size` against its own and falls back to a full transfer —
-`num_computed_blocks = 0` — whenever it is absent or differs
-(`mooncake_connector.py::MooncakeConnectorScheduler.update_state_after_alloc`), so a blob carrying only the thirteen can never
-take the incremental path.
+Three of the seven, `hash_block_size`, `block_size` and `dcp_size`, are load-bearing
+rather than descriptive. The push consumer skips its cached prefix only when every check
+in `mooncake_connector.py::MooncakeConnectorScheduler.update_state_after_alloc` holds:
+
+- the producer's pages line up with the consumer's
+  (`MooncakeConnectorScheduler._remote_page_geometry`). With `block_size` and `dcp_size`
+  both present, the producer's `block_size` equals the consumer's and its `dcp_size` is 1
+  or the consumer's. Otherwise (either field missing), the producer's `hash_block_size`
+  equals the consumer's `block_size` (an unsharded producer) or the consumer's
+  `hash_block_size` (symmetric DCP);
+- the request keeps no per-request cache (`seq.has_per_req_cache` is false), since a
+  block delta does not carry state such as an SWA ring slot;
+- the consumer's `hash_block_size` is positive.
+
+It then sets `num_computed_blocks = seq.num_cached_tokens // hash_block_size` and
+`src_block_skip_factor` to the consumer's `dcp_size` over the producer's. When any check
+fails, `num_computed_blocks = 0`, a full transfer, so a blob carrying only the thirteen
+never takes the incremental path. The simulated consumer applies the page rule in
+`atom/compass/kv/connector.py::SimulatedKVConnectorScheduler._pages_line_up` and the
+other two checks in its `update_state_after_alloc`, then prices the consumer blocks left.
+It does not model `src_block_skip_factor`, and needs no term for it: the factor only picks
+which producer blocks fill the consumer's, and the blocks left are Mooncake's
+`dst_block_ids`, priced at decode's own `TransferModel.bytes_per_block`
+(`tests/compass/test_kv_mooncake_per_req_cache.py::test_an_unsharded_producer_into_dcp2_is_priced_on_mooncakes_slices`).
 
 `tests/compass/test_kv_blob_site.py` holds the one-site claim above. Nothing re-checks
-the field sets: they describe the connectors' code as read at `92f1fdafe`, and where the
+the field sets: they describe the connectors' code as read at `faab717bc`, and where the
 two differ the code is right.
 
 ### Pros
@@ -1929,18 +1959,47 @@ two differ the code is right.
   completes (`mooncake_connector.py::MooncakeConnector._record_write_done`). The
   simulated write is one event per request, priced on the whole block table, so ranks
   with unequal shares are not modelled.
-- **The simulated connector refuses PP** (`pp_size > 1`), naming the two reasons below.
-  No milestone pairs PD with PP: M1 and M2 run PP1, and PP comes after v1 (`16` D95). Under
-  PP, Mooncake adds a decode-to-prefill `MSG_RELEASE` channel
-  (`MooncakeConnector._send_release`) that this section does not cover, and the release
-  above never happens: the PP head's
-  `PPEngineCoreProc._poll_kv_transfer_progress` passes worker output to
-  `Scheduler._update_from_kv_xfer_finished` only when it is non-empty, and this
-  connector's workers report nothing, so `process_completions` is never called, prefill
-  never frees and decode never becomes ready. `EngineCore._poll_kv_transfer_progress`
-  passes it on every poll, which is why PP1 works. Lifting the refusal takes both:
-  the `MSG_RELEASE` channel, and a PP head that passes every poll's output on, empty
-  included.
+- **Refused by name under PP:** a decode side above PP 1 (ATOM has none: a producer stage
+  maps its regions onto a consumer holding every layer, `consumer_region_indices`, and a
+  decode head reports `finished_recving` from its own stage only); `lmcache_mp` under PP
+  (ATOM's `mp/deployment.py::_validate_mp_config`); any other connector (`allocate_kv_cache`,
+  above); PP with DP (ATOM's `CoreManager`, and the channel table); Kimi-K3's KDA state
+  regions above PP 1 (ATOM's `_KimiMLAGDNCommon._with_kda_disagg_regions`, restated by
+  `overrides.py::_refuse_kda_regions_across_stages` as a runner publishes its planned
+  transfer, since no simulated runner builds the regions); DeepSeek-V4 above PP 1 (ATOM's
+  `ModelRunner.get_num_blocks`, which refuses its copied state checkpoints there and which
+  the simulated runner runs).
+
+### Prefill pipeline parallelism (owner ruling on #1385)
+
+Only prefill runs PP with Mooncake. Real Mooncake under prefill PP `K`: decode sends a
+`MSG_WRITE_REQUEST` to every stage, and stage `k` writes its own layer window
+(`MooncakeConnector._consumer_region_map`) from its `_send_executor`. Decode's
+`_notification_listener` runs `_complete_recv` at the last stage's `MSG_WRITE_DONE`, which
+reports the receive and sends `MSG_RELEASE` to stage 0 (`_send_release`); stage 0's
+`_record_release` adds the request to `done_sending` after `consumer_tp_size` releases,
+and the head passes it to the scheduler. Stages above 0 add nothing to `done_sending`, and
+`kv_status` and `PPKVAggregator` carry offload completions only.
+
+Simulated:
+
+- Each prefill stage is engine LP `engine-P-pp<k>` with the PP channels (`15` D91). The
+  write request reaches the head only, `engine-D->engine-P-pp0:kv_write_req`: the head is
+  the one stage that receives the release and owns a scheduler, and every stage gets the
+  same write requests in the same order, so one message carries what every stage's write
+  needs. Stages above 0 build an inert connector.
+- Each decode rank and prefill stage pair is one FIFO link, as above, pricing that
+  stage's paged layers (`get_pp_indices`). Both ends feed every stage's link the same
+  arrivals, so both compute each stage's write-done `c_k`.
+- **`MSG_RELEASE` is not a message either.** It follows only writes both ends see: decode
+  is ready at `max_k c_k + L` and sends the release then, so the head is done at
+  `max_k c_k + 2L`, `L` the `kv_write_req` lookahead, and reports `finished_sending` as
+  above. A channel sent from decode's step loop would free prefill's blocks up to a decode
+  step late, as #1179's rejected (b).
+- The PP head passes its workers' non-offload output to
+  `Scheduler._update_from_kv_xfer_finished` on every poll, empty included, as
+  `EngineCore._poll_kv_transfer_progress` does: this connector's workers report nothing,
+  so a head that passed only non-empty output never called `process_completions`.
 
 ---
 
@@ -2250,7 +2309,7 @@ get disabled — not virtualized.
 
    | Channel | What the router does | Carrier |
    |---|---|---|
-   | `traffic->frontend-P:http` | Parses the body into a typed request and re-serializes it. `CompletionRequest` keeps unknown fields (`#[serde(flatten)]` on `CompletionRequest.other`, `completion.rs`); `ChatCompletionRequest` (`chat.rs`) has no such field, so **an unknown top-level chat field is dropped**. Request headers are forwarded by allow-list, `tracestate` included (`header_utils.rs::should_forward_request_header`), to decode as well. | The `compass` entry of the W3C `tracestate` header, e.g. `tracestate: compass=a:12.345;s:17`, appended after any existing entry so real tracing is unaffected. The same for chat and completion. |
+   | `traffic->frontend-P:http` | Parses the body into a typed request and re-serializes it. `CompletionRequest` keeps unknown fields (`#[serde(flatten)]` on `CompletionRequest.other`, `completion.rs`); `ChatCompletionRequest` (`chat.rs`) has no such field, so **an unknown top-level chat field is dropped**. Request headers are forwarded by allow-list, `tracestate` included (`header_utils.rs::should_forward_request_header`), to decode as well. | The `compass` entry of the W3C `tracestate` header, e.g. `tracestate: compass=a:12.345;s:17`, added before any existing entry, as W3C Trace Context adds a new entry, so real tracing is unaffected. The same for chat and completion. |
    | `frontend-P->frontend-D:relay` | Takes `kv_transfer_params` from prefill's JSON, lets the ATOM adapter insert fields, and writes it into the decode body (`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`). | A field inside `kv_transfer_params`, added by frontend-P after the connector has emitted its blob (D6). frontend-D also receives the original `tracestate`, so a request carrying `kv_transfer_params` takes its stamp from there (relay channel), any other from `tracestate` (traffic channel). |
    | `frontend-D->traffic:stream` | Streamed: passes the ATOM stream through byte for byte; `PDRouter::create_streaming_response` rewrites only with `return_logprob` and prefill logprobs, and the ATOM path has neither. Not streamed: returns decode's body unchanged with decode's response headers, less hop-by-hop ones (`header_utils.rs::preserve_response_headers`). | Streamed: an SSE comment line before each event, e.g. `: compass a=12.345 s=18`; SSE clients ignore lines starting with a colon. Not streamed: a `compass` response header, e.g. `compass: a=12.345;s=18`. |
 
@@ -2298,7 +2357,10 @@ own process with the policy code untouched. It is (owner ruling on
   `router->frontend-P:http` before the request's relay is handled, on
   `router->frontend-D:relay` after, its stamp in the body's `kv_transfer_params`. A
   request that has ended, or was never placed, is nowhere, and its cancel sends nothing
-  on. frontend-D's `HttpChannel` reads a cancel on `relay` as frontend-P's does on
+  on. The cancel ends its request: the loads it still holds drop in the cancel's turn,
+  as a client hang-up drops them in a router outside a run, so neither a prefill's 499
+  to the cancel, which carries no stamp, nor a decode stream ended with no `[DONE]`
+  drops one outside a handled turn (#1988). frontend-D's `HttpChannel` reads a cancel on `relay` as frontend-P's does on
   `http`: the request it names reads `http.disconnect` at the cancel's arrival.
   No hop hands on its client's socket closing. The router handles each request apart
   from its client connection, so a hang-up drops only the response forwarding: every

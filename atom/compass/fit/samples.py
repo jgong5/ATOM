@@ -7,18 +7,20 @@ identity in format `FORMAT_VERSION`, and the step record in `steps/`, with the
 client runs its server served (`parity.served`). Its ranks are labelled
 together by `step_labels.label_run` under ATOM's two-batch-overlap split rule
 (`validate.bound._split`), and a sample's provenance gains the
-`traces` its step served.
+`traces` its step served and whether run.json says it was `profiled`.
 A DP rank no request reached writes a line per dummy forward it runs, and gives
 no sample; its file still counts in the run's digest. An empty
 rank file lost its lines, and refuses.
-A record whose run.json names `aiter_jit_builds` refuses, naming them.
+A record whose run.json names `aiter_jit_builds` or `ptl_changes` refuses,
+naming them, and so does one whose `source` counts uncommitted files.
 
 A step measurement is a `step_measurement` entry `measure steps` published,
 read by key; its member `MEMBER` holds the batch view as a step-record line
 does (`rows`, `rung`, `produces_output`), its device seconds (`seconds`), its
 `origin` (`replay`, `plan` or `ragged`) and the `traces` the batch came from.
 Its sample's provenance holds its `source`, the origin, its `run`, the entry's
-digest, and those `traces`.
+digest, those `traces`, and `profiled` false: the bench times a
+replay unprofiled.
 
 Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
@@ -44,6 +46,7 @@ from atom.compass.artifacts import ArtifactStore, Topology
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_labels import Sample, digest, label_run
 from atom.compass.drive import aiter_jit
+from atom.compass.drive.identity import PTL_CHANGES
 from atom.compass.parity import ARRIVALS
 from atom.compass.parity.served import served
 from atom.compass.run.step_grid import keyed_of
@@ -99,6 +102,13 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
         )
     if built := aiter_jit.refusal(run):
         raise ValueError(f"{directory} is not fitted: {built}")
+    if changes := run.get(PTL_CHANGES):
+        named = ", ".join(f"{c['from']} to {c['to']} at {c['at']}" for c in changes)
+        raise ValueError(
+            f"{directory} is not fitted: its cards' PTL state changed while it "
+            f"served, {named}"
+        )
+    fields = run_fields(run, directory)
     steps = directory / "steps"
     if (steps / ARRIVALS).exists():
         # `parity.read` then drops the engine's start and renumbers the rest.
@@ -117,12 +127,13 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
     name, samples = ", ".join(map(digest, files)), []
     for got, _ in label_run(files, name, _split):
         for s in got:
-            traced = {**s.provenance, "traces": traces[s.rank, s.step]}
+            at = traces[s.rank, s.step]
+            traced = {**s.provenance, "traces": at, "profiled": run["profiled"]}
             samples.append(dataclasses.replace(s, provenance=traced))
     engine = json.loads((steps / "dp0.engine.json").read_text())
     host = run["host_key"]
     return samples, {
-        **run_fields(run),
+        **fields,
         "engine_config": keyed_of(engine),
         "stack": run["stack"],
         "ptl": run.get("ptl", UNRECORDED),
@@ -131,8 +142,15 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
     }
 
 
-def run_fields(run: dict) -> dict:
-    """The `model`, `device` and `source_root` a run.json's identity states."""
+def run_fields(run: dict, record="run.json") -> dict:
+    """The `model`, `device` and `source_root` a run.json's identity states.
+    A run on a tree with uncommitted files refuses, naming `record`: its
+    source root names the tree's HEAD, which is not the code that ran."""
+    if dirty := run["source"].get("dirty"):
+        raise ValueError(
+            f"{record} ran with {dirty} uncommitted files in its source tree; "
+            "commit them and run again"
+        )
     return {
         "model": run["host_key"]["model"],
         "device": ", ".join(
@@ -161,6 +179,7 @@ def _measurement(store: ArtifactStore, key) -> tuple[Sample, dict]:
             "requests": [],
             "config": None,
             "traces": sorted(m["traces"]),
+            "profiled": False,
         }
         values = key.values
         config = {

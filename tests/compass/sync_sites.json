@@ -222,6 +222,18 @@
    "mechanism_why": "after the finish, so outside the simulated window; the wall bound only turns a missing hand-in into an error naming it"
   },
   {
+   "id": "atom/compass/run/__init__.py::_planned_transfer::time.sleep(0.1)::sleep#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "_planned_transfer",
+   "call": "time.sleep",
+   "expr": "time.sleep(0.1)",
+   "shape": "sleep",
+   "peer": "process",
+   "why": "a prefill-decode engine building its KV connector waits, in tenths of a wall second up to a bound, for every engine's planned KV block file",
+   "mechanism": "K9",
+   "mechanism_why": "at startup, while the engine is built and before its step loop's first clock request, so outside the simulated window; the wall bound only turns a missing block into an error naming the engine"
+  },
+  {
    "id": "atom/compass/runner/overrides.py::_group_step_seconds::torch.distributed.all_gather(rows, mine, group=group)::collective#0",
    "file": "atom/compass/runner/overrides.py",
    "symbol": "_group_step_seconds",
@@ -4266,6 +4278,55 @@
    "mechanism_why": "in the measuring command, which is no LP, before its run starts or after it stops; a GPU command serves no simulated run, so the bound stays real"
   },
   {
+   "id": "atom/compass/drive/identity.py::ptl_changes::threading.Thread(target=watch, daemon=True)::thread_start#0",
+   "file": "atom/compass/drive/identity.py",
+   "symbol": "ptl_changes",
+   "call": "threading.Thread",
+   "expr": "threading.Thread(target=watch, daemon=True)",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "none",
+   "why": "compass record starts a thread that reads its cards' PTL state while its real server serves",
+   "mechanism": "K9",
+   "mechanism_why": "starting a thread cannot park; in `compass record`, which is no LP: it serves a real server on the GPUs it names and refuses a run file and a clock, so no simulated clock reads this"
+  },
+  {
+   "id": "atom/compass/drive/identity.py::ptl_changes.watch::stop.wait(PTL_POLL_S)::event_wait#0",
+   "file": "atom/compass/drive/identity.py",
+   "symbol": "ptl_changes.watch",
+   "call": "stop.wait",
+   "expr": "stop.wait(PTL_POLL_S)",
+   "shape": "event_wait",
+   "peer": "thread",
+   "why": "the record's PTL watch waits a wall second at a time: for server.json to exist, then between its readings of the cards' PTL state while the server serves, until the record stops",
+   "mechanism": "K9",
+   "mechanism_why": "in `compass record`, which is no LP: it serves a real server on the GPUs it names and refuses a run file and a clock, so no simulated clock reads this"
+  },
+  {
+   "id": "atom/compass/drive/identity.py::ptl_changes.watch::stop.wait(PTL_POLL_S)::event_wait#1",
+   "file": "atom/compass/drive/identity.py",
+   "symbol": "ptl_changes.watch",
+   "call": "stop.wait",
+   "expr": "stop.wait(PTL_POLL_S)",
+   "shape": "event_wait",
+   "peer": "thread",
+   "why": "the record's PTL watch waits a wall second at a time: for server.json to exist, then between its readings of the cards' PTL state while the server serves, until the record stops",
+   "mechanism": "K9",
+   "mechanism_why": "in `compass record`, which is no LP: it serves a real server on the GPUs it names and refuses a run file and a clock, so no simulated clock reads this"
+  },
+  {
+   "id": "atom/compass/drive/identity.py::ptl_changes::thread.join()::join#0",
+   "file": "atom/compass/drive/identity.py",
+   "symbol": "ptl_changes",
+   "call": "thread.join",
+   "expr": "thread.join()",
+   "shape": "join",
+   "peer": "thread",
+   "why": "once its server has stopped, the record waits for its PTL watch to take its last reading and end",
+   "mechanism": "K9",
+   "mechanism_why": "in `compass record`, which is no LP: it serves a real server on the GPUs it names and refuses a run file and a clock, so no simulated clock reads this"
+  },
+  {
    "id": "atom/compass/drive/serve.py::serve::subprocess.Popen( argv, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True, )::thread_start#0",
    "file": "atom/compass/drive/serve.py",
    "symbol": "serve",
@@ -4469,6 +4530,18 @@
    "why": "the bench asks every worker to measure one batch's forward and waits for rank 0's reply, the step charged to the slowest rank",
    "mechanism": "K9",
    "mechanism_why": "the bench measures real forwards on a real runner for a measuring command, and no simulated run starts one, so nothing prices this call"
+  },
+  {
+   "id": "atom/compass/bench/engine.py::Bench.exit::time.sleep(serve.POLL_S)::sleep#0",
+   "file": "atom/compass/bench/engine.py",
+   "symbol": "Bench.exit",
+   "call": "time.sleep",
+   "expr": "time.sleep(serve.POLL_S)",
+   "shape": "sleep",
+   "peer": "process",
+   "why": "the bench's stop waits in half seconds, up to a wall bound, for its workers and every process they started to exit, so the measuring command's after-run GPU check does not find them still exiting",
+   "mechanism": "K9",
+   "mechanism_why": "the bench is stopping; it measures real forwards on a real runner for a measuring command, and no simulated run starts one"
   },
   {
    "id": "atom/compass/bench/runner.py::BenchModelRunner.__init__::end.synchronize()::device_sync#0",
@@ -4934,14 +5007,14 @@
    "mechanism_why": "starting a process cannot park; in the measuring command, which is no LP, around a real engine start it makes; a GPU command serves no simulated run, so the bound stays real"
   },
   {
-   "id": "atom/compass/drive/measure_memory.py::main::engine.wait(START_TIMEOUT_S)::event_wait#0",
+   "id": "atom/compass/drive/measure_memory.py::main::engine.wait(serve.POLL_S)::event_wait#0",
    "file": "atom/compass/drive/measure_memory.py",
    "symbol": "main",
    "call": "engine.wait",
-   "expr": "engine.wait(START_TIMEOUT_S)",
+   "expr": "engine.wait(serve.POLL_S)",
    "shape": "event_wait",
    "peer": "process",
-   "why": "compass measure memory waits for the engine it started to start and stop, up to a wall bound past which it kills the engine's session and refuses",
+   "why": "compass measure memory waits for the engine it started to start and stop, one poll interval at a time so a SIGINT or SIGTERM to the command ends the wait, up to a wall bound past which it kills the engine's session and refuses",
    "mechanism": "K9",
    "mechanism_why": "in the measuring command, which is no LP, around a real engine start it makes; a GPU command serves no simulated run, so the bound stays real"
   },

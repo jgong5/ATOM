@@ -188,19 +188,10 @@ def test_the_matrix_is_not_uniform():
     assert not MATRIX[Row.MACHINE_SPEC_CAPACITY][Axis.SOFTWARE_STACK].depends
 
 
-@pytest.mark.parametrize("kind", [Kind.COVERAGE_HULL])
-def test_a_kind_the_matrix_does_not_row_is_refused_by_name(kind):
-    """The key table and the matrix do not hold the same artifacts.
-
-    The tempting default is "depends on nothing", which loads clean forever,
-    and the other is "depends on everything", which re-measures forever. Both
-    answer a question the document did not.
-    """
-    with pytest.raises(ArtifactRefusal) as refused:
-        rows_for(kind)
-    assert refused.value.rule is Rule.INVALIDATED
-    assert f"no dependency row for {kind}" in str(refused.value)
-    assert "do not hold the same artifacts" in str(refused.value)
+@pytest.mark.parametrize("kind", list(Kind))
+def test_every_kind_has_a_dependency_row(kind):
+    """A kind the matrix does not row is refused on every load, so none is."""
+    assert rows_for(kind)
 
 
 def test_a_shape_population_is_rowed_on_source_model_and_engine_config():

@@ -19,12 +19,14 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from test_artifact_invalidation import BASE, STANZA
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_drive_gpu import FREE, _plant
 from test_memory_readings import (
     CONFIG_JSON,
@@ -56,6 +58,7 @@ from atom.compass.artifacts import (
 from atom.compass.drive import gpu, measure_memory, serve
 from atom.compass.drive.gpu import GpuRefusal
 from atom.compass.memory import ModelTerms, device_readings, reserves
+from atom.compass.memory.check import STORAGE
 from atom.compass.memory.readings import MemoryReadings
 from atom.compass.run import memory
 from atom.compass.spec import MachineSpec, SpecRefusal
@@ -156,6 +159,29 @@ def test_the_engine_starts_on_the_hip_device_of_its_rocm_smi_gpu(tmp_path, monke
     assert (tmp_path / "hip").read_text() == "2"
 
 
+def test_the_stop_removes_the_compiled_graph_cache_directory_the_start_used(
+    tmp_path, monkeypatch
+):
+    _, argv = a_start(tmp_path, monkeypatch, STACK)
+    root = tmp_path / "home/.cache/atom"
+    monkeypatch.setattr(serve, "CACHE_ROOT", str(root))
+    used = root / "torch_compile_cache/0123456789/rank_0/backbone"
+    other = root / "torch_compile_cache/9876543210"
+    other.mkdir(parents=True)
+    engine = measure_memory.subprocess.Popen
+
+    def compiling(*args, stdout, **kwargs):
+        used.mkdir(parents=True)
+        stdout.write(f"Using cache directory: {used} for vLLM's torch.compile\n")
+        stdout.flush()
+        return engine(*args, stdout=stdout, **kwargs)
+
+    monkeypatch.setattr(measure_memory.subprocess, "Popen", compiling)
+    measure_memory.main(argv)
+
+    assert not used.parents[1].exists() and other.exists()
+
+
 def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypatch):
     r, argv = a_start(tmp_path, monkeypatch, STACK)
 
@@ -176,16 +202,21 @@ def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(
-    "gpus, cards",
+    "gpus, asked, cards",
     [
-        ("5", [dict(MI355X, name="MI308X", arch="gfx942")]),
-        ("4,5", [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")]),
+        ("5", (5,), [dict(MI355X, name="MI308X", arch="gfx942")]),
+        (
+            "4,5",
+            (4, 5),
+            [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")],
+        ),
     ],
 )
 def test_a_start_on_another_device_than_the_spec_states_refuses_naming_both(
-    tmp_path, monkeypatch, gpus, cards
+    tmp_path, monkeypatch, gpus, asked, cards
 ):
-    monkeypatch.setattr(measure_memory, "_device", lambda gpus: cards)
+    # Only the GPUs `--gpu` names have cards; asking about any others raises.
+    monkeypatch.setattr(measure_memory, "_device", {asked: cards}.__getitem__)
     machine = tmp_path / "machine.json"
     machine.write_text(json.dumps(DOCUMENT))
     flags = ["--gpu", gpus, "--machine", str(machine), "--store", str(tmp_path / "s")]
@@ -346,6 +377,79 @@ def test_a_member_that_stays_fails_the_after_check_naming_it(
     assert str(refused.value) == f"{', '.join(on)} after the run, so it fails"
 
 
+def _state(pid) -> str | None:
+    """`pid`'s state letter in /proc, or None once it is reaped."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return None
+
+
+def _until(done, timeout_s=30):
+    for _ in range(int(timeout_s / 0.05)):
+        if done():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"{done} did not hold in {timeout_s} s")
+
+
+@pytest.mark.parametrize(
+    "signals",
+    [(signal.SIGINT, signal.SIGINT), (signal.SIGTERM,)],
+    ids=["a second SIGINT during the stop", "SIGTERM"],
+)
+def test_a_signal_to_the_command_leaves_no_member_of_the_engine_alive(
+    tmp_path, monkeypatch, signals
+):
+    """`main` runs in a forked child, so a signal that ends it ends no test.
+    The engine's group is `GROUP` whose leader stays up and whose members
+    ignore SIGTERM. The first signal lands once both members are up, each next
+    one once the leader has exited, that is, inside the group's stop."""
+    kill = os.killpg
+    _, argv = a_start(tmp_path, monkeypatch, STACK)
+    monkeypatch.setattr(os, "killpg", kill)
+    monkeypatch.setattr(serve, "STOP_GRACE_S", 1)
+    members, leader, ended = (tmp_path / n for n in ("members", "leader", "ended"))
+    group = [sys.executable, "-c", GROUP + "import time\ntime.sleep(600)\n"]
+
+    def popen(command, **kwargs):
+        engine = subprocess.Popen([*group, str(members), "stays"], **kwargs)
+        leader.write_text(str(engine.pid))
+        return engine
+
+    monkeypatch.setattr(measure_memory.subprocess, "Popen", popen)
+    child = os.fork()
+    if child == 0:
+        try:
+            measure_memory.main(argv)
+            ended.write_text("published")
+        except (ValueError, KeyboardInterrupt) as e:
+            ended.write_text(repr(e))
+        finally:
+            os._exit(0)
+    try:
+        _until(lambda: leader.exists() and members.exists() and members.read_text())
+        for i, sig in enumerate(signals):
+            if i:
+                _until(lambda: _state(leader.read_text()) in (None, "Z"))
+            os.kill(child, sig)
+        status = os.waitpid(child, 0)[1]
+        left = [p for p in members.read_text().split() if _state(p) not in (None, "Z")]
+    finally:
+        with contextlib.suppress(ProcessLookupError, ChildProcessError):
+            os.kill(child, signal.SIGKILL)
+            os.waitpid(child, 0)
+        with contextlib.suppress(ProcessLookupError, FileNotFoundError, ValueError):
+            kill(int(leader.read_text()), signal.SIGKILL)
+
+    assert left == []
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert ended.read_text() == repr(
+        ValueError(f"{signals[0].name} stopped the command; nothing is published")
+    )
+    assert not (tmp_path / "s").exists()
+
+
 def starts_autotuning(monkeypatch, r, out, autotuned, field="autotuned_kernels"):
     """Engine starts that write each rank's file with the next count in
     `autotuned` under `field`, kernels inductor autotuned unless named, and
@@ -445,7 +549,7 @@ def test_the_reading_runner_writes_its_starts_fx_graph_cache_misses(
     runner = reading_runner(monkeypatch, object).MemoryReadingModelRunner()
     runner.config, runner.rank = tp2(tmp_path).config, 0
     runner._read = dict.fromkeys(
-        ["total", "non_torch", "loaded", "weights", "current", "peak"], 0
+        ["total", "non_torch", "loaded", "weights", "parameters", "current", "peak"], 0
     ) | {"warmup_tokens": 0, "num_kvcache_blocks": 1}
     monkeypatch.setenv(measure_memory.OUT_ENV, str(tmp_path))
     monkeypatch.setitem(counters["inductor"], "fxgraph_cache_miss", 40)
@@ -454,6 +558,40 @@ def test_the_reading_runner_writes_its_starts_fx_graph_cache_misses(
 
     (written,) = tmp_path.glob("readings.*.json")
     assert json.loads(written.read_text())["fxgraph_cache_misses"] == 40
+
+
+def test_the_reading_runner_writes_its_parameter_and_buffer_storages_apart(
+    tmp_path, monkeypatch
+):
+    def storage(ptr, nbytes, cuda=True):
+        held = SimpleNamespace(data_ptr=lambda: ptr, nbytes=lambda: nbytes)
+        return SimpleNamespace(is_cuda=cuda, untyped_storage=lambda: held)
+
+    class ModelRunner:
+        def _build_and_load_model(self, model_class):
+            # A tied head is the embedding's storage, and so is a buffer
+            # that shares it; a host buffer holds no device bytes.
+            embedding = storage(1, 100)
+            self.model = SimpleNamespace(
+                parameters=lambda: [embedding, storage(2, 50), embedding],
+                buffers=lambda: [embedding, storage(3, 7), storage(4, 9, cuda=False)],
+            )
+
+    module = reading_runner(monkeypatch, ModelRunner)
+    monkeypatch.setattr(module, "_allocated", {"current": 1_000}.get)
+    runner = module.MemoryReadingModelRunner()
+    runner.config, runner.rank = tp2(tmp_path).config, 0
+    runner._build_and_load_model(None)
+    runner._read |= dict.fromkeys(["total", "non_torch", "current", "peak"], 1_000)
+    runner._read |= {"warmup_tokens": 0, "num_kvcache_blocks": 1}
+    monkeypatch.setenv(measure_memory.OUT_ENV, str(tmp_path))
+
+    runner._write(None)
+
+    (written,) = tmp_path.glob("readings.*.json")
+    held = json.loads(written.read_text())
+    assert held[STORAGE] == {"weights": 150, "buffers": 7}
+    assert held["readings"]["allocator_retained_after_load_bytes"] == 1_000 - 157
 
 
 def test_the_reading_runner_warms_up_once_as_a_serving_start_does(monkeypatch):
@@ -675,7 +813,7 @@ def test_the_mi308x_entry_gives_the_readings_its_spec_gave():
     spec = MachineSpec.from_mapping(json.loads(path.read_text()))
     entry = MemoryReadings.from_member(MI308X_READINGS, "memory_readings mi308x")
     model = ModelTerms.from_tree(
-        meta_tree(54_713_457_120), activations=entry.activations(16_384)
+        meta_tree(54_713_457_120), activations=entry.activations()
     )
     readings = device_readings(
         spec,

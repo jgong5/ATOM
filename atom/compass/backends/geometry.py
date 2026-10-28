@@ -79,6 +79,15 @@ _PAGED_LAYER_KINDS = frozenset({"full_attention"})
 # instead. A block costs nothing for them.
 _UNCACHED_LAYER_KINDS = frozenset({"linear_attention", "mamba", "recurrent"})
 
+# Fields that give a model a cache other than one key and one value per KV
+# head: MLA's latent, DeepSeek-V4's compressed cache, an indexer's keys.
+_UNSIZED_CACHE_FIELDS = (
+    "kv_lora_rank",
+    "compress_ratios",
+    "index_head_dim",
+    "sparse_attention_config",
+)
+
 # Fields ATOM reads to recognise a stack whose layers are not all alike. One
 # of these on a config that names no layer kinds means the kinds are missing,
 # not that the stack is uniform.
@@ -245,7 +254,8 @@ class KvGeometry:
         layer_range: tuple[int, int] | None = None,
         kv_dtype=None,
     ) -> KvGeometry:
-        """Read the shape off a HF config, sharded for one worker.
+        """Read the shape off a HF config, sharded for one worker; a config
+        stating a cache this geometry does not size is refused, naming it.
 
         `layer_range` is the half-open span of layers this pipeline stage
         holds, as ATOM's own partitioner returns it. It is required once there
@@ -255,6 +265,12 @@ class KvGeometry:
         """
         parallelism = Parallelism() if parallelism is None else parallelism
         text = getattr(hf_config, "text_config", hf_config)
+        if unsized := [f for f in _UNSIZED_CACHE_FIELDS if getattr(text, f, None)]:
+            model = getattr(hf_config, "architectures", None) or [text.model_type]
+            raise ValueError(
+                f"{model[0]} states {', '.join(unsized)}: its KV cache is not one "
+                "key and one value per KV head, the only cache this geometry sizes"
+            )
         total = int(text.num_hidden_layers)
         if layer_range is None:
             if parallelism.pp_size > 1:

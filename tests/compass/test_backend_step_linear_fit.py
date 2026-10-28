@@ -102,8 +102,9 @@ def traced(line: dict) -> dict:
     busy = {"b_target_ns": line.get("d_target_ns", line["d_busy_ns"])}
     if "d_target_ns" in line:
         busy["b_draft_ns"] = line["d_busy_ns"] - line["d_target_ns"]
-    if "d_propose_ns" in line:
-        busy["b_propose_ns"] = line["d_propose_ns"]
+    for key in ("d_propose_ns", "d_draft_kv_ns"):
+        if key in line:
+            busy["b" + key[1:]] = line[key]
     return {**line, **busy}
 
 
@@ -1052,6 +1053,23 @@ def test_the_command_refuses_records_without_one_engine_config_naming_the_field(
     assert not (tmp_path / "law.json").exists()
 
 
+@pytest.mark.parametrize("stated", [False, True], ids=["beside", "--engine"])
+def test_the_command_refuses_a_record_at_decode_context_parallel_width_by_name(
+    tmp_path, stated
+):
+    record = _record(tmp_path / "dp0.jsonl", _steps(6))
+    _engine_file(record, ENGINE | {"decode_context_parallel_size": 2})
+    (tmp_path / "engine.json").write_text(json.dumps(ENGINE))
+    engine = ["--engine", str(tmp_path / "engine.json")] if stated else []
+    where = str(record.with_suffix(".engine.json")) if stated else "the records'"
+    with pytest.raises(ValueError, match=re.escape(where)) as refused:
+        main([str(record), "--out", str(tmp_path / "law.json"), *SPEC, *engine])
+    assert "states decode_context_parallel_size 2, and a step linear law" in str(
+        refused.value
+    )
+    assert not (tmp_path / "law.json").exists()
+
+
 @pytest.mark.parametrize(
     "spelling",
     ["{out}/steps/dp0.jsonl", "dp0.jsonl", "{tmp}/elsewhere/link/dp0.jsonl"],
@@ -1072,7 +1090,7 @@ def test_the_command_refuses_a_record_whose_server_built_an_aiter_module(
     args = [record, "--out", str(tmp_path / "law.json"), *SPEC]
 
     (tmp_path / "out/run.json").write_text(json.dumps({BUILDS: ["mha_varlen_fwd"]}))
-    named = f"{record} is not fitted: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    named = f"{record} is not fitted: its server ran a JIT compile of ['mha_varlen_fwd'] while"
     with pytest.raises(ValueError, match=re.escape(named)):
         main(args)
     assert not (steps / "dp0.cost.jsonl").exists()

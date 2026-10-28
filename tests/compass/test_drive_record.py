@@ -18,9 +18,10 @@ import sys
 
 import pytest
 from test_drive_gpu import FREE, SHOWHW
-from test_drive_identity import CARD, GIT, _checkout, _git
+from test_drive_identity import CARD, GIT, _checkout, _git, read_marked
 from test_fit_samples import HOST, RUNS, edit
 from test_fit_samples import record as planted_out
+from test_fit_steps import fit
 from test_parity_record import BLOCK, BUDGET, LADDER
 from test_parity_served import recorded
 from test_validate_runs import _aiter
@@ -127,15 +128,6 @@ def test_dp_ranks_resolving_different_engines_refuse_the_entry(tmp_path, monkeyp
     with pytest.raises(ValueError, match=refusal):
         record.write_engine_and_costs(out)
     assert "engine" not in json.loads((out / "run.json").read_text())
-
-
-def test_dp_ranks_resolving_different_engines_keep_their_cost_lines(
-    tmp_path, monkeypatch
-):
-    out = _two_ranks(tmp_path, monkeypatch, 4000, max_num_seqs=4)
-
-    with pytest.raises(ValueError, match="resolved different engines"):
-        record.write_engine_and_costs(out)
     for r in (0, 1):
         rows = label(out / f"steps/dp{r}.jsonl")[1]
         assert rows
@@ -270,36 +262,42 @@ def test_a_record_s_out_directory_loads_through_the_fit_s_loader(tmp_path, plant
     ) == ("MI308X gfx942", 1, 1, aiter)
 
 
-#: Put before the planted server: the value its environment holds for Triton's
-#: autotune cache, written where ``PLANTED_SEEN`` points.
+#: Put before the planted server: the values its environment holds for Triton's
+#: autotune cache and its directory, written where ``PLANTED_SEEN`` points.
 SEES = """\
 import os
-seen = repr(os.environ.get("TRITON_CACHE_AUTOTUNING"))
+seen = repr([os.environ.get(k) for k in ("TRITON_CACHE_AUTOTUNING", "TRITON_CACHE_DIR")])
 open(os.environ["PLANTED_SEEN"], "w").write(seen)
 """
 
 
 @pytest.mark.skipif(GIT is None, reason="needs git")
-@pytest.mark.parametrize("caller, held", [(None, "1"), ("0", "0")])
+@pytest.mark.parametrize("caller", [(None, None), ("0", "/caller/cache")])
 def test_a_record_s_server_keeps_triton_s_autotune_choices_unless_the_caller_says(
-    tmp_path, planted_gpu, monkeypatch, caller, held
+    tmp_path, planted_gpu, monkeypatch, caller
 ):
     """The named result: the server's environment holds
-    TRITON_CACHE_AUTOTUNING=1, or the caller's value, which run.json states."""
+    TRITON_CACHE_AUTOTUNING=1 and the TRITON_CACHE_DIR Triton resolves, or the
+    caller's values, which run.json states."""
     server = tmp_path / "server.py"
     server.write_text(SEES + server.read_text())
     monkeypatch.setenv("PLANTED_SEEN", str(tmp_path / "seen"))
-    if caller is None:
-        monkeypatch.delenv("TRITON_CACHE_AUTOTUNING", raising=False)
-    else:
-        monkeypatch.setenv("TRITON_CACHE_AUTOTUNING", caller)
+    monkeypatch.setenv("TRITON_HOME", str(tmp_path / "home"))
+    names = ("TRITON_CACHE_AUTOTUNING", "TRITON_CACHE_DIR")
+    for name, value in zip(names, caller):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    held = ["1", str(tmp_path / "home" / ".triton" / "cache")]
+    held = [c or h for c, h in zip(caller, held)]
     out = tmp_path / "out"
     cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
 
     assert (tmp_path / "seen").read_text() == repr(held)
     run = json.loads((out / "run.json").read_text())
-    assert run["env"] == {"TRITON_CACHE_AUTOTUNING": held}
-    assert os.environ.get("TRITON_CACHE_AUTOTUNING") == caller
+    assert run["env"] == dict(zip(names, held))
+    assert [os.environ.get(name) for name in names] == list(caller)
 
 
 @pytest.mark.skipif(GIT is None, reason="needs git")
@@ -370,3 +368,100 @@ def test_a_record_names_each_aiter_module_its_server_built_while_it_served(
 
     run = json.loads((out / "run.json").read_text())
     assert run[aiter_jit.BUILDS] == ["mha_x", "mha_y", "pa_x"]
+
+
+@pytest.mark.skipif(GIT is None, reason="needs git")
+@pytest.mark.parametrize(
+    "written, names",
+    [
+        (
+            "inductor/triton/0/K3/triton_poi_fused_add_0.hsaco",
+            ["triton_poi_fused_add_0"],
+        ),
+        ("triton/K4/__grp___pa_decode.json", ["_pa_decode"]),
+        (
+            "home/.cache/atom/torch_compile_cache/c/rank_0/triton_cache/K5/_fwd.hsaco",
+            [],
+        ),
+        ("site/aiter/jit/flydsl_cache/launch_gemm1_c5/01b8.pkl", ["launch_gemm1_c5"]),
+        ("aiter_root/build/gfx942/pa_decode_16_1.hsaco", ["pa_decode_16_1"]),
+    ],
+    ids=["inductor", "triton", "atom", "flydsl", "hsaco"],
+)
+def test_a_record_names_each_compile_its_server_ran_while_it_served(
+    tmp_path, planted_gpu, monkeypatch, written, names
+):
+    """In Inductor's cache, Triton's, FlyDSL's under the installed aiter's JIT
+    directory, and `compile_hsaco`'s under ``AITER_ROOT_DIR``'s build
+    directory, named by its kernel or file; the record is refused naming it.
+    Not one in ATOM's compile cache, a directory every start derives afresh."""
+    _aiter(tmp_path, monkeypatch)
+    for var, root in (
+        ("AITER_ROOT_DIR", "aiter_root"),
+        ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+        ("TRITON_CACHE_DIR", "triton"),
+    ):
+        monkeypatch.setenv(var, str(tmp_path / root))
+    monkeypatch.delenv("FLYDSL_RUNTIME_CACHE_DIR", raising=False)
+    monkeypatch.setenv("PLANTED_START", str(tmp_path / "start" / "inert"))
+    monkeypatch.setenv("PLANTED_BUILT", str(tmp_path / written))
+    server = tmp_path / "server.py"
+    server.write_text(BUILDS + server.read_text() + SERVING)
+    out = tmp_path / "out"
+    cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
+
+    run = json.loads((out / "run.json").read_text())
+    assert run.get(aiter_jit.BUILDS, []) == names
+    if names:
+        assert f"JIT compile of {names}" in aiter_jit.refusal(run)
+
+
+#: Put after the planted server: once `compass record` has read its card's PTL
+#: state while it serves (``PLANTED_READ``), PTL is disabled on that card.
+FLIPS = """
+import os, pathlib, time
+for _ in range(600):
+    if os.path.exists(os.environ["PLANTED_READ"]):
+        break
+    time.sleep(0.05)
+pathlib.Path(os.environ["PLANTED_PTL"]).write_text("disabled\\n")
+"""
+
+
+@pytest.mark.skipif(GIT is None, reason="needs git")
+def test_a_record_whose_card_flips_ptl_while_it_serves_is_refused_by_both_fits(
+    tmp_path, planted_gpu, monkeypatch
+):
+    """The named result: run.json names the change, and both fits refuse it."""
+    enable = tmp_path / "pci" / CARD["PCI Bus"].lower() / "ptl" / "ptl_enable"
+    enable.parent.mkdir(parents=True)
+    enable.write_text("enabled\n")
+    monkeypatch.setenv("PLANTED_PTL", str(enable))
+    monkeypatch.setenv("PLANTED_READ", str(tmp_path / "read"))
+    monkeypatch.setattr(identity, "PTL_POLL_S", 0.01)
+    read_marked(monkeypatch, tmp_path / "read")
+    server = tmp_path / "server.py"
+    server.write_text(server.read_text() + FLIPS)
+    out = tmp_path / "record"
+    cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
+
+    run = json.loads((out / "run.json").read_text())
+    [change] = run[identity.PTL_CHANGES]
+    assert (change["from"], change["to"], run["ptl"]) == (
+        "enabled",
+        "disabled",
+        "disabled",
+    )
+    clients = []
+    for k, requests in enumerate(RUNS):
+        export = tmp_path / f"client{k}.json"
+        export.write_text(json.dumps({"requests": requests}))
+        clients += ["--client-run", out, export]
+    for command in ("fit steps", "fit host"):
+        backend = ["--backend", "step-linear"] if command == "fit steps" else []
+        with pytest.raises(SystemExit) as refused:
+            fit(tmp_path, command, *backend, out, *clients)
+        assert str(refused.value) == (
+            f"compass {command}: {out} is not fitted: its cards' PTL state changed "
+            f"while it served, enabled to disabled at {change['at']}"
+        )

@@ -25,7 +25,9 @@ handling one released frame is one job, from `LPRuntime.handed_over` to its
 next `LPRuntime.back_at_wait_point`, charged by the `wrap_decode` calls it
 makes. Callbacks it posts with ``call_soon_threadsafe`` run at its completion.
 A `wrap_encode` or `wrap_decode` call on the event loop thread, such as the
-final decode of a non-streaming completion, advances the LP clock instead.
+final decode of a non-streaming completion, advances the LP clock instead, once
+every open service job is placed: a job's result due inside the call runs when
+it ends, whatever wall time the job's thread takes.
 
 `CompassEventLoop` is the frontend's event loop in a simulated run: its
 ``time()`` is the installed `LPRuntime`'s clock, so every timer is on LP time,
@@ -36,12 +38,12 @@ earliest daemon timer (`DAEMON_TIMERS`) as ``t_daemon``. While a released
 request is unread or a station job is open it only waits on its sockets, and
 warns once, naming what it waits for, if no socket event ends that wait within
 ``diag_s`` wall seconds. Its select returns nothing only once ``time()`` has
-reached the caller's timeout. The ``+inf`` grant ends the run: from then on
-``time()`` runs on from the run's last LP time at wall rate. A uvicorn server
-on the loop is asked to exit, as a signal would ask it, and shuts down with
-nothing pending; with none, the loop cancels its timers and stops. Over a
-clock connection with a socket, it waits for the grant and its own sockets at
-once, so HTTP that reaches a frontend already in its run without a stamp, such
+reached the caller's timeout, or once it ends `SimExecutor.placed`'s wait. The
+``+inf`` grant ends the run: from then on ``time()`` runs on from the run's last
+LP time at wall rate. A uvicorn server on the loop is asked to exit, as a signal
+would ask it, and shuts down with nothing pending; with none, the loop cancels
+its timers and stops. Over a clock connection with a socket, it waits for the
+grant and its own sockets at once, so HTTP that reaches a frontend already in its run without a stamp, such
 as atomesh's worker registration at startup, is served while the grant is out.
 A timer such a request sets earlier than the time asked for fires at the grant;
 a daemon one, such as uvicorn's keep-alive timeout, keeps the run alive no more
@@ -62,8 +64,10 @@ import asyncio
 import collections
 import heapq
 import itertools
+import json
 import logging
 import math
+import queue
 import select
 import selectors
 import signal
@@ -132,6 +136,8 @@ class Station:
                     self.final,
                     self.diag_s,
                 )
+                if (rt := clock.installed()) is not None:
+                    rt.diagnostics += 1
                 self.cv.wait_for(lambda: self.final >= k)
             s = self.jobs[k][3]
             return max(self.jobs[k][0], self.free[0]) if s is None else s
@@ -189,18 +195,17 @@ class SimExecutor(ThreadPoolExecutor):
         self.passthrough = 0  # wait jobs in flight
         self.refusals: list[str] = []  # run-summary reasons, ``executor:<name>``
         self.settle: dict[int, partial | None] = {}  # finished, not yet placed
+        self.done = queue.SimpleQueue()  # (k, settle) from the serving thread
         self.serial = ThreadPoolExecutor(1)  # service jobs, in submission order
         self.placing: asyncio.Future | None = None  # `placed`'s wait
 
     async def placed(self) -> None:
-        """On the loop: until every service job submitted so far is placed, and
-        then until the callbacks due by the LP clock now have run."""
-        while self.station is not None and self.station.unresolved():
-            self.placing = self.loop.create_future()
-            await self.placing
-        due = self.loop.create_future()
-        self.loop.call_at(self.loop.time(), due.set_result, None)
-        await due
+        """On the loop: until the loop is idle at the LP clock now, every service
+        job submitted by then placed and nothing else due by now left to run, so
+        whatever else runs at this instant has run, however its awaits fell
+        against the wall (`CompassSelector.select` ends the wait)."""
+        self.placing = self.loop.create_future()
+        await self.placing
 
     def shutdown(self, wait=True, *, cancel_futures=False):
         self.serial.shutdown(wait, cancel_futures=cancel_futures)
@@ -239,32 +244,55 @@ class SimExecutor(ThreadPoolExecutor):
                 settle = partial(out.set_exception, e)
             finally:
                 job.cur = None
-        self.loop.call_soon_threadsafe(self._finish, k, settle)
+        self.done.put((k, settle))
+        self.loop.call_soon_threadsafe(self.place)
 
-    def _finish(self, k: int, settle) -> None:
-        # On the loop thread, so a placed job's timer is set before the loop's
-        # next select can see the station resolved and advance the clock.
-        self.settle[k] = settle
-        for j in self.station.finish(k):
-            done = self.settle.pop(j)
-            if done is not None:
-                self.loop.call_at(self.station.completion(j), done)
-        if self.placing is not None and not self.station.unresolved():
-            if not self.placing.done():
-                self.placing.set_result(None)
-            self.placing = None
+    def place(self, wait: bool = False) -> None:
+        """On the loop thread: place the jobs whose threads are done, so a placed
+        job's timer is set before the clock moves; with `wait`, until none is
+        open, warning for a job whose thread takes ``diag_s`` wall seconds."""
+        while (wait and self.station.unresolved()) or not self.done.empty():
+            try:
+                k, settle = self.done.get(timeout=self.station.diag_s if wait else None)
+            except queue.Empty:
+                logger.warning(
+                    "an event-loop charge waits for station job %d, open after "
+                    "%s wall seconds; still waiting",
+                    self.station.final,
+                    self.station.diag_s,
+                )
+                clock.installed().diagnostics += 1
+                k, settle = self.done.get()
+            self.settle[k] = settle
+            for j in self.station.finish(k):
+                done = self.settle.pop(j)
+                if done is not None:
+                    self.loop.call_at(self.station.completion(j), done)
+
+    def idle(self) -> bool:
+        """The loop is idle at the LP clock now: end `placed`'s wait, if there
+        is one and every service job is placed; returns whether it ended one."""
+        if self.placing is None or self.station.unresolved():
+            return False
+        placing, self.placing = self.placing, None
+        if not placing.done():
+            placing.set_result(None)
+        return True
 
 
 def charge(d: float) -> None:
     """Charge `d` to this thread's station job; with none open, in the run, the
     caller is the clock owner and advances the LP clock by `d` (`advance_to`
-    refuses any other thread)."""
+    refuses any other thread), on an event loop only once every open service
+    job is placed, so one that completes inside the charge is not late."""
     cur = getattr(job, "cur", None)
     if cur is not None:
         cur[0].charge(cur[1], d)
         return
     rt = clock.installed()
     if rt is not None and rt.in_run:
+        if rt.loop is not None and rt.loop.executor.station is not None:
+            rt.loop.executor.place(wait=True)
         rt.advance_to(rt.now + d)
 
 
@@ -507,6 +535,9 @@ class CompassSelector(selectors.DefaultSelector):
             ready = super().select(0)
             if ready or loop.time() >= deadline:
                 return ready
+            # A positive timeout: nothing is ready or due, the loop is idle now.
+            if loop.executor.idle():
+                return ready
             if rt.inline_pending() or station.unresolved():
                 # The LP clock stands still here: only an fd event ends the wait.
                 unread = loop.unread()
@@ -534,6 +565,7 @@ class CompassSelector(selectors.DefaultSelector):
                         rt.diag_s,
                         what,
                     )
+                    rt.diagnostics += 1
                     self.stall = (what, None)
                 continue
             self.stall = None
@@ -568,11 +600,19 @@ class CompassSelector(selectors.DefaultSelector):
         return True
 
 
+#: The API server's endpoints that hand a request to the engine.
+GENERATION_PATHS = frozenset(
+    ("/v1/completions", "/v1/chat/completions", "/v1/messages", "/v1/responses")
+)
+
+
 class HttpChannel:
     """ASGI middleware: the frontend's inline receive of HTTP requests.
 
     `stamp(scope)` is a request's ``(arrival, seq)`` read from its carrier, or
-    ``None`` for one sent outside the run, which passes straight through. A
+    ``None`` for one sent outside the run, which passes straight through, except
+    to a `GENERATION_PATHS` endpoint during the run: that one is answered 400,
+    naming it, and is a run-summary reason ``http:unstamped <method> <path>``. A
     stamped request waits until it is released and every released request has
     been read; released requests are handed on in ``(arrival, seq)`` order and
     count as handled once their body has been received. The app gets the
@@ -591,11 +631,11 @@ class HttpChannel:
 
     Taking in a stamped request other than a cancel costs the event loop
     ``fixed_s + body bytes x per_byte_s`` (`atom.compass.run.http_intake`),
-    charged on the loop once its body is read, every open tokenizer station job
-    is placed and the callbacks due by then have run (`SimExecutor.placed`), so
-    a burst reaches the app one request at a time. A request that arrives once
-    the last intake has ended is charged ``idle_s`` in place of ``fixed_s``. A
-    run file with no machine spec charges nothing.
+    charged on the loop once its body is read and the loop is idle at that
+    instant, every tokenizer station job placed and all else due by then run
+    (`SimExecutor.placed`), so a burst reaches the app one request at a time.
+    A request that arrives once the last intake has ended is charged ``idle_s``
+    in place of ``fixed_s``. A run file with no machine spec charges nothing.
     """
 
     def __init__(self, app, stamp) -> None:
@@ -620,6 +660,14 @@ class HttpChannel:
             got = relay_stamp(body)
         else:
             got = self.stamp(scope) if scope["type"] == "http" else None
+        if (
+            got is None
+            and rt is not None
+            and rt.in_run
+            and scope["type"] == "http"
+            and scope["path"] in GENERATION_PATHS
+        ):
+            return await _refuse_unstamped(rt, scope["method"], scope["path"], send)
         if got is not None:
             loop = asyncio.get_running_loop()
             if not isinstance(loop, CompassEventLoop):
@@ -647,8 +695,8 @@ class HttpChannel:
                 cancelled = cancel_seq(body[0].get("body", b""))
                 if self.intake is not None and cancelled is None:
                     # The clock may not pass a station job's completion before
-                    # the job is placed; the intake is charged once every open
-                    # one is, and those due by now have run.
+                    # the job is placed, nor this instant before the requests
+                    # handed on before this one have gone as far as they can.
                     await loop.executor.placed()
                     fixed, per_byte, idle = self.intake
                     if arrival >= self.intake_end:
@@ -680,6 +728,26 @@ class HttpChannel:
         finally:
             if hangup is not None:
                 del self.hangups[seq]
+
+
+async def _refuse_unstamped(rt, method: str, path: str, send) -> None:
+    """Answer an unstamped generation request 400 and record why for the run summary."""
+    why = f"unstamped {method} {path}"
+    rt.refusals.append(f"http:{why}")
+    message = (
+        f"{rt.me}: {method} {path} carries no Compass stamp during a simulated "
+        "run, so no time can be given to it; send it through the run's traffic "
+        "LP (aiperf with compass_harness), which stamps every request"
+    )
+    body = json.dumps({"error": {"type": "invalid_request_error", "message": message}})
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 400,
+            "headers": [(b"content-type", b"application/json")],
+        }
+    )
+    await send({"type": "http.response.body", "body": body.encode()})
 
 
 def _relay(channels) -> str | None:

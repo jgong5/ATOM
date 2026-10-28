@@ -346,9 +346,7 @@ def reserved(qwen, total_bytes):
 
 def model_terms(tree=META_8B):
     """`tree`'s model terms, the activations off the TP1 entry."""
-    return ModelTerms.from_tree(
-        tree, activations=measured(1).activations(WARMUP_TOKENS)
-    )
+    return ModelTerms.from_tree(tree, activations=measured(1).activations())
 
 
 def readings_at(spec, qwen, tp_width):
@@ -579,17 +577,14 @@ def test_the_graph_pool_reservation_follows_the_element_size(resident):
     assert reserved(config, 288.0e9).total == GRAPH_POOL_BY_DTYPE[name]
 
 
-def test_the_entry_measures_the_activations_at_its_own_warmup_and_scales_them():
+def test_the_entry_measures_the_activations_at_its_own_warmup():
     # One start reads `peak - current` over its warmup: measured at those
-    # tokens, and the coefficient times another count is an estimate.
-    term = measured(1).activations(WARMUP_TOKENS)
+    # tokens, which are the deployment's, so nothing scales it.
+    term = measured(1).activations()
     assert (term.nbytes, term.method) == (805_306_368, Method.MEASURED)
     assert (
         term.source == f"{SOURCE} activation_bytes over {WARMUP_TOKENS} warmup tokens"
     )
-    half = measured(1).activations(WARMUP_TOKENS // 2)
-    assert (half.nbytes, half.method) == (402_653_184, Method.ESTIMATED)
-    assert not half.validated
 
 
 @pytest.mark.parametrize(
@@ -622,7 +617,7 @@ def test_an_assumed_member_declares_every_term_built_on_it(qwen):
         tp_width=1,
         model=ModelTerms.from_tree(
             META_8B,
-            activations=measured(1, assumed=ASSUMED).activations(WARMUP_TOKENS),
+            activations=measured(1, assumed=ASSUMED).activations(),
         ),
         cudagraph_overhead=reserved(qwen, 288.0e9),
     )

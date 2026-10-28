@@ -29,7 +29,7 @@ from test_runner_non_allocating import REPO
 import atom.utils.distributed.utils as dist_utils
 import atom.utils.forward_context as fc
 from atom.compass.runner import projection
-from atom.utils import get_open_port
+from tests.compass.held_ports import held_ports
 
 DP = 2
 SET_CONTEXT = threading.Lock()  # `set_forward_context` writes one global
@@ -109,7 +109,7 @@ def group(monkeypatch):
         r = runner(None, dp_size=DP, dp_rank=rank)
         r.capture_sizes_np = np.array(ladder, dtype=np.int32)
         r.enforce_eager = False
-        r.drafter = SimpleNamespace(is_block_drafter=False)
+        r.drafter = SimpleNamespace(is_block_drafter=False, mtp_k=1)
         config = SimpleNamespace(
             parallel_config=r.config.parallel_config,
             compilation_config=SimpleNamespace(static_forward_context={}),
@@ -154,8 +154,8 @@ def group(monkeypatch):
             dist_utils.stateless_destroy_torch_distributed_process_group(local.group)
 
     def run(batches, ladder):
-        same = [ladder] * DP, [get_open_port()] * DP
-        with ThreadPoolExecutor(DP) as pool:
+        with held_ports(1) as [port], ThreadPoolExecutor(DP) as pool:
+            same = [ladder] * DP, [port] * DP
             return list(pool.map(on_rank, range(DP), batches, *same))
 
     return run

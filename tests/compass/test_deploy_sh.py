@@ -138,8 +138,10 @@ def planted(tmp_path):
         (bindir / tool).chmod(0o755)
     (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     (tmp_path / "stub.json").write_text(json.dumps(dataclasses.asdict(Coefficients())))
+    # The router stub records every ATOM_COMPASS_* it inherits, so none come
+    # from the caller (the GPU gate sets the slice model's).
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if not k.startswith("ATOM_COMPASS_")},
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "ATOMESH": str(bindir / "atomesh"),
         "PLANTED_ROUTER": str(tmp_path / "router.json"),
@@ -163,10 +165,14 @@ def argv(tmp_path, flags, prefill=PREFILL, router=ROUTER_ARGS):
 
 
 def _until(path: Path, script) -> None:
+    router = path.with_name("router.log")
     for _ in range(600):
         if path.exists():
             return
-        assert script.poll() is None, script.communicate()
+        assert script.poll() is None, (
+            script.communicate(),
+            router.read_text() if router.exists() else "no router.log",
+        )
         time.sleep(0.1)
     pytest.fail(f"no {path}")
 
@@ -394,3 +400,34 @@ def test_bad_arguments_exit_2_before_anything_starts(tmp_path, planted, case, re
     assert refusal in done.stderr
     assert not (tmp_path / "d" / "authority.argv.json").exists()
     assert not (tmp_path / "d" / "run_file.json").exists()
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        ["--prefill", "http://127.0.0.1:9"],
+        ["--decode=http://127.0.0.1:9"],
+        ["--max-concurrent-requests", "8"],
+        ["--rate-limit-tokens-per-second=100"],
+    ],
+    ids=lambda words: words[0].split("=")[0],
+)
+def test_a_simulated_router_refuses_a_worker_more_or_a_limiter_before_anything_starts(
+    tmp_path, planted, words
+):
+    env, flags = planted
+    flag = words[0].split("=")[0]
+
+    done = subprocess.run(
+        argv(tmp_path, flags, router=[*ROUTER_ARGS, *words]),
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert done.returncode == 2, done.stderr
+    assert f"the router's arguments carry {flag}," in done.stderr
+    assert not (tmp_path / "d").exists()

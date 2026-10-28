@@ -9,7 +9,8 @@ the workload the script hashed into the run file.
 
 Skips without a driver (the engine core and the TP1 worker import aiter), and
 without ``ATOM_COMPASS_SLICE_MODEL`` (a model directory holding a config and a
-tokenizer), ``ATOM_COMPASS_CCTRACES`` (a cc-traces ``traces.jsonl``) and
+tokenizer, whose context holds the replayed session's turns, as Qwen3.8-27B's
+does and Qwen3-0.6B's does not), ``ATOM_COMPASS_CCTRACES`` (a cc-traces ``traces.jsonl``) and
 ``COMPASS_HARNESS_PYTHON`` (a Python with agentx-harness 56a0cf70 and
 compass-harness installed).
 
@@ -37,6 +38,8 @@ import pytest
 import torch
 from test_drive_gpu import SHOWHW
 from test_memory_readings import DOCUMENT
+from test_pd_slice import publish_pd_entries
+from test_vertical_slice import publish_entry
 
 from atom.compass import run as compass_run
 from atom.compass.backends.step_stub import Coefficients
@@ -53,10 +56,16 @@ pytestmark = pytest.mark.skipif(
 
 TREE = Path(__file__).resolve().parents[2]
 SCRIPT = TREE / "scripts/compass/cctraces_sim.sh"
+#: What the script runs its servers with where the environment sets neither.
+DEFAULTS = {
+    "SERVER_ARGS": "--enforce-eager --max-model-len 262144",
+    "AITER_LOG_LEVEL": "WARNING",
+}
 
 
 def _template(path: Path, **extra) -> Path:
-    """A run file whose declared tokenizer also covers the model's architecture."""
+    """A run file whose declared tokenizer also covers the model's architecture,
+    and whose store holds the entry of each server the script starts for it."""
     machine = copy.deepcopy(DOCUMENT)
     arch = json.loads((Path(MODEL) / "config.json").read_text())["architectures"][0]
     machine["host"]["tokenizers"][0]["applies_to"].append(arch)
@@ -67,9 +76,16 @@ def _template(path: Path, **extra) -> Path:
         "stream_s": 2.0**-12,
         "step_stub": dataclasses.asdict(Coefficients()),
         "machine": machine,
+        "store": str(path.parent / "store"),
         **extra,
     }
     path.write_text(json.dumps(run))
+    env = DEFAULTS | dict(os.environ)
+    if "kv_write_req_s" in run:
+        publish_pd_entries(run["store"], machine, env)
+    else:
+        argv = ["--model", MODEL, *env["SERVER_ARGS"].split()]
+        publish_entry(run["store"], machine, argv, env)
     return path
 
 
@@ -116,11 +132,19 @@ def test_both_runs_answer_every_request_and_refuse_nothing(cells):
         assert fields["coverage_report"] == "False", result
 
 
-def test_the_step_records_are_byte_identical_and_carry_no_timestamps(cells):
+def _steps(cell: Path) -> list:
+    """The cell's step record, each request named without the response id its
+    server drew at random."""
+    steps = [json.loads(line) for line in (cell / "steps/dp0.jsonl").open()]
+    for step in steps:
+        step["named"] = [named[:2] for named in step["named"]]
+    return steps
+
+
+def test_the_step_records_agree_but_for_response_ids_and_carry_no_timestamps(cells):
     (left, _), (right, _) = cells
-    record = (left / "steps/dp0.jsonl").read_bytes()
-    assert record == (right / "steps/dp0.jsonl").read_bytes()
-    steps = [json.loads(line) for line in record.splitlines()]
+    steps = _steps(left)
+    assert steps == _steps(right)
     assert steps and all("rows" in s and "t_enter_ns" not in s for s in steps)
 
 

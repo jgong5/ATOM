@@ -8,6 +8,7 @@ is read by `parity.read` and priced by `StepLinearBackend.price`.
 
 import json
 import re
+from types import SimpleNamespace
 
 import pytest
 from test_backend_step_linear_fit import traced
@@ -16,6 +17,7 @@ from test_work import SPEC
 
 from atom.compass.backends import (
     CostTerm,
+    Granularity,
     Method,
     Provenance,
     StepGrid,
@@ -24,6 +26,7 @@ from atom.compass.backends import (
 from atom.compass.backends.op_graph import LISTED, OpGraphBackend
 from atom.compass.backends.resolver import CostSource
 from atom.compass.backends.step_grid_residual import Residual
+from atom.compass.backends.step_roofline import StepFallbackBackend
 from atom.compass.drive.aiter_jit import BUILDS
 from atom.compass.validate.cost import cost_accuracy, main
 
@@ -185,6 +188,18 @@ def test_the_command_prints_the_report(tmp_path, capsys):
     assert "holding out step 4 " in out and "law planted" in out
 
 
+def test_the_command_prints_a_refused_row_s_reasons(tmp_path, capsys):
+    # A law with no decode vector refuses the record's ten decode steps.
+    record = _record(tmp_path / "steps", _steps())
+    law = tmp_path / "law.json"
+    law.write_text(json.dumps({**LAW, "decode": {}}))
+    main([str(record), str(law)])
+
+    (line,) = [x for x in capsys.readouterr().out.splitlines() if "refused" in x]
+    assert line.startswith("refused decode rung 1: 10 steps, real ")
+    assert line.endswith('; reasons {"step-linear: no decode vector for rung 1": 10}')
+
+
 def test_a_one_off_slow_step_is_named_warm_mid_record_and_enters_no_total(
     tmp_path, capsys
 ):
@@ -248,6 +263,54 @@ def test_a_leading_slow_step_is_judged_by_the_law_s_scatter_not_the_record_s(
     law = json.loads(json.dumps(LAW))
     law["prefill"]["fit"] = {"centre": 0.0, "mad": 0.01}
     assert [w["step"] for w in cost_accuracy(record, law)["warm"]] == [0]
+
+
+def _grid(wrapped):
+    """`_steps()`'s step grid, bare or the first backend of a fallback."""
+    from test_validate_step_grid import _bundle  # it imports this module
+
+    member = _bundle(_steps())
+    grid = StepGridBackend(StepGrid(member["grid"]), Residual(member["residual"]), "b")
+    if not wrapped:
+        return grid
+    roofline = SimpleNamespace(granularity=Granularity.STEP, describe=lambda: "stub")
+    return StepFallbackBackend(grid, roofline)
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "under a fallback"])
+def test_a_step_grid_grades_a_slow_leading_stretch_its_own_scatter_would_drop(
+    tmp_path, wrapped
+):
+    # Decode steps 10 to 13 ran 3% slow, the next six at their price: the stretch
+    # leads slow by the record's own exact scatter, which no grid fit names warm.
+    steps = _steps()
+    record = _record(tmp_path / "steps", steps, {i: 1.03 for i in range(10, 14)})
+    report = cost_accuracy(record, _grid(wrapped))
+
+    assert report["warm"] == []
+    priced = sum(_price(rows) for rows, _ in steps[10:])
+    real = priced + 0.03 * sum(_price(rows) for rows, _ in steps[10:14])
+    graded = report["graded"]["decode"]
+    assert graded["steps"] == 10
+    assert graded["on_totals"] == pytest.approx(priced / real - 1, rel=1e-6)
+
+    # A step-linear law recording no `fit.mad` drops the same stretch.
+    law = cost_accuracy(record, LAW)
+    assert [w["step"] for w in law["warm"]] == [10, 11, 12, 13]
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "under a fallback"])
+def test_a_step_grid_step_above_the_warm_factor_is_named_warm_leading_or_not(
+    tmp_path, wrapped
+):
+    steps = _steps()
+    record = _record(tmp_path / "steps", steps, {10: 6.0, 15: 6.0})
+    report = cost_accuracy(record, _grid(wrapped))
+
+    assert [w["step"] for w in report["warm"]] == [10, 15]
+    assert report["warm"][0]["real_s"] == pytest.approx(6 * _price(steps[10][0]))
+    assert report["graded"]["decode"]["steps"] == 8
+    assert report["graded"]["decode"]["on_totals"] == pytest.approx(0.0, abs=1e-9)
 
 
 def test_a_law_without_held_out_errors_reports_every_priced_step_unvalidated(tmp_path):
@@ -434,7 +497,7 @@ def test_the_command_refuses_a_record_whose_server_built_an_aiter_module(
     assert "holding out step 4 " in capsys.readouterr().out
 
     (tmp_path / "run.json").write_text(json.dumps({BUILDS: ["mha_varlen_fwd"]}))
-    named = f"{record} is not costed: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    named = f"{record} is not costed: its server ran a JIT compile of ['mha_varlen_fwd'] while"
     with pytest.raises(ValueError, match=re.escape(named)):
         main([str(record), str(law)])
 
@@ -453,7 +516,9 @@ def test_the_command_refuses_the_record_named_from_inside_it_or_by_a_link(
     law.write_text(json.dumps(LAW))
     monkeypatch.chdir(record)
 
-    named = f"{spelling} is not costed: aiter ran a JIT build of ['mha_varlen_fwd']"
+    named = (
+        f"{spelling} is not costed: its server ran a JIT compile of ['mha_varlen_fwd']"
+    )
     with pytest.raises(ValueError, match=re.escape(named)):
         main([spelling, str(law)])
 

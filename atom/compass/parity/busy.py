@@ -6,8 +6,8 @@ profiler on every TP rank, without Python stacks, from before the first
 request to its stop, and each rank wrote ``OUT/trace/rank_<r>/`` one gzipped
 chrome trace. `reduce` writes ``OUT/steps/dp0.busy.jsonl``: per line of the
 record, its ``step`` and ``b_target_ns``, and on an MTP record ``b_draft_ns``
-and, where the line has ``d_propose_ns``, ``b_propose_ns``. `step_labels`
-labels a prefill pass by them.
+and, for each drafter pass `PASSES` names that the line times, its busy time
+under that pass's ``b_`` name. `step_labels` labels a prefill pass by them.
 
 The n-th ``ATOM::forward`` range on each rank is the record's n-th line, its
 ``tokens=`` the line's; the ranks and the record must agree on both. A
@@ -15,7 +15,7 @@ forward's kernels, memcpys and memsets are those whose launch call opens
 between its ``ATOM::run_model`` start and its end. The target's are launched
 before the recorder's `TARGET_DONE` range opens, on a forward with none before
 its first drafter pass, and outside every drafter pass range; the rest are the
-draft's, and those launched inside the ``d_propose_ns`` pass the propose's.
+draft's, and those launched inside a drafter pass's range that pass's too.
 
 A pass's busy time is the union of its kernels' device intervals plus each gap
 before one of them on the forward's device timeline: whole where that kernel's
@@ -50,7 +50,8 @@ RUNTIME = ("cuda_runtime", "cuda_driver")
 COLLECTIVE = re.compile(
     r"cross_device_reduce|allgather|all_gather|all_?reduce|nccl|mono_step_begin"
 )
-PROPOSE = MARK + "d_propose_ns"
+#: The drafter passes a busy line times apart, by their record line field.
+PASSES = ("d_propose_ns", "d_draft_kv_ns")
 #: Characters read from a trace at a time.
 CHUNK = 1 << 24
 _SKIP = re.compile(r"[\s,]*")
@@ -83,7 +84,8 @@ def events(path):
 
 def forwards(path) -> list[dict]:
     """One rank's forwards: each its ``tokens`` and its ``kernels``, each
-    (start, end, launch return, pass, in the propose pass), in start order."""
+    (start, end, launch return, pass, its drafter pass's line field or None),
+    in start order."""
     ranges, runs, marks, launches, kernels = [], [], [], {}, []
     for e in events(path):
         cat, ts = e.get("cat"), e.get("ts")
@@ -123,7 +125,8 @@ def forwards(path) -> list[dict]:
         f = out[i]
         inside = [m[2] for m in f["drafts"] if m[0] <= launch <= m[1]]
         part = "target" if launch < f["end"] and not inside else "draft"
-        f["kernels"].append((start, stop, queued, part, PROPOSE in inside, name))
+        key = next((m[len(MARK) :] for m in inside), None)
+        f["kernels"].append((start, stop, queued, part, key, name))
     for f in out:
         f["kernels"].sort()
     return out
@@ -155,12 +158,12 @@ def _walk(kernels):
     """Per kernel in start order: its passes, the union it adds, and the gap
     before it with whether it was queued when the gap opened."""
     end = None
-    for start, stop, queued, part, propose, _ in kernels:
+    for start, stop, queued, part, key, _ in kernels:
         gap = start - end if end is not None and start > end else 0.0
         was = end is not None and queued is not None and queued <= end
         add = stop - max(start, end) if end is not None else stop - start
         end = stop if end is None else max(end, stop)
-        yield (part, "propose") if propose else (part,), max(add, 0.0), gap, was
+        yield (part, key) if key else (part,), max(add, 0.0), gap, was
 
 
 def busy(fs: list[dict]) -> list[dict]:
@@ -208,13 +211,14 @@ def reduce(out) -> Path:
     for i, s in enumerate(lines):
         got = {
             p: max(r[i].get(p, 0) for r in per_rank)
-            for p in ("target", "draft", "propose")
+            for p in ("target", "draft", *PASSES)
         }
         row = {"step": s["step"], "b_target_ns": got["target"]}
         if "d_target_ns" in s:
             row["b_draft_ns"] = got["draft"]
-        if "d_propose_ns" in s:
-            row["b_propose_ns"] = got["propose"]
+        for key in PASSES:
+            if key in s:
+                row["b" + key[1:]] = got[key]
         rows.append(row)
     path = (out / RECORD).with_suffix(".busy.jsonl")
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))

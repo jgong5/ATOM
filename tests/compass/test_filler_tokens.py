@@ -12,6 +12,7 @@ runner both load it.
 
 import itertools
 import json
+from types import SimpleNamespace
 
 import pytest
 from conftest import MockConfig
@@ -75,12 +76,8 @@ def tokenizer(model_dir):
     return _load_tokenizer(str(model_dir))
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _unpriced():
-    """Reporting is under test here, not the price."""
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(overrides, "_group_step_seconds", lambda *_: 0.0)
-        yield
+# Reporting is under test here, not the price.
+pytestmark = pytest.mark.usefixtures("unpriced")
 
 
 def _stops(tokenizer):
@@ -90,6 +87,9 @@ def _stops(tokenizer):
 
 
 class _Runner(NonAllocatingRunner):
+    # What ATOM's processor sets for a single stage that is no P/D producer.
+    tokenID_processor = SimpleNamespace(is_deferred_out=True)
+
     def __init__(self, config, stream=None):
         self.config = config
         install_cost_backend(self, StepStubBackend())

@@ -16,21 +16,35 @@ from pathlib import Path
 import pytest
 from test_drive_gpu import GPU45, SHOWHW
 
+from atom.compass.artifacts import machine_spec_key
+from atom.compass.runner.pp_send import carrier_models
+from atom.compass.spec import MachineSpec
+
 ROOT = Path(__file__).resolve().parents[2]
 STUB = """#!/bin/bash
+await() { for _ in {1..600}; do [ -e "$1" ] && return; sleep 0.1; done; exit 1; }
 case "$1 $2" in
 "-m atom.entrypoints.openai.api_server")
+    # As a real DP pair's group handshake orders them: rank 1 starts after rank 0,
+    # and rank 0 listens only once rank 1 is up.
+    dp=$STUB_LOG.dp${ATOM_DP_MASTER_PORT-}
+    case "$*" in *"--data-parallel-rank 1"*) await "$dp.0" ;; esac
     echo "$* GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES-} ATOM_NUMA_BIND=${ATOM_NUMA_BIND-}" >> "$STUB_LOG"
     echo "${HIP_VISIBLE_DEVICES-} ${ATOM_DP_MASTER_PORT-}" >> "$STUB_LOG.env"
+    case "$*" in
+    *"--data-parallel-rank 0"*) touch "$dp.0" && await "$dp.1" ;;
+    *"--data-parallel-rank 1"*) touch "$dp.1" ;;
+    esac
     if [ -n "${TREE1_EXITS-}" ]; then
         case "$*" in *"--data-parallel-rank 1"*) exit 1 ;; esac
         exec sleep 60
     fi
     echo "Uvicorn running"
-    case "$*" in *--compass-run*) exit 0 ;; esac
+    # A simulated server's run ends after its traffic.
+    case "$*" in *--compass-run*) await "$STUB_LOG.sent"; exit 0 ;; esac
     exec sleep 60 ;;
 "-m atom.compass.parity.traffic")
-    [ -n "${ATOM_COMPASS_RUN-}" ] && exit 0
+    [ -n "${ATOM_COMPASS_RUN-}" ] && touch "$STUB_LOG.sent" && exit 0
     mkdir -p "$5" && echo '{"sent_ns": [0], "admitted_ns": [2000000]}' > "$5/arrivals.json"
     exit 0 ;;
 "-m atom.compass.parity")
@@ -43,8 +57,9 @@ case "$1 $2" in
     exit "${MEASURE_RC:-0}" ;;
 "-m atom.compass.run")
     echo "$*" >> "$STUB_LOG"
-    exec "$REAL_PYTHON" -c 'import socket, sys
-socket.create_server(("127.0.0.1", int(sys.argv[1].rpartition(":")[2]))).accept()' "$6" ;;
+    "$REAL_PYTHON" -c 'import socket, sys
+socket.create_server(("127.0.0.1", int(sys.argv[1].rpartition(":")[2]))).accept()' "$6"
+    exec sleep "${AUTHORITY_S:-0}" ;;
 esac
 exec "$REAL_PYTHON" "$@"
 """
@@ -74,8 +89,7 @@ def _parity(tmp_path, showhw=SHOWHW, **env):
         REAL_PYTHON=sys.executable,
         STUB_LOG=str(tmp_path / "servers.log"),
         MODEL=str(model),
-        WAIT_S="30",
-        **{"STORE": str(tmp_path / "store")} | env,
+        **{"STORE": str(tmp_path / "store"), "WAIT_S": "30"} | env,
     )
     env = {k: v for k, v in env.items() if v is not None}
     r = subprocess.run(
@@ -151,6 +165,12 @@ def test_dp_two_trees_stops_once_the_worker_tree_exits(tmp_path):
     r, _, _ = _parity(tmp_path, CONFIG="dp-two-trees", TREE1_EXITS="1")
     assert r.returncode == 1
     assert r.stderr == "parity_one_node: a real server exited\n"
+
+
+def test_dp_two_trees_stops_an_authority_still_up_after_wait_s(tmp_path):
+    r, _, _ = _parity(tmp_path, CONFIG="dp-two-trees", AUTHORITY_S="60", WAIT_S="5")
+    assert r.returncode == 1
+    assert r.stderr == "parity_one_node: the authority is still up\n"
 
 
 def test_dsv4_dpa8_runs_the_nightly_prefill_server_at_eight_ranks(tmp_path):
@@ -282,7 +302,7 @@ def test_rapidserve_measures_a_rapidserve_engine_and_compares_each_engine(tmp_pa
 def test_pp2_runs_two_stages_on_two_gpus_and_compares_each_stage(tmp_path):
     r, servers, run = _parity(tmp_path, CONFIG="pp2", STORE=None)
     assert r.returncode == 0, r.stderr
-    machine = ROOT / "scripts/compass/machines/mi308x-hjbog39.json"
+    machine = ROOT / "scripts/compass/machines/mi308x-hjbog18.json"
     assert f" measure memory --gpu 0,1 --machine {machine} " in servers[0]
     assert len(servers) == 3
     for line in servers:
@@ -290,6 +310,10 @@ def test_pp2_runs_two_stages_on_two_gpus_and_compares_each_stage(tmp_path):
     spec = json.loads(run.read_text())
     assert spec["pipeline_parallel_size"] == 2 and spec["data_parallel_size"] == 1
     assert spec["machine"]["name"] == json.loads(machine.read_text())["name"]
+    # Node 18's cards read PTL enabled, and a stage send is priced on each carrier.
+    stated = MachineSpec.from_mapping(spec["machine"])
+    assert machine_spec_key(stated).values["ptl"] == "enabled"
+    assert set(carrier_models(stated)) == {"rccl", "gloo"}
     compares = (tmp_path / "servers.log.compare").read_text().splitlines()
     assert [c.rsplit(" --stage ", 1)[1] for c in compares] == ["0", "1"]
     assert r.stdout.splitlines()[-2:] == [

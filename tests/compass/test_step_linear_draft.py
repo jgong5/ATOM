@@ -71,7 +71,7 @@ def test_an_mtp_record_fits_a_draft_law_that_prices_each_forward_apart(tmp_path)
         cost = backend.price(_output(rows, rung))
         assert cost.target_seconds == pytest.approx(seconds, rel=1e-5)
         assert cost.draft_seconds == pytest.approx(SHARE * seconds, rel=1e-5)
-        drafts = [t.name for t in cost.terms if t.draft]
+        drafts = [t.name for t in cost.draft_terms]
         assert drafts and all(n.startswith("draft.") for n in drafts)
 
     # A middle chunk's draft is its draft-KV pass, priced by the draft vector.
@@ -170,11 +170,8 @@ class _DeclaredDraft:
     def price(self, view):
         cost = self.law.price(view)
         said = Provenance(Method.DECLARED, note="stated")
-        terms = [
-            dataclasses.replace(t, provenance=said) if t.draft else t
-            for t in cost.terms
-        ]
-        return StepCost(terms, cost.treatments)
+        drafts = [dataclasses.replace(t, provenance=said) for t in cost.draft_terms]
+        return StepCost(cost.terms, cost.treatments, drafts)
 
     def describe(self):
         return "planted, with a declared draft"
@@ -198,8 +195,8 @@ class _DraftDearestWhenCheapest:
     def price(self, view):
         cost = self.law.price(view)
         made = cost.terms[0].provenance
-        draft = CostTerm("draft", 1.0 / cost.target_seconds, made, draft=True)
-        return StepCost([*cost.terms, draft], cost.treatments)
+        draft = CostTerm("draft", 1.0 / cost.target_seconds, made)
+        return StepCost(cost.terms, cost.treatments, [*cost.draft_terms, draft])
 
     def describe(self):
         return "planted, with a draft"
@@ -265,10 +262,10 @@ def test_a_final_chunk_s_propose_pass_and_tail_are_fitted_apart_and_a_middle_chu
     assert final.target_seconds == pytest.approx(middle.target_seconds, rel=1e-6)
     draft_kv = SHARE * middle.target_seconds
     assert middle.draft_seconds == pytest.approx(draft_kv, rel=1e-4)
-    assert not [t for t in middle.terms if "propose" in t.name]
+    assert not [t for t in middle.draft_terms if "propose" in t.name]
     assert [
         t.seconds
-        for t in middle.terms
+        for t in middle.draft_terms
         if t.name in ("draft.prefill.seqs", "draft.prefill.out")
     ] == [0, 0]
     assert final.draft_seconds == pytest.approx(

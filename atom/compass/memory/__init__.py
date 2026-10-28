@@ -29,10 +29,9 @@ call site, because they disagree by 4-19x and only one of them reserves.
 
 **A prediction is held to its gate one term at a time.** `compare` takes a
 breakdown a hardware run printed -- as input data; nothing here runs a model --
-and returns a per-term table with no total in it. The aggregate exists only as
-a `SummedCheck`, which cannot be built without the comparison it summarises,
-because the instrument that reads one figure over a decomposition is the one
-the per-term rule was written to reject.
+and returns a per-term table with no total in it, because the instrument that
+reads one figure over a decomposition is the one the per-term rule was written
+to reject.
 
 **A block count keeps its readings.** ATOM's own arithmetic turns the five into
 one integer, and an integer cannot say how what produced it was obtained.
@@ -49,7 +48,6 @@ from atom.compass.memory.compare import (
     Predicted,
     Recorded,
     Shape,
-    SummedCheck,
     TermComparison,
     TermRefusal,
     Verdict,
@@ -97,7 +95,6 @@ __all__ = [
     "Recorded",
     "Shape",
     "SizedKVPool",
-    "SummedCheck",
     "Term",
     "TermComparison",
     "TermRefusal",

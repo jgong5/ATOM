@@ -13,7 +13,10 @@ can be smaller than the one a batch filled. A worker that dies stops the
 bench, naming the call that got no reply; a device that cannot hold the pool
 stops it naming both counts.
 `measure(batch)` runs `bench_step` on every worker and returns rank 0's reply,
-the window's result (`window.py`). Data parallelism above one, expert
+the window's result (`window.py`). `exit()` stops the workers and returns
+once they and every process they had started have exited, or after
+`serve.STOP_GRACE_S`, so a GPU check after it does not find the bench's own
+processes still exiting. Data parallelism above one, expert
 parallelism and pipeline parallelism refuse.
 
 The manager leaves SIGINT ignored in the process that starts it, as an engine
@@ -26,9 +29,12 @@ the signal, so a command sent one fails as stopped, not as a worker's death.
 
 import contextlib
 import signal
+import time
 
+import psutil
 from torch.distributed import TCPStore
 
+from atom.compass.drive import serve
 from atom.model_engine.async_proc import AsyncIOProcManager
 
 RUNNER = "atom.compass.bench.runner.BenchModelRunner"
@@ -83,8 +89,11 @@ class Bench:
         pc.data_parallel_base_port = self.store.port
         pc._managed_distributed_store = True
         self.still_running = True
+        self.tree: list[psutil.Process] = []
         self.runner_mgr = AsyncIOProcManager(
-            self.exit,
+            # Not `exit`: from the monitor thread, it would race the command's
+            # own call, which then skips the wait the after-check needs.
+            lambda: None,
             config.tp_world_size * config.prefill_context_parallel_size,
             RUNNER,
             config,
@@ -116,6 +125,11 @@ class Bench:
             # pauses would discard repeats.
             with _refuse_a_stop("freeze_gc_heap"):
                 self.runner_mgr.call_func("freeze_gc_heap", wait_out=True)
+            # A dead worker's descendants are no longer its children, and the
+            # manager forgets its workers before the bench learns of the death.
+            # ponytail: one started after this, or by a worker that dies in
+            # the startup calls, is not waited for.
+            self._record()
         except BaseException:
             self.exit()
             raise
@@ -126,10 +140,15 @@ class Bench:
             return self.runner_mgr.call_func("bench_step", batch, wait_out=True)
 
     def exit(self) -> None:
-        """Stop every worker; the manager calls it too, when a worker dies."""
+        """Stop every worker, then wait at most `serve.STOP_GRACE_S` for the
+        workers and every process they started to exit."""
         if not self.still_running:
             return
         self.still_running = False
+        # The manager SIGKILLs a worker that outlasts its grace and joins it,
+        # not the descendants it killed with it (inductor's compile workers),
+        # which can still hold the GPU when the command's after-check reads it.
+        self._record()
         if self.runner_mgr.still_running:
             self.runner_mgr.keep_monitoring = False
             self.runner_mgr.call_func("exit")
@@ -137,3 +156,22 @@ class Bench:
         # Left to the garbage collector at interpreter exit, the broadcast
         # queue's ZMQ context never terminates and the process never exits.
         self.runner_mgr.rpc_broadcast_mq.close()
+        for _ in range(int(serve.STOP_GRACE_S / serve.POLL_S)):
+            if not any(map(_running, self.tree)):
+                return
+            time.sleep(serve.POLL_S)
+
+    def _record(self) -> None:
+        """Add every live worker and its descendants to `tree`."""
+        for worker in self.runner_mgr.procs:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                process = psutil.Process(worker.pid)
+                self.tree += [process, *process.children(recursive=True)]
+
+
+def _running(process: psutil.Process) -> bool:
+    """Whether `process` has not exited; a zombie has."""
+    try:
+        return process.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False

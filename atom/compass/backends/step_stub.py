@@ -30,7 +30,7 @@ The form, declared rather than derived:
 plus one term per collective the deployment's widths make possible. A step
 carrying both kinds of work is priced as both and pays both intercepts, because
 a step that did both launched both. A `draft_step` above 0 adds one
-term tagged `draft` to every step, the speculative drafter's device work after
+drafter term (`draft_terms`) to every step, the speculative drafter's device work after
 the target's; at 0 there is none, and a speculative run refuses each step.
 
 A tensor-parallel all-reduce runs once per layer this worker holds, so its
@@ -76,13 +76,12 @@ be read back as one that did.
 
 from __future__ import annotations
 
-import dataclasses
 import math
 from dataclasses import dataclass, fields
 
 from atom.compass.backends.base import CostBackend, Granularity
 from atom.compass.backends.cost import CostTerm, StepCost
-from atom.compass.backends.geometry import KvGeometry, Parallelism
+from atom.compass.backends.geometry import Parallelism
 from atom.compass.backends.provenance import Method, Provenance
 from atom.compass.backends.shape import (
     BatchView,
@@ -211,30 +210,10 @@ class StepStubBackend(CostBackend):
     each such term carries that qualification in its own provenance rather
     than being charged as a certainty.
 
-    Pricing one needs a layer count, and there are two of them. `stack_layers`
-    is the one the charge is made on: every layer this worker runs, whatever
-    each layer keeps. `geometry` is the KV a block is sized from, whose own
-    `layers` counts only the layers holding a cache of every past token -- the
-    same number on a uniform stack and a quarter of it on a stack that is one
-    paged layer in four. Both are held, neither is derived from the other, and
-    a deployment with a candidate collective and no stack depth is refused: a
-    count taken from the geometry there would be wrong in kind on every hybrid
-    and right by coincidence on everything else.
-
-    **A geometry is not required to price a collective, and that is a
-    loosening of what this constructor used to refuse.** Nothing that computes
-    seconds reads it -- a collective costs the tokens times the stack depth
-    times a declared coefficient, and every other term reads the batch -- so
-    declining for want of a paged count would refuse a price this would then
-    make identically, which is a refusal with nothing behind it. It stays on
-    the constructor because it is the pool declaration a price is paired with
-    where there is one, and `describe()` writes it. What its absence costs is
-    two things, stated here rather than left to be discovered. The check that
-    catches the two counts crossed -- a span shallower than the paged subset
-    inside it -- compares two stated counts, so with one stated there is
-    nothing to cross and it does not run. And `describe()` has one count to
-    write, so it says the paged one was not stated rather than printing a lone
-    number that reads like the whole description of a worker.
+    Pricing one needs a layer count. `stack_layers` is the one the charge is
+    made on: every layer this worker runs, whatever each layer keeps, and not
+    the paged subset a KV geometry counts. A deployment with a candidate
+    collective and no stack depth is refused.
 
     `stage_share` prices one pipeline stage: the stage's share of the stack's
     layers, then of its paged layers. The coefficients are the whole model's;
@@ -248,13 +227,11 @@ class StepStubBackend(CostBackend):
         self,
         coefficients: Coefficients | None = None,
         parallelism: Parallelism | None = None,
-        geometry: KvGeometry | None = None,
         stack_layers: int | None = None,
         stage_share: tuple[float, float] | None = None,
     ) -> None:
         self.coefficients = Coefficients() if coefficients is None else coefficients
         self.parallelism = Parallelism() if parallelism is None else parallelism
-        self.geometry = geometry
         if stage_share is not None and not all(0 <= s <= 1 for s in stage_share):
             raise ValueError(
                 f"stage_share={stage_share} is not a stage's (layer, paged layer) "
@@ -291,20 +268,6 @@ class StepStubBackend(CostBackend):
             raise ValueError(
                 "a worker runs at least one layer, got "
                 f"stack_layers={self.stack_layers}"
-            )
-        # Two counts are what this compares, and a geometry is optional above,
-        # so a deployment that states one count is priced with this check not
-        # run. That is the cost of the geometry being optional and it is named
-        # in the class docstring beside the reason.
-        if (
-            self.stack_layers is not None
-            and geometry is not None
-            and self.stack_layers < geometry.layers
-        ):
-            raise ValueError(
-                f"a {self.stack_layers}-layer span holding {geometry.layers} paged "
-                "layers is not a span: the layers that hold a cache are a subset "
-                "of the layers there are, so the two counts have been crossed"
             )
 
     @property
@@ -384,9 +347,7 @@ class StepStubBackend(CostBackend):
                 ),
             ]
         terms = [self._term(*row) for row in counted]
-        if c.draft_step:
-            draft = self._term("draft.step", 1, c.draft_step)
-            terms.append(dataclasses.replace(draft, draft=True))
+        drafts = [self._term("draft.step", 1, c.draft_step)] if c.draft_step else []
         collectives = self.parallelism.collectives()
         if collectives:
             # The constructor refuses a candidate collective with no depth
@@ -409,7 +370,7 @@ class StepStubBackend(CostBackend):
                         qualifier,
                     )
                 )
-        return StepCost(terms)
+        return StepCost(terms, draft_terms=drafts)
 
     def all_gather_s(self, rows: int) -> float:
         """One TP all-gather of a `rows`-row tensor, as a pipeline stage runs on
@@ -428,16 +389,8 @@ class StepStubBackend(CostBackend):
         if named:
             # The depth belongs in the line because the seconds do not carry
             # it: a collective charged on the paged layers of a hybrid and one
-            # charged on its stack read alike once they are in a total. With
-            # no geometry held there is one count to write, and a lone number
-            # here would read as the worker's whole description, so the line
-            # says which count is missing instead of quietly emitting one.
-            paged = (
-                ", paged count not stated"
-                if self.geometry is None
-                else f", {self.geometry.layers} paged"
-            )
-            named += f" on {self.stack_layers} layers{paged}"
+            # charged on its stack read alike once they are in a total.
+            named += f" on {self.stack_layers} layers"
         else:
             named = "no collectives"
         if self.stage_share is not None:

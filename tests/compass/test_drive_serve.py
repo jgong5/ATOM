@@ -43,6 +43,9 @@ child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
 with open(d + "/child", "w") as f:
     f.write(str(child.pid))
 print("planted server up", flush=True)
+for used in filter(None, os.environ.get("PLANTED_CACHE", "").split(":")):
+    os.makedirs(used)
+    print(f"Using cache directory: {used} for vLLM's torch.compile", flush=True)
 if when == "early":
     sys.exit(int(rc))
 time.sleep(float(os.environ.get("PLANTED_DELAY", "0")))
@@ -146,6 +149,54 @@ def test_a_server_runs_atom_arguments_verbatim_on_its_gpus_between_the_checks(
         "args": [str(engine), "m", str(sys.argv), "(6, 7)"],
         "group running": False,
     }
+
+
+def test_the_stop_removes_the_compiled_graph_cache_directory_its_ranks_used(
+    planted, monkeypatch
+):
+    root = planted / "home/.cache/atom"
+    monkeypatch.setattr(serve, "CACHE_ROOT", str(root))
+    mine = root / "torch_compile_cache/0123456789"
+    other = root / "torch_compile_cache/9876543210"
+    other.mkdir(parents=True)
+    configured = planted / "configured/rank_0/backbone"
+    used = [mine / "rank_0/backbone", mine / "rank_1/backbone", configured]
+    monkeypatch.setenv("PLANTED_CACHE", ":".join(map(str, used)))
+    monkeypatch.setenv("PLANTED_EXIT", "late:0")
+
+    serve.serve(ARGS, planted / "out", (7,))
+
+    assert not mine.exists()
+    assert other.exists() and configured.exists()
+
+
+#: The stop's cache removal in a process of its own: what it imports, then,
+#: after it, the root ATOM's backends module derives its cache directories from.
+DROP_ALONE = """\
+import sys
+from atom.compass.drive import serve
+loaded = set(sys.modules)
+serve.drop_compiled(sys.argv[1])
+assert set(sys.modules) == loaded, sorted(set(sys.modules) - loaded)
+from atom.utils.backends import VLLM_CACHE_ROOT
+assert serve.CACHE_ROOT == VLLM_CACHE_ROOT, (serve.CACHE_ROOT, VLLM_CACHE_ROOT)
+"""
+
+
+def test_the_stop_imports_no_module_and_removes_under_atom_s_cache_root(tmp_path):
+    """No import, so no HIP context in the calling process, which
+    `HIP_VISIBLE_DEVICES` does not narrow and the other side's GPU check sees."""
+    used = tmp_path / ".cache/atom/torch_compile_cache/0123456789/rank_0/backbone"
+    used.mkdir(parents=True)
+    log = tmp_path / serve.LOG_FILE
+    log.write_text(f"Using cache directory: {used} for vLLM's torch.compile\n")
+    env = dict(os.environ, PYTHONPATH=str(TREE), HOME=str(tmp_path))
+    drop = [sys.executable, "-c", DROP_ALONE, str(log)]
+    done = subprocess.run(
+        drop, env=env, capture_output=True, text=True, timeout=300, check=False
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    assert not used.parents[1].exists()
 
 
 def test_a_simulated_server_gets_its_run_file_and_clock_and_no_gpu_check(

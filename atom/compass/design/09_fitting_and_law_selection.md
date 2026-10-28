@@ -182,8 +182,12 @@ host and device clocks to each other. With MTP the label splits at
 `forward_done_event` into target and draft
 ([#829](https://github.com/jgong5/ATOM/issues/829)). A decode's draft-KV pass runs
 before that event, so its target label holds it; the draft law's `draft_kv` vector
-prices it on `[1, seqs]`, untagged as draft, and the target's vectors fit the rest
-([#2080](https://github.com/jgong5/ATOM/issues/2080)).
+prices it on `[1, seqs]` among the target's terms, and the target's vectors fit the rest
+([#2080](https://github.com/jgong5/ATOM/issues/2080)). An output prefill's pass runs
+before it too: its target label holds it, and the draft law's prefill vector, which
+prices a middle chunk's pass as draft, prices it among the target's terms, as the
+draft law's `output_prefill_kv` states; the output prefill's draft label, all after
+the event, fits the `propose` vector ([#2100](https://github.com/jgong5/ATOM/issues/2100)).
 
 **Host laws** price the host segments of `01` D4: `E`, `W_pre`, `W_launch` and
 `W_post`, each linear in `(1, tokens, seqs)`, fitted separately for decode, output
@@ -204,6 +208,12 @@ Under DP, `E` runs from the latest pull over the group before the same forward, 
 D4 places it ([#1893](https://github.com/jgong5/ATOM/issues/1893)).
 They use the step linear law's solver: D53's relative error and MAD drops, D57's report, D58's hull. An
 `E` sample whose gap spans an idle engine is cut as idle and counted apart.
+An output prefill or middle chunk the host did not pace (`step_labels.PACED_SHARE`) whose
+launch ends after its device ran a fifth of its window, placed on the host clock by the lead, waited on the device inside
+the launch: it gives no `W_launch` sample, since the recurrence's `end = max(start + D, launch_end)`
+charges that wait as `D`. On the DeepSeek-V4-Pro DPA8 MI355X records, pooling such launches
+priced a c=1 middle chunk's launch at 1.83 s against 0.13 s measured
+([#2256](https://github.com/jgong5/ATOM/issues/2256)).
 A forward whose `W_launch` its kind's fit drops above the law paid a first-use JIT
 compile, on a decode only past five times its price, since a decode's launch
 of a millisecond or so drops on host noise. It and the forward after it, whose period
@@ -448,7 +458,10 @@ and it is reported rather than hidden. Revised 2026-10-19 by the
 a line whose held-out points show a hidden band (a point that launched other kernels
 than the neighbours it is priced from) or an error over 5% does not interpolate. Its
 measured points still answer; every other query along it goes to the analytical law,
-and the price list names each such line with its reason. Revised 2026-10-20 by the
+and the price list names each such line with its reason. Revised 2026-10-25 by the
+[Ruling on #2107](https://github.com/jgong5/ATOM/pull/2107#issuecomment-6397946907):
+such a point declines only the two gaps beside it, between its neighbours on that line;
+the line's other gaps interpolate. Revised 2026-10-20 by the
 [ruling on #1746](https://github.com/jgong5/ATOM/pull/1746#issuecomment-6293302382):
 a point whose neighbours lie one coordinate below and one above it is not held out,
 because every query between those neighbours is that measured point; decode attention
@@ -464,7 +477,7 @@ Revised 2026-10-23 by the
 [Ruling on #2011](https://github.com/jgong5/ATOM/issues/2011#issuecomment-6365512377):
 an interpolated leaf is `estimated` and validated when, on every line it interpolates
 along, a held-out point was priced from neighbours that bracket it. `fit ops` records each
-such bracket on a line that interpolates; a declined line records none, and a line of two
+such bracket except one of a point that declines its gaps, and a line of two
 points holds no held-out point, so it validates nothing. A prefill whose rows' cached
 tokens differ is priced at their mean, which no held-out point tested, and stays
 unvalidated. An `op.<kind>.price_list` term is validated when each of its estimated
@@ -589,13 +602,13 @@ choice that must be visible.
 | # | Decision | Date |
 |---|---|---|
 | D53 | Fit relative error, not absolute seconds. MAD outlier test on the same relative residuals. | 2026-09-18 |
-| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by alternating max-affine regression. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes cut, and on prefill a trace run's busy time per pass; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait, and `L_mtp`, the status copy's latency), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), are fitted beside it, keyed by host CPU, `atom` digest, model and engine config, with no transfer. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); host-paced prefill cut 2026-10-24 (#1983); traced prefill 2026-10-24 (#2072); `L_mtp` and the decode draft-KV vector 2026-10-25 (#2080) |
+| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by alternating max-affine regression. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes cut, and on prefill a trace run's busy time per pass; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait, and `L_mtp`, the status copy's latency), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), are fitted beside it, keyed by host CPU, `atom` digest, model and engine config, with no transfer. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); host-paced prefill cut 2026-10-24 (#1983); traced prefill 2026-10-24 (#2072); `L_mtp` and the decode draft-KV vector 2026-10-25 (#2080); output prefill draft-KV pass 2026-10-25 (#2100); a prefill launch the device held gives no `W_launch` 2026-10-26 (#2256) |
 | D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61). | 2026-09-18; revised 2026-10-14 (#941) |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |
 | D58 | Refuse rather than fall back on a step kind with no samples. The extrapolation guard is a convex hull or k-NN distance, never a per-feature bounding box; an out-of-hull step is priced `estimated` and unvalidated, its source naming the extrapolation, not refused, and graded by cost accuracy as well as reported apart. The step linear law refuses a discrete value it has no vector for, extrapolates outside its fitted hull, and is validated only inside the hull of its held-out steps. | 2026-09-18; revised 2026-10-11 (#765), 2026-10-14 (#952) and 2026-10-23 (#2011) |
 | D59 | A family is validated on independently gathered data, never by LOO. Rank at least three candidates and report all held-out errors. A law that fits one axis is tested on a second before it ships. | 2026-09-18 |
-| D60 | Laws are piecewise over dispatch bands read from recorded kernel identity. A query with no same-band bracket refuses. At the op level `measure ops` records each point's kernels and `fit ops` interpolates only between same-kernel neighbours, and along no line holding a hidden band or a held-out error over 5%, holding out no point whose neighbours are one coordinate away on each side, one row's bytes for a collective whose ranks move the same rows (one byte for `all_gatherv`, `reduce_scatterv` and MORI); a declined leaf falls to its analytical law, counted. An interpolated leaf is validated inside a held-out bracket on each line it interpolates along. | 2026-09-18; op level 2026-10-18 (#1489); declined lines 2026-10-19 (#1493); adjacent neighbours 2026-10-20 (#1746), a collective's 2026-10-22 (#1908); validated brackets 2026-10-23 (#2011) |
+| D60 | Laws are piecewise over dispatch bands read from recorded kernel identity. A query with no same-band bracket refuses. At the op level `measure ops` records each point's kernels and `fit ops` interpolates only between same-kernel neighbours, and across neither gap beside a hidden band or a point with a held-out error over 5%, holding out no point whose neighbours are one coordinate away on each side, one row's bytes for a collective whose ranks move the same rows (one byte for `all_gatherv`, `reduce_scatterv` and MORI); a declined leaf falls to its analytical law, counted. An interpolated leaf is validated inside a held-out bracket on each line it interpolates along. | 2026-09-18; op level 2026-10-18 (#1489); declined lines 2026-10-19 (#1493), per gap 2026-10-25 (#2107); adjacent neighbours 2026-10-20 (#1746), a collective's 2026-10-22 (#1908); validated brackets 2026-10-23 (#2011) |
 | D61 | Treatments are stated and the calibration population matched; an assumed treatment is a property of the query, recorded in the run summary. Decode row order, worth 1.77× at a fixed multiset, is a decode feature, `rowmod(k)` in scheduled order, adopted per rung by a four-condition rule. Uniform routing of the MoE segment under DP and EP is an assumed treatment, at every granularity. | 2026-09-18; revised 2026-10-01, 2026-10-14 (#941, #952) |
 | D62 | Leading warmth is measured and reported, never charged. Error is reported stratified by the axes the law is linear in. | 2026-09-18 |
 

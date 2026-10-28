@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Two instruments on one breakdown: the per-term gate, and the sum that hid it.
+"""The per-term gate on the breakdown a summed check once hid three errors in.
 
 The per-term rule comes from an incident. A summed non-KV memory check read
 **+13.8%** and was three errors, two of which cancelled: weights over by
@@ -8,9 +8,8 @@ The per-term rule comes from an incident. A summed non-KV memory check read
 single error was 25% of its own term.**
 
 `HISTORICAL` below is that breakdown, and
-`test_two_instruments_on_one_breakdown` runs the two instruments on it side by
-side -- the per-term comparator naming three failures, and the summed check
-reading +13.8% and passing.
+`test_the_per_term_comparator_names_all_three_errors` runs the per-term
+comparator on it.
 
 **How the fixture's totals were reconstructed, since the incident was reported
 as deltas and ratios rather than totals.** Three deltas are given (+0.280, -0.015,
@@ -50,7 +49,6 @@ from atom.compass.memory import (
     Predicted,
     Recorded,
     Shape,
-    SummedCheck,
     Term,
     TermComparison,
     Verdict,
@@ -158,162 +156,43 @@ HISTORICAL_PREDICTED = Predicted(
 )
 
 
-def test_two_instruments_on_one_breakdown(capsys):
-    """Three named term errors, beside a sum that reads +13.8% and passes.
+def test_the_per_term_comparator_names_all_three_errors(capsys):
+    """Three named term errors on the breakdown a sum read as +13.8%.
 
-    The per-term table and the summed check are printed here rather than only
-    asserted, because the argument this file makes is that the two disagree on
-    one breakdown and the disagreement is the finding.
+    The per-term table is printed here rather than only asserted, because it
+    is the decomposition the summed check could not show.
     """
     comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
-    # No band for a sum exists. Both bands in use -- the 10% a non-KV term
-    # carries, and the 25% allowed one on a device nobody has measured -- are
-    # per term, and taking one of them for a sum is the substitution
-    # the incident is made of. 25% is the loosest, so it flatters the sum most.
-    summed = comparison.summed(band=0.25)
     with capsys.disabled():
         print()
-        print(summed.table())
+        print(comparison.table())
 
     errors = {t.name: t for t in comparison.compared}
     assert set(errors) == {"weights", "activations", UNATTRIBUTED}
     assert errors["weights"].delta_bytes == 280_000_000
+    assert errors["weights"].relative == pytest.approx(0.25, abs=5e-5)
     assert errors["activations"].delta_bytes == -15_000_000
     assert errors[UNATTRIBUTED].delta_bytes == -84_000_000
     assert all(t.verdict is Verdict.FAIL for t in comparison.compared)
     assert len(comparison.failures()) == 3
-
-    # The two orderings disagree on this fixture, which is why there are two
-    # accessors and both name their unit. The gate is a fraction of the
-    # recorded term, so `worst` is the unattributed one at -100%; the
-    # incident's own "25% of its term" is a statement about bytes.
-    assert comparison.worst().name == UNATTRIBUTED
-    assert comparison.worst().relative == -1.0
-    largest = comparison.largest_by_bytes()
-    assert largest.name == "weights"
-    assert largest.relative == pytest.approx(0.25, abs=5e-5)
-    # The one the sum cannot see at all: nothing predicted it, so it is absent
+    # The one a sum cannot see at all: nothing predicted it, so it is absent
     # from the prediction and from any sum over the prediction.
     assert errors[UNATTRIBUTED].predicted is None
 
-    assert summed.delta_bytes == 181_000_000
-    assert summed.relative == pytest.approx(0.13775, abs=5e-5)
-    assert f"{summed.relative:+.1%}" == "+13.8%"
-    assert summed.passed
 
-
-def test_at_the_per_term_band_the_sum_is_red_and_the_table_names_all_three():
-    """The contrast, asserted as a contrast rather than as an absence.
-
-    The objection to a summed check is not that its band was wrong. Given the
-    per-term band, the sum is red and still says only that something is wrong;
-    the per-term instrument on the same breakdown at the same band names all
-    three terms and their verdicts. That pair is the evidence. An assertion
-    that the aggregate line contains no term name would be pinned by the
-    format string rather than measured, so it is a regression pin below and
-    not the argument.
-    """
-    comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
-    summed = comparison.summed(band=NON_KV_TERM_GATE)
-    assert not summed.passed
-    assert summed.table().splitlines()[0].endswith("10% band -- fails")
-    assert {t.name: t.verdict for t in comparison.compared} == {
-        "weights": Verdict.FAIL,
-        "activations": Verdict.FAIL,
-        UNATTRIBUTED: Verdict.FAIL,
-    }
-    # The pin, stated as a pin: nothing folds a term name into the headline.
-    aggregate = summed.table().splitlines()[0]
-    for name in ("weights", "activations", UNATTRIBUTED):
-        assert name not in aggregate
-
-
-def test_the_two_compensating_errors_are_what_the_sum_folds():
+def test_the_two_compensating_errors_are_what_a_sum_folds():
     """+0.280 and -0.099 GB of error make a sum of +0.181 GB, which is the point."""
     comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
     over = sum(t.delta_bytes for t in comparison.compared if t.delta_bytes > 0)
     under = sum(t.delta_bytes for t in comparison.compared if t.delta_bytes < 0)
     assert over == 280_000_000
     assert under == -99_000_000
-    assert over + under == comparison.summed(band=0.25).delta_bytes
 
 
-# --- an aggregate never without its decomposition ---------------------------
-
-
-def test_a_comparison_has_no_total_and_a_sum_cannot_be_built_without_one():
+def test_a_comparison_has_no_total():
     assert not hasattr(Comparison, "total")
     assert not hasattr(Comparison, "__int__")
     assert not hasattr(TermComparison, "__int__")
-    # The only state a SummedCheck holds is the comparison and the band: there
-    # is no constructor that takes two totals, so the figure cannot exist
-    # without the table that produced it.
-    assert set(SummedCheck.__dataclass_fields__) == {"comparison", "band"}
-
-
-@pytest.mark.parametrize(
-    "omit, names",
-    [
-        (lambda c, r: SummedCheck(comparison=c), ("SummedCheck.__init__", "'band'")),
-        (lambda c, r: c.summed(), ("Comparison.summed", "'band'")),
-        (
-            lambda c, r: Predicted.from_readings(r, shape=HISTORICAL_SHAPE),
-            ("Predicted.from_readings", "'at_shape'"),
-        ),
-    ],
-    ids=["SummedCheck.band", "Comparison.summed-band", "from_readings-at_shape"],
-)
-def test_a_value_the_caller_must_state_is_refused_when_omitted(omit, names, spec, qwen):
-    # A band for a sum, and which terms move with the shape, are the caller's
-    # to state. Omitting one is a TypeError naming the signature and the field.
-    comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
-    with pytest.raises(TypeError) as omitted:
-        omit(comparison, live_readings(spec, qwen))
-    for name in names:
-        assert name in str(omitted.value)
-
-
-def test_printing_a_sum_prints_the_terms_it_folded():
-    summed = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED).summed(band=0.25)
-    rendered = str(summed)
-    for name in ("weights", "activations", UNATTRIBUTED):
-        assert name in rendered
-    assert "+13.8%" in rendered
-
-
-def test_both_orderings_come_back_as_their_term_not_as_a_number():
-    comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
-    for largest in (comparison.worst(), comparison.largest_by_bytes()):
-        assert isinstance(largest, TermComparison)
-    by_bytes = comparison.largest_by_bytes()
-    assert by_bytes.recorded.nbytes == 1_120_000_000
-    assert by_bytes.predicted is not None
-    # Ranked in the gate's unit it is the other term, and that is the point of
-    # having two accessors rather than one word covering both.
-    assert comparison.worst().name != by_bytes.name
-
-
-def test_a_comparison_with_no_comparable_term_refuses_a_largest_error():
-    # Every recorded term was taken at a shape and the run did not reset the
-    # peak, so every one of them refuses and nothing is left to be largest.
-    recorded = Recorded(
-        run="a tracing run that did not reset the peak",
-        shape=HISTORICAL_SHAPE,
-        high_water_reset=False,
-        terms=footprint_terms({"activations": 110_000_000}, source="the printout"),
-        at_shape=AT_SHAPE,
-    )
-    predicted = Predicted(
-        label="a prediction of that one term",
-        shape=HISTORICAL_SHAPE,
-        terms=(Term("activations", 95_000_000, Method.MEASURED, "a liveness walk"),),
-        at_shape=AT_SHAPE,
-    )
-    comparison = compare(predicted, recorded)
-    assert not comparison.compared
-    with pytest.raises(MemoryRefusal) as refusal:
-        comparison.worst()
-    assert "no largest error" in str(refusal.value)
 
 
 # --- trap 1: a term the run does not record ----------------------------------
@@ -347,16 +226,19 @@ def live_readings(spec, qwen, tp_width=1):
         tp_width=tp_width,
         model=ModelTerms.from_tree(
             meta_tree(PARAMETERS * element_bytes(qwen.dtype) // tp_width),
-            activations=measured(tp_width).activations(WARMUP_TOKENS),
+            activations=measured(tp_width).activations(),
         ),
         cudagraph_overhead=reserved(qwen, total_bytes),
     )
 
 
 def live_prediction(spec, qwen, tp_width=1):
-    return Predicted.from_readings(
-        live_readings(spec, qwen, tp_width),
+    """The footprint terms of live readings: `peak_torch`'s and `non_torch`'s."""
+    readings = live_readings(spec, qwen, tp_width)
+    return Predicted(
+        label=f"{readings.spec_digest} at TP{readings.tp_width}",
         shape=Shape(tokens=WARMUP_TOKENS, phase="prefill"),
+        terms=readings.peak_torch.terms + readings.non_torch.terms,
         at_shape=AT_SHAPE,
     )
 
@@ -415,9 +297,6 @@ def test_an_absent_term_is_not_a_term_of_zero_bytes(spec, qwen):
     prediction = live_prediction(spec, qwen)
     comparison = compare(prediction, agreeing_recording(prediction))
     assert all(t.name != "buffers" for t in comparison.compared)
-    assert comparison.summed(band=0.25).predicted_total == sum(
-        t.predicted_bytes for t in comparison.compared
-    )
 
 
 def test_every_term_agreeing_exactly_discharges_its_gate(spec, qwen):
@@ -893,29 +772,6 @@ def test_the_graph_pool_cannot_be_folded_into_the_per_term_table(spec, qwen):
     assert "compare_graph_pool" in str(refusal.value)
 
 
-# --- what `from_readings` takes, and what it deliberately leaves -------------
-
-
-def test_the_footprint_is_peak_torch_and_non_torch_and_nothing_else(spec, qwen):
-    readings = live_readings(spec, qwen)
-    prediction = Predicted.from_readings(
-        readings, shape=Shape(tokens=WARMUP_TOKENS, phase="prefill"), at_shape=AT_SHAPE
-    )
-    assert [t.name for t in prediction.terms] == [
-        "weights",
-        "buffers",
-        "load residue",
-        "persistent",
-        "activations",
-        "driver and collective reserve",
-    ]
-    # `total` is the card and `free` is what is left of it, so neither is a
-    # footprint term; `cudagraph_overhead` is one of two numbers.
-    assert "capacity" not in {t.name for t in prediction.terms}
-    assert "per-token x captured tokens" not in {t.name for t in prediction.terms}
-    assert readings.spec_digest in prediction.label
-
-
 # --- a term against the run it was built from --------------------------------
 
 GIB = 1 << 30
@@ -942,7 +798,7 @@ def _hand_in(tmp_path, qwen, record):
     spec = MachineSpec.from_mapping(document)
     entry = measured(1, record=record, activation_bytes=WARMUP_TOKENS * 180_480)
     model = ModelTerms.from_tree(
-        meta_tree(PARAMETERS * 2), activations=entry.activations(WARMUP_TOKENS)
+        meta_tree(PARAMETERS * 2), activations=entry.activations()
     )
     readings = device_readings(
         spec,

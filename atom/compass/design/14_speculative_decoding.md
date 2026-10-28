@@ -117,7 +117,9 @@ acceptance parts at the first differing draw. Only the distribution is shared; i
 checked against the kernel at K = 1, and at K > 1 by
 [#1546](https://github.com/jgong5/ATOM/issues/1546). A speculative step whose price tags
 no draft term is refused by name, `cost:<backend>: prices no draft`; step-level backends
-tag one with [#1541](https://github.com/jgong5/ATOM/issues/1541).
+tag one with [#1541](https://github.com/jgong5/ATOM/issues/1541). An eager DP dummy priced
+0 s under the `eager DP dummy` treatment (`09`) needs none
+([#1976](https://github.com/jgong5/ATOM/issues/1976)).
 
 ### What still flows through ATOM's real code
 

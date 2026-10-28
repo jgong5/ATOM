@@ -6,7 +6,7 @@ A record is a real run's step record (`steps/dp<r>.jsonl`, written with
 that is not a dummy run a `Sample`: its batch view, its device label, its host
 labels and its provenance. `step_linear_fit` fits samples and `validate.cost`
 prices them; neither reads a step's stamps. Neither takes a record whose
-run.json names `BUILDS`, aiter JIT modules its server built while it served;
+run.json names `BUILDS`, the JIT compiles its server ran while it served;
 `refusal` says why.
 
 A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
@@ -20,7 +20,9 @@ device work queued since the previous forward's exit, `d_gap_ns`. A decode step
 whose device start precedes its host launch end is launch-exposed and cut. The
 exit of each wait for the previous output's token copy (`t_recv_ns`)
 bounds the host clock's lead over the device's (that forward had finished by
-then); the tightest of the last `ANCHORS` bounds is the lead. The copy itself
+then), as does the exit of a forward's read of its own tokens (`t_read_ns`)
+over its device start, its target's end under MTP; the tightest of the last
+`ANCHORS` bounds is the lead. The copy itself
 lands on its own stream after the exit event the bound reads, by 14 to 29 us
 measured on one host (median 17 us), so each bound carries that much more lead
 than the clocks actually have; on the step linear law's records the gap never
@@ -37,7 +39,10 @@ record, is the host clock's lead there.
 A prefill step's labels are a trace run's busy time per pass (`parity.busy`),
 which a trace run's record joins from `dp<r>.busy.jsonl` beside it: the device
 label `b_target_ns`, the draft label `b_draft_ns`, and on a step that produces
-output the propose label, the draft's `propose` pass, `b_propose_ns`. A window
+output the propose label, the draft's `propose` pass, `b_propose_ns`. An output
+prefill's draft-KV pass, `b_draft_kv_ns`, runs before `forward_done_event`, as
+a decode's does: its device label holds it, as its draft-KV label too, and its
+draft label does not; a middle chunk's stays in its draft label. A window
 holds the device's idle between launches the host paced, so a prefill step
 without busy time is cut as `untraced`. A trace run, one whose run directory
 holds `TRACE`, ran under a profiler: its decode steps are cut as `traced` and
@@ -51,8 +56,12 @@ A step's host labels are its segments: `E` from the previous forward's exit,
 cut as idle when the two batches share no request; `W_pre` to the launch, less
 the staging gate's wait; `W_launch` from the launch to the token copy wait,
 the sampler's launch included, or to the launch's end on a forward with no
-such wait; `W_post` from that wait's end to the exit, less the draft copy wait,
-and a middle chunk has none. With an MTP status wait,
+such wait, and none on a prefill the host did not pace whose launch ends
+after its device ran `HELD_SHARE` of its device window, placed by the lead:
+that launch waited on the device; `W_post` from that wait's end to the exit,
+less the draft copy wait, and a middle chunk has none. A prefill is host-paced
+when its exit event ran less than `PACED_SHARE` of its device window after the
+host recorded it. With an MTP status wait,
 `W_pre` ends at it and `W_inputs` runs from it to the launch. On a later
 pipeline stage, `W_recv` runs from the launch to the receive of its input.
 Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
@@ -89,10 +98,19 @@ ANCHORS = 32
 CUTS = ("exposed", "mixed", "unsplit", "untraced", "traced")
 #: The directory beside a trace run's `steps` its traces are in (`parity.busy`).
 TRACE = "trace"
+#: A prefill's exit event running less than this share of its device window after
+#: its host record makes it host-paced: between the two clusters the DSpark TP2
+#: records show, host-paced output prefills at 0 to 4.3%, device-paced at 11% up.
+PACED_SHARE = 0.08
+#: A prefill whose launch ends after its device ran more than this share of its
+#: device window waited on the device inside the launch. On the DeepSeek-V4-Pro
+#: DPA8 MI355X records, launches over 0.5 s end past it on 99.5%, shorter ones
+#: before it on 99.2%.
+HELD_SHARE = 0.2
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
 TABLE_VERSION = 1
-#: run.json's entry naming the aiter JIT modules its server built while it
-#: served (`atom.compass.drive.aiter_jit`); a server that built none has none.
+#: run.json's entry naming the JIT modules and kernels its server compiled while
+#: it served (`atom.compass.drive.aiter_jit`); a server that compiled none has none.
 BUILDS = "aiter_jit_builds"
 
 
@@ -101,7 +119,7 @@ def refusal(run: dict) -> str | None:
     `run`, naming the modules of its `BUILDS`; None when it names none."""
     if builds := run.get(BUILDS):
         return (
-            f"aiter ran a JIT build of {builds} while its server served, "
+            f"its server ran a JIT compile of {builds} while it served, "
             "so a step may have waited on it"
         )
     return None
@@ -116,7 +134,7 @@ class Sample:
     `propose_s` is its propose label, the part of `draft_s` that is the
     `propose` pass, on a prefill step that produces output; None elsewhere.
     `draft_kv_s` is its draft-KV label, the part of `device_s` that is the
-    drafter's draft-KV pass, on a decode step; None elsewhere.
+    drafter's draft-KV pass, on a step that produces output; None elsewhere.
     `host` holds the segments it has, in seconds: no `W_post` on a middle chunk,
     no `E` on the record's first forward or after an idle engine (`idle`).
     `provenance` holds `source`, `run` (the run's digest), `requests` (the
@@ -191,20 +209,24 @@ def mtp_copy(lines) -> dict[int, tuple[int, bool]]:
     return copy
 
 
-def _exposed(lines) -> set[int]:
-    """The steps whose device start precedes their host launch end."""
-    output_end, timed = None, []
-    for s, start in _timed(lines)[0]:
+def _host_cut(lines) -> tuple[set[int], set[int]]:
+    """The steps whose device start precedes their host launch end, and the
+    prefill steps the host did not pace whose launch the device held."""
+    (lines_timed, lead), output_end, timed = _timed(lines), None, []
+    for s, start in lines_timed:
         bound = None
         if "t_recv_ns" in s and output_end is not None:
             bound = s["t_recv_ns"][1] - output_end
+        if "t_read_ns" in s:  # its own tokens: read after its target ran
+            bound = s["t_read_ns"][1] - start - s.get("d_target_ns", 0)
         if s["produces_output"]:
             output_end = start + s["d_busy_ns"]
         timed.append((s, start, bound))
     bounds = [b for _, _, b in timed if b is not None]
     if not bounds:
         raise ValueError(
-            "no token copy wait exit (`t_recv_ns`) ties the record's host and device clocks"
+            "no token read exit (`t_recv_ns` or `t_read_ns`) ties the record's "
+            "host and device clocks"
         )
     # Steps before the first anchor read the first ones.
     first, recent, exposed = min(bounds[:ANCHORS]), deque(maxlen=ANCHORS), set()
@@ -213,7 +235,22 @@ def _exposed(lines) -> set[int]:
             recent.append(bound)
         if start + min(recent, default=first) < s["t_launch_ns"][1]:
             exposed.add(s["step"])
-    return exposed
+    paced = {
+        s["step"]
+        for s, start, _ in timed
+        if not all(r[2] for r in s["rows"])
+        and start + s["d_busy_ns"] + lead - s["t_exit_ns"]
+        < PACED_SHARE * s.get("d_target_ns", s["d_busy_ns"])
+    }
+    held = {
+        s["step"]
+        for s, start, _ in timed
+        if not all(r[2] for r in s["rows"])
+        and s["step"] not in paced
+        and s["t_launch_ns"][1] - start - lead
+        > HELD_SHARE * s.get("d_target_ns", s["d_busy_ns"])
+    }
+    return exposed, held
 
 
 def join_stamps(steps: list[dict], path) -> None:
@@ -314,7 +351,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             f"{record} has no device windows (`d_busy_ns`); a fit labels a step "
             "by its device time"
         )
-    exposed, traced = _exposed(lines), _traced(path)
+    (exposed, held), traced = _host_cut(lines), _traced(path)
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
@@ -367,20 +404,25 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
         draft = propose = draft_kv = None
         if "d_target_ns" in s:  # an MTP record: the target alone, no gap
             target = s["d_target_ns"]
-            if not view.prefill:
+            if view.produces_output:  # the pass precedes forward_done_event
                 draft_kv = s.get("d_draft_kv_ns")
                 target += draft_kv or 0
             device = None if cut else target * 1e-9
             draft = (s["d_busy_ns"] - target) * 1e-9
         if view.prefill and not cut:  # a trace run's busy time
-            device, draft = s["b_target_ns"] * 1e-9, s.get("b_draft_ns")
-            draft = None if draft is None else draft * 1e-9
+            target, draft = s["b_target_ns"], s.get("b_draft_ns")
+            draft_kv = s.get("b_draft_kv_ns") if view.produces_output else None
+            target += draft_kv or 0
+            device = target * 1e-9
+            draft = None if draft is None else (draft - (draft_kv or 0)) * 1e-9
             propose = s.get("b_propose_ns") if view.produces_output else None
         enter, (l0, l1) = s["t_enter_ns"], s["t_launch_ns"]
         g0, g1 = s.get("t_gate_ns", (l0, l0))
         r0, r1 = s.get("t_recv_ns", (l1, l1))
         m0, m1 = s.get("t_mtp_ns", (l0, l0))
-        host = {"W_pre": g0 - enter + m0 - g1, "W_launch": r0 - l0}
+        host = {"W_pre": g0 - enter + m0 - g1}
+        if s["step"] not in held:
+            host["W_launch"] = r0 - l0
         if "t_mtp_ns" in s:
             host["W_inputs"] = l0 - m1
         if "t_pp_recv_ns" in s:

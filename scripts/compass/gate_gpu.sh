@@ -68,28 +68,20 @@ printf 'verdict: the last line of stdout; if this run is piped, $? is the pipe'"
 
 # The baseline is a pair AND the tree and toolchain it was measured on. A bare
 # pair cannot distinguish a regression from drift: after a torch bump, 4728/7
-# has no reading. Changing any of these seven constants is a reviewed edit.
+# has no reading. regen_gpu_gate_baseline.sh measures these seven constants and
+# writes them to gpu_gate_baseline.env; changing that file is a reviewed edit.
 #
-# Measured 2026-10-14 on hjbog-srdc-18 in xiaobizh_n18_next13 (image
-# rocm/atom-dev vllm-v0.31.0-nightly_20261013), HIP_VISIBLE_DEVICES=1, against a
-# git archive of pure upstream 661ef7661, the ATOM that image ships: 11346
-# passed, 131 failed, 0 errors, 497 skipped, 3 xfailed in 1566.2 s. A run on
-# GPU 3 the same day failed the same 131 node-ids with the same counts.
-# Upstream has no tests/compass/, so every Compass test is surplus.
-BASE_PASSED=11346
-BASE_FAILED=131
-BASE_COMMIT=661ef7661
-BASE_TORCH=2.10.0+rocm7.2.4.git3d3aa833
 # BASE_ROCM is compared against torch.version.hip below, so it carries the HIP
-# runtime version, not the ROCm release. ROCm release was 7.2.4.
-BASE_ROCM=7.2.53211
-# AITER has no __version__; this is `git describe --tags --always` in the source
-# checkout aiter imports from. Most known failures are AITER kernels or the
+# runtime version, not the ROCm release.
+#
+# AITER has no __version__; BASE_AITER is `git describe --tags --always` in the
+# source checkout aiter imports from. Most known failures are AITER kernels or the
 # gfx950-only formats they test, so AITER is the likeliest single cause of a
 # change that moves them -- a bump used to pass the drift check in silence
 # because only torch and HIP were compared.
-BASE_AITER=v0.1.25-44-g9205e1059
-# How many of BASE_PASSED came from tests/compass/ at BASE_COMMIT. The pass count
+#
+# BASE_COMPASS_TESTS is how many of BASE_PASSED came from tests/compass/ at
+# BASE_COMMIT; the regenerated baseline runs none of them. The pass count
 # is checked for EQUALITY against BASE_PASSED adjusted by what tests/compass/
 # contributes on this tree, so a surplus is accounted for rather than absorbed.
 # Every Compass task adds tests there; a task that adds tests anywhere else makes
@@ -98,10 +90,18 @@ BASE_AITER=v0.1.25-44-g9205e1059
 # Both sides are PASS counts. This one was a pass count all along; the tree side
 # used to be a COLLECTED count, so the first Compass test to skip or xfail on a
 # GPU host would have made a legitimately green tree read `unaccounted -1` and
-# blamed tests outside tests/compass/. compass_compass_pass_count in _lib.sh now
-# counts passes on both sides, so the two are the same quantity by construction
+# blamed tests outside tests/compass/. The tree side is now the passes of the
+# tests/compass run below, so the two are the same quantity by construction
 # rather than while a condition happens to hold.
-BASE_COMPASS_TESTS=0
+BASELINE=$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_baseline.env
+[ -r "$BASELINE" ] || {
+    printf 'FATAL: %s is missing; the gate has no baseline.\n' "$BASELINE" >&2
+    finish 93 "the baseline file is missing; nothing was run"
+}
+. "$BASELINE"
+for key in BASE_PASSED BASE_FAILED BASE_COMMIT BASE_TORCH BASE_ROCM BASE_AITER BASE_COMPASS_TESTS; do
+    [ -n "${!key:-}" ] || finish 93 "$(basename "$BASELINE") sets no $key; nothing was run"
+done
 
 # The baseline's failures by name. The count above and the list here are two
 # statements of one fact, so a disagreement between them is a defect in this
@@ -177,17 +177,97 @@ if [ "$TORCH" != "$BASE_TORCH" ] || [ "$ROCM" != "$BASE_ROCM" ] || [ "$AITER" !=
     printf 'WARNING: toolchain differs from the baseline'"'"'s. The known failures are\n' >&2
     printf '         mostly AITER kernel results that depend on exactly this\n' >&2
     printf '         stack; the pair below is not comparable until it is\n' >&2
-    printf '         re-measured and the constants and %s updated.\n' "$(basename "$KNOWN_FILE")" >&2
+    printf '         re-measured on this stack with regen_gpu_gate_baseline.sh.\n' >&2
 fi
 
-# The surplus this tree is allowed, derived from this tree rather than declared.
-# An absent tests/compass/ counts zero and the gate still produces a verdict --
-# on such a tree that is BASE_PASSED + 0 - BASE_COMPASS_TESTS, which is what a
-# tree without this phase's tests measures. See compass_compass_pass_count in _lib.sh
-# for why that is a count and not a refusal.
-COMPASS_N=$(compass_compass_pass_count "$ROOT") || finish $? "the tests/compass pass count has no source; the suite was not run"
-[ -d "$ROOT/tests/compass" ] ||
+# The driver-run tests start ATOM's own servers on the simulated clock. Each
+# skips without its inputs, and a skip is not a failure, so a gate that does not
+# set them passes without running them. On a tree whose tests read the slice
+# model, every input is set here, by default to node 18's, and a missing one
+# refuses the run by name.
+GPUS=$HIP_VISIBLE_DEVICES
+SMOKE=
+if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
+    hf_snapshot() { ls -d "${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--$1/snapshots/"*/ 2>/dev/null | head -1; }
+    export ATOM_COMPASS_SLICE_MODEL=${ATOM_COMPASS_SLICE_MODEL:-$(hf_snapshot Qwen3-0.6B)}
+    export ATOM_COMPASS_IMAGE_MODEL=${ATOM_COMPASS_IMAGE_MODEL:-$(hf_snapshot Qwen3.5-9B)}
+    # The speculative runs read a config and a tokenizer, no weights: MTP1 from
+    # Qwen3.5-0.8B, DSpark from DeepSeek-V4.1-Flash's config with V4-Flash's tokenizer.
+    export ATOM_COMPASS_MTP_MODEL=${ATOM_COMPASS_MTP_MODEL:-$(hf_snapshot Qwen3.5-0.8B)}
+    export ATOM_COMPASS_DSPARK_MODEL=${ATOM_COMPASS_DSPARK_MODEL:-/root/cells/deepseek-v41-flash-dspark}
+    # The cc-traces smoke replays turns longer than the slice model's context, so
+    # it runs alone, with this model as its slice model.
+    SMOKE=tests/compass/test_cctraces_sim_smoke.py
+    export ATOM_COMPASS_CCTRACES_MODEL=${ATOM_COMPASS_CCTRACES_MODEL:-$(hf_snapshot Qwen3.8-27B)}
+    export ATOM_COMPASS_CCTRACES=${ATOM_COMPASS_CCTRACES:-/root/cells/cc-traces-256k/traces.jsonl}
+    # agentx-harness with compass-harness installed, and without it.
+    export COMPASS_HARNESS_PYTHON=${COMPASS_HARNESS_PYTHON:-/root/cells/venv/bin/python}
+    export COMPASS_AIPERF_PYTHON=${COMPASS_AIPERF_PYTHON:-/opt/venv/bin/python}
+    # The cards' PTL state is part of the machine's key; node 18's run with it on.
+    export ATOM_COMPASS_SLICE_MACHINE=${ATOM_COMPASS_SLICE_MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
+    # The router-LP forms refuse a router not built at this tree's commit, so a
+    # snapshot needs one built (cargo build --release in atom/mesh) in a git
+    # checkout of it.
+    export ATOMESH=${ATOMESH:-$ROOT/atom/mesh/target/release/atomesh}
+    export PATH=$(dirname -- "$ATOMESH"):$PATH
+    MISSING=
+    [ -d "$ATOM_COMPASS_SLICE_MODEL" ] || MISSING+="ATOM_COMPASS_SLICE_MODEL, a Qwen3-0.6B directory; "
+    [ -d "$ATOM_COMPASS_IMAGE_MODEL" ] || MISSING+="ATOM_COMPASS_IMAGE_MODEL, a Qwen3.5-9B directory; "
+    [ -d "$ATOM_COMPASS_MTP_MODEL" ] || MISSING+="ATOM_COMPASS_MTP_MODEL, a Qwen3.5-0.8B directory; "
+    [ -d "$ATOM_COMPASS_DSPARK_MODEL" ] || MISSING+="ATOM_COMPASS_DSPARK_MODEL $ATOM_COMPASS_DSPARK_MODEL; "
+    [ -d "$ATOM_COMPASS_CCTRACES_MODEL" ] || MISSING+="ATOM_COMPASS_CCTRACES_MODEL, a Qwen3.8-27B directory; "
+    [ -r "$ATOM_COMPASS_CCTRACES" ] || MISSING+="ATOM_COMPASS_CCTRACES $ATOM_COMPASS_CCTRACES; "
+    [ -x "$COMPASS_HARNESS_PYTHON" ] || MISSING+="COMPASS_HARNESS_PYTHON $COMPASS_HARNESS_PYTHON; "
+    [ -x "$COMPASS_AIPERF_PYTHON" ] || MISSING+="COMPASS_AIPERF_PYTHON $COMPASS_AIPERF_PYTHON; "
+    [ -r "$ATOM_COMPASS_SLICE_MACHINE" ] || MISSING+="ATOM_COMPASS_SLICE_MACHINE $ATOM_COMPASS_SLICE_MACHINE; "
+    ROUTER=$(python -c 'import sys; from atom.compass.run import router_binary; router_binary(sys.argv[1])' \
+        "$ATOMESH" 2>&1) || MISSING+="ATOMESH, ${ROUTER##*$'\n'}; "
+    [ "$(tr ',' '\n' <<<"$GPUS" | grep -c .)" -ge 4 ] ||
+        MISSING+="four cards in HIP_VISIBLE_DEVICES, which names $GPUS; "
+    [ -z "$MISSING" ] || finish 92 "the driver-run tests lack ${MISSING%; }; nothing was run"
+    printf 'driver-run: slice %s\n            image %s\n            machine %s\n            router %s\n' \
+        "$ATOM_COMPASS_SLICE_MODEL" "$ATOM_COMPASS_IMAGE_MODEL" "$ATOM_COMPASS_SLICE_MACHINE" "$ATOMESH"
+    printf 'spec:       mtp %s\n            dspark %s\n' "$ATOM_COMPASS_MTP_MODEL" "$ATOM_COMPASS_DSPARK_MODEL"
+    printf 'cc-traces:  model %s\n            traces %s\n            harness %s\n            aiperf %s\n' \
+        "$ATOM_COMPASS_CCTRACES_MODEL" "$ATOM_COMPASS_CCTRACES" "$COMPASS_HARNESS_PYTHON" "$COMPASS_AIPERF_PYTHON"
+fi
+
+# tests/compass runs once, on every card named, and the rest of the suite on the
+# first card alone, as the baseline was measured: an upstream test that needs
+# two cards skips there. The surplus over the baseline is what tests/compass
+# passes on this tree; an absent tests/compass contributes none.
+# The tests that cargo-build atomesh skip unless cargo resolves its crates; the
+# gate has no network, so they come from the container's cache.
+export CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE:-true}
+ARGS=("$@")
+COUT=$(mktemp)
+COMPASS_N=0 C_FAILED=0 C_ERRORS=0
+compass_tests() {
+    printf '===== %s on HIP_VISIBLE_DEVICES=%s =====\n' "$1" "$GPUS"
+    local log rc
+    log=$(mktemp)
+    python -m pytest "$@" -q --no-header -p no:cacheprovider "${ARGS[@]}" -rfEs 2>&1 | tee "$log"
+    rc=${PIPESTATUS[0]}
+    cat "$log" >>"$COUT"
+    compass_pytest_counts "$log"
+    rm -f "$log"
+    # rc 5 is "no tests collected": a directory holding nothing runnable passes none.
+    case "$rc" in
+    0 | 1 | 5) ;;
+    *) rm -f "$COUT"; finish 1 "pytest rc=$rc over $1; the run did not complete" ;;
+    esac
+    COMPASS_N=$((COMPASS_N + PASSED)) C_FAILED=$((C_FAILED + FAILED)) C_ERRORS=$((C_ERRORS + ERRORS))
+}
+if [ -f "$SMOKE" ]; then
+    compass_tests tests/compass --ignore="$SMOKE"
+    # The tree's compass-harness ahead of the one the harness Python has installed.
+    PYTHONPATH=$ROOT/compass_harness:$PYTHONPATH ATOM_COMPASS_SLICE_MODEL=$ATOM_COMPASS_CCTRACES_MODEL \
+        compass_tests "$SMOKE"
+elif [ -d "$ROOT/tests/compass" ]; then
+    compass_tests tests/compass
+else
     printf 'tests/compass: absent on this tree, so it contributes no tests.\n'
+fi
 EXPECT_PASSED=$((BASE_PASSED + COMPASS_N - BASE_COMPASS_TESTS))
 printf 'expected: %s passed = %s baseline + (%s - %s) tests/compass\n' \
     "$EXPECT_PASSED" "$BASE_PASSED" "$COMPASS_N" "$BASE_COMPASS_TESTS"
@@ -195,15 +275,10 @@ printf '\n'
 
 OUT=$(mktemp)
 # -rfE, after "$@" so it wins even if a -r form slips past the refusal above.
-python -m pytest tests/ --ignore=tests/plugin -q --no-header -p no:cacheprovider "$@" -rfE \
-    2>&1 | tee "$OUT"
+HIP_VISIBLE_DEVICES=${GPUS%%,*} python -m pytest tests/ --ignore=tests/plugin --ignore=tests/compass \
+    -q --no-header -p no:cacheprovider "$@" -rfE 2>&1 | tee "$OUT"
 PYRC=${PIPESTATUS[0]}
-SUMMARY=$(tail -20 "$OUT" | grep -E '[0-9]+ (passed|failed|error)' | tail -1)
-PASSED=$(printf '%s' "$SUMMARY" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || echo 0)
-FAILED=$(printf '%s' "$SUMMARY" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo 0)
-ERRORS=$(printf '%s' "$SUMMARY" | grep -oE '[0-9]+ errors?' | grep -oE '[0-9]+' || echo 0)
-printf '\nGATE_GPU passed=%s failed=%s errors=%s pytest_rc=%s (baseline %s/%s/0, expected %s passed)\n' \
-    "$PASSED" "$FAILED" "$ERRORS" "$PYRC" "$BASE_PASSED" "$BASE_FAILED" "$EXPECT_PASSED"
+compass_pytest_counts "$OUT"
 
 # A summary line that parses to 0/0/0, or no summary line at all, means the run
 # did not get far enough to produce one -- a collection error, an OOM, a killed
@@ -212,7 +287,7 @@ printf '\nGATE_GPU passed=%s failed=%s errors=%s pytest_rc=%s (baseline %s/%s/0,
 if [ -z "$SUMMARY" ] || { [ "$PASSED" -eq 0 ] && [ "$FAILED" -eq 0 ] && [ "$ERRORS" -eq 0 ]; }; then
     printf 'NO MEASUREMENT -- no usable pytest summary line found.\n' >&2
     tail -20 "$OUT" >&2
-    rm -f "$OUT"
+    rm -f "$OUT" "$COUT"
     finish 1 "no usable pytest summary line; the run is not a measurement"
 fi
 
@@ -225,10 +300,19 @@ case "$PYRC" in
 *)
     printf 'pytest rc=%s -- not "all passed" and not "tests failed", so the run\n' "$PYRC" >&2
     printf '  did not complete and the counts above are not a measurement.\n' >&2
-    rm -f "$OUT"
+    rm -f "$OUT" "$COUT"
     finish 1 "pytest rc=$PYRC; the run did not complete"
     ;;
 esac
+
+# From here on the two runs are judged as one suite.
+PASSED=$((PASSED + COMPASS_N)) FAILED=$((FAILED + C_FAILED)) ERRORS=$((ERRORS + C_ERRORS))
+printf '\nGATE_GPU passed=%s failed=%s errors=%s pytest_rc=%s (baseline %s/%s/0, expected %s passed)\n' \
+    "$PASSED" "$FAILED" "$ERRORS" "$PYRC" "$BASE_PASSED" "$BASE_FAILED" "$EXPECT_PASSED"
+# A driver-run test that skipped did not run, whatever the counts say.
+SKIPS=$(grep -E '^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK)_MODEL|ATOM_COMPASS_CCTRACES|COMPASS_AIPERF_PYTHON|atomesh)' "$COUT")
+cat "$COUT" >>"$OUT"
+rm -f "$COUT"
 
 # Each finding goes to stderr in full. The first one's one-line form, and how
 # many more there were, travel on the verdict line. The checks run with the
@@ -247,6 +331,9 @@ fail() { printf '%s\n' "$1" >&2; VERDICT=$((VERDICT + 1)); [ -n "$WHY" ] || WHY=
   error is not a failure -- the tests behind it did not run at all, so the
   pass count below is over a smaller suite than the baseline'"'"'s.' "$ERRORS")" \
     "$ERRORS collection/teardown error(s)"
+[ -z "$SKIPS" ] ||
+    fail "$(printf 'driver-run test(s) skipped, so not run:\n%s' "$(sed 's/^/  /' <<<"$SKIPS")")" \
+        "$(grep -c . <<<"$SKIPS") driver-run skip line(s), first ${SKIPS%%$'\n'*}"
 
 # The names, not only the counts: one baseline failure fixed and one new one
 # introduced reads as 5/5.

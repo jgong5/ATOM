@@ -436,16 +436,6 @@ class Site:
         """
         return f"{self.file}::{self.symbol}::{self.expr}::{self.shape}#{self.ordinal}"
 
-    def as_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "file": self.file,
-            "symbol": self.symbol,
-            "call": self.call,
-            "expr": self.expr,
-            "shape": self.shape,
-        }
-
 
 class _ScopedVisitor(ast.NodeVisitor):
     """Tracks the enclosing qualified name a site or an anchor carries.
@@ -619,4 +609,4 @@ def load_inventory(path: str | os.PathLike | None = None) -> dict:
 
 def repo_root_from_here() -> Path:
     """The checkout this module was imported from."""
-    return Path(__file__).resolve().parents[3]
+    return Path(__file__).resolve().parents[2]

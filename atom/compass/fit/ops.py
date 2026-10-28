@@ -26,8 +26,11 @@ decode's B always, the rows its MoE gathers, ``G``, when the shape states them
 for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
 a prefill's B and the context: a decode point's ``context``, its longest
-row's, or a prefill point's rows' mean cached tokens (`band`); and a
-prefill's B for a kind its rows move (``("rows", op)``). A collective's
+row's, after its rows' mean context in `PERMILLE` of it (``mean``) where some
+point of the family has ragged rows, leaving out each uniform point whose rows
+the KV pool cut, or a prefill point's rows' mean cached
+tokens (`band`); and a prefill's B for a kind its rows move (``("rows",
+op)``). A collective's
 points name their family themselves, `measure ops`'s `exchange`, and its one
 dimension is their message bytes; one apart along it is one row's bytes
 (``row_bytes``, a decode's B or a prefill's T being its rows), when every point
@@ -48,19 +51,20 @@ measured neighbour on both sides, not both one away, the price the other
 points of that line give it and its error; between neighbours one away, every
 query is the point itself. A point that launched other kernels than the
 neighbours it is priced from is a hidden band: no check of the neighbours'
-kernels can see it. A line holding a hidden band or an error over `LIMIT` does not
-interpolate: its family lists it under `declined` with its reason, for the
-price list's reader to answer only its measured points along it. A line that
-interpolates lists under `brackets` the neighbours each of its held-out
-points was priced from, and an answer between them is validated. Per phase
-and operator the report gives the median and largest error on the lines that
-interpolate.
+kernels can see it. A hidden band or a point that reads over `LIMIT` off its
+neighbours declines the two gaps beside it: its family lists the neighbours
+under `declined` with its reason, for the price list's reader to answer only
+the point between them; the line's other gaps interpolate. Every other
+held-out point lists under `brackets` the neighbours it was priced from, and
+an answer between them is validated. Per phase and operator the report gives
+the median and largest error of the points that decline nothing.
 
 `PriceList` is that reader: a run's first source for each leaf of an
 `op_graph` (`backends.op_graph`).
 """
 
 import argparse
+import bisect
 import functools
 import itertools
 import json
@@ -70,7 +74,7 @@ from pathlib import Path
 
 from atom.compass.artifacts import ArtifactStore, Key, Kind
 from atom.compass.backends.cost import CostTerm
-from atom.compass.backends.op_graph import LISTED, band
+from atom.compass.backends.op_graph import LISTED, PERMILLE, band
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostSource
 from atom.compass.fit import publish
@@ -79,7 +83,7 @@ from atom.compass.fit.samples import run_fields
 PROG = "compass fit ops"
 #: What a masked integer reads as in a family's signature.
 MASK = "#"
-#: The largest held-out error a line that interpolates may hold.
+#: The largest held-out error a point may read and its gaps interpolate.
 LIMIT = 0.05
 
 
@@ -114,7 +118,7 @@ def read(store, dirs) -> tuple[list[dict], dict, dict]:
     for d in dirs:
         run = json.loads((d / "run.json").read_text())
         engine = json.loads((d / "engine.json").read_text())
-        config = {**run_fields(run), "engine_config": engine}
+        config = {**run_fields(run, d / "run.json"), "engine_config": engine}
         config |= {k: run[k] for k in ("stack", "host_key", "ptl")}
         lines = sorted(d.glob("round*/ops.jsonl")) or [d / "ops.jsonl"]
         for line in itertools.chain(*(f.read_text().splitlines() for f in lines)):
@@ -187,8 +191,10 @@ def _context(p) -> int:
     """A point's context: a decode point's ``context``, its longest row's; a
     prefill point's rows' mean cached tokens (`band`), else its ``context``,
     none when it states none."""
+    from atom.compass.bench.ops import _split
+
     if p["shape"].startswith("decode"):
-        return p["context"]
+        return _split(p["context"])[0]
     return band(p["rows"], False)[0] if "rows" in p else p["context"] or 0
 
 
@@ -201,7 +207,7 @@ def fit(points) -> dict:
     dispatch and combine), so a step may hold between two points' rows;
     ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad
     every rank to the same rows and keep it."""
-    from atom.compass.bench.ops import DP_GROUP, _dependent
+    from atom.compass.bench.ops import DP_GROUP, _dependent, _split
     from atom.compass.capture.peers import MORI
 
     dependent = _dependent(points)
@@ -245,7 +251,13 @@ def fit(points) -> dict:
                 vs[0][i] - shape_counts(s).get(n, -9) in (0, 1) for s, vs in at.items()
             )
         }
+        ragged = {
+            family(p["shape"], p["leaf"], free_of[skel])
+            for p in members
+            if _split(p["context"])[1]
+        }
         for p in members:
+            name = family(p["shape"], p["leaf"], free_of[skel])
             at_p = shape_counts(p["shape"]) | {"context": _context(p)}
             moves = dependent.get(p["op"], True)
             if "T" in at_p:
@@ -256,14 +268,25 @@ def fit(points) -> dict:
                 if "B" not in dims and dependent.get(("rows", p["op"]), False):
                     dims.append("B")
             dims += ["G"] if "G" in at_p else []
+            if moves and "T" not in at_p:  # a decode point, read at its mean too
+                # a uniform point whose rows the KV pool cut holds a mean its
+                # context does not name: a family with ragged points leaves it out
+                mean = _split(p["context"])[1]
+                cut = len({r[1] - r[0] for r in p.get("rows", ())}) > 1
+                if not mean and cut and name in ragged:
+                    continue
+                dims.append("mean")
+                at_p["mean"] = mean or PERMILLE
             dims += ["context"] if moves else []
-            f = families.setdefault(
-                family(p["shape"], p["leaf"], free_of[skel]),
-                {"op": p["op"], "dims": dims, "points": {}},
-            )
+            f = families.setdefault(name, {"op": p["op"], "dims": dims, "points": {}})
             got = f["points"].setdefault(tuple(at_p[d] for d in dims), [])
             got.append((p["cold_ns"], p["kernels"]))
     for name, f in families.items():
+        if "mean" in f["dims"]:  # rows measured alike only: read by max alone
+            i = f["dims"].index("mean")
+            if {c[i] for c in f["points"]} == {PERMILLE}:
+                f["dims"].pop(i)
+                f["points"] = {c[:i] + c[i + 1 :]: v for c, v in f["points"].items()}
         merged = []
         for c, got in f["points"].items():
             if any(k != got[0][1] for _, k in got):
@@ -315,15 +338,15 @@ def held_out(params) -> list[dict]:
     """Each point priced along each dimension by the other points of its line,
     where it has a neighbour on both sides and they are not both one away (a
     collective's `row_bytes` away); a hidden band is a point whose kernels are
-    not the ones its neighbours launched. Each family gets its
-    `declined` lines, [dimension, the other coordinates, reason]: those
-    holding a hidden band or an error over `LIMIT`; and its `brackets`,
-    [dimension, the other coordinates, low, high], the neighbours each point
-    of a line that interpolates was priced from."""
+    not the ones its neighbours launched. Each family gets its `declined`
+    gaps, [dimension, the other coordinates, low, high, reason]: the
+    neighbours of a hidden band or of a point with an error over `LIMIT`; and
+    its `brackets`, [dimension, the other coordinates, low, high], the
+    neighbours each other point was priced from."""
     rows = []
     for name, f in params["families"].items():
         points = {tuple(c): (ns, k) for c, ns, k in f["points"]}
-        mine, why, brackets = [], {}, []
+        f["declined"], f["brackets"] = [], []
         for c, (ns, own) in points.items():
             for i, dim in enumerate(f["dims"]):
                 rest = c[:i] + c[i + 1 :]
@@ -342,34 +365,31 @@ def held_out(params) -> list[dict]:
                 row |= {"at": list(c), "measured_ns": ns}
                 try:
                     priced, kernels = interpolate(line, (c[i],), [dim])
-                    row |= {
-                        "priced_ns": priced,
-                        "error": priced / ns - 1 if ns else None,
-                        "hidden_band": kernels != own,
-                    }
-                    lo = max(x for x in xs if x < c[i])
-                    hi = min(x for x in xs if x > c[i])
-                    brackets.append([dim, list(rest), lo, hi])
                 except Declined as e:
-                    row["declined"] = str(e)
-                bad = row.get("hidden_band") and "launched other kernels than"
-                if not bad and abs(row.get("error") or 0) > LIMIT:
+                    rows.append(row | {"declined": str(e), "declines": False})
+                    continue
+                row |= {
+                    "priced_ns": priced,
+                    "error": priced / ns - 1 if ns else None,
+                    "hidden_band": kernels != own,
+                }
+                gap = [dim, list(rest), max(x for x in xs if x < c[i])]
+                gap.append(min(x for x in xs if x > c[i]))
+                bad = row["hidden_band"] and "launched other kernels than"
+                if not bad and abs(row["error"] or 0) > LIMIT:
                     bad = f"reads {row['error']:+.1%} off"
                 if bad:
-                    why.setdefault((dim, rest), []).append(
-                        f"{dim} = {c[i]} {bad} its neighbours"
-                    )
-                mine.append((row, (dim, rest)))
-        rows += [row | {"line_declined": line in why} for row, line in mine]
-        f["declined"] = [[d, list(r), "; ".join(w)] for (d, r), w in why.items()]
-        f["brackets"] = [b for b in brackets if (b[0], tuple(b[1])) not in why]
+                    f["declined"].append([*gap, f"{dim} = {c[i]} {bad} its neighbours"])
+                else:
+                    f["brackets"].append(gap)
+                rows.append(row | {"declines": bool(bad)})
     return rows
 
 
 def summary(rows) -> dict:
     """Per phase and operator: points held out, how many were declined between
-    kernels or sit on a declined line, and the median and largest absolute
-    error on the lines that interpolate."""
+    kernels or decline the gaps beside them, and the median and largest
+    absolute error of the rest."""
     by: dict[str, list] = {}
     for r in rows:
         by.setdefault(f"{r['phase']} {r['op']}", []).append(r)
@@ -378,10 +398,10 @@ def summary(rows) -> dict:
         kept = [
             abs(r["error"])
             for r in rs
-            if r.get("error") is not None and not r["line_declined"]
+            if r.get("error") is not None and not r["declines"]
         ]
         out[name] = {"held_out": len(rs), "declined": sum("declined" in r for r in rs)}
-        out[name] |= {"on_declined_lines": sum(r["line_declined"] for r in rs)}
+        out[name] |= {"declining": sum(r["declines"] for r in rs)}
         if kept:
             out[name] |= {"median_error": statistics.median(kept)}
             out[name] |= {"max_error": max(kept)}
@@ -391,8 +411,11 @@ def summary(rows) -> dict:
 class PriceList(CostSource):
     """`compass fit ops`'s params as a leaf's first source: its family queried
     at the step's count of each of its dimensions, ``context`` the bound's:
-    a decode step's rows' max, a prefill's rows' mean cached tokens. It also
-    declines along a line the fit declined, and prefill rows whose cached
+    a decode step's rows' max, a prefill's rows' mean cached tokens; ``mean``
+    a decode step's rows' mean context over its B in `PERMILLE` of their max,
+    where the family was measured on ragged rows; a collective's family
+    (`bench.ops.exchange`) at its message bytes. It also
+    declines inside a gap the fit declined, and prefill rows whose cached
     tokens from that mean to their max cross into another kernel. An answer
     between points is validated when every line it interpolates along holds
     a bracket (`held_out`) around it; one whose rows' cached tokens differ
@@ -407,18 +430,26 @@ class PriceList(CostSource):
         self._family = functools.lru_cache(maxsize=1 << 14)(self._family)
         self._lookup = functools.lru_cache(maxsize=1 << 14)(self._lookup)
         self._table = functools.cache(self._table)
+        self._index = functools.cache(self._index)
 
     def price(self, request: tuple) -> CostTerm | Refusal:
-        from atom.compass.bench.ops import signature
+        from atom.compass.bench.ops import exchange, signature
 
-        (leaf, (phase, *counts, top), _), kind = request, request[0]["op"]
+        (leaf, (phase, *counts, last), _), kind = request, request[0]["op"]
         at = dict(zip(("T", "B", "G", "context"), counts))
         shape = phase if at["G"] is None else f"{phase} G={at['G']}"
-        name = self._family(shape, signature(leaf))
+        if ex := exchange(leaf):  # a collective: its family over its message bytes
+            name, at["bytes"] = ex
+            name = name if name in self.params["families"] else None
+        else:
+            name = self._family(shape, signature(leaf))
         if name is None:
             return self.refuse(f"{kind}: no point of its signature was measured")
-        dims = self.params["families"][name]["dims"]
-        top = top if dims[-1:] == ["context"] and top != at["context"] else None
+        dims, top = self.params["families"][name]["dims"], None
+        if phase == "decode":
+            at["mean"] = PERMILLE * last / at["context"]
+        elif dims[-1:] == ["context"] and last != at["context"]:
+            top = last
         got = self._lookup(name, tuple(at[d] for d in dims), top)
         if isinstance(got, str):
             return self.refuse(f"{kind}: {got}")
@@ -466,28 +497,36 @@ class PriceList(CostSource):
         points = {tuple(c): (ns, k) for c, ns, k in f["points"]}
         return points, [sorted({c[i] for c in points}) for i in range(len(f["dims"]))]
 
-    @staticmethod
-    def _near(at: tuple, axes: list) -> list[set]:
+    def _index(self, name: str) -> dict:
+        """Per leading coordinates of a family's points, the values its next
+        dimension takes there, in order."""
+        index: dict = {}
+        for c in self._table(name)[0]:
+            for i in range(len(c)):
+                index.setdefault(c[:i], set()).add(c[i])
+        return {lead: sorted(vs) for lead, vs in index.items()}
+
+    def _near(self, name: str, at: tuple) -> list[set]:
         """Per dimension, `at`'s value when measured, else the values either
-        side of it."""
-        return [
-            (
-                {x}
-                if x in vs
-                else {
-                    max((v for v in vs if v < x), default=x),
-                    min((v for v in vs if v > x), default=x),
-                }
-            )
-            for x, vs in zip(at, axes)
-        ]
+        side of it, among the points the earlier dimensions' values hold, as
+        `interpolate` brackets it."""
+        index, near = self._index(name), []
+        for x in at:
+            leads = itertools.product(*map(sorted, near))
+            vs = sorted({v for lead in leads for v in index.get(lead, ())})
+            i = bisect.bisect_left(vs, x)
+            if i < len(vs) and vs[i] == x:
+                near.append({x})
+            else:
+                near.append({vs[i - 1] if i else x, vs[i] if i < len(vs) else x})
+        return near
 
     def _validated(self, name: str, at: tuple) -> bool:
         """Whether every line `at` interpolates along holds a bracket around
         it: a line through `at`'s neighbours in the other dimensions that
         holds no point at `at`."""
-        f, (points, axes) = self.params["families"][name], self._table(name)
-        near, held = self._near(at, axes), f.get("brackets", ())
+        f, (points, _) = self.params["families"][name], self._table(name)
+        near, held = self._near(name, at), f.get("brackets", ())
         lines = [
             (i, list(rest))
             for i, x in enumerate(at)
@@ -503,17 +542,17 @@ class PriceList(CostSource):
         )
 
     def _at(self, name: str, at: tuple):
-        """`interpolate` at `at`, declining along a line the fit
-        declined: one along a dimension `at` lies between two values of,
-        whose other coordinates are `at`'s, or a value bracketing it."""
+        """`interpolate` at `at`, declining inside a gap the fit declined:
+        one along a dimension `at` lies inside off its measured values, whose
+        other coordinates are `at`'s, or a value bracketing it."""
 
         f, (points, axes) = self.params["families"][name], self._table(name)
         dims = f["dims"]
-        near = self._near(at, axes)
-        for dim, rest, why in f.get("declined", ()):
+        near = self._near(name, at)
+        for dim, rest, lo, hi, why in f.get("declined", ()):
             i = dims.index(dim)
             others = [near[j] for j in range(len(dims)) if j != i]
-            between = axes[i][0] < at[i] < axes[i][-1] and at[i] not in axes[i]
+            between = lo < at[i] < hi and at[i] not in axes[i]
             if between and all(r in o for r, o in zip(rest, others)):
                 where = "".join(
                     f" at {d} = {r}" for d, r in zip(dims[:i] + dims[i + 1 :], rest)

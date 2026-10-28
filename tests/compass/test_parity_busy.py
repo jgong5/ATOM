@@ -18,7 +18,6 @@ from test_parity_record import _config, _drive
 
 from atom.compass.drive import serve
 from atom.compass.parity import ENV, MARK, TARGET_DONE, busy
-from atom.compass.parity.busy import PROPOSE
 
 #: One MTP output prefill, in us. The target: K1, K2 queued 2 after K1 and
 #: counted whole, the collective K3, queued on rank 0 before K2 ends but
@@ -37,6 +36,7 @@ KERNELS = [
     ("d1", 120, 125, 111),
     ("d2", 126, 130, 113),
 ]
+PROPOSE = MARK + "d_propose_ns"
 #: Where the recorder's ranges open, each planted on a rank only where its real
 #: recorder opens it (`_opened`).
 MARKS = {MARK + "d_draft_kv_ns": (80, 90), TARGET_DONE: (100, 101), PROPOSE: (110, 200)}
@@ -100,7 +100,8 @@ def _run(
     named `collective`, at 50."""
     steps = tmp_path / "steps"
     steps.mkdir()
-    line = {"step": 7, "rows": [[100, 100, False]], "d_target_ns": 1, "d_propose_ns": 1}
+    line = {"step": 7, "rows": [[100, 100, False]], "d_target_ns": 1}
+    line.update(d_draft_kv_ns=1, d_propose_ns=1)
     (steps / "dp0.jsonl").write_text(json.dumps(line) + "\n")
     late = {"k1": (5, 20, 1), KERNELS[2][0]: (50, 60, 45)}
     for r, name in enumerate(ranks):
@@ -120,8 +121,8 @@ def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
     """The named result. Rank 0's target: union 39, gaps 2 + 1 + 1 + 1, the
     collective (an all-reduce, or the mono runner's peer fence) from rank 1's
     start and its gap capped; rank 1's 5 more. The draft: DK, D1 and D2, their
-    union 12 and gaps 1 + 1 + 1; the propose pass D1 and D2. Each rank opens the
-    ranges its real recorder opens."""
+    union 12 and gaps 1 + 1 + 1; the draft-KV pass DK, the propose pass D1 and
+    D2. Each rank opens the ranges its real recorder opens."""
     marks = [set(_opened(tmp_path / f"r{r}", monkeypatch, r)[2]) for r in (0, 1)]
     monkeypatch.setattr(busy, "CHUNK", 64)  # a decode straddles every read
     path = busy.reduce(_run(tmp_path, marks=marks, collective=collective))
@@ -129,7 +130,13 @@ def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
     assert path == tmp_path / "steps" / "dp0.busy.jsonl"
     got = [json.loads(x) for x in path.read_text().splitlines()]
     assert got == [
-        {"step": 7, "b_target_ns": 49000, "b_draft_ns": 15000, "b_propose_ns": 11000}
+        {
+            "step": 7,
+            "b_target_ns": 49000,
+            "b_draft_ns": 15000,
+            "b_propose_ns": 11000,
+            "b_draft_kv_ns": 4000,
+        }
     ]
 
 
