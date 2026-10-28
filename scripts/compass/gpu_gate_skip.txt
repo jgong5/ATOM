@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: MIT
+# Test files gate_gpu.sh leaves out of the suite on one GPU, one per line as
+# "<GPU> <test file>". A line applies when torch's name for the first card in
+# HIP_VISIBLE_DEVICES contains <GPU>; the file's collected tests then come off
+# the expected pass count. Each line is a file that stalls there, and goes when
+# the issue above it closes.
+
+# #2441: stalls at a device sync after a TBO forward.
+MI308X tests/attentions/deepseek_v41/test_tbo.py
