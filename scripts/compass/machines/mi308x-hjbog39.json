@@ -317,7 +317,7 @@
     "kernel_floor_s": 2e-06,
     "software_pinned_to": {
       "rocm": "7.2.4",
-      "aiter": "9205e1059",
+      "aiter": "41d4d8d7e",
       "rccl": "2.27.7",
       "torch": "2.10.0+rocm7.2.4.git3d3aa833"
     }

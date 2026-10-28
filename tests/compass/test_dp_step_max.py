@@ -42,7 +42,7 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.sampling_params import SamplingParams
-from atom.utils import get_open_port
+from tests.compass.held_ports import held_ports
 
 BLOCK = 16
 
@@ -139,7 +139,6 @@ def dp2(monkeypatch):
         "aiter.dist.parallel_state",
         SimpleNamespace(get_dp_group=lambda: SimpleNamespace(cpu_group=local.group)),
     )
-    port = get_open_port()
 
     def on_rank(rank, step):
         local.group = dist_utils.stateless_init_torch_distributed_process_group(
@@ -155,7 +154,8 @@ def dp2(monkeypatch):
             futures = [pool.submit(on_rank, r, s) for r, s in enumerate(steps)]
             return [f.result() for f in futures]
 
-    return run
+    with held_ports(1) as [port]:  # until rank 0's store binds it
+        yield run
 
 
 def test_one_rank_exchanges_nothing_and_reports_its_own_cost(monkeypatch):

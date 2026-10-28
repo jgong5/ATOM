@@ -335,6 +335,15 @@ def test_the_caller_is_the_kfd_entry_its_first_open_of_dev_kfd_added(
         pass
 
 
+@pytest.mark.skipif(not os.path.exists("/dev/kfd"), reason="needs /dev/kfd")
+def test_the_test_session_names_its_kfd_entry_by_its_first_open():
+    # tests/conftest.py's imports open /dev/kfd (`atom.utils.forward_context`
+    # asks torch for a GPU). Opened there first, this process could not name
+    # its own entry, and an in-process `compass measure memory` would refuse
+    # it as a process on the GPUs.
+    assert drive_gpu.kfd_pid() == drive_gpu._ADDED.get(os.getpid())
+
+
 def test_memory_is_read_on_the_kfd_node_of_the_named_rocm_smi_gpu(
     tmp_path, monkeypatch
 ):

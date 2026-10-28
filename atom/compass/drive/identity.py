@@ -13,6 +13,7 @@ served is read from its step record.
 
 import json
 import os
+import threading
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -37,6 +38,11 @@ MODELS = {"0x75a3": "MI355X", "0x75c7": "MI455X"}
 AITER_ABBREV = 9
 #: Where a card's PCI device is, by bus; `/sys/class/drm/card<n>/device` links here.
 PCI = "/sys/bus/pci/devices"
+#: run.json's entry naming each change of its cards' PTL state while the
+#: command served (`ptl_changes`); a run whose cards changed none has none.
+PTL_CHANGES = "ptl_changes"
+#: Seconds between the readings `ptl_changes` takes.
+PTL_POLL_S = 1.0
 
 
 def identity(
@@ -94,11 +100,12 @@ def _device(gpus: tuple[int, ...]) -> list[dict]:
     ]
 
 
-def _ptl(gpus: tuple[int, ...]) -> str:
+def _ptl(gpus: tuple[int, ...], buses=None) -> str:
     """The PTL state of `gpus`' cards, each read from `ptl_enable` under its
-    PCI device, as rocm-smi's bus names it, and `NO_PTL` for a card with no
-    `ptl` directory; cards that disagree refuse, naming each."""
-    buses = json.loads(smi("--showbus", "--json")) if gpus else {}
+    PCI device, as `buses`, rocm-smi's bus listing, names it, read when not
+    given, and `NO_PTL` for a card with no `ptl` directory; cards that disagree
+    refuse, naming each."""
+    buses = buses or (json.loads(smi("--showbus", "--json")) if gpus else {})
     read = {}
     for gpu in gpus:
         ptl = Path(PCI) / buses[f"card{gpu}"]["PCI Bus"].lower() / "ptl"
@@ -107,6 +114,47 @@ def _ptl(gpus: tuple[int, ...]) -> str:
         cards = ", ".join(f"GPU {gpu} {ptl}" for gpu, ptl in read.items())
         raise GpuRefusal(f"the cards of this run disagree on PTL: {cards}")
     return next(iter(read.values()), NO_PTL)
+
+
+@contextmanager
+def ptl_changes(gpus: tuple[int, ...], ready: Path):
+    """A list naming each change of `gpus`' PTL state, read every `PTL_POLL_S`
+    from when the file `ready` exists and once more as the block ends, as
+    {"at": its UTC time, "from": a state, "to": a state}; cards that disagree
+    read as ``mixed``. A reading that failed raises as the block ends."""
+    changes, failed, stop = [], [], threading.Event()
+
+    def read(buses):
+        try:
+            return _ptl(gpus, buses)
+        except GpuRefusal:
+            return "mixed"
+
+    def watch():
+        try:
+            while not ready.exists():
+                if stop.wait(PTL_POLL_S):
+                    return
+            buses = json.loads(smi("--showbus", "--json"))
+            last, stopping = read(buses), False
+            while not stopping:
+                stopping = stop.wait(PTL_POLL_S)
+                if (now := read(buses)) != last:
+                    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    changes.append({"at": at, "from": last, "to": now})
+                    last = now
+        except Exception as error:  # noqa: BLE001 - raised as the block ends
+            failed.append(error)
+
+    thread = threading.Thread(target=watch, daemon=True)
+    thread.start()
+    try:
+        yield changes
+    finally:
+        stop.set()
+        thread.join()
+    if failed:
+        raise failed[0]
 
 
 def _model(gpu: int, card: dict) -> str:

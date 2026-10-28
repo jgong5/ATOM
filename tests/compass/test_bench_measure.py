@@ -3,7 +3,8 @@
 
 Inputs are `test_fit_samples.py`'s record, whose step record ATOM's
 `Scheduler` drove through `test_parity_record.py`'s runner and which served
-two client runs, and that record's lines published as a `shape_population`.
+the client runs of `RUNS`, and that record's lines published as a
+`shape_population`.
 The bench is a fake in `Bench`'s place, on the record's engine, whose result
 is the batch's token count in microseconds; run.json's identity is the
 record's, so a measurement states the record's configuration; the GPU checks
@@ -221,6 +222,14 @@ def test_a_held_entry_taken_under_other_readings_refuses_naming_it(run):
     ):
         run(rec, "--sample", "all", *run.named(rec))
     assert Bench.started == []
+
+
+def test_a_held_entry_taken_under_other_readings_names_a_fresh_store(run):
+    rec = str(run.record)
+    run(rec, "--sample", "all", *run.named(rec))
+    run.identity["stack"]["aiter"] = "v9.9.9"
+    with pytest.raises(SystemExit, match="measure into a fresh --store"):
+        run(rec, "--sample", "all", *run.named(rec))
 
 
 def test_a_held_entry_measured_on_cards_of_another_ptl_state_refuses(run):

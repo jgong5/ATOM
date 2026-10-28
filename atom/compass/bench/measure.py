@@ -184,7 +184,9 @@ def _todo(points, configuration, engine, sampling, store, readings) -> list:
     if stale:
         raise ValueError(
             f"{len(stale)} measurements in the store were taken under other "
-            "readings than this run's:\n" + "\n".join(stale)
+            "readings than this run's:\n" + "\n".join(stale) + "\nA held entry "
+            "is never replaced: measure into a fresh --store, or remove the "
+            "entries named"
         )
     return todo
 

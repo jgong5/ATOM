@@ -50,13 +50,13 @@ from atom.compass.backends import KvGeometry
 from atom.compass.clock import LpId, prefill_decode_table
 from atom.compass.detect.determinism import StepTable
 from atom.compass.detect.scenario import check_run, pipeline_timeline
-from atom.compass.drive.serve import _free_ports
 from atom.compass.kv import Scope, TransferModel
 from atom.compass.runner.pp_send import StageSends
 from atom.compass.spec import MachineSpec
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.models.utils import get_pp_indices
 from atom.utils.clock import LPRuntime
+from tests.compass.held_ports import held_ports
 
 KV = "engine-D->engine-P-pp0:kv_write_req"
 #: The run tests' machine: the slice model's tokenizer probed for Llama too.
@@ -251,55 +251,58 @@ def run_pd_pp(out: Path, seed: str, pp: int) -> dict:
     on `split_model`, served under the slice model's name."""
     out.mkdir()
     model = split_model(out) if pp > 1 else MODEL
-    ports = dict(zip(PORTS, _free_ports(len(PORTS))))
-    more = {compass_run.PREFILL_PP: pp} if pp > 1 else {}
-    run_file = _run_file(
-        out,
-        clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
-        step_stub=CONSTANT,
-        machine=PP_MACHINE,
-        **PD,
-        **more,
-    )
-    env = dict(
-        os.environ,
-        PYTHONHASHSEED=seed,
-        PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        MODEL=str(model),
-        SERVER_ARGS=f"--enforce-eager --max-model-len 2048 --served-model-name {MODEL}",
-        PREFILL_ARGS=f"-pp {pp}" if pp > 1 else "",
-        **{name: str(port) for name, port in ports.items()},
-    )
-    if pp > 1:  # ATOM's runner sets it for a Llama model, so its key holds it
-        env["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
-    publish_pd_entries(out / "store", PP_MACHINE, env)
-    log = out / "pd_sim.log"
-    with open(log, "w") as f:
-        sim = subprocess.Popen(
-            ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
-            cwd=TREE,
-            env=env,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+    with held_ports(len(PORTS)) as drawn:
+        ports = dict(zip(PORTS, drawn))
+        more = {compass_run.PREFILL_PP: pp} if pp > 1 else {}
+        run_file = _run_file(
+            out,
+            clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
+            step_stub=CONSTANT,
+            machine=PP_MACHINE,
+            **PD,
+            **more,
         )
-    watchdog = threading.Timer(WALL_S, os.killpg, (sim.pid, signal.SIGKILL))
-    watchdog.start()
-    try:
-        deadline = time.monotonic() + WALL_S
-        while "pd_sim: ready" not in log.read_text():
-            assert sim.poll() is None, f"pd_sim.sh exited:\n{log.read_text()}"
-            assert time.monotonic() < deadline, f"no router in {WALL_S} wall seconds"
-            time.sleep(0.5)
-        run = json.loads(run_file.read_text())
-        traffic = PdTraffic(run, ports["ROUTER_PORT"], sim, ports["PREFILL_PORT"])
-        traffic.run()
-        code = sim.wait(timeout=120)
-    finally:
-        watchdog.cancel()
-        if sim.poll() is None:
-            os.killpg(sim.pid, signal.SIGKILL)
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            MODEL=str(model),
+            SERVER_ARGS=f"--enforce-eager --max-model-len 2048 --served-model-name {MODEL}",
+            PREFILL_ARGS=f"-pp {pp}" if pp > 1 else "",
+            **{name: str(port) for name, port in ports.items()},
+        )
+        if pp > 1:  # ATOM's runner sets it for a Llama model, so its key holds it
+            env["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
+        publish_pd_entries(out / "store", PP_MACHINE, env)
+        log = out / "pd_sim.log"
+        with open(log, "w") as f:
+            sim = subprocess.Popen(
+                ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        watchdog = threading.Timer(WALL_S, os.killpg, (sim.pid, signal.SIGKILL))
+        watchdog.start()
+        try:
+            deadline = time.monotonic() + WALL_S
+            while "pd_sim: ready" not in log.read_text():
+                assert sim.poll() is None, f"pd_sim.sh exited:\n{log.read_text()}"
+                assert (
+                    time.monotonic() < deadline
+                ), f"no router in {WALL_S} wall seconds"
+                time.sleep(0.5)
+            run = json.loads(run_file.read_text())
+            traffic = PdTraffic(run, ports["ROUTER_PORT"], sim, ports["PREFILL_PORT"])
+            traffic.run()
+            code = sim.wait(timeout=120)
+        finally:
+            watchdog.cancel()
+            if sim.poll() is None:
+                os.killpg(sim.pid, signal.SIGKILL)
     assert code == 0, f"pd_sim.sh exited {code}:\n{log.read_text()[-4000:]}"
     table = (out / compass_run.STEP_TABLE_FILE).read_text()
     return {

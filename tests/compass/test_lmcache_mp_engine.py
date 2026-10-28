@@ -49,7 +49,6 @@ from test_vertical_slice import (
     TREE,
     WALL_S,
     Traffic,
-    _free_port,
     _run_file,
 )
 
@@ -77,6 +76,7 @@ from atom.kv_transfer.offload.mp import native_state_worker, transfer
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.utils import clock, forward_context
 from atom.utils.distributed import utils as dist_utils
+from tests.compass.held_ports import held_ports
 
 STEP = 0.01  # the step loop's clock calls, one per step
 #: A rank's recurrent-state image: its copy over the chunks moves a reply by
@@ -564,7 +564,7 @@ def test_a_one_deployment_run_loads_a_stored_prefix_back(
     # The readings are keyed by the performance environment the server runs in.
     monkeypatch.setenv("AITER_LOG_LEVEL", "WARNING")
     machine = _machine(tmp_path)
-    port, server_port = _free_port(), lmcache_port
+    server_port = lmcache_port
     flags = ["--host", "127.0.0.1", "--port", str(server_port), "--chunk-size", "256"]
     flags += ["--l1-size-gb", "1", "--eviction-policy", "LRU"]
     flags += ["--eviction-trigger-watermark", "0"]  # every tick evicts
@@ -580,21 +580,26 @@ def test_a_one_deployment_run_loads_a_stored_prefix_back(
         + ["--store", str(tmp_path / "store"), "--out", str(tmp_path / "measure")]
         + ["--", *ATOM_ARGS]
     )
-    run_file = _run_file(
-        tmp_path,
-        step_stub=CONSTANT,
-        client_runs=3,
-        bound_s=LATE_S + 60.0,
-        machine=json.loads(machine.read_text()),
-        lmcache={"server": flags, "lookup_s": list(LOOKUP_S), "request_s": REQUEST_S},
-    )
     env = dict(
         os.environ,
         PYTHONPATH=str(TREE),
         OFFLOAD_MIN_LOAD_TOKENS="256",
         OFFLOAD_MIN_SAVE_TOKENS="256",
     )
-    with open(tmp_path / "server.log", "w") as log:
+    with held_ports(2) as (clock_port, port), open(tmp_path / "server.log", "w") as log:
+        run_file = _run_file(
+            tmp_path,
+            clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
+            step_stub=CONSTANT,
+            client_runs=3,
+            bound_s=LATE_S + 60.0,
+            machine=json.loads(machine.read_text()),
+            lmcache={
+                "server": flags,
+                "lookup_s": list(LOOKUP_S),
+                "request_s": REQUEST_S,
+            },
+        )
         server = subprocess.Popen(
             [sys.executable, "-m", "atom.entrypoints.openai.api_server", *ATOM_ARGS]
             + ["--host", "127.0.0.1", "--server-port", str(port)]
