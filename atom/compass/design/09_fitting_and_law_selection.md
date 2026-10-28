@@ -163,7 +163,14 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   `forward_done_event`, busy time is the union of the pass's kernels plus each gap before
   one of them: whole where that kernel was already queued when the gap opened, else capped
   at the trace's median such queued gap. A TP collective counts from its last rank's start;
-  a pass's busy time is its largest over the ranks. No cut, threshold or interval. The
+  a target pass's busy time is its largest over the ranks. Drafter passes are traced on rank
+  0 alone, every other rank's profiler paused for them, and labelled from rank 0
+  ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6438763733)): with both
+  ranks profiled the draft-KV concatenation ran 6% long. A traced kernel shorter than about
+  4.7 us runs to that floor, so drafter labels stay 5 to 11% over unprofiled time until
+  [#2415](https://github.com/jgong5/ATOM/issues/2415) subtracts each kernel's floor
+  ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6460474362)). No cut,
+  threshold or interval. The
   prefill device law fits from trace runs only, and a fit given none names its prefill
   vector unfitted; a trace run's decodes and host segments are profiled, so it gives no
   decode or host label, and an ordinary record fits the decode and host laws. A trace run
