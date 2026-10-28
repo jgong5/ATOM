@@ -1,14 +1,11 @@
 {
   "schema_version": 1,
-  "name": "mi455",
+  "name": "mi455-b0",
   "provenance": {
     "authored_by": "compass agent for jgong5",
-    "date": "2026-10-21",
+    "date": "2026-10-28",
     "origin": "mixed",
     "origins": {
-      "device.name": {
-        "origin": "datasheet"
-      },
       "device.count_per_node": {
         "origin": "datasheet"
       },
@@ -38,6 +35,9 @@
       },
       "interconnect.inter_node.link_bandwidth_bytes_per_s": {
         "origin": "datasheet"
+      },
+      "device.name": {
+        "origin": "assumed"
       },
       "device.arch": {
         "origin": "assumed"
@@ -111,11 +111,11 @@
     },
     "fragments": [
       "datasheet",
-      "arch",
+      "b0",
       "ratios",
       "carried"
     ],
-    "notes": "MI455X product page and brochure (07/26), read 2026-10-09; its 432 GB of HBM4 as GiB, since MI355X's 288 GB reads 288 GiB less 16 MiB at a real start and MI308X's 192 GB reads 192 GiB less 16 MiB | LLVM's AMDGPUUsage lists gfx1250 for MI455X; AMD has not confirmed it | MI455X never ran: mi355x-gpu45's derates, and its bandwidth curve over its datasheet bandwidth times MI455X's | MI455X never ran: mi355x-gpu45's values where no datasheet states one: its probed kernel floor and intra-node link latency, its host and stack, and the inter-node link latency and router relay it assumes"
+    "notes": "MI455X product page and brochure (07/26), read 2026-10-09; its 432 GB of HBM4 as GiB, since MI355X's 288 GB reads 288 GiB less 16 MiB at a real start and MI308X's 192 GB reads 192 GiB less 16 MiB | the B0 performance machines, which no card here reads: MI455X named for their stepping, at the arch the A0 samples read | no B0 card ran: mi355x-gpu45's derates, and its bandwidth curve over its datasheet bandwidth times MI455X's | no B0 card ran: mi355x-gpu45's values where no datasheet states one: its probed kernel floor and intra-node link latency, its host and stack, and the inter-node link latency and router relay it assumes"
   },
   "host": {
     "cpu": {
@@ -148,7 +148,7 @@
     }
   },
   "device": {
-    "name": "MI455X",
+    "name": "MI455X B0",
     "arch": "gfx1250",
     "count_per_node": 4,
     "memory": {

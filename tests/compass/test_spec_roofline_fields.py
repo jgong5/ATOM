@@ -120,9 +120,9 @@ def test_each_machine_file_reads_the_new_fields_with_their_origins(machine):
         "device.memory.bandwidth_curve",
         "device.kernel_floor_s",
     ]
-    # Node 18's, mi355-gpu-45's and MI455's are probe_device.py's readings;
+    # Node 18's, mi355-gpu-45's and MI455 A0's are probe_device.py's readings;
     # the others are still assumed.
-    probed = ("mi308x-hjbog18", "mi355x-gpu45", "mi455")
+    probed = ("mi308x-hjbog18", "mi355x-gpu45", "mi455-a0")
     origin = "probed" if machine in probed else "assumed"
     for path in paths:
         assert spec.value(path)
