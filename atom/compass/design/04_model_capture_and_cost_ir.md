@@ -267,7 +267,7 @@ at a new line and says nothing. **`__bool__` stays untouched**, so a branch on a
 still installs its guard and a step whose shape decides which path the engine takes still
 records that it did.
 
-ATOM's decode step needs three more answers on the capture side:
+ATOM's decode step needs more answers on the capture side:
 
 - **`SymInt.__hash__`** is answered with the hint and logged: aiter's greedy top-k caches
   a tensor per row count, and hashing a symbol otherwise raises.
