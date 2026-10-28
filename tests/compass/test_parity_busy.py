@@ -23,7 +23,8 @@ from atom.compass.parity import ENV, MARK, TARGET_DONE, busy
 #: counted whole, the collective K3, queued on rank 0 before K2 ends but
 #: started at 50 by rank 1, whose launch returns at 46, and K4 queued 1 after
 #: it, and the sampler launched after the draft-KV pass's DK. The draft: DK,
-#: then the propose pass's D1, its launch 45 late, and D2 queued 1 after D1.
+#: then the propose pass's D1, its launch 45 late, and D2, a collective, queued
+#: 1 after D1.
 #: The queued gaps are 2, 1 and 1, so every gap whose kernel was not queued
 #: counts 1.
 KERNELS = [
@@ -34,7 +35,7 @@ KERNELS = [
     ("dk", 72, 75, 81),
     ("sample", 76, 78, 92),
     ("d1", 120, 125, 111),
-    ("d2", 126, 130, 113),
+    ("allgather_naive", 126, 130, 113),
 ]
 PROPOSE = MARK + "d_propose_ns"
 #: Where the recorder's ranges open, each planted on a rank only where its real
@@ -44,8 +45,11 @@ MARKS = {MARK + "d_draft_kv_ns": (80, 90), TARGET_DONE: (100, 101), PROPOSE: (11
 
 def _trace(path, kernels, tokens=100, marks=MARKS):
     """A kineto trace of one forward running `kernels`, (name, start, end,
-    launch), each launch call 1 us long, and opening `marks`; written over many
-    lines."""
+    launch), each launch call 1 us long, and opening `marks`; a drafter pass
+    whose range it does not open ran with the profiler paused, so it holds none
+    of the kernels launched there. Written over many lines."""
+    paused = [MARKS[m] for m in MARKS if m != TARGET_DONE and m not in marks]
+    kernels = [k for k in kernels if not any(a <= k[3] <= b for a, b in paused)]
     events = [
         {
             "cat": "user_annotation",
@@ -94,10 +98,12 @@ def _run(
     tokens=100,
     marks=(MARKS, MARKS),
     collective=KERNELS[2][0],
+    slow=(),
 ):
     """A trace run's directory: its record's one line and each rank's trace,
-    opening its `marks`, rank 1's K1 starting 5 us earlier and its collective,
-    named `collective`, at 50."""
+    opening its `marks`, rank 1's K1 starting 5 us earlier, its collective,
+    named `collective`, at 50, and each kernel named in `slow` running 7 us
+    longer."""
     steps = tmp_path / "steps"
     steps.mkdir()
     line = {"step": 7, "rows": [[100, 100, False]], "d_target_ns": 1}
@@ -106,6 +112,7 @@ def _run(
     late = {"k1": (5, 20, 1), KERNELS[2][0]: (50, 60, 45)}
     for r, name in enumerate(ranks):
         kernels = [(k, *late[k]) if r and k in late else (k, *x) for k, *x in KERNELS]
+        kernels = [(k, a, b + 7 * (r and k in slow), q) for k, a, b, q in kernels]
         kernels = [(collective if k == KERNELS[2][0] else k, *x) for k, *x in kernels]
         trace = tmp_path / "trace" / name / "m_ts_1.pt.trace.json.gz"
         _trace(trace, kernels, tokens, marks[r])
@@ -120,9 +127,12 @@ def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
 ):
     """The named result. Rank 0's target: union 39, gaps 2 + 1 + 1 + 1, the
     collective (an all-reduce, or the mono runner's peer fence) from rank 1's
-    start and its gap capped; rank 1's 5 more. The draft: DK, D1 and D2, their
+    start and its gap capped, 44; rank 1's 50, its K1 5 longer, no DK before
+    the sampler and a cap of 1.5, its queued gaps 2 and 1. The draft: DK, D1 and D2, their
     union 12 and gaps 1 + 1 + 1; the draft-KV pass DK, the propose pass D1 and
-    D2. Each rank opens the ranges its real recorder opens."""
+    D2. Each rank opens the ranges its real recorder opens under ATOM's
+    profiler: rank 1 pauses it for the drafter's passes, so the draft's
+    collective is on rank 0 alone and aligns with none."""
     marks = [set(_opened(tmp_path / f"r{r}", monkeypatch, r)[2]) for r in (0, 1)]
     monkeypatch.setattr(busy, "CHUNK", 64)  # a decode straddles every read
     path = busy.reduce(_run(tmp_path, marks=marks, collective=collective))
@@ -132,12 +142,27 @@ def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
     assert got == [
         {
             "step": 7,
-            "b_target_ns": 49000,
+            "b_target_ns": 50000,
             "b_draft_ns": 15000,
             "b_propose_ns": 11000,
             "b_draft_kv_ns": 4000,
         }
     ]
+
+
+def test_the_drafter_s_passes_are_rank_0_s_though_another_rank_traced_them(tmp_path):
+    """Rank 1 traced the drafter too, its K2, DK and D1 7 us longer: the target
+    takes the larger rank, rank 1's 53.5 (union 49, gaps 2 + 1 and its cap of
+    1.5 once), the draft and its passes rank 0's alone."""
+    path = busy.reduce(_run(tmp_path, slow=("k2", "dk", "d1")))
+
+    got = json.loads(path.read_text())
+    assert got["b_target_ns"] == 53500
+    assert (got["b_draft_ns"], got["b_propose_ns"], got["b_draft_kv_ns"]) == (
+        15000,
+        11000,
+        4000,
+    )
 
 
 @pytest.mark.parametrize(
@@ -161,8 +186,10 @@ def _opened(tmp_path, monkeypatch, rank):
     monkeypatch.setenv(ENV, str(tmp_path / "real"))
     runner = recorded(rank, _config())
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as p:
+        runner.profiler = p  # as ATOM's start_profiler keeps it
         for b in batches:
             runner.forward(b)
+    runner.profiler = None  # as its stop_profiler leaves it
     return runner, batches, [e.name for e in p.events() if e.name.startswith(MARK)]
 
 
@@ -226,11 +253,13 @@ def test_a_trace_run_profiles_from_before_its_ready_file_to_its_stop(
 def test_only_a_profiled_forward_marks_its_target_end_and_each_drafter_pass(
     tmp_path, monkeypatch, rank
 ):
-    """On every TP rank, though only rank 0 records."""
+    """The target's end on every TP rank, though only rank 0 records; each
+    drafter pass on rank 0 alone, every other rank's profiler paused for it."""
     runner, batches, names = _opened(tmp_path, monkeypatch, rank)
     outputs = sum(b.produces_output() for b in batches)
-    assert names.count(TARGET_DONE) == names.count(PROPOSE) == outputs > 0
-    assert names.count(MARK + "d_draft_kv_ns") == len(batches)
+    assert names.count(TARGET_DONE) == outputs > 0
+    assert names.count(PROPOSE) == (0 if rank else outputs)
+    assert names.count(MARK + "d_draft_kv_ns") == (0 if rank else len(batches))
 
     def opened(name):
         raise AssertionError(f"{name} opened with no profiler running")

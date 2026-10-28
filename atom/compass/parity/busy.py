@@ -3,7 +3,8 @@
 
 A trace run is `compass record --trace`: its server ran under ATOM's kineto
 profiler on every TP rank, without Python stacks, from before the first
-request to its stop, and each rank wrote ``OUT/trace/rank_<r>/`` one gzipped
+request to its stop, every rank but 0 paused for each drafter pass, and each
+rank wrote ``OUT/trace/rank_<r>/`` one gzipped
 chrome trace. `reduce` writes ``OUT/steps/dp0.busy.jsonl``: per line of the
 record, its ``step`` and ``b_target_ns``, and on an MTP record ``b_draft_ns``
 and, for each drafter pass `PASSES` names that the line times, its busy time
@@ -22,9 +23,11 @@ before one of them on the forward's device timeline: whole where that kernel's
 launch call had returned when the gap opened, so the device idled on its own,
 else capped at the rank's median such queued gap, since the device then waited
 for the host's launch. A TP collective's kernel on one rank includes its wait
-for the peers: the n-th collective kernel (`COLLECTIVE`) of a forward counts on
-every rank from its latest rank's start, and as queued once its latest
-rank's launch call returned. A pass's busy time is its largest over the ranks.
+for the peers: the n-th target collective kernel (`COLLECTIVE`) of a forward
+counts on every rank from its latest rank's start, and as queued once its
+latest rank's launch call returned. The target's busy time is its largest over
+the ranks; the draft's and each drafter pass's are rank 0's, the one rank that
+profiled them.
 
 A trace directory not named ``rank_<r>``, a DP or a pipeline run's, refuses:
 per-rank busy time under DP is not reduced.
@@ -133,17 +136,21 @@ def forwards(path) -> list[dict]:
 
 
 def _align(ranks: list[list[dict]]) -> None:
-    """Start each forward's n-th collective kernel on every rank no earlier
-    than its latest rank's start, queued at its latest launch return."""
+    """Start each forward's n-th target collective kernel on every rank no
+    earlier than its latest rank's start, queued at its latest launch return."""
     for fs in zip(*ranks):
         calls = [
-            [j for j, k in enumerate(f["kernels"]) if COLLECTIVE.search(k[5])]
+            [
+                j
+                for j, k in enumerate(f["kernels"])
+                if k[3] == "target" and COLLECTIVE.search(k[5])
+            ]
             for f in fs
         ]
         if len({len(c) for c in calls}) > 1:
             raise ValueError(
                 f"the ranks' forward of {fs[0]['tokens']} tokens runs "
-                f"{[len(c) for c in calls]} collective kernels"
+                f"{[len(c) for c in calls]} target collective kernels"
             )
         for n in range(len(calls[0])):
             ks = [f["kernels"][c[n]] for f, c in zip(fs, calls)]
@@ -209,10 +216,8 @@ def reduce(out) -> Path:
     per_rank = [busy(fs) for fs in ranks]
     rows = []
     for i, s in enumerate(lines):
-        got = {
-            p: max(r[i].get(p, 0) for r in per_rank)
-            for p in ("target", "draft", *PASSES)
-        }
+        got = {p: per_rank[0][i].get(p, 0) for p in ("draft", *PASSES)}
+        got["target"] = max(r[i].get("target", 0) for r in per_rank)
         row = {"step": s["step"], "b_target_ns": got["target"]}
         if "d_target_ns" in s:
             row["b_draft_ns"] = got["draft"]
