@@ -804,7 +804,7 @@ reaches 005 through `/shared_nfs` seconds late, so set `PREFIX_S=300`.
 `ATOM_HOST_IP` is each node's `ens3` address, which the router, Mooncake's
 handshake and its notifications reach. With `ATOM_MOONCAKE_IB_DEVICE` unset,
 each GPU N registers with `ionic_N`, which carries RoCE v2 on IPv6 only (GID
-index 1). Four things keep the KV on it rather than on Mooncake's TCP fallback
+index 1). These keep the KV on it rather than on Mooncake's TCP fallback
 (`Found 0 HCAs` in `server.log`), whose transfers time out at c=256:
 
 - **The host's ionic provider.** The image's `libionic.so.1.0.54.0` does not
