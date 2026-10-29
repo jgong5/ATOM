@@ -803,7 +803,7 @@ def stamp_pulls(path, handoff, now) -> None:
 class _StampedQueue(queue.Queue):
     """A real recording's output queue: each put is offered as a ``t_put_ns``
     stamp, and the output thread's next get writes the item before it with its
-    row count, its send returned."""
+    batch's row count, its send returned."""
 
     taken = None  # (put, item) the output thread took last
 
