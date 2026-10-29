@@ -234,7 +234,7 @@ def test_a_leaf_still_open_when_the_step_ends_is_refused_by_name(recorder):
     recorder.start()  # the generator's close unwinds a leaf no step traces
 
 
-def test_a_triton_warmup_launches_nothing_and_a_compiled_kernel_is_refused(
+def test_a_triton_warmup_launches_nothing_and_a_compiled_kernel_lifts_as_a_jit_one(
     request, tmp_path
 ):
     if "COMPASS_ARCH_DECLARED" not in os.environ:
@@ -269,8 +269,8 @@ def test_a_triton_warmup_launches_nothing_and_a_compiled_kernel_is_refused(
         kernel.warmup(1, grid=(1,))
         with pytest.raises(ValueError, match="triton.kernel lifts to"):
             kernel.run(1, grid=(1,), warmup=False)
-        for launch in (lambda: compiled.run, lambda: compiled[1]):
-            with pytest.raises(ValueError, match="through CompiledKernel.run"):
+        for launch in (lambda: compiled.run(1, 1, 1), lambda: compiled[(1,)](1)):
+            with pytest.raises(ValueError, match="triton.kernel lifts to"):
                 launch()
         with pytest.raises(ValueError, match="compiled outside the capture"):
             fly.CompiledFunction(None, None)()
