@@ -49,13 +49,13 @@ class _Processor:
         self.calls += 1
         return handle
 
-    def recv_mtp_status_async(self):
+    def recv_spec_status(self):
         return None, None
 
     def prepare_sampled_ids(self, batch):
         return self.recv_async_output([])
 
-    def recv_async_output_draft(self):
+    def recv_draft_token_ids(self):
         return []
 
 
@@ -108,7 +108,7 @@ def _recorded(warmup, drafter=None):
             p, output = self.tokenID_processor, batch.produces_output()
             self._gate_staging_reuse()
             if drafter and output:
-                p.recv_mtp_status_async()
+                p.recv_spec_status()
             self.queued = ["launch"]
             assert self.run_model([], batch) == "logits"
             self.queued.append("target" if drafter else "busy")
@@ -121,7 +121,7 @@ def _recorded(warmup, drafter=None):
                 self.queued.append("sample")
                 p.prepare_sampled_ids(batch)
                 self.propose_draft_token_ids(batch)
-                p.recv_async_output_draft()
+                p.recv_draft_token_ids()
             elif output:
                 assert p.prepare_sampled_ids(batch) == []
             # The previous forward's exit event has completed, this one's has not.
