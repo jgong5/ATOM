@@ -58,9 +58,11 @@ def test_another_process_and_a_port_draw_take_no_held_port(monkeypatch):
         )
         assert squat.stdout.split() == [str(errno.EADDRINUSE)] * 4
         monkeypatch.setattr(serve, "SERVE_PORTS", range(port, port + 2))
-        with pytest.raises(serve.ServeError, match="fewer than 1 free ports"):
-            with serve._held_ports(1):
-                pass
+        with (
+            pytest.raises(serve.ServeError, match="fewer than 1 free ports"),
+            serve._held_ports(1),
+        ):
+            pass
 
 
 def _zmq(stack, port):

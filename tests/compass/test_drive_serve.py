@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 from test_drive_gpu import FREE, GPU45, LISTING, _kfd, _plant
+from test_launcher_held_ports import HELD, _squat
 
 from atom.compass.drive import gpu as drive_gpu
 from atom.compass.drive import serve
@@ -545,3 +546,22 @@ def test_a_worker_blocked_past_atom_s_default_wait_at_the_stop_keeps_its_record(
     assert driver.wait(timeout=serve.STOP_GRACE_S) == 0
     lines = (out / serve.STEPS / "dp0.jsonl").read_text().splitlines()
     assert lines == ['{"step": 0}']
+
+
+def test_each_port_a_server_is_handed_is_held_from_another_process_first(
+    planted, monkeypatch
+):
+    monkeypatch.setenv("PLANTED_EXIT", "late:0")
+    popen, squatted = subprocess.Popen, []
+
+    def squatting(argv, **kwargs):
+        if argv[:2] == list(serve.SERVER):
+            ports = [argv[argv.index(flag) + 1] for flag in ("--server-port", "--port")]
+            run = json.loads(Path(argv[argv.index("--compass-run") + 1]).read_text())
+            ports += [run["clock_endpoint"].rsplit(":", 1)[1]]
+            squatted.extend(_squat(*ports, kwargs["env"]["ATOM_DP_MASTER_PORT"]))
+        return popen(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", squatting)
+    serve.serve(ARGS, planted / "out", run={})
+    assert squatted == [HELD] * 4

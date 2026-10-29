@@ -28,6 +28,7 @@ import pytest
 from test_artifact_invalidation import BASE, STANZA
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_drive_gpu import FREE, _plant
+from test_launcher_held_ports import HELD, _squat
 from test_memory_readings import (
     CONFIG_JSON,
     DOCUMENT,
@@ -861,3 +862,18 @@ def test_a_weights_compile_key_is_the_same_whatever_the_import_order():
         for order in ("first", "torch")
     }
     assert len(keys) == 1, keys
+
+
+def test_the_engine_s_dp_master_port_is_held_from_another_process_first(
+    tmp_path, monkeypatch
+):
+    _, argv = a_start(tmp_path, monkeypatch, STACK)
+    engine, squatted = measure_memory.subprocess.Popen, []
+
+    def squatting(*args, **kwargs):
+        squatted.extend(_squat(kwargs["env"]["ATOM_DP_MASTER_PORT"]))
+        return engine(*args, **kwargs)
+
+    monkeypatch.setattr(measure_memory.subprocess, "Popen", squatting)
+    measure_memory.main(argv)
+    assert squatted == [HELD]
