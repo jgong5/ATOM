@@ -958,7 +958,7 @@ def test_a_one_token_encode_in_the_wake_of_the_whole_text_is_not_timed():
     # 4 ms each, one token or more; the one-token point then read 100 times its
     # fit. Here the text is longer than any length swept, and the seven calls
     # after its encode carry a millisecond each: one token's decode and encode
-    # and the five timed encodes.
+    # and the five untimed encodes before the timed ones.
     tok = Waking(3.0e-5, 2.0e6, long=SWEPT[-1], calls=7, extra=1.0e-3)
     text = SWEEP_TEXT * 2
     rates = tokenizer_sweep(tok, text, SWEPT, bound=0.01, clock=tok.clock)
