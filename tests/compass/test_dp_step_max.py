@@ -42,7 +42,7 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.sampling_params import SamplingParams
-from atom.utils import get_open_port
+from tests.compass.held_ports import held_ports
 
 BLOCK = 16
 
@@ -95,6 +95,8 @@ def runner(backend, dp_size=1, dp_rank=0):
     )
     r.rank, r.label, r.block_size = 0, f"dp{dp_rank}", BLOCK
     r.capture_sizes_np, r.enforce_eager = np.array([0], dtype=np.int32), True
+    r.running_tokens_per_dp_rank = np.zeros(dp_size, dtype=np.int32)
+    r.tbo_decode_graphs = False
     r.attn_metadata_builder = SimpleNamespace(step_needs_eager=lambda batch: False)
     r._token_stream = DeferredTokenStream([0])
     if backend is not None:
@@ -137,7 +139,6 @@ def dp2(monkeypatch):
         "aiter.dist.parallel_state",
         SimpleNamespace(get_dp_group=lambda: SimpleNamespace(cpu_group=local.group)),
     )
-    port = get_open_port()
 
     def on_rank(rank, step):
         local.group = dist_utils.stateless_init_torch_distributed_process_group(
@@ -153,7 +154,8 @@ def dp2(monkeypatch):
             futures = [pool.submit(on_rank, r, s) for r, s in enumerate(steps)]
             return [f.result() for f in futures]
 
-    return run
+    with held_ports(1) as [port]:  # until rank 0's store binds it
+        yield run
 
 
 def test_one_rank_exchanges_nothing_and_reports_its_own_cost(monkeypatch):
@@ -211,5 +213,5 @@ def test_a_dp_rank_whose_mode_states_no_group_count_is_refused():
     batch = prefill(8)
     single_rank_mode = projection.forward_mode(batch, runner(None))
 
-    with pytest.raises(RunnerRefusal, match="states no num_tokens_across_dp"):
+    with pytest.raises(RunnerRefusal, match="states no scheduled_tokens_per_dp_rank"):
         projection.batch_view(batch, single_rank_mode, runner(None, dp_size=2))

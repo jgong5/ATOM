@@ -1825,7 +1825,10 @@ and receives both run on the engine's step loop, and no worker takes part.
   zero when absent: on node 18 Mooncake TCP every first write of 2 to 7 blocks on a
   pair took 9.0 to 28.1 ms longer than the pair's later writes, and its second write
   was back at their median (#1172). RDMA is unmeasured. `bytes` is exactly computable from block count x
-  per-block bytes — no measurement needed. `latency` and `bandwidth` are
+  per-block bytes — no measurement needed. Mooncake posts a transfer as two writes,
+  each paying `latency`: the blocks, with a DeepSeek-V4 request's state slot, then a
+  Kimi-K3 request's KDA state slot, or DeepSeek-V4's compressor state again from a
+  staging row; a write with no bytes is not posted (#2325, #2341, #2342). `latency` and `bandwidth` are
   configuration (`05`, the `interconnect` link the run file's `kv_link` names),
   satisfying the "interconnect is configurable" requirement directly.
 - **Decode** posts the write request in `update_state_after_alloc` (called from
@@ -1960,7 +1963,12 @@ two differ the code is right.
   maps its regions onto a consumer holding every layer, `consumer_region_indices`, and a
   decode head reports `finished_recving` from its own stage only); `lmcache_mp` under PP
   (ATOM's `mp/deployment.py::_validate_mp_config`); any other connector (`allocate_kv_cache`,
-  above); PP with DP (ATOM's `CoreManager`, and the channel table).
+  above); PP with DP (ATOM's `CoreManager`, and the channel table); Kimi-K3's KDA state
+  regions above PP 1 (ATOM's `_KimiMLAGDNCommon._with_kda_disagg_regions`, restated by
+  `overrides.py::_refuse_kda_regions_across_stages` as a runner publishes its planned
+  transfer, since no simulated runner builds the regions); DeepSeek-V4 above PP 1 (ATOM's
+  `ModelRunner.get_num_blocks`, which refuses its copied state checkpoints there and which
+  the simulated runner runs).
 
 ### Prefill pipeline parallelism (owner ruling on #1385)
 

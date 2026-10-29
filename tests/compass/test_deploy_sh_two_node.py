@@ -372,10 +372,14 @@ def test_every_port_the_deployment_holds_free_is_one_no_bind_to_port_0_takes(
 
 @pytest.fixture
 def port_range(tmp_path, planted):  # noqa: F811
-    """A file that stands in for `ip_local_port_range` in the ports script."""
+    """A file that stands in for `ip_local_port_range` in the ports script.
+    With `PLANTED_PORTS_FREE` set, every bind the script makes succeeds,
+    whatever the host's listeners hold."""
     bindir, path = tmp_path / "bin", tmp_path / "ip_local_port_range"
     (bindir / "python3").rename(bindir / "python3-planted")
-    code = "import sys; from atom.compass.drive import serve; "
+    code = "import os, socket, sys; from atom.compass.drive import serve; "
+    code += '"PLANTED_PORTS_FREE" not in os.environ or '
+    code += 'setattr(socket.socket, "bind", lambda *_: None); '
     code += "serve.PORT_RANGE = serve.Path(sys.argv.pop(1)); exec(sys.stdin.read())"
     (bindir / "python3").write_text(
         '#!/bin/sh\nreal="$(dirname "$0")/python3-planted"\n'
@@ -389,7 +393,10 @@ def port_range(tmp_path, planted):  # noqa: F811
 def test_a_block_with_no_room_below_the_ephemeral_range_exits_1_naming_both(
     tmp_path, planted, on, port_range  # noqa: F811
 ):
+    """The router's and the metrics' single ports take two of the three below
+    the range, whichever of them the host holds."""
     env, _ = planted
+    env["PLANTED_PORTS_FREE"] = "1"
     port_range.write_text("17004\t60999\n")
     words = _record(tmp_path, on)
     words[words.index("-tp") + 1] = "4"

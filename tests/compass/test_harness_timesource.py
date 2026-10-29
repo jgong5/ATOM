@@ -8,6 +8,7 @@ target at once, with the event loop's timers made to raise. Skips by name as
 """
 
 import asyncio
+import math
 from importlib import metadata
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -54,14 +55,16 @@ DRAIN = 10.0
 
 
 class GrantAtOnce:
-    """The traffic LP's runtime: each clock call is granted its target."""
+    """The traffic LP's runtime: each clock call is granted its target or its
+    daemon deadline, whichever comes first."""
 
     def __init__(self) -> None:
         self.now = 0.0
         self.released = {"frontend->traffic:stream": set()}
         self.calls = []
 
-    def next_event(self, t):
+    def next_event(self, t, t_daemon=math.inf):
+        t = min(t, t_daemon)
         self.calls.append(t)
         self.now = t
         return t

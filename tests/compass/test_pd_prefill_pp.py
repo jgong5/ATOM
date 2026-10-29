@@ -7,17 +7,12 @@ which prices every stage's write: decode is ready at ``max_k c_k + L`` and
 the head is done at ``max_k c_k + 2L``, after Mooncake's release.
 
 The run tests start `pd_sim.sh` at prefill ``-pp 2`` and at ``-pp 1`` and
-skip as `test_pd_slice`'s do; the rest run anywhere. At ``-pp 2`` the slice
-model runs as `LlamaForCausalLM`, its shape and tokenizer kept: ATOM's Qwen3
-builds every layer on every stage (#2333), so its stages' planned blocks are
-not shares of decode's and the run is refused.
+skip as `test_pd_slice`'s do; the rest run anywhere.
 """
 
-import copy
 import dataclasses
 import json
 import os
-import shutil
 import signal
 import subprocess
 import threading
@@ -50,18 +45,15 @@ from atom.compass.backends import KvGeometry
 from atom.compass.clock import LpId, prefill_decode_table
 from atom.compass.detect.determinism import StepTable
 from atom.compass.detect.scenario import check_run, pipeline_timeline
-from atom.compass.drive.serve import _free_ports
 from atom.compass.kv import Scope, TransferModel
 from atom.compass.runner.pp_send import StageSends
 from atom.compass.spec import MachineSpec
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.models.utils import get_pp_indices
 from atom.utils.clock import LPRuntime
+from tests.compass.held_ports import held_ports
 
 KV = "engine-D->engine-P-pp0:kv_write_req"
-#: The run tests' machine: the slice model's tokenizer probed for Llama too.
-PP_MACHINE = copy.deepcopy(DP_MACHINE)
-PP_MACHINE["host"]["tokenizers"][0]["applies_to"].append("LlamaForCausalLM")
 
 
 def _run(tmp_path, pp: int, **more) -> dict:
@@ -234,72 +226,58 @@ def test_a_request_prefilled_at_another_pipeline_width_is_refused_by_name(
 # --- with a driver ------------------------------------------------------------
 
 
-def split_model(out: Path) -> Path:
-    """The slice model as `LlamaForCausalLM`, which ATOM builds by stage, its
-    shape and tokenizer kept and no weights."""
-    model = out / "model"
-    weights = shutil.ignore_patterns("config.json", "*.safetensors")
-    shutil.copytree(MODEL, model, ignore=weights)
-    hf = json.loads((Path(MODEL) / "config.json").read_text())
-    hf |= {"architectures": ["LlamaForCausalLM"], "model_type": "llama"}
-    (model / "config.json").write_text(json.dumps(hf))
-    return model
-
-
 def run_pd_pp(out: Path, seed: str, pp: int) -> dict:
-    """One run under `pd_sim.sh` with a prefill side of `pp` stages, above one
-    on `split_model`, served under the slice model's name."""
+    """One run under `pd_sim.sh` with a prefill side of `pp` stages."""
     out.mkdir()
-    model = split_model(out) if pp > 1 else MODEL
-    ports = dict(zip(PORTS, _free_ports(len(PORTS))))
-    more = {compass_run.PREFILL_PP: pp} if pp > 1 else {}
-    run_file = _run_file(
-        out,
-        clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
-        step_stub=CONSTANT,
-        machine=PP_MACHINE,
-        **PD,
-        **more,
-    )
-    env = dict(
-        os.environ,
-        PYTHONHASHSEED=seed,
-        PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        MODEL=str(model),
-        SERVER_ARGS=f"--enforce-eager --max-model-len 2048 --served-model-name {MODEL}",
-        PREFILL_ARGS=f"-pp {pp}" if pp > 1 else "",
-        **{name: str(port) for name, port in ports.items()},
-    )
-    if pp > 1:  # ATOM's runner sets it for a Llama model, so its key holds it
-        env["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
-    publish_pd_entries(out / "store", PP_MACHINE, env)
-    log = out / "pd_sim.log"
-    with open(log, "w") as f:
-        sim = subprocess.Popen(
-            ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
-            cwd=TREE,
-            env=env,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+    with held_ports(len(PORTS)) as drawn:
+        ports = dict(zip(PORTS, drawn))
+        more = {compass_run.PREFILL_PP: pp} if pp > 1 else {}
+        run_file = _run_file(
+            out,
+            clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
+            step_stub=CONSTANT,
+            machine=DP_MACHINE,
+            **PD,
+            **more,
         )
-    watchdog = threading.Timer(WALL_S, os.killpg, (sim.pid, signal.SIGKILL))
-    watchdog.start()
-    try:
-        deadline = time.monotonic() + WALL_S
-        while "pd_sim: ready" not in log.read_text():
-            assert sim.poll() is None, f"pd_sim.sh exited:\n{log.read_text()}"
-            assert time.monotonic() < deadline, f"no router in {WALL_S} wall seconds"
-            time.sleep(0.5)
-        run = json.loads(run_file.read_text())
-        traffic = PdTraffic(run, ports["ROUTER_PORT"], sim, ports["PREFILL_PORT"])
-        traffic.run()
-        code = sim.wait(timeout=120)
-    finally:
-        watchdog.cancel()
-        if sim.poll() is None:
-            os.killpg(sim.pid, signal.SIGKILL)
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            MODEL=MODEL,
+            PREFILL_ARGS=f"-pp {pp}" if pp > 1 else "",
+            **{name: str(port) for name, port in ports.items()},
+        )
+        publish_pd_entries(out / "store", DP_MACHINE, env)
+        log = out / "pd_sim.log"
+        with open(log, "w") as f:
+            sim = subprocess.Popen(
+                ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        watchdog = threading.Timer(WALL_S, os.killpg, (sim.pid, signal.SIGKILL))
+        watchdog.start()
+        try:
+            deadline = time.monotonic() + WALL_S
+            while "pd_sim: ready" not in log.read_text():
+                assert sim.poll() is None, f"pd_sim.sh exited:\n{log.read_text()}"
+                assert (
+                    time.monotonic() < deadline
+                ), f"no router in {WALL_S} wall seconds"
+                time.sleep(0.5)
+            run = json.loads(run_file.read_text())
+            traffic = PdTraffic(run, ports["ROUTER_PORT"], sim, ports["PREFILL_PORT"])
+            traffic.run()
+            code = sim.wait(timeout=120)
+        finally:
+            watchdog.cancel()
+            if sim.poll() is None:
+                os.killpg(sim.pid, signal.SIGKILL)
     assert code == 0, f"pd_sim.sh exited {code}:\n{log.read_text()[-4000:]}"
     table = (out / compass_run.STEP_TABLE_FILE).read_text()
     return {
@@ -307,7 +285,6 @@ def run_pd_pp(out: Path, seed: str, pp: int) -> dict:
         "run": run,
         "table": table,
         "events": traffic.events,
-        "model": model,
     }
 
 
@@ -332,7 +309,7 @@ def _write_end(ran: dict, a: float, prompt_tokens: int, pp: int) -> list[float]:
     per 16 tokens."""
     from transformers import AutoConfig
 
-    hf, run = AutoConfig.from_pretrained(ran["model"]), ran["run"]
+    hf, run = AutoConfig.from_pretrained(MODEL), ran["run"]
     blocks, spec, ends = (
         -(-prompt_tokens // 16),
         MachineSpec.from_mapping(run["machine"]),

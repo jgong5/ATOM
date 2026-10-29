@@ -18,9 +18,10 @@ import sys
 
 import pytest
 from test_drive_gpu import FREE, SHOWHW
-from test_drive_identity import CARD, GIT, _checkout, _git
+from test_drive_identity import CARD, GIT, _checkout, _git, read_marked
 from test_fit_samples import HOST, RUNS, edit
 from test_fit_samples import record as planted_out
+from test_fit_steps import fit
 from test_parity_record import BLOCK, BUDGET, LADDER
 from test_parity_served import recorded
 from test_validate_runs import _aiter
@@ -393,3 +394,54 @@ def test_a_record_names_each_compile_its_server_ran_while_it_served(
     assert run.get(aiter_jit.BUILDS, []) == names
     if names:
         assert f"JIT compile of {names}" in aiter_jit.refusal(run)
+
+
+#: Put after the planted server: once `compass record` has read its card's PTL
+#: state while it serves (``PLANTED_READ``), PTL is disabled on that card.
+FLIPS = """
+import os, pathlib, time
+for _ in range(600):
+    if os.path.exists(os.environ["PLANTED_READ"]):
+        break
+    time.sleep(0.05)
+pathlib.Path(os.environ["PLANTED_PTL"]).write_text("disabled\\n")
+"""
+
+
+@pytest.mark.skipif(GIT is None, reason="needs git")
+def test_a_record_whose_card_flips_ptl_while_it_serves_is_refused_by_both_fits(
+    tmp_path, planted_gpu, monkeypatch
+):
+    """The named result: run.json names the change, and both fits refuse it."""
+    enable = tmp_path / "pci" / CARD["PCI Bus"].lower() / "ptl" / "ptl_enable"
+    enable.parent.mkdir(parents=True)
+    enable.write_text("enabled\n")
+    monkeypatch.setenv("PLANTED_PTL", str(enable))
+    monkeypatch.setenv("PLANTED_READ", str(tmp_path / "read"))
+    monkeypatch.setattr(identity, "PTL_POLL_S", 0.01)
+    read_marked(monkeypatch, tmp_path / "read")
+    server = tmp_path / "server.py"
+    server.write_text(server.read_text() + FLIPS)
+    out = tmp_path / "record"
+    cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
+
+    run = json.loads((out / "run.json").read_text())
+    [change] = run[identity.PTL_CHANGES]
+    assert (change["from"], change["to"], run["ptl"]) == (
+        "enabled",
+        "disabled",
+        "disabled",
+    )
+    clients = []
+    for k, requests in enumerate(RUNS):
+        export = tmp_path / f"client{k}.json"
+        export.write_text(json.dumps({"requests": requests}))
+        clients += ["--client-run", out, export]
+    for command in ("fit steps", "fit host"):
+        backend = ["--backend", "step-linear"] if command == "fit steps" else []
+        with pytest.raises(SystemExit) as refused:
+            fit(tmp_path, command, *backend, out, *clients)
+        assert str(refused.value) == (
+            f"compass {command}: {out} is not fitted: its cards' PTL state changed "
+            f"while it served, enabled to disabled at {change['at']}"
+        )

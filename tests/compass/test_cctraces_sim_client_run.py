@@ -175,6 +175,11 @@ def test_a_real_cell_names_the_aiter_module_its_server_built_while_it_served(
         PATH=f"{bin_}:{os.environ['PATH']}",
         HOME=str(tmp_path / "home"),
         AITER_ROOT_DIR=str(root),
+        # Kernel caches of its own: a compile another process writes into a
+        # shared one while this cell serves is counted as built by it.
+        TORCHINDUCTOR_CACHE_DIR=str(tmp_path / "inductor"),
+        TRITON_CACHE_DIR=str(tmp_path / "triton"),
+        FLYDSL_RUNTIME_CACHE_DIR=str(tmp_path / "flydsl"),
         REAL="1",
         MODEL=str(tmp_path),
         TRACES=str(traces),

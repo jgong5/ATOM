@@ -11,8 +11,8 @@ together by `step_labels.label_run` under ATOM's two-batch-overlap split rule
 A DP rank no request reached writes a line per dummy forward it runs, and gives
 no sample; its file still counts in the run's digest. An empty
 rank file lost its lines, and refuses.
-A record whose run.json names `aiter_jit_builds` refuses, naming them, and so
-does one whose `source` counts uncommitted files.
+A record whose run.json names `aiter_jit_builds` or `ptl_changes` refuses,
+naming them, and so does one whose `source` counts uncommitted files.
 
 A step measurement is a `step_measurement` entry `measure steps` published,
 read by key; its member `MEMBER` holds the batch view as a step-record line
@@ -46,6 +46,7 @@ from atom.compass.artifacts import ArtifactStore, Topology
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_labels import Sample, digest, label_run
 from atom.compass.drive import aiter_jit
+from atom.compass.drive.identity import PTL_CHANGES
 from atom.compass.parity import ARRIVALS
 from atom.compass.parity.served import served
 from atom.compass.run.step_grid import keyed_of
@@ -101,6 +102,12 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
         )
     if built := aiter_jit.refusal(run):
         raise ValueError(f"{directory} is not fitted: {built}")
+    if changes := run.get(PTL_CHANGES):
+        named = ", ".join(f"{c['from']} to {c['to']} at {c['at']}" for c in changes)
+        raise ValueError(
+            f"{directory} is not fitted: its cards' PTL state changed while it "
+            f"served, {named}"
+        )
     fields = run_fields(run, directory)
     steps = directory / "steps"
     if (steps / ARRIVALS).exists():

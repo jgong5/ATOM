@@ -466,10 +466,6 @@ def test_a_duration_that_is_not_a_finite_number_is_refused_where_it_enters():
             RunSummary.of(ca, bad)
         with pytest.raises(ValueError, match="lazy_trace_wall_seconds must be"):
             RunSummary.of(ca, 0.1, lazy_trace_wall_seconds=bad)
-        with pytest.raises(ValueError, match="^refused_predicted_seconds must be"):
-            RefusalTally.of([], 1, refused_predicted_seconds=bad)
-        with pytest.raises(ValueError, match="^predicted_seconds must be"):
-            RefusalTally.of([], 1, predicted_seconds=bad)
 
 
 def test_the_by_value_fields_land_in_their_halves():
@@ -500,7 +496,7 @@ def test_a_clean_run_ended_by_end_workload_and_a_raise_by_what_raised():
     assert RunSummary.of(running, 0.1).ended_by is None
 
 
-def test_refusals_tally_under_their_source_and_the_fractions_count_cost_only():
+def test_refusals_tally_under_their_source_and_the_step_fraction_counts_cost_only():
     tally = RefusalTally.of(
         [
             "cost:no price for this shape",
@@ -511,14 +507,11 @@ def test_refusals_tally_under_their_source_and_the_fractions_count_cost_only():
             "command:start_profiler",
         ],
         steps=50,
-        refused_predicted_seconds=1.5,
-        predicted_seconds=30.0,
     )
     record = tally.record()
     assert record["count"] == 6
     assert record["by_source"] == [["command", 2], ["cost", 3], ["executor", 1]]
     assert record["fraction_of_steps"] == pytest.approx(3 / 50)
-    assert record["fraction_of_predicted_seconds"] == pytest.approx(0.05)
     assert record["reasons"] == [
         ["command:start_profiler", 2],
         ["cost:no price for this shape", 2],
@@ -541,10 +534,7 @@ def test_a_refusal_that_does_not_name_its_source_is_refused(reason):
 
 def test_an_empty_run_divides_by_nothing():
     record = RefusalTally().record()
-    assert (record["fraction_of_steps"], record["fraction_of_predicted_seconds"]) == (
-        0.0,
-        0.0,
-    )
+    assert record["fraction_of_steps"] == 0.0
 
 
 def test_the_summary_survives_strict_json():

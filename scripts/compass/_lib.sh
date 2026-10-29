@@ -252,9 +252,30 @@ compass_describe() {
         "$([ "$dirty" -gt 0 ] && echo " +${dirty} uncommitted")"
 }
 
-# A free TCP port on 127.0.0.1.
-compass_free_port() {
-    python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
+# Sets SUMMARY, PASSED, FAILED and ERRORS from the pytest summary line ending a
+# log. gate_gpu.sh reads its runs with it and regen_gpu_gate_baseline.sh the
+# baseline's, so the two counts are one reading.
+compass_pytest_counts() {
+    SUMMARY=$(tail -20 "$1" | grep -E '[0-9]+ (passed|failed|error)' | tail -1)
+    PASSED=$(grep -oE '[0-9]+ passed' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
+    FAILED=$(grep -oE '[0-9]+ failed' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
+    ERRORS=$(grep -oE '[0-9]+ errors?' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
+}
+
+# A TCP port held until this script exits, so no other process binds it before
+# its server does. Its holder binds it on every address, where another socket's
+# plain bind fails, then sets SO_REUSEADDR and never listens: only a listener
+# that sets it too binds the port, beside the holder, as uvicorn's, libzmq's,
+# socket.create_server's, torch's TCPStore's and the atomesh router's do.
+compass_held_port() {
+    python3 -c 'import os, select, socket, sys
+s = socket.socket()
+s.bind(("", 0))
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+print(s.getsockname()[1], flush=True)
+if not os.fork():
+    os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+    select.select([os.pidfd_open(int(sys.argv[1]))], [], [])' $$
 }
 
 # compass_wait_up WHAT PID URL: return once URL answers; exit 1 if PID exits

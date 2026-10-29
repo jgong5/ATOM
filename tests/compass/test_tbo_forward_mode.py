@@ -83,6 +83,8 @@ def runner(rank):
         parallel_config=SimpleNamespace(data_parallel_size=2, data_parallel_rank=rank),
     )
     r.capture_sizes_np, r.enforce_eager = np.array([0], dtype=np.int32), True
+    r.running_tokens_per_dp_rank = np.zeros(2, dtype=np.int32)
+    r.tbo_decode_graphs = False
     r.attn_metadata_builder = SimpleNamespace(step_needs_eager=lambda batch: False)
     r.tokenID_processor = SimpleNamespace(is_pd_producer=False)
     return r
@@ -97,7 +99,7 @@ def real(r, batch):
 def settled(mode):
     """The mode's fields, with the token counts' tensor as a list."""
     sync = {**vars(mode.sync)}
-    sync["num_tokens_across_dp"] = sync["num_tokens_across_dp"].tolist()
+    sync["scheduled_tokens_per_dp_rank"] = sync["scheduled_tokens_per_dp_rank"].tolist()
     return {**vars(mode), "sync": sync}
 
 
@@ -137,7 +139,7 @@ def test_a_dp2_step_agrees_the_mode_and_payload_a_real_step_agrees(
     for real_mode, simulated, view, (real_payload, payload) in dp2(
         on_rank(0), on_rank(1)
     ):
-        assert len(payload[0]) == 8
+        assert len(payload[0]) == 9
         assert payload == real_payload
         assert settled(simulated) == settled(real_mode)
         assert simulated.tbo_collective_active is (split is not None)
