@@ -195,7 +195,7 @@ fi
 if [[ $MODE == 1p1d ]]; then
     # pd_sim.sh takes the authority's port from its own variable; the run file
     # names the same one for the traffic LP.
-    # Each side's DP master port is free too, or a second run on this host
+    # Each side's DP master port is held too, or a second run on this host
     # network finds pd_sim.sh's default taken.
     PREFILL_DP_PORT=$(compass_held_port) DECODE_DP_PORT=$(compass_held_port)
     export MODEL SERVER_ARGS WAIT_S CLOCK_PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT \
@@ -216,7 +216,7 @@ else
     main=(-m atom.entrypoints.openai.api_server)
     [[ -z ${HTTP_INTAKE:-} ]] || main=("$ROOT/scripts/compass/http_intake.py" serve "$HTTP_INTAKE")
     # The keep-alive timeout as in pd_sim.sh, aiperf's pool in the router's place.
-    # Its own process group, so a real server's workers stop with it. A free
+    # Its own process group, so a real server's workers stop with it. A held
     # DP master port, as `compass record` gives one: the port keys ATOM's
     # compiled-graph cache, and the first start that loads it autotunes again.
     # No later start loads it, so the server's stop removes it, as there.

@@ -1011,29 +1011,41 @@ def test_the_checked_in_mi308x_specs_hold_their_start(monkeypatch, name):
                 assert values[key] == value, key
 
 
-def _mi355x_spec(monkeypatch):
-    """The MI355X script and its checked-in document, read."""
-    monkeypatch.delenv("COMPASS_MACHINE", raising=False)
+MI355X = ["mi355x-gpu45", "mi355x-crs005"]
+
+
+def _mi355x_spec(monkeypatch, name):
+    """The MI355X script for machine `name` and its checked-in document, read."""
+    monkeypatch.setenv("COMPASS_MACHINE", name)
     path = SPEC_ROOT / "scripts" / "compass" / "mi355x_spec.py"
     loaded = importlib.util.spec_from_file_location("mi355x_spec", path)
     script = importlib.util.module_from_spec(loaded)
     loaded.loader.exec_module(script)
-    document = SPEC_ROOT / "scripts" / "compass" / "machines" / f"{script.NAME}.json"
+    assert script.NAME == name
+    document = SPEC_ROOT / "scripts" / "compass" / "machines" / f"{name}.json"
     return script, MachineSpec.from_mapping(json.loads(document.read_text()))
 
 
-def test_the_checked_in_mi355x_spec_holds_its_start(monkeypatch):
-    script, spec = _mi355x_spec(monkeypatch)
+@pytest.mark.parametrize("name", ["mi355x-crs013", "mi308x-hjbog18"])
+def test_the_mi355x_spec_refuses_a_machine_it_has_no_tables_for(monkeypatch, name):
+    with pytest.raises(SystemExit, match=f"COMPASS_MACHINE={name}: "):
+        _mi355x_spec(monkeypatch, name)
+
+
+@pytest.mark.parametrize("name", MI355X)
+def test_the_checked_in_mi355x_spec_holds_its_start(monkeypatch, name):
+    script, spec = _mi355x_spec(monkeypatch, name)
     for fragment in script.device_fragments():
         for key, value in fragment.values.items():
             if not key.startswith("provenance."):
                 assert spec.values[key] == value, key
 
 
+@pytest.mark.parametrize("name", MI355X)
 def test_the_mi355x_spec_explains_what_the_start_measured_apart_from_the_declared(
-    monkeypatch,
+    monkeypatch, name
 ):
-    script, spec = _mi355x_spec(monkeypatch)
+    script, spec = _mi355x_spec(monkeypatch, name)
     origins = {}
     for block in ("host", "device", "interconnect"):
         for row in explain(spec, block).contributions:
@@ -1052,11 +1064,12 @@ def test_the_mi355x_spec_explains_what_the_start_measured_apart_from_the_declare
     assert record == f"sha256:{script.RECORD}"
 
 
+@pytest.mark.parametrize("name", MI355X)
 def test_the_mi355x_spec_rebuilds_byte_for_byte_from_its_own_sweep(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, name
 ):
-    script, _ = _mi355x_spec(monkeypatch)
-    document = SPEC_ROOT / "scripts" / "compass" / "machines" / f"{script.NAME}.json"
+    script, _ = _mi355x_spec(monkeypatch, name)
+    document = SPEC_ROOT / "scripts" / "compass" / "machines" / f"{name}.json"
     out = tmp_path / "rebuilt.json"
     assert script.main(["--sweep-from", str(document), "--out", str(out)]) == 0
     assert out.read_bytes() == document.read_bytes()

@@ -95,6 +95,8 @@ def runner(backend, dp_size=1, dp_rank=0):
     )
     r.rank, r.label, r.block_size = 0, f"dp{dp_rank}", BLOCK
     r.capture_sizes_np, r.enforce_eager = np.array([0], dtype=np.int32), True
+    r.running_tokens_per_dp_rank = np.zeros(dp_size, dtype=np.int32)
+    r.tbo_decode_graphs = False
     r.attn_metadata_builder = SimpleNamespace(step_needs_eager=lambda batch: False)
     r._token_stream = DeferredTokenStream([0])
     if backend is not None:
@@ -211,5 +213,5 @@ def test_a_dp_rank_whose_mode_states_no_group_count_is_refused():
     batch = prefill(8)
     single_rank_mode = projection.forward_mode(batch, runner(None))
 
-    with pytest.raises(RunnerRefusal, match="states no num_tokens_across_dp"):
+    with pytest.raises(RunnerRefusal, match="states no scheduled_tokens_per_dp_rank"):
         projection.batch_view(batch, single_rank_mode, runner(None, dp_size=2))

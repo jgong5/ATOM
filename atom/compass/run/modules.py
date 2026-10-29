@@ -165,7 +165,7 @@ V41_SILENT = (
     V41 + "vision.ViT",
     V41 + "vision.Aligner",
     V41 + "runtime._Stage",
-    "atom.models.deepseek_v4_dspark.DSparkMarkovHead",
+    "atom.models.dspark_draft.DSparkMarkovHead",
 )
 #: What the routed experts' kernel reads once for each expert it runs.
 HELD = tuple(f"w{w}_{p}" for w in (13, 2) for p in ("weight", "weight_scale", "bias"))
@@ -569,12 +569,15 @@ def _moe(module, name, parent):
         leaves = _is(parent, M3 + "MiniMaxM3MoE")
         reduces = dims[6] > 1 or getattr(parent, "reduce_results", not leaves)
         return Module(name, "moe", dims, fmt, ranks if reduces else 1, fused, act=act)
-    from atom.model_ops.fused_moe.mori_prepare_finalize import resolve_mori_dispatch
+    from atom.model_ops.fused_moe.routed_rows import resolve_routed_rows_wire
 
     mori = config.requested_all2all_backend in ("auto", "mori") and not (
         envs.ATOM_DISABLE_MORI_EP or envs.ATOM_MORI_V2
     )
-    sent = resolve_mori_dispatch(module.moe_config.in_dtype, module.hidden_size)
+    # The method's routed-rows wire, as `_maybe_make_prepare_finalize` takes it.
+    sent = getattr(method, "routed_rows_wire", None) or resolve_routed_rows_wire(
+        module.moe_config.in_dtype, module.hidden_size
+    )
     wire = (FORMATS.get(sent.dtype), MORI_COMBINE.get(envs.ATOM_MORI_COMBINE_QUANT))
     if not (mori and all(wire)):
         return None

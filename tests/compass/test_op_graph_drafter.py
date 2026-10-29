@@ -297,7 +297,9 @@ def dp_view(width, rung, dp, counts=None):
     r.drafter = SimpleNamespace(is_block_drafter=False, mtp_k=1)
     counts = torch.tensor(counts or [2 * width] * dp)
     mode = SimpleNamespace(
-        sync=SimpleNamespace(num_tokens_across_dp=counts, ub_tokens_across_dp=None),
+        sync=SimpleNamespace(
+            scheduled_tokens_per_dp_rank=counts, ub_tokens_across_dp=None
+        ),
         running_tokens_are_unified=True,
         running_tokens=2 * rung,
         running_bs=rung,
@@ -466,7 +468,7 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
     r.drafter = SimpleNamespace(is_block_drafter=False, mtp_k=1)
     mode = SimpleNamespace(
         sync=SimpleNamespace(
-            num_tokens_across_dp=torch.tensor([64, 64]),
+            scheduled_tokens_per_dp_rank=torch.tensor([64, 64]),
             max_bs_across_dp=1,
             ub_tokens_across_dp=None,
         ),

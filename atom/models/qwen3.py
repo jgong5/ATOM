@@ -55,6 +55,7 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
+from atom.utils.region_graph import token_graph
 
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
@@ -263,6 +264,7 @@ class Qwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+@token_graph
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,

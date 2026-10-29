@@ -478,10 +478,11 @@ def _decorators(path, class_name, name):
 
 
 # The methods the reply is handed to whole. `postprocess` reads it under
-# `fwd_output`, which the walk below sees; `send_tokens` pickles it and reads
-# nothing. A hand-off to any other method is refused: it would read the reply
-# under a name this walk does not follow.
-HANDED_TO = ("postprocess", "send_tokens")
+# `fwd_output` and `EngineCore._postprocess` under `fwd_out`, which the walk
+# below sees; `send_completion` pickles it and reads nothing. A hand-off to any
+# other method is refused: it would read the reply under a name this walk does
+# not follow.
+HANDED_TO = ("postprocess", "_postprocess", "send_completion")
 
 
 def _reply_attribute_reads():
@@ -489,7 +490,7 @@ def _reply_attribute_reads():
 
     A read is `fwd_out.x` or `fwd_output.x`. The reply may also be handed on
     whole -- passed positionally to one of `HANDED_TO`, returned, or tested
-    against `None`. Any other use of it, a `getattr`, an alias, a hand-off to
+    against `None` either way. Any other use of it, a `getattr`, an alias, a hand-off to
     any other function or method, is refused by file and line: it
     could read an attribute this set would never contain.
     """
@@ -507,7 +508,7 @@ def _reply_attribute_reads():
             up = parent[node]
             handed_on = (
                 isinstance(up, ast.Return)
-                or ast.unparse(up) == f"{node.id} is None"
+                or ast.unparse(up) in (f"{node.id} is None", f"{node.id} is not None")
                 or (
                     getattr(up, "func", None) is not None
                     and getattr(up.func, "attr", None) in HANDED_TO

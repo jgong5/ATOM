@@ -475,3 +475,73 @@ def test_no_port_a_server_draws_is_in_deploy_sh_s_range_or_mooncake_s(
             drawn += ports
 
     assert not [p for p in drawn if p in mooncake or p in deploy]
+
+
+#: A planted server whose one worker, on SIGTERM, blocks `BLOCKED_S` before it
+#: writes its step record and exits, as a worker in a Mooncake sync write does.
+#: The server stops it as ATOM's runner manager does: it waits
+#: ATOM_SHUTDOWN_TIMEOUT_S, as ATOM reads it, then kills it.
+RECORDED = """\
+import http.server, os, signal, subprocess, sys, time
+from atom.utils import envs
+d, record = os.environ["PLANTED_DIR"], os.environ["ATOM_COMPASS_PARITY_RECORD"]
+os.makedirs(record)
+open(record + "/dp0.engine.json", "w").close()
+worker = subprocess.Popen([sys.executable, "-c", os.environ["PLANTED_WORKER"], record])
+while not os.path.exists(record + "/dp0.jsonl"):
+    time.sleep(0.05)
+with open(d + "/child", "w") as f:
+    f.write(str(worker.pid))
+
+def stop(*_):
+    try:
+        worker.wait(timeout=envs.ATOM_SHUTDOWN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        worker.kill()
+    os._exit(0)
+
+signal.signal(signal.SIGTERM, stop)
+
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+port = int(sys.argv[sys.argv.index("--server-port") + 1])
+http.server.HTTPServer(("127.0.0.1", port), Health).serve_forever()
+"""
+BLOCKED_S = 7
+WORKER = f"""\
+import signal, sys, time
+steps = sys.argv[1] + "/dp0.jsonl"
+
+def stop(*_):
+    time.sleep({BLOCKED_S})
+    with open(steps, "a") as f:
+        f.write('{{"step": 0}}\\n')
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, stop)
+open(steps, "w").close()
+time.sleep(600)
+"""
+
+
+def test_a_worker_blocked_past_atom_s_default_wait_at_the_stop_keeps_its_record(
+    planted, monkeypatch
+):
+    """The named result: the worker blocks 7 s at SIGTERM, past ATOM's 5 s
+    default wait, and its step record still holds its line after the stop."""
+    monkeypatch.delenv("ATOM_SHUTDOWN_TIMEOUT_S", raising=False)
+    (planted / "recorded.py").write_text(RECORDED)
+    out = planted / "out"
+    env = dict(os.environ, PYTHONPATH=str(TREE), PLANTED_WORKER=WORKER)
+    driver = subprocess.Popen(
+        [sys.executable, "-c", DRIVE, str(planted / "recorded.py"), str(out), *ARGS],
+        env=env,
+    )
+    _ready(out, driver, 600, 0.05)
+    driver.send_signal(signal.SIGTERM)
+    assert driver.wait(timeout=serve.STOP_GRACE_S) == 0
+    lines = (out / serve.STEPS / "dp0.jsonl").read_text().splitlines()
+    assert lines == ['{"step": 0}']
