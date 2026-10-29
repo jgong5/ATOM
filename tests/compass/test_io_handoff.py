@@ -120,16 +120,19 @@ def test_a_simulated_run_with_a_record_stamps_nothing(
     assert not list(tmp_path.glob("**/*.handoff.jsonl"))
 
 
-def test_the_reader_holds_each_p99_to_its_buckets_median_step(tmp_path):
+def test_the_reader_buckets_an_output_by_its_steps_batch(tmp_path):
     ms = 1_000_000
+    # Forward entries 10 ms apart but for an idle 980 ms after the one-row step.
+    enters, batches = (10, 20, 1000, 1010, 1020), (2, 1, 2, 2, 2)
     steps = [{"step": 0, "is_dummy_run": True, "batch": [], "t_enter_ns": 0}] + [
         {
             "step": k,
             "is_dummy_run": False,
-            "batch": [[0], [1]],
-            "t_enter_ns": k * 10 * ms,
+            "batch": [[r] for r in range(n)],
+            "t_enter_ns": t * ms,
+            "t_exit_ns": (t + 5) * ms,
         }
-        for k in range(1, 5)
+        for k, (t, n) in enumerate(zip(enters, batches), 1)
     ]
     stamps = [
         {
@@ -139,15 +142,16 @@ def test_the_reader_holds_each_p99_to_its_buckets_median_step(tmp_path):
             "t_pull_ns": 15_000,
             "prompt_tokens": 100,
         },
-        {"t_out_put_ns": 0, "t_out_sent_ns": 50_000, "rows": 2},
-        {"t_out_put_ns": 0, "t_out_sent_ns": 200_000, "rows": 1},
+        # A finished list of two, put after the one-row step.
+        {"t_out_put_ns": 26 * ms, "t_out_sent_ns": 26 * ms + 200_000, "rows": 2},
+        # A finished list of one, put after a two-row step.
+        {"t_out_put_ns": 16 * ms, "t_out_sent_ns": 16 * ms + 50_000, "rows": 1},
     ]
     for name, lines in (("dp0.jsonl", steps), ("dp0.handoff.jsonl", stamps)):
         (tmp_path / name).write_text("".join(json.dumps(x) + "\n" for x in lines))
 
     rows = handoff.report(tmp_path)
 
-    # A row bucket no step has is held to the median over every step.
     assert "| out | 1 | 1 | 200.0 | 200.0 | 10000 | 2.00% |" in rows
     assert "| out | 2 | 1 | 50.0 | 50.0 | 10000 | 0.50% |" in rows
     assert "| queue | 64 | 1 | 20.0 | 20.0 | 10000 | 0.20% |" in rows

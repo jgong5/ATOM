@@ -9,16 +9,17 @@ input thread's receipt of a request frame to its queue put; ``queue``, that
 put to the busy loop's get; ``past pull``, the part of ``queue`` after the
 busy loop's idle point in the pass that got it, since a simulated busy loop
 also pulls only between steps; all bucketed by the frame's prompt tokens; and
-``out``, an output's queue put to its send returning, bucketed by its rows.
-A bucket ``b`` holds counts in ``[b, 2b)``. Per segment and bucket it prints
-N, p50 and p99 in microseconds, and p99 as a share of the median step, the
-period between consecutive forward entries: over the steps whose batch is in
-the same bucket for ``out``, over every step for the others. Then whether
-every p99 but ``queue``'s is under 1% of its step, and in the smallest prompt
-bucket the p10 of ``recv`` + ``queue`` and of ``recv`` + ``past pull`` beside
-the run file's ``ipc_s``.
+``out``, an output's queue put to its send returning, bucketed by the batch
+of the step that put it, the last step to exit before the put. A bucket ``b``
+holds counts in ``[b, 2b)``. Per segment and bucket it prints N, p50 and p99
+in microseconds, and p99 as a share of the median step, the period between
+consecutive forward entries over every step. Then whether every p99 but
+``queue``'s is under 1% of the step, and in the smallest prompt bucket the
+p10 of ``recv`` + ``queue`` and of ``recv`` + ``past pull`` beside the run
+file's ``ipc_s``.
 """
 
+import bisect
 import sys
 from collections import defaultdict
 from itertools import pairwise
@@ -35,36 +36,31 @@ def _bucket(n: int) -> int:
 
 
 def report(record) -> list[str]:
-    segments, periods = defaultdict(list), defaultdict(list)
+    segments, periods = defaultdict(list), []
     for path in sorted(Path(record).glob("dp*.handoff.jsonl")):
+        steps = read_jsonl(path.with_name(path.name.replace(".handoff", "")))
+        steps = [s for s in steps if not s.get("is_dummy_run")]
+        periods += [b["t_enter_ns"] - a["t_enter_ns"] for a, b in pairwise(steps)]
+        exits = [s["t_exit_ns"] for s in steps]
         for h in read_jsonl(path):
             if "t_recv_ns" in h:
                 b, get = _bucket(h["prompt_tokens"]), h["t_in_get_ns"]
-                past = get - max(h["t_in_put_ns"], h["t_pull_ns"])
                 segments["recv", b].append(h["t_in_put_ns"] - h["t_recv_ns"])
                 segments["queue", b].append(get - h["t_in_put_ns"])
-                segments["past pull", b].append(past)
-                segments["recv+queue", b].append(get - h["t_recv_ns"])
-                segments["recv+past pull", b].append(
-                    h["t_in_put_ns"] - h["t_recv_ns"] + past
+                segments["past pull", b].append(
+                    get - max(h["t_in_put_ns"], h["t_pull_ns"])
                 )
             else:
-                b = _bucket(h["rows"])
-                segments["out", b].append(h["t_out_sent_ns"] - h["t_out_put_ns"])
-        steps = read_jsonl(path.with_name(path.name.replace(".handoff", "")))
-        steps = [s for s in steps if not s.get("is_dummy_run")]
-        for s, after in pairwise(steps):
-            periods[_bucket(len(s["batch"]))].append(
-                after["t_enter_ns"] - s["t_enter_ns"]
-            )
-    every = np.median([p for ps in periods.values() for p in ps])
+                put = h["t_out_put_ns"]
+                step = steps[bisect.bisect_right(exits, put) - 1]
+                segments["out", _bucket(len(step["batch"]))].append(
+                    h["t_out_sent_ns"] - put
+                )
+    step = np.median(periods)
     rows = ["| segment | bucket | N | p50 us | p99 us | median step us | p99 / step |"]
     rows.append("|---|---|---|---|---|---|---|")
     small = True
     for (seg, b), ns in sorted(segments.items()):
-        if seg.startswith("recv+"):
-            continue
-        step = np.median(periods[b]) if seg == "out" and periods[b] else every
         p50, p99 = np.percentile(ns, [50, 99])
         small &= seg == "queue" or p99 < 0.01 * step
         rows.append(
@@ -76,9 +72,10 @@ def report(record) -> list[str]:
     )
     first = min((b for seg, b in segments if seg == "recv"), default=None)
     if first is not None:
+        recv = segments["recv", first]
         p10s = [
-            np.percentile(segments[s, first], 10) / 1e3
-            for s in ("recv+queue", "recv+past pull")
+            np.percentile(np.add(recv, segments[s, first]), 10) / 1e3
+            for s in ("queue", "past pull")
         ]
         rows.append(
             f"p10 at prompt bucket {first}: recv+queue {p10s[0]:.1f} us, "
