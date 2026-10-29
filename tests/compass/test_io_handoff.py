@@ -80,9 +80,9 @@ def test_a_recorded_engine_writes_each_frame_and_output_handoff(tmp_path, monkey
     frames = [h for h in map(json.loads, lines) if "t_recv_ns" in h]
     outs = [h for h in map(json.loads, lines) if "rows" in h]
     assert [h["prompt_tokens"] for h in frames] == [11]
-    assert (
-        frames[0]["t_recv_ns"] <= frames[0]["t_in_put_ns"] <= frames[0]["t_in_get_ns"]
-    )
+    f = frames[0]
+    assert f["t_recv_ns"] <= f["t_in_put_ns"] <= f["t_in_get_ns"]
+    assert 0 < f["t_pull_ns"] <= f["t_in_get_ns"]
     assert [h["rows"] for h in outs] == [1, 2]  # the frames' finished requests
     assert all(h["t_out_put_ns"] <= h["t_out_sent_ns"] for h in outs)
 
@@ -136,6 +136,7 @@ def test_the_reader_holds_each_p99_to_its_buckets_median_step(tmp_path):
             "t_recv_ns": 0,
             "t_in_put_ns": 5_000,
             "t_in_get_ns": 25_000,
+            "t_pull_ns": 15_000,
             "prompt_tokens": 100,
         },
         {"t_out_put_ns": 0, "t_out_sent_ns": 50_000, "rows": 2},
@@ -150,7 +151,11 @@ def test_the_reader_holds_each_p99_to_its_buckets_median_step(tmp_path):
     assert "| out | 1 | 1 | 200.0 | 200.0 | 10000 | 2.00% |" in rows
     assert "| out | 2 | 1 | 50.0 | 50.0 | 10000 | 0.50% |" in rows
     assert "| queue | 64 | 1 | 20.0 | 20.0 | 10000 | 0.20% |" in rows
+    assert "| past pull | 64 | 1 | 10.0 | 10.0 | 10000 | 0.10% |" in rows
     assert rows[-2:] == [
-        "every p99 under 1% of its step: no",
-        "recv+queue p10 at prompt bucket 64: 25.0 us; ipc_s 61.0 us",
+        "every p99 but queue's under 1% of its step: no",
+        (
+            "p10 at prompt bucket 64: recv+queue 25.0 us, recv+past pull 15.0 us; "
+            "ipc_s 61.0 us"
+        ),
     ]

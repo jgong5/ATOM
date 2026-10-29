@@ -761,7 +761,8 @@ class PullStamps:
 
     In `handoff`, one line per item through the engine's IO-thread queues: an
     input frame's ``t_recv_ns`` (the input thread's receipt, on the same
-    clock), ``t_in_put_ns``, ``t_in_get_ns`` and ``prompt_tokens``; an
+    clock), ``t_in_put_ns``, ``t_in_get_ns``, ``t_pull_ns`` (the busy loop's
+    idle point in the pass that got it) and ``prompt_tokens``; an
     output's ``t_out_put_ns``, ``t_out_sent_ns`` (the output thread's next
     get, so its send returned) and ``rows``."""
 
@@ -771,6 +772,7 @@ class PullStamps:
         self.lock = threading.Lock()
         self.armed: set[str] = set()
         self.inputs: dict[int, int] = {}  # id of an input item -> its put
+        self.pull = 0  # the busy loop's last idle point
 
     def arm(self) -> None:
         with self.lock:
@@ -842,6 +844,7 @@ class _StampedInputQueue(queue.Queue):
                     "t_recv_ns": recv,
                     "t_in_put_ns": put,
                     "t_in_get_ns": got,
+                    "t_pull_ns": _stamps.pull,
                     "prompt_tokens": prompt,
                 }
             )
@@ -938,6 +941,7 @@ def idle(deadline, t_daemon: float = math.inf) -> bool:
     if rt is None:
         if _stamps is not None:
             _stamps.stamp("t_pull_ns")
+            _stamps.pull = _stamps.now()
         return False
     if rt.in_run and rt.calls == rt.idle_calls:
         rt.next_event(deadline(), t_daemon)
