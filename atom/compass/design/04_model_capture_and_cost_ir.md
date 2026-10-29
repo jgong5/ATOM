@@ -962,8 +962,8 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   `compress_ratio` and `index_candidates`, the most entries it scores where an earlier
   layer chose its candidates, else null (#2344).
 
-Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers
-and DeepSeek-V4's and V4.1's attention aside, below), so its ambient reads stay
+Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers,
+DeepSeek-V4's attention and V4.1's guarded ops aside, below), so its ambient reads stay
 invisible to the trace; the bench does not need them, because it times the leaf at a
 point `ModelRunner.prepare_model` prepared, where ATOM has built the forward context for
 that point, and runs no forward (`07` D39).
