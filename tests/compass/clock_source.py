@@ -67,7 +67,10 @@ from dataclasses import dataclass
 #: `time.strftime` and `datetime.date.today` read the machine clock and hand
 #: back a calendar date or a string, which no record adds up as seconds without
 #: a conversion call a reviewer sees. `os.times` and `resource.getrusage` read
-#: CPU seconds and have not been tried.
+#: CPU seconds and have not been tried. A call through `atom.utils.time_shim`
+#: resolves to the shim and not to `time`, so a module that imports the shim as
+#: `time` reads the simulated clock at every clock call: the shim exposes no
+#: real read.
 #:
 #: **Every entry is the fully qualified name, because the comparison is exact.**
 #: A tail match would hand the whole list to any receiver whose attribute
@@ -199,7 +202,8 @@ _CONTROL_DEADLINE = (
 #: kept one is not excused by it. K8 stays real on purpose, out of the clock
 #: authority's reach; K9 is outside the model -- outside the simulated window,
 #: in code a simulated run replaces, or a timing only a log line reads. Every
-#: other read takes the LP clock through `atom.utils.clock.now`.
+#: other read takes the LP clock through `atom.utils.clock.now` or
+#: `atom.utils.time_shim`.
 # fmt: off
 _KEPT_REAL = (
     ("atom/model_engine/async_proc.py", "exit", "time.monotonic",
@@ -425,13 +429,13 @@ class ClockSourceLint:
         if self.allowed(path) is not None:
             return ()
         tree = ast.parse(source, filename=path)
-        origins = _origins(tree)
+        origins, imported = _origins(tree)
         spans = scopes(tree)
         found = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            call = _resolve(_dotted(node.func), origins)
+            call = _resolve(_dotted(node.func), origins, imported)
             if call in CLOCK_READS:
                 found.append(
                     ClockRead(path, node.lineno, call, scope_at(spans, node.lineno))
@@ -531,8 +535,9 @@ def _dotted(node) -> str | None:
     return ".".join(reversed(parts))
 
 
-def _origins(tree) -> dict[str, str]:
-    """Local name -> the dotted name it stands for: imports, and aliases of them.
+def _origins(tree) -> tuple[dict[str, str], set[str]]:
+    """Local name -> the dotted name it stands for: imports, and aliases of them;
+    and the local names whose origin is an import.
 
     An alias is an assignment whose right-hand side is a dotted name, and it is
     recorded whole -- `self._clock = time.perf_counter` binds `self._clock`, not
@@ -544,14 +549,21 @@ def _origins(tree) -> dict[str, str]:
     to be called `time` resolves to `.time` and never to the standard library.
     """
     origins: dict[str, str] = {}
+    imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                origins.setdefault(alias.asname or alias.name.split(".")[0], alias.name)
+                name = alias.asname or alias.name.split(".")[0]
+                if name not in origins:
+                    origins[name] = alias.name
+                    imported.add(name)
         elif isinstance(node, ast.ImportFrom):
             package = "." * node.level + (f"{node.module}." if node.module else "")
             for alias in node.names:
-                origins.setdefault(alias.asname or alias.name, package + alias.name)
+                name = alias.asname or alias.name
+                if name not in origins:
+                    origins[name] = package + alias.name
+                    imported.add(name)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             source = _dotted(node.value)
             if source is None:
@@ -561,10 +573,12 @@ def _origins(tree) -> dict[str, str]:
                 name = _dotted(target)
                 if name is not None and name != source:
                     origins.setdefault(name, source)
-    return origins
+    return origins, imported
 
 
-def _resolve(call: str | None, origins: dict[str, str]) -> str | None:
+def _resolve(
+    call: str | None, origins: dict[str, str], imported: set[str]
+) -> str | None:
     """Rewrite a call's head through the imports and aliases that introduced it.
 
     An alias can stand on an alias, and `ast.walk` does not visit the bindings
@@ -573,6 +587,11 @@ def _resolve(call: str | None, origins: dict[str, str]) -> str | None:
     legitimately stand for one that contains it -- `from datetime import
     datetime` binds `datetime` to `datetime.datetime` -- and expanding that a
     second time would grow the name instead of resolving it.
+
+    A name an import binds is the end of the chain: what it stands for is a
+    module's own name, not a local one. `import time as wall` beside
+    `from atom.utils import time_shim as time` makes `wall.monotonic` the
+    standard library's read, not the shim's.
     """
     if call is None:
         return None
@@ -583,6 +602,7 @@ def _resolve(call: str | None, origins: dict[str, str]) -> str | None:
             if call in expanded:
                 return call
             expanded.add(call)
+            final = call in imported
         else:
             head, _, rest = call.partition(".")
             head_origin = origins.get(head)
@@ -590,8 +610,9 @@ def _resolve(call: str | None, origins: dict[str, str]) -> str | None:
                 return call
             expanded.add(head)
             origin = f"{head_origin}.{rest}" if rest else head_origin
-        if origin == call:
-            return call
+            final = head in imported
+        if origin == call or final:
+            return origin
         call = origin
 
 

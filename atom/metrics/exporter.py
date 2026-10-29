@@ -10,7 +10,6 @@ import asyncio
 import copy
 import gc
 import threading
-import time
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 from typing import Any
@@ -19,7 +18,7 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
-from atom.utils import clock
+from atom.utils import time_shim as time
 
 Snapshot = dict[str, Any]
 SnapshotState = tuple[Snapshot, int, float]
@@ -531,7 +530,7 @@ class AtomMetricsExporter:
         with self._lock:
             # Published snapshots are replaced, never mutated or exposed.
             self._snapshot = snapshot
-            self._last_refresh = clock.now(time.time)
+            self._last_refresh = time.time()
 
     def record_refresh_error(self) -> None:
         with self._lock:

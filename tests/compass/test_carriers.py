@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
-"""The tracestate and SSE comment carriers, and the stream writer in `_client_stream`.
+"""The tracestate and SSE comment carriers, and the SSE stamps `HttpChannel` writes.
 
-The writer is driven through the shipped wrapper every streaming endpoint
-returns, with a real `LPRuntime` installed as the frontend's clock, and the
-chat response is ATOM's own `stream_chat_response`.
+A stream is driven through the shipped wrapper every streaming endpoint
+returns, `_client_stream`, in a `StreamingResponse` served behind `HttpChannel`,
+with a real `LPRuntime` installed as the frontend's clock, and the chat
+response is ATOM's own `stream_chat_response`.
 """
 
 import asyncio
 import re
 
 import pytest
+from starlette.responses import StreamingResponse
 
 from atom.compass.carriers import sse_stamp, tracestate_stamp, tracestate_with
 from atom.compass.clock import LpId, prefill_decode_table, single_engine_table
@@ -18,6 +20,7 @@ from atom.entrypoints.openai.serving_chat import stream_chat_response
 from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
+from atom.utils.compass_loop import HttpChannel
 
 STREAM = "frontend->traffic:stream"
 STREAM_S = 0.002
@@ -47,10 +50,31 @@ def installed():
 
 
 def _client_text(source):
-    async def run():
-        return [c async for c in api_server._client_stream(source, "req-1")]
+    """The body messages the client is sent, each non-empty one as text."""
+    sent = []
 
-    return asyncio.run(run())
+    async def app(scope, receive, send):
+        stream = api_server._client_stream(source, "req-1")
+        await StreamingResponse(stream, media_type="text/event-stream")(
+            scope, receive, send
+        )
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.body" and message["body"]:
+            sent.append(message["body"].decode())
+
+    scope = {
+        "type": "http",
+        "asgi": {"spec_version": "2.4"},
+        "method": "GET",
+        "path": "/stream",
+        "headers": [],
+    }
+    asyncio.run(HttpChannel(app, lambda scope: None)(scope, receive, send))
+    return sent
 
 
 async def _replay(frames):

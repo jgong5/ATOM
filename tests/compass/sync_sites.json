@@ -3022,11 +3022,11 @@
    "mechanism_why": "the per-step reduction inside one data-parallel group, which is one LP"
   },
   {
-   "id": "atom/model_engine/scheduler.py::Scheduler._schedule::while delayer_allows and (self.delay_factor <= 0 or self._passed_delay(clock.now(time.time))) and self.waiting and num_seqs_prefill < self.max_num_seqs and num_::spin_loop#0",
+   "id": "atom/model_engine/scheduler.py::Scheduler._schedule::while delayer_allows and (self.delay_factor <= 0 or self._passed_delay(time.time())) and self.waiting and num_seqs_prefill < self.max_num_seqs and num_batched_t::spin_loop#0",
    "file": "atom/model_engine/scheduler.py",
    "symbol": "Scheduler._schedule",
-   "call": "while delayer_allows and (self.delay_factor <= 0 or self._passed_delay(clock.now(time.time))) and self.waiting and num_seqs_prefill < self.max_num_seqs and num_",
-   "expr": "while delayer_allows and (self.delay_factor <= 0 or self._passed_delay(clock.now(time.time))) and self.waiting and num_seqs_prefill < self.max_num_seqs and num_",
+   "call": "while delayer_allows and (self.delay_factor <= 0 or self._passed_delay(time.time())) and self.waiting and num_seqs_prefill < self.max_num_seqs and num_batched_t",
+   "expr": "while delayer_allows and (self.delay_factor <= 0 or self._passed_delay(time.time())) and self.waiting and num_seqs_prefill < self.max_num_seqs and num_batched_t",
    "shape": "spin_loop",
    "category": "ignore",
    "peer": "none",
@@ -5432,7 +5432,7 @@
   {
    "file": "atom/model_engine/scheduler.py",
    "symbol": "Scheduler._oldest_waiting_prefill_age_ms",
-   "anchor": "return max(0.0, (clock.now(time.time) - oldest_arrive) * 1000.0)",
+   "anchor": "return max(0.0, (time.time() - oldest_arrive) * 1000.0)",
    "category": "A",
    "peer": "none",
    "why": "the coalescer's queue-age guard force-releases a prefill when the oldest waiting request exceeds its limit; the age is elapsed time and decides which batch is scheduled",
@@ -5442,7 +5442,7 @@
   {
    "file": "atom/model_engine/llm_engine.py",
    "symbol": "InputOutputProcessor.preprocess_fanout",
-   "anchor": "seq.arrive_time = clock.now(time.time)",
+   "anchor": "seq.arrive_time = time.time()",
    "category": "A",
    "peer": "none",
    "why": "every queueing age and every reported latency is measured from this stamp",
@@ -5452,7 +5452,7 @@
   {
    "file": "atom/model_engine/llm_engine.py",
    "symbol": "InputOutputProcessor.postprocess",
-   "anchor": "req.leave_time = clock.now(time.time)",
+   "anchor": "req.leave_time = time.time()",
    "category": "A",
    "peer": "none",
    "why": "the end of the reported end-to-end latency",
@@ -5462,7 +5462,7 @@
   {
    "file": "atom/model_engine/scheduler.py",
    "symbol": "Scheduler.postprocess",
-   "anchor": "seq.first_token_time = clock.now(time.time)",
+   "anchor": "seq.first_token_time = time.time()",
    "category": "A",
    "peer": "none",
    "why": "the reported time to first token, stamped in the step loop as a batch is post-processed",
@@ -5472,7 +5472,7 @@
   {
    "file": "atom/model_engine/scheduler.py",
    "symbol": "DecodeScheduler.on_prefill_done",
-   "anchor": "seq.first_token_time = clock.now(time.time)",
+   "anchor": "seq.first_token_time = time.time()",
    "category": "A",
    "peer": "thread",
    "why": "the same stamp for the intra-device split, taken in the receiving background thread rather than where the step loop promotes the sequence",
