@@ -1051,3 +1051,25 @@ one: grading in another refuses every real step's graph.
     cell is graded whole too, with the request aiperf cancelled at its cutoff: the
     server steps it alone until `client.sh --stop` stops the server, and grading
     takes those steps only from an export that `--stop` marked `server_stopped`.
+
+### A stage-4 cell smoked on MI355X
+
+The DeepSeek-V4.1-Flash cells of [#2138](https://github.com/jgong5/ATOM/issues/2138),
+TP4 with DSpark5, are smoked on mi355-gpu-40 by steps 1 to 5 and check 2, at
+concurrency 16 alone, with these changes:
+
+- The image is `rocm/atom-dev:vllm-v0.31.0-nightly_20261026`, whose aiter the tree
+  serves V4.1-Flash on, and `$M` names `machines/mi355x-gpu40.json`, pinned to its stack.
+- `$ATOM` is `--model <DeepSeek-V4.1-Flash> --max-model-len 262144 -tp 4
+  --kv_cache_dtype bf16 --index-cache-dtype fp8 --method dspark
+  --num-speculative-tokens 5 --level 0`, plus `--enable-expert-parallel` for the EP4
+  cell, and `G` names four GPUs.
+- The warm record serves traces 0 to 255 at 16. V4.1's Triton kernels still compile
+  new variants after it, so take again every record that names `aiter_jit_builds`.
+- Calibration adds a first-turn record at 16, `"16 --trajectory-start-min-ratio 0
+  --trajectory-start-max-ratio 0"`: sampled starts leave rung 6 and above too few
+  steps for a vector, and a step at a rung with none is refused.
+- Step 4's two real runs take `--duration 3600`, a calibration record between them;
+  step 5 adds `--acceptance-record $R/cell/c16/real1`.
+- The draft vectors hold no held-out error: check 2's `cost` rows of kind `draft` give
+  the draft law's error on the real runs' own steps.
