@@ -65,6 +65,8 @@ def runner(ladder=LADDER, enforce_eager=False, dp_size=1):
     return SimpleNamespace(
         capture_sizes_np=np.asarray(ladder, dtype=np.int32),
         enforce_eager=enforce_eager,
+        running_tokens_per_dp_rank=np.zeros(dp_size, dtype=np.int32),
+        tbo_decode_graphs=False,
         attn_metadata_builder=GRAPHABLE,
         config=SimpleNamespace(
             enable_tbo=False,
@@ -87,12 +89,15 @@ def _captured(declared, max_num_seqs, max_num_batched_tokens):
     class Captured(NonAllocatingRunner):
         enforce_eager = False
         capture_sizes_np = np.asarray([0], dtype=np.int32)
+        running_tokens_per_dp_rank = np.zeros(1, dtype=np.int32)
+        tbo_decode_graphs = False
         attn_metadata_builder = GRAPHABLE
         config = SimpleNamespace(
             capture_sizes=declared,
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_tbo=False,
+            enable_tbo_decode=False,
             parallel_config=SimpleNamespace(data_parallel_size=1),
         )
 

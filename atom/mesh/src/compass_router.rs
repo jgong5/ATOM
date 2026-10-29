@@ -188,6 +188,27 @@ pub fn start() {
     });
 }
 
+/// `builder` for the router's client to the workers: under the router LP, with
+/// no TCP user timeout. A frontend leaves a request's body unread until the
+/// clock releases the request, which can take more wall time than reqwest's
+/// default of 30 s, so a large body's send would end there.
+pub fn worker_client(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    match LP.get() {
+        Some(_) => held_sends(builder),
+        None => builder,
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+fn held_sends(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder.tcp_user_timeout(None)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+fn held_sends(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder
+}
+
 fn kind(channel: &str) -> &str {
     channel.rsplit(':').next().unwrap_or_default()
 }
@@ -591,6 +612,37 @@ impl Lp {
 mod tests {
     use super::{header, stamp, Handling, REQUEST};
     use std::cell::RefCell;
+
+    /// A send to a worker that leaves the body unread for 40 wall seconds, as a
+    /// frontend holding a request does: reqwest's own client ends it at its
+    /// 30 s TCP user timeout, the router LP's goes on waiting.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_held_send_outlasts_30_wall_seconds() {
+        use super::held_sends;
+        use std::time::Duration;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            loop {
+                accepted.push(listener.accept().await.unwrap().0);
+            }
+        });
+        let send = |builder: reqwest::ClientBuilder| {
+            let post = builder.build().unwrap().post(&url).body(vec![b'x'; 64 << 20]);
+            tokio::time::timeout(Duration::from_secs(40), post.send())
+        };
+        let (plain, lp) = tokio::join!(
+            send(reqwest::Client::builder()),
+            send(held_sends(reqwest::Client::builder()))
+        );
+        eprintln!("reqwest's client: {plain:?}; the router LP's: {lp:?}");
+        assert!(matches!(plain, Ok(Err(_))));
+        assert!(lp.is_err());
+        held.abort();
+    }
 
     #[test]
     fn restamped_entry_goes_first_within_32_entries() {

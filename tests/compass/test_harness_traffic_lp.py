@@ -147,7 +147,10 @@ class Frontend(threading.Thread):
 
 async def _trace(endpoint, prefix, monkeypatch, *, requests, drop=(), logged=None):
     """Run `requests` turns, each `DELAY` after the last one's return."""
-    monkeypatch.setattr(StickyCreditRouter, "__init__", lambda self, **kw: None)
+    comms = SimpleNamespace(create_pub_client=lambda address: None)
+    monkeypatch.setattr(
+        StickyCreditRouter, "__init__", lambda s, **kw: setattr(s, "comms", comms)
+    )
     sent = []
     monkeypatch.setattr(
         StickyCreditRouter, "send_credit", lambda self, credit: _record(sent, credit)
@@ -1155,10 +1158,12 @@ def test_a_failed_traffic_lp_tells_aiperf_the_run_failed_before_it_stops(
 ):
     """The reader rejects a report, as above, under the router. Before the loop
     stops, the router publishes an error the controller keeps as an exit error,
-    then the cancel the records manager finishes on."""
+    then the cancel the records manager finishes on, whose log line names the
+    error."""
     from aiperf.common.messages import ProfileCancelCommand
     from aiperf.controller.result_join_coordinator import ResultJoinCoordinator
     from aiperf.controller.system_controller import SystemController
+    from aiperf.records.records_manager import RecordsManager
 
     sent = []
 
@@ -1169,10 +1174,8 @@ def test_a_failed_traffic_lp_tells_aiperf_the_run_failed_before_it_stops(
 
     def init(self, **kw):
         self.comms = SimpleNamespace(create_pub_client=lambda address: Bus())
-        self._init_credit_channels(None)
 
     monkeypatch.setattr(StickyCreditRouter, "__init__", init)
-    monkeypatch.setattr(StickyCreditRouter, "_init_credit_channels", lambda s, c: None)
     monkeypatch.setattr(CompassCreditRouter, "exception", lambda self, msg: None)
 
     async def main():
@@ -1210,3 +1213,19 @@ def test_a_failed_traffic_lp_tells_aiperf_the_run_failed_before_it_stops(
     (exit_error,) = controller._exit_errors
     assert exit_error.error_details.type == "Straggler"
     assert "seq 1 arrives at 0.5, now 1.0" in exit_error.error_details.message
+
+    async def process_results(phase, cancelled):
+        pass
+
+    warned = []
+    records = SimpleNamespace(
+        warning=warned.append,
+        _records_tracker=SimpleNamespace(mark_phase_cancelled=lambda phase: None),
+        _process_results=process_results,
+    )
+    asyncio.run(RecordsManager._on_profile_cancel_command(records, cancel))
+    (line,) = warned
+    assert re.search(
+        r'"reason_detail":"traffic LP: Straggler\(.* seq 1 arrives at 0.5, now 1.0',
+        line,
+    )
