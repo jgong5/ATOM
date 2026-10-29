@@ -27,7 +27,7 @@ from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
 from test_parity_device_window import _Processor
 from test_parity_record import BLOCK, _config
 
-from atom.compass.bench import replay, window
+from atom.compass.bench import measure, replay, window
 from atom.compass.bench.window import BenchWindow
 from atom.compass.fit.samples import load
 from atom.compass.parity import StepRecording
@@ -38,6 +38,7 @@ from atom.sampling_params import SamplingParams
 
 #: Each drafter: its draft width and whether it is DSpark.
 DRAFTERS = {"dspark5": (5, True), "mtp1": (1, False)}
+K = DRAFTERS["dspark5"][0]
 #: Prompt lengths: two open in one prefill, the third chunked behind them.
 PROMPTS = (23, 40, 90)
 
@@ -228,3 +229,41 @@ def test_a_measurement_holds_the_drafters_value_and_fit_reads_it_as_a_draft_labe
     assert sorted((s.device_s, s.draft_s) for s in samples) == sorted(
         (m["seconds"], m["draft_seconds"]) for _, m in held
     )
+
+
+def test_each_ragged_verify_view_keeps_its_width_and_replays_in_the_pool(
+    model_dir,  # noqa: F811
+):
+    """`measure steps --ragged` under DSpark5 composes from a seed of four
+    verify rows, at the pool the seed fills with its draft rounds' positions:
+    every view keeps six tokens a row and the replay rule builds it, the
+    fullest holding the pool's last block with those positions."""
+    cached, ladder = (40, 90, 150, 260), [1, 2, 4, 8]
+    seed = {
+        "rows": [[K + 1, c + K + 1, True] for c in cached],
+        "rung": 4,
+        "produces_output": True,
+    }
+    blocks = sum(-(-(c + K + 1 + K - 1) // BLOCK) for c in cached)
+    engine = {
+        "kv_cache_block_size": BLOCK,
+        "max_model_len": 2048,
+        "ladder": ladder,
+        "num_kvcache_blocks": blocks,
+        "speculative": ["dspark", K],
+    }
+    contexts = list(range(30, 500, 5))
+    lines = [{"rows": [[K + 1, c, True]], "traces": ["trace-0"]} for c in contexts]
+    built = config(model_dir, "dspark5")
+    built.num_kvcache_blocks = blocks
+    rule = replay.ReplayRule(built)
+
+    composed = measure._ragged({"seed": {"view": seed}}, [("in", lines, engine)], 0)
+
+    views = [point["view"] for point in composed.values()]
+    assert len(views) > 10
+    for view in views:
+        assert {q for q, _, _ in view["rows"]} == {K + 1}
+        rule.batch(view)
+    held = [sum(-(-(c + K - 1) // BLOCK) for _, c, _ in v["rows"]) for v in views]
+    assert max(held) == blocks

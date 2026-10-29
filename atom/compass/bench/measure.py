@@ -47,10 +47,10 @@ refuses, naming it. Its member `MEMBER` holds the view, `seconds` (the median
 of the bench's kept repeats, under a drafter of their target's parts, and
 `draft_seconds` that of their drafter's parts), the repeats, the protocol,
 the replay rule, the origin, the inputs it came from (`sources`) and the
-`traces` their lines served. A batch the rule or the bench refuses is not published; the command
-measures the rest, then fails naming each. `<out>` also holds run.json, with
-the warm-up's and the measuring's boundaries, the engine file and the GPU
-checks.
+`traces` their lines served. A batch the rule or the bench refuses is not
+published; the command measures the rest, then fails naming each. `<out>`
+also holds run.json, with the warm-up's and the measuring's boundaries, the
+engine file and the GPU checks.
 
 The bench holds the largest KV pool its inputs' engines state, whatever this
 device's own budget gives, so every batch they ran, and every point planned
