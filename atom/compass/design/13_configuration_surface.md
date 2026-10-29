@@ -303,8 +303,10 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
     `--kv-transfer-config` and refuses one among its arguments. The router,
     `atomesh launch`, takes its arguments as given; the script adds its host and ports,
     `--pd-disaggregation` and each instance's URL, read from that instance's
-    `server.json`. Whether the router is an LP follows from those arguments (`01` D7):
-    the script refuses `--dp-aware`, under which it would be, until a cell needs it.
+    `server.json`. Simulated, the script refuses `--prefill` or `--decode` among them, a
+    worker more to choose, and the limiter `01` D7 leaves out; the caller switches the
+    router's detectors off (`01` D5). Whether the router is an LP follows from those
+    arguments (`01` D7): under `--dp-aware` it is the run's router LP.
   - *One Clock Authority, the script's.* A simulated deployment shares one standalone
     authority (`01` D3.3). The script builds the deployment's one run file from `run`'s
     flags, as `run` builds its own (`atom/compass/drive/runfile.py::prefill_decode`),

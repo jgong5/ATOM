@@ -663,9 +663,15 @@ def channel_of(rt: LPRuntime, kind: str) -> str:
 
 
 def name_endpoints(
-    dp: int, input_address: str, control_address: str, output_address: str, config=None
+    dp: int | None,
+    input_address: str,
+    control_address: str,
+    output_address: str,
+    config=None,
 ) -> None:
     """Record the channel kind each address carries; a real run records nothing.
+
+    `dp` None is `config`'s data-parallel rank, read only on a simulated run.
 
     A socket this LP binds or connects to a recorded address becomes that
     channel's `WrappedSocket`; the channel is looked up then, so an address no
@@ -684,6 +690,7 @@ def name_endpoints(
     kinds = {}
     if config is not None:
         pc = config.parallel_config
+        dp = pc.data_parallel_rank if dp is None else dp
         dp += getattr(pc, "pipeline_parallel_rank", 0)
         dp += getattr(config, "disagg_is_decode", False)
         kinds |= {a: f"meta#pp{k}" for k, a in enumerate(pc.pp_meta_addrs)}
@@ -703,17 +710,20 @@ def name_endpoints(
     rt.endpoints |= kinds
 
 
-def relay_queue(dp: int):
+def relay_queue(parallel):
     """The engine's output queue: a `RelayQueue` on its output channel, else a `queue.Queue`.
 
-    The channel is rank `dp`'s, or the LP's only one: a pipeline stage is an
-    LP of its own. Its socket is opened later, on the output thread, and takes
-    the relay's placeholder when it connects to the output address.
+    The channel is the data-parallel rank's that `parallel`, the engine's
+    parallel config, names, or the LP's only one: a pipeline stage is an LP of
+    its own. Its socket is opened later, on the output thread, and takes the
+    relay's placeholder when it connects to the output address. The rank is
+    read only on a simulated run.
     """
     rt = _installed
     if rt is None:
         return queue.Queue() if _stamps is None else _StampedQueue()
     outs = [c.name for c in rt.table.channels_from(rt.me) if ":output#" in c.name]
+    dp = parallel.data_parallel_rank
     ch = outs[0] if len(outs) == 1 else channel_of(rt, f"output#dp{dp}")
     rt.relays[ch] = RelayQueue(rt, WrappedSocket(rt, None, ch))
     return rt.relays[ch]

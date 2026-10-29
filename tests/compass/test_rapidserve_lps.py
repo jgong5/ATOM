@@ -92,7 +92,7 @@ def test_each_engine_names_its_channels_by_the_index_its_frontend_gives_it(
 ):
     rt = LPRuntime(lp, _table(), None)
     monkeypatch.setattr(clock, "_installed", rt)
-    relay = clock.relay_queue(0)
+    relay = clock.relay_queue(SimpleNamespace(data_parallel_rank=0))
     clock.name_endpoints(0, "in", "ctl", "out", _engine_config(decode))
     assert relay.wsock.ch == f"{lp.name}->frontend:output{tag}"
     kinds = [rt.endpoints[a] for a in ("in", "out", "p2d", "d2p")]

@@ -121,7 +121,9 @@ def test_an_unsharded_producer_into_dcp2_is_priced_on_mooncakes_slices(monkeypat
     sent = []
     worker = MagicMock(is_producer=False, tp_size=1, tp_rank=0, _mla_landing=None)
     worker._has_slot_regions = False
-    worker._send_on_socket = lambda addr, frames: sent.append(frames[1])
+    worker._enqueue_write_requests = lambda requests: sent.extend(
+        frames[1] for _, frames in requests
+    )
     monkeypatch.setattr(mc, "msgpack", SimpleNamespace(dumps=lambda body: body))
     mc.MooncakeConnector.start_load_kv(worker, ref.build_connector_meta())
     (body,) = sent
