@@ -937,6 +937,36 @@ def test_a_length_the_fit_does_not_hold_at_is_refused_by_name():
     assert "bound of 10.0%" in str(refused.value)
 
 
+class Waking(Clocked):
+    """Clocked, and each of the `calls` calls after one over `long` tokens
+    costs `extra` seconds more, whatever its length."""
+
+    def __init__(self, fixed, rate, long, calls, extra):
+        super().__init__(fixed, rate)
+        self.long, self.calls, self.extra, self.left = long, calls, extra, 0
+
+    def _spend(self, tokens):
+        super()._spend(tokens)
+        if self.left:
+            self.now, self.left = self.now + self.extra, self.left - 1
+        if tokens > self.long:
+            self.left = self.calls
+
+
+def test_a_one_token_encode_in_the_wake_of_the_whole_text_is_not_timed():
+    # On mi355-gpu-40 the first few encodes after the sweep text's took 0.4 to
+    # 4 ms each, one token or more; the one-token point then read 100 times its
+    # fit. Here the text is longer than any length swept, and the seven calls
+    # after its encode carry a millisecond each: one token's decode and encode
+    # and the five timed encodes.
+    tok = Waking(3.0e-5, 2.0e6, long=SWEPT[-1], calls=7, extra=1.0e-3)
+    text = SWEEP_TEXT * 2
+    rates = tokenizer_sweep(tok, text, SWEPT, bound=0.01, clock=tok.clock)
+    for side in ("encode", "decode"):
+        assert rates[f"{side}_fixed_s"] == pytest.approx(3.0e-5)
+        assert rates[f"{side}_tokens_per_s"] == pytest.approx(2.0e6)
+
+
 def test_a_sweep_text_shorter_than_the_longest_length_is_refused():
     tok = Clocked(3.0e-5, 2.0e6)
     with pytest.raises(SpecRefusal, match="the sweep text is 2 tokens"):
