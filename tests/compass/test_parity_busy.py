@@ -185,7 +185,7 @@ PACED = [
 def test_a_paused_rank_counts_no_gap_across_the_paused_pass(tmp_path):
     """Device-paced, both ranks alike, rank 1 paused for the drafter: its gap
     from K4 to the sampler is DK's device time, so it counts nothing, rank 1's
-    target 87. The target is rank 0's 88 (union 75, queued gaps 2, 10, 1 and
+    target 87. The target is rank 0's 88 (union 74, queued gaps 2, 10, 1 and
     1 whole), the draft-KV pass DK and its gap, 4: 92 in all, as on the
     device."""
     steps = tmp_path / "steps"
