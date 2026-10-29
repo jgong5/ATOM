@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 """`scripts/compass` launchers hold each port they draw until they exit: a port
-`compass_free_port` drew, and each port `cctraces_sim.sh` hands `pd_sim.sh`,
+`compass_held_port` drew, and each port `cctraces_sim.sh` hands `pd_sim.sh`,
 refuses another process's plain bind while a server's listener binds it.
 
 Nothing needs a driver: `pd_sim.sh` is stubbed on `PATH`.
@@ -9,6 +9,7 @@ Nothing needs a driver: `pd_sim.sh` is stubbed on `PATH`.
 import errno
 import json
 import os
+import select
 import shutil
 import socket
 import subprocess
@@ -64,12 +65,13 @@ def test_a_drawn_port_is_held_from_another_process_until_the_script_exits():
         [
             "bash",
             "-c",
-            f'. {SCRIPTS}/_lib.sh; p=$(compass_free_port); echo "$p"; read -r _',
+            f'. {SCRIPTS}/_lib.sh; p=$(compass_held_port); echo "$p"; read -r _',
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
     )
+    assert select.select([script.stdout], [], [], 30)[0], "no port in 30 s"
     port = script.stdout.readline().strip()
     assert _squat(port) == [HELD]
     script.communicate("\n", timeout=30)
