@@ -44,9 +44,10 @@ A measurement's key is the configuration (model, device,
 digest, so a view the store holds is not measured again and a stopped
 invocation resumes; a held entry taken under other readings than this run's
 refuses, naming it. Its member `MEMBER` holds the view, `seconds` (the median
-of the bench's kept repeats), the repeats, the protocol, the replay rule, the
-origin, the inputs it came from (`sources`) and the `traces` their lines
-served. A batch the rule or the bench refuses is not published; the command
+of the bench's kept repeats, under a drafter of their target's parts, and
+`draft_seconds` that of their drafter's parts), the repeats, the protocol,
+the replay rule, the origin, the inputs it came from (`sources`) and the
+`traces` their lines served. A batch the rule or the bench refuses is not published; the command
 measures the rest, then fails naming each. `<out>` also holds run.json, with
 the warm-up's and the measuring's boundaries, the engine file and the GPU
 checks.
@@ -536,9 +537,11 @@ def _measure(bench, config, sampling, store, command, readings, todo) -> list[st
         if "refused" in got:
             refused.append(f"{key}: {got['refused']}")
             continue
+        drafter = got.get("draft_median_ns")
         member = {
             **point["view"],
             "seconds": got["median_ns"] / 1e9,
+            **({} if drafter is None else {"draft_seconds": drafter / 1e9}),
             "statistic": "median",
             "repeats": got["repeats"],
             "discarded": got["discarded"],

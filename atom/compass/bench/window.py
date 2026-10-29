@@ -31,6 +31,13 @@ window of a worker that opened earlier also holds that wait. The last-opened
 worker's holds none, and every collective holds it for the slowest worker, so
 the reply of rank 0, the only one the runner manager returns, carries the
 group's step, charged to its slowest rank.
+
+Under a drafter a repeat is split where `step_labels` splits a real step: the
+target's part runs from F to the record's target end, `d_target_ns`, with the
+draft-KV pass before `forward_done_event` on a forward that produces output,
+and the drafter's part is the rest of A to B, kept as the repeat's fourth
+time. The statistic is then the median of the target's parts, F to B less the
+drafter's, and `draft_median_ns` the median of the drafter's.
 """
 
 import copy
@@ -61,7 +68,7 @@ class BenchWindow:
 
     def bench_step(self, batch) -> dict:
         """`batch` measured: its kept repeats and their median, or a refusal."""
-        preload = max(self._repeat(batch, 0)[4] for _ in range(WARMUPS))
+        preload = max(self._repeat(batch, 0)[-1] for _ in range(WARMUPS))
         longest = preload << DOUBLINGS
         kept, discarded, in_a_row = [], 0, 0
         while len(kept) < REPEATS:
@@ -82,17 +89,22 @@ class BenchWindow:
                     ),
                 }
             preload = min(2 * preload, longest)
-        return {
+        result = {
             "protocol": PROTOCOL,
-            "median_ns": statistics.median(ns for ns, _, _ in kept),
-            "repeats": kept,  # each [F to B, F to A, A to B] in ns
+            "median_ns": statistics.median(t[0] - sum(t[3:]) for t in kept),
+            # each [F to B, F to A, A to B] in ns, and the drafter's part
+            "repeats": kept,
             "discarded": discarded,
             "preload_ns": preload,
         }
+        if len(kept[0]) > 3:
+            result["draft_median_ns"] = statistics.median(t[3] for t in kept)
+        return result
 
     def _repeat(self, batch, preload: int) -> list[int]:
         """One forward behind `preload` ns, agreed by every worker:
-        [missed, F to B, F to A, A to B, host ns]."""
+        [missed, F to B, F to A, A to B, the drafter's part under a drafter,
+        host ns]."""
         # A real forward may rewrite batch fields in place, and a decode row
         # under a request id the runner has seen takes the token it sampled
         # last, not the batch's own: each forward runs a copy, as new requests.
@@ -122,6 +134,8 @@ class _Forward:
         self.preload = preload
 
     def add(self, batch, runner, forward):
+        # A real forward may rewrite batch fields in place.
+        output = hasattr(runner, "drafter") and batch.produces_output()
         start = runner.step_clock_ns()
         if self.preload:
             runner.preload(self.preload)
@@ -134,11 +148,14 @@ class _Forward:
         host = runner.step_clock_ns() - start
         missed = entry.query()
         fields = window(True)
-        self.values = [
+        values = [
             int(missed),
             round(entry.elapsed_time(runner._last_exit) * 1e6),
             fields["d_gap_ns"],
             fields["d_busy_ns"],
-            host,
         ]
+        if "d_target_ns" in fields:
+            target = fields["d_target_ns"] + output * fields.get("d_draft_kv_ns", 0)
+            values.append(fields["d_busy_ns"] - target)
+        self.values = [*values, host]
         return reply

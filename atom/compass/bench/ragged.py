@@ -19,6 +19,8 @@ above it there is one view per spread. A ratio no such batch reaches, past
 `max_len` or with a row below one token, a batch past `blocks` KV blocks of
 `block_size` tokens, and a draw whose last row misses the sum after `TRIES`
 draws give no view. The rows are shuffled, so the longest lands anywhere.
+Each row computes the seed's tokens a row, one, or a verify step's under a
+drafter.
 """
 
 import bisect
@@ -89,7 +91,7 @@ def compose(
             if got is None or sum(math.ceil(c / block_size) for c in got) > blocks:
                 continue
             rng.shuffle(got)
-            view = {**seed, "rows": [[1, c, True] for c in got]}
+            view = {**seed, "rows": [[rows[0][0], c, True] for c in got]}
             if view not in out:
                 out.append(view)
     return out
