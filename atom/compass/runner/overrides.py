@@ -159,6 +159,13 @@ RPC_SURFACE: dict[str, bool] = {
     # holds no real send and the stage loop has already waited for its own.
     "flush_pp_send": True,
     "poll_forward_metrics": False,  # EngineUtilityHandler does not wait
+    # EngineCore.__init__ hands the reply to its Scheduler; ATOM's own reads the
+    # prefill token graphs recorded, and this runner records none.
+    "prefill_token_graphs": True,
+    # Refused by `RefusedDynamicChunking`: a fit needs timed real forwards.
+    "profile_dynamic_chunking": True,  # EngineCore.__init__ reads the reply
+    # Reached only after a fit, so never: ATOM's own.
+    "take_dynamic_chunking_fit": True,  # EngineCore reads the reply
     "release_multimodal_requests": False,  # EngineCore does not wait
     # Refused by `RefusedControlCommands`: ATOM's own starts a real profiler.
     "start_profiler": True,  # EngineUtilityHandler forwards the reply unread
@@ -771,17 +778,110 @@ class UnbuiltModel(torch.nn.Module):
         )
 
 
-def publish_paged_block(runner: Any) -> None:
-    """Publish one entry of the paged class `get_num_blocks` planned, and the
-    runner's TP width, at the file `compass_block_file` names, which
+def publish_planned_transfer(runner: Any) -> None:
+    """Publish one entry of the paged class `get_num_blocks` planned, the state
+    slot a transfer moves beside a request's blocks (`_transferred_slot`),
+    the staging row a second write moves after them (`_staging_row_bytes`),
+    and the runner's TP width, at the file `compass_block_file` names, which
     `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
-    prices a transferred block at it."""
+    prices a transfer at them. Refused for a pipeline stage of Kimi's hybrid,
+    whose KDA state regions ATOM's builder refuses to publish there
+    (`_refuse_kda_regions_across_stages`), and for an MLA builder whose sparse
+    indexer scores in FP4, whose regions no P/D backend parses
+    (`_refuse_fp4_indexer_regions`)."""
     if path := getattr(runner, "compass_block_file", None):
         from atom.compass import run
 
+        _refuse_kda_regions_across_stages(runner)
+        _refuse_fp4_indexer_regions(runner)
         plan = runner.pool_plan
         tp = runner.config.tensor_parallel_size
-        run.publish_block(path, plan.entry_bytes[plan.paged_class], tp)
+        slot, after_blocks = _transferred_slot(runner)
+        staging = _staging_row_bytes(runner)
+        block = plan.entry_bytes[plan.paged_class]
+        run.publish_transfer(path, block, tp, slot, staging, after_blocks)
+
+
+def _refuse_kda_regions_across_stages(runner: Any) -> None:
+    """Refuse a transfer from a pipeline stage of Kimi's hybrid with the reason
+    ATOM's builder gives as it refuses to publish the KDA state regions there:
+    this runner allocates no cache, so the builder is never asked. DeepSeek-V4's
+    builder refuses a stage too, which ATOM's pool plan has refused already."""
+    from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
+
+    pp = runner.config.pipeline_parallel_size
+    if pp > 1 and isinstance(runner.attn_metadata_builder, _KimiMLAGDNCommon):
+        raise RunnerRefusal(
+            "ATOM's `_KimiMLAGDNCommon._with_kda_disagg_regions` refuses a "
+            f"prefill-decode transfer at pipeline_parallel_size {pp}: the KDA "
+            "state regions are keyed by KDA layer index, which "
+            "`_consumer_region_map` cannot align across stages"
+        )
+
+
+def _refuse_fp4_indexer_regions(runner: Any) -> None:
+    """Refuse a transfer from an MLA builder whose sparse indexer scores in FP4,
+    with the reason ATOM's builder gives as it refuses to publish its regions to
+    a P/D backend, which the simulated connector stands for: this runner
+    allocates no cache, so the builder is never asked. A run whose only region
+    reader is `lmcache_mp` is no prefill-decode run and publishes nothing here."""
+    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+
+    builder = runner.attn_metadata_builder
+    if isinstance(builder, AiterMLAMetadataBuilder) and builder._indexer_fp4:
+        raise RunnerRefusal(
+            "ATOM's `AiterMLAMetadataBuilder.get_kv_transfer_tensors` refuses a "
+            "prefill-decode transfer under the FP4 sparse indexer "
+            "(--index_cache_dtype fp4): the P/D backends and the "
+            "hybrid/m3/kimi_k3 offload layouts parse one index region per layer "
+            "and cannot place its separate e8m0 scale plane. Pass "
+            "--index_cache_dtype fp8 to use one"
+        )
+
+
+def _transferred_slot(runner: Any) -> tuple[int, bool]:
+    """The state slot a transfer moves and whether Mooncake writes it after the
+    blocks, read off the plan as the builder's regions carry it: DeepSeek-V4's
+    planned slot entry, with the blocks; one unit of each of Kimi's KDA state
+    regions (`state_slot_regions`), after them, its GDN state entry without the
+    kpool tail plus ReplaySSM's int32 cursor; none for any other builder. A
+    Qwen GDN hybrid plans a slot its regions do not carry."""
+    from atom.model_engine.kv_block import STATE_SLOT_CLASS
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.model_ops.attentions.gdn_attn import GDNStateMixin
+    from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
+
+    builder = runner.attn_metadata_builder
+    if isinstance(builder, DeepseekV4AttentionMetadataBuilder):
+        return runner.pool_plan.entry_bytes[STATE_SLOT_CLASS], False
+    if isinstance(builder, _KimiMLAGDNCommon):
+        cursor = torch.int32.itemsize if builder.replayssm else 0
+        return GDNStateMixin.state_spec(builder).entry_bytes + cursor, True
+    return 0, False
+
+
+def _staging_row_bytes(runner: Any) -> int:
+    """One entry of DeepSeek-V4's compressor state, the row its builder stages
+    a request's state through for prefill-decode (`allocate_per_req_cache`)
+    and Mooncake writes after the request's blocks and slot; 0 when the
+    builder stages nothing: another builder, a connector that needs no
+    staging, or an empty staging pool."""
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+        _uses_pd_staging,
+    )
+    from atom.model_ops.attentions.pool_layout.entry_arena import entry_bytes_for
+
+    builder = runner.attn_metadata_builder
+    if not (
+        isinstance(builder, DeepseekV4AttentionMetadataBuilder)
+        and _uses_pd_staging(runner.config.kv_transfer_config)
+        and int(os.environ.get("ATOM_PD_STAGING_POOL", "32")) > 0
+    ):
+        return 0
+    return sum(entry_bytes_for(fields) for fields in builder._arena_planes)
 
 
 def _refused(method: str):
@@ -832,6 +932,19 @@ class RefusedControlCommands:
         and not the list the runner keeps appending to.
         """
         return tuple(vars(self).get("_refused_commands", ()))
+
+
+class RefusedDynamicChunking:
+    """`--enable-dynamic-chunking`, refused at its startup fit."""
+
+    def profile_dynamic_chunking(self) -> dict[str, Any]:
+        """ATOM's own fits the pipeline's prefill chunk sizes to real forwards
+        it times on the device, and this runner runs none. Answering without a
+        fit would turn the feature off, which the real run keeps on."""
+        raise RunnerRefusal(
+            "--enable-dynamic-chunking sizes prefill chunks from timed real "
+            "forwards, and a simulated runner runs none to time"
+        )
 
 
 class PricedSteps:
@@ -987,6 +1100,7 @@ class OffloadDecisions:
 
 class NonAllocatingRunner(
     RefusedControlCommands,
+    RefusedDynamicChunking,
     PricedSteps,
     PredictedMemory,
     StepGridBundle,
@@ -1154,7 +1268,8 @@ class NonAllocatingRunner(
         the card being modelled; `kv_pool_sizing` keeps the count beside the
         readings, so which terms those were is recoverable from the runner and
         not only from a log line somebody kept. On a prefill-decode run the
-        planned block is published as well (`publish_paged_block`).
+        planned block, transferred state slot and staging row are published as
+        well (`publish_planned_transfer`).
 
         The decode process of intra-GPU prefill/decode disaggregation is
         refused rather than sized. ATOM's own runner for that answers a block
@@ -1183,7 +1298,7 @@ class NonAllocatingRunner(
             readings=readings,
         )
         logger.info("%s", self.kv_pool_sizing.table())
-        publish_paged_block(self)
+        publish_planned_transfer(self)
         return reply
 
     def allocate_kv_cache(self, num_kvcache_blocks: int) -> bool:
@@ -1244,7 +1359,9 @@ class NonAllocatingRunner(
         leaves behind: the declared `config.capture_sizes` narrowed to what
         the scheduler can produce, ascending. `ForwardMode.decide` reads the
         rung of every step off `capture_sizes_np`, so leaving the
-        construction-time `[0]` would price every decode step as eager. An empty narrowed ladder is refused: ATOM's capture asserts
+        construction-time `[0]` would price every decode step as eager.
+        `tbo_decode_graphs` is set as the base's capture sets it, so a decode
+        the DP group splits replays where a real one does. An empty narrowed ladder is refused: ATOM's capture asserts
         on it, so that deployment never starts. The reply still sends `[]` for the batch sizes, since no
         graph exists; the caller only formats it into a log line.
 
@@ -1262,6 +1379,9 @@ class NonAllocatingRunner(
                 "start this deployment, so there is no ladder to price"
             )
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
+        self.tbo_decode_graphs = (
+            self.config.enable_tbo_decode and not self._tr_hybrid_active()
+        )
         logger.info(
             "no cudagraph captured: there are no weights to trace; steps "
             "dispatch on the ladder %s.",
@@ -1293,7 +1413,7 @@ class NonAllocatingRunner(
 
         * `.req_ids`, an iterable of request ids in the batch's own order --
           `PPEngineCoreProc._pp_head_step`. That read is on the head's side of
-          the transport, on what `recv_tokens()` returns, not at the
+          the transport, on what `recv_completion()` returns, not at the
           `_downstream_busy_loop` call site, which only passes the object on.
         * `.token_ids`, `.draft_token_ids`, `.is_deferred_out`, `.logprobs`
           (None or a `dict[int, float]`) -- `Scheduler.postprocess`.
@@ -1307,7 +1427,7 @@ class NonAllocatingRunner(
         Picklable on top: under pipeline parallelism the last stage sends the
         object whole (`_downstream_busy_loop`) and the head reads it back
         (`_pp_head_step`), each hop through `pickle` in
-        `PPStageTransport.send_tokens` and `PPStageTransport.recv_tokens`
+        `PPStageTransport.send_completion` and `PPStageTransport.recv_completion`
         (`atom/distributed/pp_transport.py`). ATOM's own answer is a
         `ScheduledBatchOutput`; the contract a replacement has to meet is these
         reads and the pickle, not that class.
@@ -1506,7 +1626,9 @@ def _group_step_seconds(
         device_s, draft_s = cost.target_seconds, cost.draft_seconds
         terms = (*cost.terms, *cost.draft_terms)
     host = getattr(runner, "compass_host", None)
-    group = dp_group() if mode.sync is not None else None
+    # `decide` returns the collective's rows for a group of one too.
+    many = mode.sync is not None and len(mode.sync.scheduled_tokens_per_dp_rank) > 1
+    group = dp_group() if many else None
     charge = getattr(host, "charge", None)
     if group is not None and isinstance(host, HostDeviceRecurrence):
 

@@ -63,11 +63,12 @@ def forward_mode(batch: Any, runner: Any) -> ForwardMode:
     config's `enable_tbo` and the runner's own `_local_tbo_eligibility`, which
     ride the collective, so the group agrees the two-batch-overlap split a real
     run agrees. The other arguments that do not reach the rung are passed at
-    their inert values: `decide` settles a query length and a token count as
-    well, and those are what `captured_tokens` and `is_block_drafter` feed. The
-    width and the replay decision come from `capture_sizes`, `enforce_eager`,
-    the attention builder's `step_needs_eager`, the batch and the collective
-    alone.
+    their inert values: `decide` settles a query length as well, and that is
+    what `is_block_drafter` feeds. The width and the replay decision come from
+    `capture_sizes`, `enforce_eager`, the attention builder's
+    `step_needs_eager`, `tbo_decode_graphs`, the batch and the collective
+    alone; the group's running tokens land in the runner's own
+    `running_tokens_per_dp_rank`, as the real forward's do.
     """
     dp_size = _data_parallel_size(runner)
     tbo_on = runner.config.enable_tbo
@@ -87,13 +88,14 @@ def forward_mode(batch: Any, runner: Any) -> ForwardMode:
         enforce_eager=bool(runner.enforce_eager),
         step_needs_eager=runner.attn_metadata_builder.step_needs_eager(batch),
         capture_sizes=ladder,
-        captured_tokens=None,
         is_block_drafter=False,
         tbo_on=tbo_on,
         local_tbo=(
             runner._local_tbo_eligibility(batch) if tbo_on else (False, False, 0, 0)
         ),
         max_seqlen_q=batch.num_spec_step + 1,
+        running_tokens_per_dp_rank=runner.running_tokens_per_dp_rank,
+        tbo_decode_graphs=runner.tbo_decode_graphs,
     )
 
 
@@ -128,7 +130,8 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     Whether the step produces output is `ScheduledBatch.produces_output`, and
     the TBO split is the collective's `ub_tokens_across_dp`, this rank's slot
     in it the config's `data_parallel_rank`. A data-parallel rank's
-    `is_dummy_run` batch is its `dp_dummy`.
+    `is_dummy_run` batch is its `dp_dummy`. A single rank reads none of the
+    collective's counts, though `decide` returns them for a group of one.
 
     The MoE gather's rows follow `running_tokens_are_unified`, as
     `FusedMoE.forward_impl_graph` does. Every rank decoding, the padded
@@ -157,9 +160,13 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     ):
         wider = mode.running_bs > len(batch.num_scheduled_tokens)
         target_bs = mode.running_bs if wider else None
-    if mode.sync is not None:
+    if _data_parallel_size(runner) == 1:
+        moe_rows = None
+    elif mode.sync is not None and len(
+        mode.sync.scheduled_tokens_per_dp_rank
+    ) == _data_parallel_size(runner):
         dp_rank = runner.config.parallel_config.data_parallel_rank
-        gathered = moe_tokens = int(mode.sync.num_tokens_across_dp.sum())
+        gathered = moe_tokens = int(mode.sync.scheduled_tokens_per_dp_rank.sum())
         if mode.running_tokens_are_unified:
             moe_rows = _data_parallel_size(runner) * mode.running_tokens
         else:
@@ -172,14 +179,12 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
                     if mode.running_tokens_are_unified
                     else mode.sync.max_bs_across_dp + _data_parallel_size(runner) - 1
                 )
-    elif _data_parallel_size(runner) > 1:
+    else:
         raise RunnerRefusal(
             "this rank is one of a data-parallel group and its forward mode "
-            "states no num_tokens_across_dp, so the MoE segment has no gathered "
-            "row count to be priced from"
+            "states no scheduled_tokens_per_dp_rank for that group, so the MoE "
+            "segment has no gathered row count to be priced from"
         )
-    else:
-        moe_rows = None
     rows = zip(batch.num_scheduled_tokens, batch.context_lens)
     return BatchView(
         tuple(
@@ -191,7 +196,7 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
         draft_bs=draft_bs,
         target_bs=target_bs,
         produces_output=batch.produces_output(),
-        tbo_tokens=None if mode.sync is None else mode.sync.ub_tokens_across_dp,
+        tbo_tokens=None if dp_rank is None else mode.sync.ub_tokens_across_dp,
         image_tokens=image_tokens(batch, runner),
         moe_tokens=moe_tokens,
         dp_rank=dp_rank,

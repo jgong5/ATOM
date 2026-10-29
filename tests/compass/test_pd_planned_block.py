@@ -47,14 +47,16 @@ CONFIGS = {
 #: Both sides of the stage-4 1P1D cell: DPA-TP8, an fp8 cache, 16-token blocks.
 CELL = ["--kv_cache_dtype", "fp8", "--enable-dp-attention", "--block-size", "16"]
 
-PLAN = """
+#: Builds ATOM's runner driverless for the model under argv's root, on argv's
+#: cell, and plans its pool; a plan script goes on from there.
+BUILD = """
 import json, pathlib, sys, torch
 root, out, *atom_args = sys.argv[1:]
 from atom.compass.capture import driverless
 declared = driverless.install(root, "gfx950")
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from atom.compass.capture import forward
-from atom.compass.runner.overrides import publish_paged_block
+from atom.compass.runner.overrides import publish_planned_transfer
 from atom.config import set_current_atom_config
 config = forward._config(root + "/model", 8, atom_args)
 parallel = config.parallel_config
@@ -67,8 +69,10 @@ with forward._patches(recorder):
     runner = forward._build_runner(config, fake)
     with fake, torch.inference_mode():
         runner.get_num_blocks()
+"""
+PLAN = BUILD + """
 runner.compass_block_file = pathlib.Path(out)
-publish_paged_block(runner)
+publish_planned_transfer(runner)
 plan = runner.pool_plan
 print(json.dumps({"entry_bytes": plan.entry_bytes[plan.paged_class],
                   "block_size": config.kv_cache_block_size}))
@@ -78,7 +82,7 @@ print(json.dumps({"entry_bytes": plan.entry_bytes[plan.paged_class],
 def publish(out_dir, name: str, block: int, tp: int = 1) -> None:
     """Publish engine `name`'s planned block as its runner does."""
     now = pathlib.Path(out_dir) / compass_run.NOW_FILE.format(name)
-    compass_run.publish_block(compass_run._block_file(now), block, tp)
+    compass_run.publish_transfer(compass_run._block_file(now), block, tp)
 
 
 @pytest.fixture
@@ -131,18 +135,16 @@ def _connector(role: str, **config):
     return half
 
 
-@pytest.fixture(scope="module")
-def planned(tmp_path_factory):
-    """By model, the block ATOM's runner plans for the cell and the file it
-    published, each built in a process of its own."""
-    root = tmp_path_factory.mktemp("planned")
+def build_each(root, configs: dict, plan: str, cell: list) -> dict:
+    """By model, what `plan` printed last for `cell` and the file its runner
+    published, each built under `root` in a process of its own."""
 
     def build(name):
         (root / name / "model").mkdir(parents=True)
-        shutil.copy(CONFIGS[name], root / name / "model" / "config.json")
+        shutil.copy(configs[name], root / name / "model" / "config.json")
         out = root / name / "now-engine-P.kv_block"
         done = subprocess.run(
-            [sys.executable, "-c", PLAN, str(root / name), str(out), *CELL],
+            [sys.executable, "-c", plan, str(root / name), str(out), *cell],
             capture_output=True,
             text=True,
             check=False,
@@ -153,8 +155,15 @@ def planned(tmp_path_factory):
         assert done.returncode == 0, done.stderr[-4000:]
         return json.loads(done.stdout.splitlines()[-1]) | {"published": out}
 
-    with concurrent.futures.ThreadPoolExecutor(len(CONFIGS)) as pool:
-        return dict(zip(CONFIGS, pool.map(build, CONFIGS)))
+    with concurrent.futures.ThreadPoolExecutor(len(configs)) as pool:
+        return dict(zip(configs, pool.map(build, configs)))
+
+
+@pytest.fixture(scope="module")
+def planned(tmp_path_factory):
+    """By model, the block ATOM's runner plans for the cell and the file it
+    published, each built in a process of its own."""
+    return build_each(tmp_path_factory.mktemp("planned"), CONFIGS, PLAN, CELL)
 
 
 @pytest.mark.parametrize("model", CONFIGS)

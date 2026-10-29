@@ -204,6 +204,12 @@ def _all_reduce(op, view, tp, kv) -> Work:
     return _boundary(op) + allreduce(tp, _bytes(op["args"]["tensor"]))
 
 
+def _fused_all_reduce_norm(op, view, tp, kv) -> Work:
+    """An all-reduce of `inp` fused with the residual add and RMSNorm after
+    it: the all-reduce's bytes, and each tensor read and written once."""
+    return _boundary(op) + allreduce(tp, _bytes(op["args"]["inp"]))
+
+
 def _all_gather(op, view, tp, kv) -> Work:
     gathered = math.prod(op["out"][0]) * _size(op["args"]["input"]["dtype"])
     return _boundary(op) + allgather(op["args"]["group_size"], gathered)
@@ -227,12 +233,15 @@ def _all_to_all(op, view, tp, kv) -> Work:
 def _dp_exchange(op, view, tp, kv) -> Work:
     """The data-parallel group's gather of the MoE's input, or reduce-scatter
     of its output: the larger side holds every rank's rows, the smaller this
-    rank's, and the group is `sizes` long or their ratio wide."""
-    x, out = op["args"]["x"], op["out"][0]
-    rows = sorted((x["shape"][0], out[0]))
+    rank's, and the group is `sizes` long or their ratio wide. A gather of
+    routed rows moves several tensors of one height in the one collective."""
+    xs, out = op["args"]["x"], op["out"][0]
+    xs = xs if isinstance(xs, (list, tuple)) else [xs]
+    rows = sorted((xs[0]["shape"][0], out[0]))
     ranks = len(op["args"].get("sizes") or ()) or rows[1] // rows[0]
-    every = rows[1] * math.prod(x["shape"][1:]) * _size(x["dtype"])
-    collective = allgather if out[0] > x["shape"][0] else reduce_scatter
+    row = sum(math.prod(x["shape"][1:]) * _size(x["dtype"]) for x in xs)
+    every = rows[1] * row
+    collective = allgather if out[0] > xs[0]["shape"][0] else reduce_scatter
     return _boundary(op) + collective(ranks, every)
 
 
@@ -460,11 +469,13 @@ def _indexer(op, view, tp, kv) -> Work:
     against every compressed entry before it at the ratio the leaf states, as
     the step roofline counts them: one product of the index head width per
     index head, at fp4 when the leaf takes `q_scale`, else at `q_quant`'s
-    format, and each entry read once at that width and format."""
+    format, and each entry read once at that width and format. `q_quant` is
+    rows first and heads by packed width last, a query axis between them or
+    not."""
     (ratio,) = _stated(op, "compress_ratio")
     q = op["args"]["q_quant"]
     fmt = "fp4" if op["args"].get("q_scale") else _fmt(q["dtype"])
-    _, heads, packed = q["shape"]
+    heads, packed = q["shape"][-2:]
     dim = int(packed * _size(q["dtype"]) / ELEMENT_BYTES[fmt])
     return _boundary(op) + _index_scores(_pass(view, q), ratio, heads, dim, fmt)
 
@@ -642,6 +653,7 @@ EXTRACTORS = {
     "aten.embedding.default": _gather("weight"),
     "aten.index.Tensor": _gather("self"),
     "aiter.all_reduce_.default": _all_reduce,
+    "aiter.fused_allreduce_rmsnorm_.default": _fused_all_reduce_norm,
     "_c10d_functional.all_gather_into_tensor.default": _all_gather,
     "_c10d_functional.broadcast.default": _broadcast,
     "_c10d_functional.wait_tensor.default": lambda op, view, tp, kv: None,

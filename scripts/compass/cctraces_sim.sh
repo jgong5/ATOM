@@ -120,29 +120,30 @@ args=(--endpoint-type chat --custom-dataset-type weka_trace
 args+=($AIPERF_EXTRA_ARGS)
 
 read -r MODE CLOCK_PORT PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT < <(
-MODEL=$MODEL SERVER_ARGS=$SERVER_ARGS REAL=$REAL python3 - "$RUN_FILE" "$OUT" "$TRACES" "$BENCHMARK_ID" "${args[@]}" <<'EOF'
-import hashlib, json, os, socket, sys
+MODEL=$MODEL SERVER_ARGS=$SERVER_ARGS REAL=$REAL python3 - $$ "$RUN_FILE" "$OUT" "$TRACES" "$BENCHMARK_ID" "${args[@]}" <<'EOF'
+import hashlib, json, os, select, socket, sys
 from pathlib import Path
 
-run_file, out, traces, benchmark_id, *args = sys.argv[1:]
+script, run_file, out, traces, benchmark_id, *args = sys.argv[1:]
 out = Path(out)
 run = json.loads(Path(run_file).read_text())
 dp = run.get("data_parallel_size", 1)
 # One write-request port per prefill rank and decode rank pair, as pd_sim.sh binds.
 n = run.get("prefill_data_parallel_size", dp) * run.get("decode_data_parallel_size", dp)
-# Held together, so no two are the same port.
+# Held together, so no two are the same port, and until this script exits, as
+# compass_held_port holds its port, so no other process binds one first.
 socks = [socket.socket() for _ in range(6)]
 for s in socks:
-    s.bind(("127.0.0.1", 0))
+    s.bind(("", 0))
 ports = [s.getsockname()[1] for s in socks]
 # The write requests take n ports from KV_WRITE_REQ_PORT, the fifth: re-pick
 # it, the others still held, until none of them lies in that block.
 while {*ports[:4], ports[5]} & set(range(ports[4], ports[4] + n)):
     socks.append(socket.socket())
-    socks[-1].bind(("127.0.0.1", 0))
+    socks[-1].bind(("", 0))
     ports[4] = socks[-1].getsockname()[1]
 for s in socks:
-    s.close()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
 
 def sha256(path):
@@ -171,6 +172,8 @@ if int(os.environ["REAL"]):
     run["env"] = {k: os.environ[k] for k in ("TRITON_CACHE_AUTOTUNING", "TRITON_CACHE_DIR")}
 (out / "run.json").write_text(json.dumps(run))
 print("1p1d" if "kv_write_req_s" in run else "tp1", *ports)
+sys.stdout.close()
+select.select([os.pidfd_open(int(script))], [], [])
 EOF
 )
 
@@ -185,9 +188,9 @@ fi
 if [[ $MODE == 1p1d ]]; then
     # pd_sim.sh takes the authority's port from its own variable; the run file
     # names the same one for the traffic LP.
-    # Each side's DP master port is free too, or a second run on this host
+    # Each side's DP master port is held too, or a second run on this host
     # network finds pd_sim.sh's default taken.
-    PREFILL_DP_PORT=$(compass_free_port) DECODE_DP_PORT=$(compass_free_port)
+    PREFILL_DP_PORT=$(compass_held_port) DECODE_DP_PORT=$(compass_held_port)
     export MODEL SERVER_ARGS WAIT_S CLOCK_PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT \
         PREFILL_DP_PORT DECODE_DP_PORT
     # An agentic cell, as the real one is launched: under DP attention its
@@ -206,12 +209,12 @@ else
     main=(-m atom.entrypoints.openai.api_server)
     [[ -z ${HTTP_INTAKE:-} ]] || main=("$ROOT/scripts/compass/http_intake.py" serve "$HTTP_INTAKE")
     # The keep-alive timeout as in pd_sim.sh, aiperf's pool in the router's place.
-    # Its own process group, so a real server's workers stop with it. A free
+    # Its own process group, so a real server's workers stop with it. A held
     # DP master port, as `compass record` gives one: the port keys ATOM's
     # compiled-graph cache, and the first start that loads it autotunes again.
     # No later start loads it, so the server's stop removes it, as there.
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
-    ATOM_DP_MASTER_PORT=$(compass_free_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
+    ATOM_DP_MASTER_PORT=$(compass_held_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
         python3 "${main[@]}" \
         --model "$MODEL" --host 127.0.0.1 --server-port "$PORT" --timeout-keep-alive 1000000 \
         $SERVER_ARGS "${compass[@]}" >"$OUT/server.log" 2>&1 &

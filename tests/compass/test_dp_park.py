@@ -94,6 +94,7 @@ class _IdleRank(DPEngineCoreProc):
         self.polled = []
         self.scheduler = SimpleNamespace(
             schedule=schedule,
+            dummy_prefill=False,
             take_rejected=list,
             publish_kv_events=lambda: None,
             kv_connector=SimpleNamespace(

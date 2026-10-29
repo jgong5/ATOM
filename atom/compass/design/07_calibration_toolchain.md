@@ -471,9 +471,9 @@ campaign and the one with the tightest acceptance gate behind it — KV block co
 refuses it until its readings match a real load's on Qwen3.8-27B TP1 on MI308X (T100).
 
 **A device never measured** has no engine to start. Developer tooling outside the CLI
-publishes an entry for its configuration, every reading marked assumed, as `16` marks every
-MI455 input; `run` reads it as any entry, and every term built on it is declared, its note
-naming the assumption.
+publishes an entry for its configuration, every reading marked assumed, as the frozen MI455
+projection's entry is (`16` S3c.5); `run` reads it as any entry, and every term built on it
+is declared, its note naming the assumption.
 
 **Why it is per width and not fitted across widths:** because it does not fit. The
 measured `non_torch` sequence is 926 / 6906 / 7266 / 10704 MiB at widths 1/2/4/8, and

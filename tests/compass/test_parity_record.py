@@ -94,6 +94,10 @@ class _Runner(NonAllocatingRunner):
         self.config, self.rank = config, rank
         install_cost_backend(self, StepStubBackend())
         self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+        self.running_tokens_per_dp_rank = np.zeros(
+            self.config.parallel_config.data_parallel_size, dtype=np.int32
+        )
+        self.tbo_decode_graphs = False
         self.attn_metadata_builder = GRAPHABLE
         self._token_stream = DeferredTokenStream([0])
 
@@ -530,6 +534,10 @@ def test_a_real_record_states_the_engine_its_runner_resolved(tmp_path, monkeypat
         def __init__(self, rank, config):
             self.rank, self.config = rank, config
             self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
             self.attn_metadata_builder = GRAPHABLE
 
         def allocate_kv_cache(self, num_kvcache_blocks):
@@ -587,6 +595,10 @@ def test_the_mixin_records_from_the_first_forward_after_construction(
         def __init__(self, rank, config):
             self.rank, self.config = rank, config
             self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
             self.attn_metadata_builder = GRAPHABLE
             self.forward(batches[1])
 
@@ -619,6 +631,10 @@ def test_a_real_runner_records_the_batch_it_was_handed_and_times_its_forward(
         def __init__(self, rank, config):
             self.rank, self.config = rank, config
             self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
             self.attn_metadata_builder = GRAPHABLE
             self.inside = []
 
@@ -682,6 +698,10 @@ def test_a_dp2_real_runner_records_moe_rows_from_its_forwards_one_collective(
             self.rank, self.config = 0, _config(dp_rank)
             self.config.parallel_config.data_parallel_size = 2
             self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
             self.attn_metadata_builder = GRAPHABLE
 
         def forward(self, batch):
@@ -756,8 +776,9 @@ def test_a_dp2_simulated_runner_records_and_prices_from_one_collective(
     monkeypatch.setenv(ENV, str(tmp_path / "simulated"))
     runners = []
     for rank in (0, 1):
-        runners.append(_Runner(_config(rank)))
-        runners[-1].config.parallel_config.data_parallel_size = 2
+        config = _config(rank)
+        config.parallel_config.data_parallel_size = 2
+        runners.append(_Runner(config))
     replies = dp2(
         *(
             lambda r=r, bs=bs: [r.forward(b).predicted_s for b in bs]

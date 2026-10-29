@@ -49,7 +49,6 @@ from atom.compass.backends.step_stub import Coefficients
 from atom.compass.carriers import tracestate_with
 from atom.compass.clock import TAR
 from atom.compass.detect.scenario import check_run, expected_timeline
-from atom.compass.drive.serve import _free_ports
 from atom.compass.kv.lmcache_server import reply_channel
 from atom.compass.parity import ENV as RECORD
 from atom.compass.parity import StepRecording, read
@@ -63,6 +62,7 @@ from atom.kv_transfer.offload.metadata import (
 )
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
+from tests.compass.held_ports import held_ports
 
 PREFIX_WORDS = 600  # two whole 256-token chunks
 BURST_S, BURST = 0.5, 3  # the burst's time, and its requests per DP rank
@@ -203,16 +203,16 @@ def runs(request, tmp_path_factory, lmcache_port):  # noqa: F811
     }
     machine.write_text(json.dumps(spec))
     # The run file names the lmcache port, so both runs share it.
-    ports = _free_ports(4)
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("AITER_LOG_LEVEL", "WARNING")  # the readings are keyed by it
         for name, value in _offload(lmcache_port).items():
             mp.setenv(name, value)
         _measure(root, machine, DP2 if dp > 1 else [], lmcache_port)
-    return dp, [
-        run_scenario(root, seed, dp, lmcache_port, ports[2 * i : 2 * i + 2])
-        for i, seed in enumerate(("1", "2"))
-    ]
+    with held_ports(4) as ports:
+        return dp, [
+            run_scenario(root, seed, dp, lmcache_port, ports[2 * i : 2 * i + 2])
+            for i, seed in enumerate(("1", "2"))
+        ]
 
 
 def _releases(table: str, lp=None) -> list[tuple[float, str, int]]:

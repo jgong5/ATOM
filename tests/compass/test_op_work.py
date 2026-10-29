@@ -272,6 +272,27 @@ def test_a_collective_spans_its_group():
     assert work(cast, ONE, 2, "bf16").comm == (Collective(2, 64 * 4),)
 
 
+def test_a_fused_all_reduce_norm_reduces_its_input_and_moves_each_tensor_once():
+    # A row-parallel reduce fused with the residual add and RMSNorm after it:
+    # `inp` all-reduced, `inp`, `res_inp` and the weight read, and the normed
+    # rows and the new residual written, each once.
+    op = leaf(
+        "aiter.fused_allreduce_rmsnorm_.default",
+        [[64, 5120], [64, 5120]],
+        inp=t([64, 5120]),
+        res_inp=t([64, 5120]),
+        w=t([5120], role="weight"),
+        eps=1e-6,
+        group_name="tp:0",
+    )
+    buffer = 64 * 5120 * 2
+
+    assert work(op, ONE, 2, "bf16") == Work(
+        {}, 4 * buffer + 5120 * 2, (Collective(2, buffer),)
+    )
+    assert work(op, ONE, 1, "bf16").comm == ()
+
+
 def test_a_kind_with_no_extractor_is_refused_by_name():
     op = leaf("aiter.gemm_a8w8.default", [[4, 6]], XQ=t([4, 8], "torch.float8_e4m3fn"))
 

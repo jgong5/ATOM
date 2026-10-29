@@ -162,16 +162,30 @@ class Station:
 SERVICE_JOBS = frozenset(
     {"do_preprocess", "_prepare_multimodal_inputs", "AtomMetricsExporter.render"}
 )
+#: Service jobs by module and qualified name, for names too common to match
+#: bare: OpenTelemetry's tracer setup and flush, which the API server's lifespan
+#: hands to a thread as it starts and as it leaves, and which charge nothing.
+#: The frontend's run begins at its loop's first select, before the lifespan.
+MODULE_SERVICE_JOBS = frozenset(
+    {"atom.observability.tracing.initialize", "atom.observability.tracing.shutdown"}
+)
 
 
-def job_name(fn) -> str:
-    """`fn`'s qualified name, or that of the function `asyncio.to_thread` runs
-    when `fn` is its ``partial(Context.run, func, ...)``."""
+def _job(fn):
+    """`fn`, or the function `asyncio.to_thread` runs when `fn` is its
+    ``partial(Context.run, func, ...)``."""
     if (
         isinstance(fn, partial)
         and getattr(fn.func, "__qualname__", "") == "Context.run"
     ):
         fn = fn.args[0]
+    return fn
+
+
+def job_name(fn) -> str:
+    """`fn`'s qualified name, or that of the function `asyncio.to_thread` runs
+    when `fn` is its ``partial(Context.run, func, ...)``."""
+    fn = _job(fn)
     return getattr(fn, "__qualname__", repr(fn))
 
 
@@ -179,6 +193,8 @@ def classify(fn) -> str:
     """``service``, ``wait`` or ``refuse``: the job registry, by qualified name."""
     name = job_name(fn)
     if name in SERVICE_JOBS or name.rpartition(".")[2] in SERVICE_JOBS:
+        return "service"
+    if f"{getattr(_job(fn), '__module__', None)}.{name}" in MODULE_SERVICE_JOBS:
         return "service"
     if name == "Queue.get":
         return "wait"
