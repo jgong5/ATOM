@@ -1252,7 +1252,8 @@ def engine(config):
 
     A real run recording its steps (`parity.ENV`) outside a pipeline stamps the
     engine's input pulls and output puts into ``dp<rank>.pulls.jsonl`` beside
-    the record (`clock.stamp_pulls`).
+    the record, and its IO-thread queue handoffs into ``dp<rank>.handoff.jsonl``
+    (`clock.stamp_pulls`).
     """
     global _member
     run = spec()
@@ -1266,7 +1267,8 @@ def engine(config):
             rank = config.parallel_config.data_parallel_rank
             # The worker's step timestamps read the same host clock.
             pulls = record / f"dp{rank}.pulls.jsonl"
-            clock.stamp_pulls(pulls, time.monotonic_ns)
+            handoff = record / f"dp{rank}.handoff.jsonl"
+            clock.stamp_pulls(pulls, handoff, time.monotonic_ns)
         return contextlib.nullcontext()
     from atom.utils.distributed import utils
 
@@ -2007,7 +2009,8 @@ def engine_loop(engine_core):
     steps cost. A stop reaches the engine as the ``+inf`` grant instead.
 
     A pipeline stage's runner calls go through `pp_send.install`'s sends. A
-    recorded real run's SIGTERM goes through `_stop_recording`."""
+    recorded real run's SIGTERM goes through `_stop_recording`, and its input
+    queue stamps each request frame's handoff (`clock.stamp_input`)."""
     from atom.compass import parity
 
     run, sections, before = spec(), {}, None
@@ -2024,6 +2027,7 @@ def engine_loop(engine_core):
         )
         before = signal.signal(signal.SIGTERM, signal.SIG_IGN)
     elif os.environ.get(parity.ENV):
+        clock.stamp_input(engine_core)
         stop = functools.partial(
             _stop_recording, engine_core, signal.getsignal(signal.SIGTERM)
         )
