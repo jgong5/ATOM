@@ -108,7 +108,9 @@ class ClockPhaseRunner(PhaseRunner):
         wake = asyncio.get_running_loop().create_future()
         # ponytail: Event._waiters is private; Event.set resolves each of them.
         event._waiters.append(wake)
-        deadline = ClockTimer(timeout, lambda: wake.done() or wake.set_result(None))
+        deadline = ClockTimer(
+            timeout, lambda: wake.done() or wake.set_result(None), phase_deadline=True
+        )
         try:
             await wake
         finally:
