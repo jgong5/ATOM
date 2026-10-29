@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -358,6 +359,53 @@ def test_the_after_check_waits_for_members_that_outlive_the_engine(
 ):
     """The named result: each member exits 3 s after the engine's stop."""
     measure_memory.main(group_start("3"))
+
+    assert (tmp_path / "out" / "gpu_after.txt").read_text() == FREE
+    assert (tmp_path / "out" / "memory_readings.json").exists()
+
+
+def test_the_after_check_waits_for_kfd_to_free_what_the_engine_left(
+    tmp_path, monkeypatch
+):
+    """KFD lists an exited rank until it has freed the rank's GPU memory, by a
+    PID a container's /proc need not show: DeepSeek-V4.1-Flash's TP4 ranks,
+    270 GB a card, stayed listed seconds after the engine's group had left.
+    Here the group's members exit at once and KFD frees the rank 2 s later."""
+    kill = os.killpg
+    r, argv = a_start(tmp_path, monkeypatch, STACK)
+    out = _plant(tmp_path, monkeypatch, FREE)
+    kfd, members = tmp_path / "kfd", tmp_path / "members"
+    rank = kfd / "proc" / "3362894"
+    rank.parent.mkdir(parents=True)
+    monkeypatch.setattr(serve, "KFD", kfd)
+    smi = tmp_path / "bin" / "rocm-smi"
+    listed = f"[ -d {rank} ] && printf 'PID 3362894 is using 1 DRM device(s):\\n5\\n'\n"
+    smi.write_text(
+        smi.read_text().replace("*--showpids*)\n", "*--showpids*)\n" + listed)
+    )
+
+    def freed():
+        _until(lambda: members.exists() and members.read_text())
+        pids = members.read_text().split()
+        _until(lambda: all(_state(p) in (None, "Z") for p in pids))
+        time.sleep(2)
+        rank.rmdir()
+
+    def popen(command, **kwargs):
+        ranks_wrote(out, r.config, [READINGS[2]] * 2)
+        rank.mkdir()
+        threading.Thread(target=freed, daemon=True).start()
+        group = [sys.executable, "-c", GROUP, str(members), "0"]
+        return subprocess.Popen(group, **kwargs)
+
+    started_by = SimpleNamespace(
+        Popen=popen, STDOUT=subprocess.STDOUT, TimeoutExpired=subprocess.TimeoutExpired
+    )
+    monkeypatch.setattr(measure_memory, "subprocess", started_by)
+    monkeypatch.setattr(measure_memory, "quiet", gpu.quiet)
+    monkeypatch.setattr(os, "killpg", kill)
+
+    measure_memory.main(argv)
 
     assert (tmp_path / "out" / "gpu_after.txt").read_text() == FREE
     assert (tmp_path / "out" / "memory_readings.json").exists()
