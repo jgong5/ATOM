@@ -57,6 +57,7 @@ from aiperf.credit.sticky_router import StickyCreditRouter
 from compass_harness.router import CompassCreditRouter
 from compass_harness.scheduler import ClockPacedLoopScheduler
 from compass_harness.strategy import ClockPhaseRunner
+from compass_harness.timesource import ClockTimer
 from compass_harness.traffic_lp import (
     HTTP,
     STREAM,
@@ -272,7 +273,9 @@ class IdleEngine(threading.Thread):
 
 async def _wait_for_return(endpoint, prefix, monkeypatch, grace, sent):
     """Send request 0 if `sent`, and wait for its return as aiperf's phase
-    runner does, with a `grace` deadline; then finish."""
+    runner does, with a `grace` deadline; then finish. A pacing timer due past
+    the deadline is pending meanwhile and cancelled after it, as the phase's
+    end cancels a turn scheduled past it."""
     traffic = TrafficLP.from_env()
     monkeypatch.setattr(ClockPacedLoopScheduler, "clock", traffic)
     returned = asyncio.Event()
@@ -286,6 +289,7 @@ async def _wait_for_return(endpoint, prefix, monkeypatch, grace, sent):
     await traffic.subscribed(1)
     if sent:
         traffic.send(_key(0))
+    pacing = ClockTimer(grace + 100.0, lambda: None)
     # The deadline wait reads nothing else of its runner.
     timed_out = await ClockPhaseRunner._wait_for_event_with_timeout(
         SimpleNamespace(info=lambda message: None),
@@ -294,6 +298,7 @@ async def _wait_for_return(endpoint, prefix, monkeypatch, grace, sent):
         timeout=grace,
         task_to_cancel=None,
     )
+    pacing.cancel()
     at = traffic.now()
     traffic.finish()
     await traffic.done
@@ -322,7 +327,8 @@ def test_a_grace_deadline_keeps_no_lp_running_past_the_last_request_s_end(
     withdraws the deadline: every LP is granted ``+inf`` at the request's end,
     with no tick granted past it. At 0.75 s the deadline falls inside the
     request and fires there. With no request sent, the deadline is the only
-    work, and the clock runs to it."""
+    work, and the clock runs to it. The pacing timer due past the deadline
+    moves no LP past it in any case."""
     authority = ClockAuthority(TABLE)
     endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
     server = clock_transport.serve(authority, endpoint)

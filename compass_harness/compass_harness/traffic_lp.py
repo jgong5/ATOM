@@ -16,9 +16,11 @@ something. It asks for time only while a request is open, a clock wait (a
 pacing timer, a phase deadline, the idle watchdog) is pending or the run is
 finishing; between phases aiperf works on the wall clock and the simulation
 waits for it. While a request is open it asks for a phase deadline as a
-daemon deadline: the deadline fires once the open requests' work reaches it,
-and when the last one ends first and aiperf withdraws it, it has kept no LP
-running past that end.
+daemon deadline, and for no other wait due at or past it: the deadline fires
+once the open requests' work reaches it, and when the last one ends first and
+aiperf withdraws the deadline, nothing it asked for keeps an LP running past
+that end. The Clock Authority's essential horizon only grows, so a wait asked
+for and then withdrawn, or a pacing timer aiperf pulls earlier, would.
 
 When aiperf cancels the requests in flight at its grace deadline, the traffic
 LP closes them at that time (`cancel`): each one's cancel is a stamped request
@@ -135,7 +137,8 @@ class TrafficLP:
     def wait(self, t: float, phase_deadline: bool = False) -> asyncio.Future:
         """A clock wait for ``t``, resolved at the next grant or by ``withdraw``.
 
-        A `phase_deadline` is asked for as a daemon deadline while a request is open.
+        A `phase_deadline` is asked for as a daemon deadline while a request
+        is open, and a wait due at or past it only once it has fired.
         """
         fut = asyncio.get_running_loop().create_future()
         self._waiters.append((t, fut, phase_deadline))
@@ -259,13 +262,17 @@ class TrafficLP:
                 self._changed.clear()
                 await self._changed.wait()
                 continue
-            t, t_daemon = math.inf, math.inf
+            t, deadline = math.inf, math.inf
             for at, _, phase_deadline in self._waiters:
-                if phase_deadline and self.open:
-                    t_daemon = min(t_daemon, at)
+                if phase_deadline:
+                    deadline = min(deadline, at)
                 else:
                     t = min(t, at)
-            g = self.rt.next_event(t, t_daemon)
+            if not self.open:
+                t, deadline = min(t, deadline), math.inf
+            elif t >= deadline:  # asked for once the deadline has fired
+                t = math.inf
+            g = self.rt.next_event(t, deadline)
             if g == math.inf:
                 return self._close()
 
