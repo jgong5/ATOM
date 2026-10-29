@@ -851,11 +851,11 @@ class _StampedInputQueue(queue.Queue):
         return item
 
 
-def stamp_input(q: queue.Queue) -> None:
-    """On a real recording, make the engine's input queue `q` write each
-    request frame's handoff (`_StampedInputQueue`); the queue keeps what it holds."""
+def stamp_input(engine) -> None:
+    """On a real recording, make `engine`'s input queue write each request
+    frame's handoff (`_StampedInputQueue`); the queue keeps what it holds."""
     if _stamps is not None:
-        q.__class__ = _StampedInputQueue
+        engine.input_queue.__class__ = _StampedInputQueue
 
 
 # ---- the engine step loop: hooks ATOM calls, each a no-op on a real run ----

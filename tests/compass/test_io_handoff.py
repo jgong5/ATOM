@@ -94,7 +94,7 @@ def test_a_real_run_without_a_record_stamps_nothing(tmp_path, monkeypatch):
     with compass_run.engine(_deployment()):
         q = clock.relay_queue(_deployment().parallel_config)
     inputs = queue.Queue()
-    clock.stamp_input(inputs)
+    clock.stamp_input(SimpleNamespace(input_queue=inputs))
     assert (type(q), type(inputs), clock._stamps) == (queue.Queue, queue.Queue, None)
 
 
@@ -111,7 +111,7 @@ def test_a_simulated_run_with_a_record_stamps_nothing(
     with compass_run.engine(_deployment()):
         q = clock.relay_queue(_deployment().parallel_config)
     inputs = queue.Queue()
-    clock.stamp_input(inputs)
+    clock.stamp_input(SimpleNamespace(input_queue=inputs))
     assert (type(q), type(inputs), clock._stamps) == (
         clock.RelayQueue,
         queue.Queue,

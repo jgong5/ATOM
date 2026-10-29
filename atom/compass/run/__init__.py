@@ -2027,7 +2027,7 @@ def engine_loop(engine_core):
         )
         before = signal.signal(signal.SIGTERM, signal.SIG_IGN)
     elif os.environ.get(parity.ENV):
-        clock.stamp_input(engine_core.input_queue)
+        clock.stamp_input(engine_core)
         stop = functools.partial(
             _stop_recording, engine_core, signal.getsignal(signal.SIGTERM)
         )
