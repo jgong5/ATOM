@@ -38,6 +38,7 @@ send side stamps each frame with `stamp_send`, directly or through the
 """
 
 import contextlib
+import json
 import logging
 import math
 import os
@@ -756,12 +757,20 @@ def reply_queue() -> queue.Queue:
 class PullStamps:
     """A real recording's engine loop: the first input pull and the first
     output put after each worker reply, one ``{"t_pull_ns" | "t_put_ns": ns}``
-    line each in `path`, read off `now`, the machine clock its caller hands in."""
+    line each in `path`, read off `now`, the machine clock its caller hands in.
 
-    def __init__(self, path, now) -> None:
+    In `handoff`, one line per item through the engine's IO-thread queues: an
+    input frame's ``t_recv_ns`` (the input thread's receipt, on the same
+    clock), ``t_in_put_ns``, ``t_in_get_ns`` and ``prompt_tokens``; an
+    output's ``t_out_put_ns``, ``t_out_sent_ns`` (the output thread's next
+    get, so its send returned) and ``rows``."""
+
+    def __init__(self, path, handoff, now) -> None:
         self.file, self.now = open(path, "w", buffering=1), now  # noqa: SIM115
+        self.handoff = open(handoff, "w", buffering=1)  # noqa: SIM115
         self.lock = threading.Lock()
         self.armed: set[str] = set()
+        self.inputs: dict[int, int] = {}  # id of an input item -> its put
 
     def arm(self) -> None:
         with self.lock:
@@ -773,24 +782,77 @@ class PullStamps:
                 self.armed.discard(key)
                 self.file.write(f'{{"{key}": {self.now()}}}\n')
 
+    def write(self, line: dict) -> None:
+        with self.lock:
+            self.handoff.write(json.dumps(line) + "\n")
+
 
 #: The engine's `PullStamps` on a real recording, else None.
 _stamps: PullStamps | None = None
 
 
-def stamp_pulls(path, now) -> None:
-    """Stamp this engine's pulls and puts into `path` off the clock `now`; a
-    real recording's only."""
+def stamp_pulls(path, handoff, now) -> None:
+    """Stamp this engine's pulls and puts into `path`, and its IO-thread
+    queue handoffs into `handoff`, off the clock `now`; a real recording's only."""
     global _stamps
-    _stamps = PullStamps(path, now)
+    _stamps = PullStamps(path, handoff, now)
 
 
 class _StampedQueue(queue.Queue):
-    """A real recording's output queue: each put is offered as a ``t_put_ns`` stamp."""
+    """A real recording's output queue: each put is offered as a ``t_put_ns``
+    stamp, and the output thread's next get writes the item before it with its
+    batch's row count, its send returned."""
+
+    taken = None  # (put, item) the output thread took last
 
     def put(self, item, block: bool = True, timeout=None) -> None:
         _stamps.stamp("t_put_ns")
+        super().put((_stamps.now(), item), block, timeout)
+
+    def get(self, block: bool = True, timeout=None):
+        if self.taken is not None:
+            (put, item), self.taken = self.taken, None
+            rows = item[1] if isinstance(item, tuple) and item[0] == "STREAM" else item
+            if isinstance(rows, list):
+                sent = _stamps.now()
+                _stamps.write(
+                    {"t_out_put_ns": put, "t_out_sent_ns": sent, "rows": len(rows)}
+                )
+        self.taken = super().get(block, timeout)
+        return self.taken[1]
+
+
+class _StampedInputQueue(queue.Queue):
+    """A real recording's input queue: the busy loop's get of each request
+    frame writes the frame's receipt, put and get, and its prompt tokens."""
+
+    def put(self, item, block: bool = True, timeout=None) -> None:
+        _stamps.inputs[id(item)] = _stamps.now()
         super().put(item, block, timeout)
+
+    def get(self, block: bool = True, timeout=None):
+        item = super().get(block, timeout)
+        got, put = _stamps.now(), _stamps.inputs.pop(id(item), None)
+        timing = getattr(item[0], "queue_timing", None) if item else None
+        if put is not None and timing is not None:
+            prompt = sum(s.num_prompt_tokens for s in item)
+            recv = int(timing.received_at * 1e9)  # perf_counter: CLOCK_MONOTONIC
+            _stamps.write(
+                {
+                    "t_recv_ns": recv,
+                    "t_in_put_ns": put,
+                    "t_in_get_ns": got,
+                    "prompt_tokens": prompt,
+                }
+            )
+        return item
+
+
+def stamp_input(q: queue.Queue) -> None:
+    """On a real recording, make the engine's input queue `q` write each
+    request frame's handoff (`_StampedInputQueue`); the queue keeps what it holds."""
+    if _stamps is not None:
+        q.__class__ = _StampedInputQueue
 
 
 # ---- the engine step loop: hooks ATOM calls, each a no-op on a real run ----
