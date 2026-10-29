@@ -73,7 +73,9 @@ def capture(tmp_path_factory, argv, arch="gfx1250"):
     root = tmp_path_factory.mktemp("v41")
     done = trace(root, argv, arch)
     tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
-    assert tokens, f"rc {done.returncode}\n{done.stderr[-4000:]}"
+    assert (
+        done.returncode == 0 and tokens
+    ), f"rc {done.returncode}\n{done.stderr[-4000:]}"
     store = ArtifactStore(str(root / "store"))
     rank = next(iter(Topology().ranks()))
     graphs = {}
