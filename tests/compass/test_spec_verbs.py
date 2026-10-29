@@ -1041,7 +1041,7 @@ def test_the_checked_in_mi308x_specs_hold_their_start(monkeypatch, name):
                 assert values[key] == value, key
 
 
-MI355X = ["mi355x-gpu45", "mi355x-crs005"]
+MI355X = ["mi355x-gpu45", "mi355x-crs005", "mi355x-gpu40"]
 
 
 def _mi355x_spec(monkeypatch, name):
@@ -1103,6 +1103,33 @@ def test_the_mi355x_spec_rebuilds_byte_for_byte_from_its_own_sweep(
     out = tmp_path / "rebuilt.json"
     assert script.main(["--sweep-from", str(document), "--out", str(out)]) == 0
     assert out.read_bytes() == document.read_bytes()
+
+
+def test_the_gpu40_spec_pins_nightly_20261026_and_resolves_both_deepseek_tokenizers(
+    monkeypatch,
+):
+    _, spec = _mi355x_spec(monkeypatch, "mi355x-gpu40")
+    document = SPEC_ROOT / "scripts" / "compass" / "machines" / "mi355x-gpu40.json"
+    assert validate(json.loads(document.read_text())).ok
+    pinned = {
+        k: spec.value(f"device.software_pinned_to.{k}")
+        for k in ("rocm", "aiter", "rccl", "torch")
+    }
+    assert pinned == {
+        "rocm": "7.2.4",
+        "aiter": "41d4d8d7e",
+        "rccl": "2.27.7",
+        "torch": "2.10.0+rocm7.2.4.git3d3aa833",
+    }
+    assert spec.value("device.ptl") == "disabled"
+    resolved = {
+        architecture: spec.tokenizer_for(architecture, Backend.FAST).key.id
+        for architecture in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
+    }
+    assert resolved == {
+        "DeepseekV4ForCausalLM": "deepseek-v4-pro",
+        "DeepseekV41ForCausalLM": "deepseek-v4.1-flash",
+    }
 
 
 @pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39"])

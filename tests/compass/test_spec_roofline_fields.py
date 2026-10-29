@@ -122,7 +122,13 @@ def test_each_machine_file_reads_the_new_fields_with_their_origins(machine):
     ]
     # Node 18's, the MI355X hosts' and MI455 A0's are probe_device.py's
     # readings; the others are still assumed.
-    probed = ("mi308x-hjbog18", "mi355x-gpu45", "mi355x-crs005", "mi455-a0")
+    probed = (
+        "mi308x-hjbog18",
+        "mi355x-gpu45",
+        "mi355x-crs005",
+        "mi355x-gpu40",
+        "mi455-a0",
+    )
     origin = "probed" if machine in probed else "assumed"
     for path in paths:
         assert spec.value(path)
