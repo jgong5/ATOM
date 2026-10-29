@@ -8,7 +8,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import islice
 from math import inf, isinf
-from time import monotonic
 from weakref import WeakKeyDictionary
 
 import numpy as np
@@ -46,7 +45,8 @@ from atom.model_engine.state_runtime import (
     midstep_target_ok,
     snap_midstep_position,
 )
-from atom.utils import clock, envs
+from atom.utils import envs
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 
@@ -2031,7 +2031,7 @@ class BlockManager:
         """
         if timeout_s <= 0 or not self._orphan_load_slots:
             return 0
-        cutoff = clock.now(monotonic) - timeout_s
+        cutoff = time.monotonic() - timeout_s
         reclaimed = 0
         for req_id in list(self._orphan_load_slots):
             parked = self._orphan_load_slots[req_id]
@@ -3246,7 +3246,7 @@ class BlockManager:
             # scratch is nobody's destination and goes back regardless.
             if seq.offload_joint.load_hash != -1 and self.state_offload is not None:
                 self._orphan_load_slots.setdefault(seq.id, []).append(
-                    (seq.state_slot, clock.now(monotonic))
+                    (seq.state_slot, time.monotonic())
                 )
                 # Abandoned, not failed: an abort says nothing about the bytes,
                 # and forgetting the hash would cost the next request over this
