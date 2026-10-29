@@ -313,10 +313,13 @@ Two properties inherited rather than designed, both consequences of `03` D13's d
 run ATOM's real block accounting:
 
 1. **Whether draft KV shares the target's pool or owns its own is already decided by
-   ATOM**: the backend the draft's own config resolves to answers through
-   `DRAFT_OWNS_KV_POOL` (`atom/spec_decode/draft_kv.py::draft_kv_builder`), and
-   `ModelRunner.draft_shares_kv_pool` reports the outcome. Compass runs that choice as ATOM
-   makes it; it does not model the policy.
+   ATOM**: only an Eagle3 draft and a standalone DSpark draft ask
+   (`atom/spec_decode/draft_kv.py::draft_kv_builder`, from `EagleProposer._build_draft_model`
+   and `DSparkProposer._build_draft_model`), and for them the backend the draft's own config
+   resolves to answers through `DRAFT_OWNS_KV_POOL`. Serial MTP and a DSpark draft inside
+   the target's checkpoint always join the target's pool. `ModelRunner.draft_shares_kv_pool`
+   reports the outcome. Compass runs that choice as ATOM makes it; it does not model the
+   policy.
 2. **A draft's own pool rides the target's block ids**: `DraftKvBuilder.sub_pool_specs`
    declares it in the target's paged class (`page_pool`), and specs sharing a name merge in
    `plan_pools`. That is `03`'s statement of Eagle3 draft KV merged by name, unchanged.
@@ -390,7 +393,7 @@ on Qwen3.8-27B and the claim on Kimi-K3, was retired with those milestones.
 | draft steps | `hf_config_override` sets `num_nextn_predict_layers` to 1; the one `MTPBlock` runs `mtp_k` times, `K = --num-speculative-tokens`, 3 or 1 in the nightly cells | one draft structure per drafting step (D85); T60 is the serial case |
 | draft forward | `MTPBlock` subclasses V4's `Block` (the target's attention and MoE classes), adds `e_proj`, `h_proj`, three norms and its own `hc_head` parameters, and reads the target's un-reduced mHC residual | traced and priced like any structure (D85) |
 | draft weights | the MTP block only: `DeepseekV4MTP.share_with_target` binds the embedding and LM head to the target's | D86's weight term excludes both |
-| draft KV | in the target's pool, since V4's backend leaves `DRAFT_OWNS_KV_POOL` false. `DeepseekV4AttentionMetadataBuilder` lays its pool out from `hf_config.compress_ratios`, one entry per layer, those past `num_hidden_layers` the MTP blocks: V4-Pro's single MTP entry is ratio 0, so its KV is a sliding window in each request's slot (the STATE class), bound at layer id `n_layers` (`DeepseekV4MTPModel.mtp_start_layer_idx`) | D86: the target builder's `sub_pool_specs()` declares it |
+| draft KV | in the target's pool, since serial MTP never asks for one of its own (`EagleProposer._build_draft_model` calls `draft_kv_builder` for Eagle3 only). `DeepseekV4AttentionMetadataBuilder` lays its pool out from `hf_config.compress_ratios`, one entry per layer, those past `num_hidden_layers` the MTP blocks: V4-Pro's single MTP entry is ratio 0, so its KV is a sliding window in each request's slot (the STATE class), bound at layer id `n_layers` (`DeepseekV4MTPModel.mtp_start_layer_idx`) | D86: the target builder's `sub_pool_specs()` declares it |
 
 **Every M2 MTP cell is an acceptance cell.** Its per-position rates are measured from the
 paired real run, input 1 of D84 (`16` W4.7), and never declared. Input 1 needs T63's
@@ -408,7 +411,7 @@ target's, and relaxed verification.
 | draft steps | one pass through the draft stages drafts all `K = 5` positions; a Markov head then samples them in turn, and a confidence head scores them | one draft structure per step (D85); its terms are priced apart from the target's, at op level by [#2345](https://github.com/jgong5/ATOM/issues/2345) and at step level by [#2346](https://github.com/jgong5/ATOM/issues/2346) |
 | draft forward | `DraftBlock` and `DraftAttention` subclass V4.1's `Block` and `Attention`, with window-only attention and the draft's own routed-expert count (`dspark_n_routed_experts`) | traced and priced like any structure (D85) |
 | draft weights | the draft stages only: `share_with_target` binds the embedding and LM head to the target's | D86's weight term excludes both |
-| draft KV | in the target's pool, since V4.1's backend leaves `DRAFT_OWNS_KV_POOL` false. Under a speculative config `DeepseekV41MetadataBuilder` adds `num_nextn_predict_layers` window-only layers to the backbone's, each a sliding window in the request's STATE entry (`V41PoolGeometry.state_fields`) | D86: the target builder's `sub_pool_specs()` declares it |
+| draft KV | in the target's pool: `validate_speculative_config` requires the target checkpoint, so `DSparkProposer._build_draft_model` builds the draft from it and never calls `draft_kv_builder`. Under a speculative config `DeepseekV41MetadataBuilder` adds `num_nextn_predict_layers` window-only layers to the backbone's, each a sliding window in the request's STATE entry (`V41PoolGeometry.state_fields`) | D86: the target builder's `sub_pool_specs()` declares it |
 | verification | the cells set no confidence schedule (`DSparkConfig.confidence_schedule` is off by default), so every verify step carries the full block, real and simulated (D83) | no truncation to model |
 
 **Each stage-4 cell is an acceptance cell**, as M2's MTP cells are: its per-position rates
