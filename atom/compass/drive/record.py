@@ -2,7 +2,7 @@
 """`compass record`: one instance's real server, with its step record, serving
 whatever client runs reach it until it is stopped.
 
-    compass record --gpu G [--host H] --out DIR -- <ATOM args>
+    compass record --gpu G [--host H] [--trace] --out DIR -- <ATOM args>
 
 `serve` starts the server on the GPUs `--gpu` names with the step record on,
 bound to `--host`, 127.0.0.1 unless named, an address a router on another node
@@ -19,6 +19,13 @@ engine's stop writes ``steps/dp<r>.acceptance.json``, which `compass run
 --acceptance-record` reads.
 One record spans the server's lifetime, every
 client run it served included; `parity.served` splits it per client run.
+
+`--trace` makes it a trace run, a second run of a record's recipe and client
+that labels its prefill passes: the server runs ATOM's profiler on every rank
+from before the first request to its stop (`serve`), the drafter's passes on
+rank 0 alone (`parity.StepRecording`), and the record gets its
+busy lines (`parity.busy`) before its cost lines. A run under DP or pipeline
+stages refuses it before its server starts.
 
 The server's environment holds `AUTOTUNE_CACHE` as the command's does, 1 when
 the command's has none, and ``TRITON_CACHE_DIR`` as the command's does, or the
@@ -52,9 +59,10 @@ from triton import knobs
 from atom.compass.backends.step_grid_plan import TARGET
 from atom.compass.backends.step_labels import label_run, write_table
 from atom.compass.cli import OPS
-from atom.compass.drive import aiter_jit, serve
+from atom.compass.drive import aiter_jit, runfile, serve
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.compass.drive.identity import PTL_CHANGES, ptl_changes
+from atom.compass.parity import busy
 from atom.compass.run import _write_whole
 
 PROG = "compass record"
@@ -78,6 +86,14 @@ def main(argv: list[str]) -> None:
                 f"{arg} is among ATOM's arguments; a record times real weights, "
                 "and MoE routing follows them"
             )
+    if args.trace and (
+        runfile._dp_width(atom_args) > 1
+        or runfile._engine_args(atom_args).pipeline_parallel_size > 1
+    ):
+        raise ValueError(
+            "--trace reduces each TP rank's busy time, and ATOM's arguments run "
+            "DP ranks or pipeline stages"
+        )
     env = {
         AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1"),
         "TRITON_CACHE_DIR": knobs.cache.dir,
@@ -86,13 +102,22 @@ def main(argv: list[str]) -> None:
     # when serving began; a server that never answered served nothing.
     ready = Path(args.out) / serve.READY_FILE
     with ptl_changes(args.gpu, ready) as changes:
-        serve.serve(atom_args, args.out, args.gpu, extra_env=env, host=args.host)
+        serve.serve(
+            atom_args,
+            args.out,
+            args.gpu,
+            extra_env=env,
+            host=args.host,
+            trace=args.trace,
+        )
     run_json = Path(args.out) / serve.RUN_JSON
     builds = aiter_jit.builds_since(ready.stat().st_mtime_ns) if ready.exists() else {}
     run = {**json.loads(run_json.read_text()), "env": env, **builds}
     if changes:
         run[PTL_CHANGES] = changes
     _write_whole(run_json, json.dumps(run))
+    if args.trace:
+        busy.reduce(args.out)
     write_engine_and_costs(args.out)
 
 
@@ -102,6 +127,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default=serve.HOST, help="the address the server binds")
     p.add_argument(
         "--out", required=True, help="an empty directory for the record and logs"
+    )
+    p.add_argument(
+        "--trace",
+        action="store_true",
+        help="a trace run: profile the ranks and reduce its prefill busy time",
     )
     p.add_argument("--profile-ops", action="store_true", help="refused: ops half")
     p.add_argument("--profile-steps", metavar="A:B", help="refused: ops half")

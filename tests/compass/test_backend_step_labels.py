@@ -24,6 +24,7 @@ from test_backend_step_linear_fit import (
     _steps,
     _timed_record,
     _view,
+    busy_file,
 )
 from test_memory_readings import DOCUMENT, META_8B
 from test_parity_device_window import BUSY, GAP, _recorded
@@ -68,6 +69,7 @@ def _stamped(tmp_path, monkeypatch):
         runner.forward(batch)
     device.tick = BUSY // 3
     runner.exit()
+    busy_file(tmp_path / "real" / "dp0.jsonl")
     return tmp_path / "real" / "dp0.jsonl"
 
 
@@ -509,7 +511,7 @@ def test_a_prefill_launch_the_device_held_gives_no_W_launch_label(tmp_path):
 
     assert [s.step for s in samples if "W_launch" not in s.host] == held
     assert [row["step"] for row in table if row["W_launch"] is None] == held
-    assert [samples[n].cut for n in long] == ["exposed", "paced"]
+    assert [samples[n].cut for n in long] == ["exposed", None]
     got = fit_host(samples)[0]["laws"]["middle"]["W_launch"]
     assert got == pytest.approx(HOST["middle"]["W_launch"], rel=1e-4, abs=1e-12)
 

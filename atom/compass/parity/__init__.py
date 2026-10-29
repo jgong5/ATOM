@@ -65,6 +65,7 @@ may then report a step where the twins' rows differ.
 """
 
 import collections
+import contextlib
 import copy
 import functools
 import hashlib
@@ -111,6 +112,13 @@ TIMESTAMPS = (
     "t_pull_ns",
     "t_put_ns",
 )
+#: Profiler ranges a trace run (`busy`) splits a forward's kernels at: the target
+#: ends where `TARGET_DONE` opens, and each drafter pass is the range named `MARK`
+#: and its line field; a rank that paused its profiler for a drafter pass opens
+#: the empty range `PAUSED` as the pause starts.
+MARK = "compass::"
+TARGET_DONE = MARK + "target_done"
+PAUSED = MARK + "paused"
 
 
 class StepRecord:
@@ -509,19 +517,32 @@ class StepRecording:
         recorded `forward_done_event`: the target's end, sampling included."""
         if getattr(self, "_parity_record", None) is not None:
             self._stamps["target_event"] = self.device_event()
-        return call(*args)
+        with _traced(TARGET_DONE):
+            return call(*args)
 
     def _draft_pass(self, key, call, *args, **kwargs):
         """`call`, a drafter pass, between two device events kept under `key`,
         the line field that times it. The first pass's start also ends the
-        target of a forward that samples nothing."""
+        target of a forward that samples nothing. Under ATOM's profiler, TP rank
+        0 opens its range and every other rank pauses its profiler for the pass:
+        a trace run profiles the drafter on rank 0 alone."""
         if getattr(self, "_parity_record", None) is None:
-            return call(*args, **kwargs)
+            with self._drafter_traced(MARK + key):
+                return call(*args, **kwargs)
         start = self.device_event()
         self._stamps.setdefault("draft_event", start)
-        reply = call(*args, **kwargs)
+        with self._drafter_traced(MARK + key):
+            reply = call(*args, **kwargs)
         self._stamps[key] = [start, self.device_event()]
         return reply
+
+    def _drafter_traced(self, name: str):
+        """`_traced(name)` on TP rank 0 or with no ATOM profiler; on another
+        rank, ATOM's profiler paused while the pass runs (`_paused`)."""
+        profiler = getattr(self, "profiler", None)
+        if getattr(self, "rank", 0) == 0 or profiler is None:
+            return _traced(name)
+        return _paused(profiler)
 
     def propose_draft_token_ids(self, *args, **kwargs):
         call = super().propose_draft_token_ids
@@ -569,6 +590,30 @@ class StepRecording:
         if getattr(self, "_parity_record", None) is not None:
             self._parity_record.write()
         return super().exit()
+
+
+@contextlib.contextmanager
+def _paused(profiler):
+    """`profiler` collecting nothing inside the block, its start marked by the
+    empty range `PAUSED`."""
+    with _traced(PAUSED):
+        pass
+    activities = list(profiler.activities)
+    profiler.toggle_collection_dynamic(False, activities)
+    try:
+        yield
+    finally:
+        profiler.toggle_collection_dynamic(True, activities)
+
+
+def _traced(name: str):
+    """A profiler range named `name` while ATOM's profiler runs, else none, so
+    an untraced forward's host time pays for no range."""
+    import torch
+
+    if torch.autograd._profiler_enabled():
+        return torch.profiler.record_function(name)
+    return contextlib.nullcontext()
 
 
 def _window(previous, launch, done, marks, wait: bool):
