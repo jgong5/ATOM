@@ -23,15 +23,11 @@ class CompassCreditRouter(StickyCreditRouter):
     def __init__(self, *args, service_id: str, **kwargs) -> None:
         super().__init__(*args, service_id=service_id, **kwargs)
         self.service_id = service_id
+        # Tells the controller when the traffic LP fails.
+        self._bus = self.comms.create_pub_client(CommAddress.EVENT_BUS_PROXY_FRONTEND)
         self.traffic = TrafficLP.from_env()
         ClockPacedLoopScheduler.clock = self.traffic
         self.traffic.done.add_done_callback(self._on_finish)
-
-    def _init_credit_channels(self, comm_config) -> None:
-        super()._init_credit_channels(comm_config)
-        # Comms clients are created before the comms initialise; this one tells
-        # the controller when the traffic LP fails.
-        self._bus = self.comms.create_pub_client(CommAddress.EVENT_BUS_PROXY_FRONTEND)
 
     async def send_credit(self, credit) -> None:
         self.traffic.send(credit_key(credit.phase, credit.phase_index, credit.id))
@@ -74,6 +70,10 @@ class CompassCreditRouter(StickyCreditRouter):
                     service_id=self.service_id, error=ErrorDetails.from_exception(error)
                 )
             )
-            await self._bus.publish(ProfileCancelCommand(service_id=self.service_id))
+            await self._bus.publish(
+                ProfileCancelCommand(
+                    service_id=self.service_id, reason_detail=f"traffic LP: {error!r}"
+                )
+            )
         finally:
             asyncio.get_running_loop().stop()

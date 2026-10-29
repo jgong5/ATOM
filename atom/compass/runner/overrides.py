@@ -159,6 +159,13 @@ RPC_SURFACE: dict[str, bool] = {
     # holds no real send and the stage loop has already waited for its own.
     "flush_pp_send": True,
     "poll_forward_metrics": False,  # EngineUtilityHandler does not wait
+    # EngineCore.__init__ hands the reply to its Scheduler; ATOM's own reads the
+    # prefill token graphs recorded, and this runner records none.
+    "prefill_token_graphs": True,
+    # Refused by `RefusedDynamicChunking`: a fit needs timed real forwards.
+    "profile_dynamic_chunking": True,  # EngineCore.__init__ reads the reply
+    # Reached only after a fit, so never: ATOM's own.
+    "take_dynamic_chunking_fit": True,  # EngineCore reads the reply
     "release_multimodal_requests": False,  # EngineCore does not wait
     # Refused by `RefusedControlCommands`: ATOM's own starts a real profiler.
     "start_profiler": True,  # EngineUtilityHandler forwards the reply unread
@@ -927,6 +934,19 @@ class RefusedControlCommands:
         return tuple(vars(self).get("_refused_commands", ()))
 
 
+class RefusedDynamicChunking:
+    """`--enable-dynamic-chunking`, refused at its startup fit."""
+
+    def profile_dynamic_chunking(self) -> dict[str, Any]:
+        """ATOM's own fits the pipeline's prefill chunk sizes to real forwards
+        it times on the device, and this runner runs none. Answering without a
+        fit would turn the feature off, which the real run keeps on."""
+        raise RunnerRefusal(
+            "--enable-dynamic-chunking sizes prefill chunks from timed real "
+            "forwards, and a simulated runner runs none to time"
+        )
+
+
 class PricedSteps:
     """What a runner's steps cost, read by the run summary over the worker RPC."""
 
@@ -1080,6 +1100,7 @@ class OffloadDecisions:
 
 class NonAllocatingRunner(
     RefusedControlCommands,
+    RefusedDynamicChunking,
     PricedSteps,
     PredictedMemory,
     StepGridBundle,
@@ -1338,7 +1359,9 @@ class NonAllocatingRunner(
         leaves behind: the declared `config.capture_sizes` narrowed to what
         the scheduler can produce, ascending. `ForwardMode.decide` reads the
         rung of every step off `capture_sizes_np`, so leaving the
-        construction-time `[0]` would price every decode step as eager. An empty narrowed ladder is refused: ATOM's capture asserts
+        construction-time `[0]` would price every decode step as eager.
+        `tbo_decode_graphs` is set as the base's capture sets it, so a decode
+        the DP group splits replays where a real one does. An empty narrowed ladder is refused: ATOM's capture asserts
         on it, so that deployment never starts. The reply still sends `[]` for the batch sizes, since no
         graph exists; the caller only formats it into a log line.
 
@@ -1356,6 +1379,9 @@ class NonAllocatingRunner(
                 "start this deployment, so there is no ladder to price"
             )
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
+        self.tbo_decode_graphs = (
+            self.config.enable_tbo_decode and not self._tr_hybrid_active()
+        )
         logger.info(
             "no cudagraph captured: there are no weights to trace; steps "
             "dispatch on the ladder %s.",
@@ -1387,7 +1413,7 @@ class NonAllocatingRunner(
 
         * `.req_ids`, an iterable of request ids in the batch's own order --
           `PPEngineCoreProc._pp_head_step`. That read is on the head's side of
-          the transport, on what `recv_tokens()` returns, not at the
+          the transport, on what `recv_completion()` returns, not at the
           `_downstream_busy_loop` call site, which only passes the object on.
         * `.token_ids`, `.draft_token_ids`, `.is_deferred_out`, `.logprobs`
           (None or a `dict[int, float]`) -- `Scheduler.postprocess`.
@@ -1401,7 +1427,7 @@ class NonAllocatingRunner(
         Picklable on top: under pipeline parallelism the last stage sends the
         object whole (`_downstream_busy_loop`) and the head reads it back
         (`_pp_head_step`), each hop through `pickle` in
-        `PPStageTransport.send_tokens` and `PPStageTransport.recv_tokens`
+        `PPStageTransport.send_completion` and `PPStageTransport.recv_completion`
         (`atom/distributed/pp_transport.py`). ATOM's own answer is a
         `ScheduledBatchOutput`; the contract a replacement has to meet is these
         reads and the pickle, not that class.
@@ -1600,7 +1626,9 @@ def _group_step_seconds(
         device_s, draft_s = cost.target_seconds, cost.draft_seconds
         terms = (*cost.terms, *cost.draft_terms)
     host = getattr(runner, "compass_host", None)
-    group = dp_group() if mode.sync is not None else None
+    # `decide` returns the collective's rows for a group of one too.
+    many = mode.sync is not None and len(mode.sync.scheduled_tokens_per_dp_rank) > 1
+    group = dp_group() if many else None
     charge = getattr(host, "charge", None)
     if group is not None and isinstance(host, HostDeviceRecurrence):
 

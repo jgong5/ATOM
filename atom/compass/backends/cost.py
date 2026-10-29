@@ -94,7 +94,7 @@ class CostTerm:
             raise ValueError(f"{self.name}: {self.seconds} is not a finite duration")
         if self.seconds < 0.0:
             raise ValueError(f"{self.name}: {self.seconds} s is negative")
-        if self.provenance.is_refused and self.seconds <= 0.0:
+        if self.provenance.fell_through and self.seconds <= 0.0:
             raise ValueError(
                 f"{self.name}: a refusal was priced at {self.seconds} s. Something "
                 "declined and the stand-in charged nothing, which removes the step "
@@ -217,7 +217,7 @@ class StepCost:
     @property
     def fell_back(self) -> bool:
         """Whether a fallback priced some term after a source declined it."""
-        return any(t.provenance.is_refused for t in _every(self))
+        return any(t.provenance.fell_through for t in _every(self))
 
     @property
     def fallback_seconds(self) -> float:
@@ -226,7 +226,9 @@ class StepCost:
         Reported alongside the count because they answer different questions:
         a run can fall back on 2% of its steps and 40% of its time.
         """
-        return fold_seconds(t.seconds for t in _every(self) if t.provenance.is_refused)
+        return fold_seconds(
+            t.seconds for t in _every(self) if t.provenance.fell_through
+        )
 
     def seconds_by_method(self) -> Mapping[tuple[Method, bool], float]:
         """Seconds grouped by (method, validated), terms in stored order.

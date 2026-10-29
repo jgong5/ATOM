@@ -71,7 +71,7 @@ for c in ${CELLS:-1 4 16 64 256}; do
     gpu=$(busy | grep -xFm1 -f <(tr , '\n' <<<"$SMI_GPUS")) && { echo "calib_capture: rocm-smi GPU $gpu is in use" | tee -a "$log" >&2; exit 3; }
     CONCURRENCY=$c timeout 7200 bash "$ROOT/scripts/compass/cctraces_sim.sh" "$RUN_FILE" "$o" >"$o.out" 2>&1 &
     sim=$!
-    until [[ -s $o/steps/dp0.jsonl ]] || ! kill -0 $sim 2>/dev/null; do sleep 10; done
+    until [[ -s $o/steps/dp0.jsonl ]] || ! kill -0 $sim 2>/dev/null; do sleep 1; done
     if kill -0 $sim 2>/dev/null; then
         echo "first step $(date -u +%FT%TZ)" >>"$log"
         # Wakes each 10 s, so a cell that ends on its own is not held to STEPS_S.

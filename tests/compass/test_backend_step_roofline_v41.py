@@ -8,7 +8,7 @@ the step's draft terms.
 Each is checked against a count by hand, on a machine with no kernel floor,
 once memory-bound and once compute-bound. The published V4.1-Flash config at
 TP4 under DSpark5, expert parallelism off and at EP4, builds on the meta
-device with its drafter, every module classified, and prices on the MI455
+device with its drafter, every module classified, and prices on MI455 B0's
 spec; the build owns its process because the driverless declarations are
 process-global.
 """
@@ -36,7 +36,7 @@ from atom.compass.backends.work import Work, allgather, elementwise, gemm
 
 TREE = pathlib.Path(__file__).resolve().parents[2]
 CONFIG = TREE / "tests" / "models" / "deepseek_v41" / "fixtures" / "config.json"
-MI455 = TREE / "scripts" / "compass" / "machines" / "mi455.json"
+MI455 = TREE / "scripts" / "compass" / "machines" / "mi455-b0.json"
 
 
 def _cost(modules, step, spec):

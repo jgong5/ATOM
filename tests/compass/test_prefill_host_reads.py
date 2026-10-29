@@ -21,6 +21,15 @@ from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids_dev
 from atom.utils import CpuGpuBuffer
 
 
+def _stand_in_attr(attr):
+    """A mock for each name an importer binds, and none for a dunder:
+    `inspect` caches every module's `__file__`, and a mock there breaks the
+    real aiter's custom-op registration later in the process."""
+    if attr.startswith("__"):
+        raise AttributeError(attr)
+    return MagicMock()
+
+
 class _AiterStandIn(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     """Every `aiter` module as a stand-in: without a driver aiter's import
     raises, and nothing here calls it."""
@@ -32,7 +41,7 @@ class _AiterStandIn(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     def create_module(self, spec):
         module = types.ModuleType(spec.name)
         module.__path__ = []
-        module.__getattr__ = lambda _attr: MagicMock()
+        module.__getattr__ = _stand_in_attr
         return module
 
     def exec_module(self, module):
@@ -50,14 +59,21 @@ def _import():
 if torch.cuda.is_available():
     attention_mha, aiter_attention, gdn_attn, index = _import()
 else:
-    _finder = _AiterStandIn()
+    _finder, _before = _AiterStandIn(), set(sys.modules)
     sys.meta_path.insert(0, _finder)
     try:
         attention_mha, aiter_attention, gdn_attn, index = _import()
     finally:
         sys.meta_path.remove(_finder)
-        for _name in [n for n in sys.modules if n.split(".")[0] == "aiter"]:
-            del sys.modules[_name]
+        # Only the stand-ins go: an aiter imported for real before stays
+        # whole, and none of its packages keeps a stand-in bound.
+        for _name in [
+            n for n in set(sys.modules) - _before if n.split(".")[0] == "aiter"
+        ]:
+            _module = sys.modules.pop(_name)
+            _parent, _, _child = _name.rpartition(".")
+            if getattr(sys.modules.get(_parent), _child, None) is _module:
+                delattr(sys.modules[_parent], _child)
 
 
 def buf(n):
@@ -83,11 +99,14 @@ def test_gdn_chunk_indices_follow_the_host_lengths(monkeypatch):
     monkeypatch.setattr(
         aiter_attention.AiterAttentionMetadataBuilder,
         "prepare_prefill",
-        lambda self, b, rbs: (attn_metadata, None),
+        lambda self, b, rbs, rts: (attn_metadata, None),
     )
     builder = object.__new__(gdn_attn.GDNAttentionMetadataBuilder)
     builder.__dict__.update(
-        model_runner=SimpleNamespace(forward_vars=var),
+        model_runner=SimpleNamespace(
+            forward_vars=var,
+            config=SimpleNamespace(hf_config=SimpleNamespace(linear_conv_kernel_dim=4)),
+        ),
         use_spec_decode=False,
         replayssm=False,
         device="cpu",
@@ -105,7 +124,7 @@ def test_gdn_chunk_indices_follow_the_host_lengths(monkeypatch):
         total_tokens_num=26,
     )
 
-    md, _ = builder.prepare_prefill(batch, 3)
+    md, _ = builder.prepare_prefill(batch, 3, 26)
     cu = md.gdn_metadata.non_spec_query_start_loc
     var["cu_seqlens_q"].np[:4] = 0  # the next step reuses the buffer
     indices = index.prepare_chunk_indices(cu, 16)

@@ -39,6 +39,14 @@ cost accuracy grades every answered step with no declared term, at every backend
 This replaces #627's [ruling 3](https://github.com/jgong5/ATOM/issues/627#issuecomment-6096543740) exemption from that gate only:
 extrapolation still neither refuses nor aborts a cell (D50.1).
 
+**Revised 2026-10-25 by the owner's ruling on
+[#2138](https://github.com/jgong5/ATOM/issues/2138), 2026-10-27 by its rulings there, and
+2026-10-28 by the
+[ruling on #2141](https://github.com/jgong5/ATOM/issues/2141#issuecomment-6467960187):**
+stage 4 grades DeepSeek-V4.1-Flash on MI455's A0 sample cards in two cells of its own, with
+no ranking gate (D50); the bound is checked on their records at A0's probed spec, and the
+method's error compares the frozen projection's spec with A0's on those records (D50.2).
+
 **Scope.** What counts as evidence: which results are reported, how each is measured, what
 tolerance applies and where that tolerance comes from, and what invalidates a run.
 Acceptance is paired simulated and real execution of cc-traces proper, so every rule here
@@ -81,7 +89,7 @@ that subset is genuinely green.
 | Gate | What runs | Measured result |
 |---|---|---|
 | **CPU gate** — per task, and green is the bar | Every test file outside `tests/plugin/` and `scripts/compass/cpu_gate_exclude.txt`. Driven by `scripts/compass/gate_cpu.sh`; no driver is touched **as a batch**. That is the weaker and correct claim: `test_postprocess_width.py` and `test_v4_checkpoint_slot_copy.py` were both in the gate at `236abfd9a`, and each reached `rocminfo` when run *alone* (`no tests collected, 1 error`, rc=2, each, measured in `xiaobizh_n18_cpu`); inside the gate they module-skipped on the mock an earlier file installs. Driver-freedom here is a property of the batch, not of every file in it. | Green, `GATE_CPU_RC=0`, read at `bdd244c57` in `xiaobizh_n18_cpu`. The counts are not restated here, because they move with every test the gate gains or loses: `gate_cpu.sh` prints them under the `commit:` line of the tree it ran, and `scripts/compass/README.md` says what the gate runs. |
-| **GPU gate**, a superset — per wave, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`. | The commit, its counts and the toolchain it ran under are in `scripts/compass/gpu_gate_baseline.env`, and every failing node-id is on file verbatim in `scripts/compass/gpu_gate_known_failures.txt` and compared by name, so "N failed" is checked against "the *same* N failed". `scripts/compass/regen_gpu_gate_baseline.sh` rewrites both from two runs that pass the same count and fail the same node-ids, so a new image or GPU is re-baselined by one command. The upstream merge set the baseline to pure upstream `661ef7661`, the ATOM the nightly 20261013 image ships, on node 18's MI308X; before it the baseline was `fe9ea043c` on node 18, whose five failures (four bf16-ULP `allclose` cases in `tests/test_fused_compress_ragged.py` and the bitwise `tests/test_dcp_merge_ops.py::test_row_view_matches_output_slicing_bitwise`) the merge's list kept. |
+| **GPU gate**, a superset — per wave, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`, less any file `scripts/compass/gpu_gate_skip.txt` names for the GPU it runs on (a file that stalls there), whose collected tests come off the expectation. | The commit, its counts and the toolchain it ran under are in `scripts/compass/gpu_gate_baseline.env`, and every failing node-id is on file verbatim in `scripts/compass/gpu_gate_known_failures.txt` and compared by name, so "N failed" is checked against "the *same* N failed". `scripts/compass/regen_gpu_gate_baseline.sh` rewrites both from two runs that pass the same count and fail the same node-ids, so a new image or GPU is re-baselined by one command. |
 
 `test_dp_metadata.py`, `test_dp_sync_layout.py`
 and `test_forward_mode.py` were once excluded and were re-measured CPU-green (`16`); prose
@@ -294,20 +302,37 @@ value) and a **comparator** (value, value → distance). Admission is measured b
 stability test, not asserted. New metrics are expected; the families and the admission
 procedure are the stable part.
 
-### Family 1 — counting invariants. Exact match expected, except total prefill tokens (below); a mismatch is a defect, not noise.
+### Family 1 — counting invariants. Preemptions and prefill tokens grade a cell, each against the real runs' spread; every other count is reported, not gated.
 
 | Metric | Prior observation |
 |---|---|
 | prefill step count | 106 on both sides |
 | decode step count | 4,346 vs 4,333 |
-| total decode tokens | pure workload arithmetic — should be exact |
+| total decode tokens | 1 past a 534 real spread on #742's cell (#774) |
 | total prefill tokens | a cc-traces run issues a turn only after the previous one returns and none after its cutoff, so which turns fall inside moves with end-to-end time; on a hybrid model a prefix hit also stops at a state checkpoint that arrival order decides (#896). Ruled 2026-10-13 (#897). |
-| preemption count | 0 in the runs measured |
-| prefill streak count | identical across four real runs |
+| preemption count | `spread 0; result 0 ...`, `exact`, on every cell graded so far (#1474 at c=4, #1681 at c=1) |
+| prefill streak count | 58 against 59 on every real run of #742's cell (#774) |
 | requests admitted / completed | — |
+
+The graded counts are the set `GATED_COUNTS` holds in `atom/compass/validate/__main__.py`:
+`preemptions` and `prefill tokens`. Each is graded against the real runs' own spread, the
+largest distance between any two real runs (`_grade` in `atom/compass/validate/runs.py`):
+`exact` when the simulated value equals every real run's, `inside the real spread` when its
+distance from each is at most the spread, else `outside`. While the real runs agree, the
+spread is 0 and the grade is an exact match.
+
+A preemption needs the KV pool to run out, and which requests share the pool at a step
+moves with timing, so at a concurrency that fills the pool the real runs may disagree;
+their spread is then the tolerance.
 
 Total prefill tokens is graded over the requests both runs issued, against the real
 runs' own spread; a turn only one run issued is reported, not gated (#897).
+
+Every other count (prefill steps, decode steps, decode tokens, prefill streaks, requests
+completed) is reported with its verdict marked `not gated`, with no relative floor (ruled
+2026-10-11, #743). A discrete count's real spread is often 0, so one merged prefill streak
+or one request crossing the cutoff reads `outside`; TTFT, TPOT, throughput and the step
+distributions still grade the schedule.
 
 ### Family 2 — distributional. The family to weight most.
 
@@ -570,18 +595,22 @@ so it could not be — *"the held-out axis the user actually wants is configurat
 widths chosen to span what calibration did not see: M2 is graded at the widths those
 configurations run, so width transfer (T21) is not on the acceptance path. The nightly runs
 define the configurations, never the real side, which this project runs itself (`16`
-P0b.3). Two sets, each driven by cc-traces:
+P0b.3). The sets, each driven by cc-traces:
 
 | Set | Model and hardware | Configurations | Client counts |
 |---|---|---|---|
 | **Stage 2**, M2's first gate | Qwen3.8-27B on MI308X | TP1, aggregated | 1, 4, 16; 64 and 256 dropped on a real-side limit (below) |
 | **M2** | DeepSeek-V4-Pro, 1P+1D on the MI355X pair | the four nightly configurations of [`recipes/mesh/DeepSeek-V4.md`](../../../recipes/mesh/DeepSeek-V4.md) as written, expert parallelism off: TP, DPA, TP MTP3, DPA MTP1 | each configuration's benchmark concurrencies in that recipe |
+| **Stage 4**, the last step of v1 | DeepSeek-V4.1-Flash on MI455, one 4-card node per cell | TP4 DSpark5, aggregated: A with whole-expert EP4, B with the routed experts sharded across TP | 1, 4, 16, 64, 256 on traces 0 to 255; traces 256 to 392 calibrate |
 
-Flags and concurrencies are the recipe's; this document does not copy them. **M2's EP8
-step** adds the two DPA configurations re-run with `--enable-expert-parallel` (`16` W4.11),
-graded the same way, and joins them to the ranking gate below. The aggregated DPA+TBO
-variant in `.github/benchmark/models.json` is not a cell: D95 grades M2 at its P/D
-configurations only.
+M2's flags and concurrencies are the recipe's; this document does not copy them. Stage 4's
+cells and flags are the owner's ([#2138](https://github.com/jgong5/ATOM/issues/2138)),
+stated in `16` *Stage 4*; each is smoke-tested on MI355X and graded only on MI455.
+**M2's EP8 step** adds the two DPA configurations re-run with `--enable-expert-parallel`
+(`16` W4.11), graded the same way, and joins them to the ranking gate below. The aggregated DPA+TBO
+variant in `.github/benchmark/models.json` is not a cell: D95 grades M2 on MI355X at its
+P/D configurations only. Stage 4's cells are aggregated because DeepSeek-V4.1 serves no
+P/D ([#2347](https://github.com/jgong5/ATOM/issues/2347)).
 
 Stage 2 was registered at 1, 4, 16, 64 and 256 and now runs 1, 4 and 16, in calibration
 and grading. The case set shrank on a real-side limit, not on a simulated error: at 64 and
@@ -620,7 +649,9 @@ never a combination of them:
    hundreds of clients, so ρ is the weaker check of the two.
 
 Stage 2 runs one configuration, so it has no ranking to grade; it is graded by D44's
-results alone.
+results alone. Stage 4 has no ranking gate either, by the owner's ruling on #2138: each
+MI455 cell is graded by D44's results and by the speed floor of `README.md`, faster than
+real, with 5× reported.
 
 ### The DP cells
 
@@ -650,43 +681,57 @@ N≥3 **spaced** real runs per cell to establish the noise floor.
 
 ### Problem
 
-M2's MI455 projection (`16` D95) has no real side. D45's tolerance has no
-real-vs-real spread to measure and D44's results have nothing to compare against, so any
-error bar quoted on the projection would be invented.
+M2's MI455 projection (`16` D95) had no real side when stage 3c made it. D45's tolerance
+had no real-vs-real spread to measure and D44's results had nothing to compare against, so
+any error bar quoted on the projection would have been invented. Stage 4 gives MI455 a real
+side (`16` *Stage 4*): its own runs are graded by D44 in D50's stage-4 cells, and the
+projection stays frozen as stage 3c delivered it.
 
 ### Decision
 
 **Revised 2026-10-17 by the owner's ruling on
-[#1392](https://github.com/jgong5/ATOM/issues/1392).** **The projection is held to the
-checks below instead of an error bar.** A projection that fails item 1 or 2, or ships
-without item 3's measurement, is not M2's result.
+[#1392](https://github.com/jgong5/ATOM/issues/1392), 2026-10-25 and 2026-10-27 by the
+owner's rulings on [#2138](https://github.com/jgong5/ATOM/issues/2138), and 2026-10-28 by
+the ruling on [#2141](https://github.com/jgong5/ATOM/issues/2141).** **The projection is
+held to the checks below instead of an error bar.** A projection that fails item 1 or
+2, or ships without item 3's measurement, is not M2's result.
 
 1. **On every measured step, at both granularities, analytical is at most measured.** The
    step-level and op-level projections of `10` D64 price each step at the attainable peaks
    probed on the device that ran it, composed by the joins of
    [topic 10](10_analytical_laws.md#d64-the-attainable-peak-roofline-at-step-and-op-level).
-   Applied as D47 applies cost accuracy, on the real runs'
-   own unprofiled steps (D49), the stage-2 MI308X record and the stage-3 MI355X records: no
+   Applied as D47 applies cost accuracy, on the real runs' own unprofiled steps (D49), the
+   stage-2 MI308X record, the stage-3 MI355X records and the stage-4 MI455 records: no
    step's analytical price may exceed its measured time. One that does is a defect in an
    extractor, a join or the spec, reported with its op kind or module; it is a bound, not a
    statistic, so none is tolerated. Beside it, not gated: the measured-over-analytical
    report of `10` D68.
 2. **Every MI455 input is sourced or marked assumed.** A machine-spec field's origin is
    recorded per field across save, `MachineSpec.origin()` (`05` D26); which fields
-   are assumed is rule 5 of `05` D25's schema rules. MI455's attainable peaks are its
-   datasheet times the ratios probed on MI355X, assumed (`10` D69). The projection artifact
-   lists the assumed fields it reads, and a term that reads one is declared. A field no
-   fragment supplies is refused (principle 6).
-3. **The method's error is measured where both sides exist.** The same method, an MI355X
-   spec carried from MI308X's probed ratios as MI455's is carried from MI355X's, projects
-   Qwen3.8-27B onto MI355X and is reported against real MI355X runs by item 1's reports,
-   not gated. That error is quoted with the MI455 projection. It estimates the method, not
-   MI455: it is taken on another model and another device pair, because
-   DeepSeek-V4-Pro's FP4 experts do not run on gfx942.
+   are assumed is rule 5 of `05` D25's schema rules. MI455 has two specs
+   ([#2141](https://github.com/jgong5/ATOM/issues/2141)): the A0 sample node's attainable
+   peaks are probed there, a value not probed staying assumed; the B0 performance
+   machines' are MI455X's datasheet times the ratios probed on MI355X, assumed, as the
+   frozen projection's are (`10` D69), until a B0 node is probed
+   ([#2438](https://github.com/jgong5/ATOM/issues/2438)). What the A0 node measures keys
+   to A0, never to B0. A projection artifact lists the assumed fields it reads, and a term
+   that reads one is declared. A field no fragment supplies is refused (principle 6).
+3. **The method's error is measured where both sides exist.** On MI455, the same stage-4
+   records are bounded by item 1 twice, at the frozen projection's spec and at the spec
+   probed on the A0 node, and measured over analytical is reported at each, per cell and
+   level, not gated: the difference is the error of the carried peaks on MI455's A0
+   samples, A0's missing compute units included (`16` *Stage 4*), taken on
+   DeepSeek-V4.1-Flash, the model stage 4 runs, rather than the V4-Pro the projection
+   priced. Before MI455 ran, the same method, an MI355X spec carried from MI308X's probed ratios as
+   MI455's was carried from MI355X's, projected Qwen3.8-27B onto MI355X and was reported
+   against real MI355X runs by item 1's reports, not gated. That error stays quoted with
+   the frozen projection. It estimates the method, not MI455: it is taken on another model
+   and another device pair, because DeepSeek-V4-Pro's FP4 experts do not run on gfx942.
 
 **Reported, not gated:** configuration ranking, top-1 and top-3, over M2's four P/D cells
-(`10` D67.1). Where a claim about MI455 can be a ranking rather than an absolute, prefer
-the ranking (`10` D69). `16` *Wave 5* carries all of it.
+(`10` D67.1). Where a claim from the frozen projection about MI455 can be a ranking rather
+than an absolute, prefer the ranking (`10` D69). Stage 4 reports no ranking. `16` *Wave 5*
+carries the projection, and `16` *Stage 4* the MI455 records.
 
 ---
 
@@ -789,13 +834,13 @@ claims there are not.
 |---|---|---|
 | D44 | Three separable results — cost accuracy, schedule agreement, end-to-end — reported side by side. Aggregate latency is never the judgement. | 2026-09-18 |
 | D45 | Noise-floor first: the real-vs-real spread is the tolerance. A metric is admissible if stable; sensitivity, tested against the ×0.97 counterfactual, is deferred until a need appears. | 2026-09-18; revised 2026-10-16 (#1025) |
-| D46 | Three metric families ordered by robustness, as an extensible registry: counting invariants (exact; prefill tokens over the requests both runs issued, within the real spread), distributional (weighted most), event timing (most diagnostic). Policy agreement is a regression guard, not a discriminator. | 2026-09-18; revised 2026-10-13 (#897) |
+| D46 | Three metric families ordered by robustness, as an extensible registry: counting invariants (preemptions and prefill tokens graded against the real spread, prefill tokens over the requests both runs issued; every other count reported, not gated), distributional (weighted most), event timing (most diagnostic). Policy agreement is a regression guard, not a discriminator. | 2026-09-18; revised 2026-10-11 (#743) and 2026-10-13 (#897) |
 | D47 | Cost accuracy on the real run's own step sequence; report totals, held-out-worst, and median per step together. Graded: every answered step with no declared term, at every backend, under #627's 5% gate; validated and unvalidated steps reported beside, not gated; declared steps apart. | 2026-09-18; revised 2026-10-23 (#2011) |
 | D48 | Memory per term, never as a sum. The gate is whether the top-1 configuration choice survives, not the byte error. | 2026-09-18 |
 | D49 | Seven hygiene refusals, each with a prior incident behind it. An op-level leaf is not extrapolated: with no same-kernel bracket it falls to its analytical law. An out-of-hull step is graded and also reported apart. | 2026-09-18; op-level leaf 2026-10-18 (#1489); out-of-hull graded 2026-10-23 (#2011) |
 | D50.1 | A step is refused only when some term is still unanswered after method fallback, its reasons listed per term; a fall-through and an answer of any method are not refusals, and the priced seconds are reported by method (analytical, declared, measured, estimated, unvalidated) with their steps and share of predicted seconds. Each unanswered term costs 0 s, and a step the cost backend refuses charges no device time, its answered terms included; the run continues, `--on-refusal abort` stops at the first, and the summary is written either way. Any refusal, of any source, makes the run a coverage report: no refused-seconds fraction, no threshold, and no answered step invalidates a run, whatever its method or share. No validated share refuses or makes a coverage report. | 2026-09-19; revised 2026-10-11 (#765, and again to drop the analytical cap); 2026-10-14 (#952); 2026-10-23 (#2011); 2026-10-26 (#2294) |
-| D50 | Everything registered and hashed before evaluation; the case set never shrinks, though the owner dropped stage 2's 64 and 256, whose aiperf warmup cannot finish within a capture's window (#1590). One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The cells are stage 2's Qwen3.8-27B TP1 on MI308X and M2's four nightly P/D configurations of DeepSeek-V4-Pro on MI355X at their concurrencies, then the DPA two at EP8. M2's ranking gate: the same best configuration as hardware at each concurrency, and rank correlation across all cells, per end-to-end metric, each inside its real-vs-real spread, with Spearman's ρ also at least 0.9. DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01, 2026-10-09, 2026-10-10, 2026-10-20 |
-| D50.2 | The MI455 projection is sound, not graded: on every measured step, at both granularities, the analytical price at attainable peaks probed on the device, composed by the IR's own joins, is at most the measured time, with measured over analytical per op kind and phase reported beside it; every MI455 input is sourced or marked assumed, its peaks the datasheet times MI355X's probed ratios; the method's error, MI308X to MI355X on Qwen3.8-27B, and the configuration ranking are reported, not gated. Replaces the bound first stated at the spec's peaks with derates at 1, and the method that carried implementation efficiencies onto the target. | 2026-10-09; revised 2026-10-17 (#1392) |
+| D50 | Everything registered and hashed before evaluation; the case set never shrinks, though the owner dropped stage 2's 64 and 256, whose aiperf warmup cannot finish within a capture's window (#1590). One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The cells are stage 2's Qwen3.8-27B TP1 on MI308X and M2's four nightly P/D configurations of DeepSeek-V4-Pro on MI355X at their concurrencies, then the DPA two at EP8; stage 4's two DeepSeek-V4.1-Flash TP4 DSpark5 cells on MI455, with and without EP4, graded with no ranking gate. M2's ranking gate: the same best configuration as hardware at each concurrency, and rank correlation across all cells, per end-to-end metric, each inside its real-vs-real spread, with Spearman's ρ also at least 0.9. DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01, 2026-10-09, 2026-10-10, 2026-10-20, 2026-10-25 and 2026-10-27 (#2138) |
+| D50.2 | The MI455 projection is sound, not graded: on every measured step, at both granularities, the analytical price at attainable peaks probed on the device, composed by the IR's own joins, is at most the measured time, with measured over analytical per op kind and phase reported beside it; every MI455 input is sourced or marked assumed: the A0 samples' peaks probed on their node since stage 4, the frozen projection's the datasheet times MI355X's probed ratios, and the B0 machines' too until a B0 node is probed; the method's error, the same A0 records bounded at the frozen spec and at A0's probed spec, and before them MI308X to MI355X on Qwen3.8-27B, and the configuration ranking are reported, not gated. Replaces the bound first stated at the spec's peaks with derates at 1, and the method that carried implementation efficiencies onto the target. | 2026-10-09; revised 2026-10-17 (#1392), 2026-10-25 and 2026-10-27 (#2138), 2026-10-28 (#2141) |
 | D50.3 | The op-level empirical backend is graded by this protocol as the step-level backends are, on the same real runs: Qwen3.8-27B TP1 on MI308X on #974's runs, then M2's cells with the ranking gate. Faster than real is gated; 5× is reported. Reported, not gated: the analytical fallback's share of priced seconds, the per-step composed-over-measured gap per phase and op kind, the step-level backend's table beside it, and warm-over-cold. | 2026-10-18 (#1489) |
 | D51 | Measure a saturated cell early. Account cold costs once; report the simulator's own per-step CPU cost alongside the ratio. | 2026-09-18 |
 | D52 | Fail-closed invalidation conditions; any refusal is one, an answered step is not, whatever its method or share (D50.1). Scheduling claims require slack; throughput claims at saturation are fine. | 2026-09-18; revised 2026-10-11 twice |
