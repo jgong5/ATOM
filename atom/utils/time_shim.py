@@ -9,9 +9,10 @@ forms, `clock_gettime`, `process_time`, `thread_time`) are not exposed: a
 module that needs a real read keeps `import time` and `atom.utils.clock.now`
 at each read that takes the simulated clock.
 
-Import the module (`from atom.utils import time_shim as time`), not its names:
-`from atom.utils.time_shim import monotonic` binds whichever function was
-current at import. Setting or deleting a name sets or deletes it on `time`,
+Import the module (`from atom.utils import time_shim as time`): a name
+imported from it is whichever function was current at import. A module that
+had `from time import monotonic` imports `read_monotonic as monotonic`, which
+picks on each call. Setting or deleting a name sets or deletes it on `time`,
 as it did when the importing module's `time` was `time` itself.
 """
 
@@ -66,5 +67,11 @@ def _simulated(name: str) -> property:
 
 for _name in ("time", "monotonic", "perf_counter"):
     setattr(_TimeShim, _name, _simulated(_name))
+
+
+def read_monotonic() -> float:
+    """`time.monotonic()`, or the LP clock while a runtime is installed."""
+    return clock.now(_time.monotonic)
+
 
 sys.modules[__name__].__class__ = _TimeShim

@@ -288,12 +288,16 @@ ON_THE_TIME_SHIM = (
     "atom.kv_transfer.offload.mp.transfer",
     "atom.metrics.exporter",
     "atom.metrics.scheduler",
-    "atom.model_engine.block_manager",
     "atom.model_engine.engine_stats",
     "atom.model_engine.llm_engine",
-    "atom.model_engine.page_unit_checkpoint",
     "atom.model_engine.pp_engine_core",
     "atom.model_engine.scheduler",
+)
+#: The modules that had `from time import monotonic`: their `monotonic` is the
+#: shim's `read_monotonic`.
+ON_READ_MONOTONIC = (
+    "atom.model_engine.block_manager",
+    "atom.model_engine.page_unit_checkpoint",
 )
 
 
@@ -315,6 +319,16 @@ class TestTheTimeShim:
         shim = importlib.import_module(module).time
         for name in ("time_ns", "monotonic_ns", "perf_counter_ns", "process_time"):
             assert not hasattr(shim, name), name
+
+
+@pytest.mark.parametrize("module", ON_READ_MONOTONIC)
+class TestTheFromImportForm:
+    def test_monotonic_takes_the_lp_clock(self, module, lp_clock):
+        assert importlib.import_module(module).monotonic() == 7.25
+
+    def test_with_no_runtime_it_calls_time_monotonic(self, module, monkeypatch):
+        monkeypatch.setattr(time, "monotonic", lambda: 3.5)
+        assert importlib.import_module(module).monotonic() == 3.5
 
 
 def test_a_patched_shim_name_patches_time_and_its_undo_restores_the_lp_read(

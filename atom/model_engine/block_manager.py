@@ -46,7 +46,7 @@ from atom.model_engine.state_runtime import (
     snap_midstep_position,
 )
 from atom.utils import envs
-from atom.utils import time_shim as time
+from atom.utils.time_shim import read_monotonic as monotonic
 
 logger = logging.getLogger("atom")
 
@@ -2031,7 +2031,7 @@ class BlockManager:
         """
         if timeout_s <= 0 or not self._orphan_load_slots:
             return 0
-        cutoff = time.monotonic() - timeout_s
+        cutoff = monotonic() - timeout_s
         reclaimed = 0
         for req_id in list(self._orphan_load_slots):
             parked = self._orphan_load_slots[req_id]
@@ -3246,7 +3246,7 @@ class BlockManager:
             # scratch is nobody's destination and goes back regardless.
             if seq.offload_joint.load_hash != -1 and self.state_offload is not None:
                 self._orphan_load_slots.setdefault(seq.id, []).append(
-                    (seq.state_slot, time.monotonic())
+                    (seq.state_slot, monotonic())
                 )
                 # Abandoned, not failed: an abort says nothing about the bytes,
                 # and forgetting the hash would cost the next request over this
