@@ -112,6 +112,13 @@ CLOCK_READS_THAT_FIRE = {
         "import time\n\n\nclass A:\n    def g(self):\n        return time.time()\n",
         "engine.py:6  time.time  in g",
     ),
+    "stdlib-beside-the-shim": (
+        (
+            "from atom.utils import time_shim as time\nimport time as wall\n\n\n"
+            "def f():\n    return time.monotonic() + wall.monotonic()\n"
+        ),
+        "engine.py:6  time.monotonic  in f",
+    ),
 }
 
 #: Calls whose name ends in a listed one and which are not it. Each is a
@@ -123,6 +130,10 @@ CLOCK_READS_THAT_ARE_NOT = {
     "another-package": "from mypkg import time\n\n\ndef f():\n    return time.monotonic()\n",
     "relative-module": "from . import time\n\n\ndef f():\n    return time.monotonic()\n",
     "relative-name": "from .time import monotonic\n\n\ndef f():\n    return monotonic()\n",
+    "the-time-shim": (
+        "from atom.utils import time_shim as time\n\n\ndef f():\n"
+        "    return time.time() + time.monotonic() + time.perf_counter()\n"
+    ),
 }
 
 

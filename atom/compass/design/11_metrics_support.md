@@ -68,7 +68,7 @@ await asyncio.sleep(interval)     # ATOM_METRICS_UPDATE_INTERVAL_S
 await step()                      # _refresh_metrics_once
 
 # AtomMetricsExporter.update (atom/metrics/exporter.py)
-self._last_refresh = clock.now(time.time)   # "when was this snapshot taken", returned by read()
+self._last_refresh = time.time()   # through atom.utils.time_shim; "when was this snapshot taken", returned by read()
 ```
 
 **Decision (owner ruling, 2026-10-02): the push and the refresh are timers on simulated
@@ -395,7 +395,7 @@ D72's "valid by construction" holds today, except two frontend clock reads, both
 clock under simulation. `atom:metrics_last_refresh_timestamp_seconds` is **T**: it exports
 `_last_refresh`, a simulated instant (D72). `atom:stream_longest_silence_seconds` is **D**:
 `longest_silence_seconds` (`atom/entrypoints/openai/streaming_dispatch.py`) subtracts two
-`clock.now(time.monotonic)` reads, so it is a simulated duration (`01` D5). The classes
+`time.monotonic()` reads through `atom.utils.time_shim`, so it is a simulated duration (`01` D5). The classes
 exist so that the next metric is classified rather than assumed.
 
 ### How the Prometheus types map — note that one type spans several classes
