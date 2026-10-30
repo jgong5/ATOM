@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 """The server driver's lifecycle, against a planted server command that records
 its arguments, starts a child and answers ``/health``; the GPU checks run with
-`test_drive_gpu.py`'s planted ``rocm-smi`` and ``rocminfo``. A refusal test's
-planted server exits at once, so a refusal that regresses fails the test
-rather than hanging it.
+`test_drive_gpu.py`'s planted ``rocm-smi``, ``rocminfo`` and ``preflight.sh``,
+in this process and in a driver's own. A refusal test's planted server exits
+at once, so a refusal that regresses fails the test rather than hanging it.
 """
 
 import json
@@ -64,13 +64,15 @@ if when == "late":
 server.serve_forever()
 """
 #: Starts `serve` on GPU 7 in a process of its own: the planted server, the
-#: directory, then ATOM's arguments.
+#: directory, then ATOM's arguments. The fixture's planted `preflight.sh` comes
+#: in `PLANTED_PREFLIGHT`, since the real one's census reads this host's load.
 DRIVE = """\
-import sys
-from atom.compass.drive import serve
+import os, sys
+from atom.compass.drive import gpu, serve
 serve.SERVER = (sys.executable, sys.argv[1])
 serve.identity = lambda *args: {"identity": "planted"}
 serve.KFD = serve.Path(sys.argv[2], "kfd")
+gpu.PREFLIGHT = serve.Path(os.environ["PLANTED_PREFLIGHT"])
 serve.serve(sys.argv[3:], sys.argv[2], (7,))
 """
 ARGS = ["--model", "m", "-tp", "2", "--kv-transfer-config", '{"kv_role": "x"}']
@@ -83,6 +85,7 @@ def planted(tmp_path, monkeypatch):
     records what it is called with and whether the server's child, in its
     process group, still runs."""
     _plant(tmp_path, monkeypatch, FREE)
+    monkeypatch.setenv("PLANTED_PREFLIGHT", str(drive_gpu.PREFLIGHT))
     (tmp_path / "planted.py").write_text(PLANTED)
     monkeypatch.setattr(serve, "SERVER", (sys.executable, str(tmp_path / "planted.py")))
     monkeypatch.setenv("PLANTED_DIR", str(tmp_path))
