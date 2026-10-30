@@ -28,10 +28,10 @@ forward writes is written from ids spread over each token's compressed rows
 an activation is random at its shape, dtype and stride, except a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
 experts' ids ATOM fuses into them (`_route`), the `NM_OUTPUT` slot at
-one KV split, a view at the start of twice its span, and aiter's decode
-top-k scratch (`TOPK_WORKSPACE`), one byte in the graph, at the bytes
-aiter's own query sizes on the device for the call's rows, row stride and
-k; a weight is random at its
+one KV split, a view at the start of twice its span, and aiter's top-k
+scratch (`TOPK_WORKSPACE`), one byte in the graph, built as aiter builds it
+on the device for the call's rows, row stride, k and path
+(`_topk_workspace`); a weight is random at its
 shape, dtype and stride, one tensor per occurrence of the leaf in the step;
 a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
@@ -187,7 +187,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 19
+PROTOCOL = 20
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -287,10 +287,14 @@ V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
 #: the span, and past an exact buffer kills the process (aiter defect, #1977).
 NM_OUTPUT = (_NM, "output")
-#: The scratch aiter's decode top-k sizes by a host query into a module built
-#: for the device, which the capture answers 0 (`capture.forward._patches`),
-#: so a graph holds one byte. A point records the bytes it launched.
-TOPK_WORKSPACE = ("aiter._top_k_per_row_decode.default", "workspace")
+#: aiter's top-k leaves, each with whether it is the decode one, whose
+#: `workspace` aiter sizes by host queries into a module built for the
+#: device, which the capture answers 0 (`capture.forward._patches`), so a
+#: graph holds one byte. A point records the bytes it launched.
+TOPK_WORKSPACE = {
+    "aiter._top_k_per_row_decode.default": True,
+    "aiter._top_k_per_row_prefill.default": False,
+}
 #: The field of a per-request state layer of ATOM's KV registry that a decode
 #: row's leaf reads and writes at every state slot the row holds: GDN's and
 #: KDA's recurrent state, which their spec-decode kernel takes with each row's
@@ -961,8 +965,8 @@ class Stub:
             forward_context._forward_context = forward_context.ForwardContext()
         medians = statistics.median(cold), warm and statistics.median(warm)
         scratch = {}
-        if op["op"] == TOPK_WORKSPACE[0]:
-            scratch["workspace_bytes"] = calls[0][0][TOPK_WORKSPACE[1]].nbytes
+        if op["op"] in TOPK_WORKSPACE:
+            scratch["workspace_bytes"] = calls[0][0]["workspace"].nbytes
         return scratch | {
             "kernels": kernels,
             "cold_ns": medians[0],
@@ -1022,14 +1026,15 @@ class Stub:
                 and old is not None
             ):
                 return old
-            if (op["op"], path) == TOPK_WORKSPACE:
-                from aiter.ops import topk
-
+            if path == "workspace" and op["op"] in TOPK_WORKSPACE:
                 rows, stride, k = (
                     build(s, op["args"][s], None) for s in ("numRows", "stride0", "k")
                 )
-                size = topk.topk_ob_workspace_size(rows, stride, k, True)
-                return topk.get_topk_scratch_workspace(self.runner.device, size)
+                # a capture leaves out a trailing argument at its default
+                stable = op["args"].get("stable", False)
+                return _topk_workspace(
+                    op["op"], rows, stride, k, stable, self.runner.device
+                )
             if _ref(value):
                 key, module = instance[path], "module" in value
                 held = (
@@ -1584,6 +1589,23 @@ def _together() -> None:
     torch.distributed.barrier(group=group)
     device, flag = get_world_group().device_group, torch.zeros(1, device="cuda")
     torch.distributed.all_reduce(flag, group=device)
+
+
+def _topk_workspace(name, rows, stride, k, stable, device) -> torch.Tensor:
+    """The `workspace` aiter's top-k leaf `name` launches with on `device`
+    for `rows` rows at row stride `stride` and `k`, as aiter's wrappers build
+    it: on the multi-block path, which a prefill takes unless `stable` where
+    the device's `topk_use_mulblocks` says so, aiter's cached buffer, zeroed
+    once and reset by its kernel after each launch; on the one-block path,
+    fresh scratch."""
+    from aiter.ops import topk
+
+    decode = TOPK_WORKSPACE[name]
+    if not (decode or stable) and topk.topk_use_mulblocks(rows, stride):
+        size = topk.topk_mb_workspace_size(rows, stride, k, False)
+        return topk.get_topk_mb_workspace(device, size)
+    size = topk.topk_ob_workspace_size(rows, stride, k, decode)
+    return topk.get_topk_scratch_workspace(device, size)
 
 
 def _span(shape, stride) -> int:
