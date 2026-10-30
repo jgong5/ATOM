@@ -2119,6 +2119,62 @@ def test_v4_nm_output_at_one_kv_split_has_room_for_the_fp32_stride(splits, room)
     assert built.dtype == torch.bfloat16 and ops._room(built) == room
 
 
+@pytest.mark.parametrize("rows, stride, k", [(512, 256, 512), (128, 64, 2048)])
+def test_the_decode_top_k_launches_the_scratch_aiter_sizes_for_its_rows_stride_and_k(
+    rows, stride, k
+):
+    # V4.1-Flash's prefill T=512 B=1 graph holds both calls, each with its
+    # scratch at the one byte the capture's sizing answers; each copy takes
+    # the bytes aiter's own query sizes for the call.
+    from aiter.ops import topk
+
+    def spec(shape, dtype):
+        steps = [shape[1], 1] if len(shape) == 2 else [1]
+        return {"shape": shape, "dtype": dtype, "stride": steps, "role": "activation"}
+
+    args = {
+        "logits": spec([rows, stride], F32),
+        "next_n": 1,
+        "seqLens": spec([rows], "torch.int32"),
+        "indices": spec([rows, k], "torch.int32"),
+        "numRows": rows,
+        "stride0": stride,
+        "stride1": 1,
+        "k": k,
+        "workspace": spec([1], "torch.uint8"),
+        "stable": True,
+    }
+    op = {"op": "aiter._top_k_per_row_decode.default", "args": args}
+    asked, graphs = [], []
+
+    def size(*query):  # aiter's query, which needs a device
+        asked.append(query)
+        return 16 * query[0] * query[1]
+
+    def replay(fn, calls, flush=None):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    with (
+        patch.object(topk, "topk_ob_workspace_size", side_effect=size),
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        record = stub._time(op, "sig", [{}], 2)
+
+    want = 16 * rows * stride
+    assert set(asked) == {(rows, stride, k, True)}
+    launched = {id(kwargs["workspace"]): kwargs["workspace"] for kwargs, _ in graphs[0]}
+    assert len(launched) == 2  # a scratch of its own each cold copy
+    for scratch in launched.values():
+        assert (scratch.dtype, scratch.shape) == (torch.uint8, (want,))
+        assert scratch.device == _Runner.device
+    assert record["workspace_bytes"] == want
+
+
 def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
     monkeypatch,
 ):
