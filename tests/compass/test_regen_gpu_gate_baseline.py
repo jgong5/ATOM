@@ -84,7 +84,10 @@ def _setup(tmp_path):
     _git(base, "archive", "--prefix=ATOM/", "-o", str(tmp_path / "base.tar"), "HEAD")
 
     root = tmp_path / "ATOM"
-    shutil.copytree(REPO / COMPASS, root / COMPASS)
+    # Another gate shard may be writing bytecode into __pycache__ as this copies.
+    shutil.copytree(
+        REPO / COMPASS, root / COMPASS, ignore=shutil.ignore_patterns("__pycache__")
+    )
     artifacts = REPO / "atom" / "compass" / "artifacts"
     _write(
         root,

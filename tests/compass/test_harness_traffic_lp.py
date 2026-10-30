@@ -698,7 +698,12 @@ def test_a_raising_return_callback_does_not_stop_later_returns(tmp_path, caplog)
 
 
 def test_a_second_send_credit_call_site_refuses_the_package(tmp_path):
-    shutil.copytree(Path(aiperf.__file__).parent, tmp_path / "aiperf")
+    # Another gate shard may be writing bytecode into __pycache__ as this copies.
+    shutil.copytree(
+        Path(aiperf.__file__).parent,
+        tmp_path / "aiperf",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     fingerprint.check(tmp_path)
     path = tmp_path / "aiperf" / "timing" / "intervals.py"
     path.write_text(

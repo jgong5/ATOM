@@ -45,10 +45,14 @@ socket.socket.bind = plant
 
 
 def _hold(port=0):
-    """A socket bound to port, or to a free one for 0, that a planted bind can share."""
+    """A socket bound to port, or to a free one for 0, that a planted bind can share.
+
+    It binds every address, as the port pick does: a port free on loopback can
+    be held on another of the host's addresses, where the pick's bind is refused.
+    """
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    s.bind(("127.0.0.1", port))
+    s.bind(("", port))
     return s
 
 
