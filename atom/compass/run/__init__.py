@@ -363,6 +363,93 @@ def _fitted_here(listed: list, here: dict, engine, what: str) -> dict:
     raise ValueError(f"no {what} entry was fitted under this engine config: {named}")
 
 
+#: How each run-file key that repeats, one entry per engine config, reads the
+#: engine config an entry was fitted under.
+FITTED_UNDER = {
+    STEP_LINEAR: lambda e: e.get("engine_config"),
+    "host": lambda e: e.get("key", {}).get("engine"),
+}
+
+
+def pick_fitted(run: dict, name: str, config) -> None:
+    """Replace the run file's `name` entries, when a list, by the one fitted
+    under `config`'s engine config (`_fitted_here`)."""
+    if isinstance(run.get(name), list):
+        from atom.compass.run.step_grid import keyed
+
+        run[name] = _fitted_here(run[name], keyed(config), FITTED_UNDER[name], name)
+
+
+def refuse_unfitted_law(run: dict, config) -> None:
+    """Refuse the run file's step linear law where `config` is not what it was
+    fitted under: TP width 1, its engine config, context-parallel width 1, and
+    its machine spec, which the run file's must be."""
+    from atom.compass.artifacts import machine_spec_digest, machine_spec_key
+    from atom.compass.run.step_grid import differ, keyed
+
+    law, tp = run[STEP_LINEAR], config.tensor_parallel_size
+    if tp != 1:
+        raise ValueError(
+            "a step linear law is fitted on one rank of tensor-parallel width "
+            f"1, and this run has tensor_parallel_size {tp}"
+        )
+    if "engine_config" not in law:
+        raise ValueError(
+            "the step linear law states no engine_config, the engine config "
+            "it was fitted under, so no run can check its parallel layout"
+        )
+    if named := differ(law["engine_config"], keyed(config), "the law"):
+        raise ValueError(
+            "the step linear law was fitted under another engine config: "
+            + "; ".join(named)
+        )
+    refuse_context_parallel(STEP_LINEAR, config)
+    machine = _machine(run)
+    here = machine_spec_digest(machine)
+    if (fitted_on := law.get("machine_spec")) != here:
+        raise ValueError(
+            f"the step linear law was fitted on machine spec {fitted_on} and this "
+            f"run's is {here}, {machine_spec_key(machine)}; a law measured "
+            "on one platform is no evidence about another"
+        )
+
+
+def refuse_context_parallel(name: str, config) -> None:
+    """Refuse a context-parallel `config` for the run file's `name`, a law or a
+    bundle: neither's engine config states a context-parallel width."""
+    cp = {
+        width: getattr(config, width)
+        for width in ("prefill_context_parallel_size", "decode_context_parallel_size")
+        if getattr(config, width) != 1
+    }
+    if cp:
+        raise ValueError(
+            f"the run file's {name} is measured at context-parallel width 1 and "
+            "states no context-parallel width, and this run has "
+            + " and ".join(f"{width} {n}" for width, n in cp.items())
+        )
+
+
+def refuse_unfitted_host(host: dict, config, platform: str) -> None:
+    """Refuse the run file's host laws `host` when fitted under another host
+    key than this run's, on the machine spec of digest `platform`."""
+    ours = host.get("laws") and {**host_key(config), "machine_spec": platform}
+    theirs = host.get("key") or {}
+    if ours and theirs != ours:
+        differ = [k for k in ours if theirs.get(k) != ours[k]]
+        if isinstance(engine := theirs.get("engine"), dict):
+            mine = ours["engine"]
+            differ = [k for k in differ if k != "engine"] + [
+                f"engine.{n}"
+                for n in sorted(mine.keys() | engine.keys())
+                if engine.get(n) != mine.get(n)
+            ]
+        raise ValueError(
+            f"the run file's host laws were fitted under another {differ}; "
+            f"this run's key is {ours}, and theirs is {theirs}"
+        )
+
+
 _authority: "_RecordingAuthority | None" = None
 #: The co-hosted authority's early-end writer.
 _early_end: threading.Thread | None = None
@@ -1361,7 +1448,7 @@ def runner(model_runner, tree) -> None:
     run = spec()
     if run is None:
         return
-    from atom.compass.artifacts import machine_spec_digest, machine_spec_key
+    from atom.compass.artifacts import machine_spec_digest
     from atom.compass.backends.geometry import Parallelism
     from atom.compass.backends.step_linear import StepLinearBackend, StepLinearLaw
     from atom.compass.backends.step_roofline import (
@@ -1380,15 +1467,8 @@ def runner(model_runner, tree) -> None:
     config = model_runner.config
     tp = config.tensor_parallel_size
     refuse_renamed_keys(run, "the run file")
-    engines = {
-        STEP_LINEAR: lambda e: e.get("engine_config"),
-        "host": lambda e: e.get("key", {}).get("engine"),
-    }
-    for name, engine in engines.items():
-        if isinstance(run.get(name), list):
-            from atom.compass.run.step_grid import keyed
-
-            run[name] = _fitted_here(run[name], keyed(config), engine, name)
+    for name in FITTED_UNDER:
+        pick_fitted(run, name, config)
     backends = (STEP_STUB, STEP_LINEAR, STEP_GRID, OP_GRAPH)
     keys = [k for k in backends if k in run]
     if len(keys) != 1:
@@ -1412,29 +1492,11 @@ def runner(model_runner, tree) -> None:
         side = {"P": "prefill", "D": "decode"}.get(name[:1], "") + name[1:]
         replay = ReplayHost(Path(run["replay"]) / side, dp_rank, stage)
     if STEP_LINEAR in run:
-        if tp != 1:
-            raise ValueError(
-                "a step linear law is fitted on one rank of tensor-parallel width "
-                f"1, and this run has tensor_parallel_size {tp}"
-            )
+        refuse_unfitted_law(run, config)
         # Under DP-attention every rank runs at TP 1, and experts shard over the group.
         dpa = config.enable_dp_attention
         dp = config.parallel_config.data_parallel_size if dpa else 1
-        law = run[STEP_LINEAR]
-        backend = StepLinearBackend(StepLinearLaw(law), dp)
-        if "engine_config" in law:
-            from atom.compass.run.step_grid import differ, keyed
-
-            if named := differ(law["engine_config"], keyed(config), "the law"):
-                raise ValueError(
-                    "the step linear law was fitted under another engine "
-                    "config: " + "; ".join(named)
-                )
-        else:
-            raise ValueError(
-                "the step linear law states no engine_config, the engine config "
-                "it was fitted under, so no run can check its parallel layout"
-            )
+        backend = StepLinearBackend(StepLinearLaw(run[STEP_LINEAR]), dp)
     elif STEP_STUB in run:
         # A pipeline stage is priced for its own span of the stack, the span
         # ATOM's `make_layers` builds it from.
@@ -1462,31 +1524,13 @@ def runner(model_runner, tree) -> None:
             stack_layers=end - start,
             stage_share=share,
         )
-    # Neither a law's nor a bundle's engine config states a context-parallel width.
-    cp = {
-        name: getattr(config, name)
-        for name in ("prefill_context_parallel_size", "decode_context_parallel_size")
-        if getattr(config, name) != 1
-    }
-    if cp and keys[0] in (STEP_LINEAR, STEP_GRID):
-        raise ValueError(
-            f"the run file's {keys[0]} is measured at context-parallel width 1 and "
-            "states no context-parallel width, and this run has "
-            + " and ".join(f"{name} {width}" for name, width in cp.items())
-        )
     machine = _machine(run)
     platform = machine_spec_digest(machine)
-    fitted_on = run.get(STEP_LINEAR, {}).get("machine_spec")
-    if STEP_LINEAR in run and fitted_on != platform:
-        raise ValueError(
-            f"the step linear law was fitted on machine spec {fitted_on} and this "
-            f"run's is {platform}, {machine_spec_key(machine)}; a law measured "
-            "on one platform is no evidence about another"
-        )
     bundle = None
     if STEP_GRID in run:
         from atom.compass.run.step_grid import load
 
+        refuse_context_parallel(STEP_GRID, config)
         backend, bundle = load(run[STEP_GRID], config, machine)
     if "store" not in run:
         raise ValueError(
@@ -1557,21 +1601,7 @@ def runner(model_runner, tree) -> None:
             model_runner.compass_block_file = _block_file(now)
         slot = np.memmap(now, np.float64, "r", shape=(1,))
         host = run.get("host", {})
-        ours = host.get("laws") and {**host_key(config), "machine_spec": platform}
-        theirs = host.get("key") or {}
-        if ours and theirs != ours:
-            differ = [k for k in ours if theirs.get(k) != ours[k]]
-            if isinstance(engine := theirs.get("engine"), dict):
-                mine = ours["engine"]
-                differ = [k for k in differ if k != "engine"] + [
-                    f"engine.{n}"
-                    for n in sorted(mine.keys() | engine.keys())
-                    if engine.get(n) != mine.get(n)
-                ]
-            raise ValueError(
-                f"the run file's host laws were fitted under another {differ}; "
-                f"this run's key is {ours}, and theirs is {theirs}"
-            )
+        refuse_unfitted_host(host, config, platform)
         pp = getattr(config, "pipeline_parallel_size", 1)
         stage = (config.parallel_config.pipeline_parallel_rank, pp) if pp > 1 else None
         # A drafter's runner waits for the last output's MTP status when it
@@ -1842,16 +1872,23 @@ def tokenizer(tok, config) -> None:
     run = spec()
     if run is None:
         return
-    from atom.compass.spec import Backend
     from atom.utils.compass_loop import wrap_decode, wrap_encode
 
-    entry = _machine(run).tokenizer_for(
+    entry = tokenizer_entry(_machine(run), tok, config)
+    tok.encode = wrap_encode(tok.encode, entry)
+    tok.decode = wrap_decode(tok.decode, entry)
+
+
+def tokenizer_entry(machine, tok, config):
+    """`machine`'s entry for the tokenizer `tok` that `config`'s model loaded:
+    its architecture's, on the backend that loaded, or a refusal."""
+    from atom.compass.spec import Backend
+
+    return machine.tokenizer_for(
         config.hf_config.architectures[0],
         Backend.FAST if tok.is_fast else Backend.SLOW,
         _fingerprint(tok),
     )
-    tok.encode = wrap_encode(tok.encode, entry)
-    tok.decode = wrap_decode(tok.decode, entry)
 
 
 def http_intake() -> tuple[float, float, float] | None:

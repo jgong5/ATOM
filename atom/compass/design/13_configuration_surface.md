@@ -36,6 +36,10 @@ publishes a `price_list` only (D80).
 Authority; `run --join` joins it, `record --host` binds a routable host, and a client
 finds a deployment through its `server.json` as it finds one server (D80).
 
+**Revised 2026-10-28 by the owner's
+[ruling on #2312](https://github.com/jgong5/ATOM/issues/2312#issuecomment-6462166589):**
+`run --check` lists every input a run lacks before any server starts (D80).
+
 **Depends on:** `05_machine_spec_and_probes.md` D24 (the separation rule this extends),
 and every other topic, each of which contributed a flag.
 
@@ -152,6 +156,7 @@ python -m atom.entrypoints.openai_server <ATOM arguments> \
 | `--step-roofline` | a switch, named by its run-file key `step_roofline`, with no value: the step roofline has no host bound (the owner's ruling on [#1047](https://github.com/jgong5/ATOM/issues/1047)). On, it composes `StepFallbackBackend`: the step roofline (`10` D64) prices the device time of the steps the backend refuses, with the method its inputs give it. A step grid run composes it without the switch (`17` D102) | off; `run.json` records it when on |
 | `--coverage` | `shape_population` keys and `record` directories the backend's coverage check reads before the run starts. An input whose engine states other scheduler bounds, capture ladder or TP size than ATOM's arguments resolve refuses, naming each field that differs and both values (the [#1294 ruling](https://github.com/jgong5/ATOM/issues/1294)); the step grid's check refuses no step, and counts those it extrapolates or declines to the roofline (`17` D99) | off; `run.json` records the check's result, or that none ran |
 | `--join` | tool-only: a deployment's run file, which `scripts/compass/deploy.sh` builds from the flags above and hands every instance; the server joins the authority it names instead of co-hosting one, and every flag above but `--out` is refused beside it (below) | off: the server co-hosts its authority |
+| `--check` | tool-only: resolve the run file and the configuration ATOM's arguments give, start no server or authority and write no `--out`, and print every missing or stale input, each with the refusal the run meets and the command that makes it, exiting 1 if any (the [ruling on #2312](https://github.com/jgong5/ATOM/issues/2312#issuecomment-6462166589)). Coverage gaps, an absent price list and the modules the step roofline leaves unclassified print apart, outside the exit status. Refused beside `--join` | off: the run serves |
 
 `run` reads the `memory_readings` entry for its configuration (`07` D41) and refuses when
 there is none, naming the configuration. `compass measure memory` takes it; for a device
@@ -212,6 +217,7 @@ compass fit host       RECORD... --client-run RECORD EXPORT... --machine M \
 compass fit ops        MEASURED... --out D --store S
 compass run            <backend> --machine M  --out D --store S -- <ATOM args>
 compass run            --join RUN_FILE        --out D -- <ATOM args>
+compass run            <backend> --machine M  --store S --check -- <ATOM args>
 compass project        --model MODEL [--tp N] --machine M --store S RECORD... \
                        [-- RECORD <ATOM args>]...
 
@@ -466,7 +472,7 @@ have changed.
 |---|---|---|
 | D78 | Three homes. A setting is Compass's only if it would be meaningless in a real ATOM run — which keeps the surface small by construction. | 2026-09-19 |
 | D79 | Precedence is CLI > artifact > **refuse**, with no environment level. No silent default for anything that changes a predicted number. The resolved configuration is echoed into every artifact. The run file `compass run` writes is its transport to ATOM, not a config file. | 2026-09-19; run file 2026-10-13 (#851); no environment level 2026-10-14 (#851) |
-| D80 | A simulated serve is configured by `compass run`'s flags, handed to ATOM's server in a run file by `--compass-run`. One `compass` entry, the only way users reach Compass, with the toolchain's commands: `record`, `trace steps\|ops`, `measure steps\|ops\|memory`, `fit steps\|ops\|host` and `run`, sharing ATOM's arguments after `--`, `--out` and `--store`, one step-record format, `run.json` and the GPU refusals; no command starts the client or takes a workload. One `record` or `run` serves one instance to any number of client runs, and a record splits per client run by its requests. `run` records what grading reads, and grading decides whether a run is gradeable. The commands first listed are deprecated and removable, each with where its work went; developers' quality tooling stays outside the CLI. Non-flags audited and recorded. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); backend flags named 2026-10-14 (#952); the step roofline setting made a switch 2026-10-15 (#1047); `trace ops` per shape, `op_measurement`, `fit ops` publishes a `price_list` only 2026-10-18 (#1489); several instances started by `scripts/compass/deploy.sh`, `run --join` and `record --host` 2026-10-19 (#1031) |
+| D80 | A simulated serve is configured by `compass run`'s flags, handed to ATOM's server in a run file by `--compass-run`. One `compass` entry, the only way users reach Compass, with the toolchain's commands: `record`, `trace steps\|ops`, `measure steps\|ops\|memory`, `fit steps\|ops\|host` and `run`, sharing ATOM's arguments after `--`, `--out` and `--store`, one step-record format, `run.json` and the GPU refusals; no command starts the client or takes a workload. One `record` or `run` serves one instance to any number of client runs, and a record splits per client run by its requests. `run` records what grading reads, and grading decides whether a run is gradeable. The commands first listed are deprecated and removable, each with where its work went; developers' quality tooling stays outside the CLI. Non-flags audited and recorded. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); backend flags named 2026-10-14 (#952); the step roofline setting made a switch 2026-10-15 (#1047); `trace ops` per shape, `op_measurement`, `fit ops` publishes a `price_list` only 2026-10-18 (#1489); several instances started by `scripts/compass/deploy.sh`, `run --join` and `record --host` 2026-10-19 (#1031); `run --check` 2026-10-28 (#2312) |
 | D81 | The resolved configuration is part of every artifact, by value and never by reference. | 2026-09-19 |
 
 ---
