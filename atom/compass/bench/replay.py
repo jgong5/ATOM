@@ -30,8 +30,12 @@ them the same way for every line:
 - Every token of row i is the filler id `DeferredTokenStream` reports for a
   request numbered i, out of the ids `filler_token_ids` keeps for the model's
   tokenizer, as the simulated runner keeps them.
-- Under a model that keeps per-request state, row i holds state slot i of a
-  fresh pool, or that many past the slot `batch` is given.
+- Under a model that keeps per-request state, each row holds the state slots
+  ATOM's block manager gives a live request, as many as the workers'
+  `get_num_blocks` reply states (`state_slots_per_request`): one, or under a
+  GDN model's drafter of K drafts without ReplaySSM 1 + K. They are
+  contiguous, row after row, from slot 0 of a fresh pool or from the slot
+  `batch` is given.
 - A prefill line that produces output has every row on its final chunk, one
   that does not has none: a line does not say which of its chunks ends a
   prompt, and ATOM's runner samples every row of a step that produces output.
@@ -51,6 +55,7 @@ import numpy as np
 
 from atom.compass.runner.step_output import filler_token_ids
 from atom.model_engine.block_manager import draft_kv_lookahead
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.llm_engine import InputOutputProcessor, _load_tokenizer
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import (
@@ -61,13 +66,22 @@ from atom.model_engine.sequence import (
 from atom.sampling_params import SamplingParams
 
 NAME = "fresh-contiguous"
-VERSION = 2
+VERSION = 3
+
+
+def state_slots_per_request(config) -> int:
+    """The state slots ATOM's block manager gives a live request under
+    `config`, read as it reads them: the per-request entries the workers'
+    `get_num_blocks` reply carries, one where it states none."""
+    per_req = getattr(config, "pool_entries_per_req", None) or {}
+    return int(per_req.get(STATE_SLOT_CLASS, 1)) or 1
 
 
 class ReplayRule:
     """The rule for one engine configuration: its tokenizer, block size, KV
-    pool, drafter, and whether its model keeps per-request state; and for the
-    request parameters `sampling` states, as `SamplingParams` fields."""
+    pool, drafter, whether its model keeps per-request state and the state
+    slots a request holds; and for the request parameters `sampling` states,
+    as `SamplingParams` fields."""
 
     def __init__(self, config, sampling: dict | None = None) -> None:
         self.sampling = SamplingParams(**(sampling or {}))
@@ -88,6 +102,7 @@ class ReplayRule:
             config.hf_config.model_type
             in InputOutputProcessor._per_req_cache_model_types()
         )
+        self.slots_per_row = state_slots_per_request(config)
         spec = config.speculative_config
         self.drafts = spec.num_speculative_tokens if spec else 0
         self.lookahead = draft_kv_lookahead(self.drafts)
@@ -142,7 +157,8 @@ class ReplayRule:
             seq.block_table = new_block_table([*prefix, *range(block, block + own)])
             block += own
             if self.stateful:
-                seq.state_slots = [slot + i]
+                first = slot + i * self.slots_per_row
+                seq.state_slots = list(range(first, first + self.slots_per_row))
             seqs[seq.id] = seq
         if block > self.num_blocks:
             raise ValueError(

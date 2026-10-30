@@ -576,8 +576,9 @@ without a scheduler: `model_runner.py::ModelRunner.dummy_execution` and
 - **Replayed by rule.** A batch arrives as a step-record line (`13` D80), its rows in
   order with their query and context tokens, and is rebuilt by a fixed, versioned rule:
   row order kept, each row's KV blocks contiguous from a fresh pool in row order, filler
-  tokens, a fresh state slot per row that keeps one. Each measurement records the rule's
-  version. Whether that reproduces the recorded step's forward context is T18.
+  tokens, and a row that keeps state the fresh state slots ATOM's block manager gives a
+  request: one, or 1 + K under a GDN model's drafter of K drafts without ReplaySSM. Each
+  measurement records the rule's version. Whether that reproduces the recorded step's forward context is T18.
 
 ```
   record, trace steps;              the step bench (GPU): EngineCore's
