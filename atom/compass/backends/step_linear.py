@@ -25,7 +25,16 @@ segment is priced as if routing spread tokens evenly over the experts, which
 no feature carries. A run refuses a law whose
 `machine_spec` is not its spec's `machine_spec_digest`, naming both.
 
-A decode vector may add `rowmod`, `rowmod(k)` over its rows in scheduled
+A decode vector may add `moe_experts`, the routed experts the step's real MoE
+tokens are expected to reach, `E (1 - (1 - K/E)^n)` for the law's `moe_routing`
+`{"experts": E, "top_k": K}` and `n` real tokens: a data-parallel group's
+gathered tokens (`BatchView.moe_tokens`), or on one rank, which states none, the
+step's own. The gather pads every rank to the rung, and a pad row reaches no
+expert (before #2340, the one expert set of token 0), so at one rung the
+experts whose weights the MoE reads follow the group's real tokens, which an
+uneven spread over the ranks leaves well below the rung's rows. A law whose
+decode vector carries the column and that states no `moe_routing` is refused.
+After it a decode vector may add `rowmod`, `rowmod(k)` over its rows in scheduled
 order: the largest summed N_KV over the rows `i = r (mod k)`, with `k` the
 vector's `"rowmod"` entry. It prices an order the same multiset of rows can
 take at a different cost; `rowmod(1)` is Sum N_KV.
@@ -68,6 +77,7 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
      "machine_spec": "sha256:<hex>",
      "prefill": VECTOR,
      "decode": {"eager": VECTOR, "1": VECTOR, "2": VECTOR, ...},
+     "moe_routing": {"experts": E, "top_k": K},   # with a moe_experts column
      "draft": {"provenance": ..., "prefill": VECTOR, "decode": {...},
                "propose": VECTOR, "draft_kv": VECTOR,
                "output_prefill_kv": true}}   # all three optional
@@ -104,10 +114,13 @@ from atom.compass.backends.shape import (
     sum_query_square,
     sum_tokens,
 )
+from atom.compass.backends.work import activated_experts
 
 PREFILL = ("step", "tokens", "query_square", "query_cached")
 HISTORY = PREFILL + ("history",)
 DECODE = ("step", "context", "graph_padding")
+#: The decode vector's optional features, in the order they follow `DECODE`.
+DECODE_EXTRA = ("moe_experts", "rowmod")
 ROWMOD = DECODE + ("rowmod",)
 PROPOSE = ("step", "seqs")
 EAGER = "eager"
@@ -146,6 +159,16 @@ class _Vector:
             raise ValueError(f"the {name} vector's rowmod modulus is {self.rowmod}")
 
 
+def moe_experts(view: BatchView, experts: int, top_k: int) -> float:
+    """The routed experts `view`'s real MoE tokens are expected to reach: its
+    data-parallel group's tokens, or on one rank, which states none, its own
+    decode rows' tokens, each routed to `top_k` of `experts`."""
+    tokens = view.moe_tokens
+    if tokens is None:
+        tokens = sum_tokens(view.decode)
+    return activated_experts(experts, top_k, tokens)
+
+
 def rowmod(context, k: int) -> int:
     """The largest summed context over rows `i = r (mod k)`, in `context`'s order."""
     return max(sum(context[r::k]) for r in range(min(k, len(context))))
@@ -175,11 +198,20 @@ class StepLinearLaw:
         self.decode = {
             None if rung == EAGER else int(rung): _Vector(
                 f"decode rung {rung}",
-                ROWMOD if "rowmod" in spec["coefficients"] else DECODE,
+                DECODE + tuple(f for f in DECODE_EXTRA if f in spec["coefficients"]),
                 spec,
             )
             for rung, spec in law["decode"].items()
         }
+        routing = law.get("moe_routing")
+        self.moe_routing = routing and (int(routing["experts"]), int(routing["top_k"]))
+        if not self.moe_routing and any(
+            "moe_experts" in v.features for v in self.decode.values()
+        ):
+            raise ValueError(
+                "a decode vector carries moe_experts and the law states no "
+                "moe_routing, the experts and top-k it is counted over"
+            )
         self.draft = StepLinearLaw(law["draft"]) if "draft" in law else None
         self.propose = law.get("propose") and _Vector(
             "propose", PROPOSE, law["propose"]
@@ -272,6 +304,8 @@ class StepLinearBackend(CostBackend):
                     f"no {what}decode vector for rung {EAGER if rung is None else rung}",
                 )
             counts = (1, sum_context(decode), batch_view.graph_padding)
+            if "moe_experts" in vector.features:
+                counts += (moe_experts(batch_view, *law.moe_routing),)
             if vector.rowmod:
                 counts += (rowmod([r.context_tokens for r in decode], vector.rowmod),)
         terms, kv = self._priced(law, vector, kind, counts, what), []
