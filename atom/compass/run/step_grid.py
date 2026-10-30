@@ -61,12 +61,9 @@ from atom.compass.artifacts import (
     GateState,
     Key,
     Kind,
-    Reading,
     Row,
     Topology,
-    git_tree_root,
     machine_spec_key,
-    module_root,
 )
 from atom.compass.backends.step_grid import StepGrid, StepGridBackend
 from atom.compass.backends.step_grid_fit import VALUE
@@ -131,13 +128,13 @@ def differ(there: dict, here: dict, where: str) -> list[str]:
 
 
 def conditions(config, machine) -> Conditions:
-    """This run's readings: `readings` of this process's ATOM tree, the served
-    config.json and `keyed`."""
-    from atom.compass.run import _file_digest
+    """This run's readings: `readings` of this process's ATOM source, the
+    served config.json and `keyed`."""
+    from atom.compass.run import _file_digest, atom_source
 
     return readings(
         machine,
-        atom_src=Reading.of_source_root(git_tree_root("atom", module_root("atom"))),
+        atom_src=atom_source(),
         model=_file_digest(config.model, "config.json"),
         engine_config=json.dumps(keyed(config), sort_keys=True),
     )
@@ -145,7 +142,7 @@ def conditions(config, machine) -> Conditions:
 
 def readings(machine, **inputs) -> Conditions:
     """The readings a run on `machine` takes: the stack, torch included, and the
-    device the spec states, and this host's CPU; `inputs` state the ATOM tree,
+    device the spec states, and this host's CPU; `inputs` state the ATOM source,
     the model and the engine config."""
     from atom.compass.run import host_cpu
 
