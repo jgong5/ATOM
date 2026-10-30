@@ -209,7 +209,13 @@ def _features(
                 key = _rung_key(view.capture_rung)
                 counts = (1, sum_context(view.decode), view.graph_padding)
                 if routing:
-                    counts += (moe_experts(view, *routing),)
+                    reached = moe_experts(view, *routing)
+                    if reached is None:
+                        raise ValueError(
+                            f"{s.provenance['run']} step {s.step} has no moe_tokens, "
+                            "which a data-parallel law's moe_experts reads"
+                        )
+                    counts += (reached,)
             context = tuple(r.context_tokens for r in view.decode)
             rows.append((key, counts, s.device_s, s.step, context))
     return rows, cut

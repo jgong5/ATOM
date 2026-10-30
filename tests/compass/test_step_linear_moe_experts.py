@@ -9,6 +9,7 @@ Each rank's record is written from a known per-rank law with a `moe_experts`
 slope, every line labelled with the group's step, as in `test_step_linear_dp`.
 """
 
+import dataclasses
 import json
 
 import numpy as np
@@ -17,6 +18,7 @@ from test_backend_step_linear_fit import SPEC, _fit, _record, _steps
 
 from atom.compass.backends import (
     BatchView,
+    CostRefused,
     RequestShape,
     StepLinearBackend,
     StepLinearLaw,
@@ -149,6 +151,24 @@ def test_on_one_rank_the_column_reads_the_steps_own_tokens(cells):
     terms = {t.name: t.seconds for t in backend.price(BatchView(rows, RUNG)).terms}
     reached = activated_experts(*ROUTING, 3)
     assert terms["decode.moe_experts"] == pytest.approx(reached * LAW["moe_experts"])
+
+
+def test_a_data_parallel_step_stating_no_group_tokens_is_refused_not_priced_alone(
+    cells,
+):
+    """A rank's own tokens are a fraction of its group's: the backend refuses
+    a data-parallel step without `moe_tokens`, and the fit names it."""
+    full, sparse = cells
+    law, samples, options = _routed(full + sparse)
+    backend = StepLinearBackend(StepLinearLaw(law), DP)
+    contexts = (180_000, 20_000, 30_000, 40_000)
+    with pytest.raises(CostRefused, match="no MoE group tokens on this step"):
+        backend.price(_view(contexts, None))
+    at = next(i for i, s in enumerate(samples) if not s.cut)
+    view = dataclasses.replace(samples[at].view, moe_tokens=None)
+    samples[at] = dataclasses.replace(samples[at], view=view)
+    with pytest.raises(ValueError, match=f"step {samples[at].step} has no moe_tokens"):
+        fit(samples, options)
 
 
 def test_a_law_with_the_column_and_no_routing_refuses(cells):

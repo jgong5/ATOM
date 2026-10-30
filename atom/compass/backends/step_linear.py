@@ -28,8 +28,9 @@ no feature carries. A run refuses a law whose
 A decode vector may add `moe_experts`, the routed experts the step's real MoE
 tokens are expected to reach, `E (1 - (1 - K/E)^n)` for the law's `moe_routing`
 `{"experts": E, "top_k": K}` and `n` real tokens: a data-parallel group's
-gathered tokens (`BatchView.moe_tokens`), or on one rank, which states none, the
-step's own. The gather pads every rank to the rung, and a pad row reaches no
+gathered tokens (`BatchView.moe_tokens`), or on one rank, which has no
+`moe_rows`, the step's own; a data-parallel step stating no `moe_tokens` is
+refused. The gather pads every rank to the rung, and a pad row reaches no
 expert (before #2340, the one expert set of token 0), so at one rung the
 experts whose weights the MoE reads follow the group's real tokens, which an
 uneven spread over the ranks leaves well below the rung's rows. A law whose
@@ -159,14 +160,16 @@ class _Vector:
             raise ValueError(f"the {name} vector's rowmod modulus is {self.rowmod}")
 
 
-def moe_experts(view: BatchView, experts: int, top_k: int) -> float:
-    """The routed experts `view`'s real MoE tokens are expected to reach: its
-    data-parallel group's tokens, or on one rank, which states none, its own
-    decode rows' tokens, each routed to `top_k` of `experts`."""
-    tokens = view.moe_tokens
-    if tokens is None:
-        tokens = sum_tokens(view.decode)
-    return activated_experts(experts, top_k, tokens)
+def moe_experts(view: BatchView, experts: int, top_k: int) -> float | None:
+    """The routed experts `view`'s real MoE tokens are expected to reach, each
+    routed to `top_k` of `experts`: its data-parallel group's tokens, or on one
+    rank, which has no `moe_rows`, its own decode rows' tokens. None for a
+    data-parallel view that states no group tokens."""
+    if view.moe_rows is None:
+        return activated_experts(experts, top_k, sum_tokens(view.decode))
+    if view.moe_tokens is None:
+        return None
+    return activated_experts(experts, top_k, view.moe_tokens)
 
 
 def rowmod(context, k: int) -> int:
@@ -305,7 +308,10 @@ class StepLinearBackend(CostBackend):
                 )
             counts = (1, sum_context(decode), batch_view.graph_padding)
             if "moe_experts" in vector.features:
-                counts += (moe_experts(batch_view, *law.moe_routing),)
+                reached = moe_experts(batch_view, *law.moe_routing)
+                if reached is None:
+                    raise self._refuse(batch_view, "no MoE group tokens on this step")
+                counts += (reached,)
             if vector.rowmod:
                 counts += (rowmod([r.context_tokens for r in decode], vector.rowmod),)
         terms, kv = self._priced(law, vector, kind, counts, what), []
