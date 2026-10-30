@@ -38,7 +38,8 @@ ATOM runs its draft-KV pass, and is cut where that pass starts; under DP
 ATOM runs the drafter's propose in its place, cut where that starts. A block
 drafter runs its draft-KV pass between the target's forward and its sampling,
 before `forward_done_event` on a step that samples: that pass is cut at both
-its ends into a third graph. A decode of fewer rows than its width ran padded to that rung: its rows run
+its ends into a third graph.
+A decode of fewer rows than its width ran padded to that rung: its rows run
 the drafter's first pass, which takes the target's tokens unpadded, and the
 step continues at the rung past the cut; only its drafter's graph is kept. A
 shape's `width` is the batch a step that replays no graph pads to past its
