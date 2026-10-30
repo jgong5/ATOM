@@ -1626,7 +1626,7 @@ the right behaviour. Disabling it was a second mechanism for no gain.
 | Atomesh fan-out request bound, default 5 s (`request_timeout` in `atom/mesh/src/core/worker_manager.rs`) | `--worker-request-timeout-secs` (#478) | set large |
 | Atomesh request bound, default 1800 s: reqwest's total timeout on each request to a worker, its streamed response included (`AppContextBuilder::with_client` in `atom/mesh/src/app_context.rs`) | `--request-timeout-secs` | set to a year by `deploy.sh` and `pd_sim.sh`; a simulated stream outlasted 1800 wall s at c=256 (#2450) |
 
-Those are two Rust bounds. The 30 s `DEFAULT_WORKER_HTTP_TIMEOUT_SECS`
+The 30 s `DEFAULT_WORKER_HTTP_TIMEOUT_SECS`
 (`atom/mesh/src/core/worker.rs`) is never reached: it is the default of a client whose
 only request is the health check, which a simulated launch switches off and which sets
 its own timeout (#477). The fan-out bound bites whenever the CA holds an LP while wall
