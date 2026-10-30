@@ -296,9 +296,11 @@ fit also holds. A decode step that replays no graph, being wider than the widest
 not on this grid and refuses (D99).
 
 **Decode's boundary nodes, per rung `R`.** Each B node's KV limit,
-`c_max(B) = block_size · floor(num_kvcache_blocks / B) - N_Q`, the largest cached context at
+`c_max(B) = block_size · floor(num_kvcache_blocks / B) - N_Q - L`, the largest cached context at
 which `B` decode rows of the decode width `N_Q` (D97) fit the KV pool, is a c node of the
-rung, and so is `max_model_len - N_Q`. A B node, with its own `c_max`, is added at each `B` between the
+rung, and so is `max_model_len - N_Q`. `L` is the positions past a row that a drafter's
+round writes and ATOM allocates with it, `K - 1` under a drafter of draft width `K` and 0
+without one (`model_engine/block_manager.py::draft_kv_lookahead`). A B node, with its own `c_max`, is added at each `B` between the
 previous rung + 1 and `R` that planned shapes reach past `c_max(R)`, so a step past
 `c_max(R)` sits on its own B node, below its own limit.
 
@@ -435,7 +437,7 @@ whole context or a window of it, as V4.1-Flash's does
   bundle's grid definition on every axis (D98).
 - **Past the KV pool, an extrapolation** (#1465's ruling). The bundle records the pool
   the grid was planned for. A decode cell whose every unmeasured corner holds more
-  blocks than that pool at `B` rows of `c + N_Q` tokens is read on each B side along c:
+  blocks than that pool at `B` rows of `c + N_Q + L` tokens is read on each B side along c:
   between its measured corners, or, where a corner is past the pool, from its two highest
   c nodes inside the pool, its measured boundary nodes, extended past them. A B side
   whose extension comes out not positive, as a falling edge can give, declines the step.
