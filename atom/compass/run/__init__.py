@@ -1751,7 +1751,7 @@ def _price_list(run: dict, config, machine):
 def _graph_pool(model_runner, machine, model):
     """What ATOM's `_estimate_cudagraph_overhead` reserves for this deployment:
     nothing under ``enforce_eager``, else the branch the runner's own
-    `_piecewise_cg_active` picks, over the same config fields it reads."""
+    `_tr_hybrid_active` picks, over the same config fields it reads."""
     from atom.compass.memory import (
         PiecewiseCapture,
         capture_token_shapes,
@@ -1762,11 +1762,11 @@ def _graph_pool(model_runner, machine, model):
     config = model_runner.config
     if config.enforce_eager:
         return reserves(enforce_eager=True)
-    if not model_runner._piecewise_cg_active():
+    if not model_runner._tr_hybrid_active():
         return reserves(activations=model.activations)
     if getattr(config, "speculative_config", None):
         raise ValueError(
-            "under a drafter ATOM's piecewise capture reserves for each draft "
+            "under a drafter ATOM's token-graph capture reserves for each draft "
             "q bucket, and its DP token cap, which this mirror does not take"
         )
     hf = config.hf_config
