@@ -36,8 +36,9 @@ it (its passes, the shared embedding and LM head among them), each its own
 graph. A middle chunk, which samples nothing, is a real step's batch too, so
 ATOM runs its draft-KV pass, and is cut where that pass starts; under DP
 ATOM runs the drafter's propose in its place, cut where that starts. A block
-drafter writes its draft KV before `forward_done_event` and is refused.
-A decode of fewer rows than its width ran padded to that rung: its rows run
+drafter runs its draft-KV pass between the target's forward and its sampling,
+before `forward_done_event` on a step that samples: that pass is cut at both
+its ends into a third graph. A decode of fewer rows than its width ran padded to that rung: its rows run
 the drafter's first pass, which takes the target's tokens unpadded, and the
 step continues at the rung past the cut; only its drafter's graph is kept. A
 shape's `width` is the batch a step that replays no graph pads to past its
@@ -71,7 +72,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 import atom
 from atom.compass import ir
-from atom.compass.backends.op_graph import gathered_off_default
+from atom.compass.backends.op_graph import KV, gathered_off_default
 from atom.compass.ir.nodes import Reduced
 
 from . import driverless, peers
@@ -209,7 +210,8 @@ def structure(
     a drafter's method and width, the TP width, the DP width and the EP group's
     when they are set, the phase and the mode, `config`'s unless `eager` names
     it, ``no output`` unless the step produces output (`output`), and ``draft``
-    for the drafter's part of the step (`draft`)."""
+    for the drafter's part of the step (`draft`), ``draft kv`` for a block
+    drafter's draft-KV pass on a step that samples (`draft` is `KV`)."""
     from atom.compass.run import _file_digest
     from atom.compass.run.step_grid import keyed
 
@@ -223,7 +225,8 @@ def structure(
     widths += f" ep={tp * dp}" if config.enable_expert_parallel else ""
     key = f"{arch} {device} {digest} {engine} {widths} {phase} {mode}"
     key = key if output else f"{key} no output"
-    return f"{key} draft" if draft else key
+    key = f"{key} draft" if draft else key
+    return f"{key} {KV}" if draft == KV else key
 
 
 def _engine(text: str):
@@ -439,11 +442,12 @@ class _Recorder(TorchDispatchMode):
                 "a call that neither returned nor raised has no end to fold to"
             )
 
-    def cut(self):
+    def cut(self, mark=CUT):
         """ATOM records `forward_done_event`: the target's work ends here, and
-        what follows is the drafter's."""
+        what follows is the drafter's; or a block drafter's draft-KV pass
+        starts or ends here (`KV`)."""
         if self.on:
-            self.items.append((None, CUT))
+            self.items.append((None, mark))
 
     @contextlib.contextmanager
     def quiet(self):
@@ -1053,27 +1057,26 @@ def _build_runner(config, fake_mode):
 
 def _drafter(runner, recorder):
     """The width of `runner`'s drafter and its models, none without one. Its
-    step is cut where its target's work ends, as the parity record stamps it:
-    at `forward_done_event` on a step that samples, else where the drafter's
-    draft-KV pass starts, under DP its propose. A block drafter writes its
-    draft KV before `forward_done_event` on a step that samples, and is
-    refused."""
+    step is cut where the parity record stamps it: its target's work ends at
+    `forward_done_event` on a step that samples, else where the drafter's
+    draft-KV pass starts, under DP its propose. A block drafter runs its
+    draft-KV pass before `forward_done_event` on a step that samples, between
+    the target's forward and its sampling: it is cut at both its ends."""
     drafter = getattr(runner, "drafter", None)
     if drafter is None:
         return 0, []
-    if drafter.is_block_drafter:
-        raise ValueError(
-            f"{type(drafter).__name__} writes its draft KV before "
-            "forward_done_event on a step that samples: no cut parts its "
-            "target from its draft"
-        )
     done, draft_kv = runner.forward_done_event, drafter.compute_draft_kv
     done.record = lambda *a: (recorder.cut(), driverless.Event.record(done, *a))
-    propose = runner.propose_draft_token_ids
+    propose, block = runner.propose_draft_token_ids, drafter.is_block_drafter
 
     def compute_draft_kv(*args, **kwargs):
         if not recorder.output:
             recorder.cut()
+        elif block:
+            recorder.cut(KV)
+            out = draft_kv(*args, **kwargs)
+            recorder.cut(KV)
+            return out
         return draft_kv(*args, **kwargs)
 
     def propose_draft_token_ids(*args, **kwargs):
@@ -1084,6 +1087,22 @@ def _drafter(runner, recorder):
     drafter.compute_draft_kv = compute_draft_kv
     runner.propose_draft_token_ids = propose_draft_token_ids
     return drafter.mtp_k, [drafter.model]
+
+
+def _parts(items):
+    """A traced step's `items` by part, each its own graph: the target's, a
+    block drafter's draft-KV pass between its two marks on a step that
+    samples (`KV`), and the drafter's work after the first cut, a later cut
+    in it (a DP middle chunk's propose after its draft-KV pass) dropped."""
+    at = next((i for i, (_, item) in enumerate(items) if item is CUT), None)
+    parts = [(False, items if at is None else items[:at])]
+    if marks := [i for i, (_, item) in enumerate(parts[0][1]) if item is KV]:
+        (start, end), target = marks, parts[0][1]
+        parts = [(False, target[:start] + target[end + 1 :])]
+        parts.append((KV, target[start + 1 : end]))
+    if at is not None:
+        parts.append((True, [item for item in items[at + 1 :] if item[1] is not CUT]))
+    return parts
 
 
 def _weights(model):
@@ -1363,12 +1382,8 @@ def capture(
             items, left_out = traces[0]
             if len(traces) > 1:
                 items = _affine(str(shape), items, traces[1][0])
-            # A drafter's work follows its target's: its own graph.
-            cut = [i for i, (_, item) in enumerate(items) if item is CUT][:1]
-            for draft, part in enumerate(
-                (items[: cut[0]], items[cut[0] + 1 :]) if cut else (items,)
-            ):
-                if draft:
+            for draft, part in _parts(items):
+                if draft is True:
                     # A decode's drafter is read from its own shape, at its rows.
                     skip = shape.phase == "decode" and shape.width
                 else:
@@ -1376,7 +1391,7 @@ def capture(
                     skip = shape.tokens < shape.seqs or shape.width and not output
                 if skip:
                     continue
-                key = structure(config, shape.phase, output=output, draft=bool(draft))
+                key = structure(config, shape.phase, output=output, draft=draft)
                 crossing, traced = [], Traced(key, str(shape))
                 graph = build(part, traced, crossing)
                 gone = [*left_out, *(("step-crossing", op) for op in crossing)]

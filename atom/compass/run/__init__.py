@@ -1639,13 +1639,15 @@ def op_graph(run: dict, config, machine, ep: int = 1, lazy: dict | None = None):
         and getattr(config, "enable_low_latency", False),
         price_list=PRICE_LIST in run and _price_list(run, config, machine),
         drafts=drafter.num_speculative_tokens if drafter else 0,
+        block=bool(drafter) and drafter.use_dspark(),
     )
 
 
 def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or of its drafter's part (`draft`), or when it holds none
+    that does not, or of its drafter's part (`draft`, a block drafter's
+    draft-KV pass where it is `forward.KV`), or when it holds none
     `forward.missed`'s text, None for no text; under DP, at the rows the
     step's MoE gathers; a prefill's drafter at the `width` its later passes
     pad to.
