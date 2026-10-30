@@ -1233,15 +1233,14 @@ def test_a_prefill_kind_measured_at_one_row_count_prices_another():
 
 def _published(tmp_path, root=None):
     """The fields of a `price_list` key holding `FLAT`, published under the
-    readings a run on the suite's machine document takes from this tree, or
-    from the tree `root`."""
-    from atom.compass.artifacts import Key, Kind, Reading, git_tree_root, module_root
+    readings a run on the suite's machine document takes from this ATOM
+    source, or from the ATOM source `root`."""
+    from atom.compass.artifacts import Key, Kind
     from atom.compass.fit.publish import publish
-    from atom.compass.run import _machine
+    from atom.compass.run import _machine, atom_source
     from atom.compass.run.step_grid import readings
 
-    tree = git_tree_root("atom", module_root("atom"))
-    source = Reading("tree", root) if root else Reading.of_source_root(tree)
+    source = atom_source(root)
     machine = _machine({"machine": DOCUMENT})
     conditions = readings(machine, atom_src=source, model="m", engine_config="{}")
     key = Key.of(

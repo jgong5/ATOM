@@ -2312,7 +2312,7 @@ def test_a_measured_point_is_keyed_by_the_spec_of_the_platform_it_ran_on(
         "device": [{"index": 6, "name": name, "arch": arch}],
         "stack": stack,
         "ptl": spec.values.get("device.ptl", "disabled"),
-        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu"},
+        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu", "atom": "a"},
         "source": {"revision_kind": "tree", "revision": "a" * 40},
     }
     layout = {"dp": 1, "pp": 1, "pcp": 1, "tp": 1, "decode_context_parallel_size": 1}
@@ -2331,7 +2331,7 @@ def test_a_measured_point_is_keyed_by_the_spec_of_the_platform_it_ran_on(
     at = key("decode B=2", 9, "a")
     assert at.kind is Kind.OP_MEASUREMENT
     assert at.values["machine_spec"] == machine_spec_digest(spec)
-    assert at.values["source_root"] == "tree-" + "a" * 40
+    assert at.values["source_root"] == "atom_py-a"
     assert store.directory_for(at).exists()
     assert not store.directory_for(key("decode B=2", 9, "b")).exists()
     lines = [json.loads(x) for x in (tmp_path / "ops.jsonl").read_text().splitlines()]
