@@ -31,10 +31,15 @@ its rows to, and read each activated expert once; a DP exchange's group width
 is read off its own shapes. ATOM's Triton experts run as aiter's grouped
 GEMMs, each priced so, at the activation format its kind names; their
 expert-parallel width is the run's `ep`, the experts `ep` times a rank's.
+
+DeepSeek-V4.1's sparse attention and indexer scorers read their entries at the
+geometry their leaf states, over the queries the leaf holds (`_last`): a
+replayed prefill's decoder layers run each finishing request's last rows.
 """
 
 from __future__ import annotations
 
+import bisect
 import inspect
 import math
 from dataclasses import replace
@@ -147,6 +152,19 @@ def _pass(view, q) -> tuple:
     if q["shape"][0] < sum(r.query_tokens for r in rows):
         return tuple(replace(r, query_tokens=1) for r in rows)
     return rows
+
+
+def _last(view, q) -> tuple:
+    """The view's rows as a leaf of Q `q` runs them: each row's last `n`
+    queries, `n` the most whose sum `q`'s rows hold, every query a row has
+    when they hold them all: a bounded replay's tail of a prefill, its last
+    layer's last row, a drafter's later pass."""
+    rows, held = view.requests, q["shape"][0]
+    top = max(r.query_tokens for r in rows)
+    n = bisect.bisect_right(
+        range(1, top + 1), held, key=lambda n: sum(min(r.query_tokens, n) for r in rows)
+    )
+    return tuple(replace(r, query_tokens=min(r.query_tokens, max(n, 1))) for r in rows)
 
 
 def _attention(op, view, tp, kv) -> Work:
@@ -359,9 +377,9 @@ def _mhc(residual):
 
 def _launch(op, view, tp, kv) -> Work:
     """One launch at the kernel floor."""
-    # ponytail: V4's index builds write each row's window and compressed
-    # entries, which scale with its context through V4's geometry, and the
-    # leaf does not state that geometry; the floor is their lower bound.
+    # ponytail: V4's and V4.1's index builds write each row's window and
+    # compressed entries, which scale with its context through the model's
+    # geometry, and the leaf does not state it; the floor is their lower bound.
     return Work()
 
 
@@ -444,20 +462,21 @@ def _stated(op, *names) -> list:
     return [stated[name] for name in names]
 
 
-def _v4_decode(q, *slots, out=None):
+def _v4_decode(q, *slots, out=None, queries=_pass):
     """V4's decode attention: `_only`'s `q`, `slots` and outputs, and the KV
     entries each row reads at the window, compression ratio and top-k its
     leaf states, as the step roofline counts them: two products of `q`'s head
     width per head and entry, at the wider of Q's and the KV cache's formats,
     and each entry read once at that width in the KV format. The rotary
-    part's products and bytes are left out, which only lowers both."""
+    part's products and bytes are left out, which only lowers both. The view's
+    rows are as `queries` says `q` runs them."""
     boundary = _only(q, *slots, out=out)
 
     def extract(op, view, tp, kv) -> Work:
         geometry = _stated(op, "window_size", "compress_ratio", "index_topk")
         x = op["args"][q]
         _, heads, dim = x["shape"]
-        fmt, rows = _fmt(x["dtype"]), _pass(view, x)
+        fmt, rows = _fmt(x["dtype"]), queries(view, x)
         work = _sparse_products(rows, heads, dim, fmt, kv, *geometry)
         return boundary(op, view, tp, kv) + work
 
@@ -478,6 +497,79 @@ def _indexer(op, view, tp, kv) -> Work:
     heads, packed = q["shape"][-2:]
     dim = int(packed * _size(q["dtype"]) / ELEMENT_BYTES[fmt])
     return _boundary(op) + _index_scores(_pass(view, q), ratio, heads, dim, fmt)
+
+
+def _v41_scores(q):
+    """V4.1's indexer scorer: `q` and the head weights read once, and each
+    query `q` holds (`_last`) scored at its format against the compressed
+    entries before it at the ratio the leaf states, at most the candidates it
+    states where an earlier layer chose them (`_index_scores`). The logits
+    plane it writes is left out, which only lowers M."""
+
+    def extract(op, view, tp, kv) -> Work:
+        ratio, cap = _stated(op, "compress_ratio", "index_candidates")
+        x = op["args"][q]
+        *_, heads, dim = x["shape"]
+        scores = _index_scores(_last(view, x), ratio, heads, dim, _fmt(x["dtype"]), cap)
+        return _only(q, "weights")(op, view, tp, kv) + scores
+
+    return extract
+
+
+def _mhc_delayed(op, view, tp, kv) -> Work:
+    """V4.1's delayed hyper-connection seam: each tensor argument read once,
+    the outputs written at a byte an element, which only lowers M, and each
+    row's widened residual projected onto the `hc_base` mixes."""
+    args = op["args"]
+    *rows, copies, width = args["residual"]["shape"]
+    mixes = math.prod(args["hc_base"]["shape"])
+    flops = 2 * math.prod(rows) * copies * width * mixes
+    outs = ["torch.float8_e4m3fn"] * len(op["out"])
+    return _boundary(op, outs=outs) + Work({_fmt(args["residual"]["dtype"]): flops})
+
+
+def _quantize(op, view, tp, kv) -> Work:
+    """ATOM's group-32 fp8 quant: `x` read once and its values written in fp8
+    with an e8m0 scale per 32, or in its own format where it only rounds them
+    (`dequantize`)."""
+    x = op["args"]["x"]
+    each = _size(x["dtype"]) if op["args"].get("dequantize") else 1 + 1 / 32
+    return Work({}, _bytes(x) + math.prod(x["shape"]) * each)
+
+
+def _mx(*slots, read=()):
+    """Each of `slots` read once and written once in mxfp8, a byte an element
+    and an e8m0 scale per 32, and `read` read once."""
+
+    def extract(op, view, tp, kv) -> Work:
+        args = op["args"]
+        values = sum(math.prod(args[s]["shape"]) for s in slots)
+        moved = sum(_bytes(args[s]) for s in (*slots, *read))
+        return Work({}, moved + values * (1 + 1 / 32))
+
+    return extract
+
+
+def _gather_rows(op, view, tp, kv) -> Work:
+    """`rows`' rows of each of `tensors` along `dim`, each read and written
+    once, and the row indices."""
+    args = op["args"]
+    count, dim = args["rows"]["shape"][0], args["dim"]
+    row = sum(
+        math.prod(t["shape"][dim + 1 :]) * _size(t["dtype"])
+        for t in _tensors(args["tensors"])
+    )
+    return Work({}, 2 * count * row + _bytes(args["rows"]))
+
+
+def _index_fill(op, view, tp, kv) -> Work:
+    """A fill of `self`'s slices along `dim` that `index` names: each slice
+    written once, and the index read."""
+    args = op["args"]
+    target, index = args["self"], args["index"]
+    shape = target["shape"]
+    each = math.prod(shape) // shape[args["dim"] % len(shape)] * _size(target["dtype"])
+    return Work({}, index["shape"][0] * each + _bytes(index))
 
 
 def _shape(value):
@@ -667,6 +759,65 @@ EXTRACTORS = {
     ),
     "atom.model_ops.decode_input_ids:fill_deferred_decode_ids": _in_place(),
     "atom.utils.block_convert:kv_indices_generate_triton": _kv_indices,
+}
+#: DeepSeek-V4.1's kinds, gfx1250's and gfx950's. What a lifted leaf writes
+#: past its arguments, and the tables and planes it reads by index, are left
+#: out, which only lowers M.
+V41 = "atom.model_ops.deepseek_v41."
+V41_INDICES = "atom.model_ops.attentions.deepseek_v41.indices:"
+TOPK = "aiter.ops.flydsl.topk.topk_per_row:"
+EXTRACTORS |= {
+    "aten.index_fill_.int_Scalar": _index_fill,
+    "aiter.gemm_a8w8_blockscale.default": _gemm(
+        "XQ", "WQ", "dtype", ("x_scale", "w_scale")
+    ),
+    "aiter.router_logits.default": _gemm("x", "weight"),
+    "atom.model_ops.blockscale:quantize_fp8": _quantize,
+    "aiter.ops.triton.quant.fused_mxfp8_quant:fused_dual_rmsnorm_mxfp8_quant": _mx(
+        "q", "k", read=("q_weight", "k_weight")
+    ),
+    "aiter.dynamic_per_token_scaled_quant.default": _only("input", "out", "scales"),
+    "aiter.v41_mhc_pre_delayed.default": _mhc_delayed,
+    f"{V41}mhc:collapse_streams": _only("residual", "pre_mix"),
+    "atom.model_ops.engram.device.gate:engram_post_wkv": _only(
+        "hidden", "kv", "weight"
+    ),
+    "aiter.rope_cached_positions_fwd_impl.default": _only(
+        "input", "output", "positions"
+    ),
+    f"{V41}rope_window:_launch_rope_window": _only("query", "kv", "positions"),
+    f"{V4}fused_compress:_launch_fused_compress": _only(
+        "kv_in", "score_in", "ape", "rms_weight", "state_slot_mapping", "latent_out"
+    ),
+    f"{V41}index_write:write_index_rows": _only("keys", "plan"),
+    f"{V4}indexer_weights:scale_indexer_weights": _only("weights", "q_scale"),
+    "aiter.pa_sparse_prefill_opus.default": _v4_decode(
+        "q", "attn_sink", "out", queries=_last
+    ),
+    **dict.fromkeys(
+        (
+            FLYDSL + "mqa_logits.fp8_paged_mqa_logits_gfx1250:"
+            "flydsl_fp8_paged_mqa_logits_gfx1250",
+            "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits",
+        ),
+        _v41_scores("q_fp8"),
+    ),
+    f"{V41}indexer:_block_maxima": _only("visible", "maxima"),
+    TOPK + "flydsl_radix_topk_one_block": _only("row_starts", "row_ends", "indices"),
+    TOPK + "flydsl_top_k_per_row_decode": _only("seq_lens", "indices"),
+    "aiter._top_k_per_row_decode.default": _only("seqLens", "indices"),
+    "atom.model_ops.attentions.token_layout.gather:gather_rows": _gather_rows,
+    **dict.fromkeys(
+        (
+            V41_INDICES + "_launch_indptr_scan",
+            V41_INDICES + "_launch_indices",
+            V41_INDICES + "_launch_window_rows",
+            f"{V41}unit_table:unit_table",
+            f"{V41}candidate_table:candidate_block_table",
+            f"{V41}candidate_table:lift_candidate_selection",
+        ),
+        _launch,
+    ),
 }
 #: Every kind whose extractor takes the EP width, as a fifth parameter.
 SHARDED = {n for n, f in EXTRACTORS.items() if len(inspect.signature(f).parameters) > 4}
