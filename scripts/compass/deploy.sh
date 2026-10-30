@@ -125,15 +125,15 @@ ROUTER_LP=
 # listeners take one per rank from its handshake port. The decode's handshake
 # port, the prefill's plus its ranks as the nightly's 1P1D launch gives it, is
 # not held: its listeners bind ports the kernel hands out.
-ports=$(python3 - "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
-import argparse, json, random, socket, sys
+ports=$(python3 - $$ "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
+import argparse, json, random, socket, subprocess, sys
 from pathlib import Path
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactRefusal
 from atom.compass.drive import runfile, serve
 from atom.compass.spec import SpecRefusal
 
-run_file, kv_link, router_lp, n, *words = sys.argv[1:]
+script, run_file, kv_link, router_lp, n, *words = sys.argv[1:]
 flags, words = words[: int(n)], words[int(n) :]
 k = int(words[0])
 prefill, decode = words[1 : 1 + k], words[1 + k :]
@@ -147,15 +147,23 @@ def block(n):
                 held[-1].bind(("", p))
             return base
         except OSError:
-            continue
+            [held.pop().close() for _ in range(p - base + 1)]
     sys.exit(f"deploy: no {n} free ports in a row from {room.start} below {room.stop}, where {serve.PORT_RANGE} starts")
+def hand(*ports):
+    """Print `ports` and exit; a holder keeps every drawn port until the script
+    exits, as compass_held_port's does, spawned since this process runs threads."""
+    for s in held:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    hold = "import os, select, sys; select.select([os.pidfd_open(int(sys.argv[1]))], [], [])"
+    subprocess.Popen([sys.executable, "-c", hold, script], pass_fds=[s.fileno() for s in held], stdout=subprocess.DEVNULL)
+    print(*ports)
+    sys.exit()
 router, prometheus = block(1), block(1)
 if not run_file:
     engine = runfile._engine_args(prefill)
     ranks = engine.data_parallel_size * engine.tensor_parallel_size * engine.pipeline_parallel_size
     base = block(ranks)
-    print(router, prometheus, base, base + ranks)
-    sys.exit()
+    hand(router, prometheus, base, base + ranks)
 parser = argparse.ArgumentParser(prog="deploy.sh run")
 runfile.add_arguments(parser)
 args = parser.parse_args(flags)
@@ -173,7 +181,7 @@ clock = block(1)
 base = block(run["prefill_data_parallel_size"] * run["decode_data_parallel_size"])
 run |= {"out_dir": str(Path(run_file).parent), "clock_endpoint": f"tcp://127.0.0.1:{clock}"}
 Path(run_file).write_text(json.dumps(run))
-print(router, prometheus, base, base, clock, lookaheads)
+hand(router, prometheus, base, base, clock, lookaheads)
 EOF
 )
 # Its last line; an import may print before it.

@@ -447,7 +447,7 @@ source per term; the bullets below say why each is what it is.
 | invisible scratch | inside the activations reading; a term of its own only under the liveness walk (`04` T4) | [#704](https://github.com/jgong5/ATOM/issues/704) |
 | persistent | `persistent_forward_buffer_bytes` in the run's `memory_readings` entry | — |
 | load residue, `non_torch` | the run's `memory_readings` entry, keyed by the parallel layout (`atom/compass/run/memory.py::key_fields`) | [#702](https://github.com/jgong5/ATOM/issues/702) |
-| graph pool | `graph_pool.reserves()` for the deployment's own `enforce_eager`; when it captures, the runner's `_piecewise_cg_active()` picks the branch, whole-graph from the activations term, piecewise from `piecewise_per_token_bytes` and `capture_token_shapes` over the deployment's ladder | [#700](https://github.com/jgong5/ATOM/issues/700) |
+| graph pool | `graph_pool.reserves()` for the deployment's own `enforce_eager`; when it captures, the runner's `_tr_hybrid_active()` picks the branch, whole-graph from the activations term, piecewise from `piecewise_per_token_bytes` and `capture_token_shapes` over the deployment's ladder | [#700](https://github.com/jgong5/ATOM/issues/700) |
 
 **The per-term check** is `memory/compare.py` with `graph_pool.predicts`: each predicted
 term against the same term of a recorded real run, wired for stage 2's paired runs

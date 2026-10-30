@@ -147,17 +147,18 @@ def main(argv: list[str], again: bool = False) -> None:
     env = {k: v for k, v in os.environ.items() if k not in (ENV, CLOCK_ENV, parity.ENV)}
     env[OUT_ENV] = str(out / READINGS)
     env["HIP_VISIBLE_DEVICES"] = hip_visible(args.gpu)
-    env["ATOM_DP_MASTER_PORT"] = str(serve._free_ports(1)[0])
     if args.beside:
         env[BESIDE_ENV] = args.beside
     code = f"import sys; from {__name__} import start; start(sys.argv[1:])"
     # SIGINT and SIGTERM end the wait, never the stop: the engine runs in its
     # own session, so a command that ends first leaves it running.
     with (
+        serve._held_ports(1) as [dp_port],
         serve._stop_signals() as stopped,
         quiet(args.gpu, out),
         (out / LOG).open("w") as log,
     ):
+        env["ATOM_DP_MASTER_PORT"] = str(dp_port)
         # KFD lists an exited rank until it has freed the rank's GPU memory.
         kfd = serve._kfd()
         engine = subprocess.Popen(

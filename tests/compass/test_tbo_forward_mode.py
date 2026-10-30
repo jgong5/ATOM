@@ -33,7 +33,7 @@ REAL = {
     "prepare_model",
     "_local_tbo_eligibility",
     "_dspark_apply_q_bucket",
-    "_piecewise_cg_active",
+    "_tr_hybrid_active",
     "_producer_graph_shapes",
 }
 
