@@ -507,8 +507,9 @@ def test_the_pipeline_minimum_is_inert_on_an_even_split_and_not_otherwise(
     Whether it is *inert* is a different question and the answer is not
     "always". Every stage computes the same readings here, because
     `device_readings` takes no pipeline rank. But each stage sizes its pool
-    from the layers it holds -- `_get_total_num_layers` takes a
-    `get_pp_indices` slice under pipeline parallelism -- so the entry size
+    from the layers it holds -- `make_layers` builds only the stage's
+    `get_pp_indices` span, and the builder's module walk,
+    `PoolRowsMixin.pool_rows`, counts what was built -- so the entry size
     differs whenever the split is uneven, and the minimum is then what decides
     the count.
 
