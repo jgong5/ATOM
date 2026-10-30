@@ -2,8 +2,10 @@
 """Real-clock reads in ATOM's core: each one takes the LP clock or is listed by site."""
 
 import asyncio
+import importlib
 import logging
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -89,7 +91,6 @@ class TestTheCoreGate:
     @pytest.mark.parametrize(
         "module",
         [
-            "atom/model_engine/scheduler.py",
             "atom/model_engine/model_runner.py",
             "atom/kv_transfer/offload/dense/connector.py",
         ],
@@ -105,6 +106,16 @@ class TestTheCoreGate:
             "clock-source lint: 1 real-clock read(s) on the simulated path:",
             f"  {target}:{line}  time.time  in _seeded",
         ]
+
+    def test_a_read_in_a_module_on_the_time_shim_is_not_a_real_one(self, tmp_path):
+        """`scheduler.py`'s `time` is the shim, so a new `time.time()` there reads the LP clock."""
+        _seeded(
+            "atom/model_engine/scheduler.py",
+            tmp_path,
+            "\n\ndef _seeded():\n    return time.time()\n",
+        )
+        code, report = ClockSourceLint().check(str(tmp_path))
+        assert code == 0, report
 
     def test_a_new_read_beside_a_kept_one_fails(self, tmp_path):
         """Same file, def and call as a kept site: the count is what tells them apart."""
@@ -257,3 +268,80 @@ class TestASubstitutedReadTakesTheLpClock:
 
     def test_a_real_run_reads_the_clock_it_passed(self):
         assert clock.now(lambda: 3.5) == 3.5
+
+
+#: The modules whose `time` is `atom.utils.time_shim`: every clock read in them
+#: takes the LP clock.
+ON_THE_TIME_SHIM = (
+    "atom.distributed.kv_events",
+    "atom.entrypoints.atomesh.atom_standalone_service",
+    "atom.entrypoints.openai.api_server",
+    "atom.entrypoints.openai.protocol",
+    "atom.entrypoints.openai.request_timing",
+    "atom.entrypoints.openai.serving_chat",
+    "atom.entrypoints.openai.serving_completion",
+    "atom.entrypoints.openai.serving_responses",
+    "atom.entrypoints.openai.streaming_dispatch",
+    "atom.kv_transfer.offload.mp.lookup",
+    "atom.kv_transfer.offload.mp.native_state_worker",
+    "atom.kv_transfer.offload.mp.scheduler",
+    "atom.kv_transfer.offload.mp.transfer",
+    "atom.metrics.exporter",
+    "atom.metrics.scheduler",
+    "atom.model_engine.engine_stats",
+    "atom.model_engine.llm_engine",
+    "atom.model_engine.pp_engine_core",
+    "atom.model_engine.scheduler",
+)
+#: The modules that had `from time import monotonic`: their `monotonic` is the
+#: shim's `read_monotonic`.
+ON_READ_MONOTONIC = (
+    "atom.model_engine.block_manager",
+    "atom.model_engine.page_unit_checkpoint",
+)
+
+
+@pytest.mark.parametrize("module", ON_THE_TIME_SHIM)
+class TestTheTimeShim:
+    def test_each_clock_read_takes_the_lp_clock(self, module, lp_clock):
+        shim = importlib.import_module(module).time
+        assert (shim.time(), shim.monotonic(), shim.perf_counter()) == (7.25,) * 3
+
+    def test_with_no_runtime_each_name_is_the_standard_librarys(self, module):
+        shim = importlib.import_module(module).time
+        for name in ("time", "monotonic", "perf_counter", "sleep", "strftime"):
+            assert getattr(shim, name) is getattr(time, name), name
+
+    def test_sleep_is_never_swapped(self, module, lp_clock):
+        assert importlib.import_module(module).time.sleep is time.sleep
+
+    def test_no_real_read_is_exposed(self, module):
+        shim = importlib.import_module(module).time
+        for name in ("time_ns", "monotonic_ns", "perf_counter_ns", "process_time"):
+            assert not hasattr(shim, name), name
+
+
+@pytest.mark.parametrize("module", ON_READ_MONOTONIC)
+class TestTheFromImportForm:
+    def test_monotonic_takes_the_lp_clock(self, module, lp_clock):
+        assert importlib.import_module(module).monotonic() == 7.25
+
+    def test_with_no_runtime_it_calls_time_monotonic(self, module, monkeypatch):
+        monkeypatch.setattr(time, "monotonic", lambda: 3.5)
+        assert importlib.import_module(module).monotonic() == 3.5
+
+
+def test_a_patched_shim_name_patches_time_and_its_undo_restores_the_lp_read(
+    monkeypatch,
+):
+    """Tests patch `<module>.time.monotonic` as they did when it was `time`."""
+    from atom.model_engine import scheduler
+
+    monkeypatch.setattr(scheduler.time, "monotonic", lambda: 1.5)
+    assert time.monotonic() == 1.5
+    monkeypatch.undo()
+    clock.install(_Runtime(7.25))
+    try:
+        assert scheduler.time.monotonic() == 7.25
+    finally:
+        clock.install(None)

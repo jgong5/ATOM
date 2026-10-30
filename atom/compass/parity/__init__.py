@@ -456,8 +456,8 @@ class StepRecording:
                 group.recv_tensor_dict = functools.partial(self._pp_received, recv)
         if processor is not None and hasattr(self, "drafter"):
             for key, name in (
-                ("t_mtp_ns", "recv_mtp_status_async"),
-                ("t_draft_recv_ns", "recv_async_output_draft"),
+                ("t_mtp_ns", "recv_spec_status"),
+                ("t_draft_recv_ns", "recv_draft_token_ids"),
             ):
                 call = getattr(processor, name)
                 setattr(processor, name, functools.partial(self._stamped, key, call))

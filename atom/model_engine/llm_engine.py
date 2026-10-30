@@ -4,7 +4,6 @@
 import importlib.util
 import itertools
 import logging
-import time
 from collections import Counter
 from dataclasses import fields
 from typing import Any
@@ -20,6 +19,7 @@ from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import SamplingParams
 from atom.utils import clock, envs
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 
@@ -894,7 +894,7 @@ class InputOutputProcessor:
                 dp_session_id=dp_session_id,
                 dp_parent_session_id=dp_parent_session_id,
             )
-            seq.arrive_time = clock.now(time.time)
+            seq.arrive_time = time.time()
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:
                 self._external_to_internal[seq.external_request_id] = seq.id
@@ -939,7 +939,7 @@ class InputOutputProcessor:
             if external_request_id is not None:
                 self._external_to_internal.pop(external_request_id, None)
             output_str = self.tokenizer.decode(req.completion_token_ids)
-            req.leave_time = clock.now(time.time)
+            req.leave_time = time.time()
 
             # Calculate TTFT (Time To First Token) and TPOT (Time Per Output Token)
             ttft = 0.0

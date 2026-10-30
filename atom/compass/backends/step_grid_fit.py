@@ -50,6 +50,13 @@ counts the triples whose lookup is extrapolated past the KV pool, and gives
 per rung each alpha form's terms and errors, the views the grid does not read,
 how many it reads at their longest row past the KV pool, the cells' p50
 without and with alpha, and whether the rung keeps it.
+
+Under a drafter, which the plan states by its draft width, each measurement
+also holds the drafter's value, `draft_seconds`, which becomes its point's
+`draft`; one without it refuses. The drafter's value then gets all of the
+above apart, on the targets' draft labels (`Sample.draft_s`): its own alpha,
+`draft_alpha`, gated by its own cells, and its own residual,
+`draft_residual` in the bundle; its report is the report's `draft`.
 """
 
 import copy
@@ -60,7 +67,7 @@ from fractions import Fraction
 import numpy as np
 
 from atom.compass.backends.resolver import CostRefused
-from atom.compass.backends.step_grid import ALPHA, StepGrid, alpha_features
+from atom.compass.backends.step_grid import ALPHA, VALUES, StepGrid, alpha_features
 from atom.compass.backends.step_grid_residual import (
     RECIPE,
     Residual,
@@ -91,31 +98,62 @@ def bundle(definition, planned, points, targets, seed: int) -> tuple[dict, dict]
     """The bundle and its report; or a ValueError."""
     keys = ("graph_mode", "scope", "prefill", "decode")
     grid = copy.deepcopy({k: planned[k] for k in keys}) | {"unit": "s", "value": VALUE}
+    drafts = planned.get("draft_width", 0)
+    if drafts:
+        grid["draft_width"] = drafts
     for line, measurement in zip(planned["lines"], points, strict=True):
         (n_q, context, decode), b = line["rows"][0], len(line["rows"])
         point = {"statistic": measurement["statistic"]}
         point["repeats"] = len(measurement["repeats"])
         point["time"] = measurement["seconds"]
+        if drafts:
+            if "draft_seconds" not in measurement:
+                raise ValueError(
+                    f"the measurement of {line['rows']} holds no drafter's "
+                    f"value, and the plan's engine verifies {drafts} drafts"
+                )
+            point["draft"] = measurement["draft_seconds"]
         if "shared" in line:
             point["shared"] = line["shared"]
         if decode:
-            at, into = [line["rung"], b, context - 1], grid["decode"]["points"]
+            at, into = [line["rung"], b, context - n_q], grid["decode"]["points"]
         else:
             at = [b, b * n_q, context - n_q]
             into = grid["prefill"]["output" if line["produces_output"] else "no_output"]
         into.append({"at": at, **point})
     views = [s for s in targets if s.provenance["source"] == "ragged"]
     targets = [s for s in targets if s.provenance["source"] != "ragged"]
-    terms, alphas = _alpha(StepGrid(grid), views, seed)
-    labelled = [s for s in targets if s.device_s is not None]
+    grid, residual, report, sources = _part(grid, views, targets, seed, False)
+    out = {"residual": residual, "bounds": planned["bounds"]}
+    if drafts:
+        grid, out["draft_residual"], report["draft"], more = _part(
+            grid, views, targets, seed, True
+        )
+        sources += more
+    out |= {"grid": grid, "definition": definition, "sources": sorted(set(sources))}
+    return out, report
+
+
+def _label(s, drafter: bool) -> float | None:
+    """`s`'s label for the target's value, its device label, or the drafter's,
+    its draft label."""
+    return s.draft_s if drafter else s.device_s
+
+
+def _part(grid: dict, views, targets, seed: int, drafter: bool) -> tuple:
+    """`grid` holding the alpha the ragged `views` fit for the target's value,
+    or the drafter's; the residual `targets` fit for it, its report, and the
+    source of each triple it was fitted on."""
+    terms, alphas = _alpha(StepGrid(grid, drafter), views, seed, drafter)
+    labelled = [s for s in targets if _label(s, drafter) is not None]
     labelled.sort(
         key=lambda s: repr(s.view) if s.provenance["source"] == "replay" else ""
     )
-    kept = _kept(grid, terms, labelled, seed, alphas)
-    grid = _alpha_grid(grid, {r: terms[r] for r in kept})
-    lookup = StepGrid(grid)
+    kept = _kept(grid, terms, labelled, seed, alphas, drafter)
+    grid = _alpha_grid(grid, {r: terms[r] for r in kept}, drafter)
+    lookup = StepGrid(grid, drafter)
     triples, sources, unpriced, past = [], [], [], 0
-    cut = Counter(s.cut for s in targets if s.device_s is None)
+    cut = Counter(s.cut for s in targets if _label(s, drafter) is None)
     for s in labelled:
         try:
             _, _, value, _, _, beyond = lookup.value(s.view)
@@ -127,12 +165,13 @@ def bundle(definition, planned, points, targets, seed: int) -> tuple[dict, dict]
             )
             continue
         past += bool(beyond)
-        triples.append((s.view, float(value * lookup.unit), s.device_s))
+        triples.append((s.view, float(value * lookup.unit), _label(s, drafter)))
         sources.append(s.provenance["source"])
     if not triples:
         raise ValueError(
             f"none of the {len(targets)} targets is a step the grid answers, "
-            "with a device label and inside a complete cell"
+            f"with a {'draft' if drafter else 'device'} label and inside a "
+            "complete cell"
         )
     residual, kinds = fit(triples, seed)
     fitted = Residual(residual).kinds
@@ -150,15 +189,14 @@ def bundle(definition, planned, points, targets, seed: int) -> tuple[dict, dict]
             errors = by.setdefault(sources[i], ([], [], []))
             errors[part].append(factor * looked_up / measured - 1.0)
         report["sources"] = {source: _spread(*e) for source, e in sorted(by.items())}
-    out = {"grid": grid, "residual": residual, "bounds": planned["bounds"]}
-    out |= {"definition": definition, "sources": sorted(set(sources))}
     report = {"kinds": kinds, "unpriced": unpriced, "cut": dict(cut)}
-    return out, report | {"past_pool": past, "alpha": alphas}
+    return grid, residual, report | {"past_pool": past, "alpha": alphas}, sources
 
 
-def _alpha(grid: StepGrid, views, seed: int) -> tuple[dict, dict]:
+def _alpha(grid: StepGrid, views, seed: int, drafter=False) -> tuple[dict, dict]:
     """Each decode rung's alpha terms, the form with the least held-out error
-    fitted on its ragged `views`, as the module says; and the report by rung."""
+    fitted on its ragged `views`, as the module says, for the value `grid`
+    reads; and the report by rung."""
     rows, report = {}, {}
     for s in views:
         rung = s.view.capture_rung
@@ -174,9 +212,9 @@ def _alpha(grid: StepGrid, views, seed: int) -> tuple[dict, dict]:
             continue
         got["past_pool"] += bool(beyond)
         x = alpha_features(s.view.requests)
-        if x:
+        if x and _label(s, drafter) is not None:
             g, t = float(mean * grid.unit), float(top * grid.unit)
-            rows.setdefault(rung, []).append((g, t, s.device_s, *x))
+            rows.setdefault(rung, []).append((g, t, _label(s, drafter), *x))
     terms = {}
     for rung, got in rows.items():
         g, top, t, *x = map(np.array, zip(*got))
@@ -222,21 +260,24 @@ def _forms(x, w, e, seed: int) -> dict:
     return forms
 
 
-def _alpha_grid(grid: dict, terms: dict) -> dict:
-    """`grid` holding the alpha `terms` gives per rung."""
+def _alpha_grid(grid: dict, terms: dict, drafter: bool) -> dict:
+    """`grid` holding the alpha `terms` gives per rung, the target's or the
+    drafter's."""
     alpha = {str(r): dict(zip(ALPHA, t)) for r, t in terms.items()}
-    return grid | {"decode": grid["decode"] | {"alpha": alpha}}
+    return grid | {"decode": grid["decode"] | {VALUES[drafter][1]: alpha}}
 
 
-def _kept(grid: dict, terms: dict, targets, seed: int, report: dict) -> list:
+def _kept(grid: dict, terms: dict, targets, seed: int, report: dict, drafter) -> list:
     """The rungs of `terms` that keep their alpha, as the module says, the
     cells' evidence written into `report`."""
     decode = [s for s in targets if not s.view.prefill]
     steps = Counter((s.provenance["run"], s.view.capture_rung) for s in decode)
     cells = sorted({c for (c, r), n in steps.items() if r in terms and n >= CELL_STEPS})
-    base, kept = _p50s(grid, {}, decode, cells, terms, seed), sorted(terms)
+    base = _p50s(grid, {}, decode, cells, terms, seed, drafter)
+    kept = sorted(terms)
     while kept:
-        tried = _p50s(grid, {r: terms[r] for r in kept}, decode, cells, terms, seed)
+        alpha = {r: terms[r] for r in kept}
+        tried = _p50s(grid, alpha, decode, cells, terms, seed, drafter)
         now = []
         for rung in kept:
             pairs = {
@@ -255,11 +296,11 @@ def _kept(grid: dict, terms: dict, targets, seed: int, report: dict) -> list:
     return kept
 
 
-def _p50s(grid: dict, terms: dict, decode, cells, rungs, seed: int) -> dict:
+def _p50s(grid: dict, terms: dict, decode, cells, rungs, seed: int, drafter) -> dict:
     """Per cell and rung of `rungs` where the cell has `CELL_STEPS` steps the
     grid reads, the p50 of priced over measured less 1 of those `decode`
     targets, the residual fitted on the other cells' with `terms`' alpha."""
-    lookup, priced = StepGrid(_alpha_grid(grid, terms)), []
+    lookup, priced = StepGrid(_alpha_grid(grid, terms, drafter), drafter), []
     for s in decode:
         try:
             priced.append((s, float(lookup.value(s.view)[2] * lookup.unit)))
@@ -268,7 +309,9 @@ def _p50s(grid: dict, terms: dict, decode, cells, rungs, seed: int) -> dict:
     out = {}
     for cell in cells:
         others = [
-            (s.view, g, s.device_s) for s, g in priced if s.provenance["run"] != cell
+            (s.view, g, _label(s, drafter))
+            for s, g in priced
+            if s.provenance["run"] != cell
         ]
         try:
             fitted = Residual(fit(others, seed)[0]).kinds["decode"]
@@ -283,7 +326,8 @@ def _p50s(grid: dict, terms: dict, decode, cells, rungs, seed: int) -> dict:
                 factor = sum(w * m(s.view, x) for _, w, m in fitted.members)
             except LookupError:
                 continue
-            errors.setdefault(s.view.capture_rung, []).append(factor * g / s.device_s)
+            measured = _label(s, drafter)
+            errors.setdefault(s.view.capture_rung, []).append(factor * g / measured)
         for rung, e in errors.items():
             if len(e) >= CELL_STEPS:
                 out[cell, rung] = float(np.median(e)) - 1.0

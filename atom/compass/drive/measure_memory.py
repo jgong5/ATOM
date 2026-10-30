@@ -159,6 +159,8 @@ def main(argv: list[str], again: bool = False) -> None:
         (out / LOG).open("w") as log,
     ):
         env["ATOM_DP_MASTER_PORT"] = str(dp_port)
+        # KFD lists an exited rank until it has freed the rank's GPU memory.
+        kfd = serve._kfd()
         engine = subprocess.Popen(
             [sys.executable, "-c", code, *atom_args],
             stdout=log,
@@ -179,7 +181,7 @@ def main(argv: list[str], again: bool = False) -> None:
         finally:
             # A member of the engine's process group can outlive its leader:
             # the after-check reads the GPUs once every member has exited.
-            serve._stop(engine.pid)
+            serve._stop(engine.pid, kfd)
             engine.wait()
             serve.drop_compiled(out / LOG)
     if stopped:

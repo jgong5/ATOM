@@ -145,6 +145,9 @@ def install(tmpdir: str, arch: str) -> dict:
         "default_stream": lambda *a, **k: main_stream,
         "stream": _stream,
         "set_device": lambda *a, **k: None,
+        # `torch.cuda.device(i)` swaps the current device: there is one.
+        "_exchange_device": lambda device: 0,
+        "_maybe_exchange_device": lambda device: 0,
         "synchronize": lambda *a, **k: None,
         "memory_stats": lambda *a, **k: {
             "allocated_bytes.all.current": 0,
@@ -152,9 +155,14 @@ def install(tmpdir: str, arch: str) -> dict:
             "reserved_bytes.all.current": 0,
         },
         "memory_allocated": lambda *a, **k: 0,
+        # Free and total: nothing is allocated on the declared device.
+        "mem_get_info": lambda *a, **k: (DEVICES[arch][2],) * 2,
         "reset_peak_memory_stats": lambda *a, **k: None,
         "empty_cache": lambda *a, **k: None,
         "is_current_stream_capturing": lambda: False,
+        # A memory pool of no device; allocating from it allocates as before.
+        "MemPool": lambda *a, **k: None,
+        "use_mem_pool": lambda *a, **k: contextlib.nullcontext(),
     }
     for name, value in cuda.items():
         setattr(torch.cuda, name, value)
