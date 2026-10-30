@@ -755,6 +755,17 @@ Their host keys carry the `atom`
 digest of the tree they were last re-keyed at; `provenance` names the
 capture tree's.
 
+`scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-crs005-{prefill,decode}.json`
+are the same pair for the cell on crsuse2-m2m-v3-005 (prefill) and -013 (decode),
+keyed by `machines/mi355x-crs005.json`, in the image that file pins, at
+`--gpu-memory-utilization 0.75`: the `base` form with host laws, each written by
+`step_linear_fit` from its side's cells. The cells are the gpu-45 pair's, run by
+`calib_capture.sh`, the prefill side's on 005 and the decode side's on 013, and a
+cell that built an aiter JIT module was run again. The decode side adds a c=256 cell
+at seed 20260709 and, for rung 12, c=96 at seeds 20260707 and 20260708 and c=112 at
+seed 20260709: a lone decode server at c=256 decodes at rungs 16 to 28, and at c=64
+at rungs 4 and 8.
+
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json`
 are the same pair with expert parallelism on (MORI): the `history` form, fitted by
 `compass fit steps` and `compass fit host` on each side's cells, captured on mi355-gpu-40
