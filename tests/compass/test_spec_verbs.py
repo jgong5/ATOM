@@ -937,6 +937,36 @@ def test_a_length_the_fit_does_not_hold_at_is_refused_by_name():
     assert "bound of 10.0%" in str(refused.value)
 
 
+class Waking(Clocked):
+    """Clocked, and each of the `calls` calls after one over `long` tokens
+    costs `extra` seconds more, whatever its length."""
+
+    def __init__(self, fixed, rate, long, calls, extra):
+        super().__init__(fixed, rate)
+        self.long, self.calls, self.extra, self.left = long, calls, extra, 0
+
+    def _spend(self, tokens):
+        super()._spend(tokens)
+        if self.left:
+            self.now, self.left = self.now + self.extra, self.left - 1
+        if tokens > self.long:
+            self.left = self.calls
+
+
+def test_a_one_token_encode_in_the_wake_of_the_whole_text_is_not_timed():
+    # On mi355-gpu-40 the first few encodes after the sweep text's took 0.4 to
+    # 4 ms each, one token or more; the one-token point then read 100 times its
+    # fit. Here the text is longer than any length swept, and the seven calls
+    # after its encode carry a millisecond each: one token's decode and encode
+    # and the five untimed encodes before the timed ones.
+    tok = Waking(3.0e-5, 2.0e6, long=SWEPT[-1], calls=7, extra=1.0e-3)
+    text = SWEEP_TEXT * 2
+    rates = tokenizer_sweep(tok, text, SWEPT, bound=0.01, clock=tok.clock)
+    for side in ("encode", "decode"):
+        assert rates[f"{side}_fixed_s"] == pytest.approx(3.0e-5)
+        assert rates[f"{side}_tokens_per_s"] == pytest.approx(2.0e6)
+
+
 def test_a_sweep_text_shorter_than_the_longest_length_is_refused():
     tok = Clocked(3.0e-5, 2.0e6)
     with pytest.raises(SpecRefusal, match="the sweep text is 2 tokens"):
@@ -1011,7 +1041,7 @@ def test_the_checked_in_mi308x_specs_hold_their_start(monkeypatch, name):
                 assert values[key] == value, key
 
 
-MI355X = ["mi355x-gpu45", "mi355x-crs005"]
+MI355X = ["mi355x-gpu45", "mi355x-crs005", "mi355x-gpu40"]
 
 
 def _mi355x_spec(monkeypatch, name):
@@ -1073,6 +1103,33 @@ def test_the_mi355x_spec_rebuilds_byte_for_byte_from_its_own_sweep(
     out = tmp_path / "rebuilt.json"
     assert script.main(["--sweep-from", str(document), "--out", str(out)]) == 0
     assert out.read_bytes() == document.read_bytes()
+
+
+def test_the_gpu40_spec_pins_nightly_20261026_and_resolves_both_deepseek_tokenizers(
+    monkeypatch,
+):
+    _, spec = _mi355x_spec(monkeypatch, "mi355x-gpu40")
+    document = SPEC_ROOT / "scripts" / "compass" / "machines" / "mi355x-gpu40.json"
+    assert validate(json.loads(document.read_text())).ok
+    pinned = {
+        k: spec.value(f"device.software_pinned_to.{k}")
+        for k in ("rocm", "aiter", "rccl", "torch")
+    }
+    assert pinned == {
+        "rocm": "7.2.4",
+        "aiter": "41d4d8d7e",
+        "rccl": "2.27.7",
+        "torch": "2.10.0+rocm7.2.4.git3d3aa833",
+    }
+    assert spec.value("device.ptl") == "disabled"
+    resolved = {
+        architecture: spec.tokenizer_for(architecture, Backend.FAST).key.id
+        for architecture in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
+    }
+    assert resolved == {
+        "DeepseekV4ForCausalLM": "deepseek-v4-pro",
+        "DeepseekV41ForCausalLM": "deepseek-v4.1-flash",
+    }
 
 
 @pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39"])

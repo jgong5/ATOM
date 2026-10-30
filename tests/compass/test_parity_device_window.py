@@ -9,6 +9,8 @@ forward's launch and exit events land at known device times, and an event
 completes once the device clock has passed it.
 """
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -230,3 +232,56 @@ def test_with_a_drafter_each_line_splits_its_device_window_at_the_target(
     # The drafter's timings are not part of a step's decision.
     first = compare(tmp_path / "real", tmp_path / "simulated")["first_divergence"]
     assert first == {0: None}
+
+
+def _atom_processor_calls() -> dict[str, set[str]]:
+    """Each method ATOM's `tokenIDProcessor` defines, with what it calls on
+    `self`. Read as an AST from this checkout: importing `model_runner` needs a
+    driver."""
+    source = Path(__file__).resolve().parents[2] / "atom/model_engine/model_runner.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "tokenIDProcessor"
+    )
+    return {
+        f.name: {
+            c.func.attr
+            for c in ast.walk(f)
+            if isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Attribute)
+            and getattr(c.func.value, "id", "") == "self"
+        }
+        for f in cls.body
+        if isinstance(f, ast.FunctionDef)
+    }
+
+
+@pytest.mark.parametrize(
+    "site, key",
+    [("prepare_input_ids", "t_mtp_ns"), ("prepare_draft_ids", "t_draft_recv_ns")],
+)
+def test_a_drafting_recorder_stamps_the_waits_atoms_processor_makes(site, key):
+    """Over a processor with exactly ATOM's methods, a recorder with a drafter
+    builds, and what each of ATOM's two speculative waits calls is stamped
+    under that wait's key and no other."""
+    calls = _atom_processor_calls()
+    processor = SimpleNamespace(**{name: lambda *a: None for name in calls})
+    clock = iter(range(1, 100))
+
+    class _Base:
+        def __init__(self):
+            self.tokenID_processor = processor
+            self.drafter = SimpleNamespace(compute_draft_kv=None)
+
+    class _Recorded(StepRecording, _Base):
+        @staticmethod
+        def step_clock_ns():
+            return next(clock)
+
+    runner = _Recorded()
+    runner._parity_record = object()
+    for name in sorted(calls[site]):
+        getattr(processor, name)()
+    assert set(runner._stamps) == {key}

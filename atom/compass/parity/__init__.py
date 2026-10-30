@@ -111,14 +111,6 @@ TIMESTAMPS = (
     "t_pull_ns",
     "t_put_ns",
 )
-#: The `tokenIDProcessor` waits a speculative runner's record stamps, by line
-#: key: an output forward's wait for the previous one's acceptance status,
-#: before its launch, and its wait for the previous draft tokens' copy, after
-#: its propose.
-SPEC_WAITS = (
-    ("t_mtp_ns", "recv_spec_status"),
-    ("t_draft_recv_ns", "recv_draft_token_ids"),
-)
 
 
 class StepRecord:
@@ -463,7 +455,10 @@ class StepRecording:
                 recv = group.recv_tensor_dict
                 group.recv_tensor_dict = functools.partial(self._pp_received, recv)
         if processor is not None and hasattr(self, "drafter"):
-            for key, name in SPEC_WAITS:
+            for key, name in (
+                ("t_mtp_ns", "recv_spec_status"),
+                ("t_draft_recv_ns", "recv_draft_token_ids"),
+            ):
                 call = getattr(processor, name)
                 setattr(processor, name, functools.partial(self._stamped, key, call))
             sampled = processor.prepare_sampled_ids

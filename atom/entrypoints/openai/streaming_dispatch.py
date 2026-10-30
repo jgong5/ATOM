@@ -13,14 +13,13 @@ import array
 import logging
 import random
 import threading
-import time
 from asyncio import AbstractEventLoop, Event
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, NamedTuple
 
 from atom.model_engine.sequence import new_token_ids
-from atom.utils import clock
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 
@@ -478,13 +477,13 @@ class FrameWait:
 
     def __enter__(self) -> None:
         # No `as`: nothing needs the watch itself, only its lifetime.
-        self._started = clock.now(time.monotonic)
+        self._started = time.monotonic()
         if self.armed:
             _WAITING_SINCE[id(self)] = self._started
 
     def __exit__(self, *exc) -> None:
         _WAITING_SINCE.pop(id(self), None)
-        silence = clock.now(time.monotonic) - self._started
+        silence = time.monotonic() - self._started
         if self.armed and silence >= SILENCE_LOG_SECONDS:
             # After the fact, and free: one comparison on a frame that was
             # going to arrive anyway. Catches a stall that recovered, which
@@ -505,7 +504,7 @@ def longest_silence_seconds() -> float:
     """
     if not _WAITING_SINCE:
         return 0.0
-    now = clock.now(time.monotonic)
+    now = time.monotonic()
     return now - min(_WAITING_SINCE.values())
 
 
@@ -518,13 +517,13 @@ class StreamDeliveryTiming:
     def record(
         self, num_new_tokens: int, observe: Callable[[float, int], None]
     ) -> None:
-        now = clock.now(time.perf_counter)
+        now = time.perf_counter()
         if self.last_output_at is None:
             self.last_output_at = now
         else:
             observe(now - self.last_output_at, num_new_tokens)
             # Keep instrumentation work out of the next interval.
-            self.last_output_at = clock.now(time.perf_counter)
+            self.last_output_at = time.perf_counter()
 
 
 @dataclass
