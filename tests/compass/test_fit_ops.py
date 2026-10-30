@@ -57,8 +57,8 @@ def _run(ptl="disabled", root="a" * 40):
         "device": [card | {"arch": SPEC.value("device.arch")}],
         "stack": stack,
         "ptl": ptl,
-        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu"},
-        "source": {"revision_kind": "tree", "revision": root},
+        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu", "atom": root},
+        "source": {"revision_kind": "tree", "revision": "a" * 40},
     }
 
 
@@ -284,7 +284,10 @@ def test_fit_ops_holds_out_no_collective_point_between_neighbours_one_row_apart(
 
 @pytest.mark.parametrize(
     "moved, cell",
-    [({"ptl": "disabled"}, "PTL"), ({"source_root": "tree-" + "b" * 40}, "ATOM src")],
+    [
+        ({"ptl": "disabled"}, "PTL"),
+        ({"source_root": "atom_py-" + "b" * 40}, "ATOM src"),
+    ],
 )
 def test_a_price_list_refuses_at_load_on_another_ptl_state_or_source_root(
     measured, tmp_path, moved, cell

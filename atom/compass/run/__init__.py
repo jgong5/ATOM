@@ -224,7 +224,7 @@ from pathlib import Path
 import numpy as np
 
 import atom
-from atom.compass.artifacts import provenance
+from atom.compass.artifacts import Reading, provenance
 from atom.compass.clock import (
     TAR,
     ClockAbort,
@@ -286,6 +286,8 @@ PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
 SUMMARY_SCHEMA_VERSION = 11
+#: The reading kind of ATOM's source as `atom_digest` reads it.
+ATOM_PY = "atom_py"
 #: Compass source the host-law key leaves out, by path under the package: all
 #: of it (None), or the top-level names (def, class or assigned) only a simulated
 #: run reaches, with the comments above each and the module docstring.
@@ -301,6 +303,9 @@ COMPASS_ONLY = {
     },
     "utils/zmq_shim.py": {"_Socket", "_ChannelSocket", "_Context"},
 }
+#: The module `pip install -e .` writes (setuptools_scm) and git ignores: no
+#: commit holds it, so the host-law key leaves it out.
+INSTALL_WRITTEN = Path("_version.py")
 #: The run-file key of each backend a flag names (`atom.compass.drive.runfile`).
 STEP_STUB, STEP_LINEAR, STEP_GRID = "step_stub", "step_linear", "step_grid"
 OP_GRAPH, PRICE_LIST = "op_graph", "price_list"
@@ -1850,10 +1855,36 @@ def host_key(config) -> dict:
 def host_key_of(model: str, engine: dict) -> dict:
     """`host_key` for the model `model` names and the engine config `engine`
     that `keyed` gave, for a process that holds no resolved config."""
+    return {
+        "host_cpu": host_cpu(),
+        "atom": atom_digest(),
+        "model": _file_digest(model, "config.json"),
+        "engine": engine,
+    }
+
+
+def atom_source(digest: str | None = None) -> Reading:
+    """ATOM's source as every artifact reads it: `atom_digest`, here or as a
+    record's run.json ``host_key.atom`` states it in `digest`, a reading of
+    kind `ATOM_PY`."""
+    return Reading(ATOM_PY, atom_digest() if digest is None else digest)
+
+
+def source_root(digest: str | None = None) -> str:
+    """The ``source_root`` a key holds for `atom_source`, ``<kind>-<value>``."""
+    reading = atom_source(digest)
+    return f"{reading.kind}-{reading.value}"
+
+
+def atom_digest() -> str:
+    """The sha256 of ATOM's Python modules here, less `COMPASS_ONLY` and
+    `INSTALL_WRITTEN`."""
     root = Path(atom.__file__).parent
     digest = hashlib.sha256()
     for path in sorted(root.rglob("*.py")):
         relative = path.relative_to(root)
+        if relative == INSTALL_WRITTEN:
+            continue
         skip = next(
             (v for k, v in COMPASS_ONLY.items() if relative.is_relative_to(k)), ()
         )
@@ -1869,12 +1900,7 @@ def host_key_of(model: str, engine: dict) -> dict:
             if node is doc or names & skip:
                 del lines[prev.end_lineno if prev else 0 : node.end_lineno]
         digest.update(f"{relative}\0".encode() + b"".join(lines))
-    return {
-        "host_cpu": host_cpu(),
-        "atom": digest.hexdigest(),
-        "model": _file_digest(model, "config.json"),
-        "engine": engine,
-    }
+    return digest.hexdigest()
 
 
 def _file_digest(name: str, filename: str) -> str | None:

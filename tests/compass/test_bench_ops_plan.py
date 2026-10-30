@@ -110,7 +110,7 @@ def bench(tmp_path, monkeypatch):
         "device": [{"index": 6, "name": spec.value("device.name")}],
         "stack": {c: spec.value(f"device.software_pinned_to.{c}") for c in PINNED},
         "ptl": "disabled",
-        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu"},
+        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu", "atom": "a"},
         "source": {"revision_kind": "tree", "revision": "a" * 40},
     }
     run["device"][0]["arch"] = spec.value("device.arch")

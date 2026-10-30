@@ -22,12 +22,9 @@ from atom.compass.artifacts import (
     Key,
     Kind,
     RankCoords,
-    Reading,
     Topology,
-    git_tree_root,
     machine_spec_digest,
     machine_spec_key,
-    module_root,
 )
 from atom.compass.memory.readings import MemoryReadings
 
@@ -86,13 +83,13 @@ def key_fields(config) -> dict:
 
 def conditions(fields: dict, **platform) -> Conditions:
     """The readings an entry keyed by `fields` is published or loaded under:
-    `platform`'s device, software stack and torch, this process's ATOM tree
+    `platform`'s device, software stack and torch, this process's ATOM source
     and host CPU, and the key's model and engine config."""
-    from atom.compass.run import host_cpu
+    from atom.compass.run import atom_source, host_cpu
 
     return Conditions.of(
         **platform,
-        atom_src=Reading.of_source_root(git_tree_root("atom", module_root("atom"))),
+        atom_src=atom_source(),
         model=fields["model"],
         host_cpu=host_cpu(),
         engine_config=fields["engine_config"],

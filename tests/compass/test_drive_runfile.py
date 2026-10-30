@@ -36,9 +36,7 @@ from atom.compass.artifacts import (
     Key,
     Kind,
     Topology,
-    git_tree_root,
     member_name,
-    module_root,
 )
 from atom.compass.backends import StepGridBackend, StepLinearBackend, StepStubBackend
 from atom.compass.backends.op_graph import OpGraphBackend
@@ -454,8 +452,7 @@ def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost
 
 def price_list_key(tmp_path, **layout):
     """The `price_list` key fields of the suite's model, on its machine, from
-    this tree, at the deployment's layout less `layout`."""
-    tree = git_tree_root("atom", module_root("atom"))
+    this ATOM source, at the deployment's layout less `layout`."""
     config = (tmp_path / "config.json").read_bytes()
     return {
         "model": "sha256:" + hashlib.sha256(config).hexdigest(),
@@ -467,7 +464,7 @@ def price_list_key(tmp_path, **layout):
         "enable_expert_parallel": False,
         "enable_dp_attention": False,
         "machine_spec": SPEC_DIGEST,
-        "source_root": f"{tree.revision_kind}-{tree.revision}",
+        "source_root": compass_run.source_root(),
         **layout,
     }
 

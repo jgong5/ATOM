@@ -45,7 +45,6 @@ from atom.compass.artifacts import (
     Key,
     Kind,
     Provenance,
-    Reading,
     Topology,
     machine_spec_key,
     member_name,
@@ -247,21 +246,20 @@ def projection(machine: MachineSpec, cells: dict) -> dict:
 
 def publish(store: str, document: dict, cells: dict, machine, command: str):
     """Publish `document` in `store` as a `projection`, keyed by its model,
-    spec, ATOM tree and cells."""
+    spec, ATOM source and cells."""
     import torch
 
-    from atom.compass.run import host_cpu
+    from atom.compass.run import atom_source, host_cpu, source_root
 
     model = next(iter(cells.values()))[1]["model"]
     roots = roots_for({"atom": "atom", "aiter": "aiter"})
-    atom = next(r for r in roots if r.name == "atom")
     engines = json.dumps([c["engine"] for _, c in cells.values()], sort_keys=True)
     identity = json.dumps([[c["steps"], c["engine"]] for _, c in cells.values()])
     key = Key.of(
         Kind.PROJECTION,
         model=model,
         spec=machine.digest(),
-        source_root=f"{atom.revision_kind}-{atom.revision}",
+        source_root=source_root(),
         cells=f"sha256:{hashlib.sha256(identity.encode()).hexdigest()}",
     )
     rank = Topology().ranks()[0]
@@ -274,7 +272,7 @@ def publish(store: str, document: dict, cells: dict, machine, command: str):
         conditions=Conditions.of(
             **machine_spec_key(machine).values,
             torch=torch.__version__,
-            atom_src=Reading.of_source_root(atom),
+            atom_src=atom_source(),
             model=model,
             host_cpu=host_cpu(),
             engine_config=engines,

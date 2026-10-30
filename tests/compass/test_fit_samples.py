@@ -131,7 +131,7 @@ def test_two_records_differing_only_in_kv_cache_dtype_refuse_naming_both_values(
             "steps/dp0.engine.json",
             lambda e: e.update(tensor_parallel_size=2),
         ),
-        ("source_root", "run.json", lambda r: r["source"].update(revision="0e724ed5")),
+        ("source_root", "run.json", lambda r: r["host_key"].update(atom="1" * 64)),
         ("host_key host_cpu", "run.json", lambda r: r["host_key"].update(host_cpu="x")),
         ("sampling temperature", None, None),
     ],
@@ -217,7 +217,7 @@ def test_each_sample_copies_its_input_s_provenance_and_the_traces_it_served(
         "engine_config": json.loads(a.joinpath("run.json").read_text())["host_key"][
             "engine"
         ],
-        "source_root": "tree-67c176f0",
+        "source_root": "atom_py-" + "0" * 64,
         "stack": STACK,
         "ptl": "disabled",
         "sampling": SAMPLING,

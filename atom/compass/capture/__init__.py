@@ -181,7 +181,7 @@ def publish(store, graph, model, declared, tp, atom_args, command):
 
     from atom.compass import artifacts as a
     from atom.compass.artifacts.keys import NO_PTL
-    from atom.compass.run import host_cpu
+    from atom.compass.run import atom_source, host_cpu
 
     from .graph import to_json
 
@@ -201,7 +201,7 @@ def publish(store, graph, model, declared, tp, atom_args, command):
         conditions=a.Conditions.of(
             software_stack=a.Reading.of_source_root(roots[1]),
             torch=torch.__version__,
-            atom_src=a.Reading.of_source_root(roots[0]),
+            atom_src=atom_source(),
             model=model,
             device=declared["arch"],
             ptl=NO_PTL,

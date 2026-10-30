@@ -164,13 +164,14 @@ def record(
     (directory / "client.json").write_text(json.dumps(export))
     engine = {**step_grid.keyed(r.config), **BOUNDS, "num_kvcache_blocks": blocks}
     (path.parent / "dp0.engine.json").write_text(json.dumps(engine))
-    kind, revision = configuration["source_root"].split("-", 1)
+    atom = configuration["source_root"].split("-", 1)[1]
     run_json = {
         "format_version": 2,
         "argv": ["compass", "record", "--out", str(directory)],
-        "source": {**SOURCE, "revision": revision, "revision_kind": kind},
+        "source": SOURCE,
         "host_key": {
             **HOST,
+            "atom": atom,
             "model": configuration["model"],
             "engine": step_grid.keyed(r.config),
         },
