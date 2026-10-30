@@ -22,6 +22,7 @@ from test_bench_ops import KEY, TREE, _graph, _leaf, _t
 from test_bench_ops import _Runner as OpsRunner
 from test_bench_replay_state import MTP1, gdn_config
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
+from test_gdn_prefill_metadata_host import GDNStateMixin  # importable with no device
 
 from atom.compass import ir
 from atom.compass.bench import ops, replay
@@ -36,16 +37,6 @@ BF16 = "torch.bfloat16"
 SLOTS = 12
 #: Last-level cache bytes: 2 copies of a decode's call pass twice it.
 LLC = 4 << 20
-
-
-def gdn_state():
-    """ATOM's `GDNStateMixin`, imported as a test runs, once every file has
-    collected: with no device, `test_gdn_prefill_metadata_host` imports it
-    with aiter stood in, and an engine module first imported then keeps the
-    stand-in, which taken mid-collection reaches files collected after."""
-    from test_gdn_prefill_metadata_host import GDNStateMixin
-
-    return GDNStateMixin
 
 
 def geometry():
@@ -72,9 +63,8 @@ class GDNRunner(OpsRunner):
         super().__init__({KEY.format(L=0): SimpleNamespace(layer_num=0)})
         self.pool_plan = SimpleNamespace(entries={"state": SLOTS})
         self.config.pool_entries_per_req = {"state": MTP1}
-        mixin = gdn_state()
-        self.forward_vars |= mixin._state_index_buffers(8, MTP1 - 1, "cpu")
-        self.builder = object.__new__(mixin)
+        self.forward_vars |= GDNStateMixin._state_index_buffers(8, MTP1 - 1, "cpu")
+        self.builder = object.__new__(GDNStateMixin)
         self.builder.model_runner, self.builder.replayssm = self, False
         self.slots = []
 
@@ -97,7 +87,7 @@ def test_a_gdn_point_counts_each_state_slot_its_layer_s_kernels_are_handed(
     shape,
 ):
     k_heads, v_heads, k_dim, v_dim, kernel = geometry()
-    conv, state = gdn_state()._state_shape(
+    conv, state = GDNStateMixin._state_shape(
         1, k_heads, v_heads, k_dim, v_dim, kernel, MTP1 - 1
     )
     bf16 = torch.bfloat16
