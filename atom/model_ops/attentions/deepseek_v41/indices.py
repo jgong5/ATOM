@@ -323,23 +323,58 @@ def fill_step_indptrs(step, geometry, buffers):
         eptr = pptr if step.decode and not split else extend[: step.width + 1]
         built[ratio] = (pptr, eptr, geometry.batch_topk(ratio))
     if ratios:
-        _indptr_scan_all[(len(ratios),)](
+        _launch_indptr_scan(
             step.batch_ids,
             step.positions,
             step.cu_seqlens_q,
             tuple(built[ratio][0] for ratio in ratios),
             tuple(built[ratio][1] for ratio in ratios),
-            step.width,
             _replay_start(step),
             _cached_until(step),
-            DECODE=step.decode,
-            WINDOW=geometry.window_size,
-            RATIOS=ratios,
-            TOPKS=tuple(built[ratio][2] for ratio in ratios),
-            SPLIT=split,
-            BLOCK=min(1024, triton.next_power_of_2(max(step.width, 1))),
+            decode=step.decode,
+            window_size=geometry.window_size,
+            ratios=ratios,
+            topks=tuple(built[ratio][2] for ratio in ratios),
+            split=split,
         )
     return built
+
+
+def _launch_indptr_scan(
+    batch_ids,
+    positions,
+    cu_seqlens_q,
+    pptrs,
+    eptrs,
+    replay_start,
+    cached_until,
+    *,
+    decode,
+    window_size,
+    ratios,
+    topks,
+    split,
+):
+    """`fill_step_indptrs`' scan, from the step's fields it reads: the launch
+    takes these and no `BatchStep`, whose per-request host state and
+    per-forward tables no kernel reads."""
+    width = positions.numel()
+    _indptr_scan_all[(len(ratios),)](
+        batch_ids,
+        positions,
+        cu_seqlens_q,
+        pptrs,
+        eptrs,
+        width,
+        replay_start,
+        cached_until,
+        DECODE=decode,
+        WINDOW=window_size,
+        RATIOS=ratios,
+        TOPKS=topks,
+        SPLIT=split,
+        BLOCK=min(1024, triton.next_power_of_2(max(width, 1))),
+    )
 
 
 def build_window_rows(step, geometry, window, eptr):
@@ -354,17 +389,32 @@ def build_window_rows(step, geometry, window, eptr):
         device=step.positions.device,
     )
     if step.width:
-        _window_rows[(step.width,)](
+        _launch_window_rows(
             rows,
             eptr,
             step.positions,
             step.batch_ids,
             step.slots,
-            BLOCK=triton.next_power_of_2(geometry.window_size),
-            WINDOW=geometry.window_size,
-            **window_constexprs(window),
+            window,
+            window_size=geometry.window_size,
         )
     return rows
+
+
+def _launch_window_rows(
+    rows, eptr, positions, batch_ids, slots, window, *, window_size
+):
+    """`build_window_rows`' launch, from the step's fields it reads."""
+    _window_rows[(positions.numel(),)](
+        rows,
+        eptr,
+        positions,
+        batch_ids,
+        slots,
+        BLOCK=triton.next_power_of_2(window_size),
+        WINDOW=window_size,
+        **window_constexprs(window),
+    )
 
 
 def build_indices(
@@ -401,8 +451,8 @@ def build_indices(
         device=step.positions.device,
     )
     if step.width and plane:
-        _indices[(step.width, layers)](
-            selected if topk else prefix,
+        _launch_indices(
+            selected,
             pptr,
             prefix,
             eptr,
@@ -412,23 +462,81 @@ def build_indices(
             step.cu_seqlens_q,
             step.slots,
             step.block_tables,
-            step.block_tables.stride(0),
-            geometry.main_offset(owner) if ratio else 0,
-            window.ring_start,
-            stride,
-            plane,
             _replay_start(step),
             _cached_until(step),
-            DECODE=step.decode,
-            ROWS_PER_PAGE=geometry.block_size // (ratio or 1),
-            PAGE_ROWS=geometry.page_bytes
+            window,
+            layers=layers,
+            main_offset=geometry.main_offset(owner) if ratio else 0,
+            stride=stride,
+            plane=plane,
+            decode=step.decode,
+            rows_per_page=geometry.block_size // (ratio or 1),
+            page_rows=geometry.page_bytes
             // (1 if geometry.packed else geometry.row_bytes),
-            PACKED=geometry.packed,
-            MAIN_ROW_BYTES=geometry.main_row_bytes,
-            TOPK=topk,
-            BLOCK=triton.next_power_of_2(max(topk, geometry.window_size)),
-            WINDOW=geometry.window_size,
-            HISTORY=history,
-            **window_constexprs(window),
+            packed=geometry.packed,
+            main_row_bytes=geometry.main_row_bytes,
+            window_size=geometry.window_size,
+            history=history,
         )
     return prefix.view(layers, plane), pptr, extend, eptr
+
+
+def _launch_indices(
+    selected,
+    pptr,
+    prefix,
+    eptr,
+    extend,
+    positions,
+    batch_ids,
+    cu_seqlens_q,
+    slots,
+    block_tables,
+    replay_start,
+    cached_until,
+    window,
+    *,
+    layers,
+    main_offset,
+    stride,
+    plane,
+    decode,
+    rows_per_page,
+    page_rows,
+    packed,
+    main_row_bytes,
+    window_size,
+    history,
+):
+    """`build_indices`' launch, from the step's fields and the pool's scalars
+    it reads, into the `prefix` and `extend` its caller allocated."""
+    topk = 0 if selected is None else selected.shape[-1]
+    _indices[(positions.numel(), layers)](
+        selected if topk else prefix,
+        pptr,
+        prefix,
+        eptr,
+        extend,
+        positions,
+        batch_ids,
+        cu_seqlens_q,
+        slots,
+        block_tables,
+        block_tables.stride(0),
+        main_offset,
+        window.ring_start,
+        stride,
+        plane,
+        replay_start,
+        cached_until,
+        DECODE=decode,
+        ROWS_PER_PAGE=rows_per_page,
+        PAGE_ROWS=page_rows,
+        PACKED=packed,
+        MAIN_ROW_BYTES=main_row_bytes,
+        TOPK=topk,
+        BLOCK=triton.next_power_of_2(max(topk, window_size)),
+        WINDOW=window_size,
+        HISTORY=history,
+        **window_constexprs(window),
+    )

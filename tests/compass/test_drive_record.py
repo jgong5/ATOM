@@ -206,6 +206,10 @@ def planted_gpu(tmp_path, monkeypatch):
     (tmp_path / "rocm" / ".info").mkdir(parents=True)
     (tmp_path / "rocm" / ".info" / "version").write_text("7.2.4\n")
     monkeypatch.setenv("ROCM_PATH", str(tmp_path / "rocm"))
+    # The record names what any process writes to Inductor's and Triton's
+    # caches while it serves: the test's own, not the ones its box shares.
+    for var in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+        monkeypatch.setenv(var, str(tmp_path / var.lower()))
     (tmp_path / "model").mkdir()
     (tmp_path / "model" / "config.json").write_text('{"hidden_size": 8}')
     return tmp_path / "model"

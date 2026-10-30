@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
-from atom.utils import clock
+from atom.utils import time_shim as time
 
 
 def _has_text(fields: Any, keys: tuple[str, ...]) -> bool:
@@ -68,7 +67,7 @@ class RequestTiming:
     def first_output(self, *, streaming: bool) -> None:
         if not self.recorded:
             self.recorded = True
-            self.observe(clock.now(time.perf_counter) - self.started_at, streaming)
+            self.observe(time.perf_counter() - self.started_at, streaming)
 
 
 _request_timing: ContextVar[RequestTiming | None] = ContextVar(
@@ -117,7 +116,7 @@ class RequestTimingMiddleware:
             await self.app(scope, receive, send)
             return
 
-        timing = RequestTiming(clock.now(time.perf_counter), self.observe_ttft)
+        timing = RequestTiming(time.perf_counter(), self.observe_ttft)
         context_token = _request_timing.set(timing)
 
         async def timed_send(message):

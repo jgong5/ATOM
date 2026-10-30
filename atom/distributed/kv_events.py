@@ -11,7 +11,6 @@ import itertools
 import logging
 import queue
 import threading
-import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable
@@ -19,7 +18,7 @@ from typing import Any, Final
 
 import msgspec
 
-from atom.utils import clock
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 
@@ -318,7 +317,7 @@ class ZmqEventPublisher(EventPublisher):
         if not evt_list:
             return
         batch = EventBatch(
-            ts=clock.now(time.time),
+            ts=time.time(),
             events=evt_list,
             data_parallel_rank=self._dp_rank,
         )

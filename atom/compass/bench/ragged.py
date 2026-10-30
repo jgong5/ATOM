@@ -19,6 +19,9 @@ above it there is one view per spread. A ratio no such batch reaches, past
 `max_len` or with a row below one token, a batch past `blocks` KV blocks of
 `block_size` tokens, and a draw whose last row misses the sum after `TRIES`
 draws give no view. The rows are shuffled, so the longest lands anywhere.
+Each row computes the seed's tokens a row, one, or under a drafter of K drafts
+a verify step's K + 1, and also holds the K - 1 positions past it its draft
+round writes, as ATOM's scheduler allocates them (`draft_kv_lookahead`).
 """
 
 import bisect
@@ -74,8 +77,11 @@ def compose(
 ):
     """The ragged views of the decode view `seed` (`rows`, `rung`,
     `produces_output`), over the sorted decode-row contexts `contexts`."""
+    from atom.model_engine.block_manager import draft_kv_lookahead
+
     rows, rung = seed["rows"], seed["rung"]
     b, total = len(rows), sum(context for _, context, _ in rows)
+    lookahead = draft_kv_lookahead(rows[0][0] - 1)
     out = []
     if b < 2:
         return out
@@ -86,10 +92,11 @@ def compose(
     for b, ratio in itertools.product(counts, RATIOS):
         for spread in SPREADS[: 1 if ratio == 1.0 else None]:
             got = _rows(b, total, ratio, spread, contexts, rng, max_len)
-            if got is None or sum(math.ceil(c / block_size) for c in got) > blocks:
+            held = sum(math.ceil((c + lookahead) / block_size) for c in got or ())
+            if got is None or held > blocks:
                 continue
             rng.shuffle(got)
-            view = {**seed, "rows": [[1, c, True] for c in got]}
+            view = {**seed, "rows": [[rows[0][0], c, True] for c in got]}
             if view not in out:
                 out.append(view)
     return out

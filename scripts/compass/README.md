@@ -35,11 +35,11 @@ its header.
 | `PYTHONPATH=$T python -m atom.compass.detect.scenario` | either | The acceptance checks every simulated deployment's runs are held to, over the out_dirs of one run file run under different `PYTHONHASHSEED`: each run reached its finish with no refusal, the step tables are byte-identical, and each channel's messages were released to their receiver once each and none behind its clock. With `--record LP=DIR`, an engine LP's TAR rows must equal the timeline a constant step stub implies, computed from the parity record in `DIR` (`pd_sim.sh` writes one per side when `ATOM_COMPASS_PARITY_RECORD` is set). Prints each failure and exits 1. The vertical, DP, PD and PD-DP slices in `tests/compass/` hold their runs to it, with the traffic's outputs too. |
 | `mi308x_spec.py` | GPU container, node 18 or hjbog-srdc-39; any container with `atom` under `--sweep-from` | `python3 scripts/compass/mi308x_spec.py`: rebuild `machines/mi308x-hjbog18.json`, the node-18 MI308X machine spec, by sweeping on this host the tokenizer of each `--model` (repeatable, default Qwen3.8-27B; each distinct tokenizer once, its entry applying to the architecture of every model that loads it) and merging them with the device, capacity and stack of one real engine start and the HTTP intake terms `http_intake.py` fitted over one real burst (`INTAKE`), the PP carriers `pp_carriers.py` fitted on two of the host's GPUs (`PP`, which names the fit's commit and its record's sha256), on node 18 the idle intake over lone requests (`IDLE`), each recorded in the script; with `COMPASS_MACHINE=mi308x-hjbog39`, the same for hjbog-srdc-39 into `machines/mi308x-hjbog39.json`, and on node 18 the attainable peaks `probe_device.py` read (`PEAKS`, which names the probe's commit and its record's sha256). `--sweep-from DOC` takes the sweeps a written document carries instead; given `--model` as well, it sweeps only those models' tokenizers and adds them. Prints `validate`'s verdict and `explain`'s fields grouped by origin; on either host a value no probe fills reads `assumed`. |
 | `pp_carriers.py` | GPU container, two devices of one node | `HIP_VISIBLE_DEVICES=a,b torchrun --nproc-per-node 2 scripts/compass/pp_carriers.py OUT`: send one message per size between the two devices over RCCL and gloo, the receive posted first and late, and fit each carrier's eager threshold, overhead, latency, per-byte time and rendezvous fixed part, and how late a gloo sender blocked before the receive is posted goes on (`wake_s`, `wake_rise_s`). Writes OUT, a JSON record of the fit, its error spread, every sample and the script's text. `python3 scripts/compass/pp_carriers.py OUT RECORD...` fits several such records' samples pooled and names each record's sha256 in place of the samples: one probe's wake moves from run to run. `mi308x_spec.py`'s `PP` states a fit and cites its record. Check the two devices are idle before and after. |
-| `probe_device.py` | GPU container, two idle devices of one node | `HIP_VISIBLE_DEVICES=a,b python3 scripts/compass/probe_device.py SPEC OUT`: time the best BF16 and FP8 GEMM rate over a grid of large shapes, and the MXFP4 one through both hipBLASLt and aiter where SPEC states `fp4_flops`, read-only, write-only and copy sweeps from 4 KiB to 4 GiB moved, an empty kernel replayed in a graph, a peer copy and a peer ping-pong between the two devices, and print the fragment they make on the machine file SPEC: each format's derate, the bandwidth curve and `memory.derate`, `kernel_floor_s`, the intra-node link's latency and derate, the banded ones with their p10 and p90. Refuses a device that holds VRAM or work, or whose `ptl_enable` is not SPEC's `device.ptl`. Writes OUT, the record of the stack it ran on (ROCm, aiter's commit, RCCL and torch), every sample and the script's text; a spec script's `PEAKS` states the readings and cites its sha256. Check the two devices are idle after. |
+| `probe_device.py` | GPU container, two idle devices of one node | `HIP_VISIBLE_DEVICES=a,b python3 scripts/compass/probe_device.py SPEC OUT`: time the best BF16 and FP8 GEMM rate over a grid of large shapes, and the MXFP4 one through each of hipBLASLt and aiter that runs on the device where SPEC states `fp4_flops` (one that fails is named with its error; with neither it refuses), and each format through a Triton GEMM at the tile that ran fastest at the first shape within 1% of torch's output, read-only, write-only and copy sweeps from 4 KiB to 4 GiB moved, an empty kernel replayed in a graph, a peer copy and a peer ping-pong between the two devices, and print the fragment they make on the machine file SPEC: each format's derate, the bandwidth curve and `memory.derate`, `kernel_floor_s`, the intra-node link's latency and derate, the banded ones with their p10 and p90. Refuses a device that holds VRAM or another process's memory as KFD charges it (a gfx1250 card reads 100% busy with none), or whose `ptl_enable` is not SPEC's `device.ptl`. Writes OUT, the record of the stack it ran on (ROCm, aiter's commit, RCCL and torch), the capacity torch reads, every sample and the script's text; a spec script's `PEAKS` states the readings and cites its sha256. Check the two devices are idle after. |
 | `http_intake.py` | GPU container, one real server | `HTTP_INTAKE=STAMPS REAL=1 CONCURRENCY=256 SESSIONS=256 AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0" scripts/compass/cctraces_sim.sh RUN_FILE OUT`, aiperf stopped once the first turns are in, then `python3 scripts/compass/http_intake.py fit STAMPS`: the real server runs under the probe, which stamps each request body its event loop reads and each chat template it renders, and the fit prints `host.http_intake` from the burst; a spec script's `INTAKE` states one burst's fit, cites its STAMPS's sha256, and states each term's p10 and p90 over the host's bursts, each fitted alone. Check the GPUs are idle before and after. `channels.py`'s `ADMISSION_DELAY_S["serving"]` is the transport floor, 0.54 ms on node 18: on one idle GPU, `python3 scripts/compass/http_intake.py serve STAMPS --model /root/models/Qwen3.8-27B --host 127.0.0.1 --server-port PORT -tp 1 --enforce-eager --max-model-len 8192`; once it logs `Uvicorn running`, `python3 -m atom.compass.parity.traffic PORT MODEL RECORD 64 8 0 0 1` (64 requests, one in flight: request 0 read to its end alone, the rest 8 s apart); stop the server, then `python3 scripts/compass/http_intake.py floor STAMPS RECORD/arrivals.json` prints the median it states, with p10, p90 and both inputs' sha256. On the same stamps, `python3 scripts/compass/http_intake.py idle STAMPS PER_BYTE_S`, with the spec's `per_byte_s`, prints the idle intake a spec script's `IDLE` states (`host.http_intake.idle_s`), with p10, p90 and the sha256. |
-| `mi355x_spec.py` | any container with `atom`; the machine's host to re-sweep | `python3 scripts/compass/mi355x_spec.py --sweep-from scripts/compass/machines/mi355x-gpu45.json`: rebuild `machines/mi355x-gpu45.json`, the mi355-gpu-45 MI355X machine spec, from the tokenizer sweep that document carries and the device, capacity, HTTP intake terms (`INTAKE`), datasheet peaks, the attainable peaks `probe_device.py` read on mi355-gpu-45 (`PEAKS`) and assumed values recorded in the script; byte for byte while this script and `mi308x_spec.py` are unchanged. With `COMPASS_MACHINE=mi355x-crs005` and that machine's file, the same for crsuse2-m2m-v3-005 into `machines/mi355x-crs005.json`, which -013 also reads (same host CPU, cards, VBIOS and driver, no ptl directory). Without `--sweep-from` it re-sweeps on the machine's host the tokenizer of each `--model`, as `mi308x_spec.py` does, by default DeepSeek-V4-Pro's (`MODEL` names each host's path). Prints `validate`'s verdict and `explain`'s fields grouped by origin. |
-| `mi455_spec.py` | any container with `atom` | `python3 scripts/compass/mi455_spec.py`: rebuild `machines/mi455.json`, the machine spec of MI455X, which no engine has run on, from its datasheet peaks (`DATASHEET`) and `machines/mi355x-gpu45.json`, every value taken from that file assumed: its derates, and its bandwidth curve scaled to MI455X's datasheet bandwidth, carry MI355X's probed ratios onto MI455X's peaks, and its own values stand where no datasheet states one; byte for byte while this script, `mi308x_spec.py` and `mi355x-gpu45.json` are unchanged. Prints `validate`'s verdict and `explain`'s fields grouped by origin. |
-| `mi455_readings.py` | any container with `atom` | `python3 scripts/compass/mi455_readings.py --store S TOKEN`: publish in S MI455's `memory_readings` entry of the configuration whose mi355-gpu-45 entry `compass measure memory` printed as TOKEN, its members copied with every reading assumed, keyed by `machines/mi455.json`. A run on that spec reads it and declares each term built on it. |
+| `handoff.py` | any container with `atom` | `PYTHONPATH=$T python3 scripts/compass/handoff.py RECORD`: over a real run's step record (`compass record`'s `steps/`), the engine IO threads' queue handoffs it stamped, input receipt to queue put, put to the busy loop's get, and output put to send, as p50 and p99 per prompt-token or step-batch bucket against the median step, and the input p10 beside `ipc_s`. |
+| `mi355x_spec.py` | any container with `atom`; the machine's host to re-sweep | `python3 scripts/compass/mi355x_spec.py --sweep-from scripts/compass/machines/mi355x-gpu45.json`: rebuild `machines/mi355x-gpu45.json`, the mi355-gpu-45 MI355X machine spec, from the tokenizer sweep that document carries and the device, capacity, HTTP intake terms (`INTAKE`), datasheet peaks, the attainable peaks `probe_device.py` read on mi355-gpu-45 (`PEAKS`) and assumed values recorded in the script; byte for byte while this script and `mi308x_spec.py` are unchanged. With `COMPASS_MACHINE=mi355x-crs005` and that machine's file, the same for crsuse2-m2m-v3-005 into `machines/mi355x-crs005.json`, which -013 also reads (same host CPU, cards, VBIOS and driver, no ptl directory); with `COMPASS_MACHINE=mi355x-gpu40`, for mi355-gpu-40 under nightly 20261026's stack into `machines/mi355x-gpu40.json`. Without `--sweep-from` it re-sweeps on the machine's host the tokenizer of each `--model`, as `mi308x_spec.py` does, by default those `SWEPT` names: DeepSeek-V4-Pro's, and on gpu-40 DeepSeek-V4.1-Flash's too. Prints `validate`'s verdict and `explain`'s fields grouped by origin. |
+| `mi455_spec.py` | `a0`: `rocm/ufb-private:vllm-dsv4flash-mori-epv2-mi455-20260922-r5` with aiter at `b6a9d0aeb` on the MI455 node, or any container with `atom` under `--sweep-from`; `b0`: any container with `atom` | `python3 scripts/compass/mi455_spec.py a0 --sweep-from scripts/compass/machines/mi455-a0.json`: rebuild `machines/mi455-a0.json`, the spec of the node's MI455 A0 sample cards, from the tokenizer sweeps that document carries, MI455X's datasheet peaks (`DATASHEET`), the attainable peaks `probe_device.py` read on two of the node's cards (`PEAKS`), the arch, capacity and stack its record holds (`DEVICE`) and assumed values recorded in the script; the HTTP intake terms are mi355-gpu-45's, assumed, until a burst on MI455 fits them. Without `--sweep-from` it re-sweeps the tokenizers of the `--model`s, DeepSeek-V4.1-Flash's by default, on this host. `python3 scripts/compass/mi455_spec.py b0`: rebuild `machines/mi455-b0.json`, the spec of the MI455 B0 performance machines, device `MI455X B0`, which no card here reads, from the same datasheet peaks and `machines/mi355x-gpu45.json`, every value taken from that file assumed: its derates, and its bandwidth curve scaled to MI455X's datasheet bandwidth, carry MI355X's probed ratios onto MI455X's peaks, and its own values stand where no datasheet states one; its arch, assumed, is the A0 samples', and no rate, latency or stack A0's probe read reaches it. Each is byte for byte while this script, `mi308x_spec.py` and `mi355x-gpu45.json` are unchanged, and prints `validate`'s verdict and `explain`'s fields grouped by origin. |
 | `cpu_gate_exclude.txt` | — | Excluded test files in two marked sections: **GENERATED** (`# BEGIN GENERATED`, driver-dependent at *collection* time; never hand-edit — `regen_cpu_gate_exclude.sh` rewrites it wholesale) and **MANUAL** (`# BEGIN MANUAL`, collects cleanly then fails on a driver call or for want of a `.git`, so the regenerator cannot see it). The MANUAL section **is** hand-edited; every entry must carry its observed failure above it. |
 | `gpu_gate_triggers.txt` | — | The source paths that no *running* CPU-gate test names. Generated, not hand-written; matched by `gate_cpu.sh`. A trailing `/` matches a subtree. |
 | `gpu_gate_baseline.env` | — | The GPU gate's baseline as the `BASE_*` lines `gate_gpu.sh` reads: the commit measured, its pass and fail counts, and the torch, HIP and AITER versions it ran under. Written by `regen_gpu_gate_baseline.sh`; a change is a reviewed edit. |
@@ -249,6 +249,35 @@ docker exec <container> bash -c 'cd /app/ATOM/atom/mesh && cargo fetch --locked'
 A change to atomesh's `Cargo.toml` that needs a crate the cache lacks makes the
 probe fail, and so the gate exit 96, until `cargo fetch` runs in that tree's
 `atom/mesh` in the container, with the network.
+
+## The MI455 image, and what stops a TP4 start in it
+
+The gate image ships no gfx1250 kernels. MI455 work runs under
+`rocm/fw-bringup-mlperf:gfx1250-atom-20261026-dsv41` (`sha256:fd7450fde2da`),
+whose aiter is a git checkout (`/app/aiter`) and which carries `rocm-smi`, the
+two things `compass measure memory` reads for the stack and the device. Its
+entrypoint is `/bin/bash`, so the command is `-c`; a tree runs as in the gate,
+a `snapshot.sh` tarball extracted inside and run from `/` with `PYTHONPATH=$T`:
+
+```
+docker run -d --name <user>_mi455 --network host --device /dev/kfd --device /dev/dri \
+  --group-add video --ipc host -v <parent>:<parent> -v <models>:<models> \
+  rocm/fw-bringup-mlperf:gfx1250-atom-20261026-dsv41 -c 'sleep infinity'
+```
+
+DeepSeek-V4.1-Flash's gfx1250 flags are in
+[its recipe](../../recipes/DeepSeek-V4.1-Flash.md#gfx1250-mi455x). What stops
+`ec341a05a` serving it at TP4 in this image on an A0 node, with the measurements
+in [#2359](https://github.com/jgong5/ATOM/issues/2359):
+
+- **Every process translates its own GPU code.** On a gfx1250 A0 card ROCr
+  rewrites each B0 code object a process loads for A0, in that process, and keeps
+  nothing for the next; `HSA_HOTSWAP_VERBOSE=1` logs `installed eager gfx1250
+  B0-to-A0 hook` there. Each rank holds its translations in host memory, which a
+  TP4 start's four ranks exhaust in `ncclCommInitRank`, before the weights load;
+  watch `MemAvailable` while more than one such process starts.
+- **Its aiter lacks `ROCm/aiter#6833`:** `fused_dual_rmsnorm_mxfp8_quant` takes
+  no `amax_floor`, which V4.1's `DualRMSNormMXFP8` passes.
 
 ## A red CPU gate that may not be your diff — one flaky test in ATOM's suite
 
@@ -727,6 +756,17 @@ Their host keys carry the `atom`
 digest of the tree they were last re-keyed at; `provenance` names the
 capture tree's.
 
+`scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-crs005-{prefill,decode}.json`
+are the same pair for the cell on crsuse2-m2m-v3-005 (prefill) and -013 (decode),
+keyed by `machines/mi355x-crs005.json`, in the image that file pins, at
+`--gpu-memory-utilization 0.75`: the `base` form with host laws, each written by
+`step_linear_fit` from its side's cells. The cells are the gpu-45 pair's, run by
+`calib_capture.sh`, the prefill side's on 005 and the decode side's on 013, and a
+cell that built an aiter JIT module was run again. The decode side adds a c=256 cell
+at seed 20260709 and, for rung 12, c=96 at seeds 20260707 and 20260708 and c=112 at
+seed 20260709: a lone decode server at c=256 decodes at rungs 16 to 28, and at c=64
+at rungs 4 and 8.
+
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json`
 are the same pair with expert parallelism on (MORI): the `history` form, fitted by
 `compass fit steps` and `compass fit host` on each side's cells, captured on mi355-gpu-40
@@ -797,12 +837,34 @@ reaches 005 through `/shared_nfs` seconds late, so set `PREFIX_S=300`.
 |---|---|---|
 | `ATOM_HOST_IP` | `10.245.151.159` | `10.245.149.94`, also the decode's `--host` |
 | `ATOM_MOONCAKE_IB_DEVICE` | unset | unset |
+| `ATOM_MOONCAKE_MATCHED_RAILS` | `auto` | `auto` |
+| `MC_IB_TC` | `96` | `96` |
+| `MOONCAKE_DISABLE_HIP_DMABUF` | `0` | `0` |
 
 `ATOM_HOST_IP` is each node's `ens3` address, which the router, Mooncake's
 handshake and its notifications reach. With `ATOM_MOONCAKE_IB_DEVICE` unset,
 each GPU N registers with `ionic_N`, which carries RoCE v2 on IPv6 only (GID
-index 1); the image's libibverbs warns that the ionic driver does not support
-the kernel's ABI, and the RDMA writes still complete. The prefill side's own
+index 1). These keep the KV on it rather than on Mooncake's TCP fallback
+(`Found 0 HCAs` in `server.log`), whose transfers time out at c=256:
+
+- **The host's ionic provider.** The image's `libionic.so.1.0.54.0` does not
+  support the host kernel's ionic ABI. Create each container with the host's
+  mounted over it: `-v /usr/lib/x86_64-linux-gnu/libionic.so.1.1.2410:/usr/lib/x86_64-linux-gnu/libionic.so.1.0.54.0-149.g3304be71:ro`.
+- **`MC_IB_TC=96`.** On the default traffic class RoCE between the nodes stops
+  with retry-exceeded completions.
+- **Matched rails.** `ionic_N` on one node reaches only `ionic_N` on the other,
+  and the router pairs any prefill rank with any decode rank: without
+  `ATOM_MOONCAKE_MATCHED_RAILS=auto` ([Mooncake matched rails](../../docs/mooncake_matched_rails.md))
+  every write from GPU N to a decode rank on another GPU fails with retry
+  exceeded, and its transfer times out.
+- **dmabuf registration, at `--gpu-memory-utilization 0.75` or below.** With no
+  ionic peer-memory module loaded on the hosts, `ibv_reg_mr` on GPU memory fails
+  (`ret=-202`), so `MOONCAKE_DISABLE_HIP_DMABUF=0` overrides the image's `1`.
+  amdgpu then counts each registered buffer twice against the free memory, as
+  allocated and as pinned, after ATOM has sized its KV cache: at `0.85`
+  DeepSeek-V4-Pro at TP8 runs out of memory right after registration.
+
+The prefill side's own
 variables go in `deploy.sh`'s environment, the decode side's as `-e` words of the
 prefix:
 
@@ -914,7 +976,8 @@ Developer checks, outside the `compass` path:
 ### The same cell under the step grid
 
 The step grid reuses steps 1 to 4: the calibration records are its residual's
-targets, and the real runs are its coverage check's inputs and its graded side.
+targets and, through the ragged views step 7 composes from them, alpha's; the
+real runs are its coverage check's inputs and its graded side.
 Its points are planned from the shape populations and step 4's real runs, so
 every cell a real step falls in is measured: a population alone leaves the cells
 of shapes only the real server scheduled unmeasured (#1884). The plan reads
@@ -942,11 +1005,20 @@ powers of two and no margin:
    GPUs each take a subset of the inputs into a store of its own, starts a minute
    apart; copying each store's `step_measurement` entries into one, and this step
    again over every input, measures what remains.
+   Then `compass measure steps $R/cal/c* --sample 6 --seed N --ragged --client-run
+   $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... --sampling '{"ignore_eos":
+   true}' --gpu G $S --out $R/ragged -- $ATOM`, naming every record: it draws six
+   decode steps a rung and measures the ragged views composed from each. Alpha
+   is fitted on these views alone. Each view measured prints `measured decode
+   rung <R> <token>: ...`; keep every token, since a rerun prints only the views
+   the store lacked.
 8. `compass fit steps --backend step-grid --grid POP... $R/cell/c*/real*
-    --grid-definition $G $R/cal/c* --client-run ...`, naming every population,
-    real run and record, `$M $S --out $R/fit-grid`; it prints the bundle's
-    token. A second fit of one definition into one store is refused as an
-    overwrite: refit into a fresh store.
+    --grid-definition $G $R/cal/c* RAGGED... --client-run ...`, naming every
+    population, real run and record, and as `RAGGED` every token step 7's
+    `--ragged` run printed, `$M $S --out $R/fit-grid`; it prints the bundle's
+    token, and its report's `alpha` states per rung whether alpha was kept. A
+    second fit of one definition into one store is refused as an overwrite:
+    refit into a fresh store.
 9. `compass run --step-grid BUNDLE --host-laws HOST --coverage $R/cell/c<C>/real*
     $M $S --out $R/cell-grid/c<C>/step_grid -- $ATOM`, serving the same client run as
     step 5. The check counts the real steps the bundle covers, extrapolates past

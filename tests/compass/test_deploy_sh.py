@@ -23,6 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from test_launcher_held_ports import HELD, SQUAT
 from test_memory_readings import DOCUMENT
 
 from atom.compass import run as compass_run
@@ -472,3 +473,47 @@ def test_a_simulated_router_refuses_the_caller_s_request_timeout(
     assert done.returncode == 2, done.stderr
     assert "the router's arguments carry --request-timeout-secs," in done.stderr
     assert not (tmp_path / "d").exists()
+
+
+#: Another process, then a server, on the router's ports and the prefill's
+#: block of write requests, two for DP 2 by DP 1.
+SQUAT_ROUTER = """
+import json, os, sys
+a, d = sys.argv[1:], os.path.dirname(os.environ["PLANTED_SUMMARY"])
+kv = json.loads(json.load(open(d + "/prefill.argv.json"))[-1])
+base = int(kv["compass_kv_write_req"].rsplit(":", 1)[1])
+ports = [a[a.index(f) + 1] for f in ("--port", "--prometheus-port")]
+sys.argv[1:] = [*ports, str(base), str(base + 1)]
+""" + SQUAT
+
+
+def test_each_port_a_run_hands_a_server_is_held_from_another_process_first(
+    tmp_path, planted
+):
+    env, flags = planted
+    seen, bindir = tmp_path / "seen", Path(env["ATOMESH"]).parent
+    env |= {"SQUAT": SQUAT, "SQUAT_ROUTER": SQUAT_ROUTER}
+    python3 = (bindir / "python3").read_text().split("\n", 1)
+    (bindir / "python3").write_text(
+        f"{python3[0]}\n"
+        'case "$1 $2" in "-m atom.compass.run")\n'
+        f'    {sys.executable} -c "$SQUAT" "${{6##*:}}" >>{seen};;\n'
+        f"esac\n{python3[1]}"
+    )
+    (bindir / "atomesh").rename(bindir / "router")
+    (bindir / "atomesh").write_text(
+        f'#!/bin/sh\n{sys.executable} -c "$SQUAT_ROUTER" "$@" >>{seen}\n'
+        f'exec {bindir}/router "$@"\n'
+    )
+    (bindir / "atomesh").chmod(0o755)
+    script = subprocess.Popen(
+        argv(tmp_path, flags), env=env, cwd=tmp_path, stdout=subprocess.PIPE, text=True
+    )
+    try:
+        _until(tmp_path / "d" / "server.json", script)
+    finally:
+        script.send_signal(signal.SIGTERM)
+        script.communicate(timeout=60)
+
+    squatted = [line.split()[1:] for line in seen.read_text().splitlines()]
+    assert squatted == [HELD] * 5  # the clock's first

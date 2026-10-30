@@ -1252,7 +1252,8 @@ def engine(config):
 
     A real run recording its steps (`parity.ENV`) outside a pipeline stamps the
     engine's input pulls and output puts into ``dp<rank>.pulls.jsonl`` beside
-    the record (`clock.stamp_pulls`).
+    the record, and its IO-thread queue handoffs into ``dp<rank>.handoff.jsonl``
+    (`clock.stamp_pulls`).
     """
     global _member
     run = spec()
@@ -1266,7 +1267,8 @@ def engine(config):
             rank = config.parallel_config.data_parallel_rank
             # The worker's step timestamps read the same host clock.
             pulls = record / f"dp{rank}.pulls.jsonl"
-            clock.stamp_pulls(pulls, time.monotonic_ns)
+            handoff = record / f"dp{rank}.handoff.jsonl"
+            clock.stamp_pulls(pulls, handoff, time.monotonic_ns)
         return contextlib.nullcontext()
     from atom.utils.distributed import utils
 
@@ -1751,7 +1753,7 @@ def _price_list(run: dict, config, machine):
 def _graph_pool(model_runner, machine, model):
     """What ATOM's `_estimate_cudagraph_overhead` reserves for this deployment:
     nothing under ``enforce_eager``, else the branch the runner's own
-    `_piecewise_cg_active` picks, over the same config fields it reads."""
+    `_tr_hybrid_active` picks, over the same config fields it reads."""
     from atom.compass.memory import (
         PiecewiseCapture,
         capture_token_shapes,
@@ -1762,11 +1764,11 @@ def _graph_pool(model_runner, machine, model):
     config = model_runner.config
     if config.enforce_eager:
         return reserves(enforce_eager=True)
-    if not model_runner._piecewise_cg_active():
+    if not model_runner._tr_hybrid_active():
         return reserves(activations=model.activations)
     if getattr(config, "speculative_config", None):
         raise ValueError(
-            "under a drafter ATOM's piecewise capture reserves for each draft "
+            "under a drafter ATOM's token-graph capture reserves for each draft "
             "q bucket, and its DP token cap, which this mirror does not take"
         )
     hf = config.hf_config
@@ -2007,7 +2009,8 @@ def engine_loop(engine_core):
     steps cost. A stop reaches the engine as the ``+inf`` grant instead.
 
     A pipeline stage's runner calls go through `pp_send.install`'s sends. A
-    recorded real run's SIGTERM goes through `_stop_recording`."""
+    recorded real run's SIGTERM goes through `_stop_recording`, and its input
+    queue stamps each request frame's handoff (`clock.stamp_input`)."""
     from atom.compass import parity
 
     run, sections, before = spec(), {}, None
@@ -2024,6 +2027,7 @@ def engine_loop(engine_core):
         )
         before = signal.signal(signal.SIGTERM, signal.SIG_IGN)
     elif os.environ.get(parity.ENV):
+        clock.stamp_input(engine_core)
         stop = functools.partial(
             _stop_recording, engine_core, signal.getsignal(signal.SIGTERM)
         )

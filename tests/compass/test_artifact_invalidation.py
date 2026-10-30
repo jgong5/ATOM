@@ -217,15 +217,12 @@ def test_each_new_kind_is_checked_against_its_own_row(kind, row):
 
 
 def test_only_host_laws_depend_on_the_host_cpu():
-    """Host laws time the host; step measurements and laws hold device time,
-    so they keep the step grid bundle's axes, and the host CPU is not one."""
+    """Host laws time the host launching into, and waiting on, the device and
+    its stack, so every axis invalidates them; step measurements and laws hold
+    device time, so they keep the step grid bundle's axes, and the host CPU is
+    not one."""
     assert [row for row in Row if MATRIX[row][Axis.HOST_CPU].depends] == [Row.HOST_LAWS]
-    assert axes_of(Row.HOST_LAWS) == (
-        Axis.ATOM_SRC,
-        Axis.MODEL,
-        Axis.HOST_CPU,
-        Axis.ENGINE_CONFIG,
-    )
+    assert axes_of(Row.HOST_LAWS) == tuple(Axis)
     for row in (Row.STEP_MEASUREMENT, Row.STEP_LINEAR_LAW):
         assert axes_of(row) == axes_of(Row.STEP_GRID_BUNDLE)
 

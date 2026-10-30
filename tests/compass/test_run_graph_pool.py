@@ -76,7 +76,7 @@ def _installed(
             capture_sizes=list(sizes or CAPTURE_SIZES),
             kv_transfer_config={},
         ),
-        _piecewise_cg_active=lambda: piecewise,
+        _tr_hybrid_active=lambda: piecewise,
     )
     machine = run.get("machine", DOCUMENT)
     with_readings(runner, tmp_path / "store", readings, machine)

@@ -39,7 +39,7 @@ import socket
 import subprocess
 import sys
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
 import atom
@@ -130,7 +130,8 @@ def serve(
     if out.exists() and any(out.iterdir()):
         raise ServeError(f"{out} holds an earlier run's files; one run per directory")
     out.mkdir(parents=True, exist_ok=True)
-    server_port, engine_port, clock_port, dp_port = _free_ports(4)
+    held = ExitStack()
+    server_port, engine_port, clock_port, dp_port = held.enter_context(_held_ports(4))
     argv = [*SERVER, *KEEP_ALIVE, *atom_args, "--host", host]
     argv += ["--server-port", str(server_port), "--port", str(engine_port)]
     ready = {"url": f"http://{host}:{server_port}"}
@@ -157,7 +158,7 @@ def serve(
         run_file.write_text(json.dumps(run))
         argv += ["--compass-run", str(run_file)]
         ready |= {"clock_endpoint": run["clock_endpoint"], "run_file": str(run_file)}
-    with _stop_signals() as stopped, quiet(gpus, out) if gpus else nullcontext():
+    with held, _stop_signals() as stopped, quiet(gpus, out) if gpus else nullcontext():
         kfd = _kfd() if gpus else None
         with (out / LOG_FILE).open("w") as log:
             server = subprocess.Popen(
@@ -232,19 +233,23 @@ def _refuse(atom_args) -> None:
             raise ServeError(f"{arg} profiles the server, and only a profiled pass may")
 
 
-def _free_ports(n: int) -> list[int]:
+@contextmanager
+def _held_ports(n: int):
     """`n` free ports from `SERVE_PORTS`, bound together on every address so no
-    two are the same."""
+    two are the same, and held until leaving with SO_REUSEADDR set: no other
+    process binds one but a listener that sets it too, as a server's do."""
     held, ports = [], below_ephemeral(SERVE_PORTS)
     try:
         for port in random.sample(ports, len(ports)):
             held.append(socket.socket())
             try:
                 held[-1].bind(("", port))
+                held[-1].setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             except OSError:
                 held.pop().close()
             if len(held) == n:
-                return [s.getsockname()[1] for s in held]
+                yield [s.getsockname()[1] for s in held]
+                return
         raise ServeError(
             f"fewer than {n} free ports from {ports.start} up to {ports.stop} "
             f"({SERVE_PORTS.stop}, or the ephemeral range's low bound in {PORT_RANGE})"
