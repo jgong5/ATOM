@@ -153,21 +153,9 @@ serve() {
     shift
     PORT=$(compass_held_port) servers=()
     # The DP master port, the engine sockets across trees 100 above it (3 for
-    # each of four ranks) and the base port 112 above it: all free, and below
-    # the ephemeral range, so no connection's source port takes one of them
-    # before its server binds it.
-    master=$(python3 -c 'import random, socket
-low = int(open("/proc/sys/net/ipv4/ip_local_port_range").read().split()[0])
-def free(p):
-    with socket.socket() as s:
-        try:
-            s.bind(("", p))
-        except OSError:
-            return False
-    return True
-while not all(map(free, range(p := random.randrange(low // 2, low - 113), p + 113))):
-    pass
-print(p)')
+    # each of four ranks) and the base port 112 above it: all held, so no other
+    # process, nor any connection's source port, takes one of them first.
+    master=$(compass_held_port 113)
     base=$((master + 112))
     for ((k = 0; k < TREES; k++)); do
         log=$OUT/$side/server.log port=$PORT devices=() dp=()
