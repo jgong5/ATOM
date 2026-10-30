@@ -29,8 +29,8 @@ def _stand_in_attr(attr):
 
 
 class _AiterStandIn(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    """Every `aiter` module as a stand-in. `gdn_attn` imports aiter at module
-    scope, and without a driver aiter's import raises; nothing here calls it."""
+    """Every `aiter` module as a stand-in, where aiter is not installed:
+    `gdn_attn` imports aiter at module scope, and nothing here calls it."""
 
     def find_spec(self, name, path, target=None):
         if name == "aiter" or name.startswith("aiter."):
@@ -46,11 +46,26 @@ class _AiterStandIn(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         pass
 
 
-if torch.cuda.is_available():
-    from atom.model_ops.attentions.gdn_attn import (
-        GDNStateMixin,
-        compute_causal_conv1d_metadata,
-    )
+try:
+    from aiter.ops.triton.utils._triton import arch_info as _arch_info
+except ImportError:
+    _arch_info = None
+
+if _arch_info is not None:
+    # A real import, so no engine module keeps a stand-in for a later importer
+    # to take. With no device, aiter's Triton helpers cannot probe the arch at
+    # import; nothing here launches a kernel, so they are lent one.
+    _lent = _arch_info._CACHED_ARCH is None
+    if _lent:
+        _arch_info._CACHED_ARCH = "gfx950"
+    try:
+        from atom.model_ops.attentions.gdn_attn import (
+            GDNStateMixin,
+            compute_causal_conv1d_metadata,
+        )
+    finally:
+        if _lent:
+            _arch_info._CACHED_ARCH = None
 else:
     _finder, _before = _AiterStandIn(), set(sys.modules)
     sys.meta_path.insert(0, _finder)
