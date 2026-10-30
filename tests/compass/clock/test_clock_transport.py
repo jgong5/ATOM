@@ -416,8 +416,7 @@ def test_a_connection_closed_mid_run_ends_it_for_every_pending_call(
     served, closing, named
 ):
     ca = _joined()
-    server = served(ca, "tcp://127.0.0.1:0")
-    endpoint = server.endpoint
+    endpoint = served(ca, "tcp://127.0.0.1:0").endpoint
     conns = {"frontend": connect(FRONTEND, endpoint)}
     conns.update((rank, connect(ENGINE, endpoint, rank)) for rank in RANKS)
     pending = []
