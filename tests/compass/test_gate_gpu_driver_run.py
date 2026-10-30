@@ -65,7 +65,12 @@ ROUTER = (
 
 def _tree(tmp_path, driver=DRIVER, smoke=SMOKE):
     root = tmp_path / "ATOM"
-    shutil.copytree(REPO / "scripts" / "compass", root / "scripts" / "compass")
+    # Another gate shard may be writing bytecode into __pycache__ as this copies.
+    shutil.copytree(
+        REPO / "scripts" / "compass",
+        root / "scripts" / "compass",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     main = _suite(EXPECT - 1, RECORD + "\n\ndef test_main():\n    _record('main')\n")
     files = {
         "scripts/compass/preflight.sh": _preflight(0),
