@@ -562,8 +562,8 @@ def _moe(module, name, parent):
     shared = getattr(module, "num_fused_shared_experts", 0)
     ranks = config.ep_size if config.use_ep else config.tp_size
     dp = ranks // attention_tp
-    dealt = module.expert_layout.mode is SharedExpertMode.LEGACY_AITER and dp == 1
-    if shared and config.use_ep and not dealt:
+    legacy = SharedExpertMode.LEGACY_AITER
+    if shared and config.use_ep and (dp > 1 or module.expert_layout.mode != legacy):
         return None
     split = int(config.use_ep and config.low_latency)
     dims = (module.global_num_experts, w13.shape[0] - shared, module.top_k)
