@@ -5,8 +5,9 @@ modules less Compass's own code, the host key's ``atom``: not the git tree.
 A commit that edits a design doc, a test or Compass code moves no reading and
 no key, so memory readings and a step grid bundle published before it load
 after it; one that edits ATOM's scheduler refuses both, naming `ATOM src`. A
-`git archive` copy of a commit reads what its checkout reads, and a checkout
-with uncommitted files still publishes nothing.
+`git archive` copy of a commit reads what its checkout reads, even once
+`pip install -e .` has written `atom/_version.py` there, and a checkout with
+uncommitted files still publishes nothing.
 """
 
 import dataclasses
@@ -135,6 +136,7 @@ def test_a_git_archive_copy_of_a_commit_reads_what_its_checkout_reads(
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         tar.extractall(copy, filter="data")
     (copy / ".compass-commit").write_text(head + "\n")
+    (checkout / "atom/_version.py").write_text("__version__ = '0.1.dev1'\n")
     digest = compass_run.atom_digest()
     resolve(monkeypatch, copy)
 
@@ -163,3 +165,8 @@ def test_a_checkout_with_uncommitted_files_still_publishes_nothing(checkout, tmp
 def test_the_host_key_s_atom_is_the_reading_s_value():
     host = compass_run.host_key_of("/nonexistent-model", {})
     assert compass_run.atom_source().value == host["atom"]
+
+
+def test_an_empty_recorded_atom_refuses_rather_than_reading_this_process():
+    with pytest.raises(ArtifactRefusal, match="a reading states '' for its value"):
+        compass_run.atom_source("")

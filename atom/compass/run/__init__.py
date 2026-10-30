@@ -303,6 +303,9 @@ COMPASS_ONLY = {
     },
     "utils/zmq_shim.py": {"_Socket", "_ChannelSocket", "_Context"},
 }
+#: The module `pip install -e .` writes (setuptools_scm) and git ignores: no
+#: commit holds it, so the host-law key leaves it out.
+INSTALL_WRITTEN = Path("_version.py")
 #: The run-file key of each backend a flag names (`atom.compass.drive.runfile`).
 STEP_STUB, STEP_LINEAR, STEP_GRID = "step_stub", "step_linear", "step_grid"
 OP_GRAPH, PRICE_LIST = "op_graph", "price_list"
@@ -1864,7 +1867,7 @@ def atom_source(digest: str | None = None) -> Reading:
     """ATOM's source as every artifact reads it: `atom_digest`, here or as a
     record's run.json ``host_key.atom`` states it in `digest`, a reading of
     kind `ATOM_PY`."""
-    return Reading(ATOM_PY, digest or atom_digest())
+    return Reading(ATOM_PY, atom_digest() if digest is None else digest)
 
 
 def source_root(digest: str | None = None) -> str:
@@ -1874,11 +1877,14 @@ def source_root(digest: str | None = None) -> str:
 
 
 def atom_digest() -> str:
-    """The sha256 of ATOM's Python modules here, less `COMPASS_ONLY`."""
+    """The sha256 of ATOM's Python modules here, less `COMPASS_ONLY` and
+    `INSTALL_WRITTEN`."""
     root = Path(atom.__file__).parent
     digest = hashlib.sha256()
     for path in sorted(root.rglob("*.py")):
         relative = path.relative_to(root)
+        if relative == INSTALL_WRITTEN:
+            continue
         skip = next(
             (v for k, v in COMPASS_ONLY.items() if relative.is_relative_to(k)), ()
         )
