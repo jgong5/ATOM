@@ -17,11 +17,10 @@ keys, because the decode process owns the blocks.
 """
 
 import logging
-import time
 from collections import deque
 from collections.abc import Callable
 
-from atom.utils import clock
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 
@@ -198,7 +197,7 @@ class EngineStats:
         # usually log to the same place. "" for the aggregated engine.
         self.label = label
         self.throughput_log_interval_s = throughput_log_interval_s
-        self._throughput_last_log_time = clock.now(time.monotonic)
+        self._throughput_last_log_time = time.monotonic()
         self.num_prompt_tokens = 0
         self.num_generation_tokens = 0
 
@@ -748,7 +747,7 @@ class EngineStats:
     ) -> None:
         if not self.throughput_enabled:
             return
-        now = clock.now(time.monotonic)
+        now = time.monotonic()
         elapsed = now - self._throughput_last_log_time
         # `elapsed <= 0` is unreachable while the interval holds the positive
         # value `__init__` validated, but the interval is a public attribute
