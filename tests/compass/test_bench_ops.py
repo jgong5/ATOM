@@ -2125,7 +2125,7 @@ def test_the_decode_top_k_launches_the_scratch_aiter_sizes_for_its_rows_stride_a
 ):
     # V4.1-Flash's prefill T=512 B=1 graph holds both calls, each with its
     # scratch at the one byte the capture's sizing answers; each copy takes
-    # the bytes aiter's own query sizes for the call (255 on MI455 here).
+    # the bytes aiter's own query sizes for the call.
     from aiter.ops import topk
 
     def spec(shape, dtype):
