@@ -88,6 +88,7 @@ def _priced_here(monkeypatch):
         kv_cache_dtype="bf16",
         enable_tbo=False,
         enable_tbo_decode=False,
+        enable_expert_parallel=False,
         speculative_config=None,
         parallel_config=SimpleNamespace(data_parallel_size=1),
     )
