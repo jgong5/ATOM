@@ -261,7 +261,7 @@ def test_pipeline_parallel_speculation_is_refused_before_the_drafter():
 
 def test_piecewise_capture_under_a_drafter_is_refused():
     config = SimpleNamespace(enforce_eager=False, speculative_config=object())
-    r = SimpleNamespace(config=config, _piecewise_cg_active=lambda: True)
+    r = SimpleNamespace(config=config, _tr_hybrid_active=lambda: True)
     with pytest.raises(ValueError, match="draft q bucket"):
         _graph_pool(r, None, None)
 
