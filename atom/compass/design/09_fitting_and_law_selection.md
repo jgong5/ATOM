@@ -246,9 +246,11 @@ fitted on the lone servers prices that side 10% high at rung 4 and 14% at rung 8
 Prefill needs no such column: its gather is variable-length, so `moe_rows` is its real
 tokens. The owner's ruling set two columns, this one and linear `n` under NNLS, for the
 expert reads and the GEMM rows; on the records at hand the solve kept one of the two at
-each rung, and where it kept linear `n` (rung 8) it priced a held-out 1P1D decode side
-+6.2% against +2.2% with the expert column alone, so the law fits that column alone
-([#2493](https://github.com/jgong5/ATOM/issues/2493)).
+each rung. It kept linear `n` at rungs 8 and 20, and at rung 8, the one of them a held-out
+1P1D decode side reaches, it priced that side +6.2% against +2.2% with the expert column
+alone, so the law fits that column alone
+([#2493](https://github.com/jgong5/ATOM/issues/2493)). An MTP draft law's decode vectors
+take no routing column until a data-parallel MTP record tests it there.
 
 Two constructions are load-bearing and both were originally wrong.
 

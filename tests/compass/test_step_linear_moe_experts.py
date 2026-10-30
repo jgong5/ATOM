@@ -15,6 +15,7 @@ import json
 import numpy as np
 import pytest
 from test_backend_step_linear_fit import SPEC, _fit, _record, _steps
+from test_step_linear_draft import _mtp_record
 
 from atom.compass.backends import (
     BatchView,
@@ -169,6 +170,18 @@ def test_a_data_parallel_step_stating_no_group_tokens_is_refused_not_priced_alon
     samples[at] = dataclasses.replace(samples[at], view=view)
     with pytest.raises(ValueError, match=f"step {samples[at].step} has no moe_tokens"):
         fit(samples, options)
+
+
+def test_an_mtp_record_s_draft_law_takes_no_routing_column(tmp_path):
+    records = [_mtp_record(tmp_path / f"dp0-{s}.jsonl", _steps(s)) for s in (3, 4)]
+    law = fit(label_records(records)[0], {"moe_routing": ROUTING})[0]
+    assert all("moe_experts" in v["coefficients"] for v in law["decode"].values())
+    assert law["draft"]["decode"]
+    assert not any(
+        "moe_experts" in v["coefficients"] for v in law["draft"]["decode"].values()
+    )
+    assert "moe_routing" not in law["draft"]
+    StepLinearLaw(law)
 
 
 def test_a_law_with_the_column_and_no_routing_refuses(cells):

@@ -92,7 +92,7 @@ an intercept per rung.
 With `moe_routing`, the model's routed experts and top-k (`--moe-routing E,K`),
 every decode rung vector of any form but `shared` adds `moe_experts`, the
 experts the step's real MoE tokens are expected to reach (`StepLinearLaw`), and
-the law states `moe_routing`.
+the law states `moe_routing`. An MTP record's draft law adds no such column.
 
 Outside `shared`, a decode rung may adopt a `rowmod(k)` column (`StepLinearLaw`),
 read from its rows in scheduled order, by the rule `_rowmod` states; the
@@ -564,7 +564,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
 
     `options` takes `form` (`base` by default), `dp`, the ranks each run
     holds (1 by default), and `moe_routing`, the model's (routed experts,
-    top-k), which adds `moe_experts` to every decode vector; `seed` fixes the `rowmod` shuffles; `draft`, or a
+    top-k), which adds `moe_experts` to every decode vector but the draft
+    law's; `seed` fixes the `rowmod` shuffles; `draft`, or a
     sample with a draft label, adds `seqs` and `out` to the prefill vector.
     """
     from scipy.spatial import QhullError
@@ -713,7 +714,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         if s.draft_s is not None and _draft_kv(s) > 0
     ]
     if drafts:
-        law["draft"] = fit(drafts, options, seed, draft=True)[0]
+        unrouted = {**(options or {}), "moe_routing": None}
+        law["draft"] = fit(drafts, unrouted, seed, draft=True)[0]
         if proposes := [
             s if s.draft_kv_s is None else dataclasses.replace(s, propose_s=s.draft_s)
             for s in samples
