@@ -34,7 +34,7 @@ since serve wrote ``server.json``, when ``/health`` first answered
 steps`, `compass fit host`, `step_linear_fit` and `validate.cost` refuse the
 record. A server that built none leaves no entry.
 Its ``ptl_changes`` names each change of its cards' PTL state from then until
-the stop (`identity.ptl_changes`), which the fits refuse; ``ptl`` is the
+the stop (`identity.ptl_changes`), which they refuse as well; ``ptl`` is the
 state at the stop.
 
 `--profile-ops` and `--profile-steps A:B`, the op-level half's profiled pass,

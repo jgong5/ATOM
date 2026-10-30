@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from test_validate_runs import PTL, PTL_NAMED
 
 from atom.compass.backends import (
     BatchView,
@@ -32,6 +33,7 @@ from atom.compass.backends.step_linear_fit import (
     main,
     mark_held_out,
 )
+from atom.compass.drive.identity import PTL_CHANGES
 from atom.compass.validate.cost import cost_accuracy
 
 PREFILL = {"step": 0.02, "tokens": 6e-5, "query_square": 2e-10, "query_cached": 3e-10}
@@ -1054,6 +1056,17 @@ def test_the_command_refuses_a_record_whose_server_built_an_aiter_module(
     (tmp_path / "out/run.json").write_text(json.dumps({"profiled": False}))
     main(args)
     assert (tmp_path / "law.json").exists()
+
+
+def test_the_command_refuses_a_record_whose_cards_changed_ptl_state(tmp_path):
+    steps = tmp_path / "out/steps"
+    steps.mkdir(parents=True)
+    record = _record(steps / "dp0.jsonl", _steps(6))
+    (tmp_path / "out/run.json").write_text(json.dumps({PTL_CHANGES: PTL}))
+
+    named = f"{record} is not fitted: {PTL_NAMED}"
+    with pytest.raises(ValueError, match=re.escape(named) + "$"):
+        main([str(record), "--out", str(tmp_path / "law.json"), *SPEC])
 
 
 def test_a_dp_law_is_held_out_run_by_run_and_validates_each_steps_costliest_rank(

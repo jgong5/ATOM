@@ -9,8 +9,8 @@ Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
 states the labels; the command writes each record's per-step table beside it.
 A record refuses, before any table is written, when the run.json beside the
-`steps` directory its path resolves into names JIT compiles its server ran
-(`step_labels.refusal`).
+`steps` directory its path resolves into names JIT compiles its server ran or
+changes of its cards' PTL state (`step_labels.refusal`).
 A step whose device label is cut is counted under its reason and not fitted.
 `fit` and `fit_host` take the labelled samples, grouped into runs by their
 provenance's `run`, and each returns its laws and a report. `fit`'s report
