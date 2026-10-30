@@ -136,13 +136,20 @@ socks = [socket.socket() for _ in range(6)]
 for s in socks:
     s.bind(("", 0))
 ports = [s.getsockname()[1] for s in socks]
-# The write requests take n ports from KV_WRITE_REQ_PORT, the fifth: re-pick
-# it, the others still held, until none of them lies in that block.
-while {*ports[:4], ports[5]} & set(range(ports[4], ports[4] + n)):
-    socks.append(socket.socket())
-    socks[-1].bind(("", 0))
-    ports[4] = socks[-1].getsockname()[1]
-for s in socks:
+# The write requests take n ports from KV_WRITE_REQ_PORT, the fifth: hold the
+# rest of its block too, re-picking it, the others still held, until they bind.
+block = []
+while len(block) < n - 1:
+    block.append(socket.socket())
+    try:
+        block[-1].bind(("", ports[4] + len(block)))
+    except (OSError, OverflowError):
+        while block:
+            block.pop().close()
+        socks.append(socket.socket())
+        socks[-1].bind(("", 0))
+        ports[4] = socks[-1].getsockname()[1]
+for s in socks + block:
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
 

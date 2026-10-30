@@ -320,3 +320,26 @@ def test_the_record_names_the_stack_aiter_s_commit_included(monkeypatch, tmp_pat
         "rccl": "2.27.7",
         "torch": torch.__version__,
     }
+
+
+def test_the_cards_are_read_with_no_wait(monkeypatch, tmp_path):
+    """VRAM used, KFD's charges and PTL are counters and a setting the driver
+    keeps, none of which moves while a card wakes, so nothing waits for them."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from atom.compass.drive import identity
+
+    order = []
+    monkeypatch.setattr(probe, "time", SimpleNamespace(sleep=order.append))
+    card = SimpleNamespace(
+        pci_domain_id=0, pci_bus_id=10, pci_device_id=0, gcnArchName="gfx942"
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: card)
+    monkeypatch.setattr(identity, "_stack", dict)
+    monkeypatch.setattr(probe, "cards", lambda bdfs: order.append("cards") or [])
+    monkeypatch.setattr(probe, "probe", lambda torch, formats: RECORD)
+    spec = SCRIPTS / "machines" / "mi308x-hjbog18.json"
+    assert probe.main([str(spec), str(tmp_path / "record.json")]) == 0
+    assert order == ["cards"]

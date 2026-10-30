@@ -187,7 +187,7 @@ def test_measuring_one_record_twice_publishes_each_view_once_and_then_nothing(ru
         assert member["seconds"] == 1e-6 * sum(q for q, *_ in member["rows"])
         assert member["repeats"] and member["statistic"] == "median"
         assert member["protocol"] == window.PROTOCOL
-        assert member["replay_rule"] == {"name": "fresh-contiguous", "version": 2}
+        assert member["replay_rule"] == {"name": "fresh-contiguous", "version": 3}
         assert member["origin"] == "replay"
         assert member["sources"] == [
             measure.file_digest(run.record / "steps/dp0.jsonl")

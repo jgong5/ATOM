@@ -81,9 +81,6 @@ GRAPH, ROUNDS, LINK_BYTES = 1000, 1000, 2**30
 REPS = 20
 SPIN = 10**7  # device cycles a sample waits behind, well past its host calls
 IDLE_BYTES = 2**30
-#: Seconds the cards are left before their busy reading: a card in a low-power
-#: state reads 1% busy for under half a second after this process opens it.
-SETTLE_S = 2.0
 DRM, KFD = "/sys/class/drm", "/sys/class/kfd/kfd"
 #: The MXFP4 GEMMs timed, each as a failure names it.
 FP4 = ("torch._scaled_mm", "aiter.gemm_a4w4")
@@ -515,7 +512,6 @@ def main(argv: list[str] | None = None) -> int:
         f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"
         for p in props
     ]
-    time.sleep(SETTLE_S)
     record = {"cards": cards(bdfs), "arch": props[0].gcnArchName, "stack": _stack()}
     refuse_unfit(record["cards"], ptl)
     stated = [

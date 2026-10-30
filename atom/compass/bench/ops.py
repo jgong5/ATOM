@@ -56,7 +56,7 @@ alike (`exchange`), which the plan ladders, densifies and covers.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, a KV
 argument's as many entries of its first dimension, each the span of the
-others, as the batch's state slots, or its blocks when the model keeps no
+others, as the batch's rows, or its blocks when the model keeps no
 per-request state, or, of a decode attention leaf that states its layer's
 window and compress ratio, the plane rows the batch's blocks hold at that
 ratio, a RoPE table's (`TABLES`), a weight or a tensor of a module it names,
@@ -580,6 +580,7 @@ class Stub:
     a collective leaf refuses."""
 
     def __init__(self, runner, llc: int, journal=None) -> None:
+        from atom.compass.bench.replay import state_slots_per_request
         from atom.model_engine.kv_block import STATE_SLOT_CLASS
 
         self.runner, self.llc, self.journal = runner, llc, journal
@@ -588,6 +589,7 @@ class Stub:
         self.flush = None
         self.alone = getattr(runner.config, "dp_logical_size", 0)
         self.slots = runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
+        self.per_row = state_slots_per_request(runner.config)
         self.built, self.leaves, self.placed = {}, {}, []
         self.cold_copies, self.clones, self.kv, self.state = {}, {}, {}, set()
         self.written = {}
@@ -753,8 +755,9 @@ class Stub:
             for path, spec in _specs(op["args"])
             if spec["role"] == "kv"
         }
+        taken = len(rows) * self.per_row  # the batch's state slots
         room = [pool // blocks]
-        room += [t.k_cache.shape[0] // len(rows) for t in kv.values() if _stateful(t)]
+        room += [t.k_cache.shape[0] // taken for t in kv.values() if _stateful(t)]
         plans = {
             s: self._plan(op, i, kv, blocks, len(rows), shape.tokens, s)
             for s, (op, i) in found.items()
@@ -765,9 +768,9 @@ class Stub:
         self.context = _split(context)[0]
         self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
         for p in range(max(min(need, *room), 1)):
-            slot = p * len(rows)
-            if self.slots >= len(rows):  # past the state slots, take them again
-                slot %= self.slots - self.slots % len(rows)
+            slot = p * taken
+            if self.slots >= taken:  # past the state slots, take them again
+                slot %= self.slots - self.slots % taken
             try:
                 batch = rule.batch(view, p * blocks, slot)
             except ValueError as error:  # the rule refuses, before any preparation
@@ -792,7 +795,7 @@ class Stub:
                 # `c mod m`'s activations
                 built = min(n, record.get("copies", n))
                 at = min(len(self.placed), -(-built // len(inst)))
-                wrap = self.slots // len(rows) if self.slots >= len(rows) else at
+                wrap = self.slots // taken if self.slots >= taken else at
                 # ponytail: routed expert ids and an object's activations are
                 # drawn a copy each yet count once a cold copy here; split them
                 # out when a leaf with more instances than cold copies holds one
