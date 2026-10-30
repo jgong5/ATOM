@@ -38,8 +38,8 @@ from test_vertical_slice import (
 from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
 from atom.compass.detect.scenario import check_run
-from atom.compass.drive.serve import _free_ports
 from atom.compass.parity.traffic import bodies
+from tests.compass.held_ports import held_ports
 
 MODEL = os.environ.get("ATOM_COMPASS_IMAGE_MODEL")
 NEEDS_AN_IMAGE_RUN = pytest.mark.skipif(
@@ -74,43 +74,45 @@ class Workload(Traffic):
 def run_images(out: Path, seed: str) -> dict:
     """One run in its own process tree, reading the readings in its parent's store."""
     out.mkdir()
-    clock_port, port = _free_ports(2)
-    run_file = _run_file(
-        out,
-        clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
-        step_stub=CONSTANT,
-        image_preprocess_s=IMAGE_S,
-        machine=json.loads(MACHINE.read_text()),
-        store=str(out.parent / "store"),
-    )
-    env = dict(
-        os.environ,
-        PYTHONHASHSEED=seed,
-        PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
-    )
-    requests = bodies(MODEL, REQUESTS, images=1)
-    with open(out / "server.log", "w") as log:
-        server = subprocess.Popen(
-            [sys.executable, "-m", "atom.entrypoints.openai.api_server"]
-            + [*ARGS, "--host", "127.0.0.1", "--server-port", str(port)]
-            + ["--compass-run", str(run_file)],
-            cwd=TREE,
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
+    with held_ports(2) as (clock_port, port):
+        run_file = _run_file(
+            out,
+            clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
+            step_stub=CONSTANT,
+            image_preprocess_s=IMAGE_S,
+            machine=json.loads(MACHINE.read_text()),
+            store=str(out.parent / "store"),
         )
-        watchdog = threading.Timer(WALL_S, server.kill)
-        watchdog.start()
-        try:
-            traffic = Workload(requests, json.loads(run_file.read_text()), port, server)
-            traffic.run()
-            code = server.wait(timeout=120)
-        finally:
-            watchdog.cancel()
-            if server.poll() is None:
-                server.kill()
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
+        )
+        requests = bodies(MODEL, REQUESTS, images=1)
+        with open(out / "server.log", "w") as log:
+            server = subprocess.Popen(
+                [sys.executable, "-m", "atom.entrypoints.openai.api_server"]
+                + [*ARGS, "--host", "127.0.0.1", "--server-port", str(port)]
+                + ["--compass-run", str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            watchdog = threading.Timer(WALL_S, server.kill)
+            watchdog.start()
+            try:
+                traffic = Workload(
+                    requests, json.loads(run_file.read_text()), port, server
+                )
+                traffic.run()
+                code = server.wait(timeout=120)
+            finally:
+                watchdog.cancel()
+                if server.poll() is None:
+                    server.kill()
     tail = (out / "server.log").read_text()[-4000:]
     assert code == 0, f"the server exited {code} after the finish:\n{tail}"
     return {

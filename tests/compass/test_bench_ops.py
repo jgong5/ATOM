@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_bench_replay import _line, rule  # noqa: F401  the rule fixture
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
 

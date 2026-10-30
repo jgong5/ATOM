@@ -4,7 +4,6 @@
 """Pydantic request/response models for the OpenAI-compatible API."""
 
 import json
-import time
 from typing import Annotated, Any
 
 from pydantic import (
@@ -16,7 +15,7 @@ from pydantic import (
     ValidationError,
 )
 
-from atom.utils import clock
+from atom.utils import time_shim as time
 
 # ============================================================================
 # Constants
@@ -303,8 +302,11 @@ class CompletionRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
     model: str | None = None
-    # Required when no prompt_token_ids are supplied.
-    prompt: str | None = None
+    # Required when no prompt_token_ids are supplied. Per the OpenAI spec this
+    # may also be an array of token ids; that form is accepted and routed to the
+    # pre-tokenized path (see get_prompt_or_tokens). The nested
+    # array-of-token-arrays (batch) form is not supported.
+    prompt: str | list[int] | None = None
     temperature: float | None = DEFAULT_TEMPERATURE
     top_k: int | None = DEFAULT_TOP_K
     top_p: float | None = DEFAULT_TOP_P
@@ -333,6 +335,12 @@ class CompletionRequest(BaseModel):
             return ids
         if self.prompt is None:
             raise ValueError("either 'prompt' or 'prompt_token_ids' is required")
+        if isinstance(self.prompt, list):
+            # OpenAI-spec `prompt` as an array of token ids: same meaning as
+            # prompt_token_ids, so take the pre-tokenized path.
+            if not self.prompt:
+                raise ValueError("'prompt' was given as a token array but is empty")
+            return self.prompt
         return self.prompt
 
     def get_max_tokens(self) -> int:
@@ -385,7 +393,7 @@ class ModelCard(BaseModel):
 
     id: str
     object: str = "model"
-    created: int = Field(default_factory=lambda: int(clock.now(time.time)))
+    created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "atom"
 
 

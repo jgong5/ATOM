@@ -256,6 +256,21 @@ FORMS_THAT_FIRE = {
     "print": "def f(s: set[str]):\n    print(s)\n",
     "log-deferred-%s": 'def f(s: set[str], log):\n    log.info("ready=%s", s)\n',
     "log-level": 'def f(s: set[str], log):\n    log.log(10, "ready=%s", s)\n',
+    "list.extend": "def f(s: set[str], out):\n    out.extend(s)\n",
+    "deque": "import collections\n\n\ndef f(s: set[str]):\n    return collections.deque(s)\n",
+    "Counter": "from collections import Counter\n\n\ndef f(s: set[str]):\n    return Counter(s)\n",
+    "islice": "import itertools\n\n\ndef f(s: set[str]):\n    return itertools.islice(s, 2)\n",
+    "np.fromiter": "import numpy as np\n\n\ndef f(s: set[int]):\n    return np.fromiter(s, int)\n",
+    "class-name-outside": (
+        "class A:\n    members = {1, 2}\n\n\ndef f():\n    for x in A.members:\n        yield x\n"
+    ),
+    "class-name-inside": (
+        "class A:\n"
+        "    members: set[str] = set()\n"
+        "\n"
+        "    def g(self):\n"
+        "        return list(A.members)\n"
+    ),
     "max-key": "def f(s: set[str], cost):\n    return max(s, key=cost)\n",
     "min-key": "def f(s: set[str], cost):\n    return min(s, key=cost)\n",
     "set-literal": "def f():\n    for x in {1, 2}:\n        yield x\n",
@@ -272,6 +287,24 @@ FORMS_THAT_FIRE = {
     "or-empty": "def f(s: set[str]):\n    for x in s or ():\n        yield x\n",
     "walrus": "def f(n):\n    if s := set(n):\n        for x in s:\n            yield x\n",
     "augmented": "def f(n, t):\n    s = set(n)\n    s |= t\n    for x in s:\n        yield x\n",
+    "augmented-only": (
+        "class C:\n"
+        "    def add(self, b):\n"
+        "        self.seen |= set(b)\n"
+        "\n"
+        "    def g(self):\n"
+        "        return list(self.seen)\n"
+    ),
+    "paired-unpacking": "def f(x, y):\n    a, b = set(x), set(y)\n    return list(a)\n",
+    "global": (
+        "def g(n):\n    global ready\n    ready = set(n)\n\n\n"
+        "def f():\n    return list(ready)\n"
+    ),
+    "global-at-module-level": "global x\nx = set()\nlist(x)\n",
+    "global-past-an-enclosing-binding": (
+        "x = set()\n\n\n"
+        "def f():\n    x = None\n\n    def g():\n        global x\n        return list(x)\n"
+    ),
     "typing-Set": "from typing import Set\n\n\ndef f(r: Set[str]):\n    return [x for x in r]\n",
     "string-annotation": 'def f(r: "set[str]"):\n    return [x for x in r]\n',
     "sorted-generator": "def f(s: set[str], ids):\n    return sorted(ids.take(x) for x in s)\n",
@@ -306,6 +339,46 @@ FORMS_THAT_STAY_QUIET = {
     "dict-pop": "def f(d, k):\n    return d.pop(k)\n",
     "str-of-list": "def f(rows):\n    xs = list(rows)\n    return str(xs)\n",
     "log-of-a-count": 'def f(s: set[str], log):\n    log.info("ready=%d", len(s))\n',
+    "class-name-nested-in-a-class": (
+        "class O:\n"
+        "    class A:\n"
+        "        members = {1, 2}\n"
+        "\n"
+        "        def g(self):\n"
+        "            return list(A.members)\n"
+    ),
+    "set-display-unpacking": "def f(a: set[str], b: set[str]):\n    return {*a, *b}\n",
+    "augmented-by-a-non-set": (
+        "class C:\n    def add(self, b):\n        self.seen |= b\n        return list(self.seen)\n"
+    ),
+    "augmented-add": (
+        "class C:\n"
+        "    def add(self, b):\n"
+        "        self.seen += set(b)\n"
+        "        return list(self.seen)\n"
+    ),
+    "global-rebound": (
+        "ready = set()\n\n\ndef g():\n    global ready\n    ready = sorted(ready)\n\n\n"
+        "def f():\n    return list(ready)\n"
+    ),
+    "nonlocal-rebound": (
+        "def f(n):\n"
+        "    ready = set(n)\n"
+        "\n"
+        "    def g():\n"
+        "        def h():\n"
+        "            nonlocal ready\n"
+        "            ready = sorted(ready)\n"
+        "\n"
+        "        h()\n"
+        "\n"
+        "    g()\n"
+        "    return list(ready)\n"
+    ),
+    "class-name-rebound": (
+        "class A:\n    members = {1, 2}\n\n\nA.members = sorted(A.members)\n\n\n"
+        "def f():\n    return list(A.members)\n"
+    ),
     "rebound": (
         "def f(names):\n"
         "    s = set(names)\n"

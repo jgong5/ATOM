@@ -54,7 +54,7 @@ mkdir -p "$OUT/real/record" "$OUT/sim"
 OUT=$(realpath "$OUT")
 pids=()
 trap 'kill -KILL -- "${pids[@]/#/-}" 2>/dev/null || true' EXIT
-ROUTER_PORT=$(compass_free_port)
+ROUTER_PORT=$(compass_held_port)
 read -ra prefill_gpus <<<"${PREFILL_GPUS:-0,1}"
 read -ra decode_gpus <<<"${DECODE_GPUS:-2,3}"
 
@@ -64,13 +64,13 @@ urls=()
 serve() {
     local port name=$1
     (($3 == 1)) || name+=$2
-    port=$(compass_free_port)
+    port=$(compass_held_port)
     # shellcheck disable=SC2086 # the server flags are word lists
     HIP_VISIBLE_DEVICES=$4 ATOM_COMPASS_PARITY_RECORD=$OUT/real/record/$name setsid \
         python3 -m atom.entrypoints.openai_server --model "$MODEL" --host 127.0.0.1 \
         --server-port "$port" $(dp_args "$6") \
-        --data-parallel-master-port "$(compass_free_port)" $SERVER_ARGS --kv-transfer-config \
-        "{\"kv_role\":\"$5\",\"kv_connector\":\"mooncake\",\"protocol\":\"tcp\",\"proxy_ip\":\"127.0.0.1\",\"handshake_port\":$(compass_free_port)}" \
+        --data-parallel-master-port "$(compass_held_port)" $SERVER_ARGS --kv-transfer-config \
+        "{\"kv_role\":\"$5\",\"kv_connector\":\"mooncake\",\"protocol\":\"tcp\",\"proxy_ip\":\"127.0.0.1\",\"handshake_port\":$(compass_held_port)}" \
         >"$OUT/real/$name.log" 2>&1 &
     pids+=($!)
     compass_wait_up "$name server" $! "http://127.0.0.1:$port/health"
@@ -86,7 +86,7 @@ done
 setsid "$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" \
     --pd-disaggregation "${urls[@]}" --policy dp_sticky --dp-aware \
     --backend atom --disable-health-check --disable-circuit-breaker --disable-retries \
-    --prometheus-port "$(compass_free_port)" --log-level debug >"$OUT/real/router.log" 2>&1 &
+    --prometheus-port "$(compass_held_port)" --log-level debug >"$OUT/real/router.log" 2>&1 &
 pids+=($!)
 compass_wait_up router "${pids[-1]}" "http://127.0.0.1:$ROUTER_PORT/v1/models"
 python3 -c 'import sys; from pathlib import Path; from atom.compass.parity.traffic import bodies, real
@@ -108,7 +108,7 @@ pids=()
 for record in "$OUT"/real/record/*/; do cp "$OUT/real/record/arrivals.json" "$record"; done
 
 RUN=$OUT/sim/run.json
-CLOCK_PORT=$(compass_free_port)
+CLOCK_PORT=$(compass_held_port)
 python3 - "$RUN" "$OUT" "${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}" \
     "$MODEL" "$STORE" "$CLOCK_PORT" "${#prefill_gpus[@]}" "${#decode_gpus[@]}" \
     "$PREFILL_DP" "$DECODE_DP" "${urls[@]}" <<'EOF'
@@ -117,10 +117,12 @@ from pathlib import Path
 
 run, out, machine, model, store, port, prefills, decodes, dp_p, dp_d, *urls = sys.argv[1:]
 machine = json.loads(Path(machine).read_text())
-# ponytail: prices the model's tokenizer as the spec's first entry measured it,
-# as parity_one_node.sh does; only arrival latency reads it.
+# ponytail: a spec that measured no tokenizer for the model prices it as its
+# first entry, as parity_one_node.sh does; only arrival latency reads it.
 arch = json.loads((Path(model) / "config.json").read_text())["architectures"][0]
-machine["host"]["tokenizers"][0]["applies_to"].append(arch)
+tokenizers = machine["host"]["tokenizers"]
+if not any(arch in entry["applies_to"] for entry in tokenizers):
+    tokenizers[0]["applies_to"].append(arch)
 # Each side's (instance, DP rank) pairs in the order the real router logged
 # registering them.
 deployment, count = {}, {"--prefill": 0, "--decode": 0}
@@ -146,7 +148,7 @@ EOF
 ports=("CLOCK_PORT=$CLOCK_PORT")
 for name in PREFILL_PORT DECODE_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT \
     PREFILL_DP_PORT DECODE_DP_PORT; do
-    ports+=("$name=$(compass_free_port)")
+    ports+=("$name=$(compass_held_port)")
 done
 # shellcheck disable=SC2086 # SERVER_ARGS is a word list
 env "${ports[@]}" ROUTER_PORT="$ROUTER_PORT" MODEL="$MODEL" ATOMESH="$ATOMESH" \

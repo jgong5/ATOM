@@ -22,7 +22,7 @@ import pytest
 import torch
 from test_artifact_store import CONDITIONS, GATES, stanza
 from test_backend_step_linear import _installed, view
-from test_capture_ir import TREE, _ops, _record
+from test_capture_ir import MAIN, TREE, _ops, _record
 from test_dp_step_max import runner
 from test_memory_readings import WORKER
 from test_op_graph import FLAT, GEMM, MIDDLE, _engine, by_name, g
@@ -85,7 +85,7 @@ def capture(drafts, tmp_path_factory, shape=("--width", "2"), dp=1):
         [
             sys.executable,
             "-c",
-            "import sys; from atom.compass.cli import main; main(sys.argv[1:])",
+            MAIN,
             *argv,
         ],
         capture_output=True,
@@ -297,7 +297,9 @@ def dp_view(width, rung, dp, counts=None):
     r.drafter = SimpleNamespace(is_block_drafter=False, mtp_k=1)
     counts = torch.tensor(counts or [2 * width] * dp)
     mode = SimpleNamespace(
-        sync=SimpleNamespace(num_tokens_across_dp=counts, ub_tokens_across_dp=None),
+        sync=SimpleNamespace(
+            scheduled_tokens_per_dp_rank=counts, ub_tokens_across_dp=None
+        ),
         running_tokens_are_unified=True,
         running_tokens=2 * rung,
         running_bs=rung,
@@ -466,7 +468,7 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
     r.drafter = SimpleNamespace(is_block_drafter=False, mtp_k=1)
     mode = SimpleNamespace(
         sync=SimpleNamespace(
-            num_tokens_across_dp=torch.tensor([64, 64]),
+            scheduled_tokens_per_dp_rank=torch.tensor([64, 64]),
             max_bs_across_dp=1,
             ub_tokens_across_dp=None,
         ),
@@ -512,7 +514,7 @@ def _population(tmp_path_factory, line, drafts):
         [
             sys.executable,
             "-c",
-            "import sys; from atom.compass.cli import main; main(sys.argv[1:])",
+            MAIN,
             *argv,
         ],
         capture_output=True,

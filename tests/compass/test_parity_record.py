@@ -6,8 +6,10 @@ engine's order -- schedule, forward, postprocess -- one scheduler per DP rank,
 with every prompt distinct unless a test says otherwise.
 """
 
+import gc
 import hashlib
 import json
+import pathlib
 import queue
 import runpy
 import shutil
@@ -24,11 +26,13 @@ from test_dp_step_max import dp2  # noqa: F401  the dp2 fixture
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run
 from atom.compass.backends import step_linear_fit
+from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_stub import StepStubBackend
 from atom.compass.parity import (
     ENV,
     RUNNER,
     TIMESTAMPS,
+    StepRecord,
     StepRecording,
     _record,
     compare,
@@ -90,6 +94,10 @@ class _Runner(NonAllocatingRunner):
         self.config, self.rank = config, rank
         install_cost_backend(self, StepStubBackend())
         self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+        self.running_tokens_per_dp_rank = np.zeros(
+            self.config.parallel_config.data_parallel_size, dtype=np.int32
+        )
+        self.tbo_decode_graphs = False
         self.attn_metadata_builder = GRAPHABLE
         self._token_stream = DeferredTokenStream([0])
 
@@ -526,6 +534,10 @@ def test_a_real_record_states_the_engine_its_runner_resolved(tmp_path, monkeypat
         def __init__(self, rank, config):
             self.rank, self.config = rank, config
             self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
             self.attn_metadata_builder = GRAPHABLE
 
         def allocate_kv_cache(self, num_kvcache_blocks):
@@ -583,11 +595,18 @@ def test_the_mixin_records_from_the_first_forward_after_construction(
         def __init__(self, rank, config):
             self.rank, self.config = rank, config
             self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
             self.attn_metadata_builder = GRAPHABLE
             self.forward(batches[1])
 
         def forward(self, batch):
             return "ran"
+
+        def exit(self):
+            pass
 
     class _Recorded(StepRecording, _Base):
         step_clock_ns = staticmethod(time.monotonic_ns)
@@ -596,6 +615,7 @@ def test_the_mixin_records_from_the_first_forward_after_construction(
     runner = _Recorded(0, _config())
     assert not (tmp_path / "out").exists()
     assert runner.forward(batches[0]) == "ran"
+    runner.exit()
     assert [s["step"] for s in read(tmp_path / "out")[0]] == [0]
 
 
@@ -611,16 +631,23 @@ def test_a_real_runner_records_the_batch_it_was_handed_and_times_its_forward(
         def __init__(self, rank, config):
             self.rank, self.config = rank, config
             self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
             self.attn_metadata_builder = GRAPHABLE
             self.inside = []
 
         def forward(self, batch):
-            # The line is written once this returns, not before.
-            assert len(record.read_text().splitlines()) == len(self.inside)
+            # Nothing is written before the runner exits.
+            assert record.read_text() == ""
             self.inside.append(time.monotonic_ns())
             batch.num_scheduled_tokens[:] = 0
             batch.context_lens[:] = 0
             return "ran"
+
+        def exit(self):
+            pass
 
     class _Recorded(StepRecording, _Base):
         step_clock_ns = staticmethod(time.monotonic_ns)
@@ -628,6 +655,13 @@ def test_a_real_runner_records_the_batch_it_was_handed_and_times_its_forward(
     monkeypatch.setenv(ENV, str(tmp_path / "real"))
     runner = _Recorded(0, _config())
     assert [runner.forward(b) for b in batches] == ["ran"] * len(batches)
+    # Held lines cost later full collections nothing: one untracks a line's
+    # innermost tuples, the next the rest of it.
+    gc.collect()
+    gc.collect()
+    held = runner._parity_record.lines
+    assert len(held) == len(batches) and not any(map(gc.is_tracked, held))
+    runner.exit()
     real, simulated = read(tmp_path / "real")[0], read(tmp_path / "simulated")[0]
     for step, inside in zip(real, runner.inside, strict=True):
         assert step.pop("t_enter_ns") <= inside <= step.pop("t_exit_ns")
@@ -664,6 +698,10 @@ def test_a_dp2_real_runner_records_moe_rows_from_its_forwards_one_collective(
             self.rank, self.config = 0, _config(dp_rank)
             self.config.parallel_config.data_parallel_size = 2
             self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
             self.attn_metadata_builder = GRAPHABLE
 
         def forward(self, batch):
@@ -676,6 +714,9 @@ def test_a_dp2_real_runner_records_moe_rows_from_its_forwards_one_collective(
 
         def run_model(self):
             return "ran"
+
+        def exit(self):
+            pass
 
     class _Recorded(StepRecording, _Base):
         step_clock_ns = staticmethod(time.monotonic_ns)
@@ -692,6 +733,8 @@ def test_a_dp2_real_runner_records_moe_rows_from_its_forwards_one_collective(
             for r, bs in zip(runners, batches)
         )
     )
+    for runner in runners:
+        runner.exit()
 
     real = read(tmp_path / "real")
     assert len(batches[0]) == len(batches[1])
@@ -733,8 +776,9 @@ def test_a_dp2_simulated_runner_records_and_prices_from_one_collective(
     monkeypatch.setenv(ENV, str(tmp_path / "simulated"))
     runners = []
     for rank in (0, 1):
-        runners.append(_Runner(_config(rank)))
-        runners[-1].config.parallel_config.data_parallel_size = 2
+        config = _config(rank)
+        config.parallel_config.data_parallel_size = 2
+        runners.append(_Runner(config))
     replies = dp2(
         *(
             lambda r=r, bs=bs: [r.forward(b).predicted_s for b in bs]
@@ -785,3 +829,66 @@ def test_a_real_run_asked_to_record_refuses_a_runner_that_cannot(tmp_path, monke
     _keep_add_request(monkeypatch)
     with pytest.raises(ValueError, match="only .* has a recording runner"):
         run.frontend(SimpleNamespace(runner_qualname="x.RapidServeModelRunner"))
+
+
+def test_no_file_call_or_json_encoding_runs_between_two_forwards(tmp_path, monkeypatch):
+    """`E` is all of the worker's time between forwards, so the lines are
+    encoded and written at `write`, the runner's exit: on an NFS home an open
+    costs about 0.25 ms and a close that flushes about 0.73. The file holds the
+    step order and bytes it had."""
+    calls, path_open, dumps = [], pathlib.Path.open, json.dumps
+    monkeypatch.setattr(
+        json, "dumps", lambda *a, **k: calls.append("dumps") or dumps(*a, **k)
+    )
+
+    class _File:
+        def __init__(self, f):
+            self.f = f
+            calls.append("open")
+
+        def write(self, text):
+            calls.append("write")
+            return self.f.write(text)
+
+        def close(self):
+            calls.append("close")
+            self.f.close()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+
+    monkeypatch.setattr(
+        pathlib.Path, "open", lambda p, *a, **k: _File(path_open(p, *a, **k))
+    )
+    view = BatchView((RequestShape(1, 9, True),))
+    monkeypatch.setattr(projection, "batch_view", lambda batch, mode, run: view)
+    runner = SimpleNamespace(
+        step_clock_ns=lambda: calls.append("stamp") or len(calls),
+        step_stamps=lambda: ({"forward_mode": "m"}, lambda wait: {"d_busy_ns": 5}),
+    )
+    batch = SimpleNamespace(
+        is_dummy_run=True,
+        num_scheduled_tokens=np.array([1]),
+        context_lens=np.array([9]),
+        produces_output=lambda: True,
+    )
+    record = StepRecord(tmp_path, 0)
+    for _ in range(3):
+        record.add(batch, runner, lambda batch: None)
+    record.write()
+
+    # Emptied at the start; then only the forwards' stamps until the exit.
+    start = ["open", "write", "close"]
+    end = ["dumps"] * 3 + ["open", "write", "close"]
+    assert calls == start + ["stamp", "stamp"] * 3 + end
+    monkeypatch.undo()
+    line = '"is_dummy_run": true, "produces_output": true, "batch": [], "named": []'
+    assert record.path.read_text() == "".join(
+        f'{{"step": {n}, "dp_rank": 0, {line}, "t_enter_ns": {2 * n + 4}, '
+        f'"t_exit_ns": {2 * n + 5}, "rows": [[1, 9, true]], "rung": null, '
+        '"d_busy_ns": 5}\n'
+        for n in range(3)
+    )

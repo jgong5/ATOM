@@ -3,7 +3,8 @@
 
 Inputs are `test_fit_samples.py`'s record, whose step record ATOM's
 `Scheduler` drove through `test_parity_record.py`'s runner and which served
-two client runs, and that record's lines published as a `shape_population`.
+the client runs of `RUNS`, and that record's lines published as a
+`shape_population`.
 The bench is a fake in `Bench`'s place, on the record's engine, whose result
 is the batch's token count in microseconds; run.json's identity is the
 record's, so a measurement states the record's configuration; the GPU checks
@@ -186,7 +187,7 @@ def test_measuring_one_record_twice_publishes_each_view_once_and_then_nothing(ru
         assert member["seconds"] == 1e-6 * sum(q for q, *_ in member["rows"])
         assert member["repeats"] and member["statistic"] == "median"
         assert member["protocol"] == window.PROTOCOL
-        assert member["replay_rule"] == {"name": "fresh-contiguous", "version": 1}
+        assert member["replay_rule"] == {"name": "fresh-contiguous", "version": 2}
         assert member["origin"] == "replay"
         assert member["sources"] == [
             measure.file_digest(run.record / "steps/dp0.jsonl")
@@ -221,6 +222,14 @@ def test_a_held_entry_taken_under_other_readings_refuses_naming_it(run):
     ):
         run(rec, "--sample", "all", *run.named(rec))
     assert Bench.started == []
+
+
+def test_a_held_entry_taken_under_other_readings_names_a_fresh_store(run):
+    rec = str(run.record)
+    run(rec, "--sample", "all", *run.named(rec))
+    run.identity["stack"]["aiter"] = "v9.9.9"
+    with pytest.raises(SystemExit, match="measure into a fresh --store"):
+        run(rec, "--sample", "all", *run.named(rec))
 
 
 def test_a_held_entry_measured_on_cards_of_another_ptl_state_refuses(run):
@@ -571,11 +580,14 @@ def test_a_trace_two_exports_give_two_sessions_refuses_in_either_order(run, give
         run(str(run.record), "--sample", "all", "--sessions", "0:4", *named)
 
 
-def test_a_deployment_above_tensor_parallel_1_refuses_naming_the_skew_issue(run):
+def test_a_deployment_above_tensor_parallel_1_measures_a_record_that_states_it(run):
+    engine = run.record / "steps/dp0.engine.json"
+    stated = json.loads(engine.read_text()) | {"tensor_parallel_size": 2}
+    engine.write_text(json.dumps(stated))
     run.config.tensor_parallel_size = 2
-    with pytest.raises(SystemExit, match=r"tensor parallel size 2: .*\(#1188\)"):
-        run(str(run.record), "--sample", "all", *run.named(run.record))
-    assert Bench.started == []
+    store = run(str(run.record), "--sample", "all", *run.named(run.record))
+    assert Bench.started[0].tensor_parallel_size == 2
+    assert set(by_view(store)) == views(read(run.record / "steps")[0])
 
 
 @pytest.mark.parametrize(
@@ -683,6 +695,21 @@ def test_ragged_measures_the_views_composed_from_each_drawn_decode_view(run):
             measure.file_digest(run.record / "steps/dp0.jsonl")
         ]
         assert member["traces"] == sorted({t for s in split for t in s["traces"]})
+
+
+def test_ragged_composes_across_the_rungs_of_the_ladder_the_record_states(
+    run, monkeypatch
+):
+    rec = str(run.record)
+    ladder = json.loads((run.record / "steps/dp0.engine.json").read_text())["ladder"]
+    given, compose = [], measure.ragged.compose
+    monkeypatch.setattr(
+        measure.ragged, "compose", lambda *a: given.append(a[-1]) or compose(*a)
+    )
+
+    run(rec, "--sample", "2", "--seed", "3", "--ragged", *run.named(rec))
+
+    assert given and all(g == ladder for g in given)
 
 
 def test_ragged_without_a_replayed_input_refuses(run):

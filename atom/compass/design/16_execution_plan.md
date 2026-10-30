@@ -39,6 +39,12 @@ level on measured devices, its tasks the issues #1489 tracks; it carries W4.1's 
 and the op-level parts of W4.4, W4.5 and W4.12, and its S3d.12 makes stage 3c's capture
 concrete.
 
+**Revised 2026-10-25 by the owner's ruling on
+[#2138](https://github.com/jgong5/ATOM/issues/2138), and 2026-10-27 by its rulings there:**
+*Stage 4* measures DeepSeek-V4.1-Flash on MI455 and grades it in two cells of its own, the
+last step of v1; stage 3c's projection stays frozen as the before side of the method error
+(D95).
+
 **Scope.** How the work is organised, allocated and gated; what happens first; and what
 each stage must produce. It is **detailed through M2**. Work after v1 is listed, not
 planned — see *After v1*. Phase 0b's answers can still reshape Waves 4–6, and the plan
@@ -54,7 +60,9 @@ The milestones of `README.md` ran from a fake-model M1 through Qwen3.8-27B on MI
 hardware (M2–M4) to Kimi-K3 at TP8 with DP, PP and EP (M5–M7). Priorities changed: the
 focus is now an **MoE model with wide expert parallelism and P/D disaggregation**, with
 **full support on MI355X** and **roofline projection for MI455**. Calibration and pricing
-move onto MI455 as soon as MI455 hardware is available.
+move onto MI455 once MI455 hardware is available; *Stage 4* does so for
+DeepSeek-V4.1-Flash on two 4-card MI455 nodes
+([#2138](https://github.com/jgong5/ATOM/issues/2138)).
 
 Owner rulings shape the milestones below: Compass work is ordered by the end-to-end
 cc-traces stages of [#627](https://github.com/jgong5/ATOM/issues/627); the real side is
@@ -88,20 +96,30 @@ part of v1, added after that
   leaves M1 for M2. Its exit criterion is under *Wave 3*.
 - **M2 is v1, #627's stage 3**: DeepSeek-V4-Pro 1P+1D on MI355X, in the nightly
   configurations and then at EP8, each step first with the same
-  scheduling decisions as the real engine, then within the acceptance targets; and the
-  MI455 roofline projection. **Stage 2 is its first gate**: Qwen3.8-27B TP1 on MI308X,
+  scheduling decisions as the real engine, then within the acceptance targets; the
+  MI455 roofline projection, stage 3c's; and, last, **stage 4**: DeepSeek-V4.1-Flash
+  measured on MI455 and graded in two cells, with the analytical bound checked on the
+  same runs (*Stage 4*). **Stage 2 is its first gate**: Qwen3.8-27B TP1 on MI308X,
   paired real and simulated cc-traces graded by `08`. Its grading is under *Waves 4–6*.
 - **The TTFT target is 15%, not 10%** (`README.md`). TTFT is the hardest serving metric
   to predict in every surveyed tool, and it carries prefill, queueing and P/D transfer at
   once. The other targets stand.
 - **The analytical laws move onto the critical path.** `10` D68 authored analytical laws during the
   empirical campaign as a side wave; the MI455 projection makes them an M2 deliverable.
-- **A projection is sound, not graded.** MI455 has no ground truth in M2, so the
-  projection is held to these checks instead of an error bar (`08` D50.2, revised by
-  #1392): on every measured step, at both granularities, analytical is at most measured;
-  every MI455 input is sourced or marked assumed; and the same projection method, run
-  MI308X → MI355X on Qwen3.8-27B (DeepSeek-V4-Pro's FP4 experts do not run on gfx942), is
-  reported against real MI355X runs to give the method an error estimate.
+- **A projection is sound, not graded.** MI455 had no ground truth when stage 3c
+  projected onto it, so the projection is held to these checks instead of an error bar
+  (`08` D50.2, revised by #1392): on every measured step, at both granularities,
+  analytical is at most measured; every MI455 input is sourced or marked assumed; and the
+  same projection method, run MI308X → MI355X on Qwen3.8-27B (DeepSeek-V4-Pro's FP4
+  experts do not run on gfx942), is reported against real MI355X runs to give the method
+  an error estimate.
+- **MI455 is measured and graded in stage 4** (#2138), on DeepSeek-V4.1-Flash rather
+  than V4-Pro, because the stage has two 4-card MI455 nodes. Their cards are A0 samples:
+  the real runs on them are graded by the step linear backend in two TP4 DSpark5 cells,
+  A0's spec is probed there, and the bound is checked on A0's records at step and op
+  level. The B0 performance machines keep MI355X's ratios, carried, until a B0 node is
+  probed (#2141, #2438). The stage-3c projection stays frozen, and the same A0 records
+  bounded at the frozen spec and at A0's probed spec give the method's error (*Stage 4*).
 - **The other milestones are retired, not renumbered.** Each maps as follows, so an older
   citation still resolves:
 
@@ -323,7 +341,7 @@ stayed excluded and how one attributed cause replaced four.
 **The CPU gate's blind spot is a file, not a sentence.** P0.2 stated it as prose naming four
 areas — EPLB, DP metadata, cudagraph bounds, block tables — which nothing read, and which
 named two files (`test_dp_metadata`, `test_dp_sync_layout`) the CPU gate does in fact cover.
-It is now `scripts/compass/gpu_gate_triggers.txt`, **30 paths** in the tree committed here,
+It is now `scripts/compass/gpu_gate_triggers.txt` (**30 paths** at `236abfd9a`),
 generated by `regen_gpu_gate_triggers.sh` and never hand-edited — the counts in its own
 header included (at `fada7424e`: 189 test files, 130 CPU gate, 108 of them collecting, 47 candidates, 99
 covered). The rule it applies: an `atom` module named by an excluded test is a blind spot
@@ -335,29 +353,30 @@ a supplied file list — a `git archive` snapshot with no `.git` — it refuses 
 reporting "not required", per principle 6.
 
 The rule has three parts. One was forced by a counter-example measured in this tree, one is
-what keeps the headline example, and one currently changes no path:
+what kept the headline example at `236abfd9a`, and one changed no path there:
 
-- *Imports are read at any indentation on the excluded side.* 190 of this tree's
-  `import atom.*` lines are indented — inside a function, a `try`, or a
+- *Imports are read at any indentation on the excluded side.* At `fada7424e` 190
+  of the tree's `import atom.*` lines were indented — inside a function, a `try`, or a
   `skipif(not torch.cuda.is_available())` guard. An earlier draft anchored the match at
   column 0 on both sides and silently dropped `atom/model_ops/topK.py`, whose only
   excluded-side reference is `test_moe_dp_token_capacity.py::test_dpa_capacity_fits_gathered_topk_metadata`, indented under exactly such
   a guard.
 - *Coverage is credited only for a module-level import.* An indented import in a CPU-gate
   file is not proof that the CPU gate executes it, and crediting it would let a never-taken
-  branch suppress a trigger. **This is the part that keeps
+  branch suppress a trigger. At `236abfd9a` **this was the part that kept
   `atom/model_engine/model_runner.py`** — the module Compass's runner seam replaces.
-  `tests/test_mla_index_cache.py` imports `ModelRunner` at
-  `tests/test_mla_index_cache.py::test_model_runner_local_total_layers_adds_mtp_only_on_drafter_stage`, indented four spaces inside a test function, so that
-  import is never credited whatever the file collects. Measured at `236abfd9a` in
-  `xiaobizh_n18_cpu`: crediting coverage at any indentation drops the set 30 → 29, losing
-  `topK.py`; doing that *and* crediting non-collecting files drops it 30 → 27, losing
-  `model_runner.py`, `aiter_mla.py` and `topK.py`.
-- *Coverage is credited only from a CPU-gate file that collects at least one test.* 22 of the
-  130 CPU-gate files collect none. On this tree that probe **removes no path**: 30 triggers
-  with it, 30 without, difference empty — measured at `236abfd9a` in `xiaobizh_n18_cpu`,
-  where it withholds 15 coverage paths, and the only one of those that is also a candidate,
-  `atom/model_ops/v4_kernels/state_writes.py`, is absorbed either way by the candidate
+  `tests/test_mla_index_cache.py::test_model_runner_local_total_layers_adds_mtp_only_on_drafter_stage`
+  imported `ModelRunner` indented four spaces inside the test, so that import was never
+  credited whatever the file collected. Measured there in `xiaobizh_n18_cpu`: crediting
+  coverage at any indentation dropped the set 30 → 29, losing `topK.py`; doing that *and*
+  crediting non-collecting files dropped it 30 → 27, losing `model_runner.py`,
+  `aiter_mla.py` and `topK.py`. Later CPU-gate tests import `ModelRunner` at module level,
+  which credits it; `scripts/compass/gpu_gate_triggers.txt` is the current list.
+- *Coverage is credited only from a CPU-gate file that collects at least one test.* At
+  `236abfd9a` (measured in `xiaobizh_n18_cpu`) 22 of the 129 CPU-gate files collected none,
+  and that probe **removed no path**: 30 triggers with it, 30 without, difference empty. It
+  withheld 15 coverage paths, and the only one of those that was also a candidate,
+  `atom/model_ops/v4_kernels/state_writes.py`, was absorbed either way by the candidate
   subtree entry above it. It is kept as a forward guard for trees this one does not
   represent, and it is not free: a full `pytest --collect-only` over the CPU gate and one
   more refusal path (exit 97). Whether that guard earns its cost is an open call
@@ -401,7 +420,8 @@ the tree. The commits carrying P0.2's measurements are `9c8df1328` and `b963c941
 `947d5b282`; the ones that supersede them are on this branch. P0.1's GPU re-measurement has
 an **in-tree** record, because a plan of record cannot cite one that is not: the five failing
 node-ids verbatim in `scripts/compass/gpu_gate_known_failures.txt`, and the pair, the tree and
-the toolchain as the `BASE_*` constants in `scripts/compass/gate_gpu.sh`. P0.2's own task
+the toolchain as the `BASE_*` constants, now `scripts/compass/gpu_gate_baseline.env`, which
+`scripts/compass/regen_gpu_gate_baseline.sh` rewrites with the list on a new image. P0.2's own task
 record predates that measurement and contains neither `4779` nor `fe9ea043c`; it is a source
 for the superseded 4730 / 5 above and for nothing else.
 
@@ -594,8 +614,12 @@ S3c.5; W5.2's laws are S3c.4 with the extractors of S3c.6, S3c.7, S3c.10 and S3c
 W5.3's soundness check is S3c.13, at probed peaks rather than the spec's at derate 1; W5.4
 and W5.5 are S3c.14, whose projection carries no implementation efficiency (`10` D68).
 
-If MI455 hardware arrives during M2, W4.3–W4.5 repeat on it (W4.11 too, for the
-EP8 step), and S3c.3's probes run on it, so its peaks are probed rather than carried.
+MI455 hardware arrived during M2, as A0 sample cards rather than the B0 performance
+machines the projection targets. The projection stays frozen as this wave delivered it,
+and MI455's real side, probes, calibration and grading are *Stage 4*'s, on
+DeepSeek-V4.1-Flash in two cells of its own rather than a repeat of W4.3–W4.5 and W4.11.
+S3c.3's probes run on the A0 node there (S4.4), so A0's peaks are probed; B0's stay
+carried from MI355X until a B0 node is probed (S4.18).
 
 ### Stage 3d — the empirical op-level price on measured devices
 
@@ -635,6 +659,84 @@ fit is S3d.4's same-kernel interpolation; W4.12, deferred, is S3d.11.
 | **W6.2** | The speed check on a saturated acceptance cell, against the target in `README.md` | `validate/` | ~100 | W6.1 |
 | **W6.3** | M2's EP8 step graded the same way: W6.1 over W4.11's cells, with W4.3's cells in the ranking | `validate/` | ~100 | W4.10, W4.11, W6.1 |
 
+### Stage 4 — MI455 measured and graded
+
+The last step of v1, tracked on [#2138](https://github.com/jgong5/ATOM/issues/2138) and
+ruled there on 2026-10-25 and 2026-10-27: DeepSeek-V4.1-Flash measured on MI455 and graded
+by the step linear backend in two cells, with the analytical bound checked on the same runs
+at step and op level. Every issue carries `e2e-stage4`, and work is ordered by `Depends on`
+alone.
+
+- **Device and model.** DeepSeek-V4.1-Flash on two 4-card MI455 nodes, one cell to a
+  node, served through S4.2's merged tree. Other users share the nodes, so graded runs go
+  in windows booked with them. Their cards are A0 samples, 192 compute units and 288 GiB
+  against the datasheet's 256 and 432 GiB
+  ([measured](https://github.com/jgong5/ATOM/issues/2138#issuecomment-6440931928)), with
+  no aiter FP4 GEMM, so MI455 has two machine specs
+  ([ruling](https://github.com/jgong5/ATOM/issues/2141#issuecomment-6467960187)):
+  `mi455-a0.json`, probed on the A0 node, a value not probed staying assumed (`05` D25);
+  and `mi455-b0.json` for the B0 performance machines, device `MI455X B0`, MI455X's
+  datasheet peaks times MI355X's probed ratios, assumed, until S4.18 probes a B0 node.
+  What the A0 node measures keys to `mi455-a0.json`, never to B0. Stage 3c's projections
+  stay frozen, `1dedbac561b6` (#2036) and `af1ea3021902` (#2070), and the spec they read
+  is the before side of the method error.
+- **Cells**, each TP4 with DSpark5 (`14`): `-tp 4 --kv_cache_dtype bf16
+  --index-cache-dtype fp8 --method dspark --num-speculative-tokens 5 --level 0`. Cell A
+  adds whole-expert EP4, `--enable-expert-parallel`; cell B shards the routed experts
+  across TP. Each runs concurrency 1, 4, 16, 64 and 256 on cc-traces 0 to 255, three real
+  rounds at `--duration 3600` as #975 ran them; traces 256 to 392 calibrate (`08` D50).
+- **Gates.** The step linear backend: each cell's three separable results (`08` D44)
+  within the targets of `README.md`. The analytical bound: on every measured MI455 step,
+  at step and op level, analytical at A0's probed peaks is at most measured (`08` D50.2).
+  Speed: faster than real; 5× is reported. No ranking gate.
+- **Reported, not gated.** Measured over analytical (`10` D68), and the method error: the
+  same A0 records bounded at the frozen spec and at A0's probed spec (`08` D50.2). A
+  derate probed on A0 against the datasheet absorbs A0's missing units, so the method
+  error includes that gap; B0's probed derates beside A0's (S4.18) separate the two.
+- **Scope.** A new configuration is smoke-tested on MI355X and graded only on MI455; the
+  MI455 calibration does not wait for the smokes
+  ([ruling](https://github.com/jgong5/ATOM/issues/2145#issuecomment-6442414256)). ATOM's
+  bring-up on MI455 is upstream's: merged, not fixed here, and an ATOM defect is filed
+  `atom-issue`. S4.7, S4.8 and S4.17 wait on one,
+  [#2359](https://github.com/jgong5/ATOM/issues/2359), until an image starts V4.1-Flash
+  at TP4 on the A0 node
+  ([ruling](https://github.com/jgong5/ATOM/issues/2145#issuecomment-6467601502)). 1P+1D
+  left the stage, because DeepSeek-V4.1 refuses every KV transfer but `lmcache_mp`
+  ([#2347](https://github.com/jgong5/ATOM/issues/2347)).
+
+| ID | Task | Module | Effort | Depends on |
+|---|---|---|---|---|
+| **S4.1** | The design text ([#2139](https://github.com/jgong5/ATOM/issues/2139)) | design | 120–240 design text | — |
+| **S4.2** | Upstream `e893780f4` and the head of `ROCm/ATOM#2617`, which serves DeepSeek-V4.1-Flash on gfx1250, merged and labelled `land as merge`, with the Compass fixes for its reds ([#2140](https://github.com/jgong5/ATOM/issues/2140)) | the merge, `scripts/compass/` | 50–300 | — |
+| **S4.3** | The merged tree serves DeepSeek-V4.1-Flash on one MI455 node, in the MI455 image ([#2360](https://github.com/jgong5/ATOM/issues/2360)) | `scripts/compass/` | 0–30 | S4.2, GPU queue |
+| **S4.4** | MI455's two machine specs: `mi455-a0.json` from probes on the A0 sample node, and `mi455-b0.json` for the B0 performance machines, MI455X's datasheet peaks times MI355X's probed ratios, assumed (`05` D26; [#2141](https://github.com/jgong5/ATOM/issues/2141)) | `scripts/compass/`, `drive/` | 200–350, 101 removed | S4.2, S4.3, GPU queue |
+| **S4.5** | Cell A smoked on one MI355X node ([#2143](https://github.com/jgong5/ATOM/issues/2143)) | `scripts/compass/` | 0–20 | GPU queue |
+| **S4.6** | Cell B smoked on one MI355X node ([#2144](https://github.com/jgong5/ATOM/issues/2144)) | `scripts/compass/` | 0–20 | GPU queue |
+| **S4.7** | Cell A calibrated on MI455: memory readings, host laws and the step linear law ([#2145](https://github.com/jgong5/ATOM/issues/2145)) | `scripts/compass/laws/` | 0–20, laws generated | S4.2, S4.4, #2359, GPU queue |
+| **S4.8** | Cell B calibrated on MI455 ([#2146](https://github.com/jgong5/ATOM/issues/2146)) | `scripts/compass/laws/` | 0–20, laws generated | S4.2, S4.4, #2359, GPU queue |
+| **S4.9** | Cell A on MI455, registered, run and graded (`08` D50; [#2147](https://github.com/jgong5/ATOM/issues/2147)) | `scripts/compass/` | ~10 | S4.7, GPU queue |
+| **S4.10** | Cell B on MI455, registered, run and graded ([#2148](https://github.com/jgong5/ATOM/issues/2148)) | `scripts/compass/` | ~10 | S4.8, GPU queue |
+| **S4.11** | DeepSeek-V4.1's op kinds captured as leaves and priced by op extractors ([#2344](https://github.com/jgong5/ATOM/issues/2344)) | `capture/`, `backends/` | 200–300 | — |
+| **S4.12** | The DSpark5 drafter captured at op level, its draft terms apart (`04`; [#2345](https://github.com/jgong5/ATOM/issues/2345)) | `capture/`, `backends/` | 150–250 | S4.11 |
+| **S4.13** | DeepSeek-V4.1's module extractors for the step roofline, the DSpark draft's included ([#2346](https://github.com/jgong5/ATOM/issues/2346)) | `run/`, `backends/` | 150–450 | — |
+| **S4.14** | The bound prices a speculative step's target at op level, its draft terms reported apart ([#2149](https://github.com/jgong5/ATOM/issues/2149)) | `validate/` | 30–80 | #2108, S4.11, S4.12, S4.8 |
+| **S4.15** | The MI455 cells' op graphs captured on the card, with the extractors they lack ([#2150](https://github.com/jgong5/ATOM/issues/2150)) | `capture/`, `backends/` | 60–150, plus extractors | S4.2, S4.3, S4.11, S4.12, GPU queue |
+| **S4.16** | The analytical bound and the method error on the MI455 cells (`08` D50.2; [#2151](https://github.com/jgong5/ATOM/issues/2151)) | none, results on the issue | 0, CPU only | S4.9, S4.10, S4.13, S4.14, S4.15 |
+| **S4.17** | MI455's HTTP intake fitted from real bursts on the A0 node, in place of the terms carried from an MI355X host ([#2365](https://github.com/jgong5/ATOM/issues/2365)) | `scripts/compass/` | 10–30 | S4.3, S4.4, #2359, GPU queue |
+| **S4.18** | MI455 B0 probed, and B0 cards told from the A0 samples, so that every device field of `mi455-b0.json` is probed or datasheet ([#2438](https://github.com/jgong5/ATOM/issues/2438)) | `scripts/compass/`, `drive/` | 50–100 | S4.4, a B0 node |
+
+**Exit:** S4.9, S4.10 and S4.16 closed with their named results.
+
+Not exit criteria, lower priority, run in parallel where resources do not conflict; one
+still open at exit loses `e2e-stage4`:
+
+| ID | Task | Module | Effort | Depends on |
+|---|---|---|---|---|
+| **S4.19** | The step grid under EP4 and DSpark5: topic `17` amended and its implementation cut into issues ([#2152](https://github.com/jgong5/ATOM/issues/2152)) | design | 100–200 design text | — |
+| **S4.20** | The step grid graded on the MI455 cells ([#2153](https://github.com/jgong5/ATOM/issues/2153)) | `scripts/compass/` | ~10 | S4.19 and the issues it cuts, S4.9, S4.10 |
+| **S4.21** | `measure ops` on MI455 ([#2154](https://github.com/jgong5/ATOM/issues/2154)) | `bench/` | 30–80 | S4.15, GPU queue |
+| **S4.22** | The op-level empirical backend graded on the MI455 cells (`08` D50.3; [#2155](https://github.com/jgong5/ATOM/issues/2155)) | `scripts/compass/` | ~10 | S4.21, S3d.10, S3d.11, S4.9, S4.10 |
+
 ---
 
 ## After v1
@@ -658,8 +760,9 @@ Listed so it is not mistaken for an omission; each is re-planned when v1 lands.
 third MI355X node for W4.4, so that calibration does not queue behind the pairs; an MI308X
 node for development, the CPU-and-GPU gates, S3c.3's MI308X probes, stage 2's real side
 (S2.1), and the step grid's measurement (S2.2) while it is idle from stage 2's critical
-path. Until dedicated nodes
-exist, the shared pools below serve, with the pre-flight gate as written.
+path. *Stage 4* adds two 4-card MI455 nodes, shared with their other users in booked
+windows (#2138). Until dedicated nodes exist, the shared pools below serve, with the
+pre-flight gate as written.
 
 GPU is the scarce resource; almost everything else is CPU-only by design principle 2.
 Only calibration Phases 1b/1c/2, `--measure` runs, the real side of pairings, and the

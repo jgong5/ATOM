@@ -68,28 +68,20 @@ printf 'verdict: the last line of stdout; if this run is piped, $? is the pipe'"
 
 # The baseline is a pair AND the tree and toolchain it was measured on. A bare
 # pair cannot distinguish a regression from drift: after a torch bump, 4728/7
-# has no reading. Changing any of these seven constants is a reviewed edit.
+# has no reading. regen_gpu_gate_baseline.sh measures these seven constants and
+# writes them to gpu_gate_baseline.env; changing that file is a reviewed edit.
 #
-# Measured 2026-10-14 on hjbog-srdc-18 in xiaobizh_n18_next13 (image
-# rocm/atom-dev vllm-v0.31.0-nightly_20261013), HIP_VISIBLE_DEVICES=1, against a
-# git archive of pure upstream 661ef7661, the ATOM that image ships: 11346
-# passed, 131 failed, 0 errors, 497 skipped, 3 xfailed in 1566.2 s. A run on
-# GPU 3 the same day failed the same 131 node-ids with the same counts.
-# Upstream has no tests/compass/, so every Compass test is surplus.
-BASE_PASSED=11346
-BASE_FAILED=131
-BASE_COMMIT=661ef7661
-BASE_TORCH=2.10.0+rocm7.2.4.git3d3aa833
 # BASE_ROCM is compared against torch.version.hip below, so it carries the HIP
-# runtime version, not the ROCm release. ROCm release was 7.2.4.
-BASE_ROCM=7.2.53211
-# AITER has no __version__; this is `git describe --tags --always` in the source
-# checkout aiter imports from. Most known failures are AITER kernels or the
+# runtime version, not the ROCm release.
+#
+# AITER has no __version__; BASE_AITER is `git describe --tags --always` in the
+# source checkout aiter imports from. Most known failures are AITER kernels or the
 # gfx950-only formats they test, so AITER is the likeliest single cause of a
 # change that moves them -- a bump used to pass the drift check in silence
 # because only torch and HIP were compared.
-BASE_AITER=v0.1.25-44-g9205e1059
-# How many of BASE_PASSED came from tests/compass/ at BASE_COMMIT. The pass count
+#
+# BASE_COMPASS_TESTS is how many of BASE_PASSED came from tests/compass/ at
+# BASE_COMMIT; the regenerated baseline runs none of them. The pass count
 # is checked for EQUALITY against BASE_PASSED adjusted by what tests/compass/
 # contributes on this tree, so a surplus is accounted for rather than absorbed.
 # Every Compass task adds tests there; a task that adds tests anywhere else makes
@@ -101,7 +93,15 @@ BASE_AITER=v0.1.25-44-g9205e1059
 # blamed tests outside tests/compass/. The tree side is now the passes of the
 # tests/compass run below, so the two are the same quantity by construction
 # rather than while a condition happens to hold.
-BASE_COMPASS_TESTS=0
+BASELINE=$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_baseline.env
+[ -r "$BASELINE" ] || {
+    printf 'FATAL: %s is missing; the gate has no baseline.\n' "$BASELINE" >&2
+    finish 93 "the baseline file is missing; nothing was run"
+}
+. "$BASELINE"
+for key in BASE_PASSED BASE_FAILED BASE_COMMIT BASE_TORCH BASE_ROCM BASE_AITER BASE_COMPASS_TESTS; do
+    [ -n "${!key:-}" ] || finish 93 "$(basename "$BASELINE") sets no $key; nothing was run"
+done
 
 # The baseline's failures by name. The count above and the list here are two
 # statements of one fact, so a disagreement between them is a defect in this
@@ -177,7 +177,7 @@ if [ "$TORCH" != "$BASE_TORCH" ] || [ "$ROCM" != "$BASE_ROCM" ] || [ "$AITER" !=
     printf 'WARNING: toolchain differs from the baseline'"'"'s. The known failures are\n' >&2
     printf '         mostly AITER kernel results that depend on exactly this\n' >&2
     printf '         stack; the pair below is not comparable until it is\n' >&2
-    printf '         re-measured and the constants and %s updated.\n' "$(basename "$KNOWN_FILE")" >&2
+    printf '         re-measured on this stack with regen_gpu_gate_baseline.sh.\n' >&2
 fi
 
 # The driver-run tests start ATOM's own servers on the simulated clock. Each
@@ -191,6 +191,10 @@ if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
     hf_snapshot() { ls -d "${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--$1/snapshots/"*/ 2>/dev/null | head -1; }
     export ATOM_COMPASS_SLICE_MODEL=${ATOM_COMPASS_SLICE_MODEL:-$(hf_snapshot Qwen3-0.6B)}
     export ATOM_COMPASS_IMAGE_MODEL=${ATOM_COMPASS_IMAGE_MODEL:-$(hf_snapshot Qwen3.5-9B)}
+    # The speculative runs read a config and a tokenizer, no weights: MTP1 from
+    # Qwen3.5-0.8B, DSpark from DeepSeek-V4.1-Flash's config with V4-Flash's tokenizer.
+    export ATOM_COMPASS_MTP_MODEL=${ATOM_COMPASS_MTP_MODEL:-$(hf_snapshot Qwen3.5-0.8B)}
+    export ATOM_COMPASS_DSPARK_MODEL=${ATOM_COMPASS_DSPARK_MODEL:-/root/cells/deepseek-v41-flash-dspark}
     # The cc-traces smoke replays turns longer than the slice model's context, so
     # it runs alone, with this model as its slice model.
     SMOKE=tests/compass/test_cctraces_sim_smoke.py
@@ -209,6 +213,8 @@ if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
     MISSING=
     [ -d "$ATOM_COMPASS_SLICE_MODEL" ] || MISSING+="ATOM_COMPASS_SLICE_MODEL, a Qwen3-0.6B directory; "
     [ -d "$ATOM_COMPASS_IMAGE_MODEL" ] || MISSING+="ATOM_COMPASS_IMAGE_MODEL, a Qwen3.5-9B directory; "
+    [ -d "$ATOM_COMPASS_MTP_MODEL" ] || MISSING+="ATOM_COMPASS_MTP_MODEL, a Qwen3.5-0.8B directory; "
+    [ -d "$ATOM_COMPASS_DSPARK_MODEL" ] || MISSING+="ATOM_COMPASS_DSPARK_MODEL $ATOM_COMPASS_DSPARK_MODEL; "
     [ -d "$ATOM_COMPASS_CCTRACES_MODEL" ] || MISSING+="ATOM_COMPASS_CCTRACES_MODEL, a Qwen3.8-27B directory; "
     [ -r "$ATOM_COMPASS_CCTRACES" ] || MISSING+="ATOM_COMPASS_CCTRACES $ATOM_COMPASS_CCTRACES; "
     [ -x "$COMPASS_HARNESS_PYTHON" ] || MISSING+="COMPASS_HARNESS_PYTHON $COMPASS_HARNESS_PYTHON; "
@@ -221,17 +227,10 @@ if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
     [ -z "$MISSING" ] || finish 92 "the driver-run tests lack ${MISSING%; }; nothing was run"
     printf 'driver-run: slice %s\n            image %s\n            machine %s\n            router %s\n' \
         "$ATOM_COMPASS_SLICE_MODEL" "$ATOM_COMPASS_IMAGE_MODEL" "$ATOM_COMPASS_SLICE_MACHINE" "$ATOMESH"
+    printf 'spec:       mtp %s\n            dspark %s\n' "$ATOM_COMPASS_MTP_MODEL" "$ATOM_COMPASS_DSPARK_MODEL"
     printf 'cc-traces:  model %s\n            traces %s\n            harness %s\n            aiperf %s\n' \
         "$ATOM_COMPASS_CCTRACES_MODEL" "$ATOM_COMPASS_CCTRACES" "$COMPASS_HARNESS_PYTHON" "$COMPASS_AIPERF_PYTHON"
 fi
-
-# Sets SUMMARY, PASSED, FAILED and ERRORS from the pytest summary line ending a log.
-counts() {
-    SUMMARY=$(tail -20 "$1" | grep -E '[0-9]+ (passed|failed|error)' | tail -1)
-    PASSED=$(grep -oE '[0-9]+ passed' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
-    FAILED=$(grep -oE '[0-9]+ failed' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
-    ERRORS=$(grep -oE '[0-9]+ errors?' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
-}
 
 # tests/compass runs once, on every card named, and the rest of the suite on the
 # first card alone, as the baseline was measured: an upstream test that needs
@@ -250,7 +249,7 @@ compass_tests() {
     python -m pytest "$@" -q --no-header -p no:cacheprovider "${ARGS[@]}" -rfEs 2>&1 | tee "$log"
     rc=${PIPESTATUS[0]}
     cat "$log" >>"$COUT"
-    counts "$log"
+    compass_pytest_counts "$log"
     rm -f "$log"
     # rc 5 is "no tests collected": a directory holding nothing runnable passes none.
     case "$rc" in
@@ -269,17 +268,30 @@ elif [ -d "$ROOT/tests/compass" ]; then
 else
     printf 'tests/compass: absent on this tree, so it contributes no tests.\n'
 fi
-EXPECT_PASSED=$((BASE_PASSED + COMPASS_N - BASE_COMPASS_TESTS))
-printf 'expected: %s passed = %s baseline + (%s - %s) tests/compass\n' \
-    "$EXPECT_PASSED" "$BASE_PASSED" "$COMPASS_N" "$BASE_COMPASS_TESTS"
+# A file that stalls on one GPU keeps the suite from ever printing a summary.
+# gpu_gate_skip.txt names such files per GPU; on a matching first card each is
+# left out of the suite and its collected tests come off the expectation.
+DEVICE=$(HIP_VISIBLE_DEVICES=${GPUS%%,*} python -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null)
+printf 'device: %s\n' "${DEVICE:-UNKNOWN}"
+SKIP_ARGS=() SKIP_N=0
+while read -r gpu file; do
+    [[ -n $DEVICE && $DEVICE == *"$gpu"* && -e $file ]] || continue
+    n=$(python -m pytest "$file" --collect-only -q -p no:cacheprovider 2>&1 | sed -nE 's/^([0-9]+) tests? collected.*/\1/p')
+    [ -n "$n" ] || finish 1 "cannot count the tests of $file, which gpu_gate_skip.txt leaves out on $gpu"
+    printf 'left out on %s: %s (%s tests)\n' "$gpu" "$file" "$n"
+    SKIP_ARGS+=("--ignore=$file") SKIP_N=$((SKIP_N + n))
+done < <(grep -vE '^[[:space:]]*(#|$)' "$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_skip.txt")
+EXPECT_PASSED=$((BASE_PASSED + COMPASS_N - BASE_COMPASS_TESTS - SKIP_N))
+printf 'expected: %s passed = %s baseline + (%s - %s) tests/compass - %s left out\n' \
+    "$EXPECT_PASSED" "$BASE_PASSED" "$COMPASS_N" "$BASE_COMPASS_TESTS" "$SKIP_N"
 printf '\n'
 
 OUT=$(mktemp)
 # -rfE, after "$@" so it wins even if a -r form slips past the refusal above.
 HIP_VISIBLE_DEVICES=${GPUS%%,*} python -m pytest tests/ --ignore=tests/plugin --ignore=tests/compass \
-    -q --no-header -p no:cacheprovider "$@" -rfE 2>&1 | tee "$OUT"
+    "${SKIP_ARGS[@]}" -q --no-header -p no:cacheprovider "$@" -rfE 2>&1 | tee "$OUT"
 PYRC=${PIPESTATUS[0]}
-counts "$OUT"
+compass_pytest_counts "$OUT"
 
 # A summary line that parses to 0/0/0, or no summary line at all, means the run
 # did not get far enough to produce one -- a collection error, an OOM, a killed
@@ -311,7 +323,7 @@ PASSED=$((PASSED + COMPASS_N)) FAILED=$((FAILED + C_FAILED)) ERRORS=$((ERRORS + 
 printf '\nGATE_GPU passed=%s failed=%s errors=%s pytest_rc=%s (baseline %s/%s/0, expected %s passed)\n' \
     "$PASSED" "$FAILED" "$ERRORS" "$PYRC" "$BASE_PASSED" "$BASE_FAILED" "$EXPECT_PASSED"
 # A driver-run test that skipped did not run, whatever the counts say.
-SKIPS=$(grep -E '^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE)_MODEL|ATOM_COMPASS_CCTRACES|COMPASS_AIPERF_PYTHON|atomesh)' "$COUT")
+SKIPS=$(grep -E '^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK)_MODEL|ATOM_COMPASS_CCTRACES|COMPASS_AIPERF_PYTHON|atomesh)' "$COUT")
 cat "$COUT" >>"$OUT"
 rm -f "$COUT"
 
@@ -397,6 +409,7 @@ rm -f "$OBS_IDS" "$ERR_IDS" "$KNOWN_IDS"
     fail "$(printf '%s passed, expected %s. The difference decomposes as:
     baseline        %s   at %s
     tests/compass   %s now, %s at the baseline (delta %s)
+    left out        %s
     expected        %s
     observed        %s
     unaccounted     %s
@@ -405,7 +418,7 @@ rm -f "$OBS_IDS" "$ERR_IDS" "$KNOWN_IDS"
   accounted for; if this tree adds tests outside tests/compass/, account for
   them here.' \
         "$PASSED" "$EXPECT_PASSED" "$BASE_PASSED" "$BASE_COMMIT" \
-        "$COMPASS_N" "$BASE_COMPASS_TESTS" "$((COMPASS_N - BASE_COMPASS_TESTS))" \
+        "$COMPASS_N" "$BASE_COMPASS_TESTS" "$((COMPASS_N - BASE_COMPASS_TESTS))" "$SKIP_N" \
         "$EXPECT_PASSED" "$PASSED" "$((PASSED - EXPECT_PASSED))")" \
     "$PASSED passed, expected $EXPECT_PASSED"
 

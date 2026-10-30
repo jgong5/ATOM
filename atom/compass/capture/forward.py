@@ -2,12 +2,12 @@
 """Steps of a model, traced with no device into `ir.Graph`s, one per `Shape`.
 
 ATOM's `ModelRunner` runs its own step through the model's own classes under
-`TorchDispatchMode` over `FakeTensorMode`, the Python dispatcher on, at one
-concrete shape: a decode width, or a prefill of T tokens over B sequences. One
-runner steps through every shape of a capture, as it steps through a run.
-A decode shape is traced twice, its rows holding each of `CONTEXTS` tokens: an
-integer argument that differs between the two is affine in the context
-(`ir.Affine`), or the shape is refused by operator and slot.
+`TorchDispatchMode` over `FakeTensorMode` at one concrete shape: a decode
+width, or a prefill of T tokens over B sequences. One runner steps through
+every shape of a capture, as it steps through a run. A decode shape is traced
+twice, its rows holding each of `CONTEXTS` tokens: an integer argument that
+differs between the two is affine in the context (`ir.Affine`), or the shape
+is refused by operator and slot.
 
 Each leaf carries its contract: its arguments by schema slot, a tensor as its
 shape, dtype, stride, role and the `is_shuffled` mark ATOM sets on a
@@ -51,6 +51,8 @@ import contextlib
 import copyreg
 import dataclasses
 import enum
+import functools
+import gc
 import importlib
 import inspect
 import json
@@ -80,8 +82,9 @@ KV_BLOCKS = 64
 #: The two contexts a decode shape is traced at, each row holding that many
 #: tokens. An integer argument that differs between them is affine in the
 #: context or refused; 997 apart, a prime, so a count rounded to blocks or
-#: divided moves by less than the context and is refused.
-CONTEXTS = (1, 998)
+#: divided moves by less than the context and is refused. Each row holds a
+#: token before its new one: a request's first forward starts its state over.
+CONTEXTS = (2, 999)
 #: Torch's own namespaces; an operator in any other hides its kernels.
 TORCH_NAMESPACES = ("aten", "prim", "prims", "_c10d_functional", "c10d")
 #: ATOM's H2D publication copies the runner's host-staged inputs to the device:
@@ -104,6 +107,25 @@ V4_INDEXER = "aiter.indexer_score_topk.default"
 V4_QKNS = (
     "aiter._fused_qk_norm_rope_group_quant_kernel.default",
     "aiter.ops.flydsl.kernels.qk_norm_rope_quant:flydsl_qk_norm_rope_quant",
+)
+#: DeepSeek-V4.1's guarded ops a capture runs the bodies of: attention,
+#: Engram and the step's staging hold kernels of their own.
+V41_OPENED = (
+    "v41_attention",
+    "v41_engram",
+    "v41_begin_forward",
+    "v41_end_forward",
+    "v41_record_tbo_expert_output",
+)
+#: DeepSeek-V4.1's sparse attention, and its indexer's scorers, gfx1250's
+#: and gfx950's.
+V41_ATTENTION = "aiter.pa_sparse_prefill_opus.default"
+V41_SCORERS = (
+    (
+        "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
+        "flydsl_fp8_paged_mqa_logits_gfx1250"
+    ),
+    "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits",
 )
 #: Where a drafter's step ends its target's work: ATOM records `forward_done_event`.
 CUT = "forward_done_event"
@@ -254,9 +276,16 @@ def _atom_frames():
 
 
 def _where(frame) -> str:
-    path = pathlib.Path(frame.f_code.co_filename)
+    code = frame.f_code
+    return _site(code.co_filename, code.co_qualname, frame.f_lineno)
+
+
+# Keyed on strings: equal code objects from two files compare and hash equal.
+@functools.cache
+def _site(filename, qualname, line) -> str:
+    path = pathlib.Path(filename)
     path = path.relative_to(_ROOT) if path.is_relative_to(_ROOT) else path
-    return f"{path}:{frame.f_lineno} in {frame.f_code.co_qualname}"
+    return f"{path}:{line} in {qualname}"
 
 
 def _storage(tensor) -> StorageWeakRef:
@@ -290,6 +319,23 @@ def _function(name: str):
     for attr in qualname.split("."):
         fn = getattr(fn, attr)
     return fn
+
+
+def _call(fn, values):
+    """`fn` called with each parameter's value in `values`, by name; a
+    variadic parameter's spread."""
+    args, kwargs = [], {}
+    for param in inspect.signature(fn).parameters.values():
+        value = values[param.name]
+        if param.kind is param.VAR_POSITIONAL:
+            args.extend(value)
+        elif param.kind is param.VAR_KEYWORD:
+            kwargs.update(value)
+        elif param.kind is param.KEYWORD_ONLY:
+            kwargs[param.name] = value
+        else:
+            args.append(value)
+    return fn(*args, **kwargs)
 
 
 def _rebuilt(value, live):
@@ -378,6 +424,7 @@ class _Recorder(TorchDispatchMode):
         self.launchers, self.languages = set(), ()
         self.replaying = None  # the kernels a replay launched, while one runs
         self.counted = None  # what a size the step's data sets counts, if stated
+        self.lands = False  # whether a device value read on the host reads zeros
         self.start()
 
     def start(self):
@@ -408,8 +455,8 @@ class _Recorder(TorchDispatchMode):
             self.on = on
 
     def _fake(self, tensor):
-        if not isinstance(tensor, FakeTensor):
-            return self.fake_mode.from_tensor(tensor)
+        if not isinstance(tensor, FakeTensor):  # at its sizes, none symbolic
+            return self.fake_mode.from_tensor(tensor, static_shapes=True)
         tensor.constant = None
         return tensor
 
@@ -560,7 +607,7 @@ class _Recorder(TorchDispatchMode):
                 held = isinstance(value, str) and value.startswith("torch.")
                 held = held and getattr(torch, value[6:], None)
                 kwargs[slot] = held if isinstance(held, torch.dtype) else value
-            _function(op.name)(**kwargs)
+            _call(_function(op.name), kwargs)
             return self.replaying
         except Exception as exc:  # noqa: BLE001 - refused with what stopped it
             raise ValueError(
@@ -686,8 +733,8 @@ def _patches(recorder):
 
     * A raw Triton or FlyDSL launch goes to the driver below the dispatcher: it
       is told to the recorder and not launched. Triton's is taken at
-      `JITFunction.run`, a warmup aside, and a direct `CompiledKernel` launch
-      is refused; FlyDSL's at `JitFunction.__call__` and at a
+      `JITFunction.run`, a warmup aside, and so is a direct `CompiledKernel`
+      launch; FlyDSL's at `JitFunction.__call__` and at a
       `CompiledFunction`'s call, which `flyc.compile` maps to its jit function.
     * Each call of a launching function, its entry and its return, is told to
       the recorder through `sys.monitoring`, on those functions alone; a raise
@@ -701,20 +748,29 @@ def _patches(recorder):
       slots, a count of the device's slot indices no fake tensor holds: the
       host-staged indices state it (`_Recorder.counted`).
     * A real host tensor's values are read on the host, `tolist` as `numpy`;
-      under a drafter a device value copied to the host, which nothing
-      computed, reads as zeros (its runner reads back the last step's MTP
-      status and draft ids). Without one, such a read raises.
+      under a drafter, or where the recorder `lands` them (`_v41`), a device
+      value copied to the host, which nothing computed, reads as zeros (a
+      drafter's runner reads back the last step's MTP status and draft ids).
+      Otherwise such a read raises.
     * ATOM's MoE wrappers run their bodies, not their fakes: inside are the
       collectives, the streams and the expert kernels.
     * The checkpoint's weights iterator yields nothing: ATOM's dummy load still
       runs it, which would open every shard, or download them for a hub name.
     * A step ATOM splits into two micro-batches (`--enable-tbo`) is refused by
       name before its threads start: one graph cannot hold the two.
+    * The step's DP exchange (`sync_dp_metadata`) runs on the host, outside
+      the fake mode and the recorder: `decide` runs it on a group of one too,
+      and reads its packed rows back as numpy.
+    * aiter's top-k scratch sizes are host queries into a module built for a
+      device, which a capture cannot load: each answers 0, and the scratch
+      the call allocates holds one byte.
     """
     import flydsl
     import triton
+    from aiter.ops import topk
     from flydsl.compiler import jit_function as fly
     from torch._subclasses.fake_tensor import unset_fake_temporarily
+    from torch.utils._python_dispatch import _disable_current_modes
     from triton.compiler.compiler import CompiledKernel
     from triton.runtime.jit import JITFunction
 
@@ -722,6 +778,7 @@ def _patches(recorder):
     from atom.model_ops import module_dispatch_ops, moe
     from atom.model_ops.attentions import gdn_attn
     from atom.utils import CpuGpuBuffer
+    from atom.utils.tbo import ubatching
     from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
     recorder.languages = tuple(
@@ -733,10 +790,7 @@ def _patches(recorder):
             recorder.launch(f"triton.{kernel.__name__}", kernel)
 
     def compiled_kernel(kernel, *args):
-        raise ValueError(
-            f"triton.{kernel.name} launches through CompiledKernel.run, past "
-            "JITFunction.run: a call that took no arguments to lift"
-        )
+        return lambda *a, **k: recorder.launch(f"triton.{kernel.name}", kernel)
 
     def jit_call(jit, *args, **kwargs):
         recorder.launch(f"flydsl.{jit.func.__name__}", jit)
@@ -757,10 +811,10 @@ def _patches(recorder):
     init, zeros, numpy = CpuGpuBuffer.__init__, torch.zeros, torch.Tensor.numpy
     conv1d, tolist = gdn_attn.compute_causal_conv1d_metadata, torch.Tensor.tolist
     attach = gdn_attn.GDNStateMixin._attach_replayssm
-    fake_tolist = FakeTensor.tolist
+    fake_tolist, sync = FakeTensor.tolist, ubatching.sync_dp_metadata
 
     def landed(tensor):
-        if not getattr(recorder.runner, "drafter", None):
+        if not (recorder.lands or getattr(recorder.runner, "drafter", None)):
             return tensor
         if isinstance(tensor, FakeTensor) and tensor.device.type == "cpu":
             with unset_fake_temporarily():
@@ -801,6 +855,11 @@ def _patches(recorder):
         with unset_fake_temporarily():
             return conv1d(*args, **kwargs)
 
+    def host_sync(**kwargs):
+        # Outside every mode: host arithmetic, not the step's device work.
+        with _disable_current_modes():
+            return sync(**kwargs)
+
     def replayssm(builder, md, num_reqs, is_prefill):
         staged = builder.non_spec_state_indices_tensor.np[:num_reqs]
         live = int((staged >= 0).sum()) if is_prefill else None
@@ -817,12 +876,15 @@ def _patches(recorder):
         (fly.CompiledFunction, "__call__", compiled_call),
         (CpuGpuBuffer, "__init__", staged_init),
         (gdn_attn, "compute_causal_conv1d_metadata", host_conv1d),
+        (ubatching, "sync_dp_metadata", host_sync),
         (gdn_attn.GDNStateMixin, "_attach_replayssm", replayssm),
         (torch.Tensor, "tolist", host_tolist),
         (FakeTensor, "tolist", host_tolist),
         (torch.Tensor, "numpy", lambda t, *a, **k: host_numpy(landed(t), *a, **k)),
         (loader, "safetensors_weights_iterator", lambda *a, **k: iter(())),
         (UBatchWrapper, "_run_ubatches", micro_batches),
+        (topk, "topk_ob_workspace_size", lambda *a: 0),
+        (topk, "topk_mb_workspace_size", lambda *a: 0),
         (torch.ops.aiter, "moe_forward", moe.moe_forward),
         (
             torch.ops.aiter,
@@ -892,6 +954,61 @@ def _v4_attention(v4, recorder):
     return patch.object(torch.ops.aiter, "v4_attention_with_output", body)
 
 
+def _implementation(name):
+    """A call of aiter's guarded op `name` that runs the body ATOM wrote, not
+    its fake: aiter registers the body as the op's kernel for both device
+    keys, and the CPU one, called directly, takes fake tensors as they are."""
+    op = getattr(torch.ops.aiter, name).default
+    return functools.partial(
+        op.redispatch, torch._C.DispatchKeySet(torch._C.DispatchKey.CPU)
+    )
+
+
+def _v41(recorder, hf):
+    """DeepSeek-V4.1's guarded ops of `V41_OPENED` run their bodies, not their
+    fakes, on a real step's batch: V4.1 serves a dummy run as idle padding.
+    Its state cursors, read back to the host, read zeros, and the check that
+    each request's state is where the scheduler put it has no values to
+    judge.
+
+    Its sparse attention (`V41_ATTENTION`) states the layer's `window_size`,
+    `compress_ratio` and `index_topk` (None where it compresses nothing), and
+    its indexer's scorers (`V41_SCORERS`) the `compress_ratio` and
+    `index_candidates`, the most entries it scores where an earlier layer
+    chose its candidates, else None: read off the layer `layer_name` names
+    and the model's config `hf`.
+    """
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+
+    bodies = {name: _implementation(name) for name in V41_OPENED}
+    attend = bodies["v41_attention"]
+
+    def attention(hidden, layer_name, *args, **kwargs):
+        attn = recorder.contexts[layer_name][0].attn
+        ratio, ix = attn.spec.ratio, attn.indexer
+        top = hf.index_topk if ratio else None
+        chosen = ix is not None and attn.spec.candidate_source is not None
+        candidates = ix.topk_blocks * ix.block_size if chosen else None
+        geometry = ("window_size", hf.sliding_window), ("compress_ratio", ratio)
+        scored = ("compress_ratio", ratio), ("index_candidates", candidates)
+        stated = {
+            V41_ATTENTION: (*geometry, ("index_topk", top)),
+            **dict.fromkeys(V41_SCORERS, scored),
+        }
+        with patch.object(recorder, "stated", stated):
+            return attend(hidden, layer_name, *args, **kwargs)
+
+    bodies["v41_attention"] = attention
+    recorder.lands = True
+    stack = contextlib.ExitStack()
+    for name, body in bodies.items():
+        stack.enter_context(patch.object(torch.ops.aiter, name, body))
+    stack.enter_context(
+        patch.object(PagedAttentionCache, "_report_stale_state", lambda *a: None)
+    )
+    return stack
+
+
 def _build_runner(config, fake_mode):
     """ATOM's `ModelRunner`, built in the mode in the model's dtype, which it
     leaves torch's default for the steps, as ATOM's runner does.
@@ -901,8 +1018,16 @@ def _build_runner(config, fake_mode):
     shard opened, under `_patches`), and the declared device's memory is all
     free.
     """
+    from aiter.ops import attention
+
     from atom.model_engine.model_runner import DeviceMemoryReadings, ModelRunner
     from atom.utils import h2d
+
+    # aiter sizes MLA's metadata for the arch its C++ planner reads off the
+    # device through HIP; the declared device answers, for every later step too.
+    attention._mla_cpp_gpu_arch = lambda index: (
+        torch.cuda.get_device_properties(index).gcnArchName
+    )
 
     class _CapturedRunner(ModelRunner):
         def _setup_device_and_distributed(self, rank, config):
@@ -916,7 +1041,13 @@ def _build_runner(config, fake_mode):
             return DeviceMemoryReadings(total, total, 0, 0)
 
     # A fake tensor has no address: the alias check sees each buffer empty.
-    with fake_mode, patch.object(h2d, "_range", lambda t: (0, 0)):
+    # Built in the inference mode its steps run in, so their views of its
+    # weights and buffers keep the keys of what they view.
+    with (
+        fake_mode,
+        patch.object(h2d, "_range", lambda t: (0, 0)),
+        torch.inference_mode(),
+    ):
         return _CapturedRunner(0, config)
 
 
@@ -964,14 +1095,19 @@ def _weights(model):
                 yield value
 
 
-def _batch(shape, block_size, context=1, output=True, drafts=0):
+def _batch(
+    shape, block_size, context=1, output=True, drafts=0, stateful=False, real=False
+):
     """`shape.seqs` sequences of `shape.tokens` new tokens between them, the
     first `tokens % seqs` one longer, each in blocks of its own; and the
     blocks they take. A decode sequence holds `context` tokens, and under a
     drafter of `drafts` tokens verifies that many more, as ATOM's scheduler
     schedules it. Unless `output`, every prefill sequence is a middle chunk,
     so the step samples nothing. Under a drafter a prefill row states its next
-    token, -1 where the step samples it, as ATOM's scheduler states it."""
+    token, -1 where the step samples it, as ATOM's scheduler states it. A
+    `stateful` model's sequence holds a state slot of its own, as ATOM's block
+    manager gives one to a model with per-request cache. The step is a dummy
+    run unless it has a drafter or is `real`."""
     from atom.model_engine import sequence
     from atom.model_engine.scheduler import ScheduledBatch
 
@@ -990,6 +1126,8 @@ def _batch(shape, block_size, context=1, output=True, drafts=0):
         seq.num_cached_tokens = held - count
         taken = -(-held // block_size)
         seq.block_table = sequence.new_block_table(list(range(blocks, blocks + taken)))
+        if stateful:  # its own committed state slot, as the block manager gives it
+            seq.has_per_req_cache, seq.state_slots = True, [index]
         seqs[seq.id], blocks = seq, blocks + taken
     batch = ScheduledBatch(
         seqs=seqs,
@@ -1000,7 +1138,7 @@ def _batch(shape, block_size, context=1, output=True, drafts=0):
         **{f"total_seqs_num_{shape.phase}": shape.seqs},
         # ATOM scores drafts, and writes a prefill's draft KV, only on a step
         # that is not a dummy run.
-        is_dummy_run=not drafter,
+        is_dummy_run=not (drafter or real),
         is_final_chunk=None if output else [False] * shape.seqs,
         next_token_ids=(
             [-1 if output else 0] * shape.seqs if drafter and prefill else None
@@ -1142,6 +1280,8 @@ def capture(
         runner = _build_runner(config, fake_mode)
         if v4 := sys.modules.get("atom.models.deepseek_v4"):
             stack.enter_context(_v4_attention(v4, recorder))
+        if v41 := "atom.models.deepseek_v41.runtime" in sys.modules:
+            stack.enter_context(_v41(recorder, config.hf_config))
         stacks = [
             module
             for name, module in runner.model.named_modules()
@@ -1166,15 +1306,23 @@ def capture(
         weights = map(_storage, (w for m in models for w in _weights(m)))
         recorder.roles = dict.fromkeys(weights, ir.Role.WEIGHT)
         recorder.creating = ir.Role.KV
+        from atom.model_engine.llm_engine import InputOutputProcessor
+
+        per_req = InputOutputProcessor._per_req_cache_model_types()
+        stateful = config.hf_config.model_type in per_req
         blocks = max(
             _batch(s, block_size, max(CONTEXTS), True, drafts)[1] for s in shapes
         )
-        with fake_mode:
+        with fake_mode, torch.inference_mode():
             runner.get_num_blocks()  # sizes the pools, as `EngineCore` does
         # A warmup copy whose bytes nobody reads, like `_maybe_warmup`.
         runner.attn_metadata_builder.warmup_per_req_cache = lambda: None
-        with fake_mode, recorder:
+        with fake_mode, recorder, torch.inference_mode():
             runner.allocate_kv_cache(max(KV_BLOCKS, blocks))
+        # The runner, its drafter and its KV pool live to the end: no
+        # collection need walk them again.
+        gc.collect()
+        gc.freeze()
         # A prefill is traced as a middle chunk, which samples nothing, then as
         # a final one; a decode step always samples, as does a prefill whose
         # LM head pads, except a DP middle chunk's drafter at its later passes.
@@ -1199,8 +1347,8 @@ def capture(
             traces = []
             for context in CONTEXTS if shape.phase == "decode" else CONTEXTS[:1]:
                 recorder.creating = ir.Role.METADATA
-                batch = (shape, block_size, context, output, drafts)
-                with fake_mode, torch._C._EnablePythonDispatcher(), recorder:
+                batch = (shape, block_size, context, output, drafts, stateful, v41)
+                with fake_mode, recorder:
                     # A runner's first step takes its own path (a decode
                     # fills no deferred ids), so the traced step follows two
                     # of its own shape, which find its launching functions:

@@ -68,7 +68,7 @@ await asyncio.sleep(interval)     # ATOM_METRICS_UPDATE_INTERVAL_S
 await step()                      # _refresh_metrics_once
 
 # AtomMetricsExporter.update (atom/metrics/exporter.py)
-self._last_refresh = clock.now(time.time)   # "when was this snapshot taken", returned by read()
+self._last_refresh = time.time()   # through atom.utils.time_shim; "when was this snapshot taken", returned by read()
 ```
 
 **Decision (owner ruling, 2026-10-02): the push and the refresh are timers on simulated
@@ -356,7 +356,8 @@ forward made the run **33% slower** (TPOT 3.26 → 4.33 ms).
    counting-invariant comparison needs no new instrumentation** — a scrape on each side and
    a diff.
 2. **A histogram's `_count` is itself a counting invariant.** Same workload, same requests,
-   so real and simulated must produce the same number of observations, exactly.
+   so real and simulated observation counts compare directly; like every count but
+   preemptions and prefill tokens (`08` D46), it is reported, not gated.
 3. **`_sum / _count` is a mean** comparable against the real-vs-real noise floor of `08`
    D45, with no new instrumentation.
 
@@ -394,7 +395,7 @@ D72's "valid by construction" holds today, except two frontend clock reads, both
 clock under simulation. `atom:metrics_last_refresh_timestamp_seconds` is **T**: it exports
 `_last_refresh`, a simulated instant (D72). `atom:stream_longest_silence_seconds` is **D**:
 `longest_silence_seconds` (`atom/entrypoints/openai/streaming_dispatch.py`) subtracts two
-`clock.now(time.monotonic)` reads, so it is a simulated duration (`01` D5). The classes
+`time.monotonic()` reads through `atom.utils.time_shim`, so it is a simulated duration (`01` D5). The classes
 exist so that the next metric is classified rather than assumed.
 
 ### How the Prometheus types map — note that one type spans several classes

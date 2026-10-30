@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: MIT
-"""The mi355-gpu-45 MI355X machine spec, from a tokenizer swept here and one real start.
+"""An MI355X machine spec, from the tokenizers swept here and one real start.
 
-    python3 scripts/compass/mi355x_spec.py [--sweep-from DOC] [--out PATH]
+    python3 scripts/compass/mi355x_spec.py [--model M ...] [--sweep-from DOC] [--out PATH]
 
+Builds mi355-gpu-45's spec, or with COMPASS_MACHINE=mi355x-crs005
+crsuse2-m2m-v3-005's, which -013 shares: the same host CPU, cards, VBIOS and
+driver, and no ptl directory. With COMPASS_MACHINE=mi355x-gpu40 it builds
+mi355-gpu-40's, under rocm/atom-dev nightly 20261026's stack, the first that
+starts DeepSeek-V4.1-Flash.
 The device fragment is one DeepSeek-V4-Pro start at the nightly DPA-TP8 prefill
 side's arguments (`FLAGS`): the device, its capacity and the stack. One real
 burst at the same arguments adds the HTTP intake terms (`INTAKE`), and
@@ -10,23 +15,32 @@ burst at the same arguments adds the HTTP intake terms (`INTAKE`), and
 bandwidth curve, the kernel floor and the intra-node link's latency and derate.
 The peaks are the datasheet's; the rest is assumed. An engine start's memory
 readings are `compass measure memory`'s, not the spec's.
-`--sweep-from` takes the tokenizer sweep from a document this script wrote.
+`--model` and `--sweep-from` work as `mi308x_spec.py`'s do; with neither the
+script sweeps the tokenizers `SWEPT` names.
 """
 
 import argparse
 import copy
 import json
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+#: The machines this script has tables for. mi308x_spec.py reads the same
+#: variable for its own hosts at import.
+MACHINES = ("mi355x-gpu45", "mi355x-crs005", "mi355x-gpu40")
+NAME = os.environ.pop("COMPASS_MACHINE", MACHINES[0])
+if NAME not in MACHINES:
+    raise SystemExit(f"COMPASS_MACHINE={NAME}: this script builds only {MACHINES}")
+CRS005, GPU40 = NAME == "mi355x-crs005", NAME == "mi355x-gpu40"
 
 import mi308x_spec as base
 from mi308x_spec import fragment, saved, swept
 
 from atom.compass.spec import Fragment, merge, validate
 
-NAME = "mi355x-gpu45"
 base.NAME = NAME  # the shared fragment and sweep functions name this machine
 MODEL = "/models/DeepSeek-V4-Pro"
 FLAGS = "-tp 8 --enable-dp-attention --enable-tbo"
@@ -36,6 +50,21 @@ DATE, COMMIT = "2026-10-16", "409bedc98"
 TOTAL = 309220868096
 #: The sha256 of the start's server log.
 RECORD = "02618dade3d07bcaac510da11cf8a279a1fe3ef2fce72d41e88a76f2df7c32c6"
+#: On 005, the start is the `INTAKE` record's server; its 287.98 GB total
+#: is `TOTAL`, the bytes rocm-smi reads on every card of 005 and -013.
+if CRS005:
+    MODEL = "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro"
+    DATE, COMMIT = "2026-10-29", "f6e1fa77d"
+    RECORD = "622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+#: On gpu-40 too, under nightly 20261026.
+if GPU40:
+    MODEL = "/shared/data/amd_int/models/DeepSeek-V4-Pro"
+    DATE, COMMIT = "2026-10-29", "b71c071d3"
+    RECORD = "300adea69f618f9da5fd7258c927c14000b2f247a1bad8c02bd74928b62ce787"
+#: The models whose tokenizers a sweep with no `--model` takes.
+SWEPT = [MODEL]
+if GPU40:
+    SWEPT.append("/shared/data/amd_int/models/DeepSeek-V4.1-Flash")
 SUBJECT = {"model": MODEL, "width": 8, "source_root": f"commit:{COMMIT}"}
 SUBJECT["record"] = f"sha256:{RECORD}"
 
@@ -54,9 +83,49 @@ INTAKE = (
     },
     "2397696f6df3a280660cbc95e7c8db0d61b77fba9986c3d388ccde75f2d5f574",
 )
+#: On 005, three bursts started one after another with no gate on either
+#: node and no other deployment on 005: the record, 133dde61 and ae9b8a49; the
+#: record is the median of the fixed term, the larger.
+if CRS005:
+    INTAKE = (
+        "2026-10-29",
+        "f6e1fa77d",
+        {"fixed_s": 0.0020912355743506537, "per_byte_s": 4.19943165426115e-09},
+        {
+            "fixed_s": (0.0020310947130036056, 0.002139447088691459),
+            "per_byte_s": (3.9301788350529524e-09, 4.159128855060515e-09),
+        },
+        "fc9dadb1074821306edad43745d303c9de754feb03e9efcb195885b7282663cb",
+    )
+
+#: On gpu-40, one warm-up burst and then three, each started once no process
+#: held any card: 32a41c18, the record and ef2785a8; the record is the median
+#: of both terms.
+if GPU40:
+    INTAKE = (
+        "2026-10-29",
+        "b71c071d3",
+        {"fixed_s": 0.004323501788394507, "per_byte_s": 3.8541166293528945e-09},
+        {
+            "fixed_s": (0.004132315291889949, 0.004513225799755211),
+            "per_byte_s": (3.577973224796102e-09, 6.711557841376081e-09),
+        },
+        "163c6320f4e4793c1d153a3058649d4feb05a4cfc0ff65d30712aedfa2577373",
+    )
+
+#: Each host's core counts as /proc/cpuinfo reads them, aiter's commit in the
+#: stack its start and probe ran under (on 005 rocm/atom-dev sha256
+#: 4d44267b1d5a, nightly 20261026), and the day its cards were read with no
+#: ptl directory.
+CPU, AITER, PTL_DATE = (128, 256), "9205e1059", "2026-10-18"
+if CRS005:
+    CPU, AITER, PTL_DATE = (118, 236), "41d4d8d7e", "2026-10-29"
+#: On gpu-40, rocm/atom-dev nightly 20261026 (sha256 4d44267b1d5a).
+if GPU40:
+    AITER, PTL_DATE = "41d4d8d7e", "2026-10-29"
 
 DEVICE = {
-    "host": {"cpu": {"cores_physical": 128, "cores_logical": 256}},
+    "host": {"cpu": {"cores_physical": CPU[0], "cores_logical": CPU[1]}},
     "device": {
         "name": "MI355X",
         "arch": "gfx950",
@@ -64,7 +133,7 @@ DEVICE = {
         "memory": {"capacity_bytes": TOTAL},
         "software_pinned_to": {
             "rocm": "7.2.4",
-            "aiter": "9205e1059",
+            "aiter": AITER,
             "rccl": "2.27.7",
             "torch": "2.10.0+rocm7.2.4.git3d3aa833",
         },
@@ -137,6 +206,99 @@ PEAKS = (
     },
     "040ae2dced8e3b5aefbff28c8e6bb5f5afe016fe373e8327fb1384407e1abef0",
 )
+#: On 005, cards 0003:00:03.0 and 0003:00:04.0.
+if CRS005:
+    PEAKS = (
+        "2026-10-29",
+        "f6e1fa77d",
+        {
+            "bandwidth_curve": [
+                [4096, 2448213119.8574038],
+                [8192, 4901932899.645926],
+                [16384, 9799057786.896889],
+                [32768, 19216086138.60756],
+                [65536, 36700073375.20446],
+                [131072, 73396013852.64185],
+                [262144, 146726346018.3001],
+                [524288, 281614855936.05884],
+                [1048576, 559324208073.2725],
+                [2097152, 1069975261609.8036],
+                [4194304, 1900125139330.0735],
+                [8388608, 3036138588634.988],
+                [16777216, 4078284050135.474],
+                [33554432, 5133415851480.742],
+                [67108864, 5842638294512.771],
+                [134217728, 6020018863349.566],
+                [268435456, 6119695251585.363],
+                [536870912, 6257719852339.275],
+                [1073741824, 6371910488551.815],
+                [2147483648, 6463389077030.495],
+                [4294967296, 6556731501062.837],
+            ],
+            "bf16": 1637694846431171.0,
+            "device.kernel_floor_s": [
+                1.5658164620399475e-06,
+                1.5642129778861997e-06,
+                1.5676080465316773e-06,
+            ],
+            "fp4": 5634127727361962.0,
+            "fp8": 3384221638626554.5,
+            "interconnect.intra_node.link_latency_s": [
+                8.638092577457427e-07,
+                8.557889819145204e-07,
+                8.71113008260727e-07,
+            ],
+            "link": 60842596092.87844,
+        },
+        "ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1",
+    )
+
+#: On gpu-40, cards 0000:e5:00.0 and 0000:95:00.0 under nightly 20261026.
+if GPU40:
+    PEAKS = (
+        "2026-10-29",
+        "b71c071d3",
+        {
+            "bf16": 1609038921361468.2,
+            "fp8": 3361205421425982.5,
+            "fp4": 5534379082687883.0,
+            "bandwidth_curve": [
+                [4096, 2608792614.3273535],
+                [8192, 5215590387.848735],
+                [16384, 10434366335.520044],
+                [32768, 19588051820.511566],
+                [65536, 38229081734.511765],
+                [131072, 76369977669.6408],
+                [262144, 152418432173.76987],
+                [524288, 298199695070.9156],
+                [1048576, 581902759044.4948],
+                [2097152, 1084842857278.6284],
+                [4194304, 1986616683069.1052],
+                [8388608, 3068504544993.117],
+                [16777216, 4095006064739.851],
+                [33554432, 5151147111260.053],
+                [67108864, 5843433335088.58],
+                [134217728, 6064226650248.099],
+                [268435456, 6136658132140.043],
+                [536870912, 6376077711278.706],
+                [1073741824, 6398494894990.093],
+                [2147483648, 6462416692526.577],
+                [4294967296, 6533795160761.386],
+            ],
+            "link": 61219294824.48995,
+            "device.kernel_floor_s": [
+                1.4669345021247865e-06,
+                1.466374897956848e-06,
+                1.4678549408912658e-06,
+            ],
+            "interconnect.intra_node.link_latency_s": [
+                8.466782569885253e-07,
+                8.374245047569274e-07,
+                8.621324896812439e-07,
+            ],
+        },
+        "020692760182d835943e2ac416f59df1abd2bb82cbe71870ce0c9f316cae436a",
+    )
 
 #: No probe fills these: mi308x_spec's assumed values less what the datasheet
 #: states and what `PEAKS` fills. Its inter-node link is one 400 Gb/s NIC's
@@ -165,9 +327,7 @@ def device_fragments() -> list[Fragment]:
         base.intake(MODEL, *INTAKE),
         datasheet,
         assumed,
-        fragment(
-            "ptl", ptl, "probed", "no card has a ptl directory", date="2026-10-18"
-        ),
+        fragment("ptl", ptl, "probed", "no card has a ptl directory", date=PTL_DATE),
         probed,
     ]
 
@@ -176,10 +336,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     out = Path(__file__).resolve().parent / "machines" / f"{NAME}.json"
     parser.add_argument("--out", type=Path, default=out)
+    default = ", ".join(SWEPT)
+    parser.add_argument("--model", action="append", help="repeats; default " + default)
     parser.add_argument("--sweep-from", type=Path, help="a document to reuse")
     args = parser.parse_args(argv)
-    sweep = saved(args.sweep_from) if args.sweep_from else swept(MODEL)
-    merged = merge([sweep, *device_fragments()])
+    sweeps = [saved(args.sweep_from)] if args.sweep_from else []
+    if args.model or not sweeps:
+        sweeps += swept(args.model or SWEPT)
+    merged = merge([*sweeps, *device_fragments()])
     verdict = validate(merged.document)
     print(verdict)
     if not verdict.ok:

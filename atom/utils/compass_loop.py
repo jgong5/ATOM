@@ -78,7 +78,12 @@ import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 
-from atom.compass.carriers import cancel_seq, relay_stamp, with_relay_stamp
+from atom.compass.carriers import (
+    cancel_seq,
+    relay_stamp,
+    stamp_events,
+    with_relay_stamp,
+)
 from atom.utils import clock
 from atom.utils.clock import DIAG_S, job
 
@@ -162,16 +167,30 @@ class Station:
 SERVICE_JOBS = frozenset(
     {"do_preprocess", "_prepare_multimodal_inputs", "AtomMetricsExporter.render"}
 )
+#: Service jobs by module and qualified name, for names too common to match
+#: bare: OpenTelemetry's tracer setup and flush, which the API server's lifespan
+#: hands to a thread as it starts and as it leaves, and which charge nothing.
+#: The frontend's run begins at its loop's first select, before the lifespan.
+MODULE_SERVICE_JOBS = frozenset(
+    {"atom.observability.tracing.initialize", "atom.observability.tracing.shutdown"}
+)
 
 
-def job_name(fn) -> str:
-    """`fn`'s qualified name, or that of the function `asyncio.to_thread` runs
-    when `fn` is its ``partial(Context.run, func, ...)``."""
+def _job(fn):
+    """`fn`, or the function `asyncio.to_thread` runs when `fn` is its
+    ``partial(Context.run, func, ...)``."""
     if (
         isinstance(fn, partial)
         and getattr(fn.func, "__qualname__", "") == "Context.run"
     ):
         fn = fn.args[0]
+    return fn
+
+
+def job_name(fn) -> str:
+    """`fn`'s qualified name, or that of the function `asyncio.to_thread` runs
+    when `fn` is its ``partial(Context.run, func, ...)``."""
+    fn = _job(fn)
     return getattr(fn, "__qualname__", repr(fn))
 
 
@@ -179,6 +198,8 @@ def classify(fn) -> str:
     """``service``, ``wait`` or ``refuse``: the job registry, by qualified name."""
     name = job_name(fn)
     if name in SERVICE_JOBS or name.rpartition(".")[2] in SERVICE_JOBS:
+        return "service"
+    if f"{getattr(_job(fn), '__module__', None)}.{name}" in MODULE_SERVICE_JOBS:
         return "service"
     if name == "Queue.get":
         return "wait"
@@ -629,6 +650,11 @@ class HttpChannel:
     sends on one stamps a send on it for each JSON response whose
     ``kv_transfer_params`` is an object, and writes the stamp there.
 
+    During the run, each event of a ``text/event-stream`` response body leaves
+    with a comment line carrying its stamp on the LP's stream channel
+    (`atom.compass.carriers.stamp_events`). Each body message is one frame the
+    app's stream yielded, so it must end in a blank line.
+
     Taking in a stamped request other than a cancel costs the event loop
     ``fixed_s + body bytes x per_byte_s`` (`atom.compass.run.http_intake`),
     charged on the loop once its body is read and the loop is idle at that
@@ -653,6 +679,7 @@ class HttpChannel:
         if rt is not None and scope["type"] == "http":
             relay_in = _relay(rt.table.channels_into(rt.me))
             relay_out = _relay(rt.table.channels_from(rt.me))
+            send = _stamping_events(send, rt)
         if relay_out is not None:
             send = _stamping(send, rt, relay_out)
         if relay_in is not None:
@@ -771,6 +798,23 @@ async def _read_body(receive):
         return {"type": "http.request", "body": body, "more_body": False}
 
     return body, replay
+
+
+def _stamping_events(send, rt):
+    """`send`, stamping each event of an SSE response body sent during the run."""
+    events = False
+
+    async def stamping(message):
+        nonlocal events
+        if message["type"] == "http.response.start":
+            content_type = dict(message.get("headers", [])).get(b"content-type", b"")
+            events = content_type.startswith(b"text/event-stream")
+        elif events and rt.in_run:
+            text = stamp_events(message.get("body", b"").decode(), rt)
+            message = {**message, "body": text.encode()}
+        await send(message)
+
+    return stamping
 
 
 def _stamping(send, rt, ch: str):

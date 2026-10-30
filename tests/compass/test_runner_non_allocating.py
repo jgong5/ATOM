@@ -59,7 +59,6 @@ ENGINE_READS = {
     "overrides.py": {"atom.compass.backends.base"},
     "projection.py": {
         "atom.compass.backends.shape",
-        "atom.model_engine.sequence",
         "atom.utils.forward_context",
     },
 }
@@ -373,8 +372,9 @@ def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
     built in a package whose whole import closure `test_kv_budget.py` holds
     free of any tensor library. `capture_sizes` and `capture_sizes_np` are the
     base's own ladder, rebound to a list of ints and a host int32 array as
-    ATOM's capture rebinds them. Anything else appearing here is a tensor this
-    class put on a device, which is the thing it exists not to do.
+    ATOM's capture rebinds them, and `tbo_decode_graphs` the bool its capture
+    sets. Anything else appearing here is a tensor this class put on a device,
+    which is the thing it exists not to do.
     """
     overrides = _classes(PACKAGE / "overrides.py")["NonAllocatingRunner"]
     bound = {n for n, _ in _self_assigned(overrides)}
@@ -384,6 +384,7 @@ def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
         "kv_pool_sizing",
         "capture_sizes",
         "capture_sizes_np",
+        "tbo_decode_graphs",
     }
 
 
@@ -591,8 +592,8 @@ def test_only_the_binding_module_reaches_the_engine(path):
     The modules that read named modules outside the exemption are listed in
     `ENGINE_READS` by the exact set. `model_runner` binds ATOM's runner.
     `overrides` reads the cost backend's base class, from a package whose own
-    test keeps it free of the engine. `projection` reads a scheduled batch, a
-    sequence's kind and the dispatch rule; none of those reaches
+    test keeps it free of the engine. `projection` reads a scheduled batch and
+    the dispatch rule; neither reaches
     `atom.model_engine.model_runner`, and
     `test_every_other_module_imports_here` runs the import to measure it.
     """

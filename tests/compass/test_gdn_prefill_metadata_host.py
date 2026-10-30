@@ -19,6 +19,15 @@ import torch
 from atom.utils import CpuGpuBuffer
 
 
+def _stand_in_attr(attr):
+    """A mock for each name an importer binds, and none for a dunder:
+    `inspect` caches every module's `__file__`, and a mock there breaks the
+    real aiter's custom-op registration later in the process."""
+    if attr.startswith("__"):
+        raise AttributeError(attr)
+    return MagicMock()
+
+
 class _AiterStandIn(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     """Every `aiter` module as a stand-in. `gdn_attn` imports aiter at module
     scope, and without a driver aiter's import raises; nothing here calls it."""
@@ -30,7 +39,7 @@ class _AiterStandIn(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     def create_module(self, spec):
         module = types.ModuleType(spec.name)
         module.__path__ = []
-        module.__getattr__ = lambda _attr: MagicMock()
+        module.__getattr__ = _stand_in_attr
         return module
 
     def exec_module(self, module):
@@ -43,7 +52,7 @@ if torch.cuda.is_available():
         compute_causal_conv1d_metadata,
     )
 else:
-    _finder = _AiterStandIn()
+    _finder, _before = _AiterStandIn(), set(sys.modules)
     sys.meta_path.insert(0, _finder)
     try:
         from atom.model_ops.attentions.gdn_attn import (
@@ -52,8 +61,15 @@ else:
         )
     finally:
         sys.meta_path.remove(_finder)
-        for _name in [n for n in sys.modules if n.split(".")[0] == "aiter"]:
-            del sys.modules[_name]
+        # Only the stand-ins go: an aiter imported for real before stays
+        # whole, and none of its packages keeps a stand-in bound.
+        for _name in [
+            n for n in set(sys.modules) - _before if n.split(".")[0] == "aiter"
+        ]:
+            _module = sys.modules.pop(_name)
+            _parent, _, _child = _name.rpartition(".")
+            if getattr(sys.modules.get(_parent), _child, None) is _module:
+                delattr(sys.modules[_parent], _child)
 
 BLOCK_M = 8
 

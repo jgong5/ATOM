@@ -9,7 +9,7 @@ the batch as the `BatchView` a simulated runner prices it from (`rows`, `rung`,
 and above DP width 1 `moe_rows` and `moe_tokens`, with an MTP drafter `draft_moe_rows` too, `draft_bs` where its later passes pad, `target_bs` where its target pads, on a split step `tbo_tokens`); a
 real runner settles that view from the `ForwardMode` its own forward settled,
 so recording adds no DP collective. Its line also carries `t_enter_ns` and `t_exit_ns`, the worker's
-monotonic clock around its forward, and is written once the forward returns.
+monotonic clock around its forward, and is finished once the forward returns.
 Inside the forward it carries `[enter, exit]` on that clock around the staging
 gate (`t_gate_ns`), the launch (`t_launch_ns`) and the wait for the previous
 output's token copy (`t_recv_ns`, only on a forward that reaches it; off a
@@ -27,8 +27,11 @@ exit event to this launch's entry event, absent on the first line; summed in
 order they lay every forward on one device timeline. A later pipeline stage's
 receive of its input is `t_pp_recv_ns`, its device part `d_recv_ns`; an idle
 `flush_pp_send` since the last forward that settled a pending send is `t_flush_ns`. The events are polled,
-never waited on, so a line is written once its exit event has completed, and
-`exit` writes the rest. Under `kv` a line carries the lmcache offload loads
+never waited on, so a line is finished once its exit event has completed. A
+real runner's lines are kept in memory and written at its `exit`, so no file
+call or JSON encoding runs between its forwards; a worker that never reaches
+`exit` (SIGKILL, a native crash) leaves an empty record. A simulated runner's line is
+written as its step is recorded. Under `kv` a line carries the lmcache offload loads
 and saves the scheduler handed the worker since the previous line
 (`StepRecord.note_kv`), where any were. `compare` reads two records and names, per DP rank,
 the first step where they part; timestamps are not part of a step's decision.
@@ -118,6 +121,11 @@ class StepRecord:
         self.path = pathlib.Path(directory) / f"{name}.jsonl"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("")
+        # Finished lines, not yet written. Built of tuples, not lists, so a
+        # full collection untracks them: a million list-built lines held made
+        # each full collection 0.8 s. ponytail: the whole record is held in
+        # the worker's memory until `exit`; bound it if a run outgrows that.
+        self.lines: list[dict] = []
         self.dp_rank = dp_rank
         self.step = 0
         self.keys: dict[int, str] = {}  # request id -> key
@@ -126,7 +134,7 @@ class StepRecord:
         # (line, its device window: a callable taking `wait`, or None once closed)
         self.pending: collections.deque[tuple] = collections.deque()
         # Offload decisions handed to the worker, not yet on a line.
-        self.kv: list[list] = []
+        self.kv: list[tuple] = []
 
     def note_kv(self, meta) -> None:
         """Keep each lmcache offload load and save `meta` hands the worker:
@@ -135,11 +143,11 @@ class StepRecord:
         for req in getattr(meta, "requests", ()):
             if (ls := req.load_spec) is not None:
                 self.kv.append(
-                    [req.req_id, "load", ls.hbm_cached_tokens, ls.lmcache_cached_tokens]
+                    (req.req_id, "load", ls.hbm_cached_tokens, ls.lmcache_cached_tokens)
                 )
             if (ss := req.save_spec) is not None:
                 self.kv.append(
-                    [req.req_id, "save", ss.skip_leading_tokens, len(req.token_ids)]
+                    (req.req_id, "save", ss.skip_leading_tokens, len(req.token_ids))
                 )
 
     def add(self, batch, runner, forward=None):
@@ -163,7 +171,7 @@ class StepRecord:
         rewrites batch fields in place, and written after it returns, with `t_enter_ns`
         and `t_exit_ns` read off `runner.step_clock_ns()` around it and
         `runner.step_stamps()` added; a line with a device window waits in
-        `pending` until the window closes. Returns `forward`'s reply, or
+        `pending` until the window closes, then in `lines` until `write`. Returns `forward`'s reply, or
         without one the mode the view was built from, so a caller pricing the
         step need not run the collective again.
         """
@@ -178,7 +186,7 @@ class StepRecord:
             ends = np.cumsum(batch.num_scheduled_tokens)
             for i, req_id in enumerate(batch.req_ids):
                 num = int(batch.num_scheduled_tokens[i])
-                rows.append([req_id, num, int(batch.context_lens[i])])
+                rows.append((req_id, num, int(batch.context_lens[i])))
                 if req_id in self.keys:
                     continue
                 if batch.is_final_chunk is None:
@@ -189,7 +197,7 @@ class StepRecord:
                     response_id = batch.external_request_ids[i]
                     if response_id is not None:
                         self.keys[req_id] = req_id
-                        named.append([req_id, req_id, response_id])
+                        named.append((req_id, req_id, response_id))
                     continue
                 start = int(batch.num_cached_tokens[i])
                 if start == 0:  # a preempted prefill restarts its prompt
@@ -218,19 +226,20 @@ class StepRecord:
                 if n:
                     key = f"{key}.{n}"
                 self.keys[req_id] = key
-                named.append([req_id, key])
-                if batch.external_request_ids[i] is not None:
-                    named[-1].append(batch.external_request_ids[i])
+                response_id = batch.external_request_ids[i]
+                named.append(
+                    (req_id, key) + (() if response_id is None else (response_id,))
+                )
         line = {
             "step": self.step,
             "dp_rank": self.dp_rank,
             "is_dummy_run": bool(batch.is_dummy_run),
             "produces_output": bool(batch.produces_output()),
-            "batch": rows,
-            "named": named,
+            "batch": tuple(rows),
+            "named": tuple(named),
         }
         if self.kv:
-            line["kv"], self.kv = self.kv, []
+            line["kv"], self.kv = tuple(self.kv), []
         reply, window, mode = None, None, None
         if forward is not None:
             line["t_enter_ns"] = runner.step_clock_ns()
@@ -241,9 +250,9 @@ class StepRecord:
             line.update(stamps)
         mode = mode or forward_mode(before, runner)
         view = batch_view(before, mode, runner)
-        line["rows"] = [
-            [r.query_tokens, r.context_tokens, r.decode] for r in view.requests
-        ]
+        line["rows"] = tuple(
+            (r.query_tokens, r.context_tokens, r.decode) for r in view.requests
+        )
         line["rung"] = view.capture_rung
         if view.moe_rows is not None:
             line["moe_rows"] = view.moe_rows
@@ -254,24 +263,33 @@ class StepRecord:
                 line[field] = getattr(view, field)
         self.pending.append((line, window))
         self.flush()
+        if forward is None:  # a simulated step: priced, not timed
+            self.write()
         self.step += 1
         return mode if forward is None else reply
 
     def flush(self, wait: bool = False) -> None:
-        """Write the lines whose device windows have closed, in step order.
+        """Finish the lines whose device windows have closed, in step order.
 
-        A line stops the writing while its window is open, unless `wait`.
+        A line stops the finishing while its window is open, unless `wait`.
         """
+        while self.pending:
+            line, window = self.pending[0]
+            if window is not None:
+                fields = window(wait)
+                if fields is None:
+                    return
+                line.update(fields)
+            self.lines.append(line)
+            self.pending.popleft()
+
+    def write(self) -> None:
+        """Wait for every open window, then append the finished lines to the file."""
+        self.flush(wait=True)
+        text = "".join(json.dumps(line) + "\n" for line in self.lines)
         with self.path.open("a") as f:
-            while self.pending:
-                line, window = self.pending[0]
-                if window is not None:
-                    fields = window(wait)
-                    if fields is None:
-                        return
-                    line.update(fields)
-                f.write(json.dumps(line) + "\n")
-                self.pending.popleft()
+            f.write(text)
+        self.lines.clear()
 
 
 def record_step(runner, batch, forward=None):
@@ -438,8 +456,8 @@ class StepRecording:
                 group.recv_tensor_dict = functools.partial(self._pp_received, recv)
         if processor is not None and hasattr(self, "drafter"):
             for key, name in (
-                ("t_mtp_ns", "recv_mtp_status_async"),
-                ("t_draft_recv_ns", "recv_async_output_draft"),
+                ("t_mtp_ns", "recv_spec_status"),
+                ("t_draft_recv_ns", "recv_draft_token_ids"),
             ):
                 call = getattr(processor, name)
                 setattr(processor, name, functools.partial(self._stamped, key, call))
@@ -475,7 +493,7 @@ class StepRecording:
             return call(*args)
         enter = self.step_clock_ns()
         reply = call(*args)
-        self._stamps[key] = [enter, self.step_clock_ns()]
+        self._stamps[key] = (enter, self.step_clock_ns())
         return reply
 
     def _pp_received(self, call, *args, **kwargs):
@@ -547,8 +565,9 @@ class StepRecording:
         return stamps, window
 
     def exit(self):
+        # Reached on a clean stop and on a SIGTERM (ATOM's exit handler).
         if getattr(self, "_parity_record", None) is not None:
-            self._parity_record.flush(wait=True)
+            self._parity_record.write()
         return super().exit()
 
 

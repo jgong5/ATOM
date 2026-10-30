@@ -86,7 +86,7 @@ def test_the_top_source_answers_and_nothing_is_marked():
     got = Resolver([PRICED, LAW]).resolve("attention")
     assert got.source == "price_list"
     assert not got.fell_through
-    assert not got.term.provenance.is_refused
+    assert not got.term.provenance.fell_through
     assert str(got.term.provenance) == "measured via price_list"
 
 

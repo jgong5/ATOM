@@ -145,6 +145,9 @@ def install(tmpdir: str, arch: str) -> dict:
         "default_stream": lambda *a, **k: main_stream,
         "stream": _stream,
         "set_device": lambda *a, **k: None,
+        # `torch.cuda.device(i)` swaps the current device: there is one.
+        "_exchange_device": lambda device: 0,
+        "_maybe_exchange_device": lambda device: 0,
         "synchronize": lambda *a, **k: None,
         "memory_stats": lambda *a, **k: {
             "allocated_bytes.all.current": 0,
@@ -152,9 +155,14 @@ def install(tmpdir: str, arch: str) -> dict:
             "reserved_bytes.all.current": 0,
         },
         "memory_allocated": lambda *a, **k: 0,
+        # Free and total: nothing is allocated on the declared device.
+        "mem_get_info": lambda *a, **k: (DEVICES[arch][2],) * 2,
         "reset_peak_memory_stats": lambda *a, **k: None,
         "empty_cache": lambda *a, **k: None,
         "is_current_stream_capturing": lambda: False,
+        # A memory pool of no device; allocating from it allocates as before.
+        "MemPool": lambda *a, **k: None,
+        "use_mem_pool": lambda *a, **k: contextlib.nullcontext(),
     }
     for name, value in cuda.items():
         setattr(torch.cuda, name, value)
@@ -185,17 +193,55 @@ def install(tmpdir: str, arch: str) -> dict:
     return {"cuda": sorted(cuda), "arch": arch, "flags": flags}
 
 
+#: The operators outside torch that the fake mode's dispatch cache takes: each
+#: fake builds its outputs from its arguments' shapes, dtypes and devices and
+#: nothing else, so equal arguments give equal outputs. Torch caches no other
+#: operator outside its own namespaces (`non-builtin`).
+CACHED = frozenset(
+    {
+        "aiter.batched_gemm_a8w8_mxscale.default",
+        "aiter.gemm_a8w8_blockscale_preshuffle_impl.default",
+        "aiter.indexer_score_topk.default",
+        "aiter.linear_attention_with_output_base.default",
+        "aiter.mhc_fused_post_pre.default",
+        "aiter.mhc_pre.default",
+        "aiter.mhc_res_repeat.default",
+        "aiter.per_1x128_e8m0_quant.default",
+        "aiter.rmsnorm2d_fwd.default",
+    }
+)
+
+
 def driverless_mode(shape_env):
     """A fake mode told the device is absent, while ATOM is told it is there.
 
     `avoid_device_init` keeps `torch.tensor` on the host, makes the device guard
     a no-op and skips constant propagation across a device move, each of which
-    would otherwise reach a driver.
+    would otherwise reach a driver. Its dispatch cache also takes the operators
+    of `CACHED` whose schema mutates no argument.
     """
     from torch._subclasses.fake_tensor import FakeTensorMode
 
+    to, host = torch.ops.aten.to.dtype_layout, torch.device("cpu")
+
     class _DriverlessFakeTensorMode(FakeTensorMode):
         avoid_device_init = property(lambda self: True)
+
+        def _dispatch_impl(self, func, types, args, kwargs):
+            # Under inference mode no autograd kernel decomposes `aten.to`
+            # first, so `torch.tensor` under a device default hands the mode
+            # its host constant's move whole, which the mode would run on the
+            # device as constant propagation. Its decomposition is the
+            # `_to_copy` the mode keeps off the device.
+            if func is to and kwargs.get("device", host).type != "cpu":
+                with self:
+                    return func.decompose(*args, **kwargs)
+            return super()._dispatch_impl(func, types, args, kwargs)
+
+        def _validate_cache_key(self, func, args, kwargs):
+            if str(func) in CACHED and not func._schema.is_mutable:
+                return
+            super()._validate_cache_key(func, args, kwargs)
 
     return _DriverlessFakeTensorMode(shape_env=shape_env, allow_non_fake_inputs=True)
 

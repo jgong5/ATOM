@@ -17,6 +17,7 @@ import time
 from types import SimpleNamespace
 
 import msgspec
+import psutil
 import pytest
 import zmq
 from conftest import atom_config_double
@@ -33,6 +34,7 @@ from atom.compass.kv.lmcache_server import LMCacheLP
 from atom.compass.spec.rules import SpecRefusal
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
+from tests.compass.held_ports import held_ports
 
 IPC = 2.0**-10
 LOOKUP_S = (2.0**-8, 2.0**-10)  # fixed, per prompt chunk
@@ -44,10 +46,26 @@ LOOK, XFER = "engine->lmcache:lookup#dp0", "engine->lmcache:transfer#dp0.tp0"
 XFER_BACK = "lmcache->engine:transfer#dp0.tp0"
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _bound_port(proc) -> int:
+    """The port LP lmcache's process listens on, once it has bound one. The
+    server binds port 0, so no other process can take its port first."""
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        assert proc.poll() is None, f"LP lmcache exited {proc.returncode} unbound"
+        conns = psutil.Process(proc.pid).net_connections("tcp")
+        if ports := {c.laddr.port for c in conns if c.status == psutil.CONN_LISTEN}:
+            [port] = ports
+            return port
+        time.sleep(0.01)
+    raise AssertionError("LP lmcache bound no port in 120 s")
+
+
+@pytest.fixture(scope="module")
+def lmcache_port():
+    """A port for an lmcache server that must know its port before it starts,
+    held until the module's tests end."""
+    with held_ports(1) as [port]:
+        yield port
 
 
 def _run(tmp_path, **entry):
@@ -67,7 +85,7 @@ def _run(tmp_path, **entry):
         "lmcache": {
             "server": ["--chunk-size", str(CHUNK), "--l1-size-gb", "1"]
             + ["--eviction-policy", "LRU", "--host", "127.0.0.1"]
-            + ["--port", str(_free_port())],
+            + ["--port", "0"],
             "lookup_s": list(LOOKUP_S),
             "request_s": REQUEST_S,
             **entry,
@@ -258,7 +276,7 @@ def test_server_jobs_start_and_end_against_the_station_laws(tmp_path, monkeypatc
     table = compass_run.channel_table(run)
     rt = LPRuntime(LpId("engine"), table, connect(LpId("engine"), served.endpoint))
     ctx = zmq.Context()
-    url = f"tcp://127.0.0.1:{run['lmcache']['server'][-1]}"
+    url = f"tcp://127.0.0.1:{_bound_port(proc)}"
     look, xfer = ctx.socket(zmq.DEALER), ctx.socket(zmq.DEALER)
     look.connect(url)
     xfer.connect(url)

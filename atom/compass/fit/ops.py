@@ -27,7 +27,8 @@ for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
 a prefill's B and the context: a decode point's ``context``, its longest
 row's, after its rows' mean context in `PERMILLE` of it (``mean``) where some
-point of the family has ragged rows, or a prefill point's rows' mean cached
+point of the family has ragged rows, leaving out each uniform point whose rows
+the KV pool cut, or a prefill point's rows' mean cached
 tokens (`band`); and a prefill's B for a kind its rows move (``("rows",
 op)``). A collective's
 points name their family themselves, `measure ops`'s `exchange`, and its one
@@ -250,7 +251,13 @@ def fit(points) -> dict:
                 vs[0][i] - shape_counts(s).get(n, -9) in (0, 1) for s, vs in at.items()
             )
         }
+        ragged = {
+            family(p["shape"], p["leaf"], free_of[skel])
+            for p in members
+            if _split(p["context"])[1]
+        }
         for p in members:
+            name = family(p["shape"], p["leaf"], free_of[skel])
             at_p = shape_counts(p["shape"]) | {"context": _context(p)}
             moves = dependent.get(p["op"], True)
             if "T" in at_p:
@@ -262,13 +269,16 @@ def fit(points) -> dict:
                     dims.append("B")
             dims += ["G"] if "G" in at_p else []
             if moves and "T" not in at_p:  # a decode point, read at its mean too
+                # a uniform point whose rows the KV pool cut holds a mean its
+                # context does not name: a family with ragged points leaves it out
+                mean = _split(p["context"])[1]
+                cut = len({r[1] - r[0] for r in p.get("rows", ())}) > 1
+                if not mean and cut and name in ragged:
+                    continue
                 dims.append("mean")
-                at_p["mean"] = _split(p["context"])[1] or PERMILLE
+                at_p["mean"] = mean or PERMILLE
             dims += ["context"] if moves else []
-            f = families.setdefault(
-                family(p["shape"], p["leaf"], free_of[skel]),
-                {"op": p["op"], "dims": dims, "points": {}},
-            )
+            f = families.setdefault(name, {"op": p["op"], "dims": dims, "points": {}})
             got = f["points"].setdefault(tuple(at_p[d] for d in dims), [])
             got.append((p["cold_ns"], p["kernels"]))
     for name, f in families.items():

@@ -38,7 +38,8 @@ BLOCKS = 7
 
 class Runner(Bench):
     """Rank r takes (1 + 2r) ms to issue a forward, and its model's work lasts
-    `BUSY` + r us."""
+    `BUSY` + r us; with two ranks it ends on a collective, as a TP forward's
+    does, so no rank's work ends before every rank's has."""
 
     def __init__(self, rank, config):
         pc = config.parallel_config
@@ -55,6 +56,13 @@ class Runner(Bench):
 
     def bench_group(self):
         return dist.group.WORLD if dist.is_initialized() else None
+
+    def run_model(self, batch):
+        super().run_model(batch)
+        if dist.is_initialized():
+            end = torch.tensor([self.free])
+            dist.all_reduce(end, op=dist.ReduceOp.MAX)
+            self.free = int(end)
 
     def get_num_blocks(self):
         self.calls.append("get_num_blocks")
@@ -183,8 +191,9 @@ def test_every_worker_starts_in_engine_cores_order_and_the_slowest_is_charged(
     startup = ["get_num_blocks", ["allocate_kv_cache", BLOCKS]]
     capture = [] if eager else ["capture_cudagraph"]
     assert log == startup + capture + ["freeze_gc_heap", "bench_step"]
-    # Rank 0's reply carries rank 1's times, and its preload outlasted rank 1's
-    # host: at 3 ms rank 1's entry event had completed, and rank 0's had not.
+    # Rank 0's reply carries rank 1's work, which the closing collective holds
+    # every window for, and its preload outlasted rank 1's host: at 3 ms rank
+    # 1's entry event had completed, and rank 0's had not.
     slowest = tp - 1
     busy = BUSY + 1_000 * slowest
     assert result["repeats"] == [[PREPARE + busy, PREPARE, busy]] * window.REPEATS

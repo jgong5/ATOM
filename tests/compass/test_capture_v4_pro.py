@@ -20,7 +20,7 @@ import sys
 import types
 
 import pytest
-from test_capture_ir import _decoder, _ops
+from test_capture_ir import MAIN, _decoder, _ops
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 
@@ -67,7 +67,7 @@ def trace(root, argv):
         [
             sys.executable,
             "-c",
-            "import sys; from atom.compass.cli import main; main(sys.argv[1:])",
+            MAIN,
             *command,
         ],
         capture_output=True,
@@ -112,8 +112,18 @@ def _pars(region):
 
 
 def _rows(op):
-    """The rows an exchange takes in and gives back."""
-    sent = next(v for v in op["args"].values() if isinstance(v, dict) and "shape" in v)
+    """The rows an exchange takes in and gives back; a gather of routed rows
+    sends several tensors, its hidden states first."""
+    sent = next(
+        v[0] if isinstance(v, list) else v
+        for v in op["args"].values()
+        if isinstance(v, dict)
+        and "shape" in v
+        or isinstance(v, list)
+        and v
+        and isinstance(v[0], dict)
+        and "shape" in v[0]
+    )
     return sent["shape"][0], op["out"][0][0]
 
 
@@ -191,7 +201,7 @@ def test_a_dp_decode_at_width_1_gathers_one_row_from_each_rank(tmp_path_factory)
         if op["kind"] == "declared"
     }
     assert rows == {
-        (f"{MOE}:all_gather_with_padding", 1, DP),
+        (f"{MOE}:all_gatherv", 1, DP),
         (f"{MOE}:reduce_scatter_with_unpadding", DP, 1),
     }
 

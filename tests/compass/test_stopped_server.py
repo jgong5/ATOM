@@ -41,12 +41,12 @@ from atom.compass import clock_transport
 from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
 from atom.compass.clock import LpId, single_engine_table
-from atom.compass.drive.serve import _free_ports
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import SequenceStatus
 from atom.utils import clock, get_open_zmq_ipc_path, make_zmq_socket, zmq_shim
 from atom.utils.clock import LPRuntime, WrappedSocket
 from atom.utils.compass_loop import CompassEventLoop
+from tests.compass.held_ports import held_ports
 
 with stubbed_aiter():
     from atom.model_engine.engine_core import EngineCore
@@ -173,45 +173,45 @@ def _answers(port: int) -> bool:
 
 @contextlib.contextmanager
 def _serve(tmp_path, script, *argv):
-    """`script` as a co-hosting simulated server on a free port, in a session
-    of its own, once ``/health`` answers: its process, port and log. Leaving
-    kills what is left of its process group."""
-    run_file = tmp_path / "run.json"
-    clock_port, port = _free_ports(2)
-    run_file.write_text(
-        json.dumps(
-            {
-                "clock_endpoint": f"tcp://127.0.0.1:{clock_port}",
-                "bound_s": 100.0,
-                "admission_path": "serving",
-                "ipc_s": 2.0**-10,
-                "stream_s": 2.0**-9,
-                "out_dir": str(tmp_path),
-            }
+    """`script` as a co-hosting simulated server on ports held for it, in a
+    session of its own, once ``/health`` answers: its process, port and log.
+    Leaving kills what is left of its process group."""
+    with held_ports(2) as (clock_port, port):
+        run_file = tmp_path / "run.json"
+        run_file.write_text(
+            json.dumps(
+                {
+                    "clock_endpoint": f"tcp://127.0.0.1:{clock_port}",
+                    "bound_s": 100.0,
+                    "admission_path": "serving",
+                    "ipc_s": 2.0**-10,
+                    "stream_s": 2.0**-9,
+                    "out_dir": str(tmp_path),
+                }
+            )
         )
-    )
-    env = dict(os.environ, PYTHONPATH=str(TREE), **{compass_run.ENV: str(run_file)})
-    log = tmp_path / "server.log"
-    with log.open("w") as sink:
-        server = subprocess.Popen(
-            [sys.executable, "-c", script, str(port), *argv],
-            cwd=TREE,
-            env=env,
-            stdout=sink,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    try:
-        deadline = time.monotonic() + 120
-        while not _answers(port):
-            assert server.poll() is None, log.read_text()
-            assert time.monotonic() < deadline, "no answer in 120 wall seconds"
-            time.sleep(0.2)
-        yield server, port, log
-    finally:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(server.pid, signal.SIGKILL)
-        server.wait()
+        env = dict(os.environ, PYTHONPATH=str(TREE), **{compass_run.ENV: str(run_file)})
+        log = tmp_path / "server.log"
+        with log.open("w") as sink:
+            server = subprocess.Popen(
+                [sys.executable, "-c", script, str(port), *argv],
+                cwd=TREE,
+                env=env,
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        try:
+            deadline = time.monotonic() + 120
+            while not _answers(port):
+                assert server.poll() is None, log.read_text()
+                assert time.monotonic() < deadline, "no answer in 120 wall seconds"
+                time.sleep(0.2)
+            yield server, port, log
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(server.pid, signal.SIGKILL)
+            server.wait()
 
 
 @SIGNALS

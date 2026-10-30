@@ -1,0 +1,361 @@
+{
+  "schema_version": 1,
+  "name": "mi355x-crs005",
+  "provenance": {
+    "authored_by": "compass agent for jgong5",
+    "date": "2026-10-29",
+    "origin": "mixed",
+    "origins": {
+      "host.cpu.cores_physical": {
+        "origin": "probed"
+      },
+      "host.cpu.cores_logical": {
+        "origin": "probed"
+      },
+      "device.name": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.arch": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.count_per_node": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.memory.capacity_bytes": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.software_pinned_to.rocm": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.software_pinned_to.aiter": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.software_pinned_to.rccl": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.software_pinned_to.torch": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "host.http_intake.fixed_s": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:fc9dadb1074821306edad43745d303c9de754feb03e9efcb195885b7282663cb",
+        "p10": 0.0020310947130036056,
+        "p90": 0.002139447088691459
+      },
+      "host.http_intake.per_byte_s": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:fc9dadb1074821306edad43745d303c9de754feb03e9efcb195885b7282663cb",
+        "p10": 3.9301788350529524e-09,
+        "p90": 4.159128855060515e-09
+      },
+      "device.memory.bandwidth_bytes_per_s": {
+        "origin": "datasheet"
+      },
+      "device.compute.bf16_flops": {
+        "origin": "datasheet"
+      },
+      "device.compute.fp8_flops": {
+        "origin": "datasheet"
+      },
+      "device.compute.fp4_flops": {
+        "origin": "datasheet"
+      },
+      "interconnect.intra_node.domain_devices": {
+        "origin": "datasheet"
+      },
+      "interconnect.intra_node.link_bandwidth_bytes_per_s": {
+        "origin": "datasheet"
+      },
+      "host.ipc.zmq_roundtrip_s": {
+        "origin": "assumed"
+      },
+      "host.ipc.shm_broadcast_s": {
+        "origin": "assumed"
+      },
+      "interconnect.intra_node.topology": {
+        "origin": "assumed"
+      },
+      "interconnect.inter_node.link_bandwidth_bytes_per_s": {
+        "origin": "assumed"
+      },
+      "interconnect.inter_node.link_latency_s": {
+        "origin": "assumed"
+      },
+      "interconnect.router_relay_s": {
+        "origin": "assumed"
+      },
+      "interconnect.inter_node.derate": {
+        "origin": "assumed"
+      },
+      "device.ptl": {
+        "origin": "probed"
+      },
+      "device.memory.bandwidth_curve": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
+      },
+      "device.kernel_floor_s": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1",
+        "p10": 1.5642129778861997e-06,
+        "p90": 1.5676080465316773e-06
+      },
+      "interconnect.intra_node.link_latency_s": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1",
+        "p10": 8.557889819145204e-07,
+        "p90": 8.71113008260727e-07
+      },
+      "device.memory.derate": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
+      },
+      "device.compute.derate.bf16": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
+      },
+      "device.compute.derate.fp8": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
+      },
+      "device.compute.derate.fp4": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
+      },
+      "interconnect.intra_node.derate": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
+      },
+      "host.tokenizers[deepseek-v4-pro fast]": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "source_root": "tree:cc8322a5f25ba52eb28315ed061b7eb37296c9a7",
+        "p10": {
+          "encode_fixed_s": 5.681011131296625e-06,
+          "encode_tokens_per_s": 922292.4717718514,
+          "decode_fixed_s": 9.422951418726685e-07,
+          "decode_tokens_per_s": 7281683.996922003
+        },
+        "p90": {
+          "encode_fixed_s": 6.232589089851737e-06,
+          "encode_tokens_per_s": 944412.1376218259,
+          "decode_fixed_s": 1.0044983954628087e-06,
+          "decode_tokens_per_s": 7340732.194450311
+        }
+      }
+    },
+    "fragments": [
+      "tokenizer",
+      "device",
+      "intake",
+      "datasheet",
+      "assumed",
+      "ptl",
+      "peaks"
+    ],
+    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at f6e1fa77d | one real c=256 first-turn cc-traces burst at f6e1fa77d | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples"
+  },
+  "host": {
+    "cpu": {
+      "cores_physical": 118,
+      "cores_logical": 236
+    },
+    "tokenizers": [
+      {
+        "id": "deepseek-v4-pro",
+        "backend": "fast",
+        "vocab_size": 129280,
+        "fingerprint": "sha256:8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
+        "applies_to": [
+          "DeepseekV4ForCausalLM"
+        ],
+        "encode_fixed_s": 5.952658755239562e-06,
+        "encode_tokens_per_s": 931506.2856534075,
+        "decode_fixed_s": 9.532938990261856e-07,
+        "decode_tokens_per_s": 7326490.326455484,
+        "derate": 1.0
+      }
+    ],
+    "ipc": {
+      "zmq_roundtrip_s": 5e-05,
+      "shm_broadcast_s": 2e-05
+    },
+    "http_intake": {
+      "fixed_s": 0.0020912355743506537,
+      "per_byte_s": 4.19943165426115e-09
+    }
+  },
+  "device": {
+    "name": "MI355X",
+    "arch": "gfx950",
+    "count_per_node": 8,
+    "ptl": "disabled",
+    "memory": {
+      "capacity_bytes": 309220868096,
+      "bandwidth_bytes_per_s": 8000000000000.0,
+      "bandwidth_curve": [
+        [
+          4096,
+          2448213119.8574038
+        ],
+        [
+          8192,
+          4901932899.645926
+        ],
+        [
+          16384,
+          9799057786.896889
+        ],
+        [
+          32768,
+          19216086138.60756
+        ],
+        [
+          65536,
+          36700073375.20446
+        ],
+        [
+          131072,
+          73396013852.64185
+        ],
+        [
+          262144,
+          146726346018.3001
+        ],
+        [
+          524288,
+          281614855936.05884
+        ],
+        [
+          1048576,
+          559324208073.2725
+        ],
+        [
+          2097152,
+          1069975261609.8036
+        ],
+        [
+          4194304,
+          1900125139330.0735
+        ],
+        [
+          8388608,
+          3036138588634.988
+        ],
+        [
+          16777216,
+          4078284050135.474
+        ],
+        [
+          33554432,
+          5133415851480.742
+        ],
+        [
+          67108864,
+          5842638294512.771
+        ],
+        [
+          134217728,
+          6020018863349.566
+        ],
+        [
+          268435456,
+          6119695251585.363
+        ],
+        [
+          536870912,
+          6257719852339.275
+        ],
+        [
+          1073741824,
+          6371910488551.815
+        ],
+        [
+          2147483648,
+          6463389077030.495
+        ],
+        [
+          4294967296,
+          6556731501062.837
+        ]
+      ],
+      "derate": 0.8195914376328546
+    },
+    "compute": {
+      "bf16_flops": 2516600000000000.0,
+      "fp8_flops": 5033200000000000.0,
+      "fp4_flops": 1.00663e+16,
+      "derate": {
+        "bf16": 0.6507569126723242,
+        "fp8": 0.6723797263423974,
+        "fp4": 0.5597019488155491
+      }
+    },
+    "kernel_floor_s": 1.5658164620399475e-06,
+    "software_pinned_to": {
+      "rocm": "7.2.4",
+      "aiter": "41d4d8d7e",
+      "rccl": "2.27.7",
+      "torch": "2.10.0+rocm7.2.4.git3d3aa833"
+    }
+  },
+  "interconnect": {
+    "intra_node": {
+      "topology": "fully_connected",
+      "domain_devices": 8,
+      "link_bandwidth_bytes_per_s": 76800000000.0,
+      "link_latency_s": 8.638092577457427e-07,
+      "derate": 0.792221303292688
+    },
+    "inter_node": {
+      "link_bandwidth_bytes_per_s": 50000000000.0,
+      "link_latency_s": 5e-06,
+      "derate": 0.8
+    },
+    "router_relay_s": 0.0015
+  }
+}

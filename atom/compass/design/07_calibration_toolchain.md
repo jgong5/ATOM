@@ -471,9 +471,9 @@ campaign and the one with the tightest acceptance gate behind it — KV block co
 refuses it until its readings match a real load's on Qwen3.8-27B TP1 on MI308X (T100).
 
 **A device never measured** has no engine to start. Developer tooling outside the CLI
-publishes an entry for its configuration, every reading marked assumed, as `16` marks every
-MI455 input; `run` reads it as any entry, and every term built on it is declared, its note
-naming the assumption.
+publishes an entry for its configuration, every reading marked assumed, as the frozen MI455
+projection's entry is (`16` S3c.5); `run` reads it as any entry, and every term built on it
+is declared, its note naming the assumption.
 
 **Why it is per width and not fitted across widths:** because it does not fit. The
 measured `non_torch` sequence is 926 / 6906 / 7266 / 10704 MiB at widths 1/2/4/8, and
@@ -1033,7 +1033,7 @@ mismatch **refuses** (warn only under an explicit flag).
 | `op_measurement`, `price_list` | **X** | **X** | X | - *(shape-parametric)* | **X** | X | - | - |
 | `step_measurement`, `step_linear_law` | X | X | X | X | X | X | - | X |
 | step grid bundle (`17` D101) | X | X | X | X | X | X | - | X |
-| `host_laws` | - | - | **X** | **X** | - | - | **X** | **X** |
+| `host_laws` | X | X | **X** | **X** | X | X | **X** | **X** |
 | `projection` | - *(analytical)* | X *(op_graph capture)* | X | X | - *(the spec is in its key)* | - | - | X |
 | `memory_readings` | **X** | X | X | X | **X** | X | - | **X** |
 | `machine_spec`: capacity | - | - | - | - | **X** | - | - | - |
@@ -1048,9 +1048,13 @@ Consequences worth noting:
 - PTL invalidates what the device does, except the capacity: it moves the clock, not the
   memory. `memory_readings` still refuse under another PTL state, because their key
   carries the machine-spec digest; a parity run re-measures them.
-- `host_laws` time the host, so the host CPU invalidates them and the device does not;
-  `step_measurement` and `step_linear_law` hold device time, so the host CPU does not invalidate
-  them.
+- `host_laws` time the host, so the host CPU invalidates them. The device, the software
+  stack and PTL invalidate them too, through the machine-spec digest in their key:
+  `W_launch` is time spent launching into the HIP runtime, and `W_post` and `L_mtp` wait
+  on a device-to-host copy. Torch invalidates them through their row's fingerprint, not
+  the digest, which leaves torch out: `W_pre`, `W_launch` and `W_post` run through torch.
+  `step_measurement` and `step_linear_law` hold device time, so the host CPU does not
+  invalidate them.
 - The memory readings depend on the **library build** as much as the silicon, which is
   why ROCm, AITER and RCCL invalidate them. The +5980 MiB appearing the moment width
   exceeds one is collective buffer sizing; the 926 MiB at TP1 is HIP context plus
@@ -1086,7 +1090,7 @@ So: every gate's state is written into the artifact and checked there.
 | D40 | Four classes of communication, priced separately. Scaling is measured per width, never modelled. A collective's measured duration is an upper bound on device work. Collectives are leaves, interpolated over message bytes, measured on a multi-rank op bench that starts every rank of the layout through ATOM's own group initialisation, takes a barrier before each timed replay and measures the union of all ranks' signatures; the step bench is not reused. | 2026-09-18; collectives as leaves 2026-10-18 (#1489) |
 | D41 | Artifacts, each with key, digest, fingerprint and provenance. Keys are tuples; source roots are `git archive` digests; a source root with uncommitted files does not publish; resolution names its answer; handed-off artifacts are immutable. `step_measurement`, `step_linear_law` and `host_laws` added, and `shape_population` keyed by its pricing backend. `memory_readings` from `measure memory`, keyed as `step_linear_law` is, or published with every reading assumed for a device never measured. `price_list` and `memory_readings` keyed by the parallel layout, not a scalar width. The region-term artifact retired; `op_measurement` added, one per `measure ops` point, keyed as `price_list` is plus the point; `op_graph` keyed by structure and shape. | 2026-09-18; kinds 2026-10-13 (#851); `memory_readings` 2026-10-14 (#851); parallel layout 2026-10-15 (#165, #537); region terms retired, `op_measurement`, `op_graph` per shape 2026-10-18 (#1489); a dirty tree publishes nothing 2026-10-25 (#168) |
 | D42 | Trace is JIT and cached; pricing is offline or opt-in `--measure`. A `--measure` run is never an acceptance run. A new shape is captured, and each leaf in it interpolated between same-kernel neighbours; anywhere else, and for a new operator kind, the leaf falls to its analytical law, counted, and refuses without one. | 2026-09-18; same-kernel interpolation 2026-10-18 (#1489) |
-| D43 | Per-artifact invalidation matrix, not a global fingerprint. Every gate's state is written into the artifact and checked there. Rows for `shape_population`, `step_measurement`, `step_linear_law` and `host_laws`, and a host-CPU axis. The region-term row retired; `op_measurement` on `price_list`'s row. | 2026-09-18; rows 2026-10-13 (#851); region-term row retired, `op_measurement` 2026-10-18 (#1489) |
+| D43 | Per-artifact invalidation matrix, not a global fingerprint. Every gate's state is written into the artifact and checked there. Rows for `shape_population`, `step_measurement`, `step_linear_law` and `host_laws`, and a host-CPU axis. The region-term row retired; `op_measurement` on `price_list`'s row. | 2026-09-18; rows 2026-10-13 (#851); region-term row retired, `op_measurement` 2026-10-18 (#1489); `host_laws` row gains the device, stack and PTL its machine-spec digest carries, and torch through its fingerprint, 2026-10-29 (#2484) |
 | D38.1 | One recommended flow per half: steps (`measure memory`, `record`, `trace steps`, `measure steps` with the step grid's planner, `fit host` and `fit steps`, `run --coverage`, then grading outside the CLI), each server driven by a client started apart, and ops, after the steps half's `measure memory`, `record`, `trace steps` and `fit host` (`trace ops --population`, `measure ops --plan` over the record directories of `record` or `trace steps --out`, `fit ops` publishing a `price_list` only, then `run` and grading). Phases unchanged; the op bench, ATOM's runner preparing each point and running no forward, hosts 1b and the step bench 1c, Phase 2 is a plain startup `measure memory` runs. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); ops half 2026-10-18 (#1489); `measure ops --plan` reads record directories 2026-10-18 (#1527); op bench without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)) |
 | D40.1 | Classes (a) and p2p ride `measure ops` unchanged. Classes (b) and (c) share one new stated-entry-point benchmark inside the same multi-rank op bench, also run by `measure ops`. KV transfer is never priced. Collective prices are labelled upper bounds. | 2026-09-19; one command 2026-10-13 (#851); the multi-rank op bench 2026-10-18 (#1489) |
 

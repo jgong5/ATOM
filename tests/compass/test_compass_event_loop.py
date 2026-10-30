@@ -370,6 +370,44 @@ def test_the_finish_shuts_uvicorn_down_with_no_error_and_no_join_warning(
     assert run.rt.now == INF and "Application shutdown complete." in caplog.messages
 
 
+def test_the_api_server_s_lifespan_starts_and_stops_inside_the_run(
+    run, caplog, monkeypatch
+):
+    """ATOM's lifespan hands tracing's setup and flush to a thread as the server
+    starts and as it leaves; the loop is in its run by then, so both are station
+    jobs, and the server starts, reaches the finish and shuts down."""
+    _idle_traffic(run)
+    monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
+    # The process-wide collector settings startup makes, kept out of the test run.
+    for name in (
+        "tune_gc",
+        "maybe_attach_gc_debug_callback",
+        "freeze_gc_heap",
+        "arm_reclaim_watch",
+    ):
+        monkeypatch.setattr(api_server, name, lambda *_: None)
+    server = uvicorn.Server(
+        uvicorn.Config(
+            fastapi.FastAPI(lifespan=api_server.lifespan),
+            host="127.0.0.1",
+            port=0,
+            loop="atom.utils.compass_loop:CompassEventLoop",
+            lifespan="on",
+            log_config=None,
+        )
+    )
+    with caplog.at_level(logging.INFO, "uvicorn.error"):
+        try:
+            server.run()
+            stopped = None
+        except RuntimeError as e:
+            stopped = str(e)
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert (stopped, errors) == (None, [])
+    assert "Application startup complete." in caplog.messages
+    assert run.rt.now == INF and "Application shutdown complete." in caplog.messages
+
+
 def test_a_request_read_before_its_release_is_held_until_it(run):
     stamps, handled = queue.Queue(), []
     traffic = _traffic(

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
-"""An MI308X machine spec, from a tokenizer swept here and one real start.
+"""An MI308X machine spec, from the tokenizers swept here and one real start.
 
-    python3 scripts/compass/mi308x_spec.py [--model M] [--sweep-from DOC] [--out PATH]
+    python3 scripts/compass/mi308x_spec.py [--model M ...] [--sweep-from DOC] [--out PATH]
 
 Run on hjbog-srdc-18, or on hjbog-srdc-39 with COMPASS_MACHINE=mi308x-hjbog39,
-in a container that has the model's files: the tokenizer
+in a container that has the models' files: each tokenizer
 fragment carries this host's core counts, and the merge refuses it if they are
-not the ones the device fragment recorded there. The device fragment is what
+not the ones the device fragment recorded there. `--model` repeats: each
+distinct tokenizer the models load is swept once, and its entry applies to the
+architectures of every model that loads it. The device fragment is what
 ATOM's own `ModelRunner` read at one engine start (Qwen3.8-27B, TP1, CUDA
 graphs and prefix caching on, `--max-model-len 262144`): the device, its
 capacity and the stack; every field no probe fills is assumed, on either host.
@@ -18,7 +20,8 @@ requests add the idle intake (`IDLE`). An engine start's memory readings are `co
 not the spec's. One fragment per probe or origin. Writes the merged document to `--out` when
 `validate` passes, then prints `explain`'s rows for the host, device and
 interconnect blocks, grouped by origin.
-`--sweep-from` takes the tokenizer sweep from a document this script wrote.
+`--sweep-from` takes the tokenizer sweeps from a document this script wrote;
+given `--model` as well, it sweeps only those models' tokenizers and adds them.
 """
 
 import argparse
@@ -49,6 +52,8 @@ from atom.compass.spec import (
 from atom.compass.spec.bands import refuse_unbanded
 
 NAME = os.environ.get("COMPASS_MACHINE", "mi308x-hjbog18")
+#: The model whose tokenizer is swept when no `--model` is given.
+MODEL = "Qwen/Qwen3.8-27B"
 AUTHOR = "compass agent for jgong5"
 #: Token counts swept, one to past the 204,288-token p90 prompt of cc-traces.
 LENGTHS = tuple(4**k for k in range(10))
@@ -404,15 +409,31 @@ def peaks(readings: tuple, stated: dict, assumed: Fragment) -> tuple:
     return probed, Fragment(assumed.source, kept)
 
 
-def swept(model: str) -> Fragment:
-    """The tokenizer the server loads, swept over this tree's own source."""
+def swept(models: list[str]) -> list[Fragment]:
+    """Each distinct tokenizer the servers of `models` load, swept once; its
+    entry applies to the architectures of every model that loads it."""
     from transformers import PretrainedConfig
 
-    from atom.compass.artifacts.provenance import git_tree_root
     from atom.compass.run import _fingerprint
     from atom.model_engine.llm_engine import _load_tokenizer
 
-    tok = _load_tokenizer(model)
+    loaded: dict[tuple, tuple] = {}
+    for model in models:
+        tok = _load_tokenizer(model)
+        key = (_fingerprint(tok), tok.is_fast)
+        applies = loaded.setdefault(key, (model, tok, []))[2]
+        for name in PretrainedConfig.get_config_dict(model)[0]["architectures"]:
+            if name not in applies:
+                applies.append(name)
+    return [_swept_once(*found) for found in loaded.values()]
+
+
+def _swept_once(model: str, tok, applies_to: list[str]) -> Fragment:
+    """The tokenizer `tok` the server of `model` loads, swept over this tree's
+    own source."""
+    from atom.compass.artifacts.provenance import git_tree_root
+    from atom.compass.run import _fingerprint
+
     root = git_tree_root("atom", str(ROOT))
     text = "\n".join(p.read_text() for p in sorted((ROOT / "atom").rglob("*.py")))
     runs, refused = [], 0
@@ -437,7 +458,7 @@ def swept(model: str) -> Fragment:
         "backend": "fast" if tok.is_fast else "slow",
         "vocab_size": len(tok),
         "fingerprint": _fingerprint(tok),
-        "applies_to": PretrainedConfig.get_config_dict(model)[0]["architectures"],
+        "applies_to": applies_to,
         **{k: statistics.median(v) for k, v in rates.items()},
         # Measured on the host it describes, so nothing is taken off it.
         "derate": 1.0,
@@ -490,14 +511,16 @@ def report(merged) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--model", default="Qwen/Qwen3.8-27B")
+    parser.add_argument("--model", action="append", help="repeats; default " + MODEL)
     parser.add_argument(
         "--out", type=Path, default=ROOT / "scripts/compass/machines" / f"{NAME}.json"
     )
     parser.add_argument("--sweep-from", type=Path, help="a document to reuse")
     args = parser.parse_args(argv)
-    sweep = saved(args.sweep_from) if args.sweep_from else swept(args.model)
-    merged = merge([sweep, *device_fragments()])
+    sweeps = [saved(args.sweep_from)] if args.sweep_from else []
+    if args.model or not sweeps:
+        sweeps += swept(args.model or [MODEL])
+    merged = merge([*sweeps, *device_fragments()])
     verdict = validate(merged.document)
     print(verdict)
     if not verdict.ok:

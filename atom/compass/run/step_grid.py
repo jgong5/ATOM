@@ -13,7 +13,11 @@ steps` publishes beside its report:
 
     {"grid": <a StepGrid mapping>, "residual": <a Residual mapping>,
      "bounds": {"max_num_seqs": n, "max_num_batched_tokens": n,
-                "max_model_len": n}}
+                "max_model_len": n},
+     "draft_residual": <a Residual mapping>}     # under a drafter
+
+A grid that states a draft width prices each step's drafter too, read for its
+points' drafter values with `draft_residual`.
 
 The grid states its timing scope (`scope`) and what its points hold
 (`value`); `step_grid_fit.bundle`, which writes a bundle, also writes the grid
@@ -169,7 +173,8 @@ def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:
     entry = store.read(key)
     try:
         member = json.loads(entry.read_member(*MEMBER))
-        grid, residual = StepGrid(member["grid"]), Residual(member["residual"])
+        backend = _backend(member, str(key))
+        grid = backend.grid
         bounds = {name: member["bounds"][name] for name in BOUNDS}
         row = dict(entry.fingerprints[Row.STEP_GRID_BUNDLE].cells)
         recorded = json.loads(row[Axis.ENGINE_CONFIG].value)
@@ -215,10 +220,20 @@ def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:
         raise ValueError(
             f"this run's {'; '.join(over)} the grid of {key} was planned for"
         )
-    return StepGridBackend(grid, residual, bundle=str(key)), {
-        "key": key.values,
-        "digest": entry.digest,
-    }
+    return backend, {"key": key.values, "digest": entry.digest}
+
+
+def _backend(member: Mapping, bundle: str) -> StepGridBackend:
+    """The backend of a bundle's member, under a drafter with the grid read for
+    the drafter's value and its residual."""
+    grid, residual = StepGrid(member["grid"]), Residual(member["residual"])
+    drafter = None
+    if grid.draft_width:
+        drafter = (
+            StepGrid(member["grid"], drafter=True),
+            Residual(member["draft_residual"], drafter=True),
+        )
+    return StepGridBackend(grid, residual, bundle, drafter)
 
 
 def read(spec: Mapping, digest: str) -> StepGridBackend:
@@ -230,6 +245,4 @@ def read(spec: Mapping, digest: str) -> StepGridBackend:
     fields = dict(spec)
     store = ArtifactStore(fields.pop("store"))
     entry = store.read_recorded(Kind.STEP_GRID_BUNDLE, fields, digest)
-    member = json.loads(entry.read_member(*MEMBER))
-    grid, residual = StepGrid(member["grid"]), Residual(member["residual"])
-    return StepGridBackend(grid, residual, bundle=str(entry.key))
+    return _backend(json.loads(entry.read_member(*MEMBER)), str(entry.key))

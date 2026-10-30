@@ -38,6 +38,7 @@ send side stamps each frame with `stamp_send`, directly or through the
 """
 
 import contextlib
+import json
 import logging
 import math
 import os
@@ -663,9 +664,15 @@ def channel_of(rt: LPRuntime, kind: str) -> str:
 
 
 def name_endpoints(
-    dp: int, input_address: str, control_address: str, output_address: str, config=None
+    dp: int | None,
+    input_address: str,
+    control_address: str,
+    output_address: str,
+    config=None,
 ) -> None:
     """Record the channel kind each address carries; a real run records nothing.
+
+    `dp` None is `config`'s data-parallel rank, read only on a simulated run.
 
     A socket this LP binds or connects to a recorded address becomes that
     channel's `WrappedSocket`; the channel is looked up then, so an address no
@@ -684,6 +691,7 @@ def name_endpoints(
     kinds = {}
     if config is not None:
         pc = config.parallel_config
+        dp = pc.data_parallel_rank if dp is None else dp
         dp += getattr(pc, "pipeline_parallel_rank", 0)
         dp += getattr(config, "disagg_is_decode", False)
         kinds |= {a: f"meta#pp{k}" for k, a in enumerate(pc.pp_meta_addrs)}
@@ -703,17 +711,20 @@ def name_endpoints(
     rt.endpoints |= kinds
 
 
-def relay_queue(dp: int):
+def relay_queue(parallel):
     """The engine's output queue: a `RelayQueue` on its output channel, else a `queue.Queue`.
 
-    The channel is rank `dp`'s, or the LP's only one: a pipeline stage is an
-    LP of its own. Its socket is opened later, on the output thread, and takes
-    the relay's placeholder when it connects to the output address.
+    The channel is the data-parallel rank's that `parallel`, the engine's
+    parallel config, names, or the LP's only one: a pipeline stage is an LP of
+    its own. Its socket is opened later, on the output thread, and takes the
+    relay's placeholder when it connects to the output address. The rank is
+    read only on a simulated run.
     """
     rt = _installed
     if rt is None:
         return queue.Queue() if _stamps is None else _StampedQueue()
     outs = [c.name for c in rt.table.channels_from(rt.me) if ":output#" in c.name]
+    dp = parallel.data_parallel_rank
     ch = outs[0] if len(outs) == 1 else channel_of(rt, f"output#dp{dp}")
     rt.relays[ch] = RelayQueue(rt, WrappedSocket(rt, None, ch))
     return rt.relays[ch]
@@ -746,12 +757,22 @@ def reply_queue() -> queue.Queue:
 class PullStamps:
     """A real recording's engine loop: the first input pull and the first
     output put after each worker reply, one ``{"t_pull_ns" | "t_put_ns": ns}``
-    line each in `path`, read off `now`, the machine clock its caller hands in."""
+    line each in `path`, read off `now`, the machine clock its caller hands in.
 
-    def __init__(self, path, now) -> None:
+    In `handoff`, one line per item through the engine's IO-thread queues: an
+    input frame's ``t_recv_ns`` (the input thread's receipt, on the same
+    clock), ``t_in_put_ns``, ``t_in_get_ns``, ``t_pull_ns`` (the busy loop's
+    idle point in the pass that got it) and ``prompt_tokens``; an
+    output's ``t_out_put_ns``, ``t_out_sent_ns`` (the output thread's next
+    get, so its send returned) and ``rows``."""
+
+    def __init__(self, path, handoff, now) -> None:
         self.file, self.now = open(path, "w", buffering=1), now  # noqa: SIM115
+        self.handoff = open(handoff, "w", buffering=1)  # noqa: SIM115
         self.lock = threading.Lock()
         self.armed: set[str] = set()
+        self.inputs: dict[int, int] = {}  # id of an input item -> its put
+        self.pull = 0  # the busy loop's last idle point
 
     def arm(self) -> None:
         with self.lock:
@@ -763,24 +784,78 @@ class PullStamps:
                 self.armed.discard(key)
                 self.file.write(f'{{"{key}": {self.now()}}}\n')
 
+    def write(self, line: dict) -> None:
+        with self.lock:
+            self.handoff.write(json.dumps(line) + "\n")
+
 
 #: The engine's `PullStamps` on a real recording, else None.
 _stamps: PullStamps | None = None
 
 
-def stamp_pulls(path, now) -> None:
-    """Stamp this engine's pulls and puts into `path` off the clock `now`; a
-    real recording's only."""
+def stamp_pulls(path, handoff, now) -> None:
+    """Stamp this engine's pulls and puts into `path`, and its IO-thread
+    queue handoffs into `handoff`, off the clock `now`; a real recording's only."""
     global _stamps
-    _stamps = PullStamps(path, now)
+    _stamps = PullStamps(path, handoff, now)
 
 
 class _StampedQueue(queue.Queue):
-    """A real recording's output queue: each put is offered as a ``t_put_ns`` stamp."""
+    """A real recording's output queue: each put is offered as a ``t_put_ns``
+    stamp, and the output thread's next get writes the item before it with its
+    batch's row count, its send returned."""
+
+    taken = None  # (put, item) the output thread took last
 
     def put(self, item, block: bool = True, timeout=None) -> None:
         _stamps.stamp("t_put_ns")
+        super().put((_stamps.now(), item), block, timeout)
+
+    def get(self, block: bool = True, timeout=None):
+        if self.taken is not None:
+            (put, item), self.taken = self.taken, None
+            rows = item[1] if isinstance(item, tuple) and item[0] == "STREAM" else item
+            if isinstance(rows, list):
+                sent = _stamps.now()
+                _stamps.write(
+                    {"t_out_put_ns": put, "t_out_sent_ns": sent, "rows": len(rows)}
+                )
+        self.taken = super().get(block, timeout)
+        return self.taken[1]
+
+
+class _StampedInputQueue(queue.Queue):
+    """A real recording's input queue: the busy loop's get of each request
+    frame writes the frame's receipt, put and get, and its prompt tokens."""
+
+    def put(self, item, block: bool = True, timeout=None) -> None:
+        _stamps.inputs[id(item)] = _stamps.now()
         super().put(item, block, timeout)
+
+    def get(self, block: bool = True, timeout=None):
+        item = super().get(block, timeout)
+        got, put = _stamps.now(), _stamps.inputs.pop(id(item), None)
+        timing = getattr(item[0], "queue_timing", None) if item else None
+        if put is not None and timing is not None:
+            prompt = sum(s.num_prompt_tokens for s in item)
+            recv = int(timing.received_at * 1e9)  # perf_counter: CLOCK_MONOTONIC
+            _stamps.write(
+                {
+                    "t_recv_ns": recv,
+                    "t_in_put_ns": put,
+                    "t_in_get_ns": got,
+                    "t_pull_ns": _stamps.pull,
+                    "prompt_tokens": prompt,
+                }
+            )
+        return item
+
+
+def stamp_input(engine) -> None:
+    """On a real recording, make `engine`'s input queue write each request
+    frame's handoff (`_StampedInputQueue`); the queue keeps what it holds."""
+    if _stamps is not None:
+        engine.input_queue.__class__ = _StampedInputQueue
 
 
 # ---- the engine step loop: hooks ATOM calls, each a no-op on a real run ----
@@ -866,6 +941,7 @@ def idle(deadline, t_daemon: float = math.inf) -> bool:
     if rt is None:
         if _stamps is not None:
             _stamps.stamp("t_pull_ns")
+            _stamps.pull = _stamps.now()
         return False
     if rt.in_run and rt.calls == rt.idle_calls:
         rt.next_event(deadline(), t_daemon)
