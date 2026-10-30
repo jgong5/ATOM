@@ -64,11 +64,13 @@ DeepSeek-V4's modules, each priced and then gone into:
   tensor-parallel all-reduce on one data-parallel rank unless its block
   leaves that to the next norm (`reduce_results`), as MiniMax-M3's always
   does. Shared experts the
-  kernel runs with them (`num_fused_shared_experts`) take every row. An
+  kernel runs with them (`num_fused_shared_experts`) take every row, or
+  under expert parallelism on one data-parallel rank, where aiter's top-k
+  table deals them, a rank's share. An
   expert-parallel MoE over a data-parallel group whose exchange is not MoRI's
-  (`--all2all-backend rccl` or `none`, `ATOM_DISABLE_MORI_EP`), one under
-  expert parallelism that fuses its shared experts, the Mega kernel, and
-  experts picked by phase, are unclassified.
+  (`--all2all-backend rccl` or `none`, `ATOM_DISABLE_MORI_EP`), one over such
+  a group that fuses its shared experts, the Mega kernel, and experts picked
+  by phase, are unclassified.
 
 DeepSeek-V4.1's, each priced and then gone into, the KV and index caches at
 the formats ATOM's config states; its attention under a KV cache neither
@@ -522,9 +524,12 @@ def _moe(module, name, parent):
     weights' format when it has a quant type: the kernel quantizes them to it.
     The unquantized method's experts read its weights' format.
     A method that picks its experts by phase (`ATOM_USE_TRITON_MOE_DECODE`) is
-    unclassified, and so are fused shared experts under expert parallelism,
-    which aiter's top-k table deals out to the group's ranks token by token.
+    unclassified. Under expert parallelism with no all-to-all, on one
+    data-parallel rank, aiter's top-k table deals each row's fused shared
+    experts to rank `row mod ranks`; fused shared experts under expert
+    parallelism in any other layout are unclassified.
     """
+    from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
     from atom.utils import envs
 
     method, w13 = module.quant_method, module.w13_weight
@@ -555,12 +560,14 @@ def _moe(module, name, parent):
         return None
     config = module.moe_parallel_config
     shared = getattr(module, "num_fused_shared_experts", 0)
-    if shared and config.use_ep:
-        return None
     ranks = config.ep_size if config.use_ep else config.tp_size
+    dp = ranks // attention_tp
+    dealt = module.expert_layout.mode is SharedExpertMode.LEGACY_AITER and dp == 1
+    if shared and config.use_ep and not dealt:
+        return None
     split = int(config.use_ep and config.low_latency)
     dims = (module.global_num_experts, w13.shape[0] - shared, module.top_k)
-    dims += (inter, module.hidden_size, ranks, ranks // attention_tp, split)
+    dims += (inter, module.hidden_size, ranks, dp, split)
     dims += (held // w13.shape[0],) + ((shared,) if shared else ())
     fused = module._comm_fused_moe is not None
     if not (config.use_ep and dims[6] > 1):
