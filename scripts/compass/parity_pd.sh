@@ -70,7 +70,7 @@ serve() {
         python3 -m atom.entrypoints.openai_server --model "$MODEL" --host 127.0.0.1 \
         --server-port "$port" $(dp_args "$6") \
         --data-parallel-master-port "$(compass_held_port)" $SERVER_ARGS --kv-transfer-config \
-        "{\"kv_role\":\"$5\",\"kv_connector\":\"mooncake\",\"protocol\":\"tcp\",\"proxy_ip\":\"127.0.0.1\",\"handshake_port\":$(compass_held_port)}" \
+        "{\"kv_role\":\"$5\",\"kv_connector\":\"mooncake\",\"protocol\":\"tcp\",\"proxy_ip\":\"127.0.0.1\",\"handshake_port\":$(compass_held_port "$6")}" \
         >"$OUT/real/$name.log" 2>&1 &
     pids+=($!)
     compass_wait_up "$name server" $! "http://127.0.0.1:$port/health"
@@ -145,10 +145,13 @@ Path(run).write_text(json.dumps({
     "worker_order": order,
 }))
 EOF
+# pd_sim.sh's server k of a side takes the side's port plus k and its DP port
+# plus 16k, and the write requests one port per pair of prefill and decode ranks.
+p=${#prefill_gpus[@]} d=${#decode_gpus[@]}
 ports=("CLOCK_PORT=$CLOCK_PORT")
-for name in PREFILL_PORT DECODE_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT \
-    PREFILL_DP_PORT DECODE_DP_PORT; do
-    ports+=("$name=$(compass_held_port)")
+for name in PREFILL_PORT=$p DECODE_PORT=$d KV_WRITE_REQ_PORT=$((p * d * PREFILL_DP * DECODE_DP)) \
+    PROMETHEUS_PORT=1 PREFILL_DP_PORT=$((16 * p - 15)) DECODE_DP_PORT=$((16 * d - 15)); do
+    ports+=("${name%=*}=$(compass_held_port "${name#*=}")")
 done
 # shellcheck disable=SC2086 # SERVER_ARGS is a word list
 env "${ports[@]}" ROUTER_PORT="$ROUTER_PORT" MODEL="$MODEL" ATOMESH="$ATOMESH" \
