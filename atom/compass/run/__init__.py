@@ -1409,11 +1409,7 @@ def runner(model_runner, tree) -> None:
         side = {"P": "prefill", "D": "decode"}.get(name[:1], "") + name[1:]
         replay = ReplayHost(Path(run["replay"]) / side, dp_rank, stage)
     if STEP_LINEAR in run:
-        if tp != 1:
-            raise ValueError(
-                "a step linear law is fitted on one rank of tensor-parallel width "
-                f"1, and this run has tensor_parallel_size {tp}"
-            )
+        # A law prices a rank at the tensor-parallel width its engine config states.
         # Under DP-attention every rank runs at TP 1, and experts shard over the group.
         dpa = config.enable_dp_attention
         dp = config.parallel_config.data_parallel_size if dpa else 1
