@@ -2252,6 +2252,53 @@ def test_the_prefill_top_k_launches_the_workspace_aiter_builds_for_its_path(
     assert record["workspace_bytes"] == launched
 
 
+@pytest.mark.parametrize(
+    "decoding, rows, stride, scratch, copies",
+    [
+        (False, 8192, 2048, 8_388_863, 6),
+        (False, 1024, 32768, 16_777_471, 4),
+        (True, 512, 2048, 524_543, 94),
+    ],
+)
+def test_a_top_k_leaf_s_copies_and_footprint_count_the_scratch_it_launches(
+    monkeypatch, decoding, rows, stride, scratch, copies
+):
+    # The graph holds one byte of scratch; aiter sizes it as on MI455 for the
+    # two calls an 8192-token prefill makes at indexer budget 2048, from empty
+    # and ending at 128K, and for a 512-row decode whose row stride is its
+    # context.
+    from aiter.ops import topk
+
+    sizes = {(rows, stride, 512, decoding): scratch}
+    monkeypatch.setattr(topk, "topk_ob_workspace_size", lambda *q: sizes[q])
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda self, op, s, i, n: {"copies": n})
+    vector = _t([rows], "activation", [1], "torch.int32")
+    args = [
+        ("logits", _t([rows, stride], "activation", [stride, 1])),
+        *[(s, vector) for s in ("seqLens",) if decoding],
+        *[(s, vector) for s in ("rowStarts", "rowEnds") if not decoding],
+        ("indices", _t([rows, 512], "activation", [512, 1], "torch.int32")),
+        ("numRows", rows),
+        ("stride0", ir.Affine(1, 0) if decoding else stride),
+        ("k", 512),
+        ("workspace", _t([1], "activation", [1], "torch.uint8")),
+        ("stable", True),
+    ]
+    phase = "decode" if decoding else "prefill"
+    leaf = _leaf(f"aiter._top_k_per_row_{phase}.default", *args)
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    placed = SimpleNamespace(block_size=256, batch=lambda view, b, s: (b, s))
+    shape = decode(2) if decoding else prefill(6, 2)
+
+    [record] = ops.Stub(_Runner(), 256 << 20).point(placed, shape, 2048, found)
+
+    # Each call's logits, row bounds, indices and scratch: copies past twice
+    # a 256 MiB cache.
+    call = 4 * rows * (stride + 2 - decoding + 512) + scratch
+    assert (record["copies"], record["footprint_bytes"]) == (copies, copies * call)
+
+
 def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
     monkeypatch,
 ):
