@@ -2,8 +2,8 @@
 """The step roofline over DeepSeek-V4.1's modules and its DSpark drafter's:
 sparse attention by layer mode, the index keys a compressing layer writes,
 the fused Q and KV norm, a prefill that replays its decoder on each finishing
-request's last rows, and the drafter's block, sampler and KV pass priced as
-the step's draft terms.
+request's last rows, and the drafter's block and sampler priced as the step's
+draft terms, its KV pass as the target's on a step that samples.
 
 Each is checked against a count by hand, on a machine with no kernel floor,
 once memory-bound and once compute-bound. The published V4.1-Flash config at
@@ -128,29 +128,44 @@ def _kv(tokens, spec):
     return _module(gemm(tokens, 32, 8, "fp8", "fp8"), spec)
 
 
-@BOUND
-def test_a_drafter_prices_its_block_and_its_kv_pass_apart_from_the_target(spec):
-    # Two decode rows of 2, at contexts 3 and 9: the target and the KV pass
-    # on their 4 tokens, a block of 3 for each row.
-    step = view((2, 3, True), (2, 9, True))
-    by_name = _cost([TARGET, *DRAFTER], step, spec)
-    drafted = _block(spec, [3, 9])
-    drafted["draft roofline.gemm"] += _kv(4, spec)
+def _sides(modules, step, spec):
+    """The target's terms and the draft's, each by name."""
+    cost = StepRooflineBackend(spec, modules).price(step)
+    return [
+        {t.name: t.seconds for t in terms} for terms in (cost.terms, cost.draft_terms)
+    ]
 
-    assert by_name.pop("roofline.gemm") == pytest.approx(_module(gemm(4, 8, 8), spec))
-    assert by_name == pytest.approx(drafted)
+
+@BOUND
+def test_a_decode_drafts_its_block_and_writes_the_drafters_kv_in_the_targets_time(
+    spec,
+):
+    # Two decode rows of 2, at contexts 3 and 9: the target and the KV pass
+    # on their 4 tokens, a block of 3 for each row. The step samples, so the
+    # KV pass runs before forward_done_event: the target's, named apart.
+    target, draft = _sides([TARGET, *DRAFTER], view((2, 3, True), (2, 9, True)), spec)
+
+    assert target == pytest.approx(
+        {
+            "roofline.gemm": _module(gemm(4, 8, 8), spec),
+            "draft_kv roofline.gemm": _kv(4, spec),
+        }
+    )
+    assert draft == pytest.approx(_block(spec, [3, 9]))
 
 
 @BOUND
 def test_a_prefill_drafts_one_block_and_a_middle_chunk_drafts_none(spec):
     # Which rows finish their prompts a view does not say: one block, at the
-    # shortest context. The KV pass runs on every row of either.
-    drafted = _block(spec, [9])
-    drafted["draft roofline.gemm"] += _kv(8, spec)
-    idle = _cost(DRAFTER, prefill((5, 20), (3, 9), output=False), spec)
+    # shortest context. The KV pass runs on every row of either: the target's
+    # on a prefill that samples, the draft's on a middle chunk.
+    target, draft = _sides(DRAFTER, prefill((5, 20), (3, 9)), spec)
+    idle, idle_draft = _sides(DRAFTER, prefill((5, 20), (3, 9), output=False), spec)
 
-    assert _cost(DRAFTER, prefill((5, 20), (3, 9)), spec) == pytest.approx(drafted)
-    assert idle == pytest.approx(
+    assert target == pytest.approx({"draft_kv roofline.gemm": _kv(8, spec)})
+    assert draft == pytest.approx(_block(spec, [9]))
+    assert idle == {}
+    assert idle_draft == pytest.approx(
         {
             "draft roofline.block_attention": 0.0,
             "draft roofline.markov": 0.0,
@@ -351,8 +366,15 @@ def test_the_v41_flash_tp4_dspark_steps_price_target_and_draft_apart(built):
     draft = {name: sum(terms[1].values()) for name, terms in priced.items()}
 
     for terms, drafts in priced.values():
-        assert all(n.startswith("roofline.") for n in terms)
+        assert all(n.startswith(("roofline.", "draft_kv roofline.")) for n in terms)
         assert drafts and all(n.startswith("draft roofline.") for n in drafts)
+    # A step that samples writes the drafter's KV in the target's time: its
+    # projections and its first stage's norm.
+    for name in ("verify-1", "verify-16", "prefill"):
+        kv = {n: s for n, s in priced[name][0].items() if n.startswith("draft_kv ")}
+        assert set(kv) == {"draft_kv roofline.gemm", "draft_kv roofline.norm"}
+        assert min(kv.values()) > 0
+    assert not [n for n in priced["middle"][0] if n.startswith("draft_kv ")]
     assert 0 < target["verify-1"] < target["verify-16"]
     assert 0 < draft["verify-1"] < draft["verify-16"]
     # A middle chunk stops at the first decoder layer's compression: no
