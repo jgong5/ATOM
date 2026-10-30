@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """The step roofline over MLA: the absorbed decode, the prefill over each
 request's up-projected context, and the routed experts beside a fused shared
-expert; DeepSeek-V3's meta build at TP8 and under DP attention; and an
-attention layer with a sliding window, refused by name.
+expert, dealt out to the ranks under expert parallelism; DeepSeek-V3's meta
+build at TP8, at TP8 with EP8 and under DP attention; and an attention layer
+with a sliding window, refused by name.
 
 Each price is checked against a count by hand, on a machine with no kernel
 floor, once memory-bound and once compute-bound. The builds own their
@@ -23,7 +24,12 @@ from test_backend_step_roofline_v4 import BOUND, EP_OFF, LINK, _module, _price, 
 
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.step_roofline import Module, StepRooflineBackend
-from atom.compass.backends.work import Work, activated_experts, gemm
+from atom.compass.backends.work import (
+    Work,
+    activated_experts,
+    gemm,
+    max_rank_load,
+)
 from atom.compass.runner.overrides import FactoriesOnMeta
 from atom.compass.spec import MachineSpec
 
@@ -104,6 +110,24 @@ def test_a_fused_shared_expert_takes_every_row_by_hand(spec):
     )
 
 
+@BOUND
+def test_a_fused_shared_expert_under_ep_takes_a_dealt_share_of_rows_by_hand(spec):
+    # Two EP ranks of one data-parallel rank, 4 of the 8 experts each and the
+    # shared one on both; the next norm reduces the output.
+    ep2 = Module("experts", "moe", (8, 4, 2, 32, 32, 2, 1, 0, 1632, 1), "fp4")
+    one = BatchView((RequestShape(1, 4, True),) * 5)
+    # The busiest rank's routed rows and, of the 5 rows dealt round robin,
+    # 3; it reads the experts its rows reach and the shared one, and three
+    # top-k ids and weights a routed row.
+    load = max_rank_load(5, 2, 8, 2)
+    hit = activated_experts(8, 2, 5) / 2 + 1
+    experts = Work({"bf16": 2 * (load + 3) * (64 + 32) * 32}, hit * 1632)
+    experts += Work({}, load / 2 * (32 * 4 + 24))
+    assert _price([ep2], one, spec)["roofline.moe"] == pytest.approx(
+        _module(experts, spec)
+    )
+
+
 def test_a_meta_tensor_moved_to_the_gpu_stays_on_meta_and_not_to_the_host():
     with FactoriesOnMeta():
         scale = torch.tensor(1.0)
@@ -124,12 +148,12 @@ import json, pathlib, sys, torch
 mode, root = sys.argv[1], pathlib.Path(sys.argv[2])
 from atom.compass.capture import driverless
 driverless.install(str(root), "gfx950")
-tp = int(mode[2:]) if mode.startswith("tp") else 1
+tp = int(mode[2]) if mode.startswith("tp") else 1
 driverless.group(tp, 1)
 from atom.config import Config, set_current_atom_config
-dpa = {} if mode.startswith("tp") else dict(
-    enable_dp_attention=True, dp_logical_size=8, enable_expert_parallel=mode == "ep8"
-)
+dpa = dict(enable_expert_parallel="ep8" in mode)
+if not mode.startswith("tp"):
+    dpa.update(enable_dp_attention=True, dp_logical_size=8)
 config = Config(model=str(root / "model"), tensor_parallel_size=tp, load_dummy="empty",
                 kv_cache_dtype="fp8", **dpa)
 set_current_atom_config(config)
@@ -142,6 +166,15 @@ torch.set_default_dtype(config.torch_dtype)
 with FactoriesOnMeta():
     tree = resolve_obj_by_qualname(model)(config)
     process_weights_after_loading(tree)
+if mode.endswith("a2a"):
+    # The layout an all-to-all builds a fused shared expert into.
+    import dataclasses
+    from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
+    for m in tree.modules():
+        if hasattr(m, "expert_layout"):
+            m.expert_layout = dataclasses.replace(
+                m.expert_layout, mode=SharedExpertMode.LOCAL_REPLICA
+            )
 walked = [[m.name, m.kind, list(m.dims), m.fmt, m.act, m.ranks, m.fused, m.layer]
           for m in walk(tree)]
 print(json.dumps(walked))
@@ -150,7 +183,9 @@ print(json.dumps(walked))
 
 def _build(mode: str, config: dict) -> tuple:
     """`config`'s model walked in a process of its own at `mode`: `tp<N>`,
-    or DP attention over 8 ranks, `dpa` or, with expert parallelism, `ep8`."""
+    `tp8ep8` with expert parallelism, and with an all-to-all's expert layout
+    `tp8ep8a2a`, or DP attention over 8 ranks, `dpa` or, with expert
+    parallelism, `ep8`."""
     with tempfile.TemporaryDirectory() as root:
         (pathlib.Path(root) / "model").mkdir()
         (pathlib.Path(root) / "model" / "config.json").write_text(json.dumps(config))
@@ -211,6 +246,50 @@ def test_the_v3_ep8_build_refuses_its_fused_shared_expert_by_name():
         "FusedMoE at model.layers.3.mlp.experts"
     ]
     assert sum(m.kind == "mla_attention" for m in walked) == 61
+
+
+#: DeepSeek-V3's MoE at TP8 with EP8: 32 of the 256 experts a rank, each at
+#: its full 2048, fp8 weights and an fp32 scale per 128 by 128 block, and the
+#: shared expert fused beside them; the next norm all-reduces their output.
+V3_EP8 = (256, 32, 8, 2048, 7168, 8, 1, 0, 3 * 2048 * 7168 + 4 * 16 * 56 * 3, 1)
+
+
+def test_the_v3_tp8_ep8_build_classifies_every_module():
+    found = _counts(_v3("tp8ep8"))
+
+    assert not [m for m in found if m[0] == "unclassified"]
+    assert found[("moe", V3_EP8, "fp8", "fp8", 1)] == 58
+
+
+def test_the_v3_build_refuses_a_fused_shared_expert_under_an_all_to_all():
+    config = {**json.loads(CONFIG.read_text()), "num_hidden_layers": 4}
+    walked = _build("tp8ep8a2a", config)
+
+    assert [m.name for m in walked if m.kind == "unclassified"] == [
+        "FusedMoE at model.layers.3.mlp.experts"
+    ]
+
+
+def test_the_v3_tp8_ep8_decode_step_at_batch_64_and_context_4096_by_hand():
+    machine = MachineSpec.from_mapping(json.loads(MI355X.read_text()))
+    step = BatchView((RequestShape(1, 4096, True),) * 64, capture_rung=64)
+    cost = StepRooflineBackend(machine, _v3("tp8ep8")).price(step)
+    moe = {t.name: t.seconds for t in cost.terms}["roofline.moe"]
+    # The busiest rank's routed rows, and 8 of the 64 rows dealt round robin
+    # through the shared expert; each row from 7168 to 4096 and 2048 to 7168.
+    load = max_rank_load(64, 8, 256, 8)
+    picks = load + 64 // 8
+    # The experts its rows reach and the shared one, read whole, and a routed
+    # row's bf16 input and output, with nine top-k ids and weights.
+    reached = activated_experts(256, 8, 64) / 8 + 1
+    held = V3_EP8[8]
+    flops = 2 * picks * (4096 + 2048) * 7168
+    experts = Work({"fp8": flops}, reached * held + load / 8 * (7168 * 4 + 72))
+
+    assert load == pytest.approx(74.66, abs=0.01)
+    assert reached == pytest.approx(28.81, abs=0.01)
+    assert experts.bytes == pytest.approx(1.269e9, rel=1e-3)
+    assert moe == pytest.approx(58 * _module(experts, machine))
 
 
 def test_the_v3_tp8_decode_step_at_batch_64_and_context_4096_by_hand():

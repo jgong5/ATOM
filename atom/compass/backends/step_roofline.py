@@ -310,10 +310,14 @@ def _moe(m: Module, view: BatchView, tokens: int) -> tuple[Work, Work, Work]:
     # Pad rows all carry token 0 at position 0, so they route as one token.
     distinct = rows if real is None else min(rows, real + 1)
     routed, groups = rows * k, activated_experts(experts, k, distinct)
+    dealt = rows
     if local < experts:
         routed, groups = max_rank_load(rows, k, experts, ranks), groups / ranks
-    # Every row also runs through each shared expert the kernel holds.
-    picks, groups = routed + rows * shared, groups + shared
+        # aiter's top-k table deals each row's shared experts, pad rows too,
+        # to rank `row mod ranks`; each rank holds their weights.
+        dealt = -(-rows // ranks)
+    # The rows it is dealt also run through each shared expert it holds.
+    picks, groups = routed + dealt * shared, groups + shared
     flops = grouped_gemm(picks, 2 * inter, hidden, groups, m.act, m.fmt)
     flops += grouped_gemm(picks, hidden, inter, groups, m.act, m.fmt)
     ids = 2 * (k + shared) * ELEMENT_BYTES["fp32"]
