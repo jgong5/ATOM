@@ -21,6 +21,7 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
+from atom.compass.backends.step_linear import EXTRAPOLATED
 from atom.compass.backends.step_linear_fit import (
     fit,
     label_records,
@@ -47,14 +48,18 @@ def _price(view: BatchView) -> float:
     return float(np.dot(list(LAW.values()), (1, n, view.graph_padding, reached)))
 
 
-def _groups(seed, n, full):
-    """`n` decode steps at rung 4 over `DP` ranks, rank `i % DP` the slowest;
-    every rank holding 3 or 4 rows when `full`, else the others 1 or 2."""
+FULL, SPARSE, PACKED = (3, 5), (1, 3), (RUNG, RUNG + 1)
+
+
+def _groups(seed, n, others):
+    """`n` decode steps at rung 4 over `DP` ranks, rank `i % DP` the slowest
+    with 4 rows, each other rank `others`' rows: `FULL` 3 or 4, `SPARSE` 1 or
+    2, `PACKED` 4, so that every step's group has the same tokens."""
     rng = np.random.default_rng(seed)
     out = []
     for i in range(n):
         slow = i % DP
-        low, high = (3, 5) if full else (1, 3)
+        low, high = others
         widths = [
             RUNG if r == slow else int(rng.integers(low, high)) for r in range(DP)
         ]
@@ -98,8 +103,8 @@ def _routed(records):
 @pytest.fixture
 def cells(tmp_path):
     """Two runs: one whose ranks are all full, one whose ranks are mostly idle."""
-    full = _records(tmp_path / "full", _groups(0, 200, full=True))
-    sparse = _records(tmp_path / "sparse", _groups(1, 200, full=False))
+    full = _records(tmp_path / "full", _groups(0, 200, FULL))
+    sparse = _records(tmp_path / "sparse", _groups(1, 200, SPARSE))
     return full, sparse
 
 
@@ -184,3 +189,23 @@ def test_the_command_states_the_routing_it_fitted(tmp_path):
     assert law["moe_routing"] == {"experts": 64, "top_k": 4}
     assert all("moe_experts" in v["coefficients"] for v in law["decode"].values())
     StepLinearLaw(law)
+
+
+def test_a_rung_whose_steps_all_reach_the_same_experts_validates_a_step_that_does(
+    tmp_path,
+):
+    """Every rank packed on every step: `moe_experts` is one fraction over the
+    fit, which the fit's and the held-out hull hold as it is."""
+    runs = [_records(tmp_path / f"packed{s}", _groups(s, 100, PACKED)) for s in (2, 3)]
+    law, samples, options = _routed(runs[0] + runs[1])
+    mark_held_out(law, {"held_out": {}}, samples, options)
+    reached = activated_experts(*ROUTING, DP * RUNG)
+    assert not reached.is_integer()
+    vector = law["decode"][str(RUNG)]
+    assert vector["hull"]["equal"]["moe_experts"] == reached
+    assert vector["held_out"]["hull"]["equal"]["moe_experts"] == reached
+    backend = StepLinearBackend(StepLinearLaw(law), DP)
+    contexts = (170_000, 175_000, 180_000, 185_000)
+    terms = backend.price(_view(contexts, DP * RUNG)).terms
+    assert all(t.provenance.source != EXTRAPOLATED for t in terms)
+    assert all(t.provenance.validated for t in terms)

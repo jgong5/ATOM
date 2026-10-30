@@ -441,11 +441,12 @@ def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
     """`StepLinearLaw`'s hull over the non-intercept features of the fitted steps."""
     from scipy.spatial import ConvexHull
 
-    equal = {
-        names[j]: int(points[0, j])
-        for j in range(points.shape[1])
-        if np.ptp(points[:, j]) == 0
-    }
+    equal = {}
+    for j in range(points.shape[1]):
+        if np.ptp(points[:, j]) == 0:
+            # A count stays an int; `moe_experts` is a fraction, kept whole.
+            value = float(points[0, j])
+            equal[names[j]] = int(value) if value.is_integer() else value
     vary = [j for j in range(points.shape[1]) if names[j] not in equal]
     x = points[:, vary]
     lo, hi = x.min(axis=0), x.max(axis=0)
