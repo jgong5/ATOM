@@ -905,10 +905,11 @@ plus 1 to 2% run-to-run remains.
    tree** (owner [ruling on #2310](https://github.com/jgong5/ATOM/issues/2310#issuecomment-6497009949),
    2026-10-29). Every row's ATOM src cell (D43) and every key's `source_root` field read
    `atom/compass/run/__init__.py::atom_digest`: the sha256 of every `atom/**/*.py` file,
-   less the Compass code `COMPASS_ONLY` names, the `atom` value of the host key. It is a
+   less the Compass code `COMPASS_ONLY` names and the `atom/_version.py` that
+   `pip install -e .` writes, the `atom` value of the host key. It is a
    reading kind of its own, `atom_py`, and a record's value is its `run.json`
-   `host_key.atom`. A commit that edits no Python module ATOM runs, a doc or a test,
-   moves no reading and no key; in the week to `671e2ac9d`, 250 integration commits moved
+   `host_key.atom`. A commit that edits no Python file under `atom/` outside Compass's
+   code, a doc or a test, moves no reading and no key; in the week to `671e2ac9d`, 250 integration commits moved
    the tree and 8 moved this digest. Compass's measuring code stays outside it, as it has
    for host laws since [#935](https://github.com/jgong5/ATOM/issues/935): a change to
    what a measurement yields republishes its entries by hand. Provenance keeps the tree,
@@ -1076,7 +1077,8 @@ Consequences worth noting:
   libraries.
 - The ATOM src column reads the host key's `atom` digest, not the git tree (D41 rule 2,
   2026-10-29 on [#2310](https://github.com/jgong5/ATOM/issues/2310#issuecomment-6497009949)):
-  a doc, a test or Compass's own code moves no cell, and a Python module ATOM runs does.
+  a doc, a test or Compass's own code moves no cell, and any other Python file under
+  `atom/` does.
 - The region-term artifact's row is retired with its kind, 2026-10-18 on
   [#1489](https://github.com/jgong5/ATOM/issues/1489). An entry that still records a
   fingerprint for it refuses at load, as any row the matrix no longer names does.
