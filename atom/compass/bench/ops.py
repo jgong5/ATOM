@@ -27,8 +27,11 @@ forward writes is written from ids spread over each token's compressed rows
 (`Stub._top_k`). A `Stub` calls each leaf from its contract:
 an activation is random at its shape, dtype and stride, except a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
-experts' ids ATOM fuses into them (`_route`), and the `NM_OUTPUT` slot at
-one KV split, a view at the start of twice its span; a weight is random at its
+experts' ids ATOM fuses into them (`_route`), the `NM_OUTPUT` slot at
+one KV split, a view at the start of twice its span, and aiter's decode
+top-k scratch (`TOPK_WORKSPACE`), one byte in the graph, at the bytes
+aiter's own query sizes on the device for the call's rows, row stride and
+k; a weight is random at its
 shape, dtype and stride, one tensor per occurrence of the leaf in the step;
 a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
@@ -182,7 +185,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 17
+PROTOCOL = 18
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -282,6 +285,10 @@ V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
 #: the span, and past an exact buffer kills the process (aiter defect, #1977).
 NM_OUTPUT = (_NM, "output")
+#: The scratch aiter's decode top-k sizes by a host query into a module built
+#: for the device, which the capture answers 0 (`capture.forward._patches`),
+#: so a graph holds one byte. A point records the bytes it launched.
+TOPK_WORKSPACE = ("aiter._top_k_per_row_decode.default", "workspace")
 #: The seed of a copy's drawn expert ids, with the copy's index.
 SEED = 0
 #: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
@@ -933,7 +940,10 @@ class Stub:
         finally:
             forward_context._forward_context = forward_context.ForwardContext()
         medians = statistics.median(cold), warm and statistics.median(warm)
-        return {
+        scratch = {}
+        if op["op"] == TOPK_WORKSPACE[0]:
+            scratch["workspace_bytes"] = calls[0][0][TOPK_WORKSPACE[1]].nbytes
+        return scratch | {
             "kernels": kernels,
             "cold_ns": medians[0],
             "warm_ns": medians[1],
@@ -992,6 +1002,14 @@ class Stub:
                 and old is not None
             ):
                 return old
+            if (op["op"], path) == TOPK_WORKSPACE:
+                from aiter.ops import topk
+
+                rows, stride, k = (
+                    build(s, op["args"][s], None) for s in ("numRows", "stride0", "k")
+                )
+                size = topk.topk_ob_workspace_size(rows, stride, k, True)
+                return topk.get_topk_scratch_workspace(self.runner.device, size)
             if _ref(value):
                 key, module = instance[path], "module" in value
                 held = (
