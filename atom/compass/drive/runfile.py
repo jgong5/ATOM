@@ -152,7 +152,10 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     cost the machine spec's ``interconnect.router_relay_s``, the KV transfers
     priced on the spec's `kv_link`, ``intra_node`` for two instances on one node
     and ``inter_node`` across two, and `KV_WRITE_REQ_S`. A price list the
-    prefill side names that is not the decode side's refuses."""
+    prefill side names that is not the decode side's refuses. With
+    ``args.acceptance_record``, a decode record, it names the record as
+    ``compass run`` does, refusing what either instance would refuse as it
+    joins (`run.joined_atom_args`)."""
     out = build(args, prefill_args)
     if run.PRICE_LIST in out:
         decode = _price_list_key(decode_args, run._machine(out)).values
@@ -164,6 +167,13 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     del out["data_parallel_size"]
     out[run.DP_WIDTHS["P"]] = _dp_width(prefill_args)
     out[run.DP_WIDTHS["D"]] = _dp_width(decode_args)
+    if record := getattr(args, "acceptance_record", None):
+        # Imported here: that module imports this one.
+        from atom.compass.drive.run import joined_atom_args
+
+        out[run.ACCEPTANCE_RECORD] = str(Path(record).resolve())
+        for side, atom_args in (("D", decode_args), ("P", prefill_args)):
+            joined_atom_args(out, atom_args, side)
     return out | {
         "router_s": run._machine(out).value("interconnect.router_relay_s"),
         "kv_write_req_s": KV_WRITE_REQ_S,
