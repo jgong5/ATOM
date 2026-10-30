@@ -2299,6 +2299,45 @@ def test_a_top_k_leaf_s_copies_and_footprint_count_the_scratch_it_launches(
     assert (record["copies"], record["footprint_bytes"]) == (copies, copies * call)
 
 
+def test_a_top_k_leaf_whose_size_query_raises_refuses_and_its_point_is_timed(
+    monkeypatch,
+):
+    # aiter's top-k module fails to build: planning asks its size query, and
+    # the leaf refuses by name while the GEMM beside it is timed.
+    from aiter.ops import topk
+
+    def query(*q):
+        raise RuntimeError("module_top_k_per_row failed to build")
+
+    monkeypatch.setattr(topk, "topk_ob_workspace_size", query)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops, "_function", lambda name: lambda **kwargs: None)
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
+    monkeypatch.setattr(
+        ops, "_replay", lambda fn, calls, flush=None: [1.0] * ops.REPEATS
+    )
+    ints = [("numRows", 4), ("stride0", 8), ("k", 2), ("stable", True)]
+    scratch = ("workspace", _t([1], "activation", [1], "torch.uint8"))
+    top_k = _leaf(
+        "aiter._top_k_per_row_prefill.default",
+        ("logits", _t([4, 8], "activation")),
+        *ints,
+        scratch,
+    )
+    gemm = _leaf("aiter.gemm", ("x", _t([2, 8], "activation")))
+    found = ops.leaves(_graph(top_k, gemm, layers=1)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    got = ops.Stub(_Runner(), 1000).point(placed, prefill(6, 2), 20, found)
+
+    by_op = {record["op"]: record for record in got}
+    assert by_op["aiter._top_k_per_row_prefill.default"]["refused"] == (
+        "RuntimeError: module_top_k_per_row failed to build"
+    )
+    gemm = by_op["aiter.gemm"]
+    assert "refused" not in gemm and gemm["cold_ns"] == 1.0
+
+
 def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
     monkeypatch,
 ):

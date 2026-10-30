@@ -601,7 +601,7 @@ class Stub:
         self.per_row = state_slots_per_request(runner.config)
         self.built, self.leaves, self.placed = {}, {}, []
         self.cold_copies, self.clones, self.kv, self.state = {}, {}, {}, set()
-        self.written = {}
+        self.written, self.unplanned = {}, {}
         self.modules = dict(runner.model.named_modules())
         self.contexts = runner.config.compilation_config.static_forward_context
         self.moe = sorted(
@@ -767,7 +767,7 @@ class Stub:
         taken = len(rows) * self.per_row  # the batch's state slots
         room = [pool // blocks]
         room += [t.k_cache.shape[0] // taken for t in kv.values() if _stateful(t)]
-        self.context = _split(context)[0]
+        self.context, self.unplanned = _split(context)[0], {}
         plans = {
             s: self._plan(
                 op, i, kv, blocks, len(rows), shape.tokens, s, shape.phase == "decode"
@@ -872,7 +872,10 @@ class Stub:
                 nbytes, need = entry * unit, None
                 shared[slotted] += nbytes
             if slot == "workspace" and op["op"] in TOPK_WORKSPACE:
-                nbytes = self._workspace(op).nbytes  # not the byte captured
+                try:  # not the byte captured; a query that raises refuses the leaf
+                    nbytes = self._workspace(op).nbytes
+                except Exception as error:  # noqa: BLE001 - raised at its copy
+                    self.unplanned[sig] = error
             size += nbytes
         for key in instances[0].values():
             module = self.contexts.get(key)
@@ -1030,6 +1033,8 @@ class Stub:
             ):
                 return old
             if path == "workspace" and op["op"] in TOPK_WORKSPACE:
+                if sig in self.unplanned:  # its size query raised at planning
+                    raise self.unplanned[sig]
                 return self._workspace(op)
             if _ref(value):
                 key, module = instance[path], "module" in value
