@@ -20,9 +20,9 @@ from atom.utils import CpuGpuBuffer
 
 
 def _stand_in_attr(attr):
-    """A mock for each name an importer binds, and none for a dunder:
-    `inspect` caches every module's `__file__`, and a mock there breaks the
-    real aiter's custom-op registration later in the process."""
+    """A mock for each name an importer binds, and none for a dunder, so a
+    stand-in reads as a module without `__file__` or `__all__`, not as one
+    whose metadata is a mock."""
     if attr.startswith("__"):
         raise AttributeError(attr)
     return MagicMock()
@@ -76,8 +76,8 @@ else:
         )
     finally:
         sys.meta_path.remove(_finder)
-        # Only the stand-ins go: an aiter imported for real before stays
-        # whole, and none of its packages keeps a stand-in bound.
+        # Only the stand-ins go: an `aiter` module already in `sys.modules`
+        # stays, and keeps none of them bound.
         for _name in [
             n for n in set(sys.modules) - _before if n.split(".")[0] == "aiter"
         ]:
