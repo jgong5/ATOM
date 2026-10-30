@@ -64,7 +64,9 @@ as many rows as the point's tokens, a table a leaf gathers by token ids
 (`GATHERED`) as many rows as its ids, the other tensors of each module it names,
 of one whose first dimension is the pool's blocks the batch's blocks, and, for
 a leaf that names a context key, the KV and
-per-request state its layer holds for the batch. One graph runs the leaf K
+per-request state its layer holds for the batch, a state slot a row, but at a
+decode its recurrent state (`SNAPSHOTS`) at each slot a row holds, which under
+a drafter is one a token. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
 kernels of one eager call of copy 0, the fewer, at least one, cycling over its
 copies: N built ones: M, the least count whose bytes pass `COLD` times the
@@ -185,7 +187,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 18
+PROTOCOL = 19
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -289,6 +291,12 @@ NM_OUTPUT = (_NM, "output")
 #: for the device, which the capture answers 0 (`capture.forward._patches`),
 #: so a graph holds one byte. A point records the bytes it launched.
 TOPK_WORKSPACE = ("aiter._top_k_per_row_decode.default", "workspace")
+#: The field of a per-request state layer of ATOM's KV registry that a decode
+#: row's leaf reads and writes at every state slot the row holds: GDN's and
+#: KDA's recurrent state, which their spec-decode kernel takes with each row's
+#: slots and writes once a token, 1 + K under a drafter of K drafts without
+#: ReplaySSM. Their conv state (`k_cache`) takes the row's first slot alone.
+SNAPSHOTS = "v_cache"
 #: The seed of a copy's drawn expert ids, with the copy's index.
 SEED = 0
 #: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
@@ -755,7 +763,9 @@ class Stub:
         room = [pool // blocks]
         room += [t.k_cache.shape[0] // taken for t in kv.values() if _stateful(t)]
         plans = {
-            s: self._plan(op, i, kv, blocks, len(rows), shape.tokens, s)
+            s: self._plan(
+                op, i, kv, blocks, len(rows), shape.tokens, s, shape.phase == "decode"
+            )
             for s, (op, i) in found.items()
         }
         need = max(p for _, _, p, _ in plans.values())
@@ -816,11 +826,14 @@ class Stub:
         self.placed = []
         return got
 
-    def _plan(self, op, instances, kv, blocks, rows, tokens=None, sig=None):
+    def _plan(
+        self, op, instances, kv, blocks, rows, tokens=None, sig=None, decode=False
+    ):
         """A leaf's copies, its bytes per call, the placements its context
         keys and KV arguments take, and its KV arguments' bytes per call read
         by blocks and by state slots; `tokens` defaults to `rows`, a
-        decode's."""
+        decode's; at a `decode`, a context key's recurrent state counts each
+        state slot a row holds."""
         need, size, shared = 1, 0, [0, 0]
         table, ids = GATHERED.get(op["op"], (None, None))
         for slot, s in _specs(op["args"]):
@@ -860,7 +873,11 @@ class Stub:
                 held = kv.get(f"layer_{module.layer_num}")
                 unit = rows if _stateful(held) else blocks
                 # ponytail: a tensor's first dim is its blocks or its state slots
-                size += sum(t.nbytes // t.shape[0] * unit for t in _fields(held))
+                for name, t in _fields(held):
+                    at = unit
+                    if name == SNAPSHOTS and decode and _stateful(held):
+                        at *= self.per_row  # each slot a row holds
+                    size += t.nbytes // t.shape[0] * at
                 need = None
             elif (module := self.modules.get(key, module)) is not None:
                 pool = self.runner.config.num_kvcache_blocks
@@ -1689,9 +1706,9 @@ def _stateful(held) -> bool:
 
 
 def _fields(held):
-    for value in vars(held).values() if held is not None else ():
+    for name, value in vars(held).items() if held is not None else ():
         if torch.is_tensor(value) and value.dim():
-            yield value
+            yield name, value
 
 
 def keys(config, run: dict):
