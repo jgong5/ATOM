@@ -26,10 +26,13 @@ import contextlib
 import socket
 import threading
 
-from .service import _Connection, _refusal, _reply, _Server
+from .service import _Connection, _HereConnection, _refusal, _reply, _Server
 from .wire import JOINED, MalformedMessage, encode
 
 STREAM_SCHEME = "tcp"
+#: The servers this process runs, by the endpoint each bound and the one it was
+#: asked for.
+_SERVED: dict[str, "_StreamServer"] = {}
 #: A frame is a few hundred bytes. A length far above that is a peer that is not
 #: speaking this protocol, and is refused before anything is allocated for it.
 LARGEST_FRAME = 1 << 22
@@ -78,6 +81,8 @@ class _StreamServer:
 
     def close(self) -> None:
         """Stop listening, end every connection and stop serving."""
+        for name in [k for k, v in _SERVED.items() if v is self]:
+            del _SERVED[name]
         for sock in [self._listener, *self._open]:
             _end(sock)
         self._server.close()
@@ -196,7 +201,21 @@ class _StreamConnection(_Connection):
 
 def serve(authority, endpoint: str) -> _StreamServer:
     """Serve `authority` at ``tcp://host:port``."""
-    return _StreamServer(authority, *_address(endpoint))
+    host, port = _address(endpoint)
+    server = _StreamServer(authority, host, port)
+    _SERVED[server.endpoint] = server
+    if port:  # port 0 names no one server
+        _SERVED[endpoint] = server
+    return server
+
+
+def connect_here(lp, endpoint: str, member: str | None = None):
+    """`lp`'s connection, or its `member`'s, to the authority this process
+    serves at ``tcp://host:port``, with no socket (`service._HereConnection`)."""
+    server = _SERVED.get(endpoint)
+    if server is None:
+        raise KeyError(f"nothing is served at {endpoint} in this process")
+    return _HereConnection(server._server, lp, member)
 
 
 def connect(lp, endpoint: str, member: str | None = None) -> _StreamConnection:
