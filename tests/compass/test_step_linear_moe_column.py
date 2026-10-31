@@ -4,7 +4,8 @@ gathers (`moe_tokens`), not on every row its busiest rank pads the gather to:
 a pad row reaches no expert. A rung-only law fitted where every rank is full
 prices high a step at the same rung whose ranks are mostly idle. A law fitted
 with `moe_routing` lets each rung adopt one MoE column, the tokens `n` or the
-experts they reach `X`, by the rule a `rowmod` column is adopted by.
+experts they reach `X`: the form a record held out of the rest prices nearest,
+weighted by steps, unless it takes some record out of the rung's bar.
 
 Each rank's record is written from a known per-rank law with a MoE slope,
 every line labelled with the group's step, as in `test_step_linear_dp`.
@@ -26,9 +27,8 @@ from atom.compass.backends import (
     StepLinearLaw,
 )
 from atom.compass.backends.step_linear_fit import (
-    ROWMOD_CELL_STEPS,
+    _floor,
     _moe_column,
-    _solve,
     fit,
     label_records,
     main,
@@ -133,8 +133,10 @@ def test_a_rung_whose_cost_follows_the_experts_adopts_them(cells):
     assert vector["coefficients"] == pytest.approx(EXPERTS, rel=1e-6)
     assert list(StepLinearLaw(law).decode[RUNG].features) == list(EXPERTS)
     figures = vector["fit"]["moe_column"]
-    assert figures["adopted"] == "moe_experts"
-    assert figures["moe_experts"]["mad"] < figures["moe_tokens"]["mad"]
+    assert figures["adopted"] == figures["picked"] == "moe_experts"
+    error = {f: v["error"] for f, v in figures["held_out"].items()}
+    assert error["moe_experts"] < error["moe_tokens"] < error["none"]
+    assert error["moe_experts"] == pytest.approx(0.0, abs=1e-6)
 
 
 def test_a_rung_whose_cost_is_linear_in_the_tokens_adopts_them(tmp_path):
@@ -150,50 +152,120 @@ def test_a_rung_whose_cost_is_linear_in_the_tokens_adopts_them(tmp_path):
     assert backend.price(view).seconds == pytest.approx(_price(view, TOKENS))
 
 
-def test_a_rung_whose_cost_the_tokens_do_not_move_adopts_neither(tmp_path):
-    full, sparse = _cells(tmp_path, BASE, noise=0.02)
-    vector = _routed(full + sparse)[0]["decode"][str(RUNG)]
-    assert set(vector["coefficients"]) == set(BASE)
-    figures = vector["fit"]["moe_column"]
-    assert figures["adopted"] is None
-    assert set(figures) == {"adopted", "moe_tokens", "moe_experts"}
-
-
-def test_of_two_columns_that_qualify_the_rung_adopts_the_nearer_on_held_out_cells():
-    """Two cells whose cost is linear in the tokens over 30 to 150, and one at
-    12 to 19 tokens where it falls twice as steeply: the tokens fit the rung's
-    steps closer, the experts price the cell held out of the others closer."""
-    rng = np.random.default_rng(0)
+def _members(cells):
+    """A rung's `fit` rows over `cells`, each (steps, (low, high) tokens, price
+    of `n` tokens): its steps at tokens cycling over the span."""
     members = []
-    spans = ((30, 150), (30, 150), (12, 19))
-    for cell, (low, high), steps in zip(range(3), spans, (400, 400, 150)):
+    for cell, (steps, (low, high), price) in enumerate(cells):
         for step in range(steps):
-            n = int(rng.integers(low, high + 1))
-            seconds = 0.015 + 3e-5 * (n - 2 * max(0, 30 - n))
-            members.append((cell, "8", (1, 0, 0), seconds, step, (), n))
-    names = list(BASE)
+            n = low + step % (high - low + 1)
+            members.append((cell, "8", (1, 0, 0), price(n), step, (), n))
     x = np.array([m[2] for m in members], dtype=np.float64)
-    base = _solve(x, np.array([m[3] for m in members]), names)
-    figures = _moe_column(members, x, base, 0, names, (384, 6))[1]
-    columns = ("moe_tokens", "moe_experts")
-    worst = {
-        f: max(abs(w) for _, w in figures[f]["held_out_p50"].values()) for f in columns
-    }
-    assert figures["moe_tokens"]["mad"] < figures["moe_experts"]["mad"]
-    assert worst["moe_experts"] < worst["moe_tokens"]
-    assert figures["adopted"] == "moe_experts"
+    return members, x
 
 
-def test_a_rung_with_a_cell_of_too_few_steps_adopts_no_column(tmp_path):
-    """The cost follows the experts, but one cell holds fewer steps at the rung
-    than a held-out p50 needs: the rung adopts nothing and says why."""
-    full, sparse = _cells(tmp_path, EXPERTS, steps=(200, ROWMOD_CELL_STEPS - 1))
+def test_a_rung_whose_records_the_tokens_do_not_order_picks_no_column():
+    """Within each record the cost rises with the tokens, across the two it
+    does not: a column fitted on one record prices the other high."""
+    rising = lambda low: lambda n: 0.010 + 1e-7 * (n - low)
+    members, x = _members([(200, (10, 20), rising(10)), (200, (30, 40), rising(30))])
+    chosen, figures = _moe_column(members, x, list(BASE), (384, 6))
+    assert chosen is None
+    assert figures["picked"] == "none" and figures["adopted"] is None
+    error = {f: v["error"] for f, v in figures["held_out"].items()}
+    assert error["none"] < min(error["moe_tokens"], error["moe_experts"])
+
+
+def test_the_pick_weighs_each_held_out_record_by_its_steps():
+    """Two large records the tokens price exactly, and a small one at the
+    second's tokens that costs what the first does: the column misses the small
+    one by more than no column does, and is picked on the steps."""
+    line = lambda n: 0.010 + 5e-5 * n
+    members, x = _members(
+        [
+            (400, (10, 20), line),
+            (400, (30, 40), line),
+            (20, (30, 40), lambda n: line(n - 20)),
+        ]
+    )
+    figures = _moe_column(members, x, list(BASE), (384, 6))[1]
+    held = figures["held_out"]
+    for got in held.values():
+        folds = got["folds"].values()
+        weighted = sum(n * abs(p) for n, p in folds) / sum(n for n, _ in folds)
+        assert got["error"] == pytest.approx(weighted)
+    small = {f: abs(held[f]["folds"]["2"][1]) for f in held}
+    assert small["moe_tokens"] > small["none"]
+    assert figures["picked"] == figures["adopted"] == "moe_tokens"
+
+
+def test_a_column_that_takes_a_record_out_of_the_bar_is_not_adopted():
+    """The column prices the two large records far closer, but the small
+    record, held out, leaves a bar of 4% either way that no column kept it in."""
+    line = lambda n: 0.010 + 2e-5 * n
+    members, x = _members(
+        [
+            (1000, (10, 20), line),
+            (1000, (30, 40), line),
+            (50, (50, 60), lambda n: line(25)),
+        ]
+    )
+    reference = [-0.04, 0.04]
+    chosen, figures = _moe_column(members, x, list(BASE), (384, 6), reference)
+    held = figures["held_out"]
+    assert figures["picked"] != "none"
+    assert held[figures["picked"]]["error"] < held["none"]["error"]
+    assert figures["bar"] == reference
+    assert figures["left_bar"] == ["2"]
+    assert abs(held["none"]["folds"]["2"][1]) <= 0.04
+    assert chosen is None and figures["adopted"] is None
+
+
+def test_a_rung_with_a_record_of_few_steps_adopts_its_column(tmp_path):
+    """The cost follows the experts and one record holds 20 steps at the rung:
+    held out of the other, it is priced as closely, and the column holds."""
+    full, sparse = _cells(tmp_path, EXPERTS, steps=(200, 20))
     vector = _routed(full + sparse)[0]["decode"][str(RUNG)]
-    assert set(vector["coefficients"]) == set(BASE)
-    assert vector["fit"]["moe_column"] == {
-        "adopted": None,
-        "cell_steps": {"0": 200, "1": ROWMOD_CELL_STEPS - 1},
+    figures = vector["fit"]["moe_column"]
+    assert figures["adopted"] == "moe_experts"
+    assert {c: f[0] for c, f in figures["held_out"]["none"]["folds"].items()} == {
+        "0": 200,
+        "1": 20,
     }
+    assert vector["coefficients"] == pytest.approx(EXPERTS, rel=1e-6)
+
+
+def test_a_rung_of_one_record_has_no_held_out_error_and_adopts_none():
+    members, x = _members([(300, (10, 40), lambda n: 0.010 + 5e-5 * n)])
+    chosen, figures = _moe_column(members, x, list(BASE), (384, 6))
+    assert chosen is None and figures["picked"] is None
+    assert all(v == {"error": None, "folds": {}} for v in figures["held_out"].values())
+
+
+def test_the_floor_reads_each_records_steps_at_the_same_tokens():
+    """Each step priced at the median of its record's steps at its tokens: a
+    record's level is not mixed with another's, and a lone step is left out."""
+    rows = [(0, 5, 1.0), (0, 5, 2.0), (0, 5, 3.0), (1, 5, 30.0), (1, 5, 30.0)]
+    rows += [(0, 6, 9.0)]
+    members = [(c, "4", (1, 0, 0), y, i, (), n) for i, (c, n, y) in enumerate(rows)]
+    error = [1.0, 0.0, 2 / 3 - 1, 0.0, 0.0]
+    assert _floor(members) == pytest.approx(np.percentile(error, (10, 90)).tolist())
+
+
+@pytest.mark.parametrize("wide", [True, False])
+def test_the_bar_is_the_wider_of_the_reference_band_and_the_floor(cells, wide):
+    full, sparse = cells
+    samples = label_records(full + sparse, DP)[0]
+    band = 0.5 if wide else 1e-6
+    held = {"bands": {f"decode rung {RUNG}": {"p10": -band, "p50": 0.0, "p90": band}}}
+    reference = {"decode": {str(RUNG): {"held_out": held}}}
+    options = {"form": "base", "dp": DP, "moe_routing": ROUTING}
+    law = fit(samples, {**options, "reference": reference})[0]
+    figures = law["decode"][str(RUNG)]["fit"]["moe_column"]
+    assert figures["reference"] == [-band, band]
+    floor = figures["floor"]
+    assert floor[1] - floor[0] > 2e-6
+    assert figures["bar"] == ([-band, band] if wide else floor)
 
 
 def test_a_rung_law_fitted_on_full_ranks_prices_idle_ranks_high_and_the_routed_one_does_not(
@@ -296,14 +368,37 @@ def test_the_shared_form_refuses_moe_routing(cells):
         fit(samples, options)
 
 
-def test_the_command_states_the_routing_it_fitted(tmp_path):
+def test_the_command_states_the_routing_it_fitted_and_the_reference_band(tmp_path):
     records = [str(_record(tmp_path / f"dp0-{s}.jsonl", _steps(s))) for s in (6, 7)]
+    band = {"p10": -0.03, "p50": 0.0, "p90": 0.02}
+    held = {"held_out": {"bands": {"decode rung 4": band}}}
+    reference = tmp_path / "reference.json"
+    reference.write_text(json.dumps({"decode": {"4": held}}))
     out = tmp_path / "law.json"
-    main([*records, "--out", str(out), *SPEC, "--moe-routing", "64,4"])
+    main(
+        [*records, "--out", str(out), *SPEC, "--moe-routing", "64,4"]
+        + [
+            "--reference",
+            str(reference),
+        ]
+    )
     law = json.loads(out.read_text())
     assert law["moe_routing"] == {"experts": 64, "top_k": 4}
-    assert all("moe_column" in law["decode"][k]["fit"] for k in ("2", "4"))
+    figures = {k: law["decode"][k]["fit"]["moe_column"] for k in ("2", "4")}
+    assert figures["4"]["reference"] == [-0.03, 0.02]
+    assert figures["2"]["reference"] is None
     StepLinearLaw(law)
+
+
+@pytest.mark.parametrize("value", ["64", "64,4,1", "4,64", "64,0", "64,x"])
+def test_the_command_refuses_a_routing_other_than_experts_and_top_k(
+    tmp_path, capsys, value
+):
+    out = tmp_path / "law.json"
+    with pytest.raises(SystemExit):
+        main(["dp0.jsonl", "--out", str(out), *SPEC, "--moe-routing", value])
+    assert "argument --moe-routing" in capsys.readouterr().err
+    assert not out.exists()
 
 
 def test_a_rung_whose_steps_all_reach_the_same_experts_adopts_no_column(tmp_path):

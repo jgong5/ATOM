@@ -3,7 +3,7 @@
 
 """The step linear law fitted from real step records.
 
-    python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K] [--engine FILE]
+    python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K [--reference LAW]] [--engine FILE]
 
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
@@ -92,8 +92,9 @@ an intercept per rung.
 With `moe_routing`, the model's routed experts and top-k (`--moe-routing E,K`),
 the law states `moe_routing` and, outside `shared`, a decode rung may adopt one
 MoE column (`StepLinearLaw`), `moe_tokens` or `moe_experts`, by the rule
-`_moe_column` states; the vector records under `fit.moe_column` the figures
-the rule read. An MTP record's draft law adopts none.
+`_moe_column` states, its bar read from the law `--reference LAW` names when
+given; the vector records under `fit.moe_column` the figures the rule read.
+An MTP record's draft law adopts none.
 
 Outside `shared`, a decode rung may adopt a `rowmod(k)` column (`StepLinearLaw`),
 read from its rows in scheduled order, by the rule `_rowmod` states; the
@@ -374,104 +375,97 @@ def _solve(x: np.ndarray, y: np.ndarray, names: list[str]) -> dict:
     }
 
 
-def _cells(members) -> np.ndarray | None:
-    """Each of a rung's `fit` rows' cell (its record), or None when the rung
-    fails the cell condition: two cells or more, each holding
-    `ROWMOD_CELL_STEPS` steps at the rung."""
-    cell = np.array([r[0] for r in members])
-    steps = np.unique(cell, return_counts=True)[1]
-    return cell if len(steps) >= 2 and steps.min() >= ROWMOD_CELL_STEPS else None
-
-
-def _held_out_p50(design, y, cell, names) -> list[float]:
-    """Per cell of `cell`, in order, the p50 error on its rows of the solve of
-    `design` on the other cells' rows."""
-    out = []
+def _folds(design, y, cell, names) -> dict:
+    """Per record of `cell` beside which another holds rows, (its rows, the p50
+    error on them of the solve of `design` on the other records' rows)."""
+    out = {}
     for c in sorted(set(cell.tolist())):
         other = cell != c
-        coef = _solve(design[other], y[other], names)["coef"]
-        out.append(float(np.median(design[~other] @ coef / y[~other] - 1.0)))
+        if other.any():
+            coef = _solve(design[other], y[other], names)["coef"]
+            error = design[~other] @ coef / y[~other] - 1.0
+            out[c] = (int((~other).sum()), float(np.median(error)))
     return out
 
 
-def _adopt(
-    x, y, cell, base: dict, names, candidates, held_out: bool = False
-) -> tuple[tuple | None, dict]:
-    """The candidate column a decode rung adopts, or None, and each candidate's
-    figures: its MAD and, when that clears the gain, its shuffled MAD and
-    held-out p50 errors.
-
-    `x` is the rung's design over `names`, `base` its solve, `cell` each row's
-    cell, which `_cells` passed. Each candidate is (choice, name, column,
-    shuffled), `shuffled` giving `ROWMOD_SHUFFLES` shuffles of the column. A
-    candidate qualifies when its solve cuts `base`'s scaled MAD by
-    `ROWMOD_GAIN`, the mean MAD of its shuffles does not, and no cell priced by
-    a solve on the others has a p50 error further from zero than without it.
-    The qualifying candidate of smallest MAD is adopted, or under `held_out`
-    the one whose largest held-out p50 error, in magnitude, is smallest:
-    returned as (choice, column, solve, evidence), its evidence the MAD
-    without the column, the shuffled MAD and per cell the p50 error without
-    and with it.
-    """
-    cells = sorted(set(cell.tolist()))
-    without = _held_out_p50(x, y, cell, names)
-    target = (1.0 - ROWMOD_GAIN) * base["mad"]
-    best, figures, score = None, {}, math.inf
-    for choice, name, column, shuffled in candidates:
-        design, wide = np.column_stack([x, column]), [*names, name]
-        solved = _solve(design, y, wide)
-        figures[choice] = {"mad": solved["mad"]}
-        if solved["mad"] >= target:
-            continue
-        mads = [_solve(np.column_stack([x, c]), y, wide)["mad"] for c in shuffled()]
-        shuffled_mad = float(np.mean(mads))
-        held = _held_out_p50(design, y, cell, wide)
-        evidence = {
-            "mad_without": base["mad"],
-            "shuffled_mad": shuffled_mad,
-            "held_out_p50": {str(c): [o, w] for c, o, w in zip(cells, without, held)},
-        }
-        figures[choice] = {"mad": solved["mad"], **evidence}
-        mine = max(map(abs, held)) if held_out else solved["mad"]
-        if (
-            shuffled_mad >= target
-            and all(abs(w) <= abs(o) for w, o in zip(held, without))
-            and mine < score
-        ):
-            best, score = (choice, column, solved, evidence), mine
-    return best, figures
+def _floor(members) -> list[float] | None:
+    """The dispersion floor of decode rung `members`, its `fit` rows: the p10
+    and p90 of `median / label - 1` over its steps, each priced at the median
+    label of its record's steps at the same real MoE tokens. A step alone at
+    its record's tokens has no spread to read and is left out."""
+    labels: dict[tuple, list[float]] = {}
+    for r in members:
+        labels.setdefault((r[0], r[6]), []).append(r[3])
+    error = [np.median(v) / y - 1.0 for v in labels.values() if len(v) > 1 for y in v]
+    return np.percentile(error, (10, 90)).tolist() if error else None
 
 
-def _moe_column(members, x, base: dict, seed: int, names, routing) -> tuple:
+def _reference_band(reference: dict | None, key: str) -> list[float] | None:
+    """The p10 and p90 of `reference`'s held-out band at decode rung `key`."""
+    vector = (reference or {}).get("decode", {}).get(key) or {}
+    band = vector.get("held_out", {}).get("bands", {}).get(_band(key, None))
+    return band and [band["p10"], band["p90"]]
+
+
+def _moe_column(members, x, names, routing, reference=None) -> tuple:
     """The MoE column decode rung `members` adopts, or None, and the figures the
     rule read, as the vector records them under `fit.moe_column`.
 
-    `members` are the rung's `fit` rows, `x` their design over `names`, `base`
-    its solve. The candidates are `MOE_COLUMNS` over each step's real MoE
-    tokens, `moe_experts` under `routing`. A candidate qualifies by the four
-    conditions a `rowmod` column does (`_rowmod`), its shuffles the tokens'
-    over the rung's steps, by `seed`; of those that qualify, the one whose
-    worst held-out cell's p50 error is nearest zero is adopted: returned as
-    (feature, column, solve, evidence). A rung failing the cell condition
-    records each cell's steps.
+    `members` are the rung's `fit` rows, `x` their design over `names`. The
+    forms are no column and each of `MOE_COLUMNS` over the steps' real MoE
+    tokens, `moe_experts` under `routing`. Each form is solved with each record
+    held out of the rung's rows, and its held-out error is the mean over the
+    records of the held-out p50 error's magnitude, weighted by the record's
+    steps. The form of smallest held-out error is picked, no column on a tie;
+    a picked column is adopted unless some record's held-out p50 lies inside
+    the rung's bar without it and outside with it. The bar is the wider, p90
+    less p10, of `reference`, the reference law's held-out p10 and p90 at the
+    rung, and the dispersion floor (`_floor`). Adopted, the column is returned
+    as (feature, column, solve). A rung of one record has no held-out error
+    and adopts none.
     """
-    cell = _cells(members)
-    if cell is None:
-        steps = np.unique([r[0] for r in members], return_counts=True)
-        cells = {str(c): int(n) for c, n in zip(*steps)}
-        return None, {"adopted": None, "cell_steps": cells}
+    cell = np.array([r[0] for r in members])
     y = np.array([r[3] for r in members])
-    tokens = [r[6] for r in members]
-    rng = np.random.default_rng(seed)
-    orders = [rng.permutation(len(members)) for _ in range(ROWMOD_SHUFFLES)]
-    candidates = []
+    forms = {"none": (x, names)}
     for feature in MOE_COLUMNS:
-        column = np.array([moe_column(feature, n, routing) for n in tokens])
-        candidates.append(
-            (feature, feature, column, lambda c=column: [c[o] for o in orders])
+        column = [moe_column(feature, r[6], routing) for r in members]
+        forms[feature] = (np.column_stack([x, column]), [*names, feature])
+    held, error = {}, {}
+    for form, (design, wide) in forms.items():
+        folds = _folds(design, y, cell, wide)
+        held[form] = folds
+        steps = sum(n for n, _ in folds.values())
+        error[form] = (
+            sum(n * abs(p) for n, p in folds.values()) / steps if steps else None
         )
-    best, figures = _adopt(x, y, cell, base, names, candidates, held_out=True)
-    return best, {"adopted": best and best[0], **figures}
+    floor = _floor(members)
+    bar = max(filter(None, (reference, floor)), key=lambda b: b[1] - b[0], default=None)
+    picked = min(error, key=error.get) if held["none"] else None
+    left = [
+        c
+        for c, (_, p) in held.get(picked, {}).items()
+        if bar and bar[0] <= held["none"][c][1] <= bar[1] and not bar[0] <= p <= bar[1]
+    ]
+    adopted = None if picked in (None, "none") or left else picked
+    figures = {
+        "picked": picked,
+        "adopted": adopted,
+        "bar": bar,
+        "reference": reference,
+        "floor": floor,
+        "left_bar": [str(c) for c in left],
+        "held_out": {
+            form: {
+                "error": error[form],
+                "folds": {str(c): list(f) for c, f in held[form].items()},
+            }
+            for form in forms
+        },
+    }
+    if adopted is None:
+        return None, figures
+    design, wide = forms[adopted]
+    return (adopted, design[:, -1], _solve(design, y, wide)), figures
 
 
 def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None:
@@ -488,28 +482,47 @@ def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None
     The qualifying `k` of smallest MAD is adopted: returned with its column,
     its solve and the evidence the law records.
     """
-    cell = _cells(members)
-    if cell is None:
+    cell = np.array([r[0] for r in members])
+    cells = sorted(set(cell.tolist()))
+    if len(cells) < 2 or min((cell == c).sum() for c in cells) < ROWMOD_CELL_STEPS:
         return None
     y = np.array([r[3] for r in members])
     rng = np.random.default_rng(seed)
     shuffles = [
         [rng.permutation(r[5]) for r in members] for _ in range(ROWMOD_SHUFFLES)
     ]
-    candidates = []
-    k = 2
+    wide = [*names, "rowmod"]
+
+    def mad(rows, k):
+        column = [rowmod(r, k) for r in rows]
+        return _solve(np.column_stack([x, column]), y, wide)["mad"]
+
+    def p50(design):
+        folds = _folds(design, y, cell, wide[: design.shape[1]])
+        return [p for _, p in folds.values()]
+
+    without, best, k = p50(x), None, 2
+    target = (1.0 - ROWMOD_GAIN) * base["mad"]
     while k <= rung:
         column = np.array([rowmod(r[5], k) for r in members], dtype=np.float64)
-        candidates.append(
-            (
-                k,
-                "rowmod",
-                column,
-                lambda k=k: [[rowmod(r, k) for r in rows] for rows in shuffles],
-            )
-        )
+        design = np.column_stack([x, column])
+        solved = _solve(design, y, wide)
+        if solved["mad"] < min(target, best[2]["mad"] if best else target):
+            shuffled_mad = float(np.mean([mad(s, k) for s in shuffles]))
+            held = p50(design)
+            if shuffled_mad >= target and all(
+                abs(w) <= abs(o) for w, o in zip(held, without)
+            ):
+                evidence = {
+                    "mad_without": base["mad"],
+                    "shuffled_mad": shuffled_mad,
+                    "held_out_p50": {
+                        str(c): [o, w] for c, o, w in zip(cells, without, held)
+                    },
+                }
+                best = (k, column, solved, evidence)
         k *= 2
-    return _adopt(x, y, cell, base, names, candidates)[0]
+    return best
 
 
 def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
@@ -637,15 +650,17 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     """The law over `samples`, as the mapping `StepLinearLaw` reads, and its report.
 
     `options` takes `form` (`base` by default), `dp`, the ranks each run
-    holds (1 by default), and `moe_routing`, the model's (routed experts,
+    holds (1 by default), `moe_routing`, the model's (routed experts,
     top-k), under which each decode rung but the draft law's may adopt a MoE
-    column; `seed` fixes the `rowmod` and MoE column shuffles; `draft`, or a
+    column, and `reference`, a law whose held-out bands bar that adoption
+    (`_moe_column`); `seed` fixes the `rowmod` shuffles; `draft`, or a
     sample with a draft label, adds `seqs` and `out` to the prefill vector.
     """
     from scipy.spatial import QhullError
 
     form, dp = _options(options)
     routing = _routing(options)
+    reference = (options or {}).get("reference")
     serial = _serial(samples, options)
     kvs = [s for s in samples if s.draft_kv_s is not None and not s.view.prefill]
     samples = [
@@ -712,10 +727,10 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         if key and key.isdigit():
             if routing:
                 chosen, figures = _moe_column(
-                    members, counts, solved, seed, names, routing
+                    members, counts, names, routing, _reference_band(reference, key)
                 )
                 if chosen:
-                    feature, column, solved, _ = chosen
+                    feature, column, solved = chosen
                     counts = np.column_stack([counts, column])
                     names = [*names, feature]
             chosen = _rowmod(members, counts, int(key), solved, seed, names)
@@ -1012,6 +1027,17 @@ def join_width(engine: dict) -> int:
     return engine["data_parallel_size"]
 
 
+def _routing_arg(value: str) -> tuple[int, int]:
+    """`--moe-routing`'s `E,K`: two positive integers, `K` at most `E`."""
+    try:
+        experts, top_k = map(int, value.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not E,K") from None
+    if not 0 < top_k <= experts:
+        raise argparse.ArgumentTypeError(f"{value!r} routes to {top_k} of {experts}")
+    return experts, top_k
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         prog="python -m atom.compass.backends.step_linear_fit",
@@ -1025,9 +1051,15 @@ def main(argv=None) -> None:
     parser.add_argument(
         "--moe-routing",
         metavar="E,K",
-        type=lambda v: tuple(int(x) for x in v.split(",")),
+        type=_routing_arg,
         help="the model's routed experts and top-k: each decode rung may adopt its "
         "steps' real MoE tokens, or the experts they reach, as a column",
+    )
+    parser.add_argument(
+        "--reference",
+        metavar="LAW",
+        help="a law whose held-out band at each decode rung, with the dispersion "
+        "floor, bars that rung's MoE column",
     )
     parser.add_argument(
         "--machine-spec",
@@ -1058,6 +1090,8 @@ def main(argv=None) -> None:
         engine = engine_config(args.records)
     dp = join_width(engine)
     options = {"form": args.form, "dp": dp, "moe_routing": args.moe_routing}
+    if args.reference:
+        options["reference"] = json.loads(Path(args.reference).read_text())
     samples, tables = label_records(args.records, dp)
     for record, table in tables.items():
         step_labels.write_table(record, table)
