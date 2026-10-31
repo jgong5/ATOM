@@ -8,6 +8,7 @@ As in `test_served_tokenizer`, a run file names the machine spec of
 the fast backend, and the calls are made on the clock owner's thread.
 """
 
+import inspect
 import json
 import random
 from types import SimpleNamespace
@@ -50,8 +51,15 @@ def _plain(tok, prompt):
 @pytest.fixture
 def served(monkeypatch):
     """A fast tokenizer and its segment tokenizer, past the prompts it checks
-    against the plain encoder, taking prompts of any length."""
+    against the plain encoder, taking prompts of any length. Pricing wraps
+    ATOM's own `_encode_cached` and is put back after: an earlier in-process
+    bootstrap leaves its wrapper."""
     monkeypatch.setattr(seg_mod, "_MIN_CACHED_CHARS", 0)
+    monkeypatch.setattr(
+        SegmentTokenizer,
+        "_encode_cached",
+        inspect.unwrap(SegmentTokenizer._encode_cached),
+    )
     rng = random.Random(0)
     backend = Tokenizer(models.BPE(unk_token="[UNK]"))
     backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
@@ -97,7 +105,7 @@ def rt(monkeypatch, tmp_path):
 
 def test_each_long_prompt_costs_one_encode_of_the_ids_it_encoded(served, rt):
     tok, seg = served
-    compass_run.tokenizer(tok, CONFIG, seg)
+    compass_run.tokenizer(tok, CONFIG)
     rate = TOKENIZER["encode_tokens_per_s"] * TOKENIZER["derate"]
     rng = random.Random(1)
     # Longer than the characters that bucket a stored prompt, so a later turn
@@ -119,8 +127,9 @@ def test_each_long_prompt_costs_one_encode_of_the_ids_it_encoded(served, rt):
 def test_with_no_run_file_the_segment_tokenizer_is_left_as_it_is(served, monkeypatch):
     tok, seg = served
     monkeypatch.delenv(compass_run.ENV, raising=False)
-    backend = seg._split.backend
-    compass_run.tokenizer(tok, CONFIG, seg)
-    assert seg._split.backend is backend and vars(tok).get("encode") is None
+    backend, encode = seg._split.backend, SegmentTokenizer._encode_cached
+    compass_run.tokenizer(tok, CONFIG)
     prompt = "<|begin|>" + _text(random.Random(2), 3000) + "<|User|>"
     assert seg.encode_with_prefix(prompt, 4).token_ids == _plain(tok, prompt)
+    assert SegmentTokenizer._encode_cached is encode
+    assert seg._split.backend is backend and "encode" not in vars(tok)

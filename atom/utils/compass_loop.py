@@ -361,7 +361,10 @@ class _ChargedBatches:
 
 def wrap_encode_batch(backend, entry):
     """`backend` with its ``encode_batch`` charged as `wrap_encode` charges one
-    ``encode`` that returned every id of the batch."""
+    ``encode`` that returned every id of the batch; a backend already charged
+    is returned as it is, so wrapping twice charges once."""
+    if isinstance(backend, _ChargedBatches):
+        return backend
     return _ChargedBatches(backend, entry)
 
 
