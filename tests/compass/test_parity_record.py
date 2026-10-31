@@ -891,9 +891,10 @@ def test_no_file_call_or_json_encoding_runs_between_two_forwards(tmp_path, monke
     assert calls == start + ["stamp", "stamp"] * 3 + end
     monkeypatch.undo()
     line = '"is_dummy_run": true, "produces_output": true, "batch": [], "named": []'
+    # A stamp is the count of calls up to it, the one at the start included.
     assert record.path.read_text() == "".join(
-        f'{{"step": {n}, "dp_rank": 0, {line}, "t_enter_ns": {2 * n + 4}, '
-        f'"t_exit_ns": {2 * n + 5}, "rows": [[1, 9, true]], "rung": null, '
+        f'{{"step": {n}, "dp_rank": 0, {line}, "t_enter_ns": {2 * n + 2}, '
+        f'"t_exit_ns": {2 * n + 3}, "rows": [[1, 9, true]], "rung": null, '
         '"d_busy_ns": 5}\n'
         for n in range(3)
     )
