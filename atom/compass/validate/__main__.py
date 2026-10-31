@@ -51,7 +51,7 @@ from atom.compass.backends.cost import GROUPS
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.step_linear_fit import TOKEN_BANDS, token_band
 from atom.compass.backends.step_roofline import StepFallbackBackend, StepRooflineBackend
-from atom.compass.memory.check import MemoryRefusal, parts
+from atom.compass.memory.check import MemoryRefusal, parts, spread
 from atom.compass.run import (
     CLIENT_DIR,
     ENGINE,
@@ -185,13 +185,8 @@ def _checked(where: str, hand_in: Path, real: Path, ranks: int, blocks=None, tp=
             yield at, t.name, value, str(t.verdict)
         for r in comparison.refused:
             yield at, r.name, r.what, "refused"
-    for t in compared[0].compared if len(compared) > 1 else ():
-        held = [
-            u.recorded.nbytes for c in compared for u in c.compared if u.name == t.name
-        ]
-        low, high = min(held), max(held)
-        value = f"{low:,} to {high:,} B, {high / low - 1:.2%} apart"
-        yield where, f"{t.name} across TP ranks", value, "-"
+    for name, value in spread(compared):
+        yield where, f"{name} across TP ranks", value, "-"
     if not isinstance(graph, str):
         graph = f"reserves() {graph.reserves_relative:+.2%}, predicts() {graph.predicts_relative:+.2%}"
     yield where, "graph pool", graph, "-"
