@@ -60,9 +60,7 @@ Beside `propose` it may hold a `short_propose` vector over `[1, seqs]` with a
 `below` entry, a token count: a prefill step of fewer tokens that produces
 output prices its `propose` pass by it instead. The pass replays one draft
 graph at any prefill length; what moves its window is whether the target's
-launch paced the device, which a batch shows only through its tokens. On the
-DeepSeek-V4.1-Flash DSpark TP4 records it ran p50 1.28 to 1.57 ms per record
-under 8192 prefill tokens and 0.43 to 0.44 ms from 8192 on.
+launch paced the device, which a batch shows only through its tokens.
 A draft law may also hold a `draft_kv` vector over `[1, seqs]`: on a decode
 step it adds the drafter's draft-KV pass, which runs before
 `forward_done_event`, so its terms are the target's. A draft law with
@@ -194,6 +192,12 @@ class StepLinearLaw:
         )
         short = law.get("short_propose")
         self.short_propose = short and _Vector("short_propose", PROPOSE, short)
+        if short and ("below" not in short or not self.propose):
+            lacks = "no below" if "below" not in short else "no propose vector"
+            raise ValueError(
+                "the short_propose vector prices a pass under its below token "
+                f"count, beside a propose vector; the law states {lacks}"
+            )
         self.below = short and int(short["below"])
         self.draft_kv = law.get("draft_kv") and _Vector(
             "draft_kv", PROPOSE, law["draft_kv"]

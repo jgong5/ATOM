@@ -153,6 +153,9 @@ ROWMOD_GAIN = 0.1
 ROWMOD_SHUFFLES = 8
 #: The fraction of the unsplit `propose` vector's mean log error a split must cut.
 PROPOSE_SPLIT_GAIN = 0.1
+#: Steps each side of a `propose` split holds at least, as a `rowmod` cell holds
+#: `ROWMOD_CELL_STEPS`: on fewer, scatter that follows no token count clears the gain.
+PROPOSE_SPLIT_STEPS = 100
 HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
 
@@ -712,7 +715,7 @@ def _proposes(samples) -> dict:
     `short_propose` over the rest, the count its `below`.
 
     The count runs over the powers of two up to the largest prefill, each side
-    holding more steps than `PROPOSE` has features and solved as `_propose`
+    holding at least `PROPOSE_SPLIT_STEPS` steps and solved as `_propose`
     solves. The split whose vectors price the steps at the smallest mean
     |log(price / label)| is adopted when that cuts the unsplit vector's by
     `PROPOSE_SPLIT_GAIN`; both errors go under `short_propose`'s `fit.split`.
@@ -732,7 +735,7 @@ def _proposes(samples) -> dict:
     best, target, k = {"propose": whole}, (1 - PROPOSE_SPLIT_GAIN) * without, 2
     while k <= tokens.max():
         short = tokens < k
-        if min(short.sum(), (~short).sum()) > len(PROPOSE):
+        if min(short.sum(), (~short).sum()) >= PROPOSE_SPLIT_STEPS:
             sides = [
                 [s for s, m in zip(samples, short) if m == w] for w in (True, False)
             ]
