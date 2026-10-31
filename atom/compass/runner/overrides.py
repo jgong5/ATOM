@@ -1481,9 +1481,10 @@ class NonAllocatingRunner(
         if record is not None and record.step == 1:
             # The record was just created, replacing an earlier run's; so is
             # the cost table, before anything this step does can stop the run.
-            record.path.with_suffix(".cost.jsonl").write_text(
-                json.dumps({"version": COST_TABLE_VERSION}) + "\n"
-            )
+            # It stays open for the run, as the record's own file does.
+            self._cost_table = record.path.with_suffix(".cost.jsonl").open("w")
+            self._cost_table.write(json.dumps({"version": COST_TABLE_VERSION}) + "\n")
+            self._cost_table.flush()
 
         stream = getattr(self, "_token_stream", None)
         if stream is None:
@@ -1575,7 +1576,7 @@ def _group_step_seconds(
     has one reason.
 
     On the rank that keeps the parity record, each step also appends its cost
-    line to `dp<r>.cost.jsonl` beside it: the record's `step`; with a
+    line, flushed, to `dp<r>.cost.jsonl` beside it: the record's `step`; with a
     `compass_host` that reports them, each of `HOST_SEGMENTS` and
     `MTP_SEGMENT` and `PP_RECV_SEGMENT`, the part of `W_launch` before a
     later stage's receive, in seconds, each 0.0 where the law has none, and `skipped`,
@@ -1586,7 +1587,7 @@ def _group_step_seconds(
     and its provenance's `method`, `validated` and `source`; and `refused`,
     the ``cost:`` reason or None. Above them, `forward` starts the file with
     `{"version": COST_TABLE_VERSION}` as the record starts, replacing an
-    earlier run's file.
+    earlier run's file, and keeps it open in `_cost_table` for the run.
     """
     from atom.compass.runner.projection import batch_view, dp_group, forward_mode
 
@@ -1694,8 +1695,8 @@ def _group_step_seconds(
         ],
         "refused": refused,
     }
-    with record.path.with_suffix(".cost.jsonl").open("a") as f:
-        f.write(json.dumps(line) + "\n")
+    runner._cost_table.write(json.dumps(line) + "\n")
+    runner._cost_table.flush()
     return group_s
 
 

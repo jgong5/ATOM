@@ -31,7 +31,8 @@ never waited on, so a line is finished once its exit event has completed. A
 real runner's lines are kept in memory and written at its `exit`, so no file
 call or JSON encoding runs between its forwards; a worker that never reaches
 `exit` (SIGKILL, a native crash) leaves an empty record. A simulated runner's line is
-written as its step is recorded. Under `kv` a line carries the lmcache offload loads
+written as its step is recorded, and flushed to the file the record keeps open
+from its start, so a killed simulated worker keeps every line. Under `kv` a line carries the lmcache offload loads
 and saves the scheduler handed the worker since the previous line
 (`StepRecord.note_kv`), where any were. `compare` reads two records and names, per DP rank,
 the first step where they part; timestamps are not part of a step's decision.
@@ -120,7 +121,10 @@ class StepRecord:
         name = f"pp{stage}.dp{dp_rank}" if stage else f"dp{dp_rank}"
         self.path = pathlib.Path(directory) / f"{name}.jsonl"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text("")
+        # Opened once, replacing any earlier file, and kept open: on a network
+        # file system an open and a close per simulated step took most of its
+        # wall time.
+        self.file = self.path.open("w")
         # Finished lines, not yet written. Built of tuples, not lists, so a
         # full collection untracks them: a million list-built lines held made
         # each full collection 0.8 s. ponytail: the whole record is held in
@@ -284,11 +288,11 @@ class StepRecord:
             self.pending.popleft()
 
     def write(self) -> None:
-        """Wait for every open window, then append the finished lines to the file."""
+        """Wait for every open window, then append the finished lines to the
+        file, flushed, so a worker killed after this keeps them."""
         self.flush(wait=True)
-        text = "".join(json.dumps(line) + "\n" for line in self.lines)
-        with self.path.open("a") as f:
-            f.write(text)
+        self.file.write("".join(json.dumps(line) + "\n" for line in self.lines))
+        self.file.flush()
         self.lines.clear()
 
 
