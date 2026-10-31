@@ -186,6 +186,50 @@ def test_a_duplicate_seq_is_refused_on_read(ctx):
             rx.pull()
 
 
+def test_holds_unstamped_is_asked_only_while_an_unstamped_frame_is_buffered(ctx):
+    """`holds_unstamped` reads every frame the LP's thread channels brought in
+    the run. An output thread taking stamped frames, which their release alone
+    decides, never asks it. The sender's unstamped stop, buffered beside the
+    unreleased frame 2, is asked about and held until frame 2 is handled."""
+    push, pull = _pair(ctx, "out", zmq.PUSH, zmq.PULL)
+    tx_rt = _rt(ENGINE)[0]
+    tx = _relayed(tx_rt, push, OUT, (10.1, 1), (10.05, 0), (10.3, 2))
+    releases = (10.2, {OUT: [(0, 10.05), (1, 10.1)]}), (10.4, {OUT: [(2, 10.3)]})
+    rt, call = _rt(FRONTEND, *releases)
+    asked = []
+
+    def holds_unstamped(real=rt.holds_unstamped):
+        asked.append(real())
+        return asked[-1]
+
+    rt.holds_unstamped = holds_unstamped
+    rx = WrappedSocket(rt, pull, OUT)
+    seen = []
+
+    def output_thread():
+        poller = WrappedPoller(rt, [rx])
+        while b"stop" not in seen:
+            poller.poll()
+            seen.append(rx.recv())
+
+    thread = threading.Thread(target=output_thread, daemon=True)
+    thread.start()
+    tx.send(b"p1")
+    tx.send(b"p0")
+    call(rt.advance_to, 10.2)
+    assert seen == [b"p0", b"p1"] and asked == []
+    tx.send(b"p2")
+    tx_rt.end_run()
+    tx.send(b"stop")
+    deadline = time.monotonic() + 5
+    while True not in asked:
+        assert time.monotonic() < deadline, "the stop was never held"
+        time.sleep(0.01)
+    call(rt.advance_to, 10.4)
+    thread.join(5)
+    assert seen == [b"p0", b"p1", b"p2", b"stop"] and not thread.is_alive()
+
+
 KV = "engine-D->engine-P:kv_write_req"
 
 
