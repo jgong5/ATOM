@@ -244,6 +244,15 @@ def _write_request(seq):
     return {"request_id": "decode-1", "transfer_id": seq.id}
 
 
+def _refused(rank, request) -> bool:
+    """Whether a send worker answers `request` with a failure and writes nothing."""
+    calls = []
+    rank._execute_transfer = lambda _request: calls.append("wrote")
+    rank._notify_transfer_result = lambda _request, success: calls.append(success)
+    rank._serve_write(request)
+    return calls == [False]
+
+
 def test_mooncake_reports_an_abort_before_any_write_request_at_once():
     rank = _producer_rank()
     sched, seq = _parked(_mooncake(), rank)
@@ -254,28 +263,34 @@ def test_mooncake_reports_an_abort_before_any_write_request_at_once():
     assert sched.deferred_free_blocks == {}
     assert sched.is_finished()
     assert not seq.block_table
-    assert rank._take_write(_write_request(seq)) is False, "its blocks are free"
+    assert _refused(rank, _write_request(seq)), "its blocks are free"
 
 
 @pytest.mark.parametrize("wrote", [True, False], ids=["written", "failed"])
 def test_mooncake_reports_an_abort_mid_write_once_the_write_ends(wrote):
     rank = _producer_rank()
     sched, seq = _parked(_mooncake(), rank)
-    request = _write_request(seq)
-    assert rank._take_write(request), "the listener took it before the abort"
-
-    assert sched.abort_request(seq.id) is True
-    _poll(sched, rank)
-    assert seq.id in sched.deferred_free_blocks, "freed under a running write"
-    assert rank._take_write(dict(request, request_id="decode-2")) is False
+    started, finish = threading.Event(), threading.Event()
 
     def write(_request):
+        started.set()
+        finish.wait(5)
         if wrote:  # what a served write does on its way out
             rank.done_sending.add(seq.id)
             rank._completed_prefills.pop(seq.id)
 
     rank._execute_transfer = write
-    rank._serve_write(request)
+    worker = threading.Thread(target=rank._serve_write, args=(_write_request(seq),))
+    worker.start()
+    assert started.wait(5), "a send worker took it before the abort"
+
+    assert sched.abort_request(seq.id) is True
+    _poll(sched, rank)
+    assert seq.id in sched.deferred_free_blocks, "freed under a running write"
+    assert _refused(rank, dict(_write_request(seq), request_id="decode-2"))
+
+    finish.set()
+    worker.join(5)
     output = rank.get_finished()
     assert output.finished_sending == {seq.id}, "once, written or not"
     sched._update_from_kv_xfer_finished(output)

@@ -2011,10 +2011,7 @@ class MooncakeConnector(KVConnectorBase):
                                 logger.exception(
                                     "[PRODUCER] adopting a landing partition failed"
                                 )
-                        if self._take_write(request_data):
-                            self._send_executor.submit(self._serve_write, request_data)
-                        else:
-                            self._notify_transfer_result(request_data, success=False)
+                        self._send_executor.submit(self._serve_write, request_data)
 
                     elif msg_type == MSG_LANDING_CREDIT:
                         try:
@@ -2067,26 +2064,23 @@ class MooncakeConnector(KVConnectorBase):
                 request_data["request_id"],
             )
 
-    def _take_write(self, request_data: dict) -> bool:
-        """Count a write request in flight, or refuse one for an aborted request."""
+    def _serve_write(self, request_data: dict) -> None:
+        """Serve a write request on a send worker, unless its request was
+        aborted; the last one in flight for an aborted request reports its send."""
         transfer_id = request_data.get("transfer_id", request_data["request_id"])
         with self._completion_lock:
-            if transfer_id in self._aborted_transfers:
-                logger.warning(
-                    "[PRODUCER] refusing a write request for transfer_id=%s: its "
-                    "request was aborted and its blocks may be another's now",
-                    transfer_id,
-                )
-                return False
-            self._writes_in_flight[transfer_id] = (
-                self._writes_in_flight.get(transfer_id, 0) + 1
+            aborted = transfer_id in self._aborted_transfers
+            if not aborted:
+                in_flight = self._writes_in_flight.get(transfer_id, 0)
+                self._writes_in_flight[transfer_id] = in_flight + 1
+        if aborted:
+            logger.warning(
+                "[PRODUCER] refusing a write request for transfer_id=%s: its "
+                "request was aborted and its blocks may be another's now",
+                transfer_id,
             )
-        return True
-
-    def _serve_write(self, request_data: dict) -> None:
-        """Serve a taken write request; the last one in flight for an aborted
-        request reports its send."""
-        transfer_id = request_data.get("transfer_id", request_data["request_id"])
+            self._notify_transfer_result(request_data, success=False)
+            return
         try:
             self._execute_transfer(request_data)
         finally:
