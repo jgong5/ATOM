@@ -2338,6 +2338,48 @@ def test_a_top_k_leaf_whose_size_query_raises_refuses_and_its_point_is_timed(
     assert "refused" not in gemm and gemm["cold_ns"] == 1.0
 
 
+@pytest.mark.parametrize(
+    "rows, stride, buffer, copies",
+    [(2, 65536, 1 << 16, 256), (32, 98304, 1 << 20, 43), (128, 262144, 4 << 20, 4)],
+)
+def test_a_multi_block_top_k_leaf_counts_aiter_s_one_buffer_once(
+    monkeypatch, rows, stride, buffer, copies
+):
+    # Every copy launches aiter's one cached multi-block buffer, sized as aiter
+    # sizes it at 11 bits a pass (a 768-byte counter and 3 passes of 2048
+    # 4-byte buckets a row, 256-byte aligned, plus 255) and rounded up to a
+    # power of two: no copy's own bytes, so the footprint holds it once.
+    from aiter.ops import topk
+
+    stream = SimpleNamespace(cuda_stream=0)
+    monkeypatch.setattr(topk, "topk_use_mulblocks", lambda *q: True)
+    monkeypatch.setattr(topk, "topk_mb_workspace_size", lambda r, *q: 25344 * r + 255)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(topk, "persistent_alloc", lambda d: contextlib.nullcontext())
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda self, op, s, i, n: {"copies": n})
+    vector = _t([rows], "activation", [1], "torch.int32")
+    leaf = _leaf(
+        "aiter._top_k_per_row_prefill.default",
+        ("logits", _t([rows, stride], "activation", [stride, 1])),
+        *[(s, vector) for s in ("rowStarts", "rowEnds")],
+        ("indices", _t([rows, 512], "activation", [512, 1], "torch.int32")),
+        *[("numRows", rows), ("stride0", stride), ("k", 512)],
+        ("workspace", _t([1], "activation", [1], "torch.uint8")),
+    )
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    placed = SimpleNamespace(block_size=256, batch=lambda view, b, s: (b, s))
+    topk._get_topk_mb_workspace_keyed.cache_clear()
+
+    [record] = ops.Stub(_Runner(), 256 << 20).point(placed, prefill(6, 2), 2048, found)
+    topk._get_topk_mb_workspace_keyed.cache_clear()
+
+    # Each call's logits, row bounds and indices: copies past twice a 256 MiB
+    # cache, and the one buffer.
+    footprint = copies * 4 * rows * (stride + 2 + 512) + buffer
+    assert (record["copies"], record["footprint_bytes"]) == (copies, footprint)
+
+
 def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
     monkeypatch,
 ):

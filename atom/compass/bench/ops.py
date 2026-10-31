@@ -62,7 +62,9 @@ window and compress ratio, the plane rows the batch's blocks hold at that
 ratio, a RoPE table's (`TABLES`), a weight or a tensor of a module it names,
 as many rows as the point's tokens, a table a leaf gathers by token ids
 (`GATHERED`) as many rows as its ids, aiter's top-k scratch (`TOPK_WORKSPACE`)
-the bytes it launches with, the other tensors of each module it names,
+the bytes it launches with, but none of the multi-block path's one cached
+buffer, which every copy launches and the point's footprint counts once, the
+other tensors of each module it names,
 of one whose first dimension is the pool's blocks the batch's blocks, and, for
 a leaf that names a context key, the KV and
 per-request state its layer holds for the batch, a state slot a row, but at a
@@ -188,7 +190,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 21
+PROTOCOL = 22
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -601,7 +603,8 @@ class Stub:
         self.per_row = state_slots_per_request(runner.config)
         self.built, self.leaves, self.placed = {}, {}, []
         self.cold_copies, self.clones, self.kv, self.state = {}, {}, {}, set()
-        self.written, self.unplanned = {}, {}
+        # `once`: by leaf, the bytes of a buffer every copy launches
+        self.written, self.unplanned, self.once = {}, {}, {}
         self.modules = dict(runner.model.named_modules())
         self.contexts = runner.config.compilation_config.static_forward_context
         self.moe = sorted(
@@ -767,7 +770,7 @@ class Stub:
         taken = len(rows) * self.per_row  # the batch's state slots
         room = [pool // blocks]
         room += [t.k_cache.shape[0] // taken for t in kv.values() if _stateful(t)]
-        self.context, self.unplanned = _split(context)[0], {}
+        self.context, self.unplanned, self.once = _split(context)[0], {}, {}
         plans = {
             s: self._plan(
                 op, i, kv, blocks, len(rows), shape.tokens, s, shape.phase == "decode"
@@ -820,6 +823,7 @@ class Stub:
                     + min(built, self.cold_copies[sig]) * acts
                     + at * by_block
                     + min(at, wrap) * by_slot
+                    + self.once.get(sig, 0)
                 )
             except Exception as error:  # noqa: BLE001 - a refusal names what stopped it
                 record["refused"] = f"{type(error).__name__}: {error}"
@@ -873,7 +877,10 @@ class Stub:
                 shared[slotted] += nbytes
             if slot == "workspace" and op["op"] in TOPK_WORKSPACE:
                 try:  # not the byte captured; a query that raises refuses the leaf
-                    nbytes = self._workspace(op).nbytes
+                    scratch, cached = self._workspace(op)
+                    nbytes = scratch.nbytes
+                    if cached:  # no copy's own: one buffer, held once
+                        self.once[sig], nbytes = nbytes, 0
                 except Exception as error:  # noqa: BLE001 - raised at its copy
                     self.unplanned[sig] = error
             size += nbytes
@@ -1035,7 +1042,7 @@ class Stub:
             if path == "workspace" and op["op"] in TOPK_WORKSPACE:
                 if sig in self.unplanned:  # its size query raised at planning
                     raise self.unplanned[sig]
-                return self._workspace(op)
+                return self._workspace(op)[0]
             if _ref(value):
                 key, module = instance[path], "module" in value
                 held = (
@@ -1063,7 +1070,7 @@ class Stub:
         args = op["args"].items()
         return {s: build(s, v, like[0][s] if like else None) for s, v in args}, snap
 
-    def _workspace(self, op) -> torch.Tensor:
+    def _workspace(self, op) -> tuple[torch.Tensor, bool]:
         """`_topk_workspace` for the top-k leaf `op` at the point's context."""
         rows, stride, k = (
             ir.Affine(*v["affine"]).at(self.context) if isinstance(v, dict) else v
@@ -1602,21 +1609,21 @@ def _together() -> None:
     torch.distributed.all_reduce(flag, group=device)
 
 
-def _topk_workspace(name, rows, stride, k, stable, device) -> torch.Tensor:
+def _topk_workspace(name, rows, stride, k, stable, device) -> tuple[torch.Tensor, bool]:
     """The `workspace` aiter's top-k leaf `name` launches with on `device`
     for `rows` rows at row stride `stride` and `k`, as aiter's wrappers build
     it: on the multi-block path, which a prefill takes unless `stable` where
     the device's `topk_use_mulblocks` says so, aiter's cached buffer, zeroed
     once and reset by its kernel after each launch; on the one-block path,
-    fresh scratch."""
+    fresh scratch. With it, whether it is that cached buffer."""
     from aiter.ops import topk
 
     decode = TOPK_WORKSPACE[name]
     if not (decode or stable) and topk.topk_use_mulblocks(rows, stride):
         size = topk.topk_mb_workspace_size(rows, stride, k, False)
-        return topk.get_topk_mb_workspace(device, size)
+        return topk.get_topk_mb_workspace(device, size), True
     size = topk.topk_ob_workspace_size(rows, stride, k, decode)
-    return topk.get_topk_scratch_workspace(device, size)
+    return topk.get_topk_scratch_workspace(device, size), False
 
 
 def _span(shape, stride) -> int:
