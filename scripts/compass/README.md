@@ -1086,8 +1086,8 @@ and 5 at concurrency 16 alone, with these changes:
   rung with none is refused. The EP4 cell takes no first-turn record while
   [#2538](https://github.com/jgong5/ATOM/issues/2538) stands: under expert parallel
   that record faults, as some sampled-start records do, which are taken again. Its
-  law stops at the sampled records' widest rung, and the simulated run refuses each
-  step above it.
+  law stops at the widest rung the sampled records fit, and the simulated run
+  refuses each step above it.
 - Steps 4 and 5 take `--duration 3600`, with a calibration record between step 4's
   two real runs; step 5 adds `--acceptance-record $R/cell/c16/real1`. A step 5 at
   another duration than step 4's is graded as another workload, and refused.
