@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 """How a logical process (LP) reaches the Clock Authority.
 
-``serve(authority, endpoint)`` starts the authority's serve loop at an endpoint;
+``serve(authority, endpoint)`` serves the authority at an endpoint;
 ``connect(lp, endpoint, member=None)`` returns the LP's connection to it, or
 one member's when the LP is declared with members, whose whole surface is
 ``send((kind, t, log, t_daemon))``, ``recv() -> (G, released)`` and ``close()``. The endpoint is the only place a location appears, and its scheme
 picks the carrier: ``inproc:<name>`` serves in this process (`service`),
 ``tcp://<host>:<port>`` over a socket (`stream`). Both move the same encoded
-frames into one serve loop.
+frames into one serve side.
 
 This sits beside `atom.compass.clock` rather than inside it because it starts a
 thread and queues frames, and that package reaches nothing.

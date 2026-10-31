@@ -1,40 +1,46 @@
 # SPDX-License-Identifier: MIT
-"""The Clock Authority's serve loop, and the in-process carrier to it.
+"""The Clock Authority's serve side, and the in-process carrier to it.
 
-`serve` starts one thread that takes ``(address, request)`` off a single queue,
-in arrival order, and passes it to `ClockAuthority.on_request`. An address is
-an LP, or ``(lp, member)`` for a member of an LP declared with members; each
-member binds its own connection. Each reply that call returns goes to its
-address's own reply slot, whether or not it is waiting on it. A grant only ever
-goes to an LP waiting in TAR or NER; the finish at the end of a run comes when
-every LP waits, and answers each one's request with ``+inf``. A requester whose reply is held gets nothing until a later request
-makes it due, and nothing times it out. A bind is answered with what the LP
-starts from (`ClockAuthority.on_bind`).
+`serve` makes one serve side per endpoint. Each request is served on the
+thread that brings it, the requester's own in-process or a socket carrier's
+reader, under one lock, so requests reach `ClockAuthority.on_request` one at a
+time, in the order they take the lock. An address is an LP, or
+``(lp, member)`` for a member of an LP declared with members; each member binds
+its own connection. Each reply that call returns goes to its address's own
+reply slot, whether or not it is waiting on it, from the thread that served
+the request: no other thread carries a request in or a reply out. A grant only
+ever goes to an LP waiting in TAR or NER; the finish at the end of a run comes
+when every LP waits, and answers each one's request with ``+inf``. A requester
+whose reply is held gets nothing until a later request makes it due, and
+nothing times it out. A bind is answered with what the LP starts from
+(`ClockAuthority.on_bind`).
 
 The end of a client run before the last answers the client with ``+inf``: it
 has resigned, so its address is unbound, its connection may end without ending
 the run, and the next client binds the same LP.
 
 A `KeyError` or `ValueError` from the authority refuses the request: the
-requester's `recv` raises it as the same type, and the loop goes on serving. A
-`ClockAbort`, such as `BackdatedEvent`, ends the run: its refusal goes to every
-bound address's slot, waiting or not, and answers every later request. Any other
-exception from the authority, or while framing a reply, ends the run the same
-way, as a `ClockAbort` that names it; its table is empty when the LP table
-cannot be read or framed. So does the end of a bound socket connection, as a
-`ClockAbort` naming its address: no finish can come without it. A resigned
+requester's `recv` raises it as the same type, and the server goes on serving.
+A `ClockAbort`, such as `BackdatedEvent`, ends the run: its refusal goes to
+every bound address's slot, waiting or not, and answers every later request.
+Any other exception from the authority, or while framing a reply, ends the run
+the same way, as a `ClockAbort` that names it; its table is empty when the LP
+table cannot be read or framed. So does the end of a bound socket connection,
+as a `ClockAbort` naming its address: no finish can come without it. A resigned
 client's connection is no longer bound, and its end ends nothing.
 
-Frames and closes reach the loop: a carrier hands the serve side encoded frames
-and the serve side decodes them onto the queue, so the in-process carrier here
-moves the same bytes a socket would; a socket's end reaches it as a ``None``
-request. An LP waits for its reply on its own slot and under no lock shared with
-another connection, so one parked LP holds up no other.
+Frames and closes reach the serve side as bytes: a carrier hands it encoded
+frames and it decodes them, so the in-process carrier here moves the same bytes
+a socket would; a socket's end reaches it as a ``None`` request. An LP waits for
+its reply on its own slot and under no lock shared with another connection, so
+one parked LP holds up no other.
 
 Once every LP has sent a request, a wait of `diag_s` wall seconds with none
-arriving is a stall the authority cannot see: the loop logs the LP table once,
-counts it in the authority's `diagnostics` and keeps waiting. It logs again only
-after a request arrives and a new stall begins, never after the run has ended.
+arriving is a stall the authority cannot see: a watch thread logs the LP table
+once, counts it in the authority's `diagnostics` and keeps waiting. It logs
+again only after a request arrives and a new stall begins, never after the run
+has ended. It looks every quarter of `diag_s`, so a stall is logged between
+`diag_s` and a quarter more after the last request.
 """
 
 import logging
@@ -61,6 +67,9 @@ logger = logging.getLogger("atom")
 IN_PROCESS_SCHEME = "inproc"
 DEFAULT_ENDPOINT = f"{IN_PROCESS_SCHEME}:clock"
 
+#: How many times a `diag_s` the watch thread looks for a request served.
+_LOOKS = 4
+
 #: The authorities served in this process, by endpoint.
 _SERVED: dict[str, "_Server"] = {}
 
@@ -74,16 +83,24 @@ class _Server:
         self._diag_s = diag_s
         self._lps = [row.lp for row in authority.lp_table()]
         self._slots = {}
-        self._requests = queue.Queue()
-        self._thread = threading.Thread(
-            target=self._loop, name=f"clock {endpoint}", daemon=True
+        # Reentrant: a socket carrier binds and sends the bind's reply under it.
+        self._lock = threading.RLock()
+        self._ended = None  # the refusal frame that ended the run, once one has
+        self._unasked = set(self._lps)  # LPs yet to send a request
+        self._quiet = True  # no stall diagnostic is due
+        self._served = 0  # requests and closes served, for the watch
+        self._closed_at = threading.Event()
+        self._watch = threading.Thread(
+            target=self._watching, name=f"clock {endpoint}", daemon=True
         )
-        self._thread.start()
+        self._watch.start()
 
-    def bind(self, frame: bytes) -> tuple:
+    def bind(self, frame: bytes, slot=None) -> tuple:
         """Bind a connection to the LP, or LP and member, its first frame names:
         that addressee, its reply slot and what it starts from. A member's name
-        is checked by the authority at its first request."""
+        is checked by the authority at its first request. The slot is `slot`,
+        anything with a `put` of a frame, or a new queue the LP takes its
+        replies from."""
         kind, *rest = decode(frame)
         if kind != BIND:
             raise MalformedMessage(
@@ -91,71 +108,66 @@ class _Server:
             )
         lp, *member = rest
         address = (lp, *member) if member else lp
-        slot = queue.Queue()
-        if lp not in self._lps or self._slots.setdefault(address, slot) is not slot:
-            state, why = "not a participant", ""
-            if lp in self._lps:
-                state = "already bound"
-                why = (
-                    "two servers claim one deployment's LP; under xPyD each names "
-                    "its own compass_instance, below the run file's "
-                    "prefill_instances or decode_instances; "
+        slot = queue.Queue() if slot is None else slot
+        with self._lock:
+            taken = self._slots.setdefault(address, slot) is not slot
+            if lp not in self._lps or taken:
+                state, why = "not a participant", ""
+                if lp in self._lps:
+                    state = "already bound"
+                    why = (
+                        "two servers claim one deployment's LP; under xPyD each "
+                        "names its own compass_instance, below the run file's "
+                        "prefill_instances or decode_instances; "
+                    )
+                raise KeyError(
+                    f"{' member '.join(map(str, rest))} is {state} at "
+                    f"{self.endpoint}; {why}participants: "
+                    + ", ".join(map(str, self._lps))
                 )
-            raise KeyError(
-                f"{' member '.join(map(str, rest))} is {state} at {self.endpoint}; "
-                f"{why}participants: " + ", ".join(map(str, self._lps))
-            )
-        return address, slot, self._authority.on_bind(lp)
+            return address, slot, self._authority.on_bind(lp)
 
     def submit(self, address, frame: bytes) -> None:
-        """Queue one request frame from the connection bound to `address`."""
+        """Serve one request frame from the connection bound to `address`."""
         message = decode(frame)
         if message[0] not in REQUESTS:
             raise MalformedMessage(
                 f"{address} sent {message[0]}; a bound connection sends only "
                 + ", ".join(REQUESTS)
             )
-        self._requests.put((address, message, None))
+        self._serve(address, message, None)
 
     def _closed(self, address, slot) -> None:
         """The connection bound to `address`, replying through `slot`, closed."""
-        self._requests.put((address, None, slot))
+        self._serve(address, None, slot)
 
     def close(self) -> None:
-        """Stop the loop and give up the endpoint."""
+        """Stop serving and give up the endpoint."""
         if _SERVED.get(self.endpoint) is self:
             del _SERVED[self.endpoint]
-        self._requests.put(None)
-        self._thread.join()
+        self._closed_at.set()
+        self._watch.join()
 
-    def _loop(self) -> None:
-        ended = None  # the refusal frame that ended the run, once one has
-        unasked = set(self._lps)  # LPs yet to send a request
-        quiet = True  # no stall diagnostic is due
-        while True:
-            try:
-                item = self._requests.get(timeout=self._diag_s)
-            except queue.Empty:
-                if not quiet and ended is None and self._authority.final_clocks is None:
-                    self._stalled()
-                quiet = True
-                continue
-            if item is None:
-                return
-            address, request, slot = item
-            lp, member = address if isinstance(address, tuple) else (address, None)
-            unasked.discard(lp)
-            quiet = bool(unasked)
-            replies, resigned = [(address, ended)], []
+    def _serve(self, address, request, slot) -> None:
+        """Serve one request, or the close of the connection replying through
+        `slot` when `request` is None, and put each reply in its slot."""
+        lp, member = address if isinstance(address, tuple) else (address, None)
+        with self._lock:
+            if self._closed_at.is_set():
+                return  # nothing is served once the endpoint is closed
+            self._served += 1
+            self._unasked.discard(lp)
+            self._quiet = bool(self._unasked)
+            replies, resigned = [(address, self._ended)], []
             if request is None:
                 replies = []
-                if ended is None and self._slots.get(address) is slot:
+                if self._ended is None and self._slots.get(address) is slot:
                     name = f"{lp} member {member}" if member else f"{lp}"
-                    ended = self._ending(
+                    self._ended = self._ending(
                         f"{name} closed its connection, so the run ends here"
                     )
-                    replies = [(i, ended) for i in list(self._slots)]
-            elif ended is None:
+                    replies = [(i, self._ended) for i in list(self._slots)]
+            elif self._ended is None:
                 kind, t, log, t_daemon = request
                 try:
                     try:
@@ -172,13 +184,30 @@ class _Server:
                         if any(len(reply) > 3 for reply in grants):
                             resigned = [i for i, g, *_ in grants if g == math.inf]
                 except Exception as fault:  # noqa: BLE001 - ends the run, named
-                    ended = self._ending(fault)
-                    # A copy: a carrier thread may bind a new slot meanwhile.
-                    replies = [(i, ended) for i in list(self._slots)]
+                    self._ended = self._ending(fault)
+                    replies = [(i, self._ended) for i in list(self._slots)]
             for i, frame in replies:
                 self._slots[i].put(frame)
             for i in resigned:
                 del self._slots[i]
+
+    def _watching(self) -> None:
+        """Log a stall once no request has been served for `diag_s`."""
+        idle = 0  # looks in a row that saw no request served
+        seen = self._served
+        while not self._closed_at.wait(self._diag_s / _LOOKS):
+            with self._lock:
+                idle = idle + 1 if self._served == seen else 0
+                seen = self._served
+                if idle < _LOOKS:
+                    continue
+                if (
+                    not self._quiet
+                    and self._ended is None
+                    and self._authority.final_clocks is None
+                ):
+                    self._stalled()
+                self._quiet = True
 
     def _stalled(self) -> None:
         """Log the LP table for a stall, once; reading it never ends the run."""
