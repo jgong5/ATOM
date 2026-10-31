@@ -14,6 +14,7 @@ same predicate, so claiming at alloc would pin every running request.
 
 from __future__ import annotations
 
+import queue
 import threading
 from collections import deque
 from types import SimpleNamespace
@@ -49,6 +50,7 @@ with stubbed_aiter():
     from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import (
         MooncakeConnector,
     )
+    from atom.model_engine.engine_core import EngineCore
 
 
 def _build(cls, is_producer, **extra):
@@ -205,39 +207,69 @@ def _producer_rank():
     return rank
 
 
-def _parked(half, rank):
-    """A request the router sends on, prefilled and finished on a real
-    scheduler with Mooncake's scheduler half; its save metadata reached `rank`."""
-    sched = Scheduler(MockConfig())
-    sched.kv_connector = half
+class _Workers:
+    """The engine's workers: one Mooncake producer rank, which takes the
+    metadata the engine dispatches and reports back at each poll, and a
+    forward that samples token 7."""
+
+    def __init__(self, rank):
+        self.rank = rank
+        self.reported: list[set] = []  # each poll's finished_sending
+
+    def call_func(self, name, *args, wait_out=False):
+        if name == "process_kvconnector_output":
+            return self.rank.start_load_kv(*args)
+        assert name == "forward", name
+        (batch,) = args
+        return ScheduledBatchOutput(
+            req_ids=list(batch.req_ids),
+            token_ids=[(7,)] * len(batch.req_ids),
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+        )
+
+    def call_func_with_aggregation(self, name):
+        assert name == "async_proc_aggregation", name
+        output = self.rank.get_finished()
+        self.reported.append(set(output.finished_sending))
+        return output
+
+
+def _engine(rank):
+    """A prefill engine: a real scheduler with Mooncake's scheduler half,
+    over `rank`."""
+    core = EngineCore.__new__(EngineCore)
+    core.label = "prefill"
+    core.scheduler = Scheduler(MockConfig())
+    core.scheduler.kv_connector = _mooncake()
+    core.kv_transfer_enabled = True
+    core.runner_mgr = _Workers(rank)
+    core.output_queue = queue.Queue()
+    core.stream_output_queue = queue.Queue()
+    return core
+
+
+def _step(core):
+    """One engine step, its idle drain due."""
+    core._next_idle_kv_drain = 0.0
+    core._process_engine_step_inner()
+
+
+def _parked(core):
+    """A request the router sends on, prefilled and finished by one engine
+    step, and its rank's last."""
     seq = Sequence(
         [1, 2, 3, 4],
         4,
         sampling_params=SamplingParams(max_tokens=1),
         kv_transfer_params={"do_remote_decode": True},
     )
-    sched.add(seq)
-    batch, seqs = sched.schedule()
-    rank.start_load_kv(batch.connector_meta_output)
-    sched.postprocess(
-        list(seqs.values()),
-        ScheduledBatchOutput(
-            req_ids=[seq.id],
-            token_ids=[(7,)],
-            num_rejected=None,
-            num_bonus=None,
-            draft_token_ids=None,
-        ),
-        batch=batch,
-    )
-    assert seq.id in sched.deferred_free_blocks
-    return sched, seq
-
-
-def _poll(sched, rank):
-    """One engine step's metadata to the rank, and the rank's report back."""
-    rank.start_load_kv(sched.kv_connector.build_connector_meta())
-    sched._update_from_kv_xfer_finished(rank.get_finished())
+    core.scheduler.add(seq)
+    _step(core)
+    assert seq.id in core.scheduler.deferred_free_blocks
+    assert seq.id in core.runner_mgr.rank._completed_prefills
+    return seq
 
 
 def _write_request(seq):
@@ -254,11 +286,15 @@ def _refused(rank, request) -> bool:
 
 
 def test_mooncake_reports_an_abort_before_any_write_request_at_once():
+    """On an idle prefill: with nothing else to schedule, the abort still
+    reaches the rank, in the metadata of the next step."""
     rank = _producer_rank()
-    sched, seq = _parked(_mooncake(), rank)
+    core = _engine(rank)
+    seq = _parked(core)
+    sched = core.scheduler
 
     assert sched.abort_request(seq.id) is True
-    _poll(sched, rank)
+    _step(core)
 
     assert sched.deferred_free_blocks == {}
     assert sched.is_finished()
@@ -269,7 +305,9 @@ def test_mooncake_reports_an_abort_before_any_write_request_at_once():
 @pytest.mark.parametrize("wrote", [True, False], ids=["written", "failed"])
 def test_mooncake_reports_an_abort_mid_write_once_the_write_ends(wrote):
     rank = _producer_rank()
-    sched, seq = _parked(_mooncake(), rank)
+    core = _engine(rank)
+    seq = _parked(core)
+    sched = core.scheduler
     started, finish = threading.Event(), threading.Event()
 
     def write(_request):
@@ -285,18 +323,18 @@ def test_mooncake_reports_an_abort_mid_write_once_the_write_ends(wrote):
     assert started.wait(5), "a send worker took it before the abort"
 
     assert sched.abort_request(seq.id) is True
-    _poll(sched, rank)
+    _step(core)
     assert seq.id in sched.deferred_free_blocks, "freed under a running write"
     assert _refused(rank, dict(_write_request(seq), request_id="decode-2"))
 
     finish.set()
     worker.join(5)
-    output = rank.get_finished()
-    assert output.finished_sending == {seq.id}, "once, written or not"
-    sched._update_from_kv_xfer_finished(output)
+    _step(core)
 
     assert sched.deferred_free_blocks == {}
     assert sched.is_finished()
+    reports = [seq.id in sent for sent in core.runner_mgr.reported]
+    assert reports.count(True) == 1, "once, written or not"
 
 
 @pytest.mark.parametrize(

@@ -2403,6 +2403,7 @@ class TestPostprocess:
             should_defer_free=lambda s: str(s.id) in pending_send,
             send_finished=lambda rid: pending_send.discard(str(rid)),
             abort_send=aborted.append,
+            build_connector_meta=lambda: "metadata",
         )
 
     def test_an_abort_after_finish_hands_the_parked_send_to_the_connector(
@@ -2432,6 +2433,24 @@ class TestPostprocess:
         assert not sched.deferred_free_blocks
         assert sched.is_finished()
         assert sched.abort_request(seq.id) is False
+
+    def test_an_idle_scheduler_builds_one_empty_batch_to_carry_an_abort(
+        self, seq_factory
+    ):
+        """The connector's metadata carries the abort to its workers, and a
+        scheduler with nothing to run builds metadata only for a batch."""
+        sched = Scheduler(MockConfig())
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        sched.kv_connector = self._claiming_connector([])
+        sched.postprocess([seq], self._output(seq.id, [2]))
+        assert sched.schedule() is None, "parked, it has nothing to run"
+
+        assert sched.abort_request(seq.id) is True
+        batch, seqs = sched.schedule()
+
+        assert (batch.req_ids, seqs) == ([], {})
+        assert batch.connector_meta_output == "metadata"
+        assert sched.schedule() is None, "one batch carries it"
 
     def test_an_abort_before_finish_asks_no_connector_to_drop_a_send(self, seq_factory):
         """A running request takes no claim when it finishes aborted."""
