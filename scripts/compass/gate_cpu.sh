@@ -274,6 +274,20 @@ CF=()
 [ "${#CF[@]}" -gt 0 ] || SHARDS=0
 LOGS=$(mktemp -d) || finish 96 "mktemp failed; nothing was run"
 trap 'rm -rf "${HARNESS:-}" "$LOGS"' EXIT
+# More than one of these processes runs cargo in atom/mesh, and on NFS cargo
+# takes no lock on atom/mesh/target: two builds there at once delete each
+# other's artifacts (#2587). So every process finds cargo through a wrapper
+# that runs one started in atom/mesh only under a lock they all share, and any
+# other cargo as it is.
+if [ -r "$MESH/Cargo.toml" ] && CARGO=$(command -v cargo); then
+    FLOCK=$(command -v flock) ||
+        finish 96 "flock not found, so cargo in atom/mesh cannot run one process at a time; pytest was not run"
+    mkdir "$LOGS/bin" &&
+        printf '#!/usr/bin/env bash\ncase $(pwd -P)/ in %q/*) exec 9>>%q && %q 9 || exit ;; esac\nexec %q "$@"\n' \
+            "$(cd "$MESH" && pwd -P)" "$LOGS/cargo.lock" "$FLOCK" "$CARGO" >"$LOGS/bin/cargo" &&
+        chmod +x "$LOGS/bin/cargo" || finish 96 "cannot write the cargo wrapper; pytest was not run"
+    export PATH=$LOGS/bin:$PATH
+fi
 PYTEST=(tests/ "${IGN[@]}" -q --no-header -p no:cacheprovider)
 ARGS=("$@")
 own() {
