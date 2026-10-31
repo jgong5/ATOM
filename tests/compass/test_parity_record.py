@@ -850,6 +850,10 @@ def test_no_file_call_or_json_encoding_runs_between_two_forwards(tmp_path, monke
             calls.append("write")
             return self.f.write(text)
 
+        def flush(self):
+            calls.append("flush")
+            self.f.flush()
+
         def close(self):
             calls.append("close")
             self.f.close()
@@ -880,15 +884,17 @@ def test_no_file_call_or_json_encoding_runs_between_two_forwards(tmp_path, monke
         record.add(batch, runner, lambda batch: None)
     record.write()
 
-    # Emptied at the start; then only the forwards' stamps until the exit.
-    start = ["open", "write", "close"]
-    end = ["dumps"] * 3 + ["open", "write", "close"]
+    # Opened, emptied, at the start; then only the forwards' stamps until the
+    # exit, which writes through the file opened at the start.
+    start = ["open"]
+    end = ["dumps"] * 3 + ["write", "flush"]
     assert calls == start + ["stamp", "stamp"] * 3 + end
     monkeypatch.undo()
     line = '"is_dummy_run": true, "produces_output": true, "batch": [], "named": []'
+    # A stamp is the count of calls up to it, the one at the start included.
     assert record.path.read_text() == "".join(
-        f'{{"step": {n}, "dp_rank": 0, {line}, "t_enter_ns": {2 * n + 4}, '
-        f'"t_exit_ns": {2 * n + 5}, "rows": [[1, 9, true]], "rung": null, '
+        f'{{"step": {n}, "dp_rank": 0, {line}, "t_enter_ns": {2 * n + 2}, '
+        f'"t_exit_ns": {2 * n + 3}, "rows": [[1, 9, true]], "rung": null, '
         '"d_busy_ns": 5}\n'
         for n in range(3)
     )
