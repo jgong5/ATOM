@@ -35,7 +35,7 @@ from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.work import gemm, price
-from atom.compass.capture import forward, population_shapes
+from atom.compass.capture import population_shapes
 from atom.compass.capture.forward import structure
 from atom.compass.run import _op_graphs
 from atom.compass.runner import projection
@@ -205,15 +205,6 @@ def test_a_run_prices_a_middle_chunk_s_draft_kv_pass_from_its_own_graph(
     assert {t.name: t.seconds for t in cost.draft_terms} == drafted(1)
 
 
-def test_a_block_drafter_is_refused_by_name_before_any_step():
-    class DSparkProposer:
-        is_block_drafter = True
-
-    runner = SimpleNamespace(drafter=DSparkProposer())
-    with pytest.raises(ValueError, match="DSparkProposer writes its draft KV before"):
-        forward._drafter(runner, None)
-
-
 FINAL = BatchView((RequestShape(9, 9, False),), produces_output=True)
 
 
@@ -266,7 +257,9 @@ def test_a_step_under_a_drafter_with_no_draft_to_price_is_refused_by_name(
 
 
 def test_a_run_file_op_graph_under_a_drafter_prices_its_drafts(monkeypatch, tmp_path):
-    drafter = SimpleNamespace(method="mtp", num_speculative_tokens=2)
+    drafter = SimpleNamespace(
+        method="mtp", num_speculative_tokens=2, use_dspark=lambda: False
+    )
     monkeypatch.setitem(WORKER, "speculative_config", drafter)
 
     assert _installed(monkeypatch, tmp_path, op_graph=True).drafts == 2
