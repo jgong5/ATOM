@@ -27,6 +27,8 @@ from atom.compass.backends import (
 )
 from atom.compass.backends.step_linear_fit import (
     ROWMOD_CELL_STEPS,
+    _moe_column,
+    _solve,
     fit,
     label_records,
     main,
@@ -155,6 +157,31 @@ def test_a_rung_whose_cost_the_tokens_do_not_move_adopts_neither(tmp_path):
     figures = vector["fit"]["moe_column"]
     assert figures["adopted"] is None
     assert set(figures) == {"adopted", "moe_tokens", "moe_experts"}
+
+
+def test_of_two_columns_that_qualify_the_rung_adopts_the_nearer_on_held_out_cells():
+    """Two cells whose cost is linear in the tokens over 30 to 150, and one at
+    12 to 19 tokens where it falls twice as steeply: the tokens fit the rung's
+    steps closer, the experts price the cell held out of the others closer."""
+    rng = np.random.default_rng(0)
+    members = []
+    spans = ((30, 150), (30, 150), (12, 19))
+    for cell, (low, high), steps in zip(range(3), spans, (400, 400, 150)):
+        for step in range(steps):
+            n = int(rng.integers(low, high + 1))
+            seconds = 0.015 + 3e-5 * (n - 2 * max(0, 30 - n))
+            members.append((cell, "8", (1, 0, 0), seconds, step, (), n))
+    names = list(BASE)
+    x = np.array([m[2] for m in members], dtype=np.float64)
+    base = _solve(x, np.array([m[3] for m in members]), names)
+    figures = _moe_column(members, x, base, 0, names, (384, 6))[1]
+    columns = ("moe_tokens", "moe_experts")
+    worst = {
+        f: max(abs(w) for _, w in figures[f]["held_out_p50"].values()) for f in columns
+    }
+    assert figures["moe_tokens"]["mad"] < figures["moe_experts"]["mad"]
+    assert worst["moe_experts"] < worst["moe_tokens"]
+    assert figures["adopted"] == "moe_experts"
 
 
 def test_a_rung_with_a_cell_of_too_few_steps_adopts_no_column(tmp_path):

@@ -245,9 +245,9 @@ prices that side 10% high at rung 4 and 14% at rung 8. The candidates are `n` it
 `moe_tokens`, for the GEMM rows, and `moe_experts`, `X = E·(1 − (1 − K/E)^n)`, the routed
 experts `n` tokens reach in expectation, each routed to `K` of `E`
 (`work.activated_experts`), for the expert weights read. Nothing assumes decode is memory-
-or compute-bound: a rung adopts the candidate of smaller MAD that meets D61's four
-conditions, its shuffle that of `n` across the rung's steps, and a rung that adopts
-neither keeps its three columns. Two columns at once were tried and refused: on the small
+or compute-bound: of the candidates that meet D61's four conditions, its shuffle that of `n`
+across the rung's steps, a rung adopts the one whose worst held-out cell's p50 error lies
+nearest zero, and a rung that adopts neither keeps its three columns. Two columns at once were tried and refused: on the small
 rungs `n` and `X` are nearly collinear, and the non-negative solve kept one of the two at
 every rung ([#2493](https://github.com/jgong5/ATOM/issues/2493)). The column is a hull
 coordinate, so a step whose `n` falls outside the `n` its rung was fitted on is priced as

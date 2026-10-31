@@ -394,7 +394,9 @@ def _held_out_p50(design, y, cell, names) -> list[float]:
     return out
 
 
-def _adopt(x, y, cell, base: dict, names, candidates) -> tuple[tuple | None, dict]:
+def _adopt(
+    x, y, cell, base: dict, names, candidates, held_out: bool = False
+) -> tuple[tuple | None, dict]:
     """The candidate column a decode rung adopts, or None, and each candidate's
     figures: its MAD and, when that clears the gain, its shuffled MAD and
     held-out p50 errors.
@@ -405,14 +407,16 @@ def _adopt(x, y, cell, base: dict, names, candidates) -> tuple[tuple | None, dic
     candidate qualifies when its solve cuts `base`'s scaled MAD by
     `ROWMOD_GAIN`, the mean MAD of its shuffles does not, and no cell priced by
     a solve on the others has a p50 error further from zero than without it.
-    The qualifying candidate of smallest MAD is adopted: returned as (choice,
-    column, solve, evidence), its evidence the MAD without the column, the
-    shuffled MAD and per cell the p50 error without and with it.
+    The qualifying candidate of smallest MAD is adopted, or under `held_out`
+    the one whose largest held-out p50 error, in magnitude, is smallest:
+    returned as (choice, column, solve, evidence), its evidence the MAD
+    without the column, the shuffled MAD and per cell the p50 error without
+    and with it.
     """
     cells = sorted(set(cell.tolist()))
     without = _held_out_p50(x, y, cell, names)
     target = (1.0 - ROWMOD_GAIN) * base["mad"]
-    best, figures = None, {}
+    best, figures, score = None, {}, math.inf
     for choice, name, column, shuffled in candidates:
         design, wide = np.column_stack([x, column]), [*names, name]
         solved = _solve(design, y, wide)
@@ -428,12 +432,13 @@ def _adopt(x, y, cell, base: dict, names, candidates) -> tuple[tuple | None, dic
             "held_out_p50": {str(c): [o, w] for c, o, w in zip(cells, without, held)},
         }
         figures[choice] = {"mad": solved["mad"], **evidence}
+        mine = max(map(abs, held)) if held_out else solved["mad"]
         if (
             shuffled_mad >= target
             and all(abs(w) <= abs(o) for w, o in zip(held, without))
-            and (best is None or solved["mad"] < best[2]["mad"])
+            and mine < score
         ):
-            best = (choice, column, solved, evidence)
+            best, score = (choice, column, solved, evidence), mine
     return best, figures
 
 
@@ -445,9 +450,10 @@ def _moe_column(members, x, base: dict, seed: int, names, routing) -> tuple:
     its solve. The candidates are `MOE_COLUMNS` over each step's real MoE
     tokens, `moe_experts` under `routing`. A candidate qualifies by the four
     conditions a `rowmod` column does (`_rowmod`), its shuffles the tokens'
-    over the rung's steps, by `seed`; the qualifying one of smallest MAD is
-    adopted: returned as (feature, column, solve, evidence). A rung failing
-    the cell condition records each cell's steps.
+    over the rung's steps, by `seed`; of those that qualify, the one whose
+    worst held-out cell's p50 error is nearest zero is adopted: returned as
+    (feature, column, solve, evidence). A rung failing the cell condition
+    records each cell's steps.
     """
     cell = _cells(members)
     if cell is None:
@@ -464,7 +470,7 @@ def _moe_column(members, x, base: dict, seed: int, names, routing) -> tuple:
         candidates.append(
             (feature, feature, column, lambda c=column: [c[o] for o in orders])
         )
-    best, figures = _adopt(x, y, cell, base, names, candidates)
+    best, figures = _adopt(x, y, cell, base, names, candidates, held_out=True)
     return best, {"adopted": best and best[0], **figures}
 
 
