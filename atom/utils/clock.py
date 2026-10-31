@@ -108,12 +108,16 @@ class Straggler(Exception):
 
 
 class _Wakeup(threading.Event):
-    """An event `zmq.zmq_poll` can also wait on, through `fd`, beside the sockets."""
+    """An event `zmq.zmq_poll` can also wait on, through `fd`, beside the sockets.
+
+    A release sets it when its channel is in `channels`, the ones its thread's
+    poller waits on, and every release sets it while `channels` is None."""
 
     def __init__(self) -> None:
         super().__init__()
         # ponytail: one eventfd per receiving thread, never closed; threads are few
         self.fd = os.eventfd(0, os.EFD_NONBLOCK)
+        self.channels: frozenset[str] | None = None
 
     def set(self) -> None:
         super().set()
@@ -326,7 +330,8 @@ class LPRuntime:
                 self.released[ch].add(seq)
                 self.unreleased.pop((ch, seq), None)
                 for w in self.wakes.values():
-                    w.set()
+                    if w.channels is None or ch in w.channels:
+                        w.set()
                 if self.table.recv_mode(ch) is ReceiveMode.INLINE:
                     continue
                 reported = False
@@ -385,12 +390,14 @@ class LPRuntime:
                 if arrival < self.now:
                     self._straggler(arrival, ch, seq)
 
-    def my_wakeup(self) -> _Wakeup:
-        """This thread's event, set whenever a message is released."""
+    def my_wakeup(self, channels=None) -> _Wakeup:
+        """This thread's event, set whenever a message on one of `channels` is
+        released, or any message while `channels` is None."""
         with self.lock:
             me = threading.current_thread()
             if me not in self.wakes:
                 self.wakes[me] = _Wakeup()
+            self.wakes[me].channels = None if channels is None else frozenset(channels)
             return self.wakes[me]
 
     def is_released(self, ch: str, seq: int) -> bool:
@@ -570,8 +577,8 @@ class WrappedPoller:
 
     def poll(self) -> list[tuple]:
         self.rt.back_at_wait_point()
-        wake = self.rt.my_wakeup()
         wrapped = [s for s in self.socks if isinstance(s, WrappedSocket)]
+        wake = self.rt.my_wakeup([ch for s in wrapped for ch in s.into])
         waits = [(getattr(s, "raw", s), zmq.POLLIN) for s in self.socks]
         while True:
             wake.clear()
