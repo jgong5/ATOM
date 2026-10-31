@@ -25,16 +25,17 @@ segment is priced as if routing spread tokens evenly over the experts, which
 no feature carries. A run refuses a law whose
 `machine_spec` is not its spec's `machine_spec_digest`, naming both.
 
-A decode vector may add `moe_experts`, the routed experts the step's real MoE
-tokens are expected to reach, `E (1 - (1 - K/E)^n)` for the law's `moe_routing`
-`{"experts": E, "top_k": K}` and `n` real tokens: a data-parallel group's
-gathered tokens (`BatchView.moe_tokens`), or on one rank, which has no
-`moe_rows`, the step's own; a data-parallel step stating no `moe_tokens` is
-refused. The gather pads every rank to the rung, and a pad row reaches no
-expert (before #2340, the one expert set of token 0), so at one rung the
-experts whose weights the MoE reads follow the group's real tokens, which an
-uneven spread over the ranks leaves well below the rung's rows. A law whose
-decode vector carries the column and that states no `moe_routing` is refused.
+A decode vector may add one MoE column over `n`, the real tokens the step's
+MoE runs on: a data-parallel group's gathered tokens (`BatchView.moe_tokens`),
+or on one rank, which has no `moe_rows`, the step's own; a data-parallel step
+stating no `moe_tokens` is refused. The column is `moe_tokens`, `n` itself, or
+`moe_experts`, the routed experts those tokens are expected to reach,
+`E (1 - (1 - K/E)^n)` for the law's `moe_routing` `{"experts": E, "top_k": K}`.
+The gather pads every rank to the rung, and a pad row reaches no expert
+(before #2340, the one expert set of token 0), so at one rung the MoE's work
+follows the group's real tokens, which an uneven spread over the ranks leaves
+well below the rung's rows. A law whose decode vector carries `moe_experts`
+and that states no `moe_routing` is refused.
 After it a decode vector may add `rowmod`, `rowmod(k)` over its rows in scheduled
 order: the largest summed N_KV over the rows `i = r (mod k)`, with `k` the
 vector's `"rowmod"` entry. It prices an order the same multiset of rows can
@@ -120,9 +121,10 @@ from atom.compass.backends.work import activated_experts
 PREFILL = ("step", "tokens", "query_square", "query_cached")
 HISTORY = PREFILL + ("history",)
 DECODE = ("step", "context", "graph_padding")
+#: The MoE columns a decode vector may add, over its step's real MoE tokens.
+MOE_COLUMNS = ("moe_tokens", "moe_experts")
 #: The decode vector's optional features, in the order they follow `DECODE`.
-DECODE_EXTRA = ("moe_experts", "rowmod")
-ROWMOD = DECODE + ("rowmod",)
+DECODE_EXTRA = MOE_COLUMNS + ("rowmod",)
 PROPOSE = ("step", "seqs")
 EAGER = "eager"
 SOURCE = "step-linear"
@@ -160,16 +162,21 @@ class _Vector:
             raise ValueError(f"the {name} vector's rowmod modulus is {self.rowmod}")
 
 
-def moe_experts(view: BatchView, experts: int, top_k: int) -> float | None:
-    """The routed experts `view`'s real MoE tokens are expected to reach, each
-    routed to `top_k` of `experts`: its data-parallel group's tokens, or on one
-    rank, which has no `moe_rows`, its own decode rows' tokens. None for a
+def moe_tokens(view: BatchView) -> int | None:
+    """The real tokens `view`'s MoE runs on: its data-parallel group's, or on
+    one rank, which has no `moe_rows`, its own decode rows'. None for a
     data-parallel view that states no group tokens."""
     if view.moe_rows is None:
-        return activated_experts(experts, top_k, sum_tokens(view.decode))
-    if view.moe_tokens is None:
-        return None
-    return activated_experts(experts, top_k, view.moe_tokens)
+        return sum_tokens(view.decode)
+    return view.moe_tokens
+
+
+def moe_column(feature: str, tokens: int, routing: tuple[int, int] | None) -> float:
+    """MoE column `feature` of `MOE_COLUMNS` for a step of `tokens` real MoE
+    tokens, `moe_experts` over `routing`, the (experts, top-k) of `moe_routing`."""
+    if feature == "moe_experts":
+        return activated_experts(*routing, tokens)
+    return float(tokens)
 
 
 def rowmod(context, k: int) -> int:
@@ -307,11 +314,11 @@ class StepLinearBackend(CostBackend):
                     f"no {what}decode vector for rung {EAGER if rung is None else rung}",
                 )
             counts = (1, sum_context(decode), batch_view.graph_padding)
-            if "moe_experts" in vector.features:
-                reached = moe_experts(batch_view, *law.moe_routing)
-                if reached is None:
+            if moe := [f for f in MOE_COLUMNS if f in vector.features]:
+                tokens = moe_tokens(batch_view)
+                if tokens is None:
                     raise self._refuse(batch_view, "no MoE group tokens on this step")
-                counts += (reached,)
+                counts += tuple(moe_column(f, tokens, law.moe_routing) for f in moe)
             if vector.rowmod:
                 counts += (rowmod([r.context_tokens for r in decode], vector.rowmod),)
         terms, kv = self._priced(law, vector, kind, counts, what), []

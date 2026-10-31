@@ -700,10 +700,11 @@ and what is cut, and the command writes each record's labels beside it for
 reading, `dp0.cost.jsonl`; the module's docstring states how outliers are
 dropped. The written law also carries, per vector, its samples, warm and dropped
 counts and condition number, and names any vector it could not fit under
-`unfitted`. `--moe-routing E,K`, the model's routed experts and top-k, adds to
-every decode rung vector the experts its step's real MoE tokens reach
-(`atom/compass/backends/step_linear.py`); a law refitted without it drops that
-column.
+`unfitted`. `--moe-routing E,K`, the model's routed experts and top-k, lets each
+decode rung adopt one column over its steps' real MoE tokens, the tokens or the
+experts they reach (`atom/compass/backends/step_linear.py`), by the rule the
+module's docstring states, and records under the vector's `fit.moe_column` what
+the rule read; a law refitted without it adopts none.
 
 `DIGEST` is the `machine_spec_digest` of the capture host's spec in
 `scripts/compass/machines/`, which a run's spec must match, printed by
