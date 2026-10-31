@@ -127,6 +127,9 @@ KV_CACHE_READY_EVENT_TTL_S = 600.0
 # Requests whose ready event aged out are remembered up to this many, oldest
 # dropped first, so a late transfer still finds that its prefill is complete.
 KV_CACHE_READY_EXPIRED_MAX = 1 << 16
+# Aborted requests a producer rank remembers, oldest dropped first, so a write
+# request that comes for one after its blocks went back to the pool is refused.
+ABORTED_TRANSFERS_MAX = 1 << 16
 _IB_SYSFS_ROOT = Path("/sys/class/infiniband")
 
 
@@ -426,6 +429,10 @@ class MooncakeAgentMetadata(
 
 
 class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
+    # Claimed requests aborted since the last metadata, for the workers.
+    # Class-level so a scheduler built without __init__ sends none.
+    _aborted_sends: frozenset[ReqId] = frozenset()
+
     def __init__(self, config: Config) -> None:
         kv_transfer_config = config.kv_transfer_config
         self.is_producer = (
@@ -530,6 +537,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             )
         self._reqs_need_recv.clear()
         self._reqs_need_save.clear()
+        meta.reqs_not_processed = set(self._aborted_sends)
+        self._aborted_sends = frozenset()
         return meta
 
     def update_state_after_alloc(self, seq: Sequence) -> None:
@@ -669,6 +678,13 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
     def send_finished(self, req_id) -> None:
         self._awaiting_send.discard(str(req_id))
+
+    def abort_send(self, req_id) -> None:
+        """Ask the workers to report an aborted request's send once none of its
+        writes runs. Not under PP prefill: each stage writes its own layers
+        and sees only its own, so the claim waits for the decode's release."""
+        if self.pp_size == 1 and str(req_id) in self._awaiting_send:
+            self._aborted_sends |= {req_id}
 
     def source_blocks_released(self, seq: Sequence) -> None:
         """No block-lifetime state remains after the send claim is retired."""
@@ -922,6 +938,10 @@ class MooncakeConnector(KVConnectorBase):
         self._completed_prefills_cv = threading.Condition(self._completed_prefills_lock)
         self._transfer_refcount: dict[ReqId, int] = {}
         self._transfer_refcount_lock = threading.Lock()
+        # Under _completion_lock: write requests taken and not yet served, per
+        # transfer, and the transfers whose request was aborted, oldest first.
+        self._writes_in_flight: dict[TransferId, int] = {}
+        self._aborted_transfers: dict[TransferId, None] = {}
 
         # --- Consumer: pending receive tracking ---
         self._pending_recv: set[ReqId] = set()
@@ -1521,6 +1541,8 @@ class MooncakeConnector(KVConnectorBase):
                     meta.local_slot_index,
                     req_id,
                 )
+            if metadata.reqs_not_processed:
+                self._abort_transfers(metadata.reqs_not_processed)
             return
 
         # Consumer: send write requests to producer
@@ -1989,7 +2011,10 @@ class MooncakeConnector(KVConnectorBase):
                                 logger.exception(
                                     "[PRODUCER] adopting a landing partition failed"
                                 )
-                        self._send_executor.submit(self._execute_transfer, request_data)
+                        if self._take_write(request_data):
+                            self._send_executor.submit(self._serve_write, request_data)
+                        else:
+                            self._notify_transfer_result(request_data, success=False)
 
                     elif msg_type == MSG_LANDING_CREDIT:
                         try:
@@ -2041,6 +2066,58 @@ class MooncakeConnector(KVConnectorBase):
                 "[PRODUCER] acknowledging write request %s failed",
                 request_data["request_id"],
             )
+
+    def _take_write(self, request_data: dict) -> bool:
+        """Count a write request in flight, or refuse one for an aborted request."""
+        transfer_id = request_data.get("transfer_id", request_data["request_id"])
+        with self._completion_lock:
+            if transfer_id in self._aborted_transfers:
+                logger.warning(
+                    "[PRODUCER] refusing a write request for transfer_id=%s: its "
+                    "request was aborted and its blocks may be another's now",
+                    transfer_id,
+                )
+                return False
+            self._writes_in_flight[transfer_id] = (
+                self._writes_in_flight.get(transfer_id, 0) + 1
+            )
+        return True
+
+    def _serve_write(self, request_data: dict) -> None:
+        """Serve a taken write request; the last one in flight for an aborted
+        request reports its send."""
+        transfer_id = request_data.get("transfer_id", request_data["request_id"])
+        try:
+            self._execute_transfer(request_data)
+        finally:
+            with self._completion_lock:
+                left = self._writes_in_flight.pop(transfer_id) - 1
+                if left:
+                    self._writes_in_flight[transfer_id] = left
+                elif transfer_id in self._aborted_transfers:
+                    self._release_aborted(transfer_id)
+
+    def _abort_transfers(self, transfer_ids) -> None:
+        """Refuse every later write request for these aborted requests, and
+        report each one's send now unless a write of it is in flight."""
+        with self._completion_lock:
+            for transfer_id in transfer_ids:
+                self._aborted_transfers[transfer_id] = None
+                if len(self._aborted_transfers) > ABORTED_TRANSFERS_MAX:
+                    del self._aborted_transfers[next(iter(self._aborted_transfers))]
+                if transfer_id not in self._writes_in_flight:
+                    self._release_aborted(transfer_id)
+
+    def _release_aborted(self, transfer_id: TransferId) -> None:
+        """Report an aborted request's send, unless this rank already did.
+        Caller holds ``_completion_lock``."""
+        with self._completed_prefills_lock:
+            held = self._completed_prefills.pop(transfer_id, None) is not None
+            self._kv_cache_ready_events.pop(transfer_id, None)
+        with self._transfer_refcount_lock:
+            self._transfer_refcount.pop(transfer_id, None)
+        if held:
+            self.done_sending.add(transfer_id)
 
     def _record_release(self, transfer_id: TransferId, consumer_tp_size: int) -> None:
         """Count a consumer-rank release; free the shared page after all ranks.

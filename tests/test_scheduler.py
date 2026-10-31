@@ -2394,6 +2394,59 @@ class TestPostprocess:
         assert not sched.deferred_free_blocks
         assert sched.is_finished()
 
+    @staticmethod
+    def _claiming_connector(aborted: list):
+        pending_send: set[str] = set()
+        return SimpleNamespace(
+            is_producer=True,
+            request_finished=lambda s: pending_send.add(str(s.id)),
+            should_defer_free=lambda s: str(s.id) in pending_send,
+            send_finished=lambda rid: pending_send.discard(str(rid)),
+            abort_send=aborted.append,
+        )
+
+    def test_an_abort_after_finish_hands_the_parked_send_to_the_connector(
+        self, seq_factory
+    ):
+        """A request parked for its send is still the abort's to find.
+
+        Searching only `waiting` and `running` left it parked with its claim
+        once the decode that would pull it was gone, and `is_finished()` never
+        turned True again on that prefill.
+        """
+        sched = Scheduler(MockConfig())
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        aborted: list = []
+        sched.kv_connector = self._claiming_connector(aborted)
+        sched.postprocess([seq], self._output(seq.id, [2]))
+        assert seq.id in sched.deferred_free_blocks
+
+        assert sched.abort_request(seq.id) is True
+        assert aborted == [seq.id]
+        assert seq.id in sched.deferred_free_blocks, "freed before the send's report"
+
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={seq.id})
+        )
+        assert not seq.block_table
+        assert not sched.deferred_free_blocks
+        assert sched.is_finished()
+        assert sched.abort_request(seq.id) is False
+
+    def test_an_abort_before_finish_asks_no_connector_to_drop_a_send(self, seq_factory):
+        """A running request takes no claim when it finishes aborted."""
+        sched = Scheduler(MockConfig())
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        aborted: list = []
+        sched.kv_connector = self._claiming_connector(aborted)
+
+        assert sched.abort_request(seq.id) is True
+        sched.postprocess([seq], self._output(seq.id, [7]), mock.Mock())
+
+        assert aborted == []
+        assert not sched.deferred_free_blocks
+        assert sched.is_finished()
+
 
 # ── chunked-prefill finality ───────────────────────────────────────────────
 
