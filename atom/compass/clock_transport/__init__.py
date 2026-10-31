@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 """How a logical process (LP) reaches the Clock Authority.
 
-``serve(authority, endpoint)`` starts the authority's serve loop at an endpoint;
+``serve(authority, endpoint)`` serves the authority at an endpoint;
 ``connect(lp, endpoint, member=None)`` returns the LP's connection to it, or
 one member's when the LP is declared with members, whose whole surface is
 ``send((kind, t, log, t_daemon))``, ``recv() -> (G, released)`` and ``close()``. The endpoint is the only place a location appears, and its scheme
 picks the carrier: ``inproc:<name>`` serves in this process (`service`),
 ``tcp://<host>:<port>`` over a socket (`stream`). Both move the same encoded
-frames into one serve loop.
+frames into one serve side.
 
 This sits beside `atom.compass.clock` rather than inside it because it starts a
 thread and queues frames, and that package reaches nothing.
@@ -31,6 +31,13 @@ def connect(lp, endpoint: str = DEFAULT_ENDPOINT, member: str | None = None):
     return _carrier(endpoint).connect(lp, endpoint, member)
 
 
+def connect_here(lp, endpoint: str = DEFAULT_ENDPOINT, member: str | None = None):
+    """`connect`, for an LP in the process that serves `endpoint`: its requests
+    are served on its own thread with no socket, and the connection's `fileno`
+    is readable while a reply waits."""
+    return _carrier(endpoint).connect_here(lp, endpoint, member)
+
+
 def _carrier(endpoint: str):
     scheme, separator, _ = endpoint.partition(":")
     if not separator or scheme not in _CARRIERS:
@@ -45,6 +52,7 @@ __all__ = [
     "DEFAULT_ENDPOINT",
     "MalformedMessage",
     "connect",
+    "connect_here",
     "decode",
     "encode",
     "serve",
