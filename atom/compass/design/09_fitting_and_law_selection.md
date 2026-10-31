@@ -183,6 +183,12 @@ before it too: its target label holds it, and the draft law's prefill vector, wh
 prices a middle chunk's pass as draft, prices it among the target's terms, as the
 draft law's `output_prefill_kv` states; the output prefill's draft label, all after
 the event, fits the `propose` vector ([#2100](https://github.com/jgong5/ATOM/issues/2100)).
+The pass replays one draft graph at any prefill length, yet on the DeepSeek-V4.1-Flash
+DSpark TP4 records it ran about three times as long after a short prefill whose launch
+paced the device as after a long one or a middle chunk. So the fit splits `propose` at
+the power-of-two token count that prices the labels best, `short_propose` below it, when
+that cuts their mean log error by a tenth
+([#2492](https://github.com/jgong5/ATOM/issues/2492)).
 
 **Host laws** price the host segments of `01` D4: `E`, `W_pre`, `W_launch` and
 `W_post`, each linear in `(1, tokens, seqs)`, fitted separately for decode, output
