@@ -557,7 +557,11 @@ where
                     }
                     match upstream.next().await {
                         Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
-                        Some(Err(error)) => return Some((Err(error), (upstream, buf, guard))),
+                        Some(Err(error)) => {
+                            // The client sees only a cut body; this names the cause.
+                            error!("router LP: request {request:?}'s stream from {from} failed: {error:?}");
+                            return Some((Err(error), (upstream, buf, guard)));
+                        }
                         None if buf.is_empty() => return None,
                         None => {
                             let rest = Bytes::from(std::mem::take(&mut buf));

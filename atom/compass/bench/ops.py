@@ -27,8 +27,11 @@ forward writes is written from ids spread over each token's compressed rows
 (`Stub._top_k`). A `Stub` calls each leaf from its contract:
 an activation is random at its shape, dtype and stride, except a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
-experts' ids ATOM fuses into them (`_route`), and the `NM_OUTPUT` slot at
-one KV split, a view at the start of twice its span; a weight is random at its
+experts' ids ATOM fuses into them (`_route`), the `NM_OUTPUT` slot at
+one KV split, a view at the start of twice its span, and aiter's top-k
+scratch (`TOPK_WORKSPACE`), one byte in the graph, built as aiter builds it
+on the device for the call's rows, row stride, k and path
+(`_topk_workspace`); a weight is random at its
 shape, dtype and stride, one tensor per occurrence of the leaf in the step;
 a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
@@ -53,7 +56,7 @@ alike (`exchange`), which the plan ladders, densifies and covers.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, a KV
 argument's as many entries of its first dimension, each the span of the
-others, as the batch's state slots, or its blocks when the model keeps no
+others, as the batch's rows, or its blocks when the model keeps no
 per-request state, or, of a decode attention leaf that states its layer's
 window and compress ratio, the plane rows the batch's blocks hold at that
 ratio, a RoPE table's (`TABLES`), a weight or a tensor of a module it names,
@@ -61,7 +64,9 @@ as many rows as the point's tokens, a table a leaf gathers by token ids
 (`GATHERED`) as many rows as its ids, the other tensors of each module it names,
 of one whose first dimension is the pool's blocks the batch's blocks, and, for
 a leaf that names a context key, the KV and
-per-request state its layer holds for the batch. One graph runs the leaf K
+per-request state its layer holds for the batch, a state slot a row, but at a
+decode its recurrent state (`SNAPSHOTS`) at each slot a row holds, which under
+a drafter is one a token. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
 kernels of one eager call of copy 0, the fewer, at least one, cycling over its
 copies: N built ones: M, the least count whose bytes pass `COLD` times the
@@ -182,7 +187,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 17
+PROTOCOL = 20
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -282,6 +287,20 @@ V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
 #: the span, and past an exact buffer kills the process (aiter defect, #1977).
 NM_OUTPUT = (_NM, "output")
+#: aiter's top-k leaves, each with whether it is the decode one, whose
+#: `workspace` aiter sizes by host queries into a module built for the
+#: device, which the capture answers 0 (`capture.forward._patches`), so a
+#: graph holds one byte. A point records the bytes it launched.
+TOPK_WORKSPACE = {
+    "aiter._top_k_per_row_decode.default": True,
+    "aiter._top_k_per_row_prefill.default": False,
+}
+#: The field of a per-request state layer of ATOM's KV registry that a decode
+#: row's leaf reads and writes at every state slot the row holds: GDN's and
+#: KDA's recurrent state, which their spec-decode kernel takes with each row's
+#: slots and writes once a token, 1 + K under a drafter of K drafts without
+#: ReplaySSM. Their conv state (`k_cache`) takes the row's first slot alone.
+SNAPSHOTS = "v_cache"
 #: The seed of a copy's drawn expert ids, with the copy's index.
 SEED = 0
 #: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
@@ -569,6 +588,7 @@ class Stub:
     a collective leaf refuses."""
 
     def __init__(self, runner, llc: int, journal=None) -> None:
+        from atom.compass.bench.replay import state_slots_per_request
         from atom.model_engine.kv_block import STATE_SLOT_CLASS
 
         self.runner, self.llc, self.journal = runner, llc, journal
@@ -577,6 +597,7 @@ class Stub:
         self.flush = None
         self.alone = getattr(runner.config, "dp_logical_size", 0)
         self.slots = runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
+        self.per_row = state_slots_per_request(runner.config)
         self.built, self.leaves, self.placed = {}, {}, []
         self.cold_copies, self.clones, self.kv, self.state = {}, {}, {}, set()
         self.written = {}
@@ -742,10 +763,13 @@ class Stub:
             for path, spec in _specs(op["args"])
             if spec["role"] == "kv"
         }
+        taken = len(rows) * self.per_row  # the batch's state slots
         room = [pool // blocks]
-        room += [t.k_cache.shape[0] // len(rows) for t in kv.values() if _stateful(t)]
+        room += [t.k_cache.shape[0] // taken for t in kv.values() if _stateful(t)]
         plans = {
-            s: self._plan(op, i, kv, blocks, len(rows), shape.tokens, s)
+            s: self._plan(
+                op, i, kv, blocks, len(rows), shape.tokens, s, shape.phase == "decode"
+            )
             for s, (op, i) in found.items()
         }
         need = max(p for _, _, p, _ in plans.values())
@@ -754,9 +778,9 @@ class Stub:
         self.context = _split(context)[0]
         self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
         for p in range(max(min(need, *room), 1)):
-            slot = p * len(rows)
-            if self.slots >= len(rows):  # past the state slots, take them again
-                slot %= self.slots - self.slots % len(rows)
+            slot = p * taken
+            if self.slots >= taken:  # past the state slots, take them again
+                slot %= self.slots - self.slots % taken
             try:
                 batch = rule.batch(view, p * blocks, slot)
             except ValueError as error:  # the rule refuses, before any preparation
@@ -781,7 +805,7 @@ class Stub:
                 # `c mod m`'s activations
                 built = min(n, record.get("copies", n))
                 at = min(len(self.placed), -(-built // len(inst)))
-                wrap = self.slots // len(rows) if self.slots >= len(rows) else at
+                wrap = self.slots // taken if self.slots >= taken else at
                 # ponytail: routed expert ids and an object's activations are
                 # drawn a copy each yet count once a cold copy here; split them
                 # out when a leaf with more instances than cold copies holds one
@@ -806,11 +830,14 @@ class Stub:
         self.placed = []
         return got
 
-    def _plan(self, op, instances, kv, blocks, rows, tokens=None, sig=None):
+    def _plan(
+        self, op, instances, kv, blocks, rows, tokens=None, sig=None, decode=False
+    ):
         """A leaf's copies, its bytes per call, the placements its context
         keys and KV arguments take, and its KV arguments' bytes per call read
         by blocks and by state slots; `tokens` defaults to `rows`, a
-        decode's."""
+        decode's; at a `decode`, a context key's recurrent state counts each
+        state slot a row holds."""
         need, size, shared = 1, 0, [0, 0]
         table, ids = GATHERED.get(op["op"], (None, None))
         for slot, s in _specs(op["args"]):
@@ -850,7 +877,11 @@ class Stub:
                 held = kv.get(f"layer_{module.layer_num}")
                 unit = rows if _stateful(held) else blocks
                 # ponytail: a tensor's first dim is its blocks or its state slots
-                size += sum(t.nbytes // t.shape[0] * unit for t in _fields(held))
+                for name, t in _fields(held):
+                    at = unit
+                    if name == SNAPSHOTS and decode and _stateful(held):
+                        at *= self.per_row  # each slot a row holds
+                    size += t.nbytes // t.shape[0] * at
                 need = None
             elif (module := self.modules.get(key, module)) is not None:
                 pool = self.runner.config.num_kvcache_blocks
@@ -933,7 +964,10 @@ class Stub:
         finally:
             forward_context._forward_context = forward_context.ForwardContext()
         medians = statistics.median(cold), warm and statistics.median(warm)
-        return {
+        scratch = {}
+        if op["op"] in TOPK_WORKSPACE:
+            scratch["workspace_bytes"] = calls[0][0]["workspace"].nbytes
+        return scratch | {
             "kernels": kernels,
             "cold_ns": medians[0],
             "warm_ns": medians[1],
@@ -992,6 +1026,15 @@ class Stub:
                 and old is not None
             ):
                 return old
+            if path == "workspace" and op["op"] in TOPK_WORKSPACE:
+                rows, stride, k = (
+                    build(s, op["args"][s], None) for s in ("numRows", "stride0", "k")
+                )
+                # a capture leaves out a trailing argument at its default
+                stable = op["args"].get("stable", False)
+                return _topk_workspace(
+                    op["op"], rows, stride, k, stable, self.runner.device
+                )
             if _ref(value):
                 key, module = instance[path], "module" in value
                 held = (
@@ -1548,6 +1591,23 @@ def _together() -> None:
     torch.distributed.all_reduce(flag, group=device)
 
 
+def _topk_workspace(name, rows, stride, k, stable, device) -> torch.Tensor:
+    """The `workspace` aiter's top-k leaf `name` launches with on `device`
+    for `rows` rows at row stride `stride` and `k`, as aiter's wrappers build
+    it: on the multi-block path, which a prefill takes unless `stable` where
+    the device's `topk_use_mulblocks` says so, aiter's cached buffer, zeroed
+    once and reset by its kernel after each launch; on the one-block path,
+    fresh scratch."""
+    from aiter.ops import topk
+
+    decode = TOPK_WORKSPACE[name]
+    if not (decode or stable) and topk.topk_use_mulblocks(rows, stride):
+        size = topk.topk_mb_workspace_size(rows, stride, k, False)
+        return topk.get_topk_mb_workspace(device, size)
+    size = topk.topk_ob_workspace_size(rows, stride, k, decode)
+    return topk.get_topk_scratch_workspace(device, size)
+
+
 def _span(shape, stride) -> int:
     """Elements a view of `shape` and `stride` reaches from its offset."""
     if 0 in shape:
@@ -1668,9 +1728,9 @@ def _stateful(held) -> bool:
 
 
 def _fields(held):
-    for value in vars(held).values() if held is not None else ():
+    for name, value in vars(held).items() if held is not None else ():
         if torch.is_tensor(value) and value.dim():
-            yield value
+            yield name, value
 
 
 def keys(config, run: dict):

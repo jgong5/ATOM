@@ -95,7 +95,7 @@ def deployment(tmp_path, **config):
     (tmp_path / "config.json").write_text(CONFIG_JSON.read_text())
     hf = PretrainedConfig.from_dict(json.loads(CONFIG_JSON.read_text())["text_config"])
     r = graphed(None)
-    r._piecewise_cg_active = lambda: False
+    r._tr_hybrid_active = lambda: False
     r.rank = 0
     r.config = SimpleNamespace(
         model=str(tmp_path),
