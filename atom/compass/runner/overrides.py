@@ -1481,10 +1481,7 @@ class NonAllocatingRunner(
         if record is not None and record.step == 1:
             # The record was just created, replacing an earlier run's; so is
             # the cost table, before anything this step does can stop the run.
-            # It stays open for the run, as the record's own file does.
-            self._cost_table = record.path.with_suffix(".cost.jsonl").open("w")
-            self._cost_table.write(json.dumps({"version": COST_TABLE_VERSION}) + "\n")
-            self._cost_table.flush()
+            _start_cost_table(self, record)
 
         stream = getattr(self, "_token_stream", None)
         if stream is None:
@@ -1534,6 +1531,16 @@ class NonAllocatingRunner(
         if out.pp_send is not None:
             out.predicted_s -= out.pp_send[1]
         return out
+
+
+def _start_cost_table(runner: Any, record: Any) -> None:
+    """Open `record`'s `dp<r>.cost.jsonl`, replacing an earlier run's, and
+    write its version line; the file stays open for the run, as the record's
+    own does, in `runner`'s `_cost_table`."""
+    table = record.path.with_suffix(".cost.jsonl").open("w")
+    table.write(json.dumps({"version": COST_TABLE_VERSION}) + "\n")
+    table.flush()
+    vars(runner)["_cost_table"] = table
 
 
 def _group_step_seconds(
