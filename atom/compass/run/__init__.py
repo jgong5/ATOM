@@ -29,7 +29,7 @@ member, the frontend's included, connects to.
   selects the simulated runner.
 - `engine(config)` wraps the engine's construction in its own process the
   same way, and maps every DP rank to the engine LP for the process-group
-  check.
+  check. The engine ignores SIGTERM from just before it says READY.
 - `runner(runner, tree)` installs the cost backend and the device readings on a
   `CompassModelRunner` where it would build its model, in the worker process.
 - `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
@@ -367,6 +367,8 @@ _authority: "_RecordingAuthority | None" = None
 _early_end: threading.Thread | None = None
 #: This engine process's member name in the engine LP, None at DP width one.
 _member: str | None = None
+#: The SIGTERM handler this engine process set aside as it said READY.
+_sigterm_at_ready: list = []
 
 
 def spec() -> dict | None:
@@ -1248,7 +1250,8 @@ def engine(config):
     At DP width above one, the process joins the engine LP as the member of its
     DP rank, and its host collectives first join the group rounds it owes. A
     pipeline stage is the engine LP ``engine-pp<stage>``, or a prefill side's
-    ``engine-P-pp<stage>``.
+    ``engine-P-pp<stage>``. The engine ignores SIGTERM from just before it
+    says READY (`_ignoring_sigterm_from_ready`).
 
     A real run recording its steps (`parity.ENV`) outside a pipeline stamps the
     engine's input pulls and output puts into ``dp<rank>.pulls.jsonl`` beside
@@ -1291,7 +1294,39 @@ def engine(config):
     clock.settle_before_collectives()
     if _member is not None and _offloads_to_lmcache_mp(config.kv_transfer_config):
         _park_before_dispatch()
-    return _named(_start_on_leaving(_runtime(lp, run, _member, _PublishedClock)))
+    rt = _runtime(lp, run, _member, _PublishedClock)
+    return _ignoring_sigterm_from_ready(_named(_start_on_leaving(rt)))
+
+
+@contextlib.contextmanager
+def _ignoring_sigterm_from_ready(inner):
+    """`inner`, in which the engine ignores SIGTERM from just before it says
+    READY and sets ATOM's handler aside, for `engine_loop` to put back.
+
+    The construction goes on after READY: a pipeline stage's transport, a DP
+    engine's prefill delayer, a prefill-decode engine's `_init_disagg`. A group
+    stop from then on would run ATOM's handler, which stops the workers before
+    the engine hands in; it reaches the engine as the ``+inf`` grant instead.
+    A construction that raises has the handler back."""
+    from atom.model_engine.engine_core import EngineCore
+
+    ready = EngineCore._send_ready_signal
+
+    @functools.wraps(ready)
+    def ignoring(self):
+        _sigterm_at_ready.append(signal.signal(signal.SIGTERM, signal.SIG_IGN))
+        return ready(self)
+
+    EngineCore._send_ready_signal = ignoring
+    try:
+        with inner:
+            yield
+    except BaseException:
+        if _sigterm_at_ready and (before := _sigterm_at_ready.pop()) is not None:
+            signal.signal(signal.SIGTERM, before)
+        raise
+    finally:
+        EngineCore._send_ready_signal = ready
 
 
 def _offloads_to_lmcache_mp(kv) -> bool:
@@ -2003,16 +2038,18 @@ def engine_loop(engine_core):
     In a run the engine ignores SIGTERM until it has handed in: ATOM's handler
     would stop the workers inside a clock call, before they say what their
     steps cost. A stop reaches the engine as the ``+inf`` grant instead. The
-    engine said it was ready as its construction ended, so a stop can come
-    from then on: it ignores SIGTERM first, before the run file's read, a
-    pipeline stage's sends or the bundle's request, and has its handler back
-    however it leaves.
+    engine has ignored SIGTERM since it said READY (`engine`); the loop
+    ignores it first too, before the run file's read, a pipeline stage's sends
+    or the bundle's request, and puts back however it leaves the handler set
+    aside at READY, or else the one it found.
 
     A pipeline stage's runner calls go through `pp_send.install`'s sends. A
     recorded real run's SIGTERM goes through `_stop_recording`, and its input
     queue stamps each request frame's handoff (`clock.stamp_input`)."""
     ignoring = bool(os.environ.get(ENV))  # a run, as `spec` would say, unread
     before = signal.signal(signal.SIGTERM, signal.SIG_IGN) if ignoring else None
+    if _sigterm_at_ready:
+        before = _sigterm_at_ready.pop()
     try:
         from atom.compass import parity
 
