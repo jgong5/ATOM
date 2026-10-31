@@ -317,14 +317,39 @@ def charge(d: float) -> None:
         rt.advance_to(rt.now + d)
 
 
+#: Whether this thread is inside a `wrap_encode` call, which charges the backend
+#: calls its ``encode`` makes.
+_in_encode = threading.local()
+
+
 def wrap_encode(encode, entry):
     """`encode`, charging the current job ``fixed + tokens / derated rate``."""
     rate = entry.encode_tokens_per_s * entry.derate
 
     def charged(*args, **kwargs):
-        ids = encode(*args, **kwargs)
+        _in_encode.on = True
+        try:
+            ids = encode(*args, **kwargs)
+        finally:
+            _in_encode.on = False
         charge(entry.encode_fixed_s + len(ids) / rate)
         return ids
+
+    return charged
+
+
+def wrap_encode_batch(encode_batch, entry):
+    """A fast tokenizer backend's ``encode_batch``, charging the current job
+    ``fixed + tokens / derated rate`` over the ids of all the encodings it
+    returns, the batch at the single-call rate; a call made inside a
+    `wrap_encode` call is that call's to charge."""
+    rate = entry.encode_tokens_per_s * entry.derate
+
+    def charged(*args, **kwargs):
+        encodings = encode_batch(*args, **kwargs)
+        if not getattr(_in_encode, "on", False):
+            charge(entry.encode_fixed_s + sum(len(e.ids) for e in encodings) / rate)
+        return encodings
 
     return charged
 
@@ -338,34 +363,6 @@ def wrap_decode(decode, entry):
         return decode(ids, *args, **kwargs)
 
     return charged
-
-
-class _ChargedBatches:
-    """A `tokenizers` backend whose ``encode_batch`` charges the current job as
-    one encode of every id the batch returns; any other attribute is the
-    backend's own."""
-
-    def __init__(self, backend, entry) -> None:
-        self._backend, self._entry = backend, entry
-
-    def encode_batch(self, *args, **kwargs):
-        out = self._backend.encode_batch(*args, **kwargs)
-        e = self._entry
-        ids = sum(len(x.ids) for x in out)
-        charge(e.encode_fixed_s + ids / (e.encode_tokens_per_s * e.derate))
-        return out
-
-    def __getattr__(self, name):
-        return getattr(self._backend, name)
-
-
-def wrap_encode_batch(backend, entry):
-    """`backend` with its ``encode_batch`` charged as `wrap_encode` charges one
-    ``encode`` that returned every id of the batch; a backend already charged
-    is returned as it is, so wrapping twice charges once."""
-    if isinstance(backend, _ChargedBatches):
-        return backend
-    return _ChargedBatches(backend, entry)
 
 
 #: Timers that do not keep the run alive, by the qualified name of their

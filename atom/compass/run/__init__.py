@@ -33,9 +33,7 @@ member, the frontend's included, connects to.
 - `runner(runner, tree)` installs the cost backend and the device readings on a
   `CompassModelRunner` where it would build its model, in the worker process.
 - `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
-  ``decode`` to the frontend's clock, at the rates the machine spec measured,
-  and the batch encode the segment tokenizer makes of a long prompt's new
-  segments at the encode rate.
+  ``decode`` to the frontend's clock, at the rates the machine spec measured.
 - `http_intake()` is what `atom.utils.compass_loop.HttpChannel` charges the
   frontend's event loop for each request it takes in.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
@@ -1788,15 +1786,17 @@ def _graph_pool(model_runner, machine, model):
 
 
 def tokenizer(tok, config) -> None:
-    """Wrap `tok`'s ``encode`` and ``decode`` with the machine spec's entry for
-    the model's architecture and the backend that loaded, and price the segment
-    tokenizer's encodes at it (`_price_segments`); the entry warns when the
-    loaded ``tokenizer.json`` is not the one it was measured on."""
+    """Wrap `tok`'s ``encode`` and ``decode``, and its Rust backend's
+    ``encode_batch``, with the machine spec's entry for the model's architecture
+    and the backend that loaded; the entry warns when the loaded
+    ``tokenizer.json`` is not the one it was measured on."""
     run = spec()
     if run is None:
         return
+    from tokenizers import Tokenizer
+
     from atom.compass.spec import Backend
-    from atom.utils.compass_loop import wrap_decode, wrap_encode
+    from atom.utils.compass_loop import wrap_decode, wrap_encode, wrap_encode_batch
 
     entry = _machine(run).tokenizer_for(
         config.hf_config.architectures[0],
@@ -1805,27 +1805,11 @@ def tokenizer(tok, config) -> None:
     )
     tok.encode = wrap_encode(tok.encode, entry)
     tok.decode = wrap_decode(tok.decode, entry)
-    _price_segments(entry)
-
-
-def _price_segments(entry) -> None:
-    """Make `SegmentTokenizer._encode_cached` charge the batch encode it makes
-    of a long prompt's segments no earlier prompt held, which goes to the
-    backend past the wrapped ``encode``, as one encode of the ids it returns;
-    its own work around that call (finding the earlier prompt, splitting,
-    hashing, assembling the ids) is charged nothing."""
-    from atom.model_engine.segment_tokenizer import SegmentTokenizer
-    from atom.utils.compass_loop import wrap_encode_batch
-
-    encode = SegmentTokenizer._encode_cached
-
-    @functools.wraps(encode)
-    def priced(self, *args, **kwargs):
-        split = self._split
-        split.backend = wrap_encode_batch(split.backend, entry)
-        return encode(self, *args, **kwargs)
-
-    SegmentTokenizer._encode_cached = priced
+    # ATOM's segment tokenizer, which only a Rust backend gets, encodes a long
+    # prompt's uncached segments with its ``encode_batch``, not ``encode``.
+    backend = getattr(tok, "_tokenizer", None)
+    if isinstance(backend, Tokenizer):
+        backend.encode_batch = wrap_encode_batch(backend.encode_batch, entry)
 
 
 def http_intake() -> tuple[float, float, float] | None:
