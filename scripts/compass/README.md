@@ -270,12 +270,17 @@ docker run -d --name <user>_ufb --network host --device /dev/kfd --device /dev/d
 In each new container, move aiter from the image's `a6d2b564f` to `b6a9d0aeb`,
 and FlyDSL from 0.2.4 to the 0.4.0 it pins. `git stash` sets the image's own aiter
 patches aside: a modified checkout reads `b6a9d0aeb-dirty`, and the stack check
-compares the commit exactly.
+compares the commit exactly. Each command has its own line because `set -e` does
+not stop on a failure before the last command of an `&&` list.
 
 ```
-docker exec <user>_ufb bash -c 'set -e; cd /sgl-workspace/aiter
-  git stash && git fetch origin main && git checkout --detach b6a9d0aeb
-  git submodule update --init --recursive && git clean -fdX -- aiter/jit
+docker exec <user>_ufb bash -c 'set -e
+  cd /sgl-workspace/aiter
+  git stash
+  git fetch origin main
+  git checkout --detach b6a9d0aeb
+  git submodule update --init --recursive
+  git clean -fdX -- aiter/jit
   pip install --no-deps flydsl==0.4.0
   PREBUILD_KERNELS=0 pip install --no-build-isolation --no-deps -e .'
 ```
