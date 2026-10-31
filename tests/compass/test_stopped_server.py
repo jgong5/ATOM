@@ -10,10 +10,12 @@ or not a stamped request it holds, which only a grant would release, is open.
 The stop first ends every LP's run through the authority, so an engine in a
 process of its own leaves its loop and hands in what its steps cost, whether
 the signal reaches the server alone or its process group, whose SIGTERM would
-have ATOM's handler stop the engine's workers. An engine whose input thread
-has read a request the authority has not released leaves the same way: the
-stop's ``+inf`` grant releases it, and the input thread takes it even when the
-server's SHUTDOWN reached it first.
+have ATOM's handler stop the engine's workers. That holds from the engine's
+loop's start, before it asks its workers for a step grid bundle, as it has
+already said it is ready. An engine whose input thread has read a request the
+authority has not released leaves the same way: the stop's ``+inf`` grant
+releases it, and the input thread takes it even when the server's SHUTDOWN
+reached it first.
 """
 
 import asyncio
@@ -285,6 +287,50 @@ def test_a_stopped_servers_summary_carries_its_engines_priced_steps(tmp_path, gr
     reasons = dict(summary["schedule"]["refusals"]["reasons"])
     assert reasons == {"ended:frontend stopped by SIGTERM": 1}, out
     assert summary["schedule"]["predicted_seconds"] == 0.75, out
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["answered", "refused"])
+def test_a_sigterm_while_an_engine_asks_for_its_bundle_stops_no_worker(
+    monkeypatch, tmp_path, refused
+):
+    """An engine has said it is ready before its loop asks its workers for the
+    step grid bundle, so a group SIGTERM can come then. It reaches no handler,
+    and the one that stops the workers is back once the engine leaves."""
+    run = {"bound_s": 100.0, "out_dir": str(tmp_path), "step_grid": {}}
+    (tmp_path / "run.json").write_text(json.dumps(run))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    monkeypatch.setattr(compass_run, "_member", None)
+    engine = LPRuntime(compass_run.ENGINE, TABLE, None)
+    engine.now = math.inf  # the finish: the loop leaves at once
+    monkeypatch.setattr(clock, "_installed", engine)
+    stopped, said = [], {"refused_commands": [], "predicted_memory": {}}
+    said["priced_steps"] = {"steps": 3, "seconds": 0.75}
+
+    def call_func(name, wait_out):
+        if stopped:
+            raise RuntimeError("the workers stopped")
+        if name != "step_grid_bundle":
+            return said[name]
+        signal.raise_signal(signal.SIGTERM)
+        if refused:
+            raise RuntimeError("no bundle")
+        return {}
+
+    previous = signal.signal(signal.SIGTERM, lambda *_: stopped.append(True))
+    atom = signal.getsignal(signal.SIGTERM)
+    workers = SimpleNamespace(call_func=call_func)
+    try:
+        with (
+            pytest.raises(RuntimeError) if refused else contextlib.nullcontext(),
+            compass_run.engine_loop(SimpleNamespace(runner_mgr=workers)),
+        ):
+            pass
+        assert (stopped, signal.getsignal(signal.SIGTERM)) == ([], atom)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    if not refused:
+        hand_in = tmp_path / compass_run.LP_FILE.format("engine")
+        assert json.loads(hand_in.read_text())["priced"] == said["priced_steps"]
 
 
 def test_an_engine_stopped_holding_a_read_request_hands_in_no_straggler(
