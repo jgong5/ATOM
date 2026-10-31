@@ -63,7 +63,6 @@ import os
 import pathlib
 import re
 import sys
-import time
 from typing import NamedTuple
 from unittest.mock import patch
 
@@ -970,7 +969,7 @@ def _mono(recorder, unpatched):
             return call
 
         def compiled(kernels):
-            began, arch = time.perf_counter(), device_arch()
+            arch = device_arch()
             with contextlib.ExitStack() as real:
                 for owner, name, value in unpatched:
                     real.enter_context(patch.object(owner, name, value))
@@ -979,9 +978,8 @@ def _mono(recorder, unpatched):
                 launchers = compile_kernels(kernels)
             scratch.extend(map(scratch_bytes, launchers))
             logger.info(
-                "%s: %d width-%d kernels compiled at %s in %.1f s, scratch %s B a lane",
-                *(self._what, len(launchers), width, arch),
-                *(time.perf_counter() - began, scratch),
+                "%s: %d width-%d kernels compiled at %s, scratch %s B a lane",
+                *(self._what, len(launchers), width, arch, scratch),
             )
             return launchers
 

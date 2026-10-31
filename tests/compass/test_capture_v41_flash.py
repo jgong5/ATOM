@@ -212,7 +212,7 @@ def test_gfx950_s_mono_decode_binds_builds_its_width_and_meets_its_kernels(tmp_p
 
     log = done.stdout + done.stderr
     # The width's kernels compiled for the declared arch, as the deployment's.
-    assert re.search(r"V4\.1 mono: \d+ width-16 kernels compiled at gfx950 ", log), log
+    assert re.search(r"V4\.1 mono: \d+ width-16 kernels compiled at gfx950,", log), log
     # The step ran mono, not the original path: refused by name where it first
     # calls a mono kernel whose contract a graph cannot hold.
     refusal = done.stderr.strip().splitlines()[-1]

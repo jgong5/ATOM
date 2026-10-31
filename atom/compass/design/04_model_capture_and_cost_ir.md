@@ -539,7 +539,7 @@ and a capture's group is one process. Capture stands in for what needs a peer or
   nothing, so the build's `compile.scratch_bytes` would find no binary and mono would
   decline the width. A width's kernels compile compile-only at the declared arch, through
   FlyDSL's own entries and outside the modes; their scratch is read off their binaries,
-  and capture logs it with the compile's seconds.
+  and capture logs it.
 - **A refusal is the deployment's or the capture's.** A bind check's `MonoUnsupported` and
   a kernel that needs scratch are refusals the deployment makes too: the step traces the
   original path, and the graph's `declared` names each under `mono`. Any other bind failure,
