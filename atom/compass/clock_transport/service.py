@@ -43,7 +43,6 @@ has ended. It looks every quarter of `diag_s`, so a stall is logged between
 `diag_s` and a quarter more after the last request.
 """
 
-import contextlib
 import logging
 import math
 import os
@@ -285,16 +284,21 @@ class _Connection:
 
 class _ReadableSlot:
     """A reply slot an LP can also wait on with `select`: each reply makes its
-    pipe readable by one byte, which `get` takes with the reply."""
+    pipe readable by one byte, which `get` takes with the reply. Once closed it
+    takes nothing, so a late reply writes to no descriptor the process has
+    since reused."""
 
     def __init__(self) -> None:
         self._replies = queue.SimpleQueue()
         self._read, self._write = os.pipe()
+        self._lock = threading.Lock()
+        self._open = True
 
     def put(self, frame: bytes) -> None:
-        self._replies.put(frame)
-        with contextlib.suppress(OSError):  # the LP has closed its connection
-            os.write(self._write, b"\0")
+        with self._lock:
+            if self._open:
+                self._replies.put(frame)
+                os.write(self._write, b"\0")
 
     def get(self) -> bytes:
         os.read(self._read, 1)
@@ -304,8 +308,11 @@ class _ReadableSlot:
         return self._read
 
     def close(self) -> None:
-        os.close(self._read)
-        os.close(self._write)
+        with self._lock:
+            if self._open:
+                self._open = False
+                os.close(self._read)
+                os.close(self._write)
 
 
 class _HereConnection(_Connection):

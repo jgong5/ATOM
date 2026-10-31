@@ -99,3 +99,31 @@ def test_an_lp_in_the_serving_process_reaches_a_tcp_clock_with_no_socket_and_can
     finally:
         server.close()
     assert ca.served_on["b"] == {threading.get_ident()}
+
+
+def test_a_reply_after_an_in_process_lp_closes_writes_to_no_reused_descriptor():
+    import os
+
+    from atom.compass.clock_transport import connect_here
+
+    server = serve(ClockAuthority(_table()), "inproc:closed")
+    try:
+        a, b = connect_here(A, "inproc:closed"), connect_here(B, "inproc:closed")
+        b.send((NER, INF, [], INF))
+        b.close()
+        reused = os.pipe()  # takes the descriptors b's slot gave back
+        try:
+            a.send((TAR, 1.0, [(AB, 0, 0.7)], INF))  # releases b's reply
+            os.set_blocking(reused[0], False)
+            assert a.recv() == (1.0, {})
+            try:
+                stray = os.read(reused[0], 1)
+            except BlockingIOError:
+                stray = b""
+        finally:
+            os.close(reused[0])
+            os.close(reused[1])
+        a.close()
+    finally:
+        server.close()
+    assert stray == b""
