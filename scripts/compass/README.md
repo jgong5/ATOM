@@ -688,7 +688,7 @@ and `buffers` terms of `peak_torch` with the storage bytes the start loaded.
 
 ## The step linear law from real cells — `step_linear_fit`
 
-`PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K] [--engine FILE]`
+`PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K [--reference LAW]] [--engine FILE]`
 fits the law a run file's `step_linear` key holds (`atom/compass/backends/step_linear.py`) from
 the step records of real cells, `OUT_DIR/steps/dp0.jsonl` of `REAL=1
 cctraces_sim.sh` runs, each with the `dp0.engine.json` the run wrote beside it,
@@ -704,7 +704,8 @@ counts and condition number, and names any vector it could not fit under
 decode rung adopt one column over its steps' real MoE tokens, the tokens or the
 experts they reach (`atom/compass/backends/step_linear.py`), by the rule the
 module's docstring states, and records under the vector's `fit.moe_column` what
-the rule read; a law refitted without it adopts none.
+the rule read; a law refitted without it adopts none. `--reference LAW` names the
+law whose held-out band at each rung, with the dispersion floor, bars the column.
 
 `DIGEST` is the `machine_spec_digest` of the capture host's spec in
 `scripts/compass/machines/`, which a run's spec must match, printed by
