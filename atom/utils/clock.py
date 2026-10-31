@@ -486,7 +486,9 @@ class WrappedSocket:
 
     def _first_ready(self) -> int | None:
         with self.rt.lock:
-            held = self.rt.holds_unstamped()
+            # `holds_unstamped` reads every frame the run brought: ask it only
+            # when a frame sent outside the run is here for it to decide.
+            held = any(f[1] is None for f in self.buf) and self.rt.holds_unstamped()
             for k, (ch, arrival, seq, _) in enumerate(self.buf):
                 if (arrival is None and not held) or (
                     arrival is not None and self.rt.is_released(ch, seq)
