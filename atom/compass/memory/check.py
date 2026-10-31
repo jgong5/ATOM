@@ -101,8 +101,15 @@ def _one(
 ) -> list[tuple]:
     """The values on the lines matching `pattern`, which each of the `tp` TP ranks
     of each of `ranks` DP ranks logs once: at one DP rank each TP rank's, as
-    logged; above it the ranks' one value, or where ranks differ the one on the
-    lines that log `blocks`, the rank's KV block count."""
+    logged; above it, at TP 1, the ranks' one value, or where ranks differ the
+    one on the lines that log `blocks`, the rank's KV block count. At DP and TP
+    both above 1 the lines are refused: they name no rank to group them by."""
+    if ranks > 1 and tp > 1:
+        raise MemoryRefusal(
+            f"{log}'s lines name no rank, so at {ranks} DP ranks of TP {tp} "
+            "none of them can be paired with a DP rank's hand-in",
+            "compare a log at one DP rank or at TP 1",
+        )
     found = pattern.findall(text)
     if len(found) != ranks * tp:
         raise MemoryRefusal(
