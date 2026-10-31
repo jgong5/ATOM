@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 """DeepSeek-V4.1-Flash's DSpark5 drafter under `compass trace ops` with no
-device, one rank of TP4 EP4 (of DP4 for a middle chunk under DP), priced by
-the op-level backend a run builds.
+device, one rank of TP4 EP4 (of DP4 for a middle chunk and a decode under
+DP), priced by the op-level backend a run builds.
 
 A block drafter runs its draft-KV pass between its target's forward and its
 sampling, before `forward_done_event`: a step that samples is three graphs,
 the target's, the pass's and the drafter's propose, and the pass prices among
 the target's terms, the propose as draft terms. A middle chunk is cut where
-the pass starts, so the pass is its drafter's.
+the pass starts, so the pass is its drafter's. A DP rank's drafter samples
+its block over the whole vocabulary, not a shard of it.
 """
 
 import json
@@ -41,6 +42,18 @@ DRAFTER = {TAIL, BLOCK, MARKOV}
 SAMPLER = "aiter.mixed_sample_outer_exponential.default"
 #: A decode row verifies its 5 drafts and one over 1024 tokens of context.
 VERIFY = BatchView((RequestShape(6, 1024, True),) * 16, produces_output=True)
+#: Under DP attention a rank's LM head is whole: its drafter samples each
+#: drafted position over the whole vocabulary.
+DP = DSPARK + " --enable-dp-attention"
+WHOLE = "aiter.dspark_markov_argmax.default"
+#: A DP4 decode of 4 rows a rank, every rank alike: the MoE gathers 96 rows.
+DP_VERIFY = BatchView(
+    (RequestShape(6, 1024, True),) * 4,
+    moe_rows=96,
+    moe_tokens=96,
+    dp_rank=0,
+    produces_output=True,
+)
 FINAL = BatchView((RequestShape(512, 512, False),), produces_output=True)
 MIDDLE = BatchView((RequestShape(512, 512, False),), produces_output=False)
 
@@ -149,6 +162,23 @@ def test_a_run_prices_a_middle_chunk_s_draft_kv_pass_as_its_draft(captured):
     assert {t.name: t.seconds for t in cost.draft_terms} == _terms(
         graphs["no output draft", PREFILL], DRAFT, MIDDLE
     )
+
+
+def test_a_dp_rank_s_drafter_samples_its_block_over_the_whole_vocabulary(tmp_path):
+    graphs = _capture(tmp_path, "--width 4" + DP)
+    config = forward._config(str(tmp_path / "model"), TP, DP.split()[1:])
+    config.quant_config = _engine(graphs["", "decode B=4"])["quant_config"]
+    store = {"store": str(tmp_path / "store")}
+    cost = compass_run.op_graph(store, config, MI455, ep=TP).price(DP_VERIFY)
+
+    propose = graphs["draft", "decode B=4"]
+    sampled = [op for op in _ops(propose["region"]) if op["op"] == WHOLE]
+    # One sampling of the block per drafted token, none off a vocabulary shard.
+    assert len(sampled) == 5 and MARKOV not in _kinds(propose)
+    drafted = {t.name: t.seconds for t in cost.draft_terms}
+    each = [price(work(op, DP_VERIFY, 1, "bf16", TP), MI455) for op in sampled]
+    assert drafted[f"{DRAFT}op.{WHOLE}"] == fold_seconds(each) > 0
+    assert 0 < cost.draft_seconds < cost.target_seconds
 
 
 def test_a_block_drafter_s_sampling_step_with_no_draft_kv_graph_is_refused():

@@ -116,6 +116,26 @@ def test_the_markov_head_is_a_gemm_onto_its_shard_s_logits_and_its_picks():
     assert work(op, STEP, TP, "bf16") == Work({"bf16": 2 * 2 * 6 * 4}, gemm + picks)
 
 
+def test_the_whole_vocabulary_markov_head_writes_the_w1_rows_it_picks_as_its_output():
+    # 2 rows over a vocabulary of 6 ids at rank 4: each row's W1 row against
+    # the 6 W2 rows, base_logits read as the GEMM's output term; the previous
+    # and the picked ids read or written once, and the 2 picked W1 rows of 4
+    # bf16 written as the output.
+    op = leaf(
+        "aiter.dspark_markov_argmax.default",
+        [[2, 4]],
+        base_logits=t([2, 6]),
+        prev_ids=t([2], I32),
+        markov_w1=t([6, 4], role="weight"),
+        markov_w2=t([6, 4], role="weight"),
+        out=t([2], I32),
+    )
+
+    gemm = 2 * 4 * 2 + 6 * 4 * 2 + 2 * 6 * 2
+    picks = 2 * 4 + 2 * 4 + 2 * 4 * 2
+    assert work(op, STEP, TP, "bf16") == Work({"bf16": 2 * 2 * 6 * 4}, gemm + picks)
+
+
 def test_the_argmax_gather_reads_each_rank_s_pairs_and_writes_the_ids():
     # 4 ranks' (value, id) pairs for 2 rows in fp32 read once; the 2 ids read
     # and written.

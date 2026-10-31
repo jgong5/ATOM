@@ -641,6 +641,14 @@ def _markov(op, view, tp, kv) -> Work:
     return gemm(rows, shard, w2["shape"][1], fmt, fmt, logits) + picks
 
 
+def _markov_argmax(op, view, tp, kv) -> Work:
+    """DSpark's Markov head over the whole vocabulary, as `_markov` prices a
+    shard's, the `markov_w1` rows it picks written as its output rather than
+    into an `embed_out`."""
+    published = _only(out=op["args"]["markov_w1"]["dtype"])(op, view, tp, kv)
+    return _markov(op, view, tp, kv) + published
+
+
 def _commit_cursors(op, view, tp, kv) -> Work:
     """V4.1's tentative cursor commit: each of `count` requests' accepted
     prefix's row read from `cursors` and written to its slot of `cursor`, and
@@ -908,6 +916,7 @@ EXTRACTORS |= {
     DSPARK + "build_block_state": _block_state,
     "atom.model_ops.sparse_attn_v4:_sparse_attn_triton": _block_attention,
     MARKOV + "_launch": _markov,
+    "aiter.dspark_markov_argmax.default": _markov_argmax,
     MARKOV + "argmax_gather": _in_place("out"),
     "atom.spec_decode.dspark_proposer:DSparkProposer._stage_anchors": _only(
         "next_token_ids", "rows"
