@@ -887,7 +887,9 @@ reaches the clock authority and the write-request block at this node's
 `inter_node`, as the real pair spans. Its router arguments switch the router's
 wall-clock detectors off, as `deploy.sh`'s header says, `--disable-retries`
 among them: a router LP that retries resends a request under the seq it was
-first sent with, and the frontend refuses it as arrived twice.
+first sent with, and the frontend refuses it as arrived twice. The script
+sets `--request-timeout-secs` itself: a stream lasts the wall time the run
+takes to finish it, and the router's default 1800 s cut c=256 streams.
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
 
@@ -1067,3 +1069,31 @@ one: grading in another refuses every real step's graph.
     cell is graded whole too, with the request aiperf cancelled at its cutoff: the
     server steps it alone until `client.sh --stop` stops the server, and grading
     takes those steps only from an export that `--stop` marked `server_stopped`.
+
+### A stage-4 cell smoked on MI355X
+
+The DeepSeek-V4.1-Flash cells of [#2138](https://github.com/jgong5/ATOM/issues/2138),
+TP4 with DSpark5, are smoked on mi355-gpu-40 by steps 1 to 5 and check 2, steps 4
+and 5 at concurrency 16 alone, with these changes:
+
+- The image is `rocm/atom-dev:vllm-v0.31.0-nightly_20261026`, whose aiter the tree
+  serves V4.1-Flash on, and `$M` names `machines/mi355x-gpu40.json`, pinned to its stack.
+- `$ATOM` is `--model <DeepSeek-V4.1-Flash> --max-model-len 262144 -tp 4
+  --kv_cache_dtype bf16 --index-cache-dtype fp8 --method dspark
+  --num-speculative-tokens 5 --level 0`, plus `--enable-expert-parallel` for the EP4
+  cell, and `G` names four GPUs.
+- The warm record serves traces 0 to 255 at 16. V4.1's Triton kernels still compile
+  new variants after it, so take again every record that names `aiter_jit_builds`.
+- Calibration adds a first-turn record at 16, its `client.sh` run with
+  `AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"`:
+  sampled starts leave rung 6 and above too few steps for a vector, and a step at a
+  rung with none is refused. The EP4 cell takes no first-turn record while
+  [#2538](https://github.com/jgong5/ATOM/issues/2538) stands: under expert parallel
+  that record faults, as some sampled-start records do, which are taken again. Its
+  law stops at the widest rung the sampled records fit, and the simulated run
+  refuses each step above it.
+- Steps 4 and 5 take `--duration 3600`, with a calibration record between step 4's
+  two real runs; step 5 adds `--acceptance-record $R/cell/c16/real1`. A step 5 at
+  another duration than step 4's is graded as another workload, and refused.
+- The draft vectors hold no held-out error: check 2's `cost` rows of kind `draft` give
+  the draft law's error on the real runs' own steps.

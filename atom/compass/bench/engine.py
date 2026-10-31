@@ -11,7 +11,9 @@ not the count `get_num_blocks` reports: that count reads the device's memory
 outside torch, which moves from one start to the next, so a pool sized by it
 can be smaller than the one a batch filled. A worker that dies stops the
 bench, naming the call that got no reply; a device that cannot hold the pool
-stops it naming both counts.
+stops it naming both counts. The per-request entries `get_num_blocks` replies
+become `config.pool_entries_per_req`, as `EngineCore` carries them to its block
+manager: the state slots a request holds, which the replay rule reads.
 `measure(batch)` runs `bench_step` on every worker and returns rank 0's reply,
 the window's result (`window.py`). `exit()` stops the workers and returns
 once they and every process they had started have exited, or after
@@ -103,6 +105,7 @@ class Bench:
         try:
             with _refuse_a_stop("get_num_blocks"):
                 budget = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
+            config.pool_entries_per_req = budget.get("pool_entries_per_req", {})
             try:
                 allocated = self.runner_mgr.call_func(
                     "allocate_kv_cache", num_blocks, wait_out=True

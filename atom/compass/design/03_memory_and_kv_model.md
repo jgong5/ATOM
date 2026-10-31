@@ -266,9 +266,12 @@ wrong — and the engine's own comment on that reduce has said so all along:
 tensor, so reduce to the global minimum."* The code said what this document denied.
 
 **The stages do not compute the same number.** The five readings *are* identical across
-stages — nothing in the memory model varies with pipeline rank. The layer count is not:
-`model_runner.py::ModelRunner._get_total_num_layers` takes a `get_pp_indices` slice, so
-each stage sizes its pool from the layers it actually holds. Re-derived from ATOM's own
+stages — nothing in the memory model varies with pipeline rank. The layers are not:
+`atom/models/utils.py::make_layers` builds only a stage's `get_pp_indices` span and puts a
+`PPMissingLayer` in every other slot, and the attention builder sizes each pool from the
+modules its walk over the built model finds
+(`atom/model_ops/attentions/pool_layout/pool_rows.py::PoolRowsMixin.pool_rows`), so each
+stage sizes its pool from the layers it actually holds. Re-derived from ATOM's own
 partitioner at `feature/atomcompass_new` `92f1fdafe`, over the 64-layer hybrid vendored at
 `tests/compass/qwen3_5_27b_config.json` — one full-attention layer in four, so 16 of the 64
 hold paged KV — at block size 64, `max_num_seqs` 256, and a KV budget fixed at

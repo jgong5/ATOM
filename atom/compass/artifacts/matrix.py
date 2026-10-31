@@ -185,7 +185,9 @@ MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
         Axis.ATOM_SRC: DEPENDS,
         Axis.MODEL: DEPENDS,
         Axis.DEVICE: DEPENDS,
-        Axis.PTL: DEPENDS,
+        Axis.PTL: Cell(
+            False, "in the key only because the machine-spec digest is one hash"
+        ),
         Axis.HOST_CPU: DEPENDS,
         Axis.ENGINE_CONFIG: DEPENDS,
     },

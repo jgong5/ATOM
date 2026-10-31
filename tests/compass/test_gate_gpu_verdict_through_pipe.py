@@ -117,7 +117,12 @@ CASES = {
 
 
 def _tree(root, case):
-    shutil.copytree(REPO / "scripts" / "compass", root / "scripts" / "compass")
+    # Another gate shard may be writing bytecode into __pycache__ as this copies.
+    shutil.copytree(
+        REPO / "scripts" / "compass",
+        root / "scripts" / "compass",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     files = {
         "scripts/compass/preflight.sh": _preflight(0),
         "scripts/compass/gpu_gate_known_failures.txt": "\n".join(KNOWN) + "\n",
