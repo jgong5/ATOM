@@ -2252,6 +2252,92 @@ def test_the_prefill_top_k_launches_the_workspace_aiter_builds_for_its_path(
     assert record["workspace_bytes"] == launched
 
 
+@pytest.mark.parametrize(
+    "decoding, rows, stride, scratch, copies",
+    [
+        (False, 8192, 2048, 8_388_863, 6),
+        (False, 1024, 32768, 16_777_471, 4),
+        (True, 512, 2048, 524_543, 94),
+    ],
+)
+def test_a_top_k_leaf_s_copies_and_footprint_count_the_scratch_it_launches(
+    monkeypatch, decoding, rows, stride, scratch, copies
+):
+    # The graph holds one byte of scratch; aiter sizes it as on MI455 for the
+    # two calls an 8192-token prefill makes at indexer budget 2048, from empty
+    # and ending at 128K, and for a 512-row decode whose row stride is its
+    # context.
+    from aiter.ops import topk
+
+    sizes = {(rows, stride, 512, decoding): scratch}
+    monkeypatch.setattr(topk, "topk_ob_workspace_size", lambda *q: sizes[q])
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda self, op, s, i, n: {"copies": n})
+    vector = _t([rows], "activation", [1], "torch.int32")
+    args = [
+        ("logits", _t([rows, stride], "activation", [stride, 1])),
+        *[(s, vector) for s in ("seqLens",) if decoding],
+        *[(s, vector) for s in ("rowStarts", "rowEnds") if not decoding],
+        ("indices", _t([rows, 512], "activation", [512, 1], "torch.int32")),
+        ("numRows", rows),
+        ("stride0", ir.Affine(1, 0) if decoding else stride),
+        ("k", 512),
+        ("workspace", _t([1], "activation", [1], "torch.uint8")),
+        ("stable", True),
+    ]
+    phase = "decode" if decoding else "prefill"
+    leaf = _leaf(f"aiter._top_k_per_row_{phase}.default", *args)
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    placed = SimpleNamespace(block_size=256, batch=lambda view, b, s: (b, s))
+    shape = decode(2) if decoding else prefill(6, 2)
+
+    [record] = ops.Stub(_Runner(), 256 << 20).point(placed, shape, 2048, found)
+
+    # Each call's logits, row bounds, indices and scratch: copies past twice
+    # a 256 MiB cache.
+    call = 4 * rows * (stride + 2 - decoding + 512) + scratch
+    assert (record["copies"], record["footprint_bytes"]) == (copies, copies * call)
+
+
+def test_a_top_k_leaf_whose_size_query_raises_refuses_and_its_point_is_timed(
+    monkeypatch,
+):
+    # aiter's top-k module fails to build: planning asks its size query, and
+    # the leaf refuses by name while the GEMM beside it is timed.
+    from aiter.ops import topk
+
+    def query(*q):
+        raise RuntimeError("module_top_k_per_row failed to build")
+
+    monkeypatch.setattr(topk, "topk_ob_workspace_size", query)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops, "_function", lambda name: lambda **kwargs: None)
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
+    monkeypatch.setattr(
+        ops, "_replay", lambda fn, calls, flush=None: [1.0] * ops.REPEATS
+    )
+    ints = [("numRows", 4), ("stride0", 8), ("k", 2), ("stable", True)]
+    scratch = ("workspace", _t([1], "activation", [1], "torch.uint8"))
+    top_k = _leaf(
+        "aiter._top_k_per_row_prefill.default",
+        ("logits", _t([4, 8], "activation")),
+        *ints,
+        scratch,
+    )
+    gemm = _leaf("aiter.gemm", ("x", _t([2, 8], "activation")))
+    found = ops.leaves(_graph(top_k, gemm, layers=1)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    got = ops.Stub(_Runner(), 1000).point(placed, prefill(6, 2), 20, found)
+
+    by_op = {record["op"]: record for record in got}
+    assert by_op["aiter._top_k_per_row_prefill.default"]["refused"] == (
+        "RuntimeError: module_top_k_per_row failed to build"
+    )
+    gemm = by_op["aiter.gemm"]
+    assert "refused" not in gemm and gemm["cold_ns"] == 1.0
+
+
 def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
     monkeypatch,
 ):
