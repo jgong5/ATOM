@@ -864,6 +864,7 @@ EXTRACTORS |= {
         "q", "k", read=("q_weight", "k_weight")
     ),
     "aiter.dynamic_per_token_scaled_quant.default": _only("input", "out", "scales"),
+    "aiter.dynamic_per_group_scaled_quant.default": _only("input", "out", "scales"),
     "aiter.v41_mhc_pre_delayed.default": _mhc_delayed,
     f"{V41}mhc:collapse_streams": _only("residual", "pre_mix"),
     "atom.model_ops.engram.device.gate:engram_post_wkv": _only(
