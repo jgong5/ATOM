@@ -688,7 +688,7 @@ and `buffers` terms of `peak_torch` with the storage bytes the start loaded.
 
 ## The step linear law from real cells — `step_linear_fit`
 
-`PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--engine FILE]`
+`PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K [--reference LAW]] [--engine FILE]`
 fits the law a run file's `step_linear` key holds (`atom/compass/backends/step_linear.py`) from
 the step records of real cells, `OUT_DIR/steps/dp0.jsonl` of `REAL=1
 cctraces_sim.sh` runs, each with the `dp0.engine.json` the run wrote beside it,
@@ -700,7 +700,12 @@ and what is cut, and the command writes each record's labels beside it for
 reading, `dp0.cost.jsonl`; the module's docstring states how outliers are
 dropped. The written law also carries, per vector, its samples, warm and dropped
 counts and condition number, and names any vector it could not fit under
-`unfitted`.
+`unfitted`. `--moe-routing E,K`, the model's routed experts and top-k, lets each
+decode rung adopt one column over its steps' real MoE tokens, the tokens or the
+experts they reach (`atom/compass/backends/step_linear.py`), by the rule the
+module's docstring states, and records under the vector's `fit.moe_column` what
+the rule read; a law refitted without it adopts none. `--reference LAW` names the
+law whose held-out band at each rung, with the dispersion floor, bars the column.
 
 `DIGEST` is the `machine_spec_digest` of the capture host's spec in
 `scripts/compass/machines/`, which a run's spec must match, printed by
@@ -765,7 +770,14 @@ keyed by `machines/mi355x-crs005.json`, in the image that file pins, at
 cell that built an aiter JIT module was run again. The decode side adds a c=256 cell
 at seed 20260709 and, for rung 12, c=96 at seeds 20260707 and 20260708 and c=112 at
 seed 20260709: a lone decode server at c=256 decodes at rungs 16 to 28, and at c=64
-at rungs 4 and 8.
+at rungs 4 and 8. The decode law's rung 2, 4 and 8 vectors are refitted with
+`--moe-routing 384,6`, DeepSeek-V4-Pro's routed experts and top-k, and the gpu-45
+decode law as `--reference`, on those cells and on the decode sides of two 1P1D
+`deploy.sh record` cells (below) at c=256 over traces 256 to 392, seeds 20260707 and
+20260708, whose decode ranks run unevenly loaded
+([#2493](https://github.com/jgong5/ATOM/issues/2493)); each adopts `moe_experts`.
+Its other vectors and its host laws are the ones fitted on the lone cells alone, and
+its `sources` names the records each came from.
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json`
 are the same pair with expert parallelism on (MORI): the `history` form, fitted by

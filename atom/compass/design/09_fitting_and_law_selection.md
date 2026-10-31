@@ -234,8 +234,35 @@ prefill:  [ 1,  tokens,  Σ_req N_Q²,  Σ_req N_Q·(ctx − N_Q) ]
           + history: Σ_req (ctx − N_Q), in `step_linear_fit`'s `history` form
 decode:   [ 1,  batch,   Σ ctx ]
 per rung: [ 1,  Σ ctx,   rung·max(ctx) − Σ ctx ]
+          + n or E·(1 − (1 − K/E)^n), on a rung that adopts one (`--moe-routing E,K`)
           + rowmod(k), on a rung that adopts one (D61)
 ```
+
+A decode rung may adopt one MoE column over `n`, the real tokens the step's MoE runs on:
+the DP group's gathered tokens (`BatchView.moe_tokens`), a rank's own on one rank. The
+gather pads every rank to the rung, and a pad row reaches no expert since
+[#2340](https://github.com/jgong5/ATOM/pull/2340), and before it only the one expert set
+of token 0, so a decode step's MoE work follows the group's real tokens, not the rung. An
+uneven spread over the ranks leaves them well below the rung's rows: a 1P1D decode side at
+about 11 rows over 8 ranks decodes at rung 4 with 13 real of 32 gathered rows (p50), where
+lone decode servers at rung 4 run 26, and a rung-only vector fitted on the lone servers
+prices that side 10% high at rung 4 and 14% at rung 8. The candidates are `n` itself,
+`moe_tokens`, for the GEMM rows, and `moe_experts`, `X = E·(1 − (1 − K/E)^n)`, the routed
+experts `n` tokens reach in expectation, each routed to `K` of `E`
+(`work.activated_experts`), for the expert weights read. Nothing assumes decode is memory-
+or compute-bound; the data picks. Each of the three forms, no column, `n` and `X`, is solved
+with each record held out of the rung's steps, and its held-out error is the magnitude of
+each held-out record's p50 error, averaged with the record's steps as weights. A rung picks
+the form of smallest held-out error and adopts a picked column only when no record's
+held-out p50 moves from inside the rung's bar (D61) to outside it under the column; a rung
+that adopts neither keeps its three columns, and a rung of one record has no held-out error
+to pick by. Two columns at once were tried and refused: on the small
+rungs `n` and `X` are nearly collinear, and the non-negative solve kept one of the two at
+every rung ([#2493](https://github.com/jgong5/ATOM/issues/2493)). The column is a hull
+coordinate, so a step whose `n` falls outside the `n` its rung was fitted on is priced as
+an extrapolation (D58). Prefill needs no such column: its gather is variable-length, so
+`moe_rows` is its real tokens. An MTP draft law's decode vectors take no MoE column until
+a data-parallel MTP record tests it there.
 
 Two constructions are load-bearing and both were originally wrong.
 
@@ -530,7 +557,15 @@ MoE segment is priced under independent uniform routing over the experts, at eve
 granularity, from `T_moe` with EP on or off (`15` D90); the analytical laws price it in
 expectation, under EP at the expected maximum rank load (`10` D64). Real
 routing is data-dependent (`15` D92 Q2) and no feature carries it, so whatever skew a
-capture's routing has is folded into the fitted MoE terms. `max` over ranks is the
+capture's routing has is folded into the fitted MoE terms; a step linear decode rung's MoE
+column (D55) prices the real tokens, or the experts uniform routing has them reach in
+expectation. The gate's skew is invisible at step granularity, so it stays this treatment
+and is counted in the error budget: a decode rung's bar is the wider, p90 less p10, of the
+reference law's held-out band at that rung (the gpu-45 decode law's, for the crs005 law)
+and the dispersion floor, the p10 to p90 of the error of pricing each step at the median of
+its record's steps at the same rung and the same `n`, on the records the law is fitted on.
+A held-out record's p50 is graded against the bar, with the p50 bias and the dispersion
+reported apart. `max` over ranks is the
 per-layer critical path, by construction with EP off and under this treatment with EP on
 (`15` D90); where routing is not uniform under EP, `max` underestimates the step.
 Stage 3 keeps this treatment at EP8 (owner ruling on
@@ -538,7 +573,9 @@ Stage 3 keeps this treatment at EP8 (owner ruling on
 the step linear law fitted under the EP8 engine config absorbs MORI dispatch and combine
 through its prefill `moe_rows` term and its intercepts, and no received-rows feature is
 fitted. A decode vector needs no `moe_rows` term, since at a replayed rung `T_moe` is
-fixed by the rung and the rung's intercept holds it. The measured received-row
+fixed by the rung and the rung's intercept holds it; the real tokens among those rows
+are another matter, since a pad row reaches no expert, and a rung's MoE column fits them
+(D55). The measured received-row
 imbalance, whose size `15` D90 states, is reported beside the law's accuracy
 ([#1108](https://github.com/jgong5/ATOM/issues/1108)).
 
@@ -598,13 +635,13 @@ choice that must be visible.
 |---|---|---|
 | D53 | Fit relative error, not absolute seconds. MAD outlier test on the same relative residuals. | 2026-09-18 |
 | D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under TP, DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by alternating max-affine regression. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes and host-paced prefills cut; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait, and `L_mtp`, the status copy's latency), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), are fitted beside it, keyed by host CPU, `atom` digest, model, engine config and machine-spec digest, with no transfer. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); machine-spec digest in the host-law key 2026-10-16 (#952); host-paced prefill cut 2026-10-24 (#1983); `L_mtp` and the decode draft-KV vector 2026-10-25 (#2080); output prefill draft-KV pass 2026-10-25 (#2100); a prefill launch the device held gives no `W_launch` 2026-10-26 (#2256); TP above 1 2026-10-30 (#2490) |
-| D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61). | 2026-09-18; revised 2026-10-14 (#941) |
+| D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61), and, given the model's routing, one MoE column, the step's real MoE tokens `n` or the experts `X` they reach: the form of smallest step-weighted held-out error, no column among them, adopted when no record's held-out p50 leaves the rung's bar under it. | 2026-09-18; revised 2026-10-14 (#941) and 2026-10-31 (MoE column, #2493) |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |
 | D58 | Refuse rather than fall back on a step kind with no samples. The extrapolation guard is a convex hull or k-NN distance, never a per-feature bounding box; an out-of-hull step is priced `estimated` and unvalidated, its source naming the extrapolation, not refused, and graded by cost accuracy as well as reported apart. The step linear law refuses a discrete value it has no vector for, extrapolates outside its fitted hull, and is validated only inside the hull of its held-out steps. | 2026-09-18; revised 2026-10-11 (#765), 2026-10-14 (#952) and 2026-10-23 (#2011) |
 | D59 | A family is validated on independently gathered data, never by LOO. Rank at least three candidates and report all held-out errors. A law that fits one axis is tested on a second before it ships. | 2026-09-18 |
 | D60 | Laws are piecewise over dispatch bands read from recorded kernel identity. A query with no same-band bracket refuses. At the op level `measure ops` records each point's kernels and `fit ops` interpolates only between same-kernel neighbours, and across neither gap beside a hidden band or a point with a held-out error over 5%, holding out no point whose neighbours are one coordinate away on each side, one row's bytes for a collective whose ranks move the same rows (one byte for `all_gatherv`, `reduce_scatterv` and MORI); a declined leaf falls to its analytical law, counted. An interpolated leaf is validated inside a held-out bracket on each line it interpolates along. | 2026-09-18; op level 2026-10-18 (#1489); declined lines 2026-10-19 (#1493), per gap 2026-10-25 (#2107); adjacent neighbours 2026-10-20 (#1746), a collective's 2026-10-22 (#1908); validated brackets 2026-10-23 (#2011) |
-| D61 | Treatments are stated and the calibration population matched; an assumed treatment is a property of the query, recorded in the run summary. Decode row order, worth 1.77× at a fixed multiset, is a decode feature, `rowmod(k)` in scheduled order, adopted per rung by a four-condition rule. Uniform routing of the MoE segment under DP and EP is an assumed treatment, at every granularity. | 2026-09-18; revised 2026-10-01, 2026-10-14 (#941, #952) |
+| D61 | Treatments are stated and the calibration population matched; an assumed treatment is a property of the query, recorded in the run summary. Decode row order, worth 1.77× at a fixed multiset, is a decode feature, `rowmod(k)` in scheduled order, adopted per rung by a four-condition rule. Uniform routing of the MoE segment under DP and EP is an assumed treatment, at every granularity; a decode rung's MoE column counts experts under it, and the skew it cannot see is counted in each rung's bar, the wider of the reference law's held-out band and the dispersion floor at the same `n` on the fitted records. | 2026-09-18; revised 2026-10-01, 2026-10-14 (#941, #952) and 2026-10-31 (#2493) |
 | D62 | Leading warmth is measured and reported, never charged. Error is reported stratified by the axes the law is linear in. | 2026-09-18 |
 
 ---
