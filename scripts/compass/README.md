@@ -778,6 +778,28 @@ the decode side 64 once more at the default ([#1810](https://github.com/jgong5/A
 Each decode rung a law fits has steps in two or more cells, so each carries a held-out
 hull. Host keys as above.
 
+`scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json` is DeepSeek-V4.1-Flash's
+law for cell B of [#2138](https://github.com/jgong5/ATOM/issues/2138), TP4 with the routed
+experts sharded across TP and DSpark with 5 speculative tokens, on one MI455 A0 node: the
+`history` form with host laws, keyed by `machines/mi455-a0.json`, fitted by `compass fit
+steps` and `compass fit host` on `calibrate.sh` records at ATOM 9653adb6a, taken in the image
+and aiter that spec pins ([#2462](https://github.com/jgong5/ATOM/issues/2462)). The records
+are concurrency 1, 4, 16 and 64, then 8 and 12 from each trajectory's first turn for rungs 7,
+8 and 12; its decode vectors stop at rung 48, and a c=256 record for rungs 56 and 64 is
+[#2544](https://github.com/jgong5/ATOM/issues/2544). Each server ran with `ENABLE_CK=0
+GPU_ARCHS=gfx1250 ATOM_ENGRAM_UVA=0 AITER_LOG_LEVEL=WARNING OMP_NUM_THREADS=4
+ATOM_DISABLE_MMAP=true AITER_REUSE_IDENTICAL_COMM_GROUPS=1`, `NCCL_MIN_NCHANNELS` unset, and
+`SERVER_ARGS` of `--trust-remote-code -tp 4 --kv_cache_dtype bf16 --index-cache-dtype fp8
+--method dspark --num-speculative-tokens 5 --gpu-memory-utilization 0.9
+--max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --block-size 16 --level 0
+--max-num-seqs 64 --cudagraph-capture-sizes [1,2,3,4,5,6,7,8,12,16,24,32,40,48,56,64]
+--max-model-len 262144`; the law's engine config holds `AITER_LOG_LEVEL` and
+`OMP_NUM_THREADS`, so a run sets them too. A fresh container compiles Triton variants of
+`_unit_table_kernel` and `_indices` record after record, so unscored records at each
+concurrency, and a call of `atom/model_ops/deepseek_v41/unit_table.py::unit_table` per
+variant on tile buffers as `ScoreWorkspace` sizes them, came first; a record that still
+built one was taken again.
+
 ## Cost accuracy on a real run's own steps — `validate.cost`
 
 `PYTHONPATH=$T python -m atom.compass.validate.cost RECORD LAW` prices each step of a real
