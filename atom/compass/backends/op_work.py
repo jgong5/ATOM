@@ -678,9 +678,11 @@ def _aten(op, view, tp, kv) -> Work | None:
     """Any aten operator: its boundary, each output in the dtype a meta-device
     call of it returns, and torch's flop formula when it has one. A view,
     which aliases its input, writes nothing and keeps the dtype, launches no
-    kernel; nor does an allocation."""
+    kernel; nor does a dtype view, which reads the same bytes as another
+    dtype, or an allocation. A cast, also aliased, copies when its dtype
+    differs."""
     name, args = op["op"], op["args"]
-    if name.startswith(ALLOCATIONS):
+    if name.startswith(ALLOCATIONS) or name == "aten.view.dtype":
         return None
     _, packet, overload = name.split(".")
     target = getattr(getattr(torch.ops.aten, packet), overload)
