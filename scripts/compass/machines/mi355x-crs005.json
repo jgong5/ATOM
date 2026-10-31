@@ -3,7 +3,7 @@
   "name": "mi355x-crs005",
   "provenance": {
     "authored_by": "compass agent for jgong5",
-    "date": "2026-10-28",
+    "date": "2026-10-29",
     "origin": "mixed",
     "origins": {
       "host.cpu.cores_physical": {
@@ -16,73 +16,73 @@
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:b3d336068",
-        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
       },
       "device.arch": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:b3d336068",
-        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
       },
       "device.count_per_node": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:b3d336068",
-        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
       },
       "device.memory.capacity_bytes": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:b3d336068",
-        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
       },
       "device.software_pinned_to.rocm": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:b3d336068",
-        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
       },
       "device.software_pinned_to.aiter": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:b3d336068",
-        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
       },
       "device.software_pinned_to.rccl": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:b3d336068",
-        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
       },
       "device.software_pinned_to.torch": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
         "width": 8,
-        "source_root": "commit:b3d336068",
-        "record": "sha256:865b51aeaea5190d62271a2d457bd560bd2422b5fdc57408924345babe93a494"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
       },
       "host.http_intake.fixed_s": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
-        "source_root": "commit:b3d336068",
-        "record": "sha256:60435186b0b1daf45d7e98aa75dc4bc82150a477d5cc38c8bd7271ae19f60d6c",
-        "p10": 0.0014128760640065338,
-        "p90": 0.001521239612506286
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:fc9dadb1074821306edad43745d303c9de754feb03e9efcb195885b7282663cb",
+        "p10": 0.0020310947130036056,
+        "p90": 0.002139447088691459
       },
       "host.http_intake.per_byte_s": {
         "origin": "probed",
         "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
-        "source_root": "commit:b3d336068",
-        "record": "sha256:60435186b0b1daf45d7e98aa75dc4bc82150a477d5cc38c8bd7271ae19f60d6c",
-        "p10": 2.71217303823821e-09,
-        "p90": 3.5697033407812384e-09
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:fc9dadb1074821306edad43745d303c9de754feb03e9efcb195885b7282663cb",
+        "p10": 3.9301788350529524e-09,
+        "p90": 4.159128855060515e-09
       },
       "device.memory.bandwidth_bytes_per_s": {
         "origin": "datasheet"
@@ -128,47 +128,47 @@
       },
       "device.memory.bandwidth_curve": {
         "origin": "probed",
-        "source_root": "commit:b3d336068",
-        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
       },
       "device.kernel_floor_s": {
         "origin": "probed",
-        "source_root": "commit:b3d336068",
-        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8",
-        "p10": 1.5546149611473082e-06,
-        "p90": 1.5565140008926393e-06
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1",
+        "p10": 1.5642129778861997e-06,
+        "p90": 1.5676080465316773e-06
       },
       "interconnect.intra_node.link_latency_s": {
         "origin": "probed",
-        "source_root": "commit:b3d336068",
-        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8",
-        "p10": 8.018480122089386e-07,
-        "p90": 8.218535602092743e-07
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1",
+        "p10": 8.557889819145204e-07,
+        "p90": 8.71113008260727e-07
       },
       "device.memory.derate": {
         "origin": "probed",
-        "source_root": "commit:b3d336068",
-        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
       },
       "device.compute.derate.bf16": {
         "origin": "probed",
-        "source_root": "commit:b3d336068",
-        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
       },
       "device.compute.derate.fp8": {
         "origin": "probed",
-        "source_root": "commit:b3d336068",
-        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
       },
       "device.compute.derate.fp4": {
         "origin": "probed",
-        "source_root": "commit:b3d336068",
-        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
       },
       "interconnect.intra_node.derate": {
         "origin": "probed",
-        "source_root": "commit:b3d336068",
-        "record": "sha256:4b58faa41e05d3add78e47190d4dbf42126031c07b5a95d72f08dc233697fbc8"
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
       },
       "host.tokenizers[deepseek-v4-pro fast]": {
         "origin": "probed",
@@ -197,7 +197,7 @@
       "ptl",
       "peaks"
     ],
-    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at b3d336068 | one real c=256 first-turn cc-traces burst at b3d336068 | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples"
+    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at f6e1fa77d | one real c=256 first-turn cc-traces burst at f6e1fa77d | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples"
   },
   "host": {
     "cpu": {
@@ -225,8 +225,8 @@
       "shm_broadcast_s": 2e-05
     },
     "http_intake": {
-      "fixed_s": 0.0014311130320839418,
-      "per_byte_s": 3.5102747271578888e-09
+      "fixed_s": 0.0020912355743506537,
+      "per_byte_s": 4.19943165426115e-09
     }
   },
   "device": {
@@ -240,105 +240,105 @@
       "bandwidth_curve": [
         [
           4096,
-          2413813410.100116
+          2448213119.8574038
         ],
         [
           8192,
-          4823419983.541849
+          4901932899.645926
         ],
         [
           16384,
-          9641730481.55563
+          9799057786.896889
         ],
         [
           32768,
-          19173337233.690044
+          19216086138.60756
         ],
         [
           65536,
-          36575081937.163506
+          36700073375.20446
         ],
         [
           131072,
-          73131371239.01624
+          73396013852.64185
         ],
         [
           262144,
-          146076910277.64084
+          146726346018.3001
         ],
         [
           524288,
-          280998663743.7066
+          281614855936.05884
         ],
         [
           1048576,
-          557954112642.1067
+          559324208073.2725
         ],
         [
           2097152,
-          1069853776606.5919
+          1069975261609.8036
         ],
         [
           4194304,
-          1890921880709.587
+          1900125139330.0735
         ],
         [
           8388608,
-          3041811103890.011
+          3036138588634.988
         ],
         [
           16777216,
-          4090162662216.4897
+          4078284050135.474
         ],
         [
           33554432,
-          5139918483843.753
+          5133415851480.742
         ],
         [
           67108864,
-          5858565557039.681
+          5842638294512.771
         ],
         [
           134217728,
-          6063862790040.402
+          6020018863349.566
         ],
         [
           268435456,
-          6155113267810.816
+          6119695251585.363
         ],
         [
           536870912,
-          6277461842993.828
+          6257719852339.275
         ],
         [
           1073741824,
-          6403441199249.063
+          6371910488551.815
         ],
         [
           2147483648,
-          6483478211391.745
+          6463389077030.495
         ],
         [
           4294967296,
-          6526631423666.336
+          6556731501062.837
         ]
       ],
-      "derate": 0.815828927958292
+      "derate": 0.8195914376328546
     },
     "compute": {
       "bf16_flops": 2516600000000000.0,
       "fp8_flops": 5033200000000000.0,
       "fp4_flops": 1.00663e+16,
       "derate": {
-        "bf16": 0.6489207063596362,
-        "fp8": 0.6720787536999386,
-        "fp4": 0.5612035987465552
+        "bf16": 0.6507569126723242,
+        "fp8": 0.6723797263423974,
+        "fp4": 0.5597019488155491
       }
     },
-    "kernel_floor_s": 1.55571848154068e-06,
+    "kernel_floor_s": 1.5658164620399475e-06,
     "software_pinned_to": {
       "rocm": "7.2.4",
-      "aiter": "948dd267f",
+      "aiter": "41d4d8d7e",
       "rccl": "2.27.7",
       "torch": "2.10.0+rocm7.2.4.git3d3aa833"
     }
@@ -348,8 +348,8 @@
       "topology": "fully_connected",
       "domain_devices": 8,
       "link_bandwidth_bytes_per_s": 76800000000.0,
-      "link_latency_s": 8.134097456932069e-07,
-      "derate": 0.7925272197140891
+      "link_latency_s": 8.638092577457427e-07,
+      "derate": 0.792221303292688
     },
     "inter_node": {
       "link_bandwidth_bytes_per_s": 50000000000.0,

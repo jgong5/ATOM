@@ -266,9 +266,12 @@ wrong — and the engine's own comment on that reduce has said so all along:
 tensor, so reduce to the global minimum."* The code said what this document denied.
 
 **The stages do not compute the same number.** The five readings *are* identical across
-stages — nothing in the memory model varies with pipeline rank. The layer count is not:
-`model_runner.py::ModelRunner._get_total_num_layers` takes a `get_pp_indices` slice, so
-each stage sizes its pool from the layers it actually holds. Re-derived from ATOM's own
+stages — nothing in the memory model varies with pipeline rank. The layers are not:
+`atom/models/utils.py::make_layers` builds only a stage's `get_pp_indices` span and puts a
+`PPMissingLayer` in every other slot, and the attention builder sizes each pool from the
+modules its walk over the built model finds
+(`atom/model_ops/attentions/pool_layout/pool_rows.py::PoolRowsMixin.pool_rows`), so each
+stage sizes its pool from the layers it actually holds. Re-derived from ATOM's own
 partitioner at `feature/atomcompass_new` `92f1fdafe`, over the 64-layer hybrid vendored at
 `tests/compass/qwen3_5_27b_config.json` — one full-attention layer in four, so 16 of the 64
 hold paged KV — at block size 64, `max_num_seqs` 256, and a KV budget fixed at
@@ -447,7 +450,7 @@ source per term; the bullets below say why each is what it is.
 | invisible scratch | inside the activations reading; a term of its own only under the liveness walk (`04` T4) | [#704](https://github.com/jgong5/ATOM/issues/704) |
 | persistent | `persistent_forward_buffer_bytes` in the run's `memory_readings` entry | — |
 | load residue, `non_torch` | the run's `memory_readings` entry, keyed by the parallel layout (`atom/compass/run/memory.py::key_fields`) | [#702](https://github.com/jgong5/ATOM/issues/702) |
-| graph pool | `graph_pool.reserves()` for the deployment's own `enforce_eager`; when it captures, the runner's `_piecewise_cg_active()` picks the branch, whole-graph from the activations term, piecewise from `piecewise_per_token_bytes` and `capture_token_shapes` over the deployment's ladder | [#700](https://github.com/jgong5/ATOM/issues/700) |
+| graph pool | `graph_pool.reserves()` for the deployment's own `enforce_eager`; when it captures, the runner's `_tr_hybrid_active()` picks the branch, whole-graph from the activations term, piecewise from `piecewise_per_token_bytes` and `capture_token_shapes` over the deployment's ladder | [#700](https://github.com/jgong5/ATOM/issues/700) |
 
 **The per-term check** is `memory/compare.py` with `graph_pool.predicts`: each predicted
 term against the same term of a recorded real run, wired for stage 2's paired runs

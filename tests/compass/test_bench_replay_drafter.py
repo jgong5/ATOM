@@ -127,7 +127,7 @@ def test_a_replayed_step_is_the_batch_atoms_scheduler_built_under_a_drafter(
             past |= tables != own
     assert kinds == {(False, False), (False, True), (True, True)}
     assert past == (drafter == "dspark5")
-    assert rebuilt.replay_rule == {"name": "fresh-contiguous", "version": 2}
+    assert rebuilt.replay_rule == {"name": "fresh-contiguous", "version": 3}
 
 
 def line_tokens(line):
