@@ -103,15 +103,20 @@ class TentativeState:
         if not cursor.is_cuda:
             cursor[slots.long()] = cursors[torch.arange(count), anchors - starts]
             return
-        _commit_cursors[(count,)](
-            cursor,
-            cursors,
-            anchors,
-            starts,
-            slots,
-            cursor.stride(0),
-            cursors.stride(0),
-            cursors.stride(1),
-            WIDTH=cursor.shape[1],
-            BLOCK=triton.next_power_of_2(cursor.shape[1]),
-        )
+        _launch_commit_cursors(count, cursor, cursors, anchors, starts, slots)
+
+
+def _launch_commit_cursors(count, cursor, cursors, anchors, starts, slots):
+    """Each of `count` requests' accepted prefix's cursor into its slot."""
+    _commit_cursors[(count,)](
+        cursor,
+        cursors,
+        anchors,
+        starts,
+        slots,
+        cursor.stride(0),
+        cursors.stride(0),
+        cursors.stride(1),
+        WIDTH=cursor.shape[1],
+        BLOCK=triton.next_power_of_2(cursor.shape[1]),
+    )
