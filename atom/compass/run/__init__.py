@@ -1250,8 +1250,7 @@ def engine(config):
     At DP width above one, the process joins the engine LP as the member of its
     DP rank, and its host collectives first join the group rounds it owes. A
     pipeline stage is the engine LP ``engine-pp<stage>``, or a prefill side's
-    ``engine-P-pp<stage>``. The engine ignores SIGTERM from just before it
-    says READY (`_ignoring_sigterm_from_ready`).
+    ``engine-P-pp<stage>``.
 
     A real run recording its steps (`parity.ENV`) outside a pipeline stamps the
     engine's input pulls and output puts into ``dp<rank>.pulls.jsonl`` beside
@@ -2040,7 +2039,7 @@ def engine_loop(engine_core):
     steps cost. A stop reaches the engine as the ``+inf`` grant instead. The
     engine has ignored SIGTERM since it said READY (`engine`); the loop
     ignores it first too, before the run file's read, a pipeline stage's sends
-    or the bundle's request, and puts back however it leaves the handler set
+    or the bundle's request, and however it leaves puts back the handler set
     aside at READY, or else the one it found.
 
     A pipeline stage's runner calls go through `pp_send.install`'s sends. A
