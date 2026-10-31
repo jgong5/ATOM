@@ -1786,14 +1786,15 @@ def _graph_pool(model_runner, machine, model):
 
 
 def tokenizer(tok, config) -> None:
-    """Wrap `tok`'s ``encode`` and ``decode`` with the machine spec's entry for
-    the model's architecture and the backend that loaded; the entry warns when
-    the loaded ``tokenizer.json`` is not the one it was measured on."""
+    """Wrap `tok`'s ``encode`` and ``decode``, and its fast backend's
+    ``encode_batch``, with the machine spec's entry for the model's architecture
+    and the backend that loaded; the entry warns when the loaded
+    ``tokenizer.json`` is not the one it was measured on."""
     run = spec()
     if run is None:
         return
     from atom.compass.spec import Backend
-    from atom.utils.compass_loop import wrap_decode, wrap_encode
+    from atom.utils.compass_loop import wrap_decode, wrap_encode, wrap_encode_batch
 
     entry = _machine(run).tokenizer_for(
         config.hf_config.architectures[0],
@@ -1802,6 +1803,11 @@ def tokenizer(tok, config) -> None:
     )
     tok.encode = wrap_encode(tok.encode, entry)
     tok.decode = wrap_decode(tok.decode, entry)
+    # ATOM's segment tokenizer encodes a long prompt's uncached segments with
+    # the backend's ``encode_batch``, not ``encode``.
+    backend = getattr(tok, "_tokenizer", None)
+    if backend is not None:
+        backend.encode_batch = wrap_encode_batch(backend.encode_batch, entry)
 
 
 def http_intake() -> tuple[float, float, float] | None:

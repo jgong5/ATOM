@@ -425,6 +425,14 @@ p50 input is 88,768 tokens and p90 is 204,288, this is not a rounding error.
 `--preprocess-pool-width`; how the simulated run's executor composes with it is open
 (below).
 
+A prompt of `segment_tokenizer.py::_MIN_CACHED_CHARS` characters or more goes through ATOM's
+segment tokenizer instead (`SegmentTokenizer`, on by default, `ATOM_TOKENIZE_CACHE_MB`): it
+reuses the ids of segments earlier prompts encoded and encodes the rest in one
+`encode_batch` on the fast backend, not through `encode`. A simulated run charges that call
+by the same encode terms over the ids it returns, the batch at the single-call rate
+([#2558](https://github.com/jgong5/ATOM/issues/2558)); the reuse path's own work (splitting,
+hashing, copying ids) is charged nothing.
+
 **Decode** — `IncrementalStreamDetokenizer.update` at
 `atom/entrypoints/openai/streaming_dispatch.py`:
 
