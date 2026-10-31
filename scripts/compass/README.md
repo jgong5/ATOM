@@ -1083,7 +1083,11 @@ and 5 at concurrency 16 alone, with these changes:
 - Calibration adds a first-turn record at 16, its `client.sh` run with
   `AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"`:
   sampled starts leave rung 6 and above too few steps for a vector, and a step at a
-  rung with none is refused.
+  rung with none is refused. The EP4 cell takes no first-turn record while
+  [#2538](https://github.com/jgong5/ATOM/issues/2538) stands: under expert parallel
+  that record faults, as some sampled-start records do, which are taken again. Its
+  law stops at the widest rung the sampled records fit, and the simulated run
+  refuses each step above it.
 - Steps 4 and 5 take `--duration 3600`, with a calibration record between step 4's
   two real runs; step 5 adds `--acceptance-record $R/cell/c16/real1`. A step 5 at
   another duration than step 4's is graded as another workload, and refused.
