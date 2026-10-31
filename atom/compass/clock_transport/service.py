@@ -111,8 +111,8 @@ class _Server:
         address = (lp, *member) if member else lp
         slot = queue.Queue() if slot is None else slot
         with self._lock:
-            taken = self._slots.setdefault(address, slot) is not slot
-            if lp not in self._lps or taken:
+            # A non-participant is refused before its slot is registered.
+            if lp not in self._lps or self._slots.setdefault(address, slot) is not slot:
                 state, why = "not a participant", ""
                 if lp in self._lps:
                     state = "already bound"
@@ -284,21 +284,15 @@ class _Connection:
 
 class _ReadableSlot:
     """A reply slot an LP can also wait on with `select`: each reply makes its
-    pipe readable by one byte, which `get` takes with the reply. Once closed it
-    takes nothing, so a late reply writes to no descriptor the process has
-    since reused."""
+    pipe readable by one byte, which `get` takes with the reply."""
 
     def __init__(self) -> None:
         self._replies = queue.SimpleQueue()
         self._read, self._write = os.pipe()
-        self._lock = threading.Lock()
-        self._open = True
 
     def put(self, frame: bytes) -> None:
-        with self._lock:
-            if self._open:
-                self._replies.put(frame)
-                os.write(self._write, b"\0")
+        self._replies.put(frame)
+        os.write(self._write, b"\0")
 
     def get(self) -> bytes:
         os.read(self._read, 1)
@@ -306,13 +300,6 @@ class _ReadableSlot:
 
     def fileno(self) -> int:
         return self._read
-
-    def close(self) -> None:
-        with self._lock:
-            if self._open:
-                self._open = False
-                os.close(self._read)
-                os.close(self._write)
 
 
 class _HereConnection(_Connection):
@@ -328,9 +315,6 @@ class _HereConnection(_Connection):
 
     def fileno(self) -> int:
         return self._slot.fileno()
-
-    def close(self) -> None:
-        self._slot.close()
 
 
 def serve(
