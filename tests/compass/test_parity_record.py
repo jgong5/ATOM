@@ -850,6 +850,10 @@ def test_no_file_call_or_json_encoding_runs_between_two_forwards(tmp_path, monke
             calls.append("write")
             return self.f.write(text)
 
+        def flush(self):
+            calls.append("flush")
+            self.f.flush()
+
         def close(self):
             calls.append("close")
             self.f.close()
@@ -880,9 +884,10 @@ def test_no_file_call_or_json_encoding_runs_between_two_forwards(tmp_path, monke
         record.add(batch, runner, lambda batch: None)
     record.write()
 
-    # Emptied at the start; then only the forwards' stamps until the exit.
-    start = ["open", "write", "close"]
-    end = ["dumps"] * 3 + ["open", "write", "close"]
+    # Opened, emptied, at the start; then only the forwards' stamps until the
+    # exit, which writes through the file opened at the start.
+    start = ["open"]
+    end = ["dumps"] * 3 + ["write", "flush"]
     assert calls == start + ["stamp", "stamp"] * 3 + end
     monkeypatch.undo()
     line = '"is_dummy_run": true, "produces_output": true, "batch": [], "named": []'
