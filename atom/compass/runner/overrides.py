@@ -1481,9 +1481,7 @@ class NonAllocatingRunner(
         if record is not None and record.step == 1:
             # The record was just created, replacing an earlier run's; so is
             # the cost table, before anything this step does can stop the run.
-            record.path.with_suffix(".cost.jsonl").write_text(
-                json.dumps({"version": COST_TABLE_VERSION}) + "\n"
-            )
+            _start_cost_table(self, record)
 
         stream = getattr(self, "_token_stream", None)
         if stream is None:
@@ -1535,6 +1533,16 @@ class NonAllocatingRunner(
         return out
 
 
+def _start_cost_table(runner: Any, record: Any) -> None:
+    """Open `record`'s `dp<r>.cost.jsonl`, replacing an earlier run's, and
+    write its version line; the file stays open for the run, as the record's
+    own does, in `runner`'s `_cost_table`."""
+    table = record.path.with_suffix(".cost.jsonl").open("w")
+    table.write(json.dumps({"version": COST_TABLE_VERSION}) + "\n")
+    table.flush()
+    vars(runner)["_cost_table"] = table
+
+
 def _group_step_seconds(
     runner: Any, batch: Any, backend: CostBackend, mode: Any = None
 ) -> float:
@@ -1575,7 +1583,7 @@ def _group_step_seconds(
     has one reason.
 
     On the rank that keeps the parity record, each step also appends its cost
-    line to `dp<r>.cost.jsonl` beside it: the record's `step`; with a
+    line, flushed, to `dp<r>.cost.jsonl` beside it: the record's `step`; with a
     `compass_host` that reports them, each of `HOST_SEGMENTS` and
     `MTP_SEGMENT` and `PP_RECV_SEGMENT`, the part of `W_launch` before a
     later stage's receive, in seconds, each 0.0 where the law has none, and `skipped`,
@@ -1586,7 +1594,7 @@ def _group_step_seconds(
     and its provenance's `method`, `validated` and `source`; and `refused`,
     the ``cost:`` reason or None. Above them, `forward` starts the file with
     `{"version": COST_TABLE_VERSION}` as the record starts, replacing an
-    earlier run's file.
+    earlier run's file, and keeps it open in `_cost_table` for the run.
     """
     from atom.compass.runner.projection import batch_view, dp_group, forward_mode
 
@@ -1694,8 +1702,8 @@ def _group_step_seconds(
         ],
         "refused": refused,
     }
-    with record.path.with_suffix(".cost.jsonl").open("a") as f:
-        f.write(json.dumps(line) + "\n")
+    runner._cost_table.write(json.dumps(line) + "\n")
+    runner._cost_table.flush()
     return group_s
 
 
