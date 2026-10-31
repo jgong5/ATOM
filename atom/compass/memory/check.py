@@ -3,14 +3,15 @@
 
 """A simulated run's non-KV memory against a real run's, one term at a time.
 
-    python -m atom.compass.memory.check PREDICTED... SERVER_LOG|MEASURED
+    python -m atom.compass.memory.check [--tp N] PREDICTED... SERVER_LOG|MEASURED
 
 PREDICTED is an engine's ``lp-<engine>.json`` in a simulated run's ``out_dir``,
 whose memory section holds the readings its KV pool was sized from, the warmup shape, and
 what the graph pool really costs; at DP width N, the N ranks' ``lp-<engine>.dp<r>.json``,
 each checked in turn. SERVER_LOG is the log of one real ATOM server with the
 same deployment, at N ranks a line per rank. Those lines name no rank, so they
-are read only when every rank logs the same values. MEASURED is the ``--out``
+are read only when every rank logs the same values. ``--tp N`` reads one DP rank's
+line per TP rank, a table each, then each term's spread. MEASURED is the ``--out``
 of a `compass measure memory` start of that deployment: its engine's log is
 read as SERVER_LOG is.
 
@@ -38,6 +39,7 @@ from atom.compass.backends.provenance import Method
 from atom.compass.memory import graph_pool
 from atom.compass.memory.budget import SUBTRACTED
 from atom.compass.memory.compare import (
+    Comparison,
     Predicted,
     Recorded,
     Shape,
@@ -255,9 +257,26 @@ def parts(
     return out
 
 
-def check(predicted_file: Path, log: Path, ranks: int = 1) -> str:
-    """The per-term table, the predicted readings' own terms, and the graph pool."""
-    out = parts(predicted_file, log, ranks)
+def spread(compared: list[Comparison]):
+    """Each term's recorded bytes across `compared`, a comparison per TP rank's
+    line, none at one line; over fewer lines where a line refuses it as 0.00GB."""
+    held: dict[str, list[int]] = {}
+    every = len(compared)
+    for c in compared if every > 1 else ():
+        for t in c.compared:
+            held.setdefault(t.name, []).append(t.recorded.nbytes)
+    for name, nbytes in held.items():
+        low, high, n = min(nbytes), max(nbytes), len(nbytes)
+        over = "" if n == every else f"; {n} of {every} lines compare it"
+        yield name, f"{low:,} to {high:,} B, {high / low - 1:.2%} apart{over}"
+
+
+def check(predicted_file: Path, log: Path, ranks: int = 1, tp: int = 1) -> str:
+    """The per-term table per TP rank's line, each term's spread across those
+    lines, the predicted readings' own terms, and the graph pool."""
+    out = parts(predicted_file, log, ranks, tp=tp)
+    n = sum(isinstance(p, Comparison) for p in out)
+    out[n:n] = [f"{name} across TP ranks: {v}" for name, v in spread(out[:n])]
     return "\n".join(p if isinstance(p, str) else p.table() for p in out)
 
 
@@ -272,9 +291,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "log", type=Path, help="the real server's log, or a measure memory --out"
     )
+    parser.add_argument("--tp", type=int, default=1, help="the real server's TP width")
     args = parser.parse_args(argv)
     for hand_in in args.predicted:
-        print(check(hand_in, args.log, len(args.predicted)))
+        print(check(hand_in, args.log, len(args.predicted), args.tp))
 
 
 if __name__ == "__main__":
