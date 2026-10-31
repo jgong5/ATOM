@@ -17,13 +17,14 @@ from types import SimpleNamespace
 import pytest
 import zmq
 
-from atom.compass.clock import LpId, prefill_decode_table
+from atom.compass.clock import LpId, prefill_decode_table, single_engine_table
 from atom.utils.clock import (
     LPRuntime,
     RelayQueue,
     UnsentRelayItem,
     WrappedPoller,
     WrappedSocket,
+    _Wakeup,
 )
 
 from .test_lp_runtime import ENGINE, FRONTEND, IPC, OUT, REQ, FakeConn, _owner, _table
@@ -93,6 +94,59 @@ def test_out_of_order_frames_are_handed_over_in_arrival_order_and_counted_by_seq
     stop_tx.send(b"")
     thread.join(5)
     assert not thread.is_alive()
+
+
+def test_a_release_wakes_only_the_pollers_waiting_on_its_channel(ctx):
+    """A frontend's output threads, one per DP rank: a release on one rank's
+    channel sets no other rank's wakeup, and one no poller registered, as
+    lmcache's polling thread adds, is set by every release."""
+    table = single_engine_table(
+        admission_path="serving", ipc_s=IPC, stream_s=0.002, dp=2
+    )
+    outs = ("engine->frontend:output#dp0", "engine->frontend:output#dp1")
+    grants = (0.2, {outs[0]: [(0, 0.1)]}), (0.4, {outs[1]: [(0, 0.3)]})
+    rt, call = _rt(FRONTEND, *grants, table=table)
+    engine = _rt(ENGINE, table=table)[0]
+    txs, stops, threads, seen, woken = [], [], [], [], []
+    for r, (ch, arrival) in enumerate(zip(outs, (0.1, 0.3))):
+        push, pull = _pair(ctx, f"out{r}", zmq.PUSH, zmq.PULL)
+        txs.append(_relayed(engine, push, ch, (arrival, 0)))
+        stop_tx, stop_rx = _pair(ctx, f"stop{r}", zmq.PAIR, zmq.PAIR)
+        stops.append(stop_tx)
+        poller = WrappedPoller(rt, [stop_rx, WrappedSocket(rt, pull, ch)])
+
+        def output_thread(poller=poller):
+            stop_rx, rx = poller.socks
+            while poller.poll()[0][0] is not stop_rx:
+                seen.append((rx.ch, rx.recv(), rt.read_clock()))
+
+        threads.append(threading.Thread(target=output_thread, daemon=True))
+        threads[-1].start()
+    deadline = time.monotonic() + 5
+    while not all(t in rt.wakes for t in threads):  # until both pollers wait
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    def counted(r, set_):
+        return lambda: (woken.append(r), set_())
+
+    for r, t in enumerate(threads):
+        rt.wakes[t].set = counted(r, rt.wakes[t].set)
+    plain = _Wakeup()
+    rt.wakes[plain] = plain
+
+    txs[0].send(b"d0")
+    call(rt.advance_to, 0.2)
+    assert woken == [0] and plain.is_set()
+    plain.clear()
+    txs[1].send(b"d1")
+    call(rt.advance_to, 0.4)
+    assert woken == [0, 1] and plain.is_set()
+    assert seen == [(outs[0], b"d0", 0.1), (outs[1], b"d1", 0.3)]
+    for stop, t in zip(stops, threads):
+        stop.send(b"")
+        t.join(5)
+        assert not t.is_alive()
 
 
 def test_the_relay_sends_every_put_stamped_at_its_put(ctx):
