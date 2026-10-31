@@ -340,6 +340,31 @@ def wrap_decode(decode, entry):
     return charged
 
 
+class _ChargedBatches:
+    """A `tokenizers` backend whose ``encode_batch`` charges the current job as
+    one encode of every id the batch returns; any other attribute is the
+    backend's own."""
+
+    def __init__(self, backend, entry) -> None:
+        self._backend, self._entry = backend, entry
+
+    def encode_batch(self, *args, **kwargs):
+        out = self._backend.encode_batch(*args, **kwargs)
+        e = self._entry
+        ids = sum(len(x.ids) for x in out)
+        charge(e.encode_fixed_s + ids / (e.encode_tokens_per_s * e.derate))
+        return out
+
+    def __getattr__(self, name):
+        return getattr(self._backend, name)
+
+
+def wrap_encode_batch(backend, entry):
+    """`backend` with its ``encode_batch`` charged as `wrap_encode` charges one
+    ``encode`` that returned every id of the batch."""
+    return _ChargedBatches(backend, entry)
+
+
 #: Timers that do not keep the run alive, by the qualified name of their
 #: callback or of a coroutine on the stack that scheduled them: the API
 #: server's periodic jobs (metrics refresh, collector watch), uvicorn's server

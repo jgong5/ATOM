@@ -425,6 +425,14 @@ p50 input is 88,768 tokens and p90 is 204,288, this is not a rounding error.
 `--preprocess-pool-width`; how the simulated run's executor composes with it is open
 (below).
 
+With a fast tokenizer and `ATOM_TOKENIZE_CACHE_MB` above zero, a prompt of at least
+`segment_tokenizer.py::_MIN_CACHED_CHARS` characters is encoded in the same place by
+`segment_tokenizer.py::SegmentTokenizer` instead. It reuses the ids of the
+conversation's earlier prompt and of text segments other prompts held, and encodes
+only the segments missing from both, in one `encode_batch` call on the backend
+(`tokenizer._tokenizer`), past `encode`. Its first prompts are also checked with
+`encode`.
+
 **Decode** — `IncrementalStreamDetokenizer.update` at
 `atom/entrypoints/openai/streaming_dispatch.py`:
 
@@ -476,6 +484,15 @@ Outside the simulation window it is charged nothing.
 
 Terms come from `host.tokenizers[]` in the machine spec (doc 05 D25), populated by the
 `spec` package's class-0 tokenizer probe (doc 05 D26).
+
+**The segment tokenizer is charged its encode** (revised 2026-10-31,
+[#2518](https://github.com/jgong5/ATOM/issues/2518)). Its `encode_batch` never reaches
+the wrapped `encode`, so before this revision a prompt it served cost nothing. The
+backend call is now charged as one `encode` that returned every id of the batch, at the
+same entry's terms (`atom/utils/compass_loop.py::wrap_encode_batch`): it is the part
+that grows with a prompt's new text. Its own work around that call (finding the earlier
+prompt, splitting at added tokens, hashing segments, assembling the ids and extending
+the block hashes) is charged nothing; #2518 measured what that leaves out.
 
 **The encode and decode stages are resource stations** (revised 2026-09-28, #443; PDES
 term: a multi-server FIFO queue). The simulated run installs its own default executor on
@@ -1006,7 +1023,7 @@ requires genuine fan-out in every root is not constructible without reusing sess
 | D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes on that path. Revised: three carriers, `tracestate` on the request, a `kv_transfer_params` field on the forward and SSE comment lines on the stream; still zero Atomesh changes. | 2026-09-18; revised 2026-09-28 |
 | D31 | Filler token is non-EOS, decodes to complete standalone ASCII, and is derived from the request id. | 2026-09-18 |
 | D32 | The decode->prefill cache chain is already broken by the harness for real servers too; guard only against false hits. `theoretical_prefix_cache_hit` is the oracle. | 2026-09-18 |
-| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. Revised: both are resource stations; encode width excludes the wait jobs resident when the run starts, pool jobs are classified by a registry and unregistered ones refused, and a clock read inside a job is its start plus accumulated service time. A tokenizer call on the event loop thread (the final `decode` of a non-streaming completion, the calls in `anthropic_messages`) is no station job: it advances the frontend LP clock by its service time on the loop. Revised: it does so only once every open encode job is placed. Revised: taking in an HTTP request charges the loop `fixed + body bytes x per_byte` from `host.http_intake`, so a burst reaches the pool one request at a time. Revised: a request that arrives once the last intake has ended is charged `idle_s` in place of `fixed`. | 2026-09-18; revised 2026-09-28, 2026-10-03, 2026-10-16 (#1103), 2026-10-20 (#1775) and 2026-10-26 (#1231) |
+| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. Revised: both are resource stations; encode width excludes the wait jobs resident when the run starts, pool jobs are classified by a registry and unregistered ones refused, and a clock read inside a job is its start plus accumulated service time. A tokenizer call on the event loop thread (the final `decode` of a non-streaming completion, the calls in `anthropic_messages`) is no station job: it advances the frontend LP clock by its service time on the loop. Revised: it does so only once every open encode job is placed. Revised: taking in an HTTP request charges the loop `fixed + body bytes x per_byte` from `host.http_intake`, so a burst reaches the pool one request at a time. Revised: a request that arrives once the last intake has ended is charged `idle_s` in place of `fixed`. Revised: the segment tokenizer's backend `encode_batch` of a long prompt's missing segments is charged as one encode of the ids it returns; its work around that call is charged nothing. | 2026-09-18; revised 2026-09-28, 2026-10-03, 2026-10-16 (#1103), 2026-10-20 (#1775), 2026-10-26 (#1231) and 2026-10-31 (#2518) |
 | D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. Revised: arrival rides the `compass` entry of `tracestate`, output times ride SSE comment lines, and the `/metrics` scrape is paced on simulated time. Revised 2026-10-02 (#533, #534): the scrape is a daemon deadline, and the run ends when no essential work is left. | 2026-09-18; revised 2026-09-28 and 2026-10-02 |
 | D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists; the rebind itself is deferred by a `sys.meta_path` hook, because the bootstrap runs while `aiperf.plugin.plugins` is still importing and cannot import `aiperf`; an inline attempt does not raise to the operator, it de-registers the whole plugin and logs one `WARNING` (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
 | D35 | Declare what the harness reproduces and what it cannot; cancellation is not available from this corpus. | 2026-09-18 |

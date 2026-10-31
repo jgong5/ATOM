@@ -3074,7 +3074,9 @@ def main():
     )
     # After the probe: its decodes are startup work, not served traffic, so
     # they are not charged to a simulated run's clock.
-    compass_run.tokenizer(tokenizer, engine.config)
+    compass_run.tokenizer(
+        tokenizer, engine.config, engine.io_processor.segment_tokenizer
+    )
 
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
     # their chunks into a thread-local; the engine core manager's output thread

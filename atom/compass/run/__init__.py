@@ -32,8 +32,10 @@ member, the frontend's included, connects to.
   check.
 - `runner(runner, tree)` installs the cost backend and the device readings on a
   `CompassModelRunner` where it would build its model, in the worker process.
-- `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
-  ``decode`` to the frontend's clock, at the rates the machine spec measured.
+- `tokenizer(tokenizer, config, segments)` charges the served tokenizer's
+  ``encode`` and ``decode`` to the frontend's clock, at the rates the machine
+  spec measured, and the batch encode the engine's segment tokenizer makes of
+  a long prompt's new segments at the encode rate.
 - `http_intake()` is what `atom.utils.compass_loop.HttpChannel` charges the
   frontend's event loop for each request it takes in.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
@@ -1785,15 +1787,21 @@ def _graph_pool(model_runner, machine, model):
     return reserves(piecewise=capture)
 
 
-def tokenizer(tok, config) -> None:
+def tokenizer(tok, config, segments=None) -> None:
     """Wrap `tok`'s ``encode`` and ``decode`` with the machine spec's entry for
     the model's architecture and the backend that loaded; the entry warns when
-    the loaded ``tokenizer.json`` is not the one it was measured on."""
+    the loaded ``tokenizer.json`` is not the one it was measured on.
+
+    `segments` is the engine's `SegmentTokenizer`, or None. It encodes a long
+    prompt's segments no earlier prompt held through `tok`'s backend, past
+    ``encode``, so its backend's ``encode_batch`` is charged at the same entry;
+    its own work around that call (finding the earlier prompt, splitting,
+    hashing, assembling the ids) is charged nothing."""
     run = spec()
     if run is None:
         return
     from atom.compass.spec import Backend
-    from atom.utils.compass_loop import wrap_decode, wrap_encode
+    from atom.utils.compass_loop import wrap_decode, wrap_encode, wrap_encode_batch
 
     entry = _machine(run).tokenizer_for(
         config.hf_config.architectures[0],
@@ -1802,6 +1810,9 @@ def tokenizer(tok, config) -> None:
     )
     tok.encode = wrap_encode(tok.encode, entry)
     tok.decode = wrap_decode(tok.decode, entry)
+    if segments is not None:
+        split = segments._split
+        split.backend = wrap_encode_batch(split.backend, entry)
 
 
 def http_intake() -> tuple[float, float, float] | None:
