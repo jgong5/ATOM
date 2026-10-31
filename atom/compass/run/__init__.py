@@ -1788,14 +1788,17 @@ def _graph_pool(model_runner, machine, model):
 
 
 def tokenizer(tok, config) -> None:
-    """Wrap `tok`'s ``encode`` and ``decode`` with the machine spec's entry for
-    the model's architecture and the backend that loaded; the entry warns when
-    the loaded ``tokenizer.json`` is not the one it was measured on."""
+    """Wrap `tok`'s ``encode`` and ``decode``, and its Rust backend's
+    ``encode_batch``, with the machine spec's entry for the model's architecture
+    and the backend that loaded; the entry warns when the loaded
+    ``tokenizer.json`` is not the one it was measured on."""
     run = spec()
     if run is None:
         return
+    from tokenizers import Tokenizer
+
     from atom.compass.spec import Backend
-    from atom.utils.compass_loop import wrap_decode, wrap_encode
+    from atom.utils.compass_loop import wrap_decode, wrap_encode, wrap_encode_batch
 
     entry = _machine(run).tokenizer_for(
         config.hf_config.architectures[0],
@@ -1804,6 +1807,11 @@ def tokenizer(tok, config) -> None:
     )
     tok.encode = wrap_encode(tok.encode, entry)
     tok.decode = wrap_decode(tok.decode, entry)
+    # ATOM's segment tokenizer, which only a Rust backend gets, encodes a long
+    # prompt's uncached segments with its ``encode_batch``, not ``encode``.
+    backend = getattr(tok, "_tokenizer", None)
+    if isinstance(backend, Tokenizer):
+        backend.encode_batch = wrap_encode_batch(backend.encode_batch, entry)
 
 
 def http_intake() -> tuple[float, float, float] | None:
@@ -2004,32 +2012,43 @@ def engine_loop(engine_core):
 
     In a run the engine ignores SIGTERM until it has handed in: ATOM's handler
     would stop the workers inside a clock call, before they say what their
-    steps cost. A stop reaches the engine as the ``+inf`` grant instead.
+    steps cost. A stop reaches the engine as the ``+inf`` grant instead. The
+    engine said it was ready as its construction ended, so a stop can come
+    from then on: it ignores SIGTERM first, before the run file's read, a
+    pipeline stage's sends or the bundle's request, and has its handler back
+    however it leaves.
 
     A pipeline stage's runner calls go through `pp_send.install`'s sends. A
     recorded real run's SIGTERM goes through `_stop_recording`, and its input
     queue stamps each request frame's handoff (`clock.stamp_input`)."""
-    from atom.compass import parity
+    ignoring = bool(os.environ.get(ENV))  # a run, as `spec` would say, unread
+    before = signal.signal(signal.SIGTERM, signal.SIG_IGN) if ignoring else None
+    try:
+        from atom.compass import parity
 
-    run, sections, before = spec(), {}, None
-    if run is not None and getattr(engine_core, "pp_size", 1) > 1:
-        from atom.compass.runner import pp_send
+        run, sections = spec(), {}
+        if run is not None and getattr(engine_core, "pp_size", 1) > 1:
+            from atom.compass.runner import pp_send
 
-        pp_send.install(engine_core, _machine(run))
-    if run is not None and STEP_GRID in run:
-        workers = engine_core.runner_mgr
-        sections["step_grid"] = workers.call_func("step_grid_bundle", wait_out=True)
-    if run is not None:
-        clock.installed().client_run_ended = lambda k: _engine_hand_in(
-            run, engine_core, sections, k
-        )
-        before = signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    elif os.environ.get(parity.ENV):
-        clock.stamp_input(engine_core)
-        stop = functools.partial(
-            _stop_recording, engine_core, signal.getsignal(signal.SIGTERM)
-        )
-        before = signal.signal(signal.SIGTERM, stop)
+            pp_send.install(engine_core, _machine(run))
+        if run is not None and STEP_GRID in run:
+            workers = engine_core.runner_mgr
+            bundle = workers.call_func("step_grid_bundle", wait_out=True)
+            sections["step_grid"] = bundle
+        if run is not None:
+            clock.installed().client_run_ended = lambda k: _engine_hand_in(
+                run, engine_core, sections, k
+            )
+        elif os.environ.get(parity.ENV):
+            clock.stamp_input(engine_core)
+            stop = functools.partial(
+                _stop_recording, engine_core, signal.getsignal(signal.SIGTERM)
+            )
+            before = signal.signal(signal.SIGTERM, stop)
+    except BaseException:
+        if before is not None:  # None: not set from Python
+            signal.signal(signal.SIGTERM, before)
+        raise
     try:
         yield
         engine_done(engine_core, **sections)

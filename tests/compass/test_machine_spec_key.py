@@ -87,6 +87,7 @@ LAW_SPECS = {
     "deepseek-v4-pro-dpa8-mi355x-crs005-decode.json": "mi355x-crs005.json",
     "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-prefill.json": "mi355x-gpu45.json",
     "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-decode.json": "mi355x-gpu45.json",
+    "deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json": "mi455-a0.json",
 }
 
 
