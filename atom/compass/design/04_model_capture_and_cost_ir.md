@@ -43,6 +43,11 @@ where ATOM records `forward_done_event`, and the op-level backend tags the draft
 drafter's draft-KV pass on a step that samples is a third graph, priced among the target's
 terms (D18).
 
+**Revised 2026-10-31 by [#2560](https://github.com/jgong5/ATOM/issues/2560):** a mono
+runner binds and builds its widths under capture as its deployment does; a refusal the
+deployment makes too traces the original path and is declared, and any other bind or build
+failure is refused by name (D18).
+
 **Depends on:** `02_model_runner_and_cost_backend.md` (the backend plug point this fills),
 `03_memory_and_kv_model.md` (the activation term this supplies).
 
@@ -514,6 +519,35 @@ The drafter's roofline is not its measured time. On #1208's MTP1 record
 p50, 342 us against 874 us; the LM head's weight read is 232 us of it. The rest is time no
 leaf's roofline holds, and the op level fits no residual
 ([#1489](https://github.com/jgong5/ATOM/issues/1489)).
+
+### A mono decode binds and builds as its deployment does
+
+A mono runner (`atom/mono/runtime`), DeepSeek-V4.1's mono decode among them, is created on
+its model's first eligible decode step and builds each step width on that width's first
+step (`route.LazyRunner`, `widths.WidthBuilds`). Both are collective over the TP group,
+and a capture's group is one process. Capture stands in for what needs a peer or a device
+(`capture.forward._mono`, [#2560](https://github.com/jgong5/ATOM/issues/2560)):
+
+- **The consensus runs on the host.** `consensus.tp_agree` all-reduces a flag it builds with
+  `torch.tensor`, which inside the fake mode leaves `item()` a data-dependent guard on a
+  fake. It runs outside the fake mode and the recorder, as the step's DP exchange does, and
+  over the fake group agrees with this rank: every rank of a capture is this one.
+- **The peer buffer has no device.** `lifecycle.owned_peer_buffer` gets
+  `capture.driverless.PeerBuffer`: the regions the runner asks for, on the declared
+  device, with no IPC heap and no handle exchange.
+- **A width compiles for real.** Capture's FlyDSL entries record a launch and compile
+  nothing, so the build's `compile.scratch_bytes` would find no binary and mono would
+  decline the width. A width's kernels compile compile-only at the declared arch, through
+  FlyDSL's own entries and outside the modes; their scratch is read off their binaries,
+  and capture logs it with the compile's seconds.
+- **A refusal is the deployment's or the capture's.** A bind check's `MonoUnsupported` and
+  a kernel that needs scratch are refusals the deployment makes too: the step traces the
+  original path, and the graph's `declared` names each under `mono`. Any other bind failure,
+  which `consensus.bind_agreed` converts to a refusal, and any build failure, which
+  `WidthBuilds.prepare` logs and declines, stop the capture by name: the deployment does
+  not fail there, so it runs mono, and the original path is not its step.
+
+Past its bind and its builds, a mono runner's launches lift by the lift rule (D20).
 
 ### Open issues
 
@@ -1493,7 +1527,7 @@ Deferred to future work by decision on 2026-09-18.
 | # | Decision | Date |
 |---|---|---|
 | D17 | Two granularities behind one `CostBackend`; the step level discovers the shapes the op level captures. No fallback crosses granularity: a capture failure fails the run, lazy trace off makes an uncaptured shape a refusal | 2026-09-18; revised 2026-10-14 (#952); per shape 2026-10-18 (#1489) |
-| D18 | Capture with `TorchDispatchMode` + `FakeTensorMode`, on FakeTensor rather than bare meta, at concrete shapes: one graph per decode width and prefill (T, B) that `trace ops` is given or that a record directory's steps hold. The symbolic route A and its four disciplines (the fourth: the engine's host arithmetic asks a symbol for a number, so a symbolic capture keeps the conversion, logs it with its line, and asserts that log against a stated set) are recorded, not built. Under a drafter a step that samples is two graphs, the target's and the drafter's, cut at `forward_done_event`; a block drafter's draft-KV pass before that event is a third, priced among the target's terms | 2026-09-18, fourth discipline 2026-09-22; concrete 2026-10-18 (#1489); drafter 2026-10-21 (#1270); block drafter 2026-10-30 (#2345) |
+| D18 | Capture with `TorchDispatchMode` + `FakeTensorMode`, on FakeTensor rather than bare meta, at concrete shapes: one graph per decode width and prefill (T, B) that `trace ops` is given or that a record directory's steps hold. The symbolic route A and its four disciplines (the fourth: the engine's host arithmetic asks a symbol for a number, so a symbolic capture keeps the conversion, logs it with its line, and asserts that log against a stated set) are recorded, not built. Under a drafter a step that samples is two graphs, the target's and the drafter's, cut at `forward_done_event`; a block drafter's draft-KV pass before that event is a third, priced among the target's terms. A mono runner binds and builds its widths as its deployment does: a refusal the deployment makes too is declared, any other bind or build failure refused by name | 2026-09-18, fourth discipline 2026-09-22; concrete 2026-10-18 (#1489); drafter 2026-10-21 (#1270); block drafter 2026-10-30 (#2345); mono 2026-10-31 (#2560) |
 | D18.1 | `torch.export` recorded as an unverified alternative; rejected now on decomposition fidelity and on capturing a model call rather than an engine step | 2026-09-18 |
 | D19 | Hierarchical, concrete, stream-annotated IR: `Seq` / `Repeat` / `Par`, a node's arguments its leaf contract. No branches in the IR — applicability is a discrete key and the captured shape, matched by equality | 2026-09-18; revised 2026-10-18 (#531); concrete 2026-10-18 (#1489) |
 | D20 | Opaque leaves are priced, not decomposed. Each carries a stated parameter extractor and a contract: arguments by schema slot, each tensor's stride, role by provenance (activation, weight, KV, metadata) and preshuffled mark, non-tensor arguments and module references kept, a runner attribute as `runner.<attr>`, any other object in pickle's reduce shape or refused by its type. A raw Triton (`JITFunction.run`, a warmup aside) or FlyDSL (`JitFunction.__call__`, `CompiledFunction.__call__`) launch lifts to the first function its `module:qualname` names, past the languages' frames, closures and generic launchers, and so does a direct `CompiledKernel` launch. Nested launching calls and custom ops fold into the outermost; arguments come from call entry in a traced step that follows two untraced steps of its shape; each contract must replay to the same kernels and operators outside torch's, and a launch outside a found function, a raise after a launch or a call open at the step's end is refused. An `op_graph` is keyed by the step law's engine config less its ladder, the performance environment in it, and a miss names each differing field; keying on a kernel-selecting environment variable is a workaround for an ATOM design that should take the choice as an argument. Capture runs the two MoE wrappers' bodies; their DP and MORI exchanges are declared nodes named for the function ATOM calls, and a TBO step is refused. | 2026-09-18; contract 2026-10-18 (#1489); MoE exchanges 2026-10-19 (#1401); lift rule and key 2026-10-20 (#1811); two untraced steps 2026-10-21 (#1812); preshuffled mark 2026-10-22 (#1953); compiled kernels lift 2026-10-28 (#2344) |

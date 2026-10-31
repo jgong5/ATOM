@@ -2,7 +2,8 @@
 """`compass trace ops` on DeepSeek-V4.1-Flash with no device: one rank of TP4,
 with and without whole-expert EP4, decode and prefill at gfx1250; and decode
 at gfx950, where its indexer's FP8 scorer launches a compiled Triton kernel
-directly.
+directly, and where with expert parallelism off V4.1's mono decode binds and
+builds its width as its deployment does.
 
 V4.1's attention, Engram and the step's staging run their bodies on a real
 step's batch, so their kernels are leaves; its sparse attention states its
@@ -39,14 +40,37 @@ TP = 4
 MOE = "aiter.fused_moe_.default"
 #: gfx950's FP8 scorer: aiter's function that launches its compiled kernel.
 COMPILED = "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits"
+#: A decode V4.1's mono decode serves: gfx950, expert parallelism off.
+MONO = "--width 16" + ARGS
+#: Each run before a capture: the mono runtime's bind check refuses, its bind
+#: fails, its build fails, or a built kernel needs scratch.
+BIND = (
+    "from atom.mono.runtime import consensus\n"
+    "agreed = consensus.bind_agreed\n"
+    "def bind():\n"
+    "    raise {}('an injected bind {}')\n"
+    "consensus.bind_agreed = lambda _, group: agreed(bind, group)\n"
+)
+BIND_REFUSAL = BIND.format("consensus.MonoUnsupported", "refusal")
+BIND_FAILURE = BIND.format("RuntimeError", "failure")
+BUILD_FAILURE = (
+    "from atom.mono.runtime import compile as built\n"
+    "def compile_kernels(kernels):\n"
+    "    raise RuntimeError('an injected build failure')\n"
+    "built.compile_kernels = compile_kernels\n"
+)
+SCRATCH = (
+    "from atom.mono.runtime import compile as built\n"
+    "built.scratch_bytes = lambda launcher: 64\n"
+)
 
 _CAPTURES: dict = {}
 
 
-def trace(root, argv, arch):
-    """`trace ops --tp 4 --arch <arch>` over `argv`, in a process of its own, on
-    a model directory holding V4.1-Flash's config.json and a shard of junk:
-    nothing may open the checkpoint."""
+def trace(root, argv, arch, prelude=""):
+    """`trace ops --tp 4 --arch <arch>` over `argv`, in a process of its own
+    that runs `prelude` first, on a model directory holding V4.1-Flash's
+    config.json and a shard of junk: nothing may open the checkpoint."""
     assert hashlib.sha256(CONFIG.read_bytes()).hexdigest() == CONFIG_SHA256
     (root / "model").mkdir()
     (root / "model" / "config.json").write_bytes(CONFIG.read_bytes())
@@ -55,7 +79,7 @@ def trace(root, argv, arch):
     command = ["trace", "ops", "--model", str(root / "model"), "--tp", str(TP)]
     command += ["--arch", arch, "--store", str(root / "store"), *argv.split()]
     return subprocess.run(
-        [sys.executable, "-c", MAIN, *command],
+        [sys.executable, "-c", prelude + MAIN, *command],
         capture_output=True,
         text=True,
         check=False,
@@ -65,13 +89,13 @@ def trace(root, argv, arch):
     )
 
 
-def capture(tmp_path_factory, argv, arch="gfx1250"):
-    """`trace` over `argv` at `arch`: each shape's published graph and
-    declarations, by shape, a prefill's final chunk."""
-    if (argv, arch) in _CAPTURES:
-        return _CAPTURES[argv, arch]
+def capture(tmp_path_factory, argv, arch="gfx1250", prelude=""):
+    """`trace` over `argv` at `arch` after `prelude`: each shape's published
+    graph and declarations, by shape, a prefill's final chunk."""
+    if (argv, arch, prelude) in _CAPTURES:
+        return _CAPTURES[argv, arch, prelude]
     root = tmp_path_factory.mktemp("v41")
-    done = trace(root, argv, arch)
+    done = trace(root, argv, arch, prelude)
     tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
     assert (
         done.returncode == 0 and tokens
@@ -86,7 +110,7 @@ def capture(tmp_path_factory, argv, arch="gfx1250"):
             for stem in ("graph", "declared")
         )
         graphs[graph["shape"]] = graph, declared
-    _CAPTURES[argv, arch] = graphs
+    _CAPTURES[argv, arch, prelude] = graphs
     return graphs
 
 
@@ -181,3 +205,60 @@ def test_gfx950_s_fp8_scorer_lifts_its_compiled_kernel_launch_to_its_function(
         assert op["args"]["q_fp8"]["shape"][0] == 16
         assert op["args"]["q_fp8"]["dtype"] == "torch.float8_e4m3fn"
         assert {"kv_cache", "weights", "out_logits"} <= set(op["args"])
+
+
+def test_gfx950_s_mono_decode_binds_builds_its_width_and_meets_its_kernels(tmp_path):
+    done = trace(tmp_path, MONO, "gfx950")
+
+    log = done.stdout + done.stderr
+    # The width's kernels compiled for the declared arch, as the deployment's.
+    assert re.search(r"V4\.1 mono: \d+ width-16 kernels compiled at gfx950 ", log), log
+    # The step ran mono, not the original path: refused by name where it first
+    # calls a mono kernel whose contract a graph cannot hold.
+    refusal = done.stderr.strip().splitlines()[-1]
+    assert done.returncode and "published" not in done.stdout, refusal
+    mono = r"atom\.(mono|models\.deepseek_v41\.mono)\.[\w.]+:\w"
+    assert re.match(rf"compass trace ops: {mono}", refusal), refusal
+
+
+@pytest.mark.parametrize(
+    "prelude, refusal",
+    [
+        (
+            BIND_FAILURE,
+            "V4.1 mono decode failed to bind: RuntimeError: an injected bind failure",
+        ),
+        (
+            BUILD_FAILURE,
+            (
+                "V4.1 mono declined its width-16 kernels: "
+                "RuntimeError('an injected build failure')"
+            ),
+        ),
+    ],
+    ids=["bind", "build"],
+)
+def test_a_mono_failure_the_capture_makes_stops_it_by_name(prelude, refusal, tmp_path):
+    done = trace(tmp_path, MONO, "gfx950", prelude)
+
+    assert done.returncode and "published" not in done.stdout
+    assert done.stderr.strip().splitlines()[-1] == f"compass trace ops: {refusal}"
+
+
+@pytest.mark.parametrize(
+    "prelude, declined",
+    [
+        (BIND_REFUSAL, ("V4.1 mono decode", None, "an injected bind refusal")),
+        (SCRATCH, ("V4.1 mono", 16, "a kernel needs 64 B of scratch a lane")),
+    ],
+    ids=["bind_check", "scratch"],
+)
+def test_a_mono_refusal_the_deployment_makes_too_traces_the_original_path(
+    prelude, declined, tmp_path_factory
+):
+    graph, declared = capture(tmp_path_factory, MONO, "gfx950", prelude)["decode B=16"]
+
+    assert declared["mono"] == [dict(zip(("runner", "width", "why"), declined))]
+    ops = _ops(graph["region"])
+    assert not [op for op in ops if ".mono." in op["op"]]
+    assert len([op for op in ops if op["op"] == V41_ATTENTION]) == LAYERS

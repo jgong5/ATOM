@@ -58,9 +58,12 @@ import gc
 import importlib
 import inspect
 import json
+import logging
+import os
 import pathlib
 import re
 import sys
+import time
 from typing import NamedTuple
 from unittest.mock import patch
 
@@ -134,6 +137,7 @@ CUT = "forward_done_event"
 
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
+logger = logging.getLogger(__name__)
 
 
 class Shape(NamedTuple):
@@ -429,6 +433,7 @@ class _Recorder(TorchDispatchMode):
         self.replaying = None  # the kernels a replay launched, while one runs
         self.counted = None  # what a size the step's data sets counts, if stated
         self.lands = False  # whether a device value read on the host reads zeros
+        self.declined = []  # the mono refusals a deployment makes too (`_mono`)
         self.start()
 
     def start(self):
@@ -769,6 +774,8 @@ def _patches(recorder):
     * aiter's top-k scratch sizes are host queries into a module built for a
       device, which a capture cannot load: each answers 0, and the scratch
       the call allocates holds one byte.
+    * A mono runner binds and builds its widths as its deployment does
+      (`_mono`).
     """
     import flydsl
     import triton
@@ -871,6 +878,11 @@ def _patches(recorder):
         with patch.object(recorder, "counted", live):
             return attach(builder, md, num_reqs, is_prefill)
 
+    unpatched = [
+        (fly.JitFunction, "__call__", fly.JitFunction.__call__),
+        (fly, "_compile_impl", fly._compile_impl),
+        (fly.CompiledFunction, "__call__", fly.CompiledFunction.__call__),
+    ]
     stack = contextlib.ExitStack()
     for owner, name, value in (
         (JITFunction, "run", run),
@@ -896,10 +908,105 @@ def _patches(recorder):
             "maybe_dual_stream_forward",
             module_dispatch_ops.maybe_dual_stream_forward,
         ),
+        *_mono(recorder, unpatched),
     ):
         stack.enter_context(patch.object(owner, name, value))
     stack.enter_context(_entries(recorder))
     return stack
+
+
+def _mono(recorder, unpatched):
+    """What a mono runner's bind and width builds run under the capture, as
+    `(owner, name, value)` patches; `unpatched` are FlyDSL's entries before
+    `_patches` replaced them.
+
+    Every rank of a capture is this one: the TP consensus runs on the host,
+    outside the fake mode and the recorder, and agrees with this rank, and the
+    peer buffer is one of the sizes the runner asks for on the declared device
+    (`driverless.PeerBuffer`). A width's kernels compile for real, compile-only
+    at the declared arch through `unpatched`, so their scratch is read off
+    their binaries. A refusal the deployment makes too, a bind check's
+    `MonoUnsupported` or a kernel that needs scratch, leaves the original path
+    to trace and is told to `recorder.declined`; any other bind or build
+    failure is refused by name.
+    """
+    from torch.utils._python_dispatch import _disable_current_modes
+
+    from atom.mono.runtime import consensus, lifecycle, route, widths
+    from atom.mono.runtime.compile import compile_kernels, scratch_bytes
+
+    agree, init = consensus.tp_agree, route.LazyRunner.__init__
+    prepare = widths.WidthBuilds.prepare
+
+    def host_agree(ok, group):
+        with _disable_current_modes():
+            return agree(ok, group)
+
+    def bound(create, what):
+        try:
+            return create()
+        except consensus.MonoUnsupported as why:
+            if why.__cause__ is not None:  # a failure `bind_agreed` converted
+                raise ValueError(f"{what} failed to bind: {why}") from why.__cause__
+            recorder.declined.append({"runner": what, "width": None, "why": str(why)})
+            raise
+
+    def lazy(self, create, what):
+        init(self, functools.partial(bound, create, what), what)
+
+    def built(self, width):
+        if width in self._built or width in self._refused:
+            return prepare(self, width)
+        failed, scratch = [], []
+
+        def noted(fn):
+            def call(*args):
+                try:
+                    return fn(*args)
+                except Exception as error:
+                    failed.append(error)
+                    raise
+
+            return call
+
+        def compiled(kernels):
+            began, arch = time.perf_counter(), device_arch()
+            with contextlib.ExitStack() as real:
+                for owner, name, value in unpatched:
+                    real.enter_context(patch.object(owner, name, value))
+                real.enter_context(patch.dict(os.environ, ARCH=arch))
+                real.enter_context(_disable_current_modes())
+                launchers = compile_kernels(kernels)
+            scratch.extend(map(scratch_bytes, launchers))
+            logger.info(
+                "%s: %d width-%d kernels compiled at %s in %.1f s, scratch %s B a lane",
+                *(self._what, len(launchers), width, arch),
+                *(time.perf_counter() - began, scratch),
+            )
+            return launchers
+
+        with (
+            patch.object(self, "_build", noted(self._build)),
+            patch.object(widths, "compile_kernels", noted(compiled)),
+        ):
+            held = prepare(self, width)
+        if failed or not (held or any(scratch)):
+            why = repr(failed[0]) if failed else "no kernel needs scratch"
+            raise ValueError(
+                f"{self._what} declined its width-{width} kernels: {why}"
+            ) from (failed[0] if failed else None)
+        if not held:  # a kernel needs scratch, which the deployment refuses too
+            why = f"a kernel needs {max(scratch)} B of scratch a lane"
+            recorder.declined.append({"runner": self._what, "width": width, "why": why})
+        return held
+
+    return (
+        (consensus, "tp_agree", host_agree),
+        (widths, "tp_agree", host_agree),
+        (lifecycle, "PeerBuffer", driverless.PeerBuffer),
+        (route.LazyRunner, "__init__", lazy),
+        (widths.WidthBuilds, "prepare", built),
+    )
 
 
 @contextlib.contextmanager
@@ -1397,4 +1504,6 @@ def capture(
                 graph = build(part, traced, crossing)
                 gone = [*left_out, *(("step-crossing", op) for op in crossing)]
                 declared["left_out"] = [{"why": why, **_json(op)} for why, op in gone]
+                if recorder.declined:
+                    declared["mono"] = list(recorder.declined)
                 yield graph, digest, dict(declared)
