@@ -9,16 +9,20 @@ strategy is a stand-in that schedules the next turn a fixed delay after a
 return, on a ``ClockPacedLoopScheduler`` paced by the traffic LP. The hold
 tests replace the authority with a scripted runtime, so a return can be put
 on either side of its final event's release. The stop tests serve a run's
-recording authority over TCP and stop it as a SIGTERM does. Skips by name as
-``test_harness_pacing.py`` does.
+recording authority over TCP and stop it as a SIGTERM does. The shutdown
+tests run aiperf's own system controller, as plugin discovery resolves it,
+on the router's messages. Skips by name as ``test_harness_pacing.py`` does.
 """
 
 import asyncio
+import contextlib
 import heapq
 import json
 import math
+import os
 import re
 import shutil
+import socket
 import threading
 import time
 import uuid
@@ -46,14 +50,25 @@ if _why := _missing():
         allow_module_level=True,
     )
 
-from aiperf.plugin import plugins  # noqa: F401  plugin discovery, as in aiperf
+from aiperf.plugin import plugins  # plugin discovery, as in aiperf
 
 # isort: split
 import aiperf
 import zmq
 import zmq.asyncio
-from aiperf.common.enums import CreditPhase
+from aiperf.common.enums import (
+    CreditPhase,
+    LifecycleState,
+    make_result_producer_capability,
+)
+from aiperf.common.hooks import AIPerfHook
+from aiperf.common.messages import Message, RegisterServiceCommand
+from aiperf.common.mixins import HooksMixin
+from aiperf.controller.result_join_coordinator import ResultJoinCoordinator
+from aiperf.controller.system_controller import SystemController
 from aiperf.credit.sticky_router import StickyCreditRouter
+from aiperf.plugin.enums import PluginType, ServiceType
+from compass_harness.controller import CompassSystemController
 from compass_harness.router import CompassCreditRouter
 from compass_harness.scheduler import ClockPacedLoopScheduler
 from compass_harness.strategy import ClockPhaseRunner
@@ -71,6 +86,7 @@ from atom.compass import clock_transport
 from atom.compass import run as compass_run
 from atom.compass.clock import (
     NER,
+    ClockAbort,
     ClockAuthority,
     LpId,
     prefill_decode_table,
@@ -1240,3 +1256,223 @@ def test_a_failed_traffic_lp_tells_aiperf_the_run_failed_before_it_stops(
         r'"reason_detail":"traffic LP: Straggler\(.* seq 1 arrives at 0.5, now 1.0',
         line,
     )
+
+
+#: The records manager's results, as the controller's handler reads them.
+RESULTS = SimpleNamespace(
+    service_id="records_manager",
+    results=SimpleNamespace(
+        errors=[],
+        fatal_errors=[],
+        results=SimpleNamespace(records=["a record"], error_summary=None),
+    ),
+)
+
+
+async def _nothing(*args) -> None:
+    pass
+
+
+async def _controller(monkeypatch, stop):
+    """aiperf's system controller as plugin discovery resolves it, past each
+    service's registration and the configure step; the records manager
+    advertises ``profile``. Its own handlers and shutdown barrier run, and it
+    stops by `stop`."""
+    cls = plugins.get_class(PluginType.SERVICE, ServiceType.SYSTEM_CONTROLLER)
+    ctl = cls.__new__(cls)
+    HooksMixin.__init__(ctl)  # its hooks and logger, as BaseService builds them
+    ctl.service_id, ctl.stop, ctl._exit_errors = "system_controller", stop, []
+    ctl._processed_command_ids, ctl.publish = set(), _nothing
+    ctl.service_manager = SimpleNamespace(service_id_map={}, service_map={})
+    ctl._result_join_coordinator = ResultJoinCoordinator()
+    ctl._shutdown_lock, ctl._shutdown_triggered = asyncio.Lock(), False
+    for name, produces in (("records_manager", ("profile",)), ("timing_manager", ())):
+        await ctl._handle_register_service_command(
+            RegisterServiceCommand(
+                service_id=name,
+                service_type=ServiceType(name),
+                state=LifecycleState.RUNNING,
+                capabilities=tuple(map(make_result_producer_capability, produces)),
+            )
+        )
+    monkeypatch.setattr(SystemController, "_profile_configure_all_services", _nothing)
+    await ctl._profile_configure_all_services()
+    return ctl
+
+
+def _router_bus(monkeypatch, publish) -> None:
+    """Each router built from here publishes by `publish` and logs nothing."""
+    comms = SimpleNamespace(
+        create_pub_client=lambda a: SimpleNamespace(publish=publish)
+    )
+    monkeypatch.setattr(
+        StickyCreditRouter, "__init__", lambda s, **kw: setattr(s, "comms", comms)
+    )
+    monkeypatch.setattr(CompassCreditRouter, "exception", lambda self, msg: None)
+
+
+async def _deliver(ctl, message) -> None:
+    """`message` through aiperf's bus to each of `ctl`'s hooks on its type."""
+    message = Message.from_json(message.to_json_bytes())
+    for hook in ctl.get_hooks(AIPerfHook.ON_MESSAGE):
+        if message.message_type in hook.resolve_params(ctl):
+            await hook.func(message)
+
+
+def test_aiperf_loads_the_compass_system_controller():
+    found = plugins.get_class(PluginType.SERVICE, ServiceType.SYSTEM_CONTROLLER)
+    assert found is CompassSystemController
+
+
+#: The engine's work, which it holds past the moment every result is in.
+HELD = 50.0
+
+
+class HoldingEngine(threading.Thread):
+    """The engine LP with work to `HELD`, which it holds in wall time until
+    `release` is set. It keeps its next grant, or the refusal that ended the
+    run, as `got`."""
+
+    def __init__(self, endpoint) -> None:
+        super().__init__(name="engine", daemon=True)
+        self.endpoint, self.got = endpoint, None
+        self.holding, self.release = threading.Event(), threading.Event()
+
+    def run(self) -> None:
+        rt = LPRuntime(ENGINE, TABLE, clock_transport.connect(ENGINE, self.endpoint))
+        rt.next_event(HELD)
+        self.holding.set()
+        self.release.wait(10)
+        try:
+            self.got = rt.next_event(INF)
+        except ClockAbort as abort:
+            self.got = abort
+
+
+class TimingManager(threading.Thread):
+    """aiperf's timing manager: the router on its own event loop, the traffic
+    LP's clock owner. aiperf has sent everything, so the traffic LP asks for
+    time until its ``+inf`` grant."""
+
+    def __init__(self) -> None:
+        super().__init__(name="timing_manager", daemon=True)
+        self.loop, self.router = asyncio.new_event_loop(), None
+
+    def run(self) -> None:
+        async def serve():
+            self.router = CompassCreditRouter(run=None, service_id="timing_manager")
+            self.router.traffic.finish()
+            await asyncio.Event().wait()
+
+        with contextlib.suppress(RuntimeError):  # the loop stopped
+            self.loop.run_until_complete(serve())
+
+    def kill(self) -> None:
+        """aiperf's SIGKILL: the traffic LP's clock connection ends wherever
+        the loop is, and the loop stops."""
+        fd = os.dup(self.router.traffic.rt.conn.fileno())
+        with socket.socket(fileno=fd) as sock, contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+
+
+def test_aiperf_s_shutdown_waits_for_the_traffic_lp_s_inf_grant(tmp_path, monkeypatch):
+    """Every result reaches aiperf's controller while the engine holds work,
+    so the traffic LP still waits for its ``+inf`` grant, its event loop
+    blocked in that wait. The controller stops only once the router reports
+    the traffic LP done, and its stop kills the timing manager as aiperf's
+    does. Nothing ends the run: the engine is granted ``+inf``, and the
+    traffic LP's final-response check runs and passes."""
+    run = {**RUN, "bound_s": 100.0, "out_dir": str(tmp_path)}
+    server = clock_transport.serve(
+        compass_run._RecordingAuthority(run), "tcp://127.0.0.1:0"
+    )
+    frontend = clock_transport.connect(FRONTEND, server.endpoint)
+    frontend.send((NER, INF, [], INF))  # idle throughout
+    lp = str(tmp_path / "lp")
+
+    def traffic(cls):
+        conn = clock_transport.connect(compass_run.TRAFFIC, server.endpoint)
+        return cls(LPRuntime(compass_run.TRAFFIC, TABLE, conn), lp)
+
+    monkeypatch.setattr(TrafficLP, "from_env", classmethod(traffic))
+    monkeypatch.setattr(ClockPacedLoopScheduler, "clock", None)
+    tm, engine, kills = TimingManager(), HoldingEngine(server.endpoint), []
+
+    async def main():
+        loop, killed = asyncio.get_running_loop(), asyncio.Event()
+
+        async def publish(message):  # from the timing manager's process
+            loop.call_soon_threadsafe(asyncio.ensure_future, _deliver(ctl, message))
+
+        _router_bus(monkeypatch, publish)
+
+        async def stop():
+            kills.append(tm.router.traffic.done.done())
+            tm.kill()
+            killed.set()
+
+        ctl = await _controller(monkeypatch, stop)
+        tm.start()
+        engine.start()
+        assert await asyncio.to_thread(engine.holding.wait, 10)
+        await ctl._on_process_records_result_message(RESULTS)  # every result is in
+        engine.release.set()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(killed.wait(), 10)
+        return ctl
+
+    try:
+        ctl = _run(main())
+    finally:
+        if not kills:
+            tm.loop.call_soon_threadsafe(tm.loop.stop)
+        tm.join(10)
+        engine.join(10)
+        frontend.close()
+        server.close()
+    assert engine.got == INF
+    assert kills == [True]  # once, after the traffic LP was done
+    done = tm.router.traffic.done
+    assert done.result() is None and tm.router.traffic.now() == INF
+    assert ctl._exit_errors == []
+
+
+def test_a_failing_traffic_lp_still_fails_aiperf_s_run(tmp_path, monkeypatch):
+    """Request 0 is open at the ``+inf`` grant, so the traffic LP fails its
+    final-response check. The router's service error unregisters the timing
+    manager from the traffic domain, so aiperf stops on the records manager's
+    results and exits 1 naming the open request."""
+    sent, stops, rt, lp = [], [], ScriptedRuntime([]), str(tmp_path / "lp")
+
+    async def publish(message):
+        sent.append(message)
+
+    async def stop():
+        stops.append("stop")
+
+    _router_bus(monkeypatch, publish)
+    monkeypatch.setattr(TrafficLP, "from_env", classmethod(lambda cls: cls(rt, lp)))
+
+    async def timing_manager():
+        traffic = CompassCreditRouter(run=None, service_id="timing_manager").traffic
+        traffic.send(_key(0))
+        traffic.finish()
+        await asyncio.Event().wait()  # only the router stops the loop
+
+    with pytest.raises(RuntimeError, match="Event loop stopped before Future"):
+        _run(timing_manager())
+
+    async def controller():
+        ctl = await _controller(monkeypatch, stop)
+        for message in sent:  # the service error, then the cancel
+            await _deliver(ctl, message)
+        assert stops == []  # the records manager's results are not in yet
+        await ctl._on_process_records_result_message(RESULTS)
+        return ctl
+
+    ctl = asyncio.run(controller())
+    assert stops == ["stop"]
+    (error,) = ctl._exit_errors
+    assert error.error_details.type == "UnansweredRequests"
+    assert str(_key(0)) in error.error_details.message

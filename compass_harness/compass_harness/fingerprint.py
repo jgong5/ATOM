@@ -48,6 +48,15 @@ PINNED = {
     # exit error, and the records manager finishes on its cancel.
     "aiperf.controller.system_controller:SystemController._process_service_error_message": "a335d7bf50eceae7491304e6446a1005ea705f5e9bd5c5e987f9a9d463dbc2f8",
     "aiperf.records.records_manager:RecordsManager._on_profile_cancel_command": "35a893e20a65736d7eba322512eac6fb0ed6c547d5cf261714d18e11c99b7ff7",
+    # CompassSystemController: the registrations it reads, the configure step it
+    # extends, the shutdown barrier it joins, and the bus that routes TrafficDone.
+    "aiperf.controller.system_controller:SystemController._handle_register_service_command": "0edc5a6a8e649410ba574ac704a717c1207c23eefb39431f78aea362006e82f3",
+    "aiperf.controller.system_controller:SystemController._start_services": "6e84837b1501ac352b247ef461108ed4b58ab248ab1b730e0d1a028271c8e5e3",
+    "aiperf.controller.system_controller:SystemController._profile_configure_all_services": "9e78f32092ccae6cfcfbef42ed982ee467606e06f58c906fc0554624b231d0e0",
+    "aiperf.controller.system_controller:SystemController._check_and_trigger_shutdown": "7bc0ea5878358a526714c99e3df5268ef28034e403ef540278073545b96e31a9",
+    "aiperf.controller.result_join_coordinator:ResultJoinCoordinator": "f180e123c7a6fc4f04effc0ffc9c4170152decfdc8185493c5cc5544c54954a1",
+    "aiperf.zmq.pub_client:ZMQPubClient._determine_topic": "6e4985da168ac2055429f2b650d36409a2af5e7cf8ca02cc8c2ebd0d9bd05b94",
+    "aiperf.zmq.sub_client:ZMQSubClient._handle_message": "4208e80ca2f197d079e9bc301014d04f83be3d0842f060e0b45d12d0306f4f5f",
     # The time source: what reads the rebound ``time`` and ``uuid4``, the idle
     # watchdog the strategy moves onto the clock, the deadline wait
     # ClockPhaseRunner overrides, and the orchestrator that builds the runner.
