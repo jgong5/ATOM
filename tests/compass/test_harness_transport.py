@@ -333,7 +333,12 @@ def test_a_stamp_after_its_request_timed_out_leaves_later_requests_served(
 
 
 def test_a_changed_pinned_function_refuses_the_run_by_name(tmp_path):
-    shutil.copytree(Path(aiperf.__file__).parent, tmp_path / "aiperf")
+    # Another gate shard may be writing bytecode into __pycache__ as this copies.
+    shutil.copytree(
+        Path(aiperf.__file__).parent,
+        tmp_path / "aiperf",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     fingerprint.check(tmp_path)
     path = tmp_path / "aiperf" / "transports" / "aiohttp_client.py"
     text = path.read_text()

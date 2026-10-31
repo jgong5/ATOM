@@ -5,9 +5,9 @@ client runs.
 
 A planted server stands in for ATOM's: it copies such a record to where the
 step record's variable points, answers ``/health`` once and exits. `rocm-smi`,
-`rocminfo` and the checkouts run.json's identity reads are planted as
-`test_drive_gpu.py` and `test_drive_identity.py` plant them, so run.json's
-identity is the one `identity` builds, and `fit.samples` reads it.
+`rocminfo`, ``preflight.sh`` and the checkouts run.json's identity reads are
+planted as `test_drive_gpu.py` and `test_drive_identity.py` plant them, so
+run.json's identity is the one `identity` builds, and `fit.samples` reads it.
 """
 
 import json
@@ -28,7 +28,7 @@ from test_validate_runs import _aiter
 
 from atom.compass import cli
 from atom.compass.backends.step_labels import TABLE_VERSION, label
-from atom.compass.drive import aiter_jit, identity, record, serve
+from atom.compass.drive import aiter_jit, gpu, identity, record, serve
 from atom.compass.fit.samples import load
 
 PLANTED = """\
@@ -178,8 +178,10 @@ def test_ops_profiling_dummy_weights_and_owned_flags_refuse_before_a_server_star
 
 @pytest.fixture
 def planted_gpu(tmp_path, monkeypatch):
-    """The planted server, `rocm-smi` listing GPU 7 free, `rocminfo`, the
-    checkouts and the model whose config.json run.json digests; returns the model."""
+    """The planted server, `rocm-smi` listing GPU 7 free, `rocminfo`, a
+    ``preflight.sh`` that passes, the checkouts and the model whose config.json
+    run.json digests; returns the model. The real ``preflight.sh``'s census
+    reads this host's load and can refuse on it."""
     steps = recorded(tmp_path / "planted", monkeypatch, key=HOST)
     monkeypatch.setenv("PLANTED_RECORD", str(steps))
     (tmp_path / "server.py").write_text(PLANTED)
@@ -198,6 +200,8 @@ def planted_gpu(tmp_path, monkeypatch):
     for tool in ("rocm-smi", "rocminfo"):
         (bindir / tool).chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    (bindir / "preflight.sh").write_text("echo PREFLIGHT_RC=0\n")
+    monkeypatch.setattr(gpu, "PREFLIGHT", bindir / "preflight.sh")
     trees = {
         m: _checkout(tmp_path / m, tag) for m, tag in (("atom", None), ("aiter", "v0"))
     }

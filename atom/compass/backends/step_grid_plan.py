@@ -14,9 +14,12 @@ are read, never timestamps. Reading records stays with the caller.
 `dp<r>.engine.json`: `TARGET`, the scheduler's bounds, the KV block size and
 count, and the decode ladder. The block count is the smallest any rank
 states, since a real start sets it from its free memory; inputs whose ranks
-state two engines otherwise are refused, and so is a step whose decode row
-computes more than one token: its run had a drafter, and the ladder its
-engine states holds rungs ATOM did not capture. The grid definition is a
+state two engines otherwise are refused. A decode row computes the engine's
+decode width N_Q: one token, or under the drafter its engine states
+(`speculative`, [method, K]) the K + 1 of a verify step, whose draft round
+also writes KV at K - 1 positions past the row, the lookahead ATOM's
+scheduler allocates with it (`block_manager.draft_kv_lookahead`); a step
+whose decode row computes another count is refused. The grid definition is a
 mapping:
 
     {"prefill": {"B": [...], "T": [...], "c": [...]}, "decode": {"c": [...]},
@@ -33,9 +36,9 @@ definition node past one. Prefill's top nodes are `max_num_seqs` on B,
 c, so `max_model_len` below the token budget is refused. Each decode rung has
 B nodes at the previous rung + 1, at the rung, and at each B between them that
 a step on the rung reaches past the rung's KV limit; its c nodes add each B
-node's KV limit, `block size * (num_kvcache_blocks // B) - 1`, and
-`max_model_len - 1`; the decode grid records that pool, which a lookup
-extrapolates past.
+node's KV limit, `block size * (num_kvcache_blocks // B) - N_Q - lookahead`,
+and `max_model_len - N_Q`; the decode grid records that pool, with the
+lookahead, which a lookup extrapolates past, and the draft width K.
 
 It then plans every corner of each step's cell, widened by `margin` nodes on
 every axis and to `margin` rungs either side, each such rung at all its B
@@ -46,10 +49,11 @@ bundle whose measured rungs skip one of the ladder's does not load. A point
 that is no batch the target runs is not planned: B above `max_num_seqs`, T
 above `max_num_batched_tokens`, T not a multiple of B or below it, c + N_Q
 above `max_model_len`, or more KV blocks than the block count. B rows hold
-B * ceil((c + N_Q) / block size) blocks; past the count, a decode point's
-rows share the fewest leading blocks that bring them into it, as a server's
-prefix cache lets rows share, and its line states them as `shared`; they are
-full blocks of the cached context, so at most floor(c / block size).
+B * ceil((c + N_Q + lookahead) / block size) blocks; past the count, a
+decode point's rows share the fewest leading blocks that bring them into it,
+as a server's prefix cache lets rows share, and its line states them as
+`shared`; they are full blocks of the cached context, so at most
+floor(c / block size).
 """
 
 import bisect
@@ -96,7 +100,8 @@ def _views(steps) -> list[tuple[str, BatchView]]:
 
 def _target(definition: dict, engines: dict) -> dict:
     """The `TARGET` fields of the one engine every input rank states, at the
-    smallest KV block count any states, whose KV limits hold for every input."""
+    smallest KV block count any states, whose KV limits hold for every input,
+    and its drafter's draft width and lookahead, 0 without one."""
     if not engines:
         raise ValueError("no input states the engine its steps ran on")
     for name, engine in engines.items():
@@ -131,7 +136,14 @@ def _target(definition: dict, engines: dict) -> dict:
                 f"{k} {definition[k]!r} and the engine {engine[k]!r}" for k in differ
             )
         )
-    return {key: engine[key] for key in TARGET}
+    drafts = (engine.get("speculative") or (None, 0))[1]
+    if type(drafts) is not int or drafts < 0:
+        raise ValueError(
+            f"{first} states the drafter {engine['speculative']!r}, whose draft "
+            "width is not a count"
+        )
+    drafter = {"draft_width": drafts, "lookahead": _lookahead(drafts)}
+    return {key: engine[key] for key in TARGET} | drafter
 
 
 def _reason(refused: CostRefused) -> str:
@@ -146,12 +158,25 @@ def _span(nodes, low, high, margin: int) -> list:
     return nodes[max(0, first - margin) : last + margin + 1]
 
 
+def _lookahead(drafts: int) -> int:
+    """The KV positions past a row's context that one forward's draft round
+    writes under a drafter of draft width `drafts`, which ATOM's scheduler
+    allocates with the row (`block_manager.draft_kv_lookahead`)."""
+    return max(0, drafts - 1)
+
+
+def _extra(target: dict) -> int:
+    """The KV positions a decode row holds past its cached context: its
+    tokens, and those its draft round writes past them."""
+    return target.get("draft_width", 0) + 1 + target.get("lookahead", 0)
+
+
 def _shared(target: dict, b: int, c: int) -> int:
     """The leading KV blocks B decode rows on c cached share to fit the
     target's pool: none where they fit apart, else the fewest that bring them
     into it, at most the full blocks their cached context fills."""
     size = target["kv_cache_block_size"]
-    over = b * -(-(c + 1) // size) - target["num_kvcache_blocks"]
+    over = b * -(-(c + _extra(target)) // size) - target["num_kvcache_blocks"]
     return min(c // size, -(-over // (b - 1))) if over > 0 and b > 1 else 0
 
 
@@ -159,7 +184,8 @@ def _infeasible(target: dict, b: int, t: int, c: int, prefill: bool) -> str:
     """Why the target cannot run B rows of T tokens in all on c cached each,
     decode rows sharing `_shared` blocks, or ''."""
     n_q, shared = t // b, 0 if prefill else _shared(target, b, c)
-    blocks = b * -(-(c + n_q) // target["kv_cache_block_size"]) - (b - 1) * shared
+    held = c + n_q + target.get("lookahead", 0)
+    blocks = b * -(-held // target["kv_cache_block_size"]) - (b - 1) * shared
     checks = [
         (b > target["max_num_seqs"], f"B {b} is above max_num_seqs"),
         (
@@ -183,7 +209,8 @@ def _infeasible(target: dict, b: int, t: int, c: int, prefill: bool) -> str:
 
 def _c_max(target: dict, b: int) -> int:
     """The largest cached context at which B decode rows fit the KV pool."""
-    return target["kv_cache_block_size"] * (target["num_kvcache_blocks"] // b) - 1
+    blocks = target["num_kvcache_blocks"] // b
+    return target["kv_cache_block_size"] * blocks - _extra(target)
 
 
 def _capped(nodes, top: int) -> list:
@@ -195,16 +222,18 @@ def _layout(definition: dict, b_nodes: dict) -> dict:
     """The grid `definition` makes with these decode B nodes per rung, its
     nodes past a bound dropped and the bounds added: the token budget T's top,
     ``max_num_seqs`` B's and ``max_model_len`` less the budget c's for
-    prefill; per decode rung, each B node's KV limit and ``max_model_len - 1``
-    as c nodes, and the KV pool they come from."""
+    prefill; per decode rung, each B node's KV limit and ``max_model_len``
+    less the decode width as c nodes, and the KV pool they come from."""
     budget = definition["max_num_batched_tokens"]
     tops = {
         "B": definition["max_num_seqs"],
         "T": budget,
         "c": definition["max_model_len"] - budget,
     }
-    c, top = definition["decode"]["c"], definition["max_model_len"] - 1
+    drafts, ahead = definition["draft_width"], definition["lookahead"]
+    c, top = definition["decode"]["c"], definition["max_model_len"] - drafts - 1
     return {
+        **({"draft_width": drafts} if drafts else {}),
         "graph_mode": "replay",
         "scope": SCOPE,
         "bounds": {name: definition[name] for name in BOUNDS},
@@ -225,21 +254,22 @@ def _layout(definition: dict, b_nodes: dict) -> dict:
             "pool": {
                 "block_size": definition["kv_cache_block_size"],
                 "blocks": definition["num_kvcache_blocks"],
+                **({"lookahead": ahead} if ahead else {}),
             },
         },
     }
 
 
-def _line(step: int, phase: str, key: str, at: list, shared: int) -> dict:
+def _line(step: int, phase: str, key: str, at: list, shared: int, width) -> dict:
     """The planned point `at`, `[B, T, c]` or `[rung, B, c]`, as a step-record
-    line: B rows of N_Q = T/B tokens, or of one decode token, on c cached,
+    line: B rows of N_Q = T/B tokens, or of the decode `width`, on c cached,
     sharing their first `shared` KV blocks."""
     if phase == "prefill":
         (b, t, c), rung, output = at, None, key == "output"
         row = [t // b, c + t // b, False]
     else:
         (rung, b, c), output = at, True
-        row = [1, c + 1, True]
+        row = [width, c + width, True]
     return {
         "step": step,
         "dp_rank": 0,
@@ -258,8 +288,9 @@ def plan(definition: dict, steps, engines: dict) -> dict:
     the engine `engines` states, a mapping from each input rank's name to the
     engine it states.
 
-    It returns `graph_mode`, `scope` and `bounds`, and `prefill` and `decode`
-    in a bundle grid's layout (`step_grid.py`) with no point measured;
+    It returns `graph_mode`, `scope` and `bounds`, under a drafter its
+    `draft_width`, and `prefill` and `decode` in a bundle grid's layout
+    (`step_grid.py`) with no point measured;
     `lines`, each planned point as a step-record line with origin `plan`,
     which that grid locates on the point's node, a decode point past the KV
     pool stating the blocks its rows share; `counts` per grid;
@@ -268,13 +299,17 @@ def plan(definition: dict, steps, engines: dict) -> dict:
     """
     steps = _views(steps)
     definition = {**definition, **_target(definition, engines)}
-    drafted = [n for n, view in steps if any(r.query_tokens > 1 for r in view.decode)]
-    if drafted:
-        raise ValueError(
-            f"{drafted[0]} decodes more than one token in a row, so its run had "
-            "a drafter, and the ladder its engine states holds rungs ATOM did "
-            "not capture"
-        )
+    width = definition["draft_width"] + 1
+    for name, view in steps:
+        if other := sorted({r.query_tokens for r in view.decode} - {width}):
+            many, n = "more than one token", other[0]
+            if width > 1:
+                many = f"{n} token{'s' * (n > 1)}"
+            verifies = f"verifies {width - 1} drafts" if width > 1 else "has no drafter"
+            raise ValueError(
+                f"{name} decodes {many} in a row, and the engine its inputs "
+                f"state {verifies}"
+            )
     if sorted(definition["prefill"]) != ["B", "T", "c"]:
         raise ValueError(
             f"the grid definition's prefill nodes are on "
@@ -354,12 +389,13 @@ def plan(definition: dict, steps, engines: dict) -> dict:
                 name, why = f"prefill {key}", _infeasible(definition, *at, prefill=True)
             else:
                 name = f"decode rung {at[0]}"
-                why = _infeasible(definition, at[1], at[1], at[2], prefill=False)
+                why = _infeasible(definition, at[1], at[1] * width, at[2], False)
             if why:
                 out["infeasible"].append({"grid": name, "at": at, "reason": why})
                 continue
             shared = 0 if phase == "prefill" else _shared(definition, *at[1:])
-            out["lines"].append(_line(len(out["lines"]), phase, key, at, shared))
+            line = _line(len(out["lines"]), phase, key, at, shared, width)
+            out["lines"].append(line)
             out["counts"][name] = out["counts"].get(name, 0) + 1
     return out
 

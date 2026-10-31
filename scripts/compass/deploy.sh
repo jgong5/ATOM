@@ -25,8 +25,10 @@
 #                  run refuses --prefill and --decode, a worker more to
 #                  choose, and --max-concurrent-requests and
 #                  --rate-limit-tokens-per-second, a limiter on the wall
-#                  clock; the caller switches the router's wall-clock
-#                  detectors off, as pd_sim.sh does: --disable-health-check
+#                  clock; it sets --request-timeout-secs (`_lib.sh`) and
+#                  refuses the caller's; the caller switches the router's
+#                  wall-clock detectors off, as pd_sim.sh does:
+#                  --disable-health-check
 #                  --disable-circuit-breaker --disable-retries
 #   ATOMESH        the router binary (default atomesh)
 #   SEED           the router LP's seed (default 20260707, client.sh's)
@@ -98,6 +100,7 @@ done
     case ${word%%=*} in
     --prefill | --decode) bad "the router's arguments carry ${word%%=*}, a worker more for a simulated router to choose" ;;
     --max-concurrent-requests | --rate-limit-tokens-per-second) bad "the router's arguments carry ${word%%=*}, a limiter a simulated router leaves out" ;;
+    --request-timeout-secs) bad "the router's arguments carry ${word%%=*}, a wall-clock bound the script sets for a simulated router" ;;
     esac
 done
 for path in "$(realpath -m "$OUT")" "$ROOT" "$PWD"; do
@@ -125,15 +128,15 @@ ROUTER_LP=
 # listeners take one per rank from its handshake port. The decode's handshake
 # port, the prefill's plus its ranks as the nightly's 1P1D launch gives it, is
 # not held: its listeners bind ports the kernel hands out.
-ports=$(python3 - "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
-import argparse, json, random, socket, sys
+ports=$(python3 - $$ "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
+import argparse, json, random, socket, subprocess, sys
 from pathlib import Path
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactRefusal
 from atom.compass.drive import runfile, serve
 from atom.compass.spec import SpecRefusal
 
-run_file, kv_link, router_lp, n, *words = sys.argv[1:]
+script, run_file, kv_link, router_lp, n, *words = sys.argv[1:]
 flags, words = words[: int(n)], words[int(n) :]
 k = int(words[0])
 prefill, decode = words[1 : 1 + k], words[1 + k :]
@@ -147,15 +150,23 @@ def block(n):
                 held[-1].bind(("", p))
             return base
         except OSError:
-            continue
+            [held.pop().close() for _ in range(p - base + 1)]
     sys.exit(f"deploy: no {n} free ports in a row from {room.start} below {room.stop}, where {serve.PORT_RANGE} starts")
+def hand(*ports):
+    """Print `ports` and exit; a holder keeps every drawn port until the script
+    exits, as compass_held_port's does, spawned since this process runs threads."""
+    for s in held:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    hold = "import os, select, sys; select.select([os.pidfd_open(int(sys.argv[1]))], [], [])"
+    subprocess.Popen([sys.executable, "-c", hold, script], pass_fds=[s.fileno() for s in held], stdout=subprocess.DEVNULL)
+    print(*ports)
+    sys.exit()
 router, prometheus = block(1), block(1)
 if not run_file:
     engine = runfile._engine_args(prefill)
     ranks = engine.data_parallel_size * engine.tensor_parallel_size * engine.pipeline_parallel_size
     base = block(ranks)
-    print(router, prometheus, base, base + ranks)
-    sys.exit()
+    hand(router, prometheus, base, base + ranks)
 parser = argparse.ArgumentParser(prog="deploy.sh run")
 runfile.add_arguments(parser)
 args = parser.parse_args(flags)
@@ -173,7 +184,7 @@ clock = block(1)
 base = block(run["prefill_data_parallel_size"] * run["decode_data_parallel_size"])
 run |= {"out_dir": str(Path(run_file).parent), "clock_endpoint": f"tcp://127.0.0.1:{clock}"}
 Path(run_file).write_text(json.dumps(run))
-print(router, prometheus, base, base, clock, lookaheads)
+hand(router, prometheus, base, base, clock, lookaheads)
 EOF
 )
 # Its last line; an import may print before it.
@@ -248,8 +259,9 @@ hosts=127.0.0.1
 for u in "$prefill_url" "$decode_url"; do u=${u#*://} && hosts+=,${u%:*}; done
 export NO_PROXY=$hosts${NO_PROXY:+,$NO_PROXY} no_proxy=$hosts${no_proxy:+,$no_proxy}
 
-ROUTER=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --prometheus-port "$PROMETHEUS_PORT"
-    --pd-disaggregation --prefill "$prefill_url" --decode "$decode_url" "${router[@]}")
+ROUTER=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --prometheus-port "$PROMETHEUS_PORT")
+[[ -z $RUN_FILE ]] || ROUTER+=(--request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S")
+ROUTER+=(--pd-disaggregation --prefill "$prefill_url" --decode "$decode_url" "${router[@]}")
 router_env=()
 [[ -z $ROUTER_LP ]] || router_env=(ATOM_COMPASS_CLOCK_ENDPOINT="$CLOCK" ATOM_COMPASS_SEED="${SEED:-20260707}" ATOM_COMPASS_ROUTER_LOOKAHEADS="$LOOKAHEADS")
 env "${router_env[@]}" "${ROUTER[@]}" >"$OUT/router.log" 2>&1 &

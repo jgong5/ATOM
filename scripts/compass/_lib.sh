@@ -262,21 +262,43 @@ compass_pytest_counts() {
     ERRORS=$(grep -oE '[0-9]+ errors?' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
 }
 
-# A TCP port held until this script exits, so no other process binds it before
-# its server does. Its holder binds it on every address, where another socket's
-# plain bind fails, then sets SO_REUSEADDR and never listens: only a listener
-# that sets it too binds the port, beside the holder, as uvicorn's, libzmq's,
-# socket.create_server's, torch's TCPStore's and the atomesh router's do.
+# compass_held_port [N]: the first of N ports in a row (default 1), each one
+# a free TCP port, held until this script exits, so no other process binds it
+# before its server does. A block of more than one is drawn below the
+# ephemeral range. Its holder binds it on every address, where another
+# socket's plain bind fails, then sets SO_REUSEADDR and never listens: a server
+# that sets it too binds the port beside the holder, as uvicorn's, libzmq's,
+# socket.create_server's, torch's TCPStore's and the atomesh router's listeners
+# do.
 compass_held_port() {
-    python3 -c 'import os, select, socket, sys
-s = socket.socket()
-s.bind(("", 0))
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-print(s.getsockname()[1], flush=True)
+    python3 -c 'import os, random, select, socket, sys
+held, n = [], int(sys.argv[2])
+low = int(open("/proc/sys/net/ipv4/ip_local_port_range").read().split()[0])
+while len(held) < n:
+    first = random.randrange(low // 2, low - n) if n > 1 else 0
+    port = held[0].getsockname()[1] + len(held) if held else first
+    held.append(socket.socket())
+    try:
+        held[-1].bind(("", port))
+    except (OSError, OverflowError):
+        if not port:
+            raise
+        while held:  # another socket has one: draw the block again
+            held.pop().close()
+for s in held:
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+print(held[0].getsockname()[1], flush=True)
 if not os.fork():
     os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
-    select.select([os.pidfd_open(int(sys.argv[1]))], [], [])' $$
+    select.select([os.pidfd_open(int(sys.argv[1]))], [], [])' $$ "${1:-1}"
 }
+
+# The router's bound on each request to a worker, its whole response
+# included, which `--request-timeout-secs` sets (default 1800 s) and the
+# clock cannot reach. A simulated stream lasts as much wall time as the run
+# takes to reach its end, past 1800 s at c=256, so a simulated launch sets
+# the bound to a year.
+COMPASS_SIM_REQUEST_TIMEOUT_S=31536000
 
 # compass_wait_up WHAT PID URL: return once URL answers; exit 1 if PID exits
 # first or WAIT_S seconds pass.
