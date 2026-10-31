@@ -274,6 +274,60 @@ def test_a_dp_rank_whose_kv_blocks_name_no_one_reading_is_refused(
     assert verdict == "refused" and refused in value
 
 
+def _tp_rows(monkeypatch, tmp_path, factors, tp=4, tokens=()) -> dict:
+    """validate's memory rows for one DP rank whose real record states TP width
+    `tp`, against a server log of a TP rank's lines per factor on the predicted
+    non_torch, each warmed up at its `tokens`, the hand-in's when absent."""
+    saved = _memory(monkeypatch, tmp_path, eager=True)
+    real = tmp_path / "real"
+    (real / "steps").mkdir(parents=True)
+    record = {"tensor_parallel_size": tp, "num_kvcache_blocks": 77049}
+    (real / "steps" / "dp0.engine.json").write_text(json.dumps(record))
+    peak, non_torch = _total(saved, "peak_torch"), _total(saved, "non_torch")
+    one, logged = tmp_path / "one.log", ""
+    for f, n in zip(factors, tokens or [saved["tokens"]] * len(factors)):
+        logged += _log(one, peak=peak, non_torch=non_torch * f, tokens=n).read_text()
+    (real / "server.log").write_text(logged)
+    rows = validate._memory("real", tmp_path, "engine", real)
+    return {(where, name): (value, verdict) for where, name, value, verdict in rows}
+
+
+def test_a_tp_log_is_checked_line_by_line_and_its_spread_reported(
+    monkeypatch, tmp_path
+):
+    rows = _tp_rows(monkeypatch, tmp_path, [1.0, 1.0, 2.0, 1.0])
+    verdicts = [rows[f"memory real line {i}", "non_torch"][1] for i in (1, 2, 3, 4)]
+    assert verdicts == ["pass", "pass", "fail", "pass"]
+    assert rows["memory real line 3", "peak_torch"][1] == "pass"
+    hand_in = tmp_path / compass_run.LP_FILE.format("engine")
+    saved = json.loads(hand_in.read_text())["memory"]
+    low, high = (
+        check._gib(f"{_total(saved, 'non_torch') * f / GIB:.2f}") for f in (1, 2)
+    )
+    assert rows["memory real", "non_torch across TP ranks"] == (
+        f"{low:,} to {high:,} B, {high / low - 1:.2%} apart",
+        "-",
+    )
+    assert rows["memory real", "peak_torch across TP ranks"][0].endswith(" 0.00% apart")
+
+
+@pytest.mark.parametrize(
+    "factors,tp,tokens,refused",
+    [
+        ([1.0] * 3, 4, (), "each of the 4 ranks of one real server logs one"),
+        ([1.0] * 4, 1, (), "each of the 1 ranks of one real server logs one"),
+        ([1.0] * 2, 2, (8192, 4096), "ranks log ['4096', '8192']"),
+    ],
+    ids=["a-line-short", "record-at-tp1", "warmups-disagree"],
+)
+def test_a_tp_log_not_at_its_records_width_or_shape_is_refused(
+    monkeypatch, tmp_path, factors, tp, tokens, refused
+):
+    rows = _tp_rows(monkeypatch, tmp_path, factors, tp, tokens)
+    value, verdict = rows["memory real", "memory"]
+    assert verdict == "refused" and refused in value
+
+
 def test_a_hand_in_with_no_memory_section_is_refused_by_name(tmp_path):
     compass_run._hand_in({"out_dir": str(tmp_path)}, "frontend", [])
     frontend = tmp_path / compass_run.LP_FILE.format("frontend")

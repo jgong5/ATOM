@@ -96,16 +96,23 @@ def record(readings: DeviceReadings, *, tokens: int, memory) -> dict:
     }
 
 
-def _one(pattern: re.Pattern, text: str, log: Path, ranks: int, blocks=None) -> tuple:
-    """Each rank's values on its line matching `pattern`; where ranks differ, those
-    on the lines that log `blocks`, the rank's KV block count, which must agree."""
+def _one(
+    pattern: re.Pattern, text: str, log: Path, ranks: int, blocks=None, tp: int = 1
+) -> list[tuple]:
+    """The values on the lines matching `pattern`, which each of the `tp` TP ranks
+    of each of `ranks` DP ranks logs once: at one DP rank each TP rank's, as
+    logged; above it the ranks' one value, or where ranks differ the one on the
+    lines that log `blocks`, the rank's KV block count."""
     found = pattern.findall(text)
-    if len(found) != ranks:
+    if len(found) != ranks * tp:
         raise MemoryRefusal(
             f"{log} has {len(found)} lines matching {pattern.pattern!r}, and "
-            f"each of the {ranks} ranks of one real server logs one",
-            "pass the log of a real server at as many ranks as hand-ins",
+            f"each of the {ranks * tp} ranks of one real server logs one",
+            "pass the log of a real server at as many DP ranks as hand-ins, "
+            "at the TP width its record states",
         )
+    if ranks == 1:
+        return [f if isinstance(f, tuple) else (f,) for f in found]
     if len(set(found)) > 1 and blocks:
         count = f"num_kvcache_blocks={blocks}"
         found = re.findall(rf"{pattern.pattern}.*\b{count}\b", text)
@@ -126,7 +133,7 @@ def _one(pattern: re.Pattern, text: str, log: Path, ranks: int, blocks=None) -> 
             f"{pattern.pattern!r}, which name no rank to pair with a hand-in",
             "compare a log whose ranks log the same values",
         )
-    return found[0] if isinstance(found[0], tuple) else (found[0],)
+    return [found[0] if isinstance(found[0], tuple) else (found[0],)]
 
 
 def _gib(text: str) -> int:
@@ -152,13 +159,17 @@ def _stored(out: Path) -> tuple[Term, ...]:
     return footprint_terms(held[0], source=f"{STORAGE} in {out / READINGS}")
 
 
-def recorded(log: Path, ranks: int = 1, blocks=None) -> tuple[Recorded, Term | None]:
-    """The real server's two readings, which each of its `ranks` DP ranks logs,
-    and the pool its capture reserved; for a `compass measure memory` ``--out``,
-    its engine's, and its ranks' storage bytes besides.
+def recorded(
+    log: Path, ranks: int = 1, blocks=None, tp: int = 1
+) -> tuple[list[Recorded], Term | None]:
+    """The real server's two readings, which each TP rank of each of its `ranks`
+    DP ranks logs, at TP width `tp`, a recording per line `_one` reads, and the
+    pool its capture reserved; for a `compass measure memory` ``--out``, its
+    engine's, and its ranks' storage bytes besides.
 
     ATOM logs GiB to two places, so each recorded term is good to 5 MiB.
-    The run is named by the log's path and its record by the log's digest.
+    The run is named by the log's path, of several lines with the line's place,
+    and its record by the log's digest.
     The pool is None when the server captured no graph.
     """
     stored = ()
@@ -166,42 +177,49 @@ def recorded(log: Path, ranks: int = 1, blocks=None) -> tuple[Recorded, Term | N
         stored, log = _stored(log), log / LOG
     data = log.read_bytes()
     text = data.decode(errors="replace")
-    peak_torch, non_torch = _one(_BUDGET, text, log, ranks, blocks)
-    (tokens,) = _one(_WARMUP, text, log, ranks)
-    run = Recorded(
-        run=str(log),
-        shape=Shape(int(tokens), PHASE),
-        # `ModelRunner.warmup_model` resets the peak before its forward.
-        high_water_reset=True,
-        terms=footprint_terms(
-            {"peak_torch": _gib(peak_torch), "non_torch": _gib(non_torch)},
-            source="the Memory budget line",
+    budgets = _one(_BUDGET, text, log, ranks, blocks, tp)
+    # The TP ranks of a DP rank warm up at its one shape.
+    ((tokens,),) = _one(_WARMUP, text, log, ranks * tp)
+    runs = [
+        Recorded(
+            run=f"{log} line {i}" if len(budgets) > 1 else str(log),
+            shape=Shape(int(tokens), PHASE),
+            # `ModelRunner.warmup_model` resets the peak before its forward.
+            high_water_reset=True,
+            terms=footprint_terms(
+                {"peak_torch": _gib(peak_torch), "non_torch": _gib(non_torch)},
+                source="the Memory budget line",
+            )
+            + stored,
+            at_shape=SHAPED,
+            record="sha256:" + hashlib.sha256(data).hexdigest(),
         )
-        + stored,
-        at_shape=SHAPED,
-        record="sha256:" + hashlib.sha256(data).hexdigest(),
-    )
+        for i, (peak_torch, non_torch) in enumerate(budgets, 1)
+    ]
     pools = _POOL.findall(text)
     if not pools:
-        return run, None
+        return runs, None
     pool = Term(
         "pool(reserved)",
         _gib(pools[0]),
         Method.MEASURED,
         "the CUDA graph capture memory line",
     )
-    return run, pool
+    return runs, pool
 
 
-def parts(predicted_file: Path, log: Path, ranks: int = 1, blocks=None) -> list:
-    """The per-term comparison, the predicted readings, and the graph pool's."""
+def parts(
+    predicted_file: Path, log: Path, ranks: int = 1, blocks=None, tp: int = 1
+) -> list:
+    """The per-term comparison against each recording `recorded` reads, the
+    predicted readings, and the graph pool's."""
     if not (saved := read_json(predicted_file).get("memory")):
         what = f"{predicted_file} has no memory section"
         raise MemoryRefusal(what, "pass an engine's hand-in, lp-engine*.json")
     readings = {name: _reading(name, rows) for name, rows in saved["readings"].items()}
-    run, pool = recorded(log, ranks, blocks)
+    runs, pool = recorded(log, ranks, blocks, tp)
     # The terms of `peak_torch` the run records alone: its storages.
-    stored = run.by_name().keys() - set(COMPARED)
+    stored = runs[0].by_name().keys() - set(COMPARED)
     alone = tuple(t for t in readings["peak_torch"].terms if t.name in stored)
     predicted = Predicted(
         saved["label"],
@@ -209,7 +227,7 @@ def parts(predicted_file: Path, log: Path, ranks: int = 1, blocks=None) -> list:
         tuple(readings[name].as_term() for name in COMPARED) + alone,
         at_shape=SHAPED,
     )
-    out = [compare(predicted, run)]
+    out = [compare(predicted, run) for run in runs]
     out += [readings[name] for name in COMPARED]
     if pool is None or saved["predicts"] is None:
         out.append(

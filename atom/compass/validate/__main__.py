@@ -157,27 +157,41 @@ def _cost(name: str, run: Path, backend, steps: list[dict], op=False):
 
 def _memory(name: str, sim: Path, engine: str, real: Path):
     """`real`'s memory against `engine`'s hand-in in `sim`, per rank at DP width
-    above 1, where each rank hands in as `<engine>.dp<r>`."""
+    above 1, where each rank hands in as `<engine>.dp<r>`; at the TP width the
+    real rank's record states, against each TP rank's line."""
     ranks = sorted(sim.glob(LP_FILE.format(f"{engine}.dp*")))
     for hand_in in ranks or [sim / LP_FILE.format(engine)]:
         rank = f" {hand_in.stem.rsplit('.', 1)[1]}" if ranks else ""
         # The real rank's KV block count names its lines in the server log.
-        record = real / f"steps/{rank.strip()}.engine.json"
-        blocks = ranks and record.exists() and read_json(record)["num_kvcache_blocks"]
+        record = real / f"steps/{rank.strip() or 'dp0'}.engine.json"
+        stated = read_json(record) if record.exists() else {}
+        blocks = ranks and stated.get("num_kvcache_blocks")
+        tp = stated.get("tensor_parallel_size", 1)
         n = len(ranks) or 1
-        yield from _checked(f"memory {name}{rank}", hand_in, real, n, blocks)
+        yield from _checked(f"memory {name}{rank}", hand_in, real, n, blocks, tp)
 
 
-def _checked(where: str, hand_in: Path, real: Path, ranks: int, blocks=None):
+def _checked(where: str, hand_in: Path, real: Path, ranks: int, blocks=None, tp=1):
     try:
-        comparison, *_, graph = parts(hand_in, real / "server.log", ranks, blocks)
+        *compared, _, _, graph = parts(hand_in, real / "server.log", ranks, blocks, tp)
     except MemoryRefusal as e:
         yield where, "memory", e.what, "refused"
         return
-    for t in comparison.compared:
-        yield where, t.name, f"{t.relative:+.2%} ({t.delta_bytes:+,} B)", str(t.verdict)
-    for r in comparison.refused:
-        yield where, r.name, r.what, "refused"
+    # A TP rank's line names no rank, so its rows name its place in the log.
+    for i, comparison in enumerate(compared, 1):
+        at = f"{where} line {i}" if len(compared) > 1 else where
+        for t in comparison.compared:
+            value = f"{t.relative:+.2%} ({t.delta_bytes:+,} B)"
+            yield at, t.name, value, str(t.verdict)
+        for r in comparison.refused:
+            yield at, r.name, r.what, "refused"
+    for t in compared[0].compared if len(compared) > 1 else ():
+        held = [
+            u.recorded.nbytes for c in compared for u in c.compared if u.name == t.name
+        ]
+        low, high = min(held), max(held)
+        value = f"{low:,} to {high:,} B, {high / low - 1:.2%} apart"
+        yield where, f"{t.name} across TP ranks", value, "-"
     if not isinstance(graph, str):
         graph = f"reserves() {graph.reserves_relative:+.2%}, predicts() {graph.predicts_relative:+.2%}"
     yield where, "graph pool", graph, "-"
