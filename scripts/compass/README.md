@@ -769,12 +769,7 @@ keyed by `machines/mi355x-crs005.json`, in the image that file pins, at
 cell that built an aiter JIT module was run again. The decode side adds a c=256 cell
 at seed 20260709 and, for rung 12, c=96 at seeds 20260707 and 20260708 and c=112 at
 seed 20260709: a lone decode server at c=256 decodes at rungs 16 to 28, and at c=64
-at rungs 4 and 8. The decode law's device vectors are fitted with `--moe-routing 384,6`,
-DeepSeek-V4-Pro's routed experts and top-k, on those cells and on the decode side
-of one 1P1D `deploy.sh record` cell (below) at c=256 over traces 256 to 392, seed
-20260707, whose decode ranks run unevenly loaded
-([#2493](https://github.com/jgong5/ATOM/issues/2493)); its host laws are the ones
-fitted on the lone cells alone.
+at rungs 4 and 8.
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json`
 are the same pair with expert parallelism on (MORI): the `history` form, fitted by
