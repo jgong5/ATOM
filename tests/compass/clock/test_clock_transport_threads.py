@@ -71,3 +71,31 @@ def test_each_tcp_connection_is_served_on_its_own_reader_and_needs_no_other_thre
     assert len(ca.served_on) == 2
     assert ca.served_on["a"] != ca.served_on["b"]
     assert ca.served_on["a"] | ca.served_on["b"] <= readers
+
+
+def test_an_lp_in_the_serving_process_reaches_a_tcp_clock_with_no_socket_and_can_poll():
+    import select
+
+    from atom.compass.clock_transport import connect_here
+
+    ca = _Threads(_table())
+    server = serve(ca, LOCAL)
+    try:
+        before = set(threading.enumerate())
+        b = connect_here(B, server.endpoint)
+        assert set(threading.enumerate()) == before  # no reader for it
+        a = _result(_later(connect, A, server.endpoint))
+        b.send((NER, INF, [], INF))
+        waiting = select.poll()
+        waiting.register(b, select.POLLIN)
+        assert waiting.poll(0) == []  # held: nothing to read yet
+        _result(_later(a.send, (TAR, 1.0, [(AB, 0, 0.7)], INF)))
+        assert waiting.poll(10_000) == [(b.fileno(), select.POLLIN)]
+        assert b.recv() == (0.7, {AB: [(0, 0.7)]})
+        assert waiting.poll(0) == []
+        assert _result(_later(a.recv)) == (1.0, {})
+        a.close()
+        b.close()
+    finally:
+        server.close()
+    assert ca.served_on["b"] == {threading.get_ident()}

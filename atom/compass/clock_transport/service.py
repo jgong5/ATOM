@@ -43,8 +43,10 @@ has ended. It looks every quarter of `diag_s`, so a stall is logged between
 `diag_s` and a quarter more after the last request.
 """
 
+import contextlib
 import logging
 import math
+import os
 import queue
 import threading
 
@@ -281,6 +283,49 @@ class _Connection:
         """Nothing to release: the reply slot is the LP's, not the connection's."""
 
 
+class _ReadableSlot:
+    """A reply slot an LP can also wait on with `select`: each reply makes its
+    pipe readable by one byte, which `get` takes with the reply."""
+
+    def __init__(self) -> None:
+        self._replies = queue.SimpleQueue()
+        self._read, self._write = os.pipe()
+
+    def put(self, frame: bytes) -> None:
+        self._replies.put(frame)
+        with contextlib.suppress(OSError):  # the LP has closed its connection
+            os.write(self._write, b"\0")
+
+    def get(self) -> bytes:
+        os.read(self._read, 1)
+        return self._replies.get_nowait()
+
+    def fileno(self) -> int:
+        return self._read
+
+    def close(self) -> None:
+        os.close(self._read)
+        os.close(self._write)
+
+
+class _HereConnection(_Connection):
+    """A connection from the process that serves the endpoint, whatever its
+    scheme: no socket, and `fileno` is readable while a reply waits, as a
+    socket's is."""
+
+    def __init__(self, server: _Server, lp: LpId, member: str | None = None) -> None:
+        self._server = server
+        self._lp, self._slot, self.joined = server.bind(
+            encode((BIND, lp, member)), _ReadableSlot()
+        )
+
+    def fileno(self) -> int:
+        return self._slot.fileno()
+
+    def close(self) -> None:
+        self._slot.close()
+
+
 def serve(
     authority, endpoint: str = DEFAULT_ENDPOINT, diag_s: float = DIAG_S
 ) -> _Server:
@@ -306,3 +351,13 @@ def connect(
             + (", ".join(sorted(_SERVED)) or "<none>")
         )
     return _Connection(server, lp, member)
+
+
+def connect_here(
+    lp: LpId, endpoint: str = DEFAULT_ENDPOINT, member: str | None = None
+) -> _HereConnection:
+    """`connect`, with a `fileno` to wait on."""
+    server = _SERVED.get(endpoint)
+    if server is None:
+        raise KeyError(f"nothing is served at {endpoint} in this process")
+    return _HereConnection(server, lp, member)

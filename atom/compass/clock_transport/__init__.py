@@ -31,6 +31,13 @@ def connect(lp, endpoint: str = DEFAULT_ENDPOINT, member: str | None = None):
     return _carrier(endpoint).connect(lp, endpoint, member)
 
 
+def connect_here(lp, endpoint: str = DEFAULT_ENDPOINT, member: str | None = None):
+    """`connect`, for an LP in the process that serves `endpoint`: its requests
+    are served on its own thread with no socket, and the connection's `fileno`
+    is readable while a reply waits."""
+    return _carrier(endpoint).connect_here(lp, endpoint, member)
+
+
 def _carrier(endpoint: str):
     scheme, separator, _ = endpoint.partition(":")
     if not separator or scheme not in _CARRIERS:
@@ -45,6 +52,7 @@ __all__ = [
     "DEFAULT_ENDPOINT",
     "MalformedMessage",
     "connect",
+    "connect_here",
     "decode",
     "encode",
     "serve",
